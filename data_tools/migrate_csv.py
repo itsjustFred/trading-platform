@@ -111,6 +111,11 @@ def migrate_universe(dry_run: bool) -> int:
     return 1
 
 
+def _looks_like_timestamp(val: str) -> bool:
+    """Check if a string looks like a timestamp (starts with digit, contains '-')."""
+    return len(val) > 8 and val[0].isdigit() and "-" in val
+
+
 def _convert_ohlcv(
     csv_path: Path,
     dest: Path,
@@ -133,6 +138,22 @@ def _convert_ohlcv(
         # Normalize column names to lowercase
         df.columns = [c.lower().strip() for c in df.columns]
 
+        # Handle yfinance multi-header format: first col "price" is actually datetime,
+        # rows contain "Ticker"/symbol name and "Datetime" label as metadata
+        if "price" in df.columns and len(df) > 2:
+            first_val = str(df.iloc[0].get("price", ""))
+            if first_val in ("Ticker", "Datetime") or first_val.isupper():
+                # Skip metadata rows (Ticker row + Datetime row)
+                skip = 0
+                for r in range(min(3, len(df))):
+                    val = str(df.iloc[r].get("price", ""))
+                    if not _looks_like_timestamp(val):
+                        skip = r + 1
+                    else:
+                        break
+                df = df.iloc[skip:].reset_index(drop=True)
+            df = df.rename(columns={"price": "timestamp"})
+
         # Determine timestamp column
         ts_col = None
         if timestamp_col and timestamp_col.lower() in df.columns:
@@ -145,6 +166,12 @@ def _convert_ohlcv(
             ts_col = "timestamp"
         elif "date" in df.columns:
             ts_col = "date"
+
+        # Convert OHLCV columns to numeric, drop rows that can't be converted
+        for col in ("open", "high", "low", "close", "volume"):
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna(subset=["open", "high", "low", "close"])
 
         if ts_col:
             df[ts_col] = pd.to_datetime(df[ts_col], utc=True, errors="coerce")

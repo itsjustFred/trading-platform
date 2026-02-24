@@ -183,7 +183,7 @@ def _build_equity(data: dict) -> list[EquityPoint]:
         if ts is not None and val is not None:
             try:
                 dt = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-                points.append(EquityPoint(timestamp=dt, equity=float(val)))
+                points.append(EquityPoint(time=dt, equity=float(val)))
             except (ValueError, TypeError):
                 continue
     return points

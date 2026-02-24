@@ -30,7 +30,7 @@ class TestComputeStats:
         assert stats["total_trades"] == 3
         assert stats["winners"] == 3
         assert stats["losers"] == 0
-        assert stats["win_rate"] == 100.0
+        assert stats["win_rate"] == 1.0
         assert stats["total_pnl"] == 350.0
         assert stats["profit_factor"] is None  # no losses → inf → None
 
@@ -40,7 +40,7 @@ class TestComputeStats:
         assert stats["total_trades"] == 5
         assert stats["winners"] == 2
         assert stats["losers"] == 3
-        assert stats["win_rate"] == 40.0
+        assert stats["win_rate"] == 0.4
         assert stats["total_pnl"] == 200.0
         assert stats["avg_winner"] == 150.0
         assert stats["avg_loser"] == round(-100 / 3, 2)
@@ -92,7 +92,7 @@ class TestMaxDrawdown:
 
     def test_simple_drawdown(self):
         dd = _max_drawdown_pct([100, 110, 100, 120])
-        assert abs(dd - (10 / 110 * 100)) < 0.01  # ~9.09%
+        assert abs(dd - (10 / 110)) < 0.001  # ~0.0909
 
     def test_single_point(self):
         assert _max_drawdown_pct([100]) == 0.0

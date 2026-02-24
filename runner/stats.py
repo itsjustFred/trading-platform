@@ -45,7 +45,7 @@ def compute_stats(
     loss_count = len(losers)
 
     total_pnl = sum(pnls)
-    win_rate = (win_count / total_trades * 100) if total_trades > 0 else 0.0
+    win_rate = (win_count / total_trades) if total_trades > 0 else 0.0
 
     avg_winner = sum(winners) / win_count if win_count > 0 else 0.0
     avg_loser = sum(losers) / loss_count if loss_count > 0 else 0.0
@@ -98,7 +98,7 @@ def compute_stats(
         stats["avg_holding_bars"] = round(avg_holding_bars, 1)
 
     if equity_curve and len(equity_curve) > 1:
-        stats["max_drawdown_pct"] = round(max_drawdown_pct, 2)
+        stats["max_drawdown_pct"] = round(max_drawdown_pct, 6)
         stats["sharpe_ratio"] = round(sharpe_ratio, 4)
         stats["sortino_ratio"] = round(sortino_ratio, 4)
         stats["calmar_ratio"] = round(calmar_ratio, 4)
@@ -153,7 +153,7 @@ def _max_drawdown_pct(equities: list[float]) -> float:
     for eq in equities:
         if eq > peak:
             peak = eq
-        dd = (peak - eq) / peak * 100 if peak > 0 else 0
+        dd = (peak - eq) / peak if peak > 0 else 0
         if dd > max_dd:
             max_dd = dd
     return max_dd
