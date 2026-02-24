@@ -122,6 +122,36 @@ def get_backtest_ohlcv(backtest_id: str):
     return jsonify(ohlcv_data)
 
 
+@app.route("/api/compare")
+def compare_backtests():
+    """Compare multiple backtests. Query: ?ids=id1,id2,id3"""
+    from flask import request
+    ids_param = request.args.get("ids", "")
+    if not ids_param:
+        return jsonify({"error": "Provide ?ids=id1,id2,id3"}), 400
+
+    ids = [i.strip() for i in ids_param.split(",") if i.strip()]
+    comparison = []
+
+    for bt_id in ids:
+        path = BACKTESTS_DIR / f"{bt_id}.trades.json"
+        if not path.exists():
+            continue
+        try:
+            result = BacktestResult.load(str(path))
+            stats = compute_stats_for_result(result)
+            comparison.append({
+                "id": bt_id,
+                "strategy": result.meta.strategy,
+                "engine": result.meta.engine,
+                "stats": stats,
+            })
+        except Exception as e:
+            logger.warning("Could not load %s for comparison: %s", bt_id, e)
+
+    return jsonify(comparison)
+
+
 # ─── Frontend ─────────────────────────────────────────────────────────────────
 
 @app.route("/")
