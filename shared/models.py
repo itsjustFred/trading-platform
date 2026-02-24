@@ -34,12 +34,15 @@ class TradeExit:
     time: str                          # ISO 8601 UTC
     price: float
     quantity: float
+    pnl: float | None = None           # PnL for this partial exit
     reason: str | None = None          # e.g. "stop_loss", "tp1", "trailing_stop"
     fees: float | None = None
     tags: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {"time": self.time, "price": self.price, "quantity": self.quantity}
+        if self.pnl is not None:
+            d["pnl"] = self.pnl
         if self.reason is not None:
             d["reason"] = self.reason
         if self.fees is not None:
@@ -54,6 +57,7 @@ class TradeExit:
             time=d["time"],
             price=d["price"],
             quantity=d["quantity"],
+            pnl=d.get("pnl"),
             reason=d.get("reason"),
             fees=d.get("fees"),
             tags=d.get("tags", []),
