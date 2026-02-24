@@ -1,0 +1,31 @@
+[project]
+name = "trading-platform"
+version = "0.1.0"
+description = "Universal backtesting framework with multi-engine support and trade viewer"
+requires-python = ">=3.12"
+dependencies = [
+    "pandas>=2.0",
+    "pyarrow>=15.0",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+vectorbt = ["vectorbt>=0.26", "yfinance>=0.2.31"]
+lean = ["lean>=1.0"]
+viewer = ["flask>=3.0", "flask-cors>=4.0"]
+dev = ["pytest>=8.0", "ruff>=0.3"]
+all = ["trading-platform[vectorbt,viewer,dev]"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
