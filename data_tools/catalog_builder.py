@@ -2,9 +2,12 @@
 Scan ~/data/ and produce catalog.json — a machine-readable manifest of all
 available datasets.
 
+Supports source_meta, validation status, and storage mode fields (Phase 3).
+
 Usage:
     python -m data_tools.catalog_builder              # print to stdout
     python -m data_tools.catalog_builder --output ~/data/catalog.json
+    python -m data_tools.catalog_builder --validate   # include validation results
 """
 
 from __future__ import annotations
@@ -23,13 +26,64 @@ logger = logging.getLogger(__name__)
 
 DATA_DIR = Path(os.environ.get("TRADING_DATA_DIR", Path.home() / "data"))
 
+# Path to persisted source metadata (written by downloaders)
+SOURCE_META_FILE = "source_meta.json"
 
-def scan_ohlcv(data_dir: Path) -> list[dict]:
+
+def _load_source_meta(data_dir: Path) -> dict[str, dict]:
+    """Load source metadata index if it exists.
+
+    The file maps dataset keys (e.g. 'dukascopy/forex/XAUUSD/1h') to metadata
+    dicts with fields: url, downloaded_at, license, update_frequency.
+    """
+    meta_path = data_dir / SOURCE_META_FILE
+    if meta_path.exists():
+        try:
+            return json.loads(meta_path.read_text())
+        except Exception as exc:
+            logger.warning("Could not read %s: %s", meta_path, exc)
+    return {}
+
+
+def _detect_storage(parquet_path: Path, data_dir: Path) -> str:
+    """Determine storage mode: local, cached, or remote."""
+    cache_dir = data_dir / "cache"
+    if str(parquet_path).startswith(str(cache_dir)):
+        return "cached"
+    return "local"
+
+
+def _run_validation(parquet_path: Path, symbol: str, timeframe: str) -> dict | None:
+    """Run data validation checks and return summary dict."""
+    try:
+        from data_tools.validate import validate_parquet
+        result = validate_parquet(parquet_path)
+        return {
+            "last_checked": datetime.now(timezone.utc).isoformat(),
+            "status": result.status,
+            "gaps": len(result.gaps),
+            "duplicates": result.duplicates,
+            "warnings": [
+                w for w in [
+                    f"null_values: {result.null_counts}" if any(v > 0 for v in result.null_counts.values()) else None,
+                    f"ohlc_violations: {result.ohlc_violations}" if result.ohlc_violations > 0 else None,
+                    f"zero_volume: {result.zero_volume_pct:.1f}%" if result.zero_volume_pct > 5.0 else None,
+                ] if w is not None
+            ],
+        }
+    except Exception as exc:
+        logger.debug("Validation skipped for %s: %s", parquet_path, exc)
+        return None
+
+
+def scan_ohlcv(data_dir: Path, include_validation: bool = False) -> list[dict]:
     """Scan ohlcv/ subdirectory and return dataset entries."""
     entries = []
     ohlcv_root = data_dir / "ohlcv"
     if not ohlcv_root.exists():
         return entries
+
+    source_meta_index = _load_source_meta(data_dir)
 
     for parquet_file in sorted(ohlcv_root.rglob("*.parquet")):
         rel = parquet_file.relative_to(ohlcv_root)
@@ -52,6 +106,7 @@ def scan_ohlcv(data_dir: Path) -> list[dict]:
             "timeframe": timeframe,
             "path": str(parquet_file),
             "format": "parquet",
+            "storage": _detect_storage(parquet_file, data_dir),
         }
 
         try:
@@ -69,6 +124,17 @@ def scan_ohlcv(data_dir: Path) -> list[dict]:
             logger.warning("Could not read %s: %s", parquet_file, e)
             entry["rows"] = None
             entry["error"] = str(e)
+
+        # Source metadata (from downloaders)
+        meta_key = f"{source}/{asset_class}/{symbol}/{timeframe}"
+        if meta_key in source_meta_index:
+            entry["source_meta"] = source_meta_index[meta_key]
+
+        # Validation (optional, can be slow for large datasets)
+        if include_validation:
+            validation = _run_validation(parquet_file, symbol, timeframe)
+            if validation:
+                entry["validation"] = validation
 
         entries.append(entry)
 
@@ -93,11 +159,11 @@ def scan_universes(data_dir: Path) -> list[dict]:
     return entries
 
 
-def build_catalog(data_dir: Path | None = None) -> dict:
+def build_catalog(data_dir: Path | None = None, include_validation: bool = False) -> dict:
     """Build the full catalog dict."""
     root = data_dir or DATA_DIR
 
-    ohlcv = scan_ohlcv(root)
+    ohlcv = scan_ohlcv(root, include_validation=include_validation)
 
     # Build summary
     symbols = sorted(set(e["symbol"] for e in ohlcv))
@@ -124,10 +190,11 @@ def main():
     parser = argparse.ArgumentParser(description="Build data catalog for ~/data/")
     parser.add_argument("--output", "-o", type=str, help="Write catalog to file (default: stdout)")
     parser.add_argument("--data-dir", type=str, help="Override data directory")
+    parser.add_argument("--validate", action="store_true", help="Include validation results (slower)")
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir) if args.data_dir else None
-    catalog = build_catalog(data_dir)
+    catalog = build_catalog(data_dir, include_validation=args.validate)
 
     out = json.dumps(catalog, indent=2, default=str)
 
