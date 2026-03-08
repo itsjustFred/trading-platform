@@ -51,14 +51,16 @@ def _build_trades(data: dict) -> list[Trade]:
         sym_value = sym_info.get("value", "UNKNOWN")
         ticker = _extract_ticker(sym_value)
 
-        all_orders.append({
-            "id": order.get("id"),
-            "time": order.get("time", ""),
-            "quantity": order.get("quantity", 0),
-            "price": order.get("price", 0),
-            "tag": order.get("tag", ""),
-            "ticker": ticker,
-        })
+        all_orders.append(
+            {
+                "id": order.get("id"),
+                "time": order.get("time", ""),
+                "quantity": order.get("quantity", 0),
+                "price": order.get("price", 0),
+                "tag": order.get("tag", ""),
+                "ticker": ticker,
+            }
+        )
 
     all_orders.sort(key=lambda x: (x["time"], x["id"] or 0))
 
@@ -152,18 +154,19 @@ def _build_meta(
 ) -> BacktestMeta:
     """Extract metadata from LEAN output."""
     from datetime import datetime, timezone
+
     name = strategy_name or "lean_strategy"
     now = datetime.now(timezone.utc)
 
     return BacktestMeta(
         id=f"lean-{name}-{now.strftime('%Y%m%d-%H%M%S')}",
-        strategy=name,
-        engine=engine,
         created_at=now.isoformat(),
-        timeframe_start="",
-        timeframe_end="",
+        engine=engine,
+        strategies=[name],
+        backtest_start="",
+        backtest_end="",
         initial_capital=100000.0,
-        symbols=[],
+        data={"timeframes": [], "symbols": [], "universe": "", "source": "lean"},
     )
 
 

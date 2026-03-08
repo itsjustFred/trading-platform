@@ -21,11 +21,14 @@ class BacktestConfig:
 
     strategy_name: str
     symbols: list[str]
-    timeframe: str                     # e.g. "1h", "5m", "1d"
-    start_date: str                    # "2021-01-01"
-    end_date: str                      # "2025-06-30"
+    timeframe: str  # e.g. "1h", "5m", "1d"
+    start_date: str  # "2021-01-01"
+    end_date: str  # "2025-06-30"
     initial_capital: float = 100_000.0
-    data_dir: str = ""                 # override for ~/data/
+    risk_per_trade_pct: float | None = None  # e.g. 0.01 for 1% risk per trade
+    max_position_pct: float | None = None  # max position notional / equity (e.g. 1.0 = 100%)
+    max_leverage: float | None = None  # max notional / equity allowed with leverage
+    data_dir: str = ""  # override for ~/data/
     parameters: dict[str, Any] = field(default_factory=dict)
 
 
@@ -62,6 +65,5 @@ class EngineAdapter(ABC):
             errors.append("No symbols specified")
         if not config.timeframe:
             errors.append("No timeframe specified")
-        if not config.start_date or not config.end_date:
-            errors.append("Start/end dates required")
+        # start/end dates are now optional — auto-detected from data if missing
         return errors

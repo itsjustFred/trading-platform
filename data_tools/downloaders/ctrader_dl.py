@@ -26,14 +26,29 @@ from pathlib import Path
 import pandas as pd
 
 from data_tools.downloaders.base import Downloader, DownloadResult, SourceMeta
+from shared.constants import DATA_DIR
 
 logger = logging.getLogger(__name__)
 
 # Pairs typically available via cTrader
 AVAILABLE_PAIRS = [
-    "EURUSD", "GBPUSD", "USDJPY", "USDCHF", "AUDUSD", "NZDUSD",
-    "USDCAD", "EURGBP", "EURJPY", "GBPJPY", "XAUUSD", "XAGUSD",
-    "US500", "US100", "US30", "GER40", "UK100",
+    "EURUSD",
+    "GBPUSD",
+    "USDJPY",
+    "USDCHF",
+    "AUDUSD",
+    "NZDUSD",
+    "USDCAD",
+    "EURGBP",
+    "EURJPY",
+    "GBPJPY",
+    "XAUUSD",
+    "XAGUSD",
+    "US500",
+    "US100",
+    "US30",
+    "GER40",
+    "UK100",
 ]
 
 RESAMPLE_MAP = {
@@ -74,12 +89,14 @@ class CTraderDownloader(Downloader):
             for csv_file in self.csv_dir.glob("*.csv"):
                 parts = csv_file.stem.split("_")
                 if len(parts) >= 2:
-                    items.append({
-                        "symbol": parts[0],
-                        "timeframe": "tick" if "tick" in csv_file.stem.lower() else "1m",
-                        "asset_class": "forex",
-                        "file": str(csv_file),
-                    })
+                    items.append(
+                        {
+                            "symbol": parts[0],
+                            "timeframe": "tick" if "tick" in csv_file.stem.lower() else "1m",
+                            "asset_class": "forex",
+                            "file": str(csv_file),
+                        }
+                    )
             return items
 
         return [
@@ -190,7 +207,13 @@ class CTraderDownloader(Downloader):
             df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
 
         # Map OHLCV columns
-        for old, new in [("o", "open"), ("h", "high"), ("l", "low"), ("c", "close"), ("v", "volume")]:
+        for old, new in [
+            ("o", "open"),
+            ("h", "high"),
+            ("l", "low"),
+            ("c", "close"),
+            ("v", "volume"),
+        ]:
             if old in df.columns and new not in df.columns:
                 df = df.rename(columns={old: new})
 
@@ -198,19 +221,28 @@ class CTraderDownloader(Downloader):
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        keep = [c for c in ["timestamp", "open", "high", "low", "close", "volume"] if c in df.columns]
+        keep = [
+            c for c in ["timestamp", "open", "high", "low", "close", "volume"] if c in df.columns
+        ]
         return df[keep].dropna(subset=["open"]).sort_values("timestamp").reset_index(drop=True)
 
     def _resample(self, df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
         rule = RESAMPLE_MAP[timeframe]
         df = df.set_index("timestamp")
-        resampled = df.resample(rule).agg({
-            "open": "first",
-            "high": "max",
-            "low": "min",
-            "close": "last",
-            "volume": "sum",
-        }).dropna(subset=["open"]).reset_index()
+        resampled = (
+            df.resample(rule)
+            .agg(
+                {
+                    "open": "first",
+                    "high": "max",
+                    "low": "min",
+                    "close": "last",
+                    "volume": "sum",
+                }
+            )
+            .dropna(subset=["open"])
+            .reset_index()
+        )
         return resampled
 
     def get_source_meta(self) -> SourceMeta:
@@ -225,6 +257,7 @@ class CTraderDownloader(Downloader):
 
 # ─── CLI ─────────────────────────────────────────────────────────────────────
 
+
 def main():
     import argparse
 
@@ -235,7 +268,7 @@ def main():
     parser.add_argument("--csv-file", help="Single CSV file to import")
     parser.add_argument("--start", help="Start date")
     parser.add_argument("--end", help="End date")
-    parser.add_argument("--output", default=str(Path.home() / "data"))
+    parser.add_argument("--output", default=str(DATA_DIR))
     parser.add_argument("--list", action="store_true")
     args = parser.parse_args()
 
@@ -251,8 +284,12 @@ def main():
         parser.error("--symbol required")
 
     result = dl.download(
-        args.symbol, args.timeframe, Path(args.output),
-        csv_file=args.csv_file, start=args.start, end=args.end,
+        args.symbol,
+        args.timeframe,
+        Path(args.output),
+        csv_file=args.csv_file,
+        start=args.start,
+        end=args.end,
     )
     print(f"✅ {result.symbol}: {result.rows} rows → {result.path}")
 

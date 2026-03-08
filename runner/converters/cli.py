@@ -58,14 +58,17 @@ def cmd_convert(args):
         result = converter["convert"](input_path)
 
     # Update meta with symbols from trades
-    if result.trades and not result.meta.symbols:
-        result.meta.symbols = sorted(set(t.symbol for t in result.trades))
+    if result.trades and not result.meta.data.get("symbols"):
+        result.meta.data["symbols"] = sorted(set(t.symbol for t in result.trades))
 
     output = args.output or str(input_path.with_suffix(".trades.json"))
     result.save(output)
     logger.info(
         "Converted %d trades → %s (engine=%s, strategy=%s)",
-        len(result.trades), output, engine, result.meta.strategy,
+        len(result.trades),
+        output,
+        engine,
+        result.meta.strategies[0] if result.meta.strategies else "unknown",
     )
 
 

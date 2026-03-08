@@ -27,10 +27,10 @@ class DownloadResult:
     timeframe: str
     source: str
     asset_class: str
-    path: Path                                 # where the parquet was saved
+    path: Path  # where the parquet was saved
     rows: int
-    start: str                                 # ISO date of first row
-    end: str                                   # ISO date of last row
+    start: str  # ISO date of first row
+    end: str  # ISO date of last row
     size_bytes: int = 0
     warnings: list[str] = field(default_factory=list)
 
@@ -53,10 +53,10 @@ class DownloadResult:
 class SourceMeta:
     """Metadata about a data source for catalog integration."""
 
-    name: str                                  # e.g. "histdata", "dolthub"
-    url: str = ""                              # base URL
-    license: str = "unknown"                   # "free", "commercial", "academic"
-    update_frequency: str = "manual"           # "daily", "weekly", "manual"
+    name: str  # e.g. "histdata", "dolthub"
+    url: str = ""  # base URL
+    license: str = "unknown"  # "free", "commercial", "academic"
+    update_frequency: str = "manual"  # "daily", "weekly", "manual"
     downloaded_at: str = ""
 
     def to_dict(self) -> dict:
@@ -122,8 +122,12 @@ class Downloader(ABC):
             downloaded_at=datetime.now(timezone.utc).isoformat(),
         )
 
-    def _make_output_path(self, output_dir: Path, asset_class: str, symbol: str, timeframe: str) -> Path:
+    def _make_output_path(
+        self, output_dir: Path, asset_class: str, symbol: str, timeframe: str
+    ) -> Path:
         """Build standardised output path: {output_dir}/ohlcv/{source}/{asset_class}/{symbol}/{tf}.parquet"""
-        path = output_dir / "ohlcv" / self.source_name / asset_class / symbol / f"{timeframe}.parquet"
+        path = (
+            output_dir / "ohlcv" / self.source_name / asset_class / symbol / f"{timeframe}.parquet"
+        )
         path.parent.mkdir(parents=True, exist_ok=True)
         return path

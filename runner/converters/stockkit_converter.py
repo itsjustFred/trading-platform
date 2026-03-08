@@ -22,10 +22,26 @@ logger = logging.getLogger(__name__)
 
 # Stockkit CSV columns (;-separated)
 EXPECTED_HEADERS = [
-    "Symbol", "Direction", "Entry Date", "Entry Time", "Entry Price",
-    "Exit Date", "Exit Time", "Exit Price", "Qty Total", "Qty TP1",
-    "Qty Runner", "TP1 Reached", "TP1 Price", "SL Price", "Initial SL",
-    "Exit Reason", "PnL ($)", "PnL (%)", "Slippage", "Position Size ($)",
+    "Symbol",
+    "Direction",
+    "Entry Date",
+    "Entry Time",
+    "Entry Price",
+    "Exit Date",
+    "Exit Time",
+    "Exit Price",
+    "Qty Total",
+    "Qty TP1",
+    "Qty Runner",
+    "TP1 Reached",
+    "TP1 Price",
+    "SL Price",
+    "Initial SL",
+    "Exit Reason",
+    "PnL ($)",
+    "PnL (%)",
+    "Slippage",
+    "Position Size ($)",
 ]
 
 
@@ -54,14 +70,13 @@ def convert_stockkit_trades(
     now = datetime.now(timezone.utc).isoformat()
     meta = BacktestMeta(
         id=f"stockkit-{strategy_name}-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}",
-        strategy=strategy_name,
-        engine="stockkit",
         created_at=now,
-        timeframe_start=trades[0].entry_time[:10] if trades else "",
-        timeframe_end=trades[-1].entry_time[:10] if trades else "",
+        engine="stockkit",
+        strategies=[strategy_name],
+        backtest_start=trades[0].entry_time[:10] if trades else "",
+        backtest_end=trades[-1].entry_time[:10] if trades else "",
         initial_capital=initial_capital,
-        symbols=symbols,
-        data_timeframe="5m",
+        data={"timeframes": ["5m"], "symbols": symbols, "universe": "", "source": "stockkit"},
     )
 
     return BacktestResult(meta=meta, trades=trades, equity_curve=[])
@@ -115,29 +130,35 @@ def _build_trades(rows: list[dict], strategy_name: str) -> list[Trade]:
                     tp1_pnl = (entry_price - tp1_price) * qty_tp1
                     runner_pnl = (entry_price - exit_price) * qty_runner
 
-                exits.append(TradeExit(
-                    time="",  # exact TP1 time unknown
-                    price=round(tp1_price, 6),
-                    quantity=qty_tp1,
-                    pnl=round(tp1_pnl, 2),
-                    reason="TP1",
-                ))
-                exits.append(TradeExit(
-                    time=exit_dt,
-                    price=round(exit_price, 6),
-                    quantity=qty_runner,
-                    pnl=round(runner_pnl, 2),
-                    reason=exit_reason,
-                ))
+                exits.append(
+                    TradeExit(
+                        time="",  # exact TP1 time unknown
+                        price=round(tp1_price, 6),
+                        quantity=qty_tp1,
+                        pnl=round(tp1_pnl, 2),
+                        reason="TP1",
+                    )
+                )
+                exits.append(
+                    TradeExit(
+                        time=exit_dt,
+                        price=round(exit_price, 6),
+                        quantity=qty_runner,
+                        pnl=round(runner_pnl, 2),
+                        reason=exit_reason,
+                    )
+                )
             else:
                 # Single exit
-                exits.append(TradeExit(
-                    time=exit_dt,
-                    price=round(exit_price, 6),
-                    quantity=qty_total,
-                    pnl=round(total_pnl, 2),
-                    reason=exit_reason,
-                ))
+                exits.append(
+                    TradeExit(
+                        time=exit_dt,
+                        price=round(exit_price, 6),
+                        quantity=qty_total,
+                        pnl=round(total_pnl, 2),
+                        reason=exit_reason,
+                    )
+                )
 
             trade = Trade(
                 id=i + 1,

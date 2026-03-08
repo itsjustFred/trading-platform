@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Trade Viewer</title>
+<script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+<style>
+  :root {
+    --bg: #1a1a2e; --surface: #16213e; --border: #0f3460;
+    --text: #e0e0e0; --text-muted: #888; --accent: #00d2ff;
+    --green: #26a69a; --red: #ef5350;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text); }
+  
+  .header { display: flex; align-items: center; gap: 16px; padding: 12px 20px; background: var(--surface); border-bottom: 1px solid var(--border); }
+  .header h1 { font-size: 18px; color: var(--accent); }
+  .header select { background: var(--bg); color: var(--text); border: 1px solid var(--border); padding: 6px 12px; border-radius: 4px; }
+  
+  .main { display: grid; grid-template-columns: 1fr 320px; height: calc(100vh - 52px); }
+  
+  .chart-area { position: relative; }
+  #chart { width: 100%; height: 50%; }
+  #equity-chart { width: 100%; height: 25%; border-top: 1px solid var(--border); }
+  
+  .trade-table-wrapper { height: 25%; overflow-y: auto; border-top: 1px solid var(--border); }
+  
+  .sidebar { background: var(--surface); border-left: 1px solid var(--border); overflow-y: auto; padding: 16px; }
+  
+  .stats-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .stat-card { background: var(--bg); padding: 10px; border-radius: 6px; border: 1px solid var(--border); }
+  .stat-label { font-size: 11px; color: var(--text-muted); text-transform: uppercase; }
+  .stat-value { font-size: 16px; font-weight: 600; margin-top: 2px; }
+  .stat-value.positive { color: var(--green); }
+  .stat-value.negative { color: var(--red); }
+  
+  h3 { font-size: 13px; color: var(--accent); text-transform: uppercase; letter-spacing: 1px; margin: 16px 0 8px; }
+  h3:first-child { margin-top: 0; }
+  
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th { background: var(--surface); position: sticky; top: 0; padding: 6px 8px; text-align: left; color: var(--text-muted); font-weight: 500; }
+  td { padding: 5px 8px; border-bottom: 1px solid var(--border); }
+  tr:hover { background: rgba(0,210,255,0.05); }
+  tr.winner td:first-child { border-left: 3px solid var(--green); }
+  tr.loser td:first-child { border-left: 3px solid var(--red); }
+  tr.selected { background: rgba(0,210,255,0.15); }
+  
+  .no-data { display: flex; align-items: center; justify-content: center; height: 100%; color: var(--text-muted); font-size: 14px; }
+  
+  .meta-info { font-size: 12px; color: var(--text-muted); }
+  .meta-info span { color: var(--text); }
+
+  @media (max-width: 900px) {
+    .main { grid-template-columns: 1fr; }
+    .sidebar { border-left: none; border-top: 1px solid var(--border); max-height: 300px; }
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>📊 Trade Viewer</h1>
+  <select id="backtest-select"><option value="">Loading...</option></select>
+  <span class="meta-info" id="meta-info"></span>
+</div>
+
+<div class="main">
+  <div class="chart-area">
+    <div id="chart"></div>
+    <div id="equity-chart"></div>
+    <div class="trade-table-wrapper">
+      <table id="trade-table">
+        <thead>
+          <tr><th>#</th><th>Symbol</th><th>Dir</th><th>Entry</th><th>Exit</th><th>PnL</th><th>PnL%</th></tr>
+        </thead>
+        <tbody id="trade-tbody"></tbody>
+      </table>
+    </div>
+  </div>
+  <div class="sidebar" id="sidebar">
+    <h3>Statistics</h3>
+    <div class="stats-grid" id="stats-grid">
+      <div class="no-data">Select a backtest</div>
+    </div>
+  </div>
+</div>
+
+<script>
+const API = '';  // relative to same origin
+
+let mainChart, equityChart, candleSeries, equitySeries;
+let currentResult = null;
+let currentStats = null;
+
+// ─── Init Charts ────────────────────────────────────────────────────────────
+function initCharts() {
+  const chartEl = document.getElementById('chart');
+  const eqEl = document.getElementById('equity-chart');
+  
+  const chartOpts = {
+    layout: { background: { color: '#1a1a2e' }, textColor: '#e0e0e0' },
+    grid: { vertLines: { color: '#0f3460' }, horzLines: { color: '#0f3460' } },
+    crosshair: { mode: 0 },
+    timeScale: { timeVisible: true, secondsVisible: false },
+  };
+  
+  mainChart = LightweightCharts.createChart(chartEl, chartOpts);
+  candleSeries = mainChart.addCandlestickSeries({
+    upColor: '#26a69a', downColor: '#ef5350',
+    borderUpColor: '#26a69a', borderDownColor: '#ef5350',
+    wickUpColor: '#26a69a', wickDownColor: '#ef5350',
+  });
+  
+  equityChart = LightweightCharts.createChart(eqEl, {
+    ...chartOpts,
+    timeScale: { timeVisible: true },
+  });
+  equitySeries = equityChart.addLineSeries({ color: '#00d2ff', lineWidth: 2 });
+  
+  // Sync time scales
+  mainChart.timeScale().subscribeVisibleLogicalRangeChange(range => {
+    if (range) equityChart.timeScale().setVisibleLogicalRange(range);
+  });
+  
+  // Resize handler
+  const resize = () => {
+    const w = chartEl.parentElement.clientWidth;
+    const h = chartEl.parentElement.clientHeight;
+    mainChart.resize(w, h * 0.5);
+    equityChart.resize(w, h * 0.25);
+  };
+  window.addEventListener('resize', resize);
+  setTimeout(resize, 100);
+}
+
+// ─── Load Backtests List ────────────────────────────────────────────────────
+async function loadBacktestList() {
+  const res = await fetch(`${API}/api/backtests`);
+  const list = await res.json();
+  const sel = document.getElementById('backtest-select');
+  sel.innerHTML = '<option value="">— Select Backtest —</option>';
+  for (const bt of list) {
+    const opt = document.createElement('option');
+    opt.value = bt.id;
+    opt.textContent = `${bt.strategy} (${bt.engine}) — ${bt.trade_count} trades`;
+    sel.appendChild(opt);
+  }
+  sel.addEventListener('change', () => {
+    if (sel.value) loadBacktest(sel.value);
+  });
+}
+
+// ─── Load Backtest ──────────────────────────────────────────────────────────
+async function loadBacktest(id) {
+  const [resultRes, statsRes] = await Promise.all([
+    fetch(`${API}/api/backtest/${id}`),
+    fetch(`${API}/api/backtest/${id}/stats`),
+  ]);
+  currentResult = await resultRes.json();
+  currentStats = await statsRes.json();
+  
+  renderMeta(currentResult.meta);
+  renderStats(currentStats);
+  renderTradeTable(currentResult.trades);
+  renderEquityCurve(currentResult.trades, currentResult.meta.initial_capital);
+  
+  // Try loading OHLCV for chart
+  try {
+    const ohlcvRes = await fetch(`${API}/api/backtest/${id}/ohlcv`);
+    const ohlcvData = await ohlcvRes.json();
+    const firstSymbol = Object.keys(ohlcvData)[0];
+    if (firstSymbol) {
+      renderCandleChart(ohlcvData[firstSymbol], currentResult.trades.filter(t => t.symbol === firstSymbol));
+    } else {
+      renderTradeOnlyChart(currentResult.trades);
+    }
+  } catch {
+    renderTradeOnlyChart(currentResult.trades);
+  }
+}
+
+// ─── Render Meta ────────────────────────────────────────────────────────────
+function renderMeta(meta) {
+  document.getElementById('meta-info').innerHTML = 
+    `Strategy: <span>${meta.strategy}</span> | Engine: <span>${meta.engine}</span> | ` +
+    `Period: <span>${meta.timeframe_start || '?'} → ${meta.timeframe_end || '?'}</span>`;
+}
+
+// ─── Render Stats ───────────────────────────────────────────────────────────
+function renderStats(stats) {
+  const grid = document.getElementById('stats-grid');
+  const items = [
+    ['Total Trades', stats.total_trades, ''],
+    ['Win Rate', (stats.win_rate * 100).toFixed(1) + '%', stats.win_rate >= 0.5 ? 'positive' : 'negative'],
+    ['Total PnL', '$' + num(stats.total_pnl), stats.total_pnl >= 0 ? 'positive' : 'negative'],
+    ['Profit Factor', num(stats.profit_factor), stats.profit_factor >= 1 ? 'positive' : 'negative'],
+    ['Avg Winner', '$' + num(stats.avg_winner), 'positive'],
+    ['Avg Loser', '$' + num(stats.avg_loser), 'negative'],
+    ['Sharpe', num(stats.sharpe_ratio), stats.sharpe_ratio >= 1 ? 'positive' : 'negative'],
+    ['Sortino', num(stats.sortino_ratio), stats.sortino_ratio >= 1 ? 'positive' : 'negative'],
+    ['Max DD', (stats.max_drawdown_pct * 100).toFixed(1) + '%', 'negative'],
+    ['Max Consec. Loss', stats.max_consecutive_losses, ''],
+    ['Calmar', num(stats.calmar_ratio), stats.calmar_ratio >= 1 ? 'positive' : 'negative'],
+    ['Avg Hold Bars', num(stats.avg_holding_bars), ''],
+  ];
+  grid.innerHTML = items.map(([label, value, cls]) => `
+    <div class="stat-card">
+      <div class="stat-label">${label}</div>
+      <div class="stat-value ${cls}">${value}</div>
+    </div>
+  `).join('');
+}
+
+// ─── Render Trade Table ─────────────────────────────────────────────────────
+function renderTradeTable(trades) {
+  const tbody = document.getElementById('trade-tbody');
+  tbody.innerHTML = trades.map((t, i) => {
+    const cls = t.pnl >= 0 ? 'winner' : 'loser';
+    const pnlPct = t.pnl_pct != null ? t.pnl_pct.toFixed(2) + '%' : '—';
+    const lastExit = t.exits && t.exits.length ? t.exits[t.exits.length - 1] : {};
+    const exitTime = lastExit.time ? lastExit.time.substring(0, 16).replace('T', ' ') : '—';
+    return `<tr class="${cls}" data-idx="${i}" onclick="highlightTrade(${i})">
+      <td>${t.id}</td><td>${t.symbol}</td><td>${t.direction}</td>
+      <td>${(t.entry_time || '').substring(0, 16).replace('T', ' ')}</td>
+      <td>${exitTime}</td>
+      <td style="color:${t.pnl >= 0 ? 'var(--green)' : 'var(--red)'}">${num(t.pnl)}</td>
+      <td>${pnlPct}</td>
+    </tr>`;
+  }).join('');
+}
+
+// ─── Render Candle Chart ────────────────────────────────────────────────────
+function renderCandleChart(ohlcv, trades) {
+  const candles = ohlcv.map(bar => ({
+    time: toUTC(bar.timestamp),
+    open: bar.open, high: bar.high, low: bar.low, close: bar.close,
+  }));
+  candleSeries.setData(candles);
+  
+  // Add trade markers
+  const markers = [];
+  for (const t of trades) {
+    if (t.entry_time) {
+      markers.push({
+        time: toUTC(t.entry_time),
+        position: t.direction === 'LONG' ? 'belowBar' : 'aboveBar',
+        color: '#00d2ff',
+        shape: t.direction === 'LONG' ? 'arrowUp' : 'arrowDown',
+        text: `${t.direction} ${t.entry_price}`,
+      });
+    }
+    for (const ex of (t.exits || [])) {
+      if (ex.time) {
+        markers.push({
+          time: toUTC(ex.time),
+          position: t.direction === 'LONG' ? 'aboveBar' : 'belowBar',
+          color: ex.pnl >= 0 ? '#26a69a' : '#ef5350',
+          shape: 'circle',
+          text: `Exit ${ex.price}`,
+        });
+      }
+    }
+  }
+  markers.sort((a, b) => a.time - b.time);
+  candleSeries.setMarkers(markers);
+  mainChart.timeScale().fitContent();
+}
+
+// ─── Render Trade-Only Chart (no OHLCV) ─────────────────────────────────────
+function renderTradeOnlyChart(trades) {
+  // Show PnL per trade as a bar-like view
+  const data = [];
+  let cum = 0;
+  for (const t of trades) {
+    cum += t.pnl;
+    if (t.entry_time) {
+      data.push({ time: toUTC(t.entry_time), open: cum - t.pnl, high: Math.max(cum, cum - t.pnl), low: Math.min(cum, cum - t.pnl), close: cum });
+    }
+  }
+  candleSeries.setData(data);
+  mainChart.timeScale().fitContent();
+}
+
+// ─── Render Equity Curve ────────────────────────────────────────────────────
+function renderEquityCurve(trades, initialCapital) {
+  let equity = initialCapital || 100000;
+  const points = []; 
+  for (const t of trades) {
+    if (t.entry_time) {
+      equity += t.pnl;
+      points.push({ time: toUTC(t.entry_time), value: equity });
+    }
+  }
+  if (points.length > 0) {
+    equitySeries.setData(points);
+    equityChart.timeScale().fitContent();
+  }
+}
+
+// ─── Highlight Trade ────────────────────────────────────────────────────────
+function highlightTrade(idx) {
+  // Highlight row
+  document.querySelectorAll('#trade-tbody tr').forEach(r => r.classList.remove('selected'));
+  const row = document.querySelector(`#trade-tbody tr[data-idx="${idx}"]`);
+  if (row) row.classList.add('selected');
+  
+  // Scroll chart to trade
+  const trade = currentResult.trades[idx];
+  if (trade && trade.entry_time) {
+    const t = toUTC(trade.entry_time);
+    mainChart.timeScale().scrollToPosition(-1, false);
+    // Try to center on the trade time
+    try {
+      mainChart.timeScale().scrollToRealTime();
+    } catch {}
+  }
+}
+
+// ─── Helpers ────────────────────────────────────────────────────────────────
+function num(v) { return v != null ? Number(v).toFixed(2) : '—'; }
+function toUTC(iso) {
+  if (!iso) return 0;
+  const d = new Date(iso);
+  return Math.floor(d.getTime() / 1000);
+}
+
+// ─── Init ───────────────────────────────────────────────────────────────────
+initCharts();
+loadBacktestList();
+</script>
+</body>
+</html>

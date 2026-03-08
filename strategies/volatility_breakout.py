@@ -2,32 +2,26 @@
 Strategy: Intraday Volatility Breakout
 
 Simple breakout strategy: if price moves beyond the daily open + ATR multiplier,
-enter in that direction. Stop at the open price.
-
-Original: discord-zenomtrader-forum-strategies/Simple Intraday Volatility Breakout (NinjaTrader 8 C#)
-Adapted: vectorbt signal format
-
-Logic:
-    - Calculate ATR(period) on daily-equivalent scale
-    - Long entry: close > session_open + (atr_mult × ATR)
-    - Short entry: close < session_open - (atr_mult × ATR)  [not used in long-only version]
-    - Exit: close crosses back below session_open (stop) OR opposite signal
-
-Parameters:
-    - atr_period: 5 (ATR lookback)
-    - atr_mult: 0.3 (breakout multiplier — conservative)
-    - use_atr_stop: True (stop at open - 0.5*ATR instead of just open)
-
-Usage:
-    python -m runner.cli run --engine vectorbt --strategy strategies/volatility_breakout.py \\
-        --symbols AAPL MSFT --timeframe 1h --start 2023-06-01 --end 2025-12-31
+enter long and stop at the session open.
 """
 
-import pandas as pd
+STRATEGY_META = {
+    "name": "Volatility Breakout",
+    "version": "1.0.0",
+    "tags": {
+        "type": ["breakout"],
+        "source": "zenomtrader-discord",
+        "link": "https://discord.com/channels/zenomtrader",
+        "asset_class": ["equities"],
+        "complexity": "simple",
+    },
+}
+
 import numpy as np
+import pandas as pd
 
 
-def generate_signals(df: pd.DataFrame, params: dict) -> pd.DataFrame:
+def generate_signals(df: pd.DataFrame, params: dict):
     atr_period = params.get("atr_period", 5)
     atr_mult = params.get("atr_mult", 0.3)
 
@@ -35,28 +29,26 @@ def generate_signals(df: pd.DataFrame, params: dict) -> pd.DataFrame:
     low = df["low"]
     close = df["close"]
 
-    # True Range
     prev_close = close.shift(1)
-    tr = pd.concat([
-        high - low,
-        (high - prev_close).abs(),
-        (low - prev_close).abs()
-    ], axis=1).max(axis=1)
-
+    tr = pd.concat(
+        [
+            high - low,
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
     atr = tr.rolling(atr_period).mean()
 
-    # Session open approximation: use rolling first bar of each day
-    # For hourly data, we use the open of each new day as reference
     if "timestamp" in df.columns:
         ts = pd.to_datetime(df["timestamp"])
         day = ts.dt.date
     else:
-        day = pd.Series(range(len(df))) // 7  # fallback: 7 bars per session
+        day = pd.Series(range(len(df)), index=df.index) // 7
 
-    # Session open = first close of each new day group
     session_open = close.copy()
     prev_day = None
-    current_open = close.iloc[0]
+    current_open = float(close.iloc[0])
     for i in range(len(df)):
         d = day.iloc[i]
         if d != prev_day:
@@ -64,35 +56,41 @@ def generate_signals(df: pd.DataFrame, params: dict) -> pd.DataFrame:
             prev_day = d
         session_open.iloc[i] = current_open
 
-    # Breakout levels
     upper_band = session_open + atr_mult * atr
     lower_band = session_open - atr_mult * atr
-
-    # Long when close breaks above upper band
-    entries = (close > upper_band) & (close.shift(1) <= upper_band.shift(1))
-
-    # Exit when close drops below session open (stop) or below lower band
-    exits = close < session_open
-
-    # Clean: no entry while in trade
+    raw_entries = (close > upper_band) & (close.shift(1) <= upper_band.shift(1))
     in_trade = False
-    clean_entries = []
-    clean_exits = []
+    active_stop = np.nan
+    entries = pd.Series(False, index=df.index)
+    exits = pd.Series(False, index=df.index)
+    sl_price = pd.Series(np.nan, index=df.index)
+    exit_price = pd.Series(np.nan, index=df.index)
+    exit_reason = pd.Series(index=df.index, dtype="object")
 
     for i in range(len(df)):
-        if not in_trade and bool(entries.iloc[i]) if not pd.isna(entries.iloc[i]) else False:
-            in_trade = True
-            clean_entries.append(True)
-            clean_exits.append(False)
-        elif in_trade and (bool(exits.iloc[i]) if not pd.isna(exits.iloc[i]) else False):
-            in_trade = False
-            clean_entries.append(False)
-            clean_exits.append(True)
-        else:
-            clean_entries.append(False)
-            clean_exits.append(False)
+        entry_signal = bool(raw_entries.iloc[i]) if not pd.isna(raw_entries.iloc[i]) else False
+        exit_signal = in_trade and float(low.iloc[i]) <= float(active_stop)
 
-    return pd.DataFrame({
-        "entries": clean_entries,
-        "exits": clean_exits,
-    })
+        if not in_trade and entry_signal:
+            in_trade = True
+            entries.iloc[i] = True
+            active_stop = float(session_open.iloc[i])
+            sl_price.iloc[i] = active_stop
+        elif in_trade and exit_signal:
+            in_trade = False
+            exits.iloc[i] = True
+            exit_price.iloc[i] = active_stop
+            exit_reason.iloc[i] = "stop_loss"
+            active_stop = np.nan
+
+    indicators_dict = {
+        "Session_Open": session_open,
+        "Session_Open_at_exit": session_open,
+        "ATR": atr,
+        "Upper_Band": upper_band,
+        "Lower_Band": lower_band,
+        "sl_price": sl_price,
+        "exit_price": exit_price,
+        "exit_reason": exit_reason,
+    }
+    return entries, exits, indicators_dict

@@ -8,6 +8,7 @@ from shared.models import (
     BacktestMeta,
     BacktestResult,
     EquityPoint,
+    StrategyMeta,
     Trade,
     TradeExit,
 )
@@ -56,13 +57,18 @@ def _make_result() -> BacktestResult:
     return BacktestResult(
         meta=BacktestMeta(
             id="test-run-20260224",
-            strategy="rsi_mean_reversion",
-            engine="vectorbt",
             created_at="2026-02-24T14:30:22Z",
-            timeframe_start="2021-01-01",
-            timeframe_end="2025-06-30",
+            engine="vectorbt",
+            strategies=["rsi_mean_reversion"],
+            backtest_start="2021-01-01",
+            backtest_end="2025-06-30",
             initial_capital=100_000.0,
-            symbols=["AAPL", "CRWD"],
+            data={
+                "timeframes": ["1h"],
+                "symbols": ["AAPL", "CRWD"],
+                "universe": "",
+                "source": "yfinance",
+            },
             parameters={"rsi_period": 2},
         ),
         trades=[_make_simple_trade(), _make_partial_exit_trade()],
@@ -152,7 +158,7 @@ class TestBacktestResult:
         json_str = r.to_json()
         r2 = BacktestResult.from_json(json_str)
         assert r2.meta.id == r.meta.id
-        assert r2.meta.strategy == r.meta.strategy
+        assert r2.meta.strategies == ["rsi_mean_reversion"]
         assert len(r2.trades) == 2
         assert len(r2.equity_curve) == 2
         assert r2.stats["total_trades"] == 2
@@ -170,8 +176,31 @@ class TestBacktestResult:
         r = _make_result()
         assert r.filename == "rsi_mean_reversion_vectorbt_20260224-143022.json"
 
-    def test_meta_timeframe_serialization(self):
+    def test_meta_serialization(self):
         r = _make_result()
         d = r.to_dict()
-        assert d["meta"]["timeframe"]["start"] == "2021-01-01"
-        assert d["meta"]["timeframe"]["end"] == "2025-06-30"
+        assert d["meta"]["backtest_start"] == "2021-01-01"
+        assert d["meta"]["backtest_end"] == "2025-06-30"
+        assert d["meta"]["strategies"] == ["rsi_mean_reversion"]
+        assert d["meta"]["data"]["timeframes"] == ["1h"]
+
+
+class TestStrategyMeta:
+    def test_roundtrip(self):
+        sm = StrategyMeta(
+            name="Test Strategy",
+            version="1.0.0",
+            tags={"type": ["momentum"], "complexity": "simple"},
+        )
+        d = sm.to_dict()
+        sm2 = StrategyMeta.from_dict(d)
+        assert sm2.name == sm.name
+        assert sm2.version == sm.version
+        assert sm2.tags == sm.tags
+
+    def test_minimal(self):
+        sm = StrategyMeta(name="Minimal")
+        d = sm.to_dict()
+        assert d["name"] == "Minimal"
+        assert d["version"] == "1.0.0"
+        assert "tags" not in d

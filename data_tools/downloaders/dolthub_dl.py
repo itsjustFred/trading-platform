@@ -26,6 +26,7 @@ import pandas as pd
 import requests
 
 from data_tools.downloaders.base import Downloader, DownloadResult, SourceMeta
+from shared.constants import DATA_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -34,15 +35,17 @@ DOLTHUB_API = "https://www.dolthub.com/api/v1alpha1"
 # Well-known trading data repos
 KNOWN_REPOS = [
     {
-        "owner": "dolthub",
-        "repo": "us-stock-market-daily",
+        "owner": "post-no-preference",
+        "repo": "stocks",
+        "branch": "master",
         "description": "US stock market daily OHLCV data",
         "asset_class": "equity",
-        "tables": ["dolt_history"],
+        "tables": ["ohlcv"],
     },
     {
         "owner": "post-no-preference",
         "repo": "options",
+        "branch": "master",
         "description": "Historical US equity options data",
         "asset_class": "options",
         "tables": ["option_chain"],
@@ -77,9 +80,10 @@ class DolthubDownloader(Downloader):
         *,
         start: str | None = None,
         end: str | None = None,
-        repo: str = "dolthub/us-stock-market-daily",
+        repo: str = "post-no-preference/stocks",
         query: str | None = None,
-        table: str = "dolt_history",
+        table: str = "ohlcv",
+        branch: str = "master",
         **kwargs,
     ) -> DownloadResult:
         owner, repo_name = repo.split("/", 1)
@@ -97,16 +101,43 @@ class DolthubDownloader(Downloader):
 
         logger.info("Querying DoltHub %s/%s: %s", owner, repo_name, query[:100])
 
-        # Execute SQL query via DoltHub API
-        url = f"{DOLTHUB_API}/{owner}/{repo_name}/main"
+        # Execute SQL query via DoltHub API (with retry for timeouts)
+        url = f"{DOLTHUB_API}/{owner}/{repo_name}/{branch}"
         params = {"q": query}
+        max_retries = 3
 
-        try:
-            resp = requests.get(url, params=params, timeout=120)
-            resp.raise_for_status()
-            data = resp.json()
-        except requests.RequestException as e:
-            raise RuntimeError(f"DoltHub API error: {e}") from e
+        for attempt in range(max_retries):
+            try:
+                resp = requests.get(url, params=params, timeout=120)
+                resp.raise_for_status()
+                data = resp.json()
+                break
+            except (requests.Timeout, requests.ConnectionError) as e:
+                if attempt < max_retries - 1:
+                    import time
+
+                    wait = 5 * (attempt + 1)
+                    logger.warning(
+                        "DoltHub timeout (attempt %d/%d), retrying in %ds...",
+                        attempt + 1,
+                        max_retries,
+                        wait,
+                    )
+                    time.sleep(wait)
+                else:
+                    raise RuntimeError(
+                        f"DoltHub API timeout after {max_retries} attempts. "
+                        "The free API is slow for large tables — use narrow date "
+                        "ranges and LIMIT clauses."
+                    ) from e
+            except requests.RequestException as e:
+                raise RuntimeError(f"DoltHub API error: {e}") from e
+
+        # Check query execution status
+        if data.get("query_execution_status") == "Error":
+            raise RuntimeError(
+                f"DoltHub query error: {data.get('query_execution_message', 'unknown')}"
+            )
 
         # Parse response into DataFrame
         rows = data.get("rows", [])
@@ -115,7 +146,9 @@ class DolthubDownloader(Downloader):
         if not rows:
             raise RuntimeError(f"No data returned for {symbol} from {repo}")
 
-        col_names = [col.get("columnName", col.get("name", f"col_{i}")) for i, col in enumerate(schema)]
+        col_names = [
+            col.get("columnName", col.get("name", f"col_{i}")) for i, col in enumerate(schema)
+        ]
         df = pd.DataFrame(rows, columns=col_names)
 
         # Normalize column names
@@ -136,7 +169,9 @@ class DolthubDownloader(Downloader):
                 df[col] = pd.to_numeric(df[col], errors="coerce")
 
         # Keep only OHLCV columns
-        keep = [c for c in ["timestamp", "open", "high", "low", "close", "volume"] if c in df.columns]
+        keep = [
+            c for c in ["timestamp", "open", "high", "low", "close", "volume"] if c in df.columns
+        ]
         df = df[keep].dropna(subset=["open"]).sort_values("timestamp").reset_index(drop=True)
 
         # Save
@@ -167,17 +202,18 @@ class DolthubDownloader(Downloader):
 
 # ─── CLI ─────────────────────────────────────────────────────────────────────
 
+
 def main():
     import argparse
 
     parser = argparse.ArgumentParser(description="Download data from DoltHub")
     parser.add_argument("--symbol", help="Symbol to download")
     parser.add_argument("--timeframe", default="1d")
-    parser.add_argument("--repo", default="dolthub/us-stock-market-daily", help="DoltHub repo")
+    parser.add_argument("--repo", default="post-no-preference/stocks", help="DoltHub repo")
     parser.add_argument("--query", help="Custom SQL query")
     parser.add_argument("--start", help="Start date (YYYY-MM-DD)")
     parser.add_argument("--end", help="End date (YYYY-MM-DD)")
-    parser.add_argument("--output", default=str(Path.home() / "data"))
+    parser.add_argument("--output", default=str(DATA_DIR))
     parser.add_argument("--list-repos", action="store_true", help="List known repos")
     args = parser.parse_args()
 
@@ -193,8 +229,13 @@ def main():
         parser.error("--symbol or --query required")
 
     result = dl.download(
-        args.symbol or "UNKNOWN", args.timeframe, Path(args.output),
-        start=args.start, end=args.end, repo=args.repo, query=args.query,
+        args.symbol or "UNKNOWN",
+        args.timeframe,
+        Path(args.output),
+        start=args.start,
+        end=args.end,
+        repo=args.repo,
+        query=args.query,
     )
     print(f"✅ {result.symbol} {result.timeframe}: {result.rows} rows → {result.path}")
 

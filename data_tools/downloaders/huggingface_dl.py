@@ -28,6 +28,7 @@ import pandas as pd
 import requests
 
 from data_tools.downloaders.base import Downloader, DownloadResult, SourceMeta
+from shared.constants import DATA_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -115,7 +116,9 @@ class HuggingFaceDownloader(Downloader):
             if end:
                 df = df[df["timestamp"] <= end]
 
-        keep = [c for c in ["timestamp", "open", "high", "low", "close", "volume"] if c in df.columns]
+        keep = [
+            c for c in ["timestamp", "open", "high", "low", "close", "volume"] if c in df.columns
+        ]
         df = df[keep].dropna(subset=["open"]).sort_values("timestamp").reset_index(drop=True)
 
         # Save
@@ -189,6 +192,7 @@ class HuggingFaceDownloader(Downloader):
         """Fallback: try using the `datasets` library if installed."""
         try:
             from datasets import load_dataset
+
             ds = load_dataset(dataset, split="train", streaming=True)
             rows = []
             for row in ds:
@@ -217,6 +221,7 @@ class HuggingFaceDownloader(Downloader):
 
 # ─── CLI ─────────────────────────────────────────────────────────────────────
 
+
 def main():
     import argparse
 
@@ -227,7 +232,7 @@ def main():
     parser.add_argument("--asset-class", default="equity")
     parser.add_argument("--start", help="Start date")
     parser.add_argument("--end", help="End date")
-    parser.add_argument("--output", default=str(Path.home() / "data"))
+    parser.add_argument("--output", default=str(DATA_DIR))
     parser.add_argument("--list", action="store_true")
     args = parser.parse_args()
 
@@ -243,9 +248,13 @@ def main():
         parser.error("--symbol required (or use --list)")
 
     result = dl.download(
-        args.symbol, args.timeframe, Path(args.output),
-        dataset=args.dataset, asset_class=args.asset_class,
-        start=args.start, end=args.end,
+        args.symbol,
+        args.timeframe,
+        Path(args.output),
+        dataset=args.dataset,
+        asset_class=args.asset_class,
+        start=args.start,
+        end=args.end,
     )
     print(f"✅ {result.symbol}: {result.rows} rows → {result.path}")
 

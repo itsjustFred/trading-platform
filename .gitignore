@@ -25,11 +25,25 @@ build/
 .DS_Store
 Thumbs.db
 
-# Data (managed separately in ~/data/)
+# User data (lives in $TRADING_DATA_DIR, not in repo)
+data/
+logs/
+
+# Node
+node_modules/
+
+# Frontend build output (must be built locally)
+frontend/dist/
+
+# Data files (managed separately in $TRADING_DATA_DIR)
 *.parquet
 *.csv
 !tests/fixtures/*.csv
 !tests/fixtures/*.json
+
+# Cache
+.pytest_cache/
+.ruff_cache/
 
 # uv
 uv.lock

@@ -27,16 +27,39 @@ import pandas as pd
 import requests
 
 from data_tools.downloaders.base import Downloader, DownloadResult, SourceMeta
+from shared.constants import DATA_DIR
 
 logger = logging.getLogger(__name__)
 
 # histdata.com serves M1 ASCII data for these pairs (free tier)
 AVAILABLE_PAIRS = [
-    "EURUSD", "GBPUSD", "USDJPY", "USDCHF", "AUDUSD", "NZDUSD",
-    "USDCAD", "EURGBP", "EURJPY", "GBPJPY", "XAUUSD", "XAGUSD",
-    "EURAUD", "EURCHF", "GBPCHF", "GBPAUD", "AUDCAD", "AUDCHF",
-    "AUDJPY", "AUDNZD", "CADCHF", "CADJPY", "CHFJPY", "NZDJPY",
-    "NZDCAD", "NZDCHF", "SGDJPY",
+    "EURUSD",
+    "GBPUSD",
+    "USDJPY",
+    "USDCHF",
+    "AUDUSD",
+    "NZDUSD",
+    "USDCAD",
+    "EURGBP",
+    "EURJPY",
+    "GBPJPY",
+    "XAUUSD",
+    "XAGUSD",
+    "EURAUD",
+    "EURCHF",
+    "GBPCHF",
+    "GBPAUD",
+    "AUDCAD",
+    "AUDCHF",
+    "AUDJPY",
+    "AUDNZD",
+    "CADCHF",
+    "CADJPY",
+    "CHFJPY",
+    "NZDJPY",
+    "NZDCAD",
+    "NZDCHF",
+    "SGDJPY",
 ]
 
 # Timeframe resampling map
@@ -50,7 +73,9 @@ RESAMPLE_MAP = {
     "1d": "1D",
 }
 
-BASE_URL = "https://www.histdata.com/download-free-forex-historical-data/?/ascii/1-minute-bar-quotes"
+BASE_URL = (
+    "https://www.histdata.com/download-free-forex-historical-data/?/ascii/1-minute-bar-quotes"
+)
 DOWNLOAD_URL = "https://www.histdata.com/get.php"
 
 
@@ -63,8 +88,7 @@ class HistdataDownloader(Downloader):
 
     def list_available(self, **kwargs) -> list[dict]:
         return [
-            {"symbol": pair, "timeframe": "1m", "asset_class": "forex"}
-            for pair in AVAILABLE_PAIRS
+            {"symbol": pair, "timeframe": "1m", "asset_class": "forex"} for pair in AVAILABLE_PAIRS
         ]
 
     def download(
@@ -103,7 +127,12 @@ class HistdataDownloader(Downloader):
         if not all_dfs:
             raise RuntimeError(f"No data downloaded for {symbol}")
 
-        combined = pd.concat(all_dfs).sort_values("timestamp").drop_duplicates("timestamp").reset_index(drop=True)
+        combined = (
+            pd.concat(all_dfs)
+            .sort_values("timestamp")
+            .drop_duplicates("timestamp")
+            .reset_index(drop=True)
+        )
 
         # Apply date filters
         if start:
@@ -143,11 +172,14 @@ class HistdataDownloader(Downloader):
             page_url = f"{BASE_URL}/{symbol.lower()}/{year}"
             resp = session.get(page_url, timeout=30)
             if resp.status_code != 200:
-                logger.warning("Could not access page for %s/%d (status %d)", symbol, year, resp.status_code)
+                logger.warning(
+                    "Could not access page for %s/%d (status %d)", symbol, year, resp.status_code
+                )
                 return None
 
             # Extract form token (tk value) from page
             import re
+
             tk_match = re.search(r'id="tk"\s+value="([^"]+)"', resp.text)
             if not tk_match:
                 logger.warning("No download token found for %s/%d", symbol, year)
@@ -176,11 +208,15 @@ class HistdataDownloader(Downloader):
                 with zf.open(csv_name) as f:
                     # histdata M1 format: YYYYMMDD HHMMSS;OPEN;HIGH;LOW;CLOSE;VOLUME
                     df = pd.read_csv(
-                        f, sep=";", header=None,
+                        f,
+                        sep=";",
+                        header=None,
                         names=["datetime", "open", "high", "low", "close", "volume"],
                     )
 
-            df["timestamp"] = pd.to_datetime(df["datetime"].str.strip(), format="%Y%m%d %H%M%S", utc=True)
+            df["timestamp"] = pd.to_datetime(
+                df["datetime"].str.strip(), format="%Y%m%d %H%M%S", utc=True
+            )
             df = df[["timestamp", "open", "high", "low", "close", "volume"]]
             return df
 
@@ -192,13 +228,20 @@ class HistdataDownloader(Downloader):
         """Resample 1m data to a higher timeframe."""
         rule = RESAMPLE_MAP[timeframe]
         df = df.set_index("timestamp")
-        resampled = df.resample(rule).agg({
-            "open": "first",
-            "high": "max",
-            "low": "min",
-            "close": "last",
-            "volume": "sum",
-        }).dropna(subset=["open"]).reset_index()
+        resampled = (
+            df.resample(rule)
+            .agg(
+                {
+                    "open": "first",
+                    "high": "max",
+                    "low": "min",
+                    "close": "last",
+                    "volume": "sum",
+                }
+            )
+            .dropna(subset=["open"])
+            .reset_index()
+        )
         return resampled
 
     def get_source_meta(self) -> SourceMeta:
@@ -213,6 +256,7 @@ class HistdataDownloader(Downloader):
 
 # ─── CLI ─────────────────────────────────────────────────────────────────────
 
+
 def main():
     import argparse
 
@@ -220,7 +264,7 @@ def main():
     parser.add_argument("--symbol", help="Symbol to download (e.g. EURUSD)")
     parser.add_argument("--timeframe", default="1h", help="Target timeframe (default: 1h)")
     parser.add_argument("--years", help="Year range, e.g. 2020-2025")
-    parser.add_argument("--output", default=str(Path.home() / "data"), help="Output directory")
+    parser.add_argument("--output", default=str(DATA_DIR), help="Output directory")
     parser.add_argument("--list", action="store_true", help="List available pairs")
     args = parser.parse_args()
 

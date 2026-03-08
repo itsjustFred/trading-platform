@@ -22,10 +22,11 @@ from pathlib import Path
 
 import pandas as pd
 
+from shared.constants import DATA_DIR
+
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 logger = logging.getLogger(__name__)
 
-DATA_DIR = Path.home() / "data"
 LEAN_DATA = Path.home() / "Desktop" / "custom_lean_integration" / "data"
 STOCKKIT_DATA = Path.home() / "Desktop" / "stockkit_ai_bot" / "data"
 LEAN_UNIVERSE = Path.home() / "Desktop" / "custom_lean_integration" / "universe_sp500.txt"
@@ -106,6 +107,7 @@ def migrate_universe(dry_run: bool) -> int:
         return 1
     dest.parent.mkdir(parents=True, exist_ok=True)
     import shutil
+
     shutil.copy2(LEAN_UNIVERSE, dest)
     logger.info("Copied %s → %s", LEAN_UNIVERSE, dest)
     return 1
@@ -202,7 +204,9 @@ def _convert_ohlcv(
 
 def main():
     parser = argparse.ArgumentParser(description="Migrate CSV data to ~/data/ as Parquet")
-    parser.add_argument("--execute", action="store_true", help="Actually perform the migration (default: dry-run)")
+    parser.add_argument(
+        "--execute", action="store_true", help="Actually perform the migration (default: dry-run)"
+    )
     args = parser.parse_args()
 
     dry_run = not args.execute

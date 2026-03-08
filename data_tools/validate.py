@@ -29,7 +29,7 @@ import pandas as pd
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 logger = logging.getLogger(__name__)
 
-DATA_DIR = Path(os.environ.get("TRADING_DATA_DIR", Path.home() / "data"))
+from shared.constants import DATA_DIR
 
 # Expected bars per timeframe per trading day (forex ~24h, equities ~7h)
 EXPECTED_BARS_PER_DAY = {
@@ -62,7 +62,7 @@ class ValidationResult:
     symbol: str
     timeframe: str
     source: str
-    status: str = "ok"                  # "ok", "warning", "error"
+    status: str = "ok"  # "ok", "warning", "error"
     total_rows: int = 0
     date_range_start: str = ""
     date_range_end: str = ""
@@ -177,11 +177,13 @@ def validate_parquet(path: Path) -> ValidationResult:
             if gap_start.weekday() == 6 and gap_end.weekday() == 0:
                 continue  # Sunday→Monday
 
-            result.gaps.append({
-                "start": str(gap_start),
-                "end": str(gap_end),
-                "gap_minutes": round(gap_minutes, 1),
-            })
+            result.gaps.append(
+                {
+                    "start": str(gap_start),
+                    "end": str(gap_end),
+                    "gap_minutes": round(gap_minutes, 1),
+                }
+            )
 
         if len(result.gaps) > 0:
             result.warnings.append(f"{len(result.gaps)} data gaps detected")
@@ -252,9 +254,16 @@ def validate_all(data_dir: Path, symbol_filter: str | None = None) -> list[Valid
         r = validate_parquet(parquet)
 
         status_icon = {"ok": "✅", "warning": "⚠️", "error": "❌"}.get(r.status, "?")
-        logger.info("  %s %s %s: %d rows, %d gaps, %d dupes, %d OHLC violations",
-                     status_icon, r.symbol, r.timeframe, r.total_rows,
-                     len(r.gaps), r.duplicates, r.ohlc_violations)
+        logger.info(
+            "  %s %s %s: %d rows, %d gaps, %d dupes, %d OHLC violations",
+            status_icon,
+            r.symbol,
+            r.timeframe,
+            r.total_rows,
+            len(r.gaps),
+            r.duplicates,
+            r.ohlc_violations,
+        )
 
         for w in r.warnings:
             logger.info("    ⚠️  %s", w)
@@ -267,6 +276,7 @@ def validate_all(data_dir: Path, symbol_filter: str | None = None) -> list[Valid
 
 
 # ─── CLI ─────────────────────────────────────────────────────────────────────
+
 
 def main():
     import argparse
@@ -286,7 +296,7 @@ def main():
     err = sum(1 for r in results if r.status == "error")
     total = len(results)
 
-    print(f"\n{'='*50}")
+    print(f"\n{'=' * 50}")
     print(f"Validation Summary: {total} files")
     print(f"  ✅ OK:       {ok}")
     print(f"  ⚠️  Warning:  {warn}")

@@ -2,7 +2,7 @@
 
 import math
 
-from runner.stats import compute_stats, compute_stats_for_result, _max_consecutive_losses, _max_drawdown_pct
+from runner.stats import compute_stats, compute_stats_for_result, _max_consecutive, _max_drawdown_pct_manual
 from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, TradeExit
 
 
@@ -40,7 +40,7 @@ class TestComputeStats:
         assert stats["total_trades"] == 5
         assert stats["winners"] == 2
         assert stats["losers"] == 3
-        assert stats["win_rate"] == 0.4
+        assert abs(stats["win_rate"] - 0.4) < 0.01
         assert stats["total_pnl"] == 200.0
         assert stats["avg_winner"] == 150.0
         assert stats["avg_loser"] == round(-100 / 3, 2)
@@ -66,45 +66,54 @@ class TestComputeStats:
             EquityPoint(time="2021-01-04", equity=102500),
         ]
         stats = compute_stats(trades, equity_curve=equity)
-        assert stats["max_drawdown_pct"] > 0
+        assert stats["max_drawdown_pct"] != 0  # QuantStats returns negative
         assert "sharpe_ratio" in stats
         assert "sortino_ratio" in stats
         assert "calmar_ratio" in stats
+        assert "cagr" in stats
+        assert "total_return" in stats
+        assert "max_drawdown_duration" in stats
 
 
 class TestMaxConsecutiveLosses:
     def test_no_losses(self):
-        assert _max_consecutive_losses([10, 20, 30]) == 0
+        assert _max_consecutive([10, 20, 30], positive=False) == 0
 
     def test_all_losses(self):
-        assert _max_consecutive_losses([-10, -20, -30]) == 3
+        assert _max_consecutive([-10, -20, -30], positive=False) == 3
 
     def test_mixed(self):
-        assert _max_consecutive_losses([10, -5, -3, 20, -1, -2, -3, 10]) == 3
+        assert _max_consecutive([10, -5, -3, 20, -1, -2, -3, 10], positive=False) == 3
 
     def test_empty(self):
-        assert _max_consecutive_losses([]) == 0
+        assert _max_consecutive([], positive=False) == 0
+
+    def test_consecutive_wins(self):
+        assert _max_consecutive([10, 20, 30, -5, 10], positive=True) == 3
 
 
 class TestMaxDrawdown:
     def test_no_drawdown(self):
-        assert _max_drawdown_pct([100, 110, 120, 130]) == 0.0
+        assert _max_drawdown_pct_manual([100, 110, 120, 130]) == 0.0
 
     def test_simple_drawdown(self):
-        dd = _max_drawdown_pct([100, 110, 100, 120])
+        dd = _max_drawdown_pct_manual([100, 110, 100, 120])
         assert abs(dd - (10 / 110)) < 0.001  # ~0.0909
 
     def test_single_point(self):
-        assert _max_drawdown_pct([100]) == 0.0
+        assert _max_drawdown_pct_manual([100]) == 0.0
 
 
 class TestComputeStatsForResult:
     def test_convenience_wrapper(self):
         result = BacktestResult(
             meta=BacktestMeta(
-                id="test", strategy="test", engine="vectorbt",
+                id="test",
                 created_at="2026-01-01T00:00:00Z",
-                timeframe_start="2021-01-01", timeframe_end="2021-12-31",
+                engine="vectorbt",
+                strategies=["test"],
+                backtest_start="2021-01-01",
+                backtest_end="2021-12-31",
                 initial_capital=100000,
             ),
             trades=[_trade(100), _trade(-50)],

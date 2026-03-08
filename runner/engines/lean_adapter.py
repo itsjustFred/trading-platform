@@ -25,7 +25,12 @@ from shared.models import BacktestResult
 
 logger = logging.getLogger(__name__)
 
-LEAN_PROJECT_DIR = Path.home() / "Desktop" / "custom_lean_integration"
+LEAN_PROJECT_DIR = Path(
+    os.environ.get(
+        "LEAN_PROJECT_DIR",
+        Path.home() / "Desktop" / "custom_lean_integration",
+    )
+)
 
 
 class LeanAdapter(EngineAdapter):
@@ -41,7 +46,7 @@ class LeanAdapter(EngineAdapter):
     def run(self, config: BacktestConfig, strategy_path: str) -> BacktestResult:
         """
         Run a LEAN backtest.
-        
+
         strategy_path should point to a LEAN algorithm file or a config JSON
         in the custom_lean_integration project.
         """
@@ -84,15 +89,22 @@ class LeanAdapter(EngineAdapter):
 
         # Try to run via the lean CLI or Python entry point
         cmd = [
-            "python", "-m", "lean", "backtest",
+            "python",
+            "-m",
+            "lean",
+            "backtest",
             str(config_path),
-            "--output", str(output_dir),
+            "--output",
+            str(output_dir),
         ]
 
         logger.info("Running LEAN: %s", " ".join(cmd))
         try:
             result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=600,
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=600,
                 cwd=str(self.project_dir),
             )
             if result.returncode != 0:
