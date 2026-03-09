@@ -298,6 +298,51 @@ export function BacktestDetailPage() {
                 💰 ${(info?.initial_capital || 100000).toLocaleString()}
               </span>
             </div>
+            {/* Strategy Parameters */}
+            {info?.parameters && Object.keys(info.parameters).length > 0 && (
+              <div
+                style={{
+                  display: "flex",
+                  flexWrap: "wrap",
+                  gap: "6px",
+                  marginTop: "10px",
+                  alignItems: "center",
+                }}
+              >
+                <span
+                  style={{
+                    fontSize: "0.7rem",
+                    color: "var(--color-text-muted)",
+                    textTransform: "uppercase",
+                    letterSpacing: "0.05em",
+                    marginRight: "2px",
+                  }}
+                >
+                  Params:
+                </span>
+                {Object.entries(info.parameters).map(([key, val]) => (
+                  <span
+                    key={key}
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: "4px",
+                      background: "rgba(88,166,255,0.08)",
+                      border: "1px solid rgba(88,166,255,0.18)",
+                      borderRadius: "6px",
+                      padding: "2px 8px",
+                      fontSize: "0.72rem",
+                      fontFamily: "monospace",
+                      color: "#c9d1d9",
+                    }}
+                  >
+                    <span style={{ color: "var(--color-text-muted)" }}>{key}</span>
+                    <span style={{ color: "rgba(88,166,255,0.7)" }}>:</span>
+                    <span style={{ color: "#e6edf3" }}>{String(val)}</span>
+                  </span>
+                ))}
+              </div>
+            )}
           </div>
         </div>
         {info?.strategy_slug || info?.strategy ? (
