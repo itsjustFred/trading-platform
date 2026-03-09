@@ -4,7 +4,7 @@ import os
 import shutil
 from pathlib import Path
 
-VALID_TIMEFRAMES = ("1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w")
+VALID_TIMEFRAMES = ("tick", "s1", "1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w")
 VALID_DIRECTIONS = ("LONG", "SHORT")
 VALID_ENGINES = ("lean", "vectorbt", "pynecore")
 

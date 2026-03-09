@@ -22,7 +22,7 @@ from typing import Any
 
 import pandas as pd
 
-from runner.engines.base import BacktestConfig, EngineAdapter
+from runner.engines.base import BacktestConfig, EngineAdapter, resolve_strategy_parameters
 from runner.engines.vectorbt_adapter import _resolve_max_leverage, _resolve_max_position_pct
 from shared.constants import DATA_DIR
 from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, TradeExit
@@ -41,6 +41,7 @@ class PyneCoreAdapter(EngineAdapter):
 
     def run(self, config: BacktestConfig, strategy_path: str) -> BacktestResult:
         data_root = Path(config.data_dir) if config.data_dir else DATA_DIR
+        resolved_parameters = resolve_strategy_parameters(strategy_path, config.parameters)
         all_trades: list[Trade] = []
         all_equity: list[EquityPoint] = []
         all_stats: dict[str, Any] = {}
@@ -59,7 +60,7 @@ class PyneCoreAdapter(EngineAdapter):
                 continue
 
             total_bars += len(df)
-            trade_context = _build_trade_context(context_builder, df, config.parameters)
+            trade_context = _build_trade_context(context_builder, df, resolved_parameters)
             asset_class = _infer_asset_class(data_root, symbol, config.timeframe)
 
             with tempfile.TemporaryDirectory(prefix="pynecore_") as tmpdir:
@@ -162,7 +163,7 @@ class PyneCoreAdapter(EngineAdapter):
                 "source": "yfinance",
             },
             initial_capital=config.initial_capital,
-            parameters=config.parameters,
+            parameters=resolved_parameters,
         )
 
         return BacktestResult(

@@ -20,7 +20,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from runner.engines.base import BacktestConfig, EngineAdapter
+from runner.engines.base import BacktestConfig, EngineAdapter, resolve_strategy_parameters
+from runner.stats import compute_stats_for_result
 
 from shared.constants import DATA_DIR
 from shared.logging import get_logger
@@ -84,6 +85,10 @@ def _detect_date_range(symbols: list[str], timeframe: str, data_dir: str = "") -
 def cmd_run(args):
     """Run a backtest."""
     engine = get_engine(args.engine)
+    parameter_overrides = json.loads(args.params) if args.params else {}
+    if not isinstance(parameter_overrides, dict):
+        raise ValueError("--params must decode to a JSON object")
+    resolved_parameters = resolve_strategy_parameters(args.strategy, parameter_overrides)
 
     # Auto-detect date range if not provided
     start = args.start
@@ -108,8 +113,9 @@ def cmd_run(args):
         risk_per_trade_pct=getattr(args, "risk_pct", None),
         max_position_pct=getattr(args, "max_position_pct", None),
         max_leverage=getattr(args, "max_leverage", None),
+        modeling_resolution=getattr(args, "intrabar_resolution", "open_close") or "open_close",
         data_dir=args.data_dir or "",
-        parameters=json.loads(args.params) if args.params else {},
+        parameters=resolved_parameters,
     )
 
     # Validate
@@ -127,6 +133,7 @@ def cmd_run(args):
     )
 
     result = engine.run(config, args.strategy)
+    result.stats = {**result.stats, **compute_stats_for_result(result)}
 
     # Save result
     BACKTESTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -183,6 +190,11 @@ def main():
         type=float,
         default=None,
         help="Max notional / equity allowed with leverage",
+    )
+    run_p.add_argument(
+        "--intrabar-resolution",
+        default="open_close",
+        help="Intrabar exit modeling: open_close, 1-lower, 1m, s1, tick",
     )
     run_p.add_argument("--name", "-n", help="Strategy name (default: filename)")
     run_p.add_argument("--output", "-o", help="Output file path")

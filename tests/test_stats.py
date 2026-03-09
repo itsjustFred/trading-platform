@@ -98,6 +98,25 @@ class TestComputeStats:
         assert 0.0 <= stats["p_value"] <= 1.0
         assert stats["p_value"] < 0.05
 
+    def test_cagr_uses_elapsed_time_for_sparse_equity_curve(self):
+        equity = [
+            EquityPoint(time="2023-01-01T00:00:00+00:00", equity=100000.0),
+            EquityPoint(time="2024-01-01T00:00:00+00:00", equity=110000.0),
+        ]
+
+        stats = compute_stats([], equity_curve=equity)
+
+        assert 0.09 <= stats["cagr"] <= 0.11
+        assert stats["total_return"] == 0.1
+
+    def test_calmar_ratio_zeroed_for_tiny_drawdown(self):
+        equity = _equity_curve_from_returns([0.0200, -0.0005, 0.0150, 0.0100])
+
+        stats = compute_stats([], equity_curve=equity)
+
+        assert abs(stats["max_drawdown_pct"]) < 0.001
+        assert stats["calmar_ratio"] == 0.0
+
 
 class TestMaxConsecutiveLosses:
     def test_no_losses(self):

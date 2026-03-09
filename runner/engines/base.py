@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from shared.models import BacktestResult
+from shared.strategy_registry import load_strategy_meta
 
 
 @dataclass
@@ -28,8 +29,28 @@ class BacktestConfig:
     risk_per_trade_pct: float | None = None  # e.g. 0.01 for 1% risk per trade
     max_position_pct: float | None = None  # max position notional / equity (e.g. 1.0 = 100%)
     max_leverage: float | None = None  # max notional / equity allowed with leverage
+    modeling_resolution: str = "open_close"  # open_close | 1-lower | 1m | s1 | tick
     data_dir: str = ""  # override for ~/data/
     parameters: dict[str, Any] = field(default_factory=dict)
+
+
+def resolve_strategy_parameters(
+    strategy_path: str | Path,
+    overrides: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Merge STRATEGY_META.parameters defaults with explicit overrides."""
+    try:
+        meta = load_strategy_meta(Path(strategy_path).resolve())
+    except Exception:
+        meta = {}
+
+    defaults = meta.get("parameters", {}) if isinstance(meta, dict) else {}
+    if not isinstance(defaults, dict):
+        defaults = {}
+
+    merged = dict(defaults)
+    merged.update(overrides or {})
+    return merged
 
 
 class EngineAdapter(ABC):

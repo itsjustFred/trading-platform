@@ -22,6 +22,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import math
 import os
@@ -39,7 +40,7 @@ from flask_cors import CORS
 from data_tools.catalog_builder import build_catalog, scan_ohlcv
 from runner.auto_agent import run_auto_agent
 from runner.stats import compute_stats, compute_stats_for_result
-from shared.models import BacktestResult, EquityPoint, PortfolioStats
+from shared.models import BacktestResult, EquityPoint, PortfolioStats, Trade
 from shared.strategy_registry import (
     DEFAULT_STRATEGIES_DIR,
     StrategyEntry,
@@ -393,6 +394,17 @@ def _safe_float(value: object, default: float = 0.0) -> float:
     return numeric
 
 
+def _canonical_stats_from_result(result: BacktestResult) -> dict:
+    """Use persisted runner stats when available, otherwise compute canonical fallbacks."""
+    canonical_keys = {"total_pnl", "sharpe_ratio", "cagr", "max_drawdown_pct"}
+    cached_stats = dict(result.stats or {})
+    if canonical_keys.issubset(cached_stats):
+        return cached_stats
+
+    computed = compute_stats_for_result(result)
+    return {**cached_stats, **computed}
+
+
 # ─── API ──────────────────────────────────────────────────────────────────────
 
 
@@ -404,7 +416,7 @@ def _quick_stats_and_equity(
     equity_curve: list[dict] | None = None,
     cached_stats: dict | None = None,
 ) -> dict:
-    """Compute lightweight list-card stats with cached-stat fallbacks when available."""
+    """Build lightweight list-card stats from persisted runner stats when available."""
     if not trades and not equity_curve:
         return {
             "sharpe": 0,
@@ -429,7 +441,6 @@ def _quick_stats_and_equity(
             logger.warning("Could not parse cached equity curve: %s", exc)
             equity_points = []
 
-    derived_stats = dict(cached_stats)
     required_cached_keys = {
         "total_pnl",
         "sharpe_ratio",
@@ -438,15 +449,20 @@ def _quick_stats_and_equity(
         "psr",
         "p_value",
     }
-    if equity_points and not required_cached_keys.issubset(derived_stats):
+    derived_stats = dict(cached_stats)
+    if not required_cached_keys.issubset(derived_stats):
         try:
+            trade_models = [
+                trade if isinstance(trade, Trade) else Trade.from_dict(trade)
+                for trade in trades
+            ]
             derived_stats = compute_stats(
-                trades=[],
+                trades=trade_models,
                 initial_capital=initial_capital,
-                equity_curve=equity_points,
+                equity_curve=equity_points or None,
             )
         except Exception as exc:
-            logger.warning("Could not compute quick stats from equity curve: %s", exc)
+            logger.warning("Could not compute canonical quick stats: %s", exc)
             derived_stats = dict(cached_stats)
 
     if equity_points:
@@ -479,36 +495,8 @@ def _quick_stats_and_equity(
                 max_dd = dd
         max_drawdown_pct = round(max_dd * 100, 2)
 
-    if "cagr" in derived_stats:
-        cagr = round(_safe_float(derived_stats.get("cagr")) * 100, 2)
-    else:
-        cagr = 0
-        try:
-            if start_str and end_str:
-                from datetime import datetime as _dt
-
-                s = _dt.fromisoformat(start_str.replace("Z", "+00:00"))
-                e = _dt.fromisoformat(end_str.replace("Z", "+00:00"))
-                days = (e - s).days
-                final_equity = initial_capital + total_pnl
-                if days > 0 and initial_capital > 0 and final_equity > 0:
-                    years = days / 365.25
-                    cagr = round(((final_equity / initial_capital) ** (1 / years) - 1) * 100, 2)
-        except Exception:
-            pass
-
-    if "sharpe_ratio" in derived_stats:
-        sharpe = round(_safe_float(derived_stats.get("sharpe_ratio")), 3)
-    else:
-        sharpe = 0
-        pnls = [_safe_float(trade.get("pnl", 0)) for trade in trades]
-        if len(pnls) > 1:
-            import statistics
-
-            mean_pnl = statistics.mean(pnls)
-            std_pnl = statistics.stdev(pnls)
-            if std_pnl > 0:
-                sharpe = round(mean_pnl / std_pnl * (252**0.5), 3)
+    cagr = round(_safe_float(derived_stats.get("cagr")) * 100, 2)
+    sharpe = round(_safe_float(derived_stats.get("sharpe_ratio")), 3)
 
     psr_val = derived_stats.get("psr")
     p_value = round(_safe_float(derived_stats.get("p_value"), 1.0), 6)
@@ -640,7 +628,7 @@ def get_backtest_stats(backtest_id: str):
     if result is None:
         return jsonify({"error": f"Backtest '{backtest_id}' not found"}), 404
     try:
-        raw = compute_stats_for_result(result)
+        raw = _canonical_stats_from_result(result)
         # Normalize field names for frontend consistency
         stats = {
             "net_profit": raw.get("total_pnl", 0),
@@ -663,16 +651,9 @@ def get_backtest_stats(backtest_id: str):
             "max_consecutive_losses": raw.get("max_consecutive_losses", 0),
             "best_trade": raw.get("avg_winner", 0),
             "worst_trade": raw.get("avg_loser", 0),
-            "cagr": 0,  # computed below
+            "cagr": round(_safe_float(raw.get("cagr")) * 100, 2),
             "expectancy": 0,  # computed below
         }
-        # CAGR
-        if result.meta.duration_days and result.meta.duration_days > 0:
-            years = result.meta.duration_days / 365.25
-            initial = result.meta.initial_capital or 100000
-            final = initial + raw.get("total_pnl", 0)
-            if initial > 0 and final > 0:
-                stats["cagr"] = round(((final / initial) ** (1 / years) - 1) * 100, 2)
         # Expectancy
         wr = raw.get("win_rate", 0)
         stats["expectancy"] = round(
@@ -1021,7 +1002,7 @@ def compare_backtests_endpoint():
         if result is None:
             continue
         try:
-            stats = compute_stats_for_result(result)
+            stats = _canonical_stats_from_result(result)
             eq = _equity_to_viewer(result)
             eq_pairs = [[e["time"], e["equity"]] for e in eq]
             eq_vals = [e["equity"] for e in eq]
@@ -1118,9 +1099,123 @@ def _strategy_portfolios(entry: StrategyEntry) -> list[dict]:
     return portfolios
 
 
+def _extract_ast_parameters(file_path: Path) -> dict:
+    """Extract default parameters from a strategy file via AST analysis.
+
+    Priority order (first non-empty wins):
+      1. Keyword arguments with defaults from ``generate_signals`` signature
+         (forward-looking for ``def generate_signals(df, rsi_window=14)`` style).
+      2. ``params.get("key", default)`` calls inside ``generate_signals`` body
+         (covers all existing strategies).
+      3. Top-level ALL_CAPS scalar constant assignments (legacy fallback).
+    """
+    try:
+        source = file_path.read_text(encoding="utf-8", errors="replace")
+        tree = ast.parse(source, filename=str(file_path))
+    except Exception:
+        return {}
+
+    # --- locate generate_signals FunctionDef ---
+    gen_sig_func: ast.FunctionDef | None = None
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == "generate_signals":
+            gen_sig_func = node
+            break
+
+    # --- Pattern B: kwargs with defaults in signature ---
+    kwargs_params: dict = {}
+    if gen_sig_func is not None:
+        args_obj = gen_sig_func.args
+        # defaults align to the LAST n positional args
+        defaults = args_obj.defaults
+        all_args = args_obj.args
+        n_defaults = len(defaults)
+        for i, default_node in enumerate(defaults):
+            arg = all_args[len(all_args) - n_defaults + i]
+            name = arg.arg
+            if name in ("df", "data", "params", "self", "cls"):
+                continue
+            if isinstance(default_node, ast.Constant):
+                val = default_node.value
+                if isinstance(val, (int, float, str, bool)):
+                    kwargs_params[name] = val
+        # also check kwonly args
+        for arg, default_node in zip(args_obj.kwonlyargs, args_obj.kw_defaults):
+            if default_node is None:
+                continue
+            name = arg.arg
+            if isinstance(default_node, ast.Constant):
+                val = default_node.value
+                if isinstance(val, (int, float, str, bool)):
+                    kwargs_params[name] = val
+
+    if kwargs_params:
+        return kwargs_params
+
+    # --- Pattern A: params.get("key", default) in function body ---
+    get_params: dict = {}
+    if gen_sig_func is not None:
+        # Determine the name of the params variable (second positional arg)
+        params_var = "params"
+        if len(gen_sig_func.args.args) >= 2:
+            params_var = gen_sig_func.args.args[1].arg
+
+        for node in ast.walk(gen_sig_func):
+            # Match: <params_var>.get("key", default)
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not isinstance(func, ast.Attribute) or func.attr != "get":
+                continue
+            if not isinstance(func.value, ast.Name) or func.value.id != params_var:
+                continue
+            if len(node.args) < 2:
+                continue
+            key_node, default_node = node.args[0], node.args[1]
+            if not isinstance(key_node, ast.Constant) or not isinstance(key_node.value, str):
+                continue
+            if isinstance(default_node, ast.Constant):
+                val = default_node.value
+                if isinstance(val, (int, float, str, bool)):
+                    get_params[key_node.value] = val
+            elif isinstance(default_node, ast.UnaryOp) and isinstance(default_node.op, ast.USub):
+                # Handle negative numbers like -0.02
+                if isinstance(default_node.operand, ast.Constant):
+                    val = default_node.operand.value
+                    if isinstance(val, (int, float)):
+                        get_params[key_node.value] = -val
+
+    if get_params:
+        return get_params
+
+    # --- Pattern C (legacy fallback): ALL_CAPS top-level constants ---
+    caps_params: dict = {}
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if not isinstance(target, ast.Name):
+                continue
+            name = target.id
+            if not name or not name.replace("_", "").isalpha():
+                continue
+            if name != name.upper():
+                continue
+            if name in {"STRATEGY_META", "TRUE", "FALSE", "NONE"}:
+                continue
+            if isinstance(node.value, ast.Constant):
+                val = node.value.value
+                if isinstance(val, (int, float, str)) and not isinstance(val, bool):
+                    caps_params[name] = val
+    return caps_params
+
+
 def _strategy_payload(entry: StrategyEntry) -> dict:
     tags = entry.meta.get("tags", {})
     backtests = _strategy_backtests(entry)
+    parameters = entry.meta.get("parameters", {})
+    if not isinstance(parameters, dict) or not parameters:
+        parameters = _extract_ast_parameters(entry.file_path)
     return {
         "slug": entry.slug,
         "name": entry.display_name,
@@ -1134,6 +1229,7 @@ def _strategy_payload(entry: StrategyEntry) -> dict:
         "asset_class": tags.get("asset_class", []),
         "complexity": tags.get("complexity", ""),
         "engine": entry.engine,
+        "parameters": parameters if isinstance(parameters, dict) else {},
         "backtest_count": len(backtests),
         "best_sharpe": None,
         "documentation_markdown": read_strategy_documentation(entry),
@@ -1162,7 +1258,7 @@ def list_strategies():
     return jsonify(strategies)
 
 
-@app.route("/api/strategies/<name>", methods=["GET"])
+@app.route("/api/strategies/<path:name>", methods=["GET"])
 def get_strategy(name: str):
     """Strategy details + all backtests and portfolios using it."""
     entry = _strategy_entry(name)
@@ -1171,7 +1267,7 @@ def get_strategy(name: str):
     return jsonify(_strategy_payload(entry))
 
 
-@app.route("/api/strategies/<name>", methods=["PATCH"])
+@app.route("/api/strategies/<path:name>", methods=["PATCH"])
 def rename_strategy(name: str):
     """Rename the display name in STRATEGY_META for a strategy."""
     entry = _strategy_entry(name)
@@ -1243,10 +1339,13 @@ def run_backtest():
     risk_pct = data.get("risk_per_trade_pct")
     max_position_pct = data.get("max_position_pct")
     max_leverage = data.get("max_leverage")
+    modeling_resolution = str(data.get("modeling_resolution", data.get("intrabar_resolution", "open_close")) or "open_close")
     params = data.get("parameters", {})
 
     if not strategy or not symbols:
         return jsonify({"error": "strategy and symbols required"}), 400
+    if not isinstance(params, dict):
+        return jsonify({"error": "'parameters' must be an object"}), 400
     strategy_path = _strategy_path(strategy)
     if strategy_path is None:
         return jsonify({"error": f"Strategy '{strategy}' not found"}), 404
@@ -1284,6 +1383,8 @@ def run_backtest():
                 cmd.extend(["--max-position-pct", str(max_position_pct)])
             if max_leverage is not None:
                 cmd.extend(["--max-leverage", str(max_leverage)])
+            if modeling_resolution:
+                cmd.extend(["--intrabar-resolution", modeling_resolution])
 
             proc = subprocess.run(
                 cmd,
@@ -2187,6 +2288,7 @@ def _start_agent_task(task_id: str, payload: dict) -> dict:
                     start=payload.get("start"),
                     end=payload.get("end"),
                     capital=_safe_float(payload.get("capital"), 100000.0),
+                    timeout_seconds=300,
                     log=task_log,
                 )
                 DATA_TASKS[task_id].update(

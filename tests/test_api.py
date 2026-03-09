@@ -48,6 +48,17 @@ class TestStrategiesAPI:
             detail = resp2.get_json()
             assert "name" in detail
 
+    def test_get_strategy_detail_includes_parameters(self, client):
+        resp = client.get("/api/strategies")
+        strategies = resp.get_json()
+        target = next((item for item in strategies if item["slug"] == "example_sma"), None)
+        assert target is not None
+
+        detail_resp = client.get("/api/strategies/example_sma")
+        assert detail_resp.status_code == 200
+        detail = detail_resp.get_json()
+        assert detail["parameters"] == {"fast": 10, "slow": 30}
+
     def test_get_nonexistent_strategy(self, client):
         resp = client.get("/api/strategies/nonexistent_strategy_xyz")
         assert resp.status_code == 404

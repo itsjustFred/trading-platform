@@ -1,3 +1,5 @@
+export type StrategyParameterValue = number | string | boolean | null;
+
 export interface StrategyMeta {
   slug: string;
   name: string;
@@ -10,6 +12,7 @@ export interface StrategyMeta {
   asset_class: string[];
   complexity: string;
   engine: string;
+  parameters: Record<string, StrategyParameterValue>;
   backtest_count: number;
   best_sharpe: number | null;
 }
@@ -19,6 +22,31 @@ export interface StrategyDetail extends StrategyMeta {
   documentation_markdown: string;
   backtests: BacktestSummary[];
   portfolios: PortfolioRef[];
+}
+
+export interface RunBacktestRequest {
+  strategy: string;
+  engine: string;
+  symbols: string[];
+  timeframe: string;
+  start: string;
+  end: string;
+  capital: number;
+  risk_per_trade_pct?: number;
+  max_leverage?: number;
+  modeling_resolution?: string;
+  parameters?: Record<string, number | string>;
+}
+
+export interface RunBacktestResponse {
+  job_id: string;
+  status: string;
+}
+
+export interface RunBacktestStatusResponse {
+  status: string;
+  result: unknown;
+  error: unknown;
 }
 
 export interface BacktestSummary {

@@ -13,6 +13,7 @@ Legacy compatibility:
 from __future__ import annotations
 
 import importlib.util
+import inspect
 import logging
 import os
 from datetime import datetime, timezone
@@ -21,13 +22,55 @@ from typing import Any
 
 import pandas as pd
 
-from runner.engines.base import BacktestConfig, EngineAdapter
+from runner.engines.base import BacktestConfig, EngineAdapter, resolve_strategy_parameters
 from shared.constants import DATA_DIR
 from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, TradeExit
 
 logger = logging.getLogger(__name__)
 
 IndicatorMap = dict[str, tuple[pd.Series, str]]
+TIMEFRAME_ORDER = ["tick", "s1", "1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"]
+TIMEFRAME_TO_DURATION = {
+    "s1": pd.Timedelta(seconds=1),
+    "1m": pd.Timedelta(minutes=1),
+    "5m": pd.Timedelta(minutes=5),
+    "15m": pd.Timedelta(minutes=15),
+    "30m": pd.Timedelta(minutes=30),
+    "1h": pd.Timedelta(hours=1),
+    "4h": pd.Timedelta(hours=4),
+    "1d": pd.Timedelta(days=1),
+    "1w": pd.Timedelta(weeks=1),
+}
+
+
+def _uses_kwargs_style(func) -> bool:
+    """Return True if generate_signals uses keyword-argument style (not params dict)."""
+    try:
+        sig = inspect.signature(func)
+    except (ValueError, TypeError):
+        return False
+    params = list(sig.parameters.values())
+    if len(params) < 2:
+        return False
+    # Skip first arg (df/data). If second arg is named 'params' → dict style.
+    if params[1].name == "params":
+        return False
+    # If any param beyond the first has a non-empty default → kwargs style
+    return any(
+        p.default is not inspect.Parameter.empty
+        for p in params[1:]
+    )
+
+
+def _call_generate_signals(strategy_mod, df: pd.DataFrame, parameters: dict):
+    """Call generate_signals with dict-style or kwargs-style depending on signature."""
+    if _uses_kwargs_style(strategy_mod.generate_signals):
+        # Filter to only keys the function actually accepts
+        sig = inspect.signature(strategy_mod.generate_signals)
+        accepted = {p.name for p in list(sig.parameters.values())[1:]}
+        filtered = {k: v for k, v in parameters.items() if k in accepted}
+        return strategy_mod.generate_signals(df, **filtered)
+    return strategy_mod.generate_signals(df, parameters)
 
 
 class VectorbtAdapter(EngineAdapter):
@@ -43,9 +86,11 @@ class VectorbtAdapter(EngineAdapter):
             raise ValueError(f"Strategy {strategy_path} must define generate_signals(df, params)")
 
         data_root = Path(config.data_dir) if config.data_dir else DATA_DIR
+        resolved_parameters = resolve_strategy_parameters(strategy_path, config.parameters)
         all_trades: list[Trade] = []
         all_equity: list[EquityPoint] = []
         trade_counter = 0
+        used_timeframes = [config.timeframe]
 
         for symbol in config.symbols:
             df, data_path = _load_ohlcv(
@@ -55,12 +100,23 @@ class VectorbtAdapter(EngineAdapter):
                 logger.warning("No data for %s/%s, skipping", symbol, config.timeframe)
                 continue
             asset_class = _infer_asset_class_from_path(data_path)
+            intrabar_df, intrabar_timeframe = _load_intrabar_ohlcv(
+                data_root,
+                symbol,
+                config.timeframe,
+                config.modeling_resolution,
+                config.start_date,
+                config.end_date,
+            )
+            if intrabar_timeframe and intrabar_timeframe not in used_timeframes:
+                used_timeframes.append(intrabar_timeframe)
 
-            signal_output = strategy_mod.generate_signals(df, config.parameters)
+            signal_output = _call_generate_signals(strategy_mod, df, resolved_parameters)
             signals, indicators = _normalize_signal_output(signal_output, df.index)
             entries = signals["entries"]
             exits = signals["exits"]
             stop_loss_series = _find_stop_loss_series(signals, indicators)
+            take_profit_series = _find_take_profit_series(signals, indicators)
             atr_series = _find_atr_series(signals, indicators)
             direction_series = _find_direction_series(signals, indicators)
             exit_price_series = _find_exit_price_series(signals, indicators)
@@ -84,6 +140,25 @@ class VectorbtAdapter(EngineAdapter):
                     entry_price = float(entry_row["close"])
                     exit_price = _resolve_exit_price(exit_row, i, exit_price_series)
                     exit_reason = _resolve_exit_reason(i, exit_reason_series)
+                    entry_ts = str(entry_row.get("timestamp", entry_row.name))
+                    exit_ts = str(exit_row.get("timestamp", exit_row.name))
+                    trade_meta = _extract_trade_meta(signals, indicators, entry_idx, i)
+
+                    intrabar_exit = _resolve_intrabar_exit(
+                        intrabar_df=intrabar_df,
+                        intrabar_timeframe=intrabar_timeframe,
+                        base_timeframe=config.timeframe,
+                        direction=direction,
+                        entry_time=entry_ts,
+                        scheduled_exit_time=exit_ts,
+                        stop_price=_resolve_level_value(stop_loss_series, entry_idx),
+                        take_profit_price=_resolve_level_value(take_profit_series, entry_idx),
+                    )
+                    if intrabar_exit is not None:
+                        exit_price = intrabar_exit["price"]
+                        exit_ts = intrabar_exit["time"]
+                        exit_reason = intrabar_exit["reason"]
+                        trade_meta["modeling_resolution"] = intrabar_exit["resolution"]
 
                     if config.risk_per_trade_pct is not None and config.risk_per_trade_pct > 0:
                         max_position_pct = _resolve_max_position_pct(
@@ -149,10 +224,6 @@ class VectorbtAdapter(EngineAdapter):
                     else:
                         pnl = (entry_price - exit_price) * qty
 
-                    entry_ts = str(entry_row.get("timestamp", entry_row.name))
-                    exit_ts = str(exit_row.get("timestamp", exit_row.name))
-                    trade_meta = _extract_trade_meta(signals, indicators, entry_idx, i)
-
                     trade = Trade(
                         id=trade_counter,
                         symbol=symbol,
@@ -209,13 +280,13 @@ class VectorbtAdapter(EngineAdapter):
             duration_days=duration_days,
             total_bars=sum(1 for _ in all_trades),
             data={
-                "timeframes": [config.timeframe],
+                "timeframes": used_timeframes,
                 "symbols": config.symbols,
                 "universe": "",
                 "source": "yfinance",
             },
             initial_capital=config.initial_capital,
-            parameters=config.parameters,
+            parameters=resolved_parameters,
         )
 
         return BacktestResult(meta=meta, trades=all_trades, equity_curve=all_equity)
@@ -349,6 +420,10 @@ def _find_indicator_series(
         return signals["direction"]
     if kind == "stop_loss" and "stop_loss" in signals.columns:
         return signals["stop_loss"]
+    if kind == "take_profit" and "take_profit" in signals.columns:
+        return signals["take_profit"]
+    if kind == "take_profit" and "tp_price" in signals.columns:
+        return signals["tp_price"]
     if kind == "exit_price" and "exit_price" in signals.columns:
         return signals["exit_price"]
     if kind == "exit_reason" and "exit_reason" in signals.columns:
@@ -369,6 +444,8 @@ def _find_indicator_series(
             return series
         if kind == "stop_loss" and lowered in {"stop_loss", "sl_price"}:
             return series
+        if kind == "take_profit" and lowered in {"take_profit", "tp_price"}:
+            return series
         if kind == "exit_price" and lowered == "exit_price":
             return series
         if kind == "exit_reason" and lowered == "exit_reason":
@@ -380,6 +457,10 @@ def _find_indicator_series(
 
 def _find_stop_loss_series(signals: pd.DataFrame, indicators: IndicatorMap) -> pd.Series | None:
     return _find_indicator_series(signals, indicators, kind="stop_loss")
+
+
+def _find_take_profit_series(signals: pd.DataFrame, indicators: IndicatorMap) -> pd.Series | None:
+    return _find_indicator_series(signals, indicators, kind="take_profit")
 
 
 def _find_atr_series(signals: pd.DataFrame, indicators: IndicatorMap) -> pd.Series | None:
@@ -433,6 +514,21 @@ def _resolve_exit_reason(exit_idx: int, exit_reason_series: pd.Series | None) ->
     return str(exit_reason)
 
 
+def _resolve_level_value(series: pd.Series | None, idx: int) -> float | None:
+    if series is None:
+        return None
+    value = series.iloc[idx]
+    if pd.isna(value):
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if numeric <= 0:
+        return None
+    return numeric
+
+
 def _resolve_stop_distance(
     entry_idx: int,
     entry_price: float,
@@ -478,6 +574,145 @@ def _load_ohlcv(
             df = df[df["timestamp"] <= end_date]
 
     return df.reset_index(drop=True), selected_path
+
+
+def _normalize_intrabar_resolution(value: str | None) -> str:
+    lowered = str(value or "open_close").strip().lower()
+    if lowered in {"", "open_close", "open-close", "open/close only", "open_close_only"}:
+        return "open_close"
+    if lowered in {"1-lower", "1 timeframe lower", "one-lower"}:
+        return "1-lower"
+    if lowered == "m1":
+        return "1m"
+    if lowered in {"1m", "s1", "tick"}:
+        return lowered
+    return "open_close"
+
+
+def _resolve_intrabar_timeframe(base_timeframe: str, intrabar_resolution: str | None) -> str | None:
+    normalized = _normalize_intrabar_resolution(intrabar_resolution)
+    if normalized == "open_close":
+        return None
+
+    if normalized == "1-lower":
+        try:
+            base_index = TIMEFRAME_ORDER.index(base_timeframe)
+        except ValueError:
+            return None
+        if base_index <= 0:
+            return None
+        return TIMEFRAME_ORDER[base_index - 1]
+
+    try:
+        base_index = TIMEFRAME_ORDER.index(base_timeframe)
+        target_index = TIMEFRAME_ORDER.index(normalized)
+    except ValueError:
+        return None
+
+    if target_index >= base_index:
+        return None
+    return normalized
+
+
+def _load_intrabar_ohlcv(
+    data_root: Path,
+    symbol: str,
+    base_timeframe: str,
+    intrabar_resolution: str | None,
+    start_date: str,
+    end_date: str,
+) -> tuple[pd.DataFrame | None, str | None]:
+    target_timeframe = _resolve_intrabar_timeframe(base_timeframe, intrabar_resolution)
+    if not target_timeframe:
+        return None, None
+
+    intrabar_df, _ = _load_ohlcv(data_root, symbol, target_timeframe, start_date, end_date)
+    if intrabar_df is None or intrabar_df.empty:
+        logger.info(
+            "Intrabar data unavailable for %s/%s at %s; falling back to open/close exits",
+            symbol,
+            base_timeframe,
+            target_timeframe,
+        )
+        return None, None
+    return intrabar_df, target_timeframe
+
+
+def _resolve_intrabar_exit(
+    *,
+    intrabar_df: pd.DataFrame | None,
+    intrabar_timeframe: str | None,
+    base_timeframe: str,
+    direction: str,
+    entry_time: str,
+    scheduled_exit_time: str,
+    stop_price: float | None,
+    take_profit_price: float | None,
+) -> dict[str, Any] | None:
+    if intrabar_df is None or intrabar_df.empty or intrabar_timeframe is None:
+        return None
+    if stop_price is None and take_profit_price is None:
+        return None
+
+    entry_ts = pd.to_datetime(entry_time, utc=True, errors="coerce")
+    exit_ts = pd.to_datetime(scheduled_exit_time, utc=True, errors="coerce")
+    base_duration = TIMEFRAME_TO_DURATION.get(base_timeframe, pd.Timedelta(0))
+
+    if pd.isna(entry_ts) or pd.isna(exit_ts):
+        return None
+
+    effective_start = entry_ts + base_duration
+    effective_end = exit_ts + base_duration
+    if effective_end <= effective_start:
+        return None
+
+    timestamps = pd.to_datetime(intrabar_df["timestamp"], utc=True, errors="coerce")
+    window = intrabar_df.loc[(timestamps >= effective_start) & (timestamps < effective_end)]
+    if window.empty:
+        return None
+
+    for row in window.itertuples(index=False):
+        timestamp = pd.to_datetime(getattr(row, "timestamp"), utc=True, errors="coerce")
+        if pd.isna(timestamp):
+            continue
+        high = float(getattr(row, "high"))
+        low = float(getattr(row, "low"))
+        event = _match_intrabar_exit_event(
+            direction=direction,
+            high=high,
+            low=low,
+            stop_price=stop_price,
+            take_profit_price=take_profit_price,
+        )
+        if event is None:
+            continue
+        event["time"] = timestamp.isoformat()
+        event["resolution"] = intrabar_timeframe
+        return event
+
+    return None
+
+
+def _match_intrabar_exit_event(
+    *,
+    direction: str,
+    high: float,
+    low: float,
+    stop_price: float | None,
+    take_profit_price: float | None,
+) -> dict[str, Any] | None:
+    if direction == "LONG":
+        stop_hit = stop_price is not None and low <= stop_price
+        tp_hit = take_profit_price is not None and high >= take_profit_price
+    else:
+        stop_hit = stop_price is not None and high >= stop_price
+        tp_hit = take_profit_price is not None and low <= take_profit_price
+
+    if stop_hit:
+        return {"price": float(stop_price), "reason": "stop_loss"}
+    if tp_hit:
+        return {"price": float(take_profit_price), "reason": "take_profit"}
+    return None
 
 
 def _infer_asset_class_from_path(data_path: Path | None) -> str:

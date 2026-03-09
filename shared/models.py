@@ -29,6 +29,7 @@ class StrategyMeta:
 
     name: str
     version: str = "1.0.0"
+    parameters: dict[str, Any] = field(default_factory=dict)
     tags: dict = field(default_factory=dict)
     # Tags structure:
     # {
@@ -41,6 +42,8 @@ class StrategyMeta:
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {"name": self.name, "version": self.version}
+        if self.parameters:
+            d["parameters"] = self.parameters
         if self.tags:
             d["tags"] = self.tags
         return d
@@ -50,13 +53,14 @@ class StrategyMeta:
         return cls(
             name=d["name"],
             version=d.get("version", "1.0.0"),
+            parameters=d.get("parameters", {}),
             tags=d.get("tags", {}),
         )
 
 
 # ─── Timeframe constants ────────────────────────────────────────────────────
 
-VALID_TIMEFRAMES = ("1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w")
+VALID_TIMEFRAMES = ("tick", "s1", "1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w")
 VALID_DIRECTIONS = ("LONG", "SHORT")
 
 

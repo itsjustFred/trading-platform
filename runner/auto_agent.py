@@ -23,6 +23,7 @@ from openai import OpenAI
 from data_tools.catalog_builder import scan_ohlcv
 from runner.cli import _detect_date_range
 from shared.constants import DATA_DIR
+from shared.logging import get_logger
 from shared.strategy_registry import DEFAULT_STRATEGIES_DIR
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -35,6 +36,8 @@ MAX_ITERATIONS = 3
 DEFAULT_CAPITAL = 100_000.0
 DEFAULT_RISK_PCT = 0.01
 ERROR_CONTEXT_LIMIT = 8_000
+OPENAI_TIMEOUT_SECONDS = 300
+LONG_CODE_LINE_THRESHOLD = 1000
 
 TIMEFRAME_RANK = {
     "1h": 0,
@@ -65,6 +68,7 @@ SYMBOL_RANK = {
 }
 
 TaskLogger = Callable[[str], None]
+logger = get_logger("auto-agent")
 
 
 @dataclass
@@ -86,12 +90,19 @@ def run_auto_agent(
     end: str | None = None,
     capital: float = DEFAULT_CAPITAL,
     max_iterations: int = MAX_ITERATIONS,
+    timeout_seconds: int = OPENAI_TIMEOUT_SECONDS,
     log: TaskLogger | None = None,
 ) -> dict[str, str | int | list[str]]:
     """Convert raw strategy code into a runnable strategy and validate it via backtest."""
     source_code = (code or "").strip()
     if not source_code:
         raise ValueError("Strategy source code is required.")
+
+    line_count = source_code.count("\n") + 1
+    if line_count >= LONG_CODE_LINE_THRESHOLD:
+        message = f"Code is very long ({line_count} lines). Expect longer generation time."
+        logger.info(message, extra={"data": {"line_count": line_count, "timeout_seconds": timeout_seconds}})
+        _log(log, message)
 
     api_key = os.getenv("NVIDIA_API_KEY")
     if not api_key:
@@ -115,6 +126,7 @@ def run_auto_agent(
     client = OpenAI(
         base_url="https://integrate.api.nvidia.com/v1",
         api_key=api_key,
+        timeout=timeout_seconds,
     )
 
     developer_prompt = (

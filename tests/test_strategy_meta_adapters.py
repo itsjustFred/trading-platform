@@ -8,7 +8,7 @@ import pandas as pd
 
 from runner.engines.base import BacktestConfig
 from runner.engines.pynecore_adapter import _enrich_trades_with_context, _normalize_trade_context
-from runner.engines.vectorbt_adapter import VectorbtAdapter
+from runner.engines.vectorbt_adapter import VectorbtAdapter, _resolve_max_leverage
 from shared.models import Trade, TradeExit
 from shared.strategy_registry import DEFAULT_STRATEGIES_DIR, iter_strategy_files
 
@@ -125,6 +125,144 @@ def test_all_vectorbt_strategies_return_entries_exits_and_indicators_dict():
         assert len(pd.Series(entries)) == len(df), strategy_path.name
         assert len(pd.Series(exits)) == len(df), strategy_path.name
         assert isinstance(indicators, dict) and indicators, strategy_path.name
+
+
+def test_vectorbt_adapter_merges_strategy_meta_parameters(tmp_path: Path):
+    strategy_path = tmp_path / "meta_params_strategy.py"
+    strategy_path.write_text(
+        """
+import pandas as pd
+
+STRATEGY_META = {
+    "name": "Meta Params",
+    "parameters": {"fast": 2, "slow": 4},
+}
+
+def generate_signals(df: pd.DataFrame, params: dict):
+    entries = pd.Series(False, index=df.index)
+    exits = pd.Series(False, index=df.index)
+    entries.iloc[0] = True
+    exits.iloc[-1] = True
+    indicators = {
+        "configured_fast": pd.Series([params["fast"]] * len(df), index=df.index),
+        "configured_slow": pd.Series([params["slow"]] * len(df), index=df.index),
+    }
+    return entries, exits, indicators
+"""
+    )
+
+    data_root = tmp_path / "data"
+    parquet_dir = data_root / "ohlcv" / "test_source" / "equities" / "AAPL"
+    parquet_dir.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=3, freq="D", tz="UTC"),
+            "open": [100, 101, 102],
+            "high": [101, 102, 103],
+            "low": [99, 100, 101],
+            "close": [100, 101, 102],
+            "volume": [10, 11, 12],
+        }
+    ).to_parquet(parquet_dir / "1d.parquet", index=False)
+
+    result = VectorbtAdapter().run(
+        BacktestConfig(
+            strategy_name="meta_params_strategy",
+            symbols=["AAPL"],
+            timeframe="1d",
+            start_date="2024-01-01",
+            end_date="2024-01-03",
+            initial_capital=1000.0,
+            data_dir=str(data_root),
+            parameters={"slow": 6},
+        ),
+        str(strategy_path),
+    )
+
+    assert result.meta.parameters == {"fast": 2, "slow": 6}
+    assert result.trades[0].meta["configured_fast"] == 2
+    assert result.trades[0].meta["configured_slow"] == 6
+
+
+def test_vectorbt_adapter_uses_intrabar_take_profit_and_tracks_timeframes(tmp_path: Path):
+    strategy_path = tmp_path / "intrabar_strategy.py"
+    strategy_path.write_text(
+        """
+import pandas as pd
+
+STRATEGY_META = {"name": "Intrabar Strategy"}
+
+def generate_signals(df: pd.DataFrame, params: dict):
+    entries = pd.Series(False, index=df.index)
+    exits = pd.Series(False, index=df.index)
+    entries.iloc[0] = True
+    exits.iloc[2] = True
+    indicators = {
+        "tp_price": pd.Series([105.0, None, None], index=df.index),
+        "sl_price": pd.Series([95.0, None, None], index=df.index),
+    }
+    return entries, exits, indicators
+"""
+    )
+
+    data_root = tmp_path / "data"
+    symbol_dir = data_root / "ohlcv" / "test_source" / "equities" / "AAPL"
+    symbol_dir.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01T00:00:00Z", periods=3, freq="1h", tz="UTC"),
+            "open": [100, 101, 110],
+            "high": [101, 111, 112],
+            "low": [99, 100, 109],
+            "close": [100, 110, 111],
+            "volume": [10, 11, 12],
+        }
+    ).to_parquet(symbol_dir / "1h.parquet", index=False)
+    pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(
+                [
+                    "2024-01-01T01:15:00Z",
+                    "2024-01-01T01:30:00Z",
+                    "2024-01-01T02:15:00Z",
+                ],
+                utc=True,
+            ),
+            "open": [100.5, 104.0, 104.5],
+            "high": [104.5, 105.5, 105.0],
+            "low": [100.0, 103.5, 104.0],
+            "close": [104.0, 105.0, 104.8],
+            "volume": [1, 1, 1],
+        }
+    ).to_parquet(symbol_dir / "1m.parquet", index=False)
+
+    result = VectorbtAdapter().run(
+        BacktestConfig(
+            strategy_name="intrabar_strategy",
+            symbols=["AAPL"],
+            timeframe="1h",
+            start_date="2024-01-01",
+            end_date="2024-01-02",
+            initial_capital=1000.0,
+            data_dir=str(data_root),
+            modeling_resolution="1m",
+        ),
+        str(strategy_path),
+    )
+
+    assert result.meta.data["timeframes"] == ["1h", "1m"]
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    assert trade.exits[0].reason == "take_profit"
+    assert trade.exits[0].price == 105.0
+    assert trade.exits[0].time == "2024-01-01T01:30:00+00:00"
+    assert trade.meta["modeling_resolution"] == "1m"
+    assert trade.pnl == 50.0
+
+
+def test_default_max_leverage_is_unlevered():
+    assert _resolve_max_leverage(None) == 2.0
+    assert _resolve_max_leverage(1.0) == 1.0
 
 
 

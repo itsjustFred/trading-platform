@@ -521,6 +521,64 @@ def test_backtest_stats_endpoint_includes_p_value(viewer_client, tmp_path):
     assert payload["p_value"] < 0.05
 
 
+def test_backtests_list_uses_persisted_runner_stats(viewer_client, tmp_path):
+    backtests_dir = tmp_path / "backtests"
+    backtests_dir.mkdir(parents=True, exist_ok=True)
+
+    result = BacktestResult(
+        meta=BacktestMeta(
+            id="cached-stats-demo",
+            created_at="2026-03-07T15:00:00Z",
+            engine="vectorbt",
+            strategies=["Cached Stats Demo"],
+            backtest_start="2024-01-01",
+            backtest_end="2024-01-31",
+            initial_capital=100000.0,
+            data={"symbols": ["AAPL"], "timeframes": ["1d"], "source": "test_source"},
+        ),
+        trades=[],
+        equity_curve=_equity_curve_from_returns([0.01, -0.02, 0.015]),
+        stats={
+            "total_pnl": 1234.56,
+            "sharpe_ratio": 7.777,
+            "cagr": 0.4321,
+            "max_drawdown_pct": -0.2345,
+            "p_value": 0.012345,
+            "psr": 0.88,
+        },
+    )
+    result.save(backtests_dir / "cached-stats-demo.trades.json")
+
+    resp = viewer_client.get("/api/backtests")
+
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert len(payload) == 1
+
+    item = payload[0]
+    assert item["id"] == "cached-stats-demo"
+    assert item["filename"] == "cached-stats-demo.trades.json"
+    assert item["title"] == "Cached Stats Demo"
+    assert item["strategy"] == "Cached Stats Demo"
+    assert item["strategy_slug"] == "Cached Stats Demo"
+    assert item["strategy_display_name"] == "Cached Stats Demo"
+    assert item["engine"] == "vectorbt"
+    assert item["symbols"] == ["AAPL"]
+    assert item["timeframes"] == ["1d"]
+    assert item["trade_count"] == 0
+    assert item["start"] == "2024-01-01"
+    assert item["end"] == "2024-01-31"
+    assert item["created_at"] == "2026-03-07T15:00:00Z"
+    assert item["sharpe"] == 7.777
+    assert item["cagr"] == 43.21
+    assert item["max_drawdown_pct"] == 23.45
+    assert item["net_profit"] == 1234.56
+    assert item["net_profit_pct"] == 1.23
+    assert item["psr"] == 0.88
+    assert item["p_value"] == 0.012345
+    assert item["equity_mini"] == pytest.approx([100000.0, 101000.0, 98980.0, 100464.7])
+
+
 def test_create_portfolio_persists_p_value_and_psr(viewer_client, tmp_path):
     backtests_dir = tmp_path / "backtests"
     backtests_dir.mkdir(parents=True, exist_ok=True)

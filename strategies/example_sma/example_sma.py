@@ -8,6 +8,7 @@ Long when fast SMA crosses above slow SMA, exit when it crosses below.
 STRATEGY_META = {
     "name": "SMA Crossover",
     "version": "1.0.0",
+    "parameters": {"fast": 10, "slow": 30},
     "tags": {
         "type": ["trend-following"],
         "source": "example",

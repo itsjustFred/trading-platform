@@ -10,6 +10,11 @@ import type {
   DukascopyGenesisResponse,
   LogContent,
   LogFile,
+  RunBacktestRequest,
+  RunBacktestResponse,
+  RunBacktestStatusResponse,
+  StrategyDetail,
+  StrategyMeta,
 } from "./types";
 
 const BASE_URL = "/api";
@@ -27,13 +32,13 @@ async function fetchJSON<T>(url: string, options?: RequestInit): Promise<T> {
 }
 
 // Strategies
-export const getStrategies = () => fetchJSON<any[]>("/strategies");
+export const getStrategies = () => fetchJSON<StrategyMeta[]>("/strategies");
 export const getStrategy = (name: string) =>
-  fetchJSON<any>(`/strategies/${encodeURIComponent(name)}`);
+  fetchJSON<StrategyDetail>(`/strategies/${encodeURIComponent(name)}`);
 export const getStrategyDetail = (name: string) =>
-  fetchJSON<any>(`/strategies/${encodeURIComponent(name)}`);
+  fetchJSON<StrategyDetail>(`/strategies/${encodeURIComponent(name)}`);
 export const renameStrategy = (name: string, displayName: string) =>
-  fetchJSON<any>(`/strategies/${encodeURIComponent(name)}`, {
+  fetchJSON<StrategyDetail>(`/strategies/${encodeURIComponent(name)}`, {
     method: "PATCH",
     body: JSON.stringify({ name: displayName }),
   });
@@ -61,25 +66,13 @@ export const compareBacktests = (ids: string[]) =>
   fetchJSON<any>(`/compare?ids=${ids.join(",")}`);
 
 // Run backtest
-export const runBacktest = (data: {
-  strategy: string;
-  engine: string;
-  symbols: string[];
-  timeframe: string;
-  start: string;
-  end: string;
-  capital: number;
-  risk_per_trade_pct?: number;
-  parameters?: Record<string, any>;
-}) =>
-  fetchJSON<{ job_id: string; status: string }>("/backtests/run", {
+export const runBacktest = (data: RunBacktestRequest) =>
+  fetchJSON<RunBacktestResponse>("/backtests/run", {
     method: "POST",
     body: JSON.stringify(data),
   });
 export const getBacktestRunStatus = (jobId: string) =>
-  fetchJSON<{ status: string; result: any; error: any }>(
-    `/backtests/run/${jobId}/status`,
-  );
+  fetchJSON<RunBacktestStatusResponse>(`/backtests/run/${jobId}/status`);
 
 // Portfolios
 export const getPortfolios = () => fetchJSON<any[]>("/portfolios");
