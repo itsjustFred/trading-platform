@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields as dataclass_fields
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -317,6 +317,115 @@ class IndicatorSeries:
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> IndicatorSeries:
         return cls(name=d["name"], type=d["type"], data=d.get("data", []), style=d.get("style", {}))
+
+
+@dataclass
+class BacktestStats:
+    """Canonical backtest statistics shared across runner and viewer layers."""
+
+    total_trades: int = 0
+    winners: int = 0
+    losers: int = 0
+    win_rate: float = 0.0
+    profit_factor: float | None = None
+    total_pnl: float = 0.0
+    avg_winner: float = 0.0
+    avg_loser: float = 0.0
+    max_consecutive_wins: int = 0
+    max_consecutive_losses: int = 0
+    avg_holding_bars: float | None = None
+    max_drawdown_pct: float = 0.0
+    max_drawdown_duration: int = 0
+    sharpe_ratio: float = 0.0
+    sortino_ratio: float = 0.0
+    calmar_ratio: float = 0.0
+    cagr: float = 0.0
+    total_return: float = 0.0
+    psr: float | None = None
+    p_value: float = 1.0
+    extras: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "total_trades": self.total_trades,
+            "winners": self.winners,
+            "losers": self.losers,
+            "win_rate": self.win_rate,
+            "profit_factor": self.profit_factor,
+            "total_pnl": self.total_pnl,
+            "avg_winner": self.avg_winner,
+            "avg_loser": self.avg_loser,
+            "max_consecutive_wins": self.max_consecutive_wins,
+            "max_consecutive_losses": self.max_consecutive_losses,
+            "max_drawdown_pct": self.max_drawdown_pct,
+            "max_drawdown_duration": self.max_drawdown_duration,
+            "sharpe_ratio": self.sharpe_ratio,
+            "sortino_ratio": self.sortino_ratio,
+            "calmar_ratio": self.calmar_ratio,
+            "cagr": self.cagr,
+            "total_return": self.total_return,
+            "p_value": self.p_value,
+        }
+        if self.avg_holding_bars is not None:
+            data["avg_holding_bars"] = self.avg_holding_bars
+        if self.psr is not None:
+            data["psr"] = self.psr
+        data.update(self.extras)
+        return data
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "BacktestStats":
+        field_names = {item.name for item in dataclass_fields(cls) if item.name != "extras"}
+        payload = {key: value for key, value in d.items() if key in field_names}
+        payload["extras"] = {key: value for key, value in d.items() if key not in field_names}
+        return cls(**payload)
+
+
+@dataclass
+class PortfolioStats:
+    """Canonical portfolio statistics for persisted combined portfolio metrics."""
+
+    sharpe: float = 0.0
+    sortino: float = 0.0
+    cagr: float = 0.0
+    max_drawdown: float = 0.0
+    net_profit: float = 0.0
+    win_rate: float = 0.0
+    profit_factor: float | None = None
+    calmar: float = 0.0
+    total_return: float = 0.0
+    max_drawdown_duration: int = 0
+    psr: float | None = None
+    p_value: float = 1.0
+    correlation_matrix: dict[str, Any] = field(default_factory=dict)
+    extras: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "sharpe": self.sharpe,
+            "sortino": self.sortino,
+            "cagr": self.cagr,
+            "max_drawdown": self.max_drawdown,
+            "net_profit": self.net_profit,
+            "win_rate": self.win_rate,
+            "profit_factor": self.profit_factor,
+            "calmar": self.calmar,
+            "total_return": self.total_return,
+            "max_drawdown_duration": self.max_drawdown_duration,
+            "p_value": self.p_value,
+            "correlation_matrix": self.correlation_matrix,
+        }
+        if self.psr is not None:
+            data["psr"] = self.psr
+        data.update(self.extras)
+        return data
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "PortfolioStats":
+        field_names = {item.name for item in dataclass_fields(cls) if item.name != "extras"}
+        payload = {key: value for key, value in d.items() if key in field_names}
+        payload["extras"] = {key: value for key, value in d.items() if key not in field_names}
+        return cls(**payload)
 
 
 # ─── Complete backtest result ────────────────────────────────────────────────

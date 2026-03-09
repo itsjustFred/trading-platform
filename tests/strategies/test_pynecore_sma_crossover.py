@@ -20,7 +20,7 @@ from runner.engines.base import BacktestConfig
 from runner.engines.pynecore_adapter import PyneCoreAdapter
 
 
-STRATEGY_PATH = str(Path(__file__).parent.parent.parent / "strategies" / "pynecore_sma_crossover.py")
+STRATEGY_PATH = str(Path(__file__).parent.parent.parent / "strategies" / "pynecore_sma_crossover" / "pynecore_sma_crossover.py")
 TEST_START = "2025-10-01"
 TEST_END = "2025-12-31"
 TEST_SYMBOL = "SPY"

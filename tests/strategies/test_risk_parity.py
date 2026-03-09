@@ -20,7 +20,7 @@ from runner.engines.base import BacktestConfig
 from runner.engines.vectorbt_adapter import VectorbtAdapter
 
 
-STRATEGY_PATH = str(Path(__file__).parent.parent.parent / "strategies" / "risk_parity.py")
+STRATEGY_PATH = str(Path(__file__).parent.parent.parent / "strategies" / "risk_parity" / "risk_parity.py")
 TEST_START = "2016-01-01"
 TEST_END = "2020-12-31"
 TEST_SYMBOL = "XAUUSD"

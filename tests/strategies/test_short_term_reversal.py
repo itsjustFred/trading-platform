@@ -20,7 +20,7 @@ from runner.engines.base import BacktestConfig
 from runner.engines.vectorbt_adapter import VectorbtAdapter
 
 
-STRATEGY_PATH = str(Path(__file__).parent.parent.parent / "strategies" / "short_term_reversal.py")
+STRATEGY_PATH = str(Path(__file__).parent.parent.parent / "strategies" / "short_term_reversal" / "short_term_reversal.py")
 TEST_START = "2025-07-01"
 TEST_END = "2025-09-30"
 TEST_SYMBOL = "AAPL"

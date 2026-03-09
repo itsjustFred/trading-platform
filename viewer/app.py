@@ -22,8 +22,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
+import math
 import os
 import subprocess
 import sys
@@ -37,8 +37,18 @@ from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 
 from data_tools.catalog_builder import build_catalog, scan_ohlcv
-from runner.stats import compute_stats_for_result
-from shared.models import BacktestResult
+from runner.auto_agent import run_auto_agent
+from runner.stats import compute_stats, compute_stats_for_result
+from shared.models import BacktestResult, EquityPoint, PortfolioStats
+from shared.strategy_registry import (
+    DEFAULT_STRATEGIES_DIR,
+    StrategyEntry,
+    find_strategy_entry,
+    iter_strategy_entries,
+    matches_strategy_identifier,
+    read_strategy_documentation,
+    update_strategy_display_name,
+)
 from viewer.comparison import compare_backtests, compute_drawdown_pct
 
 from shared.constants import DATA_DIR, LOG_DIR
@@ -50,7 +60,7 @@ BACKTESTS_DIR = DATA_DIR / "backtests"
 REACT_DIST = Path(__file__).parent.parent / "frontend" / "dist"
 STATIC_DIR = REACT_DIST if REACT_DIST.exists() else Path(__file__).parent / "static"
 
-STRATEGIES_DIR = Path(__file__).parent.parent / "strategies"
+STRATEGIES_DIR = DEFAULT_STRATEGIES_DIR
 PORTFOLIOS_DIR = DATA_DIR / "portfolios"
 LOGS_DIR = LOG_DIR
 TASK_LOGS_DIR = LOGS_DIR / "tasks"
@@ -74,6 +84,59 @@ def _load_result(backtest_id: str) -> BacktestResult | None:
     return BacktestResult.load(str(path))
 
 
+def _strategy_entries() -> list[StrategyEntry]:
+    return iter_strategy_entries(STRATEGIES_DIR)
+
+
+def _strategy_entry(identifier: str) -> StrategyEntry | None:
+    return find_strategy_entry(identifier, STRATEGIES_DIR)
+
+
+def _strategy_path(identifier: str) -> Path | None:
+    entry = _strategy_entry(identifier)
+    if entry is not None:
+        return entry.file_path
+    candidate = (STRATEGIES_DIR / identifier).resolve()
+    return candidate if candidate.exists() else None
+
+
+def _strategy_labels(identifier: str) -> tuple[str, str, str]:
+    entry = _strategy_entry(identifier)
+    slug = entry.slug if entry is not None else (identifier or "unknown")
+    display_name = entry.display_name if entry is not None else slug
+    relative_file = entry.relative_file if entry is not None else ""
+    return slug, display_name, relative_file
+
+
+def _backtest_info_payload(result: BacktestResult) -> dict:
+    meta = result.meta
+    raw_strategy = meta.strategies[0] if meta.strategies else "unknown"
+    strategy_slug, strategy_display_name, strategy_file = _strategy_labels(raw_strategy)
+    notes = (meta.notes or "").strip()
+    return {
+        "id": meta.id,
+        "title": notes or strategy_display_name,
+        "notes": notes,
+        "strategy": raw_strategy,
+        "strategy_slug": strategy_slug,
+        "strategy_display_name": strategy_display_name,
+        "strategy_file": strategy_file,
+        "engine": meta.engine,
+        "symbols": meta.data.get("symbols", []),
+        "timeframe": {"start": meta.backtest_start, "end": meta.backtest_end},
+        "data_timeframe": meta.data.get("timeframes", ["1h"])[0]
+        if meta.data.get("timeframes")
+        else "1h",
+        "timeframes": meta.data.get("timeframes", []),
+        "initial_capital": meta.initial_capital,
+        "created_at": meta.created_at,
+        "trade_count": len(result.trades),
+        "parameters": meta.parameters,
+        "has_equity_curve": bool(result.equity_curve),
+        "has_indicators": bool(result.stats.get("indicators")),
+    }
+
+
 def _iso_to_unix(iso_str: str) -> float:
     """Convert ISO 8601 string to Unix timestamp (seconds)."""
     if not iso_str:
@@ -85,6 +148,58 @@ def _iso_to_unix(iso_str: str) -> float:
         return dt.timestamp()
     except (ValueError, TypeError):
         return 0.0
+
+
+def _normalize_equity_points(points: list[dict]) -> list[dict]:
+    normalized: list[dict] = []
+    for point in points:
+        raw_time = point.get("time")
+        unix_time = raw_time if isinstance(raw_time, (int, float)) else _iso_to_unix(str(raw_time))
+        if unix_time <= 0:
+            continue
+        equity_value = _safe_float(point.get("equity"), float("nan"))
+        if not math.isfinite(equity_value):
+            continue
+        normalized.append({"time": float(unix_time), "equity": round(equity_value, 2)})
+
+    normalized.sort(key=lambda item: item["time"])
+    collapsed: list[dict] = []
+    for point in normalized:
+        if collapsed and point["time"] == collapsed[-1]["time"]:
+            collapsed[-1] = point
+        else:
+            collapsed.append(point)
+    return collapsed
+
+
+def _equity_curve_from_trades(result: BacktestResult) -> list[dict]:
+    if not result.trades:
+        return []
+
+    initial_capital = _safe_float(result.meta.initial_capital, 0.0)
+    ordered_trades = sorted(
+        result.trades,
+        key=lambda trade: (
+            _iso_to_unix(trade.last_exit_time or trade.entry_time),
+            _iso_to_unix(trade.entry_time),
+            trade.id,
+        ),
+    )
+
+    first_trade_time = _iso_to_unix(ordered_trades[0].entry_time or ordered_trades[0].last_exit_time)
+    points: list[dict] = []
+    if first_trade_time > 0:
+        points.append({"time": first_trade_time, "equity": round(initial_capital, 2)})
+
+    running_equity = initial_capital
+    for trade in ordered_trades:
+        event_time = _iso_to_unix(trade.last_exit_time or trade.entry_time)
+        if event_time <= 0:
+            continue
+        running_equity += _safe_float(trade.pnl, 0.0)
+        points.append({"time": event_time, "equity": round(running_equity, 2)})
+
+    return _normalize_equity_points(points)
 
 
 def _trade_to_viewer(trade) -> dict:
@@ -260,116 +375,144 @@ def _equity_to_viewer(result: BacktestResult) -> list[dict]:
     """Extract equity curve as [{time, equity}] with Unix timestamps.
     If no equity_curve in JSON, compute from trades."""
     if result.equity_curve:
-        return [{"time": _iso_to_unix(e.time), "equity": e.equity} for e in result.equity_curve]
-    # Compute from trades
-    if not result.trades:
-        return []
-    capital = result.meta.initial_capital
-    curve = [{"time": _iso_to_unix(result.trades[0].entry_time), "equity": capital}]
-    running = capital
-    for t in result.trades:
-        running += t.pnl
-        curve.append(
-            {
-                "time": _iso_to_unix(t.last_exit_time),
-                "equity": round(running, 2),
-            }
+        cached_curve = _normalize_equity_points(
+            [{"time": point.time, "equity": point.equity} for point in result.equity_curve]
         )
-    return curve
+        if cached_curve:
+            return cached_curve
+    return _equity_curve_from_trades(result)
+
+
+def _safe_float(value: object, default: float = 0.0) -> float:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(numeric):
+        return default
+    return numeric
 
 
 # ─── API ──────────────────────────────────────────────────────────────────────
 
 
 def _quick_stats_and_equity(
-    trades: list, initial_capital: float, start_str: str, end_str: str
+    trades: list,
+    initial_capital: float,
+    start_str: str,
+    end_str: str,
+    equity_curve: list[dict] | None = None,
+    cached_stats: dict | None = None,
 ) -> dict:
-    """Compute lightweight stats + mini equity curve from trade list (no QuantStats needed)."""
-    if not trades:
+    """Compute lightweight list-card stats with cached-stat fallbacks when available."""
+    if not trades and not equity_curve:
         return {
             "sharpe": 0,
             "cagr": 0,
             "max_drawdown_pct": 0,
+            "net_profit": 0,
             "net_profit_pct": 0,
+            "p_value": 1.0,
+            "psr": None,
             "equity_mini": [],
         }
 
-    # Build equity curve from trades
-    equity = [initial_capital]
-    running = initial_capital
-    wins = losses = 0
-    for t in trades:
-        pnl = t.get("pnl", 0)
-        running += pnl
-        equity.append(round(running, 2))
-        if pnl > 0:
-            wins += 1
-        elif pnl < 0:
-            losses += 1
+    cached_stats = dict(cached_stats or {})
+    equity_points: list[EquityPoint] = []
+    if equity_curve:
+        try:
+            equity_points = [
+                point if isinstance(point, EquityPoint) else EquityPoint.from_dict(point)
+                for point in equity_curve
+            ]
+        except Exception as exc:
+            logger.warning("Could not parse cached equity curve: %s", exc)
+            equity_points = []
 
-    total_pnl = running - initial_capital
+    derived_stats = dict(cached_stats)
+    required_cached_keys = {
+        "total_pnl",
+        "sharpe_ratio",
+        "cagr",
+        "max_drawdown_pct",
+        "psr",
+        "p_value",
+    }
+    if equity_points and not required_cached_keys.issubset(derived_stats):
+        try:
+            derived_stats = compute_stats(
+                trades=[],
+                initial_capital=initial_capital,
+                equity_curve=equity_points,
+            )
+        except Exception as exc:
+            logger.warning("Could not compute quick stats from equity curve: %s", exc)
+            derived_stats = dict(cached_stats)
+
+    if equity_points:
+        equity = [point.equity for point in equity_points]
+        total_pnl = _safe_float(
+            derived_stats.get("total_pnl"),
+            equity[-1] - equity[0] if len(equity) > 1 else 0.0,
+        )
+    else:
+        equity = [initial_capital]
+        running = initial_capital
+        for trade in trades:
+            pnl = _safe_float(trade.get("pnl", 0))
+            running += pnl
+            equity.append(round(running, 2))
+        total_pnl = running - initial_capital
+
     net_profit_pct = round(total_pnl / initial_capital * 100, 2) if initial_capital else 0
 
-    # Max drawdown
-    peak = equity[0]
-    max_dd = 0
-    for val in equity:
-        if val > peak:
-            peak = val
-        dd = (peak - val) / peak if peak > 0 else 0
-        if dd > max_dd:
-            max_dd = dd
-    max_drawdown_pct = round(max_dd * 100, 2)
+    if "max_drawdown_pct" in derived_stats:
+        max_drawdown_pct = round(abs(_safe_float(derived_stats.get("max_drawdown_pct"))) * 100, 2)
+    else:
+        peak = equity[0]
+        max_dd = 0.0
+        for value in equity:
+            if value > peak:
+                peak = value
+            dd = (peak - value) / peak if peak > 0 else 0
+            if dd > max_dd:
+                max_dd = dd
+        max_drawdown_pct = round(max_dd * 100, 2)
 
-    # CAGR
-    cagr = 0
-    try:
-        if start_str and end_str:
-            from datetime import datetime as _dt
+    if "cagr" in derived_stats:
+        cagr = round(_safe_float(derived_stats.get("cagr")) * 100, 2)
+    else:
+        cagr = 0
+        try:
+            if start_str and end_str:
+                from datetime import datetime as _dt
 
-            s = _dt.fromisoformat(start_str.replace("Z", "+00:00"))
-            e = _dt.fromisoformat(end_str.replace("Z", "+00:00"))
-            days = (e - s).days
-            if days > 0 and initial_capital > 0 and running > 0:
-                years = days / 365.25
-                cagr = round(((running / initial_capital) ** (1 / years) - 1) * 100, 2)
-    except Exception:
-        pass
+                s = _dt.fromisoformat(start_str.replace("Z", "+00:00"))
+                e = _dt.fromisoformat(end_str.replace("Z", "+00:00"))
+                days = (e - s).days
+                final_equity = initial_capital + total_pnl
+                if days > 0 and initial_capital > 0 and final_equity > 0:
+                    years = days / 365.25
+                    cagr = round(((final_equity / initial_capital) ** (1 / years) - 1) * 100, 2)
+        except Exception:
+            pass
 
-    # Simple Sharpe approximation from trade PnLs
-    sharpe = 0
-    psr_val = None
-    pnls = [t.get("pnl", 0) for t in trades]
-    if len(pnls) > 1:
-        import statistics
+    if "sharpe_ratio" in derived_stats:
+        sharpe = round(_safe_float(derived_stats.get("sharpe_ratio")), 3)
+    else:
+        sharpe = 0
+        pnls = [_safe_float(trade.get("pnl", 0)) for trade in trades]
+        if len(pnls) > 1:
+            import statistics
 
-        mean_pnl = statistics.mean(pnls)
-        std_pnl = statistics.stdev(pnls)
-        if std_pnl > 0:
-            sharpe = round(mean_pnl / std_pnl * (252**0.5), 3)  # annualised
-            # PSR uses per-observation (non-annualized) Sharpe
-            sr_obs = mean_pnl / std_pnl
-            try:
-                from scipy.stats import norm as _norm
+            mean_pnl = statistics.mean(pnls)
+            std_pnl = statistics.stdev(pnls)
+            if std_pnl > 0:
+                sharpe = round(mean_pnl / std_pnl * (252**0.5), 3)
 
-                n = len(pnls)
-                if n >= 10 and sr_obs != 0:
-                    m = mean_pnl
-                    m2 = sum((p - m) ** 2 for p in pnls) / n
-                    m3 = sum((p - m) ** 3 for p in pnls) / n
-                    m4 = sum((p - m) ** 4 for p in pnls) / n
-                    s = m2**0.5 if m2 > 0 else 0
-                    if s > 0:
-                        skew = m3 / s**3
-                        kurt = m4 / s**4
-                        denom = 1 - skew * sr_obs + ((kurt - 1) / 4) * sr_obs**2
-                        if denom > 0:
-                            z = sr_obs * (n - 1) ** 0.5 / denom**0.5
-                            psr_val = round(float(_norm.cdf(z)), 4)
-            except Exception:
-                pass
+    psr_val = derived_stats.get("psr")
+    p_value = round(_safe_float(derived_stats.get("p_value"), 1.0), 6)
 
-    # Downsample equity to ~50 points for sparkline
     n = len(equity)
     if n <= 50:
         equity_mini = equity
@@ -382,8 +525,10 @@ def _quick_stats_and_equity(
         "sharpe": sharpe,
         "cagr": cagr,
         "max_drawdown_pct": max_drawdown_pct,
+        "net_profit": round(total_pnl, 2),
         "net_profit_pct": net_profit_pct,
         "psr": psr_val,
+        "p_value": p_value,
         "equity_mini": equity_mini,
     }
 
@@ -402,13 +547,28 @@ def list_backtests():
                 start = meta.get("backtest_start", "")
                 end = meta.get("backtest_end", "")
 
-                quick = _quick_stats_and_equity(trades, initial_capital, start, end)
+                quick = _quick_stats_and_equity(
+                    trades,
+                    initial_capital,
+                    start,
+                    end,
+                    equity_curve=data.get("equity_curve", []),
+                    cached_stats=data.get("stats", {}),
+                )
+                raw_strategy = (meta.get("strategies") or ["unknown"])[0]
+                strategy_slug, strategy_display_name, strategy_file = _strategy_labels(raw_strategy)
+                notes = str(meta.get("notes", "") or "").strip()
 
                 results.append(
                     {
                         "id": f.stem.replace(".trades", ""),
                         "filename": f.name,
-                        "strategy": (meta.get("strategies") or ["unknown"])[0],
+                        "title": notes or strategy_display_name,
+                        "notes": notes,
+                        "strategy": raw_strategy,
+                        "strategy_slug": strategy_slug,
+                        "strategy_display_name": strategy_display_name,
+                        "strategy_file": strategy_file,
                         "engine": meta.get("engine", "unknown"),
                         "symbols": meta.get("data", {}).get("symbols", []),
                         "timeframes": meta.get("data", {}).get("timeframes", []),
@@ -419,8 +579,10 @@ def list_backtests():
                         "sharpe": quick["sharpe"],
                         "cagr": quick["cagr"],
                         "max_drawdown_pct": quick["max_drawdown_pct"],
+                        "net_profit": quick["net_profit"],
                         "net_profit_pct": quick["net_profit_pct"],
                         "psr": quick.get("psr"),
+                        "p_value": quick.get("p_value", 1.0),
                         "equity_mini": quick["equity_mini"],
                     }
                 )
@@ -441,32 +603,34 @@ def get_backtest(backtest_id: str):
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/backtests/<backtest_id>", methods=["PATCH"])
+def rename_backtest(backtest_id: str):
+    """Update the display title stored in meta.notes for a backtest."""
+    path = BACKTESTS_DIR / f"{backtest_id}.trades.json"
+    if not path.exists():
+        return jsonify({"error": f"Backtest '{backtest_id}' not found"}), 404
+
+    data = request.get_json()
+    if not isinstance(data, dict) or "name" not in data:
+        return jsonify({"error": "JSON body with 'name' is required"}), 400
+
+    updated_name = str(data.get("name", "") or "").strip()
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload.setdefault("meta", {})
+    payload["meta"]["notes"] = updated_name
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    result = BacktestResult.load(path)
+    return jsonify(_backtest_info_payload(result))
+
+
 @app.route("/api/backtest/<backtest_id>/info")
 def get_backtest_info(backtest_id: str):
     """Metadata for topbar display."""
     result = _load_result(backtest_id)
     if result is None:
         return jsonify({"error": "Not found"}), 404
-    m = result.meta
-    return jsonify(
-        {
-            "id": m.id,
-            "strategy": m.strategies[0] if m.strategies else "unknown",
-            "engine": m.engine,
-            "symbols": m.data.get("symbols", []),
-            "timeframe": {"start": m.backtest_start, "end": m.backtest_end},
-            "data_timeframe": m.data.get("timeframes", ["1h"])[0]
-            if m.data.get("timeframes")
-            else "1h",
-            "timeframes": m.data.get("timeframes", []),
-            "initial_capital": m.initial_capital,
-            "created_at": m.created_at,
-            "trade_count": len(result.trades),
-            "parameters": m.parameters,
-            "has_equity_curve": bool(result.equity_curve),
-            "has_indicators": bool(result.stats.get("indicators")),
-        }
-    )
+    return jsonify(_backtest_info_payload(result))
 
 
 @app.route("/api/backtest/<backtest_id>/stats")
@@ -514,8 +678,9 @@ def get_backtest_stats(backtest_id: str):
         stats["expectancy"] = round(
             wr * raw.get("avg_winner", 0) + (1 - wr) * raw.get("avg_loser", 0), 2
         )
-        # PSR
+        # PSR / p-value
         stats["psr"] = raw.get("psr")
+        stats["p_value"] = raw.get("p_value", 1.0)
         return jsonify(stats)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -533,11 +698,11 @@ def get_backtest_trades(backtest_id: str):
 
 def _detect_indicators(strategy_file: str) -> list[dict]:
     """Detect indicators used by a strategy from source code with basic parameter extraction."""
-    path = STRATEGIES_DIR / strategy_file
-    if not path.exists():
+    path = _strategy_path(strategy_file)
+    if path is None or not path.exists():
         return []
     try:
-        source = path.read_text()
+        source = path.read_text(encoding="utf-8")
     except Exception:
         return []
 
@@ -780,27 +945,8 @@ def get_trade_with_context(backtest_id: str, trade_nr: int):
 
     if not indicators and ohlcv and df is not None:
         # Detect indicators from strategy source and compute them
-        strategy_file = result.meta.strategies[0] if result.meta.strategies else ""
-        # Map strategy name to file
-        for sf in STRATEGIES_DIR.glob("*.py"):
-            try:
-                src = sf.read_text()
-                if f'"name": "{strategy_file}"' in src or f"'name': '{strategy_file}'" in src:
-                    strategy_file = sf.name
-                    break
-            except Exception:
-                pass
-        # Also try matching by backtest ID pattern
-        if not strategy_file.endswith(".py"):
-            for sf in STRATEGIES_DIR.glob("*.py"):
-                if (
-                    sf.stem.replace("_", "")
-                    in backtest_id.replace("_", "").replace("-", "").lower()
-                ):
-                    strategy_file = sf.name
-                    break
-
-        detected = _detect_indicators(strategy_file)
+        strategy_identifier = result.meta.strategies[0] if result.meta.strategies else ""
+        detected = _detect_indicators(strategy_identifier)
         if detected:
             ohlcv_times = [r["time"] for r in ohlcv]
             # Use broader slice for indicator warmup (extra 50 bars before)
@@ -906,6 +1052,96 @@ def compare_backtests_endpoint():
 # ─── Strategy Endpoints ──────────────────────────────────────────────────────
 
 
+def _strategy_backtests(entry: StrategyEntry) -> list[dict]:
+    backtests: list[dict] = []
+    if not BACKTESTS_DIR.exists():
+        return backtests
+
+    for bt_file in sorted(BACKTESTS_DIR.glob("*.trades.json")):
+        try:
+            bt_data = json.loads(bt_file.read_text(encoding="utf-8"))
+            bt_meta = bt_data.get("meta", {})
+            bt_strategies = bt_meta.get("strategies", [])
+            if not any(matches_strategy_identifier(entry, strategy_name) for strategy_name in bt_strategies):
+                continue
+
+            trades = bt_data.get("trades", [])
+            total_pnl = sum(t.get("pnl", 0) for t in trades)
+            wins = sum(1 for t in trades if t.get("pnl", 0) > 0)
+            notes = str(bt_meta.get("notes", "") or "").strip()
+            raw_strategy = bt_strategies[0] if bt_strategies else entry.slug
+            strategy_slug, strategy_display_name, _ = _strategy_labels(raw_strategy)
+            backtests.append(
+                {
+                    "id": bt_file.stem.replace(".trades", ""),
+                    "title": notes or strategy_display_name,
+                    "notes": notes,
+                    "strategy_slug": strategy_slug,
+                    "engine": bt_meta.get("engine", ""),
+                    "symbols": bt_meta.get("data", {}).get("symbols", []),
+                    "timeframes": bt_meta.get("data", {}).get("timeframes", []),
+                    "backtest_start": bt_meta.get("backtest_start", ""),
+                    "backtest_end": bt_meta.get("backtest_end", ""),
+                    "trade_count": len(trades),
+                    "total_pnl": round(total_pnl, 2),
+                    "win_rate": round(wins / len(trades) * 100, 1) if trades else 0,
+                    "created_at": bt_meta.get("created_at", ""),
+                }
+            )
+        except Exception:
+            pass
+    return backtests
+
+
+def _strategy_portfolios(entry: StrategyEntry) -> list[dict]:
+    portfolios: list[dict] = []
+    if not PORTFOLIOS_DIR.exists():
+        return portfolios
+
+    for pf_file in PORTFOLIOS_DIR.glob("*.json"):
+        try:
+            pf_data = json.loads(pf_file.read_text(encoding="utf-8"))
+            strategies = pf_data.get("strategies", [])
+            if not any(
+                matches_strategy_identifier(entry, str(strategy.get("strategy_name", "")))
+                for strategy in strategies
+            ):
+                continue
+            portfolios.append(
+                {
+                    "id": pf_data.get("id", pf_file.stem),
+                    "name": pf_data.get("name", ""),
+                }
+            )
+        except Exception:
+            pass
+    return portfolios
+
+
+def _strategy_payload(entry: StrategyEntry) -> dict:
+    tags = entry.meta.get("tags", {})
+    backtests = _strategy_backtests(entry)
+    return {
+        "slug": entry.slug,
+        "name": entry.display_name,
+        "version": entry.meta.get("version", "1.0.0"),
+        "file": entry.relative_file,
+        "created_at": entry.created_at,
+        "tags": tags,
+        "type": tags.get("type", []),
+        "source": tags.get("source", ""),
+        "link": tags.get("link", ""),
+        "asset_class": tags.get("asset_class", []),
+        "complexity": tags.get("complexity", ""),
+        "engine": entry.engine,
+        "backtest_count": len(backtests),
+        "best_sharpe": None,
+        "documentation_markdown": read_strategy_documentation(entry),
+        "backtests": backtests,
+        "portfolios": _strategy_portfolios(entry),
+    }
+
+
 @app.route("/api/strategies")
 def list_strategies():
     """List all strategies by scanning strategy files for STRATEGY_META."""
@@ -913,143 +1149,48 @@ def list_strategies():
     if not STRATEGIES_DIR.exists():
         return jsonify(strategies)
 
-    for f in sorted(STRATEGIES_DIR.glob("*.py")):
-        if f.name.startswith("__"):
-            continue
+    for entry in _strategy_entries():
         try:
-            spec = importlib.util.spec_from_file_location("strat", str(f))
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-            meta = getattr(mod, "STRATEGY_META", None)
-            if meta is None:
-                continue
-
-            # Find backtests using this strategy
-            strat_name = meta.get("name", f.stem)
-            bt_count = 0
-            best_sharpe = None
-            if BACKTESTS_DIR.exists():
-                for bt_file in BACKTESTS_DIR.glob("*.trades.json"):
-                    try:
-                        bt_data = json.loads(bt_file.read_text())
-                        bt_meta = bt_data.get("meta", {})
-                        bt_strats = bt_meta.get("strategies", [])
-                        if strat_name in bt_strats:
-                            bt_count += 1
-                    except Exception:
-                        pass
-
-            tags = meta.get("tags", {})
-            strategies.append(
-                {
-                    "name": strat_name,
-                    "version": meta.get("version", "1.0.0"),
-                    "file": f.name,
-                    "tags": tags,
-                    "type": tags.get("type", []),
-                    "source": tags.get("source", ""),
-                    "asset_class": tags.get("asset_class", []),
-                    "complexity": tags.get("complexity", ""),
-                    "engine": "pynecore" if f.name.startswith("pynecore_") else "vectorbt",
-                    "backtest_count": bt_count,
-                    "best_sharpe": best_sharpe,
-                }
-            )
+            payload = _strategy_payload(entry)
+            payload.pop("documentation_markdown", None)
+            payload.pop("backtests", None)
+            payload.pop("portfolios", None)
+            strategies.append(payload)
         except Exception as e:
-            logger.warning("Could not load strategy %s: %s", f.name, e)
+            logger.warning("Could not load strategy %s: %s", entry.relative_file, e)
 
     return jsonify(strategies)
 
 
-@app.route("/api/strategies/<name>")
+@app.route("/api/strategies/<name>", methods=["GET"])
 def get_strategy(name: str):
     """Strategy details + all backtests and portfolios using it."""
-    # Find strategy file
-    strat_file = None
-    strat_meta = None
-    for f in STRATEGIES_DIR.glob("*.py"):
-        if f.name.startswith("__"):
-            continue
-        try:
-            spec = importlib.util.spec_from_file_location("strat", str(f))
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-            meta = getattr(mod, "STRATEGY_META", None)
-            if meta and meta.get("name") == name:
-                strat_file = f
-                strat_meta = meta
-                break
-        except Exception:
-            continue
+    entry = _strategy_entry(name)
+    if entry is None:
+        return jsonify({"error": f"Strategy '{name}' not found"}), 404
+    return jsonify(_strategy_payload(entry))
 
-    if strat_meta is None:
+
+@app.route("/api/strategies/<name>", methods=["PATCH"])
+def rename_strategy(name: str):
+    """Rename the display name in STRATEGY_META for a strategy."""
+    entry = _strategy_entry(name)
+    if entry is None:
         return jsonify({"error": f"Strategy '{name}' not found"}), 404
 
-    # Find related backtests
-    backtests = []
-    if BACKTESTS_DIR.exists():
-        for bt_file in sorted(BACKTESTS_DIR.glob("*.trades.json")):
-            try:
-                bt_data = json.loads(bt_file.read_text())
-                bt_meta = bt_data.get("meta", {})
-                if name in bt_meta.get("strategies", []):
-                    bt_id = bt_file.stem.replace(".trades", "")
-                    trades = bt_data.get("trades", [])
-                    total_pnl = sum(t.get("pnl", 0) for t in trades)
-                    wins = sum(1 for t in trades if t.get("pnl", 0) > 0)
-                    backtests.append(
-                        {
-                            "id": bt_id,
-                            "engine": bt_meta.get("engine", ""),
-                            "symbols": bt_meta.get("data", {}).get("symbols", []),
-                            "timeframes": bt_meta.get("data", {}).get("timeframes", []),
-                            "backtest_start": bt_meta.get("backtest_start", ""),
-                            "backtest_end": bt_meta.get("backtest_end", ""),
-                            "trade_count": len(trades),
-                            "total_pnl": round(total_pnl, 2),
-                            "win_rate": round(wins / len(trades) * 100, 1) if trades else 0,
-                            "created_at": bt_meta.get("created_at", ""),
-                        }
-                    )
-            except Exception:
-                pass
+    data = request.get_json()
+    if not isinstance(data, dict) or "name" not in data:
+        return jsonify({"error": "JSON body with 'name' is required"}), 400
 
-    # Find related portfolios
-    portfolios = []
-    if PORTFOLIOS_DIR.exists():
-        for pf_file in PORTFOLIOS_DIR.glob("*.json"):
-            try:
-                pf_data = json.loads(pf_file.read_text())
-                pf_strats = [s.get("strategy_name", "") for s in pf_data.get("strategies", [])]
-                if name in pf_strats:
-                    portfolios.append(
-                        {
-                            "id": pf_data.get("id", pf_file.stem),
-                            "name": pf_data.get("name", ""),
-                        }
-                    )
-            except Exception:
-                pass
+    updated_name = str(data.get("name", "") or "").strip()
+    if not updated_name:
+        return jsonify({"error": "Strategy name cannot be empty"}), 400
 
-    tags = strat_meta.get("tags", {})
-    return jsonify(
-        {
-            "name": name,
-            "version": strat_meta.get("version", "1.0.0"),
-            "file": strat_file.name if strat_file else "",
-            "tags": tags,
-            "type": tags.get("type", []),
-            "source": tags.get("source", ""),
-            "link": tags.get("link", ""),
-            "asset_class": tags.get("asset_class", []),
-            "complexity": tags.get("complexity", ""),
-            "engine": "pynecore"
-            if (strat_file and strat_file.name.startswith("pynecore_"))
-            else "vectorbt",
-            "backtests": backtests,
-            "portfolios": portfolios,
-        }
-    )
+    update_strategy_display_name(entry.file_path, updated_name, STRATEGIES_DIR)
+    refreshed = _strategy_entry(entry.slug)
+    if refreshed is None:
+        return jsonify({"error": f"Strategy '{name}' could not be reloaded"}), 500
+    return jsonify(_strategy_payload(refreshed))
 
 
 # ─── Dolthub Auto-Pull ────────────────────────────────────────────────────────
@@ -1106,6 +1247,9 @@ def run_backtest():
 
     if not strategy or not symbols:
         return jsonify({"error": "strategy and symbols required"}), 400
+    strategy_path = _strategy_path(strategy)
+    if strategy_path is None:
+        return jsonify({"error": f"Strategy '{strategy}' not found"}), 404
 
     job_id = str(uuid.uuid4())[:8]
     _running_jobs[job_id] = {"status": "running", "result": None, "error": None}
@@ -1120,7 +1264,7 @@ def run_backtest():
                 "--engine",
                 engine,
                 "--strategy",
-                f"strategies/{strategy}",
+                str(strategy_path),
                 "--symbols",
                 *symbols,
                 "--timeframe",
@@ -1186,7 +1330,7 @@ def list_portfolios():
     for f in sorted(PORTFOLIOS_DIR.glob("*.json")):
         try:
             data = json.loads(f.read_text())
-            cs = data.get("combined_stats", {})
+            cs = PortfolioStats.from_dict(data.get("combined_stats", {})).to_dict()
 
             # Build mini equity from combined_equity
             equity_full = data.get("combined_equity", [])
@@ -1219,6 +1363,8 @@ def list_portfolios():
                     "max_drawdown_pct": round(abs(md_raw) * 100, 2),  # decimal → percent (positive)
                     "net_profit": round(net_profit, 2),
                     "net_profit_pct": round(net_profit / capital * 100, 2) if capital else 0,
+                    "psr": cs.get("psr"),
+                    "p_value": round(_safe_float(cs.get("p_value"), 1.0), 6),
                     "equity_mini": equity_mini,
                     "created_at": data.get("created_at", ""),
                 }
@@ -1245,6 +1391,7 @@ def create_portfolio():
     # Load all trades from referenced backtests
     strategy_returns = []
     strategy_info = []
+    all_trades_timed = []
 
     import pandas as pd
 
@@ -1257,6 +1404,7 @@ def create_portfolio():
 
         # If no backtest_id but strategy name given, find latest backtest
         if not bt_id and strat_name_input and BACKTESTS_DIR.exists():
+            strategy_match = _strategy_entry(strat_name_input)
             norm_input = strat_name_input.lower().replace("_", " ").replace("-", " ")
             candidates = []
             for f in BACKTESTS_DIR.glob("*.trades.json"):
@@ -1264,10 +1412,16 @@ def create_portfolio():
                     d = json.loads(f.read_text())
                     m = d.get("meta", {})
                     strategies = m.get("strategies", [])
-                    if any(
+                    matches_input = any(
                         s.lower().replace("_", " ").replace("-", " ") == norm_input
                         for s in strategies
-                    ):
+                    )
+                    if strategy_match is not None:
+                        matches_input = any(
+                            matches_strategy_identifier(strategy_match, strategy_name)
+                            for strategy_name in strategies
+                        )
+                    if matches_input:
                         candidates.append((m.get("created_at", ""), f.stem.replace(".trades", "")))
                 except Exception:
                     pass
@@ -1309,12 +1463,27 @@ def create_portfolio():
         weighted_rets.name = strat_name
         strategy_returns.append(weighted_rets)
 
+        for trade in result.trades:
+            all_trades_timed.append(
+                {
+                    "time": trade.last_exit_time,
+                    "pnl": round(trade.pnl * risk_factor, 2),
+                    "strategy": strat_name,
+                    "symbol": trade.symbol,
+                    "direction": trade.direction,
+                }
+            )
+
     if not strategy_returns:
         return jsonify({"error": "No valid strategies found"}), 400
 
     # Combine returns
     combined_df = pd.concat(strategy_returns, axis=1).fillna(0.0)
     portfolio_daily_rets = combined_df.sum(axis=1)
+    if len(combined_df.columns) > 1:
+        corr_matrix = combined_df.corr().round(4).fillna(0.0).to_dict()
+    else:
+        corr_matrix = {column: {column: 1.0} for column in combined_df.columns}
 
     # Reconstruct equity curve
     current_equity = account_capital
@@ -1326,9 +1495,6 @@ def create_portfolio():
         current_equity *= 1 + ret
         combined_equity_points.append(EquityPoint(time=ts.isoformat(), equity=current_equity))
 
-    # Compute stats
-    from runner.stats import compute_stats
-
     stats_result = compute_stats(
         trades=[], initial_capital=account_capital, equity_curve=combined_equity_points
     )
@@ -1339,17 +1505,6 @@ def create_portfolio():
 
     # Calculate individual cumulative returns for contribution
     for col in combined_df.columns:
-        # This is an approximation of contribution to PnL
-        # PnL contribution ~= Sum(Daily_Ret) * Capital? No, compounding makes it complex.
-        # Simple attribution: Sum of daily returns relative to total sum of daily returns?
-        # Or: Re-run equity curve for just this strategy?
-        # Let's use simple cumulative sum of returns as proxy for "Effort"
-        cum_ret = combined_df[col].sum()
-        # But we need dollar contribution.
-        # Let's roughly estimate:
-        # We can't easily decouple PnL in a compounded portfolio without running them individually.
-        # But we CAN run them individually with the risk factor!
-
         # Run isolated equity for this strategy
         s_eq = account_capital
         for r in combined_df[col]:
@@ -1376,6 +1531,8 @@ def create_portfolio():
 
     now = datetime.now(timezone.utc)
     portfolio_id = f"{name.lower().replace(' ', '-')}-{now.strftime('%Y%m%d%H%M%S')}"
+    combined_equity = [point.to_dict() for point in combined_equity_points]
+    all_trades_timed.sort(key=lambda trade: trade.get("time", ""))
 
     portfolio = {
         "id": portfolio_id,
@@ -1383,20 +1540,21 @@ def create_portfolio():
         "created_at": now.isoformat(),
         "account_capital": account_capital,
         "strategies": strategy_info,
-        "combined_stats": {
-            "sharpe": stats_result.get("sharpe_ratio", 0),
-            "sortino": stats_result.get("sortino_ratio", 0),
-            "cagr": stats_result.get("cagr", 0),
-            "max_drawdown": stats_result.get("max_drawdown_pct", 0),
-            "net_profit": stats_result.get("total_pnl", 0),
-            "win_rate": stats_result.get("win_rate", 0),
-            "profit_factor": stats_result.get("profit_factor", 0),
-            "correlation_matrix": corr_matrix,
-            # Add other useful stats
-            "calmar": stats_result.get("calmar_ratio", 0),
-            "total_return": stats_result.get("total_return", 0),
-            "max_drawdown_duration": stats_result.get("max_drawdown_duration", 0),
-        },
+        "combined_stats": PortfolioStats(
+            sharpe=stats_result.get("sharpe_ratio", 0),
+            sortino=stats_result.get("sortino_ratio", 0),
+            cagr=stats_result.get("cagr", 0),
+            max_drawdown=stats_result.get("max_drawdown_pct", 0),
+            net_profit=stats_result.get("total_pnl", 0),
+            win_rate=stats_result.get("win_rate", 0),
+            profit_factor=stats_result.get("profit_factor", 0),
+            calmar=stats_result.get("calmar_ratio", 0),
+            total_return=stats_result.get("total_return", 0),
+            max_drawdown_duration=stats_result.get("max_drawdown_duration", 0),
+            psr=stats_result.get("psr"),
+            p_value=stats_result.get("p_value", 1.0),
+            correlation_matrix=corr_matrix,
+        ).to_dict(),
         "combined_equity": combined_equity,
         "strategy_contributions": contributions,
         "trades": all_trades_timed,
@@ -1415,7 +1573,9 @@ def get_portfolio(portfolio_id: str):
     path = PORTFOLIOS_DIR / f"{portfolio_id}.json"
     if not path.exists():
         return jsonify({"error": "Portfolio not found"}), 404
-    return jsonify(json.loads(path.read_text()))
+    payload = json.loads(path.read_text())
+    payload["combined_stats"] = PortfolioStats.from_dict(payload.get("combined_stats", {})).to_dict()
+    return jsonify(payload)
 
 
 @app.route("/api/portfolios/<portfolio_id>", methods=["DELETE"])
@@ -1881,6 +2041,7 @@ def _write_task_log_line(
     *,
     stream: str,
     log_level: str = "info",
+    source: str = "data-task",
 ) -> None:
     if not message.endswith("\n"):
         message = f"{message}\n"
@@ -1894,7 +2055,7 @@ def _write_task_log_line(
     log_method = getattr(logger, log_level, logger.info)
     log_method(
         text,
-        extra={"data": {"task_id": task_id, "stream": stream, "source": "data-task"}},
+        extra={"data": {"task_id": task_id, "stream": stream, "source": source}},
     )
 
 
@@ -1980,6 +2141,79 @@ def _start_data_task(task_id: str, cmd: list[str], *, total_items: int = 0) -> d
             )
 
     thread = threading.Thread(target=run_proc, daemon=True)
+    thread.start()
+    return {"task_id": task_id, "status": "starting"}
+
+
+def _start_agent_task(task_id: str, payload: dict) -> dict:
+    """Launch the autonomous conversion agent inside a streamed background thread."""
+    TASK_LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    log_file = _task_log_path(task_id)
+    DATA_TASKS[task_id] = {
+        "status": "starting",
+        "log_file": str(log_file),
+        "kind": "agent",
+    }
+
+    def run_agent() -> None:
+        started_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            with log_file.open("a", encoding="utf-8", buffering=1) as handle:
+                _write_task_log_line(
+                    handle,
+                    task_id,
+                    f"[{started_at}] Starting strategy conversion agent.",
+                    stream="task",
+                    source="agent-task",
+                )
+                DATA_TASKS[task_id].update({"status": "running"})
+
+                def task_log(message: str, *, stream: str = "task", level: str = "info") -> None:
+                    _write_task_log_line(
+                        handle,
+                        task_id,
+                        message,
+                        stream=stream,
+                        log_level=level,
+                        source="agent-task",
+                    )
+
+                result = run_auto_agent(
+                    payload["code"],
+                    strategy_name=payload.get("strategy_name"),
+                    requested_engine=payload.get("engine"),
+                    symbols=payload.get("symbols"),
+                    timeframe=payload.get("timeframe"),
+                    start=payload.get("start"),
+                    end=payload.get("end"),
+                    capital=_safe_float(payload.get("capital"), 100000.0),
+                    log=task_log,
+                )
+                DATA_TASKS[task_id].update(
+                    {"status": "completed", "returncode": 0, "result": result}
+                )
+                _write_task_log_line(
+                    handle,
+                    task_id,
+                    f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}] "
+                    "Strategy conversion completed successfully.",
+                    stream="task",
+                    source="agent-task",
+                )
+        except Exception as exc:
+            DATA_TASKS[task_id].update({"status": "failed", "error": str(exc), "returncode": 1})
+            _append_task_log(
+                log_file,
+                f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}] "
+                f"Strategy conversion failed: {exc}\n",
+            )
+            logger.error(
+                "Strategy conversion failed: %s",
+                exc,
+                extra={"data": {"task_id": task_id, "stream": "task", "source": "agent-task"}},
+            )
+
+    thread = threading.Thread(target=run_agent, daemon=True)
     thread.start()
     return {"task_id": task_id, "status": "starting"}
 
@@ -2234,6 +2468,35 @@ def data_download():
     # Count total items for progress tracking
     total_items = max(len(sym_list) * len(tf_list), 1)
     return jsonify(_start_data_task(task_id, cmd, total_items=total_items))
+
+
+@app.route("/api/agent/convert", methods=["POST"])
+def agent_convert():
+    """Start the autonomous strategy conversion worker."""
+    data = request.get_json() or {}
+    code = data.get("code", "")
+    if not isinstance(code, str) or not code.strip():
+        return jsonify({"error": "A non-empty 'code' field is required"}), 400
+
+    payload = {
+        "code": code,
+        "strategy_name": str(data.get("strategy_name", "")).strip() or None,
+        "engine": str(data.get("engine", "")).strip().lower() or None,
+        "symbols": [
+            str(symbol).strip().upper()
+            for symbol in data.get("symbols", [])
+            if str(symbol).strip()
+        ]
+        if isinstance(data.get("symbols"), list)
+        else None,
+        "timeframe": str(data.get("timeframe", "")).strip().lower() or None,
+        "start": str(data.get("start", "")).strip() or None,
+        "end": str(data.get("end", "")).strip() or None,
+        "capital": data.get("capital", 100000.0),
+    }
+
+    task_id = str(uuid.uuid4())
+    return jsonify(_start_agent_task(task_id, payload))
 
 
 @app.route("/api/data/dukascopy/genesis")

@@ -10,12 +10,13 @@ from runner.engines.base import BacktestConfig
 from runner.engines.pynecore_adapter import _enrich_trades_with_context, _normalize_trade_context
 from runner.engines.vectorbt_adapter import VectorbtAdapter
 from shared.models import Trade, TradeExit
+from shared.strategy_registry import DEFAULT_STRATEGIES_DIR, iter_strategy_files
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-STRATEGIES_DIR = REPO_ROOT / "strategies"
+STRATEGIES_DIR = DEFAULT_STRATEGIES_DIR
 
 
 
@@ -112,8 +113,8 @@ def generate_signals(df: pd.DataFrame, params: dict):
 def test_all_vectorbt_strategies_return_entries_exits_and_indicators_dict():
     df = _make_price_df()
 
-    for strategy_path in sorted(STRATEGIES_DIR.glob("*.py")):
-        if strategy_path.name == "__init__.py" or strategy_path.name.startswith("pynecore_"):
+    for strategy_path in iter_strategy_files(STRATEGIES_DIR):
+        if strategy_path.name.startswith("pynecore_"):
             continue
 
         module = _load_module(strategy_path)

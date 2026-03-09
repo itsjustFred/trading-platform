@@ -10,13 +10,14 @@ import { FilterBar } from "../components/FilterBar";
 import { Modal } from "../components/Modal";
 import { Plus, Trash2 } from "lucide-react";
 import { Sparkline } from "../components/Sparkline";
+import { formatPValue, metricValue, pValueColor, pValueMetric } from "../utils/stats";
 
 export function PortfoliosPage() {
   const navigate = useNavigate();
   const [portfolios, setPortfolios] = useState<any[]>([]);
   const [strategies, setStrategies] = useState<any[]>([]);
   const [search, setSearch] = useState("");
-  const [sortBy, setSortBy] = useState("created_at");
+  const [sortBy, setSortBy] = useState("sharpe");
   const [loading, setLoading] = useState(true);
   const [showCreate, setShowCreate] = useState(false);
 
@@ -52,8 +53,18 @@ export function PortfoliosPage() {
       );
     });
     result.sort((a, b) => {
-      if (sortBy === "name") return (a.name || "").localeCompare(b.name || "");
-      return (b.created_at || "").localeCompare(a.created_at || "");
+      switch (sortBy) {
+        case "psr":
+          return metricValue(b.psr) - metricValue(a.psr);
+        case "cagr":
+          return metricValue(b.cagr) - metricValue(a.cagr);
+        case "p_value":
+          return pValueMetric(a.p_value) - pValueMetric(b.p_value);
+        case "net_profit":
+          return metricValue(b.net_profit) - metricValue(a.net_profit);
+        default:
+          return metricValue(b.sharpe) - metricValue(a.sharpe);
+      }
     });
     return result;
   }, [portfolios, search, sortBy]);
@@ -155,8 +166,11 @@ export function PortfoliosPage() {
         onSearchChange={setSearch}
         searchPlaceholder="Search portfolios..."
         sortOptions={[
-          { label: "Newest first", value: "created_at" },
-          { label: "Name A-Z", value: "name" },
+          { label: "Sharpe Ratio (High to Low)", value: "sharpe" },
+          { label: "PSR (High to Low)", value: "psr" },
+          { label: "CAGR (High to Low)", value: "cagr" },
+          { label: "P-Value (Low to High)", value: "p_value" },
+          { label: "Net Profit (High to Low)", value: "net_profit" },
         ]}
         sortValue={sortBy}
         onSortChange={setSortBy}
@@ -297,6 +311,29 @@ export function PortfoliosPage() {
                     </b>
                   </span>
                 )}
+                {p.psr != null && (
+                  <span>
+                    PSR{" "}
+                    <b
+                      style={{
+                        color:
+                          Number(p.psr) > 0.95
+                            ? "#3fb950"
+                            : Number(p.psr) > 0.5
+                              ? "#d29922"
+                              : "#f85149",
+                      }}
+                    >
+                      {(Number(p.psr) * 100).toFixed(0)}%
+                    </b>
+                  </span>
+                )}
+                <span>
+                  P-Value{" "}
+                  <b style={{ color: pValueColor(p.p_value) }}>
+                    {formatPValue(p.p_value)}
+                  </b>
+                </span>
               </div>
             </div>
           ))}

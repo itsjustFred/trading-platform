@@ -1,4 +1,5 @@
 import type {
+  AgentConvertRequest,
   DataCategoryResponse,
   DataDownloadRequest,
   DataOverviewResponse,
@@ -31,6 +32,11 @@ export const getStrategy = (name: string) =>
   fetchJSON<any>(`/strategies/${encodeURIComponent(name)}`);
 export const getStrategyDetail = (name: string) =>
   fetchJSON<any>(`/strategies/${encodeURIComponent(name)}`);
+export const renameStrategy = (name: string, displayName: string) =>
+  fetchJSON<any>(`/strategies/${encodeURIComponent(name)}`, {
+    method: "PATCH",
+    body: JSON.stringify({ name: displayName }),
+  });
 
 // Backtests
 export const getBacktests = () => fetchJSON<any[]>("/backtests");
@@ -46,6 +52,11 @@ export const getBacktestEquity = (id: string) =>
   fetchJSON<any>(`/backtest/${id}/equity`);
 export const getBacktestOHLCV = (id: string) =>
   fetchJSON<any>(`/backtest/${id}/ohlcv`);
+export const renameBacktest = (id: string, title: string) =>
+  fetchJSON<any>(`/backtests/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    body: JSON.stringify({ name: title }),
+  });
 export const compareBacktests = (ids: string[]) =>
   fetchJSON<any>(`/compare?ids=${ids.join(",")}`);
 
@@ -149,6 +160,11 @@ export const downloadData = (data: DataDownloadRequest) =>
   });
 export const resampleData = (data: DataResampleRequest) =>
   fetchJSON<DataTaskStartResponse>("/data/resample", {
+    method: "POST",
+    body: JSON.stringify(data),
+  });
+export const startAgentConvert = (data: AgentConvertRequest) =>
+  fetchJSON<DataTaskStartResponse>("/agent/convert", {
     method: "POST",
     body: JSON.stringify(data),
   });

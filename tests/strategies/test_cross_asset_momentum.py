@@ -20,7 +20,7 @@ from runner.engines.base import BacktestConfig
 from runner.engines.vectorbt_adapter import VectorbtAdapter
 
 
-STRATEGY_PATH = str(Path(__file__).parent.parent.parent / "strategies" / "cross_asset_momentum.py")
+STRATEGY_PATH = str(Path(__file__).parent.parent.parent / "strategies" / "cross_asset_momentum" / "cross_asset_momentum.py")
 TEST_START = "2024-01-01"
 TEST_END = "2025-12-31"
 TEST_SYMBOL = "AAPL"

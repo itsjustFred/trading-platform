@@ -10,7 +10,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from shared.models import BacktestMeta, BacktestResult, Trade, TradeExit
+from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, TradeExit
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -468,6 +468,317 @@ def test_start_data_task_writes_task_logs_and_refreshes_catalog(viewer_client, m
     assert refresh_calls == ["refreshed"]
     assert any("stdout line" in line for line in routed_logs)
     assert any("stderr line" in line for line in routed_logs)
+
+
+def _equity_curve_from_returns(
+    returns: list[float],
+    *,
+    initial_capital: float = 100000.0,
+    start: str = "2024-01-01T00:00:00+00:00",
+) -> list[EquityPoint]:
+    start_ts = pd.Timestamp(start)
+    points = [EquityPoint(time=start_ts.isoformat(), equity=initial_capital)]
+    equity = initial_capital
+    for offset, daily_return in enumerate(returns, start=1):
+        equity *= 1 + daily_return
+        points.append(
+            EquityPoint(
+                time=(start_ts + pd.Timedelta(days=offset)).isoformat(),
+                equity=equity,
+            )
+        )
+    return points
+
+
+def test_backtest_stats_endpoint_includes_p_value(viewer_client, tmp_path):
+    backtests_dir = tmp_path / "backtests"
+    backtests_dir.mkdir(parents=True, exist_ok=True)
+
+    result = BacktestResult(
+        meta=BacktestMeta(
+            id="pvalue-demo",
+            created_at="2026-03-07T15:00:00Z",
+            engine="vectorbt",
+            strategies=["PValue Demo"],
+            backtest_start="2024-01-01",
+            backtest_end="2024-01-31",
+            initial_capital=100000.0,
+            duration_days=30,
+            data={"symbols": ["AAPL"], "timeframes": ["1d"], "source": "test_source"},
+        ),
+        trades=[],
+        equity_curve=_equity_curve_from_returns(
+            [0.010, 0.012, 0.009, 0.014, 0.011, 0.013, 0.008, 0.012, 0.010, 0.011, 0.009, 0.013]
+        ),
+    )
+    result.save(backtests_dir / "pvalue-demo.trades.json")
+
+    resp = viewer_client.get("/api/backtest/pvalue-demo/stats")
+
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert 0.0 <= payload["p_value"] <= 1.0
+    assert payload["p_value"] < 0.05
+
+
+def test_create_portfolio_persists_p_value_and_psr(viewer_client, tmp_path):
+    backtests_dir = tmp_path / "backtests"
+    backtests_dir.mkdir(parents=True, exist_ok=True)
+
+    result = BacktestResult(
+        meta=BacktestMeta(
+            id="portfolio-source",
+            created_at="2026-03-07T15:00:00Z",
+            engine="vectorbt",
+            strategies=["Portfolio Signal"],
+            backtest_start="2024-01-01",
+            backtest_end="2024-01-31",
+            initial_capital=100000.0,
+            duration_days=30,
+            data={"symbols": ["AAPL"], "timeframes": ["1d"], "source": "test_source"},
+        ),
+        trades=[
+            Trade(
+                id=1,
+                symbol="AAPL",
+                direction="LONG",
+                entry_time="2024-01-02T00:00:00+00:00",
+                entry_price=100.0,
+                quantity=10.0,
+                exits=[
+                    TradeExit(
+                        time="2024-01-10T00:00:00+00:00",
+                        price=105.0,
+                        quantity=10.0,
+                        pnl=50.0,
+                    )
+                ],
+                pnl=50.0,
+            )
+        ],
+        equity_curve=_equity_curve_from_returns(
+            [0.010, 0.012, 0.009, 0.014, 0.011, 0.013, 0.008, 0.012, 0.010, 0.011, 0.009, 0.013]
+        ),
+    )
+    result.save(backtests_dir / "portfolio-source.trades.json")
+
+    create_resp = viewer_client.post(
+        "/api/portfolios",
+        json={
+            "name": "Signal Basket",
+            "account_capital": 100000,
+            "strategies": [
+                {
+                    "backtest_id": "portfolio-source",
+                    "risk_per_trade_pct": 1.0,
+                    "max_positions": 5,
+                }
+            ],
+        },
+    )
+
+    assert create_resp.status_code == 201
+    payload = create_resp.get_json()
+    assert payload["combined_stats"]["p_value"] < 0.05
+    assert "psr" in payload["combined_stats"]
+
+    list_resp = viewer_client.get("/api/portfolios")
+    assert list_resp.status_code == 200
+    listed = list_resp.get_json()
+    assert listed[0]["p_value"] == pytest.approx(payload["combined_stats"]["p_value"], abs=1e-6)
+
+    detail_resp = viewer_client.get(f"/api/portfolios/{payload['id']}")
+    assert detail_resp.status_code == 200
+    assert detail_resp.get_json()["combined_stats"]["p_value"] == pytest.approx(
+        payload["combined_stats"]["p_value"],
+        abs=1e-6,
+    )
+
+
+def test_agent_convert_endpoint_starts_background_agent(viewer_client, monkeypatch):
+    import viewer.app as viewer_app_module
+
+    captured: dict[str, object] = {}
+
+    def fake_start(task_id: str, payload: dict) -> dict:
+        captured["task_id"] = task_id
+        captured["payload"] = payload
+        return {"task_id": task_id, "status": "starting"}
+
+    monkeypatch.setattr(viewer_app_module, "_start_agent_task", fake_start)
+
+    resp = viewer_client.post(
+        "/api/agent/convert",
+        json={"code": "//@version=5\nstrategy('x')", "strategy_name": "Signal Forge"},
+    )
+
+    assert resp.status_code == 200
+    assert captured["payload"] == {
+        "code": "//@version=5\nstrategy('x')",
+        "strategy_name": "Signal Forge",
+        "engine": None,
+        "symbols": None,
+        "timeframe": None,
+        "start": None,
+        "end": None,
+        "capital": 100000.0,
+    }
+
+
+def test_equity_endpoint_rebuilds_curve_from_trades(viewer_client, tmp_path):
+    backtests_dir = tmp_path / "backtests"
+    backtests_dir.mkdir(parents=True, exist_ok=True)
+
+    result = BacktestResult(
+        meta=BacktestMeta(
+            id="rebuild-equity",
+            created_at="2026-03-09T09:00:00Z",
+            engine="vectorbt",
+            strategies=["short_term_reversal"],
+            backtest_start="2024-01-01",
+            backtest_end="2024-01-31",
+            initial_capital=100000.0,
+            data={"symbols": ["AAPL"], "timeframes": ["1d"], "source": "test_source"},
+        ),
+        trades=[
+            Trade(
+                id=2,
+                symbol="AAPL",
+                direction="LONG",
+                entry_time="2024-01-03T00:00:00+00:00",
+                entry_price=101.0,
+                quantity=10.0,
+                exits=[
+                    TradeExit(
+                        time="2024-01-05T00:00:00+00:00",
+                        price=103.5,
+                        quantity=10.0,
+                        pnl=250.0,
+                    )
+                ],
+                pnl=250.0,
+            ),
+            Trade(
+                id=1,
+                symbol="AAPL",
+                direction="LONG",
+                entry_time="2024-01-01T00:00:00+00:00",
+                entry_price=100.0,
+                quantity=10.0,
+                exits=[
+                    TradeExit(
+                        time="2024-01-02T00:00:00+00:00",
+                        price=105.0,
+                        quantity=10.0,
+                        pnl=500.0,
+                    )
+                ],
+                pnl=500.0,
+            ),
+            Trade(
+                id=3,
+                symbol="AAPL",
+                direction="LONG",
+                entry_time="2024-01-04T00:00:00+00:00",
+                entry_price=103.0,
+                quantity=10.0,
+                exits=[
+                    TradeExit(
+                        time="2024-01-05T00:00:00+00:00",
+                        price=101.0,
+                        quantity=10.0,
+                        pnl=-200.0,
+                    )
+                ],
+                pnl=-200.0,
+            ),
+        ],
+        equity_curve=[],
+    )
+    result.save(backtests_dir / "rebuild-equity.trades.json")
+
+    resp = viewer_client.get("/api/backtest/rebuild-equity/equity")
+
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert payload == [
+        {"time": pytest.approx(pd.Timestamp("2024-01-01T00:00:00+00:00").timestamp()), "equity": 100000.0},
+        {"time": pytest.approx(pd.Timestamp("2024-01-02T00:00:00+00:00").timestamp()), "equity": 100500.0},
+        {"time": pytest.approx(pd.Timestamp("2024-01-05T00:00:00+00:00").timestamp()), "equity": 100550.0},
+    ]
+
+
+def test_strategy_detail_reads_markdown_and_patch_renames_strategy(
+    viewer_client, monkeypatch, tmp_path
+):
+    import viewer.app as viewer_app_module
+
+    strategies_root = tmp_path / "strategies"
+    strategy_dir = strategies_root / "demo"
+    strategy_dir.mkdir(parents=True, exist_ok=True)
+    strategy_dir.joinpath("demo.py").write_text(
+        """
+STRATEGY_META = {
+    "name": "Demo Strategy",
+    "version": "1.0.0",
+    "tags": {"type": ["momentum"], "source": "test", "asset_class": ["equities"], "complexity": "simple"},
+}
+
+def generate_signals(df, params):
+    return df["close"] > df["close"], df["close"] < df["close"], {"noop": df["close"]}
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    strategy_dir.joinpath("README.md").write_text("# Demo Strategy\n\nThis is markdown.\n", encoding="utf-8")
+    monkeypatch.setattr(viewer_app_module, "STRATEGIES_DIR", strategies_root)
+
+    detail_resp = viewer_client.get("/api/strategies/demo")
+
+    assert detail_resp.status_code == 200
+    detail_payload = detail_resp.get_json()
+    assert detail_payload["slug"] == "demo"
+    assert detail_payload["name"] == "Demo Strategy"
+    assert "This is markdown." in detail_payload["documentation_markdown"]
+
+    patch_resp = viewer_client.patch("/api/strategies/demo", json={"name": "Renamed Strategy"})
+
+    assert patch_resp.status_code == 200
+    patch_payload = patch_resp.get_json()
+    assert patch_payload["name"] == "Renamed Strategy"
+    assert "Renamed Strategy" in strategy_dir.joinpath("demo.py").read_text(encoding="utf-8")
+
+
+def test_backtest_patch_updates_title_in_meta(viewer_client, tmp_path):
+    backtests_dir = tmp_path / "backtests"
+    backtests_dir.mkdir(parents=True, exist_ok=True)
+
+    result = BacktestResult(
+        meta=BacktestMeta(
+            id="rename-backtest",
+            created_at="2026-03-09T09:00:00Z",
+            engine="vectorbt",
+            strategies=["short_term_reversal"],
+            backtest_start="2024-01-01",
+            backtest_end="2024-01-31",
+            initial_capital=100000.0,
+            data={"symbols": ["AAPL"], "timeframes": ["1d"], "source": "test_source"},
+        ),
+        trades=[],
+        equity_curve=[],
+    )
+    result.save(backtests_dir / "rename-backtest.trades.json")
+
+    patch_resp = viewer_client.patch("/api/backtests/rename-backtest", json={"name": "Desk Run"})
+
+    assert patch_resp.status_code == 200
+    payload = patch_resp.get_json()
+    assert payload["title"] == "Desk Run"
+    assert payload["notes"] == "Desk Run"
+
+    info_resp = viewer_client.get("/api/backtest/rename-backtest/info")
+    assert info_resp.status_code == 200
+    assert info_resp.get_json()["title"] == "Desk Run"
 
 
 def test_logs_endpoint_supports_all_logs_and_multi_level_filters(viewer_client, tmp_path):

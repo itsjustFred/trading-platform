@@ -52,12 +52,13 @@ export function CreateBacktestModal({
   // Auto-detect engine based on strategy file
   useEffect(() => {
     if (!strategy) return;
-    if (strategy.startsWith("pynecore_")) {
+    const selectedStrategyMeta = strategies.find((item) => item.file === strategy);
+    if (selectedStrategyMeta?.engine === "pynecore") {
       setEngine("pynecore");
     } else {
       setEngine("vectorbt");
     }
-  }, [strategy]);
+  }, [strategy, strategies]);
 
   const handleRun = async () => {
     if (!strategy || !symbols.trim()) return;
@@ -167,9 +168,12 @@ export function CreateBacktestModal({
             onChange={(e) => setEngine(e.target.value)}
             style={{
               ...inputStyle,
-              opacity: strategy.startsWith("pynecore_") ? 0.6 : 1,
+              opacity:
+                strategies.find((item) => item.file === strategy)?.engine === "pynecore"
+                  ? 0.6
+                  : 1,
             }}
-            disabled={strategy.startsWith("pynecore_")}
+            disabled={strategies.find((item) => item.file === strategy)?.engine === "pynecore"}
           >
             <option value="vectorbt">vectorbt</option>
             <option value="pynecore">pynecore</option>

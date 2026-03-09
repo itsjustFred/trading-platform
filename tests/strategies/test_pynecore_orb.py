@@ -20,7 +20,7 @@ from runner.engines.base import BacktestConfig
 from runner.engines.pynecore_adapter import PyneCoreAdapter
 
 
-STRATEGY_PATH = str(Path(__file__).parent.parent.parent / "strategies" / "pynecore_orb.py")
+STRATEGY_PATH = str(Path(__file__).parent.parent.parent / "strategies" / "pynecore_orb" / "pynecore_orb.py")
 TEST_START = "2024-04-01"
 TEST_END = "2024-06-30"
 TEST_SYMBOL = "SPY"

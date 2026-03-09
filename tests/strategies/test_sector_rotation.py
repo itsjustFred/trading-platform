@@ -20,7 +20,7 @@ from runner.engines.base import BacktestConfig
 from runner.engines.vectorbt_adapter import VectorbtAdapter
 
 
-STRATEGY_PATH = str(Path(__file__).parent.parent.parent / "strategies" / "sector_rotation.py")
+STRATEGY_PATH = str(Path(__file__).parent.parent.parent / "strategies" / "sector_rotation" / "sector_rotation.py")
 TEST_START = "2023-01-01"
 TEST_END = "2024-12-31"
 TEST_SYMBOL = "AAPL"

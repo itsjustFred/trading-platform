@@ -2,7 +2,7 @@
 Backtest Runner CLI — unified interface to run backtests on any engine.
 
 Usage:
-    python -m runner.cli run --engine vectorbt --strategy strategies/example_sma.py \\
+    python -m runner.cli run --engine vectorbt --strategy strategies/example_sma/example_sma.py \\
         --symbols AAPL MSFT --timeframe 1h --start 2023-01-01 --end 2025-01-01
 
     python -m runner.cli run --engine lean --strategy path/to/lean_result.json \\

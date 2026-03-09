@@ -6,10 +6,12 @@ import {
   getBacktestTrades,
   getBacktestEquity,
   getBenchmark,
+  renameBacktest,
 } from "../api/client";
 import { StatCard } from "../components/StatCard";
 import { DataTable } from "../components/DataTable";
-import { ArrowLeft } from "lucide-react";
+import { RenameModal } from "../components/RenameModal";
+import { ArrowLeft, ArrowUpRight, PencilLine } from "lucide-react";
 import {
   createChart,
   AreaSeries,
@@ -19,6 +21,7 @@ import {
   CrosshairMode,
 } from "lightweight-charts";
 import type { IChartApi, Time } from "lightweight-charts";
+import { formatPValue, pValueColor } from "../utils/stats";
 
 const BENCHMARK_SYMBOLS = ["SPY", "QQQ", "IWM", "DIA", "GLD", "TLT", "XAUUSD"];
 
@@ -33,6 +36,9 @@ export function BacktestDetailPage() {
   const [benchmarkData, setBenchmarkData] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [showRenameModal, setShowRenameModal] = useState(false);
+  const [savingRename, setSavingRename] = useState(false);
+  const [renameError, setRenameError] = useState("");
 
   useEffect(() => {
     if (!id) return;
@@ -68,6 +74,21 @@ export function BacktestDetailPage() {
       .then((data: any) => setBenchmarkData(data.equity || []))
       .catch(() => setBenchmarkData([]));
   }, [benchmarkSymbol, info]);
+
+  const handleRename = async (nextTitle: string) => {
+    if (!id) return;
+    setSavingRename(true);
+    setRenameError("");
+    try {
+      const updated = await renameBacktest(id, nextTitle);
+      setInfo(updated);
+      setShowRenameModal(false);
+    } catch (renameIssue: any) {
+      setRenameError(renameIssue.message || "Could not rename backtest");
+    } finally {
+      setSavingRename(false);
+    }
+  };
 
   if (loading)
     return (
@@ -174,16 +195,17 @@ export function BacktestDetailPage() {
       {/* Header */}
       <div
         style={{
-          background: "var(--color-surface)",
+          background:
+            "radial-gradient(circle at top right, rgba(88,166,255,0.12), transparent 38%), var(--color-surface)",
           border: "1px solid var(--color-border)",
-          borderRadius: "8px",
+          borderRadius: "12px",
           padding: "24px",
           marginBottom: "20px",
           display: "flex",
           justifyContent: "space-between",
-          alignItems: "center",
+          alignItems: "flex-start",
           flexWrap: "wrap",
-          gap: "12px",
+          gap: "16px",
         }}
       >
         <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
@@ -200,9 +222,60 @@ export function BacktestDetailPage() {
             <ArrowLeft size={20} />
           </button>
           <div>
-            <h1 style={{ fontSize: "1.5rem", fontWeight: 600 }}>
-              📊 {info?.strategy || id}
-            </h1>
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: "10px",
+                flexWrap: "wrap",
+              }}
+            >
+              <h1
+                style={{
+                  fontSize: "1.6rem",
+                  fontWeight: 700,
+                  letterSpacing: "-0.03em",
+                  margin: 0,
+                }}
+              >
+                {info?.title || info?.strategy_display_name || info?.strategy || id}
+              </h1>
+              <button
+                type="button"
+                onClick={() => setShowRenameModal(true)}
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  width: "34px",
+                  height: "34px",
+                  borderRadius: "999px",
+                  border: "1px solid rgba(88,166,255,0.18)",
+                  background: "rgba(88,166,255,0.08)",
+                  color: "#58a6ff",
+                  cursor: "pointer",
+                }}
+                aria-label="Rename backtest"
+              >
+                <PencilLine size={15} />
+              </button>
+              {info?.strategy_display_name &&
+              info?.title &&
+              info.title !== info.strategy_display_name ? (
+                <span
+                  style={{
+                    background: "var(--color-surface2)",
+                    border: "1px solid var(--color-border)",
+                    padding: "3px 10px",
+                    borderRadius: "999px",
+                    fontSize: "0.72rem",
+                    color: "var(--color-text-muted)",
+                  }}
+                >
+                  Strategy: {info.strategy_display_name}
+                </span>
+              ) : null}
+            </div>
             <div
               style={{
                 color: "var(--color-text-muted)",
@@ -227,6 +300,33 @@ export function BacktestDetailPage() {
             </div>
           </div>
         </div>
+        {info?.strategy_slug || info?.strategy ? (
+          <div style={{ display: "flex", gap: "10px", flexWrap: "wrap" }}>
+            <button
+              type="button"
+              onClick={() =>
+                navigate(
+                  `/strategies/${encodeURIComponent(info?.strategy_slug || info?.strategy || "")}`,
+                )
+              }
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: "8px",
+                background:
+                  "linear-gradient(135deg, rgba(88,166,255,0.18), rgba(124,58,237,0.16))",
+                color: "#c9d1d9",
+                border: "1px solid rgba(88,166,255,0.2)",
+                borderRadius: "10px",
+                padding: "10px 14px",
+                cursor: "pointer",
+              }}
+            >
+              View Strategy Details
+              <ArrowUpRight size={15} />
+            </button>
+          </div>
+        ) : null}
       </div>
 
       {/* Stats Grid */}
@@ -300,6 +400,11 @@ export function BacktestDetailPage() {
                   ? "#d29922"
                   : "#f85149"
             }
+          />
+          <StatCard
+            label="P-Value"
+            value={formatPValue(stats.p_value)}
+            color={pValueColor(stats.p_value)}
           />
           <StatCard
             label="Expectancy"
@@ -460,6 +565,23 @@ export function BacktestDetailPage() {
           onRowClick={(row) => navigate(`/backtests/${id}/trade/${row.nr}`)}
         />
       </div>
+
+      <RenameModal
+        open={showRenameModal}
+        title="Rename Backtest"
+        label="Backtest title"
+        value={info?.title || info?.strategy_display_name || info?.strategy || id || ""}
+        helperText={
+          renameError ||
+          "This updates the backtest's display title stored in meta.notes without changing its ID."
+        }
+        saving={savingRename}
+        onClose={() => {
+          setShowRenameModal(false);
+          setRenameError("");
+        }}
+        onSave={handleRename}
+      />
     </div>
   );
 }
@@ -536,10 +658,16 @@ function EquityChart({
 
     const container = containerRef.current;
     const w = container.clientWidth || 1100;
+    const locale =
+      typeof navigator !== "undefined" &&
+      navigator.language &&
+      navigator.language !== "undefined"
+        ? navigator.language
+        : "en-US";
     const chart = createChart(container, {
       width: w,
       height: 340,
-      localization: { locale: navigator.language || "en-US" },
+      localization: { locale },
       layout: {
         background: { type: ColorType.Solid, color: "#0d1117" },
         textColor: "#8b949e",

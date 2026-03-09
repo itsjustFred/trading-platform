@@ -8,7 +8,7 @@ export function StrategiesPage() {
   const [strategies, setStrategies] = useState<any[]>([]);
   const [search, setSearch] = useState("");
   const [filters, setFilters] = useState<Record<string, string>>({});
-  const [sortBy, setSortBy] = useState("name");
+  const [sortBy, setSortBy] = useState("name_asc");
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
@@ -45,6 +45,7 @@ export function StrategiesPage() {
       const matchSearch =
         !q ||
         s.name?.toLowerCase().includes(q) ||
+        s.slug?.toLowerCase().includes(q) ||
         s.tags?.source?.toLowerCase().includes(q);
       const matchType =
         !filters.type || (s.tags?.type || []).includes(filters.type);
@@ -60,11 +61,19 @@ export function StrategiesPage() {
     });
     result.sort((a, b) => {
       switch (sortBy) {
+        case "name_desc":
+          return (b.name || "").localeCompare(a.name || "");
+        case "created_desc":
+          return Date.parse(b.created_at || "") - Date.parse(a.created_at || "");
+        case "created_asc":
+          return Date.parse(a.created_at || "") - Date.parse(b.created_at || "");
         case "complexity":
           return (a.tags?.complexity || "").localeCompare(
             b.tags?.complexity || "",
           );
-        case "backtests":
+        case "backtests_asc":
+          return (a.backtest_count || 0) - (b.backtest_count || 0);
+        case "backtests_desc":
           return (b.backtest_count || 0) - (a.backtest_count || 0);
         default:
           return (a.name || "").localeCompare(b.name || "");
@@ -108,9 +117,13 @@ export function StrategiesPage() {
         filterValues={filters}
         onFilterChange={(k, v) => setFilters((prev) => ({ ...prev, [k]: v }))}
         sortOptions={[
-          { label: "Name A-Z", value: "name" },
+          { label: "Name (A-Z)", value: "name_asc" },
+          { label: "Name (Z-A)", value: "name_desc" },
+          { label: "Creation Date (Newest First)", value: "created_desc" },
+          { label: "Creation Date (Oldest First)", value: "created_asc" },
+          { label: "Trade Count (High to Low)", value: "backtests_desc" },
+          { label: "Trade Count (Low to High)", value: "backtests_asc" },
           { label: "Complexity", value: "complexity" },
-          { label: "Most backtests", value: "backtests" },
         ]}
         sortValue={sortBy}
         onSortChange={setSortBy}
@@ -136,10 +149,8 @@ export function StrategiesPage() {
         >
           {filtered.map((s) => (
             <div
-              key={s.name}
-              onClick={() =>
-                navigate(`/strategies/${encodeURIComponent(s.name)}`)
-              }
+              key={s.slug || s.name}
+              onClick={() => navigate(`/strategies/${encodeURIComponent(s.slug || s.name)}`)}
               style={{
                 background: "var(--color-surface)",
                 border: "1px solid var(--color-border)",
@@ -219,10 +230,17 @@ export function StrategiesPage() {
                   justifyContent: "space-between",
                   fontSize: "0.75rem",
                   color: "var(--color-text-muted)",
+                  gap: "8px",
+                  flexWrap: "wrap",
                 }}
               >
                 <span>{s.tags?.source || "unknown"}</span>
                 <span>{s.backtest_count || 0} backtests</span>
+                {s.created_at ? (
+                  <span>
+                    Added {new Date(s.created_at).toLocaleDateString("en-US")}
+                  </span>
+                ) : null}
               </div>
             </div>
           ))}

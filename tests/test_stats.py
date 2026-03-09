@@ -1,5 +1,6 @@
 """Tests for runner.stats — performance metrics calculation."""
 
+from datetime import datetime, timedelta, timezone
 import math
 
 from runner.stats import compute_stats, compute_stats_for_result, _max_consecutive, _max_drawdown_pct_manual
@@ -16,6 +17,17 @@ def _trade(pnl: float, holding_bars: int | None = None) -> Trade:
         pnl=pnl,
         holding_bars=holding_bars,
     )
+
+
+def _equity_curve_from_returns(returns: list[float], initial_capital: float = 100000.0) -> list[EquityPoint]:
+    points = []
+    equity = initial_capital
+    start = datetime(2021, 1, 1, tzinfo=timezone.utc)
+    points.append(EquityPoint(time=start.isoformat(), equity=equity))
+    for index, ret in enumerate(returns, start=1):
+        equity *= 1 + ret
+        points.append(EquityPoint(time=(start + timedelta(days=index)).isoformat(), equity=equity))
+    return points
 
 
 class TestComputeStats:
@@ -73,6 +85,18 @@ class TestComputeStats:
         assert "cagr" in stats
         assert "total_return" in stats
         assert "max_drawdown_duration" in stats
+
+    def test_p_value_defaults_to_one_without_equity_returns(self):
+        stats = compute_stats([_trade(100), _trade(-25)])
+        assert stats["p_value"] == 1.0
+
+    def test_p_value_is_computed_from_daily_returns(self):
+        equity = _equity_curve_from_returns(
+            [0.010, 0.012, 0.009, 0.014, 0.011, 0.013, 0.008, 0.012, 0.010, 0.011, 0.009, 0.013]
+        )
+        stats = compute_stats([], equity_curve=equity)
+        assert 0.0 <= stats["p_value"] <= 1.0
+        assert stats["p_value"] < 0.05
 
 
 class TestMaxConsecutiveLosses:

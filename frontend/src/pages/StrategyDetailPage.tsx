@@ -1,8 +1,10 @@
-import { useState, useEffect } from "react";
-import { useParams, useNavigate, Link } from "react-router-dom";
-import { getStrategyDetail } from "../api/client";
+import { useEffect, useMemo, useState } from "react";
+import { Link, useNavigate, useParams } from "react-router-dom";
+import ReactMarkdown from "react-markdown";
+import { ArrowLeft, PencilLine, Plus, ScrollText } from "lucide-react";
+import { getStrategyDetail, renameStrategy } from "../api/client";
 import { CreateBacktestModal } from "../components/CreateBacktestModal";
-import { ArrowLeft, Plus } from "lucide-react";
+import { RenameModal } from "../components/RenameModal";
 
 export function StrategyDetailPage() {
   const { name } = useParams<{ name: string }>();
@@ -10,14 +12,43 @@ export function StrategyDetailPage() {
   const [detail, setDetail] = useState<any>(null);
   const [loading, setLoading] = useState(true);
   const [showCreateModal, setShowCreateModal] = useState(false);
+  const [showRenameModal, setShowRenameModal] = useState(false);
+  const [renameError, setRenameError] = useState("");
+  const [savingRename, setSavingRename] = useState(false);
 
   useEffect(() => {
     if (!name) return;
+    setLoading(true);
     getStrategyDetail(name)
-      .then(setDetail)
-      .catch(() => {})
+      .then((data) => {
+        setDetail(data);
+        setRenameError("");
+      })
+      .catch(() => {
+        setDetail(null);
+      })
       .finally(() => setLoading(false));
   }, [name]);
+
+  const renderedMarkdown = useMemo(
+    () => (detail?.documentation_markdown || "").trim(),
+    [detail?.documentation_markdown],
+  );
+
+  const handleRename = async (nextName: string) => {
+    if (!detail?.slug) return;
+    setSavingRename(true);
+    setRenameError("");
+    try {
+      const updated = await renameStrategy(detail.slug, nextName);
+      setDetail(updated);
+      setShowRenameModal(false);
+    } catch (error: any) {
+      setRenameError(error.message || "Could not rename strategy");
+    } finally {
+      setSavingRename(false);
+    }
+  };
 
   if (loading)
     return (
@@ -32,131 +63,392 @@ export function StrategyDetailPage() {
       </div>
     );
 
+  const titleButtonStyle: React.CSSProperties = {
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    width: "34px",
+    height: "34px",
+    borderRadius: "999px",
+    border: "1px solid rgba(88,166,255,0.18)",
+    background: "rgba(88,166,255,0.08)",
+    color: "#58a6ff",
+    cursor: "pointer",
+  };
+
   return (
     <div style={{ padding: "24px" }}>
-      {/* Header */}
       <div
         style={{
-          background: "var(--color-surface)",
+          background:
+            "radial-gradient(circle at top right, rgba(88,166,255,0.12), transparent 40%), var(--color-surface)",
           border: "1px solid var(--color-border)",
-          borderRadius: "8px",
+          borderRadius: "14px",
           padding: "24px",
           marginBottom: "20px",
+          boxShadow: "0 12px 32px rgba(0, 0, 0, 0.16)",
         }}
       >
         <div
           style={{
             display: "flex",
-            alignItems: "center",
-            gap: "12px",
-            marginBottom: "12px",
+            alignItems: "start",
+            justifyContent: "space-between",
+            gap: "16px",
+            flexWrap: "wrap",
+            marginBottom: "16px",
           }}
         >
+          <div
+            style={{
+              display: "flex",
+              alignItems: "start",
+              gap: "12px",
+              flexWrap: "wrap",
+            }}
+          >
+            <button
+              onClick={() => navigate(-1)}
+              style={{
+                background: "none",
+                border: "none",
+                color: "var(--color-text-muted)",
+                cursor: "pointer",
+                padding: "4px",
+              }}
+            >
+              <ArrowLeft size={20} />
+            </button>
+            <div style={{ display: "grid", gap: "10px" }}>
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "10px",
+                  flexWrap: "wrap",
+                }}
+              >
+                <h1
+                  style={{
+                    fontSize: "1.75rem",
+                    lineHeight: 1.05,
+                    margin: 0,
+                    fontWeight: 700,
+                    letterSpacing: "-0.03em",
+                  }}
+                >
+                  {detail.name}
+                </h1>
+                <button
+                  type="button"
+                  onClick={() => setShowRenameModal(true)}
+                  style={titleButtonStyle}
+                  aria-label="Rename strategy"
+                >
+                  <PencilLine size={15} />
+                </button>
+                <span
+                  style={{
+                    background: "var(--color-surface2)",
+                    border: "1px solid var(--color-border)",
+                    padding: "3px 10px",
+                    borderRadius: "999px",
+                    fontSize: "0.72rem",
+                    color: "var(--color-text-muted)",
+                  }}
+                >
+                  v{detail.version || "1.0.0"}
+                </span>
+                <span
+                  style={{
+                    background: "rgba(88,166,255,0.12)",
+                    color: "#58a6ff",
+                    padding: "3px 10px",
+                    borderRadius: "999px",
+                    fontSize: "0.72rem",
+                    border: "1px solid rgba(88,166,255,0.18)",
+                  }}
+                >
+                  slug: {detail.slug}
+                </span>
+              </div>
+
+              <div style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}>
+                {(detail.tags?.type || []).map((tag: string) => (
+                  <span
+                    key={tag}
+                    style={{
+                      background: "rgba(88,166,255,0.12)",
+                      color: "#58a6ff",
+                      fontSize: "0.72rem",
+                      padding: "4px 10px",
+                      borderRadius: "999px",
+                    }}
+                  >
+                    {tag}
+                  </span>
+                ))}
+                {(detail.tags?.asset_class || []).map((asset: string) => (
+                  <span
+                    key={asset}
+                    style={{
+                      background: "rgba(63,185,80,0.12)",
+                      color: "#3fb950",
+                      fontSize: "0.72rem",
+                      padding: "4px 10px",
+                      borderRadius: "999px",
+                    }}
+                  >
+                    {asset}
+                  </span>
+                ))}
+                {detail.tags?.complexity && (
+                  <span
+                    style={{
+                      background: "rgba(210,153,34,0.12)",
+                      color: "#d29922",
+                      fontSize: "0.72rem",
+                      padding: "4px 10px",
+                      borderRadius: "999px",
+                    }}
+                  >
+                    {detail.tags.complexity}
+                  </span>
+                )}
+                {detail.tags?.source && (
+                  <span
+                    style={{
+                      background: "var(--color-surface2)",
+                      color: "var(--color-text-muted)",
+                      fontSize: "0.72rem",
+                      padding: "4px 10px",
+                      borderRadius: "999px",
+                    }}
+                  >
+                    {detail.tags.source}
+                  </span>
+                )}
+              </div>
+
+              <div
+                style={{
+                  display: "flex",
+                  gap: "10px",
+                  flexWrap: "wrap",
+                  color: "var(--color-text-muted)",
+                  fontSize: "0.78rem",
+                }}
+              >
+                {detail.created_at ? (
+                  <span>
+                    Added {new Date(detail.created_at).toLocaleDateString("en-US")}
+                  </span>
+                ) : null}
+                <span>{detail.backtest_count || 0} backtests</span>
+                <span>{detail.engine}</span>
+                <span>{detail.file}</span>
+              </div>
+            </div>
+          </div>
+
           <button
-            onClick={() => navigate(-1)}
+            onClick={() => setShowCreateModal(true)}
             style={{
-              background: "none",
+              display: "inline-flex",
+              alignItems: "center",
+              gap: "8px",
+              background: "linear-gradient(135deg, #58a6ff, #7c3aed)",
+              color: "#fff",
               border: "none",
-              color: "var(--color-text-muted)",
+              borderRadius: "10px",
+              padding: "10px 16px",
+              fontSize: "0.85rem",
               cursor: "pointer",
+              boxShadow: "0 12px 28px rgba(88, 166, 255, 0.22)",
             }}
           >
-            <ArrowLeft size={20} />
+            <Plus size={16} /> Run Backtest
           </button>
-          <h1 style={{ fontSize: "1.5rem", fontWeight: 600 }}>{detail.name}</h1>
-          <span
-            style={{
-              background: "var(--color-surface2)",
-              border: "1px solid var(--color-border)",
-              padding: "2px 8px",
-              borderRadius: "4px",
-              fontSize: "0.72rem",
-              color: "var(--color-text-muted)",
-            }}
-          >
-            v{detail.version || "1.0.0"}
-          </span>
         </div>
 
-        {/* Tags */}
-        <div style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}>
-          {(detail.tags?.type || []).map((t: string) => (
-            <span
-              key={t}
-              style={{
-                background: "rgba(88,166,255,0.12)",
-                color: "#58a6ff",
-                fontSize: "0.72rem",
-                padding: "3px 10px",
-                borderRadius: "4px",
-              }}
-            >
-              {t}
-            </span>
-          ))}
-          {(detail.tags?.asset_class || []).map((a: string) => (
-            <span
-              key={a}
-              style={{
-                background: "rgba(63,185,80,0.12)",
-                color: "#3fb950",
-                fontSize: "0.72rem",
-                padding: "3px 10px",
-                borderRadius: "4px",
-              }}
-            >
-              {a}
-            </span>
-          ))}
-          {detail.tags?.complexity && (
-            <span
-              style={{
-                background: "rgba(210,153,34,0.12)",
-                color: "#d29922",
-                fontSize: "0.72rem",
-                padding: "3px 10px",
-                borderRadius: "4px",
-              }}
-            >
-              {detail.tags.complexity}
-            </span>
-          )}
-          {detail.tags?.source && (
-            <span
-              style={{
-                background: "var(--color-surface2)",
-                color: "var(--color-text-muted)",
-                fontSize: "0.72rem",
-                padding: "3px 10px",
-                borderRadius: "4px",
-              }}
-            >
-              📦 {detail.tags.source}
-            </span>
-          )}
-        </div>
-        {detail.tags?.link && (
-          <div style={{ marginTop: "8px" }}>
-            <a
-              href={detail.tags.link}
-              target="_blank"
-              rel="noreferrer"
-              style={{ color: "#58a6ff", fontSize: "0.8rem" }}
-            >
-              🔗 {detail.tags.link}
-            </a>
-          </div>
-        )}
+        {detail.tags?.link ? (
+          <a
+            href={detail.tags.link}
+            target="_blank"
+            rel="noreferrer"
+            style={{
+              color: "#58a6ff",
+              fontSize: "0.85rem",
+              textDecoration: "none",
+            }}
+          >
+            Open source reference →
+          </a>
+        ) : null}
       </div>
 
-      {/* Backtests */}
+      {renderedMarkdown ? (
+        <div
+          style={{
+            background: "var(--color-surface)",
+            border: "1px solid var(--color-border)",
+            borderRadius: "14px",
+            padding: "22px",
+            marginBottom: "20px",
+            overflow: "hidden",
+          }}
+        >
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "10px",
+              marginBottom: "16px",
+              color: "var(--color-text-muted)",
+              textTransform: "uppercase",
+              letterSpacing: "0.12em",
+              fontSize: "0.72rem",
+            }}
+          >
+            <ScrollText size={15} color="#58a6ff" />
+            Strategy Dossier
+          </div>
+          <div
+            style={{
+              padding: "18px",
+              borderRadius: "12px",
+              background:
+                "linear-gradient(180deg, rgba(13,17,23,0.25), rgba(13,17,23,0.05))",
+              border: "1px solid rgba(255,255,255,0.03)",
+            }}
+          >
+            <ReactMarkdown
+              components={{
+                h1: ({ ...props }) => (
+                  <h2
+                    style={{
+                      fontSize: "1.35rem",
+                      margin: "0 0 14px",
+                      letterSpacing: "-0.02em",
+                    }}
+                    {...props}
+                  />
+                ),
+                h2: ({ ...props }) => (
+                  <h3
+                    style={{
+                      fontSize: "1.05rem",
+                      margin: "24px 0 10px",
+                      color: "#c9d1d9",
+                    }}
+                    {...props}
+                  />
+                ),
+                h3: ({ ...props }) => (
+                  <h4
+                    style={{
+                      fontSize: "0.92rem",
+                      margin: "18px 0 8px",
+                      color: "#c9d1d9",
+                    }}
+                    {...props}
+                  />
+                ),
+                p: ({ ...props }) => (
+                  <p
+                    style={{
+                      color: "var(--color-text-muted)",
+                      lineHeight: 1.75,
+                      margin: "0 0 14px",
+                    }}
+                    {...props}
+                  />
+                ),
+                ul: ({ ...props }) => (
+                  <ul style={{ margin: "0 0 14px", paddingLeft: "18px" }} {...props} />
+                ),
+                ol: ({ ...props }) => (
+                  <ol style={{ margin: "0 0 14px", paddingLeft: "18px" }} {...props} />
+                ),
+                li: ({ ...props }) => (
+                  <li
+                    style={{
+                      color: "var(--color-text-muted)",
+                      lineHeight: 1.7,
+                      marginBottom: "6px",
+                    }}
+                    {...props}
+                  />
+                ),
+                a: ({ ...props }) => (
+                  <a
+                    target="_blank"
+                    rel="noreferrer"
+                    style={{ color: "#58a6ff" }}
+                    {...props}
+                  />
+                ),
+                code: ({ inline, children, ...props }: any) =>
+                  inline ? (
+                    <code
+                      style={{
+                        background: "rgba(88,166,255,0.1)",
+                        color: "#79c0ff",
+                        borderRadius: "6px",
+                        padding: "2px 6px",
+                        fontSize: "0.8rem",
+                      }}
+                      {...props}
+                    >
+                      {children}
+                    </code>
+                  ) : (
+                    <code
+                      style={{
+                        display: "block",
+                        background: "#0d1117",
+                        border: "1px solid var(--color-border)",
+                        borderRadius: "10px",
+                        padding: "14px",
+                        overflowX: "auto",
+                        color: "#c9d1d9",
+                        fontSize: "0.82rem",
+                      }}
+                      {...props}
+                    >
+                      {children}
+                    </code>
+                  ),
+                pre: ({ ...props }) => (
+                  <pre style={{ margin: "0 0 14px", whiteSpace: "pre-wrap" }} {...props} />
+                ),
+                blockquote: ({ ...props }) => (
+                  <blockquote
+                    style={{
+                      margin: "0 0 14px",
+                      padding: "12px 16px",
+                      borderLeft: "3px solid #58a6ff",
+                      background: "rgba(88,166,255,0.06)",
+                      color: "#c9d1d9",
+                    }}
+                    {...props}
+                  />
+                ),
+              }}
+            >
+              {renderedMarkdown}
+            </ReactMarkdown>
+          </div>
+        </div>
+      ) : null}
+
       <div
         style={{
           background: "var(--color-surface)",
           border: "1px solid var(--color-border)",
-          borderRadius: "8px",
+          borderRadius: "12px",
           padding: "20px",
-          marginBottom: "20px",
+          marginBottom: detail.portfolios?.length ? "20px" : 0,
         }}
       >
         <div
@@ -167,26 +459,9 @@ export function StrategyDetailPage() {
             marginBottom: "16px",
           }}
         >
-          <h2 style={{ fontSize: "1rem", fontWeight: 600 }}>
+          <h2 style={{ fontSize: "1rem", fontWeight: 600, margin: 0 }}>
             Backtests ({detail.backtests?.length || 0})
           </h2>
-          <button
-            onClick={() => setShowCreateModal(true)}
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: "6px",
-              background: "#58a6ff",
-              color: "#fff",
-              border: "none",
-              borderRadius: "6px",
-              padding: "6px 12px",
-              fontSize: "0.82rem",
-              cursor: "pointer",
-            }}
-          >
-            <Plus size={14} /> Run Backtest
-          </button>
         </div>
         {detail.backtests?.length > 0 ? (
           <div
@@ -196,15 +471,15 @@ export function StrategyDetailPage() {
               gap: "10px",
             }}
           >
-            {detail.backtests.map((bt: any) => (
+            {detail.backtests.map((backtest: any) => (
               <Link
-                key={bt.id}
-                to={`/backtests/${bt.id}`}
+                key={backtest.id}
+                to={`/backtests/${backtest.id}`}
                 style={{
                   background: "var(--color-surface2)",
                   border: "1px solid var(--color-border)",
-                  borderRadius: "6px",
-                  padding: "12px",
+                  borderRadius: "10px",
+                  padding: "14px",
                   textDecoration: "none",
                   color: "inherit",
                 }}
@@ -213,11 +488,12 @@ export function StrategyDetailPage() {
                   style={{
                     display: "flex",
                     justifyContent: "space-between",
-                    marginBottom: "4px",
+                    gap: "10px",
+                    marginBottom: "8px",
                   }}
                 >
-                  <span style={{ fontSize: "0.82rem", fontWeight: 600 }}>
-                    {bt.engine}
+                  <span style={{ fontSize: "0.9rem", fontWeight: 600 }}>
+                    {backtest.title || backtest.id}
                   </span>
                   <span
                     style={{
@@ -225,28 +501,91 @@ export function StrategyDetailPage() {
                       color: "var(--color-text-muted)",
                     }}
                   >
-                    {bt.trade_count} trades
+                    {backtest.trade_count} trades
                   </span>
                 </div>
                 <div
                   style={{
+                    fontSize: "0.75rem",
+                    color: "var(--color-text-muted)",
+                    marginBottom: "8px",
+                  }}
+                >
+                  {backtest.symbols?.join(", ")} • {(backtest.timeframes || []).join(", ")}
+                </div>
+                <div
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    gap: "10px",
                     fontSize: "0.72rem",
                     color: "var(--color-text-muted)",
                   }}
                 >
-                  {bt.symbols?.join(", ")} • {(bt.timeframes || []).join(", ")}
+                  <span>{backtest.engine}</span>
+                  <span>
+                    {backtest.created_at
+                      ? new Date(backtest.created_at).toLocaleDateString("en-US")
+                      : ""}
+                  </span>
                 </div>
               </Link>
             ))}
           </div>
         ) : (
-          <div
-            style={{ color: "var(--color-text-muted)", fontSize: "0.85rem" }}
-          >
+          <div style={{ color: "var(--color-text-muted)", fontSize: "0.85rem" }}>
             No backtests yet
           </div>
         )}
       </div>
+
+      {detail.portfolios?.length ? (
+        <div
+          style={{
+            background: "var(--color-surface)",
+            border: "1px solid var(--color-border)",
+            borderRadius: "12px",
+            padding: "20px",
+          }}
+        >
+          <h2 style={{ fontSize: "1rem", fontWeight: 600, margin: "0 0 16px" }}>
+            Portfolios ({detail.portfolios.length})
+          </h2>
+          <div style={{ display: "flex", gap: "10px", flexWrap: "wrap" }}>
+            {detail.portfolios.map((portfolio: any) => (
+              <Link
+                key={portfolio.id}
+                to={`/portfolios/${portfolio.id}`}
+                style={{
+                  textDecoration: "none",
+                  color: "inherit",
+                  background: "var(--color-surface2)",
+                  border: "1px solid var(--color-border)",
+                  borderRadius: "999px",
+                  padding: "8px 12px",
+                  fontSize: "0.82rem",
+                }}
+              >
+                {portfolio.name || portfolio.id}
+              </Link>
+            ))}
+          </div>
+        </div>
+      ) : null}
+
+      <RenameModal
+        open={showRenameModal}
+        title="Rename Strategy"
+        label="Displayed strategy name"
+        value={detail.name}
+        helperText={renameError || "This updates STRATEGY_META.name while keeping the strategy slug stable."}
+        saving={savingRename}
+        onClose={() => {
+          setShowRenameModal(false);
+          setRenameError("");
+        }}
+        onSave={handleRename}
+      />
 
       <CreateBacktestModal
         open={showCreateModal}

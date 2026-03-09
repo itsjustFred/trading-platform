@@ -1,7 +1,9 @@
 export interface StrategyMeta {
+  slug: string;
   name: string;
   version: string;
   file: string;
+  created_at: string;
   tags: Record<string, any>;
   type: string[];
   source: string;
@@ -14,12 +16,16 @@ export interface StrategyMeta {
 
 export interface StrategyDetail extends StrategyMeta {
   link: string;
+  documentation_markdown: string;
   backtests: BacktestSummary[];
   portfolios: PortfolioRef[];
 }
 
 export interface BacktestSummary {
   id: string;
+  title: string;
+  notes: string;
+  strategy_slug: string;
   engine: string;
   symbols: string[];
   timeframes: string[];
@@ -71,7 +77,12 @@ export interface Trade {
 
 export interface BacktestInfo {
   id: string;
+  title: string;
+  notes: string;
   strategy: string;
+  strategy_slug: string;
+  strategy_display_name: string;
+  strategy_file: string;
   engine: string;
   symbols: string[];
   timeframes: string[];
@@ -99,6 +110,8 @@ export interface BacktestStats {
   avg_bars_held: number;
   calmar: number;
   expectancy: number;
+  psr?: number;
+  p_value?: number;
   [key: string]: any;
 }
 
@@ -109,13 +122,19 @@ export interface EquityPoint {
 
 export interface BacktestListItem {
   id: string;
+  title?: string;
+  notes?: string;
   strategy: string;
+  strategy_slug?: string;
+  strategy_display_name?: string;
+  strategy_file?: string;
   engine: string;
   symbols: string[];
   timeframes: string[];
   trade_count: number;
   start: string;
   end: string;
+  created_at?: string;
 }
 
 export interface TradeDetail extends Trade {
@@ -145,6 +164,8 @@ export interface PortfolioSummary {
   cagr: number;
   max_drawdown: number;
   net_profit: number;
+  psr?: number;
+  p_value?: number;
   created_at: string;
 }
 
@@ -159,6 +180,8 @@ export interface PortfolioDetail {
     cagr: number;
     max_drawdown: number;
     net_profit: number;
+    psr?: number;
+    p_value?: number;
     correlation_matrix: Record<string, any>;
   };
   combined_equity: { time: string; equity: number }[];
@@ -277,6 +300,11 @@ export interface DataTaskLogsResponse {
 export interface DataTaskStartResponse {
   task_id: string;
   status: string;
+}
+
+export interface AgentConvertRequest {
+  code: string;
+  strategy_name?: string;
 }
 
 export interface CompareResult {

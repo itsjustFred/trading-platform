@@ -16,8 +16,9 @@ from typing import Any
 
 import pandas as pd
 from scipy.stats import norm as _norm_dist
+from scipy.stats import ttest_1samp
 
-from shared.models import BacktestResult, EquityPoint, Trade
+from shared.models import BacktestResult, BacktestStats, EquityPoint, Trade
 
 logger = logging.getLogger(__name__)
 
@@ -101,9 +102,12 @@ def compute_stats(
     cagr = 0.0
     total_return = 0.0
     psr = None  # Probabilistic Sharpe Ratio
+    p_value = 1.0
 
     if equity_curve and len(equity_curve) > 1:
         equities = [e.equity for e in equity_curve]
+        daily_returns = _daily_returns_from_equity_curve(equity_curve)
+        p_value = _one_sided_p_value(daily_returns)
 
         if HAS_QUANTSTATS:
             returns_series = _equity_to_returns_series(equity_curve)
@@ -129,7 +133,6 @@ def compute_stats(
         else:
             # Fallback to manual calculations
             max_drawdown_pct = -_max_drawdown_pct_manual(equities)
-            daily_returns = _daily_returns(equities)
             if len(daily_returns) > 1:
                 sharpe_ratio = _sharpe_manual(daily_returns, risk_free_rate)
                 sortino_ratio = _sortino_manual(daily_returns, risk_free_rate)
@@ -143,34 +146,28 @@ def compute_stats(
                 max_drawdown_duration = _max_drawdown_duration(equities)
                 psr = _probabilistic_sharpe_manual(daily_returns, sharpe_ratio)
 
-    stats: dict[str, Any] = {
-        "total_trades": total_trades,
-        "winners": win_count,
-        "losers": loss_count,
-        "win_rate": round(win_rate, 4),
-        "profit_factor": round(profit_factor, 4) if profit_factor != float("inf") else None,
-        "total_pnl": round(total_pnl, 2),
-        "avg_winner": round(avg_winner, 2),
-        "avg_loser": round(avg_loser, 2),
-        "max_consecutive_wins": max_consecutive_wins,
-        "max_consecutive_losses": max_consecutive_losses,
-    }
-
-    if avg_holding_bars is not None:
-        stats["avg_holding_bars"] = round(avg_holding_bars, 1)
-
-    if equity_curve and len(equity_curve) > 1:
-        stats["max_drawdown_pct"] = round(float(max_drawdown_pct), 6)
-        stats["max_drawdown_duration"] = max_drawdown_duration
-        stats["sharpe_ratio"] = round(float(sharpe_ratio), 4)
-        stats["sortino_ratio"] = round(float(sortino_ratio), 4)
-        stats["calmar_ratio"] = round(float(calmar_ratio), 4)
-        stats["cagr"] = round(float(cagr), 6)
-        stats["total_return"] = round(float(total_return), 6)
-        if psr is not None:
-            stats["psr"] = round(float(psr), 4)
-
-    return stats
+    return BacktestStats(
+        total_trades=total_trades,
+        winners=win_count,
+        losers=loss_count,
+        win_rate=round(win_rate, 4),
+        profit_factor=round(profit_factor, 4) if profit_factor != float("inf") else None,
+        total_pnl=round(total_pnl, 2),
+        avg_winner=round(avg_winner, 2),
+        avg_loser=round(avg_loser, 2),
+        max_consecutive_wins=max_consecutive_wins,
+        max_consecutive_losses=max_consecutive_losses,
+        avg_holding_bars=round(avg_holding_bars, 1) if avg_holding_bars is not None else None,
+        max_drawdown_pct=round(float(max_drawdown_pct), 6),
+        max_drawdown_duration=max_drawdown_duration,
+        sharpe_ratio=round(float(sharpe_ratio), 4),
+        sortino_ratio=round(float(sortino_ratio), 4),
+        calmar_ratio=round(float(calmar_ratio), 4),
+        cagr=round(float(cagr), 6),
+        total_return=round(float(total_return), 6),
+        psr=round(float(psr), 4) if psr is not None else None,
+        p_value=round(float(p_value), 6),
+    ).to_dict()
 
 
 def compute_stats_for_result(
@@ -232,18 +229,7 @@ def _safe_qs(func, returns: pd.Series, **kwargs) -> float:
 
 
 def _empty_stats() -> dict[str, Any]:
-    return {
-        "total_trades": 0,
-        "winners": 0,
-        "losers": 0,
-        "win_rate": 0.0,
-        "profit_factor": None,
-        "total_pnl": 0.0,
-        "avg_winner": 0.0,
-        "avg_loser": 0.0,
-        "max_consecutive_wins": 0,
-        "max_consecutive_losses": 0,
-    }
+    return BacktestStats().to_dict()
 
 
 def _max_consecutive(pnls: list[float], positive: bool = False) -> int:
@@ -300,6 +286,41 @@ def _daily_returns(equities: list[float]) -> list[float]:
         else:
             returns.append(0.0)
     return returns
+
+
+def _daily_returns_from_equity_curve(equity_curve: list[EquityPoint]) -> list[float]:
+    """Compute daily returns from an equity curve, falling back to raw period returns."""
+    if len(equity_curve) < 2:
+        return []
+
+    equities = [point.equity for point in equity_curve]
+
+    try:
+        timestamps = pd.to_datetime([point.time for point in equity_curve], utc=True)
+        series = pd.Series(equities, index=timestamps, dtype=float).sort_index()
+        daily_equity = series.resample("D").last().ffill()
+        daily_returns = daily_equity.pct_change().dropna()
+        if not daily_returns.empty:
+            return [float(value) for value in daily_returns.tolist() if pd.notna(value)]
+    except Exception:
+        logger.debug("Falling back to raw period returns for p-value calculation", exc_info=True)
+
+    return _daily_returns(equities)
+
+
+def _one_sided_p_value(returns: list[float]) -> float:
+    """Compute the one-sided p-value for mean returns > 0; return 1.0 on failure."""
+    try:
+        clean_returns = [float(value) for value in returns if pd.notna(value)]
+        if not clean_returns:
+            return 1.0
+        _, p_value = ttest_1samp(clean_returns, popmean=0.0, alternative="greater")
+        p_value_float = float(p_value)
+        if math.isnan(p_value_float) or math.isinf(p_value_float):
+            return 1.0
+        return max(0.0, min(1.0, p_value_float))
+    except Exception:
+        return 1.0
 
 
 def _sharpe_manual(returns: list[float], risk_free_rate: float) -> float:

@@ -9,8 +9,8 @@ It refines the existing instructions with corrected command expectations, naming
 - `pyproject.toml` (Python deps, pytest config, ruff config)
 - `frontend/package.json` and `frontend/vite.config.ts` (frontend scripts and API proxy)
 - `docs/logging_guide.md` (structured logging usage and env vars)
-- `docs/data_sources.md` (data source and path conventions)
-- `docs/metrics_comparison.md` (metric semantics, especially drawdown/Calmar context)
+- `docs/DATA_SOURCES.md` (data source and path conventions)
+- `docs/ARCHITECTURE.md` (current system architecture and module responsibilities)
 - `docs/pynecore_evaluation.md` (PyneCore integration constraints)
 
 No additional assistant-specific config files were found (`CLAUDE.md`, `AGENTS.md`, `.cursorrules`, `.cursor/rules/`, `.windsurfrules`, `.clinerules`, `.cline_rules`, `CONVENTIONS.md`, `AIDER_CONVENTIONS.md`).
@@ -26,7 +26,7 @@ pip install -e ".[all]"
 
 ```bash
 # Run a backtest
-python -m runner.cli run -e vectorbt -s strategies/example_sma.py \
+python -m runner.cli run -e vectorbt -s strategies/example_sma/example_sma.py \
   --symbols AAPL --timeframe 1h --start 2024-01-01 --end 2025-12-31
 
 # List available engines

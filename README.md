@@ -27,6 +27,7 @@ cd frontend && npm install && npm run build && cd ..
 # Start the viewer
 python -m viewer.app --port 5556
 # Open http://localhost:5556
+# Strategy Lab live conversion runs also require NVIDIA_API_KEY
 ```
 
 ## Data Directory
@@ -49,7 +50,7 @@ Set the `TRADING_DATA_DIR` environment variable (in `.env` or your shell) to cus
 # Run a backtest
 python -m runner.cli run \
   --engine vectorbt \
-  --strategy strategies/example_sma.py \
+  --strategy strategies/example_sma/example_sma.py \
   --symbols AAPL \
   --timeframe 1h \
   --start 2024-01-01 --end 2025-12-31
@@ -57,6 +58,11 @@ python -m runner.cli run \
 # Convert existing results
 python -m runner.converters.cli stockkit path/to/trades.csv -o output.trades.json
 python -m runner.converters.cli lean path/to/lean_result.json -o output.trades.json
+
+# Use the Strategy Lab auto-conversion agent from the web UI
+# 1. Export NVIDIA_API_KEY
+# 2. Start the viewer
+# 3. Open http://localhost:5556/lab
 
 # Build data catalog
 python -m data_tools.catalog_builder -o "$TRADING_DATA_DIR/catalog.json"
@@ -93,7 +99,10 @@ data_tools/          — Data management
   catalog_builder.py — Scan $TRADING_DATA_DIR → catalog.json
   downloaders/       — Dukascopy, HistData, DoltHub, cTrader, HuggingFace
 
-strategies/          — Strategy collection
+strategies/          — Per-strategy folders
+  <name>/            — Strategy assets
+    <name>.py        — Executable strategy module
+    README.md        — Strategy dossier / conversion notes
 
 tests/               — Test suite
 ```
@@ -106,12 +115,14 @@ tests/               — Test suite
 | `LOG_DIR` | `~/logs` | Log file directory |
 | `LOG_LEVEL` | `INFO` | Logging level |
 | `FLASK_PORT` | `5556` | Viewer server port |
+| `NVIDIA_API_KEY` | — | API key for the Strategy Lab auto-conversion agent via NVIDIA NIM |
 
 ## Writing a Strategy (vectorbt)
 
-Create a Python file with a `generate_signals` function. The preferred contract is
-to return `entries`, `exits`, and an `indicators_dict` that will be written into
-each trade's `meta` payload by the adapter:
+Create a strategy folder such as `strategies/my_strategy/` with a main module
+`my_strategy.py`. The preferred vectorbt contract is to return `entries`, `exits`,
+and an `indicators_dict` that will be written into each trade's `meta` payload
+by the adapter:
 
 ```python
 def generate_signals(df: pd.DataFrame, params: dict):
@@ -131,7 +142,7 @@ older strategies, but new or converted strategies should use the tuple format ab
 
 Run with parameters:
 ```bash
-python -m runner.cli run -e vectorbt -s my_strategy.py --symbols AAPL -tf 1h \
+python -m runner.cli run -e vectorbt -s strategies/my_strategy/my_strategy.py --symbols AAPL -tf 1h \
   --params '{"fast": 5, "slow": 20}'
 ```
 

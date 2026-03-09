@@ -5,13 +5,14 @@ import { FilterBar } from "../components/FilterBar";
 import { CreateBacktestModal } from "../components/CreateBacktestModal";
 import { Plus, GitCompare } from "lucide-react";
 import { Sparkline } from "../components/Sparkline";
+import { formatPValue, metricValue, pValueColor, pValueMetric } from "../utils/stats";
 
 export function BacktestsPage() {
   const navigate = useNavigate();
   const [backtests, setBacktests] = useState<any[]>([]);
   const [search, setSearch] = useState("");
   const [filters, setFilters] = useState<Record<string, string>>({});
-  const [sortBy, setSortBy] = useState("created_at");
+  const [sortBy, setSortBy] = useState("sharpe");
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(true);
   const [showCreateModal, setShowCreateModal] = useState(false);
@@ -43,6 +44,8 @@ export function BacktestsPage() {
       const s = search.toLowerCase();
       const matchSearch =
         !s ||
+        bt.title?.toLowerCase().includes(s) ||
+        bt.strategy_display_name?.toLowerCase().includes(s) ||
         bt.strategy?.toLowerCase().includes(s) ||
         bt.id?.toLowerCase().includes(s) ||
         bt.symbols?.some((sym: string) => sym.toLowerCase().includes(s));
@@ -56,12 +59,32 @@ export function BacktestsPage() {
 
     result.sort((a, b) => {
       switch (sortBy) {
-        case "trades":
+        case "created_desc":
+          return Date.parse(b.created_at || "") - Date.parse(a.created_at || "");
+        case "created_asc":
+          return Date.parse(a.created_at || "") - Date.parse(b.created_at || "");
+        case "name_asc":
+          return (a.title || a.strategy_display_name || a.strategy || "").localeCompare(
+            b.title || b.strategy_display_name || b.strategy || "",
+          );
+        case "name_desc":
+          return (b.title || b.strategy_display_name || b.strategy || "").localeCompare(
+            a.title || a.strategy_display_name || a.strategy || "",
+          );
+        case "trades_desc":
           return (b.trade_count || 0) - (a.trade_count || 0);
-        case "strategy":
-          return (a.strategy || "").localeCompare(b.strategy || "");
+        case "trades_asc":
+          return (a.trade_count || 0) - (b.trade_count || 0);
+        case "psr":
+          return metricValue(b.psr) - metricValue(a.psr);
+        case "cagr":
+          return metricValue(b.cagr) - metricValue(a.cagr);
+        case "p_value":
+          return pValueMetric(a.p_value) - pValueMetric(b.p_value);
+        case "net_profit":
+          return metricValue(b.net_profit) - metricValue(a.net_profit);
         default:
-          return (b.created_at || "").localeCompare(a.created_at || "");
+          return metricValue(b.sharpe) - metricValue(a.sharpe);
       }
     });
     return result;
@@ -155,9 +178,17 @@ export function BacktestsPage() {
         filterValues={filters}
         onFilterChange={(k, v) => setFilters((prev) => ({ ...prev, [k]: v }))}
         sortOptions={[
-          { label: "Newest first", value: "created_at" },
-          { label: "Most trades", value: "trades" },
-          { label: "Strategy A-Z", value: "strategy" },
+          { label: "Creation Date (Newest First)", value: "created_desc" },
+          { label: "Creation Date (Oldest First)", value: "created_asc" },
+          { label: "Name (A-Z)", value: "name_asc" },
+          { label: "Name (Z-A)", value: "name_desc" },
+          { label: "Trade Count (High to Low)", value: "trades_desc" },
+          { label: "Trade Count (Low to High)", value: "trades_asc" },
+          { label: "Sharpe Ratio (High to Low)", value: "sharpe" },
+          { label: "PSR (High to Low)", value: "psr" },
+          { label: "CAGR (High to Low)", value: "cagr" },
+          { label: "P-Value (Low to High)", value: "p_value" },
+          { label: "Net Profit (High to Low)", value: "net_profit" },
         ]}
         sortValue={sortBy}
         onSortChange={setSortBy}
@@ -219,20 +250,23 @@ export function BacktestsPage() {
                   alignItems: "start",
                   marginBottom: "8px",
                 }}
-              >
-                <div>
-                  <div style={{ fontWeight: 600, fontSize: "0.9rem" }}>
-                    {bt.strategy || "Unknown"}
+                >
+                  <div>
+                    <div style={{ fontWeight: 600, fontSize: "0.9rem" }}>
+                      {bt.title || bt.strategy_display_name || bt.strategy || "Unknown"}
+                    </div>
+                    <div
+                      style={{
+                        color: "var(--color-text-muted)",
+                        fontSize: "0.75rem",
+                      }}
+                    >
+                      {bt.engine}
+                      {bt.title && bt.strategy_display_name && bt.title !== bt.strategy_display_name
+                        ? ` • ${bt.strategy_display_name}`
+                        : ""}
+                    </div>
                   </div>
-                  <div
-                    style={{
-                      color: "var(--color-text-muted)",
-                      fontSize: "0.75rem",
-                    }}
-                  >
-                    {bt.engine}
-                  </div>
-                </div>
                 <input
                   type="checkbox"
                   checked={selected.has(bt.id)}
@@ -252,6 +286,9 @@ export function BacktestsPage() {
               >
                 <span>{bt.symbols?.join(", ") || "—"}</span>
                 <span>{(bt.timeframes || []).join(", ") || "—"}</span>
+                {bt.created_at ? (
+                  <span>{new Date(bt.created_at).toLocaleDateString("en-US")}</span>
+                ) : null}
               </div>
               {bt.equity_mini && bt.equity_mini.length > 1 && (
                 <div style={{ margin: "6px 0" }}>
@@ -331,6 +368,12 @@ export function BacktestsPage() {
                     </b>
                   </span>
                 )}
+                <span>
+                  P-Value{" "}
+                  <b style={{ color: pValueColor(bt.p_value) }}>
+                    {formatPValue(bt.p_value)}
+                  </b>
+                </span>
               </div>
               <div
                 style={{

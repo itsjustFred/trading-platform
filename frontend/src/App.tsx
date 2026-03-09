@@ -10,6 +10,7 @@ import { PortfoliosPage } from "./pages/PortfoliosPage";
 import { PortfolioDetailPage } from "./pages/PortfolioDetailPage";
 import { LoggingPage } from "./pages/LoggingPage";
 import { DataManagementPage } from "./pages/DataManagementPage";
+import { StrategyLabPage } from "./pages/StrategyLabPage";
 
 export default function App() {
   return (
@@ -27,6 +28,7 @@ export default function App() {
           <Route path="/strategies/:name" element={<StrategyDetailPage />} />
           <Route path="/portfolios" element={<PortfoliosPage />} />
           <Route path="/portfolios/:id" element={<PortfolioDetailPage />} />
+          <Route path="/lab" element={<StrategyLabPage />} />
           <Route path="/logging" element={<LoggingPage />} />
         </Routes>
       </main>

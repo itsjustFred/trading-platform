@@ -22,8 +22,6 @@ Das Protokoll ist eine **strikt sequenzielle Pflicht-Checkliste**. Jeder Schritt
 - „Konvertiere X (Agent-Protokoll)"
 - „Verwende das Konvertierungs-Protokoll für Strategie X"
 
-Lies bei Aktivierung zuerst `docs/STRATEGY_CONVERSION_AGENT.md` für ergänzende Hintergrundinformationen.
-
 ---
 
 ## Pflicht-Workflow (8 Schritte)
@@ -53,7 +51,7 @@ Lies bei Aktivierung zuerst `docs/STRATEGY_CONVERSION_AGENT.md` für ergänzende
 **Eingabe:** Analyseergebnis aus Schritt 1.
 
 **Führe aus:**
-1. Erstelle die Datei `strategies/<name>.md` (wobei `<name>` der snake_case-Name der Strategie ist).
+1. Erstelle die Datei `strategies/<name>/README.md` (wobei `<name>` der snake_case-Name der Strategie ist).
 2. Die Datei muss folgende Abschnitte enthalten:
 
 ```markdown
@@ -97,14 +95,14 @@ Lies bei Aktivierung zuerst `docs/STRATEGY_CONVERSION_AGENT.md` für ergänzende
 
 3. **Gate:** Die Datei muss physisch auf Disk existieren, bevor Schritt 3 beginnt.
 
-**Ausgabe:** `strategies/<name>.md`
+**Ausgabe:** `strategies/<name>/README.md`
 
 ---
 
 ### SCHRITT 3 — Framework-Wahl
 
 **Führe aus:**
-Wähle das Engine-Framework nach dieser Entscheidungsmatrix und dokumentiere die Wahl in `strategies/<name>.md` unter „Framework-Empfehlung":
+Wähle das Engine-Framework nach dieser Entscheidungsmatrix und dokumentiere die Wahl in `strategies/<name>/README.md` unter „Framework-Empfehlung":
 
 | Kriterium | Empfehlung |
 |-----------|------------|
@@ -121,10 +119,10 @@ Wähle das Engine-Framework nach dieser Entscheidungsmatrix und dokumentiere die
 
 ### SCHRITT 4 — Coding der Strategie
 
-**Eingabe:** Ground-Truth aus `strategies/<name>.md`, gewähltes Framework.
+**Eingabe:** Ground-Truth aus `strategies/<name>/README.md`, gewähltes Framework.
 
 **Führe aus:**
-1. Erstelle `strategies/<name>.py`.
+1. Erstelle `strategies/<name>/<name>.py`.
 2. Das `STRATEGY_META`-Dictionary muss vollständig sein:
 
 ```python
@@ -171,11 +169,11 @@ STRATEGY_META = {
 
 5. **Gate:** Compilierbarkeit prüfen:
    ```bash
-   python -c "import importlib.util; spec = importlib.util.spec_from_file_location('s', 'strategies/<name>.py'); mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod); print('OK')"
+   python -c "import importlib.util; spec = importlib.util.spec_from_file_location('s', 'strategies/<name>/<name>.py'); mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod); print('OK')"
    ```
    Schlägt die Prüfung fehl → korrigiere Syntax-/Import-Fehler. Fahre nicht fort.
 
-**Ausgabe:** `strategies/<name>.py`
+**Ausgabe:** `strategies/<name>/<name>.py`
 
 ---
 
@@ -208,7 +206,7 @@ STRATEGY_META = {
 ```bash
 python -m runner.cli run \
   --engine <engine> \
-  --strategy strategies/<name>.py \
+  --strategy strategies/<name>/<name>.py \
   --symbols <SYMBOL> \
   --timeframe <tf> \
   --risk-pct 0.01 \
@@ -297,7 +295,7 @@ assert risk_pct_actual <= 0.011, (
 
 2. **Exit-Preis (bei Trailing Stop):** Prüfe, ob `exit_price` ≈ `trailing_stop_at_exit` aus `Trade.meta` (Toleranz: ±0.1 %). Wenn der Trailing-Stop-Wert fehlt, ist das selbst ein Fehler → gehe zu Schritt 7.3.
 
-3. **Partial Exit (Trade C):** Überprüfe, ob der erste Exit-Preis der TP1-Bedingung entspricht (aus Ground-Truth in `strategies/<name>.md`).
+3. **Partial Exit (Trade C):** Überprüfe, ob der erste Exit-Preis der TP1-Bedingung entspricht (aus Ground-Truth in `strategies/<name>/README.md`).
 
 4. **Dokumentiere** die Ergebnisse als kurze Tabelle in der Session:
 
@@ -317,7 +315,7 @@ assert risk_pct_actual <= 0.011, (
    - **Risk-Sizing-Fehler:** `sl_price` fehlt in `Trade.meta`, `stop_distance` falsch berechnet, Sizing-Formel in `generate_signals` fehlerhaft.
    - **Logic-Fehler:** Falscher Entry/Exit-Bar (Lookahead-Bug), falscher Indikator-Wert, falscher Partial-Exit-Level.
 
-2. Korrigiere den Fehler in `strategies/<name>.py`.
+2. Korrigiere den Fehler in `strategies/<name>/<name>.py`.
 
 3. Starte den Backtest neu (Schritt 6) und wiederhole die Validierung (Schritt 7).
 
@@ -462,8 +460,8 @@ class TestStrategyRegression:
 
 Bevor die Konvertierung als abgeschlossen gilt, müssen ALLE folgenden Dateien existieren:
 
-- [ ] `strategies/<name>.md` — Ground-Truth-Dokumentation
-- [ ] `strategies/<name>.py` — Strategie-Code mit vollständigem `STRATEGY_META` und `Trade.meta`-Feldern
+- [ ] `strategies/<name>/README.md` — Ground-Truth-Dokumentation
+- [ ] `strategies/<name>/<name>.py` — Strategie-Code mit vollständigem `STRATEGY_META` und `Trade.meta`-Feldern
 - [ ] `~/data/backtests/<name>_<timestamp>.trades.json` — validierter Backtest-Output
 - [ ] `tests/strategies/test_<name>.py` — grüner Regressionstest
 
@@ -493,11 +491,10 @@ Melde dem User den Abschluss mit einer kurzen Zusammenfassung:
 ## Referenz-Materialien
 
 Lies diese Dateien bei Bedarf:
-- `docs/STRATEGY_CONVERSION_AGENT.md` — Ausführliche Hintergrunddokumentation
 - `docs/pynecore_evaluation.md` — PyneCore-spezifische Einschränkungen und API
-- `docs/data_sources.md` — Datenpfad-Konventionen und verfügbare Datenquellen
+- `docs/DATA_SOURCES.md` — Datenpfad-Konventionen und verfügbare Datenquellen
 - `shared/models.py` — `Trade.meta`, `TradeExit`, `BacktestResult` Datenmodell
 - `runner/engines/vectorbt_adapter.py` — Risk-Sizing-Logik (`stop_loss`/ATR/Fallback)
 - `runner/engines/base.py` — `BacktestConfig` mit `risk_per_trade_pct`
-- `strategies/example_sma.py` — Minimales vectorbt-Strategie-Template
-- `strategies/pine_supertrend_dema.py` — Komplexeres Template mit Trailing Stop
+- `strategies/example_sma/example_sma.py` — Minimales vectorbt-Strategie-Template
+- `strategies/pine_supertrend_dema/pine_supertrend_dema.py` — Komplexeres Template mit Trailing Stop

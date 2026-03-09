@@ -20,7 +20,7 @@ from runner.engines.base import BacktestConfig
 from runner.engines.vectorbt_adapter import VectorbtAdapter
 
 
-STRATEGY_PATH = str(Path(__file__).parent.parent.parent / "strategies" / "pine_superosc_vumanchu.py")
+STRATEGY_PATH = str(Path(__file__).parent.parent.parent / "strategies" / "pine_superosc_vumanchu" / "pine_superosc_vumanchu.py")
 TEST_START = "2025-01-01"
 TEST_END = "2025-03-31"
 TEST_SYMBOL = "XAUUSD"

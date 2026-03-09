@@ -11,6 +11,7 @@ import {
   CrosshairMode,
 } from "lightweight-charts";
 import type { IChartApi, Time } from "lightweight-charts";
+import { formatPValue, pValueColor } from "../utils/stats";
 
 export function PortfolioDetailPage() {
   const { id } = useParams<{ id: string }>();
@@ -110,6 +111,24 @@ export function PortfolioDetailPage() {
           label="CAGR"
           value={((stats.cagr || 0) * 100).toFixed(2)}
           format="percent"
+        />
+        <StatCard
+          label="PSR"
+          value={
+            stats.psr != null ? `${(Number(stats.psr) * 100).toFixed(1)}%` : "N/A"
+          }
+          color={
+            Number(stats.psr) > 0.95
+              ? "#3fb950"
+              : Number(stats.psr) > 0.5
+                ? "#d29922"
+                : "#f85149"
+          }
+        />
+        <StatCard
+          label="P-Value"
+          value={formatPValue(stats.p_value)}
+          color={pValueColor(stats.p_value)}
         />
         <StatCard
           label="Max Drawdown"

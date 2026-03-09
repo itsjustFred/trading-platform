@@ -20,7 +20,7 @@ from runner.engines.base import BacktestConfig
 from runner.engines.vectorbt_adapter import VectorbtAdapter
 
 
-STRATEGY_PATH = str(Path(__file__).parent.parent.parent / "strategies" / "pine_supertrend_dema.py")
+STRATEGY_PATH = str(Path(__file__).parent.parent.parent / "strategies" / "pine_supertrend_dema" / "pine_supertrend_dema.py")
 TEST_START = "2025-04-01"
 TEST_END = "2025-06-30"
 TEST_SYMBOL = "US500"

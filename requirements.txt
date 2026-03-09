@@ -43,6 +43,7 @@ nbformat==5.10.4
 neo4j==6.1.0
 numba==0.61.2
 numpy==2.2.6
+openai==2.11.0
 packaging==26.0
 pandas==3.0.1
 pandas-ta==0.4.71b0
