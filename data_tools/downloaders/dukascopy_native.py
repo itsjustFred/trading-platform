@@ -24,9 +24,11 @@ import lzma
 import logging
 import struct
 import sys
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from threading import Event
+from typing import Any, Callable
 
 import pandas as pd
 
@@ -34,6 +36,17 @@ from data_tools.downloaders.base import DownloadResult, Downloader, SourceMeta
 from shared.constants import DATA_DIR, resolve_genesis_path
 
 logger = logging.getLogger(__name__)
+
+
+class DownloadCancelled(RuntimeError):
+    """Raised when a controlled download is cancelled by the caller."""
+
+
+@dataclass(frozen=True, slots=True)
+class FetchResult:
+    dt: datetime
+    data: bytes
+    throttle_signal: bool = False
 
 URL_ROOT = "https://datafeed.dukascopy.com/datafeed"
 
@@ -66,7 +79,7 @@ def _get_decimal_factor(instrument: str) -> int:
     return int(entry.get("decimal_factor", 1))
 
 
-# ─── Symbol/instrument resolution (matches existing dukascopy_dl.py) ─────────
+# ─── Symbol/instrument resolution ───────────────────────────────────────────
 
 SYMBOL_CONFIG: dict[str, dict[str, str]] = {
     "EURUSD": {"instrument": "eurusd", "asset_class": "forex"},
@@ -267,76 +280,206 @@ def _looks_like_html(data: bytes) -> bool:
     return b"<html" in head or b"<!doctype" in head
 
 
+def _emit_log_message(
+    message: str,
+    *,
+    level: str = "info",
+    log_callback: Callable[[str], None] | None = None,
+) -> None:
+    log_method = getattr(logger, level, logger.info)
+    log_method(message)
+    if log_callback is not None:
+        prefix = level.upper()
+        log_callback(f"{prefix}  {message}")
+
+
+def _report_progress(
+    callback: Callable[[float, str], None] | None,
+    percent: float,
+    message: str,
+) -> None:
+    if callback is None:
+        return
+    callback(max(0.0, min(100.0, round(percent, 2))), message)
+
+
+async def _wait_for_control(
+    pause_event: Event | None,
+    stop_event: Event | None,
+) -> None:
+    if stop_event is not None and stop_event.is_set():
+        raise DownloadCancelled("Download cancelled by user.")
+    while pause_event is not None and pause_event.is_set():
+        if stop_event is not None and stop_event.is_set():
+            raise DownloadCancelled("Download cancelled by user.")
+        await asyncio.sleep(1)
+
+
+async def _sleep_with_control(
+    delay_seconds: float,
+    pause_event: Event | None,
+    stop_event: Event | None,
+) -> None:
+    remaining = max(delay_seconds, 0.0)
+    while remaining > 0:
+        await _wait_for_control(pause_event, stop_event)
+        step = min(0.25, remaining)
+        await asyncio.sleep(step)
+        remaining -= step
+
+
+def _looks_like_invalid_bi5(data: bytes) -> bool:
+    if not data or _looks_like_html(data):
+        return True
+    try:
+        lzma.decompress(data)
+    except lzma.LZMAError:
+        return True
+    return False
+
+
 async def _fetch_one(
     session: Any,
     dt: datetime,
     url: str,
     semaphore: asyncio.Semaphore,
     max_retries: int = 3,
-) -> tuple[datetime, bytes]:
+    *,
+    pause_event: Event | None = None,
+    stop_event: Event | None = None,
+) -> FetchResult:
     """Download a single .bi5 file with rate-limit awareness."""
+    throttle_signal = False
     for attempt in range(max_retries + 1):
+        await _wait_for_control(pause_event, stop_event)
         async with semaphore:
             try:
                 async with session.get(url, timeout=30) as resp:
                     data = await resp.read()
 
                     if resp.status == 404:
-                        return (dt, b"")
+                        return FetchResult(dt=dt, data=b"", throttle_signal=throttle_signal)
+
+                    if resp.status in {403, 429}:
+                        throttle_signal = True
 
                     if resp.status != 200:
                         if attempt < max_retries:
-                            await asyncio.sleep(2 ** attempt)
+                            await _sleep_with_control(2 ** attempt, pause_event, stop_event)
                             continue
                         logger.warning("HTTP %d for %s after %d retries", resp.status, url, max_retries)
-                        return (dt, b"")
+                        return FetchResult(dt=dt, data=b"", throttle_signal=throttle_signal)
 
-                    if len(data) == 0 or _looks_like_html(data):
+                    if _looks_like_invalid_bi5(data):
                         is_weekday = dt.weekday() < 5
+                        if is_weekday:
+                            throttle_signal = True
                         if is_weekday and attempt < max_retries:
-                            await asyncio.sleep(2 ** attempt)
+                            await _sleep_with_control(2 ** attempt, pause_event, stop_event)
                             continue
-                        return (dt, b"")
+                        return FetchResult(dt=dt, data=b"", throttle_signal=throttle_signal)
 
-                    return (dt, data)
+                    return FetchResult(dt=dt, data=data, throttle_signal=throttle_signal)
             except (asyncio.TimeoutError, OSError) as exc:
                 if attempt < max_retries:
                     logger.debug("Retry %d/%d for %s: %s", attempt + 1, max_retries, url, exc)
-                    await asyncio.sleep(2 ** attempt)
+                    await _sleep_with_control(2 ** attempt, pause_event, stop_event)
                     continue
                 logger.warning("Failed to fetch %s after %d retries: %s", url, max_retries, exc)
-                return (dt, b"")
+                return FetchResult(dt=dt, data=b"", throttle_signal=throttle_signal)
 
-    return (dt, b"")
+    return FetchResult(dt=dt, data=b"", throttle_signal=throttle_signal)
 
 
 async def download_bi5_files(
     urls: list[tuple[datetime, str]],
     concurrency: int = 10,
     max_retries: int = 3,
-    on_progress: Any = None,
+    *,
+    batch_size: int | None = None,
+    pause_ms: int = 1000,
+    report_progress: Callable[[float, str], None] | None = None,
+    stop_event: Event | None = None,
+    pause_event: Event | None = None,
+    log_callback: Callable[[str], None] | None = None,
 ) -> list[tuple[datetime, bytes]]:
-    """Download .bi5 files asynchronously with concurrency limit."""
+    """Download .bi5 files asynchronously in controllable batches."""
     import aiohttp
 
-    semaphore = asyncio.Semaphore(concurrency)
+    effective_batch_size = max(1, int(batch_size or concurrency or 10))
+    current_pause_ms = max(0, int(pause_ms))
+    semaphore = asyncio.Semaphore(effective_batch_size)
     results: list[tuple[datetime, bytes]] = []
     total = len(urls)
     completed = 0
 
-    connector = aiohttp.TCPConnector(limit=concurrency, force_close=False)
+    if total == 0:
+        _report_progress(report_progress, 100.0, "No files to download")
+        return []
+
+    connector = aiohttp.TCPConnector(limit=effective_batch_size, force_close=False)
     timeout = aiohttp.ClientTimeout(total=60, connect=15)
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-        tasks = [
-            _fetch_one(session, dt, url, semaphore, max_retries)
-            for dt, url in urls
-        ]
-        for coro in asyncio.as_completed(tasks):
-            result = await coro
-            results.append(result)
-            completed += 1
-            if on_progress:
-                on_progress(completed, total)
+        try:
+            for batch_index, offset in enumerate(range(0, total, effective_batch_size), start=1):
+                await _wait_for_control(pause_event, stop_event)
+                batch = urls[offset : offset + effective_batch_size]
+                tasks = [
+                    asyncio.create_task(
+                        _fetch_one(
+                            session,
+                            dt,
+                            url,
+                            semaphore,
+                            max_retries,
+                            pause_event=pause_event,
+                            stop_event=stop_event,
+                        )
+                    )
+                    for dt, url in batch
+                ]
+                try:
+                    batch_results = await asyncio.gather(*tasks)
+                except DownloadCancelled:
+                    for task in tasks:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    raise
+                finally:
+                    for task in tasks:
+                        if not task.done():
+                            task.cancel()
+
+                batch_throttled = False
+                for result in batch_results:
+                    results.append((result.dt, result.data))
+                    batch_throttled = batch_throttled or result.throttle_signal
+                    completed += 1
+                    _report_progress(
+                        report_progress,
+                        (completed / total) * 100.0,
+                        f"Downloaded {completed}/{total} files",
+                    )
+
+                has_more_batches = completed < total
+                if not has_more_batches:
+                    continue
+
+                if batch_throttled:
+                    current_pause_ms = current_pause_ms * 2 if current_pause_ms > 0 else 1000
+                    _emit_log_message(
+                        (
+                            "Potential Dukascopy rate-limit detected in batch "
+                            f"{batch_index}; increasing pause to {current_pause_ms} ms."
+                        ),
+                        level="warning",
+                        log_callback=log_callback,
+                    )
+
+                await _sleep_with_control(current_pause_ms / 1000.0, pause_event, stop_event)
+        except DownloadCancelled:
+            raise
 
     return results
 
@@ -499,29 +642,53 @@ async def _download_and_assemble_merged_ticks(
     instrument: str,
     start_dt: datetime,
     end_dt: datetime,
-    concurrency: int,
+    batch_size: int,
+    pause_ms: int,
     max_retries: int,
-    on_progress: Any = None,
+    report_progress: Callable[[float, str], None] | None = None,
+    stop_event: Event | None = None,
+    pause_event: Event | None = None,
+    log_callback: Callable[[str], None] | None = None,
 ) -> pd.DataFrame:
     """Download both bid and ask ticks, merge into a single DataFrame."""
     decimal_factor = _get_decimal_factor(instrument)
 
     bid_urls = generate_tick_urls(instrument, start_dt, end_dt)
     ask_urls = generate_tick_urls(instrument, start_dt, end_dt)
-    all_urls = bid_urls + ask_urls
-    total = len(all_urls)
-    completed_count = [0]
-
-    def merged_progress(done: int, subtotal: int) -> None:
-        completed_count[0] += 1
-        if on_progress:
-            on_progress(completed_count[0], total)
-
-    bid_results = await download_bi5_files(bid_urls, concurrency, max_retries)
+    bid_results = await download_bi5_files(
+        bid_urls,
+        batch_size,
+        max_retries,
+        batch_size=batch_size,
+        pause_ms=pause_ms,
+        report_progress=(
+            (lambda pct, msg: _report_progress(report_progress, pct * 0.45, f"Bid {msg}"))
+            if report_progress
+            else None
+        ),
+        stop_event=stop_event,
+        pause_event=pause_event,
+        log_callback=log_callback,
+    )
     bid_df = _assemble_tick_dataframe(bid_results, decimal_factor)
 
-    ask_results = await download_bi5_files(ask_urls, concurrency, max_retries)
+    ask_results = await download_bi5_files(
+        ask_urls,
+        batch_size,
+        max_retries,
+        batch_size=batch_size,
+        pause_ms=pause_ms,
+        report_progress=(
+            (lambda pct, msg: _report_progress(report_progress, 45.0 + (pct * 0.45), f"Ask {msg}"))
+            if report_progress
+            else None
+        ),
+        stop_event=stop_event,
+        pause_event=pause_event,
+        log_callback=log_callback,
+    )
     ask_df = _assemble_tick_dataframe(ask_results, decimal_factor)
+    _report_progress(report_progress, 95.0, "Merging bid/ask data")
 
     if bid_df.empty and ask_df.empty:
         return pd.DataFrame()
@@ -642,8 +809,17 @@ class DukascopyNativeDownloader(Downloader):
             (normalized_tf == "tick" and merge_tick)
             or (normalized_tf == "s1" and merge_s1)
         )
-        concurrency = int(kwargs.get("concurrency", 10))
+        batch_size = int(kwargs.get("batch_size", kwargs.get("concurrency", 10)))
+        if batch_size < 1:
+            raise ValueError("batch_size must be >= 1")
+        pause_ms = int(kwargs.get("pause_ms", 1000))
+        if pause_ms < 0:
+            raise ValueError("pause_ms must be >= 0")
         max_retries = int(kwargs.get("max_retries", 3))
+        stop_event = kwargs.get("stop_event")
+        pause_event = kwargs.get("pause_event")
+        report_progress = kwargs.get("report_progress")
+        log_callback = kwargs.get("log_callback")
 
         genesis_index = _load_genesis_index()
         requested_start = _resolve_requested_start(sym, normalized_tf, start, genesis_index)
@@ -657,25 +833,68 @@ class DukascopyNativeDownloader(Downloader):
         decimal_factor = _get_decimal_factor(instrument)
         strategy = DOWNLOAD_STRATEGY[normalized_tf]
 
-        logger.info(
-            "Native download: symbol=%s instrument=%s tf=%s strategy=%s "
-            "range=%s→%s price=%s merge=%s",
-            sym, instrument, normalized_tf, strategy,
-            requested_start, requested_end, price_type, merge_bid_ask,
+        _emit_log_message(
+            "Native download: symbol=%s instrument=%s tf=%s strategy=%s range=%s→%s "
+            "price=%s merge=%s batch_size=%s pause_ms=%s"
+            % (
+                sym,
+                instrument,
+                normalized_tf,
+                strategy,
+                requested_start,
+                requested_end,
+                price_type,
+                merge_bid_ask,
+                batch_size,
+                pause_ms,
+            ),
+            log_callback=log_callback,
         )
+        _report_progress(report_progress, 0.0, "Preparing download")
 
         if strategy == "tick":
             if merge_bid_ask:
+                _emit_log_message("Downloading merged hourly tick files...", log_callback=log_callback)
                 df = await _download_and_assemble_merged_ticks(
-                    instrument, start_dt, end_dt, concurrency, max_retries,
+                    instrument,
+                    start_dt,
+                    end_dt,
+                    batch_size,
+                    pause_ms,
+                    max_retries,
+                    report_progress=report_progress,
+                    stop_event=stop_event,
+                    pause_event=pause_event,
+                    log_callback=log_callback,
                 )
                 warnings = [f"price_type:bid+ask"]
             else:
                 urls = generate_tick_urls(instrument, start_dt, end_dt)
-                logger.info("Downloading %d hourly tick files...", len(urls))
-                bi5_results = await download_bi5_files(urls, concurrency, max_retries)
+                _emit_log_message(
+                    f"Downloading {len(urls)} hourly tick files...",
+                    log_callback=log_callback,
+                )
+                bi5_results = await download_bi5_files(
+                    urls,
+                    batch_size,
+                    max_retries,
+                    batch_size=batch_size,
+                    pause_ms=pause_ms,
+                    report_progress=(
+                        (lambda pct, msg: _report_progress(report_progress, pct * 0.9, msg))
+                        if report_progress
+                        else None
+                    ),
+                    stop_event=stop_event,
+                    pause_event=pause_event,
+                    log_callback=log_callback,
+                )
                 non_empty = sum(1 for _, d in bi5_results if d)
-                logger.info("Received %d/%d non-empty files", non_empty, len(urls))
+                _emit_log_message(
+                    f"Received {non_empty}/{len(urls)} non-empty files",
+                    log_callback=log_callback,
+                )
+                _report_progress(report_progress, 95.0, "Assembling tick data")
                 df = _assemble_tick_dataframe(bi5_results, decimal_factor)
                 warnings = [f"price_type:{price_type}"]
 
@@ -691,10 +910,31 @@ class DukascopyNativeDownloader(Downloader):
 
         elif strategy == "minute":
             urls = generate_minute_urls(instrument, start_dt, end_dt, price_type)
-            logger.info("Downloading %d daily minute-candle files...", len(urls))
-            bi5_results = await download_bi5_files(urls, concurrency, max_retries)
+            _emit_log_message(
+                f"Downloading {len(urls)} daily minute-candle files...",
+                log_callback=log_callback,
+            )
+            bi5_results = await download_bi5_files(
+                urls,
+                batch_size,
+                max_retries,
+                batch_size=batch_size,
+                pause_ms=pause_ms,
+                report_progress=(
+                    (lambda pct, msg: _report_progress(report_progress, pct * 0.9, msg))
+                    if report_progress
+                    else None
+                ),
+                stop_event=stop_event,
+                pause_event=pause_event,
+                log_callback=log_callback,
+            )
             non_empty = sum(1 for _, d in bi5_results if d)
-            logger.info("Received %d/%d non-empty files", non_empty, len(urls))
+            _emit_log_message(
+                f"Received {non_empty}/{len(urls)} non-empty files",
+                log_callback=log_callback,
+            )
+            _report_progress(report_progress, 95.0, "Assembling candle data")
             df = _assemble_candle_dataframe(bi5_results, decimal_factor)
             warnings = [f"price_type:{price_type}"]
 
@@ -705,6 +945,8 @@ class DukascopyNativeDownloader(Downloader):
 
             if normalized_tf != "m1":
                 df = _resample_candles(df, normalized_tf)
+
+        await _wait_for_control(pause_event, stop_event)
 
         # Map output timeframe to storage name
         storage_tf_map = {
@@ -717,6 +959,7 @@ class DukascopyNativeDownloader(Downloader):
         out_path = self._make_output_path(output_dir, asset_class, sym, out_tf)
         df.to_parquet(out_path, index=False)
         warnings.append(f"requested_range:{requested_start}->{requested_end}")
+        _report_progress(report_progress, 100.0, f"Saved {out_path.name}")
 
         # Update source meta
         meta_key = f"{self.source_name}/{asset_class}/{sym}/{out_tf}"
@@ -788,8 +1031,18 @@ def main() -> None:
     parser.add_argument("--output", default=str(DATA_DIR), help="Output root directory")
     parser.add_argument("--list", action="store_true", help="List available instruments")
     parser.add_argument(
-        "--concurrency", type=int, default=10,
-        help="Max concurrent downloads (default: 10)",
+        "--batch-size",
+        "--concurrency",
+        dest="batch_size",
+        type=int,
+        default=10,
+        help="URLs per batch / max concurrent fetches (default: 10)",
+    )
+    parser.add_argument(
+        "--pause-ms",
+        type=int,
+        default=1000,
+        help="Pause between batches in milliseconds (default: 1000)",
     )
     args = parser.parse_args()
 
@@ -824,7 +1077,8 @@ def main() -> None:
                     price_type=args.price_type,
                     merge_tick=args.merge_tick,
                     merge_s1=args.merge_s1,
-                    concurrency=args.concurrency,
+                    batch_size=args.batch_size,
+                    pause_ms=args.pause_ms,
                 )
                 completed += 1
                 print(

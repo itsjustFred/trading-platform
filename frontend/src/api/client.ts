@@ -4,6 +4,8 @@ import type {
   DataDownloadRequest,
   DataOverviewResponse,
   DataResampleRequest,
+  DataTaskDeleteResponse,
+  DataTaskListResponse,
   DataTaskLogsResponse,
   DataTaskStartResponse,
   DataTaskStatusResponse,
@@ -161,7 +163,24 @@ export const startAgentConvert = (data: AgentConvertRequest) =>
     method: "POST",
     body: JSON.stringify(data),
   });
+export const listDataTasks = () => fetchJSON<DataTaskListResponse>("/data/tasks");
 export const getDataTask = (taskId: string) =>
   fetchJSON<DataTaskStatusResponse>(`/data/tasks/${taskId}`);
 export const getDataTaskLogs = (taskId: string) =>
   fetchJSON<DataTaskLogsResponse>(`/data/tasks/${taskId}/logs`);
+export const pauseDataTask = (taskId: string) =>
+  fetchJSON<DataTaskStatusResponse>(`/data/tasks/${taskId}/pause`, {
+    method: "POST",
+  });
+export const resumeDataTask = (taskId: string) =>
+  fetchJSON<DataTaskStatusResponse>(`/data/tasks/${taskId}/resume`, {
+    method: "POST",
+  });
+export const cancelDataTask = (taskId: string) =>
+  fetchJSON<DataTaskStatusResponse>(`/data/tasks/${taskId}/cancel`, {
+    method: "POST",
+  });
+export const deleteDataTask = (taskId: string) =>
+  fetchJSON<DataTaskDeleteResponse>(`/data/tasks/${taskId}`, {
+    method: "DELETE",
+  });

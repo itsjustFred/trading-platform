@@ -12,6 +12,7 @@ import {
 import { downloadData, getDukascopyGenesis } from "../api/client";
 import { LiveTerminal } from "./LiveTerminal";
 import { Modal } from "./Modal";
+import { useToast } from "./ToastProvider";
 
 const TIMEFRAME_OPTIONS = [
   "tick",
@@ -111,6 +112,7 @@ export function DownloadModal({
   defaultSymbols = "",
   defaultTimeframes = ["d1"],
 }: DownloadModalProps) {
+  const { showToast } = useToast();
   const normalizedDefaultTimeframes = useMemo(
     () =>
       (defaultTimeframes.length > 0 ? defaultTimeframes : ["d1"]).map(
@@ -128,6 +130,9 @@ export function DownloadModal({
   const [priceType, setPriceType] = useState<"bid" | "ask">("bid");
   const [mergeTick, setMergeTick] = useState(false);
   const [mergeS1, setMergeS1] = useState(false);
+  const [showAdvancedSettings, setShowAdvancedSettings] = useState(false);
+  const [batchSize, setBatchSize] = useState(10);
+  const [pauseMs, setPauseMs] = useState(1000);
   const [error, setError] = useState("");
   const [jobId, setJobId] = useState<string | null>(null);
   const [jobStatus, setJobStatus] = useState("idle");
@@ -193,6 +198,9 @@ export function DownloadModal({
     setPriceType("bid");
     setMergeTick(false);
     setMergeS1(false);
+    setShowAdvancedSettings(false);
+    setBatchSize(10);
+    setPauseMs(1000);
     setError("");
     setJobId(null);
     setJobStatus("idle");
@@ -302,6 +310,16 @@ export function DownloadModal({
       return;
     }
 
+    if (isDukascopy && (!Number.isFinite(batchSize) || batchSize < 1)) {
+      setError("Batch Size must be at least 1.");
+      return;
+    }
+
+    if (isDukascopy && (!Number.isFinite(pauseMs) || pauseMs < 0)) {
+      setError("Pause between batches must be 0 ms or greater.");
+      return;
+    }
+
     try {
       const res = await downloadData({
         source,
@@ -312,11 +330,15 @@ export function DownloadModal({
         price_type: isDukascopy ? priceType : undefined,
         merge_tick: isDukascopy ? mergeTick : undefined,
         merge_s1: isDukascopy ? mergeS1 : undefined,
+        batch_size: isDukascopy ? batchSize : undefined,
+        pause_ms: isDukascopy ? pauseMs : undefined,
       });
-      setJobId(res.task_id);
-      setJobStatus(res.status || "starting");
-      setCompletionNotified(false);
       onTaskStarted?.(res.task_id);
+      showToast(
+        "Download started. Check Task Manager in the top right.",
+        "success",
+      );
+      onClose();
     } catch (err: any) {
       setError(err.message || "Failed to start download.");
     }
@@ -550,6 +572,149 @@ export function DownloadModal({
                     </div>
                   )}
 
+                  {isDukascopy && (
+                    <div
+                      style={{
+                        display: "grid",
+                        gap: "12px",
+                        padding: "14px",
+                        borderRadius: "16px",
+                        border: "1px solid rgba(148, 163, 184, 0.16)",
+                        background: "rgba(15, 23, 42, 0.56)",
+                      }}
+                    >
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setShowAdvancedSettings((current) => !current)
+                        }
+                        style={{
+                          display: "flex",
+                          justifyContent: "space-between",
+                          alignItems: "center",
+                          gap: "12px",
+                          border: "none",
+                          background: "transparent",
+                          color: "var(--color-text)",
+                          padding: 0,
+                          cursor: "pointer",
+                          textAlign: "left",
+                        }}
+                      >
+                        <div>
+                          <div
+                            style={{
+                              fontSize: "0.76rem",
+                              letterSpacing: "0.08em",
+                              textTransform: "uppercase",
+                              color: "var(--color-text-muted)",
+                            }}
+                          >
+                            Advanced settings
+                          </div>
+                          <div
+                            style={{
+                              marginTop: "4px",
+                              fontSize: "0.84rem",
+                              color: "var(--color-text-muted)",
+                            }}
+                          >
+                            Control Dukascopy batch concurrency and pacing.
+                          </div>
+                        </div>
+                        <div
+                          style={{
+                            fontSize: "0.82rem",
+                            color: "#7dd3fc",
+                            fontWeight: 700,
+                          }}
+                        >
+                          {showAdvancedSettings ? "Hide" : "Show"}
+                        </div>
+                      </button>
+
+                      {showAdvancedSettings && (
+                        <div
+                          style={{
+                            display: "grid",
+                            gridTemplateColumns: "1fr 1fr",
+                            gap: "14px",
+                          }}
+                        >
+                          <div style={{ display: "grid", gap: "8px" }}>
+                            <label
+                              style={{
+                                fontSize: "0.76rem",
+                                letterSpacing: "0.08em",
+                                textTransform: "uppercase",
+                                color: "var(--color-text-muted)",
+                              }}
+                            >
+                              Batch Size
+                            </label>
+                            <input
+                              type="number"
+                              min={1}
+                              value={batchSize}
+                              onChange={(event) =>
+                                setBatchSize(
+                                  Number.isFinite(event.target.valueAsNumber)
+                                    ? Math.max(1, Math.floor(event.target.valueAsNumber))
+                                    : 1,
+                                )
+                              }
+                              style={inputStyle}
+                            />
+                            <div
+                              style={{
+                                fontSize: "0.76rem",
+                                color: "var(--color-text-muted)",
+                              }}
+                            >
+                              Maximum URLs fetched in one batch.
+                            </div>
+                          </div>
+
+                          <div style={{ display: "grid", gap: "8px" }}>
+                            <label
+                              style={{
+                                fontSize: "0.76rem",
+                                letterSpacing: "0.08em",
+                                textTransform: "uppercase",
+                                color: "var(--color-text-muted)",
+                              }}
+                            >
+                              Pause between batches (ms)
+                            </label>
+                            <input
+                              type="number"
+                              min={0}
+                              step={100}
+                              value={pauseMs}
+                              onChange={(event) =>
+                                setPauseMs(
+                                  Number.isFinite(event.target.valueAsNumber)
+                                    ? Math.max(0, Math.floor(event.target.valueAsNumber))
+                                    : 0,
+                                )
+                              }
+                              style={inputStyle}
+                            />
+                            <div
+                              style={{
+                                fontSize: "0.76rem",
+                                color: "var(--color-text-muted)",
+                              }}
+                            >
+                              Applied after every batch; the downloader doubles
+                              it automatically when rate-limit signals appear.
+                            </div>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
                   <div
                     style={{
                       display: "grid",
@@ -647,8 +812,7 @@ export function DownloadModal({
               <div
                 style={{ fontSize: "0.8rem", color: "var(--color-text-muted)" }}
               >
-                The modal will switch into a live terminal as soon as the task
-                is queued.
+                Starting the job will hand it off to the global Task Manager.
               </div>
               <div style={{ display: "flex", gap: "10px" }}>
                 <button

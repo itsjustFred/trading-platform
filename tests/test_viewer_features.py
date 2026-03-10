@@ -360,13 +360,13 @@ def test_data_download_passes_price_type_and_merge_flags(viewer_client, monkeypa
 
     captured: dict[str, object] = {}
 
-    def fake_start(task_id: str, cmd: list[str], *, total_items: int = 0) -> dict:
+    def fake_start(task_id: str, cmd: list[str], **kwargs) -> dict:
         captured["task_id"] = task_id
         captured["cmd"] = cmd
-        captured["total_items"] = total_items
+        captured.update(kwargs)
         return {"task_id": task_id, "status": "starting"}
 
-    monkeypatch.setattr(viewer_app_module, "_start_data_task", fake_start)
+    monkeypatch.setattr(viewer_app_module, "_start_dukascopy_task", fake_start)
 
     resp = viewer_client.post(
         "/api/data/download",
@@ -377,6 +377,8 @@ def test_data_download_passes_price_type_and_merge_flags(viewer_client, monkeypa
             "price_type": "ask",
             "merge_tick": True,
             "merge_s1": True,
+            "batch_size": 7,
+            "pause_ms": 2500,
         },
     )
 
@@ -385,7 +387,111 @@ def test_data_download_passes_price_type_and_merge_flags(viewer_client, monkeypa
     assert "ask" in captured["cmd"]
     assert "--merge-tick" in captured["cmd"]
     assert "--merge-s1" in captured["cmd"]
+    assert "--batch-size" in captured["cmd"]
+    assert "7" in captured["cmd"]
+    assert "--pause-ms" in captured["cmd"]
+    assert "2500" in captured["cmd"]
     assert captured["total_items"] == 3
+    assert captured["symbols"] == ["EURUSD"]
+    assert captured["timeframes"] == ["tick", "s1", "m1"]
+    assert captured["batch_size"] == 7
+    assert captured["pause_ms"] == 2500
+
+
+def test_data_tasks_list_and_controls(viewer_client, tmp_path):
+    import viewer.app as viewer_app_module
+
+    task_id = "controllable-task"
+    log_file = tmp_path / "logs" / "tasks" / f"task_{task_id}.log"
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    log_file.write_text("✅ step complete\n")
+    viewer_app_module.DATA_TASKS[task_id] = viewer_app_module._create_task_record(
+        task_id,
+        name="Download EURUSD tick",
+        description="Dukascopy download for EURUSD tick data.",
+        kind="data",
+        source="dukascopy",
+        total_items=1,
+        log_file=log_file,
+        control_mode="thread",
+        supports_control=True,
+    )
+    viewer_app_module._set_task_status(task_id, "running")
+
+    list_resp = viewer_client.get("/api/data/tasks")
+    assert list_resp.status_code == 200
+    tasks = list_resp.get_json()["tasks"]
+    assert tasks[0]["id"] == task_id
+    assert tasks[0]["progress"]["completed"] == 1
+    assert tasks[0]["can_pause"] is True
+
+    pause_resp = viewer_client.post(f"/api/data/tasks/{task_id}/pause")
+    assert pause_resp.status_code == 200
+    assert viewer_app_module.DATA_TASKS[task_id]["pause_event"].is_set()
+    assert pause_resp.get_json()["status"] == "paused"
+
+    resume_resp = viewer_client.post(f"/api/data/tasks/{task_id}/resume")
+    assert resume_resp.status_code == 200
+    assert not viewer_app_module.DATA_TASKS[task_id]["pause_event"].is_set()
+    assert resume_resp.get_json()["status"] == "running"
+
+    cancel_resp = viewer_client.post(f"/api/data/tasks/{task_id}/cancel")
+    assert cancel_resp.status_code == 200
+    assert viewer_app_module.DATA_TASKS[task_id]["stop_event"].is_set()
+    assert cancel_resp.get_json()["status"] == "cancelled"
+
+
+def test_data_task_delete_removes_finished_task(viewer_client, tmp_path):
+    import viewer.app as viewer_app_module
+
+    task_id = "finished-task"
+    log_file = tmp_path / "logs" / "tasks" / f"task_{task_id}.log"
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    log_file.write_text("Done.\n")
+    viewer_app_module.DATA_TASKS[task_id] = viewer_app_module._create_task_record(
+        task_id,
+        name="Completed download",
+        description="Finished task",
+        kind="data",
+        source="dukascopy",
+        total_items=1,
+        log_file=log_file,
+        control_mode="thread",
+        supports_control=True,
+    )
+    viewer_app_module._set_task_status(task_id, "completed")
+
+    resp = viewer_client.delete(f"/api/data/tasks/{task_id}")
+
+    assert resp.status_code == 200
+    assert resp.get_json() == {"task_id": task_id, "status": "deleted"}
+    assert task_id not in viewer_app_module.DATA_TASKS
+
+
+def test_data_task_delete_rejects_active_task(viewer_client, tmp_path):
+    import viewer.app as viewer_app_module
+
+    task_id = "active-task"
+    log_file = tmp_path / "logs" / "tasks" / f"task_{task_id}.log"
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    viewer_app_module.DATA_TASKS[task_id] = viewer_app_module._create_task_record(
+        task_id,
+        name="Running download",
+        description="Still active",
+        kind="data",
+        source="dukascopy",
+        total_items=1,
+        log_file=log_file,
+        control_mode="thread",
+        supports_control=True,
+    )
+    viewer_app_module._set_task_status(task_id, "running")
+
+    resp = viewer_client.delete(f"/api/data/tasks/{task_id}")
+
+    assert resp.status_code == 409
+    assert "can be removed" in resp.get_json()["error"]
+    assert task_id in viewer_app_module.DATA_TASKS
 
 
 def test_data_task_logs_endpoint_returns_empty_logs_when_file_missing(viewer_client, tmp_path):
@@ -460,6 +566,9 @@ def test_start_data_task_writes_task_logs_and_refreshes_catalog(viewer_client, m
     task = viewer_app_module.DATA_TASKS[task_id]
     assert task["status"] == "completed"
     assert Path(task["log_file"]).parent == tmp_path / "logs" / "tasks"
+    assert task["pause_event"].is_set() is False
+    assert task["stop_event"].is_set() is False
+    assert task["progress"] == 100.0
     log_text = Path(task["log_file"]).read_text()
     assert "Starting command:" in log_text
     assert "stdout line" in log_text
@@ -661,7 +770,7 @@ def test_agent_convert_endpoint_starts_background_agent(viewer_client, monkeypat
     def fake_start(task_id: str, payload: dict) -> dict:
         captured["task_id"] = task_id
         captured["payload"] = payload
-        return {"task_id": task_id, "status": "starting"}
+        return {"job_id": task_id, "task_id": task_id, "status": "running"}
 
     monkeypatch.setattr(viewer_app_module, "_start_agent_task", fake_start)
 
@@ -671,6 +780,11 @@ def test_agent_convert_endpoint_starts_background_agent(viewer_client, monkeypat
     )
 
     assert resp.status_code == 200
+    assert resp.get_json() == {
+        "job_id": captured["task_id"],
+        "task_id": captured["task_id"],
+        "status": "running",
+    }
     assert captured["payload"] == {
         "code": "//@version=5\nstrategy('x')",
         "strategy_name": "Signal Forge",

@@ -1,13 +1,16 @@
 """
 Autonomous strategy-conversion worker backed by NVIDIA NIM.
 
-This module converts raw strategy code into a runnable repository strategy,
-writes the generated Python + Markdown artifacts into per-strategy folders,
-immediately validates the result by launching a backtest through runner.cli.
+This module converts raw strategy code into a runnable repository strategy using
+three smaller LLM stages (analyst, architect, coder), writes the generated
+Python + Markdown artifacts into per-strategy folders, and validates the result
+by launching a backtest through runner.cli. If validation fails, only the coder
+stage is retried with the latest error context.
 """
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
@@ -16,7 +19,8 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from pprint import pformat
+from typing import Any, Callable
 
 from openai import OpenAI
 
@@ -67,7 +71,7 @@ SYMBOL_RANK = {
     "BTCUSD": 6,
 }
 
-TaskLogger = Callable[[str], None]
+TaskLogger = Callable[..., None]
 logger = get_logger("auto-agent")
 
 
@@ -77,6 +81,16 @@ class BacktestTarget:
     timeframe: str
     start: str
     end: str
+
+
+@dataclass(frozen=True)
+class StrategyArtifacts:
+    resolved_name: str
+    engine: str
+    strategy_dir: Path
+    strategy_path: Path
+    documentation_path: Path
+    output_path: Path
 
 
 def run_auto_agent(
@@ -108,7 +122,6 @@ def run_auto_agent(
     if not api_key:
         raise RuntimeError("NVIDIA_API_KEY environment variable is not set.")
 
-    system_prompt = _load_system_prompt()
     target = _resolve_backtest_target(
         symbols=symbols,
         timeframe=timeframe,
@@ -129,104 +142,101 @@ def run_auto_agent(
         timeout=timeout_seconds,
     )
 
-    developer_prompt = (
-        f"{system_prompt}\n\n"
-        "Zusatzregeln fuer den autonomen Worker:\n"
-        "1. Antworte ausschliesslich mit genau zwei fenced code blocks.\n"
-        "2. Der erste Block MUSS ```python sein und die komplette Strategie-Datei enthalten.\n"
-        "3. Der zweite Block MUSS ```markdown sein und die Dokumentation enthalten.\n"
-        "4. Die Markdown-Doku MUSS einen Abschnitt 'Framework-Empfehlung' mit exakt einem "
-        "Framework-Namen aus vectorbt, pynecore oder lean enthalten.\n"
-        "5. Fuer vectorbt-Strategien muss die Python-Datei eine generate_signals(df, params)-"
-        "Funktion und STRATEGY_META enthalten.\n"
-        "6. Verwende nur Bibliotheken, die in diesem Repository bereits installiert sind.\n"
-        "7. Erfinde keine fehlenden Backtest-Ausgaben; liefere nur die zwei Codebloecke."
+    system_prompt = _load_system_prompt()
+
+    _log(log, "Step 1/3: Requesting Markdown documentation from Kimi 2.5.")
+    markdown_response = _run_llm_step(
+        client,
+        developer_prompt=_step_one_developer_prompt(requested_engine=requested_engine),
+        user_prompt=_step_one_user_prompt(source_code=source_code, strategy_name=strategy_name),
+        log=log,
+        step_label="Step 1/3",
     )
-    user_prompt = _build_user_prompt(
-        source_code=source_code,
-        strategy_name=strategy_name,
-        target=target,
-        capital=capital,
-        requested_engine=requested_engine,
+    markdown_doc = _normalize_markdown_doc(markdown_response, strategy_name=strategy_name)
+    resolved_name = _resolve_strategy_name(markdown_doc, requested_name=strategy_name)
+    engine = _extract_engine(markdown_doc, requested_engine=requested_engine)
+    artifacts = _build_strategy_artifacts(
+        resolved_name=resolved_name,
+        engine=engine,
     )
-    messages = [
-        {"role": "developer", "content": developer_prompt},
-        {"role": "user", "content": user_prompt},
-    ]
+    artifacts.strategy_dir.mkdir(parents=True, exist_ok=True)
+    BACKTESTS_DIR.mkdir(parents=True, exist_ok=True)
+    artifacts.documentation_path.write_text(markdown_doc.rstrip() + "\n", encoding="utf-8")
+    _log(log, f"Wrote documentation file: {artifacts.documentation_path}")
+    _log(log, f"Selected engine: {engine}")
+    _log(log, "✅ Step 1/3: Markdown Documentation created.")
+
+    _log(log, "Step 2/3: Requesting STRATEGY_META from Kimi 2.5.")
+    meta_response = _run_llm_step(
+        client,
+        developer_prompt=_step_two_developer_prompt(),
+        user_prompt=_step_two_user_prompt(
+            source_code=source_code,
+            markdown_doc=markdown_doc,
+            strategy_name=resolved_name,
+        ),
+        log=log,
+        step_label="Step 2/3",
+    )
+    meta_source, meta_dict = _extract_strategy_meta(
+        meta_response,
+        requested_name=strategy_name,
+        markdown_doc=markdown_doc,
+    )
+    _log(log, f"Step 2/3: Strategy Meta includes {len(meta_dict.get('parameters', {}))} parameters.")
+    _log(log, "✅ Step 2/3: Strategy Meta defined.")
 
     last_error = "Unknown auto-agent failure."
-
     for attempt in range(1, max_iterations + 1):
-        _log(log, f"Iteration {attempt}/{max_iterations}: requesting conversion from Kimi 2.5.")
-        response = client.chat.completions.create(model=MODEL_NAME, messages=messages)
-        content = response.choices[0].message.content or ""
-        _log(log, f"Received {len(content)} characters from model.")
-        _log(log, "Model response follows:\n" + content)
+        if attempt == 1:
+            _log(log, "Step 3/3: Requesting Python code from Kimi 2.5.")
+        else:
+            _log(log, f"Step 3/3: Retry {attempt}/{max_iterations} with validation feedback.")
 
-        attempt_error = ""
-        try:
-            python_code = _extract_block(content, "python")
-            markdown_doc = _extract_markdown_block(content)
-            resolved_name = _extract_strategy_name(
-                python_code,
-                markdown_doc,
-                requested_name=strategy_name,
-            )
-            engine = _extract_engine(markdown_doc, requested_engine=requested_engine)
-
-            strategy_dir = STRATEGIES_DIR / resolved_name
-            strategy_path = strategy_dir / f"{resolved_name}.py"
-            doc_path = strategy_dir / "README.md"
-            output_path = BACKTESTS_DIR / (
-                f"{resolved_name}_auto_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.trades.json"
-            )
-
-            strategy_dir.mkdir(parents=True, exist_ok=True)
-            BACKTESTS_DIR.mkdir(parents=True, exist_ok=True)
-            strategy_path.write_text(python_code.rstrip() + "\n", encoding="utf-8")
-            doc_path.write_text(markdown_doc.rstrip() + "\n", encoding="utf-8")
-
-            _log(log, f"Wrote strategy file: {strategy_path}")
-            _log(log, f"Wrote documentation file: {doc_path}")
-            _log(log, f"Selected engine: {engine}")
-
-            cmd = _build_backtest_command(
-                strategy_path=strategy_path,
+        python_response = _run_llm_step(
+            client,
+            developer_prompt=_step_three_developer_prompt(system_prompt=system_prompt, engine=engine),
+            user_prompt=_step_three_user_prompt(
+                source_code=source_code,
+                markdown_doc=markdown_doc,
+                meta_source=meta_source,
                 engine=engine,
-                target=target,
-                output_path=output_path,
-                capital=capital,
-            )
-            returncode, combined_output = _run_backtest(cmd, log=log)
-            if returncode == 0 and output_path.exists():
-                _log(log, f"Backtest succeeded. Output saved to {output_path}")
-                return {
-                    "strategy_file": str(strategy_path),
-                    "documentation_file": str(doc_path),
-                    "backtest_output": str(output_path),
-                    "engine": engine,
-                    "symbols": target.symbols,
-                    "timeframe": target.timeframe,
-                    "attempts": attempt,
-                }
-
-            attempt_error = combined_output or "Backtest failed without output."
-        except Exception as exc:
-            attempt_error = str(exc)
-
-        last_error = attempt_error
-        _log(log, f"Iteration {attempt} failed: {attempt_error}", level="error")
-        messages.append({"role": "assistant", "content": content})
-        messages.append(
-            {
-                "role": "user",
-                "content": (
-                    "Der Code wirft diesen Fehler: "
-                    f"{_truncate(attempt_error, ERROR_CONTEXT_LIMIT)}\n"
-                    "Bitte fixen und erneut nur die beiden Codeblöcke liefern."
-                ),
-            }
+                attempt_error=None if attempt == 1 else last_error,
+            ),
+            log=log,
+            step_label="Step 3/3",
         )
+        python_body = _extract_python_response(python_response)
+        python_code = _assemble_strategy_module(meta_source, python_body)
+        artifacts.strategy_path.write_text(python_code.rstrip() + "\n", encoding="utf-8")
+        _log(log, f"Wrote strategy file: {artifacts.strategy_path}")
+        if attempt == 1:
+            _log(log, "✅ Step 3/3: Python Code generated.")
+        else:
+            _log(log, f"✅ Step 3/3: Python Code regenerated (attempt {attempt}/{max_iterations}).")
+
+        cmd = _build_backtest_command(
+            strategy_path=artifacts.strategy_path,
+            engine=engine,
+            target=target,
+            output_path=artifacts.output_path,
+            capital=capital,
+        )
+        returncode, combined_output = _run_backtest(cmd, log=log)
+        if returncode == 0 and artifacts.output_path.exists():
+            _log(log, f"✅ Validation loop: Backtest succeeded. Output saved to {artifacts.output_path}")
+            return {
+                "strategy_file": str(artifacts.strategy_path),
+                "documentation_file": str(artifacts.documentation_path),
+                "backtest_output": str(artifacts.output_path),
+                "engine": engine,
+                "symbols": target.symbols,
+                "timeframe": target.timeframe,
+                "attempts": attempt,
+            }
+
+        last_error = combined_output or "Backtest failed without output."
+        _log(log, f"Iteration {attempt} failed: {last_error}", level="error")
 
     raise RuntimeError(f"Auto-agent failed after {max_iterations} iterations: {last_error}")
 
@@ -237,31 +247,331 @@ def _load_system_prompt() -> str:
     return PROMPT_PATH.read_text(encoding="utf-8")
 
 
-def _build_user_prompt(
-    *,
-    source_code: str,
-    strategy_name: str | None,
-    target: BacktestTarget,
-    capital: float,
-    requested_engine: str | None,
-) -> str:
-    name_line = f"Gewuenschter Strategie-Name: {strategy_name}\n" if strategy_name else ""
+def _build_strategy_artifacts(*, resolved_name: str, engine: str) -> StrategyArtifacts:
+    strategy_dir = STRATEGIES_DIR / resolved_name
+    return StrategyArtifacts(
+        resolved_name=resolved_name,
+        engine=engine,
+        strategy_dir=strategy_dir,
+        strategy_path=strategy_dir / f"{resolved_name}.py",
+        documentation_path=strategy_dir / "README.md",
+        output_path=BACKTESTS_DIR
+        / f"{resolved_name}_auto_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.trades.json",
+    )
+
+
+def _step_one_developer_prompt(*, requested_engine: str | None) -> str:
     engine_line = (
-        f"Vom User angefragtes Framework: {requested_engine}\n" if requested_engine else ""
+        f"Wenn ein Framework explizit vorgegeben wurde, dokumentiere es in '## Framework-Empfehlung' als {requested_engine}."
+        if requested_engine
+        else "Füge einen Abschnitt '## Framework-Empfehlung' mit genau einem Framework aus vectorbt, pynecore oder lean hinzu."
     )
     return (
-        "Bitte konvertiere den folgenden Strategie-Quellcode fuer dieses Repository.\n"
-        f"{name_line}"
+        "Du bist The Analyst. Antworte ausschliesslich mit Markdown, ohne Erklaerungen ausserhalb der Dokumentation. "
+        "Dokumentiere die Strategie strukturiert fuer dieses Repository. "
+        "Die Doku muss mindestens folgende Abschnitte enthalten: '# <Name>', '## Quelle', '## Kernlogik', "
+        "'### Entry', '### Exit', '### Stop-Loss', optional '### Trailing Stop'/'### Partial Exits', "
+        "'## Indikator-Einstellungen', '## Risk-Management', '## Framework-Empfehlung'. "
         f"{engine_line}"
-        f"Validierungsziel fuer den automatischen Backtest: {','.join(target.symbols)} "
-        f"auf {target.timeframe}, Zeitraum {target.start} bis {target.end}, "
-        f"Kapital {capital:.2f}.\n"
-        "Der Python-Block muss direkt im Repository lauffaehig sein.\n\n"
+    )
+
+
+def _step_one_user_prompt(*, source_code: str, strategy_name: str | None) -> str:
+    name_line = f"Bevorzugter Strategie-Name: {strategy_name}\n" if strategy_name else ""
+    return (
+        "Analysiere diesen Trading-Code. Extrahiere Entry/Exit-Logik, Indikatoren und Risk-Management. "
+        "Antworte AUSSCHLIESSLICH mit einer strukturierten Markdown-Dokumentation.\n"
+        f"{name_line}"
         "Quellcode:\n"
         "```text\n"
         f"{source_code}\n"
         "```"
     )
+
+
+def _step_two_developer_prompt() -> str:
+    return (
+        "Du bist The Architect. Antworte ausschliesslich mit genau einer Python-Zuweisung 'STRATEGY_META = {...}'. "
+        "Die Antwort darf keine weiteren Erklaerungen enthalten. Das Dictionary muss mindestens die Schluessel "
+        "name, version, parameters und tags enthalten. In parameters muessen alle aus dem Quellcode ableitbaren "
+        "tunebaren Parameter mit sinnvollen Default-Werten enthalten sein."
+    )
+
+
+def _step_two_user_prompt(
+    *,
+    source_code: str,
+    markdown_doc: str,
+    strategy_name: str,
+) -> str:
+    return (
+        "Basierend auf der Doku: Generiere ausschliesslich das Python `STRATEGY_META` Dictionary fuer diese Strategie, "
+        "inklusive aller benoetigten Parameter in `parameters`.\n"
+        f"Strategie-Slug: {strategy_name}\n\n"
+        "Markdown-Dokumentation:\n"
+        "```markdown\n"
+        f"{markdown_doc}\n"
+        "```\n\n"
+        "Original-Quellcode:\n"
+        "```text\n"
+        f"{source_code}\n"
+        "```"
+    )
+
+
+def _step_three_developer_prompt(*, system_prompt: str, engine: str) -> str:
+    engine_guidance = (
+        "Fuer vectorbt muss generate_signals(df, params) genau (entries, exits, indicators_dict) zurueckgeben. "
+        "Alle logikrelevanten Entry-/Exit-/Stop-/Trailing-Indikatoren muessen in indicators_dict landen."
+        if engine == "vectorbt"
+        else (
+            "Halte dich strikt an den Contract des gewaehlten Frameworks. Wenn pynecore genutzt wird, liefere bei Bedarf "
+            "zusaetzlich build_trade_context(df, params), damit Trade-Meta angereichert werden kann."
+        )
+    )
+    return (
+        f"{system_prompt}\n\n"
+        "Du bist The Coder. Antworte ausschliesslich mit Python-Code oder einem ```python```-Block. "
+        "Keine Markdown-Erklaerungen. STRATEGY_META wird separat injiziert; definiere STRATEGY_META NICHT erneut. "
+        "Nutze nur Bibliotheken, die in diesem Repository bereits installiert sind. "
+        f"Gewaehltes Framework: {engine}. {engine_guidance}"
+    )
+
+
+def _step_three_user_prompt(
+    *,
+    source_code: str,
+    markdown_doc: str,
+    meta_source: str,
+    engine: str,
+    attempt_error: str | None,
+) -> str:
+    repair_section = ""
+    if attempt_error:
+        repair_section = (
+            "\n\nDer vorherige Backtest-/Validierungsversuch ist mit folgendem Fehler fehlgeschlagen. "
+            "Korrigiere NUR den Python-Code. Markdown und STRATEGY_META bleiben unveraendert.\n"
+            "```text\n"
+            f"{_truncate(attempt_error, ERROR_CONTEXT_LIMIT)}\n"
+            "```"
+        )
+    return (
+        "Schreibe nun den vollstaendigen Python Code (mit imports). Die Hauptfunktion MUSS `entries, exits, indicators_dict` "
+        "zurueckgeben (fuer Trade-Meta), wenn das Framework vectorbt ist. Halte dich strikt an die Logik im Markdown.\n"
+        f"Framework: {engine}\n\n"
+        "Verwende dieses STRATEGY_META unveraendert:\n"
+        "```python\n"
+        f"{meta_source}\n"
+        "```\n\n"
+        "Markdown Ground Truth:\n"
+        "```markdown\n"
+        f"{markdown_doc}\n"
+        "```\n\n"
+        "Original-Quellcode:\n"
+        "```text\n"
+        f"{source_code}\n"
+        "```"
+        f"{repair_section}"
+    )
+
+
+def _run_llm_step(
+    client: OpenAI,
+    *,
+    developer_prompt: str,
+    user_prompt: str,
+    log: TaskLogger | None,
+    step_label: str,
+) -> str:
+    response = client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=[
+            {"role": "developer", "content": developer_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+    )
+    content = response.choices[0].message.content or ""
+    _log(log, f"{step_label}: Received {len(content)} characters from model.")
+    if not content.strip():
+        raise RuntimeError(f"{step_label}: model returned an empty response.")
+    return content
+
+
+def _normalize_markdown_doc(markdown_doc: str, *, strategy_name: str | None) -> str:
+    content = _extract_markdown_response(markdown_doc).strip()
+    if not re.search(r"^\s*#\s+.+$", content, flags=re.MULTILINE):
+        title = strategy_name or "Auto Strategy"
+        content = f"# {title}\n\n{content}".strip()
+    return content
+
+
+def _extract_markdown_response(content: str) -> str:
+    for language in ("markdown", "md"):
+        match = re.search(
+            rf"```{language}\s*(.*?)```",
+            content,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if match:
+            return match.group(1).strip()
+    return (content or "").strip()
+
+
+def _extract_python_response(content: str) -> str:
+    for language in ("python", "py"):
+        match = re.search(
+            rf"```{language}\s*(.*?)```",
+            content,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if match:
+            return match.group(1).strip()
+
+    generic_match = re.search(r"```\s*(.*?)```", content, flags=re.DOTALL)
+    if generic_match:
+        return generic_match.group(1).strip()
+
+    return (content or "").strip()
+
+
+def _extract_strategy_meta(
+    content: str,
+    *,
+    requested_name: str | None,
+    markdown_doc: str,
+) -> tuple[str, dict[str, Any]]:
+    candidate = _extract_python_response(content)
+
+    try:
+        module = ast.parse(candidate)
+    except SyntaxError:
+        module = None
+
+    parsed: Any = None
+    if module is not None:
+        for node in module.body:
+            if isinstance(node, ast.Assign) and any(
+                isinstance(target, ast.Name) and target.id == "STRATEGY_META" for target in node.targets
+            ):
+                parsed = ast.literal_eval(node.value)
+                break
+        if parsed is None and len(module.body) == 1 and isinstance(module.body[0], ast.Expr):
+            parsed = ast.literal_eval(module.body[0].value)
+
+    if parsed is None:
+        start = candidate.find("{")
+        end = candidate.rfind("}")
+        if start == -1 or end == -1 or start >= end:
+            raise ValueError("Missing STRATEGY_META dictionary in model response.")
+        parsed = ast.literal_eval(candidate[start : end + 1])
+
+    if not isinstance(parsed, dict):
+        raise TypeError("STRATEGY_META must be a dictionary.")
+
+    normalized = _normalize_strategy_meta(parsed, requested_name=requested_name, markdown_doc=markdown_doc)
+    return _format_strategy_meta_assignment(normalized), normalized
+
+
+def _normalize_strategy_meta(
+    meta: dict[str, Any],
+    *,
+    requested_name: str | None,
+    markdown_doc: str,
+) -> dict[str, Any]:
+    normalized = dict(meta)
+    resolved_title = _extract_markdown_title(markdown_doc) or requested_name or normalized.get("name") or "Auto Strategy"
+    normalized["name"] = str(normalized.get("name") or resolved_title).strip() or str(resolved_title)
+    normalized["version"] = str(normalized.get("version") or "1.0.0")
+
+    parameters = normalized.get("parameters")
+    if parameters is None:
+        parameters = {}
+    if not isinstance(parameters, dict):
+        raise TypeError("STRATEGY_META['parameters'] must be a dict.")
+    normalized["parameters"] = parameters
+
+    tags = normalized.get("tags")
+    if tags is None:
+        tags = {}
+    if not isinstance(tags, dict):
+        raise TypeError("STRATEGY_META['tags'] must be a dict.")
+    normalized["tags"] = tags
+    return normalized
+
+
+def _format_strategy_meta_assignment(meta: dict[str, Any]) -> str:
+    return "STRATEGY_META = " + pformat(meta, width=100, sort_dicts=False)
+
+
+def _resolve_strategy_name(markdown_doc: str, *, requested_name: str | None) -> str:
+    if requested_name:
+        return _slugify(requested_name)
+    title = _extract_markdown_title(markdown_doc)
+    if title:
+        return _slugify(title)
+    return _slugify(f"auto_strategy_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}")
+
+
+def _extract_markdown_title(markdown_doc: str) -> str | None:
+    match = re.search(r"^\s*#\s+(.+)$", markdown_doc, flags=re.MULTILINE)
+    if not match:
+        return None
+    return match.group(1).strip()
+
+
+def _assemble_strategy_module(meta_source: str, python_body: str) -> str:
+    body = _strip_top_level_assignment(python_body.strip(), "STRATEGY_META")
+    if not body:
+        raise ValueError("Generated Python body is empty.")
+
+    try:
+        module = ast.parse(body)
+    except SyntaxError:
+        return f"{meta_source}\n\n{body.rstrip()}\n"
+
+    lines = body.splitlines()
+    insert_after = 0
+    if module.body and isinstance(module.body[0], ast.Expr):
+        value = getattr(module.body[0], "value", None)
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            insert_after = getattr(module.body[0], "end_lineno", 0)
+
+    if insert_after > 0:
+        before = "\n".join(lines[:insert_after]).rstrip()
+        after = "\n".join(lines[insert_after:]).lstrip("\n")
+        pieces = [before, meta_source]
+        if after:
+            pieces.append(after)
+        return "\n\n".join(piece for piece in pieces if piece).rstrip() + "\n"
+
+    return f"{meta_source}\n\n{body.rstrip()}\n"
+
+
+def _strip_top_level_assignment(source: str, variable_name: str) -> str:
+    try:
+        module = ast.parse(source)
+    except SyntaxError:
+        return source
+
+    ranges: list[tuple[int, int]] = []
+    for node in module.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == variable_name for target in node.targets
+        ):
+            ranges.append((node.lineno - 1, getattr(node, "end_lineno", node.lineno) - 1))
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == variable_name:
+            ranges.append((node.lineno - 1, getattr(node, "end_lineno", node.lineno) - 1))
+
+    if not ranges:
+        return source
+
+    lines = source.splitlines()
+    filtered: list[str] = []
+    for idx, line in enumerate(lines):
+        if any(start <= idx <= end for start, end in ranges):
+            continue
+        filtered.append(line)
+    return "\n".join(filtered).strip()
 
 
 def _resolve_backtest_target(
@@ -341,53 +651,6 @@ def _entry_rank(entry: dict) -> tuple[int, int, int, str, str]:
         source,
         symbol,
     )
-
-
-def _extract_block(content: str, language: str) -> str:
-    match = re.search(
-        rf"```{language}\s*(.*?)```",
-        content,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    if not match:
-        raise ValueError(f"Missing ```{language} block in model response.")
-    return match.group(1).strip()
-
-
-def _extract_markdown_block(content: str) -> str:
-    for language in ("markdown", "md"):
-        match = re.search(
-            rf"```{language}\s*(.*?)```",
-            content,
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-        if match:
-            return match.group(1).strip()
-    raise ValueError("Missing ```markdown block in model response.")
-
-
-def _extract_strategy_name(
-    python_code: str,
-    markdown_doc: str,
-    *,
-    requested_name: str | None,
-) -> str:
-    metadata_match = re.search(
-        r"STRATEGY_META\s*=\s*\{.*?[\"']name[\"']\s*:\s*[\"']([^\"']+)[\"']",
-        python_code,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    if metadata_match:
-        return _slugify(metadata_match.group(1))
-
-    markdown_title = re.search(r"^\s*#\s+(.+)$", markdown_doc, flags=re.MULTILINE)
-    if markdown_title:
-        return _slugify(markdown_title.group(1))
-
-    if requested_name:
-        return _slugify(requested_name)
-
-    return _slugify(f"auto_strategy_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}")
 
 
 def _extract_engine(markdown_doc: str, *, requested_engine: str | None) -> str:

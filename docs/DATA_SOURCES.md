@@ -30,7 +30,7 @@ python -m data_tools.catalog_builder -o "$TRADING_DATA_DIR/catalog.json"
 
 | Source | Primary entrypoint | Current role | Typical asset classes |
 | --- | --- | --- | --- |
-| Dukascopy | `python -m data_tools.downloaders.dukascopy_dl` | Main downloader for FX, metals, indices, energy | `forex`, `metals`, `indices`, `energy` |
+| Dukascopy | `python -m data_tools.downloaders.dukascopy_native` | Main downloader for FX, metals, indices, energy | `forex`, `metals`, `indices`, `energy` |
 | Dolthub | `python -m data_tools.dolthub_manager update` and `python -m data_tools.downloaders.dolthub_dl` | Repo sync plus targeted SQL exports | `equity`, `options`, fundamentals |
 | HuggingFace | `python -m data_tools.downloaders.huggingface_dl` | Direct parquet / dataset ingestion | `equity`, `crypto`, dataset-dependent |
 | HistData | `python -m data_tools.downloaders.histdata_dl` | Free historical FX import | `forex` |
@@ -39,11 +39,11 @@ python -m data_tools.catalog_builder -o "$TRADING_DATA_DIR/catalog.json"
 
 ## Dukascopy
 
-File: `data_tools/downloaders/dukascopy_dl.py`
+File: `data_tools/downloaders/dukascopy_native.py`
 
 ### What it uses
 
-- The external `dukascopy-node` executable
+- `aiohttp` for async `.bi5` file downloads directly from `datafeed.dukascopy.com`
 - `data_tools/config/dukascopy_genesis.json` plus optional runtime overrides in
   `$TRADING_DATA_DIR/dukascopy_genesis.json`
 - Source metadata in `$TRADING_DATA_DIR/source_meta.json`
@@ -67,7 +67,7 @@ File: `data_tools/downloaders/dukascopy_dl.py`
 ### Example
 
 ```bash
-python -m data_tools.downloaders.dukascopy_dl \
+python -m data_tools.downloaders.dukascopy_native \
   --symbols EURUSD,XAUUSD \
   --timeframes h1,d1 \
   --start 2024-01-01 \
@@ -212,7 +212,7 @@ python -m data_tools.migrate_csv --execute
 
 The Flask viewer uses these source names in `/api/data/download`:
 
-- `dukascopy` -> `python -m data_tools.downloaders.dukascopy_dl`
+- `dukascopy` -> `python -m data_tools.downloaders.dukascopy_native`
 - `dolthub` -> `python -m data_tools.dolthub_manager update`
 - `yfinance` -> legacy source label; current repo data is populated via
   `data_tools.migrate_csv.py`, not a direct downloader module

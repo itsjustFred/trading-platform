@@ -41,12 +41,18 @@ export function StrategyLabPage() {
     try {
       setIsSubmitting(true);
       setError("");
+      setJobId(null);
       setJobStatus("starting");
       const response = await startAgentConvert({
         code: rawCode,
         strategy_name: strategyName.trim() || undefined,
       });
-      setJobId(response.task_id);
+      const nextJobId = response.job_id ?? response.task_id;
+      if (!nextJobId) {
+        throw new Error("The conversion agent did not return a job id.");
+      }
+      setJobId(nextJobId);
+      setJobStatus(response.status || "running");
     } catch (err: any) {
       setJobStatus("failed");
       setError(err.message || "The conversion agent could not be started.");
@@ -132,9 +138,8 @@ export function StrategyLabPage() {
                 }}
               >
                 Drop in Pine Script, QuantConnect C#, or rough pseudo-code. The NVIDIA
-                NIM worker will document the idea, generate a repository strategy, and
-                immediately launch a validation backtest while the terminal streams every
-                visible step.
+                NIM worker now runs a staged 3-step conversion pipeline, then launches a
+                validation backtest while the terminal streams every visible step.
               </p>
             </div>
 
@@ -343,7 +348,8 @@ export function StrategyLabPage() {
             >
               <div style={{ color: "rgba(226, 232, 240, 0.58)", fontSize: "0.8rem" }}>
                 The agent writes a Python strategy file, emits Markdown documentation, and
-                backtests the output in the background.
+                backtests the output in the background after the analysis, meta, and code
+                generation steps complete.
               </div>
               <button
                 onClick={handleSubmit}
@@ -419,7 +425,7 @@ export function StrategyLabPage() {
           <LiveTerminal
             jobId={jobId}
             onStatusChange={setJobStatus}
-            emptyMessage="Waiting for the NVIDIA NIM worker to start..."
+            emptyMessage="Waiting for the 3-step NVIDIA NIM worker to start..."
           />
         </section>
       </div>

@@ -6,31 +6,34 @@ The search uses bounded single-day probes only and runs per timeframe:
 2. Binary search over months inside the start year.
 3. Binary search over days inside the start month.
 
-Each probe is executed via `npx dukascopy-node` into a dedicated probe directory
-and the downloaded CSV artifacts are deleted immediately afterwards.
+Each probe downloads a single .bi5 file from Dukascopy's datafeed servers
+using the native async downloader; the data is kept in memory and discarded.
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import calendar
 import json
 import logging
-import os
-import shutil
-import subprocess
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
 
-from data_tools.downloaders.dukascopy_dl import TIMEFRAME_MAP, _resolve_symbol_and_instrument
+from data_tools.downloaders.dukascopy_native import (
+    DOWNLOAD_STRATEGY,
+    TIMEFRAME_MAP,
+    _resolve_symbol_and_instrument,
+    download_bi5_files,
+    generate_minute_urls,
+    generate_tick_urls,
+)
 from shared.constants import DATA_DIR
 
 logger = logging.getLogger(__name__)
 
-PROBE_DIR = Path(os.environ.get("DUKASCOPY_DISCOVERY_PROBE_DIR", "/tmp/duka_probe"))
-NODE_OPTIONS_VALUE = "--max-old-space-size=4096"
 VERBOSE_LOGS = False
 DISCOVERY_TIMEFRAMES = ("d1", "h4", "h1", "m30", "m15", "m5", "m1", "s1", "tick")
 REFERENCE_GENESIS = {
@@ -41,54 +44,17 @@ REFERENCE_GENESIS = {
         "tick": "2003-05-04",
     },
 }
-EMPTY_OUTPUT_HINTS = (
-    "no data",
-    "empty",
-    "no csv",
-    "0 rows",
-    "not found",
-)
-
-
-def _probe_tail(output: str, lines: int = 12) -> str:
-    meaningful = [line.rstrip() for line in output.splitlines() if line.strip()]
-    if not meaningful:
-        return "(no dukascopy-node output)"
-    return "\n".join(meaningful[-lines:])
 
 
 def _looks_like_empty_response(output: str) -> bool:
     lowered = output.lower()
-    return any(hint in lowered for hint in EMPTY_OUTPUT_HINTS)
+    return any(hint in lowered for hint in ("no data", "empty", "no csv", "0 rows", "not found"))
 
 
 def _progress(message: str, *, verbose_only: bool = False) -> None:
     if verbose_only and not VERBOSE_LOGS:
         return
     print(message)
-
-
-def _cleanup_probe_dir(probe_dir: Path) -> None:
-    if not probe_dir.exists():
-        return
-
-    if probe_dir.is_file():
-        probe_dir.unlink(missing_ok=True)
-        return
-
-    for child in probe_dir.iterdir():
-        try:
-            if child.is_dir():
-                shutil.rmtree(child)
-            else:
-                child.unlink()
-        except FileNotFoundError:
-            continue
-
-    try:
-        probe_dir.rmdir()
-    except OSError:
-        pass
 
 
 def _is_valid_probe_csv(csv_path: Path) -> bool:
@@ -117,8 +83,7 @@ def _canonical_discovery_timeframe(timeframe: str) -> str:
         raise ValueError(
             f"Unsupported Dukascopy timeframe {timeframe!r}. Use one of: {sorted(TIMEFRAME_MAP)}"
         )
-    dukascopy_tf, _ = TIMEFRAME_MAP[timeframe_key]
-    return dukascopy_tf
+    return TIMEFRAME_MAP[timeframe_key]
 
 
 def _parse_timeframes(raw: str | None) -> list[str]:
@@ -143,11 +108,11 @@ def probe_single_day(
     timeframe: str = "tick",
     price_type: str = "bid",
 ) -> bool:
-    """Return True when Dukascopy provides data for the given symbol/day."""
-    from shared.constants import resolve_executable
+    """Return True when Dukascopy provides data for the given symbol/day.
 
-    npx_bin = resolve_executable("npx")
-
+    Downloads a single .bi5 file from Dukascopy's datafeed servers (no external
+    tools required) and returns True when it contains non-empty data.
+    """
     timeframe_key = timeframe.lower()
     if timeframe_key not in TIMEFRAME_MAP:
         raise ValueError(
@@ -155,55 +120,31 @@ def probe_single_day(
         )
 
     _, instrument, _ = _resolve_symbol_and_instrument(symbol)
-    dukascopy_tf, _ = TIMEFRAME_MAP[timeframe_key]
-    # dukascopy-node CLI accepts yyyy-mm-dd only, so one calendar day is the
-    # smallest supported probe window and keeps tick requests bounded enough to avoid OOM.
-    probe_from = probe_date.isoformat()
-    probe_to = (probe_date + timedelta(days=1)).isoformat()
-    env = os.environ.copy()
-    env["NODE_OPTIONS"] = NODE_OPTIONS_VALUE
+    dukascopy_tf = TIMEFRAME_MAP[timeframe_key]
 
-    _cleanup_probe_dir(PROBE_DIR)
-    PROBE_DIR.mkdir(parents=True, exist_ok=True)
+    # Probe at 10:00 UTC to stay clear of session open/close edges.
+    probe_dt = datetime(
+        probe_date.year, probe_date.month, probe_date.day, 10, tzinfo=timezone.utc
+    )
+    end_dt = probe_dt + timedelta(hours=1)
+
+    strategy = DOWNLOAD_STRATEGY.get(dukascopy_tf, "minute")
+    if strategy == "tick":
+        urls = generate_tick_urls(instrument, probe_dt, end_dt)
+    else:
+        urls = generate_minute_urls(instrument, probe_dt, end_dt, price_type=price_type)
+
+    if not urls:
+        return False
+
     try:
-        cmd = [
-            npx_bin,
-            "dukascopy-node",
-            "-i",
-            instrument,
-            "--timeframe",
-            dukascopy_tf,
-            "-p",
-            price_type,
-            "-from",
-            probe_from,
-            "-to",
-            probe_to,
-            "-f",
-            "csv",
-            "-dir",
-            str(PROBE_DIR),
-            "--silent",
-        ]
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=180,
-            env=env,
+        results = asyncio.run(
+            download_bi5_files(urls[:1], batch_size=1, pause_ms=0, max_retries=1)
         )
-        output = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
-        csv_files = sorted(PROBE_DIR.rglob("*.csv"))
-
-        if proc.returncode != 0 and not _looks_like_empty_response(output):
-            raise RuntimeError(
-                f"dukascopy-node probe failed for {symbol} on {probe_date.isoformat()} ({dukascopy_tf}):\n"
-                f"{_probe_tail(output)}"
-            )
-
-        return any(_is_valid_probe_csv(csv_path) for csv_path in csv_files)
-    finally:
-        _cleanup_probe_dir(PROBE_DIR)
+        return any(len(data) > 0 for _, data in results)
+    except Exception:
+        logger.debug("Probe failed for %s %s on %s", symbol, timeframe, probe_date)
+        return False
 
 
 def _year_probe_date(year: int) -> date:

@@ -298,6 +298,8 @@ export interface DataDownloadRequest {
   price_type?: "bid" | "ask";
   merge_tick?: boolean;
   merge_s1?: boolean;
+  batch_size?: number;
+  pause_ms?: number;
 }
 
 export interface DataResampleRequest {
@@ -315,9 +317,22 @@ export interface DataTaskProgress {
 
 export interface DataTaskStatusResponse {
   id?: string;
+  name?: string;
+  description?: string;
+  kind?: string;
+  source?: string;
   status: string;
+  created_at?: string;
+  updated_at?: string;
   log?: string;
   progress?: DataTaskProgress;
+  can_pause?: boolean;
+  can_resume?: boolean;
+  can_cancel?: boolean;
+}
+
+export interface DataTaskListResponse {
+  tasks: DataTaskStatusResponse[];
 }
 
 export interface DataTaskLogsResponse {
@@ -326,6 +341,12 @@ export interface DataTaskLogsResponse {
 }
 
 export interface DataTaskStartResponse {
+  task_id: string;
+  job_id?: string;
+  status: string;
+}
+
+export interface DataTaskDeleteResponse {
   task_id: string;
   status: string;
 }

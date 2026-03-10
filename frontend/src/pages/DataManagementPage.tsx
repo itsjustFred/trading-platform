@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, MouseEvent, ReactNode } from "react";
 import {
   AlertTriangle,
@@ -26,6 +26,7 @@ import {
 import type { DataCategorySummary, DataSymbolEntry } from "../api/types";
 import { DownloadModal } from "../components/DownloadModal";
 import { ResampleModal } from "../components/ResampleModal";
+import { TaskManager } from "../components/TaskManager";
 
 type TreeSelection =
   | { kind: "category"; category: string }
@@ -102,6 +103,8 @@ const TIMEFRAME_ORDER = [
   "mn1",
   "repo",
 ];
+
+const FINAL_DATA_TASK_STATUSES = new Set(["completed", "failed", "cancelled"]);
 
 function formatSizeMB(sizeMb: number) {
   if (!Number.isFinite(sizeMb) || sizeMb <= 0) {
@@ -316,37 +319,60 @@ export function DataManagementPage() {
     targetTimeframes: "5m,15m,30m,1h,4h",
   });
   const [backgroundTaskId, setBackgroundTaskId] = useState<string | null>(null);
-  const [backgroundTaskStatus, setBackgroundTaskStatus] =
-    useState<string>("idle");
+  const categoryEntriesRef = useRef<Record<string, DataSymbolEntry[]>>({});
+  const loadingCategoriesRef = useRef<Record<string, boolean>>({});
+  const selectionRef = useRef<TreeSelection | null>(null);
+  const handledTaskRefreshIdsRef = useRef<Set<string>>(new Set());
+
+  useEffect(() => {
+    categoryEntriesRef.current = categoryEntries;
+  }, [categoryEntries]);
+
+  useEffect(() => {
+    loadingCategoriesRef.current = loadingCategories;
+  }, [loadingCategories]);
+
+  useEffect(() => {
+    selectionRef.current = selection;
+  }, [selection]);
 
   const loadCategoryDetails = useCallback(
     async (categoryName: string, force = false) => {
       if (!categoryName) {
         return;
       }
-      if (loadingCategories[categoryName]) {
+      if (loadingCategoriesRef.current[categoryName]) {
         return;
       }
-      if (!force && categoryEntries[categoryName]) {
+      if (!force && categoryEntriesRef.current[categoryName]) {
         return;
       }
 
-      setLoadingCategories((prev) => ({ ...prev, [categoryName]: true }));
+      setLoadingCategories((prev) => {
+        const next = { ...prev, [categoryName]: true };
+        loadingCategoriesRef.current = next;
+        return next;
+      });
       try {
         const response = await getDataCategory(categoryName);
-        setCategoryEntries((prev) => ({
-          ...prev,
-          [categoryName]: response.symbols || [],
-        }));
+        setCategoryEntries((prev) => {
+          const next = {
+            ...prev,
+            [categoryName]: response.symbols || [],
+          };
+          categoryEntriesRef.current = next;
+          return next;
+        });
       } finally {
         setLoadingCategories((prev) => {
           const next = { ...prev };
           delete next[categoryName];
+          loadingCategoriesRef.current = next;
           return next;
         });
       }
     },
-    [categoryEntries, loadingCategories],
+    [],
   );
 
   const loadOverview = useCallback(
@@ -384,6 +410,17 @@ export function DataManagementPage() {
       }
     },
     [],
+  );
+
+  const refreshCurrentSelection = useCallback(
+    async (preferredSelection?: TreeSelection | null) => {
+      const nextSelection = preferredSelection ?? selectionRef.current;
+      await loadOverview(nextSelection);
+      if (nextSelection?.category) {
+        await loadCategoryDetails(nextSelection.category, true);
+      }
+    },
+    [loadCategoryDetails, loadOverview],
   );
 
   useEffect(() => {
@@ -424,30 +461,35 @@ export function DataManagementPage() {
 
     let active = true;
     let intervalId = 0;
+    const trackedTaskId = backgroundTaskId;
 
     const poll = async () => {
       try {
-        const payload = await getDataTask(backgroundTaskId);
+        const payload = await getDataTask(trackedTaskId);
         if (!active) {
           return;
         }
-        setBackgroundTaskStatus(payload.status || "unknown");
-        if (payload.status === "completed" || payload.status === "failed") {
+        const nextStatus = payload.status || "unknown";
+        if (FINAL_DATA_TASK_STATUSES.has(nextStatus)) {
           window.clearInterval(intervalId);
-          await loadOverview(selection);
-          if (selection) {
-            await loadCategoryDetails(selection.category, true);
+          setBackgroundTaskId((current) =>
+            current === trackedTaskId ? null : current,
+          );
+          if (
+            nextStatus === "completed" &&
+            !handledTaskRefreshIdsRef.current.has(trackedTaskId)
+          ) {
+            handledTaskRefreshIdsRef.current.add(trackedTaskId);
+            await refreshCurrentSelection(selectionRef.current);
           }
           if (!active) {
             return;
           }
-          setBackgroundTaskId(null);
         }
       } catch {
         if (!active) {
           return;
         }
-        setBackgroundTaskStatus("disconnected");
       }
     };
 
@@ -460,7 +502,7 @@ export function DataManagementPage() {
       active = false;
       window.clearInterval(intervalId);
     };
-  }, [backgroundTaskId, loadCategoryDetails, loadOverview, selection]);
+  }, [backgroundTaskId, refreshCurrentSelection]);
 
   const searchNeedle = searchTerm.trim().toLowerCase();
   const treeData = useMemo<TreeCategoryModel[]>(() => {
@@ -564,19 +606,6 @@ export function DataManagementPage() {
     void loadCategoryDetails(categoryName);
   };
 
-  const refreshCurrentSelection = useCallback(
-    async (preferredSelection?: TreeSelection | null) => {
-      await loadOverview(preferredSelection ?? selection);
-      if ((preferredSelection ?? selection)?.category) {
-        await loadCategoryDetails(
-          (preferredSelection ?? selection)!.category,
-          true,
-        );
-      }
-    },
-    [loadCategoryDetails, loadOverview, selection],
-  );
-
   const handleDeleteEntry = async (
     entry: DataSymbolEntry,
     event?: MouseEvent<HTMLButtonElement>,
@@ -657,14 +686,6 @@ export function DataManagementPage() {
 
   const handleTaskStarted = (taskId: string) => {
     setBackgroundTaskId(taskId);
-    setBackgroundTaskStatus("starting");
-  };
-
-  const handleTaskFinished = (status: "completed" | "failed") => {
-    setBackgroundTaskStatus(status);
-    if (status === "completed") {
-      void refreshCurrentSelection();
-    }
   };
 
   if (loading) {
@@ -750,17 +771,22 @@ export function DataManagementPage() {
           </div>
         </div>
 
-        <div style={{ display: "grid", gap: "10px", minWidth: "220px" }}>
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+            gap: "12px",
+            alignItems: "start",
+            width: "min(100%, 620px)",
+            flex: "1 1 420px",
+          }}
+        >
           <MetricTile
             label="Categories"
             value={String(categories.length)}
             accent="#7dd3fc"
           />
-          <MetricTile
-            label="Background task"
-            value={backgroundTaskId ? backgroundTaskStatus : "idle"}
-            accent={backgroundTaskId ? "#67e8f9" : "#94a3b8"}
-          />
+          <TaskManager />
         </div>
       </div>
 
@@ -1101,7 +1127,6 @@ export function DataManagementPage() {
         open={downloadModalOpen}
         onClose={() => setDownloadModalOpen(false)}
         onTaskStarted={handleTaskStarted}
-        onTaskFinished={handleTaskFinished}
         defaultSource={downloadDefaults.source}
         defaultSymbols={downloadDefaults.symbols}
         defaultTimeframes={downloadDefaults.timeframes}
@@ -1111,7 +1136,6 @@ export function DataManagementPage() {
         open={resampleModalOpen}
         onClose={() => setResampleModalOpen(false)}
         onTaskStarted={handleTaskStarted}
-        onTaskFinished={handleTaskFinished}
         defaultSourcePath={resampleDefaults.sourcePath}
         defaultTargetTimeframes={resampleDefaults.targetTimeframes}
       />

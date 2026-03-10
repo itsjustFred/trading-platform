@@ -23,15 +23,18 @@ from __future__ import annotations
 
 import argparse
 import ast
+from contextlib import redirect_stderr, redirect_stdout
 import json
 import math
 import os
+import signal
 import subprocess
 import sys
 import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Callable
 
 import pandas as pd
 from flask import Flask, jsonify, request, send_from_directory
@@ -392,6 +395,13 @@ def _safe_float(value: object, default: float = 0.0) -> float:
     if not math.isfinite(numeric):
         return default
     return numeric
+
+
+def _safe_int(value: object, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _canonical_stats_from_result(result: BacktestResult) -> dict:
@@ -2042,13 +2052,9 @@ def list_symbols():
 
 # ─── Data Management ─────────────────────────────────────────────────────────
 
-DATA_TASKS = {}
-
-
 def _categorize_path(path_str: str) -> str:
     """Derive asset category from file path."""
     p = path_str.lower()
-    # Symbol-level overrides (files in wrong directory)
     if "/xauusd/" in p:
         return "Metals"
     if "/metals/" in p:
@@ -2114,6 +2120,20 @@ def _refresh_catalog() -> None:
     (DATA_DIR / "catalog.json").write_text(json.dumps(catalog, indent=2, default=str))
 
 
+DATA_TASKS: dict[str, dict[str, Any]] = {}
+DATA_TASKS_LOCK = threading.Lock()
+ACTIVE_TASK_STATUSES = {"starting", "running", "paused"}
+FINAL_TASK_STATUSES = {"completed", "failed", "cancelled"}
+
+
+def _task_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _task_timestamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def _task_log_path(task_id: str) -> Path:
     return TASK_LOGS_DIR / f"task_{task_id}.log"
 
@@ -2156,6 +2176,8 @@ def _write_task_log_line(
     if not text:
         return
 
+    _ingest_task_log_line(task_id, text)
+
     log_method = getattr(logger, log_level, logger.info)
     log_method(
         text,
@@ -2163,30 +2185,335 @@ def _write_task_log_line(
     )
 
 
-def _start_data_task(task_id: str, cmd: list[str], *, total_items: int = 0) -> dict:
-    """Launch a background data-management subprocess with streamed task logs."""
-    TASK_LOGS_DIR.mkdir(parents=True, exist_ok=True)
-    log_file = _task_log_path(task_id)
-    DATA_TASKS[task_id] = {
+def _new_task_progress(total_items: int = 0) -> dict[str, Any]:
+    return {
+        "completed": 0,
+        "failed": 0,
+        "total": max(total_items, 0),
+        "percent": 0.0,
+        "current": "",
+    }
+
+
+def _create_task_record(
+    task_id: str,
+    *,
+    name: str,
+    description: str,
+    kind: str,
+    source: str,
+    total_items: int = 0,
+    log_file: Path,
+    control_mode: str,
+    supports_control: bool = True,
+) -> dict[str, Any]:
+    now = _task_now_iso()
+    return {
+        "id": task_id,
+        "name": name,
+        "description": description,
+        "kind": kind,
+        "source": source,
         "status": "starting",
         "log_file": str(log_file),
         "total_items": total_items,
+        "progress": 0.0,
+        "progress_detail": _new_task_progress(total_items),
+        "pause_event": threading.Event(),
+        "stop_event": threading.Event(),
+        "supports_control": supports_control,
+        "control_mode": control_mode,
+        "created_at": now,
+        "updated_at": now,
     }
 
+
+def _get_task(task_id: str) -> dict[str, Any] | None:
+    with DATA_TASKS_LOCK:
+        return DATA_TASKS.get(task_id)
+
+
+def _snapshot_task(task_id: str) -> dict[str, Any] | None:
+    with DATA_TASKS_LOCK:
+        task = DATA_TASKS.get(task_id)
+        return dict(task) if task is not None else None
+
+
+def _update_task_fields(task_id: str, **updates: Any) -> dict[str, Any] | None:
+    with DATA_TASKS_LOCK:
+        task = DATA_TASKS.get(task_id)
+        if task is None:
+            return None
+        task.update(updates)
+        task["updated_at"] = _task_now_iso()
+        return dict(task)
+
+
+def _set_task_status(task_id: str, status: str) -> dict[str, Any] | None:
+    return _update_task_fields(task_id, status=status)
+
+
+def _update_task_progress(
+    task_id: str,
+    *,
+    percent: float | None = None,
+    current: str | None = None,
+    total: int | None = None,
+) -> dict[str, Any] | None:
+    with DATA_TASKS_LOCK:
+        task = DATA_TASKS.get(task_id)
+        if task is None:
+            return None
+
+        detail = dict(task.get("progress_detail") or _new_task_progress(task.get("total_items", 0)))
+        if total is not None:
+            detail["total"] = max(total, 0)
+        elif not detail.get("total"):
+            detail["total"] = max(int(task.get("total_items", 0) or 0), 0)
+
+        if current is not None:
+            detail["current"] = current
+
+        next_percent = float(task.get("progress", 0.0) or 0.0)
+        if percent is not None:
+            next_percent = max(0.0, min(100.0, round(percent, 2)))
+
+        detail["percent"] = next_percent
+        task["progress"] = next_percent
+        task["progress_detail"] = detail
+        task["updated_at"] = _task_now_iso()
+        return dict(task)
+
+
+def _ingest_task_log_line(task_id: str, text: str) -> None:
+    with DATA_TASKS_LOCK:
+        task = DATA_TASKS.get(task_id)
+        if task is None:
+            return
+
+        detail = dict(task.get("progress_detail") or _new_task_progress(task.get("total_items", 0)))
+        detail["total"] = max(int(detail.get("total") or task.get("total_items", 0) or 0), 0)
+        detail["current"] = text
+
+        if text.startswith("✅"):
+            detail["completed"] = int(detail.get("completed", 0) or 0) + 1
+        elif text.startswith("❌"):
+            detail["failed"] = int(detail.get("failed", 0) or 0) + 1
+
+        total = detail["total"]
+        if total > 0 and (text.startswith("✅") or text.startswith("❌")):
+            done = min(int(detail.get("completed", 0) or 0) + int(detail.get("failed", 0) or 0), total)
+            detail["percent"] = round(min(100.0, done / total * 100.0), 2)
+            task["progress"] = detail["percent"]
+        else:
+            detail["percent"] = float(task.get("progress", detail.get("percent", 0.0)) or 0.0)
+
+        task["progress_detail"] = detail
+        task["updated_at"] = _task_now_iso()
+
+
+def _task_progress_payload(task: dict[str, Any], log_content: str = "") -> dict[str, Any]:
+    detail = dict(task.get("progress_detail") or _new_task_progress(task.get("total_items", 0)))
+    detail["total"] = max(int(detail.get("total") or task.get("total_items", 0) or 0), 0)
+
+    if not detail.get("current") and log_content:
+        lines = [line.strip() for line in log_content.splitlines() if line.strip()]
+        if lines:
+            detail["current"] = lines[-1]
+
+    if detail["total"] > 0 and detail.get("completed", 0) == 0 and detail.get("failed", 0) == 0 and log_content:
+        detail["completed"] = log_content.count("✅")
+        detail["failed"] = log_content.count("❌")
+
+    percent = float(task.get("progress", detail.get("percent", 0.0)) or 0.0)
+    if detail["total"] > 0 and percent == 0.0:
+        done = int(detail.get("completed", 0) or 0) + int(detail.get("failed", 0) or 0)
+        if done > 0:
+            percent = min(100.0, done / detail["total"] * 100.0)
+
+    if task.get("status") == "completed":
+        percent = 100.0
+
+    detail["percent"] = round(percent, 2)
+    return detail
+
+
+def _task_controls_payload(task: dict[str, Any]) -> dict[str, bool]:
+    status = task.get("status", "unknown")
+    supports_control = bool(task.get("supports_control", False))
+    return {
+        "can_pause": supports_control and status in {"starting", "running"},
+        "can_resume": supports_control and status == "paused",
+        "can_cancel": supports_control and status not in FINAL_TASK_STATUSES,
+    }
+
+
+def _serialize_task(
+    task_id: str,
+    task: dict[str, Any],
+    *,
+    include_log: bool = False,
+    max_log_bytes: int = 2048,
+) -> dict[str, Any]:
+    log_content = (
+        _read_task_log(task.get("log_file", ""), max_bytes=max_log_bytes)
+        if include_log and task.get("log_file")
+        else ""
+    )
+    payload = {
+        "id": task_id,
+        "name": task.get("name"),
+        "description": task.get("description"),
+        "kind": task.get("kind", "data"),
+        "source": task.get("source"),
+        "status": task.get("status", "unknown"),
+        "created_at": task.get("created_at"),
+        "updated_at": task.get("updated_at"),
+        "progress": _task_progress_payload(task, log_content),
+        "log": log_content,
+    }
+    payload.update(_task_controls_payload(task))
+    return payload
+
+
+def _mark_task_finished(
+    task_id: str,
+    *,
+    status: str,
+    returncode: int | None = None,
+    error: str | None = None,
+) -> dict[str, Any] | None:
+    updates: dict[str, Any] = {"status": status, "finished_at": _task_now_iso()}
+    if returncode is not None:
+        updates["returncode"] = returncode
+    if error is not None:
+        updates["error"] = error
+    task = _update_task_fields(task_id, **updates)
+    if status == "completed":
+        _update_task_progress(task_id, percent=100.0)
+        task = _snapshot_task(task_id)
+    return task
+
+
+def _wait_for_task_resume(task_id: str) -> bool:
+    task = _get_task(task_id)
+    if task is None:
+        return False
+
+    pause_event = task.get("pause_event")
+    stop_event = task.get("stop_event")
+    if pause_event is None or stop_event is None:
+        return True
+
+    was_paused = False
+    while pause_event.is_set():
+        was_paused = True
+        _set_task_status(task_id, "paused")
+        if stop_event.wait(0.25):
+            return False
+
+    if was_paused:
+        _set_task_status(task_id, "running")
+    return not stop_event.is_set()
+
+
+def _task_log_message(
+    task_id: str,
+    message: str,
+    *,
+    stream: str = "task",
+    log_level: str = "info",
+    source: str = "data-task",
+) -> None:
+    task = _get_task(task_id)
+    log_file = Path(task.get("log_file", _task_log_path(task_id)) if task else _task_log_path(task_id))
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    with log_file.open("a", encoding="utf-8", buffering=1) as handle:
+        _write_task_log_line(
+            handle,
+            task_id,
+            f"[{_task_timestamp()}] {message}",
+            stream=stream,
+            log_level=log_level,
+            source=source,
+        )
+
+
+def _refresh_catalog_for_task(task_id: str, *, source: str = "data-task") -> bool:
+    _task_log_message(task_id, "Refreshing catalog...", source=source)
+    try:
+        _refresh_catalog()
+    except (json.JSONDecodeError, FileNotFoundError, OSError) as exc:
+        _task_log_message(task_id, f"Catalog refresh failed: {exc}", log_level="error", source=source)
+        _mark_task_finished(task_id, status="failed", returncode=1, error=str(exc))
+        return False
+    return True
+
+
+def _start_data_task(
+    task_id: str,
+    cmd: list[str],
+    *,
+    total_items: int = 0,
+    name: str = "Background task",
+    description: str = "",
+    kind: str = "data",
+    source: str = "system",
+) -> dict:
+    """Launch a background data-management subprocess with streamed task logs."""
+    TASK_LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    log_file = _task_log_path(task_id)
+    record = _create_task_record(
+        task_id,
+        name=name,
+        description=description,
+        kind=kind,
+        source=source,
+        total_items=total_items,
+        log_file=log_file,
+        control_mode="process",
+        supports_control=True,
+    )
+    with DATA_TASKS_LOCK:
+        DATA_TASKS[task_id] = record
+
     def run_proc() -> None:
-        started_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
         command_display = " ".join(str(part) for part in cmd)
+        pause_event = record["pause_event"]
+        stop_event = record["stop_event"]
 
         try:
             with log_file.open("a", encoding="utf-8", buffering=1) as handle:
                 _write_task_log_line(
                     handle,
                     task_id,
-                    f"[{started_at}] Starting command: {command_display}",
+                    f"[{_task_timestamp()}] Starting command: {command_display}",
                     stream="task",
                 )
+
+                if stop_event.is_set():
+                    _write_task_log_line(
+                        handle,
+                        task_id,
+                        f"[{_task_timestamp()}] Task cancelled before launch.",
+                        stream="task",
+                        source="data-task",
+                    )
+                    _mark_task_finished(task_id, status="cancelled", returncode=-9)
+                    return
+
+                if pause_event.is_set() and not _wait_for_task_resume(task_id):
+                    _write_task_log_line(
+                        handle,
+                        task_id,
+                        f"[{_task_timestamp()}] Task cancelled while paused.",
+                        stream="task",
+                        source="data-task",
+                    )
+                    _mark_task_finished(task_id, status="cancelled", returncode=-9)
+                    return
 
                 proc = subprocess.Popen(
                     cmd,
@@ -2197,54 +2524,226 @@ def _start_data_task(task_id: str, cmd: list[str], *, total_items: int = 0) -> d
                     text=True,
                     bufsize=1,
                 )
-                DATA_TASKS[task_id] = {
-                    "status": "running",
-                    "pid": proc.pid,
-                    "log_file": str(log_file),
-                    "total_items": total_items,
-                }
+                _update_task_fields(task_id, status="running", pid=proc.pid, process=proc)
 
                 if proc.stdout is not None:
                     for line in proc.stdout:
                         _write_task_log_line(handle, task_id, line.rstrip("\n"), stream="stdout")
 
                 returncode = proc.wait()
+                if stop_event.is_set():
+                    _mark_task_finished(task_id, status="cancelled", returncode=returncode)
+                    return
+
                 status = "completed" if returncode == 0 else "failed"
+                if returncode == 0 and _refresh_catalog_for_task(task_id):
+                    _mark_task_finished(task_id, status="completed", returncode=returncode)
+                    return
 
-                if returncode == 0:
-                    _write_task_log_line(
-                        handle,
-                        task_id,
-                        f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}] Refreshing catalog...",
-                        stream="task",
-                    )
-                    try:
-                        _refresh_catalog()
-                    except (json.JSONDecodeError, FileNotFoundError, OSError) as exc:
-                        status = "failed"
-                        _write_task_log_line(
-                            handle,
-                            task_id,
-                            f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}] "
-                            f"Catalog refresh failed: {exc}",
-                            stream="task",
-                            log_level="error",
-                        )
-
-                DATA_TASKS[task_id].update({"status": status, "returncode": returncode})
+                _mark_task_finished(task_id, status=status, returncode=returncode)
         except (subprocess.SubprocessError, OSError) as exc:
-            DATA_TASKS[task_id].update({"status": "failed", "error": str(exc)})
+            _mark_task_finished(task_id, status="failed", returncode=1, error=str(exc))
             _append_task_log(
                 log_file,
-                f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}] Task failed: {exc}\n",
+                f"[{_task_timestamp()}] Task failed: {exc}\n",
             )
             logger.exception(
                 "Task failed: %s",
                 exc,
                 extra={"data": {"task_id": task_id, "stream": "task", "source": "data-task"}},
             )
+        finally:
+            _update_task_fields(task_id, process=None)
 
     thread = threading.Thread(target=run_proc, daemon=True)
+    _update_task_fields(task_id, thread=thread)
+    thread.start()
+    return {"task_id": task_id, "status": "starting"}
+
+
+def _start_dukascopy_task(
+    task_id: str,
+    cmd: list[str],
+    *,
+    symbols: list[str],
+    timeframes: list[str],
+    start: str | None,
+    end: str | None,
+    price_type: str,
+    merge_tick: bool,
+    merge_s1: bool,
+    batch_size: int,
+    pause_ms: int,
+    total_items: int,
+    name: str,
+    description: str,
+) -> dict[str, Any]:
+    from data_tools.downloaders.dukascopy_native import DownloadCancelled, DukascopyNativeDownloader
+
+    TASK_LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    log_file = _task_log_path(task_id)
+    record = _create_task_record(
+        task_id,
+        name=name,
+        description=description,
+        kind="data",
+        source="dukascopy",
+        total_items=total_items,
+        log_file=log_file,
+        control_mode="thread",
+        supports_control=True,
+    )
+    with DATA_TASKS_LOCK:
+        DATA_TASKS[task_id] = record
+
+    def run_download() -> None:
+        command_display = " ".join(str(part) for part in cmd)
+        pause_event = record["pause_event"]
+        stop_event = record["stop_event"]
+        downloader = DukascopyNativeDownloader()
+        refresh_needed = False
+
+        try:
+            with log_file.open("a", encoding="utf-8", buffering=1) as handle:
+                _write_task_log_line(
+                    handle,
+                    task_id,
+                    f"[{_task_timestamp()}] Starting command: {command_display}",
+                    stream="task",
+                )
+
+                if stop_event.is_set():
+                    _write_task_log_line(
+                        handle,
+                        task_id,
+                        f"[{_task_timestamp()}] Task cancelled before launch.",
+                        stream="task",
+                    )
+                    _mark_task_finished(task_id, status="cancelled", returncode=-9)
+                    return
+
+                completed_items = 0
+                failed_items = 0
+                total = max(total_items, 1)
+
+                def task_log(message: str, *, level: str = "info") -> None:
+                    _write_task_log_line(
+                        handle,
+                        task_id,
+                        message,
+                        stream="stdout",
+                        log_level=level,
+                        source="data-task",
+                    )
+
+                combinations = [(symbol, timeframe) for symbol in symbols for timeframe in timeframes]
+                for symbol, timeframe in combinations:
+                    if not _wait_for_task_resume(task_id):
+                        _write_task_log_line(
+                            handle,
+                            task_id,
+                            f"[{_task_timestamp()}] Task cancelled while paused.",
+                            stream="task",
+                        )
+                        _mark_task_finished(task_id, status="cancelled", returncode=-9)
+                        return
+
+                    if stop_event.is_set():
+                        _write_task_log_line(
+                            handle,
+                            task_id,
+                            f"[{_task_timestamp()}] Task cancelled by user.",
+                            stream="task",
+                        )
+                        _mark_task_finished(task_id, status="cancelled", returncode=-9)
+                        return
+
+                    _set_task_status(task_id, "running")
+                    item_label = f"{symbol} {timeframe}"
+                    base_completed = completed_items + failed_items
+
+                    def report_progress(pct: float, message: str) -> None:
+                        overall = ((base_completed + (max(0.0, min(pct, 100.0)) / 100.0)) / total) * 100.0
+                        _update_task_progress(
+                            task_id,
+                            percent=overall,
+                            current=f"{item_label}: {message}",
+                            total=total,
+                        )
+
+                    try:
+                        result = downloader.download(
+                            symbol,
+                            timeframe,
+                            DATA_DIR,
+                            start=start,
+                            end=end,
+                            price_type=price_type,
+                            merge_tick=merge_tick,
+                            merge_s1=merge_s1,
+                            batch_size=batch_size,
+                            pause_ms=pause_ms,
+                            pause_event=pause_event,
+                            stop_event=stop_event,
+                            report_progress=report_progress,
+                            log_callback=task_log,
+                        )
+                        refresh_needed = True
+                        completed_items += 1
+                        _write_task_log_line(
+                            handle,
+                            task_id,
+                            f"✅ {result.symbol} {result.timeframe}: {result.rows} rows ({result.start} → {result.end}) → {result.path}",
+                            stream="stdout",
+                            source="data-task",
+                        )
+                    except DownloadCancelled:
+                        _write_task_log_line(
+                            handle,
+                            task_id,
+                            f"[{_task_timestamp()}] Task cancelled by user.",
+                            stream="task",
+                        )
+                        _mark_task_finished(task_id, status="cancelled", returncode=-9)
+                        return
+                    except (OSError, RuntimeError, ValueError, KeyError, json.JSONDecodeError) as exc:
+                        failed_items += 1
+                        _write_task_log_line(
+                            handle,
+                            task_id,
+                            f"❌ {symbol} {timeframe}: {exc}",
+                            stream="stdout",
+                            log_level="error",
+                            source="data-task",
+                        )
+
+                if refresh_needed and not _refresh_catalog_for_task(task_id):
+                    return
+
+                final_status = "failed" if failed_items > 0 else "completed"
+                returncode = 1 if failed_items > 0 else 0
+                _write_task_log_line(
+                    handle,
+                    task_id,
+                    f"Done: {completed_items} downloads completed.",
+                    stream="stdout",
+                    source="data-task",
+                )
+                _mark_task_finished(task_id, status=final_status, returncode=returncode)
+        except Exception as exc:
+            _mark_task_finished(task_id, status="failed", returncode=1, error=str(exc))
+            _append_task_log(
+                log_file,
+                f"[{_task_timestamp()}] Task failed: {exc}\n",
+            )
+            logger.exception(
+                "Dukascopy task failed: %s",
+                exc,
+                extra={"data": {"task_id": task_id, "stream": "task", "source": "data-task"}},
+            )
+
+    thread = threading.Thread(target=run_download, daemon=True)
+    _update_task_fields(task_id, thread=thread)
     thread.start()
     return {"task_id": task_id, "status": "starting"}
 
@@ -2253,24 +2752,31 @@ def _start_agent_task(task_id: str, payload: dict) -> dict:
     """Launch the autonomous conversion agent inside a streamed background thread."""
     TASK_LOGS_DIR.mkdir(parents=True, exist_ok=True)
     log_file = _task_log_path(task_id)
-    DATA_TASKS[task_id] = {
-        "status": "starting",
-        "log_file": str(log_file),
-        "kind": "agent",
-    }
+    record = _create_task_record(
+        task_id,
+        name="Strategy conversion",
+        description=payload.get("strategy_name") or "Convert strategy into the repository format",
+        kind="agent_conversion",
+        source="agent",
+        total_items=0,
+        log_file=log_file,
+        control_mode="thread",
+        supports_control=False,
+    )
+    with DATA_TASKS_LOCK:
+        DATA_TASKS[task_id] = record
 
     def run_agent() -> None:
-        started_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        try:
-            with log_file.open("a", encoding="utf-8", buffering=1) as handle:
+        with log_file.open("a", encoding="utf-8", buffering=1) as handle:
+            try:
                 _write_task_log_line(
                     handle,
                     task_id,
-                    f"[{started_at}] Starting strategy conversion agent.",
+                    f"[{_task_timestamp()}] Starting strategy conversion agent.",
                     stream="task",
                     source="agent-task",
                 )
-                DATA_TASKS[task_id].update({"status": "running"})
+                _set_task_status(task_id, "running")
 
                 def task_log(message: str, *, stream: str = "task", level: str = "info") -> None:
                     _write_task_log_line(
@@ -2282,45 +2788,48 @@ def _start_agent_task(task_id: str, payload: dict) -> dict:
                         source="agent-task",
                     )
 
-                result = run_auto_agent(
-                    payload["code"],
-                    strategy_name=payload.get("strategy_name"),
-                    requested_engine=payload.get("engine"),
-                    symbols=payload.get("symbols"),
-                    timeframe=payload.get("timeframe"),
-                    start=payload.get("start"),
-                    end=payload.get("end"),
-                    capital=_safe_float(payload.get("capital"), 100000.0),
-                    timeout_seconds=300,
-                    log=task_log,
-                )
-                DATA_TASKS[task_id].update(
-                    {"status": "completed", "returncode": 0, "result": result}
-                )
+                with redirect_stdout(handle), redirect_stderr(handle):
+                    result = run_auto_agent(
+                        payload["code"],
+                        strategy_name=payload.get("strategy_name"),
+                        requested_engine=payload.get("engine"),
+                        symbols=payload.get("symbols"),
+                        timeframe=payload.get("timeframe"),
+                        start=payload.get("start"),
+                        end=payload.get("end"),
+                        capital=_safe_float(payload.get("capital"), 100000.0),
+                        timeout_seconds=300,
+                        log=task_log,
+                    )
+                _update_task_fields(task_id, result=result)
                 _write_task_log_line(
                     handle,
                     task_id,
-                    f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}] "
-                    "Strategy conversion completed successfully.",
+                    f"[{_task_timestamp()}] Strategy conversion completed successfully.",
                     stream="task",
                     source="agent-task",
                 )
-        except Exception as exc:
-            DATA_TASKS[task_id].update({"status": "failed", "error": str(exc), "returncode": 1})
-            _append_task_log(
-                log_file,
-                f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}] "
-                f"Strategy conversion failed: {exc}\n",
-            )
-            logger.exception(
-                "Strategy conversion failed: %s",
-                exc,
-                extra={"data": {"task_id": task_id, "stream": "task", "source": "agent-task"}},
-            )
+                _mark_task_finished(task_id, status="completed", returncode=0)
+            except Exception as exc:
+                _write_task_log_line(
+                    handle,
+                    task_id,
+                    f"[{_task_timestamp()}] ❌ Strategy conversion failed: {exc}",
+                    stream="task",
+                    log_level="error",
+                    source="agent-task",
+                )
+                _mark_task_finished(task_id, status="failed", returncode=1, error=str(exc))
+                logger.exception(
+                    "Strategy conversion failed: %s",
+                    exc,
+                    extra={"data": {"task_id": task_id, "stream": "task", "source": "agent-task"}},
+                )
 
     thread = threading.Thread(target=run_agent, daemon=True)
+    _update_task_fields(task_id, thread=thread)
     thread.start()
-    return {"task_id": task_id, "status": "starting"}
+    return {"job_id": task_id, "task_id": task_id, "status": "running"}
 
 
 def _dolthub_repo_status(repo_path: Path) -> tuple[dict, str]:
@@ -2493,10 +3002,63 @@ def data_category_details(category_name):
     )
 
 
+def _task_symbol_summary(symbols: list[str]) -> str:
+    if not symbols:
+        return "all symbols"
+    if len(symbols) == 1:
+        return symbols[0]
+    if len(symbols) <= 3:
+        return ", ".join(symbols)
+    return f"{symbols[0]} +{len(symbols) - 1}"
+
+
+def _task_timeframe_summary(timeframes: list[str]) -> str:
+    if not timeframes:
+        return "default timeframe"
+    if len(timeframes) == 1:
+        return timeframes[0]
+    return ", ".join(timeframes[:3]) + ("…" if len(timeframes) > 3 else "")
+
+
+def _download_task_labels(source: str, symbols: list[str], timeframes: list[str]) -> tuple[str, str]:
+    symbol_label = _task_symbol_summary(symbols)
+    timeframe_label = _task_timeframe_summary(timeframes)
+    if source == "dukascopy":
+        return (
+            f"Download {symbol_label} {timeframe_label}",
+            f"Dukascopy download for {symbol_label} on {timeframe_label}.",
+        )
+    if source == "yfinance":
+        return (
+            f"Download {symbol_label}",
+            f"Yahoo Finance download for {symbol_label}.",
+        )
+    return ("Sync Dolthub repos", "Refresh Dolthub repositories and rebuild the data catalog.")
+
+
+def _task_action_response(task_id: str):
+    task = _snapshot_task(task_id)
+    if task is None:
+        return jsonify({"error": "Task not found"}), 404
+    return jsonify(_serialize_task(task_id, task, include_log=True))
+
+
+def _signal_process(task: dict[str, Any], sig: int) -> None:
+    process = task.get("process")
+    if process is None:
+        return
+    if process.poll() is not None:
+        return
+    try:
+        os.kill(process.pid, sig)
+    except ProcessLookupError:
+        return
+
+
 @app.route("/api/data/download", methods=["POST"])
 def data_download():
     """Start a background download task."""
-    data = request.get_json()
+    data = request.get_json() or {}
     source = data.get("source", "dukascopy")
     symbols = data.get("symbols", "")  # comma separated
     timeframes = data.get("timeframes", "1m")
@@ -2505,11 +3067,18 @@ def data_download():
     price_type = data.get("price_type", "bid")
     merge_tick = bool(data.get("merge_tick", data.get("merge_bid_ask", False)))
     merge_s1 = bool(data.get("merge_s1", data.get("merge_bid_ask", False)))
+    batch_size = _safe_int(data.get("batch_size", data.get("concurrency", 10)), 10)
+    pause_ms = _safe_int(data.get("pause_ms", 1000), 1000)
     sym_list = _parse_symbol_list(symbols)
     tf_list = [
         _normalize_dukascopy_genesis_timeframe(timeframe)
         for timeframe in _parse_timeframe_list(timeframes)
     ]
+
+    if batch_size < 1 or batch_size > 50:
+        return jsonify({"error": "batch_size must be between 1 and 50"}), 400
+    if pause_ms < 0 or pause_ms > 60000:
+        return jsonify({"error": "pause_ms must be between 0 and 60000"}), 400
 
     if source == "dukascopy" and start:
         genesis_index = _load_dukascopy_genesis()
@@ -2531,10 +3100,10 @@ def data_download():
             ), 400
 
     task_id = str(uuid.uuid4())
+    name, description = _download_task_labels(source, sym_list, tf_list)
 
-    cmd = []
+    cmd: list[str]
     if source == "dukascopy":
-        # python -m data_tools.downloaders.dukascopy_native --symbols ...
         cmd = [
             sys.executable,
             "-u",
@@ -2544,6 +3113,10 @@ def data_download():
             symbols,
             "--timeframes",
             timeframes,
+            "--batch-size",
+            str(batch_size),
+            "--pause-ms",
+            str(pause_ms),
         ]
         if start:
             cmd.extend(["--start", start])
@@ -2555,7 +3128,28 @@ def data_download():
             cmd.append("--merge-tick")
         if merge_s1:
             cmd.append("--merge-s1")
-    elif source == "yfinance":
+
+        total_items = max(len(sym_list) * len(tf_list), 1)
+        return jsonify(
+            _start_dukascopy_task(
+                task_id,
+                cmd,
+                symbols=sym_list,
+                timeframes=tf_list,
+                start=start or None,
+                end=end or None,
+                price_type=str(price_type),
+                merge_tick=merge_tick,
+                merge_s1=merge_s1,
+                batch_size=batch_size,
+                pause_ms=pause_ms,
+                total_items=total_items,
+                name=name,
+                description=description,
+            )
+        )
+
+    if source == "yfinance":
         cmd = [
             sys.executable,
             "-u",
@@ -2565,14 +3159,21 @@ def data_download():
             symbols,
         ]
     elif source == "dolthub":
-        # python -m data_tools.dolthub_manager update
         cmd = [sys.executable, "-u", "-m", "data_tools.dolthub_manager", "update"]
     else:
         return jsonify({"error": "Unknown source"}), 400
 
-    # Count total items for progress tracking
     total_items = max(len(sym_list) * len(tf_list), 1)
-    return jsonify(_start_data_task(task_id, cmd, total_items=total_items))
+    return jsonify(
+        _start_data_task(
+            task_id,
+            cmd,
+            total_items=total_items,
+            name=name,
+            description=description,
+            source=source,
+        )
+    )
 
 
 @app.route("/api/agent/convert", methods=["POST"])
@@ -2627,7 +3228,7 @@ def get_dukascopy_genesis():
 @app.route("/api/data/resample", methods=["POST"])
 def data_resample():
     """Start a background resample task."""
-    data = request.get_json()
+    data = request.get_json() or {}
     source_path = data.get("source_path", "")
     target_tfs = data.get("target_timeframes", "")  # comma separated
 
@@ -2643,55 +3244,109 @@ def data_resample():
         "--timeframes",
         target_tfs,
     ]
-    return jsonify(_start_data_task(task_id, cmd))
+    return jsonify(
+        _start_data_task(
+            task_id,
+            cmd,
+            total_items=1,
+            name="Resample data",
+            description=f"Resample {Path(source_path).name or source_path} into {target_tfs}.",
+            source="resample",
+        )
+    )
 
 
-def _parse_progress(log_content: str, task: dict) -> dict:
-    """Parse download progress from log content."""
-    completed = log_content.count("✅")
-    failed = log_content.count("❌")
-    total = task.get("total_items", 0)
-    if total > 0:
-        pct = min(100, int((completed + failed) / total * 100))
-    else:
-        pct = 100 if task.get("status") == "completed" else 0
-    # Extract last meaningful line
-    lines = [l.strip() for l in log_content.strip().split("\n") if l.strip()]
-    last_line = lines[-1] if lines else ""
-    return {
-        "completed": completed,
-        "failed": failed,
-        "total": total,
-        "percent": pct,
-        "current": last_line,
-    }
+@app.route("/api/data/tasks")
+def list_data_tasks():
+    """Return recent data tasks with progress and control metadata."""
+    with DATA_TASKS_LOCK:
+        snapshots = [(task_id, dict(task)) for task_id, task in DATA_TASKS.items()]
+    payload = [
+        _serialize_task(task_id, task, include_log=True, max_log_bytes=768)
+        for task_id, task in snapshots
+    ]
+    payload.sort(
+        key=lambda item: (
+            item.get("created_at") or "",
+            item.get("id") or "",
+        ),
+    )
+    return jsonify({"tasks": payload})
 
 
 @app.route("/api/data/tasks/<task_id>")
 def get_data_task(task_id):
     """Get status of a background task."""
-    task = DATA_TASKS.get(task_id)
+    task = _snapshot_task(task_id)
     if not task:
         return jsonify({"error": "Task not found"}), 404
+    return jsonify(_serialize_task(task_id, task, include_log=True))
 
-    log_content = (
-        _read_task_log(task.get("log_file", ""), max_bytes=2048) if "log_file" in task else ""
-    )
 
-    return jsonify(
-        {
-            "id": task_id,
-            "status": task.get("status"),
-            "log": log_content,
-            "progress": _parse_progress(log_content, task),
-        }
-    )
+@app.route("/api/data/tasks/<task_id>/pause", methods=["POST"])
+def pause_data_task(task_id):
+    """Pause a controllable background task."""
+    task = _get_task(task_id)
+    if task is None:
+        return jsonify({"error": "Task not found"}), 404
+    if not task.get("supports_control", False):
+        return jsonify({"error": "Task cannot be paused"}), 409
+    if task.get("status") in FINAL_TASK_STATUSES:
+        return _task_action_response(task_id)
+
+    task["pause_event"].set()
+    if task.get("control_mode") == "process":
+        _signal_process(task, signal.SIGSTOP)
+    _set_task_status(task_id, "paused")
+    _task_log_message(task_id, "Task paused by user.")
+    return _task_action_response(task_id)
+
+
+@app.route("/api/data/tasks/<task_id>/resume", methods=["POST"])
+def resume_data_task(task_id):
+    """Resume a paused background task."""
+    task = _get_task(task_id)
+    if task is None:
+        return jsonify({"error": "Task not found"}), 404
+    if not task.get("supports_control", False):
+        return jsonify({"error": "Task cannot be resumed"}), 409
+    if task.get("status") in FINAL_TASK_STATUSES:
+        return _task_action_response(task_id)
+
+    task["pause_event"].clear()
+    if task.get("control_mode") == "process":
+        _signal_process(task, signal.SIGCONT)
+    _set_task_status(task_id, "running")
+    _task_log_message(task_id, "Task resumed by user.")
+    return _task_action_response(task_id)
+
+
+@app.route("/api/data/tasks/<task_id>/cancel", methods=["POST"])
+def cancel_data_task(task_id):
+    """Cancel a controllable background task."""
+    task = _get_task(task_id)
+    if task is None:
+        return jsonify({"error": "Task not found"}), 404
+    if not task.get("supports_control", False):
+        return jsonify({"error": "Task cannot be cancelled"}), 409
+    if task.get("status") in FINAL_TASK_STATUSES:
+        return _task_action_response(task_id)
+
+    task["stop_event"].set()
+    task["pause_event"].clear()
+    if task.get("control_mode") == "process":
+        process = task.get("process")
+        if process is not None and process.poll() is None:
+            process.kill()
+    _set_task_status(task_id, "cancelled")
+    _task_log_message(task_id, "Task cancelled by user.")
+    return _task_action_response(task_id)
 
 
 @app.route("/api/data/tasks/<task_id>/logs")
 def get_data_task_logs(task_id):
     """Return the full task log for a background data-management job."""
-    task = DATA_TASKS.get(task_id)
+    task = _snapshot_task(task_id)
     log_file = _task_log_path(task_id)
     if task is None and not log_file.exists():
         return jsonify({"error": "Task not found"}), 404
@@ -2702,6 +3357,19 @@ def get_data_task_logs(task_id):
             "status": task.get("status", "unknown") if task else "unknown",
         }
     )
+
+
+@app.route("/api/data/tasks/<task_id>", methods=["DELETE"])
+def delete_data_task(task_id):
+    """Remove a finished task from the in-memory task registry."""
+    with DATA_TASKS_LOCK:
+        task = DATA_TASKS.get(task_id)
+        if task is None:
+            return jsonify({"error": "Task not found"}), 404
+        if task.get("status") not in FINAL_TASK_STATUSES:
+            return jsonify({"error": "Only completed, failed, or cancelled tasks can be removed"}), 409
+        del DATA_TASKS[task_id]
+    return jsonify({"task_id": task_id, "status": "deleted"})
 
 
 @app.route("/api/data/symbol", methods=["DELETE"])

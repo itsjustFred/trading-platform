@@ -1,130 +1,174 @@
 from __future__ import annotations
 
-import json
-import subprocess
+import sys
+import types
 from pathlib import Path
+from threading import Event
 
 import pandas as pd
 
-from data_tools.downloaders.dukascopy_dl import DukascopyDownloader
 
+def test_native_downloader_accepts_control_events_and_reports_progress(
+    monkeypatch, tmp_path: Path
+):
+    import data_tools.downloaders.dukascopy_native as native
 
-def _fake_dukascopy_run_factory(calls: list[list[str]]):
-    def fake_run(cmd: list[str], capture_output: bool, text: bool) -> subprocess.CompletedProcess[str]:
-        calls.append(cmd)
-        output_dir = Path(cmd[cmd.index("-dir") + 1])
-        price_type = cmd[cmd.index("-p") + 1]
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        if price_type == "bid":
-            frame = pd.DataFrame({
-                "timestamp": ["2024-01-01T00:00:00Z", "2024-01-01T00:00:01Z"],
-                "open": [1.1000, 1.1001],
-                "high": [1.1002, 1.1003],
-                "low": [1.0998, 1.0999],
-                "close": [1.1001, 1.1002],
-                "volume": [100, 110],
-            })
-        else:
-            frame = pd.DataFrame({
-                "timestamp": ["2024-01-01T00:00:00Z", "2024-01-01T00:00:01Z"],
-                "open": [1.1004, 1.1005],
-                "high": [1.1006, 1.1007],
-                "low": [1.1002, 1.1003],
-                "close": [1.1005, 1.1006],
-                "volume": [120, 130],
-            })
-
-        frame.to_csv(output_dir / f"{price_type}.csv", index=False)
-        return subprocess.CompletedProcess(cmd, 0, "", "")
-
-    return fake_run
-
-
-def test_download_uses_genesis_when_start_is_missing(monkeypatch, tmp_path: Path):
-    import data_tools.downloaders.dukascopy_dl as dukascopy_dl
-
-    calls: list[list[str]] = []
-    monkeypatch.setattr(dukascopy_dl, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(dukascopy_dl, "SOURCE_META_PATH", tmp_path / "source_meta.json")
-    monkeypatch.setattr(dukascopy_dl, "GENESIS_PATH", tmp_path / "dukascopy_genesis.json")
-    monkeypatch.setattr(dukascopy_dl.subprocess, "run", _fake_dukascopy_run_factory(calls))
-
-    (tmp_path / "dukascopy_genesis.json").write_text(json.dumps({
-        "EURUSD": {"h4": "2003-05-04"},
-    }))
-
-    downloader = DukascopyDownloader()
-    result = downloader.download("EURUSD", "h4", tmp_path, end="2024-01-01")
-
-    assert result.timeframe == "4h"
-    assert any(cmd[cmd.index("-from") + 1] == "2003-05-04" for cmd in calls)
-
-    source_meta = json.loads((tmp_path / "source_meta.json").read_text())
-    assert source_meta["dukascopy/forex/EURUSD/4h"]["requested_start"] == "2003-05-04"
-
-
-def test_download_can_merge_bid_and_ask_into_one_parquet_for_s1(monkeypatch, tmp_path: Path):
-    import data_tools.downloaders.dukascopy_dl as dukascopy_dl
-
-    calls: list[list[str]] = []
-    monkeypatch.setattr(dukascopy_dl, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(dukascopy_dl, "SOURCE_META_PATH", tmp_path / "source_meta.json")
-    monkeypatch.setattr(dukascopy_dl, "GENESIS_PATH", tmp_path / "dukascopy_genesis.json")
-    monkeypatch.setattr(dukascopy_dl.subprocess, "run", _fake_dukascopy_run_factory(calls))
-
-    downloader = DukascopyDownloader()
-    result = downloader.download(
-        "EURUSD",
-        "s1",
-        tmp_path,
-        start="2024-01-01",
-        end="2024-01-01",
-        merge_s1=True,
+    monkeypatch.setattr(native, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(native, "SOURCE_META_PATH", tmp_path / "source_meta.json")
+    monkeypatch.setattr(native, "GENESIS_PATH", tmp_path / "dukascopy_genesis.json")
+    monkeypatch.setattr(native, "_load_genesis_index", lambda: {})
+    monkeypatch.setattr(native, "_load_source_meta_index", lambda: {})
+    monkeypatch.setattr(native, "_write_source_meta_index", lambda payload: None)
+    monkeypatch.setattr(
+        native,
+        "generate_minute_urls",
+        lambda instrument, start_dt, end_dt, price_type="bid": [(start_dt, "https://example.com/test.bi5")],
     )
 
-    assert [cmd[cmd.index("-p") + 1] for cmd in calls] == ["bid", "ask"]
-    assert "price_type:bid+ask" in result.warnings
+    seen: dict[str, object] = {}
+    progress_updates: list[tuple[float, str]] = []
 
-    merged = pd.read_parquet(result.path)
-    assert list(merged.columns) == [
-        "timestamp",
-        "open_bid",
-        "high_bid",
-        "low_bid",
-        "close_bid",
-        "volume_bid",
-        "open_ask",
-        "high_ask",
-        "low_ask",
-        "close_ask",
-        "volume_ask",
-    ]
+    async def fake_download_bi5_files(
+        urls,
+        concurrency=10,
+        max_retries=3,
+        *,
+        batch_size=None,
+        pause_ms=1000,
+        report_progress=None,
+        stop_event=None,
+        pause_event=None,
+        log_callback=None,
+    ):
+        seen["urls"] = urls
+        seen["stop_event"] = stop_event
+        seen["pause_event"] = pause_event
+        seen["batch_size"] = batch_size
+        seen["pause_ms"] = pause_ms
+        if report_progress is not None:
+            report_progress(50.0, "Halfway there")
+        return [(urls[0][0], b"placeholder")]
 
-    source_meta = json.loads((tmp_path / "source_meta.json").read_text())
-    assert source_meta["dukascopy/forex/EURUSD/sec"]["merge_bid_ask"] is True
+    monkeypatch.setattr(native, "download_bi5_files", fake_download_bi5_files)
+    monkeypatch.setattr(
+        native,
+        "_assemble_candle_dataframe",
+        lambda results, decimal_factor: pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(["2024-01-01T00:00:00Z", "2024-01-01T00:01:00Z"], utc=True),
+                "open": [1.1, 1.2],
+                "high": [1.2, 1.3],
+                "low": [1.0, 1.1],
+                "close": [1.15, 1.25],
+                "volume": [10.0, 12.0],
+            }
+        ),
+    )
 
+    downloader = native.DukascopyNativeDownloader()
+    pause_event = Event()
+    stop_event = Event()
 
-def test_download_uses_selected_price_type_when_merge_flags_are_off(monkeypatch, tmp_path: Path):
-    import data_tools.downloaders.dukascopy_dl as dukascopy_dl
-
-    calls: list[list[str]] = []
-    monkeypatch.setattr(dukascopy_dl, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(dukascopy_dl, "SOURCE_META_PATH", tmp_path / "source_meta.json")
-    monkeypatch.setattr(dukascopy_dl, "GENESIS_PATH", tmp_path / "dukascopy_genesis.json")
-    monkeypatch.setattr(dukascopy_dl.subprocess, "run", _fake_dukascopy_run_factory(calls))
-
-    downloader = DukascopyDownloader()
     result = downloader.download(
         "EURUSD",
         "m1",
         tmp_path,
         start="2024-01-01",
         end="2024-01-01",
-        price_type="ask",
-        merge_tick=True,
-        merge_s1=True,
+        pause_event=pause_event,
+        stop_event=stop_event,
+        report_progress=lambda pct, msg: progress_updates.append((pct, msg)),
     )
 
-    assert [cmd[cmd.index("-p") + 1] for cmd in calls] == ["ask"]
-    assert "price_type:ask" in result.warnings
+    assert result.symbol == "EURUSD"
+    assert seen["pause_event"] is pause_event
+    assert seen["stop_event"] is stop_event
+    assert seen["batch_size"] == 10
+    assert seen["pause_ms"] == 1000
+    assert any(pct == 0.0 for pct, _ in progress_updates)
+    assert any("Halfway there" in msg for _, msg in progress_updates)
+    assert progress_updates[-1][0] == 100.0
+
+
+def test_download_bi5_files_batches_and_increases_pause_on_throttle(monkeypatch):
+    import data_tools.downloaders.dukascopy_native as native
+
+    class FakeConnector:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+
+    class FakeTimeout:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+
+    class FakeClientSession:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    fake_aiohttp = types.SimpleNamespace(
+        TCPConnector=FakeConnector,
+        ClientTimeout=FakeTimeout,
+        ClientSession=FakeClientSession,
+    )
+    monkeypatch.setitem(sys.modules, "aiohttp", fake_aiohttp)
+
+    sleep_calls: list[float] = []
+    log_lines: list[str] = []
+    fetch_calls: list[str] = []
+
+    async def fake_fetch_one(
+        session,
+        dt,
+        url,
+        semaphore,
+        max_retries=3,
+        *,
+        pause_event=None,
+        stop_event=None,
+    ):
+        fetch_calls.append(url)
+        return native.FetchResult(
+            dt=dt,
+            data=url.encode("utf-8"),
+            throttle_signal=url == "u2",
+        )
+
+    async def fake_sleep_with_control(delay_seconds, pause_event, stop_event):
+        sleep_calls.append(delay_seconds)
+
+    monkeypatch.setattr(native, "_fetch_one", fake_fetch_one)
+    monkeypatch.setattr(native, "_sleep_with_control", fake_sleep_with_control)
+
+    start = pd.Timestamp("2024-01-01T00:00:00Z").to_pydatetime()
+    urls = [
+        (start, "u1"),
+        (start, "u2"),
+        (start, "u3"),
+    ]
+
+    results = native.asyncio.run(
+        native.download_bi5_files(
+            urls,
+            batch_size=2,
+            pause_ms=1000,
+            log_callback=log_lines.append,
+        )
+    )
+
+    assert fetch_calls == ["u1", "u2", "u3"]
+    assert results == [
+        (start, b"u1"),
+        (start, b"u2"),
+        (start, b"u3"),
+    ]
+    assert sleep_calls == [2.0]
+    assert any("increasing pause to 2000 ms" in line for line in log_lines)
