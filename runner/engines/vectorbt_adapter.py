@@ -16,6 +16,7 @@ import importlib.util
 import inspect
 import logging
 import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,8 @@ TIMEFRAME_TO_DURATION = {
     "1d": pd.Timedelta(days=1),
     "1w": pd.Timedelta(weeks=1),
 }
+
+MAX_PARALLEL_WORKERS = 4
 
 
 def _uses_kwargs_style(func) -> bool:
@@ -73,6 +76,179 @@ def _call_generate_signals(strategy_mod, df: pd.DataFrame, parameters: dict):
     return strategy_mod.generate_signals(df, parameters)
 
 
+def _process_symbol(
+    symbol: str,
+    config: BacktestConfig,
+    strategy_path: str,
+    resolved_parameters: dict[str, Any],
+    data_root: Path,
+) -> tuple[list[Trade], list[str]]:
+    """Process a single symbol: load data, generate signals, extract trades.
+
+    Returns (trades_with_temp_ids, used_intrabar_timeframes).
+    Runs in its own process when parallelized.
+    """
+    strategy_mod = _load_strategy_module(strategy_path)
+    df, data_path = _load_ohlcv(
+        data_root, symbol, config.timeframe, config.start_date, config.end_date
+    )
+    if df is None or df.empty:
+        logger.warning("No data for %s/%s, skipping", symbol, config.timeframe)
+        return [], []
+
+    asset_class = _infer_asset_class_from_path(data_path)
+    intrabar_df, intrabar_timeframe = _load_intrabar_ohlcv(
+        data_root,
+        symbol,
+        config.timeframe,
+        config.modeling_resolution,
+        config.start_date,
+        config.end_date,
+    )
+    extra_timeframes = [intrabar_timeframe] if intrabar_timeframe else []
+
+    signal_output = _call_generate_signals(strategy_mod, df, resolved_parameters)
+    signals, indicators = _normalize_signal_output(signal_output, df.index)
+    entries = signals["entries"]
+    exits = signals["exits"]
+    stop_loss_series = _find_stop_loss_series(signals, indicators)
+    take_profit_series = _find_take_profit_series(signals, indicators)
+    atr_series = _find_atr_series(signals, indicators)
+    direction_series = _find_direction_series(signals, indicators)
+    exit_price_series = _find_exit_price_series(signals, indicators)
+    exit_reason_series = _find_exit_reason_series(signals, indicators)
+
+    trades: list[Trade] = []
+    in_trade = False
+    entry_idx = None
+    equity = config.initial_capital
+    trade_counter = 0
+
+    for i in range(len(df)):
+        if not in_trade and bool(entries.iloc[i]):
+            in_trade = True
+            entry_idx = i
+        elif in_trade and bool(exits.iloc[i]):
+            in_trade = False
+            trade_counter += 1
+
+            entry_row = df.iloc[entry_idx]
+            exit_row = df.iloc[i]
+            direction = _resolve_direction(signals, direction_series, entry_idx)
+            entry_price = float(entry_row["close"])
+            exit_price = _resolve_exit_price(exit_row, i, exit_price_series)
+            exit_reason = _resolve_exit_reason(i, exit_reason_series)
+            entry_ts = str(entry_row.get("timestamp", entry_row.name))
+            exit_ts = str(exit_row.get("timestamp", exit_row.name))
+            trade_meta = _extract_trade_meta(signals, indicators, entry_idx, i)
+
+            intrabar_exit = _resolve_intrabar_exit(
+                intrabar_df=intrabar_df,
+                intrabar_timeframe=intrabar_timeframe,
+                base_timeframe=config.timeframe,
+                direction=direction,
+                entry_time=entry_ts,
+                scheduled_exit_time=exit_ts,
+                stop_price=_resolve_level_value(stop_loss_series, entry_idx),
+                take_profit_price=_resolve_level_value(take_profit_series, entry_idx),
+            )
+            if intrabar_exit is not None:
+                exit_price = intrabar_exit["price"]
+                exit_ts = intrabar_exit["time"]
+                exit_reason = intrabar_exit["reason"]
+                trade_meta["modeling_resolution"] = intrabar_exit["resolution"]
+
+            if config.risk_per_trade_pct is not None and config.risk_per_trade_pct > 0:
+                max_position_pct = _resolve_max_position_pct(
+                    config.max_position_pct, asset_class
+                )
+                max_leverage = _resolve_max_leverage(config.max_leverage)
+                if max_leverage < max_position_pct:
+                    max_leverage = max_position_pct
+
+                risk_amount = equity * config.risk_per_trade_pct
+                stop_dist = _resolve_stop_distance(
+                    entry_idx,
+                    entry_price,
+                    stop_loss_series=stop_loss_series,
+                    atr_series=atr_series,
+                )
+
+                if not stop_dist or stop_dist <= 0:
+                    stop_dist = entry_price * 0.02
+                    logger.warning(
+                        "Risk sizing fallback for %s at bar %s: no stop_loss/ATR, using %.2f%% default stop",
+                        symbol,
+                        entry_idx,
+                        2.0,
+                    )
+
+                base_qty = risk_amount / stop_dist
+                required_notional = base_qty * entry_price
+                cap_notional = equity * max_position_pct
+                leverage_notional_limit = equity * max_leverage
+
+                if required_notional <= cap_notional:
+                    final_notional = required_notional
+                elif required_notional <= leverage_notional_limit:
+                    final_notional = required_notional
+                    logger.info(
+                        "Leverage used for %s trade %s: required_notional=%.2f exceeds cap=%.2f (max_leverage=%.2fx)",
+                        symbol,
+                        trade_counter,
+                        required_notional,
+                        cap_notional,
+                        max_leverage,
+                    )
+                else:
+                    final_notional = leverage_notional_limit
+                    achievable_risk = (final_notional / entry_price) * stop_dist
+                    logger.warning(
+                        "Risk target underfilled for %s trade %s: target=%.2f achievable=%.2f (cap=%.2f, max_leverage=%.2fx)",
+                        symbol,
+                        trade_counter,
+                        risk_amount,
+                        achievable_risk,
+                        cap_notional,
+                        max_leverage,
+                    )
+
+                qty = final_notional / entry_price
+            else:
+                qty = equity / entry_price
+
+            if direction == "LONG":
+                pnl = (exit_price - entry_price) * qty
+            else:
+                pnl = (entry_price - exit_price) * qty
+
+            trade = Trade(
+                id=trade_counter,  # temporary; renumbered after merge
+                symbol=symbol,
+                direction=direction,
+                entry_time=entry_ts,
+                entry_price=round(entry_price, 6),
+                quantity=round(qty, 4),
+                exits=[
+                    TradeExit(
+                        time=exit_ts,
+                        price=round(exit_price, 6),
+                        quantity=round(qty, 4),
+                        pnl=round(pnl, 2),
+                        reason=exit_reason,
+                    )
+                ],
+                pnl=round(pnl, 2),
+                holding_bars=i - entry_idx,
+                tags=["vectorbt"],
+                meta=trade_meta,
+            )
+            trades.append(trade)
+            equity += pnl
+
+    return trades, extra_timeframes
+
+
 class VectorbtAdapter(EngineAdapter):
     """Adapter for vectorbt-style vectorized backtesting."""
 
@@ -88,168 +264,52 @@ class VectorbtAdapter(EngineAdapter):
         data_root = Path(config.data_dir) if config.data_dir else DATA_DIR
         resolved_parameters = resolve_strategy_parameters(strategy_path, config.parameters)
         all_trades: list[Trade] = []
-        all_equity: list[EquityPoint] = []
-        trade_counter = 0
         used_timeframes = [config.timeframe]
 
-        for symbol in config.symbols:
-            df, data_path = _load_ohlcv(
-                data_root, symbol, config.timeframe, config.start_date, config.end_date
+        num_symbols = len(config.symbols)
+        use_parallel = num_symbols > 1
+
+        if use_parallel:
+            max_workers = min(num_symbols, MAX_PARALLEL_WORKERS)
+            logger.info(
+                "Parallel backtest: %d symbols across %d workers", num_symbols, max_workers
             )
-            if df is None or df.empty:
-                logger.warning("No data for %s/%s, skipping", symbol, config.timeframe)
-                continue
-            asset_class = _infer_asset_class_from_path(data_path)
-            intrabar_df, intrabar_timeframe = _load_intrabar_ohlcv(
-                data_root,
-                symbol,
-                config.timeframe,
-                config.modeling_resolution,
-                config.start_date,
-                config.end_date,
-            )
-            if intrabar_timeframe and intrabar_timeframe not in used_timeframes:
-                used_timeframes.append(intrabar_timeframe)
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(
+                        _process_symbol, sym, config, strategy_path, resolved_parameters, data_root
+                    ): sym
+                    for sym in config.symbols
+                }
+                for future in as_completed(futures):
+                    sym = futures[future]
+                    try:
+                        trades, extra_tfs = future.result()
+                        all_trades.extend(trades)
+                        for tf in extra_tfs:
+                            if tf not in used_timeframes:
+                                used_timeframes.append(tf)
+                    except Exception:
+                        logger.exception("Failed processing symbol %s", sym)
+        else:
+            for symbol in config.symbols:
+                trades, extra_tfs = _process_symbol(
+                    symbol, config, strategy_path, resolved_parameters, data_root
+                )
+                all_trades.extend(trades)
+                for tf in extra_tfs:
+                    if tf not in used_timeframes:
+                        used_timeframes.append(tf)
 
-            signal_output = _call_generate_signals(strategy_mod, df, resolved_parameters)
-            signals, indicators = _normalize_signal_output(signal_output, df.index)
-            entries = signals["entries"]
-            exits = signals["exits"]
-            stop_loss_series = _find_stop_loss_series(signals, indicators)
-            take_profit_series = _find_take_profit_series(signals, indicators)
-            atr_series = _find_atr_series(signals, indicators)
-            direction_series = _find_direction_series(signals, indicators)
-            exit_price_series = _find_exit_price_series(signals, indicators)
-            exit_reason_series = _find_exit_reason_series(signals, indicators)
+        # Renumber trade IDs sequentially after merge
+        all_trades.sort(key=lambda t: t.entry_time)
+        for idx, trade in enumerate(all_trades, start=1):
+            trade.id = idx
 
-            in_trade = False
-            entry_idx = None
-            equity = config.initial_capital
-
-            for i in range(len(df)):
-                if not in_trade and bool(entries.iloc[i]):
-                    in_trade = True
-                    entry_idx = i
-                elif in_trade and bool(exits.iloc[i]):
-                    in_trade = False
-                    trade_counter += 1
-
-                    entry_row = df.iloc[entry_idx]
-                    exit_row = df.iloc[i]
-                    direction = _resolve_direction(signals, direction_series, entry_idx)
-                    entry_price = float(entry_row["close"])
-                    exit_price = _resolve_exit_price(exit_row, i, exit_price_series)
-                    exit_reason = _resolve_exit_reason(i, exit_reason_series)
-                    entry_ts = str(entry_row.get("timestamp", entry_row.name))
-                    exit_ts = str(exit_row.get("timestamp", exit_row.name))
-                    trade_meta = _extract_trade_meta(signals, indicators, entry_idx, i)
-
-                    intrabar_exit = _resolve_intrabar_exit(
-                        intrabar_df=intrabar_df,
-                        intrabar_timeframe=intrabar_timeframe,
-                        base_timeframe=config.timeframe,
-                        direction=direction,
-                        entry_time=entry_ts,
-                        scheduled_exit_time=exit_ts,
-                        stop_price=_resolve_level_value(stop_loss_series, entry_idx),
-                        take_profit_price=_resolve_level_value(take_profit_series, entry_idx),
-                    )
-                    if intrabar_exit is not None:
-                        exit_price = intrabar_exit["price"]
-                        exit_ts = intrabar_exit["time"]
-                        exit_reason = intrabar_exit["reason"]
-                        trade_meta["modeling_resolution"] = intrabar_exit["resolution"]
-
-                    if config.risk_per_trade_pct is not None and config.risk_per_trade_pct > 0:
-                        max_position_pct = _resolve_max_position_pct(
-                            config.max_position_pct, asset_class
-                        )
-                        max_leverage = _resolve_max_leverage(config.max_leverage)
-                        if max_leverage < max_position_pct:
-                            max_leverage = max_position_pct
-
-                        risk_amount = equity * config.risk_per_trade_pct
-                        stop_dist = _resolve_stop_distance(
-                            entry_idx,
-                            entry_price,
-                            stop_loss_series=stop_loss_series,
-                            atr_series=atr_series,
-                        )
-
-                        if not stop_dist or stop_dist <= 0:
-                            stop_dist = entry_price * 0.02
-                            logger.warning(
-                                "Risk sizing fallback for %s at bar %s: no stop_loss/ATR, using %.2f%% default stop",
-                                symbol,
-                                entry_idx,
-                                2.0,
-                            )
-
-                        base_qty = risk_amount / stop_dist
-                        required_notional = base_qty * entry_price
-                        cap_notional = equity * max_position_pct
-                        leverage_notional_limit = equity * max_leverage
-
-                        if required_notional <= cap_notional:
-                            final_notional = required_notional
-                        elif required_notional <= leverage_notional_limit:
-                            final_notional = required_notional
-                            logger.info(
-                                "Leverage used for %s trade %s: required_notional=%.2f exceeds cap=%.2f (max_leverage=%.2fx)",
-                                symbol,
-                                trade_counter + 1,
-                                required_notional,
-                                cap_notional,
-                                max_leverage,
-                            )
-                        else:
-                            final_notional = leverage_notional_limit
-                            achievable_risk = (final_notional / entry_price) * stop_dist
-                            logger.warning(
-                                "Risk target underfilled for %s trade %s: target=%.2f achievable=%.2f (cap=%.2f, max_leverage=%.2fx)",
-                                symbol,
-                                trade_counter + 1,
-                                risk_amount,
-                                achievable_risk,
-                                cap_notional,
-                                max_leverage,
-                            )
-
-                        qty = final_notional / entry_price
-                    else:
-                        qty = equity / entry_price
-
-                    if direction == "LONG":
-                        pnl = (exit_price - entry_price) * qty
-                    else:
-                        pnl = (entry_price - exit_price) * qty
-
-                    trade = Trade(
-                        id=trade_counter,
-                        symbol=symbol,
-                        direction=direction,
-                        entry_time=entry_ts,
-                        entry_price=round(entry_price, 6),
-                        quantity=round(qty, 4),
-                        exits=[
-                            TradeExit(
-                                time=exit_ts,
-                                price=round(exit_price, 6),
-                                quantity=round(qty, 4),
-                                pnl=round(pnl, 2),
-                                reason=exit_reason,
-                            )
-                        ],
-                        pnl=round(pnl, 2),
-                        holding_bars=i - entry_idx,
-                        tags=["vectorbt"],
-                        meta=trade_meta,
-                    )
-                    all_trades.append(trade)
-                    equity += pnl
-
+        # Build equity curve from sorted trades
+        all_equity: list[EquityPoint] = []
         equity = config.initial_capital
-        for trade in sorted(all_trades, key=lambda item: item.entry_time):
+        for trade in all_trades:
             equity += trade.pnl
             all_equity.append(EquityPoint(time=trade.entry_time, equity=round(equity, 2)))
 

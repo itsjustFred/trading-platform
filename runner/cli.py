@@ -20,6 +20,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from pydantic import ValidationError
+
 from runner.engines.base import BacktestConfig, EngineAdapter, resolve_strategy_parameters
 from runner.stats import compute_stats_for_result
 
@@ -103,20 +105,25 @@ def cmd_run(args):
             end = detected_end
         logger.info("Auto-detected date range: %s to %s", start, end)
 
-    config = BacktestConfig(
-        strategy_name=args.name or Path(args.strategy).stem,
-        symbols=args.symbols,
-        timeframe=args.timeframe,
-        start_date=start,
-        end_date=end,
-        initial_capital=args.capital,
-        risk_per_trade_pct=getattr(args, "risk_pct", None),
-        max_position_pct=getattr(args, "max_position_pct", None),
-        max_leverage=getattr(args, "max_leverage", None),
-        modeling_resolution=getattr(args, "intrabar_resolution", "open_close") or "open_close",
-        data_dir=args.data_dir or "",
-        parameters=resolved_parameters,
-    )
+    try:
+        config = BacktestConfig(
+            strategy_name=args.name or Path(args.strategy).stem,
+            symbols=args.symbols,
+            timeframe=args.timeframe,
+            start_date=start,
+            end_date=end,
+            initial_capital=args.capital,
+            risk_per_trade_pct=getattr(args, "risk_pct", None),
+            max_position_pct=getattr(args, "max_position_pct", None),
+            max_leverage=getattr(args, "max_leverage", None),
+            modeling_resolution=getattr(args, "intrabar_resolution", "open_close") or "open_close",
+            data_dir=args.data_dir or "",
+            parameters=resolved_parameters,
+        )
+    except ValidationError as exc:
+        for err in exc.errors():
+            logger.error("Config error: %s — %s", err["loc"], err["msg"])
+        sys.exit(1)
 
     # Validate
     errors = engine.validate_config(config)

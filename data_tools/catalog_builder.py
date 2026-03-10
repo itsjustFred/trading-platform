@@ -47,7 +47,7 @@ def _load_source_meta(data_dir: Path) -> dict[str, dict]:
     if meta_path.exists():
         try:
             return json.loads(meta_path.read_text())
-        except Exception as exc:
+        except (json.JSONDecodeError, OSError) as exc:
             logger.warning("Could not read %s: %s", meta_path, exc)
     return {}
 
@@ -60,7 +60,7 @@ def _load_catalog_cache(data_dir: Path) -> dict[str, dict]:
 
     try:
         payload = json.loads(cache_path.read_text())
-    except Exception as exc:
+    except (json.JSONDecodeError, OSError) as exc:
         logger.warning("Could not read %s: %s", cache_path, exc)
         return {}
 
@@ -110,7 +110,7 @@ def _run_validation(parquet_path: Path, symbol: str, timeframe: str) -> dict | N
                 if w is not None
             ],
         }
-    except Exception as exc:
+    except (OSError, ValueError, KeyError) as exc:
         logger.debug("Validation skipped for %s: %s", parquet_path, exc)
         return None
 
@@ -124,7 +124,7 @@ def _format_catalog_date(value: object) -> str | None:
         return None
     try:
         timestamp = pd.to_datetime(value, utc=True)
-    except Exception:
+    except (ValueError, TypeError):
         return None
     if pd.isna(timestamp):
         return None
@@ -268,7 +268,7 @@ def scan_ohlcv(data_dir: Path, include_validation: bool = False) -> list[dict]:
                         entry[key] = cached_entry[key]
             else:
                 entry.update(read_parquet_summary(parquet_file))
-        except Exception as e:
+        except (OSError, pd.errors.EmptyDataError, ValueError) as e:
             logger.warning("Could not read %s: %s", parquet_file, e)
             try:
                 stat = parquet_file.stat()
@@ -341,7 +341,7 @@ def scan_fundamentals(data_dir: Path) -> list[dict]:
             df = pd.read_parquet(parquet_file)
             entry["rows"] = len(df)
             entry["columns"] = list(df.columns)
-        except Exception as e:
+        except (OSError, pd.errors.EmptyDataError, ValueError) as e:
             entry["rows"] = None
             entry["error"] = str(e)
 

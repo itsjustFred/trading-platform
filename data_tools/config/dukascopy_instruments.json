@@ -1,0 +1,8037 @@
+{
+  "0005hkhkd": {
+    "decimal_factor": 1000,
+    "name": "0005.HK/HKD",
+    "start_tick": "2018-01-02"
+  },
+  "0027hkhkd": {
+    "decimal_factor": 1000,
+    "name": "0027.HK/HKD",
+    "start_tick": "2018-01-02"
+  },
+  "0175hkhkd": {
+    "decimal_factor": 1000,
+    "name": "0175.HK/HKD",
+    "start_tick": "2018-01-02"
+  },
+  "0291hkhkd": {
+    "decimal_factor": 1000,
+    "name": "0291.HK/HKD",
+    "start_tick": "2018-01-02"
+  },
+  "0386hkhkd": {
+    "decimal_factor": 1000,
+    "name": "0386.HK/HKD",
+    "start_tick": "2018-03-01"
+  },
+  "0388hkhkd": {
+    "decimal_factor": 1000,
+    "name": "0388.HK/HKD",
+    "start_tick": "2018-01-02"
+  },
+  "0700hkhkd": {
+    "decimal_factor": 1000,
+    "name": "0700.HK/HKD",
+    "start_tick": "2018-01-02"
+  },
+  "0857hkhkd": {
+    "decimal_factor": 1000,
+    "name": "0857.HK/HKD",
+    "start_tick": "2018-01-02"
+  },
+  "0883hkhkd": {
+    "decimal_factor": 1000,
+    "name": "0883.HK/HKD",
+    "start_tick": "2018-01-02"
+  },
+  "0939hkhkd": {
+    "decimal_factor": 1000,
+    "name": "0939.HK/HKD",
+    "start_tick": "2018-01-02"
+  },
+  "0941hkhkd": {
+    "decimal_factor": 1000,
+    "name": "0941.HK/HKD",
+    "start_tick": "2018-05-23"
+  },
+  "0998hkhkd": {
+    "decimal_factor": 1000,
+    "name": "0998.HK/HKD",
+    "start_tick": "2018-02-01"
+  },
+  "1093hkhkd": {
+    "decimal_factor": 1000,
+    "name": "1093.HK/HKD",
+    "start_tick": "2018-01-02"
+  },
+  "1177hkhkd": {
+    "decimal_factor": 1000,
+    "name": "1177.HK/HKD",
+    "start_tick": "2018-07-04"
+  },
+  "1288hkhkd": {
+    "decimal_factor": 1000,
+    "name": "1288.HK/HKD",
+    "start_tick": "2018-01-02"
+  },
+  "1299hkhkd": {
+    "decimal_factor": 1000,
+    "name": "1299.HK/HKD",
+    "start_tick": "2018-01-02"
+  },
+  "1398hkhkd": {
+    "decimal_factor": 1000,
+    "name": "1398.HK/HKD",
+    "start_tick": "2018-01-02"
+  },
+  "1810hkhkd": {
+    "decimal_factor": 1000,
+    "name": "1810.HK/HKD",
+    "start_tick": "2020-09-28"
+  },
+  "1918hkhkd": {
+    "decimal_factor": 1000,
+    "name": "1918.HK/HKD",
+    "start_tick": "2018-02-01"
+  },
+  "2007hkhkd": {
+    "decimal_factor": 1000,
+    "name": "2007.HK/HKD",
+    "start_tick": "2018-01-02"
+  },
+  "2018hkhkd": {
+    "decimal_factor": 1000,
+    "name": "2018.HK/HKD",
+    "start_tick": "2018-01-02"
+  },
+  "2318hkhkd": {
+    "decimal_factor": 1000,
+    "name": "2318.HK/HKD",
+    "start_tick": "2018-01-02"
+  },
+  "2388hkhkd": {
+    "decimal_factor": 1000,
+    "name": "2388.HK/HKD",
+    "start_tick": "2018-04-10"
+  },
+  "2502jpjpy": {
+    "decimal_factor": 10,
+    "name": "2502.JP/JPY",
+    "start_tick": "2018-09-26"
+  },
+  "2503jpjpy": {
+    "decimal_factor": 10,
+    "name": "2503.JP/JPY",
+    "start_tick": "2018-09-26"
+  },
+  "2628hkhkd": {
+    "decimal_factor": 1000,
+    "name": "2628.HK/HKD",
+    "start_tick": "2018-01-02"
+  },
+  "2822hkhkd": {
+    "decimal_factor": 1000,
+    "name": "2822.HK/HKD",
+    "start_tick": "2020-09-28"
+  },
+  "2828hkhkd": {
+    "decimal_factor": 1000,
+    "name": "2828.HK/HKD",
+    "start_tick": "2020-09-28"
+  },
+  "2836hkhkd": {
+    "decimal_factor": 1000,
+    "name": "2836.HK/HKD",
+    "start_tick": "2020-09-28"
+  },
+  "2914jpjpy": {
+    "decimal_factor": 10,
+    "name": "2914.JP/JPY",
+    "start_tick": "2018-09-21"
+  },
+  "3188hkhkd": {
+    "decimal_factor": 1000,
+    "name": "3188.HK/HKD",
+    "start_tick": "2020-09-28"
+  },
+  "3333hkhkd": {
+    "decimal_factor": 1000,
+    "name": "3333.HK/HKD",
+    "start_tick": "2018-01-02"
+  },
+  "3382jpjpy": {
+    "decimal_factor": 10,
+    "name": "3382.JP/JPY",
+    "start_tick": "2018-09-21"
+  },
+  "3436jpjpy": {
+    "decimal_factor": 10,
+    "name": "3436.JP/JPY",
+    "start_tick": "2018-09-26"
+  },
+  "3968hkhkd": {
+    "decimal_factor": 1000,
+    "name": "3968.HK/HKD",
+    "start_tick": "2018-01-02"
+  },
+  "3988hkhkd": {
+    "decimal_factor": 1000,
+    "name": "3988.HK/HKD",
+    "start_tick": "2019-06-04"
+  },
+  "4004jpjpy": {
+    "decimal_factor": 10,
+    "name": "4004.JP/JPY",
+    "start_tick": "2018-09-21"
+  },
+  "4005jpjpy": {
+    "decimal_factor": 10,
+    "name": "4005.JP/JPY",
+    "start_tick": "2018-09-21"
+  },
+  "4063jpjpy": {
+    "decimal_factor": 10,
+    "name": "4063.JP/JPY",
+    "start_tick": "2018-09-21"
+  },
+  "4452jpjpy": {
+    "decimal_factor": 10,
+    "name": "4452.JP/JPY",
+    "start_tick": "2018-09-26"
+  },
+  "4502jpjpy": {
+    "decimal_factor": 10,
+    "name": "4502.JP/JPY",
+    "start_tick": "2018-09-21"
+  },
+  "4503jpjpy": {
+    "decimal_factor": 10,
+    "name": "4503.JP/JPY",
+    "start_tick": "2018-09-26"
+  },
+  "4507jpjpy": {
+    "decimal_factor": 10,
+    "name": "4507.JP/JPY",
+    "start_tick": "2018-09-26"
+  },
+  "4523jpjpy": {
+    "decimal_factor": 10,
+    "name": "4523.JP/JPY",
+    "start_tick": "2018-09-21"
+  },
+  "4543jpjpy": {
+    "decimal_factor": 10,
+    "name": "4543.JP/JPY",
+    "start_tick": "2018-09-26"
+  },
+  "4689jpjpy": {
+    "decimal_factor": 10,
+    "name": "4689.JP/JPY",
+    "start_tick": "2018-09-21"
+  },
+  "4911jpjpy": {
+    "decimal_factor": 10,
+    "name": "4911.JP/JPY",
+    "start_tick": "2018-09-21"
+  },
+  "5108jpjpy": {
+    "decimal_factor": 10,
+    "name": "5108.JP/JPY",
+    "start_tick": "2018-09-26"
+  },
+  "5301jpjpy": {
+    "decimal_factor": 10,
+    "name": "5301.JP/JPY",
+    "start_tick": "2018-09-21"
+  },
+  "5401jpjpy": {
+    "decimal_factor": 10,
+    "name": "5401.JP/JPY",
+    "start_tick": "2018-09-21"
+  },
+  "6098jpjpy": {
+    "decimal_factor": 10,
+    "name": "6098.JP/JPY",
+    "start_tick": "2018-09-26"
+  },
+  "6301jpjpy": {
+    "decimal_factor": 10,
+    "name": "6301.JP/JPY",
+    "start_tick": "2018-09-21"
+  },
+  "6367jpjpy": {
+    "decimal_factor": 10,
+    "name": "6367.JP/JPY",
+    "start_tick": "2018-09-26"
+  },
+  "6501jpjpy": {
+    "decimal_factor": 10,
+    "name": "6501.JP/JPY",
+    "start_tick": "2018-09-26"
+  },
+  "6502jpjpy": {
+    "decimal_factor": 10,
+    "name": "6502.JP/JPY",
+    "start_tick": "2018-09-26"
+  },
+  "6503jpjpy": {
+    "decimal_factor": 10,
+    "name": "6503.JP/JPY",
+    "start_tick": "2018-09-26"
+  },
+  "6506jpjpy": {
+    "decimal_factor": 10,
+    "name": "6506.JP/JPY",
+    "start_tick": "2018-09-21"
+  },
+  "6702jpjpy": {
+    "decimal_factor": 10,
+    "name": "6702.JP/JPY",
+    "start_tick": "2018-09-26"
+  },
+  "6752jpjpy": {
+    "decimal_factor": 10,
+    "name": "6752.JP/JPY",
+    "start_tick": "2018-09-26"
+  },
+  "6758jpjpy": {
+    "decimal_factor": 10,
+    "name": "6758.JP/JPY",
+    "start_tick": "2018-09-21"
+  },
+  "6762jpjpy": {
+    "decimal_factor": 10,
+    "name": "6762.JP/JPY",
+    "start_tick": "2018-09-21"
+  },
+  "6902jpjpy": {
+    "decimal_factor": 10,
+    "name": "6902.JP/JPY",
+    "start_tick": "2018-09-21"
+  },
+  "6954jpjpy": {
+    "decimal_factor": 10,
+    "name": "6954.JP/JPY",
+    "start_tick": "2018-09-21"
+  },
+  "6971jpjpy": {
+    "decimal_factor": 10,
+    "name": "6971.JP/JPY",
+    "start_tick": "2018-09-21"
+  },
+  "7201jpjpy": {
+    "decimal_factor": 10,
+    "name": "7201.JP/JPY",
+    "start_tick": "2018-09-26"
+  },
+  "7203jpjpy": {
+    "decimal_factor": 10,
+    "name": "7203.JP/JPY",
+    "start_tick": "2018-09-21"
+  },
+  "7261jpjpy": {
+    "decimal_factor": 10,
+    "name": "7261.JP/JPY",
+    "start_tick": "2018-09-26"
+  },
+  "7267jpjpy": {
+    "decimal_factor": 10,
+    "name": "7267.JP/JPY",
+    "start_tick": "2018-09-21"
+  },
+  "7269jpjpy": {
+    "decimal_factor": 10,
+    "name": "7269.JP/JPY",
+    "start_tick": "2018-09-26"
+  },
+  "7270jpjpy": {
+    "decimal_factor": 10,
+    "name": "7270.JP/JPY",
+    "start_tick": "2018-09-26"
+  },
+  "7751jpjpy": {
+    "decimal_factor": 10,
+    "name": "7751.JP/JPY",
+    "start_tick": "2018-09-21"
+  },
+  "7974jpjpy": {
+    "decimal_factor": 10,
+    "name": "7974.JP/JPY",
+    "start_tick": "2018-09-21"
+  },
+  "8031jpjpy": {
+    "decimal_factor": 10,
+    "name": "8031.JP/JPY",
+    "start_tick": "2018-09-26"
+  },
+  "8035jpjpy": {
+    "decimal_factor": 10,
+    "name": "8035.JP/JPY",
+    "start_tick": "2018-09-21"
+  },
+  "8306jpjpy": {
+    "decimal_factor": 10,
+    "name": "8306.JP/JPY",
+    "start_tick": "2018-09-21"
+  },
+  "8316jpjpy": {
+    "decimal_factor": 10,
+    "name": "8316.JP/JPY",
+    "start_tick": "2018-09-21"
+  },
+  "8411jpjpy": {
+    "decimal_factor": 10,
+    "name": "8411.JP/JPY",
+    "start_tick": "2018-09-26"
+  },
+  "8766jpjpy": {
+    "decimal_factor": 10,
+    "name": "8766.JP/JPY",
+    "start_tick": "2018-09-26"
+  },
+  "8801jpjpy": {
+    "decimal_factor": 10,
+    "name": "8801.JP/JPY",
+    "start_tick": "2018-09-26"
+  },
+  "8802jpjpy": {
+    "decimal_factor": 10,
+    "name": "8802.JP/JPY",
+    "start_tick": "2018-09-26"
+  },
+  "9020jpjpy": {
+    "decimal_factor": 10,
+    "name": "9020.JP/JPY",
+    "start_tick": "2018-09-26"
+  },
+  "9432jpjpy": {
+    "decimal_factor": 10,
+    "name": "9432.JP/JPY",
+    "start_tick": "2018-09-21"
+  },
+  "9433jpjpy": {
+    "decimal_factor": 10,
+    "name": "9433.JP/JPY",
+    "start_tick": "2018-09-26"
+  },
+  "9501jpjpy": {
+    "decimal_factor": 10,
+    "name": "9501.JP/JPY",
+    "start_tick": "2018-09-21"
+  },
+  "9983jpjpy": {
+    "decimal_factor": 10,
+    "name": "9983.JP/JPY",
+    "start_tick": "2018-09-21"
+  },
+  "9984jpjpy": {
+    "decimal_factor": 10,
+    "name": "9984.JP/JPY",
+    "start_tick": "2018-09-21"
+  },
+  "a2aiteur": {
+    "decimal_factor": 1000,
+    "name": "A2A.IT/EUR",
+    "start_tick": "2020-06-01"
+  },
+  "aabvususd": {
+    "decimal_factor": 1000,
+    "name": "AABV.US/USD",
+    "start_tick": "2020-10-01"
+  },
+  "aalgbgbx": {
+    "decimal_factor": 1000,
+    "name": "AAL.GB/GBX",
+    "start_tick": "2015-08-25"
+  },
+  "aalususd": {
+    "decimal_factor": 1000,
+    "name": "AAL.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "aaplususd": {
+    "decimal_factor": 1000,
+    "name": "AAPL.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "aapususd": {
+    "decimal_factor": 1000,
+    "name": "AAP.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "aaususd": {
+    "decimal_factor": 1000,
+    "name": "AA.US/USD",
+    "start_tick": "2018-01-30"
+  },
+  "abbnchchf": {
+    "decimal_factor": 1000,
+    "name": "ABBN.CH/CHF",
+    "start_tick": "2015-06-16"
+  },
+  "abbsesek": {
+    "decimal_factor": 1000,
+    "name": "ABB.SE/SEK",
+    "start_tick": "2016-11-14"
+  },
+  "abcususd": {
+    "decimal_factor": 1000,
+    "name": "ABC.US/USD",
+    "start_tick": "2018-01-30"
+  },
+  "abevususd": {
+    "decimal_factor": 1000,
+    "name": "ABEV.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "abfgbgbx": {
+    "decimal_factor": 1000,
+    "name": "ABF.GB/GBX",
+    "start_tick": "2016-09-06"
+  },
+  "abibeeur": {
+    "decimal_factor": 1000,
+    "name": "ABI.BE/EUR",
+    "start_tick": "2016-11-21"
+  },
+  "abmdususd": {
+    "decimal_factor": 1000,
+    "name": "ABMD.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "abtususd": {
+    "decimal_factor": 1000,
+    "name": "ABT.US/USD",
+    "start_tick": "2017-05-11"
+  },
+  "acafreur": {
+    "decimal_factor": 1000,
+    "name": "ACA.FR/EUR",
+    "start_tick": "2016-09-30"
+  },
+  "acfreur": {
+    "decimal_factor": 1000,
+    "name": "AC.FR/EUR",
+    "start_tick": "2016-08-11"
+  },
+  "acglususd": {
+    "decimal_factor": 1000,
+    "name": "ACGL.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "acmususd": {
+    "decimal_factor": 1000,
+    "name": "ACM.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "acnususd": {
+    "decimal_factor": 1000,
+    "name": "ACN.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "acseseur": {
+    "decimal_factor": 1000,
+    "name": "ACS.ES/EUR",
+    "start_tick": "2016-11-14"
+  },
+  "acxeseur": {
+    "decimal_factor": 1000,
+    "name": "ACX.ES/EUR",
+    "start_tick": "2016-11-14"
+  },
+  "adausd": {
+    "decimal_factor": 1000,
+    "name": "ADA/USD",
+    "start_tick": "2000-01-01"
+  },
+  "adbeususd": {
+    "decimal_factor": 1000,
+    "name": "ADBE.US/USD",
+    "start_tick": "2017-05-11"
+  },
+  "adenchchf": {
+    "decimal_factor": 1000,
+    "name": "ADEN.CH/CHF",
+    "start_tick": "2015-06-16"
+  },
+  "adiususd": {
+    "decimal_factor": 1000,
+    "name": "ADI.US/USD",
+    "start_tick": "2018-01-30"
+  },
+  "admgbgbx": {
+    "decimal_factor": 1000,
+    "name": "ADM.GB/GBX",
+    "start_tick": "2016-09-06"
+  },
+  "adpususd": {
+    "decimal_factor": 1000,
+    "name": "ADP.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "adsdeeur": {
+    "decimal_factor": 1000,
+    "name": "ADS.DE/EUR",
+    "start_tick": "2015-03-13"
+  },
+  "adskususd": {
+    "decimal_factor": 1000,
+    "name": "ADSK.US/USD",
+    "start_tick": "2018-01-30"
+  },
+  "aedcnh": {
+    "decimal_factor": 100000,
+    "name": "AED/CNH",
+    "start_tick": "2024-09-17"
+  },
+  "aedczk": {
+    "decimal_factor": 10000,
+    "name": "AED/CZK",
+    "start_tick": "2024-09-16"
+  },
+  "aedhkd": {
+    "decimal_factor": 100000,
+    "name": "AED/HKD",
+    "start_tick": "2024-09-17"
+  },
+  "aedhuf": {
+    "decimal_factor": 100000,
+    "name": "AED/HUF",
+    "start_tick": "2024-09-16"
+  },
+  "aedjpy": {
+    "decimal_factor": 1000,
+    "name": "AED/JPY",
+    "start_tick": "2024-09-16"
+  },
+  "aedmxn": {
+    "decimal_factor": 100000,
+    "name": "AED/MXN",
+    "start_tick": "2024-09-16"
+  },
+  "aedron": {
+    "decimal_factor": 100000,
+    "name": "AED/RON",
+    "start_tick": "2024-09-16"
+  },
+  "aedsar": {
+    "decimal_factor": 100000,
+    "name": "AED/SAR",
+    "start_tick": "2024-09-16"
+  },
+  "aedthb": {
+    "decimal_factor": 1000,
+    "name": "AED/THB",
+    "start_tick": "2024-09-16"
+  },
+  "aedtry": {
+    "decimal_factor": 100000,
+    "name": "AED/TRY",
+    "start_tick": "2024-09-16"
+  },
+  "aedzar": {
+    "decimal_factor": 100000,
+    "name": "AED/ZAR",
+    "start_tick": "2024-09-16"
+  },
+  "aenaeseur": {
+    "decimal_factor": 1000,
+    "name": "AENA.ES/EUR",
+    "start_tick": "2016-11-14"
+  },
+  "aepususd": {
+    "decimal_factor": 1000,
+    "name": "AEP.US/USD",
+    "start_tick": "2016-09-26"
+  },
+  "affreur": {
+    "decimal_factor": 1000,
+    "name": "AF.FR/EUR",
+    "start_tick": "2016-09-27"
+  },
+  "afgususd": {
+    "decimal_factor": 1000,
+    "name": "AFG.US/USD",
+    "start_tick": "2022-08-22"
+  },
+  "agesgbgbx": {
+    "decimal_factor": 1000,
+    "name": "AGES.GB/GBX",
+    "start_tick": "2025-02-26"
+  },
+  "agkgbgbx": {
+    "decimal_factor": 1000,
+    "name": "AGK.GB/GBX",
+    "start_tick": "2016-09-06"
+  },
+  "agliteur": {
+    "decimal_factor": 1000,
+    "name": "AGL.IT/EUR",
+    "start_tick": "2020-06-01"
+  },
+  "agncususd": {
+    "decimal_factor": 1000,
+    "name": "AGNC.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "agnnleur": {
+    "decimal_factor": 1000,
+    "name": "AGN.NL/EUR",
+    "start_tick": "2016-11-14"
+  },
+  "agsbeeur": {
+    "decimal_factor": 1000,
+    "name": "AGS.BE/EUR",
+    "start_tick": "2016-11-21"
+  },
+  "ahnleur": {
+    "decimal_factor": 1000,
+    "name": "AH.NL/EUR",
+    "start_tick": "2016-11-14"
+  },
+  "ahtgbgbx": {
+    "decimal_factor": 1000,
+    "name": "AHT.GB/GBX",
+    "start_tick": "2016-09-06"
+  },
+  "aiaigbusd": {
+    "decimal_factor": 1000,
+    "name": "AIAI.GB/USD",
+    "start_tick": "2025-02-26"
+  },
+  "aifreur": {
+    "decimal_factor": 1000,
+    "name": "AI.FR/EUR",
+    "start_tick": "2016-09-30"
+  },
+  "aigususd": {
+    "decimal_factor": 1000,
+    "name": "AIG.US/USD",
+    "start_tick": "2017-05-11"
+  },
+  "airfreur": {
+    "decimal_factor": 1000,
+    "name": "AIR.FR/EUR",
+    "start_tick": "2016-09-30"
+  },
+  "ajgususd": {
+    "decimal_factor": 1000,
+    "name": "AJG.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "akzanleur": {
+    "decimal_factor": 1000,
+    "name": "AKZA.NL/EUR",
+    "start_tick": "2016-11-14"
+  },
+  "albususd": {
+    "decimal_factor": 1000,
+    "name": "ALB.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "alfaamxmxn": {
+    "decimal_factor": 1000,
+    "name": "ALFAA.MX/MXN",
+    "start_tick": "2022-10-13"
+  },
+  "alfasesek": {
+    "decimal_factor": 1000,
+    "name": "ALFA.SE/SEK",
+    "start_tick": "2016-11-07"
+  },
+  "algnususd": {
+    "decimal_factor": 1000,
+    "name": "ALGN.US/USD",
+    "start_tick": "2022-05-16"
+  },
+  "alksususd": {
+    "decimal_factor": 1000,
+    "name": "ALKS.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "alkususd": {
+    "decimal_factor": 1000,
+    "name": "ALK.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "alleususd": {
+    "decimal_factor": 1000,
+    "name": "ALLE.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "allususd": {
+    "decimal_factor": 1000,
+    "name": "ALL.US/USD",
+    "start_tick": "2018-01-31"
+  },
+  "allyususd": {
+    "decimal_factor": 1000,
+    "name": "ALLY.US/USD",
+    "start_tick": "2022-06-15"
+  },
+  "alnyususd": {
+    "decimal_factor": 1000,
+    "name": "ALNY.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "alofreur": {
+    "decimal_factor": 1000,
+    "name": "ALO.FR/EUR",
+    "start_tick": "2016-09-27"
+  },
+  "alseamxmxn": {
+    "decimal_factor": 1000,
+    "name": "ALSEA.MX/MXN",
+    "start_tick": "2022-10-13"
+  },
+  "alvdeeur": {
+    "decimal_factor": 1000,
+    "name": "ALV.DE/EUR",
+    "start_tick": "2015-04-09"
+  },
+  "alxnususd": {
+    "decimal_factor": 1000,
+    "name": "ALXN.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "amatususd": {
+    "decimal_factor": 1000,
+    "name": "AMAT.US/USD",
+    "start_tick": "2017-05-11"
+  },
+  "amcrususd": {
+    "decimal_factor": 1000,
+    "name": "AMCR.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "amdususd": {
+    "decimal_factor": 1000,
+    "name": "AMD.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "amgnususd": {
+    "decimal_factor": 1000,
+    "name": "AMGN.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "amhususd": {
+    "decimal_factor": 1000,
+    "name": "AMH.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "ampiteur": {
+    "decimal_factor": 1000,
+    "name": "AMP.IT/EUR",
+    "start_tick": "2020-06-01"
+  },
+  "ampususd": {
+    "decimal_factor": 1000,
+    "name": "AMP.US/USD",
+    "start_tick": "2018-01-31"
+  },
+  "amseseur": {
+    "decimal_factor": 1000,
+    "name": "AMS.ES/EUR",
+    "start_tick": "2016-11-14"
+  },
+  "amtususd": {
+    "decimal_factor": 1000,
+    "name": "AMT.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "amwlususd": {
+    "decimal_factor": 1000,
+    "name": "AMWL.US/USD",
+    "start_tick": "2020-10-01"
+  },
+  "amxlmxmxn": {
+    "decimal_factor": 1000,
+    "name": "AMXL.MX/MXN",
+    "start_tick": "2022-10-13"
+  },
+  "amznususd": {
+    "decimal_factor": 1000,
+    "name": "AMZN.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "anetususd": {
+    "decimal_factor": 1000,
+    "name": "ANET.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "anssususd": {
+    "decimal_factor": 1000,
+    "name": "ANSS.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "antmususd": {
+    "decimal_factor": 1000,
+    "name": "ANTM.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "antogbgbx": {
+    "decimal_factor": 1000,
+    "name": "ANTO.GB/GBX",
+    "start_tick": "2016-09-06"
+  },
+  "aonususd": {
+    "decimal_factor": 1000,
+    "name": "AON.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "aosususd": {
+    "decimal_factor": 1000,
+    "name": "AOS.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "apaususd": {
+    "decimal_factor": 1000,
+    "name": "APA.US/USD",
+    "start_tick": "2018-01-31"
+  },
+  "apdususd": {
+    "decimal_factor": 1000,
+    "name": "APD.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "appeseur": {
+    "decimal_factor": 1000,
+    "name": "APP.ES/EUR",
+    "start_tick": "2022-05-11"
+  },
+  "aptvususd": {
+    "decimal_factor": 1000,
+    "name": "APTV.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "arcamxmxn": {
+    "decimal_factor": 1000,
+    "name": "ARCA.MX/MXN",
+    "start_tick": "2022-10-13"
+  },
+  "areususd": {
+    "decimal_factor": 1000,
+    "name": "ARE.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "arkiususd": {
+    "decimal_factor": 1000,
+    "name": "ARKI.US/USD",
+    "start_tick": "2024-10-21"
+  },
+  "arkqususd": {
+    "decimal_factor": 1000,
+    "name": "ARKQ.US/USD",
+    "start_tick": "2024-11-29"
+  },
+  "arkxususd": {
+    "decimal_factor": 1000,
+    "name": "ARKX.US/USD",
+    "start_tick": "2024-11-29"
+  },
+  "armkususd": {
+    "decimal_factor": 1000,
+    "name": "ARMK.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "arususd": {
+    "decimal_factor": 1000,
+    "name": "AR.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "arwususd": {
+    "decimal_factor": 1000,
+    "name": "ARW.US/USD",
+    "start_tick": "2022-05-17"
+  },
+  "asmlnleur": {
+    "decimal_factor": 1000,
+    "name": "ASML.NL/EUR",
+    "start_tick": "2016-11-14"
+  },
+  "asurbmxmxn": {
+    "decimal_factor": 1000,
+    "name": "ASURB.MX/MXN",
+    "start_tick": "2022-10-13"
+  },
+  "atcoasesek": {
+    "decimal_factor": 1000,
+    "name": "ATCOA.SE/SEK",
+    "start_tick": "2016-11-14"
+  },
+  "atliteur": {
+    "decimal_factor": 1000,
+    "name": "ATL.IT/EUR",
+    "start_tick": "2020-06-01"
+  },
+  "atofreur": {
+    "decimal_factor": 1000,
+    "name": "ATO.FR/EUR",
+    "start_tick": "2022-06-14"
+  },
+  "atoususd": {
+    "decimal_factor": 1000,
+    "name": "ATO.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "atviususd": {
+    "decimal_factor": 1000,
+    "name": "ATVI.US/USD",
+    "start_tick": "2017-05-11"
+  },
+  "audaed": {
+    "decimal_factor": 100000,
+    "name": "AUD/AED",
+    "start_tick": "2024-09-16"
+  },
+  "audcad": {
+    "decimal_factor": 100000,
+    "name": "AUD/CAD",
+    "start_tick": "2006-01-03"
+  },
+  "audchf": {
+    "decimal_factor": 100000,
+    "name": "AUD/CHF",
+    "start_tick": "2006-03-01"
+  },
+  "audcnh": {
+    "decimal_factor": 999999.9999999999,
+    "name": "AUD/CNH",
+    "start_tick": "2023-04-17"
+  },
+  "audczk": {
+    "decimal_factor": 10000,
+    "name": "AUD/CZK",
+    "start_tick": "2023-12-19"
+  },
+  "auddkk": {
+    "decimal_factor": 100000,
+    "name": "AUD/DKK",
+    "start_tick": "2023-12-19"
+  },
+  "audhkd": {
+    "decimal_factor": 100000,
+    "name": "AUD/HKD",
+    "start_tick": "2023-12-19"
+  },
+  "audhuf": {
+    "decimal_factor": 1000,
+    "name": "AUD/HUF",
+    "start_tick": "2024-04-23"
+  },
+  "audils": {
+    "decimal_factor": 100000,
+    "name": "AUD/ILS",
+    "start_tick": "2024-09-16"
+  },
+  "audjpy": {
+    "decimal_factor": 1000,
+    "name": "AUD/JPY",
+    "start_tick": "2003-11-30"
+  },
+  "audmxn": {
+    "decimal_factor": 100000,
+    "name": "AUD/MXN",
+    "start_tick": "2023-12-19"
+  },
+  "audnok": {
+    "decimal_factor": 100000,
+    "name": "AUD/NOK",
+    "start_tick": "2023-12-19"
+  },
+  "audnzd": {
+    "decimal_factor": 100000,
+    "name": "AUD/NZD",
+    "start_tick": "2006-12-12"
+  },
+  "audpln": {
+    "decimal_factor": 100000,
+    "name": "AUD/PLN",
+    "start_tick": "2012-03-30"
+  },
+  "audron": {
+    "decimal_factor": 100000,
+    "name": "AUD/RON",
+    "start_tick": "2024-09-16"
+  },
+  "audsar": {
+    "decimal_factor": 100000,
+    "name": "AUD/SAR",
+    "start_tick": "2024-09-16"
+  },
+  "audsek": {
+    "decimal_factor": 100000,
+    "name": "AUD/SEK",
+    "start_tick": "2023-12-19"
+  },
+  "audsgd": {
+    "decimal_factor": 100000,
+    "name": "AUD/SGD",
+    "start_tick": "2007-03-14"
+  },
+  "audthb": {
+    "decimal_factor": 1000,
+    "name": "AUD/THB",
+    "start_tick": "2024-09-16"
+  },
+  "audtry": {
+    "decimal_factor": 100000,
+    "name": "AUD/TRY",
+    "start_tick": "2023-12-19"
+  },
+  "audusd": {
+    "decimal_factor": 100000,
+    "name": "AUD/USD",
+    "start_tick": "2003-08-03"
+  },
+  "audzar": {
+    "decimal_factor": 100000,
+    "name": "AUD/ZAR",
+    "start_tick": "2024-04-24"
+  },
+  "ausidxaud": {
+    "decimal_factor": 1000,
+    "name": "AUS.IDX/AUD",
+    "start_tick": "2014-06-01"
+  },
+  "aususd": {
+    "decimal_factor": 1000,
+    "name": "A.US/USD",
+    "start_tick": "2017-05-25"
+  },
+  "avbususd": {
+    "decimal_factor": 1000,
+    "name": "AVB.US/USD",
+    "start_tick": "2018-01-31"
+  },
+  "aveusd": {
+    "decimal_factor": 100,
+    "name": "AVE/USD",
+    "start_tick": "2000-01-01"
+  },
+  "avgbgbx": {
+    "decimal_factor": 1000,
+    "name": "AV.GB/GBX",
+    "start_tick": "2016-09-06"
+  },
+  "avgoususd": {
+    "decimal_factor": 1000,
+    "name": "AVGO.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "avlrususd": {
+    "decimal_factor": 1000,
+    "name": "AVLR.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "avtrususd": {
+    "decimal_factor": 1000,
+    "name": "AVTR.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "avvgbgbx": {
+    "decimal_factor": 1000,
+    "name": "AVV.GB/GBX",
+    "start_tick": "2022-05-11"
+  },
+  "awayususd": {
+    "decimal_factor": 1000,
+    "name": "AWAY.US/USD",
+    "start_tick": "2024-11-29"
+  },
+  "awkususd": {
+    "decimal_factor": 1000,
+    "name": "AWK.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "axpususd": {
+    "decimal_factor": 1000,
+    "name": "AXP.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "axtaususd": {
+    "decimal_factor": 1000,
+    "name": "AXTA.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "ayxususd": {
+    "decimal_factor": 1000,
+    "name": "AYX.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "azmiteur": {
+    "decimal_factor": 1000,
+    "name": "AZM.IT/EUR",
+    "start_tick": "2020-06-01"
+  },
+  "azngbgbx": {
+    "decimal_factor": 1000,
+    "name": "AZN.GB/GBX",
+    "start_tick": "2016-09-06"
+  },
+  "aznususd": {
+    "decimal_factor": 1000,
+    "name": "AZN.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "azoususd": {
+    "decimal_factor": 1000,
+    "name": "AZO.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "azpnususd": {
+    "decimal_factor": 1000,
+    "name": "AZPN.US/USD",
+    "start_tick": "2022-05-18"
+  },
+  "babaususd": {
+    "decimal_factor": 1000,
+    "name": "BABA.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "babgbgbx": {
+    "decimal_factor": 1000,
+    "name": "BAB.GB/GBX",
+    "start_tick": "2016-09-06"
+  },
+  "bacususd": {
+    "decimal_factor": 1000,
+    "name": "BAC.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "baerchchf": {
+    "decimal_factor": 1000,
+    "name": "BAER.CH/CHF",
+    "start_tick": "2015-06-16"
+  },
+  "bagbgbx": {
+    "decimal_factor": 1000,
+    "name": "BA.GB/GBX",
+    "start_tick": "2016-09-06"
+  },
+  "bahususd": {
+    "decimal_factor": 1000,
+    "name": "BAH.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "bamiiteur": {
+    "decimal_factor": 1000,
+    "name": "BAMI.IT/EUR",
+    "start_tick": "2020-08-10"
+  },
+  "barcgbgbx": {
+    "decimal_factor": 1000,
+    "name": "BARC.GB/GBX",
+    "start_tick": "2016-09-06"
+  },
+  "basdeeur": {
+    "decimal_factor": 1000,
+    "name": "BAS.DE/EUR",
+    "start_tick": "2015-04-22"
+  },
+  "batsgbgbx": {
+    "decimal_factor": 1000,
+    "name": "BATS.GB/GBX",
+    "start_tick": "2016-09-06"
+  },
+  "batusd": {
+    "decimal_factor": 100000,
+    "name": "BAT/USD",
+    "start_tick": "2019-08-05"
+  },
+  "baususd": {
+    "decimal_factor": 1000,
+    "name": "BA.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "bayndeeur": {
+    "decimal_factor": 1000,
+    "name": "BAYN.DE/EUR",
+    "start_tick": "2015-03-20"
+  },
+  "bbajioomxmxn": {
+    "decimal_factor": 1000,
+    "name": "BBAJIOO.MX/MXN",
+    "start_tick": "2022-10-13"
+  },
+  "bbdususd": {
+    "decimal_factor": 1000,
+    "name": "BBD.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "bbvaeseur": {
+    "decimal_factor": 1000,
+    "name": "BBVA.ES/EUR",
+    "start_tick": "2016-11-14"
+  },
+  "bbwiususd": {
+    "decimal_factor": 1000,
+    "name": "BBWI.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "bbyususd": {
+    "decimal_factor": 1000,
+    "name": "BBY.US/USD",
+    "start_tick": "2017-05-11"
+  },
+  "bchchf": {
+    "decimal_factor": 10,
+    "name": "BCH/CHF",
+    "start_tick": "2023-03-14"
+  },
+  "bcheur": {
+    "decimal_factor": 10,
+    "name": "BCH/EUR",
+    "start_tick": "2023-03-14"
+  },
+  "bchgbp": {
+    "decimal_factor": 10,
+    "name": "BCH/GBP",
+    "start_tick": "2023-03-14"
+  },
+  "bchusd": {
+    "decimal_factor": 10,
+    "name": "BCH/USD",
+    "start_tick": "2021-05-17"
+  },
+  "bciteur": {
+    "decimal_factor": 1000,
+    "name": "BC.IT/EUR",
+    "start_tick": "2020-11-02"
+  },
+  "bdevgbgbx": {
+    "decimal_factor": 1000,
+    "name": "BDEV.GB/GBX",
+    "start_tick": "2022-05-11"
+  },
+  "bdxususd": {
+    "decimal_factor": 1000,
+    "name": "BDX.US/USD",
+    "start_tick": "2018-01-31"
+  },
+  "beideeur": {
+    "decimal_factor": 1000,
+    "name": "BEI.DE/EUR",
+    "start_tick": "2015-04-08"
+  },
+  "belgbeeur": {
+    "decimal_factor": 1000,
+    "name": "BELG.BE/EUR",
+    "start_tick": "2016-11-07"
+  },
+  "beryususd": {
+    "decimal_factor": 1000,
+    "name": "BERY.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "bgususd": {
+    "decimal_factor": 1000,
+    "name": "BG.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "biduususd": {
+    "decimal_factor": 1000,
+    "name": "BIDU.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "biibususd": {
+    "decimal_factor": 1000,
+    "name": "BIIB.US/USD",
+    "start_tick": "2017-05-11"
+  },
+  "bioususd": {
+    "decimal_factor": 1000,
+    "name": "BIO.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "birgieeur": {
+    "decimal_factor": 1000,
+    "name": "BIRG.IE/EUR",
+    "start_tick": "2020-06-01"
+  },
+  "bitoususd": {
+    "decimal_factor": 1000,
+    "name": "BITO.US/USD",
+    "start_tick": "2024-11-29"
+  },
+  "bkiususd": {
+    "decimal_factor": 1000,
+    "name": "BKI.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "bkrususd": {
+    "decimal_factor": 1000,
+    "name": "BKR.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "bkususd": {
+    "decimal_factor": 1000,
+    "name": "BK.US/USD",
+    "start_tick": "2017-05-11"
+  },
+  "blkususd": {
+    "decimal_factor": 1000,
+    "name": "BLK.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "blndgbgbx": {
+    "decimal_factor": 1000,
+    "name": "BLND.GB/GBX",
+    "start_tick": "2016-09-06"
+  },
+  "bltgbgbx": {
+    "decimal_factor": 1000,
+    "name": "BLT.GB/GBX",
+    "start_tick": "2016-09-06"
+  },
+  "bmpsiteur": {
+    "decimal_factor": 1000,
+    "name": "BMPS.IT/EUR",
+    "start_tick": "2020-12-17"
+  },
+  "bmrnususd": {
+    "decimal_factor": 1000,
+    "name": "BMRN.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "bmwdeeur": {
+    "decimal_factor": 1000,
+    "name": "BMW.DE/EUR",
+    "start_tick": "2015-03-24"
+  },
+  "bmyususd": {
+    "decimal_factor": 1000,
+    "name": "BMY.US/USD",
+    "start_tick": "2017-05-11"
+  },
+  "bnfreur": {
+    "decimal_factor": 1000,
+    "name": "BN.FR/EUR",
+    "start_tick": "2016-09-30"
+  },
+  "bnpfreur": {
+    "decimal_factor": 1000,
+    "name": "BNP.FR/EUR",
+    "start_tick": "2016-09-30"
+  },
+  "bnrdeeur": {
+    "decimal_factor": 1000,
+    "name": "BNR.DE/EUR",
+    "start_tick": "2022-05-12"
+  },
+  "bnzlgbgbx": {
+    "decimal_factor": 1000,
+    "name": "BNZL.GB/GBX",
+    "start_tick": "2016-09-06"
+  },
+  "bolsaamxmxn": {
+    "decimal_factor": 1000,
+    "name": "BOLSAA.MX/MXN",
+    "start_tick": "2022-10-13"
+  },
+  "bossdeeur": {
+    "decimal_factor": 1000,
+    "name": "BOSS.DE/EUR",
+    "start_tick": "2015-04-09"
+  },
+  "bpeiteur": {
+    "decimal_factor": 1000,
+    "name": "BPE.IT/EUR",
+    "start_tick": "2020-12-17"
+  },
+  "bpgbgbx": {
+    "decimal_factor": 1000,
+    "name": "BP.GB/GBX",
+    "start_tick": "2016-09-06"
+  },
+  "bpopususd": {
+    "decimal_factor": 1000,
+    "name": "BPOP.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "bpususd": {
+    "decimal_factor": 1000,
+    "name": "BP.US/USD",
+    "start_tick": "2018-01-31"
+  },
+  "brbygbgbx": {
+    "decimal_factor": 1000,
+    "name": "BRBY.GB/GBX",
+    "start_tick": "2016-07-08"
+  },
+  "breiteur": {
+    "decimal_factor": 1000,
+    "name": "BRE.IT/EUR",
+    "start_tick": "2020-12-17"
+  },
+  "brentcmdusd": {
+    "decimal_factor": 1000,
+    "name": "BRENT.CMD/USD",
+    "start_tick": "2010-12-02"
+  },
+  "brkbususd": {
+    "decimal_factor": 1000,
+    "name": "BRKB.US/USD",
+    "start_tick": "2017-11-06"
+  },
+  "brkrususd": {
+    "decimal_factor": 1000,
+    "name": "BRKR.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "broususd": {
+    "decimal_factor": 1000,
+    "name": "BRO.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "brususd": {
+    "decimal_factor": 1000,
+    "name": "BR.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "brxususd": {
+    "decimal_factor": 1000,
+    "name": "BRX.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "bsxususd": {
+    "decimal_factor": 1000,
+    "name": "BSX.US/USD",
+    "start_tick": "2017-05-11"
+  },
+  "btcchf": {
+    "decimal_factor": 10,
+    "name": "BTC/CHF",
+    "start_tick": "2023-03-14"
+  },
+  "btceur": {
+    "decimal_factor": 10,
+    "name": "BTC/EUR",
+    "start_tick": "2018-05-15"
+  },
+  "btcgbp": {
+    "decimal_factor": 10,
+    "name": "BTC/GBP",
+    "start_tick": "2023-03-14"
+  },
+  "btcusd": {
+    "decimal_factor": 10,
+    "name": "BTC/USD",
+    "start_tick": "2017-05-07"
+  },
+  "btfususd": {
+    "decimal_factor": 1000,
+    "name": "BTF.US/USD",
+    "start_tick": "2024-11-29"
+  },
+  "btgbgbx": {
+    "decimal_factor": 1000,
+    "name": "BT.GB/GBX",
+    "start_tick": "2016-07-07"
+  },
+  "bugggbgbx": {
+    "decimal_factor": 1000,
+    "name": "BUGG.GB/GBP",
+    "start_tick": "2024-10-21"
+  },
+  "bundtreur": {
+    "decimal_factor": 1000,
+    "name": "BUND.TR/EUR",
+    "start_tick": "2016-05-02"
+  },
+  "burlususd": {
+    "decimal_factor": 1000,
+    "name": "BURL.US/USD",
+    "start_tick": "2022-06-15"
+  },
+  "bwaususd": {
+    "decimal_factor": 1000,
+    "name": "BWA.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "byndususd": {
+    "decimal_factor": 1000,
+    "name": "BYND.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "bzuiteur": {
+    "decimal_factor": 1000,
+    "name": "BZU.IT/EUR",
+    "start_tick": "2020-12-17"
+  },
+  "cabkeseur": {
+    "decimal_factor": 1000,
+    "name": "CABK.ES/EUR",
+    "start_tick": "2016-11-14"
+  },
+  "caccususd": {
+    "decimal_factor": 1000,
+    "name": "CACC.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "caciususd": {
+    "decimal_factor": 1000,
+    "name": "CACI.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "cadaed": {
+    "decimal_factor": 100000,
+    "name": "CAD/AED",
+    "start_tick": "2024-09-16"
+  },
+  "cadchf": {
+    "decimal_factor": 100000,
+    "name": "CAD/CHF",
+    "start_tick": "2006-01-02"
+  },
+  "cadcnh": {
+    "decimal_factor": 100000,
+    "name": "CAD/CNH",
+    "start_tick": "2024-09-16"
+  },
+  "cadczk": {
+    "decimal_factor": 10000,
+    "name": "CAD/CZK",
+    "start_tick": "2024-05-15"
+  },
+  "caddkk": {
+    "decimal_factor": 100000,
+    "name": "CAD/DKK",
+    "start_tick": "2024-05-15"
+  },
+  "cadhkd": {
+    "decimal_factor": 100000,
+    "name": "CAD/HKD",
+    "start_tick": "2007-03-13"
+  },
+  "cadhuf": {
+    "decimal_factor": 1000,
+    "name": "CAD/HUF",
+    "start_tick": "2024-05-15"
+  },
+  "cadils": {
+    "decimal_factor": 100000,
+    "name": "CAD/ILS",
+    "start_tick": "2024-09-16"
+  },
+  "cadjpy": {
+    "decimal_factor": 1000,
+    "name": "CAD/JPY",
+    "start_tick": "2004-10-25"
+  },
+  "cadmxn": {
+    "decimal_factor": 100000,
+    "name": "CAD/MXN",
+    "start_tick": "2024-05-15"
+  },
+  "cadnok": {
+    "decimal_factor": 100000,
+    "name": "CAD/NOK",
+    "start_tick": "2024-05-15"
+  },
+  "cadpln": {
+    "decimal_factor": 100000,
+    "name": "CAD/PLN",
+    "start_tick": "2012-03-30"
+  },
+  "cadron": {
+    "decimal_factor": 100000,
+    "name": "CAD/RON",
+    "start_tick": "2024-09-16"
+  },
+  "cadsar": {
+    "decimal_factor": 100000,
+    "name": "CAD/SAR",
+    "start_tick": "2024-09-16"
+  },
+  "cadsek": {
+    "decimal_factor": 100000,
+    "name": "CAD/SEK",
+    "start_tick": "2024-05-15"
+  },
+  "cadsgd": {
+    "decimal_factor": 100000,
+    "name": "CAD/SGD",
+    "start_tick": "2024-05-15"
+  },
+  "cadthb": {
+    "decimal_factor": 1000,
+    "name": "CAD/THB",
+    "start_tick": "2024-09-16"
+  },
+  "cadtry": {
+    "decimal_factor": 100000,
+    "name": "CAD/TRY",
+    "start_tick": "2024-05-15"
+  },
+  "cadzar": {
+    "decimal_factor": 100000,
+    "name": "CAD/ZAR",
+    "start_tick": "2024-05-15"
+  },
+  "cafreur": {
+    "decimal_factor": 1000,
+    "name": "CA.FR/EUR",
+    "start_tick": "2016-09-30"
+  },
+  "cagususd": {
+    "decimal_factor": 1000,
+    "name": "CAG.US/USD",
+    "start_tick": "2018-01-31"
+  },
+  "cahususd": {
+    "decimal_factor": 1000,
+    "name": "CAH.US/USD",
+    "start_tick": "2018-01-31"
+  },
+  "capfreur": {
+    "decimal_factor": 1000,
+    "name": "CAP.FR/EUR",
+    "start_tick": "2016-09-30"
+  },
+  "carlbdkdkk": {
+    "decimal_factor": 1000,
+    "name": "CARLB.DK/DKK",
+    "start_tick": "2016-11-08"
+  },
+  "carrususd": {
+    "decimal_factor": 1000,
+    "name": "CARR.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "cassiteur": {
+    "decimal_factor": 1000,
+    "name": "CASS.IT/EUR",
+    "start_tick": "2020-12-17"
+  },
+  "casyususd": {
+    "decimal_factor": 1000,
+    "name": "CASY.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "catususd": {
+    "decimal_factor": 1000,
+    "name": "CAT.US/USD",
+    "start_tick": "2017-05-11"
+  },
+  "cbkdeeur": {
+    "decimal_factor": 1000,
+    "name": "CBK.DE/EUR",
+    "start_tick": "2015-03-26"
+  },
+  "cboeususd": {
+    "decimal_factor": 1000,
+    "name": "CBOE.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "cbususd": {
+    "decimal_factor": 1000,
+    "name": "CB.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "cciususd": {
+    "decimal_factor": 1000,
+    "name": "CCI.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "cckususd": {
+    "decimal_factor": 1000,
+    "name": "CCK.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "cclgbgbx": {
+    "decimal_factor": 1000,
+    "name": "CCL.GB/GBX",
+    "start_tick": "2016-07-06"
+  },
+  "cclususd": {
+    "decimal_factor": 1000,
+    "name": "CCL.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "cdayususd": {
+    "decimal_factor": 1000,
+    "name": "CDAY.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "cdevususd": {
+    "decimal_factor": 1000,
+    "name": "CDEV.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "cdkususd": {
+    "decimal_factor": 1000,
+    "name": "CDK.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "cdnsususd": {
+    "decimal_factor": 1000,
+    "name": "CDNS.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "cdwususd": {
+    "decimal_factor": 1000,
+    "name": "CDW.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "cemexcpomxmxn": {
+    "decimal_factor": 1000,
+    "name": "CEMEXCPO.MX/MXN",
+    "start_tick": "2022-10-13"
+  },
+  "cernususd": {
+    "decimal_factor": 1000,
+    "name": "CERN.US/USD",
+    "start_tick": "2018-05-18"
+  },
+  "cerviteur": {
+    "decimal_factor": 1000,
+    "name": "CERV.IT/EUR",
+    "start_tick": "2020-12-17"
+  },
+  "ceususd": {
+    "decimal_factor": 1000,
+    "name": "CE.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "cfgususd": {
+    "decimal_factor": 1000,
+    "name": "CFG.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "cfrchchf": {
+    "decimal_factor": 1000,
+    "name": "CFR.CH/CHF",
+    "start_tick": "2022-06-14"
+  },
+  "cfrususd": {
+    "decimal_factor": 1000,
+    "name": "CFR.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "cfususd": {
+    "decimal_factor": 1000,
+    "name": "CF.US/USD",
+    "start_tick": "2018-01-31"
+  },
+  "cgnxususd": {
+    "decimal_factor": 1000,
+    "name": "CGNX.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "chdususd": {
+    "decimal_factor": 1000,
+    "name": "CHD.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "cheidxchf": {
+    "decimal_factor": 1000,
+    "name": "CHE.IDX/CHF",
+    "start_tick": "2013-01-03"
+  },
+  "chfaed": {
+    "decimal_factor": 100000,
+    "name": "CHF/AED",
+    "start_tick": "2024-09-17"
+  },
+  "chfcnh": {
+    "decimal_factor": 100000,
+    "name": "CHF/CNH",
+    "start_tick": "2024-09-16"
+  },
+  "chfczk": {
+    "decimal_factor": 10000,
+    "name": "CHF/CZK",
+    "start_tick": "2024-05-15"
+  },
+  "chfdkk": {
+    "decimal_factor": 100000,
+    "name": "CHF/DKK",
+    "start_tick": "2024-05-15"
+  },
+  "chfhkd": {
+    "decimal_factor": 100000,
+    "name": "CHF/HKD",
+    "start_tick": "2024-05-15"
+  },
+  "chfhuf": {
+    "decimal_factor": 1000,
+    "name": "CHF/HUF",
+    "start_tick": "2024-05-15"
+  },
+  "chfils": {
+    "decimal_factor": 100000,
+    "name": "CHF/ILS",
+    "start_tick": "2024-09-16"
+  },
+  "chfjpy": {
+    "decimal_factor": 1000,
+    "name": "CHF/JPY",
+    "start_tick": "2003-08-03"
+  },
+  "chfmxn": {
+    "decimal_factor": 100000,
+    "name": "CHF/MXN",
+    "start_tick": "2024-05-15"
+  },
+  "chfnok": {
+    "decimal_factor": 100000,
+    "name": "CHF/NOK",
+    "start_tick": "2024-05-15"
+  },
+  "chfpln": {
+    "decimal_factor": 100000,
+    "name": "CHF/PLN",
+    "start_tick": "2007-03-14"
+  },
+  "chfron": {
+    "decimal_factor": 100000,
+    "name": "CHF/RON",
+    "start_tick": "2024-09-16"
+  },
+  "chfsar": {
+    "decimal_factor": 100000,
+    "name": "CHF/SAR",
+    "start_tick": "2024-09-16"
+  },
+  "chfsek": {
+    "decimal_factor": 100000,
+    "name": "CHF/SEK",
+    "start_tick": "2024-05-15"
+  },
+  "chfsgd": {
+    "decimal_factor": 100000,
+    "name": "CHF/SGD",
+    "start_tick": "2007-06-04"
+  },
+  "chfthb": {
+    "decimal_factor": 1000,
+    "name": "CHF/THB",
+    "start_tick": "2024-09-16"
+  },
+  "chftry": {
+    "decimal_factor": 100000,
+    "name": "CHF/TRY",
+    "start_tick": "2024-05-15"
+  },
+  "chfzar": {
+    "decimal_factor": 100000,
+    "name": "CHF/ZAR",
+    "start_tick": "2024-05-15"
+  },
+  "chiidxusd": {
+    "decimal_factor": 1000,
+    "name": "CHI.IDX/USD",
+    "start_tick": "2017-07-17"
+  },
+  "chngususd": {
+    "decimal_factor": 1000,
+    "name": "CHNG.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "ciususd": {
+    "decimal_factor": 1000,
+    "name": "CI.US/USD",
+    "start_tick": "2017-05-11"
+  },
+  "clnchchf": {
+    "decimal_factor": 1000,
+    "name": "CLN.CH/CHF",
+    "start_tick": "2015-06-16"
+  },
+  "clrususd": {
+    "decimal_factor": 1000,
+    "name": "CLR.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "clususd": {
+    "decimal_factor": 1000,
+    "name": "CL.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "cmcsaususd": {
+    "decimal_factor": 1000,
+    "name": "CMCSA.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "cmeususd": {
+    "decimal_factor": 1000,
+    "name": "CME.US/USD",
+    "start_tick": "2017-05-11"
+  },
+  "cmgususd": {
+    "decimal_factor": 1000,
+    "name": "CMG.US/USD",
+    "start_tick": "2017-05-11"
+  },
+  "cmiususd": {
+    "decimal_factor": 1000,
+    "name": "CMI.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "cmpusd": {
+    "decimal_factor": 100,
+    "name": "CMP/USD",
+    "start_tick": "2000-01-01"
+  },
+  "cnagbgbx": {
+    "decimal_factor": 1000,
+    "name": "CNA.GB/GBX",
+    "start_tick": "2016-07-07"
+  },
+  "cncususd": {
+    "decimal_factor": 1000,
+    "name": "CNC.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "cndxgbusd": {
+    "decimal_factor": 1000,
+    "name": "CNDX.GB/USD",
+    "start_tick": "2025-02-26"
+  },
+  "cnhczk": {
+    "decimal_factor": 10000,
+    "name": "CNH/CZK",
+    "start_tick": "2024-09-16"
+  },
+  "cnhhkd": {
+    "decimal_factor": 100000,
+    "name": "CNH/HKD",
+    "start_tick": "2024-09-16"
+  },
+  "cnhhuf": {
+    "decimal_factor": 1000,
+    "name": "CNH/HUF",
+    "start_tick": "2024-09-16"
+  },
+  "cnhjpy": {
+    "decimal_factor": 1000,
+    "name": "CNH/JPY",
+    "start_tick": "2024-05-15"
+  },
+  "cnhmxn": {
+    "decimal_factor": 100000,
+    "name": "CNH/MXN",
+    "start_tick": "2024-09-16"
+  },
+  "cnhthb": {
+    "decimal_factor": 1000,
+    "name": "CNH/THB",
+    "start_tick": "2024-09-16"
+  },
+  "cnhtry": {
+    "decimal_factor": 100000,
+    "name": "CNH/TRY",
+    "start_tick": "2024-09-16"
+  },
+  "cnhzar": {
+    "decimal_factor": 100000,
+    "name": "CNH/ZAR",
+    "start_tick": "2024-09-16"
+  },
+  "cocoacmdusd": {
+    "decimal_factor": 1000,
+    "name": "COCOA.CMD/USD",
+    "start_tick": "2017-10-20"
+  },
+  "coffeecmdusx": {
+    "decimal_factor": 1000,
+    "name": "COFFEE.CMD/USX",
+    "start_tick": "2017-12-04"
+  },
+  "cofususd": {
+    "decimal_factor": 1000,
+    "name": "COF.US/USD",
+    "start_tick": "2018-05-18"
+  },
+  "cohrususd": {
+    "decimal_factor": 1000,
+    "name": "COHR.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "coldususd": {
+    "decimal_factor": 1000,
+    "name": "COLD.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "colobdkdkk": {
+    "decimal_factor": 1000,
+    "name": "COLOB.DK/DKK",
+    "start_tick": "2016-11-08"
+  },
+  "condeeur": {
+    "decimal_factor": 1000,
+    "name": "CON.DE/EUR",
+    "start_tick": "2015-04-08"
+  },
+  "cooususd": {
+    "decimal_factor": 1000,
+    "name": "COO.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "coppercmdusd": {
+    "decimal_factor": 10000,
+    "name": "COPPER.CMD/USD",
+    "start_tick": "2012-03-02"
+  },
+  "copususd": {
+    "decimal_factor": 1000,
+    "name": "COP.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "costususd": {
+    "decimal_factor": 1000,
+    "name": "COST.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "cottoncmdusx": {
+    "decimal_factor": 1000,
+    "name": "COTTON.CMD/USX",
+    "start_tick": "2017-10-20"
+  },
+  "coupususd": {
+    "decimal_factor": 1000,
+    "name": "COUP.US/USD",
+    "start_tick": "2022-05-16"
+  },
+  "covdeeur": {
+    "decimal_factor": 1000,
+    "name": "COV.DE/EUR",
+    "start_tick": "2022-05-12"
+  },
+  "cpggbgbx": {
+    "decimal_factor": 1000,
+    "name": "CPG.GB/GBX",
+    "start_tick": "2016-07-08"
+  },
+  "cpigbgbx": {
+    "decimal_factor": 1000,
+    "name": "CPI.GB/GBX",
+    "start_tick": "2016-07-07"
+  },
+  "cpriteur": {
+    "decimal_factor": 1000,
+    "name": "CPR.IT/EUR",
+    "start_tick": "2020-12-17"
+  },
+  "cpriususd": {
+    "decimal_factor": 1000,
+    "name": "CPRI.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "cprtususd": {
+    "decimal_factor": 1000,
+    "name": "CPRT.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "cptususd": {
+    "decimal_factor": 1000,
+    "name": "CPT.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "crdagbgbx": {
+    "decimal_factor": 1000,
+    "name": "CRDA.GB/GBX",
+    "start_tick": "2016-11-01"
+  },
+  "crgieeur": {
+    "decimal_factor": 1000,
+    "name": "CRG.IE/EUR",
+    "start_tick": "2020-10-01"
+  },
+  "crhgbgbx": {
+    "decimal_factor": 1000,
+    "name": "CRH.GB/GBX",
+    "start_tick": "2017-01-05"
+  },
+  "crlususd": {
+    "decimal_factor": 1000,
+    "name": "CRL.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "crmususd": {
+    "decimal_factor": 1000,
+    "name": "CRM.US/USD",
+    "start_tick": "2017-05-11"
+  },
+  "cscoususd": {
+    "decimal_factor": 1000,
+    "name": "CSCO.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "csfreur": {
+    "decimal_factor": 1000,
+    "name": "CS.FR/EUR",
+    "start_tick": "2016-09-30"
+  },
+  "csgnchchf": {
+    "decimal_factor": 1000,
+    "name": "CSGN.CH/CHF",
+    "start_tick": "2015-06-16"
+  },
+  "csgpususd": {
+    "decimal_factor": 1000,
+    "name": "CSGP.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "csh2freur": {
+    "decimal_factor": 1000,
+    "name": "CSH2.FR/EUR",
+    "start_tick": "2024-12-23"
+  },
+  "csh2gbgbx": {
+    "decimal_factor": 10,
+    "name": "CSH2.GB/GBX",
+    "start_tick": "2024-01-02"
+  },
+  "cslususd": {
+    "decimal_factor": 1000,
+    "name": "CSL.US/USD",
+    "start_tick": "2022-06-15"
+  },
+  "csususd": {
+    "decimal_factor": 1000,
+    "name": "CS.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "csxususd": {
+    "decimal_factor": 1000,
+    "name": "CSX.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "ctltususd": {
+    "decimal_factor": 1000,
+    "name": "CTLT.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "ctlususd": {
+    "decimal_factor": 1000,
+    "name": "CTL.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "ctshususd": {
+    "decimal_factor": 1000,
+    "name": "CTSH.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "ctvaususd": {
+    "decimal_factor": 1000,
+    "name": "CTVA.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "ctxsususd": {
+    "decimal_factor": 1000,
+    "name": "CTXS.US/USD",
+    "start_tick": "2018-05-18"
+  },
+  "cubeususd": {
+    "decimal_factor": 1000,
+    "name": "CUBE.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "cususd": {
+    "decimal_factor": 1000,
+    "name": "C.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "cvaliteur": {
+    "decimal_factor": 1000,
+    "name": "CVAL.IT/EUR",
+    "start_tick": "2020-12-17"
+  },
+  "cvnaususd": {
+    "decimal_factor": 1000,
+    "name": "CVNA.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "cvsususd": {
+    "decimal_factor": 1000,
+    "name": "CVS.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "cvxususd": {
+    "decimal_factor": 1000,
+    "name": "CVX.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "cysegbgbx": {
+    "decimal_factor": 1000,
+    "name": "CYSE.GB/GBX",
+    "start_tick": "2024-10-22"
+  },
+  "czkhuf": {
+    "decimal_factor": 10000,
+    "name": "CZK/HUF",
+    "start_tick": "2024-05-15"
+  },
+  "czkjpy": {
+    "decimal_factor": 10000,
+    "name": "CZK/JPY",
+    "start_tick": "2024-05-15"
+  },
+  "czkthb": {
+    "decimal_factor": 999999.9999999999,
+    "name": "CZK/THB",
+    "start_tick": "2024-09-16"
+  },
+  "czktry": {
+    "decimal_factor": 999999.9999999999,
+    "name": "CZK/TRY",
+    "start_tick": "2024-05-15"
+  },
+  "czrususd": {
+    "decimal_factor": 1000,
+    "name": "CZR.US/USD",
+    "start_tick": "2022-05-16"
+  },
+  "daideeur": {
+    "decimal_factor": 1000,
+    "name": "DAI.DE/EUR",
+    "start_tick": "2015-03-27"
+  },
+  "dalususd": {
+    "decimal_factor": 1000,
+    "name": "DAL.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "daniteur": {
+    "decimal_factor": 1000,
+    "name": "DAN.IT/EUR",
+    "start_tick": "2020-12-17"
+  },
+  "danskedkdkk": {
+    "decimal_factor": 1000,
+    "name": "DANSKE.DK/DKK",
+    "start_tick": "2016-11-08"
+  },
+  "db1deeur": {
+    "decimal_factor": 1000,
+    "name": "DB1.DE/EUR",
+    "start_tick": "2015-04-14"
+  },
+  "dbkdeeur": {
+    "decimal_factor": 1000,
+    "name": "DBK.DE/EUR",
+    "start_tick": "2015-03-25"
+  },
+  "dbxususd": {
+    "decimal_factor": 1000,
+    "name": "DBX.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "dccgbgbx": {
+    "decimal_factor": 1000,
+    "name": "DCC.GB/GBX",
+    "start_tick": "2022-05-11"
+  },
+  "dellususd": {
+    "decimal_factor": 1000,
+    "name": "DELL.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "deuidxeur": {
+    "decimal_factor": 1000,
+    "name": "DEU.IDX/EUR",
+    "start_tick": "2013-01-01"
+  },
+  "deususd": {
+    "decimal_factor": 1000,
+    "name": "DE.US/USD",
+    "start_tick": "2017-05-11"
+  },
+  "dfnggbgbp": {
+    "decimal_factor": 1000,
+    "name": "DFNG.GB/GBP",
+    "start_tick": "2025-02-26"
+  },
+  "dfsususd": {
+    "decimal_factor": 1000,
+    "name": "DFS.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "dgegbgbx": {
+    "decimal_factor": 1000,
+    "name": "DGE.GB/GBX",
+    "start_tick": "2016-07-06"
+  },
+  "dgfreur": {
+    "decimal_factor": 1000,
+    "name": "DG.FR/EUR",
+    "start_tick": "2016-09-30"
+  },
+  "dgususd": {
+    "decimal_factor": 1000,
+    "name": "DG.US/USD",
+    "start_tick": "2017-05-11"
+  },
+  "dhiususd": {
+    "decimal_factor": 1000,
+    "name": "DHI.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "dhrdeeur": {
+    "decimal_factor": 1000,
+    "name": "DHR.DE/EUR",
+    "start_tick": "2022-05-12"
+  },
+  "dhrususd": {
+    "decimal_factor": 1000,
+    "name": "DHR.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "diaeseur": {
+    "decimal_factor": 1000,
+    "name": "DIA.ES/EUR",
+    "start_tick": "2016-11-14"
+  },
+  "diaiteur": {
+    "decimal_factor": 1000,
+    "name": "DIA.IT/EUR",
+    "start_tick": "2020-12-17"
+  },
+  "diaususd": {
+    "decimal_factor": 1000,
+    "name": "DIA.US/USD",
+    "start_tick": "2017-05-11"
+  },
+  "dieselcmdusd": {
+    "decimal_factor": 1000,
+    "name": "DIESEL.CMD/USD",
+    "start_tick": "2017-12-26"
+  },
+  "disususd": {
+    "decimal_factor": 1000,
+    "name": "DIS.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "dkkaed": {
+    "decimal_factor": 100000,
+    "name": "DKK/AED",
+    "start_tick": "2024-09-16"
+  },
+  "dkkcnh": {
+    "decimal_factor": 100000,
+    "name": "DKK/CNH",
+    "start_tick": "2024-09-16"
+  },
+  "dkkczk": {
+    "decimal_factor": 10000,
+    "name": "DKK/CZK",
+    "start_tick": "2024-05-15"
+  },
+  "dkkhkd": {
+    "decimal_factor": 100000,
+    "name": "DKK/HKD",
+    "start_tick": "2024-05-15"
+  },
+  "dkkhuf": {
+    "decimal_factor": 1000,
+    "name": "DKK/HUF",
+    "start_tick": "2024-05-15"
+  },
+  "dkkils": {
+    "decimal_factor": 100000,
+    "name": "DKK/ILS",
+    "start_tick": "2024-09-16"
+  },
+  "dkkjpy": {
+    "decimal_factor": 100000,
+    "name": "DKK/JPY",
+    "start_tick": "2024-05-15"
+  },
+  "dkkmxn": {
+    "decimal_factor": 100000,
+    "name": "DKK/MXN",
+    "start_tick": "2024-05-15"
+  },
+  "dkkron": {
+    "decimal_factor": 100000,
+    "name": "DKK/RON",
+    "start_tick": "2024-09-16"
+  },
+  "dkksar": {
+    "decimal_factor": 100000,
+    "name": "DKK/SAR",
+    "start_tick": "2024-09-16"
+  },
+  "dkkthb": {
+    "decimal_factor": 1000,
+    "name": "DKK/THB",
+    "start_tick": "2024-09-16"
+  },
+  "dkktry": {
+    "decimal_factor": 100000,
+    "name": "DKK/TRY",
+    "start_tick": "2024-05-15"
+  },
+  "dkkzar": {
+    "decimal_factor": 100000,
+    "name": "DKK/ZAR",
+    "start_tick": "2024-05-15"
+  },
+  "dksususd": {
+    "decimal_factor": 1000,
+    "name": "DKS.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "dlrususd": {
+    "decimal_factor": 1000,
+    "name": "DLR.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "dltrususd": {
+    "decimal_factor": 1000,
+    "name": "DLTR.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "dnbnonok": {
+    "decimal_factor": 1000,
+    "name": "DNB.NO/NOK",
+    "start_tick": "2016-11-14"
+  },
+  "docuususd": {
+    "decimal_factor": 1000,
+    "name": "DOCU.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "dollaridxusd": {
+    "decimal_factor": 1000,
+    "name": "DOLLAR.IDX/USD",
+    "start_tick": "2017-12-01"
+  },
+  "doxususd": {
+    "decimal_factor": 1000,
+    "name": "DOX.US/USD",
+    "start_tick": "2022-05-16"
+  },
+  "dphgbgbx": {
+    "decimal_factor": 1000,
+    "name": "DPH.GB/GBX",
+    "start_tick": "2022-05-11"
+  },
+  "dpwdeeur": {
+    "decimal_factor": 1000,
+    "name": "DPW.DE/EUR",
+    "start_tick": "2015-03-31"
+  },
+  "dpzususd": {
+    "decimal_factor": 1000,
+    "name": "DPZ.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "dreususd": {
+    "decimal_factor": 1000,
+    "name": "DRE.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "dsbfreur": {
+    "decimal_factor": 1000,
+    "name": "DSB.FR/EUR",
+    "start_tick": "2020-09-22"
+  },
+  "dshusd": {
+    "decimal_factor": 1000,
+    "name": "DSH/USD",
+    "start_tick": "2019-08-04"
+  },
+  "dsmnleur": {
+    "decimal_factor": 1000,
+    "name": "DSM.NL/EUR",
+    "start_tick": "2016-11-14"
+  },
+  "dsyfreur": {
+    "decimal_factor": 1000,
+    "name": "DSY.FR/EUR",
+    "start_tick": "2022-05-12"
+  },
+  "dtedeeur": {
+    "decimal_factor": 1000,
+    "name": "DTE.DE/EUR",
+    "start_tick": "2015-03-31"
+  },
+  "dtususd": {
+    "decimal_factor": 1000,
+    "name": "DT.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "dukeur": {
+    "decimal_factor": 100,
+    "name": "DUK+/EUR",
+    "start_tick": "2019-02-28"
+  },
+  "dukususd": {
+    "decimal_factor": 1000,
+    "name": "DUK.US/USD",
+    "start_tick": "2017-05-11"
+  },
+  "dususd": {
+    "decimal_factor": 1000,
+    "name": "D.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "dvaususd": {
+    "decimal_factor": 1000,
+    "name": "DVA.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "dvnususd": {
+    "decimal_factor": 1000,
+    "name": "DVN.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "dvyususd": {
+    "decimal_factor": 1000,
+    "name": "DVY.US/USD",
+    "start_tick": "2017-05-11"
+  },
+  "dxcmususd": {
+    "decimal_factor": 1000,
+    "name": "DXCM.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "dxcususd": {
+    "decimal_factor": 1000,
+    "name": "DXC.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "eaususd": {
+    "decimal_factor": 1000,
+    "name": "EA.US/USD",
+    "start_tick": "2017-05-11"
+  },
+  "ebayususd": {
+    "decimal_factor": 1000,
+    "name": "EBAY.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "ebreseur": {
+    "decimal_factor": 1000,
+    "name": "EBR.ES/EUR",
+    "start_tick": "2022-05-11"
+  },
+  "ebsateur": {
+    "decimal_factor": 1000,
+    "name": "EBS.AT/EUR",
+    "start_tick": "2016-11-15"
+  },
+  "ecargbusd": {
+    "decimal_factor": 1000,
+    "name": "ECAR.GB/USD",
+    "start_tick": "2025-02-26"
+  },
+  "ecmgbgbx": {
+    "decimal_factor": 1000,
+    "name": "ECM.GB/GBX",
+    "start_tick": "2022-05-11"
+  },
+  "edffreur": {
+    "decimal_factor": 1000,
+    "name": "EDF.FR/EUR",
+    "start_tick": "2016-09-30"
+  },
+  "edppteur": {
+    "decimal_factor": 1000,
+    "name": "EDP.PT/EUR",
+    "start_tick": "2016-11-14"
+  },
+  "eeftususd": {
+    "decimal_factor": 1000,
+    "name": "EEFT.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "eemususd": {
+    "decimal_factor": 1000,
+    "name": "EEM.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "efaususd": {
+    "decimal_factor": 1000,
+    "name": "EFA.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "efxususd": {
+    "decimal_factor": 1000,
+    "name": "EFX.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "ehcususd": {
+    "decimal_factor": 1000,
+    "name": "EHC.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "eixususd": {
+    "decimal_factor": 1000,
+    "name": "EIX.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "elanususd": {
+    "decimal_factor": 1000,
+    "name": "ELAN.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "eleeseur": {
+    "decimal_factor": 1000,
+    "name": "ELE.ES/EUR",
+    "start_tick": "2016-11-14"
+  },
+  "elektramxmxn": {
+    "decimal_factor": 1000,
+    "name": "ELEKTRA.MX/MXN",
+    "start_tick": "2022-10-13"
+  },
+  "eli1vfieur": {
+    "decimal_factor": 1000,
+    "name": "ELI1V.FI/EUR",
+    "start_tick": "2016-11-03"
+  },
+  "elsususd": {
+    "decimal_factor": 1000,
+    "name": "ELS.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "elususd": {
+    "decimal_factor": 1000,
+    "name": "EL.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "eluxbsesek": {
+    "decimal_factor": 1000,
+    "name": "ELUXB.SE/SEK",
+    "start_tick": "2016-11-07"
+  },
+  "embususd": {
+    "decimal_factor": 1000,
+    "name": "EMB.US/USD",
+    "start_tick": "2017-05-11"
+  },
+  "emrususd": {
+    "decimal_factor": 1000,
+    "name": "EMR.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "eneliteur": {
+    "decimal_factor": 1000,
+    "name": "ENEL.IT/EUR",
+    "start_tick": "2020-12-17"
+  },
+  "enfreur": {
+    "decimal_factor": 1000,
+    "name": "EN.FR/EUR",
+    "start_tick": "2016-09-30"
+  },
+  "engeseur": {
+    "decimal_factor": 1000,
+    "name": "ENG.ES/EUR",
+    "start_tick": "2016-11-14"
+  },
+  "engifreur": {
+    "decimal_factor": 1000,
+    "name": "ENGI.FR/EUR",
+    "start_tick": "2016-09-30"
+  },
+  "eniiteur": {
+    "decimal_factor": 1000,
+    "name": "ENI.IT/EUR",
+    "start_tick": "2020-12-17"
+  },
+  "enjusd": {
+    "decimal_factor": 1000,
+    "name": "ENJ/USD",
+    "start_tick": "2000-01-01"
+  },
+  "enphususd": {
+    "decimal_factor": 1000,
+    "name": "ENPH.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "entgususd": {
+    "decimal_factor": 1000,
+    "name": "ENTG.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "eoandeeur": {
+    "decimal_factor": 1000,
+    "name": "EOAN.DE/EUR",
+    "start_tick": "2015-04-20"
+  },
+  "eogususd": {
+    "decimal_factor": 1000,
+    "name": "EOG.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "eosusd": {
+    "decimal_factor": 10000,
+    "name": "EOS/USD",
+    "start_tick": "2019-08-04"
+  },
+  "epamususd": {
+    "decimal_factor": 1000,
+    "name": "EPAM.US/USD",
+    "start_tick": "2022-05-16"
+  },
+  "eqhususd": {
+    "decimal_factor": 1000,
+    "name": "EQH.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "eqtususd": {
+    "decimal_factor": 1000,
+    "name": "EQT.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "ergiteur": {
+    "decimal_factor": 1000,
+    "name": "ERG.IT/EUR",
+    "start_tick": "2020-12-17"
+  },
+  "ericbsesek": {
+    "decimal_factor": 1000,
+    "name": "ERICB.SE/SEK",
+    "start_tick": "2016-11-14"
+  },
+  "esihgbgbx": {
+    "decimal_factor": 1000,
+    "name": "ESIH.GB/GBP",
+    "start_tick": "2024-10-24"
+  },
+  "espidxeur": {
+    "decimal_factor": 1000,
+    "name": "ESP.IDX/EUR",
+    "start_tick": "2014-06-02"
+  },
+  "espoususd": {
+    "decimal_factor": 1000,
+    "name": "ESPO.US/USD",
+    "start_tick": "2024-11-29"
+  },
+  "essususd": {
+    "decimal_factor": 1000,
+    "name": "ESS.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "estcususd": {
+    "decimal_factor": 1000,
+    "name": "ESTC.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "esususd": {
+    "decimal_factor": 1000,
+    "name": "ES.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "ethchf": {
+    "decimal_factor": 10,
+    "name": "ETH/CHF",
+    "start_tick": "2023-03-14"
+  },
+  "etheur": {
+    "decimal_factor": 10,
+    "name": "ETH/EUR",
+    "start_tick": "2023-03-14"
+  },
+  "ethgbp": {
+    "decimal_factor": 10,
+    "name": "ETH/GBP",
+    "start_tick": "2023-03-14"
+  },
+  "ethusd": {
+    "decimal_factor": 10,
+    "name": "ETH/USD",
+    "start_tick": "2017-12-11"
+  },
+  "etnususd": {
+    "decimal_factor": 1000,
+    "name": "ETN.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "etsyususd": {
+    "decimal_factor": 1000,
+    "name": "ETSY.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "euraed": {
+    "decimal_factor": 100000,
+    "name": "EUR/AED",
+    "start_tick": "2024-09-16"
+  },
+  "euraud": {
+    "decimal_factor": 100000,
+    "name": "EUR/AUD",
+    "start_tick": "2005-10-07"
+  },
+  "eurcad": {
+    "decimal_factor": 100000,
+    "name": "EUR/CAD",
+    "start_tick": "2004-10-25"
+  },
+  "eurchf": {
+    "decimal_factor": 100000,
+    "name": "EUR/CHF",
+    "start_tick": "2003-08-03"
+  },
+  "eurcnh": {
+    "decimal_factor": 100000,
+    "name": "EUR/CNH",
+    "start_tick": "2024-05-15"
+  },
+  "eurczk": {
+    "decimal_factor": 10000,
+    "name": "EUR/CZK",
+    "start_tick": "2016-01-03"
+  },
+  "eurdkk": {
+    "decimal_factor": 100000,
+    "name": "EUR/DKK",
+    "start_tick": "2004-10-25"
+  },
+  "eurgbp": {
+    "decimal_factor": 100000,
+    "name": "EUR/GBP",
+    "start_tick": "2003-08-03"
+  },
+  "eurhkd": {
+    "decimal_factor": 100000,
+    "name": "EUR/HKD",
+    "start_tick": "2007-03-13"
+  },
+  "eurhuf": {
+    "decimal_factor": 1000,
+    "name": "EUR/HUF",
+    "start_tick": "2007-03-14"
+  },
+  "eurils": {
+    "decimal_factor": 100000,
+    "name": "EUR/ILS",
+    "start_tick": "2024-09-16"
+  },
+  "eurjpy": {
+    "decimal_factor": 1000,
+    "name": "EUR/JPY",
+    "start_tick": "2003-08-03"
+  },
+  "eurmxn": {
+    "decimal_factor": 100000,
+    "name": "EUR/MXN",
+    "start_tick": "2007-03-13"
+  },
+  "eurnok": {
+    "decimal_factor": 100000,
+    "name": "EUR/NOK",
+    "start_tick": "2004-10-25"
+  },
+  "eurnzd": {
+    "decimal_factor": 100000,
+    "name": "EUR/NZD",
+    "start_tick": "2006-01-02"
+  },
+  "eurpln": {
+    "decimal_factor": 100000,
+    "name": "EUR/PLN",
+    "start_tick": "2007-03-14"
+  },
+  "eurron": {
+    "decimal_factor": 100000,
+    "name": "EUR/RON",
+    "start_tick": "2024-09-16"
+  },
+  "eursar": {
+    "decimal_factor": 100000,
+    "name": "EUR/SAR",
+    "start_tick": "2024-09-16"
+  },
+  "eursek": {
+    "decimal_factor": 100000,
+    "name": "EUR/SEK",
+    "start_tick": "2004-10-27"
+  },
+  "eursgd": {
+    "decimal_factor": 100000,
+    "name": "EUR/SGD",
+    "start_tick": "2007-03-13"
+  },
+  "eurthb": {
+    "decimal_factor": 1000,
+    "name": "EUR/THB",
+    "start_tick": "2024-09-16"
+  },
+  "eurtry": {
+    "decimal_factor": 100000,
+    "name": "EUR/TRY",
+    "start_tick": "2007-03-13"
+  },
+  "eurusd": {
+    "decimal_factor": 100000,
+    "name": "EUR/USD",
+    "start_tick": "2003-05-04"
+  },
+  "eurzar": {
+    "decimal_factor": 100000,
+    "name": "EUR/ZAR",
+    "start_tick": "2007-03-13"
+  },
+  "eusidxeur": {
+    "decimal_factor": 1000,
+    "name": "EUS.IDX/EUR",
+    "start_tick": "2014-06-02"
+  },
+  "evrgususd": {
+    "decimal_factor": 1000,
+    "name": "EVRG.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "ewbcususd": {
+    "decimal_factor": 1000,
+    "name": "EWBC.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "ewhususd": {
+    "decimal_factor": 1000,
+    "name": "EWH.US/USD",
+    "start_tick": "2017-11-06"
+  },
+  "ewjususd": {
+    "decimal_factor": 1000,
+    "name": "EWJ.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "ewususd": {
+    "decimal_factor": 1000,
+    "name": "EW.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "ewwususd": {
+    "decimal_factor": 1000,
+    "name": "EWW.US/USD",
+    "start_tick": "2017-03-13"
+  },
+  "ewzususd": {
+    "decimal_factor": 1000,
+    "name": "EWZ.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "excususd": {
+    "decimal_factor": 1000,
+    "name": "EXC.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "exelususd": {
+    "decimal_factor": 1000,
+    "name": "EXEL.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "expeususd": {
+    "decimal_factor": 1000,
+    "name": "EXPE.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "expngbgbx": {
+    "decimal_factor": 1000,
+    "name": "EXPN.GB/GBX",
+    "start_tick": "2016-07-08"
+  },
+  "exrususd": {
+    "decimal_factor": 1000,
+    "name": "EXR.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "ezjgbgbx": {
+    "decimal_factor": 1000,
+    "name": "EZJ.GB/GBX",
+    "start_tick": "2016-07-08"
+  },
+  "ezuususd": {
+    "decimal_factor": 1000,
+    "name": "EZU.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "fangususd": {
+    "decimal_factor": 1000,
+    "name": "FANG.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "fbhsususd": {
+    "decimal_factor": 1000,
+    "name": "FBHS.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "fbkiteur": {
+    "decimal_factor": 1000,
+    "name": "FBK.IT/EUR",
+    "start_tick": "2020-12-17"
+  },
+  "fbususd": {
+    "decimal_factor": 1000,
+    "name": "FB.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "fcaiteur": {
+    "decimal_factor": 1000,
+    "name": "FCA.IT/EUR",
+    "start_tick": "2020-12-17"
+  },
+  "fcceseur": {
+    "decimal_factor": 1000,
+    "name": "FCC.ES/EUR",
+    "start_tick": "2016-11-14"
+  },
+  "fcncaususd": {
+    "decimal_factor": 1000,
+    "name": "FCNCA.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "fcxususd": {
+    "decimal_factor": 1000,
+    "name": "FCX.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "fdsususd": {
+    "decimal_factor": 1000,
+    "name": "FDS.US/USD",
+    "start_tick": "2022-06-03"
+  },
+  "fdxususd": {
+    "decimal_factor": 1000,
+    "name": "FDX.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "femsaubdmxmxn": {
+    "decimal_factor": 1000,
+    "name": "FEMSAUBD.MX/MXN",
+    "start_tick": "2022-10-13"
+  },
+  "fereseur": {
+    "decimal_factor": 1000,
+    "name": "FER.ES/EUR",
+    "start_tick": "2016-11-14"
+  },
+  "feususd": {
+    "decimal_factor": 1000,
+    "name": "FE.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "ficoususd": {
+    "decimal_factor": 1000,
+    "name": "FICO.US/USD",
+    "start_tick": "2022-05-18"
+  },
+  "finxususd": {
+    "decimal_factor": 1000,
+    "name": "FINX.US/USD",
+    "start_tick": "2024-11-29"
+  },
+  "fitbususd": {
+    "decimal_factor": 1000,
+    "name": "FITB.US/USD",
+    "start_tick": "2018-01-31"
+  },
+  "fiveususd": {
+    "decimal_factor": 1000,
+    "name": "FIVE.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "fltususd": {
+    "decimal_factor": 1000,
+    "name": "FLT.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "flususd": {
+    "decimal_factor": 1000,
+    "name": "FL.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "fmedeeur": {
+    "decimal_factor": 1000,
+    "name": "FME.DE/EUR",
+    "start_tick": "2015-04-01"
+  },
+  "fndususd": {
+    "decimal_factor": 1000,
+    "name": "FND.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "fnfususd": {
+    "decimal_factor": 1000,
+    "name": "FNF.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "foxaususd": {
+    "decimal_factor": 1000,
+    "name": "FOXA.US/USD",
+    "start_tick": "2018-01-31"
+  },
+  "fpfreur": {
+    "decimal_factor": 1000,
+    "name": "FP.FR/EUR",
+    "start_tick": "2016-09-30"
+  },
+  "fraidxeur": {
+    "decimal_factor": 1000,
+    "name": "FRA.IDX/EUR",
+    "start_tick": "2013-01-01"
+  },
+  "frcususd": {
+    "decimal_factor": 1000,
+    "name": "FRC.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "fredeeur": {
+    "decimal_factor": 1000,
+    "name": "FRE.DE/EUR",
+    "start_tick": "2015-04-10"
+  },
+  "fresgbgbx": {
+    "decimal_factor": 1000,
+    "name": "FRES.GB/GBX",
+    "start_tick": "2016-07-07"
+  },
+  "frfreur": {
+    "decimal_factor": 1000,
+    "name": "FR.FR/EUR",
+    "start_tick": "2016-09-30"
+  },
+  "ftiususd": {
+    "decimal_factor": 1000,
+    "name": "FTI.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "ftntususd": {
+    "decimal_factor": 1000,
+    "name": "FTNT.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "ftvususd": {
+    "decimal_factor": 1000,
+    "name": "FTV.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "ftxgususd": {
+    "decimal_factor": 1000,
+    "name": "FTXG.US/USD",
+    "start_tick": "2024-11-29"
+  },
+  "fususd": {
+    "decimal_factor": 1000,
+    "name": "F.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "fxiususd": {
+    "decimal_factor": 1000,
+    "name": "FXI.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "galppteur": {
+    "decimal_factor": 1000,
+    "name": "GALP.PT/EUR",
+    "start_tick": "2016-11-14"
+  },
+  "gameseur": {
+    "decimal_factor": 1000,
+    "name": "GAM.ES/EUR",
+    "start_tick": "2016-11-14"
+  },
+  "gapbmxmxn": {
+    "decimal_factor": 1000,
+    "name": "GAPB.MX/MXN",
+    "start_tick": "2022-10-13"
+  },
+  "gascmdusd": {
+    "decimal_factor": 10000,
+    "name": "GAS.CMD/USD",
+    "start_tick": "2012-09-02"
+  },
+  "gaseseur": {
+    "decimal_factor": 1000,
+    "name": "GAS.ES/EUR",
+    "start_tick": "2016-11-14"
+  },
+  "gbpaed": {
+    "decimal_factor": 100000,
+    "name": "GBP/AED",
+    "start_tick": "2024-09-16"
+  },
+  "gbpaud": {
+    "decimal_factor": 100000,
+    "name": "GBP/AUD",
+    "start_tick": "2006-03-22"
+  },
+  "gbpcad": {
+    "decimal_factor": 100000,
+    "name": "GBP/CAD",
+    "start_tick": "2006-01-02"
+  },
+  "gbpchf": {
+    "decimal_factor": 100000,
+    "name": "GBP/CHF",
+    "start_tick": "2003-08-04"
+  },
+  "gbpcnh": {
+    "decimal_factor": 100000,
+    "name": "GBP/CNH",
+    "start_tick": "2024-05-15"
+  },
+  "gbpczk": {
+    "decimal_factor": 10000,
+    "name": "GBP/CZK",
+    "start_tick": "2024-05-15"
+  },
+  "gbpdkk": {
+    "decimal_factor": 100000,
+    "name": "GBP/DKK",
+    "start_tick": "2024-05-15"
+  },
+  "gbphkd": {
+    "decimal_factor": 100000,
+    "name": "GBP/HKD",
+    "start_tick": "2024-05-15"
+  },
+  "gbphuf": {
+    "decimal_factor": 1000,
+    "name": "GBP/HUF",
+    "start_tick": "2024-05-15"
+  },
+  "gbpils": {
+    "decimal_factor": 100000,
+    "name": "GBP/ILS",
+    "start_tick": "2024-09-16"
+  },
+  "gbpjpy": {
+    "decimal_factor": 1000,
+    "name": "GBP/JPY",
+    "start_tick": "2003-08-03"
+  },
+  "gbpmxn": {
+    "decimal_factor": 100000,
+    "name": "GBP/MXN",
+    "start_tick": "2024-05-15"
+  },
+  "gbpnok": {
+    "decimal_factor": 100000,
+    "name": "GBP/NOK",
+    "start_tick": "2024-05-15"
+  },
+  "gbpnzd": {
+    "decimal_factor": 100000,
+    "name": "GBP/NZD",
+    "start_tick": "2006-01-02"
+  },
+  "gbppln": {
+    "decimal_factor": 100000,
+    "name": "GBP/PLN",
+    "start_tick": "2024-05-15"
+  },
+  "gbpron": {
+    "decimal_factor": 100000,
+    "name": "GBP/RON",
+    "start_tick": "2024-09-16"
+  },
+  "gbpsar": {
+    "decimal_factor": 100000,
+    "name": "GBP/SAR",
+    "start_tick": "2024-09-17"
+  },
+  "gbpsek": {
+    "decimal_factor": 100000,
+    "name": "GBP/SEK",
+    "start_tick": "2024-05-15"
+  },
+  "gbpsgd": {
+    "decimal_factor": 100000,
+    "name": "GBP/SGD",
+    "start_tick": "2024-05-15"
+  },
+  "gbpthb": {
+    "decimal_factor": 1000,
+    "name": "GBP/THB",
+    "start_tick": "2024-09-17"
+  },
+  "gbptry": {
+    "decimal_factor": 100000,
+    "name": "GBP/TRY",
+    "start_tick": "2024-05-15"
+  },
+  "gbpusd": {
+    "decimal_factor": 100000,
+    "name": "GBP/USD",
+    "start_tick": "2003-05-04"
+  },
+  "gbpzar": {
+    "decimal_factor": 100000,
+    "name": "GBP/ZAR",
+    "start_tick": "2024-05-15"
+  },
+  "gbridxgbp": {
+    "decimal_factor": 1000,
+    "name": "GBR.IDX/GBP",
+    "start_tick": "2013-01-01"
+  },
+  "gcarsoa1mxmxn": {
+    "decimal_factor": 1000,
+    "name": "GCARSOA1.MX/MXN",
+    "start_tick": "2022-10-13"
+  },
+  "gccmxmxn": {
+    "decimal_factor": 1000,
+    "name": "GCC.MX/MXN",
+    "start_tick": "2022-10-13"
+  },
+  "gddyususd": {
+    "decimal_factor": 1000,
+    "name": "GDDY.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "gdususd": {
+    "decimal_factor": 1000,
+    "name": "GD.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "gdxjususd": {
+    "decimal_factor": 1000,
+    "name": "GDXJ.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "gdxususd": {
+    "decimal_factor": 1000,
+    "name": "GDX.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "getibsesek": {
+    "decimal_factor": 1000,
+    "name": "GETIB.SE/SEK",
+    "start_tick": "2016-11-07"
+  },
+  "geususd": {
+    "decimal_factor": 1000,
+    "name": "GE.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "gfnorteomxmxn": {
+    "decimal_factor": 1000,
+    "name": "GFNORTEO.MX/MXN",
+    "start_tick": "2022-10-13"
+  },
+  "gfsgbgbx": {
+    "decimal_factor": 1000,
+    "name": "GFS.GB/GBX",
+    "start_tick": "2016-07-07"
+  },
+  "gggususd": {
+    "decimal_factor": 1000,
+    "name": "GGG.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "ghususd": {
+    "decimal_factor": 1000,
+    "name": "GH.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "gildususd": {
+    "decimal_factor": 1000,
+    "name": "GILD.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "gisususd": {
+    "decimal_factor": 1000,
+    "name": "GIS.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "giteur": {
+    "decimal_factor": 1000,
+    "name": "DLG.IT/EUR",
+    "start_tick": "2020-12-17"
+  },
+  "givnchchf": {
+    "decimal_factor": 1000,
+    "name": "GIVN.CH/CHF",
+    "start_tick": "2015-06-16"
+  },
+  "gldususd": {
+    "decimal_factor": 1000,
+    "name": "GLD.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "glefreur": {
+    "decimal_factor": 1000,
+    "name": "GLE.FR/EUR",
+    "start_tick": "2016-09-30"
+  },
+  "glengbgbx": {
+    "decimal_factor": 1000,
+    "name": "GLEN.GB/GBX",
+    "start_tick": "2016-07-07"
+  },
+  "glgggbgbx": {
+    "decimal_factor": 1000,
+    "name": "GLGG.GB/GBX",
+    "start_tick": "2025-02-26"
+  },
+  "glpiususd": {
+    "decimal_factor": 1000,
+    "name": "GLPI.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "glususd": {
+    "decimal_factor": 1000,
+    "name": "GL.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "glwususd": {
+    "decimal_factor": 1000,
+    "name": "GLW.US/USD",
+    "start_tick": "2017-05-11"
+  },
+  "gmexicobmxmxn": {
+    "decimal_factor": 1000,
+    "name": "GMEXICOB.MX/MXN",
+    "start_tick": "2022-10-13"
+  },
+  "gmususd": {
+    "decimal_factor": 1000,
+    "name": "GM.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "gnrcususd": {
+    "decimal_factor": 1000,
+    "name": "GNRC.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "googlususd": {
+    "decimal_factor": 1000,
+    "name": "GOOGL.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "googususd": {
+    "decimal_factor": 1000,
+    "name": "GOOG.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "gpnususd": {
+    "decimal_factor": 1000,
+    "name": "GPN.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "gpsususd": {
+    "decimal_factor": 1000,
+    "name": "GPS.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "grfeseur": {
+    "decimal_factor": 1000,
+    "name": "GRF.ES/EUR",
+    "start_tick": "2022-05-11"
+  },
+  "grumabmxmxn": {
+    "decimal_factor": 1000,
+    "name": "GRUMAB.MX/MXN",
+    "start_tick": "2022-10-13"
+  },
+  "gskgbgbx": {
+    "decimal_factor": 1000,
+    "name": "GSK.GB/GBX",
+    "start_tick": "2016-07-06"
+  },
+  "gsususd": {
+    "decimal_factor": 1000,
+    "name": "GS.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "gususd": {
+    "decimal_factor": 1000,
+    "name": "G.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "gwwususd": {
+    "decimal_factor": 1000,
+    "name": "GWW.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "halususd": {
+    "decimal_factor": 1000,
+    "name": "HAL.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "hbiususd": {
+    "decimal_factor": 1000,
+    "name": "HBI.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "hcaususd": {
+    "decimal_factor": 1000,
+    "name": "HCA.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "hcnususd": {
+    "decimal_factor": 1000,
+    "name": "HCN.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "hdususd": {
+    "decimal_factor": 1000,
+    "name": "HD.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "heianleur": {
+    "decimal_factor": 1000,
+    "name": "HEIA.NL/EUR",
+    "start_tick": "2016-11-14"
+  },
+  "heideeur": {
+    "decimal_factor": 1000,
+    "name": "HEI.DE/EUR",
+    "start_tick": "2015-04-02"
+  },
+  "heiususd": {
+    "decimal_factor": 1000,
+    "name": "HEI.US/USD",
+    "start_tick": "2022-05-16"
+  },
+  "hen3deeur": {
+    "decimal_factor": 1000,
+    "name": "HEN3.DE/EUR",
+    "start_tick": "2015-04-21"
+  },
+  "hesususd": {
+    "decimal_factor": 1000,
+    "name": "HES.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "hfgdeeur": {
+    "decimal_factor": 1000,
+    "name": "HFG.DE/EUR",
+    "start_tick": "2022-05-12"
+  },
+  "hiiususd": {
+    "decimal_factor": 1000,
+    "name": "HII.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "hikgbgbx": {
+    "decimal_factor": 1000,
+    "name": "HIK.GB/GBX",
+    "start_tick": "2022-05-12"
+  },
+  "hkdczk": {
+    "decimal_factor": 10000,
+    "name": "HKD/CZK",
+    "start_tick": "2024-05-15"
+  },
+  "hkdhuf": {
+    "decimal_factor": 1000,
+    "name": "HKD/HUF",
+    "start_tick": "2024-05-15"
+  },
+  "hkdjpy": {
+    "decimal_factor": 100000,
+    "name": "HKD/JPY",
+    "start_tick": "2007-03-13"
+  },
+  "hkdmxn": {
+    "decimal_factor": 100000,
+    "name": "HKD/MXN",
+    "start_tick": "2024-05-15"
+  },
+  "hkdthb": {
+    "decimal_factor": 1000,
+    "name": "HKD/THB",
+    "start_tick": "2024-09-17"
+  },
+  "hkdtry": {
+    "decimal_factor": 100000,
+    "name": "HKD/TRY",
+    "start_tick": "2024-05-15"
+  },
+  "hkdzar": {
+    "decimal_factor": 100000,
+    "name": "HKD/ZAR",
+    "start_tick": "2024-05-15"
+  },
+  "hkgidxhkd": {
+    "decimal_factor": 1000,
+    "name": "HKG.IDX/HKD",
+    "start_tick": "2013-06-03"
+  },
+  "hlmagbgbx": {
+    "decimal_factor": 1000,
+    "name": "HLMA.GB/GBX",
+    "start_tick": "2022-05-12"
+  },
+  "hltususd": {
+    "decimal_factor": 1000,
+    "name": "HLT.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "hmbsesek": {
+    "decimal_factor": 1000,
+    "name": "HMB.SE/SEK",
+    "start_tick": "2016-11-07"
+  },
+  "hmsogbgbx": {
+    "decimal_factor": 1000,
+    "name": "HMSO.GB/GBX",
+    "start_tick": "2016-07-07"
+  },
+  "hnrdeeur": {
+    "decimal_factor": 1000,
+    "name": "HNR.DE/EUR",
+    "start_tick": "2022-05-12"
+  },
+  "hofreur": {
+    "decimal_factor": 1000,
+    "name": "HO.FR/EUR",
+    "start_tick": "2022-05-12"
+  },
+  "hogususd": {
+    "decimal_factor": 1000,
+    "name": "HOG.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "honususd": {
+    "decimal_factor": 1000,
+    "name": "HON.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "hpeususd": {
+    "decimal_factor": 1000,
+    "name": "HPE.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "hpqususd": {
+    "decimal_factor": 1000,
+    "name": "HPQ.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "hsbagbgbx": {
+    "decimal_factor": 1000,
+    "name": "HSBA.GB/GBX",
+    "start_tick": "2016-07-07"
+  },
+  "htaususd": {
+    "decimal_factor": 1000,
+    "name": "HTA.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "hubbususd": {
+    "decimal_factor": 1000,
+    "name": "HUBB.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "hubsususd": {
+    "decimal_factor": 1000,
+    "name": "HUBS.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "humususd": {
+    "decimal_factor": 1000,
+    "name": "HUM.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "hususd": {
+    "decimal_factor": 1000,
+    "name": "H.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "hwmususd": {
+    "decimal_factor": 1000,
+    "name": "HWM.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "hznpususd": {
+    "decimal_factor": 1000,
+    "name": "HZNP.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "iaggbgbx": {
+    "decimal_factor": 1000,
+    "name": "IAG.GB/GBX",
+    "start_tick": "2016-11-08"
+  },
+  "iakususd": {
+    "decimal_factor": 1000,
+    "name": "IAK.US/USD",
+    "start_tick": "2024-11-29"
+  },
+  "ibbususd": {
+    "decimal_factor": 1000,
+    "name": "IBB.US/USD",
+    "start_tick": "2017-05-11"
+  },
+  "ibeeseur": {
+    "decimal_factor": 1000,
+    "name": "IBE.ES/EUR",
+    "start_tick": "2016-11-14"
+  },
+  "ibkrususd": {
+    "decimal_factor": 1000,
+    "name": "IBKR.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "ibmususd": {
+    "decimal_factor": 1000,
+    "name": "IBM.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "iceususd": {
+    "decimal_factor": 1000,
+    "name": "ICE.US/USD",
+    "start_tick": "2017-11-06"
+  },
+  "icpgbgbx": {
+    "decimal_factor": 1000,
+    "name": "ICP.GB/GBX",
+    "start_tick": "2022-05-12"
+  },
+  "idxxususd": {
+    "decimal_factor": 1000,
+    "name": "IDXX.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "iefususd": {
+    "decimal_factor": 1000,
+    "name": "IEF.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "iexususd": {
+    "decimal_factor": 1000,
+    "name": "IEX.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "ifxdeeur": {
+    "decimal_factor": 1000,
+    "name": "IFX.DE/EUR",
+    "start_tick": "2015-04-13"
+  },
+  "igiteur": {
+    "decimal_factor": 1000,
+    "name": "IG.IT/EUR",
+    "start_tick": "2020-12-17"
+  },
+  "iglnususd": {
+    "decimal_factor": 1000,
+    "name": "IGLN.US/USD",
+    "start_tick": "2024-10-21"
+  },
+  "ihggbgbx": {
+    "decimal_factor": 1000,
+    "name": "IHG.GB/GBX",
+    "start_tick": "2016-11-01"
+  },
+  "iiigbgbx": {
+    "decimal_factor": 1000,
+    "name": "III.GB/GBX",
+    "start_tick": "2016-09-05"
+  },
+  "ijhususd": {
+    "decimal_factor": 1000,
+    "name": "IJH.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "ijrususd": {
+    "decimal_factor": 1000,
+    "name": "IJR.US/USD",
+    "start_tick": "2017-05-11"
+  },
+  "ilmnususd": {
+    "decimal_factor": 1000,
+    "name": "ILMN.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "ilsaed": {
+    "decimal_factor": 100000,
+    "name": "ILS/AED",
+    "start_tick": "2024-09-17"
+  },
+  "ilscnh": {
+    "decimal_factor": 100000,
+    "name": "ILS/CNH",
+    "start_tick": "2024-09-17"
+  },
+  "ilsczk": {
+    "decimal_factor": 10000,
+    "name": "ILS/CZK",
+    "start_tick": "2024-09-17"
+  },
+  "ilshkd": {
+    "decimal_factor": 100000,
+    "name": "ILS/HKD",
+    "start_tick": "2024-09-17"
+  },
+  "ilshuf": {
+    "decimal_factor": 1000,
+    "name": "ILS/HUF",
+    "start_tick": "2024-09-17"
+  },
+  "ilsjpy": {
+    "decimal_factor": 1000,
+    "name": "ILS/JPY",
+    "start_tick": "2024-09-17"
+  },
+  "ilsmxn": {
+    "decimal_factor": 100000,
+    "name": "ILS/MXN",
+    "start_tick": "2024-09-17"
+  },
+  "ilsron": {
+    "decimal_factor": 100000,
+    "name": "ILS/RON",
+    "start_tick": "2024-09-17"
+  },
+  "ilssar": {
+    "decimal_factor": 100000,
+    "name": "ILS/SAR",
+    "start_tick": "2024-09-17"
+  },
+  "ilsthb": {
+    "decimal_factor": 1000,
+    "name": "ILS/THB",
+    "start_tick": "2024-09-17"
+  },
+  "ilstry": {
+    "decimal_factor": 100000,
+    "name": "ILS/TRY",
+    "start_tick": "2024-09-17"
+  },
+  "ilszar": {
+    "decimal_factor": 100000,
+    "name": "ILS/ZAR",
+    "start_tick": "2024-09-17"
+  },
+  "imtgbgbx": {
+    "decimal_factor": 1000,
+    "name": "IMT.GB/GBX",
+    "start_tick": "2016-07-06"
+  },
+  "incyususd": {
+    "decimal_factor": 1000,
+    "name": "INCY.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "indidxusd": {
+    "decimal_factor": 1000,
+    "name": "IND.IDX/USD",
+    "start_tick": "2017-12-01"
+  },
+  "inganleur": {
+    "decimal_factor": 1000,
+    "name": "INGA.NL/EUR",
+    "start_tick": "2016-11-14"
+  },
+  "intcususd": {
+    "decimal_factor": 1000,
+    "name": "INTC.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "intlgbgbx": {
+    "decimal_factor": 1000,
+    "name": "INTL.GB/GBX",
+    "start_tick": "2025-02-26"
+  },
+  "intuususd": {
+    "decimal_factor": 1000,
+    "name": "INTU.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "invebsesek": {
+    "decimal_factor": 1000,
+    "name": "INVEB.SE/SEK",
+    "start_tick": "2016-11-14"
+  },
+  "invhususd": {
+    "decimal_factor": 1000,
+    "name": "INVH.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "inwiteur": {
+    "decimal_factor": 1000,
+    "name": "INW.IT/EUR",
+    "start_tick": "2020-12-17"
+  },
+  "ionsususd": {
+    "decimal_factor": 1000,
+    "name": "IONS.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "ipgpususd": {
+    "decimal_factor": 1000,
+    "name": "IPGP.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "ipgususd": {
+    "decimal_factor": 1000,
+    "name": "IPG.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "iqvususd": {
+    "decimal_factor": 1000,
+    "name": "IQV.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "irususd": {
+    "decimal_factor": 1000,
+    "name": "IR.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "ispiteur": {
+    "decimal_factor": 1000,
+    "name": "ISP.IT/EUR",
+    "start_tick": "2020-12-17"
+  },
+  "ispygbgbx": {
+    "decimal_factor": 1000,
+    "name": "ISPY.GB/GBX",
+    "start_tick": "2025-02-26"
+  },
+  "isrgususd": {
+    "decimal_factor": 1000,
+    "name": "ISRG.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "itaidxeur": {
+    "decimal_factor": 1000,
+    "name": "ITA.IDX/EUR",
+    "start_tick": "2016-07-29"
+  },
+  "itaususd": {
+    "decimal_factor": 1000,
+    "name": "ITA.US/USD",
+    "start_tick": "2024-11-29"
+  },
+  "itrkgbgbx": {
+    "decimal_factor": 1000,
+    "name": "ITRK.GB/GBX",
+    "start_tick": "2016-07-06"
+  },
+  "itubususd": {
+    "decimal_factor": 1000,
+    "name": "ITUB.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "itususd": {
+    "decimal_factor": 1000,
+    "name": "IT.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "itvgbgbx": {
+    "decimal_factor": 1000,
+    "name": "ITV.GB/GBX",
+    "start_tick": "2016-07-07"
+  },
+  "itwususd": {
+    "decimal_factor": 1000,
+    "name": "ITW.US/USD",
+    "start_tick": "2017-05-11"
+  },
+  "itxeseur": {
+    "decimal_factor": 1000,
+    "name": "ITX.ES/EUR",
+    "start_tick": "2016-11-14"
+  },
+  "iufsususd": {
+    "decimal_factor": 1000,
+    "name": "IUFS.US/USD",
+    "start_tick": "2024-10-21"
+  },
+  "iveususd": {
+    "decimal_factor": 1000,
+    "name": "IVE.US/USD",
+    "start_tick": "2017-05-11"
+  },
+  "ivwususd": {
+    "decimal_factor": 1000,
+    "name": "IVW.US/USD",
+    "start_tick": "2017-05-11"
+  },
+  "ivzususd": {
+    "decimal_factor": 1000,
+    "name": "IVZ.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "iwdususd": {
+    "decimal_factor": 1000,
+    "name": "IWD.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "iwfususd": {
+    "decimal_factor": 1000,
+    "name": "IWF.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "iwmususd": {
+    "decimal_factor": 1000,
+    "name": "IWM.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "iyrususd": {
+    "decimal_factor": 1000,
+    "name": "IYR.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "jazzususd": {
+    "decimal_factor": 1000,
+    "name": "JAZZ.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "jbluususd": {
+    "decimal_factor": 1000,
+    "name": "JBLU.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "jciususd": {
+    "decimal_factor": 1000,
+    "name": "JCI.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "jefususd": {
+    "decimal_factor": 1000,
+    "name": "JEF.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "jetsususd": {
+    "decimal_factor": 1000,
+    "name": "JETS.US/USD",
+    "start_tick": "2024-11-29"
+  },
+  "jkhyususd": {
+    "decimal_factor": 1000,
+    "name": "JKHY.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "jllususd": {
+    "decimal_factor": 1000,
+    "name": "JLL.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "jnjususd": {
+    "decimal_factor": 1000,
+    "name": "JNJ.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "jnkususd": {
+    "decimal_factor": 1000,
+    "name": "JNK.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "jpmususd": {
+    "decimal_factor": 1000,
+    "name": "JPM.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "jpnidxjpy": {
+    "decimal_factor": 1000,
+    "name": "JPN.IDX/JPY",
+    "start_tick": "2013-01-01"
+  },
+  "jpyhuf": {
+    "decimal_factor": 100000,
+    "name": "JPY/HUF",
+    "start_tick": "2024-09-17"
+  },
+  "juveiteur": {
+    "decimal_factor": 1000,
+    "name": "JUVE.IT/EUR",
+    "start_tick": "2020-12-17"
+  },
+  "jwnususd": {
+    "decimal_factor": 1000,
+    "name": "JWN.US/USD",
+    "start_tick": "2017-05-11"
+  },
+  "kbcbeeur": {
+    "decimal_factor": 1000,
+    "name": "KBC.BE/EUR",
+    "start_tick": "2016-11-07"
+  },
+  "kerfreur": {
+    "decimal_factor": 1000,
+    "name": "KER.FR/EUR",
+    "start_tick": "2016-09-30"
+  },
+  "keysususd": {
+    "decimal_factor": 1000,
+    "name": "KEYS.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "keyususd": {
+    "decimal_factor": 1000,
+    "name": "KEY.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "kgfgbgbx": {
+    "decimal_factor": 1000,
+    "name": "KGF.GB/GBX",
+    "start_tick": "2016-07-07"
+  },
+  "khcususd": {
+    "decimal_factor": 1000,
+    "name": "KHC.US/USD",
+    "start_tick": "2017-05-11"
+  },
+  "kieususd": {
+    "decimal_factor": 1000,
+    "name": "KIE.US/USD",
+    "start_tick": "2024-11-29"
+  },
+  "kimberamxmxn": {
+    "decimal_factor": 1000,
+    "name": "KIMBERA.MX/MXN",
+    "start_tick": "2022-10-13"
+  },
+  "kmbususd": {
+    "decimal_factor": 1000,
+    "name": "KMB.US/USD",
+    "start_tick": "2017-05-11"
+  },
+  "kmiususd": {
+    "decimal_factor": 1000,
+    "name": "KMI.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "kmxususd": {
+    "decimal_factor": 1000,
+    "name": "KMX.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "kninchchf": {
+    "decimal_factor": 1000,
+    "name": "KNIN.CH/CHF",
+    "start_tick": "2015-06-17"
+  },
+  "knxususd": {
+    "decimal_factor": 1000,
+    "name": "KNX.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "kofublmxmxn": {
+    "decimal_factor": 1000,
+    "name": "KOFUBL.MX/MXN",
+    "start_tick": "2022-10-13"
+  },
+  "koususd": {
+    "decimal_factor": 1000,
+    "name": "KO.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "kpnnleur": {
+    "decimal_factor": 1000,
+    "name": "KPN.NL/EUR",
+    "start_tick": "2016-11-14"
+  },
+  "krcususd": {
+    "decimal_factor": 1000,
+    "name": "KRC.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "kreususd": {
+    "decimal_factor": 1000,
+    "name": "KRE.US/USD",
+    "start_tick": "2024-11-29"
+  },
+  "krususd": {
+    "decimal_factor": 1000,
+    "name": "KR.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "krxieeur": {
+    "decimal_factor": 1000,
+    "name": "KRX.IE/EUR",
+    "start_tick": "2020-06-01"
+  },
+  "krzieeur": {
+    "decimal_factor": 1000,
+    "name": "KRZ.IE/EUR",
+    "start_tick": "2020-06-01"
+  },
+  "kssususd": {
+    "decimal_factor": 1000,
+    "name": "KSS.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "kususd": {
+    "decimal_factor": 1000,
+    "name": "K.US/USD",
+    "start_tick": "2017-05-11"
+  },
+  "labbmxmxn": {
+    "decimal_factor": 1000,
+    "name": "LABB.MX/MXN",
+    "start_tick": "2022-10-13"
+  },
+  "lamrususd": {
+    "decimal_factor": 1000,
+    "name": "LAMR.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "landgbgbx": {
+    "decimal_factor": 1000,
+    "name": "LAND.GB/GBX",
+    "start_tick": "2016-07-07"
+  },
+  "ldoiteur": {
+    "decimal_factor": 1000,
+    "name": "LDO.IT/EUR",
+    "start_tick": "2020-12-17"
+  },
+  "ldosususd": {
+    "decimal_factor": 1000,
+    "name": "LDOS.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "leaususd": {
+    "decimal_factor": 1000,
+    "name": "LEA.US/USD",
+    "start_tick": "2022-06-15"
+  },
+  "lenususd": {
+    "decimal_factor": 1000,
+    "name": "LEN.US/USD",
+    "start_tick": "2017-05-11"
+  },
+  "lgengbgbx": {
+    "decimal_factor": 1000,
+    "name": "LGEN.GB/GBX",
+    "start_tick": "2016-07-07"
+  },
+  "lhadeeur": {
+    "decimal_factor": 1000,
+    "name": "LHA.DE/EUR",
+    "start_tick": "2015-04-21"
+  },
+  "lhnchchf": {
+    "decimal_factor": 1000,
+    "name": "LHN.CH/CHF",
+    "start_tick": "2015-06-17"
+  },
+  "lhxususd": {
+    "decimal_factor": 1000,
+    "name": "LHX.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "lifreur": {
+    "decimal_factor": 1000,
+    "name": "LI.FR/EUR",
+    "start_tick": "2016-08-05"
+  },
+  "lightcmdusd": {
+    "decimal_factor": 1000,
+    "name": "LIGHT.CMD/USD",
+    "start_tick": "2013-01-01"
+  },
+  "lindeeur": {
+    "decimal_factor": 1000,
+    "name": "LIN.DE/EUR",
+    "start_tick": "2015-04-21"
+  },
+  "lispchchf": {
+    "decimal_factor": 1000,
+    "name": "LISP.CH/CHF",
+    "start_tick": "2022-06-14"
+  },
+  "livepolc1mxmxn": {
+    "decimal_factor": 1000,
+    "name": "LIVEPOLC1.MX/MXN",
+    "start_tick": "2022-10-13"
+  },
+  "lkqususd": {
+    "decimal_factor": 1000,
+    "name": "LKQ.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "lloygbgbx": {
+    "decimal_factor": 1000,
+    "name": "LLOY.GB/GBX",
+    "start_tick": "2016-07-08"
+  },
+  "llyususd": {
+    "decimal_factor": 1000,
+    "name": "LLY.US/USD",
+    "start_tick": "2017-05-11"
+  },
+  "lmtususd": {
+    "decimal_factor": 1000,
+    "name": "LMT.US/USD",
+    "start_tick": "2017-05-11"
+  },
+  "lncususd": {
+    "decimal_factor": 1000,
+    "name": "LNC.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "lngususd": {
+    "decimal_factor": 1000,
+    "name": "LNG.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "lnkusd": {
+    "decimal_factor": 1000,
+    "name": "LNK/USD",
+    "start_tick": "2000-01-01"
+  },
+  "lntususd": {
+    "decimal_factor": 1000,
+    "name": "LNT.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "lognchchf": {
+    "decimal_factor": 1000,
+    "name": "LOGN.CH/CHF",
+    "start_tick": "2015-06-17"
+  },
+  "lonnchchf": {
+    "decimal_factor": 1000,
+    "name": "LONN.CH/CHF",
+    "start_tick": "2015-06-16"
+  },
+  "lowususd": {
+    "decimal_factor": 1000,
+    "name": "LOW.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "lplaususd": {
+    "decimal_factor": 1000,
+    "name": "LPLA.US/USD",
+    "start_tick": "2022-06-15"
+  },
+  "lrcxususd": {
+    "decimal_factor": 1000,
+    "name": "LRCX.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "lrfreur": {
+    "decimal_factor": 1000,
+    "name": "LR.FR/EUR",
+    "start_tick": "2016-08-05"
+  },
+  "lsegbgbx": {
+    "decimal_factor": 1000,
+    "name": "LSE.GB/GBX",
+    "start_tick": "2016-07-06"
+  },
+  "lsiususd": {
+    "decimal_factor": 1000,
+    "name": "LSI.US/USD",
+    "start_tick": "2022-05-12"
+  },
+  "lstrususd": {
+    "decimal_factor": 1000,
+    "name": "LSTR.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "ltcchf": {
+    "decimal_factor": 10,
+    "name": "LTC/CHF",
+    "start_tick": "2023-03-14"
+  },
+  "ltceur": {
+    "decimal_factor": 10,
+    "name": "LTC/EUR",
+    "start_tick": "2023-03-14"
+  },
+  "ltcgbp": {
+    "decimal_factor": 10,
+    "name": "LTC/GBP",
+    "start_tick": "2023-03-14"
+  },
+  "ltcusd": {
+    "decimal_factor": 10,
+    "name": "LTC/USD",
+    "start_tick": "2018-09-03"
+  },
+  "luluususd": {
+    "decimal_factor": 1000,
+    "name": "LULU.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "lususd": {
+    "decimal_factor": 1000,
+    "name": "L.US/USD",
+    "start_tick": "2017-05-11"
+  },
+  "luvususd": {
+    "decimal_factor": 1000,
+    "name": "LUV.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "lvcfreur": {
+    "decimal_factor": 1000,
+    "name": "LVC.FR/EUR",
+    "start_tick": "2020-09-22"
+  },
+  "lvsususd": {
+    "decimal_factor": 1000,
+    "name": "LVS.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "lwususd": {
+    "decimal_factor": 1000,
+    "name": "LW.US/USD",
+    "start_tick": "2022-05-16"
+  },
+  "lxsdeeur": {
+    "decimal_factor": 1000,
+    "name": "LXS.DE/EUR",
+    "start_tick": "2015-04-21"
+  },
+  "lybususd": {
+    "decimal_factor": 1000,
+    "name": "LYB.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "lyftususd": {
+    "decimal_factor": 1000,
+    "name": "LYFT.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "lyvususd": {
+    "decimal_factor": 1000,
+    "name": "LYV.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "lyxbnkfreur": {
+    "decimal_factor": 1000,
+    "name": "LYXBNK.FR/EUR",
+    "start_tick": "2020-09-22"
+  },
+  "maaususd": {
+    "decimal_factor": 1000,
+    "name": "MAA.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "maerskbdkdkk": {
+    "decimal_factor": 1000,
+    "name": "MAERSKB.DK/DKK",
+    "start_tick": "2016-11-08"
+  },
+  "manhususd": {
+    "decimal_factor": 1000,
+    "name": "MANH.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "mapeseur": {
+    "decimal_factor": 1000,
+    "name": "MAP.ES/EUR",
+    "start_tick": "2016-11-14"
+  },
+  "marususd": {
+    "decimal_factor": 1000,
+    "name": "MAR.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "masiususd": {
+    "decimal_factor": 1000,
+    "name": "MASI.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "matusd": {
+    "decimal_factor": 1000,
+    "name": "MAT/USD",
+    "start_tick": "2000-01-01"
+  },
+  "matususd": {
+    "decimal_factor": 1000,
+    "name": "MAT.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "maususd": {
+    "decimal_factor": 1000,
+    "name": "MA.US/USD",
+    "start_tick": "2017-05-11"
+  },
+  "mbiteur": {
+    "decimal_factor": 1000,
+    "name": "MB.IT/EUR",
+    "start_tick": "2020-12-17"
+  },
+  "mbtnchchf": {
+    "decimal_factor": 1000,
+    "name": "MBTN.CH/CHF",
+    "start_tick": "2022-06-14"
+  },
+  "mcdususd": {
+    "decimal_factor": 1000,
+    "name": "MCD.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "mcfreur": {
+    "decimal_factor": 1000,
+    "name": "MC.FR/EUR",
+    "start_tick": "2016-08-05"
+  },
+  "mchpususd": {
+    "decimal_factor": 1000,
+    "name": "MCHP.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "mckususd": {
+    "decimal_factor": 1000,
+    "name": "MCK.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "mdbususd": {
+    "decimal_factor": 1000,
+    "name": "MDB.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "mdlzususd": {
+    "decimal_factor": 1000,
+    "name": "MDLZ.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "mdtususd": {
+    "decimal_factor": 1000,
+    "name": "MDT.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "megacpomxmxn": {
+    "decimal_factor": 1000,
+    "name": "MEGACPO.MX/MXN",
+    "start_tick": "2022-10-13"
+  },
+  "metususd": {
+    "decimal_factor": 1000,
+    "name": "MET.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "mggtgbgbx": {
+    "decimal_factor": 1000,
+    "name": "MGGT.GB/GBX",
+    "start_tick": "2016-07-07"
+  },
+  "mgmususd": {
+    "decimal_factor": 1000,
+    "name": "MGM.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "mhgnonok": {
+    "decimal_factor": 1000,
+    "name": "MHG.NO/NOK",
+    "start_tick": "2016-11-14"
+  },
+  "mhkususd": {
+    "decimal_factor": 1000,
+    "name": "MHK.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "middususd": {
+    "decimal_factor": 1000,
+    "name": "MIDD.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "mklususd": {
+    "decimal_factor": 1000,
+    "name": "MKL.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "mkrusd": {
+    "decimal_factor": 100,
+    "name": "MKR/USD",
+    "start_tick": "2000-01-01"
+  },
+  "mksgbgbx": {
+    "decimal_factor": 1000,
+    "name": "MKS.GB/GBX",
+    "start_tick": "2016-07-07"
+  },
+  "mksiususd": {
+    "decimal_factor": 1000,
+    "name": "MKSI.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "mktxususd": {
+    "decimal_factor": 1000,
+    "name": "MKTX.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "mlfreur": {
+    "decimal_factor": 1000,
+    "name": "ML.FR/EUR",
+    "start_tick": "2022-06-14"
+  },
+  "mlmususd": {
+    "decimal_factor": 1000,
+    "name": "MLM.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "mmmususd": {
+    "decimal_factor": 1000,
+    "name": "MMM.US/USD",
+    "start_tick": "2017-05-11"
+  },
+  "mndigbgbx": {
+    "decimal_factor": 1000,
+    "name": "MNDI.GB/GBX",
+    "start_tick": "2016-07-08"
+  },
+  "mndtususd": {
+    "decimal_factor": 1000,
+    "name": "MNDT.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "mnggbgbx": {
+    "decimal_factor": 1000,
+    "name": "MNG.GB/GBX",
+    "start_tick": "2022-05-12"
+  },
+  "mohususd": {
+    "decimal_factor": 1000,
+    "name": "MOH.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "monciteur": {
+    "decimal_factor": 1000,
+    "name": "MONC.IT/EUR",
+    "start_tick": "2020-12-17"
+  },
+  "moususd": {
+    "decimal_factor": 1000,
+    "name": "MO.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "mpcususd": {
+    "decimal_factor": 1000,
+    "name": "MPC.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "mpwrususd": {
+    "decimal_factor": 1000,
+    "name": "MPWR.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "mpwususd": {
+    "decimal_factor": 1000,
+    "name": "MPW.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "mrkdeeur": {
+    "decimal_factor": 1000,
+    "name": "MRK.DE/EUR",
+    "start_tick": "2015-03-24"
+  },
+  "mrkususd": {
+    "decimal_factor": 1000,
+    "name": "MRK.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "mrnaususd": {
+    "decimal_factor": 1000,
+    "name": "MRNA.US/USD",
+    "start_tick": "2020-10-01"
+  },
+  "mroususd": {
+    "decimal_factor": 1000,
+    "name": "MRO.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "mrvlususd": {
+    "decimal_factor": 1000,
+    "name": "MRVL.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "mrwgbgbx": {
+    "decimal_factor": 1000,
+    "name": "MRW.GB/GBX",
+    "start_tick": "2016-07-07"
+  },
+  "msciususd": {
+    "decimal_factor": 1000,
+    "name": "MSCI.US/USD",
+    "start_tick": "2022-06-15"
+  },
+  "msftususd": {
+    "decimal_factor": 1000,
+    "name": "MSFT.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "msiteur": {
+    "decimal_factor": 1000,
+    "name": "MS.IT/EUR",
+    "start_tick": "2020-12-17"
+  },
+  "msususd": {
+    "decimal_factor": 1000,
+    "name": "MS.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "mtchususd": {
+    "decimal_factor": 1000,
+    "name": "MTCH.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "mtdususd": {
+    "decimal_factor": 1000,
+    "name": "MTD.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "mtnleur": {
+    "decimal_factor": 1000,
+    "name": "MT.NL/EUR",
+    "start_tick": "2016-11-14"
+  },
+  "mtnususd": {
+    "decimal_factor": 1000,
+    "name": "MTN.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "mtxdeeur": {
+    "decimal_factor": 1000,
+    "name": "MTX.DE/EUR",
+    "start_tick": "2022-05-12"
+  },
+  "mususd": {
+    "decimal_factor": 1000,
+    "name": "M.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "muususd": {
+    "decimal_factor": 1000,
+    "name": "MU.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "muv2deeur": {
+    "decimal_factor": 1000,
+    "name": "MUV2.DE/EUR",
+    "start_tick": "2015-04-21"
+  },
+  "mxnczk": {
+    "decimal_factor": 999999.9999999999,
+    "name": "MXN/CZK",
+    "start_tick": "2024-05-15"
+  },
+  "mxnhuf": {
+    "decimal_factor": 10000,
+    "name": "MXN/HUF",
+    "start_tick": "2024-05-15"
+  },
+  "mxnjpy": {
+    "decimal_factor": 100000,
+    "name": "MXN/JPY",
+    "start_tick": "2007-06-04"
+  },
+  "mxnthb": {
+    "decimal_factor": 999999.9999999999,
+    "name": "MXN/THB",
+    "start_tick": "2024-09-17"
+  },
+  "mxntry": {
+    "decimal_factor": 100000,
+    "name": "MXN/TRY",
+    "start_tick": "2024-05-15"
+  },
+  "nbixususd": {
+    "decimal_factor": 1000,
+    "name": "NBIX.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "nclhususd": {
+    "decimal_factor": 1000,
+    "name": "NCLH.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "ndasesek": {
+    "decimal_factor": 1000,
+    "name": "NDA.SE/SEK",
+    "start_tick": "2016-11-07"
+  },
+  "ndsnususd": {
+    "decimal_factor": 1000,
+    "name": "NDSN.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "neeususd": {
+    "decimal_factor": 1000,
+    "name": "NEE.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "nemususd": {
+    "decimal_factor": 1000,
+    "name": "NEM.US/USD",
+    "start_tick": "2017-05-11"
+  },
+  "nes1vfieur": {
+    "decimal_factor": 1000,
+    "name": "NES1V.FI/EUR",
+    "start_tick": "2016-11-03"
+  },
+  "nesnchchf": {
+    "decimal_factor": 1000,
+    "name": "NESN.CH/CHF",
+    "start_tick": "2015-06-16"
+  },
+  "nflxususd": {
+    "decimal_factor": 1000,
+    "name": "NFLX.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "nggbgbx": {
+    "decimal_factor": 1000,
+    "name": "NG.GB/GBX",
+    "start_tick": "2016-07-07"
+  },
+  "nhynonok": {
+    "decimal_factor": 1000,
+    "name": "NHY.NO/NOK",
+    "start_tick": "2016-11-14"
+  },
+  "nioususd": {
+    "decimal_factor": 1000,
+    "name": "NIO.US/USD",
+    "start_tick": "2020-11-27"
+  },
+  "nkeususd": {
+    "decimal_factor": 1000,
+    "name": "NKE.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "nldidxeur": {
+    "decimal_factor": 1000,
+    "name": "NLD.IDX/EUR",
+    "start_tick": "2017-12-01"
+  },
+  "nlokususd": {
+    "decimal_factor": 1000,
+    "name": "NLOK.US/USD",
+    "start_tick": "2022-06-15"
+  },
+  "nlsnususd": {
+    "decimal_factor": 1000,
+    "name": "NLSN.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "nlyususd": {
+    "decimal_factor": 1000,
+    "name": "NLY.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "nocususd": {
+    "decimal_factor": 1000,
+    "name": "NOC.US/USD",
+    "start_tick": "2017-05-11"
+  },
+  "nokaed": {
+    "decimal_factor": 100000,
+    "name": "NOK/AED",
+    "start_tick": "2024-09-17"
+  },
+  "nokcnh": {
+    "decimal_factor": 100000,
+    "name": "NOK/CNH",
+    "start_tick": "2024-09-17"
+  },
+  "nokczk": {
+    "decimal_factor": 10000,
+    "name": "NOK/CZK",
+    "start_tick": "2024-05-15"
+  },
+  "nokdkk": {
+    "decimal_factor": 100000,
+    "name": "NOK/DKK",
+    "start_tick": "2024-05-15"
+  },
+  "nokhkd": {
+    "decimal_factor": 100000,
+    "name": "NOK/HKD",
+    "start_tick": "2024-05-15"
+  },
+  "nokhuf": {
+    "decimal_factor": 1000,
+    "name": "NOK/HUF",
+    "start_tick": "2024-05-15"
+  },
+  "nokils": {
+    "decimal_factor": 100000,
+    "name": "NOK/ILS",
+    "start_tick": "2024-09-17"
+  },
+  "nokjpy": {
+    "decimal_factor": 100000,
+    "name": "NOK/JPY",
+    "start_tick": "2024-05-15"
+  },
+  "nokmxn": {
+    "decimal_factor": 100000,
+    "name": "NOK/MXN",
+    "start_tick": "2024-05-26"
+  },
+  "nokron": {
+    "decimal_factor": 100000,
+    "name": "NOK/RON",
+    "start_tick": "2024-09-17"
+  },
+  "noksar": {
+    "decimal_factor": 100000,
+    "name": "NOK/SAR",
+    "start_tick": "2024-09-17"
+  },
+  "noksek": {
+    "decimal_factor": 100000,
+    "name": "NOK/SEK",
+    "start_tick": "2024-05-15"
+  },
+  "nokthb": {
+    "decimal_factor": 1000,
+    "name": "NOK/THB",
+    "start_tick": "2024-09-17"
+  },
+  "noktry": {
+    "decimal_factor": 100000,
+    "name": "NOK/TRY",
+    "start_tick": "2024-05-15"
+  },
+  "nokzar": {
+    "decimal_factor": 100000,
+    "name": "NOK/ZAR",
+    "start_tick": "2024-05-15"
+  },
+  "novnchchf": {
+    "decimal_factor": 1000,
+    "name": "NOVN.CH/CHF",
+    "start_tick": "2015-06-16"
+  },
+  "novobdkdkk": {
+    "decimal_factor": 1000,
+    "name": "NOVOB.DK/DKK",
+    "start_tick": "2016-11-08"
+  },
+  "nowususd": {
+    "decimal_factor": 1000,
+    "name": "NOW.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "nre1vfieur": {
+    "decimal_factor": 1000,
+    "name": "NRE1V.FI/EUR",
+    "start_tick": "2016-11-03"
+  },
+  "nrgususd": {
+    "decimal_factor": 1000,
+    "name": "NRG.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "nscususd": {
+    "decimal_factor": 1000,
+    "name": "NSC.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "ntnxususd": {
+    "decimal_factor": 1000,
+    "name": "NTNX.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "nvdaususd": {
+    "decimal_factor": 1000,
+    "name": "NVDA.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "nvrususd": {
+    "decimal_factor": 1000,
+    "name": "NVR.US/USD",
+    "start_tick": "2022-05-26"
+  },
+  "nwlususd": {
+    "decimal_factor": 1000,
+    "name": "NWL.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "nwsususd": {
+    "decimal_factor": 1000,
+    "name": "NWS.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "nxstususd": {
+    "decimal_factor": 1000,
+    "name": "NXST.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "nxtgbgbx": {
+    "decimal_factor": 1000,
+    "name": "NXT.GB/GBX",
+    "start_tick": "2016-07-06"
+  },
+  "nytususd": {
+    "decimal_factor": 1000,
+    "name": "NYT.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "nzdaed": {
+    "decimal_factor": 100000,
+    "name": "NZD/AED",
+    "start_tick": "2024-09-17"
+  },
+  "nzdcad": {
+    "decimal_factor": 100000,
+    "name": "NZD/CAD",
+    "start_tick": "2006-01-02"
+  },
+  "nzdchf": {
+    "decimal_factor": 100000,
+    "name": "NZD/CHF",
+    "start_tick": "2006-01-02"
+  },
+  "nzdcnh": {
+    "decimal_factor": 100000,
+    "name": "NZD/CNH",
+    "start_tick": "2024-05-15"
+  },
+  "nzdczk": {
+    "decimal_factor": 10000,
+    "name": "NZD/CZK",
+    "start_tick": "2024-05-15"
+  },
+  "nzddkk": {
+    "decimal_factor": 100000,
+    "name": "NZD/DKK",
+    "start_tick": "2024-05-15"
+  },
+  "nzdhkd": {
+    "decimal_factor": 1000,
+    "name": "NZD/HKD",
+    "start_tick": "2024-05-15"
+  },
+  "nzdhuf": {
+    "decimal_factor": 1000,
+    "name": "NZD/HUF",
+    "start_tick": "2024-05-15"
+  },
+  "nzdils": {
+    "decimal_factor": 100000,
+    "name": "NZD/ILS",
+    "start_tick": "2024-09-17"
+  },
+  "nzdjpy": {
+    "decimal_factor": 1000,
+    "name": "NZD/JPY",
+    "start_tick": "2006-01-02"
+  },
+  "nzdmxn": {
+    "decimal_factor": 100000,
+    "name": "NZD/MXN",
+    "start_tick": "2024-05-15"
+  },
+  "nzdnok": {
+    "decimal_factor": 100000,
+    "name": "NZD/NOK",
+    "start_tick": "2024-05-15"
+  },
+  "nzdpln": {
+    "decimal_factor": 100000,
+    "name": "NZD/PLN",
+    "start_tick": "2012-03-30"
+  },
+  "nzdron": {
+    "decimal_factor": 100000,
+    "name": "NZD/RON",
+    "start_tick": "2024-09-17"
+  },
+  "nzdsar": {
+    "decimal_factor": 100000,
+    "name": "NZD/SAR",
+    "start_tick": "2024-09-17"
+  },
+  "nzdsek": {
+    "decimal_factor": 100000,
+    "name": "NZD/SEK",
+    "start_tick": "2024-05-15"
+  },
+  "nzdsgd": {
+    "decimal_factor": 100000,
+    "name": "NZD/SGD",
+    "start_tick": "2007-03-13"
+  },
+  "nzdthb": {
+    "decimal_factor": 1000,
+    "name": "NZD/THB",
+    "start_tick": "2024-09-17"
+  },
+  "nzdtry": {
+    "decimal_factor": 100000,
+    "name": "NZD/TRY",
+    "start_tick": "2024-05-15"
+  },
+  "nzdusd": {
+    "decimal_factor": 100000,
+    "name": "NZD/USD",
+    "start_tick": "2003-08-03"
+  },
+  "nzdzar": {
+    "decimal_factor": 100000,
+    "name": "NZD/ZAR",
+    "start_tick": "2024-05-15"
+  },
+  "nzymbdkdkk": {
+    "decimal_factor": 1000,
+    "name": "NZYMB.DK/DKK",
+    "start_tick": "2016-11-08"
+  },
+  "ocdogbgbx": {
+    "decimal_factor": 1000,
+    "name": "OCDO.GB/GBX",
+    "start_tick": "2022-05-12"
+  },
+  "ocususd": {
+    "decimal_factor": 1000,
+    "name": "OC.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "odflususd": {
+    "decimal_factor": 1000,
+    "name": "ODFL.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "oerlchchf": {
+    "decimal_factor": 1000,
+    "name": "OERL.CH/CHF",
+    "start_tick": "2015-06-17"
+  },
+  "ogeususd": {
+    "decimal_factor": 1000,
+    "name": "OGE.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "ognususd": {
+    "decimal_factor": 1000,
+    "name": "OGN.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "ohiususd": {
+    "decimal_factor": 1000,
+    "name": "OHI.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "ojuicecmdusx": {
+    "decimal_factor": 1000,
+    "name": "OJUICE.CMD/USX",
+    "start_tick": "2017-10-20"
+  },
+  "okeususd": {
+    "decimal_factor": 1000,
+    "name": "OKE.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "oktaususd": {
+    "decimal_factor": 1000,
+    "name": "OKTA.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "oledususd": {
+    "decimal_factor": 1000,
+    "name": "OLED.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "olliususd": {
+    "decimal_factor": 1000,
+    "name": "OLLI.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "olnususd": {
+    "decimal_factor": 1000,
+    "name": "OLN.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "omabmxmxn": {
+    "decimal_factor": 1000,
+    "name": "OMAB.MX/MXN",
+    "start_tick": "2022-10-13"
+  },
+  "omcususd": {
+    "decimal_factor": 1000,
+    "name": "OMC.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "omfususd": {
+    "decimal_factor": 1000,
+    "name": "OMF.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "onususd": {
+    "decimal_factor": 1000,
+    "name": "ON.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "orafreur": {
+    "decimal_factor": 1000,
+    "name": "ORA.FR/EUR",
+    "start_tick": "2016-08-05"
+  },
+  "orbiamxmxn": {
+    "decimal_factor": 1000,
+    "name": "ORBIA.MX/MXN",
+    "start_tick": "2022-10-13"
+  },
+  "orclususd": {
+    "decimal_factor": 1000,
+    "name": "ORCL.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "orfreur": {
+    "decimal_factor": 1000,
+    "name": "OR.FR/EUR",
+    "start_tick": "2016-08-05"
+  },
+  "orknonok": {
+    "decimal_factor": 1000,
+    "name": "ORK.NO/NOK",
+    "start_tick": "2016-11-14"
+  },
+  "orlyususd": {
+    "decimal_factor": 1000,
+    "name": "ORLY.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "ote1vfieur": {
+    "decimal_factor": 1000,
+    "name": "OTE1V.FI/EUR",
+    "start_tick": "2016-11-03"
+  },
+  "otisususd": {
+    "decimal_factor": 1000,
+    "name": "OTIS.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "oususd": {
+    "decimal_factor": 1000,
+    "name": "O.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "out1vfieur": {
+    "decimal_factor": 1000,
+    "name": "OUT1V.FI/EUR",
+    "start_tick": "2016-11-03"
+  },
+  "oxyususd": {
+    "decimal_factor": 1000,
+    "name": "OXY.US/USD",
+    "start_tick": "2017-05-11"
+  },
+  "pah3deeur": {
+    "decimal_factor": 1000,
+    "name": "PAH3.DE/EUR",
+    "start_tick": "2015-04-21"
+  },
+  "panwususd": {
+    "decimal_factor": 1000,
+    "name": "PANW.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "paraususd": {
+    "decimal_factor": 1000,
+    "name": "PARA.US/USD",
+    "start_tick": "2022-06-15"
+  },
+  "paycususd": {
+    "decimal_factor": 1000,
+    "name": "PAYC.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "payxususd": {
+    "decimal_factor": 1000,
+    "name": "PAYX.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "pbfususd": {
+    "decimal_factor": 1000,
+    "name": "PBF.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "pbjususd": {
+    "decimal_factor": 1000,
+    "name": "PBJ.US/USD",
+    "start_tick": "2024-11-29"
+  },
+  "pbrususd": {
+    "decimal_factor": 1000,
+    "name": "PBR.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "pcarususd": {
+    "decimal_factor": 1000,
+    "name": "PCAR.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "pcgususd": {
+    "decimal_factor": 1000,
+    "name": "PCG.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "pclnususd": {
+    "decimal_factor": 1000,
+    "name": "PCLN.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "pctyususd": {
+    "decimal_factor": 1000,
+    "name": "PCTY.US/USD",
+    "start_tick": "2022-05-19"
+  },
+  "peakususd": {
+    "decimal_factor": 1000,
+    "name": "PEAK.US/USD",
+    "start_tick": "2022-06-15"
+  },
+  "pejususd": {
+    "decimal_factor": 1000,
+    "name": "PEJ.US/USD",
+    "start_tick": "2024-11-29"
+  },
+  "pennususd": {
+    "decimal_factor": 1000,
+    "name": "PENN.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "peolesmxmxn": {
+    "decimal_factor": 1000,
+    "name": "PEOLES.MX/MXN",
+    "start_tick": "2022-10-13"
+  },
+  "pepususd": {
+    "decimal_factor": 1000,
+    "name": "PEP.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "pfcgbgbx": {
+    "decimal_factor": 1000,
+    "name": "PFC.GB/GBX",
+    "start_tick": "2016-07-08"
+  },
+  "pfeususd": {
+    "decimal_factor": 1000,
+    "name": "PFE.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "pgrususd": {
+    "decimal_factor": 1000,
+    "name": "PGR.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "pgususd": {
+    "decimal_factor": 1000,
+    "name": "PG.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "phianleur": {
+    "decimal_factor": 1000,
+    "name": "PHIA.NL/EUR",
+    "start_tick": "2016-11-09"
+  },
+  "phnxgbgbx": {
+    "decimal_factor": 1000,
+    "name": "PHNX.GB/GBX",
+    "start_tick": "2022-05-12"
+  },
+  "phususd": {
+    "decimal_factor": 1000,
+    "name": "PH.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "piaiteur": {
+    "decimal_factor": 1000,
+    "name": "PIA.IT/EUR",
+    "start_tick": "2020-12-17"
+  },
+  "piiususd": {
+    "decimal_factor": 1000,
+    "name": "PII.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "pinframxmxn": {
+    "decimal_factor": 1000,
+    "name": "PINFRA.MX/MXN",
+    "start_tick": "2022-10-13"
+  },
+  "pkgususd": {
+    "decimal_factor": 1000,
+    "name": "PKG.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "planususd": {
+    "decimal_factor": 1000,
+    "name": "PLAN.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "plnaed": {
+    "decimal_factor": 100000,
+    "name": "PLN/AED",
+    "start_tick": "2024-09-17"
+  },
+  "plncnh": {
+    "decimal_factor": 100000,
+    "name": "PLN/CNH",
+    "start_tick": "2024-09-17"
+  },
+  "plnczk": {
+    "decimal_factor": 10000,
+    "name": "PLN/CZK",
+    "start_tick": "2024-05-15"
+  },
+  "plndkk": {
+    "decimal_factor": 100000,
+    "name": "PLN/DKK",
+    "start_tick": "2012-03-30"
+  },
+  "plnhkd": {
+    "decimal_factor": 100000,
+    "name": "PLN/HKD",
+    "start_tick": "2024-05-15"
+  },
+  "plnhuf": {
+    "decimal_factor": 1000,
+    "name": "PLN/HUF",
+    "start_tick": "2024-05-15"
+  },
+  "plnidxpln": {
+    "decimal_factor": 1000,
+    "name": "PLN.IDX/PLN",
+    "start_tick": "2017-12-01"
+  },
+  "plnils": {
+    "decimal_factor": 100000,
+    "name": "PLN/ILS",
+    "start_tick": "2024-09-17"
+  },
+  "plnjpy": {
+    "decimal_factor": 1000,
+    "name": "PLN/JPY",
+    "start_tick": "2024-05-15"
+  },
+  "plnmxn": {
+    "decimal_factor": 100000,
+    "name": "PLN/MXN",
+    "start_tick": "2024-05-15"
+  },
+  "plnnok": {
+    "decimal_factor": 100000,
+    "name": "PLN/NOK",
+    "start_tick": "2024-05-15"
+  },
+  "plnron": {
+    "decimal_factor": 100000,
+    "name": "PLN/RON",
+    "start_tick": "2024-09-17"
+  },
+  "plnsar": {
+    "decimal_factor": 100000,
+    "name": "PLN/SAR",
+    "start_tick": "2024-09-17"
+  },
+  "plnsek": {
+    "decimal_factor": 100000,
+    "name": "PLN/SEK",
+    "start_tick": "2024-05-15"
+  },
+  "plnthb": {
+    "decimal_factor": 100000,
+    "name": "PLN/THB",
+    "start_tick": "2024-09-17"
+  },
+  "plntry": {
+    "decimal_factor": 100000,
+    "name": "PLN/TRY",
+    "start_tick": "2024-05-15"
+  },
+  "plntususd": {
+    "decimal_factor": 1000,
+    "name": "PLNT.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "plnzar": {
+    "decimal_factor": 100000,
+    "name": "PLN/ZAR",
+    "start_tick": "2024-05-15"
+  },
+  "pltrususd": {
+    "decimal_factor": 1000,
+    "name": "PLTR.US/USD",
+    "start_tick": "2020-10-05"
+  },
+  "plugususd": {
+    "decimal_factor": 1000,
+    "name": "PLUG.US/USD",
+    "start_tick": "2020-10-02"
+  },
+  "pmususd": {
+    "decimal_factor": 1000,
+    "name": "PM.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "pncususd": {
+    "decimal_factor": 1000,
+    "name": "PNC.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "pndoradkdkk": {
+    "decimal_factor": 1000,
+    "name": "PNDORA.DK/DKK",
+    "start_tick": "2016-11-08"
+  },
+  "pnrususd": {
+    "decimal_factor": 1000,
+    "name": "PNR.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "poddususd": {
+    "decimal_factor": 1000,
+    "name": "PODD.US/USD",
+    "start_tick": "2022-05-16"
+  },
+  "poolususd": {
+    "decimal_factor": 1000,
+    "name": "POOL.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "ppaususd": {
+    "decimal_factor": 1000,
+    "name": "PPA.US/USD",
+    "start_tick": "2024-11-29"
+  },
+  "ppgususd": {
+    "decimal_factor": 1000,
+    "name": "PPG.US/USD",
+    "start_tick": "2018-02-02"
+  },
+  "prgoususd": {
+    "decimal_factor": 1000,
+    "name": "PRGO.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "prugbgbx": {
+    "decimal_factor": 1000,
+    "name": "PRU.GB/GBX",
+    "start_tick": "2016-07-07"
+  },
+  "pruususd": {
+    "decimal_factor": 1000,
+    "name": "PRU.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "pryiteur": {
+    "decimal_factor": 1000,
+    "name": "PRY.IT/EUR",
+    "start_tick": "2020-12-17"
+  },
+  "psaususd": {
+    "decimal_factor": 1000,
+    "name": "PSA.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "psmdeeur": {
+    "decimal_factor": 1000,
+    "name": "PSM.DE/EUR",
+    "start_tick": "2015-04-20"
+  },
+  "psngbgbx": {
+    "decimal_factor": 1000,
+    "name": "PSN.GB/GBX",
+    "start_tick": "2016-07-08"
+  },
+  "psongbgbx": {
+    "decimal_factor": 1000,
+    "name": "PSON.GB/GBX",
+    "start_tick": "2016-07-07"
+  },
+  "pstgususd": {
+    "decimal_factor": 1000,
+    "name": "PSTG.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "psxususd": {
+    "decimal_factor": 1000,
+    "name": "PSX.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "ptcususd": {
+    "decimal_factor": 1000,
+    "name": "PTC.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "ptenususd": {
+    "decimal_factor": 1000,
+    "name": "PTEN.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "ptonususd": {
+    "decimal_factor": 1000,
+    "name": "PTON.US/USD",
+    "start_tick": "2020-10-01"
+  },
+  "pubfreur": {
+    "decimal_factor": 1000,
+    "name": "PUB.FR/EUR",
+    "start_tick": "2016-08-05"
+  },
+  "pumdeeur": {
+    "decimal_factor": 1000,
+    "name": "PUM.DE/EUR",
+    "start_tick": "2022-05-12"
+  },
+  "pvhususd": {
+    "decimal_factor": 1000,
+    "name": "PVH.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "pxdususd": {
+    "decimal_factor": 1000,
+    "name": "PXD.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "pyplususd": {
+    "decimal_factor": 1000,
+    "name": "PYPL.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "qcomususd": {
+    "decimal_factor": 1000,
+    "name": "QCOM.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "qianleur": {
+    "decimal_factor": 1000,
+    "name": "QIA.NL/EUR",
+    "start_tick": "2022-05-12"
+  },
+  "qmxmxn": {
+    "decimal_factor": 1000,
+    "name": "Q.MX/MXN",
+    "start_tick": "2022-10-13"
+  },
+  "qqqususd": {
+    "decimal_factor": 1000,
+    "name": "QQQ.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "qrvoususd": {
+    "decimal_factor": 1000,
+    "name": "QRVO.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "raceiteur": {
+    "decimal_factor": 1000,
+    "name": "RACE.IT/EUR",
+    "start_tick": "2020-12-17"
+  },
+  "ramxmxn": {
+    "decimal_factor": 1000,
+    "name": "RA.MX/MXN",
+    "start_tick": "2022-10-13"
+  },
+  "randnleur": {
+    "decimal_factor": 1000,
+    "name": "RAND.NL/EUR",
+    "start_tick": "2016-11-14"
+  },
+  "rbgbgbx": {
+    "decimal_factor": 1000,
+    "name": "RB.GB/GBX",
+    "start_tick": "2016-07-06"
+  },
+  "rbiateur": {
+    "decimal_factor": 1000,
+    "name": "RBI.AT/EUR",
+    "start_tick": "2016-11-15"
+  },
+  "rbsgbgbx": {
+    "decimal_factor": 1000,
+    "name": "RBS.GB/GBX",
+    "start_tick": "2016-07-08"
+  },
+  "rclususd": {
+    "decimal_factor": 1000,
+    "name": "RCL.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "rdsanleur": {
+    "decimal_factor": 1000,
+    "name": "RDSA.NL/EUR",
+    "start_tick": "2016-11-14"
+  },
+  "rdsbgbgbx": {
+    "decimal_factor": 1000,
+    "name": "RDSB.GB/GBX",
+    "start_tick": "2016-11-01"
+  },
+  "reciteur": {
+    "decimal_factor": 1000,
+    "name": "REC.IT/EUR",
+    "start_tick": "2020-12-17"
+  },
+  "reeeseur": {
+    "decimal_factor": 1000,
+    "name": "REE.ES/EUR",
+    "start_tick": "2016-11-14"
+  },
+  "regnususd": {
+    "decimal_factor": 1000,
+    "name": "REGN.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "regususd": {
+    "decimal_factor": 1000,
+    "name": "REG.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "relgbgbx": {
+    "decimal_factor": 1000,
+    "name": "REL.GB/GBX",
+    "start_tick": "2016-07-08"
+  },
+  "rennleur": {
+    "decimal_factor": 1000,
+    "name": "REN.NL/EUR",
+    "start_tick": "2016-11-14"
+  },
+  "repeseur": {
+    "decimal_factor": 1000,
+    "name": "REP.ES/EUR",
+    "start_tick": "2016-11-14"
+  },
+  "reususd": {
+    "decimal_factor": 1000,
+    "name": "RE.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "rfususd": {
+    "decimal_factor": 1000,
+    "name": "RF.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "rgaususd": {
+    "decimal_factor": 1000,
+    "name": "RGA.US/USD",
+    "start_tick": "2022-05-23"
+  },
+  "rgldususd": {
+    "decimal_factor": 1000,
+    "name": "RGLD.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "rifreur": {
+    "decimal_factor": 1000,
+    "name": "RI.FR/EUR",
+    "start_tick": "2016-08-05"
+  },
+  "riogbgbx": {
+    "decimal_factor": 1000,
+    "name": "RIO.GB/GBX",
+    "start_tick": "2016-07-06"
+  },
+  "rjfususd": {
+    "decimal_factor": 1000,
+    "name": "RJF.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "rmdususd": {
+    "decimal_factor": 1000,
+    "name": "RMD.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "rmggbgbx": {
+    "decimal_factor": 1000,
+    "name": "RMG.GB/GBX",
+    "start_tick": "2016-07-07"
+  },
+  "rmsfreur": {
+    "decimal_factor": 1000,
+    "name": "RMS.FR/EUR",
+    "start_tick": "2022-05-12"
+  },
+  "rmvgbgbx": {
+    "decimal_factor": 1000,
+    "name": "RMV.GB/GBX",
+    "start_tick": "2022-05-12"
+  },
+  "rngususd": {
+    "decimal_factor": 1000,
+    "name": "RNG.US/USD",
+    "start_tick": "2022-05-16"
+  },
+  "rnofreur": {
+    "decimal_factor": 1000,
+    "name": "RNO.FR/EUR",
+    "start_tick": "2016-08-08"
+  },
+  "rnrususd": {
+    "decimal_factor": 1000,
+    "name": "RNR.US/USD",
+    "start_tick": "2022-06-15"
+  },
+  "roboususd": {
+    "decimal_factor": 1000,
+    "name": "ROBO.US/USD",
+    "start_tick": "2024-11-29"
+  },
+  "rogchchf": {
+    "decimal_factor": 1000,
+    "name": "ROG.CH/CHF",
+    "start_tick": "2015-07-03"
+  },
+  "rokuususd": {
+    "decimal_factor": 1000,
+    "name": "ROKU.US/USD",
+    "start_tick": "2020-11-23"
+  },
+  "rolususd": {
+    "decimal_factor": 1000,
+    "name": "ROL.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "roncnh": {
+    "decimal_factor": 100000,
+    "name": "RON/CNH",
+    "start_tick": "2024-09-17"
+  },
+  "ronczk": {
+    "decimal_factor": 10000,
+    "name": "RON/CZK",
+    "start_tick": "2024-09-17"
+  },
+  "ronhkd": {
+    "decimal_factor": 100000,
+    "name": "RON/HKD",
+    "start_tick": "2024-09-17"
+  },
+  "ronhuf": {
+    "decimal_factor": 1000,
+    "name": "RON/HUF",
+    "start_tick": "2024-09-17"
+  },
+  "ronjpy": {
+    "decimal_factor": 1000,
+    "name": "RON/JPY",
+    "start_tick": "2024-09-17"
+  },
+  "ronmxn": {
+    "decimal_factor": 100000,
+    "name": "RON/MXN",
+    "start_tick": "2024-09-17"
+  },
+  "ronthb": {
+    "decimal_factor": 1000,
+    "name": "RON/THB",
+    "start_tick": "2024-09-17"
+  },
+  "rontry": {
+    "decimal_factor": 100000,
+    "name": "RON/TRY",
+    "start_tick": "2024-09-17"
+  },
+  "ronzar": {
+    "decimal_factor": 100000,
+    "name": "RON/ZAR",
+    "start_tick": "2024-09-17"
+  },
+  "rostususd": {
+    "decimal_factor": 1000,
+    "name": "ROST.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "rpmususd": {
+    "decimal_factor": 1000,
+    "name": "RPM.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "rrcususd": {
+    "decimal_factor": 1000,
+    "name": "RRC.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "rrgbgbx": {
+    "decimal_factor": 1000,
+    "name": "RR.GB/GBX",
+    "start_tick": "2016-07-08"
+  },
+  "rrxususd": {
+    "decimal_factor": 1000,
+    "name": "RRX.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "rsagbgbx": {
+    "decimal_factor": 1000,
+    "name": "RSA.GB/GBX",
+    "start_tick": "2016-07-07"
+  },
+  "rsususd": {
+    "decimal_factor": 1000,
+    "name": "RS.US/USD",
+    "start_tick": "2022-05-16"
+  },
+  "rtogbgbx": {
+    "decimal_factor": 1000,
+    "name": "RTO.GB/GBX",
+    "start_tick": "2022-05-12"
+  },
+  "rtxususd": {
+    "decimal_factor": 1000,
+    "name": "RTX.US/USD",
+    "start_tick": "2022-06-15"
+  },
+  "rwedeeur": {
+    "decimal_factor": 1000,
+    "name": "RWE.DE/EUR",
+    "start_tick": "2015-04-16"
+  },
+  "ry4cieeur": {
+    "decimal_factor": 1000,
+    "name": "RY4C.IE/EUR",
+    "start_tick": "2020-10-01"
+  },
+  "sabrususd": {
+    "decimal_factor": 1000,
+    "name": "SABR.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "saffreur": {
+    "decimal_factor": 1000,
+    "name": "SAF.FR/EUR",
+    "start_tick": "2016-08-05"
+  },
+  "sandsesek": {
+    "decimal_factor": 1000,
+    "name": "SAND.SE/SEK",
+    "start_tick": "2016-11-07"
+  },
+  "saneseur": {
+    "decimal_factor": 1000,
+    "name": "SAN.ES/EUR",
+    "start_tick": "2016-11-14"
+  },
+  "sanfreur": {
+    "decimal_factor": 1000,
+    "name": "SAN.FR/EUR",
+    "start_tick": "2016-08-05"
+  },
+  "sapdeeur": {
+    "decimal_factor": 1000,
+    "name": "SAP.DE/EUR",
+    "start_tick": "2015-04-16"
+  },
+  "sarcnh": {
+    "decimal_factor": 100000,
+    "name": "SAR/CNH",
+    "start_tick": "2024-09-17"
+  },
+  "sarczk": {
+    "decimal_factor": 10000,
+    "name": "SAR/CZK",
+    "start_tick": "2024-09-17"
+  },
+  "sarhkd": {
+    "decimal_factor": 100000,
+    "name": "SAR/HKD",
+    "start_tick": "2024-09-17"
+  },
+  "sarhuf": {
+    "decimal_factor": 1000,
+    "name": "SAR/HUF",
+    "start_tick": "2024-09-17"
+  },
+  "sarjpy": {
+    "decimal_factor": 1000,
+    "name": "SAR/JPY",
+    "start_tick": "2024-09-17"
+  },
+  "sarmxn": {
+    "decimal_factor": 100000,
+    "name": "SAR/MXN",
+    "start_tick": "2024-09-17"
+  },
+  "sarron": {
+    "decimal_factor": 100000,
+    "name": "SAR/RON",
+    "start_tick": "2024-09-17"
+  },
+  "sarthb": {
+    "decimal_factor": 1000,
+    "name": "SAR/THB",
+    "start_tick": "2024-09-17"
+  },
+  "sartry": {
+    "decimal_factor": 100000,
+    "name": "SAR/TRY",
+    "start_tick": "2024-09-17"
+  },
+  "sarzar": {
+    "decimal_factor": 100000,
+    "name": "SAR/ZAR",
+    "start_tick": "2024-09-17"
+  },
+  "sbnyususd": {
+    "decimal_factor": 1000,
+    "name": "SBNY.US/USD",
+    "start_tick": "2022-05-16"
+  },
+  "sbrygbgbx": {
+    "decimal_factor": 1000,
+    "name": "SBRY.GB/GBX",
+    "start_tick": "2016-07-07"
+  },
+  "sbuxususd": {
+    "decimal_factor": 1000,
+    "name": "SBUX.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "scabsesek": {
+    "decimal_factor": 1000,
+    "name": "SCAB.SE/SEK",
+    "start_tick": "2016-11-07"
+  },
+  "sccoususd": {
+    "decimal_factor": 1000,
+    "name": "SCCO.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "schwususd": {
+    "decimal_factor": 1000,
+    "name": "SCHW.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "sciususd": {
+    "decimal_factor": 1000,
+    "name": "SCI.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "scmnchchf": {
+    "decimal_factor": 1000,
+    "name": "SCMN.CH/CHF",
+    "start_tick": "2015-07-03"
+  },
+  "sdfdeeur": {
+    "decimal_factor": 1000,
+    "name": "SDF.DE/EUR",
+    "start_tick": "2015-04-15"
+  },
+  "sdrgbgbx": {
+    "decimal_factor": 1000,
+    "name": "SDR.GB/GBX",
+    "start_tick": "2016-07-07"
+  },
+  "sebasesek": {
+    "decimal_factor": 1000,
+    "name": "SEBA.SE/SEK",
+    "start_tick": "2016-11-14"
+  },
+  "secubsesek": {
+    "decimal_factor": 1000,
+    "name": "SECUB.SE/SEK",
+    "start_tick": "2016-11-07"
+  },
+  "sedgususd": {
+    "decimal_factor": 1000,
+    "name": "SEDG.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "seicususd": {
+    "decimal_factor": 1000,
+    "name": "SEIC.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "sekaed": {
+    "decimal_factor": 100000,
+    "name": "SEK/AED",
+    "start_tick": "2024-09-17"
+  },
+  "sekcnh": {
+    "decimal_factor": 100000,
+    "name": "SEK/CNH",
+    "start_tick": "2024-09-17"
+  },
+  "sekczk": {
+    "decimal_factor": 10000,
+    "name": "SEK/CZK",
+    "start_tick": "2024-05-15"
+  },
+  "sekdkk": {
+    "decimal_factor": 100000,
+    "name": "SEK/DKK",
+    "start_tick": "2024-05-15"
+  },
+  "sekhkd": {
+    "decimal_factor": 100000,
+    "name": "SEK/HKD",
+    "start_tick": "2024-05-15"
+  },
+  "sekhuf": {
+    "decimal_factor": 1000,
+    "name": "SEK/HUF",
+    "start_tick": "2024-05-15"
+  },
+  "sekils": {
+    "decimal_factor": 100000,
+    "name": "SEK/ILS",
+    "start_tick": "2024-09-17"
+  },
+  "sekjpy": {
+    "decimal_factor": 100000,
+    "name": "SEK/JPY",
+    "start_tick": "2024-05-15"
+  },
+  "sekmxn": {
+    "decimal_factor": 100000,
+    "name": "SEK/MXN",
+    "start_tick": "2024-05-15"
+  },
+  "sekron": {
+    "decimal_factor": 100000,
+    "name": "SEK/RON",
+    "start_tick": "2024-09-17"
+  },
+  "seksar": {
+    "decimal_factor": 100000,
+    "name": "SEK/SAR",
+    "start_tick": "2024-09-17"
+  },
+  "sekthb": {
+    "decimal_factor": 1000,
+    "name": "SEK/THB",
+    "start_tick": "2024-09-17"
+  },
+  "sektry": {
+    "decimal_factor": 100000,
+    "name": "SEK/TRY",
+    "start_tick": "2024-05-15"
+  },
+  "sekzar": {
+    "decimal_factor": 100000,
+    "name": "SEK/ZAR",
+    "start_tick": "2024-05-15"
+  },
+  "semigbgbx": {
+    "decimal_factor": 1000,
+    "name": "SEMI.GB/GBP",
+    "start_tick": "2024-10-21"
+  },
+  "sferiteur": {
+    "decimal_factor": 1000,
+    "name": "SFER.IT/EUR",
+    "start_tick": "2020-12-17"
+  },
+  "sfmususd": {
+    "decimal_factor": 1000,
+    "name": "SFM.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "sgdaed": {
+    "decimal_factor": 100000,
+    "name": "SGD/AED",
+    "start_tick": "2024-09-17"
+  },
+  "sgdcnh": {
+    "decimal_factor": 100000,
+    "name": "SGD/CNH",
+    "start_tick": "2024-09-17"
+  },
+  "sgdczk": {
+    "decimal_factor": 10000,
+    "name": "SGD/CZK",
+    "start_tick": "2024-05-15"
+  },
+  "sgddkk": {
+    "decimal_factor": 100000,
+    "name": "SGD/DKK",
+    "start_tick": "2024-05-15"
+  },
+  "sgdhkd": {
+    "decimal_factor": 100000,
+    "name": "SGD/HKD",
+    "start_tick": "2024-05-15"
+  },
+  "sgdhuf": {
+    "decimal_factor": 1000,
+    "name": "SGD/HUF",
+    "start_tick": "2024-05-15"
+  },
+  "sgdidxsgd": {
+    "decimal_factor": 1000,
+    "name": "SGD.IDX/SGD",
+    "start_tick": "2017-12-01"
+  },
+  "sgdils": {
+    "decimal_factor": 100000,
+    "name": "SGD/ILS",
+    "start_tick": "2024-09-17"
+  },
+  "sgdjpy": {
+    "decimal_factor": 1000,
+    "name": "SGD/JPY",
+    "start_tick": "2007-03-13"
+  },
+  "sgdmxn": {
+    "decimal_factor": 100000,
+    "name": "SGD/MXN",
+    "start_tick": "2024-05-15"
+  },
+  "sgdnok": {
+    "decimal_factor": 100000,
+    "name": "SGD/NOK",
+    "start_tick": "2024-05-15"
+  },
+  "sgdpln": {
+    "decimal_factor": 100000,
+    "name": "SGD/PLN",
+    "start_tick": "2024-05-15"
+  },
+  "sgdron": {
+    "decimal_factor": 100000,
+    "name": "SGD/RON",
+    "start_tick": "2024-09-17"
+  },
+  "sgdsar": {
+    "decimal_factor": 100000,
+    "name": "SGD/SAR",
+    "start_tick": "2024-09-17"
+  },
+  "sgdsek": {
+    "decimal_factor": 100000,
+    "name": "SGD/SEK",
+    "start_tick": "2024-05-15"
+  },
+  "sgdthb": {
+    "decimal_factor": 1000,
+    "name": "SGD/THB",
+    "start_tick": "2024-09-17"
+  },
+  "sgdtry": {
+    "decimal_factor": 100000,
+    "name": "SGD/TRY",
+    "start_tick": "2024-05-15"
+  },
+  "sgdzar": {
+    "decimal_factor": 100000,
+    "name": "SGD/ZAR",
+    "start_tick": "2024-05-15"
+  },
+  "sgegbgbx": {
+    "decimal_factor": 1000,
+    "name": "SGE.GB/GBX",
+    "start_tick": "2016-07-08"
+  },
+  "sgenususd": {
+    "decimal_factor": 1000,
+    "name": "SGEN.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "sgldususd": {
+    "decimal_factor": 1000,
+    "name": "SGLD.US/USD",
+    "start_tick": "2024-10-21"
+  },
+  "sgofreur": {
+    "decimal_factor": 1000,
+    "name": "SGO.FR/EUR",
+    "start_tick": "2016-10-31"
+  },
+  "sgrogbgbx": {
+    "decimal_factor": 1000,
+    "name": "SGRO.GB/GBX",
+    "start_tick": "2022-05-12"
+  },
+  "sgsnchchf": {
+    "decimal_factor": 1000,
+    "name": "SGSN.CH/CHF",
+    "start_tick": "2015-08-06"
+  },
+  "shwususd": {
+    "decimal_factor": 1000,
+    "name": "SHW.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "siedeeur": {
+    "decimal_factor": 1000,
+    "name": "SIE.DE/EUR",
+    "start_tick": "2015-04-20"
+  },
+  "sivbususd": {
+    "decimal_factor": 1000,
+    "name": "SIVB.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "sjmususd": {
+    "decimal_factor": 1000,
+    "name": "SJM.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "skabsesek": {
+    "decimal_factor": 1000,
+    "name": "SKAB.SE/SEK",
+    "start_tick": "2016-11-07"
+  },
+  "skfbsesek": {
+    "decimal_factor": 1000,
+    "name": "SKFB.SE/SEK",
+    "start_tick": "2016-11-07"
+  },
+  "skygbgbx": {
+    "decimal_factor": 1000,
+    "name": "SKY.GB/GBP",
+    "start_tick": "2016-07-07"
+  },
+  "slagbgbx": {
+    "decimal_factor": 1000,
+    "name": "SLA.GB/GBX",
+    "start_tick": "2017-09-05"
+  },
+  "slbususd": {
+    "decimal_factor": 1000,
+    "name": "SLB.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "slhnchchf": {
+    "decimal_factor": 1000,
+    "name": "SLHN.CH/CHF",
+    "start_tick": "2015-08-06"
+  },
+  "slmususd": {
+    "decimal_factor": 1000,
+    "name": "SLM.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "slvususd": {
+    "decimal_factor": 1000,
+    "name": "SLV.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "smdsgbgbx": {
+    "decimal_factor": 1000,
+    "name": "SMDS.GB/GBX",
+    "start_tick": "2022-05-12"
+  },
+  "smhususd": {
+    "decimal_factor": 1000,
+    "name": "SMH.US/USD",
+    "start_tick": "2024-10-21"
+  },
+  "smingbgbx": {
+    "decimal_factor": 1000,
+    "name": "SMIN.GB/GBX",
+    "start_tick": "2016-07-08"
+  },
+  "smtcususd": {
+    "decimal_factor": 1000,
+    "name": "SMTC.US/USD",
+    "start_tick": "2023-11-21"
+  },
+  "smtgbgbx": {
+    "decimal_factor": 1000,
+    "name": "SMT.GB/GBX",
+    "start_tick": "2022-05-12"
+  },
+  "snapususd": {
+    "decimal_factor": 1000,
+    "name": "SNAP.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "sngbgbx": {
+    "decimal_factor": 1000,
+    "name": "SN.GB/GBX",
+    "start_tick": "2016-07-08"
+  },
+  "snowususd": {
+    "decimal_factor": 1000,
+    "name": "SNOW.US/USD",
+    "start_tick": "2020-09-22"
+  },
+  "snpsususd": {
+    "decimal_factor": 1000,
+    "name": "SNPS.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "soaidxzar": {
+    "decimal_factor": 100,
+    "name": "SOA.IDX/ZAR",
+    "start_tick": "2022-10-05"
+  },
+  "solbbeeur": {
+    "decimal_factor": 1000,
+    "name": "SOLB.BE/EUR",
+    "start_tick": "2016-11-07"
+  },
+  "soonchchf": {
+    "decimal_factor": 1000,
+    "name": "SOON.CH/CHF",
+    "start_tick": "2015-08-07"
+  },
+  "soususd": {
+    "decimal_factor": 1000,
+    "name": "SO.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "soybeancmdusx": {
+    "decimal_factor": 1000,
+    "name": "SOYBEAN.CMD/USX",
+    "start_tick": "2017-12-01"
+  },
+  "spgiususd": {
+    "decimal_factor": 1000,
+    "name": "SPGI.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "spgususd": {
+    "decimal_factor": 1000,
+    "name": "SPG.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "splkususd": {
+    "decimal_factor": 1000,
+    "name": "SPLK.US/USD",
+    "start_tick": "2022-05-16"
+  },
+  "spmiteur": {
+    "decimal_factor": 1000,
+    "name": "SPM.IT/EUR",
+    "start_tick": "2020-12-17"
+  },
+  "spotususd": {
+    "decimal_factor": 1000,
+    "name": "SPOT.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "sprususd": {
+    "decimal_factor": 1000,
+    "name": "SPR.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "spxgbgbx": {
+    "decimal_factor": 1000,
+    "name": "SPX.GB/GBX",
+    "start_tick": "2022-05-12"
+  },
+  "spyususd": {
+    "decimal_factor": 1000,
+    "name": "SPY.US/USD",
+    "start_tick": "2017-02-16"
+  },
+  "sqususd": {
+    "decimal_factor": 1000,
+    "name": "SQ.US/USD",
+    "start_tick": "2020-10-23"
+  },
+  "srenchchf": {
+    "decimal_factor": 1000,
+    "name": "SREN.CH/CHF",
+    "start_tick": "2015-08-06"
+  },
+  "srgiteur": {
+    "decimal_factor": 1000,
+    "name": "SRG.IT/EUR",
+    "start_tick": "2020-12-17"
+  },
+  "srptususd": {
+    "decimal_factor": 1000,
+    "name": "SRPT.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "srsiteur": {
+    "decimal_factor": 1000,
+    "name": "SRS.IT/EUR",
+    "start_tick": "2020-12-17"
+  },
+  "srtdeeur": {
+    "decimal_factor": 1000,
+    "name": "SRT.DE/EUR",
+    "start_tick": "2022-05-12"
+  },
+  "ssegbgbx": {
+    "decimal_factor": 1000,
+    "name": "SSE.GB/GBX",
+    "start_tick": "2016-07-08"
+  },
+  "ssncususd": {
+    "decimal_factor": 1000,
+    "name": "SSNC.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "stangbgbx": {
+    "decimal_factor": 1000,
+    "name": "STAN.GB/GBX",
+    "start_tick": "2016-07-07"
+  },
+  "stervfieur": {
+    "decimal_factor": 1000,
+    "name": "STERV.FI/EUR",
+    "start_tick": "2016-11-03"
+  },
+  "steususd": {
+    "decimal_factor": 1000,
+    "name": "STE.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "stjgbgbx": {
+    "decimal_factor": 1000,
+    "name": "STJ.GB/GBX",
+    "start_tick": "2022-05-12"
+  },
+  "stlnonok": {
+    "decimal_factor": 1000,
+    "name": "STL.NO/NOK",
+    "start_tick": "2016-11-14"
+  },
+  "stmiteur": {
+    "decimal_factor": 1000,
+    "name": "STM.IT/EUR",
+    "start_tick": "2020-12-17"
+  },
+  "sttususd": {
+    "decimal_factor": 1000,
+    "name": "STT.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "stzususd": {
+    "decimal_factor": 1000,
+    "name": "STZ.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "suasgbusd": {
+    "decimal_factor": 1000,
+    "name": "SUAS.GB/USD",
+    "start_tick": "2025-02-26"
+  },
+  "sufreur": {
+    "decimal_factor": 1000,
+    "name": "SU.FR/EUR",
+    "start_tick": "2016-08-05"
+  },
+  "sugarcmdusd": {
+    "decimal_factor": 1000,
+    "name": "SUGAR.CMD/USD",
+    "start_tick": "2017-10-02"
+  },
+  "suiususd": {
+    "decimal_factor": 1000,
+    "name": "SUI.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "susmgbusd": {
+    "decimal_factor": 1000,
+    "name": "SUSM.GB/USD",
+    "start_tick": "2025-02-26"
+  },
+  "suusgbgbx": {
+    "decimal_factor": 1000,
+    "name": "SUUS.GB/GBX",
+    "start_tick": "2025-02-26"
+  },
+  "svtgbgbx": {
+    "decimal_factor": 1000,
+    "name": "SVT.GB/GBX",
+    "start_tick": "2016-07-06"
+  },
+  "swedasesek": {
+    "decimal_factor": 1000,
+    "name": "SWEDA.SE/SEK",
+    "start_tick": "2016-11-07"
+  },
+  "swfreur": {
+    "decimal_factor": 1000,
+    "name": "SW.FR/EUR",
+    "start_tick": "2022-05-12"
+  },
+  "swksususd": {
+    "decimal_factor": 1000,
+    "name": "SWKS.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "swkususd": {
+    "decimal_factor": 1000,
+    "name": "SWK.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "swmasesek": {
+    "decimal_factor": 1000,
+    "name": "SWMA.SE/SEK",
+    "start_tick": "2016-11-07"
+  },
+  "sxlugbusd": {
+    "decimal_factor": 1000,
+    "name": "SXLU.GB/USD",
+    "start_tick": "2025-02-26"
+  },
+  "sy1deeur": {
+    "decimal_factor": 1000,
+    "name": "SY1.DE/EUR",
+    "start_tick": "2022-05-12"
+  },
+  "syfususd": {
+    "decimal_factor": 1000,
+    "name": "SYF.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "sykususd": {
+    "decimal_factor": 1000,
+    "name": "SYK.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "syyususd": {
+    "decimal_factor": 1000,
+    "name": "SYY.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "tapususd": {
+    "decimal_factor": 1000,
+    "name": "TAP.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "tategbgbx": {
+    "decimal_factor": 1000,
+    "name": "TATE.GB/GBX",
+    "start_tick": "2016-07-08"
+  },
+  "tdgususd": {
+    "decimal_factor": 1000,
+    "name": "TDG.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "tdyususd": {
+    "decimal_factor": 1000,
+    "name": "TDY.US/USD",
+    "start_tick": "2022-05-16"
+  },
+  "teamususd": {
+    "decimal_factor": 1000,
+    "name": "TEAM.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "tecdaxedeeur": {
+    "decimal_factor": 1000,
+    "name": "TECDAXE.DE/EUR",
+    "start_tick": "2020-09-22"
+  },
+  "techususd": {
+    "decimal_factor": 1000,
+    "name": "TECH.US/USD",
+    "start_tick": "2022-06-15"
+  },
+  "tefeseur": {
+    "decimal_factor": 1000,
+    "name": "TEF.ES/EUR",
+    "start_tick": "2016-11-14"
+  },
+  "tel2bsesek": {
+    "decimal_factor": 1000,
+    "name": "TEL2B.SE/SEK",
+    "start_tick": "2016-11-07"
+  },
+  "telnonok": {
+    "decimal_factor": 1000,
+    "name": "TEL.NO/NOK",
+    "start_tick": "2016-11-14"
+  },
+  "telususd": {
+    "decimal_factor": 1000,
+    "name": "TEL.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "temnchchf": {
+    "decimal_factor": 1000,
+    "name": "TEMN.CH/CHF",
+    "start_tick": "2015-08-07"
+  },
+  "teniteur": {
+    "decimal_factor": 1000,
+    "name": "TEN.IT/EUR",
+    "start_tick": "2020-12-17"
+  },
+  "tevaususd": {
+    "decimal_factor": 1000,
+    "name": "TEVA.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "tfcususd": {
+    "decimal_factor": 1000,
+    "name": "TFC.US/USD",
+    "start_tick": "2022-06-15"
+  },
+  "tfxususd": {
+    "decimal_factor": 1000,
+    "name": "TFX.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "tgtususd": {
+    "decimal_factor": 1000,
+    "name": "TGT.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "thbhuf": {
+    "decimal_factor": 100000,
+    "name": "THB/HUF",
+    "start_tick": "2024-09-17"
+  },
+  "thbjpy": {
+    "decimal_factor": 100000,
+    "name": "THB/JPY",
+    "start_tick": "2024-09-17"
+  },
+  "tisiteur": {
+    "decimal_factor": 1000,
+    "name": "TIS.IT/EUR",
+    "start_tick": "2020-12-17"
+  },
+  "tititeur": {
+    "decimal_factor": 1000,
+    "name": "TIT.IT/EUR",
+    "start_tick": "2020-12-17"
+  },
+  "tjxususd": {
+    "decimal_factor": 1000,
+    "name": "TJX.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "tkadeeur": {
+    "decimal_factor": 1000,
+    "name": "TKA.DE/EUR",
+    "start_tick": "2015-04-14"
+  },
+  "tls1vfieur": {
+    "decimal_factor": 1000,
+    "name": "TLS1V.FI/EUR",
+    "start_tick": "2016-11-09"
+  },
+  "tlsnsesek": {
+    "decimal_factor": 1000,
+    "name": "TLSN.SE/SEK",
+    "start_tick": "2016-11-14"
+  },
+  "tltususd": {
+    "decimal_factor": 1000,
+    "name": "TLT.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "tlwgbgbx": {
+    "decimal_factor": 1000,
+    "name": "TLW.GB/GBX",
+    "start_tick": "2016-07-07"
+  },
+  "tmoususd": {
+    "decimal_factor": 1000,
+    "name": "TMO.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "tmusususd": {
+    "decimal_factor": 1000,
+    "name": "TMUS.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "toditeur": {
+    "decimal_factor": 1000,
+    "name": "TOD.IT/EUR",
+    "start_tick": "2020-12-17"
+  },
+  "tolususd": {
+    "decimal_factor": 1000,
+    "name": "TOL.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "tpkgbgbx": {
+    "decimal_factor": 1000,
+    "name": "TPK.GB/GBX",
+    "start_tick": "2016-07-08"
+  },
+  "tprususd": {
+    "decimal_factor": 1000,
+    "name": "TPR.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "tpxususd": {
+    "decimal_factor": 1000,
+    "name": "TPX.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "trgpususd": {
+    "decimal_factor": 1000,
+    "name": "TRGP.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "trmbususd": {
+    "decimal_factor": 1000,
+    "name": "TRMB.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "trniteur": {
+    "decimal_factor": 1000,
+    "name": "TRN.IT/EUR",
+    "start_tick": "2020-12-17"
+  },
+  "trowususd": {
+    "decimal_factor": 1000,
+    "name": "TROW.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "truususd": {
+    "decimal_factor": 1000,
+    "name": "TRU.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "trvususd": {
+    "decimal_factor": 1000,
+    "name": "TRV.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "trxusd": {
+    "decimal_factor": 100000,
+    "name": "TRX/USD",
+    "start_tick": "2019-08-04"
+  },
+  "tryhuf": {
+    "decimal_factor": 1000,
+    "name": "TRY/HUF",
+    "start_tick": "2024-05-15"
+  },
+  "tryjpy": {
+    "decimal_factor": 1000,
+    "name": "TRY/JPY",
+    "start_tick": "2010-05-09"
+  },
+  "trythb": {
+    "decimal_factor": 100000,
+    "name": "TRY/THB",
+    "start_tick": "2024-09-16"
+  },
+  "tscogbgbx": {
+    "decimal_factor": 1000,
+    "name": "TSCO.GB/GBX",
+    "start_tick": "2016-07-08"
+  },
+  "tslaususd": {
+    "decimal_factor": 1000,
+    "name": "TSLA.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "tsmususd": {
+    "decimal_factor": 1000,
+    "name": "TSM.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "tsnususd": {
+    "decimal_factor": 1000,
+    "name": "TSN.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "ttdususd": {
+    "decimal_factor": 1000,
+    "name": "TTD.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "ttususd": {
+    "decimal_factor": 1000,
+    "name": "TT.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "ttwoususd": {
+    "decimal_factor": 1000,
+    "name": "TTWO.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "tui1deeur": {
+    "decimal_factor": 1000,
+    "name": "TUI1.DE/EUR",
+    "start_tick": "2015-04-15"
+  },
+  "tususd": {
+    "decimal_factor": 1000,
+    "name": "T.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "twgbgbx": {
+    "decimal_factor": 1000,
+    "name": "TW.GB/GBX",
+    "start_tick": "2022-06-14"
+  },
+  "twloususd": {
+    "decimal_factor": 1000,
+    "name": "TWLO.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "twtrususd": {
+    "decimal_factor": 1000,
+    "name": "TWTR.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "txnususd": {
+    "decimal_factor": 1000,
+    "name": "TXN.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "tylususd": {
+    "decimal_factor": 1000,
+    "name": "TYL.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "uaaususd": {
+    "decimal_factor": 1000,
+    "name": "UAA.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "ualususd": {
+    "decimal_factor": 1000,
+    "name": "VTRS.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "uaususd": {
+    "decimal_factor": 1000,
+    "name": "UA.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "uberususd": {
+    "decimal_factor": 1000,
+    "name": "UBER.US/USD",
+    "start_tick": "2020-10-01"
+  },
+  "ubsgchchf": {
+    "decimal_factor": 1000,
+    "name": "UBSG.CH/CHF",
+    "start_tick": "2015-06-15"
+  },
+  "ucbbeeur": {
+    "decimal_factor": 1000,
+    "name": "UCB.BE/EUR",
+    "start_tick": "2016-11-07"
+  },
+  "ucgiteur": {
+    "decimal_factor": 1000,
+    "name": "UCG.IT/EUR",
+    "start_tick": "2020-12-17"
+  },
+  "udrususd": {
+    "decimal_factor": 1000,
+    "name": "UDR.US/USD",
+    "start_tick": "2022-05-19"
+  },
+  "ugfreur": {
+    "decimal_factor": 1000,
+    "name": "UG.FR/EUR",
+    "start_tick": "2016-08-05"
+  },
+  "ugiususd": {
+    "decimal_factor": 1000,
+    "name": "UGI.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "uhrchchf": {
+    "decimal_factor": 1000,
+    "name": "UHR.CH/CHF",
+    "start_tick": "2015-08-07"
+  },
+  "uhrnchchf": {
+    "decimal_factor": 1000,
+    "name": "UHRN.CH/CHF",
+    "start_tick": "2022-06-14"
+  },
+  "uhsususd": {
+    "decimal_factor": 1000,
+    "name": "UHS.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "ukgilttrgbp": {
+    "decimal_factor": 1000,
+    "name": "UKGILT.TR/GBP",
+    "start_tick": "2017-12-28"
+  },
+  "ultaususd": {
+    "decimal_factor": 1000,
+    "name": "ULTA.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "ulvrgbgbx": {
+    "decimal_factor": 1000,
+    "name": "ULVR.GB/GBX",
+    "start_tick": "2016-07-06"
+  },
+  "umibeeur": {
+    "decimal_factor": 1000,
+    "name": "UMI.BE/EUR",
+    "start_tick": "2016-11-07"
+  },
+  "unanleur": {
+    "decimal_factor": 1000,
+    "name": "UNA.NL/EUR",
+    "start_tick": "2016-11-14"
+  },
+  "unhususd": {
+    "decimal_factor": 1000,
+    "name": "UNH.US/USD",
+    "start_tick": "2017-11-02"
+  },
+  "uniusd": {
+    "decimal_factor": 1000,
+    "name": "UNI/USD",
+    "start_tick": "2000-01-01"
+  },
+  "unpususd": {
+    "decimal_factor": 1000,
+    "name": "UNP.US/USD",
+    "start_tick": "2017-11-15"
+  },
+  "upsususd": {
+    "decimal_factor": 1000,
+    "name": "UPS.US/USD",
+    "start_tick": "2017-11-15"
+  },
+  "uriususd": {
+    "decimal_factor": 1000,
+    "name": "URI.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "usa30idxusd": {
+    "decimal_factor": 1000,
+    "name": "USA30.IDX/USD",
+    "start_tick": "2013-01-01"
+  },
+  "usa500idxusd": {
+    "decimal_factor": 1000,
+    "name": "USA500.IDX/USD",
+    "start_tick": "2012-01-16"
+  },
+  "usatechidxusd": {
+    "decimal_factor": 1000,
+    "name": "USATECH.IDX/USD",
+    "start_tick": "2013-01-01"
+  },
+  "usbususd": {
+    "decimal_factor": 1000,
+    "name": "USB.US/USD",
+    "start_tick": "2017-11-15"
+  },
+  "usdaed": {
+    "decimal_factor": 100,
+    "name": "USD/AED",
+    "start_tick": "2024-03-22"
+  },
+  "usdcad": {
+    "decimal_factor": 100000,
+    "name": "USD/CAD",
+    "start_tick": "2003-08-03"
+  },
+  "usdchf": {
+    "decimal_factor": 100000,
+    "name": "USD/CHF",
+    "start_tick": "2003-05-04"
+  },
+  "usdcnh": {
+    "decimal_factor": 100000,
+    "name": "USD/CNH",
+    "start_tick": "2012-06-27"
+  },
+  "usdczk": {
+    "decimal_factor": 10000,
+    "name": "USD/CZK",
+    "start_tick": "2016-01-03"
+  },
+  "usddkk": {
+    "decimal_factor": 100000,
+    "name": "USD/DKK",
+    "start_tick": "2003-08-04"
+  },
+  "usdhkd": {
+    "decimal_factor": 100000,
+    "name": "USD/HKD",
+    "start_tick": "2007-03-13"
+  },
+  "usdhuf": {
+    "decimal_factor": 1000,
+    "name": "USD/HUF",
+    "start_tick": "2007-03-13"
+  },
+  "usdils": {
+    "decimal_factor": 100000,
+    "name": "USD/ILS",
+    "start_tick": "2016-12-15"
+  },
+  "usdjpy": {
+    "decimal_factor": 1000,
+    "name": "USD/JPY",
+    "start_tick": "2003-05-04"
+  },
+  "usdmxn": {
+    "decimal_factor": 100000,
+    "name": "USD/MXN",
+    "start_tick": "2007-03-13"
+  },
+  "usdnok": {
+    "decimal_factor": 100000,
+    "name": "USD/NOK",
+    "start_tick": "2003-08-04"
+  },
+  "usdpln": {
+    "decimal_factor": 100000,
+    "name": "USD/PLN",
+    "start_tick": "2007-03-13"
+  },
+  "usdron": {
+    "decimal_factor": 100000,
+    "name": "USD/RON",
+    "start_tick": "2016-12-19"
+  },
+  "usdsar": {
+    "decimal_factor": 100,
+    "name": "USD/SAR",
+    "start_tick": "2024-03-25"
+  },
+  "usdsek": {
+    "decimal_factor": 100000,
+    "name": "USD/SEK",
+    "start_tick": "2003-08-04"
+  },
+  "usdsgd": {
+    "decimal_factor": 100000,
+    "name": "USD/SGD",
+    "start_tick": "2004-11-16"
+  },
+  "usdthb": {
+    "decimal_factor": 10000,
+    "name": "USD/THB",
+    "start_tick": "2017-02-13"
+  },
+  "usdtry": {
+    "decimal_factor": 100000,
+    "name": "USD/TRY",
+    "start_tick": "2007-03-13"
+  },
+  "usdzar": {
+    "decimal_factor": 100000,
+    "name": "USD/ZAR",
+    "start_tick": "2003-08-04"
+  },
+  "usfdususd": {
+    "decimal_factor": 1000,
+    "name": "USFD.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "usiteur": {
+    "decimal_factor": 1000,
+    "name": "US.IT/EUR",
+    "start_tick": "2020-12-17"
+  },
+  "usoususd": {
+    "decimal_factor": 1000,
+    "name": "USO.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "ussc2000idxusd": {
+    "decimal_factor": 1000,
+    "name": "USSC2000.IDX/USD",
+    "start_tick": "2018-08-08"
+  },
+  "ustbondtrusd": {
+    "decimal_factor": 1000,
+    "name": "USTBOND.TR/USD",
+    "start_tick": "2018-12-18"
+  },
+  "uthrususd": {
+    "decimal_factor": 1000,
+    "name": "UTHR.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "uugbgbx": {
+    "decimal_factor": 1000,
+    "name": "UU.GB/GBX",
+    "start_tick": "2016-07-08"
+  },
+  "valeususd": {
+    "decimal_factor": 1000,
+    "name": "VALE.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "vdeususd": {
+    "decimal_factor": 1000,
+    "name": "VDE.US/USD",
+    "start_tick": "2024-11-29"
+  },
+  "veaususd": {
+    "decimal_factor": 1000,
+    "name": "VEA.US/USD",
+    "start_tick": "2017-11-15"
+  },
+  "veevususd": {
+    "decimal_factor": 1000,
+    "name": "VEEV.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "vfcususd": {
+    "decimal_factor": 1000,
+    "name": "VFC.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "vgkususd": {
+    "decimal_factor": 1000,
+    "name": "VGK.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "viciususd": {
+    "decimal_factor": 1000,
+    "name": "VICI.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "viefreur": {
+    "decimal_factor": 1000,
+    "name": "VIE.FR/EUR",
+    "start_tick": "2016-08-05"
+  },
+  "vifnchchf": {
+    "decimal_factor": 1000,
+    "name": "VIFN.CH/CHF",
+    "start_tick": "2022-06-14"
+  },
+  "virtususd": {
+    "decimal_factor": 1000,
+    "name": "VIRT.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "viseseur": {
+    "decimal_factor": 1000,
+    "name": "VIS.ES/EUR",
+    "start_tick": "2022-05-11"
+  },
+  "vivfreur": {
+    "decimal_factor": 1000,
+    "name": "VIV.FR/EUR",
+    "start_tick": "2016-08-05"
+  },
+  "vkfreur": {
+    "decimal_factor": 1000,
+    "name": "VK.FR/EUR",
+    "start_tick": "2016-08-05"
+  },
+  "vloususd": {
+    "decimal_factor": 1000,
+    "name": "VLO.US/USD",
+    "start_tick": "2017-11-15"
+  },
+  "vmcususd": {
+    "decimal_factor": 1000,
+    "name": "VMC.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "vmwususd": {
+    "decimal_factor": 1000,
+    "name": "VMW.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "vnadeeur": {
+    "decimal_factor": 1000,
+    "name": "VNA.DE/EUR",
+    "start_tick": "2015-04-14"
+  },
+  "vnqususd": {
+    "decimal_factor": 1000,
+    "name": "VNQ.US/USD",
+    "start_tick": "2017-11-15"
+  },
+  "vodgbgbx": {
+    "decimal_factor": 1000,
+    "name": "VOD.GB/GBX",
+    "start_tick": "2016-07-07"
+  },
+  "voeateur": {
+    "decimal_factor": 1000,
+    "name": "VOE.AT/EUR",
+    "start_tick": "2016-11-15"
+  },
+  "volaramxmxn": {
+    "decimal_factor": 1000,
+    "name": "VOLARA.MX/MXN",
+    "start_tick": "2022-10-13"
+  },
+  "volidxusd": {
+    "decimal_factor": 100,
+    "name": "VOL.IDX/USD",
+    "start_tick": "2022-10-05"
+  },
+  "volvbsesek": {
+    "decimal_factor": 1000,
+    "name": "VOLVB.SE/SEK",
+    "start_tick": "2016-11-07"
+  },
+  "vow3deeur": {
+    "decimal_factor": 1000,
+    "name": "VOW3.DE/EUR",
+    "start_tick": "2015-04-14"
+  },
+  "voyaususd": {
+    "decimal_factor": 1000,
+    "name": "VOYA.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "vpknleur": {
+    "decimal_factor": 1000,
+    "name": "VPK.NL/EUR",
+    "start_tick": "2016-11-14"
+  },
+  "vrtxususd": {
+    "decimal_factor": 1000,
+    "name": "VRTX.US/USD",
+    "start_tick": "2017-11-15"
+  },
+  "vstususd": {
+    "decimal_factor": 1000,
+    "name": "VST.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "vukggbgbp": {
+    "decimal_factor": 1000,
+    "name": "VUKG.GB/GBP",
+    "start_tick": "2025-02-26"
+  },
+  "vususd": {
+    "decimal_factor": 1000,
+    "name": "V.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "vwrpgbgbp": {
+    "decimal_factor": 1000,
+    "name": "VWRP.GB/GBP",
+    "start_tick": "2025-02-26"
+  },
+  "vwsdkdkk": {
+    "decimal_factor": 1000,
+    "name": "VWS.DK/DKK",
+    "start_tick": "2016-11-08"
+  },
+  "vxxususd": {
+    "decimal_factor": 1000,
+    "name": "VXX.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "vzususd": {
+    "decimal_factor": 1000,
+    "name": "VZ.US/USD",
+    "start_tick": "2017-11-15"
+  },
+  "wabususd": {
+    "decimal_factor": 1000,
+    "name": "WAB.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "walmexmxmxn": {
+    "decimal_factor": 1000,
+    "name": "WALMEX.MX/MXN",
+    "start_tick": "2022-10-13"
+  },
+  "walususd": {
+    "decimal_factor": 1000,
+    "name": "WAL.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "wbaususd": {
+    "decimal_factor": 1000,
+    "name": "WBA.US/USD",
+    "start_tick": "2017-11-15"
+  },
+  "wbditeur": {
+    "decimal_factor": 1000,
+    "name": "WBD.IT/EUR",
+    "start_tick": "2020-12-17"
+  },
+  "wbsususd": {
+    "decimal_factor": 1000,
+    "name": "WBS.US/USD",
+    "start_tick": "2022-05-16"
+  },
+  "wdayususd": {
+    "decimal_factor": 1000,
+    "name": "WDAY.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "wdcususd": {
+    "decimal_factor": 1000,
+    "name": "WDC.US/USD",
+    "start_tick": "2017-11-15"
+  },
+  "weirgbgbx": {
+    "decimal_factor": 1000,
+    "name": "WEIR.GB/GBX",
+    "start_tick": "2016-07-08"
+  },
+  "wenususd": {
+    "decimal_factor": 1000,
+    "name": "WEN.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "wexususd": {
+    "decimal_factor": 1000,
+    "name": "WEX.US/USD",
+    "start_tick": "2022-06-15"
+  },
+  "wfcususd": {
+    "decimal_factor": 1000,
+    "name": "WFC.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "whrususd": {
+    "decimal_factor": 1000,
+    "name": "WHR.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "whususd": {
+    "decimal_factor": 1000,
+    "name": "WH.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "wklnleur": {
+    "decimal_factor": 1000,
+    "name": "WKL.NL/EUR",
+    "start_tick": "2016-11-14"
+  },
+  "wlkususd": {
+    "decimal_factor": 1000,
+    "name": "WLK.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "wmtususd": {
+    "decimal_factor": 1000,
+    "name": "WMT.US/USD",
+    "start_tick": "2017-11-15"
+  },
+  "wosgbgbx": {
+    "decimal_factor": 1000,
+    "name": "WOS.GB/GBX",
+    "start_tick": "2016-07-06"
+  },
+  "wpcususd": {
+    "decimal_factor": 1000,
+    "name": "WPC.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "wppgbgbx": {
+    "decimal_factor": 1000,
+    "name": "WPP.GB/GBX",
+    "start_tick": "2016-07-08"
+  },
+  "wrbususd": {
+    "decimal_factor": 1000,
+    "name": "WRB.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "wrkususd": {
+    "decimal_factor": 1000,
+    "name": "WRK.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "wsmlgbusd": {
+    "decimal_factor": 1000,
+    "name": "WSML.GB/USD",
+    "start_tick": "2025-02-26"
+  },
+  "wsmususd": {
+    "decimal_factor": 1000,
+    "name": "WSM.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "wsoususd": {
+    "decimal_factor": 1000,
+    "name": "WSO.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "wstususd": {
+    "decimal_factor": 1000,
+    "name": "WST.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "wtaiususd": {
+    "decimal_factor": 1000,
+    "name": "WTAI.US/USD",
+    "start_tick": "2024-10-22"
+  },
+  "wtbgbgbx": {
+    "decimal_factor": 1000,
+    "name": "WTB.GB/GBX",
+    "start_tick": "2016-07-06"
+  },
+  "wtrgususd": {
+    "decimal_factor": 1000,
+    "name": "WTRG.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "wtwususd": {
+    "decimal_factor": 1000,
+    "name": "WTW.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "wususd": {
+    "decimal_factor": 1000,
+    "name": "W.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "wwdususd": {
+    "decimal_factor": 1000,
+    "name": "WWD.US/USD",
+    "start_tick": "2022-05-16"
+  },
+  "wynnususd": {
+    "decimal_factor": 1000,
+    "name": "WYNN.US/USD",
+    "start_tick": "2017-11-15"
+  },
+  "xagaed": {
+    "decimal_factor": 1000,
+    "name": "XAG/AED",
+    "start_tick": "2024-09-17"
+  },
+  "xagaud": {
+    "decimal_factor": 1000,
+    "name": "XAG/AUD",
+    "start_tick": "2011-09-19"
+  },
+  "xagcad": {
+    "decimal_factor": 1000,
+    "name": "XAG/CAD",
+    "start_tick": "2024-05-15"
+  },
+  "xagchf": {
+    "decimal_factor": 1000,
+    "name": "XAG/CHF",
+    "start_tick": "2023-03-14"
+  },
+  "xagcnh": {
+    "decimal_factor": 1000,
+    "name": "XAG/CNH",
+    "start_tick": "2024-09-17"
+  },
+  "xagczk": {
+    "decimal_factor": 1000,
+    "name": "XAG/CZK",
+    "start_tick": "2024-05-15"
+  },
+  "xagdkk": {
+    "decimal_factor": 1000,
+    "name": "XAG/DKK",
+    "start_tick": "2011-09-19"
+  },
+  "xageur": {
+    "decimal_factor": 1000,
+    "name": "XAG/EUR",
+    "start_tick": "2011-09-19"
+  },
+  "xaggbp": {
+    "decimal_factor": 1000,
+    "name": "XAG/GBP",
+    "start_tick": "2011-09-19"
+  },
+  "xaghkd": {
+    "decimal_factor": 1000,
+    "name": "XAG/HKD",
+    "start_tick": "2011-09-19"
+  },
+  "xaghuf": {
+    "decimal_factor": 1000,
+    "name": "XAG/HUF",
+    "start_tick": "2024-05-15"
+  },
+  "xagils": {
+    "decimal_factor": 1000,
+    "name": "XAG/ILS",
+    "start_tick": "2024-09-17"
+  },
+  "xagjpy": {
+    "decimal_factor": 1000,
+    "name": "XAG/JPY",
+    "start_tick": "2024-09-17"
+  },
+  "xagmxn": {
+    "decimal_factor": 1000,
+    "name": "XAG/MXN",
+    "start_tick": "2011-09-19"
+  },
+  "xagnok": {
+    "decimal_factor": 1000,
+    "name": "XAG/NOK",
+    "start_tick": "2024-05-15"
+  },
+  "xagnzd": {
+    "decimal_factor": 1000,
+    "name": "XAG/NZD",
+    "start_tick": "2011-09-19"
+  },
+  "xagpln": {
+    "decimal_factor": 1000,
+    "name": "XAG/PLN",
+    "start_tick": "2024-05-15"
+  },
+  "xagron": {
+    "decimal_factor": 1000,
+    "name": "XAG/RON",
+    "start_tick": "2024-09-17"
+  },
+  "xagsar": {
+    "decimal_factor": 1000,
+    "name": "XAG/SAR",
+    "start_tick": "2024-09-17"
+  },
+  "xagsek": {
+    "decimal_factor": 1000,
+    "name": "XAG/SEK",
+    "start_tick": "2011-09-18"
+  },
+  "xagsgd": {
+    "decimal_factor": 1000,
+    "name": "XAG/SGD",
+    "start_tick": "2011-09-19"
+  },
+  "xagthb": {
+    "decimal_factor": 1000,
+    "name": "XAG/THB",
+    "start_tick": "2024-09-17"
+  },
+  "xagtry": {
+    "decimal_factor": 1000,
+    "name": "XAG/TRY",
+    "start_tick": "2011-09-19"
+  },
+  "xagusd": {
+    "decimal_factor": 1000,
+    "name": "XAG/USD",
+    "start_tick": "2003-05-04"
+  },
+  "xagzar": {
+    "decimal_factor": 1000,
+    "name": "XAG/ZAR",
+    "start_tick": "2024-09-17"
+  },
+  "xauaed": {
+    "decimal_factor": 1000,
+    "name": "XAU/AED",
+    "start_tick": "2024-09-17"
+  },
+  "xauaud": {
+    "decimal_factor": 1000,
+    "name": "XAU/AUD",
+    "start_tick": "2024-05-15"
+  },
+  "xaucad": {
+    "decimal_factor": 1000,
+    "name": "XAU/CAD",
+    "start_tick": "2024-05-15"
+  },
+  "xauchf": {
+    "decimal_factor": 1000,
+    "name": "XAU/CHF",
+    "start_tick": "2023-03-14"
+  },
+  "xaucnh": {
+    "decimal_factor": 1000,
+    "name": "XAU/CNH",
+    "start_tick": "2024-09-17"
+  },
+  "xauczk": {
+    "decimal_factor": 10,
+    "name": "XAU/CZK",
+    "start_tick": "2024-05-15"
+  },
+  "xaudkk": {
+    "decimal_factor": 1000,
+    "name": "XAU/DKK",
+    "start_tick": "2024-05-15"
+  },
+  "xaueur": {
+    "decimal_factor": 1000,
+    "name": "XAU/EUR",
+    "start_tick": "2023-03-14"
+  },
+  "xaugbp": {
+    "decimal_factor": 1000,
+    "name": "XAU/GBP",
+    "start_tick": "2023-03-14"
+  },
+  "xauhkd": {
+    "decimal_factor": 1000,
+    "name": "XAU/HKD",
+    "start_tick": "2024-05-15"
+  },
+  "xauhuf": {
+    "decimal_factor": 10,
+    "name": "XAU/HUF",
+    "start_tick": "2024-05-15"
+  },
+  "xauils": {
+    "decimal_factor": 1000,
+    "name": "XAU/ILS",
+    "start_tick": "2024-09-17"
+  },
+  "xaujpy": {
+    "decimal_factor": 10,
+    "name": "XAU/JPY",
+    "start_tick": "2024-09-17"
+  },
+  "xaumxn": {
+    "decimal_factor": 10,
+    "name": "XAU/MXN",
+    "start_tick": "2024-05-15"
+  },
+  "xaunok": {
+    "decimal_factor": 1000,
+    "name": "XAU/NOK",
+    "start_tick": "2024-05-15"
+  },
+  "xaunzd": {
+    "decimal_factor": 1000,
+    "name": "XAU/NZD",
+    "start_tick": "2024-05-15"
+  },
+  "xaupln": {
+    "decimal_factor": 1000,
+    "name": "XAU/PLN",
+    "start_tick": "2024-05-15"
+  },
+  "xauron": {
+    "decimal_factor": 1000,
+    "name": "XAU/RON",
+    "start_tick": "2024-09-17"
+  },
+  "xausar": {
+    "decimal_factor": 1000,
+    "name": "XAU/SAR",
+    "start_tick": "2024-09-17"
+  },
+  "xausek": {
+    "decimal_factor": 1000,
+    "name": "XAU/SEK",
+    "start_tick": "2024-05-15"
+  },
+  "xausgd": {
+    "decimal_factor": 1000,
+    "name": "XAU/SGD",
+    "start_tick": "2024-05-15"
+  },
+  "xauthb": {
+    "decimal_factor": 10,
+    "name": "XAU/THB",
+    "start_tick": "2024-09-17"
+  },
+  "xautry": {
+    "decimal_factor": 10,
+    "name": "XAU/TRY",
+    "start_tick": "2024-05-15"
+  },
+  "xauusd": {
+    "decimal_factor": 1000,
+    "name": "XAU/USD",
+    "start_tick": "2003-05-05"
+  },
+  "xauxag": {
+    "decimal_factor": 100000,
+    "name": "XAU/XAG",
+    "start_tick": "2024-09-17"
+  },
+  "xauzar": {
+    "decimal_factor": 10,
+    "name": "XAU/ZAR",
+    "start_tick": "2024-09-17"
+  },
+  "xdergbgbx": {
+    "decimal_factor": 1000,
+    "name": "XDER.GB/GBX",
+    "start_tick": "2024-10-22"
+  },
+  "xdwhususd": {
+    "decimal_factor": 1000,
+    "name": "XDWH.US/USD",
+    "start_tick": "2024-10-21"
+  },
+  "xdwtususd": {
+    "decimal_factor": 1000,
+    "name": "XDWT.US/USD",
+    "start_tick": "2024-10-24"
+  },
+  "xleususd": {
+    "decimal_factor": 1000,
+    "name": "XLE.US/USD",
+    "start_tick": "2017-11-15"
+  },
+  "xlfususd": {
+    "decimal_factor": 1000,
+    "name": "XLF.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "xliususd": {
+    "decimal_factor": 1000,
+    "name": "XLI.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "xlkususd": {
+    "decimal_factor": 1000,
+    "name": "XLK.US/USD",
+    "start_tick": "2017-11-15"
+  },
+  "xlmchf": {
+    "decimal_factor": 100000,
+    "name": "XLM/CHF",
+    "start_tick": "2023-03-14"
+  },
+  "xlmeur": {
+    "decimal_factor": 100000,
+    "name": "XLM/EUR",
+    "start_tick": "2023-03-14"
+  },
+  "xlmgbp": {
+    "decimal_factor": 100000,
+    "name": "XLM/GBP",
+    "start_tick": "2023-03-14"
+  },
+  "xlmusd": {
+    "decimal_factor": 100000,
+    "name": "XLM/USD",
+    "start_tick": "2000-01-01"
+  },
+  "xlnxususd": {
+    "decimal_factor": 1000,
+    "name": "XLNX.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "xlpususd": {
+    "decimal_factor": 1000,
+    "name": "XLP.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "xluususd": {
+    "decimal_factor": 1000,
+    "name": "XLU.US/USD",
+    "start_tick": "2017-11-15"
+  },
+  "xlvususd": {
+    "decimal_factor": 1000,
+    "name": "XLV.US/USD",
+    "start_tick": "2017-11-15"
+  },
+  "xlyususd": {
+    "decimal_factor": 1000,
+    "name": "XLY.US/USD",
+    "start_tick": "2017-11-15"
+  },
+  "xnaqgbgbp": {
+    "decimal_factor": 1000,
+    "name": "XNAQ.GB/GBP",
+    "start_tick": "2025-02-26"
+  },
+  "xomususd": {
+    "decimal_factor": 1000,
+    "name": "XOM.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "xopususd": {
+    "decimal_factor": 1000,
+    "name": "XOP.US/USD",
+    "start_tick": "2017-01-26"
+  },
+  "xpdcmdusd": {
+    "decimal_factor": 1000,
+    "name": "XPD.CMD/USD",
+    "start_tick": "2021-07-04"
+  },
+  "xpevususd": {
+    "decimal_factor": 1000,
+    "name": "XPEV.US/USD",
+    "start_tick": "2020-12-23"
+  },
+  "xpoususd": {
+    "decimal_factor": 1000,
+    "name": "XPO.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "xptcmdusd": {
+    "decimal_factor": 1000,
+    "name": "XPT.CMD/USD",
+    "start_tick": "2021-11-01"
+  },
+  "xresususd": {
+    "decimal_factor": 1000,
+    "name": "XRES.US/USD",
+    "start_tick": "2024-10-24"
+  },
+  "xs6rgbgbx": {
+    "decimal_factor": 1000,
+    "name": "XS6R.GB/GBX",
+    "start_tick": "2025-02-26"
+  },
+  "xususd": {
+    "decimal_factor": 1000,
+    "name": "X.US/USD",
+    "start_tick": "2017-11-15"
+  },
+  "xylususd": {
+    "decimal_factor": 1000,
+    "name": "XYL.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "yfiusd": {
+    "decimal_factor": 10,
+    "name": "YFI/USD",
+    "start_tick": "2000-01-01"
+  },
+  "yumcususd": {
+    "decimal_factor": 1000,
+    "name": "YUMC.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "yumususd": {
+    "decimal_factor": 1000,
+    "name": "YUM.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "yususd": {
+    "decimal_factor": 1000,
+    "name": "Y.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "zarczk": {
+    "decimal_factor": 10000,
+    "name": "ZAR/CZK",
+    "start_tick": "2024-05-15"
+  },
+  "zarhuf": {
+    "decimal_factor": 1000,
+    "name": "ZAR/HUF",
+    "start_tick": "2024-05-15"
+  },
+  "zarjpy": {
+    "decimal_factor": 1000,
+    "name": "ZAR/JPY",
+    "start_tick": "2007-06-04"
+  },
+  "zarmxn": {
+    "decimal_factor": 100000,
+    "name": "ZAR/MXN",
+    "start_tick": "2024-05-15"
+  },
+  "zarthb": {
+    "decimal_factor": 1000,
+    "name": "ZAR/THB",
+    "start_tick": "2024-09-17"
+  },
+  "zartry": {
+    "decimal_factor": 100000,
+    "name": "ZAR/TRY",
+    "start_tick": "2024-05-15"
+  },
+  "zbhususd": {
+    "decimal_factor": 1000,
+    "name": "ZBH.US/USD",
+    "start_tick": "2018-02-01"
+  },
+  "zbraususd": {
+    "decimal_factor": 1000,
+    "name": "ZBRA.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "zenususd": {
+    "decimal_factor": 1000,
+    "name": "ZEN.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "zmususd": {
+    "decimal_factor": 1000,
+    "name": "ZM.US/USD",
+    "start_tick": "2020-09-30"
+  },
+  "zsususd": {
+    "decimal_factor": 1000,
+    "name": "ZS.US/USD",
+    "start_tick": "2022-05-13"
+  },
+  "ztsususd": {
+    "decimal_factor": 1000,
+    "name": "ZTS.US/USD",
+    "start_tick": "2022-05-16"
+  },
+  "zurnchchf": {
+    "decimal_factor": 1000,
+    "name": "ZURN.CH/CHF",
+    "start_tick": "2015-08-07"
+  },
+  "zususd": {
+    "decimal_factor": 1000,
+    "name": "Z.US/USD",
+    "start_tick": "2022-05-13"
+  }
+}

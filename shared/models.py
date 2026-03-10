@@ -1,10 +1,11 @@
 """
 Shared data models for the universal trade format.
 
-Defines the canonical JSON schema as Python dataclasses:
-- TradeExit: A single (partial) exit from a position
-- Trade: One position from entry to full close
-- BacktestMeta: Metadata about a backtest run
+Defines the canonical JSON schema:
+- StrategyMeta: Pydantic model for strategy metadata (validated)
+- TradeExit: A single (partial) exit from a position (dataclass)
+- Trade: One position from entry to full close (dataclass)
+- BacktestMeta: Metadata about a backtest run (dataclass)
 - BacktestResult: Complete backtest output (meta + trades + equity + stats)
 """
 
@@ -17,20 +18,23 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
+from pydantic import BaseModel, ConfigDict, Field
+
 logger = logging.getLogger(__name__)
 
 
 # ─── Strategy metadata ──────────────────────────────────────────────────────
 
 
-@dataclass
-class StrategyMeta:
+class StrategyMeta(BaseModel):
     """Metadaten für eine Strategie (unabhängig vom Backtest)."""
+
+    model_config = ConfigDict(frozen=False)
 
     name: str
     version: str = "1.0.0"
-    parameters: dict[str, Any] = field(default_factory=dict)
-    tags: dict = field(default_factory=dict)
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    tags: dict[str, Any] = Field(default_factory=dict)
     # Tags structure:
     # {
     #     "type": ["mean-reversion", "momentum", "breakout"],

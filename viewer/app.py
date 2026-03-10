@@ -252,7 +252,7 @@ def _load_ohlcv_df(symbol: str, timeframe: str) -> pd.DataFrame | None:
         if "timestamp" in df.columns:
             df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
         return df
-    except Exception as e:
+    except (ValueError, KeyError, pd.errors.EmptyDataError, FileNotFoundError, OSError) as e:
         logger.warning("Could not load OHLCV for %s/%s: %s", symbol, timeframe, e)
         return None
 
@@ -313,7 +313,7 @@ def _load_dukascopy_genesis() -> dict[str, dict[str, str]]:
 
     try:
         data = json.loads(genesis_path.read_text())
-    except Exception as e:
+    except (json.JSONDecodeError, OSError) as e:
         logger.warning("Could not read Dukascopy genesis file %s: %s", genesis_path, e)
         return {}
 
@@ -437,7 +437,7 @@ def _quick_stats_and_equity(
                 point if isinstance(point, EquityPoint) else EquityPoint.from_dict(point)
                 for point in equity_curve
             ]
-        except Exception as exc:
+        except (ValueError, TypeError, KeyError) as exc:
             logger.warning("Could not parse cached equity curve: %s", exc)
             equity_points = []
 
@@ -461,7 +461,7 @@ def _quick_stats_and_equity(
                 initial_capital=initial_capital,
                 equity_curve=equity_points or None,
             )
-        except Exception as exc:
+        except (ValueError, TypeError, KeyError) as exc:
             logger.warning("Could not compute canonical quick stats: %s", exc)
             derived_stats = dict(cached_stats)
 
@@ -574,7 +574,7 @@ def list_backtests():
                         "equity_mini": quick["equity_mini"],
                     }
                 )
-            except Exception as e:
+            except (json.JSONDecodeError, KeyError, ValueError, TypeError, OSError) as e:
                 logger.warning("Could not read %s: %s", f, e)
     return jsonify(results)
 
@@ -588,6 +588,7 @@ def get_backtest(backtest_id: str):
     try:
         return jsonify(result.to_dict())
     except Exception as e:
+        logger.exception("Failed to serialize backtest '%s': %s", backtest_id, e)
         return jsonify({"error": str(e)}), 500
 
 
@@ -664,6 +665,7 @@ def get_backtest_stats(backtest_id: str):
         stats["p_value"] = raw.get("p_value", 1.0)
         return jsonify(stats)
     except Exception as e:
+        logger.exception("Failed to compute stats for '%s': %s", backtest_id, e)
         return jsonify({"error": str(e)}), 500
 
 
@@ -684,7 +686,7 @@ def _detect_indicators(strategy_file: str) -> list[dict]:
         return []
     try:
         source = path.read_text(encoding="utf-8")
-    except Exception:
+    except (FileNotFoundError, OSError):
         return []
 
     import re
@@ -867,7 +869,7 @@ def _compute_indicators(
                             results.append(
                                 _indicator_payload("SuperTrend", "overlay", data, "#22c55e")
                             )
-        except Exception as e:
+        except (ValueError, KeyError, pd.errors.EmptyDataError) as e:
             logger.warning("Indicator %s computation failed: %s", kind, e)
 
     return results
@@ -1023,7 +1025,7 @@ def compare_backtests_endpoint():
                     },
                 }
             )
-        except Exception as e:
+        except (ValueError, TypeError, KeyError) as e:
             logger.warning("Could not load %s for comparison: %s", bt_id, e)
 
     comparison = compare_backtests(strategies)
@@ -1069,7 +1071,7 @@ def _strategy_backtests(entry: StrategyEntry) -> list[dict]:
                     "created_at": bt_meta.get("created_at", ""),
                 }
             )
-        except Exception:
+        except (json.JSONDecodeError, KeyError, ValueError, TypeError, OSError):
             pass
     return backtests
 
@@ -1094,7 +1096,7 @@ def _strategy_portfolios(entry: StrategyEntry) -> list[dict]:
                     "name": pf_data.get("name", ""),
                 }
             )
-        except Exception:
+        except (json.JSONDecodeError, KeyError, OSError):
             pass
     return portfolios
 
@@ -1112,7 +1114,7 @@ def _extract_ast_parameters(file_path: Path) -> dict:
     try:
         source = file_path.read_text(encoding="utf-8", errors="replace")
         tree = ast.parse(source, filename=str(file_path))
-    except Exception:
+    except (FileNotFoundError, OSError, SyntaxError):
         return {}
 
     # --- locate generate_signals FunctionDef ---
@@ -1252,7 +1254,7 @@ def list_strategies():
             payload.pop("backtests", None)
             payload.pop("portfolios", None)
             strategies.append(payload)
-        except Exception as e:
+        except (ValueError, TypeError, KeyError, OSError) as e:
             logger.warning("Could not load strategy %s: %s", entry.relative_file, e)
 
     return jsonify(strategies)
@@ -1310,7 +1312,7 @@ def _dolthub_pull():
                 text=True,
                 timeout=30,
             )
-        except Exception as e:
+        except (subprocess.SubprocessError, OSError) as e:
             app.logger.warning("dolt pull %s failed: %s", repo, e)
 
 
@@ -1323,7 +1325,7 @@ def run_backtest():
     # Auto-pull Dolthub data (non-blocking, best-effort)
     try:
         threading.Thread(target=_dolthub_pull, daemon=True).start()
-    except Exception:
+    except RuntimeError:
         pass
     data = request.get_json()
     if not data:
@@ -1401,7 +1403,7 @@ def run_backtest():
             else:
                 _running_jobs[job_id]["status"] = "failed"
                 _running_jobs[job_id]["error"] = proc.stderr or proc.stdout
-        except Exception as e:
+        except (subprocess.SubprocessError, OSError) as e:
             _running_jobs[job_id]["status"] = "failed"
             _running_jobs[job_id]["error"] = str(e)
 
@@ -1470,7 +1472,7 @@ def list_portfolios():
                     "created_at": data.get("created_at", ""),
                 }
             )
-        except Exception as e:
+        except (json.JSONDecodeError, KeyError, ValueError, TypeError, OSError) as e:
             logger.warning("Could not read portfolio %s: %s", f.name, e)
     return jsonify(portfolios)
 
@@ -1524,7 +1526,7 @@ def create_portfolio():
                         )
                     if matches_input:
                         candidates.append((m.get("created_at", ""), f.stem.replace(".trades", "")))
-                except Exception:
+                except (json.JSONDecodeError, KeyError, OSError):
                     pass
             if candidates:
                 candidates.sort(reverse=True)
@@ -1902,6 +1904,7 @@ def get_log(log_name: str):
             }
         )
     except Exception as e:
+        logger.exception("Failed to read log '%s': %s", log_name, e)
         return jsonify({"error": str(e)}), 500
 
 
@@ -2085,7 +2088,7 @@ def _load_catalog_ohlcv_entries() -> tuple[list[dict], bool]:
     try:
         with open(catalog_path) as f:
             catalog = json.load(f)
-    except Exception:
+    except (json.JSONDecodeError, OSError):
         return [], False
 
     return catalog.get("ohlcv", []), True
@@ -2217,7 +2220,7 @@ def _start_data_task(task_id: str, cmd: list[str], *, total_items: int = 0) -> d
                     )
                     try:
                         _refresh_catalog()
-                    except Exception as exc:
+                    except (json.JSONDecodeError, FileNotFoundError, OSError) as exc:
                         status = "failed"
                         _write_task_log_line(
                             handle,
@@ -2229,13 +2232,13 @@ def _start_data_task(task_id: str, cmd: list[str], *, total_items: int = 0) -> d
                         )
 
                 DATA_TASKS[task_id].update({"status": status, "returncode": returncode})
-        except Exception as exc:
+        except (subprocess.SubprocessError, OSError) as exc:
             DATA_TASKS[task_id].update({"status": "failed", "error": str(exc)})
             _append_task_log(
                 log_file,
                 f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}] Task failed: {exc}\n",
             )
-            logger.error(
+            logger.exception(
                 "Task failed: %s",
                 exc,
                 extra={"data": {"task_id": task_id, "stream": "task", "source": "data-task"}},
@@ -2309,7 +2312,7 @@ def _start_agent_task(task_id: str, payload: dict) -> dict:
                 f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}] "
                 f"Strategy conversion failed: {exc}\n",
             )
-            logger.error(
+            logger.exception(
                 "Strategy conversion failed: %s",
                 exc,
                 extra={"data": {"task_id": task_id, "stream": "task", "source": "agent-task"}},
@@ -2342,7 +2345,7 @@ def _scan_dolthub_repos() -> list[dict]:
             updated_at = datetime.fromtimestamp(
                 repo_path.stat().st_mtime, tz=timezone.utc
             ).isoformat()
-        except Exception:
+        except (OSError, ValueError):
             updated_at = None
         repos.append(
             {
@@ -2379,7 +2382,7 @@ def data_overview():
                 p = Path(entry.get("path", ""))
                 if p.exists():
                     size = p.stat().st_size
-            except Exception:
+            except OSError:
                 pass
         categories[cat]["size_mb"] += size / (1024 * 1024)
         categories[cat]["symbols"].add(entry.get("symbol"))
@@ -2457,7 +2460,7 @@ def data_category_details(category_name):
                     p = Path(entry.get("path", ""))
                     if p.exists():
                         size = p.stat().st_size
-                except Exception:
+                except OSError:
                     pass
             symbol_entry = {
                 "symbol": entry.get("symbol"),
@@ -2531,12 +2534,12 @@ def data_download():
 
     cmd = []
     if source == "dukascopy":
-        # python -m data_tools.downloaders.dukascopy_dl --symbols ...
+        # python -m data_tools.downloaders.dukascopy_native --symbols ...
         cmd = [
             sys.executable,
             "-u",
             "-m",
-            "data_tools.downloaders.dukascopy_dl",
+            "data_tools.downloaders.dukascopy_native",
             "--symbols",
             symbols,
             "--timeframes",
@@ -2716,7 +2719,7 @@ def delete_symbol_data():
         dd = DATA_DIR.resolve()
         if not str(p).startswith(str(dd)):
             return jsonify({"error": "Access denied"}), 403
-    except Exception:
+    except (OSError, ValueError):
         return jsonify({"error": "Invalid path"}), 400
 
     if p.exists():
@@ -2725,7 +2728,7 @@ def delete_symbol_data():
             # Update catalog
             _refresh_catalog()
             return jsonify({"status": "deleted"})
-        except Exception as e:
+        except (FileNotFoundError, OSError) as e:
             return jsonify({"error": str(e)}), 500
     else:
         return jsonify({"error": "File not found"}), 404
