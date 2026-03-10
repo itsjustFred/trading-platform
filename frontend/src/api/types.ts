@@ -91,16 +91,39 @@ export interface Trade {
   nr: number;
   symbol: string;
   direction: string;
-  entry_time: string;
+  entry_time: number;
+  entry_time_iso?: string;
   entry_price: number;
-  exit_time: string;
+  exit_time: number;
+  exit_time_iso?: string;
   exit_price: number;
   quantity: number;
   pnl: number;
   pnl_pct: number;
   duration: string;
-  bars_held: number;
+  bars_held?: number;
+  holding_bars?: number;
   meta?: Record<string, unknown>;
+}
+
+export interface IndicatorPoint {
+  time: number;
+  value: number;
+}
+
+export interface IndicatorStyle {
+  color?: string;
+  lineStyle?: number;
+}
+
+export interface IndicatorSeriesView {
+  name: string;
+  type: "overlay" | "panel" | string;
+  data: IndicatorPoint[];
+  style?: IndicatorStyle;
+  color?: string;
+  lineStyle?: number;
+  pane?: string;
 }
 
 export interface BacktestInfo {
@@ -167,6 +190,41 @@ export interface BacktestListItem {
 
 export interface TradeDetail extends Trade {
   ohlcv: OHLCVBar[];
+}
+
+export interface ChartMarkerDrawing {
+  type: "marker";
+  time: number;
+  position?: "aboveBar" | "belowBar" | "inBar" | string;
+  shape?: "arrowUp" | "arrowDown" | "circle" | "square" | string;
+  color?: string;
+  text?: string;
+  symbol?: string;
+}
+
+export interface ChartLineDrawing {
+  type: "line";
+  start_time: number;
+  end_time: number;
+  val1: number;
+  val2: number;
+  color?: string;
+  symbol?: string;
+  title?: string;
+  lineWidth?: number;
+  lineStyle?: number | "solid" | "dashed" | "dotted";
+}
+
+export type TradeDrawing = ChartMarkerDrawing | ChartLineDrawing;
+
+export interface TradeChartResponse {
+  trade: Trade;
+  ohlcv: OHLCVBar[];
+  symbol: string;
+  timeframe: string;
+  indicators: IndicatorSeriesView[];
+  drawings: TradeDrawing[];
+  total_trades: number;
 }
 
 export interface OHLCVBar {
@@ -351,9 +409,16 @@ export interface DataTaskDeleteResponse {
   status: string;
 }
 
+export type AgentModelId =
+  | "moonshotai/kimi-k2.5"
+  | "meta/llama-3.3-70b-instruct"
+  | "deepseek-ai/deepseek-v3.2"
+  | "qwen/qwen2.5-coder-32b-instruct";
+
 export interface AgentConvertRequest {
   code: string;
   strategy_name?: string;
+  model?: AgentModelId;
 }
 
 export interface CompareResult {

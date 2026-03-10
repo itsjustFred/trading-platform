@@ -148,6 +148,24 @@ def test_trade_detail_includes_meta(viewer_client, tmp_path):
                 meta={"SMA_Fast": 150.2, "Signal_Strength": "High"},
             )
         ],
+        drawings=[
+            {
+                "type": "marker",
+                "time": "2024-01-01T10:00:00+00:00",
+                "position": "belowBar",
+                "shape": "arrowUp",
+                "color": "#3fb950",
+                "text": "SMA Cross",
+            },
+            {
+                "type": "line",
+                "start_time": "2024-01-01T10:00:00+00:00",
+                "end_time": "2024-01-01T12:00:00+00:00",
+                "val1": 101.5,
+                "val2": 103.5,
+                "color": "#58a6ff",
+            },
+        ],
     )
     result.save(backtests_dir / "meta-demo.trades.json")
 
@@ -160,6 +178,10 @@ def test_trade_detail_includes_meta(viewer_client, tmp_path):
         "Signal_Strength": "High",
     }
     assert len(payload["ohlcv"]) > 0
+    assert payload["drawings"][0]["type"] == "marker"
+    assert payload["drawings"][0]["time"] == pytest.approx(1704103200.0)
+    assert payload["drawings"][1]["type"] == "line"
+    assert payload["drawings"][1]["start_time"] == pytest.approx(1704103200.0)
 
 
 def test_data_overview_and_category_use_catalog_date_ranges(viewer_client, tmp_path):
@@ -767,34 +789,46 @@ def test_agent_convert_endpoint_starts_background_agent(viewer_client, monkeypat
 
     captured: dict[str, object] = {}
 
-    def fake_start(task_id: str, payload: dict) -> dict:
+    def fake_queue(task_id: str, payload: dict) -> dict:
         captured["task_id"] = task_id
         captured["payload"] = payload
-        return {"job_id": task_id, "task_id": task_id, "status": "running"}
+        return {"job_id": task_id, "task_id": task_id, "status": "starting"}
 
-    monkeypatch.setattr(viewer_app_module, "_start_agent_task", fake_start)
+    def fake_launch(task_id: str, payload: dict) -> None:
+        captured["launch_task_id"] = task_id
+        captured["launch_payload"] = payload
+
+    monkeypatch.setattr(viewer_app_module, "_queue_agent_task", fake_queue)
+    monkeypatch.setattr(viewer_app_module, "_launch_agent_task", fake_launch)
 
     resp = viewer_client.post(
         "/api/agent/convert",
         json={"code": "//@version=5\nstrategy('x')", "strategy_name": "Signal Forge"},
     )
 
-    assert resp.status_code == 200
+    assert resp.status_code == 202
     assert resp.get_json() == {
         "job_id": captured["task_id"],
         "task_id": captured["task_id"],
-        "status": "running",
+        "status": "starting",
     }
     assert captured["payload"] == {
         "code": "//@version=5\nstrategy('x')",
         "strategy_name": "Signal Forge",
         "engine": None,
+        "model": viewer_app_module.DEFAULT_MODEL_NAME,
         "symbols": None,
         "timeframe": None,
         "start": None,
         "end": None,
         "capital": 100000.0,
     }
+    assert "launch_task_id" not in captured
+
+    resp.close()
+
+    assert captured["launch_task_id"] == captured["task_id"]
+    assert captured["launch_payload"] == captured["payload"]
 
 
 def test_equity_endpoint_rebuilds_curve_from_trades(viewer_client, tmp_path):

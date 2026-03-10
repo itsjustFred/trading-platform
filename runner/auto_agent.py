@@ -35,12 +35,18 @@ STRATEGIES_DIR = DEFAULT_STRATEGIES_DIR
 PROMPT_PATH = PROJECT_ROOT / ".github" / "agents" / "strategy-conversion.md"
 BACKTESTS_DIR = DATA_DIR / "backtests"
 
-MODEL_NAME = "moonshotai/kimi-k2.5"
+DEFAULT_MODEL_NAME = "moonshotai/kimi-k2.5"
+SUPPORTED_MODEL_NAMES = (
+    DEFAULT_MODEL_NAME,
+    "meta/llama-3.3-70b-instruct",
+    "deepseek-ai/deepseek-v3.2",
+    "qwen/qwen2.5-coder-32b-instruct",
+)
 MAX_ITERATIONS = 3
 DEFAULT_CAPITAL = 100_000.0
 DEFAULT_RISK_PCT = 0.01
 ERROR_CONTEXT_LIMIT = 8_000
-OPENAI_TIMEOUT_SECONDS = 300
+OPENAI_TIMEOUT_SECONDS = 600.0
 LONG_CODE_LINE_THRESHOLD = 1000
 
 TIMEFRAME_RANK = {
@@ -98,19 +104,24 @@ def run_auto_agent(
     *,
     strategy_name: str | None = None,
     requested_engine: str | None = None,
+    model: str = DEFAULT_MODEL_NAME,
     symbols: list[str] | None = None,
     timeframe: str | None = None,
     start: str | None = None,
     end: str | None = None,
     capital: float = DEFAULT_CAPITAL,
     max_iterations: int = MAX_ITERATIONS,
-    timeout_seconds: int = OPENAI_TIMEOUT_SECONDS,
+    timeout_seconds: float = OPENAI_TIMEOUT_SECONDS,
     log: TaskLogger | None = None,
 ) -> dict[str, str | int | list[str]]:
     """Convert raw strategy code into a runnable strategy and validate it via backtest."""
     source_code = (code or "").strip()
     if not source_code:
         raise ValueError("Strategy source code is required.")
+
+    selected_model = (model or DEFAULT_MODEL_NAME).strip() or DEFAULT_MODEL_NAME
+    if selected_model not in SUPPORTED_MODEL_NAMES:
+        raise ValueError(f"Unsupported model: {selected_model}")
 
     line_count = source_code.count("\n") + 1
     if line_count >= LONG_CODE_LINE_THRESHOLD:
@@ -135,18 +146,20 @@ def run_auto_agent(
             f"timeframe={target.timeframe} range={target.start}..{target.end}"
         ),
     )
+    _log(log, f"Selected AI model: {selected_model}")
 
     client = OpenAI(
         base_url="https://integrate.api.nvidia.com/v1",
         api_key=api_key,
-        timeout=timeout_seconds,
+        timeout=float(timeout_seconds),
     )
 
     system_prompt = _load_system_prompt()
 
-    _log(log, "Step 1/3: Requesting Markdown documentation from Kimi 2.5.")
+    _log(log, f"Step 1/3: Requesting Markdown documentation from {selected_model}.")
     markdown_response = _run_llm_step(
         client,
+        model=selected_model,
         developer_prompt=_step_one_developer_prompt(requested_engine=requested_engine),
         user_prompt=_step_one_user_prompt(source_code=source_code, strategy_name=strategy_name),
         log=log,
@@ -166,9 +179,10 @@ def run_auto_agent(
     _log(log, f"Selected engine: {engine}")
     _log(log, "✅ Step 1/3: Markdown Documentation created.")
 
-    _log(log, "Step 2/3: Requesting STRATEGY_META from Kimi 2.5.")
+    _log(log, f"Step 2/3: Requesting STRATEGY_META from {selected_model}.")
     meta_response = _run_llm_step(
         client,
+        model=selected_model,
         developer_prompt=_step_two_developer_prompt(),
         user_prompt=_step_two_user_prompt(
             source_code=source_code,
@@ -189,12 +203,16 @@ def run_auto_agent(
     last_error = "Unknown auto-agent failure."
     for attempt in range(1, max_iterations + 1):
         if attempt == 1:
-            _log(log, "Step 3/3: Requesting Python code from Kimi 2.5.")
+            _log(log, f"Step 3/3: Requesting Python code from {selected_model}.")
         else:
-            _log(log, f"Step 3/3: Retry {attempt}/{max_iterations} with validation feedback.")
+            _log(
+                log,
+                f"Step 3/3: Retry {attempt}/{max_iterations} with validation feedback using {selected_model}.",
+            )
 
         python_response = _run_llm_step(
             client,
+            model=selected_model,
             developer_prompt=_step_three_developer_prompt(system_prompt=system_prompt, engine=engine),
             user_prompt=_step_three_user_prompt(
                 source_code=source_code,
@@ -321,12 +339,14 @@ def _step_two_user_prompt(
 
 def _step_three_developer_prompt(*, system_prompt: str, engine: str) -> str:
     engine_guidance = (
-        "Fuer vectorbt muss generate_signals(df, params) genau (entries, exits, indicators_dict) zurueckgeben. "
+        "Fuer vectorbt muss generate_signals(df, params) mindestens (entries, exits, indicators_dict) "
+        "und optional als viertes Element drawings zurueckgeben. "
         "Alle logikrelevanten Entry-/Exit-/Stop-/Trailing-Indikatoren muessen in indicators_dict landen."
         if engine == "vectorbt"
         else (
             "Halte dich strikt an den Contract des gewaehlten Frameworks. Wenn pynecore genutzt wird, liefere bei Bedarf "
-            "zusaetzlich build_trade_context(df, params), damit Trade-Meta angereichert werden kann."
+            "zusaetzlich build_trade_context(df, params) und optional build_drawings(df, params, trades, symbol), "
+            "damit Trade-Meta und Chart-Drawings angereichert werden koennen."
         )
     )
     return (
@@ -357,7 +377,8 @@ def _step_three_user_prompt(
         )
     return (
         "Schreibe nun den vollstaendigen Python Code (mit imports). Die Hauptfunktion MUSS `entries, exits, indicators_dict` "
-        "zurueckgeben (fuer Trade-Meta), wenn das Framework vectorbt ist. Halte dich strikt an die Logik im Markdown.\n"
+        "und optional `drawings` als viertes Rueckgabe-Element liefern, wenn das Framework vectorbt ist. "
+        "Halte dich strikt an die Logik im Markdown.\n"
         f"Framework: {engine}\n\n"
         "Verwende dieses STRATEGY_META unveraendert:\n"
         "```python\n"
@@ -378,13 +399,14 @@ def _step_three_user_prompt(
 def _run_llm_step(
     client: OpenAI,
     *,
+    model: str,
     developer_prompt: str,
     user_prompt: str,
     log: TaskLogger | None,
     step_label: str,
 ) -> str:
     response = client.chat.completions.create(
-        model=MODEL_NAME,
+        model=model,
         messages=[
             {"role": "developer", "content": developer_prompt},
             {"role": "user", "content": user_prompt},

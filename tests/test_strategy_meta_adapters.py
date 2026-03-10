@@ -7,7 +7,12 @@ from pathlib import Path
 import pandas as pd
 
 from runner.engines.base import BacktestConfig
-from runner.engines.pynecore_adapter import _enrich_trades_with_context, _normalize_trade_context
+from runner.engines.pynecore_adapter import (
+    _build_drawings,
+    _enrich_trades_with_context,
+    _load_strategy_artifacts,
+    _normalize_trade_context,
+)
 from runner.engines.vectorbt_adapter import VectorbtAdapter, _resolve_max_leverage
 from shared.models import Trade, TradeExit
 from shared.strategy_registry import DEFAULT_STRATEGIES_DIR, iter_strategy_files
@@ -120,11 +125,13 @@ def test_all_vectorbt_strategies_return_entries_exits_and_indicators_dict():
         module = _load_module(strategy_path)
         output = module.generate_signals(df.copy(), {})
         assert isinstance(output, tuple), strategy_path.name
-        assert len(output) == 3, strategy_path.name
-        entries, exits, indicators = output
+        assert len(output) in {3, 4}, strategy_path.name
+        entries, exits, indicators = output[:3]
         assert len(pd.Series(entries)) == len(df), strategy_path.name
         assert len(pd.Series(exits)) == len(df), strategy_path.name
         assert isinstance(indicators, dict) and indicators, strategy_path.name
+        if len(output) == 4:
+            assert isinstance(output[3], list), strategy_path.name
 
 
 def test_vectorbt_adapter_merges_strategy_meta_parameters(tmp_path: Path):
@@ -260,6 +267,76 @@ def generate_signals(df: pd.DataFrame, params: dict):
     assert trade.pnl == 50.0
 
 
+def test_vectorbt_adapter_persists_custom_drawings(tmp_path: Path):
+    strategy_path = tmp_path / "drawing_strategy.py"
+    strategy_path.write_text(
+        """
+import pandas as pd
+
+def generate_signals(df: pd.DataFrame, params: dict):
+    entries = pd.Series(False, index=df.index)
+    exits = pd.Series(False, index=df.index)
+    entries.iloc[1] = True
+    exits.iloc[3] = True
+    indicators = {"Fast": pd.Series([1, 2, 3, 4, 5], index=df.index)}
+    drawings = [
+        {
+            "type": "marker",
+            "time": df.loc[1, "timestamp"],
+            "position": "belowBar",
+            "shape": "arrowUp",
+            "color": "#3fb950",
+            "text": "Entry",
+        },
+        {
+            "type": "line",
+            "start_time": df.loc[1, "timestamp"],
+            "end_time": df.loc[3, "timestamp"],
+            "val1": 100.0,
+            "val2": 104.0,
+            "color": "#58a6ff",
+        },
+    ]
+    return entries, exits, indicators, drawings
+"""
+    )
+
+    data_root = tmp_path / "data"
+    parquet_dir = data_root / "ohlcv" / "test_source" / "equities" / "AAPL"
+    parquet_dir.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=5, freq="D", tz="UTC"),
+            "open": [100, 101, 102, 103, 104],
+            "high": [101, 102, 103, 104, 105],
+            "low": [99, 100, 101, 102, 103],
+            "close": [100, 101, 102, 103, 104],
+            "volume": [10, 11, 12, 13, 14],
+        }
+    ).to_parquet(parquet_dir / "1d.parquet", index=False)
+
+    result = VectorbtAdapter().run(
+        BacktestConfig(
+            strategy_name="drawing_strategy",
+            symbols=["AAPL"],
+            timeframe="1d",
+            start_date="2024-01-01",
+            end_date="2024-01-05",
+            initial_capital=1000.0,
+            data_dir=str(data_root),
+        ),
+        str(strategy_path),
+    )
+
+    assert len(result.drawings) == 2
+    assert result.drawings[0]["type"] == "marker"
+    assert result.drawings[0]["symbol"] == "AAPL"
+    assert result.drawings[0]["time"] == "2024-01-02T00:00:00+00:00"
+    assert result.drawings[1]["type"] == "line"
+    assert result.drawings[1]["start_time"] == "2024-01-02T00:00:00+00:00"
+    assert result.drawings[1]["end_time"] == "2024-01-04T00:00:00+00:00"
+
+
 def test_default_max_leverage_is_unlevered():
     assert _resolve_max_leverage(None) == 2.0
     assert _resolve_max_leverage(1.0) == 1.0
@@ -305,3 +382,60 @@ def test_pynecore_trade_context_enrichment_promotes_directional_prices():
     assert trade.meta["tp_price"] == 95.0
     assert "sl_price_long" not in trade.meta
     assert "sl_price_short" not in trade.meta
+
+
+def test_pynecore_helper_namespace_supports_build_drawings(tmp_path: Path):
+    strategy_path = tmp_path / "pyne_drawings.py"
+    strategy_path.write_text(
+        """
+STRATEGY_META = {"name": "Pyne Drawings"}
+"""
+    )
+    helper_path = tmp_path / "pyne_drawings_context.py"
+    helper_path.write_text(
+        """
+def build_trade_context(df, params):
+    return {"Fast": df["close"]}
+
+def build_drawings(df, params, trades, symbol):
+    return [
+        {
+            "type": "marker",
+            "time": df.loc[0, "timestamp"],
+            "position": "aboveBar",
+            "shape": "circle",
+            "color": "#f59e0b",
+            "text": f"{symbol}:{len(trades)}",
+        }
+    ]
+"""
+    )
+
+    strategy_name, context_builder, drawings_builder = _load_strategy_artifacts(
+        str(strategy_path),
+        "fallback",
+    )
+    df = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=2, freq="D", tz="UTC"),
+            "close": [100.0, 101.0],
+        }
+    )
+    trade = Trade(
+        id=1,
+        symbol="SPY",
+        direction="LONG",
+        entry_time="2024-01-01T00:00:00+00:00",
+        entry_price=100.0,
+        quantity=1.0,
+        exits=[TradeExit(time="2024-01-02T00:00:00+00:00", price=101.0, quantity=1.0, pnl=1.0)],
+        pnl=1.0,
+    )
+
+    drawings = _build_drawings(drawings_builder, df, {}, [trade], "SPY")
+
+    assert strategy_name == "Pyne Drawings"
+    assert context_builder is not None
+    assert len(drawings) == 1
+    assert drawings[0]["text"] == "SPY:1"
+    assert drawings[0]["symbol"] == "SPY"

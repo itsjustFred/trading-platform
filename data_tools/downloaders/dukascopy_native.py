@@ -47,8 +47,12 @@ class FetchResult:
     dt: datetime
     data: bytes
     throttle_signal: bool = False
+    cooldown_required: bool = False
 
 URL_ROOT = "https://datafeed.dukascopy.com/datafeed"
+
+MAX_BATCH_PAUSE_MS = 10_000
+HARD_COOLDOWN_SECONDS = 15.0
 
 TICK_STRUCT = struct.Struct(">3i2f")  # 20 bytes
 CANDLE_STRUCT = struct.Struct(">5if")  # 24 bytes
@@ -368,7 +372,12 @@ async def _fetch_one(
                             await _sleep_with_control(2 ** attempt, pause_event, stop_event)
                             continue
                         logger.warning("HTTP %d for %s after %d retries", resp.status, url, max_retries)
-                        return FetchResult(dt=dt, data=b"", throttle_signal=throttle_signal)
+                        return FetchResult(
+                            dt=dt,
+                            data=b"",
+                            throttle_signal=throttle_signal,
+                            cooldown_required=throttle_signal,
+                        )
 
                     if _looks_like_invalid_bi5(data):
                         is_weekday = dt.weekday() < 5
@@ -377,7 +386,12 @@ async def _fetch_one(
                         if is_weekday and attempt < max_retries:
                             await _sleep_with_control(2 ** attempt, pause_event, stop_event)
                             continue
-                        return FetchResult(dt=dt, data=b"", throttle_signal=throttle_signal)
+                        return FetchResult(
+                            dt=dt,
+                            data=b"",
+                            throttle_signal=throttle_signal,
+                            cooldown_required=throttle_signal and is_weekday,
+                        )
 
                     return FetchResult(dt=dt, data=data, throttle_signal=throttle_signal)
             except (asyncio.TimeoutError, OSError) as exc:
@@ -407,7 +421,8 @@ async def download_bi5_files(
     import aiohttp
 
     effective_batch_size = max(1, int(batch_size or concurrency or 10))
-    current_pause_ms = max(0, int(pause_ms))
+    base_pause_ms = max(0, int(pause_ms))
+    current_pause_ms = base_pause_ms
     semaphore = asyncio.Semaphore(effective_batch_size)
     results: list[tuple[datetime, bytes]] = []
     total = len(urls)
@@ -423,6 +438,7 @@ async def download_bi5_files(
         try:
             for batch_index, offset in enumerate(range(0, total, effective_batch_size), start=1):
                 await _wait_for_control(pause_event, stop_event)
+                batch_started_at_cap = current_pause_ms >= MAX_BATCH_PAUSE_MS
                 batch = urls[offset : offset + effective_batch_size]
                 tasks = [
                     asyncio.create_task(
@@ -452,9 +468,11 @@ async def download_bi5_files(
                             task.cancel()
 
                 batch_throttled = False
+                cooldown_required = False
                 for result in batch_results:
                     results.append((result.dt, result.data))
                     batch_throttled = batch_throttled or result.throttle_signal
+                    cooldown_required = cooldown_required or result.cooldown_required
                     completed += 1
                     _report_progress(
                         report_progress,
@@ -462,12 +480,21 @@ async def download_bi5_files(
                         f"Downloaded {completed}/{total} files",
                     )
 
-                has_more_batches = completed < total
-                if not has_more_batches:
-                    continue
-
                 if batch_throttled:
-                    current_pause_ms = current_pause_ms * 2 if current_pause_ms > 0 else 1000
+                    next_pause_ms = min(
+                        current_pause_ms * 2 if current_pause_ms > 0 else 1000,
+                        MAX_BATCH_PAUSE_MS,
+                    )
+                    if next_pause_ms == MAX_BATCH_PAUSE_MS and current_pause_ms != MAX_BATCH_PAUSE_MS:
+                        _emit_log_message(
+                            (
+                                "Potential Dukascopy rate-limit detected in batch "
+                                f"{batch_index}; backoff cap reached at {MAX_BATCH_PAUSE_MS} ms."
+                            ),
+                            level="warning",
+                            log_callback=log_callback,
+                        )
+                    current_pause_ms = next_pause_ms
                     _emit_log_message(
                         (
                             "Potential Dukascopy rate-limit detected in batch "
@@ -476,6 +503,23 @@ async def download_bi5_files(
                         level="warning",
                         log_callback=log_callback,
                     )
+
+                if batch_started_at_cap and cooldown_required:
+                    _emit_log_message(
+                        (
+                            "Dukascopy still throttled requests after the 10000 ms backoff cap; "
+                            f"starting {int(HARD_COOLDOWN_SECONDS)}s cooldown and resetting pause."
+                        ),
+                        level="warning",
+                        log_callback=log_callback,
+                    )
+                    await _sleep_with_control(HARD_COOLDOWN_SECONDS, pause_event, stop_event)
+                    current_pause_ms = base_pause_ms
+                    continue
+
+                has_more_batches = completed < total
+                if not has_more_batches:
+                    continue
 
                 await _sleep_with_control(current_pause_ms / 1000.0, pause_event, stop_event)
         except DownloadCancelled:

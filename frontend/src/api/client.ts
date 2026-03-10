@@ -17,6 +17,9 @@ import type {
   RunBacktestStatusResponse,
   StrategyDetail,
   StrategyMeta,
+  Trade,
+  TradeChartResponse,
+  BacktestInfo,
 } from "./types";
 
 const BASE_URL = "/api";
@@ -48,13 +51,13 @@ export const renameStrategy = (name: string, displayName: string) =>
 // Backtests
 export const getBacktests = () => fetchJSON<any[]>("/backtests");
 export const getBacktestInfo = (id: string) =>
-  fetchJSON<any>(`/backtest/${id}/info`);
+  fetchJSON<BacktestInfo>(`/backtest/${id}/info`);
 export const getBacktestStats = (id: string) =>
   fetchJSON<any>(`/backtest/${id}/stats`);
 export const getBacktestTrades = (id: string) =>
-  fetchJSON<any[]>(`/backtest/${id}/trades`);
+  fetchJSON<Trade[]>(`/backtest/${id}/trades`);
 export const getBacktestTrade = (id: string, nr: number) =>
-  fetchJSON<any>(`/backtest/${id}/trade/${nr}`);
+  fetchJSON<TradeChartResponse>(`/backtest/${id}/trade/${nr}`);
 export const getBacktestEquity = (id: string) =>
   fetchJSON<any>(`/backtest/${id}/equity`);
 export const getBacktestOHLCV = (id: string) =>

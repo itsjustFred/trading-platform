@@ -172,3 +172,84 @@ def test_download_bi5_files_batches_and_increases_pause_on_throttle(monkeypatch)
     ]
     assert sleep_calls == [2.0]
     assert any("increasing pause to 2000 ms" in line for line in log_lines)
+
+
+def test_download_bi5_files_caps_backoff_and_resets_after_cooldown(monkeypatch):
+    import data_tools.downloaders.dukascopy_native as native
+
+    class FakeConnector:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+
+    class FakeTimeout:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+
+    class FakeClientSession:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    fake_aiohttp = types.SimpleNamespace(
+        TCPConnector=FakeConnector,
+        ClientTimeout=FakeTimeout,
+        ClientSession=FakeClientSession,
+    )
+    monkeypatch.setitem(sys.modules, "aiohttp", fake_aiohttp)
+
+    sleep_calls: list[float] = []
+    log_lines: list[str] = []
+
+    async def fake_fetch_one(
+        session,
+        dt,
+        url,
+        semaphore,
+        max_retries=3,
+        *,
+        pause_event=None,
+        stop_event=None,
+    ):
+        if url == "u1":
+            return native.FetchResult(dt=dt, data=b"ok", throttle_signal=True)
+        if url == "u2":
+            return native.FetchResult(dt=dt, data=b"ok", throttle_signal=True)
+        if url == "u3":
+            return native.FetchResult(dt=dt, data=b"", throttle_signal=True, cooldown_required=True)
+        return native.FetchResult(dt=dt, data=b"ok")
+
+    async def fake_sleep_with_control(delay_seconds, pause_event, stop_event):
+        sleep_calls.append(delay_seconds)
+
+    monkeypatch.setattr(native, "_fetch_one", fake_fetch_one)
+    monkeypatch.setattr(native, "_sleep_with_control", fake_sleep_with_control)
+
+    start = pd.Timestamp("2024-01-01T00:00:00Z").to_pydatetime()
+    urls = [(start, "u1"), (start, "u2"), (start, "u3"), (start, "u4")]
+
+    results = native.asyncio.run(
+        native.download_bi5_files(
+            urls,
+            batch_size=2,
+            pause_ms=8000,
+            log_callback=log_lines.append,
+        )
+    )
+
+    assert results == [
+        (start, b"ok"),
+        (start, b"ok"),
+        (start, b""),
+        (start, b"ok"),
+    ]
+    assert sleep_calls == [10.0, 15.0]
+    assert any("backoff cap reached at 10000 ms" in line for line in log_lines)
+    assert any("starting 15s cooldown and resetting pause" in line for line in log_lines)

@@ -31,6 +31,7 @@ import signal
 import subprocess
 import sys
 import threading
+import traceback
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -41,7 +42,7 @@ from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 
 from data_tools.catalog_builder import build_catalog, scan_ohlcv
-from runner.auto_agent import run_auto_agent
+from runner.auto_agent import DEFAULT_MODEL_NAME, SUPPORTED_MODEL_NAMES, run_auto_agent
 from runner.stats import compute_stats, compute_stats_for_result
 from shared.models import BacktestResult, EquityPoint, PortfolioStats, Trade
 from shared.strategy_registry import (
@@ -280,6 +281,52 @@ def _df_to_ohlcv_records(df: pd.DataFrame) -> list[dict]:
             }
         )
     return records
+
+
+def _drawing_timestamp_to_unix(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        pass
+
+    ts = pd.to_datetime(value, utc=True, errors="coerce")
+    if pd.isna(ts):
+        return None
+    return float(pd.Timestamp(ts).timestamp())
+
+
+def _drawing_matches_symbol(drawing: dict[str, Any], symbol: str) -> bool:
+    drawing_symbol = drawing.get("symbol")
+    if drawing_symbol in (None, ""):
+        return True
+    return str(drawing_symbol).upper() == symbol.upper()
+
+
+def _drawing_to_viewer(drawing: dict[str, Any]) -> dict[str, Any] | None:
+    drawing_type = str(drawing.get("type", "")).strip()
+    payload = dict(drawing)
+    if drawing_type == "marker":
+        unix_time = _drawing_timestamp_to_unix(drawing.get("time"))
+        if unix_time is None:
+            logger.warning("Skipping drawing marker with invalid time: %s", drawing)
+            return None
+        payload["time"] = unix_time
+        return payload
+
+    if drawing_type == "line":
+        start_time = _drawing_timestamp_to_unix(drawing.get("start_time"))
+        end_time = _drawing_timestamp_to_unix(drawing.get("end_time"))
+        if start_time is None or end_time is None:
+            logger.warning("Skipping drawing line with invalid timestamps: %s", drawing)
+            return None
+        payload["start_time"] = start_time
+        payload["end_time"] = end_time
+        return payload
+
+    logger.warning("Skipping unsupported drawing type %r", drawing_type)
+    return None
 
 
 def _parse_symbol_list(raw_symbols: str) -> list[str]:
@@ -933,8 +980,14 @@ def get_trade_with_context(backtest_id: str, trade_nr: int):
             ohlcv = _df_to_ohlcv_records(df.iloc[ohlcv_start_idx:ohlcv_end_idx])
 
     # Indicators: use embedded ones from backtest JSON, or compute from strategy
-    raw = json.loads((BACKTESTS_DIR / f"{backtest_id}.trades.json").read_text())
-    indicators = raw.get("indicators", [])
+    indicators = [indicator.to_dict() for indicator in result.indicators]
+    drawings = [
+        viewer_drawing
+        for drawing in result.drawings
+        if _drawing_matches_symbol(drawing, trade.symbol)
+        for viewer_drawing in [_drawing_to_viewer(drawing)]
+        if viewer_drawing is not None
+    ]
 
     if not indicators and ohlcv and df is not None:
         # Detect indicators from strategy source and compute them
@@ -962,6 +1015,7 @@ def get_trade_with_context(backtest_id: str, trade_nr: int):
             "symbol": trade.symbol,
             "timeframe": tf,
             "indicators": indicators,
+            "drawings": drawings,
             "total_trades": len(result.trades),
         }
     )
@@ -2185,6 +2239,35 @@ def _write_task_log_line(
     )
 
 
+def _write_task_traceback(
+    handle,
+    task_id: str,
+    traceback_text: str,
+    *,
+    source: str = "data-task",
+) -> None:
+    content = (traceback_text or "").rstrip()
+    if not content:
+        return
+    _write_task_log_line(
+        handle,
+        task_id,
+        f"[{_task_timestamp()}] Full traceback:",
+        stream="stderr",
+        log_level="error",
+        source=source,
+    )
+    for line in content.splitlines():
+        _write_task_log_line(
+            handle,
+            task_id,
+            line,
+            stream="stderr",
+            log_level="error",
+            source=source,
+        )
+
+
 def _new_task_progress(total_items: int = 0) -> dict[str, Any]:
     return {
         "completed": 0,
@@ -2748,8 +2831,8 @@ def _start_dukascopy_task(
     return {"task_id": task_id, "status": "starting"}
 
 
-def _start_agent_task(task_id: str, payload: dict) -> dict:
-    """Launch the autonomous conversion agent inside a streamed background thread."""
+def _queue_agent_task(task_id: str, payload: dict) -> dict:
+    """Register the autonomous conversion agent before the worker thread launches."""
     TASK_LOGS_DIR.mkdir(parents=True, exist_ok=True)
     log_file = _task_log_path(task_id)
     record = _create_task_record(
@@ -2765,6 +2848,13 @@ def _start_agent_task(task_id: str, payload: dict) -> dict:
     )
     with DATA_TASKS_LOCK:
         DATA_TASKS[task_id] = record
+
+    return {"job_id": task_id, "task_id": task_id, "status": record["status"]}
+
+
+def _launch_agent_task(task_id: str, payload: dict) -> None:
+    task = _get_task(task_id)
+    log_file = Path(task.get("log_file", _task_log_path(task_id)) if task else _task_log_path(task_id))
 
     def run_agent() -> None:
         with log_file.open("a", encoding="utf-8", buffering=1) as handle:
@@ -2793,12 +2883,12 @@ def _start_agent_task(task_id: str, payload: dict) -> dict:
                         payload["code"],
                         strategy_name=payload.get("strategy_name"),
                         requested_engine=payload.get("engine"),
+                        model=payload.get("model", DEFAULT_MODEL_NAME),
                         symbols=payload.get("symbols"),
                         timeframe=payload.get("timeframe"),
                         start=payload.get("start"),
                         end=payload.get("end"),
                         capital=_safe_float(payload.get("capital"), 100000.0),
-                        timeout_seconds=300,
                         log=task_log,
                     )
                 _update_task_fields(task_id, result=result)
@@ -2811,6 +2901,7 @@ def _start_agent_task(task_id: str, payload: dict) -> dict:
                 )
                 _mark_task_finished(task_id, status="completed", returncode=0)
             except Exception as exc:
+                traceback_text = traceback.format_exc()
                 _write_task_log_line(
                     handle,
                     task_id,
@@ -2819,6 +2910,7 @@ def _start_agent_task(task_id: str, payload: dict) -> dict:
                     log_level="error",
                     source="agent-task",
                 )
+                _write_task_traceback(handle, task_id, traceback_text, source="agent-task")
                 _mark_task_finished(task_id, status="failed", returncode=1, error=str(exc))
                 logger.exception(
                     "Strategy conversion failed: %s",
@@ -2826,10 +2918,28 @@ def _start_agent_task(task_id: str, payload: dict) -> dict:
                     extra={"data": {"task_id": task_id, "stream": "task", "source": "agent-task"}},
                 )
 
-    thread = threading.Thread(target=run_agent, daemon=True)
+    thread = threading.Thread(target=run_agent, daemon=True, name=f"agent-convert-{task_id[:8]}")
     _update_task_fields(task_id, thread=thread)
-    thread.start()
-    return {"job_id": task_id, "task_id": task_id, "status": "running"}
+    try:
+        thread.start()
+    except Exception as exc:
+        traceback_text = traceback.format_exc()
+        with log_file.open("a", encoding="utf-8", buffering=1) as handle:
+            _write_task_log_line(
+                handle,
+                task_id,
+                f"[{_task_timestamp()}] ❌ Failed to launch strategy conversion worker: {exc}",
+                stream="task",
+                log_level="error",
+                source="agent-task",
+            )
+            _write_task_traceback(handle, task_id, traceback_text, source="agent-task")
+        _mark_task_finished(task_id, status="failed", returncode=1, error=str(exc))
+        logger.exception(
+            "Failed to launch strategy conversion worker: %s",
+            exc,
+            extra={"data": {"task_id": task_id, "stream": "task", "source": "agent-task"}},
+        )
 
 
 def _dolthub_repo_status(repo_path: Path) -> tuple[dict, str]:
@@ -3183,11 +3293,15 @@ def agent_convert():
     code = data.get("code", "")
     if not isinstance(code, str) or not code.strip():
         return jsonify({"error": "A non-empty 'code' field is required"}), 400
+    model = str(data.get("model", "")).strip() or DEFAULT_MODEL_NAME
+    if model not in SUPPORTED_MODEL_NAMES:
+        return jsonify({"error": f"Unsupported model '{model}'"}), 400
 
     payload = {
         "code": code,
         "strategy_name": str(data.get("strategy_name", "")).strip() or None,
         "engine": str(data.get("engine", "")).strip().lower() or None,
+        "model": model,
         "symbols": [
             str(symbol).strip().upper()
             for symbol in data.get("symbols", [])
@@ -3202,7 +3316,10 @@ def agent_convert():
     }
 
     task_id = str(uuid.uuid4())
-    return jsonify(_start_agent_task(task_id, payload))
+    response = jsonify(_queue_agent_task(task_id, payload))
+    response.status_code = 202
+    response.call_on_close(lambda: _launch_agent_task(task_id, payload))
+    return response
 
 
 @app.route("/api/data/dukascopy/genesis")

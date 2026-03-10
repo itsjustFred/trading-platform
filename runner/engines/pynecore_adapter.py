@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import csv
+import inspect
 import logging
 import os
 import shutil
@@ -23,7 +24,11 @@ from typing import Any
 import pandas as pd
 
 from runner.engines.base import BacktestConfig, EngineAdapter, resolve_strategy_parameters
-from runner.engines.vectorbt_adapter import _resolve_max_leverage, _resolve_max_position_pct
+from runner.engines.vectorbt_adapter import (
+    _normalize_drawings,
+    _resolve_max_leverage,
+    _resolve_max_position_pct,
+)
 from shared.constants import DATA_DIR
 from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, TradeExit
 
@@ -45,9 +50,10 @@ class PyneCoreAdapter(EngineAdapter):
         all_trades: list[Trade] = []
         all_equity: list[EquityPoint] = []
         all_stats: dict[str, Any] = {}
+        all_drawings: list[dict[str, Any]] = []
         trade_counter = 0
         total_bars = 0
-        strategy_name, context_builder = _load_strategy_artifacts(
+        strategy_name, context_builder, drawings_builder = _load_strategy_artifacts(
             strategy_path, config.strategy_name
         )
 
@@ -62,6 +68,7 @@ class PyneCoreAdapter(EngineAdapter):
             total_bars += len(df)
             trade_context = _build_trade_context(context_builder, df, resolved_parameters)
             asset_class = _infer_asset_class(data_root, symbol, config.timeframe)
+            trades: list[Trade] = []
 
             with tempfile.TemporaryDirectory(prefix="pynecore_") as tmpdir:
                 tmpdir_path = Path(tmpdir)
@@ -133,6 +140,15 @@ class PyneCoreAdapter(EngineAdapter):
                 if stats_csv.exists():
                     all_stats = _parse_stats_csv(stats_csv)
 
+            symbol_drawings = _build_drawings(
+                drawings_builder,
+                df,
+                resolved_parameters,
+                trades,
+                symbol,
+            )
+            all_drawings.extend(symbol_drawings)
+
         equity = config.initial_capital
         for trade in sorted(all_trades, key=lambda item: item.entry_time):
             equity += trade.pnl
@@ -167,7 +183,11 @@ class PyneCoreAdapter(EngineAdapter):
         )
 
         return BacktestResult(
-            meta=meta, trades=all_trades, equity_curve=all_equity, stats=all_stats
+            meta=meta,
+            trades=all_trades,
+            equity_curve=all_equity,
+            stats=all_stats,
+            drawings=all_drawings,
         )
 
     def validate_config(self, config: BacktestConfig) -> list[str]:
@@ -181,7 +201,7 @@ class PyneCoreAdapter(EngineAdapter):
         return errors
 
 
-def _load_strategy_artifacts(path: str, fallback_name: str) -> tuple[str, Any]:
+def _load_strategy_artifacts(path: str, fallback_name: str) -> tuple[str, Any, Any]:
     source_path = Path(path).resolve()
     source = source_path.read_text()
     tree = ast.parse(source, filename=str(source_path))
@@ -198,30 +218,49 @@ def _load_strategy_artifacts(path: str, fallback_name: str) -> tuple[str, Any]:
                             strategy_name = str(strategy_meta.get("name", strategy_name))
                     except (ValueError, SyntaxError):
                         pass
-    context_builder = _load_trade_context_helper(source_path)
-    return strategy_name, context_builder
+    helpers = _load_strategy_helper_namespace(source_path, source)
+    return strategy_name, helpers.get("build_trade_context"), helpers.get("build_drawings")
 
 
-def _load_trade_context_helper(strategy_path: Path) -> Any:
+def _load_strategy_helper_namespace(strategy_path: Path, source: str) -> dict[str, Any]:
+    namespace: dict[str, Any] = {}
+
     helper_path = strategy_path.with_name(f"{strategy_path.stem}_context.py")
-    if not helper_path.exists():
-        return None
+    if helper_path.exists():
+        namespace.update(_compile_helper_namespace(helper_path, helper_path.read_text()))
 
-    helper_source = helper_path.read_text()
-    helper_tree = ast.parse(helper_source, filename=str(helper_path))
+    source_namespace = _compile_helper_namespace(
+        strategy_path,
+        source,
+        function_names={"build_trade_context", "build_drawings"},
+    )
+    namespace.update({key: value for key, value in source_namespace.items() if value is not None})
+    return namespace
+
+
+def _compile_helper_namespace(
+    source_path: Path,
+    source: str,
+    *,
+    function_names: set[str] | None = None,
+) -> dict[str, Any]:
+    tree = ast.parse(source, filename=str(source_path))
     helper_nodes: list[ast.stmt] = []
-    for node in helper_tree.body:
-        if isinstance(node, (ast.Import, ast.ImportFrom, ast.FunctionDef)):
+    allowed_names = function_names or {"build_trade_context", "build_drawings"}
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            helper_nodes.append(node)
+        elif isinstance(node, ast.FunctionDef) and node.name in allowed_names:
             helper_nodes.append(node)
 
     if not helper_nodes:
-        return None
+        return {}
 
     helper_module = ast.Module(body=helper_nodes, type_ignores=[])
     ast.fix_missing_locations(helper_module)
     namespace: dict[str, Any] = {}
-    exec(compile(helper_module, str(helper_path), "exec"), namespace)
-    return namespace.get("build_trade_context")
+    exec(compile(helper_module, str(source_path), "exec"), namespace)
+    return {name: namespace.get(name) for name in allowed_names}
 
 
 def _normalize_trade_context_timeframe(name: str, explicit_when: str) -> str:
@@ -301,6 +340,60 @@ def _build_trade_context(context_builder: Any, df: pd.DataFrame, params: dict) -
     if context_builder is None:
         return {}
     return _normalize_trade_context(context_builder(df.copy(), params or {}), df.index)
+
+
+def _build_drawings(
+    drawings_builder: Any,
+    df: pd.DataFrame,
+    params: dict,
+    trades: list[Trade],
+    symbol: str,
+) -> list[dict[str, Any]]:
+    if drawings_builder is None:
+        return []
+    raw_drawings = _invoke_strategy_helper(
+        drawings_builder,
+        df.copy(),
+        params or {},
+        trades,
+        symbol,
+    )
+    return _normalize_drawings(raw_drawings, symbol=symbol)
+
+
+def _invoke_strategy_helper(
+    builder: Any,
+    df: pd.DataFrame,
+    params: dict,
+    trades: list[Trade],
+    symbol: str,
+) -> Any:
+    signature = inspect.signature(builder)
+    args: list[Any] = []
+    kwargs: dict[str, Any] = {}
+    positional_index = 0
+    values_by_name = {
+        "df": df,
+        "dataframe": df,
+        "params": params,
+        "trades": trades,
+        "symbol": symbol,
+    }
+
+    for parameter in signature.parameters.values():
+        if parameter.kind in {
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        }:
+            if positional_index == 0:
+                args.append(df)
+            elif parameter.name in values_by_name:
+                args.append(values_by_name[parameter.name])
+            positional_index += 1
+        elif parameter.kind == inspect.Parameter.KEYWORD_ONLY and parameter.name in values_by_name:
+            kwargs[parameter.name] = values_by_name[parameter.name]
+
+    return builder(*args, **kwargs)
 
 
 def _normalize_trade_timestamp(value: str) -> pd.Timestamp | None:

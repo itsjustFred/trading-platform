@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import { Bot, Sparkles, Wand2 } from "lucide-react";
 
 import { startAgentConvert } from "../api/client";
+import type { AgentModelId } from "../api/types";
 import { LiveTerminal } from "../components/LiveTerminal";
 
 const sampleCode = `//@version=5
@@ -17,9 +18,26 @@ if longCondition
 if exitCondition
     strategy.close("Long")`;
 
+const AI_MODELS: Array<{ label: string; value: AgentModelId }> = [
+  { label: "Kimi K2.5 (moonshotai/kimi-k2.5)", value: "moonshotai/kimi-k2.5" },
+  {
+    label: "Meta Llama 3.3 70B (meta/llama-3.3-70b-instruct)",
+    value: "meta/llama-3.3-70b-instruct",
+  },
+  {
+    label: "DeepSeek V3.2 (deepseek-ai/deepseek-v3.2)",
+    value: "deepseek-ai/deepseek-v3.2",
+  },
+  {
+    label: "Qwen2.5 Coder 32B (qwen/qwen2.5-coder-32b-instruct)",
+    value: "qwen/qwen2.5-coder-32b-instruct",
+  },
+];
+
 export function StrategyLabPage() {
   const [strategyName, setStrategyName] = useState("Aurora Cross");
   const [rawCode, setRawCode] = useState(sampleCode);
+  const [model, setModel] = useState<AgentModelId>(AI_MODELS[0].value);
   const [jobId, setJobId] = useState<string | null>(null);
   const [jobStatus, setJobStatus] = useState("idle");
   const [error, setError] = useState("");
@@ -46,6 +64,7 @@ export function StrategyLabPage() {
       const response = await startAgentConvert({
         code: rawCode,
         strategy_name: strategyName.trim() || undefined,
+        model,
       });
       const nextJobId = response.job_id ?? response.task_id;
       if (!nextJobId) {
@@ -126,7 +145,7 @@ export function StrategyLabPage() {
                   letterSpacing: "-0.02em",
                 }}
               >
-                Let Kimi rewrite raw strategy code into a backtestable trading module.
+                Let AI rewrite raw strategy code into a backtestable trading module.
               </h1>
               <p
                 style={{
@@ -138,8 +157,9 @@ export function StrategyLabPage() {
                 }}
               >
                 Drop in Pine Script, QuantConnect C#, or rough pseudo-code. The NVIDIA
-                NIM worker now runs a staged 3-step conversion pipeline, then launches a
-                validation backtest while the terminal streams every visible step.
+                NIM worker runs a staged 3-step conversion pipeline with your selected
+                model, then launches a validation backtest while the terminal streams
+                every visible step.
               </p>
             </div>
 
@@ -310,6 +330,39 @@ export function StrategyLabPage() {
                   letterSpacing: "0.14em",
                 }}
               >
+                AI Model
+              </span>
+              <select
+                value={model}
+                onChange={(event) => setModel(event.target.value as AgentModelId)}
+                style={{
+                  width: "100%",
+                  borderRadius: "14px",
+                  border: "1px solid rgba(148, 163, 184, 0.18)",
+                  background: "rgba(15, 23, 42, 0.68)",
+                  color: "#f8fafc",
+                  padding: "14px 16px",
+                  outline: "none",
+                  fontSize: "0.95rem",
+                }}
+              >
+                {AI_MODELS.map((option) => (
+                  <option key={option.value} value={option.value} style={{ color: "#020617" }}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <label style={{ display: "grid", gap: "8px" }}>
+              <span
+                style={{
+                  color: "rgba(226, 232, 240, 0.82)",
+                  fontSize: "0.78rem",
+                  textTransform: "uppercase",
+                  letterSpacing: "0.14em",
+                }}
+              >
                 Raw Strategy Code
               </span>
               <textarea
@@ -345,12 +398,12 @@ export function StrategyLabPage() {
                 gap: "14px",
                 flexWrap: "wrap",
               }}
-            >
-              <div style={{ color: "rgba(226, 232, 240, 0.58)", fontSize: "0.8rem" }}>
-                The agent writes a Python strategy file, emits Markdown documentation, and
-                backtests the output in the background after the analysis, meta, and code
-                generation steps complete.
-              </div>
+              >
+                <div style={{ color: "rgba(226, 232, 240, 0.58)", fontSize: "0.8rem" }}>
+                  The agent writes a Python strategy file, emits Markdown documentation, and
+                  backtests the output in the background after the analysis, meta, and code
+                  generation steps complete using the selected model.
+                </div>
               <button
                 onClick={handleSubmit}
                 disabled={isSubmitting}

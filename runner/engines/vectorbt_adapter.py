@@ -3,7 +3,7 @@ vectorbt Engine Adapter — runs Python strategies using vectorized signals.
 
 Preferred strategy contract:
     def generate_signals(df: pd.DataFrame, params: dict):
-        return entries, exits, indicators_dict
+        return entries, exits, indicators_dict[, drawings]
 
 Legacy compatibility:
     def generate_signals(df: pd.DataFrame, params: dict) -> pd.DataFrame
@@ -17,7 +17,7 @@ import inspect
 import logging
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +30,7 @@ from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, Trad
 logger = logging.getLogger(__name__)
 
 IndicatorMap = dict[str, tuple[pd.Series, str]]
+DrawingList = list[dict[str, Any]]
 TIMEFRAME_ORDER = ["tick", "s1", "1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"]
 TIMEFRAME_TO_DURATION = {
     "s1": pd.Timedelta(seconds=1),
@@ -82,10 +83,10 @@ def _process_symbol(
     strategy_path: str,
     resolved_parameters: dict[str, Any],
     data_root: Path,
-) -> tuple[list[Trade], list[str]]:
+) -> tuple[list[Trade], list[str], DrawingList]:
     """Process a single symbol: load data, generate signals, extract trades.
 
-    Returns (trades_with_temp_ids, used_intrabar_timeframes).
+    Returns (trades_with_temp_ids, used_intrabar_timeframes, drawings).
     Runs in its own process when parallelized.
     """
     strategy_mod = _load_strategy_module(strategy_path)
@@ -94,7 +95,7 @@ def _process_symbol(
     )
     if df is None or df.empty:
         logger.warning("No data for %s/%s, skipping", symbol, config.timeframe)
-        return [], []
+        return [], [], []
 
     asset_class = _infer_asset_class_from_path(data_path)
     intrabar_df, intrabar_timeframe = _load_intrabar_ohlcv(
@@ -108,7 +109,7 @@ def _process_symbol(
     extra_timeframes = [intrabar_timeframe] if intrabar_timeframe else []
 
     signal_output = _call_generate_signals(strategy_mod, df, resolved_parameters)
-    signals, indicators = _normalize_signal_output(signal_output, df.index)
+    signals, indicators, drawings = _normalize_signal_output(signal_output, df.index, symbol=symbol)
     entries = signals["entries"]
     exits = signals["exits"]
     stop_loss_series = _find_stop_loss_series(signals, indicators)
@@ -246,7 +247,7 @@ def _process_symbol(
             trades.append(trade)
             equity += pnl
 
-    return trades, extra_timeframes
+    return trades, extra_timeframes, drawings
 
 
 class VectorbtAdapter(EngineAdapter):
@@ -264,6 +265,7 @@ class VectorbtAdapter(EngineAdapter):
         data_root = Path(config.data_dir) if config.data_dir else DATA_DIR
         resolved_parameters = resolve_strategy_parameters(strategy_path, config.parameters)
         all_trades: list[Trade] = []
+        all_drawings: DrawingList = []
         used_timeframes = [config.timeframe]
 
         num_symbols = len(config.symbols)
@@ -284,8 +286,9 @@ class VectorbtAdapter(EngineAdapter):
                 for future in as_completed(futures):
                     sym = futures[future]
                     try:
-                        trades, extra_tfs = future.result()
+                        trades, extra_tfs, drawings = future.result()
                         all_trades.extend(trades)
+                        all_drawings.extend(drawings)
                         for tf in extra_tfs:
                             if tf not in used_timeframes:
                                 used_timeframes.append(tf)
@@ -293,10 +296,11 @@ class VectorbtAdapter(EngineAdapter):
                         logger.exception("Failed processing symbol %s", sym)
         else:
             for symbol in config.symbols:
-                trades, extra_tfs = _process_symbol(
+                trades, extra_tfs, drawings = _process_symbol(
                     symbol, config, strategy_path, resolved_parameters, data_root
                 )
                 all_trades.extend(trades)
+                all_drawings.extend(drawings)
                 for tf in extra_tfs:
                     if tf not in used_timeframes:
                         used_timeframes.append(tf)
@@ -349,7 +353,12 @@ class VectorbtAdapter(EngineAdapter):
             parameters=resolved_parameters,
         )
 
-        return BacktestResult(meta=meta, trades=all_trades, equity_curve=all_equity)
+        return BacktestResult(
+            meta=meta,
+            trades=all_trades,
+            equity_curve=all_equity,
+            drawings=all_drawings,
+        )
 
 
 def _load_strategy_module(path: str):
@@ -360,7 +369,12 @@ def _load_strategy_module(path: str):
     return mod
 
 
-def _normalize_signal_output(output: Any, index: pd.Index) -> tuple[pd.DataFrame, IndicatorMap]:
+def _normalize_signal_output(
+    output: Any,
+    index: pd.Index,
+    *,
+    symbol: str,
+) -> tuple[pd.DataFrame, IndicatorMap, DrawingList]:
     if isinstance(output, pd.DataFrame):
         if "entries" not in output.columns or "exits" not in output.columns:
             raise ValueError("Strategy DataFrame output must include 'entries' and 'exits' columns")
@@ -368,27 +382,36 @@ def _normalize_signal_output(output: Any, index: pd.Index) -> tuple[pd.DataFrame
         signals.index = index
         signals["entries"] = _coerce_boolean_series(signals["entries"], index)
         signals["exits"] = _coerce_boolean_series(signals["exits"], index)
-        return signals, {}
+        return signals, {}, []
 
     if isinstance(output, (tuple, list)):
-        if len(output) == 3:
+        raw_drawings: Any = []
+        if len(output) == 4:
+            raw_entries, raw_exits, raw_indicators, raw_drawings = output
+        elif len(output) == 3:
             raw_entries, raw_exits, raw_indicators = output
         elif len(output) == 2:
             raw_entries, raw_exits = output
             raw_indicators = {}
         else:
             raise ValueError(
-                "Tuple/list strategy output must be (entries, exits) or (entries, exits, indicators_dict)"
+                "Tuple/list strategy output must be (entries, exits), "
+                "(entries, exits, indicators_dict), or "
+                "(entries, exits, indicators_dict, drawings)"
             )
 
         signals = pd.DataFrame(index=index)
         signals["entries"] = _coerce_boolean_series(raw_entries, index)
         signals["exits"] = _coerce_boolean_series(raw_exits, index)
-        return signals, _normalize_indicator_map(raw_indicators, index)
+        return (
+            signals,
+            _normalize_indicator_map(raw_indicators, index),
+            _normalize_drawings(raw_drawings, symbol=symbol),
+        )
 
     raise TypeError(
         "generate_signals() must return a pandas DataFrame or a tuple/list of "
-        "(entries, exits, indicators_dict)"
+        "(entries, exits, indicators_dict[, drawings])"
     )
 
 
@@ -445,6 +468,93 @@ def _normalize_indicator_map(indicators: Any, index: pd.Index) -> IndicatorMap:
 
         normalized[str(name)] = (_coerce_series(value, index), when)
     return normalized
+
+
+def _normalize_drawings(drawings: Any, *, symbol: str) -> DrawingList:
+    if drawings is None:
+        return []
+    if not isinstance(drawings, list):
+        raise TypeError("drawings must be a list of drawing dictionaries")
+
+    normalized: DrawingList = []
+    for idx, raw_drawing in enumerate(drawings, start=1):
+        if not isinstance(raw_drawing, dict):
+            raise TypeError(f"drawing #{idx} must be a dict")
+
+        drawing_type = str(raw_drawing.get("type", "")).strip()
+        if drawing_type not in {"marker", "line"}:
+            raise ValueError(
+                f"drawing #{idx} has unsupported type {drawing_type!r}; use 'marker' or 'line'"
+            )
+
+        normalized_drawing: dict[str, Any] = {}
+        for key, value in raw_drawing.items():
+            serialized = _serialize_meta_value(value)
+            if serialized is not None:
+                normalized_drawing[str(key)] = serialized
+
+        normalized_drawing["type"] = drawing_type
+        normalized_drawing.setdefault("symbol", symbol)
+
+        if drawing_type == "marker":
+            normalized_drawing["time"] = _normalize_drawing_time(
+                raw_drawing.get("time"), field_name="time", drawing_index=idx
+            )
+        else:
+            normalized_drawing["start_time"] = _normalize_drawing_time(
+                raw_drawing.get("start_time"), field_name="start_time", drawing_index=idx
+            )
+            normalized_drawing["end_time"] = _normalize_drawing_time(
+                raw_drawing.get("end_time"), field_name="end_time", drawing_index=idx
+            )
+            if "val1" not in raw_drawing or "val2" not in raw_drawing:
+                raise ValueError(f"drawing #{idx} line drawings require val1 and val2")
+            try:
+                normalized_drawing["val1"] = float(raw_drawing["val1"])
+                normalized_drawing["val2"] = float(raw_drawing["val2"])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"drawing #{idx} line values must be numeric"
+                ) from exc
+
+        normalized.append(normalized_drawing)
+
+    return normalized
+
+
+def _normalize_drawing_time(value: Any, *, field_name: str, drawing_index: int) -> str:
+    if value is None:
+        raise ValueError(f"drawing #{drawing_index} missing required field {field_name!r}")
+
+    if hasattr(value, "item"):
+        try:
+            value = value.item()
+        except (TypeError, ValueError):
+            pass
+
+    if isinstance(value, pd.Timestamp):
+        timestamp = value.tz_localize("UTC") if value.tzinfo is None else value.tz_convert("UTC")
+        return timestamp.isoformat()
+
+    if isinstance(value, datetime):
+        timestamp = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+        return timestamp.astimezone(timezone.utc).isoformat()
+
+    if isinstance(value, date):
+        return datetime(value.year, value.month, value.day, tzinfo=timezone.utc).isoformat()
+
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return datetime.fromtimestamp(float(value), tz=timezone.utc).isoformat()
+
+    if isinstance(value, str):
+        parsed = pd.to_datetime(value, utc=True, errors="coerce")
+        if pd.notna(parsed):
+            return pd.Timestamp(parsed).isoformat()
+        return value
+
+    raise TypeError(
+        f"drawing #{drawing_index} field {field_name!r} must be a timestamp-like value"
+    )
 
 
 def _infer_indicator_when(name: str, explicit_when: str) -> str:

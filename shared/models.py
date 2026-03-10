@@ -448,6 +448,7 @@ class BacktestResult:
     equity_curve: list[EquityPoint] = field(default_factory=list)
     stats: dict[str, Any] = field(default_factory=dict)
     indicators: list[IndicatorSeries] = field(default_factory=list)
+    drawings: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -460,6 +461,8 @@ class BacktestResult:
             d["stats"] = self.stats
         if self.indicators:
             d["indicators"] = [i.to_dict() for i in self.indicators]
+        if self.drawings:
+            d["drawings"] = self.drawings
         return d
 
     @classmethod
@@ -470,6 +473,7 @@ class BacktestResult:
             equity_curve=[EquityPoint.from_dict(e) for e in d.get("equity_curve", [])],
             stats=d.get("stats", {}),
             indicators=[IndicatorSeries.from_dict(i) for i in d.get("indicators", [])],
+            drawings=d.get("drawings", []),
         )
 
     def to_json(self, indent: int = 2) -> str:

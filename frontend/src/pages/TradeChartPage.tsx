@@ -5,6 +5,15 @@ import {
   getBacktestTrade,
   getBacktestInfo,
 } from "../api/client";
+import type {
+  BacktestInfo,
+  ChartLineDrawing,
+  ChartMarkerDrawing,
+  IndicatorSeriesView,
+  Trade,
+  TradeChartResponse,
+  TradeDrawing,
+} from "../api/types";
 import { ArrowLeft, ChevronLeft, ChevronRight } from "lucide-react";
 import {
   createChart,
@@ -44,12 +53,76 @@ function formatTradeMetaValue(value: unknown): string {
   return String(value);
 }
 
+function isMarkerDrawing(drawing: TradeDrawing): drawing is ChartMarkerDrawing {
+  return drawing.type === "marker";
+}
+
+function isLineDrawing(drawing: TradeDrawing): drawing is ChartLineDrawing {
+  return drawing.type === "line";
+}
+
+function normalizeMarkerPosition(value: unknown): "aboveBar" | "belowBar" | "inBar" {
+  if (value === "belowBar" || value === "inBar") {
+    return value;
+  }
+  return "aboveBar";
+}
+
+function normalizeMarkerShape(
+  value: unknown,
+): "arrowUp" | "arrowDown" | "circle" | "square" {
+  if (
+    value === "arrowUp" ||
+    value === "arrowDown" ||
+    value === "circle" ||
+    value === "square"
+  ) {
+    return value;
+  }
+  return "circle";
+}
+
+function resolveLineStyle(value: unknown): number {
+  if (value === "dotted") {
+    return LineStyle.Dotted;
+  }
+  if (value === "dashed") {
+    return LineStyle.Dashed;
+  }
+  return LineStyle.Solid;
+}
+
+function resolveLineWidth(value: unknown): 1 | 2 | 3 | 4 {
+  const numeric = Number(value);
+  if (numeric >= 4) {
+    return 4;
+  }
+  if (numeric >= 3) {
+    return 3;
+  }
+  if (numeric >= 2) {
+    return 2;
+  }
+  return 1;
+}
+
+function drawingFallsWithinWindow(
+  drawing: TradeDrawing,
+  startTime: number,
+  endTime: number,
+): boolean {
+  if (isMarkerDrawing(drawing)) {
+    return drawing.time >= startTime && drawing.time <= endTime;
+  }
+  return drawing.end_time >= startTime && drawing.start_time <= endTime;
+}
+
 export function TradeChartPage() {
   const { id, nr } = useParams<{ id: string; nr: string }>();
   const navigate = useNavigate();
-  const [trades, setTrades] = useState<any[]>([]);
-  const [_info, setInfo] = useState<any>(null);
-  const [tradeData, setTradeData] = useState<any>(null);
+  const [trades, setTrades] = useState<Trade[]>([]);
+  const [_info, setInfo] = useState<BacktestInfo | null>(null);
+  const [tradeData, setTradeData] = useState<TradeChartResponse | null>(null);
   const [currentNr, setCurrentNr] = useState(parseInt(nr || "1"));
   const chartContainerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
@@ -121,7 +194,7 @@ export function TradeChartPage() {
       borderVisible: false,
     });
 
-    const ohlcv: CandlestickData[] = tradeData.ohlcv.map((bar: any) => ({
+    const ohlcv: CandlestickData[] = tradeData.ohlcv.map((bar) => ({
       time: bar.time as Time,
       open: bar.open,
       high: bar.high,
@@ -139,7 +212,7 @@ export function TradeChartPage() {
       scaleMargins: { top: 0.85, bottom: 0 },
     });
     volumeSeries.setData(
-      tradeData.ohlcv.map((bar: any) => ({
+      tradeData.ohlcv.map((bar) => ({
         time: bar.time as Time,
         value: bar.volume || 0,
         color:
@@ -147,10 +220,22 @@ export function TradeChartPage() {
       })),
     );
 
-    // Trade markers
+    const visibleStartTime = tradeData.ohlcv[0]?.time ?? 0;
+    const visibleEndTime = tradeData.ohlcv[tradeData.ohlcv.length - 1]?.time ?? 0;
+    const visibleDrawings = (tradeData.drawings || []).filter((drawing) =>
+      drawingFallsWithinWindow(drawing, visibleStartTime, visibleEndTime),
+    );
+
+    // Trade markers + custom drawings
     const trade = tradeData.trade;
+    const markers: Array<{
+      time: Time;
+      position: "aboveBar" | "belowBar" | "inBar";
+      color: string;
+      shape: "arrowUp" | "arrowDown" | "circle" | "square";
+      text?: string;
+    }> = [];
     if (trade) {
-      const markers: any[] = [];
       // Entry marker
       markers.push({
         time: trade.entry_time as Time,
@@ -184,21 +269,49 @@ export function TradeChartPage() {
         axisLabelVisible: true,
         title: "Exit",
       });
-      createSeriesMarkers(
-        candleSeries,
-        markers.sort((a, b) => (a.time as number) - (b.time as number)),
-      );
     }
+
+    visibleDrawings
+      .filter(isMarkerDrawing)
+      .forEach((drawing) => {
+        markers.push({
+          time: drawing.time as Time,
+          position: normalizeMarkerPosition(drawing.position),
+          color: drawing.color || "#f59e0b",
+          shape: normalizeMarkerShape(drawing.shape),
+          text: drawing.text,
+        });
+      });
+
+    createSeriesMarkers(
+      candleSeries,
+      markers.sort((left, right) => Number(left.time) - Number(right.time)),
+    );
+
+    visibleDrawings.filter(isLineDrawing).forEach((drawing, index) => {
+      const lineSeries = chart.addSeries(LineSeries, {
+        color: drawing.color || "#f59e0b",
+        lineWidth: resolveLineWidth(drawing.lineWidth ?? 2),
+        lineStyle: resolveLineStyle(drawing.lineStyle),
+        title: drawing.title || `Drawing ${index + 1}`,
+        lastValueVisible: false,
+        priceLineVisible: false,
+      });
+      lineSeries.setData([
+        { time: drawing.start_time as Time, value: drawing.val1 },
+        { time: drawing.end_time as Time, value: drawing.val2 },
+      ]);
+    });
 
     // Indicator overlays
     if (tradeData.indicators && Array.isArray(tradeData.indicators)) {
       // Overlay indicators (on main chart)
       tradeData.indicators
         .filter(
-          (ind: any) =>
+          (ind: IndicatorSeriesView) =>
             (ind.type || ind.pane) === "overlay" && ind.data?.length,
         )
-        .forEach((ind: any) => {
+        .forEach((ind: IndicatorSeriesView) => {
           const lineSeries = chart.addSeries(LineSeries, {
             color: ind.style?.color || ind.color || "#58a6ff",
             lineWidth: 1,
@@ -207,17 +320,18 @@ export function TradeChartPage() {
           });
           lineSeries.setData(
             ind.data
-              .filter((d: any) => d.value != null && !isNaN(d.value))
-              .map((d: any) => ({ time: d.time as Time, value: d.value })),
+              .filter((d) => d.value != null && !isNaN(d.value))
+              .map((d) => ({ time: d.time as Time, value: d.value })),
           );
         });
 
       // Panel indicators (separate price scale)
       tradeData.indicators
         .filter(
-          (ind: any) => (ind.type || ind.pane) === "panel" && ind.data?.length,
+          (ind: IndicatorSeriesView) =>
+            (ind.type || ind.pane) === "panel" && ind.data?.length,
         )
-        .forEach((ind: any, idx: number) => {
+        .forEach((ind: IndicatorSeriesView, idx: number) => {
           const scaleId = `panel-${idx}`;
           const lineSeries = chart.addSeries(LineSeries, {
             color: ind.style?.color || ind.color || "#a78bfa",
@@ -227,8 +341,8 @@ export function TradeChartPage() {
           });
           lineSeries.setData(
             ind.data
-              .filter((d: any) => d.value != null && !isNaN(d.value))
-              .map((d: any) => ({ time: d.time as Time, value: d.value })),
+              .filter((d) => d.value != null && !isNaN(d.value))
+              .map((d) => ({ time: d.time as Time, value: d.value })),
           );
           chart
             .priceScale(scaleId)

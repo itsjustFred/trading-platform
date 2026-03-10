@@ -77,6 +77,24 @@ def _make_result() -> BacktestResult:
             EquityPoint(time="2021-01-02", equity=100_150.30),
         ],
         stats={"total_trades": 2, "win_rate": 100.0},
+        drawings=[
+            {
+                "type": "marker",
+                "time": "2021-03-15T10:30:00Z",
+                "position": "belowBar",
+                "shape": "arrowUp",
+                "color": "#3fb950",
+                "text": "Buy",
+            },
+            {
+                "type": "line",
+                "start_time": "2021-03-15T10:30:00Z",
+                "end_time": "2021-03-18T15:45:00Z",
+                "val1": 121.5,
+                "val2": 124.8,
+                "color": "#58a6ff",
+            },
+        ],
     )
 
 
@@ -162,6 +180,7 @@ class TestBacktestResult:
         assert len(r2.trades) == 2
         assert len(r2.equity_curve) == 2
         assert r2.stats["total_trades"] == 2
+        assert len(r2.drawings) == 2
 
     def test_file_roundtrip(self):
         r = _make_result()
@@ -183,6 +202,7 @@ class TestBacktestResult:
         assert d["meta"]["backtest_end"] == "2025-06-30"
         assert d["meta"]["strategies"] == ["rsi_mean_reversion"]
         assert d["meta"]["data"]["timeframes"] == ["1h"]
+        assert d["drawings"][0]["type"] == "marker"
 
 
 class TestStrategyMeta:

@@ -194,7 +194,7 @@ def test_run_auto_agent_sets_timeout_and_logs_for_long_code(tmp_path, monkeypatc
         log=lambda message, **kwargs: logged_messages.append(message),
     )
 
-    assert captured_client_kwargs["timeout"] == 300
+    assert captured_client_kwargs["timeout"] == 600.0
     assert any(
         "Code is very long (1400 lines). Expect longer generation time." in message
         for message in logged_messages
