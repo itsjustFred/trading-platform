@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sys
 import time
 from pathlib import Path
@@ -24,6 +25,7 @@ def viewer_client(monkeypatch, tmp_path):
     monkeypatch.setattr(viewer_app_module, "BACKTESTS_DIR", tmp_path / "backtests")
     monkeypatch.setattr(viewer_app_module, "LOGS_DIR", tmp_path / "logs")
     monkeypatch.setattr(viewer_app_module, "TASK_LOGS_DIR", tmp_path / "logs" / "tasks")
+    monkeypatch.setattr(viewer_app_module, "OPTIMIZATIONS_DIR", tmp_path / "optimizations")
     viewer_app_module.DATA_TASKS.clear()
     viewer_app_module.app.config["TESTING"] = True
     return viewer_app_module.app.test_client()
@@ -599,6 +601,175 @@ def test_start_data_task_writes_task_logs_and_refreshes_catalog(viewer_client, m
     assert refresh_calls == ["refreshed"]
     assert any("stdout line" in line for line in routed_logs)
     assert any("stderr line" in line for line in routed_logs)
+
+
+def test_optimization_run_starts_background_task(viewer_client, monkeypatch, tmp_path):
+    import viewer.app as viewer_app_module
+
+    captured: dict[str, object] = {}
+
+    def fake_execute(config, progress_callback=None):
+        captured["config"] = config
+        output_path = tmp_path / "optimizations" / "opt_base-demo_20260311_100000.json"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "id": "opt_base-demo_20260311_100000",
+            "file": output_path.name,
+            "created_at": "2026-03-11T10:00:00+00:00",
+            "base_backtest_id": config.base_backtest_id,
+            "target_metric": config.target_metric,
+            "best_params": {"window": 10},
+            "effective_best_parameters": {"window": 10, "fixed": 3},
+            "train_period": {
+                "start": "2024-01-01T00:00:00+00:00",
+                "end": "2024-01-07T23:59:59+00:00",
+            },
+            "test_period": {
+                "start": "2024-01-08T00:00:00+00:00",
+                "end": "2024-01-10T23:59:59+00:00",
+            },
+            "train_stats": {"sharpe_ratio": 1.5},
+            "test_stats": {"sharpe_ratio": 1.1},
+            "top_trials": [],
+        }
+        output_path.write_text(json.dumps(payload), encoding="utf-8")
+        if progress_callback is not None:
+            progress_callback(50.0, "✅ Trial 1/2 (sharpe=1.500000) params={'window': 10}")
+            progress_callback(100.0, f"Optimization finished: {output_path.name}")
+        return payload
+
+    monkeypatch.setattr(viewer_app_module, "execute_optimization", fake_execute)
+
+    resp = viewer_client.post(
+        "/api/optimizations/run",
+        json={
+            "base_backtest_id": "base-demo",
+            "target_metric": "sharpe",
+            "n_trials": 2,
+            "train_split_pct": 0.7,
+            "parameter_ranges": {
+                "window": {"type": "int", "min": 5, "max": 10, "step": 1},
+            },
+        },
+    )
+
+    assert resp.status_code == 202
+    job_id = resp.get_json()["job_id"]
+
+    for _ in range(50):
+        task = viewer_app_module.DATA_TASKS[job_id]
+        if task["status"] in {"completed", "failed"}:
+            break
+        time.sleep(0.05)
+
+    task = viewer_app_module.DATA_TASKS[job_id]
+    assert task["status"] == "completed"
+    assert task["kind"] == "optimization"
+    assert task["optimization_id"] == "opt_base-demo_20260311_100000"
+    assert task["optimization_file"] == "opt_base-demo_20260311_100000.json"
+    assert task["progress"] == 100.0
+    assert captured["config"].base_backtest_id == "base-demo"
+
+    log_text = Path(task["log_file"]).read_text(encoding="utf-8")
+    assert "Starting optimization for base-demo" in log_text
+    assert "✅ Trial 1/2" in log_text
+    assert "Optimization saved to opt_base-demo_20260311_100000.json" in log_text
+
+
+def test_thread_bound_task_log_handler_emits_without_shadowing_handle(viewer_client, tmp_path):
+    import viewer.app as viewer_app_module
+
+    task_id = "optulog1"
+    log_file = tmp_path / "logs" / "tasks" / f"task_{task_id}.log"
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger("optuna.test-handler")
+    original_handlers = list(logger.handlers)
+    original_level = logger.level
+    original_propagate = logger.propagate
+
+    with log_file.open("a", encoding="utf-8", buffering=1) as handle:
+        handler = viewer_app_module._ThreadBoundTaskLogHandler(
+            task_id=task_id,
+            handle=handle,
+            source="optimization",
+        )
+        logger.handlers = []
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+        logger.addHandler(handler)
+        try:
+            logger.info("optuna logger smoke test")
+        finally:
+            logger.removeHandler(handler)
+            logger.handlers = original_handlers
+            logger.setLevel(original_level)
+            logger.propagate = original_propagate
+
+    assert "optuna logger smoke test" in log_file.read_text(encoding="utf-8")
+
+
+def test_optimizations_list_and_detail_endpoints(viewer_client, tmp_path):
+    optimizations_dir = tmp_path / "optimizations"
+    optimizations_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "id": "opt_base-demo_20260311_100000",
+        "file": "opt_base-demo_20260311_100000.json",
+        "created_at": "2026-03-11T10:00:00+00:00",
+        "base_backtest_id": "base-demo",
+        "target_metric": "sharpe",
+        "n_trials": 25,
+        "train_split_pct": 0.7,
+        "best_value": 1.2345,
+        "best_params": {"window": 10},
+        "effective_best_parameters": {"window": 10, "fixed": 3},
+        "train_period": {
+            "start": "2024-01-01T00:00:00+00:00",
+            "end": "2024-01-07T23:59:59+00:00",
+        },
+        "test_period": {
+            "start": "2024-01-08T00:00:00+00:00",
+            "end": "2024-01-10T23:59:59+00:00",
+        },
+        "train_stats": {"sharpe_ratio": 1.2345},
+        "test_stats": {"sharpe_ratio": 0.9876},
+        "top_trials": [{"number": 0, "value": 1.2345, "params": {"window": 10}}],
+    }
+    (optimizations_dir / "opt_base-demo_20260311_100000.json").write_text(
+        json.dumps(payload),
+        encoding="utf-8",
+    )
+
+    list_resp = viewer_client.get("/api/optimizations")
+    assert list_resp.status_code == 200
+    listed = list_resp.get_json()
+    assert listed == [
+        {
+            "id": "opt_base-demo_20260311_100000",
+            "filename": "opt_base-demo_20260311_100000.json",
+            "created_at": "2026-03-11T10:00:00+00:00",
+            "base_backtest_id": "base-demo",
+            "target_metric": "sharpe",
+            "n_trials": 25,
+            "train_split_pct": 0.7,
+            "best_value": 1.2345,
+            "best_params": {"window": 10},
+            "effective_best_parameters": {"window": 10, "fixed": 3},
+            "train_period": {
+                "start": "2024-01-01T00:00:00+00:00",
+                "end": "2024-01-07T23:59:59+00:00",
+            },
+            "test_period": {
+                "start": "2024-01-08T00:00:00+00:00",
+                "end": "2024-01-10T23:59:59+00:00",
+            },
+            "train_stats": {"sharpe_ratio": 1.2345},
+            "test_stats": {"sharpe_ratio": 0.9876},
+        }
+    ]
+
+    detail_resp = viewer_client.get("/api/optimizations/opt_base-demo_20260311_100000")
+    assert detail_resp.status_code == 200
+    assert detail_resp.get_json() == payload
 
 
 def _equity_curve_from_returns(

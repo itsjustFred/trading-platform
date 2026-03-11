@@ -25,6 +25,7 @@ import argparse
 import ast
 from contextlib import redirect_stderr, redirect_stdout
 import json
+import logging
 import math
 import os
 import signal
@@ -40,9 +41,11 @@ from typing import Any, Callable
 import pandas as pd
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
+from pydantic import ValidationError
 
 from data_tools.catalog_builder import build_catalog, scan_ohlcv
 from runner.auto_agent import DEFAULT_MODEL_NAME, SUPPORTED_MODEL_NAMES, run_auto_agent
+from runner.optimizer import OptimizationConfig, run_optimization as execute_optimization
 from runner.stats import compute_stats, compute_stats_for_result
 from shared.models import BacktestResult, EquityPoint, PortfolioStats, Trade
 from shared.strategy_registry import (
@@ -56,7 +59,7 @@ from shared.strategy_registry import (
 )
 from viewer.comparison import compare_backtests, compute_drawdown_pct
 
-from shared.constants import DATA_DIR, LOG_DIR
+from shared.constants import DATA_DIR, LOG_DIR, OPTIMIZATIONS_DIR
 from shared.logging import get_logger
 
 logger = get_logger("viewer")
@@ -87,6 +90,39 @@ def _load_result(backtest_id: str) -> BacktestResult | None:
     if not path.exists():
         return None
     return BacktestResult.load(str(path))
+
+
+def _optimization_path(optimization_id: str) -> Path:
+    normalized_id = str(optimization_id or "").strip()
+    if normalized_id.endswith(".json"):
+        normalized_id = normalized_id[:-5]
+    return OPTIMIZATIONS_DIR / f"{normalized_id}.json"
+
+
+def _load_optimization_payload(optimization_id: str) -> dict[str, Any] | None:
+    path = _optimization_path(optimization_id)
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _optimization_summary_payload(payload: dict[str, Any], path: Path) -> dict[str, Any]:
+    return {
+        "id": payload.get("id", path.stem),
+        "filename": path.name,
+        "created_at": payload.get("created_at"),
+        "base_backtest_id": payload.get("base_backtest_id"),
+        "target_metric": payload.get("target_metric"),
+        "n_trials": payload.get("n_trials"),
+        "train_split_pct": payload.get("train_split_pct"),
+        "best_value": payload.get("best_value"),
+        "best_params": payload.get("best_params", {}),
+        "effective_best_parameters": payload.get("effective_best_parameters", {}),
+        "train_period": payload.get("train_period", {}),
+        "test_period": payload.get("test_period", {}),
+        "train_stats": payload.get("train_stats", {}),
+        "test_stats": payload.get("test_stats", {}),
+    }
 
 
 def _strategy_entries() -> list[StrategyEntry]:
@@ -1486,6 +1522,155 @@ def get_backtest_run_status(job_id: str):
     return jsonify(job)
 
 
+@app.route("/api/optimizations/run", methods=["POST"])
+def run_optimization_job():
+    """Start an Optuna optimization as a background task."""
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "JSON body required"}), 400
+
+    try:
+        config = OptimizationConfig.model_validate(data)
+    except ValidationError as exc:
+        return jsonify({"error": "Invalid optimization payload", "details": exc.errors()}), 400
+
+    task_id = str(uuid.uuid4())[:8]
+    TASK_LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    log_file = _task_log_path(task_id)
+    record = _create_task_record(
+        task_id,
+        name="Parameter optimization",
+        description=(
+            f"Optimize {config.base_backtest_id} for {config.target_metric} "
+            f"across {config.n_trials} trials."
+        ),
+        kind="optimization",
+        source="optuna",
+        total_items=config.n_trials,
+        log_file=log_file,
+        control_mode="thread",
+        supports_control=False,
+    )
+    with DATA_TASKS_LOCK:
+        DATA_TASKS[task_id] = record
+
+    def _run() -> None:
+        optuna_logger = logging.getLogger("optuna")
+        with log_file.open("a", encoding="utf-8", buffering=1) as handle:
+            log_handler = _ThreadBoundTaskLogHandler(
+                task_id=task_id,
+                handle=handle,
+                source="optimization",
+            )
+            log_handler.setFormatter(
+                logging.Formatter("[%(asctime)s] %(message)s", "%Y-%m-%d %H:%M:%S")
+            )
+            optuna_logger.addHandler(log_handler)
+            try:
+                _set_task_status(task_id, "running")
+                _write_task_log_line(
+                    handle,
+                    task_id,
+                    (
+                        f"[{_task_timestamp()}] Starting optimization for "
+                        f"{config.base_backtest_id} ({config.target_metric})."
+                    ),
+                    stream="task",
+                    source="optimization",
+                )
+
+                def report_progress(percent: float, message: str) -> None:
+                    _update_task_progress(
+                        task_id,
+                        percent=percent,
+                        current=message,
+                        total=config.n_trials,
+                    )
+                    _write_task_log_line(
+                        handle,
+                        task_id,
+                        message,
+                        stream="task",
+                        source="optimization",
+                    )
+
+                payload = execute_optimization(config, progress_callback=report_progress)
+                _update_task_fields(
+                    task_id,
+                    optimization_id=payload.get("id"),
+                    optimization_file=payload.get("file"),
+                )
+                _write_task_log_line(
+                    handle,
+                    task_id,
+                    f"[{_task_timestamp()}] Optimization saved to {payload.get('file', '')}.",
+                    stream="task",
+                    source="optimization",
+                )
+                _mark_task_finished(task_id, status="completed")
+            except Exception as exc:
+                _write_task_log_line(
+                    handle,
+                    task_id,
+                    f"[{_task_timestamp()}] Optimization failed: {exc}",
+                    stream="stderr",
+                    log_level="error",
+                    source="optimization",
+                )
+                _write_task_traceback(
+                    handle,
+                    task_id,
+                    traceback.format_exc(),
+                    source="optimization",
+                )
+                _mark_task_finished(task_id, status="failed", returncode=1, error=str(exc))
+            finally:
+                optuna_logger.removeHandler(log_handler)
+
+    thread = threading.Thread(target=_run, daemon=True)
+    _update_task_fields(task_id, thread=thread)
+    thread.start()
+    return jsonify({"job_id": task_id, "status": "starting"}), 202
+
+
+@app.route("/api/optimizations")
+def list_optimizations():
+    """List saved optimization results."""
+    results: list[dict[str, Any]] = []
+    if not OPTIMIZATIONS_DIR.exists():
+        return jsonify(results)
+
+    for path in sorted(OPTIMIZATIONS_DIR.glob("*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            results.append(_optimization_summary_payload(payload, path))
+        except (json.JSONDecodeError, OSError, TypeError, ValueError) as exc:
+            logger.warning("Could not read optimization %s: %s", path, exc)
+
+    results.sort(
+        key=lambda item: (
+            item.get("created_at") or "",
+            item.get("id") or "",
+        ),
+        reverse=True,
+    )
+    return jsonify(results)
+
+
+@app.route("/api/optimizations/<optimization_id>")
+def get_optimization(optimization_id: str):
+    """Return the full persisted optimization payload."""
+    try:
+        payload = _load_optimization_payload(optimization_id)
+    except (json.JSONDecodeError, OSError, TypeError, ValueError) as exc:
+        logger.exception("Failed to load optimization '%s': %s", optimization_id, exc)
+        return jsonify({"error": str(exc)}), 500
+
+    if payload is None:
+        return jsonify({"error": f"Optimization '{optimization_id}' not found"}), 404
+    return jsonify(payload)
+
+
 # ─── Portfolio Endpoints ─────────────────────────────────────────────────────
 
 
@@ -2210,6 +2395,33 @@ def _read_task_log(log_file: str | Path, *, max_bytes: int | None = None) -> str
 def _append_task_log(log_file: Path, message: str) -> None:
     with log_file.open("a", encoding="utf-8") as handle:
         handle.write(message)
+
+
+class _ThreadBoundTaskLogHandler(logging.Handler):
+    def __init__(self, *, task_id: str, handle, source: str) -> None:
+        super().__init__()
+        self.task_id = task_id
+        self.log_handle = handle
+        self.source = source
+        self.thread_id = threading.get_ident()
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if threading.get_ident() != self.thread_id:
+            return
+
+        try:
+            message = self.format(record)
+        except Exception:
+            message = record.getMessage()
+
+        _write_task_log_line(
+            self.log_handle,
+            self.task_id,
+            message,
+            stream="stdout",
+            log_level=record.levelname.lower(),
+            source=self.source,
+        )
 
 
 def _write_task_log_line(

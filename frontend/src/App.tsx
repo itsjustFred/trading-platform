@@ -11,6 +11,8 @@ import { PortfolioDetailPage } from "./pages/PortfolioDetailPage";
 import { LoggingPage } from "./pages/LoggingPage";
 import { DataManagementPage } from "./pages/DataManagementPage";
 import { StrategyLabPage } from "./pages/StrategyLabPage";
+import { OptimizationsPage } from "./pages/OptimizationsPage";
+import { OptimizationResultsPage } from "./pages/OptimizationResultsPage";
 import { TaskManager } from "./components/TaskManager";
 
 export default function App() {
@@ -41,6 +43,8 @@ export default function App() {
           <Route path="/backtests/compare" element={<ComparePage />} />
           <Route path="/backtests/:id" element={<BacktestDetailPage />} />
           <Route path="/backtests/:id/trade/:nr" element={<TradeChartPage />} />
+          <Route path="/optimizations" element={<OptimizationsPage />} />
+          <Route path="/optimizations/:id" element={<OptimizationResultsPage />} />
           <Route path="/strategies" element={<StrategiesPage />} />
           <Route path="/strategies/:name" element={<StrategyDetailPage />} />
           <Route path="/portfolios" element={<PortfoliosPage />} />

@@ -136,10 +136,100 @@ export interface BacktestInfo {
   strategy_file: string;
   engine: string;
   symbols: string[];
+  timeframe: {
+    start: string;
+    end: string;
+  };
+  data_timeframe: string;
   timeframes: string[];
+  initial_capital: number;
+  created_at: string;
   trade_count: number;
+  parameters: Record<string, StrategyParameterValue>;
+  has_equity_curve: boolean;
+  has_indicators: boolean;
+}
+
+export interface OptimizationParameterRange {
+  type: "int" | "float" | "categorical";
+  min?: number;
+  max?: number;
+  step?: number;
+  choices?: Array<number | string | boolean>;
+}
+
+export interface OptimizationRunRequest {
+  base_backtest_id: string;
+  target_metric: "sharpe" | "net_profit" | "calmar" | "cagr" | "win_rate";
+  n_trials: number;
+  train_split_pct: number;
+  parameter_ranges: Record<string, OptimizationParameterRange>;
+}
+
+export interface OptimizationRunResponse {
+  job_id: string;
+  status: string;
+}
+
+export interface OptimizationPeriod {
   start: string;
   end: string;
+}
+
+export interface OptimizationTrial {
+  number: number;
+  state: string;
+  value: number | null;
+  params: Record<string, StrategyParameterValue>;
+  effective_parameters: Record<string, StrategyParameterValue>;
+  trade_count: number;
+  penalty_applied: boolean;
+  train_stats: Record<string, number | string | boolean | null>;
+}
+
+export interface OptimizationSummary {
+  id: string;
+  filename: string;
+  created_at: string;
+  base_backtest_id: string;
+  target_metric: string;
+  n_trials: number;
+  train_split_pct: number;
+  best_value: number | null;
+  best_params: Record<string, StrategyParameterValue>;
+  effective_best_parameters: Record<string, StrategyParameterValue>;
+  train_period: OptimizationPeriod;
+  test_period: OptimizationPeriod;
+  train_stats: Record<string, number | string | boolean | null>;
+  test_stats: Record<string, number | string | boolean | null>;
+}
+
+export interface OptimizationDetail {
+  id: string;
+  file: string;
+  created_at: string;
+  engine: string;
+  base_backtest_id: string;
+  strategy: {
+    identifier: string;
+    slug: string;
+    path: string;
+  };
+  symbols: string[];
+  timeframe: string;
+  target_metric: string;
+  n_trials: number;
+  train_split_pct: number;
+  parameter_ranges: Record<string, OptimizationParameterRange>;
+  base_parameters: Record<string, StrategyParameterValue>;
+  best_params: Record<string, StrategyParameterValue>;
+  effective_best_parameters: Record<string, StrategyParameterValue>;
+  best_value: number | null;
+  train_period: OptimizationPeriod;
+  test_period: OptimizationPeriod;
+  train_stats: Record<string, number | string | boolean | null>;
+  test_stats: Record<string, number | string | boolean | null>;
+  top_trials: OptimizationTrial[];
 }
 
 export interface BacktestStats {

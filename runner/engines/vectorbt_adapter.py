@@ -273,6 +273,7 @@ class VectorbtAdapter(EngineAdapter):
 
         if use_parallel:
             max_workers = min(num_symbols, MAX_PARALLEL_WORKERS)
+            symbol_errors: list[tuple[str, Exception]] = []
             logger.info(
                 "Parallel backtest: %d symbols across %d workers", num_symbols, max_workers
             )
@@ -292,8 +293,14 @@ class VectorbtAdapter(EngineAdapter):
                         for tf in extra_tfs:
                             if tf not in used_timeframes:
                                 used_timeframes.append(tf)
-                    except Exception:
+                    except Exception as exc:
                         logger.exception("Failed processing symbol %s", sym)
+                        symbol_errors.append((sym, exc))
+            if symbol_errors:
+                failed_symbols = ", ".join(symbol for symbol, _ in symbol_errors)
+                raise RuntimeError(
+                    f"Vectorbt backtest failed for symbol(s): {failed_symbols}"
+                ) from symbol_errors[0][1]
         else:
             for symbol in config.symbols:
                 trades, extra_tfs, drawings = _process_symbol(
@@ -739,11 +746,26 @@ def _load_ohlcv(
     if "timestamp" in df.columns:
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
         if start_date:
-            df = df[df["timestamp"] >= start_date]
+            df = df[df["timestamp"] >= _parse_date_bound(start_date, is_end=False)]
         if end_date:
-            df = df[df["timestamp"] <= end_date]
+            df = df[df["timestamp"] <= _parse_date_bound(end_date, is_end=True)]
 
     return df.reset_index(drop=True), selected_path
+
+
+def _parse_date_bound(value: str, *, is_end: bool) -> pd.Timestamp:
+    raw = str(value or "").strip()
+    if not raw:
+        raise ValueError("Date filter value cannot be empty")
+
+    parsed = pd.to_datetime(raw, utc=True, errors="coerce")
+    if pd.isna(parsed):
+        raise ValueError(f"Invalid date filter value: {value!r}")
+
+    timestamp = pd.Timestamp(parsed)
+    if is_end and "T" not in raw and ":" not in raw:
+        return timestamp + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
+    return timestamp
 
 
 def _normalize_intrabar_resolution(value: str | None) -> str:

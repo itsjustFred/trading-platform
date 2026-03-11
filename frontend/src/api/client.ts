@@ -12,6 +12,10 @@ import type {
   DukascopyGenesisResponse,
   LogContent,
   LogFile,
+  OptimizationDetail,
+  OptimizationRunRequest,
+  OptimizationRunResponse,
+  OptimizationSummary,
   RunBacktestRequest,
   RunBacktestResponse,
   RunBacktestStatusResponse,
@@ -78,6 +82,17 @@ export const runBacktest = (data: RunBacktestRequest) =>
   });
 export const getBacktestRunStatus = (jobId: string) =>
   fetchJSON<RunBacktestStatusResponse>(`/backtests/run/${jobId}/status`);
+
+// Optimizations
+export const runOptimization = (data: OptimizationRunRequest) =>
+  fetchJSON<OptimizationRunResponse>("/optimizations/run", {
+    method: "POST",
+    body: JSON.stringify(data),
+  });
+export const getOptimizations = () =>
+  fetchJSON<OptimizationSummary[]>("/optimizations");
+export const getOptimization = (id: string) =>
+  fetchJSON<OptimizationDetail>(`/optimizations/${encodeURIComponent(id)}`);
 
 // Portfolios
 export const getPortfolios = () => fetchJSON<any[]>("/portfolios");

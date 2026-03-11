@@ -11,6 +11,7 @@ VALID_ENGINES = ("lean", "vectorbt", "pynecore")
 # Resolved data and log directories (cross-platform)
 DATA_DIR = Path(os.environ.get("TRADING_DATA_DIR", "~/data")).expanduser().resolve()
 LOG_DIR = Path(os.environ.get("LOG_DIR", "~/logs")).expanduser().resolve()
+OPTIMIZATIONS_DIR = DATA_DIR / "optimizations"
 
 # Parquet OHLCV column names (canonical)
 OHLCV_COLUMNS = ("timestamp", "open", "high", "low", "close", "volume")

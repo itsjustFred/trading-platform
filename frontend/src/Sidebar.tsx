@@ -10,11 +10,13 @@ import {
   PanelLeftClose,
   PanelLeftOpen,
   Database,
+  Target,
 } from "lucide-react";
 
 const navItems = [
   { path: "/strategies", label: "Strategies", icon: LineChart },
   { path: "/backtests", label: "Backtests", icon: BarChart3 },
+  { path: "/optimizations", label: "Optimizations", icon: Target },
   { path: "/portfolios", label: "Portfolio", icon: Briefcase },
   { path: "/lab", label: "Strategy Lab", icon: Bot },
   { path: "/data", label: "Data", icon: Database },

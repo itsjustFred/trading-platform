@@ -11,7 +11,8 @@ import {
 import { StatCard } from "../components/StatCard";
 import { DataTable } from "../components/DataTable";
 import { RenameModal } from "../components/RenameModal";
-import { ArrowLeft, ArrowUpRight, PencilLine } from "lucide-react";
+import { OptimizeModal } from "../components/OptimizeModal";
+import { ArrowLeft, ArrowUpRight, PencilLine, Target } from "lucide-react";
 import {
   createChart,
   AreaSeries,
@@ -21,6 +22,7 @@ import {
   CrosshairMode,
 } from "lightweight-charts";
 import type { IChartApi, Time } from "lightweight-charts";
+import type { BacktestInfo, BacktestStats, EquityPoint, Trade } from "../api/types";
 import { formatPValue, pValueColor } from "../utils/stats";
 
 const BENCHMARK_SYMBOLS = ["SPY", "QQQ", "IWM", "DIA", "GLD", "TLT", "XAUUSD"];
@@ -28,15 +30,16 @@ const BENCHMARK_SYMBOLS = ["SPY", "QQQ", "IWM", "DIA", "GLD", "TLT", "XAUUSD"];
 export function BacktestDetailPage() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
-  const [info, setInfo] = useState<any>(null);
-  const [stats, setStats] = useState<any>(null);
-  const [trades, setTrades] = useState<any[]>([]);
-  const [equity, setEquity] = useState<any[]>([]);
+  const [info, setInfo] = useState<BacktestInfo | null>(null);
+  const [stats, setStats] = useState<BacktestStats | null>(null);
+  const [trades, setTrades] = useState<Trade[]>([]);
+  const [equity, setEquity] = useState<EquityPoint[]>([]);
   const [benchmarkSymbol, setBenchmarkSymbol] = useState("");
   const [benchmarkData, setBenchmarkData] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [showRenameModal, setShowRenameModal] = useState(false);
+  const [showOptimizeModal, setShowOptimizeModal] = useState(false);
   const [savingRename, setSavingRename] = useState(false);
   const [renameError, setRenameError] = useState("");
 
@@ -349,6 +352,26 @@ export function BacktestDetailPage() {
           <div style={{ display: "flex", gap: "10px", flexWrap: "wrap" }}>
             <button
               type="button"
+              onClick={() => setShowOptimizeModal(true)}
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: "8px",
+                background:
+                  "linear-gradient(135deg, rgba(14,165,233,0.18), rgba(245,158,11,0.18))",
+                color: "#f8fafc",
+                border: "1px solid rgba(56,189,248,0.22)",
+                borderRadius: "10px",
+                padding: "10px 14px",
+                cursor: "pointer",
+                boxShadow: "0 16px 36px rgba(14,165,233,0.12)",
+              }}
+            >
+              <Target size={15} />
+              Optimize
+            </button>
+            <button
+              type="button"
               onClick={() =>
                 navigate(
                   `/strategies/${encodeURIComponent(info?.strategy_slug || info?.strategy || "")}`,
@@ -439,9 +462,9 @@ export function BacktestDetailPage() {
               stats.psr != null ? `${(stats.psr * 100).toFixed(1)}%` : "N/A"
             }
             color={
-              stats.psr > 0.95
+              (stats.psr ?? 0) > 0.95
                 ? "#3fb950"
-                : stats.psr > 0.5
+                : (stats.psr ?? 0) > 0.5
                   ? "#d29922"
                   : "#f85149"
             }
@@ -626,6 +649,13 @@ export function BacktestDetailPage() {
           setRenameError("");
         }}
         onSave={handleRename}
+      />
+      <OptimizeModal
+        open={showOptimizeModal}
+        onClose={() => setShowOptimizeModal(false)}
+        backtestId={id || info?.id || ""}
+        backtestTitle={info?.title || info?.strategy_display_name || info?.strategy || id || ""}
+        parameters={info?.parameters || {}}
       />
     </div>
   );
