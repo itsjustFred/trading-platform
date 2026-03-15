@@ -19,30 +19,33 @@ pip install -e ".[all]"
 
 # Configure environment
 cp .env.example .env
-# Edit .env — set TRADING_DATA_DIR to your data location
+# Edit .env — set DATA_DIR (default: ./data)
 
 # Build frontend
 cd frontend && npm install && npm run build && cd ..
 
 # Start the viewer
-python -m viewer.app --port 5556
+uvicorn viewer.main:app --host 0.0.0.0 --port 5556
 # Open http://localhost:5556
 # Strategy Lab live conversion runs also require NVIDIA_API_KEY
 ```
 
 ## Data Directory
 
-All runtime data (OHLCV, backtests, catalogs) lives outside the repo in `$TRADING_DATA_DIR` (default: `~/data`):
+All runtime data (OHLCV, backtests, catalogs) lives in `DATA_DIR` (default: `./data` relativ zum Projekt-Root):
 
 ```
-$TRADING_DATA_DIR/
+$DATA_DIR/
   ohlcv/{source}/{asset_class}/{region}/{symbol}/{timeframe}.parquet
+  backtests.db
   backtests/*.trades.json
   universes/
   catalog.json
 ```
 
-Set the `TRADING_DATA_DIR` environment variable (in `.env` or your shell) to customize the location.
+Setze `DATA_DIR` in `.env` oder Shell. Für Legacy-Kompatibilität wird auch `TRADING_DATA_DIR` unterstützt, wenn `DATA_DIR` nicht gesetzt ist.
+
+FastAPI nutzt primär `backtests.db` (SQLite via SQLModel). JSON-Dateien unter `backtests/*.trades.json` bleiben kompatibel und werden beim Start nach SQLite migriert.
 
 ## Usage
 
@@ -65,7 +68,7 @@ python -m runner.converters.cli lean path/to/lean_result.json -o output.trades.j
 # 3. Open http://localhost:5556/lab
 
 # Build data catalog
-python -m data_tools.catalog_builder -o "$TRADING_DATA_DIR/catalog.json"
+python -m data_tools.catalog_builder -o "$DATA_DIR/catalog.json"
 
 # Migrate CSV data to Parquet
 python -m data_tools.migrate_csv --execute
@@ -85,7 +88,8 @@ runner/              — Backtest runner
   converters/        — Result format converters
 
 viewer/              — Trade viewer web app
-  app.py             — Flask backend (python -m viewer.app)
+  main.py            — FastAPI backend (uvicorn viewer.main:app ...)
+  core.py            — Internal helper module used by main.py
 
 frontend/            — React SPA (Vite + Tailwind)
 
@@ -111,11 +115,21 @@ tests/               — Test suite
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `TRADING_DATA_DIR` | `~/data` | Root for OHLCV, backtests, catalogs |
-| `LOG_DIR` | `~/logs` | Log file directory |
+| `DATA_DIR` | `./data` | Root for OHLCV, backtests, catalogs |
+| `TRADING_DATA_DIR` | `./data` | Legacy fallback if `DATA_DIR` is unset |
+| `LOG_DIR` | `./logs` | Log file directory |
 | `LOG_LEVEL` | `INFO` | Logging level |
-| `FLASK_PORT` | `5556` | Viewer server port |
+| `UVICORN_HOST` | `0.0.0.0` | Recommended host for `uvicorn viewer.main:app` |
+| `UVICORN_PORT` | `5556` | Recommended port for `uvicorn viewer.main:app` |
 | `NVIDIA_API_KEY` | — | API key for the Strategy Lab auto-conversion agent via NVIDIA NIM |
+
+## FastAPI + WebSocket
+
+- Start server: `uvicorn viewer.main:app --host 0.0.0.0 --port 5556`
+- React dev proxy forwards:
+  - `/api` → `http://localhost:5556`
+  - `/ws` → `ws://localhost:5556`
+- Live terminal uses `GET /ws/tasks/{job_id}` WebSocket stream (tail-like task logs).
 
 ## Writing a Strategy (vectorbt)
 

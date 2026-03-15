@@ -210,7 +210,7 @@ python -m data_tools.migrate_csv --execute
 
 ## Viewer integration
 
-The Flask viewer uses these source names in `/api/data/download`:
+The FastAPI viewer uses these source names in `/api/data/download`:
 
 - `dukascopy` -> `python -m data_tools.downloaders.dukascopy_native`
 - `dolthub` -> `python -m data_tools.dolthub_manager update`

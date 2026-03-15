@@ -25,6 +25,7 @@ from pydantic import ValidationError
 from runner.engines.base import BacktestConfig, EngineAdapter, resolve_strategy_parameters
 from runner.stats import compute_stats_for_result
 
+from shared.database import save_result_to_sqlite
 from shared.constants import DATA_DIR
 from shared.logging import get_logger
 
@@ -35,7 +36,11 @@ BACKTESTS_DIR = DATA_DIR / "backtests"
 
 def get_engine(name: str) -> EngineAdapter:
     """Get an engine adapter by name."""
-    if name == "vectorbt":
+    if name == "native":
+        from runner.engines.native_adapter import NativeAdapter
+
+        return NativeAdapter()
+    elif name == "vectorbt":
         from runner.engines.vectorbt_adapter import VectorbtAdapter
 
         return VectorbtAdapter()
@@ -48,7 +53,7 @@ def get_engine(name: str) -> EngineAdapter:
 
         return PyneCoreAdapter()
     else:
-        raise ValueError(f"Unknown engine: {name}. Available: vectorbt, lean, pynecore")
+        raise ValueError(f"Unknown engine: {name}. Available: native, vectorbt, lean, pynecore")
 
 
 def _detect_date_range(symbols: list[str], timeframe: str, data_dir: str = "") -> tuple[str, str]:
@@ -151,6 +156,10 @@ def cmd_run(args):
         output_path = str(BACKTESTS_DIR / f"{config.strategy_name}_{ts}.trades.json")
 
     result.save(output_path)
+    try:
+        save_result_to_sqlite(result)
+    except Exception as exc:
+        logger.warning("Could not persist backtest to SQLite: %s", exc)
     logger.info(
         "Result: %d trades, total PnL: $%.2f", len(result.trades), sum(t.pnl for t in result.trades)
     )
@@ -160,6 +169,7 @@ def cmd_run(args):
 def cmd_engines(args):
     """List available engines."""
     engines = [
+        ("native", "Event-based bar-by-bar simulation engine (default)"),
         ("vectorbt", "Python vectorized backtesting (simple signal-based strategies)"),
         ("lean", "QuantConnect LEAN (complex event-driven strategies)"),
         ("pynecore", "PyneCore Pine-style Python strategies (indicator-rich)"),
@@ -176,7 +186,12 @@ def main():
 
     # Run command
     run_p = subparsers.add_parser("run", help="Run a backtest")
-    run_p.add_argument("--engine", "-e", required=True, help="Engine: vectorbt, lean")
+    run_p.add_argument(
+        "--engine",
+        "-e",
+        required=True,
+        help="Engine: native, vectorbt, lean, pynecore",
+    )
     run_p.add_argument("--strategy", "-s", required=True, help="Path to strategy file")
     run_p.add_argument("--symbols", nargs="+", default=[], help="Symbols to trade")
     run_p.add_argument("--timeframe", "-tf", default="1h", help="Data timeframe")
@@ -201,7 +216,7 @@ def main():
     run_p.add_argument(
         "--intrabar-resolution",
         default="open_close",
-        help="Intrabar exit modeling: open_close, 1-lower, 1m, s1, tick",
+        help="Intrabar exit modeling: main_timeframe, open_close, or explicit finer timeframe",
     )
     run_p.add_argument("--name", "-n", help="Strategy name (default: filename)")
     run_p.add_argument("--output", "-o", help="Output file path")

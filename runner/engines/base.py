@@ -16,7 +16,21 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from shared.models import VALID_TIMEFRAMES, BacktestResult
 from shared.strategy_registry import load_strategy_meta
 
-VALID_RESOLUTIONS = ("open_close", "1-lower", "1m", "s1", "tick")
+VALID_RESOLUTIONS = (
+    "main_timeframe",
+    "open_close",
+    "1-lower",
+    "s1",
+    "1m",
+    "5m",
+    "15m",
+    "30m",
+    "1h",
+    "4h",
+    "1d",
+    "1w",
+    "tick",
+)
 
 
 class BacktestConfig(BaseModel):
@@ -33,7 +47,7 @@ class BacktestConfig(BaseModel):
     risk_per_trade_pct: float | None = Field(None, ge=0.0, le=1.0)
     max_position_pct: float | None = Field(None, gt=0.0)
     max_leverage: float | None = Field(None, gt=0.0)
-    modeling_resolution: str = "open_close"
+    modeling_resolution: str = "main_timeframe"
     data_dir: str = ""
     parameters: dict[str, Any] = Field(default_factory=dict)
 
@@ -47,6 +61,8 @@ class BacktestConfig(BaseModel):
     @field_validator("modeling_resolution")
     @classmethod
     def _validate_resolution(cls, v: str) -> str:
+        if v in VALID_TIMEFRAMES:
+            return v
         if v not in VALID_RESOLUTIONS:
             raise ValueError(
                 f"Invalid modeling_resolution '{v}', must be one of {VALID_RESOLUTIONS}"

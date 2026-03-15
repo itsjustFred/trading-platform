@@ -36,8 +36,8 @@ python -m runner.cli engines
 python -m runner.converters.cli stockkit path/to/trades.csv -o output.trades.json
 python -m runner.converters.cli lean path/to/lean_result.json -o output.trades.json
 
-# Start Flask API + web UI server
-python -m viewer.app --port 5556
+# Start FastAPI + web UI server
+uvicorn viewer.main:app --host 0.0.0.0 --port 5556
 ```
 
 ```bash
@@ -93,7 +93,7 @@ Current baseline in this repository state:
 1. `runner/cli.py` builds `BacktestConfig` and dispatches to an engine adapter (`vectorbt`, `lean`, `pynecore`).
 2. The adapter returns a universal `BacktestResult` (`shared/models.py`).
 3. Runner persists output under `$TRADING_DATA_DIR/backtests/*.trades.json`.
-4. `viewer/app.py` loads stored results and exposes API endpoints (`/api/backtests`, `/api/backtest/<id>/...`, `/api/strategies`, `/api/portfolios`, `/api/data/*`).
+4. `viewer/main.py` loads stored results and exposes API endpoints (`/api/backtests`, `/api/backtest/<id>/...`, `/api/strategies`, `/api/portfolios`, `/api/data/*`).
 5. `frontend/src/api/client.ts` consumes `/api/*`; in dev, Vite proxies `/api` to `http://localhost:5556`.
 6. Viewer serves built frontend from `frontend/dist` when present, else falls back to `viewer/static`.
 
@@ -101,7 +101,7 @@ Current baseline in this repository state:
 
 - `shared/`: canonical data models and centralized JSON logging.
 - `runner/`: CLI orchestration, engine adapters, stats, and import converters.
-- `viewer/`: Flask API and async job/task orchestration for runs and data operations.
+- `viewer/`: FastAPI backend and async job/task orchestration for runs and data operations.
 - `frontend/`: React SPA for backtests, strategies, portfolios, data management, and logs.
 - `data_tools/`: catalog build, validation, resampling, and downloader integrations.
 - `strategies/`: strategy implementations consumed by adapters.

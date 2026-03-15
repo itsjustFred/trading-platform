@@ -1,22 +1,8 @@
 """
-Trade Viewer Backend — Flask API serving universal-format backtest results.
+Shared viewer helper logic used by the FastAPI backend in `viewer/main.py`.
 
-Endpoints:
-    GET  /api/backtests                        — List available backtest result files
-    GET  /api/backtest/<id>                    — Load a specific backtest result (raw)
-    GET  /api/backtest/<id>/info               — Metadata for topbar display
-    GET  /api/backtest/<id>/stats              — Compute stats for a backtest
-    GET  /api/backtest/<id>/trades             — Viewer-format trade list
-    GET  /api/backtest/<id>/trade/<nr>         — Single trade with OHLCV context
-    GET  /api/backtest/<id>/ohlcv              — Full OHLCV data for all symbols
-    GET  /api/backtest/<id>/equity             — Equity curve data
-    GET  /api/compare?ids=id1,id2             — Full comparison with combined equity
-    GET  /                                     — Serve the frontend
-
-Usage:
-    python -m viewer.app                         # default port 5556
-    python -m viewer.app --port 9000
-    python -m viewer.app --backtests ~/data/backtests
+This module keeps strategy/backtest/data/task utilities and legacy helper
+functions that are consumed by the FastAPI routes.
 """
 
 from __future__ import annotations
@@ -39,8 +25,6 @@ from pathlib import Path
 from typing import Any, Callable
 
 import pandas as pd
-from flask import Flask, jsonify, request, send_from_directory
-from flask_cors import CORS
 from pydantic import ValidationError
 
 from data_tools.catalog_builder import build_catalog, scan_ohlcv
@@ -51,9 +35,12 @@ from shared.models import BacktestResult, EquityPoint, PortfolioStats, Trade
 from shared.strategy_registry import (
     DEFAULT_STRATEGIES_DIR,
     StrategyEntry,
-    find_strategy_entry,
-    iter_strategy_entries,
+    iter_strategy_files,
+    load_strategy_meta,
     matches_strategy_identifier,
+    strategy_documentation_path,
+    strategy_relative_file,
+    strategy_slug_for_path,
     read_strategy_documentation,
     update_strategy_display_name,
 )
@@ -78,8 +65,40 @@ _running_jobs: dict[str, dict] = {}  # job_id -> {status, result, error}
 BARS_BEFORE = 60
 BARS_AFTER = 25
 
-app = Flask(__name__, static_folder=str(STATIC_DIR))
-CORS(app)
+
+class _RequestPlaceholder:
+    def __getattr__(self, item: str) -> Any:
+        raise RuntimeError(
+            "Flask request context is unavailable. "
+            "Use FastAPI endpoints in viewer.main instead."
+        )
+
+
+def jsonify(payload: Any):
+    return payload
+
+
+def send_from_directory(*args: Any, **kwargs: Any):
+    raise RuntimeError("Flask static serving is unavailable. Use viewer.main static middleware.")
+
+
+class _NoopRouteApp:
+    def __init__(self) -> None:
+        self.logger = logger
+        self.config: dict[str, Any] = {}
+
+    def route(self, *args: Any, **kwargs: Any):
+        def _decorator(func):
+            return func
+
+        return _decorator
+
+    def run(self, *args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("Flask runtime is removed. Start the app via uvicorn viewer.main:app")
+
+
+request = _RequestPlaceholder()
+app = _NoopRouteApp()
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -126,11 +145,42 @@ def _optimization_summary_payload(payload: dict[str, Any], path: Path) -> dict[s
 
 
 def _strategy_entries() -> list[StrategyEntry]:
-    return iter_strategy_entries(STRATEGIES_DIR)
+    entries: list[StrategyEntry] = []
+    if not STRATEGIES_DIR.exists():
+        return entries
+
+    for path in iter_strategy_files(STRATEGIES_DIR):
+        try:
+            meta = load_strategy_meta(path, STRATEGIES_DIR)
+        except Exception as exc:
+            logger.warning("Skipping strategy %s due to import error: %s", path, exc)
+            continue
+
+        if not meta:
+            continue
+
+        entries.append(
+            StrategyEntry(
+                slug=strategy_slug_for_path(path, STRATEGIES_DIR),
+                file_path=path,
+                relative_file=strategy_relative_file(path, STRATEGIES_DIR),
+                directory=path.parent,
+                documentation_path=strategy_documentation_path(path, STRATEGIES_DIR),
+                meta=meta,
+            )
+        )
+
+    return sorted(entries, key=lambda entry: entry.slug)
 
 
 def _strategy_entry(identifier: str) -> StrategyEntry | None:
-    return find_strategy_entry(identifier, STRATEGIES_DIR)
+    normalized = str(identifier or "").strip()
+    if not normalized:
+        return None
+    for entry in _strategy_entries():
+        if matches_strategy_identifier(entry, normalized):
+            return entry
+    return None
 
 
 def _strategy_path(identifier: str) -> Path | None:
@@ -297,6 +347,67 @@ def _load_ohlcv_df(symbol: str, timeframe: str) -> pd.DataFrame | None:
         return None
 
 
+def _infer_symbol_data_category(symbol: str) -> str:
+    symbol_upper = symbol.upper()
+    entries, used_catalog = _load_catalog_ohlcv_entries()
+    if not used_catalog:
+        entries = _scan_ohlcv_filesystem()
+
+    for entry in entries:
+        entry_symbol = str(entry.get("symbol", "")).upper()
+        if entry_symbol != symbol_upper:
+            continue
+        return _categorize_path(str(entry.get("path", "")))
+
+    if symbol_upper in {"XAUUSD", "XAGUSD"}:
+        return "Metals"
+    if len(symbol_upper) == 6 and symbol_upper.isalpha():
+        return "Forex"
+    if 1 <= len(symbol_upper) <= 5 and symbol_upper.isalpha():
+        return "Equities"
+    if symbol_upper.endswith("USD") and len(symbol_upper) > 6:
+        return "Crypto"
+    return "Other"
+
+
+def _missing_ohlcv_details(
+    symbol: str,
+    timeframe: str,
+    *,
+    backtest_start: str = "",
+    backtest_end: str = "",
+) -> dict[str, Any]:
+    category = _infer_symbol_data_category(symbol)
+    category_lower = category.lower()
+
+    if category_lower in {"forex", "metals", "indices", "energy"}:
+        suggested_source = "dukascopy"
+        alternatives = ["yfinance"]
+    elif category_lower in {"equities", "etfs"}:
+        suggested_source = "yfinance"
+        alternatives = ["dolthub"]
+    else:
+        suggested_source = "dukascopy"
+        alternatives = ["yfinance", "dolthub"]
+
+    return {
+        "code": "MISSING_OHLCV",
+        "message": f"Missing OHLCV data for {symbol} {timeframe}",
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "category": category,
+        "suggested_source": suggested_source,
+        "alternative_sources": alternatives,
+        "download_request": {
+            "source": suggested_source,
+            "symbols": symbol,
+            "timeframes": timeframe,
+            "start": backtest_start,
+            "end": backtest_end,
+        },
+    }
+
+
 def _df_to_ohlcv_records(df: pd.DataFrame) -> list[dict]:
     """Convert OHLCV DataFrame to list of dicts with Unix timestamps."""
     records = []
@@ -356,6 +467,47 @@ def _drawing_to_viewer(drawing: dict[str, Any]) -> dict[str, Any] | None:
         end_time = _drawing_timestamp_to_unix(drawing.get("end_time"))
         if start_time is None or end_time is None:
             logger.warning("Skipping drawing line with invalid timestamps: %s", drawing)
+            return None
+        payload["start_time"] = start_time
+        payload["end_time"] = end_time
+        if "start_value" not in payload and "val1" in payload:
+            payload["start_value"] = payload.get("val1")
+        if "end_value" not in payload and "val2" in payload:
+            payload["end_value"] = payload.get("val2")
+        if "val1" not in payload and "start_value" in payload:
+            payload["val1"] = payload.get("start_value")
+        if "val2" not in payload and "end_value" in payload:
+            payload["val2"] = payload.get("end_value")
+        return payload
+
+    if drawing_type == "line_with_breaks":
+        points = drawing.get("data", [])
+        if not isinstance(points, list) or not points:
+            logger.warning("Skipping line_with_breaks drawing with invalid data: %s", drawing)
+            return None
+        normalized_points: list[dict[str, Any]] = []
+        for point in points:
+            if not isinstance(point, dict):
+                continue
+            unix_time = _drawing_timestamp_to_unix(point.get("time"))
+            if unix_time is None:
+                continue
+            normalized_point = dict(point)
+            normalized_point["time"] = unix_time
+            normalized_points.append(normalized_point)
+        if not normalized_points:
+            logger.warning("Skipping line_with_breaks drawing without valid points: %s", drawing)
+            return None
+        payload["data"] = normalized_points
+        payload["start_time"] = normalized_points[0]["time"]
+        payload["end_time"] = normalized_points[-1]["time"]
+        return payload
+
+    if drawing_type == "box":
+        start_time = _drawing_timestamp_to_unix(drawing.get("start_time"))
+        end_time = _drawing_timestamp_to_unix(drawing.get("end_time"))
+        if start_time is None or end_time is None:
+            logger.warning("Skipping drawing box with invalid timestamps: %s", drawing)
             return None
         payload["start_time"] = start_time
         payload["end_time"] = end_time
@@ -1005,18 +1157,45 @@ def get_trade_with_context(backtest_id: str, trade_nr: int):
     # Load OHLCV context for this trade's symbol
     ohlcv = []
     df = _load_ohlcv_df(trade.symbol, tf)
+    if df is None or len(df) == 0:
+        details = _missing_ohlcv_details(
+            trade.symbol,
+            tf,
+            backtest_start=str(result.meta.backtest_start or ""),
+            backtest_end=str(result.meta.backtest_end or ""),
+        )
+        return jsonify({"error": details["message"], "detail": details}), 404
+
     ohlcv_start_idx = 0
     ohlcv_end_idx = 0
-    if df is not None and len(df) > 0:
-        entry_ts = pd.Timestamp(trade.entry_time, tz="UTC") if trade.entry_time else None
-        if entry_ts is not None:
-            idx = df["timestamp"].searchsorted(entry_ts)
-            ohlcv_start_idx = max(0, idx - BARS_BEFORE)
-            ohlcv_end_idx = min(len(df), idx + BARS_AFTER)
-            ohlcv = _df_to_ohlcv_records(df.iloc[ohlcv_start_idx:ohlcv_end_idx])
+    entry_ts = pd.Timestamp(trade.entry_time, tz="UTC") if trade.entry_time else None
+    if entry_ts is not None:
+        idx = df["timestamp"].searchsorted(entry_ts)
+        ohlcv_start_idx = max(0, idx - BARS_BEFORE)
+        ohlcv_end_idx = min(len(df), idx + BARS_AFTER)
+        ohlcv = _df_to_ohlcv_records(df.iloc[ohlcv_start_idx:ohlcv_end_idx])
 
     # Indicators: use embedded ones from backtest JSON, or compute from strategy
     indicators = [indicator.to_dict() for indicator in result.indicators]
+    for ind in indicators:
+        points = ind.get("data") if isinstance(ind, dict) else None
+        if not isinstance(points, list):
+            continue
+        normalized_points: list[dict] = []
+        for point in points:
+            if not isinstance(point, dict):
+                continue
+            raw_time = point.get("time")
+            unix_time = (
+                float(raw_time) if isinstance(raw_time, (int, float)) else _iso_to_unix(str(raw_time))
+            )
+            if unix_time <= 0:
+                continue
+            normalized_point = dict(point)
+            normalized_point["time"] = unix_time
+            normalized_points.append(normalized_point)
+        ind["data"] = normalized_points
+
     drawings = [
         viewer_drawing
         for drawing in result.drawings
@@ -1432,7 +1611,7 @@ def run_backtest():
         return jsonify({"error": "JSON body required"}), 400
 
     strategy = data.get("strategy", "")
-    engine = data.get("engine", "vectorbt")
+    engine = data.get("engine", "native")
     symbols = data.get("symbols", [])
     timeframe = data.get("timeframe", "1d")
     start = data.get("start", "")
@@ -2293,7 +2472,7 @@ def list_symbols():
 
 def _categorize_path(path_str: str) -> str:
     """Derive asset category from file path."""
-    p = path_str.lower()
+    p = path_str.replace("\\", "/").lower()
     if "/xauusd/" in p:
         return "Metals"
     if "/metals/" in p:

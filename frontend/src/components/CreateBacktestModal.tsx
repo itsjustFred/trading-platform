@@ -33,12 +33,6 @@ function getModelingTimeframes(mainTf: string): string[] {
   return [...TIMEFRAME_ORDER.slice(0, idx + 1)];
 }
 
-function getNextLowerTimeframe(mainTf: string): string {
-  const idx = TIMEFRAME_ORDER.indexOf(mainTf as (typeof TIMEFRAME_ORDER)[number]);
-  if (idx <= 0) return mainTf;
-  return TIMEFRAME_ORDER[idx - 1];
-}
-
 interface CreateBacktestModalProps {
   open: boolean;
   onClose: () => void;
@@ -53,7 +47,7 @@ export function CreateBacktestModal({
   const navigate = useNavigate();
   const [strategies, setStrategies] = useState<StrategyMeta[]>([]);
   const [strategy, setStrategy] = useState("");
-  const [engine, setEngine] = useState("vectorbt");
+  const [engine, setEngine] = useState("native");
   const [symbols, setSymbols] = useState("AAPL");
   const [timeframe, setTimeframe] = useState("1d");
   const [start, setStart] = useState("");
@@ -61,9 +55,7 @@ export function CreateBacktestModal({
   const [capital, setCapital] = useState("100000");
   const [riskPct, setRiskPct] = useState("");
   const [maxLeverage, setMaxLeverage] = useState("1.0");
-  const [modelingResolution, setModelingResolution] = useState<string>(
-    getNextLowerTimeframe("1d"),
-  );
+  const [modelingResolution, setModelingResolution] = useState<string>("1d");
   const [strategyParameters, setStrategyParameters] = useState<Record<string, string>>({});
   // Track original type to decide input type and payload conversion
   const [parameterTypes, setParameterTypes] = useState<Record<string, "number" | "string">>({});
@@ -122,13 +114,12 @@ export function CreateBacktestModal({
   useEffect(() => {
     if (!strategy) return;
     const meta = strategies.find((item) => item.file === strategy);
-    setEngine(meta?.engine === "pynecore" ? "pynecore" : "vectorbt");
+    setEngine(meta?.engine === "pynecore" ? "pynecore" : "native");
   }, [strategy, strategies]);
 
   // Update modeling resolution default when main timeframe changes
   useEffect(() => {
-    const nextLower = getNextLowerTimeframe(timeframe);
-    setModelingResolution(nextLower);
+    setModelingResolution(timeframe);
   }, [timeframe]);
 
   const modelingTimeframes = useMemo(() => getModelingTimeframes(timeframe), [timeframe]);
@@ -248,9 +239,20 @@ export function CreateBacktestModal({
     fontSize: "0.78rem",
     fontWeight: 600,
     letterSpacing: "0.5px",
-    background: engine === "pynecore" ? "rgba(163,113,247,0.15)" : "rgba(88,166,255,0.12)",
-    color: engine === "pynecore" ? "#a371f7" : "#58a6ff",
-    border: `1px solid ${engine === "pynecore" ? "rgba(163,113,247,0.3)" : "rgba(88,166,255,0.25)"}`,
+    background:
+      engine === "pynecore"
+        ? "rgba(163,113,247,0.15)"
+        : engine === "native"
+          ? "rgba(63,185,80,0.16)"
+          : "rgba(88,166,255,0.12)",
+    color: engine === "pynecore" ? "#a371f7" : engine === "native" ? "#3fb950" : "#58a6ff",
+    border: `1px solid ${
+      engine === "pynecore"
+        ? "rgba(163,113,247,0.3)"
+        : engine === "native"
+          ? "rgba(63,185,80,0.35)"
+          : "rgba(88,166,255,0.25)"
+    }`,
   };
 
   return (

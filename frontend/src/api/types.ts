@@ -103,7 +103,34 @@ export interface Trade {
   duration: string;
   bars_held?: number;
   holding_bars?: number;
+  exits?: TradeExitView[];
   meta?: Record<string, unknown>;
+}
+
+export interface TradeExitView {
+  time: number;
+  time_iso?: string;
+  price: number;
+  quantity: number;
+  pnl?: number;
+  reason?: string;
+}
+
+export interface MissingOHLCVDetail {
+  code: "MISSING_OHLCV";
+  message: string;
+  symbol: string;
+  timeframe: string;
+  category?: string;
+  suggested_source: string;
+  alternative_sources?: string[];
+  download_request?: {
+    source: string;
+    symbols: string;
+    timeframes: string;
+    start?: string;
+    end?: string;
+  };
 }
 
 export interface IndicatorPoint {
@@ -296,8 +323,10 @@ export interface ChartLineDrawing {
   type: "line";
   start_time: number;
   end_time: number;
-  val1: number;
-  val2: number;
+  start_value?: number;
+  end_value?: number;
+  val1?: number;
+  val2?: number;
   color?: string;
   symbol?: string;
   title?: string;
@@ -305,7 +334,38 @@ export interface ChartLineDrawing {
   lineStyle?: number | "solid" | "dashed" | "dotted";
 }
 
-export type TradeDrawing = ChartMarkerDrawing | ChartLineDrawing;
+export interface ChartLineWithBreaksDrawing {
+  type: "line_with_breaks";
+  data: Array<{
+    time: number;
+    value: number | null;
+    color?: string;
+  }>;
+  color?: string;
+  symbol?: string;
+  title?: string;
+  lineWidth?: number;
+  lineStyle?: number | "solid" | "dashed" | "dotted";
+  start_time?: number;
+  end_time?: number;
+}
+
+export interface ChartBoxDrawing {
+  type: "box";
+  start_time: number;
+  end_time: number;
+  low: number;
+  high: number;
+  color?: string;
+  border_color?: string;
+  symbol?: string;
+}
+
+export type TradeDrawing =
+  | ChartMarkerDrawing
+  | ChartLineDrawing
+  | ChartLineWithBreaksDrawing
+  | ChartBoxDrawing;
 
 export interface TradeChartResponse {
   trade: Trade;

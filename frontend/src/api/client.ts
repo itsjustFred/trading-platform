@@ -28,6 +28,18 @@ import type {
 
 const BASE_URL = "/api";
 
+export class ApiError extends Error {
+  status: number;
+  detail: unknown;
+
+  constructor(message: string, status: number, detail: unknown) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.detail = detail;
+  }
+}
+
 async function fetchJSON<T>(url: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE_URL}${url}`, {
     headers: { "Content-Type": "application/json" },
@@ -35,7 +47,14 @@ async function fetchJSON<T>(url: string, options?: RequestInit): Promise<T> {
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: res.statusText }));
-    throw new Error(err.error || res.statusText);
+    const detail = err?.detail ?? err;
+    const message =
+      (typeof detail === "object" && detail && "message" in detail
+        ? String((detail as { message?: unknown }).message ?? "")
+        : "") ||
+      err?.error ||
+      res.statusText;
+    throw new ApiError(message, res.status, detail);
   }
   return res.json();
 }

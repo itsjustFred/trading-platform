@@ -4,12 +4,18 @@ import {
   getBacktestTrades,
   getBacktestTrade,
   getBacktestInfo,
+  downloadData,
+  getDataTask,
+  ApiError,
 } from "../api/client";
 import type {
   BacktestInfo,
+  ChartBoxDrawing,
   ChartLineDrawing,
+  ChartLineWithBreaksDrawing,
   ChartMarkerDrawing,
   IndicatorSeriesView,
+  MissingOHLCVDetail,
   Trade,
   TradeChartResponse,
   TradeDrawing,
@@ -59,6 +65,16 @@ function isMarkerDrawing(drawing: TradeDrawing): drawing is ChartMarkerDrawing {
 
 function isLineDrawing(drawing: TradeDrawing): drawing is ChartLineDrawing {
   return drawing.type === "line";
+}
+
+function isLineWithBreaksDrawing(
+  drawing: TradeDrawing,
+): drawing is ChartLineWithBreaksDrawing {
+  return drawing.type === "line_with_breaks";
+}
+
+function isBoxDrawing(drawing: TradeDrawing): drawing is ChartBoxDrawing {
+  return drawing.type === "box";
 }
 
 function normalizeMarkerPosition(value: unknown): "aboveBar" | "belowBar" | "inBar" {
@@ -114,15 +130,53 @@ function drawingFallsWithinWindow(
   if (isMarkerDrawing(drawing)) {
     return drawing.time >= startTime && drawing.time <= endTime;
   }
+  if (isLineWithBreaksDrawing(drawing)) {
+    const first = drawing.data?.[0]?.time;
+    const last = drawing.data?.[drawing.data.length - 1]?.time;
+    if (typeof first !== "number" || typeof last !== "number") {
+      return false;
+    }
+    return last >= startTime && first <= endTime;
+  }
   return drawing.end_time >= startTime && drawing.start_time <= endTime;
+}
+
+function isMissingOHLCVDetail(value: unknown): value is MissingOHLCVDetail {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  const candidate = value as Record<string, unknown>;
+  return (
+    candidate.code === "MISSING_OHLCV" &&
+    typeof candidate.symbol === "string" &&
+    typeof candidate.timeframe === "string"
+  );
+}
+
+function sourceButtonLabel(source: string): string {
+  if (source === "dukascopy") {
+    return "Download from Dukascopy";
+  }
+  if (source === "yfinance") {
+    return "Download from Yahoo Finance";
+  }
+  if (source === "dolthub") {
+    return "Sync from Dolthub";
+  }
+  return "Download data";
 }
 
 export function TradeChartPage() {
   const { id, nr } = useParams<{ id: string; nr: string }>();
   const navigate = useNavigate();
   const [trades, setTrades] = useState<Trade[]>([]);
-  const [_info, setInfo] = useState<BacktestInfo | null>(null);
+  const [info, setInfo] = useState<BacktestInfo | null>(null);
   const [tradeData, setTradeData] = useState<TradeChartResponse | null>(null);
+  const [isLoadingTrade, setIsLoadingTrade] = useState(false);
+  const [missingData, setMissingData] = useState<MissingOHLCVDetail | null>(null);
+  const [downloadTaskId, setDownloadTaskId] = useState<string | null>(null);
+  const [downloadStatus, setDownloadStatus] = useState<string>("idle");
+  const [downloadError, setDownloadError] = useState<string>("");
   const [currentNr, setCurrentNr] = useState(parseInt(nr || "1"));
   const chartContainerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
@@ -144,10 +198,55 @@ export function TradeChartPage() {
   // Load OHLCV data for current trade
   useEffect(() => {
     if (!id || !currentNr) return;
+
+    setIsLoadingTrade(true);
+    setDownloadTaskId(null);
+    setDownloadStatus("idle");
+    setDownloadError("");
     getBacktestTrade(id, currentNr)
-      .then(setTradeData)
-      .catch(() => setTradeData(null));
+      .then((payload) => {
+        setTradeData(payload);
+        setMissingData(null);
+      })
+      .catch((err: unknown) => {
+        if (err instanceof ApiError && isMissingOHLCVDetail(err.detail)) {
+          setMissingData(err.detail);
+          setTradeData(null);
+          return;
+        }
+        setMissingData(null);
+        setTradeData(null);
+      })
+      .finally(() => setIsLoadingTrade(false));
   }, [id, currentNr]);
+
+  useEffect(() => {
+    if (!downloadTaskId) {
+      return;
+    }
+    if (["completed", "failed", "cancelled"].includes(downloadStatus)) {
+      return;
+    }
+
+    const interval = window.setInterval(() => {
+      getDataTask(downloadTaskId)
+        .then((task) => {
+          const status = (task.status || "running").toLowerCase();
+          setDownloadStatus(status);
+          if (status === "failed") {
+            setDownloadError(task.log || "Download failed");
+          }
+        })
+        .catch((err: unknown) => {
+          setDownloadStatus("failed");
+          setDownloadError(
+            err instanceof Error ? err.message : "Could not read download task status",
+          );
+        });
+    }, 1500);
+
+    return () => window.clearInterval(interval);
+  }, [downloadTaskId, downloadStatus]);
 
   // Render chart when data arrives
   useEffect(() => {
@@ -160,6 +259,7 @@ export function TradeChartPage() {
     }
 
     const container = chartContainerRef.current;
+    container.style.position = "relative";
     const w = container.clientWidth || 1100;
     const h = 460;
     const locale =
@@ -244,14 +344,32 @@ export function TradeChartPage() {
         shape: trade.direction === "LONG" ? "arrowUp" : "arrowDown",
         text: `${trade.direction} @ ${trade.entry_price?.toFixed(2)}`,
       });
-      // Exit marker
-      markers.push({
-        time: trade.exit_time as Time,
-        position: trade.direction === "LONG" ? "aboveBar" : "belowBar",
-        color: trade.pnl >= 0 ? "#3fb950" : "#f85149",
-        shape: "circle",
-        text: `Exit @ ${trade.exit_price?.toFixed(2)} (${trade.pnl >= 0 ? "+" : ""}$${trade.pnl?.toFixed(0)})`,
-      });
+
+      if (Array.isArray(trade.exits) && trade.exits.length > 0) {
+        trade.exits.forEach((exit, index) => {
+          const finalExit = index === trade.exits!.length - 1;
+          markers.push({
+            time: exit.time as Time,
+            position: trade.direction === "LONG" ? "aboveBar" : "belowBar",
+            color: finalExit
+              ? trade.pnl >= 0
+                ? "#3fb950"
+                : "#f85149"
+              : "#f59e0b",
+            shape: "circle",
+            text: `${finalExit ? "Exit" : "Partial"} @ ${exit.price?.toFixed(2)}${exit.reason ? ` (${exit.reason})` : ""}`,
+          });
+        });
+      } else {
+        markers.push({
+          time: trade.exit_time as Time,
+          position: trade.direction === "LONG" ? "aboveBar" : "belowBar",
+          color: trade.pnl >= 0 ? "#3fb950" : "#f85149",
+          shape: "circle",
+          text: `Exit @ ${trade.exit_price?.toFixed(2)} (${trade.pnl >= 0 ? "+" : ""}$${trade.pnl?.toFixed(0)})`,
+        });
+      }
+
       // Entry/exit horizontal lines
       candleSeries.createPriceLine({
         price: trade.entry_price,
@@ -289,6 +407,17 @@ export function TradeChartPage() {
     );
 
     visibleDrawings.filter(isLineDrawing).forEach((drawing, index) => {
+      const startValue =
+        typeof drawing.start_value === "number"
+          ? drawing.start_value
+          : drawing.val1;
+      const endValue =
+        typeof drawing.end_value === "number"
+          ? drawing.end_value
+          : drawing.val2;
+      if (typeof startValue !== "number" || typeof endValue !== "number") {
+        return;
+      }
       const lineSeries = chart.addSeries(LineSeries, {
         color: drawing.color || "#f59e0b",
         lineWidth: resolveLineWidth(drawing.lineWidth ?? 2),
@@ -298,10 +427,72 @@ export function TradeChartPage() {
         priceLineVisible: false,
       });
       lineSeries.setData([
-        { time: drawing.start_time as Time, value: drawing.val1 },
-        { time: drawing.end_time as Time, value: drawing.val2 },
+        { time: drawing.start_time as Time, value: startValue },
+        { time: drawing.end_time as Time, value: endValue },
       ]);
     });
+
+    visibleDrawings.filter(isLineWithBreaksDrawing).forEach((drawing, index) => {
+      const lineSeries = chart.addSeries(LineSeries, {
+        color: drawing.color || "#f59e0b",
+        lineWidth: resolveLineWidth(drawing.lineWidth ?? 2),
+        lineStyle: resolveLineStyle(drawing.lineStyle),
+        title: drawing.title || `LineBreak ${index + 1}`,
+        lastValueVisible: false,
+        priceLineVisible: false,
+      });
+      lineSeries.setData(
+        (drawing.data || []).map((point) => {
+          if (point.value === null || Number.isNaN(point.value)) {
+            return { time: point.time as Time };
+          }
+          return { time: point.time as Time, value: point.value };
+        }),
+      );
+    });
+
+    const boxOverlayRoot = document.createElement("div");
+    boxOverlayRoot.style.position = "absolute";
+    boxOverlayRoot.style.left = "0";
+    boxOverlayRoot.style.top = "0";
+    boxOverlayRoot.style.width = "100%";
+    boxOverlayRoot.style.height = `${h}px`;
+    boxOverlayRoot.style.pointerEvents = "none";
+    container.appendChild(boxOverlayRoot);
+
+    const renderBoxes = () => {
+      boxOverlayRoot.replaceChildren();
+      visibleDrawings.filter(isBoxDrawing).forEach((drawing) => {
+        const left = chart.timeScale().timeToCoordinate(drawing.start_time as Time);
+        const right = chart.timeScale().timeToCoordinate(drawing.end_time as Time);
+        const top = candleSeries.priceToCoordinate(drawing.high);
+        const bottom = candleSeries.priceToCoordinate(drawing.low);
+        if (
+          left === null ||
+          right === null ||
+          top === null ||
+          bottom === null ||
+          !Number.isFinite(left) ||
+          !Number.isFinite(right) ||
+          !Number.isFinite(top) ||
+          !Number.isFinite(bottom)
+        ) {
+          return;
+        }
+
+        const box = document.createElement("div");
+        box.style.position = "absolute";
+        box.style.left = `${Math.min(left, right)}px`;
+        box.style.width = `${Math.max(1, Math.abs(right - left))}px`;
+        box.style.top = `${Math.min(top, bottom)}px`;
+        box.style.height = `${Math.max(1, Math.abs(bottom - top))}px`;
+        box.style.background = drawing.color || "rgba(88, 166, 255, 0.1)";
+        box.style.border = `1px solid ${drawing.border_color || "#58a6ff"}`;
+        box.style.boxSizing = "border-box";
+        boxOverlayRoot.appendChild(box);
+      });
+    };
+    renderBoxes();
 
     // Indicator overlays
     if (tradeData.indicators && Array.isArray(tradeData.indicators)) {
@@ -365,12 +556,14 @@ export function TradeChartPage() {
     const resizeObserver = new ResizeObserver(() => {
       if (container.clientWidth > 0) {
         chart.resize(container.clientWidth, h);
+        renderBoxes();
       }
     });
     resizeObserver.observe(container);
 
     return () => {
       resizeObserver.disconnect();
+      boxOverlayRoot.remove();
       chart.remove();
       chartRef.current = null;
     };
@@ -393,6 +586,57 @@ export function TradeChartPage() {
 
   const currentTrade =
     tradeData?.trade ?? trades.find((t) => t.nr === currentNr);
+
+  const triggerMissingDataDownload = async () => {
+    if (!missingData) {
+      return;
+    }
+    const request = missingData.download_request;
+    const source = request?.source || missingData.suggested_source || "dukascopy";
+    const symbols = request?.symbols || missingData.symbol;
+    const timeframes = request?.timeframes || missingData.timeframe;
+    const start = request?.start || info?.timeframe?.start || "";
+    const end = request?.end || info?.timeframe?.end || "";
+
+    setDownloadStatus("starting");
+    setDownloadError("");
+    try {
+      const started = await downloadData({
+        source,
+        symbols,
+        timeframes,
+        start,
+        end,
+      });
+      setDownloadTaskId(started.task_id);
+      setDownloadStatus(started.status || "running");
+    } catch (err) {
+      setDownloadStatus("failed");
+      setDownloadError(err instanceof Error ? err.message : "Could not start download");
+    }
+  };
+
+  const reloadCurrentTrade = () => {
+    if (!id || !currentNr) {
+      return;
+    }
+    setIsLoadingTrade(true);
+    getBacktestTrade(id, currentNr)
+      .then((payload) => {
+        setTradeData(payload);
+        setMissingData(null);
+      })
+      .catch((err: unknown) => {
+        if (err instanceof ApiError && isMissingOHLCVDetail(err.detail)) {
+          setMissingData(err.detail);
+          setTradeData(null);
+          return;
+        }
+        setMissingData(null);
+        setTradeData(null);
+      })
+      .finally(() => setIsLoadingTrade(false));
+  };
   const tradeContextEntries = useMemo(() => {
     const meta = currentTrade?.meta;
     if (!meta || typeof meta !== "object") {
@@ -408,6 +652,7 @@ export function TradeChartPage() {
     <div style={{ padding: "24px" }}>
       {/* Toolbar */}
       <div
+        data-testid="trade-chart-area"
         style={{
           background: "var(--color-surface)",
           border: "1px solid var(--color-border)",
@@ -704,8 +949,85 @@ export function TradeChartPage() {
         {tradeData?.ohlcv?.length ? (
           <div
             ref={chartContainerRef}
+            data-testid="trade-chart-canvas"
             style={{ width: "100%", height: "460px" }}
           />
+        ) : missingData ? (
+          <div
+            data-testid="missing-ohlcv"
+            style={{
+              minHeight: "460px",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              padding: "24px",
+            }}
+          >
+            <div
+              style={{
+                width: "min(680px, 100%)",
+                border: "1px solid var(--color-border)",
+                borderRadius: "10px",
+                background: "var(--color-surface2)",
+                padding: "20px",
+              }}
+            >
+              <div style={{ fontSize: "1rem", fontWeight: 700, marginBottom: "8px" }}>
+                Missing OHLCV data for {missingData.symbol} {missingData.timeframe}
+              </div>
+              <div style={{ color: "var(--color-text-muted)", fontSize: "0.9rem" }}>
+                Source suggestion: <strong>{missingData.suggested_source}</strong>
+                {missingData.alternative_sources?.length
+                  ? ` (alternatives: ${missingData.alternative_sources.join(", ")})`
+                  : ""}
+              </div>
+
+              <div style={{ display: "flex", gap: "10px", marginTop: "16px", flexWrap: "wrap" }}>
+                <button
+                  data-testid="missing-data-download-btn"
+                  onClick={triggerMissingDataDownload}
+                  disabled={downloadStatus === "starting" || downloadStatus === "running"}
+                  style={{
+                    border: "1px solid #3fb950",
+                    borderRadius: "8px",
+                    background: "rgba(63, 185, 80, 0.12)",
+                    color: "#3fb950",
+                    padding: "8px 12px",
+                    cursor: "pointer",
+                    fontWeight: 600,
+                  }}
+                >
+                  {sourceButtonLabel(missingData.suggested_source)}
+                </button>
+
+                <button
+                  onClick={reloadCurrentTrade}
+                  data-testid="missing-data-reload-btn"
+                  style={{
+                    border: "1px solid var(--color-border)",
+                    borderRadius: "8px",
+                    background: "var(--color-surface)",
+                    color: "var(--color-text)",
+                    padding: "8px 12px",
+                    cursor: "pointer",
+                  }}
+                >
+                  Reload chart
+                </button>
+              </div>
+
+              <div style={{ marginTop: "12px", fontSize: "0.82rem", color: "var(--color-text-muted)" }}>
+                {downloadTaskId
+                  ? `Download task ${downloadTaskId} status: ${downloadStatus}`
+                  : "No automatic download is started. Use the button above to trigger a download."}
+              </div>
+              {downloadError ? (
+                <div style={{ marginTop: "8px", color: "#f85149", fontSize: "0.82rem" }}>
+                  {downloadError}
+                </div>
+              ) : null}
+            </div>
+          </div>
         ) : (
           <div
             style={{
@@ -716,7 +1038,7 @@ export function TradeChartPage() {
               color: "var(--color-text-muted)",
             }}
           >
-            {tradeData === null
+            {isLoadingTrade
               ? "Loading chart data..."
               : "No OHLCV data available"}
           </div>

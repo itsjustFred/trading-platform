@@ -1,8 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { TerminalSquare } from "lucide-react";
 
-import { getDataTaskLogs } from "../api/client";
-
 interface LiveTerminalProps {
   jobId: string | null;
   onStatusChange?: (status: string) => void;
@@ -25,35 +23,46 @@ export function LiveTerminal({
       return;
     }
 
-    let cancelled = false;
+    setLogs("");
+    setStatus("connecting");
+    onStatusChange?.("connecting");
 
-    const poll = async () => {
-      try {
-        const payload = await getDataTaskLogs(jobId);
-        if (cancelled) {
-          return;
-        }
-        const nextStatus = payload.status || "unknown";
-        setLogs(payload.logs || "");
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const ws = new WebSocket(`${protocol}//${window.location.host}/ws/tasks/${jobId}`);
+
+    ws.onopen = () => {
+      setStatus("connected");
+      onStatusChange?.("connected");
+    };
+
+    ws.onmessage = (event) => {
+      const line = String(event.data ?? "");
+      setLogs((prev) => (prev ? `${prev}\n${line}` : line));
+
+      const statusMatch = line.match(/\[task:[^\]]+\]\s+status=(\w+)/i);
+      if (statusMatch?.[1]) {
+        const nextStatus = statusMatch[1].toLowerCase();
         setStatus(nextStatus);
         onStatusChange?.(nextStatus);
-      } catch {
-        if (cancelled) {
-          return;
-        }
-        setStatus("disconnected");
-        onStatusChange?.("disconnected");
       }
     };
 
-    void poll();
-    const interval = window.setInterval(() => {
-      void poll();
-    }, 1000);
+    ws.onerror = () => {
+      setStatus("disconnected");
+      onStatusChange?.("disconnected");
+    };
+
+    ws.onclose = () => {
+      setStatus((prev) =>
+        prev === "completed" || prev === "failed" || prev === "cancelled"
+          ? prev
+          : "disconnected",
+      );
+      onStatusChange?.("disconnected");
+    };
 
     return () => {
-      cancelled = true;
-      window.clearInterval(interval);
+      ws.close();
     };
   }, [jobId, onStatusChange]);
 

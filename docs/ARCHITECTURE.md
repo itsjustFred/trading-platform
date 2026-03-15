@@ -4,12 +4,12 @@ This is the current "state of the union" for the trading-platform repository.
 
 ## Stack summary
 
-- **Backend API:** Flask (`viewer/app.py`)
+- **Backend API:** FastAPI (`viewer/main.py`)
 - **Frontend:** React + TypeScript + Vite (`frontend/`)
-- **Primary backtest engine:** vectorbt (`runner/engines/vectorbt_adapter.py`)
-- **Additional engines:** PyneCore and LEAN adapters
+- **Primary backtest engine:** native event-based engine (`runner/engines/native_adapter.py`)
+- **Additional engines:** vectorbt, PyneCore and LEAN adapters
 - **Performance/statistics:** `runner/stats.py`, QuantStats-derived metrics, custom p-value / PSR handling
-- **Persistence format:** universal `BacktestResult` JSON from `shared/models.py`
+- **Persistence:** SQLite (`$DATA_DIR/backtests.db`) + JSON compatibility (`$DATA_DIR/backtests/*.trades.json`)
 
 ## End-to-end flow
 
@@ -27,10 +27,10 @@ runner/cli.py
 shared.models.BacktestResult
     |
     v
-$TRADING_DATA_DIR/backtests/*.trades.json
+$DATA_DIR/backtests.db
     |
     v
-viewer/app.py
+viewer/main.py
     |
     v
 frontend/src/api/client.ts
@@ -61,7 +61,7 @@ Execution and conversion layer.
 - `runner/cli.py`
   - constructs `BacktestConfig`
   - dispatches to an engine adapter
-  - persists results to `$TRADING_DATA_DIR/backtests`
+  - persists results to `$DATA_DIR/backtests` (JSON) and `$DATA_DIR/backtests.db` (SQLite)
 - `runner/stats.py`
   - computes Sharpe, Sortino, Calmar, drawdown, PSR, p-value, and related metrics
 - `runner/auto_agent.py`
@@ -75,7 +75,7 @@ Execution and conversion layer.
 
 ### `viewer/`
 
-Operational Flask application.
+Operational FastAPI application.
 
 - Lists backtests, strategies, portfolios, logs, and data catalog entries
 - Builds equity/drawdown payloads for charts
@@ -85,6 +85,7 @@ Operational Flask application.
   - resampling
   - strategy auto-conversion
 - Serves the built frontend from `frontend/dist`
+- Streams task logs over WebSocket (`/ws/tasks/{job_id}`)
 
 ## Frontend structure
 
@@ -114,10 +115,11 @@ The SPA lives in `frontend/src/`.
 
 ### API contract
 
-`frontend/src/api/client.ts` mirrors Flask endpoints. When fields change in the
+`frontend/src/api/client.ts` mirrors backend endpoints. When fields change in the
 backend, the following files must stay synchronized:
 
-- `viewer/app.py`
+- `viewer/main.py`
+- `viewer/core.py` (shared helper logic)
 - `frontend/src/api/client.ts`
 - `frontend/src/api/types.ts`
 
@@ -126,7 +128,7 @@ backend, the following files must stay synchronized:
 ### Canonical data path
 
 ```text
-$TRADING_DATA_DIR/ohlcv/{source}/{asset_class}/[{region}/]{symbol}/{timeframe}.parquet
+$DATA_DIR/ohlcv/{source}/{asset_class}/[{region}/]{symbol}/{timeframe}.parquet
 ```
 
 ### Supporting tools
@@ -180,8 +182,8 @@ Typical local workflow:
 ```bash
 .venv/bin/python -m pytest tests -q
 cd frontend && npm run build
-python -m viewer.app --port 5556
+uvicorn viewer.main:app --host 0.0.0.0 --port 5556
 ```
 
-Frontend development uses Vite; production/runtime serving uses Flask plus the
-built `frontend/dist` assets.
+Frontend development uses Vite; production/runtime serving uses FastAPI with
+built `frontend/dist` assets, plus SPA/static middleware and WebSocket endpoints.

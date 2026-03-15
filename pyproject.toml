@@ -12,14 +12,18 @@ dependencies = [
     "pydantic>=2.0",
     "plotly>=6.0",
     "aiohttp>=3.9",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "python-multipart>=0.0.9",
+    "websockets>=16.0",
+    "sqlmodel>=0.0.22",
 ]
 
 [project.optional-dependencies]
 vectorbt = ["vectorbt>=0.26", "yfinance>=0.2.31"]
 lean = ["lean>=1.0"]
-viewer = ["flask>=3.0", "flask-cors>=4.0"]
 dev = ["pytest>=8.0", "ruff>=0.3"]
-all = ["trading-platform[vectorbt,viewer,dev]"]
+all = ["trading-platform[vectorbt,dev]"]
 
 [build-system]
 requires = ["hatchling"]

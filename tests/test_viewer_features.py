@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
+from fastapi.testclient import TestClient
 
 from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, TradeExit
 
@@ -19,16 +20,24 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 @pytest.fixture
 def viewer_client(monkeypatch, tmp_path):
-    import viewer.app as viewer_app_module
+    import viewer.main as viewer_app_module
 
-    monkeypatch.setattr(viewer_app_module, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(viewer_app_module, "BACKTESTS_DIR", tmp_path / "backtests")
-    monkeypatch.setattr(viewer_app_module, "LOGS_DIR", tmp_path / "logs")
-    monkeypatch.setattr(viewer_app_module, "TASK_LOGS_DIR", tmp_path / "logs" / "tasks")
-    monkeypatch.setattr(viewer_app_module, "OPTIMIZATIONS_DIR", tmp_path / "optimizations")
+    legacy_module = viewer_app_module.legacy_viewer
+
+    for module in (viewer_app_module, legacy_module):
+        monkeypatch.setattr(module, "DATA_DIR", tmp_path)
+        monkeypatch.setattr(module, "BACKTESTS_DIR", tmp_path / "backtests")
+        monkeypatch.setattr(module, "LOGS_DIR", tmp_path / "logs")
+        monkeypatch.setattr(module, "TASK_LOGS_DIR", tmp_path / "logs" / "tasks")
+        monkeypatch.setattr(module, "OPTIMIZATIONS_DIR", tmp_path / "optimizations")
+        monkeypatch.setattr(module, "PORTFOLIOS_DIR", tmp_path / "portfolios")
+
+    monkeypatch.setattr(viewer_app_module, "list_backtest_ids", lambda: [])
+    monkeypatch.setattr(viewer_app_module, "load_backtest_result", lambda _backtest_id: None)
+    monkeypatch.setattr(viewer_app_module, "save_result_to_sqlite", lambda _result: None)
+    monkeypatch.setattr(viewer_app_module, "migrate_json_to_sqlite", lambda: {"migrated": 0, "failed": 0, "total": 0})
     viewer_app_module.DATA_TASKS.clear()
-    viewer_app_module.app.config["TESTING"] = True
-    return viewer_app_module.app.test_client()
+    return TestClient(viewer_app_module.app)
 
 
 def test_get_dukascopy_genesis(viewer_client, tmp_path):
@@ -50,7 +59,7 @@ def test_get_dukascopy_genesis(viewer_client, tmp_path):
     resp = viewer_client.get("/api/data/dukascopy/genesis?symbols=EURUSD,XAUUSD,GBPUSD&timeframes=d1,sec,4h")
 
     assert resp.status_code == 200
-    data = resp.get_json()
+    data = resp.json()
     assert data["source"] == "dukascopy"
     assert data["genesis"] == {
         "EURUSD": {
@@ -92,10 +101,11 @@ def test_data_download_rejects_dates_before_genesis(viewer_client, tmp_path):
     )
 
     assert resp.status_code == 400
-    payload = resp.get_json()
-    assert "precedes Dukascopy genesis" in payload["error"]
-    assert "EURUSD/s1 >= 2003-05-04" in payload["error"]
-    assert "XAUUSD/s1 >= 2003-05-04" in payload["error"]
+    payload = resp.json()
+    message = payload.get("error") or payload.get("detail", "")
+    assert "precedes Dukascopy genesis" in message
+    assert "EURUSD/s1 >= 2003-05-04" in message
+    assert "XAUUSD/s1 >= 2003-05-04" in message
 
 
 def test_trade_detail_includes_meta(viewer_client, tmp_path):
@@ -174,7 +184,7 @@ def test_trade_detail_includes_meta(viewer_client, tmp_path):
     resp = viewer_client.get("/api/backtest/meta-demo/trade/1")
 
     assert resp.status_code == 200
-    payload = resp.get_json()
+    payload = resp.json()
     assert payload["trade"]["meta"] == {
         "SMA_Fast": 150.2,
         "Signal_Strength": "High",
@@ -207,7 +217,7 @@ def test_data_overview_and_category_use_catalog_date_ranges(viewer_client, tmp_p
     assert overview_resp.status_code == 200
     categories = {
         category["name"]: category
-        for category in overview_resp.get_json()["categories"]
+        for category in overview_resp.json()["categories"]
     }
     assert categories["ETFs"]["start"] == "2024-01-02"
     assert categories["ETFs"]["end"] == "2024-02-09"
@@ -215,7 +225,7 @@ def test_data_overview_and_category_use_catalog_date_ranges(viewer_client, tmp_p
     details_resp = viewer_client.get("/api/data/category/ETFs")
 
     assert details_resp.status_code == 200
-    assert details_resp.get_json()["symbols"] == [
+    assert details_resp.json()["symbols"] == [
         {
             "symbol": "SPY",
             "timeframe": "1d",
@@ -250,7 +260,7 @@ def test_data_endpoints_read_fast_date_ranges_without_catalog(viewer_client, tmp
     assert overview_resp.status_code == 200
     categories = {
         category["name"]: category
-        for category in overview_resp.get_json()["categories"]
+        for category in overview_resp.json()["categories"]
     }
     assert categories["Equities"]["start"] == "2024-03-01"
     assert categories["Equities"]["end"] == "2024-03-03"
@@ -258,7 +268,7 @@ def test_data_endpoints_read_fast_date_ranges_without_catalog(viewer_client, tmp
     details_resp = viewer_client.get("/api/data/category/Equities")
 
     assert details_resp.status_code == 200
-    assert details_resp.get_json()["symbols"] == [
+    assert details_resp.json()["symbols"] == [
         {
             "symbol": "AAPL",
             "timeframe": "1d",
@@ -295,7 +305,7 @@ def test_data_category_includes_warning_message_from_catalog(viewer_client, tmp_
     resp = viewer_client.get("/api/data/category/Equities")
 
     assert resp.status_code == 200
-    assert resp.get_json()["symbols"] == [
+    assert resp.json()["symbols"] == [
         {
             "symbol": "MSFT",
             "timeframe": "1d",
@@ -334,7 +344,7 @@ def test_dolthub_exports_appear_as_equities(viewer_client, tmp_path):
     assert overview_resp.status_code == 200
     categories = {
         category["name"]: category
-        for category in overview_resp.get_json()["categories"]
+        for category in overview_resp.json()["categories"]
     }
     assert categories["Equities"]["symbol_count"] == 1
     assert categories["Equities"]["start"] == "2024-04-01"
@@ -343,7 +353,7 @@ def test_dolthub_exports_appear_as_equities(viewer_client, tmp_path):
     details_resp = viewer_client.get("/api/data/category/Equities")
 
     assert details_resp.status_code == 200
-    assert details_resp.get_json()["symbols"] == [
+    assert details_resp.json()["symbols"] == [
         {
             "symbol": "MSFT",
             "timeframe": "1d",
@@ -363,7 +373,7 @@ def test_dolthub_repo_entries_are_marked_ok(viewer_client, tmp_path):
     resp = viewer_client.get("/api/data/category/Dolthub%20Repos")
 
     assert resp.status_code == 200
-    symbols = resp.get_json()["symbols"]
+    symbols = resp.json()["symbols"]
     assert len(symbols) == 1
     assert symbols[0]["symbol"] == "stocks"
     assert symbols[0]["timeframe"] == "repo"
@@ -380,7 +390,7 @@ def test_dolthub_repo_entries_are_marked_ok(viewer_client, tmp_path):
 
 
 def test_data_download_passes_price_type_and_merge_flags(viewer_client, monkeypatch):
-    import viewer.app as viewer_app_module
+    import viewer.main as viewer_app_module
 
     captured: dict[str, object] = {}
 
@@ -423,12 +433,12 @@ def test_data_download_passes_price_type_and_merge_flags(viewer_client, monkeypa
 
 
 def test_data_tasks_list_and_controls(viewer_client, tmp_path):
-    import viewer.app as viewer_app_module
+    import viewer.main as viewer_app_module
 
     task_id = "controllable-task"
     log_file = tmp_path / "logs" / "tasks" / f"task_{task_id}.log"
     log_file.parent.mkdir(parents=True, exist_ok=True)
-    log_file.write_text("✅ step complete\n")
+    log_file.write_text("✅ step complete\n", encoding="utf-8")
     viewer_app_module.DATA_TASKS[task_id] = viewer_app_module._create_task_record(
         task_id,
         name="Download EURUSD tick",
@@ -444,7 +454,7 @@ def test_data_tasks_list_and_controls(viewer_client, tmp_path):
 
     list_resp = viewer_client.get("/api/data/tasks")
     assert list_resp.status_code == 200
-    tasks = list_resp.get_json()["tasks"]
+    tasks = list_resp.json()["tasks"]
     assert tasks[0]["id"] == task_id
     assert tasks[0]["progress"]["completed"] == 1
     assert tasks[0]["can_pause"] is True
@@ -452,21 +462,21 @@ def test_data_tasks_list_and_controls(viewer_client, tmp_path):
     pause_resp = viewer_client.post(f"/api/data/tasks/{task_id}/pause")
     assert pause_resp.status_code == 200
     assert viewer_app_module.DATA_TASKS[task_id]["pause_event"].is_set()
-    assert pause_resp.get_json()["status"] == "paused"
+    assert pause_resp.json()["status"] == "paused"
 
     resume_resp = viewer_client.post(f"/api/data/tasks/{task_id}/resume")
     assert resume_resp.status_code == 200
     assert not viewer_app_module.DATA_TASKS[task_id]["pause_event"].is_set()
-    assert resume_resp.get_json()["status"] == "running"
+    assert resume_resp.json()["status"] == "running"
 
     cancel_resp = viewer_client.post(f"/api/data/tasks/{task_id}/cancel")
     assert cancel_resp.status_code == 200
     assert viewer_app_module.DATA_TASKS[task_id]["stop_event"].is_set()
-    assert cancel_resp.get_json()["status"] == "cancelled"
+    assert cancel_resp.json()["status"] == "cancelled"
 
 
 def test_data_task_delete_removes_finished_task(viewer_client, tmp_path):
-    import viewer.app as viewer_app_module
+    import viewer.main as viewer_app_module
 
     task_id = "finished-task"
     log_file = tmp_path / "logs" / "tasks" / f"task_{task_id}.log"
@@ -488,12 +498,12 @@ def test_data_task_delete_removes_finished_task(viewer_client, tmp_path):
     resp = viewer_client.delete(f"/api/data/tasks/{task_id}")
 
     assert resp.status_code == 200
-    assert resp.get_json() == {"task_id": task_id, "status": "deleted"}
+    assert resp.json() == {"task_id": task_id, "status": "deleted"}
     assert task_id not in viewer_app_module.DATA_TASKS
 
 
 def test_data_task_delete_rejects_active_task(viewer_client, tmp_path):
-    import viewer.app as viewer_app_module
+    import viewer.main as viewer_app_module
 
     task_id = "active-task"
     log_file = tmp_path / "logs" / "tasks" / f"task_{task_id}.log"
@@ -514,12 +524,13 @@ def test_data_task_delete_rejects_active_task(viewer_client, tmp_path):
     resp = viewer_client.delete(f"/api/data/tasks/{task_id}")
 
     assert resp.status_code == 409
-    assert "can be removed" in resp.get_json()["error"]
+    message = resp.json().get("error") or resp.json().get("detail", "")
+    assert "can be removed" in message
     assert task_id in viewer_app_module.DATA_TASKS
 
 
 def test_data_task_logs_endpoint_returns_empty_logs_when_file_missing(viewer_client, tmp_path):
-    import viewer.app as viewer_app_module
+    import viewer.main as viewer_app_module
 
     task_id = "missing-log"
     viewer_app_module.DATA_TASKS[task_id] = {
@@ -530,11 +541,11 @@ def test_data_task_logs_endpoint_returns_empty_logs_when_file_missing(viewer_cli
     resp = viewer_client.get(f"/api/data/tasks/{task_id}/logs")
 
     assert resp.status_code == 200
-    assert resp.get_json() == {"logs": "", "status": "running"}
+    assert resp.json() == {"logs": "", "status": "running"}
 
 
 def test_data_task_logs_endpoint_returns_full_logs(viewer_client, tmp_path):
-    import viewer.app as viewer_app_module
+    import viewer.main as viewer_app_module
 
     task_id = "completed-log"
     log_file = tmp_path / "logs" / "tasks" / f"task_{task_id}.log"
@@ -548,14 +559,14 @@ def test_data_task_logs_endpoint_returns_full_logs(viewer_client, tmp_path):
     resp = viewer_client.get(f"/api/data/tasks/{task_id}/logs")
 
     assert resp.status_code == 200
-    assert resp.get_json() == {
+    assert resp.json() == {
         "logs": "[2026-03-04 10:00:00] Starting download...\nDone.\n",
         "status": "completed",
     }
 
 
 def test_start_data_task_writes_task_logs_and_refreshes_catalog(viewer_client, monkeypatch, tmp_path):
-    import viewer.app as viewer_app_module
+    import viewer.main as viewer_app_module
 
     refresh_calls: list[str] = []
     routed_logs: list[str] = []
@@ -566,8 +577,8 @@ def test_start_data_task_writes_task_logs_and_refreshes_catalog(viewer_client, m
     def fake_info(message: str, *args, **kwargs) -> None:
         routed_logs.append(message % args if args else message)
 
-    monkeypatch.setattr(viewer_app_module, "_refresh_catalog", fake_refresh)
-    monkeypatch.setattr(viewer_app_module.logger, "info", fake_info)
+    monkeypatch.setattr(viewer_app_module.legacy_viewer, "_refresh_catalog", fake_refresh)
+    monkeypatch.setattr(viewer_app_module.legacy_viewer.logger, "info", fake_info)
 
     task_id = "streamed-task"
     viewer_app_module._start_data_task(
@@ -604,7 +615,7 @@ def test_start_data_task_writes_task_logs_and_refreshes_catalog(viewer_client, m
 
 
 def test_optimization_run_starts_background_task(viewer_client, monkeypatch, tmp_path):
-    import viewer.app as viewer_app_module
+    import viewer.main as viewer_app_module
 
     captured: dict[str, object] = {}
 
@@ -654,7 +665,7 @@ def test_optimization_run_starts_background_task(viewer_client, monkeypatch, tmp
     )
 
     assert resp.status_code == 202
-    job_id = resp.get_json()["job_id"]
+    job_id = resp.json()["job_id"]
 
     for _ in range(50):
         task = viewer_app_module.DATA_TASKS[job_id]
@@ -677,7 +688,7 @@ def test_optimization_run_starts_background_task(viewer_client, monkeypatch, tmp
 
 
 def test_thread_bound_task_log_handler_emits_without_shadowing_handle(viewer_client, tmp_path):
-    import viewer.app as viewer_app_module
+    import viewer.main as viewer_app_module
 
     task_id = "optulog1"
     log_file = tmp_path / "logs" / "tasks" / f"task_{task_id}.log"
@@ -741,7 +752,7 @@ def test_optimizations_list_and_detail_endpoints(viewer_client, tmp_path):
 
     list_resp = viewer_client.get("/api/optimizations")
     assert list_resp.status_code == 200
-    listed = list_resp.get_json()
+    listed = list_resp.json()
     assert listed == [
         {
             "id": "opt_base-demo_20260311_100000",
@@ -769,7 +780,7 @@ def test_optimizations_list_and_detail_endpoints(viewer_client, tmp_path):
 
     detail_resp = viewer_client.get("/api/optimizations/opt_base-demo_20260311_100000")
     assert detail_resp.status_code == 200
-    assert detail_resp.get_json() == payload
+    assert detail_resp.json() == payload
 
 
 def _equity_curve_from_returns(
@@ -818,7 +829,7 @@ def test_backtest_stats_endpoint_includes_p_value(viewer_client, tmp_path):
     resp = viewer_client.get("/api/backtest/pvalue-demo/stats")
 
     assert resp.status_code == 200
-    payload = resp.get_json()
+    payload = resp.json()
     assert 0.0 <= payload["p_value"] <= 1.0
     assert payload["p_value"] < 0.05
 
@@ -854,7 +865,7 @@ def test_backtests_list_uses_persisted_runner_stats(viewer_client, tmp_path):
     resp = viewer_client.get("/api/backtests")
 
     assert resp.status_code == 200
-    payload = resp.get_json()
+    payload = resp.json()
     assert len(payload) == 1
 
     item = payload[0]
@@ -938,25 +949,25 @@ def test_create_portfolio_persists_p_value_and_psr(viewer_client, tmp_path):
     )
 
     assert create_resp.status_code == 201
-    payload = create_resp.get_json()
+    payload = create_resp.json()
     assert payload["combined_stats"]["p_value"] < 0.05
     assert "psr" in payload["combined_stats"]
 
     list_resp = viewer_client.get("/api/portfolios")
     assert list_resp.status_code == 200
-    listed = list_resp.get_json()
+    listed = list_resp.json()
     assert listed[0]["p_value"] == pytest.approx(payload["combined_stats"]["p_value"], abs=1e-6)
 
     detail_resp = viewer_client.get(f"/api/portfolios/{payload['id']}")
     assert detail_resp.status_code == 200
-    assert detail_resp.get_json()["combined_stats"]["p_value"] == pytest.approx(
+    assert detail_resp.json()["combined_stats"]["p_value"] == pytest.approx(
         payload["combined_stats"]["p_value"],
         abs=1e-6,
     )
 
 
 def test_agent_convert_endpoint_starts_background_agent(viewer_client, monkeypatch):
-    import viewer.app as viewer_app_module
+    import viewer.main as viewer_app_module
 
     captured: dict[str, object] = {}
 
@@ -978,7 +989,7 @@ def test_agent_convert_endpoint_starts_background_agent(viewer_client, monkeypat
     )
 
     assert resp.status_code == 202
-    assert resp.get_json() == {
+    assert resp.json() == {
         "job_id": captured["task_id"],
         "task_id": captured["task_id"],
         "status": "starting",
@@ -994,9 +1005,6 @@ def test_agent_convert_endpoint_starts_background_agent(viewer_client, monkeypat
         "end": None,
         "capital": 100000.0,
     }
-    assert "launch_task_id" not in captured
-
-    resp.close()
 
     assert captured["launch_task_id"] == captured["task_id"]
     assert captured["launch_payload"] == captured["payload"]
@@ -1077,7 +1085,7 @@ def test_equity_endpoint_rebuilds_curve_from_trades(viewer_client, tmp_path):
     resp = viewer_client.get("/api/backtest/rebuild-equity/equity")
 
     assert resp.status_code == 200
-    payload = resp.get_json()
+    payload = resp.json()
     assert payload == [
         {"time": pytest.approx(pd.Timestamp("2024-01-01T00:00:00+00:00").timestamp()), "equity": 100000.0},
         {"time": pytest.approx(pd.Timestamp("2024-01-02T00:00:00+00:00").timestamp()), "equity": 100500.0},
@@ -1088,7 +1096,7 @@ def test_equity_endpoint_rebuilds_curve_from_trades(viewer_client, tmp_path):
 def test_strategy_detail_reads_markdown_and_patch_renames_strategy(
     viewer_client, monkeypatch, tmp_path
 ):
-    import viewer.app as viewer_app_module
+    import viewer.main as viewer_app_module
 
     strategies_root = tmp_path / "strategies"
     strategy_dir = strategies_root / "demo"
@@ -1113,7 +1121,7 @@ def generate_signals(df, params):
     detail_resp = viewer_client.get("/api/strategies/demo")
 
     assert detail_resp.status_code == 200
-    detail_payload = detail_resp.get_json()
+    detail_payload = detail_resp.json()
     assert detail_payload["slug"] == "demo"
     assert detail_payload["name"] == "Demo Strategy"
     assert "This is markdown." in detail_payload["documentation_markdown"]
@@ -1121,7 +1129,7 @@ def generate_signals(df, params):
     patch_resp = viewer_client.patch("/api/strategies/demo", json={"name": "Renamed Strategy"})
 
     assert patch_resp.status_code == 200
-    patch_payload = patch_resp.get_json()
+    patch_payload = patch_resp.json()
     assert patch_payload["name"] == "Renamed Strategy"
     assert "Renamed Strategy" in strategy_dir.joinpath("demo.py").read_text(encoding="utf-8")
 
@@ -1149,13 +1157,13 @@ def test_backtest_patch_updates_title_in_meta(viewer_client, tmp_path):
     patch_resp = viewer_client.patch("/api/backtests/rename-backtest", json={"name": "Desk Run"})
 
     assert patch_resp.status_code == 200
-    payload = patch_resp.get_json()
+    payload = patch_resp.json()
     assert payload["title"] == "Desk Run"
     assert payload["notes"] == "Desk Run"
 
     info_resp = viewer_client.get("/api/backtest/rename-backtest/info")
     assert info_resp.status_code == 200
-    assert info_resp.get_json()["title"] == "Desk Run"
+    assert info_resp.json()["title"] == "Desk Run"
 
 
 def test_logs_endpoint_supports_all_logs_and_multi_level_filters(viewer_client, tmp_path):
@@ -1171,12 +1179,12 @@ def test_logs_endpoint_supports_all_logs_and_multi_level_filters(viewer_client, 
 
     listing = viewer_client.get("/api/logs")
     assert listing.status_code == 200
-    assert listing.get_json()[0]["name"] == "ALL_LOGS"
+    assert listing.json()[0]["name"] == "ALL_LOGS"
 
     resp = viewer_client.get("/api/logs/ALL_LOGS?level=INFO,WARN")
 
     assert resp.status_code == 200
-    assert resp.get_json()["lines"] == [
+    assert resp.json()["lines"] == [
         '{"timestamp":"2026-03-08T10:00:00+00:00","level":"INFO","message":"viewer-start"}',
         '{"timestamp":"2026-03-08T10:01:00+00:00","level":"WARNING","message":"runner-warn"}',
     ]

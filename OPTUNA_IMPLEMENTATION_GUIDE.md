@@ -384,15 +384,14 @@ optim_dir.mkdir(parents=True, exist_ok=True)
 ```python
 @pytest.fixture
 def viewer_client(monkeypatch, tmp_path):
-    import viewer.app as viewer_app_module
+    import viewer.main as viewer_app_module
     
     monkeypatch.setattr(viewer_app_module, "DATA_DIR", tmp_path)
     monkeypatch.setattr(viewer_app_module, "BACKTESTS_DIR", tmp_path / "backtests")
     monkeypatch.setattr(viewer_app_module, "LOGS_DIR", tmp_path / "logs")
     monkeypatch.setattr(viewer_app_module, "TASK_LOGS_DIR", tmp_path / "logs" / "tasks")
     viewer_app_module.DATA_TASKS.clear()
-    viewer_app_module.app.config["TESTING"] = True
-    return viewer_app_module.app.test_client()
+    return TestClient(viewer_app_module.app)
 ```
 
 #### 3. `/home/ubuntu/Desktop/trading-platform/tests/test_models.py` (200+ lines)
@@ -576,7 +575,8 @@ trading-platform/
 │   └── optimizers/                         # [NEW]
 │       └── optuna_optimizer.py             # [NEW] OptunaOptimizer class
 ├── viewer/
-│   └── app.py                              # Flask app, task management (3560 lines)
+│   ├── main.py                             # FastAPI app, task management
+│   └── core.py                             # Shared helper utilities
 └── tests/
     ├── test_runner_cli.py                  # Engine invocation tests
     └── test_viewer_features.py             # Task/API tests

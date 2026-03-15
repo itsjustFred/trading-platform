@@ -6,11 +6,20 @@ from pathlib import Path
 
 VALID_TIMEFRAMES = ("tick", "s1", "1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w")
 VALID_DIRECTIONS = ("LONG", "SHORT")
-VALID_ENGINES = ("lean", "vectorbt", "pynecore")
+VALID_ENGINES = ("native", "lean", "vectorbt", "pynecore")
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 # Resolved data and log directories (cross-platform)
-DATA_DIR = Path(os.environ.get("TRADING_DATA_DIR", "~/data")).expanduser().resolve()
-LOG_DIR = Path(os.environ.get("LOG_DIR", "~/logs")).expanduser().resolve()
+_data_dir_env = os.environ.get("DATA_DIR") or os.environ.get("TRADING_DATA_DIR")
+_log_dir_env = os.environ.get("LOG_DIR")
+
+DATA_DIR = (
+    Path(_data_dir_env).expanduser().resolve() if _data_dir_env else (PROJECT_ROOT / "data").resolve()
+)
+LOG_DIR = (
+    Path(_log_dir_env).expanduser().resolve() if _log_dir_env else (PROJECT_ROOT / "logs").resolve()
+)
 OPTIMIZATIONS_DIR = DATA_DIR / "optimizations"
 
 # Parquet OHLCV column names (canonical)
