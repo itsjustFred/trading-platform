@@ -103,8 +103,8 @@ def generate_signals(df: pd.DataFrame, params: dict):
 
     assert len(result.trades) == 1
     trade = result.trades[0]
-    assert trade.quantity == 200.0
-    assert trade.pnl == 200.0
+    assert trade.quantity == 142.8571
+    assert trade.pnl == -142.86
     assert trade.meta["RSI"] == 25
     assert trade.meta["sl_price"] == 95.0
     assert trade.meta["trailing_stop_at_exit"] == 101.0
@@ -321,7 +321,7 @@ def generate_signals(df: pd.DataFrame, params: dict):
     assert trade.exits[0].price == 105.0
     assert trade.exits[0].time == "2024-01-01T01:30:00+00:00"
     assert trade.meta["modeling_resolution"] == "1m"
-    assert trade.pnl == 50.0
+    assert trade.pnl == 39.6
 
 
 def test_vectorbt_adapter_persists_custom_drawings(tmp_path: Path):

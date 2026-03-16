@@ -231,6 +231,13 @@ class DataResampleRequest(SQLModel):
     target_timeframes: str
 
 
+class DataHarvestRequest(SQLModel):
+    source: str = "dukascopy"
+    symbol: str
+    asset_class: str | None = None
+    start: str | None = None
+
+
 class AgentConvertRequest(SQLModel):
     code: str
     strategy_name: str | None = None
@@ -648,6 +655,191 @@ def _load_data_entries() -> list[dict[str, Any]]:
         if path_value.endswith(".parquet"):
             fallback_entries.append(dict(entry))
     return fallback_entries
+
+
+def _merge_timeframe_entry_dates(current: str | None, candidate: Any, *, latest: bool) -> str | None:
+    value = str(candidate or "").strip()
+    if not value:
+        return current
+    if current is None:
+        return value
+    if latest:
+        return value if value > current else current
+    return value if value < current else current
+
+
+def _entry_size_bytes(entry: dict[str, Any]) -> int:
+    raw_size = entry.get("size_bytes", 0)
+    try:
+        size = int(raw_size)
+    except (TypeError, ValueError):
+        size = 0
+
+    if size > 0:
+        return size
+
+    path_value = Path(str(entry.get("path", "")))
+    try:
+        if path_value.exists():
+            return int(path_value.stat().st_size)
+    except OSError:
+        return 0
+    return 0
+
+
+def _canonical_timeframe_path(paths: set[str], timeframe: str) -> str:
+    if not paths:
+        return ""
+    normalized_tf = str(timeframe or "").strip().lower()
+    sorted_paths = sorted(paths)
+    for path_value in sorted_paths:
+        if Path(path_value).stem.lower() == normalized_tf:
+            return path_value
+    return sorted_paths[0]
+
+
+def _aggregate_symbol_timeframe_entries(
+    entries: list[dict[str, Any]],
+    *,
+    include_category: bool = False,
+    include_size_bytes: bool = False,
+) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, ...], dict[str, Any]] = {}
+
+    for entry in entries:
+        symbol = str(entry.get("symbol") or "Unknown")
+        timeframe = str(entry.get("timeframe") or "unknown")
+        path_value = str(entry.get("path") or "")
+        category = _categorize_path(path_value) if include_category else ""
+        key = (category, symbol, timeframe) if include_category else (symbol, timeframe)
+
+        aggregate = grouped.setdefault(
+            key,
+            {
+                "category": category,
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "paths": set(),
+                "sources": set(),
+                "size_bytes": 0,
+                "start": None,
+                "end": None,
+                "warning_messages": set(),
+                "errors": set(),
+                "validation_seen": False,
+                "validation_status": "ok",
+                "validation_payload": None,
+                "repo": False,
+                "last_updated": None,
+            },
+        )
+
+        if path_value:
+            aggregate["paths"].add(path_value)
+
+        source_value = str(entry.get("source") or "").strip()
+        if source_value:
+            aggregate["sources"].add(source_value)
+
+        aggregate["size_bytes"] += _entry_size_bytes(entry)
+        aggregate["start"] = _merge_timeframe_entry_dates(
+            aggregate["start"], entry.get("start"), latest=False
+        )
+        aggregate["end"] = _merge_timeframe_entry_dates(
+            aggregate["end"], entry.get("end"), latest=True
+        )
+
+        warning_message = _warning_message_from_entry(entry)
+        if warning_message:
+            aggregate["warning_messages"].add(str(warning_message))
+            if aggregate["validation_status"] == "ok":
+                aggregate["validation_status"] = "warning"
+
+        error_message = str(entry.get("error") or "").strip()
+        if error_message:
+            aggregate["errors"].add(error_message)
+            if aggregate["validation_status"] == "ok":
+                aggregate["validation_status"] = "warning"
+
+        validation_value = entry.get("validation")
+        if isinstance(validation_value, dict):
+            status = str(validation_value.get("status") or "").strip().lower()
+            if status:
+                aggregate["validation_seen"] = True
+                if status == "error":
+                    aggregate["validation_status"] = "error"
+                elif status != "ok" and aggregate["validation_status"] == "ok":
+                    aggregate["validation_status"] = status
+            if aggregate["validation_payload"] is None:
+                aggregate["validation_payload"] = dict(validation_value)
+            else:
+                existing_validation = aggregate["validation_payload"]
+                if isinstance(existing_validation, dict):
+                    for key, value in validation_value.items():
+                        if key not in existing_validation:
+                            existing_validation[key] = value
+
+        if entry.get("repo"):
+            aggregate["repo"] = True
+
+        last_updated = str(entry.get("last_updated") or "").strip()
+        if last_updated and (
+            aggregate["last_updated"] is None or last_updated > aggregate["last_updated"]
+        ):
+            aggregate["last_updated"] = last_updated
+
+    logical_entries: list[dict[str, Any]] = []
+    for aggregate in grouped.values():
+        warning_message = (
+            " | ".join(sorted(aggregate["warning_messages"]))
+            if aggregate["warning_messages"]
+            else None
+        )
+        error_message = " | ".join(sorted(aggregate["errors"])) if aggregate["errors"] else None
+        source_values = sorted(aggregate["sources"])
+        output_entry: dict[str, Any] = {
+            "symbol": aggregate["symbol"],
+            "timeframe": aggregate["timeframe"],
+            "path": _canonical_timeframe_path(aggregate["paths"], aggregate["timeframe"]),
+            "size_mb": round(aggregate["size_bytes"] / (1024 * 1024), 2),
+            "start": aggregate["start"],
+            "end": aggregate["end"],
+            "source": source_values[0] if source_values else "",
+        }
+        if include_size_bytes:
+            output_entry["size_bytes"] = aggregate["size_bytes"]
+
+        if include_category:
+            output_entry["category"] = aggregate["category"]
+
+        if aggregate["validation_seen"] or warning_message or error_message:
+            validation_payload = aggregate.get("validation_payload")
+            if isinstance(validation_payload, dict):
+                normalized_validation = dict(validation_payload)
+                normalized_validation["status"] = aggregate["validation_status"]
+                output_entry["validation"] = normalized_validation
+            else:
+                output_entry["validation"] = {"status": aggregate["validation_status"]}
+        if warning_message:
+            output_entry["warning_message"] = warning_message
+            output_entry["validation_message"] = warning_message
+        if error_message:
+            output_entry["error"] = error_message
+        if aggregate["repo"]:
+            output_entry["repo"] = True
+        if aggregate["last_updated"] is not None:
+            output_entry["last_updated"] = aggregate["last_updated"]
+
+        logical_entries.append(output_entry)
+
+    logical_entries.sort(
+        key=lambda item: (
+            str(item.get("category") or ""),
+            str(item.get("symbol") or ""),
+            str(item.get("timeframe") or ""),
+        )
+    )
+    return logical_entries
 
 
 @app.get("/api/strategies", response_model=list[dict[str, Any]])
@@ -1661,25 +1853,23 @@ async def delete_portfolio(portfolio_id: str) -> dict[str, Any]:
 @app.get("/api/data/overview", response_model=dict[str, Any])
 async def data_overview() -> dict[str, Any]:
     all_entries = _load_data_entries()
+    logical_entries = _aggregate_symbol_timeframe_entries(
+        all_entries,
+        include_category=True,
+        include_size_bytes=True,
+    )
 
     categories: dict[str, dict[str, Any]] = {}
-    for entry in all_entries:
-        category = _categorize_path(str(entry.get("path", "")))
+    for entry in logical_entries:
+        category = str(entry.get("category") or "Other")
         categories.setdefault(
             category,
-            {"count": 0, "size_mb": 0.0, "symbols": set(), "start": None, "end": None},
+            {"count": 0, "size_bytes": 0, "symbols": set(), "start": None, "end": None},
         )
         categories[category]["count"] += 1
 
-        size = entry.get("size_bytes", 0)
-        if size == 0:
-            try:
-                entry_path = Path(entry.get("path", ""))
-                if entry_path.exists():
-                    size = entry_path.stat().st_size
-            except OSError:
-                pass
-        categories[category]["size_mb"] += size / (1024 * 1024)
+        size = int(entry.get("size_bytes", 0) or 0)
+        categories[category]["size_bytes"] += max(size, 0)
         categories[category]["symbols"].add(entry.get("symbol"))
 
         start_value = entry.get("start")
@@ -1695,7 +1885,7 @@ async def data_overview() -> dict[str, Any]:
     if dolthub_repos:
         categories["Dolthub Repos"] = {
             "count": len(dolthub_repos),
-            "size_mb": sum(repo.get("size_bytes", 0) for repo in dolthub_repos) / (1024 * 1024),
+            "size_bytes": sum(repo.get("size_bytes", 0) for repo in dolthub_repos),
             "symbols": {repo.get("repo") for repo in dolthub_repos},
             "start": None,
             "end": None,
@@ -1708,7 +1898,7 @@ async def data_overview() -> dict[str, Any]:
                 "name": name,
                 "symbol_count": len(data["symbols"]),
                 "file_count": data["count"],
-                "total_size_mb": round(data["size_mb"], 2),
+                "total_size_mb": round(data["size_bytes"] / (1024 * 1024), 2),
                 "start": data["start"],
                 "end": data["end"],
             }
@@ -1742,44 +1932,12 @@ async def data_category_details(category_name: str) -> dict[str, Any]:
         return {"symbols": sorted(repos, key=lambda item: item["symbol"] or "")}
 
     all_entries = _load_data_entries()
-
-    symbols: list[dict[str, Any]] = []
-    for entry in all_entries:
-        category = _categorize_path(str(entry.get("path", ""))).lower()
-        if category != target:
-            continue
-
-        size = entry.get("size_bytes", 0)
-        if size == 0:
-            try:
-                entry_path = Path(entry.get("path", ""))
-                if entry_path.exists():
-                    size = entry_path.stat().st_size
-            except OSError:
-                pass
-
-        symbol_entry: dict[str, Any] = {
-            "symbol": entry.get("symbol"),
-            "timeframe": entry.get("timeframe"),
-            "path": entry.get("path"),
-            "size_mb": round(size / (1024 * 1024), 2),
-            "start": entry.get("start"),
-            "end": entry.get("end"),
-            "source": entry.get("source"),
-        }
-        if entry.get("validation") is not None:
-            symbol_entry["validation"] = entry.get("validation")
-        if entry.get("error") is not None:
-            symbol_entry["error"] = entry.get("error")
-        warning_message = _warning_message_from_entry(entry)
-        if warning_message is not None:
-            symbol_entry["warning_message"] = warning_message
-            symbol_entry["validation_message"] = warning_message
-        if entry.get("repo"):
-            symbol_entry["repo"] = True
-        if entry.get("last_updated") is not None:
-            symbol_entry["last_updated"] = entry.get("last_updated")
-        symbols.append(symbol_entry)
+    category_entries = [
+        entry
+        for entry in all_entries
+        if _categorize_path(str(entry.get("path", ""))).lower() == target
+    ]
+    symbols = _aggregate_symbol_timeframe_entries(category_entries)
 
     return {
         "symbols": sorted(
@@ -1976,6 +2134,43 @@ async def data_resample(payload: DataResampleRequest) -> dict[str, Any]:
         name="Resample data",
         description=f"Resample {Path(source_path).name or source_path} into {target_timeframes}.",
         source="resample",
+    )
+
+
+@app.post("/api/data/harvest", response_model=dict[str, Any])
+async def data_harvest(payload: DataHarvestRequest) -> dict[str, Any]:
+    source = str(payload.source or "dukascopy").strip().lower()
+    if source != "dukascopy":
+        raise HTTPException(status_code=400, detail="Smart Harvest currently supports only source='dukascopy'")
+
+    symbol = str(payload.symbol or "").strip().upper()
+    if not symbol:
+        raise HTTPException(status_code=400, detail="symbol is required")
+
+    asset_class = str(payload.asset_class or "").strip().lower()
+    start = str(payload.start or "").strip()
+
+    task_id = str(uuid.uuid4())
+    cmd = [
+        sys.executable,
+        "-u",
+        "-m",
+        "scripts.adaptive_harvester",
+        "--symbol",
+        symbol,
+    ]
+    if asset_class:
+        cmd.extend(["--asset_class", asset_class])
+    if start:
+        cmd.extend(["--start", start])
+
+    return _start_data_task(
+        task_id,
+        cmd,
+        total_items=1,
+        name=f"Smart Harvest {symbol}",
+        description=f"Adaptive auto-tuned Dukascopy harvest for {symbol}.",
+        source="harvest",
     )
 
 

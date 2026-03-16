@@ -121,14 +121,15 @@ def _process_symbol(
     signal_output = _call_generate_signals(strategy_mod, df, resolved_parameters)
     signals, indicators, drawings = _normalize_signal_output(signal_output, df.index, symbol=symbol)
     indicator_series = _build_indicator_series(df, indicators)
-    entries = signals["entries"]
-    exits = signals["exits"]
-    stop_loss_series = _find_stop_loss_series(signals, indicators)
-    take_profit_series = _find_take_profit_series(signals, indicators)
-    atr_series = _find_atr_series(signals, indicators)
-    direction_series = _find_direction_series(signals, indicators)
-    exit_price_series = _find_exit_price_series(signals, indicators)
-    exit_reason_series = _find_exit_reason_series(signals, indicators)
+    execution_signals, execution_indicators = _prepare_next_open_execution_data(signals, indicators)
+    entries = execution_signals["entries"]
+    exits = execution_signals["exits"]
+    stop_loss_series = _find_stop_loss_series(execution_signals, execution_indicators)
+    take_profit_series = _find_take_profit_series(execution_signals, execution_indicators)
+    atr_series = _find_atr_series(execution_signals, execution_indicators)
+    direction_series = _find_direction_series(execution_signals, execution_indicators)
+    exit_price_series = _find_exit_price_series(execution_signals, execution_indicators)
+    exit_reason_series = _find_exit_reason_series(execution_signals, execution_indicators)
 
     trades: list[Trade] = []
     in_trade = False
@@ -146,13 +147,13 @@ def _process_symbol(
 
             entry_row = df.iloc[entry_idx]
             exit_row = df.iloc[i]
-            direction = _resolve_direction(signals, direction_series, entry_idx)
-            entry_price = float(entry_row["close"])
+            direction = _resolve_direction(execution_signals, direction_series, entry_idx)
+            entry_price = _resolve_entry_price(entry_row)
             exit_price = _resolve_exit_price(exit_row, i, exit_price_series)
             exit_reason = _resolve_exit_reason(i, exit_reason_series)
             entry_ts = str(entry_row.get("timestamp", entry_row.name))
             exit_ts = str(exit_row.get("timestamp", exit_row.name))
-            trade_meta = _extract_trade_meta(signals, indicators, entry_idx, i)
+            trade_meta = _extract_trade_meta(execution_signals, execution_indicators, entry_idx, i)
 
             intrabar_exit = _resolve_intrabar_exit(
                 intrabar_df=intrabar_df,
@@ -461,6 +462,29 @@ def _coerce_series(value: Any, index: pd.Index) -> pd.Series:
 
 def _coerce_boolean_series(value: Any, index: pd.Index) -> pd.Series:
     return _coerce_series(value, index).fillna(False).astype(bool)
+
+
+def _prepare_next_open_execution_data(
+    signals: pd.DataFrame,
+    indicators: IndicatorMap,
+) -> tuple[pd.DataFrame, IndicatorMap]:
+    """Shift strategy output by one bar so signal bars execute on the next bar open."""
+    execution_signals = signals.shift(1)
+    execution_signals.index = signals.index
+    execution_signals["entries"] = _coerce_boolean_series(execution_signals["entries"], signals.index)
+    shifted_exits = _coerce_boolean_series(execution_signals["exits"], signals.index)
+    original_exits = _coerce_boolean_series(signals["exits"], signals.index)
+    if len(shifted_exits) > 0 and bool(original_exits.iloc[-1]):
+        shifted_exits.iloc[-1] = True
+    execution_signals["exits"] = shifted_exits
+
+    execution_indicators: IndicatorMap = {}
+    for name, (series, explicit_when) in indicators.items():
+        shifted_series = series.shift(1)
+        shifted_series.index = signals.index
+        execution_indicators[name] = (shifted_series, explicit_when)
+
+    return execution_signals, execution_indicators
 
 
 def _normalize_indicator_map(indicators: Any, index: pd.Index) -> IndicatorMap:
@@ -862,7 +886,17 @@ def _resolve_exit_price(
         exit_price = exit_price_series.iloc[exit_idx]
         if pd.notna(exit_price) and float(exit_price) > 0:
             return float(exit_price)
+    open_value = exit_row.get("open")
+    if open_value is not None and pd.notna(open_value):
+        return float(open_value)
     return float(exit_row["close"])
+
+
+def _resolve_entry_price(entry_row: pd.Series) -> float:
+    open_value = entry_row.get("open")
+    if open_value is not None and pd.notna(open_value):
+        return float(open_value)
+    return float(entry_row["close"])
 
 
 def _resolve_exit_reason(exit_idx: int, exit_reason_series: pd.Series | None) -> str | None:
@@ -1031,13 +1065,12 @@ def _resolve_intrabar_exit(
 
     entry_ts = pd.to_datetime(entry_time, utc=True, errors="coerce")
     exit_ts = pd.to_datetime(scheduled_exit_time, utc=True, errors="coerce")
-    base_duration = TIMEFRAME_TO_DURATION.get(base_timeframe, pd.Timedelta(0))
 
     if pd.isna(entry_ts) or pd.isna(exit_ts):
         return None
 
-    effective_start = entry_ts + base_duration
-    effective_end = exit_ts + base_duration
+    effective_start = entry_ts
+    effective_end = exit_ts
     if effective_end <= effective_start:
         return None
 

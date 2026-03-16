@@ -2,6 +2,7 @@ import type {
   AgentConvertRequest,
   DataCategoryResponse,
   DataDownloadRequest,
+  DataHarvestRequest,
   DataOverviewResponse,
   DataResampleRequest,
   DataTaskDeleteResponse,
@@ -195,6 +196,11 @@ export const downloadData = (data: DataDownloadRequest) =>
   });
 export const resampleData = (data: DataResampleRequest) =>
   fetchJSON<DataTaskStartResponse>("/data/resample", {
+    method: "POST",
+    body: JSON.stringify(data),
+  });
+export const harvestData = (data: DataHarvestRequest) =>
+  fetchJSON<DataTaskStartResponse>("/data/harvest", {
     method: "POST",
     body: JSON.stringify(data),
   });

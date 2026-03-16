@@ -13,6 +13,7 @@ import {
   RefreshCw,
   Search,
   ShieldCheck,
+  Sparkles,
   Table2,
   Trash2,
 } from "lucide-react";
@@ -26,6 +27,7 @@ import {
 import type { DataCategorySummary, DataSymbolEntry } from "../api/types";
 import { DownloadModal } from "../components/DownloadModal";
 import { ResampleModal } from "../components/ResampleModal";
+import { SmartHarvestModal } from "../components/SmartHarvestModal";
 import { TaskManager } from "../components/TaskManager";
 
 type TreeSelection =
@@ -159,6 +161,20 @@ function categoryDefaultSource(category: string) {
     return "yfinance";
   }
   return "dukascopy";
+}
+
+function categoryDefaultAssetClass(category: string) {
+  const normalized = category.toLowerCase();
+  if (normalized.includes("metals")) return "metals";
+  if (normalized.includes("indices")) return "indices";
+  if (normalized.includes("energy")) return "energy";
+  if (normalized.includes("forex")) return "forex";
+  if (normalized.includes("equities") || normalized.includes("equity")) {
+    return "equity";
+  }
+  if (normalized.includes("etf")) return "etf";
+  if (normalized.includes("crypto")) return "crypto";
+  return "";
 }
 
 function deriveValidation(
@@ -317,6 +333,18 @@ export function DataManagementPage() {
   }>({
     sourcePath: "",
     targetTimeframes: "5m,15m,30m,1h,4h",
+  });
+  const [harvestModalOpen, setHarvestModalOpen] = useState(false);
+  const [harvestDefaults, setHarvestDefaults] = useState<{
+    source: string;
+    symbol: string;
+    assetClass: string;
+    startDate: string;
+  }>({
+    source: "dukascopy",
+    symbol: "",
+    assetClass: "",
+    startDate: "",
   });
   const [backgroundTaskId, setBackgroundTaskId] = useState<string | null>(null);
   const categoryEntriesRef = useRef<Record<string, DataSymbolEntry[]>>({});
@@ -682,6 +710,25 @@ export function DataManagementPage() {
       });
     }
     setResampleModalOpen(true);
+  };
+
+  const openSmartHarvestForCurrent = () => {
+    if (selection?.kind === "symbol" && selectedGroup) {
+      setHarvestDefaults({
+        source: "dukascopy",
+        symbol: selectedGroup.symbol,
+        assetClass: categoryDefaultAssetClass(selection.category),
+        startDate: "",
+      });
+    } else if (selectedCategory) {
+      setHarvestDefaults({
+        source: "dukascopy",
+        symbol: "",
+        assetClass: categoryDefaultAssetClass(selectedCategory.name),
+        startDate: "",
+      });
+    }
+    setHarvestModalOpen(true);
   };
 
   const handleTaskStarted = (taskId: string) => {
@@ -1103,6 +1150,7 @@ export function DataManagementPage() {
               }
               onDownload={openDownloadForCurrent}
               onResample={openResampleForCurrent}
+              onHarvest={openSmartHarvestForCurrent}
               onSelectSymbol={(symbol) =>
                 handleSelectSymbol(selectedCategory.name, symbol)
               }
@@ -1114,6 +1162,7 @@ export function DataManagementPage() {
               rows={symbolRows}
               onDownload={openDownloadForCurrent}
               onResample={openResampleForCurrent}
+              onHarvest={openSmartHarvestForCurrent}
               onDeleteAll={() => handleDeleteAllForSymbol(selectedGroup)}
               onDeleteRow={handleDeleteEntry}
             />
@@ -1138,6 +1187,16 @@ export function DataManagementPage() {
         onTaskStarted={handleTaskStarted}
         defaultSourcePath={resampleDefaults.sourcePath}
         defaultTargetTimeframes={resampleDefaults.targetTimeframes}
+      />
+
+      <SmartHarvestModal
+        open={harvestModalOpen}
+        onClose={() => setHarvestModalOpen(false)}
+        onTaskStarted={handleTaskStarted}
+        defaultSource={harvestDefaults.source}
+        defaultSymbol={harvestDefaults.symbol}
+        defaultAssetClass={harvestDefaults.assetClass}
+        defaultStartDate={harvestDefaults.startDate}
       />
     </div>
   );
@@ -1189,6 +1248,7 @@ function CategoryDetailPanel({
   loading,
   onDownload,
   onResample,
+  onHarvest,
   onSelectSymbol,
 }: {
   category: DataCategorySummary;
@@ -1196,6 +1256,7 @@ function CategoryDetailPanel({
   loading: boolean;
   onDownload: () => void;
   onResample: () => void;
+  onHarvest: () => void;
   onSelectSymbol: (symbol: string) => void;
 }) {
   const columns: TableColumn<CategoryInventoryRow>[] = [
@@ -1281,6 +1342,12 @@ function CategoryDetailPanel({
               onClick={onResample}
               tone="secondary"
             />
+            <ActionButton
+              icon={<Sparkles size={15} />}
+              label="Smart Harvest (Auto-Tune)"
+              onClick={onHarvest}
+              tone="secondary"
+            />
           </div>
         }
       >
@@ -1353,6 +1420,7 @@ function SymbolDetailPanel({
   rows,
   onDownload,
   onResample,
+  onHarvest,
   onDeleteAll,
   onDeleteRow,
 }: {
@@ -1361,6 +1429,7 @@ function SymbolDetailPanel({
   rows: SymbolTableRow[];
   onDownload: () => void;
   onResample: () => void;
+  onHarvest: () => void;
   onDeleteAll: () => void;
   onDeleteRow: (
     entry: DataSymbolEntry,
@@ -1485,6 +1554,13 @@ function SymbolDetailPanel({
               icon={<RefreshCw size={15} />}
               label="Resample"
               onClick={onResample}
+              tone="secondary"
+              disabled={isRepoSymbol}
+            />
+            <ActionButton
+              icon={<Sparkles size={15} />}
+              label="Smart Harvest (Auto-Tune)"
+              onClick={onHarvest}
               tone="secondary"
               disabled={isRepoSymbol}
             />

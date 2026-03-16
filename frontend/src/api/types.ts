@@ -531,6 +531,13 @@ export interface DataResampleRequest {
   target_timeframes: string;
 }
 
+export interface DataHarvestRequest {
+  source: string;
+  symbol: string;
+  asset_class?: string;
+  start?: string;
+}
+
 export interface DataTaskProgress {
   completed: number;
   failed: number;
