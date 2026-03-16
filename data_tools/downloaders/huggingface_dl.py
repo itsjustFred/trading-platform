@@ -87,6 +87,8 @@ class HuggingFaceDownloader(Downloader):
     ) -> DownloadResult:
         symbol = symbol.upper()
         logger.info("Downloading %s from HuggingFace dataset %s", symbol, dataset)
+        out_path = self._make_output_path(output_dir, asset_class, symbol, timeframe)
+        effective_start = self._resolve_resume_start(out_path, start)
 
         # Try using the datasets library first (more reliable)
         df = self._download_via_api(dataset, symbol)
@@ -111,8 +113,8 @@ class HuggingFaceDownloader(Downloader):
 
         # Filter by date
         if "timestamp" in df.columns:
-            if start:
-                df = df[df["timestamp"] >= start]
+            if effective_start:
+                df = df[df["timestamp"] >= effective_start]
             if end:
                 df = df[df["timestamp"] <= end]
 
@@ -121,9 +123,7 @@ class HuggingFaceDownloader(Downloader):
         ]
         df = df[keep].dropna(subset=["open"]).sort_values("timestamp").reset_index(drop=True)
 
-        # Save
-        out_path = self._make_output_path(output_dir, asset_class, symbol, timeframe)
-        df.to_parquet(out_path, index=False)
+        combined = self._merge_and_store_single_file(out_path, df)
 
         return DownloadResult(
             symbol=symbol,
@@ -131,9 +131,9 @@ class HuggingFaceDownloader(Downloader):
             source=self.source_name,
             asset_class=asset_class,
             path=out_path,
-            rows=len(df),
-            start=str(df["timestamp"].iloc[0]) if "timestamp" in df.columns else "",
-            end=str(df["timestamp"].iloc[-1]) if "timestamp" in df.columns else "",
+            rows=len(combined),
+            start=str(combined["timestamp"].iloc[0]) if "timestamp" in combined.columns and len(combined) > 0 else "",
+            end=str(combined["timestamp"].iloc[-1]) if "timestamp" in combined.columns and len(combined) > 0 else "",
             size_bytes=out_path.stat().st_size,
         )
 

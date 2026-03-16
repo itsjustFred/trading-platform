@@ -138,10 +138,17 @@ class CTraderDownloader(Downloader):
         if df.empty:
             raise RuntimeError(f"No data loaded for {symbol}")
 
+        # Determine asset class
+        asset_class = "forex"
+        if symbol in ("US500", "US100", "US30", "GER40", "UK100"):
+            asset_class = "index"
+        out_path = self._make_output_path(output_dir, asset_class, symbol, timeframe)
+        effective_start = self._resolve_resume_start(out_path, start)
+
         # Filter dates
         if "timestamp" in df.columns:
-            if start:
-                df = df[df["timestamp"] >= start]
+            if effective_start:
+                df = df[df["timestamp"] >= effective_start]
             if end:
                 df = df[df["timestamp"] <= end]
 
@@ -149,14 +156,7 @@ class CTraderDownloader(Downloader):
         if timeframe != "tick" and timeframe != "1m":
             df = self._resample(df, timeframe)
 
-        # Determine asset class
-        asset_class = "forex"
-        if symbol in ("US500", "US100", "US30", "GER40", "UK100"):
-            asset_class = "index"
-
-        # Save
-        out_path = self._make_output_path(output_dir, asset_class, symbol, timeframe)
-        df.to_parquet(out_path, index=False)
+        combined = self._merge_and_store_single_file(out_path, df)
 
         return DownloadResult(
             symbol=symbol,
@@ -164,9 +164,9 @@ class CTraderDownloader(Downloader):
             source=self.source_name,
             asset_class=asset_class,
             path=out_path,
-            rows=len(df),
-            start=str(df["timestamp"].iloc[0]) if "timestamp" in df.columns else "",
-            end=str(df["timestamp"].iloc[-1]) if "timestamp" in df.columns else "",
+            rows=len(combined),
+            start=str(combined["timestamp"].iloc[0]) if "timestamp" in combined.columns and len(combined) > 0 else "",
+            end=str(combined["timestamp"].iloc[-1]) if "timestamp" in combined.columns and len(combined) > 0 else "",
             size_bytes=out_path.stat().st_size,
         )
 

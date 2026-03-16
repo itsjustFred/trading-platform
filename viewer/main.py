@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -16,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+import pyarrow.parquet as pq
 from dotenv import load_dotenv
 from fastapi import (
     BackgroundTasks,
@@ -35,12 +37,20 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(PROJECT_ROOT / ".env")
 
 _data_dir_env = os.environ.get("DATA_DIR") or os.environ.get("TRADING_DATA_DIR")
-DATA_DIR = Path(_data_dir_env).resolve() if _data_dir_env else (PROJECT_ROOT / "data").resolve()
+DATA_DIR = (
+    Path(_data_dir_env).expanduser().resolve()
+    if _data_dir_env
+    else (PROJECT_ROOT / "data").resolve()
+)
 os.environ.setdefault("DATA_DIR", str(DATA_DIR))
 os.environ.setdefault("TRADING_DATA_DIR", str(DATA_DIR))
 
 _log_dir_env = os.environ.get("LOG_DIR")
-LOG_DIR = Path(_log_dir_env).resolve() if _log_dir_env else (PROJECT_ROOT / "logs").resolve()
+LOG_DIR = (
+    Path(_log_dir_env).expanduser().resolve()
+    if _log_dir_env
+    else (PROJECT_ROOT / "logs").resolve()
+)
 os.environ.setdefault("LOG_DIR", str(LOG_DIR))
 
 from shared.logging import get_logger
@@ -404,6 +414,183 @@ def _infer_symbol_category(path_value: str, fallback_asset_class: str) -> str:
     if "crypto" in path_parts or "/crypto/" in normalized:
         return "crypto"
     return (fallback_asset_class or "other").lower()
+
+
+_TIMEFRAME_PATTERN = re.compile(r"^(?:tick|s1|mn1|\d+[smhdw])$", re.IGNORECASE)
+
+
+def _looks_like_timeframe(value: str) -> bool:
+    normalized = str(value or "").strip().lower()
+    return bool(normalized) and bool(_TIMEFRAME_PATTERN.match(normalized))
+
+
+def _format_catalog_date(value: object) -> str | None:
+    if value is None:
+        return None
+    timestamp = pd.to_datetime(value, utc=True, errors="coerce")
+    if pd.isna(timestamp):
+        return None
+    return timestamp.date().isoformat()
+
+
+def _read_row_group_stat(
+    metadata: Any,
+    column_index: int,
+    row_group_index: int,
+    *,
+    boundary: str,
+) -> object | None:
+    stats = metadata.row_group(row_group_index).column(column_index).statistics
+    if stats is None or not getattr(stats, "has_min_max", False):
+        return None
+    return stats.min if boundary == "min" else stats.max
+
+
+def _read_parquet_date_bounds(parquet_path: Path) -> tuple[str | None, str | None]:
+    parquet_file = pq.ParquetFile(parquet_path)
+    metadata = parquet_file.metadata
+    if metadata is None or metadata.num_rows == 0 or metadata.num_row_groups == 0:
+        return None, None
+
+    columns = list(parquet_file.schema_arrow.names)
+    lowered = {column.lower(): column for column in columns}
+    timestamp_column = None
+    for candidate in ("timestamp", "datetime", "date", "time"):
+        if candidate in lowered:
+            timestamp_column = lowered[candidate]
+            break
+    if timestamp_column is None:
+        return None, None
+
+    column_index = columns.index(timestamp_column)
+    start_value = _read_row_group_stat(metadata, column_index, 0, boundary="min")
+    end_value = _read_row_group_stat(
+        metadata,
+        column_index,
+        metadata.num_row_groups - 1,
+        boundary="max",
+    )
+
+    if start_value is None:
+        first_group = parquet_file.read_row_group(0, columns=[timestamp_column])
+        if first_group.num_rows > 0:
+            start_value = first_group.column(0)[0].as_py()
+    if end_value is None:
+        last_group = parquet_file.read_row_group(
+            metadata.num_row_groups - 1,
+            columns=[timestamp_column],
+        )
+        if last_group.num_rows > 0:
+            end_value = last_group.column(0)[last_group.num_rows - 1].as_py()
+
+    return _format_catalog_date(start_value), _format_catalog_date(end_value)
+
+
+def _parse_ohlcv_path(parquet_path: Path, ohlcv_root: Path) -> dict[str, Any] | None:
+    try:
+        rel = parquet_path.relative_to(ohlcv_root)
+    except ValueError:
+        return None
+
+    parts = rel.parts
+    if len(parts) < 4:
+        return None
+
+    source = parts[0]
+    asset_class = parts[1]
+    stem = parquet_path.stem
+    region: str | None = None
+
+    if len(parts) >= 5:
+        region = parts[-3]
+        symbol = parts[-2]
+        timeframe = stem if _looks_like_timeframe(stem) else "1d"
+    else:
+        if _looks_like_timeframe(stem):
+            symbol = parts[-2]
+            timeframe = stem
+        else:
+            region = parts[-2]
+            symbol = stem
+            timeframe = "1d"
+
+    entry: dict[str, Any] = {
+        "source": source,
+        "asset_class": asset_class,
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "path": str(parquet_path),
+    }
+    if region:
+        entry["region"] = region
+    return entry
+
+
+def _scan_single_file_ohlcv_entries() -> list[dict[str, Any]]:
+    ohlcv_root = DATA_DIR / "ohlcv"
+    if not ohlcv_root.exists():
+        return []
+
+    entries: list[dict[str, Any]] = []
+    for parquet_path in sorted(ohlcv_root.rglob("*.parquet")):
+        parsed = _parse_ohlcv_path(parquet_path, ohlcv_root)
+        if parsed is None:
+            continue
+
+        start_value = None
+        end_value = None
+        try:
+            start_value, end_value = _read_parquet_date_bounds(parquet_path)
+        except (OSError, ValueError, KeyError) as exc:
+            logger.warning("Could not read date range from %s: %s", parquet_path, exc)
+
+        try:
+            size_bytes = parquet_path.stat().st_size
+        except OSError:
+            size_bytes = 0
+
+        parsed["size_bytes"] = size_bytes
+        parsed["start"] = start_value
+        parsed["end"] = end_value
+        entries.append(parsed)
+
+    return entries
+
+
+def _load_data_entries() -> list[dict[str, Any]]:
+    scanned_entries = _scan_single_file_ohlcv_entries()
+    catalog_entries, _ = _load_catalog_ohlcv_entries()
+    metadata_by_path = {
+        str(entry.get("path")): entry
+        for entry in catalog_entries
+        if isinstance(entry, dict) and entry.get("path")
+    }
+
+    if scanned_entries:
+        for entry in scanned_entries:
+            catalog_entry = metadata_by_path.get(entry["path"])
+            if not isinstance(catalog_entry, dict):
+                continue
+            for key in (
+                "validation",
+                "error",
+                "warning_message",
+                "validation_message",
+                "last_updated",
+                "repo",
+            ):
+                if catalog_entry.get(key) is not None:
+                    entry[key] = catalog_entry.get(key)
+        return scanned_entries
+
+    fallback_entries: list[dict[str, Any]] = []
+    for entry in catalog_entries:
+        if not isinstance(entry, dict):
+            continue
+        path_value = str(entry.get("path", ""))
+        if path_value.endswith(".parquet"):
+            fallback_entries.append(dict(entry))
+    return fallback_entries
 
 
 @app.get("/api/strategies", response_model=list[dict[str, Any]])
@@ -1308,9 +1495,7 @@ async def delete_portfolio(portfolio_id: str) -> dict[str, Any]:
 
 @app.get("/api/data/overview", response_model=dict[str, Any])
 async def data_overview() -> dict[str, Any]:
-    all_entries, used_catalog = _load_catalog_ohlcv_entries()
-    if not used_catalog:
-        all_entries = _scan_ohlcv_filesystem()
+    all_entries = _load_data_entries()
 
     categories: dict[str, dict[str, Any]] = {}
     for entry in all_entries:
@@ -1391,9 +1576,7 @@ async def data_category_details(category_name: str) -> dict[str, Any]:
             )
         return {"symbols": sorted(repos, key=lambda item: item["symbol"] or "")}
 
-    all_entries, used_catalog = _load_catalog_ohlcv_entries()
-    if not used_catalog:
-        all_entries = _scan_ohlcv_filesystem()
+    all_entries = _load_data_entries()
 
     symbols: list[dict[str, Any]] = []
     for entry in all_entries:
@@ -1906,19 +2089,13 @@ async def get_log(
 
 @app.get("/api/symbols", response_model=SymbolsResponse)
 async def list_symbols() -> SymbolsResponse:
-    catalog_path = DATA_DIR / "catalog.json"
-    if not catalog_path.exists():
-        return SymbolsResponse(symbols=[], categories={})
-
-    try:
-        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as exc:
-        logger.warning("Could not read catalog %s: %s", catalog_path, exc)
+    datasets = _load_data_entries()
+    if not datasets:
         return SymbolsResponse(symbols=[], categories={})
 
     categories: dict[str, list[str]] = {}
     seen: set[str] = set()
-    for dataset in catalog.get("ohlcv", []):
+    for dataset in datasets:
         symbol = str(dataset.get("symbol", "") or "")
         if not symbol or symbol in seen:
             continue

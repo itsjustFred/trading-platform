@@ -841,8 +841,23 @@ class DukascopyNativeDownloader(Downloader):
             raise ValueError(
                 f"Unsupported timeframe: {timeframe}. Use one of: {list(TIMEFRAME_MAP)}"
             )
+        storage_tf_map = {
+            "tick": "tick",
+            "s1": "s1",
+            "m1": "1m",
+            "m5": "5m",
+            "m15": "15m",
+            "m30": "30m",
+            "h1": "1h",
+            "h4": "4h",
+            "d1": "1d",
+            "mn1": "mn1",
+        }
+        out_tf = storage_tf_map.get(normalized_tf, normalized_tf)
 
         sym, instrument, asset_class = _resolve_symbol_and_instrument(symbol)
+        out_path = self._make_output_path(output_dir, asset_class, sym, out_tf)
+        effective_start = self._resolve_resume_start(out_path, start)
         price_type = str(kwargs.get("price_type", "bid")).lower()
         if price_type not in {"bid", "ask"}:
             raise ValueError("price_type must be 'bid' or 'ask'")
@@ -866,7 +881,7 @@ class DukascopyNativeDownloader(Downloader):
         log_callback = kwargs.get("log_callback")
 
         genesis_index = _load_genesis_index()
-        requested_start = _resolve_requested_start(sym, normalized_tf, start, genesis_index)
+        requested_start = _resolve_requested_start(sym, normalized_tf, effective_start, genesis_index)
         requested_end = end or datetime.now(timezone.utc).date().isoformat()
 
         start_dt = datetime.fromisoformat(requested_start).replace(tzinfo=timezone.utc)
@@ -992,16 +1007,7 @@ class DukascopyNativeDownloader(Downloader):
 
         await _wait_for_control(pause_event, stop_event)
 
-        # Map output timeframe to storage name
-        storage_tf_map = {
-            "tick": "tick", "s1": "s1",
-            "m1": "1m", "m5": "5m", "m15": "15m", "m30": "30m",
-            "h1": "1h", "h4": "4h", "d1": "1d", "mn1": "mn1",
-        }
-        out_tf = storage_tf_map.get(normalized_tf, normalized_tf)
-
-        out_path = self._make_output_path(output_dir, asset_class, sym, out_tf)
-        df.to_parquet(out_path, index=False)
+        df = self._merge_and_store_single_file(out_path, df)
         warnings.append(f"requested_range:{requested_start}->{requested_end}")
         _report_progress(report_progress, 100.0, f"Saved {out_path.name}")
 
@@ -1027,8 +1033,8 @@ class DukascopyNativeDownloader(Downloader):
             asset_class=asset_class,
             path=out_path,
             rows=len(df),
-            start=str(df["timestamp"].iloc[0]) if len(df) > 0 else "",
-            end=str(df["timestamp"].iloc[-1]) if len(df) > 0 else "",
+            start=str(df["timestamp"].iloc[0]) if "timestamp" in df.columns and len(df) > 0 else "",
+            end=str(df["timestamp"].iloc[-1]) if "timestamp" in df.columns and len(df) > 0 else "",
             size_bytes=out_path.stat().st_size,
             warnings=warnings,
         )

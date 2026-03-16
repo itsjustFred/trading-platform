@@ -26,7 +26,11 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(PROJECT_ROOT / ".env")
 
 _data_dir_env = os.environ.get("DATA_DIR") or os.environ.get("TRADING_DATA_DIR")
-DATA_DIR = Path(_data_dir_env).resolve() if _data_dir_env else (PROJECT_ROOT / "data").resolve()
+DATA_DIR = (
+    Path(_data_dir_env).expanduser().resolve()
+    if _data_dir_env
+    else (PROJECT_ROOT / "data").resolve()
+)
 DB_PATH = DATA_DIR / "backtests.db"
 
 
