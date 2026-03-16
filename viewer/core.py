@@ -1507,6 +1507,8 @@ def _strategy_payload(entry: StrategyEntry) -> dict:
         "type": tags.get("type", []),
         "source": tags.get("source", ""),
         "link": tags.get("link", ""),
+        "source_url": entry.meta.get("source_url", ""),
+        "notes": entry.meta.get("notes", ""),
         "asset_class": tags.get("asset_class", []),
         "complexity": tags.get("complexity", ""),
         "engine": entry.engine,

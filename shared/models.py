@@ -35,6 +35,8 @@ class StrategyMeta(BaseModel):
     version: str = "1.0.0"
     parameters: dict[str, Any] = Field(default_factory=dict)
     tags: dict[str, Any] = Field(default_factory=dict)
+    source_url: str = ""
+    notes: str = ""
     # Tags structure:
     # {
     #     "type": ["mean-reversion", "momentum", "breakout"],
@@ -50,6 +52,10 @@ class StrategyMeta(BaseModel):
             d["parameters"] = self.parameters
         if self.tags:
             d["tags"] = self.tags
+        if self.source_url:
+            d["source_url"] = self.source_url
+        if self.notes:
+            d["notes"] = self.notes
         return d
 
     @classmethod
@@ -59,6 +65,8 @@ class StrategyMeta(BaseModel):
             version=d.get("version", "1.0.0"),
             parameters=d.get("parameters", {}),
             tags=d.get("tags", {}),
+            source_url=d.get("source_url", ""),
+            notes=d.get("notes", ""),
         )
 
 

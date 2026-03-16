@@ -1,26 +1,35 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { useParams, useNavigate } from "react-router-dom";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useNavigate, useParams } from "react-router-dom";
 import {
-  getBacktestTrades,
-  getBacktestTrade,
-  getBacktestInfo,
-  downloadData,
-  getDataTask,
   ApiError,
+  downloadData,
+  getBacktestInfo,
+  getBacktestReplay,
+  getDataTask,
 } from "../api/client";
 import type {
   BacktestInfo,
+  BacktestReplayResponse,
   ChartBoxDrawing,
   ChartLineDrawing,
   ChartLineWithBreaksDrawing,
   ChartMarkerDrawing,
+  IndicatorPoint,
   IndicatorSeriesView,
   MissingOHLCVDetail,
+  OHLCVBar,
   Trade,
-  TradeChartResponse,
   TradeDrawing,
 } from "../api/types";
-import { ArrowLeft, ChevronLeft, ChevronRight } from "lucide-react";
+import {
+  ArrowLeft,
+  Maximize2,
+  Minimize2,
+  Pause,
+  Play,
+  SkipBack,
+  SkipForward,
+} from "lucide-react";
 import {
   createChart,
   ColorType,
@@ -31,31 +40,32 @@ import {
   LineSeries,
   createSeriesMarkers,
 } from "lightweight-charts";
-import type { IChartApi, CandlestickData, Time } from "lightweight-charts";
+import type { CandlestickData, IChartApi, LogicalRange, Time } from "lightweight-charts";
+
+type PanelGroup = {
+  key: string;
+  label: string;
+  indicators: IndicatorSeriesView[];
+};
 
 function formatTradeMetaValue(value: unknown): string {
   if (value === null || value === undefined) {
     return "—";
   }
-
   if (typeof value === "number") {
     return Number.isInteger(value)
       ? value.toLocaleString("en-US")
       : value.toLocaleString("en-US", { maximumFractionDigits: 4 });
   }
-
   if (typeof value === "boolean") {
     return value ? "True" : "False";
   }
-
   if (Array.isArray(value)) {
     return value.map(formatTradeMetaValue).join(", ");
   }
-
   if (typeof value === "object") {
     return JSON.stringify(value);
   }
-
   return String(value);
 }
 
@@ -105,40 +115,31 @@ function resolveLineStyle(value: unknown): number {
   if (value === "dashed") {
     return LineStyle.Dashed;
   }
+  if (typeof value === "number") {
+    return value;
+  }
   return LineStyle.Solid;
 }
 
 function resolveLineWidth(value: unknown): 1 | 2 | 3 | 4 {
   const numeric = Number(value);
-  if (numeric >= 4) {
-    return 4;
-  }
-  if (numeric >= 3) {
-    return 3;
-  }
-  if (numeric >= 2) {
-    return 2;
-  }
+  if (numeric >= 4) return 4;
+  if (numeric >= 3) return 3;
+  if (numeric >= 2) return 2;
   return 1;
 }
 
-function drawingFallsWithinWindow(
-  drawing: TradeDrawing,
-  startTime: number,
-  endTime: number,
-): boolean {
-  if (isMarkerDrawing(drawing)) {
-    return drawing.time >= startTime && drawing.time <= endTime;
-  }
-  if (isLineWithBreaksDrawing(drawing)) {
-    const first = drawing.data?.[0]?.time;
-    const last = drawing.data?.[drawing.data.length - 1]?.time;
-    if (typeof first !== "number" || typeof last !== "number") {
-      return false;
+function toLineSeriesData(points: IndicatorPoint[]): Array<{ time: Time; value?: number }> {
+  return points.map((point) => {
+    if (point.value === null || Number.isNaN(point.value)) {
+      return { time: point.time as Time };
     }
-    return last >= startTime && first <= endTime;
-  }
-  return drawing.end_time >= startTime && drawing.start_time <= endTime;
+    return { time: point.time as Time, value: point.value };
+  });
+}
+
+function pointsInRange(points: IndicatorPoint[], start: number, end: number): IndicatorPoint[] {
+  return points.filter((point) => point.time >= start && point.time <= end);
 }
 
 function isMissingOHLCVDetail(value: unknown): value is MissingOHLCVDetail {
@@ -154,79 +155,336 @@ function isMissingOHLCVDetail(value: unknown): value is MissingOHLCVDetail {
 }
 
 function sourceButtonLabel(source: string): string {
-  if (source === "dukascopy") {
-    return "Download from Dukascopy";
-  }
-  if (source === "yfinance") {
-    return "Download from Yahoo Finance";
-  }
-  if (source === "dolthub") {
-    return "Sync from Dolthub";
-  }
+  if (source === "dukascopy") return "Download from Dukascopy";
+  if (source === "yfinance") return "Download from Yahoo Finance";
+  if (source === "dolthub") return "Sync from Dolthub";
   return "Download data";
+}
+
+function inferPanelKey(indicator: IndicatorSeriesView): string {
+  const stylePane =
+    indicator.style && typeof indicator.style === "object"
+      ? String((indicator.style as { pane?: unknown }).pane || "")
+      : "";
+  const explicitPane = String(indicator.pane || stylePane || "").trim().toLowerCase();
+  if (explicitPane && explicitPane !== "panel" && explicitPane !== "overlay") {
+    return explicitPane;
+  }
+
+  const name = indicator.name.toLowerCase();
+  if (name.includes("macd") || name.includes("signal") || name.includes("hist")) {
+    return "macd";
+  }
+  if (name.includes("rsi")) {
+    return "rsi";
+  }
+  if (name.includes("atr")) {
+    return "atr";
+  }
+  return "panel";
+}
+
+function inferPanelLabel(key: string): string {
+  if (key === "macd") return "MACD";
+  if (key === "rsi") return "RSI";
+  if (key === "atr") return "ATR";
+  if (key === "panel") return "Panel";
+  return key.toUpperCase();
+}
+
+function indicatorIsPanel(indicator: IndicatorSeriesView): boolean {
+  const type = String(indicator.type || "").toLowerCase();
+  const pane = String(indicator.pane || "").toLowerCase();
+  return type === "panel" || pane === "panel" || type.startsWith("panel-");
+}
+
+function findBarIndexByTime(ohlcv: OHLCVBar[], targetTime: number): number {
+  if (!ohlcv.length) {
+    return -1;
+  }
+  let low = 0;
+  let high = ohlcv.length - 1;
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    const value = ohlcv[mid].time;
+    if (value === targetTime) {
+      return mid;
+    }
+    if (value < targetTime) {
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+  return Math.min(Math.max(low, 0), ohlcv.length - 1);
 }
 
 export function TradeChartPage() {
   const { id, nr } = useParams<{ id: string; nr: string }>();
   const navigate = useNavigate();
-  const [trades, setTrades] = useState<Trade[]>([]);
+
   const [info, setInfo] = useState<BacktestInfo | null>(null);
-  const [tradeData, setTradeData] = useState<TradeChartResponse | null>(null);
-  const [isLoadingTrade, setIsLoadingTrade] = useState(false);
-  const [missingData, setMissingData] = useState<MissingOHLCVDetail | null>(null);
+  const [replay, setReplay] = useState<BacktestReplayResponse | null>(null);
+  const [trades, setTrades] = useState<Trade[]>([]);
+  const [currentNr, setCurrentNr] = useState(parseInt(nr || "1", 10));
+  const [isLoading, setIsLoading] = useState(true);
+  const [loadError, setLoadError] = useState("");
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [isFullscreen, setIsFullscreen] = useState(false);
+
   const [downloadTaskId, setDownloadTaskId] = useState<string | null>(null);
   const [downloadStatus, setDownloadStatus] = useState<string>("idle");
   const [downloadError, setDownloadError] = useState<string>("");
-  const [currentNr, setCurrentNr] = useState(parseInt(nr || "1"));
-  const chartContainerRef = useRef<HTMLDivElement>(null);
-  const chartRef = useRef<IChartApi | null>(null);
+  const currentNrRef = useRef(currentNr);
 
-  useEffect(() => {
+  const viewportRef = useRef<HTMLDivElement>(null);
+  const mainChartContainerRef = useRef<HTMLDivElement>(null);
+  const panelContainerRefs = useRef<Record<string, HTMLDivElement | null>>({});
+  const chartRefs = useRef<IChartApi[]>([]);
+  const mainChartRef = useRef<IChartApi | null>(null);
+  const candleSeriesRef = useRef<any>(null);
+  const priceLineRefs = useRef<{ entry: any | null; exit: any | null }>({
+    entry: null,
+    exit: null,
+  });
+  const boxOverlayRef = useRef<HTMLDivElement | null>(null);
+
+  const loadReplay = useCallback(async (requestedNr?: number) => {
     if (!id) return;
-    Promise.all([getBacktestTrades(id), getBacktestInfo(id)])
-      .then(([t, i]) => {
-        setTrades(t);
-        setInfo(i);
-      })
-      .catch(() => {});
-  }, [id]);
+    setIsLoading(true);
+    setLoadError("");
+    try {
+      const [replayPayload, infoPayload] = await Promise.all([
+        getBacktestReplay(id),
+        getBacktestInfo(id),
+      ]);
+      setReplay(replayPayload);
+      setTrades(replayPayload.trades || []);
+      setInfo(infoPayload);
+
+      const requested = Number.isFinite(requestedNr)
+        ? Number(requestedNr)
+        : currentNrRef.current;
+      const tradeNumbers = (replayPayload.trades || []).map((trade) => trade.nr);
+      const fallbackNr = tradeNumbers[0] ?? 1;
+      const resolvedNr = tradeNumbers.includes(requested) ? requested : fallbackNr;
+      setCurrentNr(resolvedNr);
+      if (resolvedNr !== requested) {
+        window.history.replaceState(
+          window.history.state,
+          "",
+          `/backtests/${id}/trade/${resolvedNr}`,
+        );
+      }
+    } catch (err: unknown) {
+      if (err instanceof ApiError && isMissingOHLCVDetail(err.detail)) {
+        setLoadError(err.detail.message);
+      } else {
+        setLoadError(err instanceof Error ? err.message : "Could not load replay data");
+      }
+      setReplay(null);
+      setTrades([]);
+    } finally {
+      setIsLoading(false);
+    }
+  }, [id, navigate]);
 
   useEffect(() => {
-    setCurrentNr(parseInt(nr || "1"));
+    const parsed = parseInt(nr || "1", 10);
+    loadReplay(Number.isNaN(parsed) ? undefined : parsed);
+  }, [id, loadReplay]);
+
+  useEffect(() => {
+    const parsed = parseInt(nr || "1", 10);
+    if (!Number.isNaN(parsed)) {
+      setCurrentNr(parsed);
+    }
   }, [nr]);
 
-  // Load OHLCV data for current trade
   useEffect(() => {
-    if (!id || !currentNr) return;
+    currentNrRef.current = currentNr;
+  }, [currentNr]);
 
-    setIsLoadingTrade(true);
-    setDownloadTaskId(null);
-    setDownloadStatus("idle");
-    setDownloadError("");
-    getBacktestTrade(id, currentNr)
-      .then((payload) => {
-        setTradeData(payload);
-        setMissingData(null);
-      })
-      .catch((err: unknown) => {
-        if (err instanceof ApiError && isMissingOHLCVDetail(err.detail)) {
-          setMissingData(err.detail);
-          setTradeData(null);
-          return;
+  useEffect(() => {
+    const onFullscreenChange = () => {
+      setIsFullscreen(document.fullscreenElement === viewportRef.current);
+    };
+    document.addEventListener("fullscreenchange", onFullscreenChange);
+    return () => document.removeEventListener("fullscreenchange", onFullscreenChange);
+  }, []);
+
+  const tradeNumbers = useMemo(
+    () => trades.map((trade) => trade.nr).sort((left, right) => left - right),
+    [trades],
+  );
+
+  const currentTrade = useMemo(
+    () => trades.find((trade) => trade.nr === currentNr) || null,
+    [trades, currentNr],
+  );
+
+  const currentSymbol = currentTrade?.symbol || replay?.primary_symbol || "";
+  const symbolTrades = useMemo(
+    () => trades.filter((trade) => trade.symbol === currentSymbol),
+    [trades, currentSymbol],
+  );
+  const symbolOHLCV = useMemo(
+    () => replay?.ohlcv_by_symbol?.[currentSymbol] || [],
+    [replay, currentSymbol],
+  );
+  const missingData = useMemo(
+    () => replay?.missing_ohlcv?.[currentSymbol] || null,
+    [replay, currentSymbol],
+  );
+
+  const symbolDrawings = useMemo(() => {
+    return (replay?.drawings || []).filter((drawing) => {
+      const drawingSymbol = (drawing as { symbol?: string }).symbol;
+      if (!drawingSymbol) return true;
+      return drawingSymbol.toUpperCase() === currentSymbol.toUpperCase();
+    });
+  }, [replay, currentSymbol]);
+
+  const [visibleStart, visibleEnd] = useMemo(() => {
+    const first = symbolOHLCV[0]?.time ?? 0;
+    const last = symbolOHLCV[symbolOHLCV.length - 1]?.time ?? 0;
+    return [first, last];
+  }, [symbolOHLCV]);
+
+  const overlayIndicators = useMemo(() => {
+    return (replay?.indicators || []).filter((indicator) => {
+      return !indicatorIsPanel(indicator) && Array.isArray(indicator.data);
+    });
+  }, [replay]);
+
+  const panelGroups = useMemo<PanelGroup[]>(() => {
+    const groups = new Map<string, PanelGroup>();
+    (replay?.indicators || [])
+      .filter((indicator) => indicatorIsPanel(indicator) && Array.isArray(indicator.data))
+      .forEach((indicator) => {
+        const key = inferPanelKey(indicator);
+        if (!groups.has(key)) {
+          groups.set(key, { key, label: inferPanelLabel(key), indicators: [] });
         }
-        setMissingData(null);
-        setTradeData(null);
-      })
-      .finally(() => setIsLoadingTrade(false));
-  }, [id, currentNr]);
+        groups.get(key)!.indicators.push(indicator);
+      });
+    return Array.from(groups.values());
+  }, [replay]);
+
+  const tradeContextEntries = useMemo(() => {
+    const meta = currentTrade?.meta;
+    if (!meta || typeof meta !== "object") {
+      return [];
+    }
+    return Object.entries(meta as Record<string, unknown>)
+      .filter(([, value]) => value !== undefined && value !== null)
+      .sort(([left], [right]) => left.localeCompare(right));
+  }, [currentTrade]);
+
+  const setPanelContainerRef = useCallback(
+    (key: string) => (node: HTMLDivElement | null) => {
+      panelContainerRefs.current[key] = node;
+    },
+    [],
+  );
+
+  const goToTradeNumber = useCallback(
+    (tradeNr: number) => {
+      if (!id) return;
+      setCurrentNr(tradeNr);
+      window.history.replaceState(
+        window.history.state,
+        "",
+        `/backtests/${id}/trade/${tradeNr}`,
+      );
+    },
+    [id],
+  );
+
+  const goToPreviousTrade = useCallback((): boolean => {
+    const idx = tradeNumbers.indexOf(currentNr);
+    if (idx <= 0) {
+      return false;
+    }
+    goToTradeNumber(tradeNumbers[idx - 1]);
+    return true;
+  }, [tradeNumbers, currentNr, goToTradeNumber]);
+
+  const goToNextTrade = useCallback((): boolean => {
+    const idx = tradeNumbers.indexOf(currentNr);
+    if (idx < 0 || idx >= tradeNumbers.length - 1) {
+      return false;
+    }
+    goToTradeNumber(tradeNumbers[idx + 1]);
+    return true;
+  }, [tradeNumbers, currentNr, goToTradeNumber]);
+
+  const toggleFullscreen = useCallback(async () => {
+    const target = viewportRef.current;
+    if (!target) return;
+
+    if (document.fullscreenElement === target) {
+      await document.exitFullscreen();
+      return;
+    }
+    if (!document.fullscreenElement) {
+      await target.requestFullscreen();
+    }
+  }, []);
 
   useEffect(() => {
-    if (!downloadTaskId) {
-      return;
-    }
-    if (["completed", "failed", "cancelled"].includes(downloadStatus)) {
-      return;
-    }
+    if (!isPlaying) return;
+    const timer = window.setInterval(() => {
+      const moved = goToNextTrade();
+      if (!moved) {
+        setIsPlaying(false);
+      }
+    }, 1300);
+    return () => window.clearInterval(timer);
+  }, [isPlaying, goToNextTrade]);
+
+  useEffect(() => {
+    const handler = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      const typing =
+        target &&
+        (target.tagName === "INPUT" ||
+          target.tagName === "TEXTAREA" ||
+          target.tagName === "SELECT" ||
+          target.isContentEditable);
+      if (typing) return;
+
+      if (event.key === "ArrowLeft") {
+        event.preventDefault();
+        goToPreviousTrade();
+        return;
+      }
+      if (event.key === "ArrowRight") {
+        event.preventDefault();
+        goToNextTrade();
+        return;
+      }
+      if (event.code === "Space") {
+        event.preventDefault();
+        setIsPlaying((value) => !value);
+        return;
+      }
+      if (event.key === "Escape") {
+        setIsPlaying(false);
+        if (document.fullscreenElement === viewportRef.current) {
+          document.exitFullscreen().catch(() => undefined);
+        } else if (id) {
+          navigate(`/backtests/${id}`);
+        }
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [goToPreviousTrade, goToNextTrade, id, navigate]);
+
+  useEffect(() => {
+    if (!downloadTaskId) return;
+    if (["completed", "failed", "cancelled"].includes(downloadStatus)) return;
 
     const interval = window.setInterval(() => {
       getDataTask(downloadTaskId)
@@ -248,344 +506,12 @@ export function TradeChartPage() {
     return () => window.clearInterval(interval);
   }, [downloadTaskId, downloadStatus]);
 
-  // Render chart when data arrives
   useEffect(() => {
-    if (!chartContainerRef.current || !tradeData?.ohlcv?.length) return;
-
-    // Clean up previous chart
-    if (chartRef.current) {
-      chartRef.current.remove();
-      chartRef.current = null;
-    }
-
-    const container = chartContainerRef.current;
-    container.style.position = "relative";
-    const w = container.clientWidth || 1100;
-    const h = 460;
-    const locale =
-      typeof navigator.language === "string" &&
-      navigator.language !== "undefined"
-        ? navigator.language
-        : "en-US";
-    const chart = createChart(container, {
-      width: w,
-      height: h,
-      localization: { locale },
-      layout: {
-        background: { type: ColorType.Solid, color: "#0d1117" },
-        textColor: "#8b949e",
-      },
-      grid: {
-        vertLines: { color: "#1c2128" },
-        horzLines: { color: "#1c2128" },
-      },
-      crosshair: { mode: CrosshairMode.Normal },
-      timeScale: { borderColor: "#30363d", timeVisible: true },
-      rightPriceScale: { borderColor: "#30363d" },
-    });
-    chartRef.current = chart;
-
-    // Candlestick series
-    const candleSeries = chart.addSeries(CandlestickSeries, {
-      upColor: "#3fb950",
-      downColor: "#f85149",
-      wickUpColor: "#3fb950",
-      wickDownColor: "#f85149",
-      borderVisible: false,
-    });
-
-    const ohlcv: CandlestickData[] = tradeData.ohlcv.map((bar) => ({
-      time: bar.time as Time,
-      open: bar.open,
-      high: bar.high,
-      low: bar.low,
-      close: bar.close,
-    }));
-    candleSeries.setData(ohlcv);
-
-    // Volume series
-    const volumeSeries = chart.addSeries(HistogramSeries, {
-      priceFormat: { type: "volume" },
-      priceScaleId: "volume",
-    });
-    chart.priceScale("volume").applyOptions({
-      scaleMargins: { top: 0.85, bottom: 0 },
-    });
-    volumeSeries.setData(
-      tradeData.ohlcv.map((bar) => ({
-        time: bar.time as Time,
-        value: bar.volume || 0,
-        color:
-          bar.close >= bar.open ? "rgba(63,185,80,0.2)" : "rgba(248,81,73,0.2)",
-      })),
-    );
-
-    const visibleStartTime = tradeData.ohlcv[0]?.time ?? 0;
-    const visibleEndTime = tradeData.ohlcv[tradeData.ohlcv.length - 1]?.time ?? 0;
-    const visibleDrawings = (tradeData.drawings || []).filter((drawing) =>
-      drawingFallsWithinWindow(drawing, visibleStartTime, visibleEndTime),
-    );
-
-    // Trade markers + custom drawings
-    const trade = tradeData.trade;
-    const markers: Array<{
-      time: Time;
-      position: "aboveBar" | "belowBar" | "inBar";
-      color: string;
-      shape: "arrowUp" | "arrowDown" | "circle" | "square";
-      text?: string;
-    }> = [];
-    if (trade) {
-      // Entry marker
-      markers.push({
-        time: trade.entry_time as Time,
-        position: trade.direction === "LONG" ? "belowBar" : "aboveBar",
-        color: trade.direction === "LONG" ? "#3fb950" : "#f85149",
-        shape: trade.direction === "LONG" ? "arrowUp" : "arrowDown",
-        text: `${trade.direction} @ ${trade.entry_price?.toFixed(2)}`,
-      });
-
-      if (Array.isArray(trade.exits) && trade.exits.length > 0) {
-        trade.exits.forEach((exit, index) => {
-          const finalExit = index === trade.exits!.length - 1;
-          markers.push({
-            time: exit.time as Time,
-            position: trade.direction === "LONG" ? "aboveBar" : "belowBar",
-            color: finalExit
-              ? trade.pnl >= 0
-                ? "#3fb950"
-                : "#f85149"
-              : "#f59e0b",
-            shape: "circle",
-            text: `${finalExit ? "Exit" : "Partial"} @ ${exit.price?.toFixed(2)}${exit.reason ? ` (${exit.reason})` : ""}`,
-          });
-        });
-      } else {
-        markers.push({
-          time: trade.exit_time as Time,
-          position: trade.direction === "LONG" ? "aboveBar" : "belowBar",
-          color: trade.pnl >= 0 ? "#3fb950" : "#f85149",
-          shape: "circle",
-          text: `Exit @ ${trade.exit_price?.toFixed(2)} (${trade.pnl >= 0 ? "+" : ""}$${trade.pnl?.toFixed(0)})`,
-        });
-      }
-
-      // Entry/exit horizontal lines
-      candleSeries.createPriceLine({
-        price: trade.entry_price,
-        color: "#58a6ff",
-        lineWidth: 1,
-        lineStyle: LineStyle.Dashed,
-        axisLabelVisible: true,
-        title: "Entry",
-      });
-      candleSeries.createPriceLine({
-        price: trade.exit_price,
-        color: trade.pnl >= 0 ? "#3fb950" : "#f85149",
-        lineWidth: 1,
-        lineStyle: LineStyle.Dashed,
-        axisLabelVisible: true,
-        title: "Exit",
-      });
-    }
-
-    visibleDrawings
-      .filter(isMarkerDrawing)
-      .forEach((drawing) => {
-        markers.push({
-          time: drawing.time as Time,
-          position: normalizeMarkerPosition(drawing.position),
-          color: drawing.color || "#f59e0b",
-          shape: normalizeMarkerShape(drawing.shape),
-          text: drawing.text,
-        });
-      });
-
-    createSeriesMarkers(
-      candleSeries,
-      markers.sort((left, right) => Number(left.time) - Number(right.time)),
-    );
-
-    visibleDrawings.filter(isLineDrawing).forEach((drawing, index) => {
-      const startValue =
-        typeof drawing.start_value === "number"
-          ? drawing.start_value
-          : drawing.val1;
-      const endValue =
-        typeof drawing.end_value === "number"
-          ? drawing.end_value
-          : drawing.val2;
-      if (typeof startValue !== "number" || typeof endValue !== "number") {
-        return;
-      }
-      const lineSeries = chart.addSeries(LineSeries, {
-        color: drawing.color || "#f59e0b",
-        lineWidth: resolveLineWidth(drawing.lineWidth ?? 2),
-        lineStyle: resolveLineStyle(drawing.lineStyle),
-        title: drawing.title || `Drawing ${index + 1}`,
-        lastValueVisible: false,
-        priceLineVisible: false,
-      });
-      lineSeries.setData([
-        { time: drawing.start_time as Time, value: startValue },
-        { time: drawing.end_time as Time, value: endValue },
-      ]);
-    });
-
-    visibleDrawings.filter(isLineWithBreaksDrawing).forEach((drawing, index) => {
-      const lineSeries = chart.addSeries(LineSeries, {
-        color: drawing.color || "#f59e0b",
-        lineWidth: resolveLineWidth(drawing.lineWidth ?? 2),
-        lineStyle: resolveLineStyle(drawing.lineStyle),
-        title: drawing.title || `LineBreak ${index + 1}`,
-        lastValueVisible: false,
-        priceLineVisible: false,
-      });
-      lineSeries.setData(
-        (drawing.data || []).map((point) => {
-          if (point.value === null || Number.isNaN(point.value)) {
-            return { time: point.time as Time };
-          }
-          return { time: point.time as Time, value: point.value };
-        }),
-      );
-    });
-
-    const boxOverlayRoot = document.createElement("div");
-    boxOverlayRoot.style.position = "absolute";
-    boxOverlayRoot.style.left = "0";
-    boxOverlayRoot.style.top = "0";
-    boxOverlayRoot.style.width = "100%";
-    boxOverlayRoot.style.height = `${h}px`;
-    boxOverlayRoot.style.pointerEvents = "none";
-    container.appendChild(boxOverlayRoot);
-
-    const renderBoxes = () => {
-      boxOverlayRoot.replaceChildren();
-      visibleDrawings.filter(isBoxDrawing).forEach((drawing) => {
-        const left = chart.timeScale().timeToCoordinate(drawing.start_time as Time);
-        const right = chart.timeScale().timeToCoordinate(drawing.end_time as Time);
-        const top = candleSeries.priceToCoordinate(drawing.high);
-        const bottom = candleSeries.priceToCoordinate(drawing.low);
-        if (
-          left === null ||
-          right === null ||
-          top === null ||
-          bottom === null ||
-          !Number.isFinite(left) ||
-          !Number.isFinite(right) ||
-          !Number.isFinite(top) ||
-          !Number.isFinite(bottom)
-        ) {
-          return;
-        }
-
-        const box = document.createElement("div");
-        box.style.position = "absolute";
-        box.style.left = `${Math.min(left, right)}px`;
-        box.style.width = `${Math.max(1, Math.abs(right - left))}px`;
-        box.style.top = `${Math.min(top, bottom)}px`;
-        box.style.height = `${Math.max(1, Math.abs(bottom - top))}px`;
-        box.style.background = drawing.color || "rgba(88, 166, 255, 0.1)";
-        box.style.border = `1px solid ${drawing.border_color || "#58a6ff"}`;
-        box.style.boxSizing = "border-box";
-        boxOverlayRoot.appendChild(box);
-      });
-    };
-    renderBoxes();
-
-    // Indicator overlays
-    if (tradeData.indicators && Array.isArray(tradeData.indicators)) {
-      // Overlay indicators (on main chart)
-      tradeData.indicators
-        .filter(
-          (ind: IndicatorSeriesView) =>
-            (ind.type || ind.pane) === "overlay" && ind.data?.length,
-        )
-        .forEach((ind: IndicatorSeriesView) => {
-          const lineSeries = chart.addSeries(LineSeries, {
-            color: ind.style?.color || ind.color || "#58a6ff",
-            lineWidth: 1,
-            lineStyle: ind.style?.lineStyle ?? ind.lineStyle ?? 0,
-            title: ind.name,
-          });
-          lineSeries.setData(
-            ind.data
-              .filter((d) => d.value != null && !isNaN(d.value))
-              .map((d) => ({ time: d.time as Time, value: d.value })),
-          );
-        });
-
-      // Panel indicators (separate price scale)
-      tradeData.indicators
-        .filter(
-          (ind: IndicatorSeriesView) =>
-            (ind.type || ind.pane) === "panel" && ind.data?.length,
-        )
-        .forEach((ind: IndicatorSeriesView, idx: number) => {
-          const scaleId = `panel-${idx}`;
-          const lineSeries = chart.addSeries(LineSeries, {
-            color: ind.style?.color || ind.color || "#a78bfa",
-            lineWidth: 1,
-            title: ind.name,
-            priceScaleId: scaleId,
-          });
-          lineSeries.setData(
-            ind.data
-              .filter((d) => d.value != null && !isNaN(d.value))
-              .map((d) => ({ time: d.time as Time, value: d.value })),
-          );
-          chart
-            .priceScale(scaleId)
-            .applyOptions({
-              scaleMargins: { top: 0.85 + idx * 0.05, bottom: 0 },
-            });
-        });
-    }
-
-    chart.timeScale().fitContent();
-
-    // Force resize to ensure canvas pixel buffer matches container
-    requestAnimationFrame(() => {
-      if (container.clientWidth > 0) {
-        chart.resize(container.clientWidth, h);
-      }
-    });
-
-    // Resize observer for responsive
-    const resizeObserver = new ResizeObserver(() => {
-      if (container.clientWidth > 0) {
-        chart.resize(container.clientWidth, h);
-        renderBoxes();
-      }
-    });
-    resizeObserver.observe(container);
-
-    return () => {
-      resizeObserver.disconnect();
-      boxOverlayRoot.remove();
-      chart.remove();
-      chartRef.current = null;
-    };
-  }, [tradeData]);
-
-  // Keyboard navigation
-  useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      if (e.key === "ArrowLeft" && currentNr > 1) {
-        navigate(`/backtests/${id}/trade/${currentNr - 1}`, { replace: true });
-      } else if (e.key === "ArrowRight" && currentNr < trades.length) {
-        navigate(`/backtests/${id}/trade/${currentNr + 1}`, { replace: true });
-      } else if (e.key === "Escape") {
-        navigate(`/backtests/${id}`);
-      }
-    };
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  }, [currentNr, trades.length, id, navigate]);
-
-  const currentTrade =
-    tradeData?.trade ?? trades.find((t) => t.nr === currentNr);
+    if (downloadStatus !== "completed") return;
+    setDownloadTaskId(null);
+    setDownloadStatus("idle");
+    loadReplay(currentNrRef.current);
+  }, [downloadStatus, loadReplay]);
 
   const triggerMissingDataDownload = async () => {
     if (!missingData) {
@@ -616,127 +542,478 @@ export function TradeChartPage() {
     }
   };
 
-  const reloadCurrentTrade = () => {
-    if (!id || !currentNr) {
+  useEffect(() => {
+    chartRefs.current.forEach((chart) => chart.remove());
+    chartRefs.current = [];
+    mainChartRef.current = null;
+    candleSeriesRef.current = null;
+    priceLineRefs.current = { entry: null, exit: null };
+    if (boxOverlayRef.current) {
+      boxOverlayRef.current.remove();
+      boxOverlayRef.current = null;
+    }
+
+    if (!mainChartContainerRef.current || !symbolOHLCV.length) {
       return;
     }
-    setIsLoadingTrade(true);
-    getBacktestTrade(id, currentNr)
-      .then((payload) => {
-        setTradeData(payload);
-        setMissingData(null);
-      })
-      .catch((err: unknown) => {
-        if (err instanceof ApiError && isMissingOHLCVDetail(err.detail)) {
-          setMissingData(err.detail);
-          setTradeData(null);
+
+    const container = mainChartContainerRef.current;
+    container.style.position = "relative";
+    const locale =
+      typeof navigator.language === "string" && navigator.language !== "undefined"
+        ? navigator.language
+        : "en-US";
+
+    const width = container.clientWidth || 1100;
+    const mainHeight = isFullscreen
+      ? Math.max(480, Math.floor(window.innerHeight * 0.58))
+      : 460;
+    const panelHeight = isFullscreen ? 170 : 145;
+
+    const chart = createChart(container, {
+      width,
+      height: mainHeight,
+      localization: { locale },
+      layout: {
+        background: { type: ColorType.Solid, color: "#0d1117" },
+        textColor: "#8b949e",
+      },
+      grid: {
+        vertLines: { color: "#1c2128" },
+        horzLines: { color: "#1c2128" },
+      },
+      crosshair: { mode: CrosshairMode.Normal },
+      timeScale: { borderColor: "#30363d", timeVisible: true },
+      rightPriceScale: { borderColor: "#30363d" },
+    });
+    mainChartRef.current = chart;
+    chartRefs.current.push(chart);
+
+    const candleSeries = chart.addSeries(CandlestickSeries, {
+      upColor: "#3fb950",
+      downColor: "#f85149",
+      wickUpColor: "#3fb950",
+      wickDownColor: "#f85149",
+      borderVisible: false,
+    });
+    candleSeriesRef.current = candleSeries;
+
+    const candleData: CandlestickData[] = symbolOHLCV.map((bar) => ({
+      time: bar.time as Time,
+      open: bar.open,
+      high: bar.high,
+      low: bar.low,
+      close: bar.close,
+    }));
+    candleSeries.setData(candleData);
+
+    const volumeSeries = chart.addSeries(HistogramSeries, {
+      priceFormat: { type: "volume" },
+      priceScaleId: "volume",
+    });
+    chart.priceScale("volume").applyOptions({
+      scaleMargins: { top: 0.85, bottom: 0 },
+    });
+    volumeSeries.setData(
+      symbolOHLCV.map((bar) => ({
+        time: bar.time as Time,
+        value: bar.volume || 0,
+        color:
+          bar.close >= bar.open ? "rgba(63,185,80,0.2)" : "rgba(248,81,73,0.2)",
+      })),
+    );
+
+    overlayIndicators.forEach((indicator) => {
+      const points = pointsInRange(indicator.data, visibleStart, visibleEnd);
+      if (!points.length) return;
+
+      const lineSeries = chart.addSeries(LineSeries, {
+        color: indicator.style?.color || indicator.color || "#58a6ff",
+        lineWidth: resolveLineWidth(indicator.style?.width ?? 1),
+        lineStyle: resolveLineStyle(indicator.style?.lineStyle ?? indicator.lineStyle),
+        title: indicator.name,
+        lastValueVisible: false,
+        priceLineVisible: false,
+      });
+      lineSeries.setData(toLineSeriesData(points));
+    });
+
+    symbolDrawings.filter(isLineDrawing).forEach((drawing, index) => {
+      const startValue =
+        typeof drawing.start_value === "number" ? drawing.start_value : drawing.val1;
+      const endValue =
+        typeof drawing.end_value === "number" ? drawing.end_value : drawing.val2;
+      if (typeof startValue !== "number" || typeof endValue !== "number") return;
+
+      const lineSeries = chart.addSeries(LineSeries, {
+        color: drawing.color || "#f59e0b",
+        lineWidth: resolveLineWidth(drawing.lineWidth ?? 2),
+        lineStyle: resolveLineStyle(drawing.lineStyle),
+        title: drawing.title || `Line ${index + 1}`,
+        lastValueVisible: false,
+        priceLineVisible: false,
+      });
+      lineSeries.setData([
+        { time: drawing.start_time as Time, value: startValue },
+        { time: drawing.end_time as Time, value: endValue },
+      ]);
+    });
+
+    symbolDrawings
+      .filter(isLineWithBreaksDrawing)
+      .forEach((drawing, index) => {
+        const lineSeries = chart.addSeries(LineSeries, {
+          color: drawing.color || "#f59e0b",
+          lineWidth: resolveLineWidth(drawing.lineWidth ?? 2),
+          lineStyle: resolveLineStyle(drawing.lineStyle),
+          title: drawing.title || `LineBreak ${index + 1}`,
+          lastValueVisible: false,
+          priceLineVisible: false,
+        });
+        lineSeries.setData(
+          (drawing.data || []).map((point) =>
+            point.value === null || Number.isNaN(point.value)
+              ? { time: point.time as Time }
+              : { time: point.time as Time, value: point.value },
+          ),
+        );
+      });
+
+    const boxOverlayRoot = document.createElement("div");
+    boxOverlayRoot.style.position = "absolute";
+    boxOverlayRoot.style.left = "0";
+    boxOverlayRoot.style.top = "0";
+    boxOverlayRoot.style.width = "100%";
+    boxOverlayRoot.style.height = `${mainHeight}px`;
+    boxOverlayRoot.style.pointerEvents = "none";
+    container.appendChild(boxOverlayRoot);
+    boxOverlayRef.current = boxOverlayRoot;
+
+    const renderBoxes = () => {
+      boxOverlayRoot.replaceChildren();
+      symbolDrawings.filter(isBoxDrawing).forEach((drawing) => {
+        const left = chart.timeScale().timeToCoordinate(drawing.start_time as Time);
+        const right = chart.timeScale().timeToCoordinate(drawing.end_time as Time);
+        const top = candleSeries.priceToCoordinate(drawing.high);
+        const bottom = candleSeries.priceToCoordinate(drawing.low);
+        if (
+          left === null ||
+          right === null ||
+          top === null ||
+          bottom === null ||
+          !Number.isFinite(left) ||
+          !Number.isFinite(right) ||
+          !Number.isFinite(top) ||
+          !Number.isFinite(bottom)
+        ) {
           return;
         }
-        setMissingData(null);
-        setTradeData(null);
-      })
-      .finally(() => setIsLoadingTrade(false));
-  };
-  const tradeContextEntries = useMemo(() => {
-    const meta = currentTrade?.meta;
-    if (!meta || typeof meta !== "object") {
-      return [];
+        const box = document.createElement("div");
+        box.style.position = "absolute";
+        box.style.left = `${Math.min(left, right)}px`;
+        box.style.width = `${Math.max(1, Math.abs(right - left))}px`;
+        box.style.top = `${Math.min(top, bottom)}px`;
+        box.style.height = `${Math.max(1, Math.abs(bottom - top))}px`;
+        box.style.background = drawing.color || "rgba(88, 166, 255, 0.1)";
+        box.style.border = `1px solid ${drawing.border_color || "#58a6ff"}`;
+        box.style.boxSizing = "border-box";
+        boxOverlayRoot.appendChild(box);
+      });
+    };
+    renderBoxes();
+    chart.timeScale().subscribeVisibleTimeRangeChange(renderBoxes);
+
+    const panelCharts: IChartApi[] = [];
+    panelGroups.forEach((group, groupIndex) => {
+      const panelContainer = panelContainerRefs.current[group.key];
+      if (!panelContainer) return;
+
+      const panelChart = createChart(panelContainer, {
+        width,
+        height: panelHeight,
+        localization: { locale },
+        layout: {
+          background: { type: ColorType.Solid, color: "#0d1117" },
+          textColor: "#8b949e",
+        },
+        grid: {
+          vertLines: { color: "#1c2128" },
+          horzLines: { color: "#1c2128" },
+        },
+        crosshair: { mode: CrosshairMode.Normal },
+        timeScale: {
+          borderColor: "#30363d",
+          timeVisible: groupIndex === panelGroups.length - 1,
+        },
+        rightPriceScale: { borderColor: "#30363d" },
+      });
+      panelCharts.push(panelChart);
+      chartRefs.current.push(panelChart);
+
+      group.indicators.forEach((indicator) => {
+        const points = pointsInRange(indicator.data, visibleStart, visibleEnd);
+        if (!points.length) return;
+
+        const lineSeries = panelChart.addSeries(LineSeries, {
+          color: indicator.style?.color || indicator.color || "#a78bfa",
+          lineWidth: resolveLineWidth(indicator.style?.width ?? 1),
+          lineStyle: resolveLineStyle(indicator.style?.lineStyle ?? indicator.lineStyle),
+          title: indicator.name,
+          lastValueVisible: false,
+          priceLineVisible: false,
+        });
+        lineSeries.setData(toLineSeriesData(points));
+      });
+      panelChart.priceScale("right").applyOptions({
+        scaleMargins: { top: 0.1, bottom: 0.1 },
+      });
+    });
+
+    const allCharts = [chart, ...panelCharts];
+    let syncing = false;
+    const syncSubscriptions: Array<{ chart: IChartApi; handler: (range: LogicalRange | null) => void }> = [];
+    allCharts.forEach((sourceChart, sourceIdx) => {
+      const handler = (range: LogicalRange | null) => {
+        if (!range || syncing) return;
+        syncing = true;
+        allCharts.forEach((targetChart, targetIdx) => {
+          if (targetIdx !== sourceIdx) {
+            targetChart.timeScale().setVisibleLogicalRange(range);
+          }
+        });
+        syncing = false;
+      };
+      sourceChart.timeScale().subscribeVisibleLogicalRangeChange(handler);
+      syncSubscriptions.push({ chart: sourceChart, handler });
+    });
+
+    chart.timeScale().fitContent();
+    const initialRange = chart.timeScale().getVisibleLogicalRange();
+    if (initialRange) {
+      panelCharts.forEach((panelChart) => {
+        panelChart.timeScale().setVisibleLogicalRange(initialRange);
+      });
     }
 
-    return Object.entries(meta as Record<string, unknown>)
-      .filter(([, value]) => value !== undefined && value !== null)
-      .sort(([left], [right]) => left.localeCompare(right));
-  }, [currentTrade]);
+    const handleResize = () => {
+      const nextWidth = container.clientWidth || width;
+      chart.resize(nextWidth, mainHeight);
+      panelCharts.forEach((panelChart) => panelChart.resize(nextWidth, panelHeight));
+      boxOverlayRoot.style.height = `${mainHeight}px`;
+      renderBoxes();
+    };
+    const resizeObserver = new ResizeObserver(handleResize);
+    resizeObserver.observe(container);
+    window.addEventListener("resize", handleResize);
+
+    return () => {
+      resizeObserver.disconnect();
+      window.removeEventListener("resize", handleResize);
+      chart.timeScale().unsubscribeVisibleTimeRangeChange(renderBoxes);
+      syncSubscriptions.forEach(({ chart: targetChart, handler }) => {
+        targetChart.timeScale().unsubscribeVisibleLogicalRangeChange(handler);
+      });
+      chartRefs.current.forEach((targetChart) => targetChart.remove());
+      chartRefs.current = [];
+      mainChartRef.current = null;
+      candleSeriesRef.current = null;
+      priceLineRefs.current = { entry: null, exit: null };
+      if (boxOverlayRef.current) {
+        boxOverlayRef.current.remove();
+        boxOverlayRef.current = null;
+      }
+    };
+  }, [
+    symbolOHLCV,
+    overlayIndicators,
+    panelGroups,
+    symbolDrawings,
+    visibleStart,
+    visibleEnd,
+    isFullscreen,
+  ]);
+
+  useEffect(() => {
+    const chart = mainChartRef.current;
+    const candleSeries = candleSeriesRef.current;
+    if (!chart || !candleSeries || !currentTrade || !symbolOHLCV.length) {
+      return;
+    }
+
+    const markers: Array<{
+      time: Time;
+      position: "aboveBar" | "belowBar" | "inBar";
+      color: string;
+      shape: "arrowUp" | "arrowDown" | "circle" | "square";
+      text?: string;
+    }> = [];
+
+    symbolTrades.forEach((trade) => {
+      markers.push({
+        time: trade.entry_time as Time,
+        position: trade.direction === "LONG" ? "belowBar" : "aboveBar",
+        color: trade.nr === currentNr ? "#58a6ff" : "rgba(88,166,255,0.55)",
+        shape: trade.direction === "LONG" ? "arrowUp" : "arrowDown",
+        text: trade.nr === currentNr ? `Trade #${trade.nr}` : undefined,
+      });
+    });
+
+    (currentTrade.exits || []).forEach((exit, index) => {
+      const isFinal = index === (currentTrade.exits?.length || 0) - 1;
+      markers.push({
+        time: exit.time as Time,
+        position: currentTrade.direction === "LONG" ? "aboveBar" : "belowBar",
+        color: isFinal
+          ? currentTrade.pnl >= 0
+            ? "#3fb950"
+            : "#f85149"
+          : "#f59e0b",
+        shape: "circle",
+        text: isFinal ? "Exit" : "Partial",
+      });
+    });
+
+    symbolDrawings.filter(isMarkerDrawing).forEach((drawing) => {
+      markers.push({
+        time: drawing.time as Time,
+        position: normalizeMarkerPosition(drawing.position),
+        color: drawing.color || "#f59e0b",
+        shape: normalizeMarkerShape(drawing.shape),
+        text: drawing.text,
+      });
+    });
+
+    createSeriesMarkers(
+      candleSeries,
+      markers.sort((left, right) => Number(left.time) - Number(right.time)),
+    );
+
+    if (priceLineRefs.current.entry) {
+      candleSeries.removePriceLine(priceLineRefs.current.entry);
+      priceLineRefs.current.entry = null;
+    }
+    if (priceLineRefs.current.exit) {
+      candleSeries.removePriceLine(priceLineRefs.current.exit);
+      priceLineRefs.current.exit = null;
+    }
+
+    priceLineRefs.current.entry = candleSeries.createPriceLine({
+      price: currentTrade.entry_price,
+      color: "#58a6ff",
+      lineWidth: 1,
+      lineStyle: LineStyle.Dashed,
+      axisLabelVisible: true,
+      title: "Entry",
+    });
+    priceLineRefs.current.exit = candleSeries.createPriceLine({
+      price: currentTrade.exit_price,
+      color: currentTrade.pnl >= 0 ? "#3fb950" : "#f85149",
+      lineWidth: 1,
+      lineStyle: LineStyle.Dashed,
+      axisLabelVisible: true,
+      title: "Exit",
+    });
+
+    const entryIndex = findBarIndexByTime(symbolOHLCV, currentTrade.entry_time);
+    if (entryIndex >= 0) {
+      const barsBefore = 120;
+      const barsAfter = 80;
+      chart.timeScale().setVisibleLogicalRange({
+        from: Math.max(entryIndex - barsBefore, 0),
+        to: Math.min(entryIndex + barsAfter, symbolOHLCV.length - 1),
+      });
+    }
+  }, [currentTrade, currentNr, symbolOHLCV, symbolTrades, symbolDrawings]);
+
+  if (isLoading) {
+    return (
+      <div style={{ padding: "20px", color: "var(--color-text-muted)" }}>
+        Loading replay data...
+      </div>
+    );
+  }
+
+  if (loadError) {
+    return (
+      <div style={{ padding: "20px", color: "var(--color-red)" }}>
+        Error: {loadError}
+      </div>
+    );
+  }
 
   return (
-    <div style={{ padding: "24px" }}>
-      {/* Toolbar */}
+    <div
+      ref={viewportRef}
+      style={{
+        padding: "24px",
+        background: "var(--color-bg)",
+        minHeight: "100%",
+      }}
+    >
       <div
-        data-testid="trade-chart-area"
         style={{
-          background: "var(--color-surface)",
+          background:
+            "radial-gradient(circle at top right, rgba(88,166,255,0.12), transparent 38%), var(--color-surface)",
           border: "1px solid var(--color-border)",
-          borderRadius: "8px",
-          padding: "12px 16px",
+          borderRadius: "12px",
+          padding: "14px 16px",
           marginBottom: "16px",
           display: "flex",
           alignItems: "center",
           justifyContent: "space-between",
+          gap: "12px",
+          flexWrap: "wrap",
         }}
       >
         <button
           onClick={() => navigate(`/backtests/${id}`)}
           style={{
-            display: "flex",
+            display: "inline-flex",
             alignItems: "center",
-            gap: "6px",
+            gap: "8px",
             background: "none",
             border: "none",
             color: "#58a6ff",
             cursor: "pointer",
-            fontSize: "0.82rem",
+            fontSize: "0.84rem",
           }}
         >
-          <ArrowLeft size={16} /> Back to Report
+          <ArrowLeft size={16} />
+          Back to Report
         </button>
 
-        <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
-          <button
-            onClick={() =>
-              currentNr > 1 &&
-              navigate(`/backtests/${id}/trade/${currentNr - 1}`, {
-                replace: true,
-              })
-            }
-            disabled={currentNr <= 1}
-            style={{
-              background: "none",
-              border: "none",
-              color: currentNr <= 1 ? "#333" : "var(--color-text-muted)",
-              cursor: "pointer",
-            }}
-          >
-            <ChevronLeft size={18} />
-          </button>
-          <span
-            style={{ fontSize: "0.82rem", color: "var(--color-text-muted)" }}
-          >
-            Trade {currentNr} / {trades.length}
-          </span>
-          <button
-            onClick={() =>
-              currentNr < trades.length &&
-              navigate(`/backtests/${id}/trade/${currentNr + 1}`, {
-                replace: true,
-              })
-            }
-            disabled={currentNr >= trades.length}
-            style={{
-              background: "none",
-              border: "none",
-              color:
-                currentNr >= trades.length ? "#333" : "var(--color-text-muted)",
-              cursor: "pointer",
-            }}
-          >
-            <ChevronRight size={18} />
-          </button>
+        <div style={{ fontSize: "0.82rem", color: "var(--color-text-muted)" }}>
+          Trade {currentNr} / {tradeNumbers.length} • {currentSymbol || "—"} •{" "}
+          {replay?.timeframe || "—"}
         </div>
 
-        <div style={{ fontSize: "0.75rem", color: "var(--color-text-muted)" }}>
-          ← → navigate • Esc back
-        </div>
+        <button
+          onClick={toggleFullscreen}
+          style={{
+            display: "inline-flex",
+            alignItems: "center",
+            gap: "6px",
+            border: "1px solid var(--color-border)",
+            borderRadius: "8px",
+            background: "var(--color-surface2)",
+            color: "var(--color-text)",
+            padding: "6px 10px",
+            cursor: "pointer",
+            fontSize: "0.78rem",
+          }}
+        >
+          {isFullscreen ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
+          {isFullscreen ? "Exit Fullscreen" : "Fullscreen"}
+        </button>
       </div>
 
-      {/* Trade Info */}
-      {currentTrade && (
+      {currentTrade ? (
         <div
           style={{
             display: "flex",
-            gap: "16px",
+            gap: "14px",
             flexWrap: "wrap",
             marginBottom: "16px",
-            alignItems: "stretch",
           }}
         >
           <div
@@ -744,142 +1021,77 @@ export function TradeChartPage() {
               flex: "2 1 560px",
               background: "var(--color-surface)",
               border: "1px solid var(--color-border)",
-              borderRadius: "8px",
-              padding: "20px",
+              borderRadius: "10px",
+              padding: "16px",
             }}
           >
-            <div style={{ display: "flex", gap: "20px", flexWrap: "wrap" }}>
-              <div
-                style={{
-                  background: "var(--color-surface2)",
-                  border: "1px solid var(--color-border)",
-                  borderRadius: "6px",
-                  padding: "8px 14px",
-                }}
-              >
+            <div style={{ display: "flex", flexWrap: "wrap", gap: "10px" }}>
+              {[
+                { label: "Direction", value: currentTrade.direction },
+                { label: "Symbol", value: currentTrade.symbol },
+                {
+                  label: "Entry",
+                  value: `$${currentTrade.entry_price?.toFixed(2)} @ ${(currentTrade.entry_time_iso || "").slice(0, 16)}`,
+                },
+                {
+                  label: "Exit",
+                  value: `$${currentTrade.exit_price?.toFixed(2)} @ ${(currentTrade.exit_time_iso || "").slice(0, 16)}`,
+                },
+                {
+                  label: "P&L",
+                  value: `$${currentTrade.pnl?.toLocaleString("en-US", { maximumFractionDigits: 2 })} (${currentTrade.pnl_pct != null ? `${currentTrade.pnl_pct.toFixed(2)}%` : "—"})`,
+                },
+              ].map((row) => (
                 <div
+                  key={row.label}
                   style={{
-                    color: "var(--color-text-muted)",
-                    fontSize: "0.7rem",
-                    textTransform: "uppercase",
+                    background: "var(--color-surface2)",
+                    border: "1px solid var(--color-border)",
+                    borderRadius: "8px",
+                    padding: "8px 12px",
+                    minWidth: "140px",
                   }}
                 >
-                  Direction
+                  <div
+                    style={{
+                      color: "var(--color-text-muted)",
+                      fontSize: "0.7rem",
+                      textTransform: "uppercase",
+                      marginBottom: "3px",
+                    }}
+                  >
+                    {row.label}
+                  </div>
+                  <div
+                    style={{
+                      fontWeight: 700,
+                      color:
+                        row.label === "Direction"
+                          ? currentTrade.direction === "LONG"
+                            ? "#3fb950"
+                            : "#f85149"
+                          : row.label === "P&L"
+                            ? currentTrade.pnl >= 0
+                              ? "#3fb950"
+                              : "#f85149"
+                            : "var(--color-text)",
+                    }}
+                  >
+                    {row.value}
+                  </div>
                 </div>
-                <div
-                  style={{
-                    fontWeight: 700,
-                    color:
-                      currentTrade.direction === "LONG" ? "#3fb950" : "#f85149",
-                  }}
-                >
-                  {currentTrade.direction}
-                </div>
-              </div>
-              <div
-                style={{
-                  background: "var(--color-surface2)",
-                  border: "1px solid var(--color-border)",
-                  borderRadius: "6px",
-                  padding: "8px 14px",
-                }}
-              >
-                <div
-                  style={{
-                    color: "var(--color-text-muted)",
-                    fontSize: "0.7rem",
-                    textTransform: "uppercase",
-                  }}
-                >
-                  Symbol
-                </div>
-                <div style={{ fontWeight: 700 }}>{currentTrade.symbol}</div>
-              </div>
-              <div
-                style={{
-                  background: "var(--color-surface2)",
-                  border: "1px solid var(--color-border)",
-                  borderRadius: "6px",
-                  padding: "8px 14px",
-                }}
-              >
-                <div
-                  style={{
-                    color: "var(--color-text-muted)",
-                    fontSize: "0.7rem",
-                    textTransform: "uppercase",
-                  }}
-                >
-                  Entry
-                </div>
-                <div style={{ fontWeight: 700 }}>
-                  ${currentTrade.entry_price?.toFixed(2)} @{" "}
-                  {(currentTrade.entry_time_iso || "").slice(0, 16)}
-                </div>
-              </div>
-              <div
-                style={{
-                  background: "var(--color-surface2)",
-                  border: "1px solid var(--color-border)",
-                  borderRadius: "6px",
-                  padding: "8px 14px",
-                }}
-              >
-                <div
-                  style={{
-                    color: "var(--color-text-muted)",
-                    fontSize: "0.7rem",
-                    textTransform: "uppercase",
-                  }}
-                >
-                  Exit
-                </div>
-                <div style={{ fontWeight: 700 }}>
-                  ${currentTrade.exit_price?.toFixed(2)} @{" "}
-                  {(currentTrade.exit_time_iso || "").slice(0, 16)}
-                </div>
-              </div>
-              <div
-                style={{
-                  background: "var(--color-surface2)",
-                  border: "1px solid var(--color-border)",
-                  borderRadius: "6px",
-                  padding: "8px 14px",
-                }}
-              >
-                <div
-                  style={{
-                    color: "var(--color-text-muted)",
-                    fontSize: "0.7rem",
-                    textTransform: "uppercase",
-                  }}
-                >
-                  P&L
-                </div>
-                <div
-                  style={{
-                    fontWeight: 700,
-                    color: currentTrade.pnl >= 0 ? "#3fb950" : "#f85149",
-                  }}
-                >
-                  $
-                  {currentTrade.pnl?.toLocaleString("en-US", {
-                    maximumFractionDigits: 2,
-                  })}{" "}
-                  ({currentTrade.pnl_pct?.toFixed(2)}%)
-                </div>
-              </div>
+              ))}
             </div>
           </div>
 
-          {tradeContextEntries.length > 0 && (
+          {tradeContextEntries.length > 0 ? (
             <div
               style={{
                 flex: "1 1 320px",
                 background: "var(--color-surface)",
                 border: "1px solid var(--color-border)",
-                borderRadius: "8px",
-                padding: "20px",
+                borderRadius: "10px",
+                padding: "16px",
               }}
             >
               <div
@@ -893,28 +1105,22 @@ export function TradeChartPage() {
               >
                 Trade Context
               </div>
-              <div
-                style={{
-                  display: "flex",
-                  flexDirection: "column",
-                  gap: "10px",
-                }}
-              >
+              <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
                 {tradeContextEntries.map(([key, value]) => (
                   <div
                     key={key}
                     style={{
                       display: "flex",
                       justifyContent: "space-between",
-                      gap: "12px",
-                      paddingBottom: "10px",
+                      gap: "10px",
                       borderBottom: "1px solid var(--color-border)",
+                      paddingBottom: "8px",
                     }}
                   >
                     <div
                       style={{
                         color: "var(--color-text-muted)",
-                        fontSize: "0.82rem",
+                        fontSize: "0.8rem",
                         wordBreak: "break-word",
                       }}
                     >
@@ -925,6 +1131,7 @@ export function TradeChartPage() {
                         fontWeight: 600,
                         textAlign: "right",
                         wordBreak: "break-word",
+                        fontSize: "0.82rem",
                       }}
                     >
                       {formatTradeMetaValue(value)}
@@ -933,25 +1140,59 @@ export function TradeChartPage() {
                 ))}
               </div>
             </div>
-          )}
+          ) : null}
         </div>
-      )}
+      ) : null}
 
-      {/* Chart area */}
       <div
         style={{
           background: "var(--color-surface)",
           border: "1px solid var(--color-border)",
-          borderRadius: "8px",
+          borderRadius: "10px",
+          padding: "12px",
           overflow: "hidden",
         }}
       >
-        {tradeData?.ohlcv?.length ? (
-          <div
-            ref={chartContainerRef}
-            data-testid="trade-chart-canvas"
-            style={{ width: "100%", height: "460px" }}
-          />
+        {symbolOHLCV.length ? (
+          <>
+            <div
+              ref={mainChartContainerRef}
+              data-testid="trade-chart-canvas"
+              style={{
+                width: "100%",
+                height: isFullscreen ? "58vh" : "460px",
+                borderRadius: "8px",
+                overflow: "hidden",
+              }}
+            />
+
+            {panelGroups.map((group) => (
+              <div key={group.key} style={{ marginTop: "8px" }}>
+                <div
+                  style={{
+                    fontSize: "0.68rem",
+                    color: "var(--color-text-muted)",
+                    letterSpacing: "0.08em",
+                    textTransform: "uppercase",
+                    marginBottom: "4px",
+                    paddingLeft: "4px",
+                  }}
+                >
+                  {group.label}
+                </div>
+                <div
+                  ref={setPanelContainerRef(group.key)}
+                  style={{
+                    width: "100%",
+                    height: isFullscreen ? "170px" : "145px",
+                    border: "1px solid var(--color-border)",
+                    borderRadius: "8px",
+                    overflow: "hidden",
+                  }}
+                />
+              </div>
+            ))}
+          </>
         ) : missingData ? (
           <div
             data-testid="missing-ohlcv"
@@ -965,7 +1206,7 @@ export function TradeChartPage() {
           >
             <div
               style={{
-                width: "min(680px, 100%)",
+                width: "min(700px, 100%)",
                 border: "1px solid var(--color-border)",
                 borderRadius: "10px",
                 background: "var(--color-surface2)",
@@ -1001,7 +1242,7 @@ export function TradeChartPage() {
                 </button>
 
                 <button
-                  onClick={reloadCurrentTrade}
+                  onClick={() => loadReplay(currentNrRef.current)}
                   data-testid="missing-data-reload-btn"
                   style={{
                     border: "1px solid var(--color-border)",
@@ -1012,7 +1253,7 @@ export function TradeChartPage() {
                     cursor: "pointer",
                   }}
                 >
-                  Reload chart
+                  Reload replay
                 </button>
               </div>
 
@@ -1031,19 +1272,98 @@ export function TradeChartPage() {
         ) : (
           <div
             style={{
-              height: "460px",
+              minHeight: "460px",
               display: "flex",
               alignItems: "center",
               justifyContent: "center",
               color: "var(--color-text-muted)",
             }}
           >
-            {isLoadingTrade
-              ? "Loading chart data..."
-              : "No OHLCV data available"}
+            No OHLCV data available for this symbol
           </div>
         )}
       </div>
+
+      {tradeNumbers.length ? (
+        <div
+          style={{
+            position: "fixed",
+            left: "50%",
+            bottom: "16px",
+            transform: "translateX(-50%)",
+            zIndex: 40,
+            display: "flex",
+            alignItems: "center",
+            gap: "8px",
+            padding: "8px",
+            borderRadius: "999px",
+            border: "1px solid rgba(88,166,255,0.22)",
+            background: "rgba(13,17,23,0.82)",
+            backdropFilter: "blur(10px)",
+            boxShadow: "0 12px 40px rgba(0,0,0,0.35)",
+          }}
+        >
+          <button
+            onClick={goToPreviousTrade}
+            disabled={tradeNumbers.indexOf(currentNr) <= 0}
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: "6px",
+              border: "1px solid var(--color-border)",
+              borderRadius: "999px",
+              background: "var(--color-surface2)",
+              color: "var(--color-text)",
+              padding: "8px 12px",
+              cursor: "pointer",
+              fontSize: "0.78rem",
+            }}
+          >
+            <SkipBack size={14} />
+            [|&lt;] Previous Trade
+          </button>
+
+          <button
+            onClick={() => setIsPlaying((value) => !value)}
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: "6px",
+              border: "1px solid rgba(88,166,255,0.38)",
+              borderRadius: "999px",
+              background: "rgba(88,166,255,0.14)",
+              color: "#79c0ff",
+              padding: "8px 12px",
+              cursor: "pointer",
+              fontSize: "0.78rem",
+              fontWeight: 700,
+            }}
+          >
+            {isPlaying ? <Pause size={14} /> : <Play size={14} />}
+            [{isPlaying ? "Pause" : "Play"}]
+          </button>
+
+          <button
+            onClick={goToNextTrade}
+            disabled={tradeNumbers.indexOf(currentNr) >= tradeNumbers.length - 1}
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: "6px",
+              border: "1px solid var(--color-border)",
+              borderRadius: "999px",
+              background: "var(--color-surface2)",
+              color: "var(--color-text)",
+              padding: "8px 12px",
+              cursor: "pointer",
+              fontSize: "0.78rem",
+            }}
+          >
+            [&gt;|] Next Trade
+            <SkipForward size={14} />
+          </button>
+        </div>
+      ) : null}
     </div>
   );
 }

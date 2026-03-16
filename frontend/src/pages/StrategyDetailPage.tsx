@@ -34,6 +34,14 @@ export function StrategyDetailPage() {
     () => (detail?.documentation_markdown || "").trim(),
     [detail?.documentation_markdown],
   );
+  const sourceUrl = useMemo(
+    () => (detail?.source_url || detail?.tags?.link || "").trim(),
+    [detail?.source_url, detail?.tags?.link],
+  );
+  const renderedNotes = useMemo(
+    () => (detail?.notes || "").trim(),
+    [detail?.notes],
+  );
 
   const handleRename = async (nextName: string) => {
     if (!detail?.slug) return;
@@ -271,19 +279,127 @@ export function StrategyDetailPage() {
           </button>
         </div>
 
-        {detail.tags?.link ? (
-          <a
-            href={detail.tags.link}
-            target="_blank"
-            rel="noreferrer"
+        {sourceUrl ? (
+          <div
             style={{
-              color: "#58a6ff",
-              fontSize: "0.85rem",
-              textDecoration: "none",
+              marginTop: "6px",
+              padding: "10px 12px",
+              borderRadius: "10px",
+              background: "rgba(88,166,255,0.08)",
+              border: "1px solid rgba(88,166,255,0.2)",
             }}
           >
-            Open source reference →
-          </a>
+            <div
+              style={{
+                fontSize: "0.7rem",
+                letterSpacing: "0.08em",
+                textTransform: "uppercase",
+                color: "#79c0ff",
+                marginBottom: "6px",
+              }}
+            >
+              Source URL
+            </div>
+            <a
+              href={sourceUrl}
+              target="_blank"
+              rel="noreferrer"
+              style={{
+                color: "#58a6ff",
+                fontSize: "0.9rem",
+                textDecoration: "none",
+                wordBreak: "break-all",
+              }}
+            >
+              {sourceUrl}
+            </a>
+          </div>
+        ) : null}
+
+        {renderedNotes ? (
+          <div
+            style={{
+              marginTop: "14px",
+              padding: "14px 16px",
+              borderRadius: "12px",
+              background: "rgba(210,153,34,0.08)",
+              border: "1px solid rgba(210,153,34,0.22)",
+            }}
+          >
+            <div
+              style={{
+                fontSize: "0.72rem",
+                letterSpacing: "0.1em",
+                textTransform: "uppercase",
+                color: "#d29922",
+                marginBottom: "8px",
+              }}
+            >
+              Strategy Notes
+            </div>
+            <ReactMarkdown
+              components={{
+                p: ({ ...props }) => (
+                  <p
+                    style={{
+                      margin: "0 0 10px",
+                      color: "var(--color-text-muted)",
+                      lineHeight: 1.65,
+                    }}
+                    {...props}
+                  />
+                ),
+                ul: ({ ...props }) => (
+                  <ul style={{ margin: "0 0 10px", paddingLeft: "18px" }} {...props} />
+                ),
+                li: ({ ...props }) => (
+                  <li
+                    style={{
+                      color: "var(--color-text-muted)",
+                      marginBottom: "4px",
+                    }}
+                    {...props}
+                  />
+                ),
+                a: ({ ...props }) => (
+                  <a target="_blank" rel="noreferrer" style={{ color: "#58a6ff" }} {...props} />
+                ),
+                code: ({ inline, children, ...props }: any) =>
+                  inline ? (
+                    <code
+                      style={{
+                        background: "rgba(88,166,255,0.1)",
+                        color: "#79c0ff",
+                        borderRadius: "6px",
+                        padding: "2px 6px",
+                        fontSize: "0.8rem",
+                      }}
+                      {...props}
+                    >
+                      {children}
+                    </code>
+                  ) : (
+                    <code
+                      style={{
+                        display: "block",
+                        background: "#0d1117",
+                        border: "1px solid var(--color-border)",
+                        borderRadius: "10px",
+                        padding: "12px",
+                        overflowX: "auto",
+                        color: "#c9d1d9",
+                        fontSize: "0.82rem",
+                      }}
+                      {...props}
+                    >
+                      {children}
+                    </code>
+                  ),
+              }}
+            >
+              {renderedNotes}
+            </ReactMarkdown>
+          </div>
         ) : null}
       </div>
 

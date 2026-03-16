@@ -6,6 +6,8 @@ export interface StrategyMeta {
   version: string;
   file: string;
   created_at: string;
+  source_url: string;
+  notes: string;
   tags: Record<string, any>;
   type: string[];
   source: string;
@@ -135,12 +137,14 @@ export interface MissingOHLCVDetail {
 
 export interface IndicatorPoint {
   time: number;
-  value: number;
+  value: number | null;
 }
 
 export interface IndicatorStyle {
   color?: string;
   lineStyle?: number;
+  width?: number;
+  pane?: string;
 }
 
 export interface IndicatorSeriesView {
@@ -374,6 +378,18 @@ export interface TradeChartResponse {
   timeframe: string;
   indicators: IndicatorSeriesView[];
   drawings: TradeDrawing[];
+  total_trades: number;
+}
+
+export interface BacktestReplayResponse {
+  trades: Trade[];
+  ohlcv_by_symbol: Record<string, OHLCVBar[]>;
+  timeframe: string;
+  symbols: string[];
+  primary_symbol: string;
+  indicators: IndicatorSeriesView[];
+  drawings: TradeDrawing[];
+  missing_ohlcv: Record<string, MissingOHLCVDetail>;
   total_trades: number;
 }
 

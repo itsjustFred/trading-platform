@@ -50,6 +50,7 @@ def test_build_catalog(sample_data_dir):
     assert "timestamp" in ds["columns"]
     assert ds["start"] == "2024-01-01"
     assert ds["end"] == "2024-01-05"
+    assert ds["last_updated"] is not None
 
     assert len(catalog["universes"]) == 1
     assert catalog["universes"][0]["name"] == "test"
@@ -72,6 +73,7 @@ def test_build_catalog_reuses_cached_metadata_for_unchanged_files(sample_data_di
     assert ds["start"] == "2024-01-01"
     assert ds["end"] == "2024-01-05"
     assert ds["rows"] == 100
+    assert ds["last_updated"] is not None
 
 
 def test_build_catalog_handles_legacy_flat_dolthub_exports(tmp_path):

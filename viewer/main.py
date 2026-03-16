@@ -433,6 +433,38 @@ def _format_catalog_date(value: object) -> str | None:
     return timestamp.date().isoformat()
 
 
+def _catalog_timestamp_to_epoch(value: object) -> float | None:
+    if value is None:
+        return None
+    timestamp = pd.to_datetime(value, utc=True, errors="coerce")
+    if pd.isna(timestamp):
+        return None
+    return float(timestamp.timestamp())
+
+
+def _should_reuse_cached_parquet_entry(cached_entry: dict[str, Any] | None, file_mtime: float) -> bool:
+    if not isinstance(cached_entry, dict):
+        return False
+
+    cached_last_updated = _catalog_timestamp_to_epoch(cached_entry.get("last_updated"))
+    if cached_last_updated is not None:
+        return file_mtime <= (cached_last_updated + 1e-6)
+
+    # Backward compatibility for stale catalog payloads without last_updated.
+    try:
+        return float(file_mtime) <= float(cached_entry.get("mtime_ns")) / 1_000_000_000
+    except (TypeError, ValueError):
+        return False
+
+
+def _catalog_metadata_by_path(catalog_entries: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    return {
+        str(entry.get("path")): entry
+        for entry in catalog_entries
+        if isinstance(entry, dict) and entry.get("path")
+    }
+
+
 def _read_row_group_stat(
     metadata: Any,
     column_index: int,
@@ -446,11 +478,16 @@ def _read_row_group_stat(
     return stats.min if boundary == "min" else stats.max
 
 
-def _read_parquet_date_bounds(parquet_path: Path) -> tuple[str | None, str | None]:
+def _read_parquet_summary(parquet_path: Path) -> dict[str, Any]:
     parquet_file = pq.ParquetFile(parquet_path)
     metadata = parquet_file.metadata
+    summary: dict[str, Any] = {
+        "rows": metadata.num_rows if metadata is not None else None,
+        "start": None,
+        "end": None,
+    }
     if metadata is None or metadata.num_rows == 0 or metadata.num_row_groups == 0:
-        return None, None
+        return summary
 
     columns = list(parquet_file.schema_arrow.names)
     lowered = {column.lower(): column for column in columns}
@@ -460,7 +497,7 @@ def _read_parquet_date_bounds(parquet_path: Path) -> tuple[str | None, str | Non
             timestamp_column = lowered[candidate]
             break
     if timestamp_column is None:
-        return None, None
+        return summary
 
     column_index = columns.index(timestamp_column)
     start_value = _read_row_group_stat(metadata, column_index, 0, boundary="min")
@@ -483,7 +520,9 @@ def _read_parquet_date_bounds(parquet_path: Path) -> tuple[str | None, str | Non
         if last_group.num_rows > 0:
             end_value = last_group.column(0)[last_group.num_rows - 1].as_py()
 
-    return _format_catalog_date(start_value), _format_catalog_date(end_value)
+    summary["start"] = _format_catalog_date(start_value)
+    summary["end"] = _format_catalog_date(end_value)
+    return summary
 
 
 def _parse_ohlcv_path(parquet_path: Path, ohlcv_root: Path) -> dict[str, Any] | None:
@@ -526,10 +565,16 @@ def _parse_ohlcv_path(parquet_path: Path, ohlcv_root: Path) -> dict[str, Any] | 
     return entry
 
 
-def _scan_single_file_ohlcv_entries() -> list[dict[str, Any]]:
+def _scan_single_file_ohlcv_entries(
+    metadata_by_path: dict[str, dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     ohlcv_root = DATA_DIR / "ohlcv"
     if not ohlcv_root.exists():
         return []
+
+    if metadata_by_path is None:
+        catalog_entries, _ = _load_catalog_ohlcv_entries()
+        metadata_by_path = _catalog_metadata_by_path(catalog_entries)
 
     entries: list[dict[str, Any]] = []
     for parquet_path in sorted(ohlcv_root.rglob("*.parquet")):
@@ -537,34 +582,46 @@ def _scan_single_file_ohlcv_entries() -> list[dict[str, Any]]:
         if parsed is None:
             continue
 
-        start_value = None
-        end_value = None
-        try:
-            start_value, end_value = _read_parquet_date_bounds(parquet_path)
-        except (OSError, ValueError, KeyError) as exc:
-            logger.warning("Could not read date range from %s: %s", parquet_path, exc)
+        path_key = str(parquet_path)
+        cached_entry = metadata_by_path.get(path_key)
 
         try:
-            size_bytes = parquet_path.stat().st_size
+            file_mtime = os.path.getmtime(parquet_path)
         except OSError:
-            size_bytes = 0
+            file_mtime = None
 
-        parsed["size_bytes"] = size_bytes
-        parsed["start"] = start_value
-        parsed["end"] = end_value
+        used_cached_summary = False
+        if (
+            file_mtime is not None
+            and _should_reuse_cached_parquet_entry(cached_entry, file_mtime)
+            and isinstance(cached_entry, dict)
+        ):
+            for key in ("rows", "size_bytes", "columns", "start", "end", "last_updated"):
+                if cached_entry.get(key) is not None:
+                    parsed[key] = cached_entry.get(key)
+            used_cached_summary = True
+
+        if not used_cached_summary:
+            try:
+                parsed.update(_read_parquet_summary(parquet_path))
+            except (OSError, ValueError, KeyError) as exc:
+                logger.warning("Could not read date range from %s: %s", parquet_path, exc)
+
+        if parsed.get("size_bytes") is None:
+            try:
+                parsed["size_bytes"] = os.path.getsize(parquet_path)
+            except OSError:
+                parsed["size_bytes"] = 0
+
         entries.append(parsed)
 
     return entries
 
 
 def _load_data_entries() -> list[dict[str, Any]]:
-    scanned_entries = _scan_single_file_ohlcv_entries()
     catalog_entries, _ = _load_catalog_ohlcv_entries()
-    metadata_by_path = {
-        str(entry.get("path")): entry
-        for entry in catalog_entries
-        if isinstance(entry, dict) and entry.get("path")
-    }
+    metadata_by_path = _catalog_metadata_by_path(catalog_entries)
+    scanned_entries = _scan_single_file_ohlcv_entries(metadata_by_path)
 
     if scanned_entries:
         for entry in scanned_entries:
@@ -836,6 +893,77 @@ async def get_backtest_trades(backtest_id: str) -> list[dict[str, Any]]:
     return [legacy_viewer._trade_to_viewer(trade) for trade in result.trades]
 
 
+def _normalize_indicator_payloads(indicators: list[Any]) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for raw_indicator in indicators:
+        indicator = (
+            raw_indicator.to_dict()
+            if hasattr(raw_indicator, "to_dict")
+            else dict(raw_indicator) if isinstance(raw_indicator, dict) else None
+        )
+        if not isinstance(indicator, dict):
+            continue
+
+        points = indicator.get("data")
+        if not isinstance(points, list):
+            continue
+
+        normalized_points: list[dict[str, Any]] = []
+        for point in points:
+            if not isinstance(point, dict):
+                continue
+            raw_time = point.get("time")
+            unix_time = (
+                float(raw_time)
+                if isinstance(raw_time, (int, float))
+                else legacy_viewer._iso_to_unix(str(raw_time))
+            )
+            if unix_time <= 0:
+                continue
+            normalized_point = dict(point)
+            normalized_point["time"] = unix_time
+            normalized_points.append(normalized_point)
+        indicator["data"] = normalized_points
+
+        if indicator.get("pane") in (None, ""):
+            style = indicator.get("style")
+            if isinstance(style, dict):
+                pane_value = style.get("pane")
+                if isinstance(pane_value, str) and pane_value.strip():
+                    indicator["pane"] = pane_value
+
+        normalized.append(indicator)
+    return normalized
+
+
+def _slice_indicators_to_time_range(
+    indicators: list[dict[str, Any]],
+    *,
+    time_start: float,
+    time_end: float,
+) -> None:
+    for indicator in indicators:
+        points = indicator.get("data")
+        if not isinstance(points, list):
+            continue
+        indicator["data"] = [
+            point
+            for point in points
+            if time_start <= float(point.get("time", 0) or 0) <= time_end
+        ]
+
+
+def _collect_viewer_drawings(result: BacktestResult, symbol: str | None = None) -> list[dict[str, Any]]:
+    drawings: list[dict[str, Any]] = []
+    for drawing in result.drawings:
+        if symbol and not legacy_viewer._drawing_matches_symbol(drawing, symbol):
+            continue
+        viewer_drawing = legacy_viewer._drawing_to_viewer(drawing)
+        if viewer_drawing is not None:
+            drawings.append(viewer_drawing)
+    return drawings
+
+
 @app.get("/api/backtest/{backtest_id}/trade/{trade_nr}", response_model=dict[str, Any])
 async def get_trade_with_context(backtest_id: str, trade_nr: int) -> dict[str, Any]:
     result = _load_result(backtest_id)
@@ -871,35 +999,8 @@ async def get_trade_with_context(backtest_id: str, trade_nr: int) -> dict[str, A
         ohlcv_end_idx = min(len(df), idx + legacy_viewer.BARS_AFTER)
         ohlcv = legacy_viewer._df_to_ohlcv_records(df.iloc[ohlcv_start_idx:ohlcv_end_idx])
 
-    indicators = [indicator.to_dict() for indicator in result.indicators]
-    for indicator in indicators:
-        points = indicator.get("data") if isinstance(indicator, dict) else None
-        if not isinstance(points, list):
-            continue
-        normalized_points: list[dict[str, Any]] = []
-        for point in points:
-            if not isinstance(point, dict):
-                continue
-            raw_time = point.get("time")
-            unix_time = (
-                float(raw_time)
-                if isinstance(raw_time, (int, float))
-                else legacy_viewer._iso_to_unix(str(raw_time))
-            )
-            if unix_time <= 0:
-                continue
-            normalized_point = dict(point)
-            normalized_point["time"] = unix_time
-            normalized_points.append(normalized_point)
-        indicator["data"] = normalized_points
-
-    drawings = [
-        viewer_drawing
-        for drawing in result.drawings
-        if legacy_viewer._drawing_matches_symbol(drawing, trade.symbol)
-        for viewer_drawing in [legacy_viewer._drawing_to_viewer(drawing)]
-        if viewer_drawing is not None
-    ]
+    indicators = _normalize_indicator_payloads(list(result.indicators))
+    drawings = _collect_viewer_drawings(result, trade.symbol)
 
     if not indicators and ohlcv and df is not None:
         strategy_identifier = result.meta.strategies[0] if result.meta.strategies else ""
@@ -913,11 +1014,7 @@ async def get_trade_with_context(backtest_id: str, trade_nr: int) -> dict[str, A
     if ohlcv and indicators:
         time_start = ohlcv[0]["time"]
         time_end = ohlcv[-1]["time"]
-        for indicator in indicators:
-            if "data" in indicator:
-                indicator["data"] = [
-                    point for point in indicator["data"] if time_start <= point.get("time", 0) <= time_end
-                ]
+        _slice_indicators_to_time_range(indicators, time_start=time_start, time_end=time_end)
 
     return {
         "trade": trade_payload,
@@ -926,6 +1023,74 @@ async def get_trade_with_context(backtest_id: str, trade_nr: int) -> dict[str, A
         "timeframe": timeframe,
         "indicators": indicators,
         "drawings": drawings,
+        "total_trades": len(result.trades),
+    }
+
+
+@app.get("/api/backtest/{backtest_id}/replay", response_model=dict[str, Any])
+async def get_backtest_replay(backtest_id: str) -> dict[str, Any]:
+    result = _load_result(backtest_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    trades = [legacy_viewer._trade_to_viewer(trade) for trade in result.trades]
+    timeframe = (
+        result.meta.data.get("timeframes", ["1h"])[0] if result.meta.data.get("timeframes") else "1h"
+    )
+    symbols = sorted({trade.symbol for trade in result.trades if trade.symbol}) or list(
+        result.meta.data.get("symbols", [])
+    )
+
+    ohlcv_by_symbol: dict[str, list[dict[str, Any]]] = {}
+    missing_ohlcv: dict[str, dict[str, Any]] = {}
+
+    for symbol in symbols:
+        df = legacy_viewer._load_ohlcv_df(symbol, timeframe)
+        if df is None or len(df) == 0:
+            missing_ohlcv[symbol] = legacy_viewer._missing_ohlcv_details(
+                symbol,
+                timeframe,
+                backtest_start=str(result.meta.backtest_start or ""),
+                backtest_end=str(result.meta.backtest_end or ""),
+            )
+            continue
+        ohlcv_by_symbol[symbol] = legacy_viewer._df_to_ohlcv_records(df)
+
+    if not ohlcv_by_symbol:
+        detail = next(iter(missing_ohlcv.values()), {"message": "No OHLCV data available"})
+        raise HTTPException(status_code=404, detail=detail)
+
+    primary_symbol = next(iter(ohlcv_by_symbol))
+    indicators = _normalize_indicator_payloads(list(result.indicators))
+
+    if not indicators:
+        df = legacy_viewer._load_ohlcv_df(primary_symbol, timeframe)
+        if df is not None and len(df) > 0:
+            strategy_identifier = result.meta.strategies[0] if result.meta.strategies else ""
+            detected = legacy_viewer._detect_indicators(strategy_identifier)
+            if detected:
+                ohlcv_times = [row["time"] for row in ohlcv_by_symbol[primary_symbol]]
+                indicators = legacy_viewer._compute_indicators(df, detected, ohlcv_times)
+
+    if indicators and ohlcv_by_symbol.get(primary_symbol):
+        symbol_ohlcv = ohlcv_by_symbol[primary_symbol]
+        _slice_indicators_to_time_range(
+            indicators,
+            time_start=symbol_ohlcv[0]["time"],
+            time_end=symbol_ohlcv[-1]["time"],
+        )
+
+    drawings = _collect_viewer_drawings(result)
+
+    return {
+        "trades": trades,
+        "ohlcv_by_symbol": ohlcv_by_symbol,
+        "timeframe": timeframe,
+        "symbols": symbols,
+        "primary_symbol": primary_symbol,
+        "indicators": indicators,
+        "drawings": drawings,
+        "missing_ohlcv": missing_ohlcv,
         "total_trades": len(result.trades),
     }
 

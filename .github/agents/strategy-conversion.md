@@ -129,6 +129,8 @@ Wähle das Engine-Framework nach dieser Entscheidungsmatrix und dokumentiere die
 STRATEGY_META = {
     "name": "<Strategiename>",
     "version": "1.0.0",
+    "source_url": "<direkter Link zur Originalstrategie (Gist/Repo/Script)>",
+    "notes": "<Markdown: bekannte Bugs, Limitierungen, Besonderheiten>",
     "tags": {
         "type": ["<trend-following|mean-reversion|breakout|momentum|...>"],
         "source": "<original-quelle oder link>",
@@ -138,6 +140,10 @@ STRATEGY_META = {
     },
 }
 ```
+
+   **Pflichtregel:** `source_url` und `notes` müssen immer explizit gefüllt sein (kein Weglassen).  
+   - `source_url`: direkter URL zur primären Quelle (GitHub, Gist, TradingView, Repo-Datei).  
+   - `notes`: Markdown-Notizen mit Bugs, bekannten Abweichungen zur Original-Logik, offenen Punkten und wichtigen Betriebs-Hinweisen.
 
 3. **Pflicht — Trade-`meta`-Felder:** Schreibe alle für die spätere Validierung relevanten Indikator-Werte in `Trade.meta`. Mindestpflichtfelder:
    - `sl_price` — berechneter Stop-Loss-Preis zum Zeitpunkt des Entries

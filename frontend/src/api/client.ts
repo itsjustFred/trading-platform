@@ -24,6 +24,7 @@ import type {
   Trade,
   TradeChartResponse,
   BacktestInfo,
+  BacktestReplayResponse,
 } from "./types";
 
 const BASE_URL = "/api";
@@ -81,6 +82,8 @@ export const getBacktestTrades = (id: string) =>
   fetchJSON<Trade[]>(`/backtest/${id}/trades`);
 export const getBacktestTrade = (id: string, nr: number) =>
   fetchJSON<TradeChartResponse>(`/backtest/${id}/trade/${nr}`);
+export const getBacktestReplay = (id: string) =>
+  fetchJSON<BacktestReplayResponse>(`/backtest/${id}/replay`);
 export const getBacktestEquity = (id: string) =>
   fetchJSON<any>(`/backtest/${id}/equity`);
 export const getBacktestOHLCV = (id: string) =>

@@ -12,7 +12,14 @@ import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
 
-from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, TradeExit
+from shared.models import (
+    BacktestMeta,
+    BacktestResult,
+    EquityPoint,
+    IndicatorSeries,
+    Trade,
+    TradeExit,
+)
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -196,6 +203,94 @@ def test_trade_detail_includes_meta(viewer_client, tmp_path):
     assert payload["drawings"][1]["start_time"] == pytest.approx(1704103200.0)
 
 
+def test_backtest_replay_endpoint_returns_full_chart_payload(viewer_client, tmp_path):
+    backtests_dir = tmp_path / "backtests"
+    ohlcv_dir = tmp_path / "ohlcv" / "test_source" / "equities" / "AAPL"
+    backtests_dir.mkdir(parents=True, exist_ok=True)
+    ohlcv_dir.mkdir(parents=True, exist_ok=True)
+
+    df = pd.DataFrame({
+        "timestamp": pd.date_range("2024-01-01T00:00:00Z", periods=6, freq="h", tz="UTC"),
+        "open": [100, 101, 102, 103, 104, 105],
+        "high": [101, 102, 103, 104, 105, 106],
+        "low": [99, 100, 101, 102, 103, 104],
+        "close": [100.5, 101.5, 102.5, 103.5, 104.5, 105.5],
+        "volume": [10, 11, 12, 13, 14, 15],
+    })
+    df.to_parquet(ohlcv_dir / "1h.parquet", index=False)
+
+    result = BacktestResult(
+        meta=BacktestMeta(
+            id="replay-demo",
+            created_at="2026-03-07T15:00:00Z",
+            engine="vectorbt",
+            strategies=["Replay Demo"],
+            backtest_start="2024-01-01",
+            backtest_end="2024-01-02",
+            initial_capital=100000.0,
+            data={
+                "timeframes": ["1h"],
+                "symbols": ["AAPL"],
+                "universe": "",
+                "source": "test_source",
+            },
+        ),
+        trades=[
+            Trade(
+                id=1,
+                symbol="AAPL",
+                direction="LONG",
+                entry_time="2024-01-01T01:00:00+00:00",
+                entry_price=101.5,
+                quantity=1,
+                exits=[
+                    TradeExit(
+                        time="2024-01-01T04:00:00+00:00",
+                        price=104.5,
+                        quantity=1,
+                        pnl=3.0,
+                    )
+                ],
+                pnl=3.0,
+            )
+        ],
+        indicators=[
+            IndicatorSeries(
+                name="supertrend_up",
+                type="overlay",
+                data=[
+                    {"time": "2024-01-01T00:00:00+00:00", "value": None},
+                    {"time": "2024-01-01T01:00:00+00:00", "value": 100.8},
+                ],
+                style={"color": "#22c55e"},
+            )
+        ],
+        drawings=[
+            {
+                "type": "line_with_breaks",
+                "symbol": "AAPL",
+                "data": [
+                    {"time": "2024-01-01T00:00:00+00:00", "value": None},
+                    {"time": "2024-01-01T02:00:00+00:00", "value": 101.2},
+                ],
+            }
+        ],
+    )
+    result.save(backtests_dir / "replay-demo.trades.json")
+
+    resp = viewer_client.get("/api/backtest/replay-demo/replay")
+
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["total_trades"] == 1
+    assert payload["primary_symbol"] == "AAPL"
+    assert "AAPL" in payload["ohlcv_by_symbol"]
+    assert payload["trades"][0]["nr"] == 1
+    supertrend = next(ind for ind in payload["indicators"] if ind["name"] == "supertrend_up")
+    assert supertrend["data"][0]["value"] is None
+    assert payload["drawings"][0]["type"] == "line_with_breaks"
+
+
 def test_data_overview_and_category_use_catalog_date_ranges(viewer_client, tmp_path):
     catalog = {
         "ohlcv": [
@@ -277,6 +372,80 @@ def test_data_endpoints_read_fast_date_ranges_without_catalog(viewer_client, tmp
             "start": "2024-03-01",
             "end": "2024-03-03",
             "source": "test_source",
+        }
+    ]
+
+
+def test_data_endpoints_reuse_catalog_summary_for_unchanged_files(
+    viewer_client, monkeypatch, tmp_path
+):
+    import viewer.main as viewer_app_module
+
+    ohlcv_dir = tmp_path / "ohlcv" / "test_source" / "equity" / "US" / "AAPL"
+    ohlcv_dir.mkdir(parents=True)
+
+    df = pd.DataFrame({
+        "timestamp": pd.to_datetime(
+            ["2024-03-01T09:30:00Z", "2024-03-02T09:30:00Z", "2024-03-03T09:30:00Z"],
+            utc=True,
+        ),
+        "open": [100.0, 101.0, 102.0],
+        "high": [101.0, 102.0, 103.0],
+        "low": [99.0, 100.0, 101.0],
+        "close": [100.5, 101.5, 102.5],
+        "volume": [10, 11, 12],
+    })
+    parquet_path = ohlcv_dir / "1d.parquet"
+    df.to_parquet(parquet_path, index=False)
+
+    cached_last_updated = pd.Timestamp.fromtimestamp(
+        parquet_path.stat().st_mtime + 60, tz="UTC"
+    ).isoformat()
+    catalog = {
+        "ohlcv": [
+            {
+                "path": str(parquet_path),
+                "symbol": "AAPL",
+                "timeframe": "1d",
+                "source": "test_source",
+                "size_bytes": parquet_path.stat().st_size,
+                "rows": 3,
+                "start": "2024-03-01",
+                "end": "2024-03-03",
+                "last_updated": cached_last_updated,
+            }
+        ]
+    }
+    (tmp_path / "catalog.json").write_text(json.dumps(catalog))
+
+    def fail_if_parquet_read(_: Path) -> dict[str, object]:
+        raise AssertionError("_read_parquet_summary should not be called for unchanged files")
+
+    monkeypatch.setattr(viewer_app_module, "_read_parquet_summary", fail_if_parquet_read)
+
+    overview_resp = viewer_client.get("/api/data/overview")
+
+    assert overview_resp.status_code == 200
+    categories = {
+        category["name"]: category
+        for category in overview_resp.json()["categories"]
+    }
+    assert categories["Equities"]["start"] == "2024-03-01"
+    assert categories["Equities"]["end"] == "2024-03-03"
+
+    details_resp = viewer_client.get("/api/data/category/Equities")
+
+    assert details_resp.status_code == 200
+    assert details_resp.json()["symbols"] == [
+        {
+            "symbol": "AAPL",
+            "timeframe": "1d",
+            "path": str(parquet_path),
+            "size_mb": pytest.approx(parquet_path.stat().st_size / (1024 * 1024), rel=0, abs=0.01),
+            "start": "2024-03-01",
+            "end": "2024-03-03",
+            "source": "test_source",
+            "last_updated": cached_last_updated,
         }
     ]
 
@@ -1106,6 +1275,8 @@ def test_strategy_detail_reads_markdown_and_patch_renames_strategy(
 STRATEGY_META = {
     "name": "Demo Strategy",
     "version": "1.0.0",
+    "source_url": "https://example.com/demo-strategy",
+    "notes": "Known issue: **gaps** can delay entry by one bar.",
     "tags": {"type": ["momentum"], "source": "test", "asset_class": ["equities"], "complexity": "simple"},
 }
 
@@ -1124,6 +1295,8 @@ def generate_signals(df, params):
     detail_payload = detail_resp.json()
     assert detail_payload["slug"] == "demo"
     assert detail_payload["name"] == "Demo Strategy"
+    assert detail_payload["source_url"] == "https://example.com/demo-strategy"
+    assert detail_payload["notes"] == "Known issue: **gaps** can delay entry by one bar."
     assert "This is markdown." in detail_payload["documentation_markdown"]
 
     patch_resp = viewer_client.patch("/api/strategies/demo", json={"name": "Renamed Strategy"})

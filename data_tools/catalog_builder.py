@@ -131,6 +131,35 @@ def _format_catalog_date(value: object) -> str | None:
     return timestamp.date().isoformat()
 
 
+def _catalog_timestamp_to_epoch(value: object) -> float | None:
+    if value is None:
+        return None
+    timestamp = pd.to_datetime(value, utc=True, errors="coerce")
+    if pd.isna(timestamp):
+        return None
+    return float(timestamp.timestamp())
+
+
+def _mtime_to_iso(value: float) -> str:
+    return datetime.fromtimestamp(value, tz=timezone.utc).isoformat()
+
+
+def _should_reuse_cached_summary(cached_entry: dict | None, file_mtime: float) -> bool:
+    if not isinstance(cached_entry, dict):
+        return False
+
+    cached_last_updated = _catalog_timestamp_to_epoch(cached_entry.get("last_updated"))
+    if cached_last_updated is not None:
+        return file_mtime <= (cached_last_updated + 1e-6)
+
+    # Backward-compatible fallback for older cache payloads without last_updated.
+    cached_mtime_ns = cached_entry.get("mtime_ns")
+    try:
+        return float(file_mtime) <= float(cached_mtime_ns) / 1_000_000_000
+    except (TypeError, ValueError):
+        return False
+
+
 def parse_ohlcv_path(parquet_path: Path, ohlcv_root: Path) -> dict | None:
     """Parse an OHLCV parquet path into source/asset_class/symbol/timeframe fields."""
     rel = parquet_path.relative_to(ohlcv_root)
@@ -200,6 +229,7 @@ def read_parquet_summary(parquet_path: Path) -> dict:
         "rows": metadata.num_rows,
         "size_bytes": stat.st_size,
         "mtime_ns": stat.st_mtime_ns,
+        "last_updated": _mtime_to_iso(stat.st_mtime),
         "columns": columns,
     }
 
@@ -256,24 +286,23 @@ def scan_ohlcv(data_dir: Path, include_validation: bool = False) -> list[dict]:
         entry["storage"] = _detect_storage(parquet_file, data_dir)
 
         try:
-            stat = parquet_file.stat()
+            file_mtime = os.path.getmtime(parquet_file)
             cached_entry = catalog_cache.get(str(parquet_file))
-            if (
-                cached_entry
-                and cached_entry.get("size_bytes") == stat.st_size
-                and cached_entry.get("mtime_ns") == stat.st_mtime_ns
-            ):
-                for key in ("rows", "size_bytes", "mtime_ns", "columns", "start", "end"):
+            if _should_reuse_cached_summary(cached_entry, file_mtime):
+                for key in ("rows", "size_bytes", "mtime_ns", "last_updated", "columns", "start", "end"):
                     if key in cached_entry:
                         entry[key] = cached_entry[key]
+                if entry.get("last_updated") is None:
+                    entry["last_updated"] = _mtime_to_iso(file_mtime)
             else:
                 entry.update(read_parquet_summary(parquet_file))
         except (OSError, pd.errors.EmptyDataError, ValueError) as e:
             logger.warning("Could not read %s: %s", parquet_file, e)
             try:
-                stat = parquet_file.stat()
-                entry["size_bytes"] = stat.st_size
-                entry["mtime_ns"] = stat.st_mtime_ns
+                file_mtime = os.path.getmtime(parquet_file)
+                entry["size_bytes"] = os.path.getsize(parquet_file)
+                entry["mtime_ns"] = int(file_mtime * 1_000_000_000)
+                entry["last_updated"] = _mtime_to_iso(file_mtime)
             except OSError:
                 entry["size_bytes"] = 0
             entry["rows"] = None
