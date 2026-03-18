@@ -12,11 +12,11 @@ import pandas as pd
 STRATEGY_META = {
     "name": "Intraday Channel Breakout",
     "version": "1.0.0",
-    "source_url": "Discord: zenomtrader",
+    "source_url": "https://discord.com/channels/zenomtrader",
     "tags": {
         "type": ["breakout"],
         "source": "zenomtrader-discord",
-        "link": "",
+        "link": "https://discord.com/channels/zenomtrader",
         "asset_class": ["equities", "futures"],
         "complexity": "medium",
     },

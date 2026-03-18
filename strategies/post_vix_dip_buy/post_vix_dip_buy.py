@@ -8,11 +8,11 @@ enter a mean-reversion long trade expecting a bounce.
 STRATEGY_META = {
     "name": "Post VIX Dip Buy",
     "version": "1.0.0",
-    "source_url": "Discord: zenomtrader",
+    "source_url": "https://discord.com/channels/zenomtrader",
     "tags": {
         "type": ["mean-reversion", "regime-filter"],
         "source": "zenomtrader-discord",
-        "link": "",
+        "link": "https://discord.com/channels/zenomtrader",
         "asset_class": ["equities", "etf"],
         "complexity": "medium",
     },

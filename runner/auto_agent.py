@@ -512,13 +512,42 @@ def _normalize_strategy_meta(
         raise TypeError("STRATEGY_META['parameters'] must be a dict.")
     normalized["parameters"] = parameters
 
-    tags = normalized.get("tags")
-    if tags is None:
-        tags = {}
-    if not isinstance(tags, dict):
-        raise TypeError("STRATEGY_META['tags'] must be a dict.")
-    normalized["tags"] = tags
+    normalized["tags"] = _normalize_meta_tags(normalized.get("tags"))
     return normalized
+
+
+def _normalize_meta_tags(tags: Any) -> dict[str, Any]:
+    if tags is None:
+        normalized_tags: dict[str, Any] = {}
+    elif isinstance(tags, dict):
+        normalized_tags = dict(tags)
+    elif isinstance(tags, str):
+        parts = [chunk.strip() for chunk in re.split(r"[;,]", tags) if chunk.strip()]
+        normalized_tags = {"type": parts}
+    elif isinstance(tags, (list, tuple, set)):
+        normalized_tags = {"type": [str(item).strip() for item in tags if str(item).strip()]}
+    else:
+        raise TypeError("STRATEGY_META['tags'] must be a dict, string, or list of tags.")
+
+    def _as_string_list(value: Any) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return [value.strip()] if value.strip() else []
+        if isinstance(value, (list, tuple, set)):
+            return [str(item).strip() for item in value if str(item).strip()]
+        return [str(value).strip()] if str(value).strip() else []
+
+    if "type" in normalized_tags:
+        normalized_tags["type"] = _as_string_list(normalized_tags.get("type"))
+    if "asset_class" in normalized_tags:
+        normalized_tags["asset_class"] = _as_string_list(normalized_tags.get("asset_class"))
+
+    for key in ("source", "link", "complexity"):
+        if key in normalized_tags and normalized_tags[key] is not None:
+            normalized_tags[key] = str(normalized_tags[key]).strip()
+
+    return normalized_tags
 
 
 def _format_strategy_meta_assignment(meta: dict[str, Any]) -> str:

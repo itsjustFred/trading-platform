@@ -8,7 +8,7 @@ enter long and stop at the session open.
 STRATEGY_META = {
     "name": "Volatility Breakout",
     "version": "1.0.0",
-    "source_url": "Discord: zenomtrader",
+    "source_url": "https://discord.com/channels/zenomtrader",
     "tags": {
         "type": ["breakout"],
         "source": "zenomtrader-discord",

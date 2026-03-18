@@ -1003,6 +1003,115 @@ def test_backtest_stats_endpoint_includes_p_value(viewer_client, tmp_path):
     assert payload["p_value"] < 0.05
 
 
+def _close_prices_from_returns(returns: list[float], *, start_price: float = 100.0) -> list[float]:
+    closes = [start_price]
+    for daily_return in returns:
+        closes.append(closes[-1] * (1 + daily_return))
+    return closes
+
+
+def test_backtest_capm_endpoint_returns_regression_payload(viewer_client, tmp_path):
+    backtests_dir = tmp_path / "backtests"
+    ohlcv_dir = tmp_path / "ohlcv" / "test_source" / "equities" / "SPY"
+    backtests_dir.mkdir(parents=True, exist_ok=True)
+    ohlcv_dir.mkdir(parents=True, exist_ok=True)
+
+    market_returns = [0.012, -0.008, 0.01, 0.003, -0.004, 0.009, 0.001, -0.002]
+    alpha_daily = 0.0002
+    beta = 0.8
+    strategy_returns = [alpha_daily + beta * value for value in market_returns]
+
+    benchmark_df = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01T00:00:00Z", periods=len(market_returns) + 1, freq="D"),
+            "open": _close_prices_from_returns(market_returns),
+            "high": _close_prices_from_returns(market_returns),
+            "low": _close_prices_from_returns(market_returns),
+            "close": _close_prices_from_returns(market_returns),
+            "volume": [1000] * (len(market_returns) + 1),
+        }
+    )
+    benchmark_df.to_parquet(ohlcv_dir / "1d.parquet", index=False)
+
+    result = BacktestResult(
+        meta=BacktestMeta(
+            id="capm-demo",
+            created_at="2026-03-18T19:00:00Z",
+            engine="vectorbt",
+            strategies=["CAPM Demo"],
+            backtest_start="2024-01-01",
+            backtest_end="2024-01-09",
+            initial_capital=100000.0,
+            duration_days=8,
+            data={"symbols": ["AAPL"], "timeframes": ["1d"], "source": "test_source"},
+        ),
+        trades=[],
+        equity_curve=_equity_curve_from_returns(strategy_returns),
+    )
+    result.save(backtests_dir / "capm-demo.trades.json")
+
+    resp = viewer_client.get("/api/backtest/capm-demo/capm?benchmark=SPY")
+
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["benchmark_symbol"] == "SPY"
+    assert payload["beta"] == pytest.approx(beta, rel=1e-6)
+    assert payload["alpha"] == pytest.approx(alpha_daily * 252, rel=1e-6)
+    assert payload["r_squared"] == pytest.approx(1.0, rel=1e-6)
+    assert payload["p_value"] < 1e-6
+    assert len(payload["scatter_data"]) == len(market_returns)
+    assert payload["regression_line"]["slope"] == pytest.approx(beta, rel=1e-6)
+    assert payload["regression_line"]["intercept"] == pytest.approx(alpha_daily, rel=1e-6)
+
+
+def test_backtest_capm_endpoint_uses_first_symbol_when_benchmark_missing(viewer_client, tmp_path):
+    backtests_dir = tmp_path / "backtests"
+    ohlcv_dir = tmp_path / "ohlcv" / "test_source" / "equities" / "SPY"
+    backtests_dir.mkdir(parents=True, exist_ok=True)
+    ohlcv_dir.mkdir(parents=True, exist_ok=True)
+
+    market_returns = [0.01, -0.004, 0.006, 0.003, -0.002]
+    closes = _close_prices_from_returns(market_returns)
+    benchmark_df = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01T00:00:00Z", periods=len(closes), freq="D"),
+            "open": closes,
+            "high": closes,
+            "low": closes,
+            "close": closes,
+            "volume": [1000] * len(closes),
+        }
+    )
+    benchmark_df.to_parquet(ohlcv_dir / "1d.parquet", index=False)
+
+    result = BacktestResult(
+        meta=BacktestMeta(
+            id="capm-default-benchmark",
+            created_at="2026-03-18T19:00:00Z",
+            engine="vectorbt",
+            strategies=["CAPM Default Benchmark"],
+            backtest_start="2024-01-01",
+            backtest_end="2024-01-06",
+            initial_capital=100000.0,
+            duration_days=5,
+            data={"symbols": ["SPY"], "timeframes": ["1d"], "source": "test_source"},
+        ),
+        trades=[],
+        equity_curve=_equity_curve_from_returns([0.008, -0.002, 0.004, 0.002, -0.001]),
+    )
+    result.save(backtests_dir / "capm-default-benchmark.trades.json")
+
+    resp = viewer_client.get("/api/backtest/capm-default-benchmark/capm")
+
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["benchmark_symbol"] == "SPY"
+    assert "alpha" in payload
+    assert "beta" in payload
+    assert "r_squared" in payload
+    assert "p_value" in payload
+
+
 def test_backtests_list_uses_persisted_runner_stats(viewer_client, tmp_path):
     backtests_dir = tmp_path / "backtests"
     backtests_dir.mkdir(parents=True, exist_ok=True)

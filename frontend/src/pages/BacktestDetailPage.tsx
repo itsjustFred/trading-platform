@@ -5,6 +5,7 @@ import {
   getBacktestStats,
   getBacktestTrades,
   getBacktestEquity,
+  getBacktestCapm,
   getBenchmark,
   renameBacktest,
 } from "../api/client";
@@ -22,7 +23,23 @@ import {
   CrosshairMode,
 } from "lightweight-charts";
 import type { IChartApi, Time } from "lightweight-charts";
-import type { BacktestInfo, BacktestStats, EquityPoint, Trade } from "../api/types";
+import {
+  CartesianGrid,
+  ReferenceLine,
+  ResponsiveContainer,
+  Scatter,
+  ScatterChart,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
+import type {
+  BacktestCapmResponse,
+  BacktestInfo,
+  BacktestStats,
+  EquityPoint,
+  Trade,
+} from "../api/types";
 import { formatPValue, pValueColor } from "../utils/stats";
 
 const BENCHMARK_SYMBOLS = ["SPY", "QQQ", "IWM", "DIA", "GLD", "TLT", "XAUUSD"];
@@ -36,6 +53,9 @@ export function BacktestDetailPage() {
   const [equity, setEquity] = useState<EquityPoint[]>([]);
   const [benchmarkSymbol, setBenchmarkSymbol] = useState("");
   const [benchmarkData, setBenchmarkData] = useState<any[]>([]);
+  const [capmData, setCapmData] = useState<BacktestCapmResponse | null>(null);
+  const [capmLoading, setCapmLoading] = useState(false);
+  const [capmError, setCapmError] = useState("");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [showRenameModal, setShowRenameModal] = useState(false);
@@ -77,6 +97,30 @@ export function BacktestDetailPage() {
       .then((data: any) => setBenchmarkData(data.equity || []))
       .catch(() => setBenchmarkData([]));
   }, [benchmarkSymbol, info]);
+
+  useEffect(() => {
+    if (!id || !info) {
+      setCapmData(null);
+      return;
+    }
+    setCapmLoading(true);
+    setCapmError("");
+    getBacktestCapm(id, benchmarkSymbol || undefined)
+      .then((payload) => {
+        setCapmData(payload);
+      })
+      .catch((capmIssue: unknown) => {
+        const message =
+          capmIssue instanceof Error && capmIssue.message
+            ? capmIssue.message
+            : "Could not load CAPM data";
+        setCapmError(message);
+        setCapmData(null);
+      })
+      .finally(() => {
+        setCapmLoading(false);
+      });
+  }, [id, info, benchmarkSymbol]);
 
   const handleRename = async (nextTitle: string) => {
     if (!id) return;
@@ -561,6 +605,71 @@ export function BacktestDetailPage() {
         )}
       </div>
 
+      {/* CAPM Analysis */}
+      <div
+        style={{
+          background: "var(--color-surface)",
+          border: "1px solid var(--color-border)",
+          borderRadius: "8px",
+          padding: "20px",
+          marginBottom: "20px",
+        }}
+      >
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            marginBottom: "14px",
+            gap: "10px",
+            flexWrap: "wrap",
+          }}
+        >
+          <h2 style={{ fontSize: "1rem", fontWeight: 600, margin: 0 }}>CAPM Analysis</h2>
+          <span style={{ fontSize: "0.78rem", color: "var(--color-text-muted)" }}>
+            Benchmark: {capmData?.benchmark_symbol || benchmarkSymbol || info?.symbols?.[0] || "N/A"}
+          </span>
+        </div>
+
+        {capmLoading ? (
+          <div style={{ color: "var(--color-text-muted)", padding: "14px 0" }}>
+            Loading CAPM analysis...
+          </div>
+        ) : capmError ? (
+          <div style={{ color: "var(--color-red)", padding: "14px 0" }}>Error: {capmError}</div>
+        ) : capmData ? (
+          <>
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))",
+                gap: "12px",
+                marginBottom: "16px",
+              }}
+            >
+              <StatCard
+                label="Alpha (ann.)"
+                value={capmData.alpha * 100}
+                format="percent"
+                color={capmData.alpha >= 0 ? "#3fb950" : "#f85149"}
+              />
+              <StatCard label="Beta" value={capmData.beta.toFixed(2)} color="#58a6ff" />
+              <StatCard label="R²" value={capmData.r_squared.toFixed(2)} color="#c9d1d9" />
+              <StatCard
+                label="P-Value"
+                value={capmData.p_value.toFixed(3)}
+                color={capmData.p_value < 0.05 ? "#3fb950" : "#f85149"}
+              />
+            </div>
+            <CapmScatterPlot capmData={capmData} />
+          </>
+        ) : (
+          <div style={{ color: "var(--color-text-muted)", padding: "14px 0" }}>
+            No CAPM data available.
+          </div>
+        )}
+      </div>
+
       {/* Trade Summary Bar */}
       <div
         style={{
@@ -912,6 +1021,88 @@ function EquityChart({
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+function CapmScatterPlot({ capmData }: { capmData: BacktestCapmResponse }) {
+  const points = capmData.scatter_data || [];
+  if (!points.length) {
+    return (
+      <div style={{ color: "var(--color-text-muted)", padding: "10px 0" }}>
+        No aligned daily returns available for CAPM scatter plot.
+      </div>
+    );
+  }
+
+  const xValues = points.map((point) => point.x);
+  const minX = Math.min(...xValues);
+  const maxX = Math.max(...xValues);
+  const lineSegment: [{ x: number; y: number }, { x: number; y: number }] = [
+    { x: minX, y: capmData.regression_line.slope * minX + capmData.regression_line.intercept },
+    { x: maxX, y: capmData.regression_line.slope * maxX + capmData.regression_line.intercept },
+  ];
+
+  const formatReturn = (value: number | string) => {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) {
+      return String(value);
+    }
+    return `${(numeric * 100).toFixed(2)}%`;
+  };
+
+  return (
+    <div>
+      <div style={{ fontSize: "0.8rem", color: "var(--color-text-muted)", marginBottom: "10px" }}>
+        Beta = {capmData.beta.toFixed(2)} | Alpha = {(capmData.alpha * 100).toFixed(2)}% (ann.) | R² ={" "}
+        {capmData.r_squared.toFixed(2)}
+      </div>
+      <div style={{ width: "100%", height: "340px" }}>
+        <ResponsiveContainer width="100%" height="100%">
+          <ScatterChart margin={{ top: 10, right: 20, bottom: 20, left: 8 }}>
+            <CartesianGrid stroke="#30363d" strokeDasharray="3 3" />
+            <XAxis
+              type="number"
+              dataKey="x"
+              name="Market Daily Returns"
+              label={{
+                value: "Market Daily Returns",
+                position: "insideBottom",
+                offset: -10,
+                fill: "#8b949e",
+              }}
+              tickFormatter={formatReturn}
+              stroke="#8b949e"
+              tick={{ fill: "#8b949e", fontSize: 12 }}
+            />
+            <YAxis
+              type="number"
+              dataKey="y"
+              name="Strategy Daily Returns"
+              label={{
+                value: "Strategy Daily Returns",
+                angle: -90,
+                position: "insideLeft",
+                fill: "#8b949e",
+              }}
+              tickFormatter={formatReturn}
+              stroke="#8b949e"
+              tick={{ fill: "#8b949e", fontSize: 12 }}
+            />
+            <Tooltip
+              cursor={{ stroke: "#8b949e", strokeDasharray: "3 3" }}
+              contentStyle={{
+                background: "#161b22",
+                border: "1px solid #30363d",
+                borderRadius: "6px",
+                color: "#c9d1d9",
+              }}
+            />
+            <Scatter name="Daily Returns" data={points} fill="#58a6ff" />
+            <ReferenceLine segment={lineSegment} stroke="#f85149" strokeWidth={2} />
+          </ScatterChart>
+        </ResponsiveContainer>
+      </div>
     </div>
   );
 }

@@ -110,6 +110,11 @@ def generate_signals(df: pd.DataFrame, params: dict):
     assert trade.meta["trailing_stop_at_exit"] == 101.0
     assert trade.meta["exit_price"] == 101.0
     assert trade.meta["exit_reason"] == "trailing_stop"
+    assert trade.meta["risk_math"]["risk_target_usd"] == 1000.0
+    assert trade.meta["risk_math"]["entry_price"] == trade.entry_price
+    assert trade.meta["risk_math"]["sl_price"] == 95.0
+    assert trade.meta["risk_math"]["position_size"] == trade.quantity
+    assert trade.meta["risk_math"]["capped_by_max_leverage"] is False
     assert trade.exits[0].price == 101.0
     assert trade.exits[0].reason == "trailing_stop"
 
@@ -392,6 +397,8 @@ def generate_signals(df: pd.DataFrame, params: dict):
     assert result.drawings[1]["type"] == "line"
     assert result.drawings[1]["start_time"] == "2024-01-02T00:00:00+00:00"
     assert result.drawings[1]["end_time"] == "2024-01-04T00:00:00+00:00"
+    assert result.trades[0].meta["risk_math"]["sizing_mode"] == "full_equity"
+    assert result.trades[0].meta["risk_math"]["position_size"] == result.trades[0].quantity
 
 
 def test_default_max_leverage_is_unlevered():

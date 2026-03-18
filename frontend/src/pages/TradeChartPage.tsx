@@ -20,6 +20,7 @@ import type {
   OHLCVBar,
   Trade,
   TradeDrawing,
+  TradeRiskMath,
 } from "../api/types";
 import {
   ArrowLeft,
@@ -38,6 +39,7 @@ import {
   CandlestickSeries,
   HistogramSeries,
   LineSeries,
+  AreaSeries,
   createSeriesMarkers,
 } from "lightweight-charts";
 import type { CandlestickData, IChartApi, LogicalRange, Time } from "lightweight-charts";
@@ -67,6 +69,67 @@ function formatTradeMetaValue(value: unknown): string {
     return JSON.stringify(value);
   }
   return String(value);
+}
+
+function toFiniteNumber(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === "string" && value.trim()) {
+    const numeric = Number(value);
+    if (Number.isFinite(numeric)) {
+      return numeric;
+    }
+  }
+  return null;
+}
+
+function formatUsd(value: number, digits = 2): string {
+  return `$${value.toLocaleString("en-US", {
+    minimumFractionDigits: digits,
+    maximumFractionDigits: digits,
+  })}`;
+}
+
+function formatPrice(value: number): string {
+  return `$${value.toLocaleString("en-US", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 6,
+  })}`;
+}
+
+function isTradeRiskMath(value: unknown): value is TradeRiskMath {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function buildRiskMathNarrative(riskMath: TradeRiskMath): string {
+  const targetRisk = toFiniteNumber(riskMath.risk_target_usd);
+  const size = toFiniteNumber(riskMath.position_size);
+  const entry = toFiniteNumber(riskMath.entry_price);
+  const stop = toFiniteNumber(riskMath.sl_price);
+  const leverageCapped = riskMath.capped_by_max_leverage === true;
+  const positionCapped = riskMath.capped_by_max_position === true;
+  const maxLeverage = toFiniteNumber(riskMath.max_leverage);
+
+  const parts: string[] = [];
+  if (targetRisk !== null) {
+    parts.push(`Target Risk: ${formatUsd(targetRisk)}`);
+  }
+  if (size !== null) {
+    parts.push(`Size: ${size.toLocaleString("en-US", { maximumFractionDigits: 4 })} units`);
+  }
+  if (entry !== null && stop !== null) {
+    parts.push(`Entry/SL: ${formatPrice(entry)} → ${formatPrice(stop)}`);
+  }
+  if (leverageCapped) {
+    parts.push("Size capped by max leverage");
+  } else if (positionCapped) {
+    parts.push("Size capped by max position");
+  }
+  if (maxLeverage !== null) {
+    parts.push(`Max leverage: ${maxLeverage.toFixed(2)}x`);
+  }
+  return parts.join(" | ");
 }
 
 function isMarkerDrawing(drawing: TradeDrawing): drawing is ChartMarkerDrawing {
@@ -129,6 +192,79 @@ function resolveLineWidth(value: unknown): 1 | 2 | 3 | 4 {
   return 1;
 }
 
+function normalizeUnixTime(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+    return value;
+  }
+  if (typeof value === "string" && value.trim()) {
+    const numeric = Number(value);
+    if (Number.isFinite(numeric) && numeric > 0) {
+      return numeric;
+    }
+    const parsed = Date.parse(value);
+    if (!Number.isNaN(parsed)) {
+      return parsed / 1000;
+    }
+  }
+  return null;
+}
+
+function sanitizeOHLCVBars(bars: OHLCVBar[]): OHLCVBar[] {
+  const barsByTime = new Map<number, OHLCVBar>();
+  bars.forEach((bar) => {
+    const time = normalizeUnixTime(bar.time);
+    const open = Number(bar.open);
+    const high = Number(bar.high);
+    const low = Number(bar.low);
+    const close = Number(bar.close);
+    if (
+      time === null ||
+      !Number.isFinite(open) ||
+      !Number.isFinite(high) ||
+      !Number.isFinite(low) ||
+      !Number.isFinite(close)
+    ) {
+      return;
+    }
+    const volume = Number(bar.volume);
+    barsByTime.set(time, {
+      time,
+      open,
+      high,
+      low,
+      close,
+      volume: Number.isFinite(volume) ? volume : 0,
+    });
+  });
+  return Array.from(barsByTime.values()).sort((left, right) => left.time - right.time);
+}
+
+function sanitizeIndicatorPoints(
+  points: IndicatorPoint[],
+  validTimes: Set<number> | null,
+): IndicatorPoint[] {
+  const pointsByTime = new Map<number, IndicatorPoint>();
+  points.forEach((point) => {
+    const time = normalizeUnixTime(point.time);
+    if (time === null) {
+      return;
+    }
+    if (validTimes && !validTimes.has(time)) {
+      return;
+    }
+    const rawValue = point.value;
+    let value: number | null = null;
+    if (rawValue !== null && rawValue !== undefined) {
+      const numeric = Number(rawValue);
+      if (Number.isFinite(numeric)) {
+        value = numeric;
+      }
+    }
+    pointsByTime.set(time, { time, value });
+  });
+  return Array.from(pointsByTime.values()).sort((left, right) => left.time - right.time);
+}
+
 function toLineSeriesData(points: IndicatorPoint[]): Array<{ time: Time; value?: number }> {
   return points.map((point) => {
     if (point.value === null || Number.isNaN(point.value)) {
@@ -139,7 +275,10 @@ function toLineSeriesData(points: IndicatorPoint[]): Array<{ time: Time; value?:
 }
 
 function pointsInRange(points: IndicatorPoint[], start: number, end: number): IndicatorPoint[] {
-  return points.filter((point) => point.time >= start && point.time <= end);
+  return points.filter(
+    (point) =>
+      Number.isFinite(point.time) && point.time >= start && point.time <= end,
+  );
 }
 
 function isMissingOHLCVDetail(value: unknown): value is MissingOHLCVDetail {
@@ -247,7 +386,11 @@ export function TradeChartPage() {
     entry: null,
     exit: null,
   });
+  const tradeHighlightSeriesRefs = useRef<any[]>([]);
   const boxOverlayRef = useRef<HTMLDivElement | null>(null);
+  const rangeSyncSourceRef = useRef<IChartApi | null>(null);
+  const rangeSyncFrameRef = useRef<number | null>(null);
+  const shouldAutoFocusTradeRef = useRef(true);
 
   const loadReplay = useCallback(async (requestedNr?: number) => {
     if (!id) return;
@@ -291,12 +434,16 @@ export function TradeChartPage() {
 
   useEffect(() => {
     const parsed = parseInt(nr || "1", 10);
+    shouldAutoFocusTradeRef.current = true;
     loadReplay(Number.isNaN(parsed) ? undefined : parsed);
   }, [id, loadReplay]);
 
   useEffect(() => {
     const parsed = parseInt(nr || "1", 10);
     if (!Number.isNaN(parsed)) {
+      if (parsed !== currentNrRef.current) {
+        shouldAutoFocusTradeRef.current = true;
+      }
       setCurrentNr(parsed);
     }
   }, [nr]);
@@ -328,10 +475,12 @@ export function TradeChartPage() {
     () => trades.filter((trade) => trade.symbol === currentSymbol),
     [trades, currentSymbol],
   );
-  const symbolOHLCV = useMemo(
+  const rawSymbolOHLCV = useMemo(
     () => replay?.ohlcv_by_symbol?.[currentSymbol] || [],
     [replay, currentSymbol],
   );
+  const symbolOHLCV = useMemo(() => sanitizeOHLCVBars(rawSymbolOHLCV), [rawSymbolOHLCV]);
+  const symbolTimeSet = useMemo(() => new Set(symbolOHLCV.map((bar) => bar.time)), [symbolOHLCV]);
   const missingData = useMemo(
     () => replay?.missing_ohlcv?.[currentSymbol] || null,
     [replay, currentSymbol],
@@ -351,15 +500,25 @@ export function TradeChartPage() {
     return [first, last];
   }, [symbolOHLCV]);
 
+  const sanitizedIndicators = useMemo(() => {
+    return (replay?.indicators || [])
+      .filter((indicator) => Array.isArray(indicator.data))
+      .map((indicator) => ({
+        ...indicator,
+        data: sanitizeIndicatorPoints(indicator.data, symbolTimeSet),
+      }))
+      .filter((indicator) => indicator.data.length > 0);
+  }, [replay, symbolTimeSet]);
+
   const overlayIndicators = useMemo(() => {
-    return (replay?.indicators || []).filter((indicator) => {
+    return sanitizedIndicators.filter((indicator) => {
       return !indicatorIsPanel(indicator) && Array.isArray(indicator.data);
     });
-  }, [replay]);
+  }, [sanitizedIndicators]);
 
   const panelGroups = useMemo<PanelGroup[]>(() => {
     const groups = new Map<string, PanelGroup>();
-    (replay?.indicators || [])
+    sanitizedIndicators
       .filter((indicator) => indicatorIsPanel(indicator) && Array.isArray(indicator.data))
       .forEach((indicator) => {
         const key = inferPanelKey(indicator);
@@ -369,7 +528,44 @@ export function TradeChartPage() {
         groups.get(key)!.indicators.push(indicator);
       });
     return Array.from(groups.values());
-  }, [replay]);
+  }, [sanitizedIndicators]);
+
+  const chartHeights = useMemo(() => {
+    if (!panelGroups.length) {
+      return {
+        mainHeight: isFullscreen ? Math.max(480, Math.floor(window.innerHeight * 0.58)) : 460,
+        panelHeight: 0,
+      };
+    }
+    const totalHeight = isFullscreen
+      ? Math.max(620, Math.floor(window.innerHeight * 0.82))
+      : 640;
+    const mainHeight = Math.max(360, Math.floor(totalHeight * 0.7));
+    const remainingHeight = Math.max(totalHeight - mainHeight, panelGroups.length * 96);
+    const panelHeight = Math.max(96, Math.floor(remainingHeight / panelGroups.length));
+    return { mainHeight, panelHeight };
+  }, [isFullscreen, panelGroups.length]);
+
+  const riskMath = useMemo(() => {
+    const candidate = currentTrade?.meta?.risk_math;
+    return isTradeRiskMath(candidate) ? candidate : null;
+  }, [currentTrade]);
+
+  const riskMathEntries = useMemo(() => {
+    if (!riskMath) {
+      return [];
+    }
+    return Object.entries(riskMath)
+      .filter(([, value]) => value !== undefined && value !== null)
+      .sort(([left], [right]) => left.localeCompare(right));
+  }, [riskMath]);
+
+  const riskMathNarrative = useMemo(() => {
+    if (!riskMath) {
+      return "";
+    }
+    return buildRiskMathNarrative(riskMath);
+  }, [riskMath]);
 
   const tradeContextEntries = useMemo(() => {
     const meta = currentTrade?.meta;
@@ -377,6 +573,7 @@ export function TradeChartPage() {
       return [];
     }
     return Object.entries(meta as Record<string, unknown>)
+      .filter(([key]) => key !== "risk_math")
       .filter(([, value]) => value !== undefined && value !== null)
       .sort(([left], [right]) => left.localeCompare(right));
   }, [currentTrade]);
@@ -391,6 +588,7 @@ export function TradeChartPage() {
   const goToTradeNumber = useCallback(
     (tradeNr: number) => {
       if (!id) return;
+      shouldAutoFocusTradeRef.current = true;
       setCurrentNr(tradeNr);
       window.history.replaceState(
         window.history.state,
@@ -548,6 +746,7 @@ export function TradeChartPage() {
     mainChartRef.current = null;
     candleSeriesRef.current = null;
     priceLineRefs.current = { entry: null, exit: null };
+    tradeHighlightSeriesRefs.current = [];
     if (boxOverlayRef.current) {
       boxOverlayRef.current.remove();
       boxOverlayRef.current = null;
@@ -565,10 +764,7 @@ export function TradeChartPage() {
         : "en-US";
 
     const width = container.clientWidth || 1100;
-    const mainHeight = isFullscreen
-      ? Math.max(480, Math.floor(window.innerHeight * 0.58))
-      : 460;
-    const panelHeight = isFullscreen ? 170 : 145;
+    const { mainHeight, panelHeight } = chartHeights;
 
     const chart = createChart(container, {
       width,
@@ -639,11 +835,24 @@ export function TradeChartPage() {
     });
 
     symbolDrawings.filter(isLineDrawing).forEach((drawing, index) => {
-      const startValue =
-        typeof drawing.start_value === "number" ? drawing.start_value : drawing.val1;
-      const endValue =
-        typeof drawing.end_value === "number" ? drawing.end_value : drawing.val2;
-      if (typeof startValue !== "number" || typeof endValue !== "number") return;
+      const startTime = normalizeUnixTime(drawing.start_time);
+      const endTime = normalizeUnixTime(drawing.end_time);
+      const startValue = Number(
+        typeof drawing.start_value === "number" ? drawing.start_value : drawing.val1,
+      );
+      const endValue = Number(
+        typeof drawing.end_value === "number" ? drawing.end_value : drawing.val2,
+      );
+      if (
+        startTime === null ||
+        endTime === null ||
+        !symbolTimeSet.has(startTime) ||
+        !symbolTimeSet.has(endTime) ||
+        !Number.isFinite(startValue) ||
+        !Number.isFinite(endValue)
+      ) {
+        return;
+      }
 
       const lineSeries = chart.addSeries(LineSeries, {
         color: drawing.color || "#f59e0b",
@@ -654,14 +863,37 @@ export function TradeChartPage() {
         priceLineVisible: false,
       });
       lineSeries.setData([
-        { time: drawing.start_time as Time, value: startValue },
-        { time: drawing.end_time as Time, value: endValue },
+        { time: startTime as Time, value: startValue },
+        { time: endTime as Time, value: endValue },
       ]);
     });
 
     symbolDrawings
       .filter(isLineWithBreaksDrawing)
       .forEach((drawing, index) => {
+        const pointsByTime = new Map<number, { time: number; value?: number }>();
+        (drawing.data || []).forEach((point) => {
+          const time = normalizeUnixTime(point.time);
+          if (time === null || !symbolTimeSet.has(time)) {
+            return;
+          }
+          if (point.value === null || Number.isNaN(point.value)) {
+            pointsByTime.set(time, { time });
+            return;
+          }
+          const value = Number(point.value);
+          if (Number.isFinite(value)) {
+            pointsByTime.set(time, { time, value });
+          } else {
+            pointsByTime.set(time, { time });
+          }
+        });
+        const linePoints = Array.from(pointsByTime.values()).sort(
+          (left, right) => left.time - right.time,
+        );
+        if (!linePoints.length) {
+          return;
+        }
         const lineSeries = chart.addSeries(LineSeries, {
           color: drawing.color || "#f59e0b",
           lineWidth: resolveLineWidth(drawing.lineWidth ?? 2),
@@ -671,8 +903,8 @@ export function TradeChartPage() {
           priceLineVisible: false,
         });
         lineSeries.setData(
-          (drawing.data || []).map((point) =>
-            point.value === null || Number.isNaN(point.value)
+          linePoints.map((point) =>
+            point.value === undefined
               ? { time: point.time as Time }
               : { time: point.time as Time, value: point.value },
           ),
@@ -692,10 +924,24 @@ export function TradeChartPage() {
     const renderBoxes = () => {
       boxOverlayRoot.replaceChildren();
       symbolDrawings.filter(isBoxDrawing).forEach((drawing) => {
-        const left = chart.timeScale().timeToCoordinate(drawing.start_time as Time);
-        const right = chart.timeScale().timeToCoordinate(drawing.end_time as Time);
-        const top = candleSeries.priceToCoordinate(drawing.high);
-        const bottom = candleSeries.priceToCoordinate(drawing.low);
+        const startTime = normalizeUnixTime(drawing.start_time);
+        const endTime = normalizeUnixTime(drawing.end_time);
+        const low = Number(drawing.low);
+        const high = Number(drawing.high);
+        if (
+          startTime === null ||
+          endTime === null ||
+          !symbolTimeSet.has(startTime) ||
+          !symbolTimeSet.has(endTime) ||
+          !Number.isFinite(low) ||
+          !Number.isFinite(high)
+        ) {
+          return;
+        }
+        const left = chart.timeScale().timeToCoordinate(startTime as Time);
+        const right = chart.timeScale().timeToCoordinate(endTime as Time);
+        const top = candleSeries.priceToCoordinate(high);
+        const bottom = candleSeries.priceToCoordinate(low);
         if (
           left === null ||
           right === null ||
@@ -770,18 +1016,35 @@ export function TradeChartPage() {
     });
 
     const allCharts = [chart, ...panelCharts];
-    let syncing = false;
+    if (rangeSyncFrameRef.current !== null) {
+      window.cancelAnimationFrame(rangeSyncFrameRef.current);
+      rangeSyncFrameRef.current = null;
+    }
+    rangeSyncSourceRef.current = null;
     const syncSubscriptions: Array<{ chart: IChartApi; handler: (range: LogicalRange | null) => void }> = [];
+    const scheduleSyncRelease = () => {
+      if (rangeSyncFrameRef.current !== null) {
+        window.cancelAnimationFrame(rangeSyncFrameRef.current);
+      }
+      rangeSyncFrameRef.current = window.requestAnimationFrame(() => {
+        rangeSyncSourceRef.current = null;
+        rangeSyncFrameRef.current = null;
+      });
+    };
     allCharts.forEach((sourceChart, sourceIdx) => {
       const handler = (range: LogicalRange | null) => {
-        if (!range || syncing) return;
-        syncing = true;
+        if (!range) return;
+        const activeSource = rangeSyncSourceRef.current;
+        if (activeSource && activeSource !== sourceChart) {
+          return;
+        }
+        rangeSyncSourceRef.current = sourceChart;
         allCharts.forEach((targetChart, targetIdx) => {
           if (targetIdx !== sourceIdx) {
             targetChart.timeScale().setVisibleLogicalRange(range);
           }
         });
-        syncing = false;
+        scheduleSyncRelease();
       };
       sourceChart.timeScale().subscribeVisibleLogicalRangeChange(handler);
       syncSubscriptions.push({ chart: sourceChart, handler });
@@ -813,11 +1076,17 @@ export function TradeChartPage() {
       syncSubscriptions.forEach(({ chart: targetChart, handler }) => {
         targetChart.timeScale().unsubscribeVisibleLogicalRangeChange(handler);
       });
+      if (rangeSyncFrameRef.current !== null) {
+        window.cancelAnimationFrame(rangeSyncFrameRef.current);
+        rangeSyncFrameRef.current = null;
+      }
+      rangeSyncSourceRef.current = null;
       chartRefs.current.forEach((targetChart) => targetChart.remove());
       chartRefs.current = [];
       mainChartRef.current = null;
       candleSeriesRef.current = null;
       priceLineRefs.current = { entry: null, exit: null };
+      tradeHighlightSeriesRefs.current = [];
       if (boxOverlayRef.current) {
         boxOverlayRef.current.remove();
         boxOverlayRef.current = null;
@@ -831,11 +1100,17 @@ export function TradeChartPage() {
     visibleStart,
     visibleEnd,
     isFullscreen,
+    chartHeights,
   ]);
 
   useEffect(() => {
     const chart = mainChartRef.current;
     const candleSeries = candleSeriesRef.current;
+    if (chart && tradeHighlightSeriesRefs.current.length) {
+      tradeHighlightSeriesRefs.current.forEach((series) => chart.removeSeries(series));
+      tradeHighlightSeriesRefs.current = [];
+    }
+
     if (!chart || !candleSeries || !currentTrade || !symbolOHLCV.length) {
       return;
     }
@@ -849,8 +1124,12 @@ export function TradeChartPage() {
     }> = [];
 
     symbolTrades.forEach((trade) => {
+      const entryTime = normalizeUnixTime(trade.entry_time);
+      if (entryTime === null || !symbolTimeSet.has(entryTime)) {
+        return;
+      }
       markers.push({
-        time: trade.entry_time as Time,
+        time: entryTime as Time,
         position: trade.direction === "LONG" ? "belowBar" : "aboveBar",
         color: trade.nr === currentNr ? "#58a6ff" : "rgba(88,166,255,0.55)",
         shape: trade.direction === "LONG" ? "arrowUp" : "arrowDown",
@@ -859,9 +1138,13 @@ export function TradeChartPage() {
     });
 
     (currentTrade.exits || []).forEach((exit, index) => {
+      const exitTime = normalizeUnixTime(exit.time);
+      if (exitTime === null || !symbolTimeSet.has(exitTime)) {
+        return;
+      }
       const isFinal = index === (currentTrade.exits?.length || 0) - 1;
       markers.push({
-        time: exit.time as Time,
+        time: exitTime as Time,
         position: currentTrade.direction === "LONG" ? "aboveBar" : "belowBar",
         color: isFinal
           ? currentTrade.pnl >= 0
@@ -874,8 +1157,12 @@ export function TradeChartPage() {
     });
 
     symbolDrawings.filter(isMarkerDrawing).forEach((drawing) => {
+      const markerTime = normalizeUnixTime(drawing.time);
+      if (markerTime === null || !symbolTimeSet.has(markerTime)) {
+        return;
+      }
       markers.push({
-        time: drawing.time as Time,
+        time: markerTime as Time,
         position: normalizeMarkerPosition(drawing.position),
         color: drawing.color || "#f59e0b",
         shape: normalizeMarkerShape(drawing.shape),
@@ -883,9 +1170,16 @@ export function TradeChartPage() {
       });
     });
 
+    const sortedMarkers = markers.sort((left, right) => {
+      const leftTime = Number(left.time);
+      const rightTime = Number(right.time);
+      if (leftTime === rightTime) return 0;
+      return leftTime < rightTime ? -1 : 1;
+    });
+
     createSeriesMarkers(
       candleSeries,
-      markers.sort((left, right) => Number(left.time) - Number(right.time)),
+      sortedMarkers,
     );
 
     if (priceLineRefs.current.entry) {
@@ -914,8 +1208,71 @@ export function TradeChartPage() {
       title: "Exit",
     });
 
+    const entryTime = normalizeUnixTime(currentTrade.entry_time);
+    const exitPoints = (currentTrade.exits || [])
+      .map((exit) => {
+        const exitTime = normalizeUnixTime(exit.time);
+        return {
+          time: exitTime,
+          price: Number(exit.price),
+        };
+      })
+      .filter(
+        (point): point is { time: number; price: number } =>
+          point.time !== null && symbolTimeSet.has(point.time) && Number.isFinite(point.price),
+      )
+      .sort((left, right) => left.time - right.time);
+
+    if (entryTime !== null && symbolTimeSet.has(entryTime) && exitPoints.length) {
+      const lastExitTime = exitPoints[exitPoints.length - 1].time;
+      const holdCeiling = symbolOHLCV.reduce(
+        (maxValue, bar) =>
+          bar.time >= entryTime && bar.time <= lastExitTime
+            ? Math.max(maxValue, bar.high)
+            : maxValue,
+        Number.NEGATIVE_INFINITY,
+      );
+
+      if (Number.isFinite(holdCeiling)) {
+        const holdSeries = chart.addSeries(AreaSeries, {
+          lineColor: "rgba(0,0,0,0)",
+          topColor: "rgba(0, 150, 255, 0.1)",
+          bottomColor: "rgba(0, 150, 255, 0.1)",
+          lineWidth: 1,
+          lastValueVisible: false,
+          priceLineVisible: false,
+          crosshairMarkerVisible: false,
+        });
+        holdSeries.setData(
+          symbolOHLCV.map((bar) =>
+            bar.time >= entryTime && bar.time <= lastExitTime
+              ? { time: bar.time as Time, value: holdCeiling }
+              : { time: bar.time as Time },
+          ),
+        );
+        tradeHighlightSeriesRefs.current.push(holdSeries);
+      }
+
+      exitPoints.forEach((exitPoint, index) => {
+        const connector = chart.addSeries(LineSeries, {
+          color: "rgba(247, 211, 84, 0.72)",
+          lineWidth: index === exitPoints.length - 1 ? 2 : 1,
+          lineStyle: LineStyle.Dashed,
+          lastValueVisible: false,
+          priceLineVisible: false,
+          crosshairMarkerVisible: false,
+        });
+        connector.setData([
+          { time: entryTime as Time, value: currentTrade.entry_price },
+          { time: exitPoint.time as Time, value: exitPoint.price },
+        ]);
+        tradeHighlightSeriesRefs.current.push(connector);
+      });
+    }
+
     const entryIndex = findBarIndexByTime(symbolOHLCV, currentTrade.entry_time);
-    if (entryIndex >= 0) {
+    if (entryIndex >= 0 && shouldAutoFocusTradeRef.current) {
+      shouldAutoFocusTradeRef.current = false;
       const barsBefore = 120;
       const barsAfter = 80;
       chart.timeScale().setVisibleLogicalRange({
@@ -923,7 +1280,7 @@ export function TradeChartPage() {
         to: Math.min(entryIndex + barsAfter, symbolOHLCV.length - 1),
       });
     }
-  }, [currentTrade, currentNr, symbolOHLCV, symbolTrades, symbolDrawings]);
+  }, [currentTrade, currentNr, symbolOHLCV, symbolTrades, symbolDrawings, symbolTimeSet]);
 
   if (isLoading) {
     return (
@@ -1084,7 +1441,7 @@ export function TradeChartPage() {
             </div>
           </div>
 
-          {tradeContextEntries.length > 0 ? (
+          {riskMath || tradeContextEntries.length > 0 ? (
             <div
               style={{
                 flex: "1 1 320px",
@@ -1102,43 +1459,110 @@ export function TradeChartPage() {
                   letterSpacing: "0.08em",
                   marginBottom: "10px",
                 }}
-              >
-                Trade Context
-              </div>
-              <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
-                {tradeContextEntries.map(([key, value]) => (
+                >
+                  Trade Context
+                </div>
+              {riskMath ? (
+                <div
+                  data-testid="risk-math-box"
+                  style={{
+                    marginBottom: tradeContextEntries.length ? "12px" : "0",
+                    background: "rgba(0, 150, 255, 0.1)",
+                    border: "1px solid rgba(88,166,255,0.38)",
+                    borderRadius: "8px",
+                    padding: "10px",
+                  }}
+                >
                   <div
-                    key={key}
                     style={{
-                      display: "flex",
-                      justifyContent: "space-between",
-                      gap: "10px",
-                      borderBottom: "1px solid var(--color-border)",
-                      paddingBottom: "8px",
+                      color: "#79c0ff",
+                      fontSize: "0.72rem",
+                      textTransform: "uppercase",
+                      letterSpacing: "0.08em",
+                      marginBottom: "8px",
+                      fontWeight: 700,
                     }}
                   >
-                    <div
-                      style={{
-                        color: "var(--color-text-muted)",
-                        fontSize: "0.8rem",
-                        wordBreak: "break-word",
-                      }}
-                    >
-                      {key}
-                    </div>
-                    <div
-                      style={{
-                        fontWeight: 600,
-                        textAlign: "right",
-                        wordBreak: "break-word",
-                        fontSize: "0.82rem",
-                      }}
-                    >
-                      {formatTradeMetaValue(value)}
-                    </div>
+                    Risk Math
                   </div>
-                ))}
-              </div>
+                  {riskMathNarrative ? (
+                    <div style={{ fontSize: "0.82rem", fontWeight: 600, marginBottom: "8px" }}>
+                      {riskMathNarrative}
+                    </div>
+                  ) : null}
+                  <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+                    {riskMathEntries.map(([key, value]) => (
+                      <div
+                        key={key}
+                        style={{
+                          display: "flex",
+                          justifyContent: "space-between",
+                          gap: "10px",
+                          borderBottom: "1px solid rgba(88,166,255,0.2)",
+                          paddingBottom: "6px",
+                        }}
+                      >
+                        <div
+                          style={{
+                            color: "var(--color-text-muted)",
+                            fontSize: "0.77rem",
+                            wordBreak: "break-word",
+                          }}
+                        >
+                          {key}
+                        </div>
+                        <div
+                          style={{
+                            fontWeight: 600,
+                            textAlign: "right",
+                            wordBreak: "break-word",
+                            fontSize: "0.8rem",
+                          }}
+                        >
+                          {formatTradeMetaValue(value)}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
+
+              {tradeContextEntries.length > 0 ? (
+                <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+                  {tradeContextEntries.map(([key, value]) => (
+                    <div
+                      key={key}
+                      style={{
+                        display: "flex",
+                        justifyContent: "space-between",
+                        gap: "10px",
+                        borderBottom: "1px solid var(--color-border)",
+                        paddingBottom: "8px",
+                      }}
+                    >
+                      <div
+                        style={{
+                          color: "var(--color-text-muted)",
+                          fontSize: "0.8rem",
+                          wordBreak: "break-word",
+                        }}
+                      >
+                        {key}
+                      </div>
+                      <div
+                        style={{
+                          fontWeight: 600,
+                          textAlign: "right",
+                          wordBreak: "break-word",
+                          fontSize: "0.82rem",
+                        }}
+                      >
+                        {formatTradeMetaValue(value)}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
             </div>
           ) : null}
         </div>
@@ -1160,7 +1584,7 @@ export function TradeChartPage() {
               data-testid="trade-chart-canvas"
               style={{
                 width: "100%",
-                height: isFullscreen ? "58vh" : "460px",
+                height: `${chartHeights.mainHeight}px`,
                 borderRadius: "8px",
                 overflow: "hidden",
               }}
@@ -1184,7 +1608,7 @@ export function TradeChartPage() {
                   ref={setPanelContainerRef(group.key)}
                   style={{
                     width: "100%",
-                    height: isFullscreen ? "170px" : "145px",
+                    height: `${chartHeights.panelHeight}px`,
                     border: "1px solid var(--color-border)",
                     borderRadius: "8px",
                     overflow: "hidden",

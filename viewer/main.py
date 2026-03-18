@@ -62,6 +62,7 @@ from shared.database import (
     migrate_json_to_sqlite,
     save_result_to_sqlite,
 )
+from runner.capm import align_return_series, calculate_capm
 from shared.strategy_registry import (
     DEFAULT_STRATEGIES_DIR,
     StrategyEntry,
@@ -176,6 +177,26 @@ class BenchmarkResponse(SQLModel):
     symbol: str
     timeframe: str
     equity: list[BenchmarkPoint]
+
+
+class CapmScatterPoint(SQLModel):
+    x: float
+    y: float
+
+
+class CapmRegressionLine(SQLModel):
+    slope: float
+    intercept: float
+
+
+class CapmResponse(SQLModel):
+    alpha: float
+    beta: float
+    r_squared: float
+    p_value: float
+    scatter_data: list[CapmScatterPoint]
+    regression_line: CapmRegressionLine
+    benchmark_symbol: str
 
 
 class NameUpdateRequest(SQLModel):
@@ -361,6 +382,89 @@ def _ensure_equity_curve(result: BacktestResult, initial_capital: float) -> list
     if end_iso != start_iso or end_value != start_value:
         points.append(EquityPoint(time=end_iso, equity=end_value))
     return points
+
+
+def _returns_from_equity_curve(equity_curve: list[EquityPoint]) -> pd.Series:
+    if len(equity_curve) < 2:
+        raise ValueError("Backtest has insufficient equity history for CAPM")
+
+    timestamps = pd.to_datetime([point.time for point in equity_curve], utc=True, errors="coerce")
+    equities = pd.to_numeric([point.equity for point in equity_curve], errors="coerce")
+    series = pd.Series(equities, index=timestamps).dropna()
+    series = series[~series.index.isna()]
+    series = series.sort_index().groupby(level=0).last()
+    if len(series) < 2:
+        raise ValueError("Backtest has insufficient equity history for CAPM")
+
+    daily_equity = series.resample("1D").last().ffill()
+    returns = daily_equity.pct_change().replace([math.inf, -math.inf], pd.NA).dropna()
+    if returns.empty:
+        raise ValueError("Backtest has no valid daily returns for CAPM")
+    return returns
+
+
+def _close_series_from_df(df: pd.DataFrame, *, symbol: str) -> pd.Series:
+    if "close" not in df.columns:
+        raise HTTPException(status_code=500, detail=f"Benchmark data for {symbol} has no close column")
+
+    if "timestamp" in df.columns:
+        timestamps = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+        close = pd.to_numeric(df["close"], errors="coerce")
+        series = pd.Series(close.values, index=timestamps).dropna()
+    elif isinstance(df.index, pd.DatetimeIndex):
+        timestamps = pd.DatetimeIndex(df.index)
+        if timestamps.tz is None:
+            timestamps = timestamps.tz_localize("UTC")
+        else:
+            timestamps = timestamps.tz_convert("UTC")
+        close = pd.to_numeric(df["close"], errors="coerce")
+        series = pd.Series(close.values, index=timestamps).dropna()
+    else:
+        raise HTTPException(status_code=500, detail=f"Benchmark data for {symbol} has no timestamp column")
+
+    series = series[~series.index.isna()].sort_index().groupby(level=0).last()
+    if series.empty:
+        raise HTTPException(status_code=404, detail=f"No benchmark price history for {symbol}")
+    return series
+
+
+def _benchmark_daily_returns(symbol: str, *, start: str = "", end: str = "") -> pd.Series:
+    df_1d = legacy_viewer._load_ohlcv_df(symbol, "1d")
+    series = _close_series_from_df(df_1d, symbol=symbol) if df_1d is not None else pd.Series(dtype=float)
+
+    if series.empty:
+        for fallback_timeframe in ["4h", "1h", "15m"]:
+            fallback_df = legacy_viewer._load_ohlcv_df(symbol, fallback_timeframe)
+            if fallback_df is None:
+                continue
+            intraday_close = _close_series_from_df(fallback_df, symbol=symbol)
+            series = intraday_close.resample("1D").last().dropna()
+            if not series.empty:
+                logger.info("CAPM benchmark %s: using %s resampled to 1d", symbol, fallback_timeframe)
+                break
+
+    if series.empty:
+        raise HTTPException(status_code=404, detail=f"No data for {symbol}")
+
+    start_ts = pd.to_datetime(start, utc=True, errors="coerce") if start else pd.NaT
+    end_ts = pd.to_datetime(end, utc=True, errors="coerce") if end else pd.NaT
+    if not pd.isna(start_ts):
+        series = series[series.index >= start_ts]
+    if not pd.isna(end_ts):
+        series = series[series.index <= end_ts]
+
+    returns = series.pct_change().replace([math.inf, -math.inf], pd.NA).dropna()
+    if returns.empty:
+        raise HTTPException(status_code=404, detail=f"No benchmark returns for {symbol} in selected range")
+    return returns
+
+
+def _default_benchmark_symbol(result: BacktestResult) -> str:
+    data = result.meta.data if isinstance(result.meta.data, dict) else {}
+    symbols = data.get("symbols") if isinstance(data, dict) else None
+    if isinstance(symbols, list) and symbols:
+        return str(symbols[0]).strip().upper()
+    return ""
 
 
 def _safe_strategy_entries() -> list[StrategyEntry]:
@@ -1077,6 +1181,65 @@ async def get_equity_curve(backtest_id: str) -> list[dict[str, float]]:
     return legacy_viewer._equity_to_viewer(result)
 
 
+@app.get("/api/backtest/{backtest_id}/capm", response_model=CapmResponse)
+async def get_backtest_capm(
+    backtest_id: str,
+    benchmark: str = Query(default=""),
+) -> CapmResponse:
+    result = _load_result(backtest_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"Backtest '{backtest_id}' not found")
+
+    benchmark_symbol = str(benchmark or "").strip().upper() or _default_benchmark_symbol(result)
+    if not benchmark_symbol:
+        raise HTTPException(
+            status_code=400,
+            detail="No benchmark symbol provided and no backtest symbol available",
+        )
+
+    initial_capital = _safe_float(result.meta.initial_capital, 100000.0) or 100000.0
+    equity_curve = _ensure_equity_curve(result, initial_capital=initial_capital)
+    try:
+        strategy_returns = _returns_from_equity_curve(equity_curve)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    benchmark_returns = _benchmark_daily_returns(
+        benchmark_symbol,
+        start=result.meta.backtest_start or "",
+        end=result.meta.backtest_end or "",
+    )
+
+    try:
+        capm = calculate_capm(strategy_returns, benchmark_returns)
+        aligned = align_return_series(strategy_returns, benchmark_returns)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    scatter = [
+        CapmScatterPoint(
+            x=float(row.benchmark_return),
+            y=float(row.strategy_return),
+        )
+        for row in aligned.itertuples(index=False)
+    ]
+
+    beta = _safe_float(capm.get("beta"), 0.0)
+    alpha_annualized = _safe_float(capm.get("alpha"), 0.0)
+    return CapmResponse(
+        alpha=alpha_annualized,
+        beta=beta,
+        r_squared=_safe_float(capm.get("r_squared"), 0.0),
+        p_value=_safe_float(capm.get("p_value"), 1.0),
+        scatter_data=scatter,
+        regression_line=CapmRegressionLine(
+            slope=beta,
+            intercept=alpha_annualized / 252.0,
+        ),
+        benchmark_symbol=benchmark_symbol,
+    )
+
+
 @app.get("/api/backtest/{backtest_id}/trades", response_model=list[dict[str, Any]])
 async def get_backtest_trades(backtest_id: str) -> list[dict[str, Any]]:
     result = _load_result(backtest_id)
@@ -1100,7 +1263,7 @@ def _normalize_indicator_payloads(indicators: list[Any]) -> list[dict[str, Any]]
         if not isinstance(points, list):
             continue
 
-        normalized_points: list[dict[str, Any]] = []
+        points_by_time: dict[float, dict[str, Any]] = {}
         for point in points:
             if not isinstance(point, dict):
                 continue
@@ -1110,12 +1273,24 @@ def _normalize_indicator_payloads(indicators: list[Any]) -> list[dict[str, Any]]
                 if isinstance(raw_time, (int, float))
                 else legacy_viewer._iso_to_unix(str(raw_time))
             )
-            if unix_time <= 0:
+            if not math.isfinite(unix_time) or unix_time <= 0:
                 continue
             normalized_point = dict(point)
-            normalized_point["time"] = unix_time
-            normalized_points.append(normalized_point)
-        indicator["data"] = normalized_points
+            normalized_point["time"] = float(unix_time)
+            if "value" in normalized_point:
+                raw_value = normalized_point.get("value")
+                if raw_value is None:
+                    normalized_point["value"] = None
+                else:
+                    try:
+                        numeric_value = float(raw_value)
+                    except (TypeError, ValueError):
+                        continue
+                    normalized_point["value"] = (
+                        round(numeric_value, 6) if math.isfinite(numeric_value) else None
+                    )
+            points_by_time[float(unix_time)] = normalized_point
+        indicator["data"] = [points_by_time[key] for key in sorted(points_by_time.keys())]
 
         if indicator.get("pane") in (None, ""):
             style = indicator.get("style")

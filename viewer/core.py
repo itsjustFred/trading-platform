@@ -410,24 +410,37 @@ def _missing_ohlcv_details(
 
 def _df_to_ohlcv_records(df: pd.DataFrame) -> list[dict]:
     """Convert OHLCV DataFrame to list of dicts with Unix timestamps."""
-    records = []
+    records_by_time: dict[float, dict] = {}
     for _, row in df.iterrows():
         ts = row["timestamp"]
         if hasattr(ts, "timestamp"):
             unix_ts = ts.timestamp()
         else:
             unix_ts = pd.Timestamp(ts).timestamp()
-        records.append(
-            {
-                "time": unix_ts,
-                "open": float(row["open"]),
-                "high": float(row["high"]),
-                "low": float(row["low"]),
-                "close": float(row["close"]),
-                "volume": int(row.get("volume", 0)),
-            }
-        )
-    return records
+        unix_time = _coerce_finite_float(unix_ts)
+        open_price = _coerce_finite_float(row.get("open"))
+        high_price = _coerce_finite_float(row.get("high"))
+        low_price = _coerce_finite_float(row.get("low"))
+        close_price = _coerce_finite_float(row.get("close"))
+        if (
+            unix_time is None
+            or unix_time <= 0
+            or open_price is None
+            or high_price is None
+            or low_price is None
+            or close_price is None
+        ):
+            continue
+        volume_numeric = _coerce_finite_float(row.get("volume", 0))
+        records_by_time[unix_time] = {
+            "time": unix_time,
+            "open": open_price,
+            "high": high_price,
+            "low": low_price,
+            "close": close_price,
+            "volume": int(volume_numeric) if volume_numeric is not None else 0,
+        }
+    return [records_by_time[key] for key in sorted(records_by_time.keys())]
 
 
 def _drawing_timestamp_to_unix(value: Any) -> float | None:
@@ -442,6 +455,16 @@ def _drawing_timestamp_to_unix(value: Any) -> float | None:
     if pd.isna(ts):
         return None
     return float(pd.Timestamp(ts).timestamp())
+
+
+def _coerce_finite_float(value: Any) -> float | None:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(numeric):
+        return None
+    return numeric
 
 
 def _drawing_matches_symbol(drawing: dict[str, Any], symbol: str) -> bool:
@@ -470,14 +493,17 @@ def _drawing_to_viewer(drawing: dict[str, Any]) -> dict[str, Any] | None:
             return None
         payload["start_time"] = start_time
         payload["end_time"] = end_time
-        if "start_value" not in payload and "val1" in payload:
-            payload["start_value"] = payload.get("val1")
-        if "end_value" not in payload and "val2" in payload:
-            payload["end_value"] = payload.get("val2")
-        if "val1" not in payload and "start_value" in payload:
-            payload["val1"] = payload.get("start_value")
-        if "val2" not in payload and "end_value" in payload:
-            payload["val2"] = payload.get("end_value")
+        start_value = payload.get("start_value", payload.get("val1"))
+        end_value = payload.get("end_value", payload.get("val2"))
+        start_numeric = _coerce_finite_float(start_value)
+        end_numeric = _coerce_finite_float(end_value)
+        if start_numeric is None or end_numeric is None:
+            logger.warning("Skipping drawing line with invalid values: %s", drawing)
+            return None
+        payload["start_value"] = start_numeric
+        payload["end_value"] = end_numeric
+        payload["val1"] = start_numeric
+        payload["val2"] = end_numeric
         return payload
 
     if drawing_type == "line_with_breaks":
@@ -485,7 +511,7 @@ def _drawing_to_viewer(drawing: dict[str, Any]) -> dict[str, Any] | None:
         if not isinstance(points, list) or not points:
             logger.warning("Skipping line_with_breaks drawing with invalid data: %s", drawing)
             return None
-        normalized_points: list[dict[str, Any]] = []
+        points_by_time: dict[float, dict[str, Any]] = {}
         for point in points:
             if not isinstance(point, dict):
                 continue
@@ -494,7 +520,13 @@ def _drawing_to_viewer(drawing: dict[str, Any]) -> dict[str, Any] | None:
                 continue
             normalized_point = dict(point)
             normalized_point["time"] = unix_time
-            normalized_points.append(normalized_point)
+            raw_value = normalized_point.get("value")
+            if raw_value is None:
+                normalized_point["value"] = None
+            else:
+                normalized_point["value"] = _coerce_finite_float(raw_value)
+            points_by_time[unix_time] = normalized_point
+        normalized_points = [points_by_time[key] for key in sorted(points_by_time.keys())]
         if not normalized_points:
             logger.warning("Skipping line_with_breaks drawing without valid points: %s", drawing)
             return None

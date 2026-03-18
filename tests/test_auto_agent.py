@@ -242,3 +242,38 @@ def test_run_auto_agent_retries_only_step_three_on_validation_failure(tmp_path, 
     assert "The Coder" in llm_calls[2]["messages"][0]["content"]
     assert "The Coder" in llm_calls[3]["messages"][0]["content"]
     assert "Traceback: boom" in llm_calls[3]["messages"][1]["content"]
+
+
+def test_normalize_strategy_meta_accepts_list_tags():
+    normalized = auto_agent._normalize_strategy_meta(
+        {
+            "name": "Demo Agent",
+            "version": "1.0.0",
+            "parameters": {"fast": 10},
+            "tags": ["momentum", "equities"],
+        },
+        requested_name="Demo Agent",
+        markdown_doc="# Demo Agent",
+    )
+
+    assert normalized["tags"] == {"type": ["momentum", "equities"]}
+
+
+def test_normalize_strategy_meta_coerces_tag_field_types():
+    normalized = auto_agent._normalize_strategy_meta(
+        {
+            "name": "Demo Agent",
+            "parameters": {"fast": 10},
+            "tags": {
+                "type": "trend",
+                "asset_class": "forex",
+                "complexity": 2,
+            },
+        },
+        requested_name="Demo Agent",
+        markdown_doc="# Demo Agent",
+    )
+
+    assert normalized["tags"]["type"] == ["trend"]
+    assert normalized["tags"]["asset_class"] == ["forex"]
+    assert normalized["tags"]["complexity"] == "2"

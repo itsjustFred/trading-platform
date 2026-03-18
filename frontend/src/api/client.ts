@@ -25,6 +25,7 @@ import type {
   Trade,
   TradeChartResponse,
   BacktestInfo,
+  BacktestCapmResponse,
   BacktestReplayResponse,
 } from "./types";
 
@@ -87,6 +88,12 @@ export const getBacktestReplay = (id: string) =>
   fetchJSON<BacktestReplayResponse>(`/backtest/${id}/replay`);
 export const getBacktestEquity = (id: string) =>
   fetchJSON<any>(`/backtest/${id}/equity`);
+export const getBacktestCapm = (id: string, benchmark?: string) => {
+  const params = new URLSearchParams();
+  if (benchmark) params.set("benchmark", benchmark);
+  const query = params.toString();
+  return fetchJSON<BacktestCapmResponse>(`/backtest/${id}/capm${query ? `?${query}` : ""}`);
+};
 export const getBacktestOHLCV = (id: string) =>
   fetchJSON<any>(`/backtest/${id}/ohlcv`);
 export const renameBacktest = (id: string, title: string) =>

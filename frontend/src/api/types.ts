@@ -106,7 +106,7 @@ export interface Trade {
   bars_held?: number;
   holding_bars?: number;
   exits?: TradeExitView[];
-  meta?: Record<string, unknown>;
+  meta?: TradeMeta;
 }
 
 export interface TradeExitView {
@@ -116,6 +116,30 @@ export interface TradeExitView {
   quantity: number;
   pnl?: number;
   reason?: string;
+}
+
+export interface TradeRiskMath {
+  sizing_mode?: string;
+  equity_at_entry?: number | null;
+  risk_target_usd?: number | null;
+  entry_price?: number | null;
+  sl_price?: number | null;
+  stop_distance?: number | null;
+  position_size?: number | null;
+  required_notional?: number | null;
+  final_notional?: number | null;
+  max_position_notional?: number | null;
+  max_leverage_notional?: number | null;
+  max_position_pct?: number | null;
+  max_leverage?: number | null;
+  capped_by_max_position?: boolean;
+  capped_by_max_leverage?: boolean;
+  [key: string]: unknown;
+}
+
+export interface TradeMeta {
+  risk_math?: TradeRiskMath;
+  [key: string]: unknown;
 }
 
 export interface MissingOHLCVDetail {
@@ -285,6 +309,26 @@ export interface BacktestStats {
   psr?: number;
   p_value?: number;
   [key: string]: any;
+}
+
+export interface CapmScatterPoint {
+  x: number;
+  y: number;
+}
+
+export interface CapmRegressionLine {
+  slope: number;
+  intercept: number;
+}
+
+export interface BacktestCapmResponse {
+  alpha: number;
+  beta: number;
+  r_squared: number;
+  p_value: number;
+  scatter_data: CapmScatterPoint[];
+  regression_line: CapmRegressionLine;
+  benchmark_symbol: string;
 }
 
 export interface EquityPoint {

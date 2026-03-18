@@ -154,6 +154,18 @@ def _process_symbol(
             entry_ts = str(entry_row.get("timestamp", entry_row.name))
             exit_ts = str(exit_row.get("timestamp", exit_row.name))
             trade_meta = _extract_trade_meta(execution_signals, execution_indicators, entry_idx, i)
+            stop_price = _resolve_level_value(stop_loss_series, entry_idx)
+            risk_target_usd: float | None = None
+            stop_distance: float | None = None
+            max_position_pct: float | None = None
+            max_leverage: float | None = None
+            required_notional: float | None = None
+            cap_notional: float | None = None
+            leverage_notional_limit: float | None = None
+            final_notional: float | None = None
+            capped_by_max_position = False
+            capped_by_max_leverage = False
+            sizing_mode = "full_equity"
 
             intrabar_exit = _resolve_intrabar_exit(
                 intrabar_df=intrabar_df,
@@ -172,6 +184,7 @@ def _process_symbol(
                 trade_meta["modeling_resolution"] = intrabar_exit["resolution"]
 
             if config.risk_per_trade_pct is not None and config.risk_per_trade_pct > 0:
+                sizing_mode = "risk_pct"
                 max_position_pct = _resolve_max_position_pct(
                     config.max_position_pct, asset_class
                 )
@@ -179,16 +192,16 @@ def _process_symbol(
                 if max_leverage < max_position_pct:
                     max_leverage = max_position_pct
 
-                risk_amount = equity * config.risk_per_trade_pct
-                stop_dist = _resolve_stop_distance(
+                risk_target_usd = equity * config.risk_per_trade_pct
+                stop_distance = _resolve_stop_distance(
                     entry_idx,
                     entry_price,
                     stop_loss_series=stop_loss_series,
                     atr_series=atr_series,
                 )
 
-                if not stop_dist or stop_dist <= 0:
-                    stop_dist = entry_price * 0.02
+                if not stop_distance or stop_distance <= 0:
+                    stop_distance = entry_price * 0.02
                     logger.warning(
                         "Risk sizing fallback for %s at bar %s: no stop_loss/ATR, using %.2f%% default stop",
                         symbol,
@@ -196,10 +209,12 @@ def _process_symbol(
                         2.0,
                     )
 
-                base_qty = risk_amount / stop_dist
+                base_qty = risk_target_usd / stop_distance
                 required_notional = base_qty * entry_price
                 cap_notional = equity * max_position_pct
                 leverage_notional_limit = equity * max_leverage
+                capped_by_max_position = required_notional > cap_notional
+                capped_by_max_leverage = required_notional > leverage_notional_limit
 
                 if required_notional <= cap_notional:
                     final_notional = required_notional
@@ -215,12 +230,12 @@ def _process_symbol(
                     )
                 else:
                     final_notional = leverage_notional_limit
-                    achievable_risk = (final_notional / entry_price) * stop_dist
+                    achievable_risk = (final_notional / entry_price) * stop_distance
                     logger.warning(
                         "Risk target underfilled for %s trade %s: target=%.2f achievable=%.2f (cap=%.2f, max_leverage=%.2fx)",
                         symbol,
                         trade_counter,
-                        risk_amount,
+                        risk_target_usd,
                         achievable_risk,
                         cap_notional,
                         max_leverage,
@@ -229,6 +244,48 @@ def _process_symbol(
                 qty = final_notional / entry_price
             else:
                 qty = equity / entry_price
+                final_notional = qty * entry_price
+
+            if stop_price is None and stop_distance is not None and stop_distance > 0:
+                stop_price = (
+                    entry_price - stop_distance
+                    if direction == "LONG"
+                    else entry_price + stop_distance
+                )
+
+            if stop_price is None:
+                sl_from_meta = trade_meta.get("sl_price")
+                if isinstance(sl_from_meta, (int, float)):
+                    stop_price = float(sl_from_meta)
+
+            if stop_distance is None and stop_price is not None:
+                stop_distance = abs(entry_price - stop_price)
+
+            trade_meta["risk_math"] = {
+                "sizing_mode": sizing_mode,
+                "equity_at_entry": round(equity, 2),
+                "risk_target_usd": round(risk_target_usd, 2) if risk_target_usd is not None else None,
+                "entry_price": round(entry_price, 6),
+                "sl_price": round(stop_price, 6) if stop_price is not None else None,
+                "stop_distance": round(stop_distance, 6) if stop_distance is not None else None,
+                "position_size": round(qty, 4),
+                "required_notional": (
+                    round(required_notional, 2) if required_notional is not None else None
+                ),
+                "final_notional": round(final_notional, 2) if final_notional is not None else None,
+                "max_position_notional": (
+                    round(cap_notional, 2) if cap_notional is not None else None
+                ),
+                "max_leverage_notional": (
+                    round(leverage_notional_limit, 2)
+                    if leverage_notional_limit is not None
+                    else None
+                ),
+                "max_position_pct": round(max_position_pct, 6) if max_position_pct is not None else None,
+                "max_leverage": round(max_leverage, 6) if max_leverage is not None else None,
+                "capped_by_max_position": capped_by_max_position,
+                "capped_by_max_leverage": capped_by_max_leverage,
+            }
 
             if direction == "LONG":
                 pnl = (exit_price - entry_price) * qty
