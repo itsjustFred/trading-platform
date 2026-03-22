@@ -30,7 +30,7 @@ python -m data_tools.catalog_builder -o "$TRADING_DATA_DIR/catalog.json"
 
 | Source | Primary entrypoint | Current role | Typical asset classes |
 | --- | --- | --- | --- |
-| Dukascopy | `python -m data_tools.downloaders.dukascopy_native` | Main downloader for FX, metals, indices, energy | `forex`, `metals`, `indices`, `energy` |
+| Dukascopy | `python -m data_tools.downloaders.jforex_dl` (fallback: `dukascopy_native`) | Main downloader path for FX, metals, indices, energy | `forex`, `metals`, `indices`, `energy` |
 | Dolthub | `python -m data_tools.dolthub_manager update` and `python -m data_tools.downloaders.dolthub_dl` | Repo sync plus targeted SQL exports | `equity`, `options`, fundamentals |
 | HuggingFace | `python -m data_tools.downloaders.huggingface_dl` | Direct parquet / dataset ingestion | `equity`, `crypto`, dataset-dependent |
 | HistData | `python -m data_tools.downloaders.histdata_dl` | Free historical FX import | `forex` |
@@ -58,11 +58,14 @@ File: `data_tools/downloaders/dukascopy_native.py`
 
 ### Notable behavior
 
-- The viewer download API launches it directly for source `dukascopy`.
+- The viewer download API launches `jforex_dl` for source `dukascopy` and falls back to `dukascopy_native` when JForex/JPype/JVM is unavailable.
 - It can merge bid/ask exports for `tick` and `s1` using `--merge-tick` or
   `--merge-s1`.
-- Requested start dates are clamped by genesis dates so the UI can reject
-  impossible ranges before the job starts.
+- Dukascopy coverage is exposed per timeframe in the API response
+  (`coverage.<timeframe>.available/start`) so the UI can show explicit
+  availability rows like `tick ✅ seit 2003-05-04` and `h4 ❌ Not found`.
+- Requested start dates are validated only against known timeframe-specific
+  genesis entries before the job starts.
 
 ### Example
 
@@ -212,7 +215,8 @@ python -m data_tools.migrate_csv --execute
 
 The FastAPI viewer uses these source names in `/api/data/download`:
 
-- `dukascopy` -> `python -m data_tools.downloaders.dukascopy_native`
+- `dukascopy` -> `python -m data_tools.downloaders.jforex_dl` with automatic fallback to `data_tools.downloaders.dukascopy_native`
+- `jforex` -> `python -m data_tools.downloaders.jforex_dl` with automatic fallback to `data_tools.downloaders.dukascopy_native`
 - `dolthub` -> `python -m data_tools.dolthub_manager update`
 - `yfinance` -> legacy source label; current repo data is populated via
   `data_tools.migrate_csv.py`, not a direct downloader module

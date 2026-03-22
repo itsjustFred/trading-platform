@@ -22,7 +22,12 @@ from pathlib import Path
 from pprint import pformat
 from typing import Any, Callable
 
-from openai import OpenAI
+try:
+    from openai import OpenAI
+except ModuleNotFoundError:  # pragma: no cover - optional dependency for agent mode
+    class OpenAI:  # type: ignore[no-redef]
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            raise ModuleNotFoundError("openai package is required for auto-agent execution")
 
 from data_tools.catalog_builder import scan_ohlcv
 from runner.cli import _detect_date_range

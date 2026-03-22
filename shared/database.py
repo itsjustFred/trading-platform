@@ -3,21 +3,29 @@ from __future__ import annotations
 import json
 import os
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator
 
 from dotenv import load_dotenv
-from sqlalchemy import Column, JSON, String, delete, select
-from sqlmodel import Field, Session, SQLModel, create_engine
+from sqlalchemy import JSON, Column, String, delete, text
+from sqlmodel import Field, Session, SQLModel, create_engine, select
 
 from shared.logging import get_logger
 from shared.models import (
     BacktestMeta,
     BacktestResult,
-    EquityPoint as EquityPointModel,
     IndicatorSeries,
+    LiveAccountConfig,
+    LiveBalanceRecord,
+    LiveDeploymentConfig,
+    LiveExecution,
+    LiveSignal,
     Trade,
     TradeExit,
+)
+from shared.models import (
+    EquityPoint as EquityPointModel,
 )
 
 logger = get_logger("database")
@@ -68,7 +76,9 @@ class TradeRecord(SQLModel, table=True):
     entry_time: str = Field(default="", index=True)
     entry_price: float = Field(default=0.0)
     quantity: float = Field(default=0.0)
-    exits: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON, nullable=False))
+    exits: list[dict[str, Any]] = Field(
+        default_factory=list, sa_column=Column(JSON, nullable=False)
+    )
     pnl: float = Field(default=0.0)
     pnl_pct: float | None = Field(default=None)
     fees: float | None = Field(default=None)
@@ -110,6 +120,168 @@ class IndicatorRecord(SQLModel, table=True):
     data: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))
 
 
+class LiveSignalModel(SQLModel, table=True):
+    __tablename__ = "live_signals"
+
+    id: str = Field(primary_key=True)
+    deployment_id: str = Field(index=True)
+    symbol: str = Field(index=True)
+    action: str = Field(index=True)
+    theoretical_price: float = Field(default=0.0)
+    timestamp: datetime = Field(index=True)
+    metadata_json: dict[str, Any] = Field(
+        default_factory=dict, sa_column=Column("metadata", JSON, nullable=False)
+    )
+
+    @classmethod
+    def from_live_signal(cls, signal: LiveSignal) -> "LiveSignalModel":
+        return cls(
+            id=str(signal.id),
+            deployment_id=signal.deployment_id,
+            symbol=signal.symbol,
+            action=signal.action,
+            theoretical_price=signal.theoretical_price,
+            timestamp=signal.timestamp,
+            metadata_json=signal.metadata,
+        )
+
+    def to_live_signal(self) -> LiveSignal:
+        return LiveSignal(
+            id=self.id,
+            deployment_id=self.deployment_id,
+            symbol=self.symbol,
+            action=self.action,
+            theoretical_price=self.theoretical_price,
+            timestamp=self.timestamp,
+            metadata=self.metadata_json or {},
+        )
+
+
+class LiveExecutionModel(SQLModel, table=True):
+    __tablename__ = "live_executions"
+
+    id: str = Field(primary_key=True)
+    signal_id: str = Field(foreign_key="live_signals.id", index=True)
+    actual_price: float = Field(default=0.0)
+    filled_qty: float = Field(default=0.0)
+    commission: float = Field(default=0.0)
+    timestamp: datetime = Field(index=True)
+    broker_order_id: str = Field(index=True)
+
+    @classmethod
+    def from_live_execution(cls, execution: LiveExecution) -> "LiveExecutionModel":
+        return cls(
+            id=str(execution.id),
+            signal_id=str(execution.signal_id),
+            actual_price=execution.actual_price,
+            filled_qty=execution.filled_qty,
+            commission=execution.commission,
+            timestamp=execution.timestamp,
+            broker_order_id=execution.broker_order_id,
+        )
+
+    def to_live_execution(self) -> LiveExecution:
+        return LiveExecution(
+            id=self.id,
+            signal_id=self.signal_id,
+            actual_price=self.actual_price,
+            filled_qty=self.filled_qty,
+            commission=self.commission,
+            timestamp=self.timestamp,
+            broker_order_id=self.broker_order_id,
+        )
+
+
+class LiveBalanceModel(SQLModel, table=True):
+    __tablename__ = "live_balances"
+
+    id: str = Field(primary_key=True)
+    account_id: str = Field(index=True)
+    timestamp: datetime = Field(index=True)
+    balance: float = Field(default=0.0)
+    equity: float = Field(default=0.0)
+
+    @classmethod
+    def from_live_balance(cls, record: LiveBalanceRecord) -> "LiveBalanceModel":
+        return cls(
+            id=str(record.id),
+            account_id=record.account_id,
+            timestamp=record.timestamp,
+            balance=record.balance,
+            equity=record.equity,
+        )
+
+    def to_live_balance(self) -> LiveBalanceRecord:
+        return LiveBalanceRecord(
+            id=self.id,
+            account_id=self.account_id,
+            timestamp=self.timestamp,
+            balance=self.balance,
+            equity=self.equity,
+        )
+
+
+class LiveAccountModel(SQLModel, table=True):
+    __tablename__ = "live_accounts"
+
+    id: str = Field(primary_key=True)
+    broker: str = Field(index=True)
+    name: str = Field(default="", index=True)
+
+    @classmethod
+    def from_live_account(cls, account: LiveAccountConfig) -> "LiveAccountModel":
+        return cls(id=account.id, broker=account.broker, name=account.name)
+
+    def to_live_account(self) -> LiveAccountConfig:
+        return LiveAccountConfig(id=self.id, broker=self.broker, name=self.name)
+
+
+class LiveDeploymentModel(SQLModel, table=True):
+    __tablename__ = "live_deployments"
+
+    id: str = Field(primary_key=True)
+    strategy_name: str = Field(index=True)
+    account_id: str = Field(foreign_key="live_accounts.id", index=True)
+    symbols_json: list[str] = Field(
+        default_factory=list,
+        sa_column=Column("symbols", JSON, nullable=False),
+    )
+    timeframe: str = Field(index=True)
+    status: str = Field(default="ACTIVE", index=True)
+    settings_json: dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column("settings", JSON, nullable=False),
+    )
+    created_at: datetime = Field(default_factory=datetime.utcnow, index=True)
+    updated_at: datetime = Field(default_factory=datetime.utcnow, index=True)
+
+    @classmethod
+    def from_live_deployment(cls, deployment: LiveDeploymentConfig) -> "LiveDeploymentModel":
+        now = datetime.utcnow()
+        return cls(
+            id=str(deployment.id),
+            strategy_name=deployment.strategy_name,
+            account_id=deployment.account_id,
+            symbols_json=deployment.symbols,
+            timeframe=deployment.timeframe,
+            status=deployment.status,
+            settings_json=deployment.settings or {},
+            created_at=now,
+            updated_at=now,
+        )
+
+    def to_live_deployment(self) -> LiveDeploymentConfig:
+        return LiveDeploymentConfig(
+            id=self.id,
+            strategy_name=self.strategy_name,
+            account_id=self.account_id,
+            symbols=self.symbols_json or [],
+            timeframe=self.timeframe,
+            status=self.status,
+            settings=self.settings_json or {},
+        )
+
+
 @contextmanager
 def get_session() -> Iterator[Session]:
     with Session(ENGINE) as session:
@@ -119,6 +291,230 @@ def get_session() -> Iterator[Session]:
 def init_db() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     SQLModel.metadata.create_all(ENGINE)
+    _migrate_live_deployments_table()
+
+
+def _migrate_live_deployments_table() -> None:
+    with ENGINE.begin() as connection:
+        rows = connection.execute(text("PRAGMA table_info('live_deployments')")).fetchall()
+        column_names = {str(row[1]) for row in rows}
+        if "settings" not in column_names:
+            connection.execute(
+                text(
+                    "ALTER TABLE live_deployments "
+                    "ADD COLUMN settings JSON NOT NULL DEFAULT '{}'"
+                )
+            )
+
+
+def save_live_signal(signal: LiveSignal) -> None:
+    init_db()
+    with get_session() as session:
+        session.merge(LiveSignalModel.from_live_signal(signal))
+        session.commit()
+
+
+def save_live_execution(execution: LiveExecution) -> None:
+    init_db()
+    with get_session() as session:
+        session.add(LiveExecutionModel.from_live_execution(execution))
+        session.commit()
+
+
+def save_live_balance(record: LiveBalanceRecord) -> None:
+    init_db()
+    with get_session() as session:
+        session.add(LiveBalanceModel.from_live_balance(record))
+        session.commit()
+
+
+def list_live_accounts() -> list[LiveAccountConfig]:
+    init_db()
+    with get_session() as session:
+        rows = session.exec(select(LiveAccountModel).order_by(LiveAccountModel.id.asc())).all()
+    return [row.to_live_account() for row in rows]
+
+
+def get_live_account(account_id: str) -> LiveAccountConfig | None:
+    init_db()
+    with get_session() as session:
+        row = session.get(LiveAccountModel, account_id)
+        if row is None:
+            return None
+    return row.to_live_account()
+
+
+def ensure_live_account(account_id: str, broker: str, *, name: str = "") -> LiveAccountConfig:
+    init_db()
+    with get_session() as session:
+        current = session.get(LiveAccountModel, account_id)
+        if current is None:
+            account = LiveAccountModel(id=account_id, broker=broker, name=name or account_id)
+            session.add(account)
+            session.commit()
+            session.refresh(account)
+            return account.to_live_account()
+
+        changed = False
+        if broker and current.broker != broker:
+            current.broker = broker
+            changed = True
+        if name and current.name != name:
+            current.name = name
+            changed = True
+        if changed:
+            session.add(current)
+            session.commit()
+            session.refresh(current)
+        return current.to_live_account()
+
+
+def upsert_live_accounts(accounts: list[LiveAccountConfig]) -> None:
+    init_db()
+    with get_session() as session:
+        for account in accounts:
+            current = session.get(LiveAccountModel, account.id)
+            if current is None:
+                session.add(LiveAccountModel.from_live_account(account))
+                continue
+            current.broker = account.broker
+            current.name = account.name
+            session.add(current)
+        session.commit()
+
+
+def list_live_deployments() -> list[LiveDeploymentConfig]:
+    init_db()
+    with get_session() as session:
+        rows = session.exec(
+            select(LiveDeploymentModel).order_by(
+                LiveDeploymentModel.created_at.desc(),
+                LiveDeploymentModel.id.desc(),
+            )
+        ).all()
+    return [row.to_live_deployment() for row in rows]
+
+
+def get_live_deployment(deployment_id: str) -> LiveDeploymentConfig | None:
+    init_db()
+    with get_session() as session:
+        row = session.get(LiveDeploymentModel, deployment_id)
+        if row is None:
+            return None
+    return row.to_live_deployment()
+
+
+def create_live_deployment(deployment: LiveDeploymentConfig) -> LiveDeploymentConfig:
+    init_db()
+    with get_session() as session:
+        account = session.get(LiveAccountModel, deployment.account_id)
+        if account is None:
+            raise ValueError(f"Unknown live account '{deployment.account_id}'")
+        deployment_status = str(deployment.status or "ACTIVE").upper()
+        if deployment_status not in {"ACTIVE", "PAUSED", "STOPPED"}:
+            raise ValueError(f"Invalid deployment status '{deployment.status}'")
+        record = LiveDeploymentModel.from_live_deployment(deployment)
+        record.status = deployment_status
+        session.add(record)
+        session.commit()
+        session.refresh(record)
+    return record.to_live_deployment()
+
+
+def update_live_deployment_status(
+    deployment_id: str, status: str
+) -> LiveDeploymentConfig | None:
+    next_status = str(status or "").upper()
+    if next_status not in {"ACTIVE", "PAUSED", "STOPPED"}:
+        raise ValueError(f"Invalid live deployment status '{status}'")
+    init_db()
+    with get_session() as session:
+        record = session.get(LiveDeploymentModel, deployment_id)
+        if record is None:
+            return None
+        record.status = next_status
+        record.updated_at = datetime.utcnow()
+        session.add(record)
+        session.commit()
+        session.refresh(record)
+    return record.to_live_deployment()
+
+
+def delete_live_deployment(deployment_id: str) -> bool:
+    init_db()
+    with get_session() as session:
+        record = session.get(LiveDeploymentModel, deployment_id)
+        if record is None:
+            return False
+        session.delete(record)
+        session.commit()
+    return True
+
+
+def list_live_deployments_for_account(account_id: str) -> list[LiveDeploymentConfig]:
+    init_db()
+    with get_session() as session:
+        rows = session.exec(
+            select(LiveDeploymentModel)
+            .where(LiveDeploymentModel.account_id == account_id)
+            .order_by(LiveDeploymentModel.created_at.desc(), LiveDeploymentModel.id.desc())
+        ).all()
+    return [row.to_live_deployment() for row in rows]
+
+
+def list_live_balances(account_id: str) -> list[LiveBalanceRecord]:
+    init_db()
+    with get_session() as session:
+        rows = session.exec(
+            select(LiveBalanceModel)
+            .where(LiveBalanceModel.account_id == account_id)
+            .order_by(LiveBalanceModel.timestamp.asc(), LiveBalanceModel.id.asc())
+        ).all()
+    return [row.to_live_balance() for row in rows]
+
+
+def list_live_signal_executions_for_deployments(
+    deployment_ids: list[str],
+) -> list[dict[str, Any]]:
+    normalized_ids = sorted({item.strip() for item in deployment_ids if item and item.strip()})
+    if not normalized_ids:
+        return []
+
+    init_db()
+    with get_session() as session:
+        rows = session.exec(
+            select(LiveSignalModel, LiveExecutionModel)
+            .join(LiveExecutionModel, LiveExecutionModel.signal_id == LiveSignalModel.id)
+            .where(LiveSignalModel.deployment_id.in_(normalized_ids))
+            .order_by(LiveExecutionModel.timestamp.desc(), LiveExecutionModel.id.desc())
+        ).all()
+
+    payload: list[dict[str, Any]] = []
+    for signal, execution in rows:
+        theoretical = float(signal.theoretical_price or 0.0)
+        actual = float(execution.actual_price or 0.0)
+        slippage = actual - theoretical
+        slippage_bps = 0.0 if theoretical == 0 else (slippage / theoretical) * 10000.0
+        payload.append(
+            {
+                "signal_id": signal.id,
+                "execution_id": execution.id,
+                "deployment_id": signal.deployment_id,
+                "symbol": signal.symbol,
+                "action": signal.action,
+                "theoretical_price": theoretical,
+                "actual_price": actual,
+                "slippage": slippage,
+                "slippage_bps": slippage_bps,
+                "filled_qty": float(execution.filled_qty or 0.0),
+                "commission": float(execution.commission or 0.0),
+                "signal_timestamp": signal.timestamp,
+                "execution_timestamp": execution.timestamp,
+                "broker_order_id": execution.broker_order_id,
+                "signal_metadata": signal.metadata_json or {},
+            }
+        )
+    return payload
 
 
 def save_result_to_sqlite(result: BacktestResult) -> None:
@@ -229,7 +625,9 @@ def migrate_json_to_sqlite() -> dict[str, int]:
 def list_backtest_ids() -> list[str]:
     init_db()
     with get_session() as session:
-        rows = session.exec(select(BacktestRecord.id).order_by(BacktestRecord.created_at.desc())).all()
+        rows = session.exec(
+            select(BacktestRecord.id).order_by(BacktestRecord.created_at.desc())
+        ).all()
     ids: list[str] = []
     for row in rows:
         if isinstance(row, str):

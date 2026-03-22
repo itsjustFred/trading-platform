@@ -10,8 +10,10 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 import traceback
 import uuid
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -32,6 +34,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import ValidationError
 from sqlmodel import SQLModel
+from starlette.middleware.gzip import GZipMiddleware
+
+from data_tools.catalog_builder import merge_ohlcv_entries
+from data_tools import cache_manager
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(PROJECT_ROOT / ".env")
@@ -56,12 +62,28 @@ os.environ.setdefault("LOG_DIR", str(LOG_DIR))
 from shared.logging import get_logger
 from shared.models import BacktestResult, EquityPoint
 from shared.database import (
+    create_live_deployment,
+    delete_live_deployment,
+    ensure_live_account,
+    get_live_account,
     init_db,
     list_backtest_ids,
+    list_live_accounts,
+    list_live_balances,
+    list_live_deployments,
+    list_live_deployments_for_account,
+    list_live_signal_executions_for_deployments,
     load_backtest_result,
     migrate_json_to_sqlite,
     save_result_to_sqlite,
+    update_live_deployment_status,
 )
+try:
+    from live_runner.account_discovery import discover_configured_accounts
+except ModuleNotFoundError:  # pragma: no cover - optional dependency for account discovery
+    async def discover_configured_accounts() -> list[dict[str, Any]]:
+        return []
+from shared.models import LiveDeploymentConfig, LiveDeploymentCreateRequest, LiveDeploymentStatusUpdateRequest
 from runner.capm import align_return_series, calculate_capm
 from shared.strategy_registry import (
     DEFAULT_STRATEGIES_DIR,
@@ -98,6 +120,7 @@ _running_jobs = legacy_viewer._running_jobs
 _refresh_catalog = legacy_viewer._refresh_catalog
 _start_data_task = legacy_viewer._start_data_task
 _start_dukascopy_task = legacy_viewer._start_dukascopy_task
+_start_jforex_task = legacy_viewer._start_jforex_task
 _create_task_record = legacy_viewer._create_task_record
 _set_task_status = legacy_viewer._set_task_status
 _update_task_progress = legacy_viewer._update_task_progress
@@ -141,7 +164,47 @@ _safe_int = legacy_viewer._safe_int
 init_db()
 migrate_json_to_sqlite()
 
-app = FastAPI(title="trading-platform viewer")
+async def _prewarm_data_views_background() -> None:
+    try:
+        await asyncio.to_thread(_prewarm_data_views_once)
+    except Exception as exc:
+        logger.warning("Data views prewarm failed: %s", exc)
+
+
+async def _prewarm_live_accounts_background() -> None:
+    try:
+        await asyncio.to_thread(_cached_live_accounts_payload, force_refresh=True)
+    except Exception as exc:
+        logger.warning("Live accounts prewarm failed: %s", exc)
+
+
+async def _prewarm_strategies_background() -> None:
+    try:
+        await asyncio.to_thread(_cached_strategies_payload, force_refresh=True)
+    except Exception as exc:
+        logger.warning("Strategies prewarm failed: %s", exc)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    data_views_prewarm_task = asyncio.create_task(_prewarm_data_views_background())
+    live_accounts_prewarm_task = asyncio.create_task(_prewarm_live_accounts_background())
+    strategies_prewarm_task = asyncio.create_task(_prewarm_strategies_background())
+    app.state.data_views_prewarm_task = data_views_prewarm_task
+    app.state.live_accounts_prewarm_task = live_accounts_prewarm_task
+    app.state.strategies_prewarm_task = strategies_prewarm_task
+    try:
+        yield
+    finally:
+        for task in (data_views_prewarm_task, live_accounts_prewarm_task, strategies_prewarm_task):
+            if not task.done():
+                task.cancel()
+        for task in (data_views_prewarm_task, live_accounts_prewarm_task, strategies_prewarm_task):
+            with suppress(asyncio.CancelledError):
+                await task
+
+
+app = FastAPI(title="trading-platform viewer", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -149,6 +212,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(GZipMiddleware, minimum_size=500)
 
 
 class SymbolsResponse(SQLModel):
@@ -245,6 +309,7 @@ class DataDownloadRequest(SQLModel):
     batch_size: int | None = None
     concurrency: int | None = None
     pause_ms: int = 1000
+    query_timeout_seconds: int = 900
 
 
 class DataResampleRequest(SQLModel):
@@ -338,6 +403,57 @@ def _task_action_payload(task_id: str) -> dict[str, Any]:
     return _serialize_task(task_id, task, include_log=True)
 
 
+_DATA_VIEWS_CACHE_LOCK = threading.RLock()
+_DATA_VIEWS_CACHE: dict[str, Any] = {
+    "key": None,
+    "overview_categories": [],
+    "category_symbols": {},
+    "symbols_payload": {"symbols": [], "categories": {}},
+}
+_DATA_VIEWS_PREWARM_DONE = False
+_LIVE_ACCOUNTS_CACHE_LOCK = threading.RLock()
+_LIVE_ACCOUNTS_CACHE: dict[str, Any] = {"expires_at": 0.0, "payload": [], "provider_marker": None}
+_LIVE_ACCOUNTS_CACHE_TTL_SECONDS = 30.0
+_STRATEGIES_CACHE_LOCK = threading.RLock()
+_STRATEGIES_CACHE: dict[str, Any] = {"expires_at": 0.0, "payload": []}
+_STRATEGIES_CACHE_TTL_SECONDS = 60.0
+
+_DATA_SYMBOL_METADATA_KEYS = {
+    "symbol",
+    "timeframe",
+    "path",
+    "size_mb",
+    "row_count",
+    "file_count",
+    "files",
+    "start",
+    "end",
+    "source",
+    "sources",
+    "asset_class",
+    "asset_classes",
+    "last_updated",
+    "validation",
+    "warning_message",
+    "validation_message",
+    "error",
+    "repo",
+    "segment_count",
+    "segments",
+}
+_DATA_SEGMENT_METADATA_KEYS = {
+    "path",
+    "start",
+    "end",
+    "rows",
+    "size_bytes",
+    "segment",
+    "last_updated",
+    "validation",
+    "error",
+}
+
+
 def _safe_float(value: object, default: float = 0.0) -> float:
     try:
         numeric = float(value)
@@ -346,6 +462,180 @@ def _safe_float(value: object, default: float = 0.0) -> float:
     if not math.isfinite(numeric):
         return default
     return numeric
+
+
+def _serialize_live_timestamp(value: datetime | str | None) -> tuple[str, float]:
+    if isinstance(value, datetime):
+        ts = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+    elif isinstance(value, str):
+        parsed = pd.to_datetime(value, utc=True, errors="coerce")
+        if pd.isna(parsed):
+            return "", 0.0
+        ts = parsed.to_pydatetime()
+    else:
+        return "", 0.0
+    return ts.isoformat(), float(ts.timestamp())
+
+
+def _serialize_live_account_payload(account: Any) -> dict[str, Any]:
+    return {"id": account.id, "broker": account.broker, "name": account.name}
+
+
+def _serialize_live_deployment_payload(deployment: LiveDeploymentConfig) -> dict[str, Any]:
+    return {
+        "id": str(deployment.id),
+        "strategy_name": deployment.strategy_name,
+        "account_id": deployment.account_id,
+        "symbols": deployment.symbols,
+        "timeframe": deployment.timeframe,
+        "status": deployment.status,
+        "settings": deployment.settings,
+    }
+
+
+def _discover_live_accounts_payload() -> list[dict[str, Any]]:
+    discovered = asyncio.run(discover_configured_accounts())
+    payload: list[dict[str, Any]] = []
+    for account in discovered:
+        if isinstance(account, dict):
+            account_id = str(account.get("id") or "").strip()
+            if not account_id:
+                continue
+            payload.append(
+                {
+                    "id": account_id,
+                    "name": str(account.get("name") or account_id),
+                    "broker": str(account.get("broker") or "unknown"),
+                    "balance": _safe_float(account.get("balance"), 0.0),
+                    "is_demo": bool(account.get("is_demo", False)),
+                }
+            )
+            continue
+        payload.append(
+            {
+                "id": account.id,
+                "name": account.name,
+                "broker": account.broker,
+                "balance": float(account.balance),
+                "is_demo": bool(account.is_demo),
+            }
+        )
+    return payload
+
+
+def _cached_live_accounts_payload(*, force_refresh: bool = False) -> list[dict[str, Any]]:
+    now = time.monotonic()
+    provider_marker = id(discover_configured_accounts)
+    with _LIVE_ACCOUNTS_CACHE_LOCK:
+        if (
+            not force_refresh
+            and now < float(_LIVE_ACCOUNTS_CACHE.get("expires_at", 0.0))
+            and _LIVE_ACCOUNTS_CACHE.get("provider_marker") == provider_marker
+        ):
+            cached = _LIVE_ACCOUNTS_CACHE.get("payload", [])
+            if isinstance(cached, list):
+                return [dict(item) for item in cached if isinstance(item, dict)]
+
+    payload = _discover_live_accounts_payload()
+    with _LIVE_ACCOUNTS_CACHE_LOCK:
+        _LIVE_ACCOUNTS_CACHE["payload"] = [dict(item) for item in payload]
+        _LIVE_ACCOUNTS_CACHE["expires_at"] = time.monotonic() + _LIVE_ACCOUNTS_CACHE_TTL_SECONDS
+        _LIVE_ACCOUNTS_CACHE["provider_marker"] = provider_marker
+        return [dict(item) for item in payload]
+
+
+def _list_strategies_payload() -> list[dict[str, Any]]:
+    strategies: list[dict[str, Any]] = []
+    if not DEFAULT_STRATEGIES_DIR.exists():
+        return strategies
+
+    for entry in _safe_strategy_entries():
+        try:
+            payload = legacy_viewer._strategy_payload(entry)
+            payload.pop("documentation_markdown", None)
+            payload.pop("backtests", None)
+            payload.pop("portfolios", None)
+            strategies.append(payload)
+        except Exception as exc:
+            logger.warning("Could not load strategy %s: %s", entry.relative_file, exc)
+
+    return strategies
+
+
+def _cached_strategies_payload(*, force_refresh: bool = False) -> list[dict[str, Any]]:
+    now = time.monotonic()
+    with _STRATEGIES_CACHE_LOCK:
+        if not force_refresh and now < float(_STRATEGIES_CACHE.get("expires_at", 0.0)):
+            cached = _STRATEGIES_CACHE.get("payload", [])
+            if isinstance(cached, list):
+                return [dict(item) for item in cached if isinstance(item, dict)]
+
+    payload = _list_strategies_payload()
+    with _STRATEGIES_CACHE_LOCK:
+        _STRATEGIES_CACHE["payload"] = [dict(item) for item in payload]
+        _STRATEGIES_CACHE["expires_at"] = time.monotonic() + _STRATEGIES_CACHE_TTL_SECONDS
+        return [dict(item) for item in payload]
+
+
+def _seed_default_live_accounts() -> None:
+    return
+
+
+def _deployment_ids_for_account(
+    account_id: str, deployments: list[LiveDeploymentConfig]
+) -> list[str]:
+    ids = {account_id}
+    for deployment in deployments:
+        ids.add(str(deployment.id))
+        strategy_name = str(deployment.strategy_name or "").strip()
+        if strategy_name:
+            ids.add(strategy_name)
+    return sorted(ids)
+
+
+def _ensure_live_account_for_deployment(account_id: str) -> dict[str, Any]:
+    existing_accounts = {account.id: account for account in list_live_accounts()}
+    current = existing_accounts.get(account_id)
+    if current is not None:
+        return _serialize_live_account_payload(current)
+
+    try:
+        discovered_payload = _cached_live_accounts_payload(force_refresh=True)
+    except Exception as exc:
+        logger.warning(
+            "Could not discover broker accounts while creating deployment",
+            extra={"data": {"account_id": account_id, "error": str(exc)}},
+        )
+        discovered_payload = []
+
+    discovered = next(
+        (
+            item
+            for item in discovered_payload
+            if str(item.get("id") or "").strip() == account_id
+        ),
+        None,
+    )
+    if isinstance(discovered, dict):
+        broker = str(discovered.get("broker") or "").strip().lower() or "unknown"
+        name = str(discovered.get("name") or "").strip() or account_id
+        account = ensure_live_account(
+            account_id,
+            broker,
+            name=name,
+        )
+        return _serialize_live_account_payload(account)
+
+    persisted = get_live_account(account_id)
+    if persisted is not None:
+        return _serialize_live_account_payload(persisted)
+
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            f"Unknown live account '{account_id}'. Select an account from /api/live/accounts."
+        ),
+    )
 
 
 def _ensure_equity_curve(result: BacktestResult, initial_capital: float) -> list[EquityPoint]:
@@ -527,12 +817,65 @@ def _infer_symbol_category(path_value: str, fallback_asset_class: str) -> str:
     return (fallback_asset_class or "other").lower()
 
 
-_TIMEFRAME_PATTERN = re.compile(r"^(?:tick|s1|mn1|\d+[smhdw])$", re.IGNORECASE)
+_TIMEFRAME_REGEX = r"(?:tick|mn1|(?:\d+)?(?:s|sec|m|min|h|d|w|mo)|[smhdw]\d+)"
+_TIMEFRAME_PATTERN = re.compile(rf"^{_TIMEFRAME_REGEX}$", re.IGNORECASE)
+_SEGMENTED_TIMEFRAME_PATTERN = re.compile(
+    rf"^(?P<timeframe>{_TIMEFRAME_REGEX})(?:[_-].+)$",
+    re.IGNORECASE,
+)
+_SYMBOL_PREFIXED_TIMEFRAME_PATTERN = re.compile(
+    rf"^(?P<symbol>.+?)[_-](?P<timeframe>{_TIMEFRAME_REGEX})(?:[_-](?P<segment>.+))?$",
+    re.IGNORECASE,
+)
 
 
 def _looks_like_timeframe(value: str) -> bool:
     normalized = str(value or "").strip().lower()
     return bool(normalized) and bool(_TIMEFRAME_PATTERN.match(normalized))
+
+
+def _extract_timeframe_and_segment(stem: str) -> tuple[str | None, str | None]:
+    normalized = str(stem or "").strip()
+    if not normalized:
+        return None, None
+    if _looks_like_timeframe(normalized):
+        return normalized.lower(), None
+
+    segmented_match = _SEGMENTED_TIMEFRAME_PATTERN.match(normalized)
+    if segmented_match is None:
+        return None, None
+
+    timeframe = str(segmented_match.group("timeframe") or "").lower()
+    separator_index = len(timeframe)
+    segment = (
+        normalized[separator_index + 1 :].strip()
+        if len(normalized) > separator_index + 1
+        else ""
+    )
+    return timeframe, (segment or None)
+
+
+def _extract_symbol_timeframe_and_segment(
+    stem: str,
+) -> tuple[str | None, str | None, str | None]:
+    normalized = str(stem or "").strip()
+    if not normalized:
+        return None, None, None
+
+    timeframe, segment = _extract_timeframe_and_segment(normalized)
+    if timeframe is not None:
+        return None, timeframe, segment
+
+    prefixed_match = _SYMBOL_PREFIXED_TIMEFRAME_PATTERN.match(normalized)
+    if prefixed_match is None:
+        return None, None, None
+
+    symbol = str(prefixed_match.group("symbol") or "").strip()
+    timeframe_value = str(prefixed_match.group("timeframe") or "").strip().lower()
+    segment_value = str(prefixed_match.group("segment") or "").strip()
+    if not symbol or not timeframe_value:
+        return None, None, None
+    return symbol, timeframe_value, (segment_value or None)
 
 
 def _format_catalog_date(value: object) -> str | None:
@@ -569,11 +912,27 @@ def _should_reuse_cached_parquet_entry(cached_entry: dict[str, Any] | None, file
 
 
 def _catalog_metadata_by_path(catalog_entries: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    return {
-        str(entry.get("path")): entry
-        for entry in catalog_entries
-        if isinstance(entry, dict) and entry.get("path")
-    }
+    metadata_by_path: dict[str, dict[str, Any]] = {}
+    for entry in catalog_entries:
+        if not isinstance(entry, dict):
+            continue
+
+        path_value = entry.get("path")
+        if path_value:
+            metadata_by_path[str(path_value)] = entry
+
+        segments = entry.get("segments")
+        if isinstance(segments, list):
+            for segment in segments:
+                if not isinstance(segment, dict):
+                    continue
+                segment_path = segment.get("path")
+                if not segment_path:
+                    continue
+                merged_segment_entry = dict(entry)
+                merged_segment_entry.update(segment)
+                metadata_by_path[str(segment_path)] = merged_segment_entry
+    return metadata_by_path
 
 
 def _read_row_group_stat(
@@ -643,36 +1002,53 @@ def _parse_ohlcv_path(parquet_path: Path, ohlcv_root: Path) -> dict[str, Any] | 
         return None
 
     parts = rel.parts
-    if len(parts) < 4:
+    if len(parts) < 3:
         return None
 
     source = parts[0]
     asset_class = parts[1]
     stem = parquet_path.stem
+    stem_symbol, timeframe, segment = _extract_symbol_timeframe_and_segment(stem)
     region: str | None = None
 
     if len(parts) >= 5:
         region = parts[-3]
         symbol = parts[-2]
-        timeframe = stem if _looks_like_timeframe(stem) else "1d"
-    else:
-        if _looks_like_timeframe(stem):
-            symbol = parts[-2]
-            timeframe = stem
+        timeframe_value = timeframe or "1d"
+    elif len(parts) == 4:
+        parent = parts[-2]
+        if timeframe:
+            timeframe_value = timeframe
+            if stem_symbol and stem_symbol.lower() != parent.lower():
+                region = parent
+                symbol = stem_symbol
+            else:
+                symbol = parent
         else:
-            region = parts[-2]
+            region = parent
             symbol = stem
-            timeframe = "1d"
+            timeframe_value = "1d"
+    else:
+        if timeframe and stem_symbol:
+            symbol = stem_symbol
+            timeframe_value = timeframe
+        elif timeframe:
+            return None
+        else:
+            symbol = stem
+            timeframe_value = "1d"
 
     entry: dict[str, Any] = {
         "source": source,
         "asset_class": asset_class,
         "symbol": symbol,
-        "timeframe": timeframe,
+        "timeframe": timeframe_value,
         "path": str(parquet_path),
     }
     if region:
         entry["region"] = region
+    if segment:
+        entry["segment"] = segment
     return entry
 
 
@@ -729,36 +1105,215 @@ def _scan_single_file_ohlcv_entries(
     return entries
 
 
-def _load_data_entries() -> list[dict[str, Any]]:
-    catalog_entries, _ = _load_catalog_ohlcv_entries()
-    metadata_by_path = _catalog_metadata_by_path(catalog_entries)
-    scanned_entries = _scan_single_file_ohlcv_entries(metadata_by_path)
+def _cached_catalog_ohlcv_entries() -> list[dict[str, Any]]:
+    try:
+        entries = cache_manager.get_catalog_ohlcv_entries(DATA_DIR, unsafe_no_copy=True)
+    except Exception as exc:
+        logger.warning("Catalog cache load failed, falling back to catalog/file scan: %s", exc)
+        entries = []
 
-    if scanned_entries:
-        for entry in scanned_entries:
-            catalog_entry = metadata_by_path.get(entry["path"])
-            if not isinstance(catalog_entry, dict):
-                continue
-            for key in (
-                "validation",
-                "error",
-                "warning_message",
-                "validation_message",
-                "last_updated",
-                "repo",
-            ):
-                if catalog_entry.get(key) is not None:
-                    entry[key] = catalog_entry.get(key)
-        return scanned_entries
+    if not isinstance(entries, list):
+        entries = []
 
-    fallback_entries: list[dict[str, Any]] = []
-    for entry in catalog_entries:
+    if not entries:
+        legacy_entries, used_legacy_catalog = _load_catalog_ohlcv_entries()
+        if used_legacy_catalog and isinstance(legacy_entries, list):
+            return [
+                dict(entry)
+                for entry in legacy_entries
+                if isinstance(entry, dict) and str(entry.get("path", "")).endswith(".parquet")
+            ]
+        return _scan_single_file_ohlcv_entries({})
+
+    include_last_updated = (DATA_DIR / "catalog.json").exists()
+    if include_last_updated:
+        normalized_entries = [
+            entry
+            for entry in entries
+            if isinstance(entry, dict) and str(entry.get("path", "")).endswith(".parquet")
+        ]
+        if normalized_entries:
+            return normalized_entries
+
+    normalized_entries: list[dict[str, Any]] = []
+    for entry in entries:
         if not isinstance(entry, dict):
             continue
-        path_value = str(entry.get("path", ""))
-        if path_value.endswith(".parquet"):
-            fallback_entries.append(dict(entry))
-    return fallback_entries
+        if not str(entry.get("path", "")).endswith(".parquet"):
+            continue
+        normalized = dict(entry)
+        normalized.pop("last_updated", None)
+        normalized_entries.append(normalized)
+    if normalized_entries:
+        return normalized_entries
+    return _scan_single_file_ohlcv_entries({})
+
+
+def _data_views_cache_key() -> tuple[Any, ...]:
+    catalog_path = DATA_DIR / "catalog.json"
+    if catalog_path.exists():
+        try:
+            stat = catalog_path.stat()
+            catalog_stamp: tuple[Any, ...] = (True, int(stat.st_mtime_ns), int(stat.st_size))
+        except OSError:
+            catalog_stamp = (True, None, None)
+    else:
+        catalog_stamp = (False, None, None)
+
+    try:
+        cache_stats = cache_manager.get_cache_stats()
+        cache_stamp = cache_stats.get("last_invalidation_at")
+    except Exception:
+        cache_stamp = None
+
+    return str(DATA_DIR), catalog_stamp, cache_stamp
+
+
+def _metadata_only_segment(segment: dict[str, Any]) -> dict[str, Any]:
+    return {key: segment[key] for key in _DATA_SEGMENT_METADATA_KEYS if key in segment}
+
+
+def _metadata_only_data_symbol(entry: dict[str, Any]) -> dict[str, Any]:
+    sanitized = {key: entry[key] for key in _DATA_SYMBOL_METADATA_KEYS if key in entry}
+    segments = sanitized.get("segments")
+    if isinstance(segments, list):
+        sanitized["segments"] = [
+            _metadata_only_segment(segment)
+            for segment in segments
+            if isinstance(segment, dict)
+        ]
+    return sanitized
+
+
+def _build_overview_categories(logical_entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    categories: dict[str, dict[str, Any]] = {}
+    for entry in logical_entries:
+        category = str(entry.get("category") or "Other")
+        bucket = categories.setdefault(
+            category,
+            {"count": 0, "size_bytes": 0, "symbols": set(), "start": None, "end": None},
+        )
+        bucket["count"] += 1
+        bucket["size_bytes"] += max(int(entry.get("size_bytes", 0) or 0), 0)
+        bucket["symbols"].add(entry.get("symbol"))
+
+        start_value = entry.get("start")
+        end_value = entry.get("end")
+        if start_value and (bucket["start"] is None or start_value < bucket["start"]):
+            bucket["start"] = start_value
+        if end_value and (bucket["end"] is None or end_value > bucket["end"]):
+            bucket["end"] = end_value
+
+    return [
+        {
+            "name": name,
+            "symbol_count": len(data["symbols"]),
+            "file_count": data["count"],
+            "total_size_mb": round(data["size_bytes"] / (1024 * 1024), 2),
+            "start": data["start"],
+            "end": data["end"],
+        }
+        for name, data in sorted(categories.items())
+    ]
+
+
+def _build_symbols_payload(entries: list[dict[str, Any]]) -> dict[str, Any]:
+    categories: dict[str, list[str]] = {}
+    seen: set[str] = set()
+
+    for dataset in entries:
+        symbol = str(dataset.get("symbol", "") or "")
+        if not symbol or symbol in seen:
+            continue
+
+        seen.add(symbol)
+        category = _infer_symbol_category(
+            str(dataset.get("path", "") or ""),
+            str(dataset.get("asset_class", "other") or "other"),
+        )
+        categories.setdefault(category, []).append(symbol)
+
+    for category in categories:
+        categories[category].sort()
+
+    return {"symbols": sorted(seen), "categories": categories}
+
+
+def _invalidate_data_views_cache() -> None:
+    with _DATA_VIEWS_CACHE_LOCK:
+        _DATA_VIEWS_CACHE["key"] = None
+        _DATA_VIEWS_CACHE["overview_categories"] = []
+        _DATA_VIEWS_CACHE["category_symbols"] = {}
+        _DATA_VIEWS_CACHE["symbols_payload"] = {"symbols": [], "categories": {}}
+
+
+def _get_data_views() -> dict[str, Any]:
+    key = _data_views_cache_key()
+    with _DATA_VIEWS_CACHE_LOCK:
+        if _DATA_VIEWS_CACHE.get("key") == key:
+            return _DATA_VIEWS_CACHE
+
+    entries = _cached_catalog_ohlcv_entries()
+    logical_entries = _aggregate_symbol_timeframe_entries(
+        entries,
+        include_category=True,
+        include_size_bytes=True,
+    )
+    category_symbols: dict[str, list[dict[str, Any]]] = {}
+    for entry in logical_entries:
+        category_key = str(entry.get("category") or "Other").lower()
+        category_symbols.setdefault(category_key, []).append(
+            _metadata_only_data_symbol(
+                {k: v for k, v in entry.items() if k not in {"category", "size_bytes"}}
+            )
+        )
+
+    computed = {
+        "key": key,
+        "overview_categories": _build_overview_categories(logical_entries),
+        "category_symbols": category_symbols,
+        "symbols_payload": _build_symbols_payload(logical_entries),
+    }
+
+    with _DATA_VIEWS_CACHE_LOCK:
+        _DATA_VIEWS_CACHE.update(computed)
+        return _DATA_VIEWS_CACHE
+
+
+def _prewarm_data_views_once() -> None:
+    global _DATA_VIEWS_PREWARM_DONE
+    with _DATA_VIEWS_CACHE_LOCK:
+        if _DATA_VIEWS_PREWARM_DONE:
+            return
+
+    try:
+        _get_data_views()
+    except Exception as exc:
+        logger.warning("Data views prewarm failed: %s", exc)
+        return
+
+    with _DATA_VIEWS_CACHE_LOCK:
+        _DATA_VIEWS_PREWARM_DONE = True
+
+
+def _needs_data_views_cache(path: str) -> bool:
+    if path == "/api/data/overview":
+        return True
+    if path.startswith("/api/data/category/"):
+        return True
+    return path == "/api/symbols"
+
+
+@app.middleware("http")
+async def data_views_prewarm_middleware(request: Request, call_next):
+    if request.method in {"GET", "HEAD"} and _needs_data_views_cache(request.url.path):
+        prewarm_task = getattr(request.app.state, "data_views_prewarm_task", None)
+        if isinstance(prewarm_task, asyncio.Task) and not prewarm_task.done():
+            with suppress(asyncio.CancelledError):
+                await asyncio.shield(prewarm_task)
+        elif not _DATA_VIEWS_PREWARM_DONE:
+            await asyncio.to_thread(_prewarm_data_views_once)
+    return await call_next(request)
 
 
 def _merge_timeframe_entry_dates(current: str | None, candidate: Any, *, latest: bool) -> str | None:
@@ -808,131 +1363,94 @@ def _aggregate_symbol_timeframe_entries(
     include_category: bool = False,
     include_size_bytes: bool = False,
 ) -> list[dict[str, Any]]:
-    grouped: dict[tuple[str, ...], dict[str, Any]] = {}
-
-    for entry in entries:
-        symbol = str(entry.get("symbol") or "Unknown")
-        timeframe = str(entry.get("timeframe") or "unknown")
+    logical_entries: list[dict[str, Any]] = []
+    merged_entries = merge_ohlcv_entries([entry for entry in entries if isinstance(entry, dict)])
+    for entry in merged_entries:
         path_value = str(entry.get("path") or "")
         category = _categorize_path(path_value) if include_category else ""
-        key = (category, symbol, timeframe) if include_category else (symbol, timeframe)
-
-        aggregate = grouped.setdefault(
-            key,
-            {
-                "category": category,
-                "symbol": symbol,
-                "timeframe": timeframe,
-                "paths": set(),
-                "sources": set(),
-                "size_bytes": 0,
-                "start": None,
-                "end": None,
-                "warning_messages": set(),
-                "errors": set(),
-                "validation_seen": False,
-                "validation_status": "ok",
-                "validation_payload": None,
-                "repo": False,
-                "last_updated": None,
-            },
-        )
-
-        if path_value:
-            aggregate["paths"].add(path_value)
-
-        source_value = str(entry.get("source") or "").strip()
-        if source_value:
-            aggregate["sources"].add(source_value)
-
-        aggregate["size_bytes"] += _entry_size_bytes(entry)
-        aggregate["start"] = _merge_timeframe_entry_dates(
-            aggregate["start"], entry.get("start"), latest=False
-        )
-        aggregate["end"] = _merge_timeframe_entry_dates(
-            aggregate["end"], entry.get("end"), latest=True
-        )
-
+        start_value = entry.get("start") or entry.get("start_date")
+        end_value = entry.get("end") or entry.get("end_date")
+        size_bytes = _entry_size_bytes(entry)
         warning_message = _warning_message_from_entry(entry)
-        if warning_message:
-            aggregate["warning_messages"].add(str(warning_message))
-            if aggregate["validation_status"] == "ok":
-                aggregate["validation_status"] = "warning"
+        error_message = str(entry.get("error") or "").strip() or None
 
-        error_message = str(entry.get("error") or "").strip()
-        if error_message:
-            aggregate["errors"].add(error_message)
-            if aggregate["validation_status"] == "ok":
-                aggregate["validation_status"] = "warning"
+        row_count_raw = entry.get("row_count", entry.get("rows"))
+        try:
+            row_count = int(row_count_raw) if row_count_raw is not None else None
+        except (TypeError, ValueError):
+            row_count = None
 
-        validation_value = entry.get("validation")
-        if isinstance(validation_value, dict):
-            status = str(validation_value.get("status") or "").strip().lower()
-            if status:
-                aggregate["validation_seen"] = True
-                if status == "error":
-                    aggregate["validation_status"] = "error"
-                elif status != "ok" and aggregate["validation_status"] == "ok":
-                    aggregate["validation_status"] = status
-            if aggregate["validation_payload"] is None:
-                aggregate["validation_payload"] = dict(validation_value)
-            else:
-                existing_validation = aggregate["validation_payload"]
-                if isinstance(existing_validation, dict):
-                    for key, value in validation_value.items():
-                        if key not in existing_validation:
-                            existing_validation[key] = value
+        files = [
+            str(file_path).strip()
+            for file_path in (entry.get("files") if isinstance(entry.get("files"), list) else [])
+            if str(file_path).strip()
+        ]
+        if not files and path_value:
+            files = [path_value]
 
-        if entry.get("repo"):
-            aggregate["repo"] = True
+        source_values = [
+            str(item).strip()
+            for item in (entry.get("sources") if isinstance(entry.get("sources"), list) else [])
+            if str(item).strip()
+        ]
 
-        last_updated = str(entry.get("last_updated") or "").strip()
-        if last_updated and (
-            aggregate["last_updated"] is None or last_updated > aggregate["last_updated"]
-        ):
-            aggregate["last_updated"] = last_updated
-
-    logical_entries: list[dict[str, Any]] = []
-    for aggregate in grouped.values():
-        warning_message = (
-            " | ".join(sorted(aggregate["warning_messages"]))
-            if aggregate["warning_messages"]
-            else None
-        )
-        error_message = " | ".join(sorted(aggregate["errors"])) if aggregate["errors"] else None
-        source_values = sorted(aggregate["sources"])
         output_entry: dict[str, Any] = {
-            "symbol": aggregate["symbol"],
-            "timeframe": aggregate["timeframe"],
-            "path": _canonical_timeframe_path(aggregate["paths"], aggregate["timeframe"]),
-            "size_mb": round(aggregate["size_bytes"] / (1024 * 1024), 2),
-            "start": aggregate["start"],
-            "end": aggregate["end"],
-            "source": source_values[0] if source_values else "",
+            "symbol": str(entry.get("symbol") or "Unknown"),
+            "timeframe": str(entry.get("timeframe") or "unknown"),
+            "path": path_value,
+            "size_mb": round(size_bytes / (1024 * 1024), 2),
+            "start": start_value,
+            "end": end_value,
+            "start_date": start_value,
+            "end_date": end_value,
+            "source": str(entry.get("source") or ""),
+            "files": files,
+            "file_count": len(files),
         }
+        if row_count is not None:
+            output_entry["row_count"] = row_count
+        if source_values:
+            output_entry["sources"] = sorted(set(source_values))
         if include_size_bytes:
-            output_entry["size_bytes"] = aggregate["size_bytes"]
+            output_entry["size_bytes"] = size_bytes
 
         if include_category:
-            output_entry["category"] = aggregate["category"]
+            output_entry["category"] = category
 
-        if aggregate["validation_seen"] or warning_message or error_message:
-            validation_payload = aggregate.get("validation_payload")
-            if isinstance(validation_payload, dict):
-                normalized_validation = dict(validation_payload)
-                normalized_validation["status"] = aggregate["validation_status"]
-                output_entry["validation"] = normalized_validation
-            else:
-                output_entry["validation"] = {"status": aggregate["validation_status"]}
+        validation_payload = entry.get("validation")
+        if isinstance(validation_payload, dict) or warning_message or error_message:
+            normalized_validation = dict(validation_payload) if isinstance(validation_payload, dict) else {}
+            status = str(normalized_validation.get("status") or "").strip().lower()
+            if status not in {"ok", "warning", "error"}:
+                status = "ok"
+            if status == "ok" and (warning_message or error_message):
+                status = "warning"
+            normalized_validation["status"] = status
+            output_entry["validation"] = normalized_validation
         if warning_message:
             output_entry["warning_message"] = warning_message
             output_entry["validation_message"] = warning_message
         if error_message:
             output_entry["error"] = error_message
-        if aggregate["repo"]:
+        if entry.get("repo"):
             output_entry["repo"] = True
-        if aggregate["last_updated"] is not None:
-            output_entry["last_updated"] = aggregate["last_updated"]
+        if entry.get("last_updated") is not None:
+            output_entry["last_updated"] = entry.get("last_updated")
+
+        segment_entries = sorted(
+            [
+                segment
+                for segment in (entry.get("segments") if isinstance(entry.get("segments"), list) else [])
+                if isinstance(segment, dict)
+            ],
+            key=lambda segment: str(segment.get("path") or ""),
+        )
+        include_segments = len(segment_entries) > 1 or any(
+            str(segment.get("segment") or "").strip() for segment in segment_entries
+        )
+        if include_segments:
+            output_entry["segments"] = segment_entries
+            output_entry["segment_count"] = len(segment_entries)
 
         logical_entries.append(output_entry)
 
@@ -941,6 +1459,8 @@ def _aggregate_symbol_timeframe_entries(
             str(item.get("category") or ""),
             str(item.get("symbol") or ""),
             str(item.get("timeframe") or ""),
+            str(item.get("source") or ""),
+            str(item.get("path") or ""),
         )
     )
     return logical_entries
@@ -948,21 +1468,7 @@ def _aggregate_symbol_timeframe_entries(
 
 @app.get("/api/strategies", response_model=list[dict[str, Any]])
 async def list_strategies() -> list[dict[str, Any]]:
-    strategies: list[dict[str, Any]] = []
-    if not DEFAULT_STRATEGIES_DIR.exists():
-        return strategies
-
-    for entry in _safe_strategy_entries():
-        try:
-            payload = legacy_viewer._strategy_payload(entry)
-            payload.pop("documentation_markdown", None)
-            payload.pop("backtests", None)
-            payload.pop("portfolios", None)
-            strategies.append(payload)
-        except Exception as exc:
-            logger.warning("Could not load strategy %s: %s", entry.relative_file, exc)
-
-    return strategies
+    return await asyncio.to_thread(_cached_strategies_payload)
 
 
 @app.get("/api/strategies/{name:path}", response_model=dict[str, Any])
@@ -2025,60 +2531,138 @@ async def delete_portfolio(portfolio_id: str) -> dict[str, Any]:
     return {"status": "deleted"}
 
 
+@app.get("/api/live/accounts", response_model=list[dict[str, Any]])
+async def get_live_accounts() -> list[dict[str, Any]]:
+    return await asyncio.to_thread(_cached_live_accounts_payload)
+
+
+@app.get("/api/live/deployments", response_model=list[dict[str, Any]])
+async def get_live_deployments() -> list[dict[str, Any]]:
+    deployments = await asyncio.to_thread(list_live_deployments)
+    return [_serialize_live_deployment_payload(deployment) for deployment in deployments]
+
+
+@app.post("/api/live/deployments", response_model=dict[str, Any], status_code=201)
+async def create_live_deployment_endpoint(
+    payload: LiveDeploymentCreateRequest,
+) -> dict[str, Any]:
+    account_payload = await asyncio.to_thread(_ensure_live_account_for_deployment, payload.account_id)
+    inferred_broker = str(account_payload.get("broker", "")).strip().lower()
+    if inferred_broker not in {"alpaca", "ctrader"}:
+        raise HTTPException(status_code=400, detail="Unknown broker for account")
+    deployment = LiveDeploymentConfig(
+        strategy_name=payload.strategy_name,
+        account_id=payload.account_id,
+        symbols=payload.symbols,
+        timeframe=payload.timeframe,
+        status="ACTIVE",
+        settings=payload.settings or {},
+    )
+    try:
+        created = await asyncio.to_thread(create_live_deployment, deployment)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _serialize_live_deployment_payload(created)
+
+
+@app.put("/api/live/deployments/{deployment_id}/status", response_model=dict[str, Any])
+async def update_live_deployment_status_endpoint(
+    deployment_id: str, payload: LiveDeploymentStatusUpdateRequest
+) -> dict[str, Any]:
+    try:
+        updated = await asyncio.to_thread(
+            update_live_deployment_status, deployment_id, payload.status
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Live deployment not found")
+    return _serialize_live_deployment_payload(updated)
+
+
+@app.delete("/api/live/deployments/{deployment_id}", response_model=dict[str, Any])
+async def delete_live_deployment_endpoint(deployment_id: str) -> dict[str, Any]:
+    deleted = await asyncio.to_thread(delete_live_deployment, deployment_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Live deployment not found")
+    return {"status": "deleted", "id": deployment_id}
+
+
+@app.get("/api/live/balances/{account_id}", response_model=dict[str, Any])
+async def get_live_balances(account_id: str) -> dict[str, Any]:
+    records = await asyncio.to_thread(list_live_balances, account_id)
+    series: list[dict[str, Any]] = []
+    for record in records:
+        iso_ts, unix_ts = _serialize_live_timestamp(record.timestamp)
+        series.append(
+            {
+                "id": str(record.id),
+                "account_id": record.account_id,
+                "timestamp": iso_ts,
+                "time": unix_ts,
+                "balance": float(record.balance),
+                "equity": float(record.equity),
+            }
+        )
+    return {"account_id": account_id, "series": series}
+
+
+@app.get("/api/live/trades/{account_id}", response_model=dict[str, Any])
+async def get_live_trades(account_id: str) -> dict[str, Any]:
+    deployments = await asyncio.to_thread(list_live_deployments_for_account, account_id)
+    deployment_ids = _deployment_ids_for_account(account_id, deployments)
+    rows = await asyncio.to_thread(list_live_signal_executions_for_deployments, deployment_ids)
+
+    trades: list[dict[str, Any]] = []
+    for row in rows:
+        signal_iso, signal_unix = _serialize_live_timestamp(row.get("signal_timestamp"))
+        execution_iso, execution_unix = _serialize_live_timestamp(row.get("execution_timestamp"))
+        trades.append(
+            {
+                "signal_id": str(row.get("signal_id", "")),
+                "execution_id": str(row.get("execution_id", "")),
+                "deployment_id": row.get("deployment_id", ""),
+                "account_id": account_id,
+                "symbol": row.get("symbol", ""),
+                "action": row.get("action", ""),
+                "theoretical_price": float(row.get("theoretical_price", 0.0)),
+                "actual_price": float(row.get("actual_price", 0.0)),
+                "slippage": float(row.get("slippage", 0.0)),
+                "slippage_bps": float(row.get("slippage_bps", 0.0)),
+                "filled_qty": float(row.get("filled_qty", 0.0)),
+                "commission": float(row.get("commission", 0.0)),
+                "signal_timestamp": signal_iso,
+                "signal_time": signal_unix,
+                "execution_timestamp": execution_iso,
+                "execution_time": execution_unix,
+                "broker_order_id": row.get("broker_order_id", ""),
+                "signal_metadata": row.get("signal_metadata", {}),
+            }
+        )
+    return {"account_id": account_id, "deployment_ids": deployment_ids, "trades": trades}
+
+
 @app.get("/api/data/overview", response_model=dict[str, Any])
 async def data_overview() -> dict[str, Any]:
-    all_entries = _load_data_entries()
-    logical_entries = _aggregate_symbol_timeframe_entries(
-        all_entries,
-        include_category=True,
-        include_size_bytes=True,
-    )
-
-    categories: dict[str, dict[str, Any]] = {}
-    for entry in logical_entries:
-        category = str(entry.get("category") or "Other")
-        categories.setdefault(
-            category,
-            {"count": 0, "size_bytes": 0, "symbols": set(), "start": None, "end": None},
-        )
-        categories[category]["count"] += 1
-
-        size = int(entry.get("size_bytes", 0) or 0)
-        categories[category]["size_bytes"] += max(size, 0)
-        categories[category]["symbols"].add(entry.get("symbol"))
-
-        start_value = entry.get("start")
-        end_value = entry.get("end")
-        if start_value and (
-            categories[category]["start"] is None or start_value < categories[category]["start"]
-        ):
-            categories[category]["start"] = start_value
-        if end_value and (categories[category]["end"] is None or end_value > categories[category]["end"]):
-            categories[category]["end"] = end_value
+    data_views = _get_data_views()
+    result = [dict(item) for item in data_views.get("overview_categories", [])]
 
     dolthub_repos = _scan_dolthub_repos()
     if dolthub_repos:
-        categories["Dolthub Repos"] = {
-            "count": len(dolthub_repos),
-            "size_bytes": sum(repo.get("size_bytes", 0) for repo in dolthub_repos),
-            "symbols": {repo.get("repo") for repo in dolthub_repos},
-            "start": None,
-            "end": None,
-        }
-
-    result: list[dict[str, Any]] = []
-    for name, data in sorted(categories.items()):
         result.append(
             {
-                "name": name,
-                "symbol_count": len(data["symbols"]),
-                "file_count": data["count"],
-                "total_size_mb": round(data["size_bytes"] / (1024 * 1024), 2),
-                "start": data["start"],
-                "end": data["end"],
+                "name": "Dolthub Repos",
+                "symbol_count": len({repo.get("repo") for repo in dolthub_repos}),
+                "file_count": len(dolthub_repos),
+                "total_size_mb": round(
+                    sum(repo.get("size_bytes", 0) for repo in dolthub_repos) / (1024 * 1024), 2
+                ),
+                "start": None,
+                "end": None,
             }
         )
-    return {"categories": result}
+
+    return {"categories": sorted(result, key=lambda item: str(item.get("name") or ""))}
 
 
 @app.get("/api/data/category/{category_name}", response_model=dict[str, Any])
@@ -2104,15 +2688,18 @@ async def data_category_details(category_name: str) -> dict[str, Any]:
                     "validation_message": validation_message,
                 }
             )
-        return {"symbols": sorted(repos, key=lambda item: item["symbol"] or "")}
+        return {
+            "symbols": [
+                _metadata_only_data_symbol(repo)
+                for repo in sorted(repos, key=lambda item: item["symbol"] or "")
+            ]
+        }
 
-    all_entries = _load_data_entries()
-    category_entries = [
-        entry
-        for entry in all_entries
-        if _categorize_path(str(entry.get("path", ""))).lower() == target
+    data_views = _get_data_views()
+    symbols = [
+        _metadata_only_data_symbol(item)
+        for item in data_views.get("category_symbols", {}).get(target, [])
     ]
-    symbols = _aggregate_symbol_timeframe_entries(category_entries)
 
     return {
         "symbols": sorted(
@@ -2122,9 +2709,20 @@ async def data_category_details(category_name: str) -> dict[str, Any]:
     }
 
 
+@app.post("/api/data/cache/invalidate", response_model=dict[str, Any])
+async def invalidate_data_cache(
+    reason: str = Query(default="manual"),
+    include_validation: bool | None = Query(default=None),
+) -> dict[str, Any]:
+    return _manual_cache_invalidation_payload(
+        reason=reason,
+        include_validation=include_validation,
+    )
+
+
 @app.post("/api/data/download", response_model=dict[str, Any])
 async def data_download(payload: DataDownloadRequest) -> dict[str, Any]:
-    source = payload.source
+    source = str(payload.source or "dukascopy").strip().lower()
     symbols = payload.symbols
     timeframes = payload.timeframes
     start = payload.start
@@ -2134,6 +2732,7 @@ async def data_download(payload: DataDownloadRequest) -> dict[str, Any]:
     merge_s1 = bool(payload.merge_s1 or payload.merge_bid_ask)
     batch_size = _safe_int(payload.batch_size if payload.batch_size is not None else payload.concurrency, 10)
     pause_ms = _safe_int(payload.pause_ms, 1000)
+    query_timeout_seconds = _safe_int(payload.query_timeout_seconds, 900)
     symbol_list = _parse_symbol_list(symbols)
     timeframe_list = [
         _normalize_dukascopy_genesis_timeframe(timeframe)
@@ -2144,14 +2743,18 @@ async def data_download(payload: DataDownloadRequest) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="batch_size must be between 1 and 50")
     if pause_ms < 0 or pause_ms > 60000:
         raise HTTPException(status_code=400, detail="pause_ms must be between 0 and 60000")
+    if source in {"dukascopy", "jforex"} and (
+        query_timeout_seconds < 30 or query_timeout_seconds > 7200
+    ):
+        raise HTTPException(status_code=400, detail="query_timeout_seconds must be between 30 and 7200")
 
-    if source == "dukascopy" and start:
+    if source in {"dukascopy", "jforex"} and start:
         genesis_index = _load_dukascopy_genesis()
         too_early: dict[str, str] = {}
         for symbol in symbol_list:
             symbol_data = genesis_index.get(symbol, {})
             for timeframe in timeframe_list:
-                genesis = symbol_data.get(timeframe) or symbol_data.get("default")
+                genesis = symbol_data.get(timeframe)
                 if genesis and start < genesis:
                     too_early[f"{symbol}/{timeframe}"] = genesis
         if too_early:
@@ -2166,20 +2769,18 @@ async def data_download(payload: DataDownloadRequest) -> dict[str, Any]:
     task_id = str(uuid.uuid4())
     name, description = _download_task_labels(source, symbol_list, timeframe_list)
 
-    if source == "dukascopy":
+    if source in {"dukascopy", "jforex"}:
         cmd = [
             sys.executable,
             "-u",
             "-m",
-            "data_tools.downloaders.dukascopy_native",
+            "data_tools.downloaders.jforex_dl",
             "--symbols",
             symbols,
             "--timeframes",
             timeframes,
-            "--batch-size",
-            str(batch_size),
-            "--pause-ms",
-            str(pause_ms),
+            "--query-timeout-seconds",
+            str(query_timeout_seconds),
         ]
         if start:
             cmd.extend(["--start", start])
@@ -2187,15 +2788,12 @@ async def data_download(payload: DataDownloadRequest) -> dict[str, Any]:
             cmd.extend(["--end", end])
         if price_type:
             cmd.extend(["--price-type", str(price_type)])
-        if merge_tick:
-            cmd.append("--merge-tick")
-        if merge_s1:
-            cmd.append("--merge-s1")
 
         total_items = max(len(symbol_list) * len(timeframe_list), 1)
-        return _start_dukascopy_task(
+        return _start_jforex_task(
             task_id,
             cmd,
+            source_label=source,
             symbols=symbol_list,
             timeframes=timeframe_list,
             start=start or None,
@@ -2205,6 +2803,7 @@ async def data_download(payload: DataDownloadRequest) -> dict[str, Any]:
             merge_s1=merge_s1,
             batch_size=batch_size,
             pause_ms=pause_ms,
+            query_timeout_seconds=query_timeout_seconds,
             total_items=total_items,
             name=name,
             description=description,
@@ -2233,6 +2832,26 @@ async def data_download(payload: DataDownloadRequest) -> dict[str, Any]:
         description=description,
         source=source,
     )
+
+
+def _manual_cache_invalidation_payload(
+    *,
+    reason: str,
+    include_validation: bool | None = None,
+) -> dict[str, Any]:
+    removed_entries = cache_manager.invalidate_cache(
+        DATA_DIR,
+        include_validation=include_validation,
+        reason=reason,
+    )
+    _invalidate_data_views_cache()
+    return {
+        "status": "ok",
+        "removed_entries": removed_entries,
+        "reason": reason,
+        "include_validation": include_validation,
+        "cache_stats": cache_manager.get_cache_stats(),
+    }
 
 
 @app.post("/api/agent/convert", response_model=dict[str, Any], status_code=202)
@@ -2275,15 +2894,14 @@ async def get_dukascopy_genesis(
     requested_symbols = _parse_symbol_list(symbols)
     requested_timeframes = _parse_timeframe_list(timeframes)
     genesis_index = _load_dukascopy_genesis()
-    filtered_genesis, lower_bound = _collect_dukascopy_genesis(
+    coverage = _collect_dukascopy_genesis(
         genesis_index,
         symbols=requested_symbols or None,
         timeframes=requested_timeframes or None,
     )
     return {
         "source": "dukascopy",
-        "genesis": filtered_genesis,
-        "lower_bound": lower_bound,
+        "coverage": coverage,
     }
 
 
@@ -2539,6 +3157,8 @@ async def delete_symbol_data(path: str = Query(default="")) -> dict[str, Any]:
 
     try:
         file_path.unlink()
+        cache_manager.invalidate_cache(DATA_DIR, reason="manual")
+        _invalidate_data_views_cache()
         _refresh_catalog()
         return {"status": "deleted"}
     except (FileNotFoundError, OSError) as exc:
@@ -2624,27 +3244,11 @@ async def get_log(
 
 @app.get("/api/symbols", response_model=SymbolsResponse)
 async def list_symbols() -> SymbolsResponse:
-    datasets = _load_data_entries()
-    if not datasets:
-        return SymbolsResponse(symbols=[], categories={})
-
-    categories: dict[str, list[str]] = {}
-    seen: set[str] = set()
-    for dataset in datasets:
-        symbol = str(dataset.get("symbol", "") or "")
-        if not symbol or symbol in seen:
-            continue
-
-        seen.add(symbol)
-        category = _infer_symbol_category(
-            str(dataset.get("path", "") or ""), str(dataset.get("asset_class", "other") or "other")
-        )
-        categories.setdefault(category, []).append(symbol)
-
-    for category in categories:
-        categories[category].sort()
-
-    return SymbolsResponse(symbols=sorted(seen), categories=categories)
+    payload = _get_data_views().get("symbols_payload", {"symbols": [], "categories": {}})
+    return SymbolsResponse(
+        symbols=list(payload.get("symbols", [])),
+        categories=dict(payload.get("categories", {})),
+    )
 
 
 @app.get("/api/benchmark/{symbol}", response_model=BenchmarkResponse)

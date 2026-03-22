@@ -10,6 +10,7 @@ import {
 } from "lucide-react";
 
 import { downloadData, getDukascopyGenesis } from "../api/client";
+import type { DukascopyGenesisResponse } from "../api/types";
 import { LiveTerminal } from "./LiveTerminal";
 import { Modal } from "./Modal";
 import { useToast } from "./ToastProvider";
@@ -93,6 +94,40 @@ function normalizeGenesisTimeframe(timeframe: string): string {
   return aliases[normalized] ?? normalized;
 }
 
+type DukascopyCoverageMap = DukascopyGenesisResponse["coverage"];
+
+interface DukascopyTimeframeCoverageRow {
+  timeframe: string;
+  available: boolean;
+  availableCount: number;
+  symbolCount: number;
+  start: string | null;
+  missingSymbols: string[];
+}
+
+function formatMissingSymbols(symbols: string[]): string {
+  if (symbols.length <= 3) {
+    return symbols.join(", ");
+  }
+  return `${symbols.slice(0, 3).join(", ")} +${symbols.length - 3} more`;
+}
+
+function formatCoverageTimeframe(timeframe: string): string {
+  const labels: Record<string, string> = {
+    tick: "tick",
+    s1: "1s",
+    m1: "1m",
+    m5: "5m",
+    m15: "15m",
+    m30: "30m",
+    h1: "1h",
+    h4: "4h",
+    d1: "1d",
+    mn1: "1mn",
+  };
+  return labels[timeframe] ?? timeframe;
+}
+
 interface DownloadModalProps {
   open: boolean;
   onClose: () => void;
@@ -137,9 +172,10 @@ export function DownloadModal({
   const [jobId, setJobId] = useState<string | null>(null);
   const [jobStatus, setJobStatus] = useState("idle");
   const [completionNotified, setCompletionNotified] = useState(false);
-  const [dukascopyGenesis, setDukascopyGenesis] = useState<
-    Record<string, Record<string, string>>
-  >({});
+  const [dukascopyCoverage, setDukascopyCoverage] =
+    useState<DukascopyCoverageMap>({});
+  const [dukascopyCoverageLoaded, setDukascopyCoverageLoaded] = useState(false);
+  const [dukascopyCoverageError, setDukascopyCoverageError] = useState("");
 
   const isDukascopy = source === "dukascopy";
   const isStreaming = jobId !== null;
@@ -152,29 +188,39 @@ export function DownloadModal({
         .filter(Boolean),
     [symbols],
   );
+  const requestedTimeframes = useMemo(() => {
+    const ordered: string[] = [];
+    const seen = new Set<string>();
+    for (const timeframe of selectedTimeframes) {
+      const normalized = normalizeGenesisTimeframe(timeframe);
+      if (seen.has(normalized)) {
+        continue;
+      }
+      seen.add(normalized);
+      ordered.push(normalized);
+    }
+    return ordered;
+  }, [selectedTimeframes]);
 
   const dukascopyMinStart = useMemo(() => {
-    if (parsedSymbols.length === 0) {
+    if (parsedSymbols.length === 0 || requestedTimeframes.length === 0) {
       return "";
     }
 
-    const requestedTimeframes = selectedTimeframes.map(
-      normalizeGenesisTimeframe,
-    );
     const knownDates: string[] = [];
 
     for (const symbol of parsedSymbols) {
-      const symbolGenesis = dukascopyGenesis[symbol];
-      if (!symbolGenesis) {
-        return "";
+      const symbolCoverage = dukascopyCoverage[symbol];
+      if (!symbolCoverage) {
+        continue;
       }
 
       for (const timeframe of requestedTimeframes) {
-        const genesis = symbolGenesis[timeframe] ?? symbolGenesis.default;
-        if (!genesis) {
-          return "";
+        const coverage = symbolCoverage[timeframe];
+        if (!coverage?.available || !coverage.start) {
+          continue;
         }
-        knownDates.push(genesis);
+        knownDates.push(coverage.start);
       }
     }
 
@@ -184,7 +230,54 @@ export function DownloadModal({
     return knownDates.reduce((latest, current) =>
       current > latest ? current : latest,
     );
-  }, [dukascopyGenesis, parsedSymbols, selectedTimeframes]);
+  }, [dukascopyCoverage, parsedSymbols, requestedTimeframes]);
+
+  const dukascopyTimeframeCoverage = useMemo<DukascopyTimeframeCoverageRow[]>(
+    () => {
+      if (
+        !isDukascopy ||
+        parsedSymbols.length === 0 ||
+        requestedTimeframes.length === 0
+      ) {
+        return [];
+      }
+
+      return requestedTimeframes.map((timeframe) => {
+        const entries = parsedSymbols.map((symbol) => {
+          const coverage = dukascopyCoverage[symbol]?.[timeframe];
+          return {
+            symbol,
+            available: Boolean(coverage?.available && coverage?.start),
+            start: coverage?.start ?? null,
+          };
+        });
+
+        const availableEntries = entries.filter((item) => item.available);
+        const starts = availableEntries
+          .map((item) => item.start)
+          .filter((value): value is string => Boolean(value));
+        const latestStart =
+          starts.length > 0
+            ? starts.reduce((latest, current) =>
+                current > latest ? current : latest,
+              )
+            : null;
+
+        return {
+          timeframe,
+          available:
+            entries.length > 0 && availableEntries.length === entries.length,
+          availableCount: availableEntries.length,
+          symbolCount: entries.length,
+          start: latestStart,
+          missingSymbols: entries
+            .filter((item) => !item.available)
+            .map((item) => item.symbol),
+        };
+      });
+    },
+    [dukascopyCoverage, isDukascopy, parsedSymbols, requestedTimeframes],
+  );
 
   useEffect(() => {
     if (!open) {
@@ -205,6 +298,9 @@ export function DownloadModal({
     setJobId(null);
     setJobStatus("idle");
     setCompletionNotified(false);
+    setDukascopyCoverage({});
+    setDukascopyCoverageLoaded(false);
+    setDukascopyCoverageError("");
   }, [
     defaultSource,
     defaultSymbols,
@@ -217,24 +313,45 @@ export function DownloadModal({
     if (!open || !isDukascopy || isStreaming) {
       return;
     }
+    if (parsedSymbols.length === 0 || requestedTimeframes.length === 0) {
+      setDukascopyCoverage({});
+      setDukascopyCoverageLoaded(false);
+      setDukascopyCoverageError("");
+      return;
+    }
 
     let cancelled = false;
+    setDukascopyCoverageLoaded(false);
+    setDukascopyCoverageError("");
     getDukascopyGenesis(parsedSymbols, selectedTimeframes)
       .then((res) => {
         if (!cancelled) {
-          setDukascopyGenesis(res.genesis || {});
+          setDukascopyCoverage(res.coverage || {});
+          setDukascopyCoverageLoaded(true);
+          setDukascopyCoverageError("");
         }
       })
       .catch(() => {
         if (!cancelled) {
-          setDukascopyGenesis({});
+          setDukascopyCoverage({});
+          setDukascopyCoverageLoaded(true);
+          setDukascopyCoverageError(
+            "Could not load Dukascopy coverage right now. Start-date guardrails may be less strict.",
+          );
         }
       });
 
     return () => {
       cancelled = true;
     };
-  }, [isDukascopy, isStreaming, open, parsedSymbols, selectedTimeframes]);
+  }, [
+    isDukascopy,
+    isStreaming,
+    open,
+    parsedSymbols,
+    requestedTimeframes,
+    selectedTimeframes,
+  ]);
 
   useEffect(() => {
     if (!jobId || completionNotified) {
@@ -267,6 +384,24 @@ export function DownloadModal({
     cursor: "pointer",
     fontWeight: 700,
     letterSpacing: "0.04em",
+  });
+
+  const coverageBadgeStyle = (available: boolean): CSSProperties => ({
+    display: "inline-flex",
+    alignItems: "center",
+    gap: "6px",
+    padding: "6px 10px",
+    borderRadius: "999px",
+    border: `1px solid ${
+      available ? "rgba(34, 197, 94, 0.28)" : "rgba(148, 163, 184, 0.18)"
+    }`,
+    background: available
+      ? "rgba(34, 197, 94, 0.12)"
+      : "rgba(15, 23, 42, 0.72)",
+    color: available ? "#bbf7d0" : "var(--color-text-muted)",
+    fontSize: "0.74rem",
+    fontWeight: 700,
+    whiteSpace: "nowrap",
   });
 
   const toggleTimeframe = (tf: string) => {
@@ -305,7 +440,7 @@ export function DownloadModal({
       startDate < dukascopyMinStart
     ) {
       setError(
-        `Explicit start date must be on or after ${dukascopyMinStart} for the selected instruments and timeframes.`,
+        `Explicit start date must be on or after ${dukascopyMinStart} for all selected instruments and timeframes with Dukascopy coverage.`,
       );
       return;
     }
@@ -339,8 +474,8 @@ export function DownloadModal({
         "success",
       );
       onClose();
-    } catch (err: any) {
-      setError(err.message || "Failed to start download.");
+    } catch (err: unknown) {
+      setError(err instanceof Error && err.message ? err.message : "Failed to start download.");
     }
   };
 
@@ -434,6 +569,7 @@ export function DownloadModal({
                     style={inputStyle}
                   >
                     <option value="dukascopy">Dukascopy</option>
+                    <option value="jforex">JForex (auto-fallback)</option>
                     <option value="yfinance">Yahoo Finance</option>
                     <option value="dolthub">Dolthub (Update All)</option>
                   </select>
@@ -768,22 +904,178 @@ export function DownloadModal({
               )}
             </div>
 
-            {isDukascopy && dukascopyMinStart && (
-              <div
-                style={{
-                  padding: "12px 14px",
-                  borderRadius: "14px",
-                  background: "rgba(37, 99, 235, 0.12)",
-                  border: "1px solid rgba(96, 165, 250, 0.18)",
-                  fontSize: "0.82rem",
-                  color: "#bfdbfe",
-                }}
-              >
-                Explicit Start Date must be on or after{" "}
-                <strong>{dukascopyMinStart}</strong> for the selected
-                instruments and timeframes.
-              </div>
-            )}
+            {isDukascopy &&
+              parsedSymbols.length > 0 &&
+              requestedTimeframes.length > 0 && (
+                <div
+                  style={{
+                    display: "grid",
+                    gap: "10px",
+                    padding: "12px",
+                    borderRadius: "14px",
+                    background: "rgba(15, 23, 42, 0.56)",
+                    border: "1px solid rgba(148, 163, 184, 0.16)",
+                  }}
+                >
+                  <div
+                    style={{
+                      fontSize: "0.76rem",
+                      letterSpacing: "0.08em",
+                      textTransform: "uppercase",
+                      color: "var(--color-text-muted)",
+                    }}
+                  >
+                    Dukascopy coverage by timeframe
+                  </div>
+                  {!dukascopyCoverageLoaded ? (
+                    <div
+                      style={{
+                        display: "inline-flex",
+                        alignItems: "center",
+                        gap: "8px",
+                        fontSize: "0.82rem",
+                        color: "var(--color-text-muted)",
+                      }}
+                    >
+                      <Loader2 size={14} className="animate-spin" />
+                      Loading timeframe coverage…
+                    </div>
+                  ) : dukascopyCoverageError ? (
+                    <div style={{ fontSize: "0.82rem", color: "#fca5a5" }}>
+                      {dukascopyCoverageError}
+                    </div>
+                  ) : dukascopyTimeframeCoverage.length === 0 ? (
+                    <div
+                      style={{
+                        fontSize: "0.8rem",
+                        color: "var(--color-text-muted)",
+                      }}
+                    >
+                      Enter one or more instruments and select at least one
+                      timeframe to inspect coverage.
+                    </div>
+                  ) : (
+                    <div style={{ display: "grid", gap: "10px" }}>
+                      {dukascopyTimeframeCoverage.map((row) => (
+                        <div
+                          key={row.timeframe}
+                          style={{
+                            padding: "12px",
+                            borderRadius: "14px",
+                            border: "1px solid rgba(148, 163, 184, 0.12)",
+                            background: "rgba(2, 6, 23, 0.32)",
+                            display: "grid",
+                            gap: "10px",
+                          }}
+                        >
+                          <div
+                            style={{
+                              display: "flex",
+                              justifyContent: "space-between",
+                              gap: "10px",
+                              alignItems: "center",
+                              flexWrap: "wrap",
+                            }}
+                          >
+                            <div
+                              style={{
+                                display: "inline-flex",
+                                alignItems: "center",
+                                gap: "8px",
+                                fontWeight: 800,
+                                color: "#e2e8f0",
+                              }}
+                            >
+                              <span
+                                style={{
+                                  ...coverageBadgeStyle(row.available),
+                                  textTransform: "uppercase",
+                                  letterSpacing: "0.08em",
+                                }}
+                              >
+                                {formatCoverageTimeframe(row.timeframe)}
+                              </span>
+                              <span style={{ fontSize: "0.8rem" }}>
+                                {row.availableCount}/{row.symbolCount} available
+                              </span>
+                            </div>
+                            <div
+                              style={{
+                                fontSize: "0.78rem",
+                                color: "var(--color-text-muted)",
+                              }}
+                            >
+                              {row.start
+                                ? `Available since ${row.start}`
+                                : "Not found"}
+                            </div>
+                          </div>
+
+                          <div
+                            style={{
+                              display: "flex",
+                              flexWrap: "wrap",
+                              gap: "8px",
+                            }}
+                          >
+                            {parsedSymbols.map((symbol) => {
+                              const coverage = dukascopyCoverage[symbol]?.[
+                                row.timeframe
+                              ];
+                              const available = Boolean(
+                                coverage?.available && coverage?.start,
+                              );
+                              return (
+                                <span
+                                  key={`${symbol}-${row.timeframe}`}
+                                  style={coverageBadgeStyle(available)}
+                                >
+                                  {symbol} ·{" "}
+                                  {available ? coverage?.start : "Not found"}
+                                </span>
+                              );
+                            })}
+                          </div>
+
+                          {!row.available && row.missingSymbols.length > 0 && (
+                            <div
+                              style={{
+                                fontSize: "0.74rem",
+                                color: "var(--color-text-muted)",
+                              }}
+                              title={row.missingSymbols.join(", ")}
+                            >
+                              Missing: {formatMissingSymbols(row.missingSymbols)}
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {dukascopyMinStart ? (
+                    <div
+                      style={{
+                        fontSize: "0.78rem",
+                        color: "#bfdbfe",
+                      }}
+                    >
+                      Explicit Start Date must be on or after{" "}
+                      <strong>{dukascopyMinStart}</strong> for selected
+                      timeframe entries with known Dukascopy coverage.
+                    </div>
+                  ) : (
+                    <div
+                      style={{
+                        fontSize: "0.78rem",
+                        color: "var(--color-text-muted)",
+                      }}
+                    >
+                      No known Dukascopy start dates for the selected
+                      instrument/timeframe scope.
+                    </div>
+                  )}
+                </div>
+              )}
             {isDukascopy && !startDate && (
               <div
                 style={{
@@ -792,7 +1084,8 @@ export function DownloadModal({
                 }}
               >
                 If Start Date is empty, the download will start from the
-                earliest available date for each timeframe.
+                earliest known date for each timeframe (or provider default when
+                coverage is unknown).
               </div>
             )}
             {error && (

@@ -10,7 +10,14 @@ import type {
   DataTaskLogsResponse,
   DataTaskStartResponse,
   DataTaskStatusResponse,
+  DataCacheInvalidationResponse,
   DukascopyGenesisResponse,
+  LiveAccount,
+  LiveBalancesResponse,
+  LiveDeploymentCreateRequest,
+  LiveDeploymentConfig,
+  LiveDeploymentStatus,
+  LiveTradesResponse,
   LogContent,
   LogFile,
   OptimizationDetail,
@@ -103,6 +110,30 @@ export const renameBacktest = (id: string, title: string) =>
   });
 export const compareBacktests = (ids: string[]) =>
   fetchJSON<any>(`/compare?ids=${ids.join(",")}`);
+
+// Live Hub
+export const getLiveDeployments = () =>
+  fetchJSON<LiveDeploymentConfig[]>("/live/deployments");
+export const getLiveAccounts = () => fetchJSON<LiveAccount[]>("/live/accounts");
+export const getLiveBalances = (accountId: string) =>
+  fetchJSON<LiveBalancesResponse>(`/live/balances/${encodeURIComponent(accountId)}`);
+export const getLiveTrades = (accountId: string) =>
+  fetchJSON<LiveTradesResponse>(`/live/trades/${encodeURIComponent(accountId)}`);
+export const createLiveDeployment = (payload: LiveDeploymentCreateRequest) =>
+  fetchJSON<LiveDeploymentConfig>("/live/deployments", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+export const updateLiveDeploymentStatus = (deploymentId: string, status: LiveDeploymentStatus) =>
+  fetchJSON<LiveDeploymentConfig>(`/live/deployments/${encodeURIComponent(deploymentId)}/status`, {
+    method: "PUT",
+    body: JSON.stringify({ status }),
+  });
+export const deleteLiveDeployment = (deploymentId: string) =>
+  fetchJSON<{ status: string; id: string }>(
+    `/live/deployments/${encodeURIComponent(deploymentId)}`,
+    { method: "DELETE" },
+  );
 
 // Run backtest
 export const runBacktest = (data: RunBacktestRequest) =>
@@ -237,3 +268,18 @@ export const deleteDataTask = (taskId: string) =>
   fetchJSON<DataTaskDeleteResponse>(`/data/tasks/${taskId}`, {
     method: "DELETE",
   });
+export const invalidateDataCache = (
+  reason = "manual",
+  includeValidation?: boolean,
+) => {
+  const params = new URLSearchParams();
+  if (reason) params.set("reason", reason);
+  if (typeof includeValidation === "boolean") {
+    params.set("include_validation", includeValidation ? "true" : "false");
+  }
+  const query = params.toString();
+  return fetchJSON<DataCacheInvalidationResponse>(
+    `/data/cache/invalidate${query ? `?${query}` : ""}`,
+    { method: "POST" },
+  );
+};

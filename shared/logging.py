@@ -20,11 +20,11 @@ import logging
 import os
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
-from pathlib import Path
 
 from shared.constants import LOG_DIR
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+LOG_TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 MAX_BYTES = 10 * 1024 * 1024  # 10 MB
 BACKUP_COUNT = 5
@@ -40,8 +40,11 @@ class JsonFormatter(logging.Formatter):
         self.service = service
 
     def format(self, record: logging.LogRecord) -> str:
+        timestamp = datetime.fromtimestamp(record.created, tz=timezone.utc).strftime(
+            LOG_TIMESTAMP_FORMAT
+        )
         entry = {
-            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+            "timestamp": timestamp,
             "level": record.levelname,
             "service": self.service,
             "module": record.module,

@@ -13,6 +13,8 @@ import { DataManagementPage } from "./pages/DataManagementPage";
 import { StrategyLabPage } from "./pages/StrategyLabPage";
 import { OptimizationsPage } from "./pages/OptimizationsPage";
 import { OptimizationResultsPage } from "./pages/OptimizationResultsPage";
+import { LiveHubPage } from "./pages/LiveHub";
+import { LiveDetailPage } from "./pages/LiveDetail";
 import { TaskManager } from "./components/TaskManager";
 
 export default function App() {
@@ -45,6 +47,8 @@ export default function App() {
           <Route path="/backtests/:id/trade/:nr" element={<TradeChartPage />} />
           <Route path="/optimizations" element={<OptimizationsPage />} />
           <Route path="/optimizations/:id" element={<OptimizationResultsPage />} />
+          <Route path="/live" element={<LiveHubPage />} />
+          <Route path="/live/:accountId" element={<LiveDetailPage />} />
           <Route path="/strategies" element={<StrategiesPage />} />
           <Route path="/strategies/:name" element={<StrategyDetailPage />} />
           <Route path="/portfolios" element={<PortfoliosPage />} />

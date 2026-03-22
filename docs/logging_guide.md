@@ -22,7 +22,7 @@ Jeder Log-Eintrag ist eine JSON-Zeile:
 
 ```json
 {
-    "timestamp": "2026-02-25T14:30:22.123Z",
+    "timestamp": "2026-02-25 14:30:22",
     "level": "INFO",
     "service": "mein_service",
     "module": "main",
@@ -34,7 +34,7 @@ Mit `extra={"data": {...}}` wird ein `data`-Feld hinzugefügt:
 
 ```json
 {
-    "timestamp": "2026-02-25T14:30:22.123Z",
+    "timestamp": "2026-02-25 14:30:22",
     "level": "WARNING",
     "service": "mein_service",
     "module": "main",

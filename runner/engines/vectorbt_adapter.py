@@ -105,7 +105,7 @@ def _process_symbol(
     )
     if df is None or df.empty:
         logger.warning("No data for %s/%s, skipping", symbol, config.timeframe)
-        return [], [], []
+        return [], [], [], []
 
     asset_class = _infer_asset_class_from_path(data_path)
     intrabar_df, intrabar_timeframe = _load_intrabar_ohlcv(

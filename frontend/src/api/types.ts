@@ -336,6 +336,75 @@ export interface EquityPoint {
   equity: number;
 }
 
+export interface LiveAccount {
+  id: string;
+  name: string;
+  broker: "alpaca" | "ctrader";
+  balance: number;
+  is_demo: boolean;
+}
+
+export type LiveDeploymentStatus = "ACTIVE" | "PAUSED" | "STOPPED";
+
+export interface LiveDeploymentConfig {
+  id: string;
+  strategy_name: string;
+  account_id: string;
+  symbols: string[];
+  timeframe: string;
+  status: LiveDeploymentStatus;
+  settings: Record<string, unknown>;
+}
+
+export interface LiveDeploymentCreateRequest {
+  strategy_name: string;
+  account_id: string;
+  symbols: string[];
+  timeframe: string;
+  settings?: Record<string, unknown>;
+}
+
+export interface LiveBalanceRecord {
+  id: string;
+  account_id: string;
+  timestamp: string;
+  time: number;
+  balance: number;
+  equity: number;
+}
+
+export interface LiveTradeSlippage {
+  signal_id: string;
+  execution_id: string;
+  deployment_id: string;
+  account_id: string;
+  symbol: string;
+  action: "buy" | "sell" | string;
+  theoretical_price: number;
+  actual_price: number;
+  slippage: number;
+  slippage_bps: number;
+  filled_qty: number;
+  commission: number;
+  signal_timestamp: string;
+  signal_time: number;
+  execution_timestamp: string;
+  execution_time: number;
+  broker_order_id: string;
+  signal_metadata: Record<string, unknown>;
+}
+
+export interface LiveBalancesResponse {
+  account_id: string;
+  series: LiveBalanceRecord[];
+}
+
+export interface LiveTradesResponse {
+  account_id: string;
+  deployment_ids: string[];
+  trades: LiveTradeSlippage[];
+}
+
 export interface BacktestListItem {
   id: string;
   title?: string;
@@ -518,8 +587,16 @@ export interface LogContent {
 
 export interface DukascopyGenesisResponse {
   source: string;
-  genesis: Record<string, Record<string, string>>;
-  lower_bound: string;
+  coverage: Record<
+    string,
+    Record<
+      string,
+      {
+        available: boolean;
+        start: string | null;
+      }
+    >
+  >;
 }
 
 export interface DataCategorySummary {
@@ -624,6 +701,14 @@ export interface DataTaskStartResponse {
 export interface DataTaskDeleteResponse {
   task_id: string;
   status: string;
+}
+
+export interface DataCacheInvalidationResponse {
+  status: string;
+  removed_entries: number;
+  reason: string;
+  include_validation: boolean | null;
+  cache_stats: Record<string, unknown>;
 }
 
 export type AgentModelId =

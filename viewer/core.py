@@ -27,6 +27,7 @@ from typing import Any, Callable
 import pandas as pd
 from pydantic import ValidationError
 
+from data_tools import cache_manager
 from data_tools.catalog_builder import build_catalog, scan_ohlcv
 from runner.auto_agent import DEFAULT_MODEL_NAME, SUPPORTED_MODEL_NAMES, run_auto_agent
 from runner.optimizer import OptimizationConfig, run_optimization as execute_optimization
@@ -574,6 +575,20 @@ def _normalize_dukascopy_genesis_timeframe(timeframe: str) -> str:
     return aliases.get(normalized, normalized)
 
 
+DUKASCOPY_COVERAGE_TIMEFRAMES: tuple[str, ...] = (
+    "tick",
+    "s1",
+    "m1",
+    "m5",
+    "m15",
+    "m30",
+    "h1",
+    "h4",
+    "d1",
+    "mn1",
+)
+
+
 def _load_dukascopy_genesis() -> dict[str, dict[str, str]]:
     from shared.constants import resolve_genesis_path
 
@@ -611,35 +626,41 @@ def _collect_dukascopy_genesis(
     genesis_index: dict[str, dict[str, str]],
     symbols: list[str] | None = None,
     timeframes: list[str] | None = None,
-) -> tuple[dict[str, dict[str, str]], str]:
-    requested_symbols = [symbol.upper() for symbol in (symbols or sorted(genesis_index))]
-    requested_timeframes = [
-        _normalize_dukascopy_genesis_timeframe(timeframe) for timeframe in (timeframes or [])
-    ]
+) -> dict[str, dict[str, dict[str, str | bool | None]]]:
+    requested_symbols_raw = symbols or sorted(genesis_index)
+    requested_symbols: list[str] = []
+    seen_symbols: set[str] = set()
+    for symbol in requested_symbols_raw:
+        normalized = str(symbol).strip().upper()
+        if not normalized or normalized in seen_symbols:
+            continue
+        seen_symbols.add(normalized)
+        requested_symbols.append(normalized)
 
-    filtered: dict[str, dict[str, str]] = {}
-    lower_bound_candidates: list[str] = []
+    requested_timeframes_raw = list(timeframes or DUKASCOPY_COVERAGE_TIMEFRAMES)
+    requested_timeframes: list[str] = []
+    seen_timeframes: set[str] = set()
+    for timeframe in requested_timeframes_raw:
+        normalized = _normalize_dukascopy_genesis_timeframe(str(timeframe))
+        if not normalized or normalized in seen_timeframes:
+            continue
+        seen_timeframes.add(normalized)
+        requested_timeframes.append(normalized)
 
+    coverage: dict[str, dict[str, dict[str, str | bool | None]]] = {}
     for symbol in requested_symbols:
         symbol_data = genesis_index.get(symbol, {})
-        if not symbol_data:
-            continue
+        timeframe_map: dict[str, dict[str, str | bool | None]] = {}
+        for timeframe in requested_timeframes:
+            raw_start = symbol_data.get(timeframe)
+            start = str(raw_start).strip() if raw_start is not None else ""
+            timeframe_map[timeframe] = {
+                "available": bool(start),
+                "start": start or None,
+            }
+        coverage[symbol] = timeframe_map
 
-        if requested_timeframes:
-            timeframe_matches: dict[str, str] = {}
-            for timeframe in requested_timeframes:
-                genesis = symbol_data.get(timeframe) or symbol_data.get("default")
-                if genesis:
-                    timeframe_matches[timeframe] = genesis
-                    lower_bound_candidates.append(genesis)
-            if timeframe_matches:
-                filtered[symbol] = timeframe_matches
-        else:
-            filtered[symbol] = dict(sorted(symbol_data.items()))
-            lower_bound_candidates.extend(symbol_data.values())
-
-    lower_bound = max(lower_bound_candidates) if lower_bound_candidates else ""
-    return filtered, lower_bound
+    return coverage
 
 
 def _equity_to_viewer(result: BacktestResult) -> list[dict]:
@@ -2202,7 +2223,10 @@ def _parse_log_timestamp(value: object) -> datetime | None:
     if not isinstance(value, str) or not value.strip():
         return None
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
     except ValueError:
         return None
 
@@ -2549,7 +2573,10 @@ def _load_catalog_ohlcv_entries() -> tuple[list[dict], bool]:
     except (json.JSONDecodeError, OSError):
         return [], False
 
-    return catalog.get("ohlcv", []), True
+    entries = catalog.get("ohlcv", [])
+    if not isinstance(entries, list):
+        return [], True
+    return [dict(entry) for entry in entries if isinstance(entry, dict)], True
 
 
 def _dir_size_bytes(root: Path) -> int:
@@ -2947,9 +2974,21 @@ def _task_log_message(
         )
 
 
-def _refresh_catalog_for_task(task_id: str, *, source: str = "data-task") -> bool:
+def _refresh_catalog_for_task(
+    task_id: str,
+    *,
+    source: str = "data-task",
+    cache_invalidation_reason: str | None = None,
+) -> bool:
     _task_log_message(task_id, "Refreshing catalog...", source=source)
     try:
+        if cache_invalidation_reason:
+            removed = cache_manager.invalidate_cache(DATA_DIR, reason=cache_invalidation_reason)
+            _task_log_message(
+                task_id,
+                f"Cache invalidated ({cache_invalidation_reason}): {removed} entries removed.",
+                source=source,
+            )
         _refresh_catalog()
     except (json.JSONDecodeError, FileNotFoundError, OSError) as exc:
         _task_log_message(task_id, f"Catalog refresh failed: {exc}", log_level="error", source=source)
@@ -3044,9 +3083,14 @@ def _start_data_task(
                     return
 
                 status = "completed" if returncode == 0 else "failed"
-                if returncode == 0 and _refresh_catalog_for_task(task_id):
-                    _mark_task_finished(task_id, status="completed", returncode=returncode)
-                    return
+                if returncode == 0:
+                    cache_reason = _task_cache_invalidation_reason(source)
+                    if _refresh_catalog_for_task(
+                        task_id,
+                        cache_invalidation_reason=cache_reason,
+                    ):
+                        _mark_task_finished(task_id, status="completed", returncode=returncode)
+                        return
 
                 _mark_task_finished(task_id, status=status, returncode=returncode)
         except (subprocess.SubprocessError, OSError) as exc:
@@ -3225,7 +3269,10 @@ def _start_dukascopy_task(
                             source="data-task",
                         )
 
-                if refresh_needed and not _refresh_catalog_for_task(task_id):
+                if refresh_needed and not _refresh_catalog_for_task(
+                    task_id,
+                    cache_invalidation_reason="post_download",
+                ):
                     return
 
                 final_status = "failed" if failed_items > 0 else "completed"
@@ -3246,6 +3293,254 @@ def _start_dukascopy_task(
             )
             logger.exception(
                 "Dukascopy task failed: %s",
+                exc,
+                extra={"data": {"task_id": task_id, "stream": "task", "source": "data-task"}},
+            )
+
+    thread = threading.Thread(target=run_download, daemon=True)
+    _update_task_fields(task_id, thread=thread)
+    thread.start()
+    return {"task_id": task_id, "status": "starting"}
+
+
+def _start_jforex_task(
+    task_id: str,
+    cmd: list[str],
+    *,
+    source_label: str,
+    symbols: list[str],
+    timeframes: list[str],
+    start: str | None,
+    end: str | None,
+    price_type: str,
+    merge_tick: bool,
+    merge_s1: bool,
+    batch_size: int,
+    pause_ms: int,
+    query_timeout_seconds: int,
+    total_items: int,
+    name: str,
+    description: str,
+) -> dict[str, Any]:
+    from data_tools.downloaders.dukascopy_native import DownloadCancelled, DukascopyNativeDownloader
+    from data_tools.downloaders.jforex_dl import JForexDownloader
+
+    TASK_LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    log_file = _task_log_path(task_id)
+    record = _create_task_record(
+        task_id,
+        name=name,
+        description=description,
+        kind="data",
+        source=source_label,
+        total_items=total_items,
+        log_file=log_file,
+        control_mode="thread",
+        supports_control=True,
+    )
+    with DATA_TASKS_LOCK:
+        DATA_TASKS[task_id] = record
+
+    def run_download() -> None:
+        command_display = " ".join(str(part) for part in cmd)
+        pause_event = record["pause_event"]
+        stop_event = record["stop_event"]
+        jforex_downloader = JForexDownloader()
+        fallback_downloader = DukascopyNativeDownloader()
+        refresh_needed = False
+
+        try:
+            with log_file.open("a", encoding="utf-8", buffering=1) as handle:
+                _write_task_log_line(
+                    handle,
+                    task_id,
+                    f"[{_task_timestamp()}] Starting command: {command_display}",
+                    stream="task",
+                )
+
+                if stop_event.is_set():
+                    _write_task_log_line(
+                        handle,
+                        task_id,
+                        f"[{_task_timestamp()}] Task cancelled before launch.",
+                        stream="task",
+                    )
+                    _mark_task_finished(task_id, status="cancelled", returncode=-9)
+                    return
+
+                completed_items = 0
+                failed_items = 0
+                total = max(total_items, 1)
+
+                def task_log(message: str, *, level: str = "info") -> None:
+                    _write_task_log_line(
+                        handle,
+                        task_id,
+                        message,
+                        stream="stdout",
+                        log_level=level,
+                        source="data-task",
+                    )
+
+                combinations = [(symbol, timeframe) for symbol in symbols for timeframe in timeframes]
+                for symbol, timeframe in combinations:
+                    if not _wait_for_task_resume(task_id):
+                        _write_task_log_line(
+                            handle,
+                            task_id,
+                            f"[{_task_timestamp()}] Task cancelled while paused.",
+                            stream="task",
+                        )
+                        _mark_task_finished(task_id, status="cancelled", returncode=-9)
+                        return
+
+                    if stop_event.is_set():
+                        _write_task_log_line(
+                            handle,
+                            task_id,
+                            f"[{_task_timestamp()}] Task cancelled by user.",
+                            stream="task",
+                        )
+                        _mark_task_finished(task_id, status="cancelled", returncode=-9)
+                        return
+
+                    _set_task_status(task_id, "running")
+                    item_label = f"{symbol} {timeframe}"
+                    base_completed = completed_items + failed_items
+
+                    def report_progress(pct: float, message: str) -> None:
+                        overall = ((base_completed + (max(0.0, min(pct, 100.0)) / 100.0)) / total) * 100.0
+                        _update_task_progress(
+                            task_id,
+                            percent=overall,
+                            current=f"{item_label}: {message}",
+                            total=total,
+                        )
+
+                    used_fallback = False
+                    try:
+                        result = jforex_downloader.download(
+                            symbol,
+                            timeframe,
+                            DATA_DIR,
+                            start=start,
+                            end=end,
+                            price_type=price_type,
+                            query_timeout_seconds=query_timeout_seconds,
+                        )
+                    except DownloadCancelled:
+                        _write_task_log_line(
+                            handle,
+                            task_id,
+                            f"[{_task_timestamp()}] Task cancelled by user.",
+                            stream="task",
+                        )
+                        _mark_task_finished(task_id, status="cancelled", returncode=-9)
+                        return
+                    except (OSError, RuntimeError, ValueError, KeyError, json.JSONDecodeError) as exc:
+                        if _is_jforex_unavailable_error(exc):
+                            used_fallback = True
+                            _write_task_log_line(
+                                handle,
+                                task_id,
+                                (
+                                    f"⚠️ {symbol} {timeframe}: JForex unavailable ({exc}). "
+                                    "Falling back to Dukascopy native HTTP downloader."
+                                ),
+                                stream="stdout",
+                                log_level="warning",
+                                source="data-task",
+                            )
+                            try:
+                                result = fallback_downloader.download(
+                                    symbol,
+                                    timeframe,
+                                    DATA_DIR,
+                                    start=start,
+                                    end=end,
+                                    price_type=price_type,
+                                    merge_tick=merge_tick,
+                                    merge_s1=merge_s1,
+                                    batch_size=batch_size,
+                                    pause_ms=pause_ms,
+                                    pause_event=pause_event,
+                                    stop_event=stop_event,
+                                    report_progress=report_progress,
+                                    log_callback=task_log,
+                                )
+                            except DownloadCancelled:
+                                _write_task_log_line(
+                                    handle,
+                                    task_id,
+                                    f"[{_task_timestamp()}] Task cancelled by user.",
+                                    stream="task",
+                                )
+                                _mark_task_finished(task_id, status="cancelled", returncode=-9)
+                                return
+                            except (OSError, RuntimeError, ValueError, KeyError, json.JSONDecodeError) as fallback_exc:
+                                failed_items += 1
+                                _write_task_log_line(
+                                    handle,
+                                    task_id,
+                                    (
+                                        f"❌ {symbol} {timeframe}: JForex failed ({exc}); "
+                                        f"native fallback also failed ({fallback_exc})"
+                                    ),
+                                    stream="stdout",
+                                    log_level="error",
+                                    source="data-task",
+                                )
+                                continue
+                        else:
+                            failed_items += 1
+                            _write_task_log_line(
+                                handle,
+                                task_id,
+                                f"❌ {symbol} {timeframe}: {exc}",
+                                stream="stdout",
+                                log_level="error",
+                                source="data-task",
+                            )
+                            continue
+
+                    refresh_needed = True
+                    completed_items += 1
+                    fallback_suffix = " (fallback:native-http)" if used_fallback else " (backend:jforex)"
+                    _write_task_log_line(
+                        handle,
+                        task_id,
+                        (
+                            f"✅ {result.symbol} {result.timeframe}: {result.rows} rows "
+                            f"({result.start} → {result.end}) → {result.path}{fallback_suffix}"
+                        ),
+                        stream="stdout",
+                        source="data-task",
+                    )
+
+                if refresh_needed and not _refresh_catalog_for_task(
+                    task_id,
+                    cache_invalidation_reason="post_download",
+                ):
+                    return
+
+                final_status = "failed" if failed_items > 0 else "completed"
+                returncode = 1 if failed_items > 0 else 0
+                _write_task_log_line(
+                    handle,
+                    task_id,
+                    f"Done: {completed_items} downloads completed.",
+                    stream="stdout",
+                    source="data-task",
+                )
+                _mark_task_finished(task_id, status=final_status, returncode=returncode)
+        except Exception as exc:
+            _mark_task_finished(task_id, status="failed", returncode=1, error=str(exc))
+            _append_task_log(
+                log_file,
+                f"[{_task_timestamp()}] Task failed: {exc}\n",
+            )
+            logger.exception(
+                "JForex task failed: %s",
                 exc,
                 extra={"data": {"task_id": task_id, "stream": "task", "source": "data-task"}},
             )
@@ -3563,6 +3858,11 @@ def _download_task_labels(source: str, symbols: list[str], timeframes: list[str]
             f"Download {symbol_label} {timeframe_label}",
             f"Dukascopy download for {symbol_label} on {timeframe_label}.",
         )
+    if source == "jforex":
+        return (
+            f"Download {symbol_label} {timeframe_label}",
+            f"JForex download for {symbol_label} on {timeframe_label}.",
+        )
     if source == "yfinance":
         return (
             f"Download {symbol_label}",
@@ -3576,6 +3876,35 @@ def _task_action_response(task_id: str):
     if task is None:
         return jsonify({"error": "Task not found"}), 404
     return jsonify(_serialize_task(task_id, task, include_log=True))
+
+
+def _task_cache_invalidation_reason(source: str) -> str | None:
+    source_key = str(source or "").strip().lower()
+    if source_key == "resample":
+        return "post_resample"
+    if source_key in {"dukascopy", "jforex", "yfinance", "dolthub", "harvest", "download"}:
+        return "post_download"
+    return None
+
+
+def _is_jforex_unavailable_error(exc: Exception) -> bool:
+    if isinstance(exc, ModuleNotFoundError):
+        missing_name = str(getattr(exc, "name", "") or "").lower()
+        if "jpype" in missing_name or "dukascopy" in missing_name:
+            return True
+
+    message = str(exc).lower()
+    unavailable_fragments = (
+        "jpype is required",
+        "no module named 'jpype'",
+        "failed to start jvm",
+        "could not resolve jforex sdk classpath",
+        "jforex sdk classpath",
+        "missing dukascopy credentials",
+        "dukascopy_username",
+        "dukascopy_jnlp_url",
+    )
+    return any(fragment in message for fragment in unavailable_fragments)
 
 
 def _signal_process(task: dict[str, Any], sig: int) -> None:
@@ -3621,7 +3950,7 @@ def data_download():
         for symbol in sym_list:
             symbol_data = genesis_index.get(symbol, {})
             for timeframe in tf_list:
-                genesis = symbol_data.get(timeframe) or symbol_data.get("default")
+                genesis = symbol_data.get(timeframe)
                 if genesis and start < genesis:
                     too_early[f"{symbol}/{timeframe}"] = genesis
         if too_early:
@@ -3753,7 +4082,7 @@ def get_dukascopy_genesis():
     requested_symbols = _parse_symbol_list(request.args.get("symbols", ""))
     requested_timeframes = _parse_timeframe_list(request.args.get("timeframes", ""))
     genesis_index = _load_dukascopy_genesis()
-    filtered_genesis, lower_bound = _collect_dukascopy_genesis(
+    coverage = _collect_dukascopy_genesis(
         genesis_index,
         symbols=requested_symbols or None,
         timeframes=requested_timeframes or None,
@@ -3761,8 +4090,7 @@ def get_dukascopy_genesis():
     return jsonify(
         {
             "source": "dukascopy",
-            "genesis": filtered_genesis,
-            "lower_bound": lower_bound,
+            "coverage": coverage,
         }
     )
 

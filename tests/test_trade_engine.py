@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 
+import pyarrow.parquet as pq
+import pyarrow.compute as pc
 import pandas as pd
 import pytest
 
@@ -10,6 +13,73 @@ from runner.engines.base import BacktestConfig
 from runner.engines.native_adapter import NativeAdapter
 from runner.engines.vectorbt_adapter import VectorbtAdapter
 from shared.constants import DATA_DIR
+
+
+def _parse_date_bound(value: str, *, is_end: bool) -> pd.Timestamp:
+    raw = str(value or "").strip()
+    normalized = raw.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise ValueError(f"Invalid date filter value: {value!r}") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    if is_end and "T" not in raw and ":" not in raw:
+        parsed = parsed + timedelta(days=1) - timedelta(microseconds=1)
+    return pd.Timestamp(parsed)
+
+
+def _to_utc_datetime(value: object) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, date):
+        return datetime.combine(value, time.min, tzinfo=timezone.utc)
+    if isinstance(value, str):
+        normalized = value.strip().replace("Z", "+00:00")
+        if not normalized:
+            return None
+        try:
+            parsed = datetime.fromisoformat(normalized)
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+    return None
+
+
+def _time_bounds(path: Path) -> tuple[datetime | None, datetime | None]:
+    try:
+        table = pq.read_table(path, columns=["timestamp"])
+    except Exception:
+        return None, None
+    if table.num_rows == 0:
+        return None, None
+    column = table["timestamp"]
+    try:
+        min_scalar = pc.min(column)
+        max_scalar = pc.max(column)
+    except Exception:
+        return None, None
+    start = _to_utc_datetime(min_scalar.as_py() if min_scalar is not None else None)
+    end = _to_utc_datetime(max_scalar.as_py() if max_scalar is not None else None)
+    return start, end
+
+
+def _has_coverage(path: Path, *, start: str, end: str) -> bool:
+    lower, upper = _time_bounds(path)
+    if lower is None or upper is None:
+        return False
+    return lower <= _parse_date_bound(start, is_end=False).to_pydatetime() and upper >= _parse_date_bound(
+        end, is_end=True
+    ).to_pydatetime()
+
+
+def _to_timestamp_utc(value: object) -> pd.Timestamp:
+    dt = _to_utc_datetime(value)
+    if dt is None:
+        raise ValueError(f"Invalid date filter value: {value!r}")
+    return pd.Timestamp(dt)
 
 
 def _synthetic_ohlcv(rows: int = 100) -> pd.DataFrame:
@@ -120,7 +190,18 @@ def test_example_sma_native_vs_vectorbt_trade_count_similarity():
     if not parquet_files:
         pytest.skip("No local 1h OHLCV parquet data available")
 
-    symbol = parquet_files[0].parent.name
+    selected = next(
+        (
+            path
+            for path in parquet_files
+            if _has_coverage(path, start="2024-01-01", end="2025-12-31")
+        ),
+        None,
+    )
+    if selected is None:
+        pytest.skip("No local 1h OHLCV parquet data covering 2024-01-01..2025-12-31")
+
+    symbol = selected.parent.name
     cfg = BacktestConfig(
         strategy_name="example_sma",
         symbols=[symbol],

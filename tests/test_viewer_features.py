@@ -11,6 +11,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
+from starlette.middleware.gzip import GZipMiddleware
 
 from shared.models import (
     BacktestMeta,
@@ -68,19 +69,52 @@ def test_get_dukascopy_genesis(viewer_client, tmp_path):
     assert resp.status_code == 200
     data = resp.json()
     assert data["source"] == "dukascopy"
-    assert data["genesis"] == {
+    assert data["coverage"] == {
         "EURUSD": {
-            "d1": "1999-01-01",
-            "h4": "2003-05-04",
-            "s1": "2003-05-04",
+            "d1": {"available": True, "start": "1999-01-01"},
+            "s1": {"available": True, "start": "2003-05-04"},
+            "h4": {"available": True, "start": "2003-05-04"},
         },
         "XAUUSD": {
-            "d1": "1999-01-01",
-            "h4": "2003-05-04",
-            "s1": "2003-05-04",
+            "d1": {"available": True, "start": "1999-01-01"},
+            "s1": {"available": True, "start": "2003-05-04"},
+            "h4": {"available": True, "start": "2003-05-04"},
+        },
+        "GBPUSD": {
+            "d1": {"available": False, "start": None},
+            "s1": {"available": False, "start": None},
+            "h4": {"available": False, "start": None},
         },
     }
-    assert data["lower_bound"] == "2003-05-04"
+
+
+def test_get_dukascopy_genesis_returns_missing_timeframes_as_unavailable(
+    viewer_client,
+    tmp_path,
+):
+    (tmp_path / "dukascopy_genesis.json").write_text(json.dumps({
+        "EURUSD": {
+            "d1": "1999-01-01",
+            "tick": "2003-05-04",
+        },
+    }))
+
+    resp = viewer_client.get("/api/data/dukascopy/genesis?symbols=EURUSD&timeframes=tick,4h,m1")
+    assert resp.status_code == 200
+
+    coverage = resp.json()["coverage"]["EURUSD"]
+    assert coverage["tick"] == {"available": True, "start": "2003-05-04"}
+    assert coverage["h4"] == {"available": False, "start": None}
+    assert coverage["m1"] == {"available": False, "start": None}
+
+
+def test_viewer_app_enables_gzip_middleware(viewer_client):
+    import viewer.main as viewer_app_module
+
+    assert any(
+        middleware.cls is GZipMiddleware and middleware.kwargs.get("minimum_size") == 500
+        for middleware in viewer_app_module.app.user_middleware
+    )
 
 
 def test_data_download_rejects_dates_before_genesis(viewer_client, tmp_path):
@@ -326,11 +360,49 @@ def test_data_overview_and_category_use_catalog_date_ranges(viewer_client, tmp_p
             "timeframe": "1d",
             "path": str(tmp_path / "ohlcv" / "test_source" / "etf" / "SPY" / "1d.parquet"),
             "size_mb": 0.0,
+            "row_count": 0,
+            "file_count": 1,
+            "files": [str(tmp_path / "ohlcv" / "test_source" / "etf" / "SPY" / "1d.parquet")],
+            "sources": ["test_source"],
             "start": "2024-01-02",
             "end": "2024-02-09",
             "source": "test_source",
         }
     ]
+
+
+def test_data_category_strips_price_payload_fields(viewer_client, tmp_path):
+    catalog = {
+        "ohlcv": [
+            {
+                "path": str(tmp_path / "ohlcv" / "test_source" / "equity" / "US" / "AAPL" / "1d.parquet"),
+                "symbol": "AAPL",
+                "timeframe": "1d",
+                "source": "test_source",
+                "size_bytes": 1024,
+                "start": "2024-03-01",
+                "end": "2024-03-03",
+                "open": 100.0,
+                "high": 101.0,
+                "low": 99.0,
+                "close": 100.5,
+                "volume": 1234,
+            }
+        ]
+    }
+    (tmp_path / "catalog.json").write_text(json.dumps(catalog))
+
+    details_resp = viewer_client.get("/api/data/category/Equities")
+
+    assert details_resp.status_code == 200
+    payload = details_resp.json()["symbols"][0]
+    assert "open" not in payload
+    assert "high" not in payload
+    assert "low" not in payload
+    assert "close" not in payload
+    assert "volume" not in payload
+    assert payload["symbol"] == "AAPL"
+    assert payload["timeframe"] == "1d"
 
 
 def test_data_endpoints_read_fast_date_ranges_without_catalog(viewer_client, tmp_path):
@@ -369,6 +441,10 @@ def test_data_endpoints_read_fast_date_ranges_without_catalog(viewer_client, tmp
             "timeframe": "1d",
             "path": str(ohlcv_dir / "1d.parquet"),
             "size_mb": pytest.approx((ohlcv_dir / "1d.parquet").stat().st_size / (1024 * 1024), rel=0, abs=0.01),
+            "row_count": 3,
+            "file_count": 1,
+            "files": [str(ohlcv_dir / "1d.parquet")],
+            "sources": ["test_source"],
             "start": "2024-03-01",
             "end": "2024-03-03",
             "source": "test_source",
@@ -442,12 +518,214 @@ def test_data_endpoints_reuse_catalog_summary_for_unchanged_files(
             "timeframe": "1d",
             "path": str(parquet_path),
             "size_mb": pytest.approx(parquet_path.stat().st_size / (1024 * 1024), rel=0, abs=0.01),
+            "row_count": 3,
+            "file_count": 1,
+            "files": [str(parquet_path)],
+            "sources": ["test_source"],
             "start": "2024-03-01",
             "end": "2024-03-03",
             "source": "test_source",
             "last_updated": cached_last_updated,
         }
     ]
+
+
+def test_data_endpoints_group_segmented_catalog_entries(viewer_client, tmp_path):
+    catalog = {
+        "ohlcv": [
+            {
+                "path": str(tmp_path / "ohlcv" / "dukascopy" / "forex" / "EURUSD" / "tick_2024_01.parquet"),
+                "symbol": "EURUSD",
+                "timeframe": "tick",
+                "source": "dukascopy",
+                "size_bytes": 1024,
+                "start": "2024-01-01",
+                "end": "2024-01-31",
+                "segment_count": 2,
+                "segments": [
+                    {
+                        "path": str(
+                            tmp_path / "ohlcv" / "dukascopy" / "forex" / "EURUSD" / "tick_2024_01.parquet"
+                        ),
+                        "segment": "2024_01",
+                        "start": "2024-01-01",
+                        "end": "2024-01-31",
+                        "rows": 100,
+                        "size_bytes": 1024,
+                    },
+                    {
+                        "path": str(
+                            tmp_path / "ohlcv" / "dukascopy" / "forex" / "EURUSD" / "tick_2024_02.parquet"
+                        ),
+                        "segment": "2024_02",
+                        "start": "2024-02-01",
+                        "end": "2024-02-29",
+                        "rows": 120,
+                        "size_bytes": 2048,
+                    },
+                ],
+            }
+        ]
+    }
+    (tmp_path / "catalog.json").write_text(json.dumps(catalog))
+
+    overview_resp = viewer_client.get("/api/data/overview")
+
+    assert overview_resp.status_code == 200
+    categories = {
+        category["name"]: category
+        for category in overview_resp.json()["categories"]
+    }
+    assert categories["Forex"]["symbol_count"] == 1
+    assert categories["Forex"]["file_count"] == 1
+    assert categories["Forex"]["start"] == "2024-01-01"
+    assert categories["Forex"]["end"] == "2024-02-29"
+
+    details_resp = viewer_client.get("/api/data/category/Forex")
+
+    assert details_resp.status_code == 200
+    symbols = details_resp.json()["symbols"]
+    assert len(symbols) == 1
+    assert symbols[0]["symbol"] == "EURUSD"
+    assert symbols[0]["timeframe"] == "tick"
+    assert symbols[0]["start"] == "2024-01-01"
+    assert symbols[0]["end"] == "2024-02-29"
+    assert symbols[0]["source"] == "dukascopy"
+    assert symbols[0]["segment_count"] == 2
+    assert [segment["segment"] for segment in symbols[0]["segments"]] == ["2024_01", "2024_02"]
+
+
+def test_data_endpoints_merge_same_symbol_timeframe_across_sources(viewer_client, tmp_path):
+    catalog = {
+        "ohlcv": [
+            {
+                "path": str(tmp_path / "ohlcv" / "dukascopy" / "forex" / "EURUSD" / "tick_2024_01.parquet"),
+                "symbol": "EURUSD",
+                "timeframe": "tick",
+                "source": "dukascopy",
+                "asset_class": "forex",
+                "size_bytes": 1024,
+                "start": "2024-01-01",
+                "end": "2024-01-31",
+                "segment_count": 1,
+                "segments": [
+                    {
+                        "path": str(
+                            tmp_path / "ohlcv" / "dukascopy" / "forex" / "EURUSD" / "tick_2024_01.parquet"
+                        ),
+                        "segment": "2024_01",
+                        "start": "2024-01-01",
+                        "end": "2024-01-31",
+                        "rows": 100,
+                        "size_bytes": 1024,
+                    }
+                ],
+            },
+            {
+                "path": str(tmp_path / "ohlcv" / "histdata" / "forex" / "EURUSD" / "tick_2024_02.parquet"),
+                "symbol": "EURUSD",
+                "timeframe": "tick",
+                "source": "histdata",
+                "asset_class": "forex",
+                "size_bytes": 2048,
+                "start": "2024-02-01",
+                "end": "2024-02-29",
+                "segment_count": 1,
+                "segments": [
+                    {
+                        "path": str(
+                            tmp_path / "ohlcv" / "histdata" / "forex" / "EURUSD" / "tick_2024_02.parquet"
+                        ),
+                        "segment": "2024_02",
+                        "start": "2024-02-01",
+                        "end": "2024-02-29",
+                        "rows": 120,
+                        "size_bytes": 2048,
+                    }
+                ],
+            },
+        ]
+    }
+    (tmp_path / "catalog.json").write_text(json.dumps(catalog))
+
+    overview_resp = viewer_client.get("/api/data/overview")
+    assert overview_resp.status_code == 200
+    categories = {
+        category["name"]: category
+        for category in overview_resp.json()["categories"]
+    }
+    assert categories["Forex"]["symbol_count"] == 1
+    assert categories["Forex"]["file_count"] == 1
+    assert categories["Forex"]["start"] == "2024-01-01"
+    assert categories["Forex"]["end"] == "2024-02-29"
+
+    details_resp = viewer_client.get("/api/data/category/Forex")
+    assert details_resp.status_code == 200
+    symbols = details_resp.json()["symbols"]
+    assert len(symbols) == 1
+
+    merged = symbols[0]
+    assert merged["symbol"] == "EURUSD"
+    assert merged["timeframe"] == "tick"
+    assert merged["source"] == "mixed"
+    assert merged["start"] == "2024-01-01"
+    assert merged["end"] == "2024-02-29"
+    assert merged["segment_count"] == 2
+    assert {segment["segment"] for segment in merged["segments"]} == {"2024_01", "2024_02"}
+
+
+def test_data_endpoints_group_symbol_prefixed_segmented_files(viewer_client, tmp_path):
+    symbol_dir = tmp_path / "ohlcv" / "dukascopy" / "forex"
+    symbol_dir.mkdir(parents=True)
+
+    jan = pd.DataFrame({
+        "timestamp": pd.to_datetime(
+            ["2024-01-01T00:00:00Z", "2024-01-31T23:59:59Z"],
+            utc=True,
+        ),
+        "bid": [2000.1, 2010.2],
+        "ask": [2000.3, 2010.4],
+    })
+    feb = pd.DataFrame({
+        "timestamp": pd.to_datetime(
+            ["2024-02-01T00:00:00Z", "2024-02-29T23:59:59Z"],
+            utc=True,
+        ),
+        "bid": [2020.1, 2030.2],
+        "ask": [2020.3, 2030.4],
+    })
+
+    jan_path = symbol_dir / "XAUUSD_tick_2024_01.parquet"
+    feb_path = symbol_dir / "XAUUSD_tick_2024_02.parquet"
+    jan.to_parquet(jan_path, index=False)
+    feb.to_parquet(feb_path, index=False)
+
+    overview_resp = viewer_client.get("/api/data/overview")
+    assert overview_resp.status_code == 200
+    categories = {
+        category["name"]: category
+        for category in overview_resp.json()["categories"]
+    }
+    assert categories["Forex"]["symbol_count"] == 1
+    assert categories["Forex"]["file_count"] == 1
+    assert categories["Forex"]["start"] == "2024-01-01"
+    assert categories["Forex"]["end"] == "2024-02-29"
+
+    details_resp = viewer_client.get("/api/data/category/Forex")
+    assert details_resp.status_code == 200
+    symbols = details_resp.json()["symbols"]
+    assert len(symbols) == 1
+    assert symbols[0]["symbol"] == "XAUUSD"
+    assert symbols[0]["timeframe"] == "tick"
+    assert symbols[0]["source"] == "dukascopy"
+    assert symbols[0]["segment_count"] == 2
+    assert symbols[0]["start"] == "2024-01-01"
+    assert symbols[0]["end"] == "2024-02-29"
+    assert [Path(segment["path"]).name for segment in symbols[0]["segments"]] == [
+        "XAUUSD_tick_2024_01.parquet",
+        "XAUUSD_tick_2024_02.parquet",
+    ]
+    assert [segment["segment"] for segment in symbols[0]["segments"]] == ["2024_01", "2024_02"]
 
 
 def test_data_category_includes_warning_message_from_catalog(viewer_client, tmp_path):
@@ -480,6 +758,10 @@ def test_data_category_includes_warning_message_from_catalog(viewer_client, tmp_
             "timeframe": "1d",
             "path": str(tmp_path / "ohlcv" / "dolthub" / "equity" / "US" / "MSFT" / "1d.parquet"),
             "size_mb": 0.0,
+            "row_count": 0,
+            "file_count": 1,
+            "files": [str(tmp_path / "ohlcv" / "dolthub" / "equity" / "US" / "MSFT" / "1d.parquet")],
+            "sources": ["dolthub"],
             "start": "2024-04-01",
             "end": "2024-04-02",
             "source": "dolthub",
@@ -528,6 +810,10 @@ def test_dolthub_exports_appear_as_equities(viewer_client, tmp_path):
             "timeframe": "1d",
             "path": str(ohlcv_dir / "MSFT.parquet"),
             "size_mb": pytest.approx((ohlcv_dir / "MSFT.parquet").stat().st_size / (1024 * 1024), rel=0, abs=0.01),
+            "row_count": 2,
+            "file_count": 1,
+            "files": [str(ohlcv_dir / "MSFT.parquet")],
+            "sources": ["dolthub"],
             "start": "2024-04-01",
             "end": "2024-04-02",
             "source": "dolthub",
@@ -569,7 +855,7 @@ def test_data_download_passes_price_type_and_merge_flags(viewer_client, monkeypa
         captured.update(kwargs)
         return {"task_id": task_id, "status": "starting"}
 
-    monkeypatch.setattr(viewer_app_module, "_start_dukascopy_task", fake_start)
+    monkeypatch.setattr(viewer_app_module, "_start_jforex_task", fake_start)
 
     resp = viewer_client.post(
         "/api/data/download",
@@ -587,18 +873,167 @@ def test_data_download_passes_price_type_and_merge_flags(viewer_client, monkeypa
 
     assert resp.status_code == 200
     assert captured["cmd"].count("--price-type") == 1
+    assert "data_tools.downloaders.jforex_dl" in captured["cmd"]
     assert "ask" in captured["cmd"]
-    assert "--merge-tick" in captured["cmd"]
-    assert "--merge-s1" in captured["cmd"]
-    assert "--batch-size" in captured["cmd"]
-    assert "7" in captured["cmd"]
-    assert "--pause-ms" in captured["cmd"]
-    assert "2500" in captured["cmd"]
+    assert "--query-timeout-seconds" in captured["cmd"]
+    assert captured["source_label"] == "dukascopy"
     assert captured["total_items"] == 3
     assert captured["symbols"] == ["EURUSD"]
     assert captured["timeframes"] == ["tick", "s1", "m1"]
     assert captured["batch_size"] == 7
     assert captured["pause_ms"] == 2500
+
+
+def test_data_download_accepts_jforex_source(viewer_client, monkeypatch):
+    import viewer.main as viewer_app_module
+
+    captured: dict[str, object] = {}
+
+    def fake_start(task_id: str, cmd: list[str], **kwargs) -> dict:
+        captured["task_id"] = task_id
+        captured["cmd"] = cmd
+        captured.update(kwargs)
+        return {"task_id": task_id, "status": "starting"}
+
+    monkeypatch.setattr(viewer_app_module, "_start_jforex_task", fake_start)
+
+    resp = viewer_client.post(
+        "/api/data/download",
+        json={
+            "source": "jforex",
+            "symbols": "EURUSD",
+            "timeframes": "h1",
+            "price_type": "bid",
+            "query_timeout_seconds": 1200,
+        },
+    )
+
+    assert resp.status_code == 200
+    assert "data_tools.downloaders.jforex_dl" in captured["cmd"]
+    assert "--query-timeout-seconds" in captured["cmd"]
+    assert "1200" in captured["cmd"]
+    assert captured["source_label"] == "jforex"
+
+
+def test_data_download_rejects_invalid_query_timeout_for_jforex(viewer_client):
+    response = viewer_client.post(
+        "/api/data/download",
+        json={
+            "source": "jforex",
+            "symbols": "EURUSD",
+            "timeframes": "h1",
+            "query_timeout_seconds": 10,
+        },
+    )
+    assert response.status_code == 400
+    message = response.json().get("detail", "")
+    assert "query_timeout_seconds" in message
+
+
+def test_data_cache_invalidate_endpoint_returns_stats(viewer_client, monkeypatch):
+    import viewer.main as viewer_app_module
+
+    monkeypatch.setattr(
+        viewer_app_module.cache_manager,
+        "invalidate_cache",
+        lambda *_args, **_kwargs: 2,
+    )
+    monkeypatch.setattr(
+        viewer_app_module.cache_manager,
+        "get_cache_stats",
+        lambda: {"entries": 0, "invalidations": 2},
+    )
+
+    resp = viewer_client.post("/api/data/cache/invalidate?reason=manual")
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["status"] == "ok"
+    assert payload["removed_entries"] == 2
+    assert payload["reason"] == "manual"
+    assert payload["cache_stats"]["entries"] == 0
+
+
+def test_data_overview_uses_cached_catalog_entries(viewer_client, monkeypatch):
+    import viewer.main as viewer_app_module
+
+    monkeypatch.setattr(
+        viewer_app_module,
+        "_cached_catalog_ohlcv_entries",
+        lambda: [
+            {
+                "path": "/tmp/ohlcv/test_source/etf/SPY/1d.parquet",
+                "symbol": "SPY",
+                "timeframe": "1d",
+                "source": "test_source",
+                "size_bytes": 1024,
+                "start": "2024-01-02",
+                "end": "2024-02-09",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        viewer_app_module.cache_manager,
+        "get_overview_metadata",
+        lambda *_args, **_kwargs: {"summary": {"total_datasets": 1}},
+    )
+
+    response = viewer_client.get("/api/data/overview")
+    assert response.status_code == 200
+    categories = {item["name"]: item for item in response.json()["categories"]}
+    assert categories["ETFs"]["file_count"] == 1
+    assert categories["ETFs"]["start"] == "2024-01-02"
+    assert categories["ETFs"]["end"] == "2024-02-09"
+
+
+def test_list_symbols_reuses_precomputed_data_views(viewer_client, monkeypatch):
+    import viewer.main as viewer_app_module
+
+    viewer_app_module._invalidate_data_views_cache()
+
+    monkeypatch.setattr(
+        viewer_app_module,
+        "_cached_catalog_ohlcv_entries",
+        lambda: [
+            {
+                "path": "/tmp/ohlcv/test_source/equity/US/AAPL/1d.parquet",
+                "symbol": "AAPL",
+                "timeframe": "1d",
+                "source": "test_source",
+                "asset_class": "equity",
+                "size_bytes": 2048,
+                "start": "2024-01-01",
+                "end": "2024-02-01",
+            },
+            {
+                "path": "/tmp/ohlcv/test_source/equity/US/AAPL/1h.parquet",
+                "symbol": "AAPL",
+                "timeframe": "1h",
+                "source": "test_source",
+                "asset_class": "equity",
+                "size_bytes": 1024,
+                "start": "2024-01-01",
+                "end": "2024-02-01",
+            },
+        ],
+    )
+
+    response_1 = viewer_client.get("/api/symbols")
+    assert response_1.status_code == 200
+    payload_1 = response_1.json()
+    assert payload_1["symbols"] == ["AAPL"]
+    assert payload_1["categories"]["equity"] == ["AAPL"]
+
+    monkeypatch.setattr(
+        viewer_app_module,
+        "_cached_catalog_ohlcv_entries",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("_cached_catalog_ohlcv_entries should not run when data views are cached")
+        ),
+    )
+
+    response_2 = viewer_client.get("/api/symbols")
+    assert response_2.status_code == 200
+    assert response_2.json() == payload_1
 
 
 def test_data_tasks_list_and_controls(viewer_client, tmp_path):
@@ -1469,4 +1904,25 @@ def test_logs_endpoint_supports_all_logs_and_multi_level_filters(viewer_client, 
     assert resp.json()["lines"] == [
         '{"timestamp":"2026-03-08T10:00:00+00:00","level":"INFO","message":"viewer-start"}',
         '{"timestamp":"2026-03-08T10:01:00+00:00","level":"WARNING","message":"runner-warn"}',
+    ]
+
+
+def test_logs_endpoint_sorts_space_separated_timestamps(viewer_client, tmp_path):
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    (logs_dir / "viewer.log").write_text(
+        '{"timestamp":"2026-03-08 10:00:00","level":"INFO","message":"viewer-start"}\n'
+        '{"timestamp":"2026-03-08 10:02:00","level":"ERROR","message":"viewer-fail"}\n'
+    )
+    (logs_dir / "runner.log").write_text(
+        '{"timestamp":"2026-03-08 10:01:00","level":"WARNING","message":"runner-warn"}\n'
+    )
+
+    resp = viewer_client.get("/api/logs/ALL_LOGS")
+
+    assert resp.status_code == 200
+    assert resp.json()["lines"] == [
+        '{"timestamp":"2026-03-08 10:00:00","level":"INFO","message":"viewer-start"}',
+        '{"timestamp":"2026-03-08 10:01:00","level":"WARNING","message":"runner-warn"}',
+        '{"timestamp":"2026-03-08 10:02:00","level":"ERROR","message":"viewer-fail"}',
     ]

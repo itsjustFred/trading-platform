@@ -139,6 +139,7 @@ function humanizeSource(source: string | undefined) {
     yfinance: "YFinance",
     dolthub: "Dolthub",
     dukascopy: "Dukascopy",
+    jforex: "JForex",
   };
   if (aliases[normalized.toLowerCase()]) {
     return aliases[normalized.toLowerCase()];
@@ -455,11 +456,16 @@ export function DataManagementPage() {
     void loadOverview();
   }, [loadOverview]);
 
+  const categoryNames = useMemo(
+    () => categories.map((category) => category.name),
+    [categories],
+  );
+
   useEffect(() => {
-    categories.forEach((category) => {
-      void loadCategoryDetails(category.name);
+    categoryNames.forEach((categoryName) => {
+      void loadCategoryDetails(categoryName);
     });
-  }, [categories, loadCategoryDetails]);
+  }, [categoryNames, loadCategoryDetails]);
 
   const groupedByCategory = useMemo(() => {
     const next: Record<string, SymbolGroup[]> = {};
@@ -653,8 +659,8 @@ export function DataManagementPage() {
             }
           : selection,
       );
-    } catch (err: any) {
-      window.alert(err.message || "Failed to delete file.");
+    } catch (err: unknown) {
+      window.alert(err instanceof Error ? err.message : "Failed to delete file.");
     }
   };
 
@@ -675,8 +681,10 @@ export function DataManagementPage() {
         kind: "category",
         category: selection?.category || selectedCategory?.name || "",
       });
-    } catch (err: any) {
-      window.alert(err.message || "Failed to delete symbol files.");
+    } catch (err: unknown) {
+      window.alert(
+        err instanceof Error ? err.message : "Failed to delete symbol files.",
+      );
     }
   };
 
@@ -1992,11 +2000,8 @@ function PanelTable<T>({
   const [sortKey, setSortKey] = useState(defaultSortKey || "");
   const [sortDirection, setSortDirection] =
     useState<SortDirection>(defaultSortDirection);
-
-  useEffect(() => {
-    setSortKey(defaultSortKey || "");
-    setSortDirection(defaultSortDirection);
-  }, [defaultSortDirection, defaultSortKey]);
+  const [pageIndex, setPageIndex] = useState(0);
+  const pageSize = 25;
 
   const sortedRows = useMemo(() => {
     if (!sortKey) {
@@ -2018,16 +2023,30 @@ function PanelTable<T>({
     return sortDirection === "asc" ? sorted : sorted.reverse();
   }, [columns, rows, sortDirection, sortKey]);
 
+  const pageCount = Math.max(1, Math.ceil(sortedRows.length / pageSize));
+  const safePageIndex = Math.min(pageIndex, pageCount - 1);
+
+  const pagedRows = useMemo(
+    () =>
+      sortedRows.slice(
+        safePageIndex * pageSize,
+        safePageIndex * pageSize + pageSize,
+      ),
+    [pageSize, safePageIndex, sortedRows],
+  );
+
   const handleSort = (column: TableColumn<T>) => {
     if (column.sortable === false) {
       return;
     }
     if (sortKey === column.key) {
       setSortDirection((prev) => (prev === "asc" ? "desc" : "asc"));
+      setPageIndex(0);
       return;
     }
     setSortKey(column.key);
     setSortDirection("asc");
+    setPageIndex(0);
   };
 
   if (rows.length === 0) {
@@ -2090,13 +2109,13 @@ function PanelTable<T>({
           </tr>
         </thead>
         <tbody>
-          {sortedRows.map((row, index) => (
+          {pagedRows.map((row, index) => (
             <tr
               key={getRowKey(row)}
               onClick={() => onRowClick?.(row)}
               style={{
                 background:
-                  index % 2 === 0
+                  (safePageIndex * pageSize + index) % 2 === 0
                     ? "rgba(8, 15, 31, 0.46)"
                     : "rgba(15, 23, 42, 0.18)",
                 cursor: onRowClick ? "pointer" : "default",
@@ -2119,6 +2138,62 @@ function PanelTable<T>({
           ))}
         </tbody>
       </table>
+      {sortedRows.length > pageSize && (
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            gap: "12px",
+            padding: "12px 14px",
+            borderTop: "1px solid rgba(148, 163, 184, 0.12)",
+            background: "rgba(15, 23, 42, 0.9)",
+          }}
+        >
+          <div style={{ color: "var(--color-text-muted)", fontSize: "0.76rem" }}>
+            Showing{" "}
+            {Math.min(safePageIndex * pageSize + 1, sortedRows.length)}–
+            {Math.min((safePageIndex + 1) * pageSize, sortedRows.length)} of{" "}
+            {sortedRows.length}
+          </div>
+          <div style={{ display: "flex", gap: "8px" }}>
+            <button
+              type="button"
+              onClick={() => setPageIndex((current) => Math.max(current - 1, 0))}
+              disabled={safePageIndex === 0}
+              style={{
+                padding: "8px 12px",
+                borderRadius: "10px",
+                border: "1px solid rgba(148, 163, 184, 0.18)",
+                background: "rgba(15, 23, 42, 0.82)",
+                color: "var(--color-text)",
+                cursor: safePageIndex === 0 ? "not-allowed" : "pointer",
+                opacity: safePageIndex === 0 ? 0.45 : 1,
+              }}
+            >
+              Previous
+            </button>
+            <button
+              type="button"
+              onClick={() =>
+                setPageIndex((current) => Math.min(current + 1, pageCount - 1))
+              }
+              disabled={safePageIndex >= pageCount - 1}
+              style={{
+                padding: "8px 12px",
+                borderRadius: "10px",
+                border: "1px solid rgba(148, 163, 184, 0.18)",
+                background: "rgba(15, 23, 42, 0.82)",
+                color: "var(--color-text)",
+                cursor: safePageIndex >= pageCount - 1 ? "not-allowed" : "pointer",
+                opacity: safePageIndex >= pageCount - 1 ? 0.45 : 1,
+              }}
+            >
+              Next
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

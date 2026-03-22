@@ -1,0 +1,21 @@
+accounts:
+  - id: alpaca-paper
+    broker: alpaca
+  - id: ctrader-live
+    broker: ctrader
+
+deployments:
+  - strategy_name: us_equities_momentum
+    account_id: alpaca-paper
+    symbols:
+      - AAPL
+      - MSFT
+    timeframe: 1h
+
+  - strategy_name: fx_breakout
+    account_id: ctrader-live
+    symbols:
+      - EURUSD
+      - XAUUSD
+    timeframe: 15m
+

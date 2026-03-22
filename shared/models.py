@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import asdict, dataclass, field, fields as dataclass_fields
-from datetime import date, datetime
+from dataclasses import dataclass, field
+from dataclasses import fields as dataclass_fields
+from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -68,6 +70,89 @@ class StrategyMeta(BaseModel):
             source_url=d.get("source_url", ""),
             notes=d.get("notes", ""),
         )
+
+
+# ─── Live trading models ─────────────────────────────────────────────────────
+
+
+class LiveAccountConfig(BaseModel):
+    """Live account configuration stored in DB and used by API payloads."""
+
+    id: str
+    broker: Literal["alpaca", "ctrader"]
+    name: str = ""
+
+
+class LiveAccount(BaseModel):
+    """Discovered broker account payload exposed to the frontend."""
+
+    id: str
+    name: str
+    broker: Literal["alpaca", "ctrader"]
+    balance: float = 0.0
+    is_demo: bool = False
+
+
+class LiveDeploymentConfig(BaseModel):
+    """Live deployment record (strategy + account + market + runtime status)."""
+
+    id: UUID = Field(default_factory=uuid4)
+    strategy_name: str
+    account_id: str
+    symbols: list[str]
+    timeframe: str
+    status: Literal["ACTIVE", "PAUSED", "STOPPED"] = "ACTIVE"
+    settings: dict[str, Any] = Field(default_factory=dict)
+
+
+class LiveDeploymentCreateRequest(BaseModel):
+    """Payload for creating a live deployment via API."""
+
+    strategy_name: str
+    account_id: str
+    symbols: list[str]
+    timeframe: str
+    settings: dict[str, Any] = Field(default_factory=dict)
+
+
+class LiveDeploymentStatusUpdateRequest(BaseModel):
+    """Payload for updating a deployment runtime status via API."""
+
+    status: Literal["ACTIVE", "PAUSED", "STOPPED"]
+
+
+class LiveSignal(BaseModel):
+    """Intent emitted by strategy logic before broker execution."""
+
+    id: UUID = Field(default_factory=uuid4)
+    deployment_id: str
+    symbol: str
+    action: Literal["buy", "sell"]
+    theoretical_price: float
+    timestamp: datetime
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class LiveExecution(BaseModel):
+    """Execution fill received from broker for a previously emitted signal."""
+
+    id: UUID = Field(default_factory=uuid4)
+    signal_id: UUID
+    actual_price: float
+    filled_qty: float
+    commission: float
+    timestamp: datetime
+    broker_order_id: str
+
+
+class LiveBalanceRecord(BaseModel):
+    """Periodic balance/equity snapshot for a live broker account."""
+
+    id: UUID = Field(default_factory=uuid4)
+    account_id: str
+    timestamp: datetime
+    balance: float
+    equity: float
 
 
 # ─── Timeframe constants ────────────────────────────────────────────────────
