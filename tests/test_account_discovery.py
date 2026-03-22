@@ -6,42 +6,17 @@ import live_runner.account_discovery as account_discovery
 
 
 def test_ctrader_account_name_prefers_resolved_account_label():
-    counters: dict[tuple[str, bool], int] = {}
     name = account_discovery._ctrader_account_name(
-        broker_name="Spotware",
+        account_id=10105152,
         account_label="Fusion Markets Demo",
-        is_demo=True,
-        fallback_counters=counters,
     )
 
     assert name == "Fusion Markets Demo"
-    assert counters == {}
 
 
-def test_ctrader_account_name_fallback_uses_stable_order_per_broker_and_mode():
-    counters: dict[tuple[str, bool], int] = {}
-    first = account_discovery._ctrader_account_name(
-        broker_name="",
-        account_label="",
-        is_demo=True,
-        fallback_counters=counters,
-    )
-    second = account_discovery._ctrader_account_name(
-        broker_name="",
-        account_label="",
-        is_demo=True,
-        fallback_counters=counters,
-    )
-    live = account_discovery._ctrader_account_name(
-        broker_name="",
-        account_label="",
-        is_demo=False,
-        fallback_counters=counters,
-    )
-
-    assert first == "cTrader Demo #1"
-    assert second == "cTrader Demo #2"
-    assert live == "cTrader Live #1"
+def test_ctrader_account_name_fallback_uses_account_id():
+    resolved = account_discovery._ctrader_account_name(account_id=10105152, account_label="")
+    assert resolved == "cTrader 10105152"
 
 
 def test_ctrader_extract_account_label_ignores_numeric_identifier_fields():

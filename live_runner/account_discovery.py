@@ -171,15 +171,6 @@ def _trader_balance(trader: Any) -> float:
     return _safe_float(getattr(trader, "balance", 0.0), default=0.0) / scale
 
 
-def _ctrader_mode_label(is_demo: bool) -> str:
-    return "Demo" if is_demo else "Live"
-
-
-def _ctrader_broker_label(broker_name: str) -> str:
-    normalized = broker_name.strip()
-    return normalized if normalized else "cTrader"
-
-
 def _ctrader_message_name_sources(message: Any) -> list[Any]:
     if message is None:
         return []
@@ -238,22 +229,24 @@ def _ctrader_extract_broker_name(*sources: Any) -> str:
 
 def _ctrader_account_name(
     *,
-    broker_name: str,
+    account_id: int | str,
     account_label: str,
-    is_demo: bool,
-    fallback_counters: dict[tuple[str, bool], int],
 ) -> str:
+    """Resolve a display name for a cTrader account.
+
+    Priority:
+    1) Use a human-readable account label discovered from API fields.
+    2) Fallback to the exact format "cTrader {accountId}" when no label is available.
+
+    Do NOT attempt any broker-specific fallbacks (e.g., "Fusion Markets Demo #N").
+    """
     resolved_name = account_label.strip()
     if resolved_name:
         return resolved_name
 
-    broker_label = _ctrader_broker_label(broker_name)
-    mode_label = _ctrader_mode_label(is_demo)
-
-    counter_key = (broker_label, is_demo)
-    fallback_index = fallback_counters.get(counter_key, 0) + 1
-    fallback_counters[counter_key] = fallback_index
-    return f"{broker_label} {mode_label} #{fallback_index}"
+    normalized_account_id = str(account_id).strip()
+    # Explicit exact fallback format required by task
+    return f"cTrader {normalized_account_id}" if normalized_account_id else "cTrader"
 
 
 async def _discover_ctrader_accounts_on_host(
@@ -332,7 +325,6 @@ async def _discover_ctrader_accounts_on_host(
                 raise RuntimeError(f"Unexpected account list response: {type(list_res).__name__}")
 
             accounts: list[LiveAccount] = []
-            fallback_name_counters: dict[tuple[str, bool], int] = {}
             account_items = sorted(
                 list_res.ctidTraderAccount,
                 key=lambda item: int(getattr(item, "ctidTraderAccountId", 0) or 0),
@@ -434,10 +426,8 @@ async def _discover_ctrader_accounts_on_host(
                     )
 
                 account_name = _ctrader_account_name(
-                    broker_name=broker_name,
+                    account_id=account_id,
                     account_label=account_name_hint,
-                    is_demo=is_demo,
-                    fallback_counters=fallback_name_counters,
                 )
                 accounts.append(
                     LiveAccount(

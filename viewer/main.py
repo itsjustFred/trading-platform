@@ -302,7 +302,8 @@ class DataDownloadRequest(SQLModel):
     timeframes: str = "1m"
     start: str = ""
     end: str = ""
-    price_type: str = "bid"
+    offer_side: str = "bid"
+    price_type: str | None = None
     merge_tick: bool = False
     merge_bid_ask: bool = False
     merge_s1: bool = False
@@ -2727,7 +2728,9 @@ async def data_download(payload: DataDownloadRequest) -> dict[str, Any]:
     timeframes = payload.timeframes
     start = payload.start
     end = payload.end
-    price_type = payload.price_type
+    offer_side = str(payload.offer_side or payload.price_type or "bid").strip().lower()
+    if offer_side not in {"bid", "ask", "both"}:
+        raise HTTPException(status_code=400, detail="offer_side must be one of: bid, ask, both")
     merge_tick = bool(payload.merge_tick or payload.merge_bid_ask)
     merge_s1 = bool(payload.merge_s1 or payload.merge_bid_ask)
     batch_size = _safe_int(payload.batch_size if payload.batch_size is not None else payload.concurrency, 10)
@@ -2786,8 +2789,8 @@ async def data_download(payload: DataDownloadRequest) -> dict[str, Any]:
             cmd.extend(["--start", start])
         if end:
             cmd.extend(["--end", end])
-        if price_type:
-            cmd.extend(["--price-type", str(price_type)])
+        if offer_side:
+            cmd.extend(["--offer-side", offer_side])
 
         total_items = max(len(symbol_list) * len(timeframe_list), 1)
         return _start_jforex_task(
@@ -2798,7 +2801,7 @@ async def data_download(payload: DataDownloadRequest) -> dict[str, Any]:
             timeframes=timeframe_list,
             start=start or None,
             end=end or None,
-            price_type=str(price_type),
+            offer_side=offer_side,
             merge_tick=merge_tick,
             merge_s1=merge_s1,
             batch_size=batch_size,
