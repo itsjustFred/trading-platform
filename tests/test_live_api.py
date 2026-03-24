@@ -48,12 +48,41 @@ def test_live_endpoints_return_expected_payloads(monkeypatch):
                 broker="alpaca",
                 balance=10_000.0,
                 is_demo=True,
+                broker_login=account_id,
             )
         ]
 
     monkeypatch.setattr(viewer_main_module, "discover_configured_accounts", _discover_accounts_stub)
     monkeypatch.setattr(viewer_main_module, "list_live_accounts", lambda: accounts)
     monkeypatch.setattr(viewer_main_module, "list_live_deployments", lambda: deployments)
+    monkeypatch.setattr(
+        viewer_main_module,
+        "load_live_account_stats_inputs",
+        lambda _account_id: (
+            [balance] if _account_id == account_id else [],
+            [
+                {
+                    "signal_id": signal_id,
+                    "execution_id": "22222222-2222-2222-2222-222222222222",
+                    "deployment_id": deployment_id,
+                    "symbol": "AAPL",
+                    "action": "buy",
+                    "theoretical_price": 100.0,
+                    "actual_price": 100.25,
+                    "slippage": 0.25,
+                    "slippage_bps": 25.0,
+                    "filled_qty": 1.0,
+                    "commission": 0.01,
+                    "signal_timestamp": datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc),
+                    "execution_timestamp": datetime(2026, 1, 1, 12, 0, 2, tzinfo=timezone.utc),
+                    "broker_order_id": "broker-123",
+                    "signal_metadata": {"qty": 1},
+                }
+            ]
+            if _account_id == account_id
+            else [],
+        ),
+    )
     monkeypatch.setattr(
         viewer_main_module,
         "list_live_deployments_for_account",
@@ -88,6 +117,30 @@ def test_live_endpoints_return_expected_payloads(monkeypatch):
         "_deployment_ids_for_account",
         lambda _account_id, _deployments: [_account_id, deployment_id],
     )
+    monkeypatch.setattr(
+        viewer_main_module,
+        "load_live_account_stats_inputs",
+        lambda _account_id: (
+            [balance],
+            [
+                {
+                    "signal_id": signal_id,
+                    "execution_id": "22222222-2222-2222-2222-222222222222",
+                    "deployment_id": deployment_id,
+                    "symbol": "AAPL",
+                    "action": "buy",
+                    "theoretical_price": 100.0,
+                    "actual_price": 100.25,
+                    "filled_qty": 1.0,
+                    "commission": 0.01,
+                    "signal_timestamp": datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc),
+                    "execution_timestamp": datetime(2026, 1, 1, 12, 0, 2, tzinfo=timezone.utc),
+                    "broker_order_id": "broker-123",
+                    "signal_metadata": {"qty": 1},
+                }
+            ],
+        ),
+    )
 
     client = TestClient(viewer_main_module.app)
 
@@ -98,6 +151,8 @@ def test_live_endpoints_return_expected_payloads(monkeypatch):
     assert accounts_payload[0]["id"] == account_id
     assert accounts_payload[0]["is_demo"] is True
     assert accounts_payload[0]["balance"] == 10_000.0
+    assert accounts_payload[0]["broker_login"] == account_id
+    assert accounts_payload[0]["ctid"] is None
 
     deployments_resp = client.get("/api/live/deployments")
     assert deployments_resp.status_code == 200
@@ -125,6 +180,20 @@ def test_live_endpoints_return_expected_payloads(monkeypatch):
     assert first_trade["actual_price"] == 100.25
     assert first_trade["theoretical_price"] == 100.0
     assert first_trade["slippage"] == 0.25
+
+    stats_resp = client.get(f"/api/live/stats/{account_id}")
+    assert stats_resp.status_code == 200
+    stats_payload = stats_resp.json()
+    assert stats_payload["account_id"] == account_id
+    assert stats_payload["total_trades"] == 1
+    assert stats_payload["winning_trades"] == 0
+    assert stats_payload["losing_trades"] == 0
+    assert stats_payload["win_rate"] == 0.0
+    assert stats_payload["total_pnl"] == 0.0
+    assert stats_payload["max_drawdown"] == 0.0
+    assert stats_payload["max_drawdown_pct"] == 0.0
+    assert stats_payload["current_balance"] == 10_000.0
+    assert stats_payload["current_equity"] == 10_010.0
 
 
 def test_live_deployments_crud_endpoints(monkeypatch):
@@ -221,3 +290,124 @@ def test_live_deployments_returns_empty_array(monkeypatch):
     response = client.get("/api/live/deployments")
     assert response.status_code == 200
     assert response.json() == []
+
+
+def test_live_stats_endpoint_returns_defaults_for_missing_data(monkeypatch):
+    import viewer.main as viewer_main_module
+
+    monkeypatch.setattr(
+        viewer_main_module,
+        "load_live_account_stats_inputs",
+        lambda _account_id: ([], []),
+    )
+
+    client = TestClient(viewer_main_module.app)
+    response = client.get("/api/live/stats/unknown-account")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["account_id"] == "unknown-account"
+    assert payload["total_trades"] == 0
+    assert payload["winning_trades"] == 0
+    assert payload["losing_trades"] == 0
+    assert payload["win_rate"] == 0.0
+    assert payload["total_pnl"] == 0.0
+    assert payload["current_balance"] == 0.0
+    assert payload["current_equity"] == 0.0
+    assert payload["max_drawdown"] == 0.0
+    assert payload["max_drawdown_pct"] == 0.0
+
+
+def test_live_stats_endpoint_uses_realized_pnl_and_balance_drawdown(monkeypatch):
+    import viewer.main as viewer_main_module
+
+    account_id = "acc-1"
+    balances = [
+        LiveBalanceRecord(
+            id=uuid4(),
+            account_id=account_id,
+            timestamp=datetime(2026, 1, 1, 10, 0, tzinfo=timezone.utc),
+            balance=1000.0,
+            equity=1000.0,
+        ),
+        LiveBalanceRecord(
+            id=uuid4(),
+            account_id=account_id,
+            timestamp=datetime(2026, 1, 1, 11, 0, tzinfo=timezone.utc),
+            balance=1100.0,
+            equity=1110.0,
+        ),
+        LiveBalanceRecord(
+            id=uuid4(),
+            account_id=account_id,
+            timestamp=datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc),
+            balance=880.0,
+            equity=900.0,
+        ),
+        LiveBalanceRecord(
+            id=uuid4(),
+            account_id=account_id,
+            timestamp=datetime(2026, 1, 1, 13, 0, tzinfo=timezone.utc),
+            balance=950.0,
+            equity=960.0,
+        ),
+    ]
+
+    execution_rows = [
+        {
+            "symbol": "AAPL",
+            "action": "buy",
+            "actual_price": 100.0,
+            "filled_qty": 1.0,
+            "execution_timestamp": datetime(2026, 1, 1, 10, 5, tzinfo=timezone.utc),
+        },
+        {
+            "symbol": "AAPL",
+            "action": "sell",
+            "actual_price": 110.0,
+            "filled_qty": 1.0,
+            "execution_timestamp": datetime(2026, 1, 1, 10, 10, tzinfo=timezone.utc),
+        },
+        {
+            "symbol": "AAPL",
+            "action": "buy",
+            "actual_price": 100.0,
+            "filled_qty": 1.0,
+            "execution_timestamp": datetime(2026, 1, 1, 10, 15, tzinfo=timezone.utc),
+        },
+        {
+            "symbol": "AAPL",
+            "action": "sell",
+            "actual_price": 90.0,
+            "filled_qty": 1.0,
+            "execution_timestamp": datetime(2026, 1, 1, 10, 20, tzinfo=timezone.utc),
+        },
+        {
+            "symbol": "AAPL",
+            "action": "buy",
+            "actual_price": 105.0,
+            "filled_qty": 1.0,
+            "execution_timestamp": datetime(2026, 1, 1, 10, 25, tzinfo=timezone.utc),
+        },
+    ]
+    monkeypatch.setattr(
+        viewer_main_module,
+        "load_live_account_stats_inputs",
+        lambda _account_id: (balances, execution_rows),
+    )
+
+    client = TestClient(viewer_main_module.app)
+    response = client.get(f"/api/live/stats/{account_id}")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["account_id"] == account_id
+    assert payload["total_trades"] == 5
+    assert payload["winning_trades"] == 1
+    assert payload["losing_trades"] == 1
+    assert payload["win_rate"] == 20.0
+    assert payload["total_pnl"] == 0.0
+    assert payload["current_balance"] == 950.0
+    assert payload["current_equity"] == 960.0
+    assert payload["max_drawdown"] == 220.0
+    assert payload["max_drawdown_pct"] == 20.0

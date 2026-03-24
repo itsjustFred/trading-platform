@@ -19,6 +19,7 @@ interface OptimizeModalProps {
   backtestId: string;
   backtestTitle: string;
   parameters: Record<string, StrategyParameterValue>;
+  onTaskStarted?: (taskId: string) => void;
 }
 
 interface ParameterDraft {
@@ -140,6 +141,7 @@ export function OptimizeModal({
   backtestId,
   backtestTitle,
   parameters,
+  onTaskStarted,
 }: OptimizeModalProps) {
   const { showToast } = useToast();
   const [parameterDrafts, setParameterDrafts] = useState<Record<string, ParameterDraft>>({});
@@ -222,7 +224,7 @@ export function OptimizeModal({
         throw new Error("Configure at least one parameter range or category list.");
       }
 
-      await runOptimization({
+      const response = await runOptimization({
         base_backtest_id: backtestId,
         target_metric: targetMetric,
         n_trials: parsedTrials,
@@ -230,6 +232,8 @@ export function OptimizeModal({
         parameter_ranges: parameterRanges,
       });
 
+      const taskId = response.task_id || response.job_id;
+      onTaskStarted?.(taskId);
       showToast("Optimization started", "success");
       onClose();
     } catch (caughtError) {

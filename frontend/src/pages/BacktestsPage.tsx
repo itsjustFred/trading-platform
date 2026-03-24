@@ -403,6 +403,7 @@ export function BacktestsPage() {
       <CreateBacktestModal
         open={showCreateModal}
         onClose={() => setShowCreateModal(false)}
+        onTaskStarted={() => setShowCreateModal(false)}
       />
     </div>
   );

@@ -6,16 +6,23 @@ import {
   createLiveDeployment,
   deleteLiveDeployment,
   getLiveAccounts,
+  getLiveBalances,
   getLiveDeployments,
+  getLiveStats,
+  getLiveTrades,
   getStrategies,
   updateLiveDeploymentStatus,
 } from "../api/client";
 import { Modal } from "../components/Modal";
+import { Sparkline } from "../components/Sparkline";
 import { SymbolInput } from "../components/SymbolInput";
 import type {
   LiveAccount,
+  LiveAccountStats,
+  LiveBalanceRecord,
   LiveDeploymentConfig,
   LiveDeploymentStatus,
+  LiveTradeSlippage,
   StrategyMeta,
 } from "../api/types";
 import { useToast } from "../components/ToastProvider";
@@ -24,7 +31,7 @@ type DeploymentCard = LiveDeploymentConfig & {
   broker: LiveAccount["broker"] | "unknown";
 };
 
-const LIVE_POLL_MS = 15000;
+const LIVE_POLL_MS = 30000;
 const DEFAULT_TIMEFRAME = "1h";
 const LIVE_TIMEFRAMES = [
   "tick",
@@ -49,11 +56,19 @@ type CreateDeploymentForm = {
   settings_json: string;
 };
 
+type LiveHubAccountStats = {
+  tradesCount: number;
+  winRate: number;
+  totalPnl: number;
+  sparkline: number[];
+};
+
 export function LiveHubPage() {
   const navigate = useNavigate();
   const { showToast } = useToast();
   const [accounts, setAccounts] = useState<LiveAccount[]>([]);
   const [cards, setCards] = useState<DeploymentCard[]>([]);
+  const [statsByAccount, setStatsByAccount] = useState<Record<string, LiveHubAccountStats>>({});
   const [strategies, setStrategies] = useState<StrategyMeta[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -81,6 +96,40 @@ export function LiveHubPage() {
           getLiveAccounts(),
           getLiveDeployments(),
         ]);
+        const statsEntries = await Promise.all(
+          accountPayload.map(async (account) => {
+            const [statsResult, balancesResult] = await Promise.allSettled([
+              getLiveStats(account.id),
+              getLiveBalances(account.id),
+            ]);
+            const balanceSeries =
+              balancesResult.status === "fulfilled" ? balancesResult.value.series : [];
+
+            if (statsResult.status === "fulfilled") {
+              return [
+                account.id,
+                normalizeLiveHubStats(statsResult.value, balanceSeries),
+              ] as const;
+            }
+
+            try {
+              const tradesPayload = await getLiveTrades(account.id);
+              return [
+                account.id,
+                buildLiveHubFallbackStats(balanceSeries, tradesPayload.trades),
+              ] as const;
+            } catch {
+              return [
+                account.id,
+                buildLiveHubFallbackStats(balanceSeries, []),
+              ] as const;
+            }
+          }),
+        );
+        const nextStatsByAccount: Record<string, LiveHubAccountStats> = {};
+        for (const [accountId, stats] of statsEntries) {
+          nextStatsByAccount[accountId] = stats;
+        }
         const brokerByAccount = new Map<string, LiveAccount["broker"]>();
         accountPayload.forEach((account) => {
           brokerByAccount.set(account.id, account.broker);
@@ -91,6 +140,7 @@ export function LiveHubPage() {
         }));
         setAccounts(accountPayload);
         setCards(nextCards);
+        setStatsByAccount(nextStatsByAccount);
         setError("");
       } catch (issue: unknown) {
         const message =
@@ -528,6 +578,18 @@ export function LiveHubPage() {
         >
           {accounts.map((account) => {
             const accountCards = groupedByAccount.get(account.id) ?? [];
+            const accountStats = statsByAccount[account.id];
+            const tradesCount = accountStats?.tradesCount ?? 0;
+            const winRate = accountStats?.winRate ?? 0;
+            const totalPnl = accountStats?.totalPnl ?? 0;
+            const sparklinePoints = accountStats?.sparkline ?? [];
+            const hasNoTradeData = tradesCount === 0 && sparklinePoints.length === 0;
+            const loginId = account.broker_login || account.login || null;
+            const ctidId = account.ctid || null;
+            const primaryLine =
+              account.broker === "ctrader"
+                ? `cTrader ${account.is_demo ? "Demo" : "Live"}`
+                : accountDisplayName(account);
             return (
               <div
                 key={account.id}
@@ -544,7 +606,7 @@ export function LiveHubPage() {
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                   <div>
                     <div style={{ fontSize: "0.98rem", fontWeight: 700 }}>
-                      {accountDisplayName(account)}
+                      {primaryLine}
                     </div>
                   </div>
                   <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
@@ -579,6 +641,86 @@ export function LiveHubPage() {
 
                 <div style={{ color: "#e2e8f0", fontSize: "0.9rem" }}>
                   Balance: ${account.balance.toLocaleString("en-US", { maximumFractionDigits: 2 })}
+                </div>
+                {(loginId || ctidId) && (
+                  <div
+                    style={{
+                      border: "1px solid rgba(148,163,184,0.26)",
+                      borderRadius: "8px",
+                      padding: "8px 10px",
+                      background: "rgba(15, 23, 42, 0.35)",
+                      display: "grid",
+                      gap: "4px",
+                      fontSize: "0.78rem",
+                      lineHeight: 1.35,
+                    }}
+                  >
+                    {loginId && (
+                      <div style={{ color: "#e2e8f0" }}>
+                        <span style={{ color: "var(--color-text-muted)" }}>Login:</span>{" "}
+                        <span style={{ fontWeight: 600 }}>{loginId}</span>
+                      </div>
+                    )}
+                    {ctidId && (
+                      <div style={{ color: "#e2e8f0" }}>
+                        <span style={{ color: "var(--color-text-muted)" }}>cTID:</span>{" "}
+                        <span style={{ fontWeight: 600 }}>{ctidId}</span>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                <div
+                  style={{
+                    border: "1px solid rgba(56, 189, 248, 0.2)",
+                    borderRadius: "10px",
+                    padding: "8px 10px 6px",
+                    background: "rgba(2, 6, 23, 0.35)",
+                  }}
+                >
+                  {sparklinePoints.length > 1 ? (
+                    <Sparkline data={sparklinePoints} width={300} height={42} />
+                  ) : (
+                    <div
+                      style={{
+                        height: "42px",
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        color: "var(--color-text-muted)",
+                        fontSize: "0.75rem",
+                      }}
+                    >
+                      {hasNoTradeData ? "No trades yet" : "Waiting for equity points…"}
+                    </div>
+                  )}
+                </div>
+                <div
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
+                    gap: "8px",
+                  }}
+                >
+                  <div style={miniStatStyle}>
+                    <span style={miniStatLabelStyle}>Trades</span>
+                    <span style={miniStatValueStyle}>{tradesCount}</span>
+                  </div>
+                  <div style={miniStatStyle}>
+                    <span style={miniStatLabelStyle}>Total PnL</span>
+                    <span
+                      style={{
+                        ...miniStatValueStyle,
+                        color: totalPnl >= 0 ? "#86efac" : "#fecaca",
+                      }}
+                    >
+                      {formatSignedUsd(totalPnl)}
+                    </span>
+                  </div>
+                  <div style={miniStatStyle}>
+                    <span style={miniStatLabelStyle}>Win Rate</span>
+                    <span style={winRateBadgeStyle(winRate)}>{formatPercent(winRate)}</span>
+                  </div>
                 </div>
 
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
@@ -711,6 +853,190 @@ const baseControlStyle: React.CSSProperties = {
   cursor: "pointer",
   transition: "border-color 120ms ease, background 120ms ease",
 };
+
+const miniStatStyle: React.CSSProperties = {
+  border: "1px solid rgba(148, 163, 184, 0.22)",
+  borderRadius: "8px",
+  padding: "7px 8px",
+  display: "grid",
+  gap: "4px",
+  background: "rgba(2, 6, 23, 0.28)",
+};
+
+const miniStatLabelStyle: React.CSSProperties = {
+  fontSize: "0.68rem",
+  color: "var(--color-text-muted)",
+  letterSpacing: "0.04em",
+  textTransform: "uppercase",
+};
+
+const miniStatValueStyle: React.CSSProperties = {
+  fontSize: "0.82rem",
+  color: "#e2e8f0",
+  fontWeight: 600,
+};
+
+function winRateBadgeStyle(rate: number): React.CSSProperties {
+  const isStrong = rate >= 55;
+  const isWeak = rate <= 45;
+  return {
+    justifySelf: "start",
+    borderRadius: "999px",
+    padding: "2px 8px",
+    fontSize: "0.72rem",
+    fontWeight: 700,
+    border: isStrong
+      ? "1px solid rgba(34, 197, 94, 0.34)"
+      : isWeak
+        ? "1px solid rgba(248, 113, 113, 0.34)"
+        : "1px solid rgba(148, 163, 184, 0.35)",
+    background: isStrong
+      ? "rgba(34, 197, 94, 0.14)"
+      : isWeak
+        ? "rgba(248, 113, 113, 0.14)"
+        : "rgba(148, 163, 184, 0.14)",
+    color: isStrong ? "#86efac" : isWeak ? "#fecaca" : "#cbd5e1",
+  };
+}
+
+function formatSignedUsd(value: number): string {
+  const sign = value > 0 ? "+" : value < 0 ? "-" : "";
+  return `${sign}$${Math.abs(value).toLocaleString("en-US", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  })}`;
+}
+
+function formatPercent(value: number): string {
+  return `${value.toFixed(1)}%`;
+}
+
+function normalizeLiveHubStats(
+  stats: LiveAccountStats,
+  balances: LiveBalanceRecord[],
+): LiveHubAccountStats {
+  const tradesCount = asFiniteNumber(stats.total_trades, 0);
+  const winRate = toWinRatePercent(stats.win_rate);
+  const totalPnl = asFiniteNumber(stats.total_pnl, 0);
+  return {
+    tradesCount,
+    winRate,
+    totalPnl,
+    sparkline: balances
+      .map((item) => asFiniteNumber(item.equity, Number.NaN))
+      .filter((value) => Number.isFinite(value)),
+  };
+}
+
+function buildLiveHubFallbackStats(
+  balances: LiveBalanceRecord[],
+  trades: LiveTradeSlippage[],
+): LiveHubAccountStats {
+  const tradesCount = trades.length;
+  const realized = calculateRealizedTradeStats(trades);
+  const winRate = tradesCount > 0 ? (realized.winningTrades / tradesCount) * 100 : 0;
+  const sparklineSource = balances.map((item) =>
+    asFiniteNumber(item.equity, Number.NaN),
+  );
+
+  return {
+    tradesCount,
+    winRate,
+    totalPnl: realized.totalPnl,
+    sparkline: sparklineSource.filter((value) => Number.isFinite(value)),
+  };
+}
+
+function calculateRealizedTradeStats(trades: LiveTradeSlippage[]): {
+  totalPnl: number;
+  winningTrades: number;
+  losingTrades: number;
+} {
+  const positions = new Map<string, { qty: number; avg: number }>();
+  let totalPnl = 0;
+  let winningTrades = 0;
+  let losingTrades = 0;
+
+  const orderedTrades = [...trades].sort((a, b) => a.execution_time - b.execution_time);
+  for (const trade of orderedTrades) {
+    const action = String(trade.action || "").toLowerCase();
+    const direction = action === "buy" ? 1 : action === "sell" ? -1 : 0;
+    if (direction === 0) {
+      continue;
+    }
+
+    const quantity = Math.abs(asFiniteNumber(trade.filled_qty, 0));
+    const price = asFiniteNumber(trade.actual_price, 0);
+    if (quantity <= 0 || price <= 0) {
+      continue;
+    }
+
+    const symbol = String(trade.symbol || "UNKNOWN").toUpperCase();
+    const delta = quantity * direction;
+    const current = positions.get(symbol) ?? { qty: 0, avg: 0 };
+    const currentQty = current.qty;
+    const currentAvg = current.avg;
+
+    if (currentQty === 0) {
+      positions.set(symbol, { qty: delta, avg: price });
+      continue;
+    }
+
+    if (currentQty * delta > 0) {
+      const combinedQty = Math.abs(currentQty) + Math.abs(delta);
+      const nextAvg =
+        combinedQty > 0
+          ? ((Math.abs(currentQty) * currentAvg) + (Math.abs(delta) * price)) / combinedQty
+          : price;
+      positions.set(symbol, { qty: currentQty + delta, avg: nextAvg });
+      continue;
+    }
+
+    const closedQty = Math.min(Math.abs(currentQty), Math.abs(delta));
+    if (closedQty > 0) {
+      const sideSign = currentQty > 0 ? 1 : -1;
+      const realized = (price - currentAvg) * closedQty * sideSign;
+      totalPnl += realized;
+      if (realized > 0) {
+        winningTrades += 1;
+      } else if (realized < 0) {
+        losingTrades += 1;
+      }
+    }
+
+    const newQty = currentQty + delta;
+    if (newQty === 0) {
+      positions.set(symbol, { qty: 0, avg: 0 });
+    } else if (currentQty * newQty > 0) {
+      positions.set(symbol, { qty: newQty, avg: currentAvg });
+    } else {
+      positions.set(symbol, { qty: newQty, avg: price });
+    }
+  }
+
+  return { totalPnl, winningTrades, losingTrades };
+}
+
+function toWinRatePercent(value: unknown): number {
+  const numeric = asFiniteNumber(value, 0);
+  if (numeric > 0 && numeric <= 1) {
+    return numeric * 100;
+  }
+  return numeric;
+}
+
+function asFiniteNumber(value: unknown, fallback: number): number {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === "string") {
+    const numeric = Number(value);
+    if (Number.isFinite(numeric)) {
+      return numeric;
+    }
+  }
+  return fallback;
+}
 
 function statusChipStyle(status: LiveDeploymentStatus): React.CSSProperties {
   if (status === "ACTIVE") {

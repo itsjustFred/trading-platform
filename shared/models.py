@@ -81,6 +81,8 @@ class LiveAccountConfig(BaseModel):
     id: str
     broker: Literal["alpaca", "ctrader"]
     name: str = ""
+    broker_login: str | None = None
+    ctid: str | None = None
 
 
 class LiveAccount(BaseModel):
@@ -91,6 +93,8 @@ class LiveAccount(BaseModel):
     broker: Literal["alpaca", "ctrader"]
     balance: float = 0.0
     is_demo: bool = False
+    broker_login: str | None = None
+    ctid: str | None = None
 
 
 class LiveDeploymentConfig(BaseModel):

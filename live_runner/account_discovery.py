@@ -26,6 +26,7 @@ from ctrader_open_api.messages.OpenApiMessages_pb2 import (
     ProtoOATraderRes,
 )
 from dotenv import load_dotenv
+from google.protobuf.json_format import MessageToDict
 
 from shared.logging import get_logger
 from shared.models import LiveAccount
@@ -81,6 +82,15 @@ def _alpaca_paper_from_endpoint(endpoint: str) -> bool:
     if not normalized:
         return True
     return "paper" in normalized
+
+
+def _ctrader_host_matches_environment(*, host: str, is_live: bool) -> bool:
+    normalized_host = host.strip().lower()
+    if "demo" in normalized_host:
+        return not is_live
+    if "live" in normalized_host:
+        return is_live
+    return True
 
 
 def _iter_alpaca_credentials(env: dict[str, str]) -> list[dict[str, Any]]:
@@ -161,6 +171,7 @@ def discover_alpaca_accounts(api_key: str, secret_key: str, paper: bool) -> list
             broker="alpaca",
             balance=balance,
             is_demo=bool(paper),
+            broker_login=account_number,
         )
     ]
 
@@ -227,6 +238,23 @@ def _ctrader_extract_broker_name(*sources: Any) -> str:
     return ""
 
 
+def _ctrader_extract_login(*sources: Any) -> str:
+    for source in sources:
+        if source is None:
+            continue
+        for field_name in ("traderLogin", "login", "traderAccountId"):
+            raw_value = getattr(source, field_name, None)
+            if raw_value is None:
+                continue
+            candidate = str(raw_value).strip()
+            if not candidate:
+                continue
+            if candidate.isdigit() and int(candidate) <= 0:
+                continue
+            return candidate
+    return ""
+
+
 def _ctrader_account_name(
     *,
     account_id: int | str,
@@ -247,6 +275,36 @@ def _ctrader_account_name(
     normalized_account_id = str(account_id).strip()
     # Explicit exact fallback format required by task
     return f"cTrader {normalized_account_id}" if normalized_account_id else "cTrader"
+
+
+def _message_to_debug_fields(message: Any) -> dict[str, Any]:
+    if message is None:
+        return {}
+    if hasattr(message, "DESCRIPTOR"):
+        try:
+            payload = MessageToDict(
+                message,
+                preserving_proto_field_name=True,
+                use_integers_for_enums=True,
+                including_default_value_fields=True,
+            )
+            if isinstance(payload, dict):
+                return payload
+        except Exception:
+            pass
+    if not hasattr(message, "ListFields"):
+        return {}
+    payload: dict[str, Any] = {}
+    for descriptor, value in message.ListFields():
+        field_name = str(descriptor.name)
+        if descriptor.label == descriptor.LABEL_REPEATED:
+            if hasattr(value, "__iter__") and not isinstance(value, (str, bytes, bytearray)):
+                payload[field_name] = [str(item) for item in value]
+            else:
+                payload[field_name] = str(value)
+            continue
+        payload[field_name] = str(value)
+    return payload
 
 
 async def _discover_ctrader_accounts_on_host(
@@ -330,16 +388,55 @@ async def _discover_ctrader_accounts_on_host(
                 key=lambda item: int(getattr(item, "ctidTraderAccountId", 0) or 0),
             )
             for account_item in account_items:
-                account_id = int(account_item.ctidTraderAccountId)
+                logger.debug(
+                    "Discovered raw cTrader account payload",
+                    extra={
+                        "data": {
+                            "host": host,
+                            "account_fields": _message_to_debug_fields(account_item),
+                        }
+                    },
+                )
+                account_id = int(
+                    getattr(account_item, "ctidTraderAccountId", 0)
+                    or getattr(account_item, "traderAccountId", 0)
+                    or 0
+                )
+                if account_id <= 0:
+                    logger.debug(
+                        "Skipping cTrader account without ctidTraderAccountId",
+                        extra={
+                            "data": {
+                                "host": host,
+                                "account_fields": _message_to_debug_fields(account_item),
+                            }
+                        },
+                    )
+                    continue
                 is_demo = not bool(getattr(account_item, "isLive", False))
+                if not _ctrader_host_matches_environment(
+                    host=host,
+                    is_live=not is_demo,
+                ):
+                    logger.debug(
+                        "Skipping cTrader account on host with mismatched environment",
+                        extra={
+                            "data": {
+                                "account_id": str(account_id),
+                                "host": host,
+                                "is_demo": is_demo,
+                            }
+                        },
+                    )
+                    continue
                 balance = 0.0
                 broker_name = _ctrader_extract_broker_name(
                     *_ctrader_message_name_sources(account_item)
                 )
-                trader_login = int(getattr(account_item, "traderLogin", 0) or 0)
+                trader_login = _ctrader_extract_login(*_ctrader_message_name_sources(account_item))
                 ignored_name_values = {str(account_id)}
-                if trader_login > 0:
-                    ignored_name_values.add(str(trader_login))
+                if trader_login:
+                    ignored_name_values.add(trader_login)
                 account_name_hint = _ctrader_extract_account_label(
                     *_ctrader_message_name_sources(account_item),
                     ignored_values=ignored_name_values,
@@ -361,6 +458,18 @@ async def _discover_ctrader_accounts_on_host(
                             if _PROTO_OA_CTID_TRADER_ACCOUNT_RES is None or isinstance(
                                 account_detail_res, _PROTO_OA_CTID_TRADER_ACCOUNT_RES
                             ):
+                                logger.debug(
+                                    "Resolved cTrader account detail payload",
+                                    extra={
+                                        "data": {
+                                            "host": host,
+                                            "ctid": str(account_id),
+                                            "account_detail_fields": _message_to_debug_fields(
+                                                account_detail_res
+                                            ),
+                                        }
+                                    },
+                                )
                                 broker_name = broker_name or _ctrader_extract_broker_name(
                                     *_ctrader_message_name_sources(account_detail_res)
                                 )
@@ -369,6 +478,12 @@ async def _discover_ctrader_accounts_on_host(
                                         *_ctrader_message_name_sources(account_detail_res),
                                         ignored_values=ignored_name_values,
                                     )
+                                detail_login = _ctrader_extract_login(
+                                    *_ctrader_message_name_sources(account_detail_res)
+                                )
+                                if detail_login:
+                                    trader_login = detail_login
+                                    ignored_name_values.add(detail_login)
                         except Exception as exc:
                             logger.debug(
                                 "Optional cTrader account detail request failed",
@@ -398,32 +513,63 @@ async def _discover_ctrader_accounts_on_host(
                     _send_message(sock, trader_req, trader_client_msg_id)
                     trader_res = _wait_response(sock, trader_client_msg_id, 20)
                     if isinstance(trader_res, ProtoOATraderRes):
+                        logger.debug(
+                            "Resolved cTrader trader payload",
+                            extra={
+                                "data": {
+                                    "host": host,
+                                    "ctid": str(account_id),
+                                    "trader_fields": _message_to_debug_fields(trader_res.trader),
+                                }
+                            },
+                        )
                         trader = trader_res.trader
                         balance = _trader_balance(trader)
                         broker_name = broker_name or _ctrader_extract_broker_name(
                             *_ctrader_message_name_sources(trader_res),
                             *_ctrader_message_name_sources(trader),
                         )
-                        resolved_login = int(getattr(trader, "traderLogin", 0) or 0)
-                        if resolved_login > 0:
+                        resolved_login = _ctrader_extract_login(
+                            *_ctrader_message_name_sources(trader_res),
+                            *_ctrader_message_name_sources(trader),
+                        )
+                        if resolved_login:
                             trader_login = resolved_login
-                            ignored_name_values.add(str(resolved_login))
+                            ignored_name_values.add(resolved_login)
                         account_name_hint = account_name_hint or _ctrader_extract_account_label(
                             *_ctrader_message_name_sources(trader_res),
                             *_ctrader_message_name_sources(trader),
                             ignored_values=ignored_name_values,
                         )
                 except Exception as exc:
-                    logger.warning(
-                        "Could not load cTrader trader details for discovered account",
-                        extra={
-                            "data": {
-                                "account_id": str(account_id),
-                                "host": host,
-                                "error": repr(exc),
-                            }
-                        },
-                    )
+                    error_text = repr(exc)
+                    # This is expected for accounts discovered on a broker environment that
+                    # does not provide trader details through this route; keep discovery non-noisy.
+                    if (
+                        "CANT_ROUTE_REQUEST" in error_text
+                        and "No environment connection" in error_text
+                    ):
+                        logger.debug(
+                            "cTrader trader details unavailable on this host",
+                            extra={
+                                "data": {
+                                    "account_id": str(account_id),
+                                    "host": host,
+                                    "error": error_text,
+                                }
+                            },
+                        )
+                    else:
+                        logger.warning(
+                            "Could not load cTrader trader details for discovered account",
+                            extra={
+                                "data": {
+                                    "account_id": str(account_id),
+                                    "host": host,
+                                    "error": error_text,
+                                }
+                            },
+                        )
 
                 account_name = _ctrader_account_name(
                     account_id=account_id,
@@ -436,6 +582,8 @@ async def _discover_ctrader_accounts_on_host(
                         broker="ctrader",
                         balance=balance,
                         is_demo=is_demo,
+                        broker_login=trader_login or None,
+                        ctid=str(account_id),
                     )
                 )
             return accounts

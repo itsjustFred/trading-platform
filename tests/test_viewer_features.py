@@ -1269,7 +1269,9 @@ def test_optimization_run_starts_background_task(viewer_client, monkeypatch, tmp
     )
 
     assert resp.status_code == 202
-    job_id = resp.json()["job_id"]
+    run_payload = resp.json()
+    assert run_payload["task_id"] == run_payload["job_id"]
+    job_id = run_payload["job_id"]
 
     for _ in range(50):
         task = viewer_app_module.DATA_TASKS[job_id]
@@ -1289,6 +1291,104 @@ def test_optimization_run_starts_background_task(viewer_client, monkeypatch, tmp
     assert "Starting optimization for base-demo" in log_text
     assert "✅ Trial 1/2" in log_text
     assert "Optimization saved to opt_base-demo_20260311_100000.json" in log_text
+
+
+def test_backtest_run_registers_task_manager_progress(viewer_client, monkeypatch, tmp_path):
+    import viewer.main as viewer_app_module
+
+    strategies_dir = tmp_path / "strategies"
+    strategies_dir.mkdir(parents=True, exist_ok=True)
+    strategy_file = strategies_dir / "demo_strategy.py"
+    strategy_file.write_text("class DemoStrategy:\n    pass\n", encoding="utf-8")
+
+    monkeypatch.setattr(viewer_app_module, "STRATEGIES_DIR", strategies_dir)
+    monkeypatch.setattr(viewer_app_module.legacy_viewer, "STRATEGIES_DIR", strategies_dir)
+
+    expected_output = tmp_path / "backtests" / "demo_20260101_120000.trades.json"
+    expected_output.parent.mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(viewer_app_module, "_dolthub_pull", lambda: None)
+
+    class _FakeProc:
+        def __init__(self, lines: list[str]):
+            self.stdout = iter(lines)
+            self.pid = 4242
+            self._killed = False
+
+        def wait(self, timeout=None):
+            return 0
+
+        def poll(self):
+            return None
+
+        def kill(self):
+            self._killed = True
+
+    def fake_popen(cmd, *args, **kwargs):
+        assert cmd[:4] == [sys.executable, "-u", "-m", "runner.cli"]
+        return _FakeProc(
+            [
+                '{"message":"Auto-detected date range: 2024-01-01 to 2024-12-31"}\n',
+                '{"message":"Running backtest: engine=native, strategy=demo, symbols=[\\"AAPL\\"]"}\n',
+                '{"message":"Result: 5 trades, total PnL: $123.45"}\n',
+                f'{{"message":"Saved to: {expected_output}"}}\n',
+            ]
+        )
+
+    monkeypatch.setattr(viewer_app_module.subprocess, "Popen", fake_popen)
+
+    response = viewer_client.post(
+        "/api/backtests/run",
+        json={
+            "strategy": "demo_strategy.py",
+            "engine": "native",
+            "symbols": ["AAPL"],
+            "timeframe": "1d",
+            "capital": 100000,
+            "parameters": {"window": 10},
+        },
+    )
+
+    assert response.status_code == 202
+    payload = response.json()
+    assert payload["task_id"] == payload["job_id"]
+    assert payload["status"] == "queued"
+    task_id = payload["task_id"]
+
+    for _ in range(50):
+        task = viewer_app_module.DATA_TASKS[task_id]
+        if task["status"] in {"completed", "failed"}:
+            break
+        time.sleep(0.05)
+
+    task = viewer_app_module.DATA_TASKS[task_id]
+    assert task["kind"] == "backtest"
+    assert task["status"] == "completed"
+    assert task["progress"] == 100.0
+    assert task["result"]["output_path"] == str(expected_output)
+    assert task["result"]["backtest_id"] == expected_output.stem.replace(".trades", "")
+
+    list_resp = viewer_client.get("/api/data/tasks")
+    assert list_resp.status_code == 200
+    listed_tasks = list_resp.json()["tasks"]
+    listed = next(item for item in listed_tasks if item["id"] == task_id)
+    assert listed["kind"] == "backtest"
+    assert listed["progress"]["percent"] == 100.0
+    assert listed["progress"]["current"]
+
+    status_resp = viewer_client.get(f"/api/backtests/run/{task_id}/status")
+    assert status_resp.status_code == 200
+    status_payload = status_resp.json()
+    assert status_payload["task_id"] == task_id
+    assert status_payload["job_id"] == task_id
+    assert status_payload["status"] == "completed"
+    assert status_payload["result"]["output_path"] == str(expected_output)
+
+    log_text = Path(task["log_file"]).read_text(encoding="utf-8")
+    assert "Loading backtest inputs..." in log_text
+    assert "Launching backtest runner..." in log_text
+    assert "Computing strategy statistics..." in log_text
+    assert "Saving backtest result..." in log_text
 
 
 def test_thread_bound_task_log_handler_emits_without_shadowing_handle(viewer_client, tmp_path):

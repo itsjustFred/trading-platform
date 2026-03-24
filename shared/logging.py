@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 
@@ -35,7 +36,7 @@ _loggers: dict[str, logging.Logger] = {}
 class JsonFormatter(logging.Formatter):
     """Formats log records as structured JSON."""
 
-    def __init__(self, service: str):
+    def __init__(self, service: str = ""):
         super().__init__()
         self.service = service
 
@@ -43,11 +44,15 @@ class JsonFormatter(logging.Formatter):
         timestamp = datetime.fromtimestamp(record.created, tz=timezone.utc).strftime(
             LOG_TIMESTAMP_FORMAT
         )
+        module_name = record.module or record.name or "<unknown>"
+        function_name = record.funcName or "<unknown>"
+        line_number = record.lineno if isinstance(record.lineno, int) else 0
         entry = {
             "timestamp": timestamp,
             "level": record.levelname,
-            "service": self.service,
-            "module": record.module,
+            "module": module_name,
+            "function": function_name,
+            "line": line_number,
             "message": record.getMessage(),
         }
         data = getattr(record, "data", None)
@@ -73,7 +78,7 @@ def get_logger(service: str) -> logging.Logger:
     logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
     logger.propagate = False
 
-    formatter = JsonFormatter(service)
+    formatter = JsonFormatter()
 
     # File handler with rotation
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -87,7 +92,7 @@ def get_logger(service: str) -> logging.Logger:
     logger.addHandler(file_handler)
 
     # Stdout handler
-    stream_handler = logging.StreamHandler()
+    stream_handler = logging.StreamHandler(stream=sys.stdout)
     stream_handler.setFormatter(formatter)
     logger.addHandler(stream_handler)
 

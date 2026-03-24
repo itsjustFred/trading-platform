@@ -34,6 +34,9 @@ function statusColor(status: string) {
   if (status === "completed") {
     return "#bbf7d0";
   }
+  if (status === "queued") {
+    return "#bfdbfe";
+  }
   return "#67e8f9";
 }
 
@@ -108,7 +111,10 @@ export function TaskManager() {
   const runningCount = useMemo(
     () =>
       orderedTasks.filter(
-        (task) => task.status === "starting" || task.status === "running",
+        (task) =>
+          task.status === "queued" ||
+          task.status === "starting" ||
+          task.status === "running",
       ).length,
     [orderedTasks],
   );
@@ -235,7 +241,7 @@ export function TaskManager() {
           </div>
           <div style={{ fontSize: "0.76rem", color: "var(--color-text-muted)" }}>
             {runningCount > 0
-              ? `${runningCount} downloading`
+              ? `${runningCount} running`
               : open
                 ? "Hide queue"
                 : "Show queue"}

@@ -3312,7 +3312,7 @@ def _start_jforex_task(
     timeframes: list[str],
     start: str | None,
     end: str | None,
-    price_type: str,
+    offer_side: str,
     merge_tick: bool,
     merge_s1: bool,
     batch_size: int,
@@ -3425,7 +3425,7 @@ def _start_jforex_task(
                             DATA_DIR,
                             start=start,
                             end=end,
-                            price_type=price_type,
+                            offer_side=offer_side,
                             query_timeout_seconds=query_timeout_seconds,
                         )
                     except DownloadCancelled:
@@ -3437,18 +3437,26 @@ def _start_jforex_task(
                         )
                         _mark_task_finished(task_id, status="cancelled", returncode=-9)
                         return
-                    except (OSError, RuntimeError, ValueError, KeyError, json.JSONDecodeError) as exc:
-                        if _is_jforex_unavailable_error(exc):
+                    except (
+                        OSError,
+                        RuntimeError,
+                        TimeoutError,
+                        ValueError,
+                        KeyError,
+                        json.JSONDecodeError,
+                    ) as exc:
+                        fallback_reason = _jforex_fallback_reason(exc)
+                        if fallback_reason is not None:
                             used_fallback = True
                             _write_task_log_line(
                                 handle,
                                 task_id,
                                 (
-                                    f"⚠️ {symbol} {timeframe}: JForex unavailable ({exc}). "
-                                    "Falling back to Dukascopy native HTTP downloader."
+                                    f"ℹ️ {symbol} {timeframe}: Falling back to Dukascopy native HTTP downloader "
+                                    f"(reason: {fallback_reason}; error: {exc})"
                                 ),
                                 stream="stdout",
-                                log_level="warning",
+                                log_level="info",
                                 source="data-task",
                             )
                             try:
@@ -3458,7 +3466,7 @@ def _start_jforex_task(
                                     DATA_DIR,
                                     start=start,
                                     end=end,
-                                    price_type=price_type,
+                                    offer_side=offer_side,
                                     merge_tick=merge_tick,
                                     merge_s1=merge_s1,
                                     batch_size=batch_size,
@@ -3477,7 +3485,14 @@ def _start_jforex_task(
                                 )
                                 _mark_task_finished(task_id, status="cancelled", returncode=-9)
                                 return
-                            except (OSError, RuntimeError, ValueError, KeyError, json.JSONDecodeError) as fallback_exc:
+                            except (
+                                OSError,
+                                RuntimeError,
+                                TimeoutError,
+                                ValueError,
+                                KeyError,
+                                json.JSONDecodeError,
+                            ) as fallback_exc:
                                 failed_items += 1
                                 _write_task_log_line(
                                     handle,
@@ -3888,23 +3903,41 @@ def _task_cache_invalidation_reason(source: str) -> str | None:
 
 
 def _is_jforex_unavailable_error(exc: Exception) -> bool:
+    return _jforex_fallback_reason(exc) is not None
+
+
+def _jforex_fallback_reason(exc: Exception) -> str | None:
     if isinstance(exc, ModuleNotFoundError):
         missing_name = str(getattr(exc, "name", "") or "").lower()
         if "jpype" in missing_name or "dukascopy" in missing_name:
-            return True
+            return f"missing python module: {missing_name or 'unknown'}"
+
+    if isinstance(exc, TimeoutError):
+        return "JForex request timed out"
 
     message = str(exc).lower()
-    unavailable_fragments = (
-        "jpype is required",
-        "no module named 'jpype'",
-        "failed to start jvm",
-        "could not resolve jforex sdk classpath",
-        "jforex sdk classpath",
-        "missing dukascopy credentials",
-        "dukascopy_username",
-        "dukascopy_jnlp_url",
-    )
-    return any(fragment in message for fragment in unavailable_fragments)
+    availability_reason_by_fragment = {
+        "jpype is required": "JPype dependency missing",
+        "no module named 'jpype'": "JPype dependency missing",
+        "failed to start jvm": "Java/JVM startup failed",
+        "could not resolve jforex sdk classpath": "JForex SDK classpath unavailable",
+        "jforex sdk classpath": "JForex SDK classpath unavailable",
+        "missing dukascopy credentials": "Dukascopy credentials missing",
+        "dukascopy_username": "Dukascopy credentials missing",
+        "dukascopy_jnlp_url": "Dukascopy JNLP configuration missing",
+        "jforex connection timed out": "JForex connection timed out",
+        "jforex data request timed out": "JForex data request timed out",
+        "jforex history query failed": "JForex runtime history query failure",
+        "java.net": "Java networking failure",
+        "connectexception": "Connection failure to Dukascopy/JForex",
+        "sockettimeout": "Socket timeout while querying JForex",
+        "socket timeout": "Socket timeout while querying JForex",
+    }
+    for fragment, reason in availability_reason_by_fragment.items():
+        if fragment in message:
+            return reason
+
+    return None
 
 
 def _signal_process(task: dict[str, Any], sig: int) -> None:
@@ -3968,26 +4001,29 @@ def data_download():
 
     cmd: list[str]
     if source == "dukascopy":
+        # Accept explicit offer_side (bid|ask|both) for Dukascopy/JForex
+        offer_side = str(data.get("offer_side", data.get("price_type", "bid"))).strip().lower()
+        if offer_side not in {"bid", "ask", "both"}:
+            return jsonify({"error": "offer_side must be one of: bid, ask, both"}), 400
+
         cmd = [
             sys.executable,
             "-u",
             "-m",
-            "data_tools.downloaders.dukascopy_native",
+            "data_tools.downloaders.jforex_dl",
             "--symbols",
             symbols,
             "--timeframes",
             timeframes,
-            "--batch-size",
-            str(batch_size),
-            "--pause-ms",
-            str(pause_ms),
+            "--query-timeout-seconds",
+            str(900),
         ]
         if start:
             cmd.extend(["--start", start])
         if end:
             cmd.extend(["--end", end])
-        if price_type:
-            cmd.extend(["--price-type", str(price_type)])
+        if offer_side:
+            cmd.extend(["--price-type", str(offer_side)])
         if merge_tick:
             cmd.append("--merge-tick")
         if merge_s1:
@@ -3995,18 +4031,20 @@ def data_download():
 
         total_items = max(len(sym_list) * len(tf_list), 1)
         return jsonify(
-            _start_dukascopy_task(
+            _start_jforex_task(
                 task_id,
                 cmd,
+                source_label="dukascopy",
                 symbols=sym_list,
                 timeframes=tf_list,
                 start=start or None,
                 end=end or None,
-                price_type=str(price_type),
+                price_type=str(offer_side),
                 merge_tick=merge_tick,
                 merge_s1=merge_s1,
                 batch_size=batch_size,
                 pause_ms=pause_ms,
+                query_timeout_seconds=900,
                 total_items=total_items,
                 name=name,
                 description=description,

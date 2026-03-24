@@ -1,15 +1,14 @@
 import { useState, useEffect, useMemo } from "react";
-import { useNavigate } from "react-router-dom";
 import { Modal } from "./Modal";
 import {
   getStrategies,
   getStrategyDetail,
   runBacktest,
-  getBacktestRunStatus,
 } from "../api/client";
 import { SymbolInput } from "./SymbolInput";
 import { Play, Loader2 } from "lucide-react";
 import type { StrategyMeta } from "../api/types";
+import { useToast } from "./ToastProvider";
 
 // Canonical timeframe order from smallest to largest (matches shared/constants.py)
 const TIMEFRAME_ORDER = ["tick", "s1", "1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"] as const;
@@ -37,14 +36,16 @@ interface CreateBacktestModalProps {
   open: boolean;
   onClose: () => void;
   preselectedStrategy?: string;
+  onTaskStarted?: (taskId: string) => void;
 }
 
 export function CreateBacktestModal({
   open,
   onClose,
   preselectedStrategy,
+  onTaskStarted,
 }: CreateBacktestModalProps) {
-  const navigate = useNavigate();
+  const { showToast } = useToast();
   const [strategies, setStrategies] = useState<StrategyMeta[]>([]);
   const [strategy, setStrategy] = useState("");
   const [engine, setEngine] = useState("native");
@@ -60,7 +61,6 @@ export function CreateBacktestModal({
   // Track original type to decide input type and payload conversion
   const [parameterTypes, setParameterTypes] = useState<Record<string, "number" | "string">>({});
   const [running, setRunning] = useState(false);
-  const [status, setStatus] = useState("");
   const [error, setError] = useState("");
 
   useEffect(() => {
@@ -125,9 +125,10 @@ export function CreateBacktestModal({
   const modelingTimeframes = useMemo(() => getModelingTimeframes(timeframe), [timeframe]);
 
   const handleRun = async () => {
-    if (!strategy || !symbols.trim()) return;
+    if (!strategy || !symbols.trim()) {
+      return;
+    }
     setRunning(true);
-    setStatus("Starting backtest...");
     setError("");
 
     try {
@@ -171,41 +172,13 @@ export function CreateBacktestModal({
         modeling_resolution: modelingResolution,
         parameters: parameterPayload,
       });
-
-      const jobId = res.job_id;
-      setStatus("Running backtest...");
-
-      // Poll for completion
-      const poll = async () => {
-        for (let i = 0; i < 120; i++) {
-          await new Promise((r) => setTimeout(r, 2500));
-          try {
-            const jobStatus = await getBacktestRunStatus(jobId);
-            if (jobStatus.status === "completed") {
-              setStatus("Completed! Redirecting...");
-              setRunning(false);
-              onClose();
-              navigate("/backtests");
-              setTimeout(() => window.location.reload(), 500);
-              return;
-            } else if (jobStatus.status === "failed") {
-              const message =
-                typeof jobStatus.error === "string" ? jobStatus.error : "Backtest failed";
-              setError(message);
-              setRunning(false);
-              return;
-            }
-            setStatus(`Running... (${(i + 1) * 2.5}s)`);
-          } catch {
-            // Continue polling
-          }
-        }
-        setError("Backtest timed out after 5 minutes");
-        setRunning(false);
-      };
-      poll();
+      const taskId = res.task_id || res.job_id;
+      onTaskStarted?.(taskId);
+      showToast("Backtest started. Check Task Manager in the top right.", "success");
+      onClose();
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "Failed to start backtest");
+    } finally {
       setRunning(false);
     }
   };
@@ -472,24 +445,7 @@ export function CreateBacktestModal({
           </div>
         )}
 
-        {/* Status / Error */}
-        {status && (
-          <div
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: "8px",
-              padding: "8px 12px",
-              borderRadius: "6px",
-              background: "rgba(88,166,255,0.08)",
-              color: "#58a6ff",
-              fontSize: "0.8rem",
-            }}
-          >
-            {running && <Loader2 size={14} className="animate-spin" />}
-            {status}
-          </div>
-        )}
+        {/* Error */}
         {error && (
           <div
             style={{
@@ -532,10 +488,9 @@ export function CreateBacktestModal({
           ) : (
             <Play size={16} />
           )}
-          {running ? "Running..." : "Run Backtest"}
+          {running ? "Starting..." : "Run Backtest"}
         </button>
       </div>
     </Modal>
   );
 }
-

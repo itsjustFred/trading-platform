@@ -162,7 +162,7 @@ export function DownloadModal({
   );
   const [startDate, setStartDate] = useState("");
   const [endDate, setEndDate] = useState("");
-  const [priceType, setPriceType] = useState<"bid" | "ask">("bid");
+  const [priceType, setPriceType] = useState<"bid" | "ask" | "both">("bid");
   const [mergeTick, setMergeTick] = useState(false);
   const [mergeS1, setMergeS1] = useState(false);
   const [showAdvancedSettings, setShowAdvancedSettings] = useState(false);
@@ -178,6 +178,8 @@ export function DownloadModal({
   const [dukascopyCoverageError, setDukascopyCoverageError] = useState("");
 
   const isDukascopy = source === "dukascopy";
+  const isJForex = source === "jforex";
+  const isDukascopyOrJForex = isDukascopy || isJForex;
   const isStreaming = jobId !== null;
   const defaultTimeframesKey = normalizedDefaultTimeframes.join("|");
   const parsedSymbols = useMemo(
@@ -462,7 +464,10 @@ export function DownloadModal({
         timeframes: selectedTimeframes.join(","),
         start: startDate || undefined,
         end: endDate || undefined,
-        price_type: isDukascopy ? priceType : undefined,
+        // Preferred new field
+        offer_side: isDukascopyOrJForex ? priceType : undefined,
+        // Legacy compatibility
+        price_type: isDukascopyOrJForex ? priceType : undefined,
         merge_tick: isDukascopy ? mergeTick : undefined,
         merge_s1: isDukascopy ? mergeS1 : undefined,
         batch_size: isDukascopy ? batchSize : undefined,
@@ -638,7 +643,7 @@ export function DownloadModal({
                     </div>
                   </div>
 
-                  {isDukascopy && (
+                  {isDukascopyOrJForex && (
                     <div style={{ display: "grid", gap: "8px" }}>
                       <label
                         style={{
@@ -657,7 +662,7 @@ export function DownloadModal({
                           flexWrap: "wrap",
                         }}
                       >
-                        {(["bid", "ask"] as const).map((option) => {
+                        {(["bid", "ask", "both"] as const).map((option) => {
                           const active = priceType === option;
                           return (
                             <button

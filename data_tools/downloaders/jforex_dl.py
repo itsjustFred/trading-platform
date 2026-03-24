@@ -448,6 +448,88 @@ def _query_jforex_history(
     return df
 
 
+def _normalize_offer_side(value: str | None) -> str:
+    normalized = str(value or "bid").strip().lower()
+    if normalized not in {"bid", "ask", "both"}:
+        raise ValueError("offer_side must be one of: bid, ask, both")
+    return normalized
+
+
+def _normalize_timeframe_for_file_suffix(timeframe: str) -> str:
+    return timeframe.replace("1m", "m1").replace("5m", "m5").replace("15m", "m15").replace(
+        "30m", "m30"
+    ).replace("1h", "h1").replace("4h", "h4").replace("1d", "d1").replace("1w", "w1")
+
+
+def _bars_with_offer_prefix(df: pd.DataFrame, offer_side: str) -> pd.DataFrame:
+    if df.empty:
+        return df.copy()
+    side = offer_side.lower()
+    renamed = df.rename(
+        columns={
+            "open": f"{side}_open",
+            "high": f"{side}_high",
+            "low": f"{side}_low",
+            "close": f"{side}_close",
+            "volume": f"{side}_volume",
+        }
+    )
+    return renamed
+
+
+def _resample_offer_prefixed(df: pd.DataFrame, target_tf: str, offer_side: str) -> pd.DataFrame:
+    base = df.rename(
+        columns={
+            f"{offer_side}_open": "open",
+            f"{offer_side}_high": "high",
+            f"{offer_side}_low": "low",
+            f"{offer_side}_close": "close",
+            f"{offer_side}_volume": "volume",
+        }
+    )
+    resampled = resample_ohlcv(base, target_tf)
+    return _bars_with_offer_prefix(resampled, offer_side)
+
+
+def _build_offer_side_output_path(base_path: Path, target_tf: str, offer_side: str) -> Path:
+    stem = base_path.stem
+    normalized_tf = _normalize_timeframe_for_file_suffix(target_tf)
+    suffix = f"{normalized_tf}_{offer_side}"
+    if stem == normalized_tf:
+        stem = suffix
+    elif stem.endswith(f"_{normalized_tf}"):
+        stem = f"{stem}_{offer_side}"
+    else:
+        stem = suffix
+    return base_path.with_name(f"{stem}{base_path.suffix}")
+
+
+def _query_bars_for_offer_side(
+    *,
+    java_instrument: Any,
+    base_tf: str,
+    offer_side: str,
+    start_dt: datetime,
+    end_dt: datetime,
+    auth: DukascopyAuthConfig,
+    timeout_seconds: int,
+    cache_path: Path,
+) -> pd.DataFrame:
+    base_df = _query_jforex_history(
+        java_instrument=java_instrument,
+        base_timeframe=base_tf,
+        start_ms=int(start_dt.timestamp() * 1000),
+        end_ms=int(end_dt.timestamp() * 1000),
+        auth=auth,
+        offer_side_name=offer_side.upper(),
+        timeout_seconds=timeout_seconds,
+        cache_dir=cache_path,
+    )
+    if base_df.empty:
+        return base_df
+    return _bars_with_offer_prefix(base_df, offer_side)
+
+
 class JForexDownloader(Downloader):
     """Dukascopy downloader using JForex Java SDK over JPype."""
 
@@ -480,9 +562,9 @@ class JForexDownloader(Downloader):
         target_tf = _normalize_timeframe(timeframe)
         base_tf = BASE_TIMEFRAME_MAP[target_tf]
 
-        price_type = str(kwargs.get("price_type", "bid")).strip().lower()
-        if price_type not in {"bid", "ask"}:
-            raise ValueError("price_type must be 'bid' or 'ask'")
+        offer_side = _normalize_offer_side(kwargs.get("offer_side", kwargs.get("price_type", "bid")))
+        if offer_side == "both" and target_tf == "tick":
+            raise ValueError("offer_side='both' is not supported for timeframe 'tick' with JForex")
 
         timeout_seconds = int(kwargs.get("query_timeout_seconds", 900))
         if timeout_seconds <= 0:
@@ -505,48 +587,112 @@ class JForexDownloader(Downloader):
             raise ValueError("end date/time must be after start date/time")
 
         auth = _read_auth_config()
-        base_df = _query_jforex_history(
-            java_instrument=java_instrument,
-            base_timeframe=base_tf,
-            start_ms=int(start_dt.timestamp() * 1000),
-            end_ms=int(end_dt.timestamp() * 1000),
-            auth=auth,
-            offer_side_name=price_type.upper(),
-            timeout_seconds=timeout_seconds,
-            cache_dir=cache_path,
-        )
 
-        if base_df.empty:
-            raise RuntimeError(
-                f"No {base_tf} data returned for {normalized_symbol} in range "
-                f"{effective_start} → {effective_end}"
+        if offer_side == "both":
+            if base_tf == "tick":
+                raise ValueError(
+                    "offer_side='both' is not supported for tick-derived outputs with JForex"
+                )
+            bid_out_path = _build_offer_side_output_path(out_path, target_tf, "bid")
+            ask_out_path = _build_offer_side_output_path(out_path, target_tf, "ask")
+            bid_df = _query_bars_for_offer_side(
+                java_instrument=java_instrument,
+                base_tf=base_tf,
+                offer_side="bid",
+                start_dt=start_dt,
+                end_dt=end_dt,
+                auth=auth,
+                timeout_seconds=timeout_seconds,
+                cache_path=cache_path,
+            )
+            ask_df = _query_bars_for_offer_side(
+                java_instrument=java_instrument,
+                base_tf=base_tf,
+                offer_side="ask",
+                start_dt=start_dt,
+                end_dt=end_dt,
+                auth=auth,
+                timeout_seconds=timeout_seconds,
+                cache_path=cache_path,
             )
 
-        if target_tf == "tick":
-            result_df = base_df
-        elif base_tf == target_tf:
-            result_df = base_df
+            if bid_df.empty or ask_df.empty:
+                raise RuntimeError(
+                    f"No {base_tf} bid/ask data returned for {normalized_symbol} in range "
+                    f"{effective_start} → {effective_end}"
+                )
+
+            if target_tf == base_tf:
+                bid_result_df = bid_df
+                ask_result_df = ask_df
+            else:
+                bid_result_df = _resample_offer_prefixed(bid_df, target_tf, "bid")
+                ask_result_df = _resample_offer_prefixed(ask_df, target_tf, "ask")
+
+            merged_bid = self._merge_and_store_single_file(bid_out_path, bid_result_df)
+            merged_ask = self._merge_and_store_single_file(ask_out_path, ask_result_df)
+            result_df = bid_result_df.merge(ask_result_df, on="timestamp", how="inner")
+            result_df = (
+                result_df.sort_values("timestamp")
+                .drop_duplicates(subset=["timestamp"])
+                .reset_index(drop=True)
+            )
         else:
-            result_df = resample_ohlcv(base_df, target_tf)
+            base_df = _query_jforex_history(
+                java_instrument=java_instrument,
+                base_timeframe=base_tf,
+                start_ms=int(start_dt.timestamp() * 1000),
+                end_ms=int(end_dt.timestamp() * 1000),
+                auth=auth,
+                offer_side_name=offer_side.upper(),
+                timeout_seconds=timeout_seconds,
+                cache_dir=cache_path,
+            )
+
+            if base_df.empty:
+                raise RuntimeError(
+                    f"No {base_tf} data returned for {normalized_symbol} in range "
+                    f"{effective_start} → {effective_end}"
+                )
+
+            if target_tf == "tick":
+                result_df = base_df
+            elif base_tf == target_tf:
+                result_df = base_df
+            else:
+                result_df = resample_ohlcv(base_df, target_tf)
 
         if result_df.empty:
             raise RuntimeError(f"No data left after processing timeframe {target_tf}")
 
-        combined = self._merge_and_store_single_file(out_path, result_df)
-        warnings: list[str] = [f"price_type:{price_type}"]
+        if offer_side == "both":
+            combined = result_df
+            size_bytes = 0
+            if bid_out_path.exists():
+                size_bytes += bid_out_path.stat().st_size
+            if ask_out_path.exists():
+                size_bytes += ask_out_path.stat().st_size
+            output_path = out_path.parent
+        else:
+            combined = self._merge_and_store_single_file(out_path, result_df)
+            size_bytes = out_path.stat().st_size
+            output_path = out_path
+        warnings: list[str] = [f"offer_side:{offer_side}", f"price_type:{offer_side}"]
         if target_tf != base_tf:
             warnings.append(f"resampled_from:{base_tf}")
+        if offer_side == "both":
+            warnings.extend([f"stored_bid:{bid_out_path.name}", f"stored_ask:{ask_out_path.name}"])
 
         return DownloadResult(
             symbol=normalized_symbol,
             timeframe=target_tf,
             source=self.source_name,
             asset_class=asset_class,
-            path=out_path,
+            path=output_path,
             rows=len(combined),
             start=str(combined["timestamp"].iloc[0]) if len(combined) > 0 else "",
             end=str(combined["timestamp"].iloc[-1]) if len(combined) > 0 else "",
-            size_bytes=out_path.stat().st_size,
+            size_bytes=size_bytes,
             warnings=warnings,
         )
 
@@ -592,7 +738,13 @@ def main() -> None:
     parser.add_argument("--start", required=True, help="Start date (YYYY-MM-DD or ISO timestamp)")
     parser.add_argument("--end", required=True, help="End date (YYYY-MM-DD or ISO timestamp)")
     parser.add_argument("--output", default=str(DATA_DIR), help="Output root directory")
-    parser.add_argument("--price-type", choices=["bid", "ask"], default="bid")
+    parser.add_argument(
+        "--offer-side",
+        "--price-type",
+        dest="offer_side",
+        choices=["bid", "ask", "both"],
+        default="bid",
+    )
     parser.add_argument("--query-timeout-seconds", type=int, default=900)
     parser.add_argument("--list", action="store_true", help="List known symbols")
     args = parser.parse_args()
@@ -622,7 +774,7 @@ def main() -> None:
                     output_dir=output_dir,
                     start=args.start,
                     end=args.end,
-                    price_type=args.price_type,
+                    offer_side=args.offer_side,
                     query_timeout_seconds=args.query_timeout_seconds,
                 )
                 completed += 1

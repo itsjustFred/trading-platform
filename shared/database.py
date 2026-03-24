@@ -9,8 +9,10 @@ from typing import Any, Iterator
 
 from dotenv import load_dotenv
 from sqlalchemy import JSON, Column, String, delete, text
+from sqlalchemy.engine import Connection
 from sqlmodel import Field, Session, SQLModel, create_engine, select
 
+from shared.constants import DATA_DIR as RESOLVED_DATA_DIR
 from shared.logging import get_logger
 from shared.models import (
     BacktestMeta,
@@ -32,13 +34,7 @@ logger = get_logger("database")
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(PROJECT_ROOT / ".env")
-
-_data_dir_env = os.environ.get("DATA_DIR") or os.environ.get("TRADING_DATA_DIR")
-DATA_DIR = (
-    Path(_data_dir_env).expanduser().resolve()
-    if _data_dir_env
-    else (PROJECT_ROOT / "data").resolve()
-)
+DATA_DIR = RESOLVED_DATA_DIR
 DB_PATH = DATA_DIR / "backtests.db"
 
 
@@ -227,13 +223,27 @@ class LiveAccountModel(SQLModel, table=True):
     id: str = Field(primary_key=True)
     broker: str = Field(index=True)
     name: str = Field(default="", index=True)
+    ctid: str | None = Field(default=None, index=True)
+    broker_login: str | None = Field(default=None, index=True)
 
     @classmethod
     def from_live_account(cls, account: LiveAccountConfig) -> "LiveAccountModel":
-        return cls(id=account.id, broker=account.broker, name=account.name)
+        return cls(
+            id=account.id,
+            broker=account.broker,
+            name=account.name,
+            ctid=account.ctid,
+            broker_login=account.broker_login,
+        )
 
     def to_live_account(self) -> LiveAccountConfig:
-        return LiveAccountConfig(id=self.id, broker=self.broker, name=self.name)
+        return LiveAccountConfig(
+            id=self.id,
+            broker=self.broker,
+            name=self.name,
+            ctid=self.ctid or "",
+            broker_login=self.broker_login or "",
+        )
 
 
 class LiveDeploymentModel(SQLModel, table=True):
@@ -291,20 +301,30 @@ def get_session() -> Iterator[Session]:
 def init_db() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     SQLModel.metadata.create_all(ENGINE)
-    _migrate_live_deployments_table()
+    _migrate_schema()
 
 
-def _migrate_live_deployments_table() -> None:
+def _table_column_names(connection: Connection, table_name: str) -> set[str]:
+    rows = connection.execute(text(f"PRAGMA table_info('{table_name}')")).fetchall()
+    return {str(row[1]) for row in rows}
+
+
+def _migrate_schema() -> None:
     with ENGINE.begin() as connection:
-        rows = connection.execute(text("PRAGMA table_info('live_deployments')")).fetchall()
-        column_names = {str(row[1]) for row in rows}
-        if "settings" not in column_names:
+        deployment_column_names = _table_column_names(connection, "live_deployments")
+        if "settings" not in deployment_column_names:
             connection.execute(
                 text(
                     "ALTER TABLE live_deployments "
                     "ADD COLUMN settings JSON NOT NULL DEFAULT '{}'"
                 )
             )
+
+        account_column_names = _table_column_names(connection, "live_accounts")
+        if "ctid" not in account_column_names:
+            connection.execute(text("ALTER TABLE live_accounts ADD COLUMN ctid TEXT"))
+        if "broker_login" not in account_column_names:
+            connection.execute(text("ALTER TABLE live_accounts ADD COLUMN broker_login TEXT"))
 
 
 def save_live_signal(signal: LiveSignal) -> None:
@@ -344,12 +364,29 @@ def get_live_account(account_id: str) -> LiveAccountConfig | None:
     return row.to_live_account()
 
 
-def ensure_live_account(account_id: str, broker: str, *, name: str = "") -> LiveAccountConfig:
+def ensure_live_account(
+    account_id: str,
+    broker: str,
+    *,
+    name: str = "",
+    ctid: str | None = None,
+    broker_login: str | None = None,
+) -> LiveAccountConfig:
     init_db()
     with get_session() as session:
         current = session.get(LiveAccountModel, account_id)
         if current is None:
-            account = LiveAccountModel(id=account_id, broker=broker, name=name or account_id)
+            account = LiveAccountModel(
+                id=account_id,
+                broker=broker,
+                name=name or account_id,
+                ctid=(ctid.strip() if isinstance(ctid, str) and ctid.strip() else None),
+                broker_login=(
+                    broker_login.strip()
+                    if isinstance(broker_login, str) and broker_login.strip()
+                    else None
+                ),
+            )
             session.add(account)
             session.commit()
             session.refresh(account)
@@ -361,6 +398,18 @@ def ensure_live_account(account_id: str, broker: str, *, name: str = "") -> Live
             changed = True
         if name and current.name != name:
             current.name = name
+            changed = True
+        normalized_ctid = ctid.strip() if isinstance(ctid, str) and ctid.strip() else None
+        if ctid is not None and current.ctid != normalized_ctid:
+            current.ctid = normalized_ctid
+            changed = True
+        normalized_broker_login = (
+            broker_login.strip()
+            if isinstance(broker_login, str) and broker_login.strip()
+            else None
+        )
+        if broker_login is not None and current.broker_login != normalized_broker_login:
+            current.broker_login = normalized_broker_login
             changed = True
         if changed:
             session.add(current)
@@ -379,6 +428,8 @@ def upsert_live_accounts(accounts: list[LiveAccountConfig]) -> None:
                 continue
             current.broker = account.broker
             current.name = account.name
+            current.ctid = account.ctid
+            current.broker_login = account.broker_login
             session.add(current)
         session.commit()
 
@@ -489,6 +540,10 @@ def list_live_signal_executions_for_deployments(
             .order_by(LiveExecutionModel.timestamp.desc(), LiveExecutionModel.id.desc())
         ).all()
 
+    return _serialize_live_signal_execution_rows(rows)
+
+
+def _serialize_live_signal_execution_rows(rows: list[Any]) -> list[dict[str, Any]]:
     payload: list[dict[str, Any]] = []
     for signal, execution in rows:
         theoretical = float(signal.theoretical_price or 0.0)
@@ -515,6 +570,49 @@ def list_live_signal_executions_for_deployments(
             }
         )
     return payload
+
+
+def load_live_account_stats_inputs(
+    account_id: str,
+) -> tuple[list[LiveBalanceRecord], list[dict[str, Any]]]:
+    normalized_account_id = str(account_id or "").strip()
+    if not normalized_account_id:
+        return [], []
+
+    init_db()
+    with get_session() as session:
+        balance_rows = session.exec(
+            select(LiveBalanceModel)
+            .where(LiveBalanceModel.account_id == normalized_account_id)
+            .order_by(LiveBalanceModel.timestamp.asc(), LiveBalanceModel.id.asc())
+        ).all()
+
+        deployment_rows = session.exec(
+            select(LiveDeploymentModel)
+            .where(LiveDeploymentModel.account_id == normalized_account_id)
+            .order_by(LiveDeploymentModel.created_at.asc(), LiveDeploymentModel.id.asc())
+        ).all()
+
+        deployment_ids = {normalized_account_id}
+        for deployment in deployment_rows:
+            deployment_ids.add(str(deployment.id))
+            strategy_name = str(deployment.strategy_name or "").strip()
+            if strategy_name:
+                deployment_ids.add(strategy_name)
+
+        execution_rows: list[Any] = []
+        if deployment_ids:
+            execution_rows = session.exec(
+                select(LiveSignalModel, LiveExecutionModel)
+                .join(LiveExecutionModel, LiveExecutionModel.signal_id == LiveSignalModel.id)
+                .where(LiveSignalModel.deployment_id.in_(sorted(deployment_ids)))
+                .order_by(LiveExecutionModel.timestamp.asc(), LiveExecutionModel.id.asc())
+            ).all()
+
+    return (
+        [row.to_live_balance() for row in balance_rows],
+        _serialize_live_signal_execution_rows(execution_rows),
+    )
 
 
 def save_result_to_sqlite(result: BacktestResult) -> None:

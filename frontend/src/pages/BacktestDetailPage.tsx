@@ -28,7 +28,6 @@ import type { IChartApi, Time } from "lightweight-charts";
 import {
   CartesianGrid,
   ReferenceLine,
-  ResponsiveContainer,
   Scatter,
   ScatterChart,
   Tooltip,
@@ -1061,6 +1060,24 @@ function EquityChart({
 
 function CapmScatterPlot({ capmData }: { capmData: BacktestCapmResponse }) {
   const points = capmData.scatter_data || [];
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const [chartWidth, setChartWidth] = useState(0);
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    const syncWidth = () => {
+      const measured = Math.floor(container.clientWidth);
+      setChartWidth((prev) => (prev !== measured ? measured : prev));
+    };
+
+    syncWidth();
+    const observer = new ResizeObserver(syncWidth);
+    observer.observe(container);
+    return () => observer.disconnect();
+  }, []);
+
   if (!points.length) {
     return (
       <div style={{ color: "var(--color-text-muted)", padding: "10px 0" }}>
@@ -1091,9 +1108,13 @@ function CapmScatterPlot({ capmData }: { capmData: BacktestCapmResponse }) {
         Beta = {capmData.beta.toFixed(2)} | Alpha = {(capmData.alpha * 100).toFixed(2)}% (ann.) | R² ={" "}
         {capmData.r_squared.toFixed(2)}
       </div>
-      <div style={{ width: "100%", height: "340px" }}>
-        <ResponsiveContainer width="100%" height="100%">
-          <ScatterChart margin={{ top: 10, right: 20, bottom: 20, left: 8 }}>
+      <div ref={containerRef} style={{ width: "100%", height: "340px", minWidth: 0 }}>
+        {chartWidth > 0 ? (
+          <ScatterChart
+            width={chartWidth}
+            height={340}
+            margin={{ top: 10, right: 20, bottom: 20, left: 8 }}
+          >
             <CartesianGrid stroke="#30363d" strokeDasharray="3 3" />
             <XAxis
               type="number"
@@ -1135,7 +1156,7 @@ function CapmScatterPlot({ capmData }: { capmData: BacktestCapmResponse }) {
             <Scatter name="Daily Returns" data={points} fill="#58a6ff" />
             <ReferenceLine segment={lineSegment} stroke="#f85149" strokeWidth={2} />
           </ScatterChart>
-        </ResponsiveContainer>
+        ) : null}
       </div>
     </div>
   );

@@ -628,6 +628,82 @@ def _assemble_candle_dataframe(
     return df.sort_values("timestamp").drop_duplicates("timestamp").reset_index(drop=True)
 
 
+def _normalize_offer_side(value: str | None) -> str:
+    normalized = str(value or "bid").strip().lower()
+    if normalized not in {"bid", "ask", "both"}:
+        raise ValueError("offer_side must be one of: bid, ask, both")
+    return normalized
+
+
+def _prefix_ohlcv_columns(df: pd.DataFrame, side: str) -> pd.DataFrame:
+    if df.empty:
+        return df.copy()
+    return df.rename(
+        columns={
+            "open": f"{side}_open",
+            "high": f"{side}_high",
+            "low": f"{side}_low",
+            "close": f"{side}_close",
+            "volume": f"{side}_volume",
+        }
+    )
+
+
+def _resample_side_prefixed_ohlcv(df: pd.DataFrame, timeframe: str, side: str) -> pd.DataFrame:
+    if timeframe == "m1":
+        return df
+    base = df.rename(
+        columns={
+            f"{side}_open": "open",
+            f"{side}_high": "high",
+            f"{side}_low": "low",
+            f"{side}_close": "close",
+            f"{side}_volume": "volume",
+        }
+    )
+    resampled = _resample_candles(base, timeframe)
+    return _prefix_ohlcv_columns(resampled, side)
+
+
+async def _download_minute_side_dataframe(
+    instrument: str,
+    start_dt: datetime,
+    end_dt: datetime,
+    *,
+    side: str,
+    decimal_factor: int,
+    batch_size: int,
+    pause_ms: int,
+    max_retries: int,
+    report_progress: Callable[[float, str], None] | None = None,
+    stop_event: Event | None = None,
+    pause_event: Event | None = None,
+    log_callback: Callable[[str], None] | None = None,
+) -> pd.DataFrame:
+    urls = generate_minute_urls(instrument, start_dt, end_dt, side)
+    _emit_log_message(
+        f"Downloading {len(urls)} daily minute-candle files for {side}...",
+        log_callback=log_callback,
+    )
+    bi5_results = await download_bi5_files(
+        urls,
+        batch_size,
+        max_retries,
+        batch_size=batch_size,
+        pause_ms=pause_ms,
+        report_progress=report_progress,
+        stop_event=stop_event,
+        pause_event=pause_event,
+        log_callback=log_callback,
+    )
+    non_empty = sum(1 for _, d in bi5_results if d)
+    _emit_log_message(
+        f"Received {non_empty}/{len(urls)} non-empty files for {side}",
+        log_callback=log_callback,
+    )
+    return _assemble_candle_dataframe(bi5_results, decimal_factor)
+
+
 def _ticks_to_ohlcv(
     tick_df: pd.DataFrame, timeframe: str, price_type: str = "bid"
 ) -> pd.DataFrame:
@@ -858,9 +934,8 @@ class DukascopyNativeDownloader(Downloader):
         sym, instrument, asset_class = _resolve_symbol_and_instrument(symbol)
         out_path = self._make_output_path(output_dir, asset_class, sym, out_tf)
         effective_start = self._resolve_resume_start(out_path, start)
-        price_type = str(kwargs.get("price_type", "bid")).lower()
-        if price_type not in {"bid", "ask"}:
-            raise ValueError("price_type must be 'bid' or 'ask'")
+        offer_side = _normalize_offer_side(kwargs.get("offer_side", kwargs.get("price_type", "bid")))
+        price_type = "bid" if offer_side == "both" else offer_side
 
         merge_tick = bool(kwargs.get("merge_tick", False))
         merge_s1 = bool(kwargs.get("merge_s1", False))
@@ -891,10 +966,12 @@ class DukascopyNativeDownloader(Downloader):
 
         decimal_factor = _get_decimal_factor(instrument)
         strategy = DOWNLOAD_STRATEGY[normalized_tf]
+        if offer_side == "both" and strategy == "tick":
+            merge_bid_ask = True
 
         _emit_log_message(
             "Native download: symbol=%s instrument=%s tf=%s strategy=%s range=%s→%s "
-            "price=%s merge=%s batch_size=%s pause_ms=%s"
+            "offer_side=%s merge=%s batch_size=%s pause_ms=%s"
             % (
                 sym,
                 instrument,
@@ -902,7 +979,7 @@ class DukascopyNativeDownloader(Downloader):
                 strategy,
                 requested_start,
                 requested_end,
-                price_type,
+                offer_side,
                 merge_bid_ask,
                 batch_size,
                 pause_ms,
@@ -926,7 +1003,7 @@ class DukascopyNativeDownloader(Downloader):
                     pause_event=pause_event,
                     log_callback=log_callback,
                 )
-                warnings = [f"price_type:bid+ask"]
+                warnings = ["offer_side:both", "price_type:bid+ask"]
             else:
                 urls = generate_tick_urls(instrument, start_dt, end_dt)
                 _emit_log_message(
@@ -955,7 +1032,7 @@ class DukascopyNativeDownloader(Downloader):
                 )
                 _report_progress(report_progress, 95.0, "Assembling tick data")
                 df = _assemble_tick_dataframe(bi5_results, decimal_factor)
-                warnings = [f"price_type:{price_type}"]
+                warnings = [f"offer_side:{offer_side}", f"price_type:{price_type}"]
 
             if df.empty:
                 raise RuntimeError(f"No tick data for {sym} in range {requested_start} → {requested_end}")
@@ -968,42 +1045,93 @@ class DukascopyNativeDownloader(Downloader):
                 df = _ticks_to_ohlcv(df, normalized_tf, price_type)
 
         elif strategy == "minute":
-            urls = generate_minute_urls(instrument, start_dt, end_dt, price_type)
-            _emit_log_message(
-                f"Downloading {len(urls)} daily minute-candle files...",
-                log_callback=log_callback,
-            )
-            bi5_results = await download_bi5_files(
-                urls,
-                batch_size,
-                max_retries,
-                batch_size=batch_size,
-                pause_ms=pause_ms,
-                report_progress=(
-                    (lambda pct, msg: _report_progress(report_progress, pct * 0.9, msg))
-                    if report_progress
-                    else None
-                ),
-                stop_event=stop_event,
-                pause_event=pause_event,
-                log_callback=log_callback,
-            )
-            non_empty = sum(1 for _, d in bi5_results if d)
-            _emit_log_message(
-                f"Received {non_empty}/{len(urls)} non-empty files",
-                log_callback=log_callback,
-            )
-            _report_progress(report_progress, 95.0, "Assembling candle data")
-            df = _assemble_candle_dataframe(bi5_results, decimal_factor)
-            warnings = [f"price_type:{price_type}"]
-
-            if df.empty:
-                raise RuntimeError(
-                    f"No candle data for {sym} in range {requested_start} → {requested_end}"
+            if offer_side == "both":
+                bid_df = await _download_minute_side_dataframe(
+                    instrument,
+                    start_dt,
+                    end_dt,
+                    side="bid",
+                    decimal_factor=decimal_factor,
+                    batch_size=batch_size,
+                    pause_ms=pause_ms,
+                    max_retries=max_retries,
+                    report_progress=(
+                        (lambda pct, msg: _report_progress(report_progress, pct * 0.45, f"Bid {msg}"))
+                        if report_progress
+                        else None
+                    ),
+                    stop_event=stop_event,
+                    pause_event=pause_event,
+                    log_callback=log_callback,
                 )
+                ask_df = await _download_minute_side_dataframe(
+                    instrument,
+                    start_dt,
+                    end_dt,
+                    side="ask",
+                    decimal_factor=decimal_factor,
+                    batch_size=batch_size,
+                    pause_ms=pause_ms,
+                    max_retries=max_retries,
+                    report_progress=(
+                        (
+                            lambda pct, msg: _report_progress(
+                                report_progress, 45.0 + (pct * 0.45), f"Ask {msg}"
+                            )
+                        )
+                        if report_progress
+                        else None
+                    ),
+                    stop_event=stop_event,
+                    pause_event=pause_event,
+                    log_callback=log_callback,
+                )
+                _report_progress(report_progress, 95.0, "Merging bid/ask candle data")
+                if bid_df.empty or ask_df.empty:
+                    raise RuntimeError(
+                        f"No bid/ask candle data for {sym} in range {requested_start} → {requested_end}"
+                    )
+                bid_prefixed = _prefix_ohlcv_columns(bid_df, "bid")
+                ask_prefixed = _prefix_ohlcv_columns(ask_df, "ask")
+                if normalized_tf != "m1":
+                    bid_prefixed = _resample_side_prefixed_ohlcv(bid_prefixed, normalized_tf, "bid")
+                    ask_prefixed = _resample_side_prefixed_ohlcv(ask_prefixed, normalized_tf, "ask")
+                df = (
+                    bid_prefixed.merge(ask_prefixed, on="timestamp", how="inner")
+                    .sort_values("timestamp")
+                    .drop_duplicates(subset=["timestamp"])
+                    .reset_index(drop=True)
+                )
+                warnings = ["offer_side:both", "price_type:bid+ask"]
+            else:
+                df = await _download_minute_side_dataframe(
+                    instrument,
+                    start_dt,
+                    end_dt,
+                    side=price_type,
+                    decimal_factor=decimal_factor,
+                    batch_size=batch_size,
+                    pause_ms=pause_ms,
+                    max_retries=max_retries,
+                    report_progress=(
+                        (lambda pct, msg: _report_progress(report_progress, pct * 0.9, msg))
+                        if report_progress
+                        else None
+                    ),
+                    stop_event=stop_event,
+                    pause_event=pause_event,
+                    log_callback=log_callback,
+                )
+                _report_progress(report_progress, 95.0, "Assembling candle data")
+                warnings = [f"offer_side:{offer_side}", f"price_type:{price_type}"]
 
-            if normalized_tf != "m1":
-                df = _resample_candles(df, normalized_tf)
+                if df.empty:
+                    raise RuntimeError(
+                        f"No candle data for {sym} in range {requested_start} → {requested_end}"
+                    )
+
+                if normalized_tf != "m1":
+                    df = _resample_candles(df, normalized_tf)
 
         await _wait_for_control(pause_event, stop_event)
 
@@ -1016,7 +1144,8 @@ class DukascopyNativeDownloader(Downloader):
         source_meta = self.get_source_meta().to_dict()
         source_meta.update({
             "instrument": instrument,
-            "price_type": "bid+ask" if merge_bid_ask else price_type,
+            "offer_side": offer_side,
+            "price_type": "bid+ask" if (merge_bid_ask or offer_side == "both") else price_type,
             "merge_bid_ask": merge_bid_ask,
             "requested_start": requested_start,
             "requested_end": requested_end,
@@ -1065,8 +1194,12 @@ def main() -> None:
         help="Comma-separated timeframes (tick,s1,m1,m5,m15,m30,h1,h4,d1,mn1)",
     )
     parser.add_argument(
-        "--price-type", default="bid", choices=["bid", "ask"],
-        help="Price side (default: bid)",
+        "--offer-side",
+        "--price-type",
+        dest="offer_side",
+        default="bid",
+        choices=["bid", "ask", "both"],
+        help="Price side selection (bid, ask, both). Default: bid",
     )
     parser.add_argument(
         "--merge-tick", action="store_true",
@@ -1124,7 +1257,7 @@ def main() -> None:
                     sym, tf, output_dir,
                     start=args.start,
                     end=args.end,
-                    price_type=args.price_type,
+                    offer_side=args.offer_side,
                     merge_tick=args.merge_tick,
                     merge_s1=args.merge_s1,
                     batch_size=args.batch_size,

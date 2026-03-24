@@ -41,22 +41,16 @@ from data_tools import cache_manager
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(PROJECT_ROOT / ".env")
+# Avoid pynecore TOML auto-writes at import-time in the web process.
+os.environ.setdefault("PYNE_SAVE_SCRIPT_TOML", "0")
 
-_data_dir_env = os.environ.get("DATA_DIR") or os.environ.get("TRADING_DATA_DIR")
-DATA_DIR = (
-    Path(_data_dir_env).expanduser().resolve()
-    if _data_dir_env
-    else (PROJECT_ROOT / "data").resolve()
-)
+from shared.constants import DATA_DIR as RESOLVED_DATA_DIR, LOG_DIR as RESOLVED_LOG_DIR
+
+DATA_DIR = RESOLVED_DATA_DIR
 os.environ.setdefault("DATA_DIR", str(DATA_DIR))
 os.environ.setdefault("TRADING_DATA_DIR", str(DATA_DIR))
 
-_log_dir_env = os.environ.get("LOG_DIR")
-LOG_DIR = (
-    Path(_log_dir_env).expanduser().resolve()
-    if _log_dir_env
-    else (PROJECT_ROOT / "logs").resolve()
-)
+LOG_DIR = RESOLVED_LOG_DIR
 os.environ.setdefault("LOG_DIR", str(LOG_DIR))
 
 from shared.logging import get_logger
@@ -73,6 +67,7 @@ from shared.database import (
     list_live_deployments,
     list_live_deployments_for_account,
     list_live_signal_executions_for_deployments,
+    load_live_account_stats_inputs,
     load_backtest_result,
     migrate_json_to_sqlite,
     save_result_to_sqlite,
@@ -373,6 +368,44 @@ async def static_spa_middleware(request: Request, call_next):
     return await call_next(request)
 
 
+@app.middleware("http")
+async def api_request_logging_middleware(request: Request, call_next):
+    path = request.url.path
+    method = request.method
+    started_at = time.perf_counter()
+
+    try:
+        response = await call_next(request)
+    except Exception:
+        duration_ms = round((time.perf_counter() - started_at) * 1000.0, 2)
+        logger.exception(
+            "HTTP request failed",
+            extra={
+                "data": {
+                    "method": method,
+                    "path": path,
+                    "status": 500,
+                    "duration_ms": duration_ms,
+                }
+            },
+        )
+        raise
+
+    duration_ms = round((time.perf_counter() - started_at) * 1000.0, 2)
+    logger.info(
+        "HTTP request completed",
+        extra={
+            "data": {
+                "method": method,
+                "path": path,
+                "status": int(response.status_code),
+                "duration_ms": duration_ms,
+            }
+        },
+    )
+    return response
+
+
 def _load_result(backtest_id: str) -> BacktestResult | None:
     result = load_backtest_result(backtest_id)
     if result is not None:
@@ -479,7 +512,17 @@ def _serialize_live_timestamp(value: datetime | str | None) -> tuple[str, float]
 
 
 def _serialize_live_account_payload(account: Any) -> dict[str, Any]:
-    return {"id": account.id, "broker": account.broker, "name": account.name}
+    broker_login = getattr(account, "broker_login", None)
+    ctid = getattr(account, "ctid", None)
+    normalized_login = str(broker_login).strip() if broker_login else None
+    return {
+        "id": account.id,
+        "broker": account.broker,
+        "name": account.name,
+        "broker_login": normalized_login,
+        "login": normalized_login,
+        "ctid": str(ctid).strip() if ctid else None,
+    }
 
 
 def _serialize_live_deployment_payload(deployment: LiveDeploymentConfig) -> dict[str, Any]:
@@ -502,6 +545,11 @@ def _discover_live_accounts_payload() -> list[dict[str, Any]]:
             account_id = str(account.get("id") or "").strip()
             if not account_id:
                 continue
+            normalized_login = (
+                str(account.get("broker_login") or account.get("login")).strip()
+                if account.get("broker_login") or account.get("login")
+                else None
+            )
             payload.append(
                 {
                     "id": account_id,
@@ -509,9 +557,17 @@ def _discover_live_accounts_payload() -> list[dict[str, Any]]:
                     "broker": str(account.get("broker") or "unknown"),
                     "balance": _safe_float(account.get("balance"), 0.0),
                     "is_demo": bool(account.get("is_demo", False)),
+                    "broker_login": normalized_login,
+                    "login": normalized_login,
+                    "ctid": (
+                        str(account.get("ctid")).strip() if account.get("ctid") else None
+                    ),
                 }
             )
             continue
+        normalized_login = (
+            str(account.broker_login).strip() if getattr(account, "broker_login", None) else None
+        )
         payload.append(
             {
                 "id": account.id,
@@ -519,6 +575,11 @@ def _discover_live_accounts_payload() -> list[dict[str, Any]]:
                 "broker": account.broker,
                 "balance": float(account.balance),
                 "is_demo": bool(account.is_demo),
+                "broker_login": normalized_login,
+                "login": normalized_login,
+                "ctid": (
+                    str(account.ctid).strip() if getattr(account, "ctid", None) else None
+                ),
             }
         )
     return payload
@@ -594,6 +655,114 @@ def _deployment_ids_for_account(
     return sorted(ids)
 
 
+def _log_live_endpoint_request(endpoint: str, **params: Any) -> None:
+    logger.debug(
+        "Live API request params",
+        extra={"data": {"endpoint": endpoint, "params": params}},
+    )
+
+
+def _calculate_realized_live_pnl(
+    rows: list[dict[str, Any]],
+) -> tuple[float, int, int]:
+    positions: dict[str, dict[str, float]] = {}
+    total_pnl = 0.0
+    wins = 0
+    losses = 0
+
+    ordered_rows = sorted(
+        rows,
+        key=lambda row: _serialize_live_timestamp(row.get("execution_timestamp"))[1],
+    )
+    for row in ordered_rows:
+        symbol = str(row.get("symbol") or "UNKNOWN").upper()
+        action = str(row.get("action") or "").strip().lower()
+        direction = 1.0 if action == "buy" else -1.0 if action == "sell" else 0.0
+        if direction == 0.0:
+            continue
+
+        quantity = abs(_safe_float(row.get("filled_qty"), 0.0))
+        price = _safe_float(row.get("actual_price"), 0.0)
+        if quantity <= 0.0 or price <= 0.0:
+            continue
+
+        delta = quantity * direction
+        state = positions.setdefault(symbol, {"qty": 0.0, "avg": 0.0})
+        current_qty = state["qty"]
+        current_avg = state["avg"]
+
+        if current_qty == 0.0:
+            state["qty"] = delta
+            state["avg"] = price
+            continue
+
+        if current_qty * delta > 0:
+            combined_qty = abs(current_qty) + abs(delta)
+            if combined_qty > 0:
+                state["avg"] = ((abs(current_qty) * current_avg) + (abs(delta) * price)) / combined_qty
+            state["qty"] = current_qty + delta
+            continue
+
+        closed_qty = min(abs(current_qty), abs(delta))
+        if closed_qty > 0:
+            side_sign = 1.0 if current_qty > 0 else -1.0
+            realized = (price - current_avg) * closed_qty * side_sign
+            total_pnl += realized
+            if realized > 0:
+                wins += 1
+            elif realized < 0:
+                losses += 1
+
+        new_qty = current_qty + delta
+        if new_qty == 0.0:
+            state["qty"] = 0.0
+            state["avg"] = 0.0
+        elif current_qty * new_qty > 0:
+            state["qty"] = new_qty
+        else:
+            state["qty"] = new_qty
+            state["avg"] = price
+
+    return total_pnl, wins, losses
+
+
+def _live_account_stats_payload(account_id: str) -> dict[str, Any]:
+    balances, execution_rows = load_live_account_stats_inputs(account_id)
+
+    total_pnl_realized, wins, losses = _calculate_realized_live_pnl(execution_rows)
+    total_trades = len(execution_rows)
+    win_rate = (wins / total_trades * 100.0) if total_trades else 0.0
+
+    max_drawdown = 0.0
+    max_drawdown_pct = 0.0
+    peak_balance = 0.0
+    current_balance = 0.0
+    current_equity = 0.0
+    for record in balances:
+        balance_value = float(record.balance)
+        equity_value = float(record.equity)
+        current_balance = balance_value
+        current_equity = equity_value
+        peak_balance = max(peak_balance, balance_value)
+        if peak_balance > 0:
+            max_drawdown = max(max_drawdown, peak_balance - balance_value)
+            drawdown = ((peak_balance - balance_value) / peak_balance) * 100.0
+            max_drawdown_pct = max(max_drawdown_pct, drawdown)
+
+    return {
+        "account_id": account_id,
+        "total_trades": total_trades,
+        "winning_trades": wins,
+        "losing_trades": losses,
+        "win_rate": round(win_rate, 2),
+        "total_pnl": round(total_pnl_realized, 2),
+        "max_drawdown": round(max_drawdown, 2),
+        "max_drawdown_pct": round(max_drawdown_pct, 2),
+        "current_balance": round(current_balance, 2),
+        "current_equity": round(current_equity, 2),
+    }
+
+
 def _ensure_live_account_for_deployment(account_id: str) -> dict[str, Any]:
     existing_accounts = {account.id: account for account in list_live_accounts()}
     current = existing_accounts.get(account_id)
@@ -620,10 +789,16 @@ def _ensure_live_account_for_deployment(account_id: str) -> dict[str, Any]:
     if isinstance(discovered, dict):
         broker = str(discovered.get("broker") or "").strip().lower() or "unknown"
         name = str(discovered.get("name") or "").strip() or account_id
+        ctid = str(discovered.get("ctid") or "").strip() or None
+        broker_login = (
+            str(discovered.get("broker_login") or discovered.get("login") or "").strip() or None
+        )
         account = ensure_live_account(
             account_id,
             broker,
             name=name,
+            ctid=ctid,
+            broker_login=broker_login,
         )
         return _serialize_live_account_payload(account)
 
@@ -1587,6 +1762,7 @@ async def list_backtests() -> list[dict[str, Any]]:
 
 
 @app.get("/api/backtest/{backtest_id}", response_model=dict[str, Any])
+@app.get("/api/backtests/{backtest_id}", response_model=dict[str, Any])
 async def get_backtest(backtest_id: str) -> dict[str, Any]:
     result = _load_result(backtest_id)
     if result is None:
@@ -1627,6 +1803,7 @@ async def rename_backtest(backtest_id: str, payload: NameUpdateRequest) -> dict[
 
 
 @app.get("/api/backtest/{backtest_id}/info", response_model=dict[str, Any])
+@app.get("/api/backtests/{backtest_id}/info", response_model=dict[str, Any])
 async def get_backtest_info(backtest_id: str) -> dict[str, Any]:
     result = _load_result(backtest_id)
     if result is None:
@@ -1635,6 +1812,7 @@ async def get_backtest_info(backtest_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/backtest/{backtest_id}/stats", response_model=dict[str, Any])
+@app.get("/api/backtests/{backtest_id}/stats", response_model=dict[str, Any])
 async def get_backtest_stats(backtest_id: str) -> dict[str, Any]:
     result = _load_result(backtest_id)
     if result is None:
@@ -1681,6 +1859,7 @@ async def get_backtest_stats(backtest_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/backtest/{backtest_id}/equity", response_model=list[dict[str, float]])
+@app.get("/api/backtests/{backtest_id}/equity", response_model=list[dict[str, float]])
 async def get_equity_curve(backtest_id: str) -> list[dict[str, float]]:
     result = _load_result(backtest_id)
     if result is None:
@@ -1748,6 +1927,7 @@ async def get_backtest_capm(
 
 
 @app.get("/api/backtest/{backtest_id}/trades", response_model=list[dict[str, Any]])
+@app.get("/api/backtests/{backtest_id}/trades", response_model=list[dict[str, Any]])
 async def get_backtest_trades(backtest_id: str) -> list[dict[str, Any]]:
     result = _load_result(backtest_id)
     if result is None:
@@ -2031,8 +2211,8 @@ async def compare_backtests_endpoint(ids: str = Query(default="")) -> dict[str, 
     return legacy_viewer.compare_backtests(strategies)
 
 
-@app.post("/api/backtests/run", response_model=dict[str, Any])
-async def run_backtest(payload: BacktestRunRequest, background_tasks: BackgroundTasks) -> dict[str, Any]:
+@app.post("/api/backtests/run", response_model=dict[str, Any], status_code=202)
+async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
     try:
         threading.Thread(target=_dolthub_pull, daemon=True).start()
     except RuntimeError:
@@ -2051,7 +2231,7 @@ async def run_backtest(payload: BacktestRunRequest, background_tasks: Background
     if strategy_path is None:
         raise HTTPException(status_code=404, detail=f"Strategy '{strategy}' not found")
 
-    engine = str(payload.engine or "native")
+    engine = str(payload.engine or "native").strip() or "native"
     timeframe = str(payload.timeframe or "1d")
     start = str(payload.start or "")
     end = str(payload.end or "")
@@ -2063,66 +2243,277 @@ async def run_backtest(payload: BacktestRunRequest, background_tasks: Background
         payload.modeling_resolution or payload.intrabar_resolution or "open_close"
     )
 
-    job_id = str(uuid.uuid4())[:8]
-    _running_jobs[job_id] = {"status": "running", "result": None, "error": None}
+    task_id = str(uuid.uuid4())[:8]
+    TASK_LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    log_file = _task_log_path(task_id)
+    stage_total = 4
+    record = _create_task_record(
+        task_id,
+        name=f"Backtest {strategy_path.stem}",
+        description=(
+            f"Run {strategy_path.stem} on {', '.join(symbols)} "
+            f"({timeframe}, engine={engine})."
+        ),
+        kind="backtest",
+        source=engine,
+        total_items=stage_total,
+        log_file=log_file,
+        control_mode="thread",
+        supports_control=False,
+    )
+    with DATA_TASKS_LOCK:
+        DATA_TASKS[task_id] = record
+    _set_task_status(task_id, "queued")
+
+    _running_jobs[task_id] = {
+        "status": "queued",
+        "result": None,
+        "error": None,
+        "task_id": task_id,
+        "job_id": task_id,
+    }
+
+    def _runner_log_message(raw_line: str) -> str:
+        text = str(raw_line or "").strip()
+        if not text:
+            return ""
+        try:
+            payload_json = json.loads(text)
+        except json.JSONDecodeError:
+            return text
+
+        if isinstance(payload_json, dict):
+            message = payload_json.get("message")
+            if isinstance(message, str) and message.strip():
+                return message.strip()
+        return text
+
+    def _runner_stage(message: str) -> tuple[float, str] | None:
+        normalized = message.lower()
+        if "auto-detected date range" in normalized:
+            return (15.0, "Loading backtest inputs...")
+        if "running backtest:" in normalized:
+            return (40.0, "Launching backtest runner...")
+        if normalized.startswith("result:"):
+            return (72.0, "Computing strategy statistics...")
+        if normalized.startswith("saved to:"):
+            return (90.0, "Saving backtest result...")
+        return None
 
     def _run() -> None:
-        try:
-            cmd = [
-                sys.executable,
-                "-m",
-                "runner.cli",
-                "run",
-                "--engine",
-                engine,
-                "--strategy",
-                str(strategy_path),
-                "--symbols",
-                *symbols,
-                "--timeframe",
-                timeframe,
-                "--capital",
-                str(capital),
-            ]
-            if start:
-                cmd.extend(["--start", start])
-            if end:
-                cmd.extend(["--end", end])
-            if params:
-                cmd.extend(["--params", json.dumps(params)])
-            if risk_pct is not None:
-                cmd.extend(["--risk-pct", str(risk_pct)])
-            if max_position_pct is not None:
-                cmd.extend(["--max-position-pct", str(max_position_pct)])
-            if max_leverage is not None:
-                cmd.extend(["--max-leverage", str(max_leverage)])
-            if modeling_resolution:
-                cmd.extend(["--intrabar-resolution", modeling_resolution])
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        cmd = [
+            sys.executable,
+            "-u",
+            "-m",
+            "runner.cli",
+            "run",
+            "--engine",
+            engine,
+            "--strategy",
+            str(strategy_path),
+            "--symbols",
+            *symbols,
+            "--timeframe",
+            timeframe,
+            "--capital",
+            str(capital),
+        ]
+        if start:
+            cmd.extend(["--start", start])
+        if end:
+            cmd.extend(["--end", end])
+        if params:
+            cmd.extend(["--params", json.dumps(params)])
+        if risk_pct is not None:
+            cmd.extend(["--risk-pct", str(risk_pct)])
+        if max_position_pct is not None:
+            cmd.extend(["--max-position-pct", str(max_position_pct)])
+        if max_leverage is not None:
+            cmd.extend(["--max-leverage", str(max_leverage)])
+        if modeling_resolution:
+            cmd.extend(["--intrabar-resolution", modeling_resolution])
 
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=300,
-                cwd=str(PROJECT_ROOT),
+        latest_message = ""
+        output_path = ""
+        backtest_id = ""
+        stage_progress = 0.0
+
+        def report_stage(
+            handle,
+            *,
+            percent: float,
+            message: str,
+            write_log_line: bool = True,
+        ) -> None:
+            nonlocal stage_progress
+            if percent <= stage_progress:
+                return
+            stage_progress = percent
+            _update_task_progress(
+                task_id,
+                percent=percent,
+                current=message,
+                total=stage_total,
             )
-            if proc.returncode == 0:
-                output = (proc.stdout or "") + (proc.stderr or "")
-                _running_jobs[job_id]["status"] = "completed"
-                _running_jobs[job_id]["result"] = output
-            else:
-                _running_jobs[job_id]["status"] = "failed"
-                _running_jobs[job_id]["error"] = proc.stderr or proc.stdout
-        except (subprocess.SubprocessError, OSError) as exc:
-            _running_jobs[job_id]["status"] = "failed"
-            _running_jobs[job_id]["error"] = str(exc)
+            if write_log_line:
+                _write_task_log_line(
+                    handle,
+                    task_id,
+                    f"[{_task_timestamp()}] {message}",
+                    stream="task",
+                    source="backtest",
+                )
 
-    background_tasks.add_task(_run)
-    return {"job_id": job_id, "status": "running"}
+        with log_file.open("a", encoding="utf-8", buffering=1) as handle:
+            try:
+                _set_task_status(task_id, "running")
+                _running_jobs[task_id]["status"] = "running"
+                report_stage(handle, percent=8.0, message="Loading backtest inputs...")
+
+                command_display = " ".join(str(part) for part in cmd)
+                _write_task_log_line(
+                    handle,
+                    task_id,
+                    f"[{_task_timestamp()}] Starting command: {command_display}",
+                    stream="task",
+                    source="backtest",
+                )
+                report_stage(handle, percent=25.0, message="Launching backtest runner...")
+
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    cwd=str(PROJECT_ROOT),
+                    env=env,
+                    text=True,
+                    bufsize=1,
+                )
+                _update_task_fields(task_id, pid=proc.pid, process=proc)
+
+                if proc.stdout is not None:
+                    for raw_line in proc.stdout:
+                        line = raw_line.rstrip("\n")
+                        if line:
+                            _write_task_log_line(
+                                handle,
+                                task_id,
+                                line,
+                                stream="stdout",
+                                source="backtest",
+                            )
+                        parsed_message = _runner_log_message(line)
+                        if not parsed_message:
+                            continue
+                        latest_message = parsed_message
+                        stage = _runner_stage(parsed_message)
+                        if stage is not None:
+                            percent, message = stage
+                            report_stage(handle, percent=percent, message=message)
+
+                        if parsed_message.lower().startswith("saved to:"):
+                            output_path = parsed_message.split(":", 1)[1].strip()
+                            if output_path:
+                                filename = Path(output_path).name
+                                if filename.endswith(".trades.json"):
+                                    filename_id = filename[: -len(".trades.json")]
+                                    backtest_id = filename_id
+                                    if filename_id:
+                                        loaded_result = _load_result(filename_id)
+                                        if loaded_result is not None:
+                                            meta_id = str(getattr(loaded_result.meta, "id", "") or "").strip()
+                                            if meta_id:
+                                                backtest_id = meta_id
+                                _update_task_fields(
+                                    task_id,
+                                    output_path=output_path,
+                                    backtest_id=backtest_id or None,
+                                )
+
+                try:
+                    returncode = proc.wait(timeout=300)
+                except subprocess.TimeoutExpired:
+                    if proc.poll() is None:
+                        proc.kill()
+                    raise subprocess.SubprocessError("Backtest timed out after 300 seconds")
+                if returncode == 0:
+                    report_stage(handle, percent=95.0, message="Saving backtest result...")
+                    result_payload = {
+                        "output_path": output_path or None,
+                        "backtest_id": backtest_id or None,
+                    }
+                    compact_result = {key: value for key, value in result_payload.items() if value}
+                    _update_task_fields(task_id, result=compact_result)
+                    _write_task_log_line(
+                        handle,
+                        task_id,
+                        f"[{_task_timestamp()}] Backtest completed successfully.",
+                        stream="task",
+                        source="backtest",
+                    )
+                    _mark_task_finished(task_id, status="completed", returncode=0)
+                    _running_jobs[task_id]["status"] = "completed"
+                    _running_jobs[task_id]["result"] = compact_result
+                    _running_jobs[task_id]["error"] = None
+                else:
+                    error_text = latest_message or f"Backtest command exited with code {returncode}"
+                    _write_task_log_line(
+                        handle,
+                        task_id,
+                        f"[{_task_timestamp()}] Backtest failed: {error_text}",
+                        stream="stderr",
+                        log_level="error",
+                        source="backtest",
+                    )
+                    _mark_task_finished(
+                        task_id,
+                        status="failed",
+                        returncode=returncode,
+                        error=error_text,
+                    )
+                    _running_jobs[task_id]["status"] = "failed"
+                    _running_jobs[task_id]["result"] = None
+                    _running_jobs[task_id]["error"] = error_text
+            except (subprocess.SubprocessError, OSError, ValueError) as exc:
+                _write_task_log_line(
+                    handle,
+                    task_id,
+                    f"[{_task_timestamp()}] Backtest failed: {exc}",
+                    stream="stderr",
+                    log_level="error",
+                    source="backtest",
+                )
+                _write_task_traceback(handle, task_id, traceback.format_exc(), source="backtest")
+                _mark_task_finished(task_id, status="failed", returncode=1, error=str(exc))
+                _running_jobs[task_id]["status"] = "failed"
+                _running_jobs[task_id]["result"] = None
+                _running_jobs[task_id]["error"] = str(exc)
+            finally:
+                _update_task_fields(task_id, process=None)
+
+    thread = threading.Thread(target=_run, daemon=True)
+    _update_task_fields(task_id, thread=thread)
+    thread.start()
+    return {"task_id": task_id, "job_id": task_id, "status": "queued"}
 
 
 @app.get("/api/backtests/run/{job_id}/status", response_model=dict[str, Any])
 async def get_backtest_run_status(job_id: str) -> dict[str, Any]:
+    task = _snapshot_task(job_id)
+    if task is not None and task.get("kind") == "backtest":
+        progress = dict(task.get("progress_detail") or {})
+        progress.setdefault("percent", float(task.get("progress", 0.0) or 0.0))
+        return {
+            "job_id": job_id,
+            "task_id": job_id,
+            "status": str(task.get("status", "unknown")),
+            "result": task.get("result"),
+            "error": task.get("error"),
+            "progress": progress,
+        }
+
     job = _running_jobs.get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -2158,6 +2549,7 @@ async def run_optimization_job(payload: dict[str, Any]) -> dict[str, Any]:
     )
     with DATA_TASKS_LOCK:
         DATA_TASKS[task_id] = record
+    _set_task_status(task_id, "queued")
 
     def _run() -> None:
         optuna_logger = logging.getLogger("optuna")
@@ -2231,7 +2623,7 @@ async def run_optimization_job(payload: dict[str, Any]) -> dict[str, Any]:
     thread = threading.Thread(target=_run, daemon=True)
     _update_task_fields(task_id, thread=thread)
     thread.start()
-    return {"job_id": task_id, "status": "starting"}
+    return {"task_id": task_id, "job_id": task_id, "status": "queued"}
 
 
 @app.get("/api/optimizations", response_model=list[dict[str, Any]])
@@ -2534,11 +2926,13 @@ async def delete_portfolio(portfolio_id: str) -> dict[str, Any]:
 
 @app.get("/api/live/accounts", response_model=list[dict[str, Any]])
 async def get_live_accounts() -> list[dict[str, Any]]:
+    _log_live_endpoint_request("/api/live/accounts")
     return await asyncio.to_thread(_cached_live_accounts_payload)
 
 
 @app.get("/api/live/deployments", response_model=list[dict[str, Any]])
 async def get_live_deployments() -> list[dict[str, Any]]:
+    _log_live_endpoint_request("/api/live/deployments")
     deployments = await asyncio.to_thread(list_live_deployments)
     return [_serialize_live_deployment_payload(deployment) for deployment in deployments]
 
@@ -2547,6 +2941,13 @@ async def get_live_deployments() -> list[dict[str, Any]]:
 async def create_live_deployment_endpoint(
     payload: LiveDeploymentCreateRequest,
 ) -> dict[str, Any]:
+    _log_live_endpoint_request(
+        "/api/live/deployments",
+        strategy_name=payload.strategy_name,
+        account_id=payload.account_id,
+        symbols=payload.symbols,
+        timeframe=payload.timeframe,
+    )
     account_payload = await asyncio.to_thread(_ensure_live_account_for_deployment, payload.account_id)
     inferred_broker = str(account_payload.get("broker", "")).strip().lower()
     if inferred_broker not in {"alpaca", "ctrader"}:
@@ -2570,6 +2971,11 @@ async def create_live_deployment_endpoint(
 async def update_live_deployment_status_endpoint(
     deployment_id: str, payload: LiveDeploymentStatusUpdateRequest
 ) -> dict[str, Any]:
+    _log_live_endpoint_request(
+        "/api/live/deployments/{deployment_id}/status",
+        deployment_id=deployment_id,
+        status=payload.status,
+    )
     try:
         updated = await asyncio.to_thread(
             update_live_deployment_status, deployment_id, payload.status
@@ -2583,6 +2989,10 @@ async def update_live_deployment_status_endpoint(
 
 @app.delete("/api/live/deployments/{deployment_id}", response_model=dict[str, Any])
 async def delete_live_deployment_endpoint(deployment_id: str) -> dict[str, Any]:
+    _log_live_endpoint_request(
+        "/api/live/deployments/{deployment_id}",
+        deployment_id=deployment_id,
+    )
     deleted = await asyncio.to_thread(delete_live_deployment, deployment_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Live deployment not found")
@@ -2591,6 +3001,10 @@ async def delete_live_deployment_endpoint(deployment_id: str) -> dict[str, Any]:
 
 @app.get("/api/live/balances/{account_id}", response_model=dict[str, Any])
 async def get_live_balances(account_id: str) -> dict[str, Any]:
+    _log_live_endpoint_request(
+        "/api/live/balances/{account_id}",
+        account_id=account_id,
+    )
     records = await asyncio.to_thread(list_live_balances, account_id)
     series: list[dict[str, Any]] = []
     for record in records:
@@ -2610,6 +3024,10 @@ async def get_live_balances(account_id: str) -> dict[str, Any]:
 
 @app.get("/api/live/trades/{account_id}", response_model=dict[str, Any])
 async def get_live_trades(account_id: str) -> dict[str, Any]:
+    _log_live_endpoint_request(
+        "/api/live/trades/{account_id}",
+        account_id=account_id,
+    )
     deployments = await asyncio.to_thread(list_live_deployments_for_account, account_id)
     deployment_ids = _deployment_ids_for_account(account_id, deployments)
     rows = await asyncio.to_thread(list_live_signal_executions_for_deployments, deployment_ids)
@@ -2641,6 +3059,15 @@ async def get_live_trades(account_id: str) -> dict[str, Any]:
             }
         )
     return {"account_id": account_id, "deployment_ids": deployment_ids, "trades": trades}
+
+
+@app.get("/api/live/stats/{account_id}", response_model=dict[str, Any])
+async def get_live_stats(account_id: str) -> dict[str, Any]:
+    _log_live_endpoint_request(
+        "/api/live/stats/{account_id}",
+        account_id=account_id,
+    )
+    return await asyncio.to_thread(_live_account_stats_payload, account_id)
 
 
 @app.get("/api/data/overview", response_model=dict[str, Any])
@@ -2728,7 +3155,15 @@ async def data_download(payload: DataDownloadRequest) -> dict[str, Any]:
     timeframes = payload.timeframes
     start = payload.start
     end = payload.end
-    offer_side = str(payload.offer_side or payload.price_type or "bid").strip().lower()
+    provided_fields = (
+        payload.model_fields_set
+        if hasattr(payload, "model_fields_set")
+        else getattr(payload, "__fields_set__", set())
+    )
+    offer_side_value = payload.offer_side
+    if payload.price_type and "offer_side" not in provided_fields:
+        offer_side_value = payload.price_type
+    offer_side = str(offer_side_value or "bid").strip().lower()
     if offer_side not in {"bid", "ask", "both"}:
         raise HTTPException(status_code=400, detail="offer_side must be one of: bid, ask, both")
     merge_tick = bool(payload.merge_tick or payload.merge_bid_ask)
@@ -2790,7 +3225,7 @@ async def data_download(payload: DataDownloadRequest) -> dict[str, Any]:
         if end:
             cmd.extend(["--end", end])
         if offer_side:
-            cmd.extend(["--offer-side", offer_side])
+            cmd.extend(["--price-type", offer_side])
 
         total_items = max(len(symbol_list) * len(timeframe_list), 1)
         return _start_jforex_task(

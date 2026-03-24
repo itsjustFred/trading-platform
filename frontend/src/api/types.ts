@@ -41,6 +41,7 @@ export interface RunBacktestRequest {
 }
 
 export interface RunBacktestResponse {
+  task_id?: string;
   job_id: string;
   status: string;
 }
@@ -222,6 +223,7 @@ export interface OptimizationRunRequest {
 }
 
 export interface OptimizationRunResponse {
+  task_id?: string;
   job_id: string;
   status: string;
 }
@@ -342,6 +344,9 @@ export interface LiveAccount {
   broker: "alpaca" | "ctrader";
   balance: number;
   is_demo: boolean;
+  broker_login?: string;
+  login?: string;
+  ctid?: string;
 }
 
 export type LiveDeploymentStatus = "ACTIVE" | "PAUSED" | "STOPPED";
@@ -371,6 +376,26 @@ export interface LiveBalanceRecord {
   time: number;
   balance: number;
   equity: number;
+}
+
+export interface LiveEquitySeriesPoint {
+  time: number;
+  equity: number;
+  balance?: number;
+  value?: number;
+}
+
+export interface LiveAccountStats {
+  account_id: string;
+  total_trades: number;
+  winning_trades: number;
+  losing_trades: number;
+  win_rate: number;
+  total_pnl: number;
+  current_balance: number;
+  current_equity: number;
+  max_drawdown: number;
+  max_drawdown_pct: number;
 }
 
 export interface LiveTradeSlippage {
@@ -640,7 +665,10 @@ export interface DataDownloadRequest {
   timeframes: string;
   start?: string;
   end?: string;
-  price_type?: "bid" | "ask";
+  // New preferred field describing which side(s) to download from the provider
+  offer_side?: "bid" | "ask" | "both";
+  // Legacy compatibility: keep price_type but allow 'both' for consistency
+  price_type?: "bid" | "ask" | "both";
   merge_tick?: boolean;
   merge_s1?: boolean;
   batch_size?: number;

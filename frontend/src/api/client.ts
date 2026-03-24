@@ -13,6 +13,7 @@ import type {
   DataCacheInvalidationResponse,
   DukascopyGenesisResponse,
   LiveAccount,
+  LiveAccountStats,
   LiveBalancesResponse,
   LiveDeploymentCreateRequest,
   LiveDeploymentConfig,
@@ -37,6 +38,10 @@ import type {
 } from "./types";
 
 const BASE_URL = "/api";
+const LIVE_STATS_PATH_FRAGMENT = "/live/stats/";
+
+let liveStatsSupported: boolean | null = null;
+let liveStatsSupportPromise: Promise<boolean> | null = null;
 
 export class ApiError extends Error {
   status: number;
@@ -67,6 +72,35 @@ async function fetchJSON<T>(url: string, options?: RequestInit): Promise<T> {
     throw new ApiError(message, res.status, detail);
   }
   return res.json();
+}
+
+async function supportsLiveStatsEndpoint(): Promise<boolean> {
+  if (liveStatsSupported !== null) {
+    return liveStatsSupported;
+  }
+  if (!liveStatsSupportPromise) {
+    liveStatsSupportPromise = (async () => {
+      try {
+        const response = await fetch("/openapi.json");
+        if (!response.ok) {
+          return true;
+        }
+        const payload = (await response.json()) as { paths?: Record<string, unknown> };
+        const paths = Object.keys(payload?.paths ?? {});
+        return paths.some((path) => path.includes(LIVE_STATS_PATH_FRAGMENT));
+      } catch {
+        return true;
+      }
+    })()
+      .then((supported) => {
+        liveStatsSupported = supported;
+        return supported;
+      })
+      .finally(() => {
+        liveStatsSupportPromise = null;
+      });
+  }
+  return liveStatsSupportPromise;
 }
 
 // Strategies
@@ -115,6 +149,15 @@ export const compareBacktests = (ids: string[]) =>
 export const getLiveDeployments = () =>
   fetchJSON<LiveDeploymentConfig[]>("/live/deployments");
 export const getLiveAccounts = () => fetchJSON<LiveAccount[]>("/live/accounts");
+export const getLiveStats = async (accountId: string) => {
+  const supported = await supportsLiveStatsEndpoint();
+  if (!supported) {
+    throw new ApiError("Live stats endpoint not available", 404, {
+      endpoint: "/api/live/stats/{account_id}",
+    });
+  }
+  return fetchJSON<LiveAccountStats>(`/live/stats/${encodeURIComponent(accountId)}`);
+};
 export const getLiveBalances = (accountId: string) =>
   fetchJSON<LiveBalancesResponse>(`/live/balances/${encodeURIComponent(accountId)}`);
 export const getLiveTrades = (accountId: string) =>
