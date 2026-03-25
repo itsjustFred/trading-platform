@@ -1,14 +1,13 @@
 import { useState, useEffect, useMemo } from "react";
 import { Modal } from "./Modal";
 import {
-  getStrategies,
   getStrategyDetail,
   runBacktest,
 } from "../api/client";
 import { SymbolInput } from "./SymbolInput";
 import { Play, Loader2 } from "lucide-react";
-import type { StrategyMeta } from "../api/types";
 import { useToast } from "./ToastProvider";
+import { useStrategiesCache } from "./StrategiesProvider";
 
 // Canonical timeframe order from smallest to largest (matches shared/constants.py)
 const TIMEFRAME_ORDER = ["tick", "s1", "1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"] as const;
@@ -46,7 +45,7 @@ export function CreateBacktestModal({
   onTaskStarted,
 }: CreateBacktestModalProps) {
   const { showToast } = useToast();
-  const [strategies, setStrategies] = useState<StrategyMeta[]>([]);
+  const { strategies } = useStrategiesCache();
   const [strategy, setStrategy] = useState("");
   const [engine, setEngine] = useState("native");
   const [symbols, setSymbols] = useState("AAPL");
@@ -62,14 +61,6 @@ export function CreateBacktestModal({
   const [parameterTypes, setParameterTypes] = useState<Record<string, "number" | "string">>({});
   const [running, setRunning] = useState(false);
   const [error, setError] = useState("");
-
-  useEffect(() => {
-    if (open) {
-      getStrategies()
-        .then(setStrategies)
-        .catch(() => {});
-    }
-  }, [open]);
 
   useEffect(() => {
     if (preselectedStrategy && strategies.length > 0) {

@@ -7,13 +7,11 @@ import {
   getBacktestEquity,
   getBacktestCapm,
   getBenchmark,
-  getBacktestOHLCV,
   renameBacktest,
 } from "../api/client";
 import { StatCard } from "../components/StatCard";
 import { DataTable } from "../components/DataTable";
 import { RenameModal } from "../components/RenameModal";
-import TradingViewChart from "../components/TradingViewChart";
 import { OptimizeModal } from "../components/OptimizeModal";
 import { ArrowLeft, ArrowUpRight, PencilLine, Target } from "lucide-react";
 import {
@@ -52,8 +50,6 @@ export function BacktestDetailPage() {
   const [stats, setStats] = useState<BacktestStats | null>(null);
   const [trades, setTrades] = useState<Trade[]>([]);
   const [equity, setEquity] = useState<EquityPoint[]>([]);
-  const [ohlcData, setOhlcData] = useState<any[]>([]);
-  const [volumeData, setVolumeData] = useState<any[]>([]);
   const [benchmarkSymbol, setBenchmarkSymbol] = useState("");
   const [benchmarkData, setBenchmarkData] = useState<any[]>([]);
   const [capmData, setCapmData] = useState<BacktestCapmResponse | null>(null);
@@ -74,29 +70,12 @@ export function BacktestDetailPage() {
       getBacktestStats(id),
       getBacktestTrades(id),
       getBacktestEquity(id),
-      getBacktestOHLCV(id),
     ])
-      .then(([i, s, t, e, o]) => {
+      .then(([i, s, t, e]) => {
         setInfo(i);
         setStats(s);
         setTrades(t);
         setEquity(e);
-        // normalize OHLCV response (backend may return { ohlcv: [...] } or direct array)
-        const raw = o && (o.ohlcv || o.bars) ? (o.ohlcv || o.bars) : Array.isArray(o) ? o : (o && o.payload && Array.isArray(o.payload) ? o.payload : []);
-        const mapped = raw.map((b: any) => ({
-          time: b.time ?? b.t ?? b.timestamp ?? b.x ?? b[0],
-          open: Number(b.open ?? b.o ?? 0),
-          high: Number(b.high ?? b.h ?? 0),
-          low: Number(b.low ?? b.l ?? 0),
-          close: Number(b.close ?? b.c ?? 0),
-        }));
-        setOhlcData(mapped);
-        const vol = raw.map((b: any) => ({
-          time: b.time ?? b.t ?? b.timestamp ?? b.x ?? b[0],
-          value: Number(b.volume ?? b.v ?? 0),
-          color: (b.close ?? b.c ?? b[3]) >= (b.open ?? b.o ?? b[1]) ? '#26a69a' : '#ef5350',
-        }));
-        setVolumeData(vol);
         setLoading(false);
       })
       .catch((err) => {
@@ -459,19 +438,6 @@ export function BacktestDetailPage() {
             </button>
           </div>
         ) : null}
-      </div>
-
-      {/* Price Chart */}
-      <div style={{background: "var(--color-surface)", border: "1px solid var(--color-border)", borderRadius: "8px", padding: "12px", marginBottom: "20px"}}>
-        <h2 style={{fontSize: '1rem', fontWeight: 600, marginBottom: '8px'}}>Price Chart</h2>
-        {ohlcData && ohlcData.length>0 ? (
-          <TradingViewChart ohlcData={ohlcData} volumeData={volumeData} trades={(trades? trades.map((tr:any)=>[
-            { time: tr.entry_time, price: tr.entry_price, side: 'buy' as const, label: 'Entry', pnl: undefined },
-            { time: tr.exit_time, price: tr.exit_price, side: 'sell' as const, label: 'Exit', pnl: tr.pnl },
-          ]).flat() : []) as any} indicators={[]} height={420} />
-        ):(
-          <div style={{height: '240px', display:'flex', alignItems:'center', justifyContent:'center', color:'var(--color-text-muted)'}}>No OHLC data</div>
-        )}
       </div>
 
       {/* Stats Grid */}

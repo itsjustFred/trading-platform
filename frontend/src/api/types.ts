@@ -445,6 +445,49 @@ export interface BacktestListItem {
   start: string;
   end: string;
   created_at?: string;
+  sharpe?: number | null;
+  cagr?: number | null;
+  max_drawdown_pct?: number | null;
+  net_profit?: number | null;
+  net_profit_pct?: number | null;
+  psr?: number | null;
+  p_value?: number | null;
+  equity_mini?: number[];
+}
+
+export interface BacktestsListResponse {
+  items: BacktestListItem[];
+  page: number;
+  per_page: number;
+  total: number;
+  sort: string;
+  order: string;
+}
+
+export interface BacktestDuplicateGroup {
+  fingerprint: string;
+  strategy_name: string;
+  symbols: string[];
+  timeframe: string;
+  start_date: string;
+  end_date: string;
+  engine: string;
+  backtests: Array<{
+    id: string;
+    created_at: string;
+  }>;
+}
+
+export interface BacktestsDuplicatesResponse {
+  groups: BacktestDuplicateGroup[];
+  total_groups: number;
+  total_backtests: number;
+}
+
+export interface BacktestsDeduplicateResponse {
+  deleted_ids: string[];
+  kept_ids: string[];
+  groups_affected: number;
 }
 
 export interface TradeDetail extends Trade {
@@ -709,6 +752,7 @@ export interface DataTaskStatusResponse {
   can_pause?: boolean;
   can_resume?: boolean;
   can_cancel?: boolean;
+  can_restart?: boolean;
 }
 
 export interface DataTaskListResponse {

@@ -7,12 +7,13 @@ import {
   deleteDataTask,
   listDataTasks,
   pauseDataTask,
+  restartDataTask,
   resumeDataTask,
 } from "../api/client";
 import type { DataTaskStatusResponse } from "../api/types";
 import { useToast } from "./ToastProvider";
 
-const FINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
+const FINAL_STATUSES = new Set(["completed", "failed", "cancelled", "interrupted"]);
 
 function progressBarColor(status: string) {
   if (status === "paused") {
@@ -20,6 +21,9 @@ function progressBarColor(status: string) {
   }
   if (status === "failed" || status === "cancelled") {
     return "linear-gradient(90deg, rgba(251, 113, 133, 0.95), rgba(244, 63, 94, 0.8))";
+  }
+  if (status === "interrupted") {
+    return "linear-gradient(90deg, rgba(251, 191, 36, 0.95), rgba(245, 158, 11, 0.8))";
   }
   return "linear-gradient(90deg, rgba(74, 222, 128, 0.95), rgba(16, 185, 129, 0.82))";
 }
@@ -30,6 +34,9 @@ function statusColor(status: string) {
   }
   if (status === "failed" || status === "cancelled") {
     return "#fecdd3";
+  }
+  if (status === "interrupted") {
+    return "#fef08a";
   }
   if (status === "completed") {
     return "#bbf7d0";
@@ -317,6 +324,7 @@ export function TaskManager() {
                 const canPause = Boolean(task.can_pause && taskId);
                 const canResume = Boolean(task.can_resume && taskId);
                 const canCancel = Boolean(task.can_cancel && taskId);
+                const canRestart = Boolean(task.can_restart && taskId);
                 const canRemove = Boolean(
                   taskId && FINAL_STATUSES.has(task.status),
                 );
@@ -407,7 +415,7 @@ export function TaskManager() {
                       </div>
                     </div>
 
-                    {(canPause || canResume || canCancel || canRemove) && (
+                    {(canPause || canResume || canCancel || canRestart || canRemove) && (
                       <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
                         {canPause ? (
                           <button
@@ -472,6 +480,28 @@ export function TaskManager() {
                               <Square size={14} />
                             )}
                             Cancel
+                          </button>
+                        ) : null}
+
+                        {canRestart ? (
+                          <button
+                            type="button"
+                            disabled={busy}
+                            onClick={() =>
+                              void withBusyState(
+                                taskId,
+                                () => restartDataTask(taskId),
+                                "Task restart requested.",
+                              )
+                            }
+                            style={actionButtonStyle("#fde68a")}
+                          >
+                            {busy ? (
+                              <Loader2 size={14} className="animate-spin" />
+                            ) : (
+                              <Play size={14} />
+                            )}
+                            Restart
                           </button>
                         ) : null}
 

@@ -57,20 +57,30 @@ from shared.logging import get_logger
 from shared.models import BacktestResult, EquityPoint
 from shared.database import (
     create_live_deployment,
+    delete_background_task_record,
+    delete_backtest,
     delete_live_deployment,
     ensure_live_account,
+    get_background_task_record,
     get_live_account,
     init_db,
     list_backtest_ids,
+    list_backtest_fingerprint_rows,
+    list_backtest_metadata_rows,
+    list_background_task_records,
     list_live_accounts,
     list_live_balances,
     list_live_deployments,
     list_live_deployments_for_account,
     list_live_signal_executions_for_deployments,
+    load_backtest_metadata_row,
+    load_backtest_equity_points,
     load_live_account_stats_inputs,
     load_backtest_result,
+    mark_background_tasks_interrupted,
     migrate_json_to_sqlite,
     save_result_to_sqlite,
+    upsert_background_task_record,
     update_live_deployment_status,
 )
 try:
@@ -156,6 +166,15 @@ _dolthub_repo_status = legacy_viewer._dolthub_repo_status
 _dolthub_pull = legacy_viewer._dolthub_pull
 _safe_int = legacy_viewer._safe_int
 
+_LEGACY_CREATE_TASK_RECORD = _create_task_record
+_LEGACY_SET_TASK_STATUS = _set_task_status
+_LEGACY_UPDATE_TASK_PROGRESS = _update_task_progress
+_LEGACY_UPDATE_TASK_FIELDS = _update_task_fields
+_LEGACY_MARK_TASK_FINISHED = _mark_task_finished
+_LEGACY_SNAPSHOT_TASK = _snapshot_task
+_LEGACY_GET_TASK = _get_task
+_LEGACY_SERIALIZE_TASK = _serialize_task
+
 init_db()
 migrate_json_to_sqlite()
 
@@ -180,21 +199,275 @@ async def _prewarm_strategies_background() -> None:
         logger.warning("Strategies prewarm failed: %s", exc)
 
 
+async def _prewarm_backtest_metadata_background() -> None:
+    try:
+        count = await asyncio.to_thread(_refresh_backtest_meta_cache)
+        logger.info("Backtest metadata cache warmed (%s items)", count)
+    except Exception as exc:
+        logger.warning("Backtest metadata prewarm failed: %s", exc)
+
+
+def _resume_interrupted_tasks() -> None:
+    records = list_background_task_records(statuses=["interrupted", "queued"])
+    for record in records:
+        try:
+            task_id = str(record.get("id") or "").strip()
+            if not task_id:
+                continue
+
+            task_type = str(record.get("type") or "")
+            raw_config = dict(record.get("config_json") or {})
+            restart_config = raw_config.get("restart_config")
+            backtest_config = dict(restart_config) if isinstance(restart_config, dict) else dict(raw_config)
+
+            if task_type == "backtest":
+                strategy = str(backtest_config.get("strategy") or "").strip()
+                symbols = backtest_config.get("symbols")
+                if not strategy or not isinstance(symbols, list) or not symbols:
+                    logger.warning(
+                        "Skipping auto-recovery for task %s: incomplete backtest restart config",
+                        task_id,
+                    )
+                    continue
+
+                logger.info(
+                    "Auto-restarting backtest task %s (%s %s %s)",
+                    task_id,
+                    strategy,
+                    ",".join(str(symbol) for symbol in symbols),
+                    str(backtest_config.get("timeframe") or "1d"),
+                )
+                request_payload = BacktestRunRequest(
+                    strategy=strategy,
+                    engine=str(backtest_config.get("engine") or "native"),
+                    symbols=[str(symbol) for symbol in symbols if str(symbol).strip()],
+                    timeframe=str(backtest_config.get("timeframe") or "1d"),
+                    start=str(backtest_config.get("start") or ""),
+                    end=str(backtest_config.get("end") or ""),
+                    capital=float(backtest_config.get("capital") or 100000.0),
+                    risk_per_trade_pct=backtest_config.get("risk_per_trade_pct"),
+                    max_position_pct=backtest_config.get("max_position_pct"),
+                    max_leverage=backtest_config.get("max_leverage"),
+                    modeling_resolution=(
+                        str(backtest_config.get("modeling_resolution"))
+                        if backtest_config.get("modeling_resolution") is not None
+                        else None
+                    ),
+                    intrabar_resolution=(
+                        str(backtest_config.get("intrabar_resolution"))
+                        if backtest_config.get("intrabar_resolution") is not None
+                        else None
+                    ),
+                    parameters=dict(backtest_config.get("parameters") or {}),
+                )
+                restarted = asyncio.run(run_backtest(request_payload))
+                restarted_task_id = restarted.get("task_id") if isinstance(restarted, dict) else None
+                upsert_background_task_record(
+                    task_id=task_id,
+                    task_type=task_type,
+                    status="completed",
+                    config_json=raw_config,
+                    progress_message=(
+                        f"Auto-restarted as task {restarted_task_id}"
+                        if restarted_task_id
+                        else "Auto-restarted as new task"
+                    ),
+                    name=str(record.get("name") or ""),
+                    description=str(record.get("description") or ""),
+                    source=str(record.get("source") or ""),
+                    created_at=str(record.get("created_at") or ""),
+                    updated_at=_now_iso(),
+                )
+                continue
+
+            if task_type == "data":
+                source = str(record.get("source") or raw_config.get("source") or "").strip().lower()
+                downloader = str(raw_config.get("downloader") or source or "").strip().lower()
+                symbols = [str(item).strip().upper() for item in raw_config.get("symbols", []) if str(item).strip()]
+                timeframes = [
+                    str(item).strip().lower()
+                    for item in raw_config.get("timeframes", [])
+                    if str(item).strip()
+                ]
+                total_items = max(int(raw_config.get("total_items", 0) or 0), 0)
+                name = str(record.get("name") or "Recovered data task")
+                description = str(record.get("description") or "")
+                start = str(raw_config.get("start") or "").strip() or None
+                end = str(raw_config.get("end") or "").strip() or None
+
+                if downloader in {"dukascopy", "jforex"} and symbols and timeframes:
+                    cmd = raw_config.get("command")
+                    if not isinstance(cmd, list) or not cmd:
+                        logger.warning(
+                            "Skipping auto-recovery for data task %s: missing command for %s",
+                            task_id,
+                            downloader,
+                        )
+                        upsert_background_task_record(
+                            task_id=task_id,
+                            task_type=task_type,
+                            status="queued",
+                            config_json=raw_config,
+                            progress_message="Recovery pending manual restart; missing restart command",
+                            name=str(record.get("name") or ""),
+                            description=str(record.get("description") or ""),
+                            source=str(record.get("source") or ""),
+                            created_at=str(record.get("created_at") or ""),
+                            updated_at=_now_iso(),
+                        )
+                        continue
+
+                    logger.info("Auto-restarting %s data task %s", downloader, task_id)
+                    cmd_list = [str(part) for part in cmd]
+                    if downloader == "jforex":
+                        _start_jforex_task(
+                            task_id,
+                            cmd_list,
+                            source_label=source or "jforex",
+                            symbols=symbols,
+                            timeframes=timeframes,
+                            start=start,
+                            end=end,
+                            offer_side=str(raw_config.get("offer_side") or "bid"),
+                            merge_tick=bool(raw_config.get("merge_tick", False)),
+                            merge_s1=bool(raw_config.get("merge_s1", False)),
+                            batch_size=_safe_int(raw_config.get("batch_size"), 10),
+                            pause_ms=_safe_int(raw_config.get("pause_ms"), 1000),
+                            query_timeout_seconds=_safe_int(raw_config.get("query_timeout_seconds"), 900),
+                            total_items=total_items or max(len(symbols) * len(timeframes), 1),
+                            name=name,
+                            description=description,
+                        )
+                    else:
+                        _start_dukascopy_task(
+                            task_id,
+                            cmd_list,
+                            symbols=symbols,
+                            timeframes=timeframes,
+                            start=start,
+                            end=end,
+                            price_type=str(raw_config.get("price_type") or "bid"),
+                            merge_tick=bool(raw_config.get("merge_tick", False)),
+                            merge_s1=bool(raw_config.get("merge_s1", False)),
+                            batch_size=_safe_int(raw_config.get("batch_size"), 10),
+                            pause_ms=_safe_int(raw_config.get("pause_ms"), 1000),
+                            total_items=total_items or max(len(symbols) * len(timeframes), 1),
+                            name=name,
+                            description=description,
+                        )
+                    _apply_recovery_data_metadata(
+                        task_id,
+                        command=cmd_list,
+                        downloader=downloader,
+                        symbols=symbols,
+                        timeframes=timeframes,
+                        start=start,
+                        end=end,
+                        offer_side=str(raw_config.get("offer_side") or "bid"),
+                        price_type=str(raw_config.get("price_type") or "bid"),
+                        merge_tick=bool(raw_config.get("merge_tick", False)),
+                        merge_s1=bool(raw_config.get("merge_s1", False)),
+                        batch_size=_safe_int(raw_config.get("batch_size"), 10),
+                        pause_ms=_safe_int(raw_config.get("pause_ms"), 1000),
+                        query_timeout_seconds=_safe_int(raw_config.get("query_timeout_seconds"), 900),
+                    )
+                    continue
+
+                command = raw_config.get("command")
+                if isinstance(command, list) and command:
+                    logger.info("Auto-restarting data task %s via persisted command", task_id)
+                    _start_data_task(
+                        task_id,
+                        [str(part) for part in command],
+                        total_items=total_items,
+                        name=name,
+                        description=description,
+                        kind="data",
+                        source=source or downloader or "data",
+                    )
+                    _apply_recovery_data_metadata(
+                        task_id,
+                        command=[str(part) for part in command],
+                        downloader=downloader or None,
+                        symbols=symbols or None,
+                        timeframes=timeframes or None,
+                        start=start,
+                        end=end,
+                        offer_side=str(raw_config.get("offer_side") or "") or None,
+                        price_type=str(raw_config.get("price_type") or "") or None,
+                        merge_tick=(
+                            bool(raw_config.get("merge_tick"))
+                            if raw_config.get("merge_tick") is not None
+                            else None
+                        ),
+                        merge_s1=(
+                            bool(raw_config.get("merge_s1"))
+                            if raw_config.get("merge_s1") is not None
+                            else None
+                        ),
+                        batch_size=(
+                            _safe_int(raw_config.get("batch_size"))
+                            if raw_config.get("batch_size") is not None
+                            else None
+                        ),
+                        pause_ms=(
+                            _safe_int(raw_config.get("pause_ms"))
+                            if raw_config.get("pause_ms") is not None
+                            else None
+                        ),
+                        query_timeout_seconds=(
+                            _safe_int(raw_config.get("query_timeout_seconds"))
+                            if raw_config.get("query_timeout_seconds") is not None
+                            else None
+                        ),
+                    )
+                    continue
+
+                upsert_background_task_record(
+                    task_id=task_id,
+                    task_type=task_type,
+                    status="queued",
+                    config_json=raw_config,
+                    progress_message="Recovery pending manual restart; missing restart metadata",
+                    name=str(record.get("name") or ""),
+                    description=str(record.get("description") or ""),
+                    source=str(record.get("source") or ""),
+                    created_at=str(record.get("created_at") or ""),
+                    updated_at=_now_iso(),
+                )
+        except Exception as exc:
+            logger.warning("Failed to recover interrupted task %s: %s", record.get("id"), exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     data_views_prewarm_task = asyncio.create_task(_prewarm_data_views_background())
     live_accounts_prewarm_task = asyncio.create_task(_prewarm_live_accounts_background())
     strategies_prewarm_task = asyncio.create_task(_prewarm_strategies_background())
+    backtests_meta_prewarm_task = asyncio.create_task(_prewarm_backtest_metadata_background())
     app.state.data_views_prewarm_task = data_views_prewarm_task
     app.state.live_accounts_prewarm_task = live_accounts_prewarm_task
     app.state.strategies_prewarm_task = strategies_prewarm_task
+    app.state.backtests_meta_prewarm_task = backtests_meta_prewarm_task
+    await asyncio.to_thread(mark_background_tasks_interrupted, from_statuses=["queued", "running"])
+    await asyncio.to_thread(_resume_interrupted_tasks)
     try:
         yield
     finally:
-        for task in (data_views_prewarm_task, live_accounts_prewarm_task, strategies_prewarm_task):
+        for task in (
+            data_views_prewarm_task,
+            live_accounts_prewarm_task,
+            strategies_prewarm_task,
+            backtests_meta_prewarm_task,
+        ):
             if not task.done():
                 task.cancel()
-        for task in (data_views_prewarm_task, live_accounts_prewarm_task, strategies_prewarm_task):
+        for task in (
+            data_views_prewarm_task,
+            live_accounts_prewarm_task,
+            strategies_prewarm_task,
+            backtests_meta_prewarm_task,
+        ):
             with suppress(asyncio.CancelledError):
                 await task
 
@@ -347,6 +620,27 @@ class DataCalibrateRequest(SQLModel):
     verbose: bool = False
 
 
+class BacktestsListResponse(SQLModel):
+    items: list[dict[str, Any]]
+    page: int
+    per_page: int
+    total: int
+    sort: str
+    order: str
+
+
+class BacktestsDuplicatesResponse(SQLModel):
+    groups: list[dict[str, Any]]
+    total_groups: int
+    total_backtests: int
+
+
+class BacktestsDeduplicateResponse(SQLModel):
+    deleted_ids: list[str]
+    kept_ids: list[str]
+    groups_affected: int
+
+
 @app.middleware("http")
 async def static_spa_middleware(request: Request, call_next):
     path = request.url.path
@@ -437,6 +731,111 @@ def _task_action_payload(task_id: str) -> dict[str, Any]:
     return _serialize_task(task_id, task, include_log=True)
 
 
+def _restart_interrupted_task(task_id: str) -> dict[str, Any]:
+    task = _get_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if str(task.get("status") or "").lower() != "interrupted":
+        raise HTTPException(status_code=409, detail="Only interrupted tasks can be restarted")
+
+    record = get_background_task_record(task_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Task persistence record not found")
+    config_payload = dict(record.get("config_json") or {})
+    restart_config = config_payload.get("restart_config")
+    if isinstance(restart_config, dict):
+        config_payload = dict(restart_config)
+    task_type = str(record.get("type") or "")
+
+    if task_type == "backtest":
+        strategy = str(config_payload.get("strategy") or "").strip()
+        symbols = config_payload.get("symbols")
+        if not strategy or not isinstance(symbols, list) or not symbols:
+            raise HTTPException(status_code=409, detail="Backtest restart configuration is incomplete")
+        request_payload = BacktestRunRequest(
+            strategy=strategy,
+            engine=str(config_payload.get("engine") or "native"),
+            symbols=[str(symbol) for symbol in symbols if str(symbol).strip()],
+            timeframe=str(config_payload.get("timeframe") or "1d"),
+            start=str(config_payload.get("start") or ""),
+            end=str(config_payload.get("end") or ""),
+            capital=float(config_payload.get("capital") or 100000.0),
+            risk_per_trade_pct=config_payload.get("risk_per_trade_pct"),
+            max_position_pct=config_payload.get("max_position_pct"),
+            max_leverage=config_payload.get("max_leverage"),
+            modeling_resolution=(
+                str(config_payload.get("modeling_resolution"))
+                if config_payload.get("modeling_resolution") is not None
+                else None
+            ),
+            intrabar_resolution=(
+                str(config_payload.get("intrabar_resolution"))
+                if config_payload.get("intrabar_resolution") is not None
+                else None
+            ),
+            parameters=dict(config_payload.get("parameters") or {}),
+        )
+        restarted = asyncio.run(run_backtest(request_payload))
+        _update_task_fields(
+            task_id,
+            status="completed",
+            progress=100.0,
+            progress_detail={
+                "completed": 1,
+                "failed": 0,
+                "total": 1,
+                "percent": 100.0,
+                "current": "Restarted as a new task",
+            },
+        )
+        upsert_background_task_record(
+            task_id=task_id,
+            task_type=task_type,
+            status="completed",
+            config_json=config_payload,
+            progress_message="Restarted as new task",
+            name=str(record.get("name") or ""),
+            description=str(record.get("description") or ""),
+            source=str(record.get("source") or ""),
+            created_at=str(record.get("created_at") or ""),
+            updated_at=_now_iso(),
+        )
+        return {
+            "task_id": task_id,
+            "status": "completed",
+            "restarted_task_id": restarted.get("task_id"),
+        }
+
+    if task_type == "data":
+        upsert_background_task_record(
+            task_id=task_id,
+            task_type=task_type,
+            status="queued",
+            config_json=config_payload,
+            progress_message="Restart requested; re-run manually from Data page",
+            name=str(record.get("name") or ""),
+            description=str(record.get("description") or ""),
+            source=str(record.get("source") or ""),
+            created_at=str(record.get("created_at") or ""),
+            updated_at=_now_iso(),
+        )
+        _update_task_fields(
+            task_id,
+            status="queued",
+            progress=5.0,
+            progress_detail={
+                "completed": 0,
+                "failed": 0,
+                "total": max(int(task.get("total_items", 0) or 0), 0),
+                "percent": 5.0,
+                "current": "Restart requested; start a new data task",
+            },
+        )
+        return {"task_id": task_id, "status": "queued"}
+
+    raise HTTPException(status_code=409, detail=f"Task type '{task_type}' does not support restart")
+
+
 _DATA_VIEWS_CACHE_LOCK = threading.RLock()
 _DATA_VIEWS_CACHE: dict[str, Any] = {
     "key": None,
@@ -451,6 +850,17 @@ _LIVE_ACCOUNTS_CACHE_TTL_SECONDS = 30.0
 _STRATEGIES_CACHE_LOCK = threading.RLock()
 _STRATEGIES_CACHE: dict[str, Any] = {"expires_at": 0.0, "payload": []}
 _STRATEGIES_CACHE_TTL_SECONDS = 60.0
+_BACKTEST_META_CACHE_LOCK = threading.RLock()
+_BACKTEST_META_CACHE: dict[str, dict[str, Any]] = {}
+_TASK_STATUS_WEIGHTS: dict[str, float] = {
+    "queued": 5.0,
+    "starting": 10.0,
+    "running": 50.0,
+    "completed": 100.0,
+    "failed": 100.0,
+    "cancelled": 100.0,
+    "interrupted": 100.0,
+}
 
 _DATA_SYMBOL_METADATA_KEYS = {
     "symbol",
@@ -496,6 +906,538 @@ def _safe_float(value: object, default: float = 0.0) -> float:
     if not math.isfinite(numeric):
         return default
     return numeric
+
+
+def _json_safe(value: Any) -> Any:
+    try:
+        return json.loads(json.dumps(value, default=str))
+    except Exception:
+        return str(value)
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _normalize_order(value: str, *, default: str = "desc") -> str:
+    normalized = str(value or default).strip().lower()
+    return "asc" if normalized == "asc" else "desc"
+
+
+def _normalize_backtest_sort(value: str) -> str:
+    normalized = str(value or "created_at").strip().lower()
+    if normalized in {"created_at", "strategy_name", "trade_count", "total_return", "sharpe_ratio"}:
+        return normalized
+    return "created_at"
+
+
+def _backtest_sort_key(item: dict[str, Any], sort_field: str) -> Any:
+    if sort_field in {"trade_count"}:
+        return int(item.get(sort_field, 0) or 0)
+    if sort_field in {"total_return", "sharpe_ratio"}:
+        return float(item.get(sort_field, 0.0) or 0.0)
+    return str(item.get(sort_field, "") or "")
+
+
+def _refresh_backtest_meta_cache() -> int:
+    rows = list_backtest_metadata_rows()
+    next_cache: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        backtest_id = str(row.get("id") or "").strip()
+        if not backtest_id:
+            continue
+        next_cache[backtest_id] = dict(row)
+    with _BACKTEST_META_CACHE_LOCK:
+        _BACKTEST_META_CACHE.clear()
+        _BACKTEST_META_CACHE.update(next_cache)
+        return len(_BACKTEST_META_CACHE)
+
+
+def _ensure_backtest_meta_cache() -> None:
+    with _BACKTEST_META_CACHE_LOCK:
+        if _BACKTEST_META_CACHE:
+            return
+    _refresh_backtest_meta_cache()
+
+
+def _upsert_backtest_meta_cache(backtest_id: str) -> None:
+    normalized_id = str(backtest_id or "").strip()
+    if not normalized_id:
+        return
+
+    row = load_backtest_metadata_row(normalized_id)
+    with _BACKTEST_META_CACHE_LOCK:
+        if row is None:
+            _BACKTEST_META_CACHE.pop(normalized_id, None)
+            return
+        _BACKTEST_META_CACHE[normalized_id] = dict(row)
+
+
+def _remove_backtest_meta_cache(backtest_id: str) -> None:
+    normalized_id = str(backtest_id or "").strip()
+    if not normalized_id:
+        return
+    with _BACKTEST_META_CACHE_LOCK:
+        _BACKTEST_META_CACHE.pop(normalized_id, None)
+
+
+def _snapshot_backtest_meta_cache() -> list[dict[str, Any]]:
+    _ensure_backtest_meta_cache()
+    with _BACKTEST_META_CACHE_LOCK:
+        return [dict(item) for item in _BACKTEST_META_CACHE.values()]
+
+
+def _backtest_summary_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
+    strategy_name = str(meta.get("strategy_name") or "unknown")
+    symbols = [str(item) for item in meta.get("symbols", []) if str(item).strip()]
+    timeframe = str(meta.get("timeframe") or "")
+    start = str(meta.get("start_date") or "")
+    end = str(meta.get("end_date") or "")
+    total_return_decimal = _safe_float(meta.get("total_return"), 0.0)
+    sharpe_ratio = _safe_float(meta.get("sharpe_ratio"), 0.0)
+    max_drawdown_decimal = abs(_safe_float(meta.get("max_drawdown"), 0.0))
+    trade_count = max(int(meta.get("trade_count", 0) or 0), 0)
+    backtest_id = str(meta.get("id") or "").strip()
+
+    equity_mini: list[float] = []
+    if backtest_id:
+        try:
+            equity_points = load_backtest_equity_points(backtest_id)
+            values = [float(point.equity) for point in equity_points]
+            count = len(values)
+            if count <= 50:
+                equity_mini = values
+            elif count > 50:
+                step = count / 50
+                equity_mini = [values[int(index * step)] for index in range(50)]
+                equity_mini.append(values[-1])
+        except Exception as exc:
+            logger.warning("Could not build equity_mini for %s: %s", backtest_id, exc)
+
+    return {
+        "id": backtest_id,
+        "filename": f"{meta.get('id', '')}.trades.json",
+        "title": strategy_name,
+        "notes": "",
+        "strategy": strategy_name,
+        "strategy_slug": strategy_name,
+        "strategy_display_name": strategy_name,
+        "strategy_file": "",
+        "engine": str(meta.get("engine") or "unknown"),
+        "symbols": symbols,
+        "timeframes": [timeframe] if timeframe else [],
+        "trade_count": trade_count,
+        "start": start,
+        "end": end,
+        "created_at": str(meta.get("created_at") or ""),
+        "sharpe": sharpe_ratio,
+        "cagr": round(total_return_decimal * 100.0, 2),
+        "max_drawdown_pct": round(max_drawdown_decimal * 100.0, 2),
+        "net_profit": 0.0,
+        "net_profit_pct": round(total_return_decimal * 100.0, 2),
+        "psr": None,
+        "p_value": 1.0,
+        "equity_mini": equity_mini,
+    }
+
+
+def _backtest_fingerprint(item: dict[str, Any]) -> str:
+    strategy_name = str(item.get("strategy_name") or "").strip().lower()
+    symbols = sorted(
+        {str(symbol).strip().upper() for symbol in item.get("symbols", []) if str(symbol).strip()}
+    )
+    timeframe = str(item.get("timeframe") or "").strip().lower()
+    start_date = str(item.get("start_date") or "").strip()
+    end_date = str(item.get("end_date") or "").strip()
+    engine = str(item.get("engine") or "unknown").strip().lower()
+    return "|".join([strategy_name, ",".join(symbols), timeframe, start_date, end_date, engine])
+
+
+def _backtest_meta_list_sorted(sort_field: str, order: str) -> list[dict[str, Any]]:
+    items = _snapshot_backtest_meta_cache()
+    reverse = order == "desc"
+    items.sort(
+        key=lambda item: (_backtest_sort_key(item, sort_field), str(item.get("id") or "")),
+        reverse=reverse,
+    )
+    return items
+
+
+def _group_duplicate_backtests() -> tuple[list[dict[str, Any]], int]:
+    groups: dict[str, list[dict[str, Any]]] = {}
+    total_items = 0
+    for row in list_backtest_fingerprint_rows():
+        fingerprint = _backtest_fingerprint(row)
+        if not fingerprint:
+            continue
+        groups.setdefault(fingerprint, []).append(dict(row))
+
+    duplicates: list[dict[str, Any]] = []
+    for fingerprint, entries in groups.items():
+        if len(entries) < 2:
+            continue
+        sorted_entries = sorted(
+            entries,
+            key=lambda item: (
+                str(item.get("created_at") or ""),
+                str(item.get("id") or ""),
+            ),
+            reverse=True,
+        )
+        total_items += len(sorted_entries)
+        first = sorted_entries[0]
+        duplicates.append(
+            {
+                "fingerprint": fingerprint,
+                "strategy_name": str(first.get("strategy_name") or ""),
+                "symbols": [str(symbol) for symbol in first.get("symbols", []) if str(symbol).strip()],
+                "timeframe": str(first.get("timeframe") or ""),
+                "start_date": str(first.get("start_date") or ""),
+                "end_date": str(first.get("end_date") or ""),
+                "engine": str(first.get("engine") or "unknown"),
+                "backtests": [
+                    {
+                        "id": str(item.get("id") or ""),
+                        "created_at": str(item.get("created_at") or ""),
+                    }
+                    for item in sorted_entries
+                ],
+            }
+        )
+
+    duplicates.sort(
+        key=lambda item: (
+            item.get("backtests", [{}])[0].get("created_at", ""),
+            item.get("backtests", [{}])[0].get("id", ""),
+        ),
+        reverse=True,
+    )
+    return duplicates, total_items
+
+
+def _task_config_payload(task: dict[str, Any]) -> dict[str, Any]:
+    progress = _json_safe(dict(task.get("progress_detail") or {}))
+    payload: dict[str, Any] = {
+        "kind": task.get("kind"),
+        "source": task.get("source"),
+        "total_items": int(task.get("total_items", 0) or 0),
+        "supports_control": bool(task.get("supports_control", False)),
+        "control_mode": str(task.get("control_mode", "") or ""),
+        "progress_percent": float(task.get("progress", 0.0) or 0.0),
+        "progress_detail": progress,
+        "error": _json_safe(task.get("error")),
+        "result": _json_safe(task.get("result")),
+        "restart_config": _json_safe(task.get("restart_config")),
+    }
+    if task.get("pid") is not None:
+        payload["pid"] = task.get("pid")
+    if task.get("command") is not None:
+        payload["command"] = _json_safe(task.get("command"))
+    if task.get("downloader") is not None:
+        payload["downloader"] = _json_safe(task.get("downloader"))
+    for key in (
+        "symbols",
+        "timeframes",
+        "start",
+        "end",
+        "offer_side",
+        "price_type",
+        "merge_tick",
+        "merge_s1",
+        "batch_size",
+        "pause_ms",
+        "query_timeout_seconds",
+    ):
+        if key in task and task.get(key) is not None:
+            payload[key] = _json_safe(task.get(key))
+    return payload
+
+
+def _persist_task_snapshot(task_id: str, task: dict[str, Any]) -> None:
+    try:
+        progress_detail = dict(task.get("progress_detail") or {})
+        progress_message = str(progress_detail.get("current") or "")
+        upsert_background_task_record(
+            task_id=task_id,
+            task_type=str(task.get("kind") or "unknown"),
+            status=str(task.get("status") or "unknown"),
+            config_json=_task_config_payload(task),
+            progress_message=progress_message,
+            name=str(task.get("name") or ""),
+            description=str(task.get("description") or ""),
+            source=str(task.get("source") or ""),
+            created_at=str(task.get("created_at") or ""),
+            updated_at=str(task.get("updated_at") or ""),
+        )
+    except Exception as exc:
+        logger.warning("Could not persist task %s: %s", task_id, exc)
+
+
+def _decorate_task_from_record(task_id: str, task: dict[str, Any]) -> None:
+    record = get_background_task_record(task_id)
+    if record is None:
+        return
+
+    if not task.get("created_at"):
+        task["created_at"] = record.get("created_at") or _now_iso()
+    if not task.get("updated_at"):
+        task["updated_at"] = record.get("updated_at") or task.get("created_at")
+
+    if task.get("name") in (None, ""):
+        task["name"] = record.get("name", "")
+    if task.get("description") in (None, ""):
+        task["description"] = record.get("description", "")
+    if task.get("source") in (None, ""):
+        task["source"] = record.get("source", "")
+    if task.get("kind") in (None, ""):
+        task["kind"] = record.get("type", "data")
+    if task.get("status") in (None, ""):
+        task["status"] = record.get("status", "unknown")
+
+    config_payload = dict(record.get("config_json") or {})
+    total_items = int(config_payload.get("total_items", task.get("total_items", 0)) or 0)
+    task["total_items"] = total_items
+
+    progress_detail = dict(config_payload.get("progress_detail") or {})
+    progress_detail.setdefault("completed", 0)
+    progress_detail.setdefault("failed", 0)
+    progress_detail.setdefault("total", max(total_items, 0))
+    progress_detail.setdefault(
+        "percent",
+        float(config_payload.get("progress_percent", _TASK_STATUS_WEIGHTS.get(str(task.get("status")), 0.0))),
+    )
+    progress_detail.setdefault("current", str(record.get("progress_message") or ""))
+    task["progress"] = float(progress_detail.get("percent", 0.0) or 0.0)
+    task["progress_detail"] = progress_detail
+
+    supports_control = bool(config_payload.get("supports_control", task.get("supports_control", True)))
+    task["supports_control"] = supports_control
+    task["control_mode"] = str(config_payload.get("control_mode", task.get("control_mode", "thread")) or "thread")
+    task.setdefault("pause_event", threading.Event())
+    task.setdefault("stop_event", threading.Event())
+    task.setdefault("log_file", str(_task_log_path(task_id)))
+
+
+def _build_task_from_record(record: dict[str, Any]) -> dict[str, Any]:
+    task_id = str(record.get("id") or "").strip()
+    config_payload = dict(record.get("config_json") or {})
+    total_items = int(config_payload.get("total_items", 0) or 0)
+    status = str(record.get("status") or "unknown")
+    progress_detail = dict(config_payload.get("progress_detail") or {})
+    progress_detail.setdefault("completed", 0)
+    progress_detail.setdefault("failed", 0)
+    progress_detail.setdefault("total", max(total_items, 0))
+    progress_detail.setdefault(
+        "percent",
+        float(config_payload.get("progress_percent", _TASK_STATUS_WEIGHTS.get(status, 0.0))),
+    )
+    progress_detail.setdefault("current", str(record.get("progress_message") or ""))
+    task = {
+        "id": task_id,
+        "name": str(record.get("name") or ""),
+        "description": str(record.get("description") or ""),
+        "kind": str(record.get("type") or "data"),
+        "source": str(record.get("source") or ""),
+        "status": status,
+        "log_file": str(_task_log_path(task_id)),
+        "total_items": total_items,
+        "progress": float(progress_detail.get("percent", 0.0) or 0.0),
+        "progress_detail": progress_detail,
+        "supports_control": bool(config_payload.get("supports_control", False)),
+        "control_mode": str(config_payload.get("control_mode", "thread") or "thread"),
+        "created_at": str(record.get("created_at") or _now_iso()),
+        "updated_at": str(record.get("updated_at") or _now_iso()),
+        "pause_event": threading.Event(),
+        "stop_event": threading.Event(),
+        "error": config_payload.get("error"),
+        "result": config_payload.get("result"),
+    }
+    if config_payload.get("pid") is not None:
+        task["pid"] = config_payload.get("pid")
+    if config_payload.get("command") is not None:
+        task["command"] = config_payload.get("command")
+    if config_payload.get("downloader") is not None:
+        task["downloader"] = config_payload.get("downloader")
+    for key in (
+        "symbols",
+        "timeframes",
+        "start",
+        "end",
+        "offer_side",
+        "price_type",
+        "merge_tick",
+        "merge_s1",
+        "batch_size",
+        "pause_ms",
+        "query_timeout_seconds",
+    ):
+        if key in config_payload and config_payload.get(key) is not None:
+            task[key] = config_payload.get(key)
+    return task
+
+
+def _apply_recovery_data_metadata(
+    task_id: str,
+    *,
+    command: list[str],
+    downloader: str | None = None,
+    symbols: list[str] | None = None,
+    timeframes: list[str] | None = None,
+    start: str | None = None,
+    end: str | None = None,
+    offer_side: str | None = None,
+    price_type: str | None = None,
+    merge_tick: bool | None = None,
+    merge_s1: bool | None = None,
+    batch_size: int | None = None,
+    pause_ms: int | None = None,
+    query_timeout_seconds: int | None = None,
+) -> None:
+    task = _get_task(task_id)
+    if task is None:
+        logger.warning("Cannot apply recovery metadata for unknown task %s", task_id)
+        return
+    payload_updates: dict[str, Any] = {}
+    payload_updates["command"] = list(command)
+    if downloader is not None:
+        payload_updates["downloader"] = downloader
+    if symbols is not None:
+        payload_updates["symbols"] = list(symbols)
+    if timeframes is not None:
+        payload_updates["timeframes"] = list(timeframes)
+    if start is not None:
+        payload_updates["start"] = start
+    if end is not None:
+        payload_updates["end"] = end
+    if offer_side is not None:
+        payload_updates["offer_side"] = offer_side
+    if price_type is not None:
+        payload_updates["price_type"] = price_type
+    if merge_tick is not None:
+        payload_updates["merge_tick"] = bool(merge_tick)
+    if merge_s1 is not None:
+        payload_updates["merge_s1"] = bool(merge_s1)
+    if batch_size is not None:
+        payload_updates["batch_size"] = int(batch_size)
+    if pause_ms is not None:
+        payload_updates["pause_ms"] = int(pause_ms)
+    if query_timeout_seconds is not None:
+        payload_updates["query_timeout_seconds"] = int(query_timeout_seconds)
+    _update_task_fields(task_id, **payload_updates)
+
+
+def _create_task_record(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    task = _LEGACY_CREATE_TASK_RECORD(*args, **kwargs)
+    task_id = str(task.get("id") or "")
+    if task_id:
+        _persist_task_snapshot(task_id, task)
+    return task
+
+
+def _get_task(task_id: str) -> dict[str, Any] | None:
+    task = _LEGACY_GET_TASK(task_id)
+    if task is not None:
+        _decorate_task_from_record(task_id, task)
+        return task
+
+    record = get_background_task_record(task_id)
+    if record is None:
+        return None
+    hydrated = _build_task_from_record(record)
+    with DATA_TASKS_LOCK:
+        existing = DATA_TASKS.get(task_id)
+        if existing is not None:
+            _decorate_task_from_record(task_id, existing)
+            return existing
+        DATA_TASKS[task_id] = hydrated
+        return hydrated
+
+
+def _snapshot_task(task_id: str) -> dict[str, Any] | None:
+    snapshot = _LEGACY_SNAPSHOT_TASK(task_id)
+    if snapshot is None:
+        current = _get_task(task_id)
+        return dict(current) if current is not None else None
+    _decorate_task_from_record(task_id, snapshot)
+    return snapshot
+
+
+def _update_task_fields(task_id: str, **updates: Any) -> dict[str, Any] | None:
+    task = _LEGACY_UPDATE_TASK_FIELDS(task_id, **updates)
+    if task is not None:
+        _persist_task_snapshot(task_id, task)
+    return task
+
+
+def _set_task_status(task_id: str, status: str) -> dict[str, Any] | None:
+    task = _LEGACY_SET_TASK_STATUS(task_id, status)
+    if task is not None:
+        _persist_task_snapshot(task_id, task)
+    return task
+
+
+def _update_task_progress(
+    task_id: str,
+    *,
+    percent: float | None = None,
+    current: str | None = None,
+    total: int | None = None,
+) -> dict[str, Any] | None:
+    task = _LEGACY_UPDATE_TASK_PROGRESS(
+        task_id,
+        percent=percent,
+        current=current,
+        total=total,
+    )
+    if task is not None:
+        _persist_task_snapshot(task_id, task)
+    return task
+
+
+def _mark_task_finished(
+    task_id: str,
+    *,
+    status: str,
+    returncode: int | None = None,
+    error: str | None = None,
+) -> dict[str, Any] | None:
+    task = _LEGACY_MARK_TASK_FINISHED(
+        task_id,
+        status=status,
+        returncode=returncode,
+        error=error,
+    )
+    if task is not None:
+        _persist_task_snapshot(task_id, task)
+    return task
+
+
+def _serialize_task(
+    task_id: str,
+    task: dict[str, Any],
+    *,
+    include_log: bool = False,
+    max_log_bytes: int = 2048,
+) -> dict[str, Any]:
+    payload = _LEGACY_SERIALIZE_TASK(
+        task_id,
+        task,
+        include_log=include_log,
+        max_log_bytes=max_log_bytes,
+    )
+    payload["can_restart"] = str(payload.get("status", "")).lower() == "interrupted"
+    return payload
+
+
+# Route legacy core task lifecycle through persistence-aware wrappers.
+legacy_viewer._create_task_record = _create_task_record
+legacy_viewer._get_task = _get_task
+legacy_viewer._snapshot_task = _snapshot_task
+legacy_viewer._update_task_fields = _update_task_fields
+legacy_viewer._set_task_status = _set_task_status
+legacy_viewer._update_task_progress = _update_task_progress
+legacy_viewer._mark_task_finished = _mark_task_finished
+legacy_viewer._serialize_task = _serialize_task
 
 
 def _serialize_live_timestamp(value: datetime | str | None) -> tuple[str, float]:
@@ -1684,81 +2626,78 @@ async def rename_strategy(name: str, payload: NameUpdateRequest) -> dict[str, An
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@app.get("/api/backtests", response_model=list[dict[str, Any]])
-async def list_backtests() -> list[dict[str, Any]]:
-    results: list[dict[str, Any]] = []
-    backtest_ids = list_backtest_ids()
-    known_ids = set(backtest_ids)
-    if BACKTESTS_DIR.exists():
-        for path in sorted(BACKTESTS_DIR.glob("*.trades.json")):
-            fallback_id = path.stem.replace(".trades", "")
-            if fallback_id not in known_ids:
-                backtest_ids.append(fallback_id)
-                known_ids.add(fallback_id)
+@app.get("/api/backtests", response_model=BacktestsListResponse)
+async def list_backtests(
+    page: int = Query(default=1, ge=1),
+    per_page: int = Query(default=50, ge=1, le=50),
+    sort: str = Query(default="created_at"),
+    order: str = Query(default="desc"),
+) -> BacktestsListResponse:
+    normalized_sort = _normalize_backtest_sort(sort)
+    normalized_order = _normalize_order(order, default="desc")
+    sorted_items = _backtest_meta_list_sorted(normalized_sort, normalized_order)
+    total = len(sorted_items)
+    offset = (page - 1) * per_page
+    page_items = sorted_items[offset : offset + per_page]
+    summaries = [_backtest_summary_from_meta(item) for item in page_items]
+    return BacktestsListResponse(
+        items=summaries,
+        page=page,
+        per_page=per_page,
+        total=total,
+        sort=normalized_sort,
+        order=normalized_order,
+    )
 
-    for backtest_id in backtest_ids:
-        result = _load_result(backtest_id)
-        if result is None:
+
+@app.get("/api/backtests/duplicates", response_model=BacktestsDuplicatesResponse)
+async def list_backtest_duplicates() -> BacktestsDuplicatesResponse:
+    groups, total_backtests = _group_duplicate_backtests()
+    return BacktestsDuplicatesResponse(
+        groups=groups,
+        total_groups=len(groups),
+        total_backtests=total_backtests,
+    )
+
+
+@app.post("/api/backtests/deduplicate", response_model=BacktestsDeduplicateResponse)
+async def deduplicate_backtests() -> BacktestsDeduplicateResponse:
+    groups, _ = _group_duplicate_backtests()
+    deleted_ids: list[str] = []
+    kept_ids: list[str] = []
+    affected = 0
+
+    for group in groups:
+        backtests = group.get("backtests", [])
+        if len(backtests) < 2:
             continue
+        keep_id = str(backtests[0].get("id") or "")
+        if keep_id:
+            kept_ids.append(keep_id)
 
-        try:
-            data = result.to_dict()
-            meta = data.get("meta", {})
-            trades = data.get("trades", [])
-            initial_capital = meta.get("initial_capital", 100000)
-            start = meta.get("backtest_start", "")
-            end = meta.get("backtest_end", "")
+        removed_in_group = False
+        for entry in backtests[1:]:
+            backtest_id = str(entry.get("id") or "")
+            if not backtest_id:
+                continue
+            if delete_backtest(backtest_id):
+                deleted_ids.append(backtest_id)
+                _remove_backtest_meta_cache(backtest_id)
+                json_path = BACKTESTS_DIR / f"{backtest_id}.trades.json"
+                if json_path.exists():
+                    try:
+                        json_path.unlink()
+                    except OSError as exc:
+                        logger.warning("Could not delete JSON backtest %s: %s", backtest_id, exc)
+                removed_in_group = True
+        if removed_in_group:
+            affected += 1
 
-            quick = legacy_viewer._quick_stats_and_equity(
-                trades,
-                initial_capital,
-                start,
-                end,
-                equity_curve=data.get("equity_curve", []),
-                cached_stats=data.get("stats", {}),
-            )
-            raw_strategy = (meta.get("strategies") or ["unknown"])[0]
-            try:
-                strategy_slug, strategy_display_name, strategy_file = legacy_viewer._strategy_labels(
-                    raw_strategy
-                )
-            except Exception:
-                strategy_slug = str(raw_strategy or "unknown")
-                strategy_display_name = strategy_slug
-                strategy_file = ""
-            notes = str(meta.get("notes", "") or "").strip()
-
-            results.append(
-                {
-                    "id": backtest_id,
-                    "filename": f"{backtest_id}.trades.json",
-                    "title": notes or strategy_display_name,
-                    "notes": notes,
-                    "strategy": raw_strategy,
-                    "strategy_slug": strategy_slug,
-                    "strategy_display_name": strategy_display_name,
-                    "strategy_file": strategy_file,
-                    "engine": meta.get("engine", "unknown"),
-                    "symbols": meta.get("data", {}).get("symbols", []),
-                    "timeframes": meta.get("data", {}).get("timeframes", []),
-                    "trade_count": len(trades),
-                    "start": start,
-                    "end": end,
-                    "created_at": meta.get("created_at", ""),
-                    "sharpe": quick["sharpe"],
-                    "cagr": quick["cagr"],
-                    "max_drawdown_pct": quick["max_drawdown_pct"],
-                    "net_profit": quick["net_profit"],
-                    "net_profit_pct": quick["net_profit_pct"],
-                    "psr": quick.get("psr"),
-                    "p_value": quick.get("p_value", 1.0),
-                    "equity_mini": quick["equity_mini"],
-                }
-            )
-        except Exception as exc:
-            logger.warning("Could not read backtest %s from sqlite: %s", backtest_id, exc)
-
-    return results
+    return BacktestsDeduplicateResponse(
+        deleted_ids=deleted_ids,
+        kept_ids=kept_ids,
+        groups_affected=affected,
+    )
 
 
 @app.get("/api/backtest/{backtest_id}", response_model=dict[str, Any])
@@ -1791,6 +2730,7 @@ async def rename_backtest(backtest_id: str, payload: NameUpdateRequest) -> dict[
     try:
         result.save(output_path)
         migrate_json_to_sqlite()
+        _upsert_backtest_meta_cache(backtest_id)
         return {
             "id": backtest_id,
             "title": updated_name,
@@ -2246,7 +3186,7 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
     task_id = str(uuid.uuid4())[:8]
     TASK_LOGS_DIR.mkdir(parents=True, exist_ok=True)
     log_file = _task_log_path(task_id)
-    stage_total = 4
+    stage_total = 6
     record = _create_task_record(
         task_id,
         name=f"Backtest {strategy_path.stem}",
@@ -2272,6 +3212,24 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
         "task_id": task_id,
         "job_id": task_id,
     }
+    _update_task_fields(
+        task_id,
+        restart_config={
+            "strategy": strategy,
+            "engine": engine,
+            "symbols": symbols,
+            "timeframe": timeframe,
+            "start": start,
+            "end": end,
+            "capital": capital,
+            "risk_per_trade_pct": risk_pct,
+            "max_position_pct": max_position_pct,
+            "max_leverage": max_leverage,
+            "modeling_resolution": payload.modeling_resolution,
+            "intrabar_resolution": payload.intrabar_resolution,
+            "parameters": dict(params),
+        },
+    )
 
     def _runner_log_message(raw_line: str) -> str:
         text = str(raw_line or "").strip()
@@ -2291,13 +3249,17 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
     def _runner_stage(message: str) -> tuple[float, str] | None:
         normalized = message.lower()
         if "auto-detected date range" in normalized:
-            return (15.0, "Loading backtest inputs...")
+            return (15.0, "Loading market data...")
+        if "starting command:" in normalized:
+            return (20.0, "Loading market data...")
         if "running backtest:" in normalized:
-            return (40.0, "Launching backtest runner...")
+            return (35.0, f"Running strategy {strategy_path.stem}...")
+        if "result:" in normalized and "trades" in normalized:
+            return (65.0, "Processing trades...")
         if normalized.startswith("result:"):
-            return (72.0, "Computing strategy statistics...")
+            return (80.0, "Calculating statistics...")
         if normalized.startswith("saved to:"):
-            return (90.0, "Saving backtest result...")
+            return (92.0, "Saving results...")
         return None
 
     def _run() -> None:
@@ -2334,6 +3296,7 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
             cmd.extend(["--max-leverage", str(max_leverage)])
         if modeling_resolution:
             cmd.extend(["--intrabar-resolution", modeling_resolution])
+        _update_task_fields(task_id, command=list(cmd))
 
         latest_message = ""
         output_path = ""
@@ -2370,7 +3333,7 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
             try:
                 _set_task_status(task_id, "running")
                 _running_jobs[task_id]["status"] = "running"
-                report_stage(handle, percent=8.0, message="Loading backtest inputs...")
+                report_stage(handle, percent=10.0, message="Loading market data...")
 
                 command_display = " ".join(str(part) for part in cmd)
                 _write_task_log_line(
@@ -2380,7 +3343,7 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
                     stream="task",
                     source="backtest",
                 )
-                report_stage(handle, percent=25.0, message="Launching backtest runner...")
+                report_stage(handle, percent=25.0, message=f"Running strategy {strategy_path.stem}...")
 
                 proc = subprocess.Popen(
                     cmd,
@@ -2439,13 +3402,31 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
                         proc.kill()
                     raise subprocess.SubprocessError("Backtest timed out after 300 seconds")
                 if returncode == 0:
-                    report_stage(handle, percent=95.0, message="Saving backtest result...")
+                    report_stage(handle, percent=92.0, message="Saving results...")
                     result_payload = {
                         "output_path": output_path or None,
                         "backtest_id": backtest_id or None,
                     }
                     compact_result = {key: value for key, value in result_payload.items() if value}
+                    final_trade_count = 0
+                    if backtest_id:
+                        loaded_result = _load_result(backtest_id)
+                        if loaded_result is not None:
+                            final_trade_count = len(loaded_result.trades)
+                    if final_trade_count == 0 and isinstance(latest_message, str):
+                        match = re.search(r"result:\s*(\d+)\s+trades", latest_message.lower())
+                        if match:
+                            try:
+                                final_trade_count = int(match.group(1))
+                            except ValueError:
+                                final_trade_count = 0
+                    _upsert_backtest_meta_cache(backtest_id or "")
                     _update_task_fields(task_id, result=compact_result)
+                    report_stage(
+                        handle,
+                        percent=100.0,
+                        message=f"Completed - {final_trade_count} trades found",
+                    )
                     _write_task_log_line(
                         handle,
                         task_id,
@@ -3228,7 +4209,7 @@ async def data_download(payload: DataDownloadRequest) -> dict[str, Any]:
             cmd.extend(["--price-type", offer_side])
 
         total_items = max(len(symbol_list) * len(timeframe_list), 1)
-        return _start_jforex_task(
+        result = _start_jforex_task(
             task_id,
             cmd,
             source_label=source,
@@ -3246,6 +4227,23 @@ async def data_download(payload: DataDownloadRequest) -> dict[str, Any]:
             name=name,
             description=description,
         )
+        _apply_recovery_data_metadata(
+            task_id,
+            command=[str(part) for part in cmd],
+            downloader=source,
+            symbols=symbol_list,
+            timeframes=timeframe_list,
+            start=start or None,
+            end=end or None,
+            offer_side=offer_side,
+            price_type=offer_side,
+            merge_tick=merge_tick,
+            merge_s1=merge_s1,
+            batch_size=batch_size,
+            pause_ms=pause_ms,
+            query_timeout_seconds=query_timeout_seconds,
+        )
+        return result
 
     if source == "yfinance":
         cmd = [
@@ -3262,7 +4260,7 @@ async def data_download(payload: DataDownloadRequest) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="Unknown source")
 
     total_items = max(len(symbol_list) * len(timeframe_list), 1)
-    return _start_data_task(
+    result = _start_data_task(
         task_id,
         cmd,
         total_items=total_items,
@@ -3270,6 +4268,16 @@ async def data_download(payload: DataDownloadRequest) -> dict[str, Any]:
         description=description,
         source=source,
     )
+    _apply_recovery_data_metadata(
+        task_id,
+        command=[str(part) for part in cmd],
+        downloader=source,
+        symbols=symbol_list,
+        timeframes=timeframe_list,
+        start=start or None,
+        end=end or None,
+    )
+    return result
 
 
 def _manual_cache_invalidation_payload(
@@ -3358,7 +4366,7 @@ async def data_resample(payload: DataResampleRequest) -> dict[str, Any]:
         "--timeframes",
         target_timeframes,
     ]
-    return _start_data_task(
+    result = _start_data_task(
         task_id,
         cmd,
         total_items=1,
@@ -3366,6 +4374,12 @@ async def data_resample(payload: DataResampleRequest) -> dict[str, Any]:
         description=f"Resample {Path(source_path).name or source_path} into {target_timeframes}.",
         source="resample",
     )
+    _apply_recovery_data_metadata(
+        task_id,
+        command=[str(part) for part in cmd],
+        downloader="resample",
+    )
+    return result
 
 
 @app.post("/api/data/harvest", response_model=dict[str, Any])
@@ -3395,7 +4409,7 @@ async def data_harvest(payload: DataHarvestRequest) -> dict[str, Any]:
     if start:
         cmd.extend(["--start", start])
 
-    return _start_data_task(
+    result = _start_data_task(
         task_id,
         cmd,
         total_items=1,
@@ -3403,6 +4417,14 @@ async def data_harvest(payload: DataHarvestRequest) -> dict[str, Any]:
         description=f"Adaptive auto-tuned Dukascopy harvest for {symbol}.",
         source="harvest",
     )
+    _apply_recovery_data_metadata(
+        task_id,
+        command=[str(part) for part in cmd],
+        downloader="harvest",
+        symbols=[symbol],
+        start=start or None,
+    )
+    return result
 
 
 @app.post("/api/data/validate", response_model=dict[str, Any])
@@ -3413,7 +4435,7 @@ async def data_validate(payload: DataValidateRequest) -> dict[str, Any]:
         cmd.extend(["--symbol", payload.symbol])
     if payload.report:
         cmd.extend(["--report", payload.report])
-    return _start_data_task(
+    result = _start_data_task(
         task_id,
         cmd,
         total_items=1,
@@ -3421,6 +4443,13 @@ async def data_validate(payload: DataValidateRequest) -> dict[str, Any]:
         description="Validate OHLCV data quality and structure.",
         source="validate",
     )
+    _apply_recovery_data_metadata(
+        task_id,
+        command=[str(part) for part in cmd],
+        downloader="validate",
+        symbols=[str(payload.symbol).strip().upper()] if payload.symbol else None,
+    )
+    return result
 
 
 @app.post("/api/data/calibrate", response_model=dict[str, Any])
@@ -3451,7 +4480,7 @@ async def data_calibrate(payload: DataCalibrateRequest) -> dict[str, Any]:
     if payload.verbose:
         cmd.append("--verbose")
 
-    return _start_data_task(
+    result = _start_data_task(
         task_id,
         cmd,
         total_items=1,
@@ -3459,10 +4488,30 @@ async def data_calibrate(payload: DataCalibrateRequest) -> dict[str, Any]:
         description=f"Discover genesis boundaries for {symbols}.",
         source="calibrate",
     )
+    _apply_recovery_data_metadata(
+        task_id,
+        command=[str(part) for part in cmd],
+        downloader="calibrate",
+        symbols=[s.strip().upper() for s in symbols.split(",") if s.strip()],
+        timeframes=(
+            [tf.strip().lower() for tf in str(payload.timeframes).split(",") if tf.strip()]
+            if payload.timeframes
+            else None
+        ),
+    )
+    return result
 
 
 @app.get("/api/data/tasks", response_model=dict[str, Any])
 async def list_data_tasks() -> dict[str, Any]:
+    records = await asyncio.to_thread(list_background_task_records)
+    with DATA_TASKS_LOCK:
+        for record in records:
+            task_id = str(record.get("id") or "").strip()
+            if not task_id or task_id in DATA_TASKS:
+                continue
+            DATA_TASKS[task_id] = _build_task_from_record(record)
+
     with DATA_TASKS_LOCK:
         snapshots = [(task_id, dict(task)) for task_id, task in DATA_TASKS.items()]
     payload = [
@@ -3484,6 +4533,11 @@ async def get_data_task(task_id: str) -> dict[str, Any]:
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     return _serialize_task(task_id, task, include_log=True)
+
+
+@app.post("/api/data/tasks/{task_id}/restart", response_model=dict[str, Any])
+async def restart_data_task(task_id: str) -> dict[str, Any]:
+    return await asyncio.to_thread(_restart_interrupted_task, task_id)
 
 
 @app.post("/api/data/tasks/{task_id}/pause", response_model=dict[str, Any])
@@ -3571,6 +4625,7 @@ async def delete_data_task(task_id: str) -> dict[str, Any]:
                 detail="Only completed, failed, or cancelled tasks can be removed",
             )
         del DATA_TASKS[task_id]
+    await asyncio.to_thread(delete_background_task_record, task_id)
     return {"task_id": task_id, "status": "deleted"}
 
 

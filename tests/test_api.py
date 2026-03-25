@@ -65,11 +65,14 @@ class TestBacktestsAPI:
         resp = client.get("/api/backtests")
         assert resp.status_code == 200
         data = resp.json()
-        assert isinstance(data, list)
+        assert isinstance(data, dict)
+        assert "items" in data
+        assert "total" in data
+        assert isinstance(data["items"], list)
 
     def test_get_backtest_info(self, client):
         resp = client.get("/api/backtests")
-        backtests = resp.json()
+        backtests = resp.json().get("items", [])
         if backtests:
             bt_id = backtests[0]["id"]
             resp2 = client.get(f"/api/backtest/{bt_id}/info")
@@ -79,7 +82,7 @@ class TestBacktestsAPI:
 
     def test_get_backtest_stats(self, client):
         resp = client.get("/api/backtests")
-        backtests = resp.json()
+        backtests = resp.json().get("items", [])
         if backtests:
             bt_id = backtests[0]["id"]
             resp2 = client.get(f"/api/backtest/{bt_id}/stats")
@@ -87,7 +90,7 @@ class TestBacktestsAPI:
 
     def test_get_backtest_trades(self, client):
         resp = client.get("/api/backtests")
-        backtests = resp.json()
+        backtests = resp.json().get("items", [])
         if backtests:
             bt_id = backtests[0]["id"]
             resp2 = client.get(f"/api/backtest/{bt_id}/trades")
@@ -96,7 +99,7 @@ class TestBacktestsAPI:
 
     def test_get_backtest_equity(self, client):
         resp = client.get("/api/backtests")
-        backtests = resp.json()
+        backtests = resp.json().get("items", [])
         if backtests:
             bt_id = backtests[0]["id"]
             resp2 = client.get(f"/api/backtest/{bt_id}/equity")

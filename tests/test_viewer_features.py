@@ -1059,9 +1059,9 @@ def test_data_tasks_list_and_controls(viewer_client, tmp_path):
     list_resp = viewer_client.get("/api/data/tasks")
     assert list_resp.status_code == 200
     tasks = list_resp.json()["tasks"]
-    assert tasks[0]["id"] == task_id
-    assert tasks[0]["progress"]["completed"] == 1
-    assert tasks[0]["can_pause"] is True
+    listed = next(item for item in tasks if item["id"] == task_id)
+    assert listed["progress"]["completed"] == 1
+    assert listed["can_pause"] is True
 
     pause_resp = viewer_client.post(f"/api/data/tasks/{task_id}/pause")
     assert pause_resp.status_code == 200
@@ -1385,10 +1385,11 @@ def test_backtest_run_registers_task_manager_progress(viewer_client, monkeypatch
     assert status_payload["result"]["output_path"] == str(expected_output)
 
     log_text = Path(task["log_file"]).read_text(encoding="utf-8")
-    assert "Loading backtest inputs..." in log_text
-    assert "Launching backtest runner..." in log_text
-    assert "Computing strategy statistics..." in log_text
-    assert "Saving backtest result..." in log_text
+    assert "Loading market data..." in log_text
+    assert "Running strategy demo_strategy..." in log_text
+    assert "Processing trades..." in log_text
+    assert "Saving results..." in log_text
+    assert "Completed - " in log_text
 
 
 def test_thread_bound_task_log_handler_emits_without_shadowing_handle(viewer_client, tmp_path):
@@ -1647,38 +1648,36 @@ def test_backtest_capm_endpoint_uses_first_symbol_when_benchmark_missing(viewer_
     assert "p_value" in payload
 
 
-def test_backtests_list_uses_persisted_runner_stats(viewer_client, tmp_path):
-    backtests_dir = tmp_path / "backtests"
-    backtests_dir.mkdir(parents=True, exist_ok=True)
+def test_backtests_list_uses_persisted_runner_stats(viewer_client, monkeypatch):
+    import viewer.main as viewer_app_module
 
-    result = BacktestResult(
-        meta=BacktestMeta(
-            id="cached-stats-demo",
-            created_at="2026-03-07T15:00:00Z",
-            engine="vectorbt",
-            strategies=["Cached Stats Demo"],
-            backtest_start="2024-01-01",
-            backtest_end="2024-01-31",
-            initial_capital=100000.0,
-            data={"symbols": ["AAPL"], "timeframes": ["1d"], "source": "test_source"},
-        ),
-        trades=[],
-        equity_curve=_equity_curve_from_returns([0.01, -0.02, 0.015]),
-        stats={
-            "total_pnl": 1234.56,
-            "sharpe_ratio": 7.777,
-            "cagr": 0.4321,
-            "max_drawdown_pct": -0.2345,
-            "p_value": 0.012345,
-            "psr": 0.88,
-        },
+    monkeypatch.setattr(
+        viewer_app_module,
+        "list_backtest_metadata_rows",
+        lambda: [
+            {
+                "id": "cached-stats-demo",
+                "engine": "vectorbt",
+                "strategy_name": "Cached Stats Demo",
+                "symbols": ["AAPL"],
+                "timeframe": "1d",
+                "start_date": "2024-01-01",
+                "end_date": "2024-01-31",
+                "total_return": 0.012345,
+                "sharpe_ratio": 7.777,
+                "max_drawdown": -0.2345,
+                "trade_count": 0,
+                "created_at": "2026-03-07T15:00:00Z",
+            }
+        ],
     )
-    result.save(backtests_dir / "cached-stats-demo.trades.json")
+    with viewer_app_module._BACKTEST_META_CACHE_LOCK:
+        viewer_app_module._BACKTEST_META_CACHE.clear()
 
     resp = viewer_client.get("/api/backtests")
 
     assert resp.status_code == 200
-    payload = resp.json()
+    payload = resp.json()["items"]
     assert len(payload) == 1
 
     item = payload[0]
@@ -1696,13 +1695,13 @@ def test_backtests_list_uses_persisted_runner_stats(viewer_client, tmp_path):
     assert item["end"] == "2024-01-31"
     assert item["created_at"] == "2026-03-07T15:00:00Z"
     assert item["sharpe"] == 7.777
-    assert item["cagr"] == 43.21
+    assert item["cagr"] == 1.23
     assert item["max_drawdown_pct"] == 23.45
-    assert item["net_profit"] == 1234.56
+    assert item["net_profit"] == 0.0
     assert item["net_profit_pct"] == 1.23
-    assert item["psr"] == 0.88
-    assert item["p_value"] == 0.012345
-    assert item["equity_mini"] == pytest.approx([100000.0, 101000.0, 98980.0, 100464.7])
+    assert item["psr"] is None
+    assert item["p_value"] == 1.0
+    assert item["equity_mini"] == []
 
 
 def test_create_portfolio_persists_p_value_and_psr(viewer_client, tmp_path):

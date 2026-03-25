@@ -3,12 +3,12 @@ from __future__ import annotations
 import json
 import os
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
 from dotenv import load_dotenv
-from sqlalchemy import JSON, Column, String, delete, text
+from sqlalchemy import JSON, Column, String, delete, func, text
 from sqlalchemy.engine import Connection
 from sqlmodel import Field, Session, SQLModel, create_engine, select
 
@@ -292,6 +292,43 @@ class LiveDeploymentModel(SQLModel, table=True):
         )
 
 
+class BackgroundTaskRecord(SQLModel, table=True):
+    __tablename__ = "background_tasks"
+
+    id: str = Field(primary_key=True)
+    type: str = Field(index=True)
+    status: str = Field(index=True)
+    config_json: dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column("config_json", JSON, nullable=False),
+    )
+    progress_message: str = Field(default="")
+    name: str = Field(default="")
+    description: str = Field(default="")
+    source: str = Field(default="")
+    created_at: str = Field(default="", index=True)
+    updated_at: str = Field(default="", index=True)
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _normalize_task_record(row: Any) -> BackgroundTaskRecord | None:
+    if row is None:
+        return None
+    if isinstance(row, BackgroundTaskRecord):
+        return row
+    if hasattr(row, "_mapping"):
+        values = list(getattr(row, "_mapping").values())
+        if values:
+            return _normalize_task_record(values[0])
+        return None
+    if isinstance(row, (tuple, list)):
+        return _normalize_task_record(row[0]) if row else None
+    return None
+
+
 @contextmanager
 def get_session() -> Iterator[Session]:
     with Session(ENGINE) as session:
@@ -325,6 +362,33 @@ def _migrate_schema() -> None:
             connection.execute(text("ALTER TABLE live_accounts ADD COLUMN ctid TEXT"))
         if "broker_login" not in account_column_names:
             connection.execute(text("ALTER TABLE live_accounts ADD COLUMN broker_login TEXT"))
+
+        task_column_names = _table_column_names(connection, "background_tasks")
+        if task_column_names:
+            if "progress_message" not in task_column_names:
+                connection.execute(
+                    text("ALTER TABLE background_tasks ADD COLUMN progress_message TEXT NOT NULL DEFAULT ''")
+                )
+            if "name" not in task_column_names:
+                connection.execute(
+                    text("ALTER TABLE background_tasks ADD COLUMN name TEXT NOT NULL DEFAULT ''")
+                )
+            if "description" not in task_column_names:
+                connection.execute(
+                    text("ALTER TABLE background_tasks ADD COLUMN description TEXT NOT NULL DEFAULT ''")
+                )
+            if "source" not in task_column_names:
+                connection.execute(
+                    text("ALTER TABLE background_tasks ADD COLUMN source TEXT NOT NULL DEFAULT ''")
+                )
+            if "created_at" not in task_column_names:
+                connection.execute(
+                    text("ALTER TABLE background_tasks ADD COLUMN created_at TEXT NOT NULL DEFAULT ''")
+                )
+            if "updated_at" not in task_column_names:
+                connection.execute(
+                    text("ALTER TABLE background_tasks ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''")
+                )
 
 
 def save_live_signal(signal: LiveSignal) -> None:
@@ -743,6 +807,380 @@ def list_backtest_ids() -> list[str]:
             if row[0]:
                 ids.append(str(row[0]))
     return ids
+
+
+def _as_string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value if str(item).strip()]
+
+
+def _safe_stat_number(value: Any, default: float = 0.0) -> float:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return default
+    if numeric != numeric:  # NaN guard
+        return default
+    return numeric
+
+
+def _backtest_metadata_payload(backtest: BacktestRecord, trade_count: int) -> dict[str, Any]:
+    data = backtest.data or {}
+    stats = backtest.stats or {}
+    strategies = _as_string_list(backtest.strategies)
+    timeframes = _as_string_list(data.get("timeframes"))
+    symbols = _as_string_list(data.get("symbols"))
+    strategy_name = strategies[0] if strategies else "unknown"
+    timeframe = timeframes[0] if timeframes else ""
+
+    return {
+        "id": str(backtest.id),
+        "engine": str(backtest.engine or "unknown"),
+        "strategy_name": strategy_name,
+        "symbols": symbols,
+        "timeframe": timeframe,
+        "start_date": str(backtest.backtest_start or ""),
+        "end_date": str(backtest.backtest_end or ""),
+        "total_return": _safe_stat_number(stats.get("total_return"), 0.0),
+        "sharpe_ratio": _safe_stat_number(stats.get("sharpe_ratio"), 0.0),
+        "max_drawdown": _safe_stat_number(stats.get("max_drawdown_pct"), 0.0),
+        "trade_count": max(int(trade_count), 0),
+        "created_at": str(backtest.created_at or ""),
+    }
+
+
+def _backtest_fingerprint_payload(backtest: BacktestRecord) -> dict[str, Any]:
+    data = backtest.data or {}
+    strategies = _as_string_list(backtest.strategies)
+    timeframes = _as_string_list(data.get("timeframes"))
+    symbols = _as_string_list(data.get("symbols"))
+    strategy_name = strategies[0] if strategies else "unknown"
+    timeframe = timeframes[0] if timeframes else ""
+    return {
+        "id": str(backtest.id),
+        "strategy_name": strategy_name,
+        "symbols": symbols,
+        "timeframe": timeframe,
+        "start_date": str(backtest.backtest_start or ""),
+        "end_date": str(backtest.backtest_end or ""),
+        "engine": str(backtest.engine or "unknown"),
+        "created_at": str(backtest.created_at or ""),
+    }
+
+
+def _extract_backtest_and_trade_count(row: Any) -> tuple[BacktestRecord | None, int]:
+    if isinstance(row, BacktestRecord):
+        return row, 0
+
+    if hasattr(row, "_mapping"):
+        values = list(getattr(row, "_mapping").values())
+    elif isinstance(row, (tuple, list)):
+        values = list(row)
+    else:
+        values = [row]
+
+    backtest: BacktestRecord | None = None
+    trade_count = 0
+
+    for value in values:
+        if isinstance(value, BacktestRecord):
+            backtest = value
+            continue
+        if value is None:
+            continue
+        try:
+            trade_count = int(value)
+        except (TypeError, ValueError):
+            continue
+
+    return backtest, max(trade_count, 0)
+
+
+def list_backtest_metadata_rows() -> list[dict[str, Any]]:
+    init_db()
+    trade_counts = (
+        select(
+            TradeRecord.backtest_id,
+            func.count(TradeRecord.id).label("trade_count"),
+        )
+        .group_by(TradeRecord.backtest_id)
+        .subquery()
+    )
+    with get_session() as session:
+        rows = session.exec(
+            select(BacktestRecord, trade_counts.c.trade_count)
+            .outerjoin(trade_counts, trade_counts.c.backtest_id == BacktestRecord.id)
+            .order_by(BacktestRecord.created_at.desc(), BacktestRecord.id.desc())
+        ).all()
+
+    payload: list[dict[str, Any]] = []
+    for row in rows:
+        backtest, trade_count = _extract_backtest_and_trade_count(row)
+        if backtest is None:
+            continue
+        payload.append(_backtest_metadata_payload(backtest, trade_count))
+    return payload
+
+
+def list_backtest_fingerprint_rows() -> list[dict[str, Any]]:
+    init_db()
+    with get_session() as session:
+        rows = session.exec(
+            select(BacktestRecord).order_by(BacktestRecord.created_at.desc(), BacktestRecord.id.desc())
+        ).all()
+
+    payload: list[dict[str, Any]] = []
+    for row in rows:
+        backtest = row if isinstance(row, BacktestRecord) else None
+        if backtest is None and hasattr(row, "_mapping"):
+            values = list(getattr(row, "_mapping").values())
+            if values and isinstance(values[0], BacktestRecord):
+                backtest = values[0]
+        if backtest is None and isinstance(row, (tuple, list)) and row and isinstance(row[0], BacktestRecord):
+            backtest = row[0]
+        if backtest is None:
+            continue
+        payload.append(_backtest_fingerprint_payload(backtest))
+    return payload
+
+
+def load_backtest_metadata_row(backtest_id: str) -> dict[str, Any] | None:
+    normalized_id = str(backtest_id or "").strip()
+    if not normalized_id:
+        return None
+
+    init_db()
+    with get_session() as session:
+        backtest = session.get(BacktestRecord, normalized_id)
+        if backtest is None:
+            return None
+        trade_count = session.exec(
+            select(func.count(TradeRecord.id)).where(TradeRecord.backtest_id == normalized_id)
+        ).one()
+    return _backtest_metadata_payload(backtest, int(trade_count or 0))
+
+
+def upsert_background_task_record(
+    *,
+    task_id: str,
+    task_type: str,
+    status: str,
+    config_json: dict[str, Any] | None = None,
+    progress_message: str = "",
+    name: str = "",
+    description: str = "",
+    source: str = "",
+    created_at: str | None = None,
+    updated_at: str | None = None,
+) -> None:
+    normalized_id = str(task_id or "").strip()
+    if not normalized_id:
+        raise ValueError("task_id is required")
+
+    normalized_type = str(task_type or "").strip() or "unknown"
+    normalized_status = str(status or "").strip() or "unknown"
+    normalized_config = dict(config_json or {})
+    now_iso = _now_iso()
+    created_value = str(created_at or "").strip() or now_iso
+    updated_value = str(updated_at or "").strip() or now_iso
+
+    init_db()
+    with get_session() as session:
+        record = session.get(BackgroundTaskRecord, normalized_id)
+        if record is None:
+            record = BackgroundTaskRecord(
+                id=normalized_id,
+                type=normalized_type,
+                status=normalized_status,
+                config_json=normalized_config,
+                progress_message=str(progress_message or ""),
+                name=str(name or ""),
+                description=str(description or ""),
+                source=str(source or ""),
+                created_at=created_value,
+                updated_at=updated_value,
+            )
+        else:
+            record.type = normalized_type
+            record.status = normalized_status
+            record.config_json = normalized_config
+            record.progress_message = str(progress_message or "")
+            record.name = str(name or "")
+            record.description = str(description or "")
+            record.source = str(source or "")
+            if created_at:
+                record.created_at = created_value
+            elif not str(record.created_at or "").strip():
+                record.created_at = created_value
+            record.updated_at = updated_value
+        session.add(record)
+        session.commit()
+
+
+def get_background_task_record(task_id: str) -> dict[str, Any] | None:
+    normalized_id = str(task_id or "").strip()
+    if not normalized_id:
+        return None
+
+    init_db()
+    with get_session() as session:
+        record = session.get(BackgroundTaskRecord, normalized_id)
+    if record is None:
+        return None
+    return {
+        "id": record.id,
+        "type": record.type,
+        "status": record.status,
+        "config_json": dict(record.config_json or {}),
+        "progress_message": str(record.progress_message or ""),
+        "name": str(record.name or ""),
+        "description": str(record.description or ""),
+        "source": str(record.source or ""),
+        "created_at": str(record.created_at or ""),
+        "updated_at": str(record.updated_at or ""),
+    }
+
+
+def list_background_task_records(*, statuses: list[str] | None = None) -> list[dict[str, Any]]:
+    init_db()
+    with get_session() as session:
+        statement = select(BackgroundTaskRecord)
+        if statuses:
+            normalized_statuses = [str(status).strip() for status in statuses if str(status).strip()]
+            if normalized_statuses:
+                statement = statement.where(BackgroundTaskRecord.status.in_(normalized_statuses))
+        rows = session.exec(
+            statement.order_by(BackgroundTaskRecord.created_at.desc(), BackgroundTaskRecord.id.desc())
+        ).all()
+
+    payload: list[dict[str, Any]] = []
+    for row in rows:
+        record = _normalize_task_record(row)
+        if record is None:
+            continue
+        payload.append(
+            {
+                "id": record.id,
+                "type": record.type,
+                "status": record.status,
+                "config_json": dict(record.config_json or {}),
+                "progress_message": str(record.progress_message or ""),
+                "name": str(record.name or ""),
+                "description": str(record.description or ""),
+                "source": str(record.source or ""),
+                "created_at": str(record.created_at or ""),
+                "updated_at": str(record.updated_at or ""),
+            }
+        )
+    return payload
+
+
+def mark_background_tasks_interrupted(
+    *,
+    from_statuses: list[str] | tuple[str, ...] = ("queued", "running"),
+) -> list[dict[str, Any]]:
+    normalized = [str(status).strip() for status in from_statuses if str(status).strip()]
+    if not normalized:
+        return []
+
+    init_db()
+    now_iso = _now_iso()
+    with get_session() as session:
+        rows = session.exec(
+            select(BackgroundTaskRecord).where(BackgroundTaskRecord.status.in_(normalized))
+        ).all()
+        interrupted: list[dict[str, Any]] = []
+        for row in rows:
+            record = _normalize_task_record(row)
+            if record is None:
+                continue
+            record.status = "interrupted"
+            record.progress_message = "Interrupted by server restart"
+            record.updated_at = now_iso
+            session.add(record)
+            interrupted.append(
+                {
+                    "id": record.id,
+                    "type": record.type,
+                    "status": record.status,
+                    "config_json": dict(record.config_json or {}),
+                    "progress_message": str(record.progress_message or ""),
+                    "name": str(record.name or ""),
+                    "description": str(record.description or ""),
+                    "source": str(record.source or ""),
+                    "created_at": str(record.created_at or ""),
+                    "updated_at": str(record.updated_at or ""),
+                }
+            )
+        session.commit()
+    return interrupted
+
+
+def delete_background_task_record(task_id: str) -> bool:
+    normalized_id = str(task_id or "").strip()
+    if not normalized_id:
+        return False
+
+    init_db()
+    with get_session() as session:
+        record = session.get(BackgroundTaskRecord, normalized_id)
+        if record is None:
+            return False
+        session.delete(record)
+        session.commit()
+    return True
+
+
+def delete_backtest(backtest_id: str) -> bool:
+    normalized_id = str(backtest_id or "").strip()
+    if not normalized_id:
+        return False
+
+    init_db()
+    with get_session() as session:
+        backtest = session.get(BacktestRecord, normalized_id)
+        if backtest is None:
+            return False
+        session.exec(delete(TradeRecord).where(TradeRecord.backtest_id == normalized_id))
+        session.exec(delete(EquityPoint).where(EquityPoint.backtest_id == normalized_id))
+        session.exec(delete(DrawingRecord).where(DrawingRecord.backtest_id == normalized_id))
+        session.exec(delete(IndicatorRecord).where(IndicatorRecord.backtest_id == normalized_id))
+        session.delete(backtest)
+        session.commit()
+    return True
+
+
+def load_backtest_equity_points(backtest_id: str) -> list[EquityPointModel]:
+    normalized_id = str(backtest_id or "").strip()
+    if not normalized_id:
+        return []
+
+    init_db()
+    with get_session() as session:
+        rows = session.exec(
+            select(EquityPoint)
+            .where(EquityPoint.backtest_id == normalized_id)
+            .order_by(EquityPoint.time.asc(), EquityPoint.id.asc())
+        ).all()
+
+    points: list[EquityPointModel] = []
+    for raw_row in rows:
+        if raw_row is None:
+            continue
+        if isinstance(raw_row, EquityPoint):
+            row = raw_row
+        elif hasattr(raw_row, "_mapping"):
+            values = list(getattr(raw_row, "_mapping").values())
+            row = values[0] if values else None
+        elif isinstance(raw_row, (tuple, list)):
+            row = raw_row[0] if raw_row else None
+        else:
+            row = raw_row
+        if not isinstance(row, EquityPoint):
+            continue
+        points.append(EquityPointModel(time=row.time, equity=row.equity))
+    return points
 
 
 def load_backtest_result(backtest_id: str) -> BacktestResult | None:

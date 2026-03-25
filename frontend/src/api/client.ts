@@ -34,6 +34,9 @@ import type {
   TradeChartResponse,
   BacktestInfo,
   BacktestCapmResponse,
+  BacktestsDeduplicateResponse,
+  BacktestsDuplicatesResponse,
+  BacktestsListResponse,
   BacktestReplayResponse,
 } from "./types";
 
@@ -116,7 +119,20 @@ export const renameStrategy = (name: string, displayName: string) =>
   });
 
 // Backtests
-export const getBacktests = () => fetchJSON<any[]>("/backtests");
+export const getBacktests = (params?: {
+  page?: number;
+  per_page?: number;
+  sort?: string;
+  order?: "asc" | "desc";
+}) => {
+  const query = new URLSearchParams();
+  if (params?.page) query.set("page", String(params.page));
+  if (params?.per_page) query.set("per_page", String(params.per_page));
+  if (params?.sort) query.set("sort", params.sort);
+  if (params?.order) query.set("order", params.order);
+  const queryString = query.toString();
+  return fetchJSON<BacktestsListResponse>(`/backtests${queryString ? `?${queryString}` : ""}`);
+};
 export const getBacktestInfo = (id: string) =>
   fetchJSON<BacktestInfo>(`/backtest/${id}/info`);
 export const getBacktestStats = (id: string) =>
@@ -144,6 +160,12 @@ export const renameBacktest = (id: string, title: string) =>
   });
 export const compareBacktests = (ids: string[]) =>
   fetchJSON<any>(`/compare?ids=${ids.join(",")}`);
+export const getBacktestDuplicates = () =>
+  fetchJSON<BacktestsDuplicatesResponse>("/backtests/duplicates");
+export const deduplicateBacktests = () =>
+  fetchJSON<BacktestsDeduplicateResponse>("/backtests/deduplicate", {
+    method: "POST",
+  });
 
 // Live Hub
 export const getLiveDeployments = () =>
@@ -305,6 +327,10 @@ export const resumeDataTask = (taskId: string) =>
   });
 export const cancelDataTask = (taskId: string) =>
   fetchJSON<DataTaskStatusResponse>(`/data/tasks/${taskId}/cancel`, {
+    method: "POST",
+  });
+export const restartDataTask = (taskId: string) =>
+  fetchJSON<DataTaskStatusResponse>(`/data/tasks/${taskId}/restart`, {
     method: "POST",
   });
 export const deleteDataTask = (taskId: string) =>
