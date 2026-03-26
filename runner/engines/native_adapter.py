@@ -8,7 +8,12 @@ from typing import Any
 import pandas as pd
 
 from runner.engine import TradeEngine
-from runner.engines.base import BacktestConfig, EngineAdapter, resolve_strategy_parameters
+from runner.engines.base import (
+    BacktestConfig,
+    EngineAdapter,
+    ProgressCallback,
+    resolve_strategy_parameters,
+)
 from shared.constants import DATA_DIR
 from shared.models import BacktestMeta, BacktestResult, EquityPoint
 
@@ -71,7 +76,19 @@ class NativeAdapter(EngineAdapter):
     def name(self) -> str:
         return "native"
 
-    def run(self, config: BacktestConfig, strategy_path: str) -> BacktestResult:
+    def run(
+        self,
+        config: BacktestConfig,
+        strategy_path: str,
+        progress_callback: ProgressCallback | None = None,
+    ) -> BacktestResult:
+        def emit_progress(percent: float, message: str) -> None:
+            if progress_callback is None:
+                return
+            bounded = max(0.0, min(100.0, float(percent)))
+            progress_callback(round(bounded, 2), message)
+
+        emit_progress(5.0, "Loading market data...")
         strategy_module = _load_strategy_module(strategy_path)
         if not hasattr(strategy_module, "generate_signals"):
             raise ValueError(f"Strategy {strategy_path} must define generate_signals")
@@ -82,11 +99,23 @@ class NativeAdapter(EngineAdapter):
         all_trades = []
         all_drawings: list[dict[str, Any]] = []
         used_timeframes = [config.timeframe]
+        symbols_total = max(len(config.symbols), 1)
+        total_loaded_bars = 0
 
-        for symbol in config.symbols:
+        for symbol_index, symbol in enumerate(config.symbols):
             data = _load_ohlcv(data_root, symbol, config.timeframe, config.start_date, config.end_date)
             if data is None or data.empty:
                 continue
+            total_loaded_bars += len(data)
+
+            symbol_start = 10.0 + (80.0 * symbol_index / symbols_total)
+            symbol_end = 10.0 + (80.0 * (symbol_index + 1) / symbols_total)
+            emit_progress(
+                symbol_start,
+                f"Data loaded: {len(data)} bars"
+                if symbols_total == 1
+                else f"Data loaded: {symbol} ({len(data)} bars)",
+            )
 
             intrabar = _load_intrabar_data(
                 data_root,
@@ -100,7 +129,14 @@ class NativeAdapter(EngineAdapter):
                 used_timeframes.append(config.modeling_resolution)
 
             symbol_config = config.model_copy(update={"symbols": [symbol], "parameters": resolved_parameters})
-            engine = TradeEngine(symbol_config, symbol=symbol, intrabar_data=intrabar)
+            engine = TradeEngine(
+                symbol_config,
+                symbol=symbol,
+                intrabar_data=intrabar,
+                progress_callback=progress_callback,
+                progress_start=symbol_start,
+                progress_end=symbol_end,
+            )
             symbol_result = engine.run(data, strategy_module.generate_signals)
 
             all_trades.extend(symbol_result.trades)
@@ -118,6 +154,7 @@ class NativeAdapter(EngineAdapter):
         for trade in sorted(all_trades, key=lambda item: item.last_exit_time):
             running += trade.pnl
             equity_curve.append(EquityPoint(time=trade.last_exit_time, equity=round(running, 2)))
+        emit_progress(90.0, "Calculating statistics...")
 
         now = datetime.now(timezone.utc)
         duration_days = 0
@@ -138,7 +175,7 @@ class NativeAdapter(EngineAdapter):
             backtest_start=config.start_date,
             backtest_end=config.end_date,
             duration_days=duration_days,
-            total_bars=0,
+            total_bars=total_loaded_bars,
             data={
                 "timeframes": used_timeframes,
                 "symbols": config.symbols,

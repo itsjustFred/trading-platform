@@ -64,6 +64,9 @@ class TradeEngine:
         *,
         symbol: str,
         intrabar_data: pd.DataFrame | None = None,
+        progress_callback: Callable[[float, str], None] | None = None,
+        progress_start: float = 10.0,
+        progress_end: float = 90.0,
     ):
         self.config = config
         self.symbol = symbol
@@ -78,6 +81,15 @@ class TradeEngine:
         self._trade_counter = 0
         self._signals_frame: pd.DataFrame | None = None
         self._intrabar = self._prepare_intrabar(intrabar_data)
+        self._progress_callback = progress_callback
+        self._progress_start = float(progress_start)
+        self._progress_end = float(progress_end)
+
+    def _emit_progress(self, percent: float, message: str) -> None:
+        if self._progress_callback is None:
+            return
+        bounded = max(0.0, min(100.0, float(percent)))
+        self._progress_callback(round(bounded, 2), message)
 
     @staticmethod
     def _prepare_intrabar(intrabar_data: pd.DataFrame | None) -> pd.DataFrame | None:
@@ -647,9 +659,16 @@ class TradeEngine:
         self._indicator_series = self._build_indicator_series(indicators, frame)
         self.drawings = drawings
 
-        for i in range(len(frame)):
+        total_bars = len(frame)
+        progress_span = max(0.0, self._progress_end - self._progress_start)
+        # Avoid noisy per-bar callbacks: at most once per 2% and at least every 1000 bars.
+        by_percent = max(1, total_bars // 50)
+        step_bars = max(1000, by_percent)
+        next_emit = 0
+
+        for i in range(total_bars):
             row = frame.iloc[i]
-            next_time = frame.iloc[i + 1]["timestamp"] if i + 1 < len(frame) else None
+            next_time = frame.iloc[i + 1]["timestamp"] if i + 1 < total_bars else None
             signal_row = self._signals_frame.iloc[i] if self._signals_frame is not None else pd.Series()
             merged_row = pd.concat([row, signal_row])
 
@@ -665,9 +684,19 @@ class TradeEngine:
 
             self._update_equity(row, i)
 
+            if i >= next_emit or i == total_bars - 1:
+                completed = i + 1
+                bar_percent = int((completed / total_bars) * 100)
+                mapped = self._progress_start + progress_span * (completed / total_bars)
+                self._emit_progress(
+                    mapped,
+                    f"Running strategy: {completed}/{total_bars} bars ({bar_percent}%)",
+                )
+                next_emit = i + step_bars
+
         if self.positions:
             last_row = frame.iloc[-1]
-            self._close_position(last_row, len(frame) - 1, reason="end_of_data")
-            self._update_equity(last_row, len(frame) - 1)
+            self._close_position(last_row, total_bars - 1, reason="end_of_data")
+            self._update_equity(last_row, total_bars - 1)
 
         return self._build_result()

@@ -1326,12 +1326,17 @@ def test_backtest_run_registers_task_manager_progress(viewer_client, monkeypatch
 
     def fake_popen(cmd, *args, **kwargs):
         assert cmd[:4] == [sys.executable, "-u", "-m", "runner.cli"]
+        assert "--progress-stdout" in cmd
         return _FakeProc(
             [
                 '{"message":"Auto-detected date range: 2024-01-01 to 2024-12-31"}\n',
+                "PROGRESS:5.00:Loading market data...\n",
                 '{"message":"Running backtest: engine=native, strategy=demo, symbols=[\\"AAPL\\"]"}\n',
+                "PROGRESS:25.00:Running strategy: 2500/10000 bars (25%)\n",
                 '{"message":"Result: 5 trades, total PnL: $123.45"}\n',
+                "PROGRESS:95.00:Saving results...\n",
                 f'{{"message":"Saved to: {expected_output}"}}\n',
+                "PROGRESS:100.00:Completed - 5 trades found\n",
             ]
         )
 
@@ -1387,6 +1392,7 @@ def test_backtest_run_registers_task_manager_progress(viewer_client, monkeypatch
     log_text = Path(task["log_file"]).read_text(encoding="utf-8")
     assert "Loading market data..." in log_text
     assert "Running strategy demo_strategy..." in log_text
+    assert "Running strategy: 2500/10000 bars (25%)" in log_text
     assert "Processing trades..." in log_text
     assert "Saving results..." in log_text
     assert "Completed - " in log_text

@@ -19,6 +19,7 @@ import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
 from pydantic import ValidationError
 
@@ -32,6 +33,17 @@ from shared.logging import get_logger
 logger = get_logger("runner")
 
 BACKTESTS_DIR = DATA_DIR / "backtests"
+
+
+def _emit_progress(
+    callback: Callable[[float, str], None] | None,
+    percent: float,
+    message: str,
+) -> None:
+    if callback is None:
+        return
+    bounded = max(0.0, min(100.0, float(percent)))
+    callback(round(bounded, 2), str(message))
 
 
 def get_engine(name: str) -> EngineAdapter:
@@ -92,6 +104,13 @@ def _detect_date_range(symbols: list[str], timeframe: str, data_dir: str = "") -
 def cmd_run(args):
     """Run a backtest."""
     engine = get_engine(args.engine)
+    progress_callback: Callable[[float, str], None] | None = None
+    if bool(getattr(args, "progress_stdout", False)):
+        def _stdout_progress(percent: float, message: str) -> None:
+            print(f"PROGRESS:{percent:.2f}:{message}", flush=True)
+
+        progress_callback = _stdout_progress
+
     parameter_overrides = json.loads(args.params) if args.params else {}
     if not isinstance(parameter_overrides, dict):
         raise ValueError("--params must decode to a JSON object")
@@ -144,10 +163,18 @@ def cmd_run(args):
         config.symbols,
     )
 
-    result = engine.run(config, args.strategy)
+    if engine.name != "native":
+        _emit_progress(progress_callback, 5.0, "Loading market data...")
+    if progress_callback is None:
+        result = engine.run(config, args.strategy)
+    else:
+        result = engine.run(config, args.strategy, progress_callback=progress_callback)
+    if engine.name != "native":
+        _emit_progress(progress_callback, 90.0, "Calculating statistics...")
     result.stats = {**result.stats, **compute_stats_for_result(result)}
 
     # Save result
+    _emit_progress(progress_callback, 95.0, "Saving results...")
     BACKTESTS_DIR.mkdir(parents=True, exist_ok=True)
     if args.output:
         output_path = args.output
@@ -164,6 +191,7 @@ def cmd_run(args):
         "Result: %d trades, total PnL: $%.2f", len(result.trades), sum(t.pnl for t in result.trades)
     )
     logger.info("Saved to: %s", output_path)
+    _emit_progress(progress_callback, 100.0, f"Completed - {len(result.trades)} trades found")
 
 
 def cmd_engines(args):
@@ -222,6 +250,11 @@ def main():
     run_p.add_argument("--output", "-o", help="Output file path")
     run_p.add_argument("--params", help='Parameters JSON, e.g. \'{"fast": 10, "slow": 30}\'')
     run_p.add_argument("--data-dir", help="Override data directory")
+    run_p.add_argument(
+        "--progress-stdout",
+        action="store_true",
+        help="Emit progress updates on stdout as PROGRESS:<percent>:<message>",
+    )
     run_p.set_defaults(func=cmd_run)
 
     # Engines command

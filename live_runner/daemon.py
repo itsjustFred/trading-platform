@@ -7,7 +7,7 @@ from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 
-from dotenv import dotenv_values, load_dotenv
+from dotenv import dotenv_values
 
 from live_runner.alpaca_adapter import AlpacaLiveAdapter
 from live_runner.base_adapter import BaseLiveAdapter
@@ -38,6 +38,13 @@ def _load_accounts_env_values(accounts_env: Path) -> dict[str, str]:
         if key and isinstance(value, str):
             result[key] = value.strip()
     return result
+
+
+def _accounts_env_mtime(accounts_env: Path) -> int | None:
+    try:
+        return accounts_env.stat().st_mtime_ns
+    except OSError:
+        return None
 
 
 def _resolve_alpaca_credentials(
@@ -119,6 +126,18 @@ def _resolve_alpaca_credentials(
     )
 
 
+def _resolve_ctrader_credentials(
+    env_values: Mapping[str, str],
+) -> tuple[str, str, str, bool] | None:
+    app_id = str(env_values.get("CTRADER_APP_ID", "")).strip()
+    app_secret = str(env_values.get("CTRADER_APP_SECRET", "")).strip()
+    access_token = str(env_values.get("CTRADER_ACCESS_TOKEN", "")).strip()
+    if not app_id or not app_secret or not access_token:
+        return None
+    demo = _parse_bool_env(str(env_values.get("CTRADER_DEMO", "")).strip(), default=True)
+    return app_id, app_secret, access_token, demo
+
+
 def _create_adapter_for_account(
     account: LiveAccountConfig, *, accounts_env_values: Mapping[str, str] | None = None
 ) -> BaseLiveAdapter | None:
@@ -146,8 +165,24 @@ def _create_adapter_for_account(
             )
             return None
     if account.broker == "ctrader":
+        credentials = _resolve_ctrader_credentials(env_values)
+        if credentials is None:
+            logger.warning(
+                "Missing cTrader credentials for account",
+                extra={"data": {"account_id": account.id}},
+            )
+            return None
+        app_id, app_secret, access_token, demo = credentials
+        account_identifier = str(account.ctid or account.broker_login or account.id).strip()
         try:
-            return CTraderLiveAdapter(account_config_id=account.id)
+            return CTraderLiveAdapter(
+                app_id=app_id,
+                app_secret=app_secret,
+                access_token=access_token,
+                account_id=account_identifier,
+                demo=demo,
+                account_config_id=account.id,
+            )
         except Exception as exc:
             logger.warning(
                 "Could not initialize ctrader adapter",
@@ -267,8 +302,8 @@ def _start_missing_tasks(
             continue
         adapter = adapters.get(account_id)
         if adapter is None:
-            logger.warning(
-                "Active deployment has no adapter",
+            logger.info(
+                "Active deployment has no adapter yet; waiting for next adapter-connect retry",
                 extra={"data": {"account_id": account_id}},
             )
             continue
@@ -389,8 +424,8 @@ async def _ensure_adapter_for_active_account(
     try:
         await adapter.connect()
     except Exception as exc:
-        logger.warning(
-            "Adapter connect failed for active deployment account",
+        logger.info(
+            "Adapter connect not ready for active deployment account; will retry",
             extra={
                 "data": {
                     "account_id": account_id,
@@ -416,10 +451,15 @@ async def sync_deployments_loop(
     interval_seconds: int = DEPLOYMENT_POLL_INTERVAL_SECONDS,
 ) -> None:
     known_deployment_statuses: dict[str, str] = {}
+    accounts_env_values = _load_accounts_env_values(accounts_env)
+    accounts_env_mtime = _accounts_env_mtime(accounts_env)
     while True:
         try:
-            load_dotenv(accounts_env, override=True)
-            accounts_env_values = _load_accounts_env_values(accounts_env)
+            # Read credential file directly without repeatedly mutating process env.
+            current_mtime = _accounts_env_mtime(accounts_env)
+            if current_mtime != accounts_env_mtime:
+                accounts_env_values = _load_accounts_env_values(accounts_env)
+                accounts_env_mtime = current_mtime
             accounts, deployments = await _load_db_accounts_and_deployments()
             account_lookup = {account.id: account for account in accounts}
             _cleanup_finished_listener_tasks(active_tasks)
@@ -464,7 +504,6 @@ async def run_daemon(
     *,
     accounts_env: Path = DEFAULT_ACCOUNTS_ENV,
 ) -> None:
-    load_dotenv(accounts_env, override=True)
     logger.info(
         "Starting live daemon",
         extra={"data": {"accounts_env": str(accounts_env)}},

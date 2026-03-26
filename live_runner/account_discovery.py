@@ -93,6 +93,11 @@ def _ctrader_host_matches_environment(*, host: str, is_live: bool) -> bool:
     return True
 
 
+def _is_expected_ctrader_host_route_error(error_text: str) -> bool:
+    normalized = error_text.upper()
+    return "CANT_ROUTE_REQUEST" in normalized and "NO ENVIRONMENT CONNECTION" in normalized
+
+
 def _iter_alpaca_credentials(env: dict[str, str]) -> list[dict[str, Any]]:
     indexed: list[dict[str, Any]] = []
     indexes = sorted(
@@ -545,10 +550,7 @@ async def _discover_ctrader_accounts_on_host(
                     error_text = repr(exc)
                     # This is expected for accounts discovered on a broker environment that
                     # does not provide trader details through this route; keep discovery non-noisy.
-                    if (
-                        "CANT_ROUTE_REQUEST" in error_text
-                        and "No environment connection" in error_text
-                    ):
+                    if _is_expected_ctrader_host_route_error(error_text):
                         logger.debug(
                             "cTrader trader details unavailable on this host",
                             extra={
@@ -612,10 +614,17 @@ async def discover_ctrader_accounts(
                 access_token=access_token,
             )
         except Exception as exc:
-            logger.warning(
-                "cTrader account discovery failed on host",
-                extra={"data": {"host": host, "error": repr(exc)}},
-            )
+            error_text = repr(exc)
+            if _is_expected_ctrader_host_route_error(error_text):
+                logger.info(
+                    "cTrader account discovery unavailable on host; skipping environment-incompatible endpoint",
+                    extra={"data": {"host": host, "error": error_text}},
+                )
+            else:
+                logger.warning(
+                    "cTrader account discovery failed on host",
+                    extra={"data": {"host": host, "error": error_text}},
+                )
             continue
         for account in discovered:
             current_rank = source_rank_by_id.get(account.id, 1_000_000)

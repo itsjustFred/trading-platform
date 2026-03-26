@@ -96,3 +96,13 @@ def test_ctrader_host_matches_environment_filters_demo_and_live_hosts():
         host="live.ctraderapi.com",
         is_live=False,
     )
+
+
+def test_is_expected_ctrader_host_route_error_detects_environment_mismatch():
+    error_text = "RuntimeError('CANT_ROUTE_REQUEST: No environment connection')"
+    assert account_discovery._is_expected_ctrader_host_route_error(error_text)
+
+
+def test_is_expected_ctrader_host_route_error_ignores_unrelated_errors():
+    error_text = "RuntimeError('UNAUTHORIZED: invalid token')"
+    assert not account_discovery._is_expected_ctrader_host_route_error(error_text)

@@ -14,6 +14,7 @@ import json
 import logging
 import math
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -1634,6 +1635,9 @@ def _dolthub_pull():
     """Non-blocking dolt pull in all Dolthub repos. Logs warnings on failure."""
     if not _DOLTHUB_REPOS.is_dir():
         return
+    if shutil.which("dolt") is None:
+        app.logger.info("Skipping dolthub pull: optional 'dolt' binary not installed")
+        return
     for repo in ("stocks", "earnings", "options", "rates"):
         repo_path = _DOLTHUB_REPOS / repo
         if not (repo_path / ".dolt").is_dir():
@@ -1646,8 +1650,8 @@ def _dolthub_pull():
                 text=True,
                 timeout=30,
             )
-        except (subprocess.SubprocessError, OSError) as e:
-            app.logger.warning("dolt pull %s failed: %s", repo, e)
+        except (subprocess.SubprocessError, OSError) as exc:
+            app.logger.warning("dolt pull %s failed: %s", repo, exc)
 
 
 # ─── Backtest Run Endpoints ──────────────────────────────────────────────────

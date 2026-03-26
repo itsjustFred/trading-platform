@@ -14,7 +14,7 @@ class _DummyEngine:
     def validate_config(self, config):
         return []
 
-    def run(self, config, strategy_path: str):
+    def run(self, config, strategy_path: str, progress_callback=None):
         return BacktestResult(
             meta=BacktestMeta(
                 id="cli-demo",

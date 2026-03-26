@@ -3248,6 +3248,16 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
 
     def _runner_stage(message: str) -> tuple[float, str] | None:
         normalized = message.lower()
+        if normalized.startswith("progress:"):
+            payload = message.split(":", 2)
+            if len(payload) == 3:
+                try:
+                    percent = float(payload[1])
+                except ValueError:
+                    return None
+                progress_message = payload[2].strip() or "Running backtest..."
+                return (percent, progress_message)
+            return None
         if "auto-detected date range" in normalized:
             return (15.0, "Loading market data...")
         if "starting command:" in normalized:
@@ -3281,6 +3291,7 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
             timeframe,
             "--capital",
             str(capital),
+            "--progress-stdout",
         ]
         if start:
             cmd.extend(["--start", start])
@@ -3343,7 +3354,6 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
                     stream="task",
                     source="backtest",
                 )
-                report_stage(handle, percent=25.0, message=f"Running strategy {strategy_path.stem}...")
 
                 proc = subprocess.Popen(
                     cmd,

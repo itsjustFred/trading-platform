@@ -385,24 +385,35 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             )
         except Exception as exc:
             self._authenticated = False
-            message = str(exc).lower()
+            error_text = str(exc).strip() or exc.__class__.__name__
+            message = error_text.lower()
             if "token" in message or "auth" in message:
-                logger.error(
-                    "cTrader authentication failed (token expired or invalid credentials)",
+                logger.info(
+                    "cTrader authentication unavailable; verify token/credentials, daemon will retry",
                     extra={
                         "data": {
                             "account_id": self.ctid_trader_account_id,
-                            "error": str(exc),
+                            "error": error_text,
+                        }
+                    },
+                )
+            elif isinstance(exc, asyncio.TimeoutError) or "timeout" in message:
+                logger.info(
+                    "cTrader connect timeout; endpoint may be unreachable, daemon will retry",
+                    extra={
+                        "data": {
+                            "account_id": self.ctid_trader_account_id,
+                            "error": error_text,
                         }
                     },
                 )
             else:
-                logger.error(
-                    "cTrader connect/auth failed",
+                logger.info(
+                    "cTrader connect/auth unavailable; daemon will retry",
                     extra={
                         "data": {
                             "account_id": self.ctid_trader_account_id,
-                            "error": str(exc),
+                            "error": error_text,
                         }
                     },
                 )

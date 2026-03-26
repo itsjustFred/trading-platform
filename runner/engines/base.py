@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -31,6 +31,8 @@ VALID_RESOLUTIONS = (
     "1w",
     "tick",
 )
+
+ProgressCallback = Callable[[float, str], None]
 
 
 class BacktestConfig(BaseModel):
@@ -99,13 +101,19 @@ class EngineAdapter(ABC):
         ...
 
     @abstractmethod
-    def run(self, config: BacktestConfig, strategy_path: str) -> BacktestResult:
+    def run(
+        self,
+        config: BacktestConfig,
+        strategy_path: str,
+        progress_callback: ProgressCallback | None = None,
+    ) -> BacktestResult:
         """
         Execute a backtest and return the result in universal format.
 
         Args:
             config: Backtest parameters (symbols, dates, capital, etc.)
             strategy_path: Path to the strategy file/module
+            progress_callback: Optional callback receiving (percent, message)
 
         Returns:
             BacktestResult with trades, meta, and optional equity curve

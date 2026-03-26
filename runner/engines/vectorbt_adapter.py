@@ -23,7 +23,12 @@ from typing import Any
 
 import pandas as pd
 
-from runner.engines.base import BacktestConfig, EngineAdapter, resolve_strategy_parameters
+from runner.engines.base import (
+    BacktestConfig,
+    EngineAdapter,
+    ProgressCallback,
+    resolve_strategy_parameters,
+)
 from shared.constants import DATA_DIR
 from shared.models import BacktestMeta, BacktestResult, EquityPoint, IndicatorSeries, Trade, TradeExit
 
@@ -326,7 +331,12 @@ class VectorbtAdapter(EngineAdapter):
     def name(self) -> str:
         return "vectorbt"
 
-    def run(self, config: BacktestConfig, strategy_path: str) -> BacktestResult:
+    def run(
+        self,
+        config: BacktestConfig,
+        strategy_path: str,
+        progress_callback: ProgressCallback | None = None,
+    ) -> BacktestResult:
         strategy_mod = _load_strategy_module(strategy_path)
         if not hasattr(strategy_mod, "generate_signals"):
             raise ValueError(f"Strategy {strategy_path} must define generate_signals(df, params)")
