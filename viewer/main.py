@@ -74,7 +74,7 @@ from shared.database import (
     list_live_deployments_for_account,
     list_live_signal_executions_for_deployments,
     load_backtest_metadata_row,
-    load_backtest_equity_points,
+    load_backtest_equity_preview_points,
     load_live_account_stats_inputs,
     load_backtest_result,
     mark_background_tasks_interrupted,
@@ -904,6 +904,8 @@ _STRATEGIES_CACHE: dict[str, Any] = {"expires_at": 0.0, "payload": []}
 _STRATEGIES_CACHE_TTL_SECONDS = 60.0
 _BACKTEST_META_CACHE_LOCK = threading.RLock()
 _BACKTEST_META_CACHE: dict[str, dict[str, Any]] = {}
+_BACKTEST_EQUITY_PREVIEW_CACHE_LOCK = threading.RLock()
+_BACKTEST_EQUITY_PREVIEW_CACHE: dict[tuple[str, int], list[float]] = {}
 _TASK_STATUS_WEIGHTS: dict[str, float] = {
     "queued": 5.0,
     "starting": 10.0,
@@ -1011,7 +1013,9 @@ def _refresh_backtest_meta_cache() -> int:
     with _BACKTEST_META_CACHE_LOCK:
         _BACKTEST_META_CACHE.clear()
         _BACKTEST_META_CACHE.update(next_cache)
-        return len(_BACKTEST_META_CACHE)
+    with _BACKTEST_EQUITY_PREVIEW_CACHE_LOCK:
+        _BACKTEST_EQUITY_PREVIEW_CACHE.clear()
+    return len(next_cache)
 
 
 def _ensure_backtest_meta_cache() -> None:
@@ -1030,8 +1034,9 @@ def _upsert_backtest_meta_cache(backtest_id: str) -> None:
     with _BACKTEST_META_CACHE_LOCK:
         if row is None:
             _BACKTEST_META_CACHE.pop(normalized_id, None)
-            return
-        _BACKTEST_META_CACHE[normalized_id] = dict(row)
+        else:
+            _BACKTEST_META_CACHE[normalized_id] = dict(row)
+    _remove_backtest_equity_preview_cache(normalized_id)
 
 
 def _remove_backtest_meta_cache(backtest_id: str) -> None:
@@ -1040,12 +1045,66 @@ def _remove_backtest_meta_cache(backtest_id: str) -> None:
         return
     with _BACKTEST_META_CACHE_LOCK:
         _BACKTEST_META_CACHE.pop(normalized_id, None)
+    _remove_backtest_equity_preview_cache(normalized_id)
 
 
 def _snapshot_backtest_meta_cache() -> list[dict[str, Any]]:
     _ensure_backtest_meta_cache()
     with _BACKTEST_META_CACHE_LOCK:
         return [dict(item) for item in _BACKTEST_META_CACHE.values()]
+
+
+def _remove_backtest_equity_preview_cache(backtest_id: str) -> None:
+    normalized_id = str(backtest_id or "").strip()
+    if not normalized_id:
+        return
+    with _BACKTEST_EQUITY_PREVIEW_CACHE_LOCK:
+        stale_keys = [key for key in _BACKTEST_EQUITY_PREVIEW_CACHE if key[0] == normalized_id]
+        for key in stale_keys:
+            _BACKTEST_EQUITY_PREVIEW_CACHE.pop(key, None)
+
+
+def _cached_backtest_equity_preview(backtest_id: str, *, limit: int = 80) -> list[float]:
+    normalized_id = str(backtest_id or "").strip()
+    if not normalized_id:
+        return []
+
+    try:
+        normalized_limit = int(limit)
+    except (TypeError, ValueError):
+        normalized_limit = 80
+    normalized_limit = max(1, min(normalized_limit, 200))
+
+    cache_key = (normalized_id, normalized_limit)
+    with _BACKTEST_EQUITY_PREVIEW_CACHE_LOCK:
+        cached = _BACKTEST_EQUITY_PREVIEW_CACHE.get(cache_key)
+        if cached is not None:
+            return list(cached)
+
+    points = load_backtest_equity_preview_points(normalized_id, normalized_limit)
+    values: list[float] = []
+    for point in points:
+        try:
+            values.append(float(point.equity))
+        except (TypeError, ValueError):
+            continue
+
+    with _BACKTEST_EQUITY_PREVIEW_CACHE_LOCK:
+        _BACKTEST_EQUITY_PREVIEW_CACHE[cache_key] = list(values)
+    return values
+
+
+def _normalize_win_rate(value: Any) -> float | None:
+    if value is None:
+        return None
+    numeric = _safe_float(value, default=0.0)
+    if numeric > 1.0 and numeric <= 100.0:
+        numeric = numeric / 100.0
+    if numeric < 0.0:
+        return 0.0
+    if numeric > 1.0:
+        return 1.0
+    return numeric
 
 
 def _backtest_summary_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
@@ -1062,21 +1121,7 @@ def _backtest_summary_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
     max_drawdown_decimal = abs(_safe_float(meta.get("max_drawdown"), 0.0))
     trade_count = max(int(meta.get("trade_count", 0) or 0), 0)
     backtest_id = str(meta.get("id") or "").strip()
-
-    equity_mini: list[float] = []
-    if backtest_id:
-        try:
-            equity_points = load_backtest_equity_points(backtest_id)
-            values = [float(point.equity) for point in equity_points]
-            count = len(values)
-            if count <= 50:
-                equity_mini = values
-            elif count > 50:
-                step = count / 50
-                equity_mini = [values[int(index * step)] for index in range(50)]
-                equity_mini.append(values[-1])
-        except Exception as exc:
-            logger.warning("Could not build equity_mini for %s: %s", backtest_id, exc)
+    win_rate = _normalize_win_rate(meta.get("win_rate"))
 
     return {
         "id": backtest_id,
@@ -1102,7 +1147,29 @@ def _backtest_summary_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
         "net_profit_pct": round(total_return_decimal * 100.0, 2),
         "psr": round(psr, 4),
         "p_value": round(p_value, 6),
-        "equity_mini": equity_mini,
+        "win_rate": round(win_rate, 6) if win_rate is not None else None,
+        "equity_mini": [],
+    }
+
+
+def _backtest_all_item_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
+    win_rate = _normalize_win_rate(meta.get("win_rate"))
+    return {
+        "id": str(meta.get("id") or "").strip(),
+        "strategy_name": str(meta.get("strategy_name") or "unknown"),
+        "symbols": [str(item) for item in meta.get("symbols", []) if str(item).strip()],
+        "timeframe": str(meta.get("timeframe") or ""),
+        "total_return": _safe_float(meta.get("total_return"), 0.0),
+        "sharpe_ratio": _safe_float(meta.get("sharpe_ratio"), 0.0),
+        "psr": _safe_float(meta.get("psr"), 0.0),
+        "p_value": _safe_float(meta.get("p_value"), 1.0),
+        "cagr": _safe_float(meta.get("cagr"), 0.0),
+        "max_drawdown": abs(_safe_float(meta.get("max_drawdown"), 0.0)),
+        "trade_count": max(int(meta.get("trade_count", 0) or 0), 0),
+        "win_rate": win_rate,
+        "start_date": str(meta.get("start_date") or ""),
+        "end_date": str(meta.get("end_date") or ""),
+        "created_at": str(meta.get("created_at") or ""),
     }
 
 
@@ -2767,7 +2834,7 @@ async def list_backtests(
     p_value_max: float | None = Query(default=None),
     cagr_min: float | None = Query(default=None),
     cagr_max: float | None = Query(default=None),
-) -> BacktestsListResponse:
+    ) -> BacktestsListResponse:
     normalized_sort = _normalize_backtest_sort(sort)
     normalized_order = _normalize_order(order, default="desc")
     sorted_items = _backtest_meta_list_sorted(normalized_sort, normalized_order)
@@ -2794,6 +2861,19 @@ async def list_backtests(
         sort=normalized_sort,
         order=normalized_order,
     )
+
+
+@app.get("/api/backtests/all", response_model=list[dict[str, Any]])
+async def list_backtests_all() -> list[dict[str, Any]]:
+    items = _snapshot_backtest_meta_cache()
+    items.sort(
+        key=lambda item: (
+            str(item.get("created_at") or ""),
+            str(item.get("id") or ""),
+        ),
+        reverse=True,
+    )
+    return [_backtest_all_item_from_meta(item) for item in items]
 
 
 @app.get("/api/backtests/duplicates", response_model=BacktestsDuplicatesResponse)
@@ -2965,6 +3045,23 @@ async def get_equity_curve(backtest_id: str) -> list[dict[str, float]]:
     if result is None:
         raise HTTPException(status_code=404, detail="Not found")
     return legacy_viewer._equity_to_viewer(result)
+
+
+@app.get("/api/backtests/{backtest_id}/equity-preview", response_model=list[float])
+async def get_backtest_equity_preview(
+    backtest_id: str,
+    limit: int = Query(default=80, ge=50, le=100),
+) -> list[float]:
+    normalized_id = str(backtest_id or "").strip()
+    if not normalized_id:
+        raise HTTPException(status_code=400, detail="Backtest id is required")
+
+    _ensure_backtest_meta_cache()
+    with _BACKTEST_META_CACHE_LOCK:
+        exists = normalized_id in _BACKTEST_META_CACHE
+    if not exists:
+        raise HTTPException(status_code=404, detail=f"Backtest '{normalized_id}' not found")
+    return _cached_backtest_equity_preview(normalized_id, limit=limit)
 
 
 @app.get("/api/backtest/{backtest_id}/capm", response_model=CapmResponse)

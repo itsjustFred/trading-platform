@@ -37,6 +37,7 @@ import type {
   BacktestsDeduplicateResponse,
   BacktestsBulkDeleteResponse,
   BacktestsDuplicatesResponse,
+  BacktestMetadataItem,
   BacktestsListResponse,
   BacktestsQueryParams,
   BacktestReplayResponse,
@@ -144,6 +145,12 @@ export const getBacktests = (params?: BacktestsQueryParams) => {
   const queryString = query.toString();
   return fetchJSON<BacktestsListResponse>(`/backtests${queryString ? `?${queryString}` : ""}`);
 };
+export const getBacktestsAll = () =>
+  fetchJSON<BacktestMetadataItem[]>("/backtests/all");
+export const getBacktestEquityPreview = (id: string, limit = 80) =>
+  fetchJSON<number[]>(
+    `/backtests/${encodeURIComponent(id)}/equity-preview?limit=${Math.max(50, Math.min(100, limit))}`,
+  );
 export const getBacktestInfo = (id: string) =>
   fetchJSON<BacktestInfo>(`/backtest/${id}/info`);
 export const getBacktestStats = (id: string) =>

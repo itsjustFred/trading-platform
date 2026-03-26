@@ -1,426 +1,474 @@
-import { useEffect, useMemo, useState, type CSSProperties, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { ChevronDown, ChevronUp, GitCompare, Plus, RefreshCw, Trash2, X } from "lucide-react";
+import { ArrowUpDown, Plus, RefreshCw, Trash2, X } from "lucide-react";
+
 import {
   deduplicateBacktests,
   deleteBacktestsBulk,
-  getBacktests,
+  getBacktestsAll,
   getBacktestDuplicates,
-  getStrategies,
-  getSymbols,
+  getBacktestEquityPreview,
 } from "../api/client";
-import type {
-  BacktestListItem,
-  BacktestsQueryParams,
-  BacktestsSortField,
-} from "../api/types";
-import { useToast } from "../components/ToastProvider";
-import { CreateBacktestModal } from "../components/CreateBacktestModal";
-import { RangeFilterControl, type RangeValue } from "../components/RangeFilterControl";
+import type { BacktestMetadataItem } from "../api/types";
 import { MultiSelectDropdown } from "../components/MultiSelectDropdown";
+import { CreateBacktestModal } from "../components/CreateBacktestModal";
+import { Sparkline } from "../components/Sparkline";
+import { useToast } from "../components/ToastProvider";
 
-type SortOrder = "asc" | "desc" | null;
+type SortField =
+  | "created_at"
+  | "total_return"
+  | "sharpe_ratio"
+  | "psr"
+  | "p_value"
+  | "cagr"
+  | "max_drawdown"
+  | "win_rate"
+  | "trade_count";
+type SortOrder = "asc" | "desc";
 
-const DEFAULT_TIMEFRAMES = ["tick", "1s", "1m", "5m", "15m", "30m", "1h", "4h", "1d"];
+interface RangeFilters {
+  totalReturnMin: string;
+  totalReturnMax: string;
+  sharpeMin: string;
+  sharpeMax: string;
+  psrMin: string;
+  psrMax: string;
+  pValueMin: string;
+  pValueMax: string;
+  cagrMin: string;
+  cagrMax: string;
+  maxDrawdownMin: string;
+  maxDrawdownMax: string;
+  winRateMin: string;
+  winRateMax: string;
+  tradesMin: string;
+  tradesMax: string;
+}
 
 const NUMERIC_FONT = '"SFMono-Regular", "Cascadia Code", "Roboto Mono", ui-monospace, monospace';
+const DEFAULT_PER_PAGE = 20;
 
-const DEFAULT_RANGES = {
-  sharpe: { min: -2, max: 5 },
-  psr: { min: 0, max: 1 },
-  pValue: { min: 0, max: 1 },
-  cagr: { min: -100, max: 300 },
-  maxDrawdown: { min: 0, max: 100 },
-};
+const SORT_OPTIONS: Array<{ value: SortField; label: string }> = [
+  { value: "created_at", label: "Created (newest)" },
+  { value: "total_return", label: "Total Return" },
+  { value: "sharpe_ratio", label: "Sharpe" },
+  { value: "psr", label: "PSR" },
+  { value: "p_value", label: "p-Value" },
+  { value: "cagr", label: "CAGR" },
+  { value: "max_drawdown", label: "Max Drawdown" },
+  { value: "win_rate", label: "Win Rate" },
+  { value: "trade_count", label: "Trades" },
+];
 
-type RangeKey = keyof typeof DEFAULT_RANGES;
+let backtestsAllCache: BacktestMetadataItem[] | null = null;
+let backtestsAllPromise: Promise<BacktestMetadataItem[]> | null = null;
 
-function formatPct(value: number | null | undefined): string {
-  if (value == null || Number.isNaN(value)) return "—";
+function cloneMetadataRows(rows: BacktestMetadataItem[]): BacktestMetadataItem[] {
+  return rows.map((row) => ({
+    ...row,
+    symbols: Array.isArray(row.symbols) ? [...row.symbols] : [],
+  }));
+}
+
+async function loadBacktestsAllCached(force = false): Promise<BacktestMetadataItem[]> {
+  if (force) {
+    backtestsAllCache = null;
+    backtestsAllPromise = null;
+  }
+  if (backtestsAllCache) {
+    return cloneMetadataRows(backtestsAllCache);
+  }
+  if (!backtestsAllPromise) {
+    backtestsAllPromise = getBacktestsAll()
+      .then((rows) => {
+        backtestsAllCache = cloneMetadataRows(rows ?? []);
+        return cloneMetadataRows(backtestsAllCache);
+      })
+      .finally(() => {
+        backtestsAllPromise = null;
+      });
+  }
+  return backtestsAllPromise;
+}
+
+function parseOptionalNumber(value: string): number | null {
+  const normalized = value.trim();
+  if (!normalized) return null;
+  const numeric = Number(normalized);
+  return Number.isFinite(numeric) ? numeric : null;
+}
+
+function normalizeWinRate(value: number | null): number | null {
+  if (value == null || !Number.isFinite(value)) return null;
+  if (value > 1 && value <= 100) return value / 100;
+  if (value < 0) return 0;
+  if (value > 1) return 1;
+  return value;
+}
+
+function percentage(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(value)) return "N/A";
   return `${value >= 0 ? "+" : ""}${value.toFixed(2)}%`;
 }
 
-function formatNum(value: number | null | undefined, digits = 2): string {
-  if (value == null || Number.isNaN(value)) return "—";
+function formatNumber(value: number | null | undefined, digits = 3): string {
+  if (value == null || !Number.isFinite(value)) return "N/A";
   return value.toFixed(digits);
 }
 
-function parseIsoToDate(value: string | undefined): string {
-  if (!value) return "—";
-  const parsed = new Date(value);
-  if (Number.isNaN(parsed.getTime())) return value;
-  return parsed.toLocaleString();
+function pValueLabel(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(value)) return "N/A";
+  return value.toFixed(4);
 }
 
-function sortParamFor(column: BacktestsSortField, order: SortOrder): BacktestsQueryParams {
-  if (!order) {
-    return {};
-  }
-  return { sort: column, order };
-}
-
-function normalizeSharpe(backtest: BacktestListItem): number | null {
-  const value = backtest.sharpe_ratio ?? backtest.sharpe;
-  return value == null || !Number.isFinite(value) ? null : Number(value);
-}
-
-function normalizePsr(backtest: BacktestListItem): number | null {
-  const value = backtest.psr;
-  return value == null || !Number.isFinite(value) ? null : Number(value);
-}
-
-function normalizePValue(backtest: BacktestListItem): number | null {
-  const value = backtest.p_value;
-  return value == null || !Number.isFinite(value) ? null : Number(value);
-}
-
-function normalizeCagr(backtest: BacktestListItem): number | null {
-  const value = backtest.cagr;
-  return value == null || !Number.isFinite(value) ? null : Number(value);
-}
-
-function normalizeMaxDrawdown(backtest: BacktestListItem): number | null {
-  const value = backtest.max_drawdown_pct;
-  return value == null || !Number.isFinite(value) ? null : Math.abs(Number(value));
-}
-
-function percentageColor(value: number | null | undefined): string {
-  if (value == null || Number.isNaN(value)) return "var(--color-text-muted)";
+function statColorPositive(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(value)) return "var(--color-text-muted)";
   return value >= 0 ? "#3fb950" : "#f85149";
 }
 
-function sharpeColor(value: number | null): string {
-  if (value == null) return "var(--color-text-muted)";
+function sharpeColor(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(value)) return "var(--color-text-muted)";
   if (value >= 1) return "#3fb950";
   if (value >= 0) return "#d4b263";
   return "#f85149";
 }
 
-function psrColor(value: number | null): string {
-  if (value == null) return "var(--color-text-muted)";
+function psrColor(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(value)) return "var(--color-text-muted)";
   if (value >= 0.95) return "#3fb950";
   if (value >= 0.5) return "#d4b263";
   return "#f85149";
 }
 
-function pValueColor(value: number | null): string {
-  if (value == null) return "var(--color-text-muted)";
+function pValueColor(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(value)) return "var(--color-text-muted)";
   return value <= 0.05 ? "#3fb950" : "#f85149";
 }
 
+function buildPageNumbers(currentPage: number, totalPages: number): Array<number | "..."> {
+  if (totalPages <= 7) return Array.from({ length: totalPages }, (_, index) => index + 1);
+  const values = new Set<number>([1, totalPages, currentPage - 1, currentPage, currentPage + 1]);
+  const pages = [...values].filter((entry) => entry >= 1 && entry <= totalPages).sort((a, b) => a - b);
+  const output: Array<number | "..."> = [];
+  pages.forEach((value, index) => {
+    const previous = pages[index - 1];
+    if (index > 0 && value - previous > 1) {
+      output.push("...");
+    }
+    output.push(value);
+  });
+  return output;
+}
+
+function rangePasses(value: number, min: number | null, max: number | null): boolean {
+  if (min != null && value < min) return false;
+  if (max != null && value > max) return false;
+  return true;
+}
+
 function toErrorMessage(error: unknown, fallback: string): string {
-  if (error instanceof Error && error.message.trim()) {
-    return error.message;
-  }
-  if (typeof error === "string" && error.trim()) {
-    return error;
-  }
+  if (error instanceof Error && error.message.trim()) return error.message;
+  if (typeof error === "string" && error.trim()) return error;
   return fallback;
 }
 
-interface ScreenerFilters {
-  strategies: string[];
-  symbols: string[];
-  symbolSearch: string;
-  timeframes: string[];
-  sharpe: RangeValue;
-  psr: RangeValue;
-  pValue: RangeValue;
-  cagr: RangeValue;
-  maxDrawdown: RangeValue;
-}
-
-function cloneInitialFilters(): ScreenerFilters {
+function initialRanges(): RangeFilters {
   return {
-    strategies: [],
-    symbols: [],
-    symbolSearch: "",
-    timeframes: [],
-    sharpe: { ...DEFAULT_RANGES.sharpe },
-    psr: { ...DEFAULT_RANGES.psr },
-    pValue: { ...DEFAULT_RANGES.pValue },
-    cagr: { ...DEFAULT_RANGES.cagr },
-    maxDrawdown: { ...DEFAULT_RANGES.maxDrawdown },
+    totalReturnMin: "",
+    totalReturnMax: "",
+    sharpeMin: "",
+    sharpeMax: "",
+    psrMin: "",
+    psrMax: "",
+    pValueMin: "",
+    pValueMax: "",
+    cagrMin: "",
+    cagrMax: "",
+    maxDrawdownMin: "",
+    maxDrawdownMax: "",
+    winRateMin: "",
+    winRateMax: "",
+    tradesMin: "",
+    tradesMax: "",
   };
-}
-
-function isRangeActive<K extends RangeKey>(key: K, range: RangeValue): boolean {
-  const baseline = DEFAULT_RANGES[key];
-  return range.min !== baseline.min || range.max !== baseline.max;
 }
 
 export function BacktestsPage() {
   const navigate = useNavigate();
   const { showToast } = useToast();
+  const previewRequestsRef = useRef<Set<string>>(new Set());
 
-  const [backtests, setBacktests] = useState<BacktestListItem[]>([]);
-  const [totalBacktests, setTotalBacktests] = useState(0);
-  const [page, setPage] = useState(1);
-  const [perPage, setPerPage] = useState(25);
+  const [items, setItems] = useState<BacktestMetadataItem[]>([]);
   const [loading, setLoading] = useState(false);
-  const [selected, setSelected] = useState<Set<string>>(new Set());
   const [deduplicating, setDeduplicating] = useState(false);
   const [showCreateModal, setShowCreateModal] = useState(false);
-  const [allStrategies, setAllStrategies] = useState<string[]>([]);
-  const [allSymbols, setAllSymbols] = useState<string[]>([]);
-  const [filters, setFilters] = useState<ScreenerFilters>(() => cloneInitialFilters());
-  const [sortColumn, setSortColumn] = useState<BacktestsSortField>("created_at");
+  const [search, setSearch] = useState("");
+  const [strategies, setStrategies] = useState<string[]>([]);
+  const [selectedStrategies, setSelectedStrategies] = useState<string[]>([]);
+  const [selectedSymbols, setSelectedSymbols] = useState<string[]>([]);
+  const [selectedTimeframes, setSelectedTimeframes] = useState<string[]>([]);
+  const [symbolDraft, setSymbolDraft] = useState("");
+  const [ranges, setRanges] = useState<RangeFilters>(() => initialRanges());
+  const [sortField, setSortField] = useState<SortField>("created_at");
   const [sortOrder, setSortOrder] = useState<SortOrder>("desc");
-  const [debouncedFilters, setDebouncedFilters] = useState<ScreenerFilters>(() => cloneInitialFilters());
+  const [page, setPage] = useState(1);
+  const [perPage, setPerPage] = useState(DEFAULT_PER_PAGE);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [equityPreviews, setEquityPreviews] = useState<Record<string, number[]>>({});
+
+  const allSymbols = useMemo(
+    () =>
+      [...new Set(items.flatMap((item) => item.symbols ?? []).filter(Boolean))]
+        .sort((a, b) => a.localeCompare(b)),
+    [items],
+  );
+
+  const allTimeframes = useMemo(
+    () => [...new Set(items.map((item) => item.timeframe).filter(Boolean))].sort((a, b) => a.localeCompare(b)),
+    [items],
+  );
 
   useEffect(() => {
-    const handle = window.setTimeout(() => {
-      setDebouncedFilters(filters);
-      setPage(1);
-    }, 300);
-    return () => window.clearTimeout(handle);
-  }, [filters]);
+    setStrategies(
+      [...new Set(items.map((item) => item.strategy_name).filter(Boolean))].sort((a, b) => a.localeCompare(b)),
+    );
+  }, [items]);
 
-  useEffect(() => {
-    let active = true;
-    Promise.allSettled([getStrategies(), getSymbols()]).then((results) => {
-      if (!active) return;
-
-      const strategiesResult = results[0];
-      if (strategiesResult.status === "fulfilled") {
-        const names = strategiesResult.value
-          .flatMap((entry) => [entry.name, entry.slug])
-          .filter((value): value is string => Boolean(value?.trim()));
-        setAllStrategies([...new Set(names)].sort((a, b) => a.localeCompare(b)));
-      }
-
-      const symbolsResult = results[1];
-      if (symbolsResult.status === "fulfilled") {
-        const symbols = [
-          ...(symbolsResult.value.symbols ?? []),
-          ...Object.values(symbolsResult.value.categories ?? {}).flatMap((entries) => entries),
-        ].filter((value): value is string => Boolean(value?.trim()));
-        setAllSymbols([...new Set(symbols)].sort((a, b) => a.localeCompare(b)));
-      }
-    });
-
-    return () => {
-      active = false;
-    };
-  }, []);
-
-  const buildQueryParams = useMemo<BacktestsQueryParams>(() => {
-    const params: BacktestsQueryParams = {
-      page,
-      per_page: perPage,
-      ...sortParamFor(sortColumn, sortOrder),
-    };
-
-    if (isRangeActive("sharpe", debouncedFilters.sharpe)) {
-      params.sharpe_min = debouncedFilters.sharpe.min;
-      params.sharpe_max = debouncedFilters.sharpe.max;
-    }
-    if (isRangeActive("psr", debouncedFilters.psr)) {
-      params.psr_min = debouncedFilters.psr.min;
-      params.psr_max = debouncedFilters.psr.max;
-    }
-    if (isRangeActive("pValue", debouncedFilters.pValue)) {
-      params.p_value_min = debouncedFilters.pValue.min;
-      params.p_value_max = debouncedFilters.pValue.max;
-    }
-    if (isRangeActive("cagr", debouncedFilters.cagr)) {
-      params.cagr_min = debouncedFilters.cagr.min;
-      params.cagr_max = debouncedFilters.cagr.max;
-    }
-    if (isRangeActive("maxDrawdown", debouncedFilters.maxDrawdown)) {
-      params.max_drawdown_min = debouncedFilters.maxDrawdown.min;
-      params.max_drawdown_max = debouncedFilters.maxDrawdown.max;
-    }
-    if (debouncedFilters.strategies.length > 0) {
-      params.strategy = debouncedFilters.strategies.join(",");
-    }
-    if (debouncedFilters.symbols.length > 0) {
-      params.symbol = debouncedFilters.symbols.join(",");
-    }
-    if (debouncedFilters.timeframes.length > 0) {
-      params.timeframe = debouncedFilters.timeframes.join(",");
-    }
-    if (debouncedFilters.symbolSearch.trim()) {
-      params.search = debouncedFilters.symbolSearch.trim();
-    }
-    return params;
-  }, [debouncedFilters, page, perPage, sortColumn, sortOrder]);
-
-  useEffect(() => {
-    let active = true;
-    setLoading(true);
-    getBacktests(buildQueryParams)
-      .then((payload) => {
-        if (!active) return;
-        setBacktests(payload.items ?? []);
-        setTotalBacktests(payload.total ?? 0);
-        setSelected((current) => {
-          if (current.size === 0) return current;
-          const validIds = new Set((payload.items ?? []).map((item) => item.id));
-          const next = new Set<string>();
-          current.forEach((id) => {
-            if (validIds.has(id)) next.add(id);
-          });
-          return next;
-        });
-      })
-      .catch((error: Error) => {
-        if (!active) return;
-        showToast(error.message || "Failed to load backtests.", "error");
-      })
-      .finally(() => {
-        if (!active) return;
+  const loadAllMetadata = useCallback(
+    async (force = false) => {
+      setLoading(true);
+      try {
+        const payload = await loadBacktestsAllCached(force);
+        setItems(payload ?? []);
+        setSelectedIds(new Set());
+        if (force) {
+          setEquityPreviews({});
+        }
+      } catch (error: unknown) {
+        showToast(toErrorMessage(error, "Failed to load backtests metadata."), "error");
+      } finally {
         setLoading(false);
-      });
+      }
+    },
+    [showToast],
+  );
 
-    return () => {
-      active = false;
-    };
-  }, [buildQueryParams, showToast]);
+  useEffect(() => {
+    void loadAllMetadata(false);
+  }, [loadAllMetadata]);
 
-  const clientFiltered = useMemo(() => {
-    const symbolNeedles = debouncedFilters.symbols.map((symbol) => symbol.toUpperCase());
-    const quickSearch = debouncedFilters.symbolSearch.trim().toUpperCase();
+  const parsedRanges = useMemo(
+    () => ({
+      totalReturnMin: parseOptionalNumber(ranges.totalReturnMin),
+      totalReturnMax: parseOptionalNumber(ranges.totalReturnMax),
+      sharpeMin: parseOptionalNumber(ranges.sharpeMin),
+      sharpeMax: parseOptionalNumber(ranges.sharpeMax),
+      psrMin: parseOptionalNumber(ranges.psrMin),
+      psrMax: parseOptionalNumber(ranges.psrMax),
+      pValueMin: parseOptionalNumber(ranges.pValueMin),
+      pValueMax: parseOptionalNumber(ranges.pValueMax),
+      cagrMin: parseOptionalNumber(ranges.cagrMin),
+      cagrMax: parseOptionalNumber(ranges.cagrMax),
+      maxDrawdownMin: parseOptionalNumber(ranges.maxDrawdownMin),
+      maxDrawdownMax: parseOptionalNumber(ranges.maxDrawdownMax),
+      winRateMin: parseOptionalNumber(ranges.winRateMin),
+      winRateMax: parseOptionalNumber(ranges.winRateMax),
+      tradesMin: parseOptionalNumber(ranges.tradesMin),
+      tradesMax: parseOptionalNumber(ranges.tradesMax),
+    }),
+    [ranges],
+  );
 
-    return backtests.filter((item) => {
-      if (
-        debouncedFilters.strategies.length > 0 &&
-        !debouncedFilters.strategies.includes(item.strategy)
-      ) {
+  const filteredSorted = useMemo(() => {
+    const needle = search.trim().toLowerCase();
+    const output = items.filter((item) => {
+      if (selectedStrategies.length > 0 && !selectedStrategies.includes(item.strategy_name)) {
         return false;
       }
-
-      if (debouncedFilters.timeframes.length > 0) {
-        const tf = item.timeframes?.[0] ?? "";
-        if (!debouncedFilters.timeframes.includes(tf)) {
+      if (selectedTimeframes.length > 0 && !selectedTimeframes.includes(item.timeframe)) {
+        return false;
+      }
+      if (selectedSymbols.length > 0) {
+        const symbolSet = new Set((item.symbols ?? []).map((entry) => entry.toUpperCase()));
+        if (!selectedSymbols.every((entry) => symbolSet.has(entry.toUpperCase()))) {
           return false;
         }
       }
-
-      if (symbolNeedles.length > 0) {
-        const symbols = (item.symbols ?? []).map((symbol) => symbol.toUpperCase());
-        if (!symbolNeedles.every((needle) => symbols.includes(needle))) {
-          return false;
-        }
+      if (needle) {
+        const haystack = `${item.id} ${item.strategy_name} ${(item.symbols ?? []).join(" ")} ${item.timeframe}`.toLowerCase();
+        if (!haystack.includes(needle)) return false;
       }
 
-      if (quickSearch) {
-        const haystack = `${item.strategy} ${(item.symbols ?? []).join(" ")} ${item.id}`.toUpperCase();
-        if (!haystack.includes(quickSearch)) {
-          return false;
-        }
-      }
+      const totalReturnPct = (item.total_return ?? 0) * 100;
+      const sharpe = item.sharpe_ratio ?? 0;
+      const psr = item.psr ?? 0;
+      const pValue = item.p_value ?? 1;
+      const cagrPct = (item.cagr ?? 0) * 100;
+      const maxDrawdownPct = Math.abs((item.max_drawdown ?? 0) * 100);
+      const winRatePct = (normalizeWinRate(item.win_rate) ?? 0) * 100;
+      const trades = item.trade_count ?? 0;
 
-      const maxDrawdown = normalizeMaxDrawdown(item);
-      if (isRangeActive("maxDrawdown", debouncedFilters.maxDrawdown) && maxDrawdown != null) {
-        if (
-          maxDrawdown < debouncedFilters.maxDrawdown.min ||
-          maxDrawdown > debouncedFilters.maxDrawdown.max
-        ) {
-          return false;
-        }
-      }
-      return true;
+      return (
+        rangePasses(totalReturnPct, parsedRanges.totalReturnMin, parsedRanges.totalReturnMax) &&
+        rangePasses(sharpe, parsedRanges.sharpeMin, parsedRanges.sharpeMax) &&
+        rangePasses(psr, parsedRanges.psrMin, parsedRanges.psrMax) &&
+        rangePasses(pValue, parsedRanges.pValueMin, parsedRanges.pValueMax) &&
+        rangePasses(cagrPct, parsedRanges.cagrMin, parsedRanges.cagrMax) &&
+        rangePasses(maxDrawdownPct, parsedRanges.maxDrawdownMin, parsedRanges.maxDrawdownMax) &&
+        rangePasses(winRatePct, parsedRanges.winRateMin, parsedRanges.winRateMax) &&
+        rangePasses(trades, parsedRanges.tradesMin, parsedRanges.tradesMax)
+      );
     });
-  }, [backtests, debouncedFilters]);
 
-  const strategyOptions = useMemo(() => {
-    const fromRows = backtests.map((item) => item.strategy).filter(Boolean);
-    return [...new Set([...allStrategies, ...fromRows])]
-      .sort((a, b) => a.localeCompare(b))
-      .map((value) => ({ label: value, value }));
-  }, [allStrategies, backtests]);
+    output.sort((left, right) => {
+      const direction = sortOrder === "asc" ? 1 : -1;
+      if (sortField === "created_at") {
+        const leftTime = Date.parse(left.created_at || "") || 0;
+        const rightTime = Date.parse(right.created_at || "") || 0;
+        if (leftTime === rightTime) return left.id.localeCompare(right.id) * direction;
+        return (leftTime - rightTime) * direction;
+      }
+      if (sortField === "win_rate") {
+        const leftWin = normalizeWinRate(left.win_rate) ?? -1;
+        const rightWin = normalizeWinRate(right.win_rate) ?? -1;
+        if (leftWin === rightWin) return left.id.localeCompare(right.id) * direction;
+        return (leftWin - rightWin) * direction;
+      }
+      const leftValue = Number(left[sortField] ?? 0);
+      const rightValue = Number(right[sortField] ?? 0);
+      if (leftValue === rightValue) return left.id.localeCompare(right.id) * direction;
+      return (leftValue - rightValue) * direction;
+    });
+    return output;
+  }, [
+    items,
+    search,
+    parsedRanges,
+    selectedStrategies,
+    selectedSymbols,
+    selectedTimeframes,
+    sortField,
+    sortOrder,
+  ]);
 
-  const symbolOptions = useMemo(() => {
-    const fromRows = backtests.flatMap((item) => item.symbols ?? []).filter(Boolean);
-    return [...new Set([...allSymbols, ...fromRows])]
-      .sort((a, b) => a.localeCompare(b))
-      .map((value) => ({ label: value, value }));
-  }, [allSymbols, backtests]);
-
-  const timeframeOptions = useMemo(() => {
-    const fromData = new Set(backtests.flatMap((item) => item.timeframes ?? []).filter(Boolean));
-    DEFAULT_TIMEFRAMES.forEach((timeframe) => fromData.add(timeframe));
-    return [...fromData].map((value) => ({ label: value, value }));
-  }, [backtests]);
-
-  const totalPages = Math.max(1, Math.ceil(totalBacktests / perPage));
-
+  const totalPages = Math.max(1, Math.ceil(filteredSorted.length / perPage));
   useEffect(() => {
     if (page > totalPages) {
       setPage(totalPages);
     }
   }, [page, totalPages]);
 
-  const allVisibleSelected =
-    clientFiltered.length > 0 && clientFiltered.every((item) => selected.has(item.id));
+  const currentPageItems = useMemo(() => {
+    const start = (page - 1) * perPage;
+    return filteredSorted.slice(start, start + perPage);
+  }, [filteredSorted, page, perPage]);
 
-  const toggleSelect = (id: string) => {
-    setSelected((current) => {
+  useEffect(() => {
+    const missing = currentPageItems
+      .map((item) => item.id)
+      .filter((id) => equityPreviews[id] == null && !previewRequestsRef.current.has(id));
+    if (missing.length === 0) return;
+
+    let cancelled = false;
+    missing.forEach((id) => previewRequestsRef.current.add(id));
+
+    const fetchPreviews = async () => {
+      const updates: Record<string, number[]> = {};
+      await Promise.all(
+        missing.map(async (id) => {
+          try {
+            updates[id] = await getBacktestEquityPreview(id, 80);
+          } catch {
+            updates[id] = [];
+          } finally {
+            previewRequestsRef.current.delete(id);
+          }
+        }),
+      );
+      if (!cancelled) {
+        setEquityPreviews((current) => ({ ...current, ...updates }));
+      }
+    };
+    void fetchPreviews();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [currentPageItems, equityPreviews]);
+
+  useEffect(() => {
+    const valid = new Set(filteredSorted.map((item) => item.id));
+    setSelectedIds((current) => {
+      if (current.size === 0) return current;
+      const next = new Set<string>();
+      current.forEach((id) => {
+        if (valid.has(id)) next.add(id);
+      });
+      return next.size === current.size ? current : next;
+    });
+  }, [filteredSorted]);
+
+  const selectedCount = selectedIds.size;
+  const allOnPageSelected =
+    currentPageItems.length > 0 && currentPageItems.every((item) => selectedIds.has(item.id));
+
+  const toggleSelected = (id: string) => {
+    setSelectedIds((current) => {
       const next = new Set(current);
-      if (next.has(id)) {
-        next.delete(id);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const toggleSelectedOnPage = () => {
+    setSelectedIds((current) => {
+      const next = new Set(current);
+      if (allOnPageSelected) {
+        currentPageItems.forEach((item) => next.delete(item.id));
       } else {
-        next.add(id);
+        currentPageItems.forEach((item) => next.add(item.id));
       }
       return next;
     });
-  };
-
-  const toggleSelectAllVisible = () => {
-    setSelected((current) => {
-      if (allVisibleSelected) {
-        const next = new Set(current);
-        clientFiltered.forEach((item) => next.delete(item.id));
-        return next;
-      }
-      const next = new Set(current);
-      clientFiltered.forEach((item) => next.add(item.id));
-      return next;
-    });
-  };
-
-  const cycleSort = (column: BacktestsSortField) => {
-    if (sortColumn !== column) {
-      setSortColumn(column);
-      setSortOrder("asc");
-      return;
-    }
-    if (sortOrder === "asc") {
-      setSortOrder("desc");
-      return;
-    }
-    if (sortOrder === "desc") {
-      setSortOrder(null);
-      return;
-    }
-    setSortOrder("asc");
   };
 
   const resetFilters = () => {
-    const next = cloneInitialFilters();
-    setFilters(next);
-    setDebouncedFilters(next);
-    setPage(1);
-    setSortColumn("created_at");
+    setSearch("");
+    setSelectedStrategies([]);
+    setSelectedSymbols([]);
+    setSelectedTimeframes([]);
+    setRanges(initialRanges());
+    setSortField("created_at");
     setSortOrder("desc");
-    setSelected(new Set());
+    setPage(1);
   };
 
-  const selectedIds = useMemo(() => [...selected], [selected]);
+  const addDraftSymbol = () => {
+    const normalized = symbolDraft.trim().toUpperCase();
+    if (!normalized) return;
+    if (!allSymbols.some((entry) => entry.toUpperCase() === normalized)) return;
+    setSelectedSymbols((current) => (current.includes(normalized) ? current : [...current, normalized]));
+    setSymbolDraft("");
+    setPage(1);
+  };
+
+  const removeSelectedSymbol = (value: string) => {
+    setSelectedSymbols((current) => current.filter((entry) => entry !== value));
+    setPage(1);
+  };
 
   const handleBulkDelete = async () => {
-    if (selectedIds.length === 0) return;
-    const confirmed = window.confirm(`Delete ${selectedIds.length} selected backtests?`);
+    if (selectedCount === 0) return;
+    const ids = [...selectedIds];
+    const confirmed = window.confirm(`Delete ${ids.length} selected backtests?`);
     if (!confirmed) return;
 
     try {
-      const result = await deleteBacktestsBulk(selectedIds);
-      showToast(`Deleted ${result.deleted} backtest(s).`, "success");
-      setSelected(new Set());
-      const refreshed = await getBacktests(buildQueryParams);
-      setBacktests(refreshed.items ?? []);
-      setTotalBacktests(refreshed.total ?? 0);
+      const payload = await deleteBacktestsBulk(ids);
+      showToast(`Deleted ${payload.deleted} backtest(s).`, "success");
+      await loadAllMetadata(true);
     } catch (error: unknown) {
       showToast(toErrorMessage(error, "Bulk delete failed."), "error");
     }
@@ -434,461 +482,508 @@ export function BacktestsPage() {
         showToast("No duplicate backtests found.", "info");
         return;
       }
-
       const confirmed = window.confirm(
-        `Found ${duplicates.total_groups} duplicate groups. Remove older duplicates and keep newest runs?`,
+        `Found ${duplicates.total_groups} duplicate groups. Remove older duplicates and keep newest?`,
       );
       if (!confirmed) return;
-
       const result = await deduplicateBacktests();
       showToast(
         `Removed ${result.deleted_ids.length} duplicate backtests across ${result.groups_affected} groups.`,
         "success",
       );
-      setSelected(new Set());
-      const refreshed = await getBacktests(buildQueryParams);
-      setBacktests(refreshed.items ?? []);
-      setTotalBacktests(refreshed.total ?? 0);
+      await loadAllMetadata(true);
     } catch (error: unknown) {
-      showToast(toErrorMessage(error, "Failed to remove duplicates."), "error");
+      showToast(toErrorMessage(error, "Deduplication failed."), "error");
     } finally {
       setDeduplicating(false);
     }
   };
 
-  const thStyle: CSSProperties = {
-    position: "sticky",
-    top: 0,
-    zIndex: 2,
-    background: "#141b2b",
-    color: "var(--color-text-muted)",
-    fontSize: "0.72rem",
-    fontWeight: 600,
-    letterSpacing: "0.04em",
-    textTransform: "uppercase",
-    padding: "10px 8px",
-    borderBottom: "1px solid rgba(148, 163, 184, 0.26)",
-    whiteSpace: "nowrap",
-  };
-
-  const tdStyle: CSSProperties = {
-    padding: "8px 8px",
-    borderBottom: "1px solid rgba(148, 163, 184, 0.14)",
-    fontSize: "0.75rem",
-    color: "var(--color-text)",
-    whiteSpace: "nowrap",
-  };
-
   return (
-    <div style={{ padding: "20px 22px 80px", background: "#131722", minHeight: "100%" }}>
+    <div style={{ padding: "20px 22px 80px", minHeight: "100%", background: "#0e1220" }}>
       <div
         style={{
-          display: "flex",
-          justifyContent: "space-between",
-          alignItems: "center",
-          gap: "12px",
-          flexWrap: "wrap",
+          borderRadius: "16px",
+          border: "1px solid rgba(90, 105, 138, 0.26)",
+          background:
+            "radial-gradient(1100px 440px at 18% -14%, rgba(88,166,255,0.22), rgba(14,18,32,0)), #111728",
+          padding: "16px",
           marginBottom: "14px",
-        }}
-      >
-        <div>
-          <h1 style={{ fontSize: "1.35rem", fontWeight: 700 }}>Backtests Screener</h1>
-          <div style={{ color: "var(--color-text-muted)", fontSize: "0.76rem" }}>
-            TradingView-style scanner with live API filters, sorting and bulk actions
-          </div>
-        </div>
-
-        <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
-          <button
-            type="button"
-            onClick={() => setShowCreateModal(true)}
-            style={{
-              borderRadius: "9px",
-              border: "1px solid rgba(88, 166, 255, 0.5)",
-              background: "rgba(88, 166, 255, 0.16)",
-              color: "#cfe3ff",
-              fontSize: "0.76rem",
-              padding: "8px 12px",
-              display: "flex",
-              alignItems: "center",
-              gap: "6px",
-              cursor: "pointer",
-            }}
-          >
-            <Plus size={13} />
-            New Backtest
-          </button>
-          <button
-            type="button"
-            onClick={() => void handleDeduplicate()}
-            disabled={deduplicating}
-            style={{
-              borderRadius: "9px",
-              border: "1px solid rgba(248, 81, 73, 0.3)",
-              background: "rgba(248, 81, 73, 0.12)",
-              color: "#f87171",
-              fontSize: "0.76rem",
-              padding: "8px 12px",
-              display: "flex",
-              alignItems: "center",
-              gap: "6px",
-              cursor: deduplicating ? "not-allowed" : "pointer",
-            }}
-          >
-            <RefreshCw size={13} className={deduplicating ? "animate-spin" : ""} />
-            {deduplicating ? "Removing..." : "Remove Duplicates"}
-          </button>
-        </div>
-      </div>
-
-      <section
-        style={{
-          borderRadius: "14px",
-          border: "1px solid rgba(148, 163, 184, 0.2)",
-          background: "rgba(19, 23, 34, 0.98)",
-          padding: "12px",
-          marginBottom: "12px",
         }}
       >
         <div
           style={{
             display: "flex",
-            gap: "10px",
-            flexWrap: "wrap",
+            justifyContent: "space-between",
             alignItems: "center",
-            marginBottom: "10px",
+            gap: "12px",
+            flexWrap: "wrap",
+            marginBottom: "12px",
           }}
         >
+          <div>
+            <h1 style={{ margin: 0, fontSize: "1.35rem", fontWeight: 700 }}>Backtests</h1>
+            <div style={{ marginTop: "4px", color: "var(--color-text-muted)", fontSize: "0.78rem" }}>
+              Fast cards view · one metadata request · client-side filters and sorting
+            </div>
+          </div>
+
+          <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", alignItems: "center" }}>
+            {selectedCount > 0 ? (
+              <button
+                type="button"
+                onClick={() => void handleBulkDelete()}
+                style={{
+                  borderRadius: "10px",
+                  border: "1px solid rgba(248, 81, 73, 0.45)",
+                  background: "rgba(248, 81, 73, 0.16)",
+                  color: "#fecaca",
+                  padding: "8px 12px",
+                  fontSize: "0.76rem",
+                  cursor: "pointer",
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: "6px",
+                }}
+              >
+                <Trash2 size={13} />
+                Delete Selected ({selectedCount})
+              </button>
+            ) : null}
+
+            <button
+              type="button"
+              onClick={() => void handleDeduplicate()}
+              disabled={deduplicating}
+              style={{
+                borderRadius: "10px",
+                border: "1px solid rgba(251, 191, 36, 0.42)",
+                background: "rgba(251, 191, 36, 0.12)",
+                color: "#fde68a",
+                padding: "8px 12px",
+                fontSize: "0.76rem",
+                cursor: deduplicating ? "not-allowed" : "pointer",
+                display: "inline-flex",
+                alignItems: "center",
+                gap: "6px",
+              }}
+            >
+              <RefreshCw size={13} className={deduplicating ? "animate-spin" : ""} />
+              {deduplicating ? "Removing..." : "Remove Duplicates"}
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setShowCreateModal(true)}
+              style={{
+                borderRadius: "10px",
+                border: "1px solid rgba(88, 166, 255, 0.5)",
+                background: "rgba(88, 166, 255, 0.16)",
+                color: "#dbeafe",
+                padding: "8px 12px",
+                fontSize: "0.76rem",
+                cursor: "pointer",
+                display: "inline-flex",
+                alignItems: "center",
+                gap: "6px",
+              }}
+            >
+              <Plus size={13} />
+              New Backtest
+            </button>
+          </div>
+        </div>
+
+        <div style={{ display: "flex", flexWrap: "wrap", gap: "10px", marginBottom: "10px" }}>
           <MultiSelectDropdown
             label="Strategy"
-            options={strategyOptions}
-            selected={filters.strategies}
-            onChange={(next) => setFilters((current) => ({ ...current, strategies: next }))}
+            options={strategies.map((value) => ({ label: value, value }))}
+            selected={selectedStrategies}
+            onChange={(next) => {
+              setSelectedStrategies(next);
+              setPage(1);
+            }}
             searchable
             searchPlaceholder="Search strategy..."
           />
 
           <MultiSelectDropdown
             label="Timeframe"
-            options={timeframeOptions}
-            selected={filters.timeframes}
-            onChange={(next) => setFilters((current) => ({ ...current, timeframes: next }))}
+            options={allTimeframes.map((value) => ({ label: value, value }))}
+            selected={selectedTimeframes}
+            onChange={(next) => {
+              setSelectedTimeframes(next);
+              setPage(1);
+            }}
           />
 
-          <MultiSelectDropdown
-            label="Symbol"
-            options={symbolOptions}
-            selected={filters.symbols}
-            onChange={(next) => setFilters((current) => ({ ...current, symbols: next }))}
-            searchable
-            searchPlaceholder="Search symbol..."
-          />
-
-          <div style={{ minWidth: "220px", flex: "1 1 220px", maxWidth: "360px" }}>
-            <input
-              type="text"
-              value={filters.symbolSearch}
-              onChange={(event) =>
-                setFilters((current) => ({ ...current, symbolSearch: event.target.value }))
-              }
-              placeholder="Quick search: strategy, symbol, id..."
+          <div style={{ minWidth: "250px", flex: "1 1 250px", maxWidth: "320px" }}>
+            <label
               style={{
-                width: "100%",
-                border: "1px solid rgba(143, 154, 184, 0.26)",
-                borderRadius: "10px",
-                background: "rgba(19, 23, 34, 0.88)",
-                color: "var(--color-text)",
-                fontSize: "0.76rem",
-                padding: "9px 10px",
+                display: "grid",
+                gap: "6px",
+                fontSize: "0.72rem",
+                color: "var(--color-text-muted)",
               }}
-            />
+            >
+              Symbol (autocomplete)
+              <div style={{ display: "flex", gap: "6px" }}>
+                <input
+                  list="backtest-symbol-options"
+                  value={symbolDraft}
+                  onChange={(event) => setSymbolDraft(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      addDraftSymbol();
+                    }
+                  }}
+                  placeholder="Type symbol..."
+                  style={{
+                    flex: 1,
+                    borderRadius: "10px",
+                    border: "1px solid rgba(143, 154, 184, 0.28)",
+                    background: "rgba(13, 19, 32, 0.95)",
+                    color: "var(--color-text)",
+                    padding: "9px 10px",
+                    fontSize: "0.76rem",
+                  }}
+                />
+                <button
+                  type="button"
+                  onClick={addDraftSymbol}
+                  style={{
+                    borderRadius: "10px",
+                    border: "1px solid rgba(143, 154, 184, 0.34)",
+                    background: "rgba(17, 24, 39, 0.95)",
+                    color: "var(--color-text)",
+                    padding: "8px 10px",
+                    fontSize: "0.73rem",
+                    cursor: "pointer",
+                  }}
+                >
+                  Add
+                </button>
+              </div>
+            </label>
+            <datalist id="backtest-symbol-options">
+              {allSymbols.map((value) => (
+                <option key={value} value={value} />
+              ))}
+            </datalist>
+            {selectedSymbols.length > 0 ? (
+              <div style={{ display: "flex", flexWrap: "wrap", gap: "6px", marginTop: "6px" }}>
+                {selectedSymbols.map((symbol) => (
+                  <button
+                    type="button"
+                    key={symbol}
+                    onClick={() => removeSelectedSymbol(symbol)}
+                    style={{
+                      borderRadius: "999px",
+                      border: "1px solid rgba(88,166,255,0.42)",
+                      background: "rgba(88,166,255,0.14)",
+                      color: "#dbeafe",
+                      padding: "3px 8px",
+                      fontSize: "0.68rem",
+                      cursor: "pointer",
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: "5px",
+                    }}
+                  >
+                    {symbol}
+                    <X size={12} />
+                  </button>
+                ))}
+              </div>
+            ) : null}
+          </div>
+
+          <div style={{ minWidth: "220px", flex: "1 1 220px", maxWidth: "320px" }}>
+            <label style={{ display: "grid", gap: "6px", fontSize: "0.72rem", color: "var(--color-text-muted)" }}>
+              Quick Search
+              <input
+                type="text"
+                value={search}
+                onChange={(event) => {
+                  setSearch(event.target.value);
+                  setPage(1);
+                }}
+                placeholder="Strategy, symbol or id..."
+                style={{
+                  borderRadius: "10px",
+                  border: "1px solid rgba(143, 154, 184, 0.28)",
+                  background: "rgba(13, 19, 32, 0.95)",
+                  color: "var(--color-text)",
+                  padding: "9px 10px",
+                  fontSize: "0.76rem",
+                }}
+              />
+            </label>
+          </div>
+
+          <div style={{ minWidth: "250px", display: "grid", gap: "6px" }}>
+            <span style={{ fontSize: "0.72rem", color: "var(--color-text-muted)" }}>Sort</span>
+            <div style={{ display: "flex", gap: "6px" }}>
+              <select
+                value={sortField}
+                onChange={(event) => {
+                  setSortField(event.target.value as SortField);
+                  setPage(1);
+                }}
+                style={{
+                  flex: 1,
+                  borderRadius: "10px",
+                  border: "1px solid rgba(143, 154, 184, 0.28)",
+                  background: "rgba(13, 19, 32, 0.95)",
+                  color: "var(--color-text)",
+                  padding: "9px 10px",
+                  fontSize: "0.76rem",
+                }}
+              >
+                {SORT_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setSortOrder((current) => (current === "desc" ? "asc" : "desc"));
+                  setPage(1);
+                }}
+                style={{
+                  borderRadius: "10px",
+                  border: "1px solid rgba(143, 154, 184, 0.34)",
+                  background: "rgba(17, 24, 39, 0.95)",
+                  color: "var(--color-text)",
+                  padding: "8px 10px",
+                  fontSize: "0.74rem",
+                  cursor: "pointer",
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: "6px",
+                }}
+              >
+                <ArrowUpDown size={14} />
+                {sortOrder === "desc" ? "Desc" : "Asc"}
+              </button>
+            </div>
           </div>
 
           <button
             type="button"
             onClick={resetFilters}
             style={{
-              border: "1px solid rgba(143, 154, 184, 0.28)",
+              alignSelf: "end",
               borderRadius: "10px",
-              background: "rgba(19, 23, 34, 0.88)",
+              border: "1px solid rgba(143, 154, 184, 0.3)",
+              background: "rgba(13, 19, 32, 0.92)",
               color: "var(--color-text-muted)",
               padding: "9px 12px",
-              fontSize: "0.75rem",
+              fontSize: "0.74rem",
               cursor: "pointer",
             }}
           >
-            Reset Filters
+            Reset
           </button>
         </div>
 
-        {filters.strategies.length > 0 || filters.timeframes.length > 0 || filters.symbols.length > 0 ? (
-          <div style={{ display: "flex", gap: "7px", flexWrap: "wrap", marginBottom: "10px" }}>
-            {filters.strategies.map((strategy) => (
-              <FilterChip
-                key={`strategy-${strategy}`}
-                label={strategy}
-                onRemove={() =>
-                  setFilters((current) => ({
-                    ...current,
-                    strategies: current.strategies.filter((entry) => entry !== strategy),
-                  }))
-                }
-              />
-            ))}
-            {filters.timeframes.map((timeframe) => (
-              <FilterChip
-                key={`timeframe-${timeframe}`}
-                label={timeframe}
-                onRemove={() =>
-                  setFilters((current) => ({
-                    ...current,
-                    timeframes: current.timeframes.filter((entry) => entry !== timeframe),
-                  }))
-                }
-              />
-            ))}
-            {filters.symbols.map((symbol) => (
-              <FilterChip
-                key={`symbol-${symbol}`}
-                label={symbol}
-                onRemove={() =>
-                  setFilters((current) => ({
-                    ...current,
-                    symbols: current.symbols.filter((entry) => entry !== symbol),
-                  }))
-                }
-              />
-            ))}
-          </div>
-        ) : null}
-
-        <div style={{ display: "flex", gap: "10px", flexWrap: "wrap" }}>
-          <RangeFilterControl
-            label="Sharpe Ratio"
-            value={filters.sharpe}
-            bounds={DEFAULT_RANGES.sharpe}
-            step={0.1}
-            onChange={(next) => setFilters((current) => ({ ...current, sharpe: next }))}
-          />
-          <RangeFilterControl
-            label="PSR"
-            value={filters.psr}
-            bounds={DEFAULT_RANGES.psr}
-            step={0.01}
-            onChange={(next) => setFilters((current) => ({ ...current, psr: next }))}
-          />
-          <RangeFilterControl
-            label="p-Value"
-            value={filters.pValue}
-            bounds={DEFAULT_RANGES.pValue}
-            step={0.001}
-            onChange={(next) => setFilters((current) => ({ ...current, pValue: next }))}
-          />
-          <RangeFilterControl
-            label="CAGR"
-            value={filters.cagr}
-            bounds={DEFAULT_RANGES.cagr}
-            step={1}
-            numberSuffix="%"
-            onChange={(next) => setFilters((current) => ({ ...current, cagr: next }))}
-          />
-          <RangeFilterControl
-            label="Max Drawdown"
-            value={filters.maxDrawdown}
-            bounds={DEFAULT_RANGES.maxDrawdown}
-            step={1}
-            numberSuffix="%"
-            onChange={(next) => setFilters((current) => ({ ...current, maxDrawdown: next }))}
-          />
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))",
+            gap: "8px",
+          }}
+        >
+          <RangePair label="Total Return %" min={ranges.totalReturnMin} max={ranges.totalReturnMax} onMinChange={(value) => setRanges((current) => ({ ...current, totalReturnMin: value }))} onMaxChange={(value) => setRanges((current) => ({ ...current, totalReturnMax: value }))} />
+          <RangePair label="Sharpe" min={ranges.sharpeMin} max={ranges.sharpeMax} onMinChange={(value) => setRanges((current) => ({ ...current, sharpeMin: value }))} onMaxChange={(value) => setRanges((current) => ({ ...current, sharpeMax: value }))} />
+          <RangePair label="PSR" min={ranges.psrMin} max={ranges.psrMax} onMinChange={(value) => setRanges((current) => ({ ...current, psrMin: value }))} onMaxChange={(value) => setRanges((current) => ({ ...current, psrMax: value }))} />
+          <RangePair label="p-Value" min={ranges.pValueMin} max={ranges.pValueMax} onMinChange={(value) => setRanges((current) => ({ ...current, pValueMin: value }))} onMaxChange={(value) => setRanges((current) => ({ ...current, pValueMax: value }))} />
+          <RangePair label="CAGR %" min={ranges.cagrMin} max={ranges.cagrMax} onMinChange={(value) => setRanges((current) => ({ ...current, cagrMin: value }))} onMaxChange={(value) => setRanges((current) => ({ ...current, cagrMax: value }))} />
+          <RangePair label="Max DD %" min={ranges.maxDrawdownMin} max={ranges.maxDrawdownMax} onMinChange={(value) => setRanges((current) => ({ ...current, maxDrawdownMin: value }))} onMaxChange={(value) => setRanges((current) => ({ ...current, maxDrawdownMax: value }))} />
+          <RangePair label="Win Rate %" min={ranges.winRateMin} max={ranges.winRateMax} onMinChange={(value) => setRanges((current) => ({ ...current, winRateMin: value }))} onMaxChange={(value) => setRanges((current) => ({ ...current, winRateMax: value }))} />
+          <RangePair label="Trades" min={ranges.tradesMin} max={ranges.tradesMax} onMinChange={(value) => setRanges((current) => ({ ...current, tradesMin: value }))} onMaxChange={(value) => setRanges((current) => ({ ...current, tradesMax: value }))} />
         </div>
-      </section>
-
-      <section
-        style={{
-          borderRadius: "14px",
-          border: "1px solid rgba(148, 163, 184, 0.2)",
-          background: "rgba(19, 23, 34, 0.96)",
-          overflow: "hidden",
-        }}
-      >
-        <div style={{ overflowX: "auto", maxHeight: "calc(100vh - 330px)", overflowY: "auto" }}>
-          <table style={{ width: "100%", borderCollapse: "collapse", minWidth: "1220px" }}>
-            <thead>
-              <tr>
-                <th style={{ ...thStyle, width: "42px" }}>
-                  <input
-                    type="checkbox"
-                    checked={allVisibleSelected}
-                    onChange={toggleSelectAllVisible}
-                    style={{ cursor: "pointer", accentColor: "#58a6ff" }}
-                  />
-                </th>
-                <HeaderCell
-                  label="Strategy"
-                  active={sortColumn === "strategy_name"}
-                  order={sortColumn === "strategy_name" ? sortOrder : null}
-                  onClick={() => cycleSort("strategy_name")}
-                />
-                <th style={thStyle}>Symbol</th>
-                <th style={thStyle}>Timeframe</th>
-                <HeaderCell
-                  label="Total Return"
-                  active={sortColumn === "total_return"}
-                  order={sortColumn === "total_return" ? sortOrder : null}
-                  onClick={() => cycleSort("total_return")}
-                />
-                <HeaderCell
-                  label="CAGR"
-                  active={sortColumn === "cagr"}
-                  order={sortColumn === "cagr" ? sortOrder : null}
-                  onClick={() => cycleSort("cagr")}
-                />
-                <HeaderCell
-                  label="Sharpe"
-                  active={sortColumn === "sharpe_ratio"}
-                  order={sortColumn === "sharpe_ratio" ? sortOrder : null}
-                  onClick={() => cycleSort("sharpe_ratio")}
-                />
-                <HeaderCell
-                  label="PSR"
-                  active={sortColumn === "psr"}
-                  order={sortColumn === "psr" ? sortOrder : null}
-                  onClick={() => cycleSort("psr")}
-                />
-                <HeaderCell
-                  label="p-Value"
-                  active={sortColumn === "p_value"}
-                  order={sortColumn === "p_value" ? sortOrder : null}
-                  onClick={() => cycleSort("p_value")}
-                />
-                <th style={thStyle}>Max Drawdown</th>
-                <HeaderCell
-                  label="Trades"
-                  active={sortColumn === "trade_count"}
-                  order={sortColumn === "trade_count" ? sortOrder : null}
-                  onClick={() => cycleSort("trade_count")}
-                />
-                <th style={thStyle}>Win Rate</th>
-                <HeaderCell
-                  label="Created"
-                  active={sortColumn === "created_at"}
-                  order={sortColumn === "created_at" ? sortOrder : null}
-                  onClick={() => cycleSort("created_at")}
-                />
-              </tr>
-            </thead>
-            <tbody>
-              {loading ? (
-                <tr>
-                  <td
-                    colSpan={13}
-                    style={{
-                      ...tdStyle,
-                      color: "var(--color-text-muted)",
-                      textAlign: "center",
-                      padding: "26px 0",
-                    }}
-                  >
-                    Loading backtests...
-                  </td>
-                </tr>
-              ) : clientFiltered.length === 0 ? (
-                <tr>
-                  <td
-                    colSpan={13}
-                    style={{
-                      ...tdStyle,
-                      color: "var(--color-text-muted)",
-                      textAlign: "center",
-                      padding: "28px 0",
-                    }}
-                  >
-                    No backtests found for current filter selection.
-                  </td>
-                </tr>
-              ) : (
-                clientFiltered.map((item) => {
-                  const sharpe = normalizeSharpe(item);
-                  const psr = normalizePsr(item);
-                  const pValue = normalizePValue(item);
-                  const cagr = normalizeCagr(item);
-                  const maxDrawdown = normalizeMaxDrawdown(item);
-                  const selectedRow = selected.has(item.id);
-
-                  return (
-                    <tr
-                      key={item.id}
-                      onClick={() => navigate(`/backtests/${item.id}`)}
-                      style={{
-                        background: selectedRow ? "rgba(88, 166, 255, 0.1)" : "transparent",
-                        cursor: "pointer",
-                      }}
-                      onMouseEnter={(event) => {
-                        if (!selectedRow) {
-                          event.currentTarget.style.background = "rgba(88, 166, 255, 0.07)";
-                        }
-                      }}
-                      onMouseLeave={(event) => {
-                        if (!selectedRow) {
-                          event.currentTarget.style.background = "transparent";
-                        }
-                      }}
-                    >
-                      <td
-                        style={tdStyle}
-                        onClick={(event) => {
-                          event.stopPropagation();
-                        }}
-                      >
-                        <input
-                          type="checkbox"
-                          checked={selectedRow}
-                          onChange={() => toggleSelect(item.id)}
-                          style={{ cursor: "pointer", accentColor: "#58a6ff" }}
-                        />
-                      </td>
-                      <td style={tdStyle}>
-                        <div style={{ display: "grid", gap: "3px" }}>
-                          <span style={{ fontWeight: 600 }}>{item.strategy}</span>
-                          <div style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}>
-                            <StatBadge label="PSR" value={psr == null ? "—" : `${(psr * 100).toFixed(0)}%`} color={psrColor(psr)} />
-                            <StatBadge label="p-Value" value={pValue == null ? "—" : pValue.toFixed(3)} color={pValueColor(pValue)} />
-                          </div>
-                        </div>
-                      </td>
-                      <td style={{ ...tdStyle, fontFamily: NUMERIC_FONT }}>{(item.symbols ?? []).join(", ") || "—"}</td>
-                      <td style={{ ...tdStyle, fontFamily: NUMERIC_FONT }}>{item.timeframes?.[0] ?? "—"}</td>
-                      <td style={{ ...tdStyle, fontFamily: NUMERIC_FONT, color: percentageColor(item.net_profit_pct) }}>
-                        {formatPct(item.net_profit_pct)}
-                      </td>
-                      <td style={{ ...tdStyle, fontFamily: NUMERIC_FONT, color: percentageColor(cagr) }}>{formatPct(cagr)}</td>
-                      <td style={{ ...tdStyle, fontFamily: NUMERIC_FONT, color: sharpeColor(sharpe) }}>{formatNum(sharpe, 3)}</td>
-                      <td style={{ ...tdStyle, fontFamily: NUMERIC_FONT, color: psrColor(psr) }}>
-                        {psr == null ? "—" : `${(psr * 100).toFixed(1)}%`}
-                      </td>
-                      <td style={{ ...tdStyle, fontFamily: NUMERIC_FONT, color: pValueColor(pValue) }}>
-                        {pValue == null ? "—" : pValue.toFixed(4)}
-                      </td>
-                      <td style={{ ...tdStyle, fontFamily: NUMERIC_FONT, color: "#f87171" }}>
-                        {maxDrawdown == null ? "—" : `${maxDrawdown.toFixed(2)}%`}
-                      </td>
-                      <td style={{ ...tdStyle, fontFamily: NUMERIC_FONT }}>{item.trade_count}</td>
-                      <td style={{ ...tdStyle, fontFamily: NUMERIC_FONT }}>
-                        {item.win_rate == null ? "—" : `${(item.win_rate * 100).toFixed(1)}%`}
-                      </td>
-                      <td style={tdStyle}>{parseIsoToDate(item.created_at)}</td>
-                    </tr>
-                  );
-                })
-              )}
-            </tbody>
-          </table>
-        </div>
-      </section>
+      </div>
 
       <div
         style={{
-          marginTop: "10px",
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          gap: "10px",
+          marginBottom: "10px",
+          flexWrap: "wrap",
+        }}
+      >
+        <div style={{ color: "var(--color-text-muted)", fontSize: "0.78rem" }}>
+          {filteredSorted.length} results · {items.length} total backtests
+        </div>
+        <label style={{ display: "inline-flex", gap: "6px", alignItems: "center", fontSize: "0.76rem", color: "var(--color-text-muted)" }}>
+          <input
+            type="checkbox"
+            checked={allOnPageSelected}
+            onChange={toggleSelectedOnPage}
+            style={{ cursor: "pointer", accentColor: "#58a6ff" }}
+          />
+          Select page
+        </label>
+      </div>
+
+      {loading ? (
+        <div
+          style={{
+            borderRadius: "14px",
+            border: "1px solid rgba(90, 105, 138, 0.24)",
+            background: "rgba(13, 19, 32, 0.92)",
+            padding: "28px",
+            textAlign: "center",
+            color: "var(--color-text-muted)",
+          }}
+        >
+          Loading backtests...
+        </div>
+      ) : currentPageItems.length === 0 ? (
+        <div
+          style={{
+            borderRadius: "14px",
+            border: "1px solid rgba(90, 105, 138, 0.24)",
+            background: "rgba(13, 19, 32, 0.92)",
+            padding: "28px",
+            textAlign: "center",
+            color: "var(--color-text-muted)",
+          }}
+        >
+          No backtests for the current filter selection.
+        </div>
+      ) : (
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))",
+            gap: "12px",
+          }}
+        >
+          {currentPageItems.map((item) => {
+            const selected = selectedIds.has(item.id);
+            const totalReturnPct = (item.total_return ?? 0) * 100;
+            const cagrPct = (item.cagr ?? 0) * 100;
+            const drawdownPct = Math.abs((item.max_drawdown ?? 0) * 100);
+            const winRate = normalizeWinRate(item.win_rate);
+            const winRatePct = winRate == null ? null : winRate * 100;
+            const sparkline = equityPreviews[item.id];
+
+            return (
+              <article
+                key={item.id}
+                onClick={() => navigate(`/backtests/${item.id}`)}
+                style={{
+                  position: "relative",
+                  borderRadius: "14px",
+                  border: selected
+                    ? "1px solid rgba(88,166,255,0.7)"
+                    : "1px solid rgba(90, 105, 138, 0.24)",
+                  background: "linear-gradient(180deg, rgba(17,24,39,0.97), rgba(9,13,24,0.97))",
+                  boxShadow: selected
+                    ? "0 16px 36px rgba(59,130,246,0.18)"
+                    : "0 10px 26px rgba(0,0,0,0.35)",
+                  padding: "12px",
+                  cursor: "pointer",
+                  transition: "transform 140ms ease, border-color 140ms ease, box-shadow 160ms ease",
+                }}
+                onMouseEnter={(event) => {
+                  event.currentTarget.style.transform = "translateY(-2px)";
+                  if (!selected) {
+                    event.currentTarget.style.borderColor = "rgba(88,166,255,0.45)";
+                    event.currentTarget.style.boxShadow = "0 16px 30px rgba(0,0,0,0.42)";
+                  }
+                }}
+                onMouseLeave={(event) => {
+                  event.currentTarget.style.transform = "translateY(0px)";
+                  if (!selected) {
+                    event.currentTarget.style.borderColor = "rgba(90, 105, 138, 0.24)";
+                    event.currentTarget.style.boxShadow = "0 10px 26px rgba(0,0,0,0.35)";
+                  }
+                }}
+              >
+                <input
+                  type="checkbox"
+                  checked={selected}
+                  onClick={(event) => event.stopPropagation()}
+                  onChange={() => toggleSelected(item.id)}
+                  style={{
+                    position: "absolute",
+                    top: "10px",
+                    left: "10px",
+                    zIndex: 2,
+                    accentColor: "#58a6ff",
+                    cursor: "pointer",
+                  }}
+                />
+
+                <div
+                  style={{
+                    height: "64px",
+                    borderRadius: "10px",
+                    border: "1px solid rgba(90, 105, 138, 0.2)",
+                    background: "rgba(15, 23, 42, 0.9)",
+                    padding: "3px 8px 0",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    marginBottom: "10px",
+                    marginInlineStart: "18px",
+                  }}
+                >
+                  {sparkline && sparkline.length > 1 ? (
+                    <Sparkline data={sparkline} width={220} height={56} />
+                  ) : (
+                    <span style={{ color: "var(--color-text-muted)", fontSize: "0.72rem" }}>
+                      Loading equity preview...
+                    </span>
+                  )}
+                </div>
+
+                <div style={{ marginBottom: "10px" }}>
+                  <div style={{ fontWeight: 700, fontSize: "0.95rem", marginBottom: "4px" }}>{item.strategy_name}</div>
+                  <div
+                    style={{
+                      color: "var(--color-text-muted)",
+                      fontSize: "0.74rem",
+                      fontFamily: NUMERIC_FONT,
+                      display: "flex",
+                      gap: "8px",
+                      flexWrap: "wrap",
+                    }}
+                  >
+                    <span>{(item.symbols ?? []).join(", ") || "N/A"}</span>
+                    <span>·</span>
+                    <span>{item.timeframe || "N/A"}</span>
+                  </div>
+                </div>
+
+                <div style={{ display: "flex", flexWrap: "wrap", gap: "6px" }}>
+                  <StatBadge label="Return" value={percentage(totalReturnPct)} color={statColorPositive(totalReturnPct)} />
+                  <StatBadge label="Sharpe" value={formatNumber(item.sharpe_ratio)} color={sharpeColor(item.sharpe_ratio)} />
+                  <StatBadge label="PSR" value={item.psr == null ? "N/A" : `${(item.psr * 100).toFixed(1)}%`} color={psrColor(item.psr)} />
+                  <StatBadge label="p-Value" value={pValueLabel(item.p_value)} color={pValueColor(item.p_value)} />
+                  <StatBadge label="CAGR" value={percentage(cagrPct)} color={statColorPositive(cagrPct)} />
+                  <StatBadge label="Trades" value={String(item.trade_count ?? 0)} color="#93c5fd" />
+                  <StatBadge label="Win Rate" value={winRatePct == null ? "N/A" : `${winRatePct.toFixed(1)}%`} color={statColorPositive(winRatePct)} />
+                  <StatBadge label="Max DD" value={percentage(-drawdownPct)} color="#f87171" />
+                </div>
+              </article>
+            );
+          })}
+        </div>
+      )}
+
+      <div
+        style={{
+          marginTop: "12px",
           display: "flex",
           justifyContent: "space-between",
           alignItems: "center",
@@ -897,12 +992,12 @@ export function BacktestsPage() {
         }}
       >
         <span style={{ color: "var(--color-text-muted)", fontSize: "0.76rem" }}>
-          Page {page} of {totalPages} • {totalBacktests} total
+          Page {page} of {totalPages}
         </span>
 
-        <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
           <label style={{ fontSize: "0.74rem", color: "var(--color-text-muted)" }}>
-            Rows per page{" "}
+            Cards per page{" "}
             <select
               value={perPage}
               onChange={(event) => {
@@ -913,15 +1008,15 @@ export function BacktestsPage() {
                 marginInlineStart: "4px",
                 borderRadius: "8px",
                 border: "1px solid rgba(148, 163, 184, 0.25)",
-                background: "#121826",
+                background: "#111827",
                 color: "var(--color-text)",
                 padding: "6px 8px",
                 fontSize: "0.74rem",
               }}
             >
-              <option value={25}>25</option>
-              <option value={50}>50</option>
-              <option value={100}>100</option>
+              <option value={20}>20</option>
+              <option value={40}>40</option>
+              <option value={80}>80</option>
             </select>
           </label>
 
@@ -930,11 +1025,7 @@ export function BacktestsPage() {
           </PagerButton>
           {buildPageNumbers(page, totalPages).map((entry, index) =>
             typeof entry === "number" ? (
-              <PagerButton
-                key={`page-${entry}`}
-                onClick={() => setPage(entry)}
-                active={entry === page}
-              >
+              <PagerButton key={`page-${entry}`} onClick={() => setPage(entry)} active={entry === page}>
                 {entry}
               </PagerButton>
             ) : (
@@ -943,80 +1034,11 @@ export function BacktestsPage() {
               </span>
             ),
           )}
-          <PagerButton
-            onClick={() => setPage((current) => Math.min(totalPages, current + 1))}
-            disabled={page >= totalPages}
-          >
+          <PagerButton onClick={() => setPage((current) => Math.min(totalPages, current + 1))} disabled={page >= totalPages}>
             {">"}
           </PagerButton>
         </div>
       </div>
-
-      {selectedIds.length > 0 ? (
-        <div
-          style={{
-            position: "fixed",
-            insetInline: "auto 18px",
-            bottom: "14px",
-            zIndex: 50,
-            display: "flex",
-            gap: "10px",
-            alignItems: "center",
-            borderRadius: "12px",
-            border: "1px solid rgba(148, 163, 184, 0.28)",
-            background: "rgba(11, 16, 27, 0.96)",
-            backdropFilter: "blur(6px)",
-            padding: "10px 12px",
-            boxShadow: "0 18px 34px rgba(0, 0, 0, 0.4)",
-          }}
-        >
-          <span style={{ color: "var(--color-text)", fontSize: "0.78rem" }}>
-            {selectedIds.length} selected
-          </span>
-
-          <button
-            type="button"
-            onClick={() => navigate(`/backtests/compare?ids=${selectedIds.join(",")}`)}
-            disabled={selectedIds.length < 2}
-            style={{
-              borderRadius: "8px",
-              border: "1px solid rgba(88, 166, 255, 0.35)",
-              background: "rgba(88, 166, 255, 0.14)",
-              color: "#a7c8ff",
-              padding: "7px 10px",
-              fontSize: "0.74rem",
-              display: "flex",
-              alignItems: "center",
-              gap: "6px",
-              cursor: selectedIds.length < 2 ? "not-allowed" : "pointer",
-              opacity: selectedIds.length < 2 ? 0.5 : 1,
-            }}
-          >
-            <GitCompare size={13} />
-            Compare Selected
-          </button>
-
-          <button
-            type="button"
-            onClick={() => void handleBulkDelete()}
-            style={{
-              borderRadius: "8px",
-              border: "1px solid rgba(248, 81, 73, 0.4)",
-              background: "rgba(248, 81, 73, 0.15)",
-              color: "#fca5a5",
-              padding: "7px 10px",
-              fontSize: "0.74rem",
-              display: "flex",
-              alignItems: "center",
-              gap: "6px",
-              cursor: "pointer",
-            }}
-          >
-            <Trash2 size={13} />
-            Delete Selected ({selectedIds.length})
-          </button>
-        </div>
-      ) : null}
 
       <CreateBacktestModal
         open={showCreateModal}
@@ -1027,97 +1049,67 @@ export function BacktestsPage() {
   );
 }
 
-function HeaderCell({
+function RangePair({
   label,
-  active,
-  order,
-  onClick,
+  min,
+  max,
+  onMinChange,
+  onMaxChange,
 }: {
   label: string;
-  active: boolean;
-  order: SortOrder;
-  onClick: () => void;
+  min: string;
+  max: string;
+  onMinChange: (value: string) => void;
+  onMaxChange: (value: string) => void;
 }) {
   return (
-    <th
-      onClick={onClick}
+    <div
       style={{
-        position: "sticky",
-        top: 0,
-        zIndex: 2,
-        background: "#141b2b",
-        color: active ? "#d8e4ff" : "var(--color-text-muted)",
-        fontSize: "0.72rem",
-        fontWeight: 600,
-        letterSpacing: "0.04em",
-        textTransform: "uppercase",
-        padding: "10px 8px",
-        borderBottom: "1px solid rgba(148, 163, 184, 0.26)",
-        whiteSpace: "nowrap",
-        cursor: "pointer",
+        borderRadius: "10px",
+        border: "1px solid rgba(90, 105, 138, 0.25)",
+        background: "rgba(13, 19, 32, 0.92)",
+        padding: "8px",
+        display: "grid",
+        gap: "5px",
       }}
     >
-      <span style={{ display: "inline-flex", alignItems: "center", gap: "4px" }}>
-        {label}
-        {order === "asc" ? <ChevronUp size={12} /> : null}
-        {order === "desc" ? <ChevronDown size={12} /> : null}
-      </span>
-    </th>
+      <span style={{ fontSize: "0.7rem", color: "var(--color-text-muted)" }}>{label}</span>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "6px" }}>
+        <input
+          type="text"
+          inputMode="decimal"
+          placeholder="min"
+          value={min}
+          onChange={(event) => onMinChange(event.target.value)}
+          style={{
+            borderRadius: "8px",
+            border: "1px solid rgba(143, 154, 184, 0.26)",
+            background: "#101726",
+            color: "var(--color-text)",
+            padding: "6px 8px",
+            fontSize: "0.73rem",
+            fontFamily: NUMERIC_FONT,
+          }}
+        />
+        <input
+          type="text"
+          inputMode="decimal"
+          placeholder="max"
+          value={max}
+          onChange={(event) => onMaxChange(event.target.value)}
+          style={{
+            borderRadius: "8px",
+            border: "1px solid rgba(143, 154, 184, 0.26)",
+            background: "#101726",
+            color: "var(--color-text)",
+            padding: "6px 8px",
+            fontSize: "0.73rem",
+            fontFamily: NUMERIC_FONT,
+          }}
+        />
+      </div>
+    </div>
   );
-}
-
-function PagerButton({
-  children,
-  onClick,
-  disabled = false,
-  active = false,
-}: {
-  children: ReactNode;
-  onClick: () => void;
-  disabled?: boolean;
-  active?: boolean;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      disabled={disabled}
-      style={{
-        borderRadius: "8px",
-        border: active
-          ? "1px solid rgba(88, 166, 255, 0.6)"
-          : "1px solid rgba(148, 163, 184, 0.24)",
-        background: active ? "rgba(88, 166, 255, 0.2)" : "rgba(17, 24, 39, 0.9)",
-        color: active ? "#dbe7ff" : "var(--color-text)",
-        minWidth: "30px",
-        height: "30px",
-        padding: "0 8px",
-        fontSize: "0.74rem",
-        cursor: disabled ? "not-allowed" : "pointer",
-        opacity: disabled ? 0.45 : 1,
-      }}
-    >
-      {children}
-    </button>
-  );
-}
-
-function buildPageNumbers(currentPage: number, totalPages: number): Array<number | "..."> {
-  if (totalPages <= 7) {
-    return Array.from({ length: totalPages }, (_, index) => index + 1);
-  }
-  const pages = new Set<number>([1, totalPages, currentPage, currentPage - 1, currentPage + 1]);
-  const validPages = [...pages].filter((page) => page >= 1 && page <= totalPages).sort((a, b) => a - b);
-  const entries: Array<number | "..."> = [];
-  for (let i = 0; i < validPages.length; i += 1) {
-    const page = validPages[i];
-    const previous = validPages[i - 1];
-    if (i > 0 && page - previous > 1) {
-      entries.push("...");
-    }
-    entries.push(page);
-  }
-  return entries;
 }
 
 function StatBadge({ label, value, color }: { label: string; value: string; color: string }) {
@@ -1129,10 +1121,10 @@ function StatBadge({ label, value, color }: { label: string; value: string; colo
         gap: "4px",
         borderRadius: "999px",
         border: "1px solid rgba(148, 163, 184, 0.24)",
-        background: "rgba(14, 20, 30, 0.9)",
+        background: "rgba(11, 18, 30, 0.9)",
         padding: "2px 7px",
         fontFamily: NUMERIC_FONT,
-        fontSize: "0.66rem",
+        fontSize: "0.67rem",
       }}
     >
       <span style={{ color: "var(--color-text-muted)" }}>{label}</span>
@@ -1141,37 +1133,36 @@ function StatBadge({ label, value, color }: { label: string; value: string; colo
   );
 }
 
-function FilterChip({ label, onRemove }: { label: string; onRemove: () => void }) {
+function PagerButton({
+  children,
+  onClick,
+  disabled = false,
+  active = false,
+}: {
+  children: string | number;
+  onClick: () => void;
+  disabled?: boolean;
+  active?: boolean;
+}) {
   return (
-    <span
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
       style={{
-        borderRadius: "999px",
-        border: "1px solid rgba(96, 165, 250, 0.4)",
-        background: "rgba(37, 99, 235, 0.18)",
-        color: "#dbeafe",
-        padding: "4px 8px",
-        fontSize: "0.7rem",
-        display: "inline-flex",
-        alignItems: "center",
-        gap: "6px",
+        borderRadius: "8px",
+        border: active ? "1px solid rgba(88, 166, 255, 0.66)" : "1px solid rgba(148, 163, 184, 0.24)",
+        background: active ? "rgba(88, 166, 255, 0.2)" : "rgba(15, 23, 42, 0.96)",
+        color: active ? "#dbeafe" : "var(--color-text)",
+        minWidth: "30px",
+        height: "30px",
+        padding: "0 8px",
+        fontSize: "0.74rem",
+        cursor: disabled ? "not-allowed" : "pointer",
+        opacity: disabled ? 0.45 : 1,
       }}
     >
-      {label}
-      <button
-        type="button"
-        onClick={onRemove}
-        style={{
-          border: "none",
-          background: "transparent",
-          color: "#bfdbfe",
-          cursor: "pointer",
-          display: "inline-flex",
-          alignItems: "center",
-          padding: 0,
-        }}
-      >
-        <X size={12} />
-      </button>
-    </span>
+      {children}
+    </button>
   );
 }

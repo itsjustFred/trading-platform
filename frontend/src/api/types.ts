@@ -457,6 +457,24 @@ export interface BacktestListItem {
   equity_mini?: number[];
 }
 
+export interface BacktestMetadataItem {
+  id: string;
+  strategy_name: string;
+  symbols: string[];
+  timeframe: string;
+  total_return: number;
+  sharpe_ratio: number;
+  psr: number;
+  p_value: number;
+  cagr: number;
+  max_drawdown: number;
+  trade_count: number;
+  win_rate: number | null;
+  start_date: string;
+  end_date: string;
+  created_at: string;
+}
+
 export type BacktestsSortField =
   | "created_at"
   | "strategy_name"

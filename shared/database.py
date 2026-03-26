@@ -848,6 +848,7 @@ def _backtest_metadata_payload(backtest: BacktestRecord, trade_count: int) -> di
         "psr": _safe_stat_number(stats.get("psr"), 0.0),
         "p_value": _safe_stat_number(stats.get("p_value"), 1.0),
         "max_drawdown": _safe_stat_number(stats.get("max_drawdown_pct"), 0.0),
+        "win_rate": stats.get("win_rate"),
         "trade_count": max(int(trade_count), 0),
         "created_at": str(backtest.created_at or ""),
     }
@@ -1169,6 +1170,45 @@ def load_backtest_equity_points(backtest_id: str) -> list[EquityPointModel]:
 
     points: list[EquityPointModel] = []
     for raw_row in rows:
+        if raw_row is None:
+            continue
+        if isinstance(raw_row, EquityPoint):
+            row = raw_row
+        elif hasattr(raw_row, "_mapping"):
+            values = list(getattr(raw_row, "_mapping").values())
+            row = values[0] if values else None
+        elif isinstance(raw_row, (tuple, list)):
+            row = raw_row[0] if raw_row else None
+        else:
+            row = raw_row
+        if not isinstance(row, EquityPoint):
+            continue
+        points.append(EquityPointModel(time=row.time, equity=row.equity))
+    return points
+
+
+def load_backtest_equity_preview_points(backtest_id: str, limit: int = 80) -> list[EquityPointModel]:
+    normalized_id = str(backtest_id or "").strip()
+    if not normalized_id:
+        return []
+
+    try:
+        normalized_limit = int(limit)
+    except (TypeError, ValueError):
+        normalized_limit = 80
+    normalized_limit = max(1, min(normalized_limit, 200))
+
+    init_db()
+    with get_session() as session:
+        rows = session.exec(
+            select(EquityPoint)
+            .where(EquityPoint.backtest_id == normalized_id)
+            .order_by(EquityPoint.time.desc(), EquityPoint.id.desc())
+            .limit(normalized_limit)
+        ).all()
+
+    points: list[EquityPointModel] = []
+    for raw_row in reversed(rows):
         if raw_row is None:
             continue
         if isinstance(raw_row, EquityPoint):

@@ -1769,6 +1769,134 @@ def test_backtests_list_filters_and_sorts_new_stat_fields(viewer_client, monkeyp
     assert payload["items"][0]["id"] == "bt-a"
 
 
+def test_backtests_all_returns_cached_metadata_payload(viewer_client, monkeypatch):
+    import viewer.main as viewer_app_module
+
+    monkeypatch.setattr(
+        viewer_app_module,
+        "list_backtest_metadata_rows",
+        lambda: [
+            {
+                "id": "bt-old",
+                "engine": "vectorbt",
+                "strategy_name": "Old Strategy",
+                "symbols": ["AAPL"],
+                "timeframe": "1d",
+                "start_date": "2024-01-01",
+                "end_date": "2024-06-30",
+                "total_return": 0.05,
+                "cagr": 0.03,
+                "sharpe_ratio": 0.8,
+                "psr": 0.6,
+                "p_value": 0.2,
+                "max_drawdown": -0.1,
+                "win_rate": 0.55,
+                "trade_count": 14,
+                "created_at": "2026-03-01T10:00:00Z",
+            },
+            {
+                "id": "bt-new",
+                "engine": "vectorbt",
+                "strategy_name": "New Strategy",
+                "symbols": ["MSFT", "NVDA"],
+                "timeframe": "4h",
+                "start_date": "2024-07-01",
+                "end_date": "2024-12-31",
+                "total_return": 0.21,
+                "cagr": 0.18,
+                "sharpe_ratio": 1.45,
+                "psr": 0.92,
+                "p_value": 0.02,
+                "max_drawdown": -0.08,
+                "win_rate": 72.5,
+                "trade_count": 33,
+                "created_at": "2026-03-09T10:00:00Z",
+            },
+        ],
+    )
+    with viewer_app_module._BACKTEST_META_CACHE_LOCK:
+        viewer_app_module._BACKTEST_META_CACHE.clear()
+    with viewer_app_module._BACKTEST_EQUITY_PREVIEW_CACHE_LOCK:
+        viewer_app_module._BACKTEST_EQUITY_PREVIEW_CACHE.clear()
+
+    resp = viewer_client.get("/api/backtests/all")
+    assert resp.status_code == 200
+    rows = resp.json()
+    assert len(rows) == 2
+
+    assert rows[0]["id"] == "bt-new"
+    assert rows[0]["strategy_name"] == "New Strategy"
+    assert rows[0]["symbols"] == ["MSFT", "NVDA"]
+    assert rows[0]["timeframe"] == "4h"
+    assert rows[0]["total_return"] == pytest.approx(0.21)
+    assert rows[0]["sharpe_ratio"] == pytest.approx(1.45)
+    assert rows[0]["psr"] == pytest.approx(0.92)
+    assert rows[0]["p_value"] == pytest.approx(0.02)
+    assert rows[0]["cagr"] == pytest.approx(0.18)
+    assert rows[0]["max_drawdown"] == pytest.approx(0.08)
+    assert rows[0]["win_rate"] == pytest.approx(0.725)
+    assert rows[0]["trade_count"] == 33
+    assert rows[0]["start_date"] == "2024-07-01"
+    assert rows[0]["end_date"] == "2024-12-31"
+    assert rows[0]["created_at"] == "2026-03-09T10:00:00Z"
+
+
+def test_backtest_equity_preview_endpoint_uses_cache(viewer_client, monkeypatch):
+    import viewer.main as viewer_app_module
+
+    calls = {"count": 0}
+
+    monkeypatch.setattr(
+        viewer_app_module,
+        "list_backtest_metadata_rows",
+        lambda: [
+            {
+                "id": "preview-demo",
+                "engine": "vectorbt",
+                "strategy_name": "Preview Demo",
+                "symbols": ["AAPL"],
+                "timeframe": "1d",
+                "start_date": "2024-01-01",
+                "end_date": "2024-01-31",
+                "total_return": 0.01,
+                "cagr": 0.01,
+                "sharpe_ratio": 0.1,
+                "psr": 0.2,
+                "p_value": 0.9,
+                "max_drawdown": -0.02,
+                "win_rate": 0.5,
+                "trade_count": 2,
+                "created_at": "2026-03-10T10:00:00Z",
+            }
+        ],
+    )
+
+    def _fake_preview_loader(backtest_id: str, limit: int = 80):
+        calls["count"] += 1
+        assert backtest_id == "preview-demo"
+        assert limit == 80
+        return [
+            EquityPoint(time="2024-01-01T00:00:00Z", equity=100000.0),
+            EquityPoint(time="2024-01-02T00:00:00Z", equity=100250.0),
+            EquityPoint(time="2024-01-03T00:00:00Z", equity=100180.0),
+        ]
+
+    monkeypatch.setattr(viewer_app_module, "load_backtest_equity_preview_points", _fake_preview_loader)
+    with viewer_app_module._BACKTEST_META_CACHE_LOCK:
+        viewer_app_module._BACKTEST_META_CACHE.clear()
+    with viewer_app_module._BACKTEST_EQUITY_PREVIEW_CACHE_LOCK:
+        viewer_app_module._BACKTEST_EQUITY_PREVIEW_CACHE.clear()
+
+    first = viewer_client.get("/api/backtests/preview-demo/equity-preview?limit=80")
+    second = viewer_client.get("/api/backtests/preview-demo/equity-preview?limit=80")
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json() == [100000.0, 100250.0, 100180.0]
+    assert second.json() == [100000.0, 100250.0, 100180.0]
+    assert calls["count"] == 1
+
+
 def test_backtests_bulk_delete_and_single_delete(viewer_client, tmp_path):
     backtests_dir = tmp_path / "backtests"
     backtests_dir.mkdir(parents=True, exist_ok=True)
