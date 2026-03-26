@@ -1670,7 +1670,10 @@ def test_backtests_list_uses_persisted_runner_stats(viewer_client, monkeypatch):
                 "start_date": "2024-01-01",
                 "end_date": "2024-01-31",
                 "total_return": 0.012345,
+                "cagr": 0.0345,
                 "sharpe_ratio": 7.777,
+                "psr": 0.8123,
+                "p_value": 0.012345,
                 "max_drawdown": -0.2345,
                 "trade_count": 0,
                 "created_at": "2026-03-07T15:00:00Z",
@@ -1701,13 +1704,131 @@ def test_backtests_list_uses_persisted_runner_stats(viewer_client, monkeypatch):
     assert item["end"] == "2024-01-31"
     assert item["created_at"] == "2026-03-07T15:00:00Z"
     assert item["sharpe"] == 7.777
-    assert item["cagr"] == 1.23
+    assert item["sharpe_ratio"] == 7.777
+    assert item["cagr"] == 3.45
     assert item["max_drawdown_pct"] == 23.45
     assert item["net_profit"] == 0.0
     assert item["net_profit_pct"] == 1.23
-    assert item["psr"] is None
-    assert item["p_value"] == 1.0
+    assert item["psr"] == pytest.approx(0.8123, abs=1e-4)
+    assert item["p_value"] == pytest.approx(0.012345, abs=1e-6)
     assert item["equity_mini"] == []
+
+
+def test_backtests_list_filters_and_sorts_new_stat_fields(viewer_client, monkeypatch):
+    import viewer.main as viewer_app_module
+
+    monkeypatch.setattr(
+        viewer_app_module,
+        "list_backtest_metadata_rows",
+        lambda: [
+            {
+                "id": "bt-a",
+                "engine": "vectorbt",
+                "strategy_name": "A",
+                "symbols": ["AAPL"],
+                "timeframe": "1d",
+                "start_date": "2024-01-01",
+                "end_date": "2024-12-31",
+                "total_return": 0.10,
+                "cagr": 0.08,
+                "sharpe_ratio": -0.5,
+                "psr": 0.40,
+                "p_value": 0.20,
+                "max_drawdown": -0.10,
+                "trade_count": 5,
+                "created_at": "2026-03-07T15:00:00Z",
+            },
+            {
+                "id": "bt-b",
+                "engine": "vectorbt",
+                "strategy_name": "B",
+                "symbols": ["MSFT"],
+                "timeframe": "1d",
+                "start_date": "2024-01-01",
+                "end_date": "2024-12-31",
+                "total_return": 0.20,
+                "cagr": 0.15,
+                "sharpe_ratio": 0.2,
+                "psr": 0.80,
+                "p_value": 0.03,
+                "max_drawdown": -0.15,
+                "trade_count": 10,
+                "created_at": "2026-03-08T15:00:00Z",
+            },
+        ],
+    )
+    with viewer_app_module._BACKTEST_META_CACHE_LOCK:
+        viewer_app_module._BACKTEST_META_CACHE.clear()
+
+    resp = viewer_client.get(
+        "/api/backtests?sort=psr&order=desc&sharpe_min=-1&sharpe_max=0&psr_min=0.3&p_value_max=0.5"
+    )
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["total"] == 1
+    assert payload["items"][0]["id"] == "bt-a"
+
+
+def test_backtests_bulk_delete_and_single_delete(viewer_client, tmp_path):
+    backtests_dir = tmp_path / "backtests"
+    backtests_dir.mkdir(parents=True, exist_ok=True)
+
+    result_a = BacktestResult(
+        meta=BacktestMeta(
+            id="delete-a",
+            created_at="2026-03-09T09:00:00Z",
+            engine="vectorbt",
+            strategies=["demo"],
+            backtest_start="2024-01-01",
+            backtest_end="2024-01-31",
+            initial_capital=100000.0,
+            data={"symbols": ["AAPL"], "timeframes": ["1d"], "source": "test_source"},
+        ),
+        trades=[],
+        equity_curve=[],
+    )
+    result_b = BacktestResult(
+        meta=BacktestMeta(
+            id="delete-b",
+            created_at="2026-03-09T09:10:00Z",
+            engine="vectorbt",
+            strategies=["demo"],
+            backtest_start="2024-01-01",
+            backtest_end="2024-01-31",
+            initial_capital=100000.0,
+            data={"symbols": ["AAPL"], "timeframes": ["1d"], "source": "test_source"},
+        ),
+        trades=[],
+        equity_curve=[],
+    )
+    result_a.save(backtests_dir / "delete-a.trades.json")
+    result_b.save(backtests_dir / "delete-b.trades.json")
+
+    bulk_resp = viewer_client.post("/api/backtests/delete-bulk", json={"ids": ["delete-a", "delete-b"]})
+    assert bulk_resp.status_code == 200
+    assert bulk_resp.json()["deleted"] == 2
+    assert not (backtests_dir / "delete-a.trades.json").exists()
+    assert not (backtests_dir / "delete-b.trades.json").exists()
+
+    result_c = BacktestResult(
+        meta=BacktestMeta(
+            id="delete-c",
+            created_at="2026-03-09T09:20:00Z",
+            engine="vectorbt",
+            strategies=["demo"],
+            backtest_start="2024-01-01",
+            backtest_end="2024-01-31",
+            initial_capital=100000.0,
+            data={"symbols": ["AAPL"], "timeframes": ["1d"], "source": "test_source"},
+        ),
+        trades=[],
+        equity_curve=[],
+    )
+    result_c.save(backtests_dir / "delete-c.trades.json")
+    single_resp = viewer_client.delete("/api/backtests/delete-c")
+    assert single_resp.status_code == 200
+    assert single_resp.json()["status"] == "deleted"
+    assert not (backtests_dir / "delete-c.trades.json").exists()
 
 
 def test_create_portfolio_persists_p_value_and_psr(viewer_client, tmp_path):

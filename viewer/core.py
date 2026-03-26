@@ -3923,6 +3923,9 @@ def _jforex_fallback_reason(exc: Exception) -> str | None:
     availability_reason_by_fragment = {
         "jpype is required": "JPype dependency missing",
         "no module named 'jpype'": "JPype dependency missing",
+        "failed to import 'com.dukascopy'": "JForex SDK classes unavailable",
+        "classnotfoundexception": "JForex SDK classes unavailable",
+        "com.dukascopy": "JForex SDK classes unavailable",
         "failed to start jvm": "Java/JVM startup failed",
         "could not resolve jforex sdk classpath": "JForex SDK classpath unavailable",
         "jforex sdk classpath": "JForex SDK classpath unavailable",

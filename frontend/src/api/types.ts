@@ -446,13 +446,46 @@ export interface BacktestListItem {
   end: string;
   created_at?: string;
   sharpe?: number | null;
+  sharpe_ratio?: number | null;
   cagr?: number | null;
   max_drawdown_pct?: number | null;
   net_profit?: number | null;
   net_profit_pct?: number | null;
   psr?: number | null;
   p_value?: number | null;
+  win_rate?: number | null;
   equity_mini?: number[];
+}
+
+export type BacktestsSortField =
+  | "created_at"
+  | "strategy_name"
+  | "trade_count"
+  | "total_return"
+  | "sharpe_ratio"
+  | "cagr"
+  | "psr"
+  | "p_value";
+
+export interface BacktestsQueryParams {
+  page?: number;
+  per_page?: number;
+  sort?: BacktestsSortField;
+  order?: "asc" | "desc";
+  strategy?: string;
+  symbol?: string;
+  timeframe?: string;
+  search?: string;
+  sharpe_min?: number;
+  sharpe_max?: number;
+  psr_min?: number;
+  psr_max?: number;
+  p_value_min?: number;
+  p_value_max?: number;
+  cagr_min?: number;
+  cagr_max?: number;
+  max_drawdown_min?: number;
+  max_drawdown_max?: number;
 }
 
 export interface BacktestsListResponse {
@@ -462,6 +495,10 @@ export interface BacktestsListResponse {
   total: number;
   sort: string;
   order: string;
+}
+
+export interface BacktestsBulkDeleteResponse {
+  deleted: number;
 }
 
 export interface BacktestDuplicateGroup {

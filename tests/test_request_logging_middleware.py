@@ -22,11 +22,14 @@ class _CaptureHandler(logging.Handler):
 def _capture_viewer_logs() -> Iterator[_CaptureHandler]:
     handler = _CaptureHandler()
     logger = viewer_main_module.logger
+    previous_level = logger.level
+    logger.setLevel(logging.DEBUG)
     logger.addHandler(handler)
     try:
         yield handler
     finally:
         logger.removeHandler(handler)
+        logger.setLevel(previous_level)
 
 
 def test_request_middleware_logs_non_api_request(_capture_viewer_logs: _CaptureHandler) -> None:
@@ -62,3 +65,18 @@ def test_request_middleware_logs_500_with_traceback(_capture_viewer_logs: _Captu
     assert getattr(record, "data", {})["status"] == 500
     assert isinstance(getattr(record, "data", {})["duration_ms"], float)
     assert record.exc_info is not None
+
+
+def test_request_middleware_uses_debug_for_quiet_polling_paths(
+    _capture_viewer_logs: _CaptureHandler,
+) -> None:
+    client = TestClient(viewer_main_module.app)
+
+    response = client.get("/api/data/tasks")
+    assert response.status_code == 200
+
+    records = [r for r in _capture_viewer_logs.records if r.getMessage() == "HTTP request completed"]
+    assert records, "Expected request completion log record"
+    record = records[-1]
+    assert getattr(record, "data", {})["path"] == "/api/data/tasks"
+    assert record.levelno == logging.DEBUG

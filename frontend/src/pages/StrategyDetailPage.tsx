@@ -645,6 +645,48 @@ export function StrategyDetailPage() {
                       : ""}
                   </span>
                 </div>
+                <div
+                  style={{
+                    marginTop: "8px",
+                    display: "flex",
+                    gap: "8px",
+                    flexWrap: "wrap",
+                  }}
+                >
+                  {backtest.psr != null ? (
+                    <span
+                      style={{
+                        borderRadius: "999px",
+                        border: "1px solid rgba(148, 163, 184, 0.32)",
+                        padding: "3px 8px",
+                        fontSize: "0.7rem",
+                        fontFamily: '"SFMono-Regular", "Cascadia Code", ui-monospace, monospace',
+                        color:
+                          Number(backtest.psr) >= 0.95
+                            ? "#3fb950"
+                            : Number(backtest.psr) >= 0.5
+                              ? "#d29922"
+                              : "#f85149",
+                      }}
+                    >
+                      PSR {(Number(backtest.psr) * 100).toFixed(0)}%
+                    </span>
+                  ) : null}
+                  {backtest.p_value != null ? (
+                    <span
+                      style={{
+                        borderRadius: "999px",
+                        border: "1px solid rgba(148, 163, 184, 0.32)",
+                        padding: "3px 8px",
+                        fontSize: "0.7rem",
+                        fontFamily: '"SFMono-Regular", "Cascadia Code", ui-monospace, monospace',
+                        color: Number(backtest.p_value) <= 0.05 ? "#3fb950" : "#f85149",
+                      }}
+                    >
+                      p-Value {Number(backtest.p_value).toFixed(3)}
+                    </span>
+                  ) : null}
+                </div>
               </Link>
             ))}
           </div>

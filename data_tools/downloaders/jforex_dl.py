@@ -118,6 +118,20 @@ def _require_jpype() -> None:
         )
 
 
+def _java_exception_types() -> tuple[type[BaseException], ...]:
+    if jpype is None:
+        return ()
+    java_exception = getattr(jpype, "JException", None)
+    if isinstance(java_exception, type):
+        return (java_exception,)
+    return ()
+
+
+def _raise_jforex_runtime_error(context: str, exc: BaseException) -> None:
+    logger.exception("%s: %s", context, exc)
+    raise RuntimeError(f"{context}: {exc}") from exc
+
+
 def _normalize_timeframe(timeframe: str) -> str:
     normalized = TIMEFRAME_ALIASES.get(timeframe.strip().lower())
     if not normalized:
@@ -213,6 +227,8 @@ def _ensure_jvm_started() -> None:
 
         try:
             jpype.startJVM(classpath=classpath, convertStrings=False)
+        except _java_exception_types() as exc:
+            _raise_jforex_runtime_error("Failed to start JVM for JForex SDK", exc)
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(
                 f"Failed to start JVM for JForex SDK. Classpath={classpath}. Error: {exc}"
@@ -222,7 +238,12 @@ def _ensure_jvm_started() -> None:
 def _resolve_java_instrument(symbol: str) -> tuple[str, str, Any]:
     _ensure_jvm_started()
 
-    from com.dukascopy.api import Instrument
+    try:
+        from com.dukascopy.api import Instrument
+    except _java_exception_types() as exc:
+        _raise_jforex_runtime_error("JForex SDK import failed for com.dukascopy.api.Instrument", exc)
+    except Exception as exc:  # noqa: BLE001
+        _raise_jforex_runtime_error("JForex SDK import failed for com.dukascopy.api.Instrument", exc)
 
     normalized_symbol, instrument_key, asset_class = _resolve_symbol_and_instrument(symbol)
     candidates = [
@@ -237,14 +258,37 @@ def _resolve_java_instrument(symbol: str) -> tuple[str, str, Any]:
             java_instrument = Instrument.fromString(candidate)
             if java_instrument is not None:
                 return normalized_symbol, asset_class, java_instrument
+        except _java_exception_types():
+            logger.debug(
+                "Instrument.fromString failed for candidate %s",
+                candidate,
+                exc_info=True,
+            )
         except Exception:  # noqa: BLE001
-            pass
+            logger.debug(
+                "Instrument.fromString failed for candidate %s",
+                candidate,
+                exc_info=True,
+            )
 
         try:
             java_instrument = getattr(Instrument, candidate.replace("/", ""))
             if java_instrument is not None:
                 return normalized_symbol, asset_class, java_instrument
+        except _java_exception_types():
+            logger.debug(
+                "Instrument attribute lookup failed for candidate %s",
+                candidate,
+                exc_info=True,
+            )
         except AttributeError:
+            continue
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "Instrument attribute lookup failed for candidate %s",
+                candidate,
+                exc_info=True,
+            )
             continue
 
     raise ValueError(f"Could not resolve JForex Instrument for symbol '{symbol}'.")
@@ -268,10 +312,15 @@ def _query_jforex_history(
 ) -> pd.DataFrame:
     _ensure_jvm_started()
 
-    from com.dukascopy.api import OfferSide, Period
-    from com.dukascopy.api.system import ClientFactory
-    from java.io import File
-    from java.util import HashSet
+    try:
+        from com.dukascopy.api import OfferSide, Period
+        from com.dukascopy.api.system import ClientFactory
+        from java.io import File
+        from java.util import HashSet
+    except _java_exception_types() as exc:
+        _raise_jforex_runtime_error("Failed to import JForex SDK runtime classes", exc)
+    except Exception as exc:  # noqa: BLE001
+        _raise_jforex_runtime_error("Failed to import JForex SDK runtime classes", exc)
 
     state = QueryState()
 
@@ -354,14 +403,20 @@ def _query_jforex_history(
                         cursor = window_end + 1
 
                 state.rows = rows
+            except _java_exception_types() as exc:
+                logger.exception("JForex history strategy failed with Java exception: %s", exc)
+                state.error = RuntimeError(f"JForex history query failed: {exc}")
             except Exception as exc:  # noqa: BLE001
+                logger.exception("JForex history strategy failed: %s", exc)
                 state.error = RuntimeError(f"JForex history query failed: {exc}")
             finally:
                 state.completed.set()
                 try:
                     context.stop()
+                except _java_exception_types():
+                    logger.debug("JForex strategy context.stop() raised Java exception", exc_info=True)
                 except Exception:  # noqa: BLE001
-                    pass
+                    logger.debug("JForex strategy context.stop() raised exception", exc_info=True)
 
         @jpype.JOverride
         def onAccount(self, account):  # noqa: N802
@@ -415,19 +470,25 @@ def _query_jforex_history(
 
         if state.error is not None:
             raise state.error
+    except _java_exception_types() as exc:
+        _raise_jforex_runtime_error("JForex SDK request execution failed", exc)
 
     finally:
         if client is not None and process_id is not None:
             try:
                 client.stopStrategy(process_id)
+            except _java_exception_types():
+                logger.debug("JForex client.stopStrategy() raised Java exception", exc_info=True)
             except Exception:  # noqa: BLE001
-                pass
+                logger.debug("JForex client.stopStrategy() raised exception", exc_info=True)
         if client is not None:
             try:
                 if bool(client.isConnected()):
                     client.disconnect()
+            except _java_exception_types():
+                logger.debug("JForex client.disconnect() raised Java exception", exc_info=True)
             except Exception:  # noqa: BLE001
-                pass
+                logger.debug("JForex client.disconnect() raised exception", exc_info=True)
 
     if base_timeframe == "tick":
         df = pd.DataFrame(
@@ -575,7 +636,12 @@ class JForexDownloader(Downloader):
             Path(cache_dir).expanduser().resolve() if cache_dir else (DATA_DIR / ".jforex-cache")
         )
 
-        normalized_symbol, asset_class, java_instrument = _resolve_java_instrument(symbol)
+        try:
+            normalized_symbol, asset_class, java_instrument = _resolve_java_instrument(symbol)
+        except _java_exception_types() as exc:
+            _raise_jforex_runtime_error("JForex instrument resolution failed", exc)
+        except Exception as exc:  # noqa: BLE001
+            _raise_jforex_runtime_error("JForex instrument resolution failed", exc)
         out_path = self._make_output_path(output_dir, asset_class, normalized_symbol, target_tf)
 
         effective_start = self._resolve_resume_start(out_path, start) or "2003-01-01"

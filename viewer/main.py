@@ -641,6 +641,57 @@ class BacktestsDeduplicateResponse(SQLModel):
     groups_affected: int
 
 
+class BacktestsBulkDeleteRequest(SQLModel):
+    ids: list[str]
+
+
+_QUIET_EXACT_PATHS = {
+    "/api/data/tasks",
+    "/api/live/accounts",
+    "/api/live/deployments",
+}
+_QUIET_PREFIX_PATHS = (
+    "/api/data/tasks/",
+    "/api/live/balances/",
+    "/api/live/stats/",
+    "/api/live/trades/",
+)
+_UVICORN_ACCESS_PATH_RE = re.compile(r'"[A-Z]+ (?P<path>/[^ ]*) HTTP/[^"]+"')
+
+
+def _is_quiet_request_path(path: str) -> bool:
+    normalized = str(path or "").split("?", 1)[0]
+    if normalized in _QUIET_EXACT_PATHS:
+        return True
+    return any(normalized.startswith(prefix) for prefix in _QUIET_PREFIX_PATHS)
+
+
+def _is_quiet_access_log_message(message: str) -> bool:
+    matched = _UVICORN_ACCESS_PATH_RE.search(str(message or ""))
+    if matched is None:
+        return False
+    return _is_quiet_request_path(matched.group("path"))
+
+
+class _QuietAccessLogFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+        except Exception:
+            return True
+        return not _is_quiet_access_log_message(message)
+
+
+def _configure_uvicorn_access_log_filter() -> None:
+    access_logger = logging.getLogger("uvicorn.access")
+    if any(isinstance(flt, _QuietAccessLogFilter) for flt in access_logger.filters):
+        return
+    access_logger.addFilter(_QuietAccessLogFilter())
+
+
+_configure_uvicorn_access_log_filter()
+
+
 @app.middleware("http")
 async def static_spa_middleware(request: Request, call_next):
     path = request.url.path
@@ -686,7 +737,8 @@ async def api_request_logging_middleware(request: Request, call_next):
         raise
 
     duration_ms = round((time.perf_counter() - started_at) * 1000.0, 2)
-    logger.info(
+    log = logger.debug if _is_quiet_request_path(path) else logger.info
+    log(
         "HTTP request completed",
         extra={
             "data": {
@@ -926,7 +978,16 @@ def _normalize_order(value: str, *, default: str = "desc") -> str:
 
 def _normalize_backtest_sort(value: str) -> str:
     normalized = str(value or "created_at").strip().lower()
-    if normalized in {"created_at", "strategy_name", "trade_count", "total_return", "sharpe_ratio"}:
+    if normalized in {
+        "created_at",
+        "strategy_name",
+        "trade_count",
+        "total_return",
+        "sharpe_ratio",
+        "cagr",
+        "psr",
+        "p_value",
+    }:
         return normalized
     return "created_at"
 
@@ -934,7 +995,7 @@ def _normalize_backtest_sort(value: str) -> str:
 def _backtest_sort_key(item: dict[str, Any], sort_field: str) -> Any:
     if sort_field in {"trade_count"}:
         return int(item.get(sort_field, 0) or 0)
-    if sort_field in {"total_return", "sharpe_ratio"}:
+    if sort_field in {"total_return", "sharpe_ratio", "cagr", "psr", "p_value"}:
         return float(item.get(sort_field, 0.0) or 0.0)
     return str(item.get(sort_field, "") or "")
 
@@ -994,7 +1055,10 @@ def _backtest_summary_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
     start = str(meta.get("start_date") or "")
     end = str(meta.get("end_date") or "")
     total_return_decimal = _safe_float(meta.get("total_return"), 0.0)
+    cagr_decimal = _safe_float(meta.get("cagr"), total_return_decimal)
     sharpe_ratio = _safe_float(meta.get("sharpe_ratio"), 0.0)
+    psr = _safe_float(meta.get("psr"), 0.0)
+    p_value = _safe_float(meta.get("p_value"), 1.0)
     max_drawdown_decimal = abs(_safe_float(meta.get("max_drawdown"), 0.0))
     trade_count = max(int(meta.get("trade_count", 0) or 0), 0)
     backtest_id = str(meta.get("id") or "").strip()
@@ -1031,12 +1095,13 @@ def _backtest_summary_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
         "end": end,
         "created_at": str(meta.get("created_at") or ""),
         "sharpe": sharpe_ratio,
-        "cagr": round(total_return_decimal * 100.0, 2),
+        "sharpe_ratio": sharpe_ratio,
+        "cagr": round(cagr_decimal * 100.0, 2),
         "max_drawdown_pct": round(max_drawdown_decimal * 100.0, 2),
         "net_profit": 0.0,
         "net_profit_pct": round(total_return_decimal * 100.0, 2),
-        "psr": None,
-        "p_value": 1.0,
+        "psr": round(psr, 4),
+        "p_value": round(p_value, 6),
         "equity_mini": equity_mini,
     }
 
@@ -1061,6 +1126,50 @@ def _backtest_meta_list_sorted(sort_field: str, order: str) -> list[dict[str, An
         reverse=reverse,
     )
     return items
+
+
+def _apply_backtest_numeric_filters(
+    items: list[dict[str, Any]],
+    *,
+    sharpe_min: float | None,
+    sharpe_max: float | None,
+    psr_min: float | None,
+    psr_max: float | None,
+    p_value_min: float | None,
+    p_value_max: float | None,
+    cagr_min: float | None,
+    cagr_max: float | None,
+) -> list[dict[str, Any]]:
+    filtered = items
+
+    def in_range(value: float, lower: float | None, upper: float | None) -> bool:
+        if lower is not None and value < lower:
+            return False
+        if upper is not None and value > upper:
+            return False
+        return True
+
+    if sharpe_min is not None or sharpe_max is not None:
+        filtered = [
+            item
+            for item in filtered
+            if in_range(_safe_float(item.get("sharpe_ratio"), 0.0), sharpe_min, sharpe_max)
+        ]
+    if psr_min is not None or psr_max is not None:
+        filtered = [
+            item for item in filtered if in_range(_safe_float(item.get("psr"), 0.0), psr_min, psr_max)
+        ]
+    if p_value_min is not None or p_value_max is not None:
+        filtered = [
+            item
+            for item in filtered
+            if in_range(_safe_float(item.get("p_value"), 1.0), p_value_min, p_value_max)
+        ]
+    if cagr_min is not None or cagr_max is not None:
+        filtered = [
+            item for item in filtered if in_range(_safe_float(item.get("cagr"), 0.0), cagr_min, cagr_max)
+        ]
+    return filtered
 
 
 def _group_duplicate_backtests() -> tuple[list[dict[str, Any]], int]:
@@ -1113,6 +1222,24 @@ def _group_duplicate_backtests() -> tuple[list[dict[str, Any]], int]:
         reverse=True,
     )
     return duplicates, total_items
+
+
+def _delete_backtest_with_artifacts(backtest_id: str) -> bool:
+    normalized_id = str(backtest_id or "").strip()
+    if not normalized_id:
+        return False
+
+    deleted_in_db = delete_backtest(normalized_id)
+    _remove_backtest_meta_cache(normalized_id)
+    json_path = BACKTESTS_DIR / f"{normalized_id}.trades.json"
+    deleted_json = False
+    if json_path.exists():
+        try:
+            json_path.unlink()
+            deleted_json = True
+        except OSError as exc:
+            logger.warning("Could not delete JSON backtest %s: %s", normalized_id, exc)
+    return deleted_in_db or deleted_json
 
 
 def _task_config_payload(task: dict[str, Any]) -> dict[str, Any]:
@@ -2632,10 +2759,29 @@ async def list_backtests(
     per_page: int = Query(default=50, ge=1, le=50),
     sort: str = Query(default="created_at"),
     order: str = Query(default="desc"),
+    sharpe_min: float | None = Query(default=None),
+    sharpe_max: float | None = Query(default=None),
+    psr_min: float | None = Query(default=None),
+    psr_max: float | None = Query(default=None),
+    p_value_min: float | None = Query(default=None),
+    p_value_max: float | None = Query(default=None),
+    cagr_min: float | None = Query(default=None),
+    cagr_max: float | None = Query(default=None),
 ) -> BacktestsListResponse:
     normalized_sort = _normalize_backtest_sort(sort)
     normalized_order = _normalize_order(order, default="desc")
     sorted_items = _backtest_meta_list_sorted(normalized_sort, normalized_order)
+    sorted_items = _apply_backtest_numeric_filters(
+        sorted_items,
+        sharpe_min=sharpe_min,
+        sharpe_max=sharpe_max,
+        psr_min=psr_min,
+        psr_max=psr_max,
+        p_value_min=p_value_min,
+        p_value_max=p_value_max,
+        cagr_min=cagr_min,
+        cagr_max=cagr_max,
+    )
     total = len(sorted_items)
     offset = (page - 1) * per_page
     page_items = sorted_items[offset : offset + per_page]
@@ -2680,15 +2826,8 @@ async def deduplicate_backtests() -> BacktestsDeduplicateResponse:
             backtest_id = str(entry.get("id") or "")
             if not backtest_id:
                 continue
-            if delete_backtest(backtest_id):
+            if _delete_backtest_with_artifacts(backtest_id):
                 deleted_ids.append(backtest_id)
-                _remove_backtest_meta_cache(backtest_id)
-                json_path = BACKTESTS_DIR / f"{backtest_id}.trades.json"
-                if json_path.exists():
-                    try:
-                        json_path.unlink()
-                    except OSError as exc:
-                        logger.warning("Could not delete JSON backtest %s: %s", backtest_id, exc)
                 removed_in_group = True
         if removed_in_group:
             affected += 1
@@ -2698,6 +2837,20 @@ async def deduplicate_backtests() -> BacktestsDeduplicateResponse:
         kept_ids=kept_ids,
         groups_affected=affected,
     )
+
+
+@app.post("/api/backtests/delete-bulk", response_model=dict[str, int])
+async def delete_backtests_bulk(payload: BacktestsBulkDeleteRequest) -> dict[str, int]:
+    deleted = 0
+    seen: set[str] = set()
+    for raw_id in payload.ids:
+        backtest_id = str(raw_id or "").strip()
+        if not backtest_id or backtest_id in seen:
+            continue
+        seen.add(backtest_id)
+        if _delete_backtest_with_artifacts(backtest_id):
+            deleted += 1
+    return {"deleted": deleted}
 
 
 @app.get("/api/backtest/{backtest_id}", response_model=dict[str, Any])
@@ -2712,6 +2865,13 @@ async def get_backtest(backtest_id: str) -> dict[str, Any]:
     except Exception as exc:
         logger.exception("Failed to serialize backtest '%s': %s", backtest_id, exc)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.delete("/api/backtests/{backtest_id}", response_model=dict[str, Any])
+async def delete_single_backtest(backtest_id: str) -> dict[str, Any]:
+    if not _delete_backtest_with_artifacts(backtest_id):
+        raise HTTPException(status_code=404, detail=f"Backtest '{backtest_id}' not found")
+    return {"id": backtest_id, "status": "deleted"}
 
 
 @app.patch("/api/backtests/{backtest_id}", response_model=dict[str, Any])
