@@ -473,6 +473,7 @@ export interface BacktestMetadataItem {
   start_date: string;
   end_date: string;
   created_at: string;
+  equity_preview?: number[];
 }
 
 export type BacktestsSortField =
@@ -798,10 +799,16 @@ export interface DataTaskStatusResponse {
   name?: string;
   description?: string;
   kind?: string;
+  category?: "backtest" | "optimization" | "download" | "resample" | "live";
   source?: string;
   status: string;
   created_at?: string;
   updated_at?: string;
+  started_at?: string;
+  finished_at?: string;
+  elapsed_seconds?: number | null;
+  eta_seconds?: number | null;
+  error?: string | null;
   log?: string;
   progress?: DataTaskProgress;
   can_pause?: boolean;

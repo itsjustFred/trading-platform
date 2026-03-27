@@ -574,7 +574,7 @@ export function DownloadModal({
                     style={inputStyle}
                   >
                     <option value="dukascopy">Dukascopy</option>
-                    <option value="jforex">JForex (auto-fallback)</option>
+                    <option value="jforex">JForex</option>
                     <option value="yfinance">Yahoo Finance</option>
                     <option value="dolthub">Dolthub (Update All)</option>
                   </select>

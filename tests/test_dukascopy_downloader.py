@@ -253,3 +253,31 @@ def test_download_bi5_files_caps_backoff_and_resets_after_cooldown(monkeypatch):
     assert sleep_calls == [10.0, 15.0]
     assert any("backoff cap reached at 10000 ms" in line for line in log_lines)
     assert any("starting 15s cooldown and resetting pause" in line for line in log_lines)
+
+
+def test_jforex_classpath_bootstraps_from_jnlp_when_no_local_jars(monkeypatch, tmp_path: Path):
+    import data_tools.downloaders.jforex_dl as jforex
+
+    monkeypatch.setattr(jforex, "DATA_DIR", tmp_path)
+    monkeypatch.setenv("DUKASCOPY_JNLP_URL", "https://example.com/jforex.jnlp")
+    monkeypatch.delenv("JFOREX_CLASSPATH", raising=False)
+    monkeypatch.delenv("JFOREX_JARS", raising=False)
+    monkeypatch.delenv("JFOREX_HOME", raising=False)
+
+    monkeypatch.setattr(
+        jforex,
+        "_download_jforex_jars_from_jnlp",
+        lambda jnlp_url, target_dir: [target_dir / "api.jar", target_dir / "sdk.jar"],
+    )
+
+    classpath = jforex._resolve_jforex_classpath()
+    expected = [str(tmp_path / ".jforex-sdk" / "api.jar"), str(tmp_path / ".jforex-sdk" / "sdk.jar")]
+    assert classpath == expected
+
+
+def test_jforex_classpath_prefers_explicit_env(monkeypatch):
+    import data_tools.downloaders.jforex_dl as jforex
+
+    monkeypatch.setenv("JFOREX_CLASSPATH", "/tmp/a.jar:/tmp/b.jar")
+    classpath = jforex._resolve_jforex_classpath()
+    assert classpath == ["/tmp/a.jar", "/tmp/b.jar"]

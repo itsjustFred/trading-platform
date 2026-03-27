@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
 from dotenv import load_dotenv
-from sqlalchemy import JSON, Column, String, delete, func, text
+from sqlalchemy import JSON, Column, String, delete, event, func, text
 from sqlalchemy.engine import Connection
 from sqlmodel import Field, Session, SQLModel, create_engine, select
 
@@ -42,7 +43,30 @@ def _sqlite_url(path: Path) -> str:
     return f"sqlite:///{path.as_posix()}"
 
 
-ENGINE = create_engine(_sqlite_url(DB_PATH), echo=False)
+ENGINE = create_engine(
+    _sqlite_url(DB_PATH),
+    echo=False,
+    connect_args={
+        "check_same_thread": False,
+        "timeout": 30.0,
+    },
+)
+
+
+@event.listens_for(ENGINE, "connect")
+def _configure_sqlite_connection(dbapi_connection: Any, _connection_record: Any) -> None:
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.execute("PRAGMA busy_timeout=30000")
+        cursor.execute("PRAGMA foreign_keys=ON")
+    finally:
+        cursor.close()
+
+
+_DB_INIT_LOCK = threading.Lock()
+_DB_INITIALIZED = False
 
 
 class BacktestRecord(SQLModel, table=True):
@@ -336,9 +360,17 @@ def get_session() -> Iterator[Session]:
 
 
 def init_db() -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    SQLModel.metadata.create_all(ENGINE)
-    _migrate_schema()
+    global _DB_INITIALIZED
+    if _DB_INITIALIZED:
+        return
+
+    with _DB_INIT_LOCK:
+        if _DB_INITIALIZED:
+            return
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        SQLModel.metadata.create_all(ENGINE)
+        _migrate_schema()
+        _DB_INITIALIZED = True
 
 
 def _table_column_names(connection: Connection, table_name: str) -> set[str]:
@@ -1224,6 +1256,73 @@ def load_backtest_equity_preview_points(backtest_id: str, limit: int = 80) -> li
             continue
         points.append(EquityPointModel(time=row.time, equity=row.equity))
     return points
+
+
+def load_backtest_equity_preview_map(
+    backtest_ids: list[str],
+    limit: int = 50,
+) -> dict[str, list[float]]:
+    normalized_ids = [str(backtest_id).strip() for backtest_id in backtest_ids if str(backtest_id).strip()]
+    if not normalized_ids:
+        return {}
+
+    try:
+        normalized_limit = int(limit)
+    except (TypeError, ValueError):
+        normalized_limit = 50
+    normalized_limit = max(1, min(normalized_limit, 200))
+
+    init_db()
+    params: dict[str, Any] = {"limit": normalized_limit}
+    placeholders: list[str] = []
+    for index, backtest_id in enumerate(normalized_ids):
+        param_name = f"id_{index}"
+        params[param_name] = backtest_id
+        placeholders.append(f":{param_name}")
+
+    ranked_query = text(
+        f"""
+        WITH ranked AS (
+            SELECT
+                backtest_id,
+                time,
+                equity,
+                ROW_NUMBER() OVER (
+                    PARTITION BY backtest_id
+                    ORDER BY time DESC, id DESC
+                ) AS row_number
+            FROM equity_points
+            WHERE backtest_id IN ({", ".join(placeholders)})
+        )
+        SELECT backtest_id, time, equity
+        FROM ranked
+        WHERE row_number <= :limit
+        ORDER BY backtest_id ASC, time ASC
+        """
+    )
+
+    with get_session() as session:
+        rows = session.exec(ranked_query, params=params).all()
+
+    previews: dict[str, list[float]] = {backtest_id: [] for backtest_id in normalized_ids}
+    for row in rows:
+        if hasattr(row, "_mapping"):
+            mapping = getattr(row, "_mapping")
+            backtest_id = str(mapping.get("backtest_id") or "").strip()
+            equity_value = mapping.get("equity")
+        elif isinstance(row, (tuple, list)):
+            backtest_id = str(row[0] or "").strip() if len(row) > 0 else ""
+            equity_value = row[2] if len(row) > 2 else None
+        else:
+            continue
+        if not backtest_id or backtest_id not in previews:
+            continue
+        try:
+            previews[backtest_id].append(float(equity_value))
+        except (TypeError, ValueError):
+            continue
+
+    return previews
 
 
 def load_backtest_result(backtest_id: str) -> BacktestResult | None:

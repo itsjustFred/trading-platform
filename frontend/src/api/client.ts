@@ -146,7 +146,7 @@ export const getBacktests = (params?: BacktestsQueryParams) => {
   return fetchJSON<BacktestsListResponse>(`/backtests${queryString ? `?${queryString}` : ""}`);
 };
 export const getBacktestsAll = () =>
-  fetchJSON<BacktestMetadataItem[]>("/backtests/all");
+  fetchJSON<BacktestMetadataItem[]>("/backtests/all?include_equity_preview=true&preview_limit=50");
 export const getBacktestEquityPreview = (id: string, limit = 80) =>
   fetchJSON<number[]>(
     `/backtests/${encodeURIComponent(id)}/equity-preview?limit=${Math.max(50, Math.min(100, limit))}`,

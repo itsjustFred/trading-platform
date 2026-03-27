@@ -75,6 +75,7 @@ from shared.database import (
     list_live_signal_executions_for_deployments,
     load_backtest_metadata_row,
     load_backtest_equity_preview_points,
+    load_backtest_equity_preview_map,
     load_live_account_stats_inputs,
     load_backtest_result,
     mark_background_tasks_interrupted,
@@ -207,6 +208,29 @@ async def _prewarm_backtest_metadata_background() -> None:
         logger.warning("Backtest metadata prewarm failed: %s", exc)
 
 
+async def _prewarm_jforex_jvm_background() -> None:
+    try:
+        from data_tools.downloaders import jforex_dl
+
+        await asyncio.to_thread(jforex_dl.prewarm_jvm)
+        logger.info("JVM prewarmed for JForex")
+    except ImportError:
+        logger.info("JPype not available, JForex disabled")
+    except RuntimeError as exc:
+        message = str(exc).lower()
+        if (
+            "jpype is required" in message
+            or "failed to import 'com.dukascopy'" in message
+            or "jforex sdk classpath" in message
+            or "failed to start jvm" in message
+        ):
+            logger.info("JPype not available, JForex disabled")
+            return
+        logger.warning("JForex JVM prewarm failed: %s", exc)
+    except Exception as exc:
+        logger.warning("JForex JVM prewarm failed: %s", exc)
+
+
 def _resume_interrupted_tasks() -> None:
     records = list_background_task_records(statuses=["interrupted", "queued"])
     for record in records:
@@ -296,6 +320,7 @@ def _resume_interrupted_tasks() -> None:
                 end = str(raw_config.get("end") or "").strip() or None
 
                 if downloader in {"dukascopy", "jforex"} and symbols and timeframes:
+                    downloader = "dukascopy" if downloader == "dukascopy" else "jforex"
                     cmd = raw_config.get("command")
                     if not isinstance(cmd, list) or not cmd:
                         logger.warning(
@@ -319,42 +344,25 @@ def _resume_interrupted_tasks() -> None:
 
                     logger.info("Auto-restarting %s data task %s", downloader, task_id)
                     cmd_list = [str(part) for part in cmd]
-                    if downloader == "jforex":
-                        _start_jforex_task(
-                            task_id,
-                            cmd_list,
-                            source_label=source or "jforex",
-                            symbols=symbols,
-                            timeframes=timeframes,
-                            start=start,
-                            end=end,
-                            offer_side=str(raw_config.get("offer_side") or "bid"),
-                            merge_tick=bool(raw_config.get("merge_tick", False)),
-                            merge_s1=bool(raw_config.get("merge_s1", False)),
-                            batch_size=_safe_int(raw_config.get("batch_size"), 10),
-                            pause_ms=_safe_int(raw_config.get("pause_ms"), 1000),
-                            query_timeout_seconds=_safe_int(raw_config.get("query_timeout_seconds"), 900),
-                            total_items=total_items or max(len(symbols) * len(timeframes), 1),
-                            name=name,
-                            description=description,
-                        )
-                    else:
-                        _start_dukascopy_task(
-                            task_id,
-                            cmd_list,
-                            symbols=symbols,
-                            timeframes=timeframes,
-                            start=start,
-                            end=end,
-                            price_type=str(raw_config.get("price_type") or "bid"),
-                            merge_tick=bool(raw_config.get("merge_tick", False)),
-                            merge_s1=bool(raw_config.get("merge_s1", False)),
-                            batch_size=_safe_int(raw_config.get("batch_size"), 10),
-                            pause_ms=_safe_int(raw_config.get("pause_ms"), 1000),
-                            total_items=total_items or max(len(symbols) * len(timeframes), 1),
-                            name=name,
-                            description=description,
-                        )
+                    _start_jforex_task(
+                        task_id,
+                        cmd_list,
+                        source_label=downloader,
+                        allow_native_fallback=(downloader == "dukascopy"),
+                        symbols=symbols,
+                        timeframes=timeframes,
+                        start=start,
+                        end=end,
+                        offer_side=str(raw_config.get("offer_side") or raw_config.get("price_type") or "bid"),
+                        merge_tick=bool(raw_config.get("merge_tick", False)),
+                        merge_s1=bool(raw_config.get("merge_s1", False)),
+                        batch_size=_safe_int(raw_config.get("batch_size"), 10),
+                        pause_ms=_safe_int(raw_config.get("pause_ms"), 1000),
+                        query_timeout_seconds=_safe_int(raw_config.get("query_timeout_seconds"), 900),
+                        total_items=total_items or max(len(symbols) * len(timeframes), 1),
+                        name=name,
+                        description=description,
+                    )
                     _apply_recovery_data_metadata(
                         task_id,
                         command=cmd_list,
@@ -445,10 +453,12 @@ async def lifespan(app: FastAPI):
     live_accounts_prewarm_task = asyncio.create_task(_prewarm_live_accounts_background())
     strategies_prewarm_task = asyncio.create_task(_prewarm_strategies_background())
     backtests_meta_prewarm_task = asyncio.create_task(_prewarm_backtest_metadata_background())
+    jforex_jvm_prewarm_task = asyncio.create_task(_prewarm_jforex_jvm_background())
     app.state.data_views_prewarm_task = data_views_prewarm_task
     app.state.live_accounts_prewarm_task = live_accounts_prewarm_task
     app.state.strategies_prewarm_task = strategies_prewarm_task
     app.state.backtests_meta_prewarm_task = backtests_meta_prewarm_task
+    app.state.jforex_jvm_prewarm_task = jforex_jvm_prewarm_task
     await asyncio.to_thread(mark_background_tasks_interrupted, from_statuses=["queued", "running"])
     await asyncio.to_thread(_resume_interrupted_tasks)
     try:
@@ -459,6 +469,7 @@ async def lifespan(app: FastAPI):
             live_accounts_prewarm_task,
             strategies_prewarm_task,
             backtests_meta_prewarm_task,
+            jforex_jvm_prewarm_task,
         ):
             if not task.done():
                 task.cancel()
@@ -467,6 +478,7 @@ async def lifespan(app: FastAPI):
             live_accounts_prewarm_task,
             strategies_prewarm_task,
             backtests_meta_prewarm_task,
+            jforex_jvm_prewarm_task,
         ):
             with suppress(asyncio.CancelledError):
                 await task
@@ -787,8 +799,9 @@ def _restart_interrupted_task(task_id: str) -> dict[str, Any]:
     task = _get_task(task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
-    if str(task.get("status") or "").lower() != "interrupted":
-        raise HTTPException(status_code=409, detail="Only interrupted tasks can be restarted")
+    current_status = str(task.get("status") or "").lower()
+    if current_status not in {"interrupted", "failed"}:
+        raise HTTPException(status_code=409, detail="Only interrupted or failed tasks can be restarted")
 
     record = get_background_task_record(task_id)
     if record is None:
@@ -852,13 +865,43 @@ def _restart_interrupted_task(task_id: str) -> dict[str, Any]:
             created_at=str(record.get("created_at") or ""),
             updated_at=_now_iso(),
         )
-        return {
-            "task_id": task_id,
-            "status": "completed",
-            "restarted_task_id": restarted.get("task_id"),
-        }
+        payload = _task_action_payload(task_id)
+        payload["restarted_task_id"] = restarted.get("task_id") if isinstance(restarted, dict) else None
+        return payload
 
     if task_type == "data":
+        downloader = str(config_payload.get("downloader") or "").strip().lower()
+        if downloader == "jforex":
+            _update_task_fields(
+                task_id,
+                status="interrupted",
+                progress=100.0,
+                progress_detail={
+                    "completed": 0,
+                    "failed": 1,
+                    "total": max(int(task.get("total_items", 0) or 0), 0),
+                    "percent": 100.0,
+                    "current": "JForex task can only be restarted from Data page controls",
+                },
+            )
+            refreshed_task = _get_task(task_id)
+            refreshed_progress = dict((refreshed_task or {}).get("progress_detail") or {})
+            upsert_background_task_record(
+                task_id=task_id,
+                task_type=task_type,
+                status="interrupted",
+                config_json=_task_config_payload(refreshed_task) if refreshed_task is not None else config_payload,
+                progress_message=str(
+                    refreshed_progress.get("current")
+                    or "JForex task requires manual restart from Data page"
+                ),
+                name=str(record.get("name") or ""),
+                description=str(record.get("description") or ""),
+                source=str(record.get("source") or ""),
+                created_at=str(record.get("created_at") or ""),
+                updated_at=_now_iso(),
+            )
+            return _task_action_payload(task_id)
         upsert_background_task_record(
             task_id=task_id,
             task_type=task_type,
@@ -883,7 +926,7 @@ def _restart_interrupted_task(task_id: str) -> dict[str, Any]:
                 "current": "Restart requested; start a new data task",
             },
         )
-        return {"task_id": task_id, "status": "queued"}
+        return _task_action_payload(task_id)
 
     raise HTTPException(status_code=409, detail=f"Task type '{task_type}' does not support restart")
 
@@ -962,6 +1005,114 @@ def _safe_float(value: object, default: float = 0.0) -> float:
     return numeric
 
 
+def _parse_iso_datetime(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    parsed = pd.to_datetime(text, utc=True, errors="coerce")
+    if pd.isna(parsed):
+        return None
+    return parsed.to_pydatetime()
+
+
+def _task_category_from_kind_source(kind: Any, source: Any) -> str:
+    kind_key = str(kind or "").strip().lower()
+    source_key = str(source or "").strip().lower()
+    if kind_key == "backtest":
+        return "backtest"
+    if kind_key in {"optimization", "agent_conversion"}:
+        return "optimization"
+    if kind_key == "live":
+        return "live"
+    if source_key == "resample":
+        return "resample"
+    if source_key == "live":
+        return "live"
+    return "download"
+
+
+def _sanitize_progress_history(entries: Any) -> list[dict[str, Any]]:
+    history: list[dict[str, Any]] = []
+    if not isinstance(entries, list):
+        return history
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        timestamp = str(entry.get("timestamp") or "").strip()
+        if not timestamp:
+            continue
+        percent = _safe_float(entry.get("percent"), default=float("nan"))
+        if not math.isfinite(percent):
+            continue
+        history.append(
+            {
+                "timestamp": timestamp,
+                "percent": max(0.0, min(100.0, round(percent, 2))),
+            }
+        )
+    return history[-120:]
+
+
+def _ensure_task_runtime_metadata(task: dict[str, Any]) -> None:
+    started_at = str(task.get("started_at") or task.get("created_at") or _now_iso())
+    task["started_at"] = started_at
+    task["category"] = str(
+        task.get("category") or _task_category_from_kind_source(task.get("kind"), task.get("source"))
+    )
+    history = _sanitize_progress_history(task.get("progress_history"))
+    if not history:
+        history = [
+            {
+                "timestamp": started_at,
+                "percent": max(0.0, min(100.0, _safe_float(task.get("progress"), 0.0))),
+            }
+        ]
+    task["progress_history"] = history
+
+
+def _append_task_progress_history(task: dict[str, Any], percent: Any) -> None:
+    numeric = _safe_float(percent, default=float("nan"))
+    if not math.isfinite(numeric):
+        return
+    _ensure_task_runtime_metadata(task)
+    bounded = max(0.0, min(100.0, round(numeric, 2)))
+    history = list(task.get("progress_history") or [])
+    if history:
+        last = history[-1]
+        if _safe_float(last.get("percent"), default=-1.0) == bounded:
+            return
+    history.append({"timestamp": _now_iso(), "percent": bounded})
+    task["progress_history"] = history[-120:]
+
+
+def _task_elapsed_seconds(task: dict[str, Any], status: str) -> int | None:
+    started = _parse_iso_datetime(task.get("started_at") or task.get("created_at"))
+    if started is None:
+        return None
+    if status in FINAL_TASK_STATUSES:
+        ended = _parse_iso_datetime(task.get("finished_at") or task.get("updated_at")) or datetime.now(
+            timezone.utc
+        )
+    else:
+        ended = datetime.now(timezone.utc)
+    elapsed = (ended - started).total_seconds()
+    if elapsed < 0:
+        return 0
+    return int(round(elapsed))
+
+
+def _task_eta_seconds(task: dict[str, Any], status: str, elapsed_seconds: int | None) -> int | None:
+    if elapsed_seconds is None or status in FINAL_TASK_STATUSES:
+        return None
+    progress = _safe_float(task.get("progress"), 0.0)
+    if progress <= 0.0 or progress >= 100.0:
+        return None
+    eta = elapsed_seconds * (100.0 - progress) / progress
+    if not math.isfinite(eta):
+        return None
+    return max(0, int(round(eta)))
+
+
 def _json_safe(value: Any) -> Any:
     try:
         return json.loads(json.dumps(value, default=str))
@@ -1010,11 +1161,18 @@ def _refresh_backtest_meta_cache() -> int:
         if not backtest_id:
             continue
         next_cache[backtest_id] = dict(row)
+    backtest_ids = list(next_cache.keys())
+    preview_map = load_backtest_equity_preview_map(backtest_ids, limit=50) if backtest_ids else {}
+    next_preview_cache = {
+        (backtest_id, 50): list(preview_map.get(backtest_id, []))
+        for backtest_id in backtest_ids
+    }
     with _BACKTEST_META_CACHE_LOCK:
         _BACKTEST_META_CACHE.clear()
         _BACKTEST_META_CACHE.update(next_cache)
     with _BACKTEST_EQUITY_PREVIEW_CACHE_LOCK:
         _BACKTEST_EQUITY_PREVIEW_CACHE.clear()
+        _BACKTEST_EQUITY_PREVIEW_CACHE.update(next_preview_cache)
     return len(next_cache)
 
 
@@ -1031,12 +1189,27 @@ def _upsert_backtest_meta_cache(backtest_id: str) -> None:
         return
 
     row = load_backtest_metadata_row(normalized_id)
+    preview_values: list[float] = []
+    if row is not None:
+        preview_points = load_backtest_equity_preview_points(normalized_id, 50)
+        for point in preview_points:
+            try:
+                preview_values.append(float(point.equity))
+            except (TypeError, ValueError):
+                continue
+
     with _BACKTEST_META_CACHE_LOCK:
         if row is None:
             _BACKTEST_META_CACHE.pop(normalized_id, None)
         else:
             _BACKTEST_META_CACHE[normalized_id] = dict(row)
-    _remove_backtest_equity_preview_cache(normalized_id)
+
+    with _BACKTEST_EQUITY_PREVIEW_CACHE_LOCK:
+        stale_keys = [key for key in _BACKTEST_EQUITY_PREVIEW_CACHE if key[0] == normalized_id]
+        for key in stale_keys:
+            _BACKTEST_EQUITY_PREVIEW_CACHE.pop(key, None)
+        if row is not None:
+            _BACKTEST_EQUITY_PREVIEW_CACHE[(normalized_id, 50)] = list(preview_values)
 
 
 def _remove_backtest_meta_cache(backtest_id: str) -> None:
@@ -1092,6 +1265,66 @@ def _cached_backtest_equity_preview(backtest_id: str, *, limit: int = 80) -> lis
     with _BACKTEST_EQUITY_PREVIEW_CACHE_LOCK:
         _BACKTEST_EQUITY_PREVIEW_CACHE[cache_key] = list(values)
     return values
+
+
+def _cached_backtest_equity_preview_only(backtest_id: str, *, limit: int = 50) -> list[float]:
+    normalized_id = str(backtest_id or "").strip()
+    if not normalized_id:
+        return []
+
+    try:
+        normalized_limit = int(limit)
+    except (TypeError, ValueError):
+        normalized_limit = 50
+    normalized_limit = max(1, min(normalized_limit, 200))
+
+    cache_key = (normalized_id, normalized_limit)
+    with _BACKTEST_EQUITY_PREVIEW_CACHE_LOCK:
+        cached = _BACKTEST_EQUITY_PREVIEW_CACHE.get(cache_key)
+        if cached is not None:
+            return list(cached)
+
+        fallback_keys = [
+            key for key in _BACKTEST_EQUITY_PREVIEW_CACHE.keys() if key[0] == normalized_id
+        ]
+        if not fallback_keys:
+            return []
+        fallback_keys.sort(key=lambda key: key[1], reverse=True)
+        return list(_BACKTEST_EQUITY_PREVIEW_CACHE.get(fallback_keys[0], []))
+
+
+def _bulk_warm_backtest_equity_preview(backtest_ids: list[str], *, limit: int = 50) -> None:
+    normalized_ids = [str(backtest_id or "").strip() for backtest_id in backtest_ids if str(backtest_id or "").strip()]
+    if not normalized_ids:
+        return
+
+    try:
+        normalized_limit = int(limit)
+    except (TypeError, ValueError):
+        normalized_limit = 50
+    normalized_limit = max(1, min(normalized_limit, 200))
+
+    missing_ids: list[str] = []
+    with _BACKTEST_EQUITY_PREVIEW_CACHE_LOCK:
+        for backtest_id in normalized_ids:
+            cache_key = (backtest_id, normalized_limit)
+            if cache_key not in _BACKTEST_EQUITY_PREVIEW_CACHE:
+                missing_ids.append(backtest_id)
+    if not missing_ids:
+        return
+
+    preview_map = load_backtest_equity_preview_map(missing_ids, limit=normalized_limit)
+    with _BACKTEST_EQUITY_PREVIEW_CACHE_LOCK:
+        for backtest_id in missing_ids:
+            cache_key = (backtest_id, normalized_limit)
+            values = preview_map.get(backtest_id, [])
+            _BACKTEST_EQUITY_PREVIEW_CACHE[cache_key] = list(values)
+
+
+def _warm_backtest_equity_preview_cache(limit: int = 50) -> None:
+    items = _snapshot_backtest_meta_cache()
+    backtest_ids = [str(item.get("id") or "").strip() for item in items if str(item.get("id") or "").strip()]
+    _bulk_warm_backtest_equity_preview(backtest_ids, limit=limit)
 
 
 def _normalize_win_rate(value: Any) -> float | None:
@@ -1171,6 +1404,16 @@ def _backtest_all_item_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
         "end_date": str(meta.get("end_date") or ""),
         "created_at": str(meta.get("created_at") or ""),
     }
+
+
+def _backtest_all_item_with_equity_preview(meta: dict[str, Any], *, preview_limit: int = 50) -> dict[str, Any]:
+    payload = _backtest_all_item_from_meta(meta)
+    backtest_id = str(payload.get("id") or "").strip()
+    if not backtest_id:
+        payload["equity_preview"] = []
+        return payload
+    payload["equity_preview"] = _cached_backtest_equity_preview_only(backtest_id, limit=preview_limit)
+    return payload
 
 
 def _backtest_fingerprint(item: dict[str, Any]) -> str:
@@ -1310,10 +1553,15 @@ def _delete_backtest_with_artifacts(backtest_id: str) -> bool:
 
 
 def _task_config_payload(task: dict[str, Any]) -> dict[str, Any]:
+    _ensure_task_runtime_metadata(task)
     progress = _json_safe(dict(task.get("progress_detail") or {}))
     payload: dict[str, Any] = {
         "kind": task.get("kind"),
         "source": task.get("source"),
+        "category": task.get("category"),
+        "started_at": task.get("started_at"),
+        "finished_at": task.get("finished_at"),
+        "progress_history": _json_safe(_sanitize_progress_history(task.get("progress_history"))),
         "total_items": int(task.get("total_items", 0) or 0),
         "supports_control": bool(task.get("supports_control", False)),
         "control_mode": str(task.get("control_mode", "") or ""),
@@ -1349,6 +1597,9 @@ def _task_config_payload(task: dict[str, Any]) -> dict[str, Any]:
 
 def _persist_task_snapshot(task_id: str, task: dict[str, Any]) -> None:
     try:
+        _ensure_task_runtime_metadata(task)
+        if str(task.get("status") or "").lower() in FINAL_TASK_STATUSES and not task.get("finished_at"):
+            task["finished_at"] = str(task.get("updated_at") or _now_iso())
         progress_detail = dict(task.get("progress_detail") or {})
         progress_message = str(progress_detail.get("current") or "")
         upsert_background_task_record(
@@ -1389,6 +1640,17 @@ def _decorate_task_from_record(task_id: str, task: dict[str, Any]) -> None:
         task["status"] = record.get("status", "unknown")
 
     config_payload = dict(record.get("config_json") or {})
+    task["category"] = str(
+        config_payload.get("category")
+        or task.get("category")
+        or _task_category_from_kind_source(task.get("kind"), task.get("source"))
+    )
+    task["started_at"] = str(
+        config_payload.get("started_at") or task.get("started_at") or task.get("created_at") or _now_iso()
+    )
+    finished_at = str(config_payload.get("finished_at") or task.get("finished_at") or "").strip()
+    if finished_at:
+        task["finished_at"] = finished_at
     total_items = int(config_payload.get("total_items", task.get("total_items", 0)) or 0)
     task["total_items"] = total_items
 
@@ -1410,6 +1672,10 @@ def _decorate_task_from_record(task_id: str, task: dict[str, Any]) -> None:
     task.setdefault("pause_event", threading.Event())
     task.setdefault("stop_event", threading.Event())
     task.setdefault("log_file", str(_task_log_path(task_id)))
+    record_history = _sanitize_progress_history(config_payload.get("progress_history"))
+    if record_history:
+        task["progress_history"] = record_history
+    _ensure_task_runtime_metadata(task)
 
 
 def _build_task_from_record(record: dict[str, Any]) -> dict[str, Any]:
@@ -1441,6 +1707,13 @@ def _build_task_from_record(record: dict[str, Any]) -> dict[str, Any]:
         "control_mode": str(config_payload.get("control_mode", "thread") or "thread"),
         "created_at": str(record.get("created_at") or _now_iso()),
         "updated_at": str(record.get("updated_at") or _now_iso()),
+        "started_at": str(config_payload.get("started_at") or record.get("created_at") or _now_iso()),
+        "finished_at": str(config_payload.get("finished_at") or ""),
+        "category": str(
+            config_payload.get("category")
+            or _task_category_from_kind_source(record.get("type"), record.get("source"))
+        ),
+        "progress_history": _sanitize_progress_history(config_payload.get("progress_history")),
         "pause_event": threading.Event(),
         "stop_event": threading.Event(),
         "error": config_payload.get("error"),
@@ -1467,6 +1740,7 @@ def _build_task_from_record(record: dict[str, Any]) -> dict[str, Any]:
     ):
         if key in config_payload and config_payload.get(key) is not None:
             task[key] = config_payload.get(key)
+    _ensure_task_runtime_metadata(task)
     return task
 
 
@@ -1522,6 +1796,8 @@ def _apply_recovery_data_metadata(
 
 def _create_task_record(*args: Any, **kwargs: Any) -> dict[str, Any]:
     task = _LEGACY_CREATE_TASK_RECORD(*args, **kwargs)
+    _ensure_task_runtime_metadata(task)
+    _append_task_progress_history(task, task.get("progress"))
     task_id = str(task.get("id") or "")
     if task_id:
         _persist_task_snapshot(task_id, task)
@@ -1559,6 +1835,11 @@ def _snapshot_task(task_id: str) -> dict[str, Any] | None:
 def _update_task_fields(task_id: str, **updates: Any) -> dict[str, Any] | None:
     task = _LEGACY_UPDATE_TASK_FIELDS(task_id, **updates)
     if task is not None:
+        _ensure_task_runtime_metadata(task)
+        if str(task.get("status") or "").lower() in FINAL_TASK_STATUSES and not task.get("finished_at"):
+            task["finished_at"] = str(task.get("updated_at") or _now_iso())
+        if "progress" in updates:
+            _append_task_progress_history(task, task.get("progress"))
         _persist_task_snapshot(task_id, task)
     return task
 
@@ -1566,6 +1847,10 @@ def _update_task_fields(task_id: str, **updates: Any) -> dict[str, Any] | None:
 def _set_task_status(task_id: str, status: str) -> dict[str, Any] | None:
     task = _LEGACY_SET_TASK_STATUS(task_id, status)
     if task is not None:
+        _ensure_task_runtime_metadata(task)
+        if str(status).lower() in FINAL_TASK_STATUSES and not task.get("finished_at"):
+            task["finished_at"] = str(task.get("updated_at") or _now_iso())
+        _append_task_progress_history(task, task.get("progress"))
         _persist_task_snapshot(task_id, task)
     return task
 
@@ -1584,6 +1869,8 @@ def _update_task_progress(
         total=total,
     )
     if task is not None:
+        _ensure_task_runtime_metadata(task)
+        _append_task_progress_history(task, task.get("progress"))
         _persist_task_snapshot(task_id, task)
     return task
 
@@ -1602,6 +1889,9 @@ def _mark_task_finished(
         error=error,
     )
     if task is not None:
+        _ensure_task_runtime_metadata(task)
+        task["finished_at"] = str(task.get("updated_at") or _now_iso())
+        _append_task_progress_history(task, task.get("progress"))
         _persist_task_snapshot(task_id, task)
     return task
 
@@ -1613,13 +1903,23 @@ def _serialize_task(
     include_log: bool = False,
     max_log_bytes: int = 2048,
 ) -> dict[str, Any]:
+    _ensure_task_runtime_metadata(task)
     payload = _LEGACY_SERIALIZE_TASK(
         task_id,
         task,
         include_log=include_log,
         max_log_bytes=max_log_bytes,
     )
-    payload["can_restart"] = str(payload.get("status", "")).lower() == "interrupted"
+    status = str(payload.get("status") or task.get("status") or "").lower()
+    elapsed_seconds = _task_elapsed_seconds(task, status)
+    eta_seconds = _task_eta_seconds(task, status, elapsed_seconds)
+    payload["can_restart"] = status in {"interrupted", "failed"}
+    payload["category"] = str(task.get("category") or _task_category_from_kind_source(task.get("kind"), task.get("source")))
+    payload["started_at"] = str(task.get("started_at") or task.get("created_at") or "")
+    payload["finished_at"] = str(task.get("finished_at") or "")
+    payload["elapsed_seconds"] = elapsed_seconds
+    payload["eta_seconds"] = eta_seconds
+    payload["error"] = task.get("error")
     return payload
 
 
@@ -2864,7 +3164,10 @@ async def list_backtests(
 
 
 @app.get("/api/backtests/all", response_model=list[dict[str, Any]])
-async def list_backtests_all() -> list[dict[str, Any]]:
+async def list_backtests_all(
+    include_equity_preview: bool = Query(default=True),
+    preview_limit: int = Query(default=50, ge=50, le=100),
+) -> list[dict[str, Any]]:
     items = _snapshot_backtest_meta_cache()
     items.sort(
         key=lambda item: (
@@ -2873,6 +3176,10 @@ async def list_backtests_all() -> list[dict[str, Any]]:
         ),
         reverse=True,
     )
+    if include_equity_preview:
+        backtest_ids = [str(item.get("id") or "").strip() for item in items]
+        _bulk_warm_backtest_equity_preview(backtest_ids, limit=preview_limit)
+        return [_backtest_all_item_with_equity_preview(item, preview_limit=preview_limit) for item in items]
     return [_backtest_all_item_from_meta(item) for item in items]
 
 
@@ -4456,6 +4763,7 @@ async def data_download(payload: DataDownloadRequest) -> dict[str, Any]:
     name, description = _download_task_labels(source, symbol_list, timeframe_list)
 
     if source in {"dukascopy", "jforex"}:
+        source_label = "dukascopy" if source == "dukascopy" else "jforex"
         cmd = [
             sys.executable,
             "-u",
@@ -4479,7 +4787,8 @@ async def data_download(payload: DataDownloadRequest) -> dict[str, Any]:
         result = _start_jforex_task(
             task_id,
             cmd,
-            source_label=source,
+            source_label=source_label,
+            allow_native_fallback=(source_label == "dukascopy"),
             symbols=symbol_list,
             timeframes=timeframe_list,
             start=start or None,
@@ -4497,7 +4806,7 @@ async def data_download(payload: DataDownloadRequest) -> dict[str, Any]:
         _apply_recovery_data_metadata(
             task_id,
             command=[str(part) for part in cmd],
-            downloader=source,
+            downloader=source_label,
             symbols=symbol_list,
             timeframes=timeframe_list,
             start=start or None,

@@ -3217,6 +3217,7 @@ def _start_dukascopy_task(
                     _set_task_status(task_id, "running")
                     item_label = f"{symbol} {timeframe}"
                     base_completed = completed_items + failed_items
+                    used_native_backend = False
 
                     def report_progress(pct: float, message: str) -> None:
                         overall = ((base_completed + (max(0.0, min(pct, 100.0)) / 100.0)) / total) * 100.0
@@ -3312,6 +3313,7 @@ def _start_jforex_task(
     cmd: list[str],
     *,
     source_label: str,
+    allow_native_fallback: bool | None = None,
     symbols: list[str],
     timeframes: list[str],
     start: str | None,
@@ -3350,7 +3352,12 @@ def _start_jforex_task(
         pause_event = record["pause_event"]
         stop_event = record["stop_event"]
         jforex_downloader = JForexDownloader()
-        fallback_downloader = DukascopyNativeDownloader()
+        fallback_downloader: DukascopyNativeDownloader | None = None
+        fallback_enabled = (
+            bool(allow_native_fallback)
+            if allow_native_fallback is not None
+            else str(source_label or "").strip().lower() == "dukascopy"
+        )
         refresh_needed = False
 
         try:
@@ -3421,7 +3428,6 @@ def _start_jforex_task(
                             total=total,
                         )
 
-                    used_fallback = False
                     try:
                         result = jforex_downloader.download(
                             symbol,
@@ -3442,6 +3448,8 @@ def _start_jforex_task(
                         _mark_task_finished(task_id, status="cancelled", returncode=-9)
                         return
                     except (
+                        ModuleNotFoundError,
+                        ImportError,
                         OSError,
                         RuntimeError,
                         TimeoutError,
@@ -3449,14 +3457,20 @@ def _start_jforex_task(
                         KeyError,
                         json.JSONDecodeError,
                     ) as exc:
-                        fallback_reason = _jforex_fallback_reason(exc)
+                        fallback_reason = (
+                            _jforex_fallback_reason(exc)
+                            if fallback_enabled
+                            else None
+                        )
                         if fallback_reason is not None:
-                            used_fallback = True
+                            if fallback_downloader is None:
+                                fallback_downloader = DukascopyNativeDownloader()
+                            used_native_backend = True
                             _write_task_log_line(
                                 handle,
                                 task_id,
                                 (
-                                    f"ℹ️ {symbol} {timeframe}: Falling back to Dukascopy native HTTP downloader "
+                                    f"ℹ️ {symbol} {timeframe}: JForex unavailable, falling back to Dukascopy native HTTP "
                                     f"(reason: {fallback_reason}; error: {exc})"
                                 ),
                                 stream="stdout",
@@ -3524,13 +3538,17 @@ def _start_jforex_task(
 
                     refresh_needed = True
                     completed_items += 1
-                    fallback_suffix = " (fallback:native-http)" if used_fallback else " (backend:jforex)"
+                    backend_suffix = (
+                        " (backend:native-http)"
+                        if used_native_backend
+                        else " (backend:jforex)"
+                    )
                     _write_task_log_line(
                         handle,
                         task_id,
                         (
                             f"✅ {result.symbol} {result.timeframe}: {result.rows} rows "
-                            f"({result.start} → {result.end}) → {result.path}{fallback_suffix}"
+                            f"({result.start} → {result.end}) → {result.path}{backend_suffix}"
                         ),
                         stream="stdout",
                         source="data-task",
@@ -3916,9 +3934,6 @@ def _jforex_fallback_reason(exc: Exception) -> str | None:
         if "jpype" in missing_name or "dukascopy" in missing_name:
             return f"missing python module: {missing_name or 'unknown'}"
 
-    if isinstance(exc, TimeoutError):
-        return "JForex request timed out"
-
     message = str(exc).lower()
     availability_reason_by_fragment = {
         "jpype is required": "JPype dependency missing",
@@ -3929,16 +3944,9 @@ def _jforex_fallback_reason(exc: Exception) -> str | None:
         "failed to start jvm": "Java/JVM startup failed",
         "could not resolve jforex sdk classpath": "JForex SDK classpath unavailable",
         "jforex sdk classpath": "JForex SDK classpath unavailable",
-        "missing dukascopy credentials": "Dukascopy credentials missing",
-        "dukascopy_username": "Dukascopy credentials missing",
-        "dukascopy_jnlp_url": "Dukascopy JNLP configuration missing",
-        "jforex connection timed out": "JForex connection timed out",
-        "jforex data request timed out": "JForex data request timed out",
-        "jforex history query failed": "JForex runtime history query failure",
-        "java.net": "Java networking failure",
-        "connectexception": "Connection failure to Dukascopy/JForex",
-        "sockettimeout": "Socket timeout while querying JForex",
-        "socket timeout": "Socket timeout while querying JForex",
+        "jvm shared library": "Java/JVM runtime unavailable",
+        "jvm dll not found": "Java/JVM runtime unavailable",
+        "no jvm shared library file": "Java/JVM runtime unavailable",
     }
     for fragment, reason in availability_reason_by_fragment.items():
         if fragment in message:

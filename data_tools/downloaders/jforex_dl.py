@@ -23,11 +23,15 @@ import logging
 import os
 import re
 import time
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Event, Lock
 from typing import Any
+from urllib.error import URLError
+from urllib.parse import urljoin, urlparse
+from urllib.request import urlopen
 
 import pandas as pd
 
@@ -161,7 +165,7 @@ def _parse_datetime(value: str | datetime, *, is_end: bool) -> datetime:
 def _read_auth_config() -> DukascopyAuthConfig:
     username = (os.getenv("DUKASCOPY_USERNAME") or os.getenv("DUKASCOPY_LOGIN") or "").strip()
     password = (os.getenv("DUKASCOPY_PASSWORD") or "").strip()
-    jnlp_url = (os.getenv("DUKASCOPY_JNLP_URL") or DEFAULT_JNLP_URL).strip()
+    jnlp_url = _resolve_jnlp_url()
 
     if not username or not password:
         raise RuntimeError(
@@ -171,6 +175,113 @@ def _read_auth_config() -> DukascopyAuthConfig:
         raise RuntimeError("DUKASCOPY_JNLP_URL is empty.")
 
     return DukascopyAuthConfig(username=username, password=password, jnlp_url=jnlp_url)
+
+
+def _resolve_jnlp_url() -> str:
+    jnlp_url = (os.getenv("DUKASCOPY_JNLP_URL") or DEFAULT_JNLP_URL).strip()
+    if not jnlp_url:
+        raise RuntimeError("DUKASCOPY_JNLP_URL is empty.")
+    return jnlp_url
+
+
+def _discover_jars(root: Path) -> list[Path]:
+    if not root.exists():
+        return []
+
+    search_roots = [root]
+    if (root / "lib").exists():
+        search_roots.append(root / "lib")
+    if (root / "libs").exists():
+        search_roots.append(root / "libs")
+
+    jars: list[Path] = []
+    for search_root in search_roots:
+        jars.extend(sorted(path for path in search_root.rglob("*.jar") if path.is_file()))
+
+    deduped: list[Path] = []
+    seen: set[Path] = set()
+    for jar in jars:
+        if jar in seen:
+            continue
+        deduped.append(jar)
+        seen.add(jar)
+    return deduped
+
+
+def _parse_jnlp_jar_urls(jnlp_url: str, *, _visited: set[str] | None = None) -> list[str]:
+    visited = _visited if _visited is not None else set()
+    if jnlp_url in visited:
+        return []
+    visited.add(jnlp_url)
+
+    try:
+        with urlopen(jnlp_url, timeout=20) as response:
+            payload = response.read()
+    except URLError as exc:
+        raise RuntimeError(f"Failed to fetch JNLP '{jnlp_url}': {exc}") from exc
+
+    try:
+        root = ET.fromstring(payload)
+    except ET.ParseError as exc:
+        raise RuntimeError(f"Invalid JNLP payload from '{jnlp_url}': {exc}") from exc
+
+    codebase = (root.attrib.get("codebase") or "").strip()
+    base_url = codebase or jnlp_url
+    jar_urls: list[str] = []
+
+    for element in root.iter():
+        tag = element.tag.rsplit("}", 1)[-1].lower()
+        href = (element.attrib.get("href") or "").strip()
+        if not href:
+            continue
+        if tag in {"jar", "nativelib"}:
+            jar_urls.append(urljoin(base_url, href))
+        elif tag == "extension":
+            extension_url = urljoin(base_url, href)
+            jar_urls.extend(_parse_jnlp_jar_urls(extension_url, _visited=visited))
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for entry in jar_urls:
+        if entry in seen:
+            continue
+        deduped.append(entry)
+        seen.add(entry)
+    return deduped
+
+
+def _download_jforex_jars_from_jnlp(jnlp_url: str, target_dir: Path) -> list[Path]:
+    jar_urls = _parse_jnlp_jar_urls(jnlp_url)
+    if not jar_urls:
+        raise RuntimeError(f"No jar resources found in JNLP '{jnlp_url}'.")
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+    downloaded: list[Path] = []
+
+    for jar_url in jar_urls:
+        file_name = Path(urlparse(jar_url).path).name
+        if not file_name.endswith(".jar"):
+            continue
+        output_path = target_dir / file_name
+        if not output_path.exists() or output_path.stat().st_size == 0:
+            try:
+                with urlopen(jar_url, timeout=30) as response:
+                    output_path.write_bytes(response.read())
+            except URLError as exc:
+                raise RuntimeError(f"Failed to download JAR '{jar_url}': {exc}") from exc
+        downloaded.append(output_path)
+
+    if not downloaded:
+        raise RuntimeError(f"JNLP '{jnlp_url}' did not resolve any downloadable JAR files.")
+
+    deduped: list[Path] = []
+    seen: set[Path] = set()
+    for path in downloaded:
+        if path in seen:
+            continue
+        deduped.append(path)
+        seen.add(path)
+    return deduped
 
 
 def _resolve_jforex_classpath() -> list[str]:
@@ -185,6 +296,7 @@ def _resolve_jforex_classpath() -> list[str]:
         candidates.append(Path(home_env).expanduser())
     candidates.extend(
         [
+            DATA_DIR / ".jforex-sdk",
             repo_root / "download" / "jforex",
             repo_root / "download" / "jforex-sdk",
             repo_root / "download",
@@ -193,22 +305,20 @@ def _resolve_jforex_classpath() -> list[str]:
 
     classpath: list[str] = []
     for root in candidates:
-        if not root.exists():
-            continue
-        classpath.append(str(root / "*"))
-        if (root / "lib").exists():
-            classpath.append(str(root / "lib" / "*"))
-        if (root / "libs").exists():
-            classpath.append(str(root / "libs" / "*"))
+        classpath.extend(str(path) for path in _discover_jars(root))
 
-    deduped: list[str] = []
-    seen: set[str] = set()
-    for entry in classpath:
-        if entry in seen:
-            continue
-        deduped.append(entry)
-        seen.add(entry)
-    return deduped
+    if classpath:
+        return classpath
+
+    bootstrap_dir = DATA_DIR / ".jforex-sdk"
+    try:
+        jnlp_url = _resolve_jnlp_url()
+        downloaded = _download_jforex_jars_from_jnlp(jnlp_url, bootstrap_dir)
+        logger.info("Bootstrapped %d JForex SDK jars from %s", len(downloaded), jnlp_url)
+        return [str(path) for path in downloaded]
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Unable to bootstrap JForex SDK jars: %s", exc)
+        return []
 
 
 def _ensure_jvm_started() -> None:
@@ -233,6 +343,17 @@ def _ensure_jvm_started() -> None:
             raise RuntimeError(
                 f"Failed to start JVM for JForex SDK. Classpath={classpath}. Error: {exc}"
             ) from exc
+
+
+def prewarm_jvm() -> None:
+    """Start JVM and validate core JForex SDK imports once at app startup."""
+    _ensure_jvm_started()
+    try:
+        from com.dukascopy.api import Instrument  # type: ignore
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"JForex SDK import failed for prewarm: {exc}") from exc
+    if Instrument is None:
+        raise RuntimeError("JForex SDK prewarm failed: Instrument class is unavailable")
 
 
 def _resolve_java_instrument(symbol: str) -> tuple[str, str, Any]:

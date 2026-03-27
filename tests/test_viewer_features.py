@@ -877,6 +877,7 @@ def test_data_download_passes_price_type_and_merge_flags(viewer_client, monkeypa
     assert "ask" in captured["cmd"]
     assert "--query-timeout-seconds" in captured["cmd"]
     assert captured["source_label"] == "dukascopy"
+    assert captured["allow_native_fallback"] is True
     assert captured["total_items"] == 3
     assert captured["symbols"] == ["EURUSD"]
     assert captured["timeframes"] == ["tick", "s1", "m1"]
@@ -913,6 +914,7 @@ def test_data_download_accepts_jforex_source(viewer_client, monkeypatch):
     assert "--query-timeout-seconds" in captured["cmd"]
     assert "1200" in captured["cmd"]
     assert captured["source_label"] == "jforex"
+    assert captured["allow_native_fallback"] is False
 
 
 def test_data_download_rejects_invalid_query_timeout_for_jforex(viewer_client):
@@ -928,6 +930,48 @@ def test_data_download_rejects_invalid_query_timeout_for_jforex(viewer_client):
     assert response.status_code == 400
     message = response.json().get("detail", "")
     assert "query_timeout_seconds" in message
+
+
+def test_data_download_fallback_flag_respects_source(viewer_client, monkeypatch):
+    import viewer.main as viewer_app_module
+
+    captured: list[dict[str, object]] = []
+
+    def fake_start(task_id: str, cmd: list[str], **kwargs) -> dict:
+        payload = {"task_id": task_id, "cmd": cmd}
+        payload.update(kwargs)
+        captured.append(payload)
+        return {"task_id": task_id, "status": "starting"}
+
+    monkeypatch.setattr(viewer_app_module, "_start_jforex_task", fake_start)
+
+    dukascopy_resp = viewer_client.post(
+        "/api/data/download",
+        json={
+            "source": "dukascopy",
+            "symbols": "EURUSD",
+            "timeframes": "h1",
+            "price_type": "bid",
+        },
+    )
+    assert dukascopy_resp.status_code == 200
+
+    jforex_resp = viewer_client.post(
+        "/api/data/download",
+        json={
+            "source": "jforex",
+            "symbols": "EURUSD",
+            "timeframes": "h1",
+            "price_type": "bid",
+        },
+    )
+    assert jforex_resp.status_code == 200
+
+    assert len(captured) == 2
+    assert captured[0]["source_label"] == "dukascopy"
+    assert captured[0]["allow_native_fallback"] is True
+    assert captured[1]["source_label"] == "jforex"
+    assert captured[1]["allow_native_fallback"] is False
 
 
 def test_data_cache_invalidate_endpoint_returns_stats(viewer_client, monkeypatch):
@@ -1062,6 +1106,9 @@ def test_data_tasks_list_and_controls(viewer_client, tmp_path):
     listed = next(item for item in tasks if item["id"] == task_id)
     assert listed["progress"]["completed"] == 1
     assert listed["can_pause"] is True
+    assert listed["category"] == "download"
+    assert isinstance(listed["elapsed_seconds"], int)
+    assert listed["eta_seconds"] is None
 
     pause_resp = viewer_client.post(f"/api/data/tasks/{task_id}/pause")
     assert pause_resp.status_code == 200
@@ -1077,6 +1124,105 @@ def test_data_tasks_list_and_controls(viewer_client, tmp_path):
     assert cancel_resp.status_code == 200
     assert viewer_app_module.DATA_TASKS[task_id]["stop_event"].is_set()
     assert cancel_resp.json()["status"] == "cancelled"
+
+
+def test_data_tasks_running_eta_is_exposed(viewer_client, tmp_path):
+    import viewer.main as viewer_app_module
+
+    task_id = "running-eta-task"
+    log_file = tmp_path / "logs" / "tasks" / f"task_{task_id}.log"
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    viewer_app_module.DATA_TASKS[task_id] = viewer_app_module._create_task_record(
+        task_id,
+        name="Download GBPUSD h1",
+        description="Long-running download.",
+        kind="data",
+        source="dukascopy",
+        total_items=10,
+        log_file=log_file,
+        control_mode="thread",
+        supports_control=True,
+    )
+    viewer_app_module._set_task_status(task_id, "running")
+    viewer_app_module._update_task_progress(
+        task_id,
+        percent=40.0,
+        current="Downloading chunk 4/10",
+        total=10,
+    )
+    viewer_app_module._update_task_fields(
+        task_id,
+        started_at="2026-03-27T10:00:00+00:00",
+    )
+
+    list_resp = viewer_client.get("/api/data/tasks")
+    assert list_resp.status_code == 200
+    listed = next(item for item in list_resp.json()["tasks"] if item["id"] == task_id)
+    assert listed["status"] == "running"
+    assert listed["category"] == "download"
+    assert listed["elapsed_seconds"] is not None
+    assert listed["eta_seconds"] is not None
+    assert listed["eta_seconds"] >= 0
+
+
+def test_failed_task_can_restart(viewer_client, tmp_path):
+    import viewer.main as viewer_app_module
+
+    task_id = "failed-task"
+    log_file = tmp_path / "logs" / "tasks" / f"task_{task_id}.log"
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    viewer_app_module.DATA_TASKS[task_id] = viewer_app_module._create_task_record(
+        task_id,
+        name="Download EURUSD",
+        description="Should be retryable.",
+        kind="data",
+        source="dukascopy",
+        total_items=2,
+        log_file=log_file,
+        control_mode="thread",
+        supports_control=True,
+    )
+    viewer_app_module._mark_task_finished(task_id, status="failed", returncode=1, error="network")
+
+    list_resp = viewer_client.get("/api/data/tasks")
+    assert list_resp.status_code == 200
+    listed = next(item for item in list_resp.json()["tasks"] if item["id"] == task_id)
+    assert listed["status"] == "failed"
+    assert listed["can_restart"] is True
+
+    restart_resp = viewer_client.post(f"/api/data/tasks/{task_id}/restart")
+    assert restart_resp.status_code == 200
+    restarted = restart_resp.json()
+    assert restarted["status"] == "queued"
+    assert restarted["can_restart"] is False
+
+
+def test_failed_jforex_task_restart_marks_interrupted(viewer_client, tmp_path):
+    import viewer.main as viewer_app_module
+
+    task_id = "failed-jforex"
+    log_file = tmp_path / "logs" / "tasks" / f"task_{task_id}.log"
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    viewer_app_module.DATA_TASKS[task_id] = viewer_app_module._create_task_record(
+        task_id,
+        name="JForex download",
+        description="Manual restart required.",
+        kind="data",
+        source="jforex",
+        total_items=1,
+        log_file=log_file,
+        control_mode="thread",
+        supports_control=True,
+    )
+    viewer_app_module._update_task_fields(task_id, downloader="jforex")
+    viewer_app_module._mark_task_finished(task_id, status="failed", returncode=1, error="jforex error")
+
+    restart_resp = viewer_client.post(f"/api/data/tasks/{task_id}/restart")
+    assert restart_resp.status_code == 200
+    payload = restart_resp.json()
+    assert payload["status"] == "interrupted"
+    assert payload["can_restart"] is True
+    assert payload["progress"]["failed"] >= 1
 
 
 def test_data_task_delete_removes_finished_task(viewer_client, tmp_path):
@@ -1839,6 +1985,146 @@ def test_backtests_all_returns_cached_metadata_payload(viewer_client, monkeypatc
     assert rows[0]["start_date"] == "2024-07-01"
     assert rows[0]["end_date"] == "2024-12-31"
     assert rows[0]["created_at"] == "2026-03-09T10:00:00Z"
+
+
+def test_backtests_all_can_include_equity_preview(viewer_client, monkeypatch):
+    import viewer.main as viewer_app_module
+
+    monkeypatch.setattr(
+        viewer_app_module,
+        "list_backtest_metadata_rows",
+        lambda: [
+            {
+                "id": "with-preview",
+                "engine": "vectorbt",
+                "strategy_name": "Preview Strategy",
+                "symbols": ["AAPL"],
+                "timeframe": "1h",
+                "start_date": "2024-01-01",
+                "end_date": "2024-01-07",
+                "total_return": 0.11,
+                "cagr": 0.08,
+                "sharpe_ratio": 1.2,
+                "psr": 0.9,
+                "p_value": 0.03,
+                "max_drawdown": -0.05,
+                "win_rate": 0.61,
+                "trade_count": 12,
+                "created_at": "2026-03-12T10:00:00Z",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        viewer_app_module,
+        "load_backtest_equity_preview_map",
+        lambda backtest_ids, limit=50: {"with-preview": [100000.0, 100120.0, 100180.0]},
+    )
+    with viewer_app_module._BACKTEST_META_CACHE_LOCK:
+        viewer_app_module._BACKTEST_META_CACHE.clear()
+    with viewer_app_module._BACKTEST_EQUITY_PREVIEW_CACHE_LOCK:
+        viewer_app_module._BACKTEST_EQUITY_PREVIEW_CACHE.clear()
+
+    response = viewer_client.get("/api/backtests/all?include_equity_preview=true&preview_limit=50")
+    assert response.status_code == 200
+    rows = response.json()
+    assert len(rows) == 1
+    assert rows[0]["id"] == "with-preview"
+    assert rows[0]["equity_preview"] == [100000.0, 100120.0, 100180.0]
+
+
+def test_backtests_all_uses_cached_equity_preview_only(viewer_client, monkeypatch):
+    import viewer.main as viewer_app_module
+
+    monkeypatch.setattr(
+        viewer_app_module,
+        "list_backtest_metadata_rows",
+        lambda: [
+            {
+                "id": "cache-preview",
+                "engine": "vectorbt",
+                "strategy_name": "Cache Strategy",
+                "symbols": ["AAPL"],
+                "timeframe": "1h",
+                "start_date": "2024-01-01",
+                "end_date": "2024-01-02",
+                "total_return": 0.04,
+                "cagr": 0.03,
+                "sharpe_ratio": 0.9,
+                "psr": 0.7,
+                "p_value": 0.07,
+                "max_drawdown": -0.03,
+                "win_rate": 0.52,
+                "trade_count": 9,
+                "created_at": "2026-03-15T10:00:00Z",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        viewer_app_module,
+        "load_backtest_equity_preview_map",
+        lambda backtest_ids, limit=50: {"cache-preview": [100000.0, 100050.0]},
+    )
+
+    def _fail_if_called(*_args, **_kwargs):
+        raise AssertionError("Per-item equity preview DB loader should not be called for /api/backtests/all")
+
+    monkeypatch.setattr(viewer_app_module, "load_backtest_equity_preview_points", _fail_if_called)
+
+    with viewer_app_module._BACKTEST_META_CACHE_LOCK:
+        viewer_app_module._BACKTEST_META_CACHE.clear()
+    with viewer_app_module._BACKTEST_EQUITY_PREVIEW_CACHE_LOCK:
+        viewer_app_module._BACKTEST_EQUITY_PREVIEW_CACHE.clear()
+
+    response = viewer_client.get("/api/backtests/all?include_equity_preview=true&preview_limit=50")
+    assert response.status_code == 200
+    rows = response.json()
+    assert len(rows) == 1
+    assert rows[0]["equity_preview"] == [100000.0, 100050.0]
+
+
+def test_backtests_all_uses_cached_preview_fallback_limit(viewer_client, monkeypatch):
+    import viewer.main as viewer_app_module
+
+    monkeypatch.setattr(
+        viewer_app_module,
+        "list_backtest_metadata_rows",
+        lambda: [
+            {
+                "id": "fallback-preview",
+                "engine": "vectorbt",
+                "strategy_name": "Fallback Strategy",
+                "symbols": ["AAPL"],
+                "timeframe": "1h",
+                "start_date": "2024-01-01",
+                "end_date": "2024-01-02",
+                "total_return": 0.04,
+                "cagr": 0.03,
+                "sharpe_ratio": 0.9,
+                "psr": 0.7,
+                "p_value": 0.07,
+                "max_drawdown": -0.03,
+                "win_rate": 0.52,
+                "trade_count": 9,
+                "created_at": "2026-03-15T10:00:00Z",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        viewer_app_module,
+        "load_backtest_equity_preview_map",
+        lambda backtest_ids, limit=50: {"fallback-preview": [100000.0, 100040.0, 100080.0]},
+    )
+
+    with viewer_app_module._BACKTEST_META_CACHE_LOCK:
+        viewer_app_module._BACKTEST_META_CACHE.clear()
+    with viewer_app_module._BACKTEST_EQUITY_PREVIEW_CACHE_LOCK:
+        viewer_app_module._BACKTEST_EQUITY_PREVIEW_CACHE.clear()
+
+    response = viewer_client.get("/api/backtests/all?include_equity_preview=true&preview_limit=80")
+    assert response.status_code == 200
+    rows = response.json()
+    assert len(rows) == 1
+    assert rows[0]["equity_preview"] == [100000.0, 100040.0, 100080.0]
 
 
 def test_backtest_equity_preview_endpoint_uses_cache(viewer_client, monkeypatch):

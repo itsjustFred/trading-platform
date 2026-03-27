@@ -45,7 +45,7 @@ export function CreateBacktestModal({
   onTaskStarted,
 }: CreateBacktestModalProps) {
   const { showToast } = useToast();
-  const { strategies } = useStrategiesCache();
+  const { strategies, ensureLoaded } = useStrategiesCache();
   const [strategy, setStrategy] = useState("");
   const [engine, setEngine] = useState("native");
   const [symbols, setSymbols] = useState("AAPL");
@@ -61,6 +61,11 @@ export function CreateBacktestModal({
   const [parameterTypes, setParameterTypes] = useState<Record<string, "number" | "string">>({});
   const [running, setRunning] = useState(false);
   const [error, setError] = useState("");
+
+  useEffect(() => {
+    if (!open) return;
+    void ensureLoaded();
+  }, [open, ensureLoaded]);
 
   useEffect(() => {
     if (preselectedStrategy && strategies.length > 0) {

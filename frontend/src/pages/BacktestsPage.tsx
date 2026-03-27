@@ -1,17 +1,17 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { ArrowUpDown, Plus, RefreshCw, Trash2, X } from "lucide-react";
+import { ArrowUpDown, Plus, Scale, Trash2 } from "lucide-react";
 
 import {
-  deduplicateBacktests,
+  compareBacktests,
   deleteBacktestsBulk,
   getBacktestsAll,
-  getBacktestDuplicates,
-  getBacktestEquityPreview,
 } from "../api/client";
 import type { BacktestMetadataItem } from "../api/types";
-import { MultiSelectDropdown } from "../components/MultiSelectDropdown";
 import { CreateBacktestModal } from "../components/CreateBacktestModal";
+import { DualRangeSlider } from "../components/DualRangeSlider";
+import { FilterBar } from "../components/FilterBar";
+import { MultiSelectDropdown } from "../components/MultiSelectDropdown";
 import { Sparkline } from "../components/Sparkline";
 import { useToast } from "../components/ToastProvider";
 
@@ -27,30 +27,37 @@ type SortField =
   | "trade_count";
 type SortOrder = "asc" | "desc";
 
-interface RangeFilters {
-  totalReturnMin: string;
-  totalReturnMax: string;
-  sharpeMin: string;
-  sharpeMax: string;
-  psrMin: string;
-  psrMax: string;
-  pValueMin: string;
-  pValueMax: string;
-  cagrMin: string;
-  cagrMax: string;
-  maxDrawdownMin: string;
-  maxDrawdownMax: string;
-  winRateMin: string;
-  winRateMax: string;
-  tradesMin: string;
-  tradesMax: string;
+type NumericRange = { min: number; max: number };
+
+interface NumericBoundsState {
+  totalReturn: NumericRange;
+  sharpe: NumericRange;
+  psr: NumericRange;
+  pValue: NumericRange;
+  cagr: NumericRange;
+  maxDrawdown: NumericRange;
+  winRate: NumericRange;
 }
 
+interface NumericFiltersState {
+  totalReturn: NumericRange;
+  sharpe: NumericRange;
+  psr: NumericRange;
+  pValue: NumericRange;
+  cagr: NumericRange;
+  maxDrawdown: NumericRange;
+  winRate: NumericRange;
+}
+
+interface BacktestCardModel extends BacktestMetadataItem {
+  equity_preview: number[];
+}
+
+const DEFAULT_PER_PAGE = 24;
 const NUMERIC_FONT = '"SFMono-Regular", "Cascadia Code", "Roboto Mono", ui-monospace, monospace';
-const DEFAULT_PER_PAGE = 20;
 
 const SORT_OPTIONS: Array<{ value: SortField; label: string }> = [
-  { value: "created_at", label: "Created (newest)" },
+  { value: "created_at", label: "Created" },
   { value: "total_return", label: "Total Return" },
   { value: "sharpe_ratio", label: "Sharpe" },
   { value: "psr", label: "PSR" },
@@ -61,49 +68,25 @@ const SORT_OPTIONS: Array<{ value: SortField; label: string }> = [
   { value: "trade_count", label: "Trades" },
 ];
 
-let backtestsAllCache: BacktestMetadataItem[] | null = null;
-let backtestsAllPromise: Promise<BacktestMetadataItem[]> | null = null;
+let backtestsAllCache: BacktestCardModel[] | null = null;
+let backtestsAllPromise: Promise<BacktestCardModel[]> | null = null;
 
-function cloneMetadataRows(rows: BacktestMetadataItem[]): BacktestMetadataItem[] {
-  return rows.map((row) => ({
-    ...row,
-    symbols: Array.isArray(row.symbols) ? [...row.symbols] : [],
-  }));
+function toErrorMessage(error: unknown, fallback: string): string {
+  if (error instanceof Error && error.message.trim()) return error.message;
+  if (typeof error === "string" && error.trim()) return error;
+  return fallback;
 }
 
-async function loadBacktestsAllCached(force = false): Promise<BacktestMetadataItem[]> {
-  if (force) {
-    backtestsAllCache = null;
-    backtestsAllPromise = null;
-  }
-  if (backtestsAllCache) {
-    return cloneMetadataRows(backtestsAllCache);
-  }
-  if (!backtestsAllPromise) {
-    backtestsAllPromise = getBacktestsAll()
-      .then((rows) => {
-        backtestsAllCache = cloneMetadataRows(rows ?? []);
-        return cloneMetadataRows(backtestsAllCache);
-      })
-      .finally(() => {
-        backtestsAllPromise = null;
-      });
-  }
-  return backtestsAllPromise;
-}
-
-function parseOptionalNumber(value: string): number | null {
-  const normalized = value.trim();
-  if (!normalized) return null;
-  const numeric = Number(normalized);
-  return Number.isFinite(numeric) ? numeric : null;
-}
-
-function normalizeWinRate(value: number | null): number | null {
+function normalizeWinRate(value: number | null | undefined): number | null {
   if (value == null || !Number.isFinite(value)) return null;
   if (value > 1 && value <= 100) return value / 100;
   if (value < 0) return 0;
   if (value > 1) return 1;
+  return value;
+}
+
+function metricValue(value: number | null | undefined, fallback = 0): number {
+  if (value == null || !Number.isFinite(value)) return fallback;
   return value;
 }
 
@@ -117,33 +100,43 @@ function formatNumber(value: number | null | undefined, digits = 3): string {
   return value.toFixed(digits);
 }
 
-function pValueLabel(value: number | null | undefined): string {
+function formatPValue(value: number | null | undefined): string {
   if (value == null || !Number.isFinite(value)) return "N/A";
   return value.toFixed(4);
 }
 
 function statColorPositive(value: number | null | undefined): string {
   if (value == null || !Number.isFinite(value)) return "var(--color-text-muted)";
-  return value >= 0 ? "#3fb950" : "#f85149";
+  return value >= 0 ? "#3fb950" : "#f87171";
 }
 
 function sharpeColor(value: number | null | undefined): string {
   if (value == null || !Number.isFinite(value)) return "var(--color-text-muted)";
   if (value >= 1) return "#3fb950";
-  if (value >= 0) return "#d4b263";
-  return "#f85149";
+  if (value >= 0) return "#fbbf24";
+  return "#f87171";
 }
 
 function psrColor(value: number | null | undefined): string {
   if (value == null || !Number.isFinite(value)) return "var(--color-text-muted)";
   if (value >= 0.95) return "#3fb950";
-  if (value >= 0.5) return "#d4b263";
-  return "#f85149";
+  if (value >= 0.5) return "#fbbf24";
+  return "#f87171";
 }
 
 function pValueColor(value: number | null | undefined): string {
   if (value == null || !Number.isFinite(value)) return "var(--color-text-muted)";
-  return value <= 0.05 ? "#3fb950" : "#f85149";
+  return value <= 0.05 ? "#3fb950" : "#f87171";
+}
+
+function formatPeriodDate(value: string | null | undefined): string {
+  const text = String(value || "").trim();
+  if (!text) return "N/A";
+  const parsed = new Date(text);
+  if (Number.isNaN(parsed.getTime())) {
+    return text;
+  }
+  return parsed.toLocaleDateString("de-DE");
 }
 
 function buildPageNumbers(currentPage: number, totalPages: number): Array<number | "..."> {
@@ -161,90 +154,148 @@ function buildPageNumbers(currentPage: number, totalPages: number): Array<number
   return output;
 }
 
-function rangePasses(value: number, min: number | null, max: number | null): boolean {
-  if (min != null && value < min) return false;
-  if (max != null && value > max) return false;
-  return true;
+function cloneRows(rows: BacktestCardModel[]): BacktestCardModel[] {
+  return rows.map((row) => ({
+    ...row,
+    symbols: Array.isArray(row.symbols) ? [...row.symbols] : [],
+    equity_preview: Array.isArray(row.equity_preview) ? [...row.equity_preview] : [],
+  }));
 }
 
-function toErrorMessage(error: unknown, fallback: string): string {
-  if (error instanceof Error && error.message.trim()) return error.message;
-  if (typeof error === "string" && error.trim()) return error;
-  return fallback;
-}
-
-function initialRanges(): RangeFilters {
+function normalizeBacktestRow(row: BacktestMetadataItem & { equity_preview?: number[] }): BacktestCardModel {
   return {
-    totalReturnMin: "",
-    totalReturnMax: "",
-    sharpeMin: "",
-    sharpeMax: "",
-    psrMin: "",
-    psrMax: "",
-    pValueMin: "",
-    pValueMax: "",
-    cagrMin: "",
-    cagrMax: "",
-    maxDrawdownMin: "",
-    maxDrawdownMax: "",
-    winRateMin: "",
-    winRateMax: "",
-    tradesMin: "",
-    tradesMax: "",
+    ...row,
+    symbols: Array.isArray(row.symbols) ? row.symbols : [],
+    equity_preview: Array.isArray(row.equity_preview)
+      ? row.equity_preview.filter((value) => Number.isFinite(value)).map((value) => Number(value))
+      : [],
+  };
+}
+
+function toBounds(values: number[], fallback: NumericRange): NumericRange {
+  const valid = values.filter((value) => Number.isFinite(value));
+  if (valid.length === 0) return fallback;
+  return {
+    min: Math.min(...valid),
+    max: Math.max(...valid),
+  };
+}
+
+function buildNumericBounds(items: BacktestCardModel[]): NumericBoundsState {
+  return {
+    totalReturn: toBounds(items.map((item) => metricValue(item.total_return) * 100), { min: -50, max: 50 }),
+    sharpe: toBounds(items.map((item) => metricValue(item.sharpe_ratio)), { min: -2, max: 3 }),
+    psr: toBounds(items.map((item) => metricValue(item.psr)), { min: 0, max: 1 }),
+    pValue: toBounds(items.map((item) => metricValue(item.p_value, 1)), { min: 0, max: 1 }),
+    cagr: toBounds(items.map((item) => metricValue(item.cagr) * 100), { min: -20, max: 40 }),
+    maxDrawdown: toBounds(items.map((item) => Math.abs(metricValue(item.max_drawdown)) * 100), {
+      min: 0,
+      max: 60,
+    }),
+    winRate: toBounds(
+      items.map((item) => {
+        const normalized = normalizeWinRate(item.win_rate);
+        return normalized == null ? 0 : normalized * 100;
+      }),
+      { min: 0, max: 100 },
+    ),
+  };
+}
+
+function cloneFilters(source: NumericFiltersState): NumericFiltersState {
+  return {
+    totalReturn: { ...source.totalReturn },
+    sharpe: { ...source.sharpe },
+    psr: { ...source.psr },
+    pValue: { ...source.pValue },
+    cagr: { ...source.cagr },
+    maxDrawdown: { ...source.maxDrawdown },
+    winRate: { ...source.winRate },
+  };
+}
+
+function boundsToFilters(bounds: NumericBoundsState): NumericFiltersState {
+  return cloneFilters({
+    totalReturn: bounds.totalReturn,
+    sharpe: bounds.sharpe,
+    psr: bounds.psr,
+    pValue: bounds.pValue,
+    cagr: bounds.cagr,
+    maxDrawdown: bounds.maxDrawdown,
+    winRate: bounds.winRate,
+  });
+}
+
+async function loadBacktestsAllCached(force = false): Promise<BacktestCardModel[]> {
+  if (force) {
+    backtestsAllCache = null;
+    backtestsAllPromise = null;
+  }
+  if (backtestsAllCache) return cloneRows(backtestsAllCache);
+
+  if (!backtestsAllPromise) {
+    backtestsAllPromise = getBacktestsAll()
+      .then((rows) => {
+        const normalized = (rows ?? []).map((row) => normalizeBacktestRow(row as BacktestMetadataItem & { equity_preview?: number[] }));
+        backtestsAllCache = cloneRows(normalized);
+        return cloneRows(backtestsAllCache);
+      })
+      .finally(() => {
+        backtestsAllPromise = null;
+      });
+  }
+  return backtestsAllPromise;
+}
+
+function updateFilter(
+  current: NumericFiltersState,
+  key: keyof NumericFiltersState,
+  min: number,
+  max: number,
+): NumericFiltersState {
+  return {
+    ...current,
+    [key]: { min, max },
   };
 }
 
 export function BacktestsPage() {
   const navigate = useNavigate();
   const { showToast } = useToast();
-  const previewRequestsRef = useRef<Set<string>>(new Set());
 
-  const [items, setItems] = useState<BacktestMetadataItem[]>([]);
+  const [items, setItems] = useState<BacktestCardModel[]>([]);
   const [loading, setLoading] = useState(false);
-  const [deduplicating, setDeduplicating] = useState(false);
   const [showCreateModal, setShowCreateModal] = useState(false);
+
   const [search, setSearch] = useState("");
-  const [strategies, setStrategies] = useState<string[]>([]);
   const [selectedStrategies, setSelectedStrategies] = useState<string[]>([]);
   const [selectedSymbols, setSelectedSymbols] = useState<string[]>([]);
   const [selectedTimeframes, setSelectedTimeframes] = useState<string[]>([]);
   const [symbolDraft, setSymbolDraft] = useState("");
-  const [ranges, setRanges] = useState<RangeFilters>(() => initialRanges());
+
   const [sortField, setSortField] = useState<SortField>("created_at");
   const [sortOrder, setSortOrder] = useState<SortOrder>("desc");
   const [page, setPage] = useState(1);
   const [perPage, setPerPage] = useState(DEFAULT_PER_PAGE);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
-  const [equityPreviews, setEquityPreviews] = useState<Record<string, number[]>>({});
 
-  const allSymbols = useMemo(
-    () =>
-      [...new Set(items.flatMap((item) => item.symbols ?? []).filter(Boolean))]
-        .sort((a, b) => a.localeCompare(b)),
-    [items],
+  const [numericBounds, setNumericBounds] = useState<NumericBoundsState>(() =>
+    buildNumericBounds([]),
   );
-
-  const allTimeframes = useMemo(
-    () => [...new Set(items.map((item) => item.timeframe).filter(Boolean))].sort((a, b) => a.localeCompare(b)),
-    [items],
+  const [numericFilters, setNumericFilters] = useState<NumericFiltersState>(() =>
+    boundsToFilters(buildNumericBounds([])),
   );
-
-  useEffect(() => {
-    setStrategies(
-      [...new Set(items.map((item) => item.strategy_name).filter(Boolean))].sort((a, b) => a.localeCompare(b)),
-    );
-  }, [items]);
 
   const loadAllMetadata = useCallback(
     async (force = false) => {
       setLoading(true);
       try {
-        const payload = await loadBacktestsAllCached(force);
-        setItems(payload ?? []);
+        const rows = await loadBacktestsAllCached(force);
+        const bounds = buildNumericBounds(rows);
+        setItems(rows);
+        setNumericBounds(bounds);
+        setNumericFilters(boundsToFilters(bounds));
         setSelectedIds(new Set());
-        if (force) {
-          setEquityPreviews({});
-        }
       } catch (error: unknown) {
         showToast(toErrorMessage(error, "Failed to load backtests metadata."), "error");
       } finally {
@@ -258,31 +309,33 @@ export function BacktestsPage() {
     void loadAllMetadata(false);
   }, [loadAllMetadata]);
 
-  const parsedRanges = useMemo(
-    () => ({
-      totalReturnMin: parseOptionalNumber(ranges.totalReturnMin),
-      totalReturnMax: parseOptionalNumber(ranges.totalReturnMax),
-      sharpeMin: parseOptionalNumber(ranges.sharpeMin),
-      sharpeMax: parseOptionalNumber(ranges.sharpeMax),
-      psrMin: parseOptionalNumber(ranges.psrMin),
-      psrMax: parseOptionalNumber(ranges.psrMax),
-      pValueMin: parseOptionalNumber(ranges.pValueMin),
-      pValueMax: parseOptionalNumber(ranges.pValueMax),
-      cagrMin: parseOptionalNumber(ranges.cagrMin),
-      cagrMax: parseOptionalNumber(ranges.cagrMax),
-      maxDrawdownMin: parseOptionalNumber(ranges.maxDrawdownMin),
-      maxDrawdownMax: parseOptionalNumber(ranges.maxDrawdownMax),
-      winRateMin: parseOptionalNumber(ranges.winRateMin),
-      winRateMax: parseOptionalNumber(ranges.winRateMax),
-      tradesMin: parseOptionalNumber(ranges.tradesMin),
-      tradesMax: parseOptionalNumber(ranges.tradesMax),
-    }),
-    [ranges],
+  const allStrategies = useMemo(
+    () =>
+      [...new Set(items.map((item) => item.strategy_name).filter(Boolean))].sort((a, b) =>
+        a.localeCompare(b),
+      ),
+    [items],
+  );
+
+  const allSymbols = useMemo(
+    () =>
+      [...new Set(items.flatMap((item) => item.symbols ?? []).filter(Boolean))].sort((a, b) =>
+        a.localeCompare(b),
+      ),
+    [items],
+  );
+
+  const allTimeframes = useMemo(
+    () =>
+      [...new Set(items.map((item) => item.timeframe).filter(Boolean))].sort((a, b) =>
+        a.localeCompare(b),
+      ),
+    [items],
   );
 
   const filteredSorted = useMemo(() => {
     const needle = search.trim().toLowerCase();
-    const output = items.filter((item) => {
+    const result = items.filter((item) => {
       if (selectedStrategies.length > 0 && !selectedStrategies.includes(item.strategy_name)) {
         return false;
       }
@@ -296,33 +349,39 @@ export function BacktestsPage() {
         }
       }
       if (needle) {
-        const haystack = `${item.id} ${item.strategy_name} ${(item.symbols ?? []).join(" ")} ${item.timeframe}`.toLowerCase();
+        const haystack =
+          `${item.id} ${item.strategy_name} ${(item.symbols ?? []).join(" ")} ${item.timeframe}`.toLowerCase();
         if (!haystack.includes(needle)) return false;
       }
 
-      const totalReturnPct = (item.total_return ?? 0) * 100;
-      const sharpe = item.sharpe_ratio ?? 0;
-      const psr = item.psr ?? 0;
-      const pValue = item.p_value ?? 1;
-      const cagrPct = (item.cagr ?? 0) * 100;
-      const maxDrawdownPct = Math.abs((item.max_drawdown ?? 0) * 100);
-      const winRatePct = (normalizeWinRate(item.win_rate) ?? 0) * 100;
-      const trades = item.trade_count ?? 0;
+      const totalReturn = metricValue(item.total_return) * 100;
+      const sharpe = metricValue(item.sharpe_ratio);
+      const psr = metricValue(item.psr);
+      const pValue = metricValue(item.p_value, 1);
+      const cagr = metricValue(item.cagr) * 100;
+      const maxDrawdown = Math.abs(metricValue(item.max_drawdown)) * 100;
+      const winRate = (normalizeWinRate(item.win_rate) ?? 0) * 100;
 
       return (
-        rangePasses(totalReturnPct, parsedRanges.totalReturnMin, parsedRanges.totalReturnMax) &&
-        rangePasses(sharpe, parsedRanges.sharpeMin, parsedRanges.sharpeMax) &&
-        rangePasses(psr, parsedRanges.psrMin, parsedRanges.psrMax) &&
-        rangePasses(pValue, parsedRanges.pValueMin, parsedRanges.pValueMax) &&
-        rangePasses(cagrPct, parsedRanges.cagrMin, parsedRanges.cagrMax) &&
-        rangePasses(maxDrawdownPct, parsedRanges.maxDrawdownMin, parsedRanges.maxDrawdownMax) &&
-        rangePasses(winRatePct, parsedRanges.winRateMin, parsedRanges.winRateMax) &&
-        rangePasses(trades, parsedRanges.tradesMin, parsedRanges.tradesMax)
+        totalReturn >= numericFilters.totalReturn.min &&
+        totalReturn <= numericFilters.totalReturn.max &&
+        sharpe >= numericFilters.sharpe.min &&
+        sharpe <= numericFilters.sharpe.max &&
+        psr >= numericFilters.psr.min &&
+        psr <= numericFilters.psr.max &&
+        pValue >= numericFilters.pValue.min &&
+        pValue <= numericFilters.pValue.max &&
+        cagr >= numericFilters.cagr.min &&
+        cagr <= numericFilters.cagr.max &&
+        maxDrawdown >= numericFilters.maxDrawdown.min &&
+        maxDrawdown <= numericFilters.maxDrawdown.max &&
+        winRate >= numericFilters.winRate.min &&
+        winRate <= numericFilters.winRate.max
       );
     });
 
-    output.sort((left, right) => {
-      const direction = sortOrder === "asc" ? 1 : -1;
+    const direction = sortOrder === "asc" ? 1 : -1;
+    result.sort((left, right) => {
       if (sortField === "created_at") {
         const leftTime = Date.parse(left.created_at || "") || 0;
         const rightTime = Date.parse(right.created_at || "") || 0;
@@ -340,11 +399,11 @@ export function BacktestsPage() {
       if (leftValue === rightValue) return left.id.localeCompare(right.id) * direction;
       return (leftValue - rightValue) * direction;
     });
-    return output;
+    return result;
   }, [
     items,
+    numericFilters,
     search,
-    parsedRanges,
     selectedStrategies,
     selectedSymbols,
     selectedTimeframes,
@@ -354,48 +413,13 @@ export function BacktestsPage() {
 
   const totalPages = Math.max(1, Math.ceil(filteredSorted.length / perPage));
   useEffect(() => {
-    if (page > totalPages) {
-      setPage(totalPages);
-    }
+    if (page > totalPages) setPage(totalPages);
   }, [page, totalPages]);
 
   const currentPageItems = useMemo(() => {
     const start = (page - 1) * perPage;
     return filteredSorted.slice(start, start + perPage);
   }, [filteredSorted, page, perPage]);
-
-  useEffect(() => {
-    const missing = currentPageItems
-      .map((item) => item.id)
-      .filter((id) => equityPreviews[id] == null && !previewRequestsRef.current.has(id));
-    if (missing.length === 0) return;
-
-    let cancelled = false;
-    missing.forEach((id) => previewRequestsRef.current.add(id));
-
-    const fetchPreviews = async () => {
-      const updates: Record<string, number[]> = {};
-      await Promise.all(
-        missing.map(async (id) => {
-          try {
-            updates[id] = await getBacktestEquityPreview(id, 80);
-          } catch {
-            updates[id] = [];
-          } finally {
-            previewRequestsRef.current.delete(id);
-          }
-        }),
-      );
-      if (!cancelled) {
-        setEquityPreviews((current) => ({ ...current, ...updates }));
-      }
-    };
-    void fetchPreviews();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [currentPageItems, equityPreviews]);
 
   useEffect(() => {
     const valid = new Set(filteredSorted.map((item) => item.id));
@@ -410,7 +434,7 @@ export function BacktestsPage() {
   }, [filteredSorted]);
 
   const selectedCount = selectedIds.size;
-  const allOnPageSelected =
+  const allVisibleSelected =
     currentPageItems.length > 0 && currentPageItems.every((item) => selectedIds.has(item.id));
 
   const toggleSelected = (id: string) => {
@@ -422,10 +446,10 @@ export function BacktestsPage() {
     });
   };
 
-  const toggleSelectedOnPage = () => {
+  const toggleSelectedVisible = () => {
     setSelectedIds((current) => {
       const next = new Set(current);
-      if (allOnPageSelected) {
+      if (allVisibleSelected) {
         currentPageItems.forEach((item) => next.delete(item.id));
       } else {
         currentPageItems.forEach((item) => next.add(item.id));
@@ -434,18 +458,7 @@ export function BacktestsPage() {
     });
   };
 
-  const resetFilters = () => {
-    setSearch("");
-    setSelectedStrategies([]);
-    setSelectedSymbols([]);
-    setSelectedTimeframes([]);
-    setRanges(initialRanges());
-    setSortField("created_at");
-    setSortOrder("desc");
-    setPage(1);
-  };
-
-  const addDraftSymbol = () => {
+  const addSymbolDraft = () => {
     const normalized = symbolDraft.trim().toUpperCase();
     if (!normalized) return;
     if (!allSymbols.some((entry) => entry.toUpperCase() === normalized)) return;
@@ -454,9 +467,20 @@ export function BacktestsPage() {
     setPage(1);
   };
 
-  const removeSelectedSymbol = (value: string) => {
-    setSelectedSymbols((current) => current.filter((entry) => entry !== value));
+  const removeSelectedSymbol = (symbol: string) => {
+    setSelectedSymbols((current) => current.filter((entry) => entry !== symbol));
     setPage(1);
+  };
+
+  const resetAllFilters = () => {
+    setSearch("");
+    setSelectedStrategies([]);
+    setSelectedSymbols([]);
+    setSelectedTimeframes([]);
+    setSortField("created_at");
+    setSortOrder("desc");
+    setPage(1);
+    setNumericFilters(boundsToFilters(numericBounds));
   };
 
   const handleBulkDelete = async () => {
@@ -466,271 +490,82 @@ export function BacktestsPage() {
     if (!confirmed) return;
 
     try {
-      const payload = await deleteBacktestsBulk(ids);
-      showToast(`Deleted ${payload.deleted} backtest(s).`, "success");
+      const result = await deleteBacktestsBulk(ids);
+      showToast(`Deleted ${result.deleted} backtest(s).`, "success");
       await loadAllMetadata(true);
     } catch (error: unknown) {
       showToast(toErrorMessage(error, "Bulk delete failed."), "error");
     }
   };
 
-  const handleDeduplicate = async () => {
-    setDeduplicating(true);
-    try {
-      const duplicates = await getBacktestDuplicates();
-      if (!duplicates.total_groups) {
-        showToast("No duplicate backtests found.", "info");
-        return;
-      }
-      const confirmed = window.confirm(
-        `Found ${duplicates.total_groups} duplicate groups. Remove older duplicates and keep newest?`,
-      );
-      if (!confirmed) return;
-      const result = await deduplicateBacktests();
-      showToast(
-        `Removed ${result.deleted_ids.length} duplicate backtests across ${result.groups_affected} groups.`,
-        "success",
-      );
-      await loadAllMetadata(true);
-    } catch (error: unknown) {
-      showToast(toErrorMessage(error, "Deduplication failed."), "error");
-    } finally {
-      setDeduplicating(false);
+  const handleCompare = () => {
+    if (selectedCount < 2) {
+      showToast("Select at least two backtests to compare.", "info");
+      return;
     }
+    const ids = [...selectedIds];
+    void compareBacktests(ids)
+      .then(() => {
+        navigate(`/backtests/compare?ids=${ids.join(",")}`);
+      })
+      .catch((error: unknown) => {
+        showToast(toErrorMessage(error, "Compare request failed."), "error");
+      });
   };
 
-  return (
-    <div style={{ padding: "20px 22px 80px", minHeight: "100%", background: "#0e1220" }}>
+  const filterPanelContent = (
+    <div
+      style={{
+        display: "grid",
+        gap: "10px",
+      }}
+    >
       <div
         style={{
-          borderRadius: "16px",
-          border: "1px solid rgba(90, 105, 138, 0.26)",
-          background:
-            "radial-gradient(1100px 440px at 18% -14%, rgba(88,166,255,0.22), rgba(14,18,32,0)), #111728",
-          padding: "16px",
-          marginBottom: "14px",
+          display: "grid",
+          gap: "10px",
+          gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
         }}
       >
-        <div
-          style={{
-            display: "flex",
-            justifyContent: "space-between",
-            alignItems: "center",
-            gap: "12px",
-            flexWrap: "wrap",
-            marginBottom: "12px",
+        <MultiSelectDropdown
+          label="Strategy"
+          options={allStrategies.map((value) => ({ label: value, value }))}
+          selected={selectedStrategies}
+          onChange={(next) => {
+            setSelectedStrategies(next);
+            setPage(1);
           }}
-        >
-          <div>
-            <h1 style={{ margin: 0, fontSize: "1.35rem", fontWeight: 700 }}>Backtests</h1>
-            <div style={{ marginTop: "4px", color: "var(--color-text-muted)", fontSize: "0.78rem" }}>
-              Fast cards view · one metadata request · client-side filters and sorting
-            </div>
-          </div>
+          searchable
+          searchPlaceholder="Search strategy..."
+          buttonWidth="100%"
+        />
 
-          <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", alignItems: "center" }}>
-            {selectedCount > 0 ? (
-              <button
-                type="button"
-                onClick={() => void handleBulkDelete()}
-                style={{
-                  borderRadius: "10px",
-                  border: "1px solid rgba(248, 81, 73, 0.45)",
-                  background: "rgba(248, 81, 73, 0.16)",
-                  color: "#fecaca",
-                  padding: "8px 12px",
-                  fontSize: "0.76rem",
-                  cursor: "pointer",
-                  display: "inline-flex",
-                  alignItems: "center",
-                  gap: "6px",
-                }}
-              >
-                <Trash2 size={13} />
-                Delete Selected ({selectedCount})
-              </button>
-            ) : null}
+        <MultiSelectDropdown
+          label="Timeframe"
+          options={allTimeframes.map((value) => ({ label: value, value }))}
+          selected={selectedTimeframes}
+          onChange={(next) => {
+            setSelectedTimeframes(next);
+            setPage(1);
+          }}
+          buttonWidth="100%"
+        />
 
-            <button
-              type="button"
-              onClick={() => void handleDeduplicate()}
-              disabled={deduplicating}
-              style={{
-                borderRadius: "10px",
-                border: "1px solid rgba(251, 191, 36, 0.42)",
-                background: "rgba(251, 191, 36, 0.12)",
-                color: "#fde68a",
-                padding: "8px 12px",
-                fontSize: "0.76rem",
-                cursor: deduplicating ? "not-allowed" : "pointer",
-                display: "inline-flex",
-                alignItems: "center",
-                gap: "6px",
-              }}
-            >
-              <RefreshCw size={13} className={deduplicating ? "animate-spin" : ""} />
-              {deduplicating ? "Removing..." : "Remove Duplicates"}
-            </button>
-
-            <button
-              type="button"
-              onClick={() => setShowCreateModal(true)}
-              style={{
-                borderRadius: "10px",
-                border: "1px solid rgba(88, 166, 255, 0.5)",
-                background: "rgba(88, 166, 255, 0.16)",
-                color: "#dbeafe",
-                padding: "8px 12px",
-                fontSize: "0.76rem",
-                cursor: "pointer",
-                display: "inline-flex",
-                alignItems: "center",
-                gap: "6px",
-              }}
-            >
-              <Plus size={13} />
-              New Backtest
-            </button>
-          </div>
-        </div>
-
-        <div style={{ display: "flex", flexWrap: "wrap", gap: "10px", marginBottom: "10px" }}>
-          <MultiSelectDropdown
-            label="Strategy"
-            options={strategies.map((value) => ({ label: value, value }))}
-            selected={selectedStrategies}
-            onChange={(next) => {
-              setSelectedStrategies(next);
-              setPage(1);
-            }}
-            searchable
-            searchPlaceholder="Search strategy..."
-          />
-
-          <MultiSelectDropdown
-            label="Timeframe"
-            options={allTimeframes.map((value) => ({ label: value, value }))}
-            selected={selectedTimeframes}
-            onChange={(next) => {
-              setSelectedTimeframes(next);
-              setPage(1);
-            }}
-          />
-
-          <div style={{ minWidth: "250px", flex: "1 1 250px", maxWidth: "320px" }}>
-            <label
-              style={{
-                display: "grid",
-                gap: "6px",
-                fontSize: "0.72rem",
-                color: "var(--color-text-muted)",
-              }}
-            >
-              Symbol (autocomplete)
-              <div style={{ display: "flex", gap: "6px" }}>
-                <input
-                  list="backtest-symbol-options"
-                  value={symbolDraft}
-                  onChange={(event) => setSymbolDraft(event.target.value)}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter") {
-                      event.preventDefault();
-                      addDraftSymbol();
-                    }
-                  }}
-                  placeholder="Type symbol..."
-                  style={{
-                    flex: 1,
-                    borderRadius: "10px",
-                    border: "1px solid rgba(143, 154, 184, 0.28)",
-                    background: "rgba(13, 19, 32, 0.95)",
-                    color: "var(--color-text)",
-                    padding: "9px 10px",
-                    fontSize: "0.76rem",
-                  }}
-                />
-                <button
-                  type="button"
-                  onClick={addDraftSymbol}
-                  style={{
-                    borderRadius: "10px",
-                    border: "1px solid rgba(143, 154, 184, 0.34)",
-                    background: "rgba(17, 24, 39, 0.95)",
-                    color: "var(--color-text)",
-                    padding: "8px 10px",
-                    fontSize: "0.73rem",
-                    cursor: "pointer",
-                  }}
-                >
-                  Add
-                </button>
-              </div>
-            </label>
-            <datalist id="backtest-symbol-options">
-              {allSymbols.map((value) => (
-                <option key={value} value={value} />
-              ))}
-            </datalist>
-            {selectedSymbols.length > 0 ? (
-              <div style={{ display: "flex", flexWrap: "wrap", gap: "6px", marginTop: "6px" }}>
-                {selectedSymbols.map((symbol) => (
-                  <button
-                    type="button"
-                    key={symbol}
-                    onClick={() => removeSelectedSymbol(symbol)}
-                    style={{
-                      borderRadius: "999px",
-                      border: "1px solid rgba(88,166,255,0.42)",
-                      background: "rgba(88,166,255,0.14)",
-                      color: "#dbeafe",
-                      padding: "3px 8px",
-                      fontSize: "0.68rem",
-                      cursor: "pointer",
-                      display: "inline-flex",
-                      alignItems: "center",
-                      gap: "5px",
-                    }}
-                  >
-                    {symbol}
-                    <X size={12} />
-                  </button>
-                ))}
-              </div>
-            ) : null}
-          </div>
-
-          <div style={{ minWidth: "220px", flex: "1 1 220px", maxWidth: "320px" }}>
-            <label style={{ display: "grid", gap: "6px", fontSize: "0.72rem", color: "var(--color-text-muted)" }}>
-              Quick Search
-              <input
-                type="text"
-                value={search}
-                onChange={(event) => {
-                  setSearch(event.target.value);
-                  setPage(1);
-                }}
-                placeholder="Strategy, symbol or id..."
-                style={{
-                  borderRadius: "10px",
-                  border: "1px solid rgba(143, 154, 184, 0.28)",
-                  background: "rgba(13, 19, 32, 0.95)",
-                  color: "var(--color-text)",
-                  padding: "9px 10px",
-                  fontSize: "0.76rem",
-                }}
-              />
-            </label>
-          </div>
-
-          <div style={{ minWidth: "250px", display: "grid", gap: "6px" }}>
-            <span style={{ fontSize: "0.72rem", color: "var(--color-text-muted)" }}>Sort</span>
+        <div style={{ minWidth: "220px" }}>
+          <label style={{ display: "grid", gap: "6px", fontSize: "0.72rem", color: "var(--color-text-muted)" }}>
+            Symbol (autocomplete)
             <div style={{ display: "flex", gap: "6px" }}>
-              <select
-                value={sortField}
-                onChange={(event) => {
-                  setSortField(event.target.value as SortField);
-                  setPage(1);
+              <input
+                list="backtests-symbols"
+                value={symbolDraft}
+                onChange={(event) => setSymbolDraft(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    addSymbolDraft();
+                  }
                 }}
+                placeholder="Type symbol..."
                 style={{
                   flex: 1,
                   borderRadius: "10px",
@@ -740,97 +575,276 @@ export function BacktestsPage() {
                   padding: "9px 10px",
                   fontSize: "0.76rem",
                 }}
-              >
-                {SORT_OPTIONS.map((option) => (
-                  <option key={option.value} value={option.value}>
-                    {option.label}
-                  </option>
-                ))}
-              </select>
-
+              />
               <button
                 type="button"
-                onClick={() => {
-                  setSortOrder((current) => (current === "desc" ? "asc" : "desc"));
-                  setPage(1);
-                }}
+                onClick={addSymbolDraft}
                 style={{
                   borderRadius: "10px",
                   border: "1px solid rgba(143, 154, 184, 0.34)",
                   background: "rgba(17, 24, 39, 0.95)",
                   color: "var(--color-text)",
                   padding: "8px 10px",
-                  fontSize: "0.74rem",
+                  fontSize: "0.73rem",
                   cursor: "pointer",
-                  display: "inline-flex",
-                  alignItems: "center",
-                  gap: "6px",
                 }}
               >
-                <ArrowUpDown size={14} />
-                {sortOrder === "desc" ? "Desc" : "Asc"}
+                Add
               </button>
             </div>
-          </div>
-
-          <button
-            type="button"
-            onClick={resetFilters}
-            style={{
-              alignSelf: "end",
-              borderRadius: "10px",
-              border: "1px solid rgba(143, 154, 184, 0.3)",
-              background: "rgba(13, 19, 32, 0.92)",
-              color: "var(--color-text-muted)",
-              padding: "9px 12px",
-              fontSize: "0.74rem",
-              cursor: "pointer",
-            }}
-          >
-            Reset
-          </button>
-        </div>
-
-        <div
-          style={{
-            display: "grid",
-            gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))",
-            gap: "8px",
-          }}
-        >
-          <RangePair label="Total Return %" min={ranges.totalReturnMin} max={ranges.totalReturnMax} onMinChange={(value) => setRanges((current) => ({ ...current, totalReturnMin: value }))} onMaxChange={(value) => setRanges((current) => ({ ...current, totalReturnMax: value }))} />
-          <RangePair label="Sharpe" min={ranges.sharpeMin} max={ranges.sharpeMax} onMinChange={(value) => setRanges((current) => ({ ...current, sharpeMin: value }))} onMaxChange={(value) => setRanges((current) => ({ ...current, sharpeMax: value }))} />
-          <RangePair label="PSR" min={ranges.psrMin} max={ranges.psrMax} onMinChange={(value) => setRanges((current) => ({ ...current, psrMin: value }))} onMaxChange={(value) => setRanges((current) => ({ ...current, psrMax: value }))} />
-          <RangePair label="p-Value" min={ranges.pValueMin} max={ranges.pValueMax} onMinChange={(value) => setRanges((current) => ({ ...current, pValueMin: value }))} onMaxChange={(value) => setRanges((current) => ({ ...current, pValueMax: value }))} />
-          <RangePair label="CAGR %" min={ranges.cagrMin} max={ranges.cagrMax} onMinChange={(value) => setRanges((current) => ({ ...current, cagrMin: value }))} onMaxChange={(value) => setRanges((current) => ({ ...current, cagrMax: value }))} />
-          <RangePair label="Max DD %" min={ranges.maxDrawdownMin} max={ranges.maxDrawdownMax} onMinChange={(value) => setRanges((current) => ({ ...current, maxDrawdownMin: value }))} onMaxChange={(value) => setRanges((current) => ({ ...current, maxDrawdownMax: value }))} />
-          <RangePair label="Win Rate %" min={ranges.winRateMin} max={ranges.winRateMax} onMinChange={(value) => setRanges((current) => ({ ...current, winRateMin: value }))} onMaxChange={(value) => setRanges((current) => ({ ...current, winRateMax: value }))} />
-          <RangePair label="Trades" min={ranges.tradesMin} max={ranges.tradesMax} onMinChange={(value) => setRanges((current) => ({ ...current, tradesMin: value }))} onMaxChange={(value) => setRanges((current) => ({ ...current, tradesMax: value }))} />
+          </label>
+          <datalist id="backtests-symbols">
+            {allSymbols.map((value) => (
+              <option key={value} value={value} />
+            ))}
+          </datalist>
+          {selectedSymbols.length > 0 ? (
+            <div style={{ display: "flex", gap: "6px", marginTop: "7px", flexWrap: "wrap" }}>
+              {selectedSymbols.map((symbol) => (
+                <button
+                  key={symbol}
+                  type="button"
+                  onClick={() => removeSelectedSymbol(symbol)}
+                  style={{
+                    borderRadius: "999px",
+                    border: "1px solid rgba(88,166,255,0.42)",
+                    background: "rgba(88,166,255,0.14)",
+                    color: "#dbeafe",
+                    padding: "3px 8px",
+                    fontSize: "0.68rem",
+                    cursor: "pointer",
+                  }}
+                >
+                  {symbol}
+                </button>
+              ))}
+            </div>
+          ) : null}
         </div>
       </div>
 
       <div
         style={{
-          display: "flex",
-          justifyContent: "space-between",
-          alignItems: "center",
-          gap: "10px",
-          marginBottom: "10px",
-          flexWrap: "wrap",
+          display: "grid",
+          gap: "8px",
+          gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))",
         }}
       >
-        <div style={{ color: "var(--color-text-muted)", fontSize: "0.78rem" }}>
-          {filteredSorted.length} results · {items.length} total backtests
+        <DualRangeSlider
+          label="Sharpe Ratio"
+          min={numericBounds.sharpe.min}
+          max={numericBounds.sharpe.max}
+          valueMin={numericFilters.sharpe.min}
+          valueMax={numericFilters.sharpe.max}
+          onChange={(min, max) => {
+            setNumericFilters((current) => updateFilter(current, "sharpe", min, max));
+            setPage(1);
+          }}
+          step={0.01}
+        />
+        <DualRangeSlider
+          label="PSR"
+          min={numericBounds.psr.min}
+          max={numericBounds.psr.max}
+          valueMin={numericFilters.psr.min}
+          valueMax={numericFilters.psr.max}
+          onChange={(min, max) => {
+            setNumericFilters((current) => updateFilter(current, "psr", min, max));
+            setPage(1);
+          }}
+          step={0.001}
+        />
+        <DualRangeSlider
+          label="p-Value"
+          min={numericBounds.pValue.min}
+          max={numericBounds.pValue.max}
+          valueMin={numericFilters.pValue.min}
+          valueMax={numericFilters.pValue.max}
+          onChange={(min, max) => {
+            setNumericFilters((current) => updateFilter(current, "pValue", min, max));
+            setPage(1);
+          }}
+          step={0.001}
+        />
+        <DualRangeSlider
+          label="CAGR %"
+          min={numericBounds.cagr.min}
+          max={numericBounds.cagr.max}
+          valueMin={numericFilters.cagr.min}
+          valueMax={numericFilters.cagr.max}
+          onChange={(min, max) => {
+            setNumericFilters((current) => updateFilter(current, "cagr", min, max));
+            setPage(1);
+          }}
+          step={0.1}
+          formatValue={(value) => `${value.toFixed(2)}%`}
+        />
+        <DualRangeSlider
+          label="Max Drawdown %"
+          min={numericBounds.maxDrawdown.min}
+          max={numericBounds.maxDrawdown.max}
+          valueMin={numericFilters.maxDrawdown.min}
+          valueMax={numericFilters.maxDrawdown.max}
+          onChange={(min, max) => {
+            setNumericFilters((current) => updateFilter(current, "maxDrawdown", min, max));
+            setPage(1);
+          }}
+          step={0.1}
+          formatValue={(value) => `${value.toFixed(2)}%`}
+        />
+        <DualRangeSlider
+          label="Total Return %"
+          min={numericBounds.totalReturn.min}
+          max={numericBounds.totalReturn.max}
+          valueMin={numericFilters.totalReturn.min}
+          valueMax={numericFilters.totalReturn.max}
+          onChange={(min, max) => {
+            setNumericFilters((current) => updateFilter(current, "totalReturn", min, max));
+            setPage(1);
+          }}
+          step={0.1}
+          formatValue={(value) => `${value.toFixed(2)}%`}
+        />
+        <DualRangeSlider
+          label="Win Rate %"
+          min={numericBounds.winRate.min}
+          max={numericBounds.winRate.max}
+          valueMin={numericFilters.winRate.min}
+          valueMax={numericFilters.winRate.max}
+          onChange={(min, max) => {
+            setNumericFilters((current) => updateFilter(current, "winRate", min, max));
+            setPage(1);
+          }}
+          step={0.1}
+          formatValue={(value) => `${value.toFixed(1)}%`}
+        />
+      </div>
+
+      <div style={{ display: "flex", justifyContent: "flex-end" }}>
+        <button
+          type="button"
+          onClick={resetAllFilters}
+          style={{
+            borderRadius: "10px",
+            border: "1px solid rgba(143, 154, 184, 0.3)",
+            background: "rgba(13, 19, 32, 0.92)",
+            color: "var(--color-text-muted)",
+            padding: "8px 12px",
+            fontSize: "0.74rem",
+            cursor: "pointer",
+          }}
+        >
+          Reset All
+        </button>
+      </div>
+    </div>
+  );
+
+  return (
+    <div style={{ padding: "20px 22px 120px", minHeight: "100%", background: "#0d1322" }}>
+      <div
+        style={{
+          borderRadius: "18px",
+          border: "1px solid rgba(90, 105, 138, 0.24)",
+          background:
+            "radial-gradient(900px 360px at 12% -18%, rgba(88,166,255,0.24), rgba(13,19,34,0)), #101729",
+          padding: "16px",
+          marginBottom: "14px",
+        }}
+      >
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            gap: "10px",
+            flexWrap: "wrap",
+            marginBottom: "10px",
+          }}
+        >
+          <div>
+            <h1 style={{ margin: 0, fontSize: "1.35rem", fontWeight: 700 }}>Backtests</h1>
+            <div style={{ marginTop: "4px", color: "var(--color-text-muted)", fontSize: "0.78rem" }}>
+              Card layout with equity previews · one metadata request · fully client-side filtering
+            </div>
+          </div>
+
+          <button
+            type="button"
+            onClick={() => setShowCreateModal(true)}
+            style={{
+              borderRadius: "10px",
+              border: "1px solid rgba(88, 166, 255, 0.5)",
+              background: "rgba(88, 166, 255, 0.16)",
+              color: "#dbeafe",
+              padding: "8px 12px",
+              fontSize: "0.76rem",
+              cursor: "pointer",
+              display: "inline-flex",
+              alignItems: "center",
+              gap: "6px",
+            }}
+          >
+            <Plus size={13} />
+            New Backtest
+          </button>
         </div>
-        <label style={{ display: "inline-flex", gap: "6px", alignItems: "center", fontSize: "0.76rem", color: "var(--color-text-muted)" }}>
-          <input
-            type="checkbox"
-            checked={allOnPageSelected}
-            onChange={toggleSelectedOnPage}
-            style={{ cursor: "pointer", accentColor: "#58a6ff" }}
-          />
-          Select page
-        </label>
+
+        <FilterBar
+          searchValue={search}
+          onSearchChange={(value) => {
+            setSearch(value);
+            setPage(1);
+          }}
+          searchPlaceholder="Search strategy, symbol, id..."
+          sortOptions={SORT_OPTIONS}
+          sortValue={sortField}
+          onSortChange={(value) => {
+            setSortField(value as SortField);
+            setPage(1);
+          }}
+          filterPanelContent={filterPanelContent}
+          filterButtonLabel="Filters"
+        />
+
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+          <div style={{ color: "var(--color-text-muted)", fontSize: "0.78rem" }}>
+            {filteredSorted.length} results · {items.length} total backtests
+          </div>
+          <div style={{ display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" }}>
+            <button
+              type="button"
+              onClick={() => {
+                setSortOrder((current) => (current === "desc" ? "asc" : "desc"));
+                setPage(1);
+              }}
+              style={{
+                borderRadius: "10px",
+                border: "1px solid rgba(143, 154, 184, 0.34)",
+                background: "rgba(17, 24, 39, 0.95)",
+                color: "var(--color-text)",
+                padding: "8px 10px",
+                fontSize: "0.74rem",
+                cursor: "pointer",
+                display: "inline-flex",
+                alignItems: "center",
+                gap: "6px",
+              }}
+            >
+              <ArrowUpDown size={14} />
+              {sortOrder === "desc" ? "Desc" : "Asc"}
+            </button>
+            <label style={{ display: "inline-flex", gap: "6px", alignItems: "center", fontSize: "0.76rem", color: "var(--color-text-muted)" }}>
+              <input
+                type="checkbox"
+                checked={allVisibleSelected}
+                onChange={toggleSelectedVisible}
+                style={{ cursor: "pointer", accentColor: "#58a6ff" }}
+              />
+              Select All (visible)
+            </label>
+          </div>
+        </div>
       </div>
 
       {loading ? (
@@ -863,18 +877,17 @@ export function BacktestsPage() {
         <div
           style={{
             display: "grid",
-            gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))",
-            gap: "12px",
+            gridTemplateColumns: "repeat(auto-fit, minmax(340px, 1fr))",
+            gap: "16px",
           }}
         >
           {currentPageItems.map((item) => {
             const selected = selectedIds.has(item.id);
-            const totalReturnPct = (item.total_return ?? 0) * 100;
-            const cagrPct = (item.cagr ?? 0) * 100;
-            const drawdownPct = Math.abs((item.max_drawdown ?? 0) * 100);
-            const winRate = normalizeWinRate(item.win_rate);
-            const winRatePct = winRate == null ? null : winRate * 100;
-            const sparkline = equityPreviews[item.id];
+            const totalReturnPct = metricValue(item.total_return) * 100;
+            const cagrPct = metricValue(item.cagr) * 100;
+            const maxDrawdownPct = Math.abs(metricValue(item.max_drawdown)) * 100;
+            const winRatePct = (normalizeWinRate(item.win_rate) ?? 0) * 100;
+            const sparkline = item.equity_preview ?? [];
 
             return (
               <article
@@ -882,30 +895,30 @@ export function BacktestsPage() {
                 onClick={() => navigate(`/backtests/${item.id}`)}
                 style={{
                   position: "relative",
-                  borderRadius: "14px",
+                  borderRadius: "12px",
                   border: selected
-                    ? "1px solid rgba(88,166,255,0.7)"
-                    : "1px solid rgba(90, 105, 138, 0.24)",
-                  background: "linear-gradient(180deg, rgba(17,24,39,0.97), rgba(9,13,24,0.97))",
+                    ? "1px solid rgba(88, 166, 255, 0.72)"
+                    : "1px solid rgba(148, 163, 184, 0.26)",
+                  background: "rgba(11, 18, 30, 0.96)",
                   boxShadow: selected
-                    ? "0 16px 36px rgba(59,130,246,0.18)"
-                    : "0 10px 26px rgba(0,0,0,0.35)",
-                  padding: "12px",
+                    ? "0 16px 34px rgba(59, 130, 246, 0.2)"
+                    : "0 12px 28px rgba(0, 0, 0, 0.34)",
+                  padding: "16px",
                   cursor: "pointer",
                   transition: "transform 140ms ease, border-color 140ms ease, box-shadow 160ms ease",
                 }}
                 onMouseEnter={(event) => {
                   event.currentTarget.style.transform = "translateY(-2px)";
                   if (!selected) {
-                    event.currentTarget.style.borderColor = "rgba(88,166,255,0.45)";
-                    event.currentTarget.style.boxShadow = "0 16px 30px rgba(0,0,0,0.42)";
+                    event.currentTarget.style.borderColor = "rgba(88, 166, 255, 0.46)";
+                    event.currentTarget.style.boxShadow = "0 16px 34px rgba(0, 0, 0, 0.42)";
                   }
                 }}
                 onMouseLeave={(event) => {
                   event.currentTarget.style.transform = "translateY(0px)";
                   if (!selected) {
-                    event.currentTarget.style.borderColor = "rgba(90, 105, 138, 0.24)";
-                    event.currentTarget.style.boxShadow = "0 10px 26px rgba(0,0,0,0.35)";
+                    event.currentTarget.style.borderColor = "rgba(148, 163, 184, 0.26)";
+                    event.currentTarget.style.boxShadow = "0 12px 28px rgba(0, 0, 0, 0.34)";
                   }
                 }}
               >
@@ -916,8 +929,8 @@ export function BacktestsPage() {
                   onChange={() => toggleSelected(item.id)}
                   style={{
                     position: "absolute",
-                    top: "10px",
-                    left: "10px",
+                    top: "12px",
+                    left: "12px",
                     zIndex: 2,
                     accentColor: "#58a6ff",
                     cursor: "pointer",
@@ -926,36 +939,38 @@ export function BacktestsPage() {
 
                 <div
                   style={{
-                    height: "64px",
+                    height: "112px",
                     borderRadius: "10px",
                     border: "1px solid rgba(90, 105, 138, 0.2)",
-                    background: "rgba(15, 23, 42, 0.9)",
-                    padding: "3px 8px 0",
+                    background: "linear-gradient(180deg, rgba(18, 27, 44, 0.92), rgba(11, 17, 30, 0.92))",
+                    padding: "10px 10px 2px",
                     display: "flex",
                     alignItems: "center",
                     justifyContent: "center",
-                    marginBottom: "10px",
-                    marginInlineStart: "18px",
+                    marginBottom: "12px",
+                    marginInlineStart: "24px",
                   }}
                 >
-                  {sparkline && sparkline.length > 1 ? (
-                    <Sparkline data={sparkline} width={220} height={56} />
+                  {sparkline.length > 1 ? (
+                    <Sparkline data={sparkline} width={300} height={92} />
                   ) : (
                     <span style={{ color: "var(--color-text-muted)", fontSize: "0.72rem" }}>
-                      Loading equity preview...
+                      No equity preview
                     </span>
                   )}
                 </div>
 
-                <div style={{ marginBottom: "10px" }}>
-                  <div style={{ fontWeight: 700, fontSize: "0.95rem", marginBottom: "4px" }}>{item.strategy_name}</div>
+                <div style={{ marginBottom: "12px" }}>
+                  <div style={{ fontWeight: 800, fontSize: "1.02rem", marginBottom: "5px" }}>
+                    {item.strategy_name}
+                  </div>
                   <div
                     style={{
                       color: "var(--color-text-muted)",
-                      fontSize: "0.74rem",
+                      fontSize: "0.76rem",
                       fontFamily: NUMERIC_FONT,
                       display: "flex",
-                      gap: "8px",
+                      gap: "6px",
                       flexWrap: "wrap",
                     }}
                   >
@@ -963,17 +978,78 @@ export function BacktestsPage() {
                     <span>·</span>
                     <span>{item.timeframe || "N/A"}</span>
                   </div>
+                  <div
+                    style={{
+                      marginTop: "6px",
+                      fontSize: "0.72rem",
+                      color: "#c7d2fe",
+                      fontFamily: NUMERIC_FONT,
+                      fontWeight: 600,
+                    }}
+                  >
+                    Period: {formatPeriodDate(item.start_date)} → {formatPeriodDate(item.end_date)}
+                  </div>
+                  <div
+                    style={{
+                      marginTop: "3px",
+                      fontSize: "0.67rem",
+                      color: "var(--color-text-muted)",
+                      fontFamily: NUMERIC_FONT,
+                    }}
+                  >
+                    Created: {formatPeriodDate(item.created_at)}
+                  </div>
                 </div>
 
-                <div style={{ display: "flex", flexWrap: "wrap", gap: "6px" }}>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: "8px" }}>
                   <StatBadge label="Return" value={percentage(totalReturnPct)} color={statColorPositive(totalReturnPct)} />
                   <StatBadge label="Sharpe" value={formatNumber(item.sharpe_ratio)} color={sharpeColor(item.sharpe_ratio)} />
                   <StatBadge label="PSR" value={item.psr == null ? "N/A" : `${(item.psr * 100).toFixed(1)}%`} color={psrColor(item.psr)} />
-                  <StatBadge label="p-Value" value={pValueLabel(item.p_value)} color={pValueColor(item.p_value)} />
                   <StatBadge label="CAGR" value={percentage(cagrPct)} color={statColorPositive(cagrPct)} />
-                  <StatBadge label="Trades" value={String(item.trade_count ?? 0)} color="#93c5fd" />
-                  <StatBadge label="Win Rate" value={winRatePct == null ? "N/A" : `${winRatePct.toFixed(1)}%`} color={statColorPositive(winRatePct)} />
-                  <StatBadge label="Max DD" value={percentage(-drawdownPct)} color="#f87171" />
+                  <StatBadge label="Max DD" value={percentage(-maxDrawdownPct)} color="#f87171" />
+                  <StatBadge label="Win Rate" value={`${winRatePct.toFixed(1)}%`} color={statColorPositive(winRatePct)} />
+                </div>
+
+                <div
+                  style={{
+                    marginTop: "10px",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: "8px",
+                    flexWrap: "wrap",
+                  }}
+                >
+                  <span
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      borderRadius: "999px",
+                      border: "1px solid rgba(147, 197, 253, 0.32)",
+                      background: "rgba(30, 58, 138, 0.28)",
+                      color: "#dbeafe",
+                      padding: "5px 10px",
+                      fontSize: "0.72rem",
+                      fontFamily: NUMERIC_FONT,
+                    }}
+                  >
+                    Trades {item.trade_count ?? 0}
+                  </span>
+                  <span
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      borderRadius: "999px",
+                      border: "1px solid rgba(148, 163, 184, 0.3)",
+                      background: "rgba(15, 23, 42, 0.9)",
+                      color: pValueColor(item.p_value),
+                      padding: "5px 10px",
+                      fontSize: "0.72rem",
+                      fontFamily: NUMERIC_FONT,
+                    }}
+                  >
+                    p-Value {formatPValue(item.p_value)}
+                  </span>
                 </div>
               </article>
             );
@@ -997,7 +1073,7 @@ export function BacktestsPage() {
 
         <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
           <label style={{ fontSize: "0.74rem", color: "var(--color-text-muted)" }}>
-            Cards per page{" "}
+            Per Page{" "}
             <select
               value={perPage}
               onChange={(event) => {
@@ -1014,9 +1090,9 @@ export function BacktestsPage() {
                 fontSize: "0.74rem",
               }}
             >
-              <option value={20}>20</option>
-              <option value={40}>40</option>
-              <option value={80}>80</option>
+              <option value={12}>12</option>
+              <option value={24}>24</option>
+              <option value={48}>48</option>
             </select>
           </label>
 
@@ -1040,6 +1116,68 @@ export function BacktestsPage() {
         </div>
       </div>
 
+      {selectedCount > 0 ? (
+        <div
+          style={{
+            position: "fixed",
+            insetInlineStart: "50%",
+            transform: "translateX(-50%)",
+            insetBlockEnd: "16px",
+            zIndex: 60,
+            borderRadius: "999px",
+            border: "1px solid rgba(90, 105, 138, 0.34)",
+            background: "rgba(11, 18, 31, 0.95)",
+            boxShadow: "0 18px 40px rgba(0,0,0,0.45)",
+            padding: "8px 10px",
+            display: "inline-flex",
+            gap: "8px",
+            alignItems: "center",
+          }}
+        >
+          <span style={{ fontSize: "0.76rem", color: "var(--color-text-muted)" }}>
+            {selectedCount} selected
+          </span>
+          <button
+            type="button"
+            onClick={() => void handleBulkDelete()}
+            style={{
+              borderRadius: "999px",
+              border: "1px solid rgba(248, 113, 113, 0.45)",
+              background: "rgba(127, 29, 29, 0.28)",
+              color: "#fecaca",
+              padding: "7px 11px",
+              fontSize: "0.74rem",
+              cursor: "pointer",
+              display: "inline-flex",
+              alignItems: "center",
+              gap: "6px",
+            }}
+          >
+            <Trash2 size={13} />
+            Delete Selected
+          </button>
+          <button
+            type="button"
+            onClick={handleCompare}
+            style={{
+              borderRadius: "999px",
+              border: "1px solid rgba(147, 197, 253, 0.5)",
+              background: "rgba(30, 58, 138, 0.3)",
+              color: "#dbeafe",
+              padding: "7px 11px",
+              fontSize: "0.74rem",
+              cursor: "pointer",
+              display: "inline-flex",
+              alignItems: "center",
+              gap: "6px",
+            }}
+          >
+            <Scale size={13} />
+            Compare Selected
+          </button>
+        </div>
+      ) : null}
+
       <CreateBacktestModal
         open={showCreateModal}
         onClose={() => setShowCreateModal(false)}
@@ -1049,87 +1187,21 @@ export function BacktestsPage() {
   );
 }
 
-function RangePair({
-  label,
-  min,
-  max,
-  onMinChange,
-  onMaxChange,
-}: {
-  label: string;
-  min: string;
-  max: string;
-  onMinChange: (value: string) => void;
-  onMaxChange: (value: string) => void;
-}) {
+function StatBadge({ label, value, color }: { label: string; value: string; color: string }) {
   return (
     <div
       style={{
-        borderRadius: "10px",
-        border: "1px solid rgba(90, 105, 138, 0.25)",
-        background: "rgba(13, 19, 32, 0.92)",
-        padding: "8px",
-        display: "grid",
-        gap: "5px",
-      }}
-    >
-      <span style={{ fontSize: "0.7rem", color: "var(--color-text-muted)" }}>{label}</span>
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "6px" }}>
-        <input
-          type="text"
-          inputMode="decimal"
-          placeholder="min"
-          value={min}
-          onChange={(event) => onMinChange(event.target.value)}
-          style={{
-            borderRadius: "8px",
-            border: "1px solid rgba(143, 154, 184, 0.26)",
-            background: "#101726",
-            color: "var(--color-text)",
-            padding: "6px 8px",
-            fontSize: "0.73rem",
-            fontFamily: NUMERIC_FONT,
-          }}
-        />
-        <input
-          type="text"
-          inputMode="decimal"
-          placeholder="max"
-          value={max}
-          onChange={(event) => onMaxChange(event.target.value)}
-          style={{
-            borderRadius: "8px",
-            border: "1px solid rgba(143, 154, 184, 0.26)",
-            background: "#101726",
-            color: "var(--color-text)",
-            padding: "6px 8px",
-            fontSize: "0.73rem",
-            fontFamily: NUMERIC_FONT,
-          }}
-        />
-      </div>
-    </div>
-  );
-}
-
-function StatBadge({ label, value, color }: { label: string; value: string; color: string }) {
-  return (
-    <span
-      style={{
-        display: "inline-flex",
-        alignItems: "center",
-        gap: "4px",
-        borderRadius: "999px",
+        borderRadius: "8px",
         border: "1px solid rgba(148, 163, 184, 0.24)",
-        background: "rgba(11, 18, 30, 0.9)",
-        padding: "2px 7px",
+        background: "rgba(15, 23, 42, 0.9)",
+        padding: "7px 9px",
         fontFamily: NUMERIC_FONT,
-        fontSize: "0.67rem",
+        fontSize: "0.72rem",
       }}
     >
-      <span style={{ color: "var(--color-text-muted)" }}>{label}</span>
-      <span style={{ color, fontWeight: 700 }}>{value}</span>
-    </span>
+      <div style={{ color: "var(--color-text-muted)", marginBottom: "3px", fontSize: "0.67rem" }}>{label}</div>
+      <div style={{ color, fontWeight: 700 }}>{value}</div>
+    </div>
   );
 }
 
