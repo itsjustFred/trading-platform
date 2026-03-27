@@ -182,7 +182,7 @@ Typical local workflow:
 ```bash
 .venv/bin/python -m pytest tests -q
 cd frontend && npm run build
-uvicorn viewer.main:app --host 0.0.0.0 --port 5556
+uvicorn viewer.main:app --host 0.0.0.0 --port 5556 --no-access-log
 ```
 
 Frontend development uses Vite; production/runtime serving uses FastAPI with

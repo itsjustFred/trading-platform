@@ -93,6 +93,12 @@ WINDOW_DAYS_BY_BASE_TF: dict[str, int] = {
     "1d": 3650,
 }
 
+BAR_INTERVAL_MS: dict[str, int] = {
+    "1m": 60 * 1000,
+    "1h": 60 * 60 * 1000,
+    "1d": 24 * 60 * 60 * 1000,
+}
+
 JFOREX_PERIOD_ATTR: dict[str, str] = {
     "1m": "ONE_MIN",
     "1h": "ONE_HOUR",
@@ -325,24 +331,57 @@ def _ensure_jvm_started() -> None:
     _require_jpype()
 
     with JVM_START_LOCK:
-        if jpype.isJVMStarted():
+        if not jpype.isJVMStarted():
+            classpath = _resolve_jforex_classpath()
+            if not classpath:
+                raise RuntimeError(
+                    "Could not resolve JForex SDK classpath. "
+                    "Set JFOREX_CLASSPATH (or JFOREX_JARS) to your SDK jars."
+                )
+
+            try:
+                jpype.startJVM(classpath=classpath, convertStrings=False)
+            except _java_exception_types() as exc:
+                _raise_jforex_runtime_error("Failed to start JVM for JForex SDK", exc)
+            except Exception as exc:  # noqa: BLE001
+                raise RuntimeError(
+                    f"Failed to start JVM for JForex SDK. Classpath={classpath}. Error: {exc}"
+                ) from exc
+
+    _ensure_jvm_thread_context_class_loader()
+
+
+def _ensure_jvm_thread_context_class_loader() -> None:
+    if jpype is None or not jpype.isJVMStarted():
+        return
+
+    try:
+        java_thread = jpype.JClass("java.lang.Thread")
+        class_loader = jpype.JClass("java.lang.ClassLoader")
+
+        current_thread = java_thread.currentThread()
+        if current_thread.getContextClassLoader() is not None:
             return
 
-        classpath = _resolve_jforex_classpath()
-        if not classpath:
-            raise RuntimeError(
-                "Could not resolve JForex SDK classpath. "
-                "Set JFOREX_CLASSPATH (or JFOREX_JARS) to your SDK jars."
-            )
+        loader = class_loader.getSystemClassLoader()
+        if loader is None:
+            from com.dukascopy.api.system import ClientFactory
 
-        try:
-            jpype.startJVM(classpath=classpath, convertStrings=False)
-        except _java_exception_types() as exc:
-            _raise_jforex_runtime_error("Failed to start JVM for JForex SDK", exc)
-        except Exception as exc:  # noqa: BLE001
-            raise RuntimeError(
-                f"Failed to start JVM for JForex SDK. Classpath={classpath}. Error: {exc}"
-            ) from exc
+            loader = ClientFactory.class_.getClassLoader()
+        if loader is None:
+            raise RuntimeError("No Java class loader available for JForex SDK thread context.")
+
+        current_thread.setContextClassLoader(loader)
+        logger.debug("Initialized Java thread context class loader for JForex SDK access")
+    except _java_exception_types() as exc:
+        _raise_jforex_runtime_error(
+            "Failed to initialize JVM thread context class loader",
+            exc,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(
+            f"Failed to initialize JVM thread context class loader: {exc}"
+        ) from exc
 
 
 def prewarm_jvm() -> None:
@@ -418,6 +457,18 @@ def _resolve_java_instrument(symbol: str) -> tuple[str, str, Any]:
 def _window_ms(base_timeframe: str) -> int:
     days = WINDOW_DAYS_BY_BASE_TF[base_timeframe]
     return int(days * 24 * 60 * 60 * 1000)
+
+
+def _align_bar_query_range(base_timeframe: str, start_ms: int, end_ms: int) -> tuple[int, int]:
+    if base_timeframe == "tick":
+        return start_ms, end_ms
+
+    interval_ms = BAR_INTERVAL_MS[base_timeframe]
+    aligned_start = (start_ms // interval_ms) * interval_ms
+    aligned_end = (end_ms // interval_ms) * interval_ms
+    if aligned_end < aligned_start:
+        aligned_end = aligned_start
+    return aligned_start, aligned_end
 
 
 def _query_jforex_history(
@@ -500,9 +551,15 @@ def _query_jforex_history(
                     if first_ms >= JAVA_LONG_MAX:
                         state.rows = []
                         return
-                    cursor = max(start_ms, first_ms)
-                    while cursor <= end_ms:
-                        window_end = min(cursor + step_ms - 1, end_ms)
+                    query_start_ms, query_end_ms = _align_bar_query_range(
+                        base_timeframe,
+                        start_ms,
+                        end_ms,
+                    )
+                    interval_ms = BAR_INTERVAL_MS[base_timeframe]
+                    cursor = max(query_start_ms, first_ms)
+                    while cursor <= query_end_ms:
+                        window_end = min(cursor + step_ms - interval_ms, query_end_ms)
                         bars = history.getBars(
                             java_instrument,
                             period,
@@ -521,7 +578,7 @@ def _query_jforex_history(
                                     float(bar.getVolume()),
                                 )
                             )
-                        cursor = window_end + 1
+                        cursor = window_end + interval_ms
 
                 state.rows = rows
             except _java_exception_types() as exc:

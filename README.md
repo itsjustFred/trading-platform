@@ -25,7 +25,7 @@ cp .env.example .env
 cd frontend && npm install && npm run build && cd ..
 
 # Start the viewer
-uvicorn viewer.main:app --host 0.0.0.0 --port 5556
+uvicorn viewer.main:app --host 0.0.0.0 --port 5556 --no-access-log
 # Open http://localhost:5556
 # Strategy Lab live conversion runs also require NVIDIA_API_KEY
 ```
@@ -125,7 +125,7 @@ tests/               — Test suite
 
 ## FastAPI + WebSocket
 
-- Start server: `uvicorn viewer.main:app --host 0.0.0.0 --port 5556`
+- Start server: `uvicorn viewer.main:app --host 0.0.0.0 --port 5556 --no-access-log`
 - React dev proxy forwards:
   - `/api` → `http://localhost:5556`
   - `/ws` → `ws://localhost:5556`

@@ -27,7 +27,7 @@ After=network.target
 Type=simple
 User=${SERVICE_USER}
 WorkingDirectory=${PROJECT_ROOT}
-ExecStart=${VENV_UVICORN} viewer.main:app --host 0.0.0.0 --port 5556
+ExecStart=${VENV_UVICORN} viewer.main:app --host 0.0.0.0 --port 5556 --no-access-log
 Restart=always
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1

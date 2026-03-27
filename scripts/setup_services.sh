@@ -35,7 +35,7 @@ User=${SERVICE_USER}
 WorkingDirectory=${PROJECT_ROOT}
 Environment=PATH=${PROJECT_ROOT}/.venv/bin:/usr/bin:/bin
 EnvironmentFile=${PROJECT_ROOT}/.env
-ExecStart=${PROJECT_ROOT}/.venv/bin/uvicorn viewer.main:app --host 0.0.0.0 --port 5556
+ExecStart=${PROJECT_ROOT}/.venv/bin/uvicorn viewer.main:app --host 0.0.0.0 --port 5556 --no-access-log
 Restart=always
 RestartSec=5
 

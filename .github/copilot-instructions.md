@@ -37,7 +37,7 @@ python -m runner.converters.cli stockkit path/to/trades.csv -o output.trades.jso
 python -m runner.converters.cli lean path/to/lean_result.json -o output.trades.json
 
 # Start FastAPI + web UI server
-uvicorn viewer.main:app --host 0.0.0.0 --port 5556
+uvicorn viewer.main:app --host 0.0.0.0 --port 5556 --no-access-log
 ```
 
 ```bash

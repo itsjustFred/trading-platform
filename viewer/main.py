@@ -696,9 +696,11 @@ class _QuietAccessLogFilter(logging.Filter):
 
 def _configure_uvicorn_access_log_filter() -> None:
     access_logger = logging.getLogger("uvicorn.access")
-    if any(isinstance(flt, _QuietAccessLogFilter) for flt in access_logger.filters):
-        return
-    access_logger.addFilter(_QuietAccessLogFilter())
+    # Access logs are intentionally disabled; request logging is handled by
+    # api_request_logging_middleware with structured timestamps.
+    access_logger.handlers.clear()
+    access_logger.propagate = False
+    access_logger.disabled = True
 
 
 _configure_uvicorn_access_log_filter()

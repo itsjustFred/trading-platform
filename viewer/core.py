@@ -3180,6 +3180,7 @@ def _start_dukascopy_task(
 
                 completed_items = 0
                 failed_items = 0
+                first_error: str | None = None
                 total = max(total_items, 1)
 
                 def task_log(message: str, *, level: str = "info") -> None:
@@ -3265,6 +3266,8 @@ def _start_dukascopy_task(
                         return
                     except (OSError, RuntimeError, ValueError, KeyError, json.JSONDecodeError) as exc:
                         failed_items += 1
+                        if first_error is None:
+                            first_error = f"{symbol} {timeframe}: {exc}"
                         _write_task_log_line(
                             handle,
                             task_id,
@@ -3272,6 +3275,27 @@ def _start_dukascopy_task(
                             stream="stdout",
                             log_level="error",
                             source="data-task",
+                        )
+                        _write_task_traceback(
+                            handle,
+                            task_id,
+                            traceback.format_exc(),
+                            source="data-task",
+                        )
+                        logger.exception(
+                            "Dukascopy download failed for %s %s: %s",
+                            symbol,
+                            timeframe,
+                            exc,
+                            extra={
+                                "data": {
+                                    "task_id": task_id,
+                                    "symbol": symbol,
+                                    "timeframe": timeframe,
+                                    "source": "data-task",
+                                    "downloader": "dukascopy-native",
+                                }
+                            },
                         )
 
                 if refresh_needed and not _refresh_catalog_for_task(
@@ -3289,13 +3313,29 @@ def _start_dukascopy_task(
                     stream="stdout",
                     source="data-task",
                 )
-                _mark_task_finished(task_id, status=final_status, returncode=returncode)
+                _mark_task_finished(
+                    task_id,
+                    status=final_status,
+                    returncode=returncode,
+                    error=first_error if failed_items > 0 else None,
+                )
         except Exception as exc:
             _mark_task_finished(task_id, status="failed", returncode=1, error=str(exc))
-            _append_task_log(
-                log_file,
-                f"[{_task_timestamp()}] Task failed: {exc}\n",
-            )
+            with log_file.open("a", encoding="utf-8", buffering=1) as handle:
+                _write_task_log_line(
+                    handle,
+                    task_id,
+                    f"[{_task_timestamp()}] Task failed: {exc}",
+                    stream="stderr",
+                    log_level="error",
+                    source="data-task",
+                )
+                _write_task_traceback(
+                    handle,
+                    task_id,
+                    traceback.format_exc(),
+                    source="data-task",
+                )
             logger.exception(
                 "Dukascopy task failed: %s",
                 exc,
@@ -3381,6 +3421,7 @@ def _start_jforex_task(
 
                 completed_items = 0
                 failed_items = 0
+                first_error: str | None = None
                 total = max(total_items, 1)
 
                 def task_log(message: str, *, level: str = "info") -> None:
@@ -3418,6 +3459,7 @@ def _start_jforex_task(
                     _set_task_status(task_id, "running")
                     item_label = f"{symbol} {timeframe}"
                     base_completed = completed_items + failed_items
+                    used_native_backend = False
 
                     def report_progress(pct: float, message: str) -> None:
                         overall = ((base_completed + (max(0.0, min(pct, 100.0)) / 100.0)) / total) * 100.0
@@ -3457,6 +3499,7 @@ def _start_jforex_task(
                         KeyError,
                         json.JSONDecodeError,
                     ) as exc:
+                        jforex_traceback = traceback.format_exc()
                         fallback_reason = (
                             _jforex_fallback_reason(exc)
                             if fallback_enabled
@@ -3470,12 +3513,34 @@ def _start_jforex_task(
                                 handle,
                                 task_id,
                                 (
-                                    f"ℹ️ {symbol} {timeframe}: JForex unavailable, falling back to Dukascopy native HTTP "
-                                    f"(reason: {fallback_reason}; error: {exc})"
+                                    f"ℹ️ {symbol} {timeframe}: JForex not available (reason: {fallback_reason}), "
+                                    f"using HTTP downloader. Original error: {exc}"
                                 ),
                                 stream="stdout",
                                 log_level="info",
                                 source="data-task",
+                            )
+                            _write_task_traceback(
+                                handle,
+                                task_id,
+                                jforex_traceback,
+                                source="data-task",
+                            )
+                            logger.exception(
+                                "JForex download failed for %s %s; attempting native fallback: %s",
+                                symbol,
+                                timeframe,
+                                exc,
+                                extra={
+                                    "data": {
+                                        "task_id": task_id,
+                                        "symbol": symbol,
+                                        "timeframe": timeframe,
+                                        "source": "data-task",
+                                        "downloader": "jforex",
+                                        "fallback": "dukascopy-native",
+                                    }
+                                },
                             )
                             try:
                                 result = fallback_downloader.download(
@@ -3512,6 +3577,11 @@ def _start_jforex_task(
                                 json.JSONDecodeError,
                             ) as fallback_exc:
                                 failed_items += 1
+                                if first_error is None:
+                                    first_error = (
+                                        f"{symbol} {timeframe}: JForex failed ({exc}); "
+                                        f"native fallback failed ({fallback_exc})"
+                                    )
                                 _write_task_log_line(
                                     handle,
                                     task_id,
@@ -3523,9 +3593,31 @@ def _start_jforex_task(
                                     log_level="error",
                                     source="data-task",
                                 )
+                                _write_task_traceback(
+                                    handle,
+                                    task_id,
+                                    traceback.format_exc(),
+                                    source="data-task",
+                                )
+                                logger.exception(
+                                    "Native fallback failed for %s %s after JForex failure",
+                                    symbol,
+                                    timeframe,
+                                    extra={
+                                        "data": {
+                                            "task_id": task_id,
+                                            "symbol": symbol,
+                                            "timeframe": timeframe,
+                                            "source": "data-task",
+                                            "downloader": "dukascopy-native",
+                                        }
+                                    },
+                                )
                                 continue
                         else:
                             failed_items += 1
+                            if first_error is None:
+                                first_error = f"{symbol} {timeframe}: {exc}"
                             _write_task_log_line(
                                 handle,
                                 task_id,
@@ -3533,6 +3625,27 @@ def _start_jforex_task(
                                 stream="stdout",
                                 log_level="error",
                                 source="data-task",
+                            )
+                            _write_task_traceback(
+                                handle,
+                                task_id,
+                                jforex_traceback,
+                                source="data-task",
+                            )
+                            logger.exception(
+                                "JForex download failed for %s %s: %s",
+                                symbol,
+                                timeframe,
+                                exc,
+                                extra={
+                                    "data": {
+                                        "task_id": task_id,
+                                        "symbol": symbol,
+                                        "timeframe": timeframe,
+                                        "source": "data-task",
+                                        "downloader": "jforex",
+                                    }
+                                },
                             )
                             continue
 
@@ -3569,13 +3682,29 @@ def _start_jforex_task(
                     stream="stdout",
                     source="data-task",
                 )
-                _mark_task_finished(task_id, status=final_status, returncode=returncode)
+                _mark_task_finished(
+                    task_id,
+                    status=final_status,
+                    returncode=returncode,
+                    error=first_error if failed_items > 0 else None,
+                )
         except Exception as exc:
             _mark_task_finished(task_id, status="failed", returncode=1, error=str(exc))
-            _append_task_log(
-                log_file,
-                f"[{_task_timestamp()}] Task failed: {exc}\n",
-            )
+            with log_file.open("a", encoding="utf-8", buffering=1) as handle:
+                _write_task_log_line(
+                    handle,
+                    task_id,
+                    f"[{_task_timestamp()}] Task failed: {exc}",
+                    stream="stderr",
+                    log_level="error",
+                    source="data-task",
+                )
+                _write_task_traceback(
+                    handle,
+                    task_id,
+                    traceback.format_exc(),
+                    source="data-task",
+                )
             logger.exception(
                 "JForex task failed: %s",
                 exc,
@@ -3947,6 +4076,14 @@ def _jforex_fallback_reason(exc: Exception) -> str | None:
         "jvm shared library": "Java/JVM runtime unavailable",
         "jvm dll not found": "Java/JVM runtime unavailable",
         "no jvm shared library file": "Java/JVM runtime unavailable",
+        "nullpointerexception": "JForex runtime classloader failure",
+        "jforex sdk request execution failed": "JForex request execution failed",
+        "jforex connection timed out": "JForex connection timed out",
+        "jforex data request timed out": "JForex data request timed out",
+        "jforex history query failed": "JForex historical query failed",
+        "interval from [": "JForex historical interval invalid",
+        "not valid for period": "JForex historical interval invalid",
+        "dukascopy credentials": "Dukascopy credentials missing or invalid",
     }
     for fragment, reason in availability_reason_by_fragment.items():
         if fragment in message:

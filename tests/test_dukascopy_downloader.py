@@ -281,3 +281,30 @@ def test_jforex_classpath_prefers_explicit_env(monkeypatch):
     monkeypatch.setenv("JFOREX_CLASSPATH", "/tmp/a.jar:/tmp/b.jar")
     classpath = jforex._resolve_jforex_classpath()
     assert classpath == ["/tmp/a.jar", "/tmp/b.jar"]
+
+
+def test_jforex_aligns_daily_query_range_to_bar_boundaries():
+    import data_tools.downloaders.jforex_dl as jforex
+
+    start_dt = jforex._parse_datetime("2025-01-01", is_end=False)
+    end_dt = jforex._parse_datetime("2025-01-31", is_end=True)
+    start_ms = int(start_dt.timestamp() * 1000)
+    end_ms = int(end_dt.timestamp() * 1000)
+
+    aligned_start, aligned_end = jforex._align_bar_query_range("1d", start_ms, end_ms)
+
+    expected_end = int(jforex._parse_datetime("2025-01-31", is_end=False).timestamp() * 1000)
+    assert aligned_start == start_ms
+    assert aligned_end == expected_end
+
+
+def test_jforex_aligns_hourly_query_range_to_hour_starts():
+    import data_tools.downloaders.jforex_dl as jforex
+
+    start_ms = int(pd.Timestamp("2025-01-01T00:17:15Z").timestamp() * 1000)
+    end_ms = int(pd.Timestamp("2025-01-01T03:59:59.900Z").timestamp() * 1000)
+
+    aligned_start, aligned_end = jforex._align_bar_query_range("1h", start_ms, end_ms)
+
+    assert aligned_start == int(pd.Timestamp("2025-01-01T00:00:00Z").timestamp() * 1000)
+    assert aligned_end == int(pd.Timestamp("2025-01-01T03:00:00Z").timestamp() * 1000)
