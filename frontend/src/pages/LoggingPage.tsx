@@ -12,8 +12,8 @@ const DEFAULT_LEVELS: Record<string, boolean> = {
   INFO: true,
   DEBUG: false,
 };
-const POLLING_PATHS = ["/api/data/tasks", "/api/live/accounts", "/api/live/deployments"];
-const POLLING_PREFIXES = ["/api/data/tasks/", "/api/live/balances/", "/api/live/stats/", "/api/live/trades/"];
+const POLLING_PATHS = ["/api/tasks", "/api/data/tasks", "/api/live/accounts", "/api/live/deployments"];
+const POLLING_PREFIXES = ["/api/tasks/", "/api/data/tasks/", "/api/live/balances/", "/api/live/stats/", "/api/live/trades/"];
 
 type Level = (typeof LEVEL_OPTIONS)[number];
 

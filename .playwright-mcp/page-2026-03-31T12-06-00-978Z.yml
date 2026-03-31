@@ -1,0 +1,161 @@
+- generic [ref=e3]:
+  - complementary [ref=e4]:
+    - button "Collapse" [ref=e5]:
+      - img [ref=e6]
+    - navigation [ref=e10]:
+      - link "Strategies" [ref=e11] [cursor=pointer]:
+        - /url: /strategies
+        - img [ref=e12]
+        - generic [ref=e15]: Strategies
+      - link "Backtests" [ref=e16] [cursor=pointer]:
+        - /url: /backtests
+        - img [ref=e17]
+        - generic [ref=e22]: Backtests
+      - link "Optimizations" [ref=e23] [cursor=pointer]:
+        - /url: /optimizations
+        - img [ref=e24]
+        - generic [ref=e28]: Optimizations
+      - link "Live Hub" [ref=e29] [cursor=pointer]:
+        - /url: /live
+        - img [ref=e30]
+        - generic [ref=e36]: Live Hub
+      - link "Portfolio" [ref=e37] [cursor=pointer]:
+        - /url: /portfolios
+        - img [ref=e38]
+        - generic [ref=e41]: Portfolio
+      - link "Strategy Lab" [ref=e42] [cursor=pointer]:
+        - /url: /lab
+        - img [ref=e43]
+        - generic [ref=e50]: Strategy Lab
+      - link "Data" [ref=e51] [cursor=pointer]:
+        - /url: /data
+        - img [ref=e52]
+        - generic [ref=e56]: Data
+      - link "Task Hub" [ref=e57] [cursor=pointer]:
+        - /url: /tasks
+        - img [ref=e58]
+        - generic [ref=e60]: Task Hub
+      - link "Logging" [ref=e61] [cursor=pointer]:
+        - /url: /logging
+        - img [ref=e62]
+        - generic [ref=e67]: Logging
+      - generic "Coming soon" [ref=e68]:
+        - img [ref=e69]
+        - generic [ref=e74]: Accounts
+  - main [ref=e75]:
+    - generic [ref=e76]:
+      - generic [ref=e77]:
+        - generic [ref=e78]:
+          - generic [ref=e79]:
+            - img [ref=e81]
+            - generic [ref=e85]:
+              - generic [ref=e86]: Data Console
+              - heading "DBMS-style market data control room" [level=1] [ref=e87]
+          - generic [ref=e88]: Navigate the stored data tree, inspect symbol-level inventories, and trigger backend jobs without leaving the page.
+        - generic [ref=e90]:
+          - generic [ref=e91]: Categories
+          - generic [ref=e92]: "6"
+      - generic [ref=e93]:
+        - complementary [ref=e94]:
+          - generic [ref=e95]:
+            - generic [ref=e96]:
+              - generic [ref=e97]:
+                - img [ref=e98]
+                - generic [ref=e103]:
+                  - generic [ref=e104]: Tree navigator
+                  - generic [ref=e105]: Categories & symbols
+              - generic [ref=e106]: 6 nodes
+            - generic [ref=e107]:
+              - img [ref=e108]
+              - textbox "Filter symbols in the tree..." [ref=e111]
+          - generic [ref=e112]:
+            - generic [ref=e113]:
+              - button "Dolthub Repos 4 symbols • 12.90 GB Date range pending" [ref=e114] [cursor=pointer]:
+                - generic [ref=e115]:
+                  - img [ref=e116]
+                  - generic [ref=e118]:
+                    - generic [ref=e119]: Dolthub Repos
+                    - generic [ref=e120]: 4 symbols • 12.90 GB
+                - generic [ref=e121]: Date range pending
+              - generic [ref=e123]: No symbol matches in this category.
+            - button "ETFs 2 symbols • 0.17 MB 2021-02-26 → 2026-02-26" [ref=e125] [cursor=pointer]:
+              - generic [ref=e126]:
+                - img [ref=e127]
+                - generic [ref=e129]:
+                  - generic [ref=e130]: ETFs
+                  - generic [ref=e131]: 2 symbols • 0.17 MB
+              - generic [ref=e132]: 2021-02-26 → 2026-02-26
+            - button "Equities 20123 symbols • 925.58 MB 1999-03-10 → 2026-03-06" [ref=e134] [cursor=pointer]:
+              - generic [ref=e135]:
+                - img [ref=e136]
+                - generic [ref=e138]:
+                  - generic [ref=e139]: Equities
+                  - generic [ref=e140]: 20123 symbols • 925.58 MB
+              - generic [ref=e141]: 1999-03-10 → 2026-03-06
+            - button "Forex 6 symbols • 534.50 MB 2020-01-01 → 2026-03-27" [ref=e143] [cursor=pointer]:
+              - generic [ref=e144]:
+                - img [ref=e145]
+                - generic [ref=e147]:
+                  - generic [ref=e148]: Forex
+                  - generic [ref=e149]: 6 symbols • 534.50 MB
+              - generic [ref=e150]: 2020-01-01 → 2026-03-27
+            - button "Indices 4 symbols • 665.70 MB 2020-01-01 → 2026-03-27" [ref=e152] [cursor=pointer]:
+              - generic [ref=e153]:
+                - img [ref=e154]
+                - generic [ref=e156]:
+                  - generic [ref=e157]: Indices
+                  - generic [ref=e158]: 4 symbols • 665.70 MB
+              - generic [ref=e159]: 2020-01-01 → 2026-03-27
+            - button "Metals 2 symbols • 7.70 GB 2000-01-03 → 2026-03-27" [ref=e161] [cursor=pointer]:
+              - generic [ref=e162]:
+                - img [ref=e163]
+                - generic [ref=e165]:
+                  - generic [ref=e166]: Metals
+                  - generic [ref=e167]: 2 symbols • 7.70 GB
+              - generic [ref=e168]: 2000-01-03 → 2026-03-27
+        - main [ref=e169]:
+          - generic [ref=e170]:
+            - generic [ref=e171]:
+              - generic [ref=e172]:
+                - generic [ref=e173]:
+                  - generic [ref=e174]: Category overview
+                  - generic [ref=e175]: Dolthub Repos
+                  - generic [ref=e176]:
+                    - generic [ref=e177]: Data Console
+                    - generic [ref=e178]:
+                      - generic [ref=e179]: ›
+                      - text: Dolthub Repos
+                - generic [ref=e180]:
+                  - button "Download Data" [ref=e181] [cursor=pointer]:
+                    - img [ref=e182]
+                    - text: Download Data
+                  - button "Resample" [ref=e186] [cursor=pointer]:
+                    - img [ref=e187]
+                    - text: Resample
+                  - button "Smart Harvest (Auto-Tune)" [ref=e192] [cursor=pointer]:
+                    - img [ref=e193]
+                    - text: Smart Harvest (Auto-Tune)
+              - generic [ref=e198]:
+                - text: Browse the full symbol inventory inside
+                - strong [ref=e199]: Dolthub Repos
+                - text: ", inspect storage coverage, and jump directly into symbol-level maintenance."
+            - generic [ref=e200]:
+              - generic [ref=e201]:
+                - generic [ref=e202]: Symbols
+                - generic [ref=e203]: "4"
+              - generic [ref=e204]:
+                - generic [ref=e205]: Files
+                - generic [ref=e206]: "4"
+              - generic [ref=e207]:
+                - generic [ref=e208]: Storage
+                - generic [ref=e209]: 12.90 GB
+              - generic [ref=e210]:
+                - generic [ref=e211]: Coverage
+                - generic [ref=e212]: Date range pending
+            - generic [ref=e213]:
+              - generic [ref=e215]:
+                - generic [ref=e216]:
+                  - img [ref=e217]
+                  - heading "Symbol inventory" [level=2] [ref=e219]
+                - generic [ref=e220]: Select a row to jump into the symbol detail workspace.
+              - generic [ref=e221]: No symbols available in this category yet.

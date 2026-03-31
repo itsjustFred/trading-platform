@@ -1029,6 +1029,47 @@ def test_data_overview_uses_cached_catalog_entries(viewer_client, monkeypatch):
     assert categories["ETFs"]["end"] == "2024-02-09"
 
 
+def test_data_views_normalize_timeframe_aliases_in_catalog(viewer_client, tmp_path):
+    catalog = {
+        "ohlcv": [
+            {
+                "path": str(tmp_path / "ohlcv" / "test_source" / "forex" / "EURUSD" / "m1.parquet"),
+                "symbol": "EURUSD",
+                "timeframe": "m1",
+                "source": "test_source",
+                "size_bytes": 1000,
+                "start": "2024-01-01",
+                "end": "2024-01-10",
+            },
+            {
+                "path": str(tmp_path / "ohlcv" / "test_source" / "forex" / "EURUSD" / "1m.parquet"),
+                "symbol": "EURUSD",
+                "timeframe": "1m",
+                "source": "test_source",
+                "size_bytes": 1200,
+                "start": "2024-01-11",
+                "end": "2024-01-20",
+            },
+        ]
+    }
+    (tmp_path / "catalog.json").write_text(json.dumps(catalog))
+
+    overview_resp = viewer_client.get("/api/data/overview")
+    assert overview_resp.status_code == 200
+    categories = {item["name"]: item for item in overview_resp.json()["categories"]}
+    assert categories["Forex"]["file_count"] == 1
+    assert categories["Forex"]["start"] == "2024-01-01"
+    assert categories["Forex"]["end"] == "2024-01-20"
+
+    details_resp = viewer_client.get("/api/data/category/Forex")
+    assert details_resp.status_code == 200
+    symbols = details_resp.json()["symbols"]
+    assert len(symbols) == 1
+    assert symbols[0]["symbol"] == "EURUSD"
+    assert symbols[0]["timeframe"] == "1m"
+    assert symbols[0]["file_count"] == 2
+
+
 def test_list_symbols_reuses_precomputed_data_views(viewer_client, monkeypatch):
     import viewer.main as viewer_app_module
 
@@ -1124,6 +1165,49 @@ def test_data_tasks_list_and_controls(viewer_client, tmp_path):
     assert cancel_resp.status_code == 200
     assert viewer_app_module.DATA_TASKS[task_id]["stop_event"].is_set()
     assert cancel_resp.json()["status"] == "cancelled"
+
+
+def test_tasks_alias_returns_enriched_fields(viewer_client, tmp_path):
+    import viewer.main as viewer_app_module
+
+    task_id = "alias-fields-task"
+    log_file = tmp_path / "logs" / "tasks" / f"task_{task_id}.log"
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    viewer_app_module.DATA_TASKS[task_id] = viewer_app_module._create_task_record(
+        task_id,
+        name="Optimize SMA window",
+        description="Optimization task",
+        kind="optimization",
+        source="optuna",
+        total_items=4,
+        log_file=log_file,
+        control_mode="thread",
+        supports_control=False,
+    )
+    viewer_app_module._set_task_status(task_id, "running")
+    viewer_app_module._update_task_progress(
+        task_id,
+        percent=25.0,
+        current="Trial 1/4",
+        total=4,
+    )
+
+    response = viewer_client.get("/api/tasks")
+    assert response.status_code == 200
+    listed = next(item for item in response.json()["tasks"] if item["id"] == task_id)
+    assert "created_at" in listed
+    assert "started_at" in listed
+    assert "completed_at" in listed
+    assert "progress_percent" in listed
+    assert "progress_message" in listed
+    assert "eta_seconds" in listed
+    assert "elapsed_seconds" in listed
+    assert "category" in listed
+    assert "error_message" in listed
+    assert listed["progress_percent"] == 25.0
+    assert listed["progress_message"] == "Trial 1/4"
+    assert listed["category"] == "optimization"
+    assert listed["error_message"] is None
 
 
 def test_data_tasks_running_eta_is_exposed(viewer_client, tmp_path):
@@ -2181,6 +2265,92 @@ def test_backtest_equity_preview_endpoint_uses_cache(viewer_client, monkeypatch)
     assert first.json() == [100000.0, 100250.0, 100180.0]
     assert second.json() == [100000.0, 100250.0, 100180.0]
     assert calls["count"] == 1
+
+
+def test_backtests_cache_refreshes_when_sqlite_changes(viewer_client, monkeypatch):
+    import viewer.main as viewer_app_module
+
+    call_count = {"value": 0}
+
+    def _list_rows():
+        call_count["value"] += 1
+        if call_count["value"] == 1:
+            return [
+                {
+                    "id": "cache-mtime-demo",
+                    "engine": "vectorbt",
+                    "strategy_name": "Cache Mtime Demo",
+                    "symbols": ["AAPL"],
+                    "timeframe": "1d",
+                    "start_date": "2024-01-01",
+                    "end_date": "2024-01-31",
+                    "total_return": 0.01,
+                    "cagr": 0.01,
+                    "sharpe_ratio": 1.0,
+                    "psr": 0.5,
+                    "p_value": 0.2,
+                    "max_drawdown": -0.02,
+                    "win_rate": 0.5,
+                    "trade_count": 10,
+                    "created_at": "2026-03-10T10:00:00Z",
+                }
+            ]
+        return [
+            {
+                "id": "cache-mtime-demo",
+                "engine": "vectorbt",
+                "strategy_name": "Cache Mtime Demo",
+                "symbols": ["AAPL"],
+                "timeframe": "1d",
+                "start_date": "2024-01-01",
+                "end_date": "2024-01-31",
+                "total_return": 0.15,
+                "cagr": 0.12,
+                "sharpe_ratio": 1.0,
+                "psr": 0.5,
+                "p_value": 0.2,
+                "max_drawdown": -0.02,
+                "win_rate": 0.5,
+                "trade_count": 10,
+                "created_at": "2026-03-10T10:00:00Z",
+            }
+        ]
+
+    class _FakeStat:
+        def __init__(self, mtime_ns: int):
+            self.st_mtime_ns = mtime_ns
+
+    mtime_state = {"value": 100}
+
+    class _FakeDbPath:
+        @staticmethod
+        def stat():
+            return _FakeStat(mtime_state["value"])
+
+    monkeypatch.setattr(viewer_app_module, "list_backtest_metadata_rows", _list_rows)
+    monkeypatch.setattr(viewer_app_module, "BACKTEST_DB_PATH", _FakeDbPath())
+    monkeypatch.setattr(
+        viewer_app_module,
+        "load_backtest_equity_preview_map",
+        lambda backtest_ids, limit=50: {"cache-mtime-demo": [100000.0, 100050.0]},
+    )
+
+    with viewer_app_module._BACKTEST_META_CACHE_LOCK:
+        viewer_app_module._BACKTEST_META_CACHE.clear()
+        viewer_app_module._BACKTEST_META_CACHE_SOURCE_MTIME_NS = 0
+    with viewer_app_module._BACKTEST_EQUITY_PREVIEW_CACHE_LOCK:
+        viewer_app_module._BACKTEST_EQUITY_PREVIEW_CACHE.clear()
+
+    first = viewer_client.get("/api/backtests")
+    assert first.status_code == 200
+    assert first.json()["items"][0]["cagr"] == pytest.approx(1.0)
+    assert call_count["value"] == 1
+
+    mtime_state["value"] = 200
+    second = viewer_client.get("/api/backtests")
+    assert second.status_code == 200
+    assert second.json()["items"][0]["cagr"] == pytest.approx(12.0)
+    assert call_count["value"] == 2
 
 
 def test_backtests_bulk_delete_and_single_delete(viewer_client, tmp_path):

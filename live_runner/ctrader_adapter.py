@@ -7,6 +7,7 @@ from typing import Any
 from uuid import UUID
 
 from live_runner.base_adapter import BaseLiveAdapter
+from risk.live import size_live_signal
 from shared.database import save_live_execution, save_live_signal
 from shared.logging import get_logger
 from shared.models import LiveExecution, LiveSignal
@@ -325,6 +326,11 @@ class CTraderLiveAdapter(BaseLiveAdapter):
 
     def _resolve_order_volume(self, signal: LiveSignal) -> int:
         metadata = signal.metadata or {}
+        if "qty" in metadata:
+            qty = _to_float(metadata.get("qty"), default=0.0)
+            if qty > 0:
+                return max(int(qty * 1000), 1000)
+
         if "ctrader_volume" in metadata:
             try:
                 explicit = int(float(metadata["ctrader_volume"]))
@@ -422,6 +428,15 @@ class CTraderLiveAdapter(BaseLiveAdapter):
     async def submit_order(self, signal: LiveSignal) -> str:
         if not self._connected or not self._authenticated:
             await self.connect()
+
+        balance, _ = await self.get_balance()
+        sized_order = size_live_signal(signal, account_balance=balance)
+        sized_qty = _to_float((signal.metadata or {}).get("qty"), default=0.0)
+        if sized_qty <= 0:
+            raise ValueError(
+                "Risk engine returned non-positive quantity; order blocked "
+                f"(risk_percent={sized_order.risk_percent:.4f})."
+            )
 
         await asyncio.to_thread(save_live_signal, signal)
         symbol_id = self._symbol_name_to_id.get(signal.symbol.upper())

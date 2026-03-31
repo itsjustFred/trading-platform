@@ -8,6 +8,7 @@ from typing import Any
 from uuid import UUID
 
 from live_runner.base_adapter import BaseLiveAdapter
+from risk.live import size_live_signal
 from shared.database import save_live_execution, save_live_signal
 from shared.logging import get_logger
 from shared.models import LiveExecution, LiveSignal
@@ -100,8 +101,16 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 "alpaca-py is required for AlpacaLiveAdapter. Install package 'alpaca-py'."
             ) from exc
 
+        balance, _ = await self.get_balance()
+        sized_order = size_live_signal(signal, account_balance=balance)
+        qty = max(_to_float(signal.metadata.get("qty"), default=0.0), 0.0)
+        if qty <= 0:
+            raise ValueError(
+                "Risk engine returned non-positive quantity; order blocked "
+                f"(risk_percent={sized_order.risk_percent:.4f})."
+            )
+
         side = OrderSide.BUY if signal.action == "buy" else OrderSide.SELL
-        qty = _to_float(signal.metadata.get("qty"), default=1.0)
         await asyncio.to_thread(save_live_signal, signal)
 
         request = MarketOrderRequest(

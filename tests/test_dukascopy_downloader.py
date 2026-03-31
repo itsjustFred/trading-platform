@@ -308,3 +308,12 @@ def test_jforex_aligns_hourly_query_range_to_hour_starts():
 
     assert aligned_start == int(pd.Timestamp("2025-01-01T00:00:00Z").timestamp() * 1000)
     assert aligned_end == int(pd.Timestamp("2025-01-01T03:00:00Z").timestamp() * 1000)
+
+
+def test_jforex_normalize_timeframe_aliases():
+    import data_tools.downloaders.jforex_dl as jforex
+
+    assert jforex._normalize_timeframe("m1") == "1m"
+    assert jforex._normalize_timeframe("h1") == "1h"
+    assert jforex._normalize_timeframe("d1") == "1d"
+    assert jforex._normalize_timeframe("1h") == "1h"

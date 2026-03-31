@@ -65,3 +65,38 @@ def test_cmd_run_persists_canonical_stats(monkeypatch, tmp_path: Path):
     assert payload["stats"]["engine_metric"] == 99
     assert payload["stats"]["cagr"] > 0
     assert payload["stats"]["total_return"] == 0.05
+
+
+def test_cmd_run_normalizes_timeframe_alias(monkeypatch, tmp_path: Path):
+    output_path = tmp_path / "cli-demo-alias.trades.json"
+    captured: dict[str, object] = {}
+
+    class _CaptureEngine(_DummyEngine):
+        def validate_config(self, config):
+            captured["timeframe"] = config.timeframe
+            return []
+
+    monkeypatch.setattr(runner_cli, "get_engine", lambda _: _CaptureEngine())
+
+    args = SimpleNamespace(
+        engine="vectorbt",
+        strategy="strategies/demo.py",
+        symbols=["AAPL"],
+        timeframe="h1",
+        start="2024-01-01",
+        end="2024-02-01",
+        capital=100000.0,
+        risk_pct=None,
+        max_position_pct=None,
+        max_leverage=None,
+        data_dir="",
+        params=json.dumps({"window": 20}),
+        name="demo",
+        output=str(output_path),
+    )
+
+    runner_cli.cmd_run(args)
+
+    assert captured["timeframe"] == "1h"
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    assert payload["meta"]["data"]["timeframes"] == ["1h"]

@@ -28,7 +28,6 @@ import type { DataCategorySummary, DataSymbolEntry } from "../api/types";
 import { DownloadModal } from "../components/DownloadModal";
 import { ResampleModal } from "../components/ResampleModal";
 import { SmartHarvestModal } from "../components/SmartHarvestModal";
-import { TaskManager } from "../components/TaskManager";
 
 type TreeSelection =
   | { kind: "category"; category: string }
@@ -829,11 +828,11 @@ export function DataManagementPage() {
         <div
           style={{
             display: "grid",
-            gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+            gridTemplateColumns: "minmax(220px, 1fr)",
             gap: "12px",
             alignItems: "start",
-            width: "min(100%, 620px)",
-            flex: "1 1 420px",
+            width: "min(100%, 320px)",
+            flex: "0 1 320px",
           }}
         >
           <MetricTile
@@ -841,7 +840,6 @@ export function DataManagementPage() {
             value={String(categories.length)}
             accent="#7dd3fc"
           />
-          <TaskManager />
         </div>
       </div>
 

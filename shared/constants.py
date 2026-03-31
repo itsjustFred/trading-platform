@@ -14,6 +14,23 @@ except ImportError:  # pragma: no cover - Windows
 VALID_TIMEFRAMES = ("tick", "s1", "1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w")
 VALID_DIRECTIONS = ("LONG", "SHORT")
 VALID_ENGINES = ("native", "lean", "vectorbt", "pynecore")
+TIMEFRAME_ALIASES: dict[str, str] = {
+    "m1": "1m",
+    "h1": "1h",
+    "d1": "1d",
+}
+
+
+def normalize_timeframe(timeframe: str | None) -> str:
+    """Normalize timeframe aliases to canonical values.
+
+    Returns canonical values for known aliases (e.g. m1 -> 1m) and safely
+    passes through already-normalized or unknown values.
+    """
+    normalized = str(timeframe or "").strip().lower()
+    if not normalized:
+        return ""
+    return TIMEFRAME_ALIASES.get(normalized, normalized)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(PROJECT_ROOT / ".env")

@@ -239,6 +239,50 @@ def test_build_catalog_merges_same_symbol_timeframe_across_sources(tmp_path):
     }
 
 
+def test_build_catalog_normalizes_timeframe_aliases_and_merges_duplicates(tmp_path):
+    symbol_dir = tmp_path / "ohlcv" / "dukascopy" / "forex" / "EURUSD"
+    symbol_dir.mkdir(parents=True)
+
+    jan = pd.DataFrame({
+        "timestamp": pd.to_datetime(
+            ["2024-01-01T00:00:00Z", "2024-01-31T23:59:59Z"],
+            utc=True,
+        ),
+        "open": [1.10, 1.20],
+        "high": [1.11, 1.21],
+        "low": [1.09, 1.19],
+        "close": [1.105, 1.205],
+        "volume": [10, 12],
+    })
+    feb = pd.DataFrame({
+        "timestamp": pd.to_datetime(
+            ["2024-02-01T00:00:00Z", "2024-02-29T23:59:59Z"],
+            utc=True,
+        ),
+        "open": [1.30, 1.40],
+        "high": [1.31, 1.41],
+        "low": [1.29, 1.39],
+        "close": [1.305, 1.405],
+        "volume": [14, 16],
+    })
+
+    jan.to_parquet(symbol_dir / "m1.parquet", index=False)
+    feb.to_parquet(symbol_dir / "1m.parquet", index=False)
+
+    catalog = build_catalog(tmp_path)
+
+    assert len(catalog["ohlcv"]) == 1
+    ds = catalog["ohlcv"][0]
+    assert ds["symbol"] == "EURUSD"
+    assert ds["timeframe"] == "1m"
+    assert ds["rows"] == 4
+    assert ds["start"] == "2024-01-01"
+    assert ds["end"] == "2024-02-29"
+    assert ds["file_count"] == 2
+    assert {Path(path).name for path in ds["files"]} == {"m1.parquet", "1m.parquet"}
+    assert catalog["summary"]["timeframes"] == ["1m"]
+
+
 def test_empty_catalog(tmp_path):
     catalog = build_catalog(tmp_path)
     assert catalog["summary"]["total_datasets"] == 0

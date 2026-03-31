@@ -40,7 +40,13 @@ async def _run(symbol: str, deployment_id: str, qty: float) -> None:
         action="buy",
         theoretical_price=theoretical_price,
         timestamp=datetime.now(timezone.utc),
-        metadata={"qty": qty},
+        metadata={
+            "qty": qty,
+            "entry_price": theoretical_price,
+            "stop_loss": theoretical_price * 0.98,
+            "take_profit": theoretical_price * 1.04,
+            "timeframe": "1m",
+        },
     )
     save_live_signal(signal)
     broker_order_id = await adapter.submit_order(signal)

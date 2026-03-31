@@ -132,6 +132,8 @@ export const getBacktests = (params?: BacktestsQueryParams) => {
   if (params?.symbol) query.set("symbol", params.symbol);
   if (params?.timeframe) query.set("timeframe", params.timeframe);
   if (params?.search) query.set("search", params.search);
+  if (params?.total_return_min != null) query.set("total_return_min", String(params.total_return_min));
+  if (params?.total_return_max != null) query.set("total_return_max", String(params.total_return_max));
   if (params?.sharpe_min != null) query.set("sharpe_min", String(params.sharpe_min));
   if (params?.sharpe_max != null) query.set("sharpe_max", String(params.sharpe_max));
   if (params?.psr_min != null) query.set("psr_min", String(params.psr_min));
@@ -140,6 +142,10 @@ export const getBacktests = (params?: BacktestsQueryParams) => {
   if (params?.p_value_max != null) query.set("p_value_max", String(params.p_value_max));
   if (params?.cagr_min != null) query.set("cagr_min", String(params.cagr_min));
   if (params?.cagr_max != null) query.set("cagr_max", String(params.cagr_max));
+  if (params?.win_rate_min != null) query.set("win_rate_min", String(params.win_rate_min));
+  if (params?.win_rate_max != null) query.set("win_rate_max", String(params.win_rate_max));
+  if (params?.drawdown_min != null) query.set("drawdown_min", String(params.drawdown_min));
+  if (params?.drawdown_max != null) query.set("drawdown_max", String(params.drawdown_max));
   if (params?.max_drawdown_min != null) query.set("max_drawdown_min", String(params.max_drawdown_min));
   if (params?.max_drawdown_max != null) query.set("max_drawdown_max", String(params.max_drawdown_max));
   const queryString = query.toString();
@@ -335,6 +341,7 @@ export const startAgentConvert = (data: AgentConvertRequest) =>
     method: "POST",
     body: JSON.stringify(data),
   });
+export const listTasks = () => fetchJSON<DataTaskListResponse>("/tasks");
 export const listDataTasks = () => fetchJSON<DataTaskListResponse>("/data/tasks");
 export const getDataTask = (taskId: string) =>
   fetchJSON<DataTaskStatusResponse>(`/data/tasks/${taskId}`);

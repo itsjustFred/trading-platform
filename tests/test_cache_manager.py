@@ -292,3 +292,54 @@ def test_get_catalog_normalizes_tick_segment_symbols_from_disk(monkeypatch, tmp_
         "tick_2003_05.parquet",
         "tick_2003_06.parquet",
     }
+
+
+def test_get_catalog_normalizes_timeframe_aliases_from_disk(monkeypatch, tmp_path):
+    raw_catalog = {
+        "summary": {"total_datasets": 999, "symbols": 999},
+        "ohlcv": [
+            {
+                "path": str(tmp_path / "ohlcv" / "dukascopy" / "forex" / "EURUSD" / "m1.parquet"),
+                "symbol": "EURUSD",
+                "timeframe": "m1",
+                "source": "dukascopy",
+                "asset_class": "forex",
+                "size_bytes": 100,
+                "rows": 10,
+                "start": "2024-01-01",
+                "end": "2024-01-31",
+            },
+            {
+                "path": str(tmp_path / "ohlcv" / "dukascopy" / "forex" / "EURUSD" / "1m.parquet"),
+                "symbol": "EURUSD",
+                "timeframe": "1m",
+                "source": "dukascopy",
+                "asset_class": "forex",
+                "size_bytes": 120,
+                "rows": 12,
+                "start": "2024-02-01",
+                "end": "2024-02-29",
+            },
+        ],
+        "fundamentals": [],
+        "universes": [],
+    }
+    (tmp_path / "catalog.json").write_text(json.dumps(raw_catalog), encoding="utf-8")
+
+    def fail_build_catalog(*_args, **_kwargs):
+        raise AssertionError("build_catalog should not be called when catalog.json exists")
+
+    monkeypatch.setattr(cache_manager, "build_catalog", fail_build_catalog)
+
+    loaded = cache_manager.get_catalog(tmp_path, include_validation=False)
+
+    assert loaded["summary"]["total_datasets"] == 1
+    assert loaded["summary"]["symbols"] == 1
+    assert loaded["summary"]["timeframes"] == ["1m"]
+    assert len(loaded["ohlcv"]) == 1
+    merged = loaded["ohlcv"][0]
+    assert merged["symbol"] == "EURUSD"
+    assert merged["timeframe"] == "1m"
+    assert merged["row_count"] == 22
+    assert merged["rows"] == 22
+    assert merged["file_count"] == 2

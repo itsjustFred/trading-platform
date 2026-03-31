@@ -1,13 +1,13 @@
 import { useState, useEffect, useMemo } from "react";
 import { Modal } from "./Modal";
 import {
-  getStrategyDetail,
   runBacktest,
 } from "../api/client";
 import { SymbolInput } from "./SymbolInput";
 import { Play, Loader2 } from "lucide-react";
 import { useToast } from "./ToastProvider";
 import { useStrategiesCache } from "./StrategiesProvider";
+import { useStrategyDetail } from "../api/queries";
 
 // Canonical timeframe order from smallest to largest (matches shared/constants.py)
 const TIMEFRAME_ORDER = ["tick", "s1", "1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"] as const;
@@ -61,6 +61,7 @@ export function CreateBacktestModal({
   const [parameterTypes, setParameterTypes] = useState<Record<string, "number" | "string">>({});
   const [running, setRunning] = useState(false);
   const [error, setError] = useState("");
+  const strategyDetailQuery = useStrategyDetail(strategy, { enabled: open && Boolean(strategy) });
 
   useEffect(() => {
     if (!open) return;
@@ -74,7 +75,7 @@ export function CreateBacktestModal({
     }
   }, [preselectedStrategy, strategies]);
 
-  // Load strategy parameters when strategy changes
+  // Sync strategy parameters from query detail when strategy changes
   useEffect(() => {
     if (!strategy) {
       setStrategyParameters({});
@@ -84,27 +85,27 @@ export function CreateBacktestModal({
 
     setStrategyParameters({});
     setParameterTypes({});
-    getStrategyDetail(strategy)
-      .then((detail) => {
-        const values: Record<string, string> = {};
-        const types: Record<string, "number" | "string"> = {};
-        for (const [key, value] of Object.entries(detail.parameters || {})) {
-          if (typeof value === "number" && Number.isFinite(value)) {
-            values[key] = String(value);
-            types[key] = "number";
-          } else if (typeof value === "string") {
-            values[key] = value;
-            types[key] = "string";
-          }
-        }
-        setStrategyParameters(values);
-        setParameterTypes(types);
-      })
-      .catch(() => {
-        setStrategyParameters({});
-        setParameterTypes({});
-      });
   }, [strategy]);
+
+  useEffect(() => {
+    const detail = strategyDetailQuery.data;
+    if (!strategy || !detail) {
+      return;
+    }
+    const values: Record<string, string> = {};
+    const types: Record<string, "number" | "string"> = {};
+    for (const [key, value] of Object.entries(detail.parameters || {})) {
+      if (typeof value === "number" && Number.isFinite(value)) {
+        values[key] = String(value);
+        types[key] = "number";
+      } else if (typeof value === "string") {
+        values[key] = value;
+        types[key] = "string";
+      }
+    }
+    setStrategyParameters(values);
+    setParameterTypes(types);
+  }, [strategy, strategyDetailQuery.data]);
 
   // Auto-detect engine from selected strategy (no manual override)
   useEffect(() => {

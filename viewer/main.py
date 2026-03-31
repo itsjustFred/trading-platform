@@ -44,7 +44,11 @@ load_dotenv(PROJECT_ROOT / ".env")
 # Avoid pynecore TOML auto-writes at import-time in the web process.
 os.environ.setdefault("PYNE_SAVE_SCRIPT_TOML", "0")
 
-from shared.constants import DATA_DIR as RESOLVED_DATA_DIR, LOG_DIR as RESOLVED_LOG_DIR
+from shared.constants import (
+    DATA_DIR as RESOLVED_DATA_DIR,
+    LOG_DIR as RESOLVED_LOG_DIR,
+    normalize_timeframe,
+)
 
 DATA_DIR = RESOLVED_DATA_DIR
 os.environ.setdefault("DATA_DIR", str(DATA_DIR))
@@ -56,6 +60,7 @@ os.environ.setdefault("LOG_DIR", str(LOG_DIR))
 from shared.logging import get_logger
 from shared.models import BacktestResult, EquityPoint
 from shared.database import (
+    DB_PATH as BACKTEST_DB_PATH,
     create_live_deployment,
     delete_background_task_record,
     delete_backtest,
@@ -658,11 +663,13 @@ class BacktestsBulkDeleteRequest(SQLModel):
 
 
 _QUIET_EXACT_PATHS = {
+    "/api/tasks",
     "/api/data/tasks",
     "/api/live/accounts",
     "/api/live/deployments",
 }
 _QUIET_PREFIX_PATHS = (
+    "/api/tasks/",
     "/api/data/tasks/",
     "/api/live/balances/",
     "/api/live/stats/",
@@ -949,6 +956,7 @@ _STRATEGIES_CACHE: dict[str, Any] = {"expires_at": 0.0, "payload": []}
 _STRATEGIES_CACHE_TTL_SECONDS = 60.0
 _BACKTEST_META_CACHE_LOCK = threading.RLock()
 _BACKTEST_META_CACHE: dict[str, dict[str, Any]] = {}
+_BACKTEST_META_CACHE_SOURCE_MTIME_NS = 0
 _BACKTEST_EQUITY_PREVIEW_CACHE_LOCK = threading.RLock()
 _BACKTEST_EQUITY_PREVIEW_CACHE: dict[tuple[str, int], list[float]] = {}
 _TASK_STATUS_WEIGHTS: dict[str, float] = {
@@ -1024,13 +1032,16 @@ def _task_category_from_kind_source(kind: Any, source: Any) -> str:
         return "backtest"
     if kind_key in {"optimization", "agent_conversion"}:
         return "optimization"
-    if kind_key == "live":
-        return "live"
     if source_key == "resample":
         return "resample"
-    if source_key == "live":
-        return "live"
     return "download"
+
+
+def _normalize_task_category(value: Any, kind: Any, source: Any) -> str:
+    category = str(value or "").strip().lower()
+    if category in {"backtest", "download", "optimization", "resample"}:
+        return category
+    return _task_category_from_kind_source(kind, source)
 
 
 def _sanitize_progress_history(entries: Any) -> list[dict[str, Any]]:
@@ -1058,9 +1069,7 @@ def _sanitize_progress_history(entries: Any) -> list[dict[str, Any]]:
 def _ensure_task_runtime_metadata(task: dict[str, Any]) -> None:
     started_at = str(task.get("started_at") or task.get("created_at") or _now_iso())
     task["started_at"] = started_at
-    task["category"] = str(
-        task.get("category") or _task_category_from_kind_source(task.get("kind"), task.get("source"))
-    )
+    task["category"] = _normalize_task_category(task.get("category"), task.get("kind"), task.get("source"))
     history = _sanitize_progress_history(task.get("progress_history"))
     if not history:
         history = [
@@ -1155,7 +1164,15 @@ def _backtest_sort_key(item: dict[str, Any], sort_field: str) -> Any:
     return str(item.get(sort_field, "") or "")
 
 
+def _current_backtest_store_mtime_ns() -> int:
+    try:
+        return int(BACKTEST_DB_PATH.stat().st_mtime_ns)
+    except OSError:
+        return 0
+
+
 def _refresh_backtest_meta_cache() -> int:
+    source_mtime_ns = _current_backtest_store_mtime_ns()
     rows = list_backtest_metadata_rows()
     next_cache: dict[str, dict[str, Any]] = {}
     for row in rows:
@@ -1169,9 +1186,11 @@ def _refresh_backtest_meta_cache() -> int:
         (backtest_id, 50): list(preview_map.get(backtest_id, []))
         for backtest_id in backtest_ids
     }
+    global _BACKTEST_META_CACHE_SOURCE_MTIME_NS
     with _BACKTEST_META_CACHE_LOCK:
         _BACKTEST_META_CACHE.clear()
         _BACKTEST_META_CACHE.update(next_cache)
+        _BACKTEST_META_CACHE_SOURCE_MTIME_NS = source_mtime_ns
     with _BACKTEST_EQUITY_PREVIEW_CACHE_LOCK:
         _BACKTEST_EQUITY_PREVIEW_CACHE.clear()
         _BACKTEST_EQUITY_PREVIEW_CACHE.update(next_preview_cache)
@@ -1179,8 +1198,12 @@ def _refresh_backtest_meta_cache() -> int:
 
 
 def _ensure_backtest_meta_cache() -> None:
+    source_mtime_ns = _current_backtest_store_mtime_ns()
     with _BACKTEST_META_CACHE_LOCK:
-        if _BACKTEST_META_CACHE:
+        if (
+            _BACKTEST_META_CACHE
+            and _BACKTEST_META_CACHE_SOURCE_MTIME_NS >= source_mtime_ns
+        ):
             return
     _refresh_backtest_meta_cache()
 
@@ -1345,7 +1368,7 @@ def _normalize_win_rate(value: Any) -> float | None:
 def _backtest_summary_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
     strategy_name = str(meta.get("strategy_name") or "unknown")
     symbols = [str(item) for item in meta.get("symbols", []) if str(item).strip()]
-    timeframe = str(meta.get("timeframe") or "")
+    timeframe = normalize_timeframe(str(meta.get("timeframe") or ""))
     start = str(meta.get("start_date") or "")
     end = str(meta.get("end_date") or "")
     total_return_decimal = _safe_float(meta.get("total_return"), 0.0)
@@ -1393,7 +1416,7 @@ def _backtest_all_item_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
         "id": str(meta.get("id") or "").strip(),
         "strategy_name": str(meta.get("strategy_name") or "unknown"),
         "symbols": [str(item) for item in meta.get("symbols", []) if str(item).strip()],
-        "timeframe": str(meta.get("timeframe") or ""),
+        "timeframe": normalize_timeframe(str(meta.get("timeframe") or "")),
         "total_return": _safe_float(meta.get("total_return"), 0.0),
         "sharpe_ratio": _safe_float(meta.get("sharpe_ratio"), 0.0),
         "psr": _safe_float(meta.get("psr"), 0.0),
@@ -1423,7 +1446,7 @@ def _backtest_fingerprint(item: dict[str, Any]) -> str:
     symbols = sorted(
         {str(symbol).strip().upper() for symbol in item.get("symbols", []) if str(symbol).strip()}
     )
-    timeframe = str(item.get("timeframe") or "").strip().lower()
+    timeframe = normalize_timeframe(str(item.get("timeframe") or "").strip())
     start_date = str(item.get("start_date") or "").strip()
     end_date = str(item.get("end_date") or "").strip()
     engine = str(item.get("engine") or "unknown").strip().lower()
@@ -1512,7 +1535,7 @@ def _group_duplicate_backtests() -> tuple[list[dict[str, Any]], int]:
                 "fingerprint": fingerprint,
                 "strategy_name": str(first.get("strategy_name") or ""),
                 "symbols": [str(symbol) for symbol in first.get("symbols", []) if str(symbol).strip()],
-                "timeframe": str(first.get("timeframe") or ""),
+                "timeframe": normalize_timeframe(str(first.get("timeframe") or "")),
                 "start_date": str(first.get("start_date") or ""),
                 "end_date": str(first.get("end_date") or ""),
                 "engine": str(first.get("engine") or "unknown"),
@@ -1642,10 +1665,10 @@ def _decorate_task_from_record(task_id: str, task: dict[str, Any]) -> None:
         task["status"] = record.get("status", "unknown")
 
     config_payload = dict(record.get("config_json") or {})
-    task["category"] = str(
-        config_payload.get("category")
-        or task.get("category")
-        or _task_category_from_kind_source(task.get("kind"), task.get("source"))
+    task["category"] = _normalize_task_category(
+        config_payload.get("category") or task.get("category"),
+        task.get("kind"),
+        task.get("source"),
     )
     task["started_at"] = str(
         config_payload.get("started_at") or task.get("started_at") or task.get("created_at") or _now_iso()
@@ -1711,9 +1734,10 @@ def _build_task_from_record(record: dict[str, Any]) -> dict[str, Any]:
         "updated_at": str(record.get("updated_at") or _now_iso()),
         "started_at": str(config_payload.get("started_at") or record.get("created_at") or _now_iso()),
         "finished_at": str(config_payload.get("finished_at") or ""),
-        "category": str(
-            config_payload.get("category")
-            or _task_category_from_kind_source(record.get("type"), record.get("source"))
+        "category": _normalize_task_category(
+            config_payload.get("category"),
+            record.get("type"),
+            record.get("source"),
         ),
         "progress_history": _sanitize_progress_history(config_payload.get("progress_history")),
         "pause_event": threading.Event(),
@@ -1915,13 +1939,32 @@ def _serialize_task(
     status = str(payload.get("status") or task.get("status") or "").lower()
     elapsed_seconds = _task_elapsed_seconds(task, status)
     eta_seconds = _task_eta_seconds(task, status, elapsed_seconds)
+    progress_payload = dict(payload.get("progress") or {})
+    progress_percent = _safe_float(progress_payload.get("percent"), _safe_float(task.get("progress"), 0.0))
+    progress_message = str(progress_payload.get("current") or "")
+    completed_at = str(task.get("finished_at") or "")
+    if not completed_at and status in FINAL_TASK_STATUSES:
+        completed_at = str(task.get("updated_at") or "")
+    error_message = task.get("error")
+    if error_message in (None, ""):
+        error_message = None
+    elif not isinstance(error_message, str):
+        error_message = str(error_message)
     payload["can_restart"] = status in {"interrupted", "failed"}
-    payload["category"] = str(task.get("category") or _task_category_from_kind_source(task.get("kind"), task.get("source")))
+    payload["category"] = _normalize_task_category(
+        task.get("category"),
+        task.get("kind"),
+        task.get("source"),
+    )
     payload["started_at"] = str(task.get("started_at") or task.get("created_at") or "")
     payload["finished_at"] = str(task.get("finished_at") or "")
+    payload["completed_at"] = completed_at
     payload["elapsed_seconds"] = elapsed_seconds
     payload["eta_seconds"] = eta_seconds
-    payload["error"] = task.get("error")
+    payload["progress_percent"] = max(0.0, min(100.0, round(progress_percent, 2)))
+    payload["progress_message"] = progress_message
+    payload["error"] = error_message
+    payload["error_message"] = error_message
     return payload
 
 
@@ -2453,13 +2496,13 @@ def _extract_timeframe_and_segment(stem: str) -> tuple[str | None, str | None]:
     if not normalized:
         return None, None
     if _looks_like_timeframe(normalized):
-        return normalized.lower(), None
+        return normalize_timeframe(normalized), None
 
     segmented_match = _SEGMENTED_TIMEFRAME_PATTERN.match(normalized)
     if segmented_match is None:
         return None, None
 
-    timeframe = str(segmented_match.group("timeframe") or "").lower()
+    timeframe = normalize_timeframe(str(segmented_match.group("timeframe") or ""))
     separator_index = len(timeframe)
     segment = (
         normalized[separator_index + 1 :].strip()
@@ -2485,7 +2528,7 @@ def _extract_symbol_timeframe_and_segment(
         return None, None, None
 
     symbol = str(prefixed_match.group("symbol") or "").strip()
-    timeframe_value = str(prefixed_match.group("timeframe") or "").strip().lower()
+    timeframe_value = normalize_timeframe(str(prefixed_match.group("timeframe") or "").strip())
     segment_value = str(prefixed_match.group("segment") or "").strip()
     if not symbol or not timeframe_value:
         return None, None, None
@@ -2656,7 +2699,7 @@ def _parse_ohlcv_path(parquet_path: Path, ohlcv_root: Path) -> dict[str, Any] | 
         "source": source,
         "asset_class": asset_class,
         "symbol": symbol,
-        "timeframe": timeframe_value,
+        "timeframe": normalize_timeframe(timeframe_value),
         "path": str(parquet_path),
     }
     if region:
@@ -2963,10 +3006,10 @@ def _entry_size_bytes(entry: dict[str, Any]) -> int:
 def _canonical_timeframe_path(paths: set[str], timeframe: str) -> str:
     if not paths:
         return ""
-    normalized_tf = str(timeframe or "").strip().lower()
+    normalized_tf = normalize_timeframe(timeframe)
     sorted_paths = sorted(paths)
     for path_value in sorted_paths:
-        if Path(path_value).stem.lower() == normalized_tf:
+        if normalize_timeframe(Path(path_value).stem) == normalized_tf:
             return path_value
     return sorted_paths[0]
 
@@ -3010,7 +3053,7 @@ def _aggregate_symbol_timeframe_entries(
 
         output_entry: dict[str, Any] = {
             "symbol": str(entry.get("symbol") or "Unknown"),
-            "timeframe": str(entry.get("timeframe") or "unknown"),
+            "timeframe": normalize_timeframe(str(entry.get("timeframe") or "unknown")),
             "path": path_value,
             "size_mb": round(size_bytes / (1024 * 1024), 2),
             "start": start_value,
@@ -3538,6 +3581,7 @@ async def get_trade_with_context(backtest_id: str, trade_nr: int) -> dict[str, A
     timeframe = (
         result.meta.data.get("timeframes", ["1h"])[0] if result.meta.data.get("timeframes") else "1h"
     )
+    timeframe = normalize_timeframe(timeframe)
 
     ohlcv: list[dict[str, Any]] = []
     df = legacy_viewer._load_ohlcv_df(trade.symbol, timeframe)
@@ -3597,6 +3641,7 @@ async def get_backtest_replay(backtest_id: str) -> dict[str, Any]:
     timeframe = (
         result.meta.data.get("timeframes", ["1h"])[0] if result.meta.data.get("timeframes") else "1h"
     )
+    timeframe = normalize_timeframe(timeframe)
     symbols = sorted({trade.symbol for trade in result.trades if trade.symbol}) or list(
         result.meta.data.get("symbols", [])
     )
@@ -3665,6 +3710,7 @@ async def get_backtest_ohlcv(backtest_id: str) -> dict[str, Any]:
     timeframe = (
         result.meta.data.get("timeframes", ["1h"])[0] if result.meta.data.get("timeframes") else "1h"
     )
+    timeframe = normalize_timeframe(timeframe)
 
     ohlcv_data: dict[str, Any] = {}
     for symbol in symbols[:10]:
@@ -3738,7 +3784,7 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=f"Strategy '{strategy}' not found")
 
     engine = str(payload.engine or "native").strip() or "native"
-    timeframe = str(payload.timeframe or "1d")
+    timeframe = normalize_timeframe(str(payload.timeframe or "1d"))
     start = str(payload.start or "")
     end = str(payload.end or "")
     capital = float(payload.capital or 100000.0)
@@ -5105,6 +5151,11 @@ async def list_data_tasks() -> dict[str, Any]:
     return {"tasks": payload}
 
 
+@app.get("/api/tasks", response_model=dict[str, Any])
+async def list_tasks() -> dict[str, Any]:
+    return await list_data_tasks()
+
+
 @app.get("/api/data/tasks/{task_id}", response_model=dict[str, Any])
 async def get_data_task(task_id: str) -> dict[str, Any]:
     task = _snapshot_task(task_id)
@@ -5329,6 +5380,7 @@ async def get_benchmark(
     end: str = Query(default=""),
     timeframe: str = Query(default="1d"),
 ) -> BenchmarkResponse:
+    timeframe = normalize_timeframe(timeframe)
     df = legacy_viewer._load_ohlcv_df(symbol, timeframe)
     if df is None and timeframe == "1d":
         for fallback_tf in ["4h", "1h", "15m"]:

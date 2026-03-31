@@ -139,6 +139,37 @@ class TestComputeStats:
         expected = (121000.0 / 100000.0) ** (365.25 / 730) - 1
         assert math.isclose(stats["cagr"], expected, rel_tol=1e-3, abs_tol=1e-3)
 
+    def test_cagr_uses_fractional_days_from_trade_bounds(self):
+        equity = [
+            EquityPoint(time="2024-01-01T00:00:00+00:00", equity=100000.0),
+            EquityPoint(time="2025-01-01T00:00:00+00:00", equity=110000.0),
+        ]
+        trades = [
+            Trade(
+                id=1,
+                symbol="X",
+                direction="LONG",
+                entry_time="2024-01-01T12:00:00+00:00",
+                entry_price=100.0,
+                quantity=1,
+                exits=[
+                    TradeExit(
+                        time="2025-01-01T06:00:00+00:00",
+                        price=110.0,
+                        quantity=1,
+                        pnl=10000.0,
+                    )
+                ],
+                pnl=10000.0,
+            )
+        ]
+
+        stats = compute_stats(trades, equity_curve=equity)
+
+        fractional_days = 365.75
+        expected = (110000.0 / 100000.0) ** (365.25 / fractional_days) - 1
+        assert math.isclose(stats["cagr"], expected, rel_tol=1e-3, abs_tol=1e-3)
+
     def test_calmar_ratio_zeroed_for_tiny_drawdown(self):
         equity = _equity_curve_from_returns([0.0200, -0.0005, 0.0150, 0.0100])
 

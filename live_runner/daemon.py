@@ -12,9 +12,10 @@ from dotenv import dotenv_values
 from live_runner.alpaca_adapter import AlpacaLiveAdapter
 from live_runner.base_adapter import BaseLiveAdapter
 from live_runner.ctrader_adapter import CTraderLiveAdapter
+from risk import RiskConfig, RiskEngine, TradeSignal
 from shared.database import list_live_accounts, list_live_deployments, save_live_balance
 from shared.logging import get_logger
-from shared.models import LiveAccountConfig, LiveBalanceRecord, LiveDeploymentConfig
+from shared.models import LiveAccountConfig, LiveBalanceRecord, LiveDeploymentConfig, LiveSignal
 
 logger = get_logger("live-runner")
 
@@ -136,6 +137,148 @@ def _resolve_ctrader_credentials(
         return None
     demo = _parse_bool_env(str(env_values.get("CTRADER_DEMO", "")).strip(), default=True)
     return app_id, app_secret, access_token, demo
+
+
+def _coerce_live_float(
+    value: object,
+    *,
+    field_name: str,
+    minimum: float | None = None,
+) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid {field_name}: {value!r}") from exc
+    if minimum is not None and parsed < minimum:
+        raise ValueError(f"{field_name} must be >= {minimum}")
+    return parsed
+
+
+def _coerce_live_int(
+    value: object,
+    *,
+    field_name: str,
+    minimum: int | None = None,
+) -> int:
+    try:
+        parsed = int(float(value))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid {field_name}: {value!r}") from exc
+    if minimum is not None and parsed < minimum:
+        raise ValueError(f"{field_name} must be >= {minimum}")
+    return parsed
+
+
+def _first_metadata_float(metadata: Mapping[str, object], keys: tuple[str, ...]) -> float | None:
+    for key in keys:
+        if key not in metadata:
+            continue
+        value = metadata.get(key)
+        if value is None:
+            continue
+        return _coerce_live_float(value, field_name=key)
+    return None
+
+
+def _risk_config_for_deployment(deployment: LiveDeploymentConfig) -> RiskConfig:
+    settings = deployment.settings or {}
+    risk_per_trade_raw = settings.get(
+        "max_risk_per_trade",
+        settings.get("risk_per_trade_pct", 0.01),
+    )
+    max_total_exposure_raw = settings.get("max_total_exposure", 0.05)
+    max_positions_raw = settings.get("max_positions", 5)
+    sl_multiplier_raw = settings.get("default_sl_atr_multiplier", 2.0)
+
+    return RiskConfig(
+        max_risk_per_trade=_coerce_live_float(
+            risk_per_trade_raw,
+            field_name="max_risk_per_trade",
+            minimum=0.0,
+        ),
+        max_total_exposure=_coerce_live_float(
+            max_total_exposure_raw,
+            field_name="max_total_exposure",
+            minimum=0.0,
+        ),
+        max_positions=_coerce_live_int(max_positions_raw, field_name="max_positions", minimum=1),
+        default_sl_atr_multiplier=_coerce_live_float(
+            sl_multiplier_raw,
+            field_name="default_sl_atr_multiplier",
+            minimum=0.0,
+        ),
+    )
+
+
+def size_live_signal_for_submission(
+    signal: LiveSignal,
+    deployment: LiveDeploymentConfig,
+    *,
+    account_balance: float,
+    current_exposure: float = 0.0,
+    pip_value: float | None = None,
+) -> LiveSignal:
+    metadata: dict[str, object] = dict(signal.metadata or {})
+    stop_loss = _first_metadata_float(metadata, ("stop_loss", "sl_price", "stop_price"))
+    take_profit = _first_metadata_float(metadata, ("take_profit", "tp_price"))
+    resolved_timeframe = (
+        str(metadata.get("timeframe") or deployment.timeframe).strip() or deployment.timeframe
+    )
+    pip = pip_value if pip_value is not None else metadata.get("pip_value", 1.0)
+    resolved_pip = _coerce_live_float(pip, field_name="pip_value", minimum=0.0)
+
+    trade_signal = TradeSignal(
+        action=signal.action,
+        symbol=signal.symbol,
+        entry_price=float(signal.theoretical_price),
+        stop_loss=stop_loss,
+        take_profit=take_profit,
+        timeframe=resolved_timeframe,
+        metadata=dict(metadata),
+    )
+    sized_order = RiskEngine(_risk_config_for_deployment(deployment)).calculate_position_size(
+        signal=trade_signal,
+        account_balance=float(account_balance),
+        pip_value=resolved_pip,
+        current_exposure=float(current_exposure),
+    )
+
+    metadata["qty"] = float(sized_order.position_size)
+    metadata["risk_amount"] = float(sized_order.risk_amount)
+    metadata["risk_percent"] = float(sized_order.risk_percent)
+    metadata["risk_reward_ratio"] = (
+        float(sized_order.risk_reward_ratio)
+        if sized_order.risk_reward_ratio is not None
+        else None
+    )
+    metadata["risk_timeframe"] = resolved_timeframe
+    if stop_loss is None and "resolved_stop_loss" in sized_order.signal.metadata:
+        metadata["resolved_stop_loss"] = float(sized_order.signal.metadata["resolved_stop_loss"])
+    return signal.model_copy(update={"metadata": metadata})
+
+
+async def submit_order_with_risk(
+    adapter: BaseLiveAdapter,
+    deployment: LiveDeploymentConfig,
+    signal: LiveSignal,
+    *,
+    current_exposure: float = 0.0,
+    account_balance: float | None = None,
+    pip_value: float | None = None,
+) -> str:
+    resolved_balance = account_balance
+    if resolved_balance is None:
+        _, equity = await adapter.get_balance()
+        resolved_balance = float(equity)
+
+    sized_signal = size_live_signal_for_submission(
+        signal,
+        deployment,
+        account_balance=resolved_balance,
+        current_exposure=current_exposure,
+        pip_value=pip_value,
+    )
+    return await adapter.submit_order(sized_signal)
 
 
 def _create_adapter_for_account(

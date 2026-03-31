@@ -27,7 +27,7 @@ from runner.engines.base import BacktestConfig, EngineAdapter, resolve_strategy_
 from runner.stats import compute_stats_for_result
 
 from shared.database import save_result_to_sqlite
-from shared.constants import DATA_DIR
+from shared.constants import DATA_DIR, normalize_timeframe
 from shared.logging import get_logger
 
 logger = get_logger("runner")
@@ -74,10 +74,11 @@ def _detect_date_range(symbols: list[str], timeframe: str, data_dir: str = "") -
     For multiple symbols, returns the intersection (common period).
     """
     ohlcv_root = Path(data_dir) / "ohlcv" if data_dir else DATA_DIR / "ohlcv"
+    normalized_timeframe = normalize_timeframe(timeframe)
     starts, ends = [], []
 
     for symbol in symbols:
-        matches = list(ohlcv_root.rglob(f"**/{symbol}/{timeframe}.parquet"))
+        matches = list(ohlcv_root.rglob(f"**/{symbol}/{normalized_timeframe}.parquet"))
         if not matches:
             # Try without exact timeframe match — find any parquet for symbol
             matches = list(ohlcv_root.rglob(f"**/{symbol}/*.parquet"))
@@ -116,12 +117,14 @@ def cmd_run(args):
         raise ValueError("--params must decode to a JSON object")
     resolved_parameters = resolve_strategy_parameters(args.strategy, parameter_overrides)
 
+    normalized_timeframe = normalize_timeframe(args.timeframe)
+
     # Auto-detect date range if not provided
     start = args.start
     end = args.end
     if not start or not end:
         detected_start, detected_end = _detect_date_range(
-            args.symbols, args.timeframe, args.data_dir or ""
+            args.symbols, normalized_timeframe, args.data_dir or ""
         )
         if not start:
             start = detected_start
@@ -133,7 +136,7 @@ def cmd_run(args):
         config = BacktestConfig(
             strategy_name=args.name or Path(args.strategy).stem,
             symbols=args.symbols,
-            timeframe=args.timeframe,
+            timeframe=normalized_timeframe,
             start_date=start,
             end_date=end,
             initial_capital=args.capital,

@@ -3,11 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from pathlib import Path
 from typing import Any, Callable
 
 import pandas as pd
 
+from risk.config import RiskConfig
+from risk.engine import RiskEngine
+from risk.models import TradeSignal
 from runner.engines.base import BacktestConfig
 from shared.models import (
     BacktestMeta,
@@ -84,6 +86,18 @@ class TradeEngine:
         self._progress_callback = progress_callback
         self._progress_start = float(progress_start)
         self._progress_end = float(progress_end)
+        configured_risk_pct = float(self.config.risk_per_trade_pct or 0.0)
+        self._risk_enabled = configured_risk_pct > 0
+        max_total_exposure = float(self.config.max_position_pct or 0.05)
+        max_positions = int(float(self.config.parameters.get("max_positions", 5) or 5))
+        self._risk_engine = RiskEngine(
+            RiskConfig(
+                max_risk_per_trade=configured_risk_pct if configured_risk_pct > 0 else 0.01,
+                max_total_exposure=max_total_exposure,
+                max_positions=max_positions,
+                default_sl_atr_multiplier=2.0,
+            )
+        )
 
     def _emit_progress(self, percent: float, message: str) -> None:
         if self._progress_callback is None:
@@ -182,16 +196,62 @@ class TradeEngine:
         direction = str(row.get("direction", "LONG")).upper()
         return "SHORT" if direction == "SHORT" else "LONG"
 
-    def _calculate_position_size(self, entry_price: float, stop_loss_price: float | None) -> float:
+    def _current_risk_exposure(self, reference_price: float) -> float:
+        if self.equity <= 0:
+            return 0.0
+
+        risk_exposure = 0.0
+
+        for position in self.positions:
+            stop_price = (
+                float(position.stop_loss)
+                if position.stop_loss is not None
+                else float(position.entry_price) * 0.98
+            )
+            risk_distance = abs(float(position.entry_price) - stop_price)
+            risk_exposure += (risk_distance * float(position.remaining_qty)) / float(self.equity)
+
+        for order in self.pending_orders:
+            stop_price = (
+                float(order.stop_loss)
+                if order.stop_loss is not None
+                else float(reference_price) * 0.98
+            )
+            risk_distance = abs(float(reference_price) - stop_price)
+            risk_exposure += (risk_distance * float(order.quantity)) / float(self.equity)
+
+        return max(0.0, risk_exposure)
+
+    def _calculate_position_size(
+        self,
+        *,
+        entry_price: float,
+        stop_loss_price: float | None,
+        direction: str,
+        take_profit_price: float | None = None,
+    ) -> float:
         max_leverage = float(self.config.max_leverage or 1.0)
 
-        if self.config.risk_per_trade_pct and stop_loss_price:
-            risk_amount = self.equity * float(self.config.risk_per_trade_pct)
-            distance = abs(entry_price - stop_loss_price)
-            if distance > 0:
-                shares = risk_amount / distance
-            else:
-                shares = risk_amount / (entry_price * 0.02)
+        if self._risk_enabled:
+            signal = TradeSignal(
+                action="buy" if str(direction).upper() == "LONG" else "sell",
+                symbol=self.symbol,
+                entry_price=float(entry_price),
+                stop_loss=stop_loss_price,
+                take_profit=take_profit_price,
+                timeframe=self.config.timeframe,
+                metadata={
+                    "current_positions": len(self.positions),
+                    "pending_positions": len(self.pending_orders),
+                },
+            )
+            sized_order = self._risk_engine.calculate_position_size(
+                signal=signal,
+                account_balance=float(self.equity),
+                pip_value=1.0,
+                current_exposure=self._current_risk_exposure(float(entry_price)),
+            )
+            shares = float(sized_order.position_size)
         else:
             shares = self.equity / entry_price
 
@@ -209,7 +269,13 @@ class TradeEngine:
     def _create_order(self, row: pd.Series, i: int, direction: str) -> None:
         entry_price = float(row["close"])
         stop_loss, tp_levels = self._extract_levels(row)
-        qty = self._calculate_position_size(entry_price, stop_loss)
+        take_profit = float(tp_levels[0]["price"]) if tp_levels else None
+        qty = self._calculate_position_size(
+            entry_price=entry_price,
+            stop_loss_price=stop_loss,
+            direction=direction,
+            take_profit_price=take_profit,
+        )
         if qty <= 0:
             return
 
@@ -284,7 +350,17 @@ class TradeEngine:
 
             if filled:
                 if order.order_type == OrderType.MARKET and order.stop_loss is not None:
-                    order.quantity = self._calculate_position_size(float(fill_price), order.stop_loss)
+                    take_profit = (
+                        float(order.take_profit_levels[0]["price"])
+                        if order.take_profit_levels
+                        else None
+                    )
+                    order.quantity = self._calculate_position_size(
+                        entry_price=float(fill_price),
+                        stop_loss_price=order.stop_loss,
+                        direction=order.direction,
+                        take_profit_price=take_profit,
+                    )
                     if order.quantity <= 0:
                         continue
                 self._open_position(order, float(fill_price), fill_time, i)

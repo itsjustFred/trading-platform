@@ -479,12 +479,16 @@ export interface BacktestMetadataItem {
 export type BacktestsSortField =
   | "created_at"
   | "strategy_name"
+  | "symbol"
+  | "timeframe"
   | "trade_count"
   | "total_return"
   | "sharpe_ratio"
   | "cagr"
   | "psr"
-  | "p_value";
+  | "p_value"
+  | "max_drawdown"
+  | "win_rate";
 
 export interface BacktestsQueryParams {
   page?: number;
@@ -495,6 +499,8 @@ export interface BacktestsQueryParams {
   symbol?: string;
   timeframe?: string;
   search?: string;
+  total_return_min?: number;
+  total_return_max?: number;
   sharpe_min?: number;
   sharpe_max?: number;
   psr_min?: number;
@@ -503,6 +509,10 @@ export interface BacktestsQueryParams {
   p_value_max?: number;
   cagr_min?: number;
   cagr_max?: number;
+  win_rate_min?: number;
+  win_rate_max?: number;
+  drawdown_min?: number;
+  drawdown_max?: number;
   max_drawdown_min?: number;
   max_drawdown_max?: number;
 }
@@ -512,6 +522,7 @@ export interface BacktestsListResponse {
   page: number;
   per_page: number;
   total: number;
+  pages: number;
   sort: string;
   order: string;
 }
@@ -799,16 +810,20 @@ export interface DataTaskStatusResponse {
   name?: string;
   description?: string;
   kind?: string;
-  category?: "backtest" | "optimization" | "download" | "resample" | "live";
+  category?: "backtest" | "optimization" | "download" | "resample";
   source?: string;
   status: string;
   created_at?: string;
   updated_at?: string;
   started_at?: string;
   finished_at?: string;
+  completed_at?: string;
+  progress_percent?: number | null;
+  progress_message?: string;
   elapsed_seconds?: number | null;
   eta_seconds?: number | null;
   error?: string | null;
+  error_message?: string | null;
   log?: string;
   progress?: DataTaskProgress;
   can_pause?: boolean;

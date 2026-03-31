@@ -38,7 +38,7 @@ import pandas as pd
 from data_tools.downloaders.base import Downloader, DownloadResult, SourceMeta
 from data_tools.downloaders.dukascopy_native import SYMBOL_CONFIG, _resolve_symbol_and_instrument
 from data_tools.resample import resample_ohlcv
-from shared.constants import DATA_DIR
+from shared.constants import DATA_DIR, normalize_timeframe
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +98,8 @@ BAR_INTERVAL_MS: dict[str, int] = {
     "1h": 60 * 60 * 1000,
     "1d": 24 * 60 * 60 * 1000,
 }
+JFOREX_TIMEOUT_RETRY_ATTEMPTS = 2
+JFOREX_TIMEOUT_RETRY_DELAY_SECONDS = 2.0
 
 JFOREX_PERIOD_ATTR: dict[str, str] = {
     "1m": "ONE_MIN",
@@ -143,7 +145,7 @@ def _raise_jforex_runtime_error(context: str, exc: BaseException) -> None:
 
 
 def _normalize_timeframe(timeframe: str) -> str:
-    normalized = TIMEFRAME_ALIASES.get(timeframe.strip().lower())
+    normalized = TIMEFRAME_ALIASES.get(normalize_timeframe(timeframe))
     if not normalized:
         raise ValueError(
             f"Unsupported timeframe: {timeframe}. Use one of: {sorted(TIMEFRAME_ALIASES)}"
@@ -687,6 +689,49 @@ def _query_jforex_history(
     return df
 
 
+def _query_jforex_history_with_timeout_retry(
+    *,
+    java_instrument: Any,
+    base_timeframe: str,
+    start_ms: int,
+    end_ms: int,
+    auth: DukascopyAuthConfig,
+    offer_side_name: str,
+    timeout_seconds: int,
+    cache_dir: Path,
+    retry_attempts: int = JFOREX_TIMEOUT_RETRY_ATTEMPTS,
+    retry_delay_seconds: float = JFOREX_TIMEOUT_RETRY_DELAY_SECONDS,
+) -> pd.DataFrame:
+    attempts = max(int(retry_attempts), 1)
+    for attempt in range(1, attempts + 1):
+        try:
+            return _query_jforex_history(
+                java_instrument=java_instrument,
+                base_timeframe=base_timeframe,
+                start_ms=start_ms,
+                end_ms=end_ms,
+                auth=auth,
+                offer_side_name=offer_side_name,
+                timeout_seconds=timeout_seconds,
+                cache_dir=cache_dir,
+            )
+        except TimeoutError as exc:
+            if attempt >= attempts:
+                raise
+            logger.warning(
+                "JForex timeout for %s (%s/%s): %s. Retrying in %.1fs",
+                base_timeframe,
+                attempt,
+                attempts,
+                exc,
+                retry_delay_seconds,
+            )
+            time.sleep(max(float(retry_delay_seconds), 0.0))
+
+    # Unreachable fallback for static analyzers.
+    raise TimeoutError("JForex query timed out.")
+
+
 def _normalize_offer_side(value: str | None) -> str:
     normalized = str(value or "bid").strip().lower()
     if normalized not in {"bid", "ask", "both"}:
@@ -754,7 +799,7 @@ def _query_bars_for_offer_side(
     timeout_seconds: int,
     cache_path: Path,
 ) -> pd.DataFrame:
-    base_df = _query_jforex_history(
+    base_df = _query_jforex_history_with_timeout_retry(
         java_instrument=java_instrument,
         base_timeframe=base_tf,
         start_ms=int(start_dt.timestamp() * 1000),
@@ -882,7 +927,7 @@ class JForexDownloader(Downloader):
                 .reset_index(drop=True)
             )
         else:
-            base_df = _query_jforex_history(
+            base_df = _query_jforex_history_with_timeout_retry(
                 java_instrument=java_instrument,
                 base_timeframe=base_tf,
                 start_ms=int(start_dt.timestamp() * 1000),

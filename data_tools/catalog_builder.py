@@ -26,7 +26,7 @@ import pyarrow.parquet as pq
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 logger = logging.getLogger(__name__)
 
-from shared.constants import DATA_DIR
+from shared.constants import DATA_DIR, normalize_timeframe
 
 CATALOG_FILE = "catalog.json"
 
@@ -143,13 +143,13 @@ def _extract_timeframe_and_segment(stem: str) -> tuple[str | None, str | None]:
     if not normalized:
         return None, None
     if _looks_like_timeframe(normalized):
-        return normalized.lower(), None
+        return normalize_timeframe(normalized), None
 
     segmented_match = SEGMENTED_TIMEFRAME_PATTERN.match(normalized)
     if segmented_match is None:
         return None, None
 
-    timeframe = str(segmented_match.group("timeframe") or "").lower()
+    timeframe = normalize_timeframe(str(segmented_match.group("timeframe") or ""))
     if timeframe == "tick":
         # Tick datasets are commonly segmented by month (e.g. tick_2024_01).
         # Treat these as timeframe-only filenames when the segment is a plain
@@ -183,7 +183,7 @@ def _extract_symbol_timeframe_and_segment(
         return None, None, None
 
     symbol = str(prefixed_match.group("symbol") or "").strip()
-    timeframe_value = str(prefixed_match.group("timeframe") or "").strip().lower()
+    timeframe_value = normalize_timeframe(str(prefixed_match.group("timeframe") or "").strip())
     segment_value = str(prefixed_match.group("segment") or "").strip()
     if not symbol or not timeframe_value:
         return None, None, None
@@ -301,7 +301,7 @@ def _normalize_grouping_entry_from_path(entry: dict) -> dict:
 
     path_obj = Path(path_value)
     symbol_value = str(entry.get("symbol") or "").strip()
-    timeframe_value = str(entry.get("timeframe") or "").strip().lower()
+    timeframe_value = normalize_timeframe(str(entry.get("timeframe") or "").strip())
     needs_reparse = (
         not symbol_value
         or not timeframe_value
@@ -441,6 +441,7 @@ def _group_ohlcv_entries(entries: list[dict]) -> list[dict]:
 
     for raw_entry in entries:
         entry = _normalize_grouping_entry_from_path(raw_entry)
+        entry["timeframe"] = normalize_timeframe(str(entry.get("timeframe") or ""))
         symbol = str(entry.get("symbol") or "")
         timeframe = str(entry.get("timeframe") or "")
         key = (symbol, timeframe)

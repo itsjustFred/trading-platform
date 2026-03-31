@@ -4,11 +4,12 @@ import {
   useContext,
   useMemo,
   useRef,
-  useState,
   type ReactNode,
 } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 
 import { getStrategies } from "../api/client";
+import { useStrategies } from "../api/queries";
 import type { StrategyMeta } from "../api/types";
 
 interface StrategiesContextValue {
@@ -21,22 +22,25 @@ interface StrategiesContextValue {
 const StrategiesContext = createContext<StrategiesContextValue | null>(null);
 
 export function StrategiesProvider({ children }: { children: ReactNode }) {
-  const [strategies, setStrategies] = useState<StrategyMeta[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [loaded, setLoaded] = useState(false);
+  const queryClient = useQueryClient();
+  const strategiesQuery = useStrategies({ enabled: false });
+  const strategies = strategiesQuery.data ?? [];
+  const loading = strategiesQuery.isFetching;
+  const loaded = strategiesQuery.data !== undefined;
   const pendingLoadRef = useRef<Promise<void> | null>(null);
 
   const refresh = useCallback(async () => {
-    setLoading(true);
     try {
-      const payload = await getStrategies();
-      setStrategies(payload);
-      setLoaded(true);
+      await queryClient.fetchQuery({
+        queryKey: ["strategies"],
+        queryFn: getStrategies,
+      });
       pendingLoadRef.current = null;
-    } finally {
-      setLoading(false);
+    } catch (error) {
+      pendingLoadRef.current = null;
+      throw error;
     }
-  }, []);
+  }, [queryClient]);
 
   const ensureLoaded = useCallback(async () => {
     if (loaded) {

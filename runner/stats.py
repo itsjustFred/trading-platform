@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_PERIODS_PER_YEAR = 252
 MIN_CALMAR_DRAWDOWN = 0.001
+SECONDS_PER_DAY = 24 * 60 * 60
 SECONDS_PER_YEAR = 365.25 * 24 * 60 * 60
 
 try:
@@ -299,7 +300,7 @@ def _cagr_from_backtest_period(*, equity_curve: list[EquityPoint], trades: list[
         return 0.0
 
     start_dt, end_dt = _resolve_backtest_period_bounds(equity_curve=equity_curve, trades=trades)
-    days = (end_dt - start_dt).days
+    days = float((end_dt - start_dt).total_seconds()) / SECONDS_PER_DAY
     if days <= 0:
         return 0.0
     return (equity_final / equity_initial) ** (365.25 / days) - 1

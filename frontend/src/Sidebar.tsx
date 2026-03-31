@@ -12,6 +12,7 @@ import {
   PanelLeftOpen,
   Database,
   Target,
+  Activity,
 } from "lucide-react";
 
 const navItems = [
@@ -22,6 +23,7 @@ const navItems = [
   { path: "/portfolios", label: "Portfolio", icon: Briefcase },
   { path: "/lab", label: "Strategy Lab", icon: Bot },
   { path: "/data", label: "Data", icon: Database },
+  { path: "/tasks", label: "Task Hub", icon: Activity },
   { path: "/logging", label: "Logging", icon: ScrollText },
   { path: "/accounts", label: "Accounts", icon: Users, disabled: true },
 ];

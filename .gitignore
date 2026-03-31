@@ -18,8 +18,11 @@ build/
 *.swp
 *.swo
 
-# Environment
+# Environment (.env.example allowed)
 .env
+*.env
+.env.*
+!*.env.exmaple
 
 # OS
 .DS_Store
@@ -47,3 +50,4 @@ frontend/dist/
 
 # uv
 uv.lock
+.accounts.env

@@ -16,6 +16,7 @@ import { OptimizationResultsPage } from "./pages/OptimizationResultsPage";
 import { LiveHubPage } from "./pages/LiveHub";
 import { LiveDetailPage } from "./pages/LiveDetail";
 import { TaskManager } from "./components/TaskManager";
+import { TaskHubPage } from "./pages/TaskHub";
 
 export default function App() {
   const location = useLocation();
@@ -54,6 +55,7 @@ export default function App() {
           <Route path="/portfolios" element={<PortfoliosPage />} />
           <Route path="/portfolios/:id" element={<PortfolioDetailPage />} />
           <Route path="/lab" element={<StrategyLabPage />} />
+          <Route path="/tasks" element={<TaskHubPage />} />
           <Route path="/logging" element={<LoggingPage />} />
         </Routes>
       </main>
