@@ -47,6 +47,7 @@ frontend/dist/
 # Cache
 .pytest_cache/
 .ruff_cache/
+.playwright-mcp
 
 # uv
 uv.lock
