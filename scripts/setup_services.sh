@@ -45,7 +45,7 @@ EOF
 
 cat <<EOF > /etc/systemd/system/trading-daemon.service
 [Unit]
-Description=Trading Live Daemon
+Description=Trading Live Daemon (Broker + Signal Sources)
 After=network.target trading-backend.service
 
 [Service]

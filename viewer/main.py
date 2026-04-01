@@ -33,6 +33,7 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from pydantic import Field as PydanticField
 from pydantic import ValidationError
 from sqlmodel import SQLModel
 from starlette.middleware.gzip import GZipMiddleware
@@ -78,6 +79,8 @@ from shared.database import (
     list_live_balances,
     list_live_deployments,
     list_live_deployments_for_account,
+    list_live_signals_for_replay,
+    list_live_signals_for_deployments,
     list_live_signal_executions_for_deployments,
     load_backtest_metadata_row,
     load_backtest_equity_preview_points,
@@ -90,6 +93,8 @@ from shared.database import (
     upsert_background_task_record,
     update_live_deployment_status,
 )
+from runner.engines.signal_replay_adapter import ReplaySignal, SignalReplayAdapter
+from risk.config import RiskConfig
 try:
     from live_runner.account_discovery import discover_configured_accounts
 except ModuleNotFoundError:  # pragma: no cover - optional dependency for account discovery
@@ -108,6 +113,8 @@ from shared.strategy_registry import (
     strategy_relative_file,
     strategy_slug_for_path,
 )
+from live_runner.market_data_stream import LiveMarketDataStreamService
+from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credentials
 from viewer import core as legacy_viewer
 
 logger = get_logger("viewer")
@@ -487,12 +494,14 @@ async def lifespan(app: FastAPI):
     strategies_prewarm_task = asyncio.create_task(_prewarm_strategies_background())
     backtests_meta_prewarm_task = asyncio.create_task(_prewarm_backtest_metadata_background())
     jforex_jvm_prewarm_task = asyncio.create_task(_prewarm_jforex_jvm_background())
+    live_market_data_sync_task = asyncio.create_task(_sync_live_market_data_stream_background())
     app.state.json_migration_task = json_migration_task
     app.state.data_views_prewarm_task = data_views_prewarm_task
     app.state.live_accounts_prewarm_task = live_accounts_prewarm_task
     app.state.strategies_prewarm_task = strategies_prewarm_task
     app.state.backtests_meta_prewarm_task = backtests_meta_prewarm_task
     app.state.jforex_jvm_prewarm_task = jforex_jvm_prewarm_task
+    app.state.live_market_data_sync_task = live_market_data_sync_task
     await asyncio.to_thread(mark_background_tasks_interrupted, from_statuses=["queued", "running"])
     await asyncio.to_thread(_resume_interrupted_tasks)
     try:
@@ -505,6 +514,7 @@ async def lifespan(app: FastAPI):
             strategies_prewarm_task,
             backtests_meta_prewarm_task,
             jforex_jvm_prewarm_task,
+            live_market_data_sync_task,
         ):
             if not task.done():
                 task.cancel()
@@ -515,9 +525,12 @@ async def lifespan(app: FastAPI):
             strategies_prewarm_task,
             backtests_meta_prewarm_task,
             jforex_jvm_prewarm_task,
+            live_market_data_sync_task,
         ):
             with suppress(asyncio.CancelledError):
                 await task
+        with suppress(Exception):
+            await _live_market_data_service.stop()
 
 
 app = FastAPI(title="trading-platform viewer", lifespan=lifespan)
@@ -597,6 +610,32 @@ class BacktestRunRequest(SQLModel):
     modeling_resolution: str | None = "open_close"
     intrabar_resolution: str | None = None
     parameters: dict[str, Any] = {}
+
+
+class SignalReplayInput(SQLModel):
+    timestamp: str
+    symbol: str
+    action: str
+    entry_price: float
+    stop_loss: float | None = None
+    take_profit: float | None = None
+    timeframe: str | None = None
+    source: str | None = None
+    signal_metadata: dict[str, Any] = PydanticField(default_factory=dict, alias="metadata")
+
+
+class BacktestRunSignalsRequest(SQLModel):
+    signals: list[SignalReplayInput] = []
+    signal_source: str | None = None
+    account_id: str | None = None
+    start_date: str
+    end_date: str
+    timeframe: str = "1h"
+    capital: float = 100000.0
+    risk_per_trade_pct: float | None = None
+    max_position_pct: float | None = None
+    max_positions: int | None = None
+    auto_download: bool = True
 
 
 class PortfolioStrategyConfig(SQLModel):
@@ -742,6 +781,22 @@ def _configure_uvicorn_access_log_filter() -> None:
 
 
 _configure_uvicorn_access_log_filter()
+
+_live_market_data_service = LiveMarketDataStreamService(max_bars_per_symbol=500)
+
+
+async def _sync_live_market_data_stream_background() -> None:
+    while True:
+        try:
+            deployments = await asyncio.to_thread(list_live_deployments)
+            accounts = await asyncio.to_thread(list_live_accounts)
+            account_lookup = {account.id: account for account in accounts}
+            await _live_market_data_service.refresh_from_deployments(deployments, account_lookup)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Live market-data stream sync failed: %s", exc)
+        await asyncio.sleep(10)
 
 
 @app.middleware("http")
@@ -1443,6 +1498,11 @@ def _backtest_summary_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
 
 def _backtest_all_item_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
     win_rate = _normalize_win_rate(meta.get("win_rate"))
+    tags = [
+        str(tag).strip()
+        for tag in (meta.get("tags") if isinstance(meta.get("tags"), list) else [])
+        if str(tag).strip()
+    ]
     return {
         "id": str(meta.get("id") or "").strip(),
         "strategy_name": str(meta.get("strategy_name") or "unknown"),
@@ -1459,6 +1519,7 @@ def _backtest_all_item_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
         "start_date": str(meta.get("start_date") or ""),
         "end_date": str(meta.get("end_date") or ""),
         "created_at": str(meta.get("created_at") or ""),
+        "tags": tags,
     }
 
 
@@ -2045,6 +2106,8 @@ def _serialize_live_deployment_payload(deployment: LiveDeploymentConfig) -> dict
         "symbols": deployment.symbols,
         "timeframe": deployment.timeframe,
         "status": deployment.status,
+        "signal_source": deployment.signal_source,
+        "signal_config": deployment.signal_config,
         "settings": deployment.settings,
     }
 
@@ -2174,6 +2237,98 @@ def _deployment_ids_for_account(
         if strategy_name:
             ids.add(strategy_name)
     return sorted(ids)
+
+
+def _signal_status_from_row(row: dict[str, Any]) -> str:
+    if row.get("execution_id"):
+        return "Filled"
+    metadata = row.get("signal_metadata")
+    signal_metadata = metadata if isinstance(metadata, dict) else {}
+    source = str(row.get("source") or signal_metadata.get("source") or "internal").lower()
+    wait_enabled = bool(
+        signal_metadata.get("wait_for_candle_close")
+        or signal_metadata.get("wait_candle_close")
+    )
+    if source == "discord" and wait_enabled:
+        return "Waiting"
+    return "Pending"
+
+
+def _parse_request_date(value: str, *, field_name: str) -> datetime:
+    text = str(value or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail=f"{field_name} is required")
+    parsed = pd.to_datetime(text, utc=True, errors="coerce")
+    if pd.isna(parsed):
+        raise HTTPException(status_code=400, detail=f"Invalid {field_name}: {value}")
+    return pd.Timestamp(parsed).to_pydatetime()
+
+
+def _normalize_replay_signal_payload(
+    payload: SignalReplayInput,
+    *,
+    default_timeframe: str,
+) -> dict[str, Any]:
+    signal_time = _parse_request_date(payload.timestamp, field_name="signals.timestamp")
+    symbol = str(payload.symbol or "").strip().upper()
+    if not symbol:
+        raise HTTPException(status_code=400, detail="signals.symbol is required")
+    action = str(payload.action or "").strip().lower()
+    if action not in {"buy", "sell", "long", "short"}:
+        raise HTTPException(status_code=400, detail=f"Unsupported signal action '{payload.action}'")
+    entry_price = _safe_float(payload.entry_price, 0.0)
+    if entry_price <= 0:
+        raise HTTPException(status_code=400, detail="signals.entry_price must be > 0")
+    metadata = (
+        payload.signal_metadata
+        if isinstance(payload.signal_metadata, dict)
+        else {}
+    )
+    return {
+        "timestamp": signal_time,
+        "symbol": symbol,
+        "action": "buy" if action in {"buy", "long"} else "sell",
+        "entry_price": entry_price,
+        "stop_loss": payload.stop_loss,
+        "take_profit": payload.take_profit,
+        "timeframe": normalize_timeframe(str(payload.timeframe or metadata.get("timeframe") or default_timeframe))
+        or default_timeframe,
+        "source": str(payload.source or metadata.get("source") or "manual").lower(),
+        "metadata": dict(metadata),
+    }
+
+
+def _signal_replay_task_name(source_label: str) -> str:
+    return f"Signal replay ({source_label})"
+
+
+def _waiting_countdown(signal_metadata: dict[str, Any], signal_time_unix: float) -> int | None:
+    if not (
+        signal_metadata.get("wait_for_candle_close")
+        or signal_metadata.get("wait_candle_close")
+    ):
+        return None
+    timeframe = normalize_timeframe(str(signal_metadata.get("timeframe") or "")) or ""
+    matched = re.match(r"^(\d+)([smhdw])$", timeframe)
+    if not matched:
+        return None
+    count = int(matched.group(1))
+    unit = matched.group(2)
+    unit_seconds = {
+        "s": 1,
+        "m": 60,
+        "h": 3600,
+        "d": 86400,
+        "w": 7 * 86400,
+    }
+    timeframe_seconds = count * unit_seconds.get(unit, 0)
+    if timeframe_seconds <= 0:
+        return None
+    now = time.time()
+    signal_reference = signal_time_unix if signal_time_unix > 0 else now
+    close_unix = ((int(signal_reference) // timeframe_seconds) + 1) * timeframe_seconds
+    remaining = int(max(0, math.ceil(close_unix - now)))
+    return remaining
 
 
 def _log_live_endpoint_request(endpoint: str, **params: Any) -> None:
@@ -3162,16 +3317,24 @@ def _data_check_result(
 
 
 def _auto_download_source(symbol: str, timeframe: str) -> str:
-    normalized_timeframe = normalize_timeframe(timeframe)
-    category = ""
-    try:
-        category = str(legacy_viewer._infer_symbol_data_category(symbol) or "").strip().lower()
-    except (AttributeError, OSError, TypeError, ValueError):
-        category = ""
+    normalized_symbol = str(symbol or "").strip().upper()
+    if "/" in normalized_symbol:
+        return "dukascopy"
 
-    if normalized_timeframe == "1d" and category in {"equities", "etfs"}:
-        return "dolthub"
-    return "dukascopy"
+    try:
+        from data_tools.downloaders.dukascopy_native import SYMBOL_CONFIG
+
+        known_forex_symbols = {
+            key.upper()
+            for key, value in SYMBOL_CONFIG.items()
+            if str(value.get("asset_class", "")).strip().lower() == "forex"
+        }
+    except Exception:
+        known_forex_symbols = set()
+
+    if normalized_symbol in known_forex_symbols:
+        return "dukascopy"
+    return "yfinance"
 
 
 def _download_missing_ohlcv_data(
@@ -3185,6 +3348,19 @@ def _download_missing_ohlcv_data(
     normalized_symbol = str(symbol or "").strip().upper()
     normalized_timeframe = normalize_timeframe(timeframe) or "1d"
     selected_source = str(source or "").strip().lower() or "dukascopy"
+
+    if selected_source == "yfinance":
+        from data_tools.downloaders.yfinance_dl import YFinanceDownloader
+
+        downloader = YFinanceDownloader()
+        downloader.download(
+            symbol=normalized_symbol,
+            timeframe=normalized_timeframe,
+            output_dir=DATA_DIR,
+            start=start or None,
+            end=end or None,
+        )
+        return
 
     if selected_source == "dolthub":
         from data_tools.downloaders.dolthub_dl import DolthubDownloader
@@ -4650,6 +4826,328 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
     return {"task_id": task_id, "job_id": task_id, "status": "queued"}
 
 
+@app.post("/api/backtests/run-signals", response_model=dict[str, Any], status_code=202)
+async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, Any]:
+    timeframe = normalize_timeframe(str(payload.timeframe or "1h")) or "1h"
+    start_dt = _parse_request_date(payload.start_date, field_name="start_date")
+    end_dt = _parse_request_date(payload.end_date, field_name="end_date")
+    if start_dt > end_dt:
+        raise HTTPException(status_code=400, detail="start_date must be <= end_date")
+
+    direct_signals_payload = list(payload.signals or [])
+    source_name = str(payload.signal_source or "").strip().lower()
+    if source_name and source_name not in {"discord", "internal"}:
+        raise HTTPException(status_code=400, detail="signal_source must be 'discord' or 'internal'")
+    normalized_source = source_name if source_name in {"discord", "internal"} else ""
+    account_id = str(payload.account_id or "").strip()
+    if not direct_signals_payload and not normalized_source:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide either 'signals' or 'signal_source'",
+        )
+
+    risk_per_trade_pct = (
+        float(payload.risk_per_trade_pct)
+        if payload.risk_per_trade_pct is not None
+        else 0.01
+    )
+    if risk_per_trade_pct <= 0:
+        raise HTTPException(status_code=400, detail="risk_per_trade_pct must be > 0")
+
+    max_position_pct = (
+        float(payload.max_position_pct)
+        if payload.max_position_pct is not None
+        else 0.05
+    )
+    if max_position_pct <= 0:
+        raise HTTPException(status_code=400, detail="max_position_pct must be > 0")
+
+    max_positions = int(payload.max_positions or 5)
+    if max_positions <= 0:
+        raise HTTPException(status_code=400, detail="max_positions must be > 0")
+
+    if direct_signals_payload:
+        normalized_signals: list[dict[str, Any]] = [
+            _normalize_replay_signal_payload(item, default_timeframe=timeframe)
+            for item in direct_signals_payload
+        ]
+        replay_source_label = "manual"
+    else:
+        deployments = await asyncio.to_thread(list_live_deployments)
+        candidate_deployment_ids = [
+            str(deployment.id)
+            for deployment in deployments
+            if str(deployment.signal_source or "internal").lower() == normalized_source
+            and (not account_id or str(deployment.account_id) == account_id)
+        ]
+        if not candidate_deployment_ids:
+            raise HTTPException(
+                status_code=404,
+                detail="No deployments found for requested signal_source/account_id",
+            )
+        db_signals = await asyncio.to_thread(
+            list_live_signals_for_replay,
+            deployment_ids=candidate_deployment_ids,
+            source=normalized_source,
+            start=start_dt,
+            end=end_dt,
+            limit=20000,
+        )
+        normalized_signals = []
+        for row in db_signals:
+            signal_time = row.get("timestamp")
+            if not isinstance(signal_time, datetime):
+                continue
+            if signal_time < start_dt or signal_time > end_dt:
+                continue
+            normalized_signals.append(
+                {
+                    "timestamp": signal_time,
+                    "symbol": str(row.get("symbol") or "").strip().upper(),
+                    "action": str(row.get("action") or "").strip().lower(),
+                    "entry_price": _safe_float(row.get("entry_price"), 0.0),
+                    "stop_loss": row.get("stop_loss"),
+                    "take_profit": row.get("take_profit"),
+                    "timeframe": normalize_timeframe(str(row.get("timeframe") or timeframe)) or timeframe,
+                    "source": str(row.get("source") or normalized_source or "internal").lower(),
+                    "metadata": (
+                        dict(row.get("metadata"))
+                        if isinstance(row.get("metadata"), dict)
+                        else {}
+                    ),
+                }
+            )
+        replay_source_label = normalized_source
+
+    normalized_signals = [
+        item
+        for item in normalized_signals
+        if str(item.get("symbol") or "").strip()
+        and str(item.get("action") or "") in {"buy", "sell"}
+        and _safe_float(item.get("entry_price"), 0.0) > 0
+    ]
+    if not normalized_signals:
+        raise HTTPException(status_code=400, detail="No valid signals to replay")
+
+    symbols = sorted({str(item["symbol"]).strip().upper() for item in normalized_signals})
+    start_str = start_dt.date().isoformat()
+    end_str = end_dt.date().isoformat()
+    task_id = str(uuid.uuid4())[:8]
+    TASK_LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    log_file = _task_log_path(task_id)
+    stage_total = 5
+    record = _create_task_record(
+        task_id,
+        name=_signal_replay_task_name(replay_source_label),
+        description=(
+            f"Replay {len(normalized_signals)} signals "
+            f"for {', '.join(symbols)} ({timeframe})."
+        ),
+        kind="backtest",
+        source="signal-replay",
+        total_items=stage_total,
+        log_file=log_file,
+        control_mode="thread",
+        supports_control=False,
+    )
+    with DATA_TASKS_LOCK:
+        DATA_TASKS[task_id] = record
+    _set_task_status(task_id, "queued")
+    _update_task_fields(
+        task_id,
+        restart_config={
+            "signal_source": replay_source_label,
+            "account_id": account_id,
+            "start_date": start_str,
+            "end_date": end_str,
+            "timeframe": timeframe,
+            "capital": float(payload.capital or 100000.0),
+            "risk_per_trade_pct": risk_per_trade_pct,
+            "max_position_pct": max_position_pct,
+            "max_positions": max_positions,
+            "signal_count": len(normalized_signals),
+        },
+    )
+    _running_jobs[task_id] = {
+        "status": "queued",
+        "result": None,
+        "error": None,
+        "task_id": task_id,
+        "job_id": task_id,
+    }
+
+    def _run_signal_replay() -> None:
+        stage_progress = 0.0
+
+        def report_stage(
+            handle: Any,
+            *,
+            percent: float,
+            message: str,
+            write_log_line: bool = True,
+        ) -> None:
+            nonlocal stage_progress
+            if percent <= stage_progress:
+                return
+            stage_progress = percent
+            _update_task_progress(
+                task_id,
+                percent=percent,
+                current=message,
+                total=stage_total,
+            )
+            if write_log_line:
+                _write_task_log_line(
+                    handle,
+                    task_id,
+                    f"[{_task_timestamp()}] {message}",
+                    stream="task",
+                    source="backtest",
+                    ingest_task_progress=False,
+                )
+
+        with log_file.open("a", encoding="utf-8", buffering=1) as handle:
+            try:
+                _set_task_status(task_id, "running")
+                _running_jobs[task_id]["status"] = "running"
+                report_stage(handle, percent=10.0, message="Preparing signal replay...")
+
+                if bool(payload.auto_download):
+                    _ensure_backtest_data_availability(
+                        symbols=symbols,
+                        timeframe=timeframe,
+                        start=start_str,
+                        end=end_str,
+                        progress_callback=lambda p, m: report_stage(
+                            handle, percent=min(45.0, max(12.0, p)), message=m
+                        ),
+                        log_callback=lambda message: _write_task_log_line(
+                            handle,
+                            task_id,
+                            f"[{_task_timestamp()}] {message}",
+                            stream="task",
+                            source="backtest",
+                            ingest_task_progress=False,
+                        ),
+                    )
+                report_stage(handle, percent=45.0, message="Loading OHLCV data...")
+
+                ohlcv_by_symbol: dict[str, pd.DataFrame] = {}
+                missing_symbols: list[str] = []
+                for symbol in symbols:
+                    frame = legacy_viewer._load_ohlcv_df(symbol, timeframe)
+                    if frame is None or frame.empty:
+                        missing_symbols.append(symbol)
+                        continue
+                    frame.columns = [str(col).lower() for col in frame.columns]
+                    if "timestamp" not in frame.columns:
+                        missing_symbols.append(symbol)
+                        continue
+                    frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
+                    frame = frame.dropna(subset=["timestamp"])
+                    frame = frame[
+                        (frame["timestamp"] >= pd.Timestamp(start_dt))
+                        & (frame["timestamp"] <= pd.Timestamp(end_dt))
+                    ]
+                    if frame.empty:
+                        missing_symbols.append(symbol)
+                        continue
+                    ohlcv_by_symbol[symbol] = frame.reset_index(drop=True)
+
+                if missing_symbols:
+                    raise RuntimeError(
+                        f"Missing OHLCV data for replay symbols: {', '.join(sorted(missing_symbols))}"
+                    )
+
+                replay_signals = [
+                    ReplaySignal.from_payload(item, default_timeframe=timeframe)
+                    for item in normalized_signals
+                ]
+                report_stage(handle, percent=60.0, message="Replaying signals...")
+
+                adapter = SignalReplayAdapter(
+                    risk_config=RiskConfig(
+                        max_risk_per_trade=risk_per_trade_pct,
+                        max_total_exposure=max_position_pct,
+                        max_positions=max_positions,
+                        default_sl_atr_multiplier=2.0,
+                    ),
+                    initial_capital=float(payload.capital or 100000.0),
+                    default_timeframe=timeframe,
+                )
+                result = adapter.run(
+                    signals=replay_signals,
+                    ohlcv_by_symbol=ohlcv_by_symbol,
+                    timeframe=timeframe,
+                    backtest_start=start_str,
+                    backtest_end=end_str,
+                    metadata={
+                        "signal_source": replay_source_label,
+                        "account_id": account_id or None,
+                        "signal_count": len(replay_signals),
+                    },
+                    progress_callback=lambda percent, _message: report_stage(
+                        handle,
+                        percent=min(92.0, 60.0 + (percent * 0.32)),
+                        message="Replaying signals...",
+                        write_log_line=False,
+                    ),
+                )
+                result.meta.tags = sorted(
+                    {
+                        *(result.meta.tags or []),
+                        "signal-replay",
+                    }
+                )
+                if replay_source_label:
+                    result.meta.tags.append(f"source:{replay_source_label}")
+                if account_id:
+                    result.meta.tags.append(f"account:{account_id}")
+                result.meta.tags = sorted({str(tag).strip() for tag in result.meta.tags if str(tag).strip()})
+
+                report_stage(handle, percent=96.0, message="Saving results...")
+                BACKTESTS_DIR.mkdir(parents=True, exist_ok=True)
+                output_path = BACKTESTS_DIR / f"{result.meta.id}.trades.json"
+                result.save(output_path)
+                save_result_to_sqlite(result)
+                _upsert_backtest_meta_cache(result.meta.id)
+                compact_result = {
+                    "output_path": str(output_path),
+                    "backtest_id": result.meta.id,
+                    "trade_count": len(result.trades),
+                }
+                _update_task_fields(task_id, result=compact_result, backtest_id=result.meta.id)
+                report_stage(
+                    handle,
+                    percent=100.0,
+                    message=f"Completed - {len(result.trades)} trades found",
+                )
+                _mark_task_finished(task_id, status="completed", returncode=0)
+                _running_jobs[task_id]["status"] = "completed"
+                _running_jobs[task_id]["result"] = compact_result
+                _running_jobs[task_id]["error"] = None
+            except (RuntimeError, ValueError, OSError) as exc:
+                _write_task_log_line(
+                    handle,
+                    task_id,
+                    f"[{_task_timestamp()}] Signal replay failed: {exc}",
+                    stream="stderr",
+                    log_level="error",
+                    source="backtest",
+                    ingest_task_progress=False,
+                )
+                _write_task_traceback(handle, task_id, traceback.format_exc(), source="backtest")
+                _mark_task_finished(task_id, status="failed", returncode=1, error=str(exc))
+                _running_jobs[task_id]["status"] = "failed"
+                _running_jobs[task_id]["result"] = None
+                _running_jobs[task_id]["error"] = str(exc)
+
+    thread = threading.Thread(target=_run_signal_replay, daemon=True)
+    _update_task_fields(task_id, thread=thread)
+    thread.start()
+    return {"task_id": task_id, "job_id": task_id, "status": "queued"}
+
+
 @app.get("/api/backtests/run/{job_id}/status", response_model=dict[str, Any])
 async def get_backtest_run_status(job_id: str) -> dict[str, Any]:
     task = _snapshot_task(job_id)
@@ -5109,6 +5607,8 @@ async def create_live_deployment_endpoint(
         symbols=payload.symbols,
         timeframe=payload.timeframe,
         status="ACTIVE",
+        signal_source=payload.signal_source,
+        signal_config=payload.signal_config or {},
         settings=payload.settings or {},
     )
     try:
@@ -5246,6 +5746,92 @@ async def get_live_trades(account_id: str) -> dict[str, Any]:
     return {"account_id": account_id, "deployment_ids": deployment_ids, "trades": trades}
 
 
+@app.get("/api/live/signals/{account_id}", response_model=dict[str, Any])
+async def get_live_signals(account_id: str, limit: int = Query(default=200, ge=1, le=1000)) -> dict[str, Any]:
+    _log_live_endpoint_request(
+        "/api/live/signals/{account_id}",
+        account_id=account_id,
+        limit=limit,
+    )
+    deployments = await asyncio.to_thread(list_live_deployments_for_account, account_id)
+    deployment_ids = _deployment_ids_for_account(account_id, deployments)
+    rows = await asyncio.to_thread(
+        list_live_signals_for_deployments,
+        deployment_ids,
+        limit=limit,
+    )
+
+    signals: list[dict[str, Any]] = []
+    for row in rows:
+        metadata = row.get("signal_metadata")
+        signal_metadata = metadata if isinstance(metadata, dict) else {}
+        signal_iso, signal_unix = _serialize_live_timestamp(row.get("signal_timestamp"))
+        execution_iso, execution_unix = _serialize_live_timestamp(row.get("execution_timestamp"))
+        source = str(row.get("source") or signal_metadata.get("source") or "internal").lower()
+        status = _signal_status_from_row(row)
+        waiting_seconds = (
+            _waiting_countdown(signal_metadata, signal_unix)
+            if status == "Waiting"
+            else None
+        )
+        if status == "Waiting" and waiting_seconds is not None and waiting_seconds <= 0:
+            status = "Pending"
+        raw_message = signal_metadata.get("discord_content")
+        signals.append(
+            {
+                "signal_id": str(row.get("signal_id") or ""),
+                "deployment_id": str(row.get("deployment_id") or ""),
+                "symbol": str(row.get("symbol") or ""),
+                "action": str(row.get("action") or ""),
+                "status": status,
+                "source": source,
+                "execution_id": (
+                    str(row.get("execution_id") or "")
+                    if row.get("execution_id") is not None
+                    else None
+                ),
+                "signal_timestamp": signal_iso,
+                "signal_time": signal_unix,
+                "execution_timestamp": execution_iso,
+                "execution_time": execution_unix,
+                "theoretical_price": _safe_float(row.get("theoretical_price"), 0.0),
+                "actual_price": (
+                    _safe_float(row.get("actual_price"))
+                    if row.get("actual_price") is not None
+                    else None
+                ),
+                "filled_qty": (
+                    _safe_float(row.get("filled_qty"))
+                    if row.get("filled_qty") is not None
+                    else None
+                ),
+                "commission": (
+                    _safe_float(row.get("commission"))
+                    if row.get("commission") is not None
+                    else None
+                ),
+                "broker_order_id": (
+                    str(row.get("broker_order_id") or "")
+                    if row.get("broker_order_id") is not None
+                    else None
+                ),
+                "signal_metadata": signal_metadata,
+                "raw_message": str(raw_message).strip() if raw_message else None,
+                "waiting_for_candle_close": bool(
+                    signal_metadata.get("wait_for_candle_close")
+                    or signal_metadata.get("wait_candle_close")
+                ),
+                "waiting_countdown_seconds": waiting_seconds,
+            }
+        )
+
+    return {
+        "account_id": account_id,
+        "deployment_ids": deployment_ids,
+        "signals": signals,
+    }
+
+
 @app.get("/api/live/stats/{account_id}", response_model=dict[str, Any])
 async def get_live_stats(account_id: str) -> dict[str, Any]:
     _log_live_endpoint_request(
@@ -5253,6 +5839,58 @@ async def get_live_stats(account_id: str) -> dict[str, Any]:
         account_id=account_id,
     )
     return await asyncio.to_thread(_live_account_stats_payload, account_id)
+
+
+@app.get("/api/live/quotes/{symbol}", response_model=dict[str, Any])
+async def get_live_quotes(symbol: str) -> dict[str, Any]:
+    _log_live_endpoint_request(
+        "/api/live/quotes/{symbol}",
+        symbol=symbol,
+    )
+    payload = await _live_market_data_service.get_quote_payload(symbol)
+    if not payload.get("latest"):
+        raise HTTPException(status_code=404, detail=f"No live quote bars available for {symbol.upper()}")
+    return payload
+
+
+@app.get("/api/live/positions/{account_id}", response_model=dict[str, Any])
+async def get_live_positions(account_id: str) -> dict[str, Any]:
+    _log_live_endpoint_request(
+        "/api/live/positions/{account_id}",
+        account_id=account_id,
+    )
+    account = await asyncio.to_thread(get_live_account, account_id)
+    if account is None:
+        raise HTTPException(status_code=404, detail="Live account not found")
+    if account.broker != "alpaca":
+        raise HTTPException(status_code=400, detail="Live positions endpoint currently supports only Alpaca accounts")
+
+    credentials = resolve_alpaca_credentials(
+        account_id=account.id,
+        broker_login=account.broker_login,
+    )
+    if credentials is None:
+        raise HTTPException(status_code=400, detail="Missing Alpaca credentials for account")
+    api_key, secret_key, paper = credentials
+
+    adapter = AlpacaLiveAdapter(
+        api_key=api_key,
+        secret_key=secret_key,
+        paper=paper,
+        account_id=account.id,
+    )
+    rows = await adapter.get_positions()
+    positions = [
+        {
+            "symbol": str(row.get("symbol") or ""),
+            "qty": _safe_float(row.get("qty"), 0.0),
+            "entry_price": _safe_float(row.get("entry_price"), 0.0),
+            "current_price": _safe_float(row.get("current_price"), 0.0),
+            "unrealized_pnl": _safe_float(row.get("unrealized_pnl"), 0.0),
+        }
+        for row in rows
+    ]
+    return {"account_id": account_id, "positions": positions}
 
 
 @app.get("/api/data/overview", response_model=dict[str, Any])
@@ -5459,7 +6097,13 @@ async def data_download(payload: DataDownloadRequest) -> dict[str, Any]:
             "data_tools.downloaders.yfinance_dl",
             "--symbols",
             symbols,
+            "--timeframes",
+            timeframes,
         ]
+        if start:
+            cmd.extend(["--start", start])
+        if end:
+            cmd.extend(["--end", end])
     elif source == "dolthub":
         cmd = [sys.executable, "-u", "-m", "data_tools.dolthub_manager", "update"]
     else:

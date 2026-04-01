@@ -133,6 +133,8 @@ def test_submit_order_with_risk_applies_qty_before_submit():
         symbols=["EURUSD"],
         timeframe="1h",
         status="ACTIVE",
+        signal_source="internal",
+        signal_config={},
         settings={"risk_per_trade_pct": 0.01, "max_total_exposure": 0.05},
     )
     signal = LiveSignal(

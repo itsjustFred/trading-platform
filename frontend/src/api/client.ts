@@ -18,6 +18,9 @@ import type {
   LiveBalancesResponse,
   LiveDeploymentCreateRequest,
   LiveDeploymentConfig,
+  LiveSignalLogResponse,
+  LivePositionsResponse,
+  LiveQuoteResponse,
   LiveDeploymentStatus,
   LiveTradesResponse,
   LogContent,
@@ -27,6 +30,7 @@ import type {
   OptimizationRunResponse,
   OptimizationSummary,
   RunBacktestRequest,
+  RunBacktestSignalsRequest,
   RunBacktestResponse,
   RunBacktestStatusResponse,
   StrategyDetail,
@@ -214,6 +218,20 @@ export const getLiveBalances = (accountId: string) =>
   fetchJSON<LiveBalancesResponse>(`/live/balances/${encodeURIComponent(accountId)}`);
 export const getLiveTrades = (accountId: string) =>
   fetchJSON<LiveTradesResponse>(`/live/trades/${encodeURIComponent(accountId)}`);
+export const getLiveQuote = (symbol: string) =>
+  fetchJSON<LiveQuoteResponse>(`/live/quotes/${encodeURIComponent(symbol)}`);
+export const getLivePositions = (accountId: string) =>
+  fetchJSON<LivePositionsResponse>(`/live/positions/${encodeURIComponent(accountId)}`);
+export const getLiveSignalLog = (accountId: string, limit = 200) => {
+  const params = new URLSearchParams();
+  if (Number.isFinite(limit)) {
+    params.set("limit", String(Math.max(1, Math.min(1000, Math.trunc(limit)))));
+  }
+  const query = params.toString();
+  return fetchJSON<LiveSignalLogResponse>(
+    `/live/signals/${encodeURIComponent(accountId)}${query ? `?${query}` : ""}`,
+  );
+};
 export const createLiveDeployment = (payload: LiveDeploymentCreateRequest) =>
   fetchJSON<LiveDeploymentConfig>("/live/deployments", {
     method: "POST",
@@ -233,6 +251,11 @@ export const deleteLiveDeployment = (deploymentId: string) =>
 // Run backtest
 export const runBacktest = (data: RunBacktestRequest) =>
   fetchJSON<RunBacktestResponse>("/backtests/run", {
+    method: "POST",
+    body: JSON.stringify(data),
+  });
+export const runBacktestSignals = (data: RunBacktestSignalsRequest) =>
+  fetchJSON<RunBacktestResponse>("/backtests/run-signals", {
     method: "POST",
     body: JSON.stringify(data),
   });

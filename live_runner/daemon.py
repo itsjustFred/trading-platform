@@ -2,16 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import os
-import re
+import uuid
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import dotenv_values
 
-from live_runner.alpaca_adapter import AlpacaLiveAdapter
+from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credentials
 from live_runner.base_adapter import BaseLiveAdapter
 from live_runner.ctrader_adapter import CTraderLiveAdapter
+from live_runner.signal_sources import DiscordSignalSource, wait_for_candle_close
 from risk import RiskConfig, RiskEngine, TradeSignal
 from shared.database import list_live_accounts, list_live_deployments, save_live_balance
 from shared.logging import get_logger
@@ -23,7 +24,6 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_ACCOUNTS_ENV = PROJECT_ROOT / ".accounts.env"
 BALANCE_POLL_INTERVAL_SECONDS = 60
 DEPLOYMENT_POLL_INTERVAL_SECONDS = 10
-_ALPACA_ACC_RE = re.compile(r"^ALPACA_API_KEY_ACC(?P<index>\d+)$")
 
 
 def _parse_bool_env(value: str | None, *, default: bool = True) -> bool:
@@ -46,85 +46,6 @@ def _accounts_env_mtime(accounts_env: Path) -> int | None:
         return accounts_env.stat().st_mtime_ns
     except OSError:
         return None
-
-
-def _resolve_alpaca_credentials(
-    account: LiveAccountConfig, env_values: Mapping[str, str]
-) -> tuple[str, str, bool] | None:
-    default_api_key = str(env_values.get("ALPACA_API_KEY", "")).strip()
-    default_secret_key = str(env_values.get("ALPACA_SECRET_KEY", "")).strip()
-    if default_api_key and default_secret_key:
-        paper = _parse_bool_env(str(env_values.get("ALPACA_PAPER", "")).strip(), default=True)
-        return default_api_key, default_secret_key, paper
-
-    indexes = sorted(
-        {
-            int(match.group("index"))
-            for key in env_values
-            if (match := _ALPACA_ACC_RE.match(str(key)))
-        }
-    )
-    if not indexes:
-        return None
-
-    blocks: list[dict[str, str | bool]] = []
-    for idx in indexes:
-        api_key = str(env_values.get(f"ALPACA_API_KEY_ACC{idx}", "")).strip()
-        secret_key = str(env_values.get(f"ALPACA_SECRET_KEY_ACC{idx}", "")).strip()
-        if not api_key or not secret_key:
-            continue
-
-        endpoint = str(env_values.get(f"ALPACA_ENDPOINT_ACC{idx}", "")).strip().lower()
-        paper = "paper" in endpoint if endpoint else _parse_bool_env(
-            str(env_values.get(f"ALPACA_PAPER_ACC{idx}", "")).strip(),
-            default=True,
-        )
-        blocks.append(
-            {
-                "api_key": api_key,
-                "secret_key": secret_key,
-                "paper": paper,
-                "account_id_hint": str(env_values.get(f"ALPACA_ACCOUNT_ID_ACC{idx}", "")).strip(),
-                "login_hint": (
-                    str(env_values.get(f"ALPACA_BROKER_LOGIN_ACC{idx}", "")).strip()
-                    or str(env_values.get(f"ALPACA_ACCOUNT_NUMBER_ACC{idx}", "")).strip()
-                ),
-            }
-        )
-
-    if not blocks:
-        return None
-
-    normalized_account_id = account.id.strip().lower()
-    normalized_login = str(account.broker_login or "").strip().lower()
-    for block in blocks:
-        account_id_hint = str(block.get("account_id_hint", "")).strip().lower()
-        if account_id_hint and account_id_hint == normalized_account_id:
-            return (
-                str(block["api_key"]),
-                str(block["secret_key"]),
-                bool(block["paper"]),
-            )
-        login_hint = str(block.get("login_hint", "")).strip().lower()
-        if login_hint and normalized_login and login_hint == normalized_login:
-            return (
-                str(block["api_key"]),
-                str(block["secret_key"]),
-                bool(block["paper"]),
-            )
-
-    if len(blocks) > 1:
-        logger.warning(
-            "Multiple Alpaca credential blocks found; falling back to first block",
-            extra={"data": {"account_id": account.id}},
-        )
-
-    first = blocks[0]
-    return (
-        str(first["api_key"]),
-        str(first["secret_key"]),
-        bool(first["paper"]),
-    )
 
 
 def _resolve_ctrader_credentials(
@@ -210,6 +131,25 @@ def _risk_config_for_deployment(deployment: LiveDeploymentConfig) -> RiskConfig:
     )
 
 
+def _deployment_wait_for_candle_close(
+    deployment: LiveDeploymentConfig, env_values: Mapping[str, str]
+) -> bool:
+    configured = deployment.signal_config or {}
+    if "wait_candle_close" in configured:
+        return _parse_bool_env(str(configured.get("wait_candle_close")), default=False)
+    if "wait_for_candle_close" in configured:
+        return _parse_bool_env(str(configured.get("wait_for_candle_close")), default=False)
+    return _parse_bool_env(str(env_values.get("DISCORD_WAIT_FOR_CANDLE_CLOSE", "")), default=True)
+
+
+def _deployment_signal_timeframe(deployment: LiveDeploymentConfig) -> str:
+    configured = deployment.signal_config or {}
+    configured_tf = str(configured.get("timeframe") or deployment.timeframe).strip()
+    if configured_tf:
+        return configured_tf
+    return deployment.timeframe
+
+
 def size_live_signal_for_submission(
     signal: LiveSignal,
     deployment: LiveDeploymentConfig,
@@ -281,12 +221,161 @@ async def submit_order_with_risk(
     return await adapter.submit_order(sized_signal)
 
 
+def _trade_signal_to_live_signal(
+    signal: TradeSignal,
+    deployment: LiveDeploymentConfig,
+) -> LiveSignal:
+    metadata: dict[str, object] = dict(signal.metadata or {})
+    if signal.stop_loss is not None:
+        metadata["stop_loss"] = float(signal.stop_loss)
+    if signal.take_profit is not None:
+        metadata["take_profit"] = float(signal.take_profit)
+    metadata["timeframe"] = signal.timeframe
+    metadata["source"] = "discord"
+    return LiveSignal(
+        id=uuid.uuid4(),
+        deployment_id=str(deployment.id),
+        symbol=signal.symbol,
+        action="buy" if signal.action in {"buy", "long"} else "sell",
+        theoretical_price=float(signal.entry_price),
+        timestamp=datetime.now(timezone.utc),
+        metadata=metadata,
+    )
+
+
+async def _run_discord_signal_listener_for_account(
+    account_id: str,
+    adapter: BaseLiveAdapter,
+    deployments: list[LiveDeploymentConfig],
+    *,
+    accounts_env_values: Mapping[str, str],
+) -> None:
+    active_discord_deployments = [
+        deployment
+        for deployment in deployments
+        if deployment.account_id == account_id
+        and _normalize_deployment_status(deployment.status) == "ACTIVE"
+        and str(deployment.signal_source or "internal").lower() == "discord"
+    ]
+    if not active_discord_deployments:
+        logger.info(
+            "No active discord deployments for account; discord listener idle",
+            extra={"data": {"account_id": account_id}},
+        )
+        return
+
+    channel_to_deployments: dict[str, list[LiveDeploymentConfig]] = {}
+    for deployment in active_discord_deployments:
+        configured_channel = str(
+            deployment.signal_config.get("channel_id") or accounts_env_values.get("DISCORD_CHANNEL_ID", "")
+        ).strip()
+        if not configured_channel:
+            logger.warning(
+                "Discord deployment missing channel id",
+                extra={"data": {"deployment_id": str(deployment.id), "account_id": account_id}},
+            )
+            continue
+        channel_to_deployments.setdefault(configured_channel, []).append(deployment)
+
+    if not channel_to_deployments:
+        logger.warning(
+            "No valid discord channels configured for active discord deployments",
+            extra={"data": {"account_id": account_id}},
+        )
+        return
+
+    source = DiscordSignalSource(
+        token=accounts_env_values.get("DISCORD_BOT_TOKEN", ""),
+        channel_ids=set(channel_to_deployments.keys()),
+        timeframe=_deployment_signal_timeframe(next(iter(active_discord_deployments))),
+    )
+    await source.connect()
+    try:
+        async for trade_signal in source.listen_signals():
+            channel_id = str(trade_signal.metadata.get("discord_channel_id", "")).strip()
+            deployments_for_channel = channel_to_deployments.get(channel_id, [])
+            if not deployments_for_channel:
+                logger.debug(
+                    "Skipping discord signal from unmapped channel",
+                    extra={"data": {"account_id": account_id, "channel_id": channel_id}},
+                )
+                continue
+
+            for deployment in deployments_for_channel:
+                deployment_symbols = {item.upper() for item in deployment.symbols}
+                if deployment_symbols and trade_signal.symbol.upper() not in deployment_symbols:
+                    continue
+
+                signal_timeframe = _deployment_signal_timeframe(deployment)
+                wait_enabled = _deployment_wait_for_candle_close(deployment, accounts_env_values)
+                normalized_signal = TradeSignal(
+                    action=trade_signal.action,
+                    symbol=trade_signal.symbol,
+                    entry_price=trade_signal.entry_price,
+                    stop_loss=trade_signal.stop_loss,
+                    take_profit=trade_signal.take_profit,
+                    timeframe=signal_timeframe,
+                    metadata={**trade_signal.metadata, "wait_for_candle_close": wait_enabled},
+                )
+                if wait_enabled:
+                    await wait_for_candle_close(normalized_signal, signal_timeframe)
+
+                live_signal = _trade_signal_to_live_signal(normalized_signal, deployment)
+                try:
+                    broker_order_id = await submit_order_with_risk(adapter, deployment, live_signal)
+                except Exception as exc:
+                    logger.warning(
+                        "Discord signal submission failed",
+                        extra={
+                            "data": {
+                                "account_id": account_id,
+                                "deployment_id": str(deployment.id),
+                                "symbol": live_signal.symbol,
+                                "error": str(exc),
+                            }
+                        },
+                    )
+                    continue
+
+                logger.info(
+                    "Discord signal submitted",
+                    extra={
+                        "data": {
+                            "account_id": account_id,
+                            "deployment_id": str(deployment.id),
+                            "signal_id": str(live_signal.id),
+                            "broker_order_id": broker_order_id,
+                            "symbol": live_signal.symbol,
+                            "action": live_signal.action,
+                        }
+                    },
+                )
+                break
+            else:
+                logger.debug(
+                    "Skipping discord signal with symbol not covered by deployment",
+                    extra={
+                        "data": {
+                            "account_id": account_id,
+                            "channel_id": channel_id,
+                            "symbol": trade_signal.symbol,
+                        }
+                    },
+                )
+    finally:
+        await source.disconnect()
+
+
 def _create_adapter_for_account(
     account: LiveAccountConfig, *, accounts_env_values: Mapping[str, str] | None = None
 ) -> BaseLiveAdapter | None:
     env_values = accounts_env_values or os.environ
     if account.broker == "alpaca":
-        credentials = _resolve_alpaca_credentials(account, env_values)
+        credentials = resolve_alpaca_credentials(
+            account_id=account.id,
+            broker_login=account.broker_login,
+            env=env_values,
+        )
         if credentials is None:
             logger.warning(
                 "Missing Alpaca credentials for account",
@@ -351,6 +440,41 @@ async def _run_adapter(account_id: str, adapter: BaseLiveAdapter) -> None:
         },
     )
     await adapter.listen_executions()
+
+
+async def _run_discord_listener_with_retries(
+    account_id: str,
+    adapter: BaseLiveAdapter,
+    deployments_by_account: dict[str, list[LiveDeploymentConfig]],
+    *,
+    accounts_env_values: Mapping[str, str],
+) -> None:
+    backoff_seconds = 2
+    while True:
+        try:
+            deployments = deployments_by_account.get(account_id, [])
+            await _run_discord_signal_listener_for_account(
+                account_id,
+                adapter,
+                deployments,
+                accounts_env_values=accounts_env_values,
+            )
+            backoff_seconds = 2
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Discord listener loop failed; retrying",
+                extra={
+                    "data": {
+                        "account_id": account_id,
+                        "retry_in_seconds": backoff_seconds,
+                        "error": str(exc),
+                    }
+                },
+            )
+            await asyncio.sleep(backoff_seconds)
+            backoff_seconds = min(backoff_seconds * 2, 30)
 
 
 async def _poll_balances(
@@ -431,6 +555,69 @@ def _cancel_inactive_tasks(
         logger.info(
             "Stopped adapter execution listener",
             extra={"data": {"account_id": account_id, "status": "inactive"}},
+        )
+
+
+def _cleanup_finished_discord_tasks(discord_tasks: dict[str, asyncio.Task[None]]) -> None:
+    for account_id, task in list(discord_tasks.items()):
+        if not task.done():
+            continue
+        discord_tasks.pop(account_id, None)
+        if task.cancelled():
+            continue
+        exception = task.exception()
+        if exception is not None:
+            logger.warning(
+                "Discord listener task finished with error",
+                extra={"data": {"account_id": account_id, "error": str(exception)}},
+            )
+
+
+def _cancel_inactive_discord_tasks(
+    discord_tasks: dict[str, asyncio.Task[None]],
+    active_discord_account_ids: set[str],
+) -> None:
+    for account_id in list(discord_tasks.keys()):
+        if account_id in active_discord_account_ids:
+            continue
+        task = discord_tasks.pop(account_id, None)
+        if task is None or task.done():
+            continue
+        task.cancel()
+        logger.info(
+            "Stopped discord signal listener",
+            extra={"data": {"account_id": account_id, "status": "inactive"}},
+        )
+
+
+def _start_missing_discord_tasks(
+    adapters: dict[str, BaseLiveAdapter],
+    discord_tasks: dict[str, asyncio.Task[None]],
+    active_discord_account_ids: set[str],
+    deployments_by_account: dict[str, list[LiveDeploymentConfig]],
+    *,
+    accounts_env_values: Mapping[str, str],
+) -> None:
+    for account_id in sorted(active_discord_account_ids):
+        running_task = discord_tasks.get(account_id)
+        if running_task is not None and not running_task.done():
+            continue
+        adapter = adapters.get(account_id)
+        if adapter is None:
+            continue
+        task = asyncio.create_task(
+            _run_discord_listener_with_retries(
+                account_id,
+                adapter,
+                deployments_by_account,
+                accounts_env_values=accounts_env_values,
+            ),
+            name=_deployment_task_name(account_id, "discord"),
+        )
+        discord_tasks[account_id] = task
+        logger.info(
+            "Started discord signal listener",
+            extra={"data": {"account_id": account_id}},
         )
 
 
@@ -589,6 +776,7 @@ async def _ensure_adapter_for_active_account(
 async def sync_deployments_loop(
     active_adapters: dict[str, BaseLiveAdapter],
     active_tasks: dict[str, asyncio.Task[None]],
+    active_discord_tasks: dict[str, asyncio.Task[None]],
     *,
     accounts_env: Path = DEFAULT_ACCOUNTS_ENV,
     interval_seconds: int = DEPLOYMENT_POLL_INTERVAL_SECONDS,
@@ -604,8 +792,12 @@ async def sync_deployments_loop(
                 accounts_env_values = _load_accounts_env_values(accounts_env)
                 accounts_env_mtime = current_mtime
             accounts, deployments = await _load_db_accounts_and_deployments()
+            deployments_by_account: dict[str, list[LiveDeploymentConfig]] = {}
+            for deployment in deployments:
+                deployments_by_account.setdefault(deployment.account_id, []).append(deployment)
             account_lookup = {account.id: account for account in accounts}
             _cleanup_finished_listener_tasks(active_tasks)
+            _cleanup_finished_discord_tasks(active_discord_tasks)
             _log_deployment_status_observations(deployments, known_deployment_statuses)
 
             active_account_ids = {
@@ -623,6 +815,13 @@ async def sync_deployments_loop(
                 },
             )
 
+            active_discord_account_ids = {
+                deployment.account_id
+                for deployment in deployments
+                if _normalize_deployment_status(deployment.status) == "ACTIVE"
+                and str(deployment.signal_source or "internal").lower() == "discord"
+            }
+
             for account_id in sorted(active_account_ids):
                 await _ensure_adapter_for_active_account(
                     account_id,
@@ -633,6 +832,14 @@ async def sync_deployments_loop(
 
             _cancel_inactive_tasks(active_tasks, active_account_ids)
             _start_missing_tasks(active_adapters, active_tasks, active_account_ids)
+            _cancel_inactive_discord_tasks(active_discord_tasks, active_discord_account_ids)
+            _start_missing_discord_tasks(
+                active_adapters,
+                active_discord_tasks,
+                active_discord_account_ids,
+                deployments_by_account,
+                accounts_env_values=accounts_env_values,
+            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -653,10 +860,12 @@ async def run_daemon(
     )
     active_adapters: dict[str, BaseLiveAdapter] = {}
     active_listener_tasks: dict[str, asyncio.Task[None]] = {}
+    active_discord_tasks: dict[str, asyncio.Task[None]] = {}
     sync_task = asyncio.create_task(
         sync_deployments_loop(
             active_adapters,
             active_listener_tasks,
+            active_discord_tasks,
             accounts_env=accounts_env,
         ),
         name="deployment-sync-loop",
@@ -671,9 +880,17 @@ async def run_daemon(
         logger.exception("Live daemon crashed")
         raise
     finally:
+        for task in list(active_discord_tasks.values()):
+            if not task.done():
+                task.cancel()
         logger.info(
             "Stopping live daemon",
-            extra={"data": {"active_listener_tasks": len(active_listener_tasks)}},
+            extra={
+                "data": {
+                    "active_listener_tasks": len(active_listener_tasks),
+                    "active_discord_tasks": len(active_discord_tasks),
+                }
+            },
         )
 
 

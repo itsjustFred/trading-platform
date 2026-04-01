@@ -10,15 +10,25 @@ import {
 } from "lightweight-charts";
 import type { IChartApi, Time } from "lightweight-charts";
 
-import { getLiveBalances, getLiveStats, getLiveTrades } from "../api/client";
+import { getLiveBalances, getLiveStats, getLiveTrades, runBacktestSignals } from "../api/client";
 import type {
   LiveAccountStats,
   LiveBalanceRecord,
   LiveTradeSlippage,
 } from "../api/types";
 import { DataTable } from "../components/DataTable";
+import { Modal } from "../components/Modal";
+import { useToast } from "../components/ToastProvider";
 
 const LIVE_DETAIL_POLL_MS = 30000;
+const DEFAULT_REPLAY_TIMEFRAME = "1h";
+
+type ReplayFormState = {
+  start_date: string;
+  end_date: string;
+  timeframe: string;
+  auto_download: boolean;
+};
 
 type LiveDetailStats = {
   totalTrades: number;
@@ -34,6 +44,7 @@ type LiveDetailStats = {
 export function LiveDetailPage() {
   const { accountId: rawAccountId } = useParams<{ accountId: string }>();
   const navigate = useNavigate();
+  const { showToast } = useToast();
   const accountId = decodeURIComponent(rawAccountId ?? "");
 
   const [balances, setBalances] = useState<LiveBalanceRecord[]>([]);
@@ -51,6 +62,19 @@ export function LiveDetailPage() {
   });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [replayModalOpen, setReplayModalOpen] = useState(false);
+  const [isStartingReplay, setIsStartingReplay] = useState(false);
+  const [replayForm, setReplayForm] = useState<ReplayFormState>(() => {
+    const today = new Date();
+    const endDate = today.toISOString().slice(0, 10);
+    const startDate = new Date(today.getTime() - (30 * 24 * 60 * 60 * 1000)).toISOString().slice(0, 10);
+    return {
+      start_date: startDate,
+      end_date: endDate,
+      timeframe: DEFAULT_REPLAY_TIMEFRAME,
+      auto_download: true,
+    };
+  });
 
   useEffect(() => {
     if (!accountId) {
@@ -243,6 +267,38 @@ export function LiveDetailPage() {
     },
   ];
 
+  const handleStartReplay = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!accountId) {
+      showToast("Missing account id for replay.", "warning");
+      return;
+    }
+    if (!replayForm.start_date || !replayForm.end_date || replayForm.start_date > replayForm.end_date) {
+      showToast("Please choose a valid start/end date range.", "warning");
+      return;
+    }
+    setIsStartingReplay(true);
+    try {
+      const response = await runBacktestSignals({
+        signal_source: "discord",
+        account_id: accountId,
+        start_date: replayForm.start_date,
+        end_date: replayForm.end_date,
+        timeframe: replayForm.timeframe || DEFAULT_REPLAY_TIMEFRAME,
+        auto_download: replayForm.auto_download,
+      });
+      const taskId = response.task_id || response.job_id;
+      setReplayModalOpen(false);
+      showToast(`Signal replay started (task ${taskId}).`, "success");
+      navigate("/backtests");
+    } catch (issue: unknown) {
+      const message = issue instanceof Error ? issue.message : "Failed to start signal replay";
+      showToast(message, "error");
+    } finally {
+      setIsStartingReplay(false);
+    }
+  };
+
   if (loading) {
     return (
       <div style={{ padding: "24px", color: "var(--color-text-muted)" }}>
@@ -261,6 +317,74 @@ export function LiveDetailPage() {
 
   return (
     <div style={{ padding: "24px" }}>
+      <Modal
+        open={replayModalOpen}
+        onClose={() => setReplayModalOpen(false)}
+        title="Backtest Signals"
+        width="520px"
+      >
+        <form onSubmit={handleStartReplay} style={{ display: "grid", gap: "12px" }}>
+          <label style={fieldLabelStyle}>
+            Start Date
+            <input
+              type="date"
+              value={replayForm.start_date}
+              onChange={(event) =>
+                setReplayForm((current) => ({ ...current, start_date: event.target.value }))
+              }
+              style={fieldInputStyle}
+              required
+            />
+          </label>
+          <label style={fieldLabelStyle}>
+            End Date
+            <input
+              type="date"
+              value={replayForm.end_date}
+              onChange={(event) =>
+                setReplayForm((current) => ({ ...current, end_date: event.target.value }))
+              }
+              style={fieldInputStyle}
+              required
+            />
+          </label>
+          <label style={fieldLabelStyle}>
+            Replay Timeframe
+            <select
+              value={replayForm.timeframe}
+              onChange={(event) =>
+                setReplayForm((current) => ({ ...current, timeframe: event.target.value }))
+              }
+              style={fieldInputStyle}
+            >
+              {["1m", "5m", "15m", "30m", "1h", "4h", "1d"].map((tf) => (
+                <option key={tf} value={tf}>
+                  {tf}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label style={{ ...fieldLabelStyle, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            Auto-download missing OHLCV
+            <input
+              type="checkbox"
+              checked={replayForm.auto_download}
+              onChange={(event) =>
+                setReplayForm((current) => ({ ...current, auto_download: event.target.checked }))
+              }
+            />
+          </label>
+          <div style={{ display: "flex", justifyContent: "flex-end", gap: "8px", marginTop: "4px" }}>
+            <button type="button" onClick={() => setReplayModalOpen(false)} style={ghostButtonStyle} disabled={isStartingReplay}>
+              Cancel
+            </button>
+            <button type="submit" style={primaryButtonStyle} disabled={isStartingReplay}>
+              {isStartingReplay ? "Starting..." : "Start Replay"}
+            </button>
+          </div>
+        </form>
+      </Modal>
+
       <div
         style={{
           background:
@@ -280,9 +404,9 @@ export function LiveDetailPage() {
             flexWrap: "wrap",
           }}
         >
-          <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
-            <button
-              onClick={() => navigate("/live")}
+            <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+              <button
+                onClick={() => navigate("/live")}
               style={{
                 border: "1px solid rgba(59, 130, 246, 0.3)",
                 background: "rgba(59, 130, 246, 0.1)",
@@ -294,11 +418,45 @@ export function LiveDetailPage() {
               }}
               title="Back to Live Hub"
             >
-              <ArrowLeft size={16} />
-            </button>
-            <div>
-              <h1 style={{ margin: 0, fontSize: "1.4rem", fontWeight: 700 }}>
-                Live Account {accountId}
+                <ArrowLeft size={16} />
+              </button>
+              <button
+                onClick={() => setReplayModalOpen(true)}
+                style={{
+                  border: "1px solid rgba(168, 85, 247, 0.45)",
+                  background: "rgba(168, 85, 247, 0.16)",
+                  color: "#e9d5ff",
+                  height: "34px",
+                  borderRadius: "10px",
+                  cursor: "pointer",
+                  padding: "0 12px",
+                  fontSize: "0.8rem",
+                  fontWeight: 600,
+                }}
+                title="Replay Discord signals as backtest"
+              >
+                Backtest Signals
+              </button>
+              <button
+                onClick={() => navigate(`/live/${encodeURIComponent(accountId)}/viewer`)}
+                style={{
+                  border: "1px solid rgba(59, 130, 246, 0.38)",
+                  background: "rgba(59, 130, 246, 0.14)",
+                  color: "#bfdbfe",
+                  height: "34px",
+                  borderRadius: "10px",
+                  cursor: "pointer",
+                  padding: "0 12px",
+                  fontSize: "0.8rem",
+                  fontWeight: 600,
+                }}
+                title="Open live viewer"
+              >
+                Open Live Viewer
+              </button>
+              <div>
+                <h1 style={{ margin: 0, fontSize: "1.4rem", fontWeight: 700 }}>
+                  Live Account {accountId}
               </h1>
               <p
                 style={{
@@ -532,6 +690,42 @@ function MetricCard({
     </div>
   );
 }
+
+const fieldLabelStyle: React.CSSProperties = {
+  display: "grid",
+  gap: "6px",
+  fontSize: "0.82rem",
+  color: "var(--color-text-muted)",
+};
+
+const fieldInputStyle: React.CSSProperties = {
+  width: "100%",
+  borderRadius: "10px",
+  border: "1px solid var(--color-border)",
+  background: "rgba(2, 6, 23, 0.42)",
+  color: "var(--color-text)",
+  padding: "10px 12px",
+  fontSize: "0.87rem",
+  outline: "none",
+};
+
+const ghostButtonStyle: React.CSSProperties = {
+  border: "1px solid var(--color-border)",
+  background: "rgba(148, 163, 184, 0.08)",
+  color: "var(--color-text)",
+  borderRadius: "10px",
+  padding: "8px 12px",
+  cursor: "pointer",
+};
+
+const primaryButtonStyle: React.CSSProperties = {
+  border: "1px solid rgba(168, 85, 247, 0.45)",
+  background: "rgba(168, 85, 247, 0.16)",
+  color: "#e9d5ff",
+  borderRadius: "10px",
+  padding: "8px 12px",
+  cursor: "pointer",
+};
 
 function normalizeStats(
   stats: LiveAccountStats,

@@ -106,6 +106,8 @@ class LiveDeploymentConfig(BaseModel):
     symbols: list[str]
     timeframe: str
     status: Literal["ACTIVE", "PAUSED", "STOPPED"] = "ACTIVE"
+    signal_source: Literal["internal", "discord"] = "internal"
+    signal_config: dict[str, Any] = Field(default_factory=dict)
     settings: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -116,6 +118,8 @@ class LiveDeploymentCreateRequest(BaseModel):
     account_id: str
     symbols: list[str]
     timeframe: str
+    signal_source: Literal["internal", "discord"] = "internal"
+    signal_config: dict[str, Any] = Field(default_factory=dict)
     settings: dict[str, Any] = Field(default_factory=dict)
 
 

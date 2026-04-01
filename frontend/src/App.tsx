@@ -15,6 +15,7 @@ import { OptimizationsPage } from "./pages/OptimizationsPage";
 import { OptimizationResultsPage } from "./pages/OptimizationResultsPage";
 import { LiveHubPage } from "./pages/LiveHub";
 import { LiveDetailPage } from "./pages/LiveDetail";
+import { LiveViewerPage } from "./pages/LiveViewer";
 import { TaskManager } from "./components/TaskManager";
 import { TaskHubPage } from "./pages/TaskHub";
 
@@ -50,6 +51,7 @@ export default function App() {
           <Route path="/optimizations/:id" element={<OptimizationResultsPage />} />
           <Route path="/live" element={<LiveHubPage />} />
           <Route path="/live/:accountId" element={<LiveDetailPage />} />
+          <Route path="/live/:accountId/viewer" element={<LiveViewerPage />} />
           <Route path="/strategies" element={<StrategiesPage />} />
           <Route path="/strategies/:name" element={<StrategyDetailPage />} />
           <Route path="/portfolios" element={<PortfoliosPage />} />

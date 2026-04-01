@@ -11,6 +11,8 @@ deployments:
       - AAPL
       - MSFT
     timeframe: 1h
+    signal_source: internal
+    signal_config: {}
 
   - strategy_name: fx_breakout
     account_id: ctrader-live
@@ -18,4 +20,7 @@ deployments:
       - EURUSD
       - XAUUSD
     timeframe: 15m
-
+    signal_source: discord
+    signal_config:
+      channel_id: "123456789012345678"
+      wait_candle_close: true

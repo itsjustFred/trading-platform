@@ -1,0 +1,495 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any, Callable
+
+import pandas as pd
+
+from risk.config import RiskConfig
+from risk.engine import RiskEngine
+from risk.models import TradeSignal as RiskTradeSignal
+from runner.stats import compute_stats_for_result
+from shared.constants import normalize_timeframe
+from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, TradeExit
+
+ProgressCallback = Callable[[float, str], None]
+
+
+def _to_iso(value: pd.Timestamp) -> str:
+    ts = pd.Timestamp(value)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    else:
+        ts = ts.tz_convert("UTC")
+    return ts.isoformat()
+
+
+def _to_timestamp(value: Any) -> pd.Timestamp:
+    ts = pd.to_datetime(value, utc=True, errors="coerce")
+    if pd.isna(ts):
+        raise ValueError(f"Invalid timestamp value: {value!r}")
+    return pd.Timestamp(ts)
+
+
+def _to_optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if pd.isna(numeric):
+        return None
+    return numeric
+
+
+def _coerce_action(value: Any) -> str:
+    action = str(value or "").strip().lower()
+    if action in {"buy", "long"}:
+        return "buy"
+    if action in {"sell", "short"}:
+        return "sell"
+    raise ValueError(f"Unsupported signal action '{value}'")
+
+
+@dataclass(slots=True)
+class ReplaySignal:
+    timestamp: pd.Timestamp
+    symbol: str
+    action: str
+    entry_price: float
+    stop_loss: float | None = None
+    take_profit: float | None = None
+    timeframe: str = "1h"
+    source: str = "internal"
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any], default_timeframe: str = "1h") -> "ReplaySignal":
+        metadata = payload.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        timeframe = normalize_timeframe(
+            str(payload.get("timeframe") or metadata.get("timeframe") or default_timeframe)
+        ) or default_timeframe
+
+        source = str(payload.get("source") or metadata.get("source") or "internal").strip().lower()
+        symbol = str(payload.get("symbol") or "").strip().upper()
+        if not symbol:
+            raise ValueError("Signal symbol is required")
+
+        timestamp = _to_timestamp(payload.get("timestamp"))
+        action = _coerce_action(payload.get("action"))
+        entry_price = float(payload.get("entry_price"))
+        if entry_price <= 0:
+            raise ValueError("entry_price must be > 0")
+
+        stop_loss = _to_optional_float(payload.get("stop_loss"))
+        take_profit = _to_optional_float(payload.get("take_profit"))
+
+        return cls(
+            timestamp=timestamp,
+            symbol=symbol,
+            action=action,
+            entry_price=entry_price,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            timeframe=timeframe,
+            source=source or "internal",
+            metadata=dict(metadata),
+        )
+
+
+@dataclass(slots=True)
+class _OpenPosition:
+    symbol: str
+    direction: str  # LONG/SHORT
+    entry_time: pd.Timestamp
+    entry_bar_index: int
+    entry_price: float
+    quantity: float
+    stop_loss: float | None
+    take_profit: float | None
+    risk_amount: float | None
+    risk_percent: float | None
+    source: str
+    signal_time: pd.Timestamp
+    signal_metadata: dict[str, Any]
+    last_checked_at: pd.Timestamp
+    mae: float = 0.0
+    mfe: float = 0.0
+
+
+class SignalReplayAdapter:
+    def __init__(
+        self,
+        *,
+        risk_config: RiskConfig | None = None,
+        initial_capital: float = 100_000.0,
+        default_timeframe: str = "1h",
+    ) -> None:
+        self.risk_config = risk_config or RiskConfig()
+        self.risk_engine = RiskEngine(self.risk_config)
+        self.initial_capital = float(initial_capital)
+        self.default_timeframe = normalize_timeframe(default_timeframe) or default_timeframe
+
+    @staticmethod
+    def _prepare_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
+        frame = df.copy()
+        frame.columns = [str(column).lower() for column in frame.columns]
+        if "timestamp" not in frame.columns:
+            raise ValueError("OHLCV frame requires timestamp column")
+
+        frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
+        frame["open"] = pd.to_numeric(frame.get("open"), errors="coerce")
+        frame["high"] = pd.to_numeric(frame.get("high"), errors="coerce")
+        frame["low"] = pd.to_numeric(frame.get("low"), errors="coerce")
+        frame["close"] = pd.to_numeric(frame.get("close"), errors="coerce")
+        frame = frame.dropna(subset=["timestamp", "open", "high", "low", "close"])
+        frame = frame.sort_values("timestamp").reset_index(drop=True)
+        return frame
+
+    @staticmethod
+    def _find_fill_bar(frame: pd.DataFrame, timestamp: pd.Timestamp) -> tuple[int, pd.Series] | None:
+        idx = int(frame["timestamp"].searchsorted(timestamp, side="left"))
+        if idx >= len(frame):
+            return None
+        return idx, frame.iloc[idx]
+
+    @staticmethod
+    def _position_risk_amount(position: _OpenPosition) -> float:
+        stop_loss = position.stop_loss
+        if stop_loss is None:
+            if position.direction == "LONG":
+                stop_loss = position.entry_price * 0.98
+            else:
+                stop_loss = position.entry_price * 1.02
+        return abs(position.entry_price - stop_loss) * position.quantity
+
+    def _current_exposure(self, open_positions: dict[str, _OpenPosition], equity: float) -> float:
+        if equity <= 0:
+            return 0.0
+        risk_amount = sum(self._position_risk_amount(position) for position in open_positions.values())
+        return max(0.0, risk_amount / equity)
+
+    @staticmethod
+    def _update_excursions(position: _OpenPosition, bar: pd.Series) -> None:
+        high = float(bar["high"])
+        low = float(bar["low"])
+        if position.direction == "LONG":
+            favorable = (high - position.entry_price) * position.quantity
+            adverse = (low - position.entry_price) * position.quantity
+        else:
+            favorable = (position.entry_price - low) * position.quantity
+            adverse = (position.entry_price - high) * position.quantity
+        position.mfe = max(position.mfe, favorable)
+        position.mae = min(position.mae, adverse)
+
+    def _close_position(
+        self,
+        position: _OpenPosition,
+        *,
+        exit_time: pd.Timestamp,
+        exit_price: float,
+        exit_reason: str,
+        exit_bar_index: int,
+    ) -> Trade:
+        if position.direction == "LONG":
+            pnl = (exit_price - position.entry_price) * position.quantity
+        else:
+            pnl = (position.entry_price - exit_price) * position.quantity
+
+        risk_amount = float(position.risk_amount or 0.0)
+        gross_notional = position.entry_price * position.quantity
+        pnl_pct = (pnl / gross_notional) * 100.0 if gross_notional > 0 else 0.0
+        r_multiple = (pnl / risk_amount) if risk_amount > 0 else None
+        tags = ["signal-replay"]
+        if position.source:
+            tags.append(str(position.source))
+
+        return Trade(
+            id=0,
+            symbol=position.symbol,
+            direction=position.direction,
+            entry_time=_to_iso(position.entry_time),
+            entry_price=float(position.entry_price),
+            quantity=float(position.quantity),
+            exits=[
+                TradeExit(
+                    time=_to_iso(exit_time),
+                    price=float(exit_price),
+                    quantity=float(position.quantity),
+                    pnl=float(pnl),
+                    reason=exit_reason,
+                )
+            ],
+            pnl=float(pnl),
+            position_size=float(position.quantity),
+            risk_amount=float(position.risk_amount) if position.risk_amount is not None else None,
+            risk_percent=float(position.risk_percent) if position.risk_percent is not None else None,
+            exit_reason=exit_reason,
+            pnl_pct=float(pnl_pct),
+            fees=0.0,
+            net_pnl=float(pnl),
+            r_multiple=float(r_multiple) if r_multiple is not None else None,
+            mae=float(position.mae),
+            mfe=float(position.mfe),
+            holding_bars=max(0, int(exit_bar_index - position.entry_bar_index)),
+            tags=tags,
+            meta={
+                "signal_timestamp": _to_iso(position.signal_time),
+                "signal_source": position.source,
+                "signal_metadata": position.signal_metadata,
+            },
+        )
+
+    def _process_protective_exits(
+        self,
+        *,
+        position: _OpenPosition,
+        frame: pd.DataFrame,
+        end_timestamp: pd.Timestamp,
+    ) -> Trade | None:
+        if position.stop_loss is None and position.take_profit is None:
+            position.last_checked_at = end_timestamp
+            return None
+
+        window = frame[
+            (frame["timestamp"] > position.last_checked_at) & (frame["timestamp"] <= end_timestamp)
+        ]
+        if window.empty:
+            position.last_checked_at = end_timestamp
+            return None
+
+        for index, bar in window.iterrows():
+            self._update_excursions(position, bar)
+            high = float(bar["high"])
+            low = float(bar["low"])
+            stop_hit = False
+            take_profit_hit = False
+
+            if position.direction == "LONG":
+                stop_hit = position.stop_loss is not None and low <= float(position.stop_loss)
+                take_profit_hit = (
+                    position.take_profit is not None and high >= float(position.take_profit)
+                )
+            else:
+                stop_hit = position.stop_loss is not None and high >= float(position.stop_loss)
+                take_profit_hit = (
+                    position.take_profit is not None and low <= float(position.take_profit)
+                )
+
+            if stop_hit or take_profit_hit:
+                if stop_hit:
+                    exit_price = float(position.stop_loss or float(bar["close"]))
+                    reason = "stop_loss"
+                else:
+                    exit_price = float(position.take_profit or float(bar["close"]))
+                    reason = "take_profit"
+                return self._close_position(
+                    position,
+                    exit_time=pd.Timestamp(bar["timestamp"]),
+                    exit_price=exit_price,
+                    exit_reason=reason,
+                    exit_bar_index=int(index),
+                )
+
+        position.last_checked_at = end_timestamp
+        return None
+
+    def run(
+        self,
+        *,
+        signals: list[ReplaySignal],
+        ohlcv_by_symbol: dict[str, pd.DataFrame],
+        timeframe: str = "1h",
+        backtest_start: str = "",
+        backtest_end: str = "",
+        metadata: dict[str, Any] | None = None,
+        progress_callback: ProgressCallback | None = None,
+    ) -> BacktestResult:
+        def emit(percent: float, message: str) -> None:
+            if progress_callback is None:
+                return
+            bounded = max(0.0, min(100.0, float(percent)))
+            progress_callback(round(bounded, 2), message)
+
+        emit(5.0, "Preparing replay inputs...")
+        normalized_timeframe = normalize_timeframe(timeframe) or self.default_timeframe
+        frames: dict[str, pd.DataFrame] = {}
+        for symbol, frame in ohlcv_by_symbol.items():
+            normalized_symbol = str(symbol or "").strip().upper()
+            if not normalized_symbol:
+                continue
+            prepared = self._prepare_ohlcv(frame)
+            if prepared.empty:
+                continue
+            frames[normalized_symbol] = prepared
+
+        if not frames:
+            raise ValueError("No OHLCV data available for replay")
+
+        replay_signals = sorted(
+            [signal for signal in signals if signal.symbol in frames],
+            key=lambda signal: (signal.timestamp, signal.symbol, signal.action),
+        )
+        if not replay_signals:
+            raise ValueError("No replayable signals after symbol/OHLCV normalization")
+
+        open_positions: dict[str, _OpenPosition] = {}
+        closed_trades: list[Trade] = []
+        realized_pnl = 0.0
+
+        total_signals = len(replay_signals)
+        for index, signal in enumerate(replay_signals, start=1):
+            frame = frames[signal.symbol]
+            current_position = open_positions.get(signal.symbol)
+            if current_position is not None:
+                protected_exit = self._process_protective_exits(
+                    position=current_position,
+                    frame=frame,
+                    end_timestamp=signal.timestamp,
+                )
+                if protected_exit is not None:
+                    closed_trades.append(protected_exit)
+                    realized_pnl += float(protected_exit.pnl)
+                    open_positions.pop(signal.symbol, None)
+                    current_position = None
+
+            filled = self._find_fill_bar(frame, signal.timestamp)
+            if filled is None:
+                continue
+            fill_index, fill_bar = filled
+            fill_price = float(fill_bar["close"])
+            fill_time = pd.Timestamp(fill_bar["timestamp"])
+            target_direction = "LONG" if signal.action == "buy" else "SHORT"
+
+            if current_position is not None:
+                if current_position.direction == target_direction:
+                    current_position.last_checked_at = fill_time
+                    emit(10.0 + ((index / total_signals) * 80.0), "Replaying signals...")
+                    continue
+                flip_trade = self._close_position(
+                    current_position,
+                    exit_time=fill_time,
+                    exit_price=fill_price,
+                    exit_reason="signal_flip",
+                    exit_bar_index=int(fill_index),
+                )
+                closed_trades.append(flip_trade)
+                realized_pnl += float(flip_trade.pnl)
+                open_positions.pop(signal.symbol, None)
+
+            account_balance = max(self.initial_capital + realized_pnl, 1.0)
+            exposure = self._current_exposure(open_positions, account_balance)
+            risk_signal = RiskTradeSignal(
+                action="buy" if target_direction == "LONG" else "sell",
+                symbol=signal.symbol,
+                entry_price=fill_price,
+                stop_loss=signal.stop_loss,
+                take_profit=signal.take_profit,
+                timeframe=signal.timeframe or normalized_timeframe,
+                metadata={"current_positions": len(open_positions)},
+            )
+            sized = self.risk_engine.calculate_position_size(
+                signal=risk_signal,
+                account_balance=account_balance,
+                pip_value=1.0,
+                current_exposure=exposure,
+            )
+            quantity = float(sized.position_size)
+            if quantity <= 0:
+                emit(10.0 + ((index / total_signals) * 80.0), "Replaying signals...")
+                continue
+
+            open_positions[signal.symbol] = _OpenPosition(
+                symbol=signal.symbol,
+                direction=target_direction,
+                entry_time=fill_time,
+                entry_bar_index=int(fill_index),
+                entry_price=fill_price,
+                quantity=quantity,
+                stop_loss=risk_signal.stop_loss,
+                take_profit=risk_signal.take_profit,
+                risk_amount=float(sized.risk_amount),
+                risk_percent=float(sized.risk_percent),
+                source=signal.source,
+                signal_time=signal.timestamp,
+                signal_metadata=dict(signal.metadata),
+                last_checked_at=fill_time,
+            )
+            emit(10.0 + ((index / total_signals) * 80.0), "Replaying signals...")
+
+        emit(92.0, "Finalizing open positions...")
+        for symbol, position in list(open_positions.items()):
+            frame = frames[symbol]
+            protected_exit = self._process_protective_exits(
+                position=position,
+                frame=frame,
+                end_timestamp=pd.Timestamp(frame["timestamp"].iloc[-1]),
+            )
+            if protected_exit is not None:
+                closed_trades.append(protected_exit)
+                realized_pnl += float(protected_exit.pnl)
+                continue
+            last_index = len(frame) - 1
+            last_bar = frame.iloc[last_index]
+            self._update_excursions(position, last_bar)
+            closed = self._close_position(
+                position,
+                exit_time=pd.Timestamp(last_bar["timestamp"]),
+                exit_price=float(last_bar["close"]),
+                exit_reason="end_of_data",
+                exit_bar_index=last_index,
+            )
+            closed_trades.append(closed)
+            realized_pnl += float(closed.pnl)
+
+        closed_trades.sort(
+            key=lambda trade: (trade.last_exit_time, trade.entry_time, trade.symbol),
+        )
+        for idx, trade in enumerate(closed_trades, start=1):
+            trade.id = idx
+
+        running_equity = float(self.initial_capital)
+        equity_curve: list[EquityPoint] = []
+        for trade in closed_trades:
+            running_equity += float(trade.pnl)
+            equity_curve.append(EquityPoint(time=trade.last_exit_time, equity=round(running_equity, 2)))
+
+        signal_sources = sorted(
+            {str(signal.source or "internal").lower() for signal in replay_signals if str(signal.source or "").strip()}
+        )
+        tags = ["signal-replay", *[f"source:{source}" for source in signal_sources]]
+        created_at = datetime.now(timezone.utc).isoformat()
+        inferred_start = backtest_start or replay_signals[0].timestamp.date().isoformat()
+        inferred_end = backtest_end or replay_signals[-1].timestamp.date().isoformat()
+        meta = BacktestMeta(
+            id=f"signal-replay-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}",
+            created_at=created_at,
+            engine="signal-replay",
+            strategies=["Signal Replay"],
+            backtest_start=str(inferred_start),
+            backtest_end=str(inferred_end),
+            data={
+                "symbols": sorted(frames.keys()),
+                "timeframes": [normalized_timeframe],
+                "source": ",".join(signal_sources) if signal_sources else "internal",
+            },
+            initial_capital=float(self.initial_capital),
+            parameters={
+                "max_risk_per_trade": float(self.risk_config.max_risk_per_trade),
+                "max_total_exposure": float(self.risk_config.max_total_exposure),
+                "max_positions": int(self.risk_config.max_positions),
+                **(metadata or {}),
+            },
+            tags=tags,
+            notes="Signal Replay",
+        )
+        result = BacktestResult(meta=meta, trades=closed_trades, equity_curve=equity_curve)
+        result.stats = compute_stats_for_result(result)
+        emit(100.0, f"Completed - {len(closed_trades)} trades found")
+        return result
+

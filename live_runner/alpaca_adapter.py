@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
@@ -14,6 +16,8 @@ from shared.logging import get_logger
 from shared.models import LiveExecution, LiveSignal
 
 logger = get_logger("live-runner")
+
+_ALPACA_ACC_RE = re.compile(r"^ALPACA_API_KEY_ACC(?P<index>\d+)$")
 
 
 def _parse_bool_env(value: str | None, default: bool = True) -> bool:
@@ -42,6 +46,95 @@ def _to_datetime(value: Any) -> datetime:
         except ValueError:
             return datetime.now(timezone.utc)
     return datetime.now(timezone.utc)
+
+
+def resolve_alpaca_credentials(
+    *,
+    account_id: str = "",
+    broker_login: str | None = None,
+    env: Mapping[str, str] | None = None,
+) -> tuple[str, str, bool] | None:
+    """Resolve Alpaca credentials from env (default or ACC{N} blocks)."""
+    values = dict(env) if env is not None else dict(os.environ)
+
+    default_api_key = str(values.get("ALPACA_API_KEY", "")).strip()
+    default_secret_key = str(values.get("ALPACA_SECRET_KEY", "")).strip()
+    if default_api_key and default_secret_key:
+        paper = _parse_bool_env(str(values.get("ALPACA_PAPER", "")).strip(), default=True)
+        return default_api_key, default_secret_key, paper
+
+    indexes = sorted(
+        {
+            int(match.group("index"))
+            for key in values
+            if (match := _ALPACA_ACC_RE.match(str(key)))
+        }
+    )
+    if not indexes:
+        return None
+
+    blocks: list[dict[str, str | bool]] = []
+    for idx in indexes:
+        api_key = str(values.get(f"ALPACA_API_KEY_ACC{idx}", "")).strip()
+        secret_key = str(values.get(f"ALPACA_SECRET_KEY_ACC{idx}", "")).strip()
+        if not api_key or not secret_key:
+            continue
+
+        endpoint = str(values.get(f"ALPACA_ENDPOINT_ACC{idx}", "")).strip().lower()
+        paper = "paper" in endpoint if endpoint else _parse_bool_env(
+            str(values.get(f"ALPACA_PAPER_ACC{idx}", "")).strip(),
+            default=True,
+        )
+        blocks.append(
+            {
+                "api_key": api_key,
+                "secret_key": secret_key,
+                "paper": paper,
+                "account_id_hint": str(values.get(f"ALPACA_ACCOUNT_ID_ACC{idx}", "")).strip(),
+                "login_hint": (
+                    str(values.get(f"ALPACA_BROKER_LOGIN_ACC{idx}", "")).strip()
+                    or str(values.get(f"ALPACA_ACCOUNT_NUMBER_ACC{idx}", "")).strip()
+                ),
+            }
+        )
+
+    if not blocks:
+        return None
+
+    normalized_account_id = str(account_id or "").strip().lower()
+    normalized_login = str(broker_login or "").strip().lower()
+    for block in blocks:
+        account_id_hint = str(block.get("account_id_hint", "")).strip().lower()
+        if account_id_hint and account_id_hint == normalized_account_id:
+            return (
+                str(block["api_key"]),
+                str(block["secret_key"]),
+                bool(block["paper"]),
+            )
+        login_hint = str(block.get("login_hint", "")).strip().lower()
+        if login_hint and normalized_login and login_hint == normalized_login:
+            return (
+                str(block["api_key"]),
+                str(block["secret_key"]),
+                bool(block["paper"]),
+            )
+
+    if normalized_account_id or normalized_login:
+        logger.warning(
+            "No exact Alpaca credential block match; using first configured block",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "broker_login": broker_login,
+                }
+            },
+        )
+    first = blocks[0]
+    return (
+        str(first["api_key"]),
+        str(first["secret_key"]),
+        bool(first["paper"]),
+    )
 
 
 class AlpacaLiveAdapter(BaseLiveAdapter):
@@ -143,6 +236,24 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         balance = _to_float(getattr(account, "cash", None), default=0.0)
         equity = _to_float(getattr(account, "equity", None), default=balance)
         return balance, equity
+
+    async def get_positions(self) -> list[dict[str, Any]]:
+        """Return open positions with pricing and unrealized PnL."""
+        if not self._connected or self._trading_client is None:
+            await self.connect()
+        rows = await asyncio.to_thread(self._trading_client.get_all_positions)
+        payload: list[dict[str, Any]] = []
+        for row in rows:
+            payload.append(
+                {
+                    "symbol": str(getattr(row, "symbol", "")).strip().upper(),
+                    "qty": _to_float(getattr(row, "qty", None), default=0.0),
+                    "entry_price": _to_float(getattr(row, "avg_entry_price", None), default=0.0),
+                    "current_price": _to_float(getattr(row, "current_price", None), default=0.0),
+                    "unrealized_pnl": _to_float(getattr(row, "unrealized_pl", None), default=0.0),
+                }
+            )
+        return payload
 
     async def _on_trade_update(self, data: Any) -> None:
         try:

@@ -29,6 +29,8 @@ def test_live_endpoints_return_expected_payloads(monkeypatch):
             symbols=["AAPL", "MSFT"],
             timeframe="1h",
             status="ACTIVE",
+            signal_source="internal",
+            signal_config={},
         )
     ]
     balance = LiveBalanceRecord(
@@ -159,6 +161,8 @@ def test_live_endpoints_return_expected_payloads(monkeypatch):
     deployments_payload = deployments_resp.json()
     assert len(deployments_payload) == 1
     assert deployments_payload[0]["status"] == "ACTIVE"
+    assert deployments_payload[0]["signal_source"] == "internal"
+    assert deployments_payload[0]["signal_config"] == {}
 
     balances_resp = client.get(f"/api/live/balances/{account_id}")
     assert balances_resp.status_code == 200
@@ -208,6 +212,8 @@ def test_live_deployments_crud_endpoints(monkeypatch):
         "symbols": ["AAPL", "MSFT"],
         "timeframe": "1h",
         "status": "ACTIVE",
+        "signal_source": "discord",
+        "signal_config": {"channel_id": "123", "wait_candle_close": True},
     }
 
     monkeypatch.setattr(viewer_main_module, "_seed_default_live_accounts", lambda: None)
@@ -230,6 +236,8 @@ def test_live_deployments_crud_endpoints(monkeypatch):
             symbols=deployment.symbols,
             timeframe=deployment.timeframe,
             status="ACTIVE",
+            signal_source=deployment.signal_source,
+            signal_config=deployment.signal_config,
             settings=deployment.settings,
         ),
     )
@@ -243,6 +251,8 @@ def test_live_deployments_crud_endpoints(monkeypatch):
             symbols=created_deployment["symbols"],
             timeframe=created_deployment["timeframe"],
             status=_status,
+            signal_source=created_deployment["signal_source"],
+            signal_config=created_deployment["signal_config"],
         ),
     )
     monkeypatch.setattr(viewer_main_module, "delete_live_deployment", lambda _deployment_id: True)
@@ -256,6 +266,8 @@ def test_live_deployments_crud_endpoints(monkeypatch):
             "account_id": account_id,
             "symbols": ["AAPL", "MSFT"],
             "timeframe": "1h",
+            "signal_source": "discord",
+            "signal_config": {"channel_id": "123", "wait_candle_close": True},
             "settings": {"risk_per_trade_pct": 0.01},
         },
     )
@@ -263,6 +275,8 @@ def test_live_deployments_crud_endpoints(monkeypatch):
     created = create_resp.json()
     assert created["id"] == deployment_id
     assert created["status"] == "ACTIVE"
+    assert created["signal_source"] == "discord"
+    assert created["signal_config"]["channel_id"] == "123"
     assert created["settings"]["risk_per_trade_pct"] == 0.01
 
     update_resp = client.put(
@@ -411,3 +425,192 @@ def test_live_stats_endpoint_uses_realized_pnl_and_balance_drawdown(monkeypatch)
     assert payload["current_equity"] == 960.0
     assert payload["max_drawdown"] == 220.0
     assert payload["max_drawdown_pct"] == 20.0
+
+
+def test_live_quote_and_positions_endpoints(monkeypatch):
+    import viewer.main as viewer_main_module
+
+    account_id = "alpaca-paper"
+    monkeypatch.setattr(viewer_main_module, "_seed_default_live_accounts", lambda: None)
+    monkeypatch.setattr(
+        viewer_main_module,
+        "get_live_account",
+        lambda _account_id: (
+            LiveAccountConfig(
+                id=account_id,
+                broker="alpaca",
+                name="Alpaca Paper",
+                broker_login="paper-login",
+            )
+            if _account_id == account_id
+            else None
+        ),
+    )
+    monkeypatch.setattr(
+        viewer_main_module,
+        "resolve_alpaca_credentials",
+        lambda **kwargs: ("api-key", "secret-key", True),
+    )
+
+    class _FakeAlpacaAdapter:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        async def get_positions(self):
+            return [
+                {
+                    "symbol": "AAPL",
+                    "qty": 2.0,
+                    "entry_price": 100.0,
+                    "current_price": 101.5,
+                    "unrealized_pnl": 3.0,
+                }
+            ]
+
+    class _FakeMarketDataService:
+        async def get_quote_payload(self, symbol: str):
+            return {
+                "symbol": symbol.upper(),
+                "latest": {
+                    "symbol": symbol.upper(),
+                    "timestamp": "2026-01-01T10:00:00+00:00",
+                    "time": 1767261600.0,
+                    "open": 100.0,
+                    "high": 101.0,
+                    "low": 99.5,
+                    "close": 100.8,
+                    "volume": 1234.0,
+                },
+                "bars": [
+                    {
+                        "symbol": symbol.upper(),
+                        "timestamp": "2026-01-01T10:00:00+00:00",
+                        "time": 1767261600.0,
+                        "open": 100.0,
+                        "high": 101.0,
+                        "low": 99.5,
+                        "close": 100.8,
+                        "volume": 1234.0,
+                    }
+                ],
+            }
+
+    monkeypatch.setattr(viewer_main_module, "AlpacaLiveAdapter", _FakeAlpacaAdapter)
+    monkeypatch.setattr(viewer_main_module, "_live_market_data_service", _FakeMarketDataService())
+
+    client = TestClient(viewer_main_module.app)
+
+    quote_resp = client.get("/api/live/quotes/AAPL")
+    assert quote_resp.status_code == 200
+    quote_payload = quote_resp.json()
+    assert quote_payload["symbol"] == "AAPL"
+    assert quote_payload["latest"]["close"] == 100.8
+
+    positions_resp = client.get(f"/api/live/positions/{account_id}")
+    assert positions_resp.status_code == 200
+    positions_payload = positions_resp.json()
+    assert positions_payload["account_id"] == account_id
+    assert positions_payload["positions"] == [
+        {
+            "symbol": "AAPL",
+            "qty": 2.0,
+            "entry_price": 100.0,
+            "current_price": 101.5,
+            "unrealized_pnl": 3.0,
+        }
+    ]
+
+
+def test_live_quote_endpoint_returns_404_when_no_data(monkeypatch):
+    import viewer.main as viewer_main_module
+
+    class _FakeMarketDataService:
+        async def get_quote_payload(self, symbol: str):
+            return {"symbol": symbol.upper(), "latest": None, "bars": []}
+
+    monkeypatch.setattr(viewer_main_module, "_live_market_data_service", _FakeMarketDataService())
+
+    client = TestClient(viewer_main_module.app)
+    response = client.get("/api/live/quotes/TSLA")
+    assert response.status_code == 404
+
+
+def test_live_signals_endpoint_returns_signal_log(monkeypatch):
+    import viewer.main as viewer_main_module
+
+    account_id = "alpaca-paper"
+    deployment_id = "55555555-5555-5555-5555-555555555555"
+    now = datetime.now(timezone.utc)
+
+    monkeypatch.setattr(viewer_main_module, "_seed_default_live_accounts", lambda: None)
+    monkeypatch.setattr(
+        viewer_main_module,
+        "list_live_deployments_for_account",
+        lambda _account_id: (
+            [
+                LiveDeploymentConfig(
+                    id=deployment_id,
+                    strategy_name="discord_scalper",
+                    account_id=account_id,
+                    symbols=["AAPL"],
+                    timeframe="1m",
+                    status="ACTIVE",
+                    signal_source="discord",
+                    signal_config={"wait_candle_close": True},
+                    settings={},
+                )
+            ]
+            if _account_id == account_id
+            else []
+        ),
+    )
+    monkeypatch.setattr(
+        viewer_main_module,
+        "_deployment_ids_for_account",
+        lambda _account_id, _deployments: [_account_id, deployment_id],
+    )
+    monkeypatch.setattr(
+        viewer_main_module,
+        "list_live_signals_for_deployments",
+        lambda _deployment_ids, limit=200: [
+            {
+                "signal_id": "sig-1",
+                "deployment_id": deployment_id,
+                "symbol": "AAPL",
+                "action": "buy",
+                "source": "discord",
+                "theoretical_price": 150.25,
+                "signal_timestamp": now,
+                "signal_metadata": {
+                    "source": "discord",
+                    "timeframe": "1m",
+                    "wait_for_candle_close": True,
+                    "discord_content": "BUY AAPL @ 150.25",
+                },
+                "execution_id": None,
+                "execution_timestamp": None,
+                "actual_price": None,
+                "filled_qty": None,
+                "commission": None,
+                "broker_order_id": None,
+            }
+        ],
+    )
+
+    client = TestClient(viewer_main_module.app)
+    response = client.get(f"/api/live/signals/{account_id}?limit=50")
+    assert response.status_code == 200
+
+    payload = response.json()
+    assert payload["account_id"] == account_id
+    assert deployment_id in payload["deployment_ids"]
+    assert len(payload["signals"]) == 1
+
+    signal = payload["signals"][0]
+    assert signal["signal_id"] == "sig-1"
+    assert signal["symbol"] == "AAPL"
+    assert signal["source"] == "discord"
+    assert signal["status"] in {"Waiting", "Pending"}
+    assert signal["waiting_for_candle_close"] is True
+    assert signal["raw_message"] == "BUY AAPL @ 150.25"
+    assert signal["execution_id"] is None

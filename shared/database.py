@@ -80,6 +80,10 @@ class BacktestRecord(SQLModel, table=True):
     data: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))
     initial_capital: float = Field(default=100_000.0)
     parameters: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))
+    tags_json: list[str] = Field(
+        default_factory=list,
+        sa_column=Column("tags", JSON, nullable=False),
+    )
     stats: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))
     notes: str = Field(default="")
     created_at: str = Field(default="", index=True)
@@ -152,6 +156,7 @@ class LiveSignalModel(SQLModel, table=True):
     action: str = Field(index=True)
     theoretical_price: float = Field(default=0.0)
     timestamp: datetime = Field(index=True)
+    source: str = Field(default="internal", index=True)
     metadata_json: dict[str, Any] = Field(
         default_factory=dict, sa_column=Column("metadata", JSON, nullable=False)
     )
@@ -165,6 +170,7 @@ class LiveSignalModel(SQLModel, table=True):
             action=signal.action,
             theoretical_price=signal.theoretical_price,
             timestamp=signal.timestamp,
+            source=str(signal.metadata.get("source", "internal")),
             metadata_json=signal.metadata,
         )
 
@@ -176,7 +182,10 @@ class LiveSignalModel(SQLModel, table=True):
             action=self.action,
             theoretical_price=self.theoretical_price,
             timestamp=self.timestamp,
-            metadata=self.metadata_json or {},
+            metadata={
+                **(self.metadata_json or {}),
+                "source": self.source or "internal",
+            },
         )
 
 
@@ -285,6 +294,11 @@ class LiveDeploymentModel(SQLModel, table=True):
     )
     timeframe: str = Field(index=True)
     status: str = Field(default="ACTIVE", index=True)
+    signal_source: str = Field(default="internal", index=True)
+    signal_config_json: dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column("signal_config", JSON, nullable=False),
+    )
     settings_json: dict[str, Any] = Field(
         default_factory=dict,
         sa_column=Column("settings", JSON, nullable=False),
@@ -302,6 +316,8 @@ class LiveDeploymentModel(SQLModel, table=True):
             symbols_json=deployment.symbols,
             timeframe=deployment.timeframe,
             status=deployment.status,
+            signal_source=deployment.signal_source,
+            signal_config_json=deployment.signal_config or {},
             settings_json=deployment.settings or {},
             created_at=now,
             updated_at=now,
@@ -315,6 +331,8 @@ class LiveDeploymentModel(SQLModel, table=True):
             symbols=self.symbols_json or [],
             timeframe=self.timeframe,
             status=self.status,
+            signal_source=self.signal_source or "internal",
+            signal_config=self.signal_config_json or {},
             settings=self.settings_json or {},
         )
 
@@ -391,6 +409,29 @@ def _migrate_schema() -> None:
                     "ADD COLUMN settings JSON NOT NULL DEFAULT '{}'"
                 )
             )
+        if "signal_source" not in deployment_column_names:
+            connection.execute(
+                text(
+                    "ALTER TABLE live_deployments "
+                    "ADD COLUMN signal_source TEXT NOT NULL DEFAULT 'internal'"
+                )
+            )
+        if "signal_config" not in deployment_column_names:
+            connection.execute(
+                text(
+                    "ALTER TABLE live_deployments "
+                    "ADD COLUMN signal_config JSON NOT NULL DEFAULT '{}'"
+                )
+            )
+
+        backtest_column_names = _table_column_names(connection, "backtests")
+        if backtest_column_names and "tags" not in backtest_column_names:
+            connection.execute(
+                text(
+                    "ALTER TABLE backtests "
+                    "ADD COLUMN tags JSON NOT NULL DEFAULT '[]'"
+                )
+            )
 
         account_column_names = _table_column_names(connection, "live_accounts")
         if "ctid" not in account_column_names:
@@ -435,6 +476,12 @@ def _migrate_schema() -> None:
                 connection.execute(text("ALTER TABLE trades ADD COLUMN risk_percent FLOAT"))
             if "exit_reason" not in trade_column_names:
                 connection.execute(text("ALTER TABLE trades ADD COLUMN exit_reason TEXT"))
+
+        live_signal_column_names = _table_column_names(connection, "live_signals")
+        if live_signal_column_names and "source" not in live_signal_column_names:
+            connection.execute(
+                text("ALTER TABLE live_signals ADD COLUMN source TEXT NOT NULL DEFAULT 'internal'")
+            )
 
 
 def save_live_signal(signal: LiveSignal) -> None:
@@ -574,8 +621,12 @@ def create_live_deployment(deployment: LiveDeploymentConfig) -> LiveDeploymentCo
         deployment_status = str(deployment.status or "ACTIVE").upper()
         if deployment_status not in {"ACTIVE", "PAUSED", "STOPPED"}:
             raise ValueError(f"Invalid deployment status '{deployment.status}'")
+        signal_source = str(deployment.signal_source or "internal").lower()
+        if signal_source not in {"internal", "discord"}:
+            raise ValueError(f"Invalid signal source '{deployment.signal_source}'")
         record = LiveDeploymentModel.from_live_deployment(deployment)
         record.status = deployment_status
+        record.signal_source = signal_source
         session.add(record)
         session.commit()
         session.refresh(record)
@@ -653,6 +704,136 @@ def list_live_signal_executions_for_deployments(
     return _serialize_live_signal_execution_rows(rows)
 
 
+def list_live_signals_for_deployments(
+    deployment_ids: list[str],
+    *,
+    limit: int = 200,
+) -> list[dict[str, Any]]:
+    normalized_ids = sorted({item.strip() for item in deployment_ids if item and item.strip()})
+    if not normalized_ids:
+        return []
+
+    try:
+        bounded_limit = max(1, min(int(limit), 1000))
+    except (TypeError, ValueError):
+        bounded_limit = 200
+
+    init_db()
+    with get_session() as session:
+        signal_rows = session.exec(
+            select(LiveSignalModel)
+            .where(LiveSignalModel.deployment_id.in_(normalized_ids))
+            .order_by(LiveSignalModel.timestamp.desc(), LiveSignalModel.id.desc())
+            .limit(bounded_limit)
+        ).all()
+        if not signal_rows:
+            return []
+
+        signal_ids = [str(row.id) for row in signal_rows]
+        execution_rows = session.exec(
+            select(LiveExecutionModel)
+            .where(LiveExecutionModel.signal_id.in_(signal_ids))
+            .order_by(LiveExecutionModel.timestamp.desc(), LiveExecutionModel.id.desc())
+        ).all()
+
+    latest_execution_by_signal: dict[str, LiveExecutionModel] = {}
+    for execution in execution_rows:
+        signal_id = str(execution.signal_id)
+        if signal_id not in latest_execution_by_signal:
+            latest_execution_by_signal[signal_id] = execution
+
+    payload: list[dict[str, Any]] = []
+    for signal in signal_rows:
+        execution = latest_execution_by_signal.get(str(signal.id))
+        payload.append(
+            {
+                "signal_id": str(signal.id),
+                "deployment_id": str(signal.deployment_id),
+                "symbol": str(signal.symbol or ""),
+                "action": str(signal.action or ""),
+                "source": str(signal.source or "internal"),
+                "theoretical_price": float(signal.theoretical_price or 0.0),
+                "signal_timestamp": signal.timestamp,
+                "signal_metadata": signal.metadata_json or {},
+                "execution_id": str(execution.id) if execution is not None else None,
+                "execution_timestamp": (
+                    execution.timestamp if execution is not None else None
+                ),
+                "actual_price": (
+                    float(execution.actual_price or 0.0) if execution is not None else None
+                ),
+                "filled_qty": (
+                    float(execution.filled_qty or 0.0) if execution is not None else None
+                ),
+                "commission": (
+                    float(execution.commission or 0.0) if execution is not None else None
+                ),
+                "broker_order_id": (
+                    str(execution.broker_order_id or "") if execution is not None else None
+                ),
+            }
+        )
+    return payload
+
+
+def list_live_signals_for_replay(
+    *,
+    deployment_ids: list[str] | None = None,
+    source: str | None = None,
+    start: datetime | None = None,
+    end: datetime | None = None,
+    limit: int = 5000,
+) -> list[dict[str, Any]]:
+    normalized_ids = sorted(
+        {str(item).strip() for item in (deployment_ids or []) if str(item).strip()}
+    )
+
+    normalized_source = str(source or "").strip().lower()
+    if normalized_source and normalized_source not in {"internal", "discord"}:
+        raise ValueError(f"Invalid signal source '{source}'")
+
+    try:
+        bounded_limit = max(1, min(int(limit), 20000))
+    except (TypeError, ValueError):
+        bounded_limit = 5000
+
+    init_db()
+    with get_session() as session:
+        statement = select(LiveSignalModel).order_by(
+            LiveSignalModel.timestamp.asc(),
+            LiveSignalModel.id.asc(),
+        )
+        if normalized_ids:
+            statement = statement.where(LiveSignalModel.deployment_id.in_(normalized_ids))
+        if normalized_source:
+            statement = statement.where(LiveSignalModel.source == normalized_source)
+        if start is not None:
+            statement = statement.where(LiveSignalModel.timestamp >= start)
+        if end is not None:
+            statement = statement.where(LiveSignalModel.timestamp <= end)
+        rows = session.exec(statement.limit(bounded_limit)).all()
+
+    payload: list[dict[str, Any]] = []
+    for row in rows:
+        metadata = dict(row.metadata_json or {})
+        payload.append(
+            {
+                "signal_id": str(row.id),
+                "deployment_id": str(row.deployment_id),
+                "symbol": str(row.symbol or "").upper(),
+                "action": str(row.action or "").lower(),
+                "source": str(row.source or "internal").lower(),
+                "timestamp": row.timestamp,
+                "entry_price": float(row.theoretical_price or 0.0),
+                "stop_loss": metadata.get("stop_loss"),
+                "take_profit": metadata.get("take_profit"),
+                "timeframe": str(metadata.get("timeframe") or ""),
+                "metadata": metadata,
+            }
+        )
+    return payload
+
+
 def _serialize_live_signal_execution_rows(rows: list[Any]) -> list[dict[str, Any]]:
     payload: list[dict[str, Any]] = []
     for signal, execution in rows:
@@ -667,6 +848,7 @@ def _serialize_live_signal_execution_rows(rows: list[Any]) -> list[dict[str, Any
                 "deployment_id": signal.deployment_id,
                 "symbol": signal.symbol,
                 "action": signal.action,
+                "source": signal.source,
                 "theoretical_price": theoretical,
                 "actual_price": actual,
                 "slippage": slippage,
@@ -743,6 +925,7 @@ def save_result_to_sqlite(result: BacktestResult) -> None:
             data=result.meta.data,
             initial_capital=result.meta.initial_capital,
             parameters=result.meta.parameters,
+            tags_json=result.meta.tags or [],
             stats=result.stats or {},
             notes=result.meta.notes,
             created_at=result.meta.created_at,
@@ -884,6 +1067,7 @@ def _backtest_metadata_payload(backtest: BacktestRecord, trade_count: int) -> di
     symbols = _as_string_list(data.get("symbols"))
     strategy_name = strategies[0] if strategies else "unknown"
     timeframe = timeframes[0] if timeframes else ""
+    tags = _as_string_list(backtest.tags_json)
 
     return {
         "id": str(backtest.id),
@@ -902,6 +1086,7 @@ def _backtest_metadata_payload(backtest: BacktestRecord, trade_count: int) -> di
         "win_rate": stats.get("win_rate"),
         "trade_count": max(int(trade_count), 0),
         "created_at": str(backtest.created_at or ""),
+        "tags": tags,
     }
 
 
@@ -921,6 +1106,7 @@ def _backtest_fingerprint_payload(backtest: BacktestRecord) -> dict[str, Any]:
         "end_date": str(backtest.backtest_end or ""),
         "engine": str(backtest.engine or "unknown"),
         "created_at": str(backtest.created_at or ""),
+        "tags": _as_string_list(backtest.tags_json),
     }
 
 
@@ -1449,6 +1635,7 @@ def load_backtest_result(backtest_id: str) -> BacktestResult | None:
         data=backtest.data or {},
         initial_capital=backtest.initial_capital,
         parameters=backtest.parameters or {},
+        tags=backtest.tags_json or [],
         notes=backtest.notes or "",
     )
 

@@ -8,9 +8,11 @@ import {
   getLiveAccounts,
   getLiveBalances,
   getLiveDeployments,
+  getLivePositions,
   getLiveStats,
   getLiveTrades,
   getStrategies,
+  runBacktestSignals,
   updateLiveDeploymentStatus,
 } from "../api/client";
 import { Modal } from "../components/Modal";
@@ -53,7 +55,18 @@ type CreateDeploymentForm = {
   account_id: string;
   symbols_input: string;
   timeframe: string;
+  signal_source: "internal" | "discord";
+  signal_channel_id: string;
+  wait_for_candle_close: boolean;
   settings_json: string;
+};
+
+type ReplayFormState = {
+  account_id: string;
+  start_date: string;
+  end_date: string;
+  timeframe: string;
+  auto_download: boolean;
 };
 
 type LiveHubAccountStats = {
@@ -61,6 +74,7 @@ type LiveHubAccountStats = {
   winRate: number;
   totalPnl: number;
   sparkline: number[];
+  openPositions: number;
 };
 
 export function LiveHubPage() {
@@ -76,14 +90,26 @@ export function LiveHubPage() {
     () => new Set(),
   );
   const [createOpenAccountId, setCreateOpenAccountId] = useState("");
+  const [replayOpenAccountId, setReplayOpenAccountId] = useState("");
   const [isCreating, setIsCreating] = useState(false);
+  const [isStartingReplay, setIsStartingReplay] = useState(false);
   const [strategiesLoading, setStrategiesLoading] = useState(false);
   const [createForm, setCreateForm] = useState<CreateDeploymentForm>({
     strategy_name: "",
     account_id: "",
     symbols_input: "",
     timeframe: DEFAULT_TIMEFRAME,
+    signal_source: "internal",
+    signal_channel_id: "",
+    wait_for_candle_close: true,
     settings_json: "{}",
+  });
+  const [replayForm, setReplayForm] = useState<ReplayFormState>({
+    account_id: "",
+    start_date: "",
+    end_date: "",
+    timeframe: DEFAULT_TIMEFRAME,
+    auto_download: true,
   });
 
   const refreshDeployments = useCallback(
@@ -98,17 +124,22 @@ export function LiveHubPage() {
         ]);
         const statsEntries = await Promise.all(
           accountPayload.map(async (account) => {
-            const [statsResult, balancesResult] = await Promise.allSettled([
+            const [statsResult, balancesResult, positionsResult] = await Promise.allSettled([
               getLiveStats(account.id),
               getLiveBalances(account.id),
+              getLivePositions(account.id),
             ]);
             const balanceSeries =
               balancesResult.status === "fulfilled" ? balancesResult.value.series : [];
+            const openPositions =
+              positionsResult.status === "fulfilled"
+                ? positionsResult.value.positions.length
+                : 0;
 
             if (statsResult.status === "fulfilled") {
               return [
                 account.id,
-                normalizeLiveHubStats(statsResult.value, balanceSeries),
+                normalizeLiveHubStats(statsResult.value, balanceSeries, openPositions),
               ] as const;
             }
 
@@ -116,12 +147,12 @@ export function LiveHubPage() {
               const tradesPayload = await getLiveTrades(account.id);
               return [
                 account.id,
-                buildLiveHubFallbackStats(balanceSeries, tradesPayload.trades),
+                buildLiveHubFallbackStats(balanceSeries, tradesPayload.trades, openPositions),
               ] as const;
             } catch {
               return [
                 account.id,
-                buildLiveHubFallbackStats(balanceSeries, []),
+                buildLiveHubFallbackStats(balanceSeries, [], openPositions),
               ] as const;
             }
           }),
@@ -316,11 +347,25 @@ export function LiveHubPage() {
 
     setIsCreating(true);
     try {
+      const signalConfig: Record<string, unknown> =
+        createForm.signal_source === "discord"
+          ? {
+              channel_id: createForm.signal_channel_id.trim(),
+              wait_candle_close: createForm.wait_for_candle_close,
+            }
+          : {};
+      if (createForm.signal_source === "discord" && !String(signalConfig.channel_id || "")) {
+        showToast("Please provide a Discord channel ID.", "warning");
+        return;
+      }
+
       await createLiveDeployment({
         strategy_name: strategyName,
         account_id: accountId,
         symbols,
         timeframe,
+        signal_source: createForm.signal_source,
+        signal_config: signalConfig,
         settings: settingsPayload,
       });
       setCreateOpenAccountId("");
@@ -329,6 +374,9 @@ export function LiveHubPage() {
         strategy_name: "",
         symbols_input: "",
         timeframe: DEFAULT_TIMEFRAME,
+        signal_source: "internal",
+        signal_channel_id: "",
+        wait_for_candle_close: true,
         settings_json: "{}",
       }));
       await refreshDeployments(true);
@@ -349,10 +397,66 @@ export function LiveHubPage() {
       account_id: accountId,
       symbols_input: "",
       timeframe: DEFAULT_TIMEFRAME,
+      signal_source: "internal",
+      signal_channel_id: "",
+      wait_for_candle_close: true,
       settings_json: "{}",
     });
     setCreateOpenAccountId(account?.id ?? accountId);
     void refreshStrategies();
+  };
+
+  const openReplayModal = (accountId: string) => {
+    const today = new Date();
+    const endDate = today.toISOString().slice(0, 10);
+    const startCandidate = new Date(today.getTime() - (30 * 24 * 60 * 60 * 1000));
+    const startDate = startCandidate.toISOString().slice(0, 10);
+    setReplayForm({
+      account_id: accountId,
+      start_date: startDate,
+      end_date: endDate,
+      timeframe: DEFAULT_TIMEFRAME,
+      auto_download: true,
+    });
+    setReplayOpenAccountId(accountId);
+  };
+
+  const handleStartSignalReplay = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const accountId = replayForm.account_id.trim();
+    if (!accountId) {
+      showToast("Please select an account for replay.", "warning");
+      return;
+    }
+    if (!replayForm.start_date || !replayForm.end_date) {
+      showToast("Please choose a start and end date.", "warning");
+      return;
+    }
+    if (replayForm.start_date > replayForm.end_date) {
+      showToast("Start date must be before end date.", "warning");
+      return;
+    }
+
+    setIsStartingReplay(true);
+    try {
+      const response = await runBacktestSignals({
+        signal_source: "discord",
+        account_id: accountId,
+        start_date: replayForm.start_date,
+        end_date: replayForm.end_date,
+        timeframe: replayForm.timeframe || DEFAULT_TIMEFRAME,
+        auto_download: replayForm.auto_download,
+      });
+      const taskId = response.task_id || response.job_id;
+      showToast(`Signal replay started (task ${taskId}).`, "success");
+      setReplayOpenAccountId("");
+      navigate("/backtests");
+    } catch (issue: unknown) {
+      const message = issue instanceof Error ? issue.message : "Failed to start signal replay";
+      showToast(message, "error");
+    } finally {
+      setIsStartingReplay(false);
+    }
   };
 
   const handleDelete = async (card: DeploymentCard, event: React.MouseEvent<HTMLButtonElement>) => {
@@ -447,6 +551,67 @@ export function LiveHubPage() {
           </label>
 
           <label style={fieldLabelStyle}>
+            Signal Source
+            <select
+              value={createForm.signal_source}
+              onChange={(event) =>
+                setCreateForm((current) => ({
+                  ...current,
+                  signal_source: event.target.value as "internal" | "discord",
+                }))
+              }
+              style={fieldInputStyle}
+              required
+            >
+              <option value="internal">Internal Strategy</option>
+              <option value="discord">Discord Signals</option>
+            </select>
+          </label>
+
+          {createForm.signal_source === "discord" ? (
+            <>
+              <label style={fieldLabelStyle}>
+                Discord Channel ID
+                <input
+                  type="text"
+                  value={createForm.signal_channel_id}
+                  onChange={(event) =>
+                    setCreateForm((current) => ({
+                      ...current,
+                      signal_channel_id: event.target.value,
+                    }))
+                  }
+                  style={fieldInputStyle}
+                  placeholder="1234567890123456789"
+                  required
+                />
+              </label>
+
+              <label
+                style={{
+                  ...fieldLabelStyle,
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: "12px",
+                }}
+              >
+                Wait for Candle Close
+                <input
+                  type="checkbox"
+                  checked={createForm.wait_for_candle_close}
+                  onChange={(event) =>
+                    setCreateForm((current) => ({
+                      ...current,
+                      wait_for_candle_close: event.target.checked,
+                    }))
+                  }
+                />
+              </label>
+            </>
+          ) : null}
+
+          <label style={fieldLabelStyle}>
             Assets / Symbols
             <SymbolInput
               value={createForm.symbols_input}
@@ -498,6 +663,128 @@ export function LiveHubPage() {
               disabled={isCreating || accounts.length === 0}
             >
               {isCreating ? "Deploying..." : "Deploy"}
+            </button>
+          </div>
+        </form>
+      </Modal>
+
+      <Modal
+        open={Boolean(replayOpenAccountId)}
+        onClose={() => setReplayOpenAccountId("")}
+        title="Backtest Signals"
+        width="520px"
+      >
+        <form onSubmit={handleStartSignalReplay} style={{ display: "grid", gap: "12px" }}>
+          <label style={fieldLabelStyle}>
+            Account
+            <select
+              value={replayForm.account_id}
+              onChange={(event) =>
+                setReplayForm((current) => ({
+                  ...current,
+                  account_id: event.target.value,
+                }))
+              }
+              style={fieldInputStyle}
+              required
+            >
+              {accounts.map((account) => (
+                <option key={account.id} value={account.id}>
+                  {accountDisplayName(account)} · {account.broker} · {account.is_demo ? "Demo" : "Live"}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: "10px" }}>
+            <label style={fieldLabelStyle}>
+              Start Date
+              <input
+                type="date"
+                value={replayForm.start_date}
+                onChange={(event) =>
+                  setReplayForm((current) => ({
+                    ...current,
+                    start_date: event.target.value,
+                  }))
+                }
+                style={fieldInputStyle}
+                required
+              />
+            </label>
+            <label style={fieldLabelStyle}>
+              End Date
+              <input
+                type="date"
+                value={replayForm.end_date}
+                onChange={(event) =>
+                  setReplayForm((current) => ({
+                    ...current,
+                    end_date: event.target.value,
+                  }))
+                }
+                style={fieldInputStyle}
+                required
+              />
+            </label>
+          </div>
+
+          <label style={fieldLabelStyle}>
+            Replay Timeframe
+            <select
+              value={replayForm.timeframe}
+              onChange={(event) =>
+                setReplayForm((current) => ({
+                  ...current,
+                  timeframe: event.target.value,
+                }))
+              }
+              style={fieldInputStyle}
+            >
+              {LIVE_TIMEFRAMES.map((tf) => (
+                <option key={tf} value={tf}>
+                  {tf}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <label
+            style={{
+              ...fieldLabelStyle,
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+            }}
+          >
+            Auto-download missing OHLCV
+            <input
+              type="checkbox"
+              checked={replayForm.auto_download}
+              onChange={(event) =>
+                setReplayForm((current) => ({
+                  ...current,
+                  auto_download: event.target.checked,
+                }))
+              }
+            />
+          </label>
+
+          <div style={{ display: "flex", justifyContent: "flex-end", gap: "8px", marginTop: "4px" }}>
+            <button
+              type="button"
+              onClick={() => setReplayOpenAccountId("")}
+              style={secondaryButtonStyle}
+              disabled={isStartingReplay}
+            >
+              Cancel
+            </button>
+            <button
+              type="submit"
+              style={primaryButtonStyle}
+              disabled={isStartingReplay}
+            >
+              {isStartingReplay ? "Starting..." : "Start Replay"}
             </button>
           </div>
         </form>
@@ -583,6 +870,7 @@ export function LiveHubPage() {
             const winRate = accountStats?.winRate ?? 0;
             const totalPnl = accountStats?.totalPnl ?? 0;
             const sparklinePoints = accountStats?.sparkline ?? [];
+            const openPositions = accountStats?.openPositions ?? 0;
             const hasNoTradeData = tradesCount === 0 && sparklinePoints.length === 0;
             const loginId = account.broker_login || account.login || null;
             const ctidId = account.ctid || null;
@@ -635,6 +923,17 @@ export function LiveHubPage() {
                       }}
                     >
                       {account.is_demo ? "Demo" : "Live"}
+                    </span>
+                    <span
+                      style={{
+                        fontSize: "0.72rem",
+                        borderRadius: "999px",
+                        padding: "3px 8px",
+                        background: "rgba(59, 130, 246, 0.18)",
+                        color: "#bfdbfe",
+                      }}
+                    >
+                      Open {openPositions}
                     </span>
                   </div>
                 </div>
@@ -725,14 +1024,30 @@ export function LiveHubPage() {
 
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                   <strong style={{ fontSize: "0.85rem" }}>Deployments</strong>
-                  <button
-                    type="button"
-                    onClick={() => openDeployModal(account.id)}
-                    style={addDeploymentBtnStyle}
-                  >
-                    <Plus size={13} />
-                    Deploy Strategy
-                  </button>
+                  <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
+                    <button
+                      type="button"
+                      onClick={() => navigate(`/live/${encodeURIComponent(account.id)}/viewer`)}
+                      style={openViewerBtnStyle}
+                    >
+                      Open Viewer
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => openReplayModal(account.id)}
+                      style={replayBtnStyle}
+                    >
+                      Backtest Signals
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => openDeployModal(account.id)}
+                      style={addDeploymentBtnStyle}
+                    >
+                      <Plus size={13} />
+                      Deploy Strategy
+                    </button>
+                  </div>
                 </div>
 
                 {accountCards.length === 0 ? (
@@ -766,6 +1081,19 @@ export function LiveHubPage() {
                         </div>
                         <div style={{ color: "var(--color-text-muted)", fontSize: "0.8rem", margin: "6px 0 8px" }}>
                           {card.timeframe} · {card.symbols.join(", ")}
+                        </div>
+                        <div style={{ color: "var(--color-text-muted)", fontSize: "0.76rem", marginBottom: "8px" }}>
+                          Source: {card.signal_source === "discord" ? "Discord Signals" : "Internal Strategy"}
+                          {(() => {
+                            if (card.signal_source !== "discord" || !card.signal_config) {
+                              return "";
+                            }
+                            const waitValue = card.signal_config["wait_candle_close"];
+                            if (typeof waitValue !== "boolean") {
+                              return "";
+                            }
+                            return ` · Wait Candle Close: ${waitValue ? "On" : "Off"}`;
+                          })()}
                         </div>
                         <div style={{ display: "flex", gap: "8px" }}>
                           <button
@@ -914,6 +1242,7 @@ function formatPercent(value: number): string {
 function normalizeLiveHubStats(
   stats: LiveAccountStats,
   balances: LiveBalanceRecord[],
+  openPositions: number,
 ): LiveHubAccountStats {
   const tradesCount = asFiniteNumber(stats.total_trades, 0);
   const winRate = toWinRatePercent(stats.win_rate);
@@ -922,6 +1251,7 @@ function normalizeLiveHubStats(
     tradesCount,
     winRate,
     totalPnl,
+    openPositions,
     sparkline: balances
       .map((item) => asFiniteNumber(item.equity, Number.NaN))
       .filter((value) => Number.isFinite(value)),
@@ -931,6 +1261,7 @@ function normalizeLiveHubStats(
 function buildLiveHubFallbackStats(
   balances: LiveBalanceRecord[],
   trades: LiveTradeSlippage[],
+  openPositions: number,
 ): LiveHubAccountStats {
   const tradesCount = trades.length;
   const realized = calculateRealizedTradeStats(trades);
@@ -943,6 +1274,7 @@ function buildLiveHubFallbackStats(
     tradesCount,
     winRate,
     totalPnl: realized.totalPnl,
+    openPositions,
     sparkline: sparklineSource.filter((value) => Number.isFinite(value)),
   };
 }
@@ -1092,6 +1424,26 @@ const addDeploymentBtnStyle: React.CSSProperties = {
   padding: "8px 12px",
   cursor: "pointer",
   fontSize: "0.84rem",
+};
+
+const openViewerBtnStyle: React.CSSProperties = {
+  border: "1px solid rgba(59, 130, 246, 0.4)",
+  background: "rgba(59, 130, 246, 0.16)",
+  color: "#bfdbfe",
+  borderRadius: "10px",
+  padding: "8px 10px",
+  fontSize: "0.82rem",
+  cursor: "pointer",
+};
+
+const replayBtnStyle: React.CSSProperties = {
+  border: "1px solid rgba(168, 85, 247, 0.45)",
+  background: "rgba(168, 85, 247, 0.16)",
+  color: "#e9d5ff",
+  borderRadius: "10px",
+  padding: "8px 10px",
+  fontSize: "0.82rem",
+  cursor: "pointer",
 };
 
 const fieldLabelStyle: React.CSSProperties = {

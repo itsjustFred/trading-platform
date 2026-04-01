@@ -6,7 +6,9 @@ import json
 import logging
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -1123,6 +1125,51 @@ def test_data_download_fallback_flag_respects_source(viewer_client, monkeypatch)
     assert captured[1]["allow_native_fallback"] is False
 
 
+def test_data_download_builds_yfinance_command_with_timeframes_and_dates(viewer_client, monkeypatch):
+    import viewer.main as viewer_app_module
+
+    captured: dict[str, object] = {}
+
+    def fake_start(task_id: str, cmd: list[str], **kwargs) -> dict:
+        captured["task_id"] = task_id
+        captured["cmd"] = cmd
+        captured.update(kwargs)
+        return {"task_id": task_id, "status": "starting"}
+
+    monkeypatch.setattr(viewer_app_module, "_start_data_task", fake_start)
+
+    resp = viewer_client.post(
+        "/api/data/download",
+        json={
+            "source": "yfinance",
+            "symbols": "AAPL,MSFT",
+            "timeframes": "1h,1d,1w",
+            "start": "2026-01-01",
+            "end": "2026-02-01",
+        },
+    )
+
+    assert resp.status_code == 200
+    cmd = captured["cmd"]
+    assert "data_tools.downloaders.yfinance_dl" in cmd
+    assert "--symbols" in cmd
+    assert "--timeframes" in cmd
+    assert "--start" in cmd
+    assert "--end" in cmd
+    assert "AAPL,MSFT" in cmd
+    assert "1h,1d,1w" in cmd
+    assert captured["source"] == "yfinance"
+    assert captured["total_items"] == 6
+
+
+def test_auto_download_source_prefers_yfinance_for_non_forex_symbols(viewer_client):
+    import viewer.main as viewer_app_module
+
+    assert viewer_app_module._auto_download_source("AAPL", "1d") == "yfinance"
+    assert viewer_app_module._auto_download_source("BTC/USD", "1h") == "dukascopy"
+    assert viewer_app_module._auto_download_source("EURUSD", "1h") == "dukascopy"
+
+
 def test_data_cache_invalidate_endpoint_returns_stats(viewer_client, monkeypatch):
     import viewer.main as viewer_app_module
 
@@ -1779,6 +1826,129 @@ def test_backtest_run_registers_task_manager_progress(viewer_client, monkeypatch
     assert "Completed - " in log_text
 
 
+def test_backtest_run_signals_registers_task_manager_progress(viewer_client, monkeypatch, tmp_path):
+    import viewer.main as viewer_app_module
+
+    replay_query_args: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        viewer_app_module,
+        "list_live_deployments",
+        lambda: [
+            SimpleNamespace(
+                id="dep-1",
+                signal_source="discord",
+                account_id="acct-1",
+            )
+        ],
+    )
+
+    def _fake_replay_query(**kwargs):
+        replay_query_args.update(kwargs)
+        return [
+            {
+                "signal_id": "sig-1",
+                "deployment_id": "dep-1",
+                "symbol": "AAPL",
+                "action": "buy",
+                "source": "discord",
+                "timestamp": datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc),
+                "entry_price": 100.0,
+                "stop_loss": 98.0,
+                "take_profit": 104.0,
+                "timeframe": "1h",
+                "metadata": {"source": "discord"},
+            }
+        ]
+
+    monkeypatch.setattr(viewer_app_module, "list_live_signals_for_replay", _fake_replay_query)
+    monkeypatch.setattr(viewer_app_module, "_ensure_backtest_data_availability", lambda **_kwargs: [])
+    monkeypatch.setattr(viewer_app_module, "_upsert_backtest_meta_cache", lambda _backtest_id: None)
+
+    monkeypatch.setattr(
+        viewer_app_module.legacy_viewer,
+        "_load_ohlcv_df",
+        lambda symbol, timeframe: pd.DataFrame(
+            {
+                "timestamp": [
+                    "2024-01-01T12:00:00+00:00",
+                    "2024-01-01T13:00:00+00:00",
+                    "2024-01-01T14:00:00+00:00",
+                ],
+                "open": [100.0, 101.0, 102.0],
+                "high": [101.0, 102.0, 103.0],
+                "low": [99.0, 100.0, 101.0],
+                "close": [100.5, 101.5, 102.5],
+                "volume": [1000, 1100, 1200],
+            }
+        ),
+    )
+
+    class _FakeSignalReplayAdapter:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+
+        def run(self, **kwargs):
+            progress_callback = kwargs.get("progress_callback")
+            if callable(progress_callback):
+                progress_callback(50.0, "halfway")
+                progress_callback(100.0, "done")
+            return BacktestResult(
+                meta=BacktestMeta(
+                    id="signal-replay-unit",
+                    created_at="2026-03-12T12:00:00Z",
+                    engine="signal-replay",
+                    strategies=["Signal Replay"],
+                    backtest_start="2024-01-01",
+                    backtest_end="2024-01-02",
+                    data={"symbols": ["AAPL"], "timeframes": ["1h"], "source": "discord"},
+                    initial_capital=100000.0,
+                    tags=["signal-replay"],
+                    notes="Signal Replay",
+                ),
+                trades=[],
+                equity_curve=[],
+            )
+
+    monkeypatch.setattr(viewer_app_module, "SignalReplayAdapter", _FakeSignalReplayAdapter)
+
+    response = viewer_client.post(
+        "/api/backtests/run-signals",
+        json={
+            "signal_source": "discord",
+            "account_id": "acct-1",
+            "start_date": "2024-01-01",
+            "end_date": "2024-01-02",
+            "timeframe": "1h",
+            "auto_download": False,
+        },
+    )
+
+    assert response.status_code == 202
+    payload = response.json()
+    assert payload["task_id"] == payload["job_id"]
+    assert payload["status"] == "queued"
+    task_id = payload["task_id"]
+
+    for _ in range(50):
+        task = viewer_app_module.DATA_TASKS[task_id]
+        if task["status"] in {"completed", "failed"}:
+            break
+        time.sleep(0.05)
+
+    task = viewer_app_module.DATA_TASKS[task_id]
+    assert task["kind"] == "backtest"
+    assert task["status"] == "completed"
+    assert task["result"]["backtest_id"] == "signal-replay-unit"
+    assert task["result"]["trade_count"] == 0
+    assert task["progress"] == 100.0
+
+    assert replay_query_args["deployment_ids"] == ["dep-1"]
+    assert replay_query_args["source"] == "discord"
+    assert replay_query_args["limit"] == 20000
+
+
 def test_thread_bound_task_log_handler_emits_without_shadowing_handle(viewer_client, tmp_path):
     import viewer.main as viewer_app_module
 
@@ -2174,6 +2344,7 @@ def test_backtests_all_returns_cached_metadata_payload(viewer_client, monkeypatc
                 "win_rate": 0.55,
                 "trade_count": 14,
                 "created_at": "2026-03-01T10:00:00Z",
+                "tags": ["baseline"],
             },
             {
                 "id": "bt-new",
@@ -2192,6 +2363,7 @@ def test_backtests_all_returns_cached_metadata_payload(viewer_client, monkeypatc
                 "win_rate": 72.5,
                 "trade_count": 33,
                 "created_at": "2026-03-09T10:00:00Z",
+                "tags": ["signal-replay", "source:discord"],
             },
         ],
     )
@@ -2220,6 +2392,7 @@ def test_backtests_all_returns_cached_metadata_payload(viewer_client, monkeypatc
     assert rows[0]["start_date"] == "2024-07-01"
     assert rows[0]["end_date"] == "2024-12-31"
     assert rows[0]["created_at"] == "2026-03-09T10:00:00Z"
+    assert rows[0]["tags"] == ["signal-replay", "source:discord"]
 
 
 def test_backtests_all_can_include_equity_preview(viewer_client, monkeypatch):

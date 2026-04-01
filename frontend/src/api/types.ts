@@ -52,6 +52,32 @@ export interface RunBacktestStatusResponse {
   error: unknown;
 }
 
+export interface SignalReplayInput {
+  timestamp: string;
+  symbol: string;
+  action: "buy" | "sell" | "long" | "short";
+  entry_price: number;
+  stop_loss?: number;
+  take_profit?: number;
+  timeframe?: string;
+  source?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface RunBacktestSignalsRequest {
+  signals?: SignalReplayInput[];
+  signal_source?: LiveSignalSource;
+  account_id?: string;
+  start_date: string;
+  end_date: string;
+  timeframe?: string;
+  capital?: number;
+  risk_per_trade_pct?: number;
+  max_position_pct?: number;
+  max_positions?: number;
+  auto_download?: boolean;
+}
+
 export interface BacktestSummary {
   id: string;
   title: string;
@@ -362,6 +388,7 @@ export interface LiveAccount {
 }
 
 export type LiveDeploymentStatus = "ACTIVE" | "PAUSED" | "STOPPED";
+export type LiveSignalSource = "internal" | "discord";
 
 export interface LiveDeploymentConfig {
   id: string;
@@ -370,6 +397,8 @@ export interface LiveDeploymentConfig {
   symbols: string[];
   timeframe: string;
   status: LiveDeploymentStatus;
+  signal_source: LiveSignalSource;
+  signal_config: Record<string, unknown>;
   settings: Record<string, unknown>;
 }
 
@@ -378,6 +407,8 @@ export interface LiveDeploymentCreateRequest {
   account_id: string;
   symbols: string[];
   timeframe: string;
+  signal_source?: LiveSignalSource;
+  signal_config?: Record<string, unknown>;
   settings?: Record<string, unknown>;
 }
 
@@ -446,6 +477,68 @@ export interface LiveTradesResponse {
   trades: LiveTradeSlippage[];
 }
 
+export interface LiveQuoteBar {
+  symbol: string;
+  timestamp: string;
+  time: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+}
+
+export type LiveQuote = LiveQuoteBar;
+
+export interface LiveQuoteResponse {
+  symbol: string;
+  latest: LiveQuoteBar | null;
+  bars: LiveQuoteBar[];
+}
+
+export interface LivePosition {
+  symbol: string;
+  qty: number;
+  entry_price: number;
+  current_price: number;
+  unrealized_pnl: number;
+}
+
+export interface LivePositionsResponse {
+  account_id: string;
+  positions: LivePosition[];
+}
+
+export type LiveSignalStatus = "Pending" | "Waiting" | "Executed" | "Filled" | "Failed";
+
+export interface LiveSignalLog {
+  signal_id: string;
+  deployment_id: string;
+  symbol: string;
+  action: string;
+  status: LiveSignalStatus;
+  source: string;
+  signal_timestamp: string;
+  signal_time: number;
+  execution_timestamp: string;
+  execution_time: number;
+  theoretical_price: number;
+  actual_price: number | null;
+  filled_qty: number | null;
+  commission: number | null;
+  broker_order_id: string | null;
+  signal_metadata: Record<string, unknown>;
+  raw_message: string | null;
+  waiting_for_candle_close: boolean;
+  waiting_countdown_seconds: number | null;
+}
+
+export interface LiveSignalLogResponse {
+  account_id: string;
+  deployment_ids: string[];
+  signals: LiveSignalLog[];
+}
+
 export interface BacktestListItem {
   id: string;
   title?: string;
@@ -489,6 +582,7 @@ export interface BacktestMetadataItem {
   start_date: string;
   end_date: string;
   created_at: string;
+  tags?: string[];
   equity_preview?: number[];
 }
 

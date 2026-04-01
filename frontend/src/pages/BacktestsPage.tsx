@@ -158,6 +158,7 @@ function cloneRows(rows: BacktestCardModel[]): BacktestCardModel[] {
   return rows.map((row) => ({
     ...row,
     symbols: Array.isArray(row.symbols) ? [...row.symbols] : [],
+    tags: Array.isArray(row.tags) ? [...row.tags] : [],
     equity_preview: Array.isArray(row.equity_preview) ? [...row.equity_preview] : [],
   }));
 }
@@ -166,6 +167,7 @@ function normalizeBacktestRow(row: BacktestMetadataItem & { equity_preview?: num
   return {
     ...row,
     symbols: Array.isArray(row.symbols) ? row.symbols : [],
+    tags: Array.isArray(row.tags) ? row.tags : [],
     equity_preview: Array.isArray(row.equity_preview)
       ? row.equity_preview.filter((value) => Number.isFinite(value)).map((value) => Number(value))
       : [],
@@ -999,6 +1001,33 @@ export function BacktestsPage() {
                   >
                     Created: {formatPeriodDate(item.created_at)}
                   </div>
+                  {Array.isArray(item.tags) && item.tags.length > 0 ? (
+                    <div
+                      style={{
+                        marginTop: "6px",
+                        display: "flex",
+                        gap: "5px",
+                        flexWrap: "wrap",
+                      }}
+                    >
+                      {item.tags.slice(0, 4).map((tag) => (
+                        <span
+                          key={`${item.id}-${tag}`}
+                          style={{
+                            borderRadius: "999px",
+                            border: "1px solid rgba(167, 139, 250, 0.45)",
+                            background: "rgba(91, 33, 182, 0.24)",
+                            color: "#ddd6fe",
+                            padding: "2px 8px",
+                            fontSize: "0.66rem",
+                            fontFamily: NUMERIC_FONT,
+                          }}
+                        >
+                          {tag}
+                        </span>
+                      ))}
+                    </div>
+                  ) : null}
                 </div>
 
                 <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: "8px" }}>
