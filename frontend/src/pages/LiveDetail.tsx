@@ -173,6 +173,67 @@ export function LiveDetailPage() {
       render: (row: LiveTradeSlippage) => row.filled_qty.toFixed(4),
     },
     {
+      key: "position_size",
+      label: "Size",
+      align: "right" as const,
+      render: (row: LiveTradeSlippage) => {
+        const directSize = row.position_size;
+        const metadataSize = Number(
+          (row.signal_metadata as Record<string, unknown>)?.qty ??
+            (row.signal_metadata as Record<string, unknown>)?.position_size ??
+            NaN,
+        );
+        const size =
+          directSize != null && Number.isFinite(directSize) ? directSize : metadataSize;
+        return Number.isFinite(size)
+          ? size.toLocaleString("en-US", {
+              minimumFractionDigits: 2,
+              maximumFractionDigits: 4,
+            })
+          : "N/A";
+      },
+    },
+    {
+      key: "risk_amount",
+      label: "Risk $",
+      align: "right" as const,
+      render: (row: LiveTradeSlippage) => {
+        const directRisk = row.risk_amount;
+        const metadataRisk = Number(
+          (row.signal_metadata as Record<string, unknown>)?.risk_amount ?? NaN,
+        );
+        const value =
+          directRisk != null && Number.isFinite(directRisk) ? directRisk : metadataRisk;
+        return Number.isFinite(value)
+          ? `$${value.toLocaleString("en-US", {
+              minimumFractionDigits: 2,
+              maximumFractionDigits: 2,
+            })}`
+          : "N/A";
+      },
+    },
+    {
+      key: "risk_percent",
+      label: "Risk %",
+      align: "right" as const,
+      render: (row: LiveTradeSlippage) => {
+        const directPercent = row.risk_percent;
+        const metadataPercent = Number(
+          (row.signal_metadata as Record<string, unknown>)?.risk_percent ?? NaN,
+        );
+        const value =
+          directPercent != null && Number.isFinite(directPercent)
+            ? directPercent
+            : metadataPercent;
+        return Number.isFinite(value)
+          ? `${(value * 100).toLocaleString("en-US", {
+              minimumFractionDigits: 2,
+              maximumFractionDigits: 2,
+            })}%`
+          : "N/A";
+      },
+    },
+    {
       key: "execution_timestamp",
       label: "Fill Time",
       align: "center" as const,

@@ -90,7 +90,7 @@ WINDOW_DAYS_BY_BASE_TF: dict[str, int] = {
     "tick": 1,
     "1m": 31,
     "1h": 365,
-    "1d": 3650,
+    "1d": 1,
 }
 
 BAR_INTERVAL_MS: dict[str, int] = {

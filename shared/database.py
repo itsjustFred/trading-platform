@@ -96,6 +96,9 @@ class TradeRecord(SQLModel, table=True):
     entry_time: str = Field(default="", index=True)
     entry_price: float = Field(default=0.0)
     quantity: float = Field(default=0.0)
+    position_size: float | None = Field(default=None)
+    risk_amount: float | None = Field(default=None)
+    risk_percent: float | None = Field(default=None)
     exits: list[dict[str, Any]] = Field(
         default_factory=list, sa_column=Column(JSON, nullable=False)
     )
@@ -422,6 +425,17 @@ def _migrate_schema() -> None:
                     text("ALTER TABLE background_tasks ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''")
                 )
 
+        trade_column_names = _table_column_names(connection, "trades")
+        if trade_column_names:
+            if "position_size" not in trade_column_names:
+                connection.execute(text("ALTER TABLE trades ADD COLUMN position_size FLOAT"))
+            if "risk_amount" not in trade_column_names:
+                connection.execute(text("ALTER TABLE trades ADD COLUMN risk_amount FLOAT"))
+            if "risk_percent" not in trade_column_names:
+                connection.execute(text("ALTER TABLE trades ADD COLUMN risk_percent FLOAT"))
+            if "exit_reason" not in trade_column_names:
+                connection.execute(text("ALTER TABLE trades ADD COLUMN exit_reason TEXT"))
+
 
 def save_live_signal(signal: LiveSignal) -> None:
     init_db()
@@ -736,7 +750,9 @@ def save_result_to_sqlite(result: BacktestResult) -> None:
         session.merge(backtest_record)
 
         for trade in result.trades:
-            exit_reason = trade.exits[-1].reason if trade.exits else None
+            exit_reason = trade.exit_reason
+            if exit_reason is None and trade.exits:
+                exit_reason = trade.exits[-1].reason
             session.add(
                 TradeRecord(
                     backtest_id=backtest_id,
@@ -746,6 +762,9 @@ def save_result_to_sqlite(result: BacktestResult) -> None:
                     entry_time=trade.entry_time,
                     entry_price=trade.entry_price,
                     quantity=trade.quantity,
+                    position_size=trade.position_size,
+                    risk_amount=trade.risk_amount,
+                    risk_percent=trade.risk_percent,
                     exits=[exit_item.to_dict() for exit_item in trade.exits],
                     pnl=trade.pnl,
                     pnl_pct=trade.pnl_pct,
@@ -1371,6 +1390,22 @@ def load_backtest_result(backtest_id: str) -> BacktestResult | None:
             continue
         exits_payload = row.exits or []
         exits = [TradeExit.from_dict(item) for item in exits_payload]
+        position_size = row.position_size
+        risk_amount = row.risk_amount
+        risk_percent = row.risk_percent
+        if isinstance(row.meta, dict):
+            risk_math = row.meta.get("risk_math")
+            if isinstance(risk_math, dict):
+                if position_size is None:
+                    position_size = risk_math.get("position_size")
+                if risk_amount is None:
+                    risk_amount = risk_math.get("risk_target_usd")
+                if risk_percent is None:
+                    risk_percent = risk_math.get("risk_target_pct")
+                    if risk_percent is None:
+                        max_position_pct = risk_math.get("max_position_pct")
+                        if max_position_pct is not None:
+                            risk_percent = max_position_pct
         trades.append(
             Trade(
                 id=row.trade_nr,
@@ -1381,6 +1416,10 @@ def load_backtest_result(backtest_id: str) -> BacktestResult | None:
                 quantity=row.quantity,
                 exits=exits,
                 pnl=row.pnl,
+                position_size=position_size,
+                risk_amount=risk_amount,
+                risk_percent=risk_percent,
+                exit_reason=row.exit_reason,
                 pnl_pct=row.pnl_pct,
                 fees=row.fees,
                 net_pnl=row.net_pnl,

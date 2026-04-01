@@ -1,6 +1,7 @@
 import { useState, useEffect, useMemo } from "react";
 import { Modal } from "./Modal";
 import {
+  getDataCheck,
   runBacktest,
 } from "../api/client";
 import { SymbolInput } from "./SymbolInput";
@@ -61,6 +62,8 @@ export function CreateBacktestModal({
   const [parameterTypes, setParameterTypes] = useState<Record<string, "number" | "string">>({});
   const [running, setRunning] = useState(false);
   const [error, setError] = useState("");
+  const [checkingDataAvailability, setCheckingDataAvailability] = useState(false);
+  const [dataAvailabilityWarning, setDataAvailabilityWarning] = useState("");
   const strategyDetailQuery = useStrategyDetail(strategy, { enabled: open && Boolean(strategy) });
 
   useEffect(() => {
@@ -120,20 +123,76 @@ export function CreateBacktestModal({
   }, [timeframe]);
 
   const modelingTimeframes = useMemo(() => getModelingTimeframes(timeframe), [timeframe]);
+  const symbolList = useMemo(
+    () =>
+      symbols
+        .split(",")
+        .map((symbolValue) => symbolValue.trim().toUpperCase())
+        .filter(Boolean),
+    [symbols],
+  );
+
+  useEffect(() => {
+    if (!open) {
+      setDataAvailabilityWarning("");
+      setCheckingDataAvailability(false);
+      return;
+    }
+
+    if (!symbolList.length || !timeframe) {
+      setDataAvailabilityWarning("");
+      setCheckingDataAvailability(false);
+      return;
+    }
+
+    let cancelled = false;
+    setCheckingDataAvailability(true);
+    const runCheck = async () => {
+      try {
+        const results = await Promise.all(
+          symbolList.map(async (symbolValue) => ({
+            symbol: symbolValue,
+            ...(await getDataCheck(symbolValue, timeframe, start, end)),
+          })),
+        );
+        if (cancelled) {
+          return;
+        }
+        const missingSymbols = results.filter((entry) => !entry.available).map((entry) => entry.symbol);
+        if (missingSymbols.length > 0) {
+          const preview = missingSymbols.slice(0, 3).join(", ");
+          const suffix = missingSymbols.length > 3 ? `, +${missingSymbols.length - 3} more` : "";
+          setDataAvailabilityWarning(
+            `Data not available, will be downloaded (~2min) — ${preview}${suffix}`,
+          );
+        } else {
+          setDataAvailabilityWarning("");
+        }
+      } catch {
+        if (!cancelled) {
+          setDataAvailabilityWarning("");
+        }
+      } finally {
+        if (!cancelled) {
+          setCheckingDataAvailability(false);
+        }
+      }
+    };
+
+    void runCheck();
+    return () => {
+      cancelled = true;
+    };
+  }, [open, symbolList, timeframe, start, end]);
 
   const handleRun = async () => {
-    if (!strategy || !symbols.trim()) {
+    if (!strategy || symbolList.length === 0) {
       return;
     }
     setRunning(true);
     setError("");
 
     try {
-      const symbolList = symbols
-        .split(",")
-        .map((s) => s.trim())
-        .filter(Boolean);
-
       const parameterPayload: Record<string, number | string> = {};
       for (const [key, rawValue] of Object.entries(strategyParameters)) {
         if (parameterTypes[key] === "number") {
@@ -310,6 +369,31 @@ export function CreateBacktestModal({
         >
           Leave empty to use full available history
         </div>
+        {checkingDataAvailability && (
+          <div
+            style={{
+              fontSize: "0.74rem",
+              color: "var(--color-text-muted)",
+              marginTop: "-6px",
+            }}
+          >
+            Checking data availability...
+          </div>
+        )}
+        {dataAvailabilityWarning && (
+          <div
+            style={{
+              padding: "8px 12px",
+              borderRadius: "6px",
+              background: "rgba(251, 191, 36, 0.12)",
+              border: "1px solid rgba(251, 191, 36, 0.3)",
+              color: "#fbbf24",
+              fontSize: "0.78rem",
+            }}
+          >
+            {dataAvailabilityWarning}
+          </div>
+        )}
 
         {/* Capital */}
         <div>
@@ -463,14 +547,14 @@ export function CreateBacktestModal({
         {/* Run button */}
         <button
           onClick={handleRun}
-          disabled={running || !strategy || !symbols.trim()}
+          disabled={running || !strategy || symbolList.length === 0}
           style={{
             display: "flex",
             alignItems: "center",
             justifyContent: "center",
             gap: "6px",
             background:
-              running || !strategy || !symbols.trim() ? "#333" : "#58a6ff",
+              running || !strategy || symbolList.length === 0 ? "#333" : "#58a6ff",
             color: "#fff",
             border: "none",
             borderRadius: "6px",

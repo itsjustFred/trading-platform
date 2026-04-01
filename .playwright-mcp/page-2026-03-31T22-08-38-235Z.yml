@@ -1,0 +1,103 @@
+- generic [ref=e3]:
+  - complementary [ref=e4]:
+    - button "Collapse" [ref=e5]:
+      - img [ref=e6]
+    - navigation [ref=e10]:
+      - link "Strategies" [ref=e11] [cursor=pointer]:
+        - /url: /strategies
+        - img [ref=e12]
+        - generic [ref=e15]: Strategies
+      - link "Backtests" [ref=e16] [cursor=pointer]:
+        - /url: /backtests
+        - img [ref=e17]
+        - generic [ref=e22]: Backtests
+      - link "Optimizations" [ref=e23] [cursor=pointer]:
+        - /url: /optimizations
+        - img [ref=e24]
+        - generic [ref=e28]: Optimizations
+      - link "Live Hub" [ref=e29] [cursor=pointer]:
+        - /url: /live
+        - img [ref=e30]
+        - generic [ref=e36]: Live Hub
+      - link "Portfolio" [ref=e37] [cursor=pointer]:
+        - /url: /portfolios
+        - img [ref=e38]
+        - generic [ref=e41]: Portfolio
+      - link "Strategy Lab" [ref=e42] [cursor=pointer]:
+        - /url: /lab
+        - img [ref=e43]
+        - generic [ref=e50]: Strategy Lab
+      - link "Data" [ref=e51] [cursor=pointer]:
+        - /url: /data
+        - img [ref=e52]
+        - generic [ref=e56]: Data
+      - link "Task Hub" [ref=e57] [cursor=pointer]:
+        - /url: /tasks
+        - img [ref=e58]
+        - generic [ref=e60]: Task Hub
+      - link "Logging" [ref=e61] [cursor=pointer]:
+        - /url: /logging
+        - img [ref=e62]
+        - generic [ref=e67]: Logging
+      - generic "Coming soon" [ref=e68]:
+        - img [ref=e69]
+        - generic [ref=e74]: Accounts
+  - main [ref=e75]:
+    - link "Task Hub 0 running · 0 total Open" [ref=e79] [cursor=pointer]:
+      - /url: /tasks
+      - generic [ref=e80]:
+        - img [ref=e82]
+        - generic [ref=e84]:
+          - generic [ref=e85]: Task Hub
+          - generic [ref=e86]: 0 running · 0 total
+      - generic [ref=e87]: Open
+    - generic [ref=e88]:
+      - generic [ref=e89]:
+        - generic [ref=e90]:
+          - generic [ref=e91]:
+            - heading "Backtests" [level=1] [ref=e92]
+            - generic [ref=e93]: Card layout with equity previews · one metadata request · fully client-side filtering
+          - button "New Backtest" [ref=e94] [cursor=pointer]:
+            - img [ref=e95]
+            - text: New Backtest
+        - generic [ref=e99]:
+          - generic [ref=e100]:
+            - img [ref=e101]
+            - textbox "Search strategy, symbol, id..." [ref=e104]
+          - button "Filters" [ref=e105] [cursor=pointer]:
+            - img [ref=e106]
+            - text: Filters
+          - generic [ref=e108]:
+            - img [ref=e109]
+            - combobox [ref=e114]:
+              - option "Created" [selected]
+              - option "Total Return"
+              - option "Sharpe"
+              - option "PSR"
+              - option "p-Value"
+              - option "CAGR"
+              - option "Max Drawdown"
+              - option "Win Rate"
+              - option "Trades"
+        - generic [ref=e115]:
+          - generic [ref=e116]: 0 results · 0 total backtests
+          - generic [ref=e117]:
+            - button "Desc" [ref=e118] [cursor=pointer]:
+              - img [ref=e119]
+              - text: Desc
+            - generic [ref=e124]:
+              - checkbox "Select All (visible)" [ref=e125] [cursor=pointer]
+              - text: Select All (visible)
+      - generic [ref=e126]: Loading backtests...
+      - generic [ref=e127]:
+        - generic [ref=e128]: Page 1 of 1
+        - generic [ref=e129]:
+          - generic [ref=e130]:
+            - text: Per Page
+            - combobox "Per Page" [ref=e131]:
+              - option "12"
+              - option "24" [selected]
+              - option "48"
+          - button "<" [disabled] [ref=e132]
+          - button "1" [ref=e133] [cursor=pointer]
+          - button ">" [disabled] [ref=e134]

@@ -11,6 +11,7 @@ import type {
   DataTaskStartResponse,
   DataTaskStatusResponse,
   DataCacheInvalidationResponse,
+  DataCheckResponse,
   DukascopyGenesisResponse,
   LiveAccount,
   LiveAccountStats,
@@ -326,6 +327,20 @@ export const downloadData = (data: DataDownloadRequest) =>
     method: "POST",
     body: JSON.stringify(data),
   });
+export const getDataCheck = (
+  symbol: string,
+  timeframe: string,
+  start: string,
+  end: string,
+) => {
+  const params = new URLSearchParams({
+    symbol,
+    timeframe,
+    start,
+    end,
+  });
+  return fetchJSON<DataCheckResponse>(`/data/check?${params.toString()}`);
+};
 export const resampleData = (data: DataResampleRequest) =>
   fetchJSON<DataTaskStartResponse>("/data/resample", {
     method: "POST",

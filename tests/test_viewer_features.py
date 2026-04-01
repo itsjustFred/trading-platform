@@ -108,6 +108,44 @@ def test_get_dukascopy_genesis_returns_missing_timeframes_as_unavailable(
     assert coverage["m1"] == {"available": False, "start": None}
 
 
+def test_data_check_endpoint_reports_availability_from_catalog(viewer_client, monkeypatch):
+    import viewer.main as viewer_app_module
+
+    monkeypatch.setattr(
+        viewer_app_module,
+        "_cached_catalog_ohlcv_entries",
+        lambda: [
+            {
+                "symbol": "AAPL",
+                "timeframe": "1d",
+                "start": "2024-01-01",
+                "end": "2024-12-31",
+                "path": "/tmp/aapl.parquet",
+                "source": "test",
+                "size_bytes": 1,
+            }
+        ],
+    )
+
+    ok_resp = viewer_client.get(
+        "/api/data/check?symbol=AAPL&timeframe=1d&start=2024-03-01&end=2024-06-01"
+    )
+    assert ok_resp.status_code == 200
+    assert ok_resp.json() == {"available": True, "missing_range": None}
+
+    missing_resp = viewer_client.get(
+        "/api/data/check?symbol=AAPL&timeframe=1d&start=2023-12-01&end=2024-02-01"
+    )
+    assert missing_resp.status_code == 200
+    missing_payload = missing_resp.json()
+    assert missing_payload["available"] is False
+    assert missing_payload["missing_range"] == {"start": "2023-12-01", "end": "2024-01-01"}
+
+    bad_resp = viewer_client.get("/api/data/check?timeframe=1d")
+    assert bad_resp.status_code == 400
+    assert bad_resp.json()["detail"] == "symbol is required"
+
+
 def test_viewer_app_enables_gzip_middleware(viewer_client):
     import viewer.main as viewer_app_module
 
@@ -323,6 +361,117 @@ def test_backtest_replay_endpoint_returns_full_chart_payload(viewer_client, tmp_
     supertrend = next(ind for ind in payload["indicators"] if ind["name"] == "supertrend_up")
     assert supertrend["data"][0]["value"] is None
     assert payload["drawings"][0]["type"] == "line_with_breaks"
+
+
+def test_backtest_replay_endpoint_limits_ohlcv_to_trade_windows(viewer_client, tmp_path):
+    backtests_dir = tmp_path / "backtests"
+    ohlcv_dir = tmp_path / "ohlcv" / "test_source" / "equities" / "AAPL"
+    backtests_dir.mkdir(parents=True, exist_ok=True)
+    ohlcv_dir.mkdir(parents=True, exist_ok=True)
+
+    df = pd.DataFrame({
+        "timestamp": pd.date_range("2021-01-01T00:00:00Z", periods=16050, freq="h", tz="UTC"),
+        "open": [100 + (idx * 0.01) for idx in range(16050)],
+        "high": [101 + (idx * 0.01) for idx in range(16050)],
+        "low": [99 + (idx * 0.01) for idx in range(16050)],
+        "close": [100.5 + (idx * 0.01) for idx in range(16050)],
+        "volume": [1000 + (idx % 100) for idx in range(16050)],
+    })
+    df.to_parquet(ohlcv_dir / "1h.parquet", index=False)
+
+    first_entry = df["timestamp"].iloc[120]
+    first_exit = df["timestamp"].iloc[160]
+    second_entry = df["timestamp"].iloc[-220]
+    second_exit = df["timestamp"].iloc[-180]
+    midpoint = df["timestamp"].iloc[len(df) // 2]
+
+    result = BacktestResult(
+        meta=BacktestMeta(
+            id="replay-window-demo",
+            created_at="2026-03-07T15:00:00Z",
+            engine="vectorbt",
+            strategies=["Replay Window Demo"],
+            backtest_start="2021-01-01",
+            backtest_end="2024-12-31",
+            initial_capital=100000.0,
+            data={
+                "timeframes": ["1h"],
+                "symbols": ["AAPL"],
+                "universe": "",
+                "source": "test_source",
+            },
+        ),
+        trades=[
+            Trade(
+                id=1,
+                symbol="AAPL",
+                direction="LONG",
+                entry_time=first_entry.isoformat(),
+                entry_price=101.5,
+                quantity=1,
+                exits=[
+                    TradeExit(
+                        time=first_exit.isoformat(),
+                        price=104.5,
+                        quantity=1,
+                        pnl=3.0,
+                    )
+                ],
+                pnl=3.0,
+            ),
+            Trade(
+                id=2,
+                symbol="AAPL",
+                direction="LONG",
+                entry_time=second_entry.isoformat(),
+                entry_price=201.5,
+                quantity=1,
+                exits=[
+                    TradeExit(
+                        time=second_exit.isoformat(),
+                        price=204.5,
+                        quantity=1,
+                        pnl=3.0,
+                    )
+                ],
+                pnl=3.0,
+            ),
+        ],
+        indicators=[
+            IndicatorSeries(
+                name="window_indicator",
+                type="overlay",
+                data=[
+                    {"time": first_entry.isoformat(), "value": 100.0},
+                    {"time": midpoint.isoformat(), "value": 150.0},
+                    {"time": second_entry.isoformat(), "value": 200.0},
+                ],
+                style={"color": "#22c55e"},
+            )
+        ],
+    )
+    result.save(backtests_dir / "replay-window-demo.trades.json")
+
+    resp = viewer_client.get("/api/backtest/replay-window-demo/replay")
+
+    assert resp.status_code == 200
+    payload = resp.json()
+    bars = payload["ohlcv_by_symbol"]["AAPL"]
+    bar_times = {round(float(bar["time"]), 6) for bar in bars}
+    first_entry_unix = round(pd.Timestamp(first_entry).timestamp(), 6)
+    second_entry_unix = round(pd.Timestamp(second_entry).timestamp(), 6)
+    midpoint_unix = round(pd.Timestamp(midpoint).timestamp(), 6)
+
+    assert len(bars) < 5000
+    assert first_entry_unix in bar_times
+    assert second_entry_unix in bar_times
+    assert midpoint_unix not in bar_times
+
+    indicator = next(ind for ind in payload["indicators"] if ind["name"] == "window_indicator")
+    indicator_times = {round(float(point["time"]), 6) for point in indicator["data"]}
+    assert first_entry_unix in indicator_times
+    assert second_entry_unix in indicator_times
+    assert midpoint_unix not in indicator_times
 
 
 def test_data_overview_and_category_use_catalog_date_ranges(viewer_client, tmp_path):
@@ -1538,6 +1687,7 @@ def test_backtest_run_registers_task_manager_progress(viewer_client, monkeypatch
     expected_output.parent.mkdir(parents=True, exist_ok=True)
 
     monkeypatch.setattr(viewer_app_module, "_dolthub_pull", lambda: None)
+    monkeypatch.setattr(viewer_app_module, "_ensure_backtest_data_availability", lambda **kwargs: [])
 
     class _FakeProc:
         def __init__(self, lines: list[str]):
@@ -1621,8 +1771,9 @@ def test_backtest_run_registers_task_manager_progress(viewer_client, monkeypatch
 
     log_text = Path(task["log_file"]).read_text(encoding="utf-8")
     assert "Loading market data..." in log_text
-    assert "Running strategy demo_strategy..." in log_text
-    assert "Running strategy: 2500/10000 bars (25%)" in log_text
+    assert "Running backtest... 45%" in log_text
+    assert "Running backtest... 58%" in log_text
+    assert "Running backtest... " in log_text
     assert "Processing trades..." in log_text
     assert "Saving results..." in log_text
     assert "Completed - " in log_text

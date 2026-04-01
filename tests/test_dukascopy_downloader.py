@@ -36,6 +36,7 @@ def test_native_downloader_accepts_control_events_and_reports_progress(
         batch_size=None,
         pause_ms=1000,
         report_progress=None,
+        progress_unit="files",
         stop_event=None,
         pause_event=None,
         log_callback=None,
@@ -45,6 +46,7 @@ def test_native_downloader_accepts_control_events_and_reports_progress(
         seen["pause_event"] = pause_event
         seen["batch_size"] = batch_size
         seen["pause_ms"] = pause_ms
+        seen["progress_unit"] = progress_unit
         if report_progress is not None:
             report_progress(50.0, "Halfway there")
         return [(urls[0][0], b"placeholder")]
@@ -85,6 +87,7 @@ def test_native_downloader_accepts_control_events_and_reports_progress(
     assert seen["stop_event"] is stop_event
     assert seen["batch_size"] == 10
     assert seen["pause_ms"] == 1000
+    assert seen["progress_unit"] == "days"
     assert any(pct == 0.0 for pct, _ in progress_updates)
     assert any("Halfway there" in msg for _, msg in progress_updates)
     assert progress_updates[-1][0] == 100.0
@@ -172,6 +175,74 @@ def test_download_bi5_files_batches_and_increases_pause_on_throttle(monkeypatch)
     ]
     assert sleep_calls == [2.0]
     assert any("increasing pause to 2000 ms" in line for line in log_lines)
+
+
+def test_download_bi5_files_reports_custom_progress_unit(monkeypatch):
+    import data_tools.downloaders.dukascopy_native as native
+
+    class FakeConnector:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+
+    class FakeTimeout:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+
+    class FakeClientSession:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    fake_aiohttp = types.SimpleNamespace(
+        TCPConnector=FakeConnector,
+        ClientTimeout=FakeTimeout,
+        ClientSession=FakeClientSession,
+    )
+    monkeypatch.setitem(sys.modules, "aiohttp", fake_aiohttp)
+
+    async def fake_fetch_one(
+        session,
+        dt,
+        url,
+        semaphore,
+        max_retries=3,
+        *,
+        pause_event=None,
+        stop_event=None,
+    ):
+        del session, semaphore, max_retries, pause_event, stop_event
+        return native.FetchResult(dt=dt, data=url.encode("utf-8"))
+
+    async def fake_sleep_with_control(delay_seconds, pause_event, stop_event):
+        del delay_seconds, pause_event, stop_event
+        return None
+
+    monkeypatch.setattr(native, "_fetch_one", fake_fetch_one)
+    monkeypatch.setattr(native, "_sleep_with_control", fake_sleep_with_control)
+
+    start = pd.Timestamp("2024-01-01T00:00:00Z").to_pydatetime()
+    urls = [(start, "u1"), (start, "u2")]
+    updates: list[tuple[float, str]] = []
+
+    native.asyncio.run(
+        native.download_bi5_files(
+            urls,
+            batch_size=2,
+            pause_ms=0,
+            progress_unit="days",
+            report_progress=lambda pct, msg: updates.append((pct, msg)),
+        )
+    )
+
+    assert updates[-1] == (100.0, "Downloaded 2/2 days")
 
 
 def test_download_bi5_files_caps_backoff_and_resets_after_cooldown(monkeypatch):
@@ -317,3 +388,9 @@ def test_jforex_normalize_timeframe_aliases():
     assert jforex._normalize_timeframe("h1") == "1h"
     assert jforex._normalize_timeframe("d1") == "1d"
     assert jforex._normalize_timeframe("1h") == "1h"
+
+
+def test_jforex_daily_window_equals_one_day():
+    import data_tools.downloaders.jforex_dl as jforex
+
+    assert jforex.WINDOW_DAYS_BY_BASE_TF["1d"] == 1

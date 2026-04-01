@@ -16,8 +16,9 @@ import uuid
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
+import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 from dotenv import load_dotenv
@@ -102,6 +103,7 @@ from shared.strategy_registry import (
     iter_strategy_files,
     load_strategy_meta,
     matches_strategy_identifier,
+    strategy_identifier_aliases,
     strategy_documentation_path,
     strategy_relative_file,
     strategy_slug_for_path,
@@ -121,6 +123,10 @@ OPTIMIZATIONS_DIR = legacy_viewer.OPTIMIZATIONS_DIR
 ALL_LOGS_NAME = legacy_viewer.ALL_LOGS_NAME
 BARS_BEFORE = legacy_viewer.BARS_BEFORE
 BARS_AFTER = legacy_viewer.BARS_AFTER
+REPLAY_MAX_BARS_WITHOUT_TRADES = 15_000
+REPLAY_TARGET_BARS = 50_000
+REPLAY_MIN_BARS_PER_EVENT = 4
+REPLAY_MAX_BARS_PER_EVENT = (BARS_BEFORE * 2) + (BARS_AFTER * 3)
 
 DATA_TASKS = legacy_viewer.DATA_TASKS
 DATA_TASKS_LOCK = legacy_viewer.DATA_TASKS_LOCK
@@ -181,8 +187,28 @@ _LEGACY_SNAPSHOT_TASK = _snapshot_task
 _LEGACY_GET_TASK = _get_task
 _LEGACY_SERIALIZE_TASK = _serialize_task
 
-init_db()
-migrate_json_to_sqlite()
+_JSON_MIGRATION_STATUS_LOCK = threading.Lock()
+_JSON_MIGRATION_STATUS = "pending"
+
+
+def _run_json_to_sqlite_migration() -> None:
+    global _JSON_MIGRATION_STATUS
+    with _JSON_MIGRATION_STATUS_LOCK:
+        if _JSON_MIGRATION_STATUS in {"running", "completed"}:
+            return
+        _JSON_MIGRATION_STATUS = "running"
+    try:
+        summary = migrate_json_to_sqlite()
+        logger.info(
+            "Startup JSON→SQLite migration finished",
+            extra={"data": {"summary": summary}},
+        )
+        with _JSON_MIGRATION_STATUS_LOCK:
+            _JSON_MIGRATION_STATUS = "completed"
+    except Exception as exc:
+        with _JSON_MIGRATION_STATUS_LOCK:
+            _JSON_MIGRATION_STATUS = "failed"
+        logger.warning("Startup JSON→SQLite migration failed: %s", exc)
 
 async def _prewarm_data_views_background() -> None:
     try:
@@ -454,11 +480,14 @@ def _resume_interrupted_tasks() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    await asyncio.to_thread(init_db)
+    json_migration_task = asyncio.create_task(asyncio.to_thread(_run_json_to_sqlite_migration))
     data_views_prewarm_task = asyncio.create_task(_prewarm_data_views_background())
     live_accounts_prewarm_task = asyncio.create_task(_prewarm_live_accounts_background())
     strategies_prewarm_task = asyncio.create_task(_prewarm_strategies_background())
     backtests_meta_prewarm_task = asyncio.create_task(_prewarm_backtest_metadata_background())
     jforex_jvm_prewarm_task = asyncio.create_task(_prewarm_jforex_jvm_background())
+    app.state.json_migration_task = json_migration_task
     app.state.data_views_prewarm_task = data_views_prewarm_task
     app.state.live_accounts_prewarm_task = live_accounts_prewarm_task
     app.state.strategies_prewarm_task = strategies_prewarm_task
@@ -470,6 +499,7 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         for task in (
+            json_migration_task,
             data_views_prewarm_task,
             live_accounts_prewarm_task,
             strategies_prewarm_task,
@@ -479,6 +509,7 @@ async def lifespan(app: FastAPI):
             if not task.done():
                 task.cancel()
         for task in (
+            json_migration_task,
             data_views_prewarm_task,
             live_accounts_prewarm_task,
             strategies_prewarm_task,
@@ -2088,21 +2119,30 @@ def _cached_live_accounts_payload(*, force_refresh: bool = False) -> list[dict[s
 
 
 def _list_strategies_payload() -> list[dict[str, Any]]:
-    strategies: list[dict[str, Any]] = []
-    if not DEFAULT_STRATEGIES_DIR.exists():
-        return strategies
+    entries = _safe_strategy_entries()
+    if not entries:
+        return []
 
-    for entry in _safe_strategy_entries():
-        try:
-            payload = legacy_viewer._strategy_payload(entry)
-            payload.pop("documentation_markdown", None)
-            payload.pop("backtests", None)
-            payload.pop("portfolios", None)
-            strategies.append(payload)
-        except Exception as exc:
-            logger.warning("Could not load strategy %s: %s", entry.relative_file, exc)
+    stats_by_slug = _strategy_list_stats_from_backtests(entries)
+    payload: list[dict[str, Any]] = []
+    for entry in entries:
+        strategy_stats = stats_by_slug.get(
+            entry.slug,
+            {"backtest_count": 0, "best_sharpe": None},
+        )
+        payload.append(
+            _strategy_list_payload(
+                entry,
+                backtest_count=max(int(strategy_stats.get("backtest_count", 0) or 0), 0),
+                best_sharpe=(
+                    float(strategy_stats["best_sharpe"])
+                    if strategy_stats.get("best_sharpe") is not None
+                    else None
+                ),
+            )
+        )
 
-    return strategies
+    return payload
 
 
 def _cached_strategies_payload(*, force_refresh: bool = False) -> list[dict[str, Any]]:
@@ -2451,6 +2491,94 @@ def _safe_strategy_entry(identifier: str) -> StrategyEntry | None:
         if matches_strategy_identifier(entry, normalized):
             return entry
     return None
+
+
+def _strategy_identifier_key(identifier: str) -> str:
+    normalized = "".join(ch.lower() if ch.isalnum() else " " for ch in str(identifier or ""))
+    return " ".join(normalized.split())
+
+
+def _strategy_list_payload(
+    entry: StrategyEntry,
+    *,
+    backtest_count: int = 0,
+    best_sharpe: float | None = None,
+) -> dict[str, Any]:
+    tags = entry.meta.get("tags", {})
+    if not isinstance(tags, dict):
+        tags = {}
+
+    parameters = entry.meta.get("parameters", {})
+    if not isinstance(parameters, dict) or not parameters:
+        parameters = legacy_viewer._extract_ast_parameters(entry.file_path)
+
+    return {
+        "slug": entry.slug,
+        "name": entry.display_name,
+        "version": entry.meta.get("version", "1.0.0"),
+        "file": entry.relative_file,
+        "created_at": entry.created_at,
+        "tags": tags,
+        "type": tags.get("type", []),
+        "source": tags.get("source", ""),
+        "link": tags.get("link", ""),
+        "source_url": entry.meta.get("source_url", ""),
+        "notes": entry.meta.get("notes", ""),
+        "asset_class": tags.get("asset_class", []),
+        "complexity": tags.get("complexity", ""),
+        "engine": entry.engine,
+        "parameters": parameters if isinstance(parameters, dict) else {},
+        "backtest_count": max(int(backtest_count or 0), 0),
+        "best_sharpe": best_sharpe,
+    }
+
+
+def _strategy_list_stats_from_backtests(entries: list[StrategyEntry]) -> dict[str, dict[str, Any]]:
+    stats_by_slug: dict[str, dict[str, Any]] = {
+        entry.slug: {"backtest_count": 0, "best_sharpe": None}
+        for entry in entries
+    }
+    if not entries:
+        return stats_by_slug
+
+    alias_to_slugs: dict[str, set[str]] = {}
+    for entry in entries:
+        for alias in strategy_identifier_aliases(entry):
+            alias_to_slugs.setdefault(alias, set()).add(entry.slug)
+
+    try:
+        metadata_rows = _snapshot_backtest_meta_cache()
+    except Exception as exc:
+        logger.warning("Could not read backtest metadata cache while listing strategies: %s", exc)
+        return stats_by_slug
+
+    for row in metadata_rows:
+        strategy_key = _strategy_identifier_key(str(row.get("strategy_name") or ""))
+        if not strategy_key:
+            continue
+        matched_slugs = alias_to_slugs.get(strategy_key, set())
+        if not matched_slugs:
+            continue
+
+        sharpe_value = None
+        raw_sharpe = row.get("sharpe_ratio")
+        if raw_sharpe is not None:
+            try:
+                parsed_sharpe = float(raw_sharpe)
+                if math.isfinite(parsed_sharpe):
+                    sharpe_value = parsed_sharpe
+            except (TypeError, ValueError):
+                sharpe_value = None
+
+        for slug in matched_slugs:
+            bucket = stats_by_slug.setdefault(slug, {"backtest_count": 0, "best_sharpe": None})
+            bucket["backtest_count"] = max(int(bucket.get("backtest_count", 0) or 0) + 1, 0)
+            if sharpe_value is not None:
+                current_best = bucket.get("best_sharpe")
+                if current_best is None or sharpe_value > float(current_best):
+                    bucket["best_sharpe"] = sharpe_value
+
+    return stats_by_slug
 
 
 def _infer_symbol_category(path_value: str, fallback_asset_class: str) -> str:
@@ -2935,6 +3063,246 @@ def _get_data_views() -> dict[str, Any]:
     with _DATA_VIEWS_CACHE_LOCK:
         _DATA_VIEWS_CACHE.update(computed)
         return _DATA_VIEWS_CACHE
+
+
+def _normalize_coverage_date(value: str | None) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    parsed = pd.to_datetime(text, utc=True, errors="coerce")
+    if pd.isna(parsed):
+        return None
+    return parsed.date().isoformat()
+
+
+def _build_ohlcv_availability_index() -> dict[tuple[str, str], dict[str, Any]]:
+    entries = _aggregate_symbol_timeframe_entries(_cached_catalog_ohlcv_entries())
+    index: dict[tuple[str, str], dict[str, Any]] = {}
+    for entry in entries:
+        symbol = str(entry.get("symbol") or "").strip().upper()
+        timeframe = normalize_timeframe(str(entry.get("timeframe") or "").strip())
+        if not symbol or not timeframe:
+            continue
+        index[(symbol, timeframe)] = entry
+    return index
+
+
+def _check_entry_range_coverage(
+    entry: dict[str, Any] | None,
+    *,
+    requested_start: str,
+    requested_end: str,
+) -> tuple[bool, dict[str, str] | None]:
+    normalized_start = _normalize_coverage_date(requested_start)
+    normalized_end = _normalize_coverage_date(requested_end)
+    if normalized_start and normalized_end and normalized_start > normalized_end:
+        normalized_start, normalized_end = normalized_end, normalized_start
+
+    if entry is None:
+        return False, {
+            "start": normalized_start or "",
+            "end": normalized_end or "",
+        }
+
+    available_start = _normalize_coverage_date(str(entry.get("start") or ""))
+    available_end = _normalize_coverage_date(str(entry.get("end") or ""))
+
+    if normalized_start is None and normalized_end is None:
+        return True, None
+
+    if available_start is None or available_end is None:
+        return False, {
+            "start": normalized_start or "",
+            "end": normalized_end or "",
+        }
+
+    required_start = normalized_start or available_start
+    required_end = normalized_end or available_end
+    if required_start >= available_start and required_end <= available_end:
+        return True, None
+
+    if required_start > available_end:
+        return False, {"start": required_start, "end": required_end}
+    if required_end < available_start:
+        return False, {"start": required_start, "end": required_end}
+
+    missing_start = required_start if required_start < available_start else None
+    missing_end = required_end if required_end > available_end else None
+    if missing_start and missing_end:
+        return False, {"start": required_start, "end": required_end}
+    if missing_start:
+        return False, {"start": missing_start, "end": available_start}
+    if missing_end:
+        return False, {"start": available_end, "end": missing_end}
+
+    return False, {"start": required_start, "end": required_end}
+
+
+def _data_check_result(
+    *,
+    symbol: str,
+    timeframe: str,
+    start: str = "",
+    end: str = "",
+    availability_index: dict[tuple[str, str], dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    normalized_symbol = str(symbol or "").strip().upper()
+    normalized_timeframe = normalize_timeframe(str(timeframe or "").strip())
+    if not normalized_symbol or not normalized_timeframe:
+        return {"available": False, "missing_range": {"start": "", "end": ""}}
+
+    index = availability_index if availability_index is not None else _build_ohlcv_availability_index()
+    entry = index.get((normalized_symbol, normalized_timeframe))
+    available, missing_range = _check_entry_range_coverage(
+        entry,
+        requested_start=start,
+        requested_end=end,
+    )
+    return {"available": available, "missing_range": missing_range}
+
+
+def _auto_download_source(symbol: str, timeframe: str) -> str:
+    normalized_timeframe = normalize_timeframe(timeframe)
+    category = ""
+    try:
+        category = str(legacy_viewer._infer_symbol_data_category(symbol) or "").strip().lower()
+    except (AttributeError, OSError, TypeError, ValueError):
+        category = ""
+
+    if normalized_timeframe == "1d" and category in {"equities", "etfs"}:
+        return "dolthub"
+    return "dukascopy"
+
+
+def _download_missing_ohlcv_data(
+    *,
+    symbol: str,
+    timeframe: str,
+    start: str | None,
+    end: str | None,
+    source: str,
+) -> None:
+    normalized_symbol = str(symbol or "").strip().upper()
+    normalized_timeframe = normalize_timeframe(timeframe) or "1d"
+    selected_source = str(source or "").strip().lower() or "dukascopy"
+
+    if selected_source == "dolthub":
+        from data_tools.downloaders.dolthub_dl import DolthubDownloader
+
+        downloader = DolthubDownloader()
+        downloader.download(
+            symbol=normalized_symbol,
+            timeframe=normalized_timeframe,
+            output_dir=DATA_DIR,
+            start=start or None,
+            end=end or None,
+        )
+        return
+
+    if selected_source in {"dukascopy", "jforex"}:
+        from data_tools.downloaders.dukascopy_native import DukascopyNativeDownloader
+
+        downloader = DukascopyNativeDownloader()
+        downloader.download(
+            symbol=normalized_symbol,
+            timeframe=normalized_timeframe,
+            output_dir=DATA_DIR,
+            start=start or None,
+            end=end or None,
+            offer_side="bid",
+        )
+        return
+
+    raise ValueError(f"Unsupported auto-download source '{selected_source}' for {normalized_symbol}")
+
+
+def _ensure_backtest_data_availability(
+    *,
+    symbols: list[str],
+    timeframe: str,
+    start: str = "",
+    end: str = "",
+    progress_callback: Callable[[float, str], None] | None = None,
+    log_callback: Callable[[str], None] | None = None,
+) -> list[dict[str, Any]]:
+    normalized_timeframe = normalize_timeframe(timeframe)
+    symbol_list = [str(symbol or "").strip().upper() for symbol in symbols if str(symbol or "").strip()]
+    if not symbol_list or not normalized_timeframe:
+        return []
+
+    availability_index = _build_ohlcv_availability_index()
+    missing_items: list[dict[str, Any]] = []
+    for symbol in symbol_list:
+        availability = _data_check_result(
+            symbol=symbol,
+            timeframe=normalized_timeframe,
+            start=start,
+            end=end,
+            availability_index=availability_index,
+        )
+        if availability.get("available"):
+            continue
+        missing_items.append(
+            {
+                "symbol": symbol,
+                "timeframe": normalized_timeframe,
+                "missing_range": availability.get("missing_range"),
+                "source": _auto_download_source(symbol, normalized_timeframe),
+            }
+        )
+
+    if not missing_items:
+        return []
+
+    total_missing = len(missing_items)
+    for index, missing in enumerate(missing_items, start=1):
+        progress_before = 10.0 + ((index - 1) / total_missing) * 35.0
+        if progress_callback is not None:
+            progress_callback(progress_before, f"Downloading data... {int(round(progress_before))}%")
+
+        symbol = str(missing["symbol"])
+        source = str(missing["source"])
+        missing_range = missing.get("missing_range") if isinstance(missing.get("missing_range"), dict) else {}
+        download_start = str((missing_range or {}).get("start") or start or "").strip() or None
+        download_end = str((missing_range or {}).get("end") or end or "").strip() or None
+
+        if log_callback is not None:
+            log_callback(
+                (
+                    f"Auto-download: {symbol} {normalized_timeframe} via {source} "
+                    f"({download_start or 'auto'} → {download_end or 'latest'})"
+                )
+            )
+
+        _download_missing_ohlcv_data(
+            symbol=symbol,
+            timeframe=normalized_timeframe,
+            start=download_start,
+            end=download_end,
+            source=source,
+        )
+        cache_manager.invalidate_cache(DATA_DIR, reason="auto-backtest-download")
+        _invalidate_data_views_cache()
+        _refresh_catalog()
+
+        availability_index = _build_ohlcv_availability_index()
+        verification = _data_check_result(
+            symbol=symbol,
+            timeframe=normalized_timeframe,
+            start=start,
+            end=end,
+            availability_index=availability_index,
+        )
+        if not verification.get("available"):
+            raise RuntimeError(
+                f"Auto-download did not provide required data range for {symbol} {normalized_timeframe}"
+            )
+
+        progress_after = 10.0 + (index / total_missing) * 35.0
+        if progress_callback is not None:
+            progress_callback(progress_after, f"Downloading data... {int(round(progress_after))}%")
+
+    return missing_items
 
 
 def _prewarm_data_views_once() -> None:
@@ -3556,6 +3924,150 @@ def _slice_indicators_to_time_range(
         ]
 
 
+def _to_unix_seconds(value: Any) -> float | None:
+    if isinstance(value, (int, float)):
+        numeric = float(value)
+        if math.isfinite(numeric) and numeric > 0:
+            return numeric
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            numeric = float(text)
+            if math.isfinite(numeric) and numeric > 0:
+                return numeric
+        except (TypeError, ValueError):
+            pass
+        parsed = pd.to_datetime(text, utc=True, errors="coerce")
+        if not pd.isna(parsed):
+            return float(pd.Timestamp(parsed).timestamp())
+    return None
+
+
+def _trade_event_unix_seconds(trade_payload: dict[str, Any]) -> list[float]:
+    timestamps: list[float] = []
+    for unix_key, iso_key in (("entry_time", "entry_time_iso"), ("exit_time", "exit_time_iso")):
+        unix_time = _to_unix_seconds(trade_payload.get(unix_key))
+        if unix_time is None:
+            unix_time = _to_unix_seconds(trade_payload.get(iso_key))
+        if unix_time is not None:
+            timestamps.append(unix_time)
+
+    exits = trade_payload.get("exits")
+    if isinstance(exits, list):
+        for exit_payload in exits:
+            if not isinstance(exit_payload, dict):
+                continue
+            unix_time = _to_unix_seconds(exit_payload.get("time"))
+            if unix_time is None:
+                unix_time = _to_unix_seconds(exit_payload.get("time_iso"))
+            if unix_time is not None:
+                timestamps.append(unix_time)
+    return timestamps
+
+
+def _replay_keep_mask_from_trades(df: pd.DataFrame, trade_payloads: list[dict[str, Any]]) -> np.ndarray:
+    keep = np.zeros(len(df), dtype=bool)
+    if "timestamp" not in df.columns:
+        keep[:] = True
+        return keep
+    if len(df) <= REPLAY_MAX_BARS_WITHOUT_TRADES:
+        keep[:] = True
+        return keep
+
+    event_seconds: list[float] = []
+    for trade_payload in trade_payloads:
+        event_seconds.extend(_trade_event_unix_seconds(trade_payload))
+    if not event_seconds:
+        keep[max(0, len(df) - REPLAY_MAX_BARS_WITHOUT_TRADES):] = True
+        return keep
+
+    event_array = np.array(event_seconds, dtype=np.float64)
+    event_array = event_array[np.isfinite(event_array) & (event_array > 0)]
+    if event_array.size == 0:
+        keep[max(0, len(df) - REPLAY_MAX_BARS_WITHOUT_TRADES):] = True
+        return keep
+    event_ns = np.unique(np.round(event_array * 1_000_000_000.0).astype(np.int64))
+
+    ts_series = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+    timestamp_values = ts_series.array.asi8.astype(np.int64, copy=False)
+    unit = str(getattr(ts_series.dtype, "unit", "ns") or "ns").lower()
+    to_ns_factor = {
+        "s": 1_000_000_000,
+        "ms": 1_000_000,
+        "us": 1_000,
+        "ns": 1,
+    }.get(unit, 1)
+    if to_ns_factor != 1:
+        timestamp_values = timestamp_values.copy()
+        valid_for_scale = timestamp_values != np.iinfo(np.int64).min
+        timestamp_values[valid_for_scale] = timestamp_values[valid_for_scale] * to_ns_factor
+    valid_ts = timestamp_values != np.iinfo(np.int64).min
+    if not np.any(valid_ts):
+        keep[max(0, len(df) - REPLAY_MAX_BARS_WITHOUT_TRADES):] = True
+        return keep
+
+    event_count = max(1, int(event_ns.size))
+    budget_per_event = max(REPLAY_MIN_BARS_PER_EVENT, REPLAY_TARGET_BARS // event_count)
+    bars_per_event = min(REPLAY_MAX_BARS_PER_EVENT, budget_per_event)
+    window_before = max(1, int(round(bars_per_event * 0.6)))
+    window_after = max(1, bars_per_event - window_before)
+    insert_idx = np.searchsorted(timestamp_values, event_ns, side="left")
+    insert_idx = np.clip(insert_idx, 0, len(df) - 1)
+    prev_idx = np.clip(insert_idx - 1, 0, len(df) - 1)
+    current_delta = np.abs(timestamp_values[insert_idx] - event_ns)
+    prev_delta = np.abs(timestamp_values[prev_idx] - event_ns)
+    choose_prev = (insert_idx > 0) & (prev_delta <= current_delta)
+    nearest_idx = np.where(choose_prev, prev_idx, insert_idx)
+
+    starts = np.maximum(0, nearest_idx - window_before)
+    ends = np.minimum(len(df), nearest_idx + window_after + 1)
+    diff = np.zeros(len(df) + 1, dtype=np.int32)
+    np.add.at(diff, starts, 1)
+    np.add.at(diff, ends, -1)
+    keep = np.cumsum(diff[:-1]) > 0
+    keep &= valid_ts
+
+    if not np.any(keep):
+        keep[max(0, len(df) - REPLAY_MAX_BARS_WITHOUT_TRADES):] = True
+    return keep
+
+
+def _slice_replay_ohlcv(df: pd.DataFrame, trade_payloads: list[dict[str, Any]]) -> pd.DataFrame:
+    if df is None or len(df) == 0:
+        return df
+    keep_mask = _replay_keep_mask_from_trades(df, trade_payloads)
+    if keep_mask.size != len(df) or np.all(keep_mask):
+        return df
+    return df.iloc[np.flatnonzero(keep_mask)]
+
+
+def _slice_indicators_to_timestamps(indicators: list[dict[str, Any]], *, ohlcv_times: list[float]) -> None:
+    if not ohlcv_times:
+        for indicator in indicators:
+            indicator["data"] = []
+        return
+
+    allowed_keys = {round(float(value), 6) for value in ohlcv_times if math.isfinite(float(value))}
+    for indicator in indicators:
+        points = indicator.get("data")
+        if not isinstance(points, list):
+            continue
+        filtered: list[dict[str, Any]] = []
+        for point in points:
+            if not isinstance(point, dict):
+                continue
+            try:
+                point_time = float(point.get("time", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if round(point_time, 6) in allowed_keys:
+                filtered.append(point)
+        indicator["data"] = filtered
+
+
 def _collect_viewer_drawings(result: BacktestResult, symbol: str | None = None) -> list[dict[str, Any]]:
     drawings: list[dict[str, Any]] = []
     for drawing in result.drawings:
@@ -3659,7 +4171,9 @@ async def get_backtest_replay(backtest_id: str) -> dict[str, Any]:
                 backtest_end=str(result.meta.backtest_end or ""),
             )
             continue
-        ohlcv_by_symbol[symbol] = legacy_viewer._df_to_ohlcv_records(df)
+        symbol_trades = [trade for trade in trades if str(trade.get("symbol") or "").upper() == symbol.upper()]
+        replay_df = _slice_replay_ohlcv(df, symbol_trades)
+        ohlcv_by_symbol[symbol] = legacy_viewer._df_to_ohlcv_records(replay_df)
 
     if not ohlcv_by_symbol:
         detail = next(iter(missing_ohlcv.values()), {"message": "No OHLCV data available"})
@@ -3674,15 +4188,18 @@ async def get_backtest_replay(backtest_id: str) -> dict[str, Any]:
             strategy_identifier = result.meta.strategies[0] if result.meta.strategies else ""
             detected = legacy_viewer._detect_indicators(strategy_identifier)
             if detected:
+                primary_trades = [
+                    trade for trade in trades if str(trade.get("symbol") or "").upper() == primary_symbol.upper()
+                ]
+                replay_df = _slice_replay_ohlcv(df, primary_trades)
                 ohlcv_times = [row["time"] for row in ohlcv_by_symbol[primary_symbol]]
-                indicators = legacy_viewer._compute_indicators(df, detected, ohlcv_times)
+                indicators = legacy_viewer._compute_indicators(replay_df, detected, ohlcv_times)
 
     if indicators and ohlcv_by_symbol.get(primary_symbol):
         symbol_ohlcv = ohlcv_by_symbol[primary_symbol]
-        _slice_indicators_to_time_range(
+        _slice_indicators_to_timestamps(
             indicators,
-            time_start=symbol_ohlcv[0]["time"],
-            time_end=symbol_ohlcv[-1]["time"],
+            ohlcv_times=[float(item.get("time", 0) or 0) for item in symbol_ohlcv],
         )
 
     drawings = _collect_viewer_drawings(result)
@@ -3868,20 +4385,23 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
                 except ValueError:
                     return None
                 progress_message = payload[2].strip() or "Running backtest..."
-                return (percent, progress_message)
+                scaled = 45.0 + (max(0.0, min(percent, 100.0)) * 0.55)
+                if progress_message:
+                    return (scaled, f"Running backtest... {int(round(scaled))}%")
+                return (scaled, "Running backtest...")
             return None
         if "auto-detected date range" in normalized:
-            return (15.0, "Loading market data...")
+            return (50.0, "Running backtest... 50%")
         if "starting command:" in normalized:
-            return (20.0, "Loading market data...")
+            return (52.0, "Running backtest... 52%")
         if "running backtest:" in normalized:
-            return (35.0, f"Running strategy {strategy_path.stem}...")
+            return (58.0, "Running backtest... 58%")
         if "result:" in normalized and "trades" in normalized:
-            return (65.0, "Processing trades...")
+            return (82.0, "Processing trades...")
         if normalized.startswith("result:"):
-            return (80.0, "Calculating statistics...")
+            return (90.0, "Calculating statistics...")
         if normalized.startswith("saved to:"):
-            return (92.0, "Saving results...")
+            return (96.0, "Saving results...")
         return None
 
     def _run() -> None:
@@ -3950,13 +4470,36 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
                     f"[{_task_timestamp()}] {message}",
                     stream="task",
                     source="backtest",
+                    ingest_task_progress=False,
                 )
+
+        def report_download_phase(percent: float, message: str) -> None:
+            report_stage(handle, percent=percent, message=message)
 
         with log_file.open("a", encoding="utf-8", buffering=1) as handle:
             try:
                 _set_task_status(task_id, "running")
                 _running_jobs[task_id]["status"] = "running"
                 report_stage(handle, percent=10.0, message="Loading market data...")
+
+                missing_downloads = _ensure_backtest_data_availability(
+                    symbols=symbols,
+                    timeframe=timeframe,
+                    start=start,
+                    end=end,
+                    progress_callback=report_download_phase,
+                    log_callback=lambda message: _write_task_log_line(
+                        handle,
+                        task_id,
+                        f"[{_task_timestamp()}] {message}",
+                        stream="task",
+                        source="backtest",
+                        ingest_task_progress=False,
+                    ),
+                )
+                if missing_downloads:
+                    report_stage(handle, percent=45.0, message="Downloading data... 45%")
+                report_stage(handle, percent=45.0, message="Running backtest... 45%")
 
                 command_display = " ".join(str(part) for part in cmd)
                 _write_task_log_line(
@@ -3965,6 +4508,7 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
                     f"[{_task_timestamp()}] Starting command: {command_display}",
                     stream="task",
                     source="backtest",
+                    ingest_task_progress=False,
                 )
 
                 proc = subprocess.Popen(
@@ -3988,6 +4532,7 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
                                 line,
                                 stream="stdout",
                                 source="backtest",
+                                ingest_task_progress=False,
                             )
                         parsed_message = _runner_log_message(line)
                         if not parsed_message:
@@ -4024,7 +4569,7 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
                         proc.kill()
                     raise subprocess.SubprocessError("Backtest timed out after 300 seconds")
                 if returncode == 0:
-                    report_stage(handle, percent=92.0, message="Saving results...")
+                    report_stage(handle, percent=96.0, message="Saving results...")
                     result_payload = {
                         "output_path": output_path or None,
                         "backtest_id": backtest_id or None,
@@ -4055,6 +4600,7 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
                         f"[{_task_timestamp()}] Backtest completed successfully.",
                         stream="task",
                         source="backtest",
+                        ingest_task_progress=False,
                     )
                     _mark_task_finished(task_id, status="completed", returncode=0)
                     _running_jobs[task_id]["status"] = "completed"
@@ -4069,6 +4615,7 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
                         stream="stderr",
                         log_level="error",
                         source="backtest",
+                        ingest_task_progress=False,
                     )
                     _mark_task_finished(
                         task_id,
@@ -4079,7 +4626,7 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
                     _running_jobs[task_id]["status"] = "failed"
                     _running_jobs[task_id]["result"] = None
                     _running_jobs[task_id]["error"] = error_text
-            except (subprocess.SubprocessError, OSError, ValueError) as exc:
+            except (subprocess.SubprocessError, OSError, RuntimeError, ValueError) as exc:
                 _write_task_log_line(
                     handle,
                     task_id,
@@ -4087,6 +4634,7 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
                     stream="stderr",
                     log_level="error",
                     source="backtest",
+                    ingest_task_progress=False,
                 )
                 _write_task_traceback(handle, task_id, traceback.format_exc(), source="backtest")
                 _mark_task_finished(task_id, status="failed", returncode=1, error=str(exc))
@@ -4637,6 +5185,8 @@ async def get_live_trades(account_id: str) -> dict[str, Any]:
 
     trades: list[dict[str, Any]] = []
     for row in rows:
+        signal_metadata = row.get("signal_metadata")
+        metadata = signal_metadata if isinstance(signal_metadata, dict) else {}
         signal_iso, signal_unix = _serialize_live_timestamp(row.get("signal_timestamp"))
         execution_iso, execution_unix = _serialize_live_timestamp(row.get("execution_timestamp"))
         trades.append(
@@ -4652,13 +5202,45 @@ async def get_live_trades(account_id: str) -> dict[str, Any]:
                 "slippage": float(row.get("slippage", 0.0)),
                 "slippage_bps": float(row.get("slippage_bps", 0.0)),
                 "filled_qty": float(row.get("filled_qty", 0.0)),
+                "position_size": (
+                    _safe_float(row.get("position_size"))
+                    if row.get("position_size") is not None
+                    else (
+                        _safe_float(metadata.get("position_size"))
+                        if metadata.get("position_size") is not None
+                        else None
+                    )
+                ),
+                "risk_amount": (
+                    _safe_float(row.get("risk_amount"))
+                    if row.get("risk_amount") is not None
+                    else (
+                        _safe_float(metadata.get("risk_amount"))
+                        if metadata.get("risk_amount") is not None
+                        else None
+                    )
+                ),
+                "risk_percent": (
+                    _safe_float(row.get("risk_percent"))
+                    if row.get("risk_percent") is not None
+                    else (
+                        _safe_float(metadata.get("risk_percent"))
+                        if metadata.get("risk_percent") is not None
+                        else None
+                    )
+                ),
+                "exit_reason": (
+                    str(row.get("exit_reason")).strip()
+                    if row.get("exit_reason") not in (None, "")
+                    else None
+                ),
                 "commission": float(row.get("commission", 0.0)),
                 "signal_timestamp": signal_iso,
                 "signal_time": signal_unix,
                 "execution_timestamp": execution_iso,
                 "execution_time": execution_unix,
                 "broker_order_id": row.get("broker_order_id", ""),
-                "signal_metadata": row.get("signal_metadata", {}),
+                "signal_metadata": metadata,
             }
         )
     return {"account_id": account_id, "deployment_ids": deployment_ids, "trades": trades}
@@ -4972,6 +5554,32 @@ async def get_dukascopy_genesis(
     return {
         "source": "dukascopy",
         "coverage": coverage,
+    }
+
+
+@app.get("/api/data/check", response_model=dict[str, Any])
+async def data_check(
+    symbol: str = Query(default=""),
+    timeframe: str = Query(default="1d"),
+    start: str = Query(default=""),
+    end: str = Query(default=""),
+) -> dict[str, Any]:
+    normalized_symbol = str(symbol or "").strip().upper()
+    normalized_timeframe = normalize_timeframe(str(timeframe or "").strip())
+    if not normalized_symbol:
+        raise HTTPException(status_code=400, detail="symbol is required")
+    if not normalized_timeframe:
+        raise HTTPException(status_code=400, detail="timeframe is required")
+
+    result = _data_check_result(
+        symbol=normalized_symbol,
+        timeframe=normalized_timeframe,
+        start=start,
+        end=end,
+    )
+    return {
+        "available": bool(result.get("available")),
+        "missing_range": result.get("missing_range"),
     }
 
 

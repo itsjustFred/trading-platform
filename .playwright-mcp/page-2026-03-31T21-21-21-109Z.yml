@@ -1,0 +1,110 @@
+- generic [ref=e3]:
+  - complementary [ref=e4]:
+    - button "Collapse" [ref=e5]:
+      - img [ref=e6]
+    - navigation [ref=e10]:
+      - link "Strategies" [ref=e11] [cursor=pointer]:
+        - /url: /strategies
+        - img [ref=e12]
+        - generic [ref=e15]: Strategies
+      - link "Backtests" [ref=e16] [cursor=pointer]:
+        - /url: /backtests
+        - img [ref=e17]
+        - generic [ref=e22]: Backtests
+      - link "Optimizations" [ref=e23] [cursor=pointer]:
+        - /url: /optimizations
+        - img [ref=e24]
+        - generic [ref=e28]: Optimizations
+      - link "Live Hub" [ref=e29] [cursor=pointer]:
+        - /url: /live
+        - img [ref=e30]
+        - generic [ref=e36]: Live Hub
+      - link "Portfolio" [ref=e37] [cursor=pointer]:
+        - /url: /portfolios
+        - img [ref=e38]
+        - generic [ref=e41]: Portfolio
+      - link "Strategy Lab" [ref=e42] [cursor=pointer]:
+        - /url: /lab
+        - img [ref=e43]
+        - generic [ref=e50]: Strategy Lab
+      - link "Data" [ref=e51] [cursor=pointer]:
+        - /url: /data
+        - img [ref=e52]
+        - generic [ref=e56]: Data
+      - link "Task Hub" [ref=e57] [cursor=pointer]:
+        - /url: /tasks
+        - img [ref=e58]
+        - generic [ref=e60]: Task Hub
+      - link "Logging" [ref=e61] [cursor=pointer]:
+        - /url: /logging
+        - img [ref=e62]
+        - generic [ref=e67]: Logging
+      - generic "Coming soon" [ref=e68]:
+        - img [ref=e69]
+        - generic [ref=e74]: Accounts
+  - main [ref=e75]:
+    - link "Task Hub 0 running · 8 total Open" [ref=e89] [cursor=pointer]:
+      - /url: /tasks
+      - generic [ref=e80]:
+        - img [ref=e82]
+        - generic [ref=e84]:
+          - generic [ref=e85]: Task Hub
+          - generic [ref=e86]: 0 running · 8 total
+      - generic [ref=e87]: Open
+    - generic [ref=e88]:
+      - generic [ref=e90]:
+        - button "Back to Report" [ref=e91] [cursor=pointer]:
+          - img [ref=e92]
+          - text: Back to Report
+        - generic [ref=e95]: Trade 1 / 1 • EURUSD • 1h
+        - button "Fullscreen" [ref=e96] [cursor=pointer]:
+          - img [ref=e97]
+          - text: Fullscreen
+      - generic [ref=e104]:
+        - generic [ref=e105]:
+          - generic [ref=e106]: Direction
+          - generic [ref=e107]: LONG
+        - generic [ref=e108]:
+          - generic [ref=e109]: Symbol
+          - generic [ref=e110]: EURUSD
+        - generic [ref=e111]:
+          - generic [ref=e112]: Entry
+          - generic [ref=e113]: $2430.75 @ 2024-01-01T12:00
+        - generic [ref=e114]:
+          - generic [ref=e115]: Exit
+          - generic [ref=e116]: $2550.00 @ 2024-01-01T18:00
+        - generic [ref=e117]:
+          - generic [ref=e118]: P&L
+          - generic [ref=e119]: $11.93 (—)
+      - generic [ref=e121]:
+        - generic [ref=e122]:
+          - generic [ref=e123]:
+            - button "50 bars" [ref=e124] [cursor=pointer]
+            - button "150 bars" [ref=e125] [cursor=pointer]
+            - button "300 bars" [ref=e126] [cursor=pointer]
+            - button "All" [ref=e127] [cursor=pointer]
+          - generic [ref=e128]:
+            - button "Screenshot" [ref=e129] [cursor=pointer]
+            - button "Fullscreen" [ref=e130] [cursor=pointer]
+        - table [ref=e133]:
+          - row [ref=e134]:
+            - cell
+            - cell [ref=e135]:
+              - link "Charting by TradingView" [ref=e139] [cursor=pointer]:
+                - /url: https://www.tradingview.com/?utm_medium=lwc-link&utm_campaign=lwc-chart&utm_source=127.0.0.1/backtests/vbt-marker_fixture-20260331-210500/trade/1
+                - img [ref=e140]
+            - cell [ref=e144]
+          - row [ref=e148]:
+            - cell
+            - cell [ref=e149]
+            - cell [ref=e153]
+      - generic [ref=e156]:
+        - button "[|<] Previous Trade" [disabled] [ref=e157] [cursor=pointer]:
+          - img [ref=e158]
+          - text: "[|<] Previous Trade"
+        - button "[Play]" [ref=e161] [cursor=pointer]:
+          - img [ref=e162]
+          - text: "[Play]"
+        - button "[>|] Next Trade" [disabled] [ref=e164] [cursor=pointer]:
+          - text: "[>|] Next Trade"
+          - img [ref=e165]

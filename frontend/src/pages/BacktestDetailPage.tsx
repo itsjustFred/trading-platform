@@ -43,6 +43,20 @@ import { formatPValue, pValueColor } from "../utils/stats";
 
 const BENCHMARK_SYMBOLS = ["SPY", "QQQ", "IWM", "DIA", "GLD", "TLT", "XAUUSD"];
 
+function formatOptionalNumber(
+  value: number | null | undefined,
+  digits: number,
+  suffix = "",
+): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) {
+    return "N/A";
+  }
+  return `${value.toLocaleString("en-US", {
+    minimumFractionDigits: digits,
+    maximumFractionDigits: digits,
+  })}${suffix}`;
+}
+
 export function BacktestDetailPage() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
@@ -207,6 +221,30 @@ export function BacktestDetailPage() {
       label: "Qty",
       align: "right" as const,
       render: (r: any) => r.quantity?.toFixed(2),
+    },
+    {
+      key: "position_size",
+      label: "Size",
+      align: "right" as const,
+      render: (r: Trade) => formatOptionalNumber(r.position_size, 2),
+    },
+    {
+      key: "risk_amount",
+      label: "Risk $",
+      align: "right" as const,
+      render: (r: Trade) =>
+        r.risk_amount != null && Number.isFinite(r.risk_amount)
+          ? `$${formatOptionalNumber(r.risk_amount, 2)}`
+          : "N/A",
+    },
+    {
+      key: "risk_percent",
+      label: "Risk %",
+      align: "right" as const,
+      render: (r: Trade) =>
+        r.risk_percent != null && Number.isFinite(r.risk_percent)
+          ? `${formatOptionalNumber(r.risk_percent * 100, 2)}%`
+          : "N/A",
     },
     {
       key: "pnl",

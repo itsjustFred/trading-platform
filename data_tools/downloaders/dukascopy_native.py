@@ -413,6 +413,7 @@ async def download_bi5_files(
     batch_size: int | None = None,
     pause_ms: int = 1000,
     report_progress: Callable[[float, str], None] | None = None,
+    progress_unit: str = "files",
     stop_event: Event | None = None,
     pause_event: Event | None = None,
     log_callback: Callable[[str], None] | None = None,
@@ -428,8 +429,10 @@ async def download_bi5_files(
     total = len(urls)
     completed = 0
 
+    unit = str(progress_unit or "files").strip().lower() or "files"
+
     if total == 0:
-        _report_progress(report_progress, 100.0, "No files to download")
+        _report_progress(report_progress, 100.0, f"No {unit} to download")
         return []
 
     connector = aiohttp.TCPConnector(limit=effective_batch_size, force_close=False)
@@ -477,7 +480,7 @@ async def download_bi5_files(
                     _report_progress(
                         report_progress,
                         (completed / total) * 100.0,
-                        f"Downloaded {completed}/{total} files",
+                        f"Downloaded {completed}/{total} {unit}",
                     )
 
                 if batch_throttled:
@@ -681,8 +684,9 @@ async def _download_minute_side_dataframe(
     log_callback: Callable[[str], None] | None = None,
 ) -> pd.DataFrame:
     urls = generate_minute_urls(instrument, start_dt, end_dt, side)
+    target_unit = "days"
     _emit_log_message(
-        f"Downloading {len(urls)} daily minute-candle files for {side}...",
+        f"Downloading {len(urls)} daily chunks for {side}...",
         log_callback=log_callback,
     )
     bi5_results = await download_bi5_files(
@@ -692,13 +696,14 @@ async def _download_minute_side_dataframe(
         batch_size=batch_size,
         pause_ms=pause_ms,
         report_progress=report_progress,
+        progress_unit=target_unit,
         stop_event=stop_event,
         pause_event=pause_event,
         log_callback=log_callback,
     )
     non_empty = sum(1 for _, d in bi5_results if d)
     _emit_log_message(
-        f"Received {non_empty}/{len(urls)} non-empty files for {side}",
+        f"Received {non_empty}/{len(urls)} non-empty {target_unit} for {side}",
         log_callback=log_callback,
     )
     return _assemble_candle_dataframe(bi5_results, decimal_factor)
@@ -786,6 +791,7 @@ async def _download_and_assemble_merged_ticks(
             if report_progress
             else None
         ),
+        progress_unit="files",
         stop_event=stop_event,
         pause_event=pause_event,
         log_callback=log_callback,
@@ -803,6 +809,7 @@ async def _download_and_assemble_merged_ticks(
             if report_progress
             else None
         ),
+        progress_unit="files",
         stop_event=stop_event,
         pause_event=pause_event,
         log_callback=log_callback,
@@ -1021,6 +1028,7 @@ class DukascopyNativeDownloader(Downloader):
                         if report_progress
                         else None
                     ),
+                    progress_unit="files",
                     stop_event=stop_event,
                     pause_event=pause_event,
                     log_callback=log_callback,

@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+import numpy as np
 import pandas as pd
 from pydantic import ValidationError
 
@@ -298,6 +299,32 @@ def _equity_curve_from_trades(result: BacktestResult) -> list[dict]:
 def _trade_to_viewer(trade) -> dict:
     """Convert a Universal Format Trade to viewer-friendly flat format."""
     last_exit = trade.exits[-1] if trade.exits else None
+    trade_meta = trade.meta if isinstance(trade.meta, dict) else {}
+    risk_math = trade_meta.get("risk_math") if isinstance(trade_meta.get("risk_math"), dict) else {}
+
+    position_size = trade.position_size
+    if position_size is None:
+        position_size = risk_math.get("position_size")
+
+    risk_amount = trade.risk_amount
+    if risk_amount is None:
+        risk_amount = risk_math.get("risk_target_usd")
+
+    risk_percent = trade.risk_percent
+    if risk_percent is None:
+        direct_percent = risk_math.get("risk_target_pct")
+        if direct_percent is not None:
+            risk_percent = direct_percent
+        else:
+            equity_at_entry = _safe_float(risk_math.get("equity_at_entry"), 0.0)
+            target_risk_usd = _safe_float(risk_math.get("risk_target_usd"), 0.0)
+            if equity_at_entry > 0 and target_risk_usd > 0:
+                risk_percent = target_risk_usd / equity_at_entry
+
+    exit_reason = trade.exit_reason or (last_exit.reason if last_exit else None)
+    if exit_reason is None and isinstance(trade_meta.get("exit_reason"), str):
+        exit_reason = str(trade_meta.get("exit_reason"))
+
     payload = {
         "nr": trade.id,
         "symbol": trade.symbol,
@@ -309,6 +336,10 @@ def _trade_to_viewer(trade) -> dict:
         "exit_time_iso": last_exit.time if last_exit else "",
         "exit_price": last_exit.price if last_exit else 0,
         "quantity": trade.quantity,
+        "position_size": position_size,
+        "risk_amount": risk_amount,
+        "risk_percent": risk_percent,
+        "exit_reason": exit_reason,
         "pnl": trade.pnl,
         "pnl_pct": trade.pnl_pct,
         "r_multiple": trade.r_multiple,
@@ -410,39 +441,83 @@ def _missing_ohlcv_details(
     }
 
 
+def _preferred_ohlcv_column(df: pd.DataFrame, base_name: str) -> str | None:
+    candidates = [base_name, f"bid_{base_name}", f"ask_{base_name}"]
+    columns = set(df.columns)
+    for candidate in candidates:
+        if candidate not in columns:
+            continue
+        numeric = pd.to_numeric(df[candidate], errors="coerce")
+        if np.isfinite(numeric).any():
+            return candidate
+    for candidate in candidates:
+        if candidate in columns:
+            return candidate
+    return None
+
+
 def _df_to_ohlcv_records(df: pd.DataFrame) -> list[dict]:
     """Convert OHLCV DataFrame to list of dicts with Unix timestamps."""
-    records_by_time: dict[float, dict] = {}
-    for _, row in df.iterrows():
-        ts = row["timestamp"]
-        if hasattr(ts, "timestamp"):
-            unix_ts = ts.timestamp()
-        else:
-            unix_ts = pd.Timestamp(ts).timestamp()
-        unix_time = _coerce_finite_float(unix_ts)
-        open_price = _coerce_finite_float(row.get("open"))
-        high_price = _coerce_finite_float(row.get("high"))
-        low_price = _coerce_finite_float(row.get("low"))
-        close_price = _coerce_finite_float(row.get("close"))
-        if (
-            unix_time is None
-            or unix_time <= 0
-            or open_price is None
-            or high_price is None
-            or low_price is None
-            or close_price is None
-        ):
-            continue
-        volume_numeric = _coerce_finite_float(row.get("volume", 0))
-        records_by_time[unix_time] = {
-            "time": unix_time,
-            "open": open_price,
-            "high": high_price,
-            "low": low_price,
-            "close": close_price,
-            "volume": int(volume_numeric) if volume_numeric is not None else 0,
+    if df is None or df.empty or "timestamp" not in df.columns:
+        return []
+
+    open_col = _preferred_ohlcv_column(df, "open")
+    high_col = _preferred_ohlcv_column(df, "high")
+    low_col = _preferred_ohlcv_column(df, "low")
+    close_col = _preferred_ohlcv_column(df, "close")
+    volume_col = _preferred_ohlcv_column(df, "volume")
+    if not open_col or not high_col or not low_col or not close_col:
+        return []
+
+    timestamp_series = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+    timestamp_values = timestamp_series.array.asi8.astype("float64", copy=False)
+    nat_sentinel = float(np.iinfo(np.int64).min)
+    timestamp_values[timestamp_values == nat_sentinel] = np.nan
+    unit = str(getattr(timestamp_series.dtype, "unit", "ns") or "ns").lower()
+    unit_scale = {
+        "s": 1.0,
+        "ms": 1_000.0,
+        "us": 1_000_000.0,
+        "ns": 1_000_000_000.0,
+    }.get(unit, 1_000_000_000.0)
+    unix_time = timestamp_values / unit_scale
+
+    open_series = pd.to_numeric(df[open_col], errors="coerce")
+    high_series = pd.to_numeric(df[high_col], errors="coerce")
+    low_series = pd.to_numeric(df[low_col], errors="coerce")
+    close_series = pd.to_numeric(df[close_col], errors="coerce")
+    if volume_col:
+        volume_series = pd.to_numeric(df[volume_col], errors="coerce")
+    else:
+        volume_series = pd.Series(0.0, index=df.index, dtype="float64")
+
+    valid_mask = (
+        np.isfinite(unix_time)
+        & (unix_time > 0)
+        & np.isfinite(open_series)
+        & np.isfinite(high_series)
+        & np.isfinite(low_series)
+        & np.isfinite(close_series)
+    )
+    if not valid_mask.any():
+        return []
+
+    normalized = pd.DataFrame(
+        {
+            "time": unix_time[valid_mask],
+            "open": open_series[valid_mask].astype(float),
+            "high": high_series[valid_mask].astype(float),
+            "low": low_series[valid_mask].astype(float),
+            "close": close_series[valid_mask].astype(float),
+            "volume": volume_series[valid_mask].fillna(0.0).astype(float),
         }
-    return [records_by_time[key] for key in sorted(records_by_time.keys())]
+    )
+    if normalized.empty:
+        return []
+
+    normalized = normalized.drop_duplicates(subset=["time"], keep="last").sort_values("time")
+    normalized["volume"] = normalized["volume"].round().astype(int)
+    return normalized.to_dict(orient="records")
 
 
 def _drawing_timestamp_to_unix(value: Any) -> float | None:
@@ -2676,6 +2751,7 @@ def _write_task_log_line(
     stream: str,
     log_level: str = "info",
     source: str = "data-task",
+    ingest_task_progress: bool = True,
 ) -> None:
     if not message.endswith("\n"):
         message = f"{message}\n"
@@ -2686,7 +2762,8 @@ def _write_task_log_line(
     if not text:
         return
 
-    _ingest_task_log_line(task_id, text)
+    if ingest_task_progress:
+        _ingest_task_log_line(task_id, text)
 
     log_method = getattr(logger, log_level, logger.info)
     log_method(

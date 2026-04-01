@@ -1,0 +1,54 @@
+- generic [ref=e3]:
+  - complementary [ref=e4]:
+    - button "Collapse" [ref=e5]:
+      - img [ref=e6]
+    - navigation [ref=e10]:
+      - link "Strategies" [ref=e11] [cursor=pointer]:
+        - /url: /strategies
+        - img [ref=e12]
+        - generic [ref=e15]: Strategies
+      - link "Backtests" [ref=e16] [cursor=pointer]:
+        - /url: /backtests
+        - img [ref=e17]
+        - generic [ref=e22]: Backtests
+      - link "Optimizations" [ref=e23] [cursor=pointer]:
+        - /url: /optimizations
+        - img [ref=e24]
+        - generic [ref=e28]: Optimizations
+      - link "Live Hub" [ref=e29] [cursor=pointer]:
+        - /url: /live
+        - img [ref=e30]
+        - generic [ref=e36]: Live Hub
+      - link "Portfolio" [ref=e37] [cursor=pointer]:
+        - /url: /portfolios
+        - img [ref=e38]
+        - generic [ref=e41]: Portfolio
+      - link "Strategy Lab" [ref=e42] [cursor=pointer]:
+        - /url: /lab
+        - img [ref=e43]
+        - generic [ref=e50]: Strategy Lab
+      - link "Data" [ref=e51] [cursor=pointer]:
+        - /url: /data
+        - img [ref=e52]
+        - generic [ref=e56]: Data
+      - link "Task Hub" [ref=e57] [cursor=pointer]:
+        - /url: /tasks
+        - img [ref=e58]
+        - generic [ref=e60]: Task Hub
+      - link "Logging" [ref=e61] [cursor=pointer]:
+        - /url: /logging
+        - img [ref=e62]
+        - generic [ref=e67]: Logging
+      - generic "Coming soon" [ref=e68]:
+        - img [ref=e69]
+        - generic [ref=e74]: Accounts
+  - main [ref=e75]:
+    - link "Task Hub 0 running · 0 total Open" [ref=e79] [cursor=pointer]:
+      - /url: /tasks
+      - generic [ref=e80]:
+        - img [ref=e82]
+        - generic [ref=e84]:
+          - generic [ref=e85]: Task Hub
+          - generic [ref=e86]: 0 running · 0 total
+      - generic [ref=e87]: Open
+    - generic [ref=e88]: Loading replay data...

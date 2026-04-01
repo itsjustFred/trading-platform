@@ -101,6 +101,10 @@ export interface Trade {
   exit_time_iso?: string;
   exit_price: number;
   quantity: number;
+  position_size?: number | null;
+  risk_amount?: number | null;
+  risk_percent?: number | null;
+  exit_reason?: string | null;
   pnl: number;
   pnl_pct: number;
   duration: string;
@@ -158,6 +162,14 @@ export interface MissingOHLCVDetail {
     start?: string;
     end?: string;
   };
+}
+
+export interface DataCheckResponse {
+  available: boolean;
+  missing_range: {
+    start: string;
+    end: string;
+  } | null;
 }
 
 export interface IndicatorPoint {
@@ -411,6 +423,10 @@ export interface LiveTradeSlippage {
   slippage_bps: number;
   filled_qty: number;
   commission: number;
+  position_size?: number | null;
+  risk_amount?: number | null;
+  risk_percent?: number | null;
+  exit_reason?: string | null;
   signal_timestamp: string;
   signal_time: number;
   execution_timestamp: string;

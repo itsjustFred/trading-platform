@@ -222,6 +222,10 @@ class Trade:
     pnl: float  # gross PnL (sum over all exits)
 
     # Optional fields
+    position_size: float | None = None
+    risk_amount: float | None = None
+    risk_percent: float | None = None
+    exit_reason: str | None = None
     pnl_pct: float | None = None
     fees: float | None = None  # total fees (entry + all exits)
     net_pnl: float | None = None
@@ -244,7 +248,19 @@ class Trade:
             "pnl": self.pnl,
         }
         # Only include optional fields if set
-        for fld in ("pnl_pct", "fees", "net_pnl", "r_multiple", "mae", "mfe", "holding_bars"):
+        for fld in (
+            "position_size",
+            "risk_amount",
+            "risk_percent",
+            "exit_reason",
+            "pnl_pct",
+            "fees",
+            "net_pnl",
+            "r_multiple",
+            "mae",
+            "mfe",
+            "holding_bars",
+        ):
             val = getattr(self, fld)
             if val is not None:
                 d[fld] = val
@@ -265,6 +281,10 @@ class Trade:
             quantity=d["quantity"],
             exits=[TradeExit.from_dict(e) for e in d["exits"]],
             pnl=d["pnl"],
+            position_size=d.get("position_size"),
+            risk_amount=d.get("risk_amount"),
+            risk_percent=d.get("risk_percent"),
+            exit_reason=d.get("exit_reason"),
             pnl_pct=d.get("pnl_pct"),
             fees=d.get("fees"),
             net_pnl=d.get("net_pnl"),

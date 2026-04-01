@@ -46,6 +46,7 @@ export type TradingViewChartExit = {
   time: TradingViewChartTime;
   price: number;
   pnl?: number;
+  reason?: string | null;
 };
 
 export type TradingViewChartTrade = {
@@ -55,6 +56,9 @@ export type TradingViewChartTrade = {
   direction?: string;
   entry_time: TradingViewChartTime;
   entry_price: number;
+  quantity?: number;
+  position_size?: number | null;
+  exit_reason?: string | null;
   exit_time?: TradingViewChartTime;
   exit_price?: number;
   exits?: TradingViewChartExit[];
@@ -134,12 +138,52 @@ function formatPnl(value: number | null | undefined): string {
   })}`;
 }
 
+function formatLotSize(value: number | null | undefined): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) {
+    return "N/A";
+  }
+  return value.toLocaleString("en-US", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 4,
+  });
+}
+
+function normalizeExitReason(reason: unknown): string {
+  const value = String(reason || "").trim().toLowerCase();
+  if (!value) {
+    return "Signal";
+  }
+  if (value === "tp" || value.includes("take_profit") || value.includes("take profit")) {
+    return "TP";
+  }
+  if (value.includes("trailing")) {
+    return "Trailing SL";
+  }
+  if (
+    value === "sl" ||
+    value.includes("stop_loss") ||
+    value.includes("stop loss") ||
+    value.includes("stopped")
+  ) {
+    return "SL";
+  }
+  return "Signal";
+}
+
 function formatMarkerTime(time: unknown): string {
   const normalized = normalizeUnixTime(time);
   if (normalized === null) {
     return "—";
   }
   return new Date(normalized * 1000).toISOString().slice(0, 16).replace("T", " ");
+}
+
+function resolveChartLocale(): string {
+  if (typeof navigator === "undefined") {
+    return "en-US";
+  }
+  const language = String(navigator.language || "").trim();
+  return language && language !== "undefined" ? language : "en-US";
 }
 
 function findNearestBarIndex(times: number[], target: number): number {
@@ -343,9 +387,11 @@ export function TradingViewChart({
     }
     const container = chartContainerRef.current;
     const width = container.clientWidth || 960;
+    const locale = resolveChartLocale();
     const chart = createChart(container, {
       width,
       height,
+      localization: { locale },
       layout: {
         background: { type: ColorType.Solid, color: "#0d1117" },
         textColor: "#8b949e",
@@ -512,6 +558,8 @@ export function TradingViewChart({
       const tradeKey = String(trade.id ?? trade.nr ?? index);
       const direction = String(trade.direction || "").toUpperCase();
       const isLong = direction !== "SHORT";
+      const entryVerb = isLong ? "BUY" : "SELL";
+      const lotSize = formatLotSize(trade.position_size ?? trade.quantity);
       const entryTime = toChartTime(trade.entry_time);
       if (entryTime !== null) {
         const entryId = `entry-${tradeKey}`;
@@ -519,14 +567,15 @@ export function TradingViewChart({
           id: entryId,
           time: entryTime,
           position: isLong ? "belowBar" : "aboveBar",
-          color: "#58a6ff",
+          color: "#3fb950",
           shape: isLong ? "arrowUp" : "arrowDown",
-          text: `Entry #${trade.nr ?? tradeKey}`,
+          text: `${entryVerb} ${lotSize} @ ${Number(trade.entry_price).toFixed(2)}`,
         });
         markerDetails.set(
           entryId,
           [
             `Trade #${trade.nr ?? tradeKey} ${direction || ""}`.trim(),
+            `${entryVerb} ${lotSize} @ ${Number(trade.entry_price).toFixed(2)}`,
             `Entry: ${formatPrice(trade.entry_price)}`,
             `Time: ${formatMarkerTime(trade.entry_time)}`,
             `P&L: ${formatPnl(trade.pnl)}`,
@@ -548,20 +597,22 @@ export function TradingViewChart({
         }
         const isFinal = exitIndex === exits.length - 1;
         const pnlValue = exit.pnl ?? trade.pnl ?? 0;
-        const exitColor = isFinal ? (pnlValue >= 0 ? "#3fb950" : "#f85149") : "#d29922";
+        const exitColor = "#f85149";
         const exitId = `exit-${tradeKey}-${exitIndex}`;
+        const reasonLabel = normalizeExitReason(exit.reason ?? trade.exit_reason);
         markers.push({
           id: exitId,
           time: exitTime,
           position: isLong ? "aboveBar" : "belowBar",
           color: exitColor,
           shape: isLong ? "arrowDown" : "arrowUp",
-          text: isFinal ? `Exit #${trade.nr ?? tradeKey}` : "Partial Exit",
+          text: `EXIT ${lotSize} @ ${Number(exit.price).toFixed(2)} · ${reasonLabel}`,
         });
         markerDetails.set(
           exitId,
           [
             `Trade #${trade.nr ?? tradeKey} ${isFinal ? "Exit" : "Partial Exit"}`,
+            `EXIT ${lotSize} @ ${Number(exit.price).toFixed(2)} · ${reasonLabel}`,
             `Price: ${formatPrice(exit.price)}`,
             `Time: ${formatMarkerTime(exit.time)}`,
             `P&L: ${formatPnl(pnlValue)}`,
