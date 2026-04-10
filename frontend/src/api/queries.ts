@@ -27,7 +27,7 @@ export function useStrategies(
   return useQuery({
     queryKey: ["strategies"],
     queryFn: getStrategies,
-    staleTime: 60_000,
+    staleTime: 300_000,
     ...options,
   });
 }
@@ -64,8 +64,8 @@ export function useLiveQuotes(
     queryKey: ["live-quotes", symbol],
     queryFn: () => getLiveQuote(symbol),
     enabled: Boolean(symbol) && (options?.enabled ?? true),
-    refetchInterval: 5_000,
-    staleTime: 4_000,
+    refetchInterval: 30_000,
+    staleTime: 30_000,
     ...options,
   });
 }
@@ -78,8 +78,8 @@ export function useLivePositions(
     queryKey: ["live-positions", accountId],
     queryFn: () => getLivePositions(accountId),
     enabled: Boolean(accountId) && (options?.enabled ?? true),
-    refetchInterval: 5_000,
-    staleTime: 4_000,
+    refetchInterval: 30_000,
+    staleTime: 30_000,
     ...options,
   });
 }
@@ -93,8 +93,8 @@ export function useLiveSignalLog(
     queryKey: ["live-signal-log", accountId, limit],
     queryFn: () => getLiveSignalLog(accountId, limit),
     enabled: Boolean(accountId) && (options?.enabled ?? true),
-    refetchInterval: 5_000,
-    staleTime: 4_000,
+    refetchInterval: 30_000,
+    staleTime: 30_000,
     ...options,
   });
 }

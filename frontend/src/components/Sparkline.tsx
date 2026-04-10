@@ -1,8 +1,10 @@
+import { memo } from "react";
+
 /**
  * Sparkline — tiny SVG equity curve for card previews.
  * Green if last > first (profitable), red otherwise.
  */
-export function Sparkline({
+export const Sparkline = memo(function Sparkline({
   data,
   width = 200,
   height = 50,
@@ -42,4 +44,4 @@ export function Sparkline({
       />
     </svg>
   );
-}
+});

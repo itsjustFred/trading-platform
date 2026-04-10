@@ -211,10 +211,14 @@ class YFinanceDownloader(Downloader):
             )
 
         if isinstance(df.columns, pd.MultiIndex):
-            df.columns = [str(level0) for level0, _ in df.columns]
+            df.columns = [
+                str(column[0]) if isinstance(column, tuple) and len(column) > 0 else str(column)
+                for column in df.columns
+            ]
         df.columns = [str(col).strip().lower() for col in df.columns]
 
         df = df.reset_index()
+        df.columns = [str(col).strip().lower() for col in df.columns]
         ts_column = None
         for candidate in ("datetime", "date", "timestamp"):
             if candidate in df.columns:

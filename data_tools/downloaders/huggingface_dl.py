@@ -1,77 +1,215 @@
 """
-HuggingFace Downloader — datasets from HuggingFace Hub.
+HuggingFace OHLCV downloader for mito0o852/OHLCV-1m.
 
-Downloads Parquet datasets via the HuggingFace Datasets API / direct file download.
-Many financial datasets are available, often already in Parquet format.
+The upstream dataset is published as monthly parquet files:
+  https://huggingface.co/datasets/mito0o852/OHLCV-1m/resolve/main/data/ohlcv_YYYY-MM.parquet
 
-Examples:
-  - edarchimbaud/timeseries-1d-sp500 (S&P 500 daily OHLCV)
-  - edarchimbaud/timeseries-1h-all-crypto (crypto 1h)
-  - alexbrockman/equity-bars (equity tick data)
-
-Usage:
-    python -m data_tools.downloaders.huggingface_dl --dataset edarchimbaud/timeseries-1d-sp500 \\
-        --symbol AAPL --output ~/data
-
-    python -m data_tools.downloaders.huggingface_dl --list
+Canonical output path:
+  {output_dir}/ohlcv/huggingface/equity/US/{symbol}/{timeframe}.parquet
 """
 
 from __future__ import annotations
 
+import argparse
 import logging
-import os
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
-import requests
 
-from data_tools.downloaders.base import Downloader, DownloadResult, SourceMeta
-from shared.constants import DATA_DIR
+from data_tools.downloaders.base import DownloadResult, Downloader, SourceMeta
+from shared.constants import DATA_DIR, normalize_timeframe
 
 logger = logging.getLogger(__name__)
 
-HF_API = "https://huggingface.co/api/datasets"
+DATASET_ID = "mito0o852/OHLCV-1m"
+MONTHLY_URL_TEMPLATE = (
+    "https://huggingface.co/datasets/mito0o852/OHLCV-1m/resolve/main/data/ohlcv_{year:04d}-{month:02d}.parquet"
+)
+DEFAULT_START_DATE = "1994-10-01"
+HF_COVERAGE_END = "2025-07-31"
 
-# Well-known financial datasets on HuggingFace
-KNOWN_DATASETS = [
-    {
-        "dataset": "edarchimbaud/timeseries-1d-sp500",
-        "description": "S&P 500 daily OHLCV",
-        "asset_class": "equity",
-        "timeframe": "1d",
-    },
-    {
-        "dataset": "edarchimbaud/timeseries-1h-all-crypto",
-        "description": "Crypto 1h OHLCV (all major pairs)",
-        "asset_class": "crypto",
-        "timeframe": "1h",
-    },
-]
+TIMEFRAME_MAP: dict[str, str] = {
+    "m1": "1m",
+    "1m": "1m",
+    "m5": "5m",
+    "5m": "5m",
+    "m15": "15m",
+    "15m": "15m",
+    "m30": "30m",
+    "30m": "30m",
+    "h1": "1h",
+    "1h": "1h",
+    "d1": "1d",
+    "1d": "1d",
+}
+
+RESAMPLE_RULES: dict[str, str] = {
+    "1m": "1min",
+    "5m": "5min",
+    "15m": "15min",
+    "30m": "30min",
+    "1h": "1h",
+    "1d": "1d",
+}
+
+
+def _normalize_supported_timeframe(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    canonical = TIMEFRAME_MAP.get(normalized) or TIMEFRAME_MAP.get(normalize_timeframe(normalized))
+    if not canonical:
+        raise ValueError(
+            f"Unsupported timeframe '{value}'. Supported: {sorted(set(TIMEFRAME_MAP.values()))}"
+        )
+    return canonical
+
+
+def _to_utc_timestamp(value: str | None) -> pd.Timestamp | None:
+    if value is None or not str(value).strip():
+        return None
+    ts = pd.to_datetime(value, utc=True, errors="raise")
+    if isinstance(ts, pd.DatetimeIndex):
+        if len(ts) == 0:
+            return None
+        return pd.Timestamp(ts[0])
+    return pd.Timestamp(ts)
+
+
+def _month_sequence(start: pd.Timestamp, end: pd.Timestamp) -> list[tuple[int, int]]:
+    months: list[tuple[int, int]] = []
+    cursor = pd.Timestamp(year=start.year, month=start.month, day=1, tz="UTC")
+    limit = pd.Timestamp(year=end.year, month=end.month, day=1, tz="UTC")
+    while cursor <= limit:
+        months.append((int(cursor.year), int(cursor.month)))
+        if cursor.month == 12:
+            cursor = pd.Timestamp(year=cursor.year + 1, month=1, day=1, tz="UTC")
+        else:
+            cursor = pd.Timestamp(year=cursor.year, month=cursor.month + 1, day=1, tz="UTC")
+    return months
+
+
+def _parse_csv_list(raw: str) -> list[str]:
+    return [item.strip() for item in str(raw or "").split(",") if item.strip()]
+
+
+def _first_matching_column(columns: list[str], candidates: tuple[str, ...]) -> str | None:
+    lowered = {column.lower(): column for column in columns}
+    for candidate in candidates:
+        if candidate in lowered:
+            return lowered[candidate]
+    return None
 
 
 class HuggingFaceDownloader(Downloader):
-    """Downloads financial datasets from HuggingFace Hub."""
-
-    def __init__(self, token: str | None = None):
-        self.token = token or os.environ.get("HF_TOKEN", "")
-
     @property
     def source_name(self) -> str:
         return "huggingface"
 
-    def list_available(self, **kwargs) -> list[dict]:
+    def list_available(self, **kwargs) -> list[dict[str, Any]]:
         return [
             {
                 "symbol": "*",
-                "dataset": d["dataset"],
-                "description": d["description"],
-                "asset_class": d["asset_class"],
-                "timeframe": d["timeframe"],
+                "dataset": DATASET_ID,
+                "description": "US stocks 1m OHLCV monthly parquet files",
+                "asset_class": "equity",
+                "region": "US",
+                "timeframes": sorted(RESAMPLE_RULES.keys()),
+                "coverage_end": HF_COVERAGE_END,
             }
-            for d in KNOWN_DATASETS
         ]
+
+    def _make_us_equity_output_path(self, output_dir: Path, symbol: str, timeframe: str) -> Path:
+        path = output_dir / "ohlcv" / self.source_name / "equity" / "US" / symbol / f"{timeframe}.parquet"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _normalize_month_frame(
+        self,
+        frame: pd.DataFrame,
+        *,
+        symbol: str,
+        start_ts: pd.Timestamp,
+        end_ts: pd.Timestamp,
+    ) -> pd.DataFrame:
+        if frame is None or frame.empty:
+            return pd.DataFrame()
+
+        working = frame.copy()
+        working.columns = [str(column).strip() for column in working.columns]
+        timestamp_column = _first_matching_column(
+            list(working.columns),
+            ("timestamp", "datetime", "date", "time"),
+        )
+        if timestamp_column is None:
+            return pd.DataFrame()
+
+        symbol_column = _first_matching_column(
+            list(working.columns),
+            ("symbol", "ticker", "sym"),
+        )
+        if symbol_column is not None:
+            working = working[working[symbol_column].astype(str).str.upper() == symbol]
+        if working.empty:
+            return pd.DataFrame()
+
+        rename_map: dict[str, str] = {timestamp_column: "timestamp"}
+        for canonical in ("open", "high", "low", "close", "volume"):
+            column = _first_matching_column(list(working.columns), (canonical,))
+            if column is not None:
+                rename_map[column] = canonical
+        working = working.rename(columns=rename_map)
+        required = {"timestamp", "open", "high", "low", "close"}
+        if not required.issubset(set(working.columns)):
+            return pd.DataFrame()
+
+        if "volume" not in working.columns:
+            working["volume"] = 0
+
+        working["timestamp"] = pd.to_datetime(working["timestamp"], utc=True, errors="coerce")
+        for column in ("open", "high", "low", "close", "volume"):
+            working[column] = pd.to_numeric(working[column], errors="coerce")
+
+        working = working.dropna(subset=["timestamp", "open", "high", "low", "close"])
+        if working.empty:
+            return pd.DataFrame()
+
+        working = working[
+            (working["timestamp"] >= start_ts)
+            & (working["timestamp"] <= end_ts)
+        ]
+        if working.empty:
+            return pd.DataFrame()
+
+        return (
+            working[["timestamp", "open", "high", "low", "close", "volume"]]
+            .sort_values("timestamp")
+            .drop_duplicates(subset=["timestamp"], keep="last")
+            .reset_index(drop=True)
+        )
+
+    def _resample(self, frame: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+        if frame.empty:
+            return frame
+        if timeframe == "1m":
+            return frame
+        rule = RESAMPLE_RULES[timeframe]
+        resampled = (
+            frame.set_index("timestamp")
+            .resample(rule)
+            .agg(
+                {
+                    "open": "first",
+                    "high": "max",
+                    "low": "min",
+                    "close": "last",
+                    "volume": "sum",
+                }
+            )
+            .dropna(subset=["open", "high", "low", "close"])
+            .reset_index()
+        )
+        return resampled
 
     def download(
         self,
@@ -81,182 +219,151 @@ class HuggingFaceDownloader(Downloader):
         *,
         start: str | None = None,
         end: str | None = None,
-        dataset: str = "edarchimbaud/timeseries-1d-sp500",
-        asset_class: str = "equity",
         **kwargs,
     ) -> DownloadResult:
-        symbol = symbol.upper()
-        logger.info("Downloading %s from HuggingFace dataset %s", symbol, dataset)
-        out_path = self._make_output_path(output_dir, asset_class, symbol, timeframe)
-        effective_start = self._resolve_resume_start(out_path, start)
+        normalized_symbol = str(symbol or "").strip().upper()
+        if not normalized_symbol:
+            raise ValueError("symbol is required")
 
-        # Try using the datasets library first (more reliable)
-        df = self._download_via_api(dataset, symbol)
+        canonical_tf = _normalize_supported_timeframe(timeframe)
+        out_path = self._make_us_equity_output_path(output_dir, normalized_symbol, canonical_tf)
 
-        if df is None or df.empty:
-            raise RuntimeError(f"No data for {symbol} in {dataset}")
+        resume_start = self._resolve_resume_start(out_path, start) or DEFAULT_START_DATE
+        parsed_start = _to_utc_timestamp(resume_start)
+        parsed_end = _to_utc_timestamp(end) or _to_utc_timestamp(HF_COVERAGE_END)
+        coverage_end = _to_utc_timestamp(HF_COVERAGE_END)
+        if parsed_start is None or parsed_end is None or coverage_end is None:
+            raise RuntimeError("Could not resolve HuggingFace date boundaries")
 
-        # Normalize columns
-        df.columns = [c.lower() for c in df.columns]
-        col_map = {}
-        for c in df.columns:
-            if c in ("date", "datetime", "time"):
-                col_map[c] = "timestamp"
-        df = df.rename(columns=col_map)
+        warnings: list[str] = []
+        if parsed_end > coverage_end:
+            warnings.append(
+                f"Requested end clipped to {HF_COVERAGE_END} (HuggingFace dataset coverage limit)."
+            )
+            parsed_end = coverage_end
 
-        if "timestamp" in df.columns:
-            df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+        if parsed_start > parsed_end:
+            raise ValueError(
+                f"Requested range is outside HuggingFace coverage ({DEFAULT_START_DATE} → {HF_COVERAGE_END})."
+            )
 
-        for col in ["open", "high", "low", "close", "volume"]:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
+        months = _month_sequence(parsed_start, parsed_end)
+        monthly_frames: list[pd.DataFrame] = []
 
-        # Filter by date
-        if "timestamp" in df.columns:
-            if effective_start:
-                df = df[df["timestamp"] >= effective_start]
-            if end:
-                df = df[df["timestamp"] <= end]
+        for index, (year, month) in enumerate(months, start=1):
+            month_label = f"{year:04d}-{month:02d}"
+            logger.info("HuggingFace download progress %s/%s: %s", index, len(months), month_label)
+            url = MONTHLY_URL_TEMPLATE.format(year=year, month=month)
+            try:
+                month_frame = pd.read_parquet(url)
+            except Exception as exc:
+                warnings.append(f"Skipping {month_label}: {exc}")
+                continue
 
-        keep = [
-            c for c in ["timestamp", "open", "high", "low", "close", "volume"] if c in df.columns
-        ]
-        df = df[keep].dropna(subset=["open"]).sort_values("timestamp").reset_index(drop=True)
+            normalized = self._normalize_month_frame(
+                month_frame,
+                symbol=normalized_symbol,
+                start_ts=parsed_start,
+                end_ts=parsed_end,
+            )
+            if not normalized.empty:
+                monthly_frames.append(normalized)
 
-        combined = self._merge_and_store_single_file(out_path, df)
+        if not monthly_frames:
+            raise RuntimeError(
+                f"No {normalized_symbol} rows found in {DATASET_ID} for {parsed_start.date()} → {parsed_end.date()}."
+            )
 
-        return DownloadResult(
-            symbol=symbol,
-            timeframe=timeframe,
-            source=self.source_name,
-            asset_class=asset_class,
-            path=out_path,
-            rows=len(combined),
-            start=str(combined["timestamp"].iloc[0]) if "timestamp" in combined.columns and len(combined) > 0 else "",
-            end=str(combined["timestamp"].iloc[-1]) if "timestamp" in combined.columns and len(combined) > 0 else "",
-            size_bytes=out_path.stat().st_size,
+        combined_months = (
+            pd.concat(monthly_frames, ignore_index=True)
+            .sort_values("timestamp")
+            .drop_duplicates(subset=["timestamp"], keep="last")
+            .reset_index(drop=True)
         )
+        prepared = self._resample(combined_months, canonical_tf)
+        if prepared.empty:
+            raise RuntimeError(
+                f"HuggingFace download produced no rows for {normalized_symbol} ({canonical_tf})."
+            )
 
-    def _download_via_api(self, dataset: str, symbol: str) -> pd.DataFrame | None:
-        """Download dataset via HuggingFace API (parquet files)."""
-        try:
-            # List parquet files in the dataset
-            headers = {}
-            if self.token:
-                headers["Authorization"] = f"Bearer {self.token}"
-
-            api_url = f"{HF_API}/{dataset}/parquet"
-            resp = requests.get(api_url, headers=headers, timeout=30)
-
-            if resp.status_code != 200:
-                logger.warning("HF API returned %d for %s", resp.status_code, dataset)
-                return self._download_via_hub_lib(dataset, symbol)
-
-            parquet_info = resp.json()
-
-            # Download parquet files
-            all_dfs = []
-            # parquet_info can be a dict of split->files or a list
-            files = []
-            if isinstance(parquet_info, dict):
-                for split_files in parquet_info.values():
-                    if isinstance(split_files, list):
-                        files.extend(split_files)
-            elif isinstance(parquet_info, list):
-                files = parquet_info
-
-            for file_url in files[:5]:  # limit to first 5 files to avoid huge downloads
-                url = file_url if isinstance(file_url, str) else file_url.get("url", "")
-                if not url:
-                    continue
-                try:
-                    df = pd.read_parquet(url)
-                    # Filter for symbol if there's a symbol column
-                    sym_cols = [c for c in df.columns if c.lower() in ("symbol", "ticker", "sym")]
-                    if sym_cols:
-                        df = df[df[sym_cols[0]].str.upper() == symbol]
-                    if not df.empty:
-                        all_dfs.append(df)
-                except Exception as e:
-                    logger.debug("Could not read parquet %s: %s", url, e)
-
-            if all_dfs:
-                return pd.concat(all_dfs, ignore_index=True)
-            return None
-
-        except Exception as e:
-            logger.warning("HF API download failed: %s", e)
-            return self._download_via_hub_lib(dataset, symbol)
-
-    def _download_via_hub_lib(self, dataset: str, symbol: str) -> pd.DataFrame | None:
-        """Fallback: try using the `datasets` library if installed."""
-        try:
-            from datasets import load_dataset
-
-            ds = load_dataset(dataset, split="train", streaming=True)
-            rows = []
-            for row in ds:
-                sym_val = row.get("symbol", row.get("ticker", ""))
-                if str(sym_val).upper() == symbol:
-                    rows.append(row)
-                if len(rows) >= 100_000:
-                    break
-            if rows:
-                return pd.DataFrame(rows)
-        except ImportError:
-            logger.debug("`datasets` library not installed, skipping hub fallback")
-        except Exception as e:
-            logger.debug("Hub lib fallback failed: %s", e)
-        return None
+        stored = self._merge_and_store_single_file(out_path, prepared)
+        return DownloadResult(
+            symbol=normalized_symbol,
+            timeframe=canonical_tf,
+            source=self.source_name,
+            asset_class="equity",
+            path=out_path,
+            rows=len(stored),
+            start=str(stored["timestamp"].iloc[0]),
+            end=str(stored["timestamp"].iloc[-1]),
+            size_bytes=out_path.stat().st_size,
+            warnings=warnings,
+        )
 
     def get_source_meta(self) -> SourceMeta:
         return SourceMeta(
             name=self.source_name,
-            url="https://huggingface.co",
+            url=f"https://huggingface.co/datasets/{DATASET_ID}",
             license="varies",
             update_frequency="manual",
             downloaded_at=datetime.now(timezone.utc).isoformat(),
         )
 
 
-# ─── CLI ─────────────────────────────────────────────────────────────────────
-
-
-def main():
-    import argparse
-
-    parser = argparse.ArgumentParser(description="Download from HuggingFace")
-    parser.add_argument("--symbol", help="Symbol to download")
-    parser.add_argument("--timeframe", default="1d")
-    parser.add_argument("--dataset", default="edarchimbaud/timeseries-1d-sp500")
-    parser.add_argument("--asset-class", default="equity")
-    parser.add_argument("--start", help="Start date")
-    parser.add_argument("--end", help="End date")
-    parser.add_argument("--output", default=str(DATA_DIR))
-    parser.add_argument("--list", action="store_true")
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Download OHLCV data from HuggingFace monthly parquet files")
+    parser.add_argument("--symbols", required=True, help="Comma-separated symbols (e.g. AAPL,MSFT)")
+    parser.add_argument(
+        "--timeframes",
+        default="1m",
+        help="Comma-separated timeframes (1m,5m,15m,30m,1h,1d)",
+    )
+    parser.add_argument("--start", default=DEFAULT_START_DATE, help="Start date (YYYY-MM-DD)")
+    parser.add_argument("--end", default=HF_COVERAGE_END, help="End date (YYYY-MM-DD)")
+    parser.add_argument("--output", default=str(DATA_DIR), help="Output data directory")
+    parser.add_argument("--list", action="store_true", help="List source metadata and exit")
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
-    dl = HuggingFaceDownloader()
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    downloader = HuggingFaceDownloader()
 
     if args.list:
-        for item in dl.list_available():
-            print(f"  {item['dataset']:45s}  {item['description']}")
+        for item in downloader.list_available():
+            print(
+                f"{item['dataset']} | {item['description']} | tf={','.join(item['timeframes'])} | end={item['coverage_end']}"
+            )
         return
 
-    if not args.symbol:
-        parser.error("--symbol required (or use --list)")
+    symbols = [item.upper() for item in _parse_csv_list(args.symbols)]
+    timeframes = _parse_csv_list(args.timeframes)
+    if not symbols:
+        parser.error("--symbols must include at least one symbol")
+    if not timeframes:
+        parser.error("--timeframes must include at least one timeframe")
 
-    result = dl.download(
-        args.symbol,
-        args.timeframe,
-        Path(args.output),
-        dataset=args.dataset,
-        asset_class=args.asset_class,
-        start=args.start,
-        end=args.end,
-    )
-    print(f"✅ {result.symbol}: {result.rows} rows → {result.path}")
+    output_dir = Path(args.output).expanduser().resolve()
+    failures: list[str] = []
+    for symbol in symbols:
+        for timeframe in timeframes:
+            try:
+                result = downloader.download(
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    output_dir=output_dir,
+                    start=args.start or None,
+                    end=args.end or None,
+                )
+                warning_suffix = f" warnings={len(result.warnings)}" if result.warnings else ""
+                print(f"✅ {result.symbol} {result.timeframe}: {result.rows} rows → {result.path}{warning_suffix}")
+                for warning in result.warnings:
+                    print(f"⚠️  {warning}")
+            except Exception as exc:
+                message = f"{symbol} {timeframe}: {exc}"
+                failures.append(message)
+                print(f"❌ {message}")
+
+    if failures:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

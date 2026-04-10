@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { ArrowLeft, Radio } from "lucide-react";
 import {
@@ -29,6 +29,7 @@ import type {
   LiveSignalLog,
   LiveTradeSlippage,
 } from "../api/types";
+import { TradeTable, type TradeTableRow } from "../components/TradeTable";
 
 type AccountHeaderStats = {
   balance: number;
@@ -175,6 +176,23 @@ export function LiveViewerPage() {
   const selectedTrades = useMemo(
     () => trades.filter((trade) => trade.symbol.toUpperCase() === effectiveSymbol.toUpperCase()),
     [trades, effectiveSymbol],
+  );
+  const selectedTradeRows = useMemo<TradeTableRow[]>(
+    () =>
+      selectedTrades.map((trade) => ({
+        id: trade.id,
+        time: trade.time,
+        symbol: trade.symbol,
+        side: trade.side,
+        size: trade.size,
+        entryPrice: trade.entry,
+        exitPrice: trade.exit,
+        pnl: trade.pnl,
+        pnlPct: null,
+        exitReason: trade.exitReason,
+        duration: null,
+      })),
+    [selectedTrades],
   );
 
   const headerStats = useMemo<AccountHeaderStats>(() => {
@@ -454,7 +472,7 @@ export function LiveViewerPage() {
           {selectedTrades.length === 0 ? (
             <EmptyState label="No completed trades" />
           ) : (
-            <TradeHistoryTable rows={selectedTrades.slice(0, 80)} />
+            <TradeTable trades={selectedTradeRows} />
           )}
         </div>
       </section>
@@ -761,48 +779,7 @@ function SignalLogTable({ signals, loading }: { signals: LiveSignalLog[]; loadin
   );
 }
 
-function TradeHistoryTable({ rows }: { rows: ViewerTrade[] }) {
-  return (
-    <div style={{ maxHeight: "350px", overflowY: "auto", border: "1px solid var(--color-border)", borderRadius: "10px" }}>
-      <table style={tableStyle}>
-        <thead>
-          <tr>
-            <th style={thStyle}>Time</th>
-            <th style={thStyle}>Symbol</th>
-            <th style={thStyle}>Side</th>
-            <th style={thStyle}>Size</th>
-            <th style={thStyle}>Entry</th>
-            <th style={thStyle}>Exit</th>
-            <th style={thStyle}>P&L</th>
-            <th style={thStyle}>Exit Reason</th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((row) => (
-            <tr key={row.id}>
-              <td style={tdStyle}>{formatTableTime(row.time)}</td>
-              <td style={tdStyle}>{row.symbol}</td>
-              <td style={tdStyle}>
-                <span style={sideBadgeStyle(row.side === "BUY" ? 1 : -1)}>{row.side}</span>
-              </td>
-              <td style={tdStyle}>{row.size.toFixed(2)}</td>
-              <td style={tdStyle}>{formatPrice(row.entry)}</td>
-              <td style={tdStyle}>{row.exit != null ? formatPrice(row.exit) : "—"}</td>
-              <td style={tdStyle}>
-                <span style={{ color: asFinite(row.pnl, 0) >= 0 ? "#86efac" : "#fecaca" }}>
-                  {row.pnl != null ? formatSignedUsd(row.pnl) : "—"}
-                </span>
-              </td>
-              <td style={tdStyle}>{row.exitReason || "—"}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  );
-}
-
-function HeaderStatCard({
+const HeaderStatCard = memo(function HeaderStatCard({
   label,
   value,
   subtitle,
@@ -836,9 +813,9 @@ function HeaderStatCard({
       ) : null}
     </div>
   );
-}
+});
 
-function MiniMetric({
+const MiniMetric = memo(function MiniMetric({
   label,
   value,
   tone = "neutral",
@@ -863,9 +840,9 @@ function MiniMetric({
       </span>
     </div>
   );
-}
+});
 
-function EmptyState({ label }: { label: string }) {
+const EmptyState = memo(function EmptyState({ label }: { label: string }) {
   return (
     <div
       style={{
@@ -881,7 +858,7 @@ function EmptyState({ label }: { label: string }) {
       {label}
     </div>
   );
-}
+});
 
 function toTradeHistoryRows(rows: LiveTradeSlippage[]): ViewerTrade[] {
   return rows.map((row) => {
@@ -1118,6 +1095,12 @@ function formatQty(value: number): string {
   });
 }
 
+function formatTableTime(value: string): string {
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed)) return "—";
+  return new Date(parsed).toISOString().slice(0, 19).replace("T", " ");
+}
+
 function calcPnlPercent(position: LivePosition): number {
   const entry = asFinite(position.entry_price, 0);
   const qty = Math.abs(asFinite(position.qty, 0));
@@ -1125,12 +1108,6 @@ function calcPnlPercent(position: LivePosition): number {
   const notional = entry * qty;
   if (notional <= 0) return 0;
   return (asFinite(position.unrealized_pnl, 0) / notional) * 100;
-}
-
-function formatTableTime(value: string): string {
-  const parsed = Date.parse(value);
-  if (!Number.isFinite(parsed)) return "—";
-  return new Date(parsed).toISOString().slice(0, 19).replace("T", " ");
 }
 
 function formatCountdown(totalSeconds: number): string {

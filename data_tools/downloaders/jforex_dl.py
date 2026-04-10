@@ -140,7 +140,8 @@ def _java_exception_types() -> tuple[type[BaseException], ...]:
 
 
 def _raise_jforex_runtime_error(context: str, exc: BaseException) -> None:
-    logger.exception("%s: %s", context, exc)
+    logger.warning("%s: %s", context, exc)
+    logger.debug("JForex runtime error details", exc_info=(type(exc), exc, exc.__traceback__))
     raise RuntimeError(f"{context}: {exc}") from exc
 
 

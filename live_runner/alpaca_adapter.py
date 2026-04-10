@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
 import re
 from collections.abc import Mapping
@@ -176,12 +177,41 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             ) from exc
         self._trading_client = TradingClient(self.api_key, self.secret_key, paper=self.paper)
         self._trading_stream = TradingStream(self.api_key, self.secret_key, paper=self.paper)
-        self._trading_client.get_account()
+        try:
+            self._trading_client.get_account()
+        except Exception:
+            await self.disconnect()
+            raise
         self._connected = True
         logger.info(
             "Connected Alpaca live adapter",
             extra={"data": {"account_id": self.account_id, "paper": self.paper}},
         )
+
+    async def disconnect(self) -> None:
+        stream = self._trading_stream
+        self._trading_stream = None
+        self._trading_client = None
+        self._connected = False
+        if stream is None:
+            return
+
+        stop_ws = getattr(stream, "stop_ws", None)
+        stop = getattr(stream, "stop", None)
+        try:
+            if callable(stop_ws):
+                result = stop_ws()
+                if inspect.isawaitable(result):
+                    await result
+            elif callable(stop):
+                result = stop()
+                if inspect.isawaitable(result):
+                    await result
+        except Exception as exc:
+            logger.warning(
+                "Failed to stop Alpaca stream cleanly",
+                extra={"data": {"account_id": self.account_id, "error": str(exc)}},
+            )
 
     async def submit_order(self, signal: LiveSignal) -> str:
         if not self._connected or self._trading_client is None:

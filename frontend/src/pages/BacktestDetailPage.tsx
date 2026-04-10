@@ -8,9 +8,10 @@ import {
   getBacktestCapm,
   getBenchmark,
   renameBacktest,
+  deleteBacktest,
 } from "../api/client";
 import { StatCard } from "../components/StatCard";
-import { DataTable } from "../components/DataTable";
+import { TradeTable, type TradeTableRow } from "../components/TradeTable";
 import { RenameModal } from "../components/RenameModal";
 import { OptimizeModal } from "../components/OptimizeModal";
 import { ArrowLeft, ArrowUpRight, PencilLine, Target } from "lucide-react";
@@ -40,26 +41,14 @@ import type {
   Trade,
 } from "../api/types";
 import { formatPValue, pValueColor } from "../utils/stats";
+import { useToast } from "../components/ToastProvider";
 
 const BENCHMARK_SYMBOLS = ["SPY", "QQQ", "IWM", "DIA", "GLD", "TLT", "XAUUSD"];
-
-function formatOptionalNumber(
-  value: number | null | undefined,
-  digits: number,
-  suffix = "",
-): string {
-  if (value === null || value === undefined || !Number.isFinite(value)) {
-    return "N/A";
-  }
-  return `${value.toLocaleString("en-US", {
-    minimumFractionDigits: digits,
-    maximumFractionDigits: digits,
-  })}${suffix}`;
-}
 
 export function BacktestDetailPage() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
+  const { showToast } = useToast();
   const [info, setInfo] = useState<BacktestInfo | null>(null);
   const [stats, setStats] = useState<BacktestStats | null>(null);
   const [trades, setTrades] = useState<Trade[]>([]);
@@ -75,6 +64,7 @@ export function BacktestDetailPage() {
   const [showOptimizeModal, setShowOptimizeModal] = useState(false);
   const [savingRename, setSavingRename] = useState(false);
   const [renameError, setRenameError] = useState("");
+  const [deleting, setDeleting] = useState(false);
 
   useEffect(() => {
     if (!id) return;
@@ -140,13 +130,33 @@ export function BacktestDetailPage() {
     setSavingRename(true);
     setRenameError("");
     try {
-      const updated = await renameBacktest(id, nextTitle);
-      setInfo(updated);
+      await renameBacktest(id, nextTitle);
+      const refreshed = await getBacktestInfo(id);
+      setInfo(refreshed);
       setShowRenameModal(false);
     } catch (renameIssue: any) {
       setRenameError(renameIssue.message || "Could not rename backtest");
     } finally {
       setSavingRename(false);
+    }
+  };
+
+  const handleDelete = async () => {
+    if (!id || deleting) return;
+    const confirmed = window.confirm("Delete this backtest?");
+    if (!confirmed) return;
+    setDeleting(true);
+    try {
+      await deleteBacktest(id);
+      showToast("Backtest deleted.", "success");
+      navigate("/backtests", { replace: true });
+    } catch (deleteIssue: unknown) {
+      const message =
+        deleteIssue instanceof Error && deleteIssue.message
+          ? deleteIssue.message
+          : "Could not delete backtest";
+      showToast(message, "error");
+      setDeleting(false);
     }
   };
 
@@ -163,116 +173,42 @@ export function BacktestDetailPage() {
       </div>
     );
 
-  // Trade stats
-  const wins = trades.filter((t) => t.pnl > 0);
-  const losses = trades.filter((t) => t.pnl <= 0);
-  const totalPnl = trades.reduce((s, t) => s + (t.pnl || 0), 0);
-  const avgPnl = trades.length > 0 ? totalPnl / trades.length : 0;
-  const bestTrade =
-    trades.length > 0 ? Math.max(...trades.map((t) => t.pnl || 0)) : 0;
-  const worstTrade =
-    trades.length > 0 ? Math.min(...trades.map((t) => t.pnl || 0)) : 0;
+  const totalPnl = trades.reduce((sum, trade) => sum + (trade.pnl || 0), 0);
+  const tradeStats = {
+    wins: trades.filter((t) => t.pnl > 0),
+    losses: trades.filter((t) => t.pnl <= 0),
+    totalPnl,
+    avgPnl: trades.length > 0 ? totalPnl / trades.length : 0,
+    bestTrade: trades.length > 0 ? Math.max(...trades.map((trade) => trade.pnl || 0)) : 0,
+    worstTrade: trades.length > 0 ? Math.min(...trades.map((trade) => trade.pnl || 0)) : 0,
+    longTrades: trades.filter((trade) => trade.direction === "LONG").length,
+    shortTrades: trades.filter((trade) => trade.direction === "SHORT").length,
+  };
 
-  const tradeColumns = [
-    { key: "nr", label: "#", width: "40px", align: "center" as const },
-    { key: "symbol", label: "Symbol", width: "70px", align: "center" as const },
-    {
-      key: "direction",
-      label: "Side",
-      width: "55px",
-      align: "center" as const,
-      render: (r: any) => (
-        <span
-          style={{
-            color: r.direction === "LONG" ? "#3fb950" : "#f85149",
-            fontWeight: 600,
-          }}
-        >
-          {r.direction}
-        </span>
-      ),
-    },
-    {
-      key: "entry_time_iso",
-      label: "Entry",
-      align: "center" as const,
-      render: (r: any) => (r.entry_time_iso || "").slice(0, 19),
-    },
-    {
-      key: "entry_price",
-      label: "Entry $",
-      align: "right" as const,
-      render: (r: any) => `$${r.entry_price?.toFixed(2)}`,
-    },
-    {
-      key: "exit_time_iso",
-      label: "Exit",
-      align: "center" as const,
-      render: (r: any) => (r.exit_time_iso || "").slice(0, 19),
-    },
-    {
-      key: "exit_price",
-      label: "Exit $",
-      align: "right" as const,
-      render: (r: any) => `$${r.exit_price?.toFixed(2)}`,
-    },
-    {
-      key: "quantity",
-      label: "Qty",
-      align: "right" as const,
-      render: (r: any) => r.quantity?.toFixed(2),
-    },
-    {
-      key: "position_size",
-      label: "Size",
-      align: "right" as const,
-      render: (r: Trade) => formatOptionalNumber(r.position_size, 2),
-    },
-    {
-      key: "risk_amount",
-      label: "Risk $",
-      align: "right" as const,
-      render: (r: Trade) =>
-        r.risk_amount != null && Number.isFinite(r.risk_amount)
-          ? `$${formatOptionalNumber(r.risk_amount, 2)}`
-          : "N/A",
-    },
-    {
-      key: "risk_percent",
-      label: "Risk %",
-      align: "right" as const,
-      render: (r: Trade) =>
-        r.risk_percent != null && Number.isFinite(r.risk_percent)
-          ? `${formatOptionalNumber(r.risk_percent * 100, 2)}%`
-          : "N/A",
-    },
-    {
-      key: "pnl",
-      label: "P&L",
-      align: "right" as const,
-      render: (r: any) => (
-        <span
-          style={{ color: r.pnl >= 0 ? "#3fb950" : "#f85149", fontWeight: 600 }}
-        >
-          ${r.pnl?.toLocaleString("en-US", { maximumFractionDigits: 2 })}
-        </span>
-      ),
-    },
-    {
-      key: "pnl_pct",
-      label: "P&L %",
-      align: "right" as const,
-      render: (r: any) =>
-        r.pnl_pct != null ? (
-          <span style={{ color: r.pnl_pct >= 0 ? "#3fb950" : "#f85149" }}>
-            {r.pnl_pct?.toFixed(2)}%
-          </span>
-        ) : (
-          "—"
-        ),
-    },
-    { key: "holding_bars", label: "Bars", align: "right" as const },
-  ];
+  const tradeRows = trades.map<TradeTableRow>((trade) => {
+    const duration =
+      (trade.duration && trade.duration.trim()) ||
+      (Number.isFinite(trade.holding_bars) ? `${trade.holding_bars} bars` : "");
+    const timestamp = trade.entry_time_iso || trade.exit_time_iso || "";
+    const parsed = Date.parse(timestamp);
+    const date = Number.isFinite(parsed) ? new Date(parsed).toISOString().slice(0, 10) : "";
+    const time = Number.isFinite(parsed) ? new Date(parsed).toISOString().slice(11, 19) : timestamp;
+    return {
+      id: String(trade.nr),
+      date,
+      time,
+      strategy: info?.title || info?.strategy_display_name || info?.strategy || "",
+      symbol: trade.symbol,
+      side: trade.direction,
+      size: trade.position_size ?? trade.quantity,
+      entryPrice: trade.entry_price,
+      exitPrice: trade.exit_price,
+      pnl: trade.pnl,
+      pnlPct: trade.pnl_pct,
+      exitReason: trade.exit_reason ?? "",
+      duration,
+    };
+  });
 
   return (
     <div style={{ padding: "24px" }}>
@@ -429,53 +365,74 @@ export function BacktestDetailPage() {
             )}
           </div>
         </div>
-        {info?.strategy_slug || info?.strategy ? (
-          <div style={{ display: "flex", gap: "10px", flexWrap: "wrap" }}>
-            <button
-              type="button"
-              onClick={() => setShowOptimizeModal(true)}
-              style={{
-                display: "inline-flex",
-                alignItems: "center",
-                gap: "8px",
-                background:
-                  "linear-gradient(135deg, rgba(14,165,233,0.18), rgba(245,158,11,0.18))",
-                color: "#f8fafc",
-                border: "1px solid rgba(56,189,248,0.22)",
-                borderRadius: "10px",
-                padding: "10px 14px",
-                cursor: "pointer",
-                boxShadow: "0 16px 36px rgba(14,165,233,0.12)",
-              }}
-            >
-              <Target size={15} />
-              Optimize
-            </button>
-            <button
-              type="button"
-              onClick={() =>
-                navigate(
-                  `/strategies/${encodeURIComponent(info?.strategy_slug || info?.strategy || "")}`,
-                )
-              }
-              style={{
-                display: "inline-flex",
-                alignItems: "center",
-                gap: "8px",
-                background:
-                  "linear-gradient(135deg, rgba(88,166,255,0.18), rgba(124,58,237,0.16))",
-                color: "#c9d1d9",
-                border: "1px solid rgba(88,166,255,0.2)",
-                borderRadius: "10px",
-                padding: "10px 14px",
-                cursor: "pointer",
-              }}
-            >
-              View Strategy Details
-              <ArrowUpRight size={15} />
-            </button>
-          </div>
-        ) : null}
+        <div style={{ display: "flex", gap: "10px", flexWrap: "wrap" }}>
+          <button
+            type="button"
+            onClick={() => void handleDelete()}
+            disabled={deleting}
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: "8px",
+              background: "rgba(127, 29, 29, 0.26)",
+              color: "#fecaca",
+              border: "1px solid rgba(248,113,113,0.3)",
+              borderRadius: "10px",
+              padding: "10px 14px",
+              cursor: deleting ? "not-allowed" : "pointer",
+              opacity: deleting ? 0.65 : 1,
+            }}
+          >
+            {deleting ? "Deleting..." : "Delete"}
+          </button>
+          {info?.strategy_slug || info?.strategy ? (
+            <>
+              <button
+                type="button"
+                onClick={() => setShowOptimizeModal(true)}
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: "8px",
+                  background:
+                    "linear-gradient(135deg, rgba(14,165,233,0.18), rgba(245,158,11,0.18))",
+                  color: "#f8fafc",
+                  border: "1px solid rgba(56,189,248,0.22)",
+                  borderRadius: "10px",
+                  padding: "10px 14px",
+                  cursor: "pointer",
+                  boxShadow: "0 16px 36px rgba(14,165,233,0.12)",
+                }}
+              >
+                <Target size={15} />
+                Optimize
+              </button>
+              <button
+                type="button"
+                onClick={() =>
+                  navigate(
+                    `/strategies/${encodeURIComponent(info?.strategy_slug || info?.strategy || "")}`,
+                  )
+                }
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: "8px",
+                  background:
+                    "linear-gradient(135deg, rgba(88,166,255,0.18), rgba(124,58,237,0.16))",
+                  color: "#c9d1d9",
+                  border: "1px solid rgba(88,166,255,0.2)",
+                  borderRadius: "10px",
+                  padding: "10px 14px",
+                  cursor: "pointer",
+                }}
+              >
+                View Strategy Details
+                <ArrowUpRight size={15} />
+              </button>
+            </>
+          ) : null}
+        </div>
       </div>
 
       {/* Stats Grid */}
@@ -498,9 +455,9 @@ export function BacktestDetailPage() {
             value={stats.net_profit_pct}
             format="percent"
           />
-          <StatCard label="CAGR" value={stats.cagr} format="percent" />
+          <StatCard label="CAGR (higher = better)" value={stats.cagr} format="percent" />
           <StatCard
-            label="Sharpe Ratio"
+            label="Sharpe (higher = better)"
             value={stats.sharpe?.toFixed(3)}
             color={
               stats.sharpe > 1
@@ -516,13 +473,13 @@ export function BacktestDetailPage() {
             color={stats.sortino > 1 ? "#3fb950" : "#d29922"}
           />
           <StatCard
-            label="Max Drawdown"
+            label="Max DD (lower = better)"
             value={stats.max_drawdown_pct}
             format="percent"
             color="#f85149"
           />
           <StatCard
-            label="Win Rate"
+            label="Win Rate (higher = better)"
             value={stats.win_rate}
             format="percent"
             color={stats.win_rate > 50 ? "#3fb950" : "#f85149"}
@@ -538,7 +495,7 @@ export function BacktestDetailPage() {
             color={stats.calmar > 1 ? "#3fb950" : "#d29922"}
           />
           <StatCard
-            label="PSR"
+            label="PSR (higher = better)"
             value={
               stats.psr != null ? `${(stats.psr * 100).toFixed(1)}%` : "N/A"
             }
@@ -551,7 +508,7 @@ export function BacktestDetailPage() {
             }
           />
           <StatCard
-            label="P-Value"
+            label="p-Value (lower = better)"
             value={formatPValue(stats.p_value)}
             color={pValueColor(stats.p_value)}
           />
@@ -731,31 +688,31 @@ export function BacktestDetailPage() {
           <SummaryItem label="Total Trades" value={String(trades.length)} />
           <SummaryItem
             label="Long / Short"
-            value={`${trades.filter((t) => t.direction === "LONG").length} / ${trades.filter((t) => t.direction === "SHORT").length}`}
+            value={`${tradeStats.longTrades} / ${tradeStats.shortTrades}`}
           />
           <SummaryItem
             label="Win / Loss"
-            value={`${wins.length} / ${losses.length}`}
+            value={`${tradeStats.wins.length} / ${tradeStats.losses.length}`}
             color={`#3fb950 / #f85149`}
           />
           <SummaryItem
             label="Total P&L"
-            value={`$${totalPnl.toLocaleString("en-US", { maximumFractionDigits: 2 })}`}
-            color={totalPnl >= 0 ? "#3fb950" : "#f85149"}
+            value={`$${tradeStats.totalPnl.toLocaleString("en-US", { maximumFractionDigits: 2 })}`}
+            color={tradeStats.totalPnl >= 0 ? "#3fb950" : "#f85149"}
           />
           <SummaryItem
             label="Avg P&L"
-            value={`$${avgPnl.toLocaleString("en-US", { maximumFractionDigits: 2 })}`}
-            color={avgPnl >= 0 ? "#3fb950" : "#f85149"}
+            value={`$${tradeStats.avgPnl.toLocaleString("en-US", { maximumFractionDigits: 2 })}`}
+            color={tradeStats.avgPnl >= 0 ? "#3fb950" : "#f85149"}
           />
           <SummaryItem
             label="Best Trade"
-            value={`$${bestTrade.toLocaleString("en-US", { maximumFractionDigits: 2 })}`}
+            value={`$${tradeStats.bestTrade.toLocaleString("en-US", { maximumFractionDigits: 2 })}`}
             color="#3fb950"
           />
           <SummaryItem
             label="Worst Trade"
-            value={`$${worstTrade.toLocaleString("en-US", { maximumFractionDigits: 2 })}`}
+            value={`$${tradeStats.worstTrade.toLocaleString("en-US", { maximumFractionDigits: 2 })}`}
             color="#f85149"
           />
         </div>
@@ -773,10 +730,9 @@ export function BacktestDetailPage() {
         <h2 style={{ fontSize: "1rem", fontWeight: 600, marginBottom: "16px" }}>
           Trades ({trades.length})
         </h2>
-        <DataTable
-          columns={tradeColumns}
-          data={trades}
-          onRowClick={(row) => navigate(`/backtests/${id}/trade/${row.nr}`)}
+        <TradeTable
+          trades={tradeRows}
+          onTradeClick={(row) => navigate(`/backtests/${id}/trade/${row.id}`)}
         />
       </div>
 

@@ -163,6 +163,36 @@ class LiveBalanceRecord(BaseModel):
     equity: float
 
 
+# ─── Portfolio models ──────────────────────────────────────────────────────────
+
+
+class PortfolioComponent(BaseModel):
+    """A weighted strategy component inside a multi-strategy portfolio."""
+
+    strategy_name: str = ""
+    symbol: str = ""
+    timeframe: str = "1h"
+    weight: float = 1.0
+    risk_config: dict[str, Any] = Field(default_factory=dict)
+    settings: dict[str, Any] = Field(default_factory=dict)
+    backtest_id: str | None = None
+
+
+class Portfolio(BaseModel):
+    """Persisted portfolio payload shared across API and storage layers."""
+
+    id: str
+    name: str = "Untitled"
+    created_at: str = ""
+    account_capital: float = 100_000.0
+    components: list[PortfolioComponent] = Field(default_factory=list)
+    combined_stats: dict[str, Any] = Field(default_factory=dict)
+    combined_equity: list[dict[str, Any]] = Field(default_factory=list)
+    strategy_contributions: list[dict[str, Any]] = Field(default_factory=list)
+    component_contributions: list[dict[str, Any]] = Field(default_factory=list)
+    trades: list[dict[str, Any]] = Field(default_factory=list)
+
+
 # ─── Timeframe constants ────────────────────────────────────────────────────
 
 VALID_TIMEFRAMES = ("tick", "s1", "1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w")
@@ -356,7 +386,7 @@ class BacktestMeta:
     #     "timeframes": ["1h"],         # oder ["1h", "1d"] für Multi-TF
     #     "symbols": ["AAPL", "MSFT"],
     #     "universe": "sp500" | "forex-majors" | "custom" | "",
-    #     "source": "yfinance" | "dukascopy" | "huggingface",
+    #     "source": "yfinance" | "dukascopy" | "huggingface" | "alpaca",
     # }
 
     # Capital

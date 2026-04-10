@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Activity, Pause, Plus, Square, X } from "lucide-react";
 
@@ -76,6 +76,86 @@ type LiveHubAccountStats = {
   sparkline: number[];
   openPositions: number;
 };
+
+
+const LiveDeploymentCard = memo(function LiveDeploymentCard({
+  card,
+  busy,
+  onNavigate,
+  onPause,
+  onStop,
+  onDelete,
+}: {
+  card: DeploymentCard;
+  busy: boolean;
+  onNavigate: (accountId: string) => void;
+  onPause: (card: DeploymentCard, event: React.MouseEvent<HTMLButtonElement>) => void;
+  onStop: (card: DeploymentCard, event: React.MouseEvent<HTMLButtonElement>) => void;
+  onDelete: (card: DeploymentCard, event: React.MouseEvent<HTMLButtonElement>) => void;
+}) {
+  return (
+    <div
+      key={card.id}
+      onClick={() => onNavigate(card.account_id)}
+      style={{
+        border: "1px solid var(--color-border)",
+        borderRadius: "10px",
+        padding: "10px",
+        cursor: "pointer",
+      }}
+    >
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <div style={{ fontWeight: 600, fontSize: "0.87rem" }}>{card.strategy_name}</div>
+        <div style={statusChipStyle(card.status)}>{card.status}</div>
+      </div>
+      <div style={{ color: "var(--color-text-muted)", fontSize: "0.8rem", margin: "6px 0 8px" }}>
+        {card.timeframe} · {card.symbols.join(", ")}
+      </div>
+      <div style={{ color: "var(--color-text-muted)", fontSize: "0.76rem", marginBottom: "8px" }}>
+        Source: {card.signal_source === "discord" ? "Discord Signals" : "Internal Strategy"}
+        {(() => {
+          if (card.signal_source !== "discord" || !card.signal_config) {
+            return "";
+          }
+          const waitValue = card.signal_config["wait_candle_close"];
+          if (typeof waitValue !== "boolean") {
+            return "";
+          }
+          return ` · Wait Candle Close: ${waitValue ? "On" : "Off"}`;
+        })()}
+      </div>
+      <div style={{ display: "flex", gap: "8px" }}>
+        <button
+          type="button"
+          onClick={(event) => onPause(card, event)}
+          title="Set status PAUSED"
+          style={controlBtnStyle("pause", card.status === "PAUSED")}
+          disabled={busy}
+        >
+          <Pause size={14} />
+        </button>
+        <button
+          type="button"
+          onClick={(event) => onStop(card, event)}
+          title="Set status STOPPED"
+          style={controlBtnStyle("stop", card.status === "STOPPED")}
+          disabled={busy}
+        >
+          <Square size={14} />
+        </button>
+        <button
+          type="button"
+          onClick={(event) => onDelete(card, event)}
+          title="Delete deployment"
+          style={controlBtnStyle("stop", false)}
+          disabled={busy}
+        >
+          <X size={14} />
+        </button>
+      </div>
+    </div>
+  );
+});
 
 export function LiveHubPage() {
   const navigate = useNavigate();
@@ -268,7 +348,7 @@ export function LiveHubPage() {
     return `${account.broker} ${account.is_demo ? "Demo" : "Live"}`;
   };
 
-  const handleControl = async (
+  const handleControl = useCallback(async (
     action: "play" | "pause" | "stop",
     card: DeploymentCard,
     event: React.MouseEvent<HTMLButtonElement>,
@@ -303,7 +383,7 @@ export function LiveHubPage() {
     } finally {
       setDeploymentBusy(card.id, false);
     }
-  };
+  }, [refreshDeployments, showToast]);
 
   const handleCreateDeployment = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -459,7 +539,15 @@ export function LiveHubPage() {
     }
   };
 
-  const handleDelete = async (card: DeploymentCard, event: React.MouseEvent<HTMLButtonElement>) => {
+  const handlePauseControl = useCallback((card: DeploymentCard, event: React.MouseEvent<HTMLButtonElement>) => {
+    void handleControl("pause", card, event);
+  }, [handleControl]);
+
+  const handleStopControl = useCallback((card: DeploymentCard, event: React.MouseEvent<HTMLButtonElement>) => {
+    void handleControl("stop", card, event);
+  }, [handleControl]);
+
+  const handleDelete = useCallback(async (card: DeploymentCard, event: React.MouseEvent<HTMLButtonElement>) => {
     event.stopPropagation();
     setDeploymentBusy(card.id, true);
     try {
@@ -473,7 +561,14 @@ export function LiveHubPage() {
     } finally {
       setDeploymentBusy(card.id, false);
     }
-  };
+  }, [refreshDeployments, showToast]);
+
+  const navigateToLiveAccount = useCallback(
+    (accountId: string) => {
+      navigate(`/live/${encodeURIComponent(accountId)}`);
+    },
+    [navigate],
+  );
 
   return (
     <div style={{ padding: "24px" }}>
@@ -1065,66 +1160,15 @@ export function LiveHubPage() {
                 ) : (
                   <div style={{ display: "grid", gap: "8px" }}>
                     {accountCards.map((card) => (
-                      <div
+                      <LiveDeploymentCard
                         key={card.id}
-                        onClick={() => navigate(`/live/${encodeURIComponent(card.account_id)}`)}
-                        style={{
-                          border: "1px solid var(--color-border)",
-                          borderRadius: "10px",
-                          padding: "10px",
-                          cursor: "pointer",
-                        }}
-                      >
-                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                          <div style={{ fontWeight: 600, fontSize: "0.87rem" }}>{card.strategy_name}</div>
-                          <div style={statusChipStyle(card.status)}>{card.status}</div>
-                        </div>
-                        <div style={{ color: "var(--color-text-muted)", fontSize: "0.8rem", margin: "6px 0 8px" }}>
-                          {card.timeframe} · {card.symbols.join(", ")}
-                        </div>
-                        <div style={{ color: "var(--color-text-muted)", fontSize: "0.76rem", marginBottom: "8px" }}>
-                          Source: {card.signal_source === "discord" ? "Discord Signals" : "Internal Strategy"}
-                          {(() => {
-                            if (card.signal_source !== "discord" || !card.signal_config) {
-                              return "";
-                            }
-                            const waitValue = card.signal_config["wait_candle_close"];
-                            if (typeof waitValue !== "boolean") {
-                              return "";
-                            }
-                            return ` · Wait Candle Close: ${waitValue ? "On" : "Off"}`;
-                          })()}
-                        </div>
-                        <div style={{ display: "flex", gap: "8px" }}>
-                          <button
-                            type="button"
-                            onClick={(event) => void handleControl("pause", card, event)}
-                            title="Set status PAUSED"
-                            style={controlBtnStyle("pause", card.status === "PAUSED")}
-                            disabled={updatingDeploymentIds.has(card.id)}
-                          >
-                            <Pause size={14} />
-                          </button>
-                          <button
-                            type="button"
-                            onClick={(event) => void handleControl("stop", card, event)}
-                            title="Set status STOPPED"
-                            style={controlBtnStyle("stop", card.status === "STOPPED")}
-                            disabled={updatingDeploymentIds.has(card.id)}
-                          >
-                            <Square size={14} />
-                          </button>
-                          <button
-                            type="button"
-                            onClick={(event) => void handleDelete(card, event)}
-                            title="Delete deployment"
-                            style={controlBtnStyle("stop", false)}
-                            disabled={updatingDeploymentIds.has(card.id)}
-                          >
-                            <X size={14} />
-                          </button>
-                        </div>
-                      </div>
+                        card={card}
+                        busy={updatingDeploymentIds.has(card.id)}
+                        onNavigate={navigateToLiveAccount}
+                        onPause={handlePauseControl}
+                        onStop={handleStopControl}
+                        onDelete={handleDelete}
+                      />
                     ))}
                   </div>
                 )}

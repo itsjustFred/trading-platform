@@ -14,6 +14,8 @@ from shared.models import LiveExecution, LiveSignal
 
 logger = get_logger("live-runner")
 
+_ASYNCIO_REACTOR_VALIDATED = False
+
 
 def _parse_bool_env(value: str | None, *, default: bool) -> bool:
     if value is None:
@@ -50,23 +52,30 @@ def _reason_to_text(reason: Any) -> str:
 
 
 def _ensure_asyncio_twisted_reactor(loop: asyncio.AbstractEventLoop) -> None:
+    global _ASYNCIO_REACTOR_VALIDATED
     try:
         from twisted.internet import asyncioreactor
         from twisted.internet.error import ReactorAlreadyInstalledError
     except ModuleNotFoundError as exc:
         raise RuntimeError("Twisted is required for cTrader OpenApiPy integration.") from exc
 
-    try:
-        asyncioreactor.install(loop)
-    except ReactorAlreadyInstalledError:
-        from twisted.internet import reactor
+    if not _ASYNCIO_REACTOR_VALIDATED:
+        try:
+            asyncioreactor.install(loop)
+        except ReactorAlreadyInstalledError:
+            pass
+        _ASYNCIO_REACTOR_VALIDATED = True
 
-        reactor_module = reactor.__class__.__module__
-        if "asyncioreactor" not in reactor_module:
-            raise RuntimeError(
-                f"Unsupported Twisted reactor already installed: {reactor_module}. "
-                "Expected asyncio reactor."
-            )
+    from twisted.internet import reactor
+
+    reactor_module = reactor.__class__.__module__
+    if "asyncioreactor" not in reactor_module:
+        raise RuntimeError(
+            f"Unsupported Twisted reactor already installed: {reactor_module}. "
+            "Expected asyncio reactor."
+        )
+    if not reactor.running:
+        reactor.startRunning(installSignalHandlers=False)
 
 
 class CTraderLiveAdapter(BaseLiveAdapter):
@@ -424,6 +433,29 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                     },
                 )
             raise
+
+    async def disconnect(self) -> None:
+        client = self._client
+        loop = self._loop
+        self._client = None
+        self._loop = None
+        self._authenticated = False
+        self._connected = False
+        self._connected_event.clear()
+        self._symbol_name_to_id.clear()
+        self._order_id_to_signal_id.clear()
+        self._execution_queue = asyncio.Queue(maxsize=5000)
+
+        if client is None:
+            return
+
+        is_running = bool(getattr(client, "running", False))
+        if not is_running:
+            return
+
+        stop_result = client.stopService()
+        if stop_result is not None and hasattr(stop_result, "asFuture") and loop is not None:
+            await stop_result.asFuture(loop)
 
     async def submit_order(self, signal: LiveSignal) -> str:
         if not self._connected or not self._authenticated:

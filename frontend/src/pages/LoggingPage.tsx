@@ -1,5 +1,6 @@
-import { Fragment, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { ChevronDown, ChevronUp } from "lucide-react";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import { getLogContent, getLogs } from "../api/client";
 import { useToast } from "../components/ToastProvider";
 import { MultiSelectDropdown } from "../components/MultiSelectDropdown";
@@ -14,6 +15,7 @@ const DEFAULT_LEVELS: Record<string, boolean> = {
 };
 const POLLING_PATHS = ["/api/tasks", "/api/data/tasks", "/api/live/accounts", "/api/live/deployments"];
 const POLLING_PREFIXES = ["/api/tasks/", "/api/data/tasks/", "/api/live/balances/", "/api/live/stats/", "/api/live/trades/"];
+const LOG_FETCH_LIMIT = 50000;
 
 type Level = (typeof LEVEL_OPTIONS)[number];
 
@@ -28,6 +30,16 @@ interface ParsedLogLine {
   data: Record<string, unknown> | null;
   isJson: boolean;
 }
+
+interface VirtualLogRow {
+  key: string;
+  rowType: "entry" | "detail";
+  entry: ParsedLogLine;
+  rowId: string;
+  index: number;
+}
+
+const LOG_TABLE_GRID_TEMPLATE = "130px 110px 170px 170px minmax(420px, 1fr)";
 
 function normalizeLevel(raw: string | undefined): Level {
   const normalized = String(raw ?? "").toUpperCase();
@@ -123,9 +135,20 @@ function parseLogLine(line: string): ParsedLogLine {
 }
 
 function isPollingLog(entry: ParsedLogLine): boolean {
+  const plainMessage = entry.message || "";
+  if (
+    plainMessage.includes("GET /api/data/tasks") ||
+    plainMessage.includes("\"GET /api/data/tasks")
+  ) {
+    return true;
+  }
+  if (!entry.isJson) {
+    return entry.message.includes("GET /api/data/tasks");
+  }
   const maybePath = typeof entry.data?.path === "string" ? entry.data.path : "";
   const path = String(maybePath || "").split("?", 1)[0];
   if (!path) return false;
+  if (path.includes("/api/data/tasks")) return true;
   if (POLLING_PATHS.includes(path)) return true;
   return POLLING_PREFIXES.some((prefix) => path.startsWith(prefix));
 }
@@ -185,7 +208,7 @@ export function LoggingPage() {
     let active = true;
 
     const loadLogs = () =>
-      getLogContent(activeLogFile, 800, levelParam)
+      getLogContent(activeLogFile, LOG_FETCH_LIMIT, levelParam)
         .then((payload) => {
           if (!active) return;
           setLines(payload.lines ?? []);
@@ -249,12 +272,53 @@ export function LoggingPage() {
     });
   }, [hidePolling, parsedEntries, search, selectedLevels, selectedModulesEffective]);
 
+  const entriesWithIds = useMemo(
+    () =>
+      filteredEntries.map((entry, index) => ({
+        entry,
+        index,
+        rowId: `${index}:${entry.timestampLong}:${entry.module}`,
+      })),
+    [filteredEntries],
+  );
+
+  const virtualRows = useMemo<VirtualLogRow[]>(() => {
+    const rows: VirtualLogRow[] = [];
+    for (const item of entriesWithIds) {
+      rows.push({
+        key: item.rowId,
+        rowType: "entry",
+        entry: item.entry,
+        rowId: item.rowId,
+        index: item.index,
+      });
+      if (item.entry.data && expandedRows.has(item.rowId)) {
+        rows.push({
+          key: `${item.rowId}:detail`,
+          rowType: "detail",
+          entry: item.entry,
+          rowId: item.rowId,
+          index: item.index,
+        });
+      }
+    }
+    return rows;
+  }, [entriesWithIds, expandedRows]);
+
+  const rowVirtualizer = useVirtualizer({
+    count: virtualRows.length,
+    getScrollElement: () => tableContainerRef.current,
+    estimateSize: (index) => (virtualRows[index]?.rowType === "detail" ? 190 : 42),
+    measureElement: (element) => element?.getBoundingClientRect().height ?? 0,
+    overscan: 15,
+  });
+
   useEffect(() => {
     if (!autoScroll) return;
     const container = tableContainerRef.current;
     if (!container) return;
     container.scrollTop = container.scrollHeight;
-  }, [autoScroll, filteredEntries]);
+  }, [autoScroll, filteredEntries, virtualRows.length]);
 
   const loading = !hasLoadedOnce && loadError == null;
 
@@ -417,190 +481,214 @@ export function LoggingPage() {
             fontFamily: '"SFMono-Regular", "Cascadia Code", "Roboto Mono", ui-monospace, monospace',
           }}
         >
-          <table style={{ width: "100%", borderCollapse: "collapse", minWidth: "1080px" }}>
-            <thead>
-              <tr>
-                {["Timestamp", "Level", "Module", "Function", "Message"].map((heading) => (
-                  <th
-                    key={heading}
-                    style={{
-                      position: "sticky",
-                      top: 0,
-                      zIndex: 2,
-                      background: "#141b2b",
-                      color: "var(--color-text-muted)",
-                      textTransform: "uppercase",
-                      letterSpacing: "0.04em",
-                      fontSize: "0.71rem",
-                      fontWeight: 700,
-                      textAlign: "left",
-                      padding: "10px 10px",
-                      borderBottom: "1px solid rgba(148, 163, 184, 0.28)",
-                    }}
-                  >
-                    {heading}
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {loading ? (
-                <tr>
-                  <td
-                    colSpan={5}
-                    style={{
-                      padding: "28px 10px",
-                      fontSize: "0.75rem",
-                      color: "var(--color-text-muted)",
-                      textAlign: "center",
-                    }}
-                  >
-                    Loading logs...
-                  </td>
-                </tr>
-              ) : filteredEntries.length === 0 ? (
-                <tr>
-                  <td
-                    colSpan={5}
-                    style={{
-                      padding: "28px 10px",
-                      fontSize: "0.75rem",
-                      color: "var(--color-text-muted)",
-                      textAlign: "center",
-                    }}
-                  >
-                    No matching log entries.
-                  </td>
-                </tr>
-              ) : (
-                filteredEntries.map((entry, index) => {
-                  const rowId = `${index}:${entry.timestampLong}:${entry.module}`;
-                  const expanded = expandedRows.has(rowId);
-                  return (
-                    <Fragment key={rowId}>
-                      <tr
-                        onClick={() => toggleExpanded(entry, index)}
-                        style={{ cursor: entry.data ? "pointer" : "default" }}
-                        onMouseEnter={(event) => {
-                          event.currentTarget.style.background = "rgba(88, 166, 255, 0.07)";
-                        }}
-                        onMouseLeave={(event) => {
-                          event.currentTarget.style.background = "transparent";
+          <div style={{ minWidth: "1080px" }}>
+            <div
+              style={{
+                position: "sticky",
+                top: 0,
+                zIndex: 3,
+                display: "grid",
+                gridTemplateColumns: LOG_TABLE_GRID_TEMPLATE,
+                background: "#141b2b",
+                borderBottom: "1px solid rgba(148, 163, 184, 0.28)",
+              }}
+            >
+              {["Timestamp", "Level", "Module", "Function", "Message"].map((heading) => (
+                <div
+                  key={heading}
+                  style={{
+                    color: "var(--color-text-muted)",
+                    textTransform: "uppercase",
+                    letterSpacing: "0.04em",
+                    fontSize: "0.71rem",
+                    fontWeight: 700,
+                    textAlign: "left",
+                    padding: "10px 10px",
+                  }}
+                >
+                  {heading}
+                </div>
+              ))}
+            </div>
+            {loading ? (
+              <div
+                style={{
+                  padding: "28px 10px",
+                  fontSize: "0.75rem",
+                  color: "var(--color-text-muted)",
+                  textAlign: "center",
+                }}
+              >
+                Loading logs...
+              </div>
+            ) : filteredEntries.length === 0 ? (
+              <div
+                style={{
+                  padding: "28px 10px",
+                  fontSize: "0.75rem",
+                  color: "var(--color-text-muted)",
+                  textAlign: "center",
+                }}
+              >
+                No matching log entries.
+              </div>
+            ) : (
+              <div
+                style={{
+                  height: `${rowVirtualizer.getTotalSize()}px`,
+                  position: "relative",
+                }}
+              >
+                {rowVirtualizer.getVirtualItems().map((virtualItem) => {
+                  const row = virtualRows[virtualItem.index];
+                  if (!row) {
+                    return null;
+                  }
+
+                  if (row.rowType === "detail") {
+                    return (
+                      <div
+                        key={row.key}
+                        data-index={virtualItem.index}
+                        ref={rowVirtualizer.measureElement}
+                        style={{
+                          position: "absolute",
+                          top: 0,
+                          left: 0,
+                          width: "100%",
+                          transform: `translateY(${virtualItem.start}px)`,
+                          borderBottom: "1px solid rgba(148, 163, 184, 0.14)",
+                          background: "rgba(17, 24, 39, 0.78)",
+                          padding: "10px",
                         }}
                       >
-                        <td
+                        <div
                           style={{
-                            padding: "8px 10px",
-                            color: "var(--color-text-muted)",
-                            fontSize: "0.72rem",
-                            borderBottom: "1px solid rgba(148, 163, 184, 0.14)",
-                            whiteSpace: "nowrap",
-                          }}
-                        >
-                          {entry.timestampShort}
-                        </td>
-                        <td
-                          style={{
-                            padding: "8px 10px",
-                            color: levelColor(entry.level),
-                            fontSize: "0.72rem",
-                            borderBottom: "1px solid rgba(148, 163, 184, 0.14)",
-                            whiteSpace: "nowrap",
-                            fontWeight: 700,
-                          }}
-                        >
-                          {entry.level}
-                        </td>
-                        <td
-                          style={{
-                            padding: "8px 10px",
+                            display: "grid",
+                            gap: "6px",
+                            fontSize: "0.71rem",
                             color: "#cbd5e1",
-                            fontSize: "0.72rem",
-                            borderBottom: "1px solid rgba(148, 163, 184, 0.14)",
-                            whiteSpace: "nowrap",
                           }}
                         >
-                          {entry.module}
-                        </td>
-                        <td
-                          style={{
-                            padding: "8px 10px",
-                            color: "#9ca3af",
-                            fontSize: "0.72rem",
-                            borderBottom: "1px solid rgba(148, 163, 184, 0.14)",
-                            whiteSpace: "nowrap",
-                          }}
-                        >
-                          {entry.func}
-                        </td>
-                        <td
-                          style={{
-                            padding: "8px 10px",
-                            color: "#e5e7eb",
-                            fontSize: "0.72rem",
-                            borderBottom: "1px solid rgba(148, 163, 184, 0.14)",
-                            whiteSpace: "pre-wrap",
-                            wordBreak: "break-word",
-                          }}
-                        >
-                          <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-                            <span>{entry.message}</span>
-                            {entry.data ? (
-                              expanded ? <ChevronUp size={13} color="#93c5fd" /> : <ChevronDown size={13} color="#93c5fd" />
-                            ) : null}
+                          <div>
+                            <span style={{ color: "var(--color-text-muted)" }}>Timestamp:</span>{" "}
+                            {row.entry.timestampLong}
                           </div>
-                        </td>
-                      </tr>
-                      {entry.data && expanded ? (
-                        <tr>
-                          <td
-                            colSpan={5}
+                          <div>
+                            <span style={{ color: "var(--color-text-muted)" }}>Format:</span>{" "}
+                            {row.entry.isJson ? "JSON" : "Plain text"}
+                          </div>
+                          <pre
                             style={{
-                              borderBottom: "1px solid rgba(148, 163, 184, 0.14)",
-                              background: "rgba(17, 24, 39, 0.78)",
+                              margin: 0,
+                              background: "rgba(2, 6, 23, 0.72)",
+                              border: "1px solid rgba(148, 163, 184, 0.24)",
+                              borderRadius: "8px",
                               padding: "10px",
+                              color: "#bfdbfe",
+                              whiteSpace: "pre-wrap",
+                              wordBreak: "break-word",
                             }}
                           >
-                            <div
-                              style={{
-                                display: "grid",
-                                gap: "6px",
-                                fontSize: "0.71rem",
-                                color: "#cbd5e1",
-                              }}
-                            >
-                              <div>
-                                <span style={{ color: "var(--color-text-muted)" }}>Timestamp:</span>{" "}
-                                {entry.timestampLong}
-                              </div>
-                              <div>
-                                <span style={{ color: "var(--color-text-muted)" }}>Format:</span>{" "}
-                                {entry.isJson ? "JSON" : "Plain text"}
-                              </div>
-                              <pre
-                                style={{
-                                  margin: 0,
-                                  background: "rgba(2, 6, 23, 0.72)",
-                                  border: "1px solid rgba(148, 163, 184, 0.24)",
-                                  borderRadius: "8px",
-                                  padding: "10px",
-                                  color: "#bfdbfe",
-                                  whiteSpace: "pre-wrap",
-                                  wordBreak: "break-word",
-                                }}
-                              >
-                                {JSON.stringify(entry.data, null, 2)}
-                              </pre>
-                            </div>
-                          </td>
-                        </tr>
-                      ) : null}
-                    </Fragment>
+                            {JSON.stringify(row.entry.data, null, 2)}
+                          </pre>
+                        </div>
+                      </div>
+                    );
+                  }
+
+                  const expanded = expandedRows.has(row.rowId);
+                  return (
+                    <div
+                      key={row.key}
+                      data-index={virtualItem.index}
+                      ref={rowVirtualizer.measureElement}
+                      onClick={() => toggleExpanded(row.entry, row.index)}
+                      style={{
+                        position: "absolute",
+                        top: 0,
+                        left: 0,
+                        width: "100%",
+                        transform: `translateY(${virtualItem.start}px)`,
+                        display: "grid",
+                        gridTemplateColumns: LOG_TABLE_GRID_TEMPLATE,
+                        cursor: row.entry.data ? "pointer" : "default",
+                        borderBottom: "1px solid rgba(148, 163, 184, 0.14)",
+                      }}
+                      onMouseEnter={(event) => {
+                        event.currentTarget.style.background = "rgba(88, 166, 255, 0.07)";
+                      }}
+                      onMouseLeave={(event) => {
+                        event.currentTarget.style.background = "transparent";
+                      }}
+                    >
+                      <div
+                        style={{
+                          padding: "8px 10px",
+                          color: "var(--color-text-muted)",
+                          fontSize: "0.72rem",
+                          whiteSpace: "nowrap",
+                        }}
+                      >
+                        {row.entry.timestampShort}
+                      </div>
+                      <div
+                        style={{
+                          padding: "8px 10px",
+                          color: levelColor(row.entry.level),
+                          fontSize: "0.72rem",
+                          whiteSpace: "nowrap",
+                          fontWeight: 700,
+                        }}
+                      >
+                        {row.entry.level}
+                      </div>
+                      <div
+                        style={{
+                          padding: "8px 10px",
+                          color: "#cbd5e1",
+                          fontSize: "0.72rem",
+                          whiteSpace: "nowrap",
+                        }}
+                      >
+                        {row.entry.module}
+                      </div>
+                      <div
+                        style={{
+                          padding: "8px 10px",
+                          color: "#9ca3af",
+                          fontSize: "0.72rem",
+                          whiteSpace: "nowrap",
+                        }}
+                      >
+                        {row.entry.func}
+                      </div>
+                      <div
+                        style={{
+                          padding: "8px 10px",
+                          color: "#e5e7eb",
+                          fontSize: "0.72rem",
+                          whiteSpace: "pre-wrap",
+                          wordBreak: "break-word",
+                        }}
+                      >
+                        <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                          <span>{row.entry.message}</span>
+                          {row.entry.data ? (
+                            expanded ? (
+                              <ChevronUp size={13} color="#93c5fd" />
+                            ) : (
+                              <ChevronDown size={13} color="#93c5fd" />
+                            )
+                          ) : null}
+                        </div>
+                      </div>
+                    </div>
                   );
-                })
-              )}
-            </tbody>
-          </table>
+                })}
+              </div>
+            )}
+          </div>
         </div>
       </section>
     </div>

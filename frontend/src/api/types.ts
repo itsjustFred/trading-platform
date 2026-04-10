@@ -605,6 +605,7 @@ export interface BacktestsQueryParams {
   per_page?: number;
   sort?: BacktestsSortField;
   order?: "asc" | "desc";
+  name?: string;
   strategy?: string;
   symbol?: string;
   timeframe?: string;
@@ -641,6 +642,10 @@ export interface BacktestsBulkDeleteResponse {
   deleted: number;
 }
 
+export interface PortfoliosBulkDeleteResponse {
+  deleted: number;
+}
+
 export interface BacktestDuplicateGroup {
   fingerprint: string;
   strategy_name: string;
@@ -662,6 +667,30 @@ export interface BacktestsDuplicatesResponse {
 }
 
 export interface BacktestsDeduplicateResponse {
+  deleted_ids: string[];
+  kept_ids: string[];
+  groups_affected: number;
+}
+
+export interface PortfolioDuplicateGroup {
+  fingerprint: string;
+  name: string;
+  account_capital: number;
+  component_count: number;
+  portfolios: Array<{
+    id: string;
+    name: string;
+    created_at: string;
+  }>;
+}
+
+export interface PortfoliosDuplicatesResponse {
+  groups: PortfolioDuplicateGroup[];
+  total_groups: number;
+  total_portfolios: number;
+}
+
+export interface PortfoliosDeduplicateResponse {
   deleted_ids: string[];
   kept_ids: string[];
   groups_affected: number;
@@ -765,18 +794,60 @@ export interface PortfolioRef {
   name: string;
 }
 
+export interface PortfolioComponent {
+  component_id: string;
+  strategy_name: string;
+  symbol: string;
+  timeframe: string;
+  weight: number;
+  risk_config: Record<string, unknown>;
+  settings: Record<string, unknown>;
+  backtest_id?: string | null;
+  return_contribution?: number;
+  return_contribution_pct?: number;
+  drawdown_contribution?: number;
+  drawdown_contribution_pct?: number;
+  trade_count?: number;
+  win_rate?: number;
+  wins?: number;
+}
+
 export interface PortfolioSummary {
   id: string;
   name: string;
   account_capital: number;
   strategy_count: number;
   sharpe: number;
+  sharpe_ratio?: number;
+  total_return?: number;
   cagr: number;
-  max_drawdown: number;
+  max_drawdown?: number;
+  max_drawdown_pct?: number;
+  win_rate?: number;
+  trade_count?: number;
   net_profit: number;
+  net_profit_pct?: number;
   psr?: number;
   p_value?: number;
+  equity_mini?: number[];
   created_at: string;
+}
+
+export type PortfoliosSortField =
+  | "created_at"
+  | "total_return"
+  | "sharpe_ratio"
+  | "psr"
+  | "p_value"
+  | "cagr"
+  | "max_drawdown"
+  | "win_rate"
+  | "trade_count";
+
+export interface PortfoliosQueryParams {
+  name?: string;
+  sort?: PortfoliosSortField;
+  order?: "asc" | "desc";
 }
 
 export interface PortfolioDetail {
@@ -784,10 +855,17 @@ export interface PortfolioDetail {
   name: string;
   created_at: string;
   account_capital: number;
+  components: PortfolioComponent[];
   strategies: PortfolioStrategy[];
   combined_stats: {
     sharpe: number;
+    sortino?: number;
     cagr: number;
+    total_return?: number;
+    max_drawdown_duration?: number;
+    win_rate?: number;
+    profit_factor?: number;
+    calmar?: number;
     max_drawdown: number;
     net_profit: number;
     psr?: number;
@@ -800,6 +878,7 @@ export interface PortfolioDetail {
     pnl_contribution: number;
     pnl_contribution_pct: number;
   }[];
+  component_contributions: PortfolioContribution[];
   trades: PortfolioTrade[];
 }
 
@@ -811,11 +890,56 @@ export interface PortfolioStrategy {
 }
 
 export interface PortfolioTrade {
+  id?: string;
+  nr?: number;
+  component_id?: string;
   time: string;
+  date?: string;
+  entry_time?: number;
+  entry_time_iso?: string;
+  exit_time?: number;
+  exit_time_iso?: string;
+  entry_price?: number;
+  exit_price?: number;
+  quantity?: number;
+  position_size?: number;
+  size?: number;
+  pnl_pct?: number;
+  exit_reason?: string;
+  duration?: string;
+  timeframe?: string;
+  strategy_name?: string;
+  strategy_label?: string;
+  backtest_id?: string;
   pnl: number;
   strategy: string;
   symbol: string;
   direction: string;
+}
+
+export interface PortfolioContribution {
+  group: "component" | "strategy" | "symbol" | "timeframe";
+  group_value: string;
+  component_id?: string;
+  component_ids: string[];
+  strategy_name: string;
+  symbol: string;
+  timeframe: string;
+  weight: number;
+  return_contribution: number;
+  return_contribution_pct: number;
+  drawdown_contribution: number;
+  drawdown_contribution_pct: number;
+  trade_count: number;
+  win_rate: number;
+  wins: number;
+  sharpe_ratio?: number;
+  psr?: number;
+  p_value?: number;
+  max_drawdown?: number;
+  pnl_total: number;
+  pnl_contribution: number;
+  pnl_contribution_pct: number;
 }
 
 export interface LogFile {
@@ -982,11 +1106,47 @@ export interface AgentConvertRequest {
   model?: AgentModelId;
 }
 
-export interface CompareResult {
+export interface BacktestCompareStats {
+  total_return: number;
+  net_profit: number;
+  sharpe_ratio: number;
+  psr: number;
+  p_value: number;
+  cagr: number;
+  max_drawdown: number;
+  win_rate: number;
+  trade_count: number;
+}
+
+export interface BacktestCompareSide {
+  id: string;
+  name: string;
+  strategy_name: string;
+  engine: string;
+  symbols: string[];
+  timeframe: string;
+  stats: BacktestCompareStats;
+  equity_curve: EquityPoint[];
+  trade_distribution: {
+    total_trades: number;
+    winning_trades: number;
+    losing_trades: number;
+  };
+}
+
+export interface BacktestsCompareResponse {
   ids: string[];
-  strategies: string[];
-  stats: BacktestStats[];
-  equity_curves: EquityPoint[][];
-  combined_equity: EquityPoint[];
-  correlation: number;
+  backtest1: BacktestCompareSide;
+  backtest2: BacktestCompareSide;
+  comparison: {
+    delta_return: number;
+    delta_net_profit: number;
+    delta_sharpe: number;
+    delta_psr: number;
+    delta_p_value: number;
+    delta_cagr: number;
+    delta_max_drawdown: number;
+    delta_win_rate: number;
+    delta_trade_count: number;
+  };
 }

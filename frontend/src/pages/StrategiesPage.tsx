@@ -1,25 +1,123 @@
-import { useState, useEffect, useMemo } from "react";
+import { memo, useCallback, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { getStrategies } from "../api/client";
 import { FilterBar } from "../components/FilterBar";
+import { useStrategies } from "../api/queries";
+import type { StrategyMeta } from "../api/types";
+
+const StrategyCard = memo(function StrategyCard({
+  strategy,
+  onOpen,
+}: {
+  strategy: StrategyMeta;
+  onOpen: (strategy: StrategyMeta) => void;
+}) {
+  return (
+    <div
+      onClick={() => onOpen(strategy)}
+      style={{
+        background: "var(--color-surface)",
+        border: "1px solid var(--color-border)",
+        borderRadius: "8px",
+        padding: "16px",
+        cursor: "pointer",
+      }}
+      onMouseEnter={(e) =>
+        (e.currentTarget.style.borderColor = "rgba(88,166,255,0.4)")
+      }
+      onMouseLeave={(e) =>
+        (e.currentTarget.style.borderColor = "var(--color-border)")
+      }
+    >
+      <div
+        style={{
+          fontWeight: 600,
+          fontSize: "0.95rem",
+          marginBottom: "6px",
+        }}
+      >
+        {strategy.name}
+      </div>
+      <div
+        style={{
+          display: "flex",
+          gap: "6px",
+          flexWrap: "wrap",
+          marginBottom: "8px",
+        }}
+      >
+        {(strategy.tags?.type || []).map((t: string) => (
+          <span
+            key={t}
+            style={{
+              background: "rgba(88,166,255,0.12)",
+              color: "#58a6ff",
+              fontSize: "0.68rem",
+              padding: "2px 8px",
+              borderRadius: "3px",
+            }}
+          >
+            {t}
+          </span>
+        ))}
+        {(strategy.tags?.asset_class || []).map((a: string) => (
+          <span
+            key={a}
+            style={{
+              background: "rgba(63,185,80,0.12)",
+              color: "#3fb950",
+              fontSize: "0.68rem",
+              padding: "2px 8px",
+              borderRadius: "3px",
+            }}
+          >
+            {a}
+          </span>
+        ))}
+        {strategy.tags?.complexity && (
+          <span
+            style={{
+              background: "rgba(210,153,34,0.12)",
+              color: "#d29922",
+              fontSize: "0.68rem",
+              padding: "2px 8px",
+              borderRadius: "3px",
+            }}
+          >
+            {strategy.tags.complexity}
+          </span>
+        )}
+      </div>
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          fontSize: "0.75rem",
+          color: "var(--color-text-muted)",
+          gap: "8px",
+          flexWrap: "wrap",
+        }}
+      >
+        <span>{strategy.tags?.source || "unknown"}</span>
+        <span>{strategy.backtest_count || 0} backtests</span>
+        {strategy.created_at ? (
+          <span>
+            Added {new Date(strategy.created_at).toLocaleDateString("en-US")}
+          </span>
+        ) : null}
+      </div>
+    </div>
+  );
+});
 
 export function StrategiesPage() {
   const navigate = useNavigate();
-  const [strategies, setStrategies] = useState<any[]>([]);
-  const [search, setSearch] = useState("");
   const [filters, setFilters] = useState<Record<string, string>>({});
   const [sortBy, setSortBy] = useState("name_asc");
-  const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
-    getStrategies()
-      .then((data) => {
-        setStrategies(data);
-        setLoading(false);
-      })
-      .catch(() => setLoading(false));
-  }, []);
-
+  const strategiesQuery = useStrategies();
+  const strategies = strategiesQuery.data ?? [];
+  const loading = strategiesQuery.isLoading;
+  const [search, setSearch] = useState("");
   const types = useMemo(
     () => [...new Set(strategies.flatMap((s) => s.tags?.type || []))],
     [strategies],
@@ -81,6 +179,13 @@ export function StrategiesPage() {
     });
     return result;
   }, [strategies, search, filters, sortBy]);
+
+  const handleOpenStrategy = useCallback(
+    (selected: StrategyMeta) => {
+      navigate(`/strategies/${encodeURIComponent(selected.slug || selected.name)}`);
+    },
+    [navigate],
+  );
 
   return (
     <div style={{ padding: "24px" }}>
@@ -147,102 +252,12 @@ export function StrategiesPage() {
             gap: "12px",
           }}
         >
-          {filtered.map((s) => (
-            <div
-              key={s.slug || s.name}
-              onClick={() => navigate(`/strategies/${encodeURIComponent(s.slug || s.name)}`)}
-              style={{
-                background: "var(--color-surface)",
-                border: "1px solid var(--color-border)",
-                borderRadius: "8px",
-                padding: "16px",
-                cursor: "pointer",
-              }}
-              onMouseEnter={(e) =>
-                (e.currentTarget.style.borderColor = "rgba(88,166,255,0.4)")
-              }
-              onMouseLeave={(e) =>
-                (e.currentTarget.style.borderColor = "var(--color-border)")
-              }
-            >
-              <div
-                style={{
-                  fontWeight: 600,
-                  fontSize: "0.95rem",
-                  marginBottom: "6px",
-                }}
-              >
-                {s.name}
-              </div>
-              <div
-                style={{
-                  display: "flex",
-                  gap: "6px",
-                  flexWrap: "wrap",
-                  marginBottom: "8px",
-                }}
-              >
-                {(s.tags?.type || []).map((t: string) => (
-                  <span
-                    key={t}
-                    style={{
-                      background: "rgba(88,166,255,0.12)",
-                      color: "#58a6ff",
-                      fontSize: "0.68rem",
-                      padding: "2px 8px",
-                      borderRadius: "3px",
-                    }}
-                  >
-                    {t}
-                  </span>
-                ))}
-                {(s.tags?.asset_class || []).map((a: string) => (
-                  <span
-                    key={a}
-                    style={{
-                      background: "rgba(63,185,80,0.12)",
-                      color: "#3fb950",
-                      fontSize: "0.68rem",
-                      padding: "2px 8px",
-                      borderRadius: "3px",
-                    }}
-                  >
-                    {a}
-                  </span>
-                ))}
-                {s.tags?.complexity && (
-                  <span
-                    style={{
-                      background: "rgba(210,153,34,0.12)",
-                      color: "#d29922",
-                      fontSize: "0.68rem",
-                      padding: "2px 8px",
-                      borderRadius: "3px",
-                    }}
-                  >
-                    {s.tags.complexity}
-                  </span>
-                )}
-              </div>
-              <div
-                style={{
-                  display: "flex",
-                  justifyContent: "space-between",
-                  fontSize: "0.75rem",
-                  color: "var(--color-text-muted)",
-                  gap: "8px",
-                  flexWrap: "wrap",
-                }}
-              >
-                <span>{s.tags?.source || "unknown"}</span>
-                <span>{s.backtest_count || 0} backtests</span>
-                {s.created_at ? (
-                  <span>
-                    Added {new Date(s.created_at).toLocaleDateString("en-US")}
-                  </span>
-                ) : null}
-              </div>
-            </div>
+          {filtered.map((strategy) => (
+            <StrategyCard
+              key={strategy.slug || strategy.name}
+              strategy={strategy}
+              onOpen={handleOpenStrategy}
+            />
           ))}
         </div>
       )}

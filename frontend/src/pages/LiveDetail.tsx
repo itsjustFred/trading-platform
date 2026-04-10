@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { ArrowLeft } from "lucide-react";
 import {
@@ -16,7 +16,7 @@ import type {
   LiveBalanceRecord,
   LiveTradeSlippage,
 } from "../api/types";
-import { DataTable } from "../components/DataTable";
+import { TradeTable, type TradeTableRow } from "../components/TradeTable";
 import { Modal } from "../components/Modal";
 import { useToast } from "../components/ToastProvider";
 
@@ -145,127 +145,35 @@ export function LiveDetailPage() {
     [balances],
   );
 
-  const tradeColumns = [
-    { key: "symbol", label: "Symbol", align: "center" as const, width: "90px" },
-    {
-      key: "action",
-      label: "Action",
-      align: "center" as const,
-      width: "84px",
-      render: (row: LiveTradeSlippage) => (
-        <span style={{ color: row.action === "buy" ? "#86efac" : "#fca5a5", fontWeight: 600 }}>
-          {row.action.toUpperCase()}
-        </span>
-      ),
-    },
-    {
-      key: "theoretical_price",
-      label: "Theo Price",
-      align: "right" as const,
-      render: (row: LiveTradeSlippage) => formatUsd(row.theoretical_price),
-    },
-    {
-      key: "actual_price",
-      label: "Actual Price",
-      align: "right" as const,
-      render: (row: LiveTradeSlippage) => formatUsd(row.actual_price),
-    },
-    {
-      key: "slippage",
-      label: "Slippage",
-      align: "right" as const,
-      render: (row: LiveTradeSlippage) => (
-        <span style={{ color: row.slippage <= 0 ? "#86efac" : "#fca5a5", fontWeight: 600 }}>
-          {formatSigned(row.slippage)}
-        </span>
-      ),
-    },
-    {
-      key: "slippage_bps",
-      label: "Bps",
-      align: "right" as const,
-      render: (row: LiveTradeSlippage) => (
-        <span style={{ color: row.slippage_bps <= 0 ? "#86efac" : "#fca5a5" }}>
-          {formatSigned(row.slippage_bps, 2)}
-        </span>
-      ),
-    },
-    {
-      key: "filled_qty",
-      label: "Qty",
-      align: "right" as const,
-      render: (row: LiveTradeSlippage) => row.filled_qty.toFixed(4),
-    },
-    {
-      key: "position_size",
-      label: "Size",
-      align: "right" as const,
-      render: (row: LiveTradeSlippage) => {
-        const directSize = row.position_size;
-        const metadataSize = Number(
-          (row.signal_metadata as Record<string, unknown>)?.qty ??
-            (row.signal_metadata as Record<string, unknown>)?.position_size ??
-            NaN,
-        );
-        const size =
-          directSize != null && Number.isFinite(directSize) ? directSize : metadataSize;
-        return Number.isFinite(size)
-          ? size.toLocaleString("en-US", {
-              minimumFractionDigits: 2,
-              maximumFractionDigits: 4,
-            })
-          : "N/A";
-      },
-    },
-    {
-      key: "risk_amount",
-      label: "Risk $",
-      align: "right" as const,
-      render: (row: LiveTradeSlippage) => {
-        const directRisk = row.risk_amount;
-        const metadataRisk = Number(
-          (row.signal_metadata as Record<string, unknown>)?.risk_amount ?? NaN,
-        );
-        const value =
-          directRisk != null && Number.isFinite(directRisk) ? directRisk : metadataRisk;
-        return Number.isFinite(value)
-          ? `$${value.toLocaleString("en-US", {
-              minimumFractionDigits: 2,
-              maximumFractionDigits: 2,
-            })}`
-          : "N/A";
-      },
-    },
-    {
-      key: "risk_percent",
-      label: "Risk %",
-      align: "right" as const,
-      render: (row: LiveTradeSlippage) => {
-        const directPercent = row.risk_percent;
-        const metadataPercent = Number(
-          (row.signal_metadata as Record<string, unknown>)?.risk_percent ?? NaN,
-        );
-        const value =
-          directPercent != null && Number.isFinite(directPercent)
-            ? directPercent
-            : metadataPercent;
-        return Number.isFinite(value)
-          ? `${(value * 100).toLocaleString("en-US", {
-              minimumFractionDigits: 2,
-              maximumFractionDigits: 2,
-            })}%`
-          : "N/A";
-      },
-    },
-    {
-      key: "execution_timestamp",
-      label: "Fill Time",
-      align: "center" as const,
-      width: "170px",
-      render: (row: LiveTradeSlippage) =>
-        row.execution_timestamp.replace("T", " ").slice(0, 19),
-    },
-  ];
+  const tradeRows = trades.map<TradeTableRow>((row, index) => {
+    const metadata = row.signal_metadata as Record<string, unknown>;
+    const metadataPnl = Number(metadata?.pnl ?? NaN);
+    const metadataPnlPct = Number(metadata?.pnl_pct ?? NaN);
+    const direction = String(row.action || "").toUpperCase();
+    const directionFactor = direction === "SELL" ? -1 : 1;
+    const slippagePnl = -asFiniteNumber(row.slippage, 0) * asFiniteNumber(row.filled_qty, 0) * directionFactor;
+    const resolvedPnl = Number.isFinite(metadataPnl) ? metadataPnl : slippagePnl;
+
+    const durationFromMeta = String(
+      metadata?.duration ?? metadata?.holding_time ?? metadata?.bars_held ?? "",
+    ).trim();
+
+    return {
+      id: row.execution_id || row.signal_id || `${row.symbol}-${row.execution_time}-${index}`,
+      time: row.execution_timestamp || row.signal_timestamp || "",
+      symbol: row.symbol,
+      side: direction || "BUY",
+      size: Number.isFinite(row.position_size) ? row.position_size : row.filled_qty,
+      entryPrice: row.theoretical_price,
+      exitPrice: row.actual_price,
+      pnl: resolvedPnl,
+      pnlPct: Number.isFinite(metadataPnlPct) ? metadataPnlPct : null,
+      exitReason:
+        row.exit_reason ||
+        String(metadata?.exit_reason ?? metadata?.reason ?? "").trim(),
+      duration: durationFromMeta || null,
+    };
+  });
 
   const handleStartReplay = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -548,7 +456,7 @@ export function LiveDetailPage() {
             No fills captured yet.
           </div>
         ) : (
-          <DataTable columns={tradeColumns} data={trades} maxHeight="520px" />
+          <TradeTable trades={tradeRows} />
         )}
       </div>
     </div>
@@ -649,7 +557,7 @@ function LiveEquityChart({
   return <div ref={containerRef} style={{ width: "100%", height: "360px" }} />;
 }
 
-function MetricCard({
+const MetricCard = memo(function MetricCard({
   label,
   value,
   valueColor,
@@ -689,7 +597,7 @@ function MetricCard({
       </div>
     </div>
   );
-}
+});
 
 const fieldLabelStyle: React.CSSProperties = {
   display: "grid",
@@ -914,9 +822,4 @@ function formatSignedUsd(value: number): string {
 
 function formatPercent(value: number): string {
   return `${value.toFixed(1)}%`;
-}
-
-function formatSigned(value: number, digits = 2): string {
-  const sign = value > 0 ? "+" : "";
-  return `${sign}${value.toFixed(digits)}`;
 }

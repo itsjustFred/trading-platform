@@ -366,18 +366,39 @@ def _trade_to_viewer(trade) -> dict:
 def _load_ohlcv_df(symbol: str, timeframe: str) -> pd.DataFrame | None:
     """Find and load OHLCV parquet for a symbol+timeframe."""
     ohlcv_root = DATA_DIR / "ohlcv"
-    matches = list(ohlcv_root.rglob(f"**/{symbol}/{timeframe}.parquet"))
+    matches = sorted(ohlcv_root.rglob(f"**/{symbol}/{timeframe}.parquet"))
     if not matches:
         return None
-    try:
-        df = pd.read_parquet(matches[0])
-        df.columns = [c.lower() for c in df.columns]
+
+    frames: list[pd.DataFrame] = []
+    for path in matches:
+        try:
+            df = pd.read_parquet(path)
+        except (ValueError, KeyError, pd.errors.EmptyDataError, FileNotFoundError, OSError) as exc:
+            logger.warning("Could not load OHLCV segment for %s/%s from %s: %s", symbol, timeframe, path, exc)
+            continue
+        df.columns = [str(column).lower() for column in df.columns]
         if "timestamp" in df.columns:
-            df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-        return df
-    except (ValueError, KeyError, pd.errors.EmptyDataError, FileNotFoundError, OSError) as e:
-        logger.warning("Could not load OHLCV for %s/%s: %s", symbol, timeframe, e)
+            df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+            df = df.dropna(subset=["timestamp"])
+        if not df.empty:
+            frames.append(df)
+
+    if not frames:
         return None
+    if len(frames) == 1:
+        return frames[0]
+
+    merged = pd.concat(frames, ignore_index=True, sort=False)
+    if "timestamp" in merged.columns:
+        merged = (
+            merged.drop_duplicates(subset=["timestamp"], keep="last")
+            .sort_values("timestamp")
+            .reset_index(drop=True)
+        )
+    else:
+        merged = merged.drop_duplicates().reset_index(drop=True)
+    return merged
 
 
 def _infer_symbol_data_category(symbol: str) -> str:
@@ -413,12 +434,19 @@ def _missing_ohlcv_details(
     category = _infer_symbol_data_category(symbol)
     category_lower = category.lower()
 
+    normalized_timeframe = str(timeframe or "").strip().lower()
+    intraday_timeframes = {"1m", "5m", "15m", "30m", "1h"}
+
     if category_lower in {"forex", "metals", "indices", "energy"}:
         suggested_source = "dukascopy"
         alternatives = ["yfinance"]
     elif category_lower in {"equities", "etfs"}:
-        suggested_source = "yfinance"
-        alternatives = ["dolthub"]
+        if normalized_timeframe in intraday_timeframes:
+            suggested_source = "alpaca"
+            alternatives = ["huggingface", "yfinance"]
+        else:
+            suggested_source = "yfinance"
+            alternatives = ["dolthub", "alpaca"]
     else:
         suggested_source = "dukascopy"
         alternatives = ["yfinance", "dolthub"]
@@ -2778,6 +2806,7 @@ def _write_task_traceback(
     traceback_text: str,
     *,
     source: str = "data-task",
+    log_level: str = "error",
 ) -> None:
     content = (traceback_text or "").rstrip()
     if not content:
@@ -2787,7 +2816,7 @@ def _write_task_traceback(
         task_id,
         f"[{_task_timestamp()}] Full traceback:",
         stream="stderr",
-        log_level="error",
+        log_level=log_level,
         source=source,
     )
     for line in content.splitlines():
@@ -2796,7 +2825,7 @@ def _write_task_traceback(
             task_id,
             line,
             stream="stderr",
-            log_level="error",
+            log_level=log_level,
             source=source,
         )
 
@@ -3602,8 +3631,9 @@ def _start_jforex_task(
                                 task_id,
                                 jforex_traceback,
                                 source="data-task",
+                                log_level="warning",
                             )
-                            logger.exception(
+                            logger.warning(
                                 "JForex download failed for %s %s; attempting native fallback: %s",
                                 symbol,
                                 timeframe,
@@ -4111,6 +4141,16 @@ def _download_task_labels(source: str, symbols: list[str], timeframes: list[str]
             f"Download {symbol_label}",
             f"Yahoo Finance download for {symbol_label}.",
         )
+    if source == "huggingface":
+        return (
+            f"Download {symbol_label} {timeframe_label}",
+            f"HuggingFace download for {symbol_label} on {timeframe_label}.",
+        )
+    if source == "alpaca":
+        return (
+            f"Download {symbol_label} {timeframe_label}",
+            f"Alpaca download for {symbol_label} on {timeframe_label}.",
+        )
     return ("Sync Dolthub repos", "Refresh Dolthub repositories and rebuild the data catalog.")
 
 
@@ -4125,7 +4165,16 @@ def _task_cache_invalidation_reason(source: str) -> str | None:
     source_key = str(source or "").strip().lower()
     if source_key == "resample":
         return "post_resample"
-    if source_key in {"dukascopy", "jforex", "yfinance", "dolthub", "harvest", "download"}:
+    if source_key in {
+        "dukascopy",
+        "jforex",
+        "yfinance",
+        "huggingface",
+        "alpaca",
+        "dolthub",
+        "harvest",
+        "download",
+    }:
         return "post_download"
     return None
 

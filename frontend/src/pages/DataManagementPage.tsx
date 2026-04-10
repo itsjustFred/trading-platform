@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, MouseEvent, ReactNode } from "react";
 import {
   AlertTriangle,
@@ -139,6 +139,8 @@ function humanizeSource(source: string | undefined) {
     dolthub: "Dolthub",
     dukascopy: "Dukascopy",
     jforex: "JForex",
+    huggingface: "HuggingFace",
+    alpaca: "Alpaca",
   };
   if (aliases[normalized.toLowerCase()]) {
     return aliases[normalized.toLowerCase()];
@@ -529,7 +531,7 @@ export function DataManagementPage() {
     void poll();
     intervalId = window.setInterval(() => {
       void poll();
-    }, 2000);
+    }, 3000);
 
     return () => {
       active = false;
@@ -1779,7 +1781,7 @@ function ActionButton({
   );
 }
 
-function MetricTile({
+const MetricTile = memo(function MetricTile({
   label,
   value,
   accent,
@@ -1813,7 +1815,7 @@ function MetricTile({
       </div>
     </div>
   );
-}
+});
 
 function SectionPanel({
   title,

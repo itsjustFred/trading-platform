@@ -42,7 +42,7 @@ export function TaskManager() {
     void poll();
     intervalId = window.setInterval(() => {
       void poll();
-    }, 1000);
+    }, 3000);
 
     return () => {
       active = false;
@@ -58,9 +58,15 @@ export function TaskManager() {
       ),
     [orderedTasks],
   );
-  const runningCount = activeTasks.filter((task) =>
-    ["queued", "starting", "running"].includes(String(task.status || "").toLowerCase()),
-  ).length;
+  const runningCount = useMemo(
+    () =>
+      activeTasks.filter((task) =>
+        ["queued", "starting", "running"].includes(
+          String(task.status || "").toLowerCase(),
+        ),
+      ).length,
+    [activeTasks],
+  );
   const summaryLabel = `${runningCount} running · ${orderedTasks.length} total`;
 
   return (

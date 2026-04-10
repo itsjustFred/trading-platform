@@ -60,12 +60,18 @@ LOG_DIR = RESOLVED_LOG_DIR
 os.environ.setdefault("LOG_DIR", str(LOG_DIR))
 
 from shared.logging import get_logger
-from shared.models import BacktestResult, EquityPoint
+from shared.models import (
+    BacktestResult,
+    EquityPoint,
+    Portfolio as PortfolioModel,
+    PortfolioComponent as PortfolioComponentModel,
+)
 from shared.database import (
     DB_PATH as BACKTEST_DB_PATH,
     create_live_deployment,
     delete_background_task_record,
     delete_backtest,
+    delete_portfolio as delete_portfolio_record,
     delete_live_deployment,
     ensure_live_account,
     get_background_task_record,
@@ -74,6 +80,7 @@ from shared.database import (
     list_backtest_ids,
     list_backtest_fingerprint_rows,
     list_backtest_metadata_rows,
+    list_portfolios as list_portfolio_records,
     list_background_task_records,
     list_live_accounts,
     list_live_balances,
@@ -87,9 +94,11 @@ from shared.database import (
     load_backtest_equity_preview_map,
     load_live_account_stats_inputs,
     load_backtest_result,
+    load_portfolio as load_portfolio_record,
     mark_background_tasks_interrupted,
     migrate_json_to_sqlite,
     save_result_to_sqlite,
+    save_portfolio as save_portfolio_record,
     upsert_background_task_record,
     update_live_deployment_status,
 )
@@ -645,10 +654,21 @@ class PortfolioStrategyConfig(SQLModel):
     max_positions: int = 99
 
 
+class PortfolioComponentConfig(SQLModel):
+    strategy_name: str = ""
+    symbol: str = ""
+    timeframe: str = "1h"
+    weight: float = 1.0
+    risk_config: dict[str, Any] = PydanticField(default_factory=dict)
+    settings: dict[str, Any] = PydanticField(default_factory=dict)
+    backtest_id: str | None = None
+
+
 class CreatePortfolioRequest(SQLModel):
     name: str = "Untitled"
     account_capital: float = 100000.0
     strategies: list[PortfolioStrategyConfig] = []
+    components: list[PortfolioComponentConfig] = []
 
 
 class DataDownloadRequest(SQLModel):
@@ -712,6 +732,7 @@ class BacktestsListResponse(SQLModel):
     page: int
     per_page: int
     total: int
+    pages: int = 1
     sort: str
     order: str
 
@@ -728,7 +749,23 @@ class BacktestsDeduplicateResponse(SQLModel):
     groups_affected: int
 
 
+class PortfoliosDuplicatesResponse(SQLModel):
+    groups: list[dict[str, Any]]
+    total_groups: int
+    total_portfolios: int
+
+
+class PortfoliosDeduplicateResponse(SQLModel):
+    deleted_ids: list[str]
+    kept_ids: list[str]
+    groups_affected: int
+
+
 class BacktestsBulkDeleteRequest(SQLModel):
+    ids: list[str]
+
+
+class PortfoliosBulkDeleteRequest(SQLModel):
     ids: list[str]
 
 
@@ -1237,6 +1274,8 @@ def _normalize_backtest_sort(value: str) -> str:
         "cagr",
         "psr",
         "p_value",
+        "max_drawdown",
+        "win_rate",
     }:
         return normalized
     return "created_at"
@@ -1245,9 +1284,266 @@ def _normalize_backtest_sort(value: str) -> str:
 def _backtest_sort_key(item: dict[str, Any], sort_field: str) -> Any:
     if sort_field in {"trade_count"}:
         return int(item.get(sort_field, 0) or 0)
-    if sort_field in {"total_return", "sharpe_ratio", "cagr", "psr", "p_value"}:
+    if sort_field == "win_rate":
+        return _normalize_win_rate(item.get("win_rate")) or 0.0
+    if sort_field in {"total_return", "sharpe_ratio", "cagr", "psr", "p_value", "max_drawdown"}:
         return float(item.get(sort_field, 0.0) or 0.0)
     return str(item.get(sort_field, "") or "")
+
+
+def _normalize_portfolio_sort(value: str) -> str:
+    normalized = str(value or "created_at").strip().lower()
+    aliases = {
+        "sharpe": "sharpe_ratio",
+        "max_drawdown_pct": "max_drawdown",
+        "total_trades": "trade_count",
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized in {
+        "created_at",
+        "total_return",
+        "sharpe_ratio",
+        "psr",
+        "p_value",
+        "cagr",
+        "max_drawdown",
+        "win_rate",
+        "trade_count",
+    }:
+        return normalized
+    return "created_at"
+
+
+def _portfolio_sort_key(item: dict[str, Any], sort_field: str) -> Any:
+    if sort_field in {"trade_count"}:
+        return int(_safe_float(item.get("trade_count"), 0))
+    if sort_field == "created_at":
+        return str(item.get("created_at") or "")
+    if sort_field in {"total_return", "sharpe_ratio", "psr", "p_value", "cagr", "max_drawdown", "win_rate"}:
+        return float(_safe_float(item.get(sort_field), 0.0))
+    return str(item.get(sort_field) or "")
+
+
+def _portfolio_equity_preview(values: Any, *, limit: int = 50) -> list[float]:
+    if not isinstance(values, list) or not values:
+        return []
+    numeric_values = [
+        _safe_float(point.get("equity"), _safe_float(point, 0.0)) if isinstance(point, dict) else _safe_float(point, 0.0)
+        for point in values
+    ]
+    if len(numeric_values) <= limit:
+        return [float(entry) for entry in numeric_values]
+    step = len(numeric_values) / limit
+    preview = [float(numeric_values[int(index * step)]) for index in range(limit)]
+    preview.append(float(numeric_values[-1]))
+    return preview
+
+
+def _portfolio_summary_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    stats = legacy_viewer.PortfolioStats.from_dict(payload.get("combined_stats", {})).to_dict()
+    account_capital = _safe_float(payload.get("account_capital"), 100000.0) or 100000.0
+    cagr = _safe_float(stats.get("cagr"), 0.0)
+    max_drawdown = abs(_safe_float(stats.get("max_drawdown"), 0.0))
+    net_profit = _safe_float(stats.get("net_profit"), 0.0)
+    total_return = _safe_float(stats.get("total_return"), 0.0)
+    win_rate = _normalize_win_rate(stats.get("win_rate")) or 0.0
+    trades = payload.get("trades") if isinstance(payload.get("trades"), list) else []
+    return {
+        "id": str(payload.get("id") or ""),
+        "name": str(payload.get("name") or ""),
+        "account_capital": account_capital,
+        "strategy_count": len(payload.get("components", [])) if isinstance(payload.get("components"), list) else 0,
+        "total_return": total_return,
+        "sharpe_ratio": round(_safe_float(stats.get("sharpe"), 0.0), 6),
+        "sharpe": round(_safe_float(stats.get("sharpe"), 0.0), 3),
+        "cagr": round(cagr * 100.0, 2),
+        "max_drawdown": max_drawdown,
+        "max_drawdown_pct": round(max_drawdown * 100.0, 2),
+        "net_profit": round(net_profit, 2),
+        "net_profit_pct": round(net_profit / account_capital * 100, 2) if account_capital else 0.0,
+        "psr": stats.get("psr"),
+        "p_value": round(_safe_float(stats.get("p_value"), 1.0), 6),
+        "win_rate": round(win_rate * 100.0, 2),
+        "trade_count": len([trade for trade in trades if isinstance(trade, dict)]),
+        "equity_mini": _portfolio_equity_preview(payload.get("combined_equity", []), limit=50),
+        "created_at": str(payload.get("created_at", "")),
+    }
+
+
+def _sanitize_portfolio_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    sanitized = dict(payload)
+    raw_components = sanitized.get("components") if isinstance(sanitized.get("components"), list) else []
+    components: list[dict[str, Any]] = []
+    for raw_component in raw_components:
+        if hasattr(raw_component, "model_dump"):
+            component = raw_component.model_dump()
+        elif isinstance(raw_component, dict):
+            component = dict(raw_component)
+        else:
+            continue
+        components.append(component)
+    sanitized["components"] = components
+    if not isinstance(sanitized.get("combined_stats"), dict):
+        sanitized["combined_stats"] = {}
+    if not isinstance(sanitized.get("combined_equity"), list):
+        sanitized["combined_equity"] = []
+    if not isinstance(sanitized.get("trades"), list):
+        sanitized["trades"] = []
+    return sanitized
+
+
+def _snapshot_portfolio_payloads() -> list[dict[str, Any]]:
+    by_id: dict[str, dict[str, Any]] = {}
+    PORTFOLIOS_DIR.mkdir(parents=True, exist_ok=True)
+
+    for file_path in sorted(PORTFOLIOS_DIR.glob("*.json")):
+        try:
+            data = _sanitize_portfolio_payload(json.loads(file_path.read_text(encoding="utf-8")))
+        except (json.JSONDecodeError, OSError, TypeError, ValueError) as exc:
+            logger.warning("Could not read portfolio %s: %s", file_path.name, exc)
+            continue
+        portfolio_id = str(data.get("id") or file_path.stem).strip()
+        if not portfolio_id:
+            continue
+        data["id"] = portfolio_id
+        by_id[portfolio_id] = data
+
+    try:
+        records = list_portfolio_records()
+    except Exception as exc:
+        logger.warning("Could not read portfolio records from DB: %s", exc)
+        records = []
+    for record in records:
+        if hasattr(record, "model_dump"):
+            source = record.model_dump()
+        elif isinstance(record, dict):
+            source = dict(record)
+        else:
+            source = {}
+        data = _sanitize_portfolio_payload(source)
+        portfolio_id = str(data.get("id") or "").strip()
+        if not portfolio_id or portfolio_id in by_id:
+            continue
+        by_id[portfolio_id] = data
+
+    payloads = list(by_id.values())
+    payloads.sort(
+        key=lambda item: (
+            str(item.get("created_at") or ""),
+            str(item.get("id") or ""),
+        ),
+        reverse=True,
+    )
+    return payloads
+
+
+def _filter_portfolios_by_name(items: list[dict[str, Any]], name: str) -> list[dict[str, Any]]:
+    needle = str(name or "").strip().lower()
+    if not needle:
+        return items
+    filtered: list[dict[str, Any]] = []
+    for item in items:
+        values = [
+            str(item.get("name") or ""),
+            str(item.get("id") or ""),
+        ]
+        if any(needle in value.lower() for value in values if value):
+            filtered.append(item)
+    return filtered
+
+
+def _portfolio_fingerprint(payload: dict[str, Any]) -> str:
+    components = payload.get("components") if isinstance(payload.get("components"), list) else []
+    component_fingerprints: list[str] = []
+    for component in components:
+        if not isinstance(component, dict):
+            continue
+        strategy_name = _normalize_strategy_key(component.get("strategy_name"))
+        symbol = _normalize_symbol_key(component.get("symbol"))
+        timeframe = _normalize_timeframe_key(component.get("timeframe"))
+        weight = round(_safe_float(component.get("weight"), 0.0), 8)
+        backtest_id = str(component.get("backtest_id") or "").strip()
+        component_fingerprints.append(
+            f"{strategy_name}|{symbol}|{timeframe}|{weight:.8f}|{backtest_id}"
+        )
+    component_fingerprints.sort()
+    account_capital = round(_safe_float(payload.get("account_capital"), 0.0), 2)
+    return f"{account_capital:.2f}|{';'.join(component_fingerprints)}"
+
+
+def _group_duplicate_portfolios() -> tuple[list[dict[str, Any]], int]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for payload in _snapshot_portfolio_payloads():
+        fingerprint = _portfolio_fingerprint(payload)
+        if not fingerprint:
+            continue
+        grouped.setdefault(fingerprint, []).append(payload)
+
+    duplicates: list[dict[str, Any]] = []
+    total_items = 0
+    for fingerprint, entries in grouped.items():
+        if len(entries) < 2:
+            continue
+        sorted_entries = sorted(
+            entries,
+            key=lambda item: (
+                str(item.get("created_at") or ""),
+                str(item.get("id") or ""),
+            ),
+            reverse=True,
+        )
+        total_items += len(sorted_entries)
+        first = sorted_entries[0]
+        duplicates.append(
+            {
+                "fingerprint": fingerprint,
+                "name": str(first.get("name") or ""),
+                "account_capital": _safe_float(first.get("account_capital"), 0.0),
+                "component_count": len(first.get("components", []))
+                if isinstance(first.get("components"), list)
+                else 0,
+                "portfolios": [
+                    {
+                        "id": str(item.get("id") or ""),
+                        "name": str(item.get("name") or ""),
+                        "created_at": str(item.get("created_at") or ""),
+                    }
+                    for item in sorted_entries
+                ],
+            }
+        )
+
+    duplicates.sort(
+        key=lambda item: (
+            item.get("portfolios", [{}])[0].get("created_at", ""),
+            item.get("portfolios", [{}])[0].get("id", ""),
+        ),
+        reverse=True,
+    )
+    return duplicates, total_items
+
+
+def _delete_portfolio_with_artifacts(portfolio_id: str) -> bool:
+    normalized_id = str(portfolio_id or "").strip()
+    if not normalized_id:
+        return False
+
+    deleted_db = False
+    try:
+        deleted_db = delete_portfolio_record(normalized_id)
+    except Exception as exc:
+        logger.warning("Could not delete portfolio %s from DB: %s", normalized_id, exc)
+
+    path = PORTFOLIOS_DIR / f"{normalized_id}.json"
+    deleted_file = False
+    if path.exists():
+        try:
+            path.unlink()
+            deleted_file = True
+        except OSError as exc:
+            logger.warning("Could not delete portfolio %s: %s", normalized_id, exc)
+
+    return deleted_db or deleted_file
 
 
 def _current_backtest_store_mtime_ns() -> int:
@@ -1453,6 +1749,12 @@ def _normalize_win_rate(value: Any) -> float | None:
 
 def _backtest_summary_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
     strategy_name = str(meta.get("strategy_name") or "unknown")
+    display_name = str(
+        meta.get("display_name")
+        or meta.get("notes")
+        or meta.get("strategy_name")
+        or "unknown"
+    ).strip() or "unknown"
     symbols = [str(item) for item in meta.get("symbols", []) if str(item).strip()]
     timeframe = normalize_timeframe(str(meta.get("timeframe") or ""))
     start = str(meta.get("start_date") or "")
@@ -1470,11 +1772,11 @@ def _backtest_summary_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": backtest_id,
         "filename": f"{meta.get('id', '')}.trades.json",
-        "title": strategy_name,
-        "notes": "",
-        "strategy": strategy_name,
+        "title": display_name,
+        "notes": str(meta.get("notes") or ""),
+        "strategy": display_name,
         "strategy_slug": strategy_name,
-        "strategy_display_name": strategy_name,
+        "strategy_display_name": display_name,
         "strategy_file": "",
         "engine": str(meta.get("engine") or "unknown"),
         "symbols": symbols,
@@ -1503,9 +1805,16 @@ def _backtest_all_item_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
         for tag in (meta.get("tags") if isinstance(meta.get("tags"), list) else [])
         if str(tag).strip()
     ]
+    display_name = str(
+        meta.get("display_name")
+        or meta.get("notes")
+        or meta.get("strategy_name")
+        or "unknown"
+    ).strip() or "unknown"
     return {
         "id": str(meta.get("id") or "").strip(),
-        "strategy_name": str(meta.get("strategy_name") or "unknown"),
+        "strategy_name": display_name,
+        "strategy_slug": str(meta.get("strategy_name") or "unknown"),
         "symbols": [str(item) for item in meta.get("symbols", []) if str(item).strip()],
         "timeframe": normalize_timeframe(str(meta.get("timeframe") or "")),
         "total_return": _safe_float(meta.get("total_return"), 0.0),
@@ -1555,9 +1864,29 @@ def _backtest_meta_list_sorted(sort_field: str, order: str) -> list[dict[str, An
     return items
 
 
+def _filter_backtests_by_name(items: list[dict[str, Any]], name: str) -> list[dict[str, Any]]:
+    needle = str(name or "").strip().lower()
+    if not needle:
+        return items
+
+    filtered: list[dict[str, Any]] = []
+    for item in items:
+        values = [
+            str(item.get("display_name") or ""),
+            str(item.get("notes") or ""),
+            str(item.get("strategy_name") or ""),
+            str(item.get("id") or ""),
+        ]
+        if any(needle in value.lower() for value in values if value):
+            filtered.append(item)
+    return filtered
+
+
 def _apply_backtest_numeric_filters(
     items: list[dict[str, Any]],
     *,
+    total_return_min: float | None,
+    total_return_max: float | None,
     sharpe_min: float | None,
     sharpe_max: float | None,
     psr_min: float | None,
@@ -1566,6 +1895,10 @@ def _apply_backtest_numeric_filters(
     p_value_max: float | None,
     cagr_min: float | None,
     cagr_max: float | None,
+    win_rate_min: float | None,
+    win_rate_max: float | None,
+    max_drawdown_min: float | None,
+    max_drawdown_max: float | None,
 ) -> list[dict[str, Any]]:
     filtered = items
 
@@ -1576,6 +1909,35 @@ def _apply_backtest_numeric_filters(
             return False
         return True
 
+    def maybe_fraction(value: float | None) -> float | None:
+        if value is None:
+            return None
+        numeric = _safe_float(value, value)
+        if abs(numeric) > 1.0:
+            return numeric / 100.0
+        return numeric
+
+    def maybe_win_rate(value: float | None) -> float | None:
+        if value is None:
+            return None
+        numeric = _safe_float(value, value)
+        if abs(numeric) > 1.0:
+            return numeric / 100.0
+        return numeric
+
+    total_return_min = maybe_fraction(total_return_min)
+    total_return_max = maybe_fraction(total_return_max)
+    max_drawdown_min = maybe_fraction(max_drawdown_min)
+    max_drawdown_max = maybe_fraction(max_drawdown_max)
+    win_rate_min = maybe_win_rate(win_rate_min)
+    win_rate_max = maybe_win_rate(win_rate_max)
+
+    if total_return_min is not None or total_return_max is not None:
+        filtered = [
+            item
+            for item in filtered
+            if in_range(_safe_float(item.get("total_return"), 0.0), total_return_min, total_return_max)
+        ]
     if sharpe_min is not None or sharpe_max is not None:
         filtered = [
             item
@@ -1595,6 +1957,18 @@ def _apply_backtest_numeric_filters(
     if cagr_min is not None or cagr_max is not None:
         filtered = [
             item for item in filtered if in_range(_safe_float(item.get("cagr"), 0.0), cagr_min, cagr_max)
+        ]
+    if win_rate_min is not None or win_rate_max is not None:
+        filtered = [
+            item
+            for item in filtered
+            if in_range(_normalize_win_rate(item.get("win_rate")) or 0.0, win_rate_min, win_rate_max)
+        ]
+    if max_drawdown_min is not None or max_drawdown_max is not None:
+        filtered = [
+            item
+            for item in filtered
+            if in_range(abs(_safe_float(item.get("max_drawdown"), 0.0)), max_drawdown_min, max_drawdown_max)
         ]
     return filtered
 
@@ -2648,6 +3022,905 @@ def _safe_strategy_entry(identifier: str) -> StrategyEntry | None:
     return None
 
 
+def _normalize_strategy_key(value: Any) -> str:
+    return str(value or "").strip().lower().replace("_", " ").replace("-", " ")
+
+
+def _normalize_symbol_key(value: Any) -> str:
+    return str(value or "").strip().upper()
+
+
+def _normalize_timeframe_key(value: Any) -> str:
+    return normalize_timeframe(str(value or "").strip() or "1h")
+
+
+def _resolve_component_backtest_id(
+    *,
+    strategy_name: str,
+    symbol: str,
+    timeframe: str,
+    explicit_backtest_id: str = "",
+) -> str:
+    explicit_id = str(explicit_backtest_id or "").strip()
+    if explicit_id:
+        return explicit_id
+
+    strategy_entry = _safe_strategy_entry(strategy_name)
+    normalized_strategy = _normalize_strategy_key(strategy_name)
+    normalized_symbol = _normalize_symbol_key(symbol)
+    normalized_timeframe = _normalize_timeframe_key(timeframe)
+
+    best_candidate: tuple[str, str] | None = None
+    for item in _snapshot_backtest_meta_cache():
+        backtest_id = str(item.get("id") or "").strip()
+        if not backtest_id:
+            continue
+        item_strategy = _normalize_strategy_key(item.get("strategy_name"))
+        strategy_matches = False
+        if strategy_entry is not None:
+            strategy_matches = matches_strategy_identifier(strategy_entry, str(item.get("strategy_name") or ""))
+        if not strategy_matches:
+            strategy_matches = item_strategy == normalized_strategy
+        if not strategy_matches:
+            continue
+
+        item_symbols = [str(raw).strip().upper() for raw in (item.get("symbols") or []) if str(raw).strip()]
+        if normalized_symbol and item_symbols and normalized_symbol not in item_symbols:
+            continue
+        item_timeframe = _normalize_timeframe_key(item.get("timeframe"))
+        if normalized_timeframe and item_timeframe and normalized_timeframe != item_timeframe:
+            continue
+
+        created_at = str(item.get("created_at") or "")
+        if best_candidate is None or created_at > best_candidate[0]:
+            best_candidate = (created_at, backtest_id)
+
+    if best_candidate is not None:
+        return best_candidate[1]
+
+    if not BACKTESTS_DIR.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"No backtest found for component '{strategy_name}' "
+                f"({normalized_symbol or 'N/A'} {normalized_timeframe})"
+            ),
+        )
+
+    for file_path in BACKTESTS_DIR.glob("*.trades.json"):
+        try:
+            payload_data = json.loads(file_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        meta = payload_data.get("meta", {})
+        raw_strategies = meta.get("strategies", [])
+        if not isinstance(raw_strategies, list) or not raw_strategies:
+            continue
+
+        strategy_matches = False
+        if strategy_entry is not None:
+            strategy_matches = any(
+                matches_strategy_identifier(strategy_entry, strategy_value)
+                for strategy_value in raw_strategies
+            )
+        if not strategy_matches:
+            strategy_matches = any(
+                _normalize_strategy_key(strategy_value) == normalized_strategy
+                for strategy_value in raw_strategies
+            )
+        if not strategy_matches:
+            continue
+
+        data_payload = meta.get("data", {}) if isinstance(meta.get("data"), dict) else {}
+        symbols_payload = [
+            _normalize_symbol_key(raw_symbol)
+            for raw_symbol in (data_payload.get("symbols") or [])
+            if _normalize_symbol_key(raw_symbol)
+        ]
+        if normalized_symbol and symbols_payload and normalized_symbol not in symbols_payload:
+            continue
+
+        timeframes_payload = data_payload.get("timeframes") or []
+        timeframe_match = True
+        if isinstance(timeframes_payload, list) and timeframes_payload:
+            timeframe_match = normalized_timeframe in {
+                _normalize_timeframe_key(raw_timeframe) for raw_timeframe in timeframes_payload
+            }
+        if not timeframe_match:
+            continue
+
+        return file_path.stem.replace(".trades", "")
+
+    raise HTTPException(
+        status_code=404,
+        detail=(
+            f"No backtest found for component '{strategy_name}' "
+            f"({normalized_symbol or 'N/A'} {normalized_timeframe})"
+        ),
+    )
+
+
+def _resolve_strategy_backtest_id(
+    strategy_name: str,
+    *,
+    explicit_backtest_id: str = "",
+) -> str:
+    explicit_id = str(explicit_backtest_id or "").strip()
+    if explicit_id:
+        return explicit_id
+
+    strategy_entry = _safe_strategy_entry(strategy_name)
+    normalized_strategy = _normalize_strategy_key(strategy_name)
+
+    best_candidate: tuple[str, str] | None = None
+    for item in _snapshot_backtest_meta_cache():
+        backtest_id = str(item.get("id") or "").strip()
+        if not backtest_id:
+            continue
+        strategy_matches = False
+        if strategy_entry is not None:
+            strategy_matches = matches_strategy_identifier(strategy_entry, str(item.get("strategy_name") or ""))
+        if not strategy_matches:
+            strategy_matches = _normalize_strategy_key(item.get("strategy_name")) == normalized_strategy
+        if not strategy_matches:
+            continue
+        created_at = str(item.get("created_at") or "")
+        if best_candidate is None or created_at > best_candidate[0]:
+            best_candidate = (created_at, backtest_id)
+
+    if best_candidate is not None:
+        return best_candidate[1]
+
+    if not BACKTESTS_DIR.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"No backtest found for strategy '{strategy_name}'",
+        )
+
+    for file_path in BACKTESTS_DIR.glob("*.trades.json"):
+        try:
+            payload_data = json.loads(file_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+
+        meta = payload_data.get("meta", {})
+        raw_strategies = meta.get("strategies", [])
+        if not isinstance(raw_strategies, list) or not raw_strategies:
+            continue
+
+        strategy_matches = False
+        if strategy_entry is not None:
+            strategy_matches = any(
+                matches_strategy_identifier(strategy_entry, strategy_value)
+                for strategy_value in raw_strategies
+            )
+        if not strategy_matches:
+            strategy_matches = any(
+                _normalize_strategy_key(strategy_value) == normalized_strategy
+                for strategy_value in raw_strategies
+            )
+        if not strategy_matches:
+            continue
+
+        return file_path.stem.replace(".trades", "")
+
+    raise HTTPException(
+        status_code=404,
+        detail=f"No backtest found for strategy '{strategy_name}'",
+    )
+
+
+def _component_trade_time(trade: dict[str, Any]) -> str:
+    for key in ("exit_time_iso", "entry_time_iso"):
+        value = str(trade.get(key) or "").strip()
+        if value:
+            return value
+    raw_exit = trade.get("exit_time")
+    raw_entry = trade.get("entry_time")
+    for value in (raw_exit, raw_entry):
+        if value is None:
+            continue
+        if isinstance(value, (int, float)):
+            try:
+                return datetime.fromtimestamp(float(value), tz=timezone.utc).isoformat()
+            except (TypeError, ValueError, OSError):
+                continue
+        parsed = pd.to_datetime(value, utc=True, errors="coerce")
+        if not pd.isna(parsed):
+            return pd.Timestamp(parsed).isoformat()
+    return ""
+
+
+def _component_group_key(item: dict[str, Any], group_by: str) -> str:
+    if group_by == "strategy":
+        return str(item.get("strategy_name") or "unknown")
+    if group_by == "symbol":
+        return str(item.get("symbol") or "unknown").upper()
+    if group_by == "timeframe":
+        return _normalize_timeframe_key(item.get("timeframe"))
+    return str(item.get("component_id") or "")
+
+
+def _resolve_component_payloads(payload: CreatePortfolioRequest) -> list[dict[str, Any]]:
+    if payload.components:
+        resolved: list[dict[str, Any]] = []
+        for index, raw in enumerate(payload.components, start=1):
+            strategy_name = str(raw.strategy_name or "").strip()
+            symbol = _normalize_symbol_key(raw.symbol)
+            timeframe = _normalize_timeframe_key(raw.timeframe)
+            if not strategy_name:
+                raise HTTPException(status_code=400, detail=f"Component #{index} is missing strategy_name")
+            if not symbol:
+                raise HTTPException(status_code=400, detail=f"Component #{index} is missing symbol")
+            weight = _safe_float(raw.weight, 1.0)
+            if not math.isfinite(weight) or weight <= 0:
+                raise HTTPException(status_code=400, detail=f"Component #{index} has invalid weight")
+            risk_config = dict(raw.risk_config or {})
+            settings = dict(raw.settings or {})
+            backtest_id = _resolve_component_backtest_id(
+                strategy_name=strategy_name,
+                symbol=symbol,
+                timeframe=timeframe,
+                explicit_backtest_id=str(raw.backtest_id or "").strip(),
+            )
+            resolved.append(
+                {
+                    "component_id": f"component-{index:03d}",
+                    "strategy_name": strategy_name,
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "weight": weight,
+                    "risk_config": risk_config,
+                    "settings": settings,
+                    "backtest_id": backtest_id,
+                    "legacy_risk_per_trade_pct": weight,
+                    "legacy_max_positions": int(_safe_float(risk_config.get("max_positions"), 99)),
+                }
+            )
+        return resolved
+
+    strategy_configs = [item.model_dump() for item in payload.strategies]
+    if not strategy_configs:
+        raise HTTPException(status_code=400, detail="At least one component required")
+
+    resolved_legacy: list[dict[str, Any]] = []
+    for index, strategy_config in enumerate(strategy_configs, start=1):
+        strategy_name = str(strategy_config.get("name") or "").strip()
+        if not strategy_name:
+            raise HTTPException(status_code=400, detail=f"Strategy row #{index} is missing name")
+        weight = _safe_float(strategy_config.get("risk_per_trade_pct"), 1.0)
+        if not math.isfinite(weight) or weight <= 0:
+            raise HTTPException(status_code=400, detail=f"Strategy row #{index} has invalid risk_per_trade_pct")
+        backtest_id = _resolve_strategy_backtest_id(
+            strategy_name,
+            explicit_backtest_id=str(strategy_config.get("backtest_id") or "").strip(),
+        )
+        result = _load_result(backtest_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail=f"Backtest '{backtest_id}' not found")
+        result_symbol = (
+            _normalize_symbol_key((result.meta.data or {}).get("symbols", [None])[0])
+            if isinstance(result.meta.data, dict)
+            else ""
+        )
+        result_timeframe = (
+            _normalize_timeframe_key((result.meta.data or {}).get("timeframes", ["1h"])[0])
+            if isinstance(result.meta.data, dict)
+            else "1h"
+        )
+        resolved_legacy.append(
+            {
+                "component_id": f"component-{index:03d}",
+                "strategy_name": strategy_name,
+                "symbol": result_symbol,
+                "timeframe": result_timeframe,
+                "weight": weight,
+                "risk_config": {"max_positions": int(strategy_config.get("max_positions", 99))},
+                "settings": {},
+                "backtest_id": backtest_id,
+                "legacy_risk_per_trade_pct": weight,
+                "legacy_max_positions": int(strategy_config.get("max_positions", 99)),
+            }
+        )
+    return resolved_legacy
+
+
+def _compute_portfolio_contributions(
+    *,
+    portfolio: dict[str, Any],
+    group_by: str = "component",
+) -> list[dict[str, Any]]:
+    components = portfolio.get("components", [])
+    if not isinstance(components, list):
+        components = []
+    trades = portfolio.get("trades", [])
+    if not isinstance(trades, list):
+        trades = []
+
+    normalized_group = str(group_by or "component").strip().lower()
+    if normalized_group not in {"component", "strategy", "symbol", "timeframe"}:
+        normalized_group = "component"
+
+    grouped: dict[str, dict[str, Any]] = {}
+    total_return = _safe_float((portfolio.get("combined_stats") or {}).get("total_return"), 0.0)
+    total_drawdown = abs(_safe_float((portfolio.get("combined_stats") or {}).get("max_drawdown"), 0.0))
+
+    component_metrics: dict[str, dict[str, float]] = {}
+    for component in components:
+        component_id = str(component.get("component_id") or "").strip()
+        if not component_id:
+            continue
+        raw_win_rate = _normalize_win_rate(component.get("win_rate"))
+        metrics = {
+            "sharpe_ratio": 0.0,
+            "psr": 0.0,
+            "p_value": 1.0,
+            "max_drawdown": 0.0,
+            "win_rate": raw_win_rate if raw_win_rate is not None else 0.0,
+        }
+        backtest_id = str(component.get("backtest_id") or "").strip()
+        if backtest_id:
+            result = _load_result(backtest_id)
+            if result is not None:
+                try:
+                    raw = legacy_viewer._canonical_stats_from_result(result)
+                    metrics = {
+                        "sharpe_ratio": _safe_float(raw.get("sharpe_ratio"), 0.0),
+                        "psr": _safe_float(raw.get("psr"), 0.0),
+                        "p_value": _safe_float(raw.get("p_value"), 1.0),
+                        "max_drawdown": abs(_safe_float(raw.get("max_drawdown_pct"), 0.0)),
+                        "win_rate": _normalize_win_rate(raw.get("win_rate")) or 0.0,
+                    }
+                except Exception as exc:
+                    logger.warning(
+                        "Could not compute contribution metrics for component %s (%s): %s",
+                        component_id,
+                        backtest_id,
+                        exc,
+                    )
+        component_metrics[component_id] = metrics
+
+    for component in components:
+        component_id = str(component.get("component_id") or "").strip()
+        if not component_id:
+            continue
+        strategy_name = str(component.get("strategy_name") or "").strip()
+        symbol = _normalize_symbol_key(component.get("symbol"))
+        timeframe = _normalize_timeframe_key(component.get("timeframe"))
+        key = _component_group_key(component, normalized_group)
+        bucket = grouped.setdefault(
+            key,
+            {
+                "group": normalized_group,
+                "group_value": key,
+                "component_id": component_id,
+                "component_ids": [],
+                "strategy_name": strategy_name,
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "weight": 0.0,
+                "return_contribution": 0.0,
+                "return_contribution_pct": 0.0,
+                "drawdown_contribution": 0.0,
+                "drawdown_contribution_pct": 0.0,
+                "trade_count": 0,
+                "win_rate": 0.0,
+                "wins": 0,
+                "pnl_total": 0.0,
+                "pnl_contribution": 0.0,
+                "pnl_contribution_pct": 0.0,
+                "metric_weight": 0.0,
+                "sharpe_sum": 0.0,
+                "psr_sum": 0.0,
+                "p_value_sum": 0.0,
+                "max_drawdown_sum": 0.0,
+                "win_rate_sum": 0.0,
+            },
+        )
+        if not bucket.get("strategy_name"):
+            bucket["strategy_name"] = strategy_name
+        if not bucket.get("symbol"):
+            bucket["symbol"] = symbol
+        if not bucket.get("timeframe"):
+            bucket["timeframe"] = timeframe
+        bucket["component_ids"].append(component_id)
+        weight = _safe_float(component.get("weight"), 0.0)
+        bucket["weight"] = _safe_float(bucket.get("weight"), 0.0) + weight
+        bucket["return_contribution"] = _safe_float(bucket.get("return_contribution"), 0.0) + _safe_float(
+            component.get("return_contribution"), 0.0
+        )
+        bucket["drawdown_contribution"] = _safe_float(
+            bucket.get("drawdown_contribution"), 0.0
+        ) + abs(_safe_float(component.get("drawdown_contribution"), 0.0))
+
+        metrics = component_metrics.get(component_id) or {
+            "sharpe_ratio": 0.0,
+            "psr": 0.0,
+            "p_value": 1.0,
+            "max_drawdown": 0.0,
+            "win_rate": 0.0,
+        }
+        metric_weight = max(weight, 0.000001)
+        bucket["metric_weight"] = _safe_float(bucket.get("metric_weight"), 0.0) + metric_weight
+        bucket["sharpe_sum"] = _safe_float(bucket.get("sharpe_sum"), 0.0) + _safe_float(
+            metrics.get("sharpe_ratio"), 0.0
+        ) * metric_weight
+        bucket["psr_sum"] = _safe_float(bucket.get("psr_sum"), 0.0) + _safe_float(
+            metrics.get("psr"), 0.0
+        ) * metric_weight
+        bucket["p_value_sum"] = _safe_float(bucket.get("p_value_sum"), 0.0) + _safe_float(
+            metrics.get("p_value"), 1.0
+        ) * metric_weight
+        bucket["max_drawdown_sum"] = _safe_float(bucket.get("max_drawdown_sum"), 0.0) + abs(
+            _safe_float(metrics.get("max_drawdown"), 0.0)
+        ) * metric_weight
+        bucket["win_rate_sum"] = _safe_float(bucket.get("win_rate_sum"), 0.0) + (
+            _normalize_win_rate(metrics.get("win_rate")) or 0.0
+        ) * metric_weight
+
+    component_ids_by_group = {
+        key: {str(component_id) for component_id in value.get("component_ids", [])}
+        for key, value in grouped.items()
+    }
+
+    for trade in trades:
+        component_id = str(trade.get("component_id") or "").strip()
+        if not component_id:
+            continue
+        for key, component_ids in component_ids_by_group.items():
+            if component_id not in component_ids:
+                continue
+            bucket = grouped[key]
+            pnl_value = _safe_float(trade.get("pnl"), 0.0)
+            bucket["trade_count"] = int(bucket.get("trade_count") or 0) + 1
+            if pnl_value > 0:
+                bucket["wins"] = int(bucket.get("wins") or 0) + 1
+            bucket["pnl_total"] = _safe_float(bucket.get("pnl_total"), 0.0) + pnl_value
+
+    total_pnl = _safe_float((portfolio.get("combined_stats") or {}).get("net_profit"), 0.0)
+    contributions: list[dict[str, Any]] = []
+    for key in sorted(grouped.keys()):
+        bucket = grouped[key]
+        trade_count = int(bucket.get("trade_count") or 0)
+        wins = int(bucket.get("wins") or 0)
+        return_value = _safe_float(bucket.get("return_contribution"), 0.0)
+        drawdown_value = abs(_safe_float(bucket.get("drawdown_contribution"), 0.0))
+        return_pct = 0.0 if total_return == 0 else (return_value / total_return) * 100.0
+        drawdown_pct = 0.0 if total_drawdown == 0 else (drawdown_value / total_drawdown) * 100.0
+        pnl_value = _safe_float(bucket.get("pnl_total"), 0.0)
+        pnl_pct = 0.0 if total_pnl == 0 else (pnl_value / total_pnl) * 100.0
+        metric_weight = _safe_float(bucket.get("metric_weight"), 0.0) or 1.0
+        sharpe_ratio = _safe_float(bucket.get("sharpe_sum"), 0.0) / metric_weight
+        psr = _safe_float(bucket.get("psr_sum"), 0.0) / metric_weight
+        p_value = _safe_float(bucket.get("p_value_sum"), 1.0) / metric_weight
+        max_drawdown = _safe_float(bucket.get("max_drawdown_sum"), 0.0) / metric_weight
+        metric_win_rate = _safe_float(bucket.get("win_rate_sum"), 0.0) / metric_weight
+        display_value = bucket.get("group_value", key)
+        if normalized_group == "component":
+            strategy_name = str(bucket.get("strategy_name") or display_value or "").strip()
+            symbol = _normalize_symbol_key(bucket.get("symbol"))
+            timeframe = _normalize_timeframe_key(bucket.get("timeframe"))
+            suffix_values = [value for value in [symbol, timeframe] if value]
+            if strategy_name and suffix_values:
+                display_value = f"{strategy_name} ({', '.join(suffix_values)})"
+            elif strategy_name:
+                display_value = strategy_name
+        contributions.append(
+            {
+                "group": normalized_group,
+                "group_value": display_value,
+                "component_id": str(bucket.get("component_id") or ""),
+                "component_ids": bucket.get("component_ids", []),
+                "strategy_name": bucket.get("strategy_name", ""),
+                "symbol": bucket.get("symbol", ""),
+                "timeframe": bucket.get("timeframe", ""),
+                "weight": round(_safe_float(bucket.get("weight"), 0.0), 6),
+                "return_contribution": round(return_value, 8),
+                "return_contribution_pct": round(return_pct, 3),
+                "drawdown_contribution": round(drawdown_value, 8),
+                "drawdown_contribution_pct": round(drawdown_pct, 3),
+                "trade_count": trade_count,
+                "win_rate": round(metric_win_rate * 100.0, 2),
+                "wins": wins,
+                "sharpe_ratio": round(sharpe_ratio, 6),
+                "psr": round(psr, 6),
+                "p_value": round(p_value, 6),
+                "max_drawdown": round(max_drawdown, 6),
+                "pnl_total": round(pnl_value, 6),
+                "pnl_contribution": round(pnl_value, 6),
+                "pnl_contribution_pct": round(pnl_pct, 3),
+            }
+        )
+    return contributions
+
+
+def _portfolio_trades_filtered(
+    *,
+    portfolio: dict[str, Any],
+    strategy: str = "",
+    symbol: str = "",
+    timeframe: str = "",
+) -> list[dict[str, Any]]:
+    trades = portfolio.get("trades", [])
+    if not isinstance(trades, list):
+        return []
+    components = portfolio.get("components") if isinstance(portfolio.get("components"), list) else []
+    component_by_id = {
+        str(component.get("component_id") or "").strip(): component
+        for component in components
+        if isinstance(component, dict) and str(component.get("component_id") or "").strip()
+    }
+
+    strategy_filter = _normalize_strategy_key(strategy)
+    symbol_filter = _normalize_symbol_key(symbol)
+    timeframe_filter = _normalize_timeframe_key(timeframe) if str(timeframe or "").strip() else ""
+
+    filtered: list[dict[str, Any]] = []
+    for trade in trades:
+        if not isinstance(trade, dict):
+            continue
+        normalized_trade = dict(trade)
+        component_id = str(normalized_trade.get("component_id") or "").strip()
+        component = component_by_id.get(component_id)
+
+        strategy_name = str(normalized_trade.get("strategy_name") or normalized_trade.get("strategy") or "").strip()
+        if not strategy_name and component is not None:
+            strategy_name = str(component.get("strategy_name") or "").strip()
+        normalized_symbol = _normalize_symbol_key(normalized_trade.get("symbol"))
+        if not normalized_symbol and component is not None:
+            normalized_symbol = _normalize_symbol_key(component.get("symbol"))
+        normalized_timeframe = _normalize_timeframe_key(normalized_trade.get("timeframe"))
+        if not normalized_timeframe and component is not None:
+            normalized_timeframe = _normalize_timeframe_key(component.get("timeframe"))
+        if not normalized_timeframe:
+            normalized_timeframe = "1h"
+
+        if strategy_filter and _normalize_strategy_key(strategy_name) != strategy_filter:
+            continue
+        if symbol_filter and normalized_symbol != symbol_filter:
+            continue
+        if timeframe_filter and normalized_timeframe != timeframe_filter:
+            continue
+
+        normalized_trade["component_id"] = component_id
+        normalized_trade["strategy_name"] = strategy_name
+        normalized_trade["strategy"] = strategy_name
+        normalized_trade["symbol"] = normalized_symbol
+        normalized_trade["timeframe"] = normalized_timeframe
+        normalized_trade["time"] = _component_trade_time(normalized_trade)
+        normalized_trade["date"] = str(normalized_trade.get("time") or "").split("T", 1)[0]
+        normalized_trade["size"] = _safe_float(
+            normalized_trade.get("position_size"),
+            _safe_float(normalized_trade.get("quantity"), 0.0),
+        )
+        normalized_trade["duration"] = _trade_duration_text(normalized_trade)
+        label_parts = [part for part in [normalized_symbol, normalized_timeframe] if part]
+        normalized_trade["strategy_label"] = (
+            f"{strategy_name} ({', '.join(label_parts)})" if strategy_name and label_parts else strategy_name
+        )
+        if not str(normalized_trade.get("id") or "").strip():
+            nr = normalized_trade.get("nr")
+            if nr is not None and component_id:
+                normalized_trade["id"] = f"{component_id}-{nr}"
+            elif nr is not None:
+                normalized_trade["id"] = str(nr)
+            else:
+                normalized_trade["id"] = uuid.uuid4().hex[:10]
+        filtered.append(normalized_trade)
+
+    filtered.sort(key=_component_trade_time)
+    return filtered
+
+
+def _normalize_portfolio_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(payload)
+
+    raw_components = normalized.get("components")
+    components: list[dict[str, Any]] = []
+    if isinstance(raw_components, list) and raw_components:
+        source_components = [item for item in raw_components if isinstance(item, dict)]
+    else:
+        source_components = []
+        for strategy_row in normalized.get("strategies", []):
+            if not isinstance(strategy_row, dict):
+                continue
+            source_components.append(
+                {
+                    "strategy_name": strategy_row.get("strategy_name") or strategy_row.get("name") or "",
+                    "symbol": strategy_row.get("symbol") or "",
+                    "timeframe": strategy_row.get("timeframe") or "1h",
+                    "weight": strategy_row.get("risk_per_trade_pct", 1.0),
+                    "risk_config": {"max_positions": strategy_row.get("max_positions", 99)},
+                    "settings": {},
+                    "backtest_id": strategy_row.get("backtest_id", ""),
+                }
+            )
+
+    for index, raw_component in enumerate(source_components, start=1):
+        strategy_name = str(raw_component.get("strategy_name") or raw_component.get("name") or "").strip()
+        symbol = _normalize_symbol_key(raw_component.get("symbol"))
+        timeframe = _normalize_timeframe_key(raw_component.get("timeframe"))
+        weight = _safe_float(
+            raw_component.get("weight"),
+            _safe_float(raw_component.get("risk_per_trade_pct"), 1.0),
+        )
+        if not math.isfinite(weight) or weight <= 0:
+            weight = 1.0
+
+        raw_risk_config = raw_component.get("risk_config")
+        risk_config = dict(raw_risk_config) if isinstance(raw_risk_config, dict) else {}
+        if not risk_config and raw_component.get("max_positions") is not None:
+            risk_config["max_positions"] = int(_safe_float(raw_component.get("max_positions"), 99))
+
+        raw_settings = raw_component.get("settings")
+        settings = dict(raw_settings) if isinstance(raw_settings, dict) else {}
+        component_id = str(
+            raw_component.get("component_id")
+            or settings.get("component_id")
+            or f"component-{index:03d}"
+        ).strip()
+        backtest_id = str(raw_component.get("backtest_id") or "").strip()
+        return_contribution = _safe_float(
+            raw_component.get("return_contribution"),
+            _safe_float(settings.get("return_contribution"), 0.0),
+        )
+        return_contribution_pct = _safe_float(
+            raw_component.get("return_contribution_pct"),
+            _safe_float(settings.get("return_contribution_pct"), 0.0),
+        )
+        drawdown_contribution = _safe_float(
+            raw_component.get("drawdown_contribution"),
+            _safe_float(settings.get("drawdown_contribution"), 0.0),
+        )
+        drawdown_contribution_pct = _safe_float(
+            raw_component.get("drawdown_contribution_pct"),
+            _safe_float(settings.get("drawdown_contribution_pct"), 0.0),
+        )
+        trade_count = int(
+            _safe_float(
+                raw_component.get("trade_count"),
+                _safe_float(settings.get("trade_count"), 0),
+            )
+        )
+        win_rate = _safe_float(
+            raw_component.get("win_rate"),
+            _safe_float(settings.get("win_rate"), 0.0),
+        )
+        wins = int(
+            _safe_float(
+                raw_component.get("wins"),
+                _safe_float(settings.get("wins"), 0),
+            )
+        )
+        legacy_risk_per_trade_pct = _safe_float(
+            raw_component.get("legacy_risk_per_trade_pct"),
+            _safe_float(settings.get("legacy_risk_per_trade_pct"), weight),
+        )
+        legacy_max_positions = int(
+            _safe_float(
+                raw_component.get("legacy_max_positions"),
+                _safe_float(
+                    settings.get("legacy_max_positions"),
+                    _safe_float(risk_config.get("max_positions"), 99),
+                ),
+            )
+        )
+
+        component_payload = PortfolioComponentModel(
+            strategy_name=strategy_name,
+            symbol=symbol,
+            timeframe=timeframe,
+            weight=weight,
+            risk_config=risk_config,
+            settings=settings,
+            backtest_id=backtest_id or None,
+        ).model_dump()
+        component_payload.update(
+            {
+                "component_id": component_id,
+                "backtest_id": backtest_id,
+                "return_contribution": return_contribution,
+                "return_contribution_pct": return_contribution_pct,
+                "drawdown_contribution": drawdown_contribution,
+                "drawdown_contribution_pct": drawdown_contribution_pct,
+                "trade_count": trade_count,
+                "win_rate": win_rate,
+                "wins": wins,
+                "legacy_risk_per_trade_pct": legacy_risk_per_trade_pct,
+                "legacy_max_positions": legacy_max_positions,
+            }
+        )
+        components.append(component_payload)
+
+    normalized["components"] = components
+    normalized["strategies"] = [
+        {
+            "backtest_id": str(component.get("backtest_id") or ""),
+            "strategy_name": str(component.get("strategy_name") or ""),
+            "risk_per_trade_pct": _safe_float(component.get("legacy_risk_per_trade_pct"), 1.0),
+            "max_positions": int(_safe_float(component.get("legacy_max_positions"), 99)),
+        }
+        for component in components
+    ]
+
+    component_by_id = {
+        str(component.get("component_id") or ""): component
+        for component in components
+        if str(component.get("component_id") or "").strip()
+    }
+    normalized_trades: list[dict[str, Any]] = []
+    for raw_trade in normalized.get("trades", []):
+        if not isinstance(raw_trade, dict):
+            continue
+        trade = dict(raw_trade)
+        component_id = str(trade.get("component_id") or "").strip()
+        component = component_by_id.get(component_id)
+
+        strategy_name = str(trade.get("strategy_name") or trade.get("strategy") or "").strip()
+        symbol = _normalize_symbol_key(trade.get("symbol"))
+        timeframe_text = str(trade.get("timeframe") or "").strip()
+        timeframe = _normalize_timeframe_key(timeframe_text) if timeframe_text else ""
+
+        if component is None and strategy_name:
+            normalized_strategy = _normalize_strategy_key(strategy_name)
+            for candidate in components:
+                if _normalize_strategy_key(candidate.get("strategy_name")) != normalized_strategy:
+                    continue
+                candidate_symbol = _normalize_symbol_key(candidate.get("symbol"))
+                candidate_timeframe = _normalize_timeframe_key(candidate.get("timeframe"))
+                if symbol and candidate_symbol and symbol != candidate_symbol:
+                    continue
+                if timeframe and candidate_timeframe and timeframe != candidate_timeframe:
+                    continue
+                component = candidate
+                component_id = str(candidate.get("component_id") or "")
+                break
+
+        if component is not None:
+            if not strategy_name:
+                strategy_name = str(component.get("strategy_name") or "")
+            if not symbol:
+                symbol = _normalize_symbol_key(component.get("symbol"))
+            if not timeframe:
+                timeframe = _normalize_timeframe_key(component.get("timeframe"))
+            if not str(trade.get("backtest_id") or "").strip():
+                trade["backtest_id"] = str(component.get("backtest_id") or "")
+
+        trade["component_id"] = component_id
+        trade["strategy_name"] = strategy_name
+        trade["strategy"] = strategy_name
+        trade["symbol"] = symbol
+        trade["timeframe"] = timeframe or "1h"
+        trade["time"] = _component_trade_time(trade)
+        if "id" not in trade:
+            nr_value = trade.get("nr")
+            if component_id and nr_value is not None:
+                trade["id"] = f"{component_id}-{nr_value}"
+            elif nr_value is not None:
+                trade["id"] = str(nr_value)
+            else:
+                trade["id"] = uuid.uuid4().hex[:10]
+        normalized_trades.append(trade)
+
+    normalized_trades.sort(key=_component_trade_time)
+    normalized["trades"] = normalized_trades
+
+    component_contributions = normalized.get("component_contributions")
+    if not isinstance(component_contributions, list):
+        normalized["component_contributions"] = _compute_portfolio_contributions(
+            portfolio=normalized,
+            group_by="component",
+        )
+
+    if not isinstance(normalized.get("strategy_contributions"), list):
+        grouped = _compute_portfolio_contributions(portfolio=normalized, group_by="strategy")
+        stats = normalized.get("combined_stats") if isinstance(normalized.get("combined_stats"), dict) else {}
+        total_pnl = _safe_float(stats.get("net_profit"), 0.0)
+        strategy_contributions: list[dict[str, Any]] = []
+        for item in grouped:
+            contribution_pnl = _safe_float(item.get("pnl_total"), 0.0)
+            pct = 0.0 if total_pnl == 0 else (contribution_pnl / total_pnl) * 100.0
+            strategy_contributions.append(
+                {
+                    "strategy_name": item.get("group_value", ""),
+                    "pnl_contribution": round(contribution_pnl, 2),
+                    "pnl_contribution_pct": round(pct, 3),
+                }
+            )
+        normalized["strategy_contributions"] = strategy_contributions
+
+    return normalized
+
+
+def _portfolio_identifier(name: str, *, now: datetime | None = None) -> str:
+    timestamp = (now or datetime.now(timezone.utc)).strftime("%Y%m%d%H%M%S")
+    slug = re.sub(r"[^a-z0-9]+", "-", str(name or "").strip().lower()).strip("-")
+    return f"{slug or 'portfolio'}-{timestamp}"
+
+
+def _portfolio_record_to_payload(record: Any) -> dict[str, Any]:
+    if hasattr(record, "model_dump"):
+        source = record.model_dump()
+    elif isinstance(record, dict):
+        source = dict(record)
+    else:
+        source = {}
+    return _normalize_portfolio_payload(source)
+
+
+def _portfolio_payload_to_model(payload: dict[str, Any]) -> PortfolioModel:
+    normalized = _normalize_portfolio_payload(payload)
+    components: list[PortfolioComponentModel] = []
+    for component in normalized.get("components", []):
+        if not isinstance(component, dict):
+            continue
+        settings = {
+            **dict(component.get("settings") or {}),
+            "component_id": str(component.get("component_id") or ""),
+            "legacy_risk_per_trade_pct": _safe_float(component.get("legacy_risk_per_trade_pct"), 1.0),
+            "legacy_max_positions": int(_safe_float(component.get("legacy_max_positions"), 99)),
+            "return_contribution": _safe_float(component.get("return_contribution"), 0.0),
+            "return_contribution_pct": _safe_float(component.get("return_contribution_pct"), 0.0),
+            "drawdown_contribution": _safe_float(component.get("drawdown_contribution"), 0.0),
+            "drawdown_contribution_pct": _safe_float(component.get("drawdown_contribution_pct"), 0.0),
+            "trade_count": int(_safe_float(component.get("trade_count"), 0)),
+            "win_rate": _safe_float(component.get("win_rate"), 0.0),
+            "wins": int(_safe_float(component.get("wins"), 0)),
+        }
+        components.append(
+            PortfolioComponentModel(
+                strategy_name=str(component.get("strategy_name") or ""),
+                symbol=str(component.get("symbol") or ""),
+                timeframe=str(component.get("timeframe") or "1h"),
+                weight=_safe_float(component.get("weight"), 1.0),
+                risk_config=dict(component.get("risk_config") or {}),
+                settings=settings,
+                backtest_id=str(component.get("backtest_id") or "") or None,
+            )
+        )
+
+    return PortfolioModel(
+        id=str(normalized.get("id") or ""),
+        name=str(normalized.get("name") or ""),
+        created_at=str(normalized.get("created_at") or ""),
+        account_capital=_safe_float(normalized.get("account_capital"), 100000.0),
+        components=components,
+        combined_stats=dict(normalized.get("combined_stats") or {}),
+        combined_equity=list(normalized.get("combined_equity") or []),
+        strategy_contributions=list(normalized.get("strategy_contributions") or []),
+        component_contributions=list(normalized.get("component_contributions") or []),
+        trades=list(normalized.get("trades") or []),
+    )
+
+
+def _trade_duration_text(trade: dict[str, Any]) -> str:
+    duration_text = str(trade.get("duration") or "").strip()
+    if duration_text:
+        return duration_text
+
+    holding_bars = int(_safe_float(trade.get("holding_bars"), 0))
+    if holding_bars > 0:
+        suffix = "bar" if holding_bars == 1 else "bars"
+        return f"{holding_bars} {suffix}"
+
+    entry_time = pd.to_datetime(trade.get("entry_time_iso"), utc=True, errors="coerce")
+    exit_time = pd.to_datetime(trade.get("exit_time_iso"), utc=True, errors="coerce")
+    if pd.isna(entry_time) or pd.isna(exit_time):
+        return ""
+    delta = pd.Timestamp(exit_time) - pd.Timestamp(entry_time)
+    seconds = int(delta.total_seconds())
+    if seconds <= 0:
+        return ""
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, _ = divmod(rem, 60)
+    if days > 0:
+        return f"{days}d {hours}h"
+    if hours > 0:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
+
+
 def _strategy_identifier_key(identifier: str) -> str:
     normalized = "".join(ch.lower() if ch.isalnum() else " " for ch in str(identifier or ""))
     return " ".join(normalized.split())
@@ -3293,6 +4566,52 @@ def _check_entry_range_coverage(
     return False, {"start": required_start, "end": required_end}
 
 
+def _allow_small_backtest_boundary_gap(
+    *,
+    requested_start: str,
+    requested_end: str,
+    available_start: str | None,
+    available_end: str | None,
+    tolerance_days: int = 3,
+) -> tuple[bool, str | None]:
+    normalized_requested_start = _normalize_coverage_date(requested_start)
+    normalized_requested_end = _normalize_coverage_date(requested_end)
+    normalized_available_start = _normalize_coverage_date(available_start)
+    normalized_available_end = _normalize_coverage_date(available_end)
+    if normalized_available_start is None or normalized_available_end is None:
+        return False, None
+
+    if (
+        normalized_requested_start is not None
+        and normalized_requested_start < normalized_available_start
+        and (
+            normalized_requested_end is None
+            or normalized_requested_end <= normalized_available_end
+        )
+    ):
+        leading_gap_days = int(
+            (pd.Timestamp(normalized_available_start) - pd.Timestamp(normalized_requested_start)).days
+        )
+        if 0 < leading_gap_days <= max(int(tolerance_days), 0):
+            return True, f"leading gap of {leading_gap_days} day(s)"
+
+    if (
+        normalized_requested_end is not None
+        and normalized_requested_end > normalized_available_end
+        and (
+            normalized_requested_start is None
+            or normalized_requested_start >= normalized_available_start
+        )
+    ):
+        trailing_gap_days = int(
+            (pd.Timestamp(normalized_requested_end) - pd.Timestamp(normalized_available_end)).days
+        )
+        if 0 < trailing_gap_days <= max(int(tolerance_days), 0):
+            return True, f"trailing gap of {trailing_gap_days} day(s)"
+
+    return False, None
+
+
 def _data_check_result(
     *,
     symbol: str,
@@ -3316,10 +4635,18 @@ def _data_check_result(
     return {"available": available, "missing_range": missing_range}
 
 
-def _auto_download_source(symbol: str, timeframe: str) -> str:
+US_INTRADAY_TIMEFRAMES = {"1m", "5m", "15m", "30m", "1h"}
+HF_INTRADAY_COVERAGE_END = "2025-07-31"
+ALPACA_INTRADAY_START = "2025-07-01"
+_US_STOCK_SYMBOL_PATTERN = re.compile(r"^[A-Z][A-Z.\-]{0,9}$")
+
+
+def _is_forex_symbol(symbol: str) -> bool:
     normalized_symbol = str(symbol or "").strip().upper()
     if "/" in normalized_symbol:
-        return "dukascopy"
+        return True
+    if len(normalized_symbol) == 6 and normalized_symbol.isalpha():
+        return True
 
     try:
         from data_tools.downloaders.dukascopy_native import SYMBOL_CONFIG
@@ -3332,9 +4659,96 @@ def _auto_download_source(symbol: str, timeframe: str) -> str:
     except Exception:
         known_forex_symbols = set()
 
-    if normalized_symbol in known_forex_symbols:
+    return normalized_symbol in known_forex_symbols
+
+
+def _is_us_intraday_stock(symbol: str, timeframe: str) -> bool:
+    normalized_symbol = str(symbol or "").strip().upper()
+    normalized_timeframe = normalize_timeframe(str(timeframe or "").strip())
+    if normalized_timeframe not in US_INTRADAY_TIMEFRAMES:
+        return False
+    if _is_forex_symbol(normalized_symbol):
+        return False
+    if not _US_STOCK_SYMBOL_PATTERN.fullmatch(normalized_symbol):
+        return False
+    if normalized_symbol.endswith("USD") and len(normalized_symbol) > 5:
+        return False
+    return True
+
+
+def _auto_download_source(symbol: str, timeframe: str) -> str:
+    normalized_symbol = str(symbol or "").strip().upper()
+    normalized_timeframe = normalize_timeframe(str(timeframe or "").strip())
+    if _is_forex_symbol(normalized_symbol):
         return "dukascopy"
+    if _is_us_intraday_stock(normalized_symbol, normalized_timeframe):
+        return "huggingface"
     return "yfinance"
+
+
+def _auto_download_source_plan(
+    *,
+    symbol: str,
+    timeframe: str,
+    start: str | None,
+    end: str | None,
+) -> list[dict[str, str | None]]:
+    normalized_symbol = str(symbol or "").strip().upper()
+    normalized_timeframe = normalize_timeframe(str(timeframe or "").strip())
+    default_source = _auto_download_source(normalized_symbol, normalized_timeframe)
+    if default_source != "huggingface":
+        return [{"source": default_source, "start": start or None, "end": end or None}]
+
+    normalized_start = _normalize_coverage_date(start)
+    normalized_end = _normalize_coverage_date(end)
+    if normalized_start and normalized_end and normalized_start > normalized_end:
+        normalized_start, normalized_end = normalized_end, normalized_start
+
+    if normalized_start is None and normalized_end is None:
+        return [{"source": "alpaca", "start": None, "end": None}]
+
+    plan: list[dict[str, str | None]] = []
+
+    hf_start = normalized_start or normalized_end
+    hf_end = normalized_end
+    if hf_start is not None and hf_start > HF_INTRADAY_COVERAGE_END:
+        hf_start = None
+        hf_end = None
+    elif hf_end is None or hf_end > HF_INTRADAY_COVERAGE_END:
+        hf_end = HF_INTRADAY_COVERAGE_END
+    if hf_start and hf_end and hf_start > hf_end:
+        hf_start = None
+        hf_end = None
+    if hf_end is not None:
+        plan.append(
+            {
+                "source": "huggingface",
+                "start": hf_start,
+                "end": hf_end,
+            }
+        )
+
+    alpaca_start = normalized_start or normalized_end
+    alpaca_end = normalized_end
+    if alpaca_end is not None and alpaca_end < ALPACA_INTRADAY_START:
+        alpaca_start = None
+    else:
+        if alpaca_start is None or alpaca_start < ALPACA_INTRADAY_START:
+            alpaca_start = ALPACA_INTRADAY_START
+        if alpaca_end is not None and alpaca_start > alpaca_end:
+            alpaca_start = None
+    if alpaca_start is not None:
+        plan.append(
+            {
+                "source": "alpaca",
+                "start": alpaca_start,
+                "end": alpaca_end or end or None,
+            }
+        )
+
+    if not plan:
+        return [{"source": "alpaca", "start": start or None, "end": end or None}]
+    return plan
 
 
 def _download_missing_ohlcv_data(
@@ -3348,6 +4762,32 @@ def _download_missing_ohlcv_data(
     normalized_symbol = str(symbol or "").strip().upper()
     normalized_timeframe = normalize_timeframe(timeframe) or "1d"
     selected_source = str(source or "").strip().lower() or "dukascopy"
+
+    if selected_source == "huggingface":
+        from data_tools.downloaders.huggingface_dl import HuggingFaceDownloader
+
+        downloader = HuggingFaceDownloader()
+        downloader.download(
+            symbol=normalized_symbol,
+            timeframe=normalized_timeframe,
+            output_dir=DATA_DIR,
+            start=start or None,
+            end=end or None,
+        )
+        return
+
+    if selected_source == "alpaca":
+        from data_tools.downloaders.alpaca_dl import AlpacaDownloader
+
+        downloader = AlpacaDownloader()
+        downloader.download(
+            symbol=normalized_symbol,
+            timeframe=normalized_timeframe,
+            output_dir=DATA_DIR,
+            start=start or None,
+            end=end or None,
+        )
+        return
 
     if selected_source == "yfinance":
         from data_tools.downloaders.yfinance_dl import YFinanceDownloader
@@ -3442,21 +4882,35 @@ def _ensure_backtest_data_availability(
         download_start = str((missing_range or {}).get("start") or start or "").strip() or None
         download_end = str((missing_range or {}).get("end") or end or "").strip() or None
 
-        if log_callback is not None:
-            log_callback(
-                (
-                    f"Auto-download: {symbol} {normalized_timeframe} via {source} "
-                    f"({download_start or 'auto'} → {download_end or 'latest'})"
-                )
-            )
-
-        _download_missing_ohlcv_data(
+        source_plan = _auto_download_source_plan(
             symbol=symbol,
             timeframe=normalized_timeframe,
             start=download_start,
             end=download_end,
-            source=source,
         )
+        for source_index, step in enumerate(source_plan, start=1):
+            step_source = str(step.get("source") or source or "").strip().lower()
+            step_start = str(step.get("start") or "").strip() or None
+            step_end = str(step.get("end") or "").strip() or None
+            if log_callback is not None:
+                suffix = (
+                    f" [{source_index}/{len(source_plan)}]"
+                    if len(source_plan) > 1
+                    else ""
+                )
+                log_callback(
+                    (
+                        f"Auto-download{suffix}: {symbol} {normalized_timeframe} via {step_source} "
+                        f"({step_start or 'auto'} → {step_end or 'latest'})"
+                    )
+                )
+            _download_missing_ohlcv_data(
+                symbol=symbol,
+                timeframe=normalized_timeframe,
+                start=step_start,
+                end=step_end,
+                source=step_source,
+            )
         cache_manager.invalidate_cache(DATA_DIR, reason="auto-backtest-download")
         _invalidate_data_views_cache()
         _refresh_catalog()
@@ -3470,9 +4924,30 @@ def _ensure_backtest_data_availability(
             availability_index=availability_index,
         )
         if not verification.get("available"):
-            raise RuntimeError(
-                f"Auto-download did not provide required data range for {symbol} {normalized_timeframe}"
-            )
+            coverage_entry = availability_index.get((symbol, normalized_timeframe))
+            tolerated_gap = False
+            tolerated_reason: str | None = None
+            if isinstance(coverage_entry, dict):
+                tolerated_gap, tolerated_reason = _allow_small_backtest_boundary_gap(
+                    requested_start=start,
+                    requested_end=end,
+                    available_start=str(coverage_entry.get("start") or ""),
+                    available_end=str(coverage_entry.get("end") or ""),
+                )
+            if tolerated_gap:
+                if log_callback is not None:
+                    available_start = str((coverage_entry or {}).get("start") or "unknown")
+                    available_end = str((coverage_entry or {}).get("end") or "unknown")
+                    log_callback(
+                        (
+                            f"Auto-download coverage tolerance for {symbol} {normalized_timeframe}: "
+                            f"{tolerated_reason}; available range {available_start} → {available_end}."
+                        )
+                    )
+            else:
+                raise RuntimeError(
+                    f"Auto-download did not provide required data range for {symbol} {normalized_timeframe}"
+                )
 
         progress_after = 10.0 + (index / total_missing) * 35.0
         if progress_callback is not None:
@@ -3715,6 +5190,9 @@ async def list_backtests(
     per_page: int = Query(default=50, ge=1, le=50),
     sort: str = Query(default="created_at"),
     order: str = Query(default="desc"),
+    name: str = Query(default=""),
+    total_return_min: float | None = Query(default=None),
+    total_return_max: float | None = Query(default=None),
     sharpe_min: float | None = Query(default=None),
     sharpe_max: float | None = Query(default=None),
     psr_min: float | None = Query(default=None),
@@ -3723,12 +5201,27 @@ async def list_backtests(
     p_value_max: float | None = Query(default=None),
     cagr_min: float | None = Query(default=None),
     cagr_max: float | None = Query(default=None),
-    ) -> BacktestsListResponse:
+    win_rate_min: float | None = Query(default=None),
+    win_rate_max: float | None = Query(default=None),
+    drawdown_min: float | None = Query(default=None),
+    drawdown_max: float | None = Query(default=None),
+    max_drawdown_min: float | None = Query(default=None),
+    max_drawdown_max: float | None = Query(default=None),
+) -> BacktestsListResponse:
     normalized_sort = _normalize_backtest_sort(sort)
     normalized_order = _normalize_order(order, default="desc")
     sorted_items = _backtest_meta_list_sorted(normalized_sort, normalized_order)
+    sorted_items = _filter_backtests_by_name(sorted_items, name)
+    effective_max_drawdown_min = (
+        max_drawdown_min if max_drawdown_min is not None else drawdown_min
+    )
+    effective_max_drawdown_max = (
+        max_drawdown_max if max_drawdown_max is not None else drawdown_max
+    )
     sorted_items = _apply_backtest_numeric_filters(
         sorted_items,
+        total_return_min=total_return_min,
+        total_return_max=total_return_max,
         sharpe_min=sharpe_min,
         sharpe_max=sharpe_max,
         psr_min=psr_min,
@@ -3737,8 +5230,13 @@ async def list_backtests(
         p_value_max=p_value_max,
         cagr_min=cagr_min,
         cagr_max=cagr_max,
+        win_rate_min=win_rate_min,
+        win_rate_max=win_rate_max,
+        max_drawdown_min=effective_max_drawdown_min,
+        max_drawdown_max=effective_max_drawdown_max,
     )
     total = len(sorted_items)
+    pages = max(1, math.ceil(total / per_page)) if per_page > 0 else 1
     offset = (page - 1) * per_page
     page_items = sorted_items[offset : offset + per_page]
     summaries = [_backtest_summary_from_meta(item) for item in page_items]
@@ -3747,6 +5245,7 @@ async def list_backtests(
         page=page,
         per_page=per_page,
         total=total,
+        pages=pages,
         sort=normalized_sort,
         order=normalized_order,
     )
@@ -3756,8 +5255,10 @@ async def list_backtests(
 async def list_backtests_all(
     include_equity_preview: bool = Query(default=True),
     preview_limit: int = Query(default=50, ge=50, le=100),
+    name: str = Query(default=""),
 ) -> list[dict[str, Any]]:
     items = _snapshot_backtest_meta_cache()
+    items = _filter_backtests_by_name(items, name)
     items.sort(
         key=lambda item: (
             str(item.get("created_at") or ""),
@@ -3829,6 +5330,49 @@ async def delete_backtests_bulk(payload: BacktestsBulkDeleteRequest) -> dict[str
     return {"deleted": deleted}
 
 
+@app.get("/api/backtests/compare", response_model=dict[str, Any])
+async def compare_two_backtests(ids: str = Query(default="")) -> dict[str, Any]:
+    if not ids:
+        raise HTTPException(status_code=400, detail="Provide ?ids=id1,id2")
+
+    requested_ids = [item.strip() for item in ids.split(",") if item.strip()]
+    unique_ids: list[str] = []
+    seen: set[str] = set()
+    for backtest_id in requested_ids:
+        if backtest_id in seen:
+            continue
+        unique_ids.append(backtest_id)
+        seen.add(backtest_id)
+
+    if len(unique_ids) != 2:
+        raise HTTPException(status_code=400, detail="Provide exactly 2 unique backtest IDs")
+
+    backtest1 = _backtest_compare_payload(unique_ids[0])
+    backtest2 = _backtest_compare_payload(unique_ids[1])
+    stats1 = backtest1.get("stats", {})
+    stats2 = backtest2.get("stats", {})
+
+    def delta(metric: str) -> float:
+        return round(_safe_float(stats2.get(metric), 0.0) - _safe_float(stats1.get(metric), 0.0), 6)
+
+    return {
+        "ids": unique_ids,
+        "backtest1": backtest1,
+        "backtest2": backtest2,
+        "comparison": {
+            "delta_return": delta("total_return"),
+            "delta_net_profit": delta("net_profit"),
+            "delta_sharpe": delta("sharpe_ratio"),
+            "delta_psr": delta("psr"),
+            "delta_p_value": delta("p_value"),
+            "delta_cagr": delta("cagr"),
+            "delta_max_drawdown": delta("max_drawdown"),
+            "delta_win_rate": delta("win_rate"),
+            "delta_trade_count": delta("trade_count"),
+        },
+    }
+
+
 @app.get("/api/backtest/{backtest_id}", response_model=dict[str, Any])
 @app.get("/api/backtests/{backtest_id}", response_model=dict[str, Any])
 async def get_backtest(backtest_id: str) -> dict[str, Any]:
@@ -3865,7 +5409,7 @@ async def rename_backtest(backtest_id: str, payload: NameUpdateRequest) -> dict[
     output_path = BACKTESTS_DIR / f"{backtest_id}.trades.json"
     try:
         result.save(output_path)
-        migrate_json_to_sqlite()
+        save_result_to_sqlite(result)
         _upsert_backtest_meta_cache(backtest_id)
         return {
             "id": backtest_id,
@@ -3876,6 +5420,11 @@ async def rename_backtest(backtest_id: str, payload: NameUpdateRequest) -> dict[
     except Exception as exc:
         logger.exception("Failed to rename backtest '%s': %s", backtest_id, exc)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.put("/api/backtests/{backtest_id}/name", response_model=dict[str, Any])
+async def rename_backtest_name(backtest_id: str, payload: NameUpdateRequest) -> dict[str, Any]:
+    return await rename_backtest(backtest_id, payload)
 
 
 @app.get("/api/backtest/{backtest_id}/info", response_model=dict[str, Any])
@@ -4454,6 +6003,61 @@ async def compare_backtests_endpoint(ids: str = Query(default="")) -> dict[str, 
             logger.warning("Could not load %s for comparison: %s", backtest_id, exc)
 
     return legacy_viewer.compare_backtests(strategies)
+
+
+def _backtest_compare_payload(backtest_id: str) -> dict[str, Any]:
+    result = _load_result(backtest_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"Backtest '{backtest_id}' not found")
+
+    raw = legacy_viewer._canonical_stats_from_result(result)
+    equity_curve = legacy_viewer._equity_to_viewer(result)
+    display_name = str(
+        result.meta.notes
+        or (result.meta.strategies[0] if result.meta.strategies else "")
+        or backtest_id
+    ).strip() or backtest_id
+    symbols = [
+        str(symbol).strip().upper()
+        for symbol in ((result.meta.data or {}).get("symbols", []) if isinstance(result.meta.data, dict) else [])
+        if str(symbol).strip()
+    ]
+    timeframe = normalize_timeframe(
+        str(
+            ((result.meta.data or {}).get("timeframes", ["1h"])[0])
+            if isinstance(result.meta.data, dict) and (result.meta.data or {}).get("timeframes")
+            else "1h"
+        )
+    )
+    win_rate = _normalize_win_rate(raw.get("win_rate")) or 0.0
+    winning_trades = sum(1 for trade in result.trades if _safe_float(trade.pnl, 0.0) > 0)
+    losing_trades = max(len(result.trades) - winning_trades, 0)
+
+    return {
+        "id": backtest_id,
+        "name": display_name,
+        "strategy_name": str(result.meta.strategies[0] if result.meta.strategies else ""),
+        "engine": str(result.meta.engine or "unknown"),
+        "symbols": symbols,
+        "timeframe": timeframe,
+        "stats": {
+            "total_return": round(_safe_float(raw.get("total_return"), 0.0) * 100.0, 6),
+            "net_profit": round(_safe_float(raw.get("total_pnl"), 0.0), 6),
+            "sharpe_ratio": round(_safe_float(raw.get("sharpe_ratio"), 0.0), 6),
+            "psr": round(_safe_float(raw.get("psr"), 0.0) * 100.0, 6),
+            "p_value": round(_safe_float(raw.get("p_value"), 1.0), 6),
+            "cagr": round(_safe_float(raw.get("cagr"), 0.0) * 100.0, 6),
+            "max_drawdown": round(abs(_safe_float(raw.get("max_drawdown_pct"), 0.0)) * 100.0, 6),
+            "win_rate": round(win_rate * 100.0, 6),
+            "trade_count": int(_safe_float(raw.get("total_trades"), len(result.trades))),
+        },
+        "equity_curve": equity_curve,
+        "trade_distribution": {
+            "total_trades": len(result.trades),
+            "winning_trades": winning_trades,
+            "losing_trades": losing_trades,
+        },
+    }
 
 
 @app.post("/api/backtests/run", response_model=dict[str, Any], status_code=202)
@@ -5320,169 +6924,207 @@ async def compare_portfolios(ids: str = Query(default="")) -> dict[str, Any]:
     portfolios: list[dict[str, Any]] = []
     for portfolio_id in portfolio_ids:
         path = PORTFOLIOS_DIR / f"{portfolio_id}.json"
-        if not path.exists():
+        if path.exists():
+            portfolios.append(_normalize_portfolio_payload(json.loads(path.read_text(encoding="utf-8"))))
             continue
-        portfolios.append(json.loads(path.read_text(encoding="utf-8")))
+        record = load_portfolio_record(portfolio_id)
+        if record is not None:
+            portfolios.append(_portfolio_record_to_payload(record))
     return {"portfolios": portfolios}
 
 
 @app.get("/api/portfolios", response_model=list[dict[str, Any]])
-async def list_portfolios() -> list[dict[str, Any]]:
-    portfolios: list[dict[str, Any]] = []
-    PORTFOLIOS_DIR.mkdir(parents=True, exist_ok=True)
-    for file_path in sorted(PORTFOLIOS_DIR.glob("*.json")):
-        try:
-            data = json.loads(file_path.read_text(encoding="utf-8"))
-            stats = legacy_viewer.PortfolioStats.from_dict(data.get("combined_stats", {})).to_dict()
+async def list_portfolios(
+    name: str = Query(default=""),
+    sort: str = Query(default="created_at"),
+    order: str = Query(default="desc"),
+) -> list[dict[str, Any]]:
+    normalized_sort = _normalize_portfolio_sort(sort)
+    normalized_order = _normalize_order(order, default="desc")
+    summaries = [_portfolio_summary_from_payload(payload) for payload in _snapshot_portfolio_payloads()]
+    summaries = _filter_portfolios_by_name(summaries, name)
+    summaries.sort(
+        key=lambda item: (_portfolio_sort_key(item, normalized_sort), str(item.get("id") or "")),
+        reverse=normalized_order == "desc",
+    )
+    return summaries
 
-            equity_full = data.get("combined_equity", [])
-            if equity_full:
-                values = [
-                    point.get("equity", point) if isinstance(point, dict) else point
-                    for point in equity_full
-                ]
-                count = len(values)
-                if count <= 50:
-                    equity_mini = values
-                else:
-                    step = count / 50
-                    equity_mini = [values[int(index * step)] for index in range(50)]
-                    equity_mini.append(values[-1])
-            else:
-                equity_mini = []
 
-            cagr_raw = stats.get("cagr", 0) or 0
-            max_drawdown_raw = stats.get("max_drawdown", 0) or 0
-            net_profit = stats.get("net_profit", 0) or 0
-            capital = data.get("account_capital", 100000) or 100000
+@app.get("/api/portfolios/duplicates", response_model=PortfoliosDuplicatesResponse)
+async def list_portfolio_duplicates() -> PortfoliosDuplicatesResponse:
+    groups, total_portfolios = _group_duplicate_portfolios()
+    return PortfoliosDuplicatesResponse(
+        groups=groups,
+        total_groups=len(groups),
+        total_portfolios=total_portfolios,
+    )
 
-            portfolios.append(
-                {
-                    "id": data.get("id", file_path.stem),
-                    "name": data.get("name", ""),
-                    "account_capital": capital,
-                    "strategy_count": len(data.get("strategies", [])),
-                    "sharpe": round(stats.get("sharpe", 0) or 0, 3),
-                    "cagr": round(cagr_raw * 100, 2),
-                    "max_drawdown_pct": round(abs(max_drawdown_raw) * 100, 2),
-                    "net_profit": round(net_profit, 2),
-                    "net_profit_pct": round(net_profit / capital * 100, 2) if capital else 0,
-                    "psr": stats.get("psr"),
-                    "p_value": round(_safe_float(stats.get("p_value"), 1.0), 6),
-                    "equity_mini": equity_mini,
-                    "created_at": data.get("created_at", ""),
-                }
-            )
-        except (json.JSONDecodeError, KeyError, ValueError, TypeError, OSError) as exc:
-            logger.warning("Could not read portfolio %s: %s", file_path.name, exc)
-    return portfolios
+
+@app.post("/api/portfolios/deduplicate", response_model=PortfoliosDeduplicateResponse)
+async def deduplicate_portfolios() -> PortfoliosDeduplicateResponse:
+    groups, _ = _group_duplicate_portfolios()
+    deleted_ids: list[str] = []
+    kept_ids: list[str] = []
+    affected = 0
+
+    for group in groups:
+        portfolios = group.get("portfolios", [])
+        if len(portfolios) < 2:
+            continue
+        keep_id = str(portfolios[0].get("id") or "")
+        if keep_id:
+            kept_ids.append(keep_id)
+
+        removed_in_group = False
+        for entry in portfolios[1:]:
+            portfolio_id = str(entry.get("id") or "")
+            if not portfolio_id:
+                continue
+            if _delete_portfolio_with_artifacts(portfolio_id):
+                deleted_ids.append(portfolio_id)
+                removed_in_group = True
+        if removed_in_group:
+            affected += 1
+
+    return PortfoliosDeduplicateResponse(
+        deleted_ids=deleted_ids,
+        kept_ids=kept_ids,
+        groups_affected=affected,
+    )
 
 
 @app.post("/api/portfolios", response_model=dict[str, Any], status_code=201)
 async def create_portfolio(payload: CreatePortfolioRequest) -> dict[str, Any]:
-    name = str(payload.name or "Untitled")
+    name = str(payload.name or "Untitled").strip() or "Untitled"
     account_capital = float(payload.account_capital or 100000.0)
-    strategy_configs = [item.model_dump() for item in payload.strategies]
+    if not math.isfinite(account_capital) or account_capital <= 0:
+        raise HTTPException(status_code=400, detail="account_capital must be positive")
 
-    if not strategy_configs:
-        raise HTTPException(status_code=400, detail="At least one strategy required")
+    component_payloads = _resolve_component_payloads(payload)
+    if not component_payloads:
+        raise HTTPException(status_code=400, detail="At least one component required")
 
-    strategy_returns = []
-    strategy_info: list[dict[str, Any]] = []
+    component_returns: list[pd.Series] = []
+    components: list[dict[str, Any]] = []
     all_trades_timed: list[dict[str, Any]] = []
 
-    for strategy_config in strategy_configs:
-        backtest_id = strategy_config.get("backtest_id", "")
-        strategy_name_input = strategy_config.get("name", "")
-        risk_factor = strategy_config.get("risk_per_trade_pct", 1.0)
-
-        if not backtest_id and strategy_name_input and BACKTESTS_DIR.exists():
-            strategy_match = _safe_strategy_entry(strategy_name_input)
-            normalized_input = strategy_name_input.lower().replace("_", " ").replace("-", " ")
-            candidates: list[tuple[str, str]] = []
-            for file_path in BACKTESTS_DIR.glob("*.trades.json"):
-                try:
-                    payload_data = json.loads(file_path.read_text(encoding="utf-8"))
-                    meta = payload_data.get("meta", {})
-                    strategies = meta.get("strategies", [])
-                    matches_input = any(
-                        str(strategy_name).lower().replace("_", " ").replace("-", " ")
-                        == normalized_input
-                        for strategy_name in strategies
-                    )
-                    if strategy_match is not None:
-                        matches_input = any(
-                            matches_strategy_identifier(strategy_match, strategy_name)
-                            for strategy_name in strategies
-                        )
-                    if matches_input:
-                        candidates.append((meta.get("created_at", ""), file_path.stem.replace(".trades", "")))
-                except (json.JSONDecodeError, KeyError, OSError):
-                    continue
-            if candidates:
-                candidates.sort(reverse=True)
-                backtest_id = candidates[0][1]
-            else:
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"No backtest found for strategy '{strategy_name_input}'",
-                )
+    for component_payload in component_payloads:
+        component_id = str(component_payload.get("component_id") or "").strip()
+        strategy_name = str(component_payload.get("strategy_name") or "").strip()
+        symbol = _normalize_symbol_key(component_payload.get("symbol"))
+        timeframe = _normalize_timeframe_key(component_payload.get("timeframe"))
+        weight = _safe_float(component_payload.get("weight"), 1.0)
+        risk_config = dict(component_payload.get("risk_config") or {})
+        settings = dict(component_payload.get("settings") or {})
+        backtest_id = str(component_payload.get("backtest_id") or "").strip()
+        if not component_id or not strategy_name or not backtest_id:
+            continue
 
         result = _load_result(backtest_id)
         if result is None:
             raise HTTPException(status_code=404, detail=f"Backtest '{backtest_id}' not found")
 
-        equity_curve = _ensure_equity_curve(result, account_capital)
-        if not equity_curve:
+        initial_capital = _safe_float(result.meta.initial_capital, account_capital) or account_capital
+        equity_curve = _ensure_equity_curve(result, initial_capital=initial_capital)
+        if len(equity_curve) < 1:
             continue
 
-        strategy_name = result.meta.strategies[0] if result.meta.strategies else backtest_id
-        strategy_info.append(
+        equity_df = pd.DataFrame([point.to_dict() for point in equity_curve])
+        if "time" not in equity_df.columns or "equity" not in equity_df.columns:
+            continue
+        equity_df["time"] = pd.to_datetime(equity_df["time"], utc=True, errors="coerce")
+        equity_df["equity"] = pd.to_numeric(equity_df["equity"], errors="coerce")
+        equity_df = equity_df.dropna(subset=["time", "equity"])
+        if equity_df.empty:
+            continue
+        equity_df = equity_df.sort_values("time").drop_duplicates(subset=["time"], keep="last")
+        equity_df.set_index("time", inplace=True)
+
+        daily_equity = equity_df["equity"].resample("D").last().ffill()
+        if daily_equity.empty:
+            continue
+        daily_returns = daily_equity.pct_change().replace([math.inf, -math.inf], pd.NA).fillna(0.0)
+        weighted_returns = daily_returns * weight
+        weighted_returns.name = component_id
+        component_returns.append(weighted_returns)
+
+        component_equity = account_capital
+        for component_return in weighted_returns:
+            component_equity *= 1.0 + _safe_float(component_return, 0.0)
+        component_return_contribution = (component_equity - account_capital) / account_capital if account_capital else 0.0
+
+        component_max_drawdown = abs(_safe_float(result.stats.get("max_drawdown_pct"), 0.0)) * weight
+        component_wins = 0
+        component_trade_count = 0
+
+        for trade in result.trades:
+            viewer_trade = legacy_viewer._trade_to_viewer(trade)
+            trade_payload: dict[str, Any] = dict(viewer_trade)
+            trade_payload.update(
+                {
+                    "component_id": component_id,
+                    "strategy_name": strategy_name,
+                    "strategy": strategy_name,
+                    "symbol": symbol or _normalize_symbol_key(viewer_trade.get("symbol")),
+                    "timeframe": timeframe,
+                    "backtest_id": backtest_id,
+                    "pnl": round(_safe_float(viewer_trade.get("pnl"), 0.0) * weight, 6),
+                }
+            )
+            trade_payload["time"] = _component_trade_time(trade_payload)
+            trade_id = f"{component_id}-{trade_payload.get('nr')}"
+            trade_payload["id"] = trade_id
+            if _safe_float(trade_payload.get("pnl"), 0.0) > 0:
+                component_wins += 1
+            component_trade_count += 1
+            all_trades_timed.append(trade_payload)
+
+        component_win_rate = (component_wins / component_trade_count * 100.0) if component_trade_count else 0.0
+        components.append(
             {
-                "backtest_id": backtest_id,
+                "component_id": component_id,
                 "strategy_name": strategy_name,
-                "risk_per_trade_pct": risk_factor,
-                "max_positions": strategy_config.get("max_positions", 99),
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "weight": weight,
+                "risk_config": risk_config,
+                "settings": settings,
+                "backtest_id": backtest_id,
+                "return_contribution": component_return_contribution,
+                "drawdown_contribution": component_max_drawdown,
+                "trade_count": component_trade_count,
+                "win_rate": component_win_rate,
+                "wins": component_wins,
+                "legacy_risk_per_trade_pct": _safe_float(
+                    component_payload.get("legacy_risk_per_trade_pct"),
+                    weight,
+                ),
+                "legacy_max_positions": int(
+                    _safe_float(
+                        component_payload.get("legacy_max_positions"),
+                        _safe_float(risk_config.get("max_positions"), 99),
+                    )
+                ),
             }
         )
 
-        equity_df = pd.DataFrame([point.to_dict() for point in equity_curve])
-        equity_df["time"] = pd.to_datetime(equity_df["time"], utc=True)
-        equity_df.set_index("time", inplace=True)
-        daily_equity = equity_df["equity"].resample("D").last().ffill()
-        daily_returns = daily_equity.pct_change().fillna(0.0)
+    if not component_returns:
+        raise HTTPException(status_code=400, detail="No valid components found")
 
-        weighted_returns = daily_returns * risk_factor
-        weighted_returns.name = strategy_name
-        strategy_returns.append(weighted_returns)
-
-        for trade in result.trades:
-            all_trades_timed.append(
-                {
-                    "time": trade.last_exit_time,
-                    "pnl": round(trade.pnl * risk_factor, 2),
-                    "strategy": strategy_name,
-                    "symbol": trade.symbol,
-                    "direction": trade.direction,
-                }
-            )
-
-    if not strategy_returns:
-        raise HTTPException(status_code=400, detail="No valid strategies found")
-
-    combined_df = pd.concat(strategy_returns, axis=1).fillna(0.0)
+    combined_df = pd.concat(component_returns, axis=1).fillna(0.0)
     portfolio_daily_returns = combined_df.sum(axis=1)
     if len(combined_df.columns) > 1:
         correlation_matrix = combined_df.corr().round(4).fillna(0.0).to_dict()
     else:
-        correlation_matrix = {column: {column: 1.0} for column in combined_df.columns}
+        first = combined_df.columns[0]
+        correlation_matrix = {first: {first: 1.0}}
 
     current_equity = account_capital
-    combined_equity_points = []
+    combined_equity_points: list[legacy_viewer.EquityPoint] = []
     for timestamp, daily_return in portfolio_daily_returns.items():
-        current_equity *= 1 + daily_return
+        current_equity *= 1.0 + _safe_float(daily_return, 0.0)
         combined_equity_points.append(
-            legacy_viewer.EquityPoint(time=timestamp.isoformat(), equity=current_equity)
+            legacy_viewer.EquityPoint(time=pd.Timestamp(timestamp).isoformat(), equity=current_equity)
         )
 
     stats_result = legacy_viewer.compute_stats(
@@ -5491,41 +7133,16 @@ async def create_portfolio(payload: CreatePortfolioRequest) -> dict[str, Any]:
         equity_curve=combined_equity_points,
     )
 
-    total_pnl = current_equity - account_capital
-    contributions: list[dict[str, Any]] = []
-    for column in combined_df.columns:
-        strategy_equity = account_capital
-        for daily_return in combined_df[column]:
-            strategy_equity *= 1 + daily_return
-        strategy_pnl = strategy_equity - account_capital
-        contributions.append(
-            {
-                "strategy_name": column,
-                "pnl_contribution": round(strategy_pnl, 2),
-                "pnl_contribution_pct": 0,
-            }
-        )
-
-    for contribution in contributions:
-        if total_pnl != 0:
-            contribution["pnl_contribution_pct"] = round(
-                contribution["pnl_contribution"] / total_pnl * 100,
-                1,
-            )
-        else:
-            contribution["pnl_contribution_pct"] = 0
-
     now = datetime.now(timezone.utc)
-    portfolio_id = f"{name.lower().replace(' ', '-')}-{now.strftime('%Y%m%d%H%M%S')}"
-    combined_equity = [point.to_dict() for point in combined_equity_points]
-    all_trades_timed.sort(key=lambda trade: trade.get("time", ""))
+    portfolio_id = _portfolio_identifier(name, now=now)
+    all_trades_timed.sort(key=_component_trade_time)
 
     portfolio = {
         "id": portfolio_id,
         "name": name,
         "created_at": now.isoformat(),
         "account_capital": account_capital,
-        "strategies": strategy_info,
+        "components": components,
         "combined_stats": legacy_viewer.PortfolioStats(
             sharpe=stats_result.get("sharpe_ratio", 0),
             sortino=stats_result.get("sortino_ratio", 0),
@@ -5541,36 +7158,151 @@ async def create_portfolio(payload: CreatePortfolioRequest) -> dict[str, Any]:
             p_value=stats_result.get("p_value", 1.0),
             correlation_matrix=correlation_matrix,
         ).to_dict(),
-        "combined_equity": combined_equity,
-        "strategy_contributions": contributions,
+        "combined_equity": [point.to_dict() for point in combined_equity_points],
         "trades": all_trades_timed,
     }
 
+    normalized_portfolio = _normalize_portfolio_payload(portfolio)
+    db_components: list[PortfolioComponentModel] = []
+    for component in normalized_portfolio.get("components", []):
+        if not isinstance(component, dict):
+            continue
+        component_model = PortfolioComponentModel(
+            strategy_name=str(component.get("strategy_name") or ""),
+            symbol=str(component.get("symbol") or ""),
+            timeframe=str(component.get("timeframe") or "1h"),
+            weight=_safe_float(component.get("weight"), 1.0),
+            risk_config=dict(component.get("risk_config") or {}),
+            settings={
+                **dict(component.get("settings") or {}),
+                "component_id": str(component.get("component_id") or ""),
+                "legacy_risk_per_trade_pct": _safe_float(component.get("legacy_risk_per_trade_pct"), 1.0),
+                "legacy_max_positions": int(_safe_float(component.get("legacy_max_positions"), 99)),
+                "return_contribution": _safe_float(component.get("return_contribution"), 0.0),
+                "return_contribution_pct": _safe_float(component.get("return_contribution_pct"), 0.0),
+                "drawdown_contribution": _safe_float(component.get("drawdown_contribution"), 0.0),
+                "drawdown_contribution_pct": _safe_float(component.get("drawdown_contribution_pct"), 0.0),
+                "trade_count": int(_safe_float(component.get("trade_count"), 0)),
+                "win_rate": _safe_float(component.get("win_rate"), 0.0),
+                "wins": int(_safe_float(component.get("wins"), 0)),
+            },
+            backtest_id=str(component.get("backtest_id") or "") or None,
+        )
+        db_components.append(component_model)
+
+    save_portfolio_record(
+        portfolio=PortfolioModel(
+            id=str(normalized_portfolio.get("id") or portfolio_id),
+            name=str(normalized_portfolio.get("name") or name),
+            created_at=str(normalized_portfolio.get("created_at") or now.isoformat()),
+            account_capital=_safe_float(normalized_portfolio.get("account_capital"), account_capital),
+            components=db_components,
+            combined_stats=dict(normalized_portfolio.get("combined_stats") or {}),
+            combined_equity=list(normalized_portfolio.get("combined_equity") or []),
+            strategy_contributions=list(normalized_portfolio.get("strategy_contributions") or []),
+            component_contributions=list(normalized_portfolio.get("component_contributions") or []),
+            trades=list(normalized_portfolio.get("trades") or []),
+        )
+    )
+
     PORTFOLIOS_DIR.mkdir(parents=True, exist_ok=True)
     output_path = PORTFOLIOS_DIR / f"{portfolio_id}.json"
-    output_path.write_text(json.dumps(portfolio, indent=2), encoding="utf-8")
-    return portfolio
+    output_path.write_text(json.dumps(normalized_portfolio, indent=2), encoding="utf-8")
+    return normalized_portfolio
+
+
+def _load_portfolio_payload(portfolio_id: str) -> dict[str, Any]:
+    path = PORTFOLIOS_DIR / f"{portfolio_id}.json"
+    if path.exists():
+        return _normalize_portfolio_payload(json.loads(path.read_text(encoding="utf-8")))
+
+    record = load_portfolio_record(portfolio_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Portfolio not found")
+    return _portfolio_record_to_payload(record)
+
+
+@app.post("/api/portfolios/delete-bulk", response_model=dict[str, int])
+async def delete_portfolios_bulk(payload: PortfoliosBulkDeleteRequest) -> dict[str, int]:
+    deleted = 0
+    seen: set[str] = set()
+    for raw_id in payload.ids:
+        portfolio_id = str(raw_id or "").strip()
+        if not portfolio_id or portfolio_id in seen:
+            continue
+        seen.add(portfolio_id)
+        if _delete_portfolio_with_artifacts(portfolio_id):
+            deleted += 1
+    return {"deleted": deleted}
 
 
 @app.get("/api/portfolios/{portfolio_id}", response_model=dict[str, Any])
 async def get_portfolio(portfolio_id: str) -> dict[str, Any]:
-    path = PORTFOLIOS_DIR / f"{portfolio_id}.json"
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="Portfolio not found")
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload = _load_portfolio_payload(portfolio_id)
     payload["combined_stats"] = legacy_viewer.PortfolioStats.from_dict(
         payload.get("combined_stats", {})
     ).to_dict()
     return payload
 
 
+@app.patch("/api/portfolios/{portfolio_id}", response_model=dict[str, Any])
+async def rename_portfolio(portfolio_id: str, payload: NameUpdateRequest) -> dict[str, Any]:
+    updated_name = str(payload.name or "").strip()
+    if not updated_name:
+        raise HTTPException(status_code=400, detail="Portfolio name cannot be empty")
+
+    portfolio_payload = _load_portfolio_payload(portfolio_id)
+    portfolio_payload["name"] = updated_name
+    normalized_portfolio = _normalize_portfolio_payload(portfolio_payload)
+    normalized_portfolio["name"] = updated_name
+
+    try:
+        save_portfolio_record(_portfolio_payload_to_model(normalized_portfolio))
+        PORTFOLIOS_DIR.mkdir(parents=True, exist_ok=True)
+        output_path = PORTFOLIOS_DIR / f"{portfolio_id}.json"
+        output_path.write_text(json.dumps(normalized_portfolio, indent=2), encoding="utf-8")
+    except Exception as exc:
+        logger.exception("Failed to rename portfolio '%s': %s", portfolio_id, exc)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    return {"id": portfolio_id, "name": updated_name, "status": "updated"}
+
+
+@app.put("/api/portfolios/{portfolio_id}/name", response_model=dict[str, Any])
+async def rename_portfolio_name(portfolio_id: str, payload: NameUpdateRequest) -> dict[str, Any]:
+    return await rename_portfolio(portfolio_id, payload)
+
+
+@app.get("/api/portfolios/{portfolio_id}/contributions", response_model=list[dict[str, Any]])
+async def get_portfolio_contributions(
+    portfolio_id: str,
+    group_by: str = Query(default="component"),
+) -> list[dict[str, Any]]:
+    portfolio = _load_portfolio_payload(portfolio_id)
+    return _compute_portfolio_contributions(portfolio=portfolio, group_by=group_by)
+
+
+@app.get("/api/portfolios/{portfolio_id}/trades", response_model=list[dict[str, Any]])
+async def get_portfolio_trades(
+    portfolio_id: str,
+    strategy: str = Query(default=""),
+    symbol: str = Query(default=""),
+    timeframe: str = Query(default=""),
+) -> list[dict[str, Any]]:
+    portfolio = _load_portfolio_payload(portfolio_id)
+    return _portfolio_trades_filtered(
+        portfolio=portfolio,
+        strategy=strategy,
+        symbol=symbol,
+        timeframe=timeframe,
+    )
+
+
 @app.delete("/api/portfolios/{portfolio_id}", response_model=dict[str, Any])
 async def delete_portfolio(portfolio_id: str) -> dict[str, Any]:
-    path = PORTFOLIOS_DIR / f"{portfolio_id}.json"
-    if not path.exists():
+    if not _delete_portfolio_with_artifacts(portfolio_id):
         raise HTTPException(status_code=404, detail="Portfolio not found")
-    path.unlink()
-    return {"status": "deleted"}
+    return {"status": "deleted", "id": portfolio_id}
 
 
 @app.get("/api/live/accounts", response_model=list[dict[str, Any]])
@@ -6089,12 +7821,17 @@ async def data_download(payload: DataDownloadRequest) -> dict[str, Any]:
         )
         return result
 
-    if source == "yfinance":
+    if source in {"yfinance", "huggingface", "alpaca"}:
+        module_name = {
+            "yfinance": "data_tools.downloaders.yfinance_dl",
+            "huggingface": "data_tools.downloaders.huggingface_dl",
+            "alpaca": "data_tools.downloaders.alpaca_dl",
+        }[source]
         cmd = [
             sys.executable,
             "-u",
             "-m",
-            "data_tools.downloaders.yfinance_dl",
+            module_name,
             "--symbols",
             symbols,
             "--timeframes",
@@ -6566,7 +8303,7 @@ async def list_logs() -> list[LogFileModel]:
 @app.get("/api/logs/{log_name}", response_model=LogContentModel)
 async def get_log(
     log_name: str,
-    lines: int = Query(default=200, ge=1, le=5000),
+    lines: int = Query(default=200, ge=1, le=100000),
     level: str = Query(default=""),
     search: str = Query(default=""),
 ) -> LogContentModel:

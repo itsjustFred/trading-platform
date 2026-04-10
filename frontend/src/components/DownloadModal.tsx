@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { memo, useEffect, useMemo, useState } from "react";
 import type { CSSProperties } from "react";
 import {
   ArrowRight,
@@ -576,6 +576,8 @@ export function DownloadModal({
                     <option value="dukascopy">Dukascopy</option>
                     <option value="jforex">JForex</option>
                     <option value="yfinance">Yahoo Finance</option>
+                    <option value="huggingface">HuggingFace (OHLCV-1m)</option>
+                    <option value="alpaca">Alpaca</option>
                     <option value="dolthub">Dolthub (Update All)</option>
                   </select>
                 </div>
@@ -1256,7 +1258,7 @@ export function DownloadModal({
   );
 }
 
-function MergeOptionCard({
+const MergeOptionCard = memo(function MergeOptionCard({
   checked,
   disabled,
   label,
@@ -1308,4 +1310,4 @@ function MergeOptionCard({
       </div>
     </label>
   );
-}
+});

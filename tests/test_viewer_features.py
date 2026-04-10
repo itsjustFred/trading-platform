@@ -148,6 +148,34 @@ def test_data_check_endpoint_reports_availability_from_catalog(viewer_client, mo
     assert bad_resp.json()["detail"] == "symbol is required"
 
 
+def test_backtest_boundary_gap_tolerance_allows_small_leading_gap():
+    import viewer.main as viewer_app_module
+
+    allowed, reason = viewer_app_module._allow_small_backtest_boundary_gap(
+        requested_start="2008-01-01",
+        requested_end="2008-01-02",
+        available_start="2008-01-02",
+        available_end="2008-01-03",
+    )
+
+    assert allowed is True
+    assert reason == "leading gap of 1 day(s)"
+
+
+def test_backtest_boundary_gap_tolerance_rejects_large_gap():
+    import viewer.main as viewer_app_module
+
+    allowed, reason = viewer_app_module._allow_small_backtest_boundary_gap(
+        requested_start="2008-01-01",
+        requested_end="2008-01-02",
+        available_start="2008-02-01",
+        available_end="2008-02-10",
+    )
+
+    assert allowed is False
+    assert reason is None
+
+
 def test_viewer_app_enables_gzip_middleware(viewer_client):
     import viewer.main as viewer_app_module
 
@@ -1162,12 +1190,94 @@ def test_data_download_builds_yfinance_command_with_timeframes_and_dates(viewer_
     assert captured["total_items"] == 6
 
 
+def test_data_download_builds_huggingface_and_alpaca_commands(viewer_client, monkeypatch):
+    import viewer.main as viewer_app_module
+
+    captured: list[dict[str, object]] = []
+
+    def fake_start(task_id: str, cmd: list[str], **kwargs) -> dict:
+        payload = {"task_id": task_id, "cmd": cmd}
+        payload.update(kwargs)
+        captured.append(payload)
+        return {"task_id": task_id, "status": "starting"}
+
+    monkeypatch.setattr(viewer_app_module, "_start_data_task", fake_start)
+
+    hf_resp = viewer_client.post(
+        "/api/data/download",
+        json={
+            "source": "huggingface",
+            "symbols": "AAPL",
+            "timeframes": "1m",
+            "start": "2025-06-01",
+            "end": "2025-07-15",
+        },
+    )
+    assert hf_resp.status_code == 200
+
+    alpaca_resp = viewer_client.post(
+        "/api/data/download",
+        json={
+            "source": "alpaca",
+            "symbols": "AAPL",
+            "timeframes": "1h",
+            "start": "2025-07-15",
+            "end": "2025-08-01",
+        },
+    )
+    assert alpaca_resp.status_code == 200
+
+    assert len(captured) == 2
+    hf_cmd = captured[0]["cmd"]
+    alpaca_cmd = captured[1]["cmd"]
+
+    assert "data_tools.downloaders.huggingface_dl" in hf_cmd
+    assert "--symbols" in hf_cmd
+    assert "--timeframes" in hf_cmd
+    assert "--start" in hf_cmd
+    assert "--end" in hf_cmd
+    assert captured[0]["source"] == "huggingface"
+
+    assert "data_tools.downloaders.alpaca_dl" in alpaca_cmd
+    assert "--symbols" in alpaca_cmd
+    assert "--timeframes" in alpaca_cmd
+    assert "--start" in alpaca_cmd
+    assert "--end" in alpaca_cmd
+    assert captured[1]["source"] == "alpaca"
+
+
 def test_auto_download_source_prefers_yfinance_for_non_forex_symbols(viewer_client):
     import viewer.main as viewer_app_module
 
     assert viewer_app_module._auto_download_source("AAPL", "1d") == "yfinance"
+    assert viewer_app_module._auto_download_source("AAPL", "1h") == "huggingface"
     assert viewer_app_module._auto_download_source("BTC/USD", "1h") == "dukascopy"
     assert viewer_app_module._auto_download_source("EURUSD", "1h") == "dukascopy"
+
+
+def test_auto_download_source_plan_splits_us_intraday_range(viewer_client):
+    import viewer.main as viewer_app_module
+
+    split_plan = viewer_app_module._auto_download_source_plan(
+        symbol="AAPL",
+        timeframe="1h",
+        start="2025-06-20",
+        end="2025-08-05",
+    )
+    assert split_plan == [
+        {"source": "huggingface", "start": "2025-06-20", "end": "2025-07-31"},
+        {"source": "alpaca", "start": "2025-07-01", "end": "2025-08-05"},
+    ]
+
+    alpaca_only_plan = viewer_app_module._auto_download_source_plan(
+        symbol="AAPL",
+        timeframe="1h",
+        start="2025-08-01",
+        end="2025-08-15",
+    )
+    assert alpaca_only_plan == [
+        {"source": "alpaca", "start": "2025-08-01", "end": "2025-08-15"}
+    ]
 
 
 def test_data_cache_invalidate_endpoint_returns_stats(viewer_client, monkeypatch):
@@ -2785,11 +2895,15 @@ def test_create_portfolio_persists_p_value_and_psr(viewer_client, tmp_path):
         json={
             "name": "Signal Basket",
             "account_capital": 100000,
-            "strategies": [
+            "components": [
                 {
+                    "strategy_name": "Portfolio Signal",
+                    "symbol": "AAPL",
+                    "timeframe": "1d",
+                    "weight": 1.0,
+                    "risk_config": {"max_positions": 5},
+                    "settings": {},
                     "backtest_id": "portfolio-source",
-                    "risk_per_trade_pct": 1.0,
-                    "max_positions": 5,
                 }
             ],
         },
@@ -2807,10 +2921,29 @@ def test_create_portfolio_persists_p_value_and_psr(viewer_client, tmp_path):
 
     detail_resp = viewer_client.get(f"/api/portfolios/{payload['id']}")
     assert detail_resp.status_code == 200
-    assert detail_resp.json()["combined_stats"]["p_value"] == pytest.approx(
+    detail_payload = detail_resp.json()
+    assert detail_payload["combined_stats"]["p_value"] == pytest.approx(
         payload["combined_stats"]["p_value"],
         abs=1e-6,
     )
+    assert len(detail_payload.get("components", [])) == 1
+
+    contributions_resp = viewer_client.get(f"/api/portfolios/{payload['id']}/contributions?group_by=strategy")
+    assert contributions_resp.status_code == 200
+    contributions = contributions_resp.json()
+    assert contributions
+    assert contributions[0]["group"] == "strategy"
+    assert contributions[0]["trade_count"] >= 1
+
+    trades_resp = viewer_client.get(
+        f"/api/portfolios/{payload['id']}/trades?strategy=Portfolio Signal&symbol=AAPL&timeframe=1d"
+    )
+    assert trades_resp.status_code == 200
+    trades_payload = trades_resp.json()
+    assert trades_payload
+    assert trades_payload[0]["strategy_name"] == "Portfolio Signal"
+    assert trades_payload[0]["symbol"] == "AAPL"
+    assert trades_payload[0]["timeframe"] == "1d"
 
 
 def test_agent_convert_endpoint_starts_background_agent(viewer_client, monkeypatch):

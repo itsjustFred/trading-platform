@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
 import uuid
 from collections.abc import Mapping
@@ -56,7 +57,9 @@ def _resolve_ctrader_credentials(
     access_token = str(env_values.get("CTRADER_ACCESS_TOKEN", "")).strip()
     if not app_id or not app_secret or not access_token:
         return None
-    demo = _parse_bool_env(str(env_values.get("CTRADER_DEMO", "")).strip(), default=True)
+    raw_demo_value = env_values.get("CTRADER_DEMO")
+    demo_value = raw_demo_value.strip() if isinstance(raw_demo_value, str) else None
+    demo = _parse_bool_env(demo_value, default=True)
     return app_id, app_secret, access_token, demo
 
 
@@ -442,6 +445,58 @@ async def _run_adapter(account_id: str, adapter: BaseLiveAdapter) -> None:
     await adapter.listen_executions()
 
 
+async def _disconnect_adapter(
+    adapter: BaseLiveAdapter,
+    *,
+    account_id: str,
+    reason: str,
+) -> None:
+    disconnect_method = getattr(adapter, "disconnect", None)
+    if not callable(disconnect_method):
+        return
+    try:
+        result = disconnect_method()
+        if inspect.isawaitable(result):
+            await result
+    except Exception as exc:
+        logger.warning(
+            "Adapter disconnect failed",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "adapter": type(adapter).__name__,
+                    "reason": reason,
+                    "error": str(exc),
+                }
+            },
+        )
+
+
+async def _disconnect_inactive_adapters(
+    active_adapters: dict[str, BaseLiveAdapter],
+    active_account_ids: set[str],
+) -> None:
+    inactive_account_ids = sorted(set(active_adapters) - set(active_account_ids))
+    for account_id in inactive_account_ids:
+        adapter = active_adapters.pop(account_id, None)
+        if adapter is None:
+            continue
+        await _disconnect_adapter(
+            adapter,
+            account_id=account_id,
+            reason="inactive_deployment",
+        )
+        logger.info(
+            "Stopped adapter for inactive account",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "adapter": type(adapter).__name__,
+                }
+            },
+        )
+
+
 async def _run_discord_listener_with_retries(
     account_id: str,
     adapter: BaseLiveAdapter,
@@ -751,6 +806,8 @@ async def _ensure_adapter_for_active_account(
     if adapter is None:
         return
 
+    active_adapters[account_id] = adapter
+
     try:
         await adapter.connect()
     except Exception as exc:
@@ -766,7 +823,6 @@ async def _ensure_adapter_for_active_account(
         )
         return
 
-    active_adapters[account_id] = adapter
     logger.info(
         "Adapter started for active deployment account",
         extra={"data": {"account_id": account_id, "adapter": type(adapter).__name__}},
@@ -814,6 +870,8 @@ async def sync_deployments_loop(
                     }
                 },
             )
+
+            await _disconnect_inactive_adapters(active_adapters, active_account_ids)
 
             active_discord_account_ids = {
                 deployment.account_id

@@ -41,11 +41,20 @@ import type {
   BacktestCapmResponse,
   BacktestsDeduplicateResponse,
   BacktestsBulkDeleteResponse,
+  BacktestsCompareResponse,
+  PortfolioComponent,
+  PortfolioContribution,
+  PortfolioDetail,
+  PortfolioSummary,
+  PortfoliosQueryParams,
+  PortfoliosDuplicatesResponse,
+  PortfoliosDeduplicateResponse,
   BacktestsDuplicatesResponse,
   BacktestMetadataItem,
   BacktestsListResponse,
   BacktestsQueryParams,
   BacktestReplayResponse,
+  PortfoliosBulkDeleteResponse,
 } from "./types";
 
 const BASE_URL = "/api";
@@ -133,6 +142,7 @@ export const getBacktests = (params?: BacktestsQueryParams) => {
   if (params?.per_page != null) query.set("per_page", String(params.per_page));
   if (params?.sort) query.set("sort", params.sort);
   if (params?.order) query.set("order", params.order);
+  if (params?.name) query.set("name", params.name);
   if (params?.strategy) query.set("strategy", params.strategy);
   if (params?.symbol) query.set("symbol", params.symbol);
   if (params?.timeframe) query.set("timeframe", params.timeframe);
@@ -156,8 +166,13 @@ export const getBacktests = (params?: BacktestsQueryParams) => {
   const queryString = query.toString();
   return fetchJSON<BacktestsListResponse>(`/backtests${queryString ? `?${queryString}` : ""}`);
 };
-export const getBacktestsAll = () =>
-  fetchJSON<BacktestMetadataItem[]>("/backtests/all?include_equity_preview=true&preview_limit=50");
+export const getBacktestsAll = (name?: string) => {
+  const query = new URLSearchParams();
+  query.set("include_equity_preview", "true");
+  query.set("preview_limit", "50");
+  if (name && name.trim()) query.set("name", name.trim());
+  return fetchJSON<BacktestMetadataItem[]>(`/backtests/all?${query.toString()}`);
+};
 export const getBacktestEquityPreview = (id: string, limit = 80) =>
   fetchJSON<number[]>(
     `/backtests/${encodeURIComponent(id)}/equity-preview?limit=${Math.max(50, Math.min(100, limit))}`,
@@ -183,17 +198,21 @@ export const getBacktestCapm = (id: string, benchmark?: string) => {
 export const getBacktestOHLCV = (id: string) =>
   fetchJSON<any>(`/backtest/${id}/ohlcv`);
 export const renameBacktest = (id: string, title: string) =>
-  fetchJSON<any>(`/backtests/${encodeURIComponent(id)}`, {
-    method: "PATCH",
+  fetchJSON<any>(`/backtests/${encodeURIComponent(id)}/name`, {
+    method: "PUT",
     body: JSON.stringify({ name: title }),
   });
 export const compareBacktests = (ids: string[]) =>
-  fetchJSON<any>(`/compare?ids=${ids.join(",")}`);
+  fetchJSON<BacktestsCompareResponse>(`/backtests/compare?ids=${ids.join(",")}`);
 export const getBacktestDuplicates = () =>
   fetchJSON<BacktestsDuplicatesResponse>("/backtests/duplicates");
 export const deduplicateBacktests = () =>
   fetchJSON<BacktestsDeduplicateResponse>("/backtests/deduplicate", {
     method: "POST",
+  });
+export const deleteBacktest = (id: string) =>
+  fetchJSON<{ id: string; status: string }>(`/backtests/${encodeURIComponent(id)}`, {
+    method: "DELETE",
   });
 export const deleteBacktestsBulk = (ids: string[]) =>
   fetchJSON<BacktestsBulkDeleteResponse>("/backtests/delete-bulk", {
@@ -274,27 +293,71 @@ export const getOptimization = (id: string) =>
   fetchJSON<OptimizationDetail>(`/optimizations/${encodeURIComponent(id)}`);
 
 // Portfolios
-export const getPortfolios = () => fetchJSON<any[]>("/portfolios");
-export const getPortfolio = (id: string) => fetchJSON<any>(`/portfolios/${id}`);
+export const getPortfolios = (params?: PortfoliosQueryParams) => {
+  const query = new URLSearchParams();
+  if (params?.name) query.set("name", params.name);
+  if (params?.sort) query.set("sort", params.sort);
+  if (params?.order) query.set("order", params.order);
+  const queryString = query.toString();
+  return fetchJSON<PortfolioSummary[]>(`/portfolios${queryString ? `?${queryString}` : ""}`);
+};
+export const getPortfolio = (id: string) => fetchJSON<PortfolioDetail>(`/portfolios/${id}`);
 export const getPortfolioDetail = (id: string) =>
-  fetchJSON<any>(`/portfolios/${id}`);
+  fetchJSON<PortfolioDetail>(`/portfolios/${id}`);
+export const renamePortfolio = (id: string, name: string) =>
+  fetchJSON<{ id: string; name: string; status: string }>(`/portfolios/${encodeURIComponent(id)}/name`, {
+    method: "PUT",
+    body: JSON.stringify({ name }),
+  });
+export const getPortfolioContributions = (
+  id: string,
+  groupBy: "component" | "strategy" | "symbol" | "timeframe" = "component",
+) =>
+  fetchJSON<PortfolioContribution[]>(
+    `/portfolios/${encodeURIComponent(id)}/contributions?group_by=${encodeURIComponent(groupBy)}`,
+  );
+export const getPortfolioTrades = (
+  id: string,
+  filters?: { strategy?: string; symbol?: string; timeframe?: string },
+) => {
+  const params = new URLSearchParams();
+  if (filters?.strategy) params.set("strategy", filters.strategy);
+  if (filters?.symbol) params.set("symbol", filters.symbol);
+  if (filters?.timeframe) params.set("timeframe", filters.timeframe);
+  const query = params.toString();
+  return fetchJSON<PortfolioDetail["trades"]>(
+    `/portfolios/${encodeURIComponent(id)}/trades${query ? `?${query}` : ""}`,
+  );
+};
 export const createPortfolio = (data: {
   name: string;
   account_capital: number;
-  strategies: {
-    name: string;
-    risk_per_trade_pct: number;
-    max_positions: number;
-  }[];
+  components: Array<
+    Pick<
+      PortfolioComponent,
+      "strategy_name" | "symbol" | "timeframe" | "weight" | "risk_config" | "settings"
+    > & { backtest_id?: string | null }
+  >;
 }) =>
-  fetchJSON<any>("/portfolios", {
+  fetchJSON<PortfolioDetail>("/portfolios", {
     method: "POST",
     body: JSON.stringify(data),
   });
 export const deletePortfolio = (id: string) =>
-  fetchJSON<any>(`/portfolios/${id}`, { method: "DELETE" });
+  fetchJSON<{ status: string; id: string }>(`/portfolios/${id}`, { method: "DELETE" });
+export const deletePortfoliosBulk = (ids: string[]) =>
+  fetchJSON<PortfoliosBulkDeleteResponse>("/portfolios/delete-bulk", {
+    method: "POST",
+    body: JSON.stringify({ ids }),
+  });
+export const getPortfolioDuplicates = () =>
+  fetchJSON<PortfoliosDuplicatesResponse>("/portfolios/duplicates");
+export const deduplicatePortfolios = () =>
+  fetchJSON<PortfoliosDeduplicateResponse>("/portfolios/deduplicate", {
+    method: "POST",
+  });
 export const comparePortfolios = (ids: string[]) =>
-  fetchJSON<any>(`/portfolios/compare?ids=${ids.join(",")}`);
+  fetchJSON<{ portfolios: PortfolioDetail[] }>(`/portfolios/compare?ids=${ids.join(",")}`);
 
 // Logs
 export const getLogs = () => fetchJSON<LogFile[]>("/logs");

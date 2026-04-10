@@ -1,16 +1,18 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { ArrowUpDown, Plus, Scale, Trash2 } from "lucide-react";
 
 import {
-  compareBacktests,
+  deduplicateBacktests,
   deleteBacktestsBulk,
+  getBacktestDuplicates,
   getBacktestsAll,
 } from "../api/client";
-import type { BacktestMetadataItem } from "../api/types";
+import type { BacktestMetadataItem, BacktestsDuplicatesResponse } from "../api/types";
 import { CreateBacktestModal } from "../components/CreateBacktestModal";
 import { DualRangeSlider } from "../components/DualRangeSlider";
 import { FilterBar } from "../components/FilterBar";
+import { Modal } from "../components/Modal";
 import { MultiSelectDropdown } from "../components/MultiSelectDropdown";
 import { Sparkline } from "../components/Sparkline";
 import { useToast } from "../components/ToastProvider";
@@ -56,17 +58,52 @@ interface BacktestCardModel extends BacktestMetadataItem {
 const DEFAULT_PER_PAGE = 24;
 const NUMERIC_FONT = '"SFMono-Regular", "Cascadia Code", "Roboto Mono", ui-monospace, monospace';
 
-const SORT_OPTIONS: Array<{ value: SortField; label: string }> = [
-  { value: "created_at", label: "Created" },
+const BACKTEST_SORT_OPTIONS: Array<{ value: SortField; label: string }> = [
+  { value: "created_at", label: "Created Date" },
   { value: "total_return", label: "Total Return" },
-  { value: "sharpe_ratio", label: "Sharpe" },
-  { value: "psr", label: "PSR" },
-  { value: "p_value", label: "p-Value" },
-  { value: "cagr", label: "CAGR" },
-  { value: "max_drawdown", label: "Max Drawdown" },
-  { value: "win_rate", label: "Win Rate" },
-  { value: "trade_count", label: "Trades" },
+  { value: "sharpe_ratio", label: "Sharpe (higher = better)" },
+  { value: "psr", label: "PSR (higher = better)" },
+  { value: "p_value", label: "p-Value (lower = better)" },
+  { value: "cagr", label: "CAGR (higher = better)" },
+  { value: "max_drawdown", label: "Max DD (lower = better)" },
+  { value: "win_rate", label: "Win Rate (higher = better)" },
+  { value: "trade_count", label: "Trade Count" },
 ];
+
+const FILTER_PANEL_GRID_STYLE: React.CSSProperties = {
+  display: "grid",
+  gap: "10px",
+};
+
+const FILTER_PANEL_CONTROLS_STYLE: React.CSSProperties = {
+  display: "grid",
+  gap: "10px",
+  gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+};
+
+const SELECT_ALL_LABEL_STYLE: React.CSSProperties = {
+  display: "inline-flex",
+  gap: "6px",
+  alignItems: "center",
+  fontSize: "0.76rem",
+  color: "var(--color-text-muted)",
+};
+
+const BULK_BAR_STYLE: React.CSSProperties = {
+  position: "fixed",
+  insetInlineStart: "50%",
+  transform: "translateX(-50%)",
+  insetBlockEnd: "16px",
+  zIndex: 60,
+  borderRadius: "999px",
+  border: "1px solid rgba(90, 105, 138, 0.34)",
+  background: "rgba(11, 18, 31, 0.95)",
+  boxShadow: "0 18px 40px rgba(0,0,0,0.45)",
+  padding: "8px 10px",
+  display: "inline-flex",
+  gap: "8px",
+  alignItems: "center",
+};
 
 let backtestsAllCache: BacktestCardModel[] | null = null;
 let backtestsAllPromise: Promise<BacktestCardModel[]> | null = null;
@@ -228,7 +265,12 @@ function boundsToFilters(bounds: NumericBoundsState): NumericFiltersState {
   });
 }
 
-async function loadBacktestsAllCached(force = false): Promise<BacktestCardModel[]> {
+async function loadBacktestsAllCached(name = "", force = false): Promise<BacktestCardModel[]> {
+  const normalizedName = name.trim();
+  if (normalizedName) {
+    const rows = await getBacktestsAll(normalizedName);
+    return (rows ?? []).map((row) => normalizeBacktestRow(row as BacktestMetadataItem & { equity_preview?: number[] }));
+  }
   if (force) {
     backtestsAllCache = null;
     backtestsAllPromise = null;
@@ -269,7 +311,7 @@ export function BacktestsPage() {
   const [loading, setLoading] = useState(false);
   const [showCreateModal, setShowCreateModal] = useState(false);
 
-  const [search, setSearch] = useState("");
+  const [nameFilter, setNameFilter] = useState("");
   const [selectedStrategies, setSelectedStrategies] = useState<string[]>([]);
   const [selectedSymbols, setSelectedSymbols] = useState<string[]>([]);
   const [selectedTimeframes, setSelectedTimeframes] = useState<string[]>([]);
@@ -287,12 +329,16 @@ export function BacktestsPage() {
   const [numericFilters, setNumericFilters] = useState<NumericFiltersState>(() =>
     boundsToFilters(buildNumericBounds([])),
   );
+  const [duplicatesInfo, setDuplicatesInfo] = useState<BacktestsDuplicatesResponse | null>(null);
+  const [showDuplicatesModal, setShowDuplicatesModal] = useState(false);
+  const [loadingDuplicates, setLoadingDuplicates] = useState(false);
+  const [runningDeduplicate, setRunningDeduplicate] = useState(false);
 
   const loadAllMetadata = useCallback(
     async (force = false) => {
       setLoading(true);
       try {
-        const rows = await loadBacktestsAllCached(force);
+        const rows = await loadBacktestsAllCached(nameFilter, force);
         const bounds = buildNumericBounds(rows);
         setItems(rows);
         setNumericBounds(bounds);
@@ -304,11 +350,11 @@ export function BacktestsPage() {
         setLoading(false);
       }
     },
-    [showToast],
+    [nameFilter, showToast],
   );
 
   useEffect(() => {
-    void loadAllMetadata(false);
+    void loadAllMetadata(nameFilter.trim().length === 0);
   }, [loadAllMetadata]);
 
   const allStrategies = useMemo(
@@ -336,7 +382,6 @@ export function BacktestsPage() {
   );
 
   const filteredSorted = useMemo(() => {
-    const needle = search.trim().toLowerCase();
     const result = items.filter((item) => {
       if (selectedStrategies.length > 0 && !selectedStrategies.includes(item.strategy_name)) {
         return false;
@@ -349,11 +394,6 @@ export function BacktestsPage() {
         if (!selectedSymbols.every((entry) => symbolSet.has(entry.toUpperCase()))) {
           return false;
         }
-      }
-      if (needle) {
-        const haystack =
-          `${item.id} ${item.strategy_name} ${(item.symbols ?? []).join(" ")} ${item.timeframe}`.toLowerCase();
-        if (!haystack.includes(needle)) return false;
       }
 
       const totalReturn = metricValue(item.total_return) * 100;
@@ -405,7 +445,6 @@ export function BacktestsPage() {
   }, [
     items,
     numericFilters,
-    search,
     selectedStrategies,
     selectedSymbols,
     selectedTimeframes,
@@ -460,22 +499,22 @@ export function BacktestsPage() {
     });
   };
 
-  const addSymbolDraft = () => {
+  const addSymbolDraft = useCallback(() => {
     const normalized = symbolDraft.trim().toUpperCase();
     if (!normalized) return;
     if (!allSymbols.some((entry) => entry.toUpperCase() === normalized)) return;
     setSelectedSymbols((current) => (current.includes(normalized) ? current : [...current, normalized]));
     setSymbolDraft("");
     setPage(1);
-  };
+  }, [allSymbols, symbolDraft]);
 
-  const removeSelectedSymbol = (symbol: string) => {
+  const removeSelectedSymbol = useCallback((symbol: string) => {
     setSelectedSymbols((current) => current.filter((entry) => entry !== symbol));
     setPage(1);
-  };
+  }, []);
 
-  const resetAllFilters = () => {
-    setSearch("");
+  const resetAllFilters = useCallback(() => {
+    setNameFilter("");
     setSelectedStrategies([]);
     setSelectedSymbols([]);
     setSelectedTimeframes([]);
@@ -483,7 +522,7 @@ export function BacktestsPage() {
     setSortOrder("desc");
     setPage(1);
     setNumericFilters(boundsToFilters(numericBounds));
-  };
+  }, [numericBounds]);
 
   const handleBulkDelete = async () => {
     if (selectedCount === 0) return;
@@ -501,34 +540,66 @@ export function BacktestsPage() {
   };
 
   const handleCompare = () => {
-    if (selectedCount < 2) {
-      showToast("Select at least two backtests to compare.", "info");
+    if (selectedCount !== 2) {
+      showToast("Select exactly 2 backtests to compare.", "info");
       return;
     }
     const ids = [...selectedIds];
-    void compareBacktests(ids)
-      .then(() => {
-        navigate(`/backtests/compare?ids=${ids.join(",")}`);
-      })
-      .catch((error: unknown) => {
-        showToast(toErrorMessage(error, "Compare request failed."), "error");
-      });
+    navigate(`/backtests/compare?ids=${ids.join(",")}`);
   };
 
-  const filterPanelContent = (
-    <div
-      style={{
-        display: "grid",
-        gap: "10px",
-      }}
-    >
-      <div
-        style={{
-          display: "grid",
-          gap: "10px",
-          gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
-        }}
-      >
+  const handleShowDuplicates = async () => {
+    setLoadingDuplicates(true);
+    try {
+      const payload = await getBacktestDuplicates();
+      setDuplicatesInfo(payload);
+      setShowDuplicatesModal(true);
+    } catch (error: unknown) {
+      showToast(toErrorMessage(error, "Could not check duplicates."), "error");
+    } finally {
+      setLoadingDuplicates(false);
+    }
+  };
+
+  const handleDeduplicate = async () => {
+    setRunningDeduplicate(true);
+    try {
+      const payload = await deduplicateBacktests();
+      showToast(`Removed ${payload.deleted_ids.length} duplicate backtest(s).`, "success");
+      setShowDuplicatesModal(false);
+      await loadAllMetadata(true);
+    } catch (error: unknown) {
+      showToast(toErrorMessage(error, "Could not remove duplicates."), "error");
+    } finally {
+      setRunningDeduplicate(false);
+    }
+  };
+
+  const filterPanelContent = useMemo(() => (
+    <div style={FILTER_PANEL_GRID_STYLE}>
+      <div style={FILTER_PANEL_CONTROLS_STYLE}>
+        <div style={{ minWidth: "220px" }}>
+          <label style={{ display: "grid", gap: "6px", fontSize: "0.72rem", color: "var(--color-text-muted)" }}>
+            Name
+            <input
+              value={nameFilter}
+              onChange={(event) => {
+                setNameFilter(event.target.value);
+                setPage(1);
+              }}
+              placeholder="Partial name..."
+              style={{
+                borderRadius: "10px",
+                border: "1px solid rgba(143, 154, 184, 0.28)",
+                background: "rgba(13, 19, 32, 0.95)",
+                color: "var(--color-text)",
+                padding: "9px 10px",
+                fontSize: "0.76rem",
+              }}
+            />
+          </label>
+        </div>
+
         <MultiSelectDropdown
           label="Strategy"
           options={allStrategies.map((value) => ({ label: value, value }))}
@@ -633,7 +704,7 @@ export function BacktestsPage() {
         }}
       >
         <DualRangeSlider
-          label="Sharpe Ratio"
+          label="Sharpe (higher = better)"
           min={numericBounds.sharpe.min}
           max={numericBounds.sharpe.max}
           valueMin={numericFilters.sharpe.min}
@@ -645,7 +716,7 @@ export function BacktestsPage() {
           step={0.01}
         />
         <DualRangeSlider
-          label="PSR"
+          label="PSR (higher = better)"
           min={numericBounds.psr.min}
           max={numericBounds.psr.max}
           valueMin={numericFilters.psr.min}
@@ -657,7 +728,7 @@ export function BacktestsPage() {
           step={0.001}
         />
         <DualRangeSlider
-          label="p-Value"
+          label="p-Value (lower = better)"
           min={numericBounds.pValue.min}
           max={numericBounds.pValue.max}
           valueMin={numericFilters.pValue.min}
@@ -669,7 +740,7 @@ export function BacktestsPage() {
           step={0.001}
         />
         <DualRangeSlider
-          label="CAGR %"
+          label="CAGR (higher = better)"
           min={numericBounds.cagr.min}
           max={numericBounds.cagr.max}
           valueMin={numericFilters.cagr.min}
@@ -682,7 +753,7 @@ export function BacktestsPage() {
           formatValue={(value) => `${value.toFixed(2)}%`}
         />
         <DualRangeSlider
-          label="Max Drawdown %"
+          label="Max DD (lower = better)"
           min={numericBounds.maxDrawdown.min}
           max={numericBounds.maxDrawdown.max}
           valueMin={numericFilters.maxDrawdown.min}
@@ -708,7 +779,7 @@ export function BacktestsPage() {
           formatValue={(value) => `${value.toFixed(2)}%`}
         />
         <DualRangeSlider
-          label="Win Rate %"
+          label="Win Rate (higher = better)"
           min={numericBounds.winRate.min}
           max={numericBounds.winRate.max}
           valueMin={numericFilters.winRate.min}
@@ -740,6 +811,51 @@ export function BacktestsPage() {
         </button>
       </div>
     </div>
+  ), [
+    addSymbolDraft,
+    allStrategies,
+    allSymbols,
+    allTimeframes,
+    numericBounds.cagr.max,
+    numericBounds.cagr.min,
+    numericBounds.maxDrawdown.max,
+    numericBounds.maxDrawdown.min,
+    numericBounds.pValue.max,
+    numericBounds.pValue.min,
+    numericBounds.psr.max,
+    numericBounds.psr.min,
+    numericBounds.sharpe.max,
+    numericBounds.sharpe.min,
+    numericBounds.totalReturn.max,
+    numericBounds.totalReturn.min,
+    numericBounds.winRate.max,
+    numericBounds.winRate.min,
+    numericFilters.cagr.max,
+    numericFilters.cagr.min,
+    numericFilters.maxDrawdown.max,
+    numericFilters.maxDrawdown.min,
+    numericFilters.pValue.max,
+    numericFilters.pValue.min,
+    numericFilters.psr.max,
+    numericFilters.psr.min,
+    numericFilters.sharpe.max,
+    numericFilters.sharpe.min,
+    numericFilters.totalReturn.max,
+    numericFilters.totalReturn.min,
+    numericFilters.winRate.max,
+    numericFilters.winRate.min,
+    nameFilter,
+    removeSelectedSymbol,
+    resetAllFilters,
+    selectedStrategies,
+    selectedSymbols,
+    selectedTimeframes,
+    symbolDraft,
+  ]);
+
+  const resultSummaryLabel = useMemo(
+    () => `${filteredSorted.length} results · ${items.length} total backtests`,
+    [filteredSorted.length, items.length],
   );
 
   return (
@@ -767,39 +883,58 @@ export function BacktestsPage() {
           <div>
             <h1 style={{ margin: 0, fontSize: "1.35rem", fontWeight: 700 }}>Backtests</h1>
             <div style={{ marginTop: "4px", color: "var(--color-text-muted)", fontSize: "0.78rem" }}>
-              Card layout with equity previews · one metadata request · fully client-side filtering
+              Card layout with equity previews · server-side name filter · client-side metric filters
             </div>
           </div>
 
-          <button
-            type="button"
-            onClick={() => setShowCreateModal(true)}
-            style={{
-              borderRadius: "10px",
-              border: "1px solid rgba(88, 166, 255, 0.5)",
-              background: "rgba(88, 166, 255, 0.16)",
-              color: "#dbeafe",
-              padding: "8px 12px",
-              fontSize: "0.76rem",
-              cursor: "pointer",
-              display: "inline-flex",
-              alignItems: "center",
-              gap: "6px",
-            }}
-          >
-            <Plus size={13} />
-            New Backtest
-          </button>
+          <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+            <button
+              type="button"
+              onClick={() => void handleShowDuplicates()}
+              disabled={loadingDuplicates}
+              style={{
+                borderRadius: "10px",
+                border: "1px solid rgba(248, 113, 113, 0.45)",
+                background: "rgba(127, 29, 29, 0.22)",
+                color: "#fecaca",
+                padding: "8px 12px",
+                fontSize: "0.76rem",
+                cursor: loadingDuplicates ? "not-allowed" : "pointer",
+                opacity: loadingDuplicates ? 0.6 : 1,
+              }}
+            >
+              {loadingDuplicates ? "Checking..." : "Remove Duplicates"}
+            </button>
+            <button
+              type="button"
+              onClick={() => setShowCreateModal(true)}
+              style={{
+                borderRadius: "10px",
+                border: "1px solid rgba(88, 166, 255, 0.5)",
+                background: "rgba(88, 166, 255, 0.16)",
+                color: "#dbeafe",
+                padding: "8px 12px",
+                fontSize: "0.76rem",
+                cursor: "pointer",
+                display: "inline-flex",
+                alignItems: "center",
+                gap: "6px",
+              }}
+            >
+              <Plus size={13} />
+              New Backtest
+            </button>
+          </div>
         </div>
 
         <FilterBar
-          searchValue={search}
+          searchValue={nameFilter}
           onSearchChange={(value) => {
-            setSearch(value);
+            setNameFilter(value);
             setPage(1);
           }}
-          searchPlaceholder="Search strategy, symbol, id..."
-          sortOptions={SORT_OPTIONS}
+          searchPlaceholder="Name (server-side contains)..."
+          sortOptions={BACKTEST_SORT_OPTIONS}
           sortValue={sortField}
           onSortChange={(value) => {
             setSortField(value as SortField);
@@ -811,7 +946,7 @@ export function BacktestsPage() {
 
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
           <div style={{ color: "var(--color-text-muted)", fontSize: "0.78rem" }}>
-            {filteredSorted.length} results · {items.length} total backtests
+            {resultSummaryLabel}
           </div>
           <div style={{ display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" }}>
             <button
@@ -836,7 +971,7 @@ export function BacktestsPage() {
               <ArrowUpDown size={14} />
               {sortOrder === "desc" ? "Desc" : "Asc"}
             </button>
-            <label style={{ display: "inline-flex", gap: "6px", alignItems: "center", fontSize: "0.76rem", color: "var(--color-text-muted)" }}>
+            <label style={SELECT_ALL_LABEL_STYLE}>
               <input
                 type="checkbox"
                 checked={allVisibleSelected}
@@ -1032,11 +1167,23 @@ export function BacktestsPage() {
 
                 <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: "8px" }}>
                   <StatBadge label="Return" value={percentage(totalReturnPct)} color={statColorPositive(totalReturnPct)} />
-                  <StatBadge label="Sharpe" value={formatNumber(item.sharpe_ratio)} color={sharpeColor(item.sharpe_ratio)} />
-                  <StatBadge label="PSR" value={item.psr == null ? "N/A" : `${(item.psr * 100).toFixed(1)}%`} color={psrColor(item.psr)} />
-                  <StatBadge label="CAGR" value={percentage(cagrPct)} color={statColorPositive(cagrPct)} />
-                  <StatBadge label="Max DD" value={percentage(-maxDrawdownPct)} color="#f87171" />
-                  <StatBadge label="Win Rate" value={`${winRatePct.toFixed(1)}%`} color={statColorPositive(winRatePct)} />
+                  <StatBadge
+                    label="Sharpe (higher = better)"
+                    value={formatNumber(item.sharpe_ratio)}
+                    color={sharpeColor(item.sharpe_ratio)}
+                  />
+                  <StatBadge
+                    label="PSR (higher = better)"
+                    value={item.psr == null ? "N/A" : `${(item.psr * 100).toFixed(1)}%`}
+                    color={psrColor(item.psr)}
+                  />
+                  <StatBadge label="CAGR (higher = better)" value={percentage(cagrPct)} color={statColorPositive(cagrPct)} />
+                  <StatBadge label="Max DD (lower = better)" value={percentage(-maxDrawdownPct)} color="#f87171" />
+                  <StatBadge
+                    label="Win Rate (higher = better)"
+                    value={`${winRatePct.toFixed(1)}%`}
+                    color={statColorPositive(winRatePct)}
+                  />
                 </div>
 
                 <div
@@ -1077,7 +1224,7 @@ export function BacktestsPage() {
                       fontFamily: NUMERIC_FONT,
                     }}
                   >
-                    p-Value {formatPValue(item.p_value)}
+                    p-Value (lower = better) {formatPValue(item.p_value)}
                   </span>
                 </div>
               </article>
@@ -1147,21 +1294,7 @@ export function BacktestsPage() {
 
       {selectedCount > 0 ? (
         <div
-          style={{
-            position: "fixed",
-            insetInlineStart: "50%",
-            transform: "translateX(-50%)",
-            insetBlockEnd: "16px",
-            zIndex: 60,
-            borderRadius: "999px",
-            border: "1px solid rgba(90, 105, 138, 0.34)",
-            background: "rgba(11, 18, 31, 0.95)",
-            boxShadow: "0 18px 40px rgba(0,0,0,0.45)",
-            padding: "8px 10px",
-            display: "inline-flex",
-            gap: "8px",
-            alignItems: "center",
-          }}
+          style={BULK_BAR_STYLE}
         >
           <span style={{ fontSize: "0.76rem", color: "var(--color-text-muted)" }}>
             {selectedCount} selected
@@ -1185,27 +1318,99 @@ export function BacktestsPage() {
             <Trash2 size={13} />
             Delete Selected
           </button>
-          <button
-            type="button"
-            onClick={handleCompare}
-            style={{
-              borderRadius: "999px",
-              border: "1px solid rgba(147, 197, 253, 0.5)",
-              background: "rgba(30, 58, 138, 0.3)",
-              color: "#dbeafe",
-              padding: "7px 11px",
-              fontSize: "0.74rem",
-              cursor: "pointer",
-              display: "inline-flex",
-              alignItems: "center",
-              gap: "6px",
-            }}
-          >
-            <Scale size={13} />
-            Compare Selected
-          </button>
+          {selectedCount === 2 ? (
+            <button
+              type="button"
+              onClick={handleCompare}
+              style={{
+                borderRadius: "999px",
+                border: "1px solid rgba(147, 197, 253, 0.5)",
+                background: "rgba(30, 58, 138, 0.3)",
+                color: "#dbeafe",
+                padding: "7px 11px",
+                fontSize: "0.74rem",
+                cursor: "pointer",
+                display: "inline-flex",
+                alignItems: "center",
+                gap: "6px",
+              }}
+            >
+              <Scale size={13} />
+              Compare Selected
+            </button>
+          ) : null}
         </div>
       ) : null}
+
+      <Modal
+        open={showDuplicatesModal}
+        onClose={() => {
+          if (runningDeduplicate) return;
+          setShowDuplicatesModal(false);
+        }}
+        title="Remove Backtest Duplicates"
+        width="520px"
+      >
+        <div style={{ display: "grid", gap: "14px" }}>
+          <div style={{ color: "var(--color-text-muted)", fontSize: "0.84rem", lineHeight: 1.45 }}>
+            Found <b>{duplicatesInfo?.total_groups ?? 0}</b> duplicate group(s) across{" "}
+            <b>{duplicatesInfo?.total_backtests ?? 0}</b> backtests.
+          </div>
+          {duplicatesInfo && duplicatesInfo.total_groups > 0 ? (
+            <div
+              style={{
+                maxHeight: "180px",
+                overflowY: "auto",
+                border: "1px solid var(--color-border)",
+                borderRadius: "8px",
+                padding: "8px 10px",
+                fontSize: "0.76rem",
+                color: "var(--color-text-muted)",
+              }}
+            >
+              {duplicatesInfo.groups.slice(0, 6).map((group) => (
+                <div key={group.fingerprint} style={{ padding: "5px 0", borderBottom: "1px solid rgba(255,255,255,0.06)" }}>
+                  {group.strategy_name || "Unknown"} · {(group.symbols || []).join(", ") || "N/A"} · {group.timeframe || "N/A"} ·{" "}
+                  {group.backtests.length} entries
+                </div>
+              ))}
+            </div>
+          ) : null}
+          <div style={{ display: "flex", justifyContent: "flex-end", gap: "8px" }}>
+            <button
+              type="button"
+              onClick={() => setShowDuplicatesModal(false)}
+              disabled={runningDeduplicate}
+              style={{
+                borderRadius: "8px",
+                border: "1px solid var(--color-border)",
+                background: "transparent",
+                color: "var(--color-text-muted)",
+                padding: "8px 12px",
+                cursor: runningDeduplicate ? "not-allowed" : "pointer",
+              }}
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              onClick={() => void handleDeduplicate()}
+              disabled={runningDeduplicate || (duplicatesInfo?.total_groups ?? 0) === 0}
+              style={{
+                borderRadius: "8px",
+                border: "1px solid rgba(248,113,113,0.4)",
+                background: "rgba(127,29,29,0.24)",
+                color: "#fecaca",
+                padding: "8px 12px",
+                cursor: runningDeduplicate ? "not-allowed" : "pointer",
+                opacity: runningDeduplicate || (duplicatesInfo?.total_groups ?? 0) === 0 ? 0.6 : 1,
+              }}
+            >
+              {runningDeduplicate ? "Removing..." : "Confirm Remove Duplicates"}
+            </button>
+          </div>
+        </div>
+      </Modal>
 
       <CreateBacktestModal
         open={showCreateModal}
@@ -1216,7 +1421,15 @@ export function BacktestsPage() {
   );
 }
 
-function StatBadge({ label, value, color }: { label: string; value: string; color: string }) {
+const StatBadge = memo(function StatBadge({
+  label,
+  value,
+  color,
+}: {
+  label: string;
+  value: string;
+  color: string;
+}) {
   return (
     <div
       style={{
@@ -1232,7 +1445,7 @@ function StatBadge({ label, value, color }: { label: string; value: string; colo
       <div style={{ color, fontWeight: 700 }}>{value}</div>
     </div>
   );
-}
+});
 
 function PagerButton({
   children,

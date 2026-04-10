@@ -23,6 +23,8 @@ from shared.models import (
     LiveBalanceRecord,
     LiveDeploymentConfig,
     LiveExecution,
+    Portfolio as PortfolioModel,
+    PortfolioComponent as PortfolioComponentModel,
     LiveSignal,
     Trade,
     TradeExit,
@@ -87,6 +89,100 @@ class BacktestRecord(SQLModel, table=True):
     stats: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))
     notes: str = Field(default="")
     created_at: str = Field(default="", index=True)
+
+
+class PortfolioRecord(SQLModel, table=True):
+    __tablename__ = "portfolios"
+
+    id: str = Field(primary_key=True)
+    name: str = Field(default="", index=True)
+    created_at: str = Field(default="", index=True)
+    account_capital: float = Field(default=100_000.0)
+    combined_stats: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))
+    combined_equity: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON, nullable=False))
+    strategy_contributions: list[dict[str, Any]] = Field(
+        default_factory=list,
+        sa_column=Column(JSON, nullable=False),
+    )
+    component_contributions: list[dict[str, Any]] = Field(
+        default_factory=list,
+        sa_column=Column(JSON, nullable=False),
+    )
+    trades: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON, nullable=False))
+
+    @classmethod
+    def from_portfolio(cls, portfolio: PortfolioModel) -> "PortfolioRecord":
+        return cls(
+            id=str(portfolio.id),
+            name=portfolio.name,
+            created_at=portfolio.created_at,
+            account_capital=portfolio.account_capital,
+            combined_stats=portfolio.combined_stats or {},
+            combined_equity=portfolio.combined_equity or [],
+            strategy_contributions=portfolio.strategy_contributions or [],
+            component_contributions=portfolio.component_contributions or [],
+            trades=portfolio.trades or [],
+        )
+
+    def to_portfolio(self, components: list["PortfolioComponentRecord"]) -> PortfolioModel:
+        return PortfolioModel(
+            id=self.id,
+            name=self.name or "",
+            created_at=self.created_at or "",
+            account_capital=float(self.account_capital or 100_000.0),
+            components=[item.to_model() for item in components],
+            combined_stats=self.combined_stats or {},
+            combined_equity=self.combined_equity or [],
+            strategy_contributions=self.strategy_contributions or [],
+            component_contributions=self.component_contributions or [],
+            trades=self.trades or [],
+        )
+
+
+class PortfolioComponentRecord(SQLModel, table=True):
+    __tablename__ = "portfolio_components"
+
+    id: int | None = Field(default=None, primary_key=True)
+    portfolio_id: str = Field(foreign_key="portfolios.id", index=True)
+    component_id: str = Field(default="", index=True)
+    strategy_name: str = Field(default="", index=True)
+    symbol: str = Field(default="", index=True)
+    timeframe: str = Field(default="", index=True)
+    weight: float = Field(default=1.0)
+    risk_config: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))
+    settings: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))
+    backtest_id: str = Field(default="", index=True)
+
+    @classmethod
+    def from_model(
+        cls,
+        *,
+        portfolio_id: str,
+        component_id: str,
+        component: PortfolioComponentModel,
+    ) -> "PortfolioComponentRecord":
+        return cls(
+            portfolio_id=portfolio_id,
+            component_id=component_id,
+            strategy_name=component.strategy_name,
+            symbol=component.symbol,
+            timeframe=component.timeframe,
+            weight=component.weight,
+            risk_config=component.risk_config or {},
+            settings=component.settings or {},
+            backtest_id=str(component.backtest_id or ""),
+        )
+
+    def to_model(self) -> PortfolioComponentModel:
+        return PortfolioComponentModel(
+            strategy_name=self.strategy_name or "",
+            symbol=self.symbol or "",
+            timeframe=self.timeframe or "1h",
+            weight=float(self.weight or 1.0),
+            risk_config=self.risk_config or {},
+            settings=self.settings or {},
+            backtest_id=self.backtest_id or None,
+        )
 
 
 class TradeRecord(SQLModel, table=True):
@@ -1066,6 +1162,8 @@ def _backtest_metadata_payload(backtest: BacktestRecord, trade_count: int) -> di
     timeframes = _as_string_list(data.get("timeframes"))
     symbols = _as_string_list(data.get("symbols"))
     strategy_name = strategies[0] if strategies else "unknown"
+    notes = str(backtest.notes or "").strip()
+    display_name = notes or strategy_name
     timeframe = timeframes[0] if timeframes else ""
     tags = _as_string_list(backtest.tags_json)
 
@@ -1073,6 +1171,8 @@ def _backtest_metadata_payload(backtest: BacktestRecord, trade_count: int) -> di
         "id": str(backtest.id),
         "engine": str(backtest.engine or "unknown"),
         "strategy_name": strategy_name,
+        "display_name": display_name,
+        "notes": notes,
         "symbols": symbols,
         "timeframe": timeframe,
         "start_date": str(backtest.backtest_start or ""),
@@ -1663,3 +1763,135 @@ def load_backtest_result(backtest_id: str) -> BacktestResult | None:
         indicators=[IndicatorSeries.from_dict(item) for item in indicators],
         drawings=drawings,
     )
+
+
+def save_portfolio(portfolio: PortfolioModel) -> None:
+    normalized_id = str(portfolio.id or "").strip()
+    if not normalized_id:
+        raise ValueError("Portfolio id is required")
+
+    init_db()
+    with get_session() as session:
+        session.exec(delete(PortfolioComponentRecord).where(PortfolioComponentRecord.portfolio_id == normalized_id))
+
+        record = session.get(PortfolioRecord, normalized_id)
+        if record is None:
+            record = PortfolioRecord.from_portfolio(portfolio)
+            session.add(record)
+        else:
+            record.name = portfolio.name
+            record.created_at = portfolio.created_at
+            record.account_capital = portfolio.account_capital
+            record.combined_stats = portfolio.combined_stats or {}
+            record.combined_equity = portfolio.combined_equity or []
+            record.strategy_contributions = portfolio.strategy_contributions or []
+            record.component_contributions = portfolio.component_contributions or []
+            record.trades = portfolio.trades or []
+            session.add(record)
+        session.flush()
+
+        for index, component in enumerate(portfolio.components, start=1):
+            component_id = f"component-{index:03d}"
+            if isinstance(component.settings, dict):
+                raw_component_id = component.settings.get("component_id")
+                if isinstance(raw_component_id, str) and raw_component_id.strip():
+                    component_id = raw_component_id.strip()
+            settings = dict(component.settings or {})
+            settings.pop("component_id", None)
+            session.add(
+                PortfolioComponentRecord.from_model(
+                    portfolio_id=normalized_id,
+                    component_id=component_id,
+                    component=PortfolioComponentModel(
+                        strategy_name=component.strategy_name,
+                        symbol=component.symbol,
+                        timeframe=component.timeframe,
+                        weight=component.weight,
+                        risk_config=component.risk_config or {},
+                        settings=settings,
+                        backtest_id=component.backtest_id,
+                    ),
+                )
+            )
+        session.commit()
+
+
+def load_portfolio(portfolio_id: str) -> PortfolioModel | None:
+    normalized_id = str(portfolio_id or "").strip()
+    if not normalized_id:
+        return None
+
+    init_db()
+    with get_session() as session:
+        portfolio_row = session.get(PortfolioRecord, normalized_id)
+        if portfolio_row is None:
+            return None
+        component_rows = session.exec(
+            select(PortfolioComponentRecord)
+            .where(PortfolioComponentRecord.portfolio_id == normalized_id)
+            .order_by(PortfolioComponentRecord.id.asc())
+        ).all()
+
+    components = [row for row in component_rows if isinstance(row, PortfolioComponentRecord)]
+    portfolio = portfolio_row.to_portfolio(components)
+    for index, component in enumerate(portfolio.components, start=1):
+        try:
+            source_component = components[index - 1]
+        except IndexError:
+            source_component = None
+        if source_component is None:
+            continue
+        settings = dict(component.settings or {})
+        settings.setdefault("component_id", source_component.component_id or f"component-{index:03d}")
+        component.settings = settings
+    return portfolio
+
+
+def list_portfolios() -> list[PortfolioModel]:
+    init_db()
+    with get_session() as session:
+        portfolio_rows = session.exec(
+            select(PortfolioRecord).order_by(PortfolioRecord.created_at.desc(), PortfolioRecord.id.desc())
+        ).all()
+        component_rows = session.exec(
+            select(PortfolioComponentRecord).order_by(
+                PortfolioComponentRecord.portfolio_id.asc(),
+                PortfolioComponentRecord.id.asc(),
+            )
+        ).all()
+
+    by_portfolio: dict[str, list[PortfolioComponentRecord]] = {}
+    for row in component_rows:
+        if not isinstance(row, PortfolioComponentRecord):
+            continue
+        by_portfolio.setdefault(row.portfolio_id, []).append(row)
+
+    payload: list[PortfolioModel] = []
+    for row in portfolio_rows:
+        if not isinstance(row, PortfolioRecord):
+            continue
+        components = by_portfolio.get(row.id, [])
+        portfolio = row.to_portfolio(components)
+        for index, component in enumerate(portfolio.components, start=1):
+            source = components[index - 1] if index - 1 < len(components) else None
+            settings = dict(component.settings or {})
+            settings.setdefault("component_id", source.component_id if source is not None else f"component-{index:03d}")
+            component.settings = settings
+        payload.append(portfolio)
+    return payload
+
+
+def delete_portfolio(portfolio_id: str) -> bool:
+    normalized_id = str(portfolio_id or "").strip()
+    if not normalized_id:
+        return False
+
+    init_db()
+    with get_session() as session:
+        portfolio = session.get(PortfolioRecord, normalized_id)
+        if portfolio is None:
+            return False
+        session.exec(delete(PortfolioComponentRecord).where(PortfolioComponentRecord.portfolio_id == normalized_id))
+        session.delete(portfolio)
+        session.commit()
+    return True

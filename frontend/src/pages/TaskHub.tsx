@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import { Link } from "react-router-dom";
 import { Activity, ArrowRight, Pause, RefreshCw, Square } from "lucide-react";
@@ -14,6 +14,7 @@ import { useToast } from "../components/ToastProvider";
 
 const ACTIVE_STATUSES = new Set(["queued", "starting", "running", "paused"]);
 const FINAL_STATUSES = new Set(["completed", "failed", "cancelled", "interrupted"]);
+const TASK_POLL_MS = 3000;
 
 function formatDuration(seconds?: number | null) {
   if (seconds == null || !Number.isFinite(seconds) || seconds < 0) return "—";
@@ -90,7 +91,7 @@ export function TaskHubPage() {
     void poll();
     id = window.setInterval(() => {
       void poll();
-    }, 1000);
+    }, TASK_POLL_MS);
 
     return () => {
       active = false;
@@ -362,7 +363,7 @@ export function TaskHubPage() {
   );
 }
 
-function SummaryCard({
+const SummaryCard = memo(function SummaryCard({
   label,
   value,
   failed = false,
@@ -389,7 +390,7 @@ function SummaryCard({
       </div>
     </div>
   );
-}
+});
 
 function buttonStyle(color: string): CSSProperties {
   return {
