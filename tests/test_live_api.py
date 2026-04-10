@@ -614,3 +614,324 @@ def test_live_signals_endpoint_returns_signal_log(monkeypatch):
     assert signal["waiting_for_candle_close"] is True
     assert signal["raw_message"] == "BUY AAPL @ 150.25"
     assert signal["execution_id"] is None
+
+
+def test_live_accounts_websocket_streams_snapshot_and_update(monkeypatch):
+    import viewer.main as viewer_main_module
+
+    snapshots = iter(
+        [
+            {
+                "accounts": [
+                    {
+                        "id": "acc-1",
+                        "broker": "alpaca",
+                        "name": "Primary",
+                        "balance": 10_000.0,
+                        "equity": 10_000.0,
+                        "is_demo": True,
+                    }
+                ]
+            },
+            {
+                "accounts": [
+                    {
+                        "id": "acc-1",
+                        "broker": "alpaca",
+                        "name": "Primary",
+                        "balance": 10_015.5,
+                        "equity": 10_020.0,
+                        "is_demo": True,
+                    }
+                ]
+            },
+        ]
+    )
+    latest_payload = {
+        "accounts": [
+            {
+                "id": "acc-1",
+                "broker": "alpaca",
+                "name": "Primary",
+                "balance": 10_015.5,
+                "equity": 10_020.0,
+                "is_demo": True,
+            }
+        ]
+    }
+
+    def _next_payload() -> dict[str, object]:
+        nonlocal latest_payload
+        try:
+            latest_payload = next(snapshots)
+        except StopIteration:
+            pass
+        return latest_payload
+
+    monkeypatch.setattr(viewer_main_module, "_live_accounts_stream_payload", _next_payload)
+    monkeypatch.setattr(viewer_main_module, "_LIVE_WS_ACCOUNTS_POLL_SECONDS", 0.05)
+    monkeypatch.setattr(viewer_main_module, "_LIVE_WS_HEARTBEAT_SECONDS", 5.0)
+
+    client = TestClient(viewer_main_module.app)
+    with client.websocket_connect("/ws/live/accounts") as websocket:
+        first = websocket.receive_json()
+        second = websocket.receive_json()
+
+    assert first["type"] == "snapshot"
+    assert first["topic"] == "live.accounts"
+    assert first["data"]["accounts"][0]["balance"] == 10_000.0
+
+    assert second["type"] == "update"
+    assert second["topic"] == "live.accounts"
+    assert second["data"]["accounts"][0]["equity"] == 10_020.0
+
+
+def test_live_signals_websocket_streams_account_payload(monkeypatch):
+    import viewer.main as viewer_main_module
+
+    calls: list[tuple[str, int]] = []
+
+    async def _signals_payload(account_id: str, *, limit: int = 200) -> dict[str, object]:
+        calls.append((account_id, limit))
+        return {
+            "account_id": account_id,
+            "deployment_ids": ["dep-1"],
+            "signals": [
+                {
+                    "signal_id": "sig-1",
+                    "deployment_id": "dep-1",
+                    "symbol": "AAPL",
+                    "action": "buy",
+                    "status": "Pending",
+                    "source": "discord",
+                    "execution_id": None,
+                    "signal_timestamp": "2026-01-01T10:00:00+00:00",
+                    "signal_time": 1767261600.0,
+                    "execution_timestamp": "",
+                    "execution_time": 0.0,
+                    "theoretical_price": 100.0,
+                    "actual_price": None,
+                    "filled_qty": None,
+                    "commission": None,
+                    "broker_order_id": None,
+                    "signal_metadata": {},
+                    "raw_message": None,
+                    "waiting_for_candle_close": False,
+                    "waiting_countdown_seconds": None,
+                }
+            ],
+        }
+
+    monkeypatch.setattr(viewer_main_module, "_live_signals_payload", _signals_payload)
+
+    client = TestClient(viewer_main_module.app)
+    with client.websocket_connect("/ws/live/test-account/signals") as websocket:
+        snapshot = websocket.receive_json()
+
+    assert snapshot["type"] == "snapshot"
+    assert snapshot["topic"] == "live.signals.test-account"
+    assert snapshot["data"]["account_id"] == "test-account"
+    assert calls[0] == ("test-account", 200)
+
+
+def test_live_positions_websocket_streams_account_payload(monkeypatch):
+    import viewer.main as viewer_main_module
+
+    calls: list[str] = []
+
+    async def _positions_payload(account_id: str) -> dict[str, object]:
+        calls.append(account_id)
+        return {
+            "account_id": account_id,
+            "positions": [
+                {
+                    "symbol": "AAPL",
+                    "qty": 1.0,
+                    "entry_price": 100.0,
+                    "current_price": 101.0,
+                    "unrealized_pnl": 1.0,
+                }
+            ],
+        }
+
+    monkeypatch.setattr(viewer_main_module, "_live_positions_payload", _positions_payload)
+
+    client = TestClient(viewer_main_module.app)
+    with client.websocket_connect("/ws/live/test-account/positions") as websocket:
+        snapshot = websocket.receive_json()
+
+    assert snapshot["type"] == "snapshot"
+    assert snapshot["topic"] == "live.positions.test-account"
+    assert snapshot["data"]["account_id"] == "test-account"
+    assert calls[0] == "test-account"
+
+
+def test_live_executions_websocket_streams_account_payload(monkeypatch):
+    import viewer.main as viewer_main_module
+
+    calls: list[str] = []
+
+    async def _executions_payload(account_id: str) -> dict[str, object]:
+        calls.append(account_id)
+        return {
+            "account_id": account_id,
+            "deployment_ids": ["dep-1"],
+            "trades": [
+                {
+                    "signal_id": "sig-1",
+                    "execution_id": "exe-1",
+                    "deployment_id": "dep-1",
+                    "account_id": account_id,
+                    "symbol": "AAPL",
+                    "action": "buy",
+                    "theoretical_price": 100.0,
+                    "actual_price": 100.1,
+                    "slippage": 0.1,
+                    "slippage_bps": 10.0,
+                    "filled_qty": 1.0,
+                    "commission": 0.01,
+                    "signal_timestamp": "2026-01-01T10:00:00+00:00",
+                    "signal_time": 1767261600.0,
+                    "execution_timestamp": "2026-01-01T10:00:01+00:00",
+                    "execution_time": 1767261601.0,
+                    "broker_order_id": "order-1",
+                    "signal_metadata": {},
+                }
+            ],
+        }
+
+    monkeypatch.setattr(viewer_main_module, "_live_trades_payload", _executions_payload)
+
+    client = TestClient(viewer_main_module.app)
+    with client.websocket_connect("/ws/live/test-account/executions") as websocket:
+        snapshot = websocket.receive_json()
+
+    assert snapshot["type"] == "snapshot"
+    assert snapshot["topic"] == "live.executions.test-account"
+    assert snapshot["data"]["account_id"] == "test-account"
+    assert calls[0] == "test-account"
+
+
+def test_live_executions_websocket_streams_snapshot_and_update(monkeypatch):
+    import viewer.main as viewer_main_module
+
+    snapshots = iter(
+        [
+            {
+                "account_id": "test-account",
+                "deployment_ids": ["dep-1"],
+                "trades": [
+                    {
+                        "signal_id": "sig-1",
+                        "execution_id": "exe-1",
+                        "deployment_id": "dep-1",
+                        "account_id": "test-account",
+                        "symbol": "AAPL",
+                        "action": "buy",
+                        "theoretical_price": 100.0,
+                        "actual_price": 100.0,
+                        "slippage": 0.0,
+                        "slippage_bps": 0.0,
+                        "filled_qty": 1.0,
+                        "commission": 0.01,
+                        "signal_timestamp": "2026-01-01T10:00:00+00:00",
+                        "signal_time": 1767261600.0,
+                        "execution_timestamp": "2026-01-01T10:00:01+00:00",
+                        "execution_time": 1767261601.0,
+                        "broker_order_id": "order-1",
+                        "signal_metadata": {},
+                    }
+                ],
+            },
+            {
+                "account_id": "test-account",
+                "deployment_ids": ["dep-1"],
+                "trades": [
+                    {
+                        "signal_id": "sig-1",
+                        "execution_id": "exe-2",
+                        "deployment_id": "dep-1",
+                        "account_id": "test-account",
+                        "symbol": "AAPL",
+                        "action": "buy",
+                        "theoretical_price": 100.0,
+                        "actual_price": 100.2,
+                        "slippage": 0.2,
+                        "slippage_bps": 20.0,
+                        "filled_qty": 1.0,
+                        "commission": 0.01,
+                        "signal_timestamp": "2026-01-01T10:00:00+00:00",
+                        "signal_time": 1767261600.0,
+                        "execution_timestamp": "2026-01-01T10:00:02+00:00",
+                        "execution_time": 1767261602.0,
+                        "broker_order_id": "order-2",
+                        "signal_metadata": {},
+                    }
+                ],
+            },
+        ]
+    )
+    latest_payload = {
+        "account_id": "test-account",
+        "deployment_ids": ["dep-1"],
+        "trades": [],
+    }
+
+    async def _next_payload(account_id: str) -> dict[str, object]:
+        nonlocal latest_payload
+        assert account_id == "test-account"
+        try:
+            latest_payload = next(snapshots)
+        except StopIteration:
+            pass
+        return latest_payload
+
+    monkeypatch.setattr(viewer_main_module, "_live_trades_payload", _next_payload)
+    monkeypatch.setattr(viewer_main_module, "_LIVE_WS_EXECUTIONS_POLL_SECONDS", 0.05)
+    monkeypatch.setattr(viewer_main_module, "_LIVE_WS_HEARTBEAT_SECONDS", 5.0)
+
+    client = TestClient(viewer_main_module.app)
+    with client.websocket_connect("/ws/live/test-account/executions") as websocket:
+        first = websocket.receive_json()
+        second = websocket.receive_json()
+
+    assert first["type"] == "snapshot"
+    assert first["topic"] == "live.executions.test-account"
+    assert first["data"]["trades"][0]["execution_id"] == "exe-1"
+
+    assert second["type"] == "update"
+    assert second["topic"] == "live.executions.test-account"
+    assert second["data"]["trades"][0]["execution_id"] == "exe-2"
+
+
+def test_live_accounts_websocket_ping_pong(monkeypatch):
+    import viewer.main as viewer_main_module
+
+    monkeypatch.setattr(
+        viewer_main_module,
+        "_live_accounts_stream_payload",
+        lambda: {
+            "accounts": [
+                {
+                    "id": "acc-1",
+                    "broker": "alpaca",
+                    "name": "Primary",
+                    "balance": 10_000.0,
+                    "equity": 10_000.0,
+                    "is_demo": True,
+                }
+            ]
+        },
+    )
+    monkeypatch.setattr(viewer_main_module, "_LIVE_WS_ACCOUNTS_POLL_SECONDS", 5.0)
+    monkeypatch.setattr(viewer_main_module, "_LIVE_WS_HEARTBEAT_SECONDS", 10.0)
+
+    client = TestClient(viewer_main_module.app)
+    with client.websocket_connect("/ws/live/accounts") as websocket:
+        snapshot = websocket.receive_json()
+        assert snapshot["type"] == "snapshot"
+        websocket.send_text('{"type":"ping"}')
+        pong = websocket.receive_json()
+
+    assert pong["type"] == "pong"
+    assert pong["topic"] == "live.accounts"

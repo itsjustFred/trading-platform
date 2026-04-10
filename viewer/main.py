@@ -14,9 +14,10 @@ import time
 import traceback
 import uuid
 from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 import numpy as np
 import pandas as pd
@@ -76,6 +77,7 @@ from shared.database import (
     ensure_live_account,
     get_background_task_record,
     get_live_account,
+    get_latest_live_balance,
     init_db,
     list_backtest_ids,
     list_backtest_fingerprint_rows,
@@ -538,6 +540,8 @@ async def lifespan(app: FastAPI):
         ):
             with suppress(asyncio.CancelledError):
                 await task
+        with suppress(Exception):
+            await _LIVE_STREAM_BROKER.shutdown()
         with suppress(Exception):
             await _live_market_data_service.stop()
 
@@ -1077,6 +1081,12 @@ _LIVE_ACCOUNTS_CACHE_TTL_SECONDS = 30.0
 _STRATEGIES_CACHE_LOCK = threading.RLock()
 _STRATEGIES_CACHE: dict[str, Any] = {"expires_at": 0.0, "payload": []}
 _STRATEGIES_CACHE_TTL_SECONDS = 60.0
+_LIVE_WS_QUEUE_MAX_SIZE = 64
+_LIVE_WS_HEARTBEAT_SECONDS = 15.0
+_LIVE_WS_ACCOUNTS_POLL_SECONDS = 1.0
+_LIVE_WS_SIGNALS_POLL_SECONDS = 1.0
+_LIVE_WS_EXECUTIONS_POLL_SECONDS = 1.0
+_LIVE_WS_POSITIONS_POLL_SECONDS = 1.0
 _BACKTEST_META_CACHE_LOCK = threading.RLock()
 _BACKTEST_META_CACHE: dict[str, dict[str, Any]] = {}
 _BACKTEST_META_CACHE_SOURCE_MTIME_NS = 0
@@ -1091,6 +1101,136 @@ _TASK_STATUS_WEIGHTS: dict[str, float] = {
     "cancelled": 100.0,
     "interrupted": 100.0,
 }
+
+
+@dataclass
+class _LiveStreamTopicState:
+    topic: str
+    fetch_payload: Callable[[], Awaitable[dict[str, Any]]]
+    poll_seconds: float
+    subscribers: set[asyncio.Queue[dict[str, Any]]] = field(default_factory=set)
+    last_signature: str | None = None
+    last_payload: dict[str, Any] | None = None
+    producer_task: asyncio.Task[None] | None = None
+
+
+class _LiveStreamBroker:
+    def __init__(self) -> None:
+        self._topics: dict[str, _LiveStreamTopicState] = {}
+        self._lock = asyncio.Lock()
+
+    async def subscribe(
+        self,
+        *,
+        topic: str,
+        fetch_payload: Callable[[], Awaitable[dict[str, Any]]],
+        poll_seconds: float,
+        seed_payload: dict[str, Any] | None = None,
+    ) -> asyncio.Queue[dict[str, Any]]:
+        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=_LIVE_WS_QUEUE_MAX_SIZE)
+        async with self._lock:
+            state = self._topics.get(topic)
+            if state is None:
+                state = _LiveStreamTopicState(
+                    topic=topic,
+                    fetch_payload=fetch_payload,
+                    poll_seconds=poll_seconds,
+                )
+                self._topics[topic] = state
+            else:
+                state.fetch_payload = fetch_payload
+                state.poll_seconds = poll_seconds
+
+            if seed_payload is not None and state.last_signature is None:
+                state.last_payload = seed_payload
+                state.last_signature = _stable_payload_signature(seed_payload)
+
+            state.subscribers.add(queue)
+            if state.producer_task is None or state.producer_task.done():
+                state.producer_task = asyncio.create_task(
+                    self._run_topic(state),
+                    name=f"ws-live-topic-{topic}",
+                )
+        return queue
+
+    async def unsubscribe(self, topic: str, queue: asyncio.Queue[dict[str, Any]]) -> None:
+        producer_task: asyncio.Task[None] | None = None
+        async with self._lock:
+            state = self._topics.get(topic)
+            if state is None:
+                return
+            state.subscribers.discard(queue)
+            if state.subscribers:
+                return
+            producer_task = state.producer_task
+            state.producer_task = None
+            self._topics.pop(topic, None)
+        if producer_task is not None and not producer_task.done():
+            producer_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await producer_task
+
+    async def _broadcast(
+        self,
+        state: _LiveStreamTopicState,
+        payload: dict[str, Any],
+    ) -> None:
+        subscribers = tuple(state.subscribers)
+        for queue in subscribers:
+            await _queue_live_ws_message(queue, payload)
+
+    async def _run_topic(self, state: _LiveStreamTopicState) -> None:
+        try:
+            while True:
+                await asyncio.sleep(max(0.1, state.poll_seconds))
+                try:
+                    payload = await state.fetch_payload()
+                except Exception as exc:
+                    await self._broadcast(
+                        state,
+                        {
+                            "type": "error",
+                            "topic": state.topic,
+                            "error": _live_ws_error_detail(exc),
+                            "ts": time.time(),
+                        },
+                    )
+                    continue
+
+                signature = _stable_payload_signature(payload)
+                is_initial = state.last_signature is None
+                if signature == state.last_signature:
+                    continue
+                state.last_signature = signature
+                state.last_payload = payload
+                if is_initial:
+                    continue
+                await self._broadcast(
+                    state,
+                    {
+                        "type": "update",
+                        "topic": state.topic,
+                        "data": payload,
+                        "ts": time.time(),
+                    },
+                )
+        except asyncio.CancelledError:
+            raise
+
+    async def shutdown(self) -> None:
+        states: list[_LiveStreamTopicState]
+        async with self._lock:
+            states = list(self._topics.values())
+            self._topics.clear()
+        for state in states:
+            task = state.producer_task
+            if task is not None and not task.done():
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+
+
+_LIVE_STREAM_BROKER = _LiveStreamBroker()
 
 _DATA_SYMBOL_METADATA_KEYS = {
     "symbol",
@@ -2458,6 +2598,125 @@ def _serialize_live_timestamp(value: datetime | str | None) -> tuple[str, float]
     return ts.isoformat(), float(ts.timestamp())
 
 
+def _stable_payload_signature(payload: Any) -> str:
+    try:
+        return json.dumps(payload, sort_keys=True, default=str, separators=(",", ":"))
+    except Exception:
+        return repr(payload)
+
+
+async def _queue_live_ws_message(
+    queue: asyncio.Queue[dict[str, Any]],
+    message: dict[str, Any],
+) -> None:
+    if queue.full():
+        with suppress(asyncio.QueueEmpty):
+            queue.get_nowait()
+    await queue.put(message)
+
+
+def _live_ws_error_detail(exc: Exception) -> str:
+    if isinstance(exc, HTTPException):
+        detail = exc.detail
+        if isinstance(detail, str):
+            return detail
+        try:
+            return json.dumps(detail, ensure_ascii=False, default=str)
+        except Exception:
+            return str(detail)
+    return str(exc)
+
+
+async def _consume_live_ws_messages(
+    websocket: WebSocket,
+    *,
+    queue: asyncio.Queue[dict[str, Any]],
+    topic: str,
+) -> None:
+    try:
+        while True:
+            raw_payload = await websocket.receive_text()
+            if not raw_payload:
+                continue
+            try:
+                inbound = json.loads(raw_payload)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(inbound, dict):
+                continue
+            msg_type = str(inbound.get("type") or "").strip().lower()
+            if msg_type == "ping":
+                await _queue_live_ws_message(
+                    queue,
+                    {"type": "pong", "topic": topic, "ts": time.time()},
+                )
+    except WebSocketDisconnect:
+        await _queue_live_ws_message(queue, {"type": "_disconnect"})
+    except Exception:
+        await _queue_live_ws_message(queue, {"type": "_disconnect"})
+
+
+async def _stream_live_payload(
+    websocket: WebSocket,
+    *,
+    topic: str,
+    fetch_payload: Callable[[], Awaitable[dict[str, Any]]],
+    poll_seconds: float,
+) -> None:
+    await websocket.accept()
+    queue: asyncio.Queue[dict[str, Any]] | None = None
+    consumer_task: asyncio.Task[None] | None = None
+
+    try:
+        initial_payload = await fetch_payload()
+    except Exception as exc:
+        error_message = _live_ws_error_detail(exc)
+        await websocket.send_json({"type": "error", "topic": topic, "error": error_message})
+        with suppress(Exception):
+            await websocket.close(code=1008)
+        return
+
+    await websocket.send_json(
+        {
+            "type": "snapshot",
+            "topic": topic,
+            "data": initial_payload,
+            "ts": time.time(),
+        }
+    )
+
+    queue = await _LIVE_STREAM_BROKER.subscribe(
+        topic=topic,
+        fetch_payload=fetch_payload,
+        poll_seconds=poll_seconds,
+        seed_payload=initial_payload,
+    )
+    consumer_task = asyncio.create_task(
+        _consume_live_ws_messages(websocket, queue=queue, topic=topic),
+        name=f"ws-live-consumer-{topic}",
+    )
+    try:
+        while True:
+            try:
+                outbound = await asyncio.wait_for(queue.get(), timeout=_LIVE_WS_HEARTBEAT_SECONDS)
+                if outbound.get("type") == "_disconnect":
+                    return
+            except asyncio.TimeoutError:
+                outbound = {"type": "ping", "topic": topic, "ts": time.time()}
+            await websocket.send_json(outbound)
+    except WebSocketDisconnect:
+        return
+    except Exception:
+        return
+    finally:
+        if consumer_task is not None:
+            consumer_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await consumer_task
+        if queue is not None:
+            await _LIVE_STREAM_BROKER.unsubscribe(topic, queue)
+
+
 def _serialize_live_account_payload(account: Any) -> dict[str, Any]:
     broker_login = getattr(account, "broker_login", None)
     ctid = getattr(account, "ctid", None)
@@ -2553,6 +2812,29 @@ def _cached_live_accounts_payload(*, force_refresh: bool = False) -> list[dict[s
         _LIVE_ACCOUNTS_CACHE["expires_at"] = time.monotonic() + _LIVE_ACCOUNTS_CACHE_TTL_SECONDS
         _LIVE_ACCOUNTS_CACHE["provider_marker"] = provider_marker
         return [dict(item) for item in payload]
+
+
+def _live_accounts_stream_payload() -> dict[str, Any]:
+    accounts = _cached_live_accounts_payload(force_refresh=True)
+    enriched_accounts: list[dict[str, Any]] = []
+    for account in accounts:
+        item = dict(account)
+        account_id = str(item.get("id") or "").strip()
+        latest_balance = get_latest_live_balance(account_id) if account_id else None
+        if latest_balance is not None:
+            timestamp_iso, timestamp_unix = _serialize_live_timestamp(latest_balance.timestamp)
+            item["balance"] = float(latest_balance.balance)
+            item["equity"] = float(latest_balance.equity)
+            item["balance_timestamp"] = timestamp_iso
+            item["balance_time"] = timestamp_unix
+        else:
+            fallback_balance = _safe_float(item.get("balance"), 0.0)
+            item["balance"] = fallback_balance
+            item["equity"] = _safe_float(item.get("equity"), fallback_balance)
+            item["balance_timestamp"] = ""
+            item["balance_time"] = 0.0
+        enriched_accounts.append(item)
+    return {"accounts": enriched_accounts}
 
 
 def _list_strategies_payload() -> list[dict[str, Any]]:
@@ -7305,6 +7587,192 @@ async def delete_portfolio(portfolio_id: str) -> dict[str, Any]:
     return {"status": "deleted", "id": portfolio_id}
 
 
+async def _live_trades_payload(account_id: str) -> dict[str, Any]:
+    deployments = await asyncio.to_thread(list_live_deployments_for_account, account_id)
+    deployment_ids = _deployment_ids_for_account(account_id, deployments)
+    rows = await asyncio.to_thread(list_live_signal_executions_for_deployments, deployment_ids)
+
+    trades: list[dict[str, Any]] = []
+    for row in rows:
+        signal_metadata = row.get("signal_metadata")
+        metadata = signal_metadata if isinstance(signal_metadata, dict) else {}
+        signal_iso, signal_unix = _serialize_live_timestamp(row.get("signal_timestamp"))
+        execution_iso, execution_unix = _serialize_live_timestamp(row.get("execution_timestamp"))
+        trades.append(
+            {
+                "signal_id": str(row.get("signal_id", "")),
+                "execution_id": str(row.get("execution_id", "")),
+                "deployment_id": row.get("deployment_id", ""),
+                "account_id": account_id,
+                "symbol": row.get("symbol", ""),
+                "action": row.get("action", ""),
+                "theoretical_price": float(row.get("theoretical_price", 0.0)),
+                "actual_price": float(row.get("actual_price", 0.0)),
+                "slippage": float(row.get("slippage", 0.0)),
+                "slippage_bps": float(row.get("slippage_bps", 0.0)),
+                "filled_qty": float(row.get("filled_qty", 0.0)),
+                "position_size": (
+                    _safe_float(row.get("position_size"))
+                    if row.get("position_size") is not None
+                    else (
+                        _safe_float(metadata.get("position_size"))
+                        if metadata.get("position_size") is not None
+                        else None
+                    )
+                ),
+                "risk_amount": (
+                    _safe_float(row.get("risk_amount"))
+                    if row.get("risk_amount") is not None
+                    else (
+                        _safe_float(metadata.get("risk_amount"))
+                        if metadata.get("risk_amount") is not None
+                        else None
+                    )
+                ),
+                "risk_percent": (
+                    _safe_float(row.get("risk_percent"))
+                    if row.get("risk_percent") is not None
+                    else (
+                        _safe_float(metadata.get("risk_percent"))
+                        if metadata.get("risk_percent") is not None
+                        else None
+                    )
+                ),
+                "exit_reason": (
+                    str(row.get("exit_reason")).strip()
+                    if row.get("exit_reason") not in (None, "")
+                    else None
+                ),
+                "commission": float(row.get("commission", 0.0)),
+                "signal_timestamp": signal_iso,
+                "signal_time": signal_unix,
+                "execution_timestamp": execution_iso,
+                "execution_time": execution_unix,
+                "broker_order_id": row.get("broker_order_id", ""),
+                "signal_metadata": metadata,
+            }
+        )
+    return {"account_id": account_id, "deployment_ids": deployment_ids, "trades": trades}
+
+
+async def _live_signals_payload(account_id: str, *, limit: int = 200) -> dict[str, Any]:
+    deployments = await asyncio.to_thread(list_live_deployments_for_account, account_id)
+    deployment_ids = _deployment_ids_for_account(account_id, deployments)
+    rows = await asyncio.to_thread(
+        list_live_signals_for_deployments,
+        deployment_ids,
+        limit=limit,
+    )
+
+    signals: list[dict[str, Any]] = []
+    for row in rows:
+        metadata = row.get("signal_metadata")
+        signal_metadata = metadata if isinstance(metadata, dict) else {}
+        signal_iso, signal_unix = _serialize_live_timestamp(row.get("signal_timestamp"))
+        execution_iso, execution_unix = _serialize_live_timestamp(row.get("execution_timestamp"))
+        source = str(row.get("source") or signal_metadata.get("source") or "internal").lower()
+        status = _signal_status_from_row(row)
+        waiting_seconds = (
+            _waiting_countdown(signal_metadata, signal_unix)
+            if status == "Waiting"
+            else None
+        )
+        if status == "Waiting" and waiting_seconds is not None and waiting_seconds <= 0:
+            status = "Pending"
+        raw_message = signal_metadata.get("discord_content")
+        signals.append(
+            {
+                "signal_id": str(row.get("signal_id") or ""),
+                "deployment_id": str(row.get("deployment_id") or ""),
+                "symbol": str(row.get("symbol") or ""),
+                "action": str(row.get("action") or ""),
+                "status": status,
+                "source": source,
+                "execution_id": (
+                    str(row.get("execution_id") or "")
+                    if row.get("execution_id") is not None
+                    else None
+                ),
+                "signal_timestamp": signal_iso,
+                "signal_time": signal_unix,
+                "execution_timestamp": execution_iso,
+                "execution_time": execution_unix,
+                "theoretical_price": _safe_float(row.get("theoretical_price"), 0.0),
+                "actual_price": (
+                    _safe_float(row.get("actual_price"))
+                    if row.get("actual_price") is not None
+                    else None
+                ),
+                "filled_qty": (
+                    _safe_float(row.get("filled_qty"))
+                    if row.get("filled_qty") is not None
+                    else None
+                ),
+                "commission": (
+                    _safe_float(row.get("commission"))
+                    if row.get("commission") is not None
+                    else None
+                ),
+                "broker_order_id": (
+                    str(row.get("broker_order_id") or "")
+                    if row.get("broker_order_id") is not None
+                    else None
+                ),
+                "signal_metadata": signal_metadata,
+                "raw_message": str(raw_message).strip() if raw_message else None,
+                "waiting_for_candle_close": bool(
+                    signal_metadata.get("wait_for_candle_close")
+                    or signal_metadata.get("wait_candle_close")
+                ),
+                "waiting_countdown_seconds": waiting_seconds,
+            }
+        )
+
+    return {
+        "account_id": account_id,
+        "deployment_ids": deployment_ids,
+        "signals": signals,
+    }
+
+
+async def _live_positions_payload(account_id: str) -> dict[str, Any]:
+    account = await asyncio.to_thread(get_live_account, account_id)
+    if account is None:
+        raise HTTPException(status_code=404, detail="Live account not found")
+    if account.broker != "alpaca":
+        raise HTTPException(
+            status_code=400,
+            detail="Live positions endpoint currently supports only Alpaca accounts",
+        )
+
+    credentials = resolve_alpaca_credentials(
+        account_id=account.id,
+        broker_login=account.broker_login,
+    )
+    if credentials is None:
+        raise HTTPException(status_code=400, detail="Missing Alpaca credentials for account")
+    api_key, secret_key, paper = credentials
+
+    adapter = AlpacaLiveAdapter(
+        api_key=api_key,
+        secret_key=secret_key,
+        paper=paper,
+        account_id=account.id,
+    )
+    rows = await adapter.get_positions()
+    positions = [
+        {
+            "symbol": str(row.get("symbol") or ""),
+            "qty": _safe_float(row.get("qty"), 0.0),
+            "entry_price": _safe_float(row.get("entry_price"), 0.0),
+            "current_price": _safe_float(row.get("current_price"), 0.0),
+            "unrealized_pnl": _safe_float(row.get("unrealized_pnl"), 0.0),
+        }
+        for row in rows
+    ]
+    return {"account_id": account_id, "positions": positions}
+
+
 @app.get("/api/live/accounts", response_model=list[dict[str, Any]])
 async def get_live_accounts() -> list[dict[str, Any]]:
     _log_live_endpoint_request("/api/live/accounts")
@@ -7411,71 +7879,7 @@ async def get_live_trades(account_id: str) -> dict[str, Any]:
         "/api/live/trades/{account_id}",
         account_id=account_id,
     )
-    deployments = await asyncio.to_thread(list_live_deployments_for_account, account_id)
-    deployment_ids = _deployment_ids_for_account(account_id, deployments)
-    rows = await asyncio.to_thread(list_live_signal_executions_for_deployments, deployment_ids)
-
-    trades: list[dict[str, Any]] = []
-    for row in rows:
-        signal_metadata = row.get("signal_metadata")
-        metadata = signal_metadata if isinstance(signal_metadata, dict) else {}
-        signal_iso, signal_unix = _serialize_live_timestamp(row.get("signal_timestamp"))
-        execution_iso, execution_unix = _serialize_live_timestamp(row.get("execution_timestamp"))
-        trades.append(
-            {
-                "signal_id": str(row.get("signal_id", "")),
-                "execution_id": str(row.get("execution_id", "")),
-                "deployment_id": row.get("deployment_id", ""),
-                "account_id": account_id,
-                "symbol": row.get("symbol", ""),
-                "action": row.get("action", ""),
-                "theoretical_price": float(row.get("theoretical_price", 0.0)),
-                "actual_price": float(row.get("actual_price", 0.0)),
-                "slippage": float(row.get("slippage", 0.0)),
-                "slippage_bps": float(row.get("slippage_bps", 0.0)),
-                "filled_qty": float(row.get("filled_qty", 0.0)),
-                "position_size": (
-                    _safe_float(row.get("position_size"))
-                    if row.get("position_size") is not None
-                    else (
-                        _safe_float(metadata.get("position_size"))
-                        if metadata.get("position_size") is not None
-                        else None
-                    )
-                ),
-                "risk_amount": (
-                    _safe_float(row.get("risk_amount"))
-                    if row.get("risk_amount") is not None
-                    else (
-                        _safe_float(metadata.get("risk_amount"))
-                        if metadata.get("risk_amount") is not None
-                        else None
-                    )
-                ),
-                "risk_percent": (
-                    _safe_float(row.get("risk_percent"))
-                    if row.get("risk_percent") is not None
-                    else (
-                        _safe_float(metadata.get("risk_percent"))
-                        if metadata.get("risk_percent") is not None
-                        else None
-                    )
-                ),
-                "exit_reason": (
-                    str(row.get("exit_reason")).strip()
-                    if row.get("exit_reason") not in (None, "")
-                    else None
-                ),
-                "commission": float(row.get("commission", 0.0)),
-                "signal_timestamp": signal_iso,
-                "signal_time": signal_unix,
-                "execution_timestamp": execution_iso,
-                "execution_time": execution_unix,
-                "broker_order_id": row.get("broker_order_id", ""),
-                "signal_metadata": metadata,
-            }
-        )
-    return {"account_id": account_id, "deployment_ids": deployment_ids, "trades": trades}
+    return await _live_trades_payload(account_id)
 
 
 @app.get("/api/live/signals/{account_id}", response_model=dict[str, Any])
@@ -7485,83 +7889,7 @@ async def get_live_signals(account_id: str, limit: int = Query(default=200, ge=1
         account_id=account_id,
         limit=limit,
     )
-    deployments = await asyncio.to_thread(list_live_deployments_for_account, account_id)
-    deployment_ids = _deployment_ids_for_account(account_id, deployments)
-    rows = await asyncio.to_thread(
-        list_live_signals_for_deployments,
-        deployment_ids,
-        limit=limit,
-    )
-
-    signals: list[dict[str, Any]] = []
-    for row in rows:
-        metadata = row.get("signal_metadata")
-        signal_metadata = metadata if isinstance(metadata, dict) else {}
-        signal_iso, signal_unix = _serialize_live_timestamp(row.get("signal_timestamp"))
-        execution_iso, execution_unix = _serialize_live_timestamp(row.get("execution_timestamp"))
-        source = str(row.get("source") or signal_metadata.get("source") or "internal").lower()
-        status = _signal_status_from_row(row)
-        waiting_seconds = (
-            _waiting_countdown(signal_metadata, signal_unix)
-            if status == "Waiting"
-            else None
-        )
-        if status == "Waiting" and waiting_seconds is not None and waiting_seconds <= 0:
-            status = "Pending"
-        raw_message = signal_metadata.get("discord_content")
-        signals.append(
-            {
-                "signal_id": str(row.get("signal_id") or ""),
-                "deployment_id": str(row.get("deployment_id") or ""),
-                "symbol": str(row.get("symbol") or ""),
-                "action": str(row.get("action") or ""),
-                "status": status,
-                "source": source,
-                "execution_id": (
-                    str(row.get("execution_id") or "")
-                    if row.get("execution_id") is not None
-                    else None
-                ),
-                "signal_timestamp": signal_iso,
-                "signal_time": signal_unix,
-                "execution_timestamp": execution_iso,
-                "execution_time": execution_unix,
-                "theoretical_price": _safe_float(row.get("theoretical_price"), 0.0),
-                "actual_price": (
-                    _safe_float(row.get("actual_price"))
-                    if row.get("actual_price") is not None
-                    else None
-                ),
-                "filled_qty": (
-                    _safe_float(row.get("filled_qty"))
-                    if row.get("filled_qty") is not None
-                    else None
-                ),
-                "commission": (
-                    _safe_float(row.get("commission"))
-                    if row.get("commission") is not None
-                    else None
-                ),
-                "broker_order_id": (
-                    str(row.get("broker_order_id") or "")
-                    if row.get("broker_order_id") is not None
-                    else None
-                ),
-                "signal_metadata": signal_metadata,
-                "raw_message": str(raw_message).strip() if raw_message else None,
-                "waiting_for_candle_close": bool(
-                    signal_metadata.get("wait_for_candle_close")
-                    or signal_metadata.get("wait_candle_close")
-                ),
-                "waiting_countdown_seconds": waiting_seconds,
-            }
-        )
-
-    return {
-        "account_id": account_id,
-        "deployment_ids": deployment_ids,
-        "signals": signals,
-    }
+    return await _live_signals_payload(account_id, limit=limit)
 
 
 @app.get("/api/live/stats/{account_id}", response_model=dict[str, Any])
@@ -7591,38 +7919,7 @@ async def get_live_positions(account_id: str) -> dict[str, Any]:
         "/api/live/positions/{account_id}",
         account_id=account_id,
     )
-    account = await asyncio.to_thread(get_live_account, account_id)
-    if account is None:
-        raise HTTPException(status_code=404, detail="Live account not found")
-    if account.broker != "alpaca":
-        raise HTTPException(status_code=400, detail="Live positions endpoint currently supports only Alpaca accounts")
-
-    credentials = resolve_alpaca_credentials(
-        account_id=account.id,
-        broker_login=account.broker_login,
-    )
-    if credentials is None:
-        raise HTTPException(status_code=400, detail="Missing Alpaca credentials for account")
-    api_key, secret_key, paper = credentials
-
-    adapter = AlpacaLiveAdapter(
-        api_key=api_key,
-        secret_key=secret_key,
-        paper=paper,
-        account_id=account.id,
-    )
-    rows = await adapter.get_positions()
-    positions = [
-        {
-            "symbol": str(row.get("symbol") or ""),
-            "qty": _safe_float(row.get("qty"), 0.0),
-            "entry_price": _safe_float(row.get("entry_price"), 0.0),
-            "current_price": _safe_float(row.get("current_price"), 0.0),
-            "unrealized_pnl": _safe_float(row.get("unrealized_pnl"), 0.0),
-        }
-        for row in rows
-    ]
-    return {"account_id": account_id, "positions": positions}
+    return await _live_positions_payload(account_id)
 
 
 @app.get("/api/data/overview", response_model=dict[str, Any])
@@ -8421,6 +8718,46 @@ async def get_benchmark(
         equity.append(BenchmarkPoint(time=float(unix_ts), equity=round(float(row["close"]) * shares, 2)))
 
     return BenchmarkResponse(symbol=symbol, timeframe=timeframe, equity=equity)
+
+
+@app.websocket("/ws/live/accounts")
+async def live_accounts_socket(websocket: WebSocket) -> None:
+    await _stream_live_payload(
+        websocket,
+        topic="live.accounts",
+        fetch_payload=lambda: asyncio.to_thread(_live_accounts_stream_payload),
+        poll_seconds=_LIVE_WS_ACCOUNTS_POLL_SECONDS,
+    )
+
+
+@app.websocket("/ws/live/{account_id}/positions")
+async def live_positions_socket(websocket: WebSocket, account_id: str) -> None:
+    await _stream_live_payload(
+        websocket,
+        topic=f"live.positions.{account_id}",
+        fetch_payload=lambda: _live_positions_payload(account_id),
+        poll_seconds=_LIVE_WS_POSITIONS_POLL_SECONDS,
+    )
+
+
+@app.websocket("/ws/live/{account_id}/signals")
+async def live_signals_socket(websocket: WebSocket, account_id: str) -> None:
+    await _stream_live_payload(
+        websocket,
+        topic=f"live.signals.{account_id}",
+        fetch_payload=lambda: _live_signals_payload(account_id, limit=200),
+        poll_seconds=_LIVE_WS_SIGNALS_POLL_SECONDS,
+    )
+
+
+@app.websocket("/ws/live/{account_id}/executions")
+async def live_executions_socket(websocket: WebSocket, account_id: str) -> None:
+    await _stream_live_payload(
+        websocket,
+        topic=f"live.executions.{account_id}",
+        fetch_payload=lambda: _live_trades_payload(account_id),
+        poll_seconds=_LIVE_WS_EXECUTIONS_POLL_SECONDS,
+    )
 
 
 @app.websocket("/ws/tasks/{job_id}")

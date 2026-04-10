@@ -224,8 +224,10 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 "alpaca-py is required for AlpacaLiveAdapter. Install package 'alpaca-py'."
             ) from exc
 
-        balance, _ = await self.get_balance()
-        sized_order = size_live_signal(signal, account_balance=balance)
+        # Use equity (not cash) for risk sizing so margin accounts with negative cash
+        # still pass sizing validation when total account value is positive.
+        _, equity = await self.get_balance()
+        sized_order = size_live_signal(signal, account_balance=equity)
         qty = max(_to_float(signal.metadata.get("qty"), default=0.0), 0.0)
         if qty <= 0:
             raise ValueError(

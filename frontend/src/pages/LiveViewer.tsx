@@ -1,4 +1,5 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useParams } from "react-router-dom";
 import { ArrowLeft, Radio } from "lucide-react";
 import {
@@ -21,6 +22,11 @@ import type {
 
 import { getLiveAccounts, getLiveDeployments, getLiveTrades } from "../api/client";
 import { useLivePositions, useLiveQuotes, useLiveSignalLog } from "../api/queries";
+import {
+  useLiveExecutionsStream,
+  useLivePositionsStream,
+  useLiveSignalsStream,
+} from "../hooks/liveStreams";
 import type {
   LiveAccount,
   LiveDeploymentConfig,
@@ -61,13 +67,17 @@ type TradeMarker = {
   text: string;
 };
 
-const LIVE_VIEWER_POLL_MS = 5_000;
+const LIVE_VIEWER_FALLBACK_POLL_MS = 30_000;
 const DEFAULT_BARS_LIMIT = 500;
 
 export function LiveViewerPage() {
   const { accountId: rawAccountId } = useParams<{ accountId: string }>();
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   const accountId = decodeURIComponent(rawAccountId ?? "");
+  const positionsStream = useLivePositionsStream(accountId);
+  const signalsStream = useLiveSignalsStream(accountId);
+  const executionsStream = useLiveExecutionsStream(accountId);
 
   const [account, setAccount] = useState<LiveAccount | null>(null);
   const [deployments, setDeployments] = useState<LiveDeploymentConfig[]>([]);
@@ -97,9 +107,7 @@ export function LiveViewerPage() {
         const accountDeployments = deploymentsPayload.filter(
           (deployment) => deployment.account_id === accountId,
         );
-        const sortedFills = [...tradesPayload.trades].sort(
-          (left, right) => right.execution_time - left.execution_time,
-        );
+        const sortedFills = sortLiveTrades(tradesPayload.trades);
         const symbols = uniqueSymbols(accountDeployments, sortedFills, [], []);
 
         setAccount(foundAccount);
@@ -123,14 +131,59 @@ export function LiveViewerPage() {
     };
 
     void load();
-    const intervalId = window.setInterval(() => {
-      void load();
-    }, LIVE_VIEWER_POLL_MS);
     return () => {
       ignore = true;
-      window.clearInterval(intervalId);
     };
   }, [accountId]);
+
+  useEffect(() => {
+    if (!accountId || !positionsStream.data) {
+      return;
+    }
+    queryClient.setQueryData(["live-positions", accountId], positionsStream.data);
+  }, [accountId, positionsStream.data, queryClient]);
+
+  useEffect(() => {
+    if (!accountId || !signalsStream.data) {
+      return;
+    }
+    queryClient.setQueryData(["live-signal-log", accountId, 200], signalsStream.data);
+  }, [accountId, queryClient, signalsStream.data]);
+
+  useEffect(() => {
+    if (!executionsStream.data) {
+      return;
+    }
+    setFills(sortLiveTrades(executionsStream.data.trades));
+  }, [executionsStream.data]);
+
+  useEffect(() => {
+    if (!accountId || executionsStream.isConnected) {
+      return;
+    }
+    let cancelled = false;
+    const refreshTrades = async () => {
+      try {
+        const payload = await getLiveTrades(accountId);
+        if (cancelled) {
+          return;
+        }
+        setFills(sortLiveTrades(payload.trades));
+      } catch {
+      }
+    };
+    void refreshTrades();
+    const intervalId = window.setInterval(() => {
+      void refreshTrades();
+    }, LIVE_VIEWER_FALLBACK_POLL_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, [accountId, executionsStream.isConnected]);
+
+  const positionsFallbackPolling = Boolean(accountId) && !positionsStream.isConnected;
+  const signalsFallbackPolling = Boolean(accountId) && !signalsStream.isConnected;
 
   const {
     data: quotePayload,
@@ -146,6 +199,8 @@ export function LiveViewerPage() {
   } = useLivePositions(accountId, {
     enabled: Boolean(accountId),
     retry: false,
+    refetchInterval: positionsFallbackPolling ? LIVE_VIEWER_FALLBACK_POLL_MS : false,
+    staleTime: positionsFallbackPolling ? LIVE_VIEWER_FALLBACK_POLL_MS : Number.POSITIVE_INFINITY,
   });
   const {
     data: signalsPayload,
@@ -153,6 +208,8 @@ export function LiveViewerPage() {
   } = useLiveSignalLog(accountId, 200, {
     enabled: Boolean(accountId),
     retry: false,
+    refetchInterval: signalsFallbackPolling ? LIVE_VIEWER_FALLBACK_POLL_MS : false,
+    staleTime: signalsFallbackPolling ? LIVE_VIEWER_FALLBACK_POLL_MS : Number.POSITIVE_INFINITY,
   });
 
   const positions = positionsPayload?.positions ?? [];
@@ -244,6 +301,8 @@ export function LiveViewerPage() {
   const accountName = account?.name?.trim() || accountId;
   const accountBroker = account?.broker ?? "unknown";
   const symbols = uniqueSymbols(deployments, fills, positions, signals);
+  const isRealtimeConnected =
+    positionsStream.isConnected && signalsStream.isConnected && executionsStream.isConnected;
 
   return (
     <div style={{ padding: "20px 24px 26px" }}>
@@ -279,7 +338,8 @@ export function LiveViewerPage() {
                 {accountName}
               </h1>
               <p style={{ margin: "3px 0 0", color: "var(--color-text-muted)", fontSize: "0.84rem" }}>
-                {accountBroker.toUpperCase()} · Live Viewer · Polling {LIVE_VIEWER_POLL_MS / 1000}s
+                {accountBroker.toUpperCase()} · Live Viewer · Realtime via WebSocket{" "}
+                {isRealtimeConnected ? "· connected" : "· fallback polling"}
               </p>
             </div>
           </div>
@@ -859,6 +919,10 @@ const EmptyState = memo(function EmptyState({ label }: { label: string }) {
     </div>
   );
 });
+
+function sortLiveTrades(rows: LiveTradeSlippage[]): LiveTradeSlippage[] {
+  return [...rows].sort((left, right) => right.execution_time - left.execution_time);
+}
 
 function toTradeHistoryRows(rows: LiveTradeSlippage[]): ViewerTrade[] {
   return rows.map((row) => {

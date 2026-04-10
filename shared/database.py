@@ -781,6 +781,24 @@ def list_live_balances(account_id: str) -> list[LiveBalanceRecord]:
     return [row.to_live_balance() for row in rows]
 
 
+def get_latest_live_balance(account_id: str) -> LiveBalanceRecord | None:
+    normalized_account_id = str(account_id or "").strip()
+    if not normalized_account_id:
+        return None
+
+    init_db()
+    with get_session() as session:
+        row = session.exec(
+            select(LiveBalanceModel)
+            .where(LiveBalanceModel.account_id == normalized_account_id)
+            .order_by(LiveBalanceModel.timestamp.desc(), LiveBalanceModel.id.desc())
+            .limit(1)
+        ).first()
+    if row is None:
+        return None
+    return row.to_live_balance()
+
+
 def list_live_signal_executions_for_deployments(
     deployment_ids: list[str],
 ) -> list[dict[str, Any]]:

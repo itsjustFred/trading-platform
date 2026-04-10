@@ -1,4 +1,5 @@
 import { memo, useCallback, useEffect, useMemo, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import { Activity, Pause, Plus, Square, X } from "lucide-react";
 
@@ -18,6 +19,7 @@ import {
 import { Modal } from "../components/Modal";
 import { Sparkline } from "../components/Sparkline";
 import { SymbolInput } from "../components/SymbolInput";
+import { useLiveAccountsStream } from "../hooks/liveStreams";
 import type {
   LiveAccount,
   LiveAccountStats,
@@ -33,7 +35,7 @@ type DeploymentCard = LiveDeploymentConfig & {
   broker: LiveAccount["broker"] | "unknown";
 };
 
-const LIVE_POLL_MS = 30000;
+const LIVE_FALLBACK_POLL_MS = 30_000;
 const DEFAULT_TIMEFRAME = "1h";
 const LIVE_TIMEFRAMES = [
   "tick",
@@ -158,8 +160,10 @@ const LiveDeploymentCard = memo(function LiveDeploymentCard({
 });
 
 export function LiveHubPage() {
+  const queryClient = useQueryClient();
   const navigate = useNavigate();
   const { showToast } = useToast();
+  const accountsStream = useLiveAccountsStream();
   const [accounts, setAccounts] = useState<LiveAccount[]>([]);
   const [cards, setCards] = useState<DeploymentCard[]>([]);
   const [statsByAccount, setStatsByAccount] = useState<Record<string, LiveHubAccountStats>>({});
@@ -290,25 +294,30 @@ export function LiveHubPage() {
   }, [accounts, createForm.account_id]);
 
   useEffect(() => {
-    let active = true;
+    void refreshDeployments(false);
+  }, [refreshDeployments]);
 
-    const load = async () => {
-      await refreshDeployments(false);
-      if (!active) {
-        return;
-      }
-    };
+  useEffect(() => {
+    const payload = accountsStream.data;
+    if (!payload) {
+      return;
+    }
+    queryClient.setQueryData(["live-accounts"], payload.accounts);
+    setAccounts(payload.accounts);
+    void refreshDeployments(true);
+  }, [accountsStream.data, queryClient, refreshDeployments]);
 
-    void load();
+  useEffect(() => {
+    if (accountsStream.isConnected) {
+      return;
+    }
     const intervalId = window.setInterval(() => {
       void refreshDeployments(true);
-    }, LIVE_POLL_MS);
-
+    }, LIVE_FALLBACK_POLL_MS);
     return () => {
-      active = false;
-      if (intervalId) window.clearInterval(intervalId);
+      window.clearInterval(intervalId);
     };
-  }, [refreshDeployments]);
+  }, [accountsStream.isConnected, refreshDeployments]);
 
   const groupedByAccount = useMemo(() => {
     const map = new Map<string, DeploymentCard[]>();
@@ -916,12 +925,12 @@ export function LiveHubPage() {
             <Activity size={18} />
           </div>
           <div>
-            <h1 style={{ fontSize: "1.4rem", margin: 0, fontWeight: 700 }}>Live Hub</h1>
-            <p style={{ margin: "2px 0 0", color: "var(--color-text-muted)", fontSize: "0.86rem" }}>
-              Connected deployments by account. Open a card to inspect equity and slippage.
-            </p>
+              <h1 style={{ fontSize: "1.4rem", margin: 0, fontWeight: 700 }}>Live Hub</h1>
+              <p style={{ margin: "2px 0 0", color: "var(--color-text-muted)", fontSize: "0.86rem" }}>
+                Realtime via WebSocket {accountsStream.isConnected ? "· connected" : "· fallback polling"}.
+              </p>
+            </div>
           </div>
-        </div>
         <button
           type="button"
           onClick={() => {
