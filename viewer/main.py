@@ -17,7 +17,7 @@ from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Literal
 
 import numpy as np
 import pandas as pd
@@ -64,6 +64,9 @@ from shared.logging import get_logger
 from shared.models import (
     BacktestResult,
     EquityPoint,
+    Service,
+    ServiceStatus,
+    ServiceType,
     Portfolio as PortfolioModel,
     PortfolioComponent as PortfolioComponentModel,
 )
@@ -77,6 +80,7 @@ from shared.database import (
     ensure_live_account,
     get_background_task_record,
     get_live_account,
+    get_service,
     get_latest_live_balance,
     init_db,
     list_backtest_ids,
@@ -88,6 +92,7 @@ from shared.database import (
     list_live_balances,
     list_live_deployments,
     list_live_deployments_for_account,
+    list_services,
     list_live_signals_for_replay,
     list_live_signals_for_deployments,
     list_live_signal_executions_for_deployments,
@@ -102,7 +107,10 @@ from shared.database import (
     save_result_to_sqlite,
     save_portfolio as save_portfolio_record,
     upsert_background_task_record,
+    create_service,
+    delete_service,
     update_live_deployment_status,
+    update_service_status,
 )
 from runner.engines.signal_replay_adapter import ReplaySignal, SignalReplayAdapter
 from risk.config import RiskConfig
@@ -111,7 +119,11 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - optional dependency for account discovery
     async def discover_configured_accounts() -> list[dict[str, Any]]:
         return []
-from shared.models import LiveDeploymentConfig, LiveDeploymentCreateRequest, LiveDeploymentStatusUpdateRequest
+from shared.models import (
+    LiveDeploymentConfig,
+    LiveDeploymentCreateRequest,
+    LiveDeploymentStatusUpdateRequest,
+)
 from runner.capm import align_return_series, calculate_capm
 from shared.strategy_registry import (
     DEFAULT_STRATEGIES_DIR,
@@ -607,6 +619,17 @@ class CapmResponse(SQLModel):
 
 class NameUpdateRequest(SQLModel):
     name: str
+
+
+class ServiceCreateRequest(SQLModel):
+    name: str
+    type: Literal["discord_bot", "scheduled_job"]
+    status: Literal["running", "paused", "failed", "stopped"] = "stopped"
+    config: dict[str, Any] = {}
+
+
+class ServiceStatusUpdateRequest(SQLModel):
+    status: Literal["running", "paused", "failed", "stopped"]
 
 
 class BacktestRunRequest(SQLModel):
@@ -2739,9 +2762,24 @@ def _serialize_live_deployment_payload(deployment: LiveDeploymentConfig) -> dict
         "symbols": deployment.symbols,
         "timeframe": deployment.timeframe,
         "status": deployment.status,
+        "signal_source_type": deployment.signal_source_type,
+        "signal_source_id": deployment.signal_source_id,
+        "symbol_filter": deployment.symbol_filter,
         "signal_source": deployment.signal_source,
         "signal_config": deployment.signal_config,
         "settings": deployment.settings,
+    }
+
+
+def _serialize_service_payload(service: Service) -> dict[str, Any]:
+    return {
+        "id": str(service.id),
+        "name": service.name,
+        "type": service.type.value,
+        "status": service.status.value,
+        "config": service.config or {},
+        "last_activity": service.last_activity.isoformat() if service.last_activity else None,
+        "created_at": service.created_at.isoformat(),
     }
 
 
@@ -2905,7 +2943,7 @@ def _signal_status_from_row(row: dict[str, Any]) -> str:
         signal_metadata.get("wait_for_candle_close")
         or signal_metadata.get("wait_candle_close")
     )
-    if source == "discord" and wait_enabled:
+    if source.startswith("discord") and wait_enabled:
         return "Waiting"
     return "Pending"
 
@@ -7670,7 +7708,8 @@ async def _live_signals_payload(account_id: str, *, limit: int = 200) -> dict[st
         signal_metadata = metadata if isinstance(metadata, dict) else {}
         signal_iso, signal_unix = _serialize_live_timestamp(row.get("signal_timestamp"))
         execution_iso, execution_unix = _serialize_live_timestamp(row.get("execution_timestamp"))
-        source = str(row.get("source") or signal_metadata.get("source") or "internal").lower()
+        raw_source = str(row.get("source") or signal_metadata.get("source") or "internal").lower()
+        source = "discord" if raw_source.startswith("discord") else "internal"
         status = _signal_status_from_row(row)
         waiting_seconds = (
             _waiting_countdown(signal_metadata, signal_unix)
@@ -7779,6 +7818,102 @@ async def get_live_accounts() -> list[dict[str, Any]]:
     return await asyncio.to_thread(_cached_live_accounts_payload)
 
 
+@app.get("/api/services", response_model=list[dict[str, Any]])
+async def get_services_endpoint(
+    type: str | None = Query(default=None),  # noqa: A002 - follows API contract
+) -> list[dict[str, Any]]:
+    normalized_type = str(type or "").strip().lower()
+    selected_type: ServiceType | None = None
+    if normalized_type:
+        if normalized_type not in {ServiceType.DISCORD_BOT.value, ServiceType.SCHEDULED_JOB.value}:
+            raise HTTPException(status_code=400, detail="type must be 'discord_bot' or 'scheduled_job'")
+        selected_type = ServiceType(normalized_type)
+    services = await asyncio.to_thread(list_services, service_type=selected_type)
+    return [_serialize_service_payload(service) for service in services]
+
+
+@app.post("/api/services", response_model=dict[str, Any], status_code=201)
+async def create_service_endpoint(payload: ServiceCreateRequest) -> dict[str, Any]:
+    try:
+        service = Service(
+            name=str(payload.name or "").strip(),
+            type=ServiceType(payload.type),
+            status=ServiceStatus(payload.status),
+            config=dict(payload.config or {}),
+            created_at=datetime.now(timezone.utc),
+        )
+        created = await asyncio.to_thread(create_service, service)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _serialize_service_payload(created)
+
+
+@app.get("/api/services/{service_id}", response_model=dict[str, Any])
+async def get_service_endpoint(service_id: str) -> dict[str, Any]:
+    service = await asyncio.to_thread(get_service, service_id)
+    if service is None:
+        raise HTTPException(status_code=404, detail="Service not found")
+    return _serialize_service_payload(service)
+
+
+@app.put("/api/services/{service_id}/status", response_model=dict[str, Any])
+async def update_service_status_endpoint(
+    service_id: str,
+    payload: ServiceStatusUpdateRequest,
+) -> dict[str, Any]:
+    try:
+        updated = await asyncio.to_thread(update_service_status, service_id, payload.status)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Service not found")
+    return _serialize_service_payload(updated)
+
+
+@app.delete("/api/services/{service_id}", response_model=dict[str, Any])
+async def delete_service_endpoint(service_id: str) -> dict[str, Any]:
+    deleted = await asyncio.to_thread(delete_service, service_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Service not found")
+    return {"status": "deleted", "id": service_id}
+
+
+@app.get("/api/services/{service_id}/logs", response_model=LogContentModel)
+async def get_service_logs_endpoint(
+    service_id: str,
+    lines: int = Query(default=200, ge=1, le=100000),
+    level: str = Query(default=""),
+    search: str = Query(default=""),
+) -> LogContentModel:
+    service = await asyncio.to_thread(get_service, service_id)
+    if service is None:
+        raise HTTPException(status_code=404, detail="Service not found")
+    try:
+        entries = legacy_viewer._collect_log_entries(legacy_viewer._available_log_files())
+        level_filter = legacy_viewer._normalize_log_levels(level)
+        if level_filter:
+            entries = [entry for entry in entries if entry.get("level") in level_filter]
+        service_terms = {str(service.id).lower(), str(service.name).strip().lower()}
+        entries = [
+            entry
+            for entry in entries
+            if any(term and term in str(entry.get("line") or "").lower() for term in service_terms)
+        ]
+        if search:
+            query_lower = search.lower()
+            entries = [entry for entry in entries if query_lower in entry["line"].lower()]
+        total_lines = len(entries)
+        recent_entries = entries[-lines:] if len(entries) > lines else entries
+        return LogContentModel(
+            name=f"service:{service.name}",
+            lines=[entry["line"] for entry in recent_entries],
+            total_lines=total_lines,
+        )
+    except Exception as exc:
+        logger.exception("Failed to load service logs for %s: %s", service_id, exc)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @app.get("/api/live/deployments", response_model=list[dict[str, Any]])
 async def get_live_deployments() -> list[dict[str, Any]]:
     _log_live_endpoint_request("/api/live/deployments")
@@ -7790,25 +7925,99 @@ async def get_live_deployments() -> list[dict[str, Any]]:
 async def create_live_deployment_endpoint(
     payload: LiveDeploymentCreateRequest,
 ) -> dict[str, Any]:
+    signal_source_type = str(
+        payload.signal_source_type or payload.signal_source or "internal"
+    ).strip().lower()
     _log_live_endpoint_request(
         "/api/live/deployments",
         strategy_name=payload.strategy_name,
         account_id=payload.account_id,
         symbols=payload.symbols,
         timeframe=payload.timeframe,
+        signal_source_type=signal_source_type,
+        signal_source_id=payload.signal_source_id,
+        symbol_filter=payload.symbol_filter,
     )
+    if signal_source_type not in {"internal", "discord"}:
+        raise HTTPException(status_code=400, detail="signal_source_type must be 'discord' or 'internal'")
+
     account_payload = await asyncio.to_thread(_ensure_live_account_for_deployment, payload.account_id)
     inferred_broker = str(account_payload.get("broker", "")).strip().lower()
     if inferred_broker not in {"alpaca", "ctrader"}:
         raise HTTPException(status_code=400, detail="Unknown broker for account")
+
+    strategy_name = str(payload.strategy_name or "").strip()
+    symbols = [
+        str(symbol).strip().upper()
+        for symbol in (payload.symbols or [])
+        if str(symbol).strip()
+    ]
+    symbol_filter = [
+        str(symbol).strip().upper()
+        for symbol in (payload.symbol_filter or [])
+        if str(symbol).strip()
+    ]
+    signal_source_id = str(payload.signal_source_id or "").strip()
+    signal_config_payload = dict(payload.signal_config or {})
+
+    if signal_source_type == "internal":
+        if not strategy_name:
+            raise HTTPException(status_code=400, detail="strategy_name is required for internal signal source")
+        if not symbols:
+            raise HTTPException(status_code=400, detail="At least one symbol is required")
+        signal_source_id = ""
+        symbol_filter = []
+    else:
+        matched_service: Service | None = None
+        if signal_source_id:
+            discord_services = await asyncio.to_thread(
+                list_services,
+                service_type=ServiceType.DISCORD_BOT,
+            )
+            matched_service = next(
+                (
+                    service
+                    for service in discord_services
+                    if str(service.name or "").strip().lower() == signal_source_id.lower()
+                ),
+                None,
+            )
+            if matched_service is None:
+                raise HTTPException(status_code=404, detail="Discord signal source service not found")
+            signal_source_id = matched_service.name
+        elif not str(signal_config_payload.get("channel_id") or "").strip():
+            raise HTTPException(
+                status_code=400,
+                detail="signal_source_id is required for discord signal source",
+            )
+        if not strategy_name:
+            strategy_name = (
+                f"discord::{signal_source_id.lower()}"
+                if signal_source_id
+                else "discord::legacy"
+            )
+        if not symbols and symbol_filter:
+            symbols = list(symbol_filter)
+        if not symbols:
+            symbols = ["*"]
+        if signal_source_id:
+            signal_config_payload.setdefault("service_name", signal_source_id)
+        if matched_service and isinstance(matched_service.config, dict):
+            channel_id = str(matched_service.config.get("channel_id") or "").strip()
+            if channel_id and not str(signal_config_payload.get("channel_id") or "").strip():
+                signal_config_payload["channel_id"] = channel_id
+
     deployment = LiveDeploymentConfig(
-        strategy_name=payload.strategy_name,
+        strategy_name=strategy_name,
         account_id=payload.account_id,
-        symbols=payload.symbols,
+        symbols=symbols,
         timeframe=payload.timeframe,
         status="ACTIVE",
-        signal_source=payload.signal_source,
-        signal_config=payload.signal_config or {},
+        signal_source_type=signal_source_type,
+        signal_source_id=signal_source_id or None,
+        symbol_filter=symbol_filter,
+        signal_source=signal_source_type,
+        signal_config=signal_config_payload,
         settings=payload.settings or {},
     )
     try:

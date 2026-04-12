@@ -7,7 +7,15 @@ from uuid import uuid4
 
 from fastapi.testclient import TestClient
 
-from shared.models import LiveAccount, LiveAccountConfig, LiveBalanceRecord, LiveDeploymentConfig
+from shared.models import (
+    LiveAccount,
+    LiveAccountConfig,
+    LiveBalanceRecord,
+    LiveDeploymentConfig,
+    Service,
+    ServiceStatus,
+    ServiceType,
+)
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -210,13 +218,30 @@ def test_live_deployments_crud_endpoints(monkeypatch):
         "strategy_name": "my_live_strategy",
         "account_id": account_id,
         "symbols": ["AAPL", "MSFT"],
+        "symbol_filter": ["AAPL", "MSFT"],
         "timeframe": "1h",
         "status": "ACTIVE",
+        "signal_source_type": "discord",
+        "signal_source_id": "RAMJET",
         "signal_source": "discord",
         "signal_config": {"channel_id": "123", "wait_candle_close": True},
     }
 
     monkeypatch.setattr(viewer_main_module, "_seed_default_live_accounts", lambda: None)
+    monkeypatch.setattr(
+        viewer_main_module,
+        "list_services",
+        lambda *args, **kwargs: [
+            Service(
+                id="88888888-8888-8888-8888-888888888888",
+                name="RAMJET",
+                type=ServiceType.DISCORD_BOT,
+                status=ServiceStatus.RUNNING,
+                config={"token_env_key": "DISCORD_BOT_RAMJET_TOKEN", "channel_id": "123"},
+                created_at=datetime.now(timezone.utc),
+            )
+        ],
+    )
     monkeypatch.setattr(
         viewer_main_module,
         "_ensure_live_account_for_deployment",
@@ -236,6 +261,9 @@ def test_live_deployments_crud_endpoints(monkeypatch):
             symbols=deployment.symbols,
             timeframe=deployment.timeframe,
             status="ACTIVE",
+            signal_source_type=deployment.signal_source_type,
+            signal_source_id=deployment.signal_source_id,
+            symbol_filter=deployment.symbol_filter,
             signal_source=deployment.signal_source,
             signal_config=deployment.signal_config,
             settings=deployment.settings,
@@ -251,6 +279,9 @@ def test_live_deployments_crud_endpoints(monkeypatch):
             symbols=created_deployment["symbols"],
             timeframe=created_deployment["timeframe"],
             status=_status,
+            signal_source_type=created_deployment["signal_source_type"],
+            signal_source_id=created_deployment["signal_source_id"],
+            symbol_filter=created_deployment["symbol_filter"],
             signal_source=created_deployment["signal_source"],
             signal_config=created_deployment["signal_config"],
         ),
@@ -266,6 +297,9 @@ def test_live_deployments_crud_endpoints(monkeypatch):
             "account_id": account_id,
             "symbols": ["AAPL", "MSFT"],
             "timeframe": "1h",
+            "signal_source_type": "discord",
+            "signal_source_id": "RAMJET",
+            "symbol_filter": ["AAPL", "MSFT"],
             "signal_source": "discord",
             "signal_config": {"channel_id": "123", "wait_candle_close": True},
             "settings": {"risk_per_trade_pct": 0.01},
@@ -275,6 +309,9 @@ def test_live_deployments_crud_endpoints(monkeypatch):
     created = create_resp.json()
     assert created["id"] == deployment_id
     assert created["status"] == "ACTIVE"
+    assert created["signal_source_type"] == "discord"
+    assert created["signal_source_id"] == "RAMJET"
+    assert created["symbol_filter"] == ["AAPL", "MSFT"]
     assert created["signal_source"] == "discord"
     assert created["signal_config"]["channel_id"] == "123"
     assert created["settings"]["risk_per_trade_pct"] == 0.01
@@ -304,6 +341,115 @@ def test_live_deployments_returns_empty_array(monkeypatch):
     response = client.get("/api/live/deployments")
     assert response.status_code == 200
     assert response.json() == []
+
+
+def test_services_crud_and_logs_endpoints(monkeypatch):
+    import viewer.main as viewer_main_module
+
+    service_id = "77777777-7777-7777-7777-777777777777"
+    services: dict[str, Service] = {}
+
+    def _list_services(*, service_type=None):
+        payload = list(services.values())
+        if service_type is None:
+            return payload
+        return [service for service in payload if service.type == service_type]
+
+    def _create_service(service: Service):
+        created = service.model_copy(update={"id": service_id})
+        services[service_id] = created
+        return created
+
+    def _get_service(value: str):
+        return services.get(value)
+
+    def _update_service_status(value: str, status, *, last_activity=None):
+        existing = services.get(value)
+        if existing is None:
+            return None
+        updated = existing.model_copy(
+            update={
+                "status": ServiceStatus(status),
+                "last_activity": last_activity or existing.last_activity,
+            }
+        )
+        services[value] = updated
+        return updated
+
+    def _delete_service(value: str):
+        return services.pop(value, None) is not None
+
+    monkeypatch.setattr(viewer_main_module, "list_services", _list_services)
+    monkeypatch.setattr(viewer_main_module, "create_service", _create_service)
+    monkeypatch.setattr(viewer_main_module, "get_service", _get_service)
+    monkeypatch.setattr(viewer_main_module, "update_service_status", _update_service_status)
+    monkeypatch.setattr(viewer_main_module, "delete_service", _delete_service)
+    monkeypatch.setattr(viewer_main_module.legacy_viewer, "_available_log_files", lambda: [])
+    monkeypatch.setattr(
+        viewer_main_module.legacy_viewer,
+        "_collect_log_entries",
+        lambda _paths: [
+            {
+                "line": "Started Discord bot RAMJET",
+                "level": "info",
+                "path": "live-runner.log",
+                "line_number": 1,
+                "timestamp": datetime(2026, 1, 1, tzinfo=timezone.utc),
+            },
+            {
+                "line": "Discovered 3 Discord bots: RAMJET, ROCKETFUEL, NITRO",
+                "level": "info",
+                "path": "live-runner.log",
+                "line_number": 2,
+                "timestamp": datetime(2026, 1, 1, tzinfo=timezone.utc),
+            },
+        ],
+    )
+
+    client = TestClient(viewer_main_module.app)
+
+    create_response = client.post(
+        "/api/services",
+        json={
+            "name": "RAMJET",
+            "type": "discord_bot",
+            "status": "running",
+            "config": {"token_env_key": "DISCORD_BOT_RAMJET_TOKEN", "channel_id": "123"},
+        },
+    )
+    assert create_response.status_code == 201
+    created = create_response.json()
+    assert created["id"] == service_id
+    assert created["name"] == "RAMJET"
+    assert created["type"] == "discord_bot"
+    assert created["status"] == "running"
+
+    list_response = client.get("/api/services")
+    assert list_response.status_code == 200
+    listed = list_response.json()
+    assert len(listed) == 1
+    assert listed[0]["name"] == "RAMJET"
+
+    detail_response = client.get(f"/api/services/{service_id}")
+    assert detail_response.status_code == 200
+    assert detail_response.json()["id"] == service_id
+
+    status_response = client.put(
+        f"/api/services/{service_id}/status",
+        json={"status": "paused"},
+    )
+    assert status_response.status_code == 200
+    assert status_response.json()["status"] == "paused"
+
+    logs_response = client.get(f"/api/services/{service_id}/logs")
+    assert logs_response.status_code == 200
+    logs_payload = logs_response.json()
+    assert logs_payload["name"] == "service:RAMJET"
+    assert logs_payload["total_lines"] >= 1
+
+    delete_response = client.delete(f"/api/services/{service_id}")
+    assert delete_response.status_code == 200
+    assert delete_response.json()["status"] == "deleted"
 
 
 def test_live_stats_endpoint_returns_defaults_for_missing_data(monkeypatch):

@@ -56,6 +56,9 @@ const OptimizationResultsPage = lazy(() =>
 const LiveHubPage = lazy(() =>
   import("./pages/LiveHub").then((mod) => ({ default: mod.LiveHubPage })),
 );
+const ServicesPage = lazy(() =>
+  import("./pages/Services").then((mod) => ({ default: mod.ServicesPage })),
+);
 const LiveDetailPage = lazy(() =>
   import("./pages/LiveDetail").then((mod) => ({ default: mod.LiveDetailPage })),
 );
@@ -101,6 +104,7 @@ export default function App() {
               element={<OptimizationResultsPage />}
             />
             <Route path="/live" element={<LiveHubPage />} />
+            <Route path="/services" element={<ServicesPage />} />
             <Route path="/live/:accountId" element={<LiveDetailPage />} />
             <Route path="/live/:accountId/viewer" element={<LiveViewerPage />} />
             <Route path="/strategies" element={<StrategiesPage />} />

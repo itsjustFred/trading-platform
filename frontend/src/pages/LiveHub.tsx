@@ -12,6 +12,7 @@ import {
   getLivePositions,
   getLiveStats,
   getLiveTrades,
+  getServices,
   getStrategies,
   runBacktestSignals,
   updateLiveDeploymentStatus,
@@ -27,6 +28,7 @@ import type {
   LiveDeploymentConfig,
   LiveDeploymentStatus,
   LiveTradeSlippage,
+  Service,
   StrategyMeta,
 } from "../api/types";
 import { useToast } from "../components/ToastProvider";
@@ -58,8 +60,7 @@ type CreateDeploymentForm = {
   symbols_input: string;
   timeframe: string;
   signal_source: "internal" | "discord";
-  signal_channel_id: string;
-  wait_for_candle_close: boolean;
+  signal_source_id: string;
   settings_json: string;
 };
 
@@ -114,7 +115,17 @@ const LiveDeploymentCard = memo(function LiveDeploymentCard({
         {card.timeframe} · {card.symbols.join(", ")}
       </div>
       <div style={{ color: "var(--color-text-muted)", fontSize: "0.76rem", marginBottom: "8px" }}>
-        Source: {card.signal_source === "discord" ? "Discord Signals" : "Internal Strategy"}
+        Source: {card.signal_source === "discord" ? "Discord Bot" : "Internal Strategy"}
+        {card.signal_source === "discord"
+          ? ` · ${
+              String(
+                card.signal_source_id ||
+                  card.signal_config?.["service_name"] ||
+                  card.signal_config?.["channel_id"] ||
+                  "—",
+              ) || "—"
+            }`
+          : ""}
         {(() => {
           if (card.signal_source !== "discord" || !card.signal_config) {
             return "";
@@ -178,14 +189,15 @@ export function LiveHubPage() {
   const [isCreating, setIsCreating] = useState(false);
   const [isStartingReplay, setIsStartingReplay] = useState(false);
   const [strategiesLoading, setStrategiesLoading] = useState(false);
+  const [servicesLoading, setServicesLoading] = useState(false);
+  const [discordServices, setDiscordServices] = useState<Service[]>([]);
   const [createForm, setCreateForm] = useState<CreateDeploymentForm>({
     strategy_name: "",
     account_id: "",
     symbols_input: "",
     timeframe: DEFAULT_TIMEFRAME,
     signal_source: "internal",
-    signal_channel_id: "",
-    wait_for_candle_close: true,
+    signal_source_id: "",
     settings_json: "{}",
   });
   const [replayForm, setReplayForm] = useState<ReplayFormState>({
@@ -286,12 +298,38 @@ export function LiveHubPage() {
     }
   }, [showToast, strategiesLoading]);
 
+  const refreshDiscordServices = useCallback(async () => {
+    if (servicesLoading) {
+      return;
+    }
+    setServicesLoading(true);
+    try {
+      const payload = await getServices("discord_bot");
+      setDiscordServices(payload);
+    } catch {
+      setDiscordServices([]);
+      showToast("Could not load Discord bot services.", "warning");
+    } finally {
+      setServicesLoading(false);
+    }
+  }, [servicesLoading, showToast]);
+
   useEffect(() => {
     if (accounts.length === 0 || createForm.account_id) {
       return;
     }
     setCreateForm((current) => ({ ...current, account_id: accounts[0].id }));
   }, [accounts, createForm.account_id]);
+
+  useEffect(() => {
+    if (createForm.signal_source !== "discord" || createForm.signal_source_id) {
+      return;
+    }
+    if (discordServices.length === 0) {
+      return;
+    }
+    setCreateForm((current) => ({ ...current, signal_source_id: discordServices[0].name }));
+  }, [createForm.signal_source, createForm.signal_source_id, discordServices]);
 
   useEffect(() => {
     void refreshDeployments(false);
@@ -399,12 +437,19 @@ export function LiveHubPage() {
     const strategyName = createForm.strategy_name.trim();
     const timeframe = createForm.timeframe.trim() || DEFAULT_TIMEFRAME;
     const accountId = createForm.account_id.trim();
-    const symbols = createForm.symbols_input
+    const symbolFilter = createForm.symbols_input
       .split(",")
-      .map((item) => item.trim())
+      .map((item) => item.trim().toUpperCase())
       .filter(Boolean);
+    const sourceId = createForm.signal_source_id.trim();
+    const symbols =
+      symbolFilter.length > 0
+        ? symbolFilter
+        : createForm.signal_source === "discord"
+          ? ["*"]
+          : [];
 
-    if (!strategyName) {
+    if (createForm.signal_source === "internal" && !strategyName) {
       showToast("Please enter a strategy name.", "warning");
       return;
     }
@@ -412,8 +457,12 @@ export function LiveHubPage() {
       showToast("Please choose an account.", "warning");
       return;
     }
-    if (symbols.length === 0) {
+    if (createForm.signal_source === "internal" && symbols.length === 0) {
       showToast("Please provide at least one symbol.", "warning");
+      return;
+    }
+    if (createForm.signal_source === "discord" && !sourceId) {
+      showToast("Please select a Discord bot service.", "warning");
       return;
     }
 
@@ -436,25 +485,19 @@ export function LiveHubPage() {
 
     setIsCreating(true);
     try {
-      const signalConfig: Record<string, unknown> =
-        createForm.signal_source === "discord"
-          ? {
-              channel_id: createForm.signal_channel_id.trim(),
-              wait_candle_close: createForm.wait_for_candle_close,
-            }
-          : {};
-      if (createForm.signal_source === "discord" && !String(signalConfig.channel_id || "")) {
-        showToast("Please provide a Discord channel ID.", "warning");
-        return;
-      }
-
       await createLiveDeployment({
         strategy_name: strategyName,
         account_id: accountId,
         symbols,
         timeframe,
+        signal_source_type: createForm.signal_source,
+        signal_source_id: createForm.signal_source === "discord" ? sourceId : undefined,
+        symbol_filter: symbolFilter,
         signal_source: createForm.signal_source,
-        signal_config: signalConfig,
+        signal_config:
+          createForm.signal_source === "discord"
+            ? { service_name: sourceId }
+            : {},
         settings: settingsPayload,
       });
       setCreateOpenAccountId("");
@@ -464,12 +507,14 @@ export function LiveHubPage() {
         symbols_input: "",
         timeframe: DEFAULT_TIMEFRAME,
         signal_source: "internal",
-        signal_channel_id: "",
-        wait_for_candle_close: true,
+        signal_source_id: "",
         settings_json: "{}",
       }));
       await refreshDeployments(true);
-      showToast(`Created deployment for ${strategyName}.`, "success");
+      showToast(
+        `Created deployment for ${createForm.signal_source === "discord" ? sourceId : strategyName}.`,
+        "success",
+      );
     } catch (issue: unknown) {
       const message =
         issue instanceof Error ? issue.message : "Failed to create deployment";
@@ -487,12 +532,12 @@ export function LiveHubPage() {
       symbols_input: "",
       timeframe: DEFAULT_TIMEFRAME,
       signal_source: "internal",
-      signal_channel_id: "",
-      wait_for_candle_close: true,
+      signal_source_id: "",
       settings_json: "{}",
     });
     setCreateOpenAccountId(account?.id ?? accountId);
     void refreshStrategies();
+    void refreshDiscordServices();
   };
 
   const openReplayModal = (accountId: string) => {
@@ -620,7 +665,8 @@ export function LiveHubPage() {
                 }))
               }
               style={fieldInputStyle}
-              required
+              required={createForm.signal_source === "internal"}
+              disabled={createForm.signal_source === "discord"}
             >
               <option value="">
                 {strategiesLoading ? "Loading strategies..." : "Select strategy"}
@@ -632,6 +678,76 @@ export function LiveHubPage() {
               ))}
             </select>
           </label>
+
+          <div style={fieldLabelStyle}>
+            Signal Source
+            <div
+              style={{
+                border: "1px solid var(--color-border)",
+                borderRadius: "8px",
+                padding: "10px",
+                display: "grid",
+                gap: "10px",
+                background: "var(--color-surface2)",
+              }}
+            >
+              <label style={{ display: "flex", alignItems: "center", gap: "8px", cursor: "pointer" }}>
+                <input
+                  type="radio"
+                  name="signal_source"
+                  checked={createForm.signal_source === "discord"}
+                  onChange={() =>
+                    setCreateForm((current) => ({
+                      ...current,
+                      signal_source: "discord",
+                      signal_source_id: current.signal_source_id || discordServices[0]?.name || "",
+                    }))
+                  }
+                />
+                Discord Bot
+              </label>
+              <label style={{ display: "flex", alignItems: "center", gap: "8px", cursor: "pointer" }}>
+                <input
+                  type="radio"
+                  name="signal_source"
+                  checked={createForm.signal_source === "internal"}
+                  onChange={() =>
+                    setCreateForm((current) => ({
+                      ...current,
+                      signal_source: "internal",
+                    }))
+                  }
+                />
+                Internal Strategy
+              </label>
+            </div>
+          </div>
+
+          {createForm.signal_source === "discord" ? (
+            <label style={fieldLabelStyle}>
+              Discord Bot
+              <select
+                value={createForm.signal_source_id}
+                onChange={(event) =>
+                  setCreateForm((current) => ({
+                    ...current,
+                    signal_source_id: event.target.value,
+                  }))
+                }
+                style={fieldInputStyle}
+                required
+              >
+                <option value="">
+                  {servicesLoading ? "Loading Discord bots..." : "Select Discord bot"}
+                </option>
+                {discordServices.map((service) => (
+                  <option key={service.id} value={service.name}>
+                    {service.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+          ) : null}
 
           <label style={fieldLabelStyle}>
             Timeframe
@@ -655,68 +771,7 @@ export function LiveHubPage() {
           </label>
 
           <label style={fieldLabelStyle}>
-            Signal Source
-            <select
-              value={createForm.signal_source}
-              onChange={(event) =>
-                setCreateForm((current) => ({
-                  ...current,
-                  signal_source: event.target.value as "internal" | "discord",
-                }))
-              }
-              style={fieldInputStyle}
-              required
-            >
-              <option value="internal">Internal Strategy</option>
-              <option value="discord">Discord Signals</option>
-            </select>
-          </label>
-
-          {createForm.signal_source === "discord" ? (
-            <>
-              <label style={fieldLabelStyle}>
-                Discord Channel ID
-                <input
-                  type="text"
-                  value={createForm.signal_channel_id}
-                  onChange={(event) =>
-                    setCreateForm((current) => ({
-                      ...current,
-                      signal_channel_id: event.target.value,
-                    }))
-                  }
-                  style={fieldInputStyle}
-                  placeholder="1234567890123456789"
-                  required
-                />
-              </label>
-
-              <label
-                style={{
-                  ...fieldLabelStyle,
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "space-between",
-                  gap: "12px",
-                }}
-              >
-                Wait for Candle Close
-                <input
-                  type="checkbox"
-                  checked={createForm.wait_for_candle_close}
-                  onChange={(event) =>
-                    setCreateForm((current) => ({
-                      ...current,
-                      wait_for_candle_close: event.target.checked,
-                    }))
-                  }
-                />
-              </label>
-            </>
-          ) : null}
-
-          <label style={fieldLabelStyle}>
-            Assets / Symbols
+            Symbol Filter (optional)
             <SymbolInput
               value={createForm.symbols_input}
               onChange={(value) =>
@@ -725,7 +780,7 @@ export function LiveHubPage() {
                   symbols_input: value,
                 }))
               }
-              placeholder="AAPL, MSFT"
+              placeholder="AAPL, TSLA"
               style={fieldInputStyle}
             />
           </label>

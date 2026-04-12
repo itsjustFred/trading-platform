@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from dotenv import load_dotenv
-from sqlalchemy import JSON, Column, String, delete, event, func, text
+from sqlalchemy import JSON, Column, String, UniqueConstraint, delete, event, func, or_, text
 from sqlalchemy.engine import Connection
 from sqlmodel import Field, Session, SQLModel, create_engine, select
 
@@ -23,6 +23,9 @@ from shared.models import (
     LiveBalanceRecord,
     LiveDeploymentConfig,
     LiveExecution,
+    Service,
+    ServiceStatus,
+    ServiceType,
     Portfolio as PortfolioModel,
     PortfolioComponent as PortfolioComponentModel,
     LiveSignal,
@@ -378,6 +381,62 @@ class LiveAccountModel(SQLModel, table=True):
         )
 
 
+class ServiceModel(SQLModel, table=True):
+    __tablename__ = "services"
+    __table_args__ = (UniqueConstraint("name", "type", name="uq_services_name_type"),)
+
+    id: str = Field(primary_key=True)
+    name: str = Field(index=True)
+    type: str = Field(index=True)
+    status: str = Field(default=ServiceStatus.STOPPED.value, index=True)
+    config_json: dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column("config", JSON, nullable=False),
+    )
+    last_activity: datetime | None = Field(default=None, index=True)
+    created_at: datetime = Field(default_factory=datetime.utcnow, index=True)
+    updated_at: datetime = Field(default_factory=datetime.utcnow, index=True)
+
+    @classmethod
+    def from_service(cls, service: Service) -> "ServiceModel":
+        now = datetime.utcnow()
+        return cls(
+            id=str(service.id),
+            name=str(service.name or "").strip(),
+            type=str(service.type.value if isinstance(service.type, ServiceType) else service.type),
+            status=str(
+                service.status.value
+                if isinstance(service.status, ServiceStatus)
+                else service.status
+            ),
+            config_json=dict(service.config or {}),
+            last_activity=service.last_activity,
+            created_at=service.created_at,
+            updated_at=now,
+        )
+
+    def to_service(self) -> Service:
+        service_type = str(self.type or "").strip().lower()
+        service_status = str(self.status or "").strip().lower()
+        try:
+            parsed_type = ServiceType(service_type)
+        except ValueError:
+            parsed_type = ServiceType.SCHEDULED_JOB
+        try:
+            parsed_status = ServiceStatus(service_status)
+        except ValueError:
+            parsed_status = ServiceStatus.STOPPED
+        return Service(
+            id=self.id,
+            name=self.name,
+            type=parsed_type,
+            status=parsed_status,
+            config=dict(self.config_json or {}),
+            last_activity=self.last_activity,
+            created_at=self.created_at,
+        )
+
+
 class LiveDeploymentModel(SQLModel, table=True):
     __tablename__ = "live_deployments"
 
@@ -391,6 +450,12 @@ class LiveDeploymentModel(SQLModel, table=True):
     timeframe: str = Field(index=True)
     status: str = Field(default="ACTIVE", index=True)
     signal_source: str = Field(default="internal", index=True)
+    signal_source_type: str = Field(default="internal", index=True)
+    signal_source_id: str = Field(default="", index=True)
+    symbol_filter_json: list[str] = Field(
+        default_factory=list,
+        sa_column=Column("symbol_filter", JSON, nullable=False),
+    )
     signal_config_json: dict[str, Any] = Field(
         default_factory=dict,
         sa_column=Column("signal_config", JSON, nullable=False),
@@ -405,6 +470,19 @@ class LiveDeploymentModel(SQLModel, table=True):
     @classmethod
     def from_live_deployment(cls, deployment: LiveDeploymentConfig) -> "LiveDeploymentModel":
         now = datetime.utcnow()
+        source_type = str(deployment.signal_source_type or "").lower()
+        source_name = str(deployment.signal_source or "").lower()
+        if source_type not in {"internal", "discord"}:
+            source_type = source_name if source_name in {"internal", "discord"} else "internal"
+        elif source_type == "internal" and source_name == "discord":
+            source_type = "discord"
+        source_name = source_name if source_name in {"internal", "discord"} else source_type
+        source_id = str(deployment.signal_source_id or "").strip()
+        symbol_filter = [
+            str(symbol).strip().upper()
+            for symbol in (deployment.symbol_filter or [])
+            if str(symbol).strip()
+        ]
         return cls(
             id=str(deployment.id),
             strategy_name=deployment.strategy_name,
@@ -412,7 +490,10 @@ class LiveDeploymentModel(SQLModel, table=True):
             symbols_json=deployment.symbols,
             timeframe=deployment.timeframe,
             status=deployment.status,
-            signal_source=deployment.signal_source,
+            signal_source=source_name,
+            signal_source_type=source_type,
+            signal_source_id=source_id,
+            symbol_filter_json=symbol_filter,
             signal_config_json=deployment.signal_config or {},
             settings_json=deployment.settings or {},
             created_at=now,
@@ -420,6 +501,8 @@ class LiveDeploymentModel(SQLModel, table=True):
         )
 
     def to_live_deployment(self) -> LiveDeploymentConfig:
+        source_type = str(self.signal_source_type or self.signal_source or "internal").lower()
+        source_name = str(self.signal_source or source_type or "internal").lower()
         return LiveDeploymentConfig(
             id=self.id,
             strategy_name=self.strategy_name,
@@ -427,7 +510,14 @@ class LiveDeploymentModel(SQLModel, table=True):
             symbols=self.symbols_json or [],
             timeframe=self.timeframe,
             status=self.status,
-            signal_source=self.signal_source or "internal",
+            signal_source_type=source_type if source_type in {"internal", "discord"} else "internal",
+            signal_source_id=str(self.signal_source_id or "").strip() or None,
+            symbol_filter=[
+                str(symbol).strip().upper()
+                for symbol in (self.symbol_filter_json or [])
+                if str(symbol).strip()
+            ],
+            signal_source=source_name if source_name in {"internal", "discord"} else "internal",
             signal_config=self.signal_config_json or {},
             settings=self.settings_json or {},
         )
@@ -517,6 +607,34 @@ def _migrate_schema() -> None:
                 text(
                     "ALTER TABLE live_deployments "
                     "ADD COLUMN signal_config JSON NOT NULL DEFAULT '{}'"
+                )
+            )
+        if "signal_source_type" not in deployment_column_names:
+            connection.execute(
+                text(
+                    "ALTER TABLE live_deployments "
+                    "ADD COLUMN signal_source_type TEXT NOT NULL DEFAULT 'internal'"
+                )
+            )
+            connection.execute(
+                text(
+                    "UPDATE live_deployments "
+                    "SET signal_source_type = LOWER(COALESCE(signal_source, 'internal')) "
+                    "WHERE signal_source_type = 'internal'"
+                )
+            )
+        if "signal_source_id" not in deployment_column_names:
+            connection.execute(
+                text(
+                    "ALTER TABLE live_deployments "
+                    "ADD COLUMN signal_source_id TEXT NOT NULL DEFAULT ''"
+                )
+            )
+        if "symbol_filter" not in deployment_column_names:
+            connection.execute(
+                text(
+                    "ALTER TABLE live_deployments "
+                    "ADD COLUMN symbol_filter JSON NOT NULL DEFAULT '[]'"
                 )
             )
 
@@ -687,6 +805,123 @@ def upsert_live_accounts(accounts: list[LiveAccountConfig]) -> None:
         session.commit()
 
 
+def _normalize_service_type(value: ServiceType | str) -> str:
+    normalized = (
+        str(value.value if isinstance(value, ServiceType) else value or "").strip().lower()
+    )
+    if normalized not in {ServiceType.DISCORD_BOT.value, ServiceType.SCHEDULED_JOB.value}:
+        raise ValueError(f"Invalid service type '{value}'")
+    return normalized
+
+
+def _normalize_service_status(value: ServiceStatus | str) -> str:
+    normalized = (
+        str(value.value if isinstance(value, ServiceStatus) else value or "").strip().lower()
+    )
+    if normalized not in {
+        ServiceStatus.RUNNING.value,
+        ServiceStatus.PAUSED.value,
+        ServiceStatus.FAILED.value,
+        ServiceStatus.STOPPED.value,
+    }:
+        raise ValueError(f"Invalid service status '{value}'")
+    return normalized
+
+
+def create_service(service: Service) -> Service:
+    init_db()
+    normalized_name = str(service.name or "").strip()
+    if not normalized_name:
+        raise ValueError("Service name is required")
+    normalized_type = _normalize_service_type(service.type)
+    normalized_status = _normalize_service_status(service.status)
+    with get_session() as session:
+        duplicate = session.exec(
+            select(ServiceModel)
+            .where(ServiceModel.name == normalized_name)
+            .where(ServiceModel.type == normalized_type)
+            .limit(1)
+        ).first()
+        if duplicate is not None:
+            raise ValueError(
+                f"Service '{normalized_name}' with type '{normalized_type}' already exists"
+            )
+        record = ServiceModel.from_service(service)
+        record.name = normalized_name
+        record.type = normalized_type
+        record.status = normalized_status
+        record.config_json = dict(service.config or {})
+        if service.last_activity is not None:
+            record.last_activity = service.last_activity
+        session.add(record)
+        session.commit()
+        session.refresh(record)
+    return record.to_service()
+
+
+def get_service(service_id: str) -> Service | None:
+    normalized_id = str(service_id or "").strip()
+    if not normalized_id:
+        return None
+    init_db()
+    with get_session() as session:
+        row = session.get(ServiceModel, normalized_id)
+        if row is None:
+            return None
+    return row.to_service()
+
+
+def list_services(*, service_type: ServiceType | str | None = None) -> list[Service]:
+    init_db()
+    with get_session() as session:
+        statement = select(ServiceModel)
+        if service_type is not None:
+            statement = statement.where(ServiceModel.type == _normalize_service_type(service_type))
+        rows = session.exec(
+            statement.order_by(ServiceModel.created_at.desc(), ServiceModel.id.desc())
+        ).all()
+    return [row.to_service() for row in rows]
+
+
+def update_service_status(
+    service_id: str,
+    status: ServiceStatus | str,
+    *,
+    last_activity: datetime | None = None,
+) -> Service | None:
+    normalized_id = str(service_id or "").strip()
+    if not normalized_id:
+        return None
+    normalized_status = _normalize_service_status(status)
+    init_db()
+    with get_session() as session:
+        record = session.get(ServiceModel, normalized_id)
+        if record is None:
+            return None
+        record.status = normalized_status
+        if last_activity is not None:
+            record.last_activity = last_activity
+        record.updated_at = datetime.utcnow()
+        session.add(record)
+        session.commit()
+        session.refresh(record)
+    return record.to_service()
+
+
+def delete_service(service_id: str) -> bool:
+    normalized_id = str(service_id or "").strip()
+    if not normalized_id:
+        return False
+    init_db()
+    with get_session() as session:
+        record = session.get(ServiceModel, normalized_id)
+        if record is None:
+            return False
+        session.delete(record)
+        session.commit()
+    return True
+
+
 def list_live_deployments() -> list[LiveDeploymentConfig]:
     init_db()
     with get_session() as session:
@@ -717,12 +952,33 @@ def create_live_deployment(deployment: LiveDeploymentConfig) -> LiveDeploymentCo
         deployment_status = str(deployment.status or "ACTIVE").upper()
         if deployment_status not in {"ACTIVE", "PAUSED", "STOPPED"}:
             raise ValueError(f"Invalid deployment status '{deployment.status}'")
-        signal_source = str(deployment.signal_source or "internal").lower()
+        signal_source_type = str(deployment.signal_source_type or "").lower()
+        signal_source_name = str(deployment.signal_source or "").lower()
+        if signal_source_type not in {"internal", "discord"}:
+            signal_source_type = (
+                signal_source_name if signal_source_name in {"internal", "discord"} else "internal"
+            )
+        elif signal_source_type == "internal" and signal_source_name == "discord":
+            signal_source_type = "discord"
+        if signal_source_type not in {"internal", "discord"}:
+            raise ValueError(
+                f"Invalid signal source type '{deployment.signal_source_type or deployment.signal_source}'"
+            )
+        signal_source = signal_source_name if signal_source_name in {"internal", "discord"} else signal_source_type
         if signal_source not in {"internal", "discord"}:
-            raise ValueError(f"Invalid signal source '{deployment.signal_source}'")
+            signal_source = signal_source_type
+        signal_source_id = str(deployment.signal_source_id or "").strip()
+        symbol_filter = [
+            str(symbol).strip().upper()
+            for symbol in (deployment.symbol_filter or [])
+            if str(symbol).strip()
+        ]
         record = LiveDeploymentModel.from_live_deployment(deployment)
         record.status = deployment_status
         record.signal_source = signal_source
+        record.signal_source_type = signal_source_type
+        record.signal_source_id = signal_source_id
+        record.symbol_filter_json = symbol_filter
         session.add(record)
         session.commit()
         session.refresh(record)
@@ -903,7 +1159,9 @@ def list_live_signals_for_replay(
     )
 
     normalized_source = str(source or "").strip().lower()
-    if normalized_source and normalized_source not in {"internal", "discord"}:
+    if normalized_source and (
+        normalized_source != "internal" and not normalized_source.startswith("discord")
+    ):
         raise ValueError(f"Invalid signal source '{source}'")
 
     try:
@@ -919,7 +1177,16 @@ def list_live_signals_for_replay(
         )
         if normalized_ids:
             statement = statement.where(LiveSignalModel.deployment_id.in_(normalized_ids))
-        if normalized_source:
+        if normalized_source == "internal":
+            statement = statement.where(LiveSignalModel.source == "internal")
+        elif normalized_source == "discord":
+            statement = statement.where(
+                or_(
+                    LiveSignalModel.source == "discord",
+                    LiveSignalModel.source.like("discord_%"),
+                )
+            )
+        elif normalized_source:
             statement = statement.where(LiveSignalModel.source == normalized_source)
         if start is not None:
             statement = statement.where(LiveSignalModel.timestamp >= start)

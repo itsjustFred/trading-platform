@@ -389,6 +389,18 @@ export interface LiveAccount {
 
 export type LiveDeploymentStatus = "ACTIVE" | "PAUSED" | "STOPPED";
 export type LiveSignalSource = "internal" | "discord";
+export type ServiceType = "discord_bot" | "scheduled_job";
+export type ServiceStatus = "running" | "paused" | "failed" | "stopped";
+
+export interface Service {
+  id: string;
+  name: string;
+  type: ServiceType;
+  status: ServiceStatus;
+  config: Record<string, unknown>;
+  last_activity?: string | null;
+  created_at: string;
+}
 
 export interface LiveDeploymentConfig {
   id: string;
@@ -397,16 +409,22 @@ export interface LiveDeploymentConfig {
   symbols: string[];
   timeframe: string;
   status: LiveDeploymentStatus;
+  signal_source_type?: LiveSignalSource;
+  signal_source_id?: string | null;
+  symbol_filter?: string[];
   signal_source: LiveSignalSource;
   signal_config: Record<string, unknown>;
   settings: Record<string, unknown>;
 }
 
 export interface LiveDeploymentCreateRequest {
-  strategy_name: string;
+  strategy_name?: string;
   account_id: string;
   symbols: string[];
   timeframe: string;
+  signal_source_type?: LiveSignalSource;
+  signal_source_id?: string;
+  symbol_filter?: string[];
   signal_source?: LiveSignalSource;
   signal_config?: Record<string, unknown>;
   settings?: Record<string, unknown>;

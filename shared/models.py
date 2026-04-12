@@ -16,6 +16,7 @@ import logging
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
 from typing import Any, Literal
 from uuid import UUID, uuid4
@@ -75,6 +76,28 @@ class StrategyMeta(BaseModel):
 # ─── Live trading models ─────────────────────────────────────────────────────
 
 
+class ServiceType(str, Enum):
+    DISCORD_BOT = "discord_bot"
+    SCHEDULED_JOB = "scheduled_job"
+
+
+class ServiceStatus(str, Enum):
+    RUNNING = "running"
+    PAUSED = "paused"
+    FAILED = "failed"
+    STOPPED = "stopped"
+
+
+class Service(BaseModel):
+    id: UUID = Field(default_factory=uuid4)
+    name: str
+    type: ServiceType
+    status: ServiceStatus
+    config: dict[str, Any] = Field(default_factory=dict)
+    last_activity: datetime | None = None
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
 class LiveAccountConfig(BaseModel):
     """Live account configuration stored in DB and used by API payloads."""
 
@@ -106,6 +129,9 @@ class LiveDeploymentConfig(BaseModel):
     symbols: list[str]
     timeframe: str
     status: Literal["ACTIVE", "PAUSED", "STOPPED"] = "ACTIVE"
+    signal_source_type: Literal["internal", "discord"] = "internal"
+    signal_source_id: str | None = None
+    symbol_filter: list[str] = Field(default_factory=list)
     signal_source: Literal["internal", "discord"] = "internal"
     signal_config: dict[str, Any] = Field(default_factory=dict)
     settings: dict[str, Any] = Field(default_factory=dict)
@@ -114,10 +140,13 @@ class LiveDeploymentConfig(BaseModel):
 class LiveDeploymentCreateRequest(BaseModel):
     """Payload for creating a live deployment via API."""
 
-    strategy_name: str
+    strategy_name: str = ""
     account_id: str
     symbols: list[str]
     timeframe: str
+    signal_source_type: Literal["internal", "discord"] | None = None
+    signal_source_id: str | None = None
+    symbol_filter: list[str] = Field(default_factory=list)
     signal_source: Literal["internal", "discord"] = "internal"
     signal_config: dict[str, Any] = Field(default_factory=dict)
     settings: dict[str, Any] = Field(default_factory=dict)

@@ -13,6 +13,7 @@ import {
   Database,
   Target,
   Activity,
+  Server,
 } from "lucide-react";
 
 const navItems = [
@@ -20,6 +21,7 @@ const navItems = [
   { path: "/backtests", label: "Backtests", icon: BarChart3 },
   { path: "/optimizations", label: "Optimizations", icon: Target },
   { path: "/live", label: "Live Hub", icon: Radio },
+  { path: "/services", label: "Services", icon: Server },
   { path: "/portfolios", label: "Portfolio", icon: Briefcase },
   { path: "/lab", label: "Strategy Lab", icon: Bot },
   { path: "/data", label: "Data", icon: Database },

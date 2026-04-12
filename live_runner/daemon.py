@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import os
+import re
 import uuid
 from collections.abc import Mapping
 from datetime import datetime, timezone
@@ -13,11 +15,28 @@ from dotenv import dotenv_values
 from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credentials
 from live_runner.base_adapter import BaseLiveAdapter
 from live_runner.ctrader_adapter import CTraderLiveAdapter
+from live_runner.service_discovery import discover_discord_bots_from_env
 from live_runner.signal_sources import DiscordSignalSource, wait_for_candle_close
 from risk import RiskConfig, RiskEngine, TradeSignal
-from shared.database import list_live_accounts, list_live_deployments, save_live_balance
+from scheduler.scheduler import ServiceScheduler
+from shared.database import (
+    create_service,
+    list_live_accounts,
+    list_live_deployments,
+    list_services,
+    save_live_balance,
+    update_service_status,
+)
 from shared.logging import get_logger
-from shared.models import LiveAccountConfig, LiveBalanceRecord, LiveDeploymentConfig, LiveSignal
+from shared.models import (
+    LiveAccountConfig,
+    LiveBalanceRecord,
+    LiveDeploymentConfig,
+    LiveSignal,
+    Service,
+    ServiceStatus,
+    ServiceType,
+)
 
 logger = get_logger("live-runner")
 
@@ -25,6 +44,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_ACCOUNTS_ENV = PROJECT_ROOT / ".accounts.env"
 BALANCE_POLL_INTERVAL_SECONDS = 60
 DEPLOYMENT_POLL_INTERVAL_SECONDS = 10
+SERVICE_SYNC_INTERVAL_SECONDS = 60
 
 
 def _parse_bool_env(value: str | None, *, default: bool = True) -> bool:
@@ -47,6 +67,64 @@ def _accounts_env_mtime(accounts_env: Path) -> int | None:
         return accounts_env.stat().st_mtime_ns
     except OSError:
         return None
+
+
+def _discover_and_register_discord_services(*, log_summary: bool = True) -> list[Service]:
+    discovered = discover_discord_bots_from_env()
+    discovered_names = [str(item.get("name") or "").strip().upper() for item in discovered]
+    if log_summary:
+        if discovered_names:
+            logger.info(
+                "Discovered %s Discord bots: %s",
+                len(discovered_names),
+                ", ".join(discovered_names),
+            )
+        else:
+            logger.info("Discovered 0 Discord bots")
+
+    existing_services = list_services(service_type=ServiceType.DISCORD_BOT)
+    existing_names = {str(service.name or "").strip().upper() for service in existing_services}
+    for item in discovered:
+        bot_name = str(item.get("name") or "").strip().upper()
+        if not bot_name or bot_name in existing_names:
+            continue
+        token_env_key = str(item.get("token_env_key") or "").strip()
+        channel_id = str(item.get("channel_id") or "").strip()
+        try:
+            created = create_service(
+                Service(
+                    name=bot_name,
+                    type=ServiceType.DISCORD_BOT,
+                    status=ServiceStatus.RUNNING,
+                    config={
+                        "token_env_key": token_env_key,
+                        "channel_id": channel_id,
+                    },
+                    created_at=datetime.now(timezone.utc),
+                )
+            )
+            existing_names.add(created.name.upper())
+        except ValueError:
+            continue
+    return list_services(service_type=ServiceType.DISCORD_BOT)
+
+
+def _set_all_services_running() -> list[Service]:
+    services = list_services()
+    for service in services:
+        if service.status == ServiceStatus.RUNNING:
+            continue
+        update_service_status(str(service.id), ServiceStatus.RUNNING)
+    return list_services()
+
+
+def _service_task_name(service_id: str) -> str:
+    return f"service-discord-{service_id}"
+
+
+def _service_config_string(config: Mapping[str, object], key: str) -> str:
+    value = config.get(key)
+    return str(value).strip() if value is not None else ""
 
 
 def _resolve_ctrader_credentials(
@@ -151,6 +229,11 @@ def _deployment_signal_timeframe(deployment: LiveDeploymentConfig) -> str:
     if configured_tf:
         return configured_tf
     return deployment.timeframe
+
+
+def _deployment_has_discord_channel(deployment: LiveDeploymentConfig) -> bool:
+    configured = deployment.signal_config or {}
+    return bool(str(configured.get("channel_id") or "").strip())
 
 
 def size_live_signal_for_submission(
@@ -532,6 +615,227 @@ async def _run_discord_listener_with_retries(
             backoff_seconds = min(backoff_seconds * 2, 30)
 
 
+def _resolve_discord_bot_runtime(
+    service: Service,
+    *,
+    accounts_env_values: Mapping[str, str],
+) -> tuple[str, str, str]:
+    config = service.config if isinstance(service.config, dict) else {}
+    token_env_key = _service_config_string(config, "token_env_key")
+    if not token_env_key:
+        canonical_name = re.sub(r"[^A-Z0-9_]+", "_", str(service.name or "").upper())
+        token_env_key = f"DISCORD_BOT_{canonical_name}_TOKEN"
+    token = str(accounts_env_values.get(token_env_key) or os.environ.get(token_env_key, "")).strip()
+    channel_id = _service_config_string(config, "channel_id")
+    return token_env_key, token, channel_id
+
+
+async def _run_discord_bot_service_listener(service: Service, source: DiscordSignalSource) -> None:
+    backoff_seconds = 2
+    while True:
+        try:
+            async for _signal in source.listen_signals():
+                pass
+            if source.is_paused:
+                return
+            await asyncio.sleep(1)
+            backoff_seconds = 2
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Discord bot listener failed; retrying",
+                extra={
+                    "data": {
+                        "service_id": str(service.id),
+                        "service_name": service.name,
+                        "retry_in_seconds": backoff_seconds,
+                        "error": str(exc),
+                    }
+                },
+            )
+            await asyncio.sleep(backoff_seconds)
+            backoff_seconds = min(backoff_seconds * 2, 30)
+
+
+def _cleanup_finished_discord_bot_tasks(discord_bot_tasks: dict[str, asyncio.Task[None]]) -> None:
+    for service_id, task in list(discord_bot_tasks.items()):
+        if not task.done():
+            continue
+        discord_bot_tasks.pop(service_id, None)
+        if task.cancelled():
+            continue
+        exception = task.exception()
+        if exception is not None:
+            logger.warning(
+                "Discord bot task finished with error",
+                extra={"data": {"service_id": service_id, "error": str(exception)}},
+            )
+
+
+async def _stop_discord_bot_service(
+    service_id: str,
+    *,
+    active_discord_bots: dict[str, DiscordSignalSource],
+    active_discord_bot_tasks: dict[str, asyncio.Task[None]],
+    paused: bool = False,
+) -> None:
+    task = active_discord_bot_tasks.pop(service_id, None)
+    if task is not None and not task.done():
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+    source = active_discord_bots.pop(service_id, None)
+    if source is not None:
+        if paused:
+            await source.pause()
+        else:
+            await source.disconnect(failed=False)
+
+
+async def _sync_discord_bot_services(
+    services: list[Service],
+    *,
+    active_discord_bots: dict[str, DiscordSignalSource],
+    active_discord_bot_tasks: dict[str, asyncio.Task[None]],
+    accounts_env_values: Mapping[str, str],
+) -> None:
+    _cleanup_finished_discord_bot_tasks(active_discord_bot_tasks)
+
+    discord_services = [
+        service for service in services if service.type == ServiceType.DISCORD_BOT
+    ]
+    service_by_id = {str(service.id): service for service in discord_services}
+    running_service_ids = {
+        str(service.id)
+        for service in discord_services
+        if service.status == ServiceStatus.RUNNING
+    }
+
+    for service_id in sorted(set(active_discord_bots) - running_service_ids):
+        service = service_by_id.get(service_id)
+        await _stop_discord_bot_service(
+            service_id,
+            active_discord_bots=active_discord_bots,
+            active_discord_bot_tasks=active_discord_bot_tasks,
+            paused=bool(service and service.status == ServiceStatus.PAUSED),
+        )
+
+    for service in discord_services:
+        service_id = str(service.id)
+        if service.status != ServiceStatus.RUNNING:
+            continue
+        token_env_key, token, channel_id = _resolve_discord_bot_runtime(
+            service,
+            accounts_env_values=accounts_env_values,
+        )
+        if not token or not channel_id:
+            logger.warning(
+                "Discord service missing runtime credentials",
+                extra={
+                    "data": {
+                        "service_id": service_id,
+                        "service_name": service.name,
+                        "token_env_key": token_env_key,
+                        "has_token": bool(token),
+                        "has_channel_id": bool(channel_id),
+                    }
+                },
+            )
+            await asyncio.to_thread(update_service_status, service_id, ServiceStatus.FAILED)
+            continue
+
+        source = active_discord_bots.get(service_id)
+        expected_channel_ids = {channel_id}
+        if source is None or source.token != token or source.channel_ids != expected_channel_ids:
+            if source is not None:
+                await _stop_discord_bot_service(
+                    service_id,
+                    active_discord_bots=active_discord_bots,
+                    active_discord_bot_tasks=active_discord_bot_tasks,
+                )
+            source = DiscordSignalSource(
+                bot_name=service.name,
+                token=token,
+                channel_id=channel_id,
+                service_id=service_id,
+            )
+            active_discord_bots[service_id] = source
+
+        running_task = active_discord_bot_tasks.get(service_id)
+        if running_task is None or running_task.done():
+            task = asyncio.create_task(
+                _run_discord_bot_service_listener(service, source),
+                name=_service_task_name(service_id),
+            )
+            active_discord_bot_tasks[service_id] = task
+            logger.info("Started Discord bot %s", service.name)
+
+        running_task = active_discord_bot_tasks.get(service_id)
+        if source.is_connected or (running_task is not None and not running_task.done()):
+            continue
+        try:
+            await source.reconnect()
+            await asyncio.to_thread(
+                update_service_status,
+                service_id,
+                ServiceStatus.RUNNING,
+                last_activity=datetime.now(timezone.utc),
+            )
+            logger.info(
+                "Reconnected Discord bot %s",
+                service.name,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Discord bot reconnect failed",
+                extra={
+                    "data": {
+                        "service_id": service_id,
+                        "service_name": service.name,
+                        "error": str(exc),
+                    }
+                },
+            )
+            await asyncio.to_thread(update_service_status, service_id, ServiceStatus.FAILED)
+
+
+async def sync_services_loop(
+    active_discord_bots: dict[str, DiscordSignalSource],
+    active_discord_bot_tasks: dict[str, asyncio.Task[None]],
+    scheduler: ServiceScheduler,
+    *,
+    accounts_env: Path = DEFAULT_ACCOUNTS_ENV,
+    interval_seconds: int = SERVICE_SYNC_INTERVAL_SECONDS,
+) -> None:
+    accounts_env_values = _load_accounts_env_values(accounts_env)
+    accounts_env_mtime = _accounts_env_mtime(accounts_env)
+    while True:
+        try:
+            current_mtime = _accounts_env_mtime(accounts_env)
+            if current_mtime != accounts_env_mtime:
+                accounts_env_values = _load_accounts_env_values(accounts_env)
+                accounts_env_mtime = current_mtime
+                await asyncio.to_thread(_discover_and_register_discord_services, log_summary=False)
+
+            services = await asyncio.to_thread(list_services)
+            await scheduler.sync_services(services)
+            await _sync_discord_bot_services(
+                services,
+                active_discord_bots=active_discord_bots,
+                active_discord_bot_tasks=active_discord_bot_tasks,
+                accounts_env_values=accounts_env_values,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Service sync iteration failed",
+                extra={"data": {"error": str(exc)}},
+            )
+        await asyncio.sleep(interval_seconds)
+
+
 async def _poll_balances(
     adapters: dict[str, BaseLiveAdapter], *, interval_seconds: int = BALANCE_POLL_INTERVAL_SECONDS
 ) -> None:
@@ -878,6 +1182,7 @@ async def sync_deployments_loop(
                 for deployment in deployments
                 if _normalize_deployment_status(deployment.status) == "ACTIVE"
                 and str(deployment.signal_source or "internal").lower() == "discord"
+                and _deployment_has_discord_channel(deployment)
             }
 
             for account_id in sorted(active_account_ids):
@@ -919,6 +1224,14 @@ async def run_daemon(
     active_adapters: dict[str, BaseLiveAdapter] = {}
     active_listener_tasks: dict[str, asyncio.Task[None]] = {}
     active_discord_tasks: dict[str, asyncio.Task[None]] = {}
+    active_discord_bots: dict[str, DiscordSignalSource] = {}
+    active_discord_bot_tasks: dict[str, asyncio.Task[None]] = {}
+    scheduler = ServiceScheduler()
+
+    await asyncio.to_thread(_discover_and_register_discord_services, log_summary=True)
+    await asyncio.to_thread(_set_all_services_running)
+    await scheduler.start()
+
     sync_task = asyncio.create_task(
         sync_deployments_loop(
             active_adapters,
@@ -928,9 +1241,18 @@ async def run_daemon(
         ),
         name="deployment-sync-loop",
     )
+    service_sync_task = asyncio.create_task(
+        sync_services_loop(
+            active_discord_bots,
+            active_discord_bot_tasks,
+            scheduler,
+            accounts_env=accounts_env,
+        ),
+        name="service-sync-loop",
+    )
     balance_task = asyncio.create_task(_poll_balances(active_adapters), name="balance-poller")
     try:
-        await asyncio.gather(sync_task, balance_task)
+        await asyncio.gather(sync_task, service_sync_task, balance_task)
     except asyncio.CancelledError:
         logger.info("Live daemon cancelled")
         raise
@@ -938,15 +1260,28 @@ async def run_daemon(
         logger.exception("Live daemon crashed")
         raise
     finally:
+        if not service_sync_task.done():
+            service_sync_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await service_sync_task
         for task in list(active_discord_tasks.values()):
             if not task.done():
                 task.cancel()
+        for task in list(active_discord_bot_tasks.values()):
+            if not task.done():
+                task.cancel()
+        for source in list(active_discord_bots.values()):
+            with contextlib.suppress(Exception):
+                await source.disconnect(failed=False)
+        with contextlib.suppress(Exception):
+            await scheduler.stop()
         logger.info(
             "Stopping live daemon",
             extra={
                 "data": {
                     "active_listener_tasks": len(active_listener_tasks),
                     "active_discord_tasks": len(active_discord_tasks),
+                    "active_discord_bot_tasks": len(active_discord_bot_tasks),
                 }
             },
         )

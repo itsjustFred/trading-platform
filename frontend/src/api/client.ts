@@ -22,6 +22,9 @@ import type {
   LivePositionsResponse,
   LiveQuoteResponse,
   LiveDeploymentStatus,
+  Service,
+  ServiceStatus,
+  ServiceType,
   LiveTradesResponse,
   LogContent,
   LogFile,
@@ -266,6 +269,50 @@ export const deleteLiveDeployment = (deploymentId: string) =>
     `/live/deployments/${encodeURIComponent(deploymentId)}`,
     { method: "DELETE" },
   );
+
+// Services
+export const getServices = (type?: ServiceType) => {
+  const params = new URLSearchParams();
+  if (type) params.set("type", type);
+  const query = params.toString();
+  return fetchJSON<Service[]>(`/services${query ? `?${query}` : ""}`);
+};
+export const getService = (serviceId: string) =>
+  fetchJSON<Service>(`/services/${encodeURIComponent(serviceId)}`);
+export const createService = (payload: {
+  name: string;
+  type: ServiceType;
+  status?: ServiceStatus;
+  config?: Record<string, unknown>;
+}) =>
+  fetchJSON<Service>("/services", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+export const updateServiceStatus = (serviceId: string, status: ServiceStatus) =>
+  fetchJSON<Service>(`/services/${encodeURIComponent(serviceId)}/status`, {
+    method: "PUT",
+    body: JSON.stringify({ status }),
+  });
+export const deleteService = (serviceId: string) =>
+  fetchJSON<{ status: string; id: string }>(`/services/${encodeURIComponent(serviceId)}`, {
+    method: "DELETE",
+  });
+export const getServiceLogs = (
+  serviceId: string,
+  lines?: number,
+  level?: string,
+  search?: string,
+) => {
+  const params = new URLSearchParams();
+  if (lines) params.set("lines", String(lines));
+  if (level) params.set("level", level);
+  if (search) params.set("search", search);
+  const query = params.toString();
+  return fetchJSON<LogContent>(
+    `/services/${encodeURIComponent(serviceId)}/logs${query ? `?${query}` : ""}`,
+  );
+};
 
 // Run backtest
 export const runBacktest = (data: RunBacktestRequest) =>

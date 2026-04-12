@@ -10,7 +10,9 @@ from typing import Any
 
 from risk.models import TradeSignal
 from shared.constants import normalize_timeframe
+from shared.database import save_live_signal, update_service_status
 from shared.logging import get_logger
+from shared.models import LiveSignal, ServiceStatus
 
 from live_runner.signal_sources.base_source import BaseSignalSource
 
@@ -222,11 +224,17 @@ class DiscordSignalSource(BaseSignalSource):
     def __init__(
         self,
         *,
+        bot_name: str = "discord",
         token: str | None = None,
         channel_id: str | None = None,
         channel_ids: set[str] | None = None,
         timeframe: str = "1h",
+        service_id: str | None = None,
     ) -> None:
+        normalized_name = str(bot_name or "discord").strip()
+        self.bot_name = normalized_name or "discord"
+        self.service_id = str(service_id or "").strip() or None
+        self.source_name = f"discord_{self.bot_name.lower()}"
         self.token = (token or os.environ.get("DISCORD_BOT_TOKEN", "")).strip()
         resolved_channel_ids: set[str] = set(channel_ids or set())
         fallback_channel_id = str(channel_id or os.environ.get("DISCORD_CHANNEL_ID", "")).strip()
@@ -238,7 +246,60 @@ class DiscordSignalSource(BaseSignalSource):
         self._queue: asyncio.Queue[TradeSignal] = asyncio.Queue()
         self._ready = asyncio.Event()
         self._connected = False
+        self._paused = False
         self._run_task: asyncio.Task[None] | None = None
+
+    @property
+    def is_connected(self) -> bool:
+        return self._connected and self._run_task is not None and not self._run_task.done()
+
+    @property
+    def is_paused(self) -> bool:
+        return self._paused
+
+    async def _set_service_status(
+        self,
+        status: ServiceStatus | str,
+        *,
+        last_activity: datetime | None = None,
+    ) -> None:
+        if not self.service_id:
+            return
+        try:
+            await asyncio.to_thread(
+                update_service_status,
+                self.service_id,
+                status,
+                last_activity=last_activity,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to update discord service status",
+                extra={
+                    "data": {
+                        "service_id": self.service_id,
+                        "status": str(status),
+                        "error": str(exc),
+                    }
+                },
+            )
+
+    async def _persist_trade_signal(self, signal: TradeSignal) -> None:
+        metadata = dict(signal.metadata or {})
+        metadata["source"] = self.source_name
+        metadata["discord_bot_name"] = self.bot_name
+        if self.service_id:
+            metadata["service_id"] = self.service_id
+        signal_time = _parse_timestamp(str(metadata.get("received_at") or ""))
+        live_signal = LiveSignal(
+            deployment_id=self.service_id or self.bot_name,
+            symbol=signal.symbol,
+            action="buy" if signal.action in {"buy", "long"} else "sell",
+            theoretical_price=float(signal.entry_price),
+            timestamp=signal_time,
+            metadata=metadata,
+        )
+        await asyncio.to_thread(save_live_signal, live_signal)
 
     async def connect(self) -> None:
         if self._connected:
@@ -247,6 +308,8 @@ class DiscordSignalSource(BaseSignalSource):
             raise ValueError("Missing DISCORD_BOT_TOKEN")
         if not self.channel_ids:
             raise ValueError("Missing DISCORD_CHANNEL_ID")
+        self._paused = False
+        self._ready.clear()
 
         try:
             import discord
@@ -266,12 +329,25 @@ class DiscordSignalSource(BaseSignalSource):
                     "Discord signal source connected",
                     extra={
                         "data": {
+                            "bot_name": source.bot_name,
+                            "service_id": source.service_id,
                             "channel_ids": sorted(source.channel_ids),
                             "bot_user": str(self.user),
                         }
                     },
                 )
+                source._connected = True
                 source._ready.set()
+                await source._set_service_status(
+                    ServiceStatus.RUNNING,
+                    last_activity=datetime.now(timezone.utc),
+                )
+
+            async def on_disconnect(self) -> None:
+                source._connected = False
+                if source._paused:
+                    return
+                await source._set_service_status(ServiceStatus.FAILED)
 
             async def on_message(self, message: Any) -> None:
                 if getattr(message.author, "bot", False):
@@ -285,21 +361,41 @@ class DiscordSignalSource(BaseSignalSource):
                 )
                 if parsed is None:
                     return
+                parsed.metadata["source"] = source.source_name
+                parsed.metadata["discord_bot_name"] = source.bot_name
+                if source.service_id:
+                    parsed.metadata["service_id"] = source.service_id
+                try:
+                    await source._persist_trade_signal(parsed)
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to persist discord signal",
+                        extra={
+                            "data": {
+                                "bot_name": source.bot_name,
+                                "service_id": source.service_id,
+                                "error": str(exc),
+                            }
+                        },
+                    )
+                await source._set_service_status(
+                    ServiceStatus.RUNNING,
+                    last_activity=datetime.now(timezone.utc),
+                )
                 await source._queue.put(parsed)
 
         self._client = _SignalClient(intents=intents)
         self._run_task = asyncio.create_task(
-            self._client.start(self.token),
-            name="discord-source-client",
+            self._client.start(self.token, reconnect=True),
+            name=f"discord-source-client-{self.bot_name.lower()}",
         )
         try:
             await asyncio.wait_for(self._ready.wait(), timeout=30)
         except Exception:
-            await self.disconnect()
+            await self.disconnect(failed=True)
             raise
-        self._connected = True
 
-    async def disconnect(self) -> None:
+    async def disconnect(self, *, failed: bool = True) -> None:
         if self._client is not None:
             await self._client.close()
         if self._run_task is not None:
@@ -307,16 +403,35 @@ class DiscordSignalSource(BaseSignalSource):
             with contextlib.suppress(asyncio.CancelledError):
                 await self._run_task
         self._connected = False
+        self._ready.clear()
         self._run_task = None
+        if self._paused:
+            await self._set_service_status(ServiceStatus.PAUSED)
+        elif failed:
+            await self._set_service_status(ServiceStatus.FAILED)
+
+    async def pause(self) -> None:
+        self._paused = True
+        await self.disconnect(failed=False)
+        await self._set_service_status(ServiceStatus.PAUSED)
+
+    async def reconnect(self) -> None:
+        await self.disconnect(failed=False)
+        self._paused = False
+        await self.connect()
 
     async def listen_signals(self) -> AsyncIterator[TradeSignal]:
+        if self._paused:
+            return
         if not self._connected:
             await self.connect()
-        while True:
+        while not self._paused:
             if self._run_task is not None and self._run_task.done():
                 exception = self._run_task.exception()
                 if exception is not None:
+                    await self._set_service_status(ServiceStatus.FAILED)
                     raise RuntimeError("Discord client task terminated") from exception
+                await self._set_service_status(ServiceStatus.FAILED)
                 raise RuntimeError("Discord client task terminated unexpectedly")
             try:
                 yield await asyncio.wait_for(self._queue.get(), timeout=1.0)
