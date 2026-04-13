@@ -72,7 +72,16 @@ def _normalize_error_code(value: Any) -> str:
 def _is_already_logged_in_error(error_code: str, error_text: str) -> bool:
     code = _normalize_error_code(error_code)
     message = str(error_text or "").lower()
-    return code == "ALREADY_LOGGED_IN" or "already logged in" in message
+    if code == "ALREADY_LOGGED_IN":
+        return True
+    return any(
+        marker in message
+        for marker in (
+            "already logged in",
+            "already_logged_in",
+            "already authorized",
+        )
+    )
 
 
 def _is_terminal_auth_error(error_code: str, error_text: str) -> bool:
@@ -163,10 +172,12 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._execution_queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=5000)
         self._connected = False
         self._authenticated = False
+        self._connect_lock = asyncio.Lock()
         self._symbol_name_to_id: dict[str, int] = {}
         self._order_id_to_signal_id: dict[int, str] = {}
         self._terminal_auth_failure_reason = ""
         self._terminal_auth_failure_code = ""
+        self._already_logged_in_notified = False
 
         self._Client: Any = None
         self._TcpProtocol: Any = None
@@ -255,6 +266,29 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._error_payload_type = ProtoOAErrorRes().payloadType
         self._order_error_payload_type = ProtoOAOrderErrorEvent().payloadType
 
+    def _raise_if_terminal_auth_failed(self) -> None:
+        if not self._terminal_auth_failure_reason:
+            return
+        raise CTraderAuthTerminalError(
+            self._terminal_auth_failure_reason,
+            error_code=self._terminal_auth_failure_code,
+        )
+
+    def _mark_terminal_auth_failure(self, reason: str, *, error_code: str = "") -> None:
+        normalized_reason = str(reason or "").strip() or "cTrader account authorization failed"
+        self._terminal_auth_failure_reason = normalized_reason
+        self._terminal_auth_failure_code = _normalize_error_code(error_code)
+        self._authenticated = False
+
+    def _raise_terminal_auth_from_api_error(self, exc: CTraderApiError) -> None:
+        error_code = _normalize_error_code(exc.error_code)
+        error_text = str(exc)
+        if not _is_terminal_auth_error(error_code, error_text):
+            return
+        reason = exc.description or error_text or "cTrader account authorization failed"
+        self._mark_terminal_auth_failure(reason, error_code=error_code)
+        raise CTraderAuthTerminalError(reason, error_code=error_code) from exc
+
     def _on_connected(self, client: Any) -> None:
         self._connected = True
         self._connected_event.set()
@@ -272,6 +306,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
     def _on_disconnected(self, client: Any, reason: Any) -> None:
         self._connected = False
         self._authenticated = False
+        self._already_logged_in_notified = False
         self._connected_event.clear()
         logger.warning(
             "cTrader transport disconnected",
@@ -304,21 +339,23 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             error_code = str(getattr(payload, "errorCode", ""))
             description = str(getattr(payload, "description", ""))
             if _is_already_logged_in_error(error_code, description):
-                logger.info(
-                    "cTrader account already authenticated; ignoring duplicate auth response",
-                    extra={
-                        "data": {
-                            "account_id": self.ctid_trader_account_id,
-                            "error_code": error_code,
-                        }
-                    },
-                )
+                if not self._already_logged_in_notified:
+                    logger.info(
+                        "cTrader account already authenticated; ignoring duplicate auth response",
+                        extra={
+                            "data": {
+                                "account_id": self.ctid_trader_account_id,
+                                "error_code": error_code,
+                            }
+                        },
+                    )
+                    self._already_logged_in_notified = True
                 return
             if _is_terminal_auth_error(error_code, description):
-                self._terminal_auth_failure_reason = description or str(
-                    error_code or "not authorized"
+                self._mark_terminal_auth_failure(
+                    description or str(error_code or "not authorized"),
+                    error_code=error_code,
                 )
-                self._terminal_auth_failure_code = _normalize_error_code(error_code)
                 logger.warning(
                     "Account %s not authorized for token, skipping",
                     self.ctid_trader_account_id,
@@ -371,6 +408,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         return payload
 
     async def _authenticate(self) -> None:
+        self._raise_if_terminal_auth_failed()
+        if self._authenticated and self._symbol_name_to_id:
+            return
+
         app_auth_req = self._ProtoOAApplicationAuthReq()
         app_auth_req.clientId = self.app_id
         app_auth_req.clientSecret = self.app_secret
@@ -395,8 +436,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 )
             elif _is_terminal_auth_error(error_code, error_text):
                 reason = exc.description or error_text or "cTrader account authorization failed"
-                self._terminal_auth_failure_reason = reason
-                self._terminal_auth_failure_code = error_code
+                self._mark_terminal_auth_failure(reason, error_code=error_code)
                 raise CTraderAuthTerminalError(reason, error_code=error_code) from exc
             else:
                 raise
@@ -458,113 +498,114 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         return max(int(qty * 1000), 1000)
 
     async def connect(self) -> None:
-        if self._connected and self._authenticated and self._client is not None:
-            return
-        if self._terminal_auth_failure_reason:
-            raise CTraderAuthTerminalError(
-                self._terminal_auth_failure_reason,
-                error_code=self._terminal_auth_failure_code,
-            )
+        async with self._connect_lock:
+            if self._connected and self._authenticated and self._client is not None:
+                return
+            self._raise_if_terminal_auth_failed()
 
-        self._loop = asyncio.get_running_loop()
-        self._load_openapi_types()
+            self._loop = asyncio.get_running_loop()
+            self._load_openapi_types()
 
-        if self._client is None:
-            host = (
-                self._EndPoints.PROTOBUF_DEMO_HOST
-                if self.demo
-                else self._EndPoints.PROTOBUF_LIVE_HOST
-            )
-            self._client = self._Client(host, self._EndPoints.PROTOBUF_PORT, self._TcpProtocol)
-            self._client.setConnectedCallback(self._on_connected)
-            self._client.setDisconnectedCallback(self._on_disconnected)
-            self._client.setMessageReceivedCallback(self._on_message)
-            logger.info(
-                "cTrader client initialized (OpenApiPy TcpProtocol handles heartbeat keepalive)",
-                extra={"data": {"host": host, "port": self._EndPoints.PROTOBUF_PORT}},
-            )
-
-        if not self._client.running:
-            self._client.startService()
-
-        try:
-            await asyncio.wait_for(self._connected_event.wait(), timeout=20)
-            await self._authenticate()
-            logger.info(
-                "cTrader account authenticated",
-                extra={
-                    "data": {
-                        "account_id": self.ctid_trader_account_id,
-                        "symbols_loaded": len(self._symbol_name_to_id),
-                    }
-                },
-            )
-        except CTraderAuthTerminalError as exc:
-            self._authenticated = False
-            reason = str(exc).strip() or "cTrader authorization failed"
-            if "not authorized" in reason.lower():
-                logger.warning(
-                    "Account %s not authorized for token, skipping",
-                    self.ctid_trader_account_id,
-                    extra={
-                        "data": {
-                            "account_id": self.ctid_trader_account_id,
-                            "account_config_id": self.account_config_id,
-                            "error_code": getattr(exc, "error_code", ""),
-                            "error": reason,
-                        }
-                    },
+            if self._client is None:
+                host = (
+                    self._EndPoints.PROTOBUF_DEMO_HOST
+                    if self.demo
+                    else self._EndPoints.PROTOBUF_LIVE_HOST
                 )
-            else:
-                logger.warning(
-                    "cTrader auth failed for account; "
-                    "skipping retries until credentials are updated",
-                    extra={
-                        "data": {
-                            "account_id": self.ctid_trader_account_id,
-                            "account_config_id": self.account_config_id,
-                            "error_code": getattr(exc, "error_code", ""),
-                            "error": reason,
-                        }
-                    },
-                )
-            raise
-        except Exception as exc:
-            self._authenticated = False
-            error_text = str(exc).strip() or exc.__class__.__name__
-            message = error_text.lower()
-            if "token" in message or "auth" in message:
+                self._client = self._Client(host, self._EndPoints.PROTOBUF_PORT, self._TcpProtocol)
+                self._client.setConnectedCallback(self._on_connected)
+                self._client.setDisconnectedCallback(self._on_disconnected)
+                self._client.setMessageReceivedCallback(self._on_message)
                 logger.info(
-                    "cTrader authentication unavailable; verify token/credentials, "
-                    "daemon will retry",
-                    extra={
-                        "data": {
-                            "account_id": self.ctid_trader_account_id,
-                            "error": error_text,
-                        }
-                    },
+                    "cTrader client initialized "
+                    "(OpenApiPy TcpProtocol handles heartbeat keepalive)",
+                    extra={"data": {"host": host, "port": self._EndPoints.PROTOBUF_PORT}},
                 )
-            elif isinstance(exc, asyncio.TimeoutError) or "timeout" in message:
+
+            if not self._client.running:
+                self._client.startService()
+
+            try:
+                await asyncio.wait_for(self._connected_event.wait(), timeout=20)
+                await self._authenticate()
                 logger.info(
-                    "cTrader connect timeout; endpoint may be unreachable, daemon will retry",
+                    "cTrader account authenticated",
                     extra={
                         "data": {
                             "account_id": self.ctid_trader_account_id,
-                            "error": error_text,
+                            "symbols_loaded": len(self._symbol_name_to_id),
                         }
                     },
                 )
-            else:
-                logger.info(
-                    "cTrader connect/auth unavailable; daemon will retry",
-                    extra={
-                        "data": {
-                            "account_id": self.ctid_trader_account_id,
-                            "error": error_text,
-                        }
-                    },
+            except CTraderAuthTerminalError as exc:
+                reason = str(exc).strip() or "cTrader authorization failed"
+                self._mark_terminal_auth_failure(
+                    reason,
+                    error_code=getattr(exc, "error_code", ""),
                 )
-            raise
+                if "not authorized" in reason.lower():
+                    logger.warning(
+                        "Account %s not authorized for token, skipping",
+                        self.ctid_trader_account_id,
+                        extra={
+                            "data": {
+                                "account_id": self.ctid_trader_account_id,
+                                "account_config_id": self.account_config_id,
+                                "error_code": getattr(exc, "error_code", ""),
+                                "error": reason,
+                            }
+                        },
+                    )
+                else:
+                    logger.warning(
+                        "cTrader auth failed for account; "
+                        "skipping retries until credentials are updated",
+                        extra={
+                            "data": {
+                                "account_id": self.ctid_trader_account_id,
+                                "account_config_id": self.account_config_id,
+                                "error_code": getattr(exc, "error_code", ""),
+                                "error": reason,
+                            }
+                        },
+                    )
+                raise
+            except Exception as exc:
+                self._authenticated = False
+                error_text = str(exc).strip() or exc.__class__.__name__
+                message = error_text.lower()
+                if "token" in message or "auth" in message:
+                    logger.info(
+                        "cTrader authentication unavailable; verify token/credentials, "
+                        "daemon will retry",
+                        extra={
+                            "data": {
+                                "account_id": self.ctid_trader_account_id,
+                                "error": error_text,
+                            }
+                        },
+                    )
+                elif isinstance(exc, asyncio.TimeoutError) or "timeout" in message:
+                    logger.info(
+                        "cTrader connect timeout; endpoint may be unreachable, daemon will retry",
+                        extra={
+                            "data": {
+                                "account_id": self.ctid_trader_account_id,
+                                "error": error_text,
+                            }
+                        },
+                    )
+                else:
+                    logger.info(
+                        "cTrader connect/auth unavailable; daemon will retry",
+                        extra={
+                            "data": {
+                                "account_id": self.ctid_trader_account_id,
+                                "error": error_text,
+                            }
+                        },
+                    )
+                raise
 
     async def disconnect(self) -> None:
         client = self._client
@@ -574,6 +615,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._authenticated = False
         self._connected = False
         self._connected_event.clear()
+        self._already_logged_in_notified = False
         self._symbol_name_to_id.clear()
         self._order_id_to_signal_id.clear()
         self._execution_queue = asyncio.Queue(maxsize=5000)
@@ -592,6 +634,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             await stop_result.asFuture(loop)
 
     async def submit_order(self, signal: LiveSignal) -> str:
+        self._raise_if_terminal_auth_failed()
         if not self._connected or not self._authenticated:
             await self.connect()
 
@@ -626,7 +669,11 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         request.timeInForce = self._ProtoOATimeInForce.IMMEDIATE_OR_CANCEL
         request.clientOrderId = str(signal.id)
 
-        response = await self._send_request(request, timeout_seconds=20)
+        try:
+            response = await self._send_request(request, timeout_seconds=20)
+        except CTraderApiError as exc:
+            self._raise_terminal_auth_from_api_error(exc)
+            raise
         if isinstance(response, self._ProtoOAOrderErrorEvent):
             raise RuntimeError(
                 f"Order rejected ({response.errorCode}): {response.description or 'no description'}"
@@ -655,12 +702,18 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         return broker_order_id
 
     async def get_balance(self) -> tuple[float, float]:
+        self._raise_if_terminal_auth_failed()
         if not self._connected or not self._authenticated:
             await self.connect()
 
+        self._raise_if_terminal_auth_failed()
         trader_req = self._ProtoOATraderReq()
         trader_req.ctidTraderAccountId = self.ctid_trader_account_id
-        trader_res = await self._send_request(trader_req, timeout_seconds=15)
+        try:
+            trader_res = await self._send_request(trader_req, timeout_seconds=15)
+        except CTraderApiError as exc:
+            self._raise_terminal_auth_from_api_error(exc)
+            raise
         if not isinstance(trader_res, self._ProtoOATraderRes):
             raise RuntimeError(f"Unexpected trader response: {type(trader_res).__name__}")
 

@@ -16,7 +16,7 @@ from dotenv import dotenv_values
 
 from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credentials
 from live_runner.base_adapter import BaseLiveAdapter
-from live_runner.ctrader_adapter import CTraderLiveAdapter
+from live_runner.ctrader_adapter import CTraderAuthTerminalError, CTraderLiveAdapter
 from live_runner.service_discovery import discover_discord_bots_from_env
 from live_runner.signal_sources import DiscordSignalSource, wait_for_candle_close
 from live_runner.signal_sources.discord_source import DiscordAuthenticationError
@@ -51,6 +51,10 @@ DEPLOYMENT_POLL_INTERVAL_SECONDS = 10
 SERVICE_SYNC_INTERVAL_SECONDS = 60
 _DISCORD_AUTH_BLOCKED_ACCOUNTS: set[str] = set()
 _DISCORD_AUTH_BLOCKED_REASONS: dict[str, str] = {}
+_DISCORD_SERVICE_AUTH_BLOCKED_IDS: set[str] = set()
+_DISCORD_SERVICE_AUTH_BLOCKED_REASONS: dict[str, str] = {}
+_CTRADER_AUTH_BLOCKED_ACCOUNTS: set[str] = set()
+_CTRADER_AUTH_BLOCKED_REASONS: dict[str, str] = {}
 
 
 def _is_terminal_discord_runtime_error(exc: BaseException) -> bool:
@@ -71,6 +75,56 @@ def _is_terminal_discord_runtime_error(exc: BaseException) -> bool:
             "missing discord_channel_id",
         )
     )
+
+
+def _is_terminal_ctrader_runtime_error(exc: BaseException) -> bool:
+    if isinstance(exc, CTraderAuthTerminalError):
+        return True
+    message = str(exc).strip().lower()
+    if not message:
+        return False
+    return any(
+        marker in message
+        for marker in (
+            "trading account is not authorized",
+            "account not authorized",
+            "not authorized",
+            "invalid token",
+            "token invalid",
+            "unauthorized",
+        )
+    )
+
+
+def _is_ctrader_pending_deferred_error(exc: BaseException) -> bool:
+    message = str(exc).strip().lower()
+    if not message:
+        return False
+    if "deferred" not in message:
+        return False
+    return message.startswith("(15")
+
+
+def _block_ctrader_account(account_id: str, exc: BaseException | str) -> None:
+    reason = str(exc).strip() or "cTrader authorization failed"
+    _CTRADER_AUTH_BLOCKED_ACCOUNTS.add(account_id)
+    _CTRADER_AUTH_BLOCKED_REASONS[account_id] = reason
+
+
+def _block_discord_service(service_id: str, exc: BaseException | str) -> None:
+    reason = str(exc).strip() or "Discord authentication failed"
+    _DISCORD_SERVICE_AUTH_BLOCKED_IDS.add(service_id)
+    _DISCORD_SERVICE_AUTH_BLOCKED_REASONS[service_id] = reason
+
+
+def _adapter_is_ready(adapter: BaseLiveAdapter) -> bool:
+    connected = getattr(adapter, "_connected", None)
+    authenticated = getattr(adapter, "_authenticated", None)
+    if connected is False:
+        return False
+    if authenticated is False:
+        return False
+    return True
 
 
 def _parse_bool_env(value: str | None, *, default: bool = True) -> bool:
@@ -718,6 +772,8 @@ async def _disconnect_inactive_adapters(
             account_id=account_id,
             reason="inactive_deployment",
         )
+        _CTRADER_AUTH_BLOCKED_ACCOUNTS.discard(account_id)
+        _CTRADER_AUTH_BLOCKED_REASONS.pop(account_id, None)
         logger.info(
             "Stopped adapter for inactive account",
             extra={
@@ -795,6 +851,7 @@ def _resolve_discord_bot_runtime(
 
 async def _run_discord_bot_service_listener(service: Service, source: DiscordSignalSource) -> None:
     backoff_seconds = 2
+    service_id = str(service.id)
     while True:
         try:
             async for _signal in source.listen_signals():
@@ -807,11 +864,12 @@ async def _run_discord_bot_service_listener(service: Service, source: DiscordSig
             raise
         except Exception as exc:
             if _is_terminal_discord_runtime_error(exc):
+                _block_discord_service(service_id, exc)
                 logger.warning(
                     "Discord bot auth failed; stopping retries",
                     extra={
                         "data": {
-                            "service_id": str(service.id),
+                            "service_id": service_id,
                             "service_name": service.name,
                             "error": str(exc),
                         }
@@ -819,7 +877,7 @@ async def _run_discord_bot_service_listener(service: Service, source: DiscordSig
                 )
                 await asyncio.to_thread(
                     update_service_status,
-                    str(service.id),
+                    service_id,
                     ServiceStatus.FAILED,
                 )
                 return
@@ -871,6 +929,8 @@ async def _stop_discord_bot_service(
             await source.pause()
         else:
             await source.disconnect(failed=False)
+    _DISCORD_SERVICE_AUTH_BLOCKED_IDS.discard(service_id)
+    _DISCORD_SERVICE_AUTH_BLOCKED_REASONS.pop(service_id, None)
 
 
 async def _sync_discord_bot_services(
@@ -891,6 +951,11 @@ async def _sync_discord_bot_services(
         for service in discord_services
         if service.status == ServiceStatus.RUNNING
     }
+    for service_id in list(_DISCORD_SERVICE_AUTH_BLOCKED_IDS):
+        if service_id in running_service_ids:
+            continue
+        _DISCORD_SERVICE_AUTH_BLOCKED_IDS.discard(service_id)
+        _DISCORD_SERVICE_AUTH_BLOCKED_REASONS.pop(service_id, None)
 
     for service_id in sorted(set(active_discord_bots) - running_service_ids):
         service = service_by_id.get(service_id)
@@ -904,6 +969,8 @@ async def _sync_discord_bot_services(
     for service in discord_services:
         service_id = str(service.id)
         if service.status != ServiceStatus.RUNNING:
+            continue
+        if service_id in _DISCORD_SERVICE_AUTH_BLOCKED_IDS:
             continue
         token_env_key, token, channel_id = _resolve_discord_bot_runtime(
             service,
@@ -928,6 +995,8 @@ async def _sync_discord_bot_services(
         source = active_discord_bots.get(service_id)
         expected_channel_ids = {channel_id}
         if source is None or source.token != token or source.channel_ids != expected_channel_ids:
+            _DISCORD_SERVICE_AUTH_BLOCKED_IDS.discard(service_id)
+            _DISCORD_SERVICE_AUTH_BLOCKED_REASONS.pop(service_id, None)
             if source is not None:
                 await _stop_discord_bot_service(
                     service_id,
@@ -967,6 +1036,20 @@ async def _sync_discord_bot_services(
                 service.name,
             )
         except Exception as exc:
+            if _is_terminal_discord_runtime_error(exc):
+                _block_discord_service(service_id, exc)
+                logger.warning(
+                    "Discord bot auth failed; skipping reconnect until credentials change",
+                    extra={
+                        "data": {
+                            "service_id": service_id,
+                            "service_name": service.name,
+                            "error": str(exc),
+                        }
+                    },
+                )
+                await asyncio.to_thread(update_service_status, service_id, ServiceStatus.FAILED)
+                continue
             logger.warning(
                 "Discord bot reconnect failed",
                 extra={
@@ -997,6 +1080,17 @@ async def sync_services_loop(
                 accounts_env_values = _load_accounts_env_values(accounts_env)
                 accounts_env_mtime = current_mtime
                 await asyncio.to_thread(_discover_and_register_discord_services, log_summary=False)
+                if _DISCORD_SERVICE_AUTH_BLOCKED_IDS:
+                    logger.info(
+                        "Credentials changed; clearing blocked Discord bot services",
+                        extra={
+                            "data": {
+                                "service_ids": sorted(_DISCORD_SERVICE_AUTH_BLOCKED_IDS),
+                            }
+                        },
+                    )
+                _DISCORD_SERVICE_AUTH_BLOCKED_IDS.clear()
+                _DISCORD_SERVICE_AUTH_BLOCKED_REASONS.clear()
 
             services = await asyncio.to_thread(list_services)
             await scheduler.sync_services(services)
@@ -1026,6 +1120,8 @@ async def _poll_balances(
             extra={"data": {"adapter_count": len(adapters)}},
         )
         for account_id, adapter in list(adapters.items()):
+            if not _adapter_is_ready(adapter):
+                continue
             try:
                 balance, equity = await adapter.get_balance()
                 record = LiveBalanceRecord(
@@ -1048,7 +1144,58 @@ async def _poll_balances(
                 )
             except asyncio.CancelledError:
                 raise
+            except CTraderAuthTerminalError as exc:
+                _block_ctrader_account(account_id, exc)
+                adapters.pop(account_id, None)
+                logger.warning(
+                    "Account %s not authorized for token, skipping",
+                    account_id,
+                    extra={
+                        "data": {
+                            "account_id": account_id,
+                            "adapter": type(adapter).__name__,
+                            "error": str(exc),
+                        }
+                    },
+                )
+                await _disconnect_adapter(
+                    adapter,
+                    account_id=account_id,
+                    reason="terminal_auth_failure",
+                )
             except Exception as exc:
+                if _is_ctrader_pending_deferred_error(exc):
+                    logger.debug(
+                        "Skipping cTrader balance snapshot while request is pending",
+                        extra={
+                            "data": {
+                                "account_id": account_id,
+                                "adapter": type(adapter).__name__,
+                                "error": str(exc),
+                            }
+                        },
+                    )
+                    continue
+                if _is_terminal_ctrader_runtime_error(exc):
+                    _block_ctrader_account(account_id, exc)
+                    adapters.pop(account_id, None)
+                    logger.warning(
+                        "Account %s not authorized for token, skipping",
+                        account_id,
+                        extra={
+                            "data": {
+                                "account_id": account_id,
+                                "adapter": type(adapter).__name__,
+                                "error": str(exc),
+                            }
+                        },
+                    )
+                    await _disconnect_adapter(
+                        adapter,
+                        account_id=account_id,
+                        reason="terminal_auth_failure",
+                    )
+                    continue
                 logger.warning(
                     "Live balance polling failed",
                     extra={
@@ -1173,6 +1320,8 @@ def _start_missing_tasks(
     active_account_ids: set[str],
 ) -> None:
     for account_id in sorted(active_account_ids):
+        if account_id in _CTRADER_AUTH_BLOCKED_ACCOUNTS:
+            continue
         running_task = active_tasks.get(account_id)
         if running_task is not None and not running_task.done():
             continue
@@ -1181,6 +1330,17 @@ def _start_missing_tasks(
             logger.info(
                 "Active deployment has no adapter yet; waiting for next adapter-connect retry",
                 extra={"data": {"account_id": account_id}},
+            )
+            continue
+        if not _adapter_is_ready(adapter):
+            logger.info(
+                "Adapter not connected yet; waiting for next adapter-connect retry",
+                extra={
+                    "data": {
+                        "account_id": account_id,
+                        "adapter": type(adapter).__name__,
+                    }
+                },
             )
             continue
         task = asyncio.create_task(
@@ -1283,25 +1443,48 @@ async def _ensure_adapter_for_active_account(
     *,
     accounts_env_values: Mapping[str, str],
 ) -> None:
-    if account_id in active_adapters:
+    if account_id in _CTRADER_AUTH_BLOCKED_ACCOUNTS:
         return
-    account = account_lookup.get(account_id)
-    if account is None:
-        logger.warning(
-            "Active deployment references unknown account",
-            extra={"data": {"account_id": account_id}},
-        )
-        return
-
-    adapter = _create_adapter_for_account(account, accounts_env_values=accounts_env_values)
-    if adapter is None:
-        return
-
-    active_adapters[account_id] = adapter
+    adapter = active_adapters.get(account_id)
+    if adapter is not None:
+        if _adapter_is_ready(adapter):
+            return
+    else:
+        account = account_lookup.get(account_id)
+        if account is None:
+            logger.warning(
+                "Active deployment references unknown account",
+                extra={"data": {"account_id": account_id}},
+            )
+            return
+        adapter = _create_adapter_for_account(account, accounts_env_values=accounts_env_values)
+        if adapter is None:
+            return
+        active_adapters[account_id] = adapter
 
     try:
         await adapter.connect()
     except Exception as exc:
+        if _is_terminal_ctrader_runtime_error(exc):
+            _block_ctrader_account(account_id, exc)
+            active_adapters.pop(account_id, None)
+            await _disconnect_adapter(
+                adapter,
+                account_id=account_id,
+                reason="terminal_auth_failure",
+            )
+            logger.warning(
+                "Account %s not authorized for token, skipping",
+                account_id,
+                extra={
+                    "data": {
+                        "account_id": account_id,
+                        "adapter": type(adapter).__name__,
+                        "error": str(exc),
+                    }
+                },
+            )
+            return
         logger.info(
             "Adapter connect not ready for active deployment account; will retry",
             extra={
@@ -1338,6 +1521,13 @@ async def sync_deployments_loop(
             if current_mtime != accounts_env_mtime:
                 accounts_env_values = _load_accounts_env_values(accounts_env)
                 accounts_env_mtime = current_mtime
+                if _CTRADER_AUTH_BLOCKED_ACCOUNTS:
+                    logger.info(
+                        "Credentials changed; clearing blocked cTrader accounts",
+                        extra={"data": {"account_ids": sorted(_CTRADER_AUTH_BLOCKED_ACCOUNTS)}},
+                    )
+                _CTRADER_AUTH_BLOCKED_ACCOUNTS.clear()
+                _CTRADER_AUTH_BLOCKED_REASONS.clear()
                 if _DISCORD_AUTH_BLOCKED_ACCOUNTS:
                     logger.info(
                         "Credentials changed; clearing blocked Discord listener accounts",
@@ -1368,8 +1558,9 @@ async def sync_deployments_loop(
                     }
                 },
             )
+            runnable_account_ids = set(active_account_ids) - _CTRADER_AUTH_BLOCKED_ACCOUNTS
 
-            await _disconnect_inactive_adapters(active_adapters, active_account_ids)
+            await _disconnect_inactive_adapters(active_adapters, runnable_account_ids)
 
             active_discord_account_ids = {
                 deployment.account_id
@@ -1379,7 +1570,7 @@ async def sync_deployments_loop(
                 and _deployment_has_discord_channel(deployment)
             }
 
-            for account_id in sorted(active_account_ids):
+            for account_id in sorted(runnable_account_ids):
                 await _ensure_adapter_for_active_account(
                     account_id,
                     account_lookup,
@@ -1387,8 +1578,8 @@ async def sync_deployments_loop(
                     accounts_env_values=accounts_env_values,
                 )
 
-            _cancel_inactive_tasks(active_tasks, active_account_ids)
-            _start_missing_tasks(active_adapters, active_tasks, active_account_ids)
+            _cancel_inactive_tasks(active_tasks, runnable_account_ids)
+            _start_missing_tasks(active_adapters, active_tasks, runnable_account_ids)
             _cancel_inactive_discord_tasks(active_discord_tasks, active_discord_account_ids)
             _start_missing_discord_tasks(
                 active_adapters,

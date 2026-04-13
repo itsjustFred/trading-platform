@@ -12,9 +12,14 @@ export interface TradeTableRow {
   strategy?: string;
   symbol: string;
   side: string;
+  signalSource?: string | null;
+  signalTime?: string | null;
+  fillLagSec?: number | null;
   size?: number | null;
   entryPrice?: number | null;
   exitPrice?: number | null;
+  processorStopLoss?: number | null;
+  processorTakeProfit?: number | null;
   pnl?: number | null;
   pnlPct?: number | null;
   exitReason?: string | null;
@@ -90,6 +95,19 @@ function formatPercent(value: unknown): string {
   return `${numeric >= 0 ? "+" : ""}${numeric.toFixed(2)}%`;
 }
 
+function formatLag(value: unknown): string {
+  const numeric = toFiniteNumber(value);
+  if (numeric == null || numeric < 0) return "—";
+  const seconds = Math.trunc(numeric);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.trunc(seconds / 60);
+  const rest = seconds % 60;
+  if (minutes < 60) return `${minutes}m ${rest}s`;
+  const hours = Math.trunc(minutes / 60);
+  const restMinutes = minutes % 60;
+  return `${hours}h ${restMinutes}m`;
+}
+
 const pnlCellStyle = (value: unknown) => {
   const numeric = toFiniteNumber(value);
   if (numeric == null || numeric === 0) {
@@ -145,6 +163,31 @@ export function TradeTable({ trades, onTradeClick }: TradeTableProps) {
           String(params.value ?? "").toUpperCase(),
       },
       {
+        field: "signalSource",
+        headerName: "Signal Source",
+        minWidth: 150,
+        flex: 1.1,
+        valueFormatter: (params: ValueFormatterParams<TradeTableRow>) =>
+          String(params.value ?? "").trim() || "—",
+      },
+      {
+        field: "signalTime",
+        headerName: "Signal Time",
+        minWidth: 150,
+        flex: 1.05,
+        valueFormatter: (params: ValueFormatterParams<TradeTableRow>) =>
+          formatTimestamp(String(params.value ?? "")),
+      },
+      {
+        field: "fillLagSec",
+        headerName: "Fill Lag",
+        minWidth: 105,
+        flex: 0.8,
+        type: "numericColumn",
+        valueFormatter: (params: ValueFormatterParams<TradeTableRow>) =>
+          formatLag(params.value),
+      },
+      {
         field: "size",
         headerName: "Size",
         minWidth: 120,
@@ -167,6 +210,24 @@ export function TradeTable({ trades, onTradeClick }: TradeTableProps) {
         headerName: "Exit Price",
         minWidth: 130,
         flex: 0.95,
+        type: "numericColumn",
+        valueFormatter: (params: ValueFormatterParams<TradeTableRow>) =>
+          formatPrice(params.value),
+      },
+      {
+        field: "processorStopLoss",
+        headerName: "Signal SL",
+        minWidth: 120,
+        flex: 0.9,
+        type: "numericColumn",
+        valueFormatter: (params: ValueFormatterParams<TradeTableRow>) =>
+          formatPrice(params.value),
+      },
+      {
+        field: "processorTakeProfit",
+        headerName: "Signal TP",
+        minWidth: 120,
+        flex: 0.9,
         type: "numericColumn",
         valueFormatter: (params: ValueFormatterParams<TradeTableRow>) =>
           formatPrice(params.value),

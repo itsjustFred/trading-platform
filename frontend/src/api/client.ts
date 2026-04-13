@@ -34,6 +34,7 @@ import type {
   OptimizationRunResponse,
   OptimizationSummary,
   RunBacktestRequest,
+  RunBacktestFromSignalsRequest,
   RunBacktestSignalsRequest,
   RunBacktestResponse,
   RunBacktestStatusResponse,
@@ -325,6 +326,11 @@ export const runBacktest = (data: RunBacktestRequest) =>
   });
 export const runBacktestSignals = (data: RunBacktestSignalsRequest) =>
   fetchJSON<RunBacktestResponse>("/backtests/run-signals", {
+    method: "POST",
+    body: JSON.stringify(data),
+  });
+export const runBacktestFromSignals = (data: RunBacktestFromSignalsRequest) =>
+  fetchJSON<RunBacktestResponse>("/backtests/run-from-signals", {
     method: "POST",
     body: JSON.stringify(data),
   });

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable
 
 import pandas as pd
@@ -10,7 +11,7 @@ from risk.config import RiskConfig
 from risk.engine import RiskEngine
 from risk.models import TradeSignal as RiskTradeSignal
 from runner.stats import compute_stats_for_result
-from shared.constants import normalize_timeframe
+from shared.constants import DATA_DIR, normalize_timeframe
 from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, TradeExit
 from signal_bots.registry import get_signal_processor
 
@@ -110,15 +111,20 @@ class _OpenPosition:
     entry_time: pd.Timestamp
     entry_bar_index: int
     entry_price: float
+    signal_entry_price: float
     quantity: float
     stop_loss: float | None
     take_profit: float | None
+    initial_stop_loss: float | None
+    initial_take_profit: float | None
     risk_amount: float | None
     risk_percent: float | None
+    timeframe: str
     source: str
     signal_time: pd.Timestamp
     signal_metadata: dict[str, Any]
     last_checked_at: pd.Timestamp
+    trailing_updates: int = 0
     mae: float = 0.0
     mfe: float = 0.0
 
@@ -200,6 +206,30 @@ class SignalReplayAdapter:
         position.mfe = max(position.mfe, favorable)
         position.mae = min(position.mae, adverse)
 
+    def _apply_trailing_stop(self, position: _OpenPosition, bar: pd.Series) -> None:
+        trailing_cfg = position.signal_metadata.get("trailing_sl_config")
+        if not isinstance(trailing_cfg, dict):
+            return
+
+        synthetic_signal = RiskTradeSignal(
+            action="buy" if position.direction == "LONG" else "sell",
+            symbol=position.symbol,
+            entry_price=position.entry_price,
+            stop_loss=position.stop_loss,
+            take_profit=position.take_profit,
+            timeframe=position.timeframe,
+            metadata={"trailing_sl_config": dict(trailing_cfg)},
+        )
+        next_stop = self.risk_engine.apply_trailing_stop(
+            synthetic_signal,
+            market_price=float(bar["close"]),
+        )
+        if next_stop is None:
+            return
+        if position.stop_loss is None or abs(float(next_stop) - float(position.stop_loss)) > 1e-12:
+            position.stop_loss = float(next_stop)
+            position.trailing_updates += 1
+
     def _close_position(
         self,
         position: _OpenPosition,
@@ -218,6 +248,12 @@ class SignalReplayAdapter:
         gross_notional = position.entry_price * position.quantity
         pnl_pct = (pnl / gross_notional) * 100.0 if gross_notional > 0 else 0.0
         r_multiple = (pnl / risk_amount) if risk_amount > 0 else None
+        signal_price = float(position.signal_entry_price)
+        slippage = float(position.entry_price - signal_price)
+        slippage_bps = (slippage / signal_price) * 10_000 if signal_price > 0 else 0.0
+        fill_delay_seconds = int(
+            max(0.0, (position.entry_time - position.signal_time).total_seconds())
+        )
         tags = ["signal-replay"]
         if position.source:
             tags.append(str(position.source))
@@ -255,7 +291,18 @@ class SignalReplayAdapter:
             tags=tags,
             meta={
                 "signal_timestamp": _to_iso(position.signal_time),
+                "fill_timestamp": _to_iso(position.entry_time),
+                "fill_delay_seconds": fill_delay_seconds,
                 "signal_source": position.source,
+                "signal_price": signal_price,
+                "fill_price": float(position.entry_price),
+                "slippage": slippage,
+                "slippage_bps": slippage_bps,
+                "signal_stop_loss": position.initial_stop_loss,
+                "signal_take_profit": position.initial_take_profit,
+                "final_stop_loss": position.stop_loss,
+                "final_take_profit": position.take_profit,
+                "trailing_stop_updates": position.trailing_updates,
                 "signal_metadata": position.signal_metadata,
             },
         )
@@ -299,7 +346,7 @@ class SignalReplayAdapter:
             if stop_hit or take_profit_hit:
                 if stop_hit:
                     exit_price = float(position.stop_loss or float(bar["close"]))
-                    reason = "stop_loss"
+                    reason = "trailing_stop" if position.trailing_updates > 0 else "stop_loss"
                 else:
                     exit_price = float(position.take_profit or float(bar["close"]))
                     reason = "take_profit"
@@ -310,6 +357,8 @@ class SignalReplayAdapter:
                     exit_reason=reason,
                     exit_bar_index=int(index),
                 )
+            self._apply_trailing_stop(position, bar)
+            position.last_checked_at = pd.Timestamp(bar["timestamp"])
 
         position.last_checked_at = end_timestamp
         return None
@@ -480,11 +529,15 @@ class SignalReplayAdapter:
                 entry_time=fill_time,
                 entry_bar_index=int(fill_index),
                 entry_price=fill_price,
+                signal_entry_price=float(effective_signal.entry_price),
                 quantity=quantity,
                 stop_loss=risk_signal.stop_loss,
                 take_profit=risk_signal.take_profit,
+                initial_stop_loss=risk_signal.stop_loss,
+                initial_take_profit=risk_signal.take_profit,
                 risk_amount=float(sized.risk_amount),
                 risk_percent=float(sized.risk_percent),
+                timeframe=risk_signal.timeframe,
                 source=effective_signal.source,
                 signal_time=effective_signal.timestamp,
                 signal_metadata=dict(effective_signal.metadata),
@@ -538,7 +591,7 @@ class SignalReplayAdapter:
                 if str(signal.source or "").strip()
             }
         )
-        tags = ["signal-replay", *[f"source:{source}" for source in signal_sources]]
+        tags = ["signal-replay", "signal_replay", *[f"source:{source}" for source in signal_sources]]
         created_at = datetime.now(timezone.utc).isoformat()
         inferred_start = backtest_start or replay_signals[0].timestamp.date().isoformat()
         inferred_end = backtest_end or replay_signals[-1].timestamp.date().isoformat()
@@ -568,4 +621,199 @@ class SignalReplayAdapter:
         result = BacktestResult(meta=meta, trades=closed_trades, equity_curve=equity_curve)
         result.stats = compute_stats_for_result(result)
         emit(100.0, f"Completed - {len(closed_trades)} trades found")
+        return result
+
+
+class SignalReplayEngine:
+    """Higher-level replay engine with optional yfinance auto-download fallback."""
+
+    def __init__(
+        self,
+        *,
+        data_dir: str | Path | None = None,
+        risk_config: RiskConfig | None = None,
+        default_timeframe: str = "1h",
+        signal_processor_name: str | None = None,
+    ) -> None:
+        self.data_dir = Path(data_dir or DATA_DIR).expanduser().resolve()
+        self.risk_config = risk_config or RiskConfig()
+        self.default_timeframe = normalize_timeframe(default_timeframe) or "1h"
+        self.signal_processor_name = str(signal_processor_name or "").strip().lower()
+
+    @staticmethod
+    def _infer_replay_timeframe(
+        signals: list[ReplaySignal],
+        fallback: str,
+    ) -> str:
+        has_intraday = False
+        for signal in signals:
+            signal_timeframe = normalize_timeframe(signal.timeframe)
+            if signal_timeframe in {"1m", "5m", "15m", "30m", "1h", "4h"}:
+                return "1m"
+            if any(
+                (
+                    signal.timestamp.hour,
+                    signal.timestamp.minute,
+                    signal.timestamp.second,
+                )
+            ):
+                has_intraday = True
+        if has_intraday:
+            return "1m"
+        if signals:
+            return "1d"
+        return fallback
+
+    def _load_ohlcv(
+        self,
+        *,
+        symbol: str,
+        timeframe: str,
+        start: str | None = None,
+        end: str | None = None,
+    ) -> pd.DataFrame | None:
+        normalized_symbol = str(symbol or "").strip().upper()
+        normalized_timeframe = normalize_timeframe(timeframe) or "1d"
+        if not normalized_symbol:
+            return None
+
+        ohlcv_root = self.data_dir / "ohlcv"
+        matches = sorted(ohlcv_root.rglob(f"**/{normalized_symbol}/{normalized_timeframe}.parquet"))
+        if not matches:
+            return None
+
+        frames: list[pd.DataFrame] = []
+        for path in matches:
+            try:
+                frame = pd.read_parquet(path)
+            except (ValueError, FileNotFoundError, OSError):
+                continue
+            frame.columns = [str(column).lower() for column in frame.columns]
+            if "timestamp" not in frame.columns:
+                continue
+            frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
+            frame = frame.dropna(subset=["timestamp"])
+            if not frame.empty:
+                frames.append(frame)
+
+        if not frames:
+            return None
+
+        merged = pd.concat(frames, ignore_index=True, sort=False)
+        merged = merged.drop_duplicates(subset=["timestamp"], keep="last").sort_values("timestamp")
+        merged = merged.reset_index(drop=True)
+        if start:
+            start_ts = pd.Timestamp(pd.to_datetime(start, utc=True))
+            merged = merged[merged["timestamp"] >= start_ts]
+        if end:
+            end_ts = pd.Timestamp(pd.to_datetime(end, utc=True))
+            merged = merged[merged["timestamp"] <= end_ts]
+        if merged.empty:
+            return None
+        return merged
+
+    def _download_yfinance(
+        self,
+        *,
+        symbol: str,
+        timeframe: str,
+        start: str | None,
+        end: str | None,
+    ) -> None:
+        from data_tools.downloaders.yfinance_dl import YFinanceDownloader
+
+        downloader = YFinanceDownloader()
+        downloader.download(
+            symbol=symbol,
+            timeframe=timeframe,
+            output_dir=self.data_dir,
+            start=start or None,
+            end=end or None,
+        )
+
+    def run_backtest(
+        self,
+        signals: list[dict[str, Any]],
+        signal_processor: str | None,
+        symbols: list[str],
+        start_date: str,
+        end_date: str,
+        initial_capital: float,
+        *,
+        timeframe: str | None = None,
+        auto_download: bool = True,
+        progress_callback: ProgressCallback | None = None,
+    ) -> BacktestResult:
+        if not signals:
+            raise ValueError("signals must not be empty")
+
+        replay_signals = [
+            ReplaySignal.from_payload(signal, default_timeframe=self.default_timeframe)
+            for signal in signals
+        ]
+        resolved_timeframe = normalize_timeframe(timeframe or "") or self._infer_replay_timeframe(
+            replay_signals,
+            self.default_timeframe,
+        )
+        selected_symbols = sorted(
+            {
+                str(symbol or "").strip().upper()
+                for symbol in (symbols or [signal.symbol for signal in replay_signals])
+                if str(symbol or "").strip()
+            }
+        )
+        if not selected_symbols:
+            raise ValueError("symbols must not be empty")
+
+        ohlcv_by_symbol: dict[str, pd.DataFrame] = {}
+        for symbol in selected_symbols:
+            frame = self._load_ohlcv(
+                symbol=symbol,
+                timeframe=resolved_timeframe,
+                start=start_date,
+                end=end_date,
+            )
+            if frame is None and auto_download:
+                self._download_yfinance(
+                    symbol=symbol,
+                    timeframe=resolved_timeframe,
+                    start=start_date,
+                    end=end_date,
+                )
+                frame = self._load_ohlcv(
+                    symbol=symbol,
+                    timeframe=resolved_timeframe,
+                    start=start_date,
+                    end=end_date,
+                )
+            if frame is None:
+                raise ValueError(f"Missing OHLCV for {symbol} ({resolved_timeframe})")
+            ohlcv_by_symbol[symbol] = frame
+
+        processor_name = str(signal_processor or self.signal_processor_name or "").strip().lower()
+        adapter = SignalReplayAdapter(
+            risk_config=self.risk_config,
+            initial_capital=float(initial_capital),
+            default_timeframe=resolved_timeframe,
+            signal_processor_name=processor_name or None,
+        )
+        result = adapter.run(
+            signals=replay_signals,
+            ohlcv_by_symbol=ohlcv_by_symbol,
+            timeframe=resolved_timeframe,
+            backtest_start=start_date,
+            backtest_end=end_date,
+            metadata={
+                "signal_source": "signal_replay",
+                "signal_processor": processor_name or None,
+            },
+            progress_callback=progress_callback,
+        )
+        result.meta.tags = sorted(
+            {
+                *[str(tag) for tag in (result.meta.tags or []) if str(tag).strip()],
+                "signal_replay",
+                "signal-replay",
+            }
+        )
         return result

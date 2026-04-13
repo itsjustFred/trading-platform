@@ -64,9 +64,26 @@ export interface SignalReplayInput {
   metadata?: Record<string, unknown>;
 }
 
+export type BacktestFromSignalsSource = "csv" | "discord-history";
+
 export interface RunBacktestSignalsRequest {
   signals?: SignalReplayInput[];
   signal_source?: LiveSignalSource;
+  signal_processor?: string;
+  account_id?: string;
+  start_date: string;
+  end_date: string;
+  timeframe?: string;
+  capital?: number;
+  risk_per_trade_pct?: number;
+  max_position_pct?: number;
+  max_positions?: number;
+  auto_download?: boolean;
+}
+
+export interface RunBacktestFromSignalsRequest {
+  signal_source: BacktestFromSignalsSource;
+  filepath?: string;
   signal_processor?: string;
   account_id?: string;
   start_date: string;

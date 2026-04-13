@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 
 import live_runner.daemon as daemon
+from live_runner.ctrader_adapter import CTraderAuthTerminalError
 from live_runner.signal_sources.discord_source import (
     DiscordAuthenticationError,
     _is_discord_auth_error,
@@ -69,6 +70,56 @@ def test_ensure_adapter_for_active_account_keeps_adapter_after_connect_failure(m
     assert active_adapters == {"acc-1": adapter}
 
 
+def test_ensure_adapter_for_active_account_blocks_ctrader_terminal_auth(monkeypatch):
+    daemon._CTRADER_AUTH_BLOCKED_ACCOUNTS.clear()
+    daemon._CTRADER_AUTH_BLOCKED_REASONS.clear()
+
+    @dataclass(slots=True)
+    class _TerminalFailAdapter:
+        connect_calls: int = 0
+        disconnect_calls: int = 0
+
+        async def connect(self) -> None:
+            self.connect_calls += 1
+            raise CTraderAuthTerminalError(
+                "Trading account is not authorized",
+                error_code="TRADING_ACCOUNT_IS_NOT_AUTHORIZED",
+            )
+
+        async def disconnect(self) -> None:
+            self.disconnect_calls += 1
+
+    adapter = _TerminalFailAdapter()
+    account = LiveAccountConfig(
+        id="acc-ctrader",
+        broker="ctrader",
+        name="Demo",
+        broker_login="",
+        ctid="",
+    )
+
+    def _factory(_account, *, accounts_env_values):
+        return adapter
+
+    monkeypatch.setattr(daemon, "_create_adapter_for_account", _factory)
+    active_adapters: dict[str, object] = {}
+
+    asyncio.run(
+        daemon._ensure_adapter_for_active_account(
+            "acc-ctrader",
+            {"acc-ctrader": account},
+            active_adapters,
+            accounts_env_values={},
+        )
+    )
+
+    assert adapter.connect_calls == 1
+    assert adapter.disconnect_calls == 1
+    assert active_adapters == {}
+    assert "acc-ctrader" in daemon._CTRADER_AUTH_BLOCKED_ACCOUNTS
+    assert "not authorized" in daemon._CTRADER_AUTH_BLOCKED_REASONS["acc-ctrader"].lower()
+
+
 def test_disconnect_inactive_adapters_removes_and_disconnects() -> None:
     keep_adapter = _TrackingAdapter()
     drop_adapter = _TrackingAdapter()
@@ -93,6 +144,11 @@ def test_resolve_ctrader_credentials_defaults_demo_true_when_unset() -> None:
 
 def test_discord_auth_error_detector_matches_improper_token_message() -> None:
     assert _is_discord_auth_error(RuntimeError("Improper token has been passed"))
+
+
+def test_ctrader_pending_deferred_error_detector() -> None:
+    assert daemon._is_ctrader_pending_deferred_error(RuntimeError("(15, 'Deferred')"))
+    assert not daemon._is_ctrader_pending_deferred_error(RuntimeError("Connection timeout"))
 
 
 def test_discord_listener_retries_stop_on_auth_error(monkeypatch) -> None:
@@ -155,6 +211,8 @@ def test_discord_bot_listener_stops_on_terminal_auth_message(monkeypatch) -> Non
             raise RuntimeError("Improper token has been passed.")
 
     updates: list[tuple[str, object]] = []
+    daemon._DISCORD_SERVICE_AUTH_BLOCKED_IDS.clear()
+    daemon._DISCORD_SERVICE_AUTH_BLOCKED_REASONS.clear()
 
     def _capture_update(service_id: str, status: object, **_kwargs) -> None:
         updates.append((service_id, status))
@@ -166,6 +224,8 @@ def test_discord_bot_listener_stops_on_terminal_auth_message(monkeypatch) -> Non
 
     assert updates
     assert updates[-1] == ("service-1", daemon.ServiceStatus.FAILED)
+    assert "service-1" in daemon._DISCORD_SERVICE_AUTH_BLOCKED_IDS
+    assert "improper token" in daemon._DISCORD_SERVICE_AUTH_BLOCKED_REASONS["service-1"].lower()
 
 
 def test_start_missing_discord_tasks_skips_blocked_accounts() -> None:
@@ -184,3 +244,19 @@ def test_start_missing_discord_tasks_skips_blocked_accounts() -> None:
     )
 
     assert discord_tasks == {}
+
+
+def test_start_missing_tasks_skips_ctrader_auth_blocked_accounts() -> None:
+    daemon._CTRADER_AUTH_BLOCKED_ACCOUNTS.clear()
+    daemon._CTRADER_AUTH_BLOCKED_REASONS.clear()
+    daemon._CTRADER_AUTH_BLOCKED_ACCOUNTS.add("blocked-ctrader")
+    daemon._CTRADER_AUTH_BLOCKED_REASONS["blocked-ctrader"] = "not authorized"
+
+    active_tasks: dict[str, asyncio.Task[None]] = {}
+    daemon._start_missing_tasks(
+        adapters={"blocked-ctrader": object()},
+        active_tasks=active_tasks,
+        active_account_ids={"blocked-ctrader"},
+    )
+
+    assert active_tasks == {}

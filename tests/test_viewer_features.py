@@ -1285,6 +1285,53 @@ def test_auto_download_source_plan_splits_us_intraday_range(viewer_client):
     ]
 
 
+def test_download_missing_ohlcv_data_falls_back_to_yfinance_when_alpaca_credentials_missing(
+    viewer_client, monkeypatch
+):
+    import viewer.main as viewer_app_module
+
+    calls: list[dict[str, str | None]] = []
+
+    class _FailingAlpacaDownloader:
+        def download(self, **_kwargs):
+            raise RuntimeError(
+                "Missing Alpaca credentials. Set ALPACA_API_KEY/APCA_API_KEY_ID and "
+                "ALPACA_SECRET_KEY/APCA_API_SECRET_KEY."
+            )
+
+    class _RecordingYFinanceDownloader:
+        def download(self, **kwargs):
+            calls.append({key: kwargs.get(key) for key in ("symbol", "timeframe", "start", "end")})
+
+    monkeypatch.setitem(
+        sys.modules,
+        "data_tools.downloaders.alpaca_dl",
+        SimpleNamespace(AlpacaDownloader=_FailingAlpacaDownloader),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "data_tools.downloaders.yfinance_dl",
+        SimpleNamespace(YFinanceDownloader=_RecordingYFinanceDownloader),
+    )
+
+    viewer_app_module._download_missing_ohlcv_data(
+        symbol="AAPL",
+        timeframe="1m",
+        start="2026-03-31",
+        end="2026-04-02",
+        source="alpaca",
+    )
+
+    assert calls == [
+        {
+            "symbol": "AAPL",
+            "timeframe": "1m",
+            "start": "2026-03-31",
+            "end": "2026-04-02",
+        }
+    ]
+
+
 def test_data_cache_invalidate_endpoint_returns_stats(viewer_client, monkeypatch):
     import viewer.main as viewer_app_module
 
@@ -2068,6 +2115,91 @@ def test_backtest_run_signals_registers_task_manager_progress(viewer_client, mon
     assert adapter_init_kwargs["signal_processor_name"] == "ramjet"
 
 
+def test_backtest_run_from_signals_csv_forwards_to_replay(viewer_client, monkeypatch, tmp_path):
+    import viewer.main as viewer_app_module
+
+    csv_path = tmp_path / "signals.csv"
+    csv_path.write_text(
+        "\n".join(
+            [
+                "Symbol;Signal Price;Datum;Zeit (NY);Signal Type",
+                "AAPL;173,79;2026-02-23;09:32;BUY",
+                "TSLA;250,10;2026-02-23;10:07;SELL",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    captured: dict[str, object] = {}
+
+    async def _fake_run_backtest_signals(payload):
+        captured["payload"] = payload
+        return {"task_id": "sigcsv01", "job_id": "sigcsv01", "status": "queued"}
+
+    monkeypatch.setattr(viewer_app_module, "run_backtest_signals", _fake_run_backtest_signals)
+
+    response = viewer_client.post(
+        "/api/backtests/run-from-signals",
+        json={
+            "signal_source": "csv",
+            "filepath": str(csv_path),
+            "signal_processor": "stockkit",
+            "start_date": "2026-02-23",
+            "end_date": "2026-02-24",
+            "auto_download": True,
+        },
+    )
+
+    assert response.status_code == 202
+    payload = response.json()
+    assert payload["status"] == "queued"
+    forwarded = captured["payload"]
+    assert forwarded is not None
+    assert forwarded.timeframe == "1m"
+    assert forwarded.signal_processor == "stockkit"
+    assert forwarded.signal_source is None
+    assert len(forwarded.signals) == 2
+    assert str(forwarded.signals[0].source).startswith("csv:")
+
+
+def test_backtest_run_from_signals_csv_date_only_end_is_inclusive(viewer_client, monkeypatch, tmp_path):
+    import viewer.main as viewer_app_module
+
+    csv_path = tmp_path / "signals.csv"
+    csv_path.write_text(
+        "\n".join(
+            [
+                "Symbol;Signal Price;Datum;Zeit (NY);Signal Type",
+                "AAPL;173,79;2026-02-23;09:32;BUY",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    captured: dict[str, object] = {}
+
+    async def _fake_run_backtest_signals(payload):
+        captured["payload"] = payload
+        return {"task_id": "sigcsv02", "job_id": "sigcsv02", "status": "queued"}
+
+    monkeypatch.setattr(viewer_app_module, "run_backtest_signals", _fake_run_backtest_signals)
+
+    response = viewer_client.post(
+        "/api/backtests/run-from-signals",
+        json={
+            "signal_source": "csv",
+            "filepath": str(csv_path),
+            "signal_processor": "stockkit",
+            "start_date": "2026-02-23",
+            "end_date": "2026-02-23",
+        },
+    )
+
+    assert response.status_code == 202
+    forwarded = captured["payload"]
+    assert forwarded is not None
+    assert len(forwarded.signals) == 1
+    assert forwarded.signals[0].symbol == "AAPL"
+
+
 def test_thread_bound_task_log_handler_emits_without_shadowing_handle(viewer_client, tmp_path):
     import viewer.main as viewer_app_module
 
@@ -2105,7 +2237,7 @@ def test_signal_processors_endpoint_exposes_registry(viewer_client):
     assert response.status_code == 200
     payload = response.json()
     ids = {item["id"] for item in payload}
-    assert {"ramjet", "rocketfuel_longsonly", "rocketfuel_longandshort", "nitro"} <= ids
+    assert {"stockkit", "ramjet", "rocketfuel_longsonly", "rocketfuel_longandshort", "nitro"} <= ids
 
 
 def test_optimizations_list_and_detail_endpoints(viewer_client, tmp_path):

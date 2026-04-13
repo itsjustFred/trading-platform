@@ -61,6 +61,11 @@ def _build_rocketfuel_longandshort(config: dict[str, Any]) -> RocketFuelSignalPr
 
 SIGNAL_PROCESSOR_OPTIONS: list[dict[str, str]] = [
     {
+        "id": "stockkit",
+        "label": "StockKit",
+        "description": "StockKit-compatible processor (SL/TP + trailing metadata).",
+    },
+    {
         "id": "ramjet",
         "label": "RamJet",
         "description": "ATR + Supertrend BUY-only setup with TP1 and trailing metadata.",
@@ -84,6 +89,7 @@ SIGNAL_PROCESSOR_OPTIONS: list[dict[str, str]] = [
 
 
 SIGNAL_PROCESSORS: dict[str, SignalProcessorFactory] = {
+    "stockkit": _build_ramjet,
     "ramjet": _build_ramjet,
     "rocketfuel": _build_rocketfuel_longsonly,
     "rocketfuel_longsonly": _build_rocketfuel_longsonly,

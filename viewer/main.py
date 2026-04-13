@@ -41,6 +41,7 @@ from starlette.middleware.gzip import GZipMiddleware
 
 from data_tools.catalog_builder import merge_ohlcv_entries
 from data_tools import cache_manager
+from data_tools.signal_import import load_signals_from_csv
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(PROJECT_ROOT / ".env")
@@ -690,6 +691,21 @@ class BacktestRunSignalsRequest(SQLModel):
     start_date: str
     end_date: str
     timeframe: str = "1h"
+    capital: float = 100000.0
+    risk_per_trade_pct: float | None = None
+    max_position_pct: float | None = None
+    max_positions: int | None = None
+    auto_download: bool = True
+
+
+class BacktestRunFromSignalsRequest(SQLModel):
+    signal_source: str = "csv"
+    filepath: str = ""
+    signal_processor: str | None = None
+    account_id: str | None = None
+    start_date: str
+    end_date: str
+    timeframe: str = ""
     capital: float = 100000.0
     risk_per_trade_pct: float | None = None
     max_position_pct: float | None = None
@@ -2979,14 +2995,17 @@ def _signal_status_from_row(row: dict[str, Any]) -> str:
     return "Pending"
 
 
-def _parse_request_date(value: str, *, field_name: str) -> datetime:
+def _parse_request_date(value: str, *, field_name: str, end_of_day: bool = False) -> datetime:
     text = str(value or "").strip()
     if not text:
         raise HTTPException(status_code=400, detail=f"{field_name} is required")
     parsed = pd.to_datetime(text, utc=True, errors="coerce")
     if pd.isna(parsed):
         raise HTTPException(status_code=400, detail=f"Invalid {field_name}: {value}")
-    return pd.Timestamp(parsed).to_pydatetime()
+    timestamp = pd.Timestamp(parsed)
+    if end_of_day and re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        timestamp = timestamp + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
+    return timestamp.to_pydatetime()
 
 
 def _normalize_replay_signal_payload(
@@ -3021,6 +3040,43 @@ def _normalize_replay_signal_payload(
         "source": str(payload.source or metadata.get("source") or "manual").lower(),
         "metadata": dict(metadata),
     }
+
+
+def _signal_has_intraday_timestamp(payload: dict[str, Any]) -> bool:
+    raw_timestamp = payload.get("timestamp")
+    parsed = pd.to_datetime(raw_timestamp, utc=True, errors="coerce")
+    if pd.isna(parsed):
+        return False
+    ts = pd.Timestamp(parsed)
+    return bool(ts.hour or ts.minute or ts.second)
+
+
+def _resolve_signal_replay_timeframe(
+    *,
+    requested_timeframe: str | None,
+    normalized_signals: list[dict[str, Any]],
+    fallback: str = "1h",
+) -> str:
+    requested = normalize_timeframe(str(requested_timeframe or "").strip())
+    if requested:
+        return requested
+
+    intraday_timeframes = {"1m", "5m", "15m", "30m", "1h", "4h"}
+    has_intraday = False
+    for signal in normalized_signals:
+        signal_timeframe = normalize_timeframe(str(signal.get("timeframe") or "").strip())
+        if signal_timeframe in intraday_timeframes:
+            has_intraday = True
+            break
+        if _signal_has_intraday_timestamp(signal):
+            has_intraday = True
+            break
+
+    if has_intraday:
+        return "1m"
+    if normalized_signals:
+        return "1d"
+    return normalize_timeframe(fallback) or fallback
 
 
 def _signal_replay_task_name(source_label: str) -> str:
@@ -5130,14 +5186,40 @@ def _download_missing_ohlcv_data(
     if selected_source == "alpaca":
         from data_tools.downloaders.alpaca_dl import AlpacaDownloader
 
-        downloader = AlpacaDownloader()
-        downloader.download(
-            symbol=normalized_symbol,
-            timeframe=normalized_timeframe,
-            output_dir=DATA_DIR,
-            start=start or None,
-            end=end or None,
-        )
+        try:
+            downloader = AlpacaDownloader()
+            downloader.download(
+                symbol=normalized_symbol,
+                timeframe=normalized_timeframe,
+                output_dir=DATA_DIR,
+                start=start or None,
+                end=end or None,
+            )
+        except RuntimeError as exc:
+            message = str(exc)
+            if "Missing Alpaca credentials" not in message:
+                raise
+            logger.warning(
+                "Alpaca credentials missing for auto-download; falling back to yfinance",
+                extra={
+                    "data": {
+                        "symbol": normalized_symbol,
+                        "timeframe": normalized_timeframe,
+                        "start": start,
+                        "end": end,
+                    }
+                },
+            )
+            from data_tools.downloaders.yfinance_dl import YFinanceDownloader
+
+            fallback = YFinanceDownloader()
+            fallback.download(
+                symbol=normalized_symbol,
+                timeframe=normalized_timeframe,
+                output_dir=DATA_DIR,
+                start=start or None,
+                end=end or None,
+            )
         return
 
     if selected_source == "yfinance":
@@ -6788,16 +6870,20 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
 
 @app.post("/api/backtests/run-signals", response_model=dict[str, Any], status_code=202)
 async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, Any]:
-    timeframe = normalize_timeframe(str(payload.timeframe or "1h")) or "1h"
+    requested_timeframe = normalize_timeframe(str(payload.timeframe or "").strip()) or ""
     start_dt = _parse_request_date(payload.start_date, field_name="start_date")
-    end_dt = _parse_request_date(payload.end_date, field_name="end_date")
+    end_dt = _parse_request_date(payload.end_date, field_name="end_date", end_of_day=True)
     if start_dt > end_dt:
         raise HTTPException(status_code=400, detail="start_date must be <= end_date")
 
     direct_signals_payload = list(payload.signals or [])
     source_name = str(payload.signal_source or "").strip().lower()
-    if source_name and source_name not in {"discord", "internal"}:
-        raise HTTPException(status_code=400, detail="signal_source must be 'discord' or 'internal'")
+    valid_sources = {"discord", "internal", "csv", "discord-history", "manual"}
+    if source_name and source_name not in valid_sources:
+        raise HTTPException(
+            status_code=400,
+            detail="signal_source must be one of: discord, internal, csv, discord-history, manual",
+        )
     normalized_source = source_name if source_name in {"discord", "internal"} else ""
     account_id = str(payload.account_id or "").strip()
     signal_processor_name = str(payload.signal_processor or "").strip().lower()
@@ -6832,13 +6918,22 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
     if max_positions <= 0:
         raise HTTPException(status_code=400, detail="max_positions must be > 0")
 
+    default_timeframe = requested_timeframe or "1h"
     if direct_signals_payload:
         normalized_signals: list[dict[str, Any]] = [
-            _normalize_replay_signal_payload(item, default_timeframe=timeframe)
+            _normalize_replay_signal_payload(item, default_timeframe=default_timeframe)
             for item in direct_signals_payload
         ]
-        replay_source_label = "manual"
+        replay_source_label = source_name or str(
+            normalized_signals[0].get("source") if normalized_signals else "manual"
+        )
+        replay_source_label = replay_source_label.strip().lower() or "manual"
     else:
+        if normalized_source not in {"discord", "internal"}:
+            raise HTTPException(
+                status_code=400,
+                detail="signal_source must be 'discord' or 'internal' when signals are omitted",
+            )
         deployments = await asyncio.to_thread(list_live_deployments)
         candidate_deployment_ids = [
             str(deployment.id)
@@ -6874,7 +6969,8 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
                     "entry_price": _safe_float(row.get("entry_price"), 0.0),
                     "stop_loss": row.get("stop_loss"),
                     "take_profit": row.get("take_profit"),
-                    "timeframe": normalize_timeframe(str(row.get("timeframe") or timeframe)) or timeframe,
+                    "timeframe": normalize_timeframe(str(row.get("timeframe") or default_timeframe))
+                    or default_timeframe,
                     "source": str(row.get("source") or normalized_source or "internal").lower(),
                     "metadata": (
                         dict(row.get("metadata"))
@@ -6894,6 +6990,12 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
     ]
     if not normalized_signals:
         raise HTTPException(status_code=400, detail="No valid signals to replay")
+
+    timeframe = _resolve_signal_replay_timeframe(
+        requested_timeframe=requested_timeframe,
+        normalized_signals=normalized_signals,
+        fallback=default_timeframe,
+    )
 
     symbols = sorted({str(item["symbol"]).strip().upper() for item in normalized_signals})
     start_str = start_dt.date().isoformat()
@@ -7066,6 +7168,7 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
                     {
                         *(result.meta.tags or []),
                         "signal-replay",
+                        "signal_replay",
                     }
                 )
                 if replay_source_label:
@@ -7115,6 +7218,119 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
     _update_task_fields(task_id, thread=thread)
     thread.start()
     return {"task_id": task_id, "job_id": task_id, "status": "queued"}
+
+
+@app.post("/api/backtests/run-from-signals", response_model=dict[str, Any], status_code=202)
+async def run_backtest_from_signals(payload: BacktestRunFromSignalsRequest) -> dict[str, Any]:
+    source = str(payload.signal_source or "csv").strip().lower()
+    if source in {"discord-history", "discord"}:
+        replay_payload = BacktestRunSignalsRequest(
+            signal_source="discord",
+            signal_processor=payload.signal_processor,
+            account_id=payload.account_id,
+            start_date=payload.start_date,
+            end_date=payload.end_date,
+            timeframe=normalize_timeframe(str(payload.timeframe or "1m")) or "1m",
+            capital=float(payload.capital or 100000.0),
+            risk_per_trade_pct=payload.risk_per_trade_pct,
+            max_position_pct=payload.max_position_pct,
+            max_positions=payload.max_positions,
+            auto_download=payload.auto_download,
+        )
+        return await run_backtest_signals(replay_payload)
+
+    if source != "csv":
+        raise HTTPException(status_code=400, detail="signal_source must be 'csv' or 'discord-history'")
+
+    file_path = str(payload.filepath or "").strip()
+    if not file_path:
+        raise HTTPException(status_code=400, detail="filepath is required for csv signal_source")
+
+    try:
+        loaded_signals = await asyncio.to_thread(load_signals_from_csv, file_path)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if not loaded_signals:
+        raise HTTPException(status_code=400, detail="CSV file contains no replayable signals")
+
+    start_dt = _parse_request_date(payload.start_date, field_name="start_date")
+    end_dt = _parse_request_date(payload.end_date, field_name="end_date", end_of_day=True)
+    if start_dt > end_dt:
+        raise HTTPException(status_code=400, detail="start_date must be <= end_date")
+
+    source_label = f"csv:{Path(file_path).name}"
+    filtered_signals: list[dict[str, Any]] = []
+    signal_inputs: list[SignalReplayInput] = []
+    for signal in loaded_signals:
+        signal_time = pd.to_datetime(signal.get("timestamp"), utc=True, errors="coerce")
+        if pd.isna(signal_time):
+            continue
+        signal_dt = pd.Timestamp(signal_time).to_pydatetime()
+        if signal_dt < start_dt or signal_dt > end_dt:
+            continue
+
+        action = str(signal.get("action") or "").strip().lower()
+        if action not in {"buy", "sell", "long", "short"}:
+            continue
+        entry_price = _safe_float(signal.get("entry_price"), 0.0)
+        if entry_price <= 0:
+            continue
+
+        metadata = dict(signal.get("metadata") or {})
+        metadata["signal_source_label"] = f"CSV: {Path(file_path).name}"
+        metadata["signal_filepath"] = str(Path(file_path).expanduser())
+        signal_payload = {
+            "timestamp": pd.Timestamp(signal_time).isoformat(),
+            "symbol": str(signal.get("symbol") or "").strip().upper(),
+            "action": action,
+            "entry_price": entry_price,
+            "stop_loss": signal.get("stop_loss"),
+            "take_profit": signal.get("take_profit"),
+            "timeframe": normalize_timeframe(str(signal.get("timeframe") or "")) or "",
+            "source": source_label,
+            "metadata": metadata,
+        }
+        filtered_signals.append(signal_payload)
+        signal_inputs.append(
+            SignalReplayInput(
+                timestamp=str(signal_payload["timestamp"]),
+                symbol=str(signal_payload["symbol"]),
+                action=str(signal_payload["action"]),
+                entry_price=float(signal_payload["entry_price"]),
+                stop_loss=signal_payload.get("stop_loss"),
+                take_profit=signal_payload.get("take_profit"),
+                timeframe=str(signal_payload["timeframe"] or ""),
+                source=str(signal_payload["source"]),
+                metadata=dict(metadata),
+            )
+        )
+
+    if not signal_inputs:
+        raise HTTPException(status_code=400, detail="No replayable CSV signals in selected date range")
+
+    timeframe = _resolve_signal_replay_timeframe(
+        requested_timeframe=payload.timeframe,
+        normalized_signals=filtered_signals,
+        fallback="1h",
+    )
+    replay_payload = BacktestRunSignalsRequest(
+        signals=signal_inputs,
+        signal_source=None,
+        signal_processor=payload.signal_processor,
+        account_id=payload.account_id,
+        start_date=payload.start_date,
+        end_date=payload.end_date,
+        timeframe=timeframe,
+        capital=float(payload.capital or 100000.0),
+        risk_per_trade_pct=payload.risk_per_trade_pct,
+        max_position_pct=payload.max_position_pct,
+        max_positions=payload.max_positions,
+        auto_download=payload.auto_download,
+    )
+    return await run_backtest_signals(replay_payload)
 
 
 @app.get("/api/backtests/run/{job_id}/status", response_model=dict[str, Any])

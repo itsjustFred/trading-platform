@@ -9,6 +9,7 @@ import {
   getBacktestsAll,
 } from "../api/client";
 import type { BacktestMetadataItem, BacktestsDuplicatesResponse } from "../api/types";
+import { BacktestFromSignalsModal } from "../components/BacktestFromSignalsModal";
 import { CreateBacktestModal } from "../components/CreateBacktestModal";
 import { DualRangeSlider } from "../components/DualRangeSlider";
 import { FilterBar } from "../components/FilterBar";
@@ -310,6 +311,7 @@ export function BacktestsPage() {
   const [items, setItems] = useState<BacktestCardModel[]>([]);
   const [loading, setLoading] = useState(false);
   const [showCreateModal, setShowCreateModal] = useState(false);
+  const [showSignalsModal, setShowSignalsModal] = useState(false);
 
   const [nameFilter, setNameFilter] = useState("");
   const [selectedStrategies, setSelectedStrategies] = useState<string[]>([]);
@@ -907,6 +909,24 @@ export function BacktestsPage() {
             </button>
             <button
               type="button"
+              onClick={() => setShowSignalsModal(true)}
+              style={{
+                borderRadius: "10px",
+                border: "1px solid rgba(56, 189, 248, 0.45)",
+                background: "rgba(12, 74, 110, 0.26)",
+                color: "#bae6fd",
+                padding: "8px 12px",
+                fontSize: "0.76rem",
+                cursor: "pointer",
+                display: "inline-flex",
+                alignItems: "center",
+                gap: "6px",
+              }}
+            >
+              Backtest from Signals
+            </button>
+            <button
+              type="button"
               onClick={() => setShowCreateModal(true)}
               style={{
                 borderRadius: "10px",
@@ -1416,6 +1436,10 @@ export function BacktestsPage() {
         open={showCreateModal}
         onClose={() => setShowCreateModal(false)}
         onTaskStarted={() => setShowCreateModal(false)}
+      />
+      <BacktestFromSignalsModal
+        open={showSignalsModal}
+        onClose={() => setShowSignalsModal(false)}
       />
     </div>
   );

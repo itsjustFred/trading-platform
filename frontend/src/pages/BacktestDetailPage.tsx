@@ -185,6 +185,15 @@ export function BacktestDetailPage() {
     shortTrades: trades.filter((trade) => trade.direction === "SHORT").length,
   };
 
+  const toNumberOrNull = (value: unknown): number | null => {
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+    if (typeof value === "string" && value.trim()) {
+      const parsed = Number(value);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+    return null;
+  };
+
   const tradeRows = trades.map<TradeTableRow>((trade) => {
     const duration =
       (trade.duration && trade.duration.trim()) ||
@@ -193,6 +202,29 @@ export function BacktestDetailPage() {
     const parsed = Date.parse(timestamp);
     const date = Number.isFinite(parsed) ? new Date(parsed).toISOString().slice(0, 10) : "";
     const time = Number.isFinite(parsed) ? new Date(parsed).toISOString().slice(11, 19) : timestamp;
+    const tradeMeta = (
+      trade.meta && typeof trade.meta === "object" ? trade.meta : {}
+    ) as Record<string, unknown>;
+    const signalTimestamp =
+      typeof tradeMeta.signal_timestamp === "string" ? tradeMeta.signal_timestamp : "";
+    const signalSource =
+      typeof tradeMeta.signal_source === "string"
+        ? tradeMeta.signal_source
+        : typeof info?.parameters?.signal_source === "string"
+          ? info.parameters.signal_source
+          : "";
+    const fillLagFromMeta = toNumberOrNull(tradeMeta.fill_delay_seconds);
+    const fillLagFromTimestamps = (() => {
+      const signalTimeMs = Date.parse(signalTimestamp || "");
+      const fillTimeMs = Date.parse(trade.entry_time_iso || "");
+      if (!Number.isFinite(signalTimeMs) || !Number.isFinite(fillTimeMs)) {
+        return null;
+      }
+      const diffSeconds = (fillTimeMs - signalTimeMs) / 1000;
+      return Number.isFinite(diffSeconds) ? Math.max(0, Math.round(diffSeconds)) : null;
+    })();
+    const signalStopLoss = toNumberOrNull(tradeMeta.signal_stop_loss);
+    const signalTakeProfit = toNumberOrNull(tradeMeta.signal_take_profit);
     return {
       id: String(trade.nr),
       date,
@@ -200,9 +232,14 @@ export function BacktestDetailPage() {
       strategy: info?.title || info?.strategy_display_name || info?.strategy || "",
       symbol: trade.symbol,
       side: trade.direction,
+      signalSource,
+      signalTime: signalTimestamp,
+      fillLagSec: fillLagFromMeta ?? fillLagFromTimestamps,
       size: trade.position_size ?? trade.quantity,
       entryPrice: trade.entry_price,
       exitPrice: trade.exit_price,
+      processorStopLoss: signalStopLoss,
+      processorTakeProfit: signalTakeProfit,
       pnl: trade.pnl,
       pnlPct: trade.pnl_pct,
       exitReason: trade.exit_reason ?? "",
@@ -314,6 +351,11 @@ export function BacktestDetailPage() {
                 📅 {info?.timeframe?.start?.slice(0, 10)} →{" "}
                 {info?.timeframe?.end?.slice(0, 10)}
               </span>
+              {info?.engine === "signal-replay" ? (
+                <span style={{ marginRight: "16px" }}>
+                  📡 {String(info?.parameters?.signal_source || "signal-replay")}
+                </span>
+              ) : null}
               <span>
                 💰 ${(info?.initial_capital || 100000).toLocaleString()}
               </span>

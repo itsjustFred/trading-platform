@@ -1,23 +1,27 @@
 # GitHub Copilot Instructions - trading-platform
 
 This file is the canonical AI assistant instruction set for this repository.
-It refines the existing instructions with corrected command expectations, naming details, and cross-module data flow.
+It captures command usage, architecture flow, and conventions that are easy to miss when reading one file at a time.
 
 ## Sources to trust first
 
-- `README.md` (quick start and CLI usage)
-- `pyproject.toml` (Python deps, pytest config, ruff config)
-- `frontend/package.json` and `frontend/vite.config.ts` (frontend scripts and API proxy)
-- `docs/logging_guide.md` (structured logging usage and env vars)
-- `docs/DATA_SOURCES.md` (data source and path conventions)
-- `docs/ARCHITECTURE.md` (current system architecture and module responsibilities)
-- `docs/pynecore_evaluation.md` (PyneCore integration constraints)
+- `README.md` (setup, runtime commands, environment variables)
+- `pyproject.toml` (Python deps, pytest config, Ruff config)
+- `frontend/package.json` and `frontend/vite.config.ts` (frontend scripts and dev proxy)
+- `docs/ARCHITECTURE.md` (cross-module flow)
+- `docs/DATA_SOURCES.md` (canonical data path and downloader entry points)
+- `docs/logging_guide.md` (structured logging contract)
+- `runner/cli.py`, `runner/engines/base.py`, `runner/engines/native_adapter.py`, `runner/engines/vectorbt_adapter.py` (engine contracts and execution semantics)
+- `shared/constants.py`, `shared/database.py`, `shared/models.py`, `shared/strategy_registry.py` (shared contracts, path resolution, persistence, strategy discovery)
+- `viewer/main.py` and `viewer/core.py` (FastAPI API shape + helper payload logic)
+- `frontend/src/api/client.ts` and `frontend/src/api/types.ts` (frontend/backend contract)
+- `.vscode/mcp.json` (workspace MCP server configuration)
 
-No additional assistant-specific config files were found (`CLAUDE.md`, `AGENTS.md`, `.cursorrules`, `.cursor/rules/`, `.windsurfrules`, `.clinerules`, `.cline_rules`, `CONVENTIONS.md`, `AIDER_CONVENTIONS.md`).
+No additional assistant-specific config files are present (`CLAUDE.md`, `AGENTS.md`, `.cursorrules`, `.cursor/rules/`, `.windsurfrules`, `.clinerules`, `.cline_rules`, `CONVENTIONS.md`, `AIDER_CONVENTIONS.md`).
 
 ## Build, test, and lint commands
 
-### Python (runner/shared/viewer/data_tools/strategies)
+### Python backend/tooling
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
@@ -26,7 +30,7 @@ pip install -e ".[all]"
 
 ```bash
 # Run a backtest
-python -m runner.cli run -e vectorbt -s strategies/example_sma/example_sma.py \
+python -m runner.cli run -e native -s strategies/example_sma/example_sma.py \
   --symbols AAPL --timeframe 1h --start 2024-01-01 --end 2025-12-31
 
 # List available engines
@@ -36,7 +40,7 @@ python -m runner.cli engines
 python -m runner.converters.cli stockkit path/to/trades.csv -o output.trades.json
 python -m runner.converters.cli lean path/to/lean_result.json -o output.trades.json
 
-# Start FastAPI + web UI server
+# Start API + UI host
 uvicorn viewer.main:app --host 0.0.0.0 --port 5556 --no-access-log
 ```
 
@@ -48,7 +52,7 @@ uvicorn viewer.main:app --host 0.0.0.0 --port 5556 --no-access-log
 .venv/bin/python -m pytest tests/test_stats.py -q
 
 # Single test
-.venv/bin/python -m pytest tests/test_models.py::TestTrade::test_simple_roundtrip -v
+.venv/bin/python -m pytest tests/test_runner_cli.py::test_cmd_run_normalizes_timeframe_alias -q
 ```
 
 ```bash
@@ -56,7 +60,7 @@ uvicorn viewer.main:app --host 0.0.0.0 --port 5556 --no-access-log
 .venv/bin/ruff check .
 ```
 
-### Frontend (React/TypeScript in `frontend/`)
+### Frontend (`frontend/`)
 
 ```bash
 cd frontend && npm install
@@ -65,12 +69,12 @@ cd frontend && npm run build
 cd frontend && npm run lint
 ```
 
-### Data tools (used by viewer data-management endpoints)
+### Data tools
 
 ```bash
-python -m data_tools.catalog_builder -o "$TRADING_DATA_DIR/catalog.json"
-python -m data_tools.validate --data-dir "$TRADING_DATA_DIR"
-python -m data_tools.resample --source "$TRADING_DATA_DIR/ohlcv/<source>/<asset_class>/<symbol>/1h.parquet" --timeframes 4h,1d
+python -m data_tools.catalog_builder -o "$DATA_DIR/catalog.json"
+python -m data_tools.validate --data-dir "$DATA_DIR"
+python -m data_tools.resample --source "$DATA_DIR/ohlcv/<source>/<asset_class>/<symbol>/1h.parquet" --timeframes 4h,1d
 ```
 
 ### Optional UI E2E script
@@ -80,87 +84,77 @@ python -m data_tools.resample --source "$TRADING_DATA_DIR/ohlcv/<source>/<asset_
 PLAYWRIGHT_BROWSERS_PATH=/home/ubuntu/.cache/ms-playwright node tests/e2e_frontend.js
 ```
 
-Current baseline in this repository state:
-- `.venv/bin/python -m pytest tests -q` passes.
-- `cd frontend && npm run build` passes.
-- `cd frontend && npm run lint` currently reports existing violations.
-- `.venv/bin/ruff check .` currently reports existing violations.
-
 ## High-level architecture
 
 ### End-to-end flow
 
-1. `runner/cli.py` builds `BacktestConfig` and dispatches to an engine adapter (`vectorbt`, `lean`, `pynecore`).
-2. The adapter returns a universal `BacktestResult` (`shared/models.py`).
-3. Runner persists output under `$TRADING_DATA_DIR/backtests/*.trades.json`.
-4. `viewer/main.py` loads stored results and exposes API endpoints (`/api/backtests`, `/api/backtest/<id>/...`, `/api/strategies`, `/api/portfolios`, `/api/data/*`).
-5. `frontend/src/api/client.ts` consumes `/api/*`; in dev, Vite proxies `/api` to `http://localhost:5556`.
-6. Viewer serves built frontend from `frontend/dist` when present, else falls back to `viewer/static`.
+1. `runner/cli.py` builds `BacktestConfig`, detects strategy type, and dispatches to an engine adapter (`native`, `vectorbt`, `lean`, `pynecore`).
+2. Adapters return a canonical `BacktestResult` (`shared/models.py`).
+3. Runner persists results both to JSON (`$DATA_DIR/backtests/*.trades.json`) and SQLite (`$DATA_DIR/backtests.db` via `shared/database.py`).
+4. `viewer/main.py` initializes DB, runs JSON→SQLite migration on startup, and serves `/api/*` + `/ws/*`.
+5. `frontend/src/api/client.ts` (typed by `frontend/src/api/types.ts`) consumes `/api/*`; Vite proxies `/api` and `/ws` to `localhost:5556` in dev.
+6. FastAPI serves SPA assets from `frontend/dist` when available, otherwise `viewer/static`.
 
 ### Module responsibilities
 
-- `shared/`: canonical data models and centralized JSON logging.
-- `runner/`: CLI orchestration, engine adapters, stats, and import converters.
-- `viewer/`: FastAPI backend and async job/task orchestration for runs and data operations.
-- `frontend/`: React SPA for backtests, strategies, portfolios, data management, and logs.
-- `data_tools/`: catalog build, validation, resampling, and downloader integrations.
-- `strategies/`: strategy implementations consumed by adapters.
+- `shared/`: canonical models, constants/path resolution, SQLite persistence layer, JSON logging, strategy registry.
+- `runner/`: CLI orchestration, engine adapters, trade/stat computation, converters, optimizer/auto-agent.
+- `viewer/`: FastAPI routes, request/task orchestration, WebSocket streams, API payload shaping.
+- `frontend/`: React SPA for backtests, portfolios, strategies, live, and data management.
+- `data_tools/`: source downloaders + validation/resampling/catalog pipeline into canonical OHLCV layout.
+- `strategies/`: strategy modules and per-strategy documentation.
 
 ## Key conventions specific to this codebase
 
-### Universal data contract and serialization
+### Canonical result contract across modules
 
-- Cross-module boundary format is always `BacktestResult`/`BacktestMeta`/`Trade`/`TradeExit` from `shared/models.py`.
-- Persisted timestamps are ISO-8601 strings; viewer transforms them to Unix seconds for chart payloads.
+- `BacktestResult` / `BacktestMeta` / `Trade` / `TradeExit` in `shared/models.py` are the cross-module contract.
+- Persisted timestamps are ISO-8601 strings; viewer APIs convert to Unix timestamps for chart payloads.
 
-### Strategy contract (vectorbt adapter)
+### Strategy execution contract (native + vectorbt)
 
-- Strategy modules must define:
-  ```python
-  def generate_signals(df: pd.DataFrame, params: dict) -> pd.DataFrame
-  ```
-- Required columns: `entries`, `exits` (boolean-like).
-- Optional columns consumed by adapter logic: `direction`, `stop_loss`, and ATR-like columns.
-- Optional module-level `STRATEGY_META` is read when present.
+- Strategies must expose `generate_signals(...)`.
+- Preferred output is tuple/list: `(entries, exits)`, `(entries, exits, indicators_dict)`, or `(entries, exits, indicators_dict, drawings)`.
+- Legacy DataFrame output is still supported, but it must contain `entries` and `exits` columns.
+- Vectorbt adapter supports both `generate_signals(df, params_dict)` and kwargs-style signatures (`generate_signals(df, fast=..., slow=...)`).
+- Signal execution in vectorbt is shifted by one bar (`signals.shift(1)`), so entries/exits execute on next bar open.
 
-### Engine adapter contract
+### Strategy metadata and discovery
 
-- All engines subclass `runner/engines/base.py::EngineAdapter` and implement `run(config, strategy_path) -> BacktestResult`.
-- `validate_config` returns a list of errors; CLI exits if any errors are returned.
+- Strategy discovery is slug-based (`strategies/<slug>/<slug>.py` is the stable pattern).
+- `STRATEGY_META` drives display metadata and parameter defaults.
+- Strategy type detection uses `STRATEGY_META` (`strategy_type`/`type`) and falls back to class-pattern detection (`*SignalProcessor` with `process_signal`).
 
-### Data directory and path conventions
+### Engine/persistence identity details
 
-- Base data root: `TRADING_DATA_DIR` env var (default `~/data`).
-- The resolved path is centralized in `shared/constants.py` as `DATA_DIR`. All modules import from there.
-- OHLCV path shape: `$TRADING_DATA_DIR/ohlcv/{source}/{asset_class}/[{region}/]{symbol}/{timeframe}.parquet`
-- Backtests are read from `$TRADING_DATA_DIR/backtests/*.trades.json`.
-- Catalog lives at `$TRADING_DATA_DIR/catalog.json`.
-- Dukascopy genesis dates: bundled baseline in `data_tools/config/dukascopy_genesis.json`, runtime overrides in `$TRADING_DATA_DIR/dukascopy_genesis.json`.
+- Available engine identifiers are `native`, `vectorbt`, `lean`, `pynecore`.
+- Default runner output filename is `{strategy_name}_{YYYYMMDD_%H%M%S}.trades.json` (engine not embedded).
+- Engine adapters generate engine-specific `meta.id` prefixes (e.g., `native-...`, `vbt-...`).
+- Viewer attempts DB-first reads and falls back to JSON (`backtests/<id>.trades.json`), then backfills SQLite.
 
-### ID and filename nuances
+### Data directory and file layout
 
-- Default runner output filename in `runner/cli.py`:
-  `{strategy_name}_{YYYYMMDD_%H%M%S}.trades.json` (engine is not part of filename).
-- `vectorbt_adapter` `meta.id` format:
-  `vbt-{strategy_name}-{YYYYMMDD-%H%M%S}`.
-- Direction values are uppercase `LONG`/`SHORT`.
-- Valid timeframes are defined in `shared/models.py` and `shared/constants.py`.
+- `DATA_DIR` is the primary env var; `TRADING_DATA_DIR` is fallback if `DATA_DIR` is unset.
+- Resolved path is centralized in `shared/constants.py` as `DATA_DIR` and reused everywhere.
+- Canonical OHLCV path: `$DATA_DIR/ohlcv/{source}/{asset_class}/[{region}/]{symbol}/{timeframe}.parquet`.
+- Catalog path: `$DATA_DIR/catalog.json`; SQLite path: `$DATA_DIR/backtests.db`.
 
 ### Metric unit semantics
 
-- In `runner/stats.py`, max drawdown is a decimal fraction (e.g., `0.12`).
-- In viewer API responses for UI (`/api/backtest/<id>/stats`), drawdown is converted to percentage points (multiplied by 100).
+- Runner canonical stats use decimal fractions for ratio-like metrics (`total_return`, `cagr`, `win_rate`, `max_drawdown_pct`).
+- Viewer endpoints convert many of these values to percentage points for UI payloads (for example `/api/backtest/{id}/stats`).
 
 ### Logging convention
 
 - Use `shared.logging.get_logger(service)` instead of ad-hoc logger setup.
-- Attach structured payloads with `extra={"data": {...}}`.
+- Attach structured payloads via `extra={"data": {...}}`.
 - Logs are JSON lines to stdout and rotating files in `$LOG_DIR/<service>.log` (10 MB, 5 backups).
 
 ### Frontend/backend contract discipline
 
-- Keep API shape changes synchronized between:
-  - `viewer/app.py`
+- Keep API shape changes synchronized across:
+  - `viewer/main.py`
+  - `viewer/core.py` (shared payload helpers)
   - `frontend/src/api/client.ts`
   - `frontend/src/api/types.ts`
-- This repository relies on API field names matching frontend expectations; update all three in the same change.
+- Frontend assumes route and field-name stability; update all four together for API changes.
