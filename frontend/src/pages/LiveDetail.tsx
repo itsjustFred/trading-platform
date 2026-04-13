@@ -10,10 +10,17 @@ import {
 } from "lightweight-charts";
 import type { IChartApi, Time } from "lightweight-charts";
 
-import { getLiveBalances, getLiveStats, getLiveTrades, runBacktestSignals } from "../api/client";
+import {
+  getLiveBalances,
+  getLiveStats,
+  getLiveTrades,
+  getSignalProcessors,
+  runBacktestSignals,
+} from "../api/client";
 import type {
   LiveAccountStats,
   LiveBalanceRecord,
+  SignalProcessorOption,
   LiveTradeSlippage,
 } from "../api/types";
 import { TradeTable, type TradeTableRow } from "../components/TradeTable";
@@ -27,6 +34,7 @@ type ReplayFormState = {
   start_date: string;
   end_date: string;
   timeframe: string;
+  signal_processor: string;
   auto_download: boolean;
 };
 
@@ -64,6 +72,8 @@ export function LiveDetailPage() {
   const [error, setError] = useState("");
   const [replayModalOpen, setReplayModalOpen] = useState(false);
   const [isStartingReplay, setIsStartingReplay] = useState(false);
+  const [signalProcessors, setSignalProcessors] = useState<SignalProcessorOption[]>([]);
+  const [signalProcessorsLoading, setSignalProcessorsLoading] = useState(false);
   const [replayForm, setReplayForm] = useState<ReplayFormState>(() => {
     const today = new Date();
     const endDate = today.toISOString().slice(0, 10);
@@ -72,6 +82,7 @@ export function LiveDetailPage() {
       start_date: startDate,
       end_date: endDate,
       timeframe: DEFAULT_REPLAY_TIMEFRAME,
+      signal_processor: "",
       auto_download: true,
     };
   });
@@ -133,6 +144,17 @@ export function LiveDetailPage() {
     };
   }, [accountId]);
 
+  useEffect(() => {
+    if (!replayModalOpen || signalProcessorsLoading) {
+      return;
+    }
+    setSignalProcessorsLoading(true);
+    getSignalProcessors()
+      .then((payload) => setSignalProcessors(payload))
+      .catch(() => setSignalProcessors([]))
+      .finally(() => setSignalProcessorsLoading(false));
+  }, [replayModalOpen, signalProcessorsLoading]);
+
   const equitySeries = useMemo(
     () =>
       balances
@@ -189,6 +211,7 @@ export function LiveDetailPage() {
     try {
       const response = await runBacktestSignals({
         signal_source: "discord",
+        signal_processor: replayForm.signal_processor || undefined,
         account_id: accountId,
         start_date: replayForm.start_date,
         end_date: replayForm.end_date,
@@ -255,6 +278,25 @@ export function LiveDetailPage() {
               style={fieldInputStyle}
               required
             />
+          </label>
+          <label style={fieldLabelStyle}>
+            Signal Processor (optional)
+            <select
+              value={replayForm.signal_processor}
+              onChange={(event) =>
+                setReplayForm((current) => ({ ...current, signal_processor: event.target.value }))
+              }
+              style={fieldInputStyle}
+            >
+              <option value="">
+                {signalProcessorsLoading ? "Loading processors..." : "No processor override"}
+              </option>
+              {signalProcessors.map((option) => (
+                <option key={option.id} value={option.id}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
           </label>
           <label style={fieldLabelStyle}>
             Replay Timeframe

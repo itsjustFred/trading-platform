@@ -114,6 +114,7 @@ from shared.database import (
 )
 from runner.engines.signal_replay_adapter import ReplaySignal, SignalReplayAdapter
 from risk.config import RiskConfig
+from signal_bots.registry import get_signal_processor, list_signal_processor_options
 try:
     from live_runner.account_discovery import discover_configured_accounts
 except ModuleNotFoundError:  # pragma: no cover - optional dependency for account discovery
@@ -684,6 +685,7 @@ class SignalReplayInput(SQLModel):
 class BacktestRunSignalsRequest(SQLModel):
     signals: list[SignalReplayInput] = []
     signal_source: str | None = None
+    signal_processor: str | None = None
     account_id: str | None = None
     start_date: str
     end_date: str
@@ -5496,6 +5498,11 @@ async def list_strategies() -> list[dict[str, Any]]:
     return await asyncio.to_thread(_cached_strategies_payload)
 
 
+@app.get("/api/signal-processors", response_model=list[dict[str, str]])
+async def list_signal_processors() -> list[dict[str, str]]:
+    return await asyncio.to_thread(list_signal_processor_options)
+
+
 @app.get("/api/strategies/{name:path}", response_model=dict[str, Any])
 async def get_strategy(name: str) -> dict[str, Any]:
     entry = _safe_strategy_entry(name)
@@ -6793,6 +6800,12 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
         raise HTTPException(status_code=400, detail="signal_source must be 'discord' or 'internal'")
     normalized_source = source_name if source_name in {"discord", "internal"} else ""
     account_id = str(payload.account_id or "").strip()
+    signal_processor_name = str(payload.signal_processor or "").strip().lower()
+    if signal_processor_name:
+        try:
+            get_signal_processor(signal_processor_name, {})
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not direct_signals_payload and not normalized_source:
         raise HTTPException(
             status_code=400,
@@ -6918,6 +6931,7 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
             "risk_per_trade_pct": risk_per_trade_pct,
             "max_position_pct": max_position_pct,
             "max_positions": max_positions,
+            "signal_processor": signal_processor_name or None,
             "signal_count": len(normalized_signals),
         },
     )
@@ -7027,6 +7041,7 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
                     ),
                     initial_capital=float(payload.capital or 100000.0),
                     default_timeframe=timeframe,
+                    signal_processor_name=signal_processor_name or None,
                 )
                 result = adapter.run(
                     signals=replay_signals,
@@ -7036,6 +7051,7 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
                     backtest_end=end_str,
                     metadata={
                         "signal_source": replay_source_label,
+                        "signal_processor": signal_processor_name or None,
                         "account_id": account_id or None,
                         "signal_count": len(replay_signals),
                     },
@@ -8007,6 +8023,13 @@ async def create_live_deployment_endpoint(
     ]
     signal_source_id = str(payload.signal_source_id or "").strip()
     signal_config_payload = dict(payload.signal_config or {})
+    signal_processor_name = str(signal_config_payload.get("signal_processor") or "").strip().lower()
+    if signal_processor_name:
+        try:
+            get_signal_processor(signal_processor_name, {})
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        signal_config_payload["signal_processor"] = signal_processor_name
 
     if signal_source_type == "internal":
         if not strategy_name:

@@ -1945,6 +1945,7 @@ def test_backtest_run_signals_registers_task_manager_progress(viewer_client, mon
     import viewer.main as viewer_app_module
 
     replay_query_args: dict[str, object] = {}
+    adapter_init_kwargs: dict[str, object] = {}
 
     monkeypatch.setattr(
         viewer_app_module,
@@ -2003,6 +2004,7 @@ def test_backtest_run_signals_registers_task_manager_progress(viewer_client, mon
         def __init__(self, *args, **kwargs):
             self.args = args
             self.kwargs = kwargs
+            adapter_init_kwargs.update(kwargs)
 
         def run(self, **kwargs):
             progress_callback = kwargs.get("progress_callback")
@@ -2032,6 +2034,7 @@ def test_backtest_run_signals_registers_task_manager_progress(viewer_client, mon
         "/api/backtests/run-signals",
         json={
             "signal_source": "discord",
+            "signal_processor": "ramjet",
             "account_id": "acct-1",
             "start_date": "2024-01-01",
             "end_date": "2024-01-02",
@@ -2062,6 +2065,7 @@ def test_backtest_run_signals_registers_task_manager_progress(viewer_client, mon
     assert replay_query_args["deployment_ids"] == ["dep-1"]
     assert replay_query_args["source"] == "discord"
     assert replay_query_args["limit"] == 20000
+    assert adapter_init_kwargs["signal_processor_name"] == "ramjet"
 
 
 def test_thread_bound_task_log_handler_emits_without_shadowing_handle(viewer_client, tmp_path):
@@ -2094,6 +2098,14 @@ def test_thread_bound_task_log_handler_emits_without_shadowing_handle(viewer_cli
             logger.propagate = original_propagate
 
     assert "optuna logger smoke test" in log_file.read_text(encoding="utf-8")
+
+
+def test_signal_processors_endpoint_exposes_registry(viewer_client):
+    response = viewer_client.get("/api/signal-processors")
+    assert response.status_code == 200
+    payload = response.json()
+    ids = {item["id"] for item in payload}
+    assert {"ramjet", "rocketfuel_longsonly", "rocketfuel_longandshort", "nitro"} <= ids
 
 
 def test_optimizations_list_and_detail_endpoints(viewer_client, tmp_path):

@@ -12,6 +12,7 @@ from risk.models import TradeSignal as RiskTradeSignal
 from runner.stats import compute_stats_for_result
 from shared.constants import normalize_timeframe
 from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, TradeExit
+from signal_bots.registry import get_signal_processor
 
 ProgressCallback = Callable[[float, str], None]
 
@@ -129,11 +130,19 @@ class SignalReplayAdapter:
         risk_config: RiskConfig | None = None,
         initial_capital: float = 100_000.0,
         default_timeframe: str = "1h",
+        signal_processor_name: str | None = None,
+        signal_processor_config: dict[str, Any] | None = None,
     ) -> None:
         self.risk_config = risk_config or RiskConfig()
         self.risk_engine = RiskEngine(self.risk_config)
         self.initial_capital = float(initial_capital)
         self.default_timeframe = normalize_timeframe(default_timeframe) or default_timeframe
+        self.signal_processor_name = str(signal_processor_name or "").strip().lower()
+        self.signal_processor = (
+            get_signal_processor(self.signal_processor_name, signal_processor_config)
+            if self.signal_processor_name
+            else None
+        )
 
     @staticmethod
     def _prepare_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
@@ -152,7 +161,9 @@ class SignalReplayAdapter:
         return frame
 
     @staticmethod
-    def _find_fill_bar(frame: pd.DataFrame, timestamp: pd.Timestamp) -> tuple[int, pd.Series] | None:
+    def _find_fill_bar(
+        frame: pd.DataFrame, timestamp: pd.Timestamp
+    ) -> tuple[int, pd.Series] | None:
         idx = int(frame["timestamp"].searchsorted(timestamp, side="left"))
         if idx >= len(frame):
             return None
@@ -171,7 +182,9 @@ class SignalReplayAdapter:
     def _current_exposure(self, open_positions: dict[str, _OpenPosition], equity: float) -> float:
         if equity <= 0:
             return 0.0
-        risk_amount = sum(self._position_risk_amount(position) for position in open_positions.values())
+        risk_amount = sum(
+            self._position_risk_amount(position) for position in open_positions.values()
+        )
         return max(0.0, risk_amount / equity)
 
     @staticmethod
@@ -228,7 +241,9 @@ class SignalReplayAdapter:
             pnl=float(pnl),
             position_size=float(position.quantity),
             risk_amount=float(position.risk_amount) if position.risk_amount is not None else None,
-            risk_percent=float(position.risk_percent) if position.risk_percent is not None else None,
+            risk_percent=(
+                float(position.risk_percent) if position.risk_percent is not None else None
+            ),
             exit_reason=exit_reason,
             pnl_pct=float(pnl_pct),
             fees=0.0,
@@ -299,6 +314,47 @@ class SignalReplayAdapter:
         position.last_checked_at = end_timestamp
         return None
 
+    def _apply_signal_processor(
+        self,
+        signal: ReplaySignal,
+        frame: pd.DataFrame,
+    ) -> ReplaySignal | None:
+        if self.signal_processor is None:
+            return signal
+
+        context = frame[frame["timestamp"] <= signal.timestamp]
+        if context.empty:
+            context = frame.iloc[:1]
+        raw_signal = {
+            "symbol": signal.symbol,
+            "action": signal.action,
+            "timestamp": signal.timestamp.isoformat(),
+            "entry_price": signal.entry_price,
+            "signal_price": signal.entry_price,
+            "timeframe": signal.timeframe,
+            "metadata": dict(signal.metadata),
+        }
+        try:
+            processed = self.signal_processor.process_signal(raw_signal, context)
+        except ValueError:
+            return None
+
+        processed_metadata = dict(signal.metadata)
+        processed_metadata.update(dict(processed.metadata or {}))
+        if self.signal_processor_name:
+            processed_metadata["signal_processor"] = self.signal_processor_name
+        return ReplaySignal(
+            timestamp=signal.timestamp,
+            symbol=signal.symbol,
+            action=_coerce_action(processed.action),
+            entry_price=float(processed.entry_price),
+            stop_loss=processed.stop_loss,
+            take_profit=processed.take_profit,
+            timeframe=processed.timeframe or signal.timeframe,
+            source=signal.source,
+            metadata=processed_metadata,
+        )
+
     def run(
         self,
         *,
@@ -345,12 +401,16 @@ class SignalReplayAdapter:
         total_signals = len(replay_signals)
         for index, signal in enumerate(replay_signals, start=1):
             frame = frames[signal.symbol]
+            effective_signal = self._apply_signal_processor(signal, frame)
+            if effective_signal is None:
+                emit(10.0 + ((index / total_signals) * 80.0), "Replaying signals...")
+                continue
             current_position = open_positions.get(signal.symbol)
             if current_position is not None:
                 protected_exit = self._process_protective_exits(
                     position=current_position,
                     frame=frame,
-                    end_timestamp=signal.timestamp,
+                    end_timestamp=effective_signal.timestamp,
                 )
                 if protected_exit is not None:
                     closed_trades.append(protected_exit)
@@ -358,13 +418,14 @@ class SignalReplayAdapter:
                     open_positions.pop(signal.symbol, None)
                     current_position = None
 
-            filled = self._find_fill_bar(frame, signal.timestamp)
+            filled = self._find_fill_bar(frame, effective_signal.timestamp)
             if filled is None:
                 continue
             fill_index, fill_bar = filled
             fill_price = float(fill_bar["close"])
             fill_time = pd.Timestamp(fill_bar["timestamp"])
-            target_direction = "LONG" if signal.action == "buy" else "SHORT"
+            target_direction = "LONG" if effective_signal.action == "buy" else "SHORT"
+            exit_only = bool(effective_signal.metadata.get("exit_only"))
 
             if current_position is not None:
                 if current_position.direction == target_direction:
@@ -381,17 +442,26 @@ class SignalReplayAdapter:
                 closed_trades.append(flip_trade)
                 realized_pnl += float(flip_trade.pnl)
                 open_positions.pop(signal.symbol, None)
+                if exit_only:
+                    emit(10.0 + ((index / total_signals) * 80.0), "Replaying signals...")
+                    continue
+            elif exit_only:
+                emit(10.0 + ((index / total_signals) * 80.0), "Replaying signals...")
+                continue
 
             account_balance = max(self.initial_capital + realized_pnl, 1.0)
             exposure = self._current_exposure(open_positions, account_balance)
             risk_signal = RiskTradeSignal(
                 action="buy" if target_direction == "LONG" else "sell",
-                symbol=signal.symbol,
+                symbol=effective_signal.symbol,
                 entry_price=fill_price,
-                stop_loss=signal.stop_loss,
-                take_profit=signal.take_profit,
-                timeframe=signal.timeframe or normalized_timeframe,
-                metadata={"current_positions": len(open_positions)},
+                stop_loss=effective_signal.stop_loss,
+                take_profit=effective_signal.take_profit,
+                timeframe=effective_signal.timeframe or normalized_timeframe,
+                metadata={
+                    **dict(effective_signal.metadata or {}),
+                    "current_positions": len(open_positions),
+                },
             )
             sized = self.risk_engine.calculate_position_size(
                 signal=risk_signal,
@@ -405,7 +475,7 @@ class SignalReplayAdapter:
                 continue
 
             open_positions[signal.symbol] = _OpenPosition(
-                symbol=signal.symbol,
+                symbol=effective_signal.symbol,
                 direction=target_direction,
                 entry_time=fill_time,
                 entry_bar_index=int(fill_index),
@@ -415,9 +485,9 @@ class SignalReplayAdapter:
                 take_profit=risk_signal.take_profit,
                 risk_amount=float(sized.risk_amount),
                 risk_percent=float(sized.risk_percent),
-                source=signal.source,
-                signal_time=signal.timestamp,
-                signal_metadata=dict(signal.metadata),
+                source=effective_signal.source,
+                signal_time=effective_signal.timestamp,
+                signal_metadata=dict(effective_signal.metadata),
                 last_checked_at=fill_time,
             )
             emit(10.0 + ((index / total_signals) * 80.0), "Replaying signals...")
@@ -457,10 +527,16 @@ class SignalReplayAdapter:
         equity_curve: list[EquityPoint] = []
         for trade in closed_trades:
             running_equity += float(trade.pnl)
-            equity_curve.append(EquityPoint(time=trade.last_exit_time, equity=round(running_equity, 2)))
+            equity_curve.append(
+                EquityPoint(time=trade.last_exit_time, equity=round(running_equity, 2))
+            )
 
         signal_sources = sorted(
-            {str(signal.source or "internal").lower() for signal in replay_signals if str(signal.source or "").strip()}
+            {
+                str(signal.source or "internal").lower()
+                for signal in replay_signals
+                if str(signal.source or "").strip()
+            }
         )
         tags = ["signal-replay", *[f"source:{source}" for source in signal_sources]]
         created_at = datetime.now(timezone.utc).isoformat()
@@ -483,6 +559,7 @@ class SignalReplayAdapter:
                 "max_risk_per_trade": float(self.risk_config.max_risk_per_trade),
                 "max_total_exposure": float(self.risk_config.max_total_exposure),
                 "max_positions": int(self.risk_config.max_positions),
+                "signal_processor": self.signal_processor_name or None,
                 **(metadata or {}),
             },
             tags=tags,
@@ -492,4 +569,3 @@ class SignalReplayAdapter:
         result.stats = compute_stats_for_result(result)
         emit(100.0, f"Completed - {len(closed_trades)} trades found")
         return result
-

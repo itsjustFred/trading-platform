@@ -93,3 +93,38 @@ class RiskEngine:
             risk_percent=risk_percent,
             risk_reward_ratio=risk_reward_ratio,
         )
+
+    def apply_trailing_stop(
+        self,
+        signal: TradeSignal,
+        *,
+        market_price: float,
+    ) -> float | None:
+        price = float(market_price)
+        if price <= 0:
+            raise ValueError("market_price must be > 0")
+
+        trailing_cfg = signal.metadata.get("trailing_sl_config")
+        if not isinstance(trailing_cfg, dict):
+            return signal.stop_loss
+
+        mode = str(trailing_cfg.get("mode") or "").strip().lower()
+        if mode != "percent":
+            return signal.stop_loss
+
+        percent = float(trailing_cfg.get("percent") or 0.0)
+        if percent <= 0 or percent >= 1:
+            raise ValueError("trailing_sl_config.percent must be between 0 and 1")
+
+        action = signal.action
+        current_stop = signal.stop_loss
+        if action in {"buy", "long"}:
+            candidate = price * (1.0 - percent)
+            if current_stop is None or candidate > current_stop:
+                signal.stop_loss = candidate
+        else:
+            candidate = price * (1.0 + percent)
+            if current_stop is None or candidate < current_stop:
+                signal.stop_loss = candidate
+
+        return signal.stop_loss

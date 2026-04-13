@@ -10,6 +10,7 @@ import {
   getLiveBalances,
   getLiveDeployments,
   getLivePositions,
+  getSignalProcessors,
   getLiveStats,
   getLiveTrades,
   getServices,
@@ -28,6 +29,7 @@ import type {
   LiveDeploymentConfig,
   LiveDeploymentStatus,
   LiveTradeSlippage,
+  SignalProcessorOption,
   Service,
   StrategyMeta,
 } from "../api/types";
@@ -61,6 +63,7 @@ type CreateDeploymentForm = {
   timeframe: string;
   signal_source: "internal" | "discord";
   signal_source_id: string;
+  signal_processor: string;
   settings_json: string;
 };
 
@@ -69,6 +72,7 @@ type ReplayFormState = {
   start_date: string;
   end_date: string;
   timeframe: string;
+  signal_processor: string;
   auto_download: boolean;
 };
 
@@ -191,6 +195,8 @@ export function LiveHubPage() {
   const [strategiesLoading, setStrategiesLoading] = useState(false);
   const [servicesLoading, setServicesLoading] = useState(false);
   const [discordServices, setDiscordServices] = useState<Service[]>([]);
+  const [signalProcessors, setSignalProcessors] = useState<SignalProcessorOption[]>([]);
+  const [signalProcessorsLoading, setSignalProcessorsLoading] = useState(false);
   const [createForm, setCreateForm] = useState<CreateDeploymentForm>({
     strategy_name: "",
     account_id: "",
@@ -198,6 +204,7 @@ export function LiveHubPage() {
     timeframe: DEFAULT_TIMEFRAME,
     signal_source: "internal",
     signal_source_id: "",
+    signal_processor: "",
     settings_json: "{}",
   });
   const [replayForm, setReplayForm] = useState<ReplayFormState>({
@@ -205,6 +212,7 @@ export function LiveHubPage() {
     start_date: "",
     end_date: "",
     timeframe: DEFAULT_TIMEFRAME,
+    signal_processor: "",
     auto_download: true,
   });
 
@@ -313,6 +321,22 @@ export function LiveHubPage() {
       setServicesLoading(false);
     }
   }, [servicesLoading, showToast]);
+
+  const refreshSignalProcessors = useCallback(async () => {
+    if (signalProcessorsLoading) {
+      return;
+    }
+    setSignalProcessorsLoading(true);
+    try {
+      const payload = await getSignalProcessors();
+      setSignalProcessors(payload);
+    } catch {
+      setSignalProcessors([]);
+      showToast("Could not load signal processors.", "warning");
+    } finally {
+      setSignalProcessorsLoading(false);
+    }
+  }, [showToast, signalProcessorsLoading]);
 
   useEffect(() => {
     if (accounts.length === 0 || createForm.account_id) {
@@ -442,6 +466,7 @@ export function LiveHubPage() {
       .map((item) => item.trim().toUpperCase())
       .filter(Boolean);
     const sourceId = createForm.signal_source_id.trim();
+    const selectedProcessor = createForm.signal_processor.trim().toLowerCase();
     const symbols =
       symbolFilter.length > 0
         ? symbolFilter
@@ -496,8 +521,13 @@ export function LiveHubPage() {
         signal_source: createForm.signal_source,
         signal_config:
           createForm.signal_source === "discord"
-            ? { service_name: sourceId }
-            : {},
+            ? {
+                service_name: sourceId,
+                ...(selectedProcessor ? { signal_processor: selectedProcessor } : {}),
+              }
+            : selectedProcessor
+              ? { signal_processor: selectedProcessor }
+              : {},
         settings: settingsPayload,
       });
       setCreateOpenAccountId("");
@@ -508,6 +538,7 @@ export function LiveHubPage() {
         timeframe: DEFAULT_TIMEFRAME,
         signal_source: "internal",
         signal_source_id: "",
+        signal_processor: "",
         settings_json: "{}",
       }));
       await refreshDeployments(true);
@@ -533,11 +564,13 @@ export function LiveHubPage() {
       timeframe: DEFAULT_TIMEFRAME,
       signal_source: "internal",
       signal_source_id: "",
+      signal_processor: "",
       settings_json: "{}",
     });
     setCreateOpenAccountId(account?.id ?? accountId);
     void refreshStrategies();
     void refreshDiscordServices();
+    void refreshSignalProcessors();
   };
 
   const openReplayModal = (accountId: string) => {
@@ -550,9 +583,11 @@ export function LiveHubPage() {
       start_date: startDate,
       end_date: endDate,
       timeframe: DEFAULT_TIMEFRAME,
+      signal_processor: "",
       auto_download: true,
     });
     setReplayOpenAccountId(accountId);
+    void refreshSignalProcessors();
   };
 
   const handleStartSignalReplay = async (event: React.FormEvent<HTMLFormElement>) => {
@@ -575,6 +610,7 @@ export function LiveHubPage() {
     try {
       const response = await runBacktestSignals({
         signal_source: "discord",
+        signal_processor: replayForm.signal_processor || undefined,
         account_id: accountId,
         start_date: replayForm.start_date,
         end_date: replayForm.end_date,
@@ -750,6 +786,29 @@ export function LiveHubPage() {
           ) : null}
 
           <label style={fieldLabelStyle}>
+            Signal Processor (optional)
+            <select
+              value={createForm.signal_processor}
+              onChange={(event) =>
+                setCreateForm((current) => ({
+                  ...current,
+                  signal_processor: event.target.value,
+                }))
+              }
+              style={fieldInputStyle}
+            >
+              <option value="">
+                {signalProcessorsLoading ? "Loading processors..." : "No processor override"}
+              </option>
+              {signalProcessors.map((option) => (
+                <option key={option.id} value={option.id}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <label style={fieldLabelStyle}>
             Timeframe
             <select
               value={createForm.timeframe}
@@ -887,6 +946,29 @@ export function LiveHubPage() {
               />
             </label>
           </div>
+
+          <label style={fieldLabelStyle}>
+            Signal Processor (optional)
+            <select
+              value={replayForm.signal_processor}
+              onChange={(event) =>
+                setReplayForm((current) => ({
+                  ...current,
+                  signal_processor: event.target.value,
+                }))
+              }
+              style={fieldInputStyle}
+            >
+              <option value="">
+                {signalProcessorsLoading ? "Loading processors..." : "No processor override"}
+              </option>
+              {signalProcessors.map((option) => (
+                <option key={option.id} value={option.id}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          </label>
 
           <label style={fieldLabelStyle}>
             Replay Timeframe

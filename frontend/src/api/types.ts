@@ -67,6 +67,7 @@ export interface SignalReplayInput {
 export interface RunBacktestSignalsRequest {
   signals?: SignalReplayInput[];
   signal_source?: LiveSignalSource;
+  signal_processor?: string;
   account_id?: string;
   start_date: string;
   end_date: string;
@@ -400,6 +401,12 @@ export interface Service {
   config: Record<string, unknown>;
   last_activity?: string | null;
   created_at: string;
+}
+
+export interface SignalProcessorOption {
+  id: string;
+  label: string;
+  description: string;
 }
 
 export interface LiveDeploymentConfig {

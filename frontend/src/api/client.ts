@@ -26,6 +26,7 @@ import type {
   ServiceStatus,
   ServiceType,
   LiveTradesResponse,
+  SignalProcessorOption,
   LogContent,
   LogFile,
   OptimizationDetail,
@@ -254,6 +255,8 @@ export const getLiveSignalLog = (accountId: string, limit = 200) => {
     `/live/signals/${encodeURIComponent(accountId)}${query ? `?${query}` : ""}`,
   );
 };
+export const getSignalProcessors = () =>
+  fetchJSON<SignalProcessorOption[]>("/signal-processors");
 export const createLiveDeployment = (payload: LiveDeploymentCreateRequest) =>
   fetchJSON<LiveDeploymentConfig>("/live/deployments", {
     method: "POST",

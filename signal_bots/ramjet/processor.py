@@ -29,8 +29,8 @@ def _resolve_timeframe(value: Any) -> str:
     return _TIMEFRAME_ALIASES.get(text, text)
 
 
-class StockKitSignalProcessor:
-    """Ram Jet StockKit signal processor with formula-identical SL/TP logic.
+class RamJetSignalProcessor:
+    """RamJet signal processor with formula-identical SL/TP logic.
 
     Ported from `/home/ubuntu/Desktop/stockkit_ai_bot`:
     - ATR via EMA(TR, span=atr_period)
@@ -56,7 +56,7 @@ class StockKitSignalProcessor:
         )
 
     @classmethod
-    def from_config_file(cls, config_path: str | Path) -> "StockKitSignalProcessor":
+    def from_config_file(cls, config_path: str | Path) -> "RamJetSignalProcessor":
         path = Path(config_path)
         payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         if not isinstance(payload, dict):
@@ -170,7 +170,7 @@ class StockKitSignalProcessor:
         action = str(raw_action or "").strip().lower()
         if action in {"buy", "long"}:
             return "buy"
-        raise ValueError("StockKitSignalProcessor (Ram Jet) only supports BUY/LONG entry signals")
+        raise ValueError("RamJetSignalProcessor only supports BUY/LONG entry signals")
 
     def process_signal(
         self,
@@ -206,9 +206,9 @@ class StockKitSignalProcessor:
         metadata = dict(base_metadata) if isinstance(base_metadata, dict) else {}
         metadata.update(
             {
-                "source": "stockkit",
-                "stockkit_bot": "ram_jet",
-                "stockkit_config": {
+                "source": "ramjet",
+                "signal_bot": "ramjet",
+                "ramjet_config": {
                     "atr_period": self.atr_period,
                     "sl_multiplier": self.sl_multiplier,
                     "tp1_multiplier": self.tp1_multiplier,

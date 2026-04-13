@@ -6,6 +6,7 @@ import type {
   PortfolioSummary,
   PortfoliosDuplicatesResponse,
   PortfoliosSortField,
+  SignalProcessorOption,
 } from "../api/types";
 import {
   createPortfolio,
@@ -14,6 +15,7 @@ import {
   deletePortfoliosBulk,
   getPortfolioDuplicates,
   getPortfolios,
+  getSignalProcessors,
   getStrategies,
   getSymbols,
 } from "../api/client";
@@ -33,6 +35,7 @@ function componentId(): string {
 type ComponentDraft = {
   id: string;
   strategy_name: string;
+  signal_processor: string;
   symbol: string;
   timeframe: string;
   weight: string;
@@ -195,6 +198,7 @@ function createDefaultComponent(index = 0): ComponentDraft {
   return {
     id: componentId(),
     strategy_name: "",
+    signal_processor: "",
     symbol: "",
     timeframe: "1h",
     weight: index === 0 ? "1.0" : "0.5",
@@ -219,6 +223,7 @@ export function PortfoliosPage() {
 
   const [portfolios, setPortfolios] = useState<PortfolioSummary[]>([]);
   const [strategies, setStrategies] = useState<StrategyOption[]>([]);
+  const [signalProcessors, setSignalProcessors] = useState<SignalProcessorOption[]>([]);
   const [symbols, setSymbols] = useState<string[]>([]);
   const [nameFilter, setNameFilter] = useState("");
   const [sortBy, setSortBy] = useState<PortfoliosSortField>("created_at");
@@ -262,10 +267,11 @@ export function PortfoliosPage() {
   }, [loadPortfolios]);
 
   useEffect(() => {
-    Promise.all([getStrategies(), getSymbols()])
-      .then(([strategyRows, symbolPayload]) => {
+    Promise.all([getStrategies(), getSymbols(), getSignalProcessors()])
+      .then(([strategyRows, symbolPayload, signalProcessorRows]) => {
         setStrategies((strategyRows || []) as StrategyOption[]);
         setSymbols(symbolPayload?.symbols || []);
+        setSignalProcessors(signalProcessorRows || []);
       })
       .catch((error: unknown) => {
         const message = error instanceof Error ? error.message : "Failed to load strategy references";
@@ -314,19 +320,24 @@ export function PortfoliosPage() {
     try {
       const components = componentsDraft.map((row, index) => {
         const strategy_name = row.strategy_name.trim();
+        const signal_processor = row.signal_processor.trim();
         const symbol = row.symbol.trim().toUpperCase();
         const timeframe = row.timeframe.trim() || "1h";
         const weightValue = Number(row.weight);
         const weight = Number.isFinite(weightValue) && weightValue > 0 ? weightValue : 1.0;
         if (!strategy_name) throw new Error(`Component #${index + 1}: strategy is required`);
         if (!symbol) throw new Error(`Component #${index + 1}: symbol is required`);
+        const settings = parseOptionalJson(row.settings);
+        if (signal_processor) {
+          settings.signal_processor = signal_processor;
+        }
         return {
           strategy_name,
           symbol,
           timeframe,
           weight,
           risk_config: parseOptionalJson(row.risk_config),
-          settings: parseOptionalJson(row.settings),
+          settings,
         };
       });
 
@@ -726,7 +737,7 @@ export function PortfoliosPage() {
             <div
               style={{
                 display: "grid",
-                gridTemplateColumns: "1.2fr 1fr 110px 100px 1fr 1fr 44px",
+                gridTemplateColumns: "1.2fr 1fr 1fr 110px 100px 1fr 1fr 44px",
                 gap: "8px",
                 padding: "10px 10px",
                 fontSize: "0.7rem",
@@ -738,6 +749,7 @@ export function PortfoliosPage() {
               }}
             >
               <div>Strategy</div>
+              <div>Signal Processor</div>
               <div>Symbol</div>
               <div>Timeframe</div>
               <div>Weight</div>
@@ -751,7 +763,7 @@ export function PortfoliosPage() {
                   key={row.id}
                   style={{
                     display: "grid",
-                    gridTemplateColumns: "1.2fr 1fr 110px 100px 1fr 1fr 44px",
+                    gridTemplateColumns: "1.2fr 1fr 1fr 110px 100px 1fr 1fr 44px",
                     gap: "8px",
                     padding: "10px",
                     borderBottom: "1px solid rgba(255,255,255,0.04)",
@@ -765,6 +777,20 @@ export function PortfoliosPage() {
                       style={inputStyle}
                       placeholder="Select strategy"
                     />
+                  </div>
+                  <div>
+                    <select
+                      value={row.signal_processor}
+                      onChange={(e) => setComponentField(row.id, "signal_processor", e.target.value)}
+                      style={inputStyle}
+                    >
+                      <option value="">None</option>
+                      {signalProcessors.map((option) => (
+                        <option key={option.id} value={option.id}>
+                          {option.label}
+                        </option>
+                      ))}
+                    </select>
                   </div>
                   <div>
                     <input

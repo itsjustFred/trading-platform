@@ -10,6 +10,8 @@ from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
 from dotenv import dotenv_values
 
 from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credentials
@@ -38,6 +40,7 @@ from shared.models import (
     ServiceStatus,
     ServiceType,
 )
+from signal_bots.registry import get_signal_processor
 
 logger = get_logger("live-runner")
 
@@ -259,6 +262,86 @@ def _deployment_has_discord_channel(deployment: LiveDeploymentConfig) -> bool:
     return bool(str(configured.get("channel_id") or "").strip())
 
 
+def _deployment_signal_processor_name(deployment: LiveDeploymentConfig) -> str:
+    configured = deployment.signal_config or {}
+    settings = deployment.settings or {}
+    return str(
+        configured.get("signal_processor") or settings.get("signal_processor") or ""
+    ).strip().lower()
+
+
+def _build_processor_market_data(
+    signal: TradeSignal,
+    *,
+    timeframe: str,
+) -> pd.DataFrame:
+    metadata = signal.metadata or {}
+    candidate = metadata.get("market_data")
+    if isinstance(candidate, pd.DataFrame) and not candidate.empty:
+        return candidate.copy()
+    if isinstance(candidate, list) and candidate:
+        frame = pd.DataFrame(candidate)
+        if not frame.empty:
+            return frame
+
+    entry = max(float(signal.entry_price), 0.01)
+    rows = 90
+    timestamps = pd.date_range(end=pd.Timestamp.utcnow(), periods=rows, freq="5min", tz="UTC")
+    basis = np.linspace(entry * 0.997, entry * 1.003, rows)
+    return pd.DataFrame(
+        {
+            "timestamp": timestamps,
+            "open": basis,
+            "high": basis * 1.0015,
+            "low": basis * 0.9985,
+            "close": basis,
+            "volume": np.full(rows, 1000.0),
+            "timeframe": timeframe,
+        }
+    )
+
+
+def _apply_signal_processor(
+    signal: TradeSignal,
+    deployment: LiveDeploymentConfig,
+) -> TradeSignal:
+    processor_name = _deployment_signal_processor_name(deployment)
+    if not processor_name:
+        return signal
+    configured = deployment.signal_config or {}
+    processor_config_payload = configured.get("signal_processor_config")
+    processor_config = (
+        dict(processor_config_payload)
+        if isinstance(processor_config_payload, Mapping)
+        else {}
+    )
+    processor = get_signal_processor(processor_name, processor_config)
+    timeframe = _deployment_signal_timeframe(deployment)
+    market_data = _build_processor_market_data(signal, timeframe=timeframe)
+    raw_signal = {
+        "symbol": signal.symbol,
+        "action": signal.action,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "entry_price": signal.entry_price,
+        "signal_price": signal.entry_price,
+        "timeframe": signal.timeframe,
+        "metadata": dict(signal.metadata or {}),
+    }
+    processed = processor.process_signal(raw_signal=raw_signal, market_data=market_data)
+    metadata = dict(signal.metadata or {})
+    metadata.update(dict(processed.metadata or {}))
+    metadata["signal_processor"] = processor_name
+    return TradeSignal(
+        action=processed.action,
+        symbol=processed.symbol,
+        entry_price=float(processed.entry_price),
+        stop_loss=processed.stop_loss,
+        take_profit=processed.take_profit,
+        timeframe=processed.timeframe or signal.timeframe,
+        metadata=metadata,
+    )
+
+
 def size_live_signal_for_submission(
     signal: LiveSignal,
     deployment: LiveDeploymentConfig,
@@ -315,6 +398,30 @@ async def submit_order_with_risk(
     account_balance: float | None = None,
     pip_value: float | None = None,
 ) -> str:
+    metadata = dict(signal.metadata or {})
+    if signal.action == "sell" and bool(metadata.get("exit_only")):
+        get_positions = getattr(adapter, "get_positions", None)
+        if not callable(get_positions):
+            raise ValueError("Exit-only signal requires broker adapter with get_positions support")
+        positions = await get_positions()
+        target_qty = 0.0
+        for position in positions:
+            symbol = str(position.get("symbol") or "").strip().upper()
+            if symbol != signal.symbol.upper():
+                continue
+            resolved_qty = _coerce_live_float(
+                position.get("qty"), field_name="qty", minimum=0.0
+            )
+            target_qty = max(resolved_qty, 0.0)
+            break
+        if target_qty <= 0:
+            raise ValueError(
+                f"Exit-only signal received for {signal.symbol} but no long position is open"
+            )
+        metadata["explicit_qty"] = float(target_qty)
+        metadata["risk_sizing_mode"] = "exit_only"
+        return await adapter.submit_order(signal.model_copy(update={"metadata": metadata}))
+
     resolved_balance = account_balance
     if resolved_balance is None:
         _, equity = await adapter.get_balance()
@@ -340,7 +447,7 @@ def _trade_signal_to_live_signal(
     if signal.take_profit is not None:
         metadata["take_profit"] = float(signal.take_profit)
     metadata["timeframe"] = signal.timeframe
-    metadata["source"] = "discord"
+    metadata["source"] = str(metadata.get("source") or "discord")
     return LiveSignal(
         id=uuid.uuid4(),
         deployment_id=str(deployment.id),
@@ -427,8 +534,26 @@ async def _run_discord_signal_listener_for_account(
                     timeframe=signal_timeframe,
                     metadata={**trade_signal.metadata, "wait_for_candle_close": wait_enabled},
                 )
+                try:
+                    normalized_signal = _apply_signal_processor(normalized_signal, deployment)
+                except ValueError as exc:
+                    logger.warning(
+                        "Signal processor rejected discord signal",
+                        extra={
+                            "data": {
+                                "account_id": account_id,
+                                "deployment_id": str(deployment.id),
+                                "symbol": trade_signal.symbol,
+                                "error": str(exc),
+                            }
+                        },
+                    )
+                    continue
                 if wait_enabled:
-                    await wait_for_candle_close(normalized_signal, signal_timeframe)
+                    await wait_for_candle_close(
+                        normalized_signal,
+                        normalized_signal.timeframe or signal_timeframe,
+                    )
 
                 live_signal = _trade_signal_to_live_signal(normalized_signal, deployment)
                 try:

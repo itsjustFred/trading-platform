@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from signal_bots.stockkit import StockKitSignalProcessor
+from signal_bots.ramjet import RamJetSignalProcessor
 
 
 def _sample_market_data(rows: int = 80) -> pd.DataFrame:
@@ -26,7 +26,7 @@ def _sample_market_data(rows: int = 80) -> pd.DataFrame:
 
 
 def test_process_signal_ports_ramjet_sl_tp_and_trailing_config():
-    processor = StockKitSignalProcessor(
+    processor = RamJetSignalProcessor(
         {
             "ram_jet": {
                 "atr_period": 14,
@@ -71,7 +71,7 @@ def test_process_signal_ports_ramjet_sl_tp_and_trailing_config():
 
 
 def test_process_signal_rejects_non_buy_actions():
-    processor = StockKitSignalProcessor({"ram_jet": {"candle_timeframe": "5Min"}})
+    processor = RamJetSignalProcessor({"ram_jet": {"candle_timeframe": "5Min"}})
     with pytest.raises(ValueError, match="BUY/LONG"):
         processor.process_signal(
             {"symbol": "AAPL", "action": "SELL"},
@@ -79,11 +79,11 @@ def test_process_signal_rejects_non_buy_actions():
         )
 
 
-def test_processor_loads_default_stockkit_config_file():
+def test_processor_loads_default_ramjet_config_file():
     config_path = (
-        Path(__file__).resolve().parent.parent / "signal_bots" / "stockkit" / "config.yaml"
+        Path(__file__).resolve().parent.parent / "signal_bots" / "ramjet" / "config.yaml"
     )
-    processor = StockKitSignalProcessor.from_config_file(config_path)
+    processor = RamJetSignalProcessor.from_config_file(config_path)
     assert processor.atr_period == 14
     assert processor.sl_multiplier == pytest.approx(2.0)
     assert processor.tp1_multiplier == pytest.approx(3.0)

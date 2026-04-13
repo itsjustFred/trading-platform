@@ -57,15 +57,15 @@ def test_detect_strategy_type_defaults_to_market_data(tmp_path: Path):
 
 
 def test_cmd_run_rejects_signal_processor_strategies(tmp_path: Path):
-    strategy_path = tmp_path / "stockkit_processor.py"
+    strategy_path = tmp_path / "ramjet_processor.py"
     strategy_path.write_text(
         "\n".join(
             [
                 (
-                    "STRATEGY_META = {'name': 'StockKit Processor', "
+                    "STRATEGY_META = {'name': 'RamJet Processor', "
                     "'strategy_type': 'signal_processor'}"
                 ),
-                "class StockKitSignalProcessor:",
+                "class RamJetSignalProcessor:",
                 "    def process_signal(self, raw_signal, market_data):",
                 "        return raw_signal",
                 "",
@@ -87,7 +87,7 @@ def test_cmd_run_rejects_signal_processor_strategies(tmp_path: Path):
         max_leverage=None,
         data_dir="",
         params="{}",
-        name="stockkit",
+        name="ramjet",
         output=str(tmp_path / "out.trades.json"),
     )
 
