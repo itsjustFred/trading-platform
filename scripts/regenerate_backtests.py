@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import re
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +24,13 @@ from shared.database import (
     init_db,
     save_result_to_sqlite,
 )
-from shared.strategy_registry import DEFAULT_STRATEGIES_DIR, iter_strategy_files, load_strategy_meta
+from shared.models import StrategyType
+from shared.strategy_registry import (
+    DEFAULT_STRATEGIES_DIR,
+    detect_strategy_type,
+    iter_strategy_files,
+    load_strategy_meta,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(PROJECT_ROOT / ".env")
@@ -165,12 +170,12 @@ def _read_parquet_date_range(parquet_path: Path) -> tuple[str, str]:
     first_stats = metadata.row_group(0).column(column_index).statistics
     last_stats = metadata.row_group(metadata.num_row_groups - 1).column(column_index).statistics
 
-    start_value = (
-        first_stats.min if first_stats is not None and getattr(first_stats, "has_min_max", False) else None
-    )
-    end_value = (
-        last_stats.max if last_stats is not None and getattr(last_stats, "has_min_max", False) else None
-    )
+    start_value = first_stats.min if (
+        first_stats is not None and getattr(first_stats, "has_min_max", False)
+    ) else None
+    end_value = last_stats.max if (
+        last_stats is not None and getattr(last_stats, "has_min_max", False)
+    ) else None
 
     if start_value is None:
         first_group = parquet_file.read_row_group(0, columns=[timestamp_column])
@@ -178,7 +183,10 @@ def _read_parquet_date_range(parquet_path: Path) -> tuple[str, str]:
             raise RuntimeError(f"Could not determine start timestamp for {parquet_path}")
         start_value = first_group.column(0)[0].as_py()
     if end_value is None:
-        last_group = parquet_file.read_row_group(metadata.num_row_groups - 1, columns=[timestamp_column])
+        last_group = parquet_file.read_row_group(
+            metadata.num_row_groups - 1,
+            columns=[timestamp_column],
+        )
         if last_group.num_rows == 0:
             raise RuntimeError(f"Could not determine end timestamp for {parquet_path}")
         end_value = last_group.column(0)[last_group.num_rows - 1].as_py()
@@ -228,6 +236,12 @@ def main() -> None:
 
     strategy_paths = iter_strategy_files(DEFAULT_STRATEGIES_DIR)
     for strategy_path in strategy_paths:
+        strategy_type = detect_strategy_type(strategy_path, DEFAULT_STRATEGIES_DIR)
+        if strategy_type == StrategyType.SIGNAL_PROCESSOR:
+            skipped += 1
+            failures.append(f"{strategy_path.name}: skipped signal_processor strategy")
+            continue
+
         meta = load_strategy_meta(strategy_path, DEFAULT_STRATEGIES_DIR)
         selection = _select_symbol_timeframe(meta, symbol_index)
         if selection is None:

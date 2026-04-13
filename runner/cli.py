@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,10 +24,11 @@ from pydantic import ValidationError
 
 from runner.engines.base import BacktestConfig, EngineAdapter, resolve_strategy_parameters
 from runner.stats import compute_stats_for_result
-
-from shared.database import save_result_to_sqlite
 from shared.constants import DATA_DIR, normalize_timeframe
+from shared.database import save_result_to_sqlite
 from shared.logging import get_logger
+from shared.models import StrategyType
+from shared.strategy_registry import detect_strategy_type
 
 logger = get_logger("runner")
 
@@ -68,6 +68,13 @@ def get_engine(name: str) -> EngineAdapter:
         raise ValueError(f"Unknown engine: {name}. Available: native, vectorbt, lean, pynecore")
 
 
+def _resolve_strategy_type(strategy_path: str) -> StrategyType:
+    resolved = Path(strategy_path).resolve()
+    if not resolved.exists():
+        return StrategyType.MARKET_DATA
+    return detect_strategy_type(resolved)
+
+
 def _detect_date_range(symbols: list[str], timeframe: str, data_dir: str = "") -> tuple[str, str]:
     """Auto-detect date range from available OHLCV data files.
 
@@ -104,7 +111,15 @@ def _detect_date_range(symbols: list[str], timeframe: str, data_dir: str = "") -
 
 def cmd_run(args):
     """Run a backtest."""
+    strategy_type = _resolve_strategy_type(args.strategy)
+    if strategy_type == StrategyType.SIGNAL_PROCESSOR:
+        raise ValueError(
+            "Detected signal_processor strategy. "
+            "runner.cli run currently supports market_data strategies only."
+        )
+
     engine = get_engine(args.engine)
+    logger.info("Detected strategy type: %s", strategy_type.value)
     progress_callback: Callable[[float, str], None] | None = None
     if bool(getattr(args, "progress_stdout", False)):
         def _stdout_progress(percent: float, message: str) -> None:

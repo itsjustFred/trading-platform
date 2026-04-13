@@ -1,7 +1,12 @@
 import asyncio
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import live_runner.daemon as daemon
+from live_runner.signal_sources.discord_source import (
+    DiscordAuthenticationError,
+    _is_discord_auth_error,
+)
 from shared.models import LiveAccountConfig
 
 
@@ -84,3 +89,98 @@ def test_resolve_ctrader_credentials_defaults_demo_true_when_unset() -> None:
     }
     credentials = daemon._resolve_ctrader_credentials(values)
     assert credentials == ("app", "secret", "token", True)
+
+
+def test_discord_auth_error_detector_matches_improper_token_message() -> None:
+    assert _is_discord_auth_error(RuntimeError("Improper token has been passed"))
+
+
+def test_discord_listener_retries_stop_on_auth_error(monkeypatch) -> None:
+    async def _raise_auth_error(*_args, **_kwargs):
+        raise DiscordAuthenticationError("Discord bot TEST auth failed: Invalid token")
+
+    monkeypatch.setattr(
+        daemon,
+        "_run_discord_signal_listener_for_account",
+        _raise_auth_error,
+    )
+    daemon._DISCORD_AUTH_BLOCKED_ACCOUNTS.clear()
+    daemon._DISCORD_AUTH_BLOCKED_REASONS.clear()
+
+    asyncio.run(
+        daemon._run_discord_listener_with_retries(
+            "acc-1",
+            object(),
+            {},
+            accounts_env_values={},
+        )
+    )
+
+    assert "acc-1" in daemon._DISCORD_AUTH_BLOCKED_ACCOUNTS
+    assert "Invalid token" in daemon._DISCORD_AUTH_BLOCKED_REASONS["acc-1"]
+
+
+def test_discord_listener_retries_stop_on_missing_token(monkeypatch) -> None:
+    async def _raise_missing_token(*_args, **_kwargs):
+        raise ValueError("Missing DISCORD_BOT_TOKEN")
+
+    monkeypatch.setattr(
+        daemon,
+        "_run_discord_signal_listener_for_account",
+        _raise_missing_token,
+    )
+    daemon._DISCORD_AUTH_BLOCKED_ACCOUNTS.clear()
+    daemon._DISCORD_AUTH_BLOCKED_REASONS.clear()
+
+    asyncio.run(
+        daemon._run_discord_listener_with_retries(
+            "acc-2",
+            object(),
+            {},
+            accounts_env_values={},
+        )
+    )
+
+    assert "acc-2" in daemon._DISCORD_AUTH_BLOCKED_ACCOUNTS
+    assert "Missing DISCORD_BOT_TOKEN" in daemon._DISCORD_AUTH_BLOCKED_REASONS["acc-2"]
+
+
+def test_discord_bot_listener_stops_on_terminal_auth_message(monkeypatch) -> None:
+    class _InvalidTokenSource:
+        is_paused = False
+
+        async def listen_signals(self):
+            if False:
+                yield None
+            raise RuntimeError("Improper token has been passed.")
+
+    updates: list[tuple[str, object]] = []
+
+    def _capture_update(service_id: str, status: object, **_kwargs) -> None:
+        updates.append((service_id, status))
+
+    monkeypatch.setattr(daemon, "update_service_status", _capture_update)
+
+    service = SimpleNamespace(id="service-1", name="TEST_BOT")
+    asyncio.run(daemon._run_discord_bot_service_listener(service, _InvalidTokenSource()))
+
+    assert updates
+    assert updates[-1] == ("service-1", daemon.ServiceStatus.FAILED)
+
+
+def test_start_missing_discord_tasks_skips_blocked_accounts() -> None:
+    daemon._DISCORD_AUTH_BLOCKED_ACCOUNTS.clear()
+    daemon._DISCORD_AUTH_BLOCKED_REASONS.clear()
+    daemon._DISCORD_AUTH_BLOCKED_ACCOUNTS.add("blocked-acc")
+    daemon._DISCORD_AUTH_BLOCKED_REASONS["blocked-acc"] = "auth failed"
+
+    discord_tasks: dict[str, asyncio.Task[None]] = {}
+    daemon._start_missing_discord_tasks(
+        adapters={"blocked-acc": object()},
+        discord_tasks=discord_tasks,
+        active_discord_account_ids={"blocked-acc"},
+        deployments_by_account={},
+        accounts_env_values={},
+    )
+
+    assert discord_tasks == {}

@@ -73,6 +73,11 @@ class StrategyMeta(BaseModel):
         )
 
 
+class StrategyType(str, Enum):
+    MARKET_DATA = "market_data"
+    SIGNAL_PROCESSOR = "signal_processor"
+
+
 # ─── Live trading models ─────────────────────────────────────────────────────
 
 

@@ -147,6 +147,27 @@ PORTFOLIOS_DIR = DATA_DIR / "portfolios"
 STRATEGIES_DIR = DEFAULT_STRATEGIES_DIR
 REACT_DIST = PROJECT_ROOT / "frontend" / "dist"
 STATIC_DIR = REACT_DIST if REACT_DIST.exists() else Path(__file__).resolve().parent / "static"
+_STATIC_ASSET_SUFFIXES = {
+    ".js",
+    ".mjs",
+    ".css",
+    ".map",
+    ".json",
+    ".svg",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".ico",
+    ".webp",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".eot",
+    ".txt",
+    ".xml",
+    ".webmanifest",
+}
 LOGS_DIR = LOG_DIR
 TASK_LOGS_DIR = LOG_DIR / "tasks"
 OPTIMIZATIONS_DIR = legacy_viewer.OPTIMIZATIONS_DIR
@@ -863,6 +884,10 @@ async def _sync_live_market_data_stream_background() -> None:
         await asyncio.sleep(10)
 
 
+def _is_static_asset_request(path: str) -> bool:
+    return Path(path).suffix.lower() in _STATIC_ASSET_SUFFIXES
+
+
 @app.middleware("http")
 async def static_spa_middleware(request: Request, call_next):
     path = request.url.path
@@ -878,6 +903,10 @@ async def static_spa_middleware(request: Request, call_next):
             candidate = (STATIC_DIR / rel_path).resolve()
             if candidate.is_file() and candidate.is_relative_to(STATIC_DIR.resolve()):
                 return FileResponse(candidate)
+            if _is_static_asset_request(rel_path):
+                # Missing static asset must not fall back to index.html,
+                # otherwise browsers report MIME errors for module scripts.
+                return await call_next(request)
         index_file = STATIC_DIR / "index.html"
         if index_file.exists():
             return FileResponse(index_file)
@@ -3601,7 +3630,7 @@ def _resolve_component_payloads(payload: CreatePortfolioRequest) -> list[dict[st
 
     strategy_configs = [item.model_dump() for item in payload.strategies]
     if not strategy_configs:
-        raise HTTPException(status_code=400, detail="At least one component required")
+        return []
 
     resolved_legacy: list[dict[str, Any]] = []
     for index, strategy_config in enumerate(strategy_configs, start=1):
@@ -7321,8 +7350,7 @@ async def create_portfolio(payload: CreatePortfolioRequest) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="account_capital must be positive")
 
     component_payloads = _resolve_component_payloads(payload)
-    if not component_payloads:
-        raise HTTPException(status_code=400, detail="At least one component required")
+    allows_empty_portfolio = len(component_payloads) == 0
 
     component_returns: list[pd.Series] = []
     components: list[dict[str, Any]] = []
@@ -7428,32 +7456,52 @@ async def create_portfolio(payload: CreatePortfolioRequest) -> dict[str, Any]:
             }
         )
 
-    if not component_returns:
+    if not component_returns and not allows_empty_portfolio:
         raise HTTPException(status_code=400, detail="No valid components found")
 
-    combined_df = pd.concat(component_returns, axis=1).fillna(0.0)
-    portfolio_daily_returns = combined_df.sum(axis=1)
-    if len(combined_df.columns) > 1:
-        correlation_matrix = combined_df.corr().round(4).fillna(0.0).to_dict()
-    else:
-        first = combined_df.columns[0]
-        correlation_matrix = {first: {first: 1.0}}
-
-    current_equity = account_capital
-    combined_equity_points: list[legacy_viewer.EquityPoint] = []
-    for timestamp, daily_return in portfolio_daily_returns.items():
-        current_equity *= 1.0 + _safe_float(daily_return, 0.0)
-        combined_equity_points.append(
-            legacy_viewer.EquityPoint(time=pd.Timestamp(timestamp).isoformat(), equity=current_equity)
-        )
-
-    stats_result = legacy_viewer.compute_stats(
-        trades=[],
-        initial_capital=account_capital,
-        equity_curve=combined_equity_points,
-    )
-
     now = datetime.now(timezone.utc)
+    if component_returns:
+        combined_df = pd.concat(component_returns, axis=1).fillna(0.0)
+        portfolio_daily_returns = combined_df.sum(axis=1)
+        if len(combined_df.columns) > 1:
+            correlation_matrix = combined_df.corr().round(4).fillna(0.0).to_dict()
+        else:
+            first = combined_df.columns[0]
+            correlation_matrix = {first: {first: 1.0}}
+
+        current_equity = account_capital
+        combined_equity_points: list[legacy_viewer.EquityPoint] = []
+        for timestamp, daily_return in portfolio_daily_returns.items():
+            current_equity *= 1.0 + _safe_float(daily_return, 0.0)
+            combined_equity_points.append(
+                legacy_viewer.EquityPoint(time=pd.Timestamp(timestamp).isoformat(), equity=current_equity)
+            )
+
+        stats_result = legacy_viewer.compute_stats(
+            trades=[],
+            initial_capital=account_capital,
+            equity_curve=combined_equity_points,
+        )
+    else:
+        correlation_matrix = {}
+        combined_equity_points = [
+            legacy_viewer.EquityPoint(time=now.isoformat(), equity=account_capital)
+        ]
+        stats_result = {
+            "sharpe_ratio": 0.0,
+            "sortino_ratio": 0.0,
+            "cagr": 0.0,
+            "max_drawdown_pct": 0.0,
+            "total_pnl": 0.0,
+            "win_rate": 0.0,
+            "profit_factor": 0.0,
+            "calmar_ratio": 0.0,
+            "total_return": 0.0,
+            "max_drawdown_duration": 0,
+            "psr": 0.0,
+            "p_value": 1.0,
+        }
+
     portfolio_id = _portfolio_identifier(name, now=now)
     all_trades_timed.sort(key=_component_trade_time)
 

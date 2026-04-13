@@ -185,6 +185,11 @@ def test_viewer_app_enables_gzip_middleware(viewer_client):
     )
 
 
+def test_static_spa_middleware_returns_404_for_missing_js_asset(viewer_client):
+    resp = viewer_client.get("/assets/missing-liveviewer-chunk.js")
+    assert resp.status_code == 404
+
+
 def test_data_download_rejects_dates_before_genesis(viewer_client, tmp_path):
     (tmp_path / "dukascopy_genesis.json").write_text(json.dumps({
         "EURUSD": {
@@ -2944,6 +2949,24 @@ def test_create_portfolio_persists_p_value_and_psr(viewer_client, tmp_path):
     assert trades_payload[0]["strategy_name"] == "Portfolio Signal"
     assert trades_payload[0]["symbol"] == "AAPL"
     assert trades_payload[0]["timeframe"] == "1d"
+
+
+def test_create_portfolio_allows_empty_components(viewer_client):
+    response = viewer_client.post(
+        "/api/portfolios",
+        json={
+            "name": "Empty Portfolio",
+            "account_capital": 50000.0,
+            "components": [],
+        },
+    )
+
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["name"] == "Empty Portfolio"
+    assert payload["components"] == []
+    assert payload["trades"] == []
+    assert payload["combined_stats"]["total_return"] == pytest.approx(0.0, abs=1e-9)
 
 
 def test_agent_convert_endpoint_starts_background_agent(viewer_client, monkeypatch):

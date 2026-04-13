@@ -8,15 +8,19 @@ from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 from typing import Any
 
+from live_runner.signal_sources.base_source import BaseSignalSource
 from risk.models import TradeSignal
 from shared.constants import normalize_timeframe
 from shared.database import save_live_signal, update_service_status
 from shared.logging import get_logger
 from shared.models import LiveSignal, ServiceStatus
 
-from live_runner.signal_sources.base_source import BaseSignalSource
-
 logger = get_logger("live-runner")
+
+
+class DiscordAuthenticationError(RuntimeError):
+    """Raised when discord.py fails with terminal authentication errors."""
+
 
 _RAMJET_OVERSOLD_RE = re.compile(r"is now oversold", re.IGNORECASE)
 _BUY_SIGNAL_RE = re.compile(r"buy signal", re.IGNORECASE)
@@ -73,6 +77,26 @@ _SKIP_WORDS = {
     "EXIT",
     "ENTRY",
 }
+
+
+def _is_discord_auth_error(exc: BaseException | None) -> bool:
+    if exc is None:
+        return False
+    name = exc.__class__.__name__.lower()
+    message = str(exc).lower()
+    if "loginfailure" in name:
+        return True
+    return any(
+        marker in message
+        for marker in (
+            "improper token has been passed",
+            "invalid token",
+            "token is invalid",
+            "unauthorized",
+            "401",
+            "authentication failed",
+        )
+    )
 
 
 def _extract_symbol(content: str) -> str | None:
@@ -391,7 +415,26 @@ class DiscordSignalSource(BaseSignalSource):
         )
         try:
             await asyncio.wait_for(self._ready.wait(), timeout=30)
-        except Exception:
+        except Exception as exc:
+            task_error: BaseException | None = None
+            if self._run_task is not None and self._run_task.done():
+                with contextlib.suppress(asyncio.CancelledError):
+                    task_error = self._run_task.exception()
+            detected_error = task_error or exc
+            if _is_discord_auth_error(detected_error):
+                message = f"Discord bot {self.bot_name} auth failed: Invalid token"
+                logger.warning(
+                    message,
+                    extra={
+                        "data": {
+                            "bot_name": self.bot_name,
+                            "service_id": self.service_id,
+                            "error": str(detected_error),
+                        }
+                    },
+                )
+                await self.disconnect(failed=True)
+                raise DiscordAuthenticationError(message) from detected_error
             await self.disconnect(failed=True)
             raise
 
@@ -399,9 +442,24 @@ class DiscordSignalSource(BaseSignalSource):
         if self._client is not None:
             await self._client.close()
         if self._run_task is not None:
-            self._run_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._run_task
+            run_task = self._run_task
+            if not run_task.done():
+                run_task.cancel()
+            try:
+                await run_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                logger.debug(
+                    "Discord client task ended during disconnect",
+                    extra={
+                        "data": {
+                            "bot_name": self.bot_name,
+                            "service_id": self.service_id,
+                            "error": str(exc),
+                        }
+                    },
+                )
         self._connected = False
         self._ready.clear()
         self._run_task = None
@@ -429,6 +487,20 @@ class DiscordSignalSource(BaseSignalSource):
             if self._run_task is not None and self._run_task.done():
                 exception = self._run_task.exception()
                 if exception is not None:
+                    if _is_discord_auth_error(exception):
+                        message = f"Discord bot {self.bot_name} auth failed: Invalid token"
+                        logger.warning(
+                            message,
+                            extra={
+                                "data": {
+                                    "bot_name": self.bot_name,
+                                    "service_id": self.service_id,
+                                    "error": str(exception),
+                                }
+                            },
+                        )
+                        await self._set_service_status(ServiceStatus.FAILED)
+                        raise DiscordAuthenticationError(message) from exception
                     await self._set_service_status(ServiceStatus.FAILED)
                     raise RuntimeError("Discord client task terminated") from exception
                 await self._set_service_status(ServiceStatus.FAILED)

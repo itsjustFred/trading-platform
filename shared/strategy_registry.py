@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from shared.models import StrategyType
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_STRATEGIES_DIR = PROJECT_ROOT / "strategies"
 
@@ -110,6 +112,64 @@ def load_strategy_meta(path: Path, strategies_dir: Path = DEFAULT_STRATEGIES_DIR
     return {}
 
 
+def _strategy_type_from_meta(meta: dict[str, Any]) -> StrategyType | None:
+    candidates: list[Any] = [
+        meta.get("strategy_type"),
+        meta.get("type"),
+    ]
+
+    tags = meta.get("tags")
+    if isinstance(tags, dict):
+        candidates.extend(
+            [
+                tags.get("strategy_type"),
+                tags.get("type"),
+            ]
+        )
+
+    normalized_tokens: set[str] = set()
+    for candidate in candidates:
+        if isinstance(candidate, (list, tuple, set)):
+            normalized_tokens.update(_identifier_key(str(item)) for item in candidate)
+        elif candidate is not None:
+            normalized_tokens.add(_identifier_key(str(candidate)))
+
+    if "signal processor" in normalized_tokens:
+        return StrategyType.SIGNAL_PROCESSOR
+    if "market data" in normalized_tokens:
+        return StrategyType.MARKET_DATA
+    return None
+
+
+def _module_has_signal_processor_class(module: Any) -> bool:
+    for value in vars(module).values():
+        if not isinstance(value, type):
+            continue
+        if value.__name__.lower().endswith("signalprocessor") and callable(
+            getattr(value, "process_signal", None)
+        ):
+            return True
+    return False
+
+
+def detect_strategy_type(
+    path: Path,
+    strategies_dir: Path = DEFAULT_STRATEGIES_DIR,
+) -> StrategyType:
+    module = load_strategy_module(path, strategies_dir)
+
+    meta = getattr(module, "STRATEGY_META", None)
+    if isinstance(meta, dict):
+        detected = _strategy_type_from_meta(meta)
+        if detected is not None:
+            return detected
+
+    if _module_has_signal_processor_class(module):
+        return StrategyType.SIGNAL_PROCESSOR
+
+    return StrategyType.MARKET_DATA
+
+
 def iter_strategy_entries(strategies_dir: Path = DEFAULT_STRATEGIES_DIR) -> list[StrategyEntry]:
     entries: list[StrategyEntry] = []
     for path in iter_strategy_files(strategies_dir):
@@ -195,7 +255,10 @@ def update_strategy_display_name(
             end = _offset_from_position(line_offsets, value.end_lineno, value.end_col_offset)
             updated = source[:start] + repr(new_name) + source[end:]
             strategy_file.write_text(updated, encoding="utf-8")
-            entry = find_strategy_entry(strategy_slug_for_path(strategy_file, strategies_dir), strategies_dir)
+            entry = find_strategy_entry(
+                strategy_slug_for_path(strategy_file, strategies_dir),
+                strategies_dir,
+            )
             return entry.meta if entry else {"name": new_name}
         break
     raise ValueError(f"Could not update STRATEGY_META.name in {strategy_file}")

@@ -17,6 +17,7 @@ from live_runner.base_adapter import BaseLiveAdapter
 from live_runner.ctrader_adapter import CTraderLiveAdapter
 from live_runner.service_discovery import discover_discord_bots_from_env
 from live_runner.signal_sources import DiscordSignalSource, wait_for_candle_close
+from live_runner.signal_sources.discord_source import DiscordAuthenticationError
 from risk import RiskConfig, RiskEngine, TradeSignal
 from scheduler.scheduler import ServiceScheduler
 from shared.database import (
@@ -45,6 +46,28 @@ DEFAULT_ACCOUNTS_ENV = PROJECT_ROOT / ".accounts.env"
 BALANCE_POLL_INTERVAL_SECONDS = 60
 DEPLOYMENT_POLL_INTERVAL_SECONDS = 10
 SERVICE_SYNC_INTERVAL_SECONDS = 60
+_DISCORD_AUTH_BLOCKED_ACCOUNTS: set[str] = set()
+_DISCORD_AUTH_BLOCKED_REASONS: dict[str, str] = {}
+
+
+def _is_terminal_discord_runtime_error(exc: BaseException) -> bool:
+    if isinstance(exc, DiscordAuthenticationError):
+        return True
+    message = str(exc).strip().lower()
+    if not message:
+        return False
+    return any(
+        marker in message
+        for marker in (
+            "improper token has been passed",
+            "invalid token",
+            "token is invalid",
+            "unauthorized",
+            "authentication failed",
+            "missing discord_bot_token",
+            "missing discord_channel_id",
+        )
+    )
 
 
 def _parse_bool_env(value: str | None, *, default: bool = True) -> bool:
@@ -353,7 +376,8 @@ async def _run_discord_signal_listener_for_account(
     channel_to_deployments: dict[str, list[LiveDeploymentConfig]] = {}
     for deployment in active_discord_deployments:
         configured_channel = str(
-            deployment.signal_config.get("channel_id") or accounts_env_values.get("DISCORD_CHANNEL_ID", "")
+            deployment.signal_config.get("channel_id")
+            or accounts_env_values.get("DISCORD_CHANNEL_ID", "")
         ).strip()
         if not configured_channel:
             logger.warning(
@@ -601,6 +625,20 @@ async def _run_discord_listener_with_retries(
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            if _is_terminal_discord_runtime_error(exc):
+                _DISCORD_AUTH_BLOCKED_ACCOUNTS.add(account_id)
+                _DISCORD_AUTH_BLOCKED_REASONS[account_id] = str(exc)
+                logger.warning(
+                    "Discord listener auth failed; stopping retries for account "
+                    "until credentials change",
+                    extra={
+                        "data": {
+                            "account_id": account_id,
+                            "error": str(exc),
+                        }
+                    },
+                )
+                return
             logger.warning(
                 "Discord listener loop failed; retrying",
                 extra={
@@ -643,6 +681,23 @@ async def _run_discord_bot_service_listener(service: Service, source: DiscordSig
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            if _is_terminal_discord_runtime_error(exc):
+                logger.warning(
+                    "Discord bot auth failed; stopping retries",
+                    extra={
+                        "data": {
+                            "service_id": str(service.id),
+                            "service_name": service.name,
+                            "error": str(exc),
+                        }
+                    },
+                )
+                await asyncio.to_thread(
+                    update_service_status,
+                    str(service.id),
+                    ServiceStatus.FAILED,
+                )
+                return
             logger.warning(
                 "Discord bot listener failed; retrying",
                 extra={
@@ -947,6 +1002,11 @@ def _cancel_inactive_discord_tasks(
             "Stopped discord signal listener",
             extra={"data": {"account_id": account_id, "status": "inactive"}},
         )
+    for account_id in list(_DISCORD_AUTH_BLOCKED_ACCOUNTS):
+        if account_id in active_discord_account_ids:
+            continue
+        _DISCORD_AUTH_BLOCKED_ACCOUNTS.discard(account_id)
+        _DISCORD_AUTH_BLOCKED_REASONS.pop(account_id, None)
 
 
 def _start_missing_discord_tasks(
@@ -958,6 +1018,8 @@ def _start_missing_discord_tasks(
     accounts_env_values: Mapping[str, str],
 ) -> None:
     for account_id in sorted(active_discord_account_ids):
+        if account_id in _DISCORD_AUTH_BLOCKED_ACCOUNTS:
+            continue
         running_task = discord_tasks.get(account_id)
         if running_task is not None and not running_task.done():
             continue
@@ -1151,6 +1213,13 @@ async def sync_deployments_loop(
             if current_mtime != accounts_env_mtime:
                 accounts_env_values = _load_accounts_env_values(accounts_env)
                 accounts_env_mtime = current_mtime
+                if _DISCORD_AUTH_BLOCKED_ACCOUNTS:
+                    logger.info(
+                        "Credentials changed; clearing blocked Discord listener accounts",
+                        extra={"data": {"account_ids": sorted(_DISCORD_AUTH_BLOCKED_ACCOUNTS)}},
+                    )
+                _DISCORD_AUTH_BLOCKED_ACCOUNTS.clear()
+                _DISCORD_AUTH_BLOCKED_REASONS.clear()
             accounts, deployments = await _load_db_accounts_and_deployments()
             deployments_by_account: dict[str, list[LiveDeploymentConfig]] = {}
             for deployment in deployments:

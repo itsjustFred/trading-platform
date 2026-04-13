@@ -98,6 +98,15 @@ def _is_expected_ctrader_host_route_error(error_text: str) -> bool:
     return "CANT_ROUTE_REQUEST" in normalized and "NO ENVIRONMENT CONNECTION" in normalized
 
 
+def _is_ctrader_account_not_authorized_error(error_text: str) -> bool:
+    normalized = error_text.upper()
+    return (
+        "TRADING_ACCOUNT_IS_NOT_AUTHORIZED" in normalized
+        or "ACCOUNT_NOT_AUTHORIZED" in normalized
+        or "NOT AUTHORIZED" in normalized
+    )
+
+
 def _iter_alpaca_credentials(env: dict[str, str]) -> list[dict[str, Any]]:
     indexed: list[dict[str, Any]] = []
     indexes = sorted(
@@ -561,6 +570,19 @@ async def _discover_ctrader_accounts_on_host(
                                 }
                             },
                         )
+                    elif _is_ctrader_account_not_authorized_error(error_text):
+                        logger.info(
+                            "Account %s not authorized for token, skipping",
+                            account_id,
+                            extra={
+                                "data": {
+                                    "account_id": str(account_id),
+                                    "host": host,
+                                    "error": error_text,
+                                }
+                            },
+                        )
+                        continue
                     else:
                         logger.warning(
                             "Could not load cTrader trader details for discovered account",

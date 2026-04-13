@@ -106,3 +106,13 @@ def test_is_expected_ctrader_host_route_error_detects_environment_mismatch():
 def test_is_expected_ctrader_host_route_error_ignores_unrelated_errors():
     error_text = "RuntimeError('UNAUTHORIZED: invalid token')"
     assert not account_discovery._is_expected_ctrader_host_route_error(error_text)
+
+
+def test_is_ctrader_account_not_authorized_error_detects_phrase():
+    error_text = "RuntimeError('TRADING_ACCOUNT_IS_NOT_AUTHORIZED: Trading account is not authorized')"
+    assert account_discovery._is_ctrader_account_not_authorized_error(error_text)
+
+
+def test_is_ctrader_account_not_authorized_error_ignores_other_errors():
+    error_text = "RuntimeError('TIMEOUT: endpoint unavailable')"
+    assert not account_discovery._is_ctrader_account_not_authorized_error(error_text)
