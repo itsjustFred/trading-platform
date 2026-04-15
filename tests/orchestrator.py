@@ -101,9 +101,7 @@ def main() -> int:
     args = parser.parse_args()
 
     requested_layers = (
-        ["validation", "strategies", "e2e", "unit"]
-        if args.layer == "all"
-        else [args.layer]
+        ["validation", "strategies", "unit", "e2e"] if args.layer == "all" else [args.layer]
     )
 
     results: list[LayerResult] = []

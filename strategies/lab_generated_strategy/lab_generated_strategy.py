@@ -1,36 +1,70 @@
-STRATEGY_META = {'name': 'lab_generated_strategy',
+STRATEGY_META = {'name': 'Sample EMA Cross',
  'version': '1.0.0',
- 'parameters': {'fast_length': 9, 'slow_length': 21},
- 'tags': {'type': ['trend_following', 'ema_cross', 'crossover', 'moving_average', 'vectorbt']}}
+ 'parameters': {'fast_length': {'type': 'int',
+                                'default': 9,
+                                'min': 1,
+                                'description': 'Fast EMA period (short term trend)'},
+                'slow_length': {'type': 'int',
+                                'default': 21,
+                                'min': 1,
+                                'description': 'Slow EMA period (long term trend)'}},
+ 'tags': {'type': ['trend-following',
+                   'ema',
+                   'crossover',
+                   'moving-average',
+                   'golden-cross',
+                   'death-cross']}}
 
 import pandas as pd
 import numpy as np
-from typing import Dict, List, Any, Tuple
 
-def generate_signals(df: pd.DataFrame, params: dict) -> Tuple[pd.Series, pd.Series, Dict[str, pd.Series], List[Dict[str, Any]]]:
+def generate_signals(df, params):
     """
-    EMA Crossover Strategy.
-    Entry: Fast EMA (9) crosses above Slow EMA (21)
-    Exit: Fast EMA (9) crosses below Slow EMA (21)
-    """
-    fast_length = params.get('fast_length', 9)
-    slow_length = params.get('slow_length', 21)
+    Generate signals for EMA Crossover strategy.
+    Entry: Fast EMA crosses above Slow EMA (Golden Cross)
+    Exit: Fast EMA crosses below Slow EMA (Death Cross)
     
+    Returns: entries, exits, indicators_dict, drawings
+    """
+    # Robust parameter extraction handling nested dicts from STRATEGY_META
+    def _get_param(p, key, default):
+        if p is None:
+            return default
+        val = p.get(key, default)
+        # Handle case where params contains metadata dict instead of values
+        if isinstance(val, dict):
+            return val.get('default', default)
+        return val
+    
+    # Extract EMA lengths with defaults
+    fast_length = int(_get_param(params, 'fast_length', 9))
+    slow_length = int(_get_param(params, 'slow_length', 21))
+    
+    # Calculate EMAs using pandas ewm
     close = df['close']
     fast_ema = close.ewm(span=fast_length, adjust=False).mean()
     slow_ema = close.ewm(span=slow_length, adjust=False).mean()
     
-    prev_fast = fast_ema.shift(1)
-    prev_slow = slow_ema.shift(1)
+    # Crossover logic: current cross vs previous bar
+    # Entry: fast crosses above slow
+    entries = (fast_ema > slow_ema) & (fast_ema.shift(1) <= slow_ema.shift(1))
+    # Exit: fast crosses below slow  
+    exits = (fast_ema < slow_ema) & (fast_ema.shift(1) >= slow_ema.shift(1))
     
-    entries = (fast_ema > slow_ema) & (prev_fast <= prev_slow)
-    exits = (fast_ema < slow_ema) & (prev_fast >= prev_slow)
+    # Clean NaN values
+    entries = entries.fillna(False)
+    exits = exits.fillna(False)
     
+    # Indicators dict with all logic-relevant values (sl_price=None per Ground Truth)
     indicators_dict = {
         'fast_ema': fast_ema,
         'slow_ema': slow_ema,
+        'fast_length': fast_length,
+        'slow_length': slow_length,
+        'sl_price': None  # No stop loss implemented in original strategy
     }
     
-    drawings = []
+    # Optional drawings - not required for this simple overlay strategy
+    drawings = None
     
     return entries, exits, indicators_dict, drawings

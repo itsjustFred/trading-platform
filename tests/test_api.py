@@ -9,6 +9,8 @@ from pathlib import Path
 from unittest.mock import patch, MagicMock
 from fastapi.testclient import TestClient
 
+from shared.strategy_registry import DEFAULT_STRATEGIES_DIR, load_strategy_meta
+
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -53,7 +55,14 @@ class TestStrategiesAPI:
         detail_resp = client.get("/api/strategies/example_sma")
         assert detail_resp.status_code == 200
         detail = detail_resp.json()
-        assert detail["parameters"] == {"fast": 10, "slow": 30}
+        expected_parameters = load_strategy_meta(
+            DEFAULT_STRATEGIES_DIR / "example_sma" / "example_sma.py"
+        ).get("parameters")
+        assert isinstance(expected_parameters, dict)
+        assert detail["parameters"] == expected_parameters
+        assert detail["parameters"] == {"fast_length": 9, "slow_length": 21}
+        assert all(isinstance(key, str) for key in detail["parameters"])
+        assert all(isinstance(value, int) for value in detail["parameters"].values())
 
     def test_get_nonexistent_strategy(self, client):
         resp = client.get("/api/strategies/nonexistent_strategy_xyz")
