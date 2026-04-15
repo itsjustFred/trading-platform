@@ -13,6 +13,7 @@ import { DataManagementPage } from "./pages/DataManagementPage";
 import { StrategyLabPage } from "./pages/StrategyLabPage";
 import { OptimizationsPage } from "./pages/OptimizationsPage";
 import { OptimizationResultsPage } from "./pages/OptimizationResultsPage";
+import { ViewerPage } from "./pages/ViewerPage";
 import { TaskManager } from "./components/TaskManager";
 
 export default function App() {
@@ -50,6 +51,7 @@ export default function App() {
           <Route path="/portfolios" element={<PortfoliosPage />} />
           <Route path="/portfolios/:id" element={<PortfolioDetailPage />} />
           <Route path="/lab" element={<StrategyLabPage />} />
+          <Route path="/viewer" element={<ViewerPage />} />
           <Route path="/logging" element={<LoggingPage />} />
         </Routes>
       </main>

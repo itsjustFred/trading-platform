@@ -167,6 +167,22 @@ def test_trade_detail_includes_meta(viewer_client, tmp_path):
                 "val2": 103.5,
                 "color": "#58a6ff",
             },
+            {
+                "type": "box",
+                "start_time": "2024-01-01T09:00:00+00:00",
+                "end_time": "2024-01-01T12:00:00+00:00",
+                "top": 104.0,
+                "bottom": 100.0,
+                "color": "#d29922",
+            },
+            {
+                "type": "triangle",
+                "x": "2024-01-01T11:00:00+00:00",
+                "y": 102.25,
+                "rotation": 30,
+                "size": "md",
+                "color": "#f59e0b",
+            },
         ],
     )
     result.save(backtests_dir / "meta-demo.trades.json")
@@ -184,6 +200,71 @@ def test_trade_detail_includes_meta(viewer_client, tmp_path):
     assert payload["drawings"][0]["time"] == pytest.approx(1704103200.0)
     assert payload["drawings"][1]["type"] == "line"
     assert payload["drawings"][1]["start_time"] == pytest.approx(1704103200.0)
+    assert payload["drawings"][2]["type"] == "box"
+    assert payload["drawings"][2]["start_time"] == pytest.approx(1704099600.0)
+    assert payload["drawings"][2]["top"] == pytest.approx(104.0)
+    assert payload["drawings"][3]["type"] == "triangle"
+    assert payload["drawings"][3]["x"] == pytest.approx(1704106800.0)
+    assert payload["drawings"][3]["y"] == pytest.approx(102.25)
+
+
+def test_viewer_strategy_signals_include_execution_preview(viewer_client, tmp_path, monkeypatch):
+    import viewer.app as viewer_app_module
+
+    strategies_root = tmp_path / "strategies"
+    strategy_dir = strategies_root / "preview_limit"
+    strategy_dir.mkdir(parents=True)
+    strategy_file = strategy_dir / "preview_limit.py"
+    strategy_file.write_text(
+        """
+import pandas as pd
+
+STRATEGY_META = {
+    "name": "Preview Limit",
+    "parameters": {},
+}
+
+def generate_signals(df: pd.DataFrame, params: dict):
+    entries = pd.Series(False, index=df.index)
+    exits = pd.Series(False, index=df.index)
+    entries.iloc[1] = True
+    exits.iloc[2] = True
+    indicators = {
+        "order_type": pd.Series([None, "LIMIT", None], index=df.index),
+        "position_size_pct": pd.Series([None, 50, None], index=df.index),
+        "limit_price": pd.Series([None, 101.25, None], index=df.index),
+    }
+    return entries, exits, indicators
+"""
+    )
+
+    monkeypatch.setattr(viewer_app_module, "STRATEGIES_DIR", strategies_root)
+
+    ohlcv_dir = tmp_path / "ohlcv" / "test_source" / "equities" / "AAPL"
+    ohlcv_dir.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=3, freq="D", tz="UTC"),
+            "open": [100.0, 101.0, 102.0],
+            "high": [101.0, 102.0, 103.0],
+            "low": [99.0, 100.0, 101.0],
+            "close": [100.0, 101.0, 102.0],
+            "volume": [1, 1, 1],
+        }
+    ).to_parquet(ohlcv_dir / "1d.parquet", index=False)
+
+    response = viewer_client.get(
+        "/api/viewer/strategy-signals?strategy=preview_limit&symbol=AAPL&timeframe=1d&limit=100"
+    )
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["signal_schema_version"] == "2.0"
+    assert payload["execution_preview"]["direction"] == "LONG"
+    assert payload["execution_preview"]["entry"]["order_type"] == "LIMIT"
+    assert payload["execution_preview"]["entry"]["size_model"] == "PCT_POSITION"
+    assert payload["execution_preview"]["entry"]["size_value"] == pytest.approx(0.5)
+    assert payload["execution_preview"]["entry"]["limit_price"] == pytest.approx(101.25)
 
 
 def test_data_overview_and_category_use_catalog_date_ranges(viewer_client, tmp_path):

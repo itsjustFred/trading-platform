@@ -5,8 +5,10 @@ import sys
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from runner.engines.base import BacktestConfig
+from runner.engines.signal_schema import build_execution_schema_for_entry
 from runner.engines.pynecore_adapter import (
     _build_drawings,
     _enrich_trades_with_context,
@@ -340,6 +342,202 @@ def generate_signals(df: pd.DataFrame, params: dict):
 def test_default_max_leverage_is_unlevered():
     assert _resolve_max_leverage(None) == 2.0
     assert _resolve_max_leverage(1.0) == 1.0
+
+
+def test_build_execution_schema_for_entry_maps_limit_and_percent_size():
+    signals = pd.DataFrame(
+        {
+            "entries": [True],
+            "exits": [False],
+            "direction": ["LONG"],
+            "order_type": ["LIMIT"],
+            "position_size_pct": [50],
+            "limit_price": [101.25],
+        }
+    )
+    indicators: dict[str, tuple[pd.Series, str]] = {}
+
+    schema = build_execution_schema_for_entry(
+        entry_idx=0,
+        signals=signals,
+        indicators=indicators,
+        default_direction="LONG",
+    )
+
+    assert schema.direction == "LONG"
+    assert schema.entry is not None
+    assert schema.entry.order_type == "LIMIT"
+    assert schema.entry.size_model == "PCT_POSITION"
+    assert schema.entry.size_value == 0.5
+    assert schema.entry.limit_price == 101.25
+
+
+def test_build_execution_schema_for_entry_maps_multi_tp_legs():
+    signals = pd.DataFrame(
+        {
+            "entries": [True],
+            "exits": [False],
+            "direction": ["LONG"],
+            "tp1_price": [102.0],
+            "tp1_qty_pct": [50],
+            "tp2_price": [104.0],
+            "tp2_qty_pct": [50],
+            "stop_loss": [95.0],
+        }
+    )
+    indicators: dict[str, tuple[pd.Series, str]] = {}
+
+    schema = build_execution_schema_for_entry(
+        entry_idx=0,
+        signals=signals,
+        indicators=indicators,
+        default_direction="LONG",
+    )
+
+    assert len(schema.tp_legs) == 2
+    assert schema.tp_legs[0].label == "tp1"
+    assert schema.tp_legs[0].price == 102.0
+    assert schema.tp_legs[0].quantity_pct == 0.5
+    assert schema.tp_legs[1].label == "tp2"
+    assert schema.tp_legs[1].price == 104.0
+    assert schema.tp_legs[1].quantity_pct == 0.5
+    assert schema.sl_leg is not None
+    assert schema.sl_leg.price == 95.0
+
+
+@pytest.mark.parametrize(
+    "size_column,size_value,expected_qty,expected_size_model",
+    [
+        ("position_size_pct", 50, 5.0, "PCT_POSITION"),
+        ("position_qty", 3, 3.0, "ABS_QTY"),
+        ("position_notional", 250, 2.5, "NOTIONAL"),
+        ("risk_pct", 0.02, 4.0, "RISK_PCT"),
+    ],
+)
+def test_vectorbt_adapter_uses_explicit_schema_size_models(
+    tmp_path: Path,
+    size_column: str,
+    size_value: float,
+    expected_qty: float,
+    expected_size_model: str,
+):
+    strategy_path = tmp_path / f"schema_size_{size_column}.py"
+    stop_loss_line = (
+        '    signals["stop_loss"] = pd.Series([None, 95.0, None], index=df.index)\n'
+        if size_column == "risk_pct"
+        else ""
+    )
+    strategy_path.write_text(
+        f"""
+import pandas as pd
+
+def generate_signals(df: pd.DataFrame, params: dict):
+    signals = pd.DataFrame(index=df.index)
+    signals["entries"] = False
+    signals["exits"] = False
+    signals.loc[df.index[1], "entries"] = True
+    signals.loc[df.index[2], "exits"] = True
+    signals["direction"] = "LONG"
+    signals["{size_column}"] = pd.Series([None, {size_value}, None], index=df.index)
+{stop_loss_line}    return signals
+"""
+    )
+
+    data_root = tmp_path / "data"
+    parquet_dir = data_root / "ohlcv" / "test_source" / "equities" / "AAPL"
+    parquet_dir.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=3, freq="D", tz="UTC"),
+            "open": [100, 100, 101],
+            "high": [101, 101, 102],
+            "low": [99, 99, 100],
+            "close": [100, 100, 101],
+            "volume": [10, 10, 10],
+        }
+    ).to_parquet(parquet_dir / "1d.parquet", index=False)
+
+    result = VectorbtAdapter().run(
+        BacktestConfig(
+            strategy_name=f"schema_size_{size_column}",
+            symbols=["AAPL"],
+            timeframe="1d",
+            start_date="2024-01-01",
+            end_date="2024-01-03",
+            initial_capital=1000.0,
+            risk_per_trade_pct=0.01,
+            data_dir=str(data_root),
+        ),
+        str(strategy_path),
+    )
+
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    assert trade.quantity == expected_qty
+    assert trade.meta["signal_execution"]["entry"]["size_model"] == expected_size_model
+
+
+def test_vectorbt_adapter_executes_partial_tp_legs(tmp_path: Path):
+    strategy_path = tmp_path / "partial_tp_strategy.py"
+    strategy_path.write_text(
+        """
+import pandas as pd
+
+def generate_signals(df: pd.DataFrame, params: dict):
+    signals = pd.DataFrame(index=df.index)
+    signals["entries"] = False
+    signals["exits"] = False
+    signals.loc[df.index[1], "entries"] = True
+    signals.loc[df.index[5], "exits"] = True
+    signals["direction"] = "LONG"
+    signals["tp1_price"] = pd.Series([None, 102.0, None, None, None, None], index=df.index)
+    signals["tp1_qty_pct"] = pd.Series([None, 50, None, None, None, None], index=df.index)
+    signals["tp2_price"] = pd.Series([None, 104.0, None, None, None, None], index=df.index)
+    signals["tp2_qty_pct"] = pd.Series([None, 50, None, None, None, None], index=df.index)
+    signals["stop_loss"] = pd.Series([None, 95.0, None, None, None, None], index=df.index)
+    return signals
+"""
+    )
+
+    data_root = tmp_path / "data"
+    parquet_dir = data_root / "ohlcv" / "test_source" / "equities" / "AAPL"
+    parquet_dir.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=6, freq="D", tz="UTC"),
+            "open": [100, 100, 101, 103, 103, 103],
+            "high": [101, 101, 102.5, 104.5, 103.5, 103.5],
+            "low": [99, 99, 100, 102, 102, 102],
+            "close": [100, 100, 101, 103, 103, 103],
+            "volume": [10, 10, 10, 10, 10, 10],
+        }
+    ).to_parquet(parquet_dir / "1d.parquet", index=False)
+
+    result = VectorbtAdapter().run(
+        BacktestConfig(
+            strategy_name="partial_tp_strategy",
+            symbols=["AAPL"],
+            timeframe="1d",
+            start_date="2024-01-01",
+            end_date="2024-01-06",
+            initial_capital=1000.0,
+            data_dir=str(data_root),
+        ),
+        str(strategy_path),
+    )
+
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    assert trade.quantity == 10.0
+    assert len(trade.exits) == 2
+    assert trade.exits[0].reason == "tp1"
+    assert trade.exits[0].quantity == 5.0
+    assert trade.exits[0].price == 102.0
+    assert trade.exits[1].reason == "tp2"
+    assert trade.exits[1].quantity == 5.0
+    assert trade.exits[1].price == 104.0
+    assert trade.pnl == 30.0
+    assert len(trade.meta["signal_execution"]["tp_legs"]) == 2
 
 
 

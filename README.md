@@ -116,6 +116,7 @@ tests/               — Test suite
 | `LOG_LEVEL` | `INFO` | Logging level |
 | `FLASK_PORT` | `5556` | Viewer server port |
 | `NVIDIA_API_KEY` | — | API key for the Strategy Lab auto-conversion agent via NVIDIA NIM |
+| `AUTO_AGENT_IR_ROLLOUT` | `ir-first` | Strategy Lab codegen rollout mode (`legacy`, `ir-first`, `ir-only`) |
 
 ## Writing a Strategy (vectorbt)
 

@@ -24,6 +24,7 @@ from typing import Any
 import pandas as pd
 
 from runner.engines.base import BacktestConfig, EngineAdapter, resolve_strategy_parameters
+from runner.engines.signal_schema import build_execution_schema_for_entry
 from shared.constants import DATA_DIR
 from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, TradeExit
 
@@ -143,6 +144,16 @@ def _process_symbol(
             exit_ts = str(exit_row.get("timestamp", exit_row.name))
             trade_meta = _extract_trade_meta(signals, indicators, entry_idx, i)
 
+            # Canonical v2 execution schema snapshot for this entry keeps
+            # order type + sizing semantics consistent across runner/viewer.
+            execution_schema = build_execution_schema_for_entry(
+                entry_idx=entry_idx,
+                signals=signals,
+                indicators=indicators,
+                default_direction=direction,
+            )
+            trade_meta.setdefault("signal_execution", execution_schema.to_dict())
+
             intrabar_exit = _resolve_intrabar_exit(
                 intrabar_df=intrabar_df,
                 intrabar_timeframe=intrabar_timeframe,
@@ -159,7 +170,25 @@ def _process_symbol(
                 exit_reason = intrabar_exit["reason"]
                 trade_meta["modeling_resolution"] = intrabar_exit["resolution"]
 
-            if config.risk_per_trade_pct is not None and config.risk_per_trade_pct > 0:
+            explicit_schema_size = _has_explicit_schema_size(signals, indicators, entry_idx)
+            qty_from_schema: float | None = None
+            if explicit_schema_size:
+                qty_from_schema = _resolve_qty_from_execution_schema(
+                    execution_schema=execution_schema,
+                    equity=equity,
+                    entry_price=entry_price,
+                    asset_class=asset_class,
+                    config=config,
+                    entry_idx=entry_idx,
+                    stop_loss_series=stop_loss_series,
+                    atr_series=atr_series,
+                    symbol=symbol,
+                    trade_counter=trade_counter,
+                )
+
+            if qty_from_schema is not None and qty_from_schema > 0:
+                qty = qty_from_schema
+            elif config.risk_per_trade_pct is not None and config.risk_per_trade_pct > 0:
                 max_position_pct = _resolve_max_position_pct(
                     config.max_position_pct, asset_class
                 )
@@ -218,10 +247,33 @@ def _process_symbol(
             else:
                 qty = equity / entry_price
 
-            if direction == "LONG":
-                pnl = (exit_price - entry_price) * qty
+            if _is_partial_exit_schema(execution_schema):
+                trade_exits, pnl = _simulate_schema_partial_exits(
+                    df=df,
+                    entry_idx=entry_idx,
+                    exit_idx=i,
+                    direction=direction,
+                    entry_price=entry_price,
+                    quantity=qty,
+                    execution_schema=execution_schema,
+                    fallback_exit_price=exit_price,
+                    fallback_exit_time=exit_ts,
+                    fallback_exit_reason=exit_reason,
+                )
             else:
-                pnl = (entry_price - exit_price) * qty
+                if direction == "LONG":
+                    pnl = (exit_price - entry_price) * qty
+                else:
+                    pnl = (entry_price - exit_price) * qty
+                trade_exits = [
+                    TradeExit(
+                        time=exit_ts,
+                        price=round(exit_price, 6),
+                        quantity=round(qty, 4),
+                        pnl=round(pnl, 2),
+                        reason=exit_reason,
+                    )
+                ]
 
             trade = Trade(
                 id=trade_counter,  # temporary; renumbered after merge
@@ -230,15 +282,7 @@ def _process_symbol(
                 entry_time=entry_ts,
                 entry_price=round(entry_price, 6),
                 quantity=round(qty, 4),
-                exits=[
-                    TradeExit(
-                        time=exit_ts,
-                        price=round(exit_price, 6),
-                        quantity=round(qty, 4),
-                        pnl=round(pnl, 2),
-                        reason=exit_reason,
-                    )
-                ],
+                exits=trade_exits,
                 pnl=round(pnl, 2),
                 holding_bars=i - entry_idx,
                 tags=["vectorbt"],
@@ -706,6 +750,18 @@ def _resolve_level_value(series: pd.Series | None, idx: int) -> float | None:
     return numeric
 
 
+def _numeric_or_none(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if pd.isna(numeric):
+        return None
+    return numeric
+
+
 def _resolve_stop_distance(
     entry_idx: int,
     entry_price: float,
@@ -724,6 +780,372 @@ def _resolve_stop_distance(
             return float(atr)
 
     return None
+
+
+def _has_explicit_schema_size(
+    signals: pd.DataFrame,
+    indicators: IndicatorMap,
+    entry_idx: int,
+) -> bool:
+    size_columns = ("position_size_pct", "position_qty", "position_notional", "risk_pct")
+    for column in size_columns:
+        if column in signals.columns:
+            value = signals[column].iloc[entry_idx]
+            if pd.notna(value):
+                return True
+
+    size_indicator_aliases = (
+        "position_size_pct",
+        "size_pct",
+        "position_qty",
+        "qty",
+        "position_notional",
+        "risk_pct",
+    )
+    for alias in size_indicator_aliases:
+        row = indicators.get(alias)
+        if row is None:
+            continue
+        value = row[0].iloc[entry_idx]
+        if pd.notna(value):
+            return True
+
+    return False
+
+
+def _cap_notional_with_leverage(
+    *,
+    required_notional: float,
+    equity: float,
+    max_position_pct: float,
+    max_leverage: float,
+    symbol: str,
+    trade_counter: int,
+) -> float:
+    cap_notional = equity * max_position_pct
+    leverage_notional_limit = equity * max_leverage
+
+    if required_notional <= cap_notional:
+        return required_notional
+
+    if required_notional <= leverage_notional_limit:
+        logger.info(
+            "Leverage used for %s trade %s: required_notional=%.2f exceeds cap=%.2f (max_leverage=%.2fx)",
+            symbol,
+            trade_counter,
+            required_notional,
+            cap_notional,
+            max_leverage,
+        )
+        return required_notional
+
+    logger.warning(
+        "Position sizing capped for %s trade %s: requested_notional=%.2f exceeds leverage cap=%.2f",
+        symbol,
+        trade_counter,
+        required_notional,
+        leverage_notional_limit,
+    )
+    return leverage_notional_limit
+
+
+def _resolve_qty_from_execution_schema(
+    *,
+    execution_schema: Any,
+    equity: float,
+    entry_price: float,
+    asset_class: str,
+    config: BacktestConfig,
+    entry_idx: int,
+    stop_loss_series: pd.Series | None,
+    atr_series: pd.Series | None,
+    symbol: str,
+    trade_counter: int,
+) -> float | None:
+    entry_order = getattr(execution_schema, "entry", None)
+    if entry_order is None:
+        return None
+
+    size_model = str(getattr(entry_order, "size_model", "")).upper()
+    try:
+        size_value = float(getattr(entry_order, "size_value", 0.0))
+    except (TypeError, ValueError):
+        return None
+
+    if size_value <= 0:
+        return None
+
+    max_position_pct = _resolve_max_position_pct(config.max_position_pct, asset_class)
+    max_leverage = _resolve_max_leverage(config.max_leverage)
+    if max_leverage < max_position_pct:
+        max_leverage = max_position_pct
+
+    if size_model == "PCT_POSITION":
+        requested_notional = equity * size_value
+        final_notional = _cap_notional_with_leverage(
+            required_notional=requested_notional,
+            equity=equity,
+            max_position_pct=max_position_pct,
+            max_leverage=max_leverage,
+            symbol=symbol,
+            trade_counter=trade_counter,
+        )
+        return final_notional / entry_price
+
+    if size_model == "ABS_QTY":
+        requested_notional = size_value * entry_price
+        final_notional = _cap_notional_with_leverage(
+            required_notional=requested_notional,
+            equity=equity,
+            max_position_pct=max_position_pct,
+            max_leverage=max_leverage,
+            symbol=symbol,
+            trade_counter=trade_counter,
+        )
+        return final_notional / entry_price
+
+    if size_model == "NOTIONAL":
+        requested_notional = size_value
+        final_notional = _cap_notional_with_leverage(
+            required_notional=requested_notional,
+            equity=equity,
+            max_position_pct=max_position_pct,
+            max_leverage=max_leverage,
+            symbol=symbol,
+            trade_counter=trade_counter,
+        )
+        return final_notional / entry_price
+
+    if size_model == "RISK_PCT":
+        risk_amount = equity * size_value
+        stop_dist = _resolve_stop_distance(
+            entry_idx,
+            entry_price,
+            stop_loss_series=stop_loss_series,
+            atr_series=atr_series,
+        )
+        if not stop_dist or stop_dist <= 0:
+            stop_dist = entry_price * 0.02
+            logger.warning(
+                "Risk sizing fallback for %s at bar %s: no stop_loss/ATR, using %.2f%% default stop",
+                symbol,
+                entry_idx,
+                2.0,
+            )
+
+        requested_notional = (risk_amount / stop_dist) * entry_price
+        final_notional = _cap_notional_with_leverage(
+            required_notional=requested_notional,
+            equity=equity,
+            max_position_pct=max_position_pct,
+            max_leverage=max_leverage,
+            symbol=symbol,
+            trade_counter=trade_counter,
+        )
+        return final_notional / entry_price
+
+    return None
+
+
+def _is_partial_exit_schema(execution_schema: Any) -> bool:
+    tp_legs = list(getattr(execution_schema, "tp_legs", []) or [])
+    if len(tp_legs) > 1:
+        return True
+
+    for leg in tp_legs:
+        qty_pct = getattr(leg, "quantity_pct", None)
+        if qty_pct is None:
+            continue
+        try:
+            numeric = float(qty_pct)
+        except (TypeError, ValueError):
+            continue
+        if 0 < numeric < 1:
+            return True
+    return False
+
+
+def _simulate_schema_partial_exits(
+    *,
+    df: pd.DataFrame,
+    entry_idx: int,
+    exit_idx: int,
+    direction: str,
+    entry_price: float,
+    quantity: float,
+    execution_schema: Any,
+    fallback_exit_price: float,
+    fallback_exit_time: str,
+    fallback_exit_reason: str | None,
+) -> tuple[list[TradeExit], float]:
+    tp_legs_raw = list(getattr(execution_schema, "tp_legs", []) or [])
+    sl_leg = getattr(execution_schema, "sl_leg", None)
+
+    # Keep deterministic ordering for multi-target take-profit legs.
+    if direction == "LONG":
+        tp_legs = sorted(
+            tp_legs_raw,
+            key=lambda leg: (
+                int(getattr(leg, "priority", 100)),
+                float(getattr(leg, "price", float("inf")) or float("inf")),
+            ),
+        )
+    else:
+        tp_legs = sorted(
+            tp_legs_raw,
+            key=lambda leg: (
+                int(getattr(leg, "priority", 100)),
+                -float(getattr(leg, "price", 0.0) or 0.0),
+            ),
+        )
+
+    explicit_pct_sum = 0.0
+    unspecified_count = 0
+    for leg in tp_legs:
+        qty_pct = getattr(leg, "quantity_pct", None)
+        if qty_pct is None:
+            unspecified_count += 1
+            continue
+        try:
+            numeric = float(qty_pct)
+        except (TypeError, ValueError):
+            unspecified_count += 1
+            continue
+        if numeric > 1:
+            numeric = numeric / 100.0
+        if numeric > 0:
+            explicit_pct_sum += min(numeric, 1.0)
+        else:
+            unspecified_count += 1
+
+    unspecified_default_pct = 0.0
+    if unspecified_count > 0:
+        unspecified_default_pct = max(0.0, 1.0 - min(explicit_pct_sum, 1.0)) / unspecified_count
+
+    pending_legs: list[tuple[Any, float]] = []
+    for leg in tp_legs:
+        leg_price = _numeric_or_none(getattr(leg, "price", None))
+        if leg_price is None or leg_price <= 0:
+            continue
+        qty_pct = getattr(leg, "quantity_pct", None)
+        resolved_pct = _resolve_qty_pct(qty_pct, fallback=unspecified_default_pct)
+        pending_legs.append((leg, resolved_pct))
+
+    sl_price = _numeric_or_none(getattr(sl_leg, "price", None))
+    exits: list[TradeExit] = []
+    remaining_qty = float(quantity)
+
+    for bar_idx in range(entry_idx + 1, exit_idx + 1):
+        if remaining_qty <= 0:
+            break
+
+        row = df.iloc[bar_idx]
+        high = float(row.get("high", row.get("close", entry_price)))
+        low = float(row.get("low", row.get("close", entry_price)))
+        bar_time = str(row.get("timestamp", row.name))
+
+        if sl_price is not None:
+            stop_hit = low <= sl_price if direction == "LONG" else high >= sl_price
+            if stop_hit:
+                stop_pnl = _compute_leg_pnl(
+                    direction=direction,
+                    entry_price=entry_price,
+                    exit_price=sl_price,
+                    quantity=remaining_qty,
+                )
+                exits.append(
+                    TradeExit(
+                        time=bar_time,
+                        price=round(sl_price, 6),
+                        quantity=round(remaining_qty, 4),
+                        pnl=round(stop_pnl, 2),
+                        reason="stop_loss",
+                    )
+                )
+                remaining_qty = 0.0
+                break
+
+        if not pending_legs:
+            continue
+
+        still_pending: list[tuple[Any, float]] = []
+        for leg, qty_pct in pending_legs:
+            if remaining_qty <= 0:
+                break
+
+            leg_price = float(getattr(leg, "price", 0.0))
+            tp_hit = high >= leg_price if direction == "LONG" else low <= leg_price
+            if not tp_hit:
+                still_pending.append((leg, qty_pct))
+                continue
+
+            target_qty = float(quantity) * qty_pct if qty_pct > 0 else remaining_qty
+            leg_qty = min(remaining_qty, target_qty)
+            if leg_qty <= 0:
+                continue
+
+            tp_pnl = _compute_leg_pnl(
+                direction=direction,
+                entry_price=entry_price,
+                exit_price=leg_price,
+                quantity=leg_qty,
+            )
+            label = str(getattr(leg, "label", "") or "take_profit")
+            exits.append(
+                TradeExit(
+                    time=bar_time,
+                    price=round(leg_price, 6),
+                    quantity=round(leg_qty, 4),
+                    pnl=round(tp_pnl, 2),
+                    reason=label,
+                )
+            )
+            remaining_qty -= leg_qty
+
+        pending_legs = still_pending
+
+    if remaining_qty > 0:
+        fallback_pnl = _compute_leg_pnl(
+            direction=direction,
+            entry_price=entry_price,
+            exit_price=fallback_exit_price,
+            quantity=remaining_qty,
+        )
+        exits.append(
+            TradeExit(
+                time=fallback_exit_time,
+                price=round(fallback_exit_price, 6),
+                quantity=round(remaining_qty, 4),
+                pnl=round(fallback_pnl, 2),
+                reason=fallback_exit_reason,
+            )
+        )
+
+    total_pnl = sum(float(exit_leg.pnl or 0.0) for exit_leg in exits)
+    return exits, total_pnl
+
+
+def _resolve_qty_pct(value: Any, *, fallback: float) -> float:
+    numeric = _numeric_or_none(value)
+    if numeric is None:
+        numeric = fallback
+    if numeric > 1:
+        numeric = numeric / 100.0
+    if numeric <= 0:
+        return max(fallback, 0.0)
+    return min(numeric, 1.0)
+
+
+def _compute_leg_pnl(
+    *,
+    direction: str,
+    entry_price: float,
+    exit_price: float,
+    quantity: float,
+) -> float:
+    if direction == "LONG":
+        return (exit_price - entry_price) * quantity
+    return (entry_price - exit_price) * quantity
 
 
 def _load_ohlcv(

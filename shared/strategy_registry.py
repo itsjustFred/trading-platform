@@ -103,7 +103,11 @@ def load_strategy_module(path: Path, strategies_dir: Path = DEFAULT_STRATEGIES_D
 
 
 def load_strategy_meta(path: Path, strategies_dir: Path = DEFAULT_STRATEGIES_DIR) -> dict[str, Any]:
-    module = load_strategy_module(path, strategies_dir)
+    try:
+        module = load_strategy_module(path, strategies_dir)
+    except Exception:
+        # Skip strategies that cannot be imported in the current environment.
+        return {}
     meta = getattr(module, "STRATEGY_META", None)
     if isinstance(meta, dict):
         return dict(meta)

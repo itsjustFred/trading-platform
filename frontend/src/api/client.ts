@@ -24,6 +24,9 @@ import type {
   Trade,
   TradeChartResponse,
   BacktestInfo,
+  MarketOHLCVResponse,
+  MarketTimeframesResponse,
+  ViewerStrategySignalsResponse,
 } from "./types";
 
 const BASE_URL = "/api";
@@ -33,10 +36,23 @@ async function fetchJSON<T>(url: string, options?: RequestInit): Promise<T> {
     headers: { "Content-Type": "application/json" },
     ...options,
   });
+
+  const contentType = res.headers.get("content-type") ?? "";
+  const isJson = contentType.includes("application/json");
+
   if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: res.statusText }));
+    const err = isJson
+      ? await res.json().catch(() => ({ error: res.statusText }))
+      : { error: res.statusText };
     throw new Error(err.error || res.statusText);
   }
+
+  if (!isJson) {
+    throw new Error(
+      "API returned non-JSON response. Check frontend API proxy and backend availability.",
+    );
+  }
+
   return res.json();
 }
 
@@ -144,6 +160,53 @@ export const getSymbols = () =>
   fetchJSON<{ symbols: string[]; categories: Record<string, string[]> }>(
     "/symbols",
   );
+
+export const getMarketTimeframes = (symbol: string) =>
+  fetchJSON<MarketTimeframesResponse>(
+    `/market/timeframes/${encodeURIComponent(symbol)}`,
+  );
+
+export const getMarketOHLCV = (params: {
+  symbol: string;
+  timeframe: string;
+  start?: string;
+  end?: string;
+  limit?: number;
+}) => {
+  const query = new URLSearchParams();
+  query.set("symbol", params.symbol);
+  query.set("timeframe", params.timeframe);
+  if (params.start) query.set("start", params.start);
+  if (params.end) query.set("end", params.end);
+  if (params.limit && Number.isFinite(params.limit)) {
+    query.set("limit", String(params.limit));
+  }
+
+  return fetchJSON<MarketOHLCVResponse>(`/market/ohlcv?${query.toString()}`);
+};
+
+export const getViewerStrategySignals = (params: {
+  strategy: string;
+  symbol: string;
+  timeframe: string;
+  start?: string;
+  end?: string;
+  limit?: number;
+}) => {
+  const query = new URLSearchParams();
+  query.set("strategy", params.strategy);
+  query.set("symbol", params.symbol);
+  query.set("timeframe", params.timeframe);
+  if (params.start) query.set("start", params.start);
+  if (params.end) query.set("end", params.end);
+  if (params.limit && Number.isFinite(params.limit)) {
+    query.set("limit", String(params.limit));
+  }
+
+  return fetchJSON<ViewerStrategySignalsResponse>(
+    `/viewer/strategy-signals?${query.toString()}`,
+  );
+};
 
 // Data Management
 export const getDataOverview = () =>

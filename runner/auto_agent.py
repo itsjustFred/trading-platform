@@ -11,6 +11,7 @@ stage is retried with the latest error context.
 from __future__ import annotations
 
 import ast
+import inspect
 import json
 import os
 import re
@@ -23,9 +24,14 @@ from pprint import pformat
 from typing import Any, Callable
 
 from openai import OpenAI
+import pandas as pd
 
 from data_tools.catalog_builder import scan_ohlcv
 from runner.cli import _detect_date_range
+from runner.strategy_ir.builder import build_strategy_ir
+from runner.strategy_ir.codegen_vectorbt import generate_vectorbt_strategy_code
+from runner.strategy_ir.routing import IR_ROLLOUT_DEFAULT, resolve_codegen_route
+from runner.strategy_ir.normalizer import normalize_strategy_meta_payload
 from shared.constants import DATA_DIR
 from shared.logging import get_logger
 from shared.strategy_registry import DEFAULT_STRATEGIES_DIR
@@ -81,6 +87,303 @@ TaskLogger = Callable[..., None]
 logger = get_logger("auto-agent")
 
 
+def _get_ir_codegen_generators() -> dict[str, Callable[[Any], str]]:
+    """Return currently supported deterministic IR code generators by engine."""
+    return {
+        "vectorbt": generate_vectorbt_strategy_code,
+    }
+
+
+def _resolve_ir_rollout_mode(*, log: TaskLogger | None) -> str:
+    raw = (os.getenv("AUTO_AGENT_IR_ROLLOUT") or "").strip()
+    if not raw:
+        return IR_ROLLOUT_DEFAULT
+
+    normalized = raw.lower()
+    aliases = {
+        "legacy-only": "legacy",
+        "legacy_llm": "legacy",
+        "llm-only": "legacy",
+        "ir_first": "ir-first",
+        "deterministic": "ir-first",
+        "ir_only": "ir-only",
+        "deterministic-only": "ir-only",
+        "strict-ir": "ir-only",
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized in {"legacy", "ir-first", "ir-only"}:
+        return normalized
+
+    _log(
+        log,
+        f"⚠️ Unknown AUTO_AGENT_IR_ROLLOUT='{raw}'. Falling back to '{IR_ROLLOUT_DEFAULT}'.",
+        level="warning",
+    )
+    return IR_ROLLOUT_DEFAULT
+
+
+def _build_preflight_dataframe() -> pd.DataFrame:
+    timestamp = pd.date_range("2024-01-01", periods=120, freq="h", tz="UTC")
+    close = pd.Series([100.0 + (idx * 0.2) for idx in range(len(timestamp))], dtype=float)
+    return pd.DataFrame(
+        {
+            "timestamp": timestamp,
+            "open": close + 0.1,
+            "high": close + 0.5,
+            "low": close - 0.5,
+            "close": close,
+            "volume": 1000,
+        }
+    )
+
+
+def _preflight_uses_kwargs_style(func: Callable[..., Any]) -> bool:
+    try:
+        signature = inspect.signature(func)
+    except (TypeError, ValueError):
+        return False
+    parameters = list(signature.parameters.values())
+    if len(parameters) < 2:
+        return False
+    if parameters[1].name == "params":
+        return False
+    return any(parameter.default is not inspect.Parameter.empty for parameter in parameters[1:])
+
+
+def _preflight_call_generate_signals(
+    generate_signals: Callable[..., Any],
+    df: pd.DataFrame,
+    parameters: dict[str, Any],
+) -> Any:
+    if _preflight_uses_kwargs_style(generate_signals):
+        signature = inspect.signature(generate_signals)
+        accepted = {parameter.name for parameter in list(signature.parameters.values())[1:]}
+        filtered = {key: value for key, value in parameters.items() if key in accepted}
+        return generate_signals(df, **filtered)
+    return generate_signals(df, parameters)
+
+
+def _preflight_validate_series_length(
+    *,
+    label: str,
+    value: Any,
+    expected_length: int,
+    issues: list[str],
+) -> None:
+    try:
+        series = pd.Series(value)
+    except Exception as exc:  # pragma: no cover - defensive conversion guard
+        issues.append(f"PREFLIGHT[SHAPE] Could not convert '{label}' to a series: {exc}")
+        return
+    if len(series) != expected_length:
+        issues.append(
+            f"PREFLIGHT[SHAPE] '{label}' length mismatch: expected {expected_length}, got {len(series)}."
+        )
+
+
+def _preflight_validate_vectorbt_output(
+    *,
+    output: Any,
+    expected_length: int,
+    issues: list[str],
+) -> None:
+    if isinstance(output, pd.DataFrame):
+        if "entries" not in output.columns or "exits" not in output.columns:
+            issues.append("PREFLIGHT[CONTRACT] DataFrame output must include 'entries' and 'exits' columns.")
+            return
+        if len(output) != expected_length:
+            issues.append(
+                f"PREFLIGHT[SHAPE] DataFrame output length mismatch: expected {expected_length}, got {len(output)}."
+            )
+        return
+
+    if not isinstance(output, (tuple, list)):
+        issues.append(
+            "PREFLIGHT[CONTRACT] generate_signals() must return DataFrame or tuple/list of "
+            "(entries, exits[, indicators_dict[, drawings]])."
+        )
+        return
+
+    if len(output) not in {2, 3, 4}:
+        issues.append(
+            "PREFLIGHT[CONTRACT] Tuple/list output must have length 2, 3, or 4."
+        )
+        return
+
+    entries, exits = output[0], output[1]
+    _preflight_validate_series_length(
+        label="entries",
+        value=entries,
+        expected_length=expected_length,
+        issues=issues,
+    )
+    _preflight_validate_series_length(
+        label="exits",
+        value=exits,
+        expected_length=expected_length,
+        issues=issues,
+    )
+
+    if len(output) >= 3 and not isinstance(output[2], dict):
+        issues.append("PREFLIGHT[CONTRACT] Third tuple element must be indicators_dict (dict).")
+    if len(output) == 4 and not isinstance(output[3], list):
+        issues.append("PREFLIGHT[CONTRACT] Fourth tuple element must be drawings (list).")
+
+
+def _preflight_validate_vectorbt_strategy(
+    *,
+    namespace: dict[str, Any],
+    expected_parameters: dict[str, Any],
+    issues: list[str],
+) -> None:
+    generate_signals = namespace.get("generate_signals")
+    if not callable(generate_signals):
+        issues.append("PREFLIGHT[CONTRACT] Missing callable generate_signals(df, params).")
+        return
+
+    try:
+        signature = inspect.signature(generate_signals)
+        parameters = list(signature.parameters.values())
+    except (TypeError, ValueError) as exc:
+        issues.append(f"PREFLIGHT[CONTRACT] Could not inspect generate_signals signature: {exc}")
+        return
+
+    if len(parameters) < 2:
+        issues.append("PREFLIGHT[CONTRACT] generate_signals must accept at least df and params/kwargs.")
+        return
+
+    run_parameters: dict[str, Any] = {}
+    if isinstance(expected_parameters, dict):
+        run_parameters.update(expected_parameters)
+    strategy_meta = namespace.get("STRATEGY_META")
+    if isinstance(strategy_meta, dict):
+        meta_parameters = strategy_meta.get("parameters")
+        if isinstance(meta_parameters, dict):
+            for key, value in meta_parameters.items():
+                run_parameters.setdefault(str(key), value)
+
+    df = _build_preflight_dataframe()
+    try:
+        output = _preflight_call_generate_signals(generate_signals, df, run_parameters)
+    except Exception as exc:
+        issues.append(f"PREFLIGHT[EXECUTION] generate_signals dry-run failed: {exc.__class__.__name__}: {exc}")
+        return
+
+    _preflight_validate_vectorbt_output(
+        output=output,
+        expected_length=len(df),
+        issues=issues,
+    )
+
+
+def _format_preflight_issues(issues: list[str]) -> str:
+    lines = ["Preflight validation failed:"]
+    lines.extend(f"- {issue}" for issue in issues)
+    return "\n".join(lines)
+
+
+def _run_strategy_preflight(
+    *,
+    strategy_path: Path,
+    engine: str,
+    expected_parameters: dict[str, Any],
+    log: TaskLogger | None,
+) -> tuple[bool, str]:
+    issues: list[str] = []
+
+    try:
+        source = strategy_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        message = f"PREFLIGHT[IO] Could not read generated strategy file: {exc}"
+        _log(log, message, level="error")
+        return False, _format_preflight_issues([message])
+
+    try:
+        parsed = ast.parse(source, filename=str(strategy_path))
+    except SyntaxError as exc:
+        issues.append(
+            f"PREFLIGHT[SYNTAX] {exc.msg} at line {exc.lineno}:{exc.offset}."
+        )
+        message = _format_preflight_issues(issues)
+        _log(log, message, level="error")
+        return False, message
+
+    namespace: dict[str, Any] = {
+        "__name__": "__auto_agent_preflight__",
+        "__file__": str(strategy_path),
+    }
+    try:
+        exec(compile(parsed, str(strategy_path), "exec"), namespace)
+    except Exception as exc:
+        issues.append(
+            f"PREFLIGHT[IMPORT] Import/definition phase failed: {exc.__class__.__name__}: {exc}"
+        )
+        message = _format_preflight_issues(issues)
+        _log(log, message, level="error")
+        return False, message
+
+    strategy_meta = namespace.get("STRATEGY_META")
+    if strategy_meta is not None and not isinstance(strategy_meta, dict):
+        issues.append("PREFLIGHT[META] STRATEGY_META must be a dict.")
+    elif isinstance(strategy_meta, dict):
+        parameters = strategy_meta.get("parameters", {})
+        if parameters is None:
+            parameters = {}
+        if not isinstance(parameters, dict):
+            issues.append("PREFLIGHT[META] STRATEGY_META['parameters'] must be a dict.")
+        elif expected_parameters:
+            missing = sorted(str(key) for key in expected_parameters if key not in parameters)
+            if missing:
+                issues.append(
+                    "PREFLIGHT[META] STRATEGY_META['parameters'] is missing expected keys: "
+                    + ", ".join(missing)
+                )
+
+    if engine == "vectorbt":
+        _preflight_validate_vectorbt_strategy(
+            namespace=namespace,
+            expected_parameters=expected_parameters,
+            issues=issues,
+        )
+
+    if issues:
+        message = _format_preflight_issues(issues)
+        _log(log, message, level="error")
+        return False, message
+
+    _log(log, "✅ Preflight: generated strategy passed contract checks.")
+    return True, ""
+
+
+def _read_env_file_value(key: str, env_path: Path) -> str | None:
+    """Read a single key from a dotenv-style file without external dependencies."""
+    try:
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        current_key, raw_value = line.split("=", 1)
+        if current_key.strip() != key:
+            continue
+        value = raw_value.strip()
+        if value and value[0] == value[-1] and value[0] in {'"', "'"}:
+            value = value[1:-1]
+        return value or None
+
+    return None
+
+
+def _resolve_env_key(key: str) -> str | None:
+    value = (os.getenv(key) or "").strip()
+    if value:
+        return value
+    return _read_env_file_value(key, PROJECT_ROOT / ".env")
+
+
 @dataclass
 class BacktestTarget:
     symbols: list[str]
@@ -96,6 +399,7 @@ class StrategyArtifacts:
     strategy_dir: Path
     strategy_path: Path
     documentation_path: Path
+    ir_path: Path
     output_path: Path
 
 
@@ -123,15 +427,19 @@ def run_auto_agent(
     if selected_model not in SUPPORTED_MODEL_NAMES:
         raise ValueError(f"Unsupported model: {selected_model}")
 
+    rollout_mode = _resolve_ir_rollout_mode(log=log)
+
     line_count = source_code.count("\n") + 1
     if line_count >= LONG_CODE_LINE_THRESHOLD:
         message = f"Code is very long ({line_count} lines). Expect longer generation time."
         logger.info(message, extra={"data": {"line_count": line_count, "timeout_seconds": timeout_seconds}})
         _log(log, message)
 
-    api_key = os.getenv("NVIDIA_API_KEY")
+    api_key = _resolve_env_key("NVIDIA_API_KEY")
     if not api_key:
-        raise RuntimeError("NVIDIA_API_KEY environment variable is not set.")
+        raise RuntimeError(
+            "NVIDIA_API_KEY environment variable is not set (and was not found in .env)."
+        )
 
     target = _resolve_backtest_target(
         symbols=symbols,
@@ -200,8 +508,120 @@ def run_auto_agent(
     _log(log, f"Step 2/3: Strategy Meta includes {len(meta_dict.get('parameters', {}))} parameters.")
     _log(log, "✅ Step 2/3: Strategy Meta defined.")
 
+    ir_artifact_written = False
+    strategy_ir = None
+    try:
+        strategy_ir = build_strategy_ir(
+            strategy_slug=artifacts.resolved_name,
+            engine=engine,
+            source_code=source_code,
+            markdown_doc=markdown_doc,
+            strategy_meta=meta_dict,
+        )
+        artifacts.ir_path.write_text(strategy_ir.to_json(indent=2) + "\n", encoding="utf-8")
+        ir_artifact_written = True
+        _log(log, f"Wrote IR artifact file: {artifacts.ir_path}")
+        _log(log, "✅ IR Seam: StrategyIR artifact created.")
+    except Exception as exc:
+        # Keep legacy generation path operational while IR seam is incrementally rolled out.
+        _log(log, f"⚠️ IR Seam fallback: continuing without IR artifact ({exc})", level="warning")
+
     last_error = "Unknown auto-agent failure."
-    for attempt in range(1, max_iterations + 1):
+    route = resolve_codegen_route(
+        engine=engine,
+        strategy_ir=strategy_ir,
+        generators=_get_ir_codegen_generators(),
+        rollout_mode=rollout_mode,
+    )
+    _log(log, f"Codegen rollout mode: {route.rollout_mode}")
+    _log(log, f"IR generator routing: {route.reason}")
+
+    if not route.use_ir_generator and not route.allow_legacy_fallback:
+        raise RuntimeError(
+            "IR-only rollout mode is enabled but deterministic IR codegen route is unavailable: "
+            f"{route.reason}"
+        )
+
+    first_llm_attempt = route.first_llm_attempt
+    if route.use_ir_generator and strategy_ir is not None and route.generator is not None:
+        _log(
+            log,
+            f"Step 3/3: Attempting deterministic {route.generator_id} code generation from IR.",
+        )
+        try:
+            deterministic_code = route.generator(strategy_ir)
+            artifacts.strategy_path.write_text(deterministic_code.rstrip() + "\n", encoding="utf-8")
+            _log(log, f"Wrote strategy file: {artifacts.strategy_path}")
+            _log(
+                log,
+                f"✅ Step 3/3: Deterministic {route.generator_id} code generated from IR.",
+            )
+
+            preflight_ok, preflight_error = _run_strategy_preflight(
+                strategy_path=artifacts.strategy_path,
+                engine=engine,
+                expected_parameters=meta_dict.get("parameters", {}),
+                log=log,
+            )
+            if not preflight_ok:
+                last_error = preflight_error
+                if not route.allow_legacy_fallback:
+                    raise RuntimeError(
+                        "Deterministic IR codegen preflight failed in ir-only rollout mode: "
+                        f"{preflight_error}"
+                    )
+                _log(
+                    log,
+                    "⚠️ Deterministic IR codegen preflight failed. Falling back to legacy LLM codegen.",
+                    level="warning",
+                )
+            else:
+                cmd = _build_backtest_command(
+                    strategy_path=artifacts.strategy_path,
+                    engine=engine,
+                    target=target,
+                    output_path=artifacts.output_path,
+                    capital=capital,
+                )
+                returncode, combined_output = _run_backtest(cmd, log=log)
+                if returncode == 0 and artifacts.output_path.exists():
+                    _log(log, f"✅ Validation loop: Backtest succeeded. Output saved to {artifacts.output_path}")
+                    return _build_success_response(
+                        artifacts=artifacts,
+                        target=target,
+                        engine=engine,
+                        attempts=1,
+                        include_ir_file=ir_artifact_written,
+                        rollout_mode=route.rollout_mode,
+                        codegen_path=f"ir:{route.generator_id or 'unknown'}",
+                    )
+
+                last_error = combined_output or "Deterministic IR codegen validation failed without output."
+                if not route.allow_legacy_fallback:
+                    raise RuntimeError(
+                        "Deterministic IR codegen validation failed in ir-only rollout mode: "
+                        f"{last_error}"
+                    )
+                _log(
+                    log,
+                    f"⚠️ Deterministic IR codegen fallback: {last_error}",
+                    level="warning",
+                )
+        except Exception as exc:
+            last_error = f"Deterministic IR codegen failed: {exc}"
+            if not route.allow_legacy_fallback:
+                raise RuntimeError(
+                    f"Deterministic IR codegen failed in ir-only rollout mode: {exc}"
+                ) from exc
+            _log(log, f"⚠️ Deterministic IR codegen fallback: {exc}", level="warning")
+
+    if route.use_ir_generator and not route.allow_legacy_fallback:
+        raise RuntimeError(
+            "IR-only rollout mode requires deterministic validation success before backtest handoff. "
+            f"Last error: {last_error}"
+        )
+
+    for attempt in range(first_llm_attempt, max_iterations + 1):
         if attempt == 1:
             _log(log, f"Step 3/3: Requesting Python code from {selected_model}.")
         else:
@@ -233,6 +653,17 @@ def run_auto_agent(
         else:
             _log(log, f"✅ Step 3/3: Python Code regenerated (attempt {attempt}/{max_iterations}).")
 
+        preflight_ok, preflight_error = _run_strategy_preflight(
+            strategy_path=artifacts.strategy_path,
+            engine=engine,
+            expected_parameters=meta_dict.get("parameters", {}),
+            log=log,
+        )
+        if not preflight_ok:
+            last_error = preflight_error
+            _log(log, f"Iteration {attempt} preflight failed.", level="error")
+            continue
+
         cmd = _build_backtest_command(
             strategy_path=artifacts.strategy_path,
             engine=engine,
@@ -243,15 +674,15 @@ def run_auto_agent(
         returncode, combined_output = _run_backtest(cmd, log=log)
         if returncode == 0 and artifacts.output_path.exists():
             _log(log, f"✅ Validation loop: Backtest succeeded. Output saved to {artifacts.output_path}")
-            return {
-                "strategy_file": str(artifacts.strategy_path),
-                "documentation_file": str(artifacts.documentation_path),
-                "backtest_output": str(artifacts.output_path),
-                "engine": engine,
-                "symbols": target.symbols,
-                "timeframe": target.timeframe,
-                "attempts": attempt,
-            }
+            return _build_success_response(
+                artifacts=artifacts,
+                target=target,
+                engine=engine,
+                attempts=attempt,
+                include_ir_file=ir_artifact_written,
+                rollout_mode=route.rollout_mode,
+                codegen_path="legacy-llm",
+            )
 
         last_error = combined_output or "Backtest failed without output."
         _log(log, f"Iteration {attempt} failed: {last_error}", level="error")
@@ -273,9 +704,36 @@ def _build_strategy_artifacts(*, resolved_name: str, engine: str) -> StrategyArt
         strategy_dir=strategy_dir,
         strategy_path=strategy_dir / f"{resolved_name}.py",
         documentation_path=strategy_dir / "README.md",
+        ir_path=strategy_dir / f"{resolved_name}.ir.json",
         output_path=BACKTESTS_DIR
         / f"{resolved_name}_auto_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.trades.json",
     )
+
+
+def _build_success_response(
+    *,
+    artifacts: StrategyArtifacts,
+    target: BacktestTarget,
+    engine: str,
+    attempts: int,
+    include_ir_file: bool,
+    rollout_mode: str,
+    codegen_path: str,
+) -> dict[str, str | int | list[str]]:
+    response: dict[str, str | int | list[str]] = {
+        "strategy_file": str(artifacts.strategy_path),
+        "documentation_file": str(artifacts.documentation_path),
+        "backtest_output": str(artifacts.output_path),
+        "engine": engine,
+        "symbols": target.symbols,
+        "timeframe": target.timeframe,
+        "attempts": attempts,
+        "rollout_mode": rollout_mode,
+        "codegen_path": codegen_path,
+    }
+    if include_ir_file and artifacts.ir_path.exists():
+        response["ir_file"] = str(artifacts.ir_path)
+    return response
 
 
 def _step_one_developer_prompt(*, requested_engine: str | None) -> str:
@@ -500,25 +958,11 @@ def _normalize_strategy_meta(
     requested_name: str | None,
     markdown_doc: str,
 ) -> dict[str, Any]:
-    normalized = dict(meta)
-    resolved_title = _extract_markdown_title(markdown_doc) or requested_name or normalized.get("name") or "Auto Strategy"
-    normalized["name"] = str(normalized.get("name") or resolved_title).strip() or str(resolved_title)
-    normalized["version"] = str(normalized.get("version") or "1.0.0")
-
-    parameters = normalized.get("parameters")
-    if parameters is None:
-        parameters = {}
-    if not isinstance(parameters, dict):
-        raise TypeError("STRATEGY_META['parameters'] must be a dict.")
-    normalized["parameters"] = parameters
-
-    tags = normalized.get("tags")
-    if tags is None:
-        tags = {}
-    if not isinstance(tags, dict):
-        raise TypeError("STRATEGY_META['tags'] must be a dict.")
-    normalized["tags"] = tags
-    return normalized
+    return normalize_strategy_meta_payload(
+        meta,
+        requested_name=requested_name,
+        markdown_doc=markdown_doc,
+    )
 
 
 def _format_strategy_meta_assignment(meta: dict[str, Any]) -> str:

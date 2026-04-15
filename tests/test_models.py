@@ -7,10 +7,17 @@ from pathlib import Path
 from shared.models import (
     BacktestMeta,
     BacktestResult,
+    DrawingSchema,
     EquityPoint,
+    ExitLeg,
+    SignalExecutionSchema,
+    SignalOrder,
     StrategyMeta,
     Trade,
     TradeExit,
+    create_triangle_definition,
+    parse_signal_order_shorthand,
+    place_triangle_instance,
 )
 
 
@@ -224,3 +231,116 @@ class TestStrategyMeta:
         assert d["name"] == "Minimal"
         assert d["version"] == "1.0.0"
         assert "tags" not in d
+
+
+class TestSignalExecutionSchema:
+    def test_roundtrip_with_limit_order_and_partial_legs(self):
+        schema = SignalExecutionSchema(
+            direction="LONG",
+            entry=SignalOrder(
+                action="OPEN",
+                direction="LONG",
+                order_type="LIMIT",
+                size_model="PCT_POSITION",
+                size_value=0.5,
+                limit_price=101.25,
+                label="long_limit_50",
+            ),
+            tp_legs=[
+                ExitLeg(kind="TP", quantity_pct=0.5, price=110.0, priority=10, label="tp1"),
+                ExitLeg(kind="TP", quantity_pct=0.5, price=115.0, priority=20, label="tp2"),
+            ],
+            sl_leg=ExitLeg(kind="SL", quantity_pct=1.0, price=96.0, priority=5, label="sl"),
+            meta={"signal_schema_version": "2.0"},
+        )
+
+        payload = schema.to_dict()
+        restored = SignalExecutionSchema.from_dict(payload)
+
+        assert restored.direction == "LONG"
+        assert restored.entry is not None
+        assert restored.entry.order_type == "LIMIT"
+        assert restored.entry.size_model == "PCT_POSITION"
+        assert restored.entry.size_value == 0.5
+        assert len(restored.tp_legs) == 2
+        assert restored.tp_legs[0].label == "tp1"
+        assert restored.sl_leg is not None
+        assert restored.sl_leg.kind == "SL"
+
+    def test_invalid_order_requirements_raise(self):
+        try:
+            SignalOrder(
+                action="OPEN",
+                direction="LONG",
+                order_type="LIMIT",
+                size_model="PCT_POSITION",
+                size_value=0.5,
+            )
+            assert False, "Expected ValueError for missing limit_price"
+        except ValueError as exc:
+            assert "limit_price" in str(exc)
+
+
+class TestDrawingSchemaV2:
+    def test_triangle_definition_and_placement_helpers(self):
+        definition = create_triangle_definition(
+            "triangle_normal_md",
+            default_size="md",
+            line_style="dashed",
+            line_width=2,
+            color="#58a6ff",
+        )
+        instance = place_triangle_instance(
+            "triangle_normal_md",
+            x=1234567890,
+            y=101.5,
+            rotation=45.0,
+            size="lg",
+        )
+
+        schema = DrawingSchema(definitions=[definition], instances=[instance])
+        payload = schema.to_dict()
+        restored = DrawingSchema.from_dict(payload)
+
+        assert restored.definitions[0].type == "triangle"
+        assert restored.definitions[0].style["line_style"] == "dashed"
+        assert restored.instances[0].x == 1234567890.0
+        assert restored.instances[0].y == 101.5
+        assert restored.instances[0].rotation == 45.0
+        assert restored.instances[0].size == "lg"
+
+    def test_triangle_size_validation(self):
+        try:
+            place_triangle_instance("triangle_normal_md", x=1, y=2, size="xl")
+            assert False, "Expected ValueError for invalid triangle size"
+        except ValueError as exc:
+            assert "size" in str(exc)
+
+
+class TestSignalOrderShorthand:
+    def test_parse_long_limit_percent(self):
+        order = parse_signal_order_shorthand("Long(Limit, 50, 101.25)")
+        assert order.direction == "LONG"
+        assert order.order_type == "LIMIT"
+        assert order.size_model == "PCT_POSITION"
+        assert order.size_value == 0.5
+        assert order.limit_price == 101.25
+
+    def test_parse_short_market_percent_symbol(self):
+        order = parse_signal_order_shorthand("Short(Market, 25%)")
+        assert order.direction == "SHORT"
+        assert order.order_type == "MARKET"
+        assert order.size_value == 0.25
+
+    def test_parse_stop_limit_requires_two_prices(self):
+        order = parse_signal_order_shorthand("Long(StopLimit, 40, 99.5, 99.8)")
+        assert order.order_type == "STOP_LIMIT"
+        assert order.stop_price == 99.5
+        assert order.limit_price == 99.8
+
+    def test_parse_invalid_format_raises(self):
+        try:
+            parse_signal_order_shorthand("Long-Limit-50")
+            assert False, "Expected ValueError for invalid shorthand format"
+        except ValueError as exc:
+            assert "Invalid shorthand" in str(exc)

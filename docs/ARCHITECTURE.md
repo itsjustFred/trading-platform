@@ -2,6 +2,8 @@
 
 This is the current "state of the union" for the trading-platform repository.
 
+For agent-specific execution constraints and architecture guardrails, see `docs/AGENT_CONTEXT.md`.
+
 ## Stack summary
 
 - **Backend API:** Flask (`viewer/app.py`)

@@ -1,0 +1,145 @@
+{
+  "confidence": 1.0,
+  "drawings": [],
+  "engine_hint": "vectorbt",
+  "entry_conditions": [
+    {
+      "description": "**Long Entry**: Ausf\u00fchrung bei `ta.crossover(fast, slow)`",
+      "expression": "**Long Entry**: Ausf\u00fchrung bei `ta.crossover(fast, slow)`",
+      "id": null,
+      "raw": null,
+      "references": [],
+      "side": "both",
+      "when": "entry"
+    },
+    {
+      "description": "Bedingung: 9-Perioden-EMA kreuzt von unten nach oben \u00fcber den 21-Perioden-EMA",
+      "expression": "Bedingung: 9-Perioden-EMA kreuzt von unten nach oben \u00fcber den 21-Perioden-EMA",
+      "id": null,
+      "raw": null,
+      "references": [],
+      "side": "both",
+      "when": "entry"
+    },
+    {
+      "description": "Ausf\u00fchrung: Marktorder zum Schlusskurs der Signal-Kerze",
+      "expression": "Ausf\u00fchrung: Marktorder zum Schlusskurs der Signal-Kerze",
+      "id": null,
+      "raw": null,
+      "references": [],
+      "side": "both",
+      "when": "entry"
+    },
+    {
+      "description": "Label: \"Long\"",
+      "expression": "Label: \"Long\"",
+      "id": null,
+      "raw": null,
+      "references": [],
+      "side": "both",
+      "when": "entry"
+    }
+  ],
+  "exit_signals": [
+    {
+      "condition": "**Vollst\u00e4ndige Positionsschlie\u00dfung**: Ausf\u00fchrung bei `ta.crossunder(fast, slow)`",
+      "kind": "custom",
+      "name": "exit_1",
+      "params": {},
+      "side": "both"
+    },
+    {
+      "condition": "Bedingung: 9-Perioden-EMA kreuzt von oben nach unten unter den 21-Perioden-EMA",
+      "kind": "custom",
+      "name": "exit_2",
+      "params": {},
+      "side": "both"
+    },
+    {
+      "condition": "Ausf\u00fchrung: `strategy.close(\"Long\")` - Schlie\u00dfung zum Schlusskurs der Ausstiegs-Kerze",
+      "kind": "close",
+      "name": "exit_3",
+      "params": {},
+      "side": "both"
+    },
+    {
+      "condition": "Keine Partial Exits implementiert",
+      "kind": "close",
+      "name": "exit_4",
+      "params": {},
+      "side": "both"
+    }
+  ],
+  "fallback_code": "",
+  "indicators": [
+    {
+      "name": "Fast EMA",
+      "output": null,
+      "params": {
+        "9 Perioden": "`ta.ema(close, 9)`"
+      },
+      "role": "signal",
+      "source": "markdown",
+      "timeframe": null
+    },
+    {
+      "name": "Slow EMA",
+      "output": null,
+      "params": {
+        "21 Perioden": "`ta.ema(close, 21)`"
+      },
+      "role": "signal",
+      "source": "markdown",
+      "timeframe": null
+    },
+    {
+      "name": "Preisdaten",
+      "output": null,
+      "params": {
+        "Schlusskurs": "`close`"
+      },
+      "role": "signal",
+      "source": "markdown",
+      "timeframe": null
+    }
+  ],
+  "metadata": {
+    "strategy_slug": "aurora_cross",
+    "tags": {
+      "labels": [
+        "trend_following",
+        "ema_crossover",
+        "impulse_cross"
+      ]
+    },
+    "version": "1.0.0"
+  },
+  "name": "Aurora Cross",
+  "parameters": [
+    {
+      "choices": [],
+      "default": 9,
+      "description": "",
+      "max_value": null,
+      "min_value": null,
+      "name": "fast_period",
+      "required": false,
+      "tags": {},
+      "value_type": "int"
+    },
+    {
+      "choices": [],
+      "default": 21,
+      "description": "",
+      "max_value": null,
+      "min_value": null,
+      "name": "slow_period",
+      "required": false,
+      "tags": {},
+      "value_type": "int"
+    }
+  ],
+  "raw_expressions": [],
+  "source_summary": "# Aurora Cross",
+  "state_machine": null
+}

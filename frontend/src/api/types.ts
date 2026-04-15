@@ -305,7 +305,40 @@ export interface ChartLineDrawing {
   lineStyle?: number | "solid" | "dashed" | "dotted";
 }
 
-export type TradeDrawing = ChartMarkerDrawing | ChartLineDrawing;
+export interface ChartBoxDrawing {
+  type: "box";
+  start_time: number;
+  end_time: number;
+  top: number;
+  bottom: number;
+  color?: string;
+  fillColor?: string;
+  fillOpacity?: number;
+  symbol?: string;
+  title?: string;
+  lineWidth?: number;
+  lineStyle?: number | "solid" | "dashed" | "dotted";
+}
+
+export interface ChartTriangleDrawing {
+  type: "triangle";
+  x: number;
+  y: number;
+  rotation?: number;
+  size?: "sm" | "md" | "lg" | string;
+  scale_override?: number;
+  color?: string;
+  fillColor?: string;
+  fillOpacity?: number;
+  symbol?: string;
+  title?: string;
+}
+
+export type TradeDrawing =
+  | ChartMarkerDrawing
+  | ChartLineDrawing
+  | ChartBoxDrawing
+  | ChartTriangleDrawing;
 
 export interface TradeChartResponse {
   trade: Trade;
@@ -324,6 +357,35 @@ export interface OHLCVBar {
   low: number;
   close: number;
   volume: number;
+}
+
+export interface MarketTimeframesResponse {
+  symbol: string;
+  timeframes: string[];
+}
+
+export interface MarketOHLCVResponse {
+  symbol: string;
+  timeframe: string;
+  ohlcv: OHLCVBar[];
+  count: number;
+  start: string | null;
+  end: string | null;
+}
+
+export interface ViewerStrategySignalsResponse {
+  strategy: string;
+  symbol: string;
+  timeframe: string;
+  markers: ChartMarkerDrawing[];
+  indicators: IndicatorSeriesView[];
+  drawings: TradeDrawing[];
+  signal_schema_version?: string;
+  execution_preview?: Record<string, any> | null;
+  entry_count: number;
+  exit_count: number;
+  start: string | null;
+  end: string | null;
 }
 
 export interface PortfolioRef {

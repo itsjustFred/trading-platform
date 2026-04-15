@@ -7,8 +7,10 @@ import {
 } from "../api/client";
 import type {
   BacktestInfo,
+  ChartBoxDrawing,
   ChartLineDrawing,
   ChartMarkerDrawing,
+  ChartTriangleDrawing,
   IndicatorSeriesView,
   Trade,
   TradeChartResponse,
@@ -26,6 +28,11 @@ import {
   createSeriesMarkers,
 } from "lightweight-charts";
 import type { IChartApi, CandlestickData, Time } from "lightweight-charts";
+
+const MAX_DRAWING_MARKERS = 1200;
+const MAX_DRAWING_LINES = 180;
+const MAX_DRAWING_BOXES = 100;
+const MAX_DRAWING_TRIANGLES = 100;
 
 function formatTradeMetaValue(value: unknown): string {
   if (value === null || value === undefined) {
@@ -59,6 +66,14 @@ function isMarkerDrawing(drawing: TradeDrawing): drawing is ChartMarkerDrawing {
 
 function isLineDrawing(drawing: TradeDrawing): drawing is ChartLineDrawing {
   return drawing.type === "line";
+}
+
+function isBoxDrawing(drawing: TradeDrawing): drawing is ChartBoxDrawing {
+  return drawing.type === "box";
+}
+
+function isTriangleDrawing(drawing: TradeDrawing): drawing is ChartTriangleDrawing {
+  return drawing.type === "triangle";
 }
 
 function normalizeMarkerPosition(value: unknown): "aboveBar" | "belowBar" | "inBar" {
@@ -106,6 +121,72 @@ function resolveLineWidth(value: unknown): 1 | 2 | 3 | 4 {
   return 1;
 }
 
+function estimateBarStepSeconds(ohlcv: Array<{ time: number }>): number {
+  if (ohlcv.length < 2) {
+    return 60;
+  }
+
+  const deltas: number[] = [];
+  const limit = Math.min(ohlcv.length - 1, 200);
+  for (let i = 1; i <= limit; i += 1) {
+    const delta = ohlcv[i].time - ohlcv[i - 1].time;
+    if (delta > 0) {
+      deltas.push(delta);
+    }
+  }
+
+  if (!deltas.length) {
+    return 60;
+  }
+
+  deltas.sort((a, b) => a - b);
+  return deltas[Math.floor(deltas.length / 2)] || 60;
+}
+
+function boxPolyline(drawing: ChartBoxDrawing): Array<{ time: Time; value: number }> {
+  return [
+    { time: drawing.start_time as Time, value: drawing.top },
+    { time: drawing.end_time as Time, value: drawing.top },
+    { time: drawing.end_time as Time, value: drawing.bottom },
+    { time: drawing.start_time as Time, value: drawing.bottom },
+    { time: drawing.start_time as Time, value: drawing.top },
+  ];
+}
+
+function trianglePolyline(
+  drawing: ChartTriangleDrawing,
+  barStepSeconds: number,
+): Array<{ time: Time; value: number }> {
+  const sizeToken = String(drawing.size || "md").toLowerCase();
+  const sizeFactor = sizeToken === "sm" ? 0.75 : sizeToken === "lg" ? 1.35 : 1;
+  const scale = Number.isFinite(Number(drawing.scale_override))
+    ? Number(drawing.scale_override)
+    : sizeFactor;
+  const widthSeconds = Math.max(barStepSeconds * 4 * scale, 1);
+  const height = Math.max(Math.abs(drawing.y) * 0.003 * scale, 0.0001);
+  const rotationDeg = Number.isFinite(Number(drawing.rotation))
+    ? Number(drawing.rotation)
+    : 0;
+  const theta = (rotationDeg * Math.PI) / 180;
+
+  const points = [
+    { x: 0, y: height },
+    { x: -widthSeconds / 2, y: -height / 2 },
+    { x: widthSeconds / 2, y: -height / 2 },
+  ];
+
+  const rotated = points.map((point) => {
+    const rx = point.x * Math.cos(theta) - point.y * Math.sin(theta);
+    const ry = point.x * Math.sin(theta) + point.y * Math.cos(theta);
+    return {
+      time: (drawing.x + rx) as Time,
+      value: drawing.y + ry,
+    };
+  });
+
+  return [...rotated, rotated[0]];
+}
+
 function drawingFallsWithinWindow(
   drawing: TradeDrawing,
   startTime: number,
@@ -114,7 +195,16 @@ function drawingFallsWithinWindow(
   if (isMarkerDrawing(drawing)) {
     return drawing.time >= startTime && drawing.time <= endTime;
   }
-  return drawing.end_time >= startTime && drawing.start_time <= endTime;
+  if (isLineDrawing(drawing)) {
+    return drawing.end_time >= startTime && drawing.start_time <= endTime;
+  }
+  if (isBoxDrawing(drawing)) {
+    return drawing.end_time >= startTime && drawing.start_time <= endTime;
+  }
+  if (isTriangleDrawing(drawing)) {
+    return drawing.x >= startTime && drawing.x <= endTime;
+  }
+  return false;
 }
 
 export function TradeChartPage() {
@@ -225,6 +315,19 @@ export function TradeChartPage() {
     const visibleDrawings = (tradeData.drawings || []).filter((drawing) =>
       drawingFallsWithinWindow(drawing, visibleStartTime, visibleEndTime),
     );
+    const markerDrawings = visibleDrawings
+      .filter(isMarkerDrawing)
+      .slice(0, MAX_DRAWING_MARKERS);
+    const lineDrawings = visibleDrawings
+      .filter(isLineDrawing)
+      .slice(0, MAX_DRAWING_LINES);
+    const boxDrawings = visibleDrawings
+      .filter(isBoxDrawing)
+      .slice(0, MAX_DRAWING_BOXES);
+    const triangleDrawings = visibleDrawings
+      .filter(isTriangleDrawing)
+      .slice(0, MAX_DRAWING_TRIANGLES);
+    const barStepSeconds = estimateBarStepSeconds(tradeData.ohlcv);
 
     // Trade markers + custom drawings
     const trade = tradeData.trade;
@@ -271,29 +374,27 @@ export function TradeChartPage() {
       });
     }
 
-    visibleDrawings
-      .filter(isMarkerDrawing)
-      .forEach((drawing) => {
-        markers.push({
-          time: drawing.time as Time,
-          position: normalizeMarkerPosition(drawing.position),
-          color: drawing.color || "#f59e0b",
-          shape: normalizeMarkerShape(drawing.shape),
-          text: drawing.text,
-        });
+    markerDrawings.forEach((drawing) => {
+      markers.push({
+        time: drawing.time as Time,
+        position: normalizeMarkerPosition(drawing.position),
+        color: drawing.color || "#f59e0b",
+        shape: normalizeMarkerShape(drawing.shape),
+        text: drawing.text,
       });
+    });
 
     createSeriesMarkers(
       candleSeries,
       markers.sort((left, right) => Number(left.time) - Number(right.time)),
     );
 
-    visibleDrawings.filter(isLineDrawing).forEach((drawing, index) => {
+    lineDrawings.forEach((drawing, index) => {
       const lineSeries = chart.addSeries(LineSeries, {
         color: drawing.color || "#f59e0b",
         lineWidth: resolveLineWidth(drawing.lineWidth ?? 2),
         lineStyle: resolveLineStyle(drawing.lineStyle),
-        title: drawing.title || `Drawing ${index + 1}`,
+        title: drawing.title || `Line ${index + 1}`,
         lastValueVisible: false,
         priceLineVisible: false,
       });
@@ -301,6 +402,29 @@ export function TradeChartPage() {
         { time: drawing.start_time as Time, value: drawing.val1 },
         { time: drawing.end_time as Time, value: drawing.val2 },
       ]);
+    });
+
+    boxDrawings.forEach((drawing, index) => {
+      const lineSeries = chart.addSeries(LineSeries, {
+        color: drawing.color || "#d29922",
+        lineWidth: resolveLineWidth(drawing.lineWidth ?? 1),
+        lineStyle: resolveLineStyle(drawing.lineStyle),
+        title: drawing.title || `Box ${index + 1}`,
+        lastValueVisible: false,
+        priceLineVisible: false,
+      });
+      lineSeries.setData(boxPolyline(drawing));
+    });
+
+    triangleDrawings.forEach((drawing, index) => {
+      const lineSeries = chart.addSeries(LineSeries, {
+        color: drawing.color || "#f59e0b",
+        lineWidth: 1,
+        title: drawing.title || `Triangle ${index + 1}`,
+        lastValueVisible: false,
+        priceLineVisible: false,
+      });
+      lineSeries.setData(trianglePolyline(drawing, barStepSeconds));
     });
 
     // Indicator overlays

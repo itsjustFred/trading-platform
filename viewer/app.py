@@ -10,6 +10,8 @@ Endpoints:
     GET  /api/backtest/<id>/trade/<nr>         — Single trade with OHLCV context
     GET  /api/backtest/<id>/ohlcv              — Full OHLCV data for all symbols
     GET  /api/backtest/<id>/equity             — Equity curve data
+    GET  /api/market/timeframes/<symbol>       — Available timeframes for a symbol
+    GET  /api/market/ohlcv                     — Raw OHLCV candles for symbol/timeframe
     GET  /api/compare?ids=id1,id2             — Full comparison with combined equity
     GET  /                                     — Serve the frontend
 
@@ -24,6 +26,7 @@ from __future__ import annotations
 import argparse
 import ast
 from contextlib import redirect_stderr, redirect_stdout
+import inspect
 import json
 import logging
 import math
@@ -42,9 +45,14 @@ import pandas as pd
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 from pydantic import ValidationError
+from werkzeug.exceptions import HTTPException
 
 from data_tools.catalog_builder import build_catalog, scan_ohlcv
 from runner.auto_agent import DEFAULT_MODEL_NAME, SUPPORTED_MODEL_NAMES, run_auto_agent
+from runner.engines.signal_schema import (
+    CANONICAL_SIGNAL_SCHEMA_VERSION,
+    build_execution_schema_for_entry,
+)
 from runner.optimizer import OptimizationConfig, run_optimization as execute_optimization
 from runner.stats import compute_stats, compute_stats_for_result
 from shared.models import BacktestResult, EquityPoint, PortfolioStats, Trade
@@ -53,6 +61,7 @@ from shared.strategy_registry import (
     StrategyEntry,
     find_strategy_entry,
     iter_strategy_entries,
+    load_strategy_module,
     matches_strategy_identifier,
     read_strategy_documentation,
     update_strategy_display_name,
@@ -80,6 +89,14 @@ BARS_AFTER = 25
 
 app = Flask(__name__, static_folder=str(STATIC_DIR))
 CORS(app)
+
+
+@app.errorhandler(Exception)
+def _handle_unexpected_exception(exc: Exception):
+    if isinstance(exc, HTTPException):
+        return exc
+    logger.exception("Unhandled API error: %s", exc)
+    return jsonify({"error": str(exc)}), 500
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -359,6 +376,61 @@ def _drawing_to_viewer(drawing: dict[str, Any]) -> dict[str, Any] | None:
             return None
         payload["start_time"] = start_time
         payload["end_time"] = end_time
+        return payload
+
+    if drawing_type == "box":
+        start_time = _drawing_timestamp_to_unix(drawing.get("start_time"))
+        end_time = _drawing_timestamp_to_unix(drawing.get("end_time"))
+        if start_time is None or end_time is None:
+            logger.warning("Skipping drawing box with invalid timestamps: %s", drawing)
+            return None
+
+        top = drawing.get("top")
+        bottom = drawing.get("bottom")
+        try:
+            top_value = float(top)
+            bottom_value = float(bottom)
+        except (TypeError, ValueError):
+            logger.warning("Skipping drawing box with invalid price bounds: %s", drawing)
+            return None
+
+        if bottom_value > top_value:
+            top_value, bottom_value = bottom_value, top_value
+
+        payload["start_time"] = start_time
+        payload["end_time"] = end_time
+        payload["top"] = top_value
+        payload["bottom"] = bottom_value
+        return payload
+
+    if drawing_type == "triangle":
+        # Triangle placement is canonicalized as x/y + optional rotation/size.
+        x = _drawing_timestamp_to_unix(drawing.get("x"))
+        if x is None:
+            x = _drawing_timestamp_to_unix(drawing.get("time"))
+        y = drawing.get("y")
+        try:
+            y_value = float(y)
+        except (TypeError, ValueError):
+            logger.warning("Skipping drawing triangle with invalid y: %s", drawing)
+            return None
+
+        if x is None:
+            logger.warning("Skipping drawing triangle with invalid x/time: %s", drawing)
+            return None
+
+        payload["x"] = x
+        payload["y"] = y_value
+        if "rotation" in payload:
+            try:
+                payload["rotation"] = float(payload["rotation"])
+            except (TypeError, ValueError):
+                payload.pop("rotation", None)
+        if "scale_override" in payload:
+            try:
+                payload["scale_override"] = float(payload["scale_override"])
+            except (TypeError, ValueError):
+                payload.pop("scale_override", None)
         return payload
 
     logger.warning("Skipping unsupported drawing type %r", drawing_type)
@@ -980,6 +1052,272 @@ def _indicator_to_points(df: pd.DataFrame, series: pd.Series, time_set: set[floa
     return points
 
 
+def _viewer_uses_kwargs_style(func: Callable[..., Any]) -> bool:
+    """Return True if generate_signals expects kwargs rather than params dict."""
+    try:
+        signature = inspect.signature(func)
+    except (TypeError, ValueError):
+        return False
+
+    parameters = list(signature.parameters.values())
+    if len(parameters) < 2:
+        return False
+    if parameters[1].name == "params":
+        return False
+    return any(parameter.default is not inspect.Parameter.empty for parameter in parameters[1:])
+
+
+def _viewer_call_generate_signals(
+    strategy_module: Any,
+    df: pd.DataFrame,
+    parameters: dict[str, Any],
+) -> Any:
+    generate_signals = getattr(strategy_module, "generate_signals", None)
+    if not callable(generate_signals):
+        raise ValueError("Strategy must define callable generate_signals(df, params).")
+
+    if _viewer_uses_kwargs_style(generate_signals):
+        signature = inspect.signature(generate_signals)
+        accepted = {parameter.name for parameter in list(signature.parameters.values())[1:]}
+        filtered = {key: value for key, value in parameters.items() if key in accepted}
+        return generate_signals(df, **filtered)
+
+    return generate_signals(df, parameters)
+
+
+def _viewer_coerce_series(value: Any, index: pd.Index, *, label: str) -> pd.Series:
+    if isinstance(value, pd.Series):
+        series = value.copy()
+    else:
+        try:
+            series = pd.Series(value)
+        except Exception as exc:
+            raise ValueError(f"Could not parse series '{label}': {exc}") from exc
+
+    if len(series) != len(index):
+        raise ValueError(
+            f"Series '{label}' length mismatch: expected {len(index)}, got {len(series)}"
+        )
+    series.index = index
+    return series
+
+
+def _viewer_parse_signal_output(
+    output: Any,
+    index: pd.Index,
+) -> tuple[pd.Series, pd.Series, dict[str, pd.Series], list[dict[str, Any]]]:
+    indicators: dict[str, pd.Series] = {}
+    drawings: list[dict[str, Any]] = []
+
+    if isinstance(output, pd.DataFrame):
+        if "entries" not in output.columns or "exits" not in output.columns:
+            raise ValueError("DataFrame output must include 'entries' and 'exits' columns.")
+
+        entries = _viewer_coerce_series(output["entries"], index, label="entries").fillna(False).astype(bool)
+        exits = _viewer_coerce_series(output["exits"], index, label="exits").fillna(False).astype(bool)
+
+        for column in output.columns:
+            if column in {"entries", "exits"}:
+                continue
+            series = pd.to_numeric(
+                _viewer_coerce_series(output[column], index, label=str(column)),
+                errors="coerce",
+            )
+            if series.notna().any():
+                indicators[str(column)] = series
+
+        return entries, exits, indicators, drawings
+
+    if not isinstance(output, (tuple, list)):
+        raise TypeError(
+            "generate_signals() must return DataFrame or tuple/list of "
+            "(entries, exits[, indicators_dict[, drawings]])."
+        )
+
+    if len(output) == 2:
+        raw_entries, raw_exits = output
+        raw_indicators = {}
+        raw_drawings = []
+    elif len(output) == 3:
+        raw_entries, raw_exits, raw_indicators = output
+        raw_drawings = []
+    elif len(output) == 4:
+        raw_entries, raw_exits, raw_indicators, raw_drawings = output
+    else:
+        raise ValueError("Tuple/list output must have length 2, 3, or 4.")
+
+    entries = _viewer_coerce_series(raw_entries, index, label="entries").fillna(False).astype(bool)
+    exits = _viewer_coerce_series(raw_exits, index, label="exits").fillna(False).astype(bool)
+
+    if isinstance(raw_indicators, dict):
+        for name, raw_value in raw_indicators.items():
+            value = raw_value
+            if isinstance(raw_value, dict) and "series" in raw_value:
+                value = raw_value["series"]
+            elif (
+                isinstance(raw_value, tuple)
+                and len(raw_value) == 2
+                and isinstance(raw_value[0], str)
+            ):
+                value = raw_value[1]
+
+            series = pd.to_numeric(
+                _viewer_coerce_series(value, index, label=str(name)),
+                errors="coerce",
+            )
+            if series.notna().any():
+                indicators[str(name)] = series
+
+    if raw_drawings is None:
+        drawings = []
+    elif isinstance(raw_drawings, list):
+        drawings = [drawing for drawing in raw_drawings if isinstance(drawing, dict)]
+    else:
+        raise TypeError("drawings must be a list of dictionaries when provided.")
+
+    return entries, exits, indicators, drawings
+
+
+_VIEWER_EXECUTION_KEYS = (
+    "direction",
+    "order_type",
+    "position_size_pct",
+    "position_qty",
+    "position_notional",
+    "risk_pct",
+    "limit_price",
+    "stop_price",
+)
+
+
+def _viewer_coerce_any_series(value: Any, index: pd.Index, *, label: str) -> pd.Series | None:
+    if value is None:
+        return None
+
+    if isinstance(value, dict) and "series" in value:
+        value = value["series"]
+    elif isinstance(value, tuple) and len(value) == 2 and isinstance(value[0], str):
+        value = value[1]
+
+    try:
+        series = pd.Series(value)
+    except Exception:
+        return None
+
+    if len(series) != len(index):
+        logger.warning(
+            "Skipping execution series '%s' because of length mismatch (%s != %s)",
+            label,
+            len(series),
+            len(index),
+        )
+        return None
+
+    series.index = index
+    return series
+
+
+def _viewer_extract_execution_series(output: Any, index: pd.Index) -> dict[str, pd.Series]:
+    extracted: dict[str, pd.Series] = {}
+
+    if isinstance(output, pd.DataFrame):
+        for key in _VIEWER_EXECUTION_KEYS:
+            if key in output.columns:
+                series = _viewer_coerce_any_series(output[key], index, label=key)
+                if series is not None:
+                    extracted[key] = series
+        return extracted
+
+    if not isinstance(output, (tuple, list)) or len(output) < 3:
+        return extracted
+
+    candidate = output[2]
+    if not isinstance(candidate, dict):
+        return extracted
+
+    for key in _VIEWER_EXECUTION_KEYS:
+        if key not in candidate:
+            continue
+        series = _viewer_coerce_any_series(candidate.get(key), index, label=key)
+        if series is not None:
+            extracted[key] = series
+
+    return extracted
+
+
+def _viewer_indicator_type(indicator_name: str) -> str:
+    lowered = indicator_name.lower()
+    panel_tokens = ("rsi", "atr", "macd", "stoch", "adx", "cci")
+    return "panel" if any(token in lowered for token in panel_tokens) else "overlay"
+
+
+def _viewer_indicator_color(indicator_name: str, index: int) -> str:
+    lowered = indicator_name.lower()
+    if "ema" in lowered:
+        return "#f97316"
+    if "sma" in lowered:
+        return "#d29922"
+    if "rsi" in lowered:
+        return "#a78bfa"
+    if "atr" in lowered:
+        return "#fb923c"
+    if "macd" in lowered:
+        return "#3b82f6"
+
+    palette = ["#58a6ff", "#22c55e", "#f59e0b", "#a78bfa", "#ef4444", "#14b8a6"]
+    return palette[index % len(palette)]
+
+
+def _viewer_series_to_points(df: pd.DataFrame, series: pd.Series) -> list[dict[str, float]]:
+    points: list[dict[str, float]] = []
+    for idx, value in series.items():
+        if pd.isna(value):
+            continue
+        timestamp = df.iloc[idx].get("timestamp")
+        unix_time = _drawing_timestamp_to_unix(timestamp)
+        if unix_time is None:
+            continue
+        points.append({"time": unix_time, "value": round(float(value), 6)})
+    return points
+
+
+def _viewer_strategy_markers(df: pd.DataFrame, entries: pd.Series, exits: pd.Series) -> list[dict[str, Any]]:
+    markers: list[dict[str, Any]] = []
+
+    for idx in entries[entries].index.tolist():
+        unix_time = _drawing_timestamp_to_unix(df.iloc[idx].get("timestamp"))
+        if unix_time is None:
+            continue
+        markers.append(
+            {
+                "type": "marker",
+                "time": unix_time,
+                "position": "belowBar",
+                "shape": "arrowUp",
+                "color": "#3fb950",
+                "text": "Entry",
+            }
+        )
+
+    for idx in exits[exits].index.tolist():
+        unix_time = _drawing_timestamp_to_unix(df.iloc[idx].get("timestamp"))
+        if unix_time is None:
+            continue
+        markers.append(
+            {
+                "type": "marker",
+                "time": unix_time,
+                "position": "aboveBar",
+                "shape": "arrowDown",
+                "color": "#f85149",
+                "text": "Exit",
+            }
+        )
+
+    markers.sort(key=lambda marker: float(marker.get("time", 0.0)))
+    return markers
+
+
 @app.route("/api/backtest/<backtest_id>/trade/<int:trade_nr>")
 def get_trade_with_context(backtest_id: str, trade_nr: int):
     """Single trade with OHLCV context (BARS_BEFORE/AFTER around entry)."""
@@ -1347,14 +1685,20 @@ def list_strategies():
     if not STRATEGIES_DIR.exists():
         return jsonify(strategies)
 
-    for entry in _strategy_entries():
+    try:
+        entries = _strategy_entries()
+    except Exception as e:
+        logger.exception("Could not enumerate strategies: %s", e)
+        return jsonify(strategies)
+
+    for entry in entries:
         try:
             payload = _strategy_payload(entry)
             payload.pop("documentation_markdown", None)
             payload.pop("backtests", None)
             payload.pop("portfolios", None)
             strategies.append(payload)
-        except (ValueError, TypeError, KeyError, OSError) as e:
+        except Exception as e:
             logger.warning("Could not load strategy %s: %s", entry.relative_file, e)
 
     return jsonify(strategies)
@@ -1363,10 +1707,20 @@ def list_strategies():
 @app.route("/api/strategies/<path:name>", methods=["GET"])
 def get_strategy(name: str):
     """Strategy details + all backtests and portfolios using it."""
-    entry = _strategy_entry(name)
+    try:
+        entry = _strategy_entry(name)
+    except Exception as e:
+        logger.exception("Could not resolve strategy '%s': %s", name, e)
+        return jsonify({"error": str(e)}), 500
+
     if entry is None:
         return jsonify({"error": f"Strategy '{name}' not found"}), 404
-    return jsonify(_strategy_payload(entry))
+
+    try:
+        return jsonify(_strategy_payload(entry))
+    except Exception as e:
+        logger.exception("Could not load strategy '%s': %s", name, e)
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/strategies/<path:name>", methods=["PATCH"])
@@ -2160,6 +2514,56 @@ def get_log(log_name: str):
 # ─── Benchmark Endpoint ─────────────────────────────────────────────────────
 
 
+def _timeframe_sort_key(timeframe: str) -> tuple[int, str]:
+    rank = {
+        "1m": 1,
+        "5m": 2,
+        "15m": 3,
+        "30m": 4,
+        "1h": 5,
+        "4h": 6,
+        "1d": 7,
+        "1w": 8,
+    }
+    normalized = str(timeframe or "").strip().lower()
+    return (rank.get(normalized, 99), normalized)
+
+
+def _extract_timeframe_from_path(path_str: str) -> str | None:
+    try:
+        stem = Path(path_str).stem.strip()
+    except (TypeError, ValueError):
+        return None
+    return stem or None
+
+
+def _available_timeframes_for_symbol(symbol: str) -> list[str]:
+    normalized_symbol = str(symbol or "").strip().upper()
+    if not normalized_symbol:
+        return []
+
+    entries, _ = _load_catalog_ohlcv_entries()
+    if not entries:
+        entries = _scan_ohlcv_filesystem()
+
+    timeframes: set[str] = set()
+    for entry in entries:
+        entry_symbol = str(entry.get("symbol", "")).strip().upper()
+        if entry_symbol != normalized_symbol:
+            continue
+
+        timeframe = str(entry.get("timeframe", "")).strip()
+        if timeframe:
+            timeframes.add(timeframe)
+            continue
+
+        parsed = _extract_timeframe_from_path(str(entry.get("path", "")))
+        if parsed:
+            timeframes.add(parsed)
+
+    return sorted(timeframes, key=_timeframe_sort_key)
+
+
 @app.route("/api/benchmark/<symbol>")
 def get_benchmark(symbol: str):
     """Get Buy & Hold equity curve for a symbol (benchmark comparison)."""
@@ -2230,6 +2634,252 @@ def get_benchmark(symbol: str):
             "symbol": symbol,
             "timeframe": timeframe,
             "equity": equity,
+        }
+    )
+
+
+@app.route("/api/market/timeframes/<symbol>")
+def get_market_timeframes(symbol: str):
+    normalized_symbol = str(symbol or "").strip().upper()
+    if not normalized_symbol:
+        return jsonify({"error": "Missing symbol"}), 400
+
+    return jsonify(
+        {
+            "symbol": normalized_symbol,
+            "timeframes": _available_timeframes_for_symbol(normalized_symbol),
+        }
+    )
+
+
+@app.route("/api/market/ohlcv")
+def get_market_ohlcv():
+    symbol = str(request.args.get("symbol", "")).strip().upper()
+    timeframe = str(request.args.get("timeframe", "1h")).strip().lower()
+    start = str(request.args.get("start", "")).strip()
+    end = str(request.args.get("end", "")).strip()
+    limit_raw = str(request.args.get("limit", "120000")).strip()
+
+    if not symbol:
+        return jsonify({"error": "Missing required query parameter: symbol"}), 400
+    if not timeframe:
+        return jsonify({"error": "Missing required query parameter: timeframe"}), 400
+
+    try:
+        limit = max(100, min(300000, int(limit_raw or "120000")))
+    except ValueError:
+        return jsonify({"error": "Invalid limit. Expected integer."}), 400
+
+    df = _load_ohlcv_df(symbol, timeframe)
+    if df is None:
+        return jsonify(
+            {
+                "error": f"No data for {symbol}/{timeframe}",
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "timeframes": _available_timeframes_for_symbol(symbol),
+            }
+        ), 404
+
+    if "timestamp" not in df.columns:
+        return jsonify({"error": "Dataset has no timestamp column"}), 500
+
+    if start:
+        start_ts = pd.to_datetime(start, utc=True, errors="coerce")
+        if pd.isna(start_ts):
+            return jsonify({"error": "Invalid start datetime"}), 400
+        df = df[df["timestamp"] >= start_ts]
+
+    if end:
+        end_ts = pd.to_datetime(end, utc=True, errors="coerce")
+        if pd.isna(end_ts):
+            return jsonify({"error": "Invalid end datetime"}), 400
+        df = df[df["timestamp"] <= end_ts]
+
+    df = df.sort_values("timestamp")
+    if len(df) > limit:
+        df = df.iloc[-limit:]
+
+    if df.empty:
+        return jsonify(
+            {
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "ohlcv": [],
+                "count": 0,
+                "start": None,
+                "end": None,
+            }
+        )
+
+    start_iso = pd.Timestamp(df.iloc[0]["timestamp"]).isoformat()
+    end_iso = pd.Timestamp(df.iloc[-1]["timestamp"]).isoformat()
+
+    return jsonify(
+        {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "ohlcv": _df_to_ohlcv_records(df),
+            "count": len(df),
+            "start": start_iso,
+            "end": end_iso,
+        }
+    )
+
+
+@app.route("/api/viewer/strategy-signals")
+def get_viewer_strategy_signals():
+    """Execute selected strategy on market data and return chart overlays."""
+    strategy_identifier = str(request.args.get("strategy", "")).strip()
+    symbol = str(request.args.get("symbol", "")).strip().upper()
+    timeframe = str(request.args.get("timeframe", "1h")).strip().lower()
+    start = str(request.args.get("start", "")).strip()
+    end = str(request.args.get("end", "")).strip()
+    limit_raw = str(request.args.get("limit", "120000")).strip()
+
+    if not strategy_identifier:
+        return jsonify({"error": "Missing required query parameter: strategy"}), 400
+    if not symbol:
+        return jsonify({"error": "Missing required query parameter: symbol"}), 400
+    if not timeframe:
+        return jsonify({"error": "Missing required query parameter: timeframe"}), 400
+
+    try:
+        limit = max(100, min(300000, int(limit_raw or "120000")))
+    except ValueError:
+        return jsonify({"error": "Invalid limit. Expected integer."}), 400
+
+    entry = _strategy_entry(strategy_identifier)
+    if entry is None:
+        return jsonify({"error": f"Strategy '{strategy_identifier}' not found"}), 404
+
+    df = _load_ohlcv_df(symbol, timeframe)
+    if df is None:
+        return jsonify(
+            {
+                "error": f"No data for {symbol}/{timeframe}",
+                "strategy": entry.slug,
+                "symbol": symbol,
+                "timeframe": timeframe,
+            }
+        ), 404
+
+    if "timestamp" not in df.columns:
+        return jsonify({"error": "Dataset has no timestamp column"}), 500
+
+    if start:
+        start_ts = pd.to_datetime(start, utc=True, errors="coerce")
+        if pd.isna(start_ts):
+            return jsonify({"error": "Invalid start datetime"}), 400
+        df = df[df["timestamp"] >= start_ts]
+
+    if end:
+        end_ts = pd.to_datetime(end, utc=True, errors="coerce")
+        if pd.isna(end_ts):
+            return jsonify({"error": "Invalid end datetime"}), 400
+        df = df[df["timestamp"] <= end_ts]
+
+    df = df.sort_values("timestamp").reset_index(drop=True)
+    if len(df) > limit:
+        df = df.iloc[-limit:].reset_index(drop=True)
+
+    if df.empty:
+        return jsonify(
+            {
+                "strategy": entry.slug,
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "markers": [],
+                "indicators": [],
+                "drawings": [],
+                "entry_count": 0,
+                "exit_count": 0,
+                "start": None,
+                "end": None,
+            }
+        )
+
+    try:
+        strategy_module = load_strategy_module(entry.file_path, STRATEGIES_DIR)
+        base_parameters = entry.meta.get("parameters", {})
+        parameters = dict(base_parameters) if isinstance(base_parameters, dict) else {}
+        signal_output = _viewer_call_generate_signals(strategy_module, df.copy(), parameters)
+        entries, exits, indicators, raw_drawings = _viewer_parse_signal_output(signal_output, df.index)
+        execution_series = _viewer_extract_execution_series(signal_output, df.index)
+    except Exception as exc:
+        logger.exception(
+            "Viewer strategy execution failed for %s on %s/%s: %s",
+            entry.slug,
+            symbol,
+            timeframe,
+            exc,
+        )
+        return jsonify({"error": f"Strategy execution failed: {exc}"}), 500
+
+    markers = _viewer_strategy_markers(df, entries, exits)
+
+    indicator_payload = []
+    for idx, (name, series) in enumerate(indicators.items()):
+        points = _viewer_series_to_points(df, series)
+        if not points:
+            continue
+        indicator_payload.append(
+            _indicator_payload(
+                name,
+                _viewer_indicator_type(name),
+                points,
+                _viewer_indicator_color(name, idx),
+            )
+        )
+
+    drawings: list[dict[str, Any]] = []
+    for drawing in raw_drawings:
+        if not _drawing_matches_symbol(drawing, symbol):
+            continue
+        viewer_drawing = _drawing_to_viewer(drawing)
+        if viewer_drawing is not None:
+            drawings.append(viewer_drawing)
+
+    execution_preview: dict[str, Any] | None = None
+    entry_indices = entries[entries].index.tolist()
+    if entry_indices:
+        try:
+            preview_signals = pd.DataFrame({"entries": entries, "exits": exits}, index=df.index)
+            for key, series in execution_series.items():
+                preview_signals[key] = series
+
+            execution_preview = build_execution_schema_for_entry(
+                entry_idx=int(entry_indices[0]),
+                signals=preview_signals,
+                indicators=indicators,
+                default_direction="LONG",
+            ).to_dict()
+        except Exception as exc:
+            logger.warning(
+                "Could not build execution preview for %s on %s/%s: %s",
+                entry.slug,
+                symbol,
+                timeframe,
+                exc,
+            )
+
+    start_iso = pd.Timestamp(df.iloc[0]["timestamp"]).isoformat()
+    end_iso = pd.Timestamp(df.iloc[-1]["timestamp"]).isoformat()
+
+    return jsonify(
+        {
+            "strategy": entry.slug,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "markers": markers,
+            "indicators": indicator_payload,
+            "drawings": drawings,
+            "signal_schema_version": CANONICAL_SIGNAL_SCHEMA_VERSION,
+            "execution_preview": execution_preview,
+            "entry_count": int(entries.sum()),
+            "exit_count": int(exits.sum()),
+            "start": start_iso,
+            "end": end_iso,
         }
     )
 
