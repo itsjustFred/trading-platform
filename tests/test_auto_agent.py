@@ -1,9 +1,8 @@
-"""Tests for the autonomous NVIDIA NIM strategy conversion worker."""
+"""Tests for the autonomous strategy conversion worker."""
 
 from __future__ import annotations
 
 from pathlib import Path
-from types import SimpleNamespace
 
 import runner.auto_agent as auto_agent
 
@@ -99,37 +98,32 @@ def _setup_agent(monkeypatch, tmp_path):
             end="2024-01-31",
         ),
     )
-    monkeypatch.setenv("NVIDIA_API_KEY", "test-key")
 
 
-def _install_fake_client(monkeypatch, responses, captured_kwargs=None, captured_calls=None):
+def _install_fake_provider(monkeypatch, responses, captured_kwargs=None, captured_calls=None):
     queue = list(responses)
     recorded_kwargs = captured_kwargs if captured_kwargs is not None else {}
     recorded_calls = captured_calls if captured_calls is not None else []
 
-    class FakeClient:
-        def __init__(self, *args, **kwargs):
-            recorded_kwargs.update(kwargs)
-            self.chat = SimpleNamespace(
-                completions=SimpleNamespace(create=self._create),
-            )
-
-        def _create(self, **kwargs):
+    class FakeProvider:
+        def generate(self, **kwargs):
             recorded_calls.append(kwargs)
             if not queue:
                 raise AssertionError("No fake responses left for auto_agent call")
-            content = queue.pop(0)
-            return SimpleNamespace(
-                choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
-            )
+            return queue.pop(0)
 
-    monkeypatch.setattr(auto_agent, "OpenAI", FakeClient)
+    def _factory(provider_name: str, **kwargs):
+        recorded_kwargs["provider_name"] = provider_name
+        recorded_kwargs.update(kwargs)
+        return FakeProvider()
+
+    monkeypatch.setattr(auto_agent, "get_llm_provider", _factory)
     return recorded_calls
 
 
 def test_run_auto_agent_writes_strategy_docs_and_backtest_output(tmp_path, monkeypatch):
     _setup_agent(monkeypatch, tmp_path)
-    llm_calls = _install_fake_client(
+    llm_calls = _install_fake_provider(
         monkeypatch,
         [STEP_ONE_MARKDOWN, STEP_TWO_META, STEP_THREE_CODE],
     )
@@ -172,11 +166,11 @@ def test_run_auto_agent_writes_strategy_docs_and_backtest_output(tmp_path, monke
 
 def test_run_auto_agent_sets_timeout_and_logs_for_long_code(tmp_path, monkeypatch):
     _setup_agent(monkeypatch, tmp_path)
-    captured_client_kwargs: dict[str, object] = {}
-    _install_fake_client(
+    captured_provider_kwargs: dict[str, object] = {}
+    _install_fake_provider(
         monkeypatch,
         [STEP_ONE_MARKDOWN, STEP_TWO_META, STEP_THREE_CODE],
-        captured_kwargs=captured_client_kwargs,
+        captured_kwargs=captured_provider_kwargs,
     )
 
     def fake_run_backtest(cmd: list[str], *, log=None):
@@ -194,7 +188,8 @@ def test_run_auto_agent_sets_timeout_and_logs_for_long_code(tmp_path, monkeypatc
         log=lambda message, **kwargs: logged_messages.append(message),
     )
 
-    assert captured_client_kwargs["timeout"] == 600.0
+    assert captured_provider_kwargs["provider_name"] == "nim"
+    assert captured_provider_kwargs["timeout_seconds"] == 600.0
     assert any(
         "Code is very long (1400 lines). Expect longer generation time." in message
         for message in logged_messages
@@ -208,7 +203,7 @@ def test_run_auto_agent_sets_timeout_and_logs_for_long_code(tmp_path, monkeypatc
 def test_run_auto_agent_retries_only_step_three_on_validation_failure(tmp_path, monkeypatch):
     _setup_agent(monkeypatch, tmp_path)
     llm_calls: list[dict[str, object]] = []
-    _install_fake_client(
+    _install_fake_provider(
         monkeypatch,
         [STEP_ONE_MARKDOWN, STEP_TWO_META, STEP_THREE_CODE, FIXED_STEP_THREE_CODE],
         captured_calls=llm_calls,
@@ -237,11 +232,11 @@ def test_run_auto_agent_retries_only_step_three_on_validation_failure(tmp_path, 
     assert result["attempts"] == 2
     assert backtest_calls == 2
     assert len(llm_calls) == 4
-    assert "The Analyst" in llm_calls[0]["messages"][0]["content"]
-    assert "The Architect" in llm_calls[1]["messages"][0]["content"]
-    assert "The Coder" in llm_calls[2]["messages"][0]["content"]
-    assert "The Coder" in llm_calls[3]["messages"][0]["content"]
-    assert "Traceback: boom" in llm_calls[3]["messages"][1]["content"]
+    assert "The Analyst" in str(llm_calls[0]["system_prompt"])
+    assert "The Architect" in str(llm_calls[1]["system_prompt"])
+    assert "The Coder" in str(llm_calls[2]["system_prompt"])
+    assert "The Coder" in str(llm_calls[3]["system_prompt"])
+    assert "Traceback: boom" in str(llm_calls[3]["prompt"])
 
 
 def test_normalize_strategy_meta_accepts_list_tags():

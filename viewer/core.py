@@ -32,6 +32,7 @@ from pydantic import ValidationError
 from data_tools import cache_manager
 from data_tools.catalog_builder import build_catalog, scan_ohlcv
 from runner.auto_agent import DEFAULT_MODEL_NAME, SUPPORTED_MODEL_NAMES, run_auto_agent
+from runner.llm_providers import DEFAULT_LLM_PROVIDER_NAME, SUPPORTED_LLM_PROVIDER_NAMES
 from runner.optimizer import OptimizationConfig, run_optimization as execute_optimization
 from runner.stats import compute_stats, compute_stats_for_result
 from shared.models import BacktestResult, EquityPoint, PortfolioStats, Trade
@@ -3828,10 +3829,15 @@ def _queue_agent_task(task_id: str, payload: dict) -> dict:
     """Register the autonomous conversion agent before the worker thread launches."""
     TASK_LOGS_DIR.mkdir(parents=True, exist_ok=True)
     log_file = _task_log_path(task_id)
+    provider = str(payload.get("provider") or DEFAULT_LLM_PROVIDER_NAME).strip().lower() or DEFAULT_LLM_PROVIDER_NAME
+    model = str(payload.get("model") or "").strip() or None
     record = _create_task_record(
         task_id,
         name="Strategy conversion",
-        description=payload.get("strategy_name") or "Convert strategy into the repository format",
+        description=(
+            f"{payload.get('strategy_name') or 'Convert strategy into the repository format'} "
+            f"(provider={provider}{f', model={model}' if model else ''})"
+        ),
         kind="agent_conversion",
         source="agent",
         total_items=0,
@@ -3839,6 +3845,8 @@ def _queue_agent_task(task_id: str, payload: dict) -> dict:
         control_mode="thread",
         supports_control=False,
     )
+    record["provider"] = provider
+    record["model"] = model
     with DATA_TASKS_LOCK:
         DATA_TASKS[task_id] = record
 
@@ -3848,18 +3856,25 @@ def _queue_agent_task(task_id: str, payload: dict) -> dict:
 def _launch_agent_task(task_id: str, payload: dict) -> None:
     task = _get_task(task_id)
     log_file = Path(task.get("log_file", _task_log_path(task_id)) if task else _task_log_path(task_id))
+    provider = str(payload.get("provider") or DEFAULT_LLM_PROVIDER_NAME).strip().lower() or DEFAULT_LLM_PROVIDER_NAME
+    model = str(payload.get("model") or "").strip() or None
 
     def run_agent() -> None:
+        started_at = datetime.now(timezone.utc)
         with log_file.open("a", encoding="utf-8", buffering=1) as handle:
             try:
                 _write_task_log_line(
                     handle,
                     task_id,
-                    f"[{_task_timestamp()}] Starting strategy conversion agent.",
+                    (
+                        f"[{_task_timestamp()}] Starting strategy conversion with "
+                        f"provider={provider} model={model or 'default'}."
+                    ),
                     stream="task",
                     source="agent-task",
                 )
                 _set_task_status(task_id, "running")
+                _update_task_fields(task_id, provider=provider, model=model, started_at=started_at.isoformat())
 
                 def task_log(message: str, *, stream: str = "task", level: str = "info") -> None:
                     _write_task_log_line(
@@ -3876,7 +3891,8 @@ def _launch_agent_task(task_id: str, payload: dict) -> None:
                         payload["code"],
                         strategy_name=payload.get("strategy_name"),
                         requested_engine=payload.get("engine"),
-                        model=payload.get("model", DEFAULT_MODEL_NAME),
+                        provider=provider,
+                        model=model,
                         symbols=payload.get("symbols"),
                         timeframe=payload.get("timeframe"),
                         start=payload.get("start"),
@@ -3884,7 +3900,14 @@ def _launch_agent_task(task_id: str, payload: dict) -> None:
                         capital=_safe_float(payload.get("capital"), 100000.0),
                         log=task_log,
                     )
-                _update_task_fields(task_id, result=result)
+                duration_seconds = max(0.0, (datetime.now(timezone.utc) - started_at).total_seconds())
+                _update_task_fields(
+                    task_id,
+                    result=result,
+                    provider=provider,
+                    model=model,
+                    duration_seconds=round(duration_seconds, 3),
+                )
                 _write_task_log_line(
                     handle,
                     task_id,
@@ -3894,6 +3917,7 @@ def _launch_agent_task(task_id: str, payload: dict) -> None:
                 )
                 _mark_task_finished(task_id, status="completed", returncode=0)
             except Exception as exc:
+                duration_seconds = max(0.0, (datetime.now(timezone.utc) - started_at).total_seconds())
                 traceback_text = traceback.format_exc()
                 _write_task_log_line(
                     handle,
@@ -3904,6 +3928,12 @@ def _launch_agent_task(task_id: str, payload: dict) -> None:
                     source="agent-task",
                 )
                 _write_task_traceback(handle, task_id, traceback_text, source="agent-task")
+                _update_task_fields(
+                    task_id,
+                    provider=provider,
+                    model=model,
+                    duration_seconds=round(duration_seconds, 3),
+                )
                 _mark_task_finished(task_id, status="failed", returncode=1, error=str(exc))
                 logger.exception(
                     "Strategy conversion failed: %s",
@@ -4363,14 +4393,21 @@ def agent_convert():
     code = data.get("code", "")
     if not isinstance(code, str) or not code.strip():
         return jsonify({"error": "A non-empty 'code' field is required"}), 400
-    model = str(data.get("model", "")).strip() or DEFAULT_MODEL_NAME
-    if model not in SUPPORTED_MODEL_NAMES:
-        return jsonify({"error": f"Unsupported model '{model}'"}), 400
+    provider = str(data.get("provider", "")).strip().lower() or DEFAULT_LLM_PROVIDER_NAME
+    if provider not in SUPPORTED_LLM_PROVIDER_NAMES:
+        return jsonify({"error": f"Unsupported provider '{provider}'"}), 400
+
+    model = str(data.get("model", "")).strip() or None
+    if provider == "nim":
+        model = model or DEFAULT_MODEL_NAME
+        if model not in SUPPORTED_MODEL_NAMES:
+            return jsonify({"error": f"Unsupported model '{model}' for provider '{provider}'"}), 400
 
     payload = {
         "code": code,
         "strategy_name": str(data.get("strategy_name", "")).strip() or None,
         "engine": str(data.get("engine", "")).strip().lower() or None,
+        "provider": provider,
         "model": model,
         "symbols": [
             str(symbol).strip().upper()

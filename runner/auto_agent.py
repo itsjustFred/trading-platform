@@ -1,5 +1,5 @@
 """
-Autonomous strategy-conversion worker backed by NVIDIA NIM.
+Autonomous strategy-conversion worker with pluggable LLM providers.
 
 This module converts raw strategy code into a runnable repository strategy using
 three smaller LLM stages (analyst, architect, coder), writes the generated
@@ -22,15 +22,14 @@ from pathlib import Path
 from pprint import pformat
 from typing import Any, Callable
 
-try:
-    from openai import OpenAI
-except ModuleNotFoundError:  # pragma: no cover - optional dependency for agent mode
-    class OpenAI:  # type: ignore[no-redef]
-        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
-            raise ModuleNotFoundError("openai package is required for auto-agent execution")
-
 from data_tools.catalog_builder import scan_ohlcv
 from runner.cli import _detect_date_range
+from runner.llm_providers import (
+    DEFAULT_LLM_PROVIDER_NAME,
+    SUPPORTED_LLM_PROVIDER_NAMES,
+    get_llm_provider,
+)
+from runner.llm_providers.base import LLMProvider
 from shared.constants import DATA_DIR
 from shared.logging import get_logger
 from shared.strategy_registry import DEFAULT_STRATEGIES_DIR
@@ -109,7 +108,8 @@ def run_auto_agent(
     *,
     strategy_name: str | None = None,
     requested_engine: str | None = None,
-    model: str = DEFAULT_MODEL_NAME,
+    provider: str = DEFAULT_LLM_PROVIDER_NAME,
+    model: str | None = None,
     symbols: list[str] | None = None,
     timeframe: str | None = None,
     start: str | None = None,
@@ -124,19 +124,23 @@ def run_auto_agent(
     if not source_code:
         raise ValueError("Strategy source code is required.")
 
-    selected_model = (model or DEFAULT_MODEL_NAME).strip() or DEFAULT_MODEL_NAME
-    if selected_model not in SUPPORTED_MODEL_NAMES:
-        raise ValueError(f"Unsupported model: {selected_model}")
+    selected_provider = str(provider or DEFAULT_LLM_PROVIDER_NAME).strip().lower() or DEFAULT_LLM_PROVIDER_NAME
+    if selected_provider not in SUPPORTED_LLM_PROVIDER_NAMES:
+        raise ValueError(f"Unsupported provider: {selected_provider}")
+
+    selected_model = (model or "").strip()
+    if selected_provider == "nim":
+        selected_model = selected_model or DEFAULT_MODEL_NAME
+        if selected_model not in SUPPORTED_MODEL_NAMES:
+            raise ValueError(f"Unsupported model: {selected_model}")
+    elif not selected_model:
+        selected_model = None
 
     line_count = source_code.count("\n") + 1
     if line_count >= LONG_CODE_LINE_THRESHOLD:
         message = f"Code is very long ({line_count} lines). Expect longer generation time."
         logger.info(message, extra={"data": {"line_count": line_count, "timeout_seconds": timeout_seconds}})
         _log(log, message)
-
-    api_key = os.getenv("NVIDIA_API_KEY")
-    if not api_key:
-        raise RuntimeError("NVIDIA_API_KEY environment variable is not set.")
 
     target = _resolve_backtest_target(
         symbols=symbols,
@@ -151,19 +155,21 @@ def run_auto_agent(
             f"timeframe={target.timeframe} range={target.start}..{target.end}"
         ),
     )
-    _log(log, f"Selected AI model: {selected_model}")
-
-    client = OpenAI(
-        base_url="https://integrate.api.nvidia.com/v1",
-        api_key=api_key,
-        timeout=float(timeout_seconds),
+    provider_instance = get_llm_provider(
+        selected_provider,
+        timeout_seconds=float(timeout_seconds),
+    )
+    _log(
+        log,
+        f"Selected LLM provider: {selected_provider}"
+        + (f" (model: {selected_model})" if selected_model else " (default model)"),
     )
 
     system_prompt = _load_system_prompt()
 
-    _log(log, f"Step 1/3: Requesting Markdown documentation from {selected_model}.")
+    _log(log, f"Step 1/3: Requesting Markdown documentation from {_provider_step_target(selected_provider, selected_model)}.")
     markdown_response = _run_llm_step(
-        client,
+        provider_instance,
         model=selected_model,
         developer_prompt=_step_one_developer_prompt(requested_engine=requested_engine),
         user_prompt=_step_one_user_prompt(source_code=source_code, strategy_name=strategy_name),
@@ -184,9 +190,9 @@ def run_auto_agent(
     _log(log, f"Selected engine: {engine}")
     _log(log, "✅ Step 1/3: Markdown Documentation created.")
 
-    _log(log, f"Step 2/3: Requesting STRATEGY_META from {selected_model}.")
+    _log(log, f"Step 2/3: Requesting STRATEGY_META from {_provider_step_target(selected_provider, selected_model)}.")
     meta_response = _run_llm_step(
-        client,
+        provider_instance,
         model=selected_model,
         developer_prompt=_step_two_developer_prompt(),
         user_prompt=_step_two_user_prompt(
@@ -208,15 +214,16 @@ def run_auto_agent(
     last_error = "Unknown auto-agent failure."
     for attempt in range(1, max_iterations + 1):
         if attempt == 1:
-            _log(log, f"Step 3/3: Requesting Python code from {selected_model}.")
+            _log(log, f"Step 3/3: Requesting Python code from {_provider_step_target(selected_provider, selected_model)}.")
         else:
             _log(
                 log,
-                f"Step 3/3: Retry {attempt}/{max_iterations} with validation feedback using {selected_model}.",
+                f"Step 3/3: Retry {attempt}/{max_iterations} with validation feedback using "
+                f"{_provider_step_target(selected_provider, selected_model)}.",
             )
 
         python_response = _run_llm_step(
-            client,
+            provider_instance,
             model=selected_model,
             developer_prompt=_step_three_developer_prompt(system_prompt=system_prompt, engine=engine),
             user_prompt=_step_three_user_prompt(
@@ -256,6 +263,8 @@ def run_auto_agent(
                 "symbols": target.symbols,
                 "timeframe": target.timeframe,
                 "attempts": attempt,
+                "provider": selected_provider,
+                "model": selected_model or "",
             }
 
         last_error = combined_output or "Backtest failed without output."
@@ -402,26 +411,30 @@ def _step_three_user_prompt(
 
 
 def _run_llm_step(
-    client: OpenAI,
+    provider: LLMProvider,
     *,
-    model: str,
+    model: str | None,
     developer_prompt: str,
     user_prompt: str,
     log: TaskLogger | None,
     step_label: str,
 ) -> str:
-    response = client.chat.completions.create(
+    content = provider.generate(
+        prompt=user_prompt,
+        system_prompt=developer_prompt,
         model=model,
-        messages=[
-            {"role": "developer", "content": developer_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
+        metadata={"step_label": step_label},
     )
-    content = response.choices[0].message.content or ""
     _log(log, f"{step_label}: Received {len(content)} characters from model.")
     if not content.strip():
         raise RuntimeError(f"{step_label}: model returned an empty response.")
     return content
+
+
+def _provider_step_target(provider: str, model: str | None) -> str:
+    if model and model.strip():
+        return f"{provider}:{model}"
+    return provider
 
 
 def _normalize_markdown_doc(markdown_doc: str, *, strategy_name: str | None) -> str:

@@ -3145,6 +3145,7 @@ def test_agent_convert_endpoint_starts_background_agent(viewer_client, monkeypat
         "code": "//@version=5\nstrategy('x')",
         "strategy_name": "Signal Forge",
         "engine": None,
+        "provider": viewer_app_module.DEFAULT_LLM_PROVIDER_NAME,
         "model": viewer_app_module.DEFAULT_MODEL_NAME,
         "symbols": None,
         "timeframe": None,
@@ -3155,6 +3156,44 @@ def test_agent_convert_endpoint_starts_background_agent(viewer_client, monkeypat
 
     assert captured["launch_task_id"] == captured["task_id"]
     assert captured["launch_payload"] == captured["payload"]
+
+
+def test_agent_convert_endpoint_rejects_unknown_provider(viewer_client):
+    resp = viewer_client.post(
+        "/api/agent/convert",
+        json={
+            "code": "//@version=5\nstrategy('x')",
+            "provider": "unknown_provider",
+        },
+    )
+
+    assert resp.status_code == 400
+    assert "Unsupported provider" in str(resp.json().get("detail"))
+
+
+def test_agent_convert_endpoint_accepts_copilot_cli_provider(viewer_client, monkeypatch):
+    import viewer.main as viewer_app_module
+
+    captured: dict[str, object] = {}
+
+    def fake_queue(task_id: str, payload: dict) -> dict:
+        captured["payload"] = payload
+        return {"job_id": task_id, "task_id": task_id, "status": "starting"}
+
+    monkeypatch.setattr(viewer_app_module, "_queue_agent_task", fake_queue)
+    monkeypatch.setattr(viewer_app_module, "_launch_agent_task", lambda task_id, payload: None)
+
+    resp = viewer_client.post(
+        "/api/agent/convert",
+        json={
+            "code": "//@version=5\nstrategy('x')",
+            "provider": "copilot_cli",
+        },
+    )
+
+    assert resp.status_code == 202
+    assert captured["payload"]["provider"] == "copilot_cli"
+    assert captured["payload"]["model"] is None
 
 
 def test_equity_endpoint_rebuilds_curve_from_trades(viewer_client, tmp_path):

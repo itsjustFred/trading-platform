@@ -1098,8 +1098,11 @@ export interface DataTaskStatusResponse {
   progress_message?: string;
   elapsed_seconds?: number | null;
   eta_seconds?: number | null;
+  duration_seconds?: number | null;
   error?: string | null;
   error_message?: string | null;
+  provider?: AgentProviderId | string | null;
+  model?: string | null;
   log?: string;
   progress?: DataTaskProgress;
   can_pause?: boolean;
@@ -1142,10 +1145,13 @@ export type AgentModelId =
   | "deepseek-ai/deepseek-v3.2"
   | "qwen/qwen2.5-coder-32b-instruct";
 
+export type AgentProviderId = "nim" | "copilot_cli" | "copilot_sdk";
+
 export interface AgentConvertRequest {
   code: string;
   strategy_name?: string;
-  model?: AgentModelId;
+  provider?: AgentProviderId;
+  model?: string;
 }
 
 export interface BacktestCompareStats {

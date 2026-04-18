@@ -64,7 +64,7 @@ def generate_signals(df, params):
         'sl_price': None  # No stop loss implemented in original strategy
     }
     
-    # Optional drawings - not required for this simple overlay strategy
-    drawings = None
+    # Optional drawings - keep contract-compatible empty list when unused
+    drawings = []
     
     return entries, exits, indicators_dict, drawings

@@ -216,6 +216,8 @@ execute_optimization = legacy_viewer.execute_optimization
 OptimizationConfig = legacy_viewer.OptimizationConfig
 DEFAULT_MODEL_NAME = legacy_viewer.DEFAULT_MODEL_NAME
 SUPPORTED_MODEL_NAMES = legacy_viewer.SUPPORTED_MODEL_NAMES
+DEFAULT_LLM_PROVIDER_NAME = legacy_viewer.DEFAULT_LLM_PROVIDER_NAME
+SUPPORTED_LLM_PROVIDER_NAMES = legacy_viewer.SUPPORTED_LLM_PROVIDER_NAMES
 _parse_symbol_list = legacy_viewer._parse_symbol_list
 _parse_timeframe_list = legacy_viewer._parse_timeframe_list
 _normalize_dukascopy_genesis_timeframe = legacy_viewer._normalize_dukascopy_genesis_timeframe
@@ -770,6 +772,7 @@ class AgentConvertRequest(SQLModel):
     code: str
     strategy_name: str | None = None
     engine: str | None = None
+    provider: str | None = None
     model: str | None = None
     symbols: list[str] | None = None
     timeframe: str | None = None
@@ -2260,8 +2263,11 @@ def _task_config_payload(task: dict[str, Any]) -> dict[str, Any]:
         "kind": task.get("kind"),
         "source": task.get("source"),
         "category": task.get("category"),
+        "provider": task.get("provider"),
+        "model": task.get("model"),
         "started_at": task.get("started_at"),
         "finished_at": task.get("finished_at"),
+        "duration_seconds": task.get("duration_seconds"),
         "progress_history": _json_safe(_sanitize_progress_history(task.get("progress_history"))),
         "total_items": int(task.get("total_items", 0) or 0),
         "supports_control": bool(task.get("supports_control", False)),
@@ -2637,10 +2643,13 @@ def _serialize_task(
     payload["completed_at"] = completed_at
     payload["elapsed_seconds"] = elapsed_seconds
     payload["eta_seconds"] = eta_seconds
+    payload["duration_seconds"] = _safe_float(task.get("duration_seconds"), elapsed_seconds or 0.0) if status in FINAL_TASK_STATUSES else task.get("duration_seconds")
     payload["progress_percent"] = max(0.0, min(100.0, round(progress_percent, 2)))
     payload["progress_message"] = progress_message
     payload["error"] = error_message
     payload["error_message"] = error_message
+    payload["provider"] = task.get("provider")
+    payload["model"] = task.get("model")
     return payload
 
 
@@ -8686,14 +8695,24 @@ async def agent_convert(payload: AgentConvertRequest, background_tasks: Backgrou
     if not code.strip():
         raise HTTPException(status_code=400, detail="A non-empty 'code' field is required")
 
-    model = str(payload.model or "").strip() or DEFAULT_MODEL_NAME
-    if model not in SUPPORTED_MODEL_NAMES:
-        raise HTTPException(status_code=400, detail=f"Unsupported model '{model}'")
+    provider = str(payload.provider or "").strip().lower() or DEFAULT_LLM_PROVIDER_NAME
+    if provider not in SUPPORTED_LLM_PROVIDER_NAMES:
+        raise HTTPException(status_code=400, detail=f"Unsupported provider '{provider}'")
+
+    model = str(payload.model or "").strip() or None
+    if provider == "nim":
+        model = model or DEFAULT_MODEL_NAME
+        if model not in SUPPORTED_MODEL_NAMES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported model '{model}' for provider '{provider}'",
+            )
 
     task_payload = {
         "code": code,
         "strategy_name": str(payload.strategy_name or "").strip() or None,
         "engine": str(payload.engine or "").strip().lower() or None,
+        "provider": provider,
         "model": model,
         "symbols": (
             [str(symbol).strip().upper() for symbol in payload.symbols if str(symbol).strip()]

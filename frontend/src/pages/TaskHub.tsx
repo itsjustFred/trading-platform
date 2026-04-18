@@ -221,6 +221,12 @@ export function TaskHubPage() {
                     <div style={{ marginTop: "6px", color: "var(--color-text-muted)" }}>
                       {percent.toFixed(0)}% · ETA: {formatDuration(task.eta_seconds)}
                     </div>
+                    {task.provider ? (
+                      <div style={{ marginTop: "6px", color: "var(--color-text-muted)", fontSize: "0.86rem" }}>
+                        provider={task.provider}
+                        {task.model ? ` · model=${task.model}` : ""}
+                      </div>
+                    ) : null}
                     <div style={{ marginTop: "6px", fontSize: "0.92rem", color: "var(--color-text-muted)" }}>
                       {taskMessage(task)}
                     </div>
@@ -333,11 +339,27 @@ export function TaskHubPage() {
                     >
                       {taskMessage(task)}
                     </div>
+                    {task.provider ? (
+                      <div
+                        style={{
+                          marginTop: "4px",
+                          fontSize: "0.78rem",
+                          color: "var(--color-text-muted)",
+                          whiteSpace: "nowrap",
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                          maxWidth: "70ch",
+                        }}
+                      >
+                        provider={task.provider}
+                        {task.model ? ` · model=${task.model}` : ""}
+                      </div>
+                    ) : null}
                   </div>
 
                   <div style={{ display: "flex", alignItems: "center", gap: "10px", flexShrink: 0 }}>
                     <span style={{ fontSize: "0.8rem", color: "var(--color-text-muted)" }}>
-                      {formatDuration(task.elapsed_seconds)}
+                      {formatDuration(task.duration_seconds ?? task.elapsed_seconds)}
                     </span>
                     {isFailed && task.can_restart ? (
                       <button
