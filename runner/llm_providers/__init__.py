@@ -25,7 +25,7 @@ def get_llm_provider(provider_name: str, **kwargs: Any) -> LLMProvider:
     if normalized == "copilot_cli":
         return CopilotCLIProvider(**kwargs)
     if normalized == "copilot_sdk":
-        return CopilotSDKProvider()
+        return CopilotSDKProvider(**kwargs)
     raise ValueError(f"Unsupported LLM provider: {provider_name}")
 
 
@@ -35,4 +35,3 @@ __all__ = [
     "SUPPORTED_LLM_PROVIDER_NAMES",
     "get_llm_provider",
 ]
-

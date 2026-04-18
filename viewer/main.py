@@ -8707,6 +8707,8 @@ async def agent_convert(payload: AgentConvertRequest, background_tasks: Backgrou
                 status_code=400,
                 detail=f"Unsupported model '{model}' for provider '{provider}'",
             )
+    elif provider == "copilot_sdk":
+        model = model or str(os.getenv("COPILOT_SDK_MODEL") or "gpt-5").strip() or "gpt-5"
 
     task_payload = {
         "code": code,

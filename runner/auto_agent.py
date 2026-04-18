@@ -419,12 +419,28 @@ def _run_llm_step(
     log: TaskLogger | None,
     step_label: str,
 ) -> str:
+    request_metadata: dict[str, Any] = {"step_label": step_label}
     content = provider.generate(
         prompt=user_prompt,
         system_prompt=developer_prompt,
         model=model,
-        metadata={"step_label": step_label},
+        metadata=request_metadata,
     )
+    provider_name = str(request_metadata.get("provider") or "")
+    provider_model = str(request_metadata.get("model") or "")
+    provider_status = str(request_metadata.get("status") or "")
+    provider_duration = request_metadata.get("duration_seconds")
+    if provider_name or provider_model or provider_status or provider_duration is not None:
+        details: list[str] = []
+        if provider_name:
+            details.append(f"provider={provider_name}")
+        if provider_model:
+            details.append(f"model={provider_model}")
+        if provider_status:
+            details.append(f"status={provider_status}")
+        if provider_duration is not None:
+            details.append(f"duration={provider_duration}s")
+        _log(log, f"{step_label}: Provider metadata: {', '.join(details)}.")
     _log(log, f"{step_label}: Received {len(content)} characters from model.")
     if not content.strip():
         raise RuntimeError(f"{step_label}: model returned an empty response.")
