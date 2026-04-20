@@ -25,6 +25,9 @@ import type {
   Service,
   ServiceStatus,
   ServiceType,
+  VerificationEvidenceCreateRequest,
+  VerificationEvidenceRecord,
+  VerificationEvidenceSummary,
   LiveTradesResponse,
   SignalProcessorOption,
   LogContent,
@@ -317,6 +320,45 @@ export const getServiceLogs = (
     `/services/${encodeURIComponent(serviceId)}/logs${query ? `?${query}` : ""}`,
   );
 };
+
+// Verification evidence
+export const getVerificationEvidence = (params?: {
+  component?: string;
+  category?: string;
+  status?: "success" | "failed" | "partial" | "skipped";
+  limit?: number;
+}) => {
+  const query = new URLSearchParams();
+  if (params?.component) query.set("component", params.component);
+  if (params?.category) query.set("category", params.category);
+  if (params?.status) query.set("status", params.status);
+  if (params?.limit != null) query.set("limit", String(params.limit));
+  const queryString = query.toString();
+  return fetchJSON<VerificationEvidenceRecord[]>(
+    `/verification/evidence${queryString ? `?${queryString}` : ""}`,
+  );
+};
+
+export const getVerificationEvidenceSummary = (params?: {
+  component?: string;
+  category?: string;
+  limit?: number;
+}) => {
+  const query = new URLSearchParams();
+  if (params?.component) query.set("component", params.component);
+  if (params?.category) query.set("category", params.category);
+  if (params?.limit != null) query.set("limit", String(params.limit));
+  const queryString = query.toString();
+  return fetchJSON<VerificationEvidenceSummary[]>(
+    `/verification/evidence/summary${queryString ? `?${queryString}` : ""}`,
+  );
+};
+
+export const createVerificationEvidence = (payload: VerificationEvidenceCreateRequest) =>
+  fetchJSON<VerificationEvidenceRecord>("/verification/evidence", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
 
 // Run backtest
 export const runBacktest = (data: RunBacktestRequest) =>

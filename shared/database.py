@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
+from uuid import uuid4
 
 from dotenv import load_dotenv
 from sqlalchemy import JSON, Column, String, UniqueConstraint, delete, event, func, or_, text
@@ -26,6 +28,8 @@ from shared.models import (
     Service,
     ServiceStatus,
     ServiceType,
+    VerificationEvidenceRecord,
+    VerificationEvidenceStatus,
     Portfolio as PortfolioModel,
     PortfolioComponent as PortfolioComponentModel,
     LiveSignal,
@@ -72,6 +76,33 @@ def _configure_sqlite_connection(dbapi_connection: Any, _connection_record: Any)
 
 _DB_INIT_LOCK = threading.Lock()
 _DB_INITIALIZED = False
+_CACHED_GIT_SHA: str | None = None
+_FINAL_TASK_STATUSES = {
+    "completed",
+    "failed",
+    "cancelled",
+    "interrupted",
+    "partial",
+    "skipped",
+}
+_TASK_STATUS_TO_EVIDENCE_STATUS = {
+    "completed": VerificationEvidenceStatus.SUCCESS.value,
+    "failed": VerificationEvidenceStatus.FAILED.value,
+    "interrupted": VerificationEvidenceStatus.FAILED.value,
+    "cancelled": VerificationEvidenceStatus.SKIPPED.value,
+    "partial": VerificationEvidenceStatus.PARTIAL.value,
+    "skipped": VerificationEvidenceStatus.SKIPPED.value,
+}
+_MANUAL_VALIDATION_CATEGORIES = {
+    "discord",
+    "discord_bot",
+    "scheduler",
+    "service",
+    "daemon",
+    "websocket",
+    "provider",
+    "live",
+}
 
 
 class BacktestRecord(SQLModel, table=True):
@@ -541,8 +572,128 @@ class BackgroundTaskRecord(SQLModel, table=True):
     updated_at: str = Field(default="", index=True)
 
 
+class VerificationEvidenceModel(SQLModel, table=True):
+    __tablename__ = "verification_evidence"
+
+    id: str = Field(primary_key=True)
+    run_id: str = Field(
+        sa_column=Column(String, nullable=False, unique=True, index=True),
+    )
+    component: str = Field(default="", index=True)
+    flow_name: str = Field(default="", index=True)
+    category: str = Field(default="", index=True)
+    status: str = Field(default=VerificationEvidenceStatus.SKIPPED.value, index=True)
+    started_at: str = Field(default="", index=True)
+    finished_at: str = Field(default="", index=True)
+    duration_seconds: float | None = Field(default=None)
+    git_sha: str = Field(default="", index=True)
+    environment: str = Field(default="", index=True)
+    mode: str = Field(default="", index=True)
+    metadata_json: dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column("metadata", JSON, nullable=False),
+    )
+    error_summary: str = Field(default="")
+    evidence_ref: str = Field(default="")
+    manual_validation_required: bool = Field(default=False, index=True)
+    source: str = Field(default="", index=True)
+    created_at: str = Field(default="", index=True)
+    updated_at: str = Field(default="", index=True)
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_iso_datetime(value: str | None) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _safe_duration_seconds(
+    *,
+    started_at: str,
+    finished_at: str,
+    duration_seconds: float | None,
+) -> float | None:
+    if duration_seconds is not None:
+        try:
+            return max(float(duration_seconds), 0.0)
+        except (TypeError, ValueError):
+            return None
+    started_dt = _parse_iso_datetime(started_at)
+    finished_dt = _parse_iso_datetime(finished_at)
+    if started_dt is None or finished_dt is None:
+        return None
+    return max((finished_dt - started_dt).total_seconds(), 0.0)
+
+
+def _detect_git_sha() -> str:
+    global _CACHED_GIT_SHA
+    if _CACHED_GIT_SHA is not None:
+        return _CACHED_GIT_SHA
+
+    env_sha = str(os.environ.get("GIT_SHA", "")).strip()
+    if env_sha:
+        _CACHED_GIT_SHA = env_sha
+        return _CACHED_GIT_SHA
+
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(PROJECT_ROOT),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        _CACHED_GIT_SHA = ""
+        return _CACHED_GIT_SHA
+
+    _CACHED_GIT_SHA = result.stdout.strip() if result.returncode == 0 else ""
+    return _CACHED_GIT_SHA
+
+
+def _normalize_evidence_status(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    allowed = {item.value for item in VerificationEvidenceStatus}
+    if normalized not in allowed:
+        raise ValueError(f"Invalid verification evidence status '{value}'")
+    return normalized
+
+
+def _serialize_verification_evidence(row: VerificationEvidenceModel) -> dict[str, Any]:
+    return {
+        "id": str(row.id),
+        "run_id": str(row.run_id or ""),
+        "component": str(row.component or ""),
+        "flow_name": str(row.flow_name or ""),
+        "category": str(row.category or ""),
+        "status": str(row.status or VerificationEvidenceStatus.SKIPPED.value),
+        "started_at": str(row.started_at or ""),
+        "finished_at": str(row.finished_at or ""),
+        "duration_seconds": (
+            float(row.duration_seconds) if row.duration_seconds is not None else None
+        ),
+        "git_sha": str(row.git_sha or ""),
+        "environment": str(row.environment or ""),
+        "mode": str(row.mode or ""),
+        "metadata": dict(row.metadata_json or {}),
+        "error_summary": str(row.error_summary or "") or None,
+        "evidence_ref": str(row.evidence_ref or "") or None,
+        "manual_validation_required": bool(row.manual_validation_required),
+        "source": str(row.source or ""),
+        "created_at": str(row.created_at or ""),
+        "updated_at": str(row.updated_at or ""),
+    }
 
 
 def _normalize_task_record(row: Any) -> BackgroundTaskRecord | None:
@@ -1587,6 +1738,268 @@ def load_backtest_metadata_row(backtest_id: str) -> dict[str, Any] | None:
     return _backtest_metadata_payload(backtest, int(trade_count or 0))
 
 
+def upsert_verification_evidence(
+    *,
+    component: str,
+    flow_name: str,
+    category: str,
+    status: VerificationEvidenceStatus | str,
+    started_at: str | None = None,
+    finished_at: str | None = None,
+    duration_seconds: float | None = None,
+    git_sha: str | None = None,
+    environment: str | None = None,
+    mode: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    error_summary: str | None = None,
+    evidence_ref: str | None = None,
+    manual_validation_required: bool = False,
+    source: str = "",
+    run_id: str | None = None,
+) -> VerificationEvidenceRecord:
+    normalized_component = str(component or "").strip()
+    if not normalized_component:
+        raise ValueError("component is required")
+    normalized_flow_name = str(flow_name or "").strip()
+    if not normalized_flow_name:
+        raise ValueError("flow_name is required")
+    normalized_category = str(category or "").strip().lower()
+    if not normalized_category:
+        raise ValueError("category is required")
+
+    status_value = status.value if isinstance(status, VerificationEvidenceStatus) else str(status)
+    normalized_status = _normalize_evidence_status(status_value)
+    now_iso = _now_iso()
+    normalized_run_id = str(run_id or "").strip() or str(uuid4())
+    normalized_metadata = dict(metadata or {})
+    normalized_source = str(source or "").strip().lower()
+    normalized_environment = str(environment or os.environ.get("APP_ENV", "local")).strip().lower()
+    normalized_mode = str(mode or "").strip().lower()
+    normalized_git_sha = str(git_sha or _detect_git_sha()).strip()
+    normalized_error = str(error_summary or "").strip()
+    normalized_evidence_ref = str(evidence_ref or "").strip()
+    init_db()
+    with get_session() as session:
+        existing = session.exec(
+            select(VerificationEvidenceModel)
+            .where(VerificationEvidenceModel.run_id == normalized_run_id)
+            .limit(1)
+        ).first()
+        record = existing if isinstance(existing, VerificationEvidenceModel) else None
+        if record is None:
+            record = VerificationEvidenceModel(
+                id=str(uuid4()),
+                run_id=normalized_run_id,
+                created_at=now_iso,
+            )
+
+        started_value = str(started_at or "").strip()
+        if not started_value:
+            started_value = str(record.started_at or "").strip() or now_iso
+        finished_value = str(finished_at or "").strip()
+        if not finished_value:
+            finished_value = str(record.finished_at or "").strip() or now_iso
+
+        safe_duration = _safe_duration_seconds(
+            started_at=started_value,
+            finished_at=finished_value,
+            duration_seconds=duration_seconds,
+        )
+        if (
+            duration_seconds is None
+            and not str(started_at or "").strip()
+            and not str(finished_at or "").strip()
+            and record.duration_seconds is not None
+        ):
+            safe_duration = float(record.duration_seconds)
+
+        record.component = normalized_component
+        record.flow_name = normalized_flow_name
+        record.category = normalized_category
+        record.status = normalized_status
+        record.started_at = started_value
+        record.finished_at = finished_value
+        record.duration_seconds = safe_duration
+        record.git_sha = normalized_git_sha
+        record.environment = normalized_environment
+        record.mode = normalized_mode
+        record.metadata_json = normalized_metadata
+        record.error_summary = normalized_error
+        record.evidence_ref = normalized_evidence_ref
+        record.manual_validation_required = bool(manual_validation_required)
+        record.source = normalized_source
+        record.updated_at = now_iso
+        if not str(record.created_at or "").strip():
+            record.created_at = now_iso
+
+        session.add(record)
+        session.commit()
+        session.refresh(record)
+        payload = _serialize_verification_evidence(record)
+    return VerificationEvidenceRecord.model_validate(payload)
+
+
+def list_verification_evidence_records(
+    *,
+    component: str | None = None,
+    category: str | None = None,
+    status: VerificationEvidenceStatus | str | None = None,
+    limit: int = 200,
+) -> list[VerificationEvidenceRecord]:
+    init_db()
+    try:
+        bounded_limit = max(1, min(int(limit), 2000))
+    except (TypeError, ValueError):
+        bounded_limit = 200
+
+    normalized_component = str(component or "").strip()
+    normalized_category = str(category or "").strip().lower()
+    normalized_status = (
+        _normalize_evidence_status(status.value if isinstance(status, VerificationEvidenceStatus) else str(status))
+        if status is not None and str(status).strip()
+        else ""
+    )
+
+    with get_session() as session:
+        statement = select(VerificationEvidenceModel)
+        if normalized_component:
+            statement = statement.where(VerificationEvidenceModel.component == normalized_component)
+        if normalized_category:
+            statement = statement.where(VerificationEvidenceModel.category == normalized_category)
+        if normalized_status:
+            statement = statement.where(VerificationEvidenceModel.status == normalized_status)
+        rows = session.exec(
+            statement.order_by(
+                VerificationEvidenceModel.finished_at.desc(),
+                VerificationEvidenceModel.started_at.desc(),
+                VerificationEvidenceModel.updated_at.desc(),
+            ).limit(bounded_limit)
+        ).all()
+
+    payload: list[VerificationEvidenceRecord] = []
+    for row in rows:
+        if not isinstance(row, VerificationEvidenceModel):
+            continue
+        payload.append(VerificationEvidenceRecord.model_validate(_serialize_verification_evidence(row)))
+    return payload
+
+
+def list_verification_evidence_summary(
+    *,
+    component: str | None = None,
+    category: str | None = None,
+    limit: int = 200,
+) -> list[dict[str, Any]]:
+    records = list_verification_evidence_records(
+        component=component,
+        category=category,
+        limit=max(limit * 20, 400),
+    )
+    grouped: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for record in records:
+        key = (record.component, record.flow_name, record.category)
+        bucket = grouped.get(key)
+        if bucket is None:
+            bucket = {
+                "component": record.component,
+                "flow_name": record.flow_name,
+                "category": record.category,
+                "run_count": 0,
+                "success_count": 0,
+                "failed_count": 0,
+                "partial_count": 0,
+                "skipped_count": 0,
+                "last_status": record.status.value,
+                "last_run_at": record.finished_at or record.started_at or record.updated_at,
+                "last_success_at": "",
+                "last_error": "",
+                "latest_git_sha": record.git_sha,
+                "latest_environment": record.environment,
+                "latest_mode": record.mode,
+                "manual_validation_required": bool(record.manual_validation_required),
+            }
+            grouped[key] = bucket
+        bucket["run_count"] += 1
+        bucket[f"{record.status.value}_count"] += 1
+        bucket["manual_validation_required"] = bool(bucket["manual_validation_required"]) or bool(
+            record.manual_validation_required
+        )
+        if record.status == VerificationEvidenceStatus.SUCCESS and not bucket["last_success_at"]:
+            bucket["last_success_at"] = record.finished_at or record.started_at or record.updated_at
+        if not bucket["last_error"] and record.error_summary:
+            bucket["last_error"] = record.error_summary
+
+    items = list(grouped.values())
+    items.sort(key=lambda item: str(item.get("last_run_at") or ""), reverse=True)
+    bounded = max(1, min(int(limit), 2000))
+    return items[:bounded]
+
+
+def _task_status_to_evidence_status(task_status: str) -> str:
+    return _TASK_STATUS_TO_EVIDENCE_STATUS.get(
+        str(task_status or "").strip().lower(),
+        VerificationEvidenceStatus.SKIPPED.value,
+    )
+
+
+def _task_requires_manual_validation(category: str) -> bool:
+    normalized = str(category or "").strip().lower()
+    if not normalized:
+        return False
+    return normalized in _MANUAL_VALIDATION_CATEGORIES
+
+
+def _record_verification_evidence_for_task(
+    *,
+    task_id: str,
+    task_type: str,
+    status: str,
+    config_json: dict[str, Any],
+    progress_message: str,
+    name: str,
+    description: str,
+    source: str,
+    created_at: str,
+    updated_at: str,
+) -> None:
+    category = str(config_json.get("category") or task_type or "task").strip().lower()
+    evidence_status = _task_status_to_evidence_status(status)
+    started_at = str(config_json.get("started_at") or created_at or "").strip()
+    finished_at = str(config_json.get("finished_at") or updated_at or "").strip()
+    error_summary = ""
+    if evidence_status in {VerificationEvidenceStatus.FAILED.value, VerificationEvidenceStatus.PARTIAL.value}:
+        error_summary = str(config_json.get("error") or progress_message or "").strip()
+
+    metadata = {
+        "task_id": task_id,
+        "task_type": task_type,
+        "task_status": status,
+        "task_name": name,
+        "task_description": description,
+        "task_source": source,
+        "progress_message": progress_message,
+        "total_items": config_json.get("total_items"),
+        "result": config_json.get("result"),
+    }
+    evidence_ref = str(config_json.get("log_file") or "").strip()
+    upsert_verification_evidence(
+        run_id=f"task:{task_id}",
+        component=str(source or task_type or category or "task").strip().lower(),
+        flow_name=str(name or task_type or "background-task").strip(),
+        category=category or "task",
+        status=evidence_status,
+        started_at=started_at or created_at,
+        finished_at=finished_at or updated_at,
+        duration_seconds=config_json.get("duration_seconds"),
+        mode=str(config_json.get("control_mode") or "").strip().lower(),
+        metadata=metadata,
+        error_summary=error_summary or None,
+        evidence_ref=evidence_ref or None,
+        manual_validation_required=_task_requires_manual_validation(category),
+        source=source or "task",
+    )
+
+
 def upsert_background_task_record(
     *,
     task_id: str,
@@ -1642,6 +2055,27 @@ def upsert_background_task_record(
             record.updated_at = updated_value
         session.add(record)
         session.commit()
+
+    if normalized_status in _FINAL_TASK_STATUSES:
+        try:
+            _record_verification_evidence_for_task(
+                task_id=normalized_id,
+                task_type=normalized_type,
+                status=normalized_status,
+                config_json=normalized_config,
+                progress_message=str(progress_message or ""),
+                name=str(name or ""),
+                description=str(description or ""),
+                source=str(source or ""),
+                created_at=created_value,
+                updated_at=updated_value,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to record verification evidence for task %s: %s",
+                normalized_id,
+                exc,
+            )
 
 
 def get_background_task_record(task_id: str) -> dict[str, Any] | None:

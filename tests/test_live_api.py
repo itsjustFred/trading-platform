@@ -452,6 +452,115 @@ def test_services_crud_and_logs_endpoints(monkeypatch):
     assert delete_response.json()["status"] == "deleted"
 
 
+def test_verification_evidence_endpoints(monkeypatch):
+    import viewer.main as viewer_main_module
+
+    record = {
+        "id": "evidence-1",
+        "run_id": "task:abc",
+        "component": "scheduler",
+        "flow_name": "weekly refresh",
+        "category": "service",
+        "status": "success",
+        "started_at": "2026-04-19T10:00:00+00:00",
+        "finished_at": "2026-04-19T10:00:05+00:00",
+        "duration_seconds": 5.0,
+        "git_sha": "deadbeef",
+        "environment": "local",
+        "mode": "thread",
+        "metadata": {"task_id": "abc"},
+        "error_summary": None,
+        "evidence_ref": "/tmp/task.log",
+        "manual_validation_required": True,
+        "source": "scheduler",
+        "created_at": "2026-04-19T10:00:05+00:00",
+        "updated_at": "2026-04-19T10:00:05+00:00",
+    }
+    summary = {
+        "component": "scheduler",
+        "flow_name": "weekly refresh",
+        "category": "service",
+        "run_count": 3,
+        "success_count": 2,
+        "failed_count": 1,
+        "partial_count": 0,
+        "skipped_count": 0,
+        "last_status": "success",
+        "last_run_at": "2026-04-19T10:00:05+00:00",
+        "last_success_at": "2026-04-19T10:00:05+00:00",
+        "last_error": "",
+        "latest_git_sha": "deadbeef",
+        "latest_environment": "local",
+        "latest_mode": "thread",
+        "manual_validation_required": True,
+    }
+
+    captured: dict[str, object] = {}
+
+    def _list_records(**_kwargs):
+        return [record]
+
+    def _list_summary(**_kwargs):
+        return [summary]
+
+    def _upsert(**kwargs):
+        captured.update(kwargs)
+        created = dict(record)
+        created.update(
+            {
+                "component": kwargs["component"],
+                "flow_name": kwargs["flow_name"],
+                "category": kwargs["category"],
+                "status": kwargs["status"],
+                "metadata": dict(kwargs.get("metadata") or {}),
+                "source": kwargs.get("source", ""),
+                "manual_validation_required": bool(kwargs.get("manual_validation_required")),
+            }
+        )
+        return created
+
+    monkeypatch.setattr(viewer_main_module, "list_verification_evidence_records", _list_records)
+    monkeypatch.setattr(viewer_main_module, "list_verification_evidence_summary", _list_summary)
+    monkeypatch.setattr(viewer_main_module, "upsert_verification_evidence", _upsert)
+
+    client = TestClient(viewer_main_module.app)
+
+    list_response = client.get("/api/verification/evidence?component=scheduler&limit=10")
+    assert list_response.status_code == 200
+    listed = list_response.json()
+    assert len(listed) == 1
+    assert listed[0]["component"] == "scheduler"
+    assert listed[0]["status"] == "success"
+
+    summary_response = client.get("/api/verification/evidence/summary?component=scheduler")
+    assert summary_response.status_code == 200
+    summaries = summary_response.json()
+    assert len(summaries) == 1
+    assert summaries[0]["run_count"] == 3
+    assert summaries[0]["failed_count"] == 1
+
+    create_response = client.post(
+        "/api/verification/evidence",
+        json={
+            "component": "discord",
+            "flow_name": "auth-check",
+            "category": "discord",
+            "status": "partial",
+            "metadata": {"bot": "RAMJET"},
+            "manual_validation_required": True,
+            "source": "manual-validation",
+            "run_id": "discord:auth-check:1",
+        },
+    )
+    assert create_response.status_code == 201
+    created = create_response.json()
+    assert created["component"] == "discord"
+    assert created["flow_name"] == "auth-check"
+    assert created["status"] == "partial"
+    assert created["metadata"]["bot"] == "RAMJET"
+    assert captured["run_id"] == "discord:auth-check:1"
+
+
 def test_live_stats_endpoint_returns_defaults_for_missing_data(monkeypatch):
     import viewer.main as viewer_main_module
 

@@ -1,3 +1,8 @@
+---
+name: review-commit-merge-agent
+description: PR Review und Remediation Orchestrator mit verbindlichen Quality Gates, Review-Gates und Merge-Entscheidung.
+---
+
 # PR Review & Remediation Orchestrator (Verbindliches Gesetz)
 
 Dieses Dokument ist bindend. Bei Trigger dieses Agents gilt **immer** dieser Ablauf ohne Ausnahmen.

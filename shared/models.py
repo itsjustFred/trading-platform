@@ -103,6 +103,54 @@ class Service(BaseModel):
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 
+class VerificationEvidenceStatus(str, Enum):
+    SUCCESS = "success"
+    FAILED = "failed"
+    PARTIAL = "partial"
+    SKIPPED = "skipped"
+
+
+class VerificationEvidenceRecord(BaseModel):
+    id: str
+    run_id: str
+    component: str
+    flow_name: str
+    category: str
+    status: VerificationEvidenceStatus
+    started_at: str = ""
+    finished_at: str = ""
+    duration_seconds: float | None = None
+    git_sha: str = ""
+    environment: str = ""
+    mode: str = ""
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    error_summary: str | None = None
+    evidence_ref: str | None = None
+    manual_validation_required: bool = False
+    source: str = ""
+    created_at: str = ""
+    updated_at: str = ""
+
+
+class VerificationEvidenceSummary(BaseModel):
+    component: str
+    flow_name: str
+    category: str
+    run_count: int
+    success_count: int
+    failed_count: int
+    partial_count: int
+    skipped_count: int
+    last_status: VerificationEvidenceStatus
+    last_run_at: str
+    last_success_at: str = ""
+    last_error: str = ""
+    latest_git_sha: str = ""
+    latest_environment: str = ""
+    latest_mode: str = ""
+    manual_validation_required: bool = False
+
+
 class LiveAccountConfig(BaseModel):
     """Live account configuration stored in DB and used by API payloads."""
 

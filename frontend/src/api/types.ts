@@ -409,6 +409,7 @@ export type LiveDeploymentStatus = "ACTIVE" | "PAUSED" | "STOPPED";
 export type LiveSignalSource = "internal" | "discord";
 export type ServiceType = "discord_bot" | "scheduled_job";
 export type ServiceStatus = "running" | "paused" | "failed" | "stopped";
+export type VerificationEvidenceStatus = "success" | "failed" | "partial" | "skipped";
 
 export interface Service {
   id: string;
@@ -418,6 +419,66 @@ export interface Service {
   config: Record<string, unknown>;
   last_activity?: string | null;
   created_at: string;
+}
+
+export interface VerificationEvidenceRecord {
+  id: string;
+  run_id: string;
+  component: string;
+  flow_name: string;
+  category: string;
+  status: VerificationEvidenceStatus;
+  started_at: string;
+  finished_at: string;
+  duration_seconds?: number | null;
+  git_sha: string;
+  environment: string;
+  mode: string;
+  metadata: Record<string, unknown>;
+  error_summary?: string | null;
+  evidence_ref?: string | null;
+  manual_validation_required: boolean;
+  source: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface VerificationEvidenceSummary {
+  component: string;
+  flow_name: string;
+  category: string;
+  run_count: number;
+  success_count: number;
+  failed_count: number;
+  partial_count: number;
+  skipped_count: number;
+  last_status: VerificationEvidenceStatus;
+  last_run_at: string;
+  last_success_at: string;
+  last_error: string;
+  latest_git_sha: string;
+  latest_environment: string;
+  latest_mode: string;
+  manual_validation_required: boolean;
+}
+
+export interface VerificationEvidenceCreateRequest {
+  component: string;
+  flow_name: string;
+  category: string;
+  status: VerificationEvidenceStatus;
+  started_at?: string;
+  finished_at?: string;
+  duration_seconds?: number;
+  git_sha?: string;
+  environment?: string;
+  mode?: string;
+  metadata?: Record<string, unknown>;
+  error_summary?: string;
+  evidence_ref?: string;
+  manual_validation_required?: boolean;
+  source?: string;
+  run_id?: string;
 }
 
 export interface SignalProcessorOption {

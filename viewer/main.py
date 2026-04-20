@@ -68,6 +68,8 @@ from shared.models import (
     Service,
     ServiceStatus,
     ServiceType,
+    VerificationEvidenceRecord,
+    VerificationEvidenceSummary,
     Portfolio as PortfolioModel,
     PortfolioComponent as PortfolioComponentModel,
 )
@@ -88,6 +90,8 @@ from shared.database import (
     list_backtest_fingerprint_rows,
     list_backtest_metadata_rows,
     list_portfolios as list_portfolio_records,
+    list_verification_evidence_records,
+    list_verification_evidence_summary,
     list_background_task_records,
     list_live_accounts,
     list_live_balances,
@@ -107,6 +111,7 @@ from shared.database import (
     migrate_json_to_sqlite,
     save_result_to_sqlite,
     save_portfolio as save_portfolio_record,
+    upsert_verification_evidence,
     upsert_background_task_record,
     create_service,
     delete_service,
@@ -655,6 +660,25 @@ class ServiceCreateRequest(SQLModel):
 
 class ServiceStatusUpdateRequest(SQLModel):
     status: Literal["running", "paused", "failed", "stopped"]
+
+
+class VerificationEvidenceCreateRequest(SQLModel):
+    component: str
+    flow_name: str
+    category: str
+    status: Literal["success", "failed", "partial", "skipped"]
+    started_at: str | None = None
+    finished_at: str | None = None
+    duration_seconds: float | None = None
+    git_sha: str | None = None
+    environment: str | None = None
+    mode: str | None = None
+    evidence_metadata: dict[str, Any] = PydanticField(default_factory=dict, alias="metadata")
+    error_summary: str | None = None
+    evidence_ref: str | None = None
+    manual_validation_required: bool = False
+    source: str = ""
+    run_id: str | None = None
 
 
 class BacktestRunRequest(SQLModel):
@@ -8201,6 +8225,74 @@ async def get_service_logs_endpoint(
     except Exception as exc:
         logger.exception("Failed to load service logs for %s: %s", service_id, exc)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/verification/evidence", response_model=list[VerificationEvidenceRecord])
+async def get_verification_evidence(
+    component: str = Query(default=""),
+    category: str = Query(default=""),
+    status: str = Query(default=""),
+    limit: int = Query(default=200, ge=1, le=2000),
+) -> list[VerificationEvidenceRecord]:
+    try:
+        return await asyncio.to_thread(
+            list_verification_evidence_records,
+            component=str(component or "").strip() or None,
+            category=str(category or "").strip() or None,
+            status=str(status or "").strip() or None,
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/verification/evidence/summary", response_model=list[VerificationEvidenceSummary])
+async def get_verification_evidence_summary(
+    component: str = Query(default=""),
+    category: str = Query(default=""),
+    limit: int = Query(default=200, ge=1, le=2000),
+) -> list[VerificationEvidenceSummary]:
+    try:
+        return await asyncio.to_thread(
+            list_verification_evidence_summary,
+            component=str(component or "").strip() or None,
+            category=str(category or "").strip() or None,
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post(
+    "/api/verification/evidence",
+    response_model=VerificationEvidenceRecord,
+    status_code=201,
+)
+async def create_verification_evidence(
+    payload: VerificationEvidenceCreateRequest,
+) -> VerificationEvidenceRecord:
+    try:
+        return await asyncio.to_thread(
+            upsert_verification_evidence,
+            component=str(payload.component or "").strip(),
+            flow_name=str(payload.flow_name or "").strip(),
+            category=str(payload.category or "").strip(),
+            status=payload.status,
+            started_at=payload.started_at,
+            finished_at=payload.finished_at,
+            duration_seconds=payload.duration_seconds,
+            git_sha=payload.git_sha,
+            environment=payload.environment,
+            mode=payload.mode,
+            metadata=dict(payload.evidence_metadata or {}),
+            error_summary=payload.error_summary,
+            evidence_ref=payload.evidence_ref,
+            manual_validation_required=payload.manual_validation_required,
+            source=payload.source,
+            run_id=payload.run_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/live/deployments", response_model=list[dict[str, Any]])
