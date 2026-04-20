@@ -15,6 +15,11 @@ Ziel: uncommittete Aenderungen (oder Diff seit letztem Commit) rigoros pruefen, 
 - **CodeRabbit:** max. **3 Reviews/Stunde**. Darf **erst nach gruener interner Qualitaet** aufgerufen werden.
 - **Qodo:** max. **30 Reviews/Monat**. Darf **pro PR exakt einmal** aufgerufen werden.
 
+## Globales Review+Fix-Loop-Prinzip
+- Jede Findings-Runde folgt strikt diesem Muster: **fixen -> lokale Custom-Review (Test/Integration/Ops) -> relevante lokale Checks -> CodeRabbit -> ggf. erneut fixen -> committen/pushen -> PR-Text/Labels aktualisieren**.
+- Ein Push auf den PR-Branch aktualisiert die bestehende PR automatisch. Danach PR-Beschreibung/Status aktiv mit `gh pr edit` nachziehen.
+- Qodo wird niemals ein zweites Mal fuer dieselbe PR getriggert.
+
 ---
 
 ## Phase 1: Diff-Analyse & Subagent-Skills
@@ -40,28 +45,49 @@ Ziel: uncommittete Aenderungen (oder Diff seit letztem Commit) rigoros pruefen, 
 
 ## Phase 4: Commit & PR-Erstellung
 1. Finalen Stand committen.
-2. PR via GitHub CLI erstellen: `gh pr create`
+2. PR via GitHub CLI erstellen: `gh pr create --base dev` (sofern vom User nicht anders verlangt, immer von der aktuellen Branch gegen `dev` erstellen).
 3. PR-Description **muss enthalten**:
-   - Saubere Zusammenfassung der Aenderungen
+   - Ausgangsproblem und Zielbild
+   - Konkrete Aenderungen nach Bereichen (Backend/Frontend/Jobs/Risk etc.)
+   - Testnachweise (ausgefuehrte Befehle + Ergebnis)
+   - Risiko-/Impact-Einschaetzung und ggf. Rollback-Hinweis
    - Links zu relevanten Issues
    - Hinweis, falls manuelles Testen (Broker, cTrader, Discord-Live) zwingend noetig ist
+   - Review-Status-Sektion (CodeRabbit/Qodo/Human Follow-up)
+4. Wenn bereits eine PR existiert: keine neue PR erzeugen, sondern bestehende PR mit `gh pr edit` (Title/Body/Labels) aktualisieren.
 
 ## Phase 5: Einmaliges Qodo-Gate
-1. Qodo-Review fuer die offene PR triggern/lesen (**genau einmal pro PR**).
+1. Qodo-Review manuell für die offene PR triggern: per GitHub CLI einen Kommentar mit dem exakten Text `/agentic_review` auf der PR abgeben (z.B. `gh pr comment --body "/agentic_review"`). Dann Zeit geben und das Feedback auslesen (**genau einmal pro PR**).
 2. Entscheidung:
    - **Fall A (alles gut):** Label **Ready for Merge**
-   - **Fall B (kleine Fehler/Nits):** lokal fixen, committen, auf PR pushen, dann **Ready for Merge**; **Qodo nicht erneut aufrufen**
-   - **Fall C (kritische Architektur/Logik):** sofort stoppen, Label **Human Intervention Needed**, kritisches Problem im Chat melden
+   - **Fall B (kleine Fehler/Nits):**
+       1. Findings lokal fixen.
+       2. Custom-Review lokal durchfuehren (Test/Integration/Ops) + relevante lokale Checks erneut ausfuehren.
+       3. CodeRabbit erneut laufen lassen (Budget beachten), Findings ggf. einmal nachfixen.
+       4. Committen und pushen; damit wird die bestehende PR aktualisiert.
+       5. PR-Beschreibung aktualisieren mit Status: **"Qodo Findings fixed, not re-reviewed by Qodo"**.
+       6. Label setzen: bevorzugt **Fixed - Not Re-reviewed** (oder naechstes vorhandenes Human-Review-Label). **Nicht** als fully reviewed markieren.
+   - **Fall C (kritische Architektur/Logik):**
+       1. Kritische Findings zuerst lokal fixen (kein Merge ohne Fix).
+       2. Vertiefte lokale Review + relevante Checks erneut ausfuehren.
+       3. CodeRabbit laufen lassen, Findings ggf. nachfixen.
+       4. Committen und pushen; PR dadurch aktualisieren.
+       5. PR-Beschreibung aktualisieren mit Status: **"Critical finding fixed, but not re-reviewed by Qodo"** + kurze Risiko-Notiz.
+       6. Label setzen: bevorzugt **Critical Fix - Not Re-reviewed** (oder naechstes vorhandenes Eskalations-Label), und im Chat klar als frueher kritischer Bug markieren.
+       7. Menschliche Nachreview verpflichtend; nicht als reviewed/merge-ready markieren.
 
 ## Phase 6: PR-Tagging & Abschluss
 1. Labels mit GitHub CLI verwalten (`gh pr edit --add-label ...`).
-2. Verwendete Labels:
+2. Vor Labeling vorhandene Labels prüfen (`gh label list`) und bevorzugte Labels in dieser Reihenfolge anwenden:
    - `Ready for Merge`
+   - `Fixed - Not Re-reviewed`
+   - `Critical Fix - Not Re-reviewed`
    - `Human Testing Needed`
    - `Needs Human Fix`
-3. Lauf mit kurzem Markdown-Summary im Chat abschliessen.
+3. Wenn ein bevorzugtes Label nicht existiert: semantisch naechstes vorhandenes Label verwenden. Nur wenn Repo-Policy es erlaubt, neues Label anlegen.
+4. Lauf mit kurzem Markdown-Summary im Chat abschliessen (inkl. was gefixt wurde, welcher Review-Status gilt, und ob Human-Re-Review offen ist).
 
 ---
 
 ## Trigger-Vertrag
-Wenn der User den Orchestrator startet, wird automatisch mit Phase 1 begonnen und der gesamte Ablauf bis zum Abschluss durchgezogen, ausser ein harter Stop-Fall (Phase 5C) tritt ein.
+Wenn der User den Orchestrator startet, wird automatisch mit Phase 1 begonnen und der gesamte Ablauf bis zum Abschluss durchgezogen. Bei Phase 5C wird ebenfalls gefixt und aktualisiert, aber mit verpflichtender menschlicher Nachreview abgeschlossen (kein "reviewed"-Abschluss).
