@@ -29,6 +29,7 @@ export interface TradeTableRow {
 interface TradeTableProps {
   trades: TradeTableRow[];
   onTradeClick?: (trade: TradeTableRow) => void;
+  showSignalColumns?: boolean;
 }
 
 function toFiniteNumber(value: unknown): number | null {
@@ -119,157 +120,165 @@ const pnlCellStyle = (value: unknown) => {
   };
 };
 
-export function TradeTable({ trades, onTradeClick }: TradeTableProps) {
+export function TradeTable({ trades, onTradeClick, showSignalColumns = false }: TradeTableProps) {
   const columnDefs = useMemo<ColDef<TradeTableRow>[]>(
-    () => [
-      {
-        field: "date",
-        headerName: "Date",
-        minWidth: 120,
-        flex: 0.8,
-        valueFormatter: (params: ValueFormatterParams<TradeTableRow>) =>
-          formatDate(String(params.value ?? "")),
-      },
-      {
-        field: "time",
-        headerName: "Time",
-        minWidth: 110,
-        flex: 0.8,
-        valueFormatter: (params: ValueFormatterParams<TradeTableRow>) =>
-          formatTimestamp(String(params.value ?? "")),
-      },
-      {
-        field: "strategy",
-        headerName: "Strategy",
-        minWidth: 220,
-        flex: 1.4,
-        valueFormatter: (params: ValueFormatterParams<TradeTableRow>) =>
-          String(params.value ?? "").trim() || "—",
-      },
-      {
-        field: "symbol",
-        headerName: "Symbol",
-        minWidth: 110,
-        flex: 0.8,
-        valueFormatter: (params: ValueFormatterParams<TradeTableRow>) =>
-          String(params.value ?? "").toUpperCase(),
-      },
-      {
-        field: "side",
-        headerName: "Side",
-        minWidth: 100,
-        flex: 0.7,
-        valueFormatter: (params: ValueFormatterParams<TradeTableRow>) =>
-          String(params.value ?? "").toUpperCase(),
-      },
-      {
-        field: "signalSource",
-        headerName: "Signal Source",
-        minWidth: 150,
-        flex: 1.1,
-        valueFormatter: (params: ValueFormatterParams<TradeTableRow>) =>
-          String(params.value ?? "").trim() || "—",
-      },
-      {
-        field: "signalTime",
-        headerName: "Signal Time",
-        minWidth: 150,
-        flex: 1.05,
-        valueFormatter: (params: ValueFormatterParams<TradeTableRow>) =>
-          formatTimestamp(String(params.value ?? "")),
-      },
-      {
-        field: "fillLagSec",
-        headerName: "Fill Lag",
-        minWidth: 105,
-        flex: 0.8,
-        type: "numericColumn",
-        valueFormatter: (params: ValueFormatterParams<TradeTableRow>) =>
-          formatLag(params.value),
-      },
-      {
-        field: "size",
-        headerName: "Size",
-        minWidth: 120,
-        flex: 0.9,
-        type: "numericColumn",
-        valueFormatter: (params: ValueFormatterParams<TradeTableRow>) =>
-          formatNumber(params.value, 4),
-      },
-      {
-        field: "entryPrice",
-        headerName: "Entry Price",
-        minWidth: 130,
-        flex: 0.95,
-        type: "numericColumn",
-        valueFormatter: (params: ValueFormatterParams<TradeTableRow>) =>
-          formatPrice(params.value),
-      },
-      {
-        field: "exitPrice",
-        headerName: "Exit Price",
-        minWidth: 130,
-        flex: 0.95,
-        type: "numericColumn",
-        valueFormatter: (params: ValueFormatterParams<TradeTableRow>) =>
-          formatPrice(params.value),
-      },
-      {
-        field: "processorStopLoss",
-        headerName: "Signal SL",
-        minWidth: 120,
-        flex: 0.9,
-        type: "numericColumn",
-        valueFormatter: (params: ValueFormatterParams<TradeTableRow>) =>
-          formatPrice(params.value),
-      },
-      {
-        field: "processorTakeProfit",
-        headerName: "Signal TP",
-        minWidth: 120,
-        flex: 0.9,
-        type: "numericColumn",
-        valueFormatter: (params: ValueFormatterParams<TradeTableRow>) =>
-          formatPrice(params.value),
-      },
-      {
-        field: "exitReason",
-        headerName: "Exit Reason",
-        minWidth: 180,
-        flex: 1.2,
-        valueFormatter: (params: ValueFormatterParams<TradeTableRow>) =>
-          String(params.value ?? "").trim() || "—",
-      },
-      {
-        field: "duration",
-        headerName: "Duration",
-        minWidth: 120,
-        flex: 0.9,
-        valueFormatter: (params: ValueFormatterParams<TradeTableRow>) =>
-          String(params.value ?? "").trim() || "—",
-      },
-      {
-        field: "pnl",
-        headerName: "P&L",
-        minWidth: 120,
-        flex: 0.95,
-        type: "numericColumn",
-        valueFormatter: (params: ValueFormatterParams<TradeTableRow>) =>
-          formatPnl(params.value),
-        cellStyle: (params) => pnlCellStyle(params.value),
-      },
-      {
-        field: "pnlPct",
-        headerName: "P&L%",
-        minWidth: 105,
-        flex: 0.8,
-        type: "numericColumn",
-        valueFormatter: (params: ValueFormatterParams<TradeTableRow>) =>
-          formatPercent(params.value),
-        cellStyle: (params) => pnlCellStyle(params.value),
-      },
-    ],
-    [],
+    () => {
+      const signalColumns: ColDef<TradeTableRow>[] = showSignalColumns
+        ? [
+            {
+              field: "signalSource",
+              headerName: "Signal Source",
+              minWidth: 150,
+              flex: 1.1,
+              valueFormatter: (params: ValueFormatterParams<TradeTableRow>) =>
+                String(params.value ?? "").trim() || "—",
+            },
+            {
+              field: "signalTime",
+              headerName: "Signal Time",
+              minWidth: 150,
+              flex: 1.05,
+              valueFormatter: (params: ValueFormatterParams<TradeTableRow>) =>
+                formatTimestamp(String(params.value ?? "")),
+            },
+            {
+              field: "fillLagSec",
+              headerName: "Fill Lag",
+              minWidth: 105,
+              flex: 0.8,
+              type: "numericColumn",
+              valueFormatter: (params: ValueFormatterParams<TradeTableRow>) =>
+                formatLag(params.value),
+            },
+          ]
+        : [];
+
+      return [
+        {
+          field: "date",
+          headerName: "Date",
+          minWidth: 120,
+          flex: 0.8,
+          valueFormatter: (params: ValueFormatterParams<TradeTableRow>) =>
+            formatDate(String(params.value ?? "")),
+        },
+        {
+          field: "time",
+          headerName: "Time",
+          minWidth: 110,
+          flex: 0.8,
+          valueFormatter: (params: ValueFormatterParams<TradeTableRow>) =>
+            formatTimestamp(String(params.value ?? "")),
+        },
+        {
+          field: "strategy",
+          headerName: "Strategy",
+          minWidth: 220,
+          flex: 1.4,
+          valueFormatter: (params: ValueFormatterParams<TradeTableRow>) =>
+            String(params.value ?? "").trim() || "—",
+        },
+        {
+          field: "symbol",
+          headerName: "Symbol",
+          minWidth: 110,
+          flex: 0.8,
+          valueFormatter: (params: ValueFormatterParams<TradeTableRow>) =>
+            String(params.value ?? "").toUpperCase(),
+        },
+        {
+          field: "side",
+          headerName: "Side",
+          minWidth: 100,
+          flex: 0.7,
+          valueFormatter: (params: ValueFormatterParams<TradeTableRow>) =>
+            String(params.value ?? "").toUpperCase(),
+        },
+        ...signalColumns,
+        {
+          field: "size",
+          headerName: "Size",
+          minWidth: 120,
+          flex: 0.9,
+          type: "numericColumn",
+          valueFormatter: (params: ValueFormatterParams<TradeTableRow>) =>
+            formatNumber(params.value, 4),
+        },
+        {
+          field: "entryPrice",
+          headerName: "Entry Price",
+          minWidth: 130,
+          flex: 0.95,
+          type: "numericColumn",
+          valueFormatter: (params: ValueFormatterParams<TradeTableRow>) =>
+            formatPrice(params.value),
+        },
+        {
+          field: "exitPrice",
+          headerName: "Exit Price",
+          minWidth: 130,
+          flex: 0.95,
+          type: "numericColumn",
+          valueFormatter: (params: ValueFormatterParams<TradeTableRow>) =>
+            formatPrice(params.value),
+        },
+        {
+          field: "processorStopLoss",
+          headerName: "Signal SL",
+          minWidth: 120,
+          flex: 0.9,
+          type: "numericColumn",
+          valueFormatter: (params: ValueFormatterParams<TradeTableRow>) =>
+            formatPrice(params.value),
+        },
+        {
+          field: "processorTakeProfit",
+          headerName: "Signal TP",
+          minWidth: 120,
+          flex: 0.9,
+          type: "numericColumn",
+          valueFormatter: (params: ValueFormatterParams<TradeTableRow>) =>
+            formatPrice(params.value),
+        },
+        {
+          field: "exitReason",
+          headerName: "Exit Reason",
+          minWidth: 180,
+          flex: 1.2,
+          valueFormatter: (params: ValueFormatterParams<TradeTableRow>) =>
+            String(params.value ?? "").trim() || "—",
+        },
+        {
+          field: "duration",
+          headerName: "Duration",
+          minWidth: 120,
+          flex: 0.9,
+          valueFormatter: (params: ValueFormatterParams<TradeTableRow>) =>
+            String(params.value ?? "").trim() || "—",
+        },
+        {
+          field: "pnl",
+          headerName: "P&L",
+          minWidth: 120,
+          flex: 0.95,
+          type: "numericColumn",
+          valueFormatter: (params: ValueFormatterParams<TradeTableRow>) =>
+            formatPnl(params.value),
+          cellStyle: (params) => pnlCellStyle(params.value),
+        },
+        {
+          field: "pnlPct",
+          headerName: "P&L%",
+          minWidth: 105,
+          flex: 0.8,
+          type: "numericColumn",
+          valueFormatter: (params: ValueFormatterParams<TradeTableRow>) =>
+            formatPercent(params.value),
+          cellStyle: (params) => pnlCellStyle(params.value),
+        },
+      ];
+    },
+    [showSignalColumns],
   );
 
   return (

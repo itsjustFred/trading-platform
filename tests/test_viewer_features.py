@@ -3171,18 +3171,7 @@ def test_agent_convert_endpoint_rejects_unknown_provider(viewer_client):
     assert "Unsupported provider" in str(resp.json().get("detail"))
 
 
-def test_agent_convert_endpoint_accepts_copilot_cli_provider(viewer_client, monkeypatch):
-    import viewer.main as viewer_app_module
-
-    captured: dict[str, object] = {}
-
-    def fake_queue(task_id: str, payload: dict) -> dict:
-        captured["payload"] = payload
-        return {"job_id": task_id, "task_id": task_id, "status": "starting"}
-
-    monkeypatch.setattr(viewer_app_module, "_queue_agent_task", fake_queue)
-    monkeypatch.setattr(viewer_app_module, "_launch_agent_task", lambda task_id, payload: None)
-
+def test_agent_convert_endpoint_rejects_copilot_cli_provider(viewer_client):
     resp = viewer_client.post(
         "/api/agent/convert",
         json={
@@ -3191,9 +3180,8 @@ def test_agent_convert_endpoint_accepts_copilot_cli_provider(viewer_client, monk
         },
     )
 
-    assert resp.status_code == 202
-    assert captured["payload"]["provider"] == "copilot_cli"
-    assert captured["payload"]["model"] is None
+    assert resp.status_code == 400
+    assert "Unsupported provider" in str(resp.json().get("detail"))
 
 
 def test_equity_endpoint_rebuilds_curve_from_trades(viewer_client, tmp_path):

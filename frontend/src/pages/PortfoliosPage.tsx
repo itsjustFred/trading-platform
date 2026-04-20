@@ -71,6 +71,8 @@ const PortfolioCard = memo(function PortfolioCard({
   onOpen: (id: string) => void;
   onDelete: (id: string, event: React.MouseEvent) => void;
 }) {
+  const componentCount = Number(portfolio.strategy_count || 0);
+  const hasComponents = componentCount > 0;
   return (
     <div
       onClick={() => onOpen(portfolio.id)}
@@ -113,83 +115,91 @@ const PortfolioCard = memo(function PortfolioCard({
           marginTop: "4px",
         }}
       >
-        {portfolio.strategy_count || 0} components • ${(portfolio.account_capital || 100000).toLocaleString()}
+        {hasComponents
+          ? `${componentCount} components • $${(portfolio.account_capital || 100000).toLocaleString()}`
+          : `No components • $${(portfolio.account_capital || 100000).toLocaleString()}`}
       </div>
       {portfolio.equity_mini && portfolio.equity_mini.length > 1 && (
         <div style={{ margin: "6px 0" }}>
           <Sparkline data={portfolio.equity_mini} width={260} height={44} />
         </div>
       )}
-      <div
-        style={{
-          display: "flex",
-          gap: "8px",
-          fontSize: "0.7rem",
-          color: "var(--color-text-muted)",
-          flexWrap: "wrap",
-        }}
-      >
-        {portfolio.sharpe !== 0 && (
+      {hasComponents ? (
+        <div
+          style={{
+            display: "flex",
+            gap: "8px",
+            fontSize: "0.7rem",
+            color: "var(--color-text-muted)",
+            flexWrap: "wrap",
+          }}
+        >
+          {portfolio.sharpe !== 0 && (
+            <span>
+              Sharpe (higher = better){" "}
+              <b style={{ color: portfolio.sharpe >= 1 ? "#3fb950" : "var(--color-text)" }}>
+                {Number(portfolio.sharpe).toFixed(2)}
+              </b>
+            </span>
+          )}
+          {portfolio.cagr !== 0 && (
+            <span>
+              CAGR (higher = better){" "}
+              <b style={{ color: portfolio.cagr >= 0 ? "#3fb950" : "#f85149" }}>
+                {Number(portfolio.cagr).toFixed(1)}%
+              </b>
+            </span>
+          )}
+          {portfolio.max_drawdown_pct != null && portfolio.max_drawdown_pct !== 0 && (
+            <span>
+              Max DD (lower = better){" "}
+              <b style={{ color: "#f85149" }}>-{Math.abs(Number(portfolio.max_drawdown_pct)).toFixed(1)}%</b>
+            </span>
+          )}
+          {portfolio.net_profit_pct != null && portfolio.net_profit_pct !== 0 && (
+            <span>
+              PnL{" "}
+              <b style={{ color: portfolio.net_profit_pct >= 0 ? "#3fb950" : "#f85149" }}>
+                {portfolio.net_profit_pct >= 0 ? "+" : ""}
+                {Number(portfolio.net_profit_pct).toFixed(1)}%
+              </b>
+            </span>
+          )}
+          {portfolio.psr != null && (
+            <span>
+              PSR (higher = better){" "}
+              <b
+                style={{
+                  color:
+                    Number(portfolio.psr) > 0.95
+                      ? "#3fb950"
+                      : Number(portfolio.psr) > 0.5
+                        ? "#d29922"
+                        : "#f85149",
+                }}
+              >
+                {(Number(portfolio.psr) * 100).toFixed(0)}%
+              </b>
+            </span>
+          )}
+          {portfolio.win_rate != null && (
+            <span>
+              Win Rate (higher = better){" "}
+              <b style={{ color: Number(portfolio.win_rate) >= 50 ? "#3fb950" : "#f85149" }}>
+                {Number(portfolio.win_rate).toFixed(1)}%
+              </b>
+            </span>
+          )}
           <span>
-            Sharpe (higher = better){" "}
-            <b style={{ color: portfolio.sharpe >= 1 ? "#3fb950" : "var(--color-text)" }}>
-              {Number(portfolio.sharpe).toFixed(2)}
-            </b>
+            p-Value (lower = better){" "}
+            <b style={{ color: pValueColor(portfolio.p_value) }}>{formatPValue(portfolio.p_value)}</b>
           </span>
-        )}
-        {portfolio.cagr !== 0 && (
-          <span>
-            CAGR (higher = better){" "}
-            <b style={{ color: portfolio.cagr >= 0 ? "#3fb950" : "#f85149" }}>
-              {Number(portfolio.cagr).toFixed(1)}%
-            </b>
-          </span>
-        )}
-        {portfolio.max_drawdown_pct != null && portfolio.max_drawdown_pct !== 0 && (
-          <span>
-            Max DD (lower = better){" "}
-            <b style={{ color: "#f85149" }}>-{Math.abs(Number(portfolio.max_drawdown_pct)).toFixed(1)}%</b>
-          </span>
-        )}
-        {portfolio.net_profit_pct != null && portfolio.net_profit_pct !== 0 && (
-          <span>
-            PnL{" "}
-            <b style={{ color: portfolio.net_profit_pct >= 0 ? "#3fb950" : "#f85149" }}>
-              {portfolio.net_profit_pct >= 0 ? "+" : ""}
-              {Number(portfolio.net_profit_pct).toFixed(1)}%
-            </b>
-          </span>
-        )}
-        {portfolio.psr != null && (
-          <span>
-            PSR (higher = better){" "}
-            <b
-              style={{
-                color:
-                  Number(portfolio.psr) > 0.95
-                    ? "#3fb950"
-                    : Number(portfolio.psr) > 0.5
-                      ? "#d29922"
-                      : "#f85149",
-              }}
-            >
-              {(Number(portfolio.psr) * 100).toFixed(0)}%
-            </b>
-          </span>
-        )}
-        {portfolio.win_rate != null && (
-          <span>
-            Win Rate (higher = better){" "}
-            <b style={{ color: Number(portfolio.win_rate) >= 50 ? "#3fb950" : "#f85149" }}>
-              {Number(portfolio.win_rate).toFixed(1)}%
-            </b>
-          </span>
-        )}
-        <span>
-          p-Value (lower = better){" "}
-          <b style={{ color: pValueColor(portfolio.p_value) }}>{formatPValue(portfolio.p_value)}</b>
-        </span>
-      </div>
+        </div>
+      ) : (
+        <div style={{ marginTop: "8px", color: "var(--color-text-muted)", fontSize: "0.74rem" }}>
+          No components
+        </div>
+      )}
     </div>
   );
 });

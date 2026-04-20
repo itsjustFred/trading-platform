@@ -34,6 +34,10 @@ def _normalize_symbol(symbol: str) -> str:
     return str(symbol or "").strip().upper()
 
 
+def _is_connection_limit_error(error: BaseException) -> bool:
+    return "connection limit exceeded" in str(error).strip().lower()
+
+
 def _serialize_bar_payload(bar: Any) -> dict[str, Any]:
     symbol = _normalize_symbol(getattr(bar, "symbol", ""))
     ts = getattr(bar, "timestamp", None)
@@ -114,6 +118,19 @@ class _StreamWorker:
                 backoff = 2.0
             except Exception as exc:
                 if not self._running:
+                    break
+                if _is_connection_limit_error(exc):
+                    logger.warning(
+                        "Alpaca market data stream stopped due to websocket connection limit",
+                        extra={
+                            "data": {
+                                "kind": self.kind,
+                                "paper": self.paper,
+                                "error": str(exc),
+                            }
+                        },
+                    )
+                    self._running = False
                     break
                 logger.warning(
                     "Alpaca market data stream disconnected, retrying",
@@ -282,4 +299,3 @@ class LiveMarketDataStreamService:
     def _append_bar_sync(self, symbol: str, payload: dict[str, Any]) -> None:
         with self._lock:
             self._bars[symbol].append(payload)
-

@@ -49,6 +49,7 @@ import type {
   BacktestCapmResponse,
   BacktestsDeduplicateResponse,
   BacktestsBulkDeleteResponse,
+  BacktestsRemoveEmptyResponse,
   BacktestsCompareResponse,
   PortfolioComponent,
   PortfolioContribution,
@@ -176,21 +177,29 @@ export const getBacktests = (params?: BacktestsQueryParams) => {
 };
 export const getBacktestsAll = (name?: string) => {
   const query = new URLSearchParams();
-  query.set("include_equity_preview", "true");
+  query.set("include_equity_preview", "false");
   query.set("preview_limit", "50");
   if (name && name.trim()) query.set("name", name.trim());
   return fetchJSON<BacktestMetadataItem[]>(`/backtests/all?${query.toString()}`);
 };
 export const getBacktestEquityPreview = (id: string, limit = 80) =>
   fetchJSON<number[]>(
-    `/backtests/${encodeURIComponent(id)}/equity-preview?limit=${Math.max(50, Math.min(100, limit))}`,
+    `/backtests/${encodeURIComponent(id)}/equity-preview?limit=${Math.max(1, Math.min(100, limit))}`,
   );
 export const getBacktestInfo = (id: string) =>
   fetchJSON<BacktestInfo>(`/backtest/${id}/info`);
 export const getBacktestStats = (id: string) =>
   fetchJSON<any>(`/backtest/${id}/stats`);
-export const getBacktestTrades = (id: string) =>
-  fetchJSON<Trade[]>(`/backtest/${id}/trades`);
+export const getBacktestTrades = (
+  id: string,
+  params?: { offset?: number; limit?: number },
+) => {
+  const query = new URLSearchParams();
+  if (params?.offset != null) query.set("offset", String(Math.max(0, Math.trunc(params.offset))));
+  if (params?.limit != null) query.set("limit", String(Math.max(1, Math.min(100, Math.trunc(params.limit)))));
+  const queryString = query.toString();
+  return fetchJSON<Trade[]>(`/backtest/${id}/trades${queryString ? `?${queryString}` : ""}`);
+};
 export const getBacktestTrade = (id: string, nr: number) =>
   fetchJSON<TradeChartResponse>(`/backtest/${id}/trade/${nr}`);
 export const getBacktestReplay = (id: string) =>
@@ -216,6 +225,10 @@ export const getBacktestDuplicates = () =>
   fetchJSON<BacktestsDuplicatesResponse>("/backtests/duplicates");
 export const deduplicateBacktests = () =>
   fetchJSON<BacktestsDeduplicateResponse>("/backtests/deduplicate", {
+    method: "POST",
+  });
+export const removeEmptyBacktests = () =>
+  fetchJSON<BacktestsRemoveEmptyResponse>("/backtests/remove-empty", {
     method: "POST",
   });
 export const deleteBacktest = (id: string) =>

@@ -68,6 +68,12 @@ _running_jobs: dict[str, dict] = {}  # job_id -> {status, result, error}
 
 BARS_BEFORE = 60
 BARS_AFTER = 25
+_OHLCV_COLUMNS = ["timestamp", "open", "high", "low", "close", "volume"]
+_OHLCV_DF_CACHE_LOCK = threading.RLock()
+_OHLCV_DF_CACHE: dict[
+    tuple[str, str],
+    tuple[tuple[tuple[str, int, int], ...], pd.DataFrame],
+] = {}
 
 
 class _RequestPlaceholder:
@@ -367,14 +373,36 @@ def _trade_to_viewer(trade) -> dict:
 def _load_ohlcv_df(symbol: str, timeframe: str) -> pd.DataFrame | None:
     """Find and load OHLCV parquet for a symbol+timeframe."""
     ohlcv_root = DATA_DIR / "ohlcv"
-    matches = sorted(ohlcv_root.rglob(f"**/{symbol}/{timeframe}.parquet"))
+    normalized_symbol = str(symbol or "").strip()
+    normalized_timeframe = str(timeframe or "").strip()
+    cache_key = (normalized_symbol.upper(), normalized_timeframe.lower())
+    matches = sorted(ohlcv_root.rglob(f"**/{normalized_symbol}/{normalized_timeframe}.parquet"))
     if not matches:
+        with _OHLCV_DF_CACHE_LOCK:
+            _OHLCV_DF_CACHE.pop(cache_key, None)
         return None
+    signature_parts: list[tuple[str, int, int]] = []
+    for path in matches:
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        signature_parts.append((str(path), int(stat.st_mtime_ns), int(stat.st_size)))
+    signature: tuple[tuple[str, int, int], ...] = tuple(signature_parts)
+    with _OHLCV_DF_CACHE_LOCK:
+        cached_entry = _OHLCV_DF_CACHE.get(cache_key)
+        if cached_entry is not None:
+            cached_signature, cached_df = cached_entry
+            if cached_signature == signature:
+                return cached_df.copy(deep=False)
 
     frames: list[pd.DataFrame] = []
     for path in matches:
         try:
-            df = pd.read_parquet(path)
+            try:
+                df = pd.read_parquet(path, columns=_OHLCV_COLUMNS)
+            except (ValueError, KeyError):
+                df = pd.read_parquet(path)
         except (ValueError, KeyError, pd.errors.EmptyDataError, FileNotFoundError, OSError) as exc:
             logger.warning("Could not load OHLCV segment for %s/%s from %s: %s", symbol, timeframe, path, exc)
             continue
@@ -388,18 +416,21 @@ def _load_ohlcv_df(symbol: str, timeframe: str) -> pd.DataFrame | None:
     if not frames:
         return None
     if len(frames) == 1:
-        return frames[0]
-
-    merged = pd.concat(frames, ignore_index=True, sort=False)
-    if "timestamp" in merged.columns:
-        merged = (
-            merged.drop_duplicates(subset=["timestamp"], keep="last")
-            .sort_values("timestamp")
-            .reset_index(drop=True)
-        )
+        merged = frames[0]
     else:
-        merged = merged.drop_duplicates().reset_index(drop=True)
-    return merged
+        merged = pd.concat(frames, ignore_index=True, sort=False)
+        if "timestamp" in merged.columns:
+            merged = (
+                merged.drop_duplicates(subset=["timestamp"], keep="last")
+                .sort_values("timestamp")
+                .reset_index(drop=True)
+            )
+        else:
+            merged = merged.drop_duplicates().reset_index(drop=True)
+
+    with _OHLCV_DF_CACHE_LOCK:
+        _OHLCV_DF_CACHE[cache_key] = (signature, merged)
+    return merged.copy(deep=False)
 
 
 def _infer_symbol_data_category(symbol: str) -> str:

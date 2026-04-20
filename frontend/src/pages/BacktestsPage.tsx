@@ -7,6 +7,7 @@ import {
   deleteBacktestsBulk,
   getBacktestDuplicates,
   getBacktestsAll,
+  removeEmptyBacktests,
 } from "../api/client";
 import type { BacktestMetadataItem, BacktestsDuplicatesResponse } from "../api/types";
 import { BacktestFromSignalsModal } from "../components/BacktestFromSignalsModal";
@@ -335,6 +336,7 @@ export function BacktestsPage() {
   const [showDuplicatesModal, setShowDuplicatesModal] = useState(false);
   const [loadingDuplicates, setLoadingDuplicates] = useState(false);
   const [runningDeduplicate, setRunningDeduplicate] = useState(false);
+  const [runningRemoveEmpty, setRunningRemoveEmpty] = useState(false);
 
   const loadAllMetadata = useCallback(
     async (force = false) => {
@@ -574,6 +576,32 @@ export function BacktestsPage() {
       showToast(toErrorMessage(error, "Could not remove duplicates."), "error");
     } finally {
       setRunningDeduplicate(false);
+    }
+  };
+
+  const emptyBacktestsCount = useMemo(
+    () => items.filter((item) => Number(item.trade_count || 0) <= 0).length,
+    [items],
+  );
+
+  const handleRemoveEmpty = async () => {
+    if (runningRemoveEmpty) return;
+    if (emptyBacktestsCount <= 0) {
+      showToast("No empty backtests found.", "info");
+      return;
+    }
+    const confirmed = window.confirm(`Remove ${emptyBacktestsCount} backtests with 0 trades?`);
+    if (!confirmed) return;
+
+    setRunningRemoveEmpty(true);
+    try {
+      const payload = await removeEmptyBacktests();
+      showToast(`Removed ${payload.removed} empty backtest(s).`, "success");
+      await loadAllMetadata(true);
+    } catch (error: unknown) {
+      showToast(toErrorMessage(error, "Could not remove empty backtests."), "error");
+    } finally {
+      setRunningRemoveEmpty(false);
     }
   };
 
@@ -906,6 +934,26 @@ export function BacktestsPage() {
               }}
             >
               {loadingDuplicates ? "Checking..." : "Remove Duplicates"}
+            </button>
+            <button
+              type="button"
+              onClick={() => void handleRemoveEmpty()}
+              disabled={runningRemoveEmpty || emptyBacktestsCount <= 0}
+              style={{
+                borderRadius: "10px",
+                border: "1px solid rgba(245, 158, 11, 0.45)",
+                background: "rgba(120, 53, 15, 0.26)",
+                color: "#fde68a",
+                padding: "8px 12px",
+                fontSize: "0.76rem",
+                cursor:
+                  runningRemoveEmpty || emptyBacktestsCount <= 0
+                    ? "not-allowed"
+                    : "pointer",
+                opacity: runningRemoveEmpty || emptyBacktestsCount <= 0 ? 0.6 : 1,
+              }}
+            >
+              {runningRemoveEmpty ? "Removing..." : "Remove Empty"}
             </button>
             <button
               type="button"

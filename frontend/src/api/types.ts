@@ -745,6 +745,10 @@ export interface BacktestsBulkDeleteResponse {
   deleted: number;
 }
 
+export interface BacktestsRemoveEmptyResponse {
+  removed: number;
+}
+
 export interface PortfoliosBulkDeleteResponse {
   deleted: number;
 }
@@ -1206,7 +1210,7 @@ export type AgentModelId =
   | "deepseek-ai/deepseek-v3.2"
   | "qwen/qwen2.5-coder-32b-instruct";
 
-export type AgentProviderId = "nim" | "copilot_cli" | "copilot_sdk";
+export type AgentProviderId = "nim" | "copilot_sdk";
 
 export interface AgentConvertRequest {
   code: string;

@@ -16,6 +16,7 @@ import uuid
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal
 
@@ -33,7 +34,7 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import Field as PydanticField
 from pydantic import ValidationError
 from sqlmodel import SQLModel
@@ -148,6 +149,7 @@ from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credent
 from viewer import core as legacy_viewer
 
 logger = get_logger("viewer")
+AGENT_CONVERT_PROVIDER_NAMES: tuple[str, ...] = ("nim", "copilot_sdk")
 
 BACKTESTS_DIR = DATA_DIR / "backtests"
 PORTFOLIOS_DIR = DATA_DIR / "portfolios"
@@ -297,6 +299,22 @@ async def _prewarm_backtest_metadata_background() -> None:
         logger.info("Backtest metadata cache warmed (%s items)", count)
     except Exception as exc:
         logger.warning("Backtest metadata prewarm failed: %s", exc)
+
+
+async def _prewarm_portfolio_metadata_background() -> None:
+    try:
+        count = await asyncio.to_thread(_refresh_portfolio_meta_cache)
+        logger.info("Portfolio metadata cache warmed (%s items)", count)
+    except Exception as exc:
+        logger.warning("Portfolio metadata prewarm failed: %s", exc)
+
+
+async def _prewarm_tasks_cache_background() -> None:
+    try:
+        count = await asyncio.to_thread(_hydrate_task_cache_once, True)
+        logger.info("Task cache warmed (%s items)", count)
+    except Exception as exc:
+        logger.warning("Task cache prewarm failed: %s", exc)
 
 
 async def _prewarm_jforex_jvm_background() -> None:
@@ -546,6 +564,8 @@ async def lifespan(app: FastAPI):
     live_accounts_prewarm_task = asyncio.create_task(_prewarm_live_accounts_background())
     strategies_prewarm_task = asyncio.create_task(_prewarm_strategies_background())
     backtests_meta_prewarm_task = asyncio.create_task(_prewarm_backtest_metadata_background())
+    portfolios_meta_prewarm_task = asyncio.create_task(_prewarm_portfolio_metadata_background())
+    task_cache_prewarm_task = asyncio.create_task(_prewarm_tasks_cache_background())
     jforex_jvm_prewarm_task = asyncio.create_task(_prewarm_jforex_jvm_background())
     live_market_data_sync_task = asyncio.create_task(_sync_live_market_data_stream_background())
     app.state.json_migration_task = json_migration_task
@@ -553,6 +573,8 @@ async def lifespan(app: FastAPI):
     app.state.live_accounts_prewarm_task = live_accounts_prewarm_task
     app.state.strategies_prewarm_task = strategies_prewarm_task
     app.state.backtests_meta_prewarm_task = backtests_meta_prewarm_task
+    app.state.portfolios_meta_prewarm_task = portfolios_meta_prewarm_task
+    app.state.task_cache_prewarm_task = task_cache_prewarm_task
     app.state.jforex_jvm_prewarm_task = jforex_jvm_prewarm_task
     app.state.live_market_data_sync_task = live_market_data_sync_task
     await asyncio.to_thread(mark_background_tasks_interrupted, from_statuses=["queued", "running"])
@@ -566,6 +588,8 @@ async def lifespan(app: FastAPI):
             live_accounts_prewarm_task,
             strategies_prewarm_task,
             backtests_meta_prewarm_task,
+            portfolios_meta_prewarm_task,
+            task_cache_prewarm_task,
             jforex_jvm_prewarm_task,
             live_market_data_sync_task,
         ):
@@ -577,6 +601,8 @@ async def lifespan(app: FastAPI):
             live_accounts_prewarm_task,
             strategies_prewarm_task,
             backtests_meta_prewarm_task,
+            portfolios_meta_prewarm_task,
+            task_cache_prewarm_task,
             jforex_jvm_prewarm_task,
             live_market_data_sync_task,
         ):
@@ -910,7 +936,17 @@ def _configure_uvicorn_access_log_filter() -> None:
     access_logger.disabled = True
 
 
+def _configure_third_party_log_filters() -> None:
+    # Alpaca stream internals emit noisy plain-text websocket logs that bypass our
+    # structured logger; silence them and rely on live_runner structured warnings.
+    alpaca_ws_logger = logging.getLogger("alpaca.data.live.websocket")
+    alpaca_ws_logger.handlers.clear()
+    alpaca_ws_logger.propagate = False
+    alpaca_ws_logger.setLevel(logging.CRITICAL)
+
+
 _configure_uvicorn_access_log_filter()
+_configure_third_party_log_filters()
 
 _live_market_data_service = LiveMarketDataStreamService(max_bars_per_symbol=500)
 
@@ -995,6 +1031,22 @@ async def api_request_logging_middleware(request: Request, call_next):
         },
     )
     return response
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    logger.exception(
+        "Unhandled server exception",
+        extra={
+            "data": {
+                "method": request.method,
+                "path": request.url.path,
+                "error": str(exc),
+                "traceback": traceback.format_exc(),
+            }
+        },
+    )
+    return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
 
 
 def _load_result(backtest_id: str) -> BacktestResult | None:
@@ -1189,6 +1241,11 @@ _BACKTEST_META_CACHE: dict[str, dict[str, Any]] = {}
 _BACKTEST_META_CACHE_SOURCE_MTIME_NS = 0
 _BACKTEST_EQUITY_PREVIEW_CACHE_LOCK = threading.RLock()
 _BACKTEST_EQUITY_PREVIEW_CACHE: dict[tuple[str, int], list[float]] = {}
+_PORTFOLIO_META_CACHE_LOCK = threading.RLock()
+_PORTFOLIO_META_CACHE: dict[str, dict[str, Any]] = {}
+_PORTFOLIO_META_CACHE_WARMED = False
+_TASK_CACHE_HYDRATION_LOCK = threading.RLock()
+_TASK_CACHE_HYDRATED = False
 _TASK_STATUS_WEIGHTS: dict[str, float] = {
     "queued": 5.0,
     "starting": 10.0,
@@ -1375,14 +1432,30 @@ def _safe_float(value: object, default: float = 0.0) -> float:
     return numeric
 
 
+@lru_cache(maxsize=8192)
+def _parse_iso_datetime_cached(text: str) -> datetime | None:
+    normalized = str(text or "").strip()
+    if not normalized:
+        return None
+    if normalized.endswith("Z"):
+        normalized = f"{normalized[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except ValueError:
+        fallback = pd.to_datetime(normalized, utc=True, errors="coerce")
+        if pd.isna(fallback):
+            return None
+        return fallback.to_pydatetime()
+
+
 def _parse_iso_datetime(value: Any) -> datetime | None:
     text = str(value or "").strip()
     if not text:
         return None
-    parsed = pd.to_datetime(text, utc=True, errors="coerce")
-    if pd.isna(parsed):
-        return None
-    return parsed.to_pydatetime()
+    return _parse_iso_datetime_cached(text)
 
 
 def _task_category_from_kind_source(kind: Any, source: Any) -> str:
@@ -1576,20 +1649,78 @@ def _portfolio_equity_preview(values: Any, *, limit: int = 50) -> list[float]:
     return preview
 
 
+def _portfolio_stats_have_values(stats: dict[str, Any]) -> bool:
+    if not isinstance(stats, dict):
+        return False
+    keys = ("net_profit", "total_return", "sharpe", "cagr", "max_drawdown", "win_rate", "trade_count")
+    for key in keys:
+        numeric = _safe_float(stats.get(key), 0.0)
+        if abs(numeric) > 1e-12:
+            return True
+    return False
+
+
+def _portfolio_stats_from_trades(
+    trades: list[dict[str, Any]],
+    *,
+    account_capital: float,
+) -> dict[str, Any]:
+    if not trades:
+        return {}
+
+    ordered_trades = sorted(trades, key=_component_trade_time)
+    total_pnl = 0.0
+    wins = 0
+    equity = account_capital
+    peak = account_capital
+    max_drawdown = 0.0
+
+    for trade in ordered_trades:
+        pnl = _safe_float(trade.get("pnl"), 0.0)
+        total_pnl += pnl
+        equity += pnl
+        peak = max(peak, equity)
+        if peak > 0:
+            max_drawdown = max(max_drawdown, (peak - equity) / peak)
+        if pnl > 0:
+            wins += 1
+
+    trade_count = len(ordered_trades)
+    win_rate = (wins / trade_count) if trade_count else 0.0
+    total_return = (total_pnl / account_capital) if account_capital else 0.0
+    return {
+        "trade_count": trade_count,
+        "net_profit": round(total_pnl, 6),
+        "total_return": round(total_return, 8),
+        "win_rate": round(win_rate, 8),
+        "max_drawdown": round(max_drawdown, 8),
+    }
+
+
 def _portfolio_summary_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    stats = legacy_viewer.PortfolioStats.from_dict(payload.get("combined_stats", {})).to_dict()
     account_capital = _safe_float(payload.get("account_capital"), 100000.0) or 100000.0
+    stats = legacy_viewer.PortfolioStats.from_dict(payload.get("combined_stats", {})).to_dict()
+    trades = payload.get("trades") if isinstance(payload.get("trades"), list) else []
+    normalized_trades = [trade for trade in trades if isinstance(trade, dict)]
+    if normalized_trades and not _portfolio_stats_have_values(stats):
+        stats = {
+            **stats,
+            **_portfolio_stats_from_trades(
+                normalized_trades,
+                account_capital=account_capital,
+            ),
+        }
     cagr = _safe_float(stats.get("cagr"), 0.0)
     max_drawdown = abs(_safe_float(stats.get("max_drawdown"), 0.0))
     net_profit = _safe_float(stats.get("net_profit"), 0.0)
     total_return = _safe_float(stats.get("total_return"), 0.0)
     win_rate = _normalize_win_rate(stats.get("win_rate")) or 0.0
-    trades = payload.get("trades") if isinstance(payload.get("trades"), list) else []
+    components = payload.get("components") if isinstance(payload.get("components"), list) else []
     return {
         "id": str(payload.get("id") or ""),
         "name": str(payload.get("name") or ""),
         "account_capital": account_capital,
-        "strategy_count": len(payload.get("components", [])) if isinstance(payload.get("components"), list) else 0,
+        "strategy_count": len(components),
         "total_return": total_return,
         "sharpe_ratio": round(_safe_float(stats.get("sharpe"), 0.0), 6),
         "sharpe": round(_safe_float(stats.get("sharpe"), 0.0), 3),
@@ -1601,10 +1732,66 @@ def _portfolio_summary_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "psr": stats.get("psr"),
         "p_value": round(_safe_float(stats.get("p_value"), 1.0), 6),
         "win_rate": round(win_rate * 100.0, 2),
-        "trade_count": len([trade for trade in trades if isinstance(trade, dict)]),
+        "trade_count": int(_safe_float(stats.get("trade_count"), len(normalized_trades))),
         "equity_mini": _portfolio_equity_preview(payload.get("combined_equity", []), limit=50),
         "created_at": str(payload.get("created_at", "")),
     }
+
+
+def _refresh_portfolio_meta_cache() -> int:
+    payloads = _snapshot_portfolio_payloads()
+    next_cache: dict[str, dict[str, Any]] = {}
+    for payload in payloads:
+        portfolio_id = str(payload.get("id") or "").strip()
+        if not portfolio_id:
+            continue
+        next_cache[portfolio_id] = _portfolio_summary_from_payload(payload)
+    global _PORTFOLIO_META_CACHE_WARMED
+    with _PORTFOLIO_META_CACHE_LOCK:
+        _PORTFOLIO_META_CACHE.clear()
+        _PORTFOLIO_META_CACHE.update(next_cache)
+        _PORTFOLIO_META_CACHE_WARMED = True
+    return len(next_cache)
+
+
+def _ensure_portfolio_meta_cache() -> None:
+    with _PORTFOLIO_META_CACHE_LOCK:
+        if _PORTFOLIO_META_CACHE_WARMED:
+            return
+    _refresh_portfolio_meta_cache()
+
+
+def _snapshot_portfolio_meta_cache() -> list[dict[str, Any]]:
+    _ensure_portfolio_meta_cache()
+    with _PORTFOLIO_META_CACHE_LOCK:
+        return [dict(item) for item in _PORTFOLIO_META_CACHE.values()]
+
+
+def _upsert_portfolio_meta_cache_from_payload(payload: dict[str, Any]) -> None:
+    portfolio_id = str(payload.get("id") or "").strip()
+    if not portfolio_id:
+        return
+    summary = _portfolio_summary_from_payload(payload)
+    global _PORTFOLIO_META_CACHE_WARMED
+    with _PORTFOLIO_META_CACHE_LOCK:
+        _PORTFOLIO_META_CACHE[portfolio_id] = summary
+        _PORTFOLIO_META_CACHE_WARMED = True
+
+
+def _upsert_portfolio_meta_cache(portfolio_id: str) -> None:
+    normalized_id = str(portfolio_id or "").strip()
+    if not normalized_id:
+        return
+    payload = _load_portfolio_payload(normalized_id)
+    _upsert_portfolio_meta_cache_from_payload(payload)
+
+
+def _remove_portfolio_meta_cache(portfolio_id: str) -> None:
+    normalized_id = str(portfolio_id or "").strip()
+    if not normalized_id:
+        return
+    with _PORTFOLIO_META_CACHE_LOCK:
+        _PORTFOLIO_META_CACHE.pop(normalized_id, None)
 
 
 def _sanitize_portfolio_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1635,7 +1822,7 @@ def _snapshot_portfolio_payloads() -> list[dict[str, Any]]:
 
     for file_path in sorted(PORTFOLIOS_DIR.glob("*.json")):
         try:
-            data = _sanitize_portfolio_payload(json.loads(file_path.read_text(encoding="utf-8")))
+            data = _normalize_portfolio_payload(json.loads(file_path.read_text(encoding="utf-8")))
         except (json.JSONDecodeError, OSError, TypeError, ValueError) as exc:
             logger.warning("Could not read portfolio %s: %s", file_path.name, exc)
             continue
@@ -1657,7 +1844,7 @@ def _snapshot_portfolio_payloads() -> list[dict[str, Any]]:
             source = dict(record)
         else:
             source = {}
-        data = _sanitize_portfolio_payload(source)
+        data = _normalize_portfolio_payload(source)
         portfolio_id = str(data.get("id") or "").strip()
         if not portfolio_id or portfolio_id in by_id:
             continue
@@ -1780,7 +1967,10 @@ def _delete_portfolio_with_artifacts(portfolio_id: str) -> bool:
         except OSError as exc:
             logger.warning("Could not delete portfolio %s: %s", normalized_id, exc)
 
-    return deleted_db or deleted_file
+    deleted = deleted_db or deleted_file
+    if deleted:
+        _remove_portfolio_meta_cache(normalized_id)
+    return deleted
 
 
 def _current_backtest_store_mtime_ns() -> int:
@@ -2562,6 +2752,24 @@ def _snapshot_task(task_id: str) -> dict[str, Any] | None:
         return dict(current) if current is not None else None
     _decorate_task_from_record(task_id, snapshot)
     return snapshot
+
+
+def _hydrate_task_cache_once(force: bool = False) -> int:
+    global _TASK_CACHE_HYDRATED
+    with _TASK_CACHE_HYDRATION_LOCK:
+        if _TASK_CACHE_HYDRATED and not force:
+            with DATA_TASKS_LOCK:
+                return len(DATA_TASKS)
+        records = list_background_task_records()
+        with DATA_TASKS_LOCK:
+            for record in records:
+                task_id = str(record.get("id") or "").strip()
+                if not task_id or task_id in DATA_TASKS:
+                    continue
+                DATA_TASKS[task_id] = _build_task_from_record(record)
+            size = len(DATA_TASKS)
+        _TASK_CACHE_HYDRATED = True
+        return size
 
 
 def _update_task_fields(task_id: str, **updates: Any) -> dict[str, Any] | None:
@@ -4269,6 +4477,18 @@ def _normalize_portfolio_payload(payload: dict[str, Any]) -> dict[str, Any]:
             )
         normalized["strategy_contributions"] = strategy_contributions
 
+    combined_stats = normalized.get("combined_stats") if isinstance(normalized.get("combined_stats"), dict) else {}
+    if normalized_trades and not _portfolio_stats_have_values(combined_stats):
+        account_capital = _safe_float(normalized.get("account_capital"), 100000.0) or 100000.0
+        derived_stats = _portfolio_stats_from_trades(
+            normalized_trades,
+            account_capital=account_capital,
+        )
+        normalized["combined_stats"] = {
+            **combined_stats,
+            **derived_stats,
+        }
+
     return normalized
 
 
@@ -5724,8 +5944,8 @@ async def list_backtests(
 
 @app.get("/api/backtests/all", response_model=list[dict[str, Any]])
 async def list_backtests_all(
-    include_equity_preview: bool = Query(default=True),
-    preview_limit: int = Query(default=50, ge=50, le=100),
+    include_equity_preview: bool = Query(default=False),
+    preview_limit: int = Query(default=50, ge=1, le=100),
     name: str = Query(default=""),
 ) -> list[dict[str, Any]]:
     items = _snapshot_backtest_meta_cache()
@@ -5787,6 +6007,21 @@ async def deduplicate_backtests() -> BacktestsDeduplicateResponse:
     )
 
 
+@app.post("/api/backtests/remove-empty", response_model=dict[str, int])
+async def remove_empty_backtests() -> dict[str, int]:
+    removed = 0
+    for item in _snapshot_backtest_meta_cache():
+        backtest_id = str(item.get("id") or "").strip()
+        if not backtest_id:
+            continue
+        trade_count = max(int(_safe_float(item.get("trade_count"), 0.0)), 0)
+        if trade_count != 0:
+            continue
+        if _delete_backtest_with_artifacts(backtest_id):
+            removed += 1
+    return {"removed": removed}
+
+
 @app.post("/api/backtests/delete-bulk", response_model=dict[str, int])
 async def delete_backtests_bulk(payload: BacktestsBulkDeleteRequest) -> dict[str, int]:
     deleted = 0
@@ -5846,13 +6081,28 @@ async def compare_two_backtests(ids: str = Query(default="")) -> dict[str, Any]:
 
 @app.get("/api/backtest/{backtest_id}", response_model=dict[str, Any])
 @app.get("/api/backtests/{backtest_id}", response_model=dict[str, Any])
-async def get_backtest(backtest_id: str) -> dict[str, Any]:
+async def get_backtest(
+    backtest_id: str,
+    include_trades: bool = Query(default=True),
+    include_equity: bool = Query(default=False),
+    include_indicators: bool = Query(default=False),
+    include_drawings: bool = Query(default=False),
+) -> dict[str, Any]:
     result = _load_result(backtest_id)
     if result is None:
         raise HTTPException(status_code=404, detail=f"Backtest '{backtest_id}' not found")
 
     try:
-        return result.to_dict()
+        payload = result.to_dict()
+        if not include_trades:
+            payload.pop("trades", None)
+        if not include_equity:
+            payload.pop("equity_curve", None)
+        if not include_indicators:
+            payload.pop("indicators", None)
+        if not include_drawings:
+            payload.pop("drawings", None)
+        return payload
     except Exception as exc:
         logger.exception("Failed to serialize backtest '%s': %s", backtest_id, exc)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -5960,13 +6210,15 @@ async def get_equity_curve(backtest_id: str) -> list[dict[str, float]]:
     result = _load_result(backtest_id)
     if result is None:
         raise HTTPException(status_code=404, detail="Not found")
-    return legacy_viewer._equity_to_viewer(result)
+    equity_curve = legacy_viewer._equity_to_viewer(result)
+    equity_curve.sort(key=lambda point: _safe_float(point.get("time"), 0.0))
+    return equity_curve
 
 
 @app.get("/api/backtests/{backtest_id}/equity-preview", response_model=list[float])
 async def get_backtest_equity_preview(
     backtest_id: str,
-    limit: int = Query(default=80, ge=50, le=100),
+    limit: int = Query(default=50, ge=1, le=100),
 ) -> list[float]:
     normalized_id = str(backtest_id or "").strip()
     if not normalized_id:
@@ -6041,11 +6293,16 @@ async def get_backtest_capm(
 
 @app.get("/api/backtest/{backtest_id}/trades", response_model=list[dict[str, Any]])
 @app.get("/api/backtests/{backtest_id}/trades", response_model=list[dict[str, Any]])
-async def get_backtest_trades(backtest_id: str) -> list[dict[str, Any]]:
+async def get_backtest_trades(
+    backtest_id: str,
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=100, ge=1, le=100),
+) -> list[dict[str, Any]]:
     result = _load_result(backtest_id)
     if result is None:
         raise HTTPException(status_code=404, detail="Not found")
-    return [legacy_viewer._trade_to_viewer(trade) for trade in result.trades]
+    paged_trades = result.trades[offset : offset + limit]
+    return [legacy_viewer._trade_to_viewer(trade) for trade in paged_trades]
 
 
 def _normalize_indicator_payloads(indicators: list[Any]) -> list[dict[str, Any]]:
@@ -6280,63 +6537,73 @@ async def get_trade_with_context(backtest_id: str, trade_nr: int) -> dict[str, A
     result = _load_result(backtest_id)
     if result is None:
         raise HTTPException(status_code=404, detail="Not found")
+    try:
+        trade = next((item for item in result.trades if item.id == trade_nr), None)
+        if trade is None:
+            raise HTTPException(status_code=404, detail=f"Trade #{trade_nr} not found")
 
-    trade = next((item for item in result.trades if item.id == trade_nr), None)
-    if trade is None:
-        raise HTTPException(status_code=404, detail=f"Trade #{trade_nr} not found")
-
-    trade_payload = legacy_viewer._trade_to_viewer(trade)
-    timeframe = (
-        result.meta.data.get("timeframes", ["1h"])[0] if result.meta.data.get("timeframes") else "1h"
-    )
-    timeframe = normalize_timeframe(timeframe)
-
-    ohlcv: list[dict[str, Any]] = []
-    df = legacy_viewer._load_ohlcv_df(trade.symbol, timeframe)
-    if df is None or len(df) == 0:
-        details = legacy_viewer._missing_ohlcv_details(
-            trade.symbol,
-            timeframe,
-            backtest_start=str(result.meta.backtest_start or ""),
-            backtest_end=str(result.meta.backtest_end or ""),
+        trade_payload = legacy_viewer._trade_to_viewer(trade)
+        timeframe = (
+            result.meta.data.get("timeframes", ["1h"])[0] if result.meta.data.get("timeframes") else "1h"
         )
-        raise HTTPException(status_code=404, detail=details)
+        timeframe = normalize_timeframe(timeframe)
 
-    ohlcv_start_idx = 0
-    ohlcv_end_idx = 0
-    entry_ts = pd.Timestamp(trade.entry_time, tz="UTC") if trade.entry_time else None
-    if entry_ts is not None:
-        idx = df["timestamp"].searchsorted(entry_ts)
-        ohlcv_start_idx = max(0, idx - legacy_viewer.BARS_BEFORE)
-        ohlcv_end_idx = min(len(df), idx + legacy_viewer.BARS_AFTER)
-        ohlcv = legacy_viewer._df_to_ohlcv_records(df.iloc[ohlcv_start_idx:ohlcv_end_idx])
+        ohlcv: list[dict[str, Any]] = []
+        df = legacy_viewer._load_ohlcv_df(trade.symbol, timeframe)
+        if df is None or len(df) == 0:
+            details = legacy_viewer._missing_ohlcv_details(
+                trade.symbol,
+                timeframe,
+                backtest_start=str(result.meta.backtest_start or ""),
+                backtest_end=str(result.meta.backtest_end or ""),
+            )
+            raise HTTPException(status_code=404, detail=details)
 
-    indicators = _normalize_indicator_payloads(list(result.indicators))
-    drawings = _collect_viewer_drawings(result, trade.symbol)
+        ohlcv_start_idx = 0
+        ohlcv_end_idx = 0
+        entry_ts = pd.Timestamp(trade.entry_time, tz="UTC") if trade.entry_time else None
+        if entry_ts is not None:
+            idx = df["timestamp"].searchsorted(entry_ts)
+            ohlcv_start_idx = max(0, idx - legacy_viewer.BARS_BEFORE)
+            ohlcv_end_idx = min(len(df), idx + legacy_viewer.BARS_AFTER)
+            ohlcv = legacy_viewer._df_to_ohlcv_records(df.iloc[ohlcv_start_idx:ohlcv_end_idx])
 
-    if not indicators and ohlcv and df is not None:
-        strategy_identifier = result.meta.strategies[0] if result.meta.strategies else ""
-        detected = legacy_viewer._detect_indicators(strategy_identifier)
-        if detected:
-            ohlcv_times = [row["time"] for row in ohlcv]
-            warmup_start = max(0, ohlcv_start_idx - 50)
-            df_slice = df.iloc[warmup_start:ohlcv_end_idx].reset_index(drop=True)
-            indicators = legacy_viewer._compute_indicators(df_slice, detected, ohlcv_times)
+        indicators = _normalize_indicator_payloads(list(result.indicators))
+        drawings = _collect_viewer_drawings(result, trade.symbol)
 
-    if ohlcv and indicators:
-        time_start = ohlcv[0]["time"]
-        time_end = ohlcv[-1]["time"]
-        _slice_indicators_to_time_range(indicators, time_start=time_start, time_end=time_end)
+        if not indicators and ohlcv and df is not None:
+            strategy_identifier = result.meta.strategies[0] if result.meta.strategies else ""
+            detected = legacy_viewer._detect_indicators(strategy_identifier)
+            if detected:
+                ohlcv_times = [row["time"] for row in ohlcv]
+                warmup_start = max(0, ohlcv_start_idx - 50)
+                df_slice = df.iloc[warmup_start:ohlcv_end_idx].reset_index(drop=True)
+                indicators = legacy_viewer._compute_indicators(df_slice, detected, ohlcv_times)
 
-    return {
-        "trade": trade_payload,
-        "ohlcv": ohlcv,
-        "symbol": trade.symbol,
-        "timeframe": timeframe,
-        "indicators": indicators,
-        "drawings": drawings,
-        "total_trades": len(result.trades),
-    }
+        if ohlcv and indicators:
+            time_start = ohlcv[0]["time"]
+            time_end = ohlcv[-1]["time"]
+            _slice_indicators_to_time_range(indicators, time_start=time_start, time_end=time_end)
+
+        return {
+            "trade": trade_payload,
+            "ohlcv": ohlcv,
+            "symbol": trade.symbol,
+            "timeframe": timeframe,
+            "indicators": indicators,
+            "drawings": drawings,
+            "total_trades": len(result.trades),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception(
+            "Trade viewer context failed for backtest '%s' trade #%s: %s",
+            backtest_id,
+            trade_nr,
+            exc,
+        )
+        raise HTTPException(status_code=500, detail="Failed to load trade context") from exc
 
 
 @app.get("/api/backtest/{backtest_id}/replay", response_model=dict[str, Any])
@@ -6344,73 +6611,78 @@ async def get_backtest_replay(backtest_id: str) -> dict[str, Any]:
     result = _load_result(backtest_id)
     if result is None:
         raise HTTPException(status_code=404, detail="Not found")
-
-    trades = [legacy_viewer._trade_to_viewer(trade) for trade in result.trades]
-    timeframe = (
-        result.meta.data.get("timeframes", ["1h"])[0] if result.meta.data.get("timeframes") else "1h"
-    )
-    timeframe = normalize_timeframe(timeframe)
-    symbols = sorted({trade.symbol for trade in result.trades if trade.symbol}) or list(
-        result.meta.data.get("symbols", [])
-    )
-
-    ohlcv_by_symbol: dict[str, list[dict[str, Any]]] = {}
-    missing_ohlcv: dict[str, dict[str, Any]] = {}
-
-    for symbol in symbols:
-        df = legacy_viewer._load_ohlcv_df(symbol, timeframe)
-        if df is None or len(df) == 0:
-            missing_ohlcv[symbol] = legacy_viewer._missing_ohlcv_details(
-                symbol,
-                timeframe,
-                backtest_start=str(result.meta.backtest_start or ""),
-                backtest_end=str(result.meta.backtest_end or ""),
-            )
-            continue
-        symbol_trades = [trade for trade in trades if str(trade.get("symbol") or "").upper() == symbol.upper()]
-        replay_df = _slice_replay_ohlcv(df, symbol_trades)
-        ohlcv_by_symbol[symbol] = legacy_viewer._df_to_ohlcv_records(replay_df)
-
-    if not ohlcv_by_symbol:
-        detail = next(iter(missing_ohlcv.values()), {"message": "No OHLCV data available"})
-        raise HTTPException(status_code=404, detail=detail)
-
-    primary_symbol = next(iter(ohlcv_by_symbol))
-    indicators = _normalize_indicator_payloads(list(result.indicators))
-
-    if not indicators:
-        df = legacy_viewer._load_ohlcv_df(primary_symbol, timeframe)
-        if df is not None and len(df) > 0:
-            strategy_identifier = result.meta.strategies[0] if result.meta.strategies else ""
-            detected = legacy_viewer._detect_indicators(strategy_identifier)
-            if detected:
-                primary_trades = [
-                    trade for trade in trades if str(trade.get("symbol") or "").upper() == primary_symbol.upper()
-                ]
-                replay_df = _slice_replay_ohlcv(df, primary_trades)
-                ohlcv_times = [row["time"] for row in ohlcv_by_symbol[primary_symbol]]
-                indicators = legacy_viewer._compute_indicators(replay_df, detected, ohlcv_times)
-
-    if indicators and ohlcv_by_symbol.get(primary_symbol):
-        symbol_ohlcv = ohlcv_by_symbol[primary_symbol]
-        _slice_indicators_to_timestamps(
-            indicators,
-            ohlcv_times=[float(item.get("time", 0) or 0) for item in symbol_ohlcv],
+    try:
+        trades = [legacy_viewer._trade_to_viewer(trade) for trade in result.trades]
+        timeframe = (
+            result.meta.data.get("timeframes", ["1h"])[0] if result.meta.data.get("timeframes") else "1h"
+        )
+        timeframe = normalize_timeframe(timeframe)
+        symbols = sorted({trade.symbol for trade in result.trades if trade.symbol}) or list(
+            result.meta.data.get("symbols", [])
         )
 
-    drawings = _collect_viewer_drawings(result)
+        ohlcv_by_symbol: dict[str, list[dict[str, Any]]] = {}
+        missing_ohlcv: dict[str, dict[str, Any]] = {}
 
-    return {
-        "trades": trades,
-        "ohlcv_by_symbol": ohlcv_by_symbol,
-        "timeframe": timeframe,
-        "symbols": symbols,
-        "primary_symbol": primary_symbol,
-        "indicators": indicators,
-        "drawings": drawings,
-        "missing_ohlcv": missing_ohlcv,
-        "total_trades": len(result.trades),
-    }
+        for symbol in symbols:
+            df = legacy_viewer._load_ohlcv_df(symbol, timeframe)
+            if df is None or len(df) == 0:
+                missing_ohlcv[symbol] = legacy_viewer._missing_ohlcv_details(
+                    symbol,
+                    timeframe,
+                    backtest_start=str(result.meta.backtest_start or ""),
+                    backtest_end=str(result.meta.backtest_end or ""),
+                )
+                continue
+            symbol_trades = [trade for trade in trades if str(trade.get("symbol") or "").upper() == symbol.upper()]
+            replay_df = _slice_replay_ohlcv(df, symbol_trades)
+            ohlcv_by_symbol[symbol] = legacy_viewer._df_to_ohlcv_records(replay_df)
+
+        if not ohlcv_by_symbol:
+            detail = next(iter(missing_ohlcv.values()), {"message": "No OHLCV data available"})
+            raise HTTPException(status_code=404, detail=detail)
+
+        primary_symbol = next(iter(ohlcv_by_symbol))
+        indicators = _normalize_indicator_payloads(list(result.indicators))
+
+        if not indicators:
+            df = legacy_viewer._load_ohlcv_df(primary_symbol, timeframe)
+            if df is not None and len(df) > 0:
+                strategy_identifier = result.meta.strategies[0] if result.meta.strategies else ""
+                detected = legacy_viewer._detect_indicators(strategy_identifier)
+                if detected:
+                    primary_trades = [
+                        trade for trade in trades if str(trade.get("symbol") or "").upper() == primary_symbol.upper()
+                    ]
+                    replay_df = _slice_replay_ohlcv(df, primary_trades)
+                    ohlcv_times = [row["time"] for row in ohlcv_by_symbol[primary_symbol]]
+                    indicators = legacy_viewer._compute_indicators(replay_df, detected, ohlcv_times)
+
+        if indicators and ohlcv_by_symbol.get(primary_symbol):
+            symbol_ohlcv = ohlcv_by_symbol[primary_symbol]
+            _slice_indicators_to_timestamps(
+                indicators,
+                ohlcv_times=[float(item.get("time", 0) or 0) for item in symbol_ohlcv],
+            )
+
+        drawings = _collect_viewer_drawings(result)
+
+        return {
+            "trades": trades,
+            "ohlcv_by_symbol": ohlcv_by_symbol,
+            "timeframe": timeframe,
+            "symbols": symbols,
+            "primary_symbol": primary_symbol,
+            "indicators": indicators,
+            "drawings": drawings,
+            "missing_ohlcv": missing_ohlcv,
+            "total_trades": len(result.trades),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Trade replay payload failed for backtest '%s': %s", backtest_id, exc)
+        raise HTTPException(status_code=500, detail="Failed to load trade replay") from exc
 
 
 @app.get("/api/backtest/{backtest_id}/ohlcv", response_model=dict[str, Any])
@@ -7555,7 +7827,7 @@ async def list_portfolios(
 ) -> list[dict[str, Any]]:
     normalized_sort = _normalize_portfolio_sort(sort)
     normalized_order = _normalize_order(order, default="desc")
-    summaries = [_portfolio_summary_from_payload(payload) for payload in _snapshot_portfolio_payloads()]
+    summaries = _snapshot_portfolio_meta_cache()
     summaries = _filter_portfolios_by_name(summaries, name)
     summaries.sort(
         key=lambda item: (_portfolio_sort_key(item, normalized_sort), str(item.get("id") or "")),
@@ -7841,6 +8113,7 @@ async def create_portfolio(payload: CreatePortfolioRequest) -> dict[str, Any]:
     PORTFOLIOS_DIR.mkdir(parents=True, exist_ok=True)
     output_path = PORTFOLIOS_DIR / f"{portfolio_id}.json"
     output_path.write_text(json.dumps(normalized_portfolio, indent=2), encoding="utf-8")
+    _upsert_portfolio_meta_cache_from_payload(normalized_portfolio)
     return normalized_portfolio
 
 
@@ -7898,6 +8171,7 @@ async def rename_portfolio(portfolio_id: str, payload: NameUpdateRequest) -> dic
         logger.exception("Failed to rename portfolio '%s': %s", portfolio_id, exc)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
+    _upsert_portfolio_meta_cache_from_payload(normalized_portfolio)
     return {"id": portfolio_id, "name": updated_name, "status": "updated"}
 
 
@@ -8191,6 +8465,55 @@ async def delete_service_endpoint(service_id: str) -> dict[str, Any]:
     return {"status": "deleted", "id": service_id}
 
 
+def _service_log_tokens(service: Service) -> set[str]:
+    tokens: set[str] = set()
+    for value in (
+        str(service.id),
+        str(service.name or ""),
+        str((service.config or {}).get("channel_id") or ""),
+        str((service.config or {}).get("token_env_key") or ""),
+    ):
+        token = value.strip().lower()
+        if token:
+            tokens.add(token)
+    return tokens
+
+
+def _entry_matches_service_log(entry: dict[str, Any], *, service: Service, tokens: set[str]) -> bool:
+    line = str(entry.get("line") or "")
+    line_lower = line.lower()
+    if any(token in line_lower for token in tokens):
+        return True
+
+    path_name = str(entry.get("path") or "").lower()
+    if any(token in path_name for token in tokens):
+        return True
+
+    payload: dict[str, Any] | None = None
+    try:
+        parsed = json.loads(line)
+        if isinstance(parsed, dict):
+            payload = parsed
+    except json.JSONDecodeError:
+        payload = None
+
+    if payload is not None:
+        payload_blob = json.dumps(payload, default=str).lower()
+        if any(token in payload_blob for token in tokens):
+            return True
+
+    if service.type.value == "discord_bot":
+        discord_markers = ("discord", "webhook", "signal", "channel")
+        if any(marker in line_lower for marker in discord_markers):
+            return True
+        if payload is not None:
+            payload_blob = json.dumps(payload, default=str).lower()
+            if any(marker in payload_blob for marker in discord_markers):
+                return True
+
+    return False
+
+
 @app.get("/api/services/{service_id}/logs", response_model=LogContentModel)
 async def get_service_logs_endpoint(
     service_id: str,
@@ -8206,11 +8529,11 @@ async def get_service_logs_endpoint(
         level_filter = legacy_viewer._normalize_log_levels(level)
         if level_filter:
             entries = [entry for entry in entries if entry.get("level") in level_filter]
-        service_terms = {str(service.id).lower(), str(service.name).strip().lower()}
+        service_terms = _service_log_tokens(service)
         entries = [
             entry
             for entry in entries
-            if any(term and term in str(entry.get("line") or "").lower() for term in service_terms)
+            if _entry_matches_service_log(entry, service=service, tokens=service_terms)
         ]
         if search:
             query_lower = search.lower()
@@ -8788,7 +9111,7 @@ async def agent_convert(payload: AgentConvertRequest, background_tasks: Backgrou
         raise HTTPException(status_code=400, detail="A non-empty 'code' field is required")
 
     provider = str(payload.provider or "").strip().lower() or DEFAULT_LLM_PROVIDER_NAME
-    if provider not in SUPPORTED_LLM_PROVIDER_NAMES:
+    if provider not in AGENT_CONVERT_PROVIDER_NAMES:
         raise HTTPException(status_code=400, detail=f"Unsupported provider '{provider}'")
 
     model = str(payload.model or "").strip() or None
@@ -8800,7 +9123,11 @@ async def agent_convert(payload: AgentConvertRequest, background_tasks: Backgrou
                 detail=f"Unsupported model '{model}' for provider '{provider}'",
             )
     elif provider == "copilot_sdk":
-        model = model or str(os.getenv("COPILOT_SDK_MODEL") or "gpt-5").strip() or "gpt-5"
+        model = (
+            model
+            or str(os.getenv("COPILOT_SDK_MODEL") or "gpt-5-mini").strip()
+            or "gpt-5-mini"
+        )
 
     task_payload = {
         "code": code,
@@ -9023,20 +9350,17 @@ async def data_calibrate(payload: DataCalibrateRequest) -> dict[str, Any]:
 
 @app.get("/api/data/tasks", response_model=dict[str, Any])
 async def list_data_tasks() -> dict[str, Any]:
-    records = await asyncio.to_thread(list_background_task_records)
-    with DATA_TASKS_LOCK:
-        for record in records:
-            task_id = str(record.get("id") or "").strip()
-            if not task_id or task_id in DATA_TASKS:
-                continue
-            DATA_TASKS[task_id] = _build_task_from_record(record)
+    await asyncio.to_thread(_hydrate_task_cache_once)
 
     with DATA_TASKS_LOCK:
         snapshots = [(task_id, dict(task)) for task_id, task in DATA_TASKS.items()]
-    payload = [
-        _serialize_task(task_id, task, include_log=True, max_log_bytes=768)
-        for task_id, task in snapshots
-    ]
+    payload: list[dict[str, Any]] = []
+    for task_id, task in snapshots:
+        status = str(task.get("status") or "").lower()
+        include_log = status not in FINAL_TASK_STATUSES
+        item = _serialize_task(task_id, task, include_log=include_log, max_log_bytes=64)
+        item.pop("log", None)
+        payload.append(item)
     payload.sort(
         key=lambda item: (
             item.get("created_at") or "",

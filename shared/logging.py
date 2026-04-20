@@ -44,7 +44,7 @@ class JsonFormatter(logging.Formatter):
         timestamp = datetime.fromtimestamp(record.created, tz=timezone.utc).strftime(
             LOG_TIMESTAMP_FORMAT
         )
-        module_name = record.module or record.name or "<unknown>"
+        module_name = record.name or record.module or "<unknown>"
         function_name = record.funcName or "<unknown>"
         line_number = record.lineno if isinstance(record.lineno, int) else 0
         entry = {

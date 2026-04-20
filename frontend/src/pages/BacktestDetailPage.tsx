@@ -44,6 +44,30 @@ import { formatPValue, pValueColor } from "../utils/stats";
 import { useToast } from "../components/ToastProvider";
 
 const BENCHMARK_SYMBOLS = ["SPY", "QQQ", "IWM", "DIA", "GLD", "TLT", "XAUUSD"];
+const TRADE_PAGE_SIZE = 100;
+
+function normalizeEquityPoints(points: EquityPoint[] | null | undefined): EquityPoint[] {
+  if (!Array.isArray(points)) return [];
+  const normalized = points
+    .map((point) => {
+      const time = typeof point?.time === "number" ? point.time : Number(point?.time);
+      const equity = typeof point?.equity === "number" ? point.equity : Number(point?.equity);
+      if (!Number.isFinite(time) || !Number.isFinite(equity)) return null;
+      return { time, equity };
+    })
+    .filter((point): point is EquityPoint => point !== null)
+    .sort((left, right) => left.time - right.time);
+
+  const deduped: EquityPoint[] = [];
+  for (const point of normalized) {
+    if (deduped.length > 0 && deduped[deduped.length - 1].time === point.time) {
+      deduped[deduped.length - 1] = point;
+      continue;
+    }
+    deduped.push(point);
+  }
+  return deduped;
+}
 
 export function BacktestDetailPage() {
   const { id } = useParams<{ id: string }>();
@@ -52,6 +76,9 @@ export function BacktestDetailPage() {
   const [info, setInfo] = useState<BacktestInfo | null>(null);
   const [stats, setStats] = useState<BacktestStats | null>(null);
   const [trades, setTrades] = useState<Trade[]>([]);
+  const [tradePage, setTradePage] = useState(1);
+  const [hasMoreTrades, setHasMoreTrades] = useState(false);
+  const [tradesLoading, setTradesLoading] = useState(false);
   const [equity, setEquity] = useState<EquityPoint[]>([]);
   const [benchmarkSymbol, setBenchmarkSymbol] = useState("");
   const [benchmarkData, setBenchmarkData] = useState<any[]>([]);
@@ -69,17 +96,16 @@ export function BacktestDetailPage() {
   useEffect(() => {
     if (!id) return;
     setLoading(true);
+    setTradePage(1);
     Promise.all([
       getBacktestInfo(id),
       getBacktestStats(id),
-      getBacktestTrades(id),
       getBacktestEquity(id),
     ])
-      .then(([i, s, t, e]) => {
+      .then(([i, s, e]) => {
         setInfo(i);
         setStats(s);
-        setTrades(t);
-        setEquity(e);
+        setEquity(normalizeEquityPoints(e));
         setLoading(false);
       })
       .catch((err) => {
@@ -87,6 +113,23 @@ export function BacktestDetailPage() {
         setLoading(false);
       });
   }, [id]);
+
+  useEffect(() => {
+    if (!id) return;
+    setTradesLoading(true);
+    const offset = Math.max(0, (tradePage - 1) * TRADE_PAGE_SIZE);
+    getBacktestTrades(id, { offset, limit: TRADE_PAGE_SIZE })
+      .then((rows) => {
+        setTrades(rows || []);
+        setHasMoreTrades((rows || []).length >= TRADE_PAGE_SIZE);
+      })
+      .catch((err) => {
+        setError(err.message || String(err));
+      })
+      .finally(() => {
+        setTradesLoading(false);
+      });
+  }, [id, tradePage]);
 
   // Load benchmark data when symbol changes
   useEffect(() => {
@@ -97,7 +140,7 @@ export function BacktestDetailPage() {
     const start = info?.timeframe?.start?.slice(0, 10) || "";
     const end = info?.timeframe?.end?.slice(0, 10) || "";
     getBenchmark(benchmarkSymbol, start, end)
-      .then((data: any) => setBenchmarkData(data.equity || []))
+      .then((data: any) => setBenchmarkData(normalizeEquityPoints(data.equity || [])))
       .catch(() => setBenchmarkData([]));
   }, [benchmarkSymbol, info]);
 
@@ -173,16 +216,40 @@ export function BacktestDetailPage() {
       </div>
     );
 
-  const totalPnl = trades.reduce((sum, trade) => sum + (trade.pnl || 0), 0);
+  const totalPnl =
+    typeof stats?.net_profit === "number"
+      ? stats.net_profit
+      : trades.reduce((sum, trade) => sum + (trade.pnl || 0), 0);
+  const totalTrades =
+    typeof stats?.total_trades === "number" ? stats.total_trades : trades.length;
+  const winners = typeof stats?.winners === "number" ? stats.winners : trades.filter((t) => t.pnl > 0).length;
+  const losers = typeof stats?.losers === "number" ? stats.losers : trades.filter((t) => t.pnl <= 0).length;
+  const avgPnl =
+    typeof stats?.avg_trade_pnl === "number"
+      ? stats.avg_trade_pnl
+      : trades.length > 0
+        ? totalPnl / trades.length
+        : 0;
   const tradeStats = {
-    wins: trades.filter((t) => t.pnl > 0),
-    losses: trades.filter((t) => t.pnl <= 0),
+    wins: winners,
+    losses: losers,
     totalPnl,
-    avgPnl: trades.length > 0 ? totalPnl / trades.length : 0,
-    bestTrade: trades.length > 0 ? Math.max(...trades.map((trade) => trade.pnl || 0)) : 0,
-    worstTrade: trades.length > 0 ? Math.min(...trades.map((trade) => trade.pnl || 0)) : 0,
+    avgPnl,
+    bestTrade:
+      typeof stats?.best_trade === "number"
+        ? stats.best_trade
+        : trades.length > 0
+          ? Math.max(...trades.map((trade) => trade.pnl || 0))
+          : 0,
+    worstTrade:
+      typeof stats?.worst_trade === "number"
+        ? stats.worst_trade
+        : trades.length > 0
+          ? Math.min(...trades.map((trade) => trade.pnl || 0))
+          : 0,
     longTrades: trades.filter((trade) => trade.direction === "LONG").length,
     shortTrades: trades.filter((trade) => trade.direction === "SHORT").length,
+    totalTrades,
   };
 
   const toNumberOrNull = (value: unknown): number | null => {
@@ -246,6 +313,11 @@ export function BacktestDetailPage() {
       duration,
     };
   });
+
+  const engine = String(info?.engine || "")
+    .trim()
+    .toLowerCase();
+  const isSignalReplay = engine === "signal-replay" || engine === "signal_replay";
 
   return (
     <div style={{ padding: "24px" }}>
@@ -351,7 +423,7 @@ export function BacktestDetailPage() {
                 📅 {info?.timeframe?.start?.slice(0, 10)} →{" "}
                 {info?.timeframe?.end?.slice(0, 10)}
               </span>
-              {info?.engine === "signal-replay" ? (
+              {isSignalReplay ? (
                 <span style={{ marginRight: "16px" }}>
                   📡 {String(info?.parameters?.signal_source || "signal-replay")}
                 </span>
@@ -727,14 +799,14 @@ export function BacktestDetailPage() {
             marginBottom: "14px",
           }}
         >
-          <SummaryItem label="Total Trades" value={String(trades.length)} />
+          <SummaryItem label="Total Trades" value={String(tradeStats.totalTrades)} />
           <SummaryItem
             label="Long / Short"
             value={`${tradeStats.longTrades} / ${tradeStats.shortTrades}`}
           />
           <SummaryItem
             label="Win / Loss"
-            value={`${tradeStats.wins.length} / ${tradeStats.losses.length}`}
+            value={`${tradeStats.wins} / ${tradeStats.losses}`}
             color={`#3fb950 / #f85149`}
           />
           <SummaryItem
@@ -770,10 +842,59 @@ export function BacktestDetailPage() {
         }}
       >
         <h2 style={{ fontSize: "1rem", fontWeight: 600, marginBottom: "16px" }}>
-          Trades ({trades.length})
+          Trades (Page {tradePage}, {trades.length} rows)
         </h2>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: "12px",
+            marginBottom: "14px",
+          }}
+        >
+          <div style={{ color: "var(--color-text-muted)", fontSize: "0.85rem" }}>
+            Loaded in pages of {TRADE_PAGE_SIZE} trades.
+          </div>
+          <div style={{ display: "flex", gap: "8px" }}>
+            <button
+              type="button"
+              onClick={() => setTradePage((current) => Math.max(1, current - 1))}
+              disabled={tradePage <= 1 || tradesLoading}
+              style={{
+                borderRadius: "8px",
+                border: "1px solid var(--color-border)",
+                background: "var(--color-surface2)",
+                color: "var(--color-text)",
+                padding: "6px 10px",
+                cursor: tradePage <= 1 || tradesLoading ? "not-allowed" : "pointer",
+              }}
+            >
+              Prev
+            </button>
+            <button
+              type="button"
+              onClick={() => setTradePage((current) => current + 1)}
+              disabled={!hasMoreTrades || tradesLoading}
+              style={{
+                borderRadius: "8px",
+                border: "1px solid var(--color-border)",
+                background: "var(--color-surface2)",
+                color: "var(--color-text)",
+                padding: "6px 10px",
+                cursor: !hasMoreTrades || tradesLoading ? "not-allowed" : "pointer",
+              }}
+            >
+              Next
+            </button>
+          </div>
+        </div>
+        {tradesLoading ? (
+          <div style={{ marginBottom: "12px", color: "var(--color-text-muted)" }}>Loading trades...</div>
+        ) : null}
         <TradeTable
           trades={tradeRows}
+          showSignalColumns={isSignalReplay}
           onTradeClick={(row) => navigate(`/backtests/${id}/trade/${row.id}`)}
         />
       </div>
@@ -868,7 +989,9 @@ function EquityChart({
   } | null>(null);
 
   useEffect(() => {
-    if (!containerRef.current || !data.length) return;
+    const normalizedData = normalizeEquityPoints(data);
+    const normalizedBenchmark = normalizeEquityPoints(benchmark);
+    if (!containerRef.current || !normalizedData.length) return;
 
     if (chartRef.current) {
       chartRef.current.remove();
@@ -897,11 +1020,12 @@ function EquityChart({
       },
       crosshair: { mode: CrosshairMode.Normal },
       timeScale: { borderColor: "#30363d", timeVisible: false },
-      rightPriceScale: { borderColor: "#30363d" },
+      rightPriceScale: { borderColor: "#30363d", invertScale: false },
     });
     chartRef.current = chart;
 
-    const isProfit = data[data.length - 1].equity >= data[0].equity;
+    const isProfit =
+      normalizedData[normalizedData.length - 1].equity >= normalizedData[0].equity;
     const lineColor = isProfit ? "#3fb950" : "#f85149";
 
     // Main equity area series
@@ -917,12 +1041,12 @@ function EquityChart({
       },
     });
     equitySeries.setData(
-      data.map((d) => ({ time: d.time as Time, value: d.equity })),
+      normalizedData.map((d) => ({ time: d.time as Time, value: d.equity })),
     );
 
     // Benchmark line
-    if (benchmark.length > 1) {
-      const bmScale = data[0].equity / benchmark[0].equity;
+    if (normalizedBenchmark.length > 1) {
+      const bmScale = normalizedData[0].equity / normalizedBenchmark[0].equity;
       const bmSeries = chart.addSeries(LineSeries, {
         color: "#58a6ff",
         lineWidth: 1,
@@ -935,7 +1059,7 @@ function EquityChart({
         },
       });
       bmSeries.setData(
-        benchmark.map((d) => ({
+        normalizedBenchmark.map((d) => ({
           time: d.time as Time,
           value: d.equity * bmScale,
         })),
@@ -943,8 +1067,8 @@ function EquityChart({
     }
 
     // Drawdown histogram (sub-pane)
-    let peak = data[0].equity;
-    const ddData = data.map((d) => {
+    let peak = normalizedData[0].equity;
+    const ddData = normalizedData.map((d) => {
       if (d.equity > peak) peak = d.equity;
       const dd = (d.equity - peak) / peak;
       return {
@@ -977,11 +1101,11 @@ function EquityChart({
         return;
       }
       const eq = (eqVal as any).value as number;
-      const initial = data[0].equity;
+      const initial = normalizedData[0].equity;
       const ret = (((eq - initial) / initial) * 100).toFixed(2);
       // Find drawdown
       let p = initial;
-      for (const d of data) {
+      for (const d of normalizedData) {
         if (d.time > (param.time as number)) break;
         if (d.equity > p) p = d.equity;
       }

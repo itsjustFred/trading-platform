@@ -10,7 +10,7 @@ from typing import Any
 AUTH_SESSION_ERROR = (
     "copilot_sdk provider is configured but no valid Copilot SDK auth/session is available"
 )
-DEFAULT_COPILOT_SDK_MODEL = "gpt-5"
+DEFAULT_COPILOT_SDK_MODEL = "gpt-5-mini"
 MODEL_ALIASES: dict[str, str] = {
     "gpt-5": "gpt-5.2",
     "gpt-5.3-codex": "gpt-5-codex",

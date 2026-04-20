@@ -93,16 +93,31 @@ function tryParseJson(line: string): Record<string, unknown> | null {
 
 function parsePlainLine(line: string): ParsedLogLine {
   const timestampMatch = line.match(/(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})/);
-  const level = normalizeLevel(line);
+  const levelMatch = line.match(/\b(ERROR|WARNING|WARN|INFO|DEBUG)\b/i);
+  const moduleFuncMatch = line.match(
+    /\b([A-Za-z_][A-Za-z0-9_.-]*)\.([A-Za-z_][A-Za-z0-9_<>-]*)\b/,
+  );
+  const tracebackMatch = line.match(
+    /File "[^"]*\/([A-Za-z_][A-Za-z0-9_]*)\.py", line \d+, in ([A-Za-z_][A-Za-z0-9_<>-]*)/,
+  );
+  const uvicornPrefixMatch = line.match(/^\s*(INFO|ERROR|WARNING|DEBUG)\s*:\s*(.*)$/i);
+  const level = normalizeLevel(levelMatch?.[1] ?? line);
   const timestamp = parseTimestamp(timestampMatch?.[1] ?? "");
+  const moduleName = (
+    tracebackMatch?.[1] ||
+    moduleFuncMatch?.[1] ||
+    (uvicornPrefixMatch ? "uvicorn" : "app")
+  ).trim();
+  const funcName = (tracebackMatch?.[2] || moduleFuncMatch?.[2] || "unknown").trim();
+  const message = (uvicornPrefixMatch?.[2] || line).trim() || line;
   return {
     raw: line,
     timestampShort: timestamp.short,
     timestampLong: timestamp.long,
     level,
-    module: "plain",
-    func: "—",
-    message: line,
+    module: moduleName || "app",
+    func: funcName || "unknown",
+    message,
     data: null,
     isJson: false,
   };

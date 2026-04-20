@@ -36,7 +36,6 @@ const AI_MODELS: Array<{ label: string; value: AgentModelId }> = [
 
 const PROVIDER_OPTIONS: Array<{ label: string; value: AgentProviderId }> = [
   { label: "NVIDIA NIM", value: "nim" },
-  { label: "GitHub Copilot CLI", value: "copilot_cli" },
   { label: "GitHub Copilot SDK", value: "copilot_sdk" },
 ];
 
@@ -418,11 +417,7 @@ export function StrategyLabPage() {
                   type="text"
                   value={customModel}
                   onChange={(event) => setCustomModel(event.target.value)}
-                  placeholder={
-                    provider === "copilot_cli"
-                      ? "Optional model override (provider default if empty)"
-                      : "Optional model override (default: gpt-5)"
-                  }
+                  placeholder="Optional model override (default: gpt-5-mini)"
                   style={{
                     width: "100%",
                     borderRadius: "14px",
