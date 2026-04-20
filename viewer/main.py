@@ -3184,6 +3184,11 @@ def _list_strategies_payload() -> list[dict[str, Any]]:
                     if strategy_stats.get("best_sharpe") is not None
                     else None
                 ),
+                equity_preview=(
+                    list(strategy_stats.get("equity_preview", []))
+                    if isinstance(strategy_stats.get("equity_preview"), list)
+                    else []
+                ),
             )
         )
 
@@ -3879,6 +3884,257 @@ def _component_trade_time(trade: dict[str, Any]) -> str:
     return ""
 
 
+def _trade_numeric_value(trade: dict[str, Any], *keys: str) -> float | None:
+    for key in keys:
+        value = trade.get(key)
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(parsed):
+            return parsed
+    return None
+
+
+def _normalize_portfolio_trade_side_direction(trade: dict[str, Any]) -> tuple[str, str]:
+    raw = str(
+        trade.get("side")
+        or trade.get("direction")
+        or trade.get("action")
+        or ""
+    ).strip().upper()
+    if not raw:
+        return "BUY", "LONG"
+    if raw in {"BUY", "LONG", "B", "+1"} or "BUY" in raw:
+        return "BUY", "LONG"
+    if raw in {"SELL", "SHORT", "S", "-1"} or "SELL" in raw:
+        return "SELL", "SHORT"
+    if "LONG" in raw:
+        return "BUY", "LONG"
+    if "SHORT" in raw:
+        return "SELL", "SHORT"
+    return "BUY", "LONG"
+
+
+def _normalize_portfolio_trade_fields(raw_trade: dict[str, Any]) -> dict[str, Any]:
+    trade = dict(raw_trade)
+
+    side, direction = _normalize_portfolio_trade_side_direction(trade)
+    trade["side"] = side
+    trade["direction"] = direction
+
+    entry_price = _trade_numeric_value(trade, "entry_price", "entry", "open_price", "price")
+    if entry_price is not None:
+        trade["entry_price"] = entry_price
+
+    exits = trade.get("exits")
+    if not isinstance(exits, list):
+        exits = []
+
+    exit_price = _trade_numeric_value(trade, "exit_price", "close_price")
+    if exit_price is None:
+        for exit_row in reversed(exits):
+            if not isinstance(exit_row, dict):
+                continue
+            exit_price = _trade_numeric_value(exit_row, "price", "exit_price")
+            if exit_price is not None:
+                break
+    if exit_price is not None:
+        trade["exit_price"] = exit_price
+
+    quantity = _trade_numeric_value(
+        trade,
+        "quantity",
+        "qty",
+        "filled_qty",
+        "filled_quantity",
+        "order_qty",
+    )
+    if quantity is None:
+        for exit_row in exits:
+            if not isinstance(exit_row, dict):
+                continue
+            quantity = _trade_numeric_value(exit_row, "quantity", "qty", "filled_qty")
+            if quantity is not None:
+                break
+    if quantity is not None:
+        trade["quantity"] = quantity
+
+    position_size = _trade_numeric_value(
+        trade,
+        "position_size",
+        "size",
+        "quantity",
+        "qty",
+        "filled_qty",
+        "filled_quantity",
+    )
+    if position_size is not None:
+        trade["position_size"] = position_size
+
+    size = _trade_numeric_value(
+        trade,
+        "size",
+        "position_size",
+        "quantity",
+        "qty",
+        "filled_qty",
+        "filled_quantity",
+    )
+    trade["size"] = _safe_float(size, _safe_float(quantity, 0.0))
+
+    pnl = _trade_numeric_value(trade, "pnl", "realized_pnl", "profit", "net_profit")
+    if pnl is not None:
+        trade["pnl"] = pnl
+    pnl_pct = _trade_numeric_value(trade, "pnl_pct", "profit_pct", "return_pct")
+    if pnl_pct is not None:
+        trade["pnl_pct"] = pnl_pct
+
+    for iso_key, raw_key in (("entry_time_iso", "entry_time"), ("exit_time_iso", "exit_time")):
+        existing = str(trade.get(iso_key) or "").strip()
+        if existing:
+            continue
+        raw_value = trade.get(raw_key)
+        if raw_value is None:
+            continue
+        parsed = pd.to_datetime(raw_value, utc=True, errors="coerce")
+        if pd.isna(parsed):
+            continue
+        trade[iso_key] = pd.Timestamp(parsed).isoformat()
+
+    trade["time"] = _component_trade_time(trade)
+    trade["date"] = str(trade.get("time") or "").split("T", 1)[0]
+    trade["duration"] = _trade_duration_text(trade)
+    return trade
+
+
+def _normalized_iso_timestamp(value: Any) -> str:
+    parsed = pd.to_datetime(value, utc=True, errors="coerce")
+    if pd.isna(parsed):
+        return ""
+    return pd.Timestamp(parsed).isoformat()
+
+
+def _portfolio_backtest_trade_lookup(backtest_id: str) -> dict[tuple[str, str, str], list[dict[str, Any]]]:
+    normalized_backtest_id = str(backtest_id or "").strip()
+    if not normalized_backtest_id:
+        return {}
+
+    result = _load_result(normalized_backtest_id)
+    if result is None:
+        return {}
+
+    lookup: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for trade in result.trades:
+        payload = legacy_viewer._trade_to_viewer(trade)
+        symbol = _normalize_symbol_key(payload.get("symbol") or trade.symbol)
+        direction = str(payload.get("direction") or trade.direction or "").strip().upper() or "LONG"
+        trade_time_iso = (
+            str(payload.get("exit_time_iso") or "").strip()
+            or str(payload.get("entry_time_iso") or "").strip()
+        )
+        normalized_time = _normalized_iso_timestamp(trade_time_iso)
+        if not symbol or not normalized_time:
+            continue
+        key = (symbol, direction, normalized_time)
+        lookup.setdefault(key, []).append(payload)
+    return lookup
+
+
+def _enrich_portfolio_trade_from_backtest(
+    trade: dict[str, Any],
+    *,
+    backtest_id: str,
+    lookup_cache: dict[str, dict[tuple[str, str, str], list[dict[str, Any]]]],
+) -> dict[str, Any]:
+    normalized_backtest_id = str(backtest_id or "").strip()
+    if not normalized_backtest_id:
+        return trade
+
+    lookup = lookup_cache.get(normalized_backtest_id)
+    if lookup is None:
+        lookup = _portfolio_backtest_trade_lookup(normalized_backtest_id)
+        lookup_cache[normalized_backtest_id] = lookup
+    if not lookup:
+        return trade
+
+    symbol = _normalize_symbol_key(trade.get("symbol"))
+    direction = str(trade.get("direction") or "").strip().upper() or "LONG"
+    trade_time = _normalized_iso_timestamp(
+        trade.get("time") or trade.get("exit_time_iso") or trade.get("entry_time_iso")
+    )
+    if not symbol or not trade_time:
+        return trade
+
+    candidate_keys = [
+        (symbol, direction, trade_time),
+        (symbol, "LONG", trade_time),
+        (symbol, "SHORT", trade_time),
+    ]
+
+    candidates: list[dict[str, Any]] = []
+    selected_key: tuple[str, str, str] | None = None
+    for key in candidate_keys:
+        entries = lookup.get(key)
+        if entries:
+            candidates = entries
+            selected_key = key
+            break
+    if not candidates or selected_key is None:
+        return trade
+
+    selected_index = 0
+    pnl_value = _trade_numeric_value(trade, "pnl")
+    if pnl_value is not None and len(candidates) > 1:
+        selected_index = min(
+            range(len(candidates)),
+            key=lambda idx: abs(_safe_float(candidates[idx].get("pnl"), 0.0) - pnl_value),
+        )
+    candidate = candidates.pop(selected_index)
+    if not candidates:
+        lookup.pop(selected_key, None)
+
+    if _trade_numeric_value(trade, "entry_price", "entry") is None:
+        candidate_entry = _trade_numeric_value(candidate, "entry_price")
+        if candidate_entry is not None:
+            trade["entry_price"] = candidate_entry
+    if _trade_numeric_value(trade, "exit_price", "close_price") is None:
+        candidate_exit = _trade_numeric_value(candidate, "exit_price")
+        if candidate_exit is not None:
+            trade["exit_price"] = candidate_exit
+    if _trade_numeric_value(trade, "quantity", "qty", "filled_qty") is None:
+        candidate_qty = _trade_numeric_value(candidate, "quantity")
+        if candidate_qty is not None:
+            trade["quantity"] = candidate_qty
+    if _trade_numeric_value(trade, "position_size", "size") is None:
+        candidate_size = _trade_numeric_value(candidate, "position_size", "quantity")
+        if candidate_size is not None:
+            trade["position_size"] = candidate_size
+    if _trade_numeric_value(trade, "pnl_pct", "profit_pct", "return_pct") is None:
+        candidate_pnl_pct = _trade_numeric_value(candidate, "pnl_pct")
+        if candidate_pnl_pct is not None:
+            trade["pnl_pct"] = candidate_pnl_pct
+
+    if not str(trade.get("entry_time_iso") or "").strip():
+        trade["entry_time_iso"] = str(candidate.get("entry_time_iso") or "")
+    if not str(trade.get("exit_time_iso") or "").strip():
+        trade["exit_time_iso"] = str(candidate.get("exit_time_iso") or "")
+    if not isinstance(trade.get("exits"), list):
+        exits = candidate.get("exits")
+        if isinstance(exits, list):
+            trade["exits"] = [dict(item) for item in exits if isinstance(item, dict)]
+    if not str(trade.get("exit_reason") or "").strip():
+        trade["exit_reason"] = str(candidate.get("exit_reason") or "")
+    if not str(trade.get("side") or "").strip():
+        trade["side"] = "SELL" if direction == "SHORT" else "BUY"
+
+    return trade
+
+
 def _component_group_key(item: dict[str, Any], group_by: str) -> str:
     if group_by == "strategy":
         return str(item.get("strategy_name") or "unknown")
@@ -4235,13 +4491,7 @@ def _portfolio_trades_filtered(
         normalized_trade["strategy"] = strategy_name
         normalized_trade["symbol"] = normalized_symbol
         normalized_trade["timeframe"] = normalized_timeframe
-        normalized_trade["time"] = _component_trade_time(normalized_trade)
-        normalized_trade["date"] = str(normalized_trade.get("time") or "").split("T", 1)[0]
-        normalized_trade["size"] = _safe_float(
-            normalized_trade.get("position_size"),
-            _safe_float(normalized_trade.get("quantity"), 0.0),
-        )
-        normalized_trade["duration"] = _trade_duration_text(normalized_trade)
+        normalized_trade = _normalize_portfolio_trade_fields(normalized_trade)
         label_parts = [part for part in [normalized_symbol, normalized_timeframe] if part]
         normalized_trade["strategy_label"] = (
             f"{strategy_name} ({', '.join(label_parts)})" if strategy_name and label_parts else strategy_name
@@ -4396,6 +4646,7 @@ def _normalize_portfolio_payload(payload: dict[str, Any]) -> dict[str, Any]:
         for component in components
         if str(component.get("component_id") or "").strip()
     }
+    backtest_trade_lookup_cache: dict[str, dict[tuple[str, str, str], list[dict[str, Any]]]] = {}
     normalized_trades: list[dict[str, Any]] = []
     for raw_trade in normalized.get("trades", []):
         if not isinstance(raw_trade, dict):
@@ -4439,7 +4690,12 @@ def _normalize_portfolio_payload(payload: dict[str, Any]) -> dict[str, Any]:
         trade["strategy"] = strategy_name
         trade["symbol"] = symbol
         trade["timeframe"] = timeframe or "1h"
-        trade["time"] = _component_trade_time(trade)
+        trade = _enrich_portfolio_trade_from_backtest(
+            trade,
+            backtest_id=str(trade.get("backtest_id") or ""),
+            lookup_cache=backtest_trade_lookup_cache,
+        )
+        trade = _normalize_portfolio_trade_fields(trade)
         if "id" not in trade:
             nr_value = trade.get("nr")
             if component_id and nr_value is not None:
@@ -4591,6 +4847,7 @@ def _strategy_list_payload(
     *,
     backtest_count: int = 0,
     best_sharpe: float | None = None,
+    equity_preview: list[float] | None = None,
 ) -> dict[str, Any]:
     tags = entry.meta.get("tags", {})
     if not isinstance(tags, dict):
@@ -4618,12 +4875,19 @@ def _strategy_list_payload(
         "parameters": parameters if isinstance(parameters, dict) else {},
         "backtest_count": max(int(backtest_count or 0), 0),
         "best_sharpe": best_sharpe,
+        "equity_preview": list(equity_preview or []),
     }
 
 
 def _strategy_list_stats_from_backtests(entries: list[StrategyEntry]) -> dict[str, dict[str, Any]]:
     stats_by_slug: dict[str, dict[str, Any]] = {
-        entry.slug: {"backtest_count": 0, "best_sharpe": None}
+        entry.slug: {
+            "backtest_count": 0,
+            "best_sharpe": None,
+            "equity_preview": [],
+            "_latest_backtest_id": "",
+            "_latest_created_at": "",
+        }
         for entry in entries
     }
     if not entries:
@@ -4648,6 +4912,8 @@ def _strategy_list_stats_from_backtests(entries: list[StrategyEntry]) -> dict[st
         if not matched_slugs:
             continue
 
+        backtest_id = str(row.get("id") or "").strip()
+        created_at = str(row.get("created_at") or "")
         sharpe_value = None
         raw_sharpe = row.get("sharpe_ratio")
         if raw_sharpe is not None:
@@ -4659,12 +4925,41 @@ def _strategy_list_stats_from_backtests(entries: list[StrategyEntry]) -> dict[st
                 sharpe_value = None
 
         for slug in matched_slugs:
-            bucket = stats_by_slug.setdefault(slug, {"backtest_count": 0, "best_sharpe": None})
+            bucket = stats_by_slug.setdefault(
+                slug,
+                {
+                    "backtest_count": 0,
+                    "best_sharpe": None,
+                    "equity_preview": [],
+                    "_latest_backtest_id": "",
+                    "_latest_created_at": "",
+                },
+            )
             bucket["backtest_count"] = max(int(bucket.get("backtest_count", 0) or 0) + 1, 0)
             if sharpe_value is not None:
                 current_best = bucket.get("best_sharpe")
                 if current_best is None or sharpe_value > float(current_best):
                     bucket["best_sharpe"] = sharpe_value
+            current_latest = str(bucket.get("_latest_created_at") or "")
+            if backtest_id and (not current_latest or created_at >= current_latest):
+                bucket["_latest_backtest_id"] = backtest_id
+                bucket["_latest_created_at"] = created_at
+
+    preview_backtest_ids = [
+        str(bucket.get("_latest_backtest_id") or "").strip()
+        for bucket in stats_by_slug.values()
+        if str(bucket.get("_latest_backtest_id") or "").strip()
+    ]
+    if preview_backtest_ids:
+        _bulk_warm_backtest_equity_preview(preview_backtest_ids, limit=50)
+
+    for bucket in stats_by_slug.values():
+        backtest_id = str(bucket.get("_latest_backtest_id") or "").strip()
+        bucket["equity_preview"] = (
+            _cached_backtest_equity_preview_only(backtest_id, limit=50) if backtest_id else []
+        )
+        bucket.pop("_latest_backtest_id", None)
+        bucket.pop("_latest_created_at", None)
 
     return stats_by_slug
 
@@ -6547,12 +6842,13 @@ async def get_trade_with_context(backtest_id: str, trade_nr: int) -> dict[str, A
             result.meta.data.get("timeframes", ["1h"])[0] if result.meta.data.get("timeframes") else "1h"
         )
         timeframe = normalize_timeframe(timeframe)
+        symbol = str(trade.symbol or "").strip() or "SPY"
 
         ohlcv: list[dict[str, Any]] = []
-        df = legacy_viewer._load_ohlcv_df(trade.symbol, timeframe)
+        df = legacy_viewer._load_ohlcv_df(symbol, timeframe)
         if df is None or len(df) == 0:
             details = legacy_viewer._missing_ohlcv_details(
-                trade.symbol,
+                symbol,
                 timeframe,
                 backtest_start=str(result.meta.backtest_start or ""),
                 backtest_end=str(result.meta.backtest_end or ""),
@@ -6561,7 +6857,8 @@ async def get_trade_with_context(backtest_id: str, trade_nr: int) -> dict[str, A
 
         ohlcv_start_idx = 0
         ohlcv_end_idx = 0
-        entry_ts = pd.Timestamp(trade.entry_time, tz="UTC") if trade.entry_time else None
+        entry_ts_raw = pd.to_datetime(trade.entry_time, utc=True, errors="coerce")
+        entry_ts = pd.Timestamp(entry_ts_raw) if not pd.isna(entry_ts_raw) else None
         if entry_ts is not None:
             idx = df["timestamp"].searchsorted(entry_ts)
             ohlcv_start_idx = max(0, idx - legacy_viewer.BARS_BEFORE)
@@ -6569,7 +6866,7 @@ async def get_trade_with_context(backtest_id: str, trade_nr: int) -> dict[str, A
             ohlcv = legacy_viewer._df_to_ohlcv_records(df.iloc[ohlcv_start_idx:ohlcv_end_idx])
 
         indicators = _normalize_indicator_payloads(list(result.indicators))
-        drawings = _collect_viewer_drawings(result, trade.symbol)
+        drawings = _collect_viewer_drawings(result, symbol)
 
         if not indicators and ohlcv and df is not None:
             strategy_identifier = result.meta.strategies[0] if result.meta.strategies else ""
@@ -6588,7 +6885,7 @@ async def get_trade_with_context(backtest_id: str, trade_nr: int) -> dict[str, A
         return {
             "trade": trade_payload,
             "ohlcv": ohlcv,
-            "symbol": trade.symbol,
+            "symbol": symbol,
             "timeframe": timeframe,
             "indicators": indicators,
             "drawings": drawings,
@@ -7879,6 +8176,27 @@ async def deduplicate_portfolios() -> PortfoliosDeduplicateResponse:
     )
 
 
+@app.post("/api/portfolios/remove-empty", response_model=dict[str, Any])
+async def remove_empty_portfolios() -> dict[str, Any]:
+    portfolios = _snapshot_portfolio_payloads()
+    removed_ids: list[str] = []
+    for portfolio in portfolios:
+        portfolio_id = str(portfolio.get("id") or "").strip()
+        components = portfolio.get("components")
+        has_components = isinstance(components, list) and len(components) > 0
+        if not portfolio_id or has_components:
+            continue
+        if _delete_portfolio_with_artifacts(portfolio_id):
+            removed_ids.append(portfolio_id)
+
+    remaining = len(_snapshot_portfolio_payloads())
+    return {
+        "removed": len(removed_ids),
+        "remaining": remaining,
+        "removed_ids": removed_ids,
+    }
+
+
 @app.post("/api/portfolios", response_model=dict[str, Any], status_code=201)
 async def create_portfolio(payload: CreatePortfolioRequest) -> dict[str, Any]:
     name = str(payload.name or "Untitled").strip() or "Untitled"
@@ -8821,6 +9139,42 @@ async def get_live_stats(account_id: str) -> dict[str, Any]:
     return await asyncio.to_thread(_live_account_stats_payload, account_id)
 
 
+def _fallback_live_quote_payload(symbol: str, *, limit: int = 500) -> dict[str, Any] | None:
+    normalized_symbol = _normalize_symbol_key(symbol)
+    raw_symbol = str(symbol or "").strip().upper()
+    symbol_candidates = [candidate for candidate in [normalized_symbol, raw_symbol] if candidate]
+    if not symbol_candidates:
+        return None
+
+    timeframe_candidates = ["1m", "5m", "15m", "30m", "1h", "4h", "1d"]
+    for candidate_symbol in symbol_candidates:
+        for timeframe in timeframe_candidates:
+            df = legacy_viewer._load_ohlcv_df(candidate_symbol, timeframe)
+            if df is None or len(df) == 0:
+                continue
+            bars_df = df.tail(max(1, min(int(limit or 500), 2000)))
+            bars: list[dict[str, Any]] = []
+            for row in bars_df.itertuples():
+                timestamp = pd.to_datetime(getattr(row, "timestamp", None), utc=True, errors="coerce")
+                if pd.isna(timestamp):
+                    continue
+                bars.append(
+                    {
+                        "symbol": candidate_symbol,
+                        "timestamp": pd.Timestamp(timestamp).isoformat(),
+                        "time": float(pd.Timestamp(timestamp).timestamp()),
+                        "open": _safe_float(getattr(row, "open", None), 0.0),
+                        "high": _safe_float(getattr(row, "high", None), 0.0),
+                        "low": _safe_float(getattr(row, "low", None), 0.0),
+                        "close": _safe_float(getattr(row, "close", None), 0.0),
+                        "volume": _safe_float(getattr(row, "volume", None), 0.0),
+                    }
+                )
+            if bars:
+                return {"symbol": candidate_symbol, "latest": bars[-1], "bars": bars}
+    return None
+
+
 @app.get("/api/live/quotes/{symbol}", response_model=dict[str, Any])
 async def get_live_quotes(symbol: str) -> dict[str, Any]:
     _log_live_endpoint_request(
@@ -8829,7 +9183,10 @@ async def get_live_quotes(symbol: str) -> dict[str, Any]:
     )
     payload = await _live_market_data_service.get_quote_payload(symbol)
     if not payload.get("latest"):
-        raise HTTPException(status_code=404, detail=f"No live quote bars available for {symbol.upper()}")
+        fallback_payload = await asyncio.to_thread(_fallback_live_quote_payload, symbol, limit=500)
+        if fallback_payload is None:
+            raise HTTPException(status_code=404, detail=f"No live quote bars available for {symbol.upper()}")
+        return fallback_payload
     return payload
 
 

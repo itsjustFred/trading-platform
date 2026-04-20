@@ -17,6 +17,7 @@ export interface StrategyMeta {
   parameters: Record<string, StrategyParameterValue>;
   backtest_count: number;
   best_sharpe: number | null;
+  equity_preview?: number[];
 }
 
 export interface StrategyDetail extends StrategyMeta {
@@ -801,6 +802,12 @@ export interface PortfoliosDeduplicateResponse {
   deleted_ids: string[];
   kept_ids: string[];
   groups_affected: number;
+}
+
+export interface PortfoliosRemoveEmptyResponse {
+  removed: number;
+  remaining: number;
+  removed_ids: string[];
 }
 
 export interface TradeDetail extends Trade {

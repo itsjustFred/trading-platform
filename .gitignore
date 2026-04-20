@@ -45,10 +45,12 @@ frontend/dist/
 !tests/fixtures/*.csv
 !tests/fixtures/*.json
 
-# Cache
+# Cache/temp
 .pytest_cache/
 .ruff_cache/
 .playwright-mcp
+temp/
+tmp/
 
 # uv
 uv.lock

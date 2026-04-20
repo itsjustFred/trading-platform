@@ -58,6 +58,7 @@ import type {
   PortfoliosQueryParams,
   PortfoliosDuplicatesResponse,
   PortfoliosDeduplicateResponse,
+  PortfoliosRemoveEmptyResponse,
   BacktestsDuplicatesResponse,
   BacktestMetadataItem,
   BacktestsListResponse,
@@ -92,10 +93,14 @@ async function fetchJSON<T>(url: string, options?: RequestInit): Promise<T> {
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: res.statusText }));
     const detail = err?.detail ?? err;
+    const messageFromDetail =
+      typeof detail === "string"
+        ? detail
+        : typeof detail === "object" && detail && "message" in detail
+          ? String((detail as { message?: unknown }).message ?? "")
+          : "";
     const message =
-      (typeof detail === "object" && detail && "message" in detail
-        ? String((detail as { message?: unknown }).message ?? "")
-        : "") ||
+      messageFromDetail ||
       err?.error ||
       res.statusText;
     throw new ApiError(message, res.status, detail);
@@ -465,6 +470,10 @@ export const getPortfolioDuplicates = () =>
   fetchJSON<PortfoliosDuplicatesResponse>("/portfolios/duplicates");
 export const deduplicatePortfolios = () =>
   fetchJSON<PortfoliosDeduplicateResponse>("/portfolios/deduplicate", {
+    method: "POST",
+  });
+export const removeEmptyPortfolios = () =>
+  fetchJSON<PortfoliosRemoveEmptyResponse>("/portfolios/remove-empty", {
     method: "POST",
   });
 export const comparePortfolios = (ids: string[]) =>

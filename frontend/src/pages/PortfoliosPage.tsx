@@ -18,6 +18,7 @@ import {
   getSignalProcessors,
   getStrategies,
   getSymbols,
+  removeEmptyPortfolios,
 } from "../api/client";
 import { FilterBar } from "../components/FilterBar";
 import { Modal } from "../components/Modal";
@@ -447,6 +448,18 @@ export function PortfoliosPage() {
     }
   };
 
+  const handleRemoveEmpty = async () => {
+    try {
+      const payload = await removeEmptyPortfolios();
+      showToast(`Removed ${payload.removed} empty portfolio(s).`, "success");
+      setSelectedIds(new Set());
+      await loadPortfolios();
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : "Could not remove empty portfolios";
+      showToast(message, "error");
+    }
+  };
+
   const inputStyle: React.CSSProperties = {
     background: "var(--color-surface2)",
     border: "1px solid var(--color-border)",
@@ -577,6 +590,21 @@ export function PortfoliosPage() {
                 }}
               >
                 {loadingDuplicates ? "Checking..." : "Remove Duplicates"}
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleRemoveEmpty()}
+                style={{
+                  borderRadius: "8px",
+                  border: "1px solid rgba(248,113,113,0.4)",
+                  background: "rgba(127,29,29,0.2)",
+                  color: "#fecaca",
+                  padding: "7px 11px",
+                  fontSize: "0.74rem",
+                  cursor: "pointer",
+                }}
+              >
+                Remove Empty
               </button>
               {selectedCount > 0 ? (
                 <button

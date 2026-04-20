@@ -310,6 +310,64 @@ def test_trade_detail_includes_meta(viewer_client, tmp_path):
     assert payload["drawings"][1]["start_time"] == pytest.approx(1704103200.0)
 
 
+def test_trade_detail_handles_invalid_entry_time(viewer_client, tmp_path):
+    backtests_dir = tmp_path / "backtests"
+    ohlcv_dir = tmp_path / "ohlcv" / "test_source" / "equities" / "AAPL"
+    backtests_dir.mkdir(parents=True, exist_ok=True)
+    ohlcv_dir.mkdir(parents=True, exist_ok=True)
+
+    df = pd.DataFrame({
+        "timestamp": pd.date_range("2024-01-01T09:00:00Z", periods=8, freq="h", tz="UTC"),
+        "open": [100, 101, 102, 103, 104, 105, 106, 107],
+        "high": [101, 102, 103, 104, 105, 106, 107, 108],
+        "low": [99, 100, 101, 102, 103, 104, 105, 106],
+        "close": [100.5, 101.5, 102.5, 103.5, 104.5, 105.5, 106.5, 107.5],
+        "volume": [10, 11, 12, 13, 14, 15, 16, 17],
+    })
+    df.to_parquet(ohlcv_dir / "1h.parquet", index=False)
+
+    result = BacktestResult(
+        meta=BacktestMeta(
+            id="invalid-entry-time-demo",
+            created_at="2026-03-07T15:00:00Z",
+            engine="vectorbt",
+            strategies=["Malformed Timestamp Strategy"],
+            backtest_start="2024-01-01",
+            backtest_end="2024-01-31",
+            initial_capital=100000.0,
+            data={"timeframes": ["1h"], "symbols": ["AAPL"], "source": "test_source"},
+        ),
+        trades=[
+            Trade(
+                id=1,
+                symbol="AAPL",
+                direction="LONG",
+                entry_time="not-a-timestamp",
+                entry_price=101.5,
+                quantity=1,
+                exits=[
+                    TradeExit(
+                        time="2024-01-01T12:00:00+00:00",
+                        price=103.5,
+                        quantity=1,
+                        pnl=2.0,
+                    )
+                ],
+                pnl=2.0,
+            )
+        ],
+    )
+    result.save(backtests_dir / "invalid-entry-time-demo.trades.json")
+
+    resp = viewer_client.get("/api/backtest/invalid-entry-time-demo/trade/1")
+
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["symbol"] == "AAPL"
+    assert isinstance(payload["ohlcv"], list)
+    assert payload["trade"]["nr"] == 1
+
+
 def test_backtest_replay_endpoint_returns_full_chart_payload(viewer_client, tmp_path):
     backtests_dir = tmp_path / "backtests"
     ohlcv_dir = tmp_path / "ohlcv" / "test_source" / "equities" / "AAPL"
@@ -2850,6 +2908,71 @@ def test_backtest_equity_preview_endpoint_uses_cache(viewer_client, monkeypatch)
     assert calls["count"] == 1
 
 
+def test_strategies_endpoint_includes_latest_equity_preview(viewer_client, monkeypatch, tmp_path):
+    import viewer.main as viewer_app_module
+
+    strategy_file = tmp_path / "demo_strategy.py"
+    strategy_file.write_text("STRATEGY_META = {}", encoding="utf-8")
+    entry = viewer_app_module.StrategyEntry(
+        slug="demo-strategy",
+        file_path=strategy_file,
+        relative_file="demo_strategy.py",
+        directory=tmp_path,
+        documentation_path=None,
+        meta={
+            "name": "Demo Strategy",
+            "version": "1.0.0",
+            "source": "tests",
+            "tags": {"type": ["momentum"], "asset_class": ["equity"], "complexity": "medium"},
+            "parameters": {"lookback": 20},
+        },
+    )
+
+    warmed_ids: dict[str, list[str]] = {}
+
+    monkeypatch.setattr(viewer_app_module, "_safe_strategy_entries", lambda: [entry])
+    monkeypatch.setattr(
+        viewer_app_module,
+        "_snapshot_backtest_meta_cache",
+        lambda: [
+            {
+                "id": "demo-old",
+                "strategy_name": "Demo Strategy",
+                "created_at": "2026-03-09T10:00:00Z",
+                "sharpe_ratio": 2.0,
+            },
+            {
+                "id": "demo-latest",
+                "strategy_name": "Demo Strategy",
+                "created_at": "2026-03-12T12:30:00Z",
+                "sharpe_ratio": 1.2,
+            },
+        ],
+    )
+    monkeypatch.setattr(
+        viewer_app_module,
+        "_bulk_warm_backtest_equity_preview",
+        lambda backtest_ids, limit=50: warmed_ids.setdefault("ids", list(backtest_ids)),
+    )
+    monkeypatch.setattr(
+        viewer_app_module,
+        "_cached_backtest_equity_preview_only",
+        lambda backtest_id, limit=50: [100000.0, 100200.0, 100350.0] if backtest_id == "demo-latest" else [],
+    )
+    with viewer_app_module._STRATEGIES_CACHE_LOCK:
+        viewer_app_module._STRATEGIES_CACHE["payload"] = []
+        viewer_app_module._STRATEGIES_CACHE["expires_at"] = 0.0
+
+    response = viewer_client.get("/api/strategies")
+    assert response.status_code == 200
+    payload = response.json()
+    row = next(item for item in payload if item.get("slug") == "demo-strategy")
+    assert row["backtest_count"] == 2
+    assert row["best_sharpe"] == pytest.approx(2.0)
+    assert row["equity_preview"] == [100000.0, 100200.0, 100350.0]
+    assert warmed_ids["ids"] == ["demo-latest"]
+
+
 def test_backtests_cache_refreshes_when_sqlite_changes(viewer_client, monkeypatch):
     import viewer.main as viewer_app_module
 
@@ -3111,6 +3234,212 @@ def test_create_portfolio_allows_empty_components(viewer_client):
     assert payload["components"] == []
     assert payload["trades"] == []
     assert payload["combined_stats"]["total_return"] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_remove_empty_portfolios_endpoint_removes_only_empty(viewer_client, monkeypatch, tmp_path):
+    import viewer.main as viewer_app_module
+
+    monkeypatch.setattr(viewer_app_module, "list_portfolio_records", lambda: [])
+    monkeypatch.setattr(viewer_app_module, "delete_portfolio_record", lambda _portfolio_id: False)
+
+    portfolios_dir = tmp_path / "portfolios"
+    portfolios_dir.mkdir(parents=True, exist_ok=True)
+    (portfolios_dir / "portfolio-empty.json").write_text(
+        json.dumps(
+            {
+                "id": "portfolio-empty",
+                "name": "Empty Portfolio",
+                "components": [],
+                "trades": [],
+                "combined_stats": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (portfolios_dir / "portfolio-keep.json").write_text(
+        json.dumps(
+            {
+                "id": "portfolio-keep",
+                "name": "Active Portfolio",
+                "components": [
+                    {
+                        "component_id": "component-001",
+                        "strategy_name": "Keep Strategy",
+                        "symbol": "AAPL",
+                        "timeframe": "1h",
+                        "weight": 1.0,
+                        "risk_config": {},
+                        "settings": {},
+                        "backtest_id": "",
+                    }
+                ],
+                "trades": [],
+                "combined_stats": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    response = viewer_client.post("/api/portfolios/remove-empty")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["removed"] == 1
+    assert payload["removed_ids"] == ["portfolio-empty"]
+    assert payload["remaining"] >= 1
+    assert not (portfolios_dir / "portfolio-empty.json").exists()
+    assert (portfolios_dir / "portfolio-keep.json").exists()
+
+
+def test_portfolio_trades_normalize_qty_and_side_fields(viewer_client, monkeypatch, tmp_path):
+    import viewer.main as viewer_app_module
+
+    monkeypatch.setattr(viewer_app_module, "list_portfolio_records", lambda: [])
+
+    portfolios_dir = tmp_path / "portfolios"
+    portfolios_dir.mkdir(parents=True, exist_ok=True)
+    (portfolios_dir / "portfolio-trade-fields.json").write_text(
+        json.dumps(
+            {
+                "id": "portfolio-trade-fields",
+                "name": "Trade Fields",
+                "account_capital": 100000.0,
+                "components": [
+                    {
+                        "component_id": "component-001",
+                        "strategy_name": "Field Strategy",
+                        "symbol": "AAPL",
+                        "timeframe": "1h",
+                        "weight": 1.0,
+                        "risk_config": {},
+                        "settings": {},
+                        "backtest_id": "",
+                    }
+                ],
+                "trades": [
+                    {
+                        "nr": 3,
+                        "component_id": "component-001",
+                        "strategy_name": "Field Strategy",
+                        "symbol": "AAPL",
+                        "timeframe": "1h",
+                        "side": "short",
+                        "qty": "2.5",
+                        "entry": "100.5",
+                        "entry_time": "2024-01-01T10:00:00Z",
+                        "exits": [{"time": "2024-01-01T12:00:00Z", "price": "99.0", "qty": "2.5"}],
+                        "pnl": "3.75",
+                    }
+                ],
+                "combined_stats": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    response = viewer_client.get("/api/portfolios/portfolio-trade-fields/trades")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload) == 1
+    assert payload[0]["size"] == pytest.approx(2.5)
+    assert payload[0]["entry_price"] == pytest.approx(100.5)
+    assert payload[0]["exit_price"] == pytest.approx(99.0)
+    assert payload[0]["side"] == "SELL"
+    assert payload[0]["direction"] == "SHORT"
+    assert payload[0]["symbol"] == "AAPL"
+
+
+def test_portfolio_trades_enrich_missing_fields_from_backtest(viewer_client, monkeypatch, tmp_path):
+    import viewer.main as viewer_app_module
+
+    monkeypatch.setattr(viewer_app_module, "list_portfolio_records", lambda: [])
+
+    backtests_dir = tmp_path / "backtests"
+    backtests_dir.mkdir(parents=True, exist_ok=True)
+    result = BacktestResult(
+        meta=BacktestMeta(
+            id="portfolio-enrich-source",
+            created_at="2026-03-10T12:00:00Z",
+            engine="vectorbt",
+            strategies=["Enrich Strategy"],
+            backtest_start="2024-01-01",
+            backtest_end="2024-01-31",
+            initial_capital=100000.0,
+            data={"symbols": ["AAPL"], "timeframes": ["1h"], "source": "test_source"},
+        ),
+        trades=[
+            Trade(
+                id=1,
+                symbol="AAPL",
+                direction="LONG",
+                entry_time="2024-01-01T10:00:00Z",
+                entry_price=100.0,
+                quantity=2.0,
+                exits=[
+                    TradeExit(
+                        time="2024-01-01T12:00:00Z",
+                        price=103.0,
+                        quantity=2.0,
+                        pnl=6.0,
+                    )
+                ],
+                pnl=6.0,
+                pnl_pct=0.03,
+            )
+        ],
+        equity_curve=[],
+    )
+    result.save(backtests_dir / "portfolio-enrich-source.trades.json")
+
+    portfolios_dir = tmp_path / "portfolios"
+    portfolios_dir.mkdir(parents=True, exist_ok=True)
+    (portfolios_dir / "portfolio-enrich.json").write_text(
+        json.dumps(
+            {
+                "id": "portfolio-enrich",
+                "name": "Enrich Portfolio",
+                "account_capital": 100000.0,
+                "components": [
+                    {
+                        "component_id": "component-001",
+                        "strategy_name": "Enrich Strategy",
+                        "symbol": "AAPL",
+                        "timeframe": "1h",
+                        "weight": 1.0,
+                        "risk_config": {},
+                        "settings": {},
+                        "backtest_id": "portfolio-enrich-source",
+                    }
+                ],
+                "trades": [
+                    {
+                        "time": "2024-01-01T12:00:00Z",
+                        "pnl": 6.0,
+                        "strategy": "Enrich Strategy",
+                        "symbol": "AAPL",
+                        "direction": "LONG",
+                        "backtest_id": "portfolio-enrich-source",
+                        "component_id": "component-001",
+                    }
+                ],
+                "combined_stats": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    response = viewer_client.get("/api/portfolios/portfolio-enrich/trades")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload) == 1
+    assert payload[0]["size"] == pytest.approx(2.0)
+    assert payload[0]["entry_price"] == pytest.approx(100.0)
+    assert payload[0]["exit_price"] == pytest.approx(103.0)
+    assert payload[0]["pnl_pct"] == pytest.approx(0.03)
+    assert payload[0]["entry_time_iso"] == "2024-01-01T10:00:00Z"
+    assert payload[0]["exit_time_iso"] == "2024-01-01T12:00:00Z"
 
 
 def test_agent_convert_endpoint_starts_background_agent(viewer_client, monkeypatch):

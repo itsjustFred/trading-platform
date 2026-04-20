@@ -3,6 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { FilterBar } from "../components/FilterBar";
 import { useStrategies } from "../api/queries";
 import type { StrategyMeta } from "../api/types";
+import { Sparkline } from "../components/Sparkline";
 
 const StrategyCard = memo(function StrategyCard({
   strategy,
@@ -105,6 +106,11 @@ const StrategyCard = memo(function StrategyCard({
           </span>
         ) : null}
       </div>
+      {Array.isArray(strategy.equity_preview) && strategy.equity_preview.length > 1 ? (
+        <div style={{ marginTop: "8px" }}>
+          <Sparkline data={strategy.equity_preview} width={280} height={46} />
+        </div>
+      ) : null}
     </div>
   );
 });

@@ -61,6 +61,20 @@ function parseTimestamp(input: unknown): { short: string; long: string } {
   if (!raw) {
     return { short: "--:--:--", long: "Unknown timestamp" };
   }
+  const canonicalMatch = raw.match(
+    /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})(\.\d+)?(?:\s*(Z|[+-]\d{2}:?\d{2}))?$/,
+  );
+  if (canonicalMatch) {
+    const datePart = canonicalMatch[1];
+    const timePart = canonicalMatch[2];
+    const millis = canonicalMatch[3] ?? "";
+    const zone = canonicalMatch[4] ?? "";
+    return {
+      short: timePart,
+      long: `${datePart} ${timePart}${millis}${zone ? ` ${zone}` : ""}`.trim(),
+    };
+  }
+
   const date = new Date(raw);
   if (!Number.isNaN(date.getTime())) {
     const short = date.toLocaleTimeString("en-GB", { hour12: false });
@@ -70,11 +84,6 @@ function parseTimestamp(input: unknown): { short: string; long: string } {
       date.getMinutes(),
     ).padStart(2, "0")}:${String(date.getSeconds()).padStart(2, "0")}`;
     return { short, long };
-  }
-
-  const match = raw.match(/(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})/);
-  if (match) {
-    return { short: match[2], long: `${match[1]} ${match[2]}` };
   }
   return { short: raw.slice(0, 8), long: raw };
 }
@@ -108,7 +117,7 @@ function parsePlainLine(line: string): ParsedLogLine {
     moduleFuncMatch?.[1] ||
     (uvicornPrefixMatch ? "uvicorn" : "app")
   ).trim();
-  const funcName = (tracebackMatch?.[2] || moduleFuncMatch?.[2] || "unknown").trim();
+  const funcName = (tracebackMatch?.[2] || moduleFuncMatch?.[2] || "—").trim();
   const message = (uvicornPrefixMatch?.[2] || line).trim() || line;
   return {
     raw: line,
@@ -116,7 +125,7 @@ function parsePlainLine(line: string): ParsedLogLine {
     timestampLong: timestamp.long,
     level,
     module: moduleName || "app",
-    func: funcName || "unknown",
+    func: funcName || "—",
     message,
     data: null,
     isJson: false,

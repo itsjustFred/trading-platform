@@ -120,7 +120,11 @@ def resolve_alpaca_credentials(
                 bool(block["paper"]),
             )
 
-    if normalized_account_id or normalized_login:
+    has_configured_hints = any(
+        str(block.get("account_id_hint", "")).strip() or str(block.get("login_hint", "")).strip()
+        for block in blocks
+    )
+    if (normalized_account_id or normalized_login) and has_configured_hints:
         logger.warning(
             "No exact Alpaca credential block match; using first configured block",
             extra={
