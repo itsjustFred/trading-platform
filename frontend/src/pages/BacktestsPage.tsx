@@ -1161,7 +1161,6 @@ export function BacktestsPage() {
                       data={sparkline}
                       width={300}
                       height={92}
-                      trend={totalReturnPct >= 0 ? "up" : "down"}
                       interactive
                       startDate={item.start_date}
                       endDate={item.end_date}

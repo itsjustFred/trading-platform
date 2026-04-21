@@ -2349,12 +2349,18 @@ def load_backtest_equity_preview_points_map(
                     ROW_NUMBER() OVER (
                         PARTITION BY backtest_id, bucket
                         ORDER BY row_number ASC
-                    ) AS bucket_rank
+                    ) AS bucket_first_rank,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY backtest_id, bucket
+                        ORDER BY row_number DESC
+                    ) AS bucket_last_rank
                 FROM bucketed
             )
             SELECT backtest_id, time, equity
             FROM picked
-            WHERE total_count <= :limit OR bucket_rank = 1
+            WHERE total_count <= :limit
+               OR (bucket = :limit AND bucket_last_rank = 1)
+               OR (bucket != :limit AND bucket_first_rank = 1)
             ORDER BY backtest_id ASC, time ASC
             """
         )

@@ -48,10 +48,22 @@ export const Sparkline = memo(function Sparkline({
 
   // Fill area under the line
   const fillPoints = `0,${height} ${points} ${width},${height}`;
+  const drawdowns = useMemo(() => {
+    let peak = Number.NEGATIVE_INFINITY;
+    return normalized.map((value) => {
+      peak = Math.max(peak, value);
+      if (!Number.isFinite(peak) || Math.abs(peak) < 1e-9) {
+        return 0;
+      }
+      return ((value - peak) / Math.abs(peak)) * 100;
+    });
+  }, [normalized]);
 
   const hoverIdx = hoverIndex == null ? null : Math.max(0, Math.min(normalized.length - 1, hoverIndex));
   const hoverX = hoverIdx == null ? 0 : (hoverIdx / (normalized.length - 1)) * width;
+  const hoverY = hoverIdx == null ? 0 : height - ((normalized[hoverIdx] - min) / range) * (height - 4) - 2;
   const hoverValue = hoverIdx == null ? null : normalized[hoverIdx];
+  const hoverDrawdown = hoverIdx == null ? null : drawdowns[hoverIdx];
   const parsedStart = Date.parse(startDate || "");
   const parsedEnd = Date.parse(endDate || "");
   const hasDateRange = Number.isFinite(parsedStart) && Number.isFinite(parsedEnd) && parsedEnd >= parsedStart;
@@ -61,6 +73,7 @@ export const Sparkline = memo(function Sparkline({
       : hasDateRange
         ? new Date(parsedStart + ((parsedEnd - parsedStart) * hoverIdx) / (normalized.length - 1)).toLocaleDateString("de-DE")
         : "";
+  const hoverPointLabel = hoverIdx == null ? "" : `Punkt ${hoverIdx + 1}`;
 
   return (
     <div style={{ position: "relative", width, height, overflow: "visible" }}>
@@ -89,15 +102,18 @@ export const Sparkline = memo(function Sparkline({
           strokeLinejoin="round"
         />
         {interactive && hoverIdx != null ? (
-          <line
-            x1={hoverX}
-            x2={hoverX}
-            y1={2}
-            y2={height - 2}
-            stroke="rgba(255,255,255,0.35)"
-            strokeWidth="1"
-            strokeDasharray="2 2"
-          />
+          <>
+            <line
+              x1={hoverX}
+              x2={hoverX}
+              y1={2}
+              y2={height - 2}
+              stroke="rgba(255,255,255,0.35)"
+              strokeWidth="1"
+              strokeDasharray="2 2"
+            />
+            <circle cx={hoverX} cy={hoverY} r={2.5} fill={color} stroke="rgba(15,23,42,0.85)" strokeWidth="1" />
+          </>
         ) : null}
       </svg>
       {interactive && hoverValue != null ? (
@@ -105,7 +121,7 @@ export const Sparkline = memo(function Sparkline({
           style={{
             position: "absolute",
             top: 4,
-            left: Math.max(4, Math.min(width - 142, hoverX - 64)),
+            left: Math.max(4, Math.min(width - 176, hoverX - 86)),
             background: "rgba(15, 23, 42, 0.96)",
             border: "1px solid rgba(148, 163, 184, 0.3)",
             borderRadius: 6,
@@ -116,7 +132,11 @@ export const Sparkline = memo(function Sparkline({
             whiteSpace: "nowrap",
           }}
         >
-          {hoverDate ? `${hoverDate} · ` : ""}${hoverValue.toLocaleString("en-US", { maximumFractionDigits: 0 })}
+          <div>{hoverDate || hoverPointLabel}</div>
+          <div>
+            {hoverValue.toLocaleString("en-US", { maximumFractionDigits: 0 })}
+            {hoverDrawdown != null ? ` · DD ${hoverDrawdown.toFixed(2)}%` : ""}
+          </div>
         </div>
       ) : null}
     </div>
