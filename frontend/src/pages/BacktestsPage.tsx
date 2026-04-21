@@ -1157,7 +1157,15 @@ export function BacktestsPage() {
                   }}
                 >
                   {sparkline.length > 1 ? (
-                    <Sparkline data={sparkline} width={300} height={92} />
+                    <Sparkline
+                      data={sparkline}
+                      width={300}
+                      height={92}
+                      trend={totalReturnPct >= 0 ? "up" : "down"}
+                      interactive
+                      startDate={item.start_date}
+                      endDate={item.end_date}
+                    />
                   ) : (
                     <span style={{ color: "var(--color-text-muted)", fontSize: "0.72rem" }}>
                       No equity preview

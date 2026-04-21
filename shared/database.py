@@ -2247,45 +2247,25 @@ def load_backtest_equity_preview_points(backtest_id: str, limit: int = 80) -> li
     normalized_id = str(backtest_id or "").strip()
     if not normalized_id:
         return []
-
-    try:
-        normalized_limit = int(limit)
-    except (TypeError, ValueError):
-        normalized_limit = 80
-    normalized_limit = max(1, min(normalized_limit, 200))
-
-    init_db()
-    with get_session() as session:
-        rows = session.exec(
-            select(EquityPoint)
-            .where(EquityPoint.backtest_id == normalized_id)
-            .order_by(EquityPoint.time.desc(), EquityPoint.id.desc())
-            .limit(normalized_limit)
-        ).all()
-
-    points: list[EquityPointModel] = []
-    for raw_row in reversed(rows):
-        if raw_row is None:
-            continue
-        if isinstance(raw_row, EquityPoint):
-            row = raw_row
-        elif hasattr(raw_row, "_mapping"):
-            values = list(getattr(raw_row, "_mapping").values())
-            row = values[0] if values else None
-        elif isinstance(raw_row, (tuple, list)):
-            row = raw_row[0] if raw_row else None
-        else:
-            row = raw_row
-        if not isinstance(row, EquityPoint):
-            continue
-        points.append(EquityPointModel(time=row.time, equity=row.equity))
-    return points
+    preview_map = load_backtest_equity_preview_points_map([normalized_id], limit=limit)
+    return list(preview_map.get(normalized_id, []))
 
 
 def load_backtest_equity_preview_map(
     backtest_ids: list[str],
     limit: int = 50,
 ) -> dict[str, list[float]]:
+    point_map = load_backtest_equity_preview_points_map(backtest_ids, limit=limit)
+    return {
+        backtest_id: [float(point.equity) for point in points]
+        for backtest_id, points in point_map.items()
+    }
+
+
+def load_backtest_equity_preview_points_map(
+    backtest_ids: list[str],
+    limit: int = 50,
+) -> dict[str, list[EquityPointModel]]:
     normalized_ids = [str(backtest_id).strip() for backtest_id in backtest_ids if str(backtest_id).strip()]
     if not normalized_ids:
         return {}
@@ -2304,45 +2284,101 @@ def load_backtest_equity_preview_map(
         params[param_name] = backtest_id
         placeholders.append(f":{param_name}")
 
-    ranked_query = text(
-        f"""
-        WITH ranked AS (
-            SELECT
-                backtest_id,
-                time,
-                equity,
-                ROW_NUMBER() OVER (
-                    PARTITION BY backtest_id
-                    ORDER BY time DESC, id DESC
-                ) AS row_number
-            FROM equity_points
-            WHERE backtest_id IN ({", ".join(placeholders)})
+    if normalized_limit <= 1:
+        ranked_query = text(
+            f"""
+            WITH ranked AS (
+                SELECT
+                    backtest_id,
+                    time,
+                    equity,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY backtest_id
+                        ORDER BY time DESC, id DESC
+                    ) AS row_number
+                FROM equity_points
+                WHERE backtest_id IN ({", ".join(placeholders)})
+            )
+            SELECT backtest_id, time, equity
+            FROM ranked
+            WHERE row_number = 1
+            ORDER BY backtest_id ASC, time ASC
+            """
         )
-        SELECT backtest_id, time, equity
-        FROM ranked
-        WHERE row_number <= :limit
-        ORDER BY backtest_id ASC, time ASC
-        """
-    )
+    else:
+        ranked_query = text(
+            f"""
+            WITH ordered AS (
+                SELECT
+                    backtest_id,
+                    time,
+                    equity,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY backtest_id
+                        ORDER BY time ASC, id ASC
+                    ) AS row_number,
+                    COUNT(*) OVER (
+                        PARTITION BY backtest_id
+                    ) AS total_count
+                FROM equity_points
+                WHERE backtest_id IN ({", ".join(placeholders)})
+            ),
+            bucketed AS (
+                SELECT
+                    backtest_id,
+                    time,
+                    equity,
+                    row_number,
+                    total_count,
+                    CASE
+                        WHEN total_count <= :limit THEN row_number
+                        ELSE CAST(
+                            ((row_number - 1) * 1.0 * (:limit - 1)) / (total_count - 1)
+                            AS INTEGER
+                        ) + 1
+                    END AS bucket
+                FROM ordered
+            ),
+            picked AS (
+                SELECT
+                    backtest_id,
+                    time,
+                    equity,
+                    total_count,
+                    bucket,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY backtest_id, bucket
+                        ORDER BY row_number ASC
+                    ) AS bucket_rank
+                FROM bucketed
+            )
+            SELECT backtest_id, time, equity
+            FROM picked
+            WHERE total_count <= :limit OR bucket_rank = 1
+            ORDER BY backtest_id ASC, time ASC
+            """
+        )
 
     with get_session() as session:
         rows = session.exec(ranked_query, params=params).all()
 
-    previews: dict[str, list[float]] = {backtest_id: [] for backtest_id in normalized_ids}
+    previews: dict[str, list[EquityPointModel]] = {backtest_id: [] for backtest_id in normalized_ids}
     for row in rows:
         if hasattr(row, "_mapping"):
             mapping = getattr(row, "_mapping")
             backtest_id = str(mapping.get("backtest_id") or "").strip()
+            timestamp = str(mapping.get("time") or "").strip()
             equity_value = mapping.get("equity")
         elif isinstance(row, (tuple, list)):
             backtest_id = str(row[0] or "").strip() if len(row) > 0 else ""
+            timestamp = str(row[1] or "").strip() if len(row) > 1 else ""
             equity_value = row[2] if len(row) > 2 else None
         else:
             continue
-        if not backtest_id or backtest_id not in previews:
+        if not backtest_id or backtest_id not in previews or not timestamp:
             continue
         try:
-            previews[backtest_id].append(float(equity_value))
+            previews[backtest_id].append(EquityPointModel(time=timestamp, equity=float(equity_value)))
         except (TypeError, ValueError):
             continue
 

@@ -3236,6 +3236,74 @@ def test_create_portfolio_allows_empty_components(viewer_client):
     assert payload["combined_stats"]["total_return"] == pytest.approx(0.0, abs=1e-9)
 
 
+def test_portfolio_contributions_fallback_to_backtest_metrics(viewer_client, monkeypatch, tmp_path):
+    import viewer.main as viewer_app_module
+
+    monkeypatch.setattr(viewer_app_module, "list_portfolio_records", lambda: [])
+    with viewer_app_module._PORTFOLIO_META_CACHE_LOCK:
+        viewer_app_module._PORTFOLIO_META_CACHE.clear()
+        viewer_app_module._PORTFOLIO_META_CACHE_WARMED = False
+
+    portfolios_dir = tmp_path / "portfolios"
+    portfolios_dir.mkdir(parents=True, exist_ok=True)
+    (portfolios_dir / "portfolio-contrib-fallback.json").write_text(
+        json.dumps(
+            {
+                "id": "portfolio-contrib-fallback",
+                "name": "Contribution Fallback",
+                "account_capital": 100000.0,
+                "components": [
+                    {
+                        "component_id": "component-001",
+                        "strategy_name": "Fallback Strat",
+                        "symbol": "AAPL",
+                        "timeframe": "1h",
+                        "weight": 0.5,
+                        "risk_config": {},
+                        "settings": {},
+                        "backtest_id": "fallback-backtest",
+                        "return_contribution": 0.0,
+                        "drawdown_contribution": 0.0,
+                    }
+                ],
+                "trades": [{"component_id": "component-001", "pnl": 50.0}],
+                "combined_stats": {"total_return": 0.2, "max_drawdown": 0.15, "net_profit": 50.0},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        viewer_app_module,
+        "_load_result",
+        lambda backtest_id: (SimpleNamespace(stats={}, trades=[]) if backtest_id == "fallback-backtest" else None),
+    )
+    monkeypatch.setattr(
+        viewer_app_module.legacy_viewer,
+        "_canonical_stats_from_result",
+        lambda _result: {
+            "total_return": 0.18,
+            "max_drawdown": 0.12,
+            "sharpe_ratio": 1.4,
+            "psr": 0.88,
+            "p_value": 0.03,
+            "win_rate": 0.55,
+            "cagr": 0.24,
+        },
+    )
+
+    response = viewer_client.get("/api/portfolios/portfolio-contrib-fallback/contributions?group_by=strategy")
+    assert response.status_code == 200
+    rows = response.json()
+    assert rows
+    row = rows[0]
+    assert row["group"] == "strategy"
+    assert row["return_contribution"] == pytest.approx(0.09, abs=1e-9)
+    assert row["drawdown_contribution"] == pytest.approx(0.06, abs=1e-9)
+    assert row["cagr"] == pytest.approx(0.24, abs=1e-9)
+    assert row["trade_count"] == 1
+
+
 def test_remove_empty_portfolios_endpoint_removes_only_empty(viewer_client, monkeypatch, tmp_path):
     import viewer.main as viewer_app_module
 

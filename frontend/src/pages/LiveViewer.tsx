@@ -70,6 +70,12 @@ type TradeMarker = {
 const LIVE_VIEWER_FALLBACK_POLL_MS = 30_000;
 const DEFAULT_BARS_LIMIT = 500;
 
+function resolveChartLocale(): string {
+  if (typeof navigator === "undefined") return "en-US";
+  const language = String(navigator.language || "").trim();
+  return language && language !== "undefined" ? language : "en-US";
+}
+
 export function LiveViewerPage() {
   const { accountId: rawAccountId } = useParams<{ accountId: string }>();
   const navigate = useNavigate();
@@ -215,6 +221,20 @@ export function LiveViewerPage() {
   const positions = positionsPayload?.positions ?? [];
   const signals = signalsPayload?.signals ?? [];
   const trades = useMemo(() => toTradeHistoryRows(fills), [fills]);
+  const symbols = useMemo(
+    () => uniqueSymbols(deployments, fills, positions, signals),
+    [deployments, fills, positions, signals],
+  );
+
+  useEffect(() => {
+    setSelectedSymbol((current) => {
+      const normalizedCurrent = current.trim().toUpperCase();
+      if (normalizedCurrent && symbols.includes(normalizedCurrent)) {
+        return normalizedCurrent;
+      }
+      return symbols[0] ?? "";
+    });
+  }, [symbols]);
 
   const chartBars = useMemo(() => quotePayload?.bars ?? [], [quotePayload?.bars]);
   const quoteSymbol = quotePayload?.symbol ?? "";
@@ -300,7 +320,6 @@ export function LiveViewerPage() {
 
   const accountName = account?.name?.trim() || accountId;
   const accountBroker = account?.broker ?? "unknown";
-  const symbols = uniqueSymbols(deployments, fills, positions, signals);
   const isRealtimeConnected =
     positionsStream.isConnected && signalsStream.isConnected && executionsStream.isConnected;
 
@@ -463,7 +482,7 @@ export function LiveViewerPage() {
                   key={`${position.symbol}-${position.qty}`}
                   type="button"
                   onClick={() => setSelectedSymbol(position.symbol)}
-                  style={positionCardStyle(position, selectedSymbol)}
+                  style={positionCardStyle(position, effectiveSymbol)}
                 >
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                     <strong style={{ fontSize: "0.9rem" }}>{position.symbol}</strong>
@@ -626,6 +645,7 @@ function LiveCandlestickChart({
     const chart = createChart(container, {
       width: container.clientWidth || 960,
       height: 470,
+      localization: { locale: resolveChartLocale() },
       layout: {
         background: { type: ColorType.Solid, color: "#0d1117" },
         textColor: "#a8b3c6",

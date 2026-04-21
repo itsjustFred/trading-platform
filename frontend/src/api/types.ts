@@ -1051,6 +1051,7 @@ export interface PortfolioContribution {
   psr?: number;
   p_value?: number;
   max_drawdown?: number;
+  cagr?: number;
   pnl_total: number;
   pnl_contribution: number;
   pnl_contribution_pct: number;

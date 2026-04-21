@@ -398,18 +398,18 @@ export function PortfolioDetailPage() {
                   <PencilLine size={14} />
                 </button>
               </div>
-              <div
-                style={{
-                  color: "var(--color-text-muted)",
-                  fontSize: "0.82rem",
-                  marginTop: "4px",
-                }}
-              >
-                {components.length} components • ${(detail.account_capital || 100000).toLocaleString()} capital •{" "}
-                {trades.length} trades
+                <div
+                  style={{
+                    color: "var(--color-text-muted)",
+                    fontSize: "0.82rem",
+                    marginTop: "4px",
+                  }}
+                >
+                  {components.length} components • ${(detail.account_capital || 100000).toLocaleString()} capital •{" "}
+                  {trades.length} trades
+                </div>
               </div>
             </div>
-          </div>
           <button
             type="button"
             onClick={() => void handleDelete()}
@@ -572,6 +572,7 @@ export function PortfolioDetailPage() {
         <div style={{ marginBottom: "16px" }}>
           <ContributionTable
             rows={filteredContributions}
+            groupBy={groupBy}
             sort={contributionSort}
             onSort={setSortKey}
           />
@@ -655,13 +656,22 @@ export function PortfolioDetailPage() {
 
 function ContributionTable({
   rows,
+  groupBy,
   sort,
   onSort,
 }: {
   rows: PortfolioContribution[];
+  groupBy: GroupBy;
   sort: { key: keyof PortfolioContribution; direction: "asc" | "desc" };
   onSort: (key: keyof PortfolioContribution) => void;
 }) {
+  const groupLabel: Record<GroupBy, string> = {
+    component: "Component",
+    strategy: "Strategy",
+    symbol: "Symbol",
+    timeframe: "Timeframe",
+  };
+
   const headerButton = (label: string, key: keyof PortfolioContribution) => (
     <button
       type="button"
@@ -688,13 +698,14 @@ function ContributionTable({
       <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.78rem" }}>
         <thead style={{ background: "var(--color-surface2)" }}>
           <tr>
-            <th style={thStyle}>{headerButton("Component", "group_value")}</th>
+            <th style={thStyle}>{headerButton(groupLabel[groupBy], "group_value")}</th>
             <th style={thStyle}>{headerButton("Return", "return_contribution")}</th>
             <th style={thStyle}>{headerButton("Drawdown", "drawdown_contribution")}</th>
             <th style={thStyle}>{headerButton("Sharpe (higher = better)", "sharpe_ratio")}</th>
             <th style={thStyle}>{headerButton("PSR (higher = better)", "psr")}</th>
             <th style={thStyle}>{headerButton("p-Value (lower = better)", "p_value")}</th>
             <th style={thStyle}>{headerButton("Max DD (lower = better)", "max_drawdown")}</th>
+            <th style={thStyle}>{headerButton("CAGR (higher = better)", "cagr")}</th>
             <th style={thStyle}>{headerButton("Win Rate (higher = better)", "win_rate")}</th>
             <th style={thStyle}>{headerButton("Trades", "trade_count")}</th>
             <th style={thStyle}>{headerButton("PnL", "pnl_total")}</th>
@@ -712,6 +723,9 @@ function ContributionTable({
               <td style={{ ...tdStyle, color: "#f85149" }}>
                 {row.max_drawdown != null ? `-${(Number(row.max_drawdown) * 100).toFixed(2)}%` : "—"}
               </td>
+              <td style={{ ...tdStyle, color: Number(row.cagr || 0) >= 0 ? "#3fb950" : "#f85149" }}>
+                {row.cagr != null ? `${(Number(row.cagr) * 100).toFixed(2)}%` : "—"}
+              </td>
               <td style={tdStyle}>{row.win_rate.toFixed(2)}%</td>
               <td style={tdStyle}>{row.trade_count}</td>
               <td style={{ ...tdStyle, color: row.pnl_total >= 0 ? "#3fb950" : "#f85149" }}>
@@ -721,7 +735,7 @@ function ContributionTable({
           ))}
           {rows.length === 0 && (
             <tr>
-              <td colSpan={10} style={{ ...tdStyle, color: "var(--color-text-muted)" }}>
+              <td colSpan={11} style={{ ...tdStyle, color: "var(--color-text-muted)" }}>
                 No contribution rows match current filters.
               </td>
             </tr>

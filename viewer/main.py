@@ -4261,6 +4261,8 @@ def _compute_portfolio_contributions(
             "p_value": 1.0,
             "max_drawdown": 0.0,
             "win_rate": raw_win_rate if raw_win_rate is not None else 0.0,
+            "cagr": 0.0,
+            "total_return": 0.0,
         }
         backtest_id = str(component.get("backtest_id") or "").strip()
         if backtest_id:
@@ -4268,12 +4270,17 @@ def _compute_portfolio_contributions(
             if result is not None:
                 try:
                     raw = legacy_viewer._canonical_stats_from_result(result)
+                    max_drawdown = abs(
+                        _safe_float(raw.get("max_drawdown_pct"), _safe_float(raw.get("max_drawdown"), 0.0))
+                    )
                     metrics = {
                         "sharpe_ratio": _safe_float(raw.get("sharpe_ratio"), 0.0),
                         "psr": _safe_float(raw.get("psr"), 0.0),
                         "p_value": _safe_float(raw.get("p_value"), 1.0),
-                        "max_drawdown": abs(_safe_float(raw.get("max_drawdown_pct"), 0.0)),
+                        "max_drawdown": max_drawdown,
                         "win_rate": _normalize_win_rate(raw.get("win_rate")) or 0.0,
+                        "cagr": _safe_float(raw.get("cagr"), 0.0),
+                        "total_return": _safe_float(raw.get("total_return"), 0.0),
                     }
                 except Exception as exc:
                     logger.warning(
@@ -4319,6 +4326,8 @@ def _compute_portfolio_contributions(
                 "p_value_sum": 0.0,
                 "max_drawdown_sum": 0.0,
                 "win_rate_sum": 0.0,
+                "cagr_sum": 0.0,
+                "total_return_sum": 0.0,
             },
         )
         if not bucket.get("strategy_name"):
@@ -4330,12 +4339,6 @@ def _compute_portfolio_contributions(
         bucket["component_ids"].append(component_id)
         weight = _safe_float(component.get("weight"), 0.0)
         bucket["weight"] = _safe_float(bucket.get("weight"), 0.0) + weight
-        bucket["return_contribution"] = _safe_float(bucket.get("return_contribution"), 0.0) + _safe_float(
-            component.get("return_contribution"), 0.0
-        )
-        bucket["drawdown_contribution"] = _safe_float(
-            bucket.get("drawdown_contribution"), 0.0
-        ) + abs(_safe_float(component.get("drawdown_contribution"), 0.0))
 
         metrics = component_metrics.get(component_id) or {
             "sharpe_ratio": 0.0,
@@ -4343,7 +4346,30 @@ def _compute_portfolio_contributions(
             "p_value": 1.0,
             "max_drawdown": 0.0,
             "win_rate": 0.0,
+            "cagr": 0.0,
+            "total_return": 0.0,
         }
+        return_contribution = _safe_float(component.get("return_contribution"), float("nan"))
+        derived_return_contribution = _safe_float(metrics.get("total_return"), 0.0) * weight
+        if (
+            not math.isfinite(return_contribution)
+            or (abs(return_contribution) <= 1e-12 and abs(derived_return_contribution) > 1e-12)
+        ):
+            return_contribution = derived_return_contribution
+
+        drawdown_contribution = _safe_float(component.get("drawdown_contribution"), float("nan"))
+        derived_drawdown_contribution = abs(_safe_float(metrics.get("max_drawdown"), 0.0)) * max(weight, 0.0)
+        if (
+            not math.isfinite(drawdown_contribution)
+            or (abs(drawdown_contribution) <= 1e-12 and derived_drawdown_contribution > 1e-12)
+        ):
+            drawdown_contribution = derived_drawdown_contribution
+
+        bucket["return_contribution"] = _safe_float(bucket.get("return_contribution"), 0.0) + return_contribution
+        bucket["drawdown_contribution"] = _safe_float(bucket.get("drawdown_contribution"), 0.0) + abs(
+            drawdown_contribution
+        )
+
         metric_weight = max(weight, 0.000001)
         bucket["metric_weight"] = _safe_float(bucket.get("metric_weight"), 0.0) + metric_weight
         bucket["sharpe_sum"] = _safe_float(bucket.get("sharpe_sum"), 0.0) + _safe_float(
@@ -4360,6 +4386,10 @@ def _compute_portfolio_contributions(
         ) * metric_weight
         bucket["win_rate_sum"] = _safe_float(bucket.get("win_rate_sum"), 0.0) + (
             _normalize_win_rate(metrics.get("win_rate")) or 0.0
+        ) * metric_weight
+        bucket["cagr_sum"] = _safe_float(bucket.get("cagr_sum"), 0.0) + _safe_float(metrics.get("cagr"), 0.0) * metric_weight
+        bucket["total_return_sum"] = _safe_float(bucket.get("total_return_sum"), 0.0) + _safe_float(
+            metrics.get("total_return"), 0.0
         ) * metric_weight
 
     component_ids_by_group = {
@@ -4399,6 +4429,7 @@ def _compute_portfolio_contributions(
         p_value = _safe_float(bucket.get("p_value_sum"), 1.0) / metric_weight
         max_drawdown = _safe_float(bucket.get("max_drawdown_sum"), 0.0) / metric_weight
         metric_win_rate = _safe_float(bucket.get("win_rate_sum"), 0.0) / metric_weight
+        cagr = _safe_float(bucket.get("cagr_sum"), 0.0) / metric_weight
         display_value = bucket.get("group_value", key)
         if normalized_group == "component":
             strategy_name = str(bucket.get("strategy_name") or display_value or "").strip()
@@ -4430,6 +4461,7 @@ def _compute_portfolio_contributions(
                 "psr": round(psr, 6),
                 "p_value": round(p_value, 6),
                 "max_drawdown": round(max_drawdown, 6),
+                "cagr": round(cagr, 6),
                 "pnl_total": round(pnl_value, 6),
                 "pnl_contribution": round(pnl_value, 6),
                 "pnl_contribution_pct": round(pnl_pct, 3),

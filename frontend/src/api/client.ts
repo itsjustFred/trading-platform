@@ -182,7 +182,7 @@ export const getBacktests = (params?: BacktestsQueryParams) => {
 };
 export const getBacktestsAll = (name?: string) => {
   const query = new URLSearchParams();
-  query.set("include_equity_preview", "false");
+  query.set("include_equity_preview", "true");
   query.set("preview_limit", "50");
   if (name && name.trim()) query.set("name", name.trim());
   return fetchJSON<BacktestMetadataItem[]>(`/backtests/all?${query.toString()}`);
