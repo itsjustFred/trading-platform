@@ -2302,7 +2302,7 @@ def load_backtest_equity_preview_points_map(
             SELECT backtest_id, time, equity
             FROM ranked
             WHERE row_number = 1
-            ORDER BY backtest_id ASC, time ASC
+            ORDER BY time ASC, backtest_id ASC
             """
         )
     else:
@@ -2361,7 +2361,7 @@ def load_backtest_equity_preview_points_map(
             WHERE total_count <= :limit
                OR (bucket = :limit AND bucket_last_rank = 1)
                OR (bucket != :limit AND bucket_first_rank = 1)
-            ORDER BY backtest_id ASC, time ASC
+            ORDER BY time ASC, backtest_id ASC
             """
         )
 

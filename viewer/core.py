@@ -416,17 +416,19 @@ def _load_ohlcv_df(symbol: str, timeframe: str) -> pd.DataFrame | None:
     if not frames:
         return None
     if len(frames) == 1:
-        merged = frames[0]
+        merged = frames[0].copy()
     else:
         merged = pd.concat(frames, ignore_index=True, sort=False)
-        if "timestamp" in merged.columns:
-            merged = (
-                merged.drop_duplicates(subset=["timestamp"], keep="last")
-                .sort_values("timestamp")
-                .reset_index(drop=True)
-            )
-        else:
-            merged = merged.drop_duplicates().reset_index(drop=True)
+
+    if "timestamp" in merged.columns:
+        merged = (
+            merged.dropna(subset=["timestamp"])
+            .sort_values("timestamp")
+            .drop_duplicates(subset=["timestamp"], keep="last")
+            .reset_index(drop=True)
+        )
+    else:
+        merged = merged.drop_duplicates().reset_index(drop=True)
 
     with _OHLCV_DF_CACHE_LOCK:
         _OHLCV_DF_CACHE[cache_key] = (signature, merged)
