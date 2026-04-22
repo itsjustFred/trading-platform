@@ -100,7 +100,7 @@ export function BacktestDetailPage() {
     Promise.all([
       getBacktestInfo(id),
       getBacktestStats(id),
-      getBacktestEquity(id),
+      getBacktestEquity(id, { max_points: 4000, sampling: "minmax" }),
     ])
       .then(([i, s, e]) => {
         setInfo(i);
@@ -1019,7 +1019,11 @@ function EquityChart({
         horzLines: { color: "#1c2128" },
       },
       crosshair: { mode: CrosshairMode.Normal },
-      timeScale: { borderColor: "#30363d", timeVisible: false },
+      timeScale: {
+        borderColor: "#30363d",
+        timeVisible: false,
+        minBarSpacing: 0.1,
+      },
       rightPriceScale: { borderColor: "#30363d", invertScale: false },
     });
     chartRef.current = chart;

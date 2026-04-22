@@ -183,7 +183,7 @@ export const getBacktests = (params?: BacktestsQueryParams) => {
 export const getBacktestsAll = (name?: string) => {
   const query = new URLSearchParams();
   query.set("include_equity_preview", "true");
-  query.set("preview_limit", "50");
+  query.set("preview_limit", "100");
   if (name && name.trim()) query.set("name", name.trim());
   return fetchJSON<BacktestMetadataItem[]>(`/backtests/all?${query.toString()}`);
 };
@@ -209,8 +209,21 @@ export const getBacktestTrade = (id: string, nr: number) =>
   fetchJSON<TradeChartResponse>(`/backtest/${id}/trade/${nr}`);
 export const getBacktestReplay = (id: string) =>
   fetchJSON<BacktestReplayResponse>(`/backtest/${id}/replay`);
-export const getBacktestEquity = (id: string) =>
-  fetchJSON<any>(`/backtest/${id}/equity`);
+export const getBacktestEquity = (
+  id: string,
+  params?: { max_points?: number; sampling?: "none" | "minmax" },
+) => {
+  const query = new URLSearchParams();
+  if (params?.max_points != null) {
+    const capped = Math.max(0, Math.min(20000, Math.trunc(params.max_points)));
+    query.set("max_points", String(capped));
+  }
+  if (params?.sampling) {
+    query.set("sampling", params.sampling);
+  }
+  const queryString = query.toString();
+  return fetchJSON<any>(`/backtest/${id}/equity${queryString ? `?${queryString}` : ""}`);
+};
 export const getBacktestCapm = (id: string, benchmark?: string) => {
   const params = new URLSearchParams();
   if (benchmark) params.set("benchmark", benchmark);

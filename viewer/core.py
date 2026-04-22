@@ -938,12 +938,7 @@ def _quick_stats_and_equity(
     p_value = round(_safe_float(derived_stats.get("p_value"), 1.0), 6)
 
     n = len(equity)
-    if n <= 50:
-        equity_mini = equity
-    else:
-        step = n / 50
-        equity_mini = [equity[int(i * step)] for i in range(50)]
-        equity_mini.append(equity[-1])
+    equity_mini = _downsample_numeric_minmax([float(v) for v in equity if isinstance(v, (int, float))], limit=50)
 
     return {
         "sharpe": sharpe,
@@ -955,6 +950,48 @@ def _quick_stats_and_equity(
         "p_value": p_value,
         "equity_mini": equity_mini,
     }
+
+
+def _downsample_numeric_minmax(values: list[float], *, limit: int) -> list[float]:
+    if not values:
+        return []
+    try:
+        normalized_limit = int(limit)
+    except (TypeError, ValueError):
+        normalized_limit = 50
+    normalized_limit = max(1, min(normalized_limit, 2000))
+    if len(values) <= normalized_limit:
+        return list(values)
+
+    bucket_count = max(1, (normalized_limit - 1) // 2)
+    n = len(values)
+    step = n / bucket_count
+
+    sampled: list[float] = []
+    for bucket in range(bucket_count):
+        start = int(bucket * step)
+        end = int((bucket + 1) * step)
+        if bucket == bucket_count - 1:
+            end = n
+        if start >= n:
+            break
+        if end <= start:
+            end = min(n, start + 1)
+        window = values[start:end]
+        if not window:
+            continue
+        min_val = min(window)
+        max_val = max(window)
+        if min_val == max_val:
+            sampled.append(float(min_val))
+        else:
+            sampled.append(float(min_val))
+            sampled.append(float(max_val))
+
+    sampled.append(float(values[-1]))
+    if len(sampled) > normalized_limit:
+        sampled = sampled[: normalized_limit - 1] + [float(values[-1])]
+    return sampled
 
 
 @app.route("/api/backtests")

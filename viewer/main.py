@@ -1637,16 +1637,65 @@ def _portfolio_sort_key(item: dict[str, Any], sort_field: str) -> Any:
 def _portfolio_equity_preview(values: Any, *, limit: int = 50) -> list[float]:
     if not isinstance(values, list) or not values:
         return []
-    numeric_values = [
-        _safe_float(point.get("equity"), _safe_float(point, 0.0)) if isinstance(point, dict) else _safe_float(point, 0.0)
-        for point in values
-    ]
-    if len(numeric_values) <= limit:
-        return [float(entry) for entry in numeric_values]
-    step = len(numeric_values) / limit
-    preview = [float(numeric_values[int(index * step)]) for index in range(limit)]
-    preview.append(float(numeric_values[-1]))
-    return preview
+    numeric_values = []
+    for point in values:
+        if isinstance(point, dict):
+            numeric_values.append(_safe_float(point.get("equity"), 0.0))
+        else:
+            numeric_values.append(_safe_float(point, 0.0))
+    numeric_values = [float(value) for value in numeric_values if math.isfinite(value)]
+    return _downsample_numeric_minmax(numeric_values, limit=limit)
+
+
+def _downsample_numeric_minmax(values: list[float], *, limit: int) -> list[float]:
+    """Downsample a numeric series while preserving extremes.
+
+    Produces up to ~2*bucket_count points (min+max per bucket) plus final point,
+    which captures drawdowns/peaks better than uniform stepping.
+    """
+    if not values:
+        return []
+
+    normalized_limit = int(limit) if isinstance(limit, int) else 50
+    normalized_limit = max(1, min(normalized_limit, 2000))
+    if len(values) <= normalized_limit:
+        return [float(v) for v in values]
+
+    # Reserve space for the last point so the series always ends correctly.
+    # For min/max sampling we target about half as many buckets as limit.
+    bucket_count = max(1, (normalized_limit - 1) // 2)
+    n = len(values)
+    step = n / bucket_count
+
+    sampled: list[float] = []
+    for bucket in range(bucket_count):
+        start = int(bucket * step)
+        end = int((bucket + 1) * step)
+        if bucket == bucket_count - 1:
+            end = n
+        if start >= n:
+            break
+        if end <= start:
+            end = min(n, start + 1)
+
+        window = values[start:end]
+        if not window:
+            continue
+        min_val = min(window)
+        max_val = max(window)
+
+        # Keep a stable order to reduce “zig-zag” artifacts when min/max are equal.
+        if min_val == max_val:
+            sampled.append(float(min_val))
+        else:
+            sampled.append(float(min_val))
+            sampled.append(float(max_val))
+
+    sampled.append(float(values[-1]))
+    # Hard cap in case bucket logic overshoots.
+    if len(sampled) > normalized_limit:
+        sampled = sampled[: normalized_limit - 1] + [float(values[-1])]
+    return sampled
 
 
 def _portfolio_stats_have_values(stats: dict[str, Any]) -> bool:
@@ -6533,13 +6582,116 @@ async def get_backtest_stats(backtest_id: str) -> dict[str, Any]:
 
 @app.get("/api/backtest/{backtest_id}/equity", response_model=list[dict[str, float]])
 @app.get("/api/backtests/{backtest_id}/equity", response_model=list[dict[str, float]])
-async def get_equity_curve(backtest_id: str) -> list[dict[str, float]]:
+async def get_equity_curve(
+    backtest_id: str,
+    max_points: int = Query(default=0, ge=0, le=20000),
+    sampling: str = Query(default="none"),
+) -> list[dict[str, float]]:
     result = _load_result(backtest_id)
     if result is None:
         raise HTTPException(status_code=404, detail="Not found")
     equity_curve = legacy_viewer._equity_to_viewer(result)
     equity_curve.sort(key=lambda point: _safe_float(point.get("time"), 0.0))
+    if max_points and max_points > 0 and str(sampling or "").strip().lower() in {"minmax", "min_max"}:
+        return _downsample_equity_curve_minmax(equity_curve, max_points=max_points)
     return equity_curve
+
+
+def _downsample_equity_curve_minmax(
+    points: list[dict[str, float]] | list[dict[str, Any]],
+    *,
+    max_points: int,
+) -> list[dict[str, float]]:
+    """Downsample equity curve points while preserving drawdowns/peaks.
+
+    Input points are expected to have at least: {time, equity}. Output stays compatible with frontend.
+    """
+    if not isinstance(points, list) or not points:
+        return []
+    try:
+        limit = int(max_points)
+    except (TypeError, ValueError):
+        limit = 0
+    if limit <= 0:
+        return [dict(p) for p in points if isinstance(p, dict)]
+    limit = max(10, min(limit, 20000))
+
+    normalized: list[dict[str, float]] = []
+    for raw in points:
+        if not isinstance(raw, dict):
+            continue
+        t = _safe_float(raw.get("time"), None)
+        e = _safe_float(raw.get("equity"), None)
+        if t is None or e is None:
+            continue
+        if not math.isfinite(t) or not math.isfinite(e):
+            continue
+        normalized.append({"time": float(t), "equity": float(e)})
+
+    if len(normalized) <= limit:
+        return normalized
+
+    # Keep endpoints stable.
+    first = normalized[0]
+    last = normalized[-1]
+
+    # Reserve room for first/last.
+    remaining = max(2, limit - 2)
+    bucket_count = max(1, remaining // 2)
+
+    n = len(normalized)
+    step = n / bucket_count
+    sampled: list[dict[str, float]] = [first]
+
+    for bucket in range(bucket_count):
+        start = int(bucket * step)
+        end = int((bucket + 1) * step)
+        if bucket == bucket_count - 1:
+            end = n
+        if start >= n:
+            break
+        if end <= start:
+            end = min(n, start + 1)
+
+        window = normalized[start:end]
+        if not window:
+            continue
+
+        min_point = min(window, key=lambda p: p["equity"])
+        max_point = max(window, key=lambda p: p["equity"])
+
+        if min_point["time"] == max_point["time"] and min_point["equity"] == max_point["equity"]:
+            sampled.append(min_point)
+        else:
+            # Add in chronological order to avoid artificial backtracking.
+            if min_point["time"] <= max_point["time"]:
+                sampled.extend([min_point, max_point])
+            else:
+                sampled.extend([max_point, min_point])
+
+    sampled.append(last)
+
+    # De-duplicate same-time points while keeping the later one.
+    deduped: list[dict[str, float]] = []
+    for p in sampled:
+        if deduped and deduped[-1]["time"] == p["time"]:
+            deduped[-1] = p
+        else:
+            deduped.append(p)
+
+    if len(deduped) > limit:
+        # If we still exceed, drop internal points evenly while preserving endpoints.
+        inner = deduped[1:-1]
+        if not inner:
+            return [first, last]
+        keep = max(0, limit - 2)
+        if keep <= 0:
+            return [first, last]
+        step2 = len(inner) / keep
+        reduced_inner = [inner[int(i * step2)] for i in range(keep)]
+        return [first, *reduced_inner, last]
+
+    return deduped
 
 
 @app.get("/api/backtests/{backtest_id}/equity-preview", response_model=list[float])

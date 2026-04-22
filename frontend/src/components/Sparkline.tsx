@@ -38,10 +38,12 @@ export const Sparkline = memo(function Sparkline({
       : normalized[normalized.length - 1] >= normalized[0];
   const color = profitable ? "#3fb950" : "#f85149";
 
+  const padding = 6;
   const points = normalized
     .map((v, i) => {
       const x = (i / (normalized.length - 1)) * width;
-      const y = height - ((v - min) / range) * (height - 4) - 2;
+      const innerHeight = Math.max(1, height - padding * 2);
+      const y = height - padding - ((v - min) / range) * innerHeight;
       return `${x},${y}`;
     })
     .join(" ");
@@ -61,9 +63,19 @@ export const Sparkline = memo(function Sparkline({
 
   const hoverIdx = hoverIndex == null ? null : Math.max(0, Math.min(normalized.length - 1, hoverIndex));
   const hoverX = hoverIdx == null ? 0 : (hoverIdx / (normalized.length - 1)) * width;
-  const hoverY = hoverIdx == null ? 0 : height - ((normalized[hoverIdx] - min) / range) * (height - 4) - 2;
+  const hoverY =
+    hoverIdx == null
+      ? 0
+      : height -
+        padding -
+        ((normalized[hoverIdx] - min) / range) * Math.max(1, height - padding * 2);
   const hoverValue = hoverIdx == null ? null : normalized[hoverIdx];
   const hoverDrawdown = hoverIdx == null ? null : drawdowns[hoverIdx];
+  const baseValue = normalized[0];
+  const hoverReturnPct =
+    hoverValue == null || !Number.isFinite(baseValue) || Math.abs(baseValue) < 1e-12
+      ? null
+      : ((hoverValue - baseValue) / baseValue) * 100;
   const parsedStart = Date.parse(startDate || "");
   const parsedEnd = Date.parse(endDate || "");
   const hasDateRange = Number.isFinite(parsedStart) && Number.isFinite(parsedEnd) && parsedEnd >= parsedStart;
@@ -93,6 +105,14 @@ export const Sparkline = memo(function Sparkline({
         }
         onMouseLeave={interactive ? () => setHoverIndex(null) : undefined}
       >
+        <line
+          x1={0}
+          x2={width}
+          y1={height - padding - ((normalized[0] - min) / range) * Math.max(1, height - padding * 2)}
+          y2={height - padding - ((normalized[0] - min) / range) * Math.max(1, height - padding * 2)}
+          stroke="rgba(255,255,255,0.10)"
+          strokeWidth="1"
+        />
         <polygon points={fillPoints} fill={color} fillOpacity="0.08" />
         <polyline
           points={points}
@@ -100,14 +120,15 @@ export const Sparkline = memo(function Sparkline({
           stroke={color}
           strokeWidth="1.5"
           strokeLinejoin="round"
+          strokeLinecap="round"
         />
         {interactive && hoverIdx != null ? (
           <>
             <line
               x1={hoverX}
               x2={hoverX}
-              y1={2}
-              y2={height - 2}
+              y1={padding}
+              y2={height - padding}
               stroke="rgba(255,255,255,0.35)"
               strokeWidth="1"
               strokeDasharray="2 2"
@@ -121,7 +142,7 @@ export const Sparkline = memo(function Sparkline({
           style={{
             position: "absolute",
             top: 4,
-            left: Math.max(4, Math.min(width - 176, hoverX - 86)),
+            left: Math.max(4, Math.min(width - 192, hoverX - 96)),
             background: "rgba(15, 23, 42, 0.96)",
             border: "1px solid rgba(148, 163, 184, 0.3)",
             borderRadius: 6,
@@ -135,6 +156,7 @@ export const Sparkline = memo(function Sparkline({
           <div>{hoverDate || hoverPointLabel}</div>
           <div>
             {hoverValue.toLocaleString("en-US", { maximumFractionDigits: 0 })}
+            {hoverReturnPct != null ? ` · ${hoverReturnPct >= 0 ? "+" : ""}${hoverReturnPct.toFixed(2)}%` : ""}
             {hoverDrawdown != null ? ` · DD ${hoverDrawdown.toFixed(2)}%` : ""}
           </div>
         </div>
