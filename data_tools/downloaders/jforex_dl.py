@@ -22,6 +22,7 @@ import argparse
 import logging
 import os
 import re
+import sys
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
@@ -47,6 +48,8 @@ try:
     import jpype.imports  # noqa: F401  (enables Java import hook)
 except ImportError:  # pragma: no cover - optional runtime dependency
     jpype = None
+
+JPYPE_AVAILABLE = jpype is not None
 
 
 DEFAULT_JNLP_URL = "https://platform.dukascopy.com/demo/jforex.jnlp"
@@ -124,14 +127,19 @@ class QueryState:
 
 
 def _require_jpype() -> None:
-    if jpype is None:
+    if not JPYPE_AVAILABLE:
         raise RuntimeError(
             "JPype is required for JForex downloader. Install with: pip install jpype1"
         )
 
 
+def _jpype_module() -> Any:
+    _require_jpype()
+    return jpype
+
+
 def _java_exception_types() -> tuple[type[BaseException], ...]:
-    if jpype is None:
+    if not JPYPE_AVAILABLE:
         return ()
     java_exception = getattr(jpype, "JException", None)
     if isinstance(java_exception, type):
@@ -217,6 +225,16 @@ def _discover_jars(root: Path) -> list[Path]:
     return deduped
 
 
+def _resolve_existing_path(path: Path) -> Path | None:
+    try:
+        candidate = path.expanduser()
+        if not candidate.exists():
+            return None
+        return candidate.resolve(strict=True)
+    except OSError:
+        return None
+
+
 def _parse_jnlp_jar_urls(jnlp_url: str, *, _visited: set[str] | None = None) -> list[str]:
     visited = _visited if _visited is not None else set()
     if jnlp_url in visited:
@@ -294,9 +312,14 @@ def _download_jforex_jars_from_jnlp(jnlp_url: str, target_dir: Path) -> list[Pat
 
 
 def _resolve_jforex_classpath() -> list[str]:
+    classpath, _ = _resolve_jforex_classpath_details()
+    return classpath
+
+
+def _resolve_jforex_classpath_details() -> tuple[list[str], str]:
     explicit = os.getenv("JFOREX_CLASSPATH") or os.getenv("JFOREX_JARS")
     if explicit:
-        return [entry.strip() for entry in explicit.split(os.pathsep) if entry.strip()]
+        return [entry.strip() for entry in explicit.split(os.pathsep) if entry.strip()], "explicit env"
 
     repo_root = Path(__file__).resolve().parents[2]
     home_env = os.getenv("JFOREX_HOME")
@@ -314,53 +337,252 @@ def _resolve_jforex_classpath() -> list[str]:
 
     classpath: list[str] = []
     for root in candidates:
-        classpath.extend(str(path) for path in _discover_jars(root))
+        classpath.extend(str(path.resolve(strict=True)) for path in _discover_jars(root))
 
     if classpath:
-        return classpath
+        return classpath, "local discovery"
 
     bootstrap_dir = DATA_DIR / ".jforex-sdk"
     try:
         jnlp_url = _resolve_jnlp_url()
         downloaded = _download_jforex_jars_from_jnlp(jnlp_url, bootstrap_dir)
         logger.info("Bootstrapped %d JForex SDK jars from %s", len(downloaded), jnlp_url)
-        return [str(path) for path in downloaded]
+        return [str(path.resolve(strict=True)) for path in downloaded], f"jnlp bootstrap: {jnlp_url}"
     except Exception as exc:  # noqa: BLE001
         logger.warning("Unable to bootstrap JForex SDK jars: %s", exc)
+        return [], f"unavailable: {exc}"
+
+
+def _trusted_java_home_roots() -> list[Path]:
+    configured = (
+        os.getenv("JFOREX_TRUSTED_JAVA_HOMES")
+        or os.getenv("JFOREX_TRUSTED_JAVA_HOME")
+        or ""
+    ).strip()
+    if configured:
+        roots: list[Path] = []
+        for entry in configured.split(os.pathsep):
+            candidate = entry.strip()
+            if candidate:
+                roots.append(Path(candidate).expanduser())
+        if roots:
+            return roots
+
+    return [
+        Path(r"C:\Program Files\Java"),
+        Path(r"C:\Program Files\Eclipse Adoptium"),
+        Path(r"C:\Program Files\Microsoft"),
+        Path("/Library/Java/JavaVirtualMachines"),
+        Path("/usr/lib/jvm"),
+        Path("/usr/java"),
+        Path("/opt/java"),
+    ]
+
+def _jvm_candidates_from_java_home(java_home: str | None) -> list[str]:
+    if not java_home:
         return []
+
+    root = Path(java_home).expanduser().resolve(strict=False)
+    candidates = [
+        root / "bin" / "server" / "jvm.dll",  # Windows JDK/JRE
+        root / "jre" / "bin" / "server" / "jvm.dll",  # Legacy Windows layouts
+        root / "lib" / "server" / "libjvm.so",  # Linux JDK/JRE
+        root / "jre" / "lib" / "server" / "libjvm.so",  # Legacy Linux layouts
+        root / "lib" / "server" / "libjvm.dylib",  # macOS JDK/JRE
+        root / "jre" / "lib" / "server" / "libjvm.dylib",  # Legacy macOS layouts
+    ]
+    resolved_candidates: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        resolved = _resolve_existing_path(candidate)
+        if resolved is None:
+            continue
+        key = os.path.normcase(str(resolved))
+        if key in seen:
+            continue
+        seen.add(key)
+        resolved_candidates.append(str(resolved))
+    return resolved_candidates
+
+
+def _is_trusted_java_home(java_home: Path) -> bool:
+    resolved_home = _resolve_existing_path(java_home)
+    if resolved_home is None:
+        return False
+
+    for root in _trusted_java_home_roots():
+        resolved_root = _resolve_existing_path(root)
+        if resolved_root is None:
+            continue
+        if resolved_home == resolved_root or resolved_root in resolved_home.parents:
+            return True
+    return False
+
+
+def _is_trusted_custom_jvm_path(jvm_path: Path) -> bool:
+    resolved_path = _resolve_existing_path(jvm_path)
+    if resolved_path is None:
+        return False
+    file_name = resolved_path.name.lower()
+    if file_name not in {"jvm.dll", "libjvm.so", "libjvm.dylib"}:
+        return False
+
+    parents = resolved_path.parents
+    java_home_candidates: list[Path] = []
+    if len(parents) >= 3 and parents[0].name == "server":
+        java_home_candidates.append(parents[2])
+    if len(parents) >= 4 and parents[0].name == "server" and parents[2].name == "jre":
+        java_home_candidates.append(parents[3])
+
+    return any(_is_trusted_java_home(candidate) for candidate in java_home_candidates)
+
+
+def _discover_jvm_paths() -> list[str]:
+    candidates: list[str] = []
+
+    # Explicit override is only honored when opted in and resolves to a trusted location.
+    explicit = (os.getenv("JFOREX_JVM_PATH") or "").strip()
+    if explicit:
+        path = _resolve_existing_path(Path(explicit))
+        if path is not None and os.getenv("JFOREX_ALLOW_CUSTOM_JVM") == "1":
+            if _is_trusted_custom_jvm_path(path):
+                candidates.append(str(path))
+
+    java_homes: list[str] = []
+    env_java_home = (os.getenv("JAVA_HOME") or "").strip()
+    if env_java_home:
+        java_homes.append(env_java_home)
+
+    if os.name == "nt":
+        java_homes.extend(
+            [
+                r"C:\Program Files\Java\jdk-17",
+                r"C:\Program Files\Java\jdk-21",
+                r"C:\Program Files\Java\jdk-17.0.1",
+            ]
+        )
+    else:
+        java_homes.extend(
+            [
+                "/usr/lib/jvm/default-java",
+                "/usr/lib/jvm/java-17-openjdk-amd64",
+                "/usr/lib/jvm/java-21-openjdk-amd64",
+            ]
+        )
+
+    for home in java_homes:
+        java_home_path = Path(home)
+        if not _is_trusted_java_home(java_home_path):
+            continue
+        for jvm_path in _jvm_candidates_from_java_home(home):
+            candidates.append(jvm_path)
+
+    # Let JPype try its own platform-specific discovery as a fallback.
+    try:
+        default_jvm = _jpype_module().getDefaultJVMPath() if JPYPE_AVAILABLE else ""
+    except Exception:  # noqa: BLE001
+        default_jvm = ""
+    if default_jvm:
+        resolved_default = _resolve_existing_path(Path(default_jvm))
+        if resolved_default is not None:
+            candidates.append(str(resolved_default))
+
+    # Preserve order but remove duplicates.
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for entry in candidates:
+        resolved_entry = _resolve_existing_path(Path(entry))
+        if resolved_entry is None:
+            continue
+        norm = os.path.normcase(str(resolved_entry))
+        if norm in seen:
+            continue
+        seen.add(norm)
+        deduped.append(str(resolved_entry))
+    return deduped
+
+
+def _format_jvm_startup_diagnostics(
+    *,
+    classpath: list[str],
+    classpath_source: str,
+    candidates: list[tuple[str, str]],
+    final_error: BaseException,
+) -> str:
+    lines = [
+        "Failed to start JVM for JForex SDK.",
+        f"Classpath source: {classpath_source}",
+        f"Classpath entries ({len(classpath)}):",
+    ]
+    for entry in classpath:
+        lines.append(f"  - {entry}")
+
+    lines.append(f"JVM candidates tried ({len(candidates)}):")
+    if candidates:
+        for candidate, reason in candidates:
+            lines.append(f"  - {candidate}")
+            lines.append(f"    reason: {reason}")
+    else:
+        lines.append("  - none")
+
+    lines.append(f"Last error: {final_error}")
+    return "\n".join(lines)
 
 
 def _ensure_jvm_started() -> None:
-    _require_jpype()
+    jpype_mod = _jpype_module()
 
     with JVM_START_LOCK:
-        if not jpype.isJVMStarted():
-            classpath = _resolve_jforex_classpath()
+        if not jpype_mod.isJVMStarted():
+            classpath, classpath_source = _resolve_jforex_classpath_details()
             if not classpath:
                 raise RuntimeError(
                     "Could not resolve JForex SDK classpath. "
                     "Set JFOREX_CLASSPATH (or JFOREX_JARS) to your SDK jars."
                 )
 
-            try:
-                jpype.startJVM(classpath=classpath, convertStrings=False)
-            except _java_exception_types() as exc:
-                _raise_jforex_runtime_error("Failed to start JVM for JForex SDK", exc)
-            except Exception as exc:  # noqa: BLE001
-                raise RuntimeError(
-                    f"Failed to start JVM for JForex SDK. Classpath={classpath}. Error: {exc}"
-                ) from exc
+            jvm_candidates = _discover_jvm_paths()
+            startup_errors: list[tuple[str, str]] = []
+
+            for jvm_path in jvm_candidates:
+                try:
+                    jpype_mod.startJVM(jvm_path, classpath=classpath, convertStrings=False)
+                    break
+                except _java_exception_types() as exc:
+                    _raise_jforex_runtime_error("Failed to start JVM for JForex SDK", exc)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("JVM candidate failed: %s", jvm_path, exc_info=True)
+                    startup_errors.append((jvm_path, str(exc)))
+
+            if not jpype_mod.isJVMStarted():
+                # Final attempt uses JPype default startup in case candidates were incomplete.
+                try:
+                    jpype_mod.startJVM(classpath=classpath, convertStrings=False)
+                except _java_exception_types() as exc:
+                    _raise_jforex_runtime_error("Failed to start JVM for JForex SDK", exc)
+                except Exception as exc:  # noqa: BLE001
+                    diagnostics = _format_jvm_startup_diagnostics(
+                        classpath=classpath,
+                        classpath_source=classpath_source,
+                        candidates=startup_errors,
+                        final_error=exc,
+                    )
+                    raise RuntimeError(diagnostics) from exc
 
     _ensure_jvm_thread_context_class_loader()
 
 
 def _ensure_jvm_thread_context_class_loader() -> None:
-    if jpype is None or not jpype.isJVMStarted():
+    if not JPYPE_AVAILABLE:
+        return
+
+    jpype_mod = jpype
+    if not jpype_mod.isJVMStarted():
         return
 
     try:
-        java_thread = jpype.JClass("java.lang.Thread")
-        class_loader = jpype.JClass("java.lang.ClassLoader")
+        java_thread = jpype_mod.JClass("java.lang.Thread")
+        class_loader = jpype_mod.JClass("java.lang.ClassLoader")
 
         current_thread = java_thread.currentThread()
         if current_thread.getContextClassLoader() is not None:
@@ -400,6 +622,7 @@ def prewarm_jvm() -> None:
 
 def _resolve_java_instrument(symbol: str) -> tuple[str, str, Any]:
     _ensure_jvm_started()
+    _jpype_module()
 
     try:
         from com.dukascopy.api import Instrument
@@ -486,6 +709,7 @@ def _query_jforex_history(
     cache_dir: Path,
 ) -> pd.DataFrame:
     _ensure_jvm_started()
+    jpype_mod = _jpype_module()
 
     try:
         from com.dukascopy.api import OfferSide, Period
@@ -499,27 +723,27 @@ def _query_jforex_history(
 
     state = QueryState()
 
-    @jpype.JImplements("com.dukascopy.api.system.ISystemListener")
+    @jpype_mod.JImplements("com.dukascopy.api.system.ISystemListener")
     class _SystemListener:
-        @jpype.JOverride
+        @jpype_mod.JOverride
         def onStart(self, processId):  # noqa: N802
             del processId
 
-        @jpype.JOverride
+        @jpype_mod.JOverride
         def onStop(self, processId):  # noqa: N802
             del processId
 
-        @jpype.JOverride
+        @jpype_mod.JOverride
         def onConnect(self):  # noqa: N802
             state.connected.set()
 
-        @jpype.JOverride
+        @jpype_mod.JOverride
         def onDisconnect(self):  # noqa: N802
             pass
 
-    @jpype.JImplements("com.dukascopy.api.IStrategy")
+    @jpype_mod.JImplements("com.dukascopy.api.IStrategy")
     class _HistoryStrategy:
-        @jpype.JOverride
+        @jpype_mod.JOverride
         def onStart(self, context):  # noqa: N802
             try:
                 history = context.getHistory()
@@ -599,23 +823,23 @@ def _query_jforex_history(
                 except Exception:  # noqa: BLE001
                     logger.debug("JForex strategy context.stop() raised exception", exc_info=True)
 
-        @jpype.JOverride
+        @jpype_mod.JOverride
         def onAccount(self, account):  # noqa: N802
             del account
 
-        @jpype.JOverride
+        @jpype_mod.JOverride
         def onMessage(self, message):  # noqa: N802
             del message
 
-        @jpype.JOverride
+        @jpype_mod.JOverride
         def onStop(self):  # noqa: N802
             pass
 
-        @jpype.JOverride
+        @jpype_mod.JOverride
         def onTick(self, instrument, tick):  # noqa: N802
             del instrument, tick
 
-        @jpype.JOverride
+        @jpype_mod.JOverride
         def onBar(self, instrument, period, askBar, bidBar):  # noqa: N802
             del instrument, period, askBar, bidBar
 
@@ -1048,11 +1272,15 @@ def main() -> None:
         return
 
     if not args.symbols:
-        parser.error("--symbols is required (or use --list)")
+        raise ValueError("--symbols is required (or use --list)")
 
     output_dir = Path(args.output)
     symbols = [part.strip() for part in args.symbols.split(",") if part.strip()]
     timeframes = [part.strip() for part in args.timeframes.split(",") if part.strip()]
+    if not symbols:
+        raise ValueError("--symbols must include at least one symbol")
+    if not timeframes:
+        raise ValueError("--timeframes must include at least one timeframe")
 
     completed = 0
     for symbol in symbols:
@@ -1079,4 +1307,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except ValueError as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc

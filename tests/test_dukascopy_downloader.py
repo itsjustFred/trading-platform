@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import os
 import sys
 import types
 from pathlib import Path
 from threading import Event
 
 import pandas as pd
+import pytest
 
 
 def test_native_downloader_accepts_control_events_and_reports_progress(
@@ -335,10 +337,18 @@ def test_jforex_classpath_bootstraps_from_jnlp_when_no_local_jars(monkeypatch, t
     monkeypatch.delenv("JFOREX_JARS", raising=False)
     monkeypatch.delenv("JFOREX_HOME", raising=False)
 
+    def fake_download_jars(jnlp_url, target_dir):
+        target_dir.mkdir(parents=True, exist_ok=True)
+        api_jar = target_dir / "api.jar"
+        sdk_jar = target_dir / "sdk.jar"
+        api_jar.write_text("api", encoding="utf-8")
+        sdk_jar.write_text("sdk", encoding="utf-8")
+        return [api_jar, sdk_jar]
+
     monkeypatch.setattr(
         jforex,
         "_download_jforex_jars_from_jnlp",
-        lambda jnlp_url, target_dir: [target_dir / "api.jar", target_dir / "sdk.jar"],
+        fake_download_jars,
     )
 
     classpath = jforex._resolve_jforex_classpath()
@@ -349,9 +359,80 @@ def test_jforex_classpath_bootstraps_from_jnlp_when_no_local_jars(monkeypatch, t
 def test_jforex_classpath_prefers_explicit_env(monkeypatch):
     import data_tools.downloaders.jforex_dl as jforex
 
-    monkeypatch.setenv("JFOREX_CLASSPATH", "/tmp/a.jar:/tmp/b.jar")
+    monkeypatch.setenv("JFOREX_CLASSPATH", os.pathsep.join(["/tmp/a.jar", "/tmp/b.jar"]))
     classpath = jforex._resolve_jforex_classpath()
     assert classpath == ["/tmp/a.jar", "/tmp/b.jar"]
+
+
+def test_jforex_discovers_and_dedupes_resolved_jvm_paths(monkeypatch, tmp_path: Path):
+    import data_tools.downloaders.jforex_dl as jforex
+
+    java_home = tmp_path / "jdk"
+    jvm_path = java_home / "bin" / "server" / "jvm.dll"
+    jvm_path.parent.mkdir(parents=True)
+    jvm_path.write_text("fake-jvm", encoding="utf-8")
+
+    monkeypatch.setenv("JAVA_HOME", str(java_home))
+    monkeypatch.setenv("JFOREX_TRUSTED_JAVA_HOME", str(java_home))
+    monkeypatch.setenv("JFOREX_ALLOW_CUSTOM_JVM", "1")
+    monkeypatch.setenv("JFOREX_JVM_PATH", str(jvm_path))
+    monkeypatch.setattr(jforex, "JPYPE_AVAILABLE", False)
+
+    discovered = jforex._discover_jvm_paths()
+
+    assert discovered == [str(jvm_path.resolve(strict=True))]
+
+
+def test_jforex_accepts_legacy_java_home_jvm_layout(monkeypatch, tmp_path: Path):
+    import data_tools.downloaders.jforex_dl as jforex
+
+    java_home = tmp_path / "legacy-jdk"
+    jvm_path = java_home / "jre" / "bin" / "server" / "jvm.dll"
+    jvm_path.parent.mkdir(parents=True)
+    jvm_path.write_text("fake-jvm", encoding="utf-8")
+
+    monkeypatch.setenv("JFOREX_TRUSTED_JAVA_HOME", str(java_home))
+
+    assert jforex._is_trusted_custom_jvm_path(jvm_path)
+
+
+def test_jforex_formats_startup_diagnostics(monkeypatch):
+    import data_tools.downloaders.jforex_dl as jforex
+
+    diagnostics = jforex._format_jvm_startup_diagnostics(
+        classpath=["/tmp/sdk.jar"],
+        classpath_source="explicit env",
+        candidates=[("/tmp/jvm.dll", "access denied")],
+        final_error=RuntimeError("boom"),
+    )
+
+    assert "Classpath source: explicit env" in diagnostics
+    assert "Classpath entries (1):" in diagnostics
+    assert "JVM candidates tried (1):" in diagnostics
+    assert "reason: access denied" in diagnostics
+    assert "Last error: boom" in diagnostics
+
+
+def test_jforex_cli_validation_raises_value_error(monkeypatch):
+    import data_tools.downloaders.jforex_dl as jforex
+
+    monkeypatch.setattr(
+        jforex.argparse.ArgumentParser,
+        "parse_args",
+        lambda self: types.SimpleNamespace(
+            symbols=None,
+            timeframes="1h",
+            start="2024-01-01",
+            end="2024-01-02",
+            output=str(Path(".")),
+            offer_side="bid",
+            query_timeout_seconds=900,
+            list=False,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="--symbols is required"):
+        jforex.main()
 
 
 def test_jforex_aligns_daily_query_range_to_bar_boundaries():

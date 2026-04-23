@@ -4384,15 +4384,18 @@ def data_download():
         if offer_side not in {"bid", "ask", "both"}:
             return jsonify({"error": "offer_side must be one of: bid, ask, both"}), 400
 
+        normalized_symbols = ",".join(sym_list)
+        normalized_timeframes = ",".join(tf_list)
+
         cmd = [
             sys.executable,
             "-u",
             "-m",
             "data_tools.downloaders.jforex_dl",
             "--symbols",
-            symbols,
+            normalized_symbols,
             "--timeframes",
-            timeframes,
+            normalized_timeframes,
             "--query-timeout-seconds",
             str(900),
         ]

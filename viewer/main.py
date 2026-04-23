@@ -9522,15 +9522,17 @@ async def data_download(payload: DataDownloadRequest) -> dict[str, Any]:
 
     if source in {"dukascopy", "jforex"}:
         source_label = "dukascopy" if source == "dukascopy" else "jforex"
+        normalized_symbols = ",".join(symbol_list)
+        normalized_timeframes = ",".join(timeframe_list)
         cmd = [
             sys.executable,
             "-u",
             "-m",
             "data_tools.downloaders.jforex_dl",
             "--symbols",
-            symbols,
+            normalized_symbols,
             "--timeframes",
-            timeframes,
+            normalized_timeframes,
             "--query-timeout-seconds",
             str(query_timeout_seconds),
         ]
