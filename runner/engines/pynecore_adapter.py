@@ -206,7 +206,7 @@ class PyneCoreAdapter(EngineAdapter):
             import pynecore  # noqa: F401
         except ImportError:
             errors.append(
-                "PyneCore not installed. Run: pip install git+https://github.com/PyneSys/pynecore.git"
+                "PyneCore not installed. Run: pip install pynesys-pynecore"
             )
         return errors
 

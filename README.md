@@ -25,7 +25,7 @@ cp .env.example .env
 cd frontend && npm install && npm run build && cd ..
 
 # Start the viewer
-uvicorn viewer.main:app --host 0.0.0.0 --port 5556 --no-access-log
+python -m uvicorn viewer.main:app --host 0.0.0.0 --port 5556 --no-access-log
 # Open http://localhost:5556
 # Strategy Lab live conversion runs also require NVIDIA_API_KEY
 ```
@@ -88,7 +88,7 @@ runner/              — Backtest runner
   converters/        — Result format converters
 
 viewer/              — Trade viewer web app
-  main.py            — FastAPI backend (uvicorn viewer.main:app ...)
+  main.py            — FastAPI backend (python -m uvicorn viewer.main:app ...)
   core.py            — Internal helper module used by main.py
 
 frontend/            — React SPA (Vite + Tailwind)
@@ -119,13 +119,13 @@ tests/               — Test suite
 | `TRADING_DATA_DIR` | `./data` | Legacy fallback if `DATA_DIR` is unset |
 | `LOG_DIR` | `./logs` | Log file directory |
 | `LOG_LEVEL` | `INFO` | Logging level |
-| `UVICORN_HOST` | `0.0.0.0` | Recommended host for `uvicorn viewer.main:app` |
-| `UVICORN_PORT` | `5556` | Recommended port for `uvicorn viewer.main:app` |
+| `UVICORN_HOST` | `0.0.0.0` | Recommended host for `python -m uvicorn viewer.main:app` |
+| `UVICORN_PORT` | `5556` | Recommended port for `python -m uvicorn viewer.main:app` |
 | `NVIDIA_API_KEY` | — | API key for the Strategy Lab auto-conversion agent via NVIDIA NIM |
 
 ## FastAPI + WebSocket
 
-- Start server: `uvicorn viewer.main:app --host 0.0.0.0 --port 5556 --no-access-log`
+- Start server: `python -m uvicorn viewer.main:app --host 0.0.0.0 --port 5556 --no-access-log`
 - React dev proxy forwards:
   - `/api` → `http://localhost:5556`
   - `/ws` → `ws://localhost:5556`
