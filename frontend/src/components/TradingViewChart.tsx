@@ -395,6 +395,11 @@ export function TradingViewChart({
       layout: {
         background: { type: ColorType.Solid, color: "#0d1117" },
         textColor: "#8b949e",
+        panes: {
+          separatorColor: "#30363d",
+          separatorHoverColor: "#58a6ff",
+          enableResize: true,
+        },
       },
       grid: {
         vertLines: { color: "#1f2630" },

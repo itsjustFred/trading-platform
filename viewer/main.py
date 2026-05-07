@@ -6711,6 +6711,38 @@ async def get_backtest_equity_preview(
     return _cached_backtest_equity_preview(normalized_id, limit=limit)
 
 
+@app.get("/api/backtests/equity-preview/batch", response_model=dict[str, list[float]])
+async def get_backtest_equity_preview_batch(
+    ids: str = Query(default=""),
+    limit: int = Query(default=48, ge=1, le=100),
+) -> dict[str, list[float]]:
+    requested_ids: list[str] = []
+    seen: set[str] = set()
+    for raw_id in str(ids or "").split(","):
+        backtest_id = raw_id.strip()
+        if not backtest_id or backtest_id in seen:
+            continue
+        requested_ids.append(backtest_id)
+        seen.add(backtest_id)
+    if not requested_ids:
+        return {}
+    requested_ids = requested_ids[:100]
+
+    _ensure_backtest_meta_cache()
+    with _BACKTEST_META_CACHE_LOCK:
+        existing_ids = [
+            backtest_id for backtest_id in requested_ids if backtest_id in _BACKTEST_META_CACHE
+        ]
+    if not existing_ids:
+        return {}
+
+    _bulk_warm_backtest_equity_preview(existing_ids, limit=limit)
+    return {
+        backtest_id: _cached_backtest_equity_preview_only(backtest_id, limit=limit)
+        for backtest_id in existing_ids
+    }
+
+
 @app.get("/api/backtest/{backtest_id}/capm", response_model=CapmResponse)
 async def get_backtest_capm(
     backtest_id: str,

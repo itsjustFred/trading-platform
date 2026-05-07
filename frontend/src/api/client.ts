@@ -180,10 +180,15 @@ export const getBacktests = (params?: BacktestsQueryParams) => {
   const queryString = query.toString();
   return fetchJSON<BacktestsListResponse>(`/backtests${queryString ? `?${queryString}` : ""}`);
 };
-export const getBacktestsAll = (name?: string) => {
+export const getBacktestsAll = (
+  name?: string,
+  options?: { includeEquityPreview?: boolean; previewLimit?: number },
+) => {
   const query = new URLSearchParams();
-  query.set("include_equity_preview", "true");
-  query.set("preview_limit", "100");
+  if (options?.includeEquityPreview) {
+    query.set("include_equity_preview", "true");
+    query.set("preview_limit", String(Math.max(1, Math.min(100, options.previewLimit ?? 48))));
+  }
   if (name && name.trim()) query.set("name", name.trim());
   return fetchJSON<BacktestMetadataItem[]>(`/backtests/all?${query.toString()}`);
 };
@@ -191,6 +196,12 @@ export const getBacktestEquityPreview = (id: string, limit = 80) =>
   fetchJSON<number[]>(
     `/backtests/${encodeURIComponent(id)}/equity-preview?limit=${Math.max(1, Math.min(100, limit))}`,
   );
+export const getBacktestEquityPreviews = (ids: string[], limit = 48) => {
+  const query = new URLSearchParams();
+  query.set("ids", ids.join(","));
+  query.set("limit", String(Math.max(1, Math.min(100, limit))));
+  return fetchJSON<Record<string, number[]>>(`/backtests/equity-preview/batch?${query.toString()}`);
+};
 export const getBacktestInfo = (id: string) =>
   fetchJSON<BacktestInfo>(`/backtest/${id}/info`);
 export const getBacktestStats = (id: string) =>

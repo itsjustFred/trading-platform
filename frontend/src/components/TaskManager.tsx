@@ -7,17 +7,6 @@ import type { DataTaskStatusResponse } from "../api/types";
 
 const ACTIVE_STATUSES = new Set(["queued", "starting", "running", "paused"]);
 
-function sortTasksStable(tasks: DataTaskStatusResponse[]) {
-  return [...tasks].sort((left, right) => {
-    const leftStarted = Date.parse(left.started_at || left.created_at || "") || 0;
-    const rightStarted = Date.parse(right.started_at || right.created_at || "") || 0;
-    if (leftStarted !== rightStarted) {
-      return rightStarted - leftStarted;
-    }
-    return (left.id || "").localeCompare(right.id || "");
-  });
-}
-
 export function TaskManager() {
   const [tasks, setTasks] = useState<DataTaskStatusResponse[]>([]);
 
@@ -50,13 +39,12 @@ export function TaskManager() {
     };
   }, []);
 
-  const orderedTasks = useMemo(() => sortTasksStable(tasks), [tasks]);
   const activeTasks = useMemo(
     () =>
-      orderedTasks.filter((task) =>
+      tasks.filter((task) =>
         ACTIVE_STATUSES.has(String(task.status || "").toLowerCase()),
       ),
-    [orderedTasks],
+    [tasks],
   );
   const runningCount = useMemo(
     () =>
@@ -67,7 +55,7 @@ export function TaskManager() {
       ).length,
     [activeTasks],
   );
-  const summaryLabel = `${runningCount} running · ${orderedTasks.length} total`;
+  const summaryLabel = `${runningCount} running · ${tasks.length} total`;
 
   return (
     <div style={{ display: "grid", gap: "10px", alignSelf: "start" }}>

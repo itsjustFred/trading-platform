@@ -74,6 +74,37 @@ def test_calculate_position_size_exposure_limit_hit():
     assert sized.risk_reward_ratio is None
 
 
+def test_calculate_position_size_blocks_stop_on_wrong_side():
+    engine = RiskEngine(
+        RiskConfig(
+            max_risk_per_trade=0.01,
+            max_total_exposure=0.05,
+            max_positions=5,
+            default_sl_atr_multiplier=2.0,
+        )
+    )
+    signal = TradeSignal(
+        action="buy",
+        symbol="AAPL",
+        entry_price=100.0,
+        stop_loss=102.0,
+        take_profit=110.0,
+        timeframe="1h",
+        metadata={"current_positions": 0, "enforce_stop_direction": True},
+    )
+
+    sized = engine.calculate_position_size(
+        signal=signal,
+        account_balance=10000.0,
+        pip_value=1.0,
+        current_exposure=0.0,
+    )
+
+    assert sized.position_size == 0.0
+    assert sized.risk_amount == 0.0
+    assert sized.risk_percent == 0.0
+
+
 def test_calculate_position_size_missing_stop_loss_uses_fallback():
     engine = RiskEngine(
         RiskConfig(
@@ -151,3 +182,4 @@ def test_submit_order_with_risk_applies_qty_before_submit():
     assert order_id == "risk-sized-order"
     assert adapter.submitted_signal is not None
     assert adapter.submitted_signal.metadata["qty"] == 200.0
+    assert adapter.submitted_signal.metadata["explicit_qty"] == 200.0

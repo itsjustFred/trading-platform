@@ -50,3 +50,19 @@ def test_size_live_signal_blocks_when_max_positions_reached():
     assert sized.position_size == 0.0
     assert signal.metadata["qty"] == 0.0
 
+
+def test_size_live_signal_respects_precomputed_qty():
+    signal = _signal(
+        {
+            "qty": 17,
+            "risk_amount": 50,
+            "risk_percent": 0.005,
+        }
+    )
+
+    sized = size_live_signal(signal, account_balance=10000.0)
+
+    assert sized.position_size == 17.0
+    assert signal.metadata["qty"] == 17.0
+    assert signal.metadata["explicit_qty"] == 17.0
+    assert signal.metadata["risk_amount"] == 50.0

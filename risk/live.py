@@ -43,7 +43,12 @@ def size_live_signal(
     metadata = dict(signal.metadata or {})
 
     explicit_qty = _to_float(metadata.get("explicit_qty"), default=0.0)
+    if explicit_qty <= 0:
+        explicit_qty = _to_float(metadata.get("qty"), default=0.0)
     if explicit_qty > 0:
+        risk_amount = _to_float(metadata.get("risk_amount"), default=0.0)
+        risk_percent = _to_float(metadata.get("risk_percent"), default=0.0)
+        risk_reward_ratio = _to_optional_float(metadata.get("risk_reward_ratio"))
         trade_signal = TradeSignal(
             action=str(signal.action),
             symbol=str(signal.symbol),
@@ -58,21 +63,23 @@ def size_live_signal(
                 "atr": metadata.get("atr"),
                 "current_positions": _to_int(metadata.get("current_positions"), default=0),
                 "pending_positions": _to_int(metadata.get("pending_positions"), default=0),
+                "enforce_stop_direction": True,
             },
         )
         sized = SizedOrder(
             signal=trade_signal,
             position_size=float(explicit_qty),
-            risk_amount=0.0,
-            risk_percent=0.0,
-            risk_reward_ratio=None,
+            risk_amount=risk_amount,
+            risk_percent=risk_percent,
+            risk_reward_ratio=risk_reward_ratio,
         )
         signal.metadata = {
             **metadata,
             "qty": float(explicit_qty),
-            "risk_amount": 0.0,
-            "risk_percent": 0.0,
-            "risk_reward_ratio": None,
+            "explicit_qty": float(explicit_qty),
+            "risk_amount": risk_amount,
+            "risk_percent": risk_percent,
+            "risk_reward_ratio": risk_reward_ratio,
             "resolved_stop_loss": trade_signal.stop_loss,
         }
         return sized
@@ -99,6 +106,7 @@ def size_live_signal(
             "atr": metadata.get("atr"),
             "current_positions": _to_int(metadata.get("current_positions"), default=0),
             "pending_positions": _to_int(metadata.get("pending_positions"), default=0),
+            "enforce_stop_direction": True,
         },
     )
 

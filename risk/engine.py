@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 from risk.config import RiskConfig
@@ -34,6 +35,12 @@ class RiskEngine:
             return None
         reward_distance = abs(float(signal.take_profit) - signal.entry_price)
         return reward_distance / risk_distance
+
+    @staticmethod
+    def _stop_matches_direction(signal: TradeSignal, stop_loss: float) -> bool:
+        if signal.action in {"buy", "long"}:
+            return stop_loss < signal.entry_price
+        return stop_loss > signal.entry_price
 
     def calculate_position_size(
         self,
@@ -76,9 +83,18 @@ class RiskEngine:
             stop_loss = self._fallback_stop_loss(signal, pip)
             signal.stop_loss = stop_loss
             signal.metadata["resolved_stop_loss"] = stop_loss
+        enforce_stop_direction = bool(signal.metadata.get("enforce_stop_direction", False))
+        if enforce_stop_direction and not self._stop_matches_direction(signal, stop_loss):
+            return SizedOrder(
+                signal=signal,
+                position_size=0.0,
+                risk_amount=0.0,
+                risk_percent=0.0,
+                risk_reward_ratio=None,
+            )
 
         risk_distance = abs(signal.entry_price - stop_loss)
-        if risk_distance <= 0:
+        if risk_distance <= 0 or not math.isfinite(risk_distance):
             raise ValueError("entry_price and stop_loss must differ for risk sizing")
 
         risk_amount = balance * risk_percent

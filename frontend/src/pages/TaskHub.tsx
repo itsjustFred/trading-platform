@@ -15,6 +15,7 @@ import { useToast } from "../components/ToastProvider";
 const ACTIVE_STATUSES = new Set(["queued", "starting", "running", "paused"]);
 const FINAL_STATUSES = new Set(["completed", "failed", "cancelled", "interrupted"]);
 const TASK_POLL_MS = 3000;
+const COMPLETED_TASK_LIMIT = 100;
 
 function formatDuration(seconds?: number | null) {
   if (seconds == null || !Number.isFinite(seconds) || seconds < 0) return "—";
@@ -128,7 +129,8 @@ export function TaskHubPage() {
     () =>
       tasks
         .filter((task) => FINAL_STATUSES.has(String(task.status || "").toLowerCase()))
-        .sort(byNewest),
+        .sort(byNewest)
+        .slice(0, COMPLETED_TASK_LIMIT),
     [tasks],
   );
 

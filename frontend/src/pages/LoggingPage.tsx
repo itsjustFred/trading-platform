@@ -15,7 +15,8 @@ const DEFAULT_LEVELS: Record<string, boolean> = {
 };
 const POLLING_PATHS = ["/api/tasks", "/api/data/tasks", "/api/live/accounts", "/api/live/deployments"];
 const POLLING_PREFIXES = ["/api/tasks/", "/api/data/tasks/", "/api/live/balances/", "/api/live/stats/", "/api/live/trades/"];
-const LOG_FETCH_LIMIT = 50000;
+const LOG_FETCH_LIMIT = 5000;
+const LOG_REFRESH_MS = 5000;
 
 type Level = (typeof LEVEL_OPTIONS)[number];
 
@@ -232,7 +233,7 @@ export function LoggingPage() {
     let active = true;
 
     const loadLogs = () =>
-      getLogContent(activeLogFile, LOG_FETCH_LIMIT, levelParam)
+      getLogContent(activeLogFile, LOG_FETCH_LIMIT, levelParam, search.trim() || undefined)
         .then((payload) => {
           if (!active) return;
           setLines(payload.lines ?? []);
@@ -252,13 +253,13 @@ export function LoggingPage() {
     void loadLogs();
     const interval = window.setInterval(() => {
       void loadLogs();
-    }, 2500);
+    }, LOG_REFRESH_MS);
 
     return () => {
       active = false;
       window.clearInterval(interval);
     };
-  }, [activeLogFile, levelParam, showToast]);
+  }, [activeLogFile, levelParam, search, showToast]);
 
   const parsedEntries = useMemo(() => {
     return lines.map(parseLogLine);

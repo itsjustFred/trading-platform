@@ -292,6 +292,13 @@ def _risk_config_for_deployment(deployment: LiveDeploymentConfig) -> RiskConfig:
     )
 
 
+def _deployment_allows_short(deployment: LiveDeploymentConfig) -> bool:
+    settings = deployment.settings or {}
+    configured = deployment.signal_config or {}
+    value = configured.get("allow_short", settings.get("allow_short", False))
+    return _parse_bool_env(str(value), default=False)
+
+
 def _deployment_wait_for_candle_close(
     deployment: LiveDeploymentConfig, env_values: Mapping[str, str]
 ) -> bool:
@@ -420,7 +427,7 @@ def size_live_signal_for_submission(
         stop_loss=stop_loss,
         take_profit=take_profit,
         timeframe=resolved_timeframe,
-        metadata=dict(metadata),
+        metadata={**metadata, "enforce_stop_direction": True},
     )
     sized_order = RiskEngine(_risk_config_for_deployment(deployment)).calculate_position_size(
         signal=trade_signal,
@@ -430,6 +437,7 @@ def size_live_signal_for_submission(
     )
 
     metadata["qty"] = float(sized_order.position_size)
+    metadata["explicit_qty"] = float(sized_order.position_size)
     metadata["risk_amount"] = float(sized_order.risk_amount)
     metadata["risk_percent"] = float(sized_order.risk_percent)
     metadata["risk_reward_ratio"] = (
@@ -502,6 +510,9 @@ def _trade_signal_to_live_signal(
         metadata["take_profit"] = float(signal.take_profit)
     metadata["timeframe"] = signal.timeframe
     metadata["source"] = str(metadata.get("source") or "discord")
+    if signal.action in {"sell", "short"} and not _deployment_allows_short(deployment):
+        metadata["exit_only"] = True
+        metadata["risk_sizing_mode"] = "exit_only"
     return LiveSignal(
         id=uuid.uuid4(),
         deployment_id=str(deployment.id),

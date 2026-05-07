@@ -205,7 +205,27 @@ function sourceButtonLabel(source: string): string {
 function indicatorIsPanel(indicator: IndicatorSeriesView): boolean {
   const type = String(indicator.type || "").toLowerCase();
   const pane = String(indicator.pane || "").toLowerCase();
-  return type === "panel" || pane === "panel" || type.startsWith("panel-");
+  const name = String(indicator.name || "").toLowerCase();
+  const panelNames = [
+    "adx",
+    "atr",
+    "macd",
+    "momentum",
+    "osc",
+    "rsi",
+    "stoch",
+    "volume",
+    "vwap deviation",
+  ];
+  return (
+    type === "panel" ||
+    pane === "panel" ||
+    pane === "separate" ||
+    type.startsWith("panel-") ||
+    panelNames.some((token) => name === token || name.includes(token)) ||
+    /(^|[\s_-])([+-]?di|di[+-]?)([\s_-]|$)/.test(name) ||
+    /^(plusdi|minusdi|diplus|diminus|pdi|mdi)$/.test(name)
+  );
 }
 
 export function TradeChartPage() {
@@ -693,6 +713,7 @@ export function TradeChartPage() {
             display: "flex",
             gap: "14px",
             flexWrap: "wrap",
+            alignItems: "flex-start",
             marginBottom: "16px",
           }}
         >
@@ -772,6 +793,8 @@ export function TradeChartPage() {
                 border: "1px solid var(--color-border)",
                 borderRadius: "10px",
                 padding: "16px",
+                maxHeight: "420px",
+                overflowY: "auto",
               }}
             >
               <div
@@ -1008,10 +1031,8 @@ export function TradeChartPage() {
       {tradeNumbers.length ? (
         <div
           style={{
-            position: "fixed",
-            left: "50%",
-            bottom: "16px",
-            transform: "translateX(-50%)",
+            justifyContent: "center",
+            marginTop: "12px",
             zIndex: 40,
             display: "flex",
             alignItems: "center",

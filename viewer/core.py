@@ -4440,7 +4440,32 @@ def data_download():
             "data_tools.downloaders.yfinance_dl",
             "--symbols",
             symbols,
+            "--timeframes",
+            timeframes,
         ]
+        if start:
+            cmd.extend(["--start", start])
+        if end:
+            cmd.extend(["--end", end])
+    elif source in {"huggingface", "alpaca"}:
+        module_name = {
+            "huggingface": "data_tools.downloaders.huggingface_dl",
+            "alpaca": "data_tools.downloaders.alpaca_dl",
+        }[source]
+        cmd = [
+            sys.executable,
+            "-u",
+            "-m",
+            module_name,
+            "--symbols",
+            symbols,
+            "--timeframes",
+            timeframes,
+        ]
+        if start:
+            cmd.extend(["--start", start])
+        if end:
+            cmd.extend(["--end", end])
     elif source == "dolthub":
         cmd = [sys.executable, "-u", "-m", "data_tools.dolthub_manager", "update"]
     else:

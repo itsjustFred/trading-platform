@@ -6,6 +6,7 @@ import {
   deduplicateBacktests,
   deleteBacktestsBulk,
   getBacktestDuplicates,
+  getBacktestEquityPreviews,
   getBacktestsAll,
   removeEmptyBacktests,
 } from "../api/client";
@@ -310,11 +311,13 @@ export function BacktestsPage() {
   const { showToast } = useToast();
 
   const [items, setItems] = useState<BacktestCardModel[]>([]);
+  const [previewById, setPreviewById] = useState<Record<string, number[]>>({});
   const [loading, setLoading] = useState(false);
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [showSignalsModal, setShowSignalsModal] = useState(false);
 
   const [nameFilter, setNameFilter] = useState("");
+  const [debouncedNameFilter, setDebouncedNameFilter] = useState("");
   const [selectedStrategies, setSelectedStrategies] = useState<string[]>([]);
   const [selectedSymbols, setSelectedSymbols] = useState<string[]>([]);
   const [selectedTimeframes, setSelectedTimeframes] = useState<string[]>([]);
@@ -342,7 +345,7 @@ export function BacktestsPage() {
     async (force = false) => {
       setLoading(true);
       try {
-        const rows = await loadBacktestsAllCached(nameFilter, force);
+        const rows = await loadBacktestsAllCached(debouncedNameFilter, force);
         const bounds = buildNumericBounds(rows);
         setItems(rows);
         setNumericBounds(bounds);
@@ -354,11 +357,18 @@ export function BacktestsPage() {
         setLoading(false);
       }
     },
-    [nameFilter, showToast],
+    [debouncedNameFilter, showToast],
   );
 
   useEffect(() => {
-    void loadAllMetadata(nameFilter.trim().length === 0);
+    const handle = window.setTimeout(() => {
+      setDebouncedNameFilter(nameFilter);
+    }, 250);
+    return () => window.clearTimeout(handle);
+  }, [nameFilter]);
+
+  useEffect(() => {
+    void loadAllMetadata(debouncedNameFilter.trim().length === 0);
   }, [loadAllMetadata]);
 
   const allStrategies = useMemo(
@@ -465,6 +475,26 @@ export function BacktestsPage() {
     const start = (page - 1) * perPage;
     return filteredSorted.slice(start, start + perPage);
   }, [filteredSorted, page, perPage]);
+
+  useEffect(() => {
+    const missingIds = currentPageItems
+      .map((item) => item.id)
+      .filter((id) => id && !previewById[id]);
+    if (missingIds.length === 0) return;
+
+    let active = true;
+    getBacktestEquityPreviews(missingIds, 48)
+      .then((payload) => {
+        if (!active) return;
+        if (Object.keys(payload).length === 0) return;
+        setPreviewById((current) => ({ ...current, ...payload }));
+      })
+      .catch(() => undefined);
+
+    return () => {
+      active = false;
+    };
+  }, [currentPageItems, previewById]);
 
   useEffect(() => {
     const valid = new Set(filteredSorted.map((item) => item.id));
@@ -1092,7 +1122,7 @@ export function BacktestsPage() {
             const cagrPct = metricValue(item.cagr) * 100;
             const maxDrawdownPct = Math.abs(metricValue(item.max_drawdown)) * 100;
             const winRatePct = (normalizeWinRate(item.win_rate) ?? 0) * 100;
-            const sparkline = item.equity_preview ?? [];
+            const sparkline = previewById[item.id] ?? item.equity_preview ?? [];
 
             return (
               <article
