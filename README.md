@@ -10,8 +10,8 @@ git clone <repo-url> && cd trading-platform
 python -m venv .venv
 
 # Activate virtual environment
-source .venv/bin/activate        # Linux/macOS
-# .venv\Scripts\activate         # Windows
+source .venv/bin/activate        # Linux/macOS / Git Bash
+# .venv\Scripts\activate         # Windows (PowerShell / cmd)
 
 # Install dependencies
 pip install -e ".[all]"
@@ -21,12 +21,17 @@ pip install -e ".[all]"
 cp .env.example .env
 # Edit .env — set DATA_DIR (default: ./data)
 
-# Build frontend
+# Production: build frontend, then start viewer
 cd frontend && npm install && npm run build && cd ..
-
-# Start the viewer
 python -m uvicorn viewer.main:app --host 0.0.0.0 --port 5556 --no-access-log
 # Open http://localhost:5556
+
+# Development (two terminals; Vite on :3000 proxies /api to backend on :5556)
+# Terminal 1:
+python -m uvicorn viewer.main:app --host 0.0.0.0 --port 5556 --no-access-log
+# Terminal 2:
+cd frontend && npm install && npm run dev
+# Open http://localhost:3000
 # Strategy Lab live conversion runs also require NVIDIA_API_KEY
 ```
 

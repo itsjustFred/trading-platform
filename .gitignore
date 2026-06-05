@@ -16,6 +16,9 @@ build/
 .idea/
 .vscode/*
 !.vscode/mcp.json
+.obsidian/
+.pi/tau-instances/
+~/.pi/tau-instances/
 *.swp
 *.swo
 
