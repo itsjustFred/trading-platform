@@ -1982,7 +1982,7 @@ def test_backtest_run_registers_task_manager_progress(viewer_client, monkeypatch
                 "PROGRESS:25.00:Running strategy: 2500/10000 bars (25%)\n",
                 '{"message":"Result: 5 trades, total PnL: $123.45"}\n',
                 "PROGRESS:95.00:Saving results...\n",
-                f'{{"message":"Saved to: {expected_output}"}}\n',
+                json.dumps({"message": f"Saved to: {expected_output}"}) + "\n",
                 "PROGRESS:100.00:Completed - 5 trades found\n",
             ]
         )

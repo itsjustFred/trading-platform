@@ -13,6 +13,7 @@ from uuid import uuid4
 from dotenv import load_dotenv
 from sqlalchemy import JSON, Column, String, UniqueConstraint, delete, event, func, or_, text
 from sqlalchemy.engine import Connection
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Field, Session, SQLModel, create_engine, select
 
 from shared.constants import DATA_DIR as RESOLVED_DATA_DIR
@@ -287,6 +288,7 @@ class LiveSignalModel(SQLModel, table=True):
     theoretical_price: float = Field(default=0.0)
     timestamp: datetime = Field(index=True)
     source: str = Field(default="internal", index=True)
+    broker_order_id: str = Field(default="", index=True)
     metadata_json: dict[str, Any] = Field(
         default_factory=dict, sa_column=Column("metadata", JSON, nullable=False)
     )
@@ -301,6 +303,7 @@ class LiveSignalModel(SQLModel, table=True):
             theoretical_price=signal.theoretical_price,
             timestamp=signal.timestamp,
             source=str(signal.metadata.get("source", "internal")),
+            broker_order_id=str(signal.metadata.get("broker_order_id") or ""),
             metadata_json=signal.metadata,
         )
 
@@ -329,6 +332,10 @@ class LiveExecutionModel(SQLModel, table=True):
     commission: float = Field(default=0.0)
     timestamp: datetime = Field(index=True)
     broker_order_id: str = Field(index=True)
+    dedupe_key: str | None = Field(
+        default=None,
+        sa_column=Column("dedupe_key", String, nullable=True, unique=True, index=True),
+    )
 
     @classmethod
     def from_live_execution(cls, execution: LiveExecution) -> "LiveExecutionModel":
@@ -340,6 +347,9 @@ class LiveExecutionModel(SQLModel, table=True):
             commission=execution.commission,
             timestamp=execution.timestamp,
             broker_order_id=execution.broker_order_id,
+            dedupe_key=(str(execution.dedupe_key).strip() or None)
+            if execution.dedupe_key is not None
+            else None,
         )
 
     def to_live_execution(self) -> LiveExecution:
@@ -351,6 +361,7 @@ class LiveExecutionModel(SQLModel, table=True):
             commission=self.commission,
             timestamp=self.timestamp,
             broker_order_id=self.broker_order_id,
+            dedupe_key=self.dedupe_key,
         )
 
 
@@ -847,6 +858,24 @@ def _migrate_schema() -> None:
             connection.execute(
                 text("ALTER TABLE live_signals ADD COLUMN source TEXT NOT NULL DEFAULT 'internal'")
             )
+        if live_signal_column_names and "broker_order_id" not in live_signal_column_names:
+            connection.execute(
+                text(
+                    "ALTER TABLE live_signals "
+                    "ADD COLUMN broker_order_id TEXT NOT NULL DEFAULT ''"
+                )
+            )
+
+        execution_column_names = _table_column_names(connection, "live_executions")
+        if execution_column_names and "dedupe_key" not in execution_column_names:
+            connection.execute(text("ALTER TABLE live_executions ADD COLUMN dedupe_key TEXT"))
+        if _table_column_names(connection, "live_executions"):
+            connection.execute(
+                text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_live_executions_dedupe_key "
+                    "ON live_executions(dedupe_key) WHERE dedupe_key IS NOT NULL"
+                )
+            )
 
 
 def save_live_signal(signal: LiveSignal) -> None:
@@ -856,11 +885,103 @@ def save_live_signal(signal: LiveSignal) -> None:
         session.commit()
 
 
-def save_live_execution(execution: LiveExecution) -> None:
+def save_live_execution(execution: LiveExecution) -> bool:
+    """Persist a fill. Returns False when a duplicate (same dedupe_key) was skipped."""
     init_db()
     with get_session() as session:
-        session.add(LiveExecutionModel.from_live_execution(execution))
+        record = LiveExecutionModel.from_live_execution(execution)
+        if record.dedupe_key:
+            existing = session.exec(
+                select(LiveExecutionModel)
+                .where(LiveExecutionModel.dedupe_key == record.dedupe_key)
+                .limit(1)
+            ).first()
+            if existing is not None:
+                logger.info(
+                    "Skipping duplicate live execution (dedupe_key=%s)", record.dedupe_key
+                )
+                return False
+        session.add(record)
+        try:
+            session.commit()
+        except IntegrityError:
+            session.rollback()
+            logger.info(
+                "Skipping duplicate live execution on unique constraint (dedupe_key=%s)",
+                record.dedupe_key,
+            )
+            return False
+    return True
+
+
+def set_live_signal_broker_order_id(signal_id: str, broker_order_id: str) -> bool:
+    """Persist the broker order id on a signal right after submission (crash recovery)."""
+    normalized_signal_id = str(signal_id or "").strip()
+    normalized_order_id = str(broker_order_id or "").strip()
+    if not normalized_signal_id or not normalized_order_id:
+        return False
+    init_db()
+    with get_session() as session:
+        record = session.get(LiveSignalModel, normalized_signal_id)
+        if record is None:
+            return False
+        record.broker_order_id = normalized_order_id
+        metadata = dict(record.metadata_json or {})
+        metadata["broker_order_id"] = normalized_order_id
+        record.metadata_json = metadata
+        session.add(record)
         session.commit()
+    return True
+
+
+def get_live_signal_broker_order_id(signal_id: str) -> str | None:
+    """Return the persisted broker order id for a signal, if any (crash recovery)."""
+    normalized_signal_id = str(signal_id or "").strip()
+    if not normalized_signal_id:
+        return None
+    init_db()
+    with get_session() as session:
+        record = session.get(LiveSignalModel, normalized_signal_id)
+        if record is None:
+            return None
+        broker_order_id = str(record.broker_order_id or "").strip()
+    return broker_order_id or None
+
+
+def find_live_signal_id_by_broker_order_id(broker_order_id: str) -> str | None:
+    normalized = str(broker_order_id or "").strip()
+    if not normalized:
+        return None
+    init_db()
+    with get_session() as session:
+        row = session.exec(
+            select(LiveSignalModel)
+            .where(LiveSignalModel.broker_order_id == normalized)
+            .order_by(LiveSignalModel.timestamp.desc())
+            .limit(1)
+        ).first()
+    return str(row.id) if row is not None else None
+
+
+def list_live_signal_ids_missing_executions(limit: int = 200) -> list[str]:
+    """Signals persisted before broker submit that never received a fill record.
+
+    Used by adapter reconciliation after a crash/restart to backfill lost fills.
+    """
+    try:
+        bounded_limit = max(1, min(int(limit), 2000))
+    except (TypeError, ValueError):
+        bounded_limit = 200
+    init_db()
+    with get_session() as session:
+        executed_ids = select(LiveExecutionModel.signal_id)
+        rows = session.exec(
+            select(LiveSignalModel)
+            .where(LiveSignalModel.id.notin_(executed_ids))
+            .order_by(LiveSignalModel.timestamp.desc(), LiveSignalModel.id.desc())
+            .limit(bounded_limit)
+        ).all()
+    return [str(row.id) for row in rows]
 
 
 def save_live_balance(record: LiveBalanceRecord) -> None:

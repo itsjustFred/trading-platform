@@ -233,6 +233,7 @@ class LiveExecution(BaseModel):
     commission: float
     timestamp: datetime
     broker_order_id: str
+    dedupe_key: str | None = None
 
 
 class LiveBalanceRecord(BaseModel):

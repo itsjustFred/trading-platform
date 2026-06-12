@@ -7580,7 +7580,7 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
                             report_stage(handle, percent=percent, message=message)
 
                         if parsed_message.lower().startswith("saved to:"):
-                            output_path = parsed_message.split(":", 1)[1].strip()
+                            output_path = parsed_message[len("saved to:"):].strip()
                             if output_path:
                                 filename = Path(output_path).name
                                 if filename.endswith(".trades.json"):

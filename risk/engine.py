@@ -14,17 +14,19 @@ class RiskEngine:
     def __init__(self, config: RiskConfig | None = None):
         self.config = config or RiskConfig()
 
-    def _fallback_stop_loss(self, signal: TradeSignal, pip_value: float) -> float:
+    def _fallback_stop_loss(self, signal: TradeSignal) -> float:
         atr = signal.metadata.get("atr")
         if atr is not None:
-            atr_distance = abs(float(atr)) * self.config.default_sl_atr_multiplier
+            distance = abs(float(atr)) * self.config.default_sl_atr_multiplier
         else:
-            atr_distance = abs(float(pip_value)) * self.config.default_sl_atr_multiplier
-        if atr_distance <= 0:
-            atr_distance = signal.entry_price * 0.02
+            # Percent-of-price fallback. An absolute (pip-based) distance under-scales
+            # on high-priced assets and produces drastically oversized positions.
+            distance = signal.entry_price * self.config.fallback_stop_pct
+        if distance <= 0 or not math.isfinite(distance):
+            distance = signal.entry_price * 0.02
         if signal.action in {"buy", "long"}:
-            return signal.entry_price - atr_distance
-        return signal.entry_price + atr_distance
+            return signal.entry_price - distance
+        return signal.entry_price + distance
 
     @staticmethod
     def _risk_reward_ratio(signal: TradeSignal, stop_loss: float) -> float | None:
@@ -80,7 +82,7 @@ class RiskEngine:
 
         stop_loss = signal.stop_loss
         if stop_loss is None:
-            stop_loss = self._fallback_stop_loss(signal, pip)
+            stop_loss = self._fallback_stop_loss(signal)
             signal.stop_loss = stop_loss
             signal.metadata["resolved_stop_loss"] = stop_loss
         enforce_stop_direction = bool(signal.metadata.get("enforce_stop_direction", False))

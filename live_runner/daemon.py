@@ -10,7 +10,6 @@ from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 from dotenv import dotenv_values
 
@@ -189,10 +188,15 @@ def _discover_and_register_discord_services(*, log_summary: bool = True) -> list
     return list_services(service_type=ServiceType.DISCORD_BOT)
 
 
-def _set_all_services_running() -> list[Service]:
+def _recover_failed_services() -> list[Service]:
+    """Retry FAILED services on startup; never resurrect PAUSED/STOPPED ones.
+
+    PAUSED/STOPPED encode operator intent and must survive a daemon restart.
+    FAILED is system state (e.g. transient auth/network) and is safe to retry.
+    """
     services = list_services()
     for service in services:
-        if service.status == ServiceStatus.RUNNING:
+        if service.status != ServiceStatus.FAILED:
             continue
         update_service_status(str(service.id), ServiceStatus.RUNNING)
     return list_services()
@@ -345,20 +349,11 @@ def _build_processor_market_data(
         if not frame.empty:
             return frame
 
-    entry = max(float(signal.entry_price), 0.01)
-    rows = 90
-    timestamps = pd.date_range(end=pd.Timestamp.utcnow(), periods=rows, freq="5min", tz="UTC")
-    basis = np.linspace(entry * 0.997, entry * 1.003, rows)
-    return pd.DataFrame(
-        {
-            "timestamp": timestamps,
-            "open": basis,
-            "high": basis * 1.0015,
-            "low": basis * 0.9985,
-            "close": basis,
-            "volume": np.full(rows, 1000.0),
-            "timeframe": timeframe,
-        }
+    # Fail closed: signal processors compute ATR/volatility/trend filters. Feeding
+    # them fabricated OHLCV approves live trades on invented context.
+    raise ValueError(
+        "Signal processor requires market data; refusing to fabricate synthetic "
+        "OHLCV for a live trading decision"
     )
 
 
@@ -410,8 +405,11 @@ def size_live_signal_for_submission(
     account_balance: float,
     current_exposure: float = 0.0,
     pip_value: float | None = None,
+    current_positions: int | None = None,
 ) -> LiveSignal:
     metadata: dict[str, object] = dict(signal.metadata or {})
+    if current_positions is not None:
+        metadata["current_positions"] = int(current_positions)
     stop_loss = _first_metadata_float(metadata, ("stop_loss", "sl_price", "stop_price"))
     take_profit = _first_metadata_float(metadata, ("take_profit", "tp_price"))
     resolved_timeframe = (
@@ -484,6 +482,25 @@ async def submit_order_with_risk(
         metadata["risk_sizing_mode"] = "exit_only"
         return await adapter.submit_order(signal.model_copy(update={"metadata": metadata}))
 
+    # Feed broker truth into sizing so max_positions / max_total_exposure actually
+    # bind. Without this, every signal is sized as if the account were flat.
+    open_positions_count: int | None = None
+    broker_exposure = 0.0
+    get_positions = getattr(adapter, "get_positions", None)
+    if callable(get_positions):
+        positions = await get_positions()
+        open_positions_count = 0
+        for position in positions:
+            try:
+                position_qty = float(position.get("qty") or 0.0)
+            except (TypeError, ValueError):
+                position_qty = 0.0
+            if abs(position_qty) > 0:
+                open_positions_count += 1
+        # Conservative estimate: each open position was sized at max_risk_per_trade.
+        risk_config = _risk_config_for_deployment(deployment)
+        broker_exposure = open_positions_count * risk_config.max_risk_per_trade
+
     resolved_balance = account_balance
     if resolved_balance is None:
         _, equity = await adapter.get_balance()
@@ -493,8 +510,9 @@ async def submit_order_with_risk(
         signal,
         deployment,
         account_balance=resolved_balance,
-        current_exposure=current_exposure,
+        current_exposure=max(float(current_exposure), broker_exposure),
         pip_value=pip_value,
+        current_positions=open_positions_count,
     )
     return await adapter.submit_order(sized_signal)
 
@@ -1625,7 +1643,7 @@ async def run_daemon(
     scheduler = ServiceScheduler()
 
     await asyncio.to_thread(_discover_and_register_discord_services, log_summary=True)
-    await asyncio.to_thread(_set_all_services_running)
+    await asyncio.to_thread(_recover_failed_services)
     await scheduler.start()
 
     sync_task = asyncio.create_task(

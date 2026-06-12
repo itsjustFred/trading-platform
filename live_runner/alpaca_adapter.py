@@ -12,7 +12,12 @@ from uuid import UUID
 
 from live_runner.base_adapter import BaseLiveAdapter
 from risk.live import size_live_signal
-from shared.database import save_live_execution, save_live_signal
+from shared.database import (
+    list_live_signal_ids_missing_executions,
+    save_live_execution,
+    save_live_signal,
+    set_live_signal_broker_order_id,
+)
 from shared.logging import get_logger
 from shared.models import LiveExecution, LiveSignal
 
@@ -191,6 +196,62 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             "Connected Alpaca live adapter",
             extra={"data": {"account_id": self.account_id, "paper": self.paper}},
         )
+        try:
+            await self.reconcile_executions()
+        except Exception as exc:
+            logger.warning(
+                "Alpaca execution reconciliation failed; fills may be missing until retry",
+                extra={"data": {"account_id": self.account_id, "error": str(exc)}},
+            )
+
+    async def reconcile_executions(self, *, max_signals: int = 200) -> int:
+        """Backfill fills for persisted signals that never received an execution record.
+
+        Recovers fills that completed while the daemon was down or crashed between
+        broker submit and stream-event persistence. Uses the client_order_id == signal.id
+        convention. Only signals with zero recorded executions are considered, so
+        partially-streamed fills are never double-counted.
+        """
+        if self._trading_client is None:
+            return 0
+        signal_ids = await asyncio.to_thread(
+            list_live_signal_ids_missing_executions, max_signals
+        )
+        recovered = 0
+        for signal_id in signal_ids:
+            try:
+                order = await asyncio.to_thread(
+                    self._trading_client.get_order_by_client_id, signal_id
+                )
+            except Exception:
+                # Unknown to this account (other broker/account) or not found.
+                continue
+            filled_qty = _to_float(getattr(order, "filled_qty", None), default=0.0)
+            if filled_qty <= 0:
+                continue
+            broker_order_id = str(getattr(order, "id", ""))
+            execution = LiveExecution(
+                signal_id=UUID(signal_id),
+                actual_price=_to_float(getattr(order, "filled_avg_price", None), default=0.0),
+                filled_qty=filled_qty,
+                commission=0.0,
+                timestamp=_to_datetime(getattr(order, "filled_at", None)),
+                broker_order_id=broker_order_id,
+                dedupe_key=f"alpaca:order:{broker_order_id}:reconciled",
+            )
+            if await asyncio.to_thread(save_live_execution, execution):
+                recovered += 1
+                logger.info(
+                    "Reconciled missed Alpaca fill",
+                    extra={
+                        "data": {
+                            "signal_id": signal_id,
+                            "broker_order_id": broker_order_id,
+                            "filled_qty": filled_qty,
+                        }
+                    },
+                )
+        return recovered
 
     async def disconnect(self) -> None:
         stream = self._trading_stream
@@ -251,6 +312,10 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         )
         order = await asyncio.to_thread(self._trading_client.submit_order, order_data=request)
         broker_order_id = str(getattr(order, "id", ""))
+        if broker_order_id:
+            await asyncio.to_thread(
+                set_live_signal_broker_order_id, str(signal.id), broker_order_id
+            )
         logger.info(
             "Submitted Alpaca live order",
             extra={
@@ -322,8 +387,19 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             if fill_price is None:
                 fill_price = getattr(order, "filled_avg_price", None)
 
-            filled_qty_value = getattr(data, "filled_qty", None)
+            # Per-event quantity. `order.filled_qty` is CUMULATIVE in alpaca-py and
+            # must not be persisted per partial-fill event (double counting).
+            filled_qty_value = getattr(data, "qty", None)
             if filled_qty_value is None:
+                filled_qty_value = getattr(data, "filled_qty", None)
+            if filled_qty_value is None:
+                if event == "partial_fill":
+                    logger.warning(
+                        "Partial fill without per-event qty; skipping to avoid "
+                        "double-counting cumulative order.filled_qty",
+                        extra={"data": {"client_order_id": str(client_order_id)}},
+                    )
+                    return
                 filled_qty_value = getattr(order, "filled_qty", None)
 
             commission_value = getattr(data, "commission", None)
@@ -336,6 +412,15 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             fill_ts = _to_datetime(getattr(data, "timestamp", None))
             broker_order_id = str(getattr(order, "id", ""))
 
+            execution_id = str(getattr(data, "execution_id", "") or "")
+            if execution_id:
+                dedupe_key = f"alpaca:exec:{execution_id}"
+            else:
+                dedupe_key = (
+                    f"alpaca:order:{broker_order_id}:{event}:"
+                    f"{fill_ts.isoformat()}:{filled_qty}"
+                )
+
             execution = LiveExecution(
                 signal_id=signal_uuid,
                 actual_price=actual_price,
@@ -343,6 +428,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 commission=commission,
                 timestamp=fill_ts,
                 broker_order_id=broker_order_id,
+                dedupe_key=dedupe_key,
             )
             await asyncio.to_thread(save_live_execution, execution)
             logger.info(
