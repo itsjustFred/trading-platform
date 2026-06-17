@@ -29,7 +29,41 @@ class StrategyEquityPoint:
 
 
 def _load_strategy_equity(backtest_id: str) -> list[StrategyEquityPoint]:
-    """Load equity curve for a strategy backtest."""
+    """Load equity curve for a strategy backtest.
+    
+    Tries SQLite first, falls back to JSON for backward compatibility.
+    """
+    # Try SQLite first (single source of truth)
+    try:
+        from shared.database import init_db, get_session
+        from sqlmodel import select
+        from shared.database import BacktestRecord
+        
+        init_db()
+        with get_session() as session:
+            record = session.exec(
+                select(BacktestRecord).where(BacktestRecord.id == backtest_id)
+            ).first()
+            if record and record.equity_curve:
+                points = []
+                for p in record.equity_curve:
+                    if isinstance(p, dict):
+                        if p.get("time") and p.get("equity"):
+                            points.append(StrategyEquityPoint(
+                                time=int(p.get("time", 0)),
+                                equity=float(p.get("equity", 0))
+                            ))
+                    elif hasattr(p, "time") and hasattr(p, "equity"):
+                        points.append(StrategyEquityPoint(
+                            time=int(getattr(p, "time", 0)),
+                            equity=float(getattr(p, "equity", 0))
+                        ))
+                if points:
+                    return points
+    except Exception:
+        pass  # Fall through to JSON fallback
+    
+    # JSON fallback for backward compatibility
     path = Path(DATA_DIR) / "backtests" / f"{backtest_id}.trades.json"
     if not path.exists():
         return []
