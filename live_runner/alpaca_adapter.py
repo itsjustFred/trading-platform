@@ -131,7 +131,7 @@ def resolve_alpaca_credentials(
     )
     if (normalized_account_id or normalized_login) and has_configured_hints:
         logger.warning(
-            "No exact Alpaca credential block match; using first configured block",
+            "No exact Alpaca credential block match; refusing ambiguous fallback",
             extra={
                 "data": {
                     "account_id": account_id,
@@ -139,6 +139,7 @@ def resolve_alpaca_credentials(
                 }
             },
         )
+        return None
     first = blocks[0]
     return (
         str(first["api_key"]),

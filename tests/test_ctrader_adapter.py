@@ -35,6 +35,10 @@ def test_is_terminal_auth_error_detects_invalid_token_code() -> None:
     assert _is_terminal_auth_error("INVALID_TOKEN", "")
 
 
+def test_is_terminal_auth_error_detects_ctrader_invalid_token_code() -> None:
+    assert _is_terminal_auth_error("CH_ACCESS_TOKEN_INVALID", "")
+
+
 def test_is_terminal_auth_error_ignores_transient_timeout() -> None:
     assert not _is_terminal_auth_error("TIMEOUT", "Connection timeout")
 
@@ -85,6 +89,77 @@ def test_on_message_keeps_terminal_state_clear_for_already_logged_in() -> None:
 
     assert adapter._terminal_auth_failure_code == ""
     assert adapter._terminal_auth_failure_reason == ""
+
+
+def test_refresh_access_token_updates_runtime_and_dotenv(tmp_path) -> None:
+    env_path = tmp_path / ".accounts.env"
+    env_path.write_text("CTRADER_ACCESS_TOKEN=old\nCTRADER_REFRESH_TOKEN=old_refresh\n", encoding="utf-8")
+    adapter = CTraderLiveAdapter(
+        app_id="app",
+        app_secret="secret",
+        access_token="old",
+        refresh_token="old_refresh",
+        account_id="46736452",
+        accounts_env_path=env_path,
+    )
+
+    class _RefreshReq:
+        def __init__(self) -> None:
+            self.refreshToken = ""
+
+    class _RefreshRes:
+        accessToken = "new_access"
+        refreshToken = "new_refresh"
+        expiresIn = 2628000
+
+    async def _fake_send(request, **_kwargs):
+        assert isinstance(request, _RefreshReq)
+        assert request.refreshToken == "old_refresh"
+        return _RefreshRes()
+
+    adapter._ProtoOARefreshTokenReq = _RefreshReq
+    adapter._ProtoOARefreshTokenRes = _RefreshRes
+    adapter._send_request = _fake_send
+
+    assert asyncio.run(adapter._refresh_access_token()) is True
+    assert adapter.access_token == "new_access"
+    assert adapter.refresh_token == "new_refresh"
+    contents = env_path.read_text(encoding="utf-8")
+    assert "CTRADER_ACCESS_TOKEN=new_access" in contents
+    assert "CTRADER_REFRESH_TOKEN=new_refresh" in contents
+
+
+def test_disconnect_times_out_instead_of_hanging() -> None:
+    async def _run() -> CTraderLiveAdapter:
+        adapter = CTraderLiveAdapter(
+            app_id="app",
+            app_secret="secret",
+            access_token="token",
+            account_id="46736452",
+        )
+        adapter._loop = asyncio.get_running_loop()
+        adapter._connected = True
+        adapter._authenticated = True
+
+        class _NeverCompletes:
+            def asFuture(self, loop):
+                return loop.create_future()
+
+        class _Client:
+            running = True
+
+            def stopService(self):
+                return _NeverCompletes()
+
+        adapter._client = _Client()
+        await adapter.disconnect()
+        return adapter
+
+    adapter = asyncio.run(_run())
+
+    assert adapter._client is None
+    assert adapter._connected is False
+    assert adapter._authenticated is False
 
 
 def test_get_balance_marks_terminal_auth_failure_for_not_authorized() -> None:
