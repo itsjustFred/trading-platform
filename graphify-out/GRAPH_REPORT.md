@@ -1,34 +1,35 @@
-# Graph Report - .  (2026-06-09)
+# Graph Report - trading-platform  (2026-06-17)
 
 ## Corpus Check
-- Large corpus: 340 files � ~571,061 words. Semantic extraction will be expensive (many Claude tokens). Consider running on a subfolder.
+- 241 files · ~896,099 words
+- Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 4473 nodes · 10358 edges · 348 communities (303 shown, 45 thin omitted)
-- Extraction: 88% EXTRACTED · 12% INFERRED · 0% AMBIGUOUS · INFERRED: 1217 edges (avg confidence: 0.51)
+- 3515 nodes · 9613 edges · 456 communities detected
+- Extraction: 51% EXTRACTED · 49% INFERRED · 0% AMBIGUOUS · INFERRED: 4672 edges (avg confidence: 0.62)
 - Token cost: 0 input · 0 output
 
 ## Community Hubs (Navigation)
-- [[_COMMUNITY_Live Trading Alpaca Adapter|Live Trading Alpaca Adapter]]
-- [[_COMMUNITY_PyneCore Engine Integration|PyneCore Engine Integration]]
-- [[_COMMUNITY_Frontend API Client|Frontend API Client]]
-- [[_COMMUNITY_Data Downloaders Pipeline|Data Downloaders Pipeline]]
-- [[_COMMUNITY_Viewer Backend API|Viewer Backend API]]
-- [[_COMMUNITY_Test Suite Viewer Features|Test Suite Viewer Features]]
-- [[_COMMUNITY_Backtest Engine Base|Backtest Engine Base]]
-- [[_COMMUNITY_Portfolio Models & Analytics|Portfolio Models & Analytics]]
-- [[_COMMUNITY_Statistics Computation|Statistics Computation]]
-- [[_COMMUNITY_Backtest API Operations|Backtest API Operations]]
-- [[_COMMUNITY_Live Deployment Management|Live Deployment Management]]
-- [[_COMMUNITY_Live Position Tracking|Live Position Tracking]]
-- [[_COMMUNITY_Stockkit Converter|Stockkit Converter]]
-- [[_COMMUNITY_Data Management API|Data Management API]]
-- [[_COMMUNITY_Downloader Infrastructure|Downloader Infrastructure]]
-- [[_COMMUNITY_Live Runner Daemon|Live Runner Daemon]]
-- [[_COMMUNITY_Data Task Management|Data Task Management]]
-- [[_COMMUNITY_Dukascopy Native Downloader|Dukascopy Native Downloader]]
-- [[_COMMUNITY_JForex Downloader|JForex Downloader]]
-- [[_COMMUNITY_Engine Base & Strategy Registry|Engine Base & Strategy Registry]]
+- [[_COMMUNITY_Community 0|Community 0]]
+- [[_COMMUNITY_Community 1|Community 1]]
+- [[_COMMUNITY_Community 2|Community 2]]
+- [[_COMMUNITY_Community 3|Community 3]]
+- [[_COMMUNITY_Community 4|Community 4]]
+- [[_COMMUNITY_Community 5|Community 5]]
+- [[_COMMUNITY_Community 6|Community 6]]
+- [[_COMMUNITY_Community 7|Community 7]]
+- [[_COMMUNITY_Community 8|Community 8]]
+- [[_COMMUNITY_Community 9|Community 9]]
+- [[_COMMUNITY_Community 10|Community 10]]
+- [[_COMMUNITY_Community 11|Community 11]]
+- [[_COMMUNITY_Community 12|Community 12]]
+- [[_COMMUNITY_Community 13|Community 13]]
+- [[_COMMUNITY_Community 14|Community 14]]
+- [[_COMMUNITY_Community 15|Community 15]]
+- [[_COMMUNITY_Community 16|Community 16]]
+- [[_COMMUNITY_Community 17|Community 17]]
+- [[_COMMUNITY_Community 18|Community 18]]
+- [[_COMMUNITY_Community 19|Community 19]]
 - [[_COMMUNITY_Community 20|Community 20]]
 - [[_COMMUNITY_Community 21|Community 21]]
 - [[_COMMUNITY_Community 22|Community 22]]
@@ -60,8 +61,6 @@
 - [[_COMMUNITY_Community 48|Community 48]]
 - [[_COMMUNITY_Community 49|Community 49]]
 - [[_COMMUNITY_Community 50|Community 50]]
-- [[_COMMUNITY_Community 51|Community 51]]
-- [[_COMMUNITY_Community 52|Community 52]]
 - [[_COMMUNITY_Community 53|Community 53]]
 - [[_COMMUNITY_Community 54|Community 54]]
 - [[_COMMUNITY_Community 55|Community 55]]
@@ -76,7 +75,6 @@
 - [[_COMMUNITY_Community 64|Community 64]]
 - [[_COMMUNITY_Community 65|Community 65]]
 - [[_COMMUNITY_Community 66|Community 66]]
-- [[_COMMUNITY_Community 67|Community 67]]
 - [[_COMMUNITY_Community 68|Community 68]]
 - [[_COMMUNITY_Community 69|Community 69]]
 - [[_COMMUNITY_Community 70|Community 70]]
@@ -88,14 +86,6 @@
 - [[_COMMUNITY_Community 76|Community 76]]
 - [[_COMMUNITY_Community 77|Community 77]]
 - [[_COMMUNITY_Community 78|Community 78]]
-- [[_COMMUNITY_Community 79|Community 79]]
-- [[_COMMUNITY_Community 80|Community 80]]
-- [[_COMMUNITY_Community 81|Community 81]]
-- [[_COMMUNITY_Community 82|Community 82]]
-- [[_COMMUNITY_Community 83|Community 83]]
-- [[_COMMUNITY_Community 84|Community 84]]
-- [[_COMMUNITY_Community 85|Community 85]]
-- [[_COMMUNITY_Community 86|Community 86]]
 - [[_COMMUNITY_Community 87|Community 87]]
 - [[_COMMUNITY_Community 88|Community 88]]
 - [[_COMMUNITY_Community 89|Community 89]]
@@ -105,43 +95,11 @@
 - [[_COMMUNITY_Community 93|Community 93]]
 - [[_COMMUNITY_Community 94|Community 94]]
 - [[_COMMUNITY_Community 95|Community 95]]
-- [[_COMMUNITY_Community 96|Community 96]]
-- [[_COMMUNITY_Community 97|Community 97]]
-- [[_COMMUNITY_Community 98|Community 98]]
-- [[_COMMUNITY_Community 99|Community 99]]
-- [[_COMMUNITY_Community 100|Community 100]]
-- [[_COMMUNITY_Community 101|Community 101]]
-- [[_COMMUNITY_Community 102|Community 102]]
-- [[_COMMUNITY_Community 103|Community 103]]
-- [[_COMMUNITY_Community 104|Community 104]]
-- [[_COMMUNITY_Community 105|Community 105]]
-- [[_COMMUNITY_Community 106|Community 106]]
-- [[_COMMUNITY_Community 107|Community 107]]
-- [[_COMMUNITY_Community 109|Community 109]]
-- [[_COMMUNITY_Community 110|Community 110]]
-- [[_COMMUNITY_Community 111|Community 111]]
-- [[_COMMUNITY_Community 112|Community 112]]
-- [[_COMMUNITY_Community 113|Community 113]]
-- [[_COMMUNITY_Community 114|Community 114]]
-- [[_COMMUNITY_Community 115|Community 115]]
-- [[_COMMUNITY_Community 116|Community 116]]
-- [[_COMMUNITY_Community 117|Community 117]]
-- [[_COMMUNITY_Community 118|Community 118]]
-- [[_COMMUNITY_Community 119|Community 119]]
-- [[_COMMUNITY_Community 120|Community 120]]
-- [[_COMMUNITY_Community 121|Community 121]]
 - [[_COMMUNITY_Community 122|Community 122]]
 - [[_COMMUNITY_Community 123|Community 123]]
 - [[_COMMUNITY_Community 124|Community 124]]
-- [[_COMMUNITY_Community 125|Community 125]]
-- [[_COMMUNITY_Community 126|Community 126]]
-- [[_COMMUNITY_Community 127|Community 127]]
-- [[_COMMUNITY_Community 128|Community 128]]
 - [[_COMMUNITY_Community 129|Community 129]]
 - [[_COMMUNITY_Community 130|Community 130]]
-- [[_COMMUNITY_Community 131|Community 131]]
-- [[_COMMUNITY_Community 132|Community 132]]
-- [[_COMMUNITY_Community 133|Community 133]]
 - [[_COMMUNITY_Community 134|Community 134]]
 - [[_COMMUNITY_Community 135|Community 135]]
 - [[_COMMUNITY_Community 136|Community 136]]
@@ -318,6 +276,7 @@
 - [[_COMMUNITY_Community 307|Community 307]]
 - [[_COMMUNITY_Community 308|Community 308]]
 - [[_COMMUNITY_Community 309|Community 309]]
+- [[_COMMUNITY_Community 310|Community 310]]
 - [[_COMMUNITY_Community 311|Community 311]]
 - [[_COMMUNITY_Community 312|Community 312]]
 - [[_COMMUNITY_Community 313|Community 313]]
@@ -326,60 +285,211 @@
 - [[_COMMUNITY_Community 316|Community 316]]
 - [[_COMMUNITY_Community 317|Community 317]]
 - [[_COMMUNITY_Community 318|Community 318]]
+- [[_COMMUNITY_Community 319|Community 319]]
+- [[_COMMUNITY_Community 320|Community 320]]
 - [[_COMMUNITY_Community 321|Community 321]]
 - [[_COMMUNITY_Community 322|Community 322]]
+- [[_COMMUNITY_Community 323|Community 323]]
+- [[_COMMUNITY_Community 324|Community 324]]
+- [[_COMMUNITY_Community 325|Community 325]]
+- [[_COMMUNITY_Community 326|Community 326]]
+- [[_COMMUNITY_Community 327|Community 327]]
 - [[_COMMUNITY_Community 328|Community 328]]
 - [[_COMMUNITY_Community 329|Community 329]]
 - [[_COMMUNITY_Community 330|Community 330]]
+- [[_COMMUNITY_Community 331|Community 331]]
+- [[_COMMUNITY_Community 332|Community 332]]
 - [[_COMMUNITY_Community 333|Community 333]]
 - [[_COMMUNITY_Community 334|Community 334]]
 - [[_COMMUNITY_Community 335|Community 335]]
+- [[_COMMUNITY_Community 336|Community 336]]
+- [[_COMMUNITY_Community 337|Community 337]]
 - [[_COMMUNITY_Community 338|Community 338]]
 - [[_COMMUNITY_Community 339|Community 339]]
+- [[_COMMUNITY_Community 340|Community 340]]
 - [[_COMMUNITY_Community 341|Community 341]]
 - [[_COMMUNITY_Community 342|Community 342]]
+- [[_COMMUNITY_Community 343|Community 343]]
 - [[_COMMUNITY_Community 344|Community 344]]
+- [[_COMMUNITY_Community 345|Community 345]]
+- [[_COMMUNITY_Community 346|Community 346]]
 - [[_COMMUNITY_Community 347|Community 347]]
+- [[_COMMUNITY_Community 348|Community 348]]
+- [[_COMMUNITY_Community 349|Community 349]]
+- [[_COMMUNITY_Community 350|Community 350]]
+- [[_COMMUNITY_Community 351|Community 351]]
+- [[_COMMUNITY_Community 352|Community 352]]
+- [[_COMMUNITY_Community 353|Community 353]]
+- [[_COMMUNITY_Community 354|Community 354]]
+- [[_COMMUNITY_Community 355|Community 355]]
+- [[_COMMUNITY_Community 356|Community 356]]
+- [[_COMMUNITY_Community 357|Community 357]]
+- [[_COMMUNITY_Community 358|Community 358]]
+- [[_COMMUNITY_Community 359|Community 359]]
+- [[_COMMUNITY_Community 360|Community 360]]
+- [[_COMMUNITY_Community 361|Community 361]]
+- [[_COMMUNITY_Community 362|Community 362]]
+- [[_COMMUNITY_Community 363|Community 363]]
+- [[_COMMUNITY_Community 364|Community 364]]
+- [[_COMMUNITY_Community 365|Community 365]]
+- [[_COMMUNITY_Community 366|Community 366]]
+- [[_COMMUNITY_Community 367|Community 367]]
+- [[_COMMUNITY_Community 368|Community 368]]
+- [[_COMMUNITY_Community 369|Community 369]]
+- [[_COMMUNITY_Community 370|Community 370]]
+- [[_COMMUNITY_Community 371|Community 371]]
+- [[_COMMUNITY_Community 372|Community 372]]
+- [[_COMMUNITY_Community 373|Community 373]]
+- [[_COMMUNITY_Community 374|Community 374]]
+- [[_COMMUNITY_Community 375|Community 375]]
+- [[_COMMUNITY_Community 376|Community 376]]
+- [[_COMMUNITY_Community 377|Community 377]]
+- [[_COMMUNITY_Community 378|Community 378]]
+- [[_COMMUNITY_Community 379|Community 379]]
+- [[_COMMUNITY_Community 380|Community 380]]
+- [[_COMMUNITY_Community 381|Community 381]]
+- [[_COMMUNITY_Community 382|Community 382]]
+- [[_COMMUNITY_Community 383|Community 383]]
+- [[_COMMUNITY_Community 384|Community 384]]
+- [[_COMMUNITY_Community 385|Community 385]]
+- [[_COMMUNITY_Community 386|Community 386]]
+- [[_COMMUNITY_Community 387|Community 387]]
+- [[_COMMUNITY_Community 388|Community 388]]
+- [[_COMMUNITY_Community 389|Community 389]]
+- [[_COMMUNITY_Community 390|Community 390]]
+- [[_COMMUNITY_Community 391|Community 391]]
+- [[_COMMUNITY_Community 392|Community 392]]
+- [[_COMMUNITY_Community 393|Community 393]]
+- [[_COMMUNITY_Community 394|Community 394]]
+- [[_COMMUNITY_Community 395|Community 395]]
+- [[_COMMUNITY_Community 396|Community 396]]
+- [[_COMMUNITY_Community 397|Community 397]]
+- [[_COMMUNITY_Community 398|Community 398]]
+- [[_COMMUNITY_Community 399|Community 399]]
+- [[_COMMUNITY_Community 400|Community 400]]
+- [[_COMMUNITY_Community 401|Community 401]]
+- [[_COMMUNITY_Community 402|Community 402]]
+- [[_COMMUNITY_Community 403|Community 403]]
+- [[_COMMUNITY_Community 404|Community 404]]
+- [[_COMMUNITY_Community 405|Community 405]]
+- [[_COMMUNITY_Community 406|Community 406]]
+- [[_COMMUNITY_Community 407|Community 407]]
+- [[_COMMUNITY_Community 408|Community 408]]
+- [[_COMMUNITY_Community 409|Community 409]]
+- [[_COMMUNITY_Community 410|Community 410]]
+- [[_COMMUNITY_Community 411|Community 411]]
+- [[_COMMUNITY_Community 412|Community 412]]
+- [[_COMMUNITY_Community 413|Community 413]]
+- [[_COMMUNITY_Community 414|Community 414]]
+- [[_COMMUNITY_Community 415|Community 415]]
+- [[_COMMUNITY_Community 416|Community 416]]
+- [[_COMMUNITY_Community 417|Community 417]]
+- [[_COMMUNITY_Community 418|Community 418]]
+- [[_COMMUNITY_Community 419|Community 419]]
+- [[_COMMUNITY_Community 420|Community 420]]
+- [[_COMMUNITY_Community 421|Community 421]]
+- [[_COMMUNITY_Community 422|Community 422]]
+- [[_COMMUNITY_Community 423|Community 423]]
+- [[_COMMUNITY_Community 424|Community 424]]
+- [[_COMMUNITY_Community 425|Community 425]]
+- [[_COMMUNITY_Community 426|Community 426]]
+- [[_COMMUNITY_Community 427|Community 427]]
+- [[_COMMUNITY_Community 428|Community 428]]
+- [[_COMMUNITY_Community 429|Community 429]]
+- [[_COMMUNITY_Community 430|Community 430]]
+- [[_COMMUNITY_Community 431|Community 431]]
+- [[_COMMUNITY_Community 432|Community 432]]
+- [[_COMMUNITY_Community 433|Community 433]]
+- [[_COMMUNITY_Community 434|Community 434]]
+- [[_COMMUNITY_Community 435|Community 435]]
+- [[_COMMUNITY_Community 436|Community 436]]
+- [[_COMMUNITY_Community 437|Community 437]]
+- [[_COMMUNITY_Community 438|Community 438]]
+- [[_COMMUNITY_Community 439|Community 439]]
+- [[_COMMUNITY_Community 440|Community 440]]
+- [[_COMMUNITY_Community 441|Community 441]]
+- [[_COMMUNITY_Community 442|Community 442]]
+- [[_COMMUNITY_Community 443|Community 443]]
+- [[_COMMUNITY_Community 444|Community 444]]
+- [[_COMMUNITY_Community 445|Community 445]]
+- [[_COMMUNITY_Community 446|Community 446]]
+- [[_COMMUNITY_Community 447|Community 447]]
+- [[_COMMUNITY_Community 448|Community 448]]
+- [[_COMMUNITY_Community 449|Community 449]]
+- [[_COMMUNITY_Community 450|Community 450]]
+- [[_COMMUNITY_Community 451|Community 451]]
+- [[_COMMUNITY_Community 452|Community 452]]
+- [[_COMMUNITY_Community 453|Community 453]]
+- [[_COMMUNITY_Community 454|Community 454]]
+- [[_COMMUNITY_Community 455|Community 455]]
+- [[_COMMUNITY_Community 456|Community 456]]
+- [[_COMMUNITY_Community 457|Community 457]]
+- [[_COMMUNITY_Community 458|Community 458]]
+- [[_COMMUNITY_Community 459|Community 459]]
+- [[_COMMUNITY_Community 460|Community 460]]
+- [[_COMMUNITY_Community 461|Community 461]]
+- [[_COMMUNITY_Community 462|Community 462]]
+- [[_COMMUNITY_Community 463|Community 463]]
+- [[_COMMUNITY_Community 464|Community 464]]
+- [[_COMMUNITY_Community 465|Community 465]]
+- [[_COMMUNITY_Community 466|Community 466]]
+- [[_COMMUNITY_Community 467|Community 467]]
+- [[_COMMUNITY_Community 468|Community 468]]
+- [[_COMMUNITY_Community 469|Community 469]]
+- [[_COMMUNITY_Community 470|Community 470]]
+- [[_COMMUNITY_Community 471|Community 471]]
+- [[_COMMUNITY_Community 472|Community 472]]
+- [[_COMMUNITY_Community 473|Community 473]]
+- [[_COMMUNITY_Community 474|Community 474]]
+- [[_COMMUNITY_Community 475|Community 475]]
+- [[_COMMUNITY_Community 476|Community 476]]
+- [[_COMMUNITY_Community 477|Community 477]]
+- [[_COMMUNITY_Community 478|Community 478]]
+- [[_COMMUNITY_Community 479|Community 479]]
+- [[_COMMUNITY_Community 480|Community 480]]
+- [[_COMMUNITY_Community 481|Community 481]]
+- [[_COMMUNITY_Community 482|Community 482]]
+- [[_COMMUNITY_Community 483|Community 483]]
+- [[_COMMUNITY_Community 484|Community 484]]
+- [[_COMMUNITY_Community 485|Community 485]]
+- [[_COMMUNITY_Community 486|Community 486]]
+- [[_COMMUNITY_Community 487|Community 487]]
+- [[_COMMUNITY_Community 488|Community 488]]
+- [[_COMMUNITY_Community 489|Community 489]]
+- [[_COMMUNITY_Community 490|Community 490]]
+- [[_COMMUNITY_Community 491|Community 491]]
+- [[_COMMUNITY_Community 492|Community 492]]
+- [[_COMMUNITY_Community 493|Community 493]]
+- [[_COMMUNITY_Community 494|Community 494]]
+- [[_COMMUNITY_Community 495|Community 495]]
+- [[_COMMUNITY_Community 496|Community 496]]
+- [[_COMMUNITY_Community 497|Community 497]]
+- [[_COMMUNITY_Community 498|Community 498]]
+- [[_COMMUNITY_Community 499|Community 499]]
 
 ## God Nodes (most connected - your core abstractions)
-1. `Any` - 209 edges
-2. `RiskConfig` - 115 edges
-3. `AlpacaLiveAdapter` - 99 edges
-4. `fetchJSON()` - 88 edges
-5. `DukascopyNativeDownloader` - 87 edges
-6. `YFinanceDownloader` - 86 edges
-7. `StrategyEntry` - 84 edges
-8. `TradeSignal` - 82 edges
-9. `SignalReplayAdapter` - 79 edges
-10. `VectorbtAdapter` - 79 edges
+1. `BacktestResult` - 233 edges
+2. `EquityPoint` - 185 edges
+3. `Trade` - 177 edges
+4. `DukascopyNativeDownloader` - 113 edges
+5. `BacktestConfig` - 106 edges
+6. `StrategyEntry` - 106 edges
+7. `TradeExit` - 96 edges
+8. `BacktestMeta` - 95 edges
+9. `fetchJSON()` - 88 edges
+10. `LiveDeploymentConfig` - 86 edges
 
 ## Surprising Connections (you probably didn't know these)
-- `Backtests Page Screenshot` --references--> `Architecture Document`  [INFERRED]
-  temp/backtests.png → docs/ARCHITECTURE.md
-- `Tasks Page Screenshot` --references--> `Architecture Document`  [INFERRED]
-  temp/tasks.png → docs/ARCHITECTURE.md
-- `Trade Viewer QG Trade Screenshot` --references--> `Architecture Document`  [INFERRED]
-  temp/trade-viewer-qg-trade-2.png → docs/ARCHITECTURE.md
-- `TradeSignal` --uses--> `TradeSignal`  [INFERRED]
-  live_runner/signal_sources/base_source.py → risk/models.py
-- `TradeSignal` --uses--> `TradeSignal`  [INFERRED]
-  live_runner/signal_sources/execution_timing.py → risk/models.py
-
-## Import Cycles
-- 1-file cycle: `viewer/core.py -> viewer/core.py`
-- 1-file cycle: `viewer/main.py -> viewer/main.py`
-- 1-file cycle: `data_tools/downloaders/dukascopy_native.py -> data_tools/downloaders/dukascopy_native.py`
-- 1-file cycle: `data_tools/downloaders/jforex_dl.py -> data_tools/downloaders/jforex_dl.py`
-- 1-file cycle: `data_tools/signal_import.py -> data_tools/signal_import.py`
-- 1-file cycle: `live_runner/alpaca_adapter.py -> live_runner/alpaca_adapter.py`
-- 1-file cycle: `live_runner/ctrader_adapter.py -> live_runner/ctrader_adapter.py`
-- 1-file cycle: `shared/database.py -> shared/database.py`
-- 1-file cycle: `live_runner/signal_sources/discord_source.py -> live_runner/signal_sources/discord_source.py`
-- 1-file cycle: `live_runner/signal_sources/execution_timing.py -> live_runner/signal_sources/execution_timing.py`
-- 1-file cycle: `tests/test_trade_engine.py -> tests/test_trade_engine.py`
-- 1-file cycle: `scripts/adaptive_harvester.py -> scripts/adaptive_harvester.py`
-- 1-file cycle: `tests/strategies/conftest.py -> tests/strategies/conftest.py`
-- 1-file cycle: `tests/validators/backtest_validator.py -> tests/validators/backtest_validator.py`
+- `Architecture Document` --references--> `Backtests Page Screenshot`  [INFERRED]
+  docs/ARCHITECTURE.md → temp/backtests.png
+- `Architecture Document` --references--> `Tasks Page Screenshot`  [INFERRED]
+  docs/ARCHITECTURE.md → temp/tasks.png
+- `Architecture Document` --references--> `Trade Viewer QG Trade Screenshot`  [INFERRED]
+  docs/ARCHITECTURE.md → temp/trade-viewer-qg-trade-2.png
+- `_strategy_payload()` --calls--> `read_strategy_documentation()`  [INFERRED]
+  viewer/core.py → shared/strategy_registry.py
+- `_ThreadBoundTaskLogHandler` --calls--> `test_thread_bound_task_log_handler_emits_without_shadowing_handle()`  [INFERRED]
+  viewer/core.py → tests/test_viewer_features.py
 
 ## Hyperedges (group relationships)
 - **Code Review Reports** — reports_qwen37maxcodereview, rndmstuff_qodoreportcodereview, rndmstuff_qodoreporttest, rndmstuff_copilotcoderabbitqodoprloopresearch [INFERRED 0.75]
@@ -392,1171 +502,2642 @@
 - **QA Success Screenshots** — serverplanning_qascreenshots_channelbreakout, serverplanning_qascreenshots_crossassetmomentum, serverplanning_qascreenshots_goldmomentum, serverplanning_qascreenshots_meanreversionrsibb, serverplanning_qascreenshots_postvixdipbuy, serverplanning_qascreenshots_riskparity, serverplanning_qascreenshots_sectorrotation, serverplanning_qascreenshots_shorttermreversal, serverplanning_qascreenshots_statarbpairs, serverplanning_qascreenshots_trendfollowing, serverplanning_qascreenshots_volatilitybreakout [EXTRACTED 1.00]
 - **Application Screenshots** — temp_backtestspng, temp_livepng, temp_loggingpng, temp_taskspng, temp_tradeviewerqgtrade2png [EXTRACTED 1.00]
 
-## Communities (348 total, 45 thin omitted)
+## Communities
 
-### Community 0 - "Live Trading Alpaca Adapter"
+### Community 0 - "Community 0"
+Cohesion: 0.01
+Nodes (378): _normalize_meta_tags(), normalize_timeframe(), Normalize timeframe aliases to canonical values.      Returns canonical values f, _discover_and_register_discord_services(), _recover_failed_services(), _as_string_list(), _backtest_fingerprint_payload(), _backtest_metadata_payload() (+370 more)
+
+### Community 1 - "Community 1"
+Cohesion: 0.04
+Nodes (306): AlpacaLiveAdapter, Live adapter for Alpaca trading + trade update streaming., Initialize REST and websocket clients, and verify account access., Backfill fills for persisted signals that never received an execution record., Return open positions with pricing and unrealized PnL., Resolve Alpaca credentials from env (default or ACC{N} blocks)., AlpacaDownloader, Initialize broker REST/stream clients and validate connectivity. (+298 more)
+
+### Community 2 - "Community 2"
+Cohesion: 0.02
+Nodes (181): _assemble_tick_dataframe(), main(), _normalize_supported_timeframe(), _parse_csv_list(), Alpaca historical stock bars downloader.  Canonical output path:   {output_dir}/, _to_utc_timestamp(), Downloader, DownloadResult (+173 more)
+
+### Community 3 - "Community 3"
+Cohesion: 0.01
+Nodes (164): handleDelete(), handleRename(), normalizeEquityPoints(), handleStart(), boundsToFilters(), buildNumericBounds(), buildPageNumbers(), cloneFilters() (+156 more)
+
+### Community 4 - "Community 4"
+Cohesion: 0.02
+Nodes (152): BaseLiveAdapter, Abstract broker adapter for live order routing and fill streaming., Initialize source connections/resources., Close source connections/resources., Yield parsed trade signals from this source., BaseLiveAdapter, RiskConfig, CTraderApiError (+144 more)
+
+### Community 5 - "Community 5"
+Cohesion: 0.02
+Nodes (113): BacktestConfig, Configuration passed to any engine adapter., cmd_convert(), cmd_engines(), cmd_list(), cmd_run(), _detect_date_range(), _emit_progress() (+105 more)
+
+### Community 6 - "Community 6"
 Cohesion: 0.03
-Nodes (116): _parse_bool_env(), Resolve Alpaca credentials from env (default or ACC{N} blocks)., resolve_alpaca_credentials(), load_backtest_equity_preview_map(), api_request_logging_middleware(), _backtest_all_item_from_meta(), _backtest_all_item_with_equity_preview(), _backtest_fingerprint() (+108 more)
+Nodes (181): _align_series(), compare_backtests(), compute_combined_equity(), compute_combined_stats(), compute_drawdown_pct(), compute_returns(), pearson_correlation(), Strategy comparison logic — ported from custom_lean_integration/compare_strategi (+173 more)
 
-### Community 1 - "PyneCore Engine Integration"
-Cohesion: 0.05
-Nodes (102): DrawingList, _apply_risk_sizing(), _build_drawings(), _build_trade_context(), _coerce_series(), _compile_helper_namespace(), _enrich_trades_with_context(), _infer_asset_class() (+94 more)
-
-### Community 2 - "Frontend API Client"
+### Community 7 - "Community 7"
 Cohesion: 0.04
-Nodes (88): getLivePositions(), getLiveQuote(), getLiveSignalLog(), getOptimizations(), getServiceLogs(), getServices(), getStrategies(), getSymbols() (+80 more)
+Nodes (78): BaseSignalSource, _accounts_env_mtime(), _adapter_is_ready(), _apply_signal_processor(), _block_ctrader_account(), _block_discord_service(), _build_processor_market_data(), _cancel_inactive_discord_tasks() (+70 more)
 
-### Community 3 - "Data Downloaders Pipeline"
-Cohesion: 0.18
-Nodes (76): BackgroundTasks, AlpacaDownloader, DolthubDownloader, Downloads data from DoltHub SQL repositories via REST API., DukascopyNativeDownloader, Pure Python async Dukascopy downloader — no Node.js dependency., HuggingFaceDownloader, YFinanceDownloader (+68 more)
-
-### Community 4 - "Viewer Backend API"
+### Community 8 - "Community 8"
 Cohesion: 0.05
-Nodes (86): agent_convert(), _append_task_progress_history(), _apply_recovery_data_metadata(), _build_task_from_record(), _cached_catalog_ohlcv_entries(), _cached_live_accounts_payload(), _cached_strategies_payload(), cancel_data_task() (+78 more)
+Nodes (77): index(), _is_finer(), _load_intrabar_data(), _load_ohlcv(), _load_strategy_module(), _apply_risk_sizing(), _build_drawings(), _build_trade_context() (+69 more)
 
-### Community 5 - "Test Suite Viewer Features"
+### Community 9 - "Community 9"
+Cohesion: 0.05
+Nodes (58): build_catalog(), _canonical_group_path(), _catalog_timestamp_to_epoch(), _coerce_nonnegative_int(), _collect_text_values(), _detect_storage(), _extract_symbol_timeframe_and_segment(), _extract_timeframe_and_segment() (+50 more)
+
+### Community 10 - "Community 10"
 Cohesion: 0.03
-Nodes (8): _close_prices_from_returns(), _equity_curve_from_returns(), EquityPoint, Focused tests for newer viewer data-management features., test_backtest_capm_endpoint_returns_regression_payload(), test_backtest_capm_endpoint_uses_first_symbol_when_benchmark_missing(), test_backtest_stats_endpoint_includes_p_value(), test_create_portfolio_persists_p_value_and_psr()
+Nodes (24): _allow_small_backtest_boundary_gap(), test_agent_convert_endpoint_rejects_copilot_cli_provider(), test_agent_convert_endpoint_rejects_unknown_provider(), test_backtest_boundary_gap_tolerance_allows_small_leading_gap(), test_backtest_boundary_gap_tolerance_rejects_large_gap(), test_backtest_run_from_signals_csv_date_only_end_is_inclusive(), test_backtest_run_from_signals_csv_forwards_to_replay(), test_backtest_run_registers_task_manager_progress() (+16 more)
 
-### Community 6 - "Backtest Engine Base"
-Cohesion: 0.05
-Nodes (48): BacktestConfig, Configuration passed to any engine adapter., Adapter for vectorbt-style vectorized backtesting., VectorbtAdapter, backtest_result(), Regression-Test fuer Strategie: Channel Breakout  Smoke-Test: stellt sicher, d, backtest_result(), Regression-Test fuer Strategie: Cross-Asset Momentum  Smoke-Test: stellt siche (+40 more)
-
-### Community 7 - "Portfolio Models & Analytics"
-Cohesion: 0.06
-Nodes (68): Portfolio, PortfolioComponent, A weighted strategy component inside a multi-strategy portfolio., Persisted portfolio payload shared across API and storage layers., _apply_backtest_numeric_filters(), _backtest_compare_payload(), _backtest_summary_from_meta(), compare_backtests_endpoint() (+60 more)
-
-### Community 8 - "Statistics Computation"
-Cohesion: 0.06
-Nodes (49): _annualize_total_return(), _attach_inferred_freq(), _cagr_from_backtest_period(), compute_stats(), _daily_returns_from_equity_curve(), _empty_stats(), _equity_to_returns_series(), _infer_periods_per_year() (+41 more)
-
-### Community 9 - "Backtest API Operations"
-Cohesion: 0.04
-Nodes (44): deduplicateBacktests(), deleteBacktestsBulk(), getBacktestDuplicates(), getBacktestEquityPreviews(), getBacktestsAll(), removeEmptyBacktests(), useStrategies(), BacktestMetadataItem (+36 more)
-
-### Community 10 - "Live Deployment Management"
-Cohesion: 0.04
-Nodes (55): createLiveDeployment(), deleteLiveDeployment(), getLiveBalances(), getLiveStats(), getLiveTrades(), runBacktestSignals(), supportsLiveStatsEndpoint(), updateLiveDeploymentStatus() (+47 more)
-
-### Community 11 - "Live Position Tracking"
-Cohesion: 0.05
-Nodes (45): getLiveAccounts(), getLiveDeployments(), useLivePositions(), useLiveQuotes(), useLiveSignalLog(), LiveAccount, LiveDeploymentConfig, LivePosition (+37 more)
-
-### Community 12 - "Stockkit Converter"
+### Community 11 - "Community 11"
 Cohesion: 0.07
-Nodes (41): _build_trades(), _parse_datetime(), Convert Stockkit AI Bot trade CSVs to the universal trade format.  Stockkit us, Parse stockkit date/time to ISO format., Convert CSV rows to Trade objects, handling partial exits., Trade, main(), mk_ohlcv() (+33 more)
+Nodes (35): _iter_json_backtests(), _load_json_payload(), main(), _parse_result_payload(), _recalculate_json_backtests(), _recalculate_sqlite_backtests(), _save_json_payload(), _annualize_total_return() (+27 more)
 
-### Community 13 - "Data Management API"
+### Community 12 - "Community 12"
 Cohesion: 0.05
-Nodes (41): downloadData(), getDataCheck(), getDukascopyGenesis(), getStrategyDetail(), harvestData(), renameStrategy(), resampleData(), runBacktest() (+33 more)
+Nodes (24): _as_float(), _as_int(), BacktestExpectation, BacktestResultValidator, _parse_time(), AICodeValidator, ValidationResult, test_ai_generated_strategy_average_score() (+16 more)
 
-### Community 14 - "Downloader Infrastructure"
-Cohesion: 0.06
-Nodes (30): Any, SourceMeta, SourceMeta, DownloadResult, Path, SourceMeta, Any, SourceMeta (+22 more)
-
-### Community 15 - "Live Runner Daemon"
-Cohesion: 0.11
-Nodes (48): _adapter_is_ready(), _apply_signal_processor(), _block_ctrader_account(), _build_processor_market_data(), _cancel_inactive_discord_tasks(), _cancel_inactive_tasks(), _cleanup_finished_discord_bot_tasks(), _cleanup_finished_discord_tasks() (+40 more)
-
-### Community 16 - "Data Task Management"
-Cohesion: 0.05
-Nodes (38): cancelDataTask(), comparePortfolios(), createVerificationEvidence(), deleteBacktest(), deleteDataTask(), fetchJSON(), getBacktestCapm(), getBacktestEquity() (+30 more)
-
-### Community 17 - "Dukascopy Native Downloader"
-Cohesion: 0.10
-Nodes (48): DataFrame, datetime, _assemble_candle_dataframe(), _assemble_tick_dataframe(), decompress_bi5(), _download_and_assemble_merged_ticks(), download_bi5_files(), _download_minute_side_dataframe() (+40 more)
-
-### Community 18 - "JForex Downloader"
-Cohesion: 0.11
-Nodes (45): Any, BaseException, DataFrame, datetime, DownloadResult, Path, _bars_with_offer_prefix(), _build_offer_side_output_path() (+37 more)
-
-### Community 19 - "Engine Base & Strategy Registry"
+### Community 13 - "Community 13"
 Cohesion: 0.08
-Nodes (37): Engine Adapter Interface — abstract base for all backtest engines.  Every engi, detect_strategy_type(), find_strategy_entry(), _identifier_key(), iter_strategy_entries(), iter_strategy_files(), _line_offsets(), load_strategy_meta() (+29 more)
+Nodes (44): _assemble_strategy_module(), BacktestTarget, _build_backtest_command(), _build_strategy_artifacts(), _entry_rank(), _extract_engine(), _extract_markdown_response(), _extract_markdown_title() (+36 more)
+
+### Community 14 - "Community 14"
+Cohesion: 0.08
+Nodes (30): _apply_metadata(), CopilotCLIProvider, _extract_content(), _apply_metadata(), _compose_prompt(), CopilotSDKProvider, _extract_content(), _extract_model_ids() (+22 more)
+
+### Community 15 - "Community 15"
+Cohesion: 0.08
+Nodes (43): _build_overview_metadata(), _cache_key(), _collect_sources(), get_cache_stats(), get_catalog(), get_catalog_ohlcv_entries(), get_overview_metadata(), invalidate_after_download() (+35 more)
+
+### Community 16 - "Community 16"
+Cohesion: 0.1
+Nodes (40): AdaptiveConfig, _batch_all_successful(), _build_parser(), _configure_logger(), _download_month(), _ensure_job_state(), _fetch_url(), FetchOutcome (+32 more)
+
+### Community 17 - "Community 17"
+Cohesion: 0.1
+Nodes (37): _strategy_entries(), _safe_strategy_entries(), _build_symbol_index(), _candidate_symbols(), _looks_like_timeframe(), main(), _parse_symbol_timeframe(), _purge_json_backtests() (+29 more)
+
+### Community 18 - "Community 18"
+Cohesion: 0.09
+Nodes (14): _parse_bool_env(), resolve_alpaca_credentials(), _to_datetime(), _to_float(), get_live_quotes(), _CredentialKey, _is_connection_limit_error(), _is_crypto_symbol() (+6 more)
+
+### Community 19 - "Community 19"
+Cohesion: 0.11
+Nodes (33): _alpaca_paper_from_endpoint(), _ctrader_account_name(), _ctrader_extract_account_label(), _ctrader_extract_broker_name(), _ctrader_extract_login(), _ctrader_host_matches_environment(), _ctrader_message_name_sources(), discover_alpaca_accounts() (+25 more)
 
 ### Community 20 - "Community 20"
 Cohesion: 0.06
-Nodes (29): EngineAdapter, LeanAdapter, Find the LEAN result JSON in output directory., Adapter for QuantConnect LEAN backtesting engine., Run a LEAN backtest.          strategy_path should point to a LEAN algorithm f, Write LEAN backtest config JSON., Execute LEAN backtest via subprocess., NativeAdapter (+21 more)
+Nodes (6): ABC, Base classes for data downloaders.  All downloaders implement the Downloader ABC, BaseSignalSource, test_live_quote_and_positions_endpoints(), test_live_signals_endpoint_returns_signal_log(), test_live_stats_endpoint_uses_realized_pnl_and_balance_drawdown()
 
 ### Community 21 - "Community 21"
-Cohesion: 0.12
-Nodes (29): RiskConfig, SizedOrder, TradeSignal, RiskEngine, Any, LiveSignal, SizedOrder, size_live_signal() (+21 more)
+Cohesion: 0.09
+Nodes (20): main(), Resample Tool — Generate higher timeframes from lower ones.  Given M1 (or any so, Resample all parquet files in a directory tree.      Finds all {from_tf}.parquet, Rebuild the catalog after resampling., Resample OHLCV DataFrame to a higher timeframe.      Args:         df: DataFrame, Resample a single parquet file to multiple timeframes.      Args:         source, resample_directory(), resample_file() (+12 more)
 
 ### Community 22 - "Community 22"
-Cohesion: 0.08
-Nodes (28): ABC, TradeSignal, Any, BaseException, datetime, ServiceStatus, TradeSignal, datetime (+20 more)
+Cohesion: 0.17
+Nodes (18): _canonical_stats(), _emit_progress(), _json_safe(), _load_base_backtest(), _metric_key(), _metric_value(), _parse_period_boundary(), _resolve_strategy_reference() (+10 more)
 
 ### Community 23 - "Community 23"
-Cohesion: 0.06
-Nodes (26): deleteDataSymbol(), getDataCategory(), getDataOverview(), DataCategorySummary, DataSymbolEntry, backdropStyle(), categoryDefaultSource(), CategoryDetailPanel() (+18 more)
+Cohesion: 0.16
+Nodes (16): _layer_pytest_args(), LayerResult, main(), _print_summary(), _run_layer(), _make_fake_probe(), Tests for data_tools.dukascopy_discovery., Return a probe_single_day drop-in that answers from a local genesis dict. (+8 more)
 
 ### Community 24 - "Community 24"
-Cohesion: 0.06
-Nodes (36): createPortfolio(), deduplicatePortfolios(), deletePortfolio(), deletePortfoliosBulk(), getPortfolioDuplicates(), getPortfolios(), getSignalProcessors(), removeEmptyPortfolios() (+28 more)
+Cohesion: 0.12
+Nodes (9): test(), buildRiskMathNarrative(), formatPrice(), formatUsd(), indicatorIsPanel(), sanitizeIndicatorPoints(), sanitizeOHLCVBars(), toFiniteNumber() (+1 more)
 
 ### Community 25 - "Community 25"
-Cohesion: 0.13
-Nodes (40): ArgumentParser, ClientSession, AdaptiveConfig, _assemble_tick_dataframe(), _batch_all_successful(), _build_parser(), _configure_logger(), _download_month() (+32 more)
+Cohesion: 0.18
+Nodes (18): _convert_ohlcv(), _looks_like_timestamp(), main(), migrate_dukascopy_xauusd(), migrate_lean_equities_daily(), migrate_lean_equities_h1(), migrate_lean_equities_m15(), migrate_stockkit_5m() (+10 more)
 
 ### Community 26 - "Community 26"
-Cohesion: 0.12
-Nodes (38): _canonical_discovery_timeframe(), _day_has_data_logged(), discover_genesis_for_symbols(), discover_symbol_genesis(), discover_symbol_timeframe_genesis(), _find_start_day(), _find_start_month(), _find_start_year() (+30 more)
+Cohesion: 0.23
+Nodes (11): export_data(), _export_table_csv(), _list_tables(), main(), List tables in a dolt repo using 'dolt sql -r csv'., Export a dolt table to CSV using 'dolt table export'., Return the canonical OHLCV output path and migrate legacy flat exports., run_cmd() (+3 more)
 
 ### Community 27 - "Community 27"
-Cohesion: 0.13
-Nodes (22): AbstractEventLoop, CTraderApiError, CTraderLiveAdapter, _ensure_asyncio_twisted_reactor(), _is_already_logged_in_error(), _is_terminal_auth_error(), _normalize_error_code(), Any (+14 more)
+Cohesion: 0.27
+Nodes (11): _detect_separator(), _find_column(), _is_intraday_timestamp(), load_signals_from_csv(), _normalize_header(), _parse_action(), _parse_decimal(), _parse_timestamp() (+3 more)
 
 ### Community 28 - "Community 28"
-Cohesion: 0.07
-Nodes (30): getPortfolioContributions(), getPortfolioDetail(), getPortfolioTrades(), renamePortfolio(), PortfolioContribution, PortfolioDetail, PortfolioTrade, formatLag() (+22 more)
+Cohesion: 0.26
+Nodes (6): loadLogs(), normalizeLevel(), parseLogLine(), parsePlainLine(), parseTimestamp(), tryParseJson()
 
 ### Community 29 - "Community 29"
-Cohesion: 0.05
-Nodes (39): dependencies, ag-grid-community, ag-grid-react, lightweight-charts, lucide-react, react, react-dom, react-markdown (+31 more)
+Cohesion: 0.17
+Nodes (2): useStrategies(), StrategiesProvider()
 
 ### Community 30 - "Community 30"
-Cohesion: 0.08
-Nodes (22): Any, datetime, LiveSignal, Initialize REST and websocket clients, and verify account access., Return open positions with pricing and unrealized PnL., _to_datetime(), _to_float(), BaseLiveAdapter (+14 more)
+Cohesion: 0.2
+Nodes (3): formatMarkerTime(), normalizeUnixTime(), toChartTime()
 
 ### Community 31 - "Community 31"
-Cohesion: 0.12
-Nodes (36): Connection, _as_string_list(), BackgroundTaskRecord, _backtest_fingerprint_payload(), _backtest_metadata_payload(), BacktestRecord, _configure_sqlite_connection(), _detect_git_sha() (+28 more)
+Cohesion: 0.23
+Nodes (7): get_logger(), JsonFormatter, Centralized logging module for trading-platform services.  Provides structured J, Formats log records as structured JSON., Create or return a logger for the given service.      Each service gets:     - A, test_json_formatter_includes_required_fields_and_defaults(), test_json_formatter_uses_required_timestamp_format()
 
 ### Community 32 - "Community 32"
-Cohesion: 0.12
-Nodes (33): EquityPointModel, LiveBalanceRecord, Session, create_live_deployment(), delete_background_task_record(), delete_backtest(), delete_live_deployment(), delete_portfolio() (+25 more)
+Cohesion: 0.25
+Nodes (9): align_return_series(), calculate_capm(), _normalize_return_series(), CAPM helper functions for strategy-vs-benchmark regression analysis., Align strategy and benchmark return series on common timestamps., Compute CAPM regression metrics from aligned return series., test_align_return_series_uses_intersection(), test_calculate_capm_linear_relationship() (+1 more)
 
 ### Community 33 - "Community 33"
-Cohesion: 0.11
-Nodes (26): NitroSignalProcessor, RocketFuel RSI strategy processor (ATR hard-stop, optional short entry)., _resolve_timeframe(), RocketFuelSignalProcessor, RocketFuelSignalProcessor, Reusable signal processor packages., _build_nitro(), _build_ramjet() (+18 more)
+Cohesion: 0.29
+Nodes (6): useLiveAccountsStream(), useLiveExecutionsStream(), useLivePositionsStream(), useLiveSignalsStream(), useLiveStream(), useWebSocket()
 
 ### Community 34 - "Community 34"
-Cohesion: 0.07
-Nodes (25): ApiError, getBacktestInfo(), getBacktestReplay(), getDataTask(), getOptimization(), BacktestInfo, BacktestReplayResponse, IndicatorPoint (+17 more)
+Cohesion: 0.31
+Nodes (8): _calc_atr(), _calc_supertrend(), _coerce_bool(), generate_signals(), Project-usable core port of the Pine Script strategy "Custom Swings + Supertrend, Generate Long/Short signals for the Custom Swings + Supertrend strategy.      Pa, True Range → Wilder's ATR (equivalent to ta.atr in Pine)., Supertrend — mirrors Pine Script logic exactly.      Returns:         trend  : +
 
 ### Community 35 - "Community 35"
-Cohesion: 0.11
-Nodes (35): _canonical_group_path(), _catalog_timestamp_to_epoch(), _coerce_nonnegative_int(), _collect_text_values(), _detect_storage(), _extract_symbol_timeframe_and_segment(), _extract_timeframe_and_segment(), _format_catalog_date() (+27 more)
-
-### Community 36 - "Community 36"
-Cohesion: 0.09
-Nodes (28): DownloadCancelled, Raised when a controlled download is cancelled by the caller., JForexDownloader, Dukascopy downloader using JForex Java SDK over JPype., OptimizationConfig, _compute_indicators(), _df_to_ohlcv_records(), get_backtest_ohlcv() (+20 more)
-
-### Community 37 - "Community 37"
-Cohesion: 0.11
-Nodes (33): _assemble_strategy_module(), BacktestTarget, _build_backtest_command(), _build_strategy_artifacts(), _extract_engine(), _extract_markdown_response(), _extract_markdown_title(), _extract_python_response() (+25 more)
-
-### Community 38 - "Community 38"
-Cohesion: 0.17
-Nodes (8): Position, Any, BacktestResult, DataFrame, Index, Series, Timestamp, TradeEngine
-
-### Community 39 - "Community 39"
-Cohesion: 0.10
-Nodes (22): main(), DataFrame, Path, Resample Tool — Generate higher timeframes from lower ones.  Given M1 (or any, Resample all parquet files in a directory tree.      Finds all {from_tf}.parqu, Rebuild the catalog after resampling., Resample OHLCV DataFrame to a higher timeframe.      Args:         df: DataFr, Resample a single parquet file to multiple timeframes.      Args:         sou (+14 more)
-
-### Community 40 - "Community 40"
-Cohesion: 0.11
-Nodes (30): normalize_timeframe(), Normalize timeframe aliases to canonical values.      Returns canonical values, test_normalize_timeframe_aliases_to_canonical_values(), test_normalize_timeframe_preserves_canonical_and_unknown_values(), _aggregate_symbol_timeframe_entries(), _allow_small_backtest_boundary_gap(), _auto_download_source(), _auto_download_source_plan() (+22 more)
-
-### Community 41 - "Community 41"
-Cohesion: 0.06
-Nodes (31): audio-recorder, backlink, bases, bookmarks, canvas, command-palette, daily-notes, editor-status (+23 more)
-
-### Community 42 - "Community 42"
-Cohesion: 0.10
-Nodes (32): agent_convert(), cancel_data_task(), compare_portfolios(), delete_data_task(), delete_portfolio(), get_backtest_run_status(), get_portfolio(), _get_task() (+24 more)
-
-### Community 43 - "Community 43"
-Cohesion: 0.06
-Nodes (30): EURUSD, d1, h1, h4, m1, m15, m30, m5 (+22 more)
-
-### Community 44 - "Community 44"
-Cohesion: 0.10
-Nodes (29): _available_log_files(), _collect_log_entries(), delete_symbol_data(), _downsample_numeric_minmax(), _extract_log_level(), get_log(), get_optimization(), index() (+21 more)
-
-### Community 45 - "Community 45"
-Cohesion: 0.16
-Nodes (29): CacheKey, _build_overview_metadata(), _cache_key(), _collect_sources(), get_cache_stats(), get_catalog(), get_catalog_ohlcv_entries(), get_overview_metadata() (+21 more)
-
-### Community 46 - "Community 46"
-Cohesion: 0.07
-Nodes (29): active, bases:Neue Base erstellen, canvas:Neuen Canvas erstellen, command-palette:Befehlspalette öffnen, daily-notes:Heutige Notiz öffnen, graph:Graph-Ansicht öffnen, switcher:Schnellauswahl öffnen, templates:Vorlage einfügen (+21 more)
-
-### Community 47 - "Community 47"
-Cohesion: 0.09
-Nodes (30): _backtest_info_payload(), _canonical_stats_from_result(), _drawing_matches_symbol(), _equity_curve_from_trades(), _equity_to_viewer(), get_backtest(), get_backtest_info(), get_backtest_stats() (+22 more)
-
-### Community 48 - "Community 48"
-Cohesion: 0.10
-Nodes (17): Enum, _discover_and_register_discord_services(), LiveBalanceRecord, LiveDeploymentConfig, Live deployment record (strategy + account + market + runtime status)., Periodic balance/equity snapshot for a live broker account., Service, ServiceStatus (+9 more)
-
-### Community 49 - "Community 49"
-Cohesion: 0.14
-Nodes (29): _coerce_finite_float(), _create_task_record(), _drawing_timestamp_to_unix(), _drawing_to_viewer(), get_data_task(), get_data_task_logs(), _ingest_task_log_line(), _mark_task_finished() (+21 more)
-
-### Community 50 - "Community 50"
-Cohesion: 0.14
-Nodes (21): DiscordSignalSource, CTraderAuthTerminalError, _accounts_env_mtime(), _block_discord_service(), _is_terminal_discord_runtime_error(), _load_accounts_env_values(), main(), BaseException (+13 more)
-
-### Community 51 - "Community 51"
-Cohesion: 0.16
-Nodes (12): _coerce_action(), _OpenPosition, Higher-level replay engine with optional yfinance auto-download fallback., SignalReplayEngine, _to_iso(), _to_optional_float(), _to_timestamp(), Any (+4 more)
-
-### Community 52 - "Community 52"
-Cohesion: 0.16
-Nodes (24): FrozenTrial, _detect_date_range(), Auto-detect date range from available OHLCV data files.      For multiple symb, _canonical_stats(), _emit_progress(), _json_safe(), _load_base_backtest(), _metric_key() (+16 more)
-
-### Community 53 - "Community 53"
-Cohesion: 0.10
-Nodes (25): _append_task_log(), _categorize_path(), data_category_details(), data_overview(), data_resample(), _dir_size_bytes(), _dolthub_pull(), _dolthub_repo_status() (+17 more)
-
-### Community 54 - "Community 54"
-Cohesion: 0.09
-Nodes (21): LoadingSpinner, BacktestDetailPage, BacktestsPage, ComparePage, DataManagementPage, LiveDetailPage, LiveHubPage, LiveViewerPage (+13 more)
-
-### Community 55 - "Community 55"
-Cohesion: 0.12
-Nodes (17): run(), parse_live_deployments_config(), LiveAccountConfig, LiveDeploymentConfig, Path, get_logger(), JsonFormatter, Logger (+9 more)
-
-### Community 56 - "Community 56"
-Cohesion: 0.16
-Nodes (19): CopilotCLIProvider, CopilotSDKProvider, get_llm_provider(), NIMProvider, Any, LLMProvider, test_copilot_cli_provider_empty_output(), test_copilot_cli_provider_missing_executable() (+11 more)
-
-### Community 57 - "Community 57"
-Cohesion: 0.11
-Nodes (18): getLogContent(), getLogs(), MultiSelectDropdown(), MultiSelectDropdownProps, MultiSelectOption, DEFAULT_LEVELS, Level, LEVEL_OPTIONS (+10 more)
-
-### Community 58 - "Community 58"
-Cohesion: 0.12
-Nodes (13): DataFrame, Path, Timestamp, Downloader, Download OHLCV data for one symbol/timeframe and save as Parquet.          Arg, Return metadata about this source for catalog integration., Build standardised output path: {output_dir}/ohlcv/{source}/{asset_class}/{symbo, Return requested start or latest stored timestamp for smart resume. (+5 more)
-
-### Community 59 - "Community 59"
-Cohesion: 0.15
-Nodes (12): RamJet signal-processor package., RamJetSignalProcessor, RamJet signal processor with formula-identical SL/TP logic.      Ported from `, _resolve_timeframe(), Any, DataFrame, Path, TradeSignal (+4 more)
-
-### Community 60 - "Community 60"
-Cohesion: 0.10
-Nodes (19): createService(), deleteService(), useServiceLogs(), useServices(), useUpdateServiceStatus(), Service, ServiceStatus, dangerButtonStyle (+11 more)
-
-### Community 61 - "Community 61"
-Cohesion: 0.09
-Nodes (21): compilerOptions, allowImportingTsExtensions, erasableSyntaxOnly, jsx, lib, module, moduleDetection, moduleResolution (+13 more)
-
-### Community 62 - "Community 62"
-Cohesion: 0.12
-Nodes (12): DataFrame, LiveAccountConfig, Live account configuration stored in DB and used by API payloads., DiscordAuthenticationError, Raised when discord.py fails with terminal authentication errors., test_live_quote_and_positions_endpoints(), _FailingAdapter, test_disconnect_inactive_adapters_removes_and_disconnects() (+4 more)
-
-### Community 63 - "Community 63"
-Cohesion: 0.15
-Nodes (9): _make_partial_exit_trade(), _make_result(), _make_simple_trade(), BacktestResult, Trade, Tests for shared.models — universal trade format., TestBacktestResult, TestStrategyMeta (+1 more)
-
-### Community 64 - "Community 64"
-Cohesion: 0.22
-Nodes (20): _build_symbol_index(), _candidate_symbols(), _looks_like_timeframe(), main(), _parse_symbol_timeframe(), _purge_json_backtests(), _purge_sqlite_backtests(), Any (+12 more)
-
-### Community 65 - "Community 65"
-Cohesion: 0.11
-Nodes (13): formatMarkerTime(), normalizeUnixTime(), PreparedIndicator, RangePreset, toChartTime(), TradingViewChart(), TradingViewChartExit, TradingViewChartIndicator (+5 more)
-
-### Community 66 - "Community 66"
-Cohesion: 0.16
-Nodes (19): _convert_ohlcv(), _looks_like_timestamp(), main(), migrate_dukascopy_xauusd(), migrate_lean_equities_daily(), migrate_lean_equities_h1(), migrate_lean_equities_m15(), migrate_stockkit_5m() (+11 more)
-
-### Community 67 - "Community 67"
-Cohesion: 0.10
-Nodes (19): compilerOptions, allowImportingTsExtensions, erasableSyntaxOnly, lib, module, moduleDetection, moduleResolution, noEmit (+11 more)
-
-### Community 68 - "Community 68"
-Cohesion: 0.14
-Nodes (20): matches_strategy_identifier(), read_strategy_documentation(), create_portfolio(), _extract_ast_parameters(), get_strategy(), list_backtests(), list_strategies(), StrategyEntry (+12 more)
-
-### Community 69 - "Community 69"
-Cohesion: 0.13
-Nodes (18): BacktestMeta, _build_equity(), _build_meta(), _build_trades(), convert_lean_result(), _extract_ticker(), _parse_iso(), Convert LEAN Engine backtest results to the universal trade format.  Reads LEA (+10 more)
-
-### Community 70 - "Community 70"
-Cohesion: 0.20
-Nodes (17): _detect_separator(), _find_column(), _is_intraday_timestamp(), load_signals_from_csv(), _normalize_header(), _parse_action(), _parse_decimal(), _parse_timestamp() (+9 more)
-
-### Community 71 - "Community 71"
-Cohesion: 0.18
-Nodes (14): NitroSignalProcessor, Nitro processor: RamJet formulas, but BUY-only signal intake., RamJetSignalProcessor, RiskEngine, Any, TradeSignal, DataFrame, _risk_engine() (+6 more)
-
-### Community 72 - "Community 72"
-Cohesion: 0.13
-Nodes (7): BacktestStats, PortfolioStats, Any, Metadaten für eine Strategie (unabhängig vom Backtest)., Canonical backtest statistics shared across runner and viewer layers., Canonical portfolio statistics for persisted combined portfolio metrics., StrategyMeta
-
-### Community 73 - "Community 73"
-Cohesion: 0.15
-Nodes (18): _align_series(), compare_backtests(), compute_combined_equity(), compute_combined_stats(), compute_drawdown_pct(), compute_returns(), pearson_correlation(), Any (+10 more)
-
-### Community 74 - "Community 74"
-Cohesion: 0.20
-Nodes (9): AST, test_ai_generated_strategy_average_score(), test_ai_generated_strategy_validates(), _extract_generated_code(), test_lab_conversion_generates_valid_python(), Page, Path, AICodeValidator (+1 more)
-
-### Community 75 - "Community 75"
-Cohesion: 0.14
-Nodes (15): DatetimeIndex, _daily_returns(), Compute period-over-period returns., EquityPoint, compare_scenario(), equity_to_returns_series(), fmt(), make_equity_curve_objs() (+7 more)
-
-### Community 76 - "Community 76"
-Cohesion: 0.24
-Nodes (17): _alpaca_paper_from_endpoint(), _ctrader_account_name(), _ctrader_extract_account_label(), _ctrader_extract_broker_name(), _ctrader_extract_login(), _ctrader_host_matches_environment(), _ctrader_message_name_sources(), _discover_ctrader_accounts_on_host() (+9 more)
-
-### Community 77 - "Community 77"
-Cohesion: 0.18
-Nodes (7): _CredentialKey, _is_connection_limit_error(), _is_crypto_symbol(), BaseException, LiveAccountConfig, LiveDeploymentConfig, _StreamWorker
-
-### Community 78 - "Community 78"
-Cohesion: 0.18
-Nodes (16): build_catalog(), Scan universes/ subdirectory., Scan fundamentals/ subdirectory for non-OHLCV datasets., Build the full catalog dict., scan_fundamentals(), scan_universes(), Create a minimal data directory for testing., sample_data_dir() (+8 more)
-
-### Community 79 - "Community 79"
-Cohesion: 0.19
-Nodes (15): export_data(), _export_table_csv(), _list_tables(), main(), Path, List tables in a dolt repo using 'dolt sql -r csv'., Export a dolt table to CSV using 'dolt table export'., Return the canonical OHLCV output path and migrate legacy flat exports. (+7 more)
-
-### Community 80 - "Community 80"
-Cohesion: 0.12
-Nodes (9): generate_signals muss konfigurierbare Parameter mit Default-Werten in der Signat, Jeder Trade muss sl_price in meta haben (Risk-Sizing-Kontrolle)., Kein Trade darf mehr als 1.5% des Eigenkapitals riskieren., indicators_dict muss stop_loss, atr und direction enthalten., STRATEGY_META muss alle Pflichtfelder enthalten., Anzahl der Trades darf sich nicht verändern., Net Profit darf sich nicht wesentlich verändern (Toleranz: 0.5 $)., generate_signals muss exakt 4 Elemente zurückgeben (entries, exits, indicators_d (+1 more)
-
-### Community 81 - "Community 81"
-Cohesion: 0.16
-Nodes (13): runOptimization(), OptimizationParameterRange, OptimizationRunRequest, StrategyParameterValue, buildRangePayload(), MetricOption, normalizeChoices(), OptimizeModal() (+5 more)
-
-### Community 82 - "Community 82"
-Cohesion: 0.31
-Nodes (10): Client, _discover_strategy_matrix(), DiscoveryResult, _poll_task_completion(), test_strategy_pipeline(), Any, Any, datetime (+2 more)
-
-### Community 83 - "Community 83"
-Cohesion: 0.20
-Nodes (9): DataFrame, DownloadResult, Path, CTraderDownloader, main(), cTrader Downloader — tick/minute data from cTrader via cTrader Open API.  Port, Load cTrader CSV export.          cTrader exports have various formats — try c, Downloads data from cTrader Open API or CSV exports.      Since cTrader Open A (+1 more)
-
-### Community 84 - "Community 84"
-Cohesion: 0.21
-Nodes (11): DataFrame, DownloadResult, Path, Timestamp, _first_matching_column(), main(), _month_sequence(), _normalize_supported_timeframe() (+3 more)
-
-### Community 85 - "Community 85"
-Cohesion: 0.16
-Nodes (6): Path, test_jforex_accepts_legacy_java_home_jvm_layout(), test_jforex_classpath_bootstraps_from_jnlp_when_no_local_jars(), test_jforex_cli_validation_raises_value_error(), test_jforex_discovers_and_dedupes_resolved_jvm_paths(), test_native_downloader_accepts_control_events_and_reports_progress()
-
-### Community 86 - "Community 86"
-Cohesion: 0.19
-Nodes (9): DataFrame, DownloadResult, Path, Timestamp, main(), _normalize_supported_timeframe(), _parse_csv_list(), Alpaca historical stock bars downloader.  Canonical output path:   {output_di (+1 more)
-
-### Community 87 - "Community 87"
-Cohesion: 0.20
-Nodes (11): DownloadResult, Path, Timestamp, _clip_intraday_window(), main(), _normalize_supported_timeframe(), _parse_csv_list(), Yahoo Finance downloader for US equity OHLCV data.  Stores data under canonica (+3 more)
-
-### Community 88 - "Community 88"
-Cohesion: 0.23
-Nodes (13): Merge STRATEGY_META.parameters defaults with explicit overrides., resolve_strategy_parameters(), _is_finer(), _load_intrabar_data(), _load_ohlcv(), _load_strategy_module(), Any, Path (+5 more)
-
-### Community 89 - "Community 89"
-Cohesion: 0.27
-Nodes (13): compute_stats_for_result(), BacktestResult, Convenience: compute stats from a BacktestResult., _iter_json_backtests(), _load_json_payload(), main(), _parse_result_payload(), Any (+5 more)
-
-### Community 90 - "Community 90"
-Cohesion: 0.24
-Nodes (15): _collect_dukascopy_genesis(), data_download(), _download_task_labels(), get_dukascopy_genesis(), _load_dukascopy_genesis(), _normalize_dukascopy_genesis_timeframe(), _parse_symbol_list(), _parse_timeframe_list() (+7 more)
-
-### Community 91 - "Community 91"
-Cohesion: 0.26
-Nodes (11): _apply_metadata(), _compose_prompt(), _extract_content(), _extract_model_ids(), _is_auth_error(), _is_model_error(), _load_copilot_sdk(), _run_coroutine() (+3 more)
-
-### Community 92 - "Community 92"
-Cohesion: 0.24
-Nodes (12): align_return_series(), calculate_capm(), _normalize_return_series(), Any, DataFrame, Series, CAPM helper functions for strategy-vs-benchmark regression analysis., Align strategy and benchmark return series on common timestamps. (+4 more)
-
-### Community 93 - "Community 93"
-Cohesion: 0.29
-Nodes (13): _has_coverage(), _parse_date_bound(), DataFrame, datetime, Path, Timestamp, _synthetic_ohlcv(), test_example_sma_native_vs_vectorbt_trade_count_similarity() (+5 more)
-
-### Community 94 - "Community 94"
-Cohesion: 0.15
-Nodes (12): 0998hkhkd, decimal_factor, name, start_tick, 2828hkhkd, decimal_factor, name, start_tick (+4 more)
-
-### Community 95 - "Community 95"
-Cohesion: 0.17
-Nodes (11): cmd_convert(), cmd_list(), CLI to convert backtest results from various engines to the universal format., Convert a file using the specified engine converter., List available converters., convert_stockkit_trades(), Convert a Stockkit trade CSV to a BacktestResult., Read semicolon-separated Stockkit CSV. (+3 more)
-
-### Community 96 - "Community 96"
-Cohesion: 0.24
-Nodes (10): main(), Path, Data Validation — automated quality checks for OHLCV Parquet files.  Checks:, Validate all Parquet files in the OHLCV directory., Result of validating a single Parquet file., Compact summary for catalog integration., Validate a single OHLCV Parquet file., validate_all() (+2 more)
-
-### Community 97 - "Community 97"
-Cohesion: 0.15
-Nodes (9): EngineAdapter, Short engine identifier, e.g. 'vectorbt', 'lean'., Execute a backtest and return the result in universal format.          Args:, Optional validation. Returns list of error messages (empty = valid).         De, Abstract base class for backtest engine adapters., LEAN Engine Adapter — runs strategies through QuantConnect LEAN.  This adapter, BacktestResult, ProgressCallback (+1 more)
-
-### Community 98 - "Community 98"
-Cohesion: 0.32
-Nodes (11): _set_all_services_running(), ServiceType, create_service(), get_service(), list_services(), _normalize_service_status(), _normalize_service_type(), Service (+3 more)
-
-### Community 99 - "Community 99"
-Cohesion: 0.18
-Nodes (5): _catalog_payload(), Path, Tests for data_tools.cache_manager., test_get_catalog_normalizes_tick_segment_symbols_from_disk(), test_get_catalog_reads_catalog_json_without_build()
-
-### Community 100 - "Community 100"
-Cohesion: 0.23
-Nodes (7): _consume_live_ws_messages(), live_accounts_socket(), _live_ws_error_detail(), _LiveStreamBroker, _queue_live_ws_message(), _stable_payload_signature(), _stream_live_payload()
-
-### Community 101 - "Community 101"
-Cohesion: 0.17
-Nodes (7): compareBacktests(), BacktestsCompareResponse, COLORS, MetricConfig, METRICS, tdStyle, thStyle
-
-### Community 102 - "Community 102"
-Cohesion: 0.24
-Nodes (7): LayerResult, _layer_pytest_args(), LayerResult, main(), _print_summary(), _run_layer(), _result()
-
-### Community 103 - "Community 103"
-Cohesion: 0.29
-Nodes (10): _calc_atr(), _calc_supertrend(), _coerce_bool(), generate_signals(), Project-usable core port of the Pine Script strategy "Custom Swings + Supertrend, Generate Long/Short signals for the Custom Swings + Supertrend strategy., True Range → Wilder's ATR (equivalent to ta.atr in Pine)., Supertrend — mirrors Pine Script logic exactly.      Returns:         trend (+2 more)
-
-### Community 104 - "Community 104"
-Cohesion: 0.42
-Nodes (10): FixtureRequest, _candidate_ohlcv_paths(), _covers_requested_period(), _has_ohlcv_data(), _parse_date_bound(), _path_time_coverage(), skip_when_required_data_or_dependency_missing(), _to_utc_datetime() (+2 more)
-
-### Community 105 - "Community 105"
-Cohesion: 0.25
-Nodes (4): _normalize_symbol(), Any, _serialize_bar_payload(), _to_float()
-
-### Community 106 - "Community 106"
-Cohesion: 0.25
-Nodes (6): LLMProvider, _apply_metadata(), _extract_content(), Protocol, Any, Any
-
-### Community 107 - "Community 107"
-Cohesion: 0.31
-Nodes (7): PortfolioComponentModel, list_portfolios(), load_portfolio(), PortfolioComponentRecord, PortfolioRecord, PortfolioModel, save_portfolio()
-
-### Community 109 - "Community 109"
-Cohesion: 0.20
-Nodes (9): dukascopy:metals:XAUUSD:tick, asset_class, batch_size, delay_ms, files_per_sec, sample_month, symbol, timeframe (+1 more)
-
-### Community 110 - "Community 110"
-Cohesion: 0.22
-Nodes (9): BaseModel, LiveAccount, LiveDeploymentCreateRequest, LiveDeploymentStatusUpdateRequest, Discovered broker account payload exposed to the frontend., Payload for creating a live deployment via API., Payload for updating a deployment runtime status via API., VerificationEvidenceRecord (+1 more)
-
-### Community 111 - "Community 111"
 Cohesion: 0.22
 Nodes (9): Architecture Document, Frontend Index HTML, Frontend README, Copilot Instructions, Uvicorn Error Notes, Trading Platform README, Backtests Page Screenshot, Tasks Page Screenshot (+1 more)
 
-### Community 112 - "Community 112"
-Cohesion: 0.36
-Nodes (6): _fetch_latest_price(), main(), _run(), LiveSignalModel, LiveSignal, save_live_signal()
-
-### Community 113 - "Community 113"
+### Community 36 - "Community 36"
 Cohesion: 0.22
 Nodes (9): QA Error: Risk Parity, QA Error: Sector Rotation, QA Error: Stat Arb Pairs, QA Screenshot: Risk Parity, QA Screenshot: Sector Rotation, QA Screenshot: Stat Arb Pairs, Risk Parity Strategy, Sector Rotation Strategy (+1 more)
 
-### Community 114 - "Community 114"
-Cohesion: 0.42
-Nodes (8): _data_dir_score(), _home_candidates(), Path, Shared constants for the trading platform., Return the best available dukascopy_genesis.json path.      Prefers runtime fi, _resolve_data_dir(), resolve_genesis_path(), _safe_path_exists()
-
-### Community 115 - "Community 115"
-Cohesion: 0.39
-Nodes (6): _install_fake_provider(), Tests for the autonomous strategy conversion worker., _setup_agent(), test_run_auto_agent_retries_only_step_three_on_validation_failure(), test_run_auto_agent_sets_timeout_and_logs_for_long_code(), test_run_auto_agent_writes_strategy_docs_and_backtest_output()
-
-### Community 116 - "Community 116"
-Cohesion: 0.33
-Nodes (6): _capture_viewer_logs(), _CaptureHandler, LogRecord, test_request_middleware_logs_500_with_traceback(), test_request_middleware_logs_non_api_request(), test_request_middleware_uses_debug_for_quiet_polling_paths()
-
-### Community 117 - "Community 117"
+### Community 37 - "Community 37"
 Cohesion: 0.29
-Nodes (4): BaseLiveAdapter, _DummyAdapter, LiveSignal, test_submit_order_with_risk_applies_qty_before_submit()
+Nodes (2): _capture_viewer_logs(), _CaptureHandler
 
-### Community 118 - "Community 118"
-Cohesion: 0.39
-Nodes (3): _max_consecutive(), Compute max consecutive wins (positive=True) or losses (positive=False)., TestMaxConsecutiveLosses
+### Community 38 - "Community 38"
+Cohesion: 0.54
+Nodes (7): _candidate_ohlcv_paths(), _covers_requested_period(), _has_ohlcv_data(), _parse_date_bound(), _path_time_coverage(), skip_when_required_data_or_dependency_missing(), _to_utc_datetime()
 
-### Community 119 - "Community 119"
-Cohesion: 0.43
-Nodes (7): _canonical_target(), consolidate(), main(), _normalize_frame(), _normalize_timeframe(), DataFrame, Path
-
-### Community 120 - "Community 120"
-Cohesion: 0.46
-Nodes (6): ensure_live_account(), get_live_account(), list_live_accounts(), LiveAccountModel, LiveAccountConfig, upsert_live_accounts()
-
-### Community 121 - "Community 121"
+### Community 39 - "Community 39"
 Cohesion: 0.38
-Nodes (7): discover_alpaca_accounts(), discover_configured_accounts(), discover_ctrader_accounts(), Path, Discover Alpaca account details for one credential set., Discover all cTrader accounts linked to an access token., LiveAccount
+Nodes (3): clamp(), updateMax(), updateMin()
 
-### Community 122 - "Community 122"
-Cohesion: 0.43
-Nodes (3): _apply_metadata(), OpenAI, Any
+### Community 40 - "Community 40"
+Cohesion: 0.6
+Nodes (5): _canonical_target(), consolidate(), main(), _normalize_frame(), _normalize_timeframe()
 
-### Community 123 - "Community 123"
-Cohesion: 0.52
-Nodes (6): _calc_dema(), _calc_supertrend(), generate_signals(), Strategy: Supertrend + DEMA (Pine Script Conversion)  Combines Supertrend indi, DataFrame, Series
+### Community 41 - "Community 41"
+Cohesion: 0.6
+Nodes (4): _calc_dema(), _calc_supertrend(), generate_signals(), Strategy: Supertrend + DEMA (Pine Script Conversion)  Combines Supertrend indica
 
-### Community 124 - "Community 124"
-Cohesion: 0.48
-Nodes (6): _calc_rsi(), generate_signals(), _load_vix_data(), Strategy: Post VIX Dip Buy  Buys SPY on panic dips: when VIX spikes significan, DataFrame, Series
+### Community 42 - "Community 42"
+Cohesion: 0.6
+Nodes (4): _calc_adx(), generate_signals(), QG-30Min ES Breakout Strategy (Pine v6 conversion)., _wilder_rma()
 
-### Community 125 - "Community 125"
-Cohesion: 0.48
-Nodes (6): _calc_adx(), generate_signals(), QG-30Min ES Breakout Strategy (Pine v6 conversion)., _wilder_rma(), DataFrame, Series
+### Community 43 - "Community 43"
+Cohesion: 0.6
+Nodes (4): _calc_supertrend_osc(), _calc_wavetrend(), generate_signals(), Strategy: SuperOSC + VuManChu WaveTrend (Pine Script Conversion)  Combines a Sup
 
-### Community 127 - "Community 127"
-Cohesion: 0.38
-Nodes (4): _DummyEngine, Path, test_cmd_run_normalizes_timeframe_alias(), test_cmd_run_persists_canonical_stats()
+### Community 44 - "Community 44"
+Cohesion: 0.6
+Nodes (4): _calc_rsi(), generate_signals(), _load_vix_data(), Strategy: Post VIX Dip Buy  Buys SPY on panic dips: when VIX spikes significantl
 
-### Community 128 - "Community 128"
-Cohesion: 0.29
-Nodes (6): python.testing.pytestArgs, python.testing.pytestEnabled, python.testing.unittestEnabled, sonarlint.connectedMode.project, connectionId, projectKey
+### Community 45 - "Community 45"
+Cohesion: 0.6
+Nodes (3): formatPValue(), pValueColor(), pValueMetric()
 
-### Community 129 - "Community 129"
-Cohesion: 0.33
-Nodes (3): generate_signals(), DataFrame, Series
+### Community 46 - "Community 46"
+Cohesion: 0.6
+Nodes (3): clamp(), updateMax(), updateMin()
 
-### Community 130 - "Community 130"
-Cohesion: 0.33
-Nodes (3): generate_signals(), DataFrame, Series
+### Community 47 - "Community 47"
+Cohesion: 0.5
+Nodes (3): parse_live_deployments_config(), test_parse_live_deployments_warns_for_missing_account(), test_parse_live_deployments_yaml_valid()
 
-### Community 131 - "Community 131"
-Cohesion: 0.40
-Nodes (4): DownloadResult, Path, main(), Synchronous wrapper around the async download pipeline.
+### Community 48 - "Community 48"
+Cohesion: 0.7
+Nodes (4): _is_missing_browser_error(), _playwright_browser_launchable(), pytest_runtest_setup(), _requested_browser_name()
 
-### Community 132 - "Community 132"
-Cohesion: 0.60
-Nodes (5): Item, _is_missing_browser_error(), _playwright_browser_launchable(), pytest_runtest_setup(), _requested_browser_name()
-
-### Community 133 - "Community 133"
-Cohesion: 0.60
-Nodes (5): _calc_supertrend_osc(), _calc_wavetrend(), generate_signals(), Strategy: SuperOSC + VuManChu WaveTrend (Pine Script Conversion)  Combines a S, DataFrame
-
-### Community 134 - "Community 134"
-Cohesion: 0.33
-Nodes (5): cwd, pid, port, sessionFile, startedAt
-
-### Community 135 - "Community 135"
-Cohesion: 0.33
-Nodes (5): cwd, pid, port, sessionFile, startedAt
-
-### Community 137 - "Community 137"
-Cohesion: 0.60
-Nodes (3): LiveExecution, LiveExecutionModel, save_live_execution()
-
-### Community 138 - "Community 138"
-Cohesion: 0.70
-Nodes (5): _extract_strategy_meta(), _format_strategy_meta_assignment(), _normalize_meta_tags(), _normalize_strategy_meta(), Any
-
-### Community 139 - "Community 139"
-Cohesion: 0.40
+### Community 49 - "Community 49"
+Cohesion: 0.4
 Nodes (5): Phase 2 Outlook, Phase 2 Plan, Phase 2 Progress, Phase 3 Plan, Phase 3 Progress
 
-### Community 152 - "Community 152"
-Cohesion: 0.40
-Nodes (5): _detect_indicators(), Detect indicators used by a strategy from source code with basic parameter extra, Start a backtest asynchronously., run_backtest(), _strategy_path()
-
-### Community 153 - "Community 153"
-Cohesion: 0.50
-Nodes (3): generate_signals(), Intraday Channel Breakout Strategy  N-Bar High/Low channel breakout with 200 E, DataFrame
-
-### Community 154 - "Community 154"
-Cohesion: 0.50
-Nodes (4): 0005hkhkd, decimal_factor, name, start_tick
-
-### Community 155 - "Community 155"
-Cohesion: 0.50
-Nodes (4): 0027hkhkd, decimal_factor, name, start_tick
-
-### Community 156 - "Community 156"
-Cohesion: 0.50
-Nodes (4): 0175hkhkd, decimal_factor, name, start_tick
-
-### Community 157 - "Community 157"
-Cohesion: 0.50
-Nodes (4): 0291hkhkd, decimal_factor, name, start_tick
-
-### Community 158 - "Community 158"
-Cohesion: 0.50
-Nodes (4): 0386hkhkd, decimal_factor, name, start_tick
-
-### Community 159 - "Community 159"
-Cohesion: 0.50
-Nodes (4): 0388hkhkd, decimal_factor, name, start_tick
-
-### Community 160 - "Community 160"
-Cohesion: 0.50
-Nodes (4): 0700hkhkd, decimal_factor, name, start_tick
-
-### Community 161 - "Community 161"
-Cohesion: 0.50
-Nodes (4): 0857hkhkd, decimal_factor, name, start_tick
-
-### Community 162 - "Community 162"
-Cohesion: 0.50
-Nodes (4): 0883hkhkd, decimal_factor, name, start_tick
-
-### Community 163 - "Community 163"
-Cohesion: 0.50
-Nodes (4): 0939hkhkd, decimal_factor, name, start_tick
-
-### Community 164 - "Community 164"
-Cohesion: 0.50
-Nodes (4): 0941hkhkd, decimal_factor, name, start_tick
-
-### Community 165 - "Community 165"
-Cohesion: 0.50
-Nodes (4): 1093hkhkd, decimal_factor, name, start_tick
-
-### Community 166 - "Community 166"
-Cohesion: 0.50
-Nodes (4): 1177hkhkd, decimal_factor, name, start_tick
-
-### Community 167 - "Community 167"
-Cohesion: 0.50
-Nodes (4): 1288hkhkd, decimal_factor, name, start_tick
-
-### Community 168 - "Community 168"
-Cohesion: 0.50
-Nodes (4): 1299hkhkd, decimal_factor, name, start_tick
-
-### Community 169 - "Community 169"
-Cohesion: 0.50
-Nodes (4): 1398hkhkd, decimal_factor, name, start_tick
-
-### Community 170 - "Community 170"
-Cohesion: 0.50
-Nodes (4): 1810hkhkd, decimal_factor, name, start_tick
-
-### Community 171 - "Community 171"
-Cohesion: 0.50
-Nodes (4): 1918hkhkd, decimal_factor, name, start_tick
-
-### Community 172 - "Community 172"
-Cohesion: 0.50
-Nodes (4): 2007hkhkd, decimal_factor, name, start_tick
-
-### Community 173 - "Community 173"
-Cohesion: 0.50
-Nodes (4): 2018hkhkd, decimal_factor, name, start_tick
-
-### Community 174 - "Community 174"
-Cohesion: 0.50
-Nodes (4): 2318hkhkd, decimal_factor, name, start_tick
-
-### Community 175 - "Community 175"
-Cohesion: 0.50
-Nodes (4): 2388hkhkd, decimal_factor, name, start_tick
-
-### Community 176 - "Community 176"
-Cohesion: 0.50
-Nodes (4): 2502jpjpy, decimal_factor, name, start_tick
-
-### Community 177 - "Community 177"
-Cohesion: 0.50
-Nodes (4): 2503jpjpy, decimal_factor, name, start_tick
-
-### Community 178 - "Community 178"
-Cohesion: 0.50
-Nodes (4): 2628hkhkd, decimal_factor, name, start_tick
-
-### Community 179 - "Community 179"
-Cohesion: 0.50
-Nodes (4): 2822hkhkd, decimal_factor, name, start_tick
-
-### Community 180 - "Community 180"
-Cohesion: 0.50
-Nodes (4): 2836hkhkd, decimal_factor, name, start_tick
-
-### Community 181 - "Community 181"
-Cohesion: 0.50
-Nodes (4): 2914jpjpy, decimal_factor, name, start_tick
-
-### Community 182 - "Community 182"
-Cohesion: 0.50
-Nodes (4): 3188hkhkd, decimal_factor, name, start_tick
-
-### Community 183 - "Community 183"
-Cohesion: 0.50
-Nodes (4): 3333hkhkd, decimal_factor, name, start_tick
-
-### Community 184 - "Community 184"
-Cohesion: 0.50
-Nodes (4): 3382jpjpy, decimal_factor, name, start_tick
-
-### Community 185 - "Community 185"
-Cohesion: 0.50
-Nodes (4): 3436jpjpy, decimal_factor, name, start_tick
-
-### Community 186 - "Community 186"
-Cohesion: 0.50
-Nodes (4): 3968hkhkd, decimal_factor, name, start_tick
-
-### Community 187 - "Community 187"
-Cohesion: 0.50
-Nodes (4): 3988hkhkd, decimal_factor, name, start_tick
-
-### Community 188 - "Community 188"
-Cohesion: 0.50
-Nodes (4): 4004jpjpy, decimal_factor, name, start_tick
-
-### Community 189 - "Community 189"
-Cohesion: 0.50
-Nodes (4): 4005jpjpy, decimal_factor, name, start_tick
-
-### Community 190 - "Community 190"
-Cohesion: 0.50
-Nodes (4): 4063jpjpy, decimal_factor, name, start_tick
-
-### Community 191 - "Community 191"
-Cohesion: 0.50
-Nodes (4): 4452jpjpy, decimal_factor, name, start_tick
-
-### Community 192 - "Community 192"
-Cohesion: 0.50
-Nodes (4): 4502jpjpy, decimal_factor, name, start_tick
-
-### Community 193 - "Community 193"
-Cohesion: 0.50
-Nodes (4): 4503jpjpy, decimal_factor, name, start_tick
-
-### Community 194 - "Community 194"
-Cohesion: 0.50
-Nodes (4): 4507jpjpy, decimal_factor, name, start_tick
-
-### Community 195 - "Community 195"
-Cohesion: 0.50
-Nodes (4): 4523jpjpy, decimal_factor, name, start_tick
-
-### Community 196 - "Community 196"
-Cohesion: 0.50
-Nodes (4): 4543jpjpy, decimal_factor, name, start_tick
-
-### Community 197 - "Community 197"
-Cohesion: 0.50
-Nodes (4): 4689jpjpy, decimal_factor, name, start_tick
-
-### Community 198 - "Community 198"
-Cohesion: 0.50
-Nodes (4): 4911jpjpy, decimal_factor, name, start_tick
-
-### Community 199 - "Community 199"
-Cohesion: 0.50
-Nodes (4): 5108jpjpy, decimal_factor, name, start_tick
-
-### Community 200 - "Community 200"
-Cohesion: 0.50
-Nodes (4): 5301jpjpy, decimal_factor, name, start_tick
-
-### Community 201 - "Community 201"
-Cohesion: 0.50
-Nodes (4): 5401jpjpy, decimal_factor, name, start_tick
-
-### Community 202 - "Community 202"
-Cohesion: 0.50
-Nodes (4): 6098jpjpy, decimal_factor, name, start_tick
-
-### Community 203 - "Community 203"
-Cohesion: 0.50
-Nodes (4): 6301jpjpy, decimal_factor, name, start_tick
-
-### Community 204 - "Community 204"
-Cohesion: 0.50
-Nodes (4): 6367jpjpy, decimal_factor, name, start_tick
-
-### Community 205 - "Community 205"
-Cohesion: 0.50
-Nodes (4): 6501jpjpy, decimal_factor, name, start_tick
-
-### Community 206 - "Community 206"
-Cohesion: 0.50
-Nodes (4): 6502jpjpy, decimal_factor, name, start_tick
-
-### Community 207 - "Community 207"
-Cohesion: 0.50
-Nodes (4): 6503jpjpy, decimal_factor, name, start_tick
-
-### Community 208 - "Community 208"
-Cohesion: 0.50
-Nodes (4): 6506jpjpy, decimal_factor, name, start_tick
-
-### Community 209 - "Community 209"
-Cohesion: 0.50
-Nodes (4): 6702jpjpy, decimal_factor, name, start_tick
-
-### Community 210 - "Community 210"
-Cohesion: 0.50
-Nodes (4): 6752jpjpy, decimal_factor, name, start_tick
-
-### Community 211 - "Community 211"
-Cohesion: 0.50
-Nodes (4): 6758jpjpy, decimal_factor, name, start_tick
-
-### Community 212 - "Community 212"
-Cohesion: 0.50
-Nodes (4): 6762jpjpy, decimal_factor, name, start_tick
-
-### Community 213 - "Community 213"
-Cohesion: 0.50
-Nodes (4): 6902jpjpy, decimal_factor, name, start_tick
-
-### Community 214 - "Community 214"
-Cohesion: 0.50
-Nodes (4): 6954jpjpy, decimal_factor, name, start_tick
-
-### Community 215 - "Community 215"
-Cohesion: 0.50
-Nodes (4): 6971jpjpy, decimal_factor, name, start_tick
-
-### Community 216 - "Community 216"
-Cohesion: 0.50
-Nodes (4): 7201jpjpy, decimal_factor, name, start_tick
-
-### Community 217 - "Community 217"
-Cohesion: 0.50
-Nodes (4): 7203jpjpy, decimal_factor, name, start_tick
-
-### Community 218 - "Community 218"
-Cohesion: 0.50
-Nodes (4): 7261jpjpy, decimal_factor, name, start_tick
-
-### Community 219 - "Community 219"
-Cohesion: 0.50
-Nodes (4): 7267jpjpy, decimal_factor, name, start_tick
-
-### Community 220 - "Community 220"
-Cohesion: 0.50
-Nodes (4): 7270jpjpy, decimal_factor, name, start_tick
-
-### Community 221 - "Community 221"
-Cohesion: 0.50
-Nodes (4): 7751jpjpy, decimal_factor, name, start_tick
-
-### Community 222 - "Community 222"
-Cohesion: 0.50
-Nodes (4): 7974jpjpy, decimal_factor, name, start_tick
-
-### Community 223 - "Community 223"
-Cohesion: 0.50
-Nodes (4): 8031jpjpy, decimal_factor, name, start_tick
-
-### Community 224 - "Community 224"
-Cohesion: 0.50
-Nodes (4): 8035jpjpy, decimal_factor, name, start_tick
-
-### Community 225 - "Community 225"
-Cohesion: 0.50
-Nodes (4): 8306jpjpy, decimal_factor, name, start_tick
-
-### Community 226 - "Community 226"
-Cohesion: 0.50
-Nodes (4): 8316jpjpy, decimal_factor, name, start_tick
-
-### Community 227 - "Community 227"
-Cohesion: 0.50
-Nodes (4): 8411jpjpy, decimal_factor, name, start_tick
-
-### Community 228 - "Community 228"
-Cohesion: 0.50
-Nodes (4): 8766jpjpy, decimal_factor, name, start_tick
-
-### Community 229 - "Community 229"
-Cohesion: 0.50
-Nodes (4): 8801jpjpy, decimal_factor, name, start_tick
-
-### Community 230 - "Community 230"
-Cohesion: 0.50
-Nodes (4): 8802jpjpy, decimal_factor, name, start_tick
-
-### Community 231 - "Community 231"
-Cohesion: 0.50
-Nodes (4): 9020jpjpy, decimal_factor, name, start_tick
-
-### Community 232 - "Community 232"
-Cohesion: 0.50
-Nodes (4): 9432jpjpy, decimal_factor, name, start_tick
-
-### Community 233 - "Community 233"
-Cohesion: 0.50
-Nodes (4): 9433jpjpy, decimal_factor, name, start_tick
-
-### Community 234 - "Community 234"
-Cohesion: 0.50
-Nodes (4): 9501jpjpy, decimal_factor, name, start_tick
-
-### Community 235 - "Community 235"
-Cohesion: 0.50
-Nodes (4): 9983jpjpy, decimal_factor, name, start_tick
-
-### Community 236 - "Community 236"
-Cohesion: 0.50
-Nodes (4): 9984jpjpy, decimal_factor, name, start_tick
-
-### Community 237 - "Community 237"
-Cohesion: 0.50
-Nodes (4): a2aiteur, decimal_factor, name, start_tick
-
-### Community 238 - "Community 238"
-Cohesion: 0.50
-Nodes (4): aabvususd, decimal_factor, name, start_tick
-
-### Community 239 - "Community 239"
-Cohesion: 0.50
-Nodes (4): aalgbgbx, decimal_factor, name, start_tick
-
-### Community 240 - "Community 240"
-Cohesion: 0.50
-Nodes (4): aalususd, decimal_factor, name, start_tick
-
-### Community 241 - "Community 241"
-Cohesion: 0.50
-Nodes (4): aaplususd, decimal_factor, name, start_tick
-
-### Community 242 - "Community 242"
-Cohesion: 0.50
-Nodes (4): aapususd, decimal_factor, name, start_tick
-
-### Community 243 - "Community 243"
-Cohesion: 0.50
-Nodes (4): aaususd, decimal_factor, name, start_tick
-
-### Community 244 - "Community 244"
-Cohesion: 0.50
-Nodes (4): abbnchchf, decimal_factor, name, start_tick
-
-### Community 245 - "Community 245"
-Cohesion: 0.50
-Nodes (4): abbsesek, decimal_factor, name, start_tick
-
-### Community 246 - "Community 246"
-Cohesion: 0.50
-Nodes (4): abcususd, decimal_factor, name, start_tick
-
-### Community 247 - "Community 247"
-Cohesion: 0.50
-Nodes (4): abevususd, decimal_factor, name, start_tick
-
-### Community 248 - "Community 248"
-Cohesion: 0.50
-Nodes (4): abfgbgbx, decimal_factor, name, start_tick
-
-### Community 249 - "Community 249"
-Cohesion: 0.50
-Nodes (4): abibeeur, decimal_factor, name, start_tick
-
-### Community 250 - "Community 250"
-Cohesion: 0.50
-Nodes (4): abmdususd, decimal_factor, name, start_tick
-
-### Community 251 - "Community 251"
-Cohesion: 0.50
-Nodes (4): abtususd, decimal_factor, name, start_tick
-
-### Community 252 - "Community 252"
-Cohesion: 0.50
-Nodes (4): acafreur, decimal_factor, name, start_tick
-
-### Community 253 - "Community 253"
-Cohesion: 0.50
-Nodes (4): acfreur, decimal_factor, name, start_tick
-
-### Community 254 - "Community 254"
-Cohesion: 0.50
-Nodes (4): acglususd, decimal_factor, name, start_tick
-
-### Community 255 - "Community 255"
-Cohesion: 0.50
-Nodes (4): acmususd, decimal_factor, name, start_tick
-
-### Community 256 - "Community 256"
-Cohesion: 0.50
-Nodes (4): acnususd, decimal_factor, name, start_tick
-
-### Community 257 - "Community 257"
-Cohesion: 0.50
-Nodes (4): acseseur, decimal_factor, name, start_tick
-
-### Community 258 - "Community 258"
-Cohesion: 0.50
-Nodes (4): acxeseur, decimal_factor, name, start_tick
-
-### Community 259 - "Community 259"
-Cohesion: 0.50
-Nodes (4): adausd, decimal_factor, name, start_tick
-
-### Community 260 - "Community 260"
-Cohesion: 0.50
-Nodes (4): adbeususd, decimal_factor, name, start_tick
-
-### Community 261 - "Community 261"
-Cohesion: 0.50
-Nodes (4): adenchchf, decimal_factor, name, start_tick
-
-### Community 262 - "Community 262"
-Cohesion: 0.50
-Nodes (4): adiususd, decimal_factor, name, start_tick
-
-### Community 263 - "Community 263"
-Cohesion: 0.50
-Nodes (4): admgbgbx, decimal_factor, name, start_tick
-
-### Community 264 - "Community 264"
-Cohesion: 0.50
-Nodes (4): adpususd, decimal_factor, name, start_tick
-
-### Community 265 - "Community 265"
-Cohesion: 0.50
-Nodes (4): adsdeeur, decimal_factor, name, start_tick
-
-### Community 266 - "Community 266"
-Cohesion: 0.50
-Nodes (4): adskususd, decimal_factor, name, start_tick
-
-### Community 267 - "Community 267"
-Cohesion: 0.50
-Nodes (4): aedcnh, decimal_factor, name, start_tick
-
-### Community 268 - "Community 268"
-Cohesion: 0.50
-Nodes (4): aedczk, decimal_factor, name, start_tick
-
-### Community 269 - "Community 269"
-Cohesion: 0.50
-Nodes (4): aedhkd, decimal_factor, name, start_tick
-
-### Community 270 - "Community 270"
-Cohesion: 0.50
-Nodes (4): aedhuf, decimal_factor, name, start_tick
-
-### Community 271 - "Community 271"
-Cohesion: 0.50
-Nodes (4): aedjpy, decimal_factor, name, start_tick
-
-### Community 272 - "Community 272"
-Cohesion: 0.50
-Nodes (4): aedmxn, decimal_factor, name, start_tick
-
-### Community 273 - "Community 273"
-Cohesion: 0.50
-Nodes (4): aedron, decimal_factor, name, start_tick
-
-### Community 274 - "Community 274"
-Cohesion: 0.50
-Nodes (4): aedsar, decimal_factor, name, start_tick
-
-### Community 275 - "Community 275"
-Cohesion: 0.50
-Nodes (4): aedthb, decimal_factor, name, start_tick
-
-### Community 276 - "Community 276"
-Cohesion: 0.50
-Nodes (3): generate_signals(), Strategy: Cross-Asset Momentum (Time-Series)  Time-series momentum applied acr, DataFrame
-
-### Community 277 - "Community 277"
-Cohesion: 0.50
-Nodes (3): generate_signals(), Strategy: Gold Momentum (Multi-Timeframe)  Multi-timeframe momentum strategy f, DataFrame
-
-### Community 278 - "Community 278"
-Cohesion: 0.50
-Nodes (3): generate_signals(), Strategy: Mean Reversion (RSI + Bollinger Bands)  Mean reversion strategy usin, DataFrame
-
-### Community 279 - "Community 279"
-Cohesion: 0.50
-Nodes (3): main(), @pyne Opening Range Breakout Strategy (PyneCore). Converted from NinjaTrader 8, Series
-
-### Community 280 - "Community 280"
-Cohesion: 0.50
-Nodes (3): build_trade_context(), DataFrame, Series
-
-### Community 281 - "Community 281"
-Cohesion: 0.50
-Nodes (3): main(), @pyne SMA Crossover — PyneCore-Format Strategie. Einfache Trend-Following Stra, Series
-
-### Community 282 - "Community 282"
-Cohesion: 0.50
-Nodes (3): build_trade_context(), DataFrame, Series
-
-### Community 283 - "Community 283"
-Cohesion: 0.50
-Nodes (3): generate_signals(), Strategy: Risk Parity (Simplified)  Equal-risk allocation across multiple asse, DataFrame
-
-### Community 284 - "Community 284"
-Cohesion: 1.00
+### Community 50 - "Community 50"
+Cohesion: 1.0
 Nodes (3): joinUrl(), main(), snap()
 
-### Community 285 - "Community 285"
-Cohesion: 0.50
-Nodes (3): generate_signals(), Strategy: Sector Rotation (Relative Momentum)  Rotates allocation among US sec, DataFrame
+### Community 53 - "Community 53"
+Cohesion: 0.67
+Nodes (1): @pyne Opening Range Breakout Strategy (PyneCore). Converted from NinjaTrader 8 (
 
-### Community 286 - "Community 286"
-Cohesion: 0.50
-Nodes (3): generate_signals(), Strategy: Short-Term Reversal  Exploits weekly mean reversion: stocks that dro, DataFrame
+### Community 54 - "Community 54"
+Cohesion: 0.67
+Nodes (1): Strategy: Trend Following (Multi-Timeframe Momentum)  CTA-style trend following
 
-### Community 287 - "Community 287"
-Cohesion: 0.50
-Nodes (3): generate_signals(), Statistical Arbitrage Pairs Trading Strategy  Simplified pairs trading: Z-scor, DataFrame
+### Community 55 - "Community 55"
+Cohesion: 0.67
+Nodes (2): generate_signals(), Generate signals for EMA Crossover strategy.     Entry: EMA(9) crosses above EMA
 
-### Community 288 - "Community 288"
-Cohesion: 0.50
-Nodes (3): DataFrame, generate_signals(), Strategy: Trend Following (Multi-Timeframe Momentum)  CTA-style trend followin
+### Community 56 - "Community 56"
+Cohesion: 0.67
+Nodes (1): Strategy: Cross-Asset Momentum (Time-Series)  Time-series momentum applied acros
 
-### Community 289 - "Community 289"
-Cohesion: 0.50
-Nodes (3): DataFrame, generate_signals(), Strategy: Intraday Volatility Breakout  Simple breakout strategy: if price mov
+### Community 57 - "Community 57"
+Cohesion: 0.67
+Nodes (1): Strategy: Risk Parity (Simplified)  Equal-risk allocation across multiple asset
 
-### Community 295 - "Community 295"
+### Community 58 - "Community 58"
+Cohesion: 0.67
+Nodes (1): Strategy: Sector Rotation (Relative Momentum)  Rotates allocation among US secto
+
+### Community 59 - "Community 59"
+Cohesion: 0.67
+Nodes (1): Statistical Arbitrage Pairs Trading Strategy  Simplified pairs trading: Z-score
+
+### Community 60 - "Community 60"
+Cohesion: 0.67
+Nodes (1): Strategy: Intraday Volatility Breakout  Simple breakout strategy: if price moves
+
+### Community 61 - "Community 61"
+Cohesion: 0.67
+Nodes (1): @pyne SMA Crossover — PyneCore-Format Strategie. Einfache Trend-Following Strate
+
+### Community 62 - "Community 62"
+Cohesion: 0.67
+Nodes (1): Intraday Channel Breakout Strategy  N-Bar High/Low channel breakout with 200 EMA
+
+### Community 63 - "Community 63"
+Cohesion: 0.67
+Nodes (2): generate_signals(), Generate signals for EMA Crossover strategy.     Entry: Fast EMA crosses above S
+
+### Community 64 - "Community 64"
+Cohesion: 0.67
+Nodes (1): Strategy: Short-Term Reversal  Exploits weekly mean reversion: stocks that dropp
+
+### Community 65 - "Community 65"
+Cohesion: 0.67
+Nodes (1): Strategy: Mean Reversion (RSI + Bollinger Bands)  Mean reversion strategy using
+
+### Community 66 - "Community 66"
+Cohesion: 0.67
+Nodes (1): Strategy: Gold Momentum (Multi-Timeframe)  Multi-timeframe momentum strategy for
+
+### Community 68 - "Community 68"
 Cohesion: 0.67
 Nodes (3): Qwen3 7 Max Code Review Report, Qodo Code Review Report, Test Suite Report
 
-### Community 296 - "Community 296"
+### Community 69 - "Community 69"
 Cohesion: 0.67
 Nodes (3): Current State Analysis, Phase 1 Plan, Phase 1 Progress
 
-### Community 297 - "Community 297"
-Cohesion: 0.67
-Nodes (3): QA Error: Channel Breakout, QA Screenshot: Channel Breakout, Channel Breakout Strategy
-
-### Community 298 - "Community 298"
-Cohesion: 0.67
-Nodes (3): QA Error: Cross Asset Momentum, QA Screenshot: Cross Asset Momentum, Cross Asset Momentum Strategy
-
-### Community 299 - "Community 299"
-Cohesion: 0.67
-Nodes (3): QA Error: Gold Momentum, QA Screenshot: Gold Momentum, Gold Momentum Strategy
-
-### Community 300 - "Community 300"
-Cohesion: 0.67
-Nodes (3): QA Error: Mean Reversion RSI BB, QA Screenshot: Mean Reversion RSI BB, Mean Reversion RSI BB Strategy
-
-### Community 301 - "Community 301"
-Cohesion: 0.67
-Nodes (3): QA Error: Post VIX Dip Buy, QA Screenshot: Post VIX Dip Buy, Post VIX Dip Buy Strategy
-
-### Community 302 - "Community 302"
-Cohesion: 0.67
-Nodes (3): QA Error: Short Term Reversal, QA Screenshot: Short Term Reversal, Short Term Reversal Strategy
-
-### Community 303 - "Community 303"
-Cohesion: 0.67
-Nodes (3): QA Error: Trend Following, QA Screenshot: Trend Following, Trend Following Strategy
-
-### Community 304 - "Community 304"
-Cohesion: 0.67
-Nodes (3): QA Error: Volatility Breakout, QA Screenshot: Volatility Breakout, Volatility Breakout Strategy
-
-### Community 305 - "Community 305"
+### Community 70 - "Community 70"
 Cohesion: 0.67
 Nodes (3): Ramjet Signal Bot Config, Signal Bots README, Rocketfuel Signal Bot Config
 
+### Community 71 - "Community 71"
+Cohesion: 0.67
+Nodes (3): QA Error: Cross Asset Momentum, QA Screenshot: Cross Asset Momentum, Cross Asset Momentum Strategy
+
+### Community 72 - "Community 72"
+Cohesion: 0.67
+Nodes (3): QA Error: Gold Momentum, QA Screenshot: Gold Momentum, Gold Momentum Strategy
+
+### Community 73 - "Community 73"
+Cohesion: 0.67
+Nodes (3): QA Error: Mean Reversion RSI BB, QA Screenshot: Mean Reversion RSI BB, Mean Reversion RSI BB Strategy
+
+### Community 74 - "Community 74"
+Cohesion: 0.67
+Nodes (3): QA Error: Trend Following, QA Screenshot: Trend Following, Trend Following Strategy
+
+### Community 75 - "Community 75"
+Cohesion: 0.67
+Nodes (3): QA Error: Channel Breakout, QA Screenshot: Channel Breakout, Channel Breakout Strategy
+
+### Community 76 - "Community 76"
+Cohesion: 0.67
+Nodes (3): QA Error: Post VIX Dip Buy, QA Screenshot: Post VIX Dip Buy, Post VIX Dip Buy Strategy
+
+### Community 77 - "Community 77"
+Cohesion: 0.67
+Nodes (3): QA Error: Short Term Reversal, QA Screenshot: Short Term Reversal, Short Term Reversal Strategy
+
+### Community 78 - "Community 78"
+Cohesion: 0.67
+Nodes (3): QA Error: Volatility Breakout, QA Screenshot: Volatility Breakout, Volatility Breakout Strategy
+
+### Community 87 - "Community 87"
+Cohesion: 1.0
+Nodes (2): Live Deployments Example Config, Live Trading Screenshot
+
+### Community 88 - "Community 88"
+Cohesion: 1.0
+Nodes (2): PR Orchestrator Skill, PR Loop Research
+
+### Community 89 - "Community 89"
+Cohesion: 1.0
+Nodes (2): Strategy QA Report, Strategy Triage
+
+### Community 90 - "Community 90"
+Cohesion: 1.0
+Nodes (2): Frontend Progress, Frontend Design Plan
+
+### Community 91 - "Community 91"
+Cohesion: 1.0
+Nodes (2): EMA Crossover Conversion Test, Lab Generated Strategy
+
+### Community 92 - "Community 92"
+Cohesion: 1.0
+Nodes (2): Pine SuperOsc VuManChu Strategy, Pine Supertrend DEMA Strategy
+
+### Community 93 - "Community 93"
+Cohesion: 1.0
+Nodes (2): PyneCore ORB Strategy, PyneCore SMA Crossover Strategy
+
+### Community 94 - "Community 94"
+Cohesion: 1.0
+Nodes (2): Vite Logo SVG, React Logo SVG
+
+### Community 95 - "Community 95"
+Cohesion: 1.0
+Nodes (2): Logging Guide, Logging Screenshot
+
+### Community 122 - "Community 122"
+Cohesion: 1.0
+Nodes (1): Short identifier, e.g. 'histdata', 'dolthub', 'huggingface'.
+
+### Community 123 - "Community 123"
+Cohesion: 1.0
+Nodes (1): List datasets available for download.          Returns list of dicts with at lea
+
+### Community 124 - "Community 124"
+Cohesion: 1.0
+Nodes (1): Download OHLCV data for one symbol/timeframe and save as Parquet.          Args:
+
+### Community 129 - "Community 129"
+Cohesion: 1.0
+Nodes (1): Time of the final exit.
+
+### Community 130 - "Community 130"
+Cohesion: 1.0
+Nodes (1): Generate filename: {strategy}_{engine}_{YYYYMMDD-HHmmss}.json
+
+### Community 134 - "Community 134"
+Cohesion: 1.0
+Nodes (1): In-memory, thread-safe cache for catalog and overview metadata.  This module i
+
+### Community 135 - "Community 135"
+Cohesion: 1.0
+Nodes (1): Load catalog.json directly when available to avoid a full filesystem rescan.
+
+### Community 136 - "Community 136"
+Cohesion: 1.0
+Nodes (1): Return cached catalog payload, lazily building on first read.
+
+### Community 137 - "Community 137"
+Cohesion: 1.0
+Nodes (1): Return cached catalog OHLCV entries.
+
+### Community 138 - "Community 138"
+Cohesion: 1.0
+Nodes (1): Return cached overview metadata derived from the catalog.
+
+### Community 139 - "Community 139"
+Cohesion: 1.0
+Nodes (1): Invalidate cache entries globally or for a specific data directory.
+
+### Community 140 - "Community 140"
+Cohesion: 1.0
+Nodes (1): Invalidate cache after a successful download mutation.
+
+### Community 141 - "Community 141"
+Cohesion: 1.0
+Nodes (1): Invalidate cache after a successful resample mutation.
+
+### Community 142 - "Community 142"
+Cohesion: 1.0
+Nodes (1): Return cache hit/miss/invalidation stats for observability.
+
+### Community 143 - "Community 143"
+Cohesion: 1.0
+Nodes (1): Scan ~/data/ and produce catalog.json — a machine-readable manifest of all avai
+
+### Community 144 - "Community 144"
+Cohesion: 1.0
+Nodes (1): Load source metadata index if it exists.      The file maps dataset keys (e.g.
+
+### Community 145 - "Community 145"
+Cohesion: 1.0
+Nodes (1): Load the previous catalog to reuse unchanged file metadata.
+
+### Community 146 - "Community 146"
+Cohesion: 1.0
+Nodes (1): Determine storage mode: local, cached, or remote.
+
+### Community 147 - "Community 147"
+Cohesion: 1.0
+Nodes (1): Run data validation checks and return summary dict.
+
+### Community 148 - "Community 148"
+Cohesion: 1.0
+Nodes (1): Parse an OHLCV parquet path into source/asset_class/symbol/timeframe fields.
+
+### Community 149 - "Community 149"
+Cohesion: 1.0
+Nodes (1): Read parquet metadata and timestamp bounds without loading the full file.
+
+### Community 150 - "Community 150"
+Cohesion: 1.0
+Nodes (1): Scan ohlcv/ subdirectory and return dataset entries.
+
+### Community 151 - "Community 151"
+Cohesion: 1.0
+Nodes (1): Scan universes/ subdirectory.
+
+### Community 152 - "Community 152"
+Cohesion: 1.0
+Nodes (1): Scan fundamentals/ subdirectory for non-OHLCV datasets.
+
+### Community 153 - "Community 153"
+Cohesion: 1.0
+Nodes (1): Build the full catalog dict.
+
+### Community 154 - "Community 154"
+Cohesion: 1.0
+Nodes (1): List tables in a dolt repo using 'dolt sql -r csv'.
+
+### Community 155 - "Community 155"
+Cohesion: 1.0
+Nodes (1): Export a dolt table to CSV using 'dolt table export'.
+
+### Community 156 - "Community 156"
+Cohesion: 1.0
+Nodes (1): Return the canonical OHLCV output path and migrate legacy flat exports.
+
+### Community 157 - "Community 157"
+Cohesion: 1.0
+Nodes (1): Alpaca historical stock bars downloader.  Canonical output path:   {output_di
+
+### Community 158 - "Community 158"
+Cohesion: 1.0
+Nodes (1): Base classes for data downloaders.  All downloaders implement the Downloader A
+
+### Community 159 - "Community 159"
+Cohesion: 1.0
+Nodes (1): Result of a single download operation.
+
+### Community 160 - "Community 160"
+Cohesion: 1.0
+Nodes (1): Metadata about a data source for catalog integration.
+
+### Community 161 - "Community 161"
+Cohesion: 1.0
+Nodes (1): Abstract base class for all data downloaders.      Each downloader knows how t
+
+### Community 162 - "Community 162"
+Cohesion: 1.0
+Nodes (1): Short identifier, e.g. 'histdata', 'dolthub', 'huggingface'.
+
+### Community 163 - "Community 163"
+Cohesion: 1.0
+Nodes (1): List datasets available for download.          Returns list of dicts with at l
+
+### Community 164 - "Community 164"
+Cohesion: 1.0
+Nodes (1): Download OHLCV data for one symbol/timeframe and save as Parquet.          Arg
+
+### Community 165 - "Community 165"
+Cohesion: 1.0
+Nodes (1): Return metadata about this source for catalog integration.
+
+### Community 166 - "Community 166"
+Cohesion: 1.0
+Nodes (1): Build standardised output path: {output_dir}/ohlcv/{source}/{asset_class}/{symbo
+
+### Community 167 - "Community 167"
+Cohesion: 1.0
+Nodes (1): Return requested start or latest stored timestamp for smart resume.
+
+### Community 168 - "Community 168"
+Cohesion: 1.0
+Nodes (1): Persist data in a single parquet file per symbol/timeframe.          If the fi
+
+### Community 169 - "Community 169"
+Cohesion: 1.0
+Nodes (1): Read max timestamp from an existing parquet without loading full OHLCV payload.
+
+### Community 170 - "Community 170"
+Cohesion: 1.0
+Nodes (1): cTrader Downloader — tick/minute data from cTrader via cTrader Open API.  Port
+
+### Community 171 - "Community 171"
+Cohesion: 1.0
+Nodes (1): Downloads data from cTrader Open API or CSV exports.      Since cTrader Open A
+
+### Community 172 - "Community 172"
+Cohesion: 1.0
+Nodes (1): Args:             csv_dir: Directory containing cTrader CSV exports. If provide
+
+### Community 173 - "Community 173"
+Cohesion: 1.0
+Nodes (1): Load cTrader CSV export.          cTrader exports have various formats — try c
+
+### Community 174 - "Community 174"
+Cohesion: 1.0
+Nodes (1): Dolthub Downloader — datasets from DoltHub repositories.  DoltHub hosts versio
+
+### Community 175 - "Community 175"
+Cohesion: 1.0
+Nodes (1): Downloads data from DoltHub SQL repositories via REST API.
+
+### Community 176 - "Community 176"
+Cohesion: 1.0
+Nodes (1): Native Python Dukascopy Downloader — async .bi5 fetcher with LZMA decompression.
+
+### Community 177 - "Community 177"
+Cohesion: 1.0
+Nodes (1): Raised when a controlled download is cancelled by the caller.
+
+### Community 178 - "Community 178"
+Cohesion: 1.0
+Nodes (1): Generate hourly tick-data URLs. CRITICAL: months are 0-based in URLs.
+
+### Community 179 - "Community 179"
+Cohesion: 1.0
+Nodes (1): Generate daily minute-candle URLs. Months are 0-based.
+
+### Community 180 - "Community 180"
+Cohesion: 1.0
+Nodes (1): Check if response is HTML error page instead of binary data.
+
+### Community 181 - "Community 181"
+Cohesion: 1.0
+Nodes (1): Download a single .bi5 file with rate-limit awareness.
+
+### Community 182 - "Community 182"
+Cohesion: 1.0
+Nodes (1): Download .bi5 files asynchronously in controllable batches.
+
+### Community 183 - "Community 183"
+Cohesion: 1.0
+Nodes (1): Decompress LZMA .bi5 data. Returns empty bytes on failure.
+
+### Community 184 - "Community 184"
+Cohesion: 1.0
+Nodes (1): Parse raw tick binary: (timestamp, ask, bid, ask_vol, bid_vol).
+
+### Community 185 - "Community 185"
+Cohesion: 1.0
+Nodes (1): Parse raw candle binary: (timestamp, open, high, low, close, volume).      Not
+
+### Community 186 - "Community 186"
+Cohesion: 1.0
+Nodes (1): Decompress and parse tick data into a DataFrame.
+
+### Community 187 - "Community 187"
+Cohesion: 1.0
+Nodes (1): Decompress and parse minute candle data into a DataFrame.
+
+### Community 188 - "Community 188"
+Cohesion: 1.0
+Nodes (1): Resample tick data to OHLCV for a given timeframe and price type.
+
+### Community 189 - "Community 189"
+Cohesion: 1.0
+Nodes (1): Resample minute candle data to higher timeframe.
+
+### Community 190 - "Community 190"
+Cohesion: 1.0
+Nodes (1): Download both bid and ask ticks, merge into a single DataFrame.
+
+### Community 191 - "Community 191"
+Cohesion: 1.0
+Nodes (1): Pure Python async Dukascopy downloader — no Node.js dependency.
+
+### Community 192 - "Community 192"
+Cohesion: 1.0
+Nodes (1): Synchronous wrapper around the async download pipeline.
+
+### Community 193 - "Community 193"
+Cohesion: 1.0
+Nodes (1): Histdata Downloader — free Forex minute/tick data from histdata.com.  Download
+
+### Community 194 - "Community 194"
+Cohesion: 1.0
+Nodes (1): Downloads free Forex minute data from histdata.com.
+
+### Community 195 - "Community 195"
+Cohesion: 1.0
+Nodes (1): Download one year of M1 data from histdata.com.          histdata.com requires
+
+### Community 196 - "Community 196"
+Cohesion: 1.0
+Nodes (1): Resample 1m data to a higher timeframe.
+
+### Community 197 - "Community 197"
+Cohesion: 1.0
+Nodes (1): HuggingFace OHLCV downloader for mito0o852/OHLCV-1m.  The upstream dataset is
+
+### Community 198 - "Community 198"
+Cohesion: 1.0
+Nodes (1): JForex Downloader — Dukascopy historical data via JForex Java SDK (JPype bridge)
+
+### Community 199 - "Community 199"
+Cohesion: 1.0
+Nodes (1): Start JVM and validate core JForex SDK imports once at app startup.
+
+### Community 200 - "Community 200"
+Cohesion: 1.0
+Nodes (1): Dukascopy downloader using JForex Java SDK over JPype.
+
+### Community 201 - "Community 201"
+Cohesion: 1.0
+Nodes (1): Convenience function for direct module-level downloads.
+
+### Community 202 - "Community 202"
+Cohesion: 1.0
+Nodes (1): Yahoo Finance downloader for US equity OHLCV data.  Stores data under canonica
+
+### Community 203 - "Community 203"
+Cohesion: 1.0
+Nodes (1): Discover earliest available Dukascopy dates ("genesis") for one or more symbols.
+
+### Community 204 - "Community 204"
+Cohesion: 1.0
+Nodes (1): Return True when Dukascopy provides data for the given symbol/day.      Downlo
+
+### Community 205 - "Community 205"
+Cohesion: 1.0
+Nodes (1): Discover the earliest Dukascopy date available for a symbol/timeframe.
+
+### Community 206 - "Community 206"
+Cohesion: 1.0
+Nodes (1): Discover genesis dates for multiple Dukascopy symbols/timeframes.
+
+### Community 207 - "Community 207"
+Cohesion: 1.0
+Nodes (1): Migrate existing CSV data to the central ~/data/ directory as Parquet.  Source
+
+### Community 208 - "Community 208"
+Cohesion: 1.0
+Nodes (1): Migrate XAUUSD H1 and M15 CSVs from lean integration.
+
+### Community 209 - "Community 209"
+Cohesion: 1.0
+Nodes (1): Migrate US equity H1 CSVs (730d files).
+
+### Community 210 - "Community 210"
+Cohesion: 1.0
+Nodes (1): Migrate US equity M15 CSVs.
+
+### Community 211 - "Community 211"
+Cohesion: 1.0
+Nodes (1): Migrate daily equity CSVs from lean integration/data/equity/.
+
+### Community 212 - "Community 212"
+Cohesion: 1.0
+Nodes (1): Migrate stockkit 5-min equity CSVs.
+
+### Community 213 - "Community 213"
+Cohesion: 1.0
+Nodes (1): Copy SP500 universe file.
+
+### Community 214 - "Community 214"
+Cohesion: 1.0
+Nodes (1): Check if a string looks like a timestamp (starts with digit, contains '-').
+
+### Community 215 - "Community 215"
+Cohesion: 1.0
+Nodes (1): Convert a single OHLCV CSV to Parquet.
+
+### Community 216 - "Community 216"
+Cohesion: 1.0
+Nodes (1): Resample Tool — Generate higher timeframes from lower ones.  Given M1 (or any
+
+### Community 217 - "Community 217"
+Cohesion: 1.0
+Nodes (1): Resample OHLCV DataFrame to a higher timeframe.      Args:         df: DataFr
+
+### Community 218 - "Community 218"
+Cohesion: 1.0
+Nodes (1): Resample a single parquet file to multiple timeframes.      Args:         sou
+
+### Community 219 - "Community 219"
+Cohesion: 1.0
+Nodes (1): Resample all parquet files in a directory tree.      Finds all {from_tf}.parqu
+
+### Community 220 - "Community 220"
+Cohesion: 1.0
+Nodes (1): Rebuild the catalog after resampling.
+
+### Community 221 - "Community 221"
+Cohesion: 1.0
+Nodes (1): Load replay signals from a CSV file.      Returns dict payloads compatible wit
+
+### Community 222 - "Community 222"
+Cohesion: 1.0
+Nodes (1): Data Validation — automated quality checks for OHLCV Parquet files.  Checks:
+
+### Community 223 - "Community 223"
+Cohesion: 1.0
+Nodes (1): Result of validating a single Parquet file.
+
+### Community 224 - "Community 224"
+Cohesion: 1.0
+Nodes (1): Compact summary for catalog integration.
+
+### Community 225 - "Community 225"
+Cohesion: 1.0
+Nodes (1): Validate a single OHLCV Parquet file.
+
+### Community 226 - "Community 226"
+Cohesion: 1.0
+Nodes (1): Validate all Parquet files in the OHLCV directory.
+
+### Community 227 - "Community 227"
+Cohesion: 1.0
+Nodes (1): Live trading runner package.
+
+### Community 228 - "Community 228"
+Cohesion: 1.0
+Nodes (1): Discover Alpaca account details for one credential set.
+
+### Community 229 - "Community 229"
+Cohesion: 1.0
+Nodes (1): Resolve a display name for a cTrader account.      Priority:     1) Use a hum
+
+### Community 230 - "Community 230"
+Cohesion: 1.0
+Nodes (1): Discover all cTrader accounts linked to an access token.
+
+### Community 231 - "Community 231"
+Cohesion: 1.0
+Nodes (1): Resolve Alpaca credentials from env (default or ACC{N} blocks).
+
+### Community 232 - "Community 232"
+Cohesion: 1.0
+Nodes (1): Live adapter for Alpaca trading + trade update streaming.
+
+### Community 233 - "Community 233"
+Cohesion: 1.0
+Nodes (1): Initialize REST and websocket clients, and verify account access.
+
+### Community 234 - "Community 234"
+Cohesion: 1.0
+Nodes (1): Return open positions with pricing and unrealized PnL.
+
+### Community 235 - "Community 235"
+Cohesion: 1.0
+Nodes (1): Abstract broker adapter for live order routing and fill streaming.
+
+### Community 236 - "Community 236"
+Cohesion: 1.0
+Nodes (1): Initialize broker REST/stream clients and validate connectivity.
+
+### Community 237 - "Community 237"
+Cohesion: 1.0
+Nodes (1): Submit an order for the given signal and return broker order id.
+
+### Community 238 - "Community 238"
+Cohesion: 1.0
+Nodes (1): Block and listen for execution updates, persisting fills to storage.
+
+### Community 239 - "Community 239"
+Cohesion: 1.0
+Nodes (1): Return current account (balance, equity).
+
+### Community 240 - "Community 240"
+Cohesion: 1.0
+Nodes (1): cTrader live adapter backed by OpenApiPy.
+
+### Community 241 - "Community 241"
+Cohesion: 1.0
+Nodes (1): Initialize source connections/resources.
+
+### Community 242 - "Community 242"
+Cohesion: 1.0
+Nodes (1): Close source connections/resources.
+
+### Community 243 - "Community 243"
+Cohesion: 1.0
+Nodes (1): Yield parsed trade signals from this source.
+
+### Community 244 - "Community 244"
+Cohesion: 1.0
+Nodes (1): Raised when discord.py fails with terminal authentication errors.
+
+### Community 245 - "Community 245"
+Cohesion: 1.0
+Nodes (1): Wait until the next candle close for the given timeframe.
+
+### Community 246 - "Community 246"
+Cohesion: 1.0
+Nodes (1): Autonomous strategy-conversion worker with pluggable LLM providers.  This modu
+
+### Community 247 - "Community 247"
+Cohesion: 1.0
+Nodes (1): Convert raw strategy code into a runnable strategy and validate it via backtest.
+
+### Community 248 - "Community 248"
+Cohesion: 1.0
+Nodes (1): CAPM helper functions for strategy-vs-benchmark regression analysis.
+
+### Community 249 - "Community 249"
+Cohesion: 1.0
+Nodes (1): Align strategy and benchmark return series on common timestamps.
+
+### Community 250 - "Community 250"
+Cohesion: 1.0
+Nodes (1): Compute CAPM regression metrics from aligned return series.
+
+### Community 251 - "Community 251"
+Cohesion: 1.0
+Nodes (1): Backtest Runner CLI — unified interface to run backtests on any engine.  Usage
+
+### Community 252 - "Community 252"
+Cohesion: 1.0
+Nodes (1): Get an engine adapter by name.
+
+### Community 253 - "Community 253"
+Cohesion: 1.0
+Nodes (1): Auto-detect date range from available OHLCV data files.      For multiple symb
+
+### Community 254 - "Community 254"
+Cohesion: 1.0
+Nodes (1): List available engines.
+
+### Community 255 - "Community 255"
+Cohesion: 1.0
+Nodes (1): CLI to convert backtest results from various engines to the universal format.
+
+### Community 256 - "Community 256"
+Cohesion: 1.0
+Nodes (1): Convert a file using the specified engine converter.
+
+### Community 257 - "Community 257"
+Cohesion: 1.0
+Nodes (1): List available converters.
+
+### Community 258 - "Community 258"
+Cohesion: 1.0
+Nodes (1): Convert LEAN Engine backtest results to the universal trade format.  Reads LEA
+
+### Community 259 - "Community 259"
+Cohesion: 1.0
+Nodes (1): Convert a LEAN backtest JSON to a BacktestResult.
+
+### Community 260 - "Community 260"
+Cohesion: 1.0
+Nodes (1): Pair LEAN orders into entry/exit trades.
+
+### Community 261 - "Community 261"
+Cohesion: 1.0
+Nodes (1): Extract metadata from LEAN output.
+
+### Community 262 - "Community 262"
+Cohesion: 1.0
+Nodes (1): Extract equity curve if available in LEAN output.
+
+### Community 263 - "Community 263"
+Cohesion: 1.0
+Nodes (1): Extract clean ticker from LEAN symbol value like 'AAPL 2T' → 'AAPL'.
+
+### Community 264 - "Community 264"
+Cohesion: 1.0
+Nodes (1): Normalize ISO timestamp to consistent format.
+
+### Community 265 - "Community 265"
+Cohesion: 1.0
+Nodes (1): Convert Stockkit AI Bot trade CSVs to the universal trade format.  Stockkit us
+
+### Community 266 - "Community 266"
+Cohesion: 1.0
+Nodes (1): Convert a Stockkit trade CSV to a BacktestResult.
+
+### Community 267 - "Community 267"
+Cohesion: 1.0
+Nodes (1): Read semicolon-separated Stockkit CSV.
+
+### Community 268 - "Community 268"
+Cohesion: 1.0
+Nodes (1): Convert CSV rows to Trade objects, handling partial exits.
+
+### Community 269 - "Community 269"
+Cohesion: 1.0
+Nodes (1): Parse stockkit date/time to ISO format.
+
+### Community 270 - "Community 270"
+Cohesion: 1.0
+Nodes (1): Engine Adapter Interface — abstract base for all backtest engines.  Every engi
+
+### Community 271 - "Community 271"
+Cohesion: 1.0
+Nodes (1): Configuration passed to any engine adapter.
+
+### Community 272 - "Community 272"
+Cohesion: 1.0
+Nodes (1): Merge STRATEGY_META.parameters defaults with explicit overrides.
+
+### Community 273 - "Community 273"
+Cohesion: 1.0
+Nodes (1): Abstract base class for backtest engine adapters.
+
+### Community 274 - "Community 274"
+Cohesion: 1.0
+Nodes (1): Short engine identifier, e.g. 'vectorbt', 'lean'.
+
+### Community 275 - "Community 275"
+Cohesion: 1.0
+Nodes (1): Execute a backtest and return the result in universal format.          Args:
+
+### Community 276 - "Community 276"
+Cohesion: 1.0
+Nodes (1): Optional validation. Returns list of error messages (empty = valid).         De
+
+### Community 277 - "Community 277"
+Cohesion: 1.0
+Nodes (1): LEAN Engine Adapter — runs strategies through QuantConnect LEAN.  This adapter
+
+### Community 278 - "Community 278"
+Cohesion: 1.0
+Nodes (1): Adapter for QuantConnect LEAN backtesting engine.
+
+### Community 279 - "Community 279"
+Cohesion: 1.0
+Nodes (1): Run a LEAN backtest.          strategy_path should point to a LEAN algorithm f
+
+### Community 280 - "Community 280"
+Cohesion: 1.0
+Nodes (1): Write LEAN backtest config JSON.
+
+### Community 281 - "Community 281"
+Cohesion: 1.0
+Nodes (1): Execute LEAN backtest via subprocess.
+
+### Community 282 - "Community 282"
+Cohesion: 1.0
+Nodes (1): Find the LEAN result JSON in output directory.
+
+### Community 283 - "Community 283"
+Cohesion: 1.0
+Nodes (1): PyneCore Engine Adapter — runs Pine-style Python strategies via PyneCore.  Dat
+
+### Community 284 - "Community 284"
+Cohesion: 1.0
+Nodes (1): Adapter for PyneCore-based Pine-style backtesting.
+
+### Community 285 - "Community 285"
+Cohesion: 1.0
+Nodes (1): Find and load OHLCV parquet for a symbol.
+
+### Community 286 - "Community 286"
+Cohesion: 1.0
+Nodes (1): Higher-level replay engine with optional yfinance auto-download fallback.
+
+### Community 287 - "Community 287"
+Cohesion: 1.0
+Nodes (1): vectorbt Engine Adapter — runs Python strategies using vectorized signals.  Pr
+
+### Community 288 - "Community 288"
+Cohesion: 1.0
+Nodes (1): Return True if generate_signals uses keyword-argument style (not params dict).
+
+### Community 289 - "Community 289"
+Cohesion: 1.0
+Nodes (1): Call generate_signals with dict-style or kwargs-style depending on signature.
+
+### Community 290 - "Community 290"
+Cohesion: 1.0
+Nodes (1): Process a single symbol: load data, generate signals, extract trades.      Ret
+
+### Community 291 - "Community 291"
+Cohesion: 1.0
+Nodes (1): Adapter for vectorbt-style vectorized backtesting.
+
+### Community 292 - "Community 292"
+Cohesion: 1.0
+Nodes (1): Shift strategy output by one bar so signal bars execute on the next bar open.
+
+### Community 293 - "Community 293"
+Cohesion: 1.0
+Nodes (1): Find and load OHLCV parquet for a symbol.
+
+### Community 294 - "Community 294"
+Cohesion: 1.0
+Nodes (1): Statistics module — computes performance metrics from a list of Trades.  Uses
+
+### Community 295 - "Community 295"
+Cohesion: 1.0
+Nodes (1): Compute comprehensive performance metrics from a list of trades.      Args:
+
+### Community 296 - "Community 296"
+Cohesion: 1.0
+Nodes (1): Convenience: compute stats from a BacktestResult.
+
+### Community 297 - "Community 297"
+Cohesion: 1.0
+Nodes (1): Convert EquityPoint list to a pandas Series of returns with datetime index.
+
+### Community 298 - "Community 298"
+Cohesion: 1.0
+Nodes (1): Attach an inferred frequency when the datetime index is regular.
+
+### Community 299 - "Community 299"
+Cohesion: 1.0
+Nodes (1): Infer observations per year from equity-curve timestamps.
+
+### Community 300 - "Community 300"
+Cohesion: 1.0
+Nodes (1): Annualize a total return using the inferred observation frequency.
+
+### Community 301 - "Community 301"
+Cohesion: 1.0
+Nodes (1): Avoid exploding Calmar ratios when drawdown is effectively zero.
+
+### Community 302 - "Community 302"
+Cohesion: 1.0
+Nodes (1): Safely call a quantstats function, returning 0.0 on failure.
+
+### Community 303 - "Community 303"
+Cohesion: 1.0
+Nodes (1): Compute max consecutive wins (positive=True) or losses (positive=False).
+
+### Community 304 - "Community 304"
+Cohesion: 1.0
+Nodes (1): Compute max drawdown as a positive fraction (0.05 = 5%).
+
+### Community 305 - "Community 305"
+Cohesion: 1.0
+Nodes (1): Compute max drawdown duration in periods.
+
+### Community 306 - "Community 306"
+Cohesion: 1.0
+Nodes (1): Compute period-over-period returns.
+
+### Community 307 - "Community 307"
+Cohesion: 1.0
+Nodes (1): Compute daily returns from an equity curve, falling back to raw period returns.
+
+### Community 308 - "Community 308"
+Cohesion: 1.0
+Nodes (1): Compute the one-sided p-value for mean returns > 0; return 1.0 on failure.
+
+### Community 309 - "Community 309"
+Cohesion: 1.0
+Nodes (1): Annualized Sharpe ratio (manual).
+
+### Community 310 - "Community 310"
+Cohesion: 1.0
+Nodes (1): Annualized Sortino ratio (manual).
+
+### Community 311 - "Community 311"
+Cohesion: 1.0
+Nodes (1): Probabilistic Sharpe Ratio using returns series (QuantStats path).     PSR = Φ(
+
+### Community 312 - "Community 312"
+Cohesion: 1.0
+Nodes (1): PSR from raw returns list (manual fallback). Uses per-observation SR.
+
+### Community 313 - "Community 313"
+Cohesion: 1.0
+Nodes (1): Core PSR formula: Φ((SR - SR*) × √(n-1) / √(1 - skew×SR + ((kurt-1)/4)×SR²))
+
+### Community 314 - "Community 314"
+Cohesion: 1.0
+Nodes (1): Shared constants for the trading platform.
+
+### Community 315 - "Community 315"
+Cohesion: 1.0
+Nodes (1): Normalize timeframe aliases to canonical values.      Returns canonical values
+
+### Community 316 - "Community 316"
+Cohesion: 1.0
+Nodes (1): Return the best available dukascopy_genesis.json path.      Prefers runtime fi
+
+### Community 317 - "Community 317"
+Cohesion: 1.0
+Nodes (1): Resolve an executable path, handling Windows .cmd/.bat extensions.
+
+### Community 318 - "Community 318"
+Cohesion: 1.0
+Nodes (1): Centralized logging module for trading-platform services.  Provides structured
+
+### Community 319 - "Community 319"
+Cohesion: 1.0
+Nodes (1): Formats log records as structured JSON.
+
+### Community 320 - "Community 320"
+Cohesion: 1.0
+Nodes (1): Create or return a logger for the given service.      Each service gets:
+
+### Community 321 - "Community 321"
+Cohesion: 1.0
+Nodes (1): Shared data models for the universal trade format.  Defines the canonical JSON
+
+### Community 322 - "Community 322"
+Cohesion: 1.0
+Nodes (1): Metadaten für eine Strategie (unabhängig vom Backtest).
+
+### Community 323 - "Community 323"
+Cohesion: 1.0
+Nodes (1): Live account configuration stored in DB and used by API payloads.
+
+### Community 324 - "Community 324"
+Cohesion: 1.0
+Nodes (1): Discovered broker account payload exposed to the frontend.
+
+### Community 325 - "Community 325"
+Cohesion: 1.0
+Nodes (1): Live deployment record (strategy + account + market + runtime status).
+
+### Community 326 - "Community 326"
+Cohesion: 1.0
+Nodes (1): Payload for creating a live deployment via API.
+
+### Community 327 - "Community 327"
+Cohesion: 1.0
+Nodes (1): Payload for updating a deployment runtime status via API.
+
+### Community 328 - "Community 328"
+Cohesion: 1.0
+Nodes (1): Intent emitted by strategy logic before broker execution.
+
+### Community 329 - "Community 329"
+Cohesion: 1.0
+Nodes (1): Execution fill received from broker for a previously emitted signal.
+
+### Community 330 - "Community 330"
+Cohesion: 1.0
+Nodes (1): Periodic balance/equity snapshot for a live broker account.
+
+### Community 331 - "Community 331"
+Cohesion: 1.0
+Nodes (1): A weighted strategy component inside a multi-strategy portfolio.
+
+### Community 332 - "Community 332"
+Cohesion: 1.0
+Nodes (1): Persisted portfolio payload shared across API and storage layers.
+
+### Community 333 - "Community 333"
+Cohesion: 1.0
+Nodes (1): A single (partial) exit from a position.
+
+### Community 334 - "Community 334"
+Cohesion: 1.0
+Nodes (1): One position from entry to full close. Supports partial exits.
+
+### Community 335 - "Community 335"
+Cohesion: 1.0
+Nodes (1): Time of the final exit.
+
+### Community 336 - "Community 336"
+Cohesion: 1.0
+Nodes (1): Metadata about a backtest run.
+
+### Community 337 - "Community 337"
+Cohesion: 1.0
+Nodes (1): Time-series indicator data for viewer display.      - type "overlay": drawn on
+
+### Community 338 - "Community 338"
+Cohesion: 1.0
+Nodes (1): Canonical backtest statistics shared across runner and viewer layers.
+
+### Community 339 - "Community 339"
+Cohesion: 1.0
+Nodes (1): Canonical portfolio statistics for persisted combined portfolio metrics.
+
+### Community 340 - "Community 340"
+Cohesion: 1.0
+Nodes (1): Complete backtest output: meta + trades + optional equity_curve + stats.
+
+### Community 341 - "Community 341"
+Cohesion: 1.0
+Nodes (1): Save to JSON file. Returns the path written to.
+
+### Community 342 - "Community 342"
+Cohesion: 1.0
+Nodes (1): Generate filename: {strategy}_{engine}_{YYYYMMDD-HHmmss}.json
+
+### Community 343 - "Community 343"
+Cohesion: 1.0
+Nodes (1): Helpers for discovering and editing strategy assets.
+
+### Community 344 - "Community 344"
+Cohesion: 1.0
+Nodes (1): Reusable signal processor packages.
+
+### Community 345 - "Community 345"
+Cohesion: 1.0
+Nodes (1): Nitro processor: RamJet formulas, but BUY-only signal intake.
+
+### Community 346 - "Community 346"
+Cohesion: 1.0
+Nodes (1): RamJet signal-processor package.
+
+### Community 347 - "Community 347"
+Cohesion: 1.0
+Nodes (1): RamJet signal processor with formula-identical SL/TP logic.      Ported from `
+
+### Community 348 - "Community 348"
+Cohesion: 1.0
+Nodes (1): RocketFuel RSI strategy processor (ATR hard-stop, optional short entry).
+
+### Community 349 - "Community 349"
+Cohesion: 1.0
+Nodes (1): Intraday Channel Breakout Strategy  N-Bar High/Low channel breakout with 200 E
+
+### Community 350 - "Community 350"
+Cohesion: 1.0
+Nodes (1): Strategy: Cross-Asset Momentum (Time-Series)  Time-series momentum applied acr
+
+### Community 351 - "Community 351"
+Cohesion: 1.0
+Nodes (1): Project-usable core port of the Pine Script strategy "Custom Swings + Supertrend
+
+### Community 352 - "Community 352"
+Cohesion: 1.0
+Nodes (1): True Range → Wilder's ATR (equivalent to ta.atr in Pine).
+
+### Community 353 - "Community 353"
+Cohesion: 1.0
+Nodes (1): Supertrend — mirrors Pine Script logic exactly.      Returns:         trend
+
+### Community 354 - "Community 354"
+Cohesion: 1.0
+Nodes (1): Generate Long/Short signals for the Custom Swings + Supertrend strategy.
+
+### Community 355 - "Community 355"
+Cohesion: 1.0
+Nodes (1): Generate signals for EMA Crossover strategy.     Entry: EMA(9) crosses above EM
+
+### Community 356 - "Community 356"
+Cohesion: 1.0
+Nodes (1): Strategy: Gold Momentum (Multi-Timeframe)  Multi-timeframe momentum strategy f
+
+### Community 357 - "Community 357"
+Cohesion: 1.0
+Nodes (1): Generate signals for EMA Crossover strategy.     Entry: Fast EMA crosses above
+
+### Community 358 - "Community 358"
+Cohesion: 1.0
+Nodes (1): Strategy: Mean Reversion (RSI + Bollinger Bands)  Mean reversion strategy usin
+
+### Community 359 - "Community 359"
+Cohesion: 1.0
+Nodes (1): Strategy: SuperOSC + VuManChu WaveTrend (Pine Script Conversion)  Combines a S
+
+### Community 360 - "Community 360"
+Cohesion: 1.0
+Nodes (1): Strategy: Supertrend + DEMA (Pine Script Conversion)  Combines Supertrend indi
+
+### Community 361 - "Community 361"
+Cohesion: 1.0
+Nodes (1): Strategy: Post VIX Dip Buy  Buys SPY on panic dips: when VIX spikes significan
+
+### Community 362 - "Community 362"
+Cohesion: 1.0
+Nodes (1): @pyne Opening Range Breakout Strategy (PyneCore). Converted from NinjaTrader 8
+
+### Community 363 - "Community 363"
+Cohesion: 1.0
+Nodes (1): @pyne SMA Crossover — PyneCore-Format Strategie. Einfache Trend-Following Stra
+
+### Community 364 - "Community 364"
+Cohesion: 1.0
+Nodes (1): QG-30Min ES Breakout Strategy (Pine v6 conversion).
+
+### Community 365 - "Community 365"
+Cohesion: 1.0
+Nodes (1): Strategy: Risk Parity (Simplified)  Equal-risk allocation across multiple asse
+
+### Community 366 - "Community 366"
+Cohesion: 1.0
+Nodes (1): Strategy: Sector Rotation (Relative Momentum)  Rotates allocation among US sec
+
+### Community 367 - "Community 367"
+Cohesion: 1.0
+Nodes (1): Strategy: Short-Term Reversal  Exploits weekly mean reversion: stocks that dro
+
+### Community 368 - "Community 368"
+Cohesion: 1.0
+Nodes (1): Statistical Arbitrage Pairs Trading Strategy  Simplified pairs trading: Z-scor
+
+### Community 369 - "Community 369"
+Cohesion: 1.0
+Nodes (1): Strategy: Trend Following (Multi-Timeframe Momentum)  CTA-style trend followin
+
+### Community 370 - "Community 370"
+Cohesion: 1.0
+Nodes (1): Strategy: Intraday Volatility Breakout  Simple breakout strategy: if price mov
+
+### Community 371 - "Community 371"
+Cohesion: 1.0
+Nodes (1): Metrics Validation: runner.stats vs QuantStats ================================
+
+### Community 372 - "Community 372"
+Cohesion: 1.0
+Nodes (1): Convert equity list to daily returns pd.Series.
+
+### Community 373 - "Community 373"
+Cohesion: 1.0
+Nodes (1): # NOTE: QuantStats expects the ANNUAL rf — it deannualizes internally.
+
+### Community 374 - "Community 374"
+Cohesion: 1.0
+Nodes (1): Regression-Test fuer Strategie: Channel Breakout  Smoke-Test: stellt sicher, d
+
+### Community 375 - "Community 375"
+Cohesion: 1.0
+Nodes (1): Regression-Test fuer Strategie: Cross-Asset Momentum  Smoke-Test: stellt siche
+
+### Community 376 - "Community 376"
+Cohesion: 1.0
+Nodes (1): Regression-Test für Strategie: Custom Swings + Supertrend  Smoke-Test: stellt
+
+### Community 377 - "Community 377"
+Cohesion: 1.0
+Nodes (1): Anzahl der Trades darf sich nicht verändern.
+
+### Community 378 - "Community 378"
+Cohesion: 1.0
+Nodes (1): Net Profit darf sich nicht wesentlich verändern (Toleranz: 0.5 $).
+
+### Community 379 - "Community 379"
+Cohesion: 1.0
+Nodes (1): generate_signals muss exakt 4 Elemente zurückgeben (entries, exits, indicators_d
+
+### Community 380 - "Community 380"
+Cohesion: 1.0
+Nodes (1): generate_signals muss konfigurierbare Parameter mit Default-Werten in der Signat
+
+### Community 381 - "Community 381"
+Cohesion: 1.0
+Nodes (1): Jeder Trade muss sl_price in meta haben (Risk-Sizing-Kontrolle).
+
+### Community 382 - "Community 382"
+Cohesion: 1.0
+Nodes (1): Kein Trade darf mehr als 1.5% des Eigenkapitals riskieren.
+
+### Community 383 - "Community 383"
+Cohesion: 1.0
+Nodes (1): indicators_dict muss stop_loss, atr und direction enthalten.
+
+### Community 384 - "Community 384"
+Cohesion: 1.0
+Nodes (1): STRATEGY_META muss alle Pflichtfelder enthalten.
+
+### Community 385 - "Community 385"
+Cohesion: 1.0
+Nodes (1): Regression-Test fuer Strategie: Gold Momentum  Smoke-Test: stellt sicher, dass
+
+### Community 386 - "Community 386"
+Cohesion: 1.0
+Nodes (1): Regression-Test fuer Strategie: Mean Reversion RSI+BB  Smoke-Test: stellt sich
+
+### Community 387 - "Community 387"
+Cohesion: 1.0
+Nodes (1): Regression-Test fuer Strategie: SuperOSC + VuManChu  Smoke-Test: stellt sicher
+
+### Community 388 - "Community 388"
+Cohesion: 1.0
+Nodes (1): Regression-Test fuer Strategie: Supertrend + DEMA  Smoke-Test: stellt sicher,
+
+### Community 389 - "Community 389"
+Cohesion: 1.0
+Nodes (1): Regression-Test fuer Strategie: Post VIX Dip Buy  Smoke-Test: stellt sicher, d
+
+### Community 390 - "Community 390"
+Cohesion: 1.0
+Nodes (1): Regression-Test fuer Strategie: Opening Range Breakout  Smoke-Test: stellt sic
+
+### Community 391 - "Community 391"
+Cohesion: 1.0
+Nodes (1): Regression-Test fuer Strategie: SMA Crossover (PyneCore)  Smoke-Test: stellt s
+
+### Community 392 - "Community 392"
+Cohesion: 1.0
+Nodes (1): Regression-Test fuer Strategie: QG-30Min ES Breakout Strategy  Smoke-Test: ste
+
+### Community 393 - "Community 393"
+Cohesion: 1.0
+Nodes (1): Regression-Test fuer Strategie: Risk Parity  Smoke-Test: stellt sicher, dass z
+
+### Community 394 - "Community 394"
+Cohesion: 1.0
+Nodes (1): Regression-Test fuer Strategie: Sector Rotation  Smoke-Test: stellt sicher, da
+
+### Community 395 - "Community 395"
+Cohesion: 1.0
+Nodes (1): Regression-Test fuer Strategie: Short Term Reversal  Smoke-Test: stellt sicher
+
+### Community 396 - "Community 396"
+Cohesion: 1.0
+Nodes (1): Regression-Test fuer Strategie: Statistical Arbitrage Pairs  Smoke-Test: stell
+
+### Community 397 - "Community 397"
+Cohesion: 1.0
+Nodes (1): Regression-Test fuer Strategie: Trend Following  Smoke-Test: stellt sicher, da
+
+### Community 398 - "Community 398"
+Cohesion: 1.0
+Nodes (1): Regression-Test fuer Strategie: Volatility Breakout  Smoke-Test: stellt sicher
+
+### Community 399 - "Community 399"
+Cohesion: 1.0
+Nodes (1): Tests for the FastAPI endpoints in viewer/main.py.
+
+### Community 400 - "Community 400"
+Cohesion: 1.0
+Nodes (1): Create a test FastAPI app client.
+
+### Community 401 - "Community 401"
+Cohesion: 1.0
+Nodes (1): Tests for the autonomous strategy conversion worker.
+
+### Community 402 - "Community 402"
+Cohesion: 1.0
+Nodes (1): Tests for data_tools.cache_manager.
+
+### Community 403 - "Community 403"
+Cohesion: 1.0
+Nodes (1): Create a minimal data directory for testing.
+
+### Community 404 - "Community 404"
+Cohesion: 1.0
+Nodes (1): Tests for data_tools.dukascopy_discovery.
+
+### Community 405 - "Community 405"
+Cohesion: 1.0
+Nodes (1): Return a probe_single_day drop-in that answers from a local genesis dict.
+
+### Community 406 - "Community 406"
+Cohesion: 1.0
+Nodes (1): Tests for shared.models — universal trade format.
+
+### Community 407 - "Community 407"
+Cohesion: 1.0
+Nodes (1): Tests for data_tools/resample.py.
+
+### Community 408 - "Community 408"
+Cohesion: 1.0
+Nodes (1): Create a sample 1-minute OHLCV DataFrame.
+
+### Community 409 - "Community 409"
+Cohesion: 1.0
+Nodes (1): Create a sample 1-hour OHLCV DataFrame.
+
+### Community 410 - "Community 410"
+Cohesion: 1.0
+Nodes (1): Verify OHLCV aggregation rules: O=first, H=max, L=min, C=last, V=sum.
+
+### Community 411 - "Community 411"
+Cohesion: 1.0
+Nodes (1): Test resampling a parquet file.
+
+### Community 412 - "Community 412"
+Cohesion: 1.0
+Nodes (1): Test resampling to multiple timeframes.
+
+### Community 413 - "Community 413"
+Cohesion: 1.0
+Nodes (1): Tests for runner.stats — performance metrics calculation.
+
+### Community 414 - "Community 414"
+Cohesion: 1.0
+Nodes (1): Helper: minimal trade with given PnL.
+
+### Community 415 - "Community 415"
+Cohesion: 1.0
+Nodes (1): Focused tests for newer viewer data-management features.
+
+### Community 416 - "Community 416"
+Cohesion: 1.0
+Nodes (1): Strategy comparison logic — ported from custom_lean_integration/compare_strategi
+
+### Community 417 - "Community 417"
+Cohesion: 1.0
+Nodes (1): Period-over-period returns from an equity series.
+
+### Community 418 - "Community 418"
+Cohesion: 1.0
+Nodes (1): Drawdown percentage series from equity values.
+
+### Community 419 - "Community 419"
+Cohesion: 1.0
+Nodes (1): Pearson correlation coefficient.
+
+### Community 420 - "Community 420"
+Cohesion: 1.0
+Nodes (1): Align two [time, value] series to common timestamps.
+
+### Community 421 - "Community 421"
+Cohesion: 1.0
+Nodes (1): 50/50 combined equity curve from two aligned series.
+
+### Community 422 - "Community 422"
+Cohesion: 1.0
+Nodes (1): Stats for the combined 50/50 portfolio.
+
+### Community 423 - "Community 423"
+Cohesion: 1.0
+Nodes (1): Compare multiple backtest results.      Parameters     ----------     strate
+
+### Community 424 - "Community 424"
+Cohesion: 1.0
+Nodes (1): Shared viewer helper logic used by the FastAPI backend in `viewer/main.py`.  T
+
+### Community 425 - "Community 425"
+Cohesion: 1.0
+Nodes (1): Convert ISO 8601 string to Unix timestamp (seconds).
+
+### Community 426 - "Community 426"
+Cohesion: 1.0
+Nodes (1): Convert a Universal Format Trade to viewer-friendly flat format.
+
+### Community 427 - "Community 427"
+Cohesion: 1.0
+Nodes (1): Find and load OHLCV parquet for a symbol+timeframe.
+
+### Community 428 - "Community 428"
+Cohesion: 1.0
+Nodes (1): Convert OHLCV DataFrame to list of dicts with Unix timestamps.
+
+### Community 429 - "Community 429"
+Cohesion: 1.0
+Nodes (1): Extract equity curve as [{time, equity}] with Unix timestamps.     If no equity
+
+### Community 430 - "Community 430"
+Cohesion: 1.0
+Nodes (1): Use persisted runner stats when available, otherwise compute canonical fallbacks
+
+### Community 431 - "Community 431"
+Cohesion: 1.0
+Nodes (1): Build lightweight list-card stats from persisted runner stats when available.
+
+### Community 432 - "Community 432"
+Cohesion: 1.0
+Nodes (1): List all available backtest result files.
+
+### Community 433 - "Community 433"
+Cohesion: 1.0
+Nodes (1): Load a specific backtest result (raw format).
+
+### Community 434 - "Community 434"
+Cohesion: 1.0
+Nodes (1): Update the display title stored in meta.notes for a backtest.
+
+### Community 435 - "Community 435"
+Cohesion: 1.0
+Nodes (1): Metadata for topbar display.
+
+### Community 436 - "Community 436"
+Cohesion: 1.0
+Nodes (1): Compute stats for a backtest.
+
+### Community 437 - "Community 437"
+Cohesion: 1.0
+Nodes (1): Viewer-format trade list (flattened, unix timestamps).
+
+### Community 438 - "Community 438"
+Cohesion: 1.0
+Nodes (1): Detect indicators used by a strategy from source code with basic parameter extra
+
+### Community 439 - "Community 439"
+Cohesion: 1.0
+Nodes (1): Compute indicator values from OHLCV DataFrame for given time range.
+
+### Community 440 - "Community 440"
+Cohesion: 1.0
+Nodes (1): Convert a pandas Series to time/value points filtered to the OHLCV window.
+
+### Community 441 - "Community 441"
+Cohesion: 1.0
+Nodes (1): Single trade with OHLCV context (BARS_BEFORE/AFTER around entry).
+
+### Community 442 - "Community 442"
+Cohesion: 1.0
+Nodes (1): Equity curve data for chart.
+
+### Community 443 - "Community 443"
+Cohesion: 1.0
+Nodes (1): Full OHLCV data for all symbols in this backtest.
+
+### Community 444 - "Community 444"
+Cohesion: 1.0
+Nodes (1): Full comparison with combined equity, drawdowns, correlations.
+
+### Community 445 - "Community 445"
+Cohesion: 1.0
+Nodes (1): Extract default parameters from a strategy file via AST analysis.      Priorit
+
+### Community 446 - "Community 446"
+Cohesion: 1.0
+Nodes (1): List all strategies by scanning strategy files for STRATEGY_META.
+
+### Community 447 - "Community 447"
+Cohesion: 1.0
+Nodes (1): Strategy details + all backtests and portfolios using it.
+
+### Community 448 - "Community 448"
+Cohesion: 1.0
+Nodes (1): Rename the display name in STRATEGY_META for a strategy.
+
+### Community 449 - "Community 449"
+Cohesion: 1.0
+Nodes (1): Non-blocking dolt pull in all Dolthub repos. Logs warnings on failure.
+
+### Community 450 - "Community 450"
+Cohesion: 1.0
+Nodes (1): Start a backtest asynchronously.
+
+### Community 451 - "Community 451"
+Cohesion: 1.0
+Nodes (1): Check status of a running backtest.
+
+### Community 452 - "Community 452"
+Cohesion: 1.0
+Nodes (1): Start an Optuna optimization as a background task.
+
+### Community 453 - "Community 453"
+Cohesion: 1.0
+Nodes (1): List saved optimization results.
+
+### Community 454 - "Community 454"
+Cohesion: 1.0
+Nodes (1): Return the full persisted optimization payload.
+
+### Community 455 - "Community 455"
+Cohesion: 1.0
+Nodes (1): Create a new portfolio with risk-sized trade simulation.
+
+### Community 456 - "Community 456"
+Cohesion: 1.0
+Nodes (1): Get portfolio details.
+
+### Community 457 - "Community 457"
+Cohesion: 1.0
+Nodes (1): Compare multiple portfolios.
+
+### Community 458 - "Community 458"
+Cohesion: 1.0
+Nodes (1): List available log files.
+
+### Community 459 - "Community 459"
+Cohesion: 1.0
+Nodes (1): Get last N lines of a log file, optionally filtered by level.
+
+### Community 460 - "Community 460"
+Cohesion: 1.0
+Nodes (1): Get Buy & Hold equity curve for a symbol (benchmark comparison).
+
+### Community 461 - "Community 461"
+Cohesion: 1.0
+Nodes (1): Return available symbols grouped by category for autocomplete.
+
+### Community 462 - "Community 462"
+Cohesion: 1.0
+Nodes (1): Derive asset category from file path.
+
+### Community 463 - "Community 463"
+Cohesion: 1.0
+Nodes (1): Scan ~/data/ohlcv/ when no catalog cache is available.
+
+### Community 464 - "Community 464"
+Cohesion: 1.0
+Nodes (1): Load cached OHLCV catalog entries if catalog.json is available.
+
+### Community 465 - "Community 465"
+Cohesion: 1.0
+Nodes (1): Compute recursive directory size in bytes.
+
+### Community 466 - "Community 466"
+Cohesion: 1.0
+Nodes (1): Rebuild the data catalog after file mutations.
+
+### Community 467 - "Community 467"
+Cohesion: 1.0
+Nodes (1): Launch a background data-management subprocess with streamed task logs.
+
+### Community 468 - "Community 468"
+Cohesion: 1.0
+Nodes (1): Register the autonomous conversion agent before the worker thread launches.
+
+### Community 469 - "Community 469"
+Cohesion: 1.0
+Nodes (1): Scan ~/data/dolthub repos and return size metadata.
+
+### Community 470 - "Community 470"
+Cohesion: 1.0
+Nodes (1): Return summary of available data categories.
+
+### Community 471 - "Community 471"
+Cohesion: 1.0
+Nodes (1): Return detailed symbol list for a category.
+
+### Community 472 - "Community 472"
+Cohesion: 1.0
+Nodes (1): Start a background download task.
+
+### Community 473 - "Community 473"
+Cohesion: 1.0
+Nodes (1): Start the autonomous strategy conversion worker.
+
+### Community 474 - "Community 474"
+Cohesion: 1.0
+Nodes (1): Return discovered Dukascopy genesis dates for one or more symbols.
+
+### Community 475 - "Community 475"
+Cohesion: 1.0
+Nodes (1): Start a background resample task.
+
+### Community 476 - "Community 476"
+Cohesion: 1.0
+Nodes (1): Return recent data tasks with progress and control metadata.
+
+### Community 477 - "Community 477"
+Cohesion: 1.0
+Nodes (1): Get status of a background task.
+
+### Community 478 - "Community 478"
+Cohesion: 1.0
+Nodes (1): Pause a controllable background task.
+
+### Community 479 - "Community 479"
+Cohesion: 1.0
+Nodes (1): Resume a paused background task.
+
+### Community 480 - "Community 480"
+Cohesion: 1.0
+Nodes (1): Cancel a controllable background task.
+
+### Community 481 - "Community 481"
+Cohesion: 1.0
+Nodes (1): Return the full task log for a background data-management job.
+
+### Community 482 - "Community 482"
+Cohesion: 1.0
+Nodes (1): Remove a finished task from the in-memory task registry.
+
+### Community 483 - "Community 483"
+Cohesion: 1.0
+Nodes (1): Delete a specific data file.
+
+### Community 484 - "Community 484"
+Cohesion: 1.0
+Nodes (1): Downsample a numeric series while preserving extremes.      Produces up to ~2*
+
+### Community 485 - "Community 485"
+Cohesion: 1.0
+Nodes (1): Downsample equity curve points while preserving drawdowns/peaks.      Input po
+
+### Community 486 - "Community 486"
+Cohesion: 1.0
+Nodes (1): Review Commit Merge Agent
+
+### Community 487 - "Community 487"
+Cohesion: 1.0
+Nodes (1): Signal Bot Converter Agent
+
+### Community 488 - "Community 488"
+Cohesion: 1.0
+Nodes (1): Strategy Conversion Agent
+
+### Community 489 - "Community 489"
+Cohesion: 1.0
+Nodes (1): Data Sources Document
+
+### Community 490 - "Community 490"
+Cohesion: 1.0
+Nodes (1): Optuna Implementation Guide
+
+### Community 491 - "Community 491"
+Cohesion: 1.0
+Nodes (1): Python Requirements
+
+### Community 492 - "Community 492"
+Cohesion: 1.0
+Nodes (1): Qodo Test Report
+
+### Community 493 - "Community 493"
+Cohesion: 1.0
+Nodes (1): Platform Overview
+
+### Community 494 - "Community 494"
+Cohesion: 1.0
+Nodes (1): Status Check
+
+### Community 495 - "Community 495"
+Cohesion: 1.0
+Nodes (1): Migration Guide
+
+### Community 496 - "Community 496"
+Cohesion: 1.0
+Nodes (1): Custom Swings Supertrend Strategy
+
+### Community 497 - "Community 497"
+Cohesion: 1.0
+Nodes (1): DEMA RSI Strategy
+
+### Community 498 - "Community 498"
+Cohesion: 1.0
+Nodes (1): QG 30min ES Breakout Strategy
+
+### Community 499 - "Community 499"
+Cohesion: 1.0
+Nodes (1): Viewer Static Index
+
 ## Knowledge Gaps
-- **916 isolated node(s):** `file-explorer`, `global-search`, `switcher`, `graph`, `backlink` (+911 more)
+- **568 isolated node(s):** `Remove duplicate LiveExecution rows from the live_executions table.  Duplicates`, `Delete duplicate live_executions rows, keeping the oldest row per group.      Re`, `Strategy comparison logic — ported from custom_lean_integration/compare_strategi`, `Period-over-period returns from an equity series.`, `Drawdown percentage series from equity values.` (+563 more)
   These have ≤1 connection - possible missing edges or undocumented components.
-- **45 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
+- **Thin community `Community 29`** (12 nodes): `queries.ts`, `StrategiesProvider.tsx`, `useLivePositions()`, `useLiveQuotes()`, `useLiveSignalLog()`, `useServiceLogs()`, `useServices()`, `useStrategies()`, `useStrategyDetail()`, `useSymbols()`, `useUpdateServiceStatus()`, `StrategiesProvider()`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 37`** (8 nodes): `_capture_viewer_logs()`, `_CaptureHandler`, `.emit()`, `.__init__()`, `test_request_middleware_logs_500_with_traceback()`, `test_request_middleware_logs_non_api_request()`, `test_request_middleware_uses_debug_for_quiet_polling_paths()`, `test_request_logging_middleware.py`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 53`** (3 nodes): `main()`, `@pyne Opening Range Breakout Strategy (PyneCore). Converted from NinjaTrader 8 (`, `pynecore_orb.py`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 54`** (3 nodes): `trend_following.py`, `generate_signals()`, `Strategy: Trend Following (Multi-Timeframe Momentum)  CTA-style trend following`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 55`** (3 nodes): `generate_signals()`, `Generate signals for EMA Crossover strategy.     Entry: EMA(9) crosses above EMA`, `ema_crossoiver_conversion_test.py`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 56`** (3 nodes): `generate_signals()`, `Strategy: Cross-Asset Momentum (Time-Series)  Time-series momentum applied acros`, `cross_asset_momentum.py`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 57`** (3 nodes): `generate_signals()`, `Strategy: Risk Parity (Simplified)  Equal-risk allocation across multiple asset`, `risk_parity.py`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 58`** (3 nodes): `generate_signals()`, `Strategy: Sector Rotation (Relative Momentum)  Rotates allocation among US secto`, `sector_rotation.py`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 59`** (3 nodes): `generate_signals()`, `Statistical Arbitrage Pairs Trading Strategy  Simplified pairs trading: Z-score`, `stat_arb_pairs.py`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 60`** (3 nodes): `volatility_breakout.py`, `generate_signals()`, `Strategy: Intraday Volatility Breakout  Simple breakout strategy: if price moves`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 61`** (3 nodes): `main()`, `@pyne SMA Crossover — PyneCore-Format Strategie. Einfache Trend-Following Strate`, `pynecore_sma_crossover.py`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 62`** (3 nodes): `generate_signals()`, `Intraday Channel Breakout Strategy  N-Bar High/Low channel breakout with 200 EMA`, `channel_breakout.py`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 63`** (3 nodes): `generate_signals()`, `Generate signals for EMA Crossover strategy.     Entry: Fast EMA crosses above S`, `lab_generated_strategy.py`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 64`** (3 nodes): `generate_signals()`, `Strategy: Short-Term Reversal  Exploits weekly mean reversion: stocks that dropp`, `short_term_reversal.py`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 65`** (3 nodes): `generate_signals()`, `Strategy: Mean Reversion (RSI + Bollinger Bands)  Mean reversion strategy using`, `mean_reversion_rsi_bb.py`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 66`** (3 nodes): `generate_signals()`, `Strategy: Gold Momentum (Multi-Timeframe)  Multi-timeframe momentum strategy for`, `gold_momentum.py`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 87`** (2 nodes): `Live Deployments Example Config`, `Live Trading Screenshot`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 88`** (2 nodes): `PR Orchestrator Skill`, `PR Loop Research`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 89`** (2 nodes): `Strategy QA Report`, `Strategy Triage`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 90`** (2 nodes): `Frontend Progress`, `Frontend Design Plan`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 91`** (2 nodes): `EMA Crossover Conversion Test`, `Lab Generated Strategy`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 92`** (2 nodes): `Pine SuperOsc VuManChu Strategy`, `Pine Supertrend DEMA Strategy`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 93`** (2 nodes): `PyneCore ORB Strategy`, `PyneCore SMA Crossover Strategy`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 94`** (2 nodes): `Vite Logo SVG`, `React Logo SVG`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 95`** (2 nodes): `Logging Guide`, `Logging Screenshot`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 122`** (1 nodes): `Short identifier, e.g. 'histdata', 'dolthub', 'huggingface'.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 123`** (1 nodes): `List datasets available for download.          Returns list of dicts with at lea`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 124`** (1 nodes): `Download OHLCV data for one symbol/timeframe and save as Parquet.          Args:`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 129`** (1 nodes): `Time of the final exit.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 130`** (1 nodes): `Generate filename: {strategy}_{engine}_{YYYYMMDD-HHmmss}.json`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 134`** (1 nodes): `In-memory, thread-safe cache for catalog and overview metadata.  This module i`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 135`** (1 nodes): `Load catalog.json directly when available to avoid a full filesystem rescan.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 136`** (1 nodes): `Return cached catalog payload, lazily building on first read.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 137`** (1 nodes): `Return cached catalog OHLCV entries.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 138`** (1 nodes): `Return cached overview metadata derived from the catalog.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 139`** (1 nodes): `Invalidate cache entries globally or for a specific data directory.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 140`** (1 nodes): `Invalidate cache after a successful download mutation.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 141`** (1 nodes): `Invalidate cache after a successful resample mutation.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 142`** (1 nodes): `Return cache hit/miss/invalidation stats for observability.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 143`** (1 nodes): `Scan ~/data/ and produce catalog.json — a machine-readable manifest of all avai`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 144`** (1 nodes): `Load source metadata index if it exists.      The file maps dataset keys (e.g.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 145`** (1 nodes): `Load the previous catalog to reuse unchanged file metadata.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 146`** (1 nodes): `Determine storage mode: local, cached, or remote.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 147`** (1 nodes): `Run data validation checks and return summary dict.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 148`** (1 nodes): `Parse an OHLCV parquet path into source/asset_class/symbol/timeframe fields.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 149`** (1 nodes): `Read parquet metadata and timestamp bounds without loading the full file.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 150`** (1 nodes): `Scan ohlcv/ subdirectory and return dataset entries.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 151`** (1 nodes): `Scan universes/ subdirectory.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 152`** (1 nodes): `Scan fundamentals/ subdirectory for non-OHLCV datasets.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 153`** (1 nodes): `Build the full catalog dict.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 154`** (1 nodes): `List tables in a dolt repo using 'dolt sql -r csv'.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 155`** (1 nodes): `Export a dolt table to CSV using 'dolt table export'.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 156`** (1 nodes): `Return the canonical OHLCV output path and migrate legacy flat exports.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 157`** (1 nodes): `Alpaca historical stock bars downloader.  Canonical output path:   {output_di`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 158`** (1 nodes): `Base classes for data downloaders.  All downloaders implement the Downloader A`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 159`** (1 nodes): `Result of a single download operation.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 160`** (1 nodes): `Metadata about a data source for catalog integration.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 161`** (1 nodes): `Abstract base class for all data downloaders.      Each downloader knows how t`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 162`** (1 nodes): `Short identifier, e.g. 'histdata', 'dolthub', 'huggingface'.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 163`** (1 nodes): `List datasets available for download.          Returns list of dicts with at l`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 164`** (1 nodes): `Download OHLCV data for one symbol/timeframe and save as Parquet.          Arg`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 165`** (1 nodes): `Return metadata about this source for catalog integration.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 166`** (1 nodes): `Build standardised output path: {output_dir}/ohlcv/{source}/{asset_class}/{symbo`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 167`** (1 nodes): `Return requested start or latest stored timestamp for smart resume.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 168`** (1 nodes): `Persist data in a single parquet file per symbol/timeframe.          If the fi`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 169`** (1 nodes): `Read max timestamp from an existing parquet without loading full OHLCV payload.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 170`** (1 nodes): `cTrader Downloader — tick/minute data from cTrader via cTrader Open API.  Port`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 171`** (1 nodes): `Downloads data from cTrader Open API or CSV exports.      Since cTrader Open A`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 172`** (1 nodes): `Args:             csv_dir: Directory containing cTrader CSV exports. If provide`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 173`** (1 nodes): `Load cTrader CSV export.          cTrader exports have various formats — try c`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 174`** (1 nodes): `Dolthub Downloader — datasets from DoltHub repositories.  DoltHub hosts versio`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 175`** (1 nodes): `Downloads data from DoltHub SQL repositories via REST API.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 176`** (1 nodes): `Native Python Dukascopy Downloader — async .bi5 fetcher with LZMA decompression.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 177`** (1 nodes): `Raised when a controlled download is cancelled by the caller.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 178`** (1 nodes): `Generate hourly tick-data URLs. CRITICAL: months are 0-based in URLs.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 179`** (1 nodes): `Generate daily minute-candle URLs. Months are 0-based.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 180`** (1 nodes): `Check if response is HTML error page instead of binary data.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 181`** (1 nodes): `Download a single .bi5 file with rate-limit awareness.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 182`** (1 nodes): `Download .bi5 files asynchronously in controllable batches.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 183`** (1 nodes): `Decompress LZMA .bi5 data. Returns empty bytes on failure.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 184`** (1 nodes): `Parse raw tick binary: (timestamp, ask, bid, ask_vol, bid_vol).`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 185`** (1 nodes): `Parse raw candle binary: (timestamp, open, high, low, close, volume).      Not`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 186`** (1 nodes): `Decompress and parse tick data into a DataFrame.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 187`** (1 nodes): `Decompress and parse minute candle data into a DataFrame.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 188`** (1 nodes): `Resample tick data to OHLCV for a given timeframe and price type.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 189`** (1 nodes): `Resample minute candle data to higher timeframe.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 190`** (1 nodes): `Download both bid and ask ticks, merge into a single DataFrame.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 191`** (1 nodes): `Pure Python async Dukascopy downloader — no Node.js dependency.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 192`** (1 nodes): `Synchronous wrapper around the async download pipeline.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 193`** (1 nodes): `Histdata Downloader — free Forex minute/tick data from histdata.com.  Download`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 194`** (1 nodes): `Downloads free Forex minute data from histdata.com.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 195`** (1 nodes): `Download one year of M1 data from histdata.com.          histdata.com requires`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 196`** (1 nodes): `Resample 1m data to a higher timeframe.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 197`** (1 nodes): `HuggingFace OHLCV downloader for mito0o852/OHLCV-1m.  The upstream dataset is`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 198`** (1 nodes): `JForex Downloader — Dukascopy historical data via JForex Java SDK (JPype bridge)`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 199`** (1 nodes): `Start JVM and validate core JForex SDK imports once at app startup.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 200`** (1 nodes): `Dukascopy downloader using JForex Java SDK over JPype.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 201`** (1 nodes): `Convenience function for direct module-level downloads.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 202`** (1 nodes): `Yahoo Finance downloader for US equity OHLCV data.  Stores data under canonica`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 203`** (1 nodes): `Discover earliest available Dukascopy dates ("genesis") for one or more symbols.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 204`** (1 nodes): `Return True when Dukascopy provides data for the given symbol/day.      Downlo`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 205`** (1 nodes): `Discover the earliest Dukascopy date available for a symbol/timeframe.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 206`** (1 nodes): `Discover genesis dates for multiple Dukascopy symbols/timeframes.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 207`** (1 nodes): `Migrate existing CSV data to the central ~/data/ directory as Parquet.  Source`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 208`** (1 nodes): `Migrate XAUUSD H1 and M15 CSVs from lean integration.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 209`** (1 nodes): `Migrate US equity H1 CSVs (730d files).`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 210`** (1 nodes): `Migrate US equity M15 CSVs.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 211`** (1 nodes): `Migrate daily equity CSVs from lean integration/data/equity/.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 212`** (1 nodes): `Migrate stockkit 5-min equity CSVs.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 213`** (1 nodes): `Copy SP500 universe file.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 214`** (1 nodes): `Check if a string looks like a timestamp (starts with digit, contains '-').`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 215`** (1 nodes): `Convert a single OHLCV CSV to Parquet.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 216`** (1 nodes): `Resample Tool — Generate higher timeframes from lower ones.  Given M1 (or any`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 217`** (1 nodes): `Resample OHLCV DataFrame to a higher timeframe.      Args:         df: DataFr`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 218`** (1 nodes): `Resample a single parquet file to multiple timeframes.      Args:         sou`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 219`** (1 nodes): `Resample all parquet files in a directory tree.      Finds all {from_tf}.parqu`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 220`** (1 nodes): `Rebuild the catalog after resampling.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 221`** (1 nodes): `Load replay signals from a CSV file.      Returns dict payloads compatible wit`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 222`** (1 nodes): `Data Validation — automated quality checks for OHLCV Parquet files.  Checks:`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 223`** (1 nodes): `Result of validating a single Parquet file.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 224`** (1 nodes): `Compact summary for catalog integration.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 225`** (1 nodes): `Validate a single OHLCV Parquet file.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 226`** (1 nodes): `Validate all Parquet files in the OHLCV directory.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 227`** (1 nodes): `Live trading runner package.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 228`** (1 nodes): `Discover Alpaca account details for one credential set.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 229`** (1 nodes): `Resolve a display name for a cTrader account.      Priority:     1) Use a hum`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 230`** (1 nodes): `Discover all cTrader accounts linked to an access token.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 231`** (1 nodes): `Resolve Alpaca credentials from env (default or ACC{N} blocks).`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 232`** (1 nodes): `Live adapter for Alpaca trading + trade update streaming.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 233`** (1 nodes): `Initialize REST and websocket clients, and verify account access.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 234`** (1 nodes): `Return open positions with pricing and unrealized PnL.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 235`** (1 nodes): `Abstract broker adapter for live order routing and fill streaming.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 236`** (1 nodes): `Initialize broker REST/stream clients and validate connectivity.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 237`** (1 nodes): `Submit an order for the given signal and return broker order id.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 238`** (1 nodes): `Block and listen for execution updates, persisting fills to storage.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 239`** (1 nodes): `Return current account (balance, equity).`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 240`** (1 nodes): `cTrader live adapter backed by OpenApiPy.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 241`** (1 nodes): `Initialize source connections/resources.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 242`** (1 nodes): `Close source connections/resources.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 243`** (1 nodes): `Yield parsed trade signals from this source.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 244`** (1 nodes): `Raised when discord.py fails with terminal authentication errors.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 245`** (1 nodes): `Wait until the next candle close for the given timeframe.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 246`** (1 nodes): `Autonomous strategy-conversion worker with pluggable LLM providers.  This modu`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 247`** (1 nodes): `Convert raw strategy code into a runnable strategy and validate it via backtest.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 248`** (1 nodes): `CAPM helper functions for strategy-vs-benchmark regression analysis.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 249`** (1 nodes): `Align strategy and benchmark return series on common timestamps.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 250`** (1 nodes): `Compute CAPM regression metrics from aligned return series.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 251`** (1 nodes): `Backtest Runner CLI — unified interface to run backtests on any engine.  Usage`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 252`** (1 nodes): `Get an engine adapter by name.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 253`** (1 nodes): `Auto-detect date range from available OHLCV data files.      For multiple symb`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 254`** (1 nodes): `List available engines.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 255`** (1 nodes): `CLI to convert backtest results from various engines to the universal format.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 256`** (1 nodes): `Convert a file using the specified engine converter.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 257`** (1 nodes): `List available converters.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 258`** (1 nodes): `Convert LEAN Engine backtest results to the universal trade format.  Reads LEA`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 259`** (1 nodes): `Convert a LEAN backtest JSON to a BacktestResult.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 260`** (1 nodes): `Pair LEAN orders into entry/exit trades.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 261`** (1 nodes): `Extract metadata from LEAN output.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 262`** (1 nodes): `Extract equity curve if available in LEAN output.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 263`** (1 nodes): `Extract clean ticker from LEAN symbol value like 'AAPL 2T' → 'AAPL'.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 264`** (1 nodes): `Normalize ISO timestamp to consistent format.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 265`** (1 nodes): `Convert Stockkit AI Bot trade CSVs to the universal trade format.  Stockkit us`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 266`** (1 nodes): `Convert a Stockkit trade CSV to a BacktestResult.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 267`** (1 nodes): `Read semicolon-separated Stockkit CSV.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 268`** (1 nodes): `Convert CSV rows to Trade objects, handling partial exits.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 269`** (1 nodes): `Parse stockkit date/time to ISO format.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 270`** (1 nodes): `Engine Adapter Interface — abstract base for all backtest engines.  Every engi`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 271`** (1 nodes): `Configuration passed to any engine adapter.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 272`** (1 nodes): `Merge STRATEGY_META.parameters defaults with explicit overrides.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 273`** (1 nodes): `Abstract base class for backtest engine adapters.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 274`** (1 nodes): `Short engine identifier, e.g. 'vectorbt', 'lean'.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 275`** (1 nodes): `Execute a backtest and return the result in universal format.          Args:`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 276`** (1 nodes): `Optional validation. Returns list of error messages (empty = valid).         De`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 277`** (1 nodes): `LEAN Engine Adapter — runs strategies through QuantConnect LEAN.  This adapter`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 278`** (1 nodes): `Adapter for QuantConnect LEAN backtesting engine.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 279`** (1 nodes): `Run a LEAN backtest.          strategy_path should point to a LEAN algorithm f`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 280`** (1 nodes): `Write LEAN backtest config JSON.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 281`** (1 nodes): `Execute LEAN backtest via subprocess.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 282`** (1 nodes): `Find the LEAN result JSON in output directory.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 283`** (1 nodes): `PyneCore Engine Adapter — runs Pine-style Python strategies via PyneCore.  Dat`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 284`** (1 nodes): `Adapter for PyneCore-based Pine-style backtesting.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 285`** (1 nodes): `Find and load OHLCV parquet for a symbol.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 286`** (1 nodes): `Higher-level replay engine with optional yfinance auto-download fallback.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 287`** (1 nodes): `vectorbt Engine Adapter — runs Python strategies using vectorized signals.  Pr`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 288`** (1 nodes): `Return True if generate_signals uses keyword-argument style (not params dict).`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 289`** (1 nodes): `Call generate_signals with dict-style or kwargs-style depending on signature.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 290`** (1 nodes): `Process a single symbol: load data, generate signals, extract trades.      Ret`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 291`** (1 nodes): `Adapter for vectorbt-style vectorized backtesting.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 292`** (1 nodes): `Shift strategy output by one bar so signal bars execute on the next bar open.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 293`** (1 nodes): `Find and load OHLCV parquet for a symbol.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 294`** (1 nodes): `Statistics module — computes performance metrics from a list of Trades.  Uses`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 295`** (1 nodes): `Compute comprehensive performance metrics from a list of trades.      Args:`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 296`** (1 nodes): `Convenience: compute stats from a BacktestResult.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 297`** (1 nodes): `Convert EquityPoint list to a pandas Series of returns with datetime index.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 298`** (1 nodes): `Attach an inferred frequency when the datetime index is regular.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 299`** (1 nodes): `Infer observations per year from equity-curve timestamps.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 300`** (1 nodes): `Annualize a total return using the inferred observation frequency.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 301`** (1 nodes): `Avoid exploding Calmar ratios when drawdown is effectively zero.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 302`** (1 nodes): `Safely call a quantstats function, returning 0.0 on failure.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 303`** (1 nodes): `Compute max consecutive wins (positive=True) or losses (positive=False).`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 304`** (1 nodes): `Compute max drawdown as a positive fraction (0.05 = 5%).`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 305`** (1 nodes): `Compute max drawdown duration in periods.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 306`** (1 nodes): `Compute period-over-period returns.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 307`** (1 nodes): `Compute daily returns from an equity curve, falling back to raw period returns.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 308`** (1 nodes): `Compute the one-sided p-value for mean returns > 0; return 1.0 on failure.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 309`** (1 nodes): `Annualized Sharpe ratio (manual).`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 310`** (1 nodes): `Annualized Sortino ratio (manual).`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 311`** (1 nodes): `Probabilistic Sharpe Ratio using returns series (QuantStats path).     PSR = Φ(`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 312`** (1 nodes): `PSR from raw returns list (manual fallback). Uses per-observation SR.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 313`** (1 nodes): `Core PSR formula: Φ((SR - SR*) × √(n-1) / √(1 - skew×SR + ((kurt-1)/4)×SR²))`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 314`** (1 nodes): `Shared constants for the trading platform.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 315`** (1 nodes): `Normalize timeframe aliases to canonical values.      Returns canonical values`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 316`** (1 nodes): `Return the best available dukascopy_genesis.json path.      Prefers runtime fi`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 317`** (1 nodes): `Resolve an executable path, handling Windows .cmd/.bat extensions.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 318`** (1 nodes): `Centralized logging module for trading-platform services.  Provides structured`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 319`** (1 nodes): `Formats log records as structured JSON.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 320`** (1 nodes): `Create or return a logger for the given service.      Each service gets:`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 321`** (1 nodes): `Shared data models for the universal trade format.  Defines the canonical JSON`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 322`** (1 nodes): `Metadaten für eine Strategie (unabhängig vom Backtest).`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 323`** (1 nodes): `Live account configuration stored in DB and used by API payloads.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 324`** (1 nodes): `Discovered broker account payload exposed to the frontend.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 325`** (1 nodes): `Live deployment record (strategy + account + market + runtime status).`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 326`** (1 nodes): `Payload for creating a live deployment via API.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 327`** (1 nodes): `Payload for updating a deployment runtime status via API.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 328`** (1 nodes): `Intent emitted by strategy logic before broker execution.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 329`** (1 nodes): `Execution fill received from broker for a previously emitted signal.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 330`** (1 nodes): `Periodic balance/equity snapshot for a live broker account.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 331`** (1 nodes): `A weighted strategy component inside a multi-strategy portfolio.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 332`** (1 nodes): `Persisted portfolio payload shared across API and storage layers.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 333`** (1 nodes): `A single (partial) exit from a position.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 334`** (1 nodes): `One position from entry to full close. Supports partial exits.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 335`** (1 nodes): `Time of the final exit.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 336`** (1 nodes): `Metadata about a backtest run.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 337`** (1 nodes): `Time-series indicator data for viewer display.      - type "overlay": drawn on`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 338`** (1 nodes): `Canonical backtest statistics shared across runner and viewer layers.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 339`** (1 nodes): `Canonical portfolio statistics for persisted combined portfolio metrics.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 340`** (1 nodes): `Complete backtest output: meta + trades + optional equity_curve + stats.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 341`** (1 nodes): `Save to JSON file. Returns the path written to.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 342`** (1 nodes): `Generate filename: {strategy}_{engine}_{YYYYMMDD-HHmmss}.json`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 343`** (1 nodes): `Helpers for discovering and editing strategy assets.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 344`** (1 nodes): `Reusable signal processor packages.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 345`** (1 nodes): `Nitro processor: RamJet formulas, but BUY-only signal intake.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 346`** (1 nodes): `RamJet signal-processor package.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 347`** (1 nodes): `RamJet signal processor with formula-identical SL/TP logic.      Ported from ``
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 348`** (1 nodes): `RocketFuel RSI strategy processor (ATR hard-stop, optional short entry).`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 349`** (1 nodes): `Intraday Channel Breakout Strategy  N-Bar High/Low channel breakout with 200 E`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 350`** (1 nodes): `Strategy: Cross-Asset Momentum (Time-Series)  Time-series momentum applied acr`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 351`** (1 nodes): `Project-usable core port of the Pine Script strategy "Custom Swings + Supertrend`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 352`** (1 nodes): `True Range → Wilder's ATR (equivalent to ta.atr in Pine).`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 353`** (1 nodes): `Supertrend — mirrors Pine Script logic exactly.      Returns:         trend`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 354`** (1 nodes): `Generate Long/Short signals for the Custom Swings + Supertrend strategy.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 355`** (1 nodes): `Generate signals for EMA Crossover strategy.     Entry: EMA(9) crosses above EM`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 356`** (1 nodes): `Strategy: Gold Momentum (Multi-Timeframe)  Multi-timeframe momentum strategy f`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 357`** (1 nodes): `Generate signals for EMA Crossover strategy.     Entry: Fast EMA crosses above`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 358`** (1 nodes): `Strategy: Mean Reversion (RSI + Bollinger Bands)  Mean reversion strategy usin`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 359`** (1 nodes): `Strategy: SuperOSC + VuManChu WaveTrend (Pine Script Conversion)  Combines a S`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 360`** (1 nodes): `Strategy: Supertrend + DEMA (Pine Script Conversion)  Combines Supertrend indi`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 361`** (1 nodes): `Strategy: Post VIX Dip Buy  Buys SPY on panic dips: when VIX spikes significan`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 362`** (1 nodes): `@pyne Opening Range Breakout Strategy (PyneCore). Converted from NinjaTrader 8`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 363`** (1 nodes): `@pyne SMA Crossover — PyneCore-Format Strategie. Einfache Trend-Following Stra`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 364`** (1 nodes): `QG-30Min ES Breakout Strategy (Pine v6 conversion).`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 365`** (1 nodes): `Strategy: Risk Parity (Simplified)  Equal-risk allocation across multiple asse`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 366`** (1 nodes): `Strategy: Sector Rotation (Relative Momentum)  Rotates allocation among US sec`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 367`** (1 nodes): `Strategy: Short-Term Reversal  Exploits weekly mean reversion: stocks that dro`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 368`** (1 nodes): `Statistical Arbitrage Pairs Trading Strategy  Simplified pairs trading: Z-scor`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 369`** (1 nodes): `Strategy: Trend Following (Multi-Timeframe Momentum)  CTA-style trend followin`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 370`** (1 nodes): `Strategy: Intraday Volatility Breakout  Simple breakout strategy: if price mov`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 371`** (1 nodes): `Metrics Validation: runner.stats vs QuantStats ================================`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 372`** (1 nodes): `Convert equity list to daily returns pd.Series.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 373`** (1 nodes): `# NOTE: QuantStats expects the ANNUAL rf — it deannualizes internally.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 374`** (1 nodes): `Regression-Test fuer Strategie: Channel Breakout  Smoke-Test: stellt sicher, d`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 375`** (1 nodes): `Regression-Test fuer Strategie: Cross-Asset Momentum  Smoke-Test: stellt siche`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 376`** (1 nodes): `Regression-Test für Strategie: Custom Swings + Supertrend  Smoke-Test: stellt`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 377`** (1 nodes): `Anzahl der Trades darf sich nicht verändern.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 378`** (1 nodes): `Net Profit darf sich nicht wesentlich verändern (Toleranz: 0.5 $).`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 379`** (1 nodes): `generate_signals muss exakt 4 Elemente zurückgeben (entries, exits, indicators_d`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 380`** (1 nodes): `generate_signals muss konfigurierbare Parameter mit Default-Werten in der Signat`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 381`** (1 nodes): `Jeder Trade muss sl_price in meta haben (Risk-Sizing-Kontrolle).`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 382`** (1 nodes): `Kein Trade darf mehr als 1.5% des Eigenkapitals riskieren.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 383`** (1 nodes): `indicators_dict muss stop_loss, atr und direction enthalten.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 384`** (1 nodes): `STRATEGY_META muss alle Pflichtfelder enthalten.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 385`** (1 nodes): `Regression-Test fuer Strategie: Gold Momentum  Smoke-Test: stellt sicher, dass`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 386`** (1 nodes): `Regression-Test fuer Strategie: Mean Reversion RSI+BB  Smoke-Test: stellt sich`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 387`** (1 nodes): `Regression-Test fuer Strategie: SuperOSC + VuManChu  Smoke-Test: stellt sicher`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 388`** (1 nodes): `Regression-Test fuer Strategie: Supertrend + DEMA  Smoke-Test: stellt sicher,`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 389`** (1 nodes): `Regression-Test fuer Strategie: Post VIX Dip Buy  Smoke-Test: stellt sicher, d`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 390`** (1 nodes): `Regression-Test fuer Strategie: Opening Range Breakout  Smoke-Test: stellt sic`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 391`** (1 nodes): `Regression-Test fuer Strategie: SMA Crossover (PyneCore)  Smoke-Test: stellt s`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 392`** (1 nodes): `Regression-Test fuer Strategie: QG-30Min ES Breakout Strategy  Smoke-Test: ste`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 393`** (1 nodes): `Regression-Test fuer Strategie: Risk Parity  Smoke-Test: stellt sicher, dass z`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 394`** (1 nodes): `Regression-Test fuer Strategie: Sector Rotation  Smoke-Test: stellt sicher, da`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 395`** (1 nodes): `Regression-Test fuer Strategie: Short Term Reversal  Smoke-Test: stellt sicher`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 396`** (1 nodes): `Regression-Test fuer Strategie: Statistical Arbitrage Pairs  Smoke-Test: stell`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 397`** (1 nodes): `Regression-Test fuer Strategie: Trend Following  Smoke-Test: stellt sicher, da`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 398`** (1 nodes): `Regression-Test fuer Strategie: Volatility Breakout  Smoke-Test: stellt sicher`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 399`** (1 nodes): `Tests for the FastAPI endpoints in viewer/main.py.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 400`** (1 nodes): `Create a test FastAPI app client.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 401`** (1 nodes): `Tests for the autonomous strategy conversion worker.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 402`** (1 nodes): `Tests for data_tools.cache_manager.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 403`** (1 nodes): `Create a minimal data directory for testing.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 404`** (1 nodes): `Tests for data_tools.dukascopy_discovery.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 405`** (1 nodes): `Return a probe_single_day drop-in that answers from a local genesis dict.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 406`** (1 nodes): `Tests for shared.models — universal trade format.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 407`** (1 nodes): `Tests for data_tools/resample.py.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 408`** (1 nodes): `Create a sample 1-minute OHLCV DataFrame.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 409`** (1 nodes): `Create a sample 1-hour OHLCV DataFrame.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 410`** (1 nodes): `Verify OHLCV aggregation rules: O=first, H=max, L=min, C=last, V=sum.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 411`** (1 nodes): `Test resampling a parquet file.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 412`** (1 nodes): `Test resampling to multiple timeframes.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 413`** (1 nodes): `Tests for runner.stats — performance metrics calculation.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 414`** (1 nodes): `Helper: minimal trade with given PnL.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 415`** (1 nodes): `Focused tests for newer viewer data-management features.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 416`** (1 nodes): `Strategy comparison logic — ported from custom_lean_integration/compare_strategi`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 417`** (1 nodes): `Period-over-period returns from an equity series.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 418`** (1 nodes): `Drawdown percentage series from equity values.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 419`** (1 nodes): `Pearson correlation coefficient.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 420`** (1 nodes): `Align two [time, value] series to common timestamps.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 421`** (1 nodes): `50/50 combined equity curve from two aligned series.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 422`** (1 nodes): `Stats for the combined 50/50 portfolio.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 423`** (1 nodes): `Compare multiple backtest results.      Parameters     ----------     strate`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 424`** (1 nodes): `Shared viewer helper logic used by the FastAPI backend in `viewer/main.py`.  T`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 425`** (1 nodes): `Convert ISO 8601 string to Unix timestamp (seconds).`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 426`** (1 nodes): `Convert a Universal Format Trade to viewer-friendly flat format.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 427`** (1 nodes): `Find and load OHLCV parquet for a symbol+timeframe.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 428`** (1 nodes): `Convert OHLCV DataFrame to list of dicts with Unix timestamps.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 429`** (1 nodes): `Extract equity curve as [{time, equity}] with Unix timestamps.     If no equity`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 430`** (1 nodes): `Use persisted runner stats when available, otherwise compute canonical fallbacks`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 431`** (1 nodes): `Build lightweight list-card stats from persisted runner stats when available.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 432`** (1 nodes): `List all available backtest result files.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 433`** (1 nodes): `Load a specific backtest result (raw format).`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 434`** (1 nodes): `Update the display title stored in meta.notes for a backtest.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 435`** (1 nodes): `Metadata for topbar display.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 436`** (1 nodes): `Compute stats for a backtest.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 437`** (1 nodes): `Viewer-format trade list (flattened, unix timestamps).`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 438`** (1 nodes): `Detect indicators used by a strategy from source code with basic parameter extra`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 439`** (1 nodes): `Compute indicator values from OHLCV DataFrame for given time range.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 440`** (1 nodes): `Convert a pandas Series to time/value points filtered to the OHLCV window.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 441`** (1 nodes): `Single trade with OHLCV context (BARS_BEFORE/AFTER around entry).`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 442`** (1 nodes): `Equity curve data for chart.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 443`** (1 nodes): `Full OHLCV data for all symbols in this backtest.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 444`** (1 nodes): `Full comparison with combined equity, drawdowns, correlations.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 445`** (1 nodes): `Extract default parameters from a strategy file via AST analysis.      Priorit`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 446`** (1 nodes): `List all strategies by scanning strategy files for STRATEGY_META.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 447`** (1 nodes): `Strategy details + all backtests and portfolios using it.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 448`** (1 nodes): `Rename the display name in STRATEGY_META for a strategy.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 449`** (1 nodes): `Non-blocking dolt pull in all Dolthub repos. Logs warnings on failure.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 450`** (1 nodes): `Start a backtest asynchronously.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 451`** (1 nodes): `Check status of a running backtest.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 452`** (1 nodes): `Start an Optuna optimization as a background task.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 453`** (1 nodes): `List saved optimization results.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 454`** (1 nodes): `Return the full persisted optimization payload.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 455`** (1 nodes): `Create a new portfolio with risk-sized trade simulation.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 456`** (1 nodes): `Get portfolio details.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 457`** (1 nodes): `Compare multiple portfolios.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 458`** (1 nodes): `List available log files.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 459`** (1 nodes): `Get last N lines of a log file, optionally filtered by level.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 460`** (1 nodes): `Get Buy & Hold equity curve for a symbol (benchmark comparison).`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 461`** (1 nodes): `Return available symbols grouped by category for autocomplete.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 462`** (1 nodes): `Derive asset category from file path.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 463`** (1 nodes): `Scan ~/data/ohlcv/ when no catalog cache is available.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 464`** (1 nodes): `Load cached OHLCV catalog entries if catalog.json is available.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 465`** (1 nodes): `Compute recursive directory size in bytes.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 466`** (1 nodes): `Rebuild the data catalog after file mutations.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 467`** (1 nodes): `Launch a background data-management subprocess with streamed task logs.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 468`** (1 nodes): `Register the autonomous conversion agent before the worker thread launches.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 469`** (1 nodes): `Scan ~/data/dolthub repos and return size metadata.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 470`** (1 nodes): `Return summary of available data categories.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 471`** (1 nodes): `Return detailed symbol list for a category.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 472`** (1 nodes): `Start a background download task.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 473`** (1 nodes): `Start the autonomous strategy conversion worker.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 474`** (1 nodes): `Return discovered Dukascopy genesis dates for one or more symbols.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 475`** (1 nodes): `Start a background resample task.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 476`** (1 nodes): `Return recent data tasks with progress and control metadata.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 477`** (1 nodes): `Get status of a background task.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 478`** (1 nodes): `Pause a controllable background task.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 479`** (1 nodes): `Resume a paused background task.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 480`** (1 nodes): `Cancel a controllable background task.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 481`** (1 nodes): `Return the full task log for a background data-management job.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 482`** (1 nodes): `Remove a finished task from the in-memory task registry.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 483`** (1 nodes): `Delete a specific data file.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 484`** (1 nodes): `Downsample a numeric series while preserving extremes.      Produces up to ~2*`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 485`** (1 nodes): `Downsample equity curve points while preserving drawdowns/peaks.      Input po`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 486`** (1 nodes): `Review Commit Merge Agent`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 487`** (1 nodes): `Signal Bot Converter Agent`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 488`** (1 nodes): `Strategy Conversion Agent`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 489`** (1 nodes): `Data Sources Document`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 490`** (1 nodes): `Optuna Implementation Guide`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 491`** (1 nodes): `Python Requirements`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 492`** (1 nodes): `Qodo Test Report`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 493`** (1 nodes): `Platform Overview`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 494`** (1 nodes): `Status Check`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 495`** (1 nodes): `Migration Guide`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 496`** (1 nodes): `Custom Swings Supertrend Strategy`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 497`** (1 nodes): `DEMA RSI Strategy`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 498`** (1 nodes): `QG 30min ES Breakout Strategy`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 499`** (1 nodes): `Viewer Static Index`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
 
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
 
-- **Why does `VectorbtAdapter` connect `Backtest Engine Base` to `PyneCore Engine Integration`, `Community 36`, `Community 140`, `Community 141`, `Community 142`, `Community 143`, `Community 80`, `Community 144`, `Community 145`, `Community 146`, `Community 20`, `Community 52`, `Community 147`, `Community 148`, `Community 149`, `Community 150`, `Community 93`, `Community 151`?**
-  _High betweenness centrality (0.029) - this node is a cross-community bridge._
-- **Why does `Downloader` connect `Community 58` to `Community 131`, `Data Downloaders Pipeline`, `Community 36`, `Downloader Infrastructure`, `Dukascopy Native Downloader`, `JForex Downloader`, `Community 83`, `Community 84`, `Community 86`, `Community 87`, `Community 22`?**
-  _High betweenness centrality (0.019) - this node is a cross-community bridge._
-- **Why does `BacktestResult` connect `Stockkit Converter` to `Live Trading Alpaca Adapter`, `Community 97`, `PyneCore Engine Integration`, `Community 69`, `Test Suite Viewer Features`, `Statistics Computation`, `Community 72`, `Community 44`, `Community 127`, `Engine Base & Strategy Registry`, `Community 52`, `Community 21`, `Community 88`, `Community 89`, `Community 31`, `Community 63`, `Community 95`?**
-  _High betweenness centrality (0.019) - this node is a cross-community bridge._
-- **Are the 11 inferred relationships involving `Any` (e.g. with `AlpacaDownloader` and `DolthubDownloader`) actually correct?**
-  _`Any` has 11 INFERRED edges - model-reasoned connections that need verification._
-- **Are the 95 inferred relationships involving `RiskConfig` (e.g. with `BackgroundTasks` and `_OpenPosition`) actually correct?**
-  _`RiskConfig` has 95 INFERRED edges - model-reasoned connections that need verification._
-- **Are the 80 inferred relationships involving `AlpacaLiveAdapter` (e.g. with `BackgroundTasks` and `DiscordSignalSource`) actually correct?**
-  _`AlpacaLiveAdapter` has 80 INFERRED edges - model-reasoned connections that need verification._
-- **Are the 74 inferred relationships involving `DukascopyNativeDownloader` (e.g. with `BackgroundTasks` and `Downloader`) actually correct?**
-  _`DukascopyNativeDownloader` has 74 INFERRED edges - model-reasoned connections that need verification._
+- **Why does `sort()` connect `Community 6` to `Community 0`, `Community 1`, `Community 3`, `Community 4`, `Community 8`, `Community 24`, `Community 27`?**
+  _High betweenness centrality (0.077) - this node is a cross-community bridge._
+- **Why does `BacktestResult` connect `Community 1` to `Community 0`, `Community 4`, `Community 5`, `Community 6`, `Community 8`, `Community 11`, `Community 20`, `Community 22`?**
+  _High betweenness centrality (0.055) - this node is a cross-community bridge._
+- **Why does `BacktestConfig` connect `Community 5` to `Community 1`, `Community 4`, `Community 17`, `Community 20`, `Community 22`?**
+  _High betweenness centrality (0.044) - this node is a cross-community bridge._
+- **Are the 589 inferred relationships involving `str` (e.g. with `consolidate()` and `_run()`) actually correct?**
+  _`str` has 589 INFERRED edges - model-reasoned connections that need verification._
+- **Are the 228 inferred relationships involving `BacktestResult` (e.g. with `_RequestPlaceholder` and `_NoopRouteApp`) actually correct?**
+  _`BacktestResult` has 228 INFERRED edges - model-reasoned connections that need verification._
+- **Are the 183 inferred relationships involving `EquityPoint` (e.g. with `_RequestPlaceholder` and `_NoopRouteApp`) actually correct?**
+  _`EquityPoint` has 183 INFERRED edges - model-reasoned connections that need verification._
+- **Are the 174 inferred relationships involving `Trade` (e.g. with `_RequestPlaceholder` and `_NoopRouteApp`) actually correct?**
+  _`Trade` has 174 INFERRED edges - model-reasoned connections that need verification._
