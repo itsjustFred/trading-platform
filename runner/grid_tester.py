@@ -1,6 +1,7 @@
 """Grid Strategy Tester - Tests strategies across symbols/timeframes.
 
 Generates a performance matrix to identify strategy strength/symbol combinations.
+Saves results to SQLite for portfolio optimizer consumption.
 """
 from __future__ import annotations
 
