@@ -61,6 +61,7 @@ STATIC_DIR = REACT_DIST if REACT_DIST.exists() else Path(__file__).parent / "sta
 
 STRATEGIES_DIR = DEFAULT_STRATEGIES_DIR
 PORTFOLIOS_DIR = DATA_DIR / "portfolios"
+GRID_RESULTS_DIR = DATA_DIR / "grid_results"
 LOGS_DIR = LOG_DIR
 TASK_LOGS_DIR = LOGS_DIR / "tasks"
 ALL_LOGS_NAME = "ALL_LOGS"
@@ -1496,45 +1497,6 @@ def get_backtest_ohlcv(backtest_id: str):
     return jsonify(ohlcv_data)
 
 
-@app.route("/api/compare")
-def compare_backtests_endpoint():
-    """Full comparison with combined equity, drawdowns, correlations."""
-    ids_param = request.args.get("ids", "")
-    if not ids_param:
-        return jsonify({"error": "Provide ?ids=id1,id2,id3"}), 400
-
-    ids = [i.strip() for i in ids_param.split(",") if i.strip()]
-    strategies = []
-
-    for bt_id in ids:
-        result = _load_result(bt_id)
-        if result is None:
-            continue
-        try:
-            stats = _canonical_stats_from_result(result)
-            eq = _equity_to_viewer(result)
-            eq_pairs = [[e["time"], e["equity"]] for e in eq]
-            eq_vals = [e["equity"] for e in eq]
-            dd = compute_drawdown_pct(eq_vals)
-            dd_pairs = [[eq[i]["time"], round(dd[i], 4)] for i in range(len(dd))]
-
-            strategies.append(
-                {
-                    "id": bt_id,
-                    "name": f"{result.meta.strategies[0] if result.meta.strategies else 'unknown'} ({result.meta.engine})",
-                    "equity_curve": eq_pairs,
-                    "drawdown_curve": dd_pairs,
-                    "stats": stats,
-                    "trades": {
-                        "total_trades": len(result.trades),
-                        "winning_trades": sum(1 for t in result.trades if t.pnl > 0),
-                        "losing_trades": sum(1 for t in result.trades if t.pnl <= 0),
-                    },
-                }
-            )
-        except (ValueError, TypeError, KeyError) as e:
-            logger.warning("Could not load %s for comparison: %s", bt_id, e)
-
     comparison = compare_backtests(strategies)
     return jsonify(comparison)
 
@@ -2364,13 +2326,54 @@ def compare_portfolios():
 
     for pid in ids:
         path = PORTFOLIOS_DIR / f"{pid}.json"
-        if path.exists():
+        if not path.exists():
+            continue
+        try:
             portfolios.append(json.loads(path.read_text()))
-
+        except Exception as exc:
+            logger.warning("Could not read portfolio %s: %s", path, exc)
     return jsonify({"portfolios": portfolios})
 
 
-# ─── Log Endpoints ───────────────────────────────────────────────────────────
+@app.route("/api/grid-results")
+def list_grid_results():
+    """List all grid test results."""
+    GRID_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    results = []
+    for path in sorted(GRID_RESULTS_DIR.glob("*.json")):
+        try:
+            payload = json.loads(path.read_text())
+            results.append({
+                "id": path.stem,
+                "created_at": payload.get("created_at", ""),
+                "strategy": payload.get("strategy", ""),
+                "symbols": payload.get("symbols", []),
+                "timeframes": payload.get("timeframes", []),
+                "best_score": payload.get("best_score", 0.0),
+                "total_combinations": payload.get("total_combinations", 0),
+            })
+        except Exception as exc:
+            logger.warning("Could not read grid result %s: %s", path, exc)
+    return jsonify({"results": results})
+
+
+@app.route("/api/grid-results/<result_id>")
+def get_grid_result(result_id: str):
+    """Get grid test result details."""
+    path = GRID_RESULTS_DIR / f"{result_id}.json"
+    if not path.exists():
+        return jsonify({"error": "Grid result not found"}), 404
+    return jsonify(json.loads(path.read_text()))
+
+
+@app.route("/api/grid-results/<result_id>", methods=["DELETE"])
+def delete_grid_result(result_id: str):
+    """Delete grid test result."""
+    path = GRID_RESULTS_DIR / f"{result_id}.json"
+    if not path.exists():
+        return jsonify({"error": "Grid result not found"}), 404
+    path.unlink()
+    return jsonify({"deleted": True})
 
 
 def _available_log_files() -> list[Path]:
