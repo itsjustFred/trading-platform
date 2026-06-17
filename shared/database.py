@@ -124,6 +124,9 @@ class BacktestRecord(SQLModel, table=True):
     stats: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))
     notes: str = Field(default="")
     created_at: str = Field(default="", index=True)
+    equity_curve: list[dict[str, Any]] = Field(
+        default_factory=list, sa_column=Column("equity_curve", JSON, nullable=False)
+    )
 
 
 class PortfolioRecord(SQLModel, table=True):
@@ -886,6 +889,11 @@ def _migrate_schema() -> None:
                     "ON live_signals(discord_message_id) WHERE discord_message_id IS NOT NULL"
                 )
             )
+
+        # Add equity_curve column to backtests (for portfolio optimizer to read from SQLite)
+        backtest_column_names = _table_column_names(connection, "backtests")
+        if backtest_column_names and "equity_curve" not in backtest_column_names:
+            connection.execute(text("ALTER TABLE backtests ADD COLUMN equity_curve TEXT DEFAULT '[]'"))
 
         execution_column_names = _table_column_names(connection, "live_executions")
         if execution_column_names and "dedupe_key" not in execution_column_names:
