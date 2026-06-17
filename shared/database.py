@@ -281,7 +281,7 @@ class IndicatorRecord(SQLModel, table=True):
 class LiveSignalModel(SQLModel, table=True):
     __tablename__ = "live_signals"
 
-    id: str = Field(primary_key=True)
+    id: str = Field(primary_key=True, default_factory=lambda: str(uuid4()))
     deployment_id: str = Field(index=True)
     symbol: str = Field(index=True)
     action: str = Field(index=True)
@@ -289,6 +289,10 @@ class LiveSignalModel(SQLModel, table=True):
     timestamp: datetime = Field(index=True)
     source: str = Field(default="internal", index=True)
     broker_order_id: str = Field(default="", index=True)
+    discord_message_id: str | None = Field(
+        default=None,
+        sa_column=Column("discord_message_id", String, nullable=True, unique=True, index=True),
+    )
     metadata_json: dict[str, Any] = Field(
         default_factory=dict, sa_column=Column("metadata", JSON, nullable=False)
     )
@@ -304,6 +308,7 @@ class LiveSignalModel(SQLModel, table=True):
             timestamp=signal.timestamp,
             source=str(signal.metadata.get("source", "internal")),
             broker_order_id=str(signal.metadata.get("broker_order_id") or ""),
+            discord_message_id=str(signal.metadata.get("discord_message_id") or None),
             metadata_json=signal.metadata,
         )
 
@@ -318,6 +323,11 @@ class LiveSignalModel(SQLModel, table=True):
             metadata={
                 **(self.metadata_json or {}),
                 "source": self.source or "internal",
+                **(
+                    {"discord_message_id": self.discord_message_id}
+                    if self.discord_message_id
+                    else {}
+                ),
             },
         )
 
@@ -865,6 +875,17 @@ def _migrate_schema() -> None:
                     "ADD COLUMN broker_order_id TEXT NOT NULL DEFAULT ''"
                 )
             )
+        if live_signal_column_names and "discord_message_id" not in live_signal_column_names:
+            connection.execute(
+                text("ALTER TABLE live_signals ADD COLUMN discord_message_id TEXT")
+            )
+        if _table_column_names(connection, "live_signals") and "discord_message_id" in _table_column_names(connection, "live_signals"):
+            connection.execute(
+                text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_live_signals_discord_msg_id "
+                    "ON live_signals(discord_message_id) WHERE discord_message_id IS NOT NULL"
+                )
+            )
 
         execution_column_names = _table_column_names(connection, "live_executions")
         if execution_column_names and "dedupe_key" not in execution_column_names:
@@ -881,7 +902,21 @@ def _migrate_schema() -> None:
 def save_live_signal(signal: LiveSignal) -> None:
     init_db()
     with get_session() as session:
-        session.merge(LiveSignalModel.from_live_signal(signal))
+        record = LiveSignalModel.from_live_signal(signal)
+        # Deduplicate by discord_message_id to prevent duplicate signals on bot reconnect
+        discord_msg_id = record.discord_message_id
+        if discord_msg_id:
+            existing = session.exec(
+                select(LiveSignalModel)
+                .where(LiveSignalModel.discord_message_id == discord_msg_id)
+                .limit(1)
+            ).first()
+            if existing is not None:
+                logger.info(
+                    "Skipping duplicate live signal (discord_message_id=%s)", discord_msg_id
+                )
+                return
+        session.add(record)
         session.commit()
 
 
