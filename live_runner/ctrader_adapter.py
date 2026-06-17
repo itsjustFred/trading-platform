@@ -207,6 +207,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._terminal_auth_failure_reason = ""
         self._terminal_auth_failure_code = ""
         self._already_logged_in_notified = False
+        self._refresh_flow = False
 
         self._Client: Any = None
         self._TcpProtocol: Any = None
@@ -346,6 +347,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         try:
             refresh_res = await self._send_request(refresh_req, timeout_seconds=15)
         except CTraderApiError as exc:
+            # Use non-refresh version to avoid infinite recursion
             logger.warning(
                 "cTrader access token refresh failed",
                 extra={
@@ -533,6 +535,30 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 description=str(getattr(payload, "description", "")),
             )
         return payload
+
+    async def _send_request_with_refresh_retry(
+        self, request: Any, *, timeout_seconds: int = 10, _depth: int = 0
+    ) -> Any:
+        """Send request with automatic token refresh on invalid-token/Auth errors.
+
+        Retries once after refreshing the access token if the error indicates
+        an expired or invalid token. Prevents infinite loops via _depth counter.
+        """
+        if _depth > 0:
+            # Already attempted refresh; don't loop infinitely
+            return await self._send_request(request, timeout_seconds=timeout_seconds)
+
+        try:
+            return await self._send_request(request, timeout_seconds=timeout_seconds)
+        except CTraderApiError as exc:
+            error_code = _normalize_error_code(exc.error_code)
+            error_text = str(exc)
+            if _is_terminal_auth_error(error_code, error_text) and await self._refresh_access_token():
+                # Token was refreshed successfully; retry once with new token
+                return await self._send_request_with_refresh_retry(
+                    request, timeout_seconds=timeout_seconds, _depth=_depth + 1
+                )
+            raise
 
     async def _authenticate(self) -> None:
         self._raise_if_terminal_auth_failed()
