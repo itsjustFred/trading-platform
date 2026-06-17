@@ -139,7 +139,19 @@ def test_resolve_ctrader_credentials_defaults_demo_true_when_unset() -> None:
         "CTRADER_ACCESS_TOKEN": "token",
     }
     credentials = daemon._resolve_ctrader_credentials(values)
-    assert credentials == ("app", "secret", "token", True)
+    assert credentials == ("app", "secret", "token", "", True)
+
+
+def test_resolve_ctrader_credentials_includes_refresh_token() -> None:
+    values = {
+        "CTRADER_APP_ID": "app",
+        "CTRADER_APP_SECRET": "secret",
+        "CTRADER_ACCESS_TOKEN": "token",
+        "CTRADER_REFRESH_TOKEN": "refresh",
+        "CTRADER_DEMO": "false",
+    }
+    credentials = daemon._resolve_ctrader_credentials(values)
+    assert credentials == ("app", "secret", "token", "refresh", False)
 
 
 def test_discord_auth_error_detector_matches_improper_token_message() -> None:

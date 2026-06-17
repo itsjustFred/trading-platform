@@ -213,16 +213,17 @@ def _service_config_string(config: Mapping[str, object], key: str) -> str:
 
 def _resolve_ctrader_credentials(
     env_values: Mapping[str, str],
-) -> tuple[str, str, str, bool] | None:
+) -> tuple[str, str, str, str, bool] | None:
     app_id = str(env_values.get("CTRADER_APP_ID", "")).strip()
     app_secret = str(env_values.get("CTRADER_APP_SECRET", "")).strip()
     access_token = str(env_values.get("CTRADER_ACCESS_TOKEN", "")).strip()
+    refresh_token = str(env_values.get("CTRADER_REFRESH_TOKEN", "")).strip()
     if not app_id or not app_secret or not access_token:
         return None
     raw_demo_value = env_values.get("CTRADER_DEMO")
     demo_value = raw_demo_value.strip() if isinstance(raw_demo_value, str) else None
     demo = _parse_bool_env(demo_value, default=True)
-    return app_id, app_secret, access_token, demo
+    return app_id, app_secret, access_token, refresh_token, demo
 
 
 def _coerce_live_float(
@@ -722,13 +723,14 @@ def _create_adapter_for_account(
                 extra={"data": {"account_id": account.id}},
             )
             return None
-        app_id, app_secret, access_token, demo = credentials
+        app_id, app_secret, access_token, refresh_token, demo = credentials
         account_identifier = str(account.ctid or account.broker_login or account.id).strip()
         try:
             return CTraderLiveAdapter(
                 app_id=app_id,
                 app_secret=app_secret,
                 access_token=access_token,
+                refresh_token=refresh_token,
                 account_id=account_identifier,
                 demo=demo,
                 account_config_id=account.id,
