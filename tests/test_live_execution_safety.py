@@ -459,7 +459,7 @@ def test_alpaca_reconcile_backfills_missing_fill(monkeypatch):
     saved: list[LiveExecution] = []
     monkeypatch.setattr(module, "save_live_execution", lambda e: saved.append(e) or True)
 
-    adapter._trading_client = SimpleNamespace(
+    _client = SimpleNamespace(
         get_order_by_client_id=lambda _cid: SimpleNamespace(
             id="bo-77",
             filled_qty="25",
@@ -467,6 +467,7 @@ def test_alpaca_reconcile_backfills_missing_fill(monkeypatch):
             filled_at=datetime.now(timezone.utc),
         )
     )
+    adapter._trading_client = _client
 
     recovered = asyncio.run(adapter.reconcile_executions())
 
@@ -475,6 +476,116 @@ def test_alpaca_reconcile_backfills_missing_fill(monkeypatch):
     assert saved[0].broker_order_id == "bo-77"
     assert saved[0].dedupe_key == "alpaca:order:bo-77:reconciled"
     assert str(saved[0].signal_id) == signal_id
+
+
+# ── cTrader adapter specific tests ──────────────────────────────────────────────
+
+
+def test_ctrader_reconcile_backfills_missing_fill(monkeypatch):
+    """cTrader reconcile_executions backfills fills for signals with broker_order_id."""
+    from live_runner import ctrader_adapter as module
+
+    adapter = module.CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="123",
+    )
+    adapter._client = object()
+    adapter._authenticated = True
+    signal_id = str(uuid4())
+
+    monkeypatch.setattr(
+        module, "list_live_signal_ids_missing_executions", lambda _limit: [signal_id]
+    )
+    monkeypatch.setattr(
+        module, "get_live_signal_broker_order_id", lambda _sid: "45678"
+    )
+    saved: list[LiveExecution] = []
+    monkeypatch.setattr(module, "save_live_execution", lambda e: saved.append(e) or True)
+
+    # Mock _send_request to return a reconciled order with deals
+    deal = SimpleNamespace(
+        dealId=999,
+        dealStatus=1,  # FILLED
+        filledVolume=5000,
+        executionPrice=1.2345,
+        executionTimestamp=1700000000000,
+        commission=0.0,
+    )
+    # Create the response object using the adapter's response class so isinstance() works
+    # We need to mock the Protobuf types that are loaded by _load_openapi_types
+    # Since _load_openapi_types requires a running event loop and Twisted reactor,
+    # we mock the specific types needed for the reconcile logic.
+    adapter._ProtoOAOrderDetailsRes = type("ProtoOAOrderDetailsRes", (), {"deal": [deal]})
+    # Mock _send_request to return the details response
+    order_details_res = adapter._ProtoOAOrderDetailsRes()
+
+    async def _mock_send_request(req, *, timeout_seconds=15):
+        return order_details_res
+
+    adapter._send_request = _mock_send_request
+    adapter._ProtoOAOrderDetailsReq = SimpleNamespace
+    adapter._ProtoOADealStatus = SimpleNamespace(FILLED=1, PARTIALLY_FILLED=2)
+
+    recovered = asyncio.run(adapter.reconcile_executions())
+
+    assert recovered == 1
+    assert len(saved) == 1
+    assert saved[0].filled_qty == 5000.0
+    assert saved[0].broker_order_id == "45678"
+    assert "ctrader:deal:999:reconciled" in saved[0].dedupe_key
+
+
+def test_ctrader_reconcile_skips_signals_without_broker_order_id(monkeypatch):
+    """cTrader reconcile must skip signals that have no broker_order_id persisted."""
+    from live_runner import ctrader_adapter as module
+
+    adapter = module.CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="123",
+    )
+    adapter._client = object()
+    adapter._authenticated = True
+    signal_id = str(uuid4())
+
+    monkeypatch.setattr(
+        module, "list_live_signal_ids_missing_executions", lambda _limit: [signal_id]
+    )
+    # Return empty string for broker_order_id -> signal never reached broker
+    monkeypatch.setattr(
+        module, "get_live_signal_broker_order_id", lambda _sid: ""
+    )
+    saved: list[LiveExecution] = []
+    monkeypatch.setattr(module, "save_live_execution", lambda e: saved.append(e) or True)
+
+    recovered = asyncio.run(adapter.reconcile_executions())
+
+    assert recovered == 0
+    assert saved == []
+
+
+def test_ctrader_reconcile_skips_non_numeric_broker_order_ids(monkeypatch):
+    """cTrader reconcile must skip Alpaca-style UUID broker_order_ids (non-numeric)."""
+    from live_runner import ctrader_adapter as module
+
+    adapter = module.CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="123",
+    )
+    adapter._client = object()
+    adapter._authenticated = True
+    signal_id = str(uuid4())
+
+    monkeypatch.setattr(
+        module, "list_live_signal_ids_missing_executions", lambda _limit: [signal_id]
+    )
+    # Alpaca UUID format - not numeric, should be skipped
+    monkeypatch.setattr(
+        module, "get_live_signal_broker_order_id", lambda _sid: "f47ac10b-58cc-4372-a567-0e02b2c3d479"
+    )
+    saved: list[LiveExecution] = []
+    monkeypatch.setattr(module, "save_live_execution", lambda e: saved.append(e) or True)
+
+    recovered = asyncio.run(adapter.reconcile_executions())
+
+    assert recovered == 0
+    assert saved == []
 
 
 # ── Service restart semantics ──────────────────────────────────────────────────
