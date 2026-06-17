@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="de"><head><meta charset="utf-8"><title>Hermes Live Run Report 2026-06-17</title>
+<style>body{font-family:system-ui,Arial,sans-serif;margin:32px;line-height:1.45}code{background:#eee;padding:2px 4px}table{border-collapse:collapse;width:100%;margin:14px 0}td,th{border:1px solid #ccc;padding:6px 8px;text-align:left}.ok{color:#067d17}.warn{color:#a86600}.bad{color:#b00020}</style></head>
+<body><h1>Hermes Live Run Report — 2026-06-17</h1>
+<p><b>Branch:</b> <code>hermes-master</code> (integriert: <code>fix/live-broker-smoke</code>)<br>
+<b>Fokus:</b> Live Broker Smoke, cTrader Refresh, Alpaca/Discord Routing, Provider/Kilo Free.</p>
+<h2>Zusammenfassung</h2><ul>
+<li class="ok">Alpaca Paper E2E auf Nitro/RocketFuel/RamJet erfolgreich: BUY+SELL jeweils filled, danach keine offenen Positionen.</li>
+<li class="ok">cTrader Discovery fand 5 Demo-Accounts; Connect/Balance-Smoke auf Account 44695443 erfolgreich (159 Symbole, Positionen 0).</li>
+<li class="ok">cTrader Token-Refresh-Code ergänzt: Refresh-Token Support, Runtime+dotenv Persistenz, Retry nach invalid-token/Auth-Fehler.</li>
+<li class="ok">Alpaca Credential Routing gehärtet: mit Account-Hints kein stiller Fallback auf ACC1 mehr.</li>
+<li class="ok">Kilo Auto Free verifiziert: <code>hermes --provider kilocode -m 'kilo-auto/free'</code>. MiniMax-M3 gestoppt.</li>
+<li class="warn">cTrader Real-Order noch nicht platziert; Refresh braucht realen <code>CTRADER_REFRESH_TOKEN</code> in lokaler .accounts.env.</li>
+<li class="warn">Live-Daemon Langlauf und echte Discord-Bot-Signal-Ausführung noch offen.</li>
+</ul>
+<h2>Alpaca Demo Orders</h2><table><tr><th>Bot</th><th>Account</th><th>Symbol</th><th>BUY Order</th><th>BUY Status</th><th>SELL Order</th><th>SELL Status</th><th>Outcome</th></tr>
+<tr><td>Nitro</td><td>PA3E767TJ91D</td><td>SPY 0.01</td><td>49c62b82-e27a-45e1-ad4a-413896121c6e</td><td class="ok">FILLED</td><td>83e4cde6-5a39-4b26-a24f-ba7eab8d97c3</td><td class="ok">FILLED</td><td>positions=[]</td></tr>
+<tr><td>RocketFuel</td><td>PA3EFBL4P7BU</td><td>SPY 0.01</td><td>8d38db46-269b-431f-84c9-8f5ac7b18146</td><td class="ok">FILLED</td><td>3ec92909-b882-469b-a085-2b892aa29b4f</td><td class="ok">FILLED</td><td>positions=[]</td></tr>
+<tr><td>RamJet</td><td>PA3T0MQAGQ51</td><td>SPY 0.01</td><td>9c54ff15-53e2-425e-b39b-d800d2c01b9c</td><td class="ok">FILLED</td><td>ae7498ff-a623-4cb1-a0cd-79e6cb5af8ce</td><td class="ok">FILLED</td><td>positions=[]</td></tr>
+</table>
+<p>Erster 0.001-SPY-Versuch wurde korrekt vom Broker abgelehnt: Mindest-Notional 1 USD.</p>
+<h2>cTrader</h2><ul><li>Discovery: Demo-Accounts <code>44695443</code>, <code>46736434</code>, <code>46736452</code>, <code>46736456</code>, <code>47644617</code>.</li><li>Smoke: Account <code>44695443</code>, Balance/Equity ca. 90.07, Positionen 0, Symbole 159.</li><li>Disconnect ist timeout-geschützt, aber Reactor-Lifecycle sollte weiter beobachtet werden.</li></ul>
+<h2>Tests</h2><table><tr><th>Command</th><th>Result</th></tr><tr><td><code>pytest tests/test_ctrader_adapter.py tests/test_live_daemon.py tests/test_alpaca_account_routing.py tests/test_discord_signal_parsing.py tests/test_live_execution_safety.py tests/test_live_risk_sizing.py tests/test_live_api.py -q</code></td><td class="ok">67 passed, 2 warnings</td></tr><tr><td><code>py_compile live_runner/ctrader_adapter.py live_runner/daemon.py live_runner/alpaca_adapter.py live_runner/signal_sources/discord_source.py</code></td><td class="ok">OK</td></tr></table>
+<h2>Provider / Kosten</h2><ul><li>Kilo Free OK: <code>kilo-auto/free</code>.</li><li>BluesMinds/GPT-5.5 letzter Snapshot 18:12: 17,981,902 Tokens/24h. Grobe Kostenspanne ca. $89.91–$539.46; Delta seit Start ca. $77.63–$465.78. Spanne, da Hermes keine Input/Output-Aufteilung ausgibt.</li></ul>
+<h2>Geänderte Dateien</h2><ul><li><code>live_runner/ctrader_adapter.py</code>, <code>live_runner/daemon.py</code>, <code>live_runner/alpaca_adapter.py</code></li><li><code>tests/test_ctrader_adapter.py</code>, <code>tests/test_live_daemon.py</code>, <code>tests/test_alpaca_account_routing.py</code>, <code>tests/test_discord_signal_parsing.py</code></li><li><code>.accounts.example.env</code></li><li>Kilo-Reviewnotizen: <code>reports/kilo-*.md</code></li></ul>
+<h2>Offene Blocker</h2><ol><li><code>CTRADER_REFRESH_TOKEN</code> in lokaler <code>.accounts.env</code> ergänzen und echten Refresh testen.</li><li>cTrader Demo-Order klein und kontrolliert platzieren/schließen/reconcilen.</li><li>Discord-Live-Daemon mit echten Bot-Signalen oder kontrolliertem Replay testen.</li><li>Discord-Deduplication und Multi-Deployment-Routing-Risiken aus Kilo-Reviews weiter schließen.</li><li><code>graphify update .</code>, Push und finaler PR/Review-Flow.</li></ol>
+</body></html>
