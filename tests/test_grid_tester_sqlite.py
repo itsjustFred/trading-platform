@@ -1,5 +1,8 @@
 """Tests for grid strategy tester SQLite integration."""
 import json
+import sys
+import types
+import uuid
 from datetime import datetime, timezone
 
 import pytest
@@ -29,6 +32,62 @@ def test_grid_record_model_creation() -> None:
     assert record.engine == "vectorbt"
     assert len(record.symbols_json) == 2
     assert len(record.timeframes_json) == 2
+
+
+def test_run_strategy_grid_persists_to_sqlite(monkeypatch, tmp_path) -> None:
+    """Test run_strategy_grid writes grid results to SQLite through GridRecord."""
+    scipy_module = types.ModuleType("scipy")
+    scipy_stats_module = types.ModuleType("scipy.stats")
+    setattr(scipy_stats_module, "norm", lambda *args, **kwargs: 0.5)
+    setattr(scipy_stats_module, "ttest_1samp", lambda *args, **kwargs: None)
+    monkeypatch.setitem(sys.modules, "scipy", scipy_module)
+    monkeypatch.setitem(sys.modules, "scipy.stats", scipy_stats_module)
+    import runner.grid_tester as grid_tester_module
+
+    class FakeResult:
+        stats = {
+            "sharpe": 1.25,
+            "cagr": 0.18,
+            "max_drawdown_pct": 0.04,
+            "win_rate": 0.6,
+            "total_trades": 7,
+            "net_profit_pct": 12.5,
+        }
+
+    class FakeEngine:
+        def run(self, config):
+            return FakeResult()
+
+    class FixedDateTime:
+        @staticmethod
+        def now(tz):
+            return datetime(2026, 6, 17, 12, 0, tzinfo=tz)
+
+    monkeypatch.setattr(grid_tester_module, "find_strategy_entry", lambda slug: object())
+    monkeypatch.setattr(grid_tester_module, "get_engine", lambda engine_name: FakeEngine())
+    monkeypatch.setattr(grid_tester_module, "GRID_RESULTS_DIR", tmp_path / "grid_results")
+    monkeypatch.setattr(grid_tester_module, "datetime", FixedDateTime)
+
+    strategy_slug = f"example_sma_{uuid.uuid4().hex[:8]}_{tmp_path.name.replace('-', '_')}"
+
+    result = grid_tester_module.run_strategy_grid(
+        strategy_slug=strategy_slug,
+        symbols=["AAPL"],
+        timeframes=["1h"],
+        start="2024-01-01",
+        end="2024-01-31",
+        engine_name="fake_engine",
+    )
+
+    assert result["id"].startswith(f"grid_{strategy_slug}_20260617_120000")
+    assert (tmp_path / "grid_results" / f"{result['id']}.json").exists()
+
+    saved = get_grid_results(limit=100)
+    matching = [item for item in saved if item["id"] == result["id"]]
+    assert len(matching) == 1
+    assert matching[0]["strategy"] == strategy_slug
+    assert matching[0]["symbols"] == ["AAPL"]
+    assert matching[0]["results"]["AAPL"]["1h"]["sharpe"] == 1.25
 
 
 def test_save_grid_result_to_sqlite() -> None:

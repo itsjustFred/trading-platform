@@ -34,6 +34,16 @@ from shared.models import BacktestMeta, BacktestResult, EquityPoint, IndicatorSe
 
 logger = logging.getLogger(__name__)
 
+_RISK_WARNING_KEYS: set[tuple[str, str, str]] = set()
+
+
+def _warn_once(key: tuple[str, str, str], message: str, *args: Any) -> None:
+    if key in _RISK_WARNING_KEYS:
+        return
+    _RISK_WARNING_KEYS.add(key)
+    logger.warning(message, *args)
+
+
 IndicatorMap = dict[str, tuple[pd.Series, str]]
 DrawingList = list[dict[str, Any]]
 TIMEFRAME_ORDER = ["tick", "s1", "1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"]
@@ -207,10 +217,11 @@ def _process_symbol(
 
                 if not stop_distance or stop_distance <= 0:
                     stop_distance = entry_price * 0.02
-                    logger.warning(
-                        "Risk sizing fallback for %s at bar %s: no stop_loss/ATR, using %.2f%% default stop",
+                    _warn_once(
+                        (symbol, config.timeframe, "fallback_stop"),
+                        "Risk sizing fallback for %s/%s: no stop_loss/ATR, using %.2f%% default stop",
                         symbol,
-                        entry_idx,
+                        config.timeframe,
                         2.0,
                     )
 
@@ -236,12 +247,11 @@ def _process_symbol(
                 else:
                     final_notional = leverage_notional_limit
                     achievable_risk = (final_notional / entry_price) * stop_distance
-                    logger.warning(
-                        "Risk target underfilled for %s trade %s: target=%.2f achievable=%.2f (cap=%.2f, max_leverage=%.2fx)",
+                    _warn_once(
+                        (symbol, config.timeframe, "risk_underfilled"),
+                        "Risk target underfilled for %s/%s: cap=%.2f, max_leverage=%.2fx",
                         symbol,
-                        trade_counter,
-                        risk_target_usd,
-                        achievable_risk,
+                        config.timeframe,
                         cap_notional,
                         max_leverage,
                     )

@@ -52,7 +52,7 @@ def _split_equity_curves_by_time(
     
     Args:
         curves: List of equity curves for each strategy
-        train_months: Number of months for training period (from start). If None, use all data.
+        train_months: Currently unused - reserved for future walk-forward implementation.
         test_months: Number of months for testing period (from end). If None, no OOS split.
     
     Returns:
@@ -71,12 +71,10 @@ def _split_equity_curves_by_time(
     if not all_timestamps:
         return curves, []
     
-    min_ts = min(all_timestamps)
     max_ts = max(all_timestamps)
     
-    # Calculate split points
+    # Calculate split point for test period
     seconds_per_month = 30 * 24 * 60 * 60
-    
     test_start_ts = max_ts - (test_months * seconds_per_month)
     
     train_curves: list[list[StrategyEquityPoint]] = []
@@ -118,8 +116,10 @@ def _load_strategy_equity(backtest_id: str) -> list[StrategyEquityPoint]:
                 for p in record.equity_curve:
                     if isinstance(p, dict):
                         if p.get("time") and p.get("equity"):
+                            # Parse time through _parse_time_to_ts for ISO or Unix format
+                            time_ts = _parse_time_to_ts(p.get("time", 0))
                             points.append(StrategyEquityPoint(
-                                time=int(p.get("time", 0)),
+                                time=int(time_ts),
                                 equity=float(p.get("equity", 0))
                             ))
                 if points:
@@ -137,7 +137,7 @@ def _load_strategy_equity(backtest_id: str) -> list[StrategyEquityPoint]:
         equity = data.get("equity_curve", [])
         return [
             StrategyEquityPoint(
-                time=int(p.get("time", 0)),
+                time=int(_parse_time_to_ts(p.get("time", 0))),
                 equity=float(p.get("equity", 0))
             )
             for p in equity
@@ -169,13 +169,18 @@ def _align_equity_curves(
         equity_values = {}
         for pt in curve:
             equity_values[pt.time] = pt.equity
-        
-        # Fill values, forward-fill missing
-        last_val = 0.0
+
+        # Fill values, forward-fill missing values. Start from the first known
+        # point for this strategy so missing leading days do not create a bogus
+        # zero-equity row and an artificial return spike.
+        last_val: float | None = None
+        first_valid = next((pt.equity for pt in curve if pt.equity), None)
+        if first_valid is None:
+            first_valid = 0.0
         for row, t in enumerate(sorted_times):
             if t in equity_values:
                 last_val = equity_values[t]
-            aligned[row, col] = last_val
+            aligned[row, col] = first_valid if last_val is None else last_val
     
     return aligned
 

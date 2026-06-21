@@ -10,10 +10,10 @@ Der Grid-Tester führt automatisierte Backtest-Matrizen für jede Strategie aus.
 
 ```bash
 # Grid-Run für eine Strategie
-python -m runner.grid_tester --strategy example_sma --symbols EURUSD,GBPUSD,USDJPY --timeframes 1h,4h,1d
+python -m runner.grid_tester --strategy example_sma --symbols EURUSD GBPUSD USDJPY --timeframes 1h 4h 1d --start 2023-01-01 --end 2024-12-31
 
-# Mit benutzerdefiniertem Parameter-Grid
-python -m runner.grid_tester --strategy my_strategy --config grid_config.yaml
+# Mit mehreren Strategien/Timeframes und anderem Engine-Backend
+python -m runner.grid_tester --strategy my_strategy --symbols BTCUSDT ETHUSDT --timeframes 1h 1d --start 2023-01-01 --end 2024-12-31 --engine vectorbt
 ```
 
 ## Output

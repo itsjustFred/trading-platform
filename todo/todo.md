@@ -5,7 +5,35 @@
 > (was schon gemacht ist, was halbfertig ist, was kaputt ist). Nicht doppelt
 > anfangen, was schon steht. Status-Notizen je Punkt gerne ins `overnight_report.md`.
 
-Stand: 2026-06-17 · Repo: `trading-platform` · Working branch: `feature/portfolio-optimizer-bayesopt`
+Stand: 2026-06-18 09:25 UTC · Repo: `trading-platform` · Working branch: `feature/portfolio-optimizer-bayesopt` · Verified: 2026-06-18 09:25 UTC
+
+Heute-Status (Stand 2026-06-18 09:25 UTC):
+- 1. cTrader Token Refresh: ✅ ERLEDIGT
+- 2. Portfolio Optimizer SQLite/OOS: ✅ ERLEDIGT
+- 3. Walk-Forward CLI: ✅ ERLEDIGT
+- 4. Walk-Forward Tests: ✅ ERLEDIGT — `tests/test_walkforward.py` läuft grün; CLI-Help geprüft.
+- 5. Dukascopy Downloader: ✅ ERLEDIGT — `tests/test_dukascopy_downloader.py` läuft grün; Async-Parallel-, Progress-, Throttle- und JForex-Pfade abgedeckt.
+- 6. Viewer-UI Tests: ✅ ERLEDIGT — `tests/test_viewer_features.py` läuft grün mit Python-3.11-kompatiblem SciPy-Testpfad; ohne diesen Pfad fehlt `scipy` im aktiven Hermes-venv.
+- 7. DB-Konsolidierung Tests: ✅ ERLEDIGT — `save_result_to_sqlite()` persistiert `equity_curve`; Migration/Persistence-Tests laufen grün.
+- 8. Live-Risk-Konsistenz Docs/Tests: ✅ ERLEDIGT — `docs/live-risk-consistency.md`, `tests/test_live_risk_sizing.py` und `tests/test_risk_consistency.py` laufen grün.
+- 9. Signal-Bots Health-Check: ✅ ERLEDIGT — health CLI returned 5/5 OK and focused scheduler/health-check tests passed during 2026-06-18 09:25 UTC verification.
+- 10. Overnight Strategy Discovery: ✅ ERLEDIGT — `scripts/overnight_strategy_discovery.py` erzeugt `/mnt/block-volume-data/discovered_strategies/discovery_20260618_0924.json` mit 20 Mock-Trials (Keltner 9, RSI 7, SMA 4).
+
+---
+
+## 10. Overnight Strategy Discovery
+
+**Ziel**: Nach Abschluss der aktuellen Pflichtaufgaben automatisch Kandidaten-Strategien entdecken und dokumentieren.
+
+- **Status prüfen**:
+  - `todo/todo.md` muss zuerst gelesen werden.
+  - Nur ausführen, wenn alle Pflichtaufgaben erledigt sind.
+  - Ergebnisse nach `/mnt/block-volume-data/discovered_strategies/` schreiben.
+
+- **Akzeptanz**:
+  - `scripts/overnight_strategy_discovery.py` läuft ohne Fehler.
+  - Neue JSON-Datei mit `mock`-Trials wird erzeugt.
+  - `overnight_report.md` dokumentiert Strategy-/Symbol-/Timeframe-Verteilung und Parameterbereiche.
 
 ---
 
@@ -217,18 +245,6 @@ gleiche Größen berechnen, sonst klaffen Backtest und Realität.
   - Frischer Leser findet ohne Code-Lesen den Einstieg.
   - Alle neuen CLI-Commands sind in `README.md` oder verlinkt.
 
-## 10. Signal-Bots Health-Check
-
-**Ziel**: `signal_bots/{nitro,ramjet,rocketfuel}` — laufen die?
-
-- **Status prüfen**:
-  - `signal_bots/README.md` lesen.
-  - Letzte Commits / letzte Runs in Logs.
-- **Definition**: Wenn ungenutzt → dokumentieren oder archivieren.
-  Wenn aktiv → Health-Check-Job im `scheduler/jobs/`.
-- **Akzeptanz**: Pro Bot entweder lauffähig + im Scheduler, oder
-  dokumentiert "deprecated / not in use".
-
 ---
 
 ## Out of Scope (erstmal)
@@ -240,7 +256,7 @@ gleiche Größen berechnen, sonst klaffen Backtest und Realität.
 
 - `README.md` — Architektur, CLI-Examples.
 - `overnight_report.md` — letzter Status Provider + cTrader + Portfolio-Branch.
-- `runner/portfolio_optimizer.py` — Stand 2026-06-17 (Optuna, nur JSON).
-- `runner/grid_tester.py` — Stand 2026-06-17 (Matrix-Run).
+- `runner/portfolio_optimizer.py` — SQLite first via `BacktestRecord.equity_curve`, OOS split, Optuna allocation.
+- `runner/grid_tester.py` — Matrix-Run mit JSON + SQLite-Persistenz via `GridRecord`.
 - `live_runner/ctrader_adapter.py` — Token-Refresh unklar.
 - `data_tools/downloaders/dukascopy_native.py` — langsam, Node-Alternative offen.

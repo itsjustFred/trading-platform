@@ -1,4 +1,5 @@
 """Tests for signal bot health check."""
+from signal_bots.health_check import main
 from signal_bots.health_check import check_signal_bots
 
 
@@ -22,3 +23,13 @@ def test_check_signal_bots_detects_config_files() -> None:
     assert any(r["name"] == "nitro" for r in result["results"])
     assert any(r["name"] == "ramjet" for r in result["results"])
     assert any(r["name"].startswith("rocketfuel") for r in result["results"])
+
+
+def test_signal_bot_health_check_main_returns_json(capsys) -> None:
+    """Test command-line entrypoint returns JSON status."""
+    assert main() == 0
+
+    captured = capsys.readouterr()
+    assert '"status": "ok"' in captured.out
+    assert "stockkit" in captured.out
+    assert "nitro" in captured.out

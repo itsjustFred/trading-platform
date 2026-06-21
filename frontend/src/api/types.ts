@@ -742,6 +742,63 @@ export interface BacktestsListResponse {
   order: string;
 }
 
+export interface BacktestMatrixStrategyOverview {
+  strategy: string;
+  strategy_name?: string;
+  ok_cells: number;
+  failed_cells: number;
+  skipped_existing_cells: number;
+  total_trades: number;
+  total_pnl: number;
+  avg_sharpe?: number | null;
+  best_sharpe?: number | null;
+  best_net_profit_pct?: number | null;
+  best_symbol?: string | null;
+  best_timeframe?: string | null;
+  best_run_id?: string | null;
+}
+
+export interface BacktestMatrixRun {
+  strategy: string;
+  strategy_name?: string;
+  symbol: string;
+  timeframe: string;
+  run_id?: string;
+  status: string;
+  total_trades?: number;
+  total_pnl?: number;
+  net_profit_pct?: number;
+  sharpe?: number | null;
+  cagr?: number | null;
+  max_drawdown_pct?: number | null;
+  win_rate?: number | null;
+  daily_return_count?: number;
+  output?: string;
+  error?: string;
+}
+
+export interface BacktestMatrixSummary {
+  started_at?: string;
+  completed_at?: string;
+  strategies: string[];
+  strategy_names?: string[];
+  symbols: string[];
+  timeframes: string[];
+  start: string;
+  end: string;
+  engine: string;
+  capital: number;
+  requested_cells: number;
+  ok_cells: number;
+  failed_cells: number;
+  skipped_existing_cells: number;
+  daily_equity_rows: number;
+  matrix_csv?: string;
+  daily_equity_csv?: string;
+  strategy_overview?: BacktestMatrixStrategyOverview[];
+  runs?: BacktestMatrixRun[];
+}
+
 export interface BacktestsBulkDeleteResponse {
   deleted: number;
 }

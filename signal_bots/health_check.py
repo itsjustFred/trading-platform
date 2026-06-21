@@ -4,9 +4,13 @@ Checks:
 - Bot processors import successfully
 - Config files exist
 - Registry entries are valid
+
+Run with:
+    python -m signal_bots.health_check
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -33,7 +37,7 @@ def check_signal_bots() -> dict[str, Any]:
         config_path = Path(__file__).parent / name.split("_")[0] / "config.yaml"
         if name in {"rocketfuel_longsonly", "rocketfuel_longandshort"}:
             config_path = Path(__file__).parent / "rocketfuel" / "config.yaml"
-        elif name == "stockkit":
+        elif name in {"stockkit", "nitro"}:
             config_path = Path(__file__).parent / "ramjet" / "config.yaml"
         
         if not config_path.exists():
@@ -46,3 +50,14 @@ def check_signal_bots() -> dict[str, Any]:
         "status": "ok" if all(r["status"] == "ok" for r in results) else "error",
         "results": results,
     }
+
+
+def main() -> int:
+    """Print JSON health-check result and return a process exit code."""
+    result = check_signal_bots()
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+    return 0 if result["status"] == "ok" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

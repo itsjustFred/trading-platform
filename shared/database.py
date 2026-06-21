@@ -281,6 +281,29 @@ class IndicatorRecord(SQLModel, table=True):
     data: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))
 
 
+class GridRecord(SQLModel, table=True):
+    """Model for grid strategy tester results stored in SQLite."""
+
+    __tablename__ = "grid_results"
+
+    id: str = Field(primary_key=True)
+    strategy: str = Field(index=True)
+    created_at: str = Field(default="", index=True)
+    symbols_json: list[str] = Field(
+        default_factory=list,
+        sa_column=Column("symbols", JSON, nullable=False),
+    )
+    timeframes_json: list[str] = Field(
+        default_factory=list,
+        sa_column=Column("timeframes", JSON, nullable=False),
+    )
+    results_json: dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column("results", JSON, nullable=False),
+    )
+    engine: str = Field(default="vectorbt", index=True)
+
+
 class LiveSignalModel(SQLModel, table=True):
     __tablename__ = "live_signals"
 
@@ -1625,6 +1648,7 @@ def save_result_to_sqlite(result: BacktestResult) -> None:
             stats=result.stats or {},
             notes=result.meta.notes,
             created_at=result.meta.created_at,
+            equity_curve=[point.to_dict() for point in result.equity_curve],
         )
         session.merge(backtest_record)
 
@@ -2820,3 +2844,87 @@ def delete_portfolio(portfolio_id: str) -> bool:
         session.delete(portfolio)
         session.commit()
     return True
+
+
+def save_grid_result_to_sqlite(grid_result: dict[str, Any]) -> None:
+    """Save grid strategy tester result to SQLite.
+
+    Args:
+        grid_result: Grid result payload from grid_tester.run_strategy_grid()
+    """
+    init_db()
+    with get_session() as session:
+        record = GridRecord(
+            id=grid_result.get("id", ""),
+            strategy=grid_result.get("strategy", ""),
+            created_at=grid_result.get("created_at", ""),
+            symbols_json=grid_result.get("symbols", []),
+            timeframes_json=grid_result.get("timeframes", []),
+            results_json=grid_result.get("results", {}),
+            engine=grid_result.get("engine", "vectorbt"),
+        )
+        session.merge(record)
+        session.commit()
+
+
+def get_grid_results(limit: int = 100) -> list[dict[str, Any]]:
+    """Retrieve grid results from SQLite, newest first.
+
+    Args:
+        limit: Maximum number of results to return
+
+    Returns:
+        List of grid result payloads
+    """
+    init_db()
+    with get_session() as session:
+        records = session.exec(
+            select(GridRecord).order_by(GridRecord.created_at.desc()).limit(limit)
+        ).all()
+
+        return [
+            {
+                "id": rec.id,
+                "strategy": rec.strategy,
+                "created_at": rec.created_at,
+                "symbols": rec.symbols_json,
+                "timeframes": rec.timeframes_json,
+                "results": rec.results_json,
+                "engine": rec.engine,
+            }
+            for rec in records
+        ]
+
+
+def save_grid_result(
+    grid_id: str,
+    strategy: str,
+    symbols: list[str],
+    timeframes: list[str],
+    results: dict[str, Any],
+    engine: str = "vectorbt",
+) -> None:
+    """Save grid test results to SQLite."""
+    init_db()
+    with get_session() as session:
+        record = GridRecord(
+            id=grid_id,
+            strategy=strategy,
+            created_at=_now_iso(),
+            symbols_json=symbols,
+            timeframes_json=timeframes,
+            results_json=results,
+            engine=engine,
+        )
+        session.add(record)
+        session.commit()
+
+
+def list_grid_results() -> list[GridRecord]:
+    """List all grid results, newest first."""
+    init_db()
+    with get_session() as session:
+        rows = session.exec(
+            select(GridRecord).order_by(GridRecord.created_at.desc())
+        ).all()
+    return [row for row in rows if isinstance(row, GridRecord)]

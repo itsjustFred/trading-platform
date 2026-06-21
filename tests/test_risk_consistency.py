@@ -22,6 +22,60 @@ def test_risk_engine_and_live_use_same_defaults() -> None:
     assert engine.config.fallback_stop_pct == live_config.fallback_stop_pct
 
 
+@pytest.mark.parametrize(
+    ("action", "entry_price", "stop_loss", "take_profit", "pip_value", "expected_size"),
+    [
+        ("buy", 100.0, 98.0, 110.0, 10.0, 50.0),
+        ("sell", 100.0, 105.0, 90.0, 10.0, 20.0),
+    ],
+)
+def test_risk_engine_and_live_size_match_for_valid_signals(
+    action: str,
+    entry_price: float,
+    stop_loss: float,
+    take_profit: float,
+    pip_value: float,
+    expected_size: float,
+) -> None:
+    """Parametrized parity test for identical valid inputs."""
+    engine = RiskEngine()
+    backtest_signal = TradeSignal(
+        action=action,
+        entry_price=entry_price,
+        stop_loss=stop_loss,
+        take_profit=take_profit,
+        symbol="EURUSD",
+        timeframe="1h",
+    )
+    live_signal = LiveSignal(
+        deployment_id="test-deployment",
+        symbol="EURUSD",
+        action=action,
+        theoretical_price=entry_price,
+        timestamp=datetime.now(),
+        metadata={
+            "entry_price": entry_price,
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+            "pip_value": pip_value,
+            "current_exposure": 0.0,
+        },
+    )
+
+    backtest_result = engine.calculate_position_size(
+        signal=backtest_signal,
+        account_balance=100000.0,
+        pip_value=pip_value,
+        current_exposure=0.0,
+    )
+    live_result = size_live_signal(live_signal, account_balance=100000.0)
+
+    assert backtest_result.position_size == pytest.approx(expected_size)
+    assert live_result.position_size == pytest.approx(expected_size)
+    assert live_result.risk_amount == pytest.approx(1000.0)
+    assert live_result.risk_percent == pytest.approx(0.01)
+
+
 def test_live_size_rejects_wrong_stop_direction() -> None:
     """Test that live sizing rejects wrong stop direction."""
     signal = TradeSignal(

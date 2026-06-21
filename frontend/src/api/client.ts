@@ -51,6 +51,7 @@ import type {
   BacktestsBulkDeleteResponse,
   BacktestsRemoveEmptyResponse,
   BacktestsCompareResponse,
+  BacktestMatrixSummary,
   PortfolioComponent,
   PortfolioContribution,
   PortfolioDetail,
@@ -252,6 +253,9 @@ export const compareBacktests = (ids: string[]) =>
   fetchJSON<BacktestsCompareResponse>(`/backtests/compare?ids=${ids.join(",")}`);
 export const getBacktestDuplicates = () =>
   fetchJSON<BacktestsDuplicatesResponse>("/backtests/duplicates");
+export const getBacktestMatrix = () => fetchJSON<BacktestMatrixSummary>("/backtests/matrix/summary");
+export const getBacktestMatrixMatrixCsvUrl = () => "/api/backtests/matrix/matrix.csv";
+export const getBacktestMatrixDailyEquityCsvUrl = () => "/api/backtests/matrix/daily-equity.csv";
 export const deduplicateBacktests = () =>
   fetchJSON<BacktestsDeduplicateResponse>("/backtests/deduplicate", {
     method: "POST",

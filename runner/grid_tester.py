@@ -89,7 +89,7 @@ def run_strategy_grid(
     now = datetime.now(timezone.utc)
     grid_id = f"grid_{strategy_slug}_{now.strftime('%Y%m%d_%H%M%S')}"
     output_path = GRID_RESULTS_DIR / f"{grid_id}.json"
-    
+
     payload = {
         "id": grid_id,
         "strategy": strategy_slug,
@@ -99,9 +99,21 @@ def run_strategy_grid(
         "results": results_matrix,
         "engine": engine_name,
     }
-    
+
     output_path.write_text(json.dumps(payload, indent=2))
-    
+
+    # Also save to SQLite
+    from shared.database import save_grid_result
+
+    save_grid_result(
+        grid_id=grid_id,
+        strategy=strategy_slug,
+        symbols=symbols,
+        timeframes=timeframes,
+        results=results_matrix,
+        engine=engine_name,
+    )
+
     return payload
 
 

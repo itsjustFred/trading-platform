@@ -7,10 +7,13 @@ import {
   deleteBacktestsBulk,
   getBacktestDuplicates,
   getBacktestEquityPreviews,
+  getBacktestMatrix,
+  getBacktestMatrixDailyEquityCsvUrl,
+  getBacktestMatrixMatrixCsvUrl,
   getBacktestsAll,
   removeEmptyBacktests,
 } from "../api/client";
-import type { BacktestMetadataItem, BacktestsDuplicatesResponse } from "../api/types";
+import type { BacktestMatrixSummary, BacktestMetadataItem, BacktestsDuplicatesResponse } from "../api/types";
 import { BacktestFromSignalsModal } from "../components/BacktestFromSignalsModal";
 import { CreateBacktestModal } from "../components/CreateBacktestModal";
 import { DualRangeSlider } from "../components/DualRangeSlider";
@@ -304,6 +307,236 @@ function updateFilter(
     ...current,
     [key]: { min, max },
   };
+}
+
+function BacktestMatrixPanel() {
+  const [summary, setSummary] = useState<BacktestMatrixSummary | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const loadMatrix = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const payload = await getBacktestMatrix();
+      setSummary(payload);
+    } catch (err) {
+      setError(toErrorMessage(err, "Matrix summary not available"));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadMatrix();
+  }, [loadMatrix]);
+
+  if (loading) {
+    return (
+      <div style={MATRIX_PANEL_STYLE}>
+        <div style={MATRIX_HEADER_STYLE}>
+          <div>
+            <h2 style={MATRIX_TITLE_STYLE}>Backtest Matrix</h2>
+            <p style={MATRIX_SUBTITLE_STYLE}>Loading latest matrix summary…</p>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (error || !summary) {
+    return (
+      <div style={MATRIX_PANEL_STYLE}>
+        <div style={MATRIX_HEADER_STYLE}>
+          <div>
+            <h2 style={MATRIX_TITLE_STYLE}>Backtest Matrix</h2>
+            <p style={MATRIX_SUBTITLE_STYLE}>
+              Run <code>python -m runner.cli matrix</code> to generate strategy × symbol × timeframe results.
+            </p>
+          </div>
+          <button style={MATRIX_BUTTON_STYLE} onClick={() => void loadMatrix()}>
+            Refresh
+          </button>
+        </div>
+        {error ? <p style={MATRIX_ERROR_STYLE}>{error}</p> : null}
+      </div>
+    );
+  }
+
+  const overview = summary.strategy_overview ?? [];
+  const totalCells = summary.requested_cells || 0;
+  const okRate = totalCells ? (summary.ok_cells / totalCells) * 100 : 0;
+
+  return (
+    <div style={MATRIX_PANEL_STYLE}>
+      <div style={MATRIX_HEADER_STYLE}>
+        <div>
+          <h2 style={MATRIX_TITLE_STYLE}>Backtest Matrix</h2>
+          <p style={MATRIX_SUBTITLE_STYLE}>
+            Latest run: {summary.completed_at ? new Date(summary.completed_at).toLocaleString("de-DE") : "n/a"} ·{" "}
+            {summary.symbols.length} symbols × {summary.timeframes.length} timeframes × {summary.strategies.length} strategies
+          </p>
+        </div>
+        <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+          <a style={MATRIX_BUTTON_STYLE} href={getBacktestMatrixMatrixCsvUrl()} download>
+            matrix CSV
+          </a>
+          <a style={MATRIX_BUTTON_STYLE} href={getBacktestMatrixDailyEquityCsvUrl()} download>
+            daily equity CSV
+          </a>
+          <button style={MATRIX_BUTTON_STYLE} onClick={() => void loadMatrix()}>
+            Refresh
+          </button>
+        </div>
+      </div>
+
+      <div style={MATRIX_METRIC_GRID_STYLE}>
+        <MatrixMetric label="Cells OK" value={`${summary.ok_cells}/${totalCells}`} tone="positive" />
+        <MatrixMetric label="OK Rate" value={okRate ? `${okRate.toFixed(1)}%` : "0%"} tone={okRate >= 80 ? "positive" : "warning"} />
+        <MatrixMetric label="Failed" value={String(summary.failed_cells)} tone={summary.failed_cells ? "danger" : "positive"} />
+        <MatrixMetric label="Daily equity rows" value={summary.daily_equity_rows.toLocaleString("de-DE")} tone="neutral" />
+      </div>
+
+      <div style={{ overflowX: "auto", marginTop: "16px" }}>
+        <table style={MATRIX_TABLE_STYLE}>
+          <thead>
+            <tr>
+              <Th>Strategy</Th>
+              <Th align="right">OK</Th>
+              <Th align="right">Failed</Th>
+              <Th align="right">Trades</Th>
+              <Th align="right">P&L</Th>
+              <Th align="right">Avg Sharpe</Th>
+              <Th align="right">Best Sharpe</Th>
+              <Th align="right">Best Return</Th>
+              <Th>Best Cell</Th>
+            </tr>
+          </thead>
+          <tbody>
+            {overview.map((row) => (
+              <tr key={row.strategy}>
+                <Td>{row.strategy_name || row.strategy}</Td>
+                <Td align="right">{row.ok_cells}</Td>
+                <Td align="right" tone={row.failed_cells ? "danger" : "neutral"}>{row.failed_cells}</Td>
+                <Td align="right">{row.total_trades.toLocaleString("de-DE")}</Td>
+                <Td align="right" tone={metricValue(row.total_pnl) >= 0 ? "positive" : "danger"}>
+                  ${metricValue(row.total_pnl).toLocaleString("de-DE", { maximumFractionDigits: 0 })}
+                </Td>
+                <Td align="right" tone={metricValue(row.avg_sharpe) >= 0 ? "positive" : "danger"}>
+                  {formatNumber(row.avg_sharpe)}
+                </Td>
+                <Td align="right" tone={metricValue(row.best_sharpe) >= 0 ? "positive" : "danger"}>
+                  {formatNumber(row.best_sharpe)}
+                </Td>
+                <Td align="right" tone={metricValue(row.best_net_profit_pct) >= 0 ? "positive" : "danger"}>
+                  {percentage(row.best_net_profit_pct)}
+                </Td>
+                <Td>
+                  {row.best_symbol || row.best_timeframe ? `${row.best_symbol || ""} ${row.best_timeframe || ""}`.trim() : "—"}
+                </Td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+const MATRIX_PANEL_STYLE: React.CSSProperties = {
+  background: "var(--color-surface)",
+  border: "1px solid var(--color-border)",
+  borderRadius: "12px",
+  padding: "18px",
+  marginBottom: "20px",
+};
+const MATRIX_HEADER_STYLE: React.CSSProperties = {
+  display: "flex",
+  justifyContent: "space-between",
+  gap: "12px",
+  alignItems: "flex-start",
+  flexWrap: "wrap",
+};
+const MATRIX_TITLE_STYLE: React.CSSProperties = {
+  fontSize: "1rem",
+  fontWeight: 700,
+  margin: 0,
+};
+const MATRIX_SUBTITLE_STYLE: React.CSSProperties = {
+  color: "var(--color-text-muted)",
+  fontSize: "0.8rem",
+  margin: "4px 0 0",
+};
+const MATRIX_ERROR_STYLE: React.CSSProperties = {
+  color: "#f85149",
+  fontSize: "0.82rem",
+  margin: "12px 0 0",
+};
+const MATRIX_BUTTON_STYLE: React.CSSProperties = {
+  background: "rgba(88,166,255,0.10)",
+  border: "1px solid rgba(88,166,255,0.24)",
+  borderRadius: "8px",
+  color: "var(--color-text)",
+  padding: "8px 10px",
+  fontSize: "0.78rem",
+  textDecoration: "none",
+  cursor: "pointer",
+};
+const MATRIX_METRIC_GRID_STYLE: React.CSSProperties = {
+  display: "grid",
+  gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))",
+  gap: "10px",
+  marginTop: "16px",
+};
+const MATRIX_TABLE_STYLE: React.CSSProperties = {
+  width: "100%",
+  borderCollapse: "collapse",
+  fontSize: "0.78rem",
+};
+function MatrixMetric(props: { label: string; value: string; tone?: "positive" | "warning" | "danger" | "neutral" }) {
+  const color =
+    props.tone === "positive"
+      ? "#3fb950"
+      : props.tone === "danger"
+        ? "#f85149"
+        : props.tone === "warning"
+          ? "#fbbf24"
+          : "var(--color-text)";
+  return (
+    <div style={{ background: "var(--color-surface2)", border: "1px solid var(--color-border)", borderRadius: "10px", padding: "10px" }}>
+      <div style={{ color: "var(--color-text-muted)", fontSize: "0.72rem" }}>{props.label}</div>
+      <div style={{ color, fontWeight: 700, marginTop: "4px" }}>{props.value}</div>
+    </div>
+  );
+}
+function Th(props: { children: React.ReactNode; align?: "left" | "right" }) {
+  return (
+    <th
+      style={{
+        textAlign: props.align ?? "left",
+        padding: "8px",
+        color: "var(--color-text-muted)",
+        borderBottom: "1px solid var(--color-border)",
+      }}
+    >
+      {props.children}
+    </th>
+  );
+}
+function Td(props: { children: React.ReactNode; align?: "left" | "right"; tone?: string }) {
+  const color = props.tone === "positive" ? "#3fb950" : props.tone === "danger" ? "#f85149" : "var(--color-text)";
+  return (
+    <td
+      style={{
+        textAlign: props.align ?? "left",
+        padding: "8px",
+        borderBottom: "1px solid rgba(110,118,129,0.18)",
+        color,
+      }}
+    >
+      {props.children}
+    </td>
+  );
 }
 
 export function BacktestsPage() {
@@ -1041,6 +1274,8 @@ export function BacktestsPage() {
           filterPanelContent={filterPanelContent}
           filterButtonLabel="Filters"
         />
+
+        <BacktestMatrixPanel />
 
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
           <div style={{ color: "var(--color-text-muted)", fontSize: "0.78rem" }}>

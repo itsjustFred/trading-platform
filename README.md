@@ -77,7 +77,26 @@ python -m data_tools.catalog_builder -o "$DATA_DIR/catalog.json"
 
 # Migrate CSV data to Parquet
 python -m data_tools.migrate_csv --execute
+
+# Grid testing for strategy optimization
+python -m runner.grid_tester --strategy example_sma --symbols EURUSD,GBPUSD,USDJPY --timeframes 1h,4h,1d
+
+# Portfolio optimization
+python -m runner.portfolio_optimizer --backtest-ids bt_001,bt_002,bt_003
+
+# Walk-forward validation
+python -m runner.cli walkforward --strategy example_sma --train-months 12 --test-months 3
 ```
+
+## Advanced Workflows
+
+- **Grid Testing:** `runner/grid_tester.py` - Automated strategy matrices (Symbol × Timeframe × ParamSet)
+- **Portfolio Optimization:** `runner/portfolio_optimizer.py` - Multi-strategy allocation with OOS validation
+- **Walk-Forward Analysis:** Anti-overfitting validation with train/test splits
+- **Signal Bots:** `signal_bots/health_check.py` - Registry/config validation for stockkit, ramjet, rocketfuel, and nitro processors
+- **Live Risk Consistency:** Backtest vs live position sizing behavior and stop-direction validation
+
+Documentation: See `docs/grid_tester.md`, `docs/portfolio_optimizer.md`, `docs/walk_forward.md`, `docs/signal_bots.md`, and `docs/live-risk-consistency.md`
 
 ## Structure
 

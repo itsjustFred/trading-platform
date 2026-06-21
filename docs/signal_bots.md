@@ -23,29 +23,46 @@ Zentrale Registry in `signal_bots/registry.py`:
 | `rocketfuel_longandshort` | RocketFuelSignalProcessor | ✅ Verfügbar |
 | `nitro` | NitroSignalProcessor | ✅ Verfügbar (RamJet-Formeln, BUY-only) |
 
+Zusätzlich gilt `stockkit` als RamJet-kompatibler Prozessor und wird über dieselbe
+RamJet-Konfiguration validiert.
+
 ## Bots im Detail
 
 ### Nitro
 - **Status:** Aktiv, registriert
 - **Features:** RamJet-Formeln, BUY-only Signalzusammenführung
-- **Last-Run:** Nicht im Scheduler als Job konfiguriert
+- **Last-Run:** Über Health-Check-Job validierbar
 
 ### RamJet
 - **Status:** Aktiv, registriert
 - **Features:** ATR + Supertrend BUY-only Setup mit TP1 und trailing metadata
-- **Last-Run:** Nicht im Scheduler als Job konfiguriert
+- **Last-Run:** Über Health-Check-Job validierbar
 
 ### RocketFuel (Long-only & Long+Short)
 - **Status:** Aktiv, registriert
 - **Features:** Komplexere Entry-Logik, Varianten für Long-only vs Long+Short
-- **Last-Run:** Nicht im Scheduler als Job konfiguriert
+- **Last-Run:** Über Health-Check-Job validierbar
+
+### StockKit
+- **Status:** Aktiv, registriert als RamJet-kompatible Variante
+- **Features:** Nutzt RamJet-SL/TP- und Trailing-Metadaten-Verhalten
+- **Last-Run:** Über Health-Check-Job validierbar
 
 ## Health-Check Status
 
-**Stand 2026-06-17:**
-- Alle 3 Bots (`nitro`, `ramjet`, `rocketfuel`) sind registriert und importierbar
-- Keine laufenden Scheduler-Jobs gefunden (`scheduler/jobs/` enthält nur `weekly_data_refresh.py`)
-- Kein Health-Check-Job implementiert
+**Stand 2026-06-18:**
+- Alle 5 registrierten Prozessoren (`stockkit`, `ramjet`, `rocketfuel_longsonly`,
+  `rocketfuel_longandshort`, `nitro`) sind importierbar und haben gültige
+  Konfigurationsdateien.
+- Health-Check-CLI:
+  ```bash
+  python -m signal_bots.health_check
+  ```
+- Scheduler-Job: `scheduler/jobs/signal_bot_health_check.py` aktualisiert den
+  Hintergrundtask-Status und protokolliert Registry-/Config-Fehler.
+- Tests:
+  - `tests/test_signal_bot_health_check.py`
+  - `tests/test_scheduler_signal_bot_health.py`
 
 ## Risk-Engine Integration
 
@@ -57,6 +74,6 @@ Zentrale Registry in `signal_bots/registry.py`:
 
 ## Empfehlung
 
-Die Bots sind **nicht aktiv im Scheduler**. Optionen:
-1. Health-Check-Job erstellen in `scheduler/jobs/signal_bots_health.py`
-2. Oder als "available but not scheduled" dokumentieren
+Der Health-Check-Job ist implementiert. Für Produktionsbetrieb sollte die
+Scheduler-Konfiguration den Job regelmäßig ausführen und bei `failed`-Status
+einen Alert auslösen.

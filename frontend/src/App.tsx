@@ -12,6 +12,9 @@ const BacktestDetailPage = lazy(() =>
     default: mod.BacktestDetailPage,
   })),
 );
+const MatrixGridPage = lazy(() =>
+  import("./pages/MatrixGridPage").then((mod) => ({ default: mod.MatrixGridPage })),
+);
 const TradeChartPage = lazy(() =>
   import("./pages/TradeChartPage").then((mod) => ({ default: mod.TradeChartPage })),
 );
@@ -98,6 +101,7 @@ export default function App() {
             <Route path="/backtests/compare" element={<ComparePage />} />
             <Route path="/backtests/:id" element={<BacktestDetailPage />} />
             <Route path="/backtests/:id/trade/:nr" element={<TradeChartPage />} />
+            <Route path="/matrix-grid" element={<MatrixGridPage />} />
             <Route path="/optimizations" element={<OptimizationsPage />} />
             <Route
               path="/optimizations/:id"

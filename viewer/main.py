@@ -152,6 +152,7 @@ logger = get_logger("viewer")
 AGENT_CONVERT_PROVIDER_NAMES: tuple[str, ...] = ("nim", "copilot_sdk")
 
 BACKTESTS_DIR = DATA_DIR / "backtests"
+MATRIX_RESULTS_DIR = DATA_DIR / "backtests" / "matrix_runner"
 PORTFOLIOS_DIR = DATA_DIR / "portfolios"
 STRATEGIES_DIR = DEFAULT_STRATEGIES_DIR
 REACT_DIST = PROJECT_ROOT / "frontend" / "dist"
@@ -6249,6 +6250,47 @@ async def rename_strategy(name: str, payload: NameUpdateRequest) -> dict[str, An
     except Exception as exc:
         logger.exception("Failed to rename strategy %s: %s", name, exc)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+def _matrix_result_path(filename: str) -> Path:
+    normalized = str(filename or "").strip()
+    if not normalized or ".." in normalized or normalized.startswith("/"):
+        raise HTTPException(status_code=400, detail="Invalid matrix filename")
+    return MATRIX_RESULTS_DIR / normalized
+
+
+def _matrix_summary_payload() -> dict[str, Any]:
+    summary_path = MATRIX_RESULTS_DIR / "matrix_summary.json"
+    if not summary_path.exists():
+        raise HTTPException(status_code=404, detail="No matrix summary found. Run `python -m runner.cli matrix` first.")
+    try:
+        payload = json.loads(summary_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        raise HTTPException(status_code=500, detail=f"Invalid matrix summary: {exc}") from exc
+    payload["matrix_csv"] = str(_matrix_result_path("matrix_matrix.csv"))
+    payload["daily_equity_csv"] = str(_matrix_result_path("matrix_daily_equity.csv"))
+    return payload
+
+
+@app.get("/api/backtests/matrix/summary", response_model=dict[str, Any])
+async def get_backtest_matrix_summary() -> dict[str, Any]:
+    return _matrix_summary_payload()
+
+
+@app.get("/api/backtests/matrix/matrix.csv", response_class=FileResponse)
+async def get_backtest_matrix_csv() -> FileResponse:
+    path = _matrix_result_path("matrix_matrix.csv")
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Matrix CSV not found")
+    return FileResponse(path, media_type="text/csv", filename=path.name)
+
+
+@app.get("/api/backtests/matrix/daily-equity.csv", response_class=FileResponse)
+async def get_backtest_matrix_daily_equity_csv() -> FileResponse:
+    path = _matrix_result_path("matrix_daily_equity.csv")
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Matrix daily equity CSV not found")
+    return FileResponse(path, media_type="text/csv", filename=path.name)
 
 
 @app.get("/api/backtests", response_model=BacktestsListResponse)
