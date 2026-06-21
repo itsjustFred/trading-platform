@@ -82,6 +82,25 @@ def compute_psr_from_trades(output_path: str, capital: float | None) -> float | 
     return psr if math.isfinite(psr) else None
 
 
+def load_backtest_id(output_path: str, fallback: str | None = None) -> str:
+    if not output_path:
+        return fallback or ''
+    path = Path(output_path)
+    try:
+        with path.open('r', encoding='utf-8') as fh:
+            payload = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return fallback or path.name.removesuffix('.trades.json')
+    if not isinstance(payload, dict):
+        return fallback or path.name.removesuffix('.trades.json')
+    meta = payload.get('meta')
+    if isinstance(meta, dict):
+        backtest_id = str(meta.get('id') or '').strip()
+        if backtest_id:
+            return backtest_id
+    return fallback or path.name.removesuffix('.trades.json')
+
+
 def safe_round(value, digits=4):
     return round(value, digits) if value is not None and math.isfinite(value) else None
 
@@ -171,13 +190,16 @@ for item in report.get('strategies', []):
         symbols_seen.add(symbol)
         duration = parse_minutes(run.get('started_at'), run.get('finished_at'))
         psr = compute_psr_from_trades(run.get('output') or '', capital)
+        backtest_id = str(run.get('backtest_id') or '').strip() or load_backtest_id(run.get('output') or '', run.get('run_id'))
         row = {
             'strategy': strategy,
             'status': run.get('status'),
             'symbol': symbol,
             'timeframe': tf,
             'run_id': run.get('run_id'),
+            'backtest_id': backtest_id,
             'output': run.get('output'),
+            'trade_data_available': bool(run.get('trade_data_available', True) and run.get('output')),
             'started_at': run.get('started_at'),
             'finished_at': run.get('finished_at'),
             'duration_minutes': round(duration, 2) if duration is not None else None,

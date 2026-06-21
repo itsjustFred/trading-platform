@@ -92,11 +92,22 @@ def output_path_for(output_dir: Path, run_id: str) -> Path:
     return output_dir / f"{run_id}.trades.json"
 
 
+def backtest_id_from_output_path(path: Path) -> str:
+    name = path.name
+    if name.endswith(".trades.json"):
+        return name[: -len(".trades.json")]
+    return path.stem
+
+
 def read_backtest_stats(path: Path) -> dict[str, Any]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     stats = payload.get("stats", {}) if isinstance(payload, dict) else {}
     trades = payload.get("trades", []) if isinstance(payload, dict) else []
+    meta = payload.get("meta", {}) if isinstance(payload, dict) else {}
+    backtest_id = str(meta.get("id") or "").strip() if isinstance(meta, dict) else ""
     return {
+        "backtest_id": backtest_id or backtest_id_from_output_path(path),
+        "trade_data_available": isinstance(trades, list),
         "total_trades": len(trades) if isinstance(trades, list) else 0,
         "total_pnl": stats.get("total_pnl"),
         "net_profit_pct": stats.get("net_profit_pct", stats.get("total_return")),
@@ -131,6 +142,7 @@ def build_cli_command(
     data_dir: str,
     save_sqlite: bool = True,
     keep_indicators: bool = False,
+    result_id: str = "",
 ) -> list[str]:
     cmd = [
         sys.executable,
@@ -170,6 +182,8 @@ def build_cli_command(
         cmd.append("--skip-sqlite")
     if keep_indicators:
         cmd.append("--keep-indicators")
+    if result_id:
+        cmd.extend(["--result-id", result_id])
     return cmd
 
 
@@ -304,6 +318,7 @@ def run_one_backtest_in_process(
 
         logger.info("Running grid cell: engine=%s strategy=%s symbol=%s timeframe=%s", engine, strategy, symbol, timeframe)
         backtest_result = engine_adapter.run(config, strategy)
+        backtest_result.meta.id = run_id
         if not keep_indicators:
             backtest_result.indicators = []
         attach_daily_equity(backtest_result, start_date=start, end_date=end)
@@ -414,6 +429,7 @@ def run_one_backtest(
         data_dir=data_dir,
         save_sqlite=save_sqlite,
         keep_indicators=keep_indicators,
+        result_id=run_id,
     )
     result["cmd"] = " ".join(cmd)
 
@@ -445,6 +461,8 @@ def write_matrix_csv(output_dir: Path, rows: list[dict[str, Any]]) -> Path:
         "symbol",
         "timeframe",
         "status",
+        "backtest_id",
+        "trade_data_available",
         "total_trades",
         "total_pnl",
         "net_profit_pct",

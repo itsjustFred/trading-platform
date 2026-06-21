@@ -100,6 +100,8 @@ def write_matrix_csv(output_dir: Path, rows: list[dict[str, Any]]) -> Path:
         "symbol",
         "timeframe",
         "status",
+        "backtest_id",
+        "trade_data_available",
         "total_trades",
         "total_pnl",
         "net_profit_pct",

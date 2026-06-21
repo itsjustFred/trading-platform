@@ -205,6 +205,9 @@ def cmd_run(args):
         result = engine.run(config, args.strategy)
     else:
         result = engine.run(config, args.strategy, progress_callback=progress_callback)
+    result_id = str(getattr(args, "result_id", "") or "").strip()
+    if result_id:
+        result.meta.id = result_id
     if engine.name != "native":
         _emit_progress(progress_callback, 90.0, "Calculating statistics...")
     attach_daily_equity(result, start_date=start, end_date=end)
@@ -360,6 +363,7 @@ def main():
     )
     run_p.add_argument("--name", "-n", help="Strategy name (default: filename)")
     run_p.add_argument("--output", "-o", help="Output file path")
+    run_p.add_argument("--result-id", help="Persisted BacktestMeta.id override")
     run_p.add_argument("--skip-sqlite", action="store_true", help="Do not persist this run to SQLite")
     run_p.add_argument("--params", help="Parameters JSON, e.g. '{\"fast\": 10, \"slow\": 30}'")
     run_p.add_argument("--data-dir", help="Override data directory")
