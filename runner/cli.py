@@ -22,6 +22,7 @@ from typing import Callable
 
 from pydantic import ValidationError
 
+from data_tools.auto_download import ensure_backtest_data
 from runner.backtest_grid import DEFAULT_OUTPUT_DIR, parse_csv_list, parse_params, run_backtest_grid
 from runner.backtest_matrix import MATRIX_OUTPUT_DIR, run_backtest_matrix
 from runner.daily_equity import attach_daily_equity
@@ -150,6 +151,19 @@ def cmd_run(args):
         if not end:
             end = detected_end
         logger.info("Auto-detected date range: %s to %s", start, end)
+
+    downloaded = ensure_backtest_data(
+        symbols=args.symbols,
+        timeframe=normalized_timeframe,
+        start=start,
+        end=end,
+        data_dir=args.data_dir or "",
+        modeling_resolution=getattr(args, "intrabar_resolution", "open_close") or "open_close",
+        progress_callback=progress_callback,
+        log_callback=logger.info,
+    )
+    if downloaded:
+        logger.info("Auto-downloaded %d missing OHLCV dataset(s)", len(downloaded))
 
     try:
         config = BacktestConfig(

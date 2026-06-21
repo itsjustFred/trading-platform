@@ -23,6 +23,7 @@ from typing import Any, Iterable
 import pandas as pd
 from pydantic import ValidationError
 
+from data_tools.auto_download import ensure_backtest_data
 from runner.daily_equity import attach_daily_equity
 from runner.engines.base import BacktestConfig, resolve_strategy_parameters
 from runner.stats import compute_stats_for_result
@@ -269,6 +270,18 @@ def run_one_backtest_in_process(
             detected_start, detected_end = _detect_date_range(symbol, normalized_timeframe, data_dir)
             start_date = start_date or detected_start
             end_date = end_date or detected_end
+
+        downloaded = ensure_backtest_data(
+            symbols=[symbol],
+            timeframe=normalized_timeframe,
+            start=start_date,
+            end=end_date,
+            data_dir=data_dir,
+            modeling_resolution=intrabar_resolution or "open_close",
+            log_callback=logger.info,
+        )
+        if downloaded:
+            result["auto_downloaded_data"] = downloaded
 
         config = BacktestConfig(
             strategy_name=Path(strategy).stem,
