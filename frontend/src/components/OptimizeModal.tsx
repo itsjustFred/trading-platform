@@ -12,6 +12,7 @@ import { Modal } from "./Modal";
 
 type MetricOption = OptimizationRunRequest["target_metric"];
 type ParameterKind = "int" | "float" | "categorical";
+type OptimizationMode = NonNullable<OptimizationRunRequest["optimization_mode"]>;
 
 interface OptimizeModalProps {
   open: boolean;
@@ -135,6 +136,25 @@ function buildRangePayload(
   return payload;
 }
 
+function parseSymbolUniverses(raw: string): string[][] {
+  const universes = raw
+    .split(/\r?\n/)
+    .map((line) =>
+      line
+        .split(",")
+        .map((symbol) => symbol.trim().toUpperCase())
+        .filter(Boolean),
+    )
+    .filter((symbols) => symbols.length > 0);
+
+  for (const symbols of universes) {
+    if (symbols.length < 2) {
+      throw new Error("Each symbol universe must contain at least two symbols.");
+    }
+  }
+  return universes;
+}
+
 export function OptimizeModal({
   open,
   onClose,
@@ -146,6 +166,8 @@ export function OptimizeModal({
   const { showToast } = useToast();
   const [parameterDrafts, setParameterDrafts] = useState<Record<string, ParameterDraft>>({});
   const [targetMetric, setTargetMetric] = useState<MetricOption>("sharpe");
+  const [optimizationMode, setOptimizationMode] = useState<OptimizationMode>("parameter");
+  const [symbolUniversesText, setSymbolUniversesText] = useState("");
   const [nTrials, setNTrials] = useState("100");
   const [trainSplitPct, setTrainSplitPct] = useState("0.7");
   const [running, setRunning] = useState(false);
@@ -172,6 +194,8 @@ export function OptimizeModal({
 
     setParameterDrafts(nextDrafts);
     setTargetMetric("sharpe");
+    setOptimizationMode("parameter");
+    setSymbolUniversesText("");
     setNTrials("100");
     setTrainSplitPct("0.7");
     setError("");
@@ -191,6 +215,11 @@ export function OptimizeModal({
         return count + (draft.min.trim() && draft.max.trim() ? 1 : 0);
       }, 0),
     [parameterEntries],
+  );
+
+  const symbolUniverseCount = useMemo(
+    () => symbolUniversesText.split(/\r?\n/).filter((line) => line.trim()).length,
+    [symbolUniversesText],
   );
 
   const updateDraft = (name: string, patch: Partial<ParameterDraft>) => {
@@ -220,8 +249,13 @@ export function OptimizeModal({
       }
 
       const parameterRanges = buildRangePayload(parameterDrafts);
-      if (Object.keys(parameterRanges).length === 0) {
-        throw new Error("Configure at least one parameter range or category list.");
+      const symbolUniverses = parseSymbolUniverses(symbolUniversesText);
+      if (
+        Object.keys(parameterRanges).length === 0
+        && optimizationMode !== "risk_parity_universe"
+        && symbolUniverses.length === 0
+      ) {
+        throw new Error("Configure at least one parameter range, category list, or symbol universe.");
       }
 
       const response = await runOptimization({
@@ -230,6 +264,8 @@ export function OptimizeModal({
         n_trials: parsedTrials,
         train_split_pct: parsedSplit,
         parameter_ranges: parameterRanges,
+        optimization_mode: optimizationMode,
+        symbol_universes: symbolUniverses,
       });
 
       const taskId = response.task_id || response.job_id;
@@ -347,7 +383,9 @@ export function OptimizeModal({
                 <div style={{ fontSize: "0.72rem", textTransform: "uppercase", letterSpacing: "0.12em", color: "#fbbf24" }}>
                   Active parameters
                 </div>
-                <div style={{ marginTop: "8px", fontSize: "1.8rem", fontWeight: 700 }}>{configuredCount}</div>
+                <div style={{ marginTop: "8px", fontSize: "1.8rem", fontWeight: 700 }}>
+                  {configuredCount + symbolUniverseCount}
+                </div>
               </div>
               <div
                 style={{
@@ -534,6 +572,40 @@ export function OptimizeModal({
         <div
           style={{
             display: "grid",
+            gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))",
+            gap: "12px",
+            borderRadius: "22px",
+            border: "1px solid rgba(148, 163, 184, 0.16)",
+            background: "linear-gradient(180deg, rgba(15, 23, 42, 0.94), rgba(2, 6, 23, 0.94))",
+            padding: "18px",
+          }}
+        >
+          <div>
+            <label style={labelStyle}>Optimization Mode</label>
+            <select
+              value={optimizationMode}
+              onChange={(event) => setOptimizationMode(event.target.value as OptimizationMode)}
+              style={inputStyle}
+            >
+              <option value="parameter">Parameter sweep</option>
+              <option value="risk_parity_universe">Risk parity universes</option>
+            </select>
+          </div>
+          <div>
+            <label style={labelStyle}>Fixed Symbol Lists</label>
+            <textarea
+              value={symbolUniversesText}
+              onChange={(event) => setSymbolUniversesText(event.target.value)}
+              placeholder={"SPY, TLT, GLD\nSPY, IEF, DBC, GLD"}
+              rows={3}
+              style={{ ...inputStyle, resize: "vertical", minHeight: "92px" }}
+            />
+          </div>
+        </div>
+
+        <div
+          style={{
+            display: "grid",
             gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))",
             gap: "12px",
             borderRadius: "22px",
@@ -614,7 +686,14 @@ export function OptimizeModal({
             <button
               type="button"
               onClick={handleStart}
-              disabled={running || parameterEntries.length === 0}
+              disabled={
+                running
+                || (
+                  parameterEntries.length === 0
+                  && symbolUniverseCount === 0
+                  && optimizationMode !== "risk_parity_universe"
+                )
+              }
               style={{
                 display: "inline-flex",
                 alignItems: "center",
@@ -629,7 +708,15 @@ export function OptimizeModal({
                 padding: "12px 18px",
                 cursor: running ? "progress" : "pointer",
                 boxShadow: running ? "none" : "0 18px 40px rgba(14, 165, 233, 0.18)",
-                opacity: running || parameterEntries.length === 0 ? 0.7 : 1,
+                opacity:
+                  running
+                  || (
+                    parameterEntries.length === 0
+                    && symbolUniverseCount === 0
+                    && optimizationMode !== "risk_parity_universe"
+                  )
+                    ? 0.7
+                    : 1,
               }}
             >
               <Target size={16} />

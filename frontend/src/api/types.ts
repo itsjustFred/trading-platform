@@ -277,6 +277,8 @@ export interface OptimizationRunRequest {
   n_trials: number;
   train_split_pct: number;
   parameter_ranges: Record<string, OptimizationParameterRange>;
+  optimization_mode?: "parameter" | "risk_parity_universe";
+  symbol_universes?: string[][];
 }
 
 export interface OptimizationRunResponse {
@@ -330,11 +332,14 @@ export interface OptimizationDetail {
     path: string;
   };
   symbols: string[];
+  best_symbols?: string[];
   timeframe: string;
   target_metric: string;
   n_trials: number;
   train_split_pct: number;
+  optimization_mode?: string;
   parameter_ranges: Record<string, OptimizationParameterRange>;
+  symbol_universes?: string[][];
   base_parameters: Record<string, StrategyParameterValue>;
   best_params: Record<string, StrategyParameterValue>;
   effective_best_parameters: Record<string, StrategyParameterValue>;
