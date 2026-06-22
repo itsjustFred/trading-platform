@@ -117,6 +117,13 @@ Im Repo existieren bereits ausgearbeitete Strategie-Vergleiche unter `strategy-c
 - **Geschätzte Dauer:** ~5 Minuten für alle 11 Symbole (Daily, 9 Jahre).
 - **Status:** ✅ **Bereits heruntergeladen** via `data_tools/downloaders/yfinance_dl.py` unter `/mnt/block-volume-data/ohlcv/yfinance/equity/US/{SYMBOL}/1d.parquet`.
 
+### 3. Dukascopy EURUSD H1
+- **Status:** ✅ **Download abgeschlossen** (trotz 503-Warnungen für einzelne Tage).
+  - **Datei:** `/mnt/block-volume-data/ohlcv/dukascopy/forex/EURUSD/1h.parquet`
+  - **Zeitraum:** 2008-01-01 bis 2026-06-21
+  - **Zeilen:** 52.575
+  - **Quelle:** Dukascopy native `.bi5` → Parquet
+
 ---
 
 ## Projekt-Phasen (Priorisiert)
