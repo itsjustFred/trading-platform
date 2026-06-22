@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { Link } from "react-router-dom";
 import { ArrowUpRight, Target, Telescope } from "lucide-react";
 
 import { getOptimizations } from "../api/client";
@@ -19,7 +19,6 @@ function formatMetricValue(metric: string, value: number | string | boolean | nu
 }
 
 export function OptimizationsPage() {
-  const navigate = useNavigate();
   const [optimizations, setOptimizations] = useState<OptimizationSummary[]>([]);
   const [search, setSearch] = useState("");
   const [loading, setLoading] = useState(true);
@@ -187,10 +186,9 @@ export function OptimizationsPage() {
               optimization.best_value,
             );
             return (
-              <button
+              <Link
                 key={optimization.id}
-                type="button"
-                onClick={() => navigate(`/optimizations/${optimization.id}`)}
+                to={`/optimizations/${optimization.id}`}
                 style={{
                   textAlign: "left",
                   borderRadius: "22px",
@@ -202,6 +200,7 @@ export function OptimizationsPage() {
                   cursor: "pointer",
                   display: "grid",
                   gap: "16px",
+                  textDecoration: "none",
                 }}
               >
                 <div style={{ display: "flex", justifyContent: "space-between", gap: "12px", alignItems: "flex-start" }}>
@@ -291,7 +290,7 @@ export function OptimizationsPage() {
                     </span>
                   ))}
                 </div>
-              </button>
+              </Link>
             );
           })}
         </div>

@@ -1,5 +1,5 @@
 import { memo, useCallback, useEffect, useMemo, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { ArrowUpDown, Plus, Scale, Trash2 } from "lucide-react";
 
 import {
@@ -1362,7 +1362,6 @@ export function BacktestsPage() {
             return (
               <article
                 key={item.id}
-                onClick={() => navigate(`/backtests/${item.id}`)}
                 style={{
                   position: "relative",
                   borderRadius: "12px",
@@ -1392,6 +1391,16 @@ export function BacktestsPage() {
                   }
                 }}
               >
+                <Link
+                  to={`/backtests/${item.id}`}
+                  aria-label={`Open backtest ${item.strategy_name || item.id}`}
+                  style={{
+                    position: "absolute",
+                    inset: 0,
+                    zIndex: 1,
+                    borderRadius: "12px",
+                  }}
+                />
                 <input
                   type="checkbox"
                   checked={selected}

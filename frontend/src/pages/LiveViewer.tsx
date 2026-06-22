@@ -1,6 +1,6 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { useNavigate, useParams } from "react-router-dom";
+import { Link, useParams } from "react-router-dom";
 import { ArrowLeft, Radio } from "lucide-react";
 import {
   CandlestickSeries,
@@ -78,7 +78,6 @@ function resolveChartLocale(): string {
 
 export function LiveViewerPage() {
   const { accountId: rawAccountId } = useParams<{ accountId: string }>();
-  const navigate = useNavigate();
   const queryClient = useQueryClient();
   const accountId = decodeURIComponent(rawAccountId ?? "");
   const positionsStream = useLivePositionsStream(accountId);
@@ -345,13 +344,13 @@ export function LiveViewerPage() {
           }}
         >
           <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
-            <button
-              onClick={() => navigate(`/live/${encodeURIComponent(accountId)}`)}
+            <Link
+              to={"/live/" + encodeURIComponent(accountId)}
               style={iconButtonStyle}
               title="Back to account details"
             >
               <ArrowLeft size={15} />
-            </button>
+            </Link>
             <div>
               <h1 style={{ margin: 0, fontSize: "1.35rem", fontWeight: 700 }}>
                 {accountName}

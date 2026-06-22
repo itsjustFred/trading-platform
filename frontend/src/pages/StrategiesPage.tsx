@@ -1,25 +1,27 @@
-import { memo, useCallback, useMemo, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { memo, useMemo, useState } from "react";
+import { Link } from "react-router-dom";
 import { FilterBar } from "../components/FilterBar";
 import { useStrategies } from "../api/queries";
 import type { StrategyMeta } from "../api/types";
 
 const StrategyCard = memo(function StrategyCard({
   strategy,
-  onOpen,
 }: {
   strategy: StrategyMeta;
-  onOpen: (strategy: StrategyMeta) => void;
 }) {
+  const href = `/strategies/${encodeURIComponent(strategy.slug || strategy.name)}`;
   return (
-    <div
-      onClick={() => onOpen(strategy)}
+    <Link
+      to={href}
       style={{
         background: "var(--color-surface)",
         border: "1px solid var(--color-border)",
         borderRadius: "8px",
         padding: "16px",
         cursor: "pointer",
+        color: "inherit",
+        display: "block",
+        textDecoration: "none",
       }}
       onMouseEnter={(e) =>
         (e.currentTarget.style.borderColor = "rgba(88,166,255,0.4)")
@@ -105,12 +107,11 @@ const StrategyCard = memo(function StrategyCard({
           </span>
         ) : null}
       </div>
-    </div>
+    </Link>
   );
 });
 
 export function StrategiesPage() {
-  const navigate = useNavigate();
   const [filters, setFilters] = useState<Record<string, string>>({});
   const [sortBy, setSortBy] = useState("name_asc");
 
@@ -179,13 +180,6 @@ export function StrategiesPage() {
     });
     return result;
   }, [strategies, search, filters, sortBy]);
-
-  const handleOpenStrategy = useCallback(
-    (selected: StrategyMeta) => {
-      navigate(`/strategies/${encodeURIComponent(selected.slug || selected.name)}`);
-    },
-    [navigate],
-  );
 
   return (
     <div style={{ padding: "24px" }}>
@@ -256,7 +250,6 @@ export function StrategiesPage() {
             <StrategyCard
               key={strategy.slug || strategy.name}
               strategy={strategy}
-              onOpen={handleOpenStrategy}
             />
           ))}
         </div>

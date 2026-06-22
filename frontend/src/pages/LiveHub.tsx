@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { useNavigate } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { Activity, Pause, Plus, Square, X } from "lucide-react";
 
 import {
@@ -88,14 +88,12 @@ type LiveHubAccountStats = {
 const LiveDeploymentCard = memo(function LiveDeploymentCard({
   card,
   busy,
-  onNavigate,
   onPause,
   onStop,
   onDelete,
 }: {
   card: DeploymentCard;
   busy: boolean;
-  onNavigate: (accountId: string) => void;
   onPause: (card: DeploymentCard, event: React.MouseEvent<HTMLButtonElement>) => void;
   onStop: (card: DeploymentCard, event: React.MouseEvent<HTMLButtonElement>) => void;
   onDelete: (card: DeploymentCard, event: React.MouseEvent<HTMLButtonElement>) => void;
@@ -103,14 +101,19 @@ const LiveDeploymentCard = memo(function LiveDeploymentCard({
   return (
     <div
       key={card.id}
-      onClick={() => onNavigate(card.account_id)}
       style={{
         border: "1px solid var(--color-border)",
         borderRadius: "10px",
         padding: "10px",
         cursor: "pointer",
+        position: "relative",
       }}
     >
+      <Link
+        to={"/live/" + encodeURIComponent(card.account_id)}
+        aria-label={`Open live account `}
+        style={{ position: "absolute", inset: 0, zIndex: 1, borderRadius: "10px" }}
+      />
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
         <div style={{ fontWeight: 600, fontSize: "0.87rem" }}>{card.strategy_name}</div>
         <div style={statusChipStyle(card.status)}>{card.status}</div>
@@ -652,13 +655,6 @@ export function LiveHubPage() {
       setDeploymentBusy(card.id, false);
     }
   }, [refreshDeployments, showToast]);
-
-  const navigateToLiveAccount = useCallback(
-    (accountId: string) => {
-      navigate(`/live/${encodeURIComponent(accountId)}`);
-    },
-    [navigate],
-  );
 
   return (
     <div style={{ padding: "24px" }}>
@@ -1310,7 +1306,6 @@ export function LiveHubPage() {
                         key={card.id}
                         card={card}
                         busy={updatingDeploymentIds.has(card.id)}
-                        onNavigate={navigateToLiveAccount}
                         onPause={handlePauseControl}
                         onStop={handleStopControl}
                         onDelete={handleDelete}

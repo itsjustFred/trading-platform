@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { useNavigate, useParams } from "react-router-dom";
+import { Link, useParams } from "react-router-dom";
 import { ArrowLeft, ArrowUpRight, Gauge, Layers3, Target } from "lucide-react";
 
 import { getBacktestInfo, getOptimization } from "../api/client";
@@ -37,7 +37,6 @@ function formatComparisonValue(key: string, value: number | string | boolean | n
 
 export function OptimizationResultsPage() {
   const { id } = useParams<{ id: string }>();
-  const navigate = useNavigate();
   const [optimization, setOptimization] = useState<OptimizationDetail | null>(null);
   const [backtestInfo, setBacktestInfo] = useState<BacktestInfo | null>(null);
   const [loading, setLoading] = useState(true);
@@ -146,9 +145,8 @@ export function OptimizationResultsPage() {
         <div style={{ position: "relative", display: "grid", gap: "18px" }}>
           <div style={{ display: "flex", justifyContent: "space-between", gap: "16px", flexWrap: "wrap" }}>
             <div style={{ display: "grid", gap: "10px" }}>
-              <button
-                type="button"
-                onClick={() => navigate("/optimizations")}
+              <Link
+                to="/optimizations"
                 style={{
                   display: "inline-flex",
                   alignItems: "center",
@@ -158,11 +156,12 @@ export function OptimizationResultsPage() {
                   color: "var(--color-text-muted)",
                   cursor: "pointer",
                   padding: 0,
+                  textDecoration: "none",
                 }}
               >
                 <ArrowLeft size={16} />
                 Back to optimizations
-              </button>
+              </Link>
               <div
                 style={{
                   display: "inline-flex",
@@ -194,9 +193,8 @@ export function OptimizationResultsPage() {
               </div>
             </div>
             <div style={{ display: "flex", gap: "10px", flexWrap: "wrap", alignItems: "flex-start" }}>
-              <button
-                type="button"
-                onClick={() => navigate(`/backtests/${optimization.base_backtest_id}`)}
+              <Link
+                to={`/backtests/${optimization.base_backtest_id}`}
                 style={{
                   display: "inline-flex",
                   alignItems: "center",
@@ -207,11 +205,12 @@ export function OptimizationResultsPage() {
                   color: "#bfdbfe",
                   padding: "12px 16px",
                   cursor: "pointer",
+                  textDecoration: "none",
                 }}
               >
                 Open base backtest
                 <ArrowUpRight size={15} />
-              </button>
+              </Link>
             </div>
           </div>
 

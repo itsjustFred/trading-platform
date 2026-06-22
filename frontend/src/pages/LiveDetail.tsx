@@ -1,5 +1,5 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams } from "react-router-dom";
 import { ArrowLeft } from "lucide-react";
 import {
   AreaSeries,
@@ -355,8 +355,8 @@ export function LiveDetailPage() {
           }}
         >
             <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
-              <button
-                onClick={() => navigate("/live")}
+              <Link
+                to="/live"
               style={{
                 border: "1px solid rgba(59, 130, 246, 0.3)",
                 background: "rgba(59, 130, 246, 0.1)",
@@ -369,7 +369,7 @@ export function LiveDetailPage() {
               title="Back to Live Hub"
             >
                 <ArrowLeft size={16} />
-              </button>
+              </Link>
               <button
                 onClick={() => setReplayModalOpen(true)}
                 style={{
@@ -387,8 +387,8 @@ export function LiveDetailPage() {
               >
                 Backtest Signals
               </button>
-              <button
-                onClick={() => navigate(`/live/${encodeURIComponent(accountId)}/viewer`)}
+              <Link
+                to={"/live/" + encodeURIComponent(accountId) + "/viewer"}
                 style={{
                   border: "1px solid rgba(59, 130, 246, 0.38)",
                   background: "rgba(59, 130, 246, 0.14)",
@@ -399,11 +399,14 @@ export function LiveDetailPage() {
                   padding: "0 12px",
                   fontSize: "0.8rem",
                   fontWeight: 600,
+                  textDecoration: "none",
+                  display: "inline-flex",
+                  alignItems: "center",
                 }}
                 title="Open live viewer"
               >
                 Open Live Viewer
-              </button>
+              </Link>
               <div>
                 <h1 style={{ margin: 0, fontSize: "1.4rem", fontWeight: 700 }}>
                   Live Account {accountId}

@@ -1,5 +1,5 @@
 import { memo, useCallback, useEffect, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { ArrowUpDown, Plus, Trash2, X } from "lucide-react";
 
 import type {
@@ -65,18 +65,15 @@ const PORTFOLIO_SORT_OPTIONS: Array<{ label: string; value: PortfoliosSortField 
 
 const PortfolioCard = memo(function PortfolioCard({
   portfolio,
-  onOpen,
   onDelete,
 }: {
   portfolio: PortfolioSummary & { equity_mini?: number[]; max_drawdown_pct?: number; net_profit_pct?: number };
-  onOpen: (id: string) => void;
   onDelete: (id: string, event: React.MouseEvent) => void;
 }) {
   const componentCount = Number(portfolio.strategy_count || 0);
   const hasComponents = componentCount > 0;
   return (
     <div
-      onClick={() => onOpen(portfolio.id)}
       style={{
         background: "var(--color-surface)",
         border: "1px solid var(--color-border)",
@@ -88,6 +85,16 @@ const PortfolioCard = memo(function PortfolioCard({
       onMouseEnter={(e) => (e.currentTarget.style.borderColor = "rgba(88,166,255,0.4)")}
       onMouseLeave={(e) => (e.currentTarget.style.borderColor = "var(--color-border)")}
     >
+      <Link
+        to={`/portfolios/${portfolio.id}`}
+        aria-label={`Open portfolio ${portfolio.name || portfolio.id}`}
+        style={{
+          position: "absolute",
+          inset: 0,
+          zIndex: 1,
+          borderRadius: "8px",
+        }}
+      />
       <div
         style={{
           display: "flex",
@@ -104,6 +111,8 @@ const PortfolioCard = memo(function PortfolioCard({
             color: "var(--color-text-muted)",
             cursor: "pointer",
             padding: "2px",
+            position: "relative",
+            zIndex: 2,
           }}
         >
           <Trash2 size={14} />
@@ -388,13 +397,6 @@ export function PortfoliosPage() {
     }
   };
 
-  const handleOpenPortfolio = useCallback(
-    (id: string) => {
-      navigate(`/portfolios/${id}`);
-    },
-    [navigate],
-  );
-
   const toggleSelected = (id: string) => {
     setSelectedIds((current) => {
       const next = new Set(current);
@@ -648,7 +650,7 @@ export function PortfoliosPage() {
                   }}
                   aria-label={`Select portfolio ${portfolio.name || portfolio.id}`}
                 />
-                <PortfolioCard portfolio={portfolio} onOpen={handleOpenPortfolio} onDelete={handleDelete} />
+                <PortfolioCard portfolio={portfolio} onDelete={handleDelete} />
               </div>
             ))}
           </div>
