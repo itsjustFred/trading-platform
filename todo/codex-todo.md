@@ -63,8 +63,8 @@
 
 ### 2. Alpaca Live-Integration
 - **Code:** `live_runner/alpaca_adapter.py`
-- **Status:** Unit-Tests grün. **Nicht** gegen echte Alpaca Paper-Accounts getestet.
-- **Risiko:** Account-Discovery (`PA3T0MQAGQ51`, `PA3EFBL4P7BU`, `PA3E767TJ91D`) ist im Code, aber ob die Keys noch gültig sind, wurde nicht verifiziert.
+- **Status:** Unit-Tests grün + orderfreier Connectivity-Preflight gegen echte Alpaca Paper-Accounts am 2026-06-22 erfolgreich (Nitro, RocketFuel, RamJet; paper=true; Balance/Positions lesbar). Siehe `reports/live-smoke-progress-2026-06-22.md`.
+- **Risiko:** Echte Paper-Demo-Order mit fill/cancel/close/reconcile ist noch offen; Account-Keys selbst sind gültig genug für Account-/Positionsabfragen.
 
 ### 3. Discord Signal Routing
 - **Code:** `live_runner/signal_sources/discord_source.py`, `signal_bots/`
@@ -81,7 +81,8 @@
 
 ### 1. Echte End-to-End-Live-Tests
 - [x] Orderfreier Live-Smoke-Preflight: `python -m live_runner.preflight --config ... --accounts-env ...` prüft Deployment-Zuordnung, Credential-Verfügbarkeit, Paper/Demo-Modus-Warnungen und cTrader Account-ID-Form, ohne Broker-Orders zu platzieren.
-- [ ] Alpaca Paper: Mindestens eine Demo-Order pro Account (RamJet, RocketFuel, Nitro) plazieren + fill/cancel/close/reconcile verifizieren
+- [x] Alpaca Paper: Minimaler BTC/USD-Paper-Roundtrip auf Nitro, RocketFuel und RamJet ausgeführt; Buy/Sell jeweils filled, danach `remaining_qty=0.0`. Report: `reports/live_smoke_alpaca-crypto-roundtrip_20260622T231721Z.json`.
+- [x] cTrader Demo: Account-Discovery + Adapter-Connect gegen echten Demo-Account `47644617` verifiziert; Balance/Equity 100000.00, keine offenen Positionen. Report: `reports/live_smoke_account-check_20260622T231539Z.json`.
 - [ ] cTrader Demo: Erste Demo-Order plazieren + fill verifizieren
 - [ ] Discord → Order: Einen echten Signal-Parsing-Durchlauf mit mindestens einem Bot
 

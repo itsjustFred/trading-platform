@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field
@@ -9,9 +10,9 @@ from typing import Any
 
 from dotenv import dotenv_values
 
-from live_runner.alpaca_adapter import resolve_alpaca_credentials
+from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credentials
 from live_runner.config_parser import parse_live_deployments_config
-from live_runner.ctrader_adapter import DEFAULT_ACCOUNTS_ENV
+from live_runner.ctrader_adapter import CTraderLiveAdapter, DEFAULT_ACCOUNTS_ENV
 from shared.models import LiveAccountConfig, LiveDeploymentConfig
 
 
@@ -22,6 +23,10 @@ class LivePreflightAccountResult:
     ok: bool
     paper: bool | None = None
     demo: bool | None = None
+    connected: bool | None = None
+    balance: float | None = None
+    equity: float | None = None
+    positions_count: int | None = None
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
@@ -70,11 +75,16 @@ def _preflight_account(
     account: LiveAccountConfig,
     *,
     env_values: Mapping[str, str],
+    check_connectivity: bool,
 ) -> LivePreflightAccountResult:
     errors: list[str] = []
     warnings: list[str] = []
     paper: bool | None = None
     demo: bool | None = None
+    connected: bool | None = None
+    balance: float | None = None
+    equity: float | None = None
+    positions_count: int | None = None
 
     if account.broker == "alpaca":
         credentials = resolve_alpaca_credentials(
@@ -88,9 +98,32 @@ def _preflight_account(
                 "ALPACA_API_KEY/ALPACA_SECRET_KEY or a matching ACC{N} block."
             )
         else:
-            _, _, paper = credentials
+            api_key, secret_key, paper = credentials
             if not paper:
                 warnings.append("Alpaca account resolves to live mode, not paper mode.")
+            if check_connectivity:
+                adapter = AlpacaLiveAdapter(
+                    api_key=api_key,
+                    secret_key=secret_key,
+                    paper=paper,
+                    account_id=account.id,
+                )
+                try:
+                    asyncio.run(adapter.connect())
+                    balance, equity = asyncio.run(adapter.get_balance())
+                    positions = asyncio.run(adapter.get_positions())
+                    positions_count = len(positions)
+                    connected = True
+                except Exception as exc:
+                    connected = False
+                    errors.append(
+                        f"Alpaca connectivity check failed: {type(exc).__name__}: {exc}"
+                    )
+                finally:
+                    try:
+                        asyncio.run(adapter.disconnect())
+                    except Exception:
+                        pass
 
     elif account.broker == "ctrader":
         credentials = _resolve_ctrader_credentials(env_values)
@@ -113,6 +146,33 @@ def _preflight_account(
                 )
         except ValueError:
             errors.append("cTrader account id must be numeric via ctid, broker_login, or id.")
+        if check_connectivity and credentials is not None and not errors:
+            app_id, app_secret, access_token, refresh_token, demo = credentials
+            adapter = CTraderLiveAdapter(
+                app_id=app_id,
+                app_secret=app_secret,
+                access_token=access_token,
+                refresh_token=refresh_token,
+                account_id=account_identifier,
+                demo=demo,
+                account_config_id=account.id,
+            )
+            try:
+                asyncio.run(adapter.connect())
+                balance, equity = asyncio.run(adapter.get_balance())
+                positions = asyncio.run(adapter.get_positions())
+                positions_count = len(positions)
+                connected = True
+            except Exception as exc:
+                connected = False
+                errors.append(
+                    f"cTrader connectivity check failed: {type(exc).__name__}: {exc}"
+                )
+            finally:
+                try:
+                    asyncio.run(adapter.disconnect())
+                except Exception:
+                    pass
 
     return LivePreflightAccountResult(
         account_id=account.id,
@@ -120,6 +180,10 @@ def _preflight_account(
         ok=not errors,
         paper=paper,
         demo=demo,
+        connected=connected,
+        balance=balance,
+        equity=equity,
+        positions_count=positions_count,
         errors=errors,
         warnings=warnings,
     )
@@ -154,6 +218,7 @@ def run_live_preflight(
     *,
     accounts_env_path: str | Path = DEFAULT_ACCOUNTS_ENV,
     env: Mapping[str, str] | None = None,
+    check_connectivity: bool = False,
 ) -> LivePreflightResult:
     config = Path(config_path)
     accounts_env = Path(accounts_env_path)
@@ -161,7 +226,11 @@ def run_live_preflight(
     env_values = dict(env) if env is not None else _load_env_file(accounts_env)
 
     account_results = [
-        _preflight_account(account, env_values=env_values)
+        _preflight_account(
+            account,
+            env_values=env_values,
+            check_connectivity=check_connectivity,
+        )
         for account in accounts
     ]
     deployment_errors, deployment_warnings = _validate_deployments(accounts, deployments)
@@ -193,9 +262,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=str(DEFAULT_ACCOUNTS_ENV),
         help="Path to .accounts.env-style credential file.",
     )
+    parser.add_argument(
+        "--check-connectivity",
+        action="store_true",
+        help="Connect to brokers and read balance/positions without placing orders.",
+    )
     args = parser.parse_args(argv)
 
-    result = run_live_preflight(args.config, accounts_env_path=args.accounts_env)
+    result = run_live_preflight(
+        args.config,
+        accounts_env_path=args.accounts_env,
+        check_connectivity=args.check_connectivity,
+    )
     print(json.dumps(_result_to_jsonable(result), indent=2, sort_keys=True))
     return 0 if result.ok else 1
 

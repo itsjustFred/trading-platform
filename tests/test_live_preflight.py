@@ -136,3 +136,106 @@ def test_live_preflight_reports_unknown_deployment_account(tmp_path: Path) -> No
     assert result.deployment_errors == [
         "orphan_strategy (missing-account): references unknown account_id."
     ]
+
+
+
+def test_live_preflight_connectivity_reads_alpaca_balance_and_positions(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config_path = _write_config(
+        tmp_path / "live_deployments.yaml",
+        """
+        accounts:
+          - id: alpaca-paper
+            broker: alpaca
+
+        deployments:
+          - strategy_name: equity_momentum
+            account_id: alpaca-paper
+            symbols: [AAPL]
+            timeframe: 1h
+        """,
+    )
+
+    class _FakeAlpacaAdapter:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        async def connect(self):
+            return None
+
+        async def get_balance(self):
+            return 1234.5, 2345.6
+
+        async def get_positions(self):
+            return [{"symbol": "AAPL"}, {"symbol": "MSFT"}]
+
+        async def disconnect(self):
+            return None
+
+    from live_runner import preflight
+
+    monkeypatch.setattr(preflight, "AlpacaLiveAdapter", _FakeAlpacaAdapter)
+
+    result = run_live_preflight(
+        config_path,
+        env={
+            "ALPACA_API_KEY": "alpaca-key",
+            "ALPACA_SECRET_KEY": "alpaca-secret",
+            "ALPACA_PAPER": "true",
+        },
+        check_connectivity=True,
+    )
+
+    assert result.ok is True
+    assert result.accounts[0].connected is True
+    assert result.accounts[0].balance == 1234.5
+    assert result.accounts[0].equity == 2345.6
+    assert result.accounts[0].positions_count == 2
+
+
+def test_live_preflight_connectivity_reports_ctrader_error(tmp_path: Path, monkeypatch) -> None:
+    config_path = _write_config(
+        tmp_path / "live_deployments.yaml",
+        """
+        accounts:
+          - id: "10105152"
+            broker: ctrader
+
+        deployments:
+          - strategy_name: fx_breakout
+            account_id: "10105152"
+            symbols: [EURUSD]
+            timeframe: 15m
+        """,
+    )
+
+    class _FakeCTraderAdapter:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        async def connect(self):
+            raise RuntimeError("auth failed")
+
+        async def disconnect(self):
+            return None
+
+    from live_runner import preflight
+
+    monkeypatch.setattr(preflight, "CTraderLiveAdapter", _FakeCTraderAdapter)
+
+    result = run_live_preflight(
+        config_path,
+        env={
+            "CTRADER_APP_ID": "app",
+            "CTRADER_APP_SECRET": "secret",
+            "CTRADER_ACCESS_TOKEN": "token",
+            "CTRADER_REFRESH_TOKEN": "refresh",
+        },
+        check_connectivity=True,
+    )
+
+    assert result.ok is False
+    assert result.accounts[0].connected is False
+    assert "cTrader connectivity check failed" in result.accounts[0].errors[0]
