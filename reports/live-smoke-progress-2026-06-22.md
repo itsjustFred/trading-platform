@@ -66,3 +66,23 @@ Notes:
 - The successful EURUSD smoke used `volume=100000`, which corresponds to the broker minimum in this Open API volume scale.
 - The smoke runner closes cTrader positions with `ProtoOAClosePositionReq` rather than an opposite market order, so hedged demo accounts do not keep an offsetting position open.
 - Evidence: `reports/live_smoke_ctrader-demo-roundtrip_20260622T232608Z.json`.
+
+## Discord parser-to-order replay
+
+Command:
+
+```bash
+.venv/bin/python scripts/live_smoke.py --mode discord-replay --accounts-env .accounts.env --timeout-seconds 10
+```
+
+Result:
+
+| Check | Channel | Symbol | Action | Qty | Broker order | Status |
+|---|---|---|---|---:|---|---|
+| discord-replay-routing | discord-smoke-channel | AAPL | buy | 262.4671916010497 | discord-smoke-order | OK |
+
+Notes:
+- This is a controlled replay smoke, not a long-running Discord gateway listener.
+- It uses the real Discord message parser, channel metadata, deployment symbol filter, `_trade_signal_to_live_signal`, `submit_order_with_risk`, and a fake broker adapter.
+- The fake adapter prevents accidental live/Paper orders while still proving parser-to-submission routing and risk sizing.
+- Evidence: `reports/live_smoke_discord-replay_20260622T233019Z.json`.

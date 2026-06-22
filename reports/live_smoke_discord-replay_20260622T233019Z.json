@@ -1,0 +1,21 @@
+{
+  "checks": [
+    {
+      "details": {
+        "action": "buy",
+        "broker_order_id": "discord-smoke-order",
+        "channel_id": "discord-smoke-channel",
+        "message_id": "discord-smoke-message",
+        "qty": 262.4671916010497,
+        "symbol": "AAPL"
+      },
+      "error": "",
+      "name": "discord-replay-routing",
+      "ok": true
+    }
+  ],
+  "finished_at": "2026-06-22T23:30:19.136126+00:00",
+  "mode": "discord-replay",
+  "ok": true,
+  "started_at": "2026-06-22T23:30:18.255761+00:00"
+}

@@ -565,6 +565,96 @@ async def _ctrader_demo_roundtrip(
         return [SmokeCheck("ctrader-demo-roundtrip", False, error=_public_error(exc))]
 
 
+class _DiscordSmokeAdapter:
+    def __init__(self) -> None:
+        self.submitted_signal: Any | None = None
+
+    async def connect(self) -> None:
+        return None
+
+    async def submit_order(self, signal: Any) -> str:
+        self.submitted_signal = signal
+        return "discord-smoke-order"
+
+    async def listen_executions(self) -> None:
+        return None
+
+    async def get_balance(self) -> tuple[float, float]:
+        return 100000.0, 100000.0
+
+    async def get_positions(self) -> list[dict[str, Any]]:
+        return []
+
+
+async def _discord_replay_smoke() -> list[SmokeCheck]:
+    from types import SimpleNamespace
+
+    from live_runner.daemon import _trade_signal_to_live_signal
+    from live_runner.daemon import submit_order_with_risk
+    from live_runner.signal_sources.discord_source import _parse_trade_signal_from_message
+    from shared.models import LiveDeploymentConfig
+
+    channel_id = "discord-smoke-channel"
+    message = SimpleNamespace(
+        content="**$AAPL** is now oversold - buy signal\nPrice: $190.50",
+        id="discord-smoke-message",
+        channel=SimpleNamespace(id=channel_id),
+        author=SimpleNamespace(id="discord-smoke-author", bot=False),
+        created_at=datetime.now(timezone.utc),
+    )
+    deployment = LiveDeploymentConfig(
+        strategy_name="discord_smoke",
+        account_id="alpaca-paper-smoke",
+        symbols=["AAPL"],
+        timeframe="1h",
+        status="ACTIVE",
+        signal_source="discord",
+        signal_config={"channel_id": channel_id},
+        settings={"max_risk_per_trade": 0.01, "max_total_exposure": 0.05},
+    )
+    adapter = _DiscordSmokeAdapter()
+
+    try:
+        trade_signal = _parse_trade_signal_from_message(message, default_timeframe="1h")
+        if trade_signal is None:
+            raise RuntimeError("Discord parser returned no signal.")
+        if str(trade_signal.metadata.get("discord_channel_id")) != channel_id:
+            raise RuntimeError("Discord parser did not preserve channel routing metadata.")
+        if trade_signal.symbol.upper() not in {symbol.upper() for symbol in deployment.symbols}:
+            raise RuntimeError("Parsed signal did not match deployment symbols.")
+
+        live_signal = _trade_signal_to_live_signal(trade_signal, deployment)
+        broker_order_id = await submit_order_with_risk(
+            adapter,
+            deployment,
+            live_signal,
+            account_balance=100000.0,
+        )
+        submitted = adapter.submitted_signal
+        if submitted is None:
+            raise RuntimeError("Fake adapter received no submitted signal.")
+        qty = float(submitted.metadata.get("qty") or 0.0)
+        if qty <= 0:
+            raise RuntimeError("Risk sizing produced non-positive quantity.")
+
+        return [
+            SmokeCheck(
+                "discord-replay-routing",
+                True,
+                {
+                    "channel_id": channel_id,
+                    "message_id": str(trade_signal.metadata.get("discord_message_id")),
+                    "symbol": submitted.symbol,
+                    "action": submitted.action,
+                    "qty": qty,
+                    "broker_order_id": broker_order_id,
+                },
+            )
+        ]
+    except Exception as exc:
+        return [SmokeCheck("discord-replay-routing", False, error=_public_error(exc))]
+
+
 class contextlib_suppress:
     def __enter__(self) -> None:
         return None
@@ -615,6 +705,8 @@ async def run_smoke(
                 timeout_seconds=timeout_seconds,
             )
         )
+    if mode in {"discord-replay", "all"}:
+        checks.extend(await _discord_replay_smoke())
 
     return SmokeReport(
         mode=mode,
@@ -633,6 +725,7 @@ def main(argv: list[str] | None = None) -> int:
             "account-check",
             "alpaca-crypto-roundtrip",
             "ctrader-demo-roundtrip",
+            "discord-replay",
             "all",
             "ctrader-adapter-worker",
             "ctrader-order-worker",

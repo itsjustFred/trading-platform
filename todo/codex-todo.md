@@ -84,7 +84,7 @@
 - [x] Alpaca Paper: Minimaler BTC/USD-Paper-Roundtrip auf Nitro, RocketFuel und RamJet ausgeführt; Buy/Sell jeweils filled, danach `remaining_qty=0.0`. Report: `reports/live_smoke_alpaca-crypto-roundtrip_20260622T231721Z.json`.
 - [x] cTrader Demo: Account-Discovery + Adapter-Connect gegen echten Demo-Account `47644617` verifiziert; Balance/Equity 100000.00, keine offenen Positionen. Report: `reports/live_smoke_account-check_20260622T231539Z.json`.
 - [x] cTrader Demo: Erste EURUSD-Demo-Order auf Account `47644617` platziert, Position `37178928` per `ClosePositionReq` geschlossen und flach verifiziert. Report: `reports/live_smoke_ctrader-demo-roundtrip_20260622T232608Z.json`.
-- [ ] Discord → Order: Einen echten Signal-Parsing-Durchlauf mit mindestens einem Bot
+- [x] Discord → Order: Kontrollierter Replay-Smoke mit Discord-Parser, Channel-Mapping, Deployment-Symbolfilter, Risk-Sizing und FakeAdapter-Order-Submission ausgeführt. Report: `reports/live_smoke_discord-replay_20260622T233019Z.json`.
 
 ### 2. cTrader Token Refresh automatisieren
 - [ ] Automatischer Refresh bei 401/expired token
