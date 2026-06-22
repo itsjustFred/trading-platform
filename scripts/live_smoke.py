@@ -356,26 +356,21 @@ async def _ctrader_order_worker(
     if before_position is not None:
         raise RuntimeError(f"Refusing smoke order because {symbol} already has an open position.")
 
-    symbol_id = adapter._symbol_name_to_id.get(symbol.upper())
-    if symbol_id is None:
-        raise RuntimeError(f"Unknown cTrader symbol: {symbol}")
-
-    order_req = adapter._ProtoOANewOrderReq()
-    order_req.ctidTraderAccountId = adapter.ctid_trader_account_id
-    order_req.symbolId = int(symbol_id)
-    order_req.orderType = adapter._ProtoOAOrderType.MARKET
-    order_req.tradeSide = adapter._ProtoOATradeSide.BUY
-    order_req.volume = int(volume)
-    order_req.timeInForce = adapter._ProtoOATimeInForce.IMMEDIATE_OR_CANCEL
-    order_req.clientOrderId = f"codex-smoke-{uuid4().hex[:20]}"
-
-    order_res = await asyncio.wait_for(adapter._send_request(order_req, timeout_seconds=20), timeout=25)
-    if isinstance(order_res, adapter._ProtoOAOrderErrorEvent):
-        raise RuntimeError(
-            f"Order rejected ({order_res.errorCode}): "
-            f"{order_res.description or 'no description'}"
-        )
-    broker_order_id = adapter._extract_order_id_from_payload(order_res)
+    signal = LiveSignal(
+        deployment_id=f"ctrader-demo-smoke-{account_id}",
+        symbol=symbol.upper(),
+        action="buy",
+        theoretical_price=1.0,
+        timestamp=datetime.now(timezone.utc),
+        metadata={
+            "ctrader_volume": volume,
+            "entry_price": 1.0,
+            "timeframe": "1m",
+            "risk_percent": 0.0,
+            "risk_amount": 0.0,
+        },
+    )
+    broker_order_id = await asyncio.wait_for(adapter.submit_order(signal), timeout=timeout_seconds)
 
     opened_position = await _wait_for_ctrader_position(
         adapter,
