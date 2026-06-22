@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 from scripts.live_smoke import SmokeCheck
 from scripts.live_smoke import SmokeReport
+from scripts.live_smoke import main
 from scripts.live_smoke import _position_qty_for_symbol
 
 
@@ -37,3 +38,14 @@ def test_smoke_report_serializes_without_secret_fields() -> None:
     assert payload["ok"] is True
     assert "api_key" not in str(payload).lower()
     assert "secret" not in str(payload).lower()
+
+
+def test_live_smoke_help_exposes_ctrader_broker_minimum_default(capsys) -> None:
+    try:
+        main(["--help"])
+    except SystemExit:
+        pass
+
+    output = capsys.readouterr().out
+    assert "--ctrader-volume" in output
+    assert "100000" in output

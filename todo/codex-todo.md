@@ -58,8 +58,8 @@
 
 ### 1. cTrader Live-Integration
 - **Code:** `live_runner/ctrader_adapter.py`, `live_runner/daemon.py`, `live_runner/account_discovery.py`
-- **Status:** Unit-Tests grün (gemockte Adapter). **Nicht** gegen echte cTrader Demo-API getestet.
-- **Risiko:** Token-Refresh (`CH_ACCESS_TOKEN_INVALID`) ist im Code vorhanden, aber ob er gegen den echten Endpoint funktioniert, ist unklar.
+- **Status:** Unit-Tests grün + Account-Discovery und Adapter-Connect gegen echte cTrader Demo-API am 2026-06-22 erfolgreich (`47644617`, Balance/Equity 100000.00, 0 Positionen). Siehe `reports/live_smoke_account-check_20260622T231539Z.json`.
+- **Risiko:** Erste echte cTrader Demo-Order + Fill ist noch offen. Token-Refresh (`CH_ACCESS_TOKEN_INVALID`) ist im Code vorhanden, aber ob er gegen den echten Refresh-Endpoint funktioniert, ist weiter unklar, weil `.accounts.env` keinen `CTRADER_REFRESH_TOKEN` enthält.
 
 ### 2. Alpaca Live-Integration
 - **Code:** `live_runner/alpaca_adapter.py`
@@ -83,7 +83,7 @@
 - [x] Orderfreier Live-Smoke-Preflight: `python -m live_runner.preflight --config ... --accounts-env ...` prüft Deployment-Zuordnung, Credential-Verfügbarkeit, Paper/Demo-Modus-Warnungen und cTrader Account-ID-Form, ohne Broker-Orders zu platzieren.
 - [x] Alpaca Paper: Minimaler BTC/USD-Paper-Roundtrip auf Nitro, RocketFuel und RamJet ausgeführt; Buy/Sell jeweils filled, danach `remaining_qty=0.0`. Report: `reports/live_smoke_alpaca-crypto-roundtrip_20260622T231721Z.json`.
 - [x] cTrader Demo: Account-Discovery + Adapter-Connect gegen echten Demo-Account `47644617` verifiziert; Balance/Equity 100000.00, keine offenen Positionen. Report: `reports/live_smoke_account-check_20260622T231539Z.json`.
-- [ ] cTrader Demo: Erste Demo-Order plazieren + fill verifizieren
+- [x] cTrader Demo: Erste EURUSD-Demo-Order auf Account `47644617` platziert, Position `37178928` per `ClosePositionReq` geschlossen und flach verifiziert. Report: `reports/live_smoke_ctrader-demo-roundtrip_20260622T232608Z.json`.
 - [ ] Discord → Order: Einen echten Signal-Parsing-Durchlauf mit mindestens einem Bot
 
 ### 2. cTrader Token Refresh automatisieren

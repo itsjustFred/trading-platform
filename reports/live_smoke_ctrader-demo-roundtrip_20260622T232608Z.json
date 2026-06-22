@@ -1,0 +1,22 @@
+{
+  "checks": [
+    {
+      "details": {
+        "account_id": "47644617",
+        "broker_order_id": "26549660",
+        "close_response": "ProtoOAExecutionEvent",
+        "position_id": 37178928,
+        "remaining_position": null,
+        "symbol": "EURUSD",
+        "volume": 100000
+      },
+      "error": "",
+      "name": "ctrader-demo-roundtrip",
+      "ok": true
+    }
+  ],
+  "finished_at": "2026-06-22T23:26:08.862597+00:00",
+  "mode": "ctrader-demo-roundtrip",
+  "ok": true,
+  "started_at": "2026-06-22T23:25:56.011856+00:00"
+}

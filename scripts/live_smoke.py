@@ -19,7 +19,6 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from live_runner.alpaca_adapter import resolve_alpaca_credentials
 
 DEFAULT_ACCOUNTS_ENV = PROJECT_ROOT / ".accounts.env"
 DEFAULT_REPORTS_DIR = PROJECT_ROOT / "reports"
@@ -77,7 +76,7 @@ def _write_report(report: SmokeReport, reports_dir: Path) -> Path:
 
 
 async def _alpaca_account_checks(env: dict[str, str]) -> list[SmokeCheck]:
-    from live_runner.alpaca_adapter import AlpacaLiveAdapter
+    from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credentials
 
     checks: list[SmokeCheck] = []
     for index in (1, 2, 3):
@@ -207,6 +206,50 @@ async def _run_ctrader_adapter_subprocess(
     return json.loads(payload_line)
 
 
+async def _run_ctrader_order_subprocess(
+    *,
+    account_id: str,
+    accounts_env: Path,
+    symbol: str,
+    volume: int,
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--mode",
+        "ctrader-order-worker",
+        "--accounts-env",
+        str(accounts_env),
+        "--ctrader-account-id",
+        account_id,
+        "--ctrader-symbol",
+        symbol,
+        "--ctrader-volume",
+        str(volume),
+        "--timeout-seconds",
+        str(timeout_seconds),
+    ]
+    completed = await asyncio.to_thread(
+        subprocess.run,
+        command,
+        cwd=str(PROJECT_ROOT),
+        capture_output=True,
+        text=True,
+        timeout=timeout_seconds + 20,
+        check=False,
+    )
+    if completed.returncode != 0:
+        stderr = (completed.stderr or "").strip()
+        stdout = (completed.stdout or "").strip()
+        raise RuntimeError(stderr or stdout or f"worker exited {completed.returncode}")
+    lines = [line.strip() for line in (completed.stdout or "").splitlines() if line.strip()]
+    payload_line = next((line for line in reversed(lines) if line.startswith("{")), "")
+    if not payload_line:
+        raise RuntimeError("worker returned no JSON payload")
+    return json.loads(payload_line)
+
+
 async def _ctrader_adapter_worker(
     *,
     account_id: str,
@@ -236,6 +279,133 @@ async def _ctrader_adapter_worker(
     }
 
 
+async def _find_ctrader_open_position(
+    adapter: Any,
+    *,
+    symbol: str,
+) -> dict[str, Any] | None:
+    reconcile_req = adapter._ProtoOAReconcileReq()
+    reconcile_req.ctidTraderAccountId = adapter.ctid_trader_account_id
+    reconcile_res = await adapter._send_request(reconcile_req, timeout_seconds=15)
+    if not isinstance(reconcile_res, adapter._ProtoOAReconcileRes):
+        raise RuntimeError(f"Unexpected reconcile response: {type(reconcile_res).__name__}")
+
+    symbol_id = adapter._symbol_name_to_id.get(symbol.upper())
+    for position in getattr(reconcile_res, "position", []):
+        if int(getattr(position, "positionStatus", 0) or 0) != (
+            adapter._ProtoOAPositionStatus.POSITION_STATUS_OPEN
+        ):
+            continue
+        trade_data = getattr(position, "tradeData", None)
+        if trade_data is None:
+            continue
+        if symbol_id is not None and int(getattr(trade_data, "symbolId", 0) or 0) != symbol_id:
+            continue
+        return {
+            "position_id": int(getattr(position, "positionId", 0) or 0),
+            "volume": int(getattr(trade_data, "volume", 0) or 0),
+            "symbol_id": int(getattr(trade_data, "symbolId", 0) or 0),
+        }
+    return None
+
+
+async def _wait_for_ctrader_position(
+    adapter: Any,
+    *,
+    symbol: str,
+    should_exist: bool,
+    timeout_seconds: int,
+) -> dict[str, Any] | None:
+    deadline = time.monotonic() + timeout_seconds
+    latest: dict[str, Any] | None = None
+    while time.monotonic() < deadline:
+        latest = await _find_ctrader_open_position(adapter, symbol=symbol)
+        if should_exist and latest is not None:
+            return latest
+        if not should_exist and latest is None:
+            return None
+        await asyncio.sleep(1)
+    return latest
+
+
+async def _ctrader_order_worker(
+    *,
+    account_id: str,
+    accounts_env: Path,
+    symbol: str,
+    volume: int,
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    from live_runner.ctrader_adapter import CTraderLiveAdapter
+    from shared.models import LiveSignal
+
+    env = _env_values(accounts_env)
+    adapter = CTraderLiveAdapter(
+        app_id=env.get("CTRADER_APP_ID", ""),
+        app_secret=env.get("CTRADER_APP_SECRET", ""),
+        access_token=env.get("CTRADER_ACCESS_TOKEN", ""),
+        refresh_token=env.get("CTRADER_REFRESH_TOKEN", ""),
+        account_id=account_id,
+        demo=True,
+        account_config_id=f"ctrader-demo-{account_id}",
+    )
+    await asyncio.wait_for(adapter.connect(), timeout=timeout_seconds)
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOAClosePositionReq
+
+    before_position = await _find_ctrader_open_position(adapter, symbol=symbol)
+    if before_position is not None:
+        raise RuntimeError(f"Refusing smoke order because {symbol} already has an open position.")
+
+    signal = LiveSignal(
+        deployment_id=f"ctrader-demo-smoke-{account_id}",
+        symbol=symbol.upper(),
+        action="buy",
+        theoretical_price=1.0,
+        timestamp=datetime.now(timezone.utc),
+        metadata={
+            "explicit_qty": volume / 1000.0,
+            "ctrader_volume": volume,
+            "entry_price": 1.0,
+            "timeframe": "1m",
+            "risk_percent": 0.0,
+            "risk_amount": 0.0,
+        },
+    )
+    broker_order_id = await asyncio.wait_for(adapter.submit_order(signal), timeout=timeout_seconds)
+    opened_position = await _wait_for_ctrader_position(
+        adapter,
+        symbol=symbol,
+        should_exist=True,
+        timeout_seconds=timeout_seconds,
+    )
+    if opened_position is None:
+        raise RuntimeError("cTrader order submitted but no open position appeared.")
+
+    close_req = ProtoOAClosePositionReq()
+    close_req.ctidTraderAccountId = adapter.ctid_trader_account_id
+    close_req.positionId = int(opened_position["position_id"])
+    close_req.volume = int(opened_position["volume"])
+    close_res = await asyncio.wait_for(adapter._send_request(close_req, timeout_seconds=20), timeout=25)
+    remaining_position = await _wait_for_ctrader_position(
+        adapter,
+        symbol=symbol,
+        should_exist=False,
+        timeout_seconds=timeout_seconds,
+    )
+    if remaining_position is not None:
+        raise RuntimeError(f"cTrader close did not flatten position: {remaining_position}")
+
+    return {
+        "account_id": account_id,
+        "symbol": symbol.upper(),
+        "volume": volume,
+        "broker_order_id": broker_order_id,
+        "position_id": opened_position["position_id"],
+        "close_response": type(close_res).__name__,
+        "remaining_position": None,
+    }
+
+
 async def _alpaca_crypto_roundtrip(
     env: dict[str, str],
     *,
@@ -246,6 +416,7 @@ async def _alpaca_crypto_roundtrip(
     from alpaca.trading.client import TradingClient
     from alpaca.trading.enums import OrderSide, OrderStatus, OrderType, TimeInForce
     from alpaca.trading.requests import MarketOrderRequest
+    from live_runner.alpaca_adapter import resolve_alpaca_credentials
 
     checks: list[SmokeCheck] = []
     for index in (1, 2, 3):
@@ -359,6 +530,41 @@ async def _alpaca_crypto_roundtrip(
     return checks
 
 
+async def _ctrader_demo_roundtrip(
+    env: dict[str, str],
+    *,
+    accounts_env: Path,
+    symbol: str,
+    volume: int,
+    timeout_seconds: int,
+) -> list[SmokeCheck]:
+    from live_runner.account_discovery import discover_ctrader_accounts
+
+    try:
+        accounts = await asyncio.wait_for(
+            discover_ctrader_accounts(
+                env.get("CTRADER_APP_ID", ""),
+                env.get("CTRADER_APP_SECRET", ""),
+                env.get("CTRADER_ACCESS_TOKEN", ""),
+            ),
+            timeout=timeout_seconds,
+        )
+        demo_accounts = [account for account in accounts if account.is_demo]
+        if not demo_accounts:
+            return [SmokeCheck("ctrader-demo-roundtrip", False, error="No demo account found.")]
+        selected = max(demo_accounts, key=lambda account: float(account.balance or 0.0))
+        details = await _run_ctrader_order_subprocess(
+            account_id=str(selected.ctid or selected.id),
+            accounts_env=accounts_env,
+            symbol=symbol,
+            volume=volume,
+            timeout_seconds=timeout_seconds,
+        )
+        return [SmokeCheck("ctrader-demo-roundtrip", True, details)]
+    except Exception as exc:
+        return [SmokeCheck("ctrader-demo-roundtrip", False, error=_public_error(exc))]
+
+
 class contextlib_suppress:
     def __enter__(self) -> None:
         return None
@@ -373,6 +579,8 @@ async def run_smoke(
     accounts_env: Path,
     alpaca_symbol: str,
     alpaca_notional: float,
+    ctrader_symbol: str,
+    ctrader_volume: int,
     timeout_seconds: int,
 ) -> SmokeReport:
     started_at = _utc_now()
@@ -397,6 +605,16 @@ async def run_smoke(
                 timeout_seconds=timeout_seconds,
             )
         )
+    if mode in {"ctrader-demo-roundtrip", "all"}:
+        checks.extend(
+            await _ctrader_demo_roundtrip(
+                env,
+                accounts_env=accounts_env,
+                symbol=ctrader_symbol,
+                volume=ctrader_volume,
+                timeout_seconds=timeout_seconds,
+            )
+        )
 
     return SmokeReport(
         mode=mode,
@@ -407,11 +625,18 @@ async def run_smoke(
     )
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run live broker smoke checks.")
     parser.add_argument(
         "--mode",
-        choices=["account-check", "alpaca-crypto-roundtrip", "all", "ctrader-adapter-worker"],
+        choices=[
+            "account-check",
+            "alpaca-crypto-roundtrip",
+            "ctrader-demo-roundtrip",
+            "all",
+            "ctrader-adapter-worker",
+            "ctrader-order-worker",
+        ],
         default="account-check",
     )
     parser.add_argument("--accounts-env", default=str(DEFAULT_ACCOUNTS_ENV))
@@ -419,8 +644,15 @@ def main() -> int:
     parser.add_argument("--alpaca-symbol", default="BTC/USD")
     parser.add_argument("--alpaca-notional", type=float, default=10.0)
     parser.add_argument("--ctrader-account-id", default="")
+    parser.add_argument("--ctrader-symbol", default="EURUSD")
+    parser.add_argument(
+        "--ctrader-volume",
+        type=int,
+        default=100000,
+        help="cTrader order volume; EURUSD demo minimum observed via Open API is 100000.",
+    )
     parser.add_argument("--timeout-seconds", type=int, default=30)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     os.environ.setdefault("PYTHONUNBUFFERED", "1")
     if args.mode == "ctrader-adapter-worker":
@@ -437,6 +669,22 @@ def main() -> int:
         except Exception as exc:
             print(json.dumps({"error": _public_error(exc)}, sort_keys=True), flush=True)
             os._exit(1)
+    if args.mode == "ctrader-order-worker":
+        try:
+            payload = asyncio.run(
+                _ctrader_order_worker(
+                    account_id=args.ctrader_account_id,
+                    accounts_env=Path(args.accounts_env),
+                    symbol=args.ctrader_symbol,
+                    volume=args.ctrader_volume,
+                    timeout_seconds=args.timeout_seconds,
+                )
+            )
+            print(json.dumps(payload, sort_keys=True), flush=True)
+            os._exit(0)
+        except Exception as exc:
+            print(json.dumps({"error": _public_error(exc)}, sort_keys=True), flush=True)
+            os._exit(1)
 
     report = asyncio.run(
         run_smoke(
@@ -444,6 +692,8 @@ def main() -> int:
             accounts_env=Path(args.accounts_env),
             alpaca_symbol=args.alpaca_symbol,
             alpaca_notional=args.alpaca_notional,
+            ctrader_symbol=args.ctrader_symbol,
+            ctrader_volume=args.ctrader_volume,
             timeout_seconds=args.timeout_seconds,
         )
     )
