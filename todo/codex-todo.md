@@ -80,6 +80,7 @@
 ## ❌ Was komplett fehlt / noch nicht angegangen
 
 ### 1. Echte End-to-End-Live-Tests
+- [x] Orderfreier Live-Smoke-Preflight: `python -m live_runner.preflight --config ... --accounts-env ...` prüft Deployment-Zuordnung, Credential-Verfügbarkeit, Paper/Demo-Modus-Warnungen und cTrader Account-ID-Form, ohne Broker-Orders zu platzieren.
 - [ ] Alpaca Paper: Mindestens eine Demo-Order pro Account (RamJet, RocketFuel, Nitro) plazieren + fill/cancel/close/reconcile verifizieren
 - [ ] cTrader Demo: Erste Demo-Order plazieren + fill verifizieren
 - [ ] Discord → Order: Einen echten Signal-Parsing-Durchlauf mit mindestens einem Bot
