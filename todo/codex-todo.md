@@ -87,9 +87,9 @@
 - [x] Discord → Order: Kontrollierter Replay-Smoke mit Discord-Parser, Channel-Mapping, Deployment-Symbolfilter, Risk-Sizing und FakeAdapter-Order-Submission ausgeführt. Report: `reports/live_smoke_discord-replay_20260622T233019Z.json`.
 
 ### 2. cTrader Token Refresh automatisieren
-- [ ] Automatischer Refresh bei 401/expired token
-- [ ] Persistenz des neuen Tokens in `.accounts.env` oder etabliertem Secret-Mechanismus
-- [ ] Retry-Logik nach Refresh
+- [x] Automatischer Refresh bei 401/expired token: `CTraderLiveAdapter` erkennt terminale Token/Auth-Fehler (`CH_ACCESS_TOKEN_INVALID`, invalid/expired token, unauthorized) und nutzt Refresh-Retry für Symbols, Order, Balance, Reconcile und Order-Details.
+- [x] Persistenz des neuen Tokens in `.accounts.env` oder etabliertem Secret-Mechanismus: Refresh aktualisiert Runtime-Env und schreibt `CTRADER_ACCESS_TOKEN`/`CTRADER_REFRESH_TOKEN` über den konfigurierten Accounts-Env-Pfad zurück.
+- [x] Retry-Logik nach Refresh: Requests werden nach erfolgreichem Refresh einmal wiederholt; Account-Auth baut den Auth-Request nach Refresh mit dem neuen Access Token neu. Verifiziert mit `tests/test_ctrader_adapter.py` und `tests/test_live_preflight.py`.
 
 ### 3. Walk-Forward / OOS Validation (generisch)
 - [ ] Rollierendes Window (z.B. 12 Monate Train, 3 Monate Test)

@@ -336,9 +336,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
 
     async def _refresh_access_token(self) -> bool:
         """Refresh cTrader OAuth tokens via Open API and persist them safely."""
-        if not self.refresh_token:
+        if not self.refresh_token or self._ProtoOARefreshTokenReq is None:
             logger.warning(
-                "cTrader access token refresh unavailable: missing refresh token",
+                "cTrader access token refresh unavailable: missing refresh token or OpenAPI type",
                 extra={"data": {"account_id": self.ctid_trader_account_id}},
             )
             return False
@@ -560,6 +560,12 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 )
             raise
 
+    async def _send_account_auth_request(self, *, timeout_seconds: int = 15) -> Any:
+        account_auth_req = self._ProtoOAAccountAuthReq()
+        account_auth_req.ctidTraderAccountId = self.ctid_trader_account_id
+        account_auth_req.accessToken = self.access_token
+        return await self._send_request(account_auth_req, timeout_seconds=timeout_seconds)
+
     async def _authenticate(self) -> None:
         self._raise_if_terminal_auth_failed()
         if self._authenticated and self._symbol_name_to_id:
@@ -574,11 +580,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 f"Unexpected application auth response: {type(app_auth_res).__name__}"
             )
 
-        account_auth_req = self._ProtoOAAccountAuthReq()
-        account_auth_req.ctidTraderAccountId = self.ctid_trader_account_id
-        account_auth_req.accessToken = self.access_token
         try:
-            account_auth_res = await self._send_request(account_auth_req, timeout_seconds=15)
+            account_auth_res = await self._send_account_auth_request(timeout_seconds=15)
         except CTraderApiError as exc:
             error_code = _normalize_error_code(exc.error_code)
             error_text = str(exc)
@@ -589,13 +592,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 )
             elif _is_terminal_auth_error(error_code, error_text):
                 if await self._refresh_access_token():
-                    account_auth_req = self._ProtoOAAccountAuthReq()
-                    account_auth_req.ctidTraderAccountId = self.ctid_trader_account_id
-                    account_auth_req.accessToken = self.access_token
-                    account_auth_res = await self._send_request(
-                        account_auth_req,
-                        timeout_seconds=15,
-                    )
+                    account_auth_res = await self._send_account_auth_request(timeout_seconds=15)
                     if not isinstance(account_auth_res, self._ProtoOAAccountAuthRes):
                         raise RuntimeError(
                             "Unexpected account auth response after refresh: "
@@ -616,7 +613,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         symbols_req = self._ProtoOASymbolsListReq()
         symbols_req.ctidTraderAccountId = self.ctid_trader_account_id
         symbols_req.includeArchivedSymbols = False
-        symbols_res = await self._send_request(symbols_req, timeout_seconds=15)
+        symbols_res = await self._send_request_with_refresh_retry(symbols_req, timeout_seconds=15)
         if not isinstance(symbols_res, self._ProtoOASymbolsListRes):
             raise RuntimeError(f"Unexpected symbols response: {type(symbols_res).__name__}")
 
@@ -834,7 +831,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             details_req.ctidTraderAccountId = self.ctid_trader_account_id
             details_req.orderId = order_id
             try:
-                details_res = await self._send_request(details_req, timeout_seconds=15)
+                details_res = await self._send_request_with_refresh_retry(
+                    details_req,
+                    timeout_seconds=15,
+                )
             except CTraderApiError as exc:
                 self._raise_terminal_auth_from_api_error(exc)
                 # Unknown to this account (other account/broker) or not found.
@@ -977,7 +977,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         request.clientOrderId = str(signal.id)
 
         try:
-            response = await self._send_request(request, timeout_seconds=20)
+            response = await self._send_request_with_refresh_retry(request, timeout_seconds=20)
         except CTraderApiError as exc:
             self._raise_terminal_auth_from_api_error(exc)
             raise
@@ -1020,7 +1020,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         trader_req = self._ProtoOATraderReq()
         trader_req.ctidTraderAccountId = self.ctid_trader_account_id
         try:
-            trader_res = await self._send_request(trader_req, timeout_seconds=15)
+            trader_res = await self._send_request_with_refresh_retry(
+                trader_req,
+                timeout_seconds=15,
+            )
         except CTraderApiError as exc:
             self._raise_terminal_auth_from_api_error(exc)
             raise
@@ -1052,7 +1055,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         reconcile_req = self._ProtoOAReconcileReq()
         reconcile_req.ctidTraderAccountId = self.ctid_trader_account_id
         try:
-            reconcile_res = await self._send_request(reconcile_req, timeout_seconds=15)
+            reconcile_res = await self._send_request_with_refresh_retry(
+                reconcile_req,
+                timeout_seconds=15,
+            )
         except CTraderApiError as exc:
             self._raise_terminal_auth_from_api_error(exc)
             raise

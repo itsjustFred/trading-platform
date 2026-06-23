@@ -129,6 +129,81 @@ def test_refresh_access_token_updates_runtime_and_dotenv(tmp_path) -> None:
     assert "CTRADER_REFRESH_TOKEN=new_refresh" in contents
 
 
+def test_send_request_with_refresh_retry_retries_once_after_token_refresh() -> None:
+    adapter = CTraderLiveAdapter(
+        app_id="app",
+        app_secret="secret",
+        access_token="old",
+        refresh_token="refresh",
+        account_id="46736452",
+    )
+    calls: list[object] = []
+    request = object()
+    response = object()
+
+    async def _fake_send(sent_request, **_kwargs):
+        calls.append(sent_request)
+        if len(calls) == 1:
+            raise CTraderApiError("CH_ACCESS_TOKEN_INVALID", "expired")
+        return response
+
+    async def _fake_refresh():
+        adapter.access_token = "new"
+        return True
+
+    adapter._send_request = _fake_send
+    adapter._refresh_access_token = _fake_refresh
+
+    assert asyncio.run(adapter._send_request_with_refresh_retry(request)) is response
+    assert calls == [request, request]
+
+
+def test_auth_refresh_rebuilds_account_auth_request_with_new_access_token() -> None:
+    adapter = CTraderLiveAdapter(
+        app_id="app",
+        app_secret="secret",
+        access_token="old_access",
+        refresh_token="refresh",
+        account_id="46736452",
+    )
+    sent_tokens: list[str] = []
+
+    class _AccountAuthReq:
+        def __init__(self) -> None:
+            self.ctidTraderAccountId = 0
+            self.accessToken = ""
+
+    class _AccountAuthRes:
+        pass
+
+    adapter._ProtoOAAccountAuthReq = _AccountAuthReq
+    adapter._ProtoOAAccountAuthRes = _AccountAuthRes
+
+    async def _fake_send(request, **_kwargs):
+        sent_tokens.append(request.accessToken)
+        if len(sent_tokens) == 1:
+            raise CTraderApiError("CH_ACCESS_TOKEN_INVALID", "expired")
+        return _AccountAuthRes()
+
+    async def _fake_refresh():
+        adapter.access_token = "new_access"
+        return True
+
+    adapter._send_request = _fake_send
+    adapter._refresh_access_token = _fake_refresh
+
+    async def _run() -> object:
+        try:
+            return await adapter._send_account_auth_request(timeout_seconds=15)
+        except CTraderApiError as exc:
+            assert _is_terminal_auth_error(exc.error_code, str(exc))
+            assert await adapter._refresh_access_token()
+            return await adapter._send_account_auth_request(timeout_seconds=15)
+
+    assert isinstance(asyncio.run(_run()), _AccountAuthRes)
+    assert sent_tokens == ["old_access", "new_access"]
+
+
 def test_disconnect_times_out_instead_of_hanging() -> None:
     async def _run() -> CTraderLiveAdapter:
         adapter = CTraderLiveAdapter(
