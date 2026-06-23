@@ -18,6 +18,16 @@ function formatMetricValue(metric: string, value: number | string | boolean | nu
   return value.toFixed(3);
 }
 
+function formatMode(value: string | null | undefined) {
+  const normalized = String(value || "parameter").replaceAll("_", " ");
+  return normalized.replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function formatSymbols(symbols: string[] | null | undefined) {
+  const cleaned = (symbols || []).map((symbol) => String(symbol || "").trim()).filter(Boolean);
+  return cleaned.length ? cleaned.join(", ") : "—";
+}
+
 export function OptimizationsPage() {
   const [optimizations, setOptimizations] = useState<OptimizationSummary[]>([]);
   const [search, setSearch] = useState("");
@@ -46,6 +56,9 @@ export function OptimizationsPage() {
         optimization.id,
         optimization.base_backtest_id,
         optimization.target_metric,
+        optimization.optimization_mode || "",
+        ...(optimization.symbols || []),
+        ...(optimization.best_symbols || []),
         ...Object.keys(optimization.best_params || {}),
       ]
         .filter(Boolean)
@@ -205,28 +218,48 @@ export function OptimizationsPage() {
               >
                 <div style={{ display: "flex", justifyContent: "space-between", gap: "12px", alignItems: "flex-start" }}>
                   <div>
-                    <div
-                      style={{
-                        display: "inline-flex",
-                        alignItems: "center",
-                        gap: "8px",
-                        padding: "5px 10px",
-                        borderRadius: "999px",
-                        background: "rgba(251, 191, 36, 0.12)",
-                        color: "#fbbf24",
-                        fontSize: "0.72rem",
-                        textTransform: "uppercase",
-                        letterSpacing: "0.12em",
-                      }}
-                    >
-                      <Target size={12} />
-                      {optimization.target_metric}
+                    <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+                      <div
+                        style={{
+                          display: "inline-flex",
+                          alignItems: "center",
+                          gap: "8px",
+                          padding: "5px 10px",
+                          borderRadius: "999px",
+                          background: "rgba(251, 191, 36, 0.12)",
+                          color: "#fbbf24",
+                          fontSize: "0.72rem",
+                          textTransform: "uppercase",
+                          letterSpacing: "0.12em",
+                        }}
+                      >
+                        <Target size={12} />
+                        {optimization.target_metric}
+                      </div>
+                      <div
+                        style={{
+                          display: "inline-flex",
+                          alignItems: "center",
+                          padding: "5px 10px",
+                          borderRadius: "999px",
+                          background: "rgba(124, 58, 237, 0.12)",
+                          color: "#c4b5fd",
+                          fontSize: "0.72rem",
+                          textTransform: "uppercase",
+                          letterSpacing: "0.12em",
+                        }}
+                      >
+                        {formatMode(optimization.optimization_mode)}
+                      </div>
                     </div>
                     <div style={{ marginTop: "12px", fontSize: "1.06rem", fontWeight: 700 }}>
                       {optimization.base_backtest_id}
                     </div>
                     <div style={{ marginTop: "6px", color: "var(--color-text-muted)", fontSize: "0.82rem" }}>
                       {optimization.n_trials} trials • split {Math.round(optimization.train_split_pct * 100)} / {Math.round((1 - optimization.train_split_pct) * 100)}
+                    </div>
+                    <div style={{ marginTop: "6px", color: "#cbd5e1", fontSize: "0.78rem", lineHeight: 1.45 }}>
+                      {formatSymbols(optimization.best_symbols || optimization.symbols)}
                     </div>
                   </div>
                   <ArrowUpRight size={18} color="#93c5fd" />
@@ -289,6 +322,22 @@ export function OptimizationsPage() {
                       <span>{String(value)}</span>
                     </span>
                   ))}
+                  {(optimization.symbol_universes?.length || 0) > 0 ? (
+                    <span
+                      style={{
+                        display: "inline-flex",
+                        alignItems: "center",
+                        gap: "6px",
+                        padding: "7px 10px",
+                        borderRadius: "999px",
+                        background: "rgba(124, 58, 237, 0.12)",
+                        color: "#ddd6fe",
+                        fontSize: "0.76rem",
+                      }}
+                    >
+                      {optimization.symbol_universes?.length} universes
+                    </span>
+                  ) : null}
                 </div>
               </Link>
             );

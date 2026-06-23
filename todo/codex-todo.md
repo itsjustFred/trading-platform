@@ -73,7 +73,7 @@
 
 ### 4. Portfolio Optimizer UI-Anbindung
 - **Code:** Backend existiert, Frontend-Seiten (`PortfoliosPage.tsx`, `OptimizationsPage.tsx`) existieren
-- **Status:** Nicht verifiziert, ob die neuen `risk_parity_universe`-Ergebnisse korrekt im Frontend angezeigt werden.
+- **Status:** Verifiziert am 2026-06-23: Optimizer-API-Summary reicht `optimization_mode`, `symbols`, `best_symbols` und `symbol_universes` weiter; Optimizer-Archiv und Detailseite zeigen Modus, bestes Universum, Kandidaten-Universen und Trial-Symbole an. `npm run build` und `tests/test_viewer_features.py::test_optimizations_list_and_detail_endpoints` grün.
 
 ---
 

@@ -298,6 +298,7 @@ export interface OptimizationTrial {
   value: number | null;
   params: Record<string, StrategyParameterValue>;
   effective_parameters: Record<string, StrategyParameterValue>;
+  symbols?: string[];
   trade_count: number;
   penalty_applied: boolean;
   train_stats: Record<string, number | string | boolean | null>;
@@ -314,6 +315,10 @@ export interface OptimizationSummary {
   best_value: number | null;
   best_params: Record<string, StrategyParameterValue>;
   effective_best_parameters: Record<string, StrategyParameterValue>;
+  symbols?: string[];
+  best_symbols?: string[];
+  optimization_mode?: string;
+  symbol_universes?: string[][];
   train_period: OptimizationPeriod;
   test_period: OptimizationPeriod;
   train_stats: Record<string, number | string | boolean | null>;

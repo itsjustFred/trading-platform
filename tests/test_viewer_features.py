@@ -2312,6 +2312,10 @@ def test_optimizations_list_and_detail_endpoints(viewer_client, tmp_path):
         "best_value": 1.2345,
         "best_params": {"window": 10},
         "effective_best_parameters": {"window": 10, "fixed": 3},
+        "symbols": ["SPY", "TLT", "GLD"],
+        "best_symbols": ["SPY", "TLT"],
+        "optimization_mode": "risk_parity_universe",
+        "symbol_universes": [["SPY", "TLT"], ["SPY", "GLD"]],
         "train_period": {
             "start": "2024-01-01T00:00:00+00:00",
             "end": "2024-01-07T23:59:59+00:00",
@@ -2322,7 +2326,9 @@ def test_optimizations_list_and_detail_endpoints(viewer_client, tmp_path):
         },
         "train_stats": {"sharpe_ratio": 1.2345},
         "test_stats": {"sharpe_ratio": 0.9876},
-        "top_trials": [{"number": 0, "value": 1.2345, "params": {"window": 10}}],
+        "top_trials": [
+            {"number": 0, "value": 1.2345, "params": {"window": 10}, "symbols": ["SPY", "TLT"]}
+        ],
     }
     (optimizations_dir / "opt_base-demo_20260311_100000.json").write_text(
         json.dumps(payload),
@@ -2344,6 +2350,10 @@ def test_optimizations_list_and_detail_endpoints(viewer_client, tmp_path):
             "best_value": 1.2345,
             "best_params": {"window": 10},
             "effective_best_parameters": {"window": 10, "fixed": 3},
+            "symbols": ["SPY", "TLT", "GLD"],
+            "best_symbols": ["SPY", "TLT"],
+            "optimization_mode": "risk_parity_universe",
+            "symbol_universes": [["SPY", "TLT"], ["SPY", "GLD"]],
             "train_period": {
                 "start": "2024-01-01T00:00:00+00:00",
                 "end": "2024-01-07T23:59:59+00:00",
