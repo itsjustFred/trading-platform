@@ -111,9 +111,9 @@
 - [x] API-Endpunkte für `/api/grid/{strategy_id}` mit Trade-Level-Daten: FastAPI-Endpunkt filtert Strategie-Rows, ergänzt Backtest-/Trades-URLs und lädt Trade-Samples aus SQLite. Verifiziert mit `tests/test_viewer_features.py` und `npm run build`.
 
 ### 7. Repo aufräumen
-- [ ] Verwaiste Debug-/Scratch-Dateien identifizieren und entfernen
-- [ ] Agent-Artefakte bereinigen
-- [ ] `.accounts.env` ist bereits aus Git-Tracking entfernt ✅
+- [x] Verwaiste Debug-/Scratch-Dateien identifizieren und entfernen: getrackte Backup-Datei `viewer/static/index.html.bak` entfernt; unversionierte supersedete cTrader-Fehlversuchsreports bereinigt.
+- [x] Agent-Artefakte bereinigen: `.github/agents/*`, `runner/auto_agent.py` und Tests als getrackte Projektfeatures eingeordnet; keine wegwerfbaren Agent-Artefakte mehr im Git-Status.
+- [x] `.accounts.env` ist bereits aus Git-Tracking entfernt ✅
 
 ---
 
