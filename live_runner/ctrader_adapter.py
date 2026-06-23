@@ -638,17 +638,6 @@ class CTraderLiveAdapter(BaseLiveAdapter):
 
     def _resolve_order_volume(self, signal: LiveSignal) -> int:
         metadata = signal.metadata or {}
-        if "qty" in metadata:
-            qty = _to_float(metadata.get("qty"), default=0.0)
-            if qty > 0:
-                volume = int(qty * 1000)
-                if volume < 1000:
-                    raise ValueError(
-                        f"Risk-sized volume {volume} is below the broker minimum (1000); "
-                        "order rejected instead of silently upsizing beyond the risk limit."
-                    )
-                return volume
-
         if "ctrader_volume" in metadata:
             try:
                 explicit = int(float(metadata["ctrader_volume"]))
@@ -666,6 +655,17 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             if explicit <= 0:
                 raise ValueError("'volume' must be > 0.")
             return explicit
+
+        if "qty" in metadata:
+            qty = _to_float(metadata.get("qty"), default=0.0)
+            if qty > 0:
+                volume = int(qty * 1000)
+                if volume < 1000:
+                    raise ValueError(
+                        f"Risk-sized volume {volume} is below the broker minimum (1000); "
+                        "order rejected instead of silently upsizing beyond the risk limit."
+                    )
+                return volume
 
         # Fail closed: never trade a default size, and never silently upsize a
         # risk-sized quantity to the broker minimum.

@@ -67,6 +67,11 @@ Notes:
 - The smoke runner closes cTrader positions with `ProtoOAClosePositionReq` rather than an opposite market order, so hedged demo accounts do not keep an offsetting position open.
 - Evidence: `reports/live_smoke_ctrader-demo-roundtrip_20260622T232608Z.json`.
 
+Follow-up on 2026-06-23:
+- The adapter path was re-run with the same `--ctrader-volume 100000` smoke input after making explicit `ctrader_volume` take precedence over risk-sized `qty` in `CTraderLiveAdapter._resolve_order_volume`.
+- The broker accepted order `26605465`, opened position `37237927`, and the smoke runner closed it with no remaining position.
+- Evidence: `reports/live_smoke_ctrader-demo-roundtrip_20260623T083829Z.json`.
+
 ## Discord parser-to-order replay
 
 Command:

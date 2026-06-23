@@ -271,6 +271,7 @@ def test_ctrader_volume_rejects_missing_and_below_minimum_qty():
         adapter._resolve_order_volume(_signal({"qty": 0.07}))
     assert adapter._resolve_order_volume(_signal({"qty": 5.0})) == 5000
     assert adapter._resolve_order_volume(_signal({"ctrader_volume": 2000})) == 2000
+    assert adapter._resolve_order_volume(_signal({"qty": 499.999, "ctrader_volume": 100000})) == 100000
 
 
 def test_processor_market_data_refuses_synthetic_fabrication():

@@ -366,8 +366,6 @@ async def _ctrader_order_worker(
             "ctrader_volume": volume,
             "entry_price": 1.0,
             "timeframe": "1m",
-            "risk_percent": 0.0,
-            "risk_amount": 0.0,
         },
     )
     broker_order_id = await asyncio.wait_for(adapter.submit_order(signal), timeout=timeout_seconds)
