@@ -106,16 +106,11 @@
 - [ ] Ziel: Bulk-Jobs deutlich schneller (Connection-Pool, HTTP/2, Chunked Requests)
 - [ ] Alternative: Node.js Sidecar (`scripts/dukascopy_fast/`) als subprocess
 
-### 6. SP500 / US100 Intraday-Daten
-- [ ] `strategy-comparisons/intraday_volatility_breakout` braucht SP500 M1 und US100 M15
-- [ ] Problem: yfinance M1 nur ~60 Tage frei; Dukascopy hat keine US-Index-CFDs
-- [ ] Optionen: Kürzerer Backtest-Zeitraum, Proxy-Symbol (SPY/QQQ), Paid-API (Polygon)
-
-### 7. Viewer UI für Grid/Matrix
+### 6. Viewer UI für Grid/Matrix
 - [ ] `MatrixGridPage.tsx` mit Heatmap, Trade-Details, Backtest-ID-Links
 - [ ] API-Endpunkte für `/api/grid/{strategy_id}` mit Trade-Level-Daten
 
-### 8. Repo aufräumen
+### 7. Repo aufräumen
 - [ ] Verwaiste Debug-/Scratch-Dateien identifizieren und entfernen
 - [ ] Agent-Artefakte bereinigen
 - [ ] `.accounts.env` ist bereits aus Git-Tracking entfernt ✅
@@ -138,19 +133,17 @@
 | GLD | D1 | yfinance | 2016–2024 | ✅ 2.263 Tage |
 | DBC | D1 | yfinance | 2016–2024 | ✅ 2.263 Tage |
 | VNQ | D1 | yfinance | 2016–2024 | ✅ 2.263 Tage |
-| SP500 (ES=F) | M1 | yfinance | ~60 Tage | ⚠️ Limit |
-| US100 (NQ=F) | M15 | yfinance | ~60 Tage | ⚠️ Limit |
+| SP500 / US500 CFD | M1 | Dukascopy | Intraday-CFD verfügbar | ✅ Quelle vorhanden |
+| US100 / NAS100 CFD | M15 | Dukascopy | Intraday-CFD verfügbar | ✅ Quelle vorhanden |
 
 ---
 
 ## 🎯 Nächste Schritte (Priorisiert)
 
-1. **Echte Live-Smoke-Tests** (Alpaca Paper + cTrader Demo)
-2. **SP500/US100 Daten** beschaffen oder Proxy-Strategie anpassen
-3. **Walk-Forward + OOS** implementieren
-4. **DB-Migration** (JSON → SQLite) abschließen
-5. **Dukascopy Speed** verbessern
-6. **Viewer UI** für Grid/Matrix vervollständigen
+1. **Walk-Forward + OOS** implementieren
+2. **DB-Migration** (JSON → SQLite) abschließen
+3. **Dukascopy Speed** verbessern
+4. **Viewer UI** für Grid/Matrix vervollständigen
 
 ---
 
