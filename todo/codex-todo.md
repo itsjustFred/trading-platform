@@ -92,9 +92,9 @@
 - [x] Retry-Logik nach Refresh: Requests werden nach erfolgreichem Refresh einmal wiederholt; Account-Auth baut den Auth-Request nach Refresh mit dem neuen Access Token neu. Verifiziert mit `tests/test_ctrader_adapter.py` und `tests/test_live_preflight.py`.
 
 ### 3. Walk-Forward / OOS Validation (generisch)
-- [ ] Rollierendes Window (z.B. 12 Monate Train, 3 Monate Test)
-- [ ] Aggregierte Metriken (OOS-Sharpe, Worst-DD, profitable Folds %)
-- [ ] CLI: `python -m runner.cli walkforward --strategy ...`
+- [x] Rollierendes Window (z.B. 12 Monate Train, 3 Monate Test): `runner.walkforward.run_walkforward` baut echte rollierende Train/Test-Folds und führt pro Fold IS/OOS-Backtests über den gewählten Engine-Adapter aus.
+- [x] Aggregierte Metriken (OOS-Sharpe, Worst-DD, profitable Folds %): Summary enthält Fold-Anzahl, durchschnittlichen OOS-Sharpe, Worst-OOS-Drawdown und profitable Fold-%.
+- [x] CLI: `python -m runner.cli walkforward --strategy ...` akzeptiert Engine, Symbols, Timeframe, Start/Ende, Risk-/Leverage-Parameter, Params JSON und Output-Dir. Verifiziert mit `tests/test_walkforward.py` und `tests/test_runner_cli.py`.
 
 ### 4. DB-Konsolidierung
 - [ ] Legacy `*.trades.json` → SQLite Migration idempotent beim Server-Start

@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from pathlib import Path
 
 import runner.cli as runner_cli
-from shared.models import BacktestMeta, BacktestResult, EquityPoint
+from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, TradeExit
 
 
 class _DummyEngine:
@@ -27,7 +27,25 @@ class _DummyEngine:
                 data={"symbols": config.symbols, "timeframes": [config.timeframe], "source": "test"},
                 parameters=config.parameters,
             ),
-            trades=[],
+            trades=[
+                Trade(
+                    id=1,
+                    symbol=config.symbols[0],
+                    direction="LONG",
+                    entry_time=config.start_date,
+                    entry_price=100.0,
+                    quantity=10.0,
+                    exits=[
+                        TradeExit(
+                            time=config.end_date,
+                            price=105.0,
+                            quantity=10.0,
+                            pnl=5000.0,
+                        )
+                    ],
+                    pnl=5000.0,
+                )
+            ],
             equity_curve=[
                 EquityPoint(time="2024-01-01T00:00:00+00:00", equity=config.initial_capital),
                 EquityPoint(time="2024-02-01T00:00:00+00:00", equity=config.initial_capital * 1.05),
@@ -40,6 +58,7 @@ def test_cmd_run_persists_canonical_stats(monkeypatch, tmp_path: Path):
     output_path = tmp_path / "cli-demo.trades.json"
 
     monkeypatch.setattr(runner_cli, "get_engine", lambda _: _DummyEngine())
+    monkeypatch.setattr(runner_cli, "ensure_backtest_data", lambda **_kwargs: [])
 
     args = SimpleNamespace(
         engine="vectorbt",
@@ -77,6 +96,7 @@ def test_cmd_run_normalizes_timeframe_alias(monkeypatch, tmp_path: Path):
             return []
 
     monkeypatch.setattr(runner_cli, "get_engine", lambda _: _CaptureEngine())
+    monkeypatch.setattr(runner_cli, "ensure_backtest_data", lambda **_kwargs: [])
 
     args = SimpleNamespace(
         engine="vectorbt",
@@ -100,3 +120,50 @@ def test_cmd_run_normalizes_timeframe_alias(monkeypatch, tmp_path: Path):
     assert captured["timeframe"] == "1h"
     payload = json.loads(output_path.read_text(encoding="utf-8"))
     assert payload["meta"]["data"]["timeframes"] == ["1h"]
+
+
+def test_cmd_walkforward_maps_cli_args_and_prints_json(monkeypatch, capsys, tmp_path: Path):
+    captured: dict[str, object] = {}
+
+    def fake_run_walkforward(**kwargs):
+        captured.update(kwargs)
+        return {
+            "mode": "strategy",
+            "summary": {"fold_count": 2, "avg_oos_sharpe": 1.2},
+            "output_path": str(tmp_path / "wf.json"),
+        }
+
+    monkeypatch.setattr(runner_cli, "get_engine", lambda _: _DummyEngine())
+    monkeypatch.setattr(runner_cli, "run_walkforward", fake_run_walkforward)
+
+    args = SimpleNamespace(
+        strategy="strategies/demo.py",
+        engine="vectorbt",
+        symbols="SPY,TLT",
+        timeframe="d1",
+        start="2020-01-01",
+        end="2022-01-01",
+        capital=100000.0,
+        train_months=12,
+        test_months=3,
+        step_months=3,
+        risk_pct=0.01,
+        max_position_pct=1.0,
+        max_leverage=2.0,
+        intrabar_resolution="open_close",
+        params=json.dumps({"window": 20}),
+        data_dir="",
+        output_dir=str(tmp_path),
+    )
+
+    runner_cli.cmd_walkforward(args)
+
+    assert captured["strategy"] == "strategies/demo.py"
+    assert captured["symbols"] == ["SPY", "TLT"]
+    assert captured["timeframe"] == "1d"
+    assert captured["train_months"] == 12
+    assert captured["test_months"] == 3
+    assert captured["step_months"] == 3
+    assert captured["params"] == {"window": 20}
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["summary"]["fold_count"] == 2

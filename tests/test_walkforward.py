@@ -4,11 +4,15 @@ from __future__ import annotations
 import json
 import inspect
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
+import pandas as pd
 import pytest
 
+from runner.engines.base import BacktestConfig
 from runner import walkforward as wf_module
+from shared.models import BacktestMeta, BacktestResult, EquityPoint
 
 
 class TestWalkforwardSignature:
@@ -19,6 +23,8 @@ class TestWalkforwardSignature:
         # Verify function signature
         sig = inspect.signature(wf_module.run_walkforward)
         params = list(sig.parameters.keys())
+        assert "strategy" in params
+        assert "engine" in params
         assert "backtest_ids" in params
         assert "train_months" in params
         assert "test_months" in params
@@ -216,13 +222,11 @@ class TestWalkforwardFileOutput:
 
         monkeypatch.setattr(wf_module, "optimize_portfolio_allocation", mock_optimize)
 
-        # Patch DATA_DIR to use our temp directory
-        monkeypatch.setattr(wf_module, "DATA_DIR", tmp_path)
-
         result = wf_module.run_walkforward(
             backtest_ids=["test_strat"],
             train_months=6,
             test_months=2,
+            output_dir=output_dir,
         )
 
         # Verify output directory was created
@@ -247,12 +251,12 @@ class TestWalkforwardFileOutput:
             return {"sharpe": 1.0, "oos_sharpe": 0.5}
 
         monkeypatch.setattr(wf_module, "optimize_portfolio_allocation", mock_optimize)
-        monkeypatch.setattr(wf_module, "DATA_DIR", tmp_path)
 
         wf_module.run_walkforward(
             backtest_ids=["strat1"],
             train_months=12,
             test_months=3,
+            output_dir=output_dir,
         )
 
         json_files = list(output_dir.glob("wf_*.json"))
@@ -279,7 +283,6 @@ class TestWalkforwardEdgeCases:
             }
 
         monkeypatch.setattr(wf_module, "optimize_portfolio_allocation", mock_optimize)
-        monkeypatch.setattr(wf_module, "DATA_DIR", tmp_path)
 
         backtest_ids = ["strat_a", "strat_b", "strat_c", "strat_d"]
         result = wf_module.run_walkforward(
@@ -287,6 +290,7 @@ class TestWalkforwardEdgeCases:
             train_months=12,
             test_months=3,
             n_trials=50,
+            output_dir=tmp_path / "walkforward_results",
         )
 
         assert result["backtest_ids"] == backtest_ids
@@ -301,7 +305,6 @@ class TestWalkforwardEdgeCases:
             return {"sharpe": 1.0, "oos_sharpe": 0.9}
 
         monkeypatch.setattr(wf_module, "optimize_portfolio_allocation", mock_optimize)
-        monkeypatch.setattr(wf_module, "DATA_DIR", tmp_path)
 
         wf_module.run_walkforward(
             backtest_ids=["custom_strat"],
@@ -309,6 +312,7 @@ class TestWalkforwardEdgeCases:
             test_months=6,
             step_months=2,
             n_trials=200,
+            output_dir=tmp_path / "walkforward_results",
         )
 
         # Verify parameters are passed correctly to optimizer
@@ -322,10 +326,10 @@ class TestWalkforwardEdgeCases:
             return {"sharpe": 1.0, "oos_sharpe": 0.7}
 
         monkeypatch.setattr(wf_module, "optimize_portfolio_allocation", mock_optimize)
-        monkeypatch.setattr(wf_module, "DATA_DIR", tmp_path)
 
         result = wf_module.run_walkforward(
             backtest_ids=["strat1"],
+            output_dir=tmp_path / "walkforward_results",
         )
 
         # Verify ISO format with timezone
@@ -334,3 +338,84 @@ class TestWalkforwardEdgeCases:
         # Should be parseable as ISO format
         parsed_dt = datetime.fromisoformat(created_at)
         assert parsed_dt.tzinfo is not None  # Should have timezone info
+
+
+class _FakeEngine:
+    name = "fake"
+
+    def __init__(self) -> None:
+        self.configs: list[BacktestConfig] = []
+
+    def validate_config(self, config: BacktestConfig) -> list[str]:
+        return []
+
+    def run(self, config: BacktestConfig, strategy_path: str, progress_callback=None) -> BacktestResult:
+        self.configs.append(config)
+        is_oos = len(self.configs) % 2 == 0
+        sharpe = 0.5 if is_oos else 1.5
+        drawdown = -0.08 if is_oos else -0.03
+        initial = config.initial_capital
+        periods = 24
+        returns = [0.004, -0.001, 0.003, 0.002] if is_oos else [0.007, -0.002, 0.005, 0.004]
+        timestamps = pd.date_range(config.start_date, config.end_date, periods=periods)
+        equity = initial
+        equities = []
+        for index in range(periods):
+            if index > 0:
+                equity *= 1.0 + returns[index % len(returns)]
+            equities.append(equity)
+        equity_points = [
+            EquityPoint(time=timestamp.isoformat(), equity=equity)
+            for timestamp, equity in zip(timestamps, equities, strict=True)
+        ]
+        return BacktestResult(
+            meta=BacktestMeta(
+                id=f"{Path(strategy_path).stem}-{len(self.configs)}",
+                created_at="2026-01-01T00:00:00+00:00",
+                engine="fake",
+                strategies=[Path(strategy_path).stem],
+                backtest_start=config.start_date,
+                backtest_end=config.end_date,
+                initial_capital=config.initial_capital,
+                data={"symbols": config.symbols, "timeframes": [config.timeframe], "source": "test"},
+                parameters=config.parameters,
+            ),
+            trades=[],
+            equity_curve=equity_points,
+            stats={
+                "sharpe_ratio": sharpe,
+                "max_drawdown_pct": drawdown,
+                "total_trades": 2,
+            },
+        )
+
+
+def test_strategy_walkforward_builds_rolling_folds_and_summary(tmp_path: Path) -> None:
+    engine = _FakeEngine()
+    result = wf_module.run_walkforward(
+        strategy="strategies/example.py",
+        engine=engine,
+        symbols=["SPY"],
+        timeframe="1d",
+        start="2020-01-01",
+        end="2021-10-01",
+        train_months=12,
+        test_months=3,
+        step_months=3,
+        output_dir=tmp_path / "walkforward_results",
+        params={"window": 10},
+    )
+
+    assert result["mode"] == "strategy"
+    assert result["summary"]["fold_count"] == 3
+    assert result["summary"]["avg_oos_sharpe"] > 0
+    assert result["summary"]["worst_oos_drawdown"] >= 0
+    assert result["summary"]["profitable_fold_pct"] == 100.0
+    assert len(result["folds"]) == 3
+    assert len(engine.configs) == 6
+    assert engine.configs[0].start_date.startswith("2020-01-01")
+    assert engine.configs[1].start_date.startswith("2021-01-01")
+    assert result["folds"][0]["train_start"].startswith("2020-01-01")
+    assert result["folds"][0]["test_start"].startswith("2021-01-01")
+    saved = json.loads(Path(result["output_path"]).read_text(encoding="utf-8"))
+    assert saved == result

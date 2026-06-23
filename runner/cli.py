@@ -251,17 +251,29 @@ def cmd_engines(args):
 
 def cmd_walkforward(args):
     """Run walk-forward validation for a strategy."""
-    symbols = [symbol.strip() for symbol in args.symbols.split(",") if symbol.strip()]
+    symbols = parse_csv_list(args.symbols)
+    params = parse_params(args.params)
     result = run_walkforward(
         strategy=args.strategy,
+        engine=get_engine(args.engine),
+        engine_name=args.engine,
         symbols=symbols,
+        timeframe=normalize_timeframe(args.timeframe),
+        start=args.start,
+        end=args.end,
+        capital=args.capital,
         train_months=args.train_months,
         test_months=args.test_months,
         step_months=args.step_months,
+        risk_pct=args.risk_pct,
+        max_position_pct=args.max_position_pct,
+        max_leverage=args.max_leverage,
+        modeling_resolution=args.intrabar_resolution,
+        params=params,
+        data_dir=args.data_dir or "",
         output_dir=args.output_dir,
-        max_drawdown=args.max_drawdown,
     )
-    print(json.dumps(result, indent=2))
+    print(json.dumps(result, indent=2, ensure_ascii=False))
 
 
 def cmd_grid(args):
@@ -381,12 +393,22 @@ def main():
     # Walk-forward validation command
     wf_p = subparsers.add_parser("walkforward", help="Run walk-forward validation")
     wf_p.add_argument("--strategy", "-s", required=True, help="Strategy name or path")
-    wf_p.add_argument("--symbols", default="", help="Comma-separated symbols; empty = strategy defaults")
+    wf_p.add_argument("--engine", default="vectorbt", help="Backtest engine")
+    wf_p.add_argument("--symbols", required=True, help="Comma-separated symbols")
+    wf_p.add_argument("--timeframe", "-tf", default="1d", help="Data timeframe")
+    wf_p.add_argument("--start", required=True, help="Walk-forward start date")
+    wf_p.add_argument("--end", required=True, help="Walk-forward end date")
+    wf_p.add_argument("--capital", type=float, default=100000, help="Initial capital")
     wf_p.add_argument("--train-months", type=int, default=12, help="Training window in months")
     wf_p.add_argument("--test-months", type=int, default=3, help="Out-of-sample test window in months")
     wf_p.add_argument("--step-months", type=int, default=1, help="Rolling step in months")
     wf_p.add_argument("--output-dir", default="", help="Override output directory")
-    wf_p.add_argument("--max-drawdown", type=float, default=0.1, help="Flag if OOS drawdown exceeds this fraction")
+    wf_p.add_argument("--risk-pct", type=float, default=None, help="Risk per trade")
+    wf_p.add_argument("--max-position-pct", type=float, default=None)
+    wf_p.add_argument("--max-leverage", type=float, default=None)
+    wf_p.add_argument("--intrabar-resolution", default="open_close")
+    wf_p.add_argument("--params", default="", help="Strategy params JSON")
+    wf_p.add_argument("--data-dir", default="", help="Override data directory")
     wf_p.set_defaults(func=cmd_walkforward)
 
     # Backtest grid command
