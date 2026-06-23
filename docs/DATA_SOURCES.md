@@ -66,6 +66,9 @@ File: `data_tools/downloaders/dukascopy_native.py`
   availability rows like `tick ✅ seit 2003-05-04` and `h4 ❌ Not found`.
 - Requested start dates are validated only against known timeframe-specific
   genesis entries before the job starts.
+- Bulk downloads can raise `--pipeline-batches` to keep multiple URL batches in
+  flight before the inter-batch pause is applied. This improves long M1/tick
+  jobs while preserving the existing throttling backoff.
 
 ### Example
 
@@ -75,7 +78,8 @@ python -m data_tools.downloaders.dukascopy_native \
   --timeframes h1,d1 \
   --start 2024-01-01 \
   --end 2024-12-31 \
-  --price-type bid
+  --price-type bid \
+  --pipeline-batches 2
 ```
 
 ## Dolthub

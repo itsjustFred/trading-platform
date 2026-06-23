@@ -155,6 +155,7 @@ def download_symbol(
     end: str | None,
     price_type: str,
     batch_size: int,
+    pipeline_batches: int,
     pause_ms: int,
     force: bool,
 ) -> dict[str, Any]:
@@ -189,6 +190,7 @@ def download_symbol(
                     end=end,
                     offer_side=price_type,
                     batch_size=batch_size,
+                    pipeline_batches=pipeline_batches,
                     pause_ms=pause_ms,
                 )
                 result["download"] = dl_result.to_dict() | {"path": str(dl_result.path)}
@@ -230,6 +232,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=DATA_DIR, help="Data root directory")
     parser.add_argument("--workers", type=int, default=6, help="Parallel symbols")
     parser.add_argument("--batch-size", type=int, default=20, help="Dukascopy URL batch size per symbol")
+    parser.add_argument("--pipeline-batches", type=int, default=2, help="Dukascopy batches kept in flight per symbol")
     parser.add_argument("--pause-ms", type=int, default=500, help="Pause between Dukascopy batches")
     parser.add_argument("--price-type", choices=["bid", "ask", "both"], default="bid")
     parser.add_argument("--oil-type", choices=sorted(OIL_ALIASES), default="USOIL")
@@ -270,6 +273,7 @@ def main() -> None:
                     end=end,
                     price_type=args.price_type,
                     batch_size=args.batch_size,
+                    pipeline_batches=args.pipeline_batches,
                     pause_ms=args.pause_ms,
                     force=args.force,
                 )
@@ -288,6 +292,7 @@ def main() -> None:
                 end=end,
                 price_type=args.price_type,
                 batch_size=args.batch_size,
+                pipeline_batches=args.pipeline_batches,
                 pause_ms=args.pause_ms,
                 force=args.force,
             )
@@ -304,6 +309,7 @@ def main() -> None:
         "end": end,
         "output_dir": str(output_dir),
         "workers": workers,
+        "pipeline_batches": args.pipeline_batches,
         "ok": sum(1 for row in rows if row.get("status") == "ok"),
         "failed": sum(1 for row in rows if row.get("status") == "failed"),
         "results": rows,

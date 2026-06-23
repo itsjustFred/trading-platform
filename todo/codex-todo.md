@@ -102,9 +102,9 @@
 - [x] Migration-Integration-Test: `tests/test_database_migrations.py` prüft wiederholte Legacy-JSON-Migration ohne doppelte Trade-/Equity-Zeilen; zusätzlich grün mit `tests/test_portfolio_optimizer_oos.py` und `tests/test_grid_tester_sqlite.py`.
 
 ### 5. Dukascopy Speed / Parallelisierung
-- [ ] Aktuell: Single-Threaded-Async, viele 503-Warnungen bei längeren Downloads
-- [ ] Ziel: Bulk-Jobs deutlich schneller (Connection-Pool, HTTP/2, Chunked Requests)
-- [ ] Alternative: Node.js Sidecar (`scripts/dukascopy_fast/`) als subprocess
+- [x] Aktuell: Single-Threaded-Async, viele 503-Warnungen bei längeren Downloads: Native Downloader unterstützt jetzt `pipeline_batches`, behält Backoff/Cooldown bei und kann mehrere URL-Batches pro Pause-Fenster parallel halten.
+- [x] Ziel: Bulk-Jobs deutlich schneller (Connection-Pool, HTTP/2, Chunked Requests): `download_bi5_files()` skaliert Connector/Semaphore auf `batch_size * pipeline_batches`; `download_grid_market_data` nutzt standardmäßig `--pipeline-batches 2`.
+- [x] Alternative: Node.js Sidecar (`scripts/dukascopy_fast/`) als subprocess: nicht nötig; bestehender Python/aiohttp-Pfad wurde erweitert und mit `tests/test_dukascopy_downloader.py` sowie `tests/test_grid_market_data_download.py` verifiziert.
 
 ### 6. Viewer UI für Grid/Matrix
 - [ ] `MatrixGridPage.tsx` mit Heatmap, Trade-Details, Backtest-ID-Links

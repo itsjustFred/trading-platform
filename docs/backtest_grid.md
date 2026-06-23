@@ -35,6 +35,8 @@ Useful options:
 - `--end YYYY-MM-DD` to cap the download.
 - `--workers N` for parallel symbol downloads.
 - `--batch-size N` and `--pause-ms N` to tune Dukascopy batch behavior.
+- `--pipeline-batches N` to keep multiple Dukascopy batches in flight per
+  symbol before pausing; default is `2` for this bulk downloader.
 - `--oil-type UKOIL` if Brent is desired instead of WTI.
 - `--dry-run` to print the planned download plan without network calls.
 

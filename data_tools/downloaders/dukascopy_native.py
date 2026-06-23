@@ -411,6 +411,7 @@ async def download_bi5_files(
     max_retries: int = 3,
     *,
     batch_size: int | None = None,
+    pipeline_batches: int = 1,
     pause_ms: int = 1000,
     report_progress: Callable[[float, str], None] | None = None,
     progress_unit: str = "files",
@@ -422,9 +423,11 @@ async def download_bi5_files(
     import aiohttp
 
     effective_batch_size = max(1, int(batch_size or concurrency or 10))
+    effective_pipeline_batches = max(1, int(pipeline_batches or 1))
+    window_size = effective_batch_size * effective_pipeline_batches
     base_pause_ms = max(0, int(pause_ms))
     current_pause_ms = base_pause_ms
-    semaphore = asyncio.Semaphore(effective_batch_size)
+    semaphore = asyncio.Semaphore(window_size)
     results: list[tuple[datetime, bytes]] = []
     total = len(urls)
     completed = 0
@@ -435,14 +438,14 @@ async def download_bi5_files(
         _report_progress(report_progress, 100.0, f"No {unit} to download")
         return []
 
-    connector = aiohttp.TCPConnector(limit=effective_batch_size, force_close=False)
+    connector = aiohttp.TCPConnector(limit=window_size, force_close=False)
     timeout = aiohttp.ClientTimeout(total=60, connect=15)
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
         try:
-            for batch_index, offset in enumerate(range(0, total, effective_batch_size), start=1):
+            for batch_index, offset in enumerate(range(0, total, window_size), start=1):
                 await _wait_for_control(pause_event, stop_event)
                 batch_started_at_cap = current_pause_ms >= MAX_BATCH_PAUSE_MS
-                batch = urls[offset : offset + effective_batch_size]
+                batch = urls[offset : offset + window_size]
                 tasks = [
                     asyncio.create_task(
                         _fetch_one(
@@ -676,6 +679,7 @@ async def _download_minute_side_dataframe(
     side: str,
     decimal_factor: int,
     batch_size: int,
+    pipeline_batches: int,
     pause_ms: int,
     max_retries: int,
     report_progress: Callable[[float, str], None] | None = None,
@@ -694,6 +698,7 @@ async def _download_minute_side_dataframe(
         batch_size,
         max_retries,
         batch_size=batch_size,
+        pipeline_batches=pipeline_batches,
         pause_ms=pause_ms,
         report_progress=report_progress,
         progress_unit=target_unit,
@@ -768,6 +773,7 @@ async def _download_and_assemble_merged_ticks(
     start_dt: datetime,
     end_dt: datetime,
     batch_size: int,
+    pipeline_batches: int,
     pause_ms: int,
     max_retries: int,
     report_progress: Callable[[float, str], None] | None = None,
@@ -785,6 +791,7 @@ async def _download_and_assemble_merged_ticks(
         batch_size,
         max_retries,
         batch_size=batch_size,
+        pipeline_batches=pipeline_batches,
         pause_ms=pause_ms,
         report_progress=(
             (lambda pct, msg: _report_progress(report_progress, pct * 0.45, f"Bid {msg}"))
@@ -803,6 +810,7 @@ async def _download_and_assemble_merged_ticks(
         batch_size,
         max_retries,
         batch_size=batch_size,
+        pipeline_batches=pipeline_batches,
         pause_ms=pause_ms,
         report_progress=(
             (lambda pct, msg: _report_progress(report_progress, 45.0 + (pct * 0.45), f"Ask {msg}"))
@@ -953,6 +961,9 @@ class DukascopyNativeDownloader(Downloader):
         batch_size = int(kwargs.get("batch_size", kwargs.get("concurrency", 10)))
         if batch_size < 1:
             raise ValueError("batch_size must be >= 1")
+        pipeline_batches = int(kwargs.get("pipeline_batches", 1))
+        if pipeline_batches < 1:
+            raise ValueError("pipeline_batches must be >= 1")
         pause_ms = int(kwargs.get("pause_ms", 1000))
         if pause_ms < 0:
             raise ValueError("pause_ms must be >= 0")
@@ -978,7 +989,7 @@ class DukascopyNativeDownloader(Downloader):
 
         _emit_log_message(
             "Native download: symbol=%s instrument=%s tf=%s strategy=%s range=%s→%s "
-            "offer_side=%s merge=%s batch_size=%s pause_ms=%s"
+            "offer_side=%s merge=%s batch_size=%s pipeline_batches=%s pause_ms=%s"
             % (
                 sym,
                 instrument,
@@ -989,6 +1000,7 @@ class DukascopyNativeDownloader(Downloader):
                 offer_side,
                 merge_bid_ask,
                 batch_size,
+                pipeline_batches,
                 pause_ms,
             ),
             log_callback=log_callback,
@@ -1005,6 +1017,7 @@ class DukascopyNativeDownloader(Downloader):
                     batch_size,
                     pause_ms,
                     max_retries,
+                    pipeline_batches=pipeline_batches,
                     report_progress=report_progress,
                     stop_event=stop_event,
                     pause_event=pause_event,
@@ -1022,6 +1035,7 @@ class DukascopyNativeDownloader(Downloader):
                     batch_size,
                     max_retries,
                     batch_size=batch_size,
+                    pipeline_batches=pipeline_batches,
                     pause_ms=pause_ms,
                     report_progress=(
                         (lambda pct, msg: _report_progress(report_progress, pct * 0.9, msg))
@@ -1061,6 +1075,7 @@ class DukascopyNativeDownloader(Downloader):
                     side="bid",
                     decimal_factor=decimal_factor,
                     batch_size=batch_size,
+                    pipeline_batches=pipeline_batches,
                     pause_ms=pause_ms,
                     max_retries=max_retries,
                     report_progress=(
@@ -1079,6 +1094,7 @@ class DukascopyNativeDownloader(Downloader):
                     side="ask",
                     decimal_factor=decimal_factor,
                     batch_size=batch_size,
+                    pipeline_batches=pipeline_batches,
                     pause_ms=pause_ms,
                     max_retries=max_retries,
                     report_progress=(
@@ -1119,6 +1135,7 @@ class DukascopyNativeDownloader(Downloader):
                     side=price_type,
                     decimal_factor=decimal_factor,
                     batch_size=batch_size,
+                    pipeline_batches=pipeline_batches,
                     pause_ms=pause_ms,
                     max_retries=max_retries,
                     report_progress=(
@@ -1235,6 +1252,15 @@ def main() -> None:
         default=1000,
         help="Pause between batches in milliseconds (default: 1000)",
     )
+    parser.add_argument(
+        "--pipeline-batches",
+        type=int,
+        default=1,
+        help=(
+            "Number of batches to keep in flight before applying the inter-batch pause "
+            "(default: 1; raise to 2-4 for faster bulk downloads)"
+        ),
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -1269,6 +1295,7 @@ def main() -> None:
                     merge_tick=args.merge_tick,
                     merge_s1=args.merge_s1,
                     batch_size=args.batch_size,
+                    pipeline_batches=args.pipeline_batches,
                     pause_ms=args.pause_ms,
                 )
                 completed += 1
