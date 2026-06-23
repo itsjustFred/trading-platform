@@ -2,6 +2,9 @@
 
 import pytest
 import numpy as np
+from sqlmodel import SQLModel, create_engine
+
+from shared.models import BacktestMeta, BacktestResult, EquityPoint
 from runner.portfolio_optimizer import (
     _split_equity_curves_by_time,
     _portfolio_sharpe_from_weights,
@@ -371,3 +374,43 @@ def test_portfolio_optimizer_with_train_months_oos_split(monkeypatch, tmp_path) 
     assert result["oos_split"]["test_months"] == 6
     # Verify both IS and OOS curves were processed
     assert "sharpe" in result  # In-sample Sharpe
+
+
+def test_load_strategy_equity_reads_sqlite_first(monkeypatch, tmp_path) -> None:
+    """Portfolio optimizer should read canonical SQLite backtest results."""
+    import shared.database as database
+    import runner.portfolio_optimizer as po_module
+
+    engine = create_engine(
+        f"sqlite:///{(tmp_path / 'backtests.db').as_posix()}",
+        connect_args={"check_same_thread": False},
+    )
+    monkeypatch.setattr(database, "ENGINE", engine)
+    monkeypatch.setattr(database, "DATA_DIR", tmp_path / "data")
+    monkeypatch.setattr(database, "_DB_INITIALIZED", False)
+    SQLModel.metadata.create_all(engine)
+
+    database.save_result_to_sqlite(
+        BacktestResult(
+            meta=BacktestMeta(
+                id="sqlite_equity_source",
+                created_at="2026-06-23T00:00:00+00:00",
+                engine="native",
+                strategies=["sqlite_strategy"],
+                backtest_start="2024-01-01",
+                backtest_end="2024-01-03",
+                data={"symbols": ["SPY"], "timeframes": ["1d"]},
+            ),
+            trades=[],
+            equity_curve=[
+                EquityPoint(time="2024-01-01T00:00:00+00:00", equity=100000.0),
+                EquityPoint(time="2024-01-02T00:00:00+00:00", equity=101000.0),
+            ],
+            stats={},
+        )
+    )
+
+    points = po_module._load_strategy_equity("sqlite_equity_source")
+
+    assert [point.equity for point in points] == [100000.0, 101000.0]
+    assert points[0].time == 1704067200

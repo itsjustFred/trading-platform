@@ -96,55 +96,24 @@ def _split_equity_curves_by_time(
 
 
 def _load_strategy_equity(backtest_id: str) -> list[StrategyEquityPoint]:
-    """Load equity curve for a strategy backtest.
-    
-    Tries SQLite first, falls back to JSON for backward compatibility.
-    """
-    # Try SQLite first (single source of truth)
+    """Load an equity curve for a strategy backtest from SQLite."""
     try:
-        from shared.constants import DATA_DIR
-        from shared.database import init_db, get_session, BacktestRecord
-        from sqlmodel import select
-        
-        init_db()
-        with get_session() as session:
-            record = session.exec(
-                select(BacktestRecord).where(BacktestRecord.id == backtest_id)
-            ).first()
-            if record and record.equity_curve:
-                points = []
-                for p in record.equity_curve:
-                    if isinstance(p, dict):
-                        if p.get("time") and p.get("equity"):
-                            # Parse time through _parse_time_to_ts for ISO or Unix format
-                            time_ts = _parse_time_to_ts(p.get("time", 0))
-                            points.append(StrategyEquityPoint(
-                                time=int(time_ts),
-                                equity=float(p.get("equity", 0))
-                            ))
-                if points:
-                    return points
+        from shared.database import load_backtest_result
+
+        result = load_backtest_result(backtest_id)
+        if result and result.equity_curve:
+            points = []
+            for point in result.equity_curve:
+                time_ts = _parse_time_to_ts(point.time)
+                if time_ts and point.equity:
+                    points.append(
+                        StrategyEquityPoint(time=int(time_ts), equity=float(point.equity))
+                    )
+            if points:
+                return points
     except Exception:
-        pass  # Fall through to JSON fallback
-    
-    # JSON fallback for backward compatibility
-    from shared.constants import DATA_DIR
-    path = Path(DATA_DIR) / "backtests" / f"{backtest_id}.trades.json"
-    if not path.exists():
         return []
-    try:
-        data = json.loads(path.read_text())
-        equity = data.get("equity_curve", [])
-        return [
-            StrategyEquityPoint(
-                time=int(_parse_time_to_ts(p.get("time", 0))),
-                equity=float(p.get("equity", 0))
-            )
-            for p in equity
-            if p.get("time") and p.get("equity")
-        ]
-    except (json.JSONDecodeError, KeyError, ValueError):
-        return []
+    return []
 
 
 def _align_equity_curves(

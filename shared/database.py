@@ -1709,20 +1709,44 @@ def save_result_to_sqlite(result: BacktestResult) -> None:
         session.commit()
 
 
-def migrate_json_to_sqlite() -> dict[str, int]:
+def migrate_json_to_sqlite(*, skip_existing: bool = True) -> dict[str, int]:
+    """Migrate legacy ``*.trades.json`` files into SQLite.
+
+    By default this is idempotent for app startup: existing backtest IDs are
+    skipped instead of being re-written on every boot. Set ``skip_existing`` to
+    false for an explicit repair/rebuild pass.
+    """
     init_db()
     backtests_dir = DATA_DIR / "backtests"
-    summary = {"migrated": 0, "failed": 0, "total": 0}
+    summary = {"migrated": 0, "skipped": 0, "failed": 0, "total": 0}
 
     if not backtests_dir.exists():
         return summary
+
+    existing_ids: set[str] = set()
+    if skip_existing:
+        with get_session() as session:
+            rows = session.exec(select(BacktestRecord.id)).all()
+        for row in rows:
+            if isinstance(row, str):
+                existing_ids.add(row)
+            elif hasattr(row, "_mapping"):
+                value = getattr(row, "_mapping").get("id")
+                if value:
+                    existing_ids.add(str(value))
+            elif isinstance(row, (tuple, list)) and row and row[0]:
+                existing_ids.add(str(row[0]))
 
     for path in sorted(backtests_dir.glob("*.trades.json")):
         summary["total"] += 1
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
             result = BacktestResult.from_dict(payload)
+            if skip_existing and result.meta.id in existing_ids:
+                summary["skipped"] += 1
+                continue
             save_result_to_sqlite(result)
+            existing_ids.add(result.meta.id)
             summary["migrated"] += 1
         except Exception as exc:
             summary["failed"] += 1
@@ -1730,9 +1754,10 @@ def migrate_json_to_sqlite() -> dict[str, int]:
 
     if summary["total"]:
         logger.info(
-            "JSON→SQLite migration finished: total=%s migrated=%s failed=%s",
+            "JSON→SQLite migration finished: total=%s migrated=%s skipped=%s failed=%s",
             summary["total"],
             summary["migrated"],
+            summary["skipped"],
             summary["failed"],
         )
     return summary
@@ -2867,6 +2892,18 @@ def save_grid_result_to_sqlite(grid_result: dict[str, Any]) -> None:
         session.commit()
 
 
+def _grid_record_payload(record: GridRecord) -> dict[str, Any]:
+    return {
+        "id": record.id,
+        "strategy": record.strategy,
+        "created_at": record.created_at,
+        "symbols": record.symbols_json,
+        "timeframes": record.timeframes_json,
+        "results": record.results_json,
+        "engine": record.engine,
+    }
+
+
 def get_grid_results(limit: int = 100) -> list[dict[str, Any]]:
     """Retrieve grid results from SQLite, newest first.
 
@@ -2882,18 +2919,18 @@ def get_grid_results(limit: int = 100) -> list[dict[str, Any]]:
             select(GridRecord).order_by(GridRecord.created_at.desc()).limit(limit)
         ).all()
 
-        return [
-            {
-                "id": rec.id,
-                "strategy": rec.strategy,
-                "created_at": rec.created_at,
-                "symbols": rec.symbols_json,
-                "timeframes": rec.timeframes_json,
-                "results": rec.results_json,
-                "engine": rec.engine,
-            }
-            for rec in records
-        ]
+        return [_grid_record_payload(rec) for rec in records if isinstance(rec, GridRecord)]
+
+
+def load_grid_result(grid_id: str) -> dict[str, Any] | None:
+    """Load a single grid result payload from SQLite."""
+    normalized_id = str(grid_id or "").strip()
+    if not normalized_id:
+        return None
+    init_db()
+    with get_session() as session:
+        record = session.get(GridRecord, normalized_id)
+    return _grid_record_payload(record) if isinstance(record, GridRecord) else None
 
 
 def save_grid_result(

@@ -13,10 +13,15 @@ from typing import Any, Callable
 from runner.cli import get_engine
 from runner.engines.base import BacktestConfig
 from shared.constants import DATA_DIR
-from shared.database import save_result_to_sqlite
+from shared.database import get_grid_results
 from shared.strategy_registry import find_strategy_entry
 
 GRID_RESULTS_DIR = DATA_DIR / "grid_results"
+
+
+def load_grid_results(limit: int = 100) -> list[dict[str, Any]]:
+    """Load persisted grid results from SQLite."""
+    return get_grid_results(limit=limit)
 
 
 def run_strategy_grid(

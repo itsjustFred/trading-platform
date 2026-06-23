@@ -180,3 +180,23 @@ def test_get_grid_results_returns_newest_first() -> None:
     ids = [r["id"] for r in results]
     assert id_1 in ids, "First grid result should exist"
     assert id_2 in ids, "Second grid result should exist"
+
+
+def test_grid_tester_loads_results_from_sqlite(monkeypatch) -> None:
+    """Grid tester should expose SQLite-backed grid result reads."""
+    import runner.grid_tester as grid_tester_module
+
+    expected = [
+        {
+            "id": "grid_sqlite_read",
+            "strategy": "example_sma",
+            "symbols": ["AAPL"],
+            "timeframes": ["1d"],
+            "results": {"AAPL": {"1d": {"status": "success"}}},
+            "engine": "vectorbt",
+        }
+    ]
+
+    monkeypatch.setattr(grid_tester_module, "get_grid_results", lambda limit=100: expected[:limit])
+
+    assert grid_tester_module.load_grid_results(limit=1) == expected

@@ -97,9 +97,9 @@
 - [x] CLI: `python -m runner.cli walkforward --strategy ...` akzeptiert Engine, Symbols, Timeframe, Start/Ende, Risk-/Leverage-Parameter, Params JSON und Output-Dir. Verifiziert mit `tests/test_walkforward.py` und `tests/test_runner_cli.py`.
 
 ### 4. DB-Konsolidierung
-- [ ] Legacy `*.trades.json` → SQLite Migration idempotent beim Server-Start
-- [ ] `portfolio_optimizer.py` und `grid_tester.py` lesen aus SQLite (nicht mehr aus JSON)
-- [ ] Migration-Integration-Test
+- [x] Legacy `*.trades.json` → SQLite Migration idempotent beim Server-Start: `viewer.main` startet die Migration im Lifespan, `migrate_json_to_sqlite()` überspringt bestehende Backtest-IDs und zählt `skipped` explizit.
+- [x] `portfolio_optimizer.py` und `grid_tester.py` lesen aus SQLite (nicht mehr aus JSON): Portfolio-Equity lädt über `load_backtest_result`; Grid-Tester bietet `load_grid_results()` über `grid_results`.
+- [x] Migration-Integration-Test: `tests/test_database_migrations.py` prüft wiederholte Legacy-JSON-Migration ohne doppelte Trade-/Equity-Zeilen; zusätzlich grün mit `tests/test_portfolio_optimizer_oos.py` und `tests/test_grid_tester_sqlite.py`.
 
 ### 5. Dukascopy Speed / Parallelisierung
 - [ ] Aktuell: Single-Threaded-Async, viele 503-Warnungen bei längeren Downloads
