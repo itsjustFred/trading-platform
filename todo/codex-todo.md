@@ -107,8 +107,8 @@
 - [x] Alternative: Node.js Sidecar (`scripts/dukascopy_fast/`) als subprocess: nicht nötig; bestehender Python/aiohttp-Pfad wurde erweitert und mit `tests/test_dukascopy_downloader.py` sowie `tests/test_grid_market_data_download.py` verifiziert.
 
 ### 6. Viewer UI für Grid/Matrix
-- [ ] `MatrixGridPage.tsx` mit Heatmap, Trade-Details, Backtest-ID-Links
-- [ ] API-Endpunkte für `/api/grid/{strategy_id}` mit Trade-Level-Daten
+- [x] `MatrixGridPage.tsx` mit Heatmap, Trade-Details, Backtest-ID-Links: Seite lädt Matrix/Grid-Daten über API, Zellen und Tabellen-Rows verlinken auf Backtest-Details und zeigen Trade-Samples/Trade-API an.
+- [x] API-Endpunkte für `/api/grid/{strategy_id}` mit Trade-Level-Daten: FastAPI-Endpunkt filtert Strategie-Rows, ergänzt Backtest-/Trades-URLs und lädt Trade-Samples aus SQLite. Verifiziert mit `tests/test_viewer_features.py` und `npm run build`.
 
 ### 7. Repo aufräumen
 - [ ] Verwaiste Debug-/Scratch-Dateien identifizieren und entfernen

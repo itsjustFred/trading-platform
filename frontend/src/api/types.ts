@@ -809,6 +809,97 @@ export interface BacktestMatrixSummary {
   runs?: BacktestMatrixRun[];
 }
 
+export interface MatrixGridRow {
+  strategy: string;
+  status: string;
+  symbol: string;
+  timeframe: string;
+  run_id: string;
+  backtest_id?: string | null;
+  backtest_url?: string | null;
+  trades_url?: string | null;
+  trade_data_available?: boolean | null;
+  trades?: Trade[];
+  trade_sample_count?: number;
+  output?: string | null;
+  started_at?: string | null;
+  finished_at?: string | null;
+  duration_minutes?: number | null;
+  total_trades: number;
+  total_pnl?: number | null;
+  net_profit_pct?: number | null;
+  sharpe?: number | null;
+  cagr?: number | null;
+  max_drawdown_pct?: number | null;
+  win_rate?: number | null;
+  psr?: number | null;
+  daily_return_count?: number | null;
+  returncode?: number | null;
+  matrix_csv?: string | null;
+}
+
+export interface MatrixGridBlockedStrategy {
+  strategy: string;
+  status: string;
+  ok?: number | null;
+  failed?: number | null;
+  requested?: number | null;
+  trades?: number | null;
+  blocked_reason?: string | null;
+  updated_at?: string | null;
+}
+
+export interface MatrixGridStrategySummary {
+  strategy: string;
+  status: string;
+  ok: number;
+  failed: number;
+  skipped_existing: number;
+  requested: number;
+  trades: number;
+  count: number;
+  total_trades: number;
+  total_pnl?: number | null;
+  avg_sharpe?: number | null;
+  best_sharpe?: number | null;
+  best_sharpe_combo?: { symbol: string; timeframe: string } | null;
+  avg_cagr?: number | null;
+  best_cagr?: number | null;
+  best_cagr_combo?: { symbol: string; timeframe: string } | null;
+  avg_psr?: number | null;
+  best_psr?: number | null;
+  best_psr_combo?: { symbol: string; timeframe: string } | null;
+  avg_max_drawdown_pct?: number | null;
+  worst_max_drawdown_pct?: number | null;
+  worst_drawdown_combo?: { symbol: string; timeframe: string } | null;
+  avg_net_profit_pct?: number | null;
+  best_net_profit_pct?: number | null;
+  best_profit_combo?: { symbol: string; timeframe: string } | null;
+  completed_at?: string | null;
+  updated_at?: string | null;
+  matrix_csv?: string | null;
+}
+
+export interface MatrixGridOverview {
+  generated_at: string;
+  source: string;
+  api_source?: string;
+  selected_strategy?: string | null;
+  report_started_at?: string | null;
+  report_updated_at?: string | null;
+  counts: {
+    strategies_done: number;
+    strategies_blocked: number;
+    rows: number;
+    ok_rows: number;
+    failed_rows: number;
+    symbols: string[];
+  };
+  strategy_summaries: MatrixGridStrategySummary[];
+  blocked_strategies: MatrixGridBlockedStrategy[];
+  rows: MatrixGridRow[];
+}
+
 export interface BacktestsBulkDeleteResponse {
   deleted: number;
 }

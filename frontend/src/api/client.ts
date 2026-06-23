@@ -52,6 +52,7 @@ import type {
   BacktestsRemoveEmptyResponse,
   BacktestsCompareResponse,
   BacktestMatrixSummary,
+  MatrixGridOverview,
   PortfolioComponent,
   PortfolioContribution,
   PortfolioDetail,
@@ -256,6 +257,10 @@ export const getBacktestDuplicates = () =>
 export const getBacktestMatrix = () => fetchJSON<BacktestMatrixSummary>("/backtests/matrix/summary");
 export const getBacktestMatrixMatrixCsvUrl = () => "/api/backtests/matrix/matrix.csv";
 export const getBacktestMatrixDailyEquityCsvUrl = () => "/api/backtests/matrix/daily-equity.csv";
+export const getMatrixGrid = (strategyId = "all", tradesLimit = 3) =>
+  fetchJSON<MatrixGridOverview>(
+    `/grid/${encodeURIComponent(strategyId)}?trades_limit=${Math.max(0, Math.min(20, Math.trunc(tradesLimit)))}`,
+  );
 export const deduplicateBacktests = () =>
   fetchJSON<BacktestsDeduplicateResponse>("/backtests/deduplicate", {
     method: "POST",

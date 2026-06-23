@@ -1,7 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
+import { Link } from "react-router-dom";
 import { Download, RefreshCw, Search, Table2, AlertTriangle } from "lucide-react";
 
+import { getMatrixGrid } from "../api/client";
 import { Badge } from "../components/Badge";
+import type { Trade } from "../api/types";
 
 type MatrixStatus = "ok" | "failed" | "blocked" | "missing_grid_summary" | string;
 
@@ -53,6 +56,12 @@ interface MatrixRow {
   symbol: string;
   timeframe: string;
   run_id: string;
+  backtest_id?: string | null;
+  backtest_url?: string | null;
+  trades_url?: string | null;
+  trade_data_available?: boolean | null;
+  trades?: Trade[];
+  trade_sample_count?: number;
   output?: string | null;
   started_at?: string | null;
   finished_at?: string | null;
@@ -247,13 +256,7 @@ export function MatrixGridPage() {
     let cancelled = false;
     setLoading(true);
     setError(null);
-    fetch("/matrix-grid-overview.json")
-      .then(async (response) => {
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`);
-        }
-        return response.json() as Promise<MatrixGridOverview>;
-      })
+    getMatrixGrid("all", 3)
       .then((data) => {
         if (!cancelled) setOverview(data);
       })
@@ -604,9 +607,9 @@ interface StrategyGridCellProps {
 
 function StrategyGridCell({ row, metric }: StrategyGridCellProps) {
   const value = selectedGridMetricValue(row, metric);
-  return (
-    <div className="min-w-[150px] rounded-lg border border-border/70 bg-surface2 p-3 text-center">
-      <div className="text-[0.68rem] uppercase tracking-wide text-text-muted">
+  const content = (
+    <>
+      <div className="text-[0.68rem] uppercase text-text-muted">
         Sharpe {formatMetric(row.sharpe, 2)} · PSR {formatMetric(row.psr, 3)}
       </div>
       <div className="mt-1 text-lg font-semibold" style={{ color: gridMetricColor(value, metric) }}>
@@ -615,7 +618,22 @@ function StrategyGridCell({ row, metric }: StrategyGridCellProps) {
       <div className="mt-1 text-xs text-text-muted">
         {formatNumber(row.total_trades, 0)} Trades · Win {formatPctFraction(row.win_rate, 1)}
       </div>
-    </div>
+      {row.backtest_id ? (
+        <div className="mt-2 text-[0.68rem] text-blue">Backtest {row.backtest_id}</div>
+      ) : null}
+    </>
+  );
+  return (
+    row.backtest_id ? (
+      <Link
+        to={`/backtests/${encodeURIComponent(row.backtest_id)}`}
+        className="block min-w-[150px] rounded border border-border bg-surface2 p-3 text-center hover:border-blue/70"
+      >
+        {content}
+      </Link>
+    ) : (
+      <div className="min-w-[150px] rounded border border-border/70 bg-surface2 p-3 text-center">{content}</div>
+    )
   );
 }
 
@@ -710,6 +728,7 @@ function MatrixTableView({
                 <SortableTh label="PSR" sortKey="psr" current={sortKey} dir={sortDir} onSort={handleSort} sortLabel={sortLabel} align="right" />
                 <th className="border-b border-border px-2 py-2">Status</th>
                 <th className="border-b border-border px-2 py-2">Run</th>
+                <th className="border-b border-border px-2 py-2">Trades</th>
               </tr>
             </thead>
             <tbody>
@@ -727,7 +746,29 @@ function MatrixTableView({
                   <td className="px-2 py-2 text-right">{formatPctFraction(row.win_rate, 1)}</td>
                   <td className="px-2 py-2 text-right" style={{ color: psrColor(row.psr) }}>{formatMetric(row.psr, 3)}</td>
                   <td className="px-2 py-2 text-center"><Badge color={statusColor(row.status)}>{row.status}</Badge></td>
-                  <td className="px-2 py-2 max-w-[220px] truncate text-text-muted" title={row.run_id}>{row.run_id}</td>
+                  <td className="px-2 py-2 max-w-[220px] truncate" title={row.backtest_id || row.run_id}>
+                    {row.backtest_id ? (
+                      <Link className="text-blue hover:underline" to={`/backtests/${encodeURIComponent(row.backtest_id)}`}>
+                        {row.backtest_id}
+                      </Link>
+                    ) : (
+                      <span className="text-text-muted">{row.run_id}</span>
+                    )}
+                  </td>
+                  <td className="px-2 py-2 text-xs text-text-muted">
+                    {row.trades_url ? (
+                      <a className="text-blue hover:underline" href={row.trades_url}>
+                        API
+                      </a>
+                    ) : null}
+                    {row.trades && row.trades.length > 0 ? (
+                      <span className="ml-2">
+                        {row.trades.slice(0, 2).map((trade) => `${trade.direction} ${formatNumber(trade.pnl, 0)}`).join(" · ")}
+                      </span>
+                    ) : (
+                      <span className="ml-2">Keine Samples</span>
+                    )}
+                  </td>
                 </tr>
               ))}
             </tbody>

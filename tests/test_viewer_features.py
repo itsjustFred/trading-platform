@@ -90,6 +90,125 @@ def test_get_dukascopy_genesis(viewer_client, tmp_path):
     }
 
 
+def test_grid_strategy_endpoint_returns_rows_and_trade_samples(
+    viewer_client,
+    monkeypatch,
+    tmp_path,
+):
+    import viewer.main as viewer_app_module
+
+    overview_path = tmp_path / "matrix-grid-overview.json"
+    overview_path.write_text(
+        json.dumps(
+            {
+                "generated_at": "2026-06-23T00:00:00Z",
+                "source": "test",
+                "counts": {
+                    "strategies_done": 1,
+                    "strategies_blocked": 0,
+                    "rows": 1,
+                    "ok_rows": 1,
+                    "failed_rows": 0,
+                    "symbols": ["SPY"],
+                },
+                "strategy_summaries": [{"strategy": "example_sma", "ok": 1, "requested": 1}],
+                "blocked_strategies": [],
+                "rows": [
+                    {
+                        "strategy": "example_sma",
+                        "status": "ok",
+                        "symbol": "SPY",
+                        "timeframe": "1d",
+                        "run_id": "grid_example_sma_spy_1d",
+                        "backtest_id": "bt_grid_spy_1d",
+                        "total_trades": 1,
+                        "sharpe": 1.25,
+                    }
+                ],
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(viewer_app_module, "MATRIX_GRID_OVERVIEW_PATH", overview_path)
+
+    result = BacktestResult(
+        meta=BacktestMeta(
+            id="bt_grid_spy_1d",
+            created_at="2026-06-23T00:00:00+00:00",
+            engine="native",
+            strategies=["example_sma"],
+            backtest_start="2024-01-01",
+            backtest_end="2024-01-05",
+            data={"symbols": ["SPY"], "timeframes": ["1d"]},
+        ),
+        trades=[
+            Trade(
+                id=1,
+                symbol="SPY",
+                direction="LONG",
+                entry_time="2024-01-02T00:00:00+00:00",
+                entry_price=100.0,
+                quantity=2.0,
+                exits=[
+                    TradeExit(
+                        time="2024-01-03T00:00:00+00:00",
+                        price=105.0,
+                        quantity=2.0,
+                        pnl=10.0,
+                    )
+                ],
+                pnl=10.0,
+            )
+        ],
+        equity_curve=[],
+        stats={},
+    )
+    monkeypatch.setattr(viewer_app_module, "load_backtest_result", lambda backtest_id: result if backtest_id == "bt_grid_spy_1d" else None)
+
+    resp = viewer_client.get("/api/grid/example_sma?trades_limit=2")
+
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["selected_strategy"] == "example_sma"
+    assert payload["counts"]["rows"] == 1
+    row = payload["rows"][0]
+    assert row["backtest_id"] == "bt_grid_spy_1d"
+    assert row["backtest_url"] == "/backtests/bt_grid_spy_1d"
+    assert row["trades_url"] == "/api/backtest/bt_grid_spy_1d/trades"
+    assert row["trade_sample_count"] == 1
+    assert row["trades"][0]["symbol"] == "SPY"
+
+
+def test_grid_strategy_endpoint_returns_404_for_unknown_strategy(
+    viewer_client,
+    monkeypatch,
+    tmp_path,
+):
+    import viewer.main as viewer_app_module
+
+    overview_path = tmp_path / "matrix-grid-overview.json"
+    overview_path.write_text(
+        json.dumps(
+            {
+                "generated_at": "2026-06-23T00:00:00Z",
+                "source": "test",
+                "counts": {"rows": 0, "ok_rows": 0, "failed_rows": 0, "symbols": []},
+                "strategy_summaries": [],
+                "blocked_strategies": [],
+                "rows": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(viewer_app_module, "MATRIX_GRID_OVERVIEW_PATH", overview_path)
+
+    resp = viewer_client.get("/api/grid/missing_strategy")
+
+    assert resp.status_code == 404
+
+
 def test_get_dukascopy_genesis_returns_missing_timeframes_as_unavailable(
     viewer_client,
     tmp_path,

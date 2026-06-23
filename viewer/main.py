@@ -153,6 +153,7 @@ AGENT_CONVERT_PROVIDER_NAMES: tuple[str, ...] = ("nim", "copilot_sdk")
 
 BACKTESTS_DIR = DATA_DIR / "backtests"
 MATRIX_RESULTS_DIR = DATA_DIR / "backtests" / "matrix_runner"
+MATRIX_GRID_OVERVIEW_PATH = PROJECT_ROOT / "frontend" / "public" / "matrix-grid-overview.json"
 PORTFOLIOS_DIR = DATA_DIR / "portfolios"
 STRATEGIES_DIR = DEFAULT_STRATEGIES_DIR
 REACT_DIST = PROJECT_ROOT / "frontend" / "dist"
@@ -6272,6 +6273,71 @@ def _matrix_summary_payload() -> dict[str, Any]:
     return payload
 
 
+def _matrix_grid_overview_path() -> Path:
+    candidates = [
+        MATRIX_GRID_OVERVIEW_PATH,
+        STATIC_DIR / "matrix-grid-overview.json",
+        PROJECT_ROOT / "frontend" / "public" / "matrix-grid-overview.json",
+    ]
+    for path in candidates:
+        if path.exists():
+            return path
+    return candidates[0]
+
+
+def _load_matrix_grid_overview_payload() -> dict[str, Any]:
+    path = _matrix_grid_overview_path()
+    if not path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail="No matrix grid overview found. Run `python scripts/generate_matrix_grid_overview.py` first.",
+        )
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        raise HTTPException(status_code=500, detail=f"Invalid matrix grid overview: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=500, detail="Invalid matrix grid overview payload")
+    payload["api_source"] = str(path)
+    return payload
+
+
+def _matrix_row_backtest_id(row: dict[str, Any]) -> str:
+    backtest_id = str(row.get("backtest_id") or "").strip()
+    if backtest_id:
+        return backtest_id
+    run_id = str(row.get("run_id") or "").strip()
+    return run_id
+
+
+def _matrix_grid_row_with_trades(row: dict[str, Any], *, trades_limit: int) -> dict[str, Any]:
+    enriched = dict(row)
+    backtest_id = _matrix_row_backtest_id(row)
+    if backtest_id:
+        enriched["backtest_id"] = backtest_id
+        enriched["backtest_url"] = f"/backtests/{backtest_id}"
+        enriched["trades_url"] = f"/api/backtest/{backtest_id}/trades"
+
+    if not backtest_id or trades_limit <= 0:
+        enriched.setdefault("trades", [])
+        enriched["trade_sample_count"] = 0
+        return enriched
+
+    result = load_backtest_result(backtest_id)
+    if result is None:
+        enriched.setdefault("trades", [])
+        enriched["trade_sample_count"] = 0
+        enriched["trade_data_available"] = False
+        return enriched
+
+    trades = [legacy_viewer._trade_to_viewer(trade) for trade in result.trades[:trades_limit]]
+    enriched["trades"] = trades
+    enriched["trade_sample_count"] = len(trades)
+    enriched["trade_data_available"] = bool(result.trades)
+    enriched["total_trades"] = len(result.trades)
+    return enriched
+
+
 @app.get("/api/backtests/matrix/summary", response_model=dict[str, Any])
 async def get_backtest_matrix_summary() -> dict[str, Any]:
     return _matrix_summary_payload()
@@ -6291,6 +6357,50 @@ async def get_backtest_matrix_daily_equity_csv() -> FileResponse:
     if not path.exists():
         raise HTTPException(status_code=404, detail="Matrix daily equity CSV not found")
     return FileResponse(path, media_type="text/csv", filename=path.name)
+
+
+@app.get("/api/grid/{strategy_id:path}", response_model=dict[str, Any])
+async def get_grid_strategy_detail(
+    strategy_id: str,
+    trades_limit: int = Query(default=3, ge=0, le=20),
+) -> dict[str, Any]:
+    payload = _load_matrix_grid_overview_payload()
+    normalized_strategy = str(strategy_id or "").strip()
+    include_all = normalized_strategy.lower() in {"", "all", "*"}
+
+    rows = [row for row in payload.get("rows", []) if isinstance(row, dict)]
+    if not include_all:
+        rows = [row for row in rows if str(row.get("strategy") or "") == normalized_strategy]
+        if not rows:
+            raise HTTPException(status_code=404, detail=f"Grid strategy '{strategy_id}' not found")
+
+    payload = dict(payload)
+    payload["rows"] = [
+        _matrix_grid_row_with_trades(row, trades_limit=trades_limit)
+        for row in rows
+    ]
+    if include_all:
+        summaries = payload.get("strategy_summaries", [])
+        payload["strategy_summaries"] = [item for item in summaries if isinstance(item, dict)]
+    else:
+        summaries = payload.get("strategy_summaries", [])
+        payload["strategy_summaries"] = [
+            item for item in summaries
+            if isinstance(item, dict) and str(item.get("strategy") or "") == normalized_strategy
+        ]
+        payload["blocked_strategies"] = [
+            item for item in payload.get("blocked_strategies", [])
+            if isinstance(item, dict) and str(item.get("strategy") or "") == normalized_strategy
+        ]
+    payload["selected_strategy"] = None if include_all else normalized_strategy
+    payload["counts"] = {
+        **dict(payload.get("counts") or {}),
+        "rows": len(payload["rows"]),
+        "ok_rows": sum(1 for row in payload["rows"] if row.get("status") == "ok"),
+        "failed_rows": sum(1 for row in payload["rows"] if row.get("status") == "failed"),
+        "symbols": sorted({str(row.get("symbol") or "") for row in payload["rows"] if row.get("symbol")}),
+    }
+    return payload
 
 
 @app.get("/api/backtests", response_model=BacktestsListResponse)
