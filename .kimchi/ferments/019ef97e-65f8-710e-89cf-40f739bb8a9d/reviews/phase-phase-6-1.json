@@ -1,0 +1,48 @@
+{
+  "schemaVersion": 1,
+  "fermentId": "019ef97e-65f8-710e-89cf-40f739bb8a9d",
+  "phaseId": "phase-6",
+  "phaseName": "Reporting",
+  "attempt": 1,
+  "timestamp": "2026-06-24T16:46:09.927Z",
+  "goal": "Vergleichsberichte erzeugen, Abweichungen erklären, agentenfreundliche und menschenlesbare Ausgabe bereitstellen.",
+  "summary": "Phase 6 „Reporting“ abgeschlossen. JSON-Report, Markdown-Report und CLI-Entrypoint implementiert und getestet.",
+  "stepSummaries": "  1. Agentenfreundlichen JSON-Report mit allen Deltas und Erklärungen implementieren. [verified]\n  2. Menschenlesbaren Markdown-Report implementieren. [verified]\n  3. CLI/Entrypoint für Report-Generierung aus zwei `ValidationReference`-Objekten. [verified]",
+  "diffAvailable": false,
+  "flags": [],
+  "derivedGrade": "A",
+  "reviewerRationale": "All gates pass; project checks validate.",
+  "gateVerdicts": [
+    {
+      "id": "F1",
+      "verdict": "pass",
+      "rationale": "Alle Steps mit echten pytest-Läufen verifiziert.",
+      "evidence": "pytest tests/validation/test_report_structured.py -v: 19 passed; pytest tests/validation/test_markdown_report.py -v: 19 passed; pytest tests/validation/test_cli.py -v: 12 passed"
+    },
+    {
+      "id": "F2",
+      "verdict": "pass",
+      "rationale": "Phase-Ziel erreicht.",
+      "evidence": "validation/reporting/json_report.py; validation/cli.py"
+    },
+    {
+      "id": "F3",
+      "verdict": "pass",
+      "rationale": "Nichts zurückgestellt.",
+      "evidence": "n/a"
+    }
+  ],
+  "projectChecks": {
+    "discovered": true,
+    "anyFailed": false,
+    "commands": [
+      {
+        "kind": "test",
+        "command": "pytest -q",
+        "exitCode": 0,
+        "durationMs": 1,
+        "timedOut": false
+      }
+    ]
+  }
+}

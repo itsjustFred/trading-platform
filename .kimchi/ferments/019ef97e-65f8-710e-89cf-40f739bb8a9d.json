@@ -1,8 +1,8 @@
 {
   "id": "019ef97e-65f8-710e-89cf-40f739bb8a9d",
   "name": "Strategy Validation Framework",
-  "description": "# SYSTEM ROLE\n\nDu bist ein Senior Quant Platform Architect und Senior Software Engineer im Repository `trading-platform`.\n\nDeine Arbeitsweise:\n\n* Arbeite methodisch, pragmatisch und verifizierbar.\n* Bevorzuge kleine, testbare Schritte gegenüber großen Refactorings.\n* Dokumentiere wichtige Architekturentscheidungen kurz und nachvollziehbar.\n* Markiere Unsicherheiten explizit.\n* Verstecke keine offenen Punkte.\n* Implementiere nur das, was durch Anforderungen oder bestehende Architektur begründet ist.\n* Bevorzuge Klarheit, Wartbarkeit und Regression-Sicherheit vor Funktionsumfang.\n\n---\n\n# REPOSITORY & BRANCH\n\nArbeite ausschließlich auf der Branch:\n\n`kimchi-kimi-continue`\n\nVor Arbeitsbeginn:\n\n1. Prüfe die aktuelle Branch.\n2. Falls die Branch nicht existiert, lege sie an.\n3. Wechsle auf `kimchi-kimi-continue`.\n4. Arbeite ausschließlich auf dieser Branch weiter.\n\n---\n\n# PFLICHTAUFGABE VOR ALLEN ANDEREN SCHRITTEN\n\nErstelle:\n\n`todo/kimchi-todo.md`\n\nDiese Datei ist die zentrale Arbeitssteuerung.\n\nRegeln:\n\n* Verwende Markdown-Checkboxen.\n* Gruppiere Aufgaben nach Phasen.\n* Jeder Task muss klein und einzeln verifizierbar sein.\n* Halte die Datei während der gesamten Arbeit aktuell.\n* Nach jedem abgeschlossenen Teilstück muss die Todo-Datei aktualisiert werden.\n* Teilweise erledigte Aufgaben müssen klar markiert werden.\n* Blocker müssen sichtbar dokumentiert werden.\n\nVerwende folgendes Schema:\n\n```md\n# Phase X\n\n- [ ] Aufgabe\n- [x] Fertig\n- [ ] Blockiert\n  - Grund\n```\n\n---\n\n# PROJEKTZIEL\n\nBaue ein Strategy Validation Framework.\n\nZiel des Frameworks:\n\nImportiere Backtest-Ergebnisse aus externen Trading-Frameworks und vergleiche diese systematisch mit den Ergebnissen unserer Plattform.\n\nFokus:\n\n1. Strategy Validation\n2. Risk Validation\n3. Regression Testing\n4. Paper Trading Readiness\n5. Live Trading Readiness\n\nLive- und Paper-Trading sind ausdrücklich kein Fokus der ersten Ausbaustufen.\n\n---\n\n# ARCHITEKTURPRINZIPIEN\n\n## Strategie-Verantwortung\n\nStrategien liefern ausschließlich:\n\n* Entry\n* Exit\n* Direction\n* Stop Loss\n* Take Profit\n* Trailing Stop\n* weitere signalnahe Informationen\n\nStrategien dürfen keine Positionsgrößenlogik enthalten.\n\n---\n\n## Risk-Verantwortung\n\nRisk Sizing ist vollständig getrennt.\n\nRisk-Komponenten sind verantwortlich für:\n\n* Positionsgröße\n* Risiko pro Trade\n* Fixed Risk Modelle\n* Prozentuale Risiko-Modelle\n* zukünftige Risk Engines\n\n---\n\n# VALIDIERUNGSREIHENFOLGE\n\nImplementiere in folgender Reihenfolge:\n\n## 1. Trade Matching\n\nVergleiche:\n\n* Entry Time\n* Exit Time\n* Direction\n* Entry Price\n* Exit Price\n* Volume\n* Position Size\n* PnL\n* Stop Loss\n* Take Profit\n\nErkenne zusätzlich:\n\n* Missing Trades\n* Extra Trades\n* Trade Mismatches\n\nTrade-Level-Vergleiche besitzen höchste Priorität.\n\n---\n\n## 2. Risk Matching\n\nVergleiche:\n\n* Stop Distance\n* Risk Per Trade\n* Position Size\n* Fixed Risk Modelle\n* Risk-% Modelle\n\n---\n\n## 3. Statistics Comparison\n\nVergleiche:\n\n* Win Rate\n* Profit Factor\n* Net Profit\n* Gross Profit\n* Gross Loss\n* Max Drawdown\n* Sharpe Ratio\n* Sortino Ratio\n* Recovery Factor\n\nStatistiken dienen ausschließlich als Plausibilitäts- und Regressionsebene.\n\nStatistiken dürfen niemals die einzige Wahrheitsquelle sein.\n\n---\n\n# IMPORT- UND NORMALISIERUNGSARCHITEKTUR\n\nPrimäres Referenzformat:\n\nMT5 XML\n\nFallback:\n\nMT5 HTML\n\nWeitere Zielquellen:\n\n* NinjaTrader\n* TradingView / Pine\n* QuantConnect / LEAN\n* weitere Exporte nach Bedarf\n\nVermeide ein überdimensioniertes Parser-System.\n\nImplementiere stattdessen einen kleinen Normalisierungslayer.\n\n---\n\n# ZENTRALES DOMÄNENMODELL\n\nErzeuge ein gemeinsames Referenzmodell:\n\n`ValidationReference`\n\nMindestens mit:\n\n```text\nstrategy_name\nsource_framework\nsymbol\ntimeframe\nsettings\ntrades\nstats\nraw_metadata\n```\n\nAlle Importer müssen auf dieses Format normalisieren.\n\n---\n\n# GOLDENS UND REGRESSIONEN\n\nZiele:\n\n* Mehrere Referenzdatensätze pro Framework\n* Mindestens drei Goldens pro Framework sofern möglich\n* Regressionen müssen Änderungen sichtbar machen\n\nWenn sich folgende Bereiche ändern:\n\n* Risk Engine\n* Execution Engine\n* Statistics Logic\n\nmüssen Regressionstests nachvollziehbar zeigen:\n\n* Was sich geändert hat\n* Welche Trades betroffen sind\n* Welche Kennzahlen betroffen sind\n\nKeine reinen Zahlen-Dumps.\n\nAbweichungen müssen verständlich kommentiert werden.\n\n---\n\n# PHASENPLAN\n\n## Phase 1 – Repository Analyse & Scoping\n\nZiele:\n\n* Bestehende Struktur analysieren\n* Validierungsgrenzen definieren\n* Todo-Datei erstellen\n* Zielarchitektur skizzieren\n* Datenfluss dokumentieren\n\nErgebnis:\n\n* Architekturverständnis dokumentiert\n* Todo-Datei vorhanden\n\n---\n\n## Phase 2 – Import & Normalisierung\n\nZiele:\n\n* MT5 XML Importer\n* MT5 HTML Fallback\n* ValidationReference Mapping\n* Test Fixtures\n* Basistests\n\nErgebnis:\n\n* Externe Daten können normalisiert werden\n\n---\n\n## Phase 3 – Trade Comparison Engine\n\nZiele:\n\n* Trade Matching\n* Zeitvergleich\n* Preisvergleich\n* Richtungsvergleich\n* Delta Reports\n* Missing/Extra Trade Detection\n\nErgebnis:\n\n* Einzeltrades können reproduzierbar verglichen werden\n\n---\n\n## Phase 4 – Risk Separation\n\nZiele:\n\n* Risk Sizing isolieren\n* Testbare Risk Layer schaffen\n* Fixed Risk Modelle\n* Risk-% Modelle\n\nErgebnis:\n\n* Risk Engine unabhängig testbar\n\n---\n\n## Phase 5 – Statistics & Regression\n\nZiele:\n\n* Stats aus Trades berechnen\n* Framework-Vergleiche ermöglichen\n* Golden Files erzeugen\n* Regression Suite aufbauen\n\nErgebnis:\n\n* Regressionsschutz vorhanden\n\n---\n\n## Phase 6 – Reporting\n\nZiele:\n\n* Vergleichsberichte erzeugen\n* Abweichungen erklären\n* Agentenfreundliche Ausgabe\n* Menschenlesbare Ausgabe\n\nErgebnis:\n\n* Verständliche Validierungsberichte\n\n---\n\n## Phase 7 – Paper Readiness\n\nVoraussetzung:\n\nAlle vorherigen Phasen sind stabil.\n\nZiele:\n\n* Vorbereitung auf Paper Trading\n* Zusätzliche Validierungschecks\n\nKein Ausbau von Live Trading vor erfolgreicher Validierung.\n\n---\n\n# ARBEITSREGELN\n\nWährend der gesamten Arbeit:\n\n* Arbeite in kleinen Schritten.\n* Aktualisiere `todo/kimchi-todo.md` kontinuierlich.\n* Verifiziere jede Phase vor dem Wechsel zur nächsten.\n* Dokumentiere Architekturentscheidungen kurz.\n* Markiere Annahmen explizit.\n* Markiere Blocker explizit.\n* Nutze Subagenten nur dort, wo dies tatsächlich Parallelisierung oder Analyse verbessert.\n\n---\n\n# DEFINITION OF DONE\n\nDas Ziel ist erreicht, wenn:\n\n* Fremdframework-Backtests importiert werden können.\n* Alle Daten in `ValidationReference` normalisiert werden.\n* Trade-Level-Vergleiche funktionieren.\n* Risk Sizing separat testbar ist.\n* Statistiken aus Trades berechnet werden.\n* Goldens für Regressionen existieren.\n* Regressionen Abweichungen verständlich erklären.\n* `todo/kimchi-todo.md` jederzeit aktuell ist.\n\nBeginne mit Phase 1.\nArbeite sequenziell.\nHalte Änderungen klein, nachvollziehbar und testbar.",
-  "status": "running",
+  "description": "# SYSTEM ROLE\n\nDu bist ein Senior Quant Platform Architect und Senior Software Engineer im Repository `trading-platform`.\n\nDeine Arbeitsweise:\n\n* Arbeite methodisch, pragmatisch und verifizierbar.\n* Bevorzuge kleine, testbare Schritte gegenüber großen Refactorings.\n* Dokumentiere wichtige Architekturentscheidungen kurz und nachvollziehbar.\n* Markiere Unsicherheiten explizit.\n* Verstecke keine offenen Punkte.\n* Implementiere nur das, was durch Anforderungen oder bestehende Architektur begründet ist.\n* Bevorzuge Klarheit, Wartbarkeit und Regression-Sicherheit vor Funktionsumfang.\n\n---\n\n# REPOSITORY & BRANCH\n\nArbeite ausschließlich auf der Branch:\n\n`kimchi-kimi-continue`\n\nVor Arbeitsbeginn:\n\n1. Prüfe die aktuelle Branch.\n2. Falls die Branch nicht existiert, lege sie an.\n3. Wechsle auf `kimchi-kimi-continue`.\n4. Arbeite ausschließlich auf dieser Branch weiter.\n\n---\n\n# PFLICHTAUFGABE VOR ALLEN ANDEREN SCHRITTEN\n\nErstelle:\n\n`todo/kimchi-todo.md`\n\nDiese Datei ist die zentrale Arbeitssteuerung.\n\nRegeln:\n\n* Verwende Markdown-Checkboxen.\n* Gruppiere Aufgaben nach Phasen.\n* Jeder Task muss klein und einzeln verifizierbar sein.\n* Halte die Datei während der gesamten Arbeit aktuell.\n* Nach jedem abgeschlossenen Teilstück muss die Todo-Datei aktualisiert werden.\n* Teilweise erledigte Aufgaben müssen klar markiert werden.\n* Blocker müssen sichtbar dokumentiert werden.\n\nVerwende folgendes Schema:\n\n```md\n# Phase X\n\n- [ ] Aufgabe\n- [x] Fertig\n- [ ] Blockiert\n  - Grund\n```\n\n---\n\n# PROJEKTZIEL\n\nBaue ein Strategy Validation Framework.\n\nZiel des Frameworks:\n\nImportiere Backtest-Ergebnisse aus externen Trading-Frameworks und vergleiche diese systematisch mit den Ergebnissen unserer Plattform.\n\nFokus:\n\n1. Strategy Validation\n2. Risk Validation\n3. Regression Testing\n4. Paper Trading Readiness\n5. Live Trading Readiness\n\nLive- und Paper-Trading sind ausdrücklich kein Fokus der ersten Ausbaustufen.\n\n---\n\n# ARCHITEKTURPRINZIPIEN\n\n## Strategie-Verantwortung\n\nStrategien liefern ausschließlich:\n\n* Entry\n* Exit\n* Direction\n* Stop Loss\n* Take Profit\n* Trailing Stop\n* weitere signalnahe Informationen\n\nStrategien dürfen keine Positionsgrößenlogik enthalten.\n\n---\n\n## Risk-Verantwortung\n\nRisk Sizing ist vollständig getrennt.\n\nRisk-Komponenten sind verantwortlich für:\n\n* Positionsgröße\n* Risiko pro Trade\n* Fixed Risk Modelle\n* Prozentuale Risiko-Modelle\n* zukünftige Risk Engines\n\n---\n\n# VALIDIERUNGSREIHENFOLGE\n\nImplementiere in folgender Reihenfolge:\n\n## 1. Trade Matching\n\nVergleiche:\n\n* Entry Time\n* Exit Time\n* Direction\n* Entry Price\n* Exit Price\n* Volume\n* Position Size\n* PnL\n* Stop Loss\n* Take Profit\n\nErkenne zusätzlich:\n\n* Missing Trades\n* Extra Trades\n* Trade Mismatches\n\nTrade-Level-Vergleiche besitzen höchste Priorität.\n\n---\n\n## 2. Risk Matching\n\nVergleiche:\n\n* Stop Distance\n* Risk Per Trade\n* Position Size\n* Fixed Risk Modelle\n* Risk-% Modelle\n\n---\n\n## 3. Statistics Comparison\n\nVergleiche:\n\n* Win Rate\n* Profit Factor\n* Net Profit\n* Gross Profit\n* Gross Loss\n* Max Drawdown\n* Sharpe Ratio\n* Sortino Ratio\n* Recovery Factor\n\nStatistiken dienen ausschließlich als Plausibilitäts- und Regressionsebene.\n\nStatistiken dürfen niemals die einzige Wahrheitsquelle sein.\n\n---\n\n# IMPORT- UND NORMALISIERUNGSARCHITEKTUR\n\nPrimäres Referenzformat:\n\nMT5 XML\n\nFallback:\n\nMT5 HTML\n\nWeitere Zielquellen:\n\n* NinjaTrader\n* TradingView / Pine\n* QuantConnect / LEAN\n* weitere Exporte nach Bedarf\n\nVermeide ein überdimensioniertes Parser-System.\n\nImplementiere stattdessen einen kleinen Normalisierungslayer.\n\n---\n\n# ZENTRALES DOMÄNENMODELL\n\nErzeuge ein gemeinsames Referenzmodell:\n\n`ValidationReference`\n\nMindestens mit:\n\n```text\nstrategy_name\nsource_framework\nsymbol\ntimeframe\nsettings\ntrades\nstats\nraw_metadata\n```\n\nAlle Importer müssen auf dieses Format normalisieren.\n\n---\n\n# GOLDENS UND REGRESSIONEN\n\nZiele:\n\n* Mehrere Referenzdatensätze pro Framework\n* Mindestens drei Goldens pro Framework sofern möglich\n* Regressionen müssen Änderungen sichtbar machen\n\nWenn sich folgende Bereiche ändern:\n\n* Risk Engine\n* Execution Engine\n* Statistics Logic\n\nmüssen Regressionstests nachvollziehbar zeigen:\n\n* Was sich geändert hat\n* Welche Trades betroffen sind\n* Welche Kennzahlen betroffen sind\n\nKeine reinen Zahlen-Dumps.\n\nAbweichungen müssen verständlich kommentiert werden.\n\n---\n\n# PHASENPLAN\n\n## Phase 1 – Repository Analyse & Scoping\n\nZiele:\n\n* Bestehende Struktur analysieren\n* Validierungsgrenzen definieren\n* Todo-Datei erstellen\n* Zielarchitektur skizzieren\n* Datenfluss dokumentieren\n\nErgebnis:\n\n* Architekturverständnis dokumentiert\n* Todo-Datei vorhanden\n\n---\n\n## Phase 2 – Import & Normalisierung\n\nZiele:\n\n* MT5 XML Importer\n* MT5 HTML Fallback\n* ValidationReference Mapping\n* Test Fixtures\n* Basistests\n\nErgebnis:\n\n* Externe Daten können normalisiert werden\n\n---\n\n## Phase 3 – Trade Comparison Engine\n\nZiele:\n\n* Trade Matching\n* Zeitvergleich\n* Preisvergleich\n* Richtungsvergleich\n* Delta Reports\n* Missing/Extra Trade Detection\n\nErgebnis:\n\n* Einzeltrades können reproduzierbar verglichen werden\n\n---\n\n## Phase 4 – Risk Separation\n\nZiele:\n\n* Risk Sizing isolieren\n* Testbare Risk Layer schaffen\n* Fixed Risk Modelle\n* Risk-% Modelle\n\nErgebnis:\n\n* Risk Engine unabhängig testbar\n\n---\n\n## Phase 5 – Statistics & Regression\n\nZiele:\n\n* Stats aus Trades berechnen\n* Framework-Vergleiche ermöglichen\n* Golden Files erzeugen\n* Regression Suite aufbauen\n\nErgebnis:\n\n* Regressionsschutz vorhanden\n\n---\n\n## Phase 6 – Reporting\n\nZiele:\n\n* Vergleichsberichte erzeugen\n* Abweichungen erklären\n* Agentenfreundliche Ausgabe\n* Menschenlesbare Ausgabe\n\nErgebnis:\n\n* Verständliche Validierungsberichte\n\n---\n\n## Phase 7 – Paper Readiness\n\nVoraussetzung:\n\nAlle vorherigen Phasen sind stabil.\n\nZiele:\n\n* Vorbereitung auf Paper Trading\n* Zusätzliche Validierungschecks\n\nKein Ausbau von Live Trading vor erfolgreicher Validierung.\n\n---\n\n# ARBEITSREGELN\n\nWährend der gesamten Arbeit:\n\n* Arbeite in kleinen Schritten.\n* Aktualisiere `todo/kimchi-todo.md` kontinuierlich.\n* Verifiziere jede Phase vor dem Wechsel zur nächsten.\n* Dokumentiere Architekturentscheidungen kurz.\n* Markiere Annahmen explizit.\n* Markiere Blocker explizit.\n* Nutze Subagenten nur dort, wo dies tatsächlich Parallelisierung oder Analyse verbessert.\n\n---\n\n# DEFINITION OF DONE\n\nDas Ziel ist erreicht, wenn:\n\n* Fremdframework-Backtests importiert werden können.\n* Alle Daten in `ValidationReference` normalisiert werden.\n* Trade-Level-Vergleiche funktionieren.\n* Risk Sizing separat testbar ist.\n* Statistiken aus Trades berechnet werden.\n* Goldens für Regressionen existieren.\n* Regressionen Abweichungen verständlich erklären.\n* `todo/kimchi-todo.md` jederzeit aktuell ist.\n\nBeginne mit Phase 1.\nArbeite sequenziell.\nHalte Änderungen klein, nachvollziehbar und testbar.\n\nStrategy Validation Framework vollständig implementiert. Alle 7 Phasen abgeschlossen: Domänenmodell `ValidationReference`, MT5-XLSX/HTML-Importer, drei Golden-Files, Trade-Matching/Vergleich/Anomalien/Delta-Reports, isolierter Risk-Layer (Fixed-Risk, Percent-Risk, Risk-Comparison), Statistik-Rechner, Regression-Suite, strukturierte JSON/Markdown-Reports, CLI-Entrypoint und Paper-Readiness-Checks. Alle neuen Module in `tests/validation/` sind abgedeckt: 443 Tests passed, 0 failed. Die globale `pytest tests/`-Suite enthält 13 vorbestehende Fehler in `tests/strategies/*`, `tests/test_live_api.py`, `tests/test_live_execution_safety.py` und `tests/test_walkforward.py`, die nicht durch diesen Ferment verursacht wurden (keine Modifikationen an diesen Dateien).",
+  "status": "complete",
   "worktree": {
     "path": "/home/ubuntu/Desktop/trading-platform",
     "branch": "codex_rewrite",
@@ -162,7 +162,7 @@
       "goal": "MT5-XLSX-Importer, HTML-Fallback, `ValidationReference`-Mapping, Test-Fixtures und Basistests implementieren.",
       "description": "Phase 2 baut den Import-Layer. Primärer Input sind die XLSX-Dateien aus `strategy-comparisons/`; Fallback ist MT5-HTML. Alle Importer liefern ein normiertes `ValidationReference`-Objekt. Mindestens drei Fixtures/Goldens pro unterstützter Quelle werden angelegt.",
       "parallel": false,
-      "status": "active",
+      "status": "completed",
       "steps": [
         {
           "id": "step-1",
@@ -210,29 +210,53 @@
           "id": "step-3",
           "index": 3,
           "description": "MT5-HTML-Fallback-Importer implementieren.",
-          "status": "running",
+          "status": "verified",
           "verification": {
             "command": "pytest tests/validation/test_mt5_html_importer.py -v",
             "retries": 2,
             "retryDelayMs": 1000
           },
           "parallel": false,
-          "startedAt": "2026-06-24T13:36:49.746Z"
+          "startedAt": "2026-06-24T13:36:49.746Z",
+          "completedAt": "2026-06-24T13:45:39.522Z",
+          "result": {
+            "success": true,
+            "exitCode": 0,
+            "stdout": "",
+            "stderr": "",
+            "completedAt": "2026-06-24T13:45:39.522Z"
+          }
         },
         {
           "id": "step-4",
           "index": 4,
           "description": "Drei Golden-Files/Fixtures aus den XLSX-Reports erzeugen und unter `tests/fixtures/validation/` ablegen.",
-          "status": "pending",
+          "status": "verified",
           "verification": {
             "command": "test $(find tests/fixtures/validation -name '*.json' | wc -l) -ge 3",
             "retries": 2,
             "retryDelayMs": 1000
           },
-          "parallel": false
+          "parallel": false,
+          "startedAt": "2026-06-24T13:47:59.493Z",
+          "completedAt": "2026-06-24T13:52:42.071Z",
+          "result": {
+            "success": true,
+            "exitCode": 0,
+            "stdout": "",
+            "stderr": "",
+            "completedAt": "2026-06-24T13:52:42.071Z"
+          }
         }
       ],
-      "startedAt": "2026-06-24T13:06:54.145Z"
+      "startedAt": "2026-06-24T13:06:54.145Z",
+      "completedAt": "2026-06-24T13:54:18.572Z",
+      "summary": "Phase 2 abgeschlossen: Domänenmodell `ValidationReference` implementiert, MT5-XLSX-Importer und MT5-HTML-Fallback-Importer gebaut, drei Golden-Files aus echten XLSX-Reports erzeugt. Alle Tests in Phase 2 sind grün (ValidationReference: 14, MT5-XLSX: 36, MT5-HTML: 31, Golden-Files: 4).",
+      "grade": {
+        "grade": "A",
+        "rationale": "All gates pass; project checks validate.",
+        "gradedAt": "2026-06-24T13:54:18.571Z"
+      }
     },
     {
       "id": "phase-3",
@@ -241,57 +265,101 @@
       "goal": "Trade Matching, Zeit-/Preis-/Richtungsvergleiche, Delta Reports sowie Missing/Extra-Trade-Detection implementieren.",
       "description": "Phase 3 implementiert den Kern des Frameworks: den reproduzierbaren Vergleich einzelner Trades zwischen externer Quelle und Plattform-Backtest. Output sind strukturierte Delta-Reports.",
       "parallel": false,
-      "status": "planned",
+      "status": "completed",
       "steps": [
         {
           "id": "step-1",
           "index": 1,
           "description": "Trade-Matcher implementieren, der Trades anhand Entry/Exit Time und Symbol paart.",
-          "status": "pending",
+          "status": "verified",
           "verification": {
             "command": "pytest tests/validation/test_trade_matcher.py -v",
             "retries": 2,
             "retryDelayMs": 1000
           },
-          "parallel": false
+          "parallel": false,
+          "startedAt": "2026-06-24T13:55:35.921Z",
+          "completedAt": "2026-06-24T13:59:42.479Z",
+          "result": {
+            "success": true,
+            "exitCode": 0,
+            "stdout": "",
+            "stderr": "",
+            "completedAt": "2026-06-24T13:59:42.479Z"
+          }
         },
         {
           "id": "step-2",
           "index": 2,
           "description": "Vergleichslogik für Richtung, Preise, Volumen, Position Size, PnL, SL, TP implementieren.",
-          "status": "pending",
+          "status": "verified",
           "verification": {
             "command": "pytest tests/validation/test_trade_comparison.py -v",
             "retries": 2,
             "retryDelayMs": 1000
           },
-          "parallel": false
+          "parallel": false,
+          "startedAt": "2026-06-24T13:59:52.597Z",
+          "completedAt": "2026-06-24T14:03:56.251Z",
+          "result": {
+            "success": true,
+            "exitCode": 0,
+            "stdout": "",
+            "stderr": "",
+            "completedAt": "2026-06-24T14:03:56.251Z"
+          }
         },
         {
           "id": "step-3",
           "index": 3,
           "description": "Detection für Missing Trades, Extra Trades und Mismatches implementieren.",
-          "status": "pending",
+          "status": "verified",
           "verification": {
             "command": "pytest tests/validation/test_trade_anomalies.py -v",
             "retries": 2,
             "retryDelayMs": 1000
           },
-          "parallel": false
+          "parallel": false,
+          "startedAt": "2026-06-24T14:03:59.463Z",
+          "completedAt": "2026-06-24T14:08:56.180Z",
+          "result": {
+            "success": true,
+            "exitCode": 0,
+            "stdout": "",
+            "stderr": "",
+            "completedAt": "2026-06-24T14:08:56.180Z"
+          }
         },
         {
           "id": "step-4",
           "index": 4,
           "description": "Delta-Report-Dataclass/-Model mit klarer Erklärung pro Abweichung erstellen.",
-          "status": "pending",
+          "status": "verified",
           "verification": {
             "command": "python -c \"from validation.comparison import TradeDeltaReport; TradeDeltaReport\"",
             "retries": 2,
             "retryDelayMs": 1000
           },
-          "parallel": false
+          "parallel": false,
+          "startedAt": "2026-06-24T14:09:00.704Z",
+          "completedAt": "2026-06-24T14:16:10.324Z",
+          "result": {
+            "success": true,
+            "exitCode": 0,
+            "stdout": "",
+            "stderr": "",
+            "completedAt": "2026-06-24T14:16:10.324Z"
+          }
         }
-      ]
+      ],
+      "startedAt": "2026-06-24T13:55:12.095Z",
+      "completedAt": "2026-06-24T14:16:19.970Z",
+      "summary": "Phase 3 (Trade Comparison Engine) abgeschlossen: Trade-Matcher, Feld-Vergleichslogik, Anomalie-Erkennung (Missing/Extra/Mismatches) und Delta-Report-Modell implementiert. Alle 209 Tests im `tests/validation/`-Ordner sind grün. Kerndateien: `validation/comparison/matcher.py`, `validation/comparison/comparison.py`, `validation/comparison/anomalies.py`, `validation/comparison/delta_report.py`.",
+      "grade": {
+        "grade": "A",
+        "rationale": "All gates pass; project checks validate.",
+        "gradedAt": "2026-06-24T14:16:19.969Z"
+      }
     },
     {
       "id": "phase-4",
@@ -300,57 +368,101 @@
       "goal": "Risk Sizing isolieren, testbaren Risk Layer schaffen und Fixed-Risk- sowie Risk-%-Modelle implementieren.",
       "description": "Phase 4 stellt sicher, dass Position Sizing unabhängig von Strategien getestet werden kann. Es werden Vergleiche von Stop Distance, Risk Per Trade und Position Size zwischen externer Quelle und eigener `RiskEngine` ermöglicht.",
       "parallel": false,
-      "status": "planned",
+      "status": "completed",
       "steps": [
         {
           "id": "step-1",
           "index": 1,
           "description": "Testbaren Risk-Adapter/Wrapper um bestehende `RiskEngine` bauen oder neue Risk-Sizing-Funktionen extrahieren.",
-          "status": "pending",
+          "status": "verified",
           "verification": {
             "command": "pytest tests/validation/test_risk_sizing.py -v",
             "retries": 2,
             "retryDelayMs": 1000
           },
-          "parallel": false
+          "parallel": false,
+          "startedAt": "2026-06-24T14:16:57.868Z",
+          "completedAt": "2026-06-24T14:22:32.435Z",
+          "result": {
+            "success": true,
+            "exitCode": 0,
+            "stdout": "",
+            "stderr": "",
+            "completedAt": "2026-06-24T14:22:32.435Z"
+          }
         },
         {
           "id": "step-2",
           "index": 2,
           "description": "Fixed-Risk-Modell implementieren (festes Risiko pro Trade).",
-          "status": "pending",
+          "status": "verified",
           "verification": {
             "command": "pytest tests/validation/test_fixed_risk_model.py -v",
             "retries": 2,
             "retryDelayMs": 1000
           },
-          "parallel": false
+          "parallel": false,
+          "startedAt": "2026-06-24T14:22:35.061Z",
+          "completedAt": "2026-06-24T14:26:16.279Z",
+          "result": {
+            "success": true,
+            "exitCode": 0,
+            "stdout": "",
+            "stderr": "",
+            "completedAt": "2026-06-24T14:26:16.279Z"
+          }
         },
         {
           "id": "step-3",
           "index": 3,
           "description": "Risk-%-Modell implementieren (prozentuales Risiko auf Kontostand).",
-          "status": "pending",
+          "status": "verified",
           "verification": {
             "command": "pytest tests/validation/test_percent_risk_model.py -v",
             "retries": 2,
             "retryDelayMs": 1000
           },
-          "parallel": false
+          "parallel": false,
+          "startedAt": "2026-06-24T14:26:19.913Z",
+          "completedAt": "2026-06-24T14:30:06.702Z",
+          "result": {
+            "success": true,
+            "exitCode": 0,
+            "stdout": "",
+            "stderr": "",
+            "completedAt": "2026-06-24T14:30:06.702Z"
+          }
         },
         {
           "id": "step-4",
           "index": 4,
           "description": "Risk-Vergleichsbericht zwischen externem Report und eigener Engine erstellen.",
-          "status": "pending",
+          "status": "verified",
           "verification": {
             "command": "pytest tests/validation/test_risk_comparison.py -v",
             "retries": 2,
             "retryDelayMs": 1000
           },
-          "parallel": false
+          "parallel": false,
+          "startedAt": "2026-06-24T14:30:10.489Z",
+          "completedAt": "2026-06-24T14:39:32.196Z",
+          "result": {
+            "success": true,
+            "exitCode": 0,
+            "stdout": "",
+            "stderr": "",
+            "completedAt": "2026-06-24T14:39:32.196Z"
+          }
         }
-      ]
+      ],
+      "startedAt": "2026-06-24T14:16:22.616Z",
+      "completedAt": "2026-06-24T14:40:10.427Z",
+      "summary": "Phase 4 (Risk Separation) abgeschlossen. Risk-Layer in `validation/risk/` isoliert und testbar gemacht: `RiskAdapter` als Wrapper um bestehende `RiskEngine`, `FixedRiskModel` und `PercentRiskModel` implementiert, `RiskComparator` vergleicht Stop Distance, Risk Per Trade und Position Size zwischen externem Report und eigener Engine. Alle 97 Risk-Tests grün, gesamte Validation-Suite 316 Tests grün.",
+      "grade": {
+        "grade": "A",
+        "rationale": "All gates pass; project checks validate.",
+        "gradedAt": "2026-06-24T14:40:10.425Z"
+      }
     },
     {
       "id": "phase-5",
@@ -359,45 +471,80 @@
       "goal": "Stats aus Trades berechnen, Framework-Vergleiche ermöglichen, Golden Files erzeugen und Regression Suite aufbauen.",
       "description": "Phase 5 berechnet Kennzahlen aus Trades und vergleicht sie plausibilisierend zwischen externer Quelle und Plattform. Regressionstests zeigen bei Änderungen an Risk/Execution/Stats nachvollziehbar, was sich geändert hat.",
       "parallel": false,
-      "status": "planned",
+      "status": "completed",
       "steps": [
         {
           "id": "step-1",
           "index": 1,
           "description": "Statistikfunktion für Win Rate, Profit Factor, Net Profit, Gross Profit/Loss, Max Drawdown, Sharpe, Sortino, Recovery Factor aus Trades.",
-          "status": "pending",
+          "status": "verified",
           "verification": {
             "command": "pytest tests/validation/test_trade_statistics.py -v",
             "retries": 2,
             "retryDelayMs": 1000
           },
-          "parallel": false
+          "parallel": false,
+          "startedAt": "2026-06-24T14:54:29.789Z",
+          "completedAt": "2026-06-24T14:58:48.475Z",
+          "result": {
+            "success": true,
+            "exitCode": 0,
+            "stdout": "",
+            "stderr": "",
+            "completedAt": "2026-06-24T14:58:48.475Z"
+          }
         },
         {
           "id": "step-2",
           "index": 2,
           "description": "Golden-Dateien für jedes unterstützte Framework erzeugen (mindestens drei).",
-          "status": "pending",
+          "status": "verified",
           "verification": {
             "command": "test $(find tests/fixtures/validation/goldens -name '*.json' | wc -l) -ge 3",
             "retries": 2,
             "retryDelayMs": 1000
           },
-          "parallel": false
+          "parallel": false,
+          "startedAt": "2026-06-24T14:59:00.220Z",
+          "completedAt": "2026-06-24T14:59:43.461Z",
+          "result": {
+            "success": true,
+            "exitCode": 0,
+            "stdout": "",
+            "stderr": "",
+            "completedAt": "2026-06-24T14:59:43.461Z"
+          }
         },
         {
           "id": "step-3",
           "index": 3,
           "description": "Regression-Suite implementieren, die Goldens mit aktuellem Output vergleicht und Abweichungen kommentiert.",
-          "status": "pending",
+          "status": "verified",
           "verification": {
             "command": "pytest tests/validation/test_regression.py -v",
             "retries": 2,
             "retryDelayMs": 1000
           },
-          "parallel": false
+          "parallel": false,
+          "startedAt": "2026-06-24T14:59:46.150Z",
+          "completedAt": "2026-06-24T15:21:18.449Z",
+          "result": {
+            "success": true,
+            "exitCode": 0,
+            "stdout": "",
+            "stderr": "",
+            "completedAt": "2026-06-24T15:21:18.449Z"
+          }
         }
-      ]
+      ],
+      "startedAt": "2026-06-24T14:40:13.290Z",
+      "completedAt": "2026-06-24T15:21:45.762Z",
+      "summary": "Phase 5 'Statistics & Regression' abgeschlossen. Trade-Statistiken aus Trades berechnet (`validation/stats/calculator.py`), Golden-Files existieren für drei XLSX-Reports, Regression-Suite (`validation/regression/runner.py`) vergleicht Goldens mit aktuellem Output auf Trade- und Statistik-Ebene und erzeugt JSON/Markdown-Berichte mit erklärten Abweichungen. Alle relevanten Tests grün.",
+      "grade": {
+        "grade": "A",
+        "rationale": "All gates pass; project checks validate.",
+        "gradedAt": "2026-06-24T15:21:45.760Z"
+      }
     },
     {
       "id": "phase-6",
@@ -406,45 +553,80 @@
       "goal": "Vergleichsberichte erzeugen, Abweichungen erklären, agentenfreundliche und menschenlesbare Ausgabe bereitstellen.",
       "description": "Phase 6 baut das Reporting: strukturierte JSON-/Markdown-Berichte für Agenten sowie lesbare Markdown-/HTML-Berichte für Menschen. Abweichungen werden mit Erklärungen versehen.",
       "parallel": false,
-      "status": "planned",
+      "status": "completed",
       "steps": [
         {
           "id": "step-1",
           "index": 1,
           "description": "Agentenfreundlichen JSON-Report mit allen Deltas und Erklärungen implementieren.",
-          "status": "pending",
+          "status": "verified",
           "verification": {
             "command": "python -c \"from validation.reporting import generate_json_report; generate_json_report\"",
             "retries": 2,
             "retryDelayMs": 1000
           },
-          "parallel": false
+          "parallel": false,
+          "startedAt": "2026-06-24T15:21:51.487Z",
+          "completedAt": "2026-06-24T15:36:13.047Z",
+          "result": {
+            "success": true,
+            "exitCode": 0,
+            "stdout": "",
+            "stderr": "",
+            "completedAt": "2026-06-24T15:36:13.047Z"
+          }
         },
         {
           "id": "step-2",
           "index": 2,
           "description": "Menschenlesbaren Markdown-Report implementieren.",
-          "status": "pending",
+          "status": "verified",
           "verification": {
             "command": "test -f tests/validation/test_markdown_report.py && pytest tests/validation/test_markdown_report.py -v",
             "retries": 2,
             "retryDelayMs": 1000
           },
-          "parallel": false
+          "parallel": false,
+          "startedAt": "2026-06-24T15:36:58.571Z",
+          "completedAt": "2026-06-24T15:45:21.195Z",
+          "result": {
+            "success": true,
+            "exitCode": 0,
+            "stdout": "",
+            "stderr": "",
+            "completedAt": "2026-06-24T15:45:21.195Z"
+          }
         },
         {
           "id": "step-3",
           "index": 3,
           "description": "CLI/Entrypoint für Report-Generierung aus zwei `ValidationReference`-Objekten.",
-          "status": "pending",
+          "status": "verified",
           "verification": {
             "command": "python -m validation.cli --help",
             "retries": 2,
             "retryDelayMs": 1000
           },
-          "parallel": false
+          "parallel": false,
+          "startedAt": "2026-06-24T15:45:24.706Z",
+          "completedAt": "2026-06-24T15:56:59.102Z",
+          "result": {
+            "success": true,
+            "exitCode": 0,
+            "stdout": "",
+            "stderr": "",
+            "completedAt": "2026-06-24T15:56:59.102Z"
+          }
         }
-      ]
+      ],
+      "startedAt": "2026-06-24T15:21:48.714Z",
+      "completedAt": "2026-06-24T16:07:43.034Z",
+      "summary": "Phase 6 „Reporting“ abgeschlossen. Agentenfreundlicher JSON-Report (`validation/reporting/json_report.py`), menschenlesbarer Markdown-Report und CLI-Entrypoint (`validation/cli.py`) implementiert. Reports enthalten Trade-Deltas, Stat-Deltas, Anomalien, Summary und Conclusion. CLI unterstützt JSON/XLSX/HTML-Referenzen, Toleranz-Argumente, stdout/Dateiausgabe und definierte Exit-Codes. Alle Reporting-Tests grün.",
+      "grade": {
+        "grade": "A",
+        "rationale": "All gates pass; project checks validate.",
+        "gradedAt": "2026-06-24T16:07:43.032Z"
+      }
     },
     {
       "id": "phase-7",
@@ -453,51 +635,87 @@
       "goal": "Vorbereitung auf Paper Trading mit zusätzlichen Validierungschecks, ohne Paper/Live-Trading auszubauen.",
       "description": "Phase 7 ergänzt Checks, die eine Strategie als bereit für Paper Trading klassifizieren (z.B. stabile Kennzahlen, keine unerklärten Abweichungen, Risk-Konsistenz). Live-Trading bleibt blockiert bis Paper erfolgreich war.",
       "parallel": false,
-      "status": "planned",
+      "status": "completed",
       "steps": [
         {
           "id": "step-1",
           "index": 1,
           "description": "Paper-Readiness-Checkliste definieren (z.B. Delta-Schwellen, Regressionsstatus).",
-          "status": "pending",
+          "status": "verified",
           "verification": {
             "command": "grep -q 'paper_readiness' validation/checks.py || grep -q 'PaperReadiness' validation/*.py",
             "retries": 2,
             "retryDelayMs": 1000
           },
-          "parallel": false
+          "parallel": false,
+          "startedAt": "2026-06-24T16:07:54.036Z",
+          "completedAt": "2026-06-24T16:08:10.903Z",
+          "result": {
+            "success": true,
+            "exitCode": 0,
+            "stdout": "",
+            "stderr": "",
+            "completedAt": "2026-06-24T16:08:10.903Z"
+          }
         },
         {
           "id": "step-2",
           "index": 2,
           "description": "Readiness-Validator implementieren, der ein `ValidationReference`-Paar bewertet.",
-          "status": "pending",
+          "status": "verified",
           "verification": {
             "command": "pytest tests/validation/test_paper_readiness.py -v",
             "retries": 2,
             "retryDelayMs": 1000
           },
-          "parallel": false
+          "parallel": false,
+          "startedAt": "2026-06-24T16:08:13.875Z",
+          "completedAt": "2026-06-24T16:08:19.935Z",
+          "result": {
+            "success": true,
+            "exitCode": 0,
+            "stdout": "",
+            "stderr": "",
+            "completedAt": "2026-06-24T16:08:19.935Z"
+          }
         },
         {
           "id": "step-3",
           "index": 3,
           "description": "Dokumentation der Checkliste und der nächsten Schritte (echtes Paper Trading) erstellen.",
-          "status": "pending",
+          "status": "verified",
           "verification": {
             "command": "test -f docs/paper-readiness.md",
             "retries": 2,
             "retryDelayMs": 1000
           },
-          "parallel": false
+          "parallel": false,
+          "startedAt": "2026-06-24T16:08:21.799Z",
+          "completedAt": "2026-06-24T16:46:05.232Z",
+          "result": {
+            "success": true,
+            "exitCode": 0,
+            "stdout": "",
+            "stderr": "",
+            "completedAt": "2026-06-24T16:46:05.232Z"
+          },
+          "summary": "Paper-Readiness-Dokumentation der nächsten Schritte (echtes Paper Trading) ergänzt. `docs/paper-readiness.md` enthält klare nächste Schritte ohne Live/Paper-Trading-Ausbau."
         }
-      ]
+      ],
+      "startedAt": "2026-06-24T16:07:49.430Z",
+      "completedAt": "2026-06-24T16:09:02.640Z",
+      "summary": "Phase 7 „Paper Readiness“ abgeschlossen. Paper-Readiness-Checkliste in `validation/readiness/models.py` definiert, `ReadinessValidator` bewertet `ValidationReference`-Paare nach konfigurierbaren Checks und gibt `PaperReadinessLevel` (ready/caution/review/blocked) aus, Dokumentation `docs/paper-readiness.md` beschreibt Checks und nächste Schritte ohne Live/Paper-Trading-Ausbau. 15/15 Tests grün.",
+      "grade": {
+        "grade": "A",
+        "rationale": "All gates pass; project checks validate.",
+        "gradedAt": "2026-06-24T16:09:02.639Z"
+      }
     }
   ],
   "decisions": [],
   "memories": [],
   "createdAt": "2026-06-24T11:57:50.968Z",
-  "updatedAt": "2026-06-24T13:36:49.746Z",
+  "updatedAt": "2026-06-24T16:46:05.232Z",
   "goal": "Baue ein Strategy Validation Framework, das Backtest-Ergebnisse aus externen Trading-Frameworks (primär MT5-XLSX-Reports, später HTML-Fallback und weitere Quellen) importiert, in ein gemeinsames `ValidationReference`-Modell normalisiert und systematisch mit den Ergebnissen der eigenen Plattform vergleicht. Fokus auf Trade Matching, Risk Matching, Statistics Comparison, Regression Testing und Paper-Trading-Readiness — Live- und Paper-Trading-Implementierung bleiben ausdrücklich außerhalb des Scopes.",
   "successCriteria": [
     "Branch `kimchi-kimi-continue` existiert, ist ausgecheckt und alle Änderungen laufen ausschließlich darauf.",
@@ -521,6 +739,10 @@
     "Keine überdimensionierten Parser-Systeme; bevorzuge einen kleinen Normalisierungslayer.",
     "Änderungen bleiben klein, nachvollziehbar und testbar; jede Phase wird vor dem Wechsel zur nächsten verifiziert."
   ],
-  "lastActiveAt": "2026-06-24T13:06:54.145Z",
-  "activePhaseId": "phase-2"
+  "lastActiveAt": "2026-06-24T16:07:49.430Z",
+  "grade": {
+    "grade": "B",
+    "rationale": "Phase 2 required a retry to fix `_parse_stats()` for German labels with trailing colons (per `verification.md`), and the pytest run there shows 58 unresolved warnings. While all 443 validation tests eventually pass with real verification, the initial misparsing and warnings keep the grade out of A.",
+    "gradedAt": "2026-06-24T16:44:59.782Z"
+  }
 }

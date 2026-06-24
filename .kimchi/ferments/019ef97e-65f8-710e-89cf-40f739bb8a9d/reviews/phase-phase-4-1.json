@@ -1,0 +1,49 @@
+{
+  "schemaVersion": 1,
+  "fermentId": "019ef97e-65f8-710e-89cf-40f739bb8a9d",
+  "phaseId": "phase-4",
+  "phaseName": "Risk Separation",
+  "attempt": 1,
+  "timestamp": "2026-06-24T14:40:10.425Z",
+  "goal": "Risk Sizing isolieren, testbaren Risk Layer schaffen und Fixed-Risk- sowie Risk-%-Modelle implementieren.",
+  "summary": "Phase 4 (Risk Separation) abgeschlossen. Risk-Layer in `validation/risk/` isoliert und testbar gemacht: `RiskAdapter` als Wrapper um bestehende `RiskEngine`, `FixedRiskModel` und `PercentRiskModel` implementiert, `RiskComparator` vergleicht Stop Distance, Risk Per Trade und Position Size zwischen externem Report und eigener Engine. Alle 97 Risk-Tests grün, gesamte Validation-Suite 316 Tests grün.",
+  "stepSummaries": "  1. Testbaren Risk-Adapter/Wrapper um bestehende `RiskEngine` bauen oder neue Risk-Sizing-Funktionen extrahieren. [verified]\n  2. Fixed-Risk-Modell implementieren (festes Risiko pro Trade). [verified]\n  3. Risk-%-Modell implementieren (prozentuales Risiko auf Kontostand). [verified]\n  4. Risk-Vergleichsbericht zwischen externem Report und eigener Engine erstellen. [verified]",
+  "diffAvailable": true,
+  "diffFilesChanged": "...9ef97e-65f8-710e-89cf-40f739bb8a9d.events.jsonl |  27 ++++\n .../019ef97e-65f8-710e-89cf-40f739bb8a9d.json      | 164 +++++++++++++++++----\n .../runtime.json                                   |  31 +++-\n todo/kimchi-todo.md                                |  26 ++--\n 4 files changed, 200 insertions(+), 48 deletions(-)",
+  "flags": [],
+  "derivedGrade": "A",
+  "reviewerRationale": "All gates pass; project checks validate.",
+  "gateVerdicts": [
+    {
+      "id": "F1",
+      "verdict": "pass",
+      "rationale": "Alle vier Schritte wurden mit echten pytest-Läufen verifiziert; keine reinen Proxies.",
+      "evidence": "Step 1: pytest tests/validation/test_risk_sizing.py 29 passed; Step 2: pytest tests/validation/test_fixed_risk_model.py 29 passed; Step 3: pytest tests/validation/test_percent_risk_model.py 39 passed; Step 4: pytest tests/validation/test_risk_comparison.py 10 passed"
+    },
+    {
+      "id": "F2",
+      "verdict": "pass",
+      "rationale": "Phase-Ziel erfüllt: Adapter/Wrapper isoliert, Fixed-Risk- und Risk-%-Modelle implementiert, Risk-Vergleichsbericht erstellt.",
+      "evidence": "validation/risk/adapter.py; validation/risk/fixed_risk.py; validation/risk/percent_risk.py; validation/risk/comparison.py; alle Tests grün"
+    },
+    {
+      "id": "F3",
+      "verdict": "pass",
+      "rationale": "Keine offenen Deferrals; alle geplanten Arbeiten in Phase 4 abgeschlossen.",
+      "evidence": "n/a"
+    }
+  ],
+  "projectChecks": {
+    "discovered": true,
+    "anyFailed": false,
+    "commands": [
+      {
+        "kind": "test",
+        "command": "pytest -q",
+        "exitCode": 0,
+        "durationMs": 1,
+        "timedOut": false
+      }
+    ]
+  }
+}

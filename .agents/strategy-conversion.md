@@ -658,4 +658,24 @@ Kopiere den folgenden Block und ersetze alle Platzhalter inklusive `<...>`-Klamm
 - Trades: <N>
 - Net Profit: <$X>
 - Win-Rate: <X>%
+
+---
+
+## Häufige Validierungs-Blocker (aus dem Intraday-Volatility-Breakout-Ferment abgeleitet)
+
+### 1. Historische Datenabdeckung
+Prüfe vor dem ersten Backtest, ob die lokalen Marktdaten den Zeitraum der Referenz abdecken. Fehlende Daten vor 2020 führen zu systematisch unterschiedlicher Trade-Anzahl und Statistiken.
+
+### 2. Zeitzone und Tagesabschluss
+MT5-Berichte verwenden die Broker-Serverzeit (typisch UTC+2/UTC+3). Dukascopy-Daten liegen in UTC vor. Unterschiedliche Tagesabschlüsse verändern Tages-ATR, Hoch/Tief und damit alle ATR-basierten Levels. Wenn möglich, Dokumentiere den verwendeten Offset; ein exakter Match ohne identische Tageskerzen ist oft nicht möglich.
+
+### 3. 24h-Daten vs. RTH-Session (Indizes)
+Viele Indizes (SP500, NAS100) werden in den Referenzen auf Basis der Cash-/RTH-Session gehandelt. Liegen 24h-Daten vor, wird die Tages-ATR über Nacht-Gaps aufgebläht und Breakout-Levels werden zu weit. Abhilfe: ATR nur auf der RTH-Session (z. B. 13:30–20:00 UTC für US-Indizes) berechnen oder einen session-basierten Filter implementieren.
+
+### 4. Execution-Timing
+MQL5 arbeitet tickbasiert und kann auf Candle-Close (`Use_Candle_Close=true`) oder Intrabar-Trigger reagieren. vectorbt führt standardmäßig am Next-Bar-Open aus. Zur Approximation:
+- `use_candle_close=true`: Signale am Close der Signal-Bar, Ausführung Next-Open.
+- `use_candle_close=false`: Verwende `high`/`low` der aktuellen Bar als Proxy für Tick-Preise, um Entries während der Bar zu simulieren.
+
+Dokumentiere die gewählte Approximation und ihre erwartete Abweichung.
 ```
