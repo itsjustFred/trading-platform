@@ -100,7 +100,7 @@
 # Ferment: Strategy Comparison Backtests
 
 > **Branch:** `kimchi-kimi-continue`
-> **Stand:** Phase 3 läuft
+> **Stand:** Phase 4 abgeschlossen
 > **Letztes Update:** 2026-06-24
 
 ## Phase 1 – Setup & Strategy-Conversion Skill
@@ -142,9 +142,9 @@
   - Verifikation: `pytest tests/strategies/test_intraday_volatility_breakout.py -v` läuft grün
 - [x] Regressionstest für Risk Parity anlegen (QC-kompatible Python-Reimplementierung getestet)
   - Verifikation: `pytest tests/strategies/test_risk_parity.py -v` läuft grün
-- [ ] Finale Validation-Suite laufen lassen
+- [x] Finale Validation-Suite laufen lassen
   - Verifikation: `pytest tests/validation/ -q` läuft grün
-- [ ] Alle Änderungen commiten
+- [x] Alle Änderungen commiten
   - Verifikation: `git status --short` zeigt keine uncommitted Änderungen
 
 ---
