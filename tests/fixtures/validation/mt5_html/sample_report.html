@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Strategietesterbericht</title>
+<style>
+body { font-family: Arial, sans-serif; font-size: 12px; }
+h1 { font-size: 16px; }
+table { border-collapse: collapse; width: 100%; margin-bottom: 20px; }
+th, td { border: 1px solid #ccc; padding: 4px; text-align: left; }
+th { background-color: #eee; }
+</style>
+</head>
+<body>
+<h1>Strategietesterbericht</h1>
+
+<div class="meta">
+  <table>
+    <tr><td>Expertenprogramm:</td><td colspan="3">ZenomTrader_IntradayVolatilityBreakout</td></tr>
+    <tr><td>Symbol:</td><td colspan="3">EURUSD</td></tr>
+    <tr><td>Periode:</td><td colspan="3">H1 (2024.01.02 - 2025.06.23)</td></tr>
+    <tr><td>Ersteinlage:</td><td colspan="3">10000.00</td></tr>
+    <tr><td>Hebel:</td><td colspan="3">1:100</td></tr>
+  </table>
+</div>
+
+<div class="summary">
+  <h2>Zusammenfassung</h2>
+  <table>
+    <tr><td>Gesamtanzahl Trades:</td><td>5</td><td>Profitfaktor:</td><td>2.15</td></tr>
+    <tr><td>Gewonnene Trades (in % von Gesamt):</td><td>3 (60.00%)</td><td>Sharpe-Ratio:</td><td>1.45</td></tr>
+    <tr><td>Verlorene Trades (in % von Gesamt):</td><td>2 (40.00%)</td><td>Nettogewinn gesamt:</td><td>1250.50</td></tr>
+    <tr><td>Bruttogewinn:</td><td>2100.00</td><td>Bruttoverlust:</td><td>849.50</td></tr>
+    <tr><td>Rückgang Kontostand relativ:</td><td>5.52% (551.80)</td><td>Rückgang Kontostand maximal:</td><td>8.20% (820.00)</td></tr>
+    <tr><td>Durchschnitt Gewinntrade:</td><td>700.00</td><td>Durchschnitt Verlusttrade:</td><td>424.75</td></tr>
+    <tr><td>Anzahl Deals:</td><td>10</td><td>Erwartetes Ergebnis:</td><td>250.10</td></tr>
+  </table>
+</div>
+
+<div class="orders">
+  <h2>Orders</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Auftrag</th><th>Zeit</th><th>Symbol</th><th>Typ</th><th>Richtung</th>
+        <th>Volumen</th><th>Preis</th><th>S / L</th><th>T / P</th><th>Kommentar</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>1001</td><td>2024.01.03 08:00:00</td><td>EURUSD</td><td>buy</td><td>in</td>
+        <td>0.10</td><td>1.08500</td><td>1.08000</td><td>1.09500</td><td>Entry</td>
+      </tr>
+      <tr>
+        <td>1002</td><td>2024.01.04 14:30:00</td><td>EURUSD</td><td>sell</td><td>in</td>
+        <td>0.15</td><td>1.09200</td><td>1.09700</td><td>1.08200</td><td>Entry</td>
+      </tr>
+      <tr>
+        <td>1003</td><td>2024.01.08 10:00:00</td><td>EURUSD</td><td>buy</td><td>in</td>
+        <td>0.20</td><td>1.08850</td><td>1.08350</td><td>1.09850</td><td>Entry</td>
+      </tr>
+      <tr>
+        <td>1004</td><td>2024.01.12 16:00:00</td><td>EURUSD</td><td>sell</td><td>in</td>
+        <td>0.10</td><td>1.09500</td><td>1.10000</td><td>1.08500</td><td>Entry</td>
+      </tr>
+      <tr>
+        <td>1005</td><td>2024.01.15 09:00:00</td><td>EURUSD</td><td>buy</td><td>in</td>
+        <td>0.25</td><td>1.09000</td><td>1.08500</td><td>1.10000</td><td>Entry</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="trades">
+  <h2>Trades</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Trade</th><th>Zeit</th><th>Symbol</th><th>Typ</th><th>Richtung</th>
+        <th>Volumen</th><th>Preis</th><th>Auftrag</th><th>Kommission</th>
+        <th>Swap</th><th>Gewinn</th><th>Kommentar</th>
+      </tr>
+    </thead>
+    <tbody>
+      <!-- Trade 1: LONG, Gewinn -->
+      <tr>
+        <td>1</td><td>2024.01.03 08:00:00</td><td>EURUSD</td><td>buy</td><td>in</td>
+        <td>0.10</td><td>1.08500</td><td>1001</td><td>-1.00</td>
+        <td>0.00</td><td></td><td>Entry Long</td>
+      </tr>
+      <tr>
+        <td>1</td><td>2024.01.03 16:00:00</td><td>EURUSD</td><td>sell</td><td>out</td>
+        <td>0.10</td><td>1.09000</td><td>1001</td><td>-1.00</td>
+        <td>0.00</td><td>500.00</td><td>TP 1.09000</td>
+      </tr>
+      <!-- Trade 2: SHORT, Verlust -->
+      <tr>
+        <td>2</td><td>2024.01.04 14:30:00</td><td>EURUSD</td><td>sell</td><td>in</td>
+        <td>0.15</td><td>1.09200</td><td>1002</td><td>-1.50</td>
+        <td>0.00</td><td></td><td>Entry Short</td>
+      </tr>
+      <tr>
+        <td>2</td><td>2024.01.05 10:00:00</td><td>EURUSD</td><td>buy</td><td>out</td>
+        <td>0.15</td><td>1.09700</td><td>1002</td><td>-1.50</td>
+        <td>0.00</td><td>-750.00</td><td>SL 1.09700</td>
+      </tr>
+      <!-- Trade 3: LONG, Gewinn -->
+      <tr>
+        <td>3</td><td>2024.01.08 10:00:00</td><td>EURUSD</td><td>buy</td><td>in</td>
+        <td>0.20</td><td>1.08850</td><td>1003</td><td>-2.00</td>
+        <td>0.00</td><td></td><td>Entry Long</td>
+      </tr>
+      <tr>
+        <td>3</td><td>2024.01.09 14:00:00</td><td>EURUSD</td><td>sell</td><td>out</td>
+        <td>0.20</td><td>1.09500</td><td>1003</td><td>-2.00</td>
+        <td>0.00</td><td>1300.00</td><td>TP 1.09500</td>
+      </tr>
+      <!-- Trade 4: SHORT, Verlust -->
+      <tr>
+        <td>4</td><td>2024.01.12 16:00:00</td><td>EURUSD</td><td>sell</td><td>in</td>
+        <td>0.10</td><td>1.09500</td><td>1004</td><td>-1.00</td>
+        <td>0.00</td><td></td><td>Entry Short</td>
+      </tr>
+      <tr>
+        <td>4</td><td>2024.01.14 08:00:00</td><td>EURUSD</td><td>buy</td><td>out</td>
+        <td>0.10</td><td>1.09950</td><td>1004</td><td>-1.00</td>
+        <td>0.00</td><td>-450.00</td><td>SL 1.09950</td>
+      </tr>
+      <!-- Trade 5: LONG, Gewinn -->
+      <tr>
+        <td>5</td><td>2024.01.15 09:00:00</td><td>EURUSD</td><td>buy</td><td>in</td>
+        <td>0.25</td><td>1.09000</td><td>1005</td><td>-2.50</td>
+        <td>0.00</td><td></td><td>Entry Long</td>
+      </tr>
+      <tr>
+        <td>5</td><td>2024.01.16 11:00:00</td><td>EURUSD</td><td>sell</td><td>out</td>
+        <td>0.25</td><td>1.09800</td><td>1005</td><td>-2.50</td>
+        <td>0.00</td><td>2000.00</td><td>Close</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+</body>
+</html>
