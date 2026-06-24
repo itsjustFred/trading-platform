@@ -115,6 +115,11 @@
 - [x] Agent-Artefakte bereinigen: `.github/agents/*`, `runner/auto_agent.py` und Tests als getrackte Projektfeatures eingeordnet; keine wegwerfbaren Agent-Artefakte mehr im Git-Status.
 - [x] `.accounts.env` ist bereits aus Git-Tracking entfernt ✅
 
+### 8. Strategy-Comparison-Nacharbeit
+- [x] Plattform-Backtests gegen `strategy-comparisons/` gestartet und Abweichungen dokumentiert. Report: `reports/strategy-comparison-platform-check-2026-06-23.md`.
+- [x] Runner/Viewer-Auto-Download korrigiert: `SP500`, `NAS100` und `US100` werden als Dukascopy-Index-CFD-Aliase behandelt statt als yfinance/HuggingFace-US-Aktien.
+- [x] `volatility_breakout` näher an die MT5-Referenz angepasst: Long/Short-Breakouts, ATR-Multiplier 0.25, ATR-Stop, Regimefilter und Trading-Hours.
+
 ---
 
 ## 📊 Daten-Status Übersicht

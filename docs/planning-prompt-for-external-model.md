@@ -94,16 +94,13 @@ Im Repo existieren bereits ausgearbeitete Strategie-Vergleiche unter `strategy-c
   - `SP500` — M1 (1-Minuten-Candles), Zeitraum: 2018-01-01 bis heute
   - `US100` — M15 (15-Minuten-Candles), Zeitraum: 2018-01-01 bis heute
 - **Datenquellen:**
-  - `EURUSD H1`: **Dukascopy** (kostenlos, native .bi5 → Parquet). Download läuft aktuell.
-  - `SP500 M1`: Kein CFD direkt auf Dukascopy. Optionen:
-    - **yfinance** mit `ES=F` (E-mini S&P 500 Futures) — M1 nur ~60 Tage frei verfügbar.
-    - Alternativ: `SPY` ETF mit M1/M15 via yfinance (gleiche Limitierung).
-    - Für mehr Historie: Paid-API (Polygon, Tradovate) oder lokale Tick-Speicher.
-  - `US100 M15`: Analog zu SP500, z. B. `NQ=F` oder `QQQ` via yfinance.
+  - `EURUSD H1`: **Dukascopy** (kostenlos, native .bi5 → Parquet).
+  - `SP500 M1`: **Dukascopy** Index-CFD, Alias `SP500`/`US500` → `usa500idxusd`.
+  - `US100 M15`: **Dukascopy** Index-CFD, Alias `US100`/`NAS100`/`USTEC` → `usatechidxusd`.
 - **Geschätzte Dauer:**
-  - Dukascopy EURUSD H1 (8 Jahre): ~5–10 Minuten (async download, bereits gestartet)
-  - yfinance intraday (SP500/US100): Minuten, aber nur ~60 Tage History frei
-- **Hinweis:** M1/M15-Daten für Indizes über Jahre hinweg sind im Free-Bereich kaum verfügbar. Für die Strategie-Vergleiche reicht ggf. ein kürzerer Backtest-Zeitraum oder ein Proxy-Symbol.
+  - Dukascopy EURUSD H1 (8 Jahre): ~5–10 Minuten
+  - Dukascopy SP500/US100 Intraday-CFDs: Minuten bis länger je nach Zeitraum; native Downloader mit Batch-Pipeline nutzen.
+- **Hinweis:** Nicht auf yfinance-Proxies ausweichen, solange die Dukascopy-CFDs verfügbar sind.
 
 ### 2. Risk Parity
 - **Pfad:** `strategy-comparisons/risk_parity/`
@@ -156,7 +153,7 @@ Berücksichtige dabei:
 - Prüfe zuerst, welche OHLCV-Daten bereits im Repo vorhanden sind (`data/ohlcv/`, `data/catalog.json`).
 - Falls Daten fehlen: Lade sie via vorhandene Downloader (`data_tools/downloaders/yfinance_dl.py`, `dukascopy_native.py`) herunter.
 - Für Strategy-Comparisons unbedingt die benötigten Symbol/Timeframe-Kombinationen sicherstellen.
-- Dokumentiere Limitationen (z.B. yfinance M1 nur 60 Tage frei, Dukascopy keine US-Index-CFDs).
+- Dokumentiere Limitationen (z.B. yfinance M1 nur 60 Tage frei; Dukascopy-US-Index-CFDs sind für Intraday verfügbar und sollen bevorzugt werden).
 - Gib bei jedem Daten-Download den Befehl, die erwartete Dauer und das Zielverzeichnis an.
 
 **WICHTIG — Setup-Dokumentation:**

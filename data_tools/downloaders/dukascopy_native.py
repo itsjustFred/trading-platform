@@ -116,7 +116,10 @@ SYMBOL_CONFIG: dict[str, dict[str, str]] = {
     "XAGUSD": {"instrument": "xagusd", "asset_class": "metals"},
     # Indices
     "US30": {"instrument": "usa30idxusd", "asset_class": "indices"},
+    "SP500": {"instrument": "usa500idxusd", "asset_class": "indices"},
     "US500": {"instrument": "usa500idxusd", "asset_class": "indices"},
+    "NAS100": {"instrument": "usatechidxusd", "asset_class": "indices"},
+    "US100": {"instrument": "usatechidxusd", "asset_class": "indices"},
     "USTEC": {"instrument": "usatechidxusd", "asset_class": "indices"},
     "USA30IDXUSD": {"instrument": "usa30idxusd", "asset_class": "indices"},
     "USA500IDXUSD": {"instrument": "usa500idxusd", "asset_class": "indices"},

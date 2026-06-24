@@ -5700,12 +5700,22 @@ def _is_forex_symbol(symbol: str) -> bool:
     return normalized_symbol in known_forex_symbols
 
 
+def _is_dukascopy_symbol(symbol: str) -> bool:
+    normalized_symbol = str(symbol or "").strip().upper()
+    try:
+        from data_tools.downloaders.dukascopy_native import SYMBOL_CONFIG
+
+        return normalized_symbol in {key.upper() for key in SYMBOL_CONFIG}
+    except Exception:
+        return False
+
+
 def _is_us_intraday_stock(symbol: str, timeframe: str) -> bool:
     normalized_symbol = str(symbol or "").strip().upper()
     normalized_timeframe = normalize_timeframe(str(timeframe or "").strip())
     if normalized_timeframe not in US_INTRADAY_TIMEFRAMES:
         return False
-    if _is_forex_symbol(normalized_symbol):
+    if _is_forex_symbol(normalized_symbol) or _is_dukascopy_symbol(normalized_symbol):
         return False
     if not _US_STOCK_SYMBOL_PATTERN.fullmatch(normalized_symbol):
         return False
@@ -5717,7 +5727,7 @@ def _is_us_intraday_stock(symbol: str, timeframe: str) -> bool:
 def _auto_download_source(symbol: str, timeframe: str) -> str:
     normalized_symbol = str(symbol or "").strip().upper()
     normalized_timeframe = normalize_timeframe(str(timeframe or "").strip())
-    if _is_forex_symbol(normalized_symbol):
+    if _is_dukascopy_symbol(normalized_symbol) or _is_forex_symbol(normalized_symbol):
         return "dukascopy"
     if _is_us_intraday_stock(normalized_symbol, normalized_timeframe):
         return "huggingface"

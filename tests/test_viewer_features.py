@@ -1433,6 +1433,9 @@ def test_auto_download_source_prefers_yfinance_for_non_forex_symbols(viewer_clie
 
     assert viewer_app_module._auto_download_source("AAPL", "1d") == "yfinance"
     assert viewer_app_module._auto_download_source("AAPL", "1h") == "huggingface"
+    assert viewer_app_module._auto_download_source("SP500", "1m") == "dukascopy"
+    assert viewer_app_module._auto_download_source("NAS100", "15m") == "dukascopy"
+    assert viewer_app_module._auto_download_source("US100", "15m") == "dukascopy"
     assert viewer_app_module._auto_download_source("BTC/USD", "1h") == "dukascopy"
     assert viewer_app_module._auto_download_source("EURUSD", "1h") == "dukascopy"
 
