@@ -26,6 +26,7 @@ DEFAULT_PERIODS_PER_YEAR = 252
 MIN_CALMAR_DRAWDOWN = 0.001
 SECONDS_PER_DAY = 24 * 60 * 60
 SECONDS_PER_YEAR = 365.25 * 24 * 60 * 60
+DAILY_RETURN_PERIODS_PER_YEAR = 252
 
 try:
     import quantstats as qs
@@ -114,13 +115,11 @@ def compute_stats(
         daily_returns = _daily_returns_from_equity_curve(equity_curve)
         p_value = _one_sided_p_value(daily_returns)
         cagr = _cagr_from_backtest_period(equity_curve=equity_curve, trades=trades)
+        daily_return_series = _daily_returns_series_from_equity_curve(equity_curve)
 
         if HAS_QUANTSTATS:
-            returns_series = _equity_to_returns_series(equity_curve)
+            returns_series = daily_return_series
             if returns_series is not None and not returns_series.empty:
-                returns_series = _attach_inferred_freq(returns_series)
-                periods_per_year = _infer_periods_per_year(equity_curve, len(returns_series))
-
                 sharpe_ratio = 0.0
                 sortino_ratio = 0.0
                 if len(returns_series) > 1:
@@ -128,13 +127,13 @@ def compute_stats(
                         qs.stats.sharpe,
                         returns_series,
                         rf=risk_free_rate,
-                        periods=periods_per_year,
+                        periods=DAILY_RETURN_PERIODS_PER_YEAR,
                     )
                     sortino_ratio = _safe_qs(
                         qs.stats.sortino,
                         returns_series,
                         rf=risk_free_rate,
-                        periods=periods_per_year,
+                        periods=DAILY_RETURN_PERIODS_PER_YEAR,
                     )
                     psr = _probabilistic_sharpe(returns_series, sharpe_ratio)
 
@@ -228,6 +227,34 @@ def _equity_to_returns_series(equity_curve: list[EquityPoint]) -> pd.Series | No
 
     eq_series = pd.Series(equities, dtype=float)
     return eq_series.pct_change().dropna()
+
+
+def _daily_returns_series_from_equity_curve(equity_curve: list[EquityPoint]) -> pd.Series | None:
+    """Convert any equity curve cadence into daily close-to-close returns.
+
+    Sharpe, Sortino, PSR and p-values are reported on daily observations.  For
+    intraday curves this avoids treating every bar as a full annualization
+    period and prevents dense bar spacing from changing the metric definition.
+    """
+    if len(equity_curve) < 2:
+        return None
+
+    equities = [point.equity for point in equity_curve]
+    try:
+        timestamps = pd.to_datetime([point.time for point in equity_curve], utc=True)
+        series = pd.Series(equities, index=timestamps, dtype=float).sort_index()
+        series = series.groupby(level=0).last()
+        daily_equity = series.resample("D").last().ffill()
+        returns = daily_equity.pct_change().dropna()
+        returns = returns.replace([math.inf, -math.inf], pd.NA).dropna()
+        return returns if not returns.empty else None
+    except Exception:
+        logger.debug("Could not build daily returns series from equity curve", exc_info=True)
+
+    raw_returns = _equity_to_returns_series(equity_curve)
+    if raw_returns is None or raw_returns.empty:
+        return None
+    return raw_returns
 
 
 def _attach_inferred_freq(returns: pd.Series) -> pd.Series:
@@ -427,21 +454,14 @@ def _daily_returns(equities: list[float]) -> list[float]:
 
 def _daily_returns_from_equity_curve(equity_curve: list[EquityPoint]) -> list[float]:
     """Compute daily returns from an equity curve, falling back to raw period returns."""
+    daily_series = _daily_returns_series_from_equity_curve(equity_curve)
+    if daily_series is not None and not daily_series.empty:
+        return [float(value) for value in daily_series.tolist() if pd.notna(value)]
+
     if len(equity_curve) < 2:
         return []
 
     equities = [point.equity for point in equity_curve]
-
-    try:
-        timestamps = pd.to_datetime([point.time for point in equity_curve], utc=True)
-        series = pd.Series(equities, index=timestamps, dtype=float).sort_index()
-        daily_equity = series.resample("D").last().ffill()
-        daily_returns = daily_equity.pct_change().dropna()
-        if not daily_returns.empty:
-            return [float(value) for value in daily_returns.tolist() if pd.notna(value)]
-    except Exception:
-        logger.debug("Falling back to raw period returns for p-value calculation", exc_info=True)
-
     return _daily_returns(equities)
 
 

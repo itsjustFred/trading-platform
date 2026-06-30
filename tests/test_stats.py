@@ -3,7 +3,13 @@
 from datetime import datetime, timedelta, timezone
 import math
 
-from runner.stats import compute_stats, compute_stats_for_result, _max_consecutive, _max_drawdown_pct_manual
+from runner.stats import (
+    compute_stats,
+    compute_stats_for_result,
+    _daily_returns_from_equity_curve,
+    _max_consecutive,
+    _max_drawdown_pct_manual,
+)
 from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, TradeExit
 
 
@@ -177,6 +183,32 @@ class TestComputeStats:
 
         assert abs(stats["max_drawdown_pct"]) < 0.001
         assert stats["calmar_ratio"] == 0.0
+
+    def test_intraday_sharpe_uses_daily_returns_not_bar_density(self):
+        start = datetime(2024, 1, 1, 9, 30, tzinfo=timezone.utc)
+        equity: list[EquityPoint] = []
+        value = 100000.0
+        for day in range(30):
+            for bar in range(24):
+                if bar == 23:
+                    value *= 1.001
+                elif bar % 7 == 0:
+                    value *= 0.99995
+                else:
+                    value *= 1.00002
+                equity.append(
+                    EquityPoint(
+                        time=(start + timedelta(days=day, minutes=bar)).isoformat(),
+                        equity=value,
+                    )
+                )
+
+        stats = compute_stats([], equity_curve=equity, risk_free_rate=0.04)
+        daily_returns = _daily_returns_from_equity_curve(equity)
+
+        assert stats["total_return"] > 0
+        assert stats["sharpe_ratio"] > 0
+        assert len(daily_returns) == 29
 
 
 class TestMaxConsecutiveLosses:

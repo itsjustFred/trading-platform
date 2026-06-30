@@ -1,0 +1,281 @@
+{
+  "generated_at": "2026-06-30T13:13:31.287635+00:00",
+  "metrics": [
+    "trade_count",
+    "win_rate",
+    "net_profit",
+    "cagr",
+    "sharpe_ratio"
+  ],
+  "risk_free_rate_note": "Platform canonical Sharpe uses daily equity returns and risk_free_rate=0.04 by default; MT5 and QuantConnect reference reports do not expose a matching risk-free-rate input, so Sharpe deltas include R_f and execution-model effects.",
+  "rows": [
+    {
+      "case_id": "intraday_volatility_breakout_sp500_m1",
+      "reference_framework": "mt5_xlsx",
+      "reference_path": "/home/ubuntu/Desktop/trading-platform-codex_copy/strategy-comparisons/intraday_volatility_breakout/SP500_M1.xlsx",
+      "platform_path": "/home/ubuntu/Desktop/trading-platform-codex_copy/reports/strategy_comparison_backtest_SP500_M1_after_align_20260623.trades.json",
+      "missing_artifacts": [],
+      "reference": {
+        "trade_count": 512.0,
+        "win_rate": 0.44920000000000004,
+        "net_profit": 39255.92,
+        "cagr": 0.03985281380821437,
+        "sharpe_ratio": 4.595921
+      },
+      "platform": {
+        "trade_count": 239.0,
+        "win_rate": 0.205,
+        "net_profit": -4800.04,
+        "cagr": -0.104363,
+        "sharpe_ratio": -0.2183
+      },
+      "deltas": [
+        {
+          "metric": "trade_count",
+          "reference": 512.0,
+          "platform": 239.0,
+          "absolute_delta": -273.0,
+          "relative_delta": -0.533203125,
+          "note": ""
+        },
+        {
+          "metric": "win_rate",
+          "reference": 0.44920000000000004,
+          "platform": 0.205,
+          "absolute_delta": -0.24420000000000006,
+          "relative_delta": -0.5436331255565451,
+          "note": ""
+        },
+        {
+          "metric": "net_profit",
+          "reference": 39255.92,
+          "platform": -4800.04,
+          "absolute_delta": -44055.96,
+          "relative_delta": -1.1222755701560427,
+          "note": ""
+        },
+        {
+          "metric": "cagr",
+          "reference": 0.03985281380821437,
+          "platform": -0.104363,
+          "absolute_delta": -0.14421581380821435,
+          "relative_delta": -1.3818672691300016,
+          "note": ""
+        },
+        {
+          "metric": "sharpe_ratio",
+          "reference": 4.595921,
+          "platform": -0.2183,
+          "absolute_delta": -4.814221,
+          "relative_delta": -1.0474986406424305,
+          "note": ""
+        }
+      ],
+      "notes": [
+        "MT5 fills, spread/commission, contract sizing and fixed-risk execution differ from platform fills.",
+        "MT5 CAGR is derived from report period, initial deposit and net profit because the XLSX summary omits CAGR."
+      ]
+    },
+    {
+      "case_id": "intraday_volatility_breakout_eurusd_h1",
+      "reference_framework": "mt5_xlsx",
+      "reference_path": "/home/ubuntu/Desktop/trading-platform-codex_copy/strategy-comparisons/intraday_volatility_breakout/EURUSD_H1.xlsx",
+      "platform_path": "/home/ubuntu/Desktop/trading-platform-codex_copy/reports/strategy_comparison_backtest_EURUSD_H1_after_align_20260623.trades.json",
+      "missing_artifacts": [],
+      "reference": {
+        "trade_count": 492.0,
+        "win_rate": 0.4512,
+        "net_profit": 21868.81,
+        "cagr": 0.023614509760820024,
+        "sharpe_ratio": 2.711472
+      },
+      "platform": {
+        "trade_count": 71.0,
+        "win_rate": 0.3944,
+        "net_profit": 11310.19,
+        "cagr": 0.098205,
+        "sharpe_ratio": 0.2102
+      },
+      "deltas": [
+        {
+          "metric": "trade_count",
+          "reference": 492.0,
+          "platform": 71.0,
+          "absolute_delta": -421.0,
+          "relative_delta": -0.8556910569105691,
+          "note": ""
+        },
+        {
+          "metric": "win_rate",
+          "reference": 0.4512,
+          "platform": 0.3944,
+          "absolute_delta": -0.05680000000000002,
+          "relative_delta": -0.12588652482269508,
+          "note": ""
+        },
+        {
+          "metric": "net_profit",
+          "reference": 21868.81,
+          "platform": 11310.19,
+          "absolute_delta": -10558.62,
+          "relative_delta": -0.4828163946735099,
+          "note": ""
+        },
+        {
+          "metric": "cagr",
+          "reference": 0.023614509760820024,
+          "platform": 0.098205,
+          "absolute_delta": 0.07459049023917998,
+          "relative_delta": 0.7595386206321468,
+          "note": ""
+        },
+        {
+          "metric": "sharpe_ratio",
+          "reference": 2.711472,
+          "platform": 0.2102,
+          "absolute_delta": -2.501272,
+          "relative_delta": -0.9224775324989526,
+          "note": ""
+        }
+      ],
+      "notes": [
+        "MT5 fills, spread/commission, contract sizing and fixed-risk execution differ from platform fills.",
+        "MT5 CAGR is derived from report period, initial deposit and net profit because the XLSX summary omits CAGR."
+      ]
+    },
+    {
+      "case_id": "intraday_volatility_breakout_nas100_m15",
+      "reference_framework": "mt5_xlsx",
+      "reference_path": "/home/ubuntu/Desktop/trading-platform-codex_copy/strategy-comparisons/intraday_volatility_breakout/NAS100_M15.xlsx",
+      "platform_path": "/home/ubuntu/Desktop/trading-platform-codex_copy/reports/strategy_comparison_backtest_US100_M15_after_align_20260623.trades.json",
+      "missing_artifacts": [],
+      "reference": {
+        "trade_count": 597.0,
+        "win_rate": 0.4355,
+        "net_profit": 43791.14,
+        "cagr": 0.043793118964499556,
+        "sharpe_ratio": 4.67729
+      },
+      "platform": {
+        "trade_count": 319.0,
+        "win_rate": 0.2727,
+        "net_profit": -5598.22,
+        "cagr": -0.123891,
+        "sharpe_ratio": -0.4031
+      },
+      "deltas": [
+        {
+          "metric": "trade_count",
+          "reference": 597.0,
+          "platform": 319.0,
+          "absolute_delta": -278.0,
+          "relative_delta": -0.4656616415410385,
+          "note": ""
+        },
+        {
+          "metric": "win_rate",
+          "reference": 0.4355,
+          "platform": 0.2727,
+          "absolute_delta": -0.1628,
+          "relative_delta": -0.3738231917336395,
+          "note": ""
+        },
+        {
+          "metric": "net_profit",
+          "reference": 43791.14,
+          "platform": -5598.22,
+          "absolute_delta": -49389.36,
+          "relative_delta": -1.1278391016995675,
+          "note": ""
+        },
+        {
+          "metric": "cagr",
+          "reference": 0.043793118964499556,
+          "platform": -0.123891,
+          "absolute_delta": -0.16768411896449956,
+          "relative_delta": -1.3534810354626208,
+          "note": ""
+        },
+        {
+          "metric": "sharpe_ratio",
+          "reference": 4.67729,
+          "platform": -0.4031,
+          "absolute_delta": -5.08039,
+          "relative_delta": -1.0861823833886717,
+          "note": ""
+        }
+      ],
+      "notes": [
+        "MT5 fills, spread/commission, contract sizing and fixed-risk execution differ from platform fills.",
+        "MT5 CAGR is derived from report period, initial deposit and net profit because the XLSX summary omits CAGR."
+      ]
+    },
+    {
+      "case_id": "risk_parity_quantconnect",
+      "reference_framework": "lean",
+      "reference_path": "/home/ubuntu/Desktop/trading-platform-codex_copy/strategy-comparisons/risk_parity/risk_parity_reference.json",
+      "platform_path": "/home/ubuntu/Desktop/trading-platform-codex_copy/reports/strategy_comparison_backtest_risk_parity_20260623.trades.json",
+      "missing_artifacts": [],
+      "reference": {
+        "trade_count": 240.0,
+        "win_rate": 0.575,
+        "net_profit": 126183.49,
+        "cagr": 0.058651,
+        "sharpe_ratio": 0.544687
+      },
+      "platform": {
+        "trade_count": 67.0,
+        "win_rate": 0.4627,
+        "net_profit": 108851.57,
+        "cagr": 0.099824,
+        "sharpe_ratio": 0.2106
+      },
+      "deltas": [
+        {
+          "metric": "trade_count",
+          "reference": 240.0,
+          "platform": 67.0,
+          "absolute_delta": -173.0,
+          "relative_delta": -0.7208333333333333,
+          "note": ""
+        },
+        {
+          "metric": "win_rate",
+          "reference": 0.575,
+          "platform": 0.4627,
+          "absolute_delta": -0.11229999999999996,
+          "relative_delta": -0.19530434782608688,
+          "note": ""
+        },
+        {
+          "metric": "net_profit",
+          "reference": 126183.49,
+          "platform": 108851.57,
+          "absolute_delta": -17331.92,
+          "relative_delta": -0.1373548948440085,
+          "note": ""
+        },
+        {
+          "metric": "cagr",
+          "reference": 0.058651,
+          "platform": 0.099824,
+          "absolute_delta": 0.041172999999999994,
+          "relative_delta": 0.41245592242346524,
+          "note": ""
+        },
+        {
+          "metric": "sharpe_ratio",
+          "reference": 0.544687,
+          "platform": 0.2106,
+          "absolute_delta": -0.334087,
+          "relative_delta": -0.6133559273491014,
+          "note": ""
+        }
+      ],
+      "notes": [
+        "QuantConnect PDF summary has limited extractable trade detail; JSON reference carries the auditable fields.",
+        "Risk Parity implementations may differ in universe, rebalance timing, covariance estimator and R_f convention."
+      ]
+    }
+  ]
+}
