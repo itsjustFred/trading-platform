@@ -180,6 +180,45 @@ def test_trade_engine_stop_uses_bar_low_and_risk_sizing_1pct():
     assert trade.pnl == pytest.approx(-1000.0, abs=0.5)
 
 
+def test_trade_engine_accepts_sl_price_alias_for_native_stops_and_risk_sizing():
+    data = _synthetic_ohlcv(100)
+    data.loc[12, "low"] = 109.0
+
+    def strategy_fn(df: pd.DataFrame, params: dict):
+        entries = pd.Series(False, index=df.index)
+        exits = pd.Series(False, index=df.index)
+        entries.iloc[10] = True
+        indicators = {
+            "direction": pd.Series("LONG", index=df.index),
+            "sl_price": pd.Series(pd.NA, index=df.index),
+        }
+        indicators["sl_price"].iloc[10] = 109.0
+        return entries, exits, indicators, []
+
+    cfg = BacktestConfig(
+        strategy_name="risk-test",
+        symbols=["TEST"],
+        timeframe="1h",
+        start_date="2024-01-01",
+        end_date="2024-01-31",
+        initial_capital=100_000,
+        risk_per_trade_pct=0.01,
+        max_leverage=3.0,
+        modeling_resolution="main_timeframe",
+        parameters={},
+    )
+
+    engine = TradeEngine(cfg, symbol="TEST")
+    result = engine.run(data, strategy_fn)
+
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    assert trade.entry_price == pytest.approx(111.0)
+    assert trade.exits[-1].price == pytest.approx(109.0)
+    assert trade.exits[-1].reason == "stop_loss"
+    assert trade.pnl == pytest.approx(-1000.0, abs=0.5)
+
+
 def test_example_sma_native_vs_vectorbt_trade_count_similarity():
     strategy_path = Path("strategies/example_sma/example_sma.py").resolve()
     if not strategy_path.exists():

@@ -163,13 +163,15 @@ class TradeEngine:
 
     def _extract_levels(self, row: pd.Series) -> tuple[float | None, list[dict[str, Any]]]:
         stop_loss = row.get("stop_loss")
+        if pd.isna(stop_loss):
+            stop_loss = row.get("sl_price")
         stop_loss = float(stop_loss) if pd.notna(stop_loss) else None
 
         tp_levels: list[dict[str, Any]] = []
         tp_candidates: list[tuple[str, float]] = []
         for key in row.index:
             lower = str(key).lower()
-            if lower == "take_profit" and pd.notna(row.get(key)):
+            if lower in {"take_profit", "tp_price"} and pd.notna(row.get(key)):
                 tp_candidates.append(("tp", float(row.get(key))))
             elif lower.startswith("tp") and lower[2:].isdigit() and pd.notna(row.get(key)):
                 tp_candidates.append((lower, float(row.get(key))))

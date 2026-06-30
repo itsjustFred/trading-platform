@@ -57,6 +57,41 @@ def _make_df(n_bars: int = 100, start: str = "2024-01-01 15:00") -> pd.DataFrame
     )
 
 
+def _two_day_breakout_df(*, direction: str) -> pd.DataFrame:
+    idx = pd.date_range("2024-01-01 00:00", periods=2880, freq="1min")
+    close = np.full(len(idx), 1.1000)
+    open_ = np.full(len(idx), 1.1000)
+    high = np.full(len(idx), 1.1010)
+    low = np.full(len(idx), 1.0990)
+    entry_mask = (idx >= pd.Timestamp("2024-01-02 16:30")) & (
+        idx < pd.Timestamp("2024-01-02 17:30")
+    )
+    after_entry_mask = idx >= pd.Timestamp("2024-01-02 17:30")
+    if direction == "down":
+        close[entry_mask] = np.linspace(1.1000, 1.0980, entry_mask.sum())
+        close[after_entry_mask] = 1.0980
+        open_[entry_mask] = close[entry_mask] + 0.00001
+        open_[after_entry_mask] = 1.0980
+    else:
+        close[entry_mask] = np.linspace(1.1000, 1.1020, entry_mask.sum())
+        close[after_entry_mask] = 1.1020
+        open_[entry_mask] = close[entry_mask] - 0.00001
+        open_[after_entry_mask] = 1.1020
+    high[entry_mask] = close[entry_mask] + 0.0001
+    high[after_entry_mask] = close[after_entry_mask] + 0.0001
+    low[entry_mask] = close[entry_mask] - 0.0001
+    low[after_entry_mask] = close[after_entry_mask] - 0.0001
+    return pd.DataFrame(
+        {
+            "timestamp": idx,
+            "open": open_,
+            "high": high,
+            "low": low,
+            "close": close,
+        }
+    )
+
+
 # ---------------------------------------------------------------------------
 # Module-load smoke test
 # ---------------------------------------------------------------------------
@@ -158,72 +193,47 @@ def test_one_trade_per_day():
 # ---------------------------------------------------------------------------
 def test_reverse_mode_flips_signals():
     mod = _load_module()
-    idx = pd.date_range("2024-01-01 16:30", periods=60, freq="1min")
-    # Price drops well below lower level
-    close = np.linspace(1.1020, 1.0980, 60)
-    open_ = close + 0.00001
-    high = close + 0.0001
-    low = close - 0.0001
-    df = pd.DataFrame({
-        "timestamp": idx,
-        "open": open_,
-        "high": high,
-        "low": low,
-        "close": close,
-    })
+    df = _two_day_breakout_df(direction="down")
     base_params = mod.STRATEGY_META["parameters"].copy()
     base_params["use_candle_close"] = False
     base_params["entry_time"] = "16:30"
     base_params["max_entry_time"] = "18:00"
     base_params["exit_time"] = "20:00"
+    base_params["atr_regime_factor"] = 2.0
 
     # Normal mode: short should trigger (price drops below lower)
     params_normal = {**base_params, "reverse_mode": False}
     entries_normal, _, indicators_normal, _ = mod.generate_signals(df, params_normal)
-    dirs_normal = indicators_normal.get("direction")
-    if dirs_normal is not None:
-        assert (dirs_normal == "SHORT").any(), "Expected a SHORT entry in normal mode"
+    dirs_normal = indicators_normal["direction"]
+    assert entries_normal.any()
+    assert (dirs_normal == "SHORT").any(), "Expected a SHORT entry in normal mode"
 
     # Reverse mode: the same breakout should produce a LONG
     params_reverse = {**base_params, "reverse_mode": True}
     entries_reverse, _, indicators_reverse, _ = mod.generate_signals(df, params_reverse)
-    dirs_reverse = indicators_reverse.get("direction")
-    if dirs_reverse is not None:
-        # In reverse mode a drop below lower_level becomes LONG
-        assert (dirs_reverse == "LONG").any(), "Expected a LONG entry in reverse mode"
+    dirs_reverse = indicators_reverse["direction"]
+    assert entries_reverse.any()
+    assert (dirs_reverse == "LONG").any(), "Expected a LONG entry in reverse mode"
 
 
 # ---------------------------------------------------------------------------
 # Trade direction filters
 # ---------------------------------------------------------------------------
-def test_long_only_blocks_short():
+def test_short_only_blocks_long_breakouts():
     mod = _load_module()
-    idx = pd.date_range("2024-01-01 16:30", periods=60, freq="1min")
-    close = np.linspace(1.0980, 1.1020, 60)  # rises above upper
-    open_ = close - 0.00001
-    high = close + 0.0001
-    low = close - 0.0001
-    df = pd.DataFrame({
-        "timestamp": idx,
-        "open": open_,
-        "high": high,
-        "low": low,
-        "close": close,
-    })
+    df = _two_day_breakout_df(direction="up")
     params = mod.STRATEGY_META["parameters"].copy()
     params["trade_direction"] = "short_only"
     params["use_candle_close"] = False
     params["entry_time"] = "16:30"
     params["max_entry_time"] = "18:00"
     params["exit_time"] = "20:00"
+    params["atr_regime_factor"] = 2.0
 
     entries, _, indicators, _ = mod.generate_signals(df, params)
-    dirs = indicators.get("direction")
-    if dirs is not None:
-        active_dirs = dirs.dropna()
-        assert (active_dirs == "SHORT").all(), (
-            f"Expected only SHORT in short_only mode, got {active_dirs.unique()}"
-        )
+    active_dirs = indicators["direction"].dropna()
+    assert not entries.any()
+    assert active_dirs.empty
 
 
 # ---------------------------------------------------------------------------
@@ -329,3 +339,49 @@ def test_adapter_normalization():
     assert "exits" in signals.columns
     assert len(norm_indicators) > 0
     assert isinstance(norm_drawings, list)
+
+
+def test_candle_close_signal_emits_previous_bar_for_next_open_execution():
+    mod = _load_module()
+    idx = pd.date_range("2024-01-01 00:00", periods=3 * 24 * 4, freq="15min", tz="UTC")
+    close = np.full(len(idx), 100.0)
+    open_ = np.full(len(idx), 100.0)
+    high = np.full(len(idx), 100.2)
+    low = np.full(len(idx), 99.8)
+    breakout_bar = idx.get_loc(pd.Timestamp("2024-01-03 16:45", tz="UTC"))
+    close[breakout_bar] = 110.0
+    open_[breakout_bar + 1] = 110.0
+    close[breakout_bar + 1] = 110.0
+    high[breakout_bar] = 110.2
+    high[breakout_bar + 1] = 110.2
+
+    df = pd.DataFrame(
+        {
+            "timestamp": idx,
+            "open": open_,
+            "high": high,
+            "low": low,
+            "close": close,
+        }
+    )
+    params = mod.STRATEGY_META["parameters"].copy()
+    params.update(
+        {
+            "use_candle_close": True,
+            "confirmation_timeframe": "15m",
+            "entry_time": "16:30",
+            "max_entry_time": "18:05",
+            "exit_time": "22:55",
+            "atr_multiplier": 0.25,
+            "atr_regime_factor": 2.0,
+        }
+    )
+
+    entries, _, indicators, _ = mod.generate_signals(df, params)
+    entry_times = df.loc[entries[entries].index, "timestamp"].tolist()
+
+    assert pd.Timestamp("2024-01-03 17:00", tz="UTC") not in entry_times
+    assert pd.Timestamp("2024-01-03 16:45", tz="UTC") in entry_times
+    entry_idx = df.index[df["timestamp"] == pd.Timestamp("2024-01-03 16:45", tz="UTC")][0]
+    assert indicators["direction"].iloc[entry_idx] == "LONG"
+    assert pd.notna(indicators["sl_price"].iloc[entry_idx])

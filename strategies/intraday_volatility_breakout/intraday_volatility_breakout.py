@@ -271,16 +271,29 @@ def generate_signals(df: pd.DataFrame, params: dict):
     both_hit = long_entries & short_entries
     short_entries = short_entries & ~both_hit
 
-    entries = long_entries | short_entries
+    # The MQL5 EA evaluates a just-closed confirmation candle at the first tick
+    # of the next confirmation bar, then submits a market order immediately.
+    # The platform engines execute strategy signals on the next bar open, so
+    # candle-close entries are emitted one source bar earlier to land on the
+    # same execution timestamp as MT5 for M1/M15 data.
+    signal_long_entries = long_entries
+    signal_short_entries = short_entries
+    if use_candle_close:
+        signal_long_entries = long_entries.shift(-1, fill_value=False).astype(bool)
+        signal_short_entries = short_entries.shift(-1, fill_value=False).astype(bool)
+
+    entries = signal_long_entries | signal_short_entries
 
     # --- Direction & sl_price per entry --------------------------------------
     direction = pd.Series(index=idx, dtype=object)
-    direction.loc[long_entries] = "LONG"
-    direction.loc[short_entries] = "SHORT"
+    direction.loc[signal_long_entries] = "LONG"
+    direction.loc[signal_short_entries] = "SHORT"
 
-    sl_price = pd.Series(np.nan, index=idx)
-    sl_price.loc[long_entries] = (close - stop_distance).loc[long_entries]
-    sl_price.loc[short_entries] = (close + stop_distance).loc[short_entries]
+    long_sl_price = (close - stop_distance).where(long_entries)
+    short_sl_price = (close + stop_distance).where(short_entries)
+    sl_price = long_sl_price.combine_first(short_sl_price)
+    if use_candle_close:
+        sl_price = sl_price.shift(-1)
 
     # --- Exits (time exit + EOD safety net) ----------------------------------
     exit_time_mask = minute_of_day >= exit_minute
@@ -297,6 +310,7 @@ def generate_signals(df: pd.DataFrame, params: dict):
         "lower_level": lower_level,
         "regime_ok": regime_ok,
         "entry_open": entry_open,
+        "direction": direction,
         "sl_price": sl_price,
     }
 
