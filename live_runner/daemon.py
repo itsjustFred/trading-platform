@@ -39,8 +39,10 @@ from shared.models import (
     ServiceStatus,
     ServiceType,
 )
+from shared.sentry import capture_exception, initialize_sentry
 from signal_bots.registry import get_signal_processor
 
+initialize_sentry("live-runner")
 logger = get_logger("live-runner")
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -1672,8 +1674,14 @@ async def run_daemon(
     except asyncio.CancelledError:
         logger.info("Live daemon cancelled")
         raise
-    except Exception:
+    except Exception as exc:
         logger.exception("Live daemon crashed")
+        with contextlib.suppress(Exception):
+            capture_exception(
+                exc,
+                service_name="live-runner",
+                context={"component": "live_daemon", "phase": "run_daemon"},
+            )
         raise
     finally:
         if not service_sync_task.done():

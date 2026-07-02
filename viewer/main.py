@@ -37,6 +37,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import Field as PydanticField
 from pydantic import ValidationError
+from sentry_sdk.integrations.fastapi import FastApiIntegration
+from sentry_sdk.integrations.starlette import StarletteIntegration
 from sqlmodel import SQLModel
 from starlette.middleware.gzip import GZipMiddleware
 
@@ -63,6 +65,7 @@ LOG_DIR = RESOLVED_LOG_DIR
 os.environ.setdefault("LOG_DIR", str(LOG_DIR))
 
 from shared.logging import get_logger
+from shared.sentry import initialize_sentry
 from shared.models import (
     BacktestResult,
     EquityPoint,
@@ -148,6 +151,13 @@ from live_runner.market_data_stream import LiveMarketDataStreamService
 from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credentials
 from viewer import core as legacy_viewer
 
+initialize_sentry(
+    "viewer",
+    integrations=[
+        StarletteIntegration(),
+        FastApiIntegration(),
+    ],
+)
 logger = get_logger("viewer")
 AGENT_CONVERT_PROVIDER_NAMES: tuple[str, ...] = ("nim", "copilot_sdk")
 

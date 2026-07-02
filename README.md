@@ -143,6 +143,17 @@ tests/               — Test suite
 | `TRADING_DATA_DIR` | `./data` | Legacy fallback if `DATA_DIR` is unset |
 | `LOG_DIR` | `./logs` | Log file directory |
 | `LOG_LEVEL` | `INFO` | Logging level |
+| `SENTRY_DSN` | — | Sentry project DSN. Empty disables Sentry unless `SENTRY_ENABLED=true` |
+| `SENTRY_ENABLED` | auto | Optional override. Defaults to enabled when `SENTRY_DSN` is present |
+| `SENTRY_ENVIRONMENT` | `local` | Sentry environment name |
+| `SENTRY_RELEASE` | auto | Sentry release. Defaults to package version plus git SHA when available |
+| `SENTRY_SAMPLE_RATE` | `1.0` | Error event sample rate from `0.0` to `1.0` |
+| `SENTRY_TRACES_SAMPLE_RATE` | — | Optional performance trace sample rate from `0.0` to `1.0` |
+| `SENTRY_PROFILES_SAMPLE_RATE` | `0.0` | Optional profile sample rate from `0.0` to `1.0` |
+| `SENTRY_SEND_DEFAULT_PII` | `false` | Include default personally identifiable request data in Sentry events |
+| `SENTRY_ENABLE_LOGS` | `true` | Send SDK log records to Sentry |
+| `SENTRY_DEBUG` | `false` | Enable Sentry SDK debug logging |
+| `SENTRY_ATTACH_STACKTRACE` | `true` | Attach stacktraces to captured events |
 | `UVICORN_HOST` | `0.0.0.0` | Recommended host for `python -m uvicorn viewer.main:app` |
 | `UVICORN_PORT` | `5556` | Recommended port for `python -m uvicorn viewer.main:app` |
 | `NVIDIA_API_KEY` | — | API key for the Strategy Lab auto-conversion agent via NVIDIA NIM |

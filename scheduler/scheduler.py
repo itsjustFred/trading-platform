@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from datetime import datetime, timezone
 from typing import Awaitable, Callable
 
@@ -11,6 +12,7 @@ from scheduler.jobs.weekly_data_refresh import run as run_weekly_data_refresh
 from shared.database import list_services, update_service_status, upsert_background_task_record
 from shared.logging import get_logger
 from shared.models import Service, ServiceStatus, ServiceType
+from shared.sentry import capture_exception
 
 logger = get_logger("scheduler")
 
@@ -228,6 +230,17 @@ class ServiceScheduler:
                 last_activity=finished,
             )
         except Exception as exc:
+            with contextlib.suppress(Exception):
+                capture_exception(
+                    exc,
+                    service_name="scheduler",
+                    context={
+                        "service_id": service_id,
+                        "service_name": service_name,
+                        "job_type": job_type,
+                        "task_id": task_id,
+                    },
+                )
             failed_at = datetime.now(timezone.utc)
             failed_config = dict(base_config)
             failed_config.update(

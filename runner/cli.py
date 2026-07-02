@@ -33,8 +33,10 @@ from shared.constants import DATA_DIR, normalize_timeframe
 from shared.database import save_result_to_sqlite
 from shared.logging import get_logger
 from shared.models import StrategyType
+from shared.sentry import initialize_sentry
 from shared.strategy_registry import detect_strategy_type
 
+initialize_sentry("runner")
 logger = get_logger("runner")
 
 BACKTESTS_DIR = DATA_DIR / "backtests"
