@@ -241,21 +241,22 @@ def optimize_portfolio_allocation(
         # Normalize to sum=1
         weights = np.array(weights_raw)
         weights = weights / weights.sum()
-        
+
         # Portfolio metrics
         sharpe, max_dd = _portfolio_sharpe_from_weights(weights, equity_matrix)
-        
-        # Correlation penalty: encourage negative correlation off-diagonal
+
+        # Correlation penalty: encourage negative correlation off-diagonal / minimize positive correlation
         corr_matrix = _compute_correlation_matrix(returns)
         avg_off_diag = 0.0
         n = corr_matrix.shape[0]
         if n > 1:
             off_diag_sum = corr_matrix.sum() - np.trace(corr_matrix)
             avg_off_diag = off_diag_sum / (n * n - n)
-        
-        # Objective: maximize Sharpe, minimize positive correlation, maximize negative drawdown
-        score = sharpe + (5.0 * avg_off_diag) - (3.0 * max(0, max_dd - 0.3))
-        
+
+        # Objective: maximize Sharpe, minimize positive correlation, penalize excessive drawdown
+        # Note: avg_off_diag > 0 means positive correlation (bad for diversification), so we SUBTRACT it
+        score = sharpe - (5.0 * avg_off_diag) - (3.0 * max(0, max_dd - 0.3))
+
         trial.report(sharpe, trial.number)
         return -score  # Minimize negative score
     

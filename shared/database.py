@@ -325,6 +325,19 @@ class LiveSignalModel(SQLModel, table=True):
 
     @classmethod
     def from_live_signal(cls, signal: LiveSignal) -> "LiveSignalModel":
+        discord_msg_id = signal.metadata.get("discord_message_id")
+        # Normalize: keep None as None (real SQL NULL), convert empty/whitespace to None
+        if discord_msg_id is not None:
+            discord_msg_id = str(discord_msg_id).strip()
+            if not discord_msg_id:
+                discord_msg_id = None
+
+        broker_order_id = signal.metadata.get("broker_order_id")
+        if broker_order_id is not None:
+            broker_order_id = str(broker_order_id).strip()
+            if not broker_order_id:
+                broker_order_id = ""
+
         return cls(
             id=str(signal.id),
             deployment_id=signal.deployment_id,
@@ -333,8 +346,8 @@ class LiveSignalModel(SQLModel, table=True):
             theoretical_price=signal.theoretical_price,
             timestamp=signal.timestamp,
             source=str(signal.metadata.get("source", "internal")),
-            broker_order_id=str(signal.metadata.get("broker_order_id") or ""),
-            discord_message_id=str(signal.metadata.get("discord_message_id") or None),
+            broker_order_id=broker_order_id or "",
+            discord_message_id=discord_msg_id,
             metadata_json=signal.metadata,
         )
 
@@ -943,9 +956,25 @@ def save_live_signal(signal: LiveSignal) -> None:
                 .limit(1)
             ).first()
             if existing is not None:
-                logger.info(
-                    "Skipping duplicate live signal (discord_message_id=%s)", discord_msg_id
-                )
+                # Reconcile broker_order_id: if existing lacks it but new record has it, update
+                new_broker_id = (record.broker_order_id or "").strip()
+                existing_broker_id = (existing.broker_order_id or "").strip()
+                if new_broker_id and not existing_broker_id:
+                    existing.broker_order_id = new_broker_id
+                    # Also update metadata_json for consistency
+                    metadata = dict(existing.metadata_json or {})
+                    metadata["broker_order_id"] = new_broker_id
+                    existing.metadata_json = metadata
+                    session.add(existing)
+                    session.commit()
+                    logger.info(
+                        "Updated existing live signal with broker_order_id (discord_message_id=%s)",
+                        discord_msg_id,
+                    )
+                else:
+                    logger.info(
+                        "Skipping duplicate live signal (discord_message_id=%s)", discord_msg_id
+                    )
                 return
         session.add(record)
         session.commit()
