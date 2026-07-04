@@ -9,6 +9,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+from uuid import uuid4
 
 from runner.cli import get_engine
 from runner.engines.base import BacktestConfig
@@ -92,7 +93,8 @@ def run_strategy_grid(
     # Save grid results
     GRID_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     now = datetime.now(timezone.utc)
-    grid_id = f"grid_{strategy_slug}_{now.strftime('%Y%m%d_%H%M%S')}"
+    # Use microseconds + UUID to avoid collisions in parallel runs
+    grid_id = f"grid_{strategy_slug}_{now.strftime('%Y%m%d_%H%M%S_%f')}_{uuid4().hex[:8]}"
     output_path = GRID_RESULTS_DIR / f"{grid_id}.json"
 
     payload = {

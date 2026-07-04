@@ -117,39 +117,65 @@ def _load_strategy_equity(backtest_id: str) -> list[StrategyEquityPoint]:
 
 
 def _align_equity_curves(
-    curves: list[list[StrategyEquityPoint]]
+    curves: list[list[StrategyEquityPoint]],
+    require_overlap: bool = False,
 ) -> np.ndarray:
-    """Align equity curves to common timestamps, return as 2D array."""
+    """Align equity curves to common timestamps, return as 2D array.
+    
+    Args:
+        curves: List of equity curves for each strategy
+        require_overlap: If True, only use timestamps present in ALL curves (overlap window).
+                         If False (default), use union of all timestamps with forward-fill.
+    """
     if not curves:
         return np.array([]).reshape(0, 0)
     
-    # Find common time range
-    all_times = set()
-    for curve in curves:
-        for pt in curve:
-            all_times.add(pt.time)
-    sorted_times = sorted(all_times)
+    if require_overlap:
+        # Find timestamps present in ALL curves (intersection)
+        common_times = None
+        for curve in curves:
+            curve_times = {pt.time for pt in curve}
+            if common_times is None:
+                common_times = curve_times
+            else:
+                common_times &= curve_times
+        sorted_times = sorted(common_times) if common_times else []
+    else:
+        # Find all unique timestamps across all curves (union)
+        all_times = set()
+        for curve in curves:
+            for pt in curve:
+                all_times.add(pt.time)
+        sorted_times = sorted(all_times)
     
     n_points = len(sorted_times)
     n_strategies = len(curves)
     aligned = np.zeros((n_points, n_strategies))
     
+    if n_points == 0:
+        return aligned
+    
     for col, curve in enumerate(curves):
         equity_values = {}
         for pt in curve:
             equity_values[pt.time] = pt.equity
-
-        # Fill values, forward-fill missing values. Start from the first known
-        # point for this strategy so missing leading days do not create a bogus
-        # zero-equity row and an artificial return spike.
-        last_val: float | None = None
-        first_valid = next((pt.equity for pt in curve if pt.equity), None)
-        if first_valid is None:
-            first_valid = 0.0
-        for row, t in enumerate(sorted_times):
-            if t in equity_values:
-                last_val = equity_values[t]
-            aligned[row, col] = first_valid if last_val is None else last_val
+        
+        if require_overlap:
+            # No forward-fill needed in overlap window - all timestamps exist
+            for row, t in enumerate(sorted_times):
+                aligned[row, col] = equity_values.get(t, 0.0)
+        else:
+            # Fill values, forward-fill missing values. Start from the first known
+            # point for this strategy so missing leading days do not create a bogus
+            # zero-equity row and an artificial return spike.
+            last_val: float | None = None
+            first_valid = next((pt.equity for pt in curve if pt.equity), None)
+            if first_valid is None:
+                first_valid = 0.0
+            for row, t in enumerate(sorted_times):
+                if t in equity_values:
+                    last_val = equity_values[t]
+                aligned[row, col] = first_valid if last_val is None else last_val
     
     return aligned
 
@@ -220,45 +246,49 @@ def optimize_portfolio_allocation(
     
     # Use train curves if available, otherwise all curves
     curves_to_optimize = train_curves if train_curves else curves
-    equity_matrix = _align_equity_curves(curves_to_optimize)
-    
+    equity_matrix = _align_equity_curves(curves_to_optimize, require_overlap=True)
+
     if equity_matrix.size == 0 or equity_matrix.shape[1] < 2:
         return {
             "status": "error",
-            "message": "Need at least 2 valid backtest equity curves",
+            "message": "Need at least 2 valid backtest equity curves with overlapping timestamps",
             "backtest_ids": backtest_ids,
         }
-    
+
     # Compute returns for correlation
     returns = np.diff(equity_matrix, axis=0)
-    
+
     def objective(trial: optuna.Trial) -> float:
-        # Sample weights (softmax later)
-        weights_raw = [
-            trial.suggest_float(f"weight_{i}", 0.0, 1.0)
-            for i in range(len(backtest_ids))
-        ]
-        # Normalize to sum=1
-        weights = np.array(weights_raw)
-        weights = weights / weights.sum()
+            # Sample weights (softmax later)
+            weights_raw = [
+                trial.suggest_float(f"weight_{i}", 0.0, 1.0)
+                for i in range(len(backtest_ids))
+            ]
+            # Normalize to sum=1
+            weights = np.array(weights_raw)
+            w_sum = weights.sum()
+            if not np.isfinite(w_sum) or w_sum <= 0:
+                # All weights are zero - trial should be pruned
+                raise optuna.TrialPruned("All weights are zero")
+            weights = weights / w_sum
 
-        # Portfolio metrics
-        sharpe, max_dd = _portfolio_sharpe_from_weights(weights, equity_matrix)
+            # Portfolio metrics
+            sharpe, max_dd = _portfolio_sharpe_from_weights(weights, equity_matrix)
 
-        # Correlation penalty: encourage negative correlation off-diagonal / minimize positive correlation
-        corr_matrix = _compute_correlation_matrix(returns)
-        avg_off_diag = 0.0
-        n = corr_matrix.shape[0]
-        if n > 1:
-            off_diag_sum = corr_matrix.sum() - np.trace(corr_matrix)
-            avg_off_diag = off_diag_sum / (n * n - n)
+            # Correlation penalty: encourage negative correlation off-diagonal / minimize positive correlation
+            corr_matrix = _compute_correlation_matrix(returns)
+            avg_off_diag = 0.0
+            n = corr_matrix.shape[0]
+            if n > 1:
+                off_diag_sum = corr_matrix.sum() - np.trace(corr_matrix)
+                avg_off_diag = off_diag_sum / (n * n - n)
 
-        # Objective: maximize Sharpe, minimize positive correlation, penalize excessive drawdown
-        # Note: avg_off_diag > 0 means positive correlation (bad for diversification), so we SUBTRACT it
-        score = sharpe - (5.0 * avg_off_diag) - (3.0 * max(0, max_dd - 0.3))
+            # Objective: maximize Sharpe, minimize positive correlation, penalize excessive drawdown
+            # Note: avg_off_diag > 0 means positive correlation (bad for diversification), so we SUBTRACT it
+            score = sharpe - (5.0 * avg_off_diag) - (3.0 * max(0, max_dd - 0.3))
 
-        trial.report(sharpe, trial.number)
-        return -score  # Minimize negative score
+            trial.report(sharpe, trial.number)
+            return -score  # Minimize negative score
     
     study = optuna.create_study(direction="minimize")
     
@@ -270,19 +300,23 @@ def optimize_portfolio_allocation(
     # Extract best weights
     best_raw = [study.best_trial._params[f"weight_{i}"] for i in range(len(backtest_ids))]
     best_weights = np.array(best_raw)
-    best_weights = best_weights / best_weights.sum()
-    
+    w_sum = best_weights.sum()
+    if not np.isfinite(w_sum) or w_sum <= 0:
+        best_weights = np.ones(len(backtest_ids)) / len(backtest_ids)
+    else:
+        best_weights = best_weights / w_sum
+
     sharpe, max_dd = _portfolio_sharpe_from_weights(best_weights, equity_matrix)
     corr_matrix = _compute_correlation_matrix(returns)
-    
+
     # Compute OOS Sharpe if test curves available
     oos_sharpe: float | None = None
     oos_max_dd: float | None = None
     if test_curves:
-        oos_equity_matrix = _align_equity_curves(test_curves)
+        oos_equity_matrix = _align_equity_curves(test_curves, require_overlap=True)
         if oos_equity_matrix.size > 0 and oos_equity_matrix.shape[1] >= 2:
             oos_sharpe, oos_max_dd = _portfolio_sharpe_from_weights(best_weights, oos_equity_matrix)
-    
+
     # Save optimization
     now = datetime.now(timezone.utc)
     opt_id = f"portfolio_{len(backtest_ids)}strat_{now.strftime('%Y%m%d_%H%M%S')}"

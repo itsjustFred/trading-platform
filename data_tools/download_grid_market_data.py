@@ -30,7 +30,7 @@ from data_tools.resample import resample_file
 from shared.constants import DATA_DIR, normalize_timeframe
 
 DEFAULT_SYMBOLS = ["XAUUSD", "SP500", "NAS100", "EURUSD", "USDJPY", "OIL"]
-DEFAULT_TIMEFRAMES = ["1m", "5m", "15m", "1h", "4h", "1d"]
+DEFAULT_TIMEFRAMES = ["1m", "5m", "15m", "30m", "1h", "4h", "1d"]
 DEFAULT_START = "2020-01-01"
 CANONICAL_SYMBOLS = {
     "SP500": "US500",
@@ -145,6 +145,8 @@ def ensure_alias_copy(canonical_path: Path, requested_symbol: str, asset_class: 
     return alias_path
 
 
+VALID_TIMEFRAMES = {"1m", "5m", "15m", "30m", "1h", "4h", "1d"}
+
 def download_symbol(
     *,
     requested_symbol: str,
@@ -159,12 +161,27 @@ def download_symbol(
     pause_ms: int,
     force: bool,
 ) -> dict[str, Any]:
+    # Validate timeframes early - fail fast per symbol/tf
+    invalid_timeframes = [tf for tf in timeframes if tf not in VALID_TIMEFRAMES]
+    if invalid_timeframes:
+        return {
+            "symbol": requested_symbol,
+            "canonical_symbol": canonical_symbol,
+            "asset_class": symbol_asset_class(canonical_symbol),
+            "requested_timeframes": timeframes,
+            "source": "dukascopy",
+            "status": "failed",
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "paths": {},
+            "error": f"Invalid timeframes: {invalid_timeframes}. Valid: {sorted(VALID_TIMEFRAMES)}",
+        }
+
     downloader = DukascopyNativeDownloader()
     asset_class = symbol_asset_class(canonical_symbol)
     canonical_dir = output_dir / "ohlcv" / "dukascopy" / asset_class / canonical_symbol
     requested_dir = output_dir / "ohlcv" / "dukascopy" / asset_class / requested_symbol
     source_path = canonical_dir / "1m.parquet"
-    requested_timeframes = sorted(set(timeframes), key=lambda tf: ["1m", "5m", "15m", "1h", "4h", "1d"].index(tf))
+    requested_timeframes = sorted(set(timeframes), key=lambda tf: ["1m", "5m", "15m", "30m", "1h", "4h", "1d"].index(tf))
     higher_timeframes = [tf for tf in requested_timeframes if tf != "1m"]
 
     started_at = datetime.now(timezone.utc).isoformat()

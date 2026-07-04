@@ -931,6 +931,46 @@ def _migrate_schema() -> None:
         if backtest_column_names and "equity_curve" not in backtest_column_names:
             connection.execute(text("ALTER TABLE backtests ADD COLUMN equity_curve TEXT DEFAULT '[]'"))
 
+        # Backfill equity_curve for existing backtests with empty equity_curve
+        if backtest_column_names and "equity_curve" in backtest_column_names:
+            backtests_to_fill = connection.execute(
+                text("SELECT id, equity_curve FROM backtests WHERE equity_curve IS NULL OR equity_curve = '[]' OR equity_curve = ''")
+            ).fetchall()
+            for row in backtests_to_fill:
+                bt_id, eq_curve = row
+                if eq_curve and eq_curve != '[]':
+                    try:
+                        import json
+                        eq_list = json.loads(eq_curve)
+                        if eq_list:
+                            connection.execute(
+                                text("UPDATE backtests SET equity_curve = :eq WHERE id = :id"),
+                                {"eq": json.dumps(eq_list), "id": bt_id},
+                            )
+                    except Exception:
+                        pass  # Skip invalid JSON
+
+        # Backfill discord_message_id from metadata for existing live_signals
+        live_signal_column_names = _table_column_names(connection, "live_signals")
+        if live_signal_column_names and "discord_message_id" in live_signal_column_names:
+            signals_to_fill = connection.execute(
+                text("SELECT id, metadata FROM live_signals WHERE discord_message_id IS NULL OR discord_message_id = ''")
+            ).fetchall()
+            for row in signals_to_fill:
+                sig_id, meta_json = row
+                if meta_json:
+                    try:
+                        import json
+                        meta = json.loads(meta_json)
+                        discord_msg_id = meta.get("discord_message_id")
+                        if discord_msg_id:
+                            connection.execute(
+                                text("UPDATE live_signals SET discord_message_id = :dmid WHERE id = :id"),
+                                {"dmid": str(discord_msg_id), "id": sig_id},
+                            )
+                    except Exception:
+                        pass  # Skip invalid JSON
+
         execution_column_names = _table_column_names(connection, "live_executions")
         if execution_column_names and "dedupe_key" not in execution_column_names:
             connection.execute(text("ALTER TABLE live_executions ADD COLUMN dedupe_key TEXT"))

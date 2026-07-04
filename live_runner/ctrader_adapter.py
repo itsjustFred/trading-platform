@@ -126,6 +126,11 @@ def _write_env_key(path: Path, key: str, value: str) -> None:
     else:
         lines.append(replacement)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    # Harden file permissions: tokens grant full trading access
+    path.chmod(0o600)
+    # Ensure parent directory is also private
+    if path.parent.exists():
+        path.parent.chmod(0o700)
 
 
 def _ensure_asyncio_twisted_reactor(loop: asyncio.AbstractEventLoop) -> None:
