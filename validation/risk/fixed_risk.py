@@ -86,7 +86,7 @@ class FixedRiskModel:
 
         if self.config.round_lots and self.config.lot_size > 0:
             position_size = (
-                round(position_size / self.config.lot_size) * self.config.lot_size
+                math.floor(position_size / self.config.lot_size) * self.config.lot_size
             )
 
         if position_size < self.config.min_position_size:

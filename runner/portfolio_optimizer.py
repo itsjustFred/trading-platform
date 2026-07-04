@@ -248,11 +248,23 @@ def optimize_portfolio_allocation(
     curves_to_optimize = train_curves if train_curves else curves
     equity_matrix = _align_equity_curves(curves_to_optimize, require_overlap=True)
 
+    # Weight sum guard: ensure we have valid, non-zero weight capacity
     if equity_matrix.size == 0 or equity_matrix.shape[1] < 2:
         return {
             "status": "error",
             "message": "Need at least 2 valid backtest equity curves with overlapping timestamps",
             "backtest_ids": backtest_ids,
+        }
+
+    # Overlap alignment validation: warn if insufficient common timestamps
+    n_points = equity_matrix.shape[0]
+    n_strategies = equity_matrix.shape[1]
+    if n_points < 10:
+        return {
+            "status": "error",
+            "message": f"Insufficient overlap: only {n_points} common timestamps across {n_strategies} strategies (need >= 10)",
+            "backtest_ids": backtest_ids,
+            "overlap_points": n_points,
         }
 
     # Compute returns for correlation

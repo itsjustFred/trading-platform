@@ -71,13 +71,17 @@ for label, key in _STAT_LABELS:
 class MT5XLSXImporter(BaseImporter):
     """Import MT5 Strategy Tester XLSX reports (German UI)."""
 
-    def load(self, source: str | Path, **kwargs: Any) -> ValidationReference:
+    def load(self, source: str | Path, source_timezone: str | None = None, **kwargs: Any) -> ValidationReference:
         """Read an MT5 XLSX report and return a ``ValidationReference``.
 
         Parameters
         ----------
         source:
             Path to the ``.xlsx`` file.
+        source_timezone:
+            Optional IANA timezone name (e.g. "Europe/Athens") of the report's timestamps.
+            If provided, naive timestamps will be interpreted in this timezone and
+            converted to UTC. Defaults to UTC if not provided.
         **kwargs:
             Forwarded to ``pandas.read_excel`` (e.g. ``engine``).
         """
@@ -103,13 +107,13 @@ class MT5XLSXImporter(BaseImporter):
         stats = self._parse_stats(rows, orders_header_idx)
         raw_metadata = {"parsed_meta": meta, "parsed_stats": stats}
 
-        # Parse Orders table for SL/TP lookup (stops before Trades section)
+        # Parse Orders table for SL/TP from Orders table
         orders_df = self._extract_table(df_raw, orders_header_idx, end_idx=trades_header_idx)
         sltp_map = self._build_sltp_map(orders_df)
 
-        # Parse Trades / Deals table (goes to end of sheet)
+        # Parse Trades / Deals table
         trades_df = self._extract_table(df_raw, trades_header_idx, end_idx=None)
-        trades = self._build_trades(trades_df, sltp_map)
+        trades = self._build_trades(trades_df, sltp_map, source_timezone)
 
         return ValidationReference(
             strategy_name=meta.get("strategy_name", "unknown"),
@@ -404,7 +408,11 @@ class MT5XLSXImporter(BaseImporter):
     # ── trade reconstruction ──────────────────────────────────────────────
 
     @staticmethod
-    def _build_trades(trades_df: pd.DataFrame, sltp_map: dict[Any, dict[str, float | None]]) -> list[Trade]:
+    def _build_trades(
+        trades_df: pd.DataFrame,
+        sltp_map: dict[Any, dict[str, float | None]],
+        source_timezone: str | None = None,
+    ) -> list[Trade]:
         if trades_df.empty:
             return []
 
@@ -501,7 +509,7 @@ class MT5XLSXImporter(BaseImporter):
                 tp = mapped.get("tp")
 
             exit_obj = TradeExit(
-                time=MT5XLSXImporter._to_iso(exit_time_raw),
+                time=MT5XLSXImporter._to_iso(exit_time_raw, source_timezone),
                 price=exit_price,
                 quantity=volume if volume is not None else 0.0,
                 pnl=pnl,
@@ -513,7 +521,7 @@ class MT5XLSXImporter(BaseImporter):
                 id=trade_id_counter,
                 symbol=symbol,
                 direction=direction_str,
-                entry_time=MT5XLSXImporter._to_iso(entry_time_raw),
+                entry_time=MT5XLSXImporter._to_iso(entry_time_raw, source_timezone),
                 entry_price=entry_price if entry_price is not None else 0.0,
                 quantity=volume if volume is not None else 0.0,
                 exits=[exit_obj],
@@ -555,13 +563,19 @@ class MT5XLSXImporter(BaseImporter):
             return default
 
     @staticmethod
-    def _to_iso(raw: str) -> str:
+    def _to_iso(raw: str, source_tz: str | None = None) -> str:
         """Convert MT5 datetime string to ISO-8601 UTC string."""
         text = raw.strip() if raw else ""
         for fmt in ("%Y.%m.%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
             try:
                 dt = datetime.strptime(text, fmt)
-                dt = dt.replace(tzinfo=timezone.utc)
+                if source_tz:
+                    import zoneinfo
+                    tz = zoneinfo.ZoneInfo(source_tz)
+                    dt = dt.replace(tzinfo=tz)
+                    dt = dt.astimezone(timezone.utc)
+                else:
+                    dt = dt.replace(tzinfo=timezone.utc)
                 return dt.isoformat().replace("+00:00", "Z")
             except ValueError:
                 continue

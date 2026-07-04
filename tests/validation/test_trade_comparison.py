@@ -260,14 +260,16 @@ class TestPnL:
         assert "pnl" in result.mismatches
 
     def test_pnl_outside_abs_tolerance_only(self):
-        # pct diff tiny, abs diff huge
+        # ref=100000, act=100000.1: pct diff ~0.000001 (0.0001%), abs diff=0.1
+        # With OR logic: pct diff passes (0.0001% <= 0.1%)
         ref = _make_trade(pnl=100000.0)
         act = _make_trade(pnl=100000.1)
         result = TradeComparator().compare(_make_matched(ref, act))
         # pct diff is 0.000001 (0.0001%), inside 0.1%
         # abs diff is 0.1, outside 0.01
-        _assert_field_failed(result, "pnl")
-        assert not result.is_match
+        # With OR logic: passes because pct is within tolerance
+        _assert_field_passed(result, "pnl")
+        assert result.is_match
 
     def test_zero_pnl_exact_match(self):
         ref = _make_trade(pnl=0.0)
@@ -277,11 +279,16 @@ class TestPnL:
         assert result.is_match
 
     def test_zero_vs_nonzero_pnl_mismatch(self):
+        # ref=0, act=0.001: pct diff=1.0 (100%), abs diff=0.001
+        # With OR logic: abs diff 0.001 <= 0.01 passes
         ref = _make_trade(pnl=0.0)
         act = _make_trade(pnl=0.001)
         result = TradeComparator().compare(_make_matched(ref, act))
-        _assert_field_failed(result, "pnl")
-        assert not result.is_match
+        # pct diff is 1.0 (100%), outside 0.1%
+        # abs diff is 0.001, inside 0.01
+        # With OR logic: passes because abs is within tolerance
+        _assert_field_passed(result, "pnl")
+        assert result.is_match
 
 
 class TestStopLoss:

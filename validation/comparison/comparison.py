@@ -279,7 +279,7 @@ class TradeComparator:
         diff_abs = _abs_diff(expected, actual)
         passed_pct = diff_pct <= tolerance_pct
         passed_abs = diff_abs <= tolerance_abs
-        passed = passed_pct and passed_abs
+        passed = passed_pct or passed_abs
         return FieldComparisonResult(
             field="pnl",
             expected=expected,

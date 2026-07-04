@@ -199,7 +199,15 @@ class TestDirectionError:
             field_deltas=[price_fd, dir_fd],
         )
         report = _make_delta_report(matched=[delta])
-        result = ReadinessValidator.validate(report=report)
+        regression = _make_regression_result(passed=True)
+        risk = _make_risk_report()
+        stats = (_make_stats(), _make_stats())
+        result = ReadinessValidator.validate(
+            report=report,
+            regression=regression,
+            risk_report=risk,
+            stats=stats,
+        )
 
         assert result.level == PaperReadinessLevel.NOT_READY
         assert result.passed is False
@@ -216,7 +224,15 @@ class TestPnlError:
             field_deltas=[pnl_fd],
         )
         report = _make_delta_report(matched=[delta])
-        result = ReadinessValidator.validate(report=report)
+        regression = _make_regression_result(passed=True)
+        risk = _make_risk_report()
+        stats = (_make_stats(), _make_stats())
+        result = ReadinessValidator.validate(
+            report=report,
+            regression=regression,
+            risk_report=risk,
+            stats=stats,
+        )
 
         assert result.level == PaperReadinessLevel.NOT_READY
         assert result.passed is False
@@ -228,8 +244,17 @@ class TestMissingTrades:
         """Missing trades within threshold produce a warning, not an error."""
         missing = _make_trade_delta(severity="warning", anomaly_type="missing")
         report = _make_delta_report(missing=[missing])
+        regression = _make_regression_result(passed=True)
+        risk = _make_risk_report()
+        stats = (_make_stats(), _make_stats())
         config = ReadinessConfig(max_missing_trades=2)
-        result = ReadinessValidator.validate(report=report, config=config)
+        result = ReadinessValidator.validate(
+            report=report,
+            regression=regression,
+            risk_report=risk,
+            stats=stats,
+            config=config,
+        )
 
         missing_check = next(c for c in result.checks if c.name == "missing_trades")
         assert missing_check.passed is True
@@ -242,8 +267,17 @@ class TestMissingTrades:
         missing1 = _make_trade_delta(severity="warning", anomaly_type="missing", trade_id="1")
         missing2 = _make_trade_delta(severity="warning", anomaly_type="missing", trade_id="2")
         report = _make_delta_report(missing=[missing1, missing2])
+        regression = _make_regression_result(passed=True)
+        risk = _make_risk_report()
+        stats = (_make_stats(), _make_stats())
         config = ReadinessConfig(max_missing_trades=1)
-        result = ReadinessValidator.validate(report=report, config=config)
+        result = ReadinessValidator.validate(
+            report=report,
+            regression=regression,
+            risk_report=risk,
+            stats=stats,
+            config=config,
+        )
 
         missing_check = next(c for c in result.checks if c.name == "missing_trades")
         assert missing_check.passed is False
@@ -262,7 +296,15 @@ class TestPriceMismatch:
             field_deltas=[price_fd],
         )
         report = _make_delta_report(matched=[delta])
-        result = ReadinessValidator.validate(report=report)
+        regression = _make_regression_result(passed=True)
+        risk = _make_risk_report()
+        stats = (_make_stats(), _make_stats())
+        result = ReadinessValidator.validate(
+            report=report,
+            regression=regression,
+            risk_report=risk,
+            stats=stats,
+        )
 
         warn_check = next(c for c in result.checks if c.name == "trade_warnings")
         assert warn_check.passed is False
@@ -274,8 +316,17 @@ class TestRegression:
     def test_not_ready_on_regression_failure(self) -> None:
         """A failed regression with require_all_goldens_pass=True → NOT_READY."""
         regression = _make_regression_result(passed=False)
+        report = _make_delta_report()
+        risk = _make_risk_report()
+        stats = (_make_stats(), _make_stats())
         config = ReadinessConfig(require_all_goldens_pass=True)
-        result = ReadinessValidator.validate(regression=regression, config=config)
+        result = ReadinessValidator.validate(
+            report=report,
+            regression=regression,
+            risk_report=risk,
+            stats=stats,
+            config=config,
+        )
 
         reg_check = next(c for c in result.checks if c.name == "regression_status")
         assert reg_check.passed is False
@@ -288,8 +339,17 @@ class TestReadyWithWarnings:
         """Warnings but no errors → READY_WITH_WARNINGS."""
         missing = _make_trade_delta(severity="warning", anomaly_type="missing")
         report = _make_delta_report(missing=[missing])
+        regression = _make_regression_result(passed=True)
+        risk = _make_risk_report()
+        stats = (_make_stats(), _make_stats())
         config = ReadinessConfig(max_missing_trades=5)
-        result = ReadinessValidator.validate(report=report, config=config)
+        result = ReadinessValidator.validate(
+            report=report,
+            regression=regression,
+            risk_report=risk,
+            stats=stats,
+            config=config,
+        )
 
         assert result.level == PaperReadinessLevel.READY_WITH_WARNINGS
         assert result.passed is True
@@ -301,7 +361,15 @@ class TestRiskConsistency:
     def test_risk_consistency_pass(self) -> None:
         """Passing risk comparison → READY."""
         risk = _make_risk_report()
-        result = ReadinessValidator.validate(risk_report=risk)
+        report = _make_delta_report()
+        regression = _make_regression_result(passed=True)
+        stats = (_make_stats(), _make_stats())
+        result = ReadinessValidator.validate(
+            report=report,
+            regression=regression,
+            risk_report=risk,
+            stats=stats,
+        )
 
         ps_check = next(c for c in result.checks if c.name == "risk_position_size")
         sd_check = next(c for c in result.checks if c.name == "risk_stop_distance")
@@ -317,11 +385,20 @@ class TestRiskConsistency:
             stop_distance_passed=True,
         )
         risk = _make_risk_report(results=[risk_result])
+        report = _make_delta_report()
+        regression = _make_regression_result(passed=True)
+        stats = (_make_stats(), _make_stats())
         config = ReadinessConfig(
             max_position_size_diff_pct=0.001,
             max_stop_distance_diff_pct=1.0,
         )
-        result = ReadinessValidator.validate(risk_report=risk, config=config)
+        result = ReadinessValidator.validate(
+            report=report,
+            regression=regression,
+            risk_report=risk,
+            stats=stats,
+            config=config,
+        )
 
         ps_check = next(c for c in result.checks if c.name == "risk_position_size")
         assert ps_check.passed is False
@@ -333,7 +410,15 @@ class TestStatsConsistency:
     def test_stats_consistency_pass(self) -> None:
         """Identical stats → READY."""
         stats = (_make_stats(), _make_stats())
-        result = ReadinessValidator.validate(stats=stats)
+        report = _make_delta_report()
+        regression = _make_regression_result(passed=True)
+        risk = _make_risk_report()
+        result = ReadinessValidator.validate(
+            report=report,
+            regression=regression,
+            risk_report=risk,
+            stats=stats,
+        )
 
         wr_check = next(c for c in result.checks if c.name == "stats_win_rate")
         np_check = next(c for c in result.checks if c.name == "stats_net_profit")
@@ -346,8 +431,17 @@ class TestStatsConsistency:
         expected = _make_stats(win_rate=0.5)
         actual = _make_stats(win_rate=0.7)
         stats = (expected, actual)
+        report = _make_delta_report()
+        regression = _make_regression_result(passed=True)
+        risk = _make_risk_report()
         config = ReadinessConfig(stats_win_rate_tolerance_pct=0.01)
-        result = ReadinessValidator.validate(stats=stats, config=config)
+        result = ReadinessValidator.validate(
+            report=report,
+            regression=regression,
+            risk_report=risk,
+            stats=stats,
+            config=config,
+        )
 
         wr_check = next(c for c in result.checks if c.name == "stats_win_rate")
         assert wr_check.passed is False
@@ -360,8 +454,17 @@ class TestReportMeta:
         """Any non-trivial validation yields at least one recommendation."""
         missing = _make_trade_delta(severity="warning", anomaly_type="missing")
         report = _make_delta_report(missing=[missing])
+        regression = _make_regression_result(passed=True)
+        risk = _make_risk_report()
+        stats = (_make_stats(), _make_stats())
         config = ReadinessConfig(max_missing_trades=5)
-        result = ReadinessValidator.validate(report=report, config=config)
+        result = ReadinessValidator.validate(
+            report=report,
+            regression=regression,
+            risk_report=risk,
+            stats=stats,
+            config=config,
+        )
 
         assert len(result.recommendations) > 0
         assert any("warning" in r.lower() or "ready" in r.lower() for r in result.recommendations)
@@ -371,23 +474,49 @@ class TestReportMeta:
         # Error path
         err_delta = _make_trade_delta(severity="error", anomaly_type="mismatch")
         err_report = _make_delta_report(matched=[err_delta])
-        err_result = ReadinessValidator.validate(report=err_report)
+        regression = _make_regression_result(passed=True)
+        risk = _make_risk_report()
+        stats = (_make_stats(), _make_stats())
+        err_result = ReadinessValidator.validate(
+            report=err_report,
+            regression=regression,
+            risk_report=risk,
+            stats=stats,
+        )
         assert err_result.level == PaperReadinessLevel.NOT_READY
 
         # Warning path
         warn_delta = _make_trade_delta(severity="warning", anomaly_type="missing")
         warn_report = _make_delta_report(missing=[warn_delta])
         warn_config = ReadinessConfig(max_missing_trades=5)
-        warn_result = ReadinessValidator.validate(report=warn_report, config=warn_config)
+        warn_result = ReadinessValidator.validate(
+            report=warn_report,
+            regression=regression,
+            risk_report=risk,
+            stats=stats,
+            config=warn_config,
+        )
         assert warn_result.level == PaperReadinessLevel.READY_WITH_WARNINGS
 
         # Ready path
-        ready_result = ReadinessValidator.validate(report=_make_delta_report())
+        ready_result = ReadinessValidator.validate(
+            report=_make_delta_report(),
+            regression=regression,
+            risk_report=risk,
+            stats=stats,
+        )
         assert ready_result.level == PaperReadinessLevel.READY
 
     def test_empty_inputs(self) -> None:
-        """All optional inputs omitted → default checks pass with info severity."""
-        result = ReadinessValidator.validate()
+        """All optional inputs omitted → NOT_READY because required artifacts missing."""
+        # Empty inputs with default config (require all artifacts) should be NOT_READY
+        config = ReadinessConfig(
+            require_trade_report=False,
+            require_regression=False,
+            require_risk_report=False,
+            require_stats=False,
+        )
+        result = ReadinessValidator.validate(config=config)
 
         assert result.level == PaperReadinessLevel.READY
         assert result.passed is True
