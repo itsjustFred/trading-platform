@@ -1,90 +1,269 @@
-"""Tests for runner.daily_equity finite-value and frequency-metadata handling."""
+"""Tests for runner.daily_equity module."""
+
 from __future__ import annotations
 
-import math
+from datetime import datetime, timezone
 
-from runner.daily_equity import attach_daily_equity, build_daily_equity_curve
-from shared.models import BacktestMeta, BacktestResult, Trade, TradeExit
+import pytest
+
+from runner.daily_equity import build_daily_equity_curve, attach_daily_equity
+from shared.models import BacktestResult, BacktestMeta, EquityPoint, Trade, TradeExit
 
 
-def _make_result(trades: list[Trade], *, start: str, end: str) -> BacktestResult:
+def make_result(
+    trades=None,
+    equity_curve=None,
+    initial_capital=100000.0,
+    backtest_start="2024-01-01",
+    backtest_end="2024-02-01",
+):
+    """Helper to create a BacktestResult."""
     return BacktestResult(
         meta=BacktestMeta(
-            id="t",
-            created_at="2024-01-01T00:00:00+00:00",
-            engine="native",
-            strategies=["s"],
-            backtest_start=start,
-            backtest_end=end,
-            initial_capital=100000.0,
-            data={"symbols": ["SPY"], "timeframes": ["1d"]},
+            id="test",
+            created_at=datetime.now(timezone.utc).isoformat(),
+            engine="vectorbt",
+            strategies=["demo"],
+            initial_capital=initial_capital,
+            backtest_start=backtest_start,
+            backtest_end=backtest_end,
         ),
-        trades=trades,
-        equity_curve=[],
+        trades=trades or [],
+        equity_curve=equity_curve or [],
         stats={},
     )
 
 
-def _trade(exit_time: str, pnl: float) -> Trade:
+def make_trade(
+    entry_time="2024-01-15T10:00:00Z",
+    exit_time="2024-01-15T15:00:00Z",
+    pnl=500.0,
+    symbol="AAPL",
+    direction="LONG",
+):
+    """Helper to create a Trade."""
     return Trade(
         id=1,
-        symbol="SPY",
-        direction="LONG",
-        entry_time="2024-01-01T00:00:00+00:00",
-        entry_price=100.0,
-        quantity=1.0,
-        exits=[TradeExit(time=exit_time, price=101.0, quantity=1.0, pnl=pnl)],
+        symbol=symbol,
+        direction=direction,
+        entry_time=entry_time,
+        entry_price=150.0,
+        quantity=10.0,
+        exits=[TradeExit(time=exit_time, price=155.0, quantity=10.0, pnl=pnl)],
         pnl=pnl,
     )
 
 
-def test_non_finite_pnl_is_skipped():
-    result = _make_result(
-        [
-            _trade("2024-01-02T00:00:00+00:00", float("nan")),
-            _trade("2024-01-02T00:00:00+00:00", float("inf")),
-            _trade("2024-01-02T00:00:00+00:00", 500.0),
-        ],
-        start="2024-01-01",
-        end="2024-01-03",
-    )
-    points, returns = build_daily_equity_curve(result)
+class TestBuildDailyEquityCurve:
+    """Tests for build_daily_equity_curve function."""
 
-    # All equity points stay finite, and only the finite 500.0 PnL is applied.
-    assert all(math.isfinite(p.equity) for p in points)
-    assert all(math.isfinite(r["equity"]) and math.isfinite(r["return"]) for r in returns)
-    assert points[-1].equity == 100500.0
+    def test_empty_result(self):
+        """Test with no trades and no equity curve."""
+        result = make_result()
+        points, returns = build_daily_equity_curve(result)
+        assert points == []
+        assert returns == []
+
+    def test_no_trades_no_equity(self):
+        """Test with no trades but existing equity curve."""
+        result = make_result(
+            equity_curve=[
+                EquityPoint(time="2024-01-01T00:00:00+00:00", equity=100000.0),
+                EquityPoint(time="2024-01-02T00:00:00+00:00", equity=101000.0),
+            ]
+        )
+        points, returns = build_daily_equity_curve(result)
+        assert points == []
+        assert returns == []
+
+    def test_single_trade_single_day(self):
+        """Test single trade within one day."""
+        result = make_result(trades=[make_trade()])
+        points, returns = build_daily_equity_curve(result)
+
+        assert len(points) == 1
+        assert points[0].time == "2024-01-15T00:00:00+00:00"
+        assert points[0].equity == 100500.0
+        assert len(returns) == 1
+        assert returns[0]["date"] == "2024-01-15"
+        assert abs(returns[0]["return"] - 0.005) < 1e-10
+
+    def test_multiple_trades_same_day(self):
+        """Test multiple trades aggregated to same day."""
+        trade1 = make_trade(pnl=500.0)
+        trade2 = make_trade(pnl=300.0, exit_time="2024-01-15T16:00:00Z")
+        result = make_result(trades=[trade1, trade2])
+        points, returns = build_daily_equity_curve(result)
+
+        assert len(points) == 1
+        assert points[0].equity == 100800.0  # 100000 + 500 + 300
+
+    def test_trades_different_days(self):
+        """Test trades on different days create separate equity points."""
+        trade1 = make_trade(entry_time="2024-01-15T10:00:00Z", exit_time="2024-01-15T15:00:00Z", pnl=500.0)
+        trade2 = make_trade(entry_time="2024-01-16T10:00:00Z", exit_time="2024-01-16T15:00:00Z", pnl=300.0)
+        result = make_result(trades=[trade1, trade2])
+        points, returns = build_daily_equity_curve(result)
+
+        assert len(points) == 2
+        assert points[0].equity == 100500.0
+        assert points[1].equity == 100800.0
+        assert points[0].time == "2024-01-15T00:00:00+00:00"
+        assert points[1].time == "2024-01-16T00:00:00+00:00"
+
+    def test_trades_sorted_chronologically(self):
+        """Test that output is sorted by date regardless of trade order."""
+        trade1 = make_trade(entry_time="2024-01-16T10:00:00Z", exit_time="2024-01-16T15:00:00Z", pnl=300.0)
+        trade2 = make_trade(entry_time="2024-01-15T10:00:00Z", exit_time="2024-01-15T15:00:00Z", pnl=500.0)
+        result = make_result(trades=[trade1, trade2])
+        points, returns = build_daily_equity_curve(result)
+
+        assert points[0].time == "2024-01-15T00:00:00+00:00"
+        assert points[1].time == "2024-01-16T00:00:00+00:00"
+
+    def test_skips_non_finite_pnl(self):
+        """Test that non-finite PnL values are skipped."""
+        import math
+        trade1 = make_trade(pnl=500.0)
+        trade2 = Trade(
+            id=2, symbol="AAPL", direction="LONG",
+            entry_time="2024-01-15T10:00:00Z", entry_price=150.0, quantity=10.0,
+            exits=[TradeExit(time="2024-01-15T15:00:00Z", price=155.0, quantity=10.0, pnl=float("nan"))],
+            pnl=float("nan"),
+        )
+        trade3 = Trade(
+            id=3, symbol="AAPL", direction="LONG",
+            entry_time="2024-01-15T10:00:00Z", entry_price=150.0, quantity=10.0,
+            exits=[TradeExit(time="2024-01-15T15:00:00Z", price=155.0, quantity=10.0, pnl=float("inf"))],
+            pnl=float("inf"),
+        )
+        result = make_result(trades=[trade1, trade2, trade3])
+        points, returns = build_daily_equity_curve(result)
+
+        # Only trade1 should be counted
+        assert len(points) == 1
+        assert points[0].equity == 100500.0
+
+    def test_skips_trades_without_valid_exit_time(self):
+        """Test that trades with invalid exit times are skipped."""
+        trade1 = make_trade()
+        trade2 = Trade(
+            id=2, symbol="AAPL", direction="LONG",
+            entry_time="2024-01-15T10:00:00Z", entry_price=150.0, quantity=10.0,
+            exits=[TradeExit(time="invalid-time", price=155.0, quantity=10.0, pnl=300.0)],
+            pnl=300.0,
+        )
+        trade3 = Trade(
+            id=3, symbol="AAPL", direction="LONG",
+            entry_time="2024-01-15T10:00:00Z", entry_price=150.0, quantity=10.0,
+            exits=[],
+            pnl=200.0,
+        )
+        result = make_result(trades=[trade1, trade2, trade3])
+        points, returns = build_daily_equity_curve(result)
+
+        assert len(points) == 1
+        assert points[0].equity == 100500.0
+
+    def test_daily_return_calculation(self):
+        """Test daily return is calculated correctly."""
+        trade1 = make_trade(pnl=5000.0)  # 5% return
+        result = make_result(trades=[trade1])
+        points, returns = build_daily_equity_curve(result)
+
+        assert len(returns) == 1
+        assert abs(returns[0]["return"] - 0.05) < 1e-10
+        assert returns[0]["equity"] == 105000.0
 
 
-def test_attach_marks_frequency_daily_for_valid_window():
-    result = _make_result(
-        [_trade("2024-01-02T00:00:00+00:00", 250.0)],
-        start="2024-01-01",
-        end="2024-01-03",
-    )
-    attach_daily_equity(result)
-    assert result.meta.data["equity_frequency"] == "daily"
-    assert result.stats["daily_return_count"] > 0
+class TestAttachDailyEquity:
+    """Tests for attach_daily_equity function."""
+
+    def test_no_trades_no_equity_curve(self):
+        """Test with no trades and no equity curve."""
+        result = make_result()
+        attach_daily_equity(result)
+        assert result.meta.data["equity_frequency"] == "unknown"
+        assert result.stats["daily_return_count"] == 0
+
+    def test_trades_but_no_existing_equity_curve(self):
+        """Test building daily equity from trades when none exists."""
+        result = make_result(trades=[make_trade(pnl=500.0)])
+        attach_daily_equity(result)
+
+        assert result.meta.data["equity_frequency"] == "daily"
+        assert result.stats["daily_return_count"] == 1
+        assert len(result.equity_curve) == 1
+        assert result.equity_curve[0].equity == 100500.0
+
+    def test_preserves_existing_equity_curve_when_longer(self):
+        """Test that existing equity curve is preserved when it has more points."""
+        result = make_result(
+            trades=[make_trade(pnl=500.0)],
+            equity_curve=[
+                EquityPoint(time="2024-01-01T00:00:00+00:00", equity=100000.0),
+                EquityPoint(time="2024-01-10T00:00:00+00:00", equity=101000.0),
+                EquityPoint(time="2024-01-20T00:00:00+00:00", equity=102000.0),
+                EquityPoint(time="2024-02-01T00:00:00+00:00", equity=105000.0),
+            ]
+        )
+        attach_daily_equity(result)
+
+        # Should keep original 4-point curve, not replace with 1-point daily curve
+        assert len(result.equity_curve) == 4
+        assert result.equity_curve[0].equity == 100000.0
+        assert result.equity_curve[-1].equity == 105000.0
+        assert result.meta.data["equity_frequency"] == "daily"
+        assert result.stats["daily_return_count"] == 1
+
+    def test_replaces_equity_curve_when_daily_has_more_points(self):
+        """Test that daily curve replaces when it has more points."""
+        # Build a case where daily curve would have multiple points
+        trade1 = make_trade(
+            entry_time="2024-01-10T10:00:00Z", exit_time="2024-01-10T15:00:00Z", pnl=500.0
+        )
+        trade2 = make_trade(
+            entry_time="2024-01-15T10:00:00Z", exit_time="2024-01-15T15:00:00Z", pnl=300.0
+        )
+        trade3 = make_trade(
+            entry_time="2024-01-20T10:00:00Z", exit_time="2024-01-20T15:00:00Z", pnl=200.0
+        )
+        result = make_result(
+            trades=[trade1, trade2, trade3],
+            equity_curve=[
+                EquityPoint(time="2024-01-01T00:00:00+00:00", equity=100000.0),
+                EquityPoint(time="2024-02-01T00:00:00+00:00", equity=105000.0),
+            ]
+        )
+        attach_daily_equity(result)
+
+        # Daily curve has 3 points, original has 2 - should use daily
+        assert len(result.equity_curve) == 3
+        assert result.equity_curve[0].equity == 100500.0
+        assert result.equity_curve[1].equity == 100800.0
+        assert result.equity_curve[2].equity == 101000.0
+
+    def test_start_end_params_accepted(self):
+        """Test that start and end parameters are accepted."""
+        result = make_result(trades=[make_trade()])
+        # Should not raise
+        attach_daily_equity(result, start="2024-01-01", end="2024-02-01")
+        assert result.meta.data["equity_frequency"] == "daily"
+
+    def test_empty_trades_with_existing_equity_curve(self):
+        """Test with no trades but existing multi-point equity curve."""
+        result = make_result(
+            equity_curve=[
+                EquityPoint(time="2024-01-01T00:00:00+00:00", equity=100000.0),
+                EquityPoint(time="2024-01-02T00:00:00+00:00", equity=101000.0),
+            ]
+        )
+        attach_daily_equity(result)
+
+        # Should mark as daily since curve exists
+        assert result.meta.data["equity_frequency"] == "daily"
+        assert result.stats["daily_return_count"] == 0
 
 
-def test_attach_does_not_mislabel_fallback_as_daily():
-    # No usable window (no dates, no trades, no equity) -> fallback path must not
-    # claim the curve is daily.
-    result = BacktestResult(
-        meta=BacktestMeta(
-            id="t",
-            created_at="2024-01-01T00:00:00+00:00",
-            engine="native",
-            strategies=["s"],
-            backtest_start="",
-            backtest_end="",
-            initial_capital=100000.0,
-            data={"symbols": ["SPY"], "timeframes": ["1d"]},
-        ),
-        trades=[],
-        equity_curve=[],
-        stats={},
-    )
-    attach_daily_equity(result)
-    assert result.meta.data["equity_frequency"] == "unknown"
-    assert result.stats["daily_return_count"] == 0
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
