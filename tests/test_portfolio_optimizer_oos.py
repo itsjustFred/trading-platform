@@ -65,10 +65,14 @@ def test_split_equity_curves_basic() -> None:
         curves, train_months=12, test_months=3
     )
 
-    # Test period = last 3 months (months 15-18), but split point is max - 3months
-    # So with 18 points: 3 months from end means ts >= max - 3months goes to test
-    assert len(test_curves[0]) == 4  # Last 4 points (split point includes boundary)
-    assert len(train_curves[0]) == 14  # First 14 points
+    # Test period = last 3 months from end (max - 3 months = month 14)
+    # train_end_ts = min + 12 months = month 12
+    # With 18 points (months 0-17): 
+    #   train gets months 0-11 = 12 points (ts < month 12)
+    #   gap: months 12-13 = 2 points (excluded)
+    #   test gets months 14-17 = 4 points (ts >= month 14)
+    assert len(test_curves[0]) == 4  # Last 4 points (month 14-17)
+    assert len(train_curves[0]) == 12  # First 12 points (month 0-11)
 
 
 def test_split_equity_curves_empty() -> None:

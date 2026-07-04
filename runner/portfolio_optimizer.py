@@ -49,49 +49,60 @@ def _split_equity_curves_by_time(
     test_months: int | None,
 ) -> tuple[list[list[StrategyEquityPoint]], list[list[StrategyEquityPoint]]]:
     """Split equity curves into train (IS) and test (OOS) by time.
-    
+
     Args:
         curves: List of equity curves for each strategy
-        train_months: Currently unused - reserved for future walk-forward implementation.
+        train_months: Number of months for training period (from start). If None, use all data before test period.
         test_months: Number of months for testing period (from end). If None, no OOS split.
-    
+
     Returns:
         Tuple of (train_curves, test_curves). test_curves may be empty if test_months is None.
     """
     if not curves or test_months is None or test_months <= 0:
         return curves, []
-    
+
     # Find overall time range across all curves
     all_timestamps: list[float] = []
     for curve in curves:
         for pt in curve:
             ts = _parse_time_to_ts(pt.time)
             all_timestamps.append(ts)
-    
+
     if not all_timestamps:
         return curves, []
-    
+
+    min_ts = min(all_timestamps)
     max_ts = max(all_timestamps)
-    
-    # Calculate split point for test period
+
+    # Calculate split points
     seconds_per_month = 30 * 24 * 60 * 60
     test_start_ts = max_ts - (test_months * seconds_per_month)
-    
+
+    # If train_months specified, limit training data to first N months
+    if train_months is not None and train_months > 0:
+        train_end_ts = min_ts + (train_months * seconds_per_month)
+        # Ensure train period doesn't overlap with test period
+        if train_end_ts >= test_start_ts:
+            train_end_ts = test_start_ts
+    else:
+        train_end_ts = test_start_ts
+
     train_curves: list[list[StrategyEquityPoint]] = []
     test_curves: list[list[StrategyEquityPoint]] = []
-    
+
     for curve in curves:
         train_curve = []
         test_curve = []
         for pt in curve:
             ts = _parse_time_to_ts(pt.time)
-            if ts < test_start_ts:
+            if ts < train_end_ts:
                 train_curve.append(pt)
-            else:
+            elif ts >= test_start_ts:
                 test_curve.append(pt)
+            # Points between train_end_ts and test_start_ts are excluded (gap)
         train_curves.append(train_curve)
         test_curves.append(test_curve)
-    
+
     return train_curves, test_curves
 
 

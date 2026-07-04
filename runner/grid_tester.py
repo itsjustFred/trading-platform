@@ -133,9 +133,8 @@ if __name__ == "__main__":
     parser.add_argument("--start", required=True)
     parser.add_argument("--end", required=True)
     parser.add_argument("--engine", default="vectorbt")
-    parser.add_argument("--trials", type=int, default=100)
     args = parser.parse_args()
-    
+
     result = run_strategy_grid(
         args.strategy,
         args.symbols,
