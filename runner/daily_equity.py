@@ -103,6 +103,18 @@ def attach_daily_equity(
         result.stats["daily_return_count"] = 0
         return result
 
+    # Preserve existing equity_curve if it has more points than what we built
+    # (e.g., the engine already provided a full equity curve with multiple points)
+    if result.equity_curve and len(result.equity_curve) > len(daily_points):
+        # Keep the original curve, but update metadata
+        result.stats = result.stats or {}
+        result.stats["daily_return_count"] = len(daily_returns)
+        result.stats["daily_returns"] = daily_returns
+        result.meta.data = result.meta.data or {}
+        result.meta.data["equity_frequency"] = "daily"
+        result.meta.data["daily_return_count"] = len(daily_returns)
+        return result
+
     # Attach the daily equity curve
     result.equity_curve = daily_points
     result.stats = result.stats or {}

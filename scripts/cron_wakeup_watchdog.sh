@@ -50,28 +50,6 @@ PY
   else
     log 'could not inspect cron jobs for failed statuses'
   fi
-path = sys.argv[1]
-try:
-    with open(path, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-except Exception:
-    data = {}
-jobs = data.get('jobs', []) if isinstance(data, dict) else []
-for job in jobs:
-    if isinstance(job, dict) and job.get('enabled') and job.get('last_status') == 'error':
-        job_id = job.get('job_id')
-        if job_id:
-            print(job_id)
-PY
-  then
-    while read -r job_id; do
-      [ -n "$job_id" ] || continue
-      log "cron job $job_id last_status=error; restarting"
-      hermes cron run --accept-hooks "$job_id" >> "$LOG" 2>&1 || log "restart failed for $job_id"
-    done < /tmp/cron_failed_ids.txt
-  else
-    log 'could not inspect cron jobs for failed statuses'
-  fi
 
   if case "$gateway_status" in *"Gateway is running"*) true;; *) false;; esac; then
     printf '{"ok":true,"checked_at":"%s"}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$STATUS"

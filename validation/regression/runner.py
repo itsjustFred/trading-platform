@@ -300,8 +300,12 @@ def run_regression(
             raise ValueError(
                 "Golden file has no source_path; cannot re-import with importer."
             )
+        # Resolve source_path relative to golden file if it's relative
+        source_path = Path(golden_ref.source_path)
+        if not source_path.is_absolute():
+            source_path = (golden_path.parent / source_path).resolve()
         importer = importer_class()
-        current_ref = importer.load(golden_ref.source_path)
+        current_ref = importer.load(source_path)
     else:
         raise ValueError("Either importer_class or current_data must be provided.")
 
