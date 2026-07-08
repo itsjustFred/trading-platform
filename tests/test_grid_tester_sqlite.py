@@ -93,7 +93,7 @@ def test_run_strategy_grid_persists_to_sqlite(monkeypatch, tmp_path) -> None:
 def test_save_grid_result_to_sqlite() -> None:
     """Test saving grid result to SQLite database."""
     init_db()
-    
+
     payload = {
         "id": f"test_grid_sqlite_save_{datetime.now(timezone.utc).strftime('%H%M%S')}",
         "strategy": "example_sma",
@@ -111,14 +111,14 @@ def test_save_grid_result_to_sqlite() -> None:
         },
         "engine": "vectorbt",
     }
-    
+
     save_grid_result_to_sqlite(payload)
-    
+
     # Verify it was saved
     results = get_grid_results(limit=100)
     grid_id = payload["id"]
     saved = [r for r in results if r["id"] == grid_id]
-    
+
     assert len(saved) == 1, f"Grid result {grid_id} should be saved to SQLite"
     saved_record = saved[0]
     assert saved_record["strategy"] == "example_sma"
@@ -130,9 +130,9 @@ def test_save_grid_result_to_sqlite() -> None:
 def test_save_grid_result_function() -> None:
     """Test save_grid_result convenience function."""
     init_db()
-    
+
     grid_id = f"test_grid_func_{datetime.now(timezone.utc).strftime('%H%M%S')}"
-    
+
     save_grid_result(
         grid_id=grid_id,
         strategy="test_strat",
@@ -141,10 +141,10 @@ def test_save_grid_result_function() -> None:
         results={"TSLA": {"1d": {"sharpe": 2.0, "status": "success"}}},
         engine="vectorbt",
     )
-    
+
     results = get_grid_results(limit=100)
     saved = [r for r in results if r["id"] == grid_id]
-    
+
     assert len(saved) == 1, "save_grid_result should persist to SQLite"
     assert saved[0]["results"]["TSLA"]["1d"]["sharpe"] == 2.0
 
@@ -152,12 +152,12 @@ def test_save_grid_result_function() -> None:
 def test_get_grid_results_returns_newest_first() -> None:
     """Test that get_grid_results orders by created_at descending."""
     init_db()
-    
+
     # Use unique IDs to avoid collision
     timestamp = datetime.now(timezone.utc).strftime("%H%M%S%f")
     id_1 = f"grid_older_{timestamp}a"
     id_2 = f"grid_newer_{timestamp}b"
-    
+
     # Save two records with different timestamps
     save_grid_result(
         grid_id=id_1,
@@ -173,9 +173,9 @@ def test_get_grid_results_returns_newest_first() -> None:
         timeframes=["1h"],
         results={},
     )
-    
+
     results = get_grid_results(limit=100)
-    
+
     # Verify both records exist
     ids = [r["id"] for r in results]
     assert id_1 in ids, "First grid result should exist"

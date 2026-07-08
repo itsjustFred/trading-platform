@@ -1,7 +1,15 @@
 import json
+import subprocess
 from pathlib import Path
 
-from runner.backtest_grid import build_cli_command, normalize_timeframe_value, parse_csv_list, run_backtest_grid
+import runner.backtest_grid as bg
+from runner.backtest_grid import (
+    build_cli_command,
+    normalize_timeframe_value,
+    parse_csv_list,
+    run_backtest_grid,
+    run_one_backtest,
+)
 
 
 def test_parse_and_normalize_grid_inputs():
@@ -81,3 +89,143 @@ def test_run_backtest_grid_runs_all_cells_with_same_risk(monkeypatch, tmp_path):
     assert (output_dir / "grid_matrix.csv").exists()
     assert (output_dir / "grid_summary.json").exists()
     assert json.loads((output_dir / "grid_summary.json").read_text(encoding="utf-8"))["requested"] == 4
+
+
+def test_subprocess_timeout_is_isolated_to_cell(monkeypatch, tmp_path):
+    # A hung subprocess cell must be marked failed/timeout, not raise and abort
+    # the whole grid run.
+    strategy = tmp_path / "trend_following.py"
+    strategy.write_text("STRATEGY_META = {'name': 'trend_following'}\n", encoding="utf-8")
+
+    def fake_run(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=args[0] if args else "cmd", timeout=5)
+
+    monkeypatch.setattr("runner.backtest_grid.subprocess.run", fake_run)
+
+    result = run_one_backtest(
+        strategy=str(strategy),
+        symbol="SP500",
+        timeframe="1h",
+        start="2025-01-01",
+        end="2025-12-31",
+        engine="vectorbt",
+        capital=10000.0,
+        risk_pct=0.01,
+        max_position_pct=None,
+        max_leverage=None,
+        intrabar_resolution="open_close",
+        params=None,
+        output_dir=tmp_path / "out",
+        data_dir="/tmp/data",
+        timeout_seconds=5,
+        skip_existing=False,
+        use_subprocess=True,
+    )
+
+    assert result["status"] == "failed"
+    assert result["error_class"] == "timeout"
+    assert "timed out" in result["error"]
+
+
+def test_subprocess_launch_failure_is_isolated_to_cell(monkeypatch, tmp_path):
+    strategy = tmp_path / "trend_following.py"
+    strategy.write_text("STRATEGY_META = {'name': 'trend_following'}\n", encoding="utf-8")
+
+    def fake_run(*args, **kwargs):
+        raise OSError("python executable missing")
+
+    monkeypatch.setattr("runner.backtest_grid.subprocess.run", fake_run)
+
+    result = run_one_backtest(
+        strategy=str(strategy),
+        symbol="SP500",
+        timeframe="1h",
+        start="2025-01-01",
+        end="2025-12-31",
+        engine="vectorbt",
+        capital=10000.0,
+        risk_pct=0.01,
+        max_position_pct=None,
+        max_leverage=None,
+        intrabar_resolution="open_close",
+        params=None,
+        output_dir=tmp_path / "out",
+        data_dir="/tmp/data",
+        timeout_seconds=5,
+        skip_existing=False,
+        use_subprocess=True,
+    )
+
+    assert result["status"] == "failed"
+    assert result["error_class"] == "subprocess_error"
+    assert "python executable missing" in result["error"]
+
+
+def test_in_process_uses_resolved_dates_for_daily_equity(monkeypatch, tmp_path):
+    # Regression: attach_daily_equity must receive the resolved date range, not
+    # the original (empty) start/end.
+    from shared.models import BacktestMeta, BacktestResult
+
+    strategy = tmp_path / "trend_following.py"
+    strategy.write_text("STRATEGY_META = {'name': 'trend_following'}\n", encoding="utf-8")
+
+    monkeypatch.setattr(bg, "detect_strategy_type", lambda p: bg.StrategyType.MARKET_DATA)
+    monkeypatch.setattr(bg, "resolve_strategy_parameters", lambda s, p: dict(p or {}))
+    monkeypatch.setattr(bg, "_detect_date_range", lambda *a, **k: ("2024-01-01", "2024-02-01"))
+    monkeypatch.setattr(bg, "ensure_backtest_data", lambda **k: [])
+    monkeypatch.setattr(bg, "compute_stats_for_result", lambda r: {})
+
+    captured: dict[str, str | None] = {}
+
+    def fake_attach(result, *, start_date=None, end_date=None):
+        captured["start_date"] = start_date
+        captured["end_date"] = end_date
+        return result
+
+    monkeypatch.setattr(bg, "attach_daily_equity", fake_attach)
+
+    class FakeEngine:
+        def validate_config(self, config):
+            return []
+
+        def run(self, config, strategy):
+            return BacktestResult(
+                meta=BacktestMeta(
+                    id="x",
+                    created_at="2024-01-01T00:00:00+00:00",
+                    engine="native",
+                    strategies=["trend_following"],
+                    backtest_start="2024-01-01",
+                    backtest_end="2024-02-01",
+                    data={"symbols": ["SP500"], "timeframes": ["1h"]},
+                ),
+                trades=[],
+                equity_curve=[],
+                stats={},
+            )
+
+    monkeypatch.setattr(bg, "get_engine", lambda e: FakeEngine())
+
+    result = bg.run_one_backtest_in_process(
+        strategy=str(strategy),
+        symbol="SP500",
+        timeframe="1h",
+        start="",
+        end="",
+        engine="native",
+        capital=10000.0,
+        risk_pct=0.01,
+        max_position_pct=None,
+        max_leverage=None,
+        intrabar_resolution="open_close",
+        params=None,
+        output_dir=tmp_path / "out",
+        data_dir="/tmp/data",
+        skip_existing=False,
+        save_sqlite=False,
+    )
+
+    assert captured["start_date"] == "2024-01-01"
+    assert captured["end_date"] == "2024-02-01"
+    assert result["start"] == "2024-01-01"
+    assert result["end"] == "2024-02-01"

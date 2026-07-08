@@ -1,10 +1,10 @@
 # Codex Rewrite — Hermes Agent Status Report
 
-**Branch:** `codex_rewrite`  
-**Basis:** Codex CLI Session (OpenAI OAuth)  
-**Weitergeführt von:** Hermes Agent  
-**Modell:** `kilo-auto/free` (Kilo Gateway)  
-**Datum:** 2026-06-21  
+**Branch:** `codex_rewrite`
+**Basis:** Codex CLI Session (OpenAI OAuth)
+**Weitergeführt von:** Hermes Agent
+**Modell:** `kilo-auto/free` (Kilo Gateway)
+**Datum:** 2026-06-21
 **Repo:** `/home/ubuntu/Desktop/trading-platform`
 
 ---

@@ -13,7 +13,10 @@ from dotenv import dotenv_values
 from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credentials
 from live_runner.config_parser import parse_live_deployments_config
 from live_runner.ctrader_adapter import CTraderLiveAdapter, DEFAULT_ACCOUNTS_ENV
+from shared.logging import get_logger
 from shared.models import LiveAccountConfig, LiveDeploymentConfig
+
+logger = get_logger("live-runner")
 
 
 @dataclass(frozen=True)
@@ -52,10 +55,28 @@ def _load_env_file(path: Path) -> dict[str, str]:
     }
 
 
-def _parse_bool_env(value: str | None, *, default: bool) -> bool:
+_TRUE_BOOL_TOKENS = frozenset({"1", "true", "yes", "y", "on"})
+_FALSE_BOOL_TOKENS = frozenset({"0", "false", "no", "n", "off"})
+
+
+def _parse_bool_env(name: str, value: str | None, *, default: bool) -> bool:
+    """Strictly parse a boolean env var.
+
+    Missing value -> default. Recognized true/false tokens (case-insensitive,
+    stripped) parse accordingly. Anything else raises so a malformed value can
+    never implicitly select live trading.
+    """
     if value is None:
         return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
+    token = value.strip().lower()
+    if token in _TRUE_BOOL_TOKENS:
+        return True
+    if token in _FALSE_BOOL_TOKENS:
+        return False
+    valid = ", ".join(sorted(_TRUE_BOOL_TOKENS | _FALSE_BOOL_TOKENS))
+    raise ValueError(
+        f"Invalid boolean value for {name}: {value!r}. Valid values are: {valid}."
+    )
 
 
 def _resolve_ctrader_credentials(
@@ -67,7 +88,7 @@ def _resolve_ctrader_credentials(
     refresh_token = str(env_values.get("CTRADER_REFRESH_TOKEN", "")).strip()
     if not app_id or not app_secret or not access_token:
         return None
-    demo = _parse_bool_env(env_values.get("CTRADER_DEMO"), default=True)
+    demo = _parse_bool_env("CTRADER_DEMO", env_values.get("CTRADER_DEMO"), default=True)
     return app_id, app_secret, access_token, refresh_token, demo
 
 
@@ -76,6 +97,7 @@ def _preflight_account(
     *,
     env_values: Mapping[str, str],
     check_connectivity: bool,
+    accounts_env_path: Path,
 ) -> LivePreflightAccountResult:
     errors: list[str] = []
     warnings: list[str] = []
@@ -148,6 +170,16 @@ def _preflight_account(
             errors.append("cTrader account id must be numeric via ctid, broker_login, or id.")
         if check_connectivity and credentials is not None and not errors:
             app_id, app_secret, access_token, refresh_token, demo = credentials
+            logger.info(
+                "cTrader preflight using accounts file for credential read/refresh",
+                extra={
+                    "data": {
+                        "account_id": account.id,
+                        "accounts_env_path": str(accounts_env_path),
+                        "refresh_target_path": str(accounts_env_path),
+                    }
+                },
+            )
             adapter = CTraderLiveAdapter(
                 app_id=app_id,
                 app_secret=app_secret,
@@ -156,6 +188,7 @@ def _preflight_account(
                 account_id=account_identifier,
                 demo=demo,
                 account_config_id=account.id,
+                accounts_env_path=accounts_env_path,
             )
             try:
                 asyncio.run(adapter.connect())
@@ -223,6 +256,16 @@ def run_live_preflight(
     config = Path(config_path)
     accounts_env = Path(accounts_env_path)
     accounts, deployments = parse_live_deployments_config(config)
+    logger.info(
+        "Running live preflight",
+        extra={
+            "data": {
+                "config_path": str(config),
+                "accounts_env_path": str(accounts_env),
+                "check_connectivity": check_connectivity,
+            }
+        },
+    )
     env_values = dict(env) if env is not None else _load_env_file(accounts_env)
 
     account_results = [
@@ -230,6 +273,7 @@ def run_live_preflight(
             account,
             env_values=env_values,
             check_connectivity=check_connectivity,
+            accounts_env_path=accounts_env,
         )
         for account in accounts
     ]

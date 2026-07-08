@@ -222,6 +222,18 @@ export function OptimizeModal({
     [symbolUniversesText],
   );
 
+  // Mirror the validation in handleStart: a run needs at least one *configured*
+  // parameter range/category, at least one symbol universe, or risk-parity mode.
+  // (Previously the button keyed off parameterEntries.length, so it stayed
+  // enabled even when no row was actually configured and the run then threw.)
+  const canSubmit = useMemo(
+    () =>
+      configuredCount > 0
+      || symbolUniverseCount > 0
+      || optimizationMode === "risk_parity_universe",
+    [configuredCount, symbolUniverseCount, optimizationMode],
+  );
+
   const updateDraft = (name: string, patch: Partial<ParameterDraft>) => {
     setParameterDrafts((current) => ({
       ...current,
@@ -686,14 +698,7 @@ export function OptimizeModal({
             <button
               type="button"
               onClick={handleStart}
-              disabled={
-                running
-                || (
-                  parameterEntries.length === 0
-                  && symbolUniverseCount === 0
-                  && optimizationMode !== "risk_parity_universe"
-                )
-              }
+              disabled={running || !canSubmit}
               style={{
                 display: "inline-flex",
                 alignItems: "center",
@@ -708,15 +713,7 @@ export function OptimizeModal({
                 padding: "12px 18px",
                 cursor: running ? "progress" : "pointer",
                 boxShadow: running ? "none" : "0 18px 40px rgba(14, 165, 233, 0.18)",
-                opacity:
-                  running
-                  || (
-                    parameterEntries.length === 0
-                    && symbolUniverseCount === 0
-                    && optimizationMode !== "risk_parity_universe"
-                  )
-                    ? 0.7
-                    : 1,
+                opacity: running || !canSubmit ? 0.7 : 1,
               }}
             >
               <Target size={16} />

@@ -261,18 +261,109 @@ def test_align_equity_curves_single_strategy() -> None:
 
 
 def test_align_equity_curves_multiple_strategies() -> None:
-    """Test aligning multiple strategy equity curves to common timestamps."""
+    """Alignment is restricted to the common overlap window of all strategies."""
     curves = [
         [StrategyEquityPoint(time=1, equity=100.0),
          StrategyEquityPoint(time=2, equity=101.0)],
         [StrategyEquityPoint(time=1, equity=50.0),
          StrategyEquityPoint(time=2, equity=55.0),
-         StrategyEquityPoint(time=3, equity=60.0)],  # Extra timestamp
+         StrategyEquityPoint(time=3, equity=60.0)],  # Extends past strategy 0
     ]
     result = _align_equity_curves(curves)
-    assert result.shape == (3, 2)  # 3 timestamps, 2 strategies
-    # Forward fill for missing values
-    assert result[2, 0] == 101.0  # Forward filled from time=2
+    # Overlap window is [1, 2]; time=3 (only strategy 1 has it) is excluded so no
+    # synthetic flat is invented for strategy 0.
+    assert result.shape == (2, 2)
+    assert result[0, 0] == 100.0
+    assert result[1, 0] == 101.0
+    assert result[0, 1] == 50.0
+    assert result[1, 1] == 55.0
+
+
+def test_align_equity_curves_no_synthetic_pre_inception() -> None:
+    """A late-starting strategy must not get synthetic pre-inception flats."""
+    curves = [
+        [StrategyEquityPoint(time=1, equity=100.0),
+         StrategyEquityPoint(time=2, equity=110.0),
+         StrategyEquityPoint(time=3, equity=120.0)],
+        # Starts at time=2, so the common window is [2, 3].
+        [StrategyEquityPoint(time=2, equity=50.0),
+         StrategyEquityPoint(time=3, equity=55.0)],
+    ]
+    result = _align_equity_curves(curves)
+    assert result.shape == (2, 2)
+    # No row for time=1 where strategy 1 had no data (would have been a flat 50.0).
+    assert result[0, 1] == 50.0
+    assert result[1, 1] == 55.0
+
+
+def test_align_equity_curves_no_overlap_returns_empty() -> None:
+    """Strategies that never overlap in time yield an empty alignment."""
+    curves = [
+        [StrategyEquityPoint(time=1, equity=100.0),
+         StrategyEquityPoint(time=2, equity=101.0)],
+        [StrategyEquityPoint(time=10, equity=50.0),
+         StrategyEquityPoint(time=11, equity=55.0)],
+    ]
+    result = _align_equity_curves(curves)
+    assert result.size == 0
+
+
+def test_normalize_weights_all_zero_falls_back_to_equal() -> None:
+    """All-zero weights must not produce nan/inf — fall back to equal weight."""
+    from runner.portfolio_optimizer import _normalize_weights
+
+    weights = _normalize_weights(np.zeros(4))
+    assert np.all(np.isfinite(weights))
+    assert np.isclose(weights.sum(), 1.0)
+    assert np.allclose(weights, 0.25)
+
+
+def test_normalize_weights_normal_case() -> None:
+    from runner.portfolio_optimizer import _normalize_weights
+
+    weights = _normalize_weights(np.array([1.0, 3.0]))
+    assert np.allclose(weights, [0.25, 0.75])
+
+
+def test_objective_penalizes_positive_correlation() -> None:
+    """Highly correlated strategies must score worse than diversified ones.
+
+    Regression guard for the sign flip: the objective subtracts the average
+    off-diagonal correlation, so positive correlation can no longer inflate the
+    score.
+    """
+    import runner.portfolio_optimizer as po_module
+
+    seconds_per_day = 24 * 60 * 60
+    base = 1700000000
+    n = 40
+
+    # Identical-Sharpe building block (steady up-drift with small noise).
+    def make_curve(start: float, signs: list[int]) -> list[StrategyEquityPoint]:
+        pts = []
+        eq = start
+        for i in range(n):
+            eq += 100.0 + signs[i % len(signs)]
+            pts.append(StrategyEquityPoint(time=base + i * seconds_per_day, equity=eq))
+        return pts
+
+    pos_a = make_curve(100000.0, [10, -10])
+    pos_b = make_curve(100000.0, [10, -10])  # perfectly correlated with pos_a
+    neg_a = make_curve(100000.0, [10, -10])
+    neg_b = make_curve(100000.0, [-10, 10])  # anti-correlated with neg_a
+
+    weights = np.array([0.5, 0.5])
+
+    def score(c1, c2):
+        matrix = _align_equity_curves([c1, c2])
+        returns = np.diff(matrix, axis=0)
+        sharpe, max_dd = _portfolio_sharpe_from_weights(weights, matrix)
+        corr = _compute_correlation_matrix(returns)
+        nn = corr.shape[0]
+        off = (corr.sum() - np.trace(corr)) / (nn * nn - nn)
+        return sharpe - (5.0 * off) - (3.0 * max(0.0, max_dd - 0.3))
+
+    assert score(neg_a, neg_b) > score(pos_a, pos_b)
 
 
 def test_compute_correlation_matrix_single_strategy() -> None:

@@ -93,4 +93,3 @@ class ExampleSignalProcessor:
 | Ausgabe | Einzelnes `TradeSignal` | Entry/Exit-Serien für Backtest |
 | Hauptaufgabe | Signal-Anreicherung (SL/TP/Trailing) | Signal-Generierung aus Preis-/Indikatorlogik |
 | Seiteneffekte | Keine (pure Verarbeitung) | Keine (pure Berechnung) |
-

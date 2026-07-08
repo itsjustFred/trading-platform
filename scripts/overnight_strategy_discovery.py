@@ -64,15 +64,15 @@ def random_keltner_params() -> dict:
 def run_discovery_batch(n_trials: int = 10) -> list[dict]:
     """Run random strategy discovery."""
     results = []
-    
+
     for i in range(n_trials):
         symbol = random.choice(SYMBOLS)
         tf = random.choice(TIMEFRAMES)
-        
+
         # Pick random strategy type
         strategy_types = ["sma", "rsi", "keltner"]
         strat_type = random.choice(strategy_types)
-        
+
         params = {}
         if strat_type == "sma":
             params = random_sma_params()
@@ -80,7 +80,7 @@ def run_discovery_batch(n_trials: int = 10) -> list[dict]:
             params = random_rsi_params()
         elif strat_type == "keltner":
             params = random_keltner_params()
-        
+
         try:
             config = BacktestConfig(
                 strategy_name=f"{strat_type}_cross",  # Simplified
@@ -109,18 +109,18 @@ def run_discovery_batch(n_trials: int = 10) -> list[dict]:
                 "strategy": strat_type,
                 "error": str(e),
             })
-    
+
     # Save results
     out_path = DISCOVERED_DIR / f"discovery_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.json"
     out_path.write_text(json.dumps(results, indent=2))
-    
+
     return results
 
 
 if __name__ == "__main__":
     print("Overnight Strategy Discovery - Experimental")
     print("=" * 50)
-    
+
     results = run_discovery_batch(n_trials=20)
     print(f"Completed {len(results)} trial configurations")
     print(f"Results saved to {DISCOVERED_DIR}")

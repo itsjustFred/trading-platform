@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 from itertools import combinations
 from datetime import datetime, timezone
@@ -19,6 +20,18 @@ from runner.stats import compute_stats_for_result
 from shared.constants import DATA_DIR, OPTIMIZATIONS_DIR
 from shared.models import BacktestResult
 from shared.strategy_registry import find_strategy_entry
+
+logger = logging.getLogger(__name__)
+
+# Optuna param name for the internal symbol-universe selection. Namespaced so it
+# can never collide with (and be filtered away alongside) a real strategy
+# parameter that happens to be called "symbol_universe".
+_INTERNAL_SYMBOL_UNIVERSE_PARAM = "__internal_symbol_universe"
+
+# Upper bound on the number of symbol-subset universes we enumerate. Without a
+# cap the candidate set grows as 2**n and both memory and the Optuna categorical
+# search space explode for large symbol lists.
+MAX_CANDIDATE_SYMBOL_UNIVERSES = 256
 
 BACKTESTS_DIR = DATA_DIR / "backtests"
 TARGET_METRIC_ALIASES = {
@@ -235,7 +248,7 @@ def run_optimization(
     best_params = {
         key: value
         for key, value in dict(study.best_params).items()
-        if key != "symbol_universe"
+        if key != _INTERNAL_SYMBOL_UNIVERSE_PARAM
     }
     best_symbols = list(best_trial.user_attrs.get("symbols") or symbols)
     effective_best_params = dict(base_parameters)
@@ -424,6 +437,14 @@ def _candidate_symbol_universes(
     for size in range(2, len(symbols) + 1):
         for combo in combinations(symbols, size):
             universes.append(list(combo))
+            if len(universes) >= MAX_CANDIDATE_SYMBOL_UNIVERSES:
+                logger.warning(
+                    "Symbol-universe combinations capped at %d (from %d base "
+                    "symbols); not all subsets will be explored.",
+                    MAX_CANDIDATE_SYMBOL_UNIVERSES,
+                    len(symbols),
+                )
+                return universes
     return universes
 
 
@@ -434,7 +455,9 @@ def _trial_symbols(
 ) -> list[str]:
     if not candidate_universes:
         return list(base_symbols)
-    universe_index = trial.suggest_categorical("symbol_universe", list(range(len(candidate_universes))))
+    universe_index = trial.suggest_categorical(
+        _INTERNAL_SYMBOL_UNIVERSE_PARAM, list(range(len(candidate_universes)))
+    )
     return list(candidate_universes[int(universe_index)])
 
 

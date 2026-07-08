@@ -73,16 +73,16 @@ class TestStrategyRegression:
     def test_no_trade_exceeds_risk_limit(self, backtest_result):
         equity = backtest_result.meta.initial_capital
         assert equity > 0, "Initial capital must be positive"
-        
+
         for trade in backtest_result.trades:
             sl = trade.meta.get("sl_price")
             assert sl is not None, f"Trade {trade.id}: 'sl_price' fehlt in trade.meta"
             stop_dist = abs(trade.entry_price - sl)
             risk_usd = stop_dist * trade.quantity
-            
+
             if equity <= 0:
                 pytest.fail(f"Equity became non-positive before trade {trade.id}")
-            
+
             risk_pct = risk_usd / equity
             assert risk_pct <= 0.015, (
                 f"Trade {trade.id}: Risk {risk_pct*100:.2f}% ueberschreitet Limit von 1.5%"

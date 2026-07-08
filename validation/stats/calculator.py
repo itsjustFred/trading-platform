@@ -1,4 +1,20 @@
-"""Trade statistics calculator — pure functional metrics from a list of Trades."""
+"""Trade statistics calculator — pure functional metrics from a list of Trades.
+
+This is the single canonical statistics implementation for the validation
+framework (the parallel ``validation/statistics/`` module was removed).
+
+Mathematical conventions (kept explicit so results are reproducible):
+
+* **Standard deviation:** *population* std (divide by ``n``), risk-free rate 0.
+* **Sharpe:** ``mean(returns) / population_std(returns) * sqrt(252)`` where the
+  "returns" series is the per-trade realized PnL sequence.
+* **Sortino:** ``mean(returns) / downside_deviation * sqrt(252)`` where the
+  downside deviation divides the sum of squared *negative* returns by the count
+  of *negative* returns only.
+* **Annualization:** ``sqrt(252)`` (daily-trade assumption).
+* **Drawdown:** absolute is in account currency; ``max_drawdown_pct`` is a
+  fraction (0..1) of the running peak.
+"""
 
 from __future__ import annotations
 

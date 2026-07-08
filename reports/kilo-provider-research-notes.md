@@ -1,6 +1,6 @@
 # Provider Research Notes
 
-**Datum:** 2026-06-17  
+**Datum:** 2026-06-17
 **Scope:** Kilo/kilocode, Kimchi, Bluesminds, Aerolink - Free-Model-Usage ohne Secrets
 
 ---
@@ -64,7 +64,7 @@
 ### Verfügbare Modelle (ohne Auth-Details)
 ```
 gpt-5.5
-gpt-5.4  
+gpt-5.4
 gpt-5.4-mini
 gpt-5.3-codex
 ```

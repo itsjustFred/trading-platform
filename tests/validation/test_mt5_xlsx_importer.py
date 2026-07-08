@@ -244,3 +244,26 @@ class TestHelpers:
     def test_infer_exit_reason_none(self):
         assert MT5XLSXImporter._infer_exit_reason("") is None
         assert MT5XLSXImporter._infer_exit_reason("some comment") is None
+
+
+class TestSourceTimezone:
+    def test_to_iso_defaults_to_utc(self):
+        assert (
+            MT5XLSXImporter._to_iso("2024.01.01 10:00:00")
+            == "2024-01-01T10:00:00Z"
+        )
+
+    def test_to_iso_converts_source_timezone_to_utc(self):
+        from zoneinfo import ZoneInfo
+
+        # 10:00 in Europe/Athens (UTC+2 in January) -> 08:00 UTC.
+        assert (
+            MT5XLSXImporter._to_iso("2024.01.01 10:00:00", ZoneInfo("Europe/Athens"))
+            == "2024-01-01T08:00:00Z"
+        )
+
+    def test_resolve_source_timezone_rejects_unknown(self):
+        from validation.importers.mt5_xlsx import _resolve_source_timezone
+
+        with pytest.raises(ValueError):
+            _resolve_source_timezone("Not/AZone")

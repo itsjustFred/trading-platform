@@ -60,6 +60,13 @@ class ReadinessConfig(BaseModel):
 
     require_all_goldens_pass: bool = True
 
+    # Mandatory artifacts. When a required artifact is missing the gate emits an
+    # error-level check so it can never report READY on an incomplete validation.
+    require_trade_report: bool = True
+    require_regression: bool = True
+    require_risk_report: bool = True
+    require_stats: bool = True
+
     max_position_size_diff_pct: float = 0.01
     max_stop_distance_diff_pct: float = 0.01
 

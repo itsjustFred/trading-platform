@@ -4,7 +4,7 @@
 
 ### Heute Erledigt
 - Portfolio Optimizer SQLite Integration ✅
-- Portfolio Optimizer OOS Support ✅  
+- Portfolio Optimizer OOS Support ✅
 - Grid-Tester SQLite Integration ✅
 - OOS Tests (8 tests passing) ✅
 
@@ -29,7 +29,7 @@ Walk-Forward Konzept:
 - Speichere Top-10 Strategien mit >1.0 Sharpe in `data/discovered_strategies/`
 - Minimaler Score-Threshold um Fehl-Positives zu vermeiden
 
-### 2. Correlation Heatmap Generator  
+### 2. Correlation Heatmap Generator
 - Für alle Backtests in `backtests.db` eine Korrelationsmatrix
 - Speichere als PNG via matplotlib/seaborn
 

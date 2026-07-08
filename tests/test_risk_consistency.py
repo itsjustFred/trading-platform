@@ -14,7 +14,7 @@ def test_risk_engine_and_live_use_same_defaults() -> None:
     """Test that both engines use same RiskConfig defaults."""
     engine = RiskEngine()
     live_config = RiskConfig()
-    
+
     assert engine.config.max_risk_per_trade == live_config.max_risk_per_trade
     assert engine.config.max_total_exposure == live_config.max_total_exposure
     assert engine.config.max_positions == live_config.max_positions
@@ -99,9 +99,9 @@ def test_live_size_rejects_wrong_stop_direction() -> None:
             "take_profit": 110.0,
         },
     )
-    
+
     result = size_live_signal(live_signal, account_balance=100000.0)
-    
+
     assert result.position_size == 0
     assert result.risk_amount == 0
     assert result.risk_percent == 0
@@ -118,13 +118,13 @@ def test_backtest_engine_allows_wrong_stop_direction() -> None:
         symbol="EURUSD",
         timeframe="1h",
     )
-    
+
     result = engine.calculate_position_size(
         signal=signal,
         account_balance=100000.0,
         pip_value=10.0,
         current_exposure=0.0,
     )
-    
+
     assert result.position_size > 0
     assert result.risk_amount > 0

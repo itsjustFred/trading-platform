@@ -158,4 +158,3 @@ class RocketFuelSignalProcessor:
             timeframe=timeframe,
             metadata=metadata,
         )
-

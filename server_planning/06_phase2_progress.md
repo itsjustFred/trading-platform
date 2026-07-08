@@ -7,8 +7,8 @@ Stand: 2026-02-25
 ## Phase 2a: Viewer Upgrade
 
 ### ✅ Task 1: Backend-Endpoints (app.py rewrite)
-**Status:** Erledigt  
-**Komplexität:** M  
+**Status:** Erledigt
+**Komplexität:** M
 **Dateien:**
 - `viewer/app.py` — Komplett neugeschrieben (~310 Zeilen)
 - `viewer/comparison.py` — Neu erstellt (Strategy-Vergleich portiert von custom_lean_integration)
@@ -30,20 +30,20 @@ Stand: 2026-02-25
 ---
 
 ### ✅ Task 2: HTML/JS Migration
-**Status:** Erledigt  
-**Komplexität:** L  
+**Status:** Erledigt
+**Komplexität:** L
 **Dateien:**
 - `viewer/static/index.html` — Komplett ersetzt (333 → 1536 Zeilen)
 - `viewer/static/index.html.bak` — Backup der alten Version
 
-**Basis:** `custom_lean_integration/static/trade_viewer.html`  
+**Basis:** `custom_lean_integration/static/trade_viewer.html`
 **Anpassungen:** API-Layer komplett auf Universal Trade Format umgeschrieben, alle Endpoints neu.
 
 ---
 
 ### ✅ Task 3: Equity Curve Panel
-**Status:** Erledigt  
-**Komplexität:** M  
+**Status:** Erledigt
+**Komplexität:** M
 **Details:**
 - Lightweight-charts LineSeries unter dem Hauptchart
 - Orange Marker zeigt aktuelle Trade-Position
@@ -53,8 +53,8 @@ Stand: 2026-02-25
 ---
 
 ### ✅ Task 4: Trade-Tabelle
-**Status:** Erledigt  
-**Komplexität:** S  
+**Status:** Erledigt
+**Komplexität:** S
 **Details:**
 - Sortierbar nach allen Spalten (Nr, Symbol, Direction, Entry, Exit, PnL, Duration)
 - Klick auf Zeile navigiert zum Trade
@@ -64,8 +64,8 @@ Stand: 2026-02-25
 ---
 
 ### ✅ Task 5: Stats Panel im Sidebar
-**Status:** Erledigt  
-**Komplexität:** S  
+**Status:** Erledigt
+**Komplexität:** S
 **Details:**
 - Grid-Layout im rechten Sidebar
 - Zeigt: Total PnL, Win Rate, Sharpe, Sortino, Profit Factor, Max DD, Avg Winner/Loser, etc.
@@ -74,8 +74,8 @@ Stand: 2026-02-25
 ---
 
 ### ✅ Task 6: Multi-Symbol Support
-**Status:** Erledigt  
-**Komplexität:** M  
+**Status:** Erledigt
+**Komplexität:** M
 **Details:**
 - Backend: `/api/backtest/<id>/trade/<nr>` liefert OHLCV des jeweiligen Trade-Symbols
 - Frontend: Chart wechselt automatisch Symbol beim Trade-Navigieren
@@ -86,8 +86,8 @@ Stand: 2026-02-25
 ---
 
 ### ✅ Task 7: Partial Exits + Indikator-Format
-**Status:** Erledigt  
-**Komplexität:** M  
+**Status:** Erledigt
+**Komplexität:** M
 
 **Partial Exits:**
 - Jeder Exit als separater Marker auf dem Chart
@@ -117,8 +117,8 @@ Stand: 2026-02-25
 ---
 
 ### ✅ Task 8: Comparison Mode
-**Status:** Erledigt  
-**Komplexität:** L  
+**Status:** Erledigt
+**Komplexität:** L
 **Details:**
 - Portiert von `custom_lean_integration/compare_strategies.py` + `view_compare.py`
 - Backend `/api/compare` liefert: Equity Curves, Combined 50/50 Equity, Drawdown-Serien, Korrelationen
@@ -132,8 +132,8 @@ Stand: 2026-02-25
 ---
 
 ### ✅ Task 9: Testing + Dokumentation
-**Status:** Erledigt  
-**Komplexität:** S  
+**Status:** Erledigt
+**Komplexität:** S
 **Details:**
 - Alle API-Endpoints via test_client verifiziert
 - Multi-Symbol-Backtest getestet
@@ -196,8 +196,8 @@ Stand: 2026-02-25
 ## Phase 2b: Zentrales Logging
 
 ### ✅ Task 9: Logging-Modul erstellen
-**Status:** Erledigt  
-**Komplexität:** S  
+**Status:** Erledigt
+**Komplexität:** S
 **Dateien:**
 - `shared/logging.py` — Neu erstellt (~85 Zeilen)
 
@@ -211,8 +211,8 @@ Stand: 2026-02-25
 ---
 
 ### ✅ Task 10: Log-Verzeichnis einrichten
-**Status:** Erledigt  
-**Komplexität:** S  
+**Status:** Erledigt
+**Komplexität:** S
 **Details:**
 - `~/logs/` wird automatisch durch das Logging-Modul angelegt (`mkdir -p`)
 - Ein Logfile pro Service: `viewer.log`, `runner.log`
@@ -221,8 +221,8 @@ Stand: 2026-02-25
 ---
 
 ### ✅ Task 11: Services umstellen
-**Status:** Erledigt  
-**Komplexität:** S  
+**Status:** Erledigt
+**Komplexität:** S
 **Dateien:**
 - `viewer/app.py` — `logging.basicConfig()` ersetzt durch `get_logger("viewer")`
 - `runner/cli.py` — `logging.basicConfig()` ersetzt durch `get_logger("runner")`
@@ -235,8 +235,8 @@ Stand: 2026-02-25
 ---
 
 ### ✅ Task 12: stockkit Logging-Guide
-**Status:** Erledigt  
-**Komplexität:** S  
+**Status:** Erledigt
+**Komplexität:** S
 **Dateien:**
 - `docs/logging_guide.md` — Neu erstellt
 

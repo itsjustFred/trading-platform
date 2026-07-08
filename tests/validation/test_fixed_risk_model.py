@@ -83,6 +83,20 @@ def test_basic_fixed_risk_calculation() -> None:
     assert result.profiles[0].risk_amount == pytest.approx(100.0)
 
 
+def test_lot_rounding_never_exceeds_risk_budget() -> None:
+    # raw size = 100/0.4 = 250 ... use a value that rounds UP under round() but
+    # would breach the risk budget: 100 / (1/2.6) -> 260 lots? Instead pick a
+    # fractional lot count and assert realized risk stays within budget.
+    config = FixedRiskConfig(risk_amount=100.0, round_lots=True, lot_size=1.0)
+    model = FixedRiskModel(config)
+    # stop_distance = 0.385 -> raw size = 259.74 ; round() -> 260 (risk 100.1),
+    # floor -> 259 (risk 99.7), which must not exceed the 100.0 budget.
+    inp = _make_input(entry_price=100.0, stop_loss=99.615)
+    result = model.size(inp)
+    assert result.profiles[0].position_size == pytest.approx(259.0)
+    assert result.profiles[0].risk_amount <= 100.0 + 1e-9
+
+
 def test_long_direction_preserved() -> None:
     config = FixedRiskConfig(risk_amount=100.0)
     model = FixedRiskModel(config)

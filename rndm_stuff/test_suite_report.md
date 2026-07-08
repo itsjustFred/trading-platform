@@ -120,5 +120,5 @@ Das bestätigt: Der Großteil der Fehler ist durch den E2E/Playwright-Pfad verur
 
 ## Fazit
 
-Die „vielen Fehler“ sind größtenteils **sekundäre Folgefehler** eines fehlenden Playwright-Browsers.  
+Die „vielen Fehler“ sind größtenteils **sekundäre Folgefehler** eines fehlenden Playwright-Browsers.
 Funktional unabhängig ist aktuell primär der **eine veraltete API-Parameter-Test**.

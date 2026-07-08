@@ -30,4 +30,3 @@ rocket_fuel:
   # Operational
   signal_max_age_seconds: 300
   order_fill_wait_seconds: 2
-

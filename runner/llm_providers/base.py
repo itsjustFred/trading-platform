@@ -14,4 +14,3 @@ class LLMProvider(Protocol):
         metadata: dict[str, Any] | None = None,
     ) -> str:
         ...
-

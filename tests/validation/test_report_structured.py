@@ -400,3 +400,40 @@ class TestJsonReportBasics:
         assert d["strategy_name"] == "s"
         assert d["trade_summary"]["matched"] == 2
         assert d["trade_summary"]["missing"] == 1
+
+
+class TestStrictJsonCompatibility:
+    def test_sanitize_json_numbers_replaces_non_finite(self):
+        from validation.reporting.json_report import _sanitize_json_numbers
+
+        raw = {
+            "a": float("inf"),
+            "b": float("-inf"),
+            "c": float("nan"),
+            "d": 1.5,
+            "nested": {"x": float("inf")},
+            "list": [float("nan"), 2, 3.0],
+        }
+        clean = _sanitize_json_numbers(raw)
+        assert clean["a"] is None
+        assert clean["b"] is None
+        assert clean["c"] is None
+        assert clean["d"] == 1.5
+        assert clean["nested"]["x"] is None
+        assert clean["list"] == [None, 2, 3.0]
+        text = json.dumps(clean, allow_nan=False)
+        assert "Infinity" not in text and "NaN" not in text
+
+    def test_report_with_infinite_profit_factor_is_strict_json(self):
+        # A platform result with only winners yields profit_factor == inf; the
+        # report must still be strictly parseable (no NaN/Infinity tokens).
+        ref = _make_reference([_make_trade(trade_id=1, pnl=50.0)])
+        platform = _make_platform_result([_make_trade(trade_id=1, pnl=50.0)])
+
+        json_str = generate_json_report(ref, platform)
+        assert "Infinity" not in json_str
+        assert "NaN" not in json_str
+        # Strict parser (json.loads rejects NaN/Infinity only with parse hooks,
+        # so assert via allow_nan=False round-trip instead).
+        data = json.loads(json_str)
+        json.dumps(data, allow_nan=False)

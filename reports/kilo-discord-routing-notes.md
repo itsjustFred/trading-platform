@@ -112,11 +112,11 @@ wird das Signal nur an deployment_a gesendet. deployment_b verliert es.
 def test_discord_routing_multiple_deployments_same_account_symbol():
     """
     Discord-Signal wird nur an erste passende Deployment gesendet.
-    
+
     Setup:
     - 2 ACTIVE Deployments für Account A mit gleichem Symbol (z.B. AAPL)
     - Beide nutzen gleichen Discord Channel
-    
+
     Erwartet:
     - Nur 1 Order-Submission statt 2
     - deployment_b verliert Signal (silent signal loss)
@@ -128,11 +128,11 @@ def test_discord_routing_multiple_deployments_same_account_symbol():
 def test_submit_order_with_risk_uses_conservative_exposure():
     """
     Positions-Check wird für normale Buy-Signale konservativ gehandhabt.
-    
+
     Setup:
     - Mock AlpacaLiveAdapter mit offener AAPL-Position (qty=100)
     - Deployment mit max_positions=1
-    
+
     Erwartet:
     - Signal wird gesendet
     - broker_exposure = open_positions_count * max_risk_per_trade (konservative Schätzung)
@@ -144,11 +144,11 @@ def test_submit_order_with_risk_uses_conservative_exposure():
 def test_rocketfuel_longsonly_sell_sets_exit_only():
     """
     RocketFuel longsonly Variante: SELL Signal sollte exit_only=True setzen.
-    
+
     Setup:
     - RocketFuelSignalProcessor mit variant="longsonly"
     - SELL action signal
-    
+
     Erwartet:
     - metadata["exit_only"] == True
     - stop_loss == None
@@ -160,11 +160,11 @@ def test_rocketfuel_longsonly_sell_sets_exit_only():
 def test_rocketfuel_longandshort_sell_opens_short():
     """
     RocketFuel longandshort Variante: SELL Signal öffnet Short.
-    
+
     Setup:
     - RocketFuelSignalProcessor mit variant="longandshort"
     - SELL action signal
-    
+
     Erwartet:
     - stop_loss > entry_price (protection for short)
     - Kein exit_only Flag
@@ -175,11 +175,11 @@ def test_rocketfuel_longandshort_sell_opens_short():
 def test_market_data_required_for_processor():
     """
     _build_processor_market_data wirft ValueError wenn kein Market Data.
-    
+
     Setup:
     - TradeSignal ohne metadata["market_data"]
     - Deployment mit signal_processor="rocketfuel_longsonly"
-    
+
     Erwartet:
     - ValueError wird geworfen
     - Signal wird nicht zur Order

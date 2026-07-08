@@ -6,8 +6,8 @@ Pine Script v5 (TradingView), originärer Strategiename "Supertrend + DEMA + RSI
 ## Kernlogik
 
 ### Entry
-**Primärer Trigger:** Trendwechsel des Supertrend-Indikators  
-- **Long:** Supertrend wechselt von Abwärtstrend zu Aufwärtstrend (`trend == 1 and trend[1] == -1`)  
+**Primärer Trigger:** Trendwechsel des Supertrend-Indikators
+- **Long:** Supertrend wechselt von Abwärtstrend zu Aufwärtstrend (`trend == 1 and trend[1] == -1`)
 - **Short:** Supertrend wechselt von Aufwärtstrend zu Abwärtstrend (`trend == -1 and trend[1] == 1`)
 
 **Filterbedingungen (Strong Confluence):**

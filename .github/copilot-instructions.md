@@ -4,25 +4,25 @@ Diese Regeln sind verbindlich für Änderungen in diesem Repository.
 
 ## Architektur-Regeln
 
-1. **API-Source of Truth ist `viewer/main.py`.**  
+1. **API-Source of Truth ist `viewer/main.py`.**
    Neue/angepasste Endpunkte immer synchron in:
    - `viewer/main.py`
    - `frontend/src/api/client.ts`
    - `frontend/src/api/types.ts`
 
-2. **Kanonische Datenverträge liegen in `shared/models.py`.**  
+2. **Kanonische Datenverträge liegen in `shared/models.py`.**
    API- und Persistenz-Payloads auf bestehende Pydantic-Modelle abstimmen statt ad-hoc Felder einzuführen.
 
-3. **`DATA_DIR` nie hardcoden.**  
+3. **`DATA_DIR` nie hardcoden.**
    Immer über `shared/constants.py` beziehen (`DATA_DIR`, optionaler Fallback `TRADING_DATA_DIR`).
 
-4. **Timeframes immer normalisieren.**  
+4. **Timeframes immer normalisieren.**
    Für Inputs/Metadaten konsequent `normalize_timeframe()` aus `shared/constants.py` verwenden.
 
-5. **Signals vor Execution immer durch Risk Sizing.**  
+5. **Signals vor Execution immer durch Risk Sizing.**
    Vor Broker-Ausführung muss `RiskEngine.calculate_position_size()` (`risk/engine.py`) laufen.
 
-6. **Background-Workflows als async Jobs.**  
+6. **Background-Workflows als async Jobs.**
    Start-Endpoints liefern `202 Accepted`; Fortschritt über Task-Status und Streaming (`/api/tasks`, `/api/data/tasks`, `/ws/tasks/{job_id}`).
 
 ## Backend-Stack (Python)
