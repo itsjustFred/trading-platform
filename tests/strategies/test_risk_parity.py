@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -25,6 +26,9 @@ from scripts.run_risk_parity_backtest import (
     calculate_covariance,
     calculate_risk_parity_weights,
     detect_correlation_regime,
+    first_available_trading_dates,
+    latest_correlation_regime,
+    weekly_correlation_regimes,
 )
 
 
@@ -118,3 +122,27 @@ def test_apply_tail_risk_hedge_reduces_equity_exposure():
     equity_before = sum(weights[t] for t in TICKERS if ASSETS[t]["class"] == "equity")
     equity_after = sum(hedged[t] for t in TICKERS if ASSETS[t]["class"] == "equity")
     assert equity_after < equity_before
+
+
+def test_weekly_correlation_regime_uses_latest_week_start():
+    dates = pd.to_datetime(["2024-01-02", "2024-01-03", "2024-01-08", "2024-01-09"])
+    scheduled = pd.to_datetime(["2024-01-01", "2024-01-08"])
+
+    assert first_available_trading_dates(dates, scheduled) == [dates[0], dates[2]]
+    assert latest_correlation_regime({dates[0]: "normal", dates[2]: "elevated"}, dates[3]) == "elevated"
+
+
+def test_weekly_correlation_regimes_returns_scheduled_state():
+    dates = pd.bdate_range("2024-01-02", periods=140)
+    data = pd.DataFrame(
+        np.tile(np.linspace(100.0, 120.0, len(dates)), (len(TICKERS), 1)).T,
+        index=dates,
+        columns=TICKERS,
+    )
+    returns = data.pct_change().dropna()
+
+    regimes = weekly_correlation_regimes(returns)
+
+    assert regimes
+    assert all(date in returns.index for date in regimes)
+    assert set(regimes.values()).issubset({"normal", "elevated", "crisis"})

@@ -47,27 +47,29 @@ def build_comparison_matrix(
     *,
     comparisons_dir: Path,
     reports_dir: Path,
+    platform_data_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Compare MT5 and QuantConnect references with available platform artifacts."""
     comparisons_dir = comparisons_dir.resolve()
     reports_dir = reports_dir.resolve()
+    platform_data_dir = (platform_data_dir or reports_dir.parent / "data" / "backtests").resolve()
     rows: list[dict[str, Any]] = []
 
     mt5_cases = [
         (
             "intraday_volatility_breakout_sp500_m1",
             comparisons_dir / "intraday_volatility_breakout" / "SP500_M1.xlsx",
-            reports_dir / "strategy_comparison_backtest_SP500_M1_after_align_20260623.trades.json",
+            platform_data_dir / "intraday_volatility_breakout_sp500_m1.json",
         ),
         (
             "intraday_volatility_breakout_eurusd_h1",
             comparisons_dir / "intraday_volatility_breakout" / "EURUSD_H1.xlsx",
-            reports_dir / "strategy_comparison_backtest_EURUSD_H1_after_align_20260623.trades.json",
+            platform_data_dir / "intraday_volatility_breakout_eurusd_h1.json",
         ),
         (
             "intraday_volatility_breakout_nas100_m15",
             comparisons_dir / "intraday_volatility_breakout" / "NAS100_M15.xlsx",
-            reports_dir / "strategy_comparison_backtest_US100_M15_after_align_20260623.trades.json",
+            platform_data_dir / "intraday_volatility_breakout_nas100_m15.json",
         ),
     ]
 
@@ -78,7 +80,7 @@ def build_comparison_matrix(
         _build_json_reference_row(
             "risk_parity_quantconnect",
             comparisons_dir / "risk_parity" / "risk_parity_reference.json",
-            reports_dir / "strategy_comparison_backtest_risk_parity_20260623.trades.json",
+            platform_data_dir / "risk_parity_quantconnect_reimplementation.json",
         )
     )
 
@@ -220,12 +222,21 @@ def _load_platform_stats(platform_path: Path) -> dict[str, float | None]:
     result = BacktestResult.from_dict(payload)
     from runner.stats import compute_stats_for_result
 
-    stats = {**dict(result.stats or {}), **compute_stats_for_result(result)}
+    if _prefers_stored_platform_stats(result):
+        stats = dict(result.stats or {})
+    else:
+        stats = {**dict(result.stats or {}), **compute_stats_for_result(result)}
     normalized = _normalize_reference_stats(stats)
     if normalized["net_profit"] is None:
         normalized["net_profit"] = _safe_float(stats.get("total_pnl"))
     return normalized
 
+
+
+def _prefers_stored_platform_stats(result: BacktestResult) -> bool:
+    tags = {str(tag).lower() for tag in (result.meta.tags or [])}
+    engine = str(result.meta.engine or "").strip().lower()
+    return "qc-parity" in tags or engine == "python-reimplementation"
 
 def _extract_mt5_period(path: Path) -> tuple[datetime, datetime] | None:
     try:

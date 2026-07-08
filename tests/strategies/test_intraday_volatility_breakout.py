@@ -124,6 +124,8 @@ def test_default_parameters_present():
         "entry_time": "16:30",
         "max_entry_time": "18:05",
         "exit_time": "22:55",
+        "session_timezone": "",
+        "session_timezone_offset_hours": 0,
     }
     for key, val in expected.items():
         assert params.get(key) == val, f"param {key} expected {val}, got {params.get(key)}"
@@ -214,6 +216,64 @@ def test_reverse_mode_flips_signals():
     dirs_reverse = indicators_reverse["direction"]
     assert entries_reverse.any()
     assert (dirs_reverse == "LONG").any(), "Expected a LONG entry in reverse mode"
+
+
+def test_mt5_numeric_direction_and_regime_settings_are_normalized():
+    mod = _load_module()
+    df = _two_day_breakout_df(direction="down")
+    params = mod.STRATEGY_META["parameters"].copy()
+    params.update(
+        {
+            "Trade_Direction": 0,
+            "Regime_Filter_Mode": 0,
+            "use_candle_close": False,
+            "entry_time": "16:30",
+            "max_entry_time": "18:05",
+            "exit_time": "20:00",
+            "atr_regime_factor": 2.0,
+        }
+    )
+
+    entries, _, indicators, _ = mod.generate_signals(df, params)
+
+    assert entries.any()
+    assert "direction" in indicators
+    assert (indicators["direction"].dropna() == "SHORT").any()
+
+
+def test_session_timezone_uses_dst_aware_server_day():
+    mod = _load_module()
+    df = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(
+                [
+                    "2018-01-04T13:30:00Z",
+                    "2018-07-04T13:30:00Z",
+                ],
+                utc=True,
+            ),
+            "open": [1.0, 1.0],
+            "high": [1.0, 1.0],
+            "low": [1.0, 1.0],
+            "close": [1.0, 1.0],
+        }
+    )
+    params = mod.STRATEGY_META["parameters"].copy()
+    params.update(
+        {
+            "session_timezone": "Europe/Athens",
+            "entry_time": "16:30",
+            "max_entry_time": "18:05",
+            "exit_time": "22:55",
+            "use_candle_close": False,
+        }
+    )
+
+    _, _, indicators, _ = mod.generate_signals(df, params)
+
+    entry_open = indicators["entry_open"]
+    assert pd.isna(entry_open.iloc[0])
+    assert entry_open.iloc[1] == 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -385,3 +445,44 @@ def test_candle_close_signal_emits_previous_bar_for_next_open_execution():
     entry_idx = df.index[df["timestamp"] == pd.Timestamp("2024-01-03 16:45", tz="UTC")][0]
     assert indicators["direction"].iloc[entry_idx] == "LONG"
     assert pd.notna(indicators["sl_price"].iloc[entry_idx])
+
+
+def test_native_daily_ohlcv_overrides_intraday_resampled_atr():
+    mod = _load_module()
+    idx = pd.date_range("2024-01-01", periods=72, freq="1h", tz="UTC")
+    df = pd.DataFrame(
+        {
+            "timestamp": idx,
+            "open": np.full(len(idx), 100.0),
+            "high": np.full(len(idx), 101.0),
+            "low": np.full(len(idx), 99.0),
+            "close": np.full(len(idx), 100.0),
+        }
+    )
+    daily_ohlcv = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=3, freq="1D", tz="UTC"),
+            "open": [100.0, 105.0, 110.0],
+            "high": [110.0, 125.0, 120.0],
+            "low": [100.0, 105.0, 110.0],
+            "close": [105.0, 110.0, 115.0],
+        }
+    )
+    params = mod.STRATEGY_META["parameters"].copy()
+    params.update(
+        {
+            "atr_period": 1,
+            "atr_short_period": 1,
+            "atr_long_period": 1,
+            "atr_regime_factor": 2.0,
+        }
+    )
+
+    _, _, resampled_indicators, _ = mod.generate_signals(df, params)
+    native_params = dict(params)
+    native_params["daily_ohlcv"] = daily_ohlcv
+    _, _, native_indicators, _ = mod.generate_signals(df, native_params)
+
+    jan3 = df["timestamp"] == pd.Timestamp("2024-01-03 12:00", tz="UTC")
+    assert resampled_indicators["daily_atr"].loc[jan3].iloc[0] == pytest.approx(2.0)
+    assert native_indicators["daily_atr"].loc[jan3].iloc[0] == pytest.approx(20.0)

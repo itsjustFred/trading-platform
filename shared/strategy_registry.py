@@ -30,6 +30,9 @@ class StrategyEntry:
 
     @property
     def engine(self) -> str:
+        configured = str(self.meta.get("engine") or "").strip().lower()
+        if configured:
+            return configured
         return "pynecore" if self.file_path.stem.startswith("pynecore_") else "vectorbt"
 
     @property

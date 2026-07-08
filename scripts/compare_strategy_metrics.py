@@ -26,7 +26,13 @@ def main() -> int:
         "--reports-dir",
         type=Path,
         default=Path("reports"),
-        help="Directory containing platform comparison backtest artifacts.",
+        help="Directory containing legacy platform report artifacts.",
+    )
+    parser.add_argument(
+        "--platform-data-dir",
+        type=Path,
+        default=Path("data/backtests"),
+        help="Directory containing regenerated platform backtest artifacts.",
     )
     parser.add_argument(
         "--output",
@@ -39,6 +45,7 @@ def main() -> int:
     matrix = build_comparison_matrix(
         comparisons_dir=args.comparisons_dir,
         reports_dir=args.reports_dir,
+        platform_data_dir=args.platform_data_dir,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(matrix, indent=2), encoding="utf-8")

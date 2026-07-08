@@ -14,6 +14,8 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -91,6 +93,86 @@ def _load_daily_rows(path: Path, *, strategy: str, symbol: str, timeframe: str) 
             }
         )
     return rows
+
+
+def _run_strategy_matrix_cell(
+    *,
+    entry: StrategyEntry,
+    normalized_symbols: list[str],
+    normalized_timeframes: list[str],
+    start: str,
+    end: str,
+    engine: str,
+    capital: float,
+    risk_pct: float | None,
+    max_position_pct: float | None,
+    max_leverage: float | None,
+    intrabar_resolution: str,
+    params: dict[str, Any],
+    output_dir: Path,
+    data_dir: str,
+    max_workers: int,
+    timeout_seconds: int,
+    skip_existing: bool,
+    use_subprocess: bool,
+    save_sqlite: bool,
+    keep_indicators: bool,
+) -> dict[str, Any]:
+    strategy_engine = engine or entry.engine
+    strategy_output_dir = output_dir / entry.slug
+    strategy_output_dir.mkdir(parents=True, exist_ok=True)
+    logger.info("Running matrix strategy=%s engine=%s", entry.slug, strategy_engine)
+    summary = run_backtest_grid(
+        strategy=str(entry.file_path),
+        symbols=normalized_symbols,
+        timeframes=normalized_timeframes,
+        start=start,
+        end=end,
+        engine=strategy_engine,
+        capital=capital,
+        risk_pct=risk_pct,
+        max_position_pct=max_position_pct,
+        max_leverage=max_leverage,
+        intrabar_resolution=intrabar_resolution,
+        params=params,
+        output_dir=strategy_output_dir,
+        data_dir=data_dir,
+        max_workers=max_workers,
+        timeout_seconds=timeout_seconds,
+        skip_existing=skip_existing,
+        use_subprocess=use_subprocess,
+        save_sqlite=save_sqlite,
+        keep_indicators=keep_indicators,
+    )
+    (strategy_output_dir / "grid_summary.json").write_text(
+        json.dumps(summary, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    rows: list[dict[str, Any]] = []
+    daily_rows: list[dict[str, Any]] = []
+    for row in summary.get("runs", []):
+        enriched = {"strategy": entry.slug, "strategy_name": entry.display_name, **row}
+        if enriched.get("backtest_id"):
+            enriched["backtest_url"] = f"/backtests/{enriched['backtest_id']}"
+            enriched["trades_url"] = f"/api/backtest/{enriched['backtest_id']}/trades"
+        enriched["matrix_node_id"] = (
+            f"{entry.slug}:{enriched.get('symbol', '')}:{enriched.get('timeframe', '')}"
+        )
+        rows.append(enriched)
+        if row.get("status") == "ok" and row.get("output"):
+            daily_rows.extend(
+                _load_daily_rows(
+                    Path(str(row["output"])),
+                    strategy=entry.slug,
+                    symbol=str(row.get("symbol", "")),
+                    timeframe=str(row.get("timeframe", "")),
+                )
+            )
+    return {
+        "summary": summary,
+        "rows": rows,
+        "daily_rows": daily_rows,
+    }
 
 
 def write_matrix_csv(output_dir: Path, rows: list[dict[str, Any]]) -> Path:
@@ -196,6 +278,7 @@ def run_backtest_matrix(
     output_dir: Path | None = None,
     data_dir: str = "",
     max_workers: int = 1,
+    strategy_workers: int | None = None,
     timeout_seconds: int = 1800,
     skip_existing: bool = False,
     use_subprocess: bool = False,
@@ -247,63 +330,79 @@ def run_backtest_matrix(
     strategy_summaries: list[dict[str, Any]] = []
     started_at = datetime.now(timezone.utc).isoformat()
 
-    for entry in entries:
-        strategy_engine = engine or entry.engine
-        strategy_output_dir = output_dir / entry.slug
-        strategy_output_dir.mkdir(parents=True, exist_ok=True)
-        logger.info("Running matrix strategy=%s engine=%s", entry.slug, strategy_engine)
-        try:
-            summary = run_backtest_grid(
-                strategy=str(entry.file_path),
-                symbols=normalized_symbols,
-                timeframes=normalized_timeframes,
-                start=start,
-                end=end,
-                engine=strategy_engine,
-                capital=capital,
-                risk_pct=risk_pct,
-                max_position_pct=max_position_pct,
-                max_leverage=max_leverage,
-                intrabar_resolution=intrabar_resolution,
-                params=params,
-                output_dir=strategy_output_dir,
-                data_dir=data_dir,
-                max_workers=max_workers,
-                timeout_seconds=timeout_seconds,
-                skip_existing=skip_existing,
-                use_subprocess=use_subprocess,
-                save_sqlite=save_sqlite,
-                keep_indicators=keep_indicators,
-            )
-            (strategy_output_dir / "grid_summary.json").write_text(
-                json.dumps(summary, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
-            strategy_summaries.append(summary)
-            for row in summary.get("runs", []):
-                enriched = {"strategy": entry.slug, "strategy_name": entry.display_name, **row}
-                all_rows.append(enriched)
-                if row.get("status") == "ok" and row.get("output"):
-                    all_daily_rows.extend(
-                        _load_daily_rows(
-                            Path(str(row["output"])),
-                            strategy=entry.slug,
-                            symbol=str(row.get("symbol", "")),
-                            timeframe=str(row.get("timeframe", "")),
-                        )
+    strategy_worker_count = strategy_workers or min(len(entries), max(1, os.cpu_count() or 1))
+    strategy_worker_count = max(1, min(strategy_worker_count, len(entries)))
+    strategy_tasks = [
+        {
+            "entry": entry,
+            "normalized_symbols": normalized_symbols,
+            "normalized_timeframes": normalized_timeframes,
+            "start": start,
+            "end": end,
+            "engine": engine,
+            "capital": capital,
+            "risk_pct": risk_pct,
+            "max_position_pct": max_position_pct,
+            "max_leverage": max_leverage,
+            "intrabar_resolution": intrabar_resolution,
+            "params": params,
+            "output_dir": output_dir,
+            "data_dir": data_dir,
+            "max_workers": max_workers,
+            "timeout_seconds": timeout_seconds,
+            "skip_existing": skip_existing,
+            "use_subprocess": use_subprocess,
+            "save_sqlite": save_sqlite,
+            "keep_indicators": keep_indicators,
+        }
+        for entry in entries
+    ]
+
+    def handle_strategy_result(entry: StrategyEntry, result: dict[str, Any]) -> None:
+        strategy_summaries.append(result["summary"])
+        all_rows.extend(result["rows"])
+        all_daily_rows.extend(result["daily_rows"])
+
+    if strategy_worker_count > 1:
+        with ThreadPoolExecutor(max_workers=strategy_worker_count) as executor:
+            futures = {
+                executor.submit(_run_strategy_matrix_cell, **task): task["entry"]
+                for task in strategy_tasks
+            }
+            for future in as_completed(futures):
+                entry = futures[future]
+                try:
+                    handle_strategy_result(entry, future.result())
+                except Exception as exc:
+                    logger.exception("Matrix strategy failed: %s", entry.slug)
+                    all_rows.append(
+                        {
+                            "strategy": entry.slug,
+                            "strategy_name": entry.display_name,
+                            "symbol": "",
+                            "timeframe": "",
+                            "status": "failed",
+                            "error": str(exc),
+                        }
                     )
-        except Exception as exc:
-            logger.exception("Matrix strategy failed: %s", entry.slug)
-            all_rows.append(
-                {
-                    "strategy": entry.slug,
-                    "strategy_name": entry.display_name,
-                    "symbol": "",
-                    "timeframe": "",
-                    "status": "failed",
-                    "error": str(exc),
-                }
-            )
+    else:
+        for task in strategy_tasks:
+            entry = task["entry"]
+            assert isinstance(entry, StrategyEntry)
+            try:
+                handle_strategy_result(entry, _run_strategy_matrix_cell(**task))
+            except Exception as exc:
+                logger.exception("Matrix strategy failed: %s", entry.slug)
+                all_rows.append(
+                    {
+                        "strategy": entry.slug,
+                        "strategy_name": entry.display_name,
+                        "symbol": "",
+                        "timeframe": "",
+                        "status": "failed",
+                        "error": str(exc),
+                    }
+                )
 
     all_rows.sort(key=lambda row: (row.get("strategy", ""), row.get("symbol", ""), row.get("timeframe", "")))
     all_daily_rows.sort(key=lambda row: (row.get("strategy", ""), row.get("symbol", ""), row.get("timeframe", ""), row.get("time", "")))
@@ -330,6 +429,7 @@ def run_backtest_matrix(
         "output_dir": str(output_dir),
         "data_dir": data_dir,
         "max_workers": max_workers,
+        "strategy_workers": strategy_worker_count,
         "timeout_seconds": timeout_seconds,
         "skip_existing": skip_existing,
         "use_subprocess": use_subprocess,
@@ -368,6 +468,7 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, default=MATRIX_OUTPUT_DIR)
     parser.add_argument("--data-dir", default="", help="Override data directory")
     parser.add_argument("--max-workers", type=int, default=1, help="Parallel backtest cells per strategy")
+    parser.add_argument("--strategy-workers", type=int, default=None, help="Parallel strategies in the matrix runner")
     parser.add_argument("--timeout-seconds", type=int, default=1800, help="Timeout per cell")
     parser.add_argument("--resume", action="store_true", help="Skip/rehydrate cells with existing output JSON")
     parser.add_argument("--subprocess", action="store_true", help="Run each grid cell via runner.cli subprocess")
@@ -390,6 +491,7 @@ def main() -> None:
         output_dir=args.output_dir,
         data_dir=args.data_dir,
         max_workers=args.max_workers,
+        strategy_workers=args.strategy_workers,
         timeout_seconds=args.timeout_seconds,
         skip_existing=args.resume,
         use_subprocess=args.subprocess,

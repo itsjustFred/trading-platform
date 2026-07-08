@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Callable
@@ -233,6 +234,30 @@ class TradeEngine:
         take_profit_price: float | None = None,
     ) -> float:
         max_leverage = float(self.config.max_leverage or 1.0)
+        fixed_risk_amount = self.config.parameters.get("fixed_risk_amount")
+        if fixed_risk_amount is None:
+            fixed_risk_amount = self.config.parameters.get("Fixed_Risk_Amount")
+
+        if fixed_risk_amount is not None and stop_loss_price is not None:
+            risk_amount = float(fixed_risk_amount)
+            risk_distance = abs(float(entry_price) - float(stop_loss_price))
+            if risk_amount > 0 and risk_distance > 0:
+                tick_value = float(self.config.parameters.get("tick_value", 1.0) or 1.0)
+                tick_size = float(self.config.parameters.get("tick_size", 1.0) or 1.0)
+                lot_step = float(self.config.parameters.get("lot_step", 0.0) or 0.0)
+                min_lot = float(self.config.parameters.get("min_lot", 0.0) or 0.0)
+                max_lot = float(self.config.parameters.get("max_lot", 0.0) or 0.0)
+                shares = (risk_amount / risk_distance) * (tick_size / tick_value)
+                if lot_step > 0:
+                    shares = math.floor((shares / lot_step) + 1e-12) * lot_step
+                if min_lot > 0:
+                    shares = max(shares, min_lot)
+                if max_lot > 0:
+                    shares = min(shares, max_lot)
+                if bool(self.config.parameters.get("cap_fixed_risk_by_leverage", True)):
+                    max_value = self.equity * max_leverage
+                    shares = min(shares, max_value / entry_price)
+                return max(shares, 0.0)
 
         if self._risk_enabled:
             signal = TradeSignal(
