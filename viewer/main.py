@@ -122,6 +122,8 @@ from shared.database import (
 from runner.engines.signal_replay_adapter import ReplaySignal, SignalReplayAdapter
 from risk.config import RiskConfig
 from signal_bots.registry import get_signal_processor, list_signal_processor_options
+from live_runner.ctrader_deployment import build_ctrader_deployment_plan
+from live_runner.stockkit_routing import validate_stockkit_deployment_route
 try:
     from live_runner.account_discovery import discover_configured_accounts
 except ModuleNotFoundError:  # pragma: no cover - optional dependency for account discovery
@@ -688,6 +690,12 @@ class ServiceCreateRequest(SQLModel):
 
 class ServiceStatusUpdateRequest(SQLModel):
     status: Literal["running", "paused", "failed", "stopped"]
+
+
+class CTraderTopDeployRequest(SQLModel):
+    limit: int = 5
+    activate: bool = False
+    dry_run: bool = True
 
 
 class VerificationEvidenceCreateRequest(SQLModel):
@@ -9321,6 +9329,120 @@ async def get_live_deployments() -> list[dict[str, Any]]:
     return [_serialize_live_deployment_payload(deployment) for deployment in deployments]
 
 
+@app.get("/api/live/dashboard", response_model=dict[str, Any])
+async def get_live_dashboard() -> dict[str, Any]:
+    _log_live_endpoint_request("/api/live/dashboard")
+    accounts, deployments = await asyncio.gather(
+        asyncio.to_thread(list_live_accounts),
+        asyncio.to_thread(list_live_deployments),
+    )
+    account_payloads: list[dict[str, Any]] = []
+    active_strategies: list[dict[str, Any]] = []
+    recent_fills: list[dict[str, Any]] = []
+    total_equity = 0.0
+    active_deployments = [
+        deployment for deployment in deployments if str(deployment.status).upper() == "ACTIVE"
+    ]
+
+    for account in accounts:
+        stats = await asyncio.to_thread(_live_account_stats_payload, account.id)
+        equity = _safe_float(stats.get("current_equity"), 0.0) or 0.0
+        total_equity += equity
+        account_payloads.append(
+            {
+                **_serialize_live_account_payload(account),
+                "current_equity": equity,
+                "current_balance": _safe_float(stats.get("current_balance"), 0.0),
+                "total_trades": stats.get("total_trades", 0),
+                "total_pnl": stats.get("total_pnl", 0.0),
+            }
+        )
+        trades_payload = await _live_trades_payload(account.id)
+        recent_fills.extend(trades_payload.get("trades", [])[:10])
+
+    for deployment in active_deployments:
+        account_equity = next(
+            (
+                float(item.get("current_equity") or 0.0)
+                for item in account_payloads
+                if item.get("id") == deployment.account_id
+            ),
+            0.0,
+        )
+        allocation = (
+            account_equity / total_equity
+            if total_equity > 0 and account_equity > 0
+            else 0.0
+        )
+        active_strategies.append(
+            {
+                **_serialize_live_deployment_payload(deployment),
+                "capital_allocation": round(allocation, 6),
+                "account_equity": round(account_equity, 2),
+            }
+        )
+
+    recent_fills.sort(key=lambda item: str(item.get("execution_timestamp") or ""), reverse=True)
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "accounts": account_payloads,
+        "active_strategies": active_strategies,
+        "capital": {
+            "total_equity": round(total_equity, 2),
+            "active_account_count": len(account_payloads),
+            "active_strategy_count": len(active_strategies),
+        },
+        "recent_fills": recent_fills[:25],
+    }
+
+
+@app.post("/api/live/deployments/ctrader/top5", response_model=dict[str, Any])
+async def deploy_top_ctrader_strategies(payload: CTraderTopDeployRequest) -> dict[str, Any]:
+    limit = max(1, min(int(payload.limit or 5), 20))
+    status = "ACTIVE" if payload.activate else "PAUSED"
+    _log_live_endpoint_request(
+        "/api/live/deployments/ctrader/top5",
+        limit=limit,
+        status=status,
+        dry_run=payload.dry_run,
+    )
+    backtests, accounts = await asyncio.gather(
+        asyncio.to_thread(list_backtest_metadata_rows),
+        asyncio.to_thread(list_live_accounts),
+    )
+    plan = build_ctrader_deployment_plan(
+        backtests=backtests,
+        accounts=accounts,
+        limit=limit,
+        status=status,
+    )
+    if not plan:
+        raise HTTPException(
+            status_code=400,
+            detail="No eligible cTrader account or backtest candidates found",
+        )
+
+    if payload.dry_run:
+        return {
+            "status": "planned",
+            "dry_run": True,
+            "deployments": [_serialize_live_deployment_payload(item) for item in plan],
+        }
+
+    created: list[dict[str, Any]] = []
+    for deployment in plan:
+        try:
+            created_deployment = await asyncio.to_thread(create_live_deployment, deployment)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        created.append(_serialize_live_deployment_payload(created_deployment))
+    return {
+        "status": "created",
+        "dry_run": False,
+        "deployments": created,
+    }
+
+
 @app.post("/api/live/deployments", response_model=dict[str, Any], status_code=201)
 async def create_live_deployment_endpoint(
     payload: LiveDeploymentCreateRequest,
@@ -9427,6 +9549,10 @@ async def create_live_deployment_endpoint(
         signal_config=signal_config_payload,
         settings=payload.settings or {},
     )
+    try:
+        validate_stockkit_deployment_route(deployment)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     try:
         created = await asyncio.to_thread(create_live_deployment, deployment)
     except ValueError as exc:

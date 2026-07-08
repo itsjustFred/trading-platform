@@ -8,6 +8,7 @@ import {
   deleteLiveDeployment,
   getLiveAccounts,
   getLiveBalances,
+  getLiveDashboard,
   getLiveDeployments,
   getLivePositions,
   getSignalProcessors,
@@ -26,6 +27,7 @@ import type {
   LiveAccount,
   LiveAccountStats,
   LiveBalanceRecord,
+  LiveDashboardResponse,
   LiveDeploymentConfig,
   LiveDeploymentStatus,
   LiveTradeSlippage,
@@ -185,6 +187,7 @@ export function LiveHubPage() {
   const [accounts, setAccounts] = useState<LiveAccount[]>([]);
   const [cards, setCards] = useState<DeploymentCard[]>([]);
   const [statsByAccount, setStatsByAccount] = useState<Record<string, LiveHubAccountStats>>({});
+  const [dashboard, setDashboard] = useState<LiveDashboardResponse | null>(null);
   const [strategies, setStrategies] = useState<StrategyMeta[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -229,6 +232,9 @@ export function LiveHubPage() {
           getLiveAccounts(),
           getLiveDeployments(),
         ]);
+        void getLiveDashboard()
+          .then(setDashboard)
+          .catch(() => setDashboard(null));
         const statsEntries = await Promise.all(
           accountPayload.map(async (account) => {
             const [statsResult, balancesResult, positionsResult] = await Promise.allSettled([
@@ -1080,6 +1086,47 @@ export function LiveHubPage() {
         </button>
       </div>
 
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
+          gap: "10px",
+          marginBottom: "18px",
+        }}
+      >
+        <div style={telemetryCardStyle}>
+          <span style={miniStatLabelStyle}>Total Equity</span>
+          <strong style={telemetryValueStyle}>
+            ${Number(dashboard?.capital.total_equity ?? 0).toLocaleString("en-US", {
+              maximumFractionDigits: 2,
+            })}
+          </strong>
+        </div>
+        <div style={telemetryCardStyle}>
+          <span style={miniStatLabelStyle}>Active Strategies</span>
+          <strong style={telemetryValueStyle}>
+            {dashboard?.capital.active_strategy_count ?? cards.filter((card) => card.status === "ACTIVE").length}
+          </strong>
+        </div>
+        <div style={telemetryCardStyle}>
+          <span style={miniStatLabelStyle}>Recent Fills</span>
+          <strong style={telemetryValueStyle}>{dashboard?.recent_fills.length ?? 0}</strong>
+        </div>
+        <div style={telemetryCardStyle}>
+          <span style={miniStatLabelStyle}>Capital Allocation</span>
+          <strong style={telemetryValueStyle}>
+            {dashboard?.active_strategies.length
+              ? `${Math.round(
+                  dashboard.active_strategies.reduce(
+                    (total, strategy) => total + strategy.capital_allocation,
+                    0,
+                  ) * 100,
+                )}%`
+              : "0%"}
+          </strong>
+        </div>
+      </div>
+
       {loading ? (
         <div style={{ color: "var(--color-text-muted)", textAlign: "center", padding: "48px 0" }}>
           Loading live deployments...
@@ -1387,6 +1434,21 @@ const miniStatValueStyle: React.CSSProperties = {
   fontSize: "0.82rem",
   color: "#e2e8f0",
   fontWeight: 600,
+};
+
+const telemetryCardStyle: React.CSSProperties = {
+  border: "1px solid rgba(148, 163, 184, 0.2)",
+  borderRadius: "8px",
+  padding: "10px 12px",
+  background: "rgba(15, 23, 42, 0.42)",
+  display: "grid",
+  gap: "5px",
+  minHeight: "72px",
+};
+
+const telemetryValueStyle: React.CSSProperties = {
+  fontSize: "1.05rem",
+  color: "#e2e8f0",
 };
 
 function winRateBadgeStyle(rate: number): React.CSSProperties {

@@ -8,7 +8,7 @@ from live_runner.signal_sources.discord_source import (
     DiscordAuthenticationError,
     _is_discord_auth_error,
 )
-from shared.models import LiveAccountConfig
+from shared.models import LiveAccountConfig, LiveDeploymentConfig
 
 
 @dataclass(slots=True)
@@ -272,3 +272,26 @@ def test_start_missing_tasks_skips_ctrader_auth_blocked_accounts() -> None:
     )
 
     assert active_tasks == {}
+
+
+def test_stockkit_route_guard_rejects_mismatched_signal_metadata() -> None:
+    deployment = LiveDeploymentConfig(
+        strategy_name="discord::ramjet",
+        account_id="PA3T0MQAGQ51",
+        symbols=["AAPL"],
+        timeframe="1h",
+        status="ACTIVE",
+        signal_source="discord",
+        signal_source_type="discord",
+        signal_source_id="RAMJET",
+        signal_config={"signal_processor": "ramjet"},
+    )
+
+    assert daemon._deployment_matches_stockkit_route(
+        deployment,
+        {"discord_bot_name": "RAMJET"},
+    )
+    assert not daemon._deployment_matches_stockkit_route(
+        deployment,
+        {"discord_bot_name": "NITRO"},
+    )
