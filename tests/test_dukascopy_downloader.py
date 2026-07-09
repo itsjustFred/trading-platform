@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import os
 import sys
 import types
 from pathlib import Path
 from threading import Event
 
 import pandas as pd
+import pytest
 
 
 def test_native_downloader_accepts_control_events_and_reports_progress(
@@ -34,8 +36,10 @@ def test_native_downloader_accepts_control_events_and_reports_progress(
         max_retries=3,
         *,
         batch_size=None,
+        pipeline_batches=1,
         pause_ms=1000,
         report_progress=None,
+        progress_unit="files",
         stop_event=None,
         pause_event=None,
         log_callback=None,
@@ -44,7 +48,9 @@ def test_native_downloader_accepts_control_events_and_reports_progress(
         seen["stop_event"] = stop_event
         seen["pause_event"] = pause_event
         seen["batch_size"] = batch_size
+        seen["pipeline_batches"] = pipeline_batches
         seen["pause_ms"] = pause_ms
+        seen["progress_unit"] = progress_unit
         if report_progress is not None:
             report_progress(50.0, "Halfway there")
         return [(urls[0][0], b"placeholder")]
@@ -78,13 +84,16 @@ def test_native_downloader_accepts_control_events_and_reports_progress(
         pause_event=pause_event,
         stop_event=stop_event,
         report_progress=lambda pct, msg: progress_updates.append((pct, msg)),
+        pipeline_batches=3,
     )
 
     assert result.symbol == "EURUSD"
     assert seen["pause_event"] is pause_event
     assert seen["stop_event"] is stop_event
     assert seen["batch_size"] == 10
+    assert seen["pipeline_batches"] == 3
     assert seen["pause_ms"] == 1000
+    assert seen["progress_unit"] == "days"
     assert any(pct == 0.0 for pct, _ in progress_updates)
     assert any("Halfway there" in msg for _, msg in progress_updates)
     assert progress_updates[-1][0] == 100.0
@@ -174,6 +183,146 @@ def test_download_bi5_files_batches_and_increases_pause_on_throttle(monkeypatch)
     assert any("increasing pause to 2000 ms" in line for line in log_lines)
 
 
+def test_download_bi5_files_reports_custom_progress_unit(monkeypatch):
+    import data_tools.downloaders.dukascopy_native as native
+
+    class FakeConnector:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+
+    class FakeTimeout:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+
+    class FakeClientSession:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    fake_aiohttp = types.SimpleNamespace(
+        TCPConnector=FakeConnector,
+        ClientTimeout=FakeTimeout,
+        ClientSession=FakeClientSession,
+    )
+    monkeypatch.setitem(sys.modules, "aiohttp", fake_aiohttp)
+
+    async def fake_fetch_one(
+        session,
+        dt,
+        url,
+        semaphore,
+        max_retries=3,
+        *,
+        pause_event=None,
+        stop_event=None,
+    ):
+        del session, semaphore, max_retries, pause_event, stop_event
+        return native.FetchResult(dt=dt, data=url.encode("utf-8"))
+
+    async def fake_sleep_with_control(delay_seconds, pause_event, stop_event):
+        del delay_seconds, pause_event, stop_event
+        return None
+
+    monkeypatch.setattr(native, "_fetch_one", fake_fetch_one)
+    monkeypatch.setattr(native, "_sleep_with_control", fake_sleep_with_control)
+
+    start = pd.Timestamp("2024-01-01T00:00:00Z").to_pydatetime()
+    urls = [(start, "u1"), (start, "u2")]
+    updates: list[tuple[float, str]] = []
+
+    native.asyncio.run(
+        native.download_bi5_files(
+            urls,
+            batch_size=2,
+            pause_ms=0,
+            progress_unit="days",
+            report_progress=lambda pct, msg: updates.append((pct, msg)),
+        )
+    )
+
+    assert updates[-1] == (100.0, "Downloaded 2/2 days")
+
+
+def test_download_bi5_files_pipelines_multiple_batches_before_pause(monkeypatch):
+    import data_tools.downloaders.dukascopy_native as native
+
+    class FakeConnector:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+
+    class FakeTimeout:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+
+    class FakeClientSession:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    fake_aiohttp = types.SimpleNamespace(
+        TCPConnector=FakeConnector,
+        ClientTimeout=FakeTimeout,
+        ClientSession=FakeClientSession,
+    )
+    monkeypatch.setitem(sys.modules, "aiohttp", fake_aiohttp)
+
+    fetch_calls: list[str] = []
+    sleep_calls: list[float] = []
+
+    async def fake_fetch_one(
+        session,
+        dt,
+        url,
+        semaphore,
+        max_retries=3,
+        *,
+        pause_event=None,
+        stop_event=None,
+    ):
+        del session, semaphore, max_retries, pause_event, stop_event
+        fetch_calls.append(url)
+        return native.FetchResult(dt=dt, data=url.encode("utf-8"))
+
+    async def fake_sleep_with_control(delay_seconds, pause_event, stop_event):
+        del pause_event, stop_event
+        sleep_calls.append(delay_seconds)
+
+    monkeypatch.setattr(native, "_fetch_one", fake_fetch_one)
+    monkeypatch.setattr(native, "_sleep_with_control", fake_sleep_with_control)
+
+    start = pd.Timestamp("2024-01-01T00:00:00Z").to_pydatetime()
+    urls = [(start, f"u{i}") for i in range(1, 5)]
+
+    results = native.asyncio.run(
+        native.download_bi5_files(
+            urls,
+            batch_size=1,
+            pipeline_batches=2,
+            pause_ms=500,
+        )
+    )
+
+    assert [data.decode("utf-8") for _, data in results] == ["u1", "u2", "u3", "u4"]
+    assert fetch_calls == ["u1", "u2", "u3", "u4"]
+    assert sleep_calls == [0.5]
+
+
 def test_download_bi5_files_caps_backoff_and_resets_after_cooldown(monkeypatch):
     import data_tools.downloaders.dukascopy_native as native
 
@@ -253,3 +402,152 @@ def test_download_bi5_files_caps_backoff_and_resets_after_cooldown(monkeypatch):
     assert sleep_calls == [10.0, 15.0]
     assert any("backoff cap reached at 10000 ms" in line for line in log_lines)
     assert any("starting 15s cooldown and resetting pause" in line for line in log_lines)
+
+
+def test_jforex_classpath_bootstraps_from_jnlp_when_no_local_jars(monkeypatch, tmp_path: Path):
+    import data_tools.downloaders.jforex_dl as jforex
+
+    monkeypatch.setattr(jforex, "DATA_DIR", tmp_path)
+    monkeypatch.setenv("DUKASCOPY_JNLP_URL", "https://example.com/jforex.jnlp")
+    monkeypatch.delenv("JFOREX_CLASSPATH", raising=False)
+    monkeypatch.delenv("JFOREX_JARS", raising=False)
+    monkeypatch.delenv("JFOREX_HOME", raising=False)
+
+    def fake_download_jars(jnlp_url, target_dir):
+        target_dir.mkdir(parents=True, exist_ok=True)
+        api_jar = target_dir / "api.jar"
+        sdk_jar = target_dir / "sdk.jar"
+        api_jar.write_text("api", encoding="utf-8")
+        sdk_jar.write_text("sdk", encoding="utf-8")
+        return [api_jar, sdk_jar]
+
+    monkeypatch.setattr(
+        jforex,
+        "_download_jforex_jars_from_jnlp",
+        fake_download_jars,
+    )
+
+    classpath = jforex._resolve_jforex_classpath()
+    expected = [str(tmp_path / ".jforex-sdk" / "api.jar"), str(tmp_path / ".jforex-sdk" / "sdk.jar")]
+    assert classpath == expected
+
+
+def test_jforex_classpath_prefers_explicit_env(monkeypatch):
+    import data_tools.downloaders.jforex_dl as jforex
+
+    monkeypatch.setenv("JFOREX_CLASSPATH", os.pathsep.join(["/tmp/a.jar", "/tmp/b.jar"]))
+    classpath = jforex._resolve_jforex_classpath()
+    assert classpath == ["/tmp/a.jar", "/tmp/b.jar"]
+
+
+def test_jforex_discovers_and_dedupes_resolved_jvm_paths(monkeypatch, tmp_path: Path):
+    import data_tools.downloaders.jforex_dl as jforex
+
+    java_home = tmp_path / "jdk"
+    jvm_path = java_home / "bin" / "server" / "jvm.dll"
+    jvm_path.parent.mkdir(parents=True)
+    jvm_path.write_text("fake-jvm", encoding="utf-8")
+
+    monkeypatch.setenv("JAVA_HOME", str(java_home))
+    monkeypatch.setenv("JFOREX_TRUSTED_JAVA_HOME", str(java_home))
+    monkeypatch.setenv("JFOREX_ALLOW_CUSTOM_JVM", "1")
+    monkeypatch.setenv("JFOREX_JVM_PATH", str(jvm_path))
+    monkeypatch.setattr(jforex, "JPYPE_AVAILABLE", False)
+
+    discovered = jforex._discover_jvm_paths()
+
+    assert discovered == [str(jvm_path.resolve(strict=True))]
+
+
+def test_jforex_accepts_legacy_java_home_jvm_layout(monkeypatch, tmp_path: Path):
+    import data_tools.downloaders.jforex_dl as jforex
+
+    java_home = tmp_path / "legacy-jdk"
+    jvm_path = java_home / "jre" / "bin" / "server" / "jvm.dll"
+    jvm_path.parent.mkdir(parents=True)
+    jvm_path.write_text("fake-jvm", encoding="utf-8")
+
+    monkeypatch.setenv("JFOREX_TRUSTED_JAVA_HOME", str(java_home))
+
+    assert jforex._is_trusted_custom_jvm_path(jvm_path)
+
+
+def test_jforex_formats_startup_diagnostics(monkeypatch):
+    import data_tools.downloaders.jforex_dl as jforex
+
+    diagnostics = jforex._format_jvm_startup_diagnostics(
+        classpath=["/tmp/sdk.jar"],
+        classpath_source="explicit env",
+        candidates=[("/tmp/jvm.dll", "access denied")],
+        final_error=RuntimeError("boom"),
+    )
+
+    assert "Classpath source: explicit env" in diagnostics
+    assert "Classpath entries (1):" in diagnostics
+    assert "JVM candidates tried (1):" in diagnostics
+    assert "reason: access denied" in diagnostics
+    assert "Last error: boom" in diagnostics
+
+
+def test_jforex_cli_validation_raises_value_error(monkeypatch):
+    import data_tools.downloaders.jforex_dl as jforex
+
+    monkeypatch.setattr(
+        jforex.argparse.ArgumentParser,
+        "parse_args",
+        lambda self: types.SimpleNamespace(
+            symbols=None,
+            timeframes="1h",
+            start="2024-01-01",
+            end="2024-01-02",
+            output=str(Path(".")),
+            offer_side="bid",
+            query_timeout_seconds=900,
+            list=False,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="--symbols is required"):
+        jforex.main()
+
+
+def test_jforex_aligns_daily_query_range_to_bar_boundaries():
+    import data_tools.downloaders.jforex_dl as jforex
+
+    start_dt = jforex._parse_datetime("2025-01-01", is_end=False)
+    end_dt = jforex._parse_datetime("2025-01-31", is_end=True)
+    start_ms = int(start_dt.timestamp() * 1000)
+    end_ms = int(end_dt.timestamp() * 1000)
+
+    aligned_start, aligned_end = jforex._align_bar_query_range("1d", start_ms, end_ms)
+
+    expected_end = int(jforex._parse_datetime("2025-01-31", is_end=False).timestamp() * 1000)
+    assert aligned_start == start_ms
+    assert aligned_end == expected_end
+
+
+def test_jforex_aligns_hourly_query_range_to_hour_starts():
+    import data_tools.downloaders.jforex_dl as jforex
+
+    start_ms = int(pd.Timestamp("2025-01-01T00:17:15Z").timestamp() * 1000)
+    end_ms = int(pd.Timestamp("2025-01-01T03:59:59.900Z").timestamp() * 1000)
+
+    aligned_start, aligned_end = jforex._align_bar_query_range("1h", start_ms, end_ms)
+
+    assert aligned_start == int(pd.Timestamp("2025-01-01T00:00:00Z").timestamp() * 1000)
+    assert aligned_end == int(pd.Timestamp("2025-01-01T03:00:00Z").timestamp() * 1000)
+
+
+def test_jforex_normalize_timeframe_aliases():
+    import data_tools.downloaders.jforex_dl as jforex
+
+    assert jforex._normalize_timeframe("m1") == "1m"
+    assert jforex._normalize_timeframe("h1") == "1h"
+    assert jforex._normalize_timeframe("d1") == "1d"
+    assert jforex._normalize_timeframe("1h") == "1h"
+
+
+def test_jforex_daily_window_equals_one_day():
+    import data_tools.downloaders.jforex_dl as jforex
+
+    assert jforex.WINDOW_DAYS_BY_BASE_TF["1d"] == 1

@@ -1,0 +1,26 @@
+accounts:
+  - id: alpaca-paper
+    broker: alpaca
+  - id: ctrader-live
+    broker: ctrader
+
+deployments:
+  - strategy_name: us_equities_momentum
+    account_id: alpaca-paper
+    symbols:
+      - AAPL
+      - MSFT
+    timeframe: 1h
+    signal_source: internal
+    signal_config: {}
+
+  - strategy_name: fx_breakout
+    account_id: ctrader-live
+    symbols:
+      - EURUSD
+      - XAUUSD
+    timeframe: 15m
+    signal_source: discord
+    signal_config:
+      channel_id: "123456789012345678"
+      wait_candle_close: true

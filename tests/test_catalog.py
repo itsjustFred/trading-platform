@@ -1,14 +1,10 @@
-"""Tests for data_tools.catalog_builder."""
-
-import data_tools.catalog_builder as catalog_builder
 import json
-import os
-import tempfile
 from pathlib import Path
 
 import pandas as pd
 import pytest
 
+import data_tools.catalog_builder as catalog_builder
 from data_tools.catalog_builder import build_catalog
 
 
@@ -50,6 +46,7 @@ def test_build_catalog(sample_data_dir):
     assert "timestamp" in ds["columns"]
     assert ds["start"] == "2024-01-01"
     assert ds["end"] == "2024-01-05"
+    assert ds["last_updated"] is not None
 
     assert len(catalog["universes"]) == 1
     assert catalog["universes"][0]["name"] == "test"
@@ -72,6 +69,7 @@ def test_build_catalog_reuses_cached_metadata_for_unchanged_files(sample_data_di
     assert ds["start"] == "2024-01-01"
     assert ds["end"] == "2024-01-05"
     assert ds["rows"] == 100
+    assert ds["last_updated"] is not None
 
 
 def test_build_catalog_handles_legacy_flat_dolthub_exports(tmp_path):
@@ -97,6 +95,192 @@ def test_build_catalog_handles_legacy_flat_dolthub_exports(tmp_path):
     assert ds["region"] == "US"
     assert ds["start"] == "2024-02-01"
     assert ds["end"] == "2024-02-03"
+
+
+def test_build_catalog_groups_segmented_files_into_single_dataset(tmp_path):
+    symbol_dir = tmp_path / "ohlcv" / "dukascopy" / "forex" / "EURUSD"
+    symbol_dir.mkdir(parents=True)
+
+    jan = pd.DataFrame({
+        "timestamp": pd.to_datetime(
+            ["2024-01-01T00:00:00Z", "2024-01-31T23:59:59Z"],
+            utc=True,
+        ),
+        "bid": [1.10, 1.20],
+        "ask": [1.11, 1.21],
+    })
+    feb = pd.DataFrame({
+        "timestamp": pd.to_datetime(
+            ["2024-02-01T00:00:00Z", "2024-02-28T23:59:59Z"],
+            utc=True,
+        ),
+        "bid": [1.30, 1.40],
+        "ask": [1.31, 1.41],
+    })
+
+    jan.to_parquet(symbol_dir / "tick_2024_01.parquet", index=False)
+    feb.to_parquet(symbol_dir / "tick_2024_02.parquet", index=False)
+
+    catalog = build_catalog(tmp_path)
+
+    assert len(catalog["ohlcv"]) == 1
+    ds = catalog["ohlcv"][0]
+    assert ds["symbol"] == "EURUSD"
+    assert ds["timeframe"] == "tick"
+    assert ds["rows"] == 4
+    assert ds["start"] == "2024-01-01"
+    assert ds["end"] == "2024-02-28"
+    assert ds["segment_count"] == 2
+    assert [segment["segment"] for segment in ds["segments"]] == ["2024_01", "2024_02"]
+    assert {Path(segment["path"]).name for segment in ds["segments"]} == {
+        "tick_2024_01.parquet",
+        "tick_2024_02.parquet",
+    }
+
+    assert catalog["summary"]["total_datasets"] == 1
+    assert catalog["summary"]["symbols"] == 1
+    assert catalog["summary"]["sources"] == ["dukascopy"]
+    assert catalog["summary"]["timeframes"] == ["tick"]
+
+
+def test_build_catalog_groups_symbol_prefixed_segmented_files_into_single_dataset(tmp_path):
+    ohlcv_root = tmp_path / "ohlcv" / "dukascopy" / "forex"
+    ohlcv_root.mkdir(parents=True)
+
+    jan = pd.DataFrame({
+        "timestamp": pd.to_datetime(
+            ["2024-01-01T00:00:00Z", "2024-01-31T23:59:59Z"],
+            utc=True,
+        ),
+        "bid": [2000.1, 2010.2],
+        "ask": [2000.3, 2010.4],
+    })
+    feb = pd.DataFrame({
+        "timestamp": pd.to_datetime(
+            ["2024-02-01T00:00:00Z", "2024-02-29T23:59:59Z"],
+            utc=True,
+        ),
+        "bid": [2020.1, 2030.2],
+        "ask": [2020.3, 2030.4],
+    })
+
+    jan.to_parquet(ohlcv_root / "XAUUSD_tick_2024_01.parquet", index=False)
+    feb.to_parquet(ohlcv_root / "XAUUSD_tick_2024_02.parquet", index=False)
+
+    catalog = build_catalog(tmp_path)
+
+    assert len(catalog["ohlcv"]) == 1
+    ds = catalog["ohlcv"][0]
+    assert ds["source"] == "dukascopy"
+    assert ds["asset_class"] == "forex"
+    assert ds["symbol"] == "XAUUSD"
+    assert ds["timeframe"] == "tick"
+    assert ds["rows"] == 4
+    assert ds["start"] == "2024-01-01"
+    assert ds["end"] == "2024-02-29"
+    assert ds["segment_count"] == 2
+    assert [segment["segment"] for segment in ds["segments"]] == ["2024_01", "2024_02"]
+    assert {Path(segment["path"]).name for segment in ds["segments"]} == {
+        "XAUUSD_tick_2024_01.parquet",
+        "XAUUSD_tick_2024_02.parquet",
+    }
+
+
+def test_build_catalog_merges_same_symbol_timeframe_across_sources(tmp_path):
+    dukascopy_dir = tmp_path / "ohlcv" / "dukascopy" / "forex" / "XAUUSD"
+    histdata_dir = tmp_path / "ohlcv" / "histdata" / "forex" / "XAUUSD"
+    dukascopy_dir.mkdir(parents=True)
+    histdata_dir.mkdir(parents=True)
+
+    jan = pd.DataFrame({
+        "timestamp": pd.to_datetime(
+            ["2024-01-01T00:00:00Z", "2024-01-31T23:59:59Z"],
+            utc=True,
+        ),
+        "bid": [2000.1, 2010.2],
+        "ask": [2000.3, 2010.4],
+    })
+    feb = pd.DataFrame({
+        "timestamp": pd.to_datetime(
+            ["2024-02-01T00:00:00Z", "2024-02-29T23:59:59Z"],
+            utc=True,
+        ),
+        "bid": [2020.1, 2030.2],
+        "ask": [2020.3, 2030.4],
+    })
+
+    jan.to_parquet(dukascopy_dir / "4h_2024_01.parquet", index=False)
+    feb.to_parquet(histdata_dir / "4h_2024_02.parquet", index=False)
+
+    catalog = build_catalog(tmp_path)
+
+    assert len(catalog["ohlcv"]) == 1
+    ds = catalog["ohlcv"][0]
+    assert ds["symbol"] == "XAUUSD"
+    assert ds["timeframe"] == "4h"
+    assert ds["source"] == "mixed"
+    assert ds["asset_class"] == "forex"
+    assert ds["sources"] == ["dukascopy", "histdata"]
+    assert ds["rows"] == 4
+    assert ds["row_count"] == 4
+    assert ds["start"] == "2024-01-01"
+    assert ds["end"] == "2024-02-29"
+    assert ds["start_date"] == "2024-01-01"
+    assert ds["end_date"] == "2024-02-29"
+    assert ds["segment_count"] == 2
+    assert ds["file_count"] == 2
+    assert {Path(path).name for path in ds["files"]} == {
+        "4h_2024_01.parquet",
+        "4h_2024_02.parquet",
+    }
+    assert {Path(segment["path"]).name for segment in ds["segments"]} == {
+        "4h_2024_01.parquet",
+        "4h_2024_02.parquet",
+    }
+
+
+def test_build_catalog_normalizes_timeframe_aliases_and_merges_duplicates(tmp_path):
+    symbol_dir = tmp_path / "ohlcv" / "dukascopy" / "forex" / "EURUSD"
+    symbol_dir.mkdir(parents=True)
+
+    jan = pd.DataFrame({
+        "timestamp": pd.to_datetime(
+            ["2024-01-01T00:00:00Z", "2024-01-31T23:59:59Z"],
+            utc=True,
+        ),
+        "open": [1.10, 1.20],
+        "high": [1.11, 1.21],
+        "low": [1.09, 1.19],
+        "close": [1.105, 1.205],
+        "volume": [10, 12],
+    })
+    feb = pd.DataFrame({
+        "timestamp": pd.to_datetime(
+            ["2024-02-01T00:00:00Z", "2024-02-29T23:59:59Z"],
+            utc=True,
+        ),
+        "open": [1.30, 1.40],
+        "high": [1.31, 1.41],
+        "low": [1.29, 1.39],
+        "close": [1.305, 1.405],
+        "volume": [14, 16],
+    })
+
+    jan.to_parquet(symbol_dir / "m1.parquet", index=False)
+    feb.to_parquet(symbol_dir / "1m.parquet", index=False)
+
+    catalog = build_catalog(tmp_path)
+
+    assert len(catalog["ohlcv"]) == 1
+    ds = catalog["ohlcv"][0]
+    assert ds["symbol"] == "EURUSD"
+    assert ds["timeframe"] == "1m"
+    assert ds["rows"] == 4
+    assert ds["start"] == "2024-01-01"
+    assert ds["end"] == "2024-02-29"
+    assert ds["file_count"] == 2
+    assert {Path(path).name for path in ds["files"]} == {"m1.parquet", "1m.parquet"}
+    assert catalog["summary"]["timeframes"] == ["1m"]
 
 
 def test_empty_catalog(tmp_path):

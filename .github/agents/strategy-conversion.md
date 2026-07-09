@@ -129,6 +129,8 @@ Wähle das Engine-Framework nach dieser Entscheidungsmatrix und dokumentiere die
 STRATEGY_META = {
     "name": "<Strategiename>",
     "version": "1.0.0",
+    "source_url": "<direkter Link zur Originalstrategie (Gist/Repo/Script)>",
+    "notes": "<Markdown: bekannte Bugs, Limitierungen, Besonderheiten>",
     "tags": {
         "type": ["<trend-following|mean-reversion|breakout|momentum|...>"],
         "source": "<original-quelle oder link>",
@@ -138,6 +140,10 @@ STRATEGY_META = {
     },
 }
 ```
+
+   **Pflichtregel:** `source_url` und `notes` müssen immer explizit gefüllt sein (kein Weglassen).  
+   - `source_url`: direkter URL zur primären Quelle (GitHub, Gist, TradingView, Repo-Datei).  
+   - `notes`: Markdown-Notizen mit Bugs, bekannten Abweichungen zur Original-Logik, offenen Punkten und wichtigen Betriebs-Hinweisen.
 
 3. **Pflicht — Trade-`meta`-Felder:** Schreibe alle für die spätere Validierung relevanten Indikator-Werte in `Trade.meta`. Mindestpflichtfelder:
    - `sl_price` — berechneter Stop-Loss-Preis zum Zeitpunkt des Entries
@@ -167,7 +173,11 @@ STRATEGY_META = {
 
 4. Für vectorbt-Strategies: Die bevorzugte Schnittstelle ist `return entries, exits, indicators_dict`. Darin müssen alle logikrelevanten Indikatoren enthalten sein; `sl_price`/`stop_loss` und ATR-bezogene Werte sind Pflicht, sobald sie Risk-Sizing oder Exit-Logik beeinflussen. Legacy-DataFrame-Rückgaben sind nur für Altcode tolerierbar und müssen die gleiche Meta-Information transportieren.
 
-5. **Gate:** Compilierbarkeit prüfen:
+5. **Partial Exits (Pflicht):** Wenn die Pine-Strategie Teilverkäufe nutzt (z. B. TP1 50 %, Runner 50 %), muss die Strategie ein Array von Custom-Exits oder ein Size-Array zurückgeben, das von Vectorbt unterstützt wird. Generiere zusätzlich für jeden Partial Exit ein Marker-Drawing im `drawings` Array (z. B. `shape: arrowDown`, `text: "TP1 50%"`).
+
+6. **Plots (Pflicht):** Alle `plot()`, `plotshape()` oder `bgcolor()` aus PineScript **müssen** in das `drawings` Array (`type: line`, `marker`, `box`) übersetzt werden, damit der User die Trades visuell verifizieren kann.
+
+7. **Gate:** Compilierbarkeit prüfen:
    ```bash
    python -c "import importlib.util; spec = importlib.util.spec_from_file_location('s', 'strategies/<name>/<name>.py'); mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod); print('OK')"
    ```

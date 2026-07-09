@@ -5,11 +5,13 @@ import {
   getBacktestStats,
   getBacktestTrades,
   getBacktestEquity,
+  getBacktestCapm,
   getBenchmark,
   renameBacktest,
+  deleteBacktest,
 } from "../api/client";
 import { StatCard } from "../components/StatCard";
-import { DataTable } from "../components/DataTable";
+import { TradeTable, type TradeTableRow } from "../components/TradeTable";
 import { RenameModal } from "../components/RenameModal";
 import { OptimizeModal } from "../components/OptimizeModal";
 import { ArrowLeft, ArrowUpRight, PencilLine, Target } from "lucide-react";
@@ -22,48 +24,112 @@ import {
   CrosshairMode,
 } from "lightweight-charts";
 import type { IChartApi, Time } from "lightweight-charts";
-import type { BacktestInfo, BacktestStats, EquityPoint, Trade } from "../api/types";
+import {
+  CartesianGrid,
+  ReferenceLine,
+  Scatter,
+  ScatterChart,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
+import type {
+  BacktestCapmResponse,
+  BacktestInfo,
+  BacktestStats,
+  EquityPoint,
+  Trade,
+} from "../api/types";
 import { formatPValue, pValueColor } from "../utils/stats";
+import { useToast } from "../components/ToastProvider";
 
 const BENCHMARK_SYMBOLS = ["SPY", "QQQ", "IWM", "DIA", "GLD", "TLT", "XAUUSD"];
+const TRADE_PAGE_SIZE = 100;
+
+function normalizeEquityPoints(points: EquityPoint[] | null | undefined): EquityPoint[] {
+  if (!Array.isArray(points)) return [];
+  const normalized = points
+    .map((point) => {
+      const time = typeof point?.time === "number" ? point.time : Number(point?.time);
+      const equity = typeof point?.equity === "number" ? point.equity : Number(point?.equity);
+      if (!Number.isFinite(time) || !Number.isFinite(equity)) return null;
+      return { time, equity };
+    })
+    .filter((point): point is EquityPoint => point !== null)
+    .sort((left, right) => left.time - right.time);
+
+  const deduped: EquityPoint[] = [];
+  for (const point of normalized) {
+    if (deduped.length > 0 && deduped[deduped.length - 1].time === point.time) {
+      deduped[deduped.length - 1] = point;
+      continue;
+    }
+    deduped.push(point);
+  }
+  return deduped;
+}
 
 export function BacktestDetailPage() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
+  const { showToast } = useToast();
   const [info, setInfo] = useState<BacktestInfo | null>(null);
   const [stats, setStats] = useState<BacktestStats | null>(null);
   const [trades, setTrades] = useState<Trade[]>([]);
+  const [tradePage, setTradePage] = useState(1);
+  const [hasMoreTrades, setHasMoreTrades] = useState(false);
+  const [tradesLoading, setTradesLoading] = useState(false);
   const [equity, setEquity] = useState<EquityPoint[]>([]);
   const [benchmarkSymbol, setBenchmarkSymbol] = useState("");
   const [benchmarkData, setBenchmarkData] = useState<any[]>([]);
+  const [capmData, setCapmData] = useState<BacktestCapmResponse | null>(null);
+  const [capmLoading, setCapmLoading] = useState(false);
+  const [capmError, setCapmError] = useState("");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [showRenameModal, setShowRenameModal] = useState(false);
   const [showOptimizeModal, setShowOptimizeModal] = useState(false);
   const [savingRename, setSavingRename] = useState(false);
   const [renameError, setRenameError] = useState("");
+  const [deleting, setDeleting] = useState(false);
 
   useEffect(() => {
     if (!id) return;
     setLoading(true);
+    setTradePage(1);
     Promise.all([
       getBacktestInfo(id),
       getBacktestStats(id),
-      getBacktestTrades(id),
-      getBacktestEquity(id),
+      getBacktestEquity(id, { max_points: 4000, sampling: "minmax" }),
     ])
-      .then(([i, s, t, e]) => {
+      .then(([i, s, e]) => {
         setInfo(i);
         setStats(s);
-        setTrades(t);
-        setEquity(e);
+        setEquity(normalizeEquityPoints(e));
         setLoading(false);
       })
       .catch((err) => {
-        setError(err.message);
+        setError(err.message || String(err));
         setLoading(false);
       });
   }, [id]);
+
+  useEffect(() => {
+    if (!id) return;
+    setTradesLoading(true);
+    const offset = Math.max(0, (tradePage - 1) * TRADE_PAGE_SIZE);
+    getBacktestTrades(id, { offset, limit: TRADE_PAGE_SIZE })
+      .then((rows) => {
+        setTrades(rows || []);
+        setHasMoreTrades((rows || []).length >= TRADE_PAGE_SIZE);
+      })
+      .catch((err) => {
+        setError(err.message || String(err));
+      })
+      .finally(() => {
+        setTradesLoading(false);
+      });
+  }, [id, tradePage]);
 
   // Load benchmark data when symbol changes
   useEffect(() => {
@@ -74,22 +140,66 @@ export function BacktestDetailPage() {
     const start = info?.timeframe?.start?.slice(0, 10) || "";
     const end = info?.timeframe?.end?.slice(0, 10) || "";
     getBenchmark(benchmarkSymbol, start, end)
-      .then((data: any) => setBenchmarkData(data.equity || []))
+      .then((data: any) => setBenchmarkData(normalizeEquityPoints(data.equity || [])))
       .catch(() => setBenchmarkData([]));
   }, [benchmarkSymbol, info]);
+
+  useEffect(() => {
+    if (!id || !info) {
+      setCapmData(null);
+      return;
+    }
+    setCapmLoading(true);
+    setCapmError("");
+    getBacktestCapm(id, benchmarkSymbol || undefined)
+      .then((payload) => {
+        setCapmData(payload);
+      })
+      .catch((capmIssue: unknown) => {
+        const message =
+          capmIssue instanceof Error && capmIssue.message
+            ? capmIssue.message
+            : "Could not load CAPM data";
+        setCapmError(message);
+        setCapmData(null);
+      })
+      .finally(() => {
+        setCapmLoading(false);
+      });
+  }, [id, info, benchmarkSymbol]);
 
   const handleRename = async (nextTitle: string) => {
     if (!id) return;
     setSavingRename(true);
     setRenameError("");
     try {
-      const updated = await renameBacktest(id, nextTitle);
-      setInfo(updated);
+      await renameBacktest(id, nextTitle);
+      const refreshed = await getBacktestInfo(id);
+      setInfo(refreshed);
       setShowRenameModal(false);
     } catch (renameIssue: any) {
       setRenameError(renameIssue.message || "Could not rename backtest");
     } finally {
       setSavingRename(false);
+    }
+  };
+
+  const handleDelete = async () => {
+    if (!id || deleting) return;
+    const confirmed = window.confirm("Delete this backtest?");
+    if (!confirmed) return;
+    setDeleting(true);
+    try {
+      await deleteBacktest(id);
+      showToast("Backtest deleted.", "success");
+      navigate("/backtests", { replace: true });
+    } catch (deleteIssue: unknown) {
+      const message =
+        deleteIssue instanceof Error && deleteIssue.message
+          ? deleteIssue.message
+          : "Could not delete backtest";
+      showToast(message, "error");
+      setDeleting(false);
     }
   };
 
@@ -106,92 +216,108 @@ export function BacktestDetailPage() {
       </div>
     );
 
-  // Trade stats
-  const wins = trades.filter((t) => t.pnl > 0);
-  const losses = trades.filter((t) => t.pnl <= 0);
-  const totalPnl = trades.reduce((s, t) => s + (t.pnl || 0), 0);
-  const avgPnl = trades.length > 0 ? totalPnl / trades.length : 0;
-  const bestTrade =
-    trades.length > 0 ? Math.max(...trades.map((t) => t.pnl || 0)) : 0;
-  const worstTrade =
-    trades.length > 0 ? Math.min(...trades.map((t) => t.pnl || 0)) : 0;
+  const totalPnl =
+    typeof stats?.net_profit === "number"
+      ? stats.net_profit
+      : trades.reduce((sum, trade) => sum + (trade.pnl || 0), 0);
+  const totalTrades =
+    typeof stats?.total_trades === "number" ? stats.total_trades : trades.length;
+  const winners = typeof stats?.winners === "number" ? stats.winners : trades.filter((t) => t.pnl > 0).length;
+  const losers = typeof stats?.losers === "number" ? stats.losers : trades.filter((t) => t.pnl <= 0).length;
+  const avgPnl =
+    typeof stats?.avg_trade_pnl === "number"
+      ? stats.avg_trade_pnl
+      : trades.length > 0
+        ? totalPnl / trades.length
+        : 0;
+  const tradeStats = {
+    wins: winners,
+    losses: losers,
+    totalPnl,
+    avgPnl,
+    bestTrade:
+      typeof stats?.best_trade === "number"
+        ? stats.best_trade
+        : trades.length > 0
+          ? Math.max(...trades.map((trade) => trade.pnl || 0))
+          : 0,
+    worstTrade:
+      typeof stats?.worst_trade === "number"
+        ? stats.worst_trade
+        : trades.length > 0
+          ? Math.min(...trades.map((trade) => trade.pnl || 0))
+          : 0,
+    longTrades: trades.filter((trade) => trade.direction === "LONG").length,
+    shortTrades: trades.filter((trade) => trade.direction === "SHORT").length,
+    totalTrades,
+  };
 
-  const tradeColumns = [
-    { key: "nr", label: "#", width: "40px", align: "center" as const },
-    { key: "symbol", label: "Symbol", width: "70px", align: "center" as const },
-    {
-      key: "direction",
-      label: "Side",
-      width: "55px",
-      align: "center" as const,
-      render: (r: any) => (
-        <span
-          style={{
-            color: r.direction === "LONG" ? "#3fb950" : "#f85149",
-            fontWeight: 600,
-          }}
-        >
-          {r.direction}
-        </span>
-      ),
-    },
-    {
-      key: "entry_time_iso",
-      label: "Entry",
-      align: "center" as const,
-      render: (r: any) => (r.entry_time_iso || "").slice(0, 19),
-    },
-    {
-      key: "entry_price",
-      label: "Entry $",
-      align: "right" as const,
-      render: (r: any) => `$${r.entry_price?.toFixed(2)}`,
-    },
-    {
-      key: "exit_time_iso",
-      label: "Exit",
-      align: "center" as const,
-      render: (r: any) => (r.exit_time_iso || "").slice(0, 19),
-    },
-    {
-      key: "exit_price",
-      label: "Exit $",
-      align: "right" as const,
-      render: (r: any) => `$${r.exit_price?.toFixed(2)}`,
-    },
-    {
-      key: "quantity",
-      label: "Qty",
-      align: "right" as const,
-      render: (r: any) => r.quantity?.toFixed(2),
-    },
-    {
-      key: "pnl",
-      label: "P&L",
-      align: "right" as const,
-      render: (r: any) => (
-        <span
-          style={{ color: r.pnl >= 0 ? "#3fb950" : "#f85149", fontWeight: 600 }}
-        >
-          ${r.pnl?.toLocaleString("en-US", { maximumFractionDigits: 2 })}
-        </span>
-      ),
-    },
-    {
-      key: "pnl_pct",
-      label: "P&L %",
-      align: "right" as const,
-      render: (r: any) =>
-        r.pnl_pct != null ? (
-          <span style={{ color: r.pnl_pct >= 0 ? "#3fb950" : "#f85149" }}>
-            {r.pnl_pct?.toFixed(2)}%
-          </span>
-        ) : (
-          "—"
-        ),
-    },
-    { key: "holding_bars", label: "Bars", align: "right" as const },
-  ];
+  const toNumberOrNull = (value: unknown): number | null => {
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+    if (typeof value === "string" && value.trim()) {
+      const parsed = Number(value);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+    return null;
+  };
+
+  const tradeRows = trades.map<TradeTableRow>((trade) => {
+    const duration =
+      (trade.duration && trade.duration.trim()) ||
+      (Number.isFinite(trade.holding_bars) ? `${trade.holding_bars} bars` : "");
+    const timestamp = trade.entry_time_iso || trade.exit_time_iso || "";
+    const parsed = Date.parse(timestamp);
+    const date = Number.isFinite(parsed) ? new Date(parsed).toISOString().slice(0, 10) : "";
+    const time = Number.isFinite(parsed) ? new Date(parsed).toISOString().slice(11, 19) : timestamp;
+    const tradeMeta = (
+      trade.meta && typeof trade.meta === "object" ? trade.meta : {}
+    ) as Record<string, unknown>;
+    const signalTimestamp =
+      typeof tradeMeta.signal_timestamp === "string" ? tradeMeta.signal_timestamp : "";
+    const signalSource =
+      typeof tradeMeta.signal_source === "string"
+        ? tradeMeta.signal_source
+        : typeof info?.parameters?.signal_source === "string"
+          ? info.parameters.signal_source
+          : "";
+    const fillLagFromMeta = toNumberOrNull(tradeMeta.fill_delay_seconds);
+    const fillLagFromTimestamps = (() => {
+      const signalTimeMs = Date.parse(signalTimestamp || "");
+      const fillTimeMs = Date.parse(trade.entry_time_iso || "");
+      if (!Number.isFinite(signalTimeMs) || !Number.isFinite(fillTimeMs)) {
+        return null;
+      }
+      const diffSeconds = (fillTimeMs - signalTimeMs) / 1000;
+      return Number.isFinite(diffSeconds) ? Math.max(0, Math.round(diffSeconds)) : null;
+    })();
+    const signalStopLoss = toNumberOrNull(tradeMeta.signal_stop_loss);
+    const signalTakeProfit = toNumberOrNull(tradeMeta.signal_take_profit);
+    return {
+      id: String(trade.nr),
+      date,
+      time,
+      strategy: info?.title || info?.strategy_display_name || info?.strategy || "",
+      symbol: trade.symbol,
+      side: trade.direction,
+      signalSource,
+      signalTime: signalTimestamp,
+      fillLagSec: fillLagFromMeta ?? fillLagFromTimestamps,
+      size: trade.position_size ?? trade.quantity,
+      entryPrice: trade.entry_price,
+      exitPrice: trade.exit_price,
+      processorStopLoss: signalStopLoss,
+      processorTakeProfit: signalTakeProfit,
+      pnl: trade.pnl,
+      pnlPct: trade.pnl_pct,
+      exitReason: trade.exit_reason ?? "",
+      duration,
+    };
+  });
+
+  const engine = String(info?.engine || "")
+    .trim()
+    .toLowerCase();
+  const isSignalReplay = engine === "signal-replay" || engine === "signal_replay";
 
   return (
     <div style={{ padding: "24px" }}>
@@ -297,6 +423,11 @@ export function BacktestDetailPage() {
                 📅 {info?.timeframe?.start?.slice(0, 10)} →{" "}
                 {info?.timeframe?.end?.slice(0, 10)}
               </span>
+              {isSignalReplay ? (
+                <span style={{ marginRight: "16px" }}>
+                  📡 {String(info?.parameters?.signal_source || "signal-replay")}
+                </span>
+              ) : null}
               <span>
                 💰 ${(info?.initial_capital || 100000).toLocaleString()}
               </span>
@@ -348,53 +479,74 @@ export function BacktestDetailPage() {
             )}
           </div>
         </div>
-        {info?.strategy_slug || info?.strategy ? (
-          <div style={{ display: "flex", gap: "10px", flexWrap: "wrap" }}>
-            <button
-              type="button"
-              onClick={() => setShowOptimizeModal(true)}
-              style={{
-                display: "inline-flex",
-                alignItems: "center",
-                gap: "8px",
-                background:
-                  "linear-gradient(135deg, rgba(14,165,233,0.18), rgba(245,158,11,0.18))",
-                color: "#f8fafc",
-                border: "1px solid rgba(56,189,248,0.22)",
-                borderRadius: "10px",
-                padding: "10px 14px",
-                cursor: "pointer",
-                boxShadow: "0 16px 36px rgba(14,165,233,0.12)",
-              }}
-            >
-              <Target size={15} />
-              Optimize
-            </button>
-            <button
-              type="button"
-              onClick={() =>
-                navigate(
-                  `/strategies/${encodeURIComponent(info?.strategy_slug || info?.strategy || "")}`,
-                )
-              }
-              style={{
-                display: "inline-flex",
-                alignItems: "center",
-                gap: "8px",
-                background:
-                  "linear-gradient(135deg, rgba(88,166,255,0.18), rgba(124,58,237,0.16))",
-                color: "#c9d1d9",
-                border: "1px solid rgba(88,166,255,0.2)",
-                borderRadius: "10px",
-                padding: "10px 14px",
-                cursor: "pointer",
-              }}
-            >
-              View Strategy Details
-              <ArrowUpRight size={15} />
-            </button>
-          </div>
-        ) : null}
+        <div style={{ display: "flex", gap: "10px", flexWrap: "wrap" }}>
+          <button
+            type="button"
+            onClick={() => void handleDelete()}
+            disabled={deleting}
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: "8px",
+              background: "rgba(127, 29, 29, 0.26)",
+              color: "#fecaca",
+              border: "1px solid rgba(248,113,113,0.3)",
+              borderRadius: "10px",
+              padding: "10px 14px",
+              cursor: deleting ? "not-allowed" : "pointer",
+              opacity: deleting ? 0.65 : 1,
+            }}
+          >
+            {deleting ? "Deleting..." : "Delete"}
+          </button>
+          {info?.strategy_slug || info?.strategy ? (
+            <>
+              <button
+                type="button"
+                onClick={() => setShowOptimizeModal(true)}
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: "8px",
+                  background:
+                    "linear-gradient(135deg, rgba(14,165,233,0.18), rgba(245,158,11,0.18))",
+                  color: "#f8fafc",
+                  border: "1px solid rgba(56,189,248,0.22)",
+                  borderRadius: "10px",
+                  padding: "10px 14px",
+                  cursor: "pointer",
+                  boxShadow: "0 16px 36px rgba(14,165,233,0.12)",
+                }}
+              >
+                <Target size={15} />
+                Optimize
+              </button>
+              <button
+                type="button"
+                onClick={() =>
+                  navigate(
+                    `/strategies/${encodeURIComponent(info?.strategy_slug || info?.strategy || "")}`,
+                  )
+                }
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: "8px",
+                  background:
+                    "linear-gradient(135deg, rgba(88,166,255,0.18), rgba(124,58,237,0.16))",
+                  color: "#c9d1d9",
+                  border: "1px solid rgba(88,166,255,0.2)",
+                  borderRadius: "10px",
+                  padding: "10px 14px",
+                  cursor: "pointer",
+                }}
+              >
+                View Strategy Details
+                <ArrowUpRight size={15} />
+              </button>
+            </>
+          ) : null}
+        </div>
       </div>
 
       {/* Stats Grid */}
@@ -417,9 +569,9 @@ export function BacktestDetailPage() {
             value={stats.net_profit_pct}
             format="percent"
           />
-          <StatCard label="CAGR" value={stats.cagr} format="percent" />
+          <StatCard label="CAGR (higher = better)" value={stats.cagr} format="percent" />
           <StatCard
-            label="Sharpe Ratio"
+            label="Sharpe (higher = better)"
             value={stats.sharpe?.toFixed(3)}
             color={
               stats.sharpe > 1
@@ -435,13 +587,13 @@ export function BacktestDetailPage() {
             color={stats.sortino > 1 ? "#3fb950" : "#d29922"}
           />
           <StatCard
-            label="Max Drawdown"
+            label="Max DD (lower = better)"
             value={stats.max_drawdown_pct}
             format="percent"
             color="#f85149"
           />
           <StatCard
-            label="Win Rate"
+            label="Win Rate (higher = better)"
             value={stats.win_rate}
             format="percent"
             color={stats.win_rate > 50 ? "#3fb950" : "#f85149"}
@@ -457,7 +609,7 @@ export function BacktestDetailPage() {
             color={stats.calmar > 1 ? "#3fb950" : "#d29922"}
           />
           <StatCard
-            label="PSR"
+            label="PSR (higher = better)"
             value={
               stats.psr != null ? `${(stats.psr * 100).toFixed(1)}%` : "N/A"
             }
@@ -470,7 +622,7 @@ export function BacktestDetailPage() {
             }
           />
           <StatCard
-            label="P-Value"
+            label="p-Value (lower = better)"
             value={formatPValue(stats.p_value)}
             color={pValueColor(stats.p_value)}
           />
@@ -561,6 +713,71 @@ export function BacktestDetailPage() {
         )}
       </div>
 
+      {/* CAPM Analysis */}
+      <div
+        style={{
+          background: "var(--color-surface)",
+          border: "1px solid var(--color-border)",
+          borderRadius: "8px",
+          padding: "20px",
+          marginBottom: "20px",
+        }}
+      >
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            marginBottom: "14px",
+            gap: "10px",
+            flexWrap: "wrap",
+          }}
+        >
+          <h2 style={{ fontSize: "1rem", fontWeight: 600, margin: 0 }}>CAPM Analysis</h2>
+          <span style={{ fontSize: "0.78rem", color: "var(--color-text-muted)" }}>
+            Benchmark: {capmData?.benchmark_symbol || benchmarkSymbol || info?.symbols?.[0] || "N/A"}
+          </span>
+        </div>
+
+        {capmLoading ? (
+          <div style={{ color: "var(--color-text-muted)", padding: "14px 0" }}>
+            Loading CAPM analysis...
+          </div>
+        ) : capmError ? (
+          <div style={{ color: "var(--color-red)", padding: "14px 0" }}>Error: {capmError}</div>
+        ) : capmData ? (
+          <>
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))",
+                gap: "12px",
+                marginBottom: "16px",
+              }}
+            >
+              <StatCard
+                label="Alpha (ann.)"
+                value={capmData.alpha * 100}
+                format="percent"
+                color={capmData.alpha >= 0 ? "#3fb950" : "#f85149"}
+              />
+              <StatCard label="Beta" value={capmData.beta.toFixed(2)} color="#58a6ff" />
+              <StatCard label="R²" value={capmData.r_squared.toFixed(2)} color="#c9d1d9" />
+              <StatCard
+                label="P-Value"
+                value={capmData.p_value.toFixed(3)}
+                color={capmData.p_value < 0.05 ? "#3fb950" : "#f85149"}
+              />
+            </div>
+            <CapmScatterPlot capmData={capmData} />
+          </>
+        ) : (
+          <div style={{ color: "var(--color-text-muted)", padding: "14px 0" }}>
+            No CAPM data available.
+          </div>
+        )}
+      </div>
+
       {/* Trade Summary Bar */}
       <div
         style={{
@@ -582,34 +799,34 @@ export function BacktestDetailPage() {
             marginBottom: "14px",
           }}
         >
-          <SummaryItem label="Total Trades" value={String(trades.length)} />
+          <SummaryItem label="Total Trades" value={String(tradeStats.totalTrades)} />
           <SummaryItem
             label="Long / Short"
-            value={`${trades.filter((t) => t.direction === "LONG").length} / ${trades.filter((t) => t.direction === "SHORT").length}`}
+            value={`${tradeStats.longTrades} / ${tradeStats.shortTrades}`}
           />
           <SummaryItem
             label="Win / Loss"
-            value={`${wins.length} / ${losses.length}`}
+            value={`${tradeStats.wins} / ${tradeStats.losses}`}
             color={`#3fb950 / #f85149`}
           />
           <SummaryItem
             label="Total P&L"
-            value={`$${totalPnl.toLocaleString("en-US", { maximumFractionDigits: 2 })}`}
-            color={totalPnl >= 0 ? "#3fb950" : "#f85149"}
+            value={`$${tradeStats.totalPnl.toLocaleString("en-US", { maximumFractionDigits: 2 })}`}
+            color={tradeStats.totalPnl >= 0 ? "#3fb950" : "#f85149"}
           />
           <SummaryItem
             label="Avg P&L"
-            value={`$${avgPnl.toLocaleString("en-US", { maximumFractionDigits: 2 })}`}
-            color={avgPnl >= 0 ? "#3fb950" : "#f85149"}
+            value={`$${tradeStats.avgPnl.toLocaleString("en-US", { maximumFractionDigits: 2 })}`}
+            color={tradeStats.avgPnl >= 0 ? "#3fb950" : "#f85149"}
           />
           <SummaryItem
             label="Best Trade"
-            value={`$${bestTrade.toLocaleString("en-US", { maximumFractionDigits: 2 })}`}
+            value={`$${tradeStats.bestTrade.toLocaleString("en-US", { maximumFractionDigits: 2 })}`}
             color="#3fb950"
           />
           <SummaryItem
             label="Worst Trade"
-            value={`$${worstTrade.toLocaleString("en-US", { maximumFractionDigits: 2 })}`}
+            value={`$${tradeStats.worstTrade.toLocaleString("en-US", { maximumFractionDigits: 2 })}`}
             color="#f85149"
           />
         </div>
@@ -625,12 +842,60 @@ export function BacktestDetailPage() {
         }}
       >
         <h2 style={{ fontSize: "1rem", fontWeight: 600, marginBottom: "16px" }}>
-          Trades ({trades.length})
+          Trades (Page {tradePage}, {trades.length} rows)
         </h2>
-        <DataTable
-          columns={tradeColumns}
-          data={trades}
-          onRowClick={(row) => navigate(`/backtests/${id}/trade/${row.nr}`)}
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: "12px",
+            marginBottom: "14px",
+          }}
+        >
+          <div style={{ color: "var(--color-text-muted)", fontSize: "0.85rem" }}>
+            Loaded in pages of {TRADE_PAGE_SIZE} trades.
+          </div>
+          <div style={{ display: "flex", gap: "8px" }}>
+            <button
+              type="button"
+              onClick={() => setTradePage((current) => Math.max(1, current - 1))}
+              disabled={tradePage <= 1 || tradesLoading}
+              style={{
+                borderRadius: "8px",
+                border: "1px solid var(--color-border)",
+                background: "var(--color-surface2)",
+                color: "var(--color-text)",
+                padding: "6px 10px",
+                cursor: tradePage <= 1 || tradesLoading ? "not-allowed" : "pointer",
+              }}
+            >
+              Prev
+            </button>
+            <button
+              type="button"
+              onClick={() => setTradePage((current) => current + 1)}
+              disabled={!hasMoreTrades || tradesLoading}
+              style={{
+                borderRadius: "8px",
+                border: "1px solid var(--color-border)",
+                background: "var(--color-surface2)",
+                color: "var(--color-text)",
+                padding: "6px 10px",
+                cursor: !hasMoreTrades || tradesLoading ? "not-allowed" : "pointer",
+              }}
+            >
+              Next
+            </button>
+          </div>
+        </div>
+        {tradesLoading ? (
+          <div style={{ marginBottom: "12px", color: "var(--color-text-muted)" }}>Loading trades...</div>
+        ) : null}
+        <TradeTable
+          trades={tradeRows}
+          showSignalColumns={isSignalReplay}
+          onTradeClick={(row) => navigate(`/backtests/${id}/trade/${row.id}`)}
         />
       </div>
 
@@ -724,7 +989,9 @@ function EquityChart({
   } | null>(null);
 
   useEffect(() => {
-    if (!containerRef.current || !data.length) return;
+    const normalizedData = normalizeEquityPoints(data);
+    const normalizedBenchmark = normalizeEquityPoints(benchmark);
+    if (!containerRef.current || !normalizedData.length) return;
 
     if (chartRef.current) {
       chartRef.current.remove();
@@ -752,12 +1019,17 @@ function EquityChart({
         horzLines: { color: "#1c2128" },
       },
       crosshair: { mode: CrosshairMode.Normal },
-      timeScale: { borderColor: "#30363d", timeVisible: false },
-      rightPriceScale: { borderColor: "#30363d" },
+      timeScale: {
+        borderColor: "#30363d",
+        timeVisible: false,
+        minBarSpacing: 0.1,
+      },
+      rightPriceScale: { borderColor: "#30363d", invertScale: false },
     });
     chartRef.current = chart;
 
-    const isProfit = data[data.length - 1].equity >= data[0].equity;
+    const isProfit =
+      normalizedData[normalizedData.length - 1].equity >= normalizedData[0].equity;
     const lineColor = isProfit ? "#3fb950" : "#f85149";
 
     // Main equity area series
@@ -773,12 +1045,12 @@ function EquityChart({
       },
     });
     equitySeries.setData(
-      data.map((d) => ({ time: d.time as Time, value: d.equity })),
+      normalizedData.map((d) => ({ time: d.time as Time, value: d.equity })),
     );
 
     // Benchmark line
-    if (benchmark.length > 1) {
-      const bmScale = data[0].equity / benchmark[0].equity;
+    if (normalizedBenchmark.length > 1) {
+      const bmScale = normalizedData[0].equity / normalizedBenchmark[0].equity;
       const bmSeries = chart.addSeries(LineSeries, {
         color: "#58a6ff",
         lineWidth: 1,
@@ -791,7 +1063,7 @@ function EquityChart({
         },
       });
       bmSeries.setData(
-        benchmark.map((d) => ({
+        normalizedBenchmark.map((d) => ({
           time: d.time as Time,
           value: d.equity * bmScale,
         })),
@@ -799,8 +1071,8 @@ function EquityChart({
     }
 
     // Drawdown histogram (sub-pane)
-    let peak = data[0].equity;
-    const ddData = data.map((d) => {
+    let peak = normalizedData[0].equity;
+    const ddData = normalizedData.map((d) => {
       if (d.equity > peak) peak = d.equity;
       const dd = (d.equity - peak) / peak;
       return {
@@ -833,11 +1105,11 @@ function EquityChart({
         return;
       }
       const eq = (eqVal as any).value as number;
-      const initial = data[0].equity;
+      const initial = normalizedData[0].equity;
       const ret = (((eq - initial) / initial) * 100).toFixed(2);
       // Find drawdown
       let p = initial;
-      for (const d of data) {
+      for (const d of normalizedData) {
         if (d.time > (param.time as number)) break;
         if (d.equity > p) p = d.equity;
       }
@@ -912,6 +1184,110 @@ function EquityChart({
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+function CapmScatterPlot({ capmData }: { capmData: BacktestCapmResponse }) {
+  const points = capmData.scatter_data || [];
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const [chartWidth, setChartWidth] = useState(0);
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    const syncWidth = () => {
+      const measured = Math.floor(container.clientWidth);
+      setChartWidth((prev) => (prev !== measured ? measured : prev));
+    };
+
+    syncWidth();
+    const observer = new ResizeObserver(syncWidth);
+    observer.observe(container);
+    return () => observer.disconnect();
+  }, []);
+
+  if (!points.length) {
+    return (
+      <div style={{ color: "var(--color-text-muted)", padding: "10px 0" }}>
+        No aligned daily returns available for CAPM scatter plot.
+      </div>
+    );
+  }
+
+  const xValues = points.map((point) => point.x);
+  const minX = Math.min(...xValues);
+  const maxX = Math.max(...xValues);
+  const lineSegment: [{ x: number; y: number }, { x: number; y: number }] = [
+    { x: minX, y: capmData.regression_line.slope * minX + capmData.regression_line.intercept },
+    { x: maxX, y: capmData.regression_line.slope * maxX + capmData.regression_line.intercept },
+  ];
+
+  const formatReturn = (value: number | string) => {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) {
+      return String(value);
+    }
+    return `${(numeric * 100).toFixed(2)}%`;
+  };
+
+  return (
+    <div>
+      <div style={{ fontSize: "0.8rem", color: "var(--color-text-muted)", marginBottom: "10px" }}>
+        Beta = {capmData.beta.toFixed(2)} | Alpha = {(capmData.alpha * 100).toFixed(2)}% (ann.) | R² ={" "}
+        {capmData.r_squared.toFixed(2)}
+      </div>
+      <div ref={containerRef} style={{ width: "100%", height: "340px", minWidth: 0 }}>
+        {chartWidth > 0 ? (
+          <ScatterChart
+            width={chartWidth}
+            height={340}
+            margin={{ top: 10, right: 20, bottom: 20, left: 8 }}
+          >
+            <CartesianGrid stroke="#30363d" strokeDasharray="3 3" />
+            <XAxis
+              type="number"
+              dataKey="x"
+              name="Market Daily Returns"
+              label={{
+                value: "Market Daily Returns",
+                position: "insideBottom",
+                offset: -10,
+                fill: "#8b949e",
+              }}
+              tickFormatter={formatReturn}
+              stroke="#8b949e"
+              tick={{ fill: "#8b949e", fontSize: 12 }}
+            />
+            <YAxis
+              type="number"
+              dataKey="y"
+              name="Strategy Daily Returns"
+              label={{
+                value: "Strategy Daily Returns",
+                angle: -90,
+                position: "insideLeft",
+                fill: "#8b949e",
+              }}
+              tickFormatter={formatReturn}
+              stroke="#8b949e"
+              tick={{ fill: "#8b949e", fontSize: 12 }}
+            />
+            <Tooltip
+              cursor={{ stroke: "#8b949e", strokeDasharray: "3 3" }}
+              contentStyle={{
+                background: "#161b22",
+                border: "1px solid #30363d",
+                borderRadius: "6px",
+                color: "#c9d1d9",
+              }}
+            />
+            <Scatter name="Daily Returns" data={points} fill="#58a6ff" />
+            <ReferenceLine segment={lineSegment} stroke="#f85149" strokeWidth={2} />
+          </ScatterChart>
+        ) : null}
+      </div>
     </div>
   );
 }

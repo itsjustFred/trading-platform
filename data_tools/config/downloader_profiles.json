@@ -1,0 +1,12 @@
+{
+  "dukascopy:metals:XAUUSD:tick": {
+    "asset_class": "metals",
+    "batch_size": 8,
+    "delay_ms": 3280,
+    "files_per_sec": 0.812,
+    "sample_month": "XAUUSD_2005_03",
+    "symbol": "XAUUSD",
+    "timeframe": "tick",
+    "updated_at": "2026-03-17T06:26:06Z"
+  }
+}

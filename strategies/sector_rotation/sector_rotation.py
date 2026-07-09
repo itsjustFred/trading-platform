@@ -8,6 +8,7 @@ In the single-symbol adapter this becomes a momentum-filtered long strategy.
 STRATEGY_META = {
     "name": "Sector Rotation",
     "version": "1.0.0",
+    "source_url": "https://github.com/desenyon/quantconnect-strategies/blob/main/sector_rotation_strategy.py",
     "tags": {
         "type": ["momentum", "rotation"],
         "source": "desenyon-github",
@@ -94,4 +95,35 @@ def generate_signals(df: pd.DataFrame, params: dict):
         "exit_price": exit_price,
         "exit_reason": exit_reason,
     }
-    return entries, exits, indicators_dict
+    drawings: list[dict] = []
+    if "timestamp" in df.columns:
+        entry_times = pd.to_datetime(
+            df.loc[entries[entries].index, "timestamp"], utc=True, errors="coerce"
+        ).dropna()
+        exit_times = pd.to_datetime(
+            df.loc[exits[exits].index, "timestamp"], utc=True, errors="coerce"
+        ).dropna()
+        for ts in entry_times.iloc[:30]:
+            drawings.append(
+                {
+                    "type": "marker",
+                    "time": ts.isoformat(),
+                    "position": "belowBar",
+                    "shape": "arrowUp",
+                    "color": "#22c55e",
+                    "text": "Entry",
+                }
+            )
+        for ts in exit_times.iloc[:30]:
+            drawings.append(
+                {
+                    "type": "marker",
+                    "time": ts.isoformat(),
+                    "position": "aboveBar",
+                    "shape": "arrowDown",
+                    "color": "#ef4444",
+                    "text": "Exit",
+                }
+            )
+
+    return entries, exits, indicators_dict, drawings

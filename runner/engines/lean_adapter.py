@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from runner.converters.lean_converter import convert_lean_result
-from runner.engines.base import BacktestConfig, EngineAdapter
+from runner.engines.base import BacktestConfig, EngineAdapter, ProgressCallback
 from shared.models import BacktestResult
 
 logger = logging.getLogger(__name__)
@@ -43,7 +43,12 @@ class LeanAdapter(EngineAdapter):
     def __init__(self, lean_project_dir: str | Path | None = None):
         self.project_dir = Path(lean_project_dir) if lean_project_dir else LEAN_PROJECT_DIR
 
-    def run(self, config: BacktestConfig, strategy_path: str) -> BacktestResult:
+    def run(
+        self,
+        config: BacktestConfig,
+        strategy_path: str,
+        progress_callback: ProgressCallback | None = None,
+    ) -> BacktestResult:
         """
         Run a LEAN backtest.
 

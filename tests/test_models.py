@@ -211,12 +211,16 @@ class TestStrategyMeta:
             name="Test Strategy",
             version="1.0.0",
             tags={"type": ["momentum"], "complexity": "simple"},
+            source_url="https://example.com/strategy",
+            notes="Known caveat: avoid low-volume sessions.",
         )
         d = sm.to_dict()
         sm2 = StrategyMeta.from_dict(d)
         assert sm2.name == sm.name
         assert sm2.version == sm.version
         assert sm2.tags == sm.tags
+        assert sm2.source_url == sm.source_url
+        assert sm2.notes == sm.notes
 
     def test_minimal(self):
         sm = StrategyMeta(name="Minimal")
@@ -224,3 +228,5 @@ class TestStrategyMeta:
         assert d["name"] == "Minimal"
         assert d["version"] == "1.0.0"
         assert "tags" not in d
+        assert "source_url" not in d
+        assert "notes" not in d

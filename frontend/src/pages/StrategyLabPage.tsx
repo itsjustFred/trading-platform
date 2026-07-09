@@ -2,7 +2,7 @@ import { useMemo, useState } from "react";
 import { Bot, Sparkles, Wand2 } from "lucide-react";
 
 import { startAgentConvert } from "../api/client";
-import type { AgentModelId } from "../api/types";
+import type { AgentModelId, AgentProviderId } from "../api/types";
 import { LiveTerminal } from "../components/LiveTerminal";
 
 const sampleCode = `//@version=5
@@ -34,12 +34,21 @@ const AI_MODELS: Array<{ label: string; value: AgentModelId }> = [
   },
 ];
 
+const PROVIDER_OPTIONS: Array<{ label: string; value: AgentProviderId }> = [
+  { label: "NVIDIA NIM", value: "nim" },
+  { label: "GitHub Copilot SDK", value: "copilot_sdk" },
+];
+
 export function StrategyLabPage() {
   const [strategyName, setStrategyName] = useState("Aurora Cross");
   const [rawCode, setRawCode] = useState(sampleCode);
+  const [provider, setProvider] = useState<AgentProviderId>("nim");
   const [model, setModel] = useState<AgentModelId>(AI_MODELS[0].value);
+  const [customModel, setCustomModel] = useState("");
   const [jobId, setJobId] = useState<string | null>(null);
   const [jobStatus, setJobStatus] = useState("idle");
+  const [activeProvider, setActiveProvider] = useState<AgentProviderId | null>(null);
+  const [activeModel, setActiveModel] = useState<string | null>(null);
   const [error, setError] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
 
@@ -61,16 +70,25 @@ export function StrategyLabPage() {
       setError("");
       setJobId(null);
       setJobStatus("starting");
+      const selectedModel =
+        provider === "nim"
+          ? model
+          : customModel.trim()
+            ? customModel.trim()
+            : undefined;
       const response = await startAgentConvert({
         code: rawCode,
         strategy_name: strategyName.trim() || undefined,
-        model,
+        provider,
+        model: selectedModel,
       });
       const nextJobId = response.job_id ?? response.task_id;
       if (!nextJobId) {
         throw new Error("The conversion agent did not return a job id.");
       }
       setJobId(nextJobId);
+      setActiveProvider(provider);
+      setActiveModel(selectedModel ?? null);
       setJobStatus(response.status || "running");
     } catch (err: any) {
       setJobStatus("failed");
@@ -147,7 +165,7 @@ export function StrategyLabPage() {
               >
                 Let AI rewrite raw strategy code into a backtestable trading module.
               </h1>
-              <p
+                <p
                 style={{
                   marginTop: "12px",
                   maxWidth: "700px",
@@ -155,12 +173,12 @@ export function StrategyLabPage() {
                   fontSize: "0.96rem",
                   lineHeight: 1.6,
                 }}
-              >
-                Drop in Pine Script, QuantConnect C#, or rough pseudo-code. The NVIDIA
-                NIM worker runs a staged 3-step conversion pipeline with your selected
-                model, then launches a validation backtest while the terminal streams
-                every visible step.
-              </p>
+                >
+                 Drop in Pine Script, QuantConnect C#, or rough pseudo-code. The conversion
+                 worker runs a staged 3-step pipeline with your selected LLM provider and
+                 model, then launches a validation backtest while the terminal streams
+                 every visible step.
+                </p>
             </div>
 
             <div
@@ -217,7 +235,9 @@ export function StrategyLabPage() {
                 </div>
               </div>
               <div style={{ color: "rgba(226, 232, 240, 0.72)", fontSize: "0.82rem" }}>
-                {jobId ? `Live task ${jobId}` : "Start a run to stream conversion and backtest logs."}
+                {jobId
+                  ? `Live task ${jobId} · ${activeProvider || provider}${activeModel ? ` · ${activeModel}` : ""}`
+                  : "Start a run to stream conversion and backtest logs."}
               </div>
             </div>
           </div>
@@ -301,6 +321,45 @@ export function StrategyLabPage() {
                   letterSpacing: "0.14em",
                 }}
               >
+                LLM Provider
+              </span>
+              <select
+                value={provider}
+                onChange={(event) => {
+                  const nextProvider = event.target.value as AgentProviderId;
+                  setProvider(nextProvider);
+                  if (nextProvider === "nim" && !AI_MODELS.some((option) => option.value === model)) {
+                    setModel(AI_MODELS[0].value);
+                  }
+                }}
+                style={{
+                  width: "100%",
+                  borderRadius: "14px",
+                  border: "1px solid rgba(148, 163, 184, 0.18)",
+                  background: "rgba(15, 23, 42, 0.68)",
+                  color: "#f8fafc",
+                  padding: "14px 16px",
+                  outline: "none",
+                  fontSize: "0.95rem",
+                }}
+              >
+                {PROVIDER_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value} style={{ color: "#020617" }}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <label style={{ display: "grid", gap: "8px" }}>
+              <span
+                style={{
+                  color: "rgba(226, 232, 240, 0.82)",
+                  fontSize: "0.78rem",
+                  textTransform: "uppercase",
+                  letterSpacing: "0.14em",
+                }}
+              >
                 Strategy Name
               </span>
               <input
@@ -332,26 +391,45 @@ export function StrategyLabPage() {
               >
                 AI Model
               </span>
-              <select
-                value={model}
-                onChange={(event) => setModel(event.target.value as AgentModelId)}
-                style={{
-                  width: "100%",
-                  borderRadius: "14px",
-                  border: "1px solid rgba(148, 163, 184, 0.18)",
-                  background: "rgba(15, 23, 42, 0.68)",
-                  color: "#f8fafc",
-                  padding: "14px 16px",
-                  outline: "none",
-                  fontSize: "0.95rem",
-                }}
-              >
-                {AI_MODELS.map((option) => (
-                  <option key={option.value} value={option.value} style={{ color: "#020617" }}>
-                    {option.label}
-                  </option>
-                ))}
-              </select>
+              {provider === "nim" ? (
+                <select
+                  value={model}
+                  onChange={(event) => setModel(event.target.value as AgentModelId)}
+                  style={{
+                    width: "100%",
+                    borderRadius: "14px",
+                    border: "1px solid rgba(148, 163, 184, 0.18)",
+                    background: "rgba(15, 23, 42, 0.68)",
+                    color: "#f8fafc",
+                    padding: "14px 16px",
+                    outline: "none",
+                    fontSize: "0.95rem",
+                  }}
+                >
+                  {AI_MODELS.map((option) => (
+                    <option key={option.value} value={option.value} style={{ color: "#020617" }}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              ) : (
+                <input
+                  type="text"
+                  value={customModel}
+                  onChange={(event) => setCustomModel(event.target.value)}
+                  placeholder="Optional model override (default: gpt-5-mini)"
+                  style={{
+                    width: "100%",
+                    borderRadius: "14px",
+                    border: "1px solid rgba(148, 163, 184, 0.18)",
+                    background: "rgba(15, 23, 42, 0.68)",
+                    color: "#f8fafc",
+                    padding: "14px 16px",
+                    outline: "none",
+                    fontSize: "0.95rem",
+                  }}
+                />
+              )}
             </label>
 
             <label style={{ display: "grid", gap: "8px" }}>
@@ -402,7 +480,8 @@ export function StrategyLabPage() {
                 <div style={{ color: "rgba(226, 232, 240, 0.58)", fontSize: "0.8rem" }}>
                   The agent writes a Python strategy file, emits Markdown documentation, and
                   backtests the output in the background after the analysis, meta, and code
-                  generation steps complete using the selected model.
+                  generation steps complete using provider {provider}
+                  {provider === "nim" ? ` (${model})` : customModel.trim() ? ` (${customModel.trim()})` : ""}.
                 </div>
               <button
                 onClick={handleSubmit}
@@ -478,7 +557,7 @@ export function StrategyLabPage() {
           <LiveTerminal
             jobId={jobId}
             onStatusChange={setJobStatus}
-            emptyMessage="Waiting for the 3-step NVIDIA NIM worker to start..."
+            emptyMessage={`Waiting for the 3-step ${provider} worker to start...`}
           />
         </section>
       </div>

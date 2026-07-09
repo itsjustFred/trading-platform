@@ -116,7 +116,10 @@ SYMBOL_CONFIG: dict[str, dict[str, str]] = {
     "XAGUSD": {"instrument": "xagusd", "asset_class": "metals"},
     # Indices
     "US30": {"instrument": "usa30idxusd", "asset_class": "indices"},
+    "SP500": {"instrument": "usa500idxusd", "asset_class": "indices"},
     "US500": {"instrument": "usa500idxusd", "asset_class": "indices"},
+    "NAS100": {"instrument": "usatechidxusd", "asset_class": "indices"},
+    "US100": {"instrument": "usatechidxusd", "asset_class": "indices"},
     "USTEC": {"instrument": "usatechidxusd", "asset_class": "indices"},
     "USA30IDXUSD": {"instrument": "usa30idxusd", "asset_class": "indices"},
     "USA500IDXUSD": {"instrument": "usa500idxusd", "asset_class": "indices"},
@@ -411,8 +414,10 @@ async def download_bi5_files(
     max_retries: int = 3,
     *,
     batch_size: int | None = None,
+    pipeline_batches: int = 1,
     pause_ms: int = 1000,
     report_progress: Callable[[float, str], None] | None = None,
+    progress_unit: str = "files",
     stop_event: Event | None = None,
     pause_event: Event | None = None,
     log_callback: Callable[[str], None] | None = None,
@@ -421,25 +426,29 @@ async def download_bi5_files(
     import aiohttp
 
     effective_batch_size = max(1, int(batch_size or concurrency or 10))
+    effective_pipeline_batches = max(1, int(pipeline_batches or 1))
+    window_size = effective_batch_size * effective_pipeline_batches
     base_pause_ms = max(0, int(pause_ms))
     current_pause_ms = base_pause_ms
-    semaphore = asyncio.Semaphore(effective_batch_size)
+    semaphore = asyncio.Semaphore(window_size)
     results: list[tuple[datetime, bytes]] = []
     total = len(urls)
     completed = 0
 
+    unit = str(progress_unit or "files").strip().lower() or "files"
+
     if total == 0:
-        _report_progress(report_progress, 100.0, "No files to download")
+        _report_progress(report_progress, 100.0, f"No {unit} to download")
         return []
 
-    connector = aiohttp.TCPConnector(limit=effective_batch_size, force_close=False)
+    connector = aiohttp.TCPConnector(limit=window_size, force_close=False)
     timeout = aiohttp.ClientTimeout(total=60, connect=15)
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
         try:
-            for batch_index, offset in enumerate(range(0, total, effective_batch_size), start=1):
+            for batch_index, offset in enumerate(range(0, total, window_size), start=1):
                 await _wait_for_control(pause_event, stop_event)
                 batch_started_at_cap = current_pause_ms >= MAX_BATCH_PAUSE_MS
-                batch = urls[offset : offset + effective_batch_size]
+                batch = urls[offset : offset + window_size]
                 tasks = [
                     asyncio.create_task(
                         _fetch_one(
@@ -477,7 +486,7 @@ async def download_bi5_files(
                     _report_progress(
                         report_progress,
                         (completed / total) * 100.0,
-                        f"Downloaded {completed}/{total} files",
+                        f"Downloaded {completed}/{total} {unit}",
                     )
 
                 if batch_throttled:
@@ -628,6 +637,86 @@ def _assemble_candle_dataframe(
     return df.sort_values("timestamp").drop_duplicates("timestamp").reset_index(drop=True)
 
 
+def _normalize_offer_side(value: str | None) -> str:
+    normalized = str(value or "bid").strip().lower()
+    if normalized not in {"bid", "ask", "both"}:
+        raise ValueError("offer_side must be one of: bid, ask, both")
+    return normalized
+
+
+def _prefix_ohlcv_columns(df: pd.DataFrame, side: str) -> pd.DataFrame:
+    if df.empty:
+        return df.copy()
+    return df.rename(
+        columns={
+            "open": f"{side}_open",
+            "high": f"{side}_high",
+            "low": f"{side}_low",
+            "close": f"{side}_close",
+            "volume": f"{side}_volume",
+        }
+    )
+
+
+def _resample_side_prefixed_ohlcv(df: pd.DataFrame, timeframe: str, side: str) -> pd.DataFrame:
+    if timeframe == "m1":
+        return df
+    base = df.rename(
+        columns={
+            f"{side}_open": "open",
+            f"{side}_high": "high",
+            f"{side}_low": "low",
+            f"{side}_close": "close",
+            f"{side}_volume": "volume",
+        }
+    )
+    resampled = _resample_candles(base, timeframe)
+    return _prefix_ohlcv_columns(resampled, side)
+
+
+async def _download_minute_side_dataframe(
+    instrument: str,
+    start_dt: datetime,
+    end_dt: datetime,
+    *,
+    side: str,
+    decimal_factor: int,
+    batch_size: int,
+    pipeline_batches: int,
+    pause_ms: int,
+    max_retries: int,
+    report_progress: Callable[[float, str], None] | None = None,
+    stop_event: Event | None = None,
+    pause_event: Event | None = None,
+    log_callback: Callable[[str], None] | None = None,
+) -> pd.DataFrame:
+    urls = generate_minute_urls(instrument, start_dt, end_dt, side)
+    target_unit = "days"
+    _emit_log_message(
+        f"Downloading {len(urls)} daily chunks for {side}...",
+        log_callback=log_callback,
+    )
+    bi5_results = await download_bi5_files(
+        urls,
+        batch_size,
+        max_retries,
+        batch_size=batch_size,
+        pipeline_batches=pipeline_batches,
+        pause_ms=pause_ms,
+        report_progress=report_progress,
+        progress_unit=target_unit,
+        stop_event=stop_event,
+        pause_event=pause_event,
+        log_callback=log_callback,
+    )
+    non_empty = sum(1 for _, d in bi5_results if d)
+    _emit_log_message(
+        f"Received {non_empty}/{len(urls)} non-empty {target_unit} for {side}",
+        log_callback=log_callback,
+    )
+    return _assemble_candle_dataframe(bi5_results, decimal_factor)
+
+
 def _ticks_to_ohlcv(
     tick_df: pd.DataFrame, timeframe: str, price_type: str = "bid"
 ) -> pd.DataFrame:
@@ -687,6 +776,7 @@ async def _download_and_assemble_merged_ticks(
     start_dt: datetime,
     end_dt: datetime,
     batch_size: int,
+    pipeline_batches: int,
     pause_ms: int,
     max_retries: int,
     report_progress: Callable[[float, str], None] | None = None,
@@ -704,12 +794,14 @@ async def _download_and_assemble_merged_ticks(
         batch_size,
         max_retries,
         batch_size=batch_size,
+        pipeline_batches=pipeline_batches,
         pause_ms=pause_ms,
         report_progress=(
             (lambda pct, msg: _report_progress(report_progress, pct * 0.45, f"Bid {msg}"))
             if report_progress
             else None
         ),
+        progress_unit="files",
         stop_event=stop_event,
         pause_event=pause_event,
         log_callback=log_callback,
@@ -721,12 +813,14 @@ async def _download_and_assemble_merged_ticks(
         batch_size,
         max_retries,
         batch_size=batch_size,
+        pipeline_batches=pipeline_batches,
         pause_ms=pause_ms,
         report_progress=(
             (lambda pct, msg: _report_progress(report_progress, 45.0 + (pct * 0.45), f"Ask {msg}"))
             if report_progress
             else None
         ),
+        progress_unit="files",
         stop_event=stop_event,
         pause_event=pause_event,
         log_callback=log_callback,
@@ -841,11 +935,25 @@ class DukascopyNativeDownloader(Downloader):
             raise ValueError(
                 f"Unsupported timeframe: {timeframe}. Use one of: {list(TIMEFRAME_MAP)}"
             )
+        storage_tf_map = {
+            "tick": "tick",
+            "s1": "s1",
+            "m1": "1m",
+            "m5": "5m",
+            "m15": "15m",
+            "m30": "30m",
+            "h1": "1h",
+            "h4": "4h",
+            "d1": "1d",
+            "mn1": "mn1",
+        }
+        out_tf = storage_tf_map.get(normalized_tf, normalized_tf)
 
         sym, instrument, asset_class = _resolve_symbol_and_instrument(symbol)
-        price_type = str(kwargs.get("price_type", "bid")).lower()
-        if price_type not in {"bid", "ask"}:
-            raise ValueError("price_type must be 'bid' or 'ask'")
+        out_path = self._make_output_path(output_dir, asset_class, sym, out_tf)
+        effective_start = self._resolve_resume_start(out_path, start)
+        offer_side = _normalize_offer_side(kwargs.get("offer_side", kwargs.get("price_type", "bid")))
+        price_type = "bid" if offer_side == "both" else offer_side
 
         merge_tick = bool(kwargs.get("merge_tick", False))
         merge_s1 = bool(kwargs.get("merge_s1", False))
@@ -856,6 +964,9 @@ class DukascopyNativeDownloader(Downloader):
         batch_size = int(kwargs.get("batch_size", kwargs.get("concurrency", 10)))
         if batch_size < 1:
             raise ValueError("batch_size must be >= 1")
+        pipeline_batches = int(kwargs.get("pipeline_batches", 1))
+        if pipeline_batches < 1:
+            raise ValueError("pipeline_batches must be >= 1")
         pause_ms = int(kwargs.get("pause_ms", 1000))
         if pause_ms < 0:
             raise ValueError("pause_ms must be >= 0")
@@ -866,7 +977,7 @@ class DukascopyNativeDownloader(Downloader):
         log_callback = kwargs.get("log_callback")
 
         genesis_index = _load_genesis_index()
-        requested_start = _resolve_requested_start(sym, normalized_tf, start, genesis_index)
+        requested_start = _resolve_requested_start(sym, normalized_tf, effective_start, genesis_index)
         requested_end = end or datetime.now(timezone.utc).date().isoformat()
 
         start_dt = datetime.fromisoformat(requested_start).replace(tzinfo=timezone.utc)
@@ -876,10 +987,12 @@ class DukascopyNativeDownloader(Downloader):
 
         decimal_factor = _get_decimal_factor(instrument)
         strategy = DOWNLOAD_STRATEGY[normalized_tf]
+        if offer_side == "both" and strategy == "tick":
+            merge_bid_ask = True
 
         _emit_log_message(
             "Native download: symbol=%s instrument=%s tf=%s strategy=%s range=%s→%s "
-            "price=%s merge=%s batch_size=%s pause_ms=%s"
+            "offer_side=%s merge=%s batch_size=%s pipeline_batches=%s pause_ms=%s"
             % (
                 sym,
                 instrument,
@@ -887,9 +1000,10 @@ class DukascopyNativeDownloader(Downloader):
                 strategy,
                 requested_start,
                 requested_end,
-                price_type,
+                offer_side,
                 merge_bid_ask,
                 batch_size,
+                pipeline_batches,
                 pause_ms,
             ),
             log_callback=log_callback,
@@ -906,12 +1020,13 @@ class DukascopyNativeDownloader(Downloader):
                     batch_size,
                     pause_ms,
                     max_retries,
+                    pipeline_batches=pipeline_batches,
                     report_progress=report_progress,
                     stop_event=stop_event,
                     pause_event=pause_event,
                     log_callback=log_callback,
                 )
-                warnings = [f"price_type:bid+ask"]
+                warnings = ["offer_side:both", "price_type:bid+ask"]
             else:
                 urls = generate_tick_urls(instrument, start_dt, end_dt)
                 _emit_log_message(
@@ -923,12 +1038,14 @@ class DukascopyNativeDownloader(Downloader):
                     batch_size,
                     max_retries,
                     batch_size=batch_size,
+                    pipeline_batches=pipeline_batches,
                     pause_ms=pause_ms,
                     report_progress=(
                         (lambda pct, msg: _report_progress(report_progress, pct * 0.9, msg))
                         if report_progress
                         else None
                     ),
+                    progress_unit="files",
                     stop_event=stop_event,
                     pause_event=pause_event,
                     log_callback=log_callback,
@@ -940,7 +1057,7 @@ class DukascopyNativeDownloader(Downloader):
                 )
                 _report_progress(report_progress, 95.0, "Assembling tick data")
                 df = _assemble_tick_dataframe(bi5_results, decimal_factor)
-                warnings = [f"price_type:{price_type}"]
+                warnings = [f"offer_side:{offer_side}", f"price_type:{price_type}"]
 
             if df.empty:
                 raise RuntimeError(f"No tick data for {sym} in range {requested_start} → {requested_end}")
@@ -953,55 +1070,100 @@ class DukascopyNativeDownloader(Downloader):
                 df = _ticks_to_ohlcv(df, normalized_tf, price_type)
 
         elif strategy == "minute":
-            urls = generate_minute_urls(instrument, start_dt, end_dt, price_type)
-            _emit_log_message(
-                f"Downloading {len(urls)} daily minute-candle files...",
-                log_callback=log_callback,
-            )
-            bi5_results = await download_bi5_files(
-                urls,
-                batch_size,
-                max_retries,
-                batch_size=batch_size,
-                pause_ms=pause_ms,
-                report_progress=(
-                    (lambda pct, msg: _report_progress(report_progress, pct * 0.9, msg))
-                    if report_progress
-                    else None
-                ),
-                stop_event=stop_event,
-                pause_event=pause_event,
-                log_callback=log_callback,
-            )
-            non_empty = sum(1 for _, d in bi5_results if d)
-            _emit_log_message(
-                f"Received {non_empty}/{len(urls)} non-empty files",
-                log_callback=log_callback,
-            )
-            _report_progress(report_progress, 95.0, "Assembling candle data")
-            df = _assemble_candle_dataframe(bi5_results, decimal_factor)
-            warnings = [f"price_type:{price_type}"]
-
-            if df.empty:
-                raise RuntimeError(
-                    f"No candle data for {sym} in range {requested_start} → {requested_end}"
+            if offer_side == "both":
+                bid_df = await _download_minute_side_dataframe(
+                    instrument,
+                    start_dt,
+                    end_dt,
+                    side="bid",
+                    decimal_factor=decimal_factor,
+                    batch_size=batch_size,
+                    pipeline_batches=pipeline_batches,
+                    pause_ms=pause_ms,
+                    max_retries=max_retries,
+                    report_progress=(
+                        (lambda pct, msg: _report_progress(report_progress, pct * 0.45, f"Bid {msg}"))
+                        if report_progress
+                        else None
+                    ),
+                    stop_event=stop_event,
+                    pause_event=pause_event,
+                    log_callback=log_callback,
                 )
+                ask_df = await _download_minute_side_dataframe(
+                    instrument,
+                    start_dt,
+                    end_dt,
+                    side="ask",
+                    decimal_factor=decimal_factor,
+                    batch_size=batch_size,
+                    pipeline_batches=pipeline_batches,
+                    pause_ms=pause_ms,
+                    max_retries=max_retries,
+                    report_progress=(
+                        (
+                            lambda pct, msg: _report_progress(
+                                report_progress, 45.0 + (pct * 0.45), f"Ask {msg}"
+                            )
+                        )
+                        if report_progress
+                        else None
+                    ),
+                    stop_event=stop_event,
+                    pause_event=pause_event,
+                    log_callback=log_callback,
+                )
+                _report_progress(report_progress, 95.0, "Merging bid/ask candle data")
+                if bid_df.empty or ask_df.empty:
+                    raise RuntimeError(
+                        f"No bid/ask candle data for {sym} in range {requested_start} → {requested_end}"
+                    )
+                bid_prefixed = _prefix_ohlcv_columns(bid_df, "bid")
+                ask_prefixed = _prefix_ohlcv_columns(ask_df, "ask")
+                if normalized_tf != "m1":
+                    bid_prefixed = _resample_side_prefixed_ohlcv(bid_prefixed, normalized_tf, "bid")
+                    ask_prefixed = _resample_side_prefixed_ohlcv(ask_prefixed, normalized_tf, "ask")
+                df = (
+                    bid_prefixed.merge(ask_prefixed, on="timestamp", how="inner")
+                    .sort_values("timestamp")
+                    .drop_duplicates(subset=["timestamp"])
+                    .reset_index(drop=True)
+                )
+                warnings = ["offer_side:both", "price_type:bid+ask"]
+            else:
+                df = await _download_minute_side_dataframe(
+                    instrument,
+                    start_dt,
+                    end_dt,
+                    side=price_type,
+                    decimal_factor=decimal_factor,
+                    batch_size=batch_size,
+                    pipeline_batches=pipeline_batches,
+                    pause_ms=pause_ms,
+                    max_retries=max_retries,
+                    report_progress=(
+                        (lambda pct, msg: _report_progress(report_progress, pct * 0.9, msg))
+                        if report_progress
+                        else None
+                    ),
+                    stop_event=stop_event,
+                    pause_event=pause_event,
+                    log_callback=log_callback,
+                )
+                _report_progress(report_progress, 95.0, "Assembling candle data")
+                warnings = [f"offer_side:{offer_side}", f"price_type:{price_type}"]
 
-            if normalized_tf != "m1":
-                df = _resample_candles(df, normalized_tf)
+                if df.empty:
+                    raise RuntimeError(
+                        f"No candle data for {sym} in range {requested_start} → {requested_end}"
+                    )
+
+                if normalized_tf != "m1":
+                    df = _resample_candles(df, normalized_tf)
 
         await _wait_for_control(pause_event, stop_event)
 
-        # Map output timeframe to storage name
-        storage_tf_map = {
-            "tick": "tick", "s1": "s1",
-            "m1": "1m", "m5": "5m", "m15": "15m", "m30": "30m",
-            "h1": "1h", "h4": "4h", "d1": "1d", "mn1": "mn1",
-        }
-        out_tf = storage_tf_map.get(normalized_tf, normalized_tf)
-
-        out_path = self._make_output_path(output_dir, asset_class, sym, out_tf)
-        df.to_parquet(out_path, index=False)
+        df = self._merge_and_store_single_file(out_path, df)
         warnings.append(f"requested_range:{requested_start}->{requested_end}")
         _report_progress(report_progress, 100.0, f"Saved {out_path.name}")
 
@@ -1010,7 +1172,8 @@ class DukascopyNativeDownloader(Downloader):
         source_meta = self.get_source_meta().to_dict()
         source_meta.update({
             "instrument": instrument,
-            "price_type": "bid+ask" if merge_bid_ask else price_type,
+            "offer_side": offer_side,
+            "price_type": "bid+ask" if (merge_bid_ask or offer_side == "both") else price_type,
             "merge_bid_ask": merge_bid_ask,
             "requested_start": requested_start,
             "requested_end": requested_end,
@@ -1027,8 +1190,8 @@ class DukascopyNativeDownloader(Downloader):
             asset_class=asset_class,
             path=out_path,
             rows=len(df),
-            start=str(df["timestamp"].iloc[0]) if len(df) > 0 else "",
-            end=str(df["timestamp"].iloc[-1]) if len(df) > 0 else "",
+            start=str(df["timestamp"].iloc[0]) if "timestamp" in df.columns and len(df) > 0 else "",
+            end=str(df["timestamp"].iloc[-1]) if "timestamp" in df.columns and len(df) > 0 else "",
             size_bytes=out_path.stat().st_size,
             warnings=warnings,
         )
@@ -1059,8 +1222,12 @@ def main() -> None:
         help="Comma-separated timeframes (tick,s1,m1,m5,m15,m30,h1,h4,d1,mn1)",
     )
     parser.add_argument(
-        "--price-type", default="bid", choices=["bid", "ask"],
-        help="Price side (default: bid)",
+        "--offer-side",
+        "--price-type",
+        dest="offer_side",
+        default="bid",
+        choices=["bid", "ask", "both"],
+        help="Price side selection (bid, ask, both). Default: bid",
     )
     parser.add_argument(
         "--merge-tick", action="store_true",
@@ -1087,6 +1254,15 @@ def main() -> None:
         type=int,
         default=1000,
         help="Pause between batches in milliseconds (default: 1000)",
+    )
+    parser.add_argument(
+        "--pipeline-batches",
+        type=int,
+        default=1,
+        help=(
+            "Number of batches to keep in flight before applying the inter-batch pause "
+            "(default: 1; raise to 2-4 for faster bulk downloads)"
+        ),
     )
     args = parser.parse_args()
 
@@ -1118,10 +1294,11 @@ def main() -> None:
                     sym, tf, output_dir,
                     start=args.start,
                     end=args.end,
-                    price_type=args.price_type,
+                    offer_side=args.offer_side,
                     merge_tick=args.merge_tick,
                     merge_s1=args.merge_s1,
                     batch_size=args.batch_size,
+                    pipeline_batches=args.pipeline_batches,
                     pause_ms=args.pause_ms,
                 )
                 completed += 1

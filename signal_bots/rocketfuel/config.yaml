@@ -1,0 +1,33 @@
+rocket_fuel:
+  # Risk Management
+  risk_per_trade_percent: 0.01
+  risk_mode: "PERCENT"
+  risk_per_trade_dollar: 1000
+  max_positions: 10
+
+  # ATR Settings (for hard SL safety net)
+  atr_period: 14
+  sl_multiplier: 3.0
+
+  # RSI Settings
+  rsi_period: 14
+  rsi_oversold: 30
+  rsi_overbought: 70
+  rsi_exit_drop: 1
+
+  # DMA Settings
+  dma_fast: 50
+  dma_slow: 200
+
+  # Golden Cross
+  golden_cross_add_percent: 0.50
+
+  # Timing
+  candle_timeframe: "5Min"
+  discord_poll_interval: 15
+  dashboard_refresh_interval: 1
+
+  # Operational
+  signal_max_age_seconds: 300
+  order_fill_wait_seconds: 2
+

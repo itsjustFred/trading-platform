@@ -1,15 +1,14 @@
 import { useState, useEffect, useMemo } from "react";
-import { useNavigate } from "react-router-dom";
 import { Modal } from "./Modal";
 import {
-  getStrategies,
-  getStrategyDetail,
+  getDataCheck,
   runBacktest,
-  getBacktestRunStatus,
 } from "../api/client";
 import { SymbolInput } from "./SymbolInput";
 import { Play, Loader2 } from "lucide-react";
-import type { StrategyMeta } from "../api/types";
+import { useToast } from "./ToastProvider";
+import { useStrategiesCache } from "./StrategiesProvider";
+import { useStrategyDetail } from "../api/queries";
 
 // Canonical timeframe order from smallest to largest (matches shared/constants.py)
 const TIMEFRAME_ORDER = ["tick", "s1", "1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"] as const;
@@ -33,27 +32,23 @@ function getModelingTimeframes(mainTf: string): string[] {
   return [...TIMEFRAME_ORDER.slice(0, idx + 1)];
 }
 
-function getNextLowerTimeframe(mainTf: string): string {
-  const idx = TIMEFRAME_ORDER.indexOf(mainTf as (typeof TIMEFRAME_ORDER)[number]);
-  if (idx <= 0) return mainTf;
-  return TIMEFRAME_ORDER[idx - 1];
-}
-
 interface CreateBacktestModalProps {
   open: boolean;
   onClose: () => void;
   preselectedStrategy?: string;
+  onTaskStarted?: (taskId: string) => void;
 }
 
 export function CreateBacktestModal({
   open,
   onClose,
   preselectedStrategy,
+  onTaskStarted,
 }: CreateBacktestModalProps) {
-  const navigate = useNavigate();
-  const [strategies, setStrategies] = useState<StrategyMeta[]>([]);
+  const { showToast } = useToast();
+  const { strategies, ensureLoaded } = useStrategiesCache();
   const [strategy, setStrategy] = useState("");
-  const [engine, setEngine] = useState("vectorbt");
+  const [engine, setEngine] = useState("native");
   const [symbols, setSymbols] = useState("AAPL");
   const [timeframe, setTimeframe] = useState("1d");
   const [start, setStart] = useState("");
@@ -61,23 +56,20 @@ export function CreateBacktestModal({
   const [capital, setCapital] = useState("100000");
   const [riskPct, setRiskPct] = useState("");
   const [maxLeverage, setMaxLeverage] = useState("1.0");
-  const [modelingResolution, setModelingResolution] = useState<string>(
-    getNextLowerTimeframe("1d"),
-  );
+  const [modelingResolution, setModelingResolution] = useState<string>("1d");
   const [strategyParameters, setStrategyParameters] = useState<Record<string, string>>({});
   // Track original type to decide input type and payload conversion
   const [parameterTypes, setParameterTypes] = useState<Record<string, "number" | "string">>({});
   const [running, setRunning] = useState(false);
-  const [status, setStatus] = useState("");
   const [error, setError] = useState("");
+  const [checkingDataAvailability, setCheckingDataAvailability] = useState(false);
+  const [dataAvailabilityWarning, setDataAvailabilityWarning] = useState("");
+  const strategyDetailQuery = useStrategyDetail(strategy, { enabled: open && Boolean(strategy) });
 
   useEffect(() => {
-    if (open) {
-      getStrategies()
-        .then(setStrategies)
-        .catch(() => {});
-    }
-  }, [open]);
+    if (!open) return;
+    void ensureLoaded();
+  }, [open, ensureLoaded]);
 
   useEffect(() => {
     if (preselectedStrategy && strategies.length > 0) {
@@ -86,7 +78,7 @@ export function CreateBacktestModal({
     }
   }, [preselectedStrategy, strategies]);
 
-  // Load strategy parameters when strategy changes
+  // Sync strategy parameters from query detail when strategy changes
   useEffect(() => {
     if (!strategy) {
       setStrategyParameters({});
@@ -96,55 +88,111 @@ export function CreateBacktestModal({
 
     setStrategyParameters({});
     setParameterTypes({});
-    getStrategyDetail(strategy)
-      .then((detail) => {
-        const values: Record<string, string> = {};
-        const types: Record<string, "number" | "string"> = {};
-        for (const [key, value] of Object.entries(detail.parameters || {})) {
-          if (typeof value === "number" && Number.isFinite(value)) {
-            values[key] = String(value);
-            types[key] = "number";
-          } else if (typeof value === "string") {
-            values[key] = value;
-            types[key] = "string";
-          }
-        }
-        setStrategyParameters(values);
-        setParameterTypes(types);
-      })
-      .catch(() => {
-        setStrategyParameters({});
-        setParameterTypes({});
-      });
   }, [strategy]);
+
+  useEffect(() => {
+    const detail = strategyDetailQuery.data;
+    if (!strategy || !detail) {
+      return;
+    }
+    const values: Record<string, string> = {};
+    const types: Record<string, "number" | "string"> = {};
+    for (const [key, value] of Object.entries(detail.parameters || {})) {
+      if (typeof value === "number" && Number.isFinite(value)) {
+        values[key] = String(value);
+        types[key] = "number";
+      } else if (typeof value === "string") {
+        values[key] = value;
+        types[key] = "string";
+      }
+    }
+    setStrategyParameters(values);
+    setParameterTypes(types);
+  }, [strategy, strategyDetailQuery.data]);
 
   // Auto-detect engine from selected strategy (no manual override)
   useEffect(() => {
     if (!strategy) return;
     const meta = strategies.find((item) => item.file === strategy);
-    setEngine(meta?.engine === "pynecore" ? "pynecore" : "vectorbt");
+    setEngine(meta?.engine === "pynecore" ? "pynecore" : "native");
   }, [strategy, strategies]);
 
   // Update modeling resolution default when main timeframe changes
   useEffect(() => {
-    const nextLower = getNextLowerTimeframe(timeframe);
-    setModelingResolution(nextLower);
+    setModelingResolution(timeframe);
   }, [timeframe]);
 
   const modelingTimeframes = useMemo(() => getModelingTimeframes(timeframe), [timeframe]);
+  const symbolList = useMemo(
+    () =>
+      symbols
+        .split(",")
+        .map((symbolValue) => symbolValue.trim().toUpperCase())
+        .filter(Boolean),
+    [symbols],
+  );
+
+  useEffect(() => {
+    if (!open) {
+      setDataAvailabilityWarning("");
+      setCheckingDataAvailability(false);
+      return;
+    }
+
+    if (!symbolList.length || !timeframe) {
+      setDataAvailabilityWarning("");
+      setCheckingDataAvailability(false);
+      return;
+    }
+
+    let cancelled = false;
+    setCheckingDataAvailability(true);
+    const runCheck = async () => {
+      try {
+        const results = await Promise.all(
+          symbolList.map(async (symbolValue) => ({
+            symbol: symbolValue,
+            ...(await getDataCheck(symbolValue, timeframe, start, end)),
+          })),
+        );
+        if (cancelled) {
+          return;
+        }
+        const missingSymbols = results.filter((entry) => !entry.available).map((entry) => entry.symbol);
+        if (missingSymbols.length > 0) {
+          const preview = missingSymbols.slice(0, 3).join(", ");
+          const suffix = missingSymbols.length > 3 ? `, +${missingSymbols.length - 3} more` : "";
+          setDataAvailabilityWarning(
+            `Data not available, will be downloaded (~2min) — ${preview}${suffix}`,
+          );
+        } else {
+          setDataAvailabilityWarning("");
+        }
+      } catch {
+        if (!cancelled) {
+          setDataAvailabilityWarning("");
+        }
+      } finally {
+        if (!cancelled) {
+          setCheckingDataAvailability(false);
+        }
+      }
+    };
+
+    void runCheck();
+    return () => {
+      cancelled = true;
+    };
+  }, [open, symbolList, timeframe, start, end]);
 
   const handleRun = async () => {
-    if (!strategy || !symbols.trim()) return;
+    if (!strategy || symbolList.length === 0) {
+      return;
+    }
     setRunning(true);
-    setStatus("Starting backtest...");
     setError("");
 
     try {
-      const symbolList = symbols
-        .split(",")
-        .map((s) => s.trim())
-        .filter(Boolean);
-
       const parameterPayload: Record<string, number | string> = {};
       for (const [key, rawValue] of Object.entries(strategyParameters)) {
         if (parameterTypes[key] === "number") {
@@ -180,41 +228,13 @@ export function CreateBacktestModal({
         modeling_resolution: modelingResolution,
         parameters: parameterPayload,
       });
-
-      const jobId = res.job_id;
-      setStatus("Running backtest...");
-
-      // Poll for completion
-      const poll = async () => {
-        for (let i = 0; i < 120; i++) {
-          await new Promise((r) => setTimeout(r, 2500));
-          try {
-            const jobStatus = await getBacktestRunStatus(jobId);
-            if (jobStatus.status === "completed") {
-              setStatus("Completed! Redirecting...");
-              setRunning(false);
-              onClose();
-              navigate("/backtests");
-              setTimeout(() => window.location.reload(), 500);
-              return;
-            } else if (jobStatus.status === "failed") {
-              const message =
-                typeof jobStatus.error === "string" ? jobStatus.error : "Backtest failed";
-              setError(message);
-              setRunning(false);
-              return;
-            }
-            setStatus(`Running... (${(i + 1) * 2.5}s)`);
-          } catch {
-            // Continue polling
-          }
-        }
-        setError("Backtest timed out after 5 minutes");
-        setRunning(false);
-      };
-      poll();
+      const taskId = res.task_id || res.job_id;
+      onTaskStarted?.(taskId);
+      showToast("Backtest started. Check Task Manager in the top right.", "success");
+      onClose();
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "Failed to start backtest");
+    } finally {
       setRunning(false);
     }
   };
@@ -248,9 +268,20 @@ export function CreateBacktestModal({
     fontSize: "0.78rem",
     fontWeight: 600,
     letterSpacing: "0.5px",
-    background: engine === "pynecore" ? "rgba(163,113,247,0.15)" : "rgba(88,166,255,0.12)",
-    color: engine === "pynecore" ? "#a371f7" : "#58a6ff",
-    border: `1px solid ${engine === "pynecore" ? "rgba(163,113,247,0.3)" : "rgba(88,166,255,0.25)"}`,
+    background:
+      engine === "pynecore"
+        ? "rgba(163,113,247,0.15)"
+        : engine === "native"
+          ? "rgba(63,185,80,0.16)"
+          : "rgba(88,166,255,0.12)",
+    color: engine === "pynecore" ? "#a371f7" : engine === "native" ? "#3fb950" : "#58a6ff",
+    border: `1px solid ${
+      engine === "pynecore"
+        ? "rgba(163,113,247,0.3)"
+        : engine === "native"
+          ? "rgba(63,185,80,0.35)"
+          : "rgba(88,166,255,0.25)"
+    }`,
   };
 
   return (
@@ -338,6 +369,31 @@ export function CreateBacktestModal({
         >
           Leave empty to use full available history
         </div>
+        {checkingDataAvailability && (
+          <div
+            style={{
+              fontSize: "0.74rem",
+              color: "var(--color-text-muted)",
+              marginTop: "-6px",
+            }}
+          >
+            Checking data availability...
+          </div>
+        )}
+        {dataAvailabilityWarning && (
+          <div
+            style={{
+              padding: "8px 12px",
+              borderRadius: "6px",
+              background: "rgba(251, 191, 36, 0.12)",
+              border: "1px solid rgba(251, 191, 36, 0.3)",
+              color: "#fbbf24",
+              fontSize: "0.78rem",
+            }}
+          >
+            {dataAvailabilityWarning}
+          </div>
+        )}
 
         {/* Capital */}
         <div>
@@ -470,24 +526,7 @@ export function CreateBacktestModal({
           </div>
         )}
 
-        {/* Status / Error */}
-        {status && (
-          <div
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: "8px",
-              padding: "8px 12px",
-              borderRadius: "6px",
-              background: "rgba(88,166,255,0.08)",
-              color: "#58a6ff",
-              fontSize: "0.8rem",
-            }}
-          >
-            {running && <Loader2 size={14} className="animate-spin" />}
-            {status}
-          </div>
-        )}
+        {/* Error */}
         {error && (
           <div
             style={{
@@ -508,14 +547,14 @@ export function CreateBacktestModal({
         {/* Run button */}
         <button
           onClick={handleRun}
-          disabled={running || !strategy || !symbols.trim()}
+          disabled={running || !strategy || symbolList.length === 0}
           style={{
             display: "flex",
             alignItems: "center",
             justifyContent: "center",
             gap: "6px",
             background:
-              running || !strategy || !symbols.trim() ? "#333" : "#58a6ff",
+              running || !strategy || symbolList.length === 0 ? "#333" : "#58a6ff",
             color: "#fff",
             border: "none",
             borderRadius: "6px",
@@ -530,10 +569,9 @@ export function CreateBacktestModal({
           ) : (
             <Play size={16} />
           )}
-          {running ? "Running..." : "Run Backtest"}
+          {running ? "Starting..." : "Run Backtest"}
         </button>
       </div>
     </Modal>
   );
 }
-

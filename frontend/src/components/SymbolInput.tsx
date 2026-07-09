@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from "react";
-import { getSymbols } from "../api/client";
+import { useSymbols } from "../api/queries";
 import { ChevronDown, ChevronRight } from "lucide-react";
 
 interface SymbolInputProps {
@@ -32,21 +32,21 @@ export function SymbolInput({
   const [expandedCats, setExpandedCats] = useState<Record<string, boolean>>({});
   const wrapperRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const symbolsQuery = useSymbols();
 
   useEffect(() => {
-    getSymbols()
-      .then((data) => {
-        setCategories(data.categories || {});
-        // Expand all by default if total categories < 5
-        const cats = Object.keys(data.categories || {});
-        if (cats.length < 5) {
-          const init: Record<string, boolean> = {};
-          cats.forEach((c) => (init[c] = true));
-          setExpandedCats(init);
-        }
-      })
-      .catch(() => {});
-  }, []);
+    const data = symbolsQuery.data;
+    if (!data) {
+      return;
+    }
+    setCategories(data.categories || {});
+    const cats = Object.keys(data.categories || {});
+    if (cats.length < 5) {
+      const init: Record<string, boolean> = {};
+      cats.forEach((c) => (init[c] = true));
+      setExpandedCats(init);
+    }
+  }, [symbolsQuery.data]);
 
   // Close dropdown on outside click
   useEffect(() => {

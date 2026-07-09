@@ -23,7 +23,12 @@ from typing import Any
 
 import pandas as pd
 
-from runner.engines.base import BacktestConfig, EngineAdapter, resolve_strategy_parameters
+from runner.engines.base import (
+    BacktestConfig,
+    EngineAdapter,
+    ProgressCallback,
+    resolve_strategy_parameters,
+)
 from runner.engines.vectorbt_adapter import (
     _normalize_drawings,
     _resolve_max_leverage,
@@ -44,7 +49,12 @@ class PyneCoreAdapter(EngineAdapter):
     def name(self) -> str:
         return "pynecore"
 
-    def run(self, config: BacktestConfig, strategy_path: str) -> BacktestResult:
+    def run(
+        self,
+        config: BacktestConfig,
+        strategy_path: str,
+        progress_callback: ProgressCallback | None = None,
+    ) -> BacktestResult:
         data_root = Path(config.data_dir) if config.data_dir else DATA_DIR
         resolved_parameters = resolve_strategy_parameters(strategy_path, config.parameters)
         all_trades: list[Trade] = []
@@ -196,7 +206,7 @@ class PyneCoreAdapter(EngineAdapter):
             import pynecore  # noqa: F401
         except ImportError:
             errors.append(
-                "PyneCore not installed. Run: pip install git+https://github.com/PyneSys/pynecore.git"
+                "PyneCore not installed. Run: pip install pynesys-pynecore"
             )
         return errors
 

@@ -23,11 +23,26 @@ from typing import Any
 
 import pandas as pd
 
-from runner.engines.base import BacktestConfig, EngineAdapter, resolve_strategy_parameters
+from runner.engines.base import (
+    BacktestConfig,
+    EngineAdapter,
+    ProgressCallback,
+    resolve_strategy_parameters,
+)
 from shared.constants import DATA_DIR
-from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, TradeExit
+from shared.models import BacktestMeta, BacktestResult, EquityPoint, IndicatorSeries, Trade, TradeExit
 
 logger = logging.getLogger(__name__)
+
+_RISK_WARNING_KEYS: set[tuple[str, str, str]] = set()
+
+
+def _warn_once(key: tuple[str, str, str], message: str, *args: Any) -> None:
+    if key in _RISK_WARNING_KEYS:
+        return
+    _RISK_WARNING_KEYS.add(key)
+    logger.warning(message, *args)
+
 
 IndicatorMap = dict[str, tuple[pd.Series, str]]
 DrawingList = list[dict[str, Any]]
@@ -45,6 +60,16 @@ TIMEFRAME_TO_DURATION = {
 }
 
 MAX_PARALLEL_WORKERS = 4
+PANEL_INDICATOR_HINTS = ("rsi", "macd", "signal", "hist", "atr", "osc", "stoch", "cci", "adx")
+HIDDEN_DISPLAY_HINTS = (
+    "sl_price",
+    "stop_loss",
+    "tp_price",
+    "take_profit",
+    "exit_price",
+    "exit_reason",
+    "direction",
+)
 
 
 def _uses_kwargs_style(func) -> bool:
@@ -83,7 +108,7 @@ def _process_symbol(
     strategy_path: str,
     resolved_parameters: dict[str, Any],
     data_root: Path,
-) -> tuple[list[Trade], list[str], DrawingList]:
+) -> tuple[list[Trade], list[str], DrawingList, list[IndicatorSeries]]:
     """Process a single symbol: load data, generate signals, extract trades.
 
     Returns (trades_with_temp_ids, used_intrabar_timeframes, drawings).
@@ -95,7 +120,7 @@ def _process_symbol(
     )
     if df is None or df.empty:
         logger.warning("No data for %s/%s, skipping", symbol, config.timeframe)
-        return [], [], []
+        return [], [], [], []
 
     asset_class = _infer_asset_class_from_path(data_path)
     intrabar_df, intrabar_timeframe = _load_intrabar_ohlcv(
@@ -110,14 +135,16 @@ def _process_symbol(
 
     signal_output = _call_generate_signals(strategy_mod, df, resolved_parameters)
     signals, indicators, drawings = _normalize_signal_output(signal_output, df.index, symbol=symbol)
-    entries = signals["entries"]
-    exits = signals["exits"]
-    stop_loss_series = _find_stop_loss_series(signals, indicators)
-    take_profit_series = _find_take_profit_series(signals, indicators)
-    atr_series = _find_atr_series(signals, indicators)
-    direction_series = _find_direction_series(signals, indicators)
-    exit_price_series = _find_exit_price_series(signals, indicators)
-    exit_reason_series = _find_exit_reason_series(signals, indicators)
+    indicator_series = _build_indicator_series(df, indicators)
+    execution_signals, execution_indicators = _prepare_next_open_execution_data(signals, indicators)
+    entries = execution_signals["entries"]
+    exits = execution_signals["exits"]
+    stop_loss_series = _find_stop_loss_series(execution_signals, execution_indicators)
+    take_profit_series = _find_take_profit_series(execution_signals, execution_indicators)
+    atr_series = _find_atr_series(execution_signals, execution_indicators)
+    direction_series = _find_direction_series(execution_signals, execution_indicators)
+    exit_price_series = _find_exit_price_series(execution_signals, execution_indicators)
+    exit_reason_series = _find_exit_reason_series(execution_signals, execution_indicators)
 
     trades: list[Trade] = []
     in_trade = False
@@ -135,13 +162,25 @@ def _process_symbol(
 
             entry_row = df.iloc[entry_idx]
             exit_row = df.iloc[i]
-            direction = _resolve_direction(signals, direction_series, entry_idx)
-            entry_price = float(entry_row["close"])
+            direction = _resolve_direction(execution_signals, direction_series, entry_idx)
+            entry_price = _resolve_entry_price(entry_row)
             exit_price = _resolve_exit_price(exit_row, i, exit_price_series)
             exit_reason = _resolve_exit_reason(i, exit_reason_series)
             entry_ts = str(entry_row.get("timestamp", entry_row.name))
             exit_ts = str(exit_row.get("timestamp", exit_row.name))
-            trade_meta = _extract_trade_meta(signals, indicators, entry_idx, i)
+            trade_meta = _extract_trade_meta(execution_signals, execution_indicators, entry_idx, i)
+            stop_price = _resolve_level_value(stop_loss_series, entry_idx)
+            risk_target_usd: float | None = None
+            stop_distance: float | None = None
+            max_position_pct: float | None = None
+            max_leverage: float | None = None
+            required_notional: float | None = None
+            cap_notional: float | None = None
+            leverage_notional_limit: float | None = None
+            final_notional: float | None = None
+            capped_by_max_position = False
+            capped_by_max_leverage = False
+            sizing_mode = "full_equity"
 
             intrabar_exit = _resolve_intrabar_exit(
                 intrabar_df=intrabar_df,
@@ -160,6 +199,7 @@ def _process_symbol(
                 trade_meta["modeling_resolution"] = intrabar_exit["resolution"]
 
             if config.risk_per_trade_pct is not None and config.risk_per_trade_pct > 0:
+                sizing_mode = "risk_pct"
                 max_position_pct = _resolve_max_position_pct(
                     config.max_position_pct, asset_class
                 )
@@ -167,27 +207,30 @@ def _process_symbol(
                 if max_leverage < max_position_pct:
                     max_leverage = max_position_pct
 
-                risk_amount = equity * config.risk_per_trade_pct
-                stop_dist = _resolve_stop_distance(
+                risk_target_usd = equity * config.risk_per_trade_pct
+                stop_distance = _resolve_stop_distance(
                     entry_idx,
                     entry_price,
                     stop_loss_series=stop_loss_series,
                     atr_series=atr_series,
                 )
 
-                if not stop_dist or stop_dist <= 0:
-                    stop_dist = entry_price * 0.02
-                    logger.warning(
-                        "Risk sizing fallback for %s at bar %s: no stop_loss/ATR, using %.2f%% default stop",
+                if not stop_distance or stop_distance <= 0:
+                    stop_distance = entry_price * 0.02
+                    _warn_once(
+                        (symbol, config.timeframe, "fallback_stop"),
+                        "Risk sizing fallback for %s/%s: no stop_loss/ATR, using %.2f%% default stop",
                         symbol,
-                        entry_idx,
+                        config.timeframe,
                         2.0,
                     )
 
-                base_qty = risk_amount / stop_dist
+                base_qty = risk_target_usd / stop_distance
                 required_notional = base_qty * entry_price
                 cap_notional = equity * max_position_pct
                 leverage_notional_limit = equity * max_leverage
+                capped_by_max_position = required_notional > cap_notional
+                capped_by_max_leverage = required_notional > leverage_notional_limit
 
                 if required_notional <= cap_notional:
                     final_notional = required_notional
@@ -203,13 +246,12 @@ def _process_symbol(
                     )
                 else:
                     final_notional = leverage_notional_limit
-                    achievable_risk = (final_notional / entry_price) * stop_dist
-                    logger.warning(
-                        "Risk target underfilled for %s trade %s: target=%.2f achievable=%.2f (cap=%.2f, max_leverage=%.2fx)",
+                    achievable_risk = (final_notional / entry_price) * stop_distance
+                    _warn_once(
+                        (symbol, config.timeframe, "risk_underfilled"),
+                        "Risk target underfilled for %s/%s: cap=%.2f, max_leverage=%.2fx",
                         symbol,
-                        trade_counter,
-                        risk_amount,
-                        achievable_risk,
+                        config.timeframe,
                         cap_notional,
                         max_leverage,
                     )
@@ -217,6 +259,48 @@ def _process_symbol(
                 qty = final_notional / entry_price
             else:
                 qty = equity / entry_price
+                final_notional = qty * entry_price
+
+            if stop_price is None and stop_distance is not None and stop_distance > 0:
+                stop_price = (
+                    entry_price - stop_distance
+                    if direction == "LONG"
+                    else entry_price + stop_distance
+                )
+
+            if stop_price is None:
+                sl_from_meta = trade_meta.get("sl_price")
+                if isinstance(sl_from_meta, (int, float)):
+                    stop_price = float(sl_from_meta)
+
+            if stop_distance is None and stop_price is not None:
+                stop_distance = abs(entry_price - stop_price)
+
+            trade_meta["risk_math"] = {
+                "sizing_mode": sizing_mode,
+                "equity_at_entry": round(equity, 2),
+                "risk_target_usd": round(risk_target_usd, 2) if risk_target_usd is not None else None,
+                "entry_price": round(entry_price, 6),
+                "sl_price": round(stop_price, 6) if stop_price is not None else None,
+                "stop_distance": round(stop_distance, 6) if stop_distance is not None else None,
+                "position_size": round(qty, 4),
+                "required_notional": (
+                    round(required_notional, 2) if required_notional is not None else None
+                ),
+                "final_notional": round(final_notional, 2) if final_notional is not None else None,
+                "max_position_notional": (
+                    round(cap_notional, 2) if cap_notional is not None else None
+                ),
+                "max_leverage_notional": (
+                    round(leverage_notional_limit, 2)
+                    if leverage_notional_limit is not None
+                    else None
+                ),
+                "max_position_pct": round(max_position_pct, 6) if max_position_pct is not None else None,
+                "max_leverage": round(max_leverage, 6) if max_leverage is not None else None,
+                "capped_by_max_position": capped_by_max_position,
+                "capped_by_max_leverage": capped_by_max_leverage,
+            }
 
             if direction == "LONG":
                 pnl = (exit_price - entry_price) * qty
@@ -247,7 +331,7 @@ def _process_symbol(
             trades.append(trade)
             equity += pnl
 
-    return trades, extra_timeframes, drawings
+    return trades, extra_timeframes, drawings, indicator_series
 
 
 class VectorbtAdapter(EngineAdapter):
@@ -257,7 +341,12 @@ class VectorbtAdapter(EngineAdapter):
     def name(self) -> str:
         return "vectorbt"
 
-    def run(self, config: BacktestConfig, strategy_path: str) -> BacktestResult:
+    def run(
+        self,
+        config: BacktestConfig,
+        strategy_path: str,
+        progress_callback: ProgressCallback | None = None,
+    ) -> BacktestResult:
         strategy_mod = _load_strategy_module(strategy_path)
         if not hasattr(strategy_mod, "generate_signals"):
             raise ValueError(f"Strategy {strategy_path} must define generate_signals(df, params)")
@@ -266,6 +355,7 @@ class VectorbtAdapter(EngineAdapter):
         resolved_parameters = resolve_strategy_parameters(strategy_path, config.parameters)
         all_trades: list[Trade] = []
         all_drawings: DrawingList = []
+        all_indicators: list[IndicatorSeries] = []
         used_timeframes = [config.timeframe]
 
         num_symbols = len(config.symbols)
@@ -287,9 +377,10 @@ class VectorbtAdapter(EngineAdapter):
                 for future in as_completed(futures):
                     sym = futures[future]
                     try:
-                        trades, extra_tfs, drawings = future.result()
+                        trades, extra_tfs, drawings, indicator_series = future.result()
                         all_trades.extend(trades)
                         all_drawings.extend(drawings)
+                        all_indicators.extend(indicator_series)
                         for tf in extra_tfs:
                             if tf not in used_timeframes:
                                 used_timeframes.append(tf)
@@ -303,11 +394,12 @@ class VectorbtAdapter(EngineAdapter):
                 ) from symbol_errors[0][1]
         else:
             for symbol in config.symbols:
-                trades, extra_tfs, drawings = _process_symbol(
+                trades, extra_tfs, drawings, indicator_series = _process_symbol(
                     symbol, config, strategy_path, resolved_parameters, data_root
                 )
                 all_trades.extend(trades)
                 all_drawings.extend(drawings)
+                all_indicators.extend(indicator_series)
                 for tf in extra_tfs:
                     if tf not in used_timeframes:
                         used_timeframes.append(tf)
@@ -364,6 +456,7 @@ class VectorbtAdapter(EngineAdapter):
             meta=meta,
             trades=all_trades,
             equity_curve=all_equity,
+            indicators=all_indicators,
             drawings=all_drawings,
         )
 
@@ -448,6 +541,29 @@ def _coerce_boolean_series(value: Any, index: pd.Index) -> pd.Series:
     return _coerce_series(value, index).fillna(False).astype(bool)
 
 
+def _prepare_next_open_execution_data(
+    signals: pd.DataFrame,
+    indicators: IndicatorMap,
+) -> tuple[pd.DataFrame, IndicatorMap]:
+    """Shift strategy output by one bar so signal bars execute on the next bar open."""
+    execution_signals = signals.shift(1)
+    execution_signals.index = signals.index
+    execution_signals["entries"] = _coerce_boolean_series(execution_signals["entries"], signals.index)
+    shifted_exits = _coerce_boolean_series(execution_signals["exits"], signals.index)
+    original_exits = _coerce_boolean_series(signals["exits"], signals.index)
+    if len(shifted_exits) > 0 and bool(original_exits.iloc[-1]):
+        shifted_exits.iloc[-1] = True
+    execution_signals["exits"] = shifted_exits
+
+    execution_indicators: IndicatorMap = {}
+    for name, (series, explicit_when) in indicators.items():
+        shifted_series = series.shift(1)
+        shifted_series.index = signals.index
+        execution_indicators[name] = (shifted_series, explicit_when)
+
+    return execution_signals, execution_indicators
+
+
 def _normalize_indicator_map(indicators: Any, index: pd.Index) -> IndicatorMap:
     if indicators is None:
         return {}
@@ -475,6 +591,174 @@ def _normalize_indicator_map(indicators: Any, index: pd.Index) -> IndicatorMap:
 
         normalized[str(name)] = (_coerce_series(value, index), when)
     return normalized
+
+
+def _infer_indicator_display_type(name: str) -> str:
+    lowered = name.lower()
+    if any(hint in lowered for hint in PANEL_INDICATOR_HINTS):
+        return "panel"
+    return "overlay"
+
+
+def _infer_indicator_pane(name: str) -> str | None:
+    lowered = name.lower()
+    if "macd" in lowered or "signal" in lowered or "hist" in lowered:
+        return "macd"
+    if "rsi" in lowered:
+        return "rsi"
+    if "atr" in lowered:
+        return "atr"
+    return None
+
+
+def _is_hidden_indicator(name: str) -> bool:
+    lowered = name.lower()
+    return any(hint in lowered for hint in HIDDEN_DISPLAY_HINTS)
+
+
+def _series_points(
+    timestamps: pd.Series,
+    values: pd.Series,
+    *,
+    include_gaps: bool = False,
+) -> list[dict[str, Any]]:
+    points: list[dict[str, Any]] = []
+    for idx, raw_time in timestamps.items():
+        if idx not in values.index:
+            continue
+        value = values.loc[idx]
+        timestamp = pd.to_datetime(raw_time, utc=True, errors="coerce")
+        if pd.isna(timestamp):
+            continue
+
+        point: dict[str, Any] = {"time": pd.Timestamp(timestamp).isoformat()}
+        if pd.isna(value):
+            if include_gaps:
+                point["value"] = None
+                points.append(point)
+            continue
+
+        point["value"] = round(float(value), 6)
+        points.append(point)
+
+    return points
+
+
+def _supertrend_component(name: str) -> str | None:
+    lowered = name.lower()
+    if "supertrend" not in lowered:
+        return None
+
+    if any(token in lowered for token in ("_down", "down_", "upper", "bear")):
+        return "down"
+    if any(token in lowered for token in ("_up", "up_", "lower", "bull")):
+        return "up"
+    if "trend" in lowered:
+        return "trend"
+    return None
+
+
+def _build_supertrend_series(
+    timestamps: pd.Series,
+    indicators: IndicatorMap,
+) -> tuple[list[IndicatorSeries], set[str]]:
+    trend_series: pd.Series | None = None
+    up_series: pd.Series | None = None
+    down_series: pd.Series | None = None
+    consumed: set[str] = set()
+
+    for name, (series, _explicit_when) in indicators.items():
+        component = _supertrend_component(name)
+        if component is None:
+            continue
+        if component == "trend" and trend_series is None:
+            trend_series = pd.to_numeric(series, errors="coerce")
+            consumed.add(name)
+            continue
+        if component == "up" and up_series is None:
+            up_series = pd.to_numeric(series, errors="coerce")
+            consumed.add(name)
+            continue
+        if component == "down" and down_series is None:
+            down_series = pd.to_numeric(series, errors="coerce")
+            consumed.add(name)
+            continue
+
+    if up_series is None and down_series is None:
+        return [], set()
+
+    supertrend_indicators: list[IndicatorSeries] = []
+
+    if up_series is not None:
+        split_up = up_series.copy()
+        if trend_series is not None:
+            split_up = split_up.where(trend_series > 0)
+        points = _series_points(timestamps, split_up, include_gaps=True)
+        if points:
+            supertrend_indicators.append(
+                IndicatorSeries(
+                    name="supertrend_up",
+                    type="overlay",
+                    data=points,
+                    style={"color": "#22c55e", "pane": "price"},
+                )
+            )
+
+    if down_series is not None:
+        split_down = down_series.copy()
+        if trend_series is not None:
+            split_down = split_down.where(trend_series < 0)
+        points = _series_points(timestamps, split_down, include_gaps=True)
+        if points:
+            supertrend_indicators.append(
+                IndicatorSeries(
+                    name="supertrend_down",
+                    type="overlay",
+                    data=points,
+                    style={"color": "#ef4444", "pane": "price"},
+                )
+            )
+
+    return supertrend_indicators, consumed
+
+
+def _build_indicator_series(df: pd.DataFrame, indicators: IndicatorMap) -> list[IndicatorSeries]:
+    if not indicators or "timestamp" not in df.columns:
+        return []
+
+    timestamps = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+    output: list[IndicatorSeries] = []
+    supertrend_series, consumed = _build_supertrend_series(timestamps, indicators)
+    output.extend(supertrend_series)
+
+    for name, (series, _explicit_when) in indicators.items():
+        if name in consumed or _is_hidden_indicator(name):
+            continue
+
+        numeric = pd.to_numeric(series, errors="coerce")
+        if numeric.isna().all():
+            continue
+
+        points = _series_points(timestamps, numeric)
+        if not points:
+            continue
+
+        display_type = _infer_indicator_display_type(name)
+        style: dict[str, Any] = {}
+        pane = _infer_indicator_pane(name)
+        if pane is not None:
+            style["pane"] = pane
+
+        output.append(
+            IndicatorSeries(
+                name=name,
+                type=display_type,
+                data=points,
+                style=style,
+            )
+        )
+
+    return output
 
 
 def _normalize_drawings(drawings: Any, *, symbol: str) -> DrawingList:
@@ -679,7 +963,17 @@ def _resolve_exit_price(
         exit_price = exit_price_series.iloc[exit_idx]
         if pd.notna(exit_price) and float(exit_price) > 0:
             return float(exit_price)
+    open_value = exit_row.get("open")
+    if open_value is not None and pd.notna(open_value):
+        return float(open_value)
     return float(exit_row["close"])
+
+
+def _resolve_entry_price(entry_row: pd.Series) -> float:
+    open_value = entry_row.get("open")
+    if open_value is not None and pd.notna(open_value):
+        return float(open_value)
+    return float(entry_row["close"])
 
 
 def _resolve_exit_reason(exit_idx: int, exit_reason_series: pd.Series | None) -> str | None:
@@ -848,13 +1142,12 @@ def _resolve_intrabar_exit(
 
     entry_ts = pd.to_datetime(entry_time, utc=True, errors="coerce")
     exit_ts = pd.to_datetime(scheduled_exit_time, utc=True, errors="coerce")
-    base_duration = TIMEFRAME_TO_DURATION.get(base_timeframe, pd.Timedelta(0))
 
     if pd.isna(entry_ts) or pd.isna(exit_ts):
         return None
 
-    effective_start = entry_ts + base_duration
-    effective_end = exit_ts + base_duration
+    effective_start = entry_ts
+    effective_end = exit_ts
     if effective_end <= effective_start:
         return None
 

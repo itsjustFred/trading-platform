@@ -2,6 +2,7 @@ import type {
   AgentConvertRequest,
   DataCategoryResponse,
   DataDownloadRequest,
+  DataHarvestRequest,
   DataOverviewResponse,
   DataResampleRequest,
   DataTaskDeleteResponse,
@@ -9,7 +10,26 @@ import type {
   DataTaskLogsResponse,
   DataTaskStartResponse,
   DataTaskStatusResponse,
+  DataCacheInvalidationResponse,
+  DataCheckResponse,
   DukascopyGenesisResponse,
+  LiveAccount,
+  LiveAccountStats,
+  LiveBalancesResponse,
+  LiveDeploymentCreateRequest,
+  LiveDeploymentConfig,
+  LiveSignalLogResponse,
+  LivePositionsResponse,
+  LiveQuoteResponse,
+  LiveDeploymentStatus,
+  Service,
+  ServiceStatus,
+  ServiceType,
+  VerificationEvidenceCreateRequest,
+  VerificationEvidenceRecord,
+  VerificationEvidenceSummary,
+  LiveTradesResponse,
+  SignalProcessorOption,
   LogContent,
   LogFile,
   OptimizationDetail,
@@ -17,6 +37,8 @@ import type {
   OptimizationRunResponse,
   OptimizationSummary,
   RunBacktestRequest,
+  RunBacktestFromSignalsRequest,
+  RunBacktestSignalsRequest,
   RunBacktestResponse,
   RunBacktestStatusResponse,
   StrategyDetail,
@@ -24,9 +46,46 @@ import type {
   Trade,
   TradeChartResponse,
   BacktestInfo,
+  BacktestCapmResponse,
+  BacktestsDeduplicateResponse,
+  BacktestsBulkDeleteResponse,
+  BacktestsRemoveEmptyResponse,
+  BacktestsCompareResponse,
+  BacktestMatrixSummary,
+  MatrixGridOverview,
+  PortfolioComponent,
+  PortfolioContribution,
+  PortfolioDetail,
+  PortfolioSummary,
+  PortfoliosQueryParams,
+  PortfoliosDuplicatesResponse,
+  PortfoliosDeduplicateResponse,
+  PortfoliosRemoveEmptyResponse,
+  BacktestsDuplicatesResponse,
+  BacktestMetadataItem,
+  BacktestsListResponse,
+  BacktestsQueryParams,
+  BacktestReplayResponse,
+  PortfoliosBulkDeleteResponse,
 } from "./types";
 
 const BASE_URL = "/api";
+const LIVE_STATS_PATH_FRAGMENT = "/live/stats/";
+
+let liveStatsSupported: boolean | null = null;
+let liveStatsSupportPromise: Promise<boolean> | null = null;
+
+export class ApiError extends Error {
+  status: number;
+  detail: unknown;
+
+  constructor(message: string, status: number, detail: unknown) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.detail = detail;
+  }
+}
 
 async function fetchJSON<T>(url: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE_URL}${url}`, {
@@ -35,9 +94,49 @@ async function fetchJSON<T>(url: string, options?: RequestInit): Promise<T> {
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: res.statusText }));
-    throw new Error(err.error || res.statusText);
+    const detail = err?.detail ?? err;
+    const messageFromDetail =
+      typeof detail === "string"
+        ? detail
+        : typeof detail === "object" && detail && "message" in detail
+          ? String((detail as { message?: unknown }).message ?? "")
+          : "";
+    const message =
+      messageFromDetail ||
+      err?.error ||
+      res.statusText;
+    throw new ApiError(message, res.status, detail);
   }
   return res.json();
+}
+
+async function supportsLiveStatsEndpoint(): Promise<boolean> {
+  if (liveStatsSupported !== null) {
+    return liveStatsSupported;
+  }
+  if (!liveStatsSupportPromise) {
+    liveStatsSupportPromise = (async () => {
+      try {
+        const response = await fetch("/openapi.json");
+        if (!response.ok) {
+          return true;
+        }
+        const payload = (await response.json()) as { paths?: Record<string, unknown> };
+        const paths = Object.keys(payload?.paths ?? {});
+        return paths.some((path) => path.includes(LIVE_STATS_PATH_FRAGMENT));
+      } catch {
+        return true;
+      }
+    })()
+      .then((supported) => {
+        liveStatsSupported = supported;
+        return supported;
+      })
+      .finally(() => {
+        liveStatsSupportPromise = null;
+      });
+  }
+  return liveStatsSupportPromise;
 }
 
 // Strategies
@@ -53,30 +152,278 @@ export const renameStrategy = (name: string, displayName: string) =>
   });
 
 // Backtests
-export const getBacktests = () => fetchJSON<any[]>("/backtests");
+export const getBacktests = (params?: BacktestsQueryParams) => {
+  const query = new URLSearchParams();
+  if (params?.page != null) query.set("page", String(params.page));
+  if (params?.per_page != null) query.set("per_page", String(params.per_page));
+  if (params?.sort) query.set("sort", params.sort);
+  if (params?.order) query.set("order", params.order);
+  if (params?.name) query.set("name", params.name);
+  if (params?.strategy) query.set("strategy", params.strategy);
+  if (params?.symbol) query.set("symbol", params.symbol);
+  if (params?.timeframe) query.set("timeframe", params.timeframe);
+  if (params?.search) query.set("search", params.search);
+  if (params?.total_return_min != null) query.set("total_return_min", String(params.total_return_min));
+  if (params?.total_return_max != null) query.set("total_return_max", String(params.total_return_max));
+  if (params?.sharpe_min != null) query.set("sharpe_min", String(params.sharpe_min));
+  if (params?.sharpe_max != null) query.set("sharpe_max", String(params.sharpe_max));
+  if (params?.psr_min != null) query.set("psr_min", String(params.psr_min));
+  if (params?.psr_max != null) query.set("psr_max", String(params.psr_max));
+  if (params?.p_value_min != null) query.set("p_value_min", String(params.p_value_min));
+  if (params?.p_value_max != null) query.set("p_value_max", String(params.p_value_max));
+  if (params?.cagr_min != null) query.set("cagr_min", String(params.cagr_min));
+  if (params?.cagr_max != null) query.set("cagr_max", String(params.cagr_max));
+  if (params?.win_rate_min != null) query.set("win_rate_min", String(params.win_rate_min));
+  if (params?.win_rate_max != null) query.set("win_rate_max", String(params.win_rate_max));
+  if (params?.drawdown_min != null) query.set("drawdown_min", String(params.drawdown_min));
+  if (params?.drawdown_max != null) query.set("drawdown_max", String(params.drawdown_max));
+  if (params?.max_drawdown_min != null) query.set("max_drawdown_min", String(params.max_drawdown_min));
+  if (params?.max_drawdown_max != null) query.set("max_drawdown_max", String(params.max_drawdown_max));
+  const queryString = query.toString();
+  return fetchJSON<BacktestsListResponse>(`/backtests${queryString ? `?${queryString}` : ""}`);
+};
+export const getBacktestsAll = (
+  name?: string,
+  options?: { includeEquityPreview?: boolean; previewLimit?: number },
+) => {
+  const query = new URLSearchParams();
+  if (options?.includeEquityPreview) {
+    query.set("include_equity_preview", "true");
+    query.set("preview_limit", String(Math.max(1, Math.min(100, options.previewLimit ?? 48))));
+  }
+  if (name && name.trim()) query.set("name", name.trim());
+  return fetchJSON<BacktestMetadataItem[]>(`/backtests/all?${query.toString()}`);
+};
+export const getBacktestEquityPreview = (id: string, limit = 80) =>
+  fetchJSON<number[]>(
+    `/backtests/${encodeURIComponent(id)}/equity-preview?limit=${Math.max(1, Math.min(100, limit))}`,
+  );
+export const getBacktestEquityPreviews = (ids: string[], limit = 48) => {
+  const query = new URLSearchParams();
+  query.set("ids", ids.join(","));
+  query.set("limit", String(Math.max(1, Math.min(100, limit))));
+  return fetchJSON<Record<string, number[]>>(`/backtests/equity-preview/batch?${query.toString()}`);
+};
 export const getBacktestInfo = (id: string) =>
   fetchJSON<BacktestInfo>(`/backtest/${id}/info`);
 export const getBacktestStats = (id: string) =>
   fetchJSON<any>(`/backtest/${id}/stats`);
-export const getBacktestTrades = (id: string) =>
-  fetchJSON<Trade[]>(`/backtest/${id}/trades`);
+export const getBacktestTrades = (
+  id: string,
+  params?: { offset?: number; limit?: number },
+) => {
+  const query = new URLSearchParams();
+  if (params?.offset != null) query.set("offset", String(Math.max(0, Math.trunc(params.offset))));
+  if (params?.limit != null) query.set("limit", String(Math.max(1, Math.min(100, Math.trunc(params.limit)))));
+  const queryString = query.toString();
+  return fetchJSON<Trade[]>(`/backtest/${id}/trades${queryString ? `?${queryString}` : ""}`);
+};
 export const getBacktestTrade = (id: string, nr: number) =>
   fetchJSON<TradeChartResponse>(`/backtest/${id}/trade/${nr}`);
-export const getBacktestEquity = (id: string) =>
-  fetchJSON<any>(`/backtest/${id}/equity`);
+export const getBacktestReplay = (id: string) =>
+  fetchJSON<BacktestReplayResponse>(`/backtest/${id}/replay`);
+export const getBacktestEquity = (
+  id: string,
+  params?: { max_points?: number; sampling?: "none" | "minmax" },
+) => {
+  const query = new URLSearchParams();
+  if (params?.max_points != null) {
+    const capped = Math.max(0, Math.min(20000, Math.trunc(params.max_points)));
+    query.set("max_points", String(capped));
+  }
+  if (params?.sampling) {
+    query.set("sampling", params.sampling);
+  }
+  const queryString = query.toString();
+  return fetchJSON<any>(`/backtest/${id}/equity${queryString ? `?${queryString}` : ""}`);
+};
+export const getBacktestCapm = (id: string, benchmark?: string) => {
+  const params = new URLSearchParams();
+  if (benchmark) params.set("benchmark", benchmark);
+  const query = params.toString();
+  return fetchJSON<BacktestCapmResponse>(`/backtest/${id}/capm${query ? `?${query}` : ""}`);
+};
 export const getBacktestOHLCV = (id: string) =>
   fetchJSON<any>(`/backtest/${id}/ohlcv`);
 export const renameBacktest = (id: string, title: string) =>
-  fetchJSON<any>(`/backtests/${encodeURIComponent(id)}`, {
-    method: "PATCH",
+  fetchJSON<any>(`/backtests/${encodeURIComponent(id)}/name`, {
+    method: "PUT",
     body: JSON.stringify({ name: title }),
   });
 export const compareBacktests = (ids: string[]) =>
-  fetchJSON<any>(`/compare?ids=${ids.join(",")}`);
+  fetchJSON<BacktestsCompareResponse>(`/backtests/compare?ids=${ids.join(",")}`);
+export const getBacktestDuplicates = () =>
+  fetchJSON<BacktestsDuplicatesResponse>("/backtests/duplicates");
+export const getBacktestMatrix = () => fetchJSON<BacktestMatrixSummary>("/backtests/matrix/summary");
+export const getBacktestMatrixMatrixCsvUrl = () => "/api/backtests/matrix/matrix.csv";
+export const getBacktestMatrixDailyEquityCsvUrl = () => "/api/backtests/matrix/daily-equity.csv";
+export const getMatrixGrid = (strategyId = "all", tradesLimit = 3) =>
+  fetchJSON<MatrixGridOverview>(
+    `/grid/${encodeURIComponent(strategyId)}?trades_limit=${Math.max(0, Math.min(20, Math.trunc(tradesLimit)))}`,
+  );
+export const deduplicateBacktests = () =>
+  fetchJSON<BacktestsDeduplicateResponse>("/backtests/deduplicate", {
+    method: "POST",
+  });
+export const removeEmptyBacktests = () =>
+  fetchJSON<BacktestsRemoveEmptyResponse>("/backtests/remove-empty", {
+    method: "POST",
+  });
+export const deleteBacktest = (id: string) =>
+  fetchJSON<{ id: string; status: string }>(`/backtests/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+export const deleteBacktestsBulk = (ids: string[]) =>
+  fetchJSON<BacktestsBulkDeleteResponse>("/backtests/delete-bulk", {
+    method: "POST",
+    body: JSON.stringify({ ids }),
+  });
+
+// Live Hub
+export const getLiveDeployments = () =>
+  fetchJSON<LiveDeploymentConfig[]>("/live/deployments");
+export const getLiveAccounts = () => fetchJSON<LiveAccount[]>("/live/accounts");
+export const getLiveStats = async (accountId: string) => {
+  const supported = await supportsLiveStatsEndpoint();
+  if (!supported) {
+    throw new ApiError("Live stats endpoint not available", 404, {
+      endpoint: "/api/live/stats/{account_id}",
+    });
+  }
+  return fetchJSON<LiveAccountStats>(`/live/stats/${encodeURIComponent(accountId)}`);
+};
+export const getLiveBalances = (accountId: string) =>
+  fetchJSON<LiveBalancesResponse>(`/live/balances/${encodeURIComponent(accountId)}`);
+export const getLiveTrades = (accountId: string) =>
+  fetchJSON<LiveTradesResponse>(`/live/trades/${encodeURIComponent(accountId)}`);
+export const getLiveQuote = (symbol: string) =>
+  fetchJSON<LiveQuoteResponse>(`/live/quotes/${encodeURIComponent(symbol)}`);
+export const getLivePositions = (accountId: string) =>
+  fetchJSON<LivePositionsResponse>(`/live/positions/${encodeURIComponent(accountId)}`);
+export const getLiveSignalLog = (accountId: string, limit = 200) => {
+  const params = new URLSearchParams();
+  if (Number.isFinite(limit)) {
+    params.set("limit", String(Math.max(1, Math.min(1000, Math.trunc(limit)))));
+  }
+  const query = params.toString();
+  return fetchJSON<LiveSignalLogResponse>(
+    `/live/signals/${encodeURIComponent(accountId)}${query ? `?${query}` : ""}`,
+  );
+};
+export const getSignalProcessors = () =>
+  fetchJSON<SignalProcessorOption[]>("/signal-processors");
+export const createLiveDeployment = (payload: LiveDeploymentCreateRequest) =>
+  fetchJSON<LiveDeploymentConfig>("/live/deployments", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+export const updateLiveDeploymentStatus = (deploymentId: string, status: LiveDeploymentStatus) =>
+  fetchJSON<LiveDeploymentConfig>(`/live/deployments/${encodeURIComponent(deploymentId)}/status`, {
+    method: "PUT",
+    body: JSON.stringify({ status }),
+  });
+export const deleteLiveDeployment = (deploymentId: string) =>
+  fetchJSON<{ status: string; id: string }>(
+    `/live/deployments/${encodeURIComponent(deploymentId)}`,
+    { method: "DELETE" },
+  );
+
+// Services
+export const getServices = (type?: ServiceType) => {
+  const params = new URLSearchParams();
+  if (type) params.set("type", type);
+  const query = params.toString();
+  return fetchJSON<Service[]>(`/services${query ? `?${query}` : ""}`);
+};
+export const getService = (serviceId: string) =>
+  fetchJSON<Service>(`/services/${encodeURIComponent(serviceId)}`);
+export const createService = (payload: {
+  name: string;
+  type: ServiceType;
+  status?: ServiceStatus;
+  config?: Record<string, unknown>;
+}) =>
+  fetchJSON<Service>("/services", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+export const updateServiceStatus = (serviceId: string, status: ServiceStatus) =>
+  fetchJSON<Service>(`/services/${encodeURIComponent(serviceId)}/status`, {
+    method: "PUT",
+    body: JSON.stringify({ status }),
+  });
+export const deleteService = (serviceId: string) =>
+  fetchJSON<{ status: string; id: string }>(`/services/${encodeURIComponent(serviceId)}`, {
+    method: "DELETE",
+  });
+export const getServiceLogs = (
+  serviceId: string,
+  lines?: number,
+  level?: string,
+  search?: string,
+) => {
+  const params = new URLSearchParams();
+  if (lines) params.set("lines", String(lines));
+  if (level) params.set("level", level);
+  if (search) params.set("search", search);
+  const query = params.toString();
+  return fetchJSON<LogContent>(
+    `/services/${encodeURIComponent(serviceId)}/logs${query ? `?${query}` : ""}`,
+  );
+};
+
+// Verification evidence
+export const getVerificationEvidence = (params?: {
+  component?: string;
+  category?: string;
+  status?: "success" | "failed" | "partial" | "skipped";
+  limit?: number;
+}) => {
+  const query = new URLSearchParams();
+  if (params?.component) query.set("component", params.component);
+  if (params?.category) query.set("category", params.category);
+  if (params?.status) query.set("status", params.status);
+  if (params?.limit != null) query.set("limit", String(params.limit));
+  const queryString = query.toString();
+  return fetchJSON<VerificationEvidenceRecord[]>(
+    `/verification/evidence${queryString ? `?${queryString}` : ""}`,
+  );
+};
+
+export const getVerificationEvidenceSummary = (params?: {
+  component?: string;
+  category?: string;
+  limit?: number;
+}) => {
+  const query = new URLSearchParams();
+  if (params?.component) query.set("component", params.component);
+  if (params?.category) query.set("category", params.category);
+  if (params?.limit != null) query.set("limit", String(params.limit));
+  const queryString = query.toString();
+  return fetchJSON<VerificationEvidenceSummary[]>(
+    `/verification/evidence/summary${queryString ? `?${queryString}` : ""}`,
+  );
+};
+
+export const createVerificationEvidence = (payload: VerificationEvidenceCreateRequest) =>
+  fetchJSON<VerificationEvidenceRecord>("/verification/evidence", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
 
 // Run backtest
 export const runBacktest = (data: RunBacktestRequest) =>
   fetchJSON<RunBacktestResponse>("/backtests/run", {
+    method: "POST",
+    body: JSON.stringify(data),
+  });
+export const runBacktestSignals = (data: RunBacktestSignalsRequest) =>
+  fetchJSON<RunBacktestResponse>("/backtests/run-signals", {
+    method: "POST",
+    body: JSON.stringify(data),
+  });
+export const runBacktestFromSignals = (data: RunBacktestFromSignalsRequest) =>
+  fetchJSON<RunBacktestResponse>("/backtests/run-from-signals", {
     method: "POST",
     body: JSON.stringify(data),
   });
@@ -95,27 +442,75 @@ export const getOptimization = (id: string) =>
   fetchJSON<OptimizationDetail>(`/optimizations/${encodeURIComponent(id)}`);
 
 // Portfolios
-export const getPortfolios = () => fetchJSON<any[]>("/portfolios");
-export const getPortfolio = (id: string) => fetchJSON<any>(`/portfolios/${id}`);
+export const getPortfolios = (params?: PortfoliosQueryParams) => {
+  const query = new URLSearchParams();
+  if (params?.name) query.set("name", params.name);
+  if (params?.sort) query.set("sort", params.sort);
+  if (params?.order) query.set("order", params.order);
+  const queryString = query.toString();
+  return fetchJSON<PortfolioSummary[]>(`/portfolios${queryString ? `?${queryString}` : ""}`);
+};
+export const getPortfolio = (id: string) => fetchJSON<PortfolioDetail>(`/portfolios/${id}`);
 export const getPortfolioDetail = (id: string) =>
-  fetchJSON<any>(`/portfolios/${id}`);
+  fetchJSON<PortfolioDetail>(`/portfolios/${id}`);
+export const renamePortfolio = (id: string, name: string) =>
+  fetchJSON<{ id: string; name: string; status: string }>(`/portfolios/${encodeURIComponent(id)}/name`, {
+    method: "PUT",
+    body: JSON.stringify({ name }),
+  });
+export const getPortfolioContributions = (
+  id: string,
+  groupBy: "component" | "strategy" | "symbol" | "timeframe" = "component",
+) =>
+  fetchJSON<PortfolioContribution[]>(
+    `/portfolios/${encodeURIComponent(id)}/contributions?group_by=${encodeURIComponent(groupBy)}`,
+  );
+export const getPortfolioTrades = (
+  id: string,
+  filters?: { strategy?: string; symbol?: string; timeframe?: string },
+) => {
+  const params = new URLSearchParams();
+  if (filters?.strategy) params.set("strategy", filters.strategy);
+  if (filters?.symbol) params.set("symbol", filters.symbol);
+  if (filters?.timeframe) params.set("timeframe", filters.timeframe);
+  const query = params.toString();
+  return fetchJSON<PortfolioDetail["trades"]>(
+    `/portfolios/${encodeURIComponent(id)}/trades${query ? `?${query}` : ""}`,
+  );
+};
 export const createPortfolio = (data: {
   name: string;
   account_capital: number;
-  strategies: {
-    name: string;
-    risk_per_trade_pct: number;
-    max_positions: number;
-  }[];
+  components: Array<
+    Pick<
+      PortfolioComponent,
+      "strategy_name" | "symbol" | "timeframe" | "weight" | "risk_config" | "settings"
+    > & { backtest_id?: string | null }
+  >;
 }) =>
-  fetchJSON<any>("/portfolios", {
+  fetchJSON<PortfolioDetail>("/portfolios", {
     method: "POST",
     body: JSON.stringify(data),
   });
 export const deletePortfolio = (id: string) =>
-  fetchJSON<any>(`/portfolios/${id}`, { method: "DELETE" });
+  fetchJSON<{ status: string; id: string }>(`/portfolios/${id}`, { method: "DELETE" });
+export const deletePortfoliosBulk = (ids: string[]) =>
+  fetchJSON<PortfoliosBulkDeleteResponse>("/portfolios/delete-bulk", {
+    method: "POST",
+    body: JSON.stringify({ ids }),
+  });
+export const getPortfolioDuplicates = () =>
+  fetchJSON<PortfoliosDuplicatesResponse>("/portfolios/duplicates");
+export const deduplicatePortfolios = () =>
+  fetchJSON<PortfoliosDeduplicateResponse>("/portfolios/deduplicate", {
+    method: "POST",
+  });
+export const removeEmptyPortfolios = () =>
+  fetchJSON<PortfoliosRemoveEmptyResponse>("/portfolios/remove-empty", {
+    method: "POST",
+  });
 export const comparePortfolios = (ids: string[]) =>
-  fetchJSON<any>(`/portfolios/compare?ids=${ids.join(",")}`);
+  fetchJSON<{ portfolios: PortfolioDetail[] }>(`/portfolios/compare?ids=${ids.join(",")}`);
 
 // Logs
 export const getLogs = () => fetchJSON<LogFile[]>("/logs");
@@ -171,8 +566,27 @@ export const downloadData = (data: DataDownloadRequest) =>
     method: "POST",
     body: JSON.stringify(data),
   });
+export const getDataCheck = (
+  symbol: string,
+  timeframe: string,
+  start: string,
+  end: string,
+) => {
+  const params = new URLSearchParams({
+    symbol,
+    timeframe,
+    start,
+    end,
+  });
+  return fetchJSON<DataCheckResponse>(`/data/check?${params.toString()}`);
+};
 export const resampleData = (data: DataResampleRequest) =>
   fetchJSON<DataTaskStartResponse>("/data/resample", {
+    method: "POST",
+    body: JSON.stringify(data),
+  });
+export const harvestData = (data: DataHarvestRequest) =>
+  fetchJSON<DataTaskStartResponse>("/data/harvest", {
     method: "POST",
     body: JSON.stringify(data),
   });
@@ -181,6 +595,7 @@ export const startAgentConvert = (data: AgentConvertRequest) =>
     method: "POST",
     body: JSON.stringify(data),
   });
+export const listTasks = () => fetchJSON<DataTaskListResponse>("/tasks");
 export const listDataTasks = () => fetchJSON<DataTaskListResponse>("/data/tasks");
 export const getDataTask = (taskId: string) =>
   fetchJSON<DataTaskStatusResponse>(`/data/tasks/${taskId}`);
@@ -198,7 +613,26 @@ export const cancelDataTask = (taskId: string) =>
   fetchJSON<DataTaskStatusResponse>(`/data/tasks/${taskId}/cancel`, {
     method: "POST",
   });
+export const restartDataTask = (taskId: string) =>
+  fetchJSON<DataTaskStatusResponse>(`/data/tasks/${taskId}/restart`, {
+    method: "POST",
+  });
 export const deleteDataTask = (taskId: string) =>
   fetchJSON<DataTaskDeleteResponse>(`/data/tasks/${taskId}`, {
     method: "DELETE",
   });
+export const invalidateDataCache = (
+  reason = "manual",
+  includeValidation?: boolean,
+) => {
+  const params = new URLSearchParams();
+  if (reason) params.set("reason", reason);
+  if (typeof includeValidation === "boolean") {
+    params.set("include_validation", includeValidation ? "true" : "false");
+  }
+  const query = params.toString();
+  return fetchJSON<DataCacheInvalidationResponse>(
+    `/data/cache/invalidate${query ? `?${query}` : ""}`,
+    { method: "POST" },
+  );
+};

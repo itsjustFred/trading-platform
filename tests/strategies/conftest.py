@@ -1,0 +1,138 @@
+from __future__ import annotations
+
+import importlib.util
+from datetime import date, datetime, time, timedelta, timezone
+from pathlib import Path
+
+import pyarrow.parquet as pq
+import pyarrow.compute as pc
+import pytest
+
+from shared.constants import DATA_DIR
+
+
+def _candidate_ohlcv_paths(symbol: str, timeframe: str) -> list[Path]:
+    root = DATA_DIR / "ohlcv"
+    if not root.exists():
+        return []
+
+    symbol = str(symbol or "").strip().upper()
+    timeframe = str(timeframe or "").strip().lower()
+    if not symbol or not timeframe:
+        return []
+
+    paths = list(root.rglob(f"**/{symbol}/{timeframe}.parquet"))
+
+    # Canonical layout: .../<symbol>/<timeframe>.parquet
+    if timeframe == "1d":
+        # Some datasets are exported as .../<symbol>.parquet (typically 1d).
+        paths.extend(root.rglob(f"**/{symbol}.parquet"))
+
+    return sorted({path.resolve() for path in paths})
+
+
+def _has_ohlcv_data(symbol: str, timeframe: str) -> bool:
+    return bool(_candidate_ohlcv_paths(symbol, timeframe))
+
+
+def _to_utc_datetime(value: object) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, date):
+        return datetime.combine(value, time.min, tzinfo=timezone.utc)
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        normalized = raw.replace("Z", "+00:00")
+        try:
+            parsed = datetime.fromisoformat(normalized)
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+    return None
+
+
+def _parse_date_bound(value: str, *, is_end: bool) -> datetime:
+    parsed = _to_utc_datetime(str(value or "").strip())
+    if parsed is None:
+        raise ValueError(f"Invalid date filter value: {value!r}")
+    raw = str(value or "").strip()
+    if is_end and "T" not in raw and ":" not in raw:
+        return parsed + timedelta(days=1) - timedelta(microseconds=1)
+    return parsed
+
+
+def _path_time_coverage(path: Path) -> tuple[datetime | None, datetime | None]:
+    try:
+        table = pq.read_table(path, columns=["timestamp"])
+    except Exception:
+        return None, None
+    if table.num_rows == 0:
+        return None, None
+
+    column = table["timestamp"]
+    try:
+        min_scalar = pc.min(column)
+        max_scalar = pc.max(column)
+    except Exception:
+        return None, None
+    start = _to_utc_datetime(min_scalar.as_py() if min_scalar is not None else None)
+    end = _to_utc_datetime(max_scalar.as_py() if max_scalar is not None else None)
+    return start, end
+
+
+def _covers_requested_period(symbol: str, timeframe: str, start: str, end: str) -> bool:
+    paths = _candidate_ohlcv_paths(symbol, timeframe)
+    if not paths:
+        return False
+
+    coverage_start: datetime | None = None
+    coverage_end: datetime | None = None
+    for path in paths:
+        path_start, path_end = _path_time_coverage(path)
+        if path_start is None or path_end is None:
+            continue
+        if coverage_start is None or path_start < coverage_start:
+            coverage_start = path_start
+        if coverage_end is None or path_end > coverage_end:
+            coverage_end = path_end
+
+    if coverage_start is None or coverage_end is None:
+        return False
+
+    if start:
+        start_bound = _parse_date_bound(start, is_end=False)
+        if coverage_start > start_bound:
+            return False
+    if end:
+        end_bound = _parse_date_bound(end, is_end=True)
+        if coverage_end < end_bound:
+            return False
+    return True
+
+
+@pytest.fixture(autouse=True, scope="module")
+def skip_when_required_data_or_dependency_missing(request: pytest.FixtureRequest):
+    module = request.module
+    module_name = str(getattr(module, "__name__", "") or "").lower()
+
+    if "pynecore" in module_name and importlib.util.find_spec("pynecore") is None:
+        pytest.skip("pynecore is not installed in this environment")
+
+    symbol = getattr(module, "TEST_SYMBOL", None)
+    timeframe = getattr(module, "TEST_TIMEFRAME", None)
+    if symbol and timeframe and not _has_ohlcv_data(str(symbol), str(timeframe)):
+        pytest.skip(
+            f"missing OHLCV dataset for {symbol}/{timeframe} under {Path(DATA_DIR) / 'ohlcv'}"
+        )
+    start = getattr(module, "TEST_START", None)
+    end = getattr(module, "TEST_END", None)
+    if symbol and timeframe and (start or end):
+        if not _covers_requested_period(str(symbol), str(timeframe), str(start or ""), str(end or "")):
+            pytest.skip(
+                f"insufficient OHLCV coverage for {symbol}/{timeframe} "
+                f"within requested range {start}..{end}"
+            )

@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_PERIODS_PER_YEAR = 252
 MIN_CALMAR_DRAWDOWN = 0.001
+SECONDS_PER_DAY = 24 * 60 * 60
 SECONDS_PER_YEAR = 365.25 * 24 * 60 * 60
 
 try:
@@ -112,6 +113,7 @@ def compute_stats(
         equities = [e.equity for e in equity_curve]
         daily_returns = _daily_returns_from_equity_curve(equity_curve)
         p_value = _one_sided_p_value(daily_returns)
+        cagr = _cagr_from_backtest_period(equity_curve=equity_curve, trades=trades)
 
         if HAS_QUANTSTATS:
             returns_series = _equity_to_returns_series(equity_curve)
@@ -140,13 +142,6 @@ def compute_stats(
                 # MaxDD is purely geometric and doesn't require annualization logic like Sharpe
                 equities_series = [e.equity for e in equity_curve]
                 max_drawdown_pct = -_max_drawdown_pct_manual(equities_series)
-
-                cagr = _safe_qs(
-                    qs.stats.cagr,
-                    returns_series,
-                    rf=risk_free_rate,
-                    periods=periods_per_year,
-                )
                 calmar_ratio = _safe_calmar_ratio(cagr, max_drawdown_pct)
                 total_return = float((1 + returns_series).prod() - 1)
 
@@ -164,7 +159,6 @@ def compute_stats(
                 periods_per_year=periods_per_year,
                 observations=n_returns,
             )
-            cagr = annualized_return
             calmar_ratio = _safe_calmar_ratio(annualized_return, max_drawdown_pct)
             max_drawdown_duration = _max_drawdown_duration(equities)
             if len(daily_returns) > 1:
@@ -294,6 +288,56 @@ def _annualize_total_return(total_return: float, *, periods_per_year: int, obser
         return 0.0
 
     return (1 + total_return) ** (1 / years) - 1
+
+
+def _cagr_from_backtest_period(*, equity_curve: list[EquityPoint], trades: list[Trade]) -> float:
+    if len(equity_curve) < 2:
+        return 0.0
+
+    equity_initial = float(equity_curve[0].equity)
+    equity_final = float(equity_curve[-1].equity)
+    if equity_initial <= 0 or equity_final <= 0:
+        return 0.0
+
+    start_dt, end_dt = _resolve_backtest_period_bounds(equity_curve=equity_curve, trades=trades)
+    days = float((end_dt - start_dt).total_seconds()) / SECONDS_PER_DAY
+    if days <= 0:
+        return 0.0
+    return (equity_final / equity_initial) ** (365.25 / days) - 1
+
+
+def _resolve_backtest_period_bounds(
+    *, equity_curve: list[EquityPoint], trades: list[Trade]
+) -> tuple[pd.Timestamp, pd.Timestamp]:
+    trade_start_times: list[pd.Timestamp] = []
+    trade_end_times: list[pd.Timestamp] = []
+
+    for trade in trades:
+        entry_ts = pd.to_datetime(str(trade.entry_time), utc=True, errors="coerce")
+        if not pd.isna(entry_ts):
+            trade_start_times.append(pd.Timestamp(entry_ts))
+
+        exit_ts = pd.to_datetime(str(trade.last_exit_time), utc=True, errors="coerce")
+        if not pd.isna(exit_ts):
+            trade_end_times.append(pd.Timestamp(exit_ts))
+
+    if trade_start_times and trade_end_times:
+        return min(trade_start_times), max(trade_end_times)
+
+    try:
+        equity_times = [
+            pd.Timestamp(ts)
+            for ts in pd.to_datetime([point.time for point in equity_curve], utc=True, errors="coerce")
+            if not pd.isna(ts)
+        ]
+    except Exception:
+        equity_times = []
+
+    if len(equity_times) >= 2:
+        return min(equity_times), max(equity_times)
+
+    fallback_start = pd.Timestamp.now(tz="UTC")
+    return fallback_start, fallback_start
 
 
 def _safe_calmar_ratio(annualized_return: float, max_drawdown_pct: float) -> float:

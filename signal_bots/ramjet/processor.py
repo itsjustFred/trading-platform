@@ -1,0 +1,247 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pandas as pd
+import yaml
+
+from risk.models import TradeSignal
+from shared.constants import normalize_timeframe
+
+_TIMEFRAME_ALIASES: dict[str, str] = {
+    "1min": "1m",
+    "5min": "5m",
+    "15min": "15m",
+    "30min": "30m",
+    "60min": "1h",
+}
+
+
+def _resolve_timeframe(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    normalized = normalize_timeframe(text)
+    if normalized:
+        return _TIMEFRAME_ALIASES.get(normalized, normalized)
+    return _TIMEFRAME_ALIASES.get(text, text)
+
+
+class RamJetSignalProcessor:
+    """RamJet signal processor with formula-identical SL/TP logic.
+
+    Ported from `/home/ubuntu/Desktop/stockkit_ai_bot`:
+    - ATR via EMA(TR, span=atr_period)
+    - SL: entry - ATR * sl_multiplier
+    - TP1: entry + ATR * tp1_multiplier
+    - Trailing model: breakeven after TP1 + two-phase Supertrend flip workflow
+    """
+
+    def __init__(self, config: dict[str, Any]):
+        loaded = dict(config or {})
+        if isinstance(loaded.get("ram_jet"), dict):
+            loaded = dict(loaded["ram_jet"])
+        self.config = loaded
+
+        self.atr_period = int(self.config.get("atr_period", 14))
+        self.sl_multiplier = float(self.config.get("sl_multiplier", 2.0))
+        self.tp1_multiplier = float(self.config.get("tp1_multiplier", 3.0))
+        self.tp1_exit_percent = float(self.config.get("tp1_exit_percent", 0.50))
+        self.supertrend_period = int(self.config.get("supertrend_period", 10))
+        self.supertrend_multiplier = float(self.config.get("supertrend_multiplier", 3.0))
+        self.default_timeframe = (
+            _resolve_timeframe(self.config.get("candle_timeframe", "5m")) or "5m"
+        )
+
+    @classmethod
+    def from_config_file(cls, config_path: str | Path) -> "RamJetSignalProcessor":
+        path = Path(config_path)
+        payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        if not isinstance(payload, dict):
+            raise ValueError(f"Config file {path} must decode to a mapping")
+        return cls(payload)
+
+    @staticmethod
+    def _prepare_market_data(market_data: pd.DataFrame) -> pd.DataFrame:
+        if market_data is None or market_data.empty:
+            raise ValueError("market_data must contain OHLCV rows")
+
+        frame = market_data.copy()
+        frame.columns = [str(column).strip().lower() for column in frame.columns]
+        required = {"open", "high", "low", "close"}
+        missing = required.difference(frame.columns)
+        if missing:
+            missing_cols = ", ".join(sorted(missing))
+            raise ValueError(f"market_data missing required columns: {missing_cols}")
+
+        for column in required:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+        frame = frame.dropna(subset=sorted(required))
+        if frame.empty:
+            raise ValueError("market_data has no valid OHLC rows after cleaning")
+        return frame
+
+    @staticmethod
+    def _calculate_atr(df: pd.DataFrame, period: int) -> pd.DataFrame:
+        frame = df.copy()
+        frame["h_l"] = frame["high"] - frame["low"]
+        frame["h_pc"] = (frame["high"] - frame["close"].shift(1)).abs()
+        frame["l_pc"] = (frame["low"] - frame["close"].shift(1)).abs()
+        frame["tr"] = frame[["h_l", "h_pc", "l_pc"]].max(axis=1)
+        frame["atr"] = frame["tr"].ewm(span=period, adjust=False).mean()
+        frame = frame.drop(columns=["h_l", "h_pc", "l_pc", "tr"])
+        return frame
+
+    @staticmethod
+    def _calculate_supertrend(df: pd.DataFrame, period: int, multiplier: float) -> pd.DataFrame:
+        frame = df.copy()
+        st_dir_found = False
+
+        if hasattr(frame, "ta"):
+            st = frame.ta.supertrend(length=period, multiplier=multiplier)
+            if isinstance(st, pd.DataFrame):
+                st_dir_col = f"SUPERTd_{period}_{float(multiplier)}"
+                if st_dir_col not in st.columns:
+                    for column in st.columns:
+                        if str(column).startswith("SUPERTd"):
+                            st_dir_col = str(column)
+                            break
+                if st_dir_col in st.columns:
+                    frame["supertrend"] = st[st_dir_col] == 1
+                    st_dir_found = True
+
+        if not st_dir_found:
+            hl2 = (frame["high"] + frame["low"]) / 2
+
+            frame["h_l_st"] = frame["high"] - frame["low"]
+            frame["h_pc_st"] = (frame["high"] - frame["close"].shift(1)).abs()
+            frame["l_pc_st"] = (frame["low"] - frame["close"].shift(1)).abs()
+            frame["tr_st"] = frame[["h_l_st", "h_pc_st", "l_pc_st"]].max(axis=1)
+            frame["atr_st"] = frame["tr_st"].ewm(alpha=1 / period, adjust=False).mean()
+
+            basic_upper = (hl2 + (multiplier * frame["atr_st"])).to_numpy()
+            basic_lower = (hl2 - (multiplier * frame["atr_st"])).to_numpy()
+            close = frame["close"].to_numpy()
+
+            n_rows = len(frame)
+            final_upper = np.full(n_rows, np.nan)
+            final_lower = np.full(n_rows, np.nan)
+            supertrend = np.ones(n_rows, dtype=bool)
+
+            first_valid_idx = 0
+            for i in range(n_rows):
+                if not np.isnan(basic_upper[i]):
+                    first_valid_idx = i
+                    break
+
+            if n_rows > first_valid_idx:
+                final_upper[first_valid_idx] = basic_upper[first_valid_idx]
+                final_lower[first_valid_idx] = basic_lower[first_valid_idx]
+
+            for i in range(first_valid_idx + 1, n_rows):
+                if basic_upper[i] < final_upper[i - 1] or close[i - 1] > final_upper[i - 1]:
+                    final_upper[i] = basic_upper[i]
+                else:
+                    final_upper[i] = final_upper[i - 1]
+
+                if basic_lower[i] > final_lower[i - 1] or close[i - 1] < final_lower[i - 1]:
+                    final_lower[i] = basic_lower[i]
+                else:
+                    final_lower[i] = final_lower[i - 1]
+
+                prev_st = supertrend[i - 1]
+                if prev_st:
+                    supertrend[i] = close[i] > final_lower[i]
+                else:
+                    supertrend[i] = close[i] >= final_upper[i]
+
+            frame["supertrend"] = supertrend
+            frame = frame.drop(
+                columns=["h_l_st", "h_pc_st", "l_pc_st", "tr_st", "atr_st"],
+                errors="ignore",
+            )
+
+        return frame
+
+    @staticmethod
+    def _normalize_buy_action(raw_action: Any) -> str:
+        action = str(raw_action or "").strip().lower()
+        if action in {"buy", "long"}:
+            return "buy"
+        raise ValueError("RamJetSignalProcessor only supports BUY/LONG entry signals")
+
+    def process_signal(
+        self,
+        raw_signal: dict[str, Any],
+        market_data: pd.DataFrame,
+    ) -> TradeSignal:
+        symbol = str(raw_signal.get("symbol") or "").strip().upper()
+        if not symbol:
+            raise ValueError("raw_signal must include symbol")
+
+        action = self._normalize_buy_action(raw_signal.get("action"))
+
+        frame = self._prepare_market_data(market_data)
+        frame = self._calculate_atr(frame, self.atr_period)
+        frame = self._calculate_supertrend(
+            frame,
+            self.supertrend_period,
+            self.supertrend_multiplier,
+        )
+
+        entry_price = float(frame["close"].iloc[-1])
+        atr_value = float(frame["atr"].iloc[-1])
+        if not np.isfinite(atr_value) or atr_value <= 0:
+            raise ValueError("Latest ATR value is invalid for SL/TP calculation")
+
+        stop_loss = entry_price - (atr_value * self.sl_multiplier)
+        take_profit = entry_price + (atr_value * self.tp1_multiplier)
+        latest_supertrend_green = bool(frame["supertrend"].iloc[-1])
+
+        timeframe = _resolve_timeframe(raw_signal.get("timeframe")) or self.default_timeframe
+
+        base_metadata = raw_signal.get("metadata", {})
+        metadata = dict(base_metadata) if isinstance(base_metadata, dict) else {}
+        metadata.update(
+            {
+                "source": "ramjet",
+                "signal_bot": "ramjet",
+                "ramjet_config": {
+                    "atr_period": self.atr_period,
+                    "sl_multiplier": self.sl_multiplier,
+                    "tp1_multiplier": self.tp1_multiplier,
+                    "tp1_exit_percent": self.tp1_exit_percent,
+                    "supertrend_period": self.supertrend_period,
+                    "supertrend_multiplier": self.supertrend_multiplier,
+                },
+                "atr": atr_value,
+                "tp1_price": take_profit,
+                "tp1_exit_percent": self.tp1_exit_percent,
+                "supertrend_green_at_entry": latest_supertrend_green,
+                "trailing_sl_config": {
+                    "mode": "supertrend_flip",
+                    "breakeven_after_tp1": True,
+                    "activation_phase": "wait_for_first_green_after_tp1",
+                    "exit_phase": "exit_on_first_red_after_activation",
+                    "supertrend_period": self.supertrend_period,
+                    "supertrend_multiplier": self.supertrend_multiplier,
+                },
+            }
+        )
+
+        if "timestamp" in raw_signal and raw_signal.get("timestamp") is not None:
+            metadata["signal_timestamp"] = str(raw_signal.get("timestamp"))
+        if "signal_price" in raw_signal and raw_signal.get("signal_price") is not None:
+            metadata["signal_price"] = float(raw_signal.get("signal_price"))
+
+        return TradeSignal(
+            action=action,
+            symbol=symbol,
+            entry_price=entry_price,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            timeframe=timeframe,
+            metadata=metadata,
+        )

@@ -103,15 +103,77 @@ def generate_signals(df: pd.DataFrame, params: dict):
 
     assert len(result.trades) == 1
     trade = result.trades[0]
-    assert trade.quantity == 200.0
-    assert trade.pnl == 200.0
+    assert trade.quantity == 142.8571
+    assert trade.pnl == -142.86
     assert trade.meta["RSI"] == 25
     assert trade.meta["sl_price"] == 95.0
     assert trade.meta["trailing_stop_at_exit"] == 101.0
     assert trade.meta["exit_price"] == 101.0
     assert trade.meta["exit_reason"] == "trailing_stop"
+    assert trade.meta["risk_math"]["risk_target_usd"] == 1000.0
+    assert trade.meta["risk_math"]["entry_price"] == trade.entry_price
+    assert trade.meta["risk_math"]["sl_price"] == 95.0
+    assert trade.meta["risk_math"]["position_size"] == trade.quantity
+    assert trade.meta["risk_math"]["capped_by_max_leverage"] is False
     assert trade.exits[0].price == 101.0
     assert trade.exits[0].reason == "trailing_stop"
+
+
+def test_vectorbt_adapter_emits_supertrend_split_indicator_series(tmp_path: Path):
+    strategy_path = tmp_path / "supertrend_strategy.py"
+    strategy_path.write_text(
+        """
+import pandas as pd
+
+def generate_signals(df: pd.DataFrame, params: dict):
+    entries = pd.Series(False, index=df.index)
+    exits = pd.Series(False, index=df.index)
+    entries.iloc[1] = True
+    exits.iloc[4] = True
+    indicators = {
+        "Supertrend_Trend": pd.Series([-1, -1, 1, 1, -1, -1], index=df.index),
+        "Supertrend_Lower": pd.Series([None, None, 101.0, 102.0, None, None], index=df.index),
+        "Supertrend_Upper": pd.Series([103.0, 104.0, None, None, 106.0, 107.0], index=df.index),
+    }
+    return entries, exits, indicators
+"""
+    )
+
+    data_root = tmp_path / "data"
+    parquet_dir = data_root / "ohlcv" / "test_source" / "equities" / "AAPL"
+    parquet_dir.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=6, freq="D", tz="UTC"),
+            "open": [100, 101, 102, 103, 104, 105],
+            "high": [101, 102, 103, 104, 105, 106],
+            "low": [99, 100, 101, 102, 103, 104],
+            "close": [100, 101, 102, 103, 104, 105],
+            "volume": [10, 11, 12, 13, 14, 15],
+        }
+    ).to_parquet(parquet_dir / "1d.parquet", index=False)
+
+    result = VectorbtAdapter().run(
+        BacktestConfig(
+            strategy_name="supertrend_strategy",
+            symbols=["AAPL"],
+            timeframe="1d",
+            start_date="2024-01-01",
+            end_date="2024-01-06",
+            initial_capital=1000.0,
+            data_dir=str(data_root),
+        ),
+        str(strategy_path),
+    )
+
+    names = {indicator.name for indicator in result.indicators}
+    assert "supertrend_up" in names
+    assert "supertrend_down" in names
+
+    up = next(indicator for indicator in result.indicators if indicator.name == "supertrend_up")
+    down = next(indicator for indicator in result.indicators if indicator.name == "supertrend_down")
+    assert any(point.get("value") is None for point in up.data)
+    assert any(point.get("value") is None for point in down.data)
 
 
 
@@ -264,7 +326,7 @@ def generate_signals(df: pd.DataFrame, params: dict):
     assert trade.exits[0].price == 105.0
     assert trade.exits[0].time == "2024-01-01T01:30:00+00:00"
     assert trade.meta["modeling_resolution"] == "1m"
-    assert trade.pnl == 50.0
+    assert trade.pnl == 39.6
 
 
 def test_vectorbt_adapter_persists_custom_drawings(tmp_path: Path):
@@ -335,6 +397,8 @@ def generate_signals(df: pd.DataFrame, params: dict):
     assert result.drawings[1]["type"] == "line"
     assert result.drawings[1]["start_time"] == "2024-01-02T00:00:00+00:00"
     assert result.drawings[1]["end_time"] == "2024-01-04T00:00:00+00:00"
+    assert result.trades[0].meta["risk_math"]["sizing_mode"] == "full_equity"
+    assert result.trades[0].meta["risk_math"]["position_size"] == result.trades[0].quantity
 
 
 def test_default_max_leverage_is_unlevered():

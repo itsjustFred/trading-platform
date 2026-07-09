@@ -7,19 +7,27 @@ import {
   Bot,
   ScrollText,
   Users,
+  Radio,
   PanelLeftClose,
   PanelLeftOpen,
   Database,
   Target,
+  Activity,
+  Server,
+  Table,
 } from "lucide-react";
 
 const navItems = [
   { path: "/strategies", label: "Strategies", icon: LineChart },
   { path: "/backtests", label: "Backtests", icon: BarChart3 },
+  { path: "/matrix-grid", label: "Matrix Grid", icon: Table },
   { path: "/optimizations", label: "Optimizations", icon: Target },
+  { path: "/live", label: "Live Hub", icon: Radio },
+  { path: "/services", label: "Services", icon: Server },
   { path: "/portfolios", label: "Portfolio", icon: Briefcase },
   { path: "/lab", label: "Strategy Lab", icon: Bot },
   { path: "/data", label: "Data", icon: Database },
+  { path: "/tasks", label: "Task Hub", icon: Activity },
   { path: "/logging", label: "Logging", icon: ScrollText },
   { path: "/accounts", label: "Accounts", icon: Users, disabled: true },
 ];

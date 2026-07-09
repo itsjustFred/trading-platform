@@ -1,0 +1,3362 @@
+[
+  {
+    "entry_time": "2016-09-01T00:00:00Z",
+    "exit_time": "2016-10-03T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 43.757141,
+    "exit_price": null,
+    "quantity": 0.211025,
+    "position_size": 211025.45,
+    "pnl": 0.0,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2016-09-01T00:00:00Z",
+    "exit_time": "2016-10-03T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 29.565416,
+    "exit_price": null,
+    "quantity": 0.210591,
+    "position_size": 210591.07,
+    "pnl": 0.0,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2016-09-01T00:00:00Z",
+    "exit_time": "2016-10-03T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 12.030577,
+    "exit_price": null,
+    "quantity": 0.21496,
+    "position_size": 214960.44,
+    "pnl": 0.0,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2016-10-03T00:00:00Z",
+    "exit_time": "2016-11-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 184.732712,
+    "exit_price": null,
+    "quantity": 0.097857,
+    "position_size": 97856.86,
+    "pnl": 0.0,
+    "meta": {
+      "regime": "elevated",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2016-10-03T00:00:00Z",
+    "exit_time": "2016-11-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 110.900505,
+    "exit_price": null,
+    "quantity": 0.117293,
+    "position_size": 117293.16,
+    "pnl": 0.0,
+    "meta": {
+      "regime": "elevated",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2016-10-03T00:00:00Z",
+    "exit_time": "2016-11-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 12.799925,
+    "exit_price": null,
+    "quantity": 0.134933,
+    "position_size": 80027.64,
+    "pnl": 13746.59,
+    "meta": {
+      "regime": "elevated",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2016-11-01T00:00:00Z",
+    "exit_time": "2016-12-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 108.61795,
+    "exit_price": null,
+    "quantity": 0.045169,
+    "position_size": 162461.82,
+    "pnl": -2414.13,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2016-11-01T00:00:00Z",
+    "exit_time": "2016-12-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 12.706927,
+    "exit_price": null,
+    "quantity": 0.064216,
+    "position_size": 15811.79,
+    "pnl": -581.44,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2016-12-01T00:00:00Z",
+    "exit_time": "2017-01-03T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 187.977402,
+    "exit_price": null,
+    "quantity": 0.022289,
+    "position_size": 75568.31,
+    "pnl": 3969.75,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2017-01-03T00:00:00Z",
+    "exit_time": "2017-02-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 193.96814,
+    "exit_price": null,
+    "quantity": 0.056712,
+    "position_size": 18856.08,
+    "pnl": 2408.32,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2017-01-03T00:00:00Z",
+    "exit_time": "2017-02-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 112.157326,
+    "exit_price": null,
+    "quantity": 0.044961,
+    "position_size": 117501.11,
+    "pnl": 6223.7,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2017-01-03T00:00:00Z",
+    "exit_time": "2017-02-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 43.712914,
+    "exit_price": null,
+    "quantity": 0.082867,
+    "position_size": 128158.52,
+    "pnl": 7910.63,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2017-01-03T00:00:00Z",
+    "exit_time": "2017-02-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 28.782387,
+    "exit_price": null,
+    "quantity": 0.071391,
+    "position_size": 281981.78,
+    "pnl": 4532.94,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2017-01-03T00:00:00Z",
+    "exit_time": "2017-02-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 57.764378,
+    "exit_price": null,
+    "quantity": 0.280649,
+    "position_size": 280649.05,
+    "pnl": 0.0,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2017-04-03T00:00:00Z",
+    "exit_time": "2017-05-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 124.387466,
+    "exit_price": null,
+    "quantity": 0.097287,
+    "position_size": 20214.15,
+    "pnl": 1014.77,
+    "meta": {
+      "regime": "elevated",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2017-04-03T00:00:00Z",
+    "exit_time": "2017-05-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 46.805698,
+    "exit_price": null,
+    "quantity": 0.107944,
+    "position_size": 20214.15,
+    "pnl": 2585.43,
+    "meta": {
+      "regime": "elevated",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2017-04-03T00:00:00Z",
+    "exit_time": "2017-05-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 32.178112,
+    "exit_price": null,
+    "quantity": 0.02123,
+    "position_size": 303212.27,
+    "pnl": 7528.28,
+    "meta": {
+      "regime": "elevated",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2017-04-03T00:00:00Z",
+    "exit_time": "2017-05-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 93.920052,
+    "exit_price": null,
+    "quantity": 0.269522,
+    "position_size": 269522.02,
+    "pnl": 0.0,
+    "meta": {
+      "regime": "elevated",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2017-04-03T00:00:00Z",
+    "exit_time": "2017-05-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 85.530029,
+    "exit_price": null,
+    "quantity": 0.02246,
+    "position_size": 22460.17,
+    "pnl": 0.0,
+    "meta": {
+      "regime": "elevated",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2017-04-03T00:00:00Z",
+    "exit_time": "2017-05-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 85.390785,
+    "exit_price": null,
+    "quantity": 0.02246,
+    "position_size": 22460.17,
+    "pnl": 0.0,
+    "meta": {
+      "regime": "elevated",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2017-04-03T00:00:00Z",
+    "exit_time": "2017-05-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 86.258507,
+    "exit_price": null,
+    "quantity": 0.02246,
+    "position_size": 22460.17,
+    "pnl": 0.0,
+    "meta": {
+      "regime": "elevated",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2017-04-03T00:00:00Z",
+    "exit_time": "2017-05-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 119.349998,
+    "exit_price": null,
+    "quantity": 0.02246,
+    "position_size": 22460.17,
+    "pnl": 0.0,
+    "meta": {
+      "regime": "elevated",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2017-04-03T00:00:00Z",
+    "exit_time": "2017-05-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 58.207607,
+    "exit_price": null,
+    "quantity": 0.056253,
+    "position_size": 336902.53,
+    "pnl": -5166.1,
+    "meta": {
+      "regime": "elevated",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2017-05-01T00:00:00Z",
+    "exit_time": "2017-06-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 32.730522,
+    "exit_price": null,
+    "quantity": 0.022581,
+    "position_size": 325792.97,
+    "pnl": 5205.32,
+    "meta": {
+      "regime": "elevated",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2017-05-01T00:00:00Z",
+    "exit_time": "2017-06-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 93.659782,
+    "exit_price": null,
+    "quantity": 0.020072,
+    "position_size": 289593.76,
+    "pnl": -746.89,
+    "meta": {
+      "regime": "elevated",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2017-05-01T00:00:00Z",
+    "exit_time": "2017-06-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 58.523834,
+    "exit_price": null,
+    "quantity": 0.02509,
+    "position_size": 361992.19,
+    "pnl": 1830.3,
+    "meta": {
+      "regime": "elevated",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2017-06-01T00:00:00Z",
+    "exit_time": "2017-07-03T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 33.754112,
+    "exit_price": null,
+    "quantity": 0.071572,
+    "position_size": 397365.31,
+    "pnl": 10188.61,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2017-06-01T00:00:00Z",
+    "exit_time": "2017-07-03T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 96.238045,
+    "exit_price": null,
+    "quantity": 0.263103,
+    "position_size": 26491.02,
+    "pnl": 7971.92,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2017-06-01T00:00:00Z",
+    "exit_time": "2017-07-03T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 12.250391,
+    "exit_price": null,
+    "quantity": 0.33435,
+    "position_size": 350161.79,
+    "pnl": -362.51,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2017-07-03T00:00:00Z",
+    "exit_time": "2017-08-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 33.975807,
+    "exit_price": null,
+    "quantity": 0.023954,
+    "position_size": 421319.44,
+    "pnl": 2609.87,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2017-07-03T00:00:00Z",
+    "exit_time": "2017-08-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 12.34339,
+    "exit_price": null,
+    "quantity": 0.071158,
+    "position_size": 421319.44,
+    "pnl": 2658.24,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2017-07-03T00:00:00Z",
+    "exit_time": "2017-08-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 59.799389,
+    "exit_price": null,
+    "quantity": 0.024937,
+    "position_size": 337055.55,
+    "pnl": 10844.53,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2017-08-01T00:00:00Z",
+    "exit_time": "2017-09-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 135.341736,
+    "exit_price": null,
+    "quantity": 0.16125,
+    "position_size": 181464.25,
+    "pnl": 1093.89,
+    "meta": {
+      "regime": "elevated",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2017-08-01T00:00:00Z",
+    "exit_time": "2017-09-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 51.46336,
+    "exit_price": null,
+    "quantity": 0.154697,
+    "position_size": 174911.06,
+    "pnl": 676.7,
+    "meta": {
+      "regime": "elevated",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2017-08-01T00:00:00Z",
+    "exit_time": "2017-09-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 12.571658,
+    "exit_price": null,
+    "quantity": 0.172597,
+    "position_size": 248722.34,
+    "pnl": 7791.54,
+    "meta": {
+      "regime": "elevated",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2017-08-01T00:00:00Z",
+    "exit_time": "2017-09-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 60.047695,
+    "exit_price": null,
+    "quantity": 0.059264,
+    "position_size": 277791.06,
+    "pnl": 1399.56,
+    "meta": {
+      "regime": "elevated",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2017-09-01T00:00:00Z",
+    "exit_time": "2017-10-02T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 215.404266,
+    "exit_price": null,
+    "quantity": 0.091259,
+    "position_size": 110114.81,
+    "pnl": 39.65,
+    "meta": {
+      "regime": "elevated",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2017-09-01T00:00:00Z",
+    "exit_time": "2017-10-02T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 137.642014,
+    "exit_price": null,
+    "quantity": 0.207666,
+    "position_size": 389130.37,
+    "pnl": 3084.18,
+    "meta": {
+      "regime": "elevated",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2017-09-01T00:00:00Z",
+    "exit_time": "2017-10-02T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 51.226303,
+    "exit_price": null,
+    "quantity": 0.05222,
+    "position_size": 227131.51,
+    "pnl": -805.7,
+    "meta": {
+      "regime": "elevated",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2017-09-01T00:00:00Z",
+    "exit_time": "2017-10-02T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 36.85677,
+    "exit_price": null,
+    "quantity": 0.032189,
+    "position_size": 389130.37,
+    "pnl": 11796.51,
+    "meta": {
+      "regime": "elevated",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2017-09-01T00:00:00Z",
+    "exit_time": "2017-10-02T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 12.783017,
+    "exit_price": null,
+    "quantity": 0.219898,
+    "position_size": 28824.47,
+    "pnl": 4181.61,
+    "meta": {
+      "regime": "elevated",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2017-09-01T00:00:00Z",
+    "exit_time": "2017-10-02T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 59.827763,
+    "exit_price": null,
+    "quantity": 0.248967,
+    "position_size": 28824.47,
+    "pnl": -1017.45,
+    "meta": {
+      "regime": "elevated",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2017-11-01T00:00:00Z",
+    "exit_time": "2017-12-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 224.901978,
+    "exit_price": null,
+    "quantity": 0.025583,
+    "position_size": 135698.17,
+    "pnl": 2256.25,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2017-11-01T00:00:00Z",
+    "exit_time": "2017-12-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 53.298595,
+    "exit_price": null,
+    "quantity": 0.023065,
+    "position_size": 204066.16,
+    "pnl": 4249.14,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2017-12-01T00:00:00Z",
+    "exit_time": "2018-01-02T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 230.989838,
+    "exit_price": null,
+    "quantity": 0.0603,
+    "position_size": 75398.31,
+    "pnl": 3673.21,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2017-12-01T00:00:00Z",
+    "exit_time": "2018-01-02T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 53.398022,
+    "exit_price": null,
+    "quantity": 0.050289,
+    "position_size": 153776.72,
+    "pnl": 380.68,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2017-12-01T00:00:00Z",
+    "exit_time": "2018-01-02T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 60.629116,
+    "exit_price": null,
+    "quantity": 0.120571,
+    "position_size": 149395.41,
+    "pnl": 694.43,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2018-01-02T00:00:00Z",
+    "exit_time": "2018-02-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 235.9543,
+    "exit_price": null,
+    "quantity": 0.046785,
+    "position_size": 28613.28,
+    "pnl": 1620.47,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2018-01-02T00:00:00Z",
+    "exit_time": "2018-02-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 150.05722,
+    "exit_price": null,
+    "quantity": 0.040069,
+    "position_size": 429199.2,
+    "pnl": 10909.82,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2018-01-02T00:00:00Z",
+    "exit_time": "2018-02-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 54.737122,
+    "exit_price": null,
+    "quantity": 0.125163,
+    "position_size": 28613.28,
+    "pnl": 3856.37,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2018-01-02T00:00:00Z",
+    "exit_time": "2018-02-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 39.776558,
+    "exit_price": null,
+    "quantity": 0.040069,
+    "position_size": 429199.2,
+    "pnl": 24597.12,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2018-01-02T00:00:00Z",
+    "exit_time": "2018-02-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 14.110354,
+    "exit_price": null,
+    "quantity": 0.314535,
+    "position_size": 343359.36,
+    "pnl": 689.67,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2018-01-02T00:00:00Z",
+    "exit_time": "2018-02-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 60.170986,
+    "exit_price": null,
+    "quantity": 0.120782,
+    "position_size": 28613.28,
+    "pnl": -1128.87,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2018-02-01T00:00:00Z",
+    "exit_time": "2018-03-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 14.600708,
+    "exit_price": null,
+    "quantity": 0.316019,
+    "position_size": 27340.41,
+    "pnl": 11932.19,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2018-02-01T00:00:00Z",
+    "exit_time": "2018-03-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 56.582714,
+    "exit_price": null,
+    "quantity": 0.299472,
+    "position_size": 328084.9,
+    "pnl": -1706.34,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2018-03-01T00:00:00Z",
+    "exit_time": "2018-04-02T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 235.014954,
+    "exit_price": null,
+    "quantity": 0.147108,
+    "position_size": 175720.8,
+    "pnl": -1410.44,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2018-03-01T00:00:00Z",
+    "exit_time": "2018-04-02T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 155.728546,
+    "exit_price": null,
+    "quantity": 0.202662,
+    "position_size": 226537.45,
+    "pnl": -8892.73,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2018-03-01T00:00:00Z",
+    "exit_time": "2018-04-02T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 53.392464,
+    "exit_price": null,
+    "quantity": 0.104981,
+    "position_size": 133594.53,
+    "pnl": -1916.57,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2018-03-01T00:00:00Z",
+    "exit_time": "2018-04-02T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 39.710281,
+    "exit_price": null,
+    "quantity": 0.196139,
+    "position_size": 233059.93,
+    "pnl": -20547.47,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2018-03-01T00:00:00Z",
+    "exit_time": "2018-04-02T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 53.438423,
+    "exit_price": null,
+    "quantity": 0.310203,
+    "position_size": 17881.69,
+    "pnl": -18231.62,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2018-04-02T00:00:00Z",
+    "exit_time": "2018-05-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 147.47467,
+    "exit_price": null,
+    "quantity": 0.03028,
+    "position_size": 196257.2,
+    "pnl": -12006.87,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2018-04-02T00:00:00Z",
+    "exit_time": "2018-05-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 53.106533,
+    "exit_price": null,
+    "quantity": 0.030962,
+    "position_size": 102632.08,
+    "pnl": -715.43,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2018-04-02T00:00:00Z",
+    "exit_time": "2018-05-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 39.279453,
+    "exit_price": null,
+    "quantity": 0.039172,
+    "position_size": 193887.68,
+    "pnl": -2528.53,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2018-06-01T00:00:00Z",
+    "exit_time": "2018-07-02T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 163.814331,
+    "exit_price": null,
+    "quantity": 0.024937,
+    "position_size": 171320.32,
+    "pnl": 12008.29,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2018-07-02T00:00:00Z",
+    "exit_time": "2018-08-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 35.775101,
+    "exit_price": null,
+    "quantity": 0.02199,
+    "position_size": 171897.39,
+    "pnl": -13181.39,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2018-08-01T00:00:00Z",
+    "exit_time": "2018-09-04T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 248.667343,
+    "exit_price": null,
+    "quantity": 0.024145,
+    "position_size": 199866.22,
+    "pnl": 5817.33,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2018-08-01T00:00:00Z",
+    "exit_time": "2018-09-04T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 168.327576,
+    "exit_price": null,
+    "quantity": 0.043224,
+    "position_size": 214544.41,
+    "pnl": 4282.99,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2018-08-01T00:00:00Z",
+    "exit_time": "2018-09-04T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 54.011967,
+    "exit_price": null,
+    "quantity": 0.038281,
+    "position_size": 64350.85,
+    "pnl": 3356.1,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2018-08-01T00:00:00Z",
+    "exit_time": "2018-09-04T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 37.076004,
+    "exit_price": null,
+    "quantity": 0.041152,
+    "position_size": 213049.39,
+    "pnl": 6250.77,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2018-09-04T00:00:00Z",
+    "exit_time": "2018-10-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 176.624222,
+    "exit_price": null,
+    "quantity": 0.028231,
+    "position_size": 242775.87,
+    "pnl": 10574.61,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2018-10-01T00:00:00Z",
+    "exit_time": "2018-11-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 259.46051,
+    "exit_price": null,
+    "quantity": 0.17855,
+    "position_size": 21316.03,
+    "pnl": 2234.78,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2018-10-01T00:00:00Z",
+    "exit_time": "2018-11-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 177.246719,
+    "exit_price": null,
+    "quantity": 0.076965,
+    "position_size": 319740.5,
+    "pnl": 855.64,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2018-10-01T00:00:00Z",
+    "exit_time": "2018-11-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 53.649403,
+    "exit_price": null,
+    "quantity": 0.11173,
+    "position_size": 176080.66,
+    "pnl": 1252.88,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2018-10-01T00:00:00Z",
+    "exit_time": "2018-11-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 35.800114,
+    "exit_price": null,
+    "quantity": 0.106691,
+    "position_size": 319740.5,
+    "pnl": 3019.81,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2018-10-01T00:00:00Z",
+    "exit_time": "2018-11-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 15.479961,
+    "exit_price": null,
+    "quantity": 0.073687,
+    "position_size": 101027.77,
+    "pnl": 1629.66,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2018-11-01T00:00:00Z",
+    "exit_time": "2018-12-03T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 243.255966,
+    "exit_price": null,
+    "quantity": 0.108615,
+    "position_size": 129931.24,
+    "pnl": -1331.29,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2018-11-01T00:00:00Z",
+    "exit_time": "2018-12-03T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 163.813065,
+    "exit_price": null,
+    "quantity": 0.105106,
+    "position_size": 214634.46,
+    "pnl": -24233.36,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2018-11-01T00:00:00Z",
+    "exit_time": "2018-12-03T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 49.858414,
+    "exit_price": null,
+    "quantity": 0.039966,
+    "position_size": 136114.27,
+    "pnl": -12442.26,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2018-11-01T00:00:00Z",
+    "exit_time": "2018-12-03T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 33.823727,
+    "exit_price": null,
+    "quantity": 0.098871,
+    "position_size": 220869.84,
+    "pnl": -17651.65,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2018-11-01T00:00:00Z",
+    "exit_time": "2018-12-03T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 14.237169,
+    "exit_price": null,
+    "quantity": 0.084713,
+    "position_size": 16315.11,
+    "pnl": -8110.91,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2018-12-03T00:00:00Z",
+    "exit_time": "2019-01-02T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 164.070068,
+    "exit_price": null,
+    "quantity": 0.029215,
+    "position_size": 185419.5,
+    "pnl": 336.74,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2018-12-03T00:00:00Z",
+    "exit_time": "2019-01-02T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 34.949516,
+    "exit_price": null,
+    "quantity": 0.034908,
+    "position_size": 185961.34,
+    "pnl": 7351.44,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2019-01-02T00:00:00Z",
+    "exit_time": "2019-02-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 223.805954,
+    "exit_price": null,
+    "quantity": 0.083825,
+    "position_size": 46106.57,
+    "pnl": -12867.13,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": true
+    }
+  },
+  {
+    "entry_time": "2019-01-02T00:00:00Z",
+    "exit_time": "2019-02-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 147.878311,
+    "exit_price": null,
+    "quantity": 0.139088,
+    "position_size": 46331.33,
+    "pnl": -18298.69,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": true
+    }
+  },
+  {
+    "entry_time": "2019-01-02T00:00:00Z",
+    "exit_time": "2019-02-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 46.729977,
+    "exit_price": null,
+    "quantity": 0.10372,
+    "position_size": 32394.45,
+    "pnl": -9222.67,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": true
+    }
+  },
+  {
+    "entry_time": "2019-01-02T00:00:00Z",
+    "exit_time": "2019-02-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 33.146805,
+    "exit_price": null,
+    "quantity": 0.137321,
+    "position_size": 48640.46,
+    "pnl": -9591.97,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": true
+    }
+  },
+  {
+    "entry_time": "2019-02-01T00:00:00Z",
+    "exit_time": "2019-03-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 241.590195,
+    "exit_price": null,
+    "quantity": 0.096957,
+    "position_size": 143063.67,
+    "pnl": 3663.76,
+    "meta": {
+      "regime": "elevated",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2019-02-01T00:00:00Z",
+    "exit_time": "2019-03-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 159.880096,
+    "exit_price": null,
+    "quantity": 0.092291,
+    "position_size": 138622.7,
+    "pnl": 3760.25,
+    "meta": {
+      "regime": "elevated",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2019-02-01T00:00:00Z",
+    "exit_time": "2019-03-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 49.916477,
+    "exit_price": null,
+    "quantity": 0.08244,
+    "position_size": 114834.74,
+    "pnl": 2208.97,
+    "meta": {
+      "regime": "elevated",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2019-02-01T00:00:00Z",
+    "exit_time": "2019-03-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 36.194004,
+    "exit_price": null,
+    "quantity": 0.097611,
+    "position_size": 146251.8,
+    "pnl": 4471.54,
+    "meta": {
+      "regime": "elevated",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2019-05-01T00:00:00Z",
+    "exit_time": "2019-06-03T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 262.197113,
+    "exit_price": null,
+    "quantity": 0.031731,
+    "position_size": 174794.63,
+    "pnl": 2993.07,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2019-05-01T00:00:00Z",
+    "exit_time": "2019-06-03T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 180.717331,
+    "exit_price": null,
+    "quantity": 0.042024,
+    "position_size": 180646.36,
+    "pnl": 5246.72,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2019-06-03T00:00:00Z",
+    "exit_time": "2019-07-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 34.771984,
+    "exit_price": null,
+    "quantity": 0.040786,
+    "position_size": 187037.5,
+    "pnl": -8453.07,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2019-07-01T00:00:00Z",
+    "exit_time": "2019-08-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 181.433228,
+    "exit_price": null,
+    "quantity": 0.08214,
+    "position_size": 262786.76,
+    "pnl": 20768.61,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2019-07-01T00:00:00Z",
+    "exit_time": "2019-08-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 53.743984,
+    "exit_price": null,
+    "quantity": 0.039415,
+    "position_size": 154250.11,
+    "pnl": 6653.21,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2019-07-01T00:00:00Z",
+    "exit_time": "2019-08-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 37.032887,
+    "exit_price": null,
+    "quantity": 0.071439,
+    "position_size": 258476.88,
+    "pnl": 12161.33,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2019-08-01T00:00:00Z",
+    "exit_time": "2019-09-03T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 182.286438,
+    "exit_price": null,
+    "quantity": 0.021262,
+    "position_size": 284049.16,
+    "pnl": 1235.78,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2019-09-03T00:00:00Z",
+    "exit_time": "2019-10-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 177.972504,
+    "exit_price": null,
+    "quantity": 0.054478,
+    "position_size": 229571.16,
+    "pnl": -6722.22,
+    "meta": {
+      "regime": "elevated",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2019-09-03T00:00:00Z",
+    "exit_time": "2019-10-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 51.343254,
+    "exit_price": null,
+    "quantity": 0.021632,
+    "position_size": 132618.44,
+    "pnl": -2832.02,
+    "meta": {
+      "regime": "elevated",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2019-09-03T00:00:00Z",
+    "exit_time": "2019-10-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 34.064796,
+    "exit_price": null,
+    "quantity": 0.051244,
+    "position_size": 207232.87,
+    "pnl": -6375.18,
+    "meta": {
+      "regime": "elevated",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2019-11-01T00:00:00Z",
+    "exit_time": "2019-12-02T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 277.687317,
+    "exit_price": null,
+    "quantity": 0.027184,
+    "position_size": 201979.08,
+    "pnl": 7689.48,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2019-11-01T00:00:00Z",
+    "exit_time": "2019-12-02T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 191.030289,
+    "exit_price": null,
+    "quantity": 0.022307,
+    "position_size": 251878.02,
+    "pnl": 14220.25,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2020-02-03T00:00:00Z",
+    "exit_time": "2020-03-02T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 214.076599,
+    "exit_price": null,
+    "quantity": 0.02009,
+    "position_size": 271967.99,
+    "pnl": 7247.74,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2020-02-03T00:00:00Z",
+    "exit_time": "2020-03-02T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 55.666191,
+    "exit_price": null,
+    "quantity": 0.020438,
+    "position_size": 153056.64,
+    "pnl": -4726.93,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2020-02-03T00:00:00Z",
+    "exit_time": "2020-03-02T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 37.092201,
+    "exit_price": null,
+    "quantity": 0.051338,
+    "position_size": 258570.37,
+    "pnl": -14485.47,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2020-03-02T00:00:00Z",
+    "exit_time": "2020-04-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 208.339157,
+    "exit_price": null,
+    "quantity": 0.045731,
+    "position_size": 226236.67,
+    "pnl": -7288.98,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2020-03-02T00:00:00Z",
+    "exit_time": "2020-04-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 51.880501,
+    "exit_price": null,
+    "quantity": 0.031638,
+    "position_size": 121418.55,
+    "pnl": -10408.92,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2020-03-02T00:00:00Z",
+    "exit_time": "2020-04-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 36.064281,
+    "exit_price": null,
+    "quantity": 0.064551,
+    "position_size": 194019.27,
+    "pnl": -7165.65,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2020-04-01T00:00:00Z",
+    "exit_time": "2020-05-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 225.689835,
+    "exit_price": null,
+    "quantity": 0.178035,
+    "position_size": 23943.92,
+    "pnl": -40183.17,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": true
+    }
+  },
+  {
+    "entry_time": "2020-04-01T00:00:00Z",
+    "exit_time": "2020-05-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 175.876785,
+    "exit_price": null,
+    "quantity": 0.202204,
+    "position_size": 24032.99,
+    "pnl": -35251.07,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": true
+    }
+  },
+  {
+    "entry_time": "2020-04-01T00:00:00Z",
+    "exit_time": "2020-05-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 42.045918,
+    "exit_price": null,
+    "quantity": 0.096434,
+    "position_size": 24984.21,
+    "pnl": -23016.37,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": true
+    }
+  },
+  {
+    "entry_time": "2020-04-01T00:00:00Z",
+    "exit_time": "2020-05-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 28.459425,
+    "exit_price": null,
+    "quantity": 0.169846,
+    "position_size": 24173.52,
+    "pnl": -40912.74,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": true
+    }
+  },
+  {
+    "entry_time": "2020-06-01T00:00:00Z",
+    "exit_time": "2020-07-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 280.152405,
+    "exit_price": null,
+    "quantity": 0.051654,
+    "position_size": 75598.4,
+    "pnl": 1927.09,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2020-06-01T00:00:00Z",
+    "exit_time": "2020-07-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 225.800674,
+    "exit_price": null,
+    "quantity": 0.052469,
+    "position_size": 76501.6,
+    "pnl": 2408.5,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2020-06-01T00:00:00Z",
+    "exit_time": "2020-07-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 50.176933,
+    "exit_price": null,
+    "quantity": 0.053766,
+    "position_size": 78750.29,
+    "pnl": 2541.76,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2020-06-01T00:00:00Z",
+    "exit_time": "2020-07-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 33.625141,
+    "exit_price": null,
+    "quantity": 0.052562,
+    "position_size": 76735.43,
+    "pnl": 2244.87,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2020-06-01T00:00:00Z",
+    "exit_time": "2020-07-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 10.311135,
+    "exit_price": null,
+    "quantity": 0.057055,
+    "position_size": 73369.87,
+    "pnl": 1652.74,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2020-06-01T00:00:00Z",
+    "exit_time": "2020-07-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 62.952797,
+    "exit_price": null,
+    "quantity": 0.051163,
+    "position_size": 69044.41,
+    "pnl": 1381.13,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2020-09-01T00:00:00Z",
+    "exit_time": "2020-10-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 11.799071,
+    "exit_price": null,
+    "quantity": 0.045904,
+    "position_size": 27465.4,
+    "pnl": 2750.68,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2020-10-01T00:00:00Z",
+    "exit_time": "2020-11-02T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 311.62735,
+    "exit_price": null,
+    "quantity": 0.024093,
+    "position_size": 99691.05,
+    "pnl": -3046.85,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2020-10-01T00:00:00Z",
+    "exit_time": "2020-11-02T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 272.763672,
+    "exit_price": null,
+    "quantity": 0.025907,
+    "position_size": 102408.82,
+    "pnl": -4507.17,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2020-10-01T00:00:00Z",
+    "exit_time": "2020-11-02T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 38.98967,
+    "exit_price": null,
+    "quantity": 0.022689,
+    "position_size": 99424.16,
+    "pnl": -1355.15,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2020-10-01T00:00:00Z",
+    "exit_time": "2020-11-02T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 65.136421,
+    "exit_price": null,
+    "quantity": 0.035392,
+    "position_size": 104436.33,
+    "pnl": -545.05,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2020-12-01T00:00:00Z",
+    "exit_time": "2021-01-04T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 338.422272,
+    "exit_price": null,
+    "quantity": 0.03109,
+    "position_size": 130781.36,
+    "pnl": 10814.47,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2020-12-01T00:00:00Z",
+    "exit_time": "2021-01-04T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 293.260834,
+    "exit_price": null,
+    "quantity": 0.045259,
+    "position_size": 147667.35,
+    "pnl": 12699.65,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2020-12-01T00:00:00Z",
+    "exit_time": "2021-01-04T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 59.928585,
+    "exit_price": null,
+    "quantity": 0.030249,
+    "position_size": 108999.58,
+    "pnl": 12169.01,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2021-01-04T00:00:00Z",
+    "exit_time": "2021-02-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 46.031986,
+    "exit_price": null,
+    "quantity": 0.022107,
+    "position_size": 121531.5,
+    "pnl": 5697.72,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2021-01-04T00:00:00Z",
+    "exit_time": "2021-02-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 67.52401,
+    "exit_price": null,
+    "quantity": 0.028505,
+    "position_size": 132941.03,
+    "pnl": -1949.03,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2021-04-01T00:00:00Z",
+    "exit_time": "2021-05-03T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 47.678528,
+    "exit_price": null,
+    "quantity": 0.040104,
+    "position_size": 161635.11,
+    "pnl": -2885.7,
+    "meta": {
+      "regime": "elevated",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2021-04-01T00:00:00Z",
+    "exit_time": "2021-05-03T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 77.308571,
+    "exit_price": null,
+    "quantity": 0.042083,
+    "position_size": 90857.59,
+    "pnl": 8761.62,
+    "meta": {
+      "regime": "elevated",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2021-05-03T00:00:00Z",
+    "exit_time": "2021-06-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 389.588013,
+    "exit_price": null,
+    "quantity": 0.041294,
+    "position_size": 172075.26,
+    "pnl": 5742.35,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2021-05-03T00:00:00Z",
+    "exit_time": "2021-06-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 325.890778,
+    "exit_price": null,
+    "quantity": 0.047206,
+    "position_size": 194873.15,
+    "pnl": 5286.69,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2021-05-03T00:00:00Z",
+    "exit_time": "2021-06-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 47.784744,
+    "exit_price": null,
+    "quantity": 0.042593,
+    "position_size": 204228.27,
+    "pnl": 360.08,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2021-05-03T00:00:00Z",
+    "exit_time": "2021-06-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 81.738968,
+    "exit_price": null,
+    "quantity": 0.074995,
+    "position_size": 15863.07,
+    "pnl": 5206.86,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2021-06-01T00:00:00Z",
+    "exit_time": "2021-07-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 68.364944,
+    "exit_price": null,
+    "quantity": 0.025878,
+    "position_size": 83121.49,
+    "pnl": 2967.58,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2021-07-01T00:00:00Z",
+    "exit_time": "2021-08-02T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 67.5485,
+    "exit_price": null,
+    "quantity": 0.025151,
+    "position_size": 108272.16,
+    "pnl": -992.67,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2021-08-02T00:00:00Z",
+    "exit_time": "2021-09-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 408.985046,
+    "exit_price": null,
+    "quantity": 0.027483,
+    "position_size": 144591.78,
+    "pnl": 2862.4,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2021-08-02T00:00:00Z",
+    "exit_time": "2021-09-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 353.840454,
+    "exit_price": null,
+    "quantity": 0.033082,
+    "position_size": 227954.84,
+    "pnl": 5512.57,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2021-08-02T00:00:00Z",
+    "exit_time": "2021-09-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 46.206871,
+    "exit_price": null,
+    "quantity": 0.021512,
+    "position_size": 225739.79,
+    "pnl": -10688.14,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2021-09-01T00:00:00Z",
+    "exit_time": "2021-10-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 422.266174,
+    "exit_price": null,
+    "quantity": 0.125453,
+    "position_size": 19139.15,
+    "pnl": 4695.38,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2021-09-01T00:00:00Z",
+    "exit_time": "2021-10-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 47.193787,
+    "exit_price": null,
+    "quantity": 0.032043,
+    "position_size": 257782.88,
+    "pnl": 4821.49,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2021-09-01T00:00:00Z",
+    "exit_time": "2021-10-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 16.610935,
+    "exit_price": null,
+    "quantity": 0.221002,
+    "position_size": 248467.46,
+    "pnl": -284.76,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2021-10-01T00:00:00Z",
+    "exit_time": "2021-11-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 407.154236,
+    "exit_price": null,
+    "quantity": 0.101444,
+    "position_size": 120583.45,
+    "pnl": -684.95,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2021-10-01T00:00:00Z",
+    "exit_time": "2021-11-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 349.938385,
+    "exit_price": null,
+    "quantity": 0.024932,
+    "position_size": 252886.47,
+    "pnl": -11979.74,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2021-10-01T00:00:00Z",
+    "exit_time": "2021-11-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 66.805267,
+    "exit_price": null,
+    "quantity": 0.120858,
+    "position_size": 229130.6,
+    "pnl": -4218.05,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2021-10-01T00:00:00Z",
+    "exit_time": "2021-11-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 17.794321,
+    "exit_price": null,
+    "quantity": 0.228129,
+    "position_size": 20338.91,
+    "pnl": 17701.16,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2021-11-01T00:00:00Z",
+    "exit_time": "2021-12-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 431.344971,
+    "exit_price": null,
+    "quantity": 0.100659,
+    "position_size": 19924.0,
+    "pnl": 7164.37,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2021-11-01T00:00:00Z",
+    "exit_time": "2021-12-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 376.413422,
+    "exit_price": null,
+    "quantity": 0.232962,
+    "position_size": 19924.0,
+    "pnl": 19132.45,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2021-11-01T00:00:00Z",
+    "exit_time": "2021-12-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 45.628956,
+    "exit_price": null,
+    "quantity": 0.041077,
+    "position_size": 298859.95,
+    "pnl": 5070.63,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2021-11-01T00:00:00Z",
+    "exit_time": "2021-12-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 18.716667,
+    "exit_price": null,
+    "quantity": 0.278521,
+    "position_size": 298859.95,
+    "pnl": 1054.24,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2021-12-01T00:00:00Z",
+    "exit_time": "2022-01-03T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 43.584015,
+    "exit_price": null,
+    "quantity": 0.031487,
+    "position_size": 267372.55,
+    "pnl": -13393.93,
+    "meta": {
+      "regime": "elevated",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2022-01-03T00:00:00Z",
+    "exit_time": "2022-02-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 449.48645,
+    "exit_price": null,
+    "quantity": 0.124393,
+    "position_size": 144316.6,
+    "pnl": 1277.62,
+    "meta": {
+      "regime": "elevated",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2022-01-03T00:00:00Z",
+    "exit_time": "2022-02-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 390.756714,
+    "exit_price": null,
+    "quantity": 0.191037,
+    "position_size": 210961.1,
+    "pnl": 775.76,
+    "meta": {
+      "regime": "elevated",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2022-01-03T00:00:00Z",
+    "exit_time": "2022-02-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 68.969986,
+    "exit_price": null,
+    "quantity": 0.123698,
+    "position_size": 105432.79,
+    "pnl": 12997.89,
+    "meta": {
+      "regime": "elevated",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2022-01-03T00:00:00Z",
+    "exit_time": "2022-02-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 44.394218,
+    "exit_price": null,
+    "quantity": 0.142689,
+    "position_size": 124683.84,
+    "pnl": 4970.31,
+    "meta": {
+      "regime": "elevated",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2022-01-03T00:00:00Z",
+    "exit_time": "2022-02-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 18.151079,
+    "exit_price": null,
+    "quantity": 0.063427,
+    "position_size": 235432.77,
+    "pnl": 23989.29,
+    "meta": {
+      "regime": "elevated",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2022-02-01T00:00:00Z",
+    "exit_time": "2022-03-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 426.18927,
+    "exit_price": null,
+    "quantity": 0.030577,
+    "position_size": 174893.33,
+    "pnl": -7480.02,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2022-02-01T00:00:00Z",
+    "exit_time": "2022-03-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 66.66198,
+    "exit_price": null,
+    "quantity": 0.062782,
+    "position_size": 42650.33,
+    "pnl": -3528.19,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2022-02-01T00:00:00Z",
+    "exit_time": "2022-03-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 44.340069,
+    "exit_price": null,
+    "quantity": 0.036668,
+    "position_size": 161352.22,
+    "pnl": -152.08,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2022-02-01T00:00:00Z",
+    "exit_time": "2022-03-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 19.586805,
+    "exit_price": null,
+    "quantity": 0.096378,
+    "position_size": 139054.41,
+    "pnl": 18622.42,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2022-02-01T00:00:00Z",
+    "exit_time": "2022-03-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 89.502098,
+    "exit_price": null,
+    "quantity": 0.066575,
+    "position_size": 82437.81,
+    "pnl": -1273.46,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2022-03-01T00:00:00Z",
+    "exit_time": "2022-04-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 404.576477,
+    "exit_price": null,
+    "quantity": 0.129825,
+    "position_size": 45067.84,
+    "pnl": -8869.14,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": true
+    }
+  },
+  {
+    "entry_time": "2022-03-01T00:00:00Z",
+    "exit_time": "2022-04-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 332.203583,
+    "exit_price": null,
+    "quantity": 0.157417,
+    "position_size": 53543.75,
+    "pnl": -13869.01,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": true
+    }
+  },
+  {
+    "entry_time": "2022-03-01T00:00:00Z",
+    "exit_time": "2022-04-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 41.606045,
+    "exit_price": null,
+    "quantity": 0.127012,
+    "position_size": 34340.46,
+    "pnl": -9949.03,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": true
+    }
+  },
+  {
+    "entry_time": "2022-03-01T00:00:00Z",
+    "exit_time": "2022-04-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 21.605528,
+    "exit_price": null,
+    "quantity": 0.131224,
+    "position_size": 7830.32,
+    "pnl": 14331.7,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": true
+    }
+  },
+  {
+    "entry_time": "2022-04-01T00:00:00Z",
+    "exit_time": "2022-05-02T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 427.485016,
+    "exit_price": null,
+    "quantity": 0.074523,
+    "position_size": 119590.5,
+    "pnl": 2551.9,
+    "meta": {
+      "regime": "elevated",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2022-04-01T00:00:00Z",
+    "exit_time": "2022-05-02T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 352.445129,
+    "exit_price": null,
+    "quantity": 0.080278,
+    "position_size": 133822.17,
+    "pnl": 3262.48,
+    "meta": {
+      "regime": "elevated",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2022-04-01T00:00:00Z",
+    "exit_time": "2022-05-02T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 64.702354,
+    "exit_price": null,
+    "quantity": 0.064045,
+    "position_size": 106695.32,
+    "pnl": 1590.0,
+    "meta": {
+      "regime": "elevated",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2022-04-01T00:00:00Z",
+    "exit_time": "2022-05-02T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 41.416553,
+    "exit_price": null,
+    "quantity": 0.095929,
+    "position_size": 130269.35,
+    "pnl": -156.4,
+    "meta": {
+      "regime": "elevated",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2022-04-01T00:00:00Z",
+    "exit_time": "2022-05-02T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 93.919342,
+    "exit_price": null,
+    "quantity": 0.03045,
+    "position_size": 112887.7,
+    "pnl": 7342.27,
+    "meta": {
+      "regime": "elevated",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2022-05-02T00:00:00Z",
+    "exit_time": "2022-06-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 391.203705,
+    "exit_price": null,
+    "quantity": 0.084489,
+    "position_size": 35101.14,
+    "pnl": -10149.83,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": true
+    }
+  },
+  {
+    "entry_time": "2022-05-02T00:00:00Z",
+    "exit_time": "2022-06-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 310.202362,
+    "exit_price": null,
+    "quantity": 0.097666,
+    "position_size": 36156.5,
+    "pnl": -16039.43,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": true
+    }
+  },
+  {
+    "entry_time": "2022-05-02T00:00:00Z",
+    "exit_time": "2022-06-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 59.633472,
+    "exit_price": null,
+    "quantity": 0.077733,
+    "position_size": 28962.21,
+    "pnl": -8358.68,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": true
+    }
+  },
+  {
+    "entry_time": "2022-05-02T00:00:00Z",
+    "exit_time": "2022-06-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 38.186245,
+    "exit_price": null,
+    "quantity": 0.095747,
+    "position_size": 34522.4,
+    "pnl": -10160.43,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": true
+    }
+  },
+  {
+    "entry_time": "2022-05-02T00:00:00Z",
+    "exit_time": "2022-06-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 86.225929,
+    "exit_price": null,
+    "quantity": 0.061953,
+    "position_size": 50934.62,
+    "pnl": -9247.21,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": true
+    }
+  },
+  {
+    "entry_time": "2022-12-01T00:00:00Z",
+    "exit_time": "2023-01-03T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 387.749664,
+    "exit_price": null,
+    "quantity": 0.055797,
+    "position_size": 90897.77,
+    "pnl": 2086.79,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2022-12-01T00:00:00Z",
+    "exit_time": "2023-01-03T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 287.15094,
+    "exit_price": null,
+    "quantity": 0.052993,
+    "position_size": 89149.52,
+    "pnl": 2445.84,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2022-12-01T00:00:00Z",
+    "exit_time": "2023-01-03T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 60.32959,
+    "exit_price": null,
+    "quantity": 0.062011,
+    "position_size": 90972.73,
+    "pnl": 3870.99,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2022-12-01T00:00:00Z",
+    "exit_time": "2023-01-03T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 35.844479,
+    "exit_price": null,
+    "quantity": 0.041883,
+    "position_size": 76405.04,
+    "pnl": 4530.94,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2022-12-01T00:00:00Z",
+    "exit_time": "2023-01-03T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 76.005959,
+    "exit_price": null,
+    "quantity": 0.04164,
+    "position_size": 92574.94,
+    "pnl": 3033.37,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2023-01-03T00:00:00Z",
+    "exit_time": "2023-02-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 364.133942,
+    "exit_price": null,
+    "quantity": 0.062121,
+    "position_size": 28776.27,
+    "pnl": -5536.09,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": true
+    }
+  },
+  {
+    "entry_time": "2023-01-03T00:00:00Z",
+    "exit_time": "2023-02-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 259.183929,
+    "exit_price": null,
+    "quantity": 0.060382,
+    "position_size": 28767.09,
+    "pnl": -8682.7,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": true
+    }
+  },
+  {
+    "entry_time": "2023-01-03T00:00:00Z",
+    "exit_time": "2023-02-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 59.186131,
+    "exit_price": null,
+    "quantity": 0.062296,
+    "position_size": 28676.81,
+    "pnl": -1724.26,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": true
+    }
+  },
+  {
+    "entry_time": "2023-01-03T00:00:00Z",
+    "exit_time": "2023-02-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 35.309898,
+    "exit_price": null,
+    "quantity": 0.054164,
+    "position_size": 22241.0,
+    "pnl": -1139.5,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": true
+    }
+  },
+  {
+    "entry_time": "2023-01-03T00:00:00Z",
+    "exit_time": "2023-02-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 72.405739,
+    "exit_price": null,
+    "quantity": 0.04358,
+    "position_size": 48995.02,
+    "pnl": -4385.05,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": true
+    }
+  },
+  {
+    "entry_time": "2023-02-01T00:00:00Z",
+    "exit_time": "2023-03-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 392.800354,
+    "exit_price": null,
+    "quantity": 0.066586,
+    "position_size": 95361.93,
+    "pnl": 2265.41,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2023-02-01T00:00:00Z",
+    "exit_time": "2023-03-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 294.894257,
+    "exit_price": null,
+    "quantity": 0.067415,
+    "position_size": 96182.48,
+    "pnl": 3963.53,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2023-02-01T00:00:00Z",
+    "exit_time": "2023-03-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 64.521996,
+    "exit_price": null,
+    "quantity": 0.064797,
+    "position_size": 93473.6,
+    "pnl": 2585.33,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2023-02-01T00:00:00Z",
+    "exit_time": "2023-03-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 38.68198,
+    "exit_price": null,
+    "quantity": 0.056725,
+    "position_size": 78965.88,
+    "pnl": 2124.01,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2023-02-01T00:00:00Z",
+    "exit_time": "2023-03-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 80.351433,
+    "exit_price": null,
+    "quantity": 0.049283,
+    "position_size": 98277.96,
+    "pnl": 5376.64,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2023-05-01T00:00:00Z",
+    "exit_time": "2023-06-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 398.820343,
+    "exit_price": null,
+    "quantity": 0.026699,
+    "position_size": 122061.26,
+    "pnl": 1058.16,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2023-05-01T00:00:00Z",
+    "exit_time": "2023-06-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 316.227081,
+    "exit_price": null,
+    "quantity": 0.036613,
+    "position_size": 132795.21,
+    "pnl": 612.89,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2023-05-01T00:00:00Z",
+    "exit_time": "2023-06-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 73.237801,
+    "exit_price": null,
+    "quantity": 0.034515,
+    "position_size": 132793.21,
+    "pnl": 357.91,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2023-06-01T00:00:00Z",
+    "exit_time": "2023-07-03T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 404.876862,
+    "exit_price": null,
+    "quantity": 0.028017,
+    "position_size": 150078.15,
+    "pnl": 1853.63,
+    "meta": {
+      "regime": "elevated",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2023-06-01T00:00:00Z",
+    "exit_time": "2023-07-03T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 345.495209,
+    "exit_price": null,
+    "quantity": 0.03156,
+    "position_size": 164355.37,
+    "pnl": 12290.75,
+    "meta": {
+      "regime": "elevated",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2023-06-01T00:00:00Z",
+    "exit_time": "2023-07-03T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 70.872711,
+    "exit_price": null,
+    "quantity": 0.049005,
+    "position_size": 181797.78,
+    "pnl": -4288.33,
+    "meta": {
+      "regime": "elevated",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2023-07-03T00:00:00Z",
+    "exit_time": "2023-08-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 427.546661,
+    "exit_price": null,
+    "quantity": 0.035005,
+    "position_size": 185083.61,
+    "pnl": 8403.15,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2023-07-03T00:00:00Z",
+    "exit_time": "2023-08-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 363.935425,
+    "exit_price": null,
+    "quantity": 0.042386,
+    "position_size": 206740.89,
+    "pnl": 8772.19,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2023-07-03T00:00:00Z",
+    "exit_time": "2023-08-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 65.914085,
+    "exit_price": null,
+    "quantity": 0.059783,
+    "position_size": 33690.87,
+    "pnl": 2642.49,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2023-08-01T00:00:00Z",
+    "exit_time": "2023-09-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 439.772186,
+    "exit_price": null,
+    "quantity": 0.068148,
+    "position_size": 116935.23,
+    "pnl": 5292.39,
+    "meta": {
+      "regime": "crisis",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2023-08-01T00:00:00Z",
+    "exit_time": "2023-09-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 376.220917,
+    "exit_price": null,
+    "quantity": 0.035705,
+    "position_size": 171035.85,
+    "pnl": 6979.02,
+    "meta": {
+      "regime": "crisis",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2023-08-01T00:00:00Z",
+    "exit_time": "2023-09-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 66.924362,
+    "exit_price": null,
+    "quantity": 0.093883,
+    "position_size": 127574.27,
+    "pnl": 516.39,
+    "meta": {
+      "regime": "crisis",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2023-08-01T00:00:00Z",
+    "exit_time": "2023-09-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 38.566032,
+    "exit_price": null,
+    "quantity": 0.079174,
+    "position_size": 158139.86,
+    "pnl": 2803.29,
+    "meta": {
+      "regime": "crisis",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2023-08-01T00:00:00Z",
+    "exit_time": "2023-09-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 76.250542,
+    "exit_price": null,
+    "quantity": 0.041676,
+    "position_size": 223473.45,
+    "pnl": 1594.33,
+    "meta": {
+      "regime": "crisis",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2023-09-01T00:00:00Z",
+    "exit_time": "2023-10-02T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 65.067619,
+    "exit_price": null,
+    "quantity": 0.032517,
+    "position_size": 160091.61,
+    "pnl": -3539.41,
+    "meta": {
+      "regime": "crisis",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2023-09-01T00:00:00Z",
+    "exit_time": "2023-10-02T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 36.899372,
+    "exit_price": null,
+    "quantity": 0.027678,
+    "position_size": 185817.86,
+    "pnl": -6834.13,
+    "meta": {
+      "regime": "crisis",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2023-09-01T00:00:00Z",
+    "exit_time": "2023-10-02T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 73.921463,
+    "exit_price": null,
+    "quantity": 0.026098,
+    "position_size": 197375.72,
+    "pnl": -6826.01,
+    "meta": {
+      "regime": "crisis",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2023-10-02T00:00:00Z",
+    "exit_time": "2023-11-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 355.574371,
+    "exit_price": null,
+    "quantity": 0.02098,
+    "position_size": 192015.58,
+    "pnl": -7160.05,
+    "meta": {
+      "regime": "elevated",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2023-11-01T00:00:00Z",
+    "exit_time": "2023-12-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 408.626373,
+    "exit_price": null,
+    "quantity": 0.035134,
+    "position_size": 81800.81,
+    "pnl": -1272.49,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2023-12-01T00:00:00Z",
+    "exit_time": "2024-01-02T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 443.856476,
+    "exit_price": null,
+    "quantity": 0.064453,
+    "position_size": 17347.5,
+    "pnl": 7052.53,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2023-12-01T00:00:00Z",
+    "exit_time": "2024-01-02T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 383.802948,
+    "exit_price": null,
+    "quantity": 0.044364,
+    "position_size": 147651.57,
+    "pnl": 17740.58,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2023-12-01T00:00:00Z",
+    "exit_time": "2024-01-02T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 66.605804,
+    "exit_price": null,
+    "quantity": 0.062185,
+    "position_size": 97906.89,
+    "pnl": 13342.94,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2023-12-01T00:00:00Z",
+    "exit_time": "2024-01-02T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 36.992481,
+    "exit_price": null,
+    "quantity": 0.040437,
+    "position_size": 145381.03,
+    "pnl": 13494.85,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2023-12-01T00:00:00Z",
+    "exit_time": "2024-01-02T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 83.65834,
+    "exit_price": null,
+    "quantity": 0.137737,
+    "position_size": 164228.0,
+    "pnl": 2547.76,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2024-01-02T00:00:00Z",
+    "exit_time": "2024-02-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 68.667007,
+    "exit_price": null,
+    "quantity": 0.029595,
+    "position_size": 68311.91,
+    "pnl": 3029.86,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2024-01-02T00:00:00Z",
+    "exit_time": "2024-02-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 88.729439,
+    "exit_price": null,
+    "quantity": 0.023974,
+    "position_size": 188201.53,
+    "pnl": 9954.97,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2024-02-01T00:00:00Z",
+    "exit_time": "2024-03-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 36.771832,
+    "exit_price": null,
+    "quantity": 0.031459,
+    "position_size": 113922.49,
+    "pnl": -3585.15,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2024-04-01T00:00:00Z",
+    "exit_time": "2024-05-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 439.633331,
+    "exit_price": null,
+    "quantity": 0.026732,
+    "position_size": 120919.51,
+    "pnl": -23.73,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2024-04-01T00:00:00Z",
+    "exit_time": "2024-05-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 39.039234,
+    "exit_price": null,
+    "quantity": 0.025106,
+    "position_size": 139028.52,
+    "pnl": 1885.58,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2024-04-01T00:00:00Z",
+    "exit_time": "2024-05-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 84.340927,
+    "exit_price": null,
+    "quantity": 0.033308,
+    "position_size": 221509.54,
+    "pnl": -3214.98,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2024-04-01T00:00:00Z",
+    "exit_time": "2024-05-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 78.524925,
+    "exit_price": null,
+    "quantity": 0.031969,
+    "position_size": 229344.95,
+    "pnl": -1854.26,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2024-05-01T00:00:00Z",
+    "exit_time": "2024-06-03T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 487.207184,
+    "exit_price": null,
+    "quantity": 0.071758,
+    "position_size": 89105.26,
+    "pnl": -724.58,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2024-05-01T00:00:00Z",
+    "exit_time": "2024-06-03T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 416.483307,
+    "exit_price": null,
+    "quantity": 0.08741,
+    "position_size": 208329.9,
+    "pnl": -6367.33,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2024-05-01T00:00:00Z",
+    "exit_time": "2024-06-03T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 38.925392,
+    "exit_price": null,
+    "quantity": 0.055891,
+    "position_size": 194919.58,
+    "pnl": -405.42,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2024-05-01T00:00:00Z",
+    "exit_time": "2024-06-03T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 80.987587,
+    "exit_price": null,
+    "quantity": 0.20307,
+    "position_size": 18439.47,
+    "pnl": -8807.07,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2024-06-03T00:00:00Z",
+    "exit_time": "2024-07-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 75.025917,
+    "exit_price": null,
+    "quantity": 0.048243,
+    "position_size": 116555.22,
+    "pnl": 3818.74,
+    "meta": {
+      "regime": "elevated",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2024-06-03T00:00:00Z",
+    "exit_time": "2024-07-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 76.696396,
+    "exit_price": null,
+    "quantity": 0.031475,
+    "position_size": 260819.66,
+    "pnl": 9820.0,
+    "meta": {
+      "regime": "elevated",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2024-07-01T00:00:00Z",
+    "exit_time": "2024-08-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 532.728577,
+    "exit_price": null,
+    "quantity": 0.024407,
+    "position_size": 64698.5,
+    "pnl": 3258.2,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2024-07-01T00:00:00Z",
+    "exit_time": "2024-08-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 40.779884,
+    "exit_price": null,
+    "quantity": 0.034366,
+    "position_size": 229285.97,
+    "pnl": 3483.7,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2024-08-01T00:00:00Z",
+    "exit_time": "2024-09-03T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 530.452393,
+    "exit_price": null,
+    "quantity": 0.058846,
+    "position_size": 123544.77,
+    "pnl": -276.44,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2024-08-01T00:00:00Z",
+    "exit_time": "2024-09-03T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 454.889465,
+    "exit_price": null,
+    "quantity": 0.038799,
+    "position_size": 247129.08,
+    "pnl": -9622.78,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2024-08-01T00:00:00Z",
+    "exit_time": "2024-09-03T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 73.353523,
+    "exit_price": null,
+    "quantity": 0.03037,
+    "position_size": 146924.82,
+    "pnl": -356.47,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2024-08-01T00:00:00Z",
+    "exit_time": "2024-09-03T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 40.31181,
+    "exit_price": null,
+    "quantity": 0.047312,
+    "position_size": 181974.0,
+    "pnl": -2631.76,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2024-08-01T00:00:00Z",
+    "exit_time": "2024-09-03T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 85.382088,
+    "exit_price": null,
+    "quantity": 0.085019,
+    "position_size": 175800.48,
+    "pnl": 26248.59,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2024-09-03T00:00:00Z",
+    "exit_time": "2024-10-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 539.312744,
+    "exit_price": null,
+    "quantity": 0.054045,
+    "position_size": 177589.53,
+    "pnl": 2063.62,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2024-09-03T00:00:00Z",
+    "exit_time": "2024-10-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 457.01712,
+    "exit_price": null,
+    "quantity": 0.028499,
+    "position_size": 218630.5,
+    "pnl": 1155.9,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2024-09-03T00:00:00Z",
+    "exit_time": "2024-10-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 88.897614,
+    "exit_price": null,
+    "quantity": 0.158515,
+    "position_size": 17285.31,
+    "pnl": 7238.42,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2024-10-01T00:00:00Z",
+    "exit_time": "2024-11-01T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 557.17395,
+    "exit_price": null,
+    "quantity": 0.037092,
+    "position_size": 140497.6,
+    "pnl": 5881.49,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2024-11-01T00:00:00Z",
+    "exit_time": "2024-12-02T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 74.431824,
+    "exit_price": null,
+    "quantity": 0.025743,
+    "position_size": 172667.78,
+    "pnl": -6425.0,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  },
+  {
+    "entry_time": "2024-11-01T00:00:00Z",
+    "exit_time": "2024-12-02T00:00:00Z",
+    "direction": "LONG",
+    "entry_price": 42.499348,
+    "exit_price": null,
+    "quantity": 0.027621,
+    "position_size": 209594.74,
+    "pnl": -6697.46,
+    "meta": {
+      "regime": "normal",
+      "hedge_active": false
+    }
+  }
+]

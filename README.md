@@ -10,8 +10,8 @@ git clone <repo-url> && cd trading-platform
 python -m venv .venv
 
 # Activate virtual environment
-source .venv/bin/activate        # Linux/macOS
-# .venv\Scripts\activate         # Windows
+source .venv/bin/activate        # Linux/macOS / Git Bash
+# .venv\Scripts\activate         # Windows (PowerShell / cmd)
 
 # Install dependencies
 pip install -e ".[all]"
@@ -19,30 +19,38 @@ pip install -e ".[all]"
 
 # Configure environment
 cp .env.example .env
-# Edit .env — set TRADING_DATA_DIR to your data location
+# Edit .env — set DATA_DIR (default: ./data)
 
-# Build frontend
+# Production: build frontend, then start viewer
 cd frontend && npm install && npm run build && cd ..
-
-# Start the viewer
-python -m viewer.app --port 5556
+python -m uvicorn viewer.main:app --host 0.0.0.0 --port 5556 --no-access-log
 # Open http://localhost:5556
+
+# Development (two terminals; Vite on :3000 proxies /api to backend on :5556)
+# Terminal 1:
+python -m uvicorn viewer.main:app --host 0.0.0.0 --port 5556 --no-access-log
+# Terminal 2:
+cd frontend && npm install && npm run dev
+# Open http://localhost:3000
 # Strategy Lab live conversion runs also require NVIDIA_API_KEY
 ```
 
 ## Data Directory
 
-All runtime data (OHLCV, backtests, catalogs) lives outside the repo in `$TRADING_DATA_DIR` (default: `~/data`):
+All runtime data (OHLCV, backtests, catalogs) lives in `DATA_DIR` (default: `./data` relativ zum Projekt-Root):
 
 ```
-$TRADING_DATA_DIR/
+$DATA_DIR/
   ohlcv/{source}/{asset_class}/{region}/{symbol}/{timeframe}.parquet
+  backtests.db
   backtests/*.trades.json
   universes/
   catalog.json
 ```
 
-Set the `TRADING_DATA_DIR` environment variable (in `.env` or your shell) to customize the location.
+Setze `DATA_DIR` in `.env` oder Shell. Für Legacy-Kompatibilität wird auch `TRADING_DATA_DIR` unterstützt, wenn `DATA_DIR` nicht gesetzt ist.
+
+FastAPI nutzt primär `backtests.db` (SQLite via SQLModel). JSON-Dateien unter `backtests/*.trades.json` bleiben kompatibel und werden beim Start nach SQLite migriert.
 
 ## Usage
 
@@ -65,11 +73,30 @@ python -m runner.converters.cli lean path/to/lean_result.json -o output.trades.j
 # 3. Open http://localhost:5556/lab
 
 # Build data catalog
-python -m data_tools.catalog_builder -o "$TRADING_DATA_DIR/catalog.json"
+python -m data_tools.catalog_builder -o "$DATA_DIR/catalog.json"
 
 # Migrate CSV data to Parquet
 python -m data_tools.migrate_csv --execute
+
+# Grid testing for strategy optimization
+python -m runner.grid_tester --strategy example_sma --symbols EURUSD,GBPUSD,USDJPY --timeframes 1h,4h,1d
+
+# Portfolio optimization
+python -m runner.portfolio_optimizer --backtest-ids bt_001,bt_002,bt_003
+
+# Walk-forward validation
+python -m runner.cli walkforward --strategy example_sma --train-months 12 --test-months 3
 ```
+
+## Advanced Workflows
+
+- **Grid Testing:** `runner/grid_tester.py` - Automated strategy matrices (Symbol × Timeframe × ParamSet)
+- **Portfolio Optimization:** `runner/portfolio_optimizer.py` - Multi-strategy allocation with OOS validation
+- **Walk-Forward Analysis:** Anti-overfitting validation with train/test splits
+- **Signal Bots:** `signal_bots/health_check.py` - Registry/config validation for stockkit, ramjet, rocketfuel, and nitro processors
+- **Live Risk Consistency:** Backtest vs live position sizing behavior and stop-direction validation
+
+Documentation: See `docs/grid_tester.md`, `docs/portfolio_optimizer.md`, `docs/walk_forward.md`, `docs/signal_bots.md`, and `docs/live-risk-consistency.md`
 
 ## Structure
 
@@ -85,7 +112,8 @@ runner/              — Backtest runner
   converters/        — Result format converters
 
 viewer/              — Trade viewer web app
-  app.py             — Flask backend (python -m viewer.app)
+  main.py            — FastAPI backend (python -m uvicorn viewer.main:app ...)
+  core.py            — Internal helper module used by main.py
 
 frontend/            — React SPA (Vite + Tailwind)
 
@@ -111,11 +139,32 @@ tests/               — Test suite
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `TRADING_DATA_DIR` | `~/data` | Root for OHLCV, backtests, catalogs |
-| `LOG_DIR` | `~/logs` | Log file directory |
+| `DATA_DIR` | `./data` | Root for OHLCV, backtests, catalogs |
+| `TRADING_DATA_DIR` | `./data` | Legacy fallback if `DATA_DIR` is unset |
+| `LOG_DIR` | `./logs` | Log file directory |
 | `LOG_LEVEL` | `INFO` | Logging level |
-| `FLASK_PORT` | `5556` | Viewer server port |
+| `SENTRY_DSN` | — | Sentry project DSN. Empty disables Sentry unless `SENTRY_ENABLED=true` |
+| `SENTRY_ENABLED` | auto | Optional override. Defaults to enabled when `SENTRY_DSN` is present |
+| `SENTRY_ENVIRONMENT` | `local` | Sentry environment name |
+| `SENTRY_RELEASE` | auto | Sentry release. Defaults to package version plus git SHA when available |
+| `SENTRY_SAMPLE_RATE` | `1.0` | Error event sample rate from `0.0` to `1.0` |
+| `SENTRY_TRACES_SAMPLE_RATE` | — | Optional performance trace sample rate from `0.0` to `1.0` |
+| `SENTRY_PROFILES_SAMPLE_RATE` | `0.0` | Optional profile sample rate from `0.0` to `1.0` |
+| `SENTRY_SEND_DEFAULT_PII` | `false` | Include default personally identifiable request data in Sentry events |
+| `SENTRY_ENABLE_LOGS` | `true` | Send SDK log records to Sentry |
+| `SENTRY_DEBUG` | `false` | Enable Sentry SDK debug logging |
+| `SENTRY_ATTACH_STACKTRACE` | `true` | Attach stacktraces to captured events |
+| `UVICORN_HOST` | `0.0.0.0` | Recommended host for `python -m uvicorn viewer.main:app` |
+| `UVICORN_PORT` | `5556` | Recommended port for `python -m uvicorn viewer.main:app` |
 | `NVIDIA_API_KEY` | — | API key for the Strategy Lab auto-conversion agent via NVIDIA NIM |
+
+## FastAPI + WebSocket
+
+- Start server: `python -m uvicorn viewer.main:app --host 0.0.0.0 --port 5556 --no-access-log`
+- React dev proxy forwards:
+  - `/api` → `http://localhost:5556`
+  - `/ws` → `ws://localhost:5556`
+- Live terminal uses `GET /ws/tasks/{job_id}` WebSocket stream (tail-like task logs).
 
 ## Writing a Strategy (vectorbt)
 

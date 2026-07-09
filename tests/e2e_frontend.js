@@ -106,8 +106,9 @@ function assert(cond, msg) {
 
   await test('Shows stats and equity chart', async () => {
     const resp = await page.evaluate(() => fetch('/api/backtests').then(r => r.json()));
-    if (resp && resp.length > 0) {
-      await page.goto(`${BASE}/backtests/${resp[0].id}`);
+    const items = Array.isArray(resp) ? resp : (resp?.items || []);
+    if (items.length > 0) {
+      await page.goto(`${BASE}/backtests/${items[0].id}`);
       await page.waitForTimeout(3000);
       const text = await page.textContent('body');
       assert(text.includes('Equity Curve'), 'Should show Equity Curve section');

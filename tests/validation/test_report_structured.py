@@ -1,0 +1,402 @@
+"""Tests for validation.reporting.json_report (structured JSON reports)."""
+
+from __future__ import annotations
+
+import json
+from datetime import datetime
+from typing import Any
+
+import pytest
+
+from shared.models import BacktestMeta, BacktestResult, Trade, TradeExit
+from validation.comparison.anomalies import AnomalyDetector
+from validation.comparison.comparison import (
+    MatchedTrade,
+    TradeComparisonResult,
+    TradeComparator,
+)
+from validation.comparison.delta_report import (
+    DeltaReportBuilder,
+    FieldDelta,
+    TradeDeltaReport,
+)
+from validation.comparison.matcher import MatchKey, TradeMatcher
+from validation.reference import ValidationReference
+from validation.reporting.json_report import (
+    ReportSummary,
+    StatDelta,
+    ValidationReport,
+    generate_json_report,
+    generate_markdown_report,
+)
+from validation.stats.calculator import TradeStatistics, compute_trade_statistics
+
+
+def _make_trade(
+    trade_id: int = 1,
+    symbol: str = "EURUSD",
+    direction: str = "LONG",
+    entry_time: str = "2024-01-01T10:00:00Z",
+    exit_time: str = "2024-01-01T11:00:00Z",
+    entry_price: float = 1.1000,
+    exit_price: float = 1.1050,
+    quantity: float = 1000.0,
+    position_size: float | None = None,
+    pnl: float = 50.0,
+    stop_loss: float | None = None,
+    take_profit: float | None = None,
+) -> Trade:
+    meta: dict[str, object] = {}
+    if stop_loss is not None:
+        meta["stop_loss"] = stop_loss
+    if take_profit is not None:
+        meta["take_profit"] = take_profit
+    return Trade(
+        id=trade_id,
+        symbol=symbol,
+        direction=direction,
+        entry_time=entry_time,
+        entry_price=entry_price,
+        quantity=quantity,
+        exits=[TradeExit(time=exit_time, price=exit_price, quantity=quantity)],
+        pnl=pnl,
+        position_size=position_size,
+        meta=meta,
+    )
+
+
+def _make_reference(trades: list[Trade]) -> ValidationReference:
+    return ValidationReference(
+        strategy_name="test_strategy",
+        source_framework="unknown",
+        symbol="EURUSD",
+        timeframe="1h",
+        settings={},
+        trades=trades,
+        stats={},
+        raw_metadata={},
+        allow_empty=True,
+    )
+
+
+def _make_platform_result(trades: list[Trade]) -> BacktestResult:
+    meta = BacktestMeta(
+        id="platform_test",
+        created_at="2024-01-01T00:00:00Z",
+        engine="test",
+        strategies=["test"],
+    )
+    return BacktestResult(meta=meta, trades=trades, stats={})
+
+
+# ---------------------------------------------------------------------------
+# Basic JSON output tests
+# ---------------------------------------------------------------------------
+
+
+class TestJsonReportBasics:
+    def test_generate_json_report_returns_valid_json(self):
+        ref_trade = _make_trade(trade_id=1)
+        ref = _make_reference([ref_trade])
+        platform = _make_platform_result([_make_trade(trade_id=10)])
+
+        json_str = generate_json_report(ref, platform)
+        data = json.loads(json_str)
+        assert isinstance(data, dict)
+
+    def test_report_has_required_top_level_keys(self):
+        ref_trade = _make_trade(trade_id=1)
+        ref = _make_reference([ref_trade])
+        platform = _make_platform_result([_make_trade(trade_id=10)])
+
+        json_str = generate_json_report(ref, platform)
+        data = json.loads(json_str)
+
+        required = [
+            "strategy_name",
+            "symbol",
+            "timeframe",
+            "source_framework",
+            "generated_at",
+            "passed",
+            "trade_summary",
+            "stat_summary",
+            "trade_deltas",
+            "stat_deltas",
+            "risk_deltas",
+            "anomalies",
+            "explanations",
+        ]
+        for key in required:
+            assert key in data, f"Missing key: {key}"
+
+    def test_perfect_match_passed_true(self):
+        ref_trade = _make_trade(trade_id=1)
+        act_trade = _make_trade(trade_id=10)
+        ref = _make_reference([ref_trade])
+        platform = _make_platform_result([act_trade])
+
+        json_str = generate_json_report(ref, platform)
+        data = json.loads(json_str)
+        assert data["passed"] is True
+        assert data["trade_passed"] is True
+        assert data["stat_passed"] is True
+        assert data["risk_passed"] is True
+        assert data["trade_summary"]["matched"] == 1
+        assert data["trade_summary"]["missing"] == 0
+        assert data["trade_summary"]["extra"] == 0
+
+    def test_missing_trade_in_report(self):
+        ref_trade = _make_trade(trade_id=1)
+        ref = _make_reference([ref_trade])
+        platform = _make_platform_result([])
+
+        json_str = generate_json_report(ref, platform)
+        data = json.loads(json_str)
+        assert data["passed"] is False
+        assert data["trade_passed"] is False
+        assert data["trade_summary"]["missing"] == 1
+        assert data["trade_summary"]["matched"] == 0
+        assert len(data["anomalies"]) == 1
+        assert data["anomalies"][0]["anomaly_type"] == "missing"
+
+    def test_extra_trade_in_report(self):
+        act_trade = _make_trade(trade_id=10)
+        ref = _make_reference([])
+        platform = _make_platform_result([act_trade])
+
+        json_str = generate_json_report(ref, platform)
+        data = json.loads(json_str)
+        assert data["passed"] is False
+        assert data["trade_summary"]["extra"] == 1
+        assert len(data["anomalies"]) == 1
+        assert data["anomalies"][0]["anomaly_type"] == "extra"
+
+    def test_price_mismatch_in_report(self):
+        ref_trade = _make_trade(trade_id=1, entry_price=1.1000)
+        act_trade = _make_trade(trade_id=10, entry_price=1.1050)
+        ref = _make_reference([ref_trade])
+        platform = _make_platform_result([act_trade])
+
+        json_str = generate_json_report(ref, platform)
+        data = json.loads(json_str)
+        assert data["trade_summary"]["mismatched"] == 1
+        trade_delta = data["trade_deltas"][0]
+        assert trade_delta["anomaly_type"] == "mismatch"
+        assert trade_delta["severity"] == "warning"
+        field_deltas = trade_delta["field_deltas"]
+        entry_fd = next((fd for fd in field_deltas if fd["field"] == "entry_price"), None)
+        assert entry_fd is not None
+        assert entry_fd["passed"] is False
+        assert "explanation" in entry_fd
+
+    def test_direction_mismatch_is_error(self):
+        # Different directions cause trades to not match at all (missing+extra)
+        # rather than being classified as a "mismatch".
+        ref_trade = _make_trade(trade_id=1, direction="LONG")
+        act_trade = _make_trade(trade_id=10, direction="SHORT")
+        ref = _make_reference([ref_trade])
+        platform = _make_platform_result([act_trade])
+
+        json_str = generate_json_report(ref, platform)
+        data = json.loads(json_str)
+        assert data["passed"] is False
+        assert data["trade_summary"]["matched"] == 0
+        assert data["trade_summary"]["missing"] == 1
+        assert data["trade_summary"]["extra"] == 1
+
+    def test_stat_delta_in_report(self):
+        # Use explicit exit PnL so realized_pnl differs between reference and platform.
+        ref_trade = _make_trade(trade_id=1, pnl=100.0)
+        ref_trade.exits[0].pnl = 100.0
+        act_trade = _make_trade(trade_id=10, pnl=200.0)
+        act_trade.exits[0].pnl = 200.0
+        ref = _make_reference([ref_trade])
+        platform = _make_platform_result([act_trade])
+
+        json_str = generate_json_report(ref, platform)
+        data = json.loads(json_str)
+        stat_deltas = data["stat_deltas"]
+        assert len(stat_deltas) > 0
+        net_profit_delta = next(
+            (sd for sd in stat_deltas if sd["field"] == "net_profit"), None
+        )
+        assert net_profit_delta is not None
+        assert net_profit_delta["passed"] is False
+        assert net_profit_delta["expected"] == 100.0
+        assert net_profit_delta["actual"] == 200.0
+        assert "explanation" in net_profit_delta
+        assert "severity" in net_profit_delta
+
+    def test_report_summary_counts(self):
+        ref1 = _make_trade(trade_id=1)
+        ref2 = _make_trade(trade_id=2, entry_time="2024-01-02T10:00:00Z")
+        act1 = _make_trade(trade_id=10)
+        act2 = _make_trade(trade_id=20, entry_time="2024-01-03T10:00:00Z")
+        ref = _make_reference([ref1, ref2])
+        platform = _make_platform_result([act1, act2])
+
+        json_str = generate_json_report(ref, platform)
+        data = json.loads(json_str)
+        trade_summary = data["trade_summary"]
+        assert trade_summary["matched"] == 1
+        assert trade_summary["missing"] == 1
+        assert trade_summary["extra"] == 1
+        assert trade_summary["errors"] + trade_summary["warnings"] >= 0
+
+    def test_report_serializes_datetimes(self):
+        ref = _make_reference([_make_trade()])
+        platform = _make_platform_result([_make_trade()])
+
+        json_str = generate_json_report(ref, platform)
+        data = json.loads(json_str)
+        generated_at = data["generated_at"]
+        assert isinstance(generated_at, str)
+        # Should be a valid ISO-8601 string
+        dt = datetime.fromisoformat(generated_at.replace("Z", "+00:00"))
+        assert isinstance(dt, datetime)
+
+    def test_empty_platform_trades(self):
+        ref = _make_reference([_make_trade(trade_id=1)])
+        platform = _make_platform_result([])
+
+        json_str = generate_json_report(ref, platform)
+        data = json.loads(json_str)
+        assert data["passed"] is False
+        assert data["trade_summary"]["missing"] == 1
+        assert data["anomalies"][0]["severity"] == "warning"
+
+    def test_platform_result_as_validation_reference(self):
+        ref_trade = _make_trade(trade_id=1)
+        act_trade = _make_trade(trade_id=10)
+        ref = _make_reference([ref_trade])
+        platform_ref = _make_reference([act_trade])
+
+        json_str = generate_json_report(ref, platform_ref)
+        data = json.loads(json_str)
+        assert data["passed"] is True
+        assert data["trade_summary"]["matched"] == 1
+
+    def test_with_precomputed_trade_delta_report(self):
+        ref_trade = _make_trade(trade_id=1)
+        act_trade = _make_trade(trade_id=10, entry_price=1.1050)
+        ref = _make_reference([ref_trade])
+        platform = _make_platform_result([act_trade])
+
+        match_result = TradeMatcher.match([ref_trade], [act_trade])
+        matched = MatchedTrade(
+            reference=ref_trade,
+            actual=act_trade,
+            key=MatchKey(
+                entry_time=ref_trade.entry_time,
+                exit_time=ref_trade.last_exit_time,
+                symbol=ref_trade.symbol,
+                direction=ref_trade.direction,
+            ),
+        )
+        comp = TradeComparator().compare(matched)
+        anomalies = AnomalyDetector.detect_mismatches([comp])
+        tdr = DeltaReportBuilder.build(ref, platform, [comp], anomalies)
+
+        json_str = generate_json_report(ref, platform, trade_delta_report=tdr)
+        data = json.loads(json_str)
+        assert data["trade_summary"]["mismatched"] == 1
+        assert data["passed"] is True  # entry_price is warning only
+
+    def test_with_precomputed_stats_delta(self):
+        ref = _make_reference([_make_trade(trade_id=1, pnl=100.0)])
+        platform = _make_platform_result([_make_trade(trade_id=10, pnl=200.0)])
+
+        stats_delta = [
+            StatDelta(
+                field="net_profit",
+                expected=100.0,
+                actual=200.0,
+                absolute_diff=100.0,
+                relative_diff=0.5,
+                passed=False,
+                explanation="net_profit differs significantly",
+                severity="warning",
+            ),
+            StatDelta(
+                field="win_rate",
+                expected=1.0,
+                actual=1.0,
+                passed=True,
+                explanation="win_rate matches",
+                severity="info",
+            ),
+        ]
+
+        json_str = generate_json_report(ref, platform, stats_delta=stats_delta)
+        data = json.loads(json_str)
+        assert data["stat_summary"]["mismatched"] == 1
+        assert data["stat_summary"]["matched"] == 1
+        assert data["stat_passed"] is False
+
+    def test_invalid_platform_input_raises(self):
+        ref = _make_reference([_make_trade()])
+        with pytest.raises((TypeError, AttributeError)):
+            # Passing a string is invalid
+            generate_json_report(ref, "invalid")  # type: ignore[arg-type]
+
+    def test_markdown_report_generation(self):
+        ref_trade = _make_trade(trade_id=1)
+        act_trade = _make_trade(trade_id=10)
+        ref = _make_reference([ref_trade])
+        platform = _make_platform_result([act_trade])
+
+        md = generate_markdown_report(ref, platform)
+        assert isinstance(md, str)
+        assert "# Validation Report" in md
+        assert "test_strategy" in md
+        assert "EURUSD" in md
+        assert "Yes" in md or "No" in md
+
+    def test_anomalies_have_explanation_and_severity(self):
+        ref_trade = _make_trade(trade_id=1)
+        ref = _make_reference([ref_trade])
+        platform = _make_platform_result([])
+
+        json_str = generate_json_report(ref, platform)
+        data = json.loads(json_str)
+        for anomaly in data["anomalies"]:
+            assert "explanation" in anomaly
+            assert isinstance(anomaly["explanation"], str)
+            assert "severity" in anomaly
+            assert isinstance(anomaly["severity"], str)
+
+    def test_no_internal_python_objects(self):
+        ref = _make_reference([_make_trade()])
+        platform = _make_platform_result([_make_trade()])
+
+        json_str = generate_json_report(ref, platform)
+        data = json.loads(json_str)
+
+        def _check(obj: Any) -> None:
+            if isinstance(obj, dict):
+                for v in obj.values():
+                    _check(v)
+            elif isinstance(obj, list):
+                for item in obj:
+                    _check(item)
+            else:
+                assert obj is None or isinstance(
+                    obj, (str, int, float, bool)
+                ), f"Non-JSON-serializable type: {type(obj).__name__} = {obj!r}"
+
+        _check(data)
+
+    def test_report_model_directly(self):
+        report = ValidationReport(
+            strategy_name="s",
+            symbol=" sym",
+            timeframe="1h",
+            source_framework="unknown",
+            passed=True,
+            trade_summary=ReportSummary(matched=2, missing=1),
+        )
+        d = report.model_dump(mode="json")
+        assert d["strategy_name"] == "s"
+        assert d["trade_summary"]["matched"] == 2
+        assert d["trade_summary"]["missing"] == 1

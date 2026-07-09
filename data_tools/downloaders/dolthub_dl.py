@@ -88,12 +88,14 @@ class DolthubDownloader(Downloader):
     ) -> DownloadResult:
         owner, repo_name = repo.split("/", 1)
         symbol = symbol.upper()
+        out_path = self._make_output_path(output_dir, "equity", symbol, timeframe)
+        effective_start = self._resolve_resume_start(out_path, start)
 
         if query is None:
             # Default query for stock data
             conditions = [f"act_symbol = '{symbol}'"]
-            if start:
-                conditions.append(f"date >= '{start}'")
+            if effective_start:
+                conditions.append(f"date >= '{effective_start}'")
             if end:
                 conditions.append(f"date <= '{end}'")
             where = " AND ".join(conditions)
@@ -163,6 +165,10 @@ class DolthubDownloader(Downloader):
 
         if "timestamp" in df.columns:
             df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+            if effective_start:
+                df = df[df["timestamp"] >= effective_start]
+            if end:
+                df = df[df["timestamp"] <= end]
 
         for col in ["open", "high", "low", "close", "volume"]:
             if col in df.columns:
@@ -174,9 +180,7 @@ class DolthubDownloader(Downloader):
         ]
         df = df[keep].dropna(subset=["open"]).sort_values("timestamp").reset_index(drop=True)
 
-        # Save
-        out_path = self._make_output_path(output_dir, "equity", symbol, timeframe)
-        df.to_parquet(out_path, index=False)
+        combined = self._merge_and_store_single_file(out_path, df)
 
         return DownloadResult(
             symbol=symbol,
@@ -184,9 +188,9 @@ class DolthubDownloader(Downloader):
             source=self.source_name,
             asset_class="equity",
             path=out_path,
-            rows=len(df),
-            start=str(df["timestamp"].iloc[0]) if "timestamp" in df.columns else "",
-            end=str(df["timestamp"].iloc[-1]) if "timestamp" in df.columns else "",
+            rows=len(combined),
+            start=str(combined["timestamp"].iloc[0]) if "timestamp" in combined.columns and len(combined) > 0 else "",
+            end=str(combined["timestamp"].iloc[-1]) if "timestamp" in combined.columns and len(combined) > 0 else "",
             size_bytes=out_path.stat().st_size,
         )
 

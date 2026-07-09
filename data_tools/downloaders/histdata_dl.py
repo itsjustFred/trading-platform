@@ -109,9 +109,12 @@ class HistdataDownloader(Downloader):
         if timeframe not in RESAMPLE_MAP:
             raise ValueError(f"Unsupported timeframe {timeframe}. Use: {list(RESAMPLE_MAP.keys())}")
 
+        out_path = self._make_output_path(output_dir, "forex", symbol, timeframe)
+        effective_start = self._resolve_resume_start(out_path, start)
+
         # Determine years to download
         if years is None:
-            start_year = int(start[:4]) if start else 2020
+            start_year = int(effective_start[:4]) if effective_start else 2020
             end_year = int(end[:4]) if end else datetime.now().year
             years = list(range(start_year, end_year + 1))
 
@@ -135,8 +138,8 @@ class HistdataDownloader(Downloader):
         )
 
         # Apply date filters
-        if start:
-            combined = combined[combined["timestamp"] >= start]
+        if effective_start:
+            combined = combined[combined["timestamp"] >= effective_start]
         if end:
             combined = combined[combined["timestamp"] <= end]
 
@@ -144,9 +147,7 @@ class HistdataDownloader(Downloader):
         if timeframe != "1m":
             combined = self._resample(combined, timeframe)
 
-        # Save
-        out_path = self._make_output_path(output_dir, "forex", symbol, timeframe)
-        combined.to_parquet(out_path, index=False)
+        combined = self._merge_and_store_single_file(out_path, combined)
 
         return DownloadResult(
             symbol=symbol,

@@ -22,6 +22,8 @@ interface FilterBarProps {
   sortOptions?: FilterOption[];
   sortValue?: string;
   onSortChange?: (v: string) => void;
+  filterPanelContent?: React.ReactNode;
+  filterButtonLabel?: string;
 }
 
 export function FilterBar({
@@ -34,8 +36,11 @@ export function FilterBar({
   sortOptions,
   sortValue,
   onSortChange,
+  filterPanelContent,
+  filterButtonLabel = "Filter",
 }: FilterBarProps) {
   const [showFilters, setShowFilters] = useState(false);
+  const hasFilterPanel = filters.length > 0 || filterPanelContent != null;
 
   const inputStyle: React.CSSProperties = {
     background: "var(--color-surface2)",
@@ -87,7 +92,7 @@ export function FilterBar({
         </div>
 
         {/* Filter toggle */}
-        {filters.length > 0 && (
+        {hasFilterPanel && (
           <button
             onClick={() => setShowFilters((s) => !s)}
             style={{
@@ -101,7 +106,7 @@ export function FilterBar({
             }}
           >
             <Filter size={14} />
-            Filter
+            {filterButtonLabel}
           </button>
         )}
 
@@ -128,46 +133,50 @@ export function FilterBar({
       </div>
 
       {/* Filter dropdowns */}
-      {showFilters && filters.length > 0 && (
+      {showFilters && hasFilterPanel && (
         <div
           style={{
-            display: "flex",
-            gap: "8px",
+            display: "grid",
+            gap: "10px",
             marginTop: "8px",
-            flexWrap: "wrap",
             padding: "8px 12px",
             background: "var(--color-surface)",
             border: "1px solid var(--color-border)",
             borderRadius: "6px",
           }}
         >
-          {filters.map((f) => (
-            <div
-              key={f.key}
-              style={{ display: "flex", alignItems: "center", gap: "4px" }}
-            >
-              <label
-                style={{
-                  color: "var(--color-text-muted)",
-                  fontSize: "0.75rem",
-                }}
-              >
-                {f.label}:
-              </label>
-              <select
-                value={filterValues[f.key] || ""}
-                onChange={(e) => onFilterChange?.(f.key, e.target.value)}
-                style={inputStyle}
-              >
-                <option value="">All</option>
-                {f.options.map((o) => (
-                  <option key={o.value} value={o.value}>
-                    {o.label}
-                  </option>
-                ))}
-              </select>
+          {filters.length > 0 ? (
+            <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+              {filters.map((f) => (
+                <div
+                  key={f.key}
+                  style={{ display: "flex", alignItems: "center", gap: "4px" }}
+                >
+                  <label
+                    style={{
+                      color: "var(--color-text-muted)",
+                      fontSize: "0.75rem",
+                    }}
+                  >
+                    {f.label}:
+                  </label>
+                  <select
+                    value={filterValues[f.key] || ""}
+                    onChange={(e) => onFilterChange?.(f.key, e.target.value)}
+                    style={inputStyle}
+                  >
+                    <option value="">All</option>
+                    {f.options.map((o) => (
+                      <option key={o.value} value={o.value}>
+                        {o.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              ))}
             </div>
-          ))}
+          ) : null}
+          {filterPanelContent}
         </div>
       )}
     </div>

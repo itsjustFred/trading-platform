@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, MouseEvent, ReactNode } from "react";
 import {
   AlertTriangle,
@@ -13,6 +13,7 @@ import {
   RefreshCw,
   Search,
   ShieldCheck,
+  Sparkles,
   Table2,
   Trash2,
 } from "lucide-react";
@@ -26,7 +27,7 @@ import {
 import type { DataCategorySummary, DataSymbolEntry } from "../api/types";
 import { DownloadModal } from "../components/DownloadModal";
 import { ResampleModal } from "../components/ResampleModal";
-import { TaskManager } from "../components/TaskManager";
+import { SmartHarvestModal } from "../components/SmartHarvestModal";
 
 type TreeSelection =
   | { kind: "category"; category: string }
@@ -137,6 +138,9 @@ function humanizeSource(source: string | undefined) {
     yfinance: "YFinance",
     dolthub: "Dolthub",
     dukascopy: "Dukascopy",
+    jforex: "JForex",
+    huggingface: "HuggingFace",
+    alpaca: "Alpaca",
   };
   if (aliases[normalized.toLowerCase()]) {
     return aliases[normalized.toLowerCase()];
@@ -159,6 +163,20 @@ function categoryDefaultSource(category: string) {
     return "yfinance";
   }
   return "dukascopy";
+}
+
+function categoryDefaultAssetClass(category: string) {
+  const normalized = category.toLowerCase();
+  if (normalized.includes("metals")) return "metals";
+  if (normalized.includes("indices")) return "indices";
+  if (normalized.includes("energy")) return "energy";
+  if (normalized.includes("forex")) return "forex";
+  if (normalized.includes("equities") || normalized.includes("equity")) {
+    return "equity";
+  }
+  if (normalized.includes("etf")) return "etf";
+  if (normalized.includes("crypto")) return "crypto";
+  return "";
 }
 
 function deriveValidation(
@@ -318,6 +336,18 @@ export function DataManagementPage() {
     sourcePath: "",
     targetTimeframes: "5m,15m,30m,1h,4h",
   });
+  const [harvestModalOpen, setHarvestModalOpen] = useState(false);
+  const [harvestDefaults, setHarvestDefaults] = useState<{
+    source: string;
+    symbol: string;
+    assetClass: string;
+    startDate: string;
+  }>({
+    source: "dukascopy",
+    symbol: "",
+    assetClass: "",
+    startDate: "",
+  });
   const [backgroundTaskId, setBackgroundTaskId] = useState<string | null>(null);
   const categoryEntriesRef = useRef<Record<string, DataSymbolEntry[]>>({});
   const loadingCategoriesRef = useRef<Record<string, boolean>>({});
@@ -427,11 +457,16 @@ export function DataManagementPage() {
     void loadOverview();
   }, [loadOverview]);
 
+  const categoryNames = useMemo(
+    () => categories.map((category) => category.name),
+    [categories],
+  );
+
   useEffect(() => {
-    categories.forEach((category) => {
-      void loadCategoryDetails(category.name);
+    categoryNames.forEach((categoryName) => {
+      void loadCategoryDetails(categoryName);
     });
-  }, [categories, loadCategoryDetails]);
+  }, [categoryNames, loadCategoryDetails]);
 
   const groupedByCategory = useMemo(() => {
     const next: Record<string, SymbolGroup[]> = {};
@@ -496,7 +531,7 @@ export function DataManagementPage() {
     void poll();
     intervalId = window.setInterval(() => {
       void poll();
-    }, 2000);
+    }, 3000);
 
     return () => {
       active = false;
@@ -625,8 +660,8 @@ export function DataManagementPage() {
             }
           : selection,
       );
-    } catch (err: any) {
-      window.alert(err.message || "Failed to delete file.");
+    } catch (err: unknown) {
+      window.alert(err instanceof Error ? err.message : "Failed to delete file.");
     }
   };
 
@@ -647,8 +682,10 @@ export function DataManagementPage() {
         kind: "category",
         category: selection?.category || selectedCategory?.name || "",
       });
-    } catch (err: any) {
-      window.alert(err.message || "Failed to delete symbol files.");
+    } catch (err: unknown) {
+      window.alert(
+        err instanceof Error ? err.message : "Failed to delete symbol files.",
+      );
     }
   };
 
@@ -682,6 +719,25 @@ export function DataManagementPage() {
       });
     }
     setResampleModalOpen(true);
+  };
+
+  const openSmartHarvestForCurrent = () => {
+    if (selection?.kind === "symbol" && selectedGroup) {
+      setHarvestDefaults({
+        source: "dukascopy",
+        symbol: selectedGroup.symbol,
+        assetClass: categoryDefaultAssetClass(selection.category),
+        startDate: "",
+      });
+    } else if (selectedCategory) {
+      setHarvestDefaults({
+        source: "dukascopy",
+        symbol: "",
+        assetClass: categoryDefaultAssetClass(selectedCategory.name),
+        startDate: "",
+      });
+    }
+    setHarvestModalOpen(true);
   };
 
   const handleTaskStarted = (taskId: string) => {
@@ -774,11 +830,11 @@ export function DataManagementPage() {
         <div
           style={{
             display: "grid",
-            gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+            gridTemplateColumns: "minmax(220px, 1fr)",
             gap: "12px",
             alignItems: "start",
-            width: "min(100%, 620px)",
-            flex: "1 1 420px",
+            width: "min(100%, 320px)",
+            flex: "0 1 320px",
           }}
         >
           <MetricTile
@@ -786,7 +842,6 @@ export function DataManagementPage() {
             value={String(categories.length)}
             accent="#7dd3fc"
           />
-          <TaskManager />
         </div>
       </div>
 
@@ -1103,6 +1158,7 @@ export function DataManagementPage() {
               }
               onDownload={openDownloadForCurrent}
               onResample={openResampleForCurrent}
+              onHarvest={openSmartHarvestForCurrent}
               onSelectSymbol={(symbol) =>
                 handleSelectSymbol(selectedCategory.name, symbol)
               }
@@ -1114,6 +1170,7 @@ export function DataManagementPage() {
               rows={symbolRows}
               onDownload={openDownloadForCurrent}
               onResample={openResampleForCurrent}
+              onHarvest={openSmartHarvestForCurrent}
               onDeleteAll={() => handleDeleteAllForSymbol(selectedGroup)}
               onDeleteRow={handleDeleteEntry}
             />
@@ -1138,6 +1195,16 @@ export function DataManagementPage() {
         onTaskStarted={handleTaskStarted}
         defaultSourcePath={resampleDefaults.sourcePath}
         defaultTargetTimeframes={resampleDefaults.targetTimeframes}
+      />
+
+      <SmartHarvestModal
+        open={harvestModalOpen}
+        onClose={() => setHarvestModalOpen(false)}
+        onTaskStarted={handleTaskStarted}
+        defaultSource={harvestDefaults.source}
+        defaultSymbol={harvestDefaults.symbol}
+        defaultAssetClass={harvestDefaults.assetClass}
+        defaultStartDate={harvestDefaults.startDate}
       />
     </div>
   );
@@ -1189,6 +1256,7 @@ function CategoryDetailPanel({
   loading,
   onDownload,
   onResample,
+  onHarvest,
   onSelectSymbol,
 }: {
   category: DataCategorySummary;
@@ -1196,6 +1264,7 @@ function CategoryDetailPanel({
   loading: boolean;
   onDownload: () => void;
   onResample: () => void;
+  onHarvest: () => void;
   onSelectSymbol: (symbol: string) => void;
 }) {
   const columns: TableColumn<CategoryInventoryRow>[] = [
@@ -1281,6 +1350,12 @@ function CategoryDetailPanel({
               onClick={onResample}
               tone="secondary"
             />
+            <ActionButton
+              icon={<Sparkles size={15} />}
+              label="Smart Harvest (Auto-Tune)"
+              onClick={onHarvest}
+              tone="secondary"
+            />
           </div>
         }
       >
@@ -1353,6 +1428,7 @@ function SymbolDetailPanel({
   rows,
   onDownload,
   onResample,
+  onHarvest,
   onDeleteAll,
   onDeleteRow,
 }: {
@@ -1361,6 +1437,7 @@ function SymbolDetailPanel({
   rows: SymbolTableRow[];
   onDownload: () => void;
   onResample: () => void;
+  onHarvest: () => void;
   onDeleteAll: () => void;
   onDeleteRow: (
     entry: DataSymbolEntry,
@@ -1485,6 +1562,13 @@ function SymbolDetailPanel({
               icon={<RefreshCw size={15} />}
               label="Resample"
               onClick={onResample}
+              tone="secondary"
+              disabled={isRepoSymbol}
+            />
+            <ActionButton
+              icon={<Sparkles size={15} />}
+              label="Smart Harvest (Auto-Tune)"
+              onClick={onHarvest}
               tone="secondary"
               disabled={isRepoSymbol}
             />
@@ -1697,7 +1781,7 @@ function ActionButton({
   );
 }
 
-function MetricTile({
+const MetricTile = memo(function MetricTile({
   label,
   value,
   accent,
@@ -1731,7 +1815,7 @@ function MetricTile({
       </div>
     </div>
   );
-}
+});
 
 function SectionPanel({
   title,
@@ -1916,11 +2000,8 @@ function PanelTable<T>({
   const [sortKey, setSortKey] = useState(defaultSortKey || "");
   const [sortDirection, setSortDirection] =
     useState<SortDirection>(defaultSortDirection);
-
-  useEffect(() => {
-    setSortKey(defaultSortKey || "");
-    setSortDirection(defaultSortDirection);
-  }, [defaultSortDirection, defaultSortKey]);
+  const [pageIndex, setPageIndex] = useState(0);
+  const pageSize = 25;
 
   const sortedRows = useMemo(() => {
     if (!sortKey) {
@@ -1942,16 +2023,30 @@ function PanelTable<T>({
     return sortDirection === "asc" ? sorted : sorted.reverse();
   }, [columns, rows, sortDirection, sortKey]);
 
+  const pageCount = Math.max(1, Math.ceil(sortedRows.length / pageSize));
+  const safePageIndex = Math.min(pageIndex, pageCount - 1);
+
+  const pagedRows = useMemo(
+    () =>
+      sortedRows.slice(
+        safePageIndex * pageSize,
+        safePageIndex * pageSize + pageSize,
+      ),
+    [pageSize, safePageIndex, sortedRows],
+  );
+
   const handleSort = (column: TableColumn<T>) => {
     if (column.sortable === false) {
       return;
     }
     if (sortKey === column.key) {
       setSortDirection((prev) => (prev === "asc" ? "desc" : "asc"));
+      setPageIndex(0);
       return;
     }
     setSortKey(column.key);
     setSortDirection("asc");
+    setPageIndex(0);
   };
 
   if (rows.length === 0) {
@@ -2014,13 +2109,13 @@ function PanelTable<T>({
           </tr>
         </thead>
         <tbody>
-          {sortedRows.map((row, index) => (
+          {pagedRows.map((row, index) => (
             <tr
               key={getRowKey(row)}
               onClick={() => onRowClick?.(row)}
               style={{
                 background:
-                  index % 2 === 0
+                  (safePageIndex * pageSize + index) % 2 === 0
                     ? "rgba(8, 15, 31, 0.46)"
                     : "rgba(15, 23, 42, 0.18)",
                 cursor: onRowClick ? "pointer" : "default",
@@ -2043,6 +2138,62 @@ function PanelTable<T>({
           ))}
         </tbody>
       </table>
+      {sortedRows.length > pageSize && (
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            gap: "12px",
+            padding: "12px 14px",
+            borderTop: "1px solid rgba(148, 163, 184, 0.12)",
+            background: "rgba(15, 23, 42, 0.9)",
+          }}
+        >
+          <div style={{ color: "var(--color-text-muted)", fontSize: "0.76rem" }}>
+            Showing{" "}
+            {Math.min(safePageIndex * pageSize + 1, sortedRows.length)}–
+            {Math.min((safePageIndex + 1) * pageSize, sortedRows.length)} of{" "}
+            {sortedRows.length}
+          </div>
+          <div style={{ display: "flex", gap: "8px" }}>
+            <button
+              type="button"
+              onClick={() => setPageIndex((current) => Math.max(current - 1, 0))}
+              disabled={safePageIndex === 0}
+              style={{
+                padding: "8px 12px",
+                borderRadius: "10px",
+                border: "1px solid rgba(148, 163, 184, 0.18)",
+                background: "rgba(15, 23, 42, 0.82)",
+                color: "var(--color-text)",
+                cursor: safePageIndex === 0 ? "not-allowed" : "pointer",
+                opacity: safePageIndex === 0 ? 0.45 : 1,
+              }}
+            >
+              Previous
+            </button>
+            <button
+              type="button"
+              onClick={() =>
+                setPageIndex((current) => Math.min(current + 1, pageCount - 1))
+              }
+              disabled={safePageIndex >= pageCount - 1}
+              style={{
+                padding: "8px 12px",
+                borderRadius: "10px",
+                border: "1px solid rgba(148, 163, 184, 0.18)",
+                background: "rgba(15, 23, 42, 0.82)",
+                color: "var(--color-text)",
+                cursor: safePageIndex >= pageCount - 1 ? "not-allowed" : "pointer",
+                opacity: safePageIndex >= pageCount - 1 ? 0.45 : 1,
+              }}
+            >
+              Next
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

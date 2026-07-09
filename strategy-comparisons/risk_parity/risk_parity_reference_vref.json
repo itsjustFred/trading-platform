@@ -1,0 +1,51 @@
+{
+  "strategy_name": "RiskParityStrategy",
+  "source_framework": "lean",
+  "symbol": "MULTI",
+  "timeframe": "1d",
+  "settings": {
+    "target_volatility": 0.1,
+    "max_leverage": 1.5,
+    "lookback_volatility": 60,
+    "lookback_correlation": 120,
+    "min_weight": 0.02,
+    "max_weight": 0.3
+  },
+  "trades": [],
+  "stats": {
+    "total_return": 2.5,
+    "cagr": 0.076,
+    "max_drawdown": -0.177,
+    "max_drawdown_pct": -17.7,
+    "sharpe_ratio": 0.4,
+    "sortino_ratio": 0.4,
+    "total_trades": 1315,
+    "net_profit": 0.0,
+    "gross_profit": 0.0,
+    "gross_loss": 0.0,
+    "profit_factor": 0.0,
+    "win_rate": 0.0,
+    "recovery_factor": 0.0
+  },
+  "raw_metadata": {
+    "source": "strategy-comparisons/risk_parity/risk_parity_report_quantconnect.pdf",
+    "note": "PDF contains only summary statistics and charts; no trade table available. Stats extracted via OCR.",
+    "pdf_stats": {
+      "Runtime Days": 3287,
+      "Drawdown": "17.7%",
+      "Turnover": "1%",
+      "Probabilistic SR": "9%",
+      "CAGR": "7.6%",
+      "Capacity USD": "1B",
+      "Trades per Day": 0.4,
+      "Sharpe Ratio": 0.4,
+      "Sortino Ratio": 0.4,
+      "Information Ratio": 0.6
+    }
+  },
+  "source_path": null,
+  "source_hash": null,
+  "imported_at": "2026-06-24T20:15:29.230103",
+  "validation_status": "pending",
+  "allow_empty": true
+}

@@ -14,12 +14,19 @@ build/
 
 # IDE
 .idea/
-.vscode/
+.vscode/*
+!.vscode/mcp.json
+.obsidian/
+.pi/tau-instances/
+~/.pi/tau-instances/
 *.swp
 *.swo
 
-# Environment
+# Environment (.env.example allowed)
 .env
+*.env
+.env.*
+!*.env.example
 
 # OS
 .DS_Store
@@ -41,9 +48,22 @@ frontend/dist/
 !tests/fixtures/*.csv
 !tests/fixtures/*.json
 
-# Cache
+# Cache/temp
 .pytest_cache/
 .ruff_cache/
+.playwright-mcp
+temp/
+tmp/
 
 # uv
 uv.lock
+.accounts.env
+
+
+# graphify - keep graph outputs, skip heavy/local-only files
+
+graphify-out/.graphify_python
+graphify-out/.graphify_uncached.txt
+graphify-out/cache/
+graphify-out/manifest.json
+graphify-out/cost.json

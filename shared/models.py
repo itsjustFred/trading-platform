@@ -13,10 +13,13 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import asdict, dataclass, field, fields as dataclass_fields
-from datetime import date, datetime
+from dataclasses import dataclass, field
+from dataclasses import fields as dataclass_fields
+from datetime import datetime
+from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -35,6 +38,8 @@ class StrategyMeta(BaseModel):
     version: str = "1.0.0"
     parameters: dict[str, Any] = Field(default_factory=dict)
     tags: dict[str, Any] = Field(default_factory=dict)
+    source_url: str = ""
+    notes: str = ""
     # Tags structure:
     # {
     #     "type": ["mean-reversion", "momentum", "breakout"],
@@ -50,6 +55,10 @@ class StrategyMeta(BaseModel):
             d["parameters"] = self.parameters
         if self.tags:
             d["tags"] = self.tags
+        if self.source_url:
+            d["source_url"] = self.source_url
+        if self.notes:
+            d["notes"] = self.notes
         return d
 
     @classmethod
@@ -59,7 +68,212 @@ class StrategyMeta(BaseModel):
             version=d.get("version", "1.0.0"),
             parameters=d.get("parameters", {}),
             tags=d.get("tags", {}),
+            source_url=d.get("source_url", ""),
+            notes=d.get("notes", ""),
         )
+
+
+class StrategyType(str, Enum):
+    MARKET_DATA = "market_data"
+    SIGNAL_PROCESSOR = "signal_processor"
+
+
+# ─── Live trading models ─────────────────────────────────────────────────────
+
+
+class ServiceType(str, Enum):
+    DISCORD_BOT = "discord_bot"
+    SCHEDULED_JOB = "scheduled_job"
+
+
+class ServiceStatus(str, Enum):
+    RUNNING = "running"
+    PAUSED = "paused"
+    FAILED = "failed"
+    STOPPED = "stopped"
+
+
+class Service(BaseModel):
+    id: UUID = Field(default_factory=uuid4)
+    name: str
+    type: ServiceType
+    status: ServiceStatus
+    config: dict[str, Any] = Field(default_factory=dict)
+    last_activity: datetime | None = None
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class VerificationEvidenceStatus(str, Enum):
+    SUCCESS = "success"
+    FAILED = "failed"
+    PARTIAL = "partial"
+    SKIPPED = "skipped"
+
+
+class VerificationEvidenceRecord(BaseModel):
+    id: str
+    run_id: str
+    component: str
+    flow_name: str
+    category: str
+    status: VerificationEvidenceStatus
+    started_at: str = ""
+    finished_at: str = ""
+    duration_seconds: float | None = None
+    git_sha: str = ""
+    environment: str = ""
+    mode: str = ""
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    error_summary: str | None = None
+    evidence_ref: str | None = None
+    manual_validation_required: bool = False
+    source: str = ""
+    created_at: str = ""
+    updated_at: str = ""
+
+
+class VerificationEvidenceSummary(BaseModel):
+    component: str
+    flow_name: str
+    category: str
+    run_count: int
+    success_count: int
+    failed_count: int
+    partial_count: int
+    skipped_count: int
+    last_status: VerificationEvidenceStatus
+    last_run_at: str
+    last_success_at: str = ""
+    last_error: str = ""
+    latest_git_sha: str = ""
+    latest_environment: str = ""
+    latest_mode: str = ""
+    manual_validation_required: bool = False
+
+
+class LiveAccountConfig(BaseModel):
+    """Live account configuration stored in DB and used by API payloads."""
+
+    id: str
+    broker: Literal["alpaca", "ctrader"]
+    name: str = ""
+    broker_login: str | None = None
+    ctid: str | None = None
+
+
+class LiveAccount(BaseModel):
+    """Discovered broker account payload exposed to the frontend."""
+
+    id: str
+    name: str
+    broker: Literal["alpaca", "ctrader"]
+    balance: float = 0.0
+    is_demo: bool = False
+    broker_login: str | None = None
+    ctid: str | None = None
+
+
+class LiveDeploymentConfig(BaseModel):
+    """Live deployment record (strategy + account + market + runtime status)."""
+
+    id: UUID = Field(default_factory=uuid4)
+    strategy_name: str
+    account_id: str
+    symbols: list[str]
+    timeframe: str
+    status: Literal["ACTIVE", "PAUSED", "STOPPED"] = "ACTIVE"
+    signal_source_type: Literal["internal", "discord"] = "internal"
+    signal_source_id: str | None = None
+    symbol_filter: list[str] = Field(default_factory=list)
+    signal_source: Literal["internal", "discord"] = "internal"
+    signal_config: dict[str, Any] = Field(default_factory=dict)
+    settings: dict[str, Any] = Field(default_factory=dict)
+
+
+class LiveDeploymentCreateRequest(BaseModel):
+    """Payload for creating a live deployment via API."""
+
+    strategy_name: str = ""
+    account_id: str
+    symbols: list[str]
+    timeframe: str
+    signal_source_type: Literal["internal", "discord"] | None = None
+    signal_source_id: str | None = None
+    symbol_filter: list[str] = Field(default_factory=list)
+    signal_source: Literal["internal", "discord"] = "internal"
+    signal_config: dict[str, Any] = Field(default_factory=dict)
+    settings: dict[str, Any] = Field(default_factory=dict)
+
+
+class LiveDeploymentStatusUpdateRequest(BaseModel):
+    """Payload for updating a deployment runtime status via API."""
+
+    status: Literal["ACTIVE", "PAUSED", "STOPPED"]
+
+
+class LiveSignal(BaseModel):
+    """Intent emitted by strategy logic before broker execution."""
+
+    id: UUID = Field(default_factory=uuid4)
+    deployment_id: str
+    symbol: str
+    action: Literal["buy", "sell"]
+    theoretical_price: float
+    timestamp: datetime
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class LiveExecution(BaseModel):
+    """Execution fill received from broker for a previously emitted signal."""
+
+    id: UUID = Field(default_factory=uuid4)
+    signal_id: UUID
+    actual_price: float
+    filled_qty: float
+    commission: float
+    timestamp: datetime
+    broker_order_id: str
+    dedupe_key: str | None = None
+
+
+class LiveBalanceRecord(BaseModel):
+    """Periodic balance/equity snapshot for a live broker account."""
+
+    id: UUID = Field(default_factory=uuid4)
+    account_id: str
+    timestamp: datetime
+    balance: float
+    equity: float
+
+
+# ─── Portfolio models ──────────────────────────────────────────────────────────
+
+
+class PortfolioComponent(BaseModel):
+    """A weighted strategy component inside a multi-strategy portfolio."""
+
+    strategy_name: str = ""
+    symbol: str = ""
+    timeframe: str = "1h"
+    weight: float = 1.0
+    risk_config: dict[str, Any] = Field(default_factory=dict)
+    settings: dict[str, Any] = Field(default_factory=dict)
+    backtest_id: str | None = None
+
+
+class Portfolio(BaseModel):
+    """Persisted portfolio payload shared across API and storage layers."""
+
+    id: str
+    name: str = "Untitled"
+    created_at: str = ""
+    account_capital: float = 100_000.0
+    components: list[PortfolioComponent] = Field(default_factory=list)
+    combined_stats: dict[str, Any] = Field(default_factory=dict)
+    combined_equity: list[dict[str, Any]] = Field(default_factory=list)
+    strategy_contributions: list[dict[str, Any]] = Field(default_factory=list)
+    component_contributions: list[dict[str, Any]] = Field(default_factory=list)
+    trades: list[dict[str, Any]] = Field(default_factory=list)
 
 
 # ─── Timeframe constants ────────────────────────────────────────────────────
@@ -125,6 +339,10 @@ class Trade:
     pnl: float  # gross PnL (sum over all exits)
 
     # Optional fields
+    position_size: float | None = None
+    risk_amount: float | None = None
+    risk_percent: float | None = None
+    exit_reason: str | None = None
     pnl_pct: float | None = None
     fees: float | None = None  # total fees (entry + all exits)
     net_pnl: float | None = None
@@ -147,7 +365,19 @@ class Trade:
             "pnl": self.pnl,
         }
         # Only include optional fields if set
-        for fld in ("pnl_pct", "fees", "net_pnl", "r_multiple", "mae", "mfe", "holding_bars"):
+        for fld in (
+            "position_size",
+            "risk_amount",
+            "risk_percent",
+            "exit_reason",
+            "pnl_pct",
+            "fees",
+            "net_pnl",
+            "r_multiple",
+            "mae",
+            "mfe",
+            "holding_bars",
+        ):
             val = getattr(self, fld)
             if val is not None:
                 d[fld] = val
@@ -168,6 +398,10 @@ class Trade:
             quantity=d["quantity"],
             exits=[TradeExit.from_dict(e) for e in d["exits"]],
             pnl=d["pnl"],
+            position_size=d.get("position_size"),
+            risk_amount=d.get("risk_amount"),
+            risk_percent=d.get("risk_percent"),
+            exit_reason=d.get("exit_reason"),
             pnl_pct=d.get("pnl_pct"),
             fees=d.get("fees"),
             net_pnl=d.get("net_pnl"),
@@ -235,7 +469,7 @@ class BacktestMeta:
     #     "timeframes": ["1h"],         # oder ["1h", "1d"] für Multi-TF
     #     "symbols": ["AAPL", "MSFT"],
     #     "universe": "sp500" | "forex-majors" | "custom" | "",
-    #     "source": "yfinance" | "dukascopy" | "huggingface",
+    #     "source": "yfinance" | "dukascopy" | "huggingface" | "alpaca",
     # }
 
     # Capital

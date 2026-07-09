@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import json
 import math
+from itertools import combinations
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
 import optuna
 import pandas as pd
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from data_tools.auto_download import ensure_backtest_data
 from runner.cli import _detect_date_range
 from runner.engines.base import BacktestConfig
 from runner.engines.vectorbt_adapter import VectorbtAdapter
@@ -46,7 +48,9 @@ class OptimizationConfig(BaseModel):
     target_metric: str
     n_trials: int = Field(default=100, gt=0)
     train_split_pct: float = Field(default=0.7, gt=0.0, le=1.0)
-    parameter_ranges: dict[str, dict[str, Any]] = Field(default_factory=dict, min_length=1)
+    parameter_ranges: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    optimization_mode: str = "parameter"
+    symbol_universes: list[list[str]] = Field(default_factory=list)
 
     @field_validator("base_backtest_id", "target_metric")
     @classmethod
@@ -61,14 +65,41 @@ class OptimizationConfig(BaseModel):
     def _normalize_target_metric(cls, value: str) -> str:
         return value.strip().lower()
 
+    @field_validator("optimization_mode")
+    @classmethod
+    def _normalize_optimization_mode(cls, value: str) -> str:
+        normalized = str(value or "parameter").strip().lower()
+        if normalized not in {"parameter", "risk_parity_universe"}:
+            raise ValueError("optimization_mode must be 'parameter' or 'risk_parity_universe'")
+        return normalized
+
+    @field_validator("symbol_universes")
+    @classmethod
+    def _normalize_symbol_universes(cls, value: list[list[str]]) -> list[list[str]]:
+        normalized: list[list[str]] = []
+        seen: set[tuple[str, ...]] = set()
+        for raw_universe in value or []:
+            if not isinstance(raw_universe, list):
+                raise ValueError("symbol_universes must be a list of symbol lists")
+            universe = []
+            for raw_symbol in raw_universe:
+                symbol = str(raw_symbol or "").strip().upper()
+                if symbol and symbol not in universe:
+                    universe.append(symbol)
+            if len(universe) < 2:
+                raise ValueError("Each symbol universe must contain at least two symbols")
+            key = tuple(universe)
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized.append(universe)
+        return normalized
+
     @field_validator("parameter_ranges")
     @classmethod
     def _validate_parameter_ranges(
         cls, value: dict[str, dict[str, Any]]
     ) -> dict[str, dict[str, Any]]:
-        if not value:
-            raise ValueError("parameter_ranges must not be empty")
-
         normalized: dict[str, dict[str, Any]] = {}
         for name, spec in value.items():
             if not isinstance(spec, dict):
@@ -94,6 +125,14 @@ class OptimizationConfig(BaseModel):
                         f"Parameter {param_name!r} requires a non-empty 'choices' list"
                     )
         return normalized
+
+    @model_validator(mode="after")
+    def _validate_optimization_surface(self) -> "OptimizationConfig":
+        if not self.parameter_ranges and not self.symbol_universes and self.optimization_mode != "risk_parity_universe":
+            raise ValueError(
+                "Configure at least one parameter range or symbol universe for optimization"
+            )
+        return self
 
 
 def run_optimization(
@@ -129,10 +168,17 @@ def run_optimization(
 
     base_parameters = dict(base_result.meta.parameters or {})
     initial_capital = float(base_result.meta.initial_capital or 100_000.0)
+    candidate_universes = _candidate_symbol_universes(
+        configured_universes=config.symbol_universes,
+        base_symbols=symbols,
+        strategy_slug=strategy_slug,
+        optimization_mode=config.optimization_mode,
+    )
 
     _emit_progress(progress_callback, 0.0, "Starting Optuna optimization.")
 
     def objective(trial: optuna.Trial) -> float:
+        trial_symbols = _trial_symbols(trial, symbols, candidate_universes)
         trial_params = {
             param_name: _suggest_parameter(trial, param_name, spec)
             for param_name, spec in config.parameter_ranges.items()
@@ -143,7 +189,7 @@ def run_optimization(
         train_result = _run_vectorbt_backtest(
             BacktestConfig(
                 strategy_name=strategy_slug,
-                symbols=symbols,
+                symbols=trial_symbols,
                 timeframe=timeframe,
                 start_date=train_period["start"],
                 end_date=train_period["end"],
@@ -155,6 +201,7 @@ def run_optimization(
         train_stats = _canonical_stats(train_result)
         trial.set_user_attr("train_stats", _json_safe(train_stats))
         trial.set_user_attr("effective_parameters", _json_safe(combined_params))
+        trial.set_user_attr("symbols", _json_safe(trial_symbols))
         trial.set_user_attr("trade_count", len(train_result.trades))
 
         if not train_result.trades:
@@ -185,7 +232,12 @@ def run_optimization(
     study.optimize(objective, n_trials=config.n_trials, callbacks=[on_trial_complete])
 
     best_trial = study.best_trial
-    best_params = dict(study.best_params)
+    best_params = {
+        key: value
+        for key, value in dict(study.best_params).items()
+        if key != "symbol_universe"
+    }
+    best_symbols = list(best_trial.user_attrs.get("symbols") or symbols)
     effective_best_params = dict(base_parameters)
     effective_best_params.update(best_params)
     best_train_stats = dict(best_trial.user_attrs.get("train_stats") or {})
@@ -193,7 +245,7 @@ def run_optimization(
     test_result = _run_vectorbt_backtest(
         BacktestConfig(
             strategy_name=strategy_slug,
-            symbols=symbols,
+            symbols=best_symbols,
             timeframe=timeframe,
             start_date=test_period["start"],
             end_date=test_period["end"],
@@ -219,11 +271,14 @@ def run_optimization(
             "path": str(strategy_path),
         },
         "symbols": symbols,
+        "best_symbols": best_symbols,
         "timeframe": timeframe,
         "target_metric": config.target_metric,
         "n_trials": config.n_trials,
         "train_split_pct": config.train_split_pct,
+        "optimization_mode": config.optimization_mode,
         "parameter_ranges": _json_safe(config.parameter_ranges),
+        "symbol_universes": _json_safe(candidate_universes),
         "base_parameters": _json_safe(base_parameters),
         "best_params": _json_safe(best_params),
         "effective_best_parameters": _json_safe(effective_best_params),
@@ -331,9 +386,56 @@ def _suggest_parameter(trial: optuna.Trial, name: str, spec: dict[str, Any]) -> 
 
 
 def _run_vectorbt_backtest(config: BacktestConfig, strategy_path: Path) -> BacktestResult:
+    ensure_backtest_data(
+        symbols=config.symbols,
+        timeframe=config.timeframe,
+        start=config.start_date,
+        end=config.end_date,
+        data_dir=config.data_dir,
+        modeling_resolution=config.modeling_resolution,
+        log_callback=lambda message: None,
+    )
     result = VectorbtAdapter().run(config, str(strategy_path))
     result.stats = {**result.stats, **compute_stats_for_result(result)}
     return result
+
+
+def _candidate_symbol_universes(
+    *,
+    configured_universes: list[list[str]],
+    base_symbols: list[str],
+    strategy_slug: str,
+    optimization_mode: str,
+) -> list[list[str]]:
+    if configured_universes:
+        return [list(universe) for universe in configured_universes]
+    if optimization_mode != "risk_parity_universe" and strategy_slug != "risk_parity":
+        return []
+
+    symbols = []
+    for raw_symbol in base_symbols:
+        symbol = str(raw_symbol or "").strip().upper()
+        if symbol and symbol not in symbols:
+            symbols.append(symbol)
+    if len(symbols) < 2:
+        return []
+
+    universes: list[list[str]] = []
+    for size in range(2, len(symbols) + 1):
+        for combo in combinations(symbols, size):
+            universes.append(list(combo))
+    return universes
+
+
+def _trial_symbols(
+    trial: optuna.Trial,
+    base_symbols: list[str],
+    candidate_universes: list[list[str]],
+) -> list[str]:
+    if not candidate_universes:
+        return list(base_symbols)
+    universe_index = trial.suggest_categorical("symbol_universe", list(range(len(candidate_universes))))
+    return list(candidate_universes[int(universe_index)])
 
 
 def _canonical_stats(result: BacktestResult) -> dict[str, Any]:
@@ -383,6 +485,7 @@ def _top_trials_payload(
                 "effective_parameters": _json_safe(
                     dict(trial.user_attrs.get("effective_parameters") or {})
                 ),
+                "symbols": _json_safe(list(trial.user_attrs.get("symbols") or [])),
                 "trade_count": int(trial.user_attrs.get("trade_count", 0) or 0),
                 "penalty_applied": bool(trial.user_attrs.get("penalty_applied", False)),
                 "train_stats": _json_safe(dict(trial.user_attrs.get("train_stats") or {})),

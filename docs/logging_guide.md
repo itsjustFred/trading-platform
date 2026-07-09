@@ -22,7 +22,7 @@ Jeder Log-Eintrag ist eine JSON-Zeile:
 
 ```json
 {
-    "timestamp": "2026-02-25T14:30:22.123Z",
+    "timestamp": "2026-02-25 14:30:22",
     "level": "INFO",
     "service": "mein_service",
     "module": "main",
@@ -34,7 +34,7 @@ Mit `extra={"data": {...}}` wird ein `data`-Feld hinzugefügt:
 
 ```json
 {
-    "timestamp": "2026-02-25T14:30:22.123Z",
+    "timestamp": "2026-02-25 14:30:22",
     "level": "WARNING",
     "service": "mein_service",
     "module": "main",
@@ -48,11 +48,11 @@ Mit `extra={"data": {...}}` wird ein `data`-Feld hinzugefügt:
 | Env-Variable | Default | Beschreibung |
 |-------------|---------|--------------|
 | `LOG_LEVEL` | `INFO` | Minimum Log-Level (DEBUG, INFO, WARNING, ERROR, CRITICAL) |
-| `LOG_DIR` | `~/logs` | Verzeichnis für Log-Dateien |
+| `LOG_DIR` | `./logs` | Verzeichnis für Log-Dateien |
 
 ## File-Rotation
 
-- Jeder Service schreibt in `~/logs/<service>.log`
+- Jeder Service schreibt in `./logs/<service>.log` (oder in den per `LOG_DIR` gesetzten Pfad)
 - Rotation bei **10 MB**
 - Maximal **5 Backup-Dateien** (`service.log.1` bis `service.log.5`)
 - Das Verzeichnis wird automatisch angelegt
@@ -66,7 +66,7 @@ Um das Logging-Modul in stockkit einzubinden:
 Der `trading-platform`-Ordner muss im Python-Path sein:
 
 ```bash
-export PYTHONPATH="/home/ubuntu/Desktop/trading-platform:$PYTHONPATH"
+export PYTHONPATH="/path/to/trading-platform:$PYTHONPATH"
 ```
 
 Oder in der `.env` / Startskript des Bots.
@@ -80,6 +80,7 @@ logger = get_logger("stockkit")
 ```
 
 Das erzeugt `~/logs/stockkit.log` mit dem gleichen JSON-Format.
+Das erzeugt `./logs/stockkit.log` (oder `LOG_DIR/stockkit.log`) mit dem gleichen JSON-Format.
 
 ### 3. Bestehende print()-Aufrufe ersetzen
 
@@ -104,6 +105,6 @@ except Exception as e:
 
 | Service | Logger-Name | Log-Datei |
 |---------|------------|-----------|
-| Viewer | `viewer` | `~/logs/viewer.log` |
-| Runner | `runner` | `~/logs/runner.log` |
-| stockkit | `stockkit` | `~/logs/stockkit.log` (nach Einbindung) |
+| Viewer | `viewer` | `./logs/viewer.log` |
+| Runner | `runner` | `./logs/runner.log` |
+| stockkit | `stockkit` | `./logs/stockkit.log` (nach Einbindung) |

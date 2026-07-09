@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { useNavigate, useParams } from "react-router-dom";
+import { Link, useParams } from "react-router-dom";
 import { ArrowLeft, ArrowUpRight, Gauge, Layers3, Target } from "lucide-react";
 
 import { getBacktestInfo, getOptimization } from "../api/client";
@@ -35,9 +35,18 @@ function formatComparisonValue(key: string, value: number | string | boolean | n
   return value.toFixed(3);
 }
 
+function formatMode(value: string | null | undefined) {
+  const normalized = String(value || "parameter").replaceAll("_", " ");
+  return normalized.replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function formatSymbols(symbols: string[] | null | undefined) {
+  const cleaned = (symbols || []).map((symbol) => String(symbol || "").trim()).filter(Boolean);
+  return cleaned.length ? cleaned.join(", ") : "—";
+}
+
 export function OptimizationResultsPage() {
   const { id } = useParams<{ id: string }>();
-  const navigate = useNavigate();
   const [optimization, setOptimization] = useState<OptimizationDetail | null>(null);
   const [backtestInfo, setBacktestInfo] = useState<BacktestInfo | null>(null);
   const [loading, setLoading] = useState(true);
@@ -86,6 +95,14 @@ export function OptimizationResultsPage() {
           return <span style={{ color: "#7dd3fc", fontWeight: 700 }}>{value}</span>;
         },
       },
+      {
+        key: "symbols",
+        label: "Symbols",
+        render: (row: Record<string, unknown>) => {
+          const symbols = Array.isArray(row.symbols) ? row.symbols.map(String) : [];
+          return <span style={{ whiteSpace: "normal" }}>{formatSymbols(symbols)}</span>;
+        },
+      },
       ...parameterKeys.map((key) => ({
         key,
         label: key,
@@ -103,6 +120,7 @@ export function OptimizationResultsPage() {
       (optimization?.top_trials || []).map((trial) => ({
         trial_id: trial.number,
         metric_value: trial.value,
+        symbols: trial.symbols || [],
         trade_count: trial.trade_count,
         ...trial.params,
       })),
@@ -146,9 +164,8 @@ export function OptimizationResultsPage() {
         <div style={{ position: "relative", display: "grid", gap: "18px" }}>
           <div style={{ display: "flex", justifyContent: "space-between", gap: "16px", flexWrap: "wrap" }}>
             <div style={{ display: "grid", gap: "10px" }}>
-              <button
-                type="button"
-                onClick={() => navigate("/optimizations")}
+              <Link
+                to="/optimizations"
                 style={{
                   display: "inline-flex",
                   alignItems: "center",
@@ -158,11 +175,12 @@ export function OptimizationResultsPage() {
                   color: "var(--color-text-muted)",
                   cursor: "pointer",
                   padding: 0,
+                  textDecoration: "none",
                 }}
               >
                 <ArrowLeft size={16} />
                 Back to optimizations
-              </button>
+              </Link>
               <div
                 style={{
                   display: "inline-flex",
@@ -190,13 +208,12 @@ export function OptimizationResultsPage() {
                 {backtestInfo?.title || backtestInfo?.strategy_display_name || optimization.base_backtest_id}
               </h1>
               <div style={{ color: "var(--color-text-muted)", lineHeight: 1.6 }}>
-                {optimization.n_trials} trials • {optimization.symbols.join(", ")} • {optimization.timeframe} • created {new Date(optimization.created_at).toLocaleString("en-US")}
+                {optimization.n_trials} trials • {formatSymbols(optimization.best_symbols || optimization.symbols)} • {optimization.timeframe} • created {new Date(optimization.created_at).toLocaleString("en-US")}
               </div>
             </div>
             <div style={{ display: "flex", gap: "10px", flexWrap: "wrap", alignItems: "flex-start" }}>
-              <button
-                type="button"
-                onClick={() => navigate(`/backtests/${optimization.base_backtest_id}`)}
+              <Link
+                to={`/backtests/${optimization.base_backtest_id}`}
                 style={{
                   display: "inline-flex",
                   alignItems: "center",
@@ -207,17 +224,19 @@ export function OptimizationResultsPage() {
                   color: "#bfdbfe",
                   padding: "12px 16px",
                   cursor: "pointer",
+                  textDecoration: "none",
                 }}
               >
                 Open base backtest
                 <ArrowUpRight size={15} />
-              </button>
+              </Link>
             </div>
           </div>
 
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: "12px" }}>
             {[
               { label: "Best score", value: formatComparisonValue(optimization.target_metric, optimization.best_value), tone: "#7dd3fc" },
+              { label: "Mode", value: formatMode(optimization.optimization_mode), tone: "#c4b5fd" },
               { label: "Train split", value: `${Math.round(optimization.train_split_pct * 100)}%`, tone: "#fbbf24" },
               { label: "OOS window", value: `${optimization.test_period.start.slice(0, 10)} → ${optimization.test_period.end.slice(0, 10)}`, tone: "#86efac" },
             ].map((item) => (
@@ -240,6 +259,66 @@ export function OptimizationResultsPage() {
             ))}
           </div>
         </div>
+      </section>
+
+      <section
+        style={{
+          borderRadius: "22px",
+          border: "1px solid rgba(148, 163, 184, 0.16)",
+          background: "linear-gradient(180deg, rgba(15, 23, 42, 0.96), rgba(2, 6, 23, 0.94))",
+          padding: "18px",
+        }}
+      >
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))", gap: "14px" }}>
+          {[
+            { label: "Base symbols", value: formatSymbols(optimization.symbols), tone: "#93c5fd" },
+            { label: "Best symbols", value: formatSymbols(optimization.best_symbols || optimization.symbols), tone: "#86efac" },
+            {
+              label: "Candidate universes",
+              value: `${optimization.symbol_universes?.length || 0}`,
+              tone: "#fbbf24",
+            },
+          ].map((item) => (
+            <div
+              key={item.label}
+              style={{
+                borderRadius: "16px",
+                border: "1px solid rgba(148, 163, 184, 0.12)",
+                background: "rgba(15, 23, 42, 0.78)",
+                padding: "14px",
+                minWidth: 0,
+              }}
+            >
+              <div style={{ fontSize: "0.72rem", textTransform: "uppercase", letterSpacing: "0.12em", color: item.tone }}>
+                {item.label}
+              </div>
+              <div style={{ marginTop: "8px", color: "#e2e8f0", lineHeight: 1.5, wordBreak: "break-word" }}>
+                {item.value}
+              </div>
+            </div>
+          ))}
+        </div>
+        {(optimization.symbol_universes?.length || 0) > 0 ? (
+          <div style={{ marginTop: "14px", display: "flex", flexWrap: "wrap", gap: "8px" }}>
+            {(optimization.symbol_universes || []).slice(0, 12).map((universe, index) => (
+              <span
+                key={`${index}-${universe.join("-")}`}
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  padding: "8px 10px",
+                  borderRadius: "999px",
+                  border: "1px solid rgba(148, 163, 184, 0.14)",
+                  background: "rgba(148, 163, 184, 0.1)",
+                  color: "#cbd5e1",
+                  fontSize: "0.78rem",
+                }}
+              >
+                {formatSymbols(universe)}
+              </span>
+            ))}
+          </div>
+        ) : null}
       </section>
 
       <section
