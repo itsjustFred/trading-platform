@@ -22,6 +22,7 @@ import type {
   LivePositionsResponse,
   LiveQuoteResponse,
   LiveDeploymentStatus,
+  LiveDashboardResponse,
   Service,
   ServiceStatus,
   ServiceType,
@@ -296,6 +297,8 @@ export const getLiveBalances = (accountId: string) =>
   fetchJSON<LiveBalancesResponse>(`/live/balances/${encodeURIComponent(accountId)}`);
 export const getLiveTrades = (accountId: string) =>
   fetchJSON<LiveTradesResponse>(`/live/trades/${encodeURIComponent(accountId)}`);
+export const getLiveDashboard = () =>
+  fetchJSON<LiveDashboardResponse>("/live/dashboard");
 export const getLiveQuote = (symbol: string) =>
   fetchJSON<LiveQuoteResponse>(`/live/quotes/${encodeURIComponent(symbol)}`);
 export const getLivePositions = (accountId: string) =>

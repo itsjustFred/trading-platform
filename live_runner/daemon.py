@@ -19,6 +19,10 @@ from live_runner.ctrader_adapter import CTraderAuthTerminalError, CTraderLiveAda
 from live_runner.service_discovery import discover_discord_bots_from_env
 from live_runner.signal_sources import DiscordSignalSource, wait_for_candle_close
 from live_runner.signal_sources.discord_source import DiscordAuthenticationError
+from live_runner.stockkit_routing import (
+    infer_stockkit_route,
+    validate_stockkit_deployment_route,
+)
 from risk import RiskConfig, RiskEngine, TradeSignal
 from scheduler.scheduler import ServiceScheduler
 from shared.database import (
@@ -338,6 +342,36 @@ def _deployment_signal_processor_name(deployment: LiveDeploymentConfig) -> str:
     ).strip().lower()
 
 
+def _deployment_matches_stockkit_route(
+    deployment: LiveDeploymentConfig,
+    signal_metadata: Mapping[str, object],
+) -> bool:
+    route = infer_stockkit_route(
+        signal_source_id=deployment.signal_source_id,
+        signal_config=deployment.signal_config,
+        settings=deployment.settings,
+        metadata=signal_metadata,
+    )
+    if not route:
+        return True
+    try:
+        validate_stockkit_deployment_route(deployment)
+    except ValueError as exc:
+        logger.warning(
+            "Blocking misrouted StockKit deployment",
+            extra={
+                "data": {
+                    "deployment_id": str(deployment.id),
+                    "account_id": deployment.account_id,
+                    "error": str(exc),
+                }
+            },
+        )
+        return False
+    signal_route = infer_stockkit_route(metadata=signal_metadata)
+    return not signal_route or signal_route == route
+
+
 def _build_processor_market_data(
     signal: TradeSignal,
     *,
@@ -605,6 +639,8 @@ async def _run_discord_signal_listener_for_account(
                 continue
 
             for deployment in deployments_for_channel:
+                if not _deployment_matches_stockkit_route(deployment, trade_signal.metadata):
+                    continue
                 deployment_symbols = {item.upper() for item in deployment.symbols}
                 if deployment_symbols and trade_signal.symbol.upper() not in deployment_symbols:
                     continue

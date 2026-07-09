@@ -1351,6 +1351,9 @@ def get_live_deployment(deployment_id: str) -> LiveDeploymentConfig | None:
 
 
 def create_live_deployment(deployment: LiveDeploymentConfig) -> LiveDeploymentConfig:
+    from live_runner.stockkit_routing import validate_stockkit_deployment_route
+
+    validate_stockkit_deployment_route(deployment)
     init_db()
     with get_session() as session:
         account = session.get(LiveAccountModel, deployment.account_id)

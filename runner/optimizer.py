@@ -16,6 +16,7 @@ from data_tools.auto_download import ensure_backtest_data
 from runner.cli import _detect_date_range
 from runner.engines.base import BacktestConfig
 from runner.engines.vectorbt_adapter import VectorbtAdapter
+from runner.risk_parity_optimizer import select_best_risk_parity_universe
 from runner.stats import compute_stats_for_result
 from shared.constants import DATA_DIR, OPTIMIZATIONS_DIR
 from shared.models import BacktestResult
@@ -82,8 +83,11 @@ class OptimizationConfig(BaseModel):
     @classmethod
     def _normalize_optimization_mode(cls, value: str) -> str:
         normalized = str(value or "parameter").strip().lower()
-        if normalized not in {"parameter", "risk_parity_universe"}:
-            raise ValueError("optimization_mode must be 'parameter' or 'risk_parity_universe'")
+        if normalized not in {"parameter", "risk_parity_universe", "risk_parity_covariance"}:
+            raise ValueError(
+                "optimization_mode must be 'parameter', 'risk_parity_universe', "
+                "or 'risk_parity_covariance'"
+            )
         return normalized
 
     @field_validator("symbol_universes")
@@ -141,7 +145,11 @@ class OptimizationConfig(BaseModel):
 
     @model_validator(mode="after")
     def _validate_optimization_surface(self) -> "OptimizationConfig":
-        if not self.parameter_ranges and not self.symbol_universes and self.optimization_mode != "risk_parity_universe":
+        if (
+            not self.parameter_ranges
+            and not self.symbol_universes
+            and self.optimization_mode not in {"risk_parity_universe", "risk_parity_covariance"}
+        ):
             raise ValueError(
                 "Configure at least one parameter range or symbol universe for optimization"
             )
@@ -187,6 +195,23 @@ def run_optimization(
         strategy_slug=strategy_slug,
         optimization_mode=config.optimization_mode,
     )
+
+    if config.optimization_mode == "risk_parity_covariance":
+        return _run_risk_parity_covariance_optimization(
+            config=config,
+            base_result=base_result,
+            strategy_identifier=strategy_identifier,
+            strategy_path=strategy_path,
+            strategy_slug=strategy_slug,
+            symbols=symbols,
+            candidate_universes=candidate_universes,
+            timeframe=timeframe,
+            initial_capital=initial_capital,
+            train_period=train_period,
+            test_period=test_period,
+            base_parameters=base_parameters,
+            progress_callback=progress_callback,
+        )
 
     _emit_progress(progress_callback, 0.0, "Starting Optuna optimization.")
 
@@ -422,7 +447,10 @@ def _candidate_symbol_universes(
 ) -> list[list[str]]:
     if configured_universes:
         return [list(universe) for universe in configured_universes]
-    if optimization_mode != "risk_parity_universe" and strategy_slug != "risk_parity":
+    if (
+        optimization_mode not in {"risk_parity_universe", "risk_parity_covariance"}
+        and strategy_slug != "risk_parity"
+    ):
         return []
 
     symbols = []
@@ -459,6 +487,174 @@ def _trial_symbols(
         _INTERNAL_SYMBOL_UNIVERSE_PARAM, list(range(len(candidate_universes)))
     )
     return list(candidate_universes[int(universe_index)])
+
+
+def _run_risk_parity_covariance_optimization(
+    *,
+    config: OptimizationConfig,
+    base_result: BacktestResult,
+    strategy_identifier: str,
+    strategy_path: Path,
+    strategy_slug: str,
+    symbols: list[str],
+    candidate_universes: list[list[str]],
+    timeframe: str,
+    initial_capital: float,
+    train_period: dict[str, str],
+    test_period: dict[str, str],
+    base_parameters: dict[str, Any],
+    progress_callback: ProgressCallback | None,
+) -> dict[str, Any]:
+    _emit_progress(progress_callback, 5.0, "Loading asset return history for risk parity.")
+    returns_frame = _asset_returns_frame_from_base_result(base_result)
+    if returns_frame.empty or len(returns_frame.columns) < 2:
+        returns_frame = _asset_returns_frame_from_market_data(
+            symbols=symbols,
+            timeframe=timeframe,
+            start=train_period["start"],
+            end=train_period["end"],
+            data_dir=str(base_result.meta.data.get("data_dir") or ""),
+        )
+    if returns_frame.empty or len(returns_frame.columns) < 2:
+        raise ValueError("Risk parity covariance optimization requires at least two asset return series")
+
+    _emit_progress(progress_callback, 35.0, "Solving covariance risk parity weights.")
+    selection = select_best_risk_parity_universe(
+        returns_frame,
+        candidate_universes or None,
+    )
+    best_symbols = list(selection["best_symbols"])
+    effective_best_params = dict(base_parameters)
+    effective_best_params["asset_weights"] = dict(selection["best_weights"])
+    effective_best_params["risk_parity_weights"] = dict(selection["best_weights"])
+
+    _emit_progress(progress_callback, 70.0, "Running OOS backtest for selected risk parity universe.")
+    test_result = _run_vectorbt_backtest(
+        BacktestConfig(
+            strategy_name=strategy_slug,
+            symbols=best_symbols,
+            timeframe=timeframe,
+            start_date=test_period["start"],
+            end_date=test_period["end"],
+            initial_capital=initial_capital,
+            parameters=effective_best_params,
+        ),
+        strategy_path,
+    )
+    test_stats = _canonical_stats(test_result)
+
+    now = datetime.now(timezone.utc)
+    optimization_id = f"rp_cov_{config.base_backtest_id}_{now.strftime('%Y%m%d_%H%M%S')}"
+    output_path = OPTIMIZATIONS_DIR / f"{optimization_id}.json"
+    payload = {
+        "id": optimization_id,
+        "file": output_path.name,
+        "created_at": now.isoformat(),
+        "engine": "vectorbt",
+        "base_backtest_id": config.base_backtest_id,
+        "strategy": {
+            "identifier": strategy_identifier,
+            "slug": strategy_slug,
+            "path": str(strategy_path),
+        },
+        "symbols": symbols,
+        "best_symbols": best_symbols,
+        "timeframe": timeframe,
+        "target_metric": "risk_parity_score",
+        "n_trials": 0,
+        "train_split_pct": config.train_split_pct,
+        "optimization_mode": config.optimization_mode,
+        "parameter_ranges": _json_safe(config.parameter_ranges),
+        "symbol_universes": _json_safe(candidate_universes),
+        "base_parameters": _json_safe(base_parameters),
+        "best_params": {},
+        "effective_best_parameters": _json_safe(effective_best_params),
+        "best_value": _safe_float_or_none(selection["best_score"]),
+        "train_period": train_period,
+        "test_period": test_period,
+        "train_stats": {
+            "risk_parity_score": selection["best_score"],
+            "risk_parity_sharpe": selection["best_sharpe"],
+            "risk_parity_volatility": selection["best_volatility"],
+            "diversification_ratio": selection["best_diversification_ratio"],
+            "avg_abs_correlation": selection["best_avg_abs_correlation"],
+        },
+        "test_stats": _json_safe(test_stats),
+        "risk_parity": _json_safe(selection),
+        "top_trials": [],
+    }
+
+    OPTIMIZATIONS_DIR.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(_json_safe(payload), indent=2), encoding="utf-8")
+    _emit_progress(progress_callback, 100.0, f"Risk parity optimization finished: {output_path.name}")
+    return payload
+
+
+def _asset_returns_frame_from_base_result(result: BacktestResult) -> pd.DataFrame:
+    by_symbol: dict[str, list[tuple[pd.Timestamp, float]]] = {}
+    for trade in result.trades:
+        symbol = str(trade.symbol or "").strip().upper()
+        if not symbol:
+            continue
+        timestamp = pd.to_datetime(trade.entry_time, utc=True, errors="coerce")
+        if pd.isna(timestamp):
+            continue
+        by_symbol.setdefault(symbol, []).append((pd.Timestamp(timestamp), float(trade.pnl or 0.0)))
+    series: dict[str, pd.Series] = {}
+    for symbol, rows in by_symbol.items():
+        if len(rows) < 2:
+            continue
+        frame = pd.DataFrame(rows, columns=["time", "pnl"]).sort_values("time")
+        equity = float(result.meta.initial_capital or 100_000.0) + frame["pnl"].cumsum()
+        returns = equity.pct_change().fillna(0.0)
+        series[symbol] = pd.Series(returns.to_numpy(), index=frame["time"])
+    if len(series) < 2:
+        return pd.DataFrame()
+    return pd.DataFrame(series).sort_index().fillna(0.0)
+
+
+def _asset_returns_frame_from_market_data(
+    *,
+    symbols: list[str],
+    timeframe: str,
+    start: str,
+    end: str,
+    data_dir: str,
+) -> pd.DataFrame:
+    ensure_backtest_data(
+        symbols=symbols,
+        timeframe=timeframe,
+        start=start,
+        end=end,
+        data_dir=data_dir,
+        modeling_resolution="open_close",
+        log_callback=lambda message: None,
+    )
+    root = Path(data_dir) / "ohlcv" if data_dir else DATA_DIR / "ohlcv"
+    series: dict[str, pd.Series] = {}
+    start_ts = pd.to_datetime(start, utc=True, errors="coerce")
+    end_ts = pd.to_datetime(end, utc=True, errors="coerce")
+    for symbol in symbols:
+        path = next(root.rglob(f"**/{symbol}/{timeframe}.parquet"), None)
+        if path is None:
+            continue
+        frame = pd.read_parquet(path)
+        if "timestamp" not in frame.columns or "close" not in frame.columns:
+            continue
+        timestamps = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
+        close = pd.to_numeric(frame["close"], errors="coerce")
+        asset = pd.DataFrame({"time": timestamps, "close": close}).dropna()
+        if not pd.isna(start_ts):
+            asset = asset[asset["time"] >= start_ts]
+        if not pd.isna(end_ts):
+            asset = asset[asset["time"] <= end_ts]
+        if len(asset) < 3:
+            continue
+        asset = asset.sort_values("time").drop_duplicates("time", keep="last")
+        series[str(symbol).upper()] = asset.set_index("time")["close"].pct_change().fillna(0.0)
+    if len(series) < 2:
+        return pd.DataFrame()
+    return pd.DataFrame(series).sort_index().fillna(0.0)
 
 
 def _canonical_stats(result: BacktestResult) -> dict[str, Any]:

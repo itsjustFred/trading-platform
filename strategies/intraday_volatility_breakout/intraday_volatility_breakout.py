@@ -17,10 +17,12 @@ Logic:
 
 import numpy as np
 import pandas as pd
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 STRATEGY_META = {
     "name": "intraday_volatility_breakout",
     "version": "1.0.0",
+    "engine": "native",
     "parameters": {
         "atr_period": 5,
         "atr_multiplier": 0.25,
@@ -37,6 +39,9 @@ STRATEGY_META = {
         "entry_time": "16:30",
         "max_entry_time": "18:05",
         "exit_time": "22:55",
+        "session_timezone": "",
+        "session_timezone_offset_hours": 0,
+        "evaluate_on_confirmation_bar": True,
         "magic_number": 123456,
     },
     "tags": {
@@ -71,6 +76,34 @@ def _parse_minutes(value: str) -> int:
     return int(hour) * 60 + int(minute)
 
 
+def _normalize_regime_filter_mode(value) -> str:
+    normalized = str(value).strip().lower()
+    if normalized in {"0", "low", "low_volatility", "low_volatility_filter"}:
+        return "low"
+    if normalized in {"1", "high", "high_volatility", "high_volatility_filter"}:
+        return "high"
+    return normalized
+
+
+def _normalize_trade_direction(value) -> str:
+    normalized = str(value).strip().lower()
+    if normalized in {"0", "both", "all"}:
+        return "both"
+    if normalized in {"1", "long", "long_only", "buy"}:
+        return "long_only"
+    if normalized in {"2", "-1", "short", "short_only", "sell"}:
+        return "short_only"
+    return normalized
+
+
+def _mt5_atr(true_range: pd.Series, period: int) -> pd.Series:
+    period = max(1, int(period))
+    values = pd.to_numeric(true_range, errors="coerce").astype(float)
+    if period == 1:
+        return values.copy()
+    return values.ewm(alpha=1.0 / period, adjust=False, min_periods=1).mean()
+
+
 def generate_signals(df: pd.DataFrame, params: dict):
     # --- Parameter extraction ------------------------------------------------
     atr_period = int(params.get("atr_period", params.get("ATR_Period", 5)))
@@ -98,15 +131,15 @@ def generate_signals(df: pd.DataFrame, params: dict):
     atr_regime_factor = float(
         params.get("atr_regime_factor", params.get("ATR_Regime_Factor", 1.0))
     )
-    regime_filter_mode = str(
+    regime_filter_mode = _normalize_regime_filter_mode(
         params.get(
             "regime_filter_mode",
             params.get("Regime_Filter_Mode", "low"),
         )
-    ).lower()
-    trade_direction = str(
+    )
+    trade_direction = _normalize_trade_direction(
         params.get("trade_direction", params.get("Trade_Direction", "both"))
-    ).lower()
+    )
     reverse_mode = bool(
         params.get("reverse_mode", params.get("Reverse_Mode", False))
     )
@@ -115,19 +148,57 @@ def generate_signals(df: pd.DataFrame, params: dict):
         params.get("max_entry_time", params.get("Max_Entry_Time", "18:05"))
     )
     exit_time = str(params.get("exit_time", params.get("Exit_Time", "22:55")))
+    session_timezone = str(
+        params.get(
+            "session_timezone",
+            params.get("Session_Timezone", ""),
+        )
+        or ""
+    ).strip()
+    session_timezone_offset_hours = float(
+        params.get(
+            "session_timezone_offset_hours",
+            params.get("Session_Timezone_Offset_Hours", 0),
+        )
+    )
+    evaluate_on_confirmation_bar = bool(
+        params.get(
+            "evaluate_on_confirmation_bar",
+            params.get("Evaluate_On_Confirmation_Bar", True),
+        )
+    )
 
     close = df["close"]
     open_ = df["open"]
     idx = df.index
 
+    def _to_session_time(values):
+        converted = pd.to_datetime(values, utc=True, errors="coerce")
+        if session_timezone:
+            try:
+                return converted.dt.tz_convert(ZoneInfo(session_timezone))
+            except (ZoneInfoNotFoundError, TypeError, AttributeError):
+                pass
+        return converted + pd.to_timedelta(session_timezone_offset_hours, unit="h")
+
+    def _index_to_session_time(values):
+        converted = pd.DatetimeIndex(pd.to_datetime(values, utc=True, errors="coerce"))
+        if session_timezone:
+            try:
+                return converted.tz_convert(ZoneInfo(session_timezone))
+            except ZoneInfoNotFoundError:
+                pass
+        return converted + pd.to_timedelta(session_timezone_offset_hours, unit="h")
+
     # --- Time features -------------------------------------------------------
     if "timestamp" in df.columns:
-        ts = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
-        day = pd.Series(ts.dt.date.values, index=idx)
-        minute_of_day = pd.Series(ts.dt.hour * 60 + ts.dt.minute, index=idx)
+        session_ts = _to_session_time(df["timestamp"])
+        day = pd.Series(session_ts.dt.date.values, index=idx)
+        minute_of_day = pd.Series(session_ts.dt.hour * 60 + session_ts.dt.minute, index=idx)
     elif hasattr(idx, "hour"):
-        day = pd.Series(idx.date, index=idx)
-        minute_of_day = pd.Series(idx.hour * 60 + idx.minute, index=idx)
+        session_idx = _index_to_session_time(idx)
+        day = pd.Series(session_idx.date, index=idx)
+        minute_of_day = pd.Series(session_idx.hour * 60 + session_idx.minute, index=idx)
     else:
         # Fallback: synthetic day every 100 bars
         day = pd.Series(range(len(df)) // 100, index=idx)
@@ -143,11 +214,33 @@ def generate_signals(df: pd.DataFrame, params: dict):
 
     def _to_datetime_index():
         if "timestamp" in df.columns:
-            return pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
-        return idx
+            return _to_session_time(df["timestamp"])
+        return _index_to_session_time(idx)
 
     # --- Daily indicators (resample to D1, shift 1, ffill) ------------------
-    if _has_datetime_index():
+    daily_ohlcv = params.get("daily_ohlcv")
+    if isinstance(daily_ohlcv, pd.DataFrame) and not daily_ohlcv.empty:
+        daily_frame = daily_ohlcv.copy()
+        daily_frame.columns = [str(col).lower() for col in daily_frame.columns]
+        daily_ts = pd.to_datetime(daily_frame.get("timestamp"), utc=True, errors="coerce")
+        if daily_ts.isna().all():
+            daily_ts = pd.to_datetime(daily_frame.index, utc=True, errors="coerce")
+        daily_idx = _index_to_session_time(daily_ts).normalize()
+        daily = pd.DataFrame(
+            {
+                "open": pd.to_numeric(daily_frame["open"], errors="coerce").values,
+                "high": pd.to_numeric(daily_frame["high"], errors="coerce").values,
+                "low": pd.to_numeric(daily_frame["low"], errors="coerce").values,
+                "close": pd.to_numeric(daily_frame["close"], errors="coerce").values,
+            },
+            index=daily_idx,
+        ).dropna()
+        daily = daily.groupby(level=0).last().sort_index()
+        align_index = _to_datetime_index() if _has_datetime_index() else pd.Index(day.values)
+
+        def _ffill_daily(daily_series):
+            return daily_series.reindex(align_index, method="ffill").values
+    elif _has_datetime_index():
         dt_idx = _to_datetime_index()
         temp_df = pd.DataFrame(
             {"open": open_.values, "high": df["high"].values, "low": df["low"].values, "close": close.values},
@@ -184,9 +277,9 @@ def generate_signals(df: pd.DataFrame, params: dict):
         axis=1,
     ).max(axis=1)
 
-    daily_atr = tr_daily.rolling(atr_period, min_periods=1).mean().shift(1)
-    daily_atr_short = tr_daily.rolling(atr_short_period, min_periods=1).mean().shift(1)
-    daily_atr_long = tr_daily.rolling(atr_long_period, min_periods=1).mean().shift(1)
+    daily_atr = _mt5_atr(tr_daily, atr_period).shift(1)
+    daily_atr_short = _mt5_atr(tr_daily, atr_short_period).shift(1)
+    daily_atr_long = _mt5_atr(tr_daily, atr_long_period).shift(1)
 
     daily_atr_ffill = pd.Series(_ffill_daily(daily_atr), index=idx)
     daily_atr_short_ffill = pd.Series(_ffill_daily(daily_atr_short), index=idx)
@@ -226,6 +319,14 @@ def generate_signals(df: pd.DataFrame, params: dict):
             signal_price_long = conf_close.reindex(signal_sr.index, method="ffill")
             signal_price_long = pd.Series(signal_price_long.values, index=idx)
             signal_price_short = signal_price_long
+            if evaluate_on_confirmation_bar:
+                conf_bar = signal_sr.resample(conf_freq).last()
+                confirmation_eval_mask = pd.Series(
+                    signal_sr.index.isin(conf_bar.index),
+                    index=idx,
+                )
+            else:
+                confirmation_eval_mask = pd.Series(True, index=idx)
             # Fallback when data resolution is the same as or coarser than
             # confirmation timeframe (e.g. H1 data with 15m confirmation).
             # In that case the resampled Series only has values at :00 and
@@ -233,19 +334,22 @@ def generate_signals(df: pd.DataFrame, params: dict):
             if signal_price_long.isna().all():
                 signal_price_long = close.shift(1)
                 signal_price_short = signal_price_long
+                confirmation_eval_mask = pd.Series(True, index=idx)
         except Exception:
             signal_price_long = close.shift(1)
             signal_price_short = signal_price_long
+            confirmation_eval_mask = pd.Series(True, index=idx)
     else:
         signal_price_long = df["high"]
         signal_price_short = df["low"]
+        confirmation_eval_mask = pd.Series(True, index=idx)
 
     # --- Entry window --------------------------------------------------------
     in_entry_window = (minute_of_day >= entry_minute) & (minute_of_day < max_entry_minute)
 
     # --- Raw entry candidates ------------------------------------------------
-    long_candidates = in_entry_window & regime_ok & (signal_price_long >= upper_level)
-    short_candidates = in_entry_window & regime_ok & (signal_price_short <= lower_level)
+    long_candidates = in_entry_window & confirmation_eval_mask & regime_ok & (signal_price_long >= upper_level)
+    short_candidates = in_entry_window & confirmation_eval_mask & regime_ok & (signal_price_short <= lower_level)
 
     # Trade direction
     if trade_direction == "long_only":
@@ -271,16 +375,29 @@ def generate_signals(df: pd.DataFrame, params: dict):
     both_hit = long_entries & short_entries
     short_entries = short_entries & ~both_hit
 
-    entries = long_entries | short_entries
+    # The MQL5 EA evaluates a just-closed confirmation candle at the first tick
+    # of the next confirmation bar, then submits a market order immediately.
+    # The platform engines execute strategy signals on the next bar open, so
+    # candle-close entries are emitted one source bar earlier to land on the
+    # same execution timestamp as MT5 for M1/M15 data.
+    signal_long_entries = long_entries
+    signal_short_entries = short_entries
+    if use_candle_close:
+        signal_long_entries = long_entries.shift(-1, fill_value=False).astype(bool)
+        signal_short_entries = short_entries.shift(-1, fill_value=False).astype(bool)
+
+    entries = signal_long_entries | signal_short_entries
 
     # --- Direction & sl_price per entry --------------------------------------
     direction = pd.Series(index=idx, dtype=object)
-    direction.loc[long_entries] = "LONG"
-    direction.loc[short_entries] = "SHORT"
+    direction.loc[signal_long_entries] = "LONG"
+    direction.loc[signal_short_entries] = "SHORT"
 
-    sl_price = pd.Series(np.nan, index=idx)
-    sl_price.loc[long_entries] = (close - stop_distance).loc[long_entries]
-    sl_price.loc[short_entries] = (close + stop_distance).loc[short_entries]
+    long_sl_price = (close - stop_distance).where(long_entries)
+    short_sl_price = (close + stop_distance).where(short_entries)
+    sl_price = long_sl_price.combine_first(short_sl_price)
+    if use_candle_close:
+        sl_price = sl_price.shift(-1)
 
     # --- Exits (time exit + EOD safety net) ----------------------------------
     exit_time_mask = minute_of_day >= exit_minute
@@ -297,6 +414,7 @@ def generate_signals(df: pd.DataFrame, params: dict):
         "lower_level": lower_level,
         "regime_ok": regime_ok,
         "entry_open": entry_open,
+        "direction": direction,
         "sl_price": sl_price,
     }
 

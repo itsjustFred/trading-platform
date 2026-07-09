@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+"""Regenerate the platform artifact for the QuantConnect RiskParityStrategy report."""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from shared.constants import DATA_DIR
+from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, TradeExit
+from scripts import run_risk_parity_backtest as risk_parity
+
+DEFAULT_OUTPUT = Path("data/backtests/risk_parity_quantconnect_reimplementation.json")
+DEFAULT_SOURCE = Path("ohlcv/yfinance/equity/US")
+
+
+def _load_local_prices(data_dir: Path, source: Path, start: str, end: str) -> pd.DataFrame:
+    root = data_dir / source
+    columns: dict[str, pd.Series] = {}
+    start_ts = pd.Timestamp(start, tz="UTC")
+    end_ts = pd.Timestamp(end, tz="UTC")
+
+    for ticker in risk_parity.TICKERS:
+        path = root / ticker / "1d.parquet"
+        if not path.exists():
+            raise FileNotFoundError(f"Missing local Risk Parity data for {ticker}: {path}")
+        frame = pd.read_parquet(path)
+        frame.columns = [str(col).lower() for col in frame.columns]
+        required = {"timestamp", "close"}
+        missing = required.difference(frame.columns)
+        if missing:
+            raise ValueError(f"{path} missing columns: {', '.join(sorted(missing))}")
+        timestamps = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
+        closes = pd.to_numeric(frame["close"], errors="coerce")
+        series = pd.Series(closes.values, index=timestamps).dropna().sort_index()
+        series = series[(series.index >= start_ts) & (series.index <= end_ts)]
+        if series.empty:
+            raise ValueError(f"No usable local Risk Parity rows for {ticker}: {path}")
+        columns[ticker] = series
+
+    prices = pd.DataFrame(columns).dropna(how="all")
+    prices.index = prices.index.tz_convert(None)
+    return prices
+
+
+def _to_iso(value: Any) -> str:
+    ts = pd.Timestamp(value)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    else:
+        ts = ts.tz_convert("UTC")
+    return ts.isoformat()
+
+
+def _build_result(result: dict[str, Any], prices: pd.DataFrame, *, start: str, end: str, output: Path, source: Path) -> BacktestResult:
+    trades: list[Trade] = []
+    for idx, raw in enumerate(result["trades"], start=1):
+        entry_price = float(raw["entry_price"])
+        exit_price = raw.get("exit_price")
+        if exit_price is None:
+            exit_price = entry_price
+        pnl = float(raw.get("pnl") or 0.0)
+        quantity = float(raw.get("quantity") or 0.0)
+        trades.append(
+            Trade(
+                id=idx,
+                symbol=str(raw.get("symbol") or "PORTFOLIO"),
+                direction=str(raw.get("direction") or "LONG"),
+                entry_time=_to_iso(raw["entry_time"]),
+                entry_price=entry_price,
+                quantity=quantity,
+                exits=[
+                    TradeExit(
+                        time=_to_iso(raw["exit_time"]),
+                        price=float(exit_price),
+                        quantity=quantity,
+                        pnl=pnl,
+                        reason="rebalance",
+                    )
+                ],
+                pnl=pnl,
+                net_pnl=pnl,
+                position_size=float(raw.get("position_size") or 0.0),
+                tags=["qc-risk-parity-reimplementation"],
+                meta=dict(raw.get("meta") or {}),
+            )
+        )
+
+    portfolio_value = result["portfolio_value"]
+    equity_curve = [
+        EquityPoint(time=_to_iso(ts), equity=round(float(value), 6))
+        for ts, value in portfolio_value.dropna().items()
+    ]
+    now = datetime.now(timezone.utc).isoformat()
+    stats = dict(result["stats"])
+    stats.setdefault("total_pnl", stats.get("net_profit"))
+    stats["net_profit"] = stats.get("net_profit")
+    stats["local_price_start"] = _to_iso(prices.index.min())
+    stats["local_price_end"] = _to_iso(prices.index.max())
+
+    return BacktestResult(
+        meta=BacktestMeta(
+            id=output.stem,
+            created_at=now,
+            engine="python-reimplementation",
+            strategies=["RiskParityStrategy"],
+            backtest_start=start,
+            backtest_end=end,
+            duration_days=(pd.Timestamp(end) - pd.Timestamp(start)).days,
+            total_bars=int(prices.count().sum()),
+            data={
+                "symbols": list(risk_parity.TICKERS),
+                "timeframes": ["1d"],
+                "source": str(source),
+                "price_start": _to_iso(prices.index.min()),
+                "price_end": _to_iso(prices.index.max()),
+            },
+            initial_capital=1_000_000.0,
+            parameters={
+                "target_volatility": 0.10,
+                "max_leverage": 1.5,
+                "lookback_volatility": 60,
+                "lookback_correlation": 120,
+                "min_weight": 0.02,
+                "max_weight": 0.30,
+            },
+            tags=["qc-parity", "risk-parity"],
+            notes="Python reimplementation of strategy-comparisons/risk_parity/risk_parity_strategy.py using local daily parquet data.",
+        ),
+        trades=trades,
+        equity_curve=equity_curve,
+        stats=stats,
+    )
+
+
+def regenerate(*, data_dir: Path, source: Path, output: Path, start: str, end: str) -> BacktestResult:
+    prices = _load_local_prices(data_dir, source, start, end)
+
+    def local_prices(_: str, __: str) -> pd.DataFrame:
+        return prices.copy()
+
+    original = risk_parity.download_prices
+    risk_parity.download_prices = local_prices
+    try:
+        result = risk_parity.run_backtest(start_date=start, end_date=end, initial_cash=1_000_000.0)
+    finally:
+        risk_parity.download_prices = original
+
+    backtest = _build_result(result, prices, start=start, end=end, output=output, source=source)
+    backtest.save(output)
+    return backtest
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data-dir", type=Path, default=DATA_DIR)
+    parser.add_argument("--source", type=Path, default=DEFAULT_SOURCE)
+    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--start", default="2016-01-01")
+    parser.add_argument("--end", default="2024-12-31")
+    args = parser.parse_args()
+
+    result = regenerate(
+        data_dir=args.data_dir,
+        source=args.source,
+        output=args.output,
+        start=args.start,
+        end=args.end,
+    )
+    print(
+        json.dumps(
+            {
+                "output": str(args.output),
+                "total_trades": len(result.trades),
+                "stats": result.stats,
+                "data": result.meta.data,
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

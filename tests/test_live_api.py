@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 def test_live_endpoints_return_expected_payloads(monkeypatch):
     import viewer.main as viewer_main_module
 
-    account_id = "alpaca-paper"
+    account_id = "PA3T0MQAGQ51"
     deployment_id = "33333333-3333-3333-3333-333333333333"
     signal_id = "11111111-1111-1111-1111-111111111111"
 
@@ -211,7 +211,7 @@ def test_live_endpoints_return_expected_payloads(monkeypatch):
 def test_live_deployments_crud_endpoints(monkeypatch):
     import viewer.main as viewer_main_module
 
-    account_id = "alpaca-paper"
+    account_id = "PA3T0MQAGQ51"
     deployment_id = "44444444-4444-4444-4444-444444444444"
     created_deployment = {
         "id": deployment_id,
@@ -341,6 +341,129 @@ def test_live_deployments_returns_empty_array(monkeypatch):
     response = client.get("/api/live/deployments")
     assert response.status_code == 200
     assert response.json() == []
+
+
+def test_live_dashboard_endpoint_returns_telemetry(monkeypatch):
+    import viewer.main as viewer_main_module
+
+    account = LiveAccountConfig(id="acct-1", broker="alpaca", name="Account One")
+    deployment = LiveDeploymentConfig(
+        id="55555555-5555-5555-5555-555555555555",
+        strategy_name="live_strategy",
+        account_id="acct-1",
+        symbols=["AAPL"],
+        timeframe="1h",
+        status="ACTIVE",
+    )
+
+    monkeypatch.setattr(viewer_main_module, "_seed_default_live_accounts", lambda: None)
+    monkeypatch.setattr(viewer_main_module, "list_live_accounts", lambda: [account])
+    monkeypatch.setattr(viewer_main_module, "list_live_deployments", lambda: [deployment])
+    monkeypatch.setattr(
+        viewer_main_module,
+        "_live_account_stats_payload",
+        lambda _account_id: {
+            "account_id": _account_id,
+            "current_equity": 10000.0,
+            "current_balance": 9900.0,
+            "total_trades": 1,
+            "total_pnl": 25.0,
+        },
+    )
+
+    async def _fake_trades(_account_id):
+        return {"account_id": _account_id, "deployment_ids": [str(deployment.id)], "trades": []}
+
+    monkeypatch.setattr(viewer_main_module, "_live_trades_payload", _fake_trades)
+
+    client = TestClient(viewer_main_module.app)
+    response = client.get("/api/live/dashboard")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["capital"]["total_equity"] == 10000.0
+    assert payload["active_strategies"][0]["strategy_name"] == "live_strategy"
+    assert payload["active_strategies"][0]["capital_allocation"] == 1.0
+
+
+def test_ctrader_top5_endpoint_dry_run(monkeypatch):
+    import viewer.main as viewer_main_module
+
+    monkeypatch.setattr(viewer_main_module, "_seed_default_live_accounts", lambda: None)
+    monkeypatch.setattr(
+        viewer_main_module,
+        "list_live_accounts",
+        lambda: [LiveAccountConfig(id="ct-1", broker="ctrader", name="cTrader")],
+    )
+    monkeypatch.setattr(
+        viewer_main_module,
+        "list_backtest_metadata_rows",
+        lambda: [
+            {
+                "id": "bt-1",
+                "strategy_name": "fx_breakout",
+                "symbols": ["EURUSD"],
+                "timeframe": "15m",
+                "sharpe_ratio": 1.4,
+                "cagr": 0.2,
+                "psr": 0.8,
+                "max_drawdown": -5,
+                "trade_count": 11,
+            }
+        ],
+    )
+
+    client = TestClient(viewer_main_module.app)
+    response = client.post("/api/live/deployments/ctrader/top5", json={"dry_run": True})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "planned"
+    assert payload["deployments"][0]["account_id"] == "ct-1"
+    assert payload["deployments"][0]["signal_config"]["source_backtest_id"] == "bt-1"
+
+
+def test_discord_stockkit_deployment_rejects_wrong_account(monkeypatch):
+    import viewer.main as viewer_main_module
+
+    monkeypatch.setattr(viewer_main_module, "_seed_default_live_accounts", lambda: None)
+    monkeypatch.setattr(
+        viewer_main_module,
+        "list_services",
+        lambda *args, **kwargs: [
+            Service(
+                id="88888888-8888-8888-8888-888888888888",
+                name="RAMJET",
+                type=ServiceType.DISCORD_BOT,
+                status=ServiceStatus.RUNNING,
+                config={"token_env_key": "DISCORD_BOT_RAMJET_TOKEN", "channel_id": "123"},
+                created_at=datetime.now(timezone.utc),
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        viewer_main_module,
+        "_ensure_live_account_for_deployment",
+        lambda _account_id: {"id": _account_id, "broker": "alpaca", "name": "Wrong"},
+    )
+
+    client = TestClient(viewer_main_module.app)
+    response = client.post(
+        "/api/live/deployments",
+        json={
+            "strategy_name": "my_live_strategy",
+            "account_id": "wrong-account",
+            "symbols": ["AAPL"],
+            "timeframe": "1h",
+            "signal_source_type": "discord",
+            "signal_source_id": "RAMJET",
+            "signal_source": "discord",
+            "signal_config": {"channel_id": "123", "signal_processor": "ramjet"},
+        },
+    )
+
+    assert response.status_code == 400
+    assert "PA3T0MQAGQ51" in response.json()["detail"]
 
 
 def test_services_crud_and_logs_endpoints(monkeypatch):

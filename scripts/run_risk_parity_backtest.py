@@ -171,6 +171,45 @@ def apply_volatility_scaling(
     return scaled
 
 
+
+def first_available_trading_dates(index: pd.DatetimeIndex, scheduled_dates: pd.DatetimeIndex) -> list[pd.Timestamp]:
+    """Map scheduled calendar dates to the next available trading date."""
+    dates: list[pd.Timestamp] = []
+    for scheduled in scheduled_dates:
+        candidates = index[index >= scheduled]
+        if len(candidates):
+            dates.append(candidates[0])
+    return dates
+
+
+def weekly_correlation_regimes(returns: pd.DataFrame) -> dict[pd.Timestamp, str]:
+    """Reproduce QC's weekly correlation-regime state updates."""
+    if returns.empty:
+        return {}
+    week_starts = first_available_trading_dates(
+        returns.index,
+        pd.date_range(start=returns.index[0], end=returns.index[-1], freq="W-MON"),
+    )
+    regimes: dict[pd.Timestamp, str] = {}
+    for regime_date in week_starts:
+        loc = returns.index.get_loc(regime_date)
+        hist_start = max(0, loc - 120 + 1)
+        ret_matrix = returns.iloc[hist_start : loc + 1].T.values
+        regimes[regime_date] = detect_correlation_regime(ret_matrix)
+    return regimes
+
+
+def latest_correlation_regime(
+    regimes: dict[pd.Timestamp, str],
+    rebalance_date: pd.Timestamp,
+    default: str = "normal",
+) -> str:
+    """Return the latest weekly regime known at a rebalance date."""
+    known_dates = [date for date in regimes if date <= rebalance_date]
+    if not known_dates:
+        return default
+    return regimes[max(known_dates)]
+
 def apply_tail_risk_hedge(weights: dict[str, float]) -> dict[str, float]:
     """Reduce risk exposure when tail risk hedge is active."""
     hedged = dict(weights)
@@ -208,14 +247,28 @@ def run_backtest(
     warm_up_days = 150
     rebalance_dates = pd.date_range(start=prices.index[0], end=prices.index[-1], freq="MS")
     rebalance_dates = rebalance_dates[rebalance_dates > prices.index[warm_up_days]]
-    # Map to next available trading day
-    rebalance_dates = [prices.index[prices.index >= d][0] for d in rebalance_dates]
+    rebalance_dates = first_available_trading_dates(prices.index, rebalance_dates)
+    regime_schedule = weekly_correlation_regimes(returns)
 
     current_weights: dict[str, float] = {t: 0.0 for t in TICKERS}
     rebalance_schedule: dict[pd.Timestamp, dict[str, float]] = {}
     trades: list[dict[str, Any]] = []
+    portfolio_value_at_rebalance = float(initial_cash)
+    last_rebalance_value_date = returns.index[0]
+
+    def advance_portfolio_value(rebalance_date: pd.Timestamp) -> float:
+        """Mark previous holdings to market through the rebalance date."""
+        nonlocal portfolio_value_at_rebalance, last_rebalance_value_date
+        start_loc = returns.index.get_loc(last_rebalance_value_date) + 1
+        end_loc = returns.index.get_loc(rebalance_date)
+        for date in returns.index[start_loc : end_loc + 1]:
+            daily_ret = sum(current_weights[t] * returns[t].loc[date] for t in TICKERS)
+            portfolio_value_at_rebalance *= 1 + daily_ret
+        last_rebalance_value_date = rebalance_date
+        return portfolio_value_at_rebalance
 
     for i, reb_date in enumerate(rebalance_dates):
+        current_portfolio_value = advance_portfolio_value(reb_date)
         loc = returns.index.get_loc(reb_date)
         hist_start = max(0, loc - lookback_corr + 1)
         ret_matrix = returns.iloc[hist_start : loc + 1].T.values
@@ -223,7 +276,7 @@ def run_backtest(
         cov = calculate_covariance(ret_matrix)
         weights = calculate_risk_parity_weights(cov, min_weight, max_weight, TICKERS)
 
-        regime = detect_correlation_regime(ret_matrix)
+        regime = latest_correlation_regime(regime_schedule, reb_date)
         weights = adjust_for_regime(weights, regime)
         weights = apply_volatility_scaling(
             weights, cov, target_vol, max_leverage, max_weight, TICKERS
@@ -248,13 +301,14 @@ def run_backtest(
                     (price - prev_price)
                     / prev_price
                     * prev_weight
-                    * initial_cash
+                    * current_portfolio_value
                     if prev_weight and i > 0
                     else 0.0
                 )
                 trades.append(
                     {
                         "entry_time": reb_date.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "symbol": ticker,
                         "exit_time": (
                             rebalance_dates[i + 1].strftime("%Y-%m-%dT%H:%M:%SZ")
                             if i + 1 < len(rebalance_dates)
@@ -264,7 +318,7 @@ def run_backtest(
                         "entry_price": round(price, 6),
                         "exit_price": None,
                         "quantity": round(abs(weights[ticker] - prev_weight), 6),
-                        "position_size": round(abs(weights[ticker]) * initial_cash, 2),
+                        "position_size": round(abs(weights[ticker]) * current_portfolio_value, 2),
                         "pnl": round(pnl, 2),
                         "meta": {"regime": regime, "hedge_active": bool(spy_price < spy_sma * 0.98)},
                     }

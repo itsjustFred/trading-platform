@@ -12,6 +12,12 @@ def _write_strategy(path: Path, name: str) -> None:
     )
 
 
+def _write_strategy_with_meta(path: Path, name: str, meta: str) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "__init__.py").write_text("", encoding="utf-8")
+    (path / f"{name}.py").write_text(f"STRATEGY_META = {meta}\n", encoding="utf-8")
+
+
 def test_run_backtest_matrix_runs_selected_strategies_and_writes_outputs(monkeypatch, tmp_path):
     strategies_dir = tmp_path / "strategies"
     _write_strategy(strategies_dir / "sma", "sma")
@@ -87,6 +93,44 @@ def test_run_backtest_matrix_runs_selected_strategies_and_writes_outputs(monkeyp
     assert (output_dir / "matrix_matrix.csv").exists()
     assert (output_dir / "matrix_daily_equity.csv").exists()
     assert (output_dir / "matrix_summary.json").exists()
+
+
+def test_run_backtest_matrix_honors_strategy_engine_metadata(monkeypatch, tmp_path):
+    strategies_dir = tmp_path / "strategies"
+    _write_strategy_with_meta(
+        strategies_dir / "intraday_volatility_breakout",
+        "intraday_volatility_breakout",
+        "{'name': 'intraday_volatility_breakout', 'engine': 'native'}",
+    )
+    output_dir = tmp_path / "matrix_out"
+    calls = []
+
+    def fake_run_backtest_grid(**kwargs):
+        calls.append(kwargs)
+        return {
+            "strategy": str(kwargs["strategy"]),
+            "runs": [],
+            "ok": 0,
+            "failed": 0,
+            "skipped_existing": 0,
+            "requested": 0,
+            "matrix_csv": str(kwargs["output_dir"] / "grid_matrix.csv"),
+        }
+
+    monkeypatch.setattr("runner.backtest_matrix.run_backtest_grid", fake_run_backtest_grid)
+
+    summary = run_backtest_matrix(
+        strategy_identifiers=["intraday_volatility_breakout"],
+        strategies_dir=strategies_dir,
+        symbols=["EURUSD"],
+        timeframes=["1h"],
+        output_dir=output_dir,
+        max_workers=1,
+    )
+
+    assert summary["strategies"] == ["intraday_volatility_breakout"]
+    assert len(calls) == 1
+    assert calls[0]["engine"] == "native"
 
 
 def test_run_backtest_matrix_reports_strategy_failure(monkeypatch, tmp_path):

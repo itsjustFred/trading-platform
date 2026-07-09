@@ -601,6 +601,7 @@ export function OptimizeModal({
             >
               <option value="parameter">Parameter sweep</option>
               <option value="risk_parity_universe">Risk parity universes</option>
+              <option value="risk_parity_covariance">Risk parity covariance</option>
             </select>
           </div>
           <div>

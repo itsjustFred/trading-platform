@@ -30,6 +30,48 @@ def _write_base_backtest(backtests_dir: Path) -> None:
     result.save(backtests_dir / "base-demo.trades.json")
 
 
+def _write_risk_parity_base_backtest(backtests_dir: Path) -> None:
+    trades: list[Trade] = []
+    for index, symbol in enumerate(["SPY", "TLT", "GLD"], start=1):
+        for day in range(1, 6):
+            pnl = float((6 - day) * (10 if symbol != "GLD" else 3))
+            trades.append(
+                Trade(
+                    id=len(trades) + 1,
+                    symbol=symbol,
+                    direction="LONG",
+                    entry_time=f"2024-01-0{day}T00:00:00+00:00",
+                    entry_price=100.0 + index,
+                    quantity=1.0,
+                    exits=[
+                        TradeExit(
+                            time=f"2024-01-0{day}T01:00:00+00:00",
+                            price=101.0,
+                            quantity=1.0,
+                            pnl=pnl,
+                        )
+                    ],
+                    pnl=pnl,
+                )
+            )
+    result = BacktestResult(
+        meta=BacktestMeta(
+            id="rp-base",
+            created_at="2026-03-11T09:00:00+00:00",
+            engine="vectorbt",
+            strategies=["risk_parity"],
+            backtest_start="2024-01-01",
+            backtest_end="2024-01-10",
+            initial_capital=100000.0,
+            data={"symbols": ["SPY", "TLT", "GLD"], "timeframes": ["1d"], "source": "test"},
+            parameters={"rebalance_period": 21},
+        ),
+        trades=trades,
+        equity_curve=[],
+    )
+    result.save(backtests_dir / "rp-base.trades.json")
+
+
 def _trial_result(config, *, metric: float, trade_count: int) -> BacktestResult:
     trades = []
     if trade_count > 0:
@@ -208,3 +250,51 @@ def test_run_optimization_propagates_backtest_errors(monkeypatch, tmp_path: Path
                 parameter_ranges={"window": {"type": "int", "min": 2, "max": 2, "step": 1}},
             )
         )
+
+
+def test_run_risk_parity_covariance_optimization_saves_weights(monkeypatch, tmp_path: Path):
+    backtests_dir = tmp_path / "backtests"
+    optimizations_dir = tmp_path / "optimizations"
+    backtests_dir.mkdir(parents=True, exist_ok=True)
+    _write_risk_parity_base_backtest(backtests_dir)
+
+    monkeypatch.setattr(optimizer_module, "BACKTESTS_DIR", backtests_dir)
+    monkeypatch.setattr(optimizer_module, "OPTIMIZATIONS_DIR", optimizations_dir)
+    monkeypatch.setattr(
+        optimizer_module,
+        "find_strategy_entry",
+        lambda _: SimpleNamespace(
+            file_path=tmp_path / "strategies" / "risk_parity.py",
+            slug="risk_parity",
+        ),
+    )
+    monkeypatch.setattr(
+        optimizer_module,
+        "_run_vectorbt_backtest",
+        lambda config, strategy_path: _trial_result(config, metric=1.25, trade_count=1),
+    )
+    monkeypatch.setattr(
+        optimizer_module,
+        "compute_stats_for_result",
+        lambda result: dict(result.stats),
+    )
+
+    payload = optimizer_module.run_optimization(
+        optimizer_module.OptimizationConfig(
+            base_backtest_id="rp-base",
+            target_metric="sharpe",
+            n_trials=5,
+            train_split_pct=0.7,
+            optimization_mode="risk_parity_covariance",
+            symbol_universes=[["SPY", "TLT"], ["SPY", "GLD"], ["SPY", "TLT", "GLD"]],
+        )
+    )
+
+    assert payload["optimization_mode"] == "risk_parity_covariance"
+    assert payload["target_metric"] == "risk_parity_score"
+    assert set(payload["best_symbols"]) <= {"SPY", "TLT", "GLD"}
+    assert payload["effective_best_parameters"]["risk_parity_weights"]
+    assert sum(payload["effective_best_parameters"]["risk_parity_weights"].values()) == pytest.approx(1.0)
+    assert payload["risk_parity"]["evaluated_universes"]
+    saved_files = list(optimizations_dir.glob("rp_cov_rp-base_*.json"))
+    assert len(saved_files) == 1

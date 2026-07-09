@@ -277,7 +277,7 @@ export interface OptimizationRunRequest {
   n_trials: number;
   train_split_pct: number;
   parameter_ranges: Record<string, OptimizationParameterRange>;
-  optimization_mode?: "parameter" | "risk_parity_universe";
+  optimization_mode?: "parameter" | "risk_parity_universe" | "risk_parity_covariance";
   symbol_universes?: string[][];
 }
 
@@ -589,6 +589,30 @@ export interface LiveTradesResponse {
   account_id: string;
   deployment_ids: string[];
   trades: LiveTradeSlippage[];
+}
+
+export interface LiveDashboardAccount extends LiveAccount {
+  current_equity: number;
+  current_balance: number;
+  total_trades: number;
+  total_pnl: number;
+}
+
+export interface LiveDashboardStrategy extends LiveDeploymentConfig {
+  capital_allocation: number;
+  account_equity: number;
+}
+
+export interface LiveDashboardResponse {
+  generated_at: string;
+  accounts: LiveDashboardAccount[];
+  active_strategies: LiveDashboardStrategy[];
+  capital: {
+    total_equity: number;
+    active_account_count: number;
+    active_strategy_count: number;
+  };
+  recent_fills: LiveTradeSlippage[];
 }
 
 export interface LiveQuoteBar {
