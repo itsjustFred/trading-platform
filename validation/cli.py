@@ -141,6 +141,21 @@ def main(argv: list[str] | None = None) -> int:
     parser = _build_argument_parser()
     args = parser.parse_args(argv)
 
+    # Tolerances are magnitudes; a negative tolerance is meaningless and would
+    # silently accept (or reject) every comparison.
+    _tolerances = {
+        "--time-tolerance": args.time_tolerance,
+        "--price-tolerance": args.price_tolerance,
+        "--volume-tolerance": args.volume_tolerance,
+        "--pnl-absolute-tolerance": args.pnl_absolute_tolerance,
+        "--stats-tolerance": args.stats_tolerance,
+    }
+    negative = {name: value for name, value in _tolerances.items() if value < 0}
+    if negative:
+        for name, value in negative.items():
+            logger.error("%s must be >= 0 (got %s)", name, value)
+        return 2
+
     ref_path = Path(args.reference)
     platform_path = Path(args.platform)
 

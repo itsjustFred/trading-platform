@@ -8,7 +8,7 @@ Fred arbeitet an einer automatisierten Trading-Plattform unter `/home/ubuntu/Des
 ---
 
 ## Oberziel
-**Maximaler Sharpe bei hohem CAGR durch viele profitable Strategien mit negativ oder unkorreliertem Drawdown.**  
+**Maximaler Sharpe bei hohem CAGR durch viele profitable Strategien mit negativ oder unkorreliertem Drawdown.**
 Das bedeutet:
 - Suche nicht nur einzelne „beste“ Strategien, sondern einen **Strategie-Pool**.
 - Zeichne dich durch **Diversifikation** aus: Drawdowns sollen möglichst nicht gleichzeitig auftreten (negative/unkorrelierte Drawdowns).

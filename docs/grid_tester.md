@@ -30,7 +30,7 @@ class GridRecord(SQLModel, table=True):
     strategy: str  # Strategy name
     created_at: str  # ISO timestamp
     symbols_json: list[str]  # Tested symbols
-    timeframes_json: list[str]  # Tested timeframes  
+    timeframes_json: list[str]  # Tested timeframes
     results_json: dict[str, Any]  # {symbol: {timeframe: {metrics}}}
     engine: str  # Backtest engine used
 ```

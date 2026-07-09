@@ -7,6 +7,7 @@ all deltas, summaries and explanations.
 from __future__ import annotations
 
 import json
+import math
 from datetime import datetime, timezone
 from typing import Any
 
@@ -475,11 +476,34 @@ def generate_json_report(
         explanations=explanations,
     )
 
-    return json.dumps(
-        report.model_dump(mode="json"),
-        indent=2,
-        ensure_ascii=False,
-    )
+    payload = _sanitize_json_numbers(report.model_dump(mode="json"))
+    try:
+        return json.dumps(
+            payload,
+            indent=2,
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    except ValueError as exc:  # pragma: no cover - defensive guard
+        raise ValueError(
+            "Validation report contains values that cannot be encoded as strict "
+            f"JSON (nan/inf leaked past sanitization): {exc}"
+        ) from exc
+
+
+def _sanitize_json_numbers(value: Any) -> Any:
+    """Recursively replace non-finite floats (nan/inf/-inf) with ``None``.
+
+    ``json.dumps`` would otherwise emit ``NaN``/``Infinity`` tokens, which are
+    not valid strict JSON and break strict parsers downstream.
+    """
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {key: _sanitize_json_numbers(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_json_numbers(item) for item in value]
+    return value
 
 
 def _build_recommendation(data: dict[str, Any]) -> list[str]:

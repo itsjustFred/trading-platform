@@ -259,15 +259,15 @@ class TestPnL:
         assert not result.is_match
         assert "pnl" in result.mismatches
 
-    def test_pnl_outside_abs_tolerance_only(self):
-        # pct diff tiny, abs diff huge
+    def test_pnl_within_pct_passes_even_if_outside_abs(self):
+        # Percentage and absolute tolerances are alternatives: satisfying EITHER
+        # is a match. Here the pct diff is tiny so the comparison passes.
         ref = _make_trade(pnl=100000.0)
         act = _make_trade(pnl=100000.1)
         result = TradeComparator().compare(_make_matched(ref, act))
-        # pct diff is 0.000001 (0.0001%), inside 0.1%
-        # abs diff is 0.1, outside 0.01
-        _assert_field_failed(result, "pnl")
-        assert not result.is_match
+        # pct diff is 0.000001 (0.0001%), inside 0.1%; abs diff 0.1 outside 0.01.
+        _assert_field_passed(result, "pnl")
+        assert result.is_match
 
     def test_zero_pnl_exact_match(self):
         ref = _make_trade(pnl=0.0)
@@ -276,9 +276,19 @@ class TestPnL:
         _assert_field_passed(result, "pnl")
         assert result.is_match
 
-    def test_zero_vs_nonzero_pnl_mismatch(self):
+    def test_zero_vs_near_zero_pnl_within_abs_tolerance_passes(self):
+        # 0.0 vs 0.001: pct diff is 100% but the absolute diff (0.001) is within
+        # the absolute tolerance (0.01), so the alternatives-based rule matches.
         ref = _make_trade(pnl=0.0)
         act = _make_trade(pnl=0.001)
+        result = TradeComparator().compare(_make_matched(ref, act))
+        _assert_field_passed(result, "pnl")
+        assert result.is_match
+
+    def test_zero_vs_large_pnl_mismatch(self):
+        # Both tolerances fail -> genuine mismatch.
+        ref = _make_trade(pnl=0.0)
+        act = _make_trade(pnl=5.0)
         result = TradeComparator().compare(_make_matched(ref, act))
         _assert_field_failed(result, "pnl")
         assert not result.is_match

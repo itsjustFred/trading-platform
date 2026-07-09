@@ -10,7 +10,7 @@
 ### C1: Undocumented Logic Deviation in `breakout_short` Calculation
 - **Location**: `strategies/qg_30min_es_breakout_strategy/qg_30min_es_breakout_strategy.py:105`
 - **Severity**: Critical
-- **Description**: The Python implementation calculates `breakout_short = high - fract * (high - open_).abs()`. However, the original Pine Script uses `breakout_short = high - FRACT * math.abs(open - low)`. 
+- **Description**: The Python implementation calculates `breakout_short = high - fract * (high - open_).abs()`. However, the original Pine Script uses `breakout_short = high - FRACT * math.abs(open - low)`.
 - **Impact**: If this was an intentional "fix" for a suspected copy-paste error in the original Pine script, it fundamentally changes the short-entry signals. Without documentation, this is a silent, unverified behavioral change.
 - **Fix**: Either revert to `(open_ - low).abs()` to match the Pine script exactly, or explicitly document this as a deliberate correction in the README with justification.
 
@@ -26,7 +26,7 @@
 - **Location**: `tests/strategies/test_qg_30min_es_breakout_strategy.py`
 - **Severity**: Major
 - **Description**: Running `pytest` results in all 4 tests being skipped due to: `missing OHLCV dataset for XAUUSD/1h under C:\Users\user\PycharmProjects\trading-platform\data\ohlcv`.
-- **Impact**: The core mandate of a code review is to verify correctness. Without the ability to execute the tests, the regression guarantees are void. 
+- **Impact**: The core mandate of a code review is to verify correctness. Without the ability to execute the tests, the regression guarantees are void.
 - **Fix**: Provide the required test dataset in the repository (or via a download script), or mock the data within the test file itself to ensure it can run in any environment.
 
 ### M2: Misleading "Vectorized" Claim vs Stateful Loop Implementation
@@ -122,13 +122,13 @@ It's 3 months from now. The data pipeline switches to a new provider that delive
 
 ### Inversion Check
 
-**What would guarantee failure:** 
+**What would guarantee failure:**
 1. Running the strategy on unsorted or NaN-filled data.
 2. Deploying to ES 30min without ever testing on ES 30min data.
 3. Feeding the function non-UTC timestamps without conversion.
 
-**Do any exist now?** 
-- Yes, #1 is a risk because there are no defensive checks in the `for` loop. 
+**Do any exist now?**
+- Yes, #1 is a risk because there are no defensive checks in the `for` loop.
 - Yes, #2 exists because the test explicitly uses XAUUSD 1h, not ES 30min.
 
 ---
@@ -142,7 +142,7 @@ It's 3 months from now. The data pipeline switches to a new provider that delive
 
 ## CodeRabbit Second Pass
 - **Status**: Skipped.
-- **Failed Prerequisites**: 
+- **Failed Prerequisites**:
   1. The `coderabbit` CLI is not installed in the native Windows environment (commands `coderabbit` and `npx coderabbit` failed with "command not found").
   2. The `coderabbit` CLI is also not installed in the WSL environment (`wsl coderabbit` and `wsl npx coderabbit` failed).
   3. The `.agents/control.json` configuration file does not exist to enable `coderabbitReview: true`.

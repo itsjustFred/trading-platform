@@ -1,7 +1,7 @@
 # Strategy Validation Framework — Modell-Inventur
 
-**Datum:** 2026-06-24  
-**Phase:** 1 — Repository Analysis & Scoping  
+**Datum:** 2026-06-24
+**Phase:** 1 — Repository Analysis & Scoping
 **Ziel:** Bestehende Modelle, Converter, Stats und Risk-Engine analysieren, um Mapping und Lücken für das Strategy Validation Framework zu identifizieren.
 
 ---

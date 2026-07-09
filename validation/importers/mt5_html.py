@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, tzinfo
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +12,7 @@ from bs4 import BeautifulSoup
 
 from shared.models import Trade, TradeExit
 from validation.importers.base import BaseImporter
+from validation.importers.mt5_xlsx import _resolve_source_timezone
 from validation.reference import ValidationReference
 
 logger = logging.getLogger(__name__)
@@ -70,13 +71,23 @@ for label, key in _STAT_LABELS:
 class MT5HTMLImporter(BaseImporter):
     """Import MT5 Strategy Tester HTML reports (German UI)."""
 
-    def load(self, source: str | Path, **kwargs: Any) -> ValidationReference:
+    def load(
+        self,
+        source: str | Path,
+        *,
+        source_timezone: str = "UTC",
+        **kwargs: Any,
+    ) -> ValidationReference:
         """Read an MT5 HTML report and return a ``ValidationReference``.
 
         Parameters
         ----------
         source:
             Path to the ``.html`` file.
+        source_timezone:
+            Timezone the (naive) MT5 timestamps are recorded in. Defaults to
+            ``"UTC"`` (legacy behavior); pass e.g. ``"Europe/Athens"`` for a
+            broker server time so timestamps are converted to UTC.
         **kwargs:
             Forwarded to ``BeautifulSoup`` parser selection.
         """
@@ -84,6 +95,7 @@ class MT5HTMLImporter(BaseImporter):
         if not path.exists():
             raise FileNotFoundError(f"MT5 HTML report not found: {path}")
 
+        source_tz = _resolve_source_timezone(source_timezone)
         html_text = path.read_text(encoding="utf-8", errors="replace")
         soup = BeautifulSoup(html_text, kwargs.pop("features", "lxml"))
 
@@ -102,7 +114,7 @@ class MT5HTMLImporter(BaseImporter):
             raise ValueError("Could not locate 'Trades' table in the HTML report.")
 
         sltp_map = self._build_sltp_map(orders_table)
-        trades = self._build_trades(trades_table, sltp_map)
+        trades = self._build_trades(trades_table, sltp_map, source_tz=source_tz)
 
         return ValidationReference(
             strategy_name=meta.get("strategy_name", "unknown"),
@@ -400,7 +412,11 @@ class MT5HTMLImporter(BaseImporter):
     # ── trade reconstruction ──────────────────────────────────────────────
 
     @staticmethod
-    def _build_trades(trades_table: BeautifulSoup, sltp_map: dict[str, dict[str, float | None]]) -> list[Trade]:
+    def _build_trades(
+        trades_table: BeautifulSoup,
+        sltp_map: dict[str, dict[str, float | None]],
+        source_tz: tzinfo = timezone.utc,
+    ) -> list[Trade]:
         rows = MT5HTMLImporter._table_to_rows(trades_table)
         if not rows:
             return []
@@ -492,7 +508,7 @@ class MT5HTMLImporter(BaseImporter):
                 tp = mapped.get("tp")
 
             exit_obj = TradeExit(
-                time=MT5HTMLImporter._to_iso(exit_time_raw),
+                time=MT5HTMLImporter._to_iso(exit_time_raw, source_tz),
                 price=exit_price if exit_price is not None else 0.0,
                 quantity=volume if volume is not None else 0.0,
                 pnl=pnl,
@@ -504,7 +520,7 @@ class MT5HTMLImporter(BaseImporter):
                 id=trade_id_counter,
                 symbol=symbol,
                 direction=direction_str,
-                entry_time=MT5HTMLImporter._to_iso(entry_time_raw),
+                entry_time=MT5HTMLImporter._to_iso(entry_time_raw, source_tz),
                 entry_price=entry_price if entry_price is not None else 0.0,
                 quantity=volume if volume is not None else 0.0,
                 exits=[exit_obj],
@@ -555,12 +571,13 @@ class MT5HTMLImporter(BaseImporter):
             return default
 
     @staticmethod
-    def _to_iso(raw: str) -> str:
+    def _to_iso(raw: str, source_tz: tzinfo = timezone.utc) -> str:
+        """Convert a naive MT5 datetime string from ``source_tz`` to ISO-8601 UTC."""
         text = raw.strip() if raw else ""
         for fmt in ("%Y.%m.%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
             try:
                 dt = datetime.strptime(text, fmt)
-                dt = dt.replace(tzinfo=timezone.utc)
+                dt = dt.replace(tzinfo=source_tz).astimezone(timezone.utc)
                 return dt.isoformat().replace("+00:00", "Z")
             except ValueError:
                 continue

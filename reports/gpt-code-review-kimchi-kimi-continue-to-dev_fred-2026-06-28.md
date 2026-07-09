@@ -1,8 +1,8 @@
 # Code Review: kimchi-kimi-continue -> dev_fred
 
-**Datum:** 2026-06-28  
-**Branch:** `kimchi-kimi-continue`  
-**Merge-Ziel:** `dev_fred`  
+**Datum:** 2026-06-28
+**Branch:** `kimchi-kimi-continue`
+**Merge-Ziel:** `dev_fred`
 **Ergebnis:** Nicht merge-ready
 
 ## Kurzfazit

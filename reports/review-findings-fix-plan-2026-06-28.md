@@ -1,7 +1,7 @@
 # Fix-Plan für Review-Findings aus Opus 4.8 und GPT 5.5
 
-**Datum:** 2026-06-28  
-**Basis:** Reviews zu `codex_rewrite -> dev_fred` und `kimchi-kimi-continue -> dev_fred`  
+**Datum:** 2026-06-28
+**Basis:** Reviews zu `codex_rewrite -> dev_fred` und `kimchi-kimi-continue -> dev_fred`
 **Quellen:**
 
 - `reports/opus-codex_rewrite_review.md`

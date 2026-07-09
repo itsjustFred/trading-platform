@@ -35,4 +35,3 @@ ram_jet:
       enabled: false
       threshold: 1.5
       sma_period: 20
-

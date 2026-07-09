@@ -25,17 +25,17 @@ def test_signal_bot_health_check_job_runs_successfully() -> None:
                     {"name": "nitro", "status": "ok", "errors": []},
                 ],
             }
-            
+
             with patch(
                 "scheduler.jobs.signal_bot_health_check.upsert_background_task_record"
             ) as mock_upsert:
                 mock_upsert.return_value = MagicMock()
-                
+
                 await run(task_id="test-task-1", service_id="svc-1", service_name="test-service")
-                
+
                 assert mock_check.called
                 assert mock_upsert.call_count >= 2
-    
+
     asyncio.run(_run_test())
 
 
@@ -51,15 +51,15 @@ def test_signal_bot_health_check_job_detects_errors() -> None:
                     {"name": "nitro", "status": "error", "errors": ["Config missing"]},
                 ],
             }
-            
+
             with patch(
                 "scheduler.jobs.signal_bot_health_check.upsert_background_task_record"
             ) as mock_upsert:
                 mock_upsert.return_value = MagicMock()
-                
+
                 await run(task_id="test-task-2", service_id="svc-2", service_name="test-service")
-                
+
                 assert mock_check.called
                 assert mock_upsert.call_count >= 2
-    
+
     asyncio.run(_run_test())

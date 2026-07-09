@@ -1,7 +1,7 @@
 # Strategy Validation Framework — Scope & Grenzen
 
-**Datum:** 2026-06-24  
-**Branch:** `kimchi-kimi-continue`  
+**Datum:** 2026-06-24
+**Branch:** `kimchi-kimi-continue`
 **Phase:** 1 — Repository Analysis & Scoping
 
 ---

@@ -85,9 +85,15 @@ class FixedRiskModel:
         position_size = self.config.risk_amount / stop_distance
 
         if self.config.round_lots and self.config.lot_size > 0:
-            position_size = (
-                round(position_size / self.config.lot_size) * self.config.lot_size
-            )
+            # Round DOWN to whole lots so rounding can never push the realized
+            # risk above the configured risk budget. Snap up only when the raw
+            # lot count is a whole number to within floating-point tolerance
+            # (e.g. 99999.99999999991 -> 100000, but 2.6 -> 2).
+            raw_lots = position_size / self.config.lot_size
+            lots = math.floor(raw_lots)
+            if math.isclose(raw_lots, lots + 1, rel_tol=1e-9, abs_tol=1e-9):
+                lots += 1
+            position_size = lots * self.config.lot_size
 
         if position_size < self.config.min_position_size:
             position_size = 0.0

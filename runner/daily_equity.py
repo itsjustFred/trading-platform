@@ -2,6 +2,8 @@
 """Daily equity-curve helpers for grid and portfolio optimization workflows."""
 from __future__ import annotations
 
+import logging
+import math
 from collections import defaultdict
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
@@ -9,6 +11,8 @@ from typing import Any
 import pandas as pd
 
 from shared.models import BacktestResult, EquityPoint
+
+logger = logging.getLogger(__name__)
 
 
 def _parse_date(value: str | None, default: date | None = None) -> date | None:
@@ -66,6 +70,8 @@ def build_daily_equity_curve(
     from the last known equity and daily returns are stored explicitly.
     """
     initial = float(result.meta.initial_capital or 0.0)
+    if not math.isfinite(initial):
+        initial = 0.0
     start, end = _date_bounds(result, start_date, end_date)
     if start is None or end is None or end < start:
         return result.equity_curve, []
@@ -77,9 +83,14 @@ def build_daily_equity_curve(
         if exit_day is None:
             continue
         try:
-            pnl_by_day[exit_day] += float(trade.pnl or 0.0)
+            pnl = float(trade.pnl or 0.0)
         except (TypeError, ValueError):
             continue
+        if not math.isfinite(pnl):
+            # Never let nan/inf PnL contaminate the equity curve.
+            logger.warning("Skipping non-finite PnL on %s for daily equity", exit_day)
+            continue
+        pnl_by_day[exit_day] += pnl
 
     points: list[EquityPoint] = []
     returns: list[dict[str, Any]] = []
@@ -89,6 +100,10 @@ def build_daily_equity_curve(
     current = start
     while current <= end:
         equity += pnl_by_day.get(current, 0.0)
+        if not math.isfinite(equity):
+            # Defensive: keep the curve finite even if upstream data is corrupt.
+            logger.warning("Non-finite equity on %s; holding previous equity", current)
+            equity = previous_equity
         equity = round(equity, 6)
         ts = datetime.combine(current, time.min, tzinfo=timezone.utc).isoformat()
         points.append(EquityPoint(time=ts, equity=equity))
@@ -120,6 +135,9 @@ def attach_daily_equity(
     result.stats["daily_return_count"] = len(daily_returns)
     result.stats["daily_returns"] = daily_returns
     result.meta.data = result.meta.data or {}
-    result.meta.data["equity_frequency"] = "daily"
+    # Only claim a daily frequency when an actual daily curve was synthesized.
+    # The fallback path (invalid/empty date window) returns the original,
+    # possibly non-daily curve, so it must not be mislabeled as "daily".
+    result.meta.data["equity_frequency"] = "daily" if daily_returns else "unknown"
     result.meta.data["daily_return_count"] = len(daily_returns)
     return result

@@ -1,8 +1,8 @@
 # Codex Rewrite — Was gemacht wurde, was fehlt
 
-**Branch:** `codex_rewrite`  
-**Basis:** Codex CLI Session (OpenAI OAuth)  
-**Datum:** 2026-06-21  
+**Branch:** `codex_rewrite`
+**Basis:** Codex CLI Session (OpenAI OAuth)
+**Datum:** 2026-06-21
 **Repo:** `/home/ubuntu/Desktop/trading-platform`
 
 ---
@@ -16,7 +16,7 @@
 
 ### 2. Risk-Parity-Optimizer erweitert
 - **Dateien:** `runner/optimizer.py`, Frontend (`OptimizeModal`, API-Types)
-- **Inhalt:** 
+- **Inhalt:**
   - `optimization_mode="risk_parity_universe"` hinzugefügt
   - Feste Symbol-Listen (`symbol_universes`) möglich
   - Optuna wählt pro Trial ein Universum
@@ -25,7 +25,7 @@
 
 ### 3. Matrix/Grid stabilisiert
 - **Dateien:** `runner/backtest_grid.py`, `runner/backtest_matrix.py`, `shared/database.py`, `scripts/generate_matrix_grid_overview.py`
-- **Inhalt:** 
+- **Inhalt:**
   - Stabile `run_id` als `BacktestMeta.id` pro Matrix-Zelle
   - `--result-id` wird an Subprocess-Runs weitergegeben
   - `backtest_id` + `trade_data_available` in Grid-Summaries
@@ -38,7 +38,7 @@
 
 ### 5. Strategy Comparisons angelegt
 - **Pfad:** `strategy-comparisons/`
-- **Inhalt:** 
+- **Inhalt:**
   - `intraday_volatility_breakout/` — HTML-Reports + Charts für EURUSD_H1, SP500_M1, US100_M15
   - `risk_parity/` — QuantConnect-Report + Strategy-Code
 

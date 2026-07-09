@@ -48,4 +48,3 @@ Falls ein Processor keinen SL setzt, nutzt die Risk-Engine den Fallback über
 - Spätere Trailing-Updates sind ein Broker-Order-Update-Problem:
   bestehende Schutzorders werden nach Regel-Trigger angepasst (z. B. SL nachziehen,
   breakeven setzen, exit-only auf Signalwechsel).
-

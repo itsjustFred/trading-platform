@@ -35,4 +35,3 @@ class NitroSignalProcessor(RamJetSignalProcessor):
             timeframe=signal.timeframe,
             metadata=metadata,
         )
-

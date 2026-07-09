@@ -14,6 +14,7 @@ import json
 import logging
 import math
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -2361,10 +2362,31 @@ def list_grid_results():
     return jsonify({"results": results})
 
 
+_GRID_RESULT_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _resolve_grid_result_path(result_id: str) -> Path | None:
+    """Resolve ``result_id`` to a path strictly inside ``GRID_RESULTS_DIR``.
+
+    Returns ``None`` for ids that fail the whitelist or that would escape the
+    grid-results directory (path traversal), so a request can never read or
+    delete a file outside the intended directory.
+    """
+    if not _GRID_RESULT_ID_RE.match(result_id):
+        return None
+    base = GRID_RESULTS_DIR.resolve()
+    candidate = (base / f"{result_id}.json").resolve()
+    if candidate.parent != base:
+        return None
+    return candidate
+
+
 @app.route("/api/grid-results/<result_id>")
 def get_grid_result(result_id: str):
     """Get grid test result details."""
-    path = GRID_RESULTS_DIR / f"{result_id}.json"
+    path = _resolve_grid_result_path(result_id)
+    if path is None:
+        return jsonify({"error": "Invalid grid result id"}), 400
     if not path.exists():
         return jsonify({"error": "Grid result not found"}), 404
     return jsonify(json.loads(path.read_text()))
@@ -2373,7 +2395,9 @@ def get_grid_result(result_id: str):
 @app.route("/api/grid-results/<result_id>", methods=["DELETE"])
 def delete_grid_result(result_id: str):
     """Delete grid test result."""
-    path = GRID_RESULTS_DIR / f"{result_id}.json"
+    path = _resolve_grid_result_path(result_id)
+    if path is None:
+        return jsonify({"error": "Invalid grid result id"}), 400
     if not path.exists():
         return jsonify({"error": "Grid result not found"}), 404
     path.unlink()

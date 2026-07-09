@@ -1,8 +1,8 @@
 # Code Review: codex_rewrite -> dev_fred
 
-**Datum:** 2026-06-28  
-**Branch:** `codex_rewrite`  
-**Merge-Ziel:** `dev_fred`  
+**Datum:** 2026-06-28
+**Branch:** `codex_rewrite`
+**Merge-Ziel:** `dev_fred`
 **Ergebnis:** Nicht merge-ready
 
 ## Kurzfazit
@@ -28,7 +28,7 @@ Die Hauptgründe sind echte Integrationsrisiken in Live-Trading- und Datenbankpf
 
 ### 1. cTrader-Refresh kann nach Tokenwechsel account-scoped Requests ohne erneute Account-Auth retryen
 
-**Datei:** `live_runner/ctrader_adapter.py`  
+**Datei:** `live_runner/ctrader_adapter.py`
 **Relevante Stellen laut CodeRabbit:** ca. Zeilen 556-560, 594, 210, 381-387
 
 Nach erfolgreichem Token-Refresh wird der Request einmal wiederholt. Für cTrader account-scoped Requests muss nach einem neuen Access Token aber wieder Account-Authorization erfolgen. Sonst kann Recovery aus Auth-Fehlern im Live-Betrieb weiterhin scheitern oder inkonsistent reagieren.
@@ -39,7 +39,7 @@ Zusätzlich schreibt der Code Access- und Refresh-Token getrennt in `.accounts.e
 
 ### 2. Live-Preflight kann bei fehlerhafter Boolean-Env versehentlich Live statt Demo wählen
 
-**Datei:** `live_runner/preflight.py`  
+**Datei:** `live_runner/preflight.py`
 **Relevante Stellen laut CodeRabbit:** ca. Zeilen 55-58 und 70-71
 
 `CTRADER_DEMO` defaultet auf `True`, aber ein Tippfehler wie `tru` wird aktuell als `False` interpretiert. Damit kann ein Connectivity-Check unabsichtlich gegen Live statt Demo laufen.
@@ -48,7 +48,7 @@ Zusätzlich schreibt der Code Access- und Refresh-Token getrennt in `.accounts.e
 
 ### 3. Live-Preflight verwendet bei cTrader-Refresh nicht zwingend die geprüfte Accounts-Datei
 
-**Datei:** `live_runner/preflight.py`  
+**Datei:** `live_runner/preflight.py`
 **Relevante Stellen laut CodeRabbit:** ca. Zeilen 74-79, 151-159, 228-233
 
 `run_live_preflight(..., accounts_env_path=...)` liest eine bestimmte Credentials-Datei, erstellt den `CTraderLiveAdapter` aber ohne diesen Pfad. Falls der Connectivity-Check Token refreshen muss, kann eine andere/default `.accounts.env` geschrieben werden als die Datei, die gerade validiert wird.
@@ -57,7 +57,7 @@ Zusätzlich schreibt der Code Access- und Refresh-Token getrennt in `.accounts.e
 
 ### 4. SQLite-Migration füllt neue Dedupe-/Equity-Spalten nicht zurück
 
-**Datei:** `shared/database.py`  
+**Datei:** `shared/database.py`
 **Relevante Stellen:** ca. Zeilen 904-919 und 1745-1748
 
 Die Migration fügt `live_signals.discord_message_id` hinzu und erstellt einen Unique Index, backfillt aber vorhandene Discord IDs aus `metadata` nicht. Danach findet `save_live_signal` alte Signale nicht und kann Duplikate für bereits verarbeitete Discord Messages erzeugen.
@@ -68,7 +68,7 @@ Die Migration fügt `live_signals.discord_message_id` hinzu und erstellt einen U
 
 ### 5. `save_live_signal` hat eine Race Condition trotz Unique Index
 
-**Datei:** `shared/database.py`  
+**Datei:** `shared/database.py`
 **Relevante Stellen:** ca. Zeilen 939-951
 
 Die Dedupe-Prüfung ist ein Pre-Check vor `session.commit()`. Zwei Reconnect-/Worker-Prozesse können beide keinen vorhandenen Datensatz sehen; einer gewinnt, der andere bekommt `IntegrityError`. Anders als `save_live_execution` behandelt `save_live_signal` diesen Fall nicht.
@@ -77,7 +77,7 @@ Die Dedupe-Prüfung ist ein Pre-Check vor `session.commit()`. Zwei Reconnect-/Wo
 
 ### 6. Grid-Market-Data-Download bricht bei `m30`/`30m` vor Fehlerbehandlung ab
 
-**Datei:** `data_tools/download_grid_market_data.py`  
+**Datei:** `data_tools/download_grid_market_data.py`
 **Relevante Stellen:** Zeilen 47-53 und 167
 
 `TIMEFRAME_ALIASES` mappt `m30` auf `30m`, aber die Sortierliste in `download_symbol` kennt `30m` nicht:

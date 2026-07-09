@@ -284,6 +284,10 @@ def run_one_backtest_in_process(
             detected_start, detected_end = _detect_date_range(symbol, normalized_timeframe, data_dir)
             start_date = start_date or detected_start
             end_date = end_date or detected_end
+        # Record the date range actually used so the result metadata and daily
+        # equity window match the backtest window.
+        result["start"] = start_date
+        result["end"] = end_date
 
         downloaded = ensure_backtest_data(
             symbols=[symbol],
@@ -321,7 +325,7 @@ def run_one_backtest_in_process(
         backtest_result.meta.id = run_id
         if not keep_indicators:
             backtest_result.indicators = []
-        attach_daily_equity(backtest_result, start_date=start, end_date=end)
+        attach_daily_equity(backtest_result, start_date=start_date, end_date=end_date)
         backtest_result.stats = {**backtest_result.stats, **compute_stats_for_result(backtest_result)}
         output_dir.mkdir(parents=True, exist_ok=True)
         backtest_result.save(path)
@@ -435,14 +439,44 @@ def run_one_backtest(
 
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
-    proc = subprocess.run(
-        cmd,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        timeout=timeout_seconds,
-        env=env,
-    )
+    try:
+        proc = subprocess.run(
+            cmd,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=timeout_seconds,
+            env=env,
+        )
+    except subprocess.TimeoutExpired as exc:
+        # Isolate the timeout to this grid cell. Without this the exception would
+        # propagate through future.result()/the serial loop and abort the entire
+        # grid run.
+        partial = exc.stdout or ""
+        if isinstance(partial, bytes):
+            partial = partial.decode("utf-8", "replace")
+        result.update(
+            {
+                "status": "failed",
+                "error_class": "timeout",
+                "returncode": None,
+                "error": f"grid cell timed out after {timeout_seconds}s\n{partial[-2000:]}".strip(),
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        return result
+    except (OSError, subprocess.SubprocessError) as exc:
+        result.update(
+            {
+                "status": "failed",
+                "error_class": "subprocess_error",
+                "returncode": None,
+                "error": f"grid cell subprocess failed to run: {exc}",
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        return result
+
     result["returncode"] = proc.returncode
     result["finished_at"] = datetime.now(timezone.utc).isoformat()
 

@@ -72,6 +72,11 @@ class ReadinessValidator:
         checks: list[ReadinessCheck] = []
         recommendations: list[str] = []
 
+        checks.extend(
+            cls._check_required_artifacts(
+                report, regression, risk_report, stats, cfg, recommendations
+            )
+        )
         checks.extend(cls._check_trades(report, cfg, recommendations))
         checks.extend(cls._check_regression(regression, cfg, recommendations))
         checks.extend(cls._check_risk(risk_report, cfg, recommendations))
@@ -116,6 +121,53 @@ class ReadinessValidator:
             warnings=warnings,
             recommendations=recommendations,
         )
+
+    @classmethod
+    def _check_required_artifacts(
+        cls,
+        report: TradeDeltaReport | None,
+        regression: RegressionResult | None,
+        risk_report: RiskComparisonReport | None,
+        stats: tuple[TradeStatistics, TradeStatistics] | None,
+        cfg: ReadinessConfig,
+        recommendations: list[str],
+    ) -> list[ReadinessCheck]:
+        """Error if a mandatory validation artifact is missing.
+
+        Without this, a partial run (e.g. only trade checks, no regression/risk/
+        stats) could be classified READY even though the validation never
+        actually ran end-to-end.
+        """
+        checks: list[ReadinessCheck] = []
+        required = [
+            ("trade_delta_report", cfg.require_trade_report, report is not None),
+            ("regression_result", cfg.require_regression, regression is not None),
+            ("risk_comparison_report", cfg.require_risk_report, risk_report is not None),
+            ("trade_statistics", cfg.require_stats, stats is not None),
+        ]
+        for name, is_required, present in required:
+            if not is_required:
+                continue
+            checks.append(
+                ReadinessCheck(
+                    name=f"required_artifact_{name}",
+                    description=f"Required validation artifact '{name}' is present",
+                    passed=present,
+                    severity="info" if present else "error",
+                    message=(
+                        f"Artifact '{name}' present"
+                        if present
+                        else f"Required validation artifact '{name}' is missing; "
+                        "cannot certify paper-trading readiness."
+                    ),
+                )
+            )
+            if not present:
+                recommendations.append(
+                    f"Provide the '{name}' artifact (a full validation run is "
+                    "required before readiness can be certified)."
+                )
+        return checks
 
     @classmethod
     def _check_trades(

@@ -1,9 +1,9 @@
 # Kimchi Strategy Validation Framework — TODO
 
-> **Projekt:** Strategy Validation Framework  
-> **Branch:** `kimchi-kimi-continue`  
-> **Repo:** `/home/ubuntu/Desktop/trading-platform`  
-> **Stand:** Phase 4 läuft  
+> **Projekt:** Strategy Validation Framework
+> **Branch:** `kimchi-kimi-continue`
+> **Repo:** `/home/ubuntu/Desktop/trading-platform`
+> **Stand:** Phase 4 läuft
 > **Letztes Update:** 2026-06-24
 
 ---
@@ -35,7 +35,7 @@
   - Verifikation: `pytest tests/validation/test_mt5_html_importer.py -v` läuft grün
 - [x] Mindestens drei Golden-/Fixture-Dateien pro unterstütztem Framework anlegen
   - Verifikation: `find tests/fixtures/validation -type f | wc -l` ≥ 3 pro Framework
-- [ ] Basistests für Importer schreiben
+- [x] Basistests für Importer schreiben
   - Verifikation: `pytest tests/validation/test_importers.py -v` läuft grün
 
 # Phase 3 – Trade Comparison Engine
@@ -64,7 +64,7 @@
 
 - [x] Statistiken aus Trades berechnen (Win Rate, Profit Factor, Net Profit, Gross Profit, Gross Loss, Max Drawdown, Sharpe, Sortino, Recovery Factor)
   - Verifikation: `pytest tests/validation/test_trade_statistics.py -v` läuft grün
-- [ ] Framework-Statistik-Vergleich implementieren
+- [x] Framework-Statistik-Vergleich implementieren
   - Verifikation: `pytest tests/validation/test_stats_comparison.py -v` läuft grün
 - [x] Golden Files für Regression erzeugen
   - Verifikation: `find tests/fixtures/validation/goldens -name '*.json' | wc -l` ≥ 3 pro Framework

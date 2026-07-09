@@ -141,8 +141,8 @@ STRATEGY_META = {
 }
 ```
 
-   **Pflichtregel:** `source_url` und `notes` müssen immer explizit gefüllt sein (kein Weglassen).  
-   - `source_url`: direkter URL zur primären Quelle (GitHub, Gist, TradingView, Repo-Datei).  
+   **Pflichtregel:** `source_url` und `notes` müssen immer explizit gefüllt sein (kein Weglassen).
+   - `source_url`: direkter URL zur primären Quelle (GitHub, Gist, TradingView, Repo-Datei).
    - `notes`: Markdown-Notizen mit Bugs, bekannten Abweichungen zur Original-Logik, offenen Punkten und wichtigen Betriebs-Hinweisen.
 
 3. **Pflicht — Trade-`meta`-Felder:** Schreibe alle für die spätere Validierung relevanten Indikator-Werte in `Trade.meta`. Mindestpflichtfelder:
@@ -294,7 +294,7 @@ assert risk_pct_actual <= 0.011, (
 )
 ```
 
-**Akzeptierte Toleranz:** `risk_pct_actual ≤ 1.1 %` (10 % Puffer für Leverage-Cap-Capping).  
+**Akzeptierte Toleranz:** `risk_pct_actual ≤ 1.1 %` (10 % Puffer für Leverage-Cap-Capping).
 **Bei Trade A (Max Loss):** Überprüfe zusätzlich, ob der tatsächliche Verlust (`pnl` absolut) nicht mehr als **2× das geplante Risiko** übersteigt (mögliches Gap-Risk).
 
 ##### Prüfung L — Entry/Exit-Logik

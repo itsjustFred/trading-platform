@@ -130,7 +130,7 @@ def _run_fold_backtest(
     result = engine.run(config, strategy)
     if not result.equity_curve:
         attach_daily_equity(result, start_date=start, end_date=end)
-    result.stats = {**result.stats, **compute_stats_for_result(result)}
+    result.stats = {**compute_stats_for_result(result), **result.stats}
     return dict(result.stats)
 
 

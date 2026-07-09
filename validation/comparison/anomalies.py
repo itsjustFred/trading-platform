@@ -55,20 +55,32 @@ class AnomalyDetector:
         reference: ValidationReference,
         platform_trades: list[Trade],
         comparison_results: list[TradeComparisonResult] | None = None,
+        match_result: Any | None = None,
         **match_kwargs: Any,
     ) -> list[TradeAnomaly]:
-        """Run all detection methods and return aggregated anomalies."""
+        """Run all detection methods and return aggregated anomalies.
+
+        Pass a pre-computed ``match_result`` (from :meth:`TradeMatcher.match`)
+        to reuse an existing matching instead of re-matching the trades several
+        times over.
+        """
         anomalies: list[TradeAnomaly] = []
 
         ref_trades = reference.trades
 
-        anomalies.extend(cls.detect_missing(ref_trades, platform_trades, **match_kwargs))
-        anomalies.extend(cls.detect_extra(ref_trades, platform_trades, **match_kwargs))
+        if match_result is None:
+            match_result = TradeMatcher.match(ref_trades, platform_trades, **match_kwargs)
+
+        anomalies.extend(
+            cls.detect_missing(ref_trades, platform_trades, match_result=match_result)
+        )
+        anomalies.extend(
+            cls.detect_extra(ref_trades, platform_trades, match_result=match_result)
+        )
 
         if comparison_results:
             anomalies.extend(cls.detect_mismatches(comparison_results))
 
-        match_result = TradeMatcher.match(ref_trades, platform_trades, **match_kwargs)
         matched_trades = [
             MatchedTrade(reference=ref, actual=act, key=key)
             for ref, act, key in match_result.matched
@@ -82,10 +94,15 @@ class AnomalyDetector:
         cls,
         reference_trades: list[Trade],
         platform_trades: list[Trade],
+        match_result: Any | None = None,
         **match_kwargs: Any,
     ) -> list[TradeAnomaly]:
         """Return anomalies for reference trades with no platform pair."""
-        result = TradeMatcher.match(reference_trades, platform_trades, **match_kwargs)
+        result = (
+            match_result
+            if match_result is not None
+            else TradeMatcher.match(reference_trades, platform_trades, **match_kwargs)
+        )
         anomalies: list[TradeAnomaly] = []
         for trade in result.missing:
             msg = (
@@ -107,10 +124,15 @@ class AnomalyDetector:
         cls,
         reference_trades: list[Trade],
         platform_trades: list[Trade],
+        match_result: Any | None = None,
         **match_kwargs: Any,
     ) -> list[TradeAnomaly]:
         """Return anomalies for platform trades with no reference pair."""
-        result = TradeMatcher.match(reference_trades, platform_trades, **match_kwargs)
+        result = (
+            match_result
+            if match_result is not None
+            else TradeMatcher.match(reference_trades, platform_trades, **match_kwargs)
+        )
         anomalies: list[TradeAnomaly] = []
         for trade in result.extra:
             msg = (

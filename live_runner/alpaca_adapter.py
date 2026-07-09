@@ -282,13 +282,6 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
     async def submit_order(self, signal: LiveSignal) -> str:
         if not self._connected or self._trading_client is None:
             await self.connect()
-        try:
-            from alpaca.trading.enums import OrderSide, TimeInForce
-            from alpaca.trading.requests import MarketOrderRequest
-        except ModuleNotFoundError as exc:
-            raise RuntimeError(
-                "alpaca-py is required for AlpacaLiveAdapter. Install package 'alpaca-py'."
-            ) from exc
 
         # Use equity (not cash) for risk sizing so margin accounts with negative cash
         # still pass sizing validation when total account value is positive.
@@ -300,6 +293,14 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 "Risk engine returned non-positive quantity; order blocked "
                 f"(risk_percent={sized_order.risk_percent:.4f})."
             )
+
+        try:
+            from alpaca.trading.enums import OrderSide, TimeInForce
+            from alpaca.trading.requests import MarketOrderRequest
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "alpaca-py is required for AlpacaLiveAdapter. Install package 'alpaca-py'."
+            ) from exc
 
         side = OrderSide.BUY if signal.action == "buy" else OrderSide.SELL
         await asyncio.to_thread(save_live_signal, signal)

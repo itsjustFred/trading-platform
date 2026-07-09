@@ -1,8 +1,8 @@
 # MT5 Strategy Tester XLSX — Spaltenschema & Mapping
 
-**Datum:** 2026-06-24  
-**Branch:** `kimchi-kimi-continue`  
-**Quelle:** `strategy-comparisons/intraday_volatility_breakout/`  
+**Datum:** 2026-06-24
+**Branch:** `kimchi-kimi-continue`
+**Quelle:** `strategy-comparisons/intraday_volatility_breakout/`
 **Berichtssprache:** Deutsch (MT5 Build 5836)
 
 ---
@@ -65,7 +65,7 @@ Das Sheet ist vertikal in drei logische Bereiche unterteilt:
 
 ### Tabelle A — Orders (Zeile 77 ist Header)
 
-**Zeilen:** 1.972 (inkl. Header)  
+**Zeilen:** 1.972 (inkl. Header)
 **Erste Zeile:** 77
 
 | Spalte (Deutsch) | Spalte (technisch) | Typ | Bemerkung |
@@ -93,7 +93,7 @@ Das Sheet ist vertikal in drei logische Bereiche unterteilt:
 
 ### Tabelle B — Trades / Deals (Zeile 1063 ist Header)
 
-**Zeilen:** 986 (inkl. Header + Balance-Initialisierung)  
+**Zeilen:** 986 (inkl. Header + Balance-Initialisierung)
 **Erste Zeile:** 1063
 
 | Spalte (Deutsch) | Spalte (technisch) | Typ | Bemerkung |
@@ -153,14 +153,14 @@ Kommentar      str
 
 ### Tabelle A — Orders
 
-**Zeilen:** 2.392  
-**Erste Zeile:** 77  
+**Zeilen:** 2.392
+**Erste Zeile:** 77
 **Spalten:** identisch zu EURUSD_H1 (`Eröffnungszeit`, `Auftrag`, `Symbol`, `Typ`, `Volumen`, `Preis`, `S / L`, `T / P`, `Zeit`, `Status`, `Kommentar`)
 
 ### Tabelle B — Trades / Deals
 
-**Zeilen:** 1.196  
-**Erste Zeile:** 1273  
+**Zeilen:** 1.196
+**Erste Zeile:** 1273
 **Spalten:** identisch zu EURUSD_H1 (`Zeit`, `Trade`, `Symbol`, `Typ`, `Richtung`, `Volumen`, `Preis`, `Auftrag`, `Kommission`, `Swap`, `Gewinn`, `Kontostand`, `Kommentar`)
 
 **Beispiel-Zeilen:**
@@ -185,14 +185,14 @@ Kommentar      str
 
 ### Tabelle A — Orders
 
-**Zeilen:** 2.052  
-**Erste Zeile:** 77  
+**Zeilen:** 2.052
+**Erste Zeile:** 77
 **Spalten:** identisch zu oben
 
 ### Tabelle B — Trades / Deals
 
-**Zeilen:** 1.026  
-**Erste Zeile:** 1103  
+**Zeilen:** 1.026
+**Erste Zeile:** 1103
 **Spalten:** identisch zu oben
 
 **Beispiel-Zeilen:**

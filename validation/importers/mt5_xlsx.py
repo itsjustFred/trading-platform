@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, tzinfo
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pandas as pd
 
@@ -15,6 +16,21 @@ from validation.importers.base import BaseImporter
 from validation.reference import ValidationReference
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_source_timezone(name: str | None) -> tzinfo:
+    """Resolve a timezone name to a tzinfo (defaults to UTC).
+
+    MT5 server timestamps are naive; the caller declares which timezone they are
+    in via ``source_timezone`` so they can be converted to canonical UTC instead
+    of being silently assumed to already be UTC.
+    """
+    if not name or name.upper() == "UTC":
+        return timezone.utc
+    try:
+        return ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ValueError(f"Unknown source_timezone {name!r}") from exc
 
 # German labels we scan for when locating tables and parsing metadata.
 _ORDERS_LABEL = "Orders"
@@ -71,13 +87,24 @@ for label, key in _STAT_LABELS:
 class MT5XLSXImporter(BaseImporter):
     """Import MT5 Strategy Tester XLSX reports (German UI)."""
 
-    def load(self, source: str | Path, **kwargs: Any) -> ValidationReference:
+    def load(
+        self,
+        source: str | Path,
+        *,
+        source_timezone: str = "UTC",
+        **kwargs: Any,
+    ) -> ValidationReference:
         """Read an MT5 XLSX report and return a ``ValidationReference``.
 
         Parameters
         ----------
         source:
             Path to the ``.xlsx`` file.
+        source_timezone:
+            Timezone the (naive) MT5 timestamps are recorded in. Defaults to
+            ``"UTC"`` (preserving legacy behavior); pass e.g. ``"Europe/Athens"``
+            for a broker server time so timestamps are converted to UTC instead
+            of being silently treated as UTC.
         **kwargs:
             Forwarded to ``pandas.read_excel`` (e.g. ``engine``).
         """
@@ -85,6 +112,7 @@ class MT5XLSXImporter(BaseImporter):
         if not path.exists():
             raise FileNotFoundError(f"MT5 XLSX report not found: {path}")
 
+        source_tz = _resolve_source_timezone(source_timezone)
         df_raw = pd.read_excel(path, header=None, sheet_name=0, **kwargs)
         rows = df_raw.values.tolist()
 
@@ -109,7 +137,7 @@ class MT5XLSXImporter(BaseImporter):
 
         # Parse Trades / Deals table (goes to end of sheet)
         trades_df = self._extract_table(df_raw, trades_header_idx, end_idx=None)
-        trades = self._build_trades(trades_df, sltp_map)
+        trades = self._build_trades(trades_df, sltp_map, source_tz=source_tz)
 
         return ValidationReference(
             strategy_name=meta.get("strategy_name", "unknown"),
@@ -404,7 +432,11 @@ class MT5XLSXImporter(BaseImporter):
     # ── trade reconstruction ──────────────────────────────────────────────
 
     @staticmethod
-    def _build_trades(trades_df: pd.DataFrame, sltp_map: dict[Any, dict[str, float | None]]) -> list[Trade]:
+    def _build_trades(
+        trades_df: pd.DataFrame,
+        sltp_map: dict[Any, dict[str, float | None]],
+        source_tz: tzinfo = timezone.utc,
+    ) -> list[Trade]:
         if trades_df.empty:
             return []
 
@@ -501,7 +533,7 @@ class MT5XLSXImporter(BaseImporter):
                 tp = mapped.get("tp")
 
             exit_obj = TradeExit(
-                time=MT5XLSXImporter._to_iso(exit_time_raw),
+                time=MT5XLSXImporter._to_iso(exit_time_raw, source_tz),
                 price=exit_price,
                 quantity=volume if volume is not None else 0.0,
                 pnl=pnl,
@@ -513,7 +545,7 @@ class MT5XLSXImporter(BaseImporter):
                 id=trade_id_counter,
                 symbol=symbol,
                 direction=direction_str,
-                entry_time=MT5XLSXImporter._to_iso(entry_time_raw),
+                entry_time=MT5XLSXImporter._to_iso(entry_time_raw, source_tz),
                 entry_price=entry_price if entry_price is not None else 0.0,
                 quantity=volume if volume is not None else 0.0,
                 exits=[exit_obj],
@@ -555,13 +587,18 @@ class MT5XLSXImporter(BaseImporter):
             return default
 
     @staticmethod
-    def _to_iso(raw: str) -> str:
-        """Convert MT5 datetime string to ISO-8601 UTC string."""
+    def _to_iso(raw: str, source_tz: tzinfo = timezone.utc) -> str:
+        """Convert an MT5 datetime string to an ISO-8601 UTC string.
+
+        The naive MT5 timestamp is localized to ``source_tz`` and then converted
+        to UTC, so a non-UTC broker server time is handled explicitly instead of
+        being silently assumed to already be UTC.
+        """
         text = raw.strip() if raw else ""
         for fmt in ("%Y.%m.%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
             try:
                 dt = datetime.strptime(text, fmt)
-                dt = dt.replace(tzinfo=timezone.utc)
+                dt = dt.replace(tzinfo=source_tz).astimezone(timezone.utc)
                 return dt.isoformat().replace("+00:00", "Z")
             except ValueError:
                 continue
