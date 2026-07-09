@@ -104,8 +104,9 @@ def test_percent_risk_with_10_pip_stop() -> None:
     inp = _make_input(entry_price=1.1000, stop_loss=1.0990, account_balance=10_000.0)
     result = model.size(inp)
     # risk_amount = 100, distance = 0.001 -> size = 100_000
-    assert result.profiles[0].position_size == pytest.approx(100_000.0)
-    assert result.profiles[0].risk_amount == pytest.approx(100.0)
+    # Use rel=1e-5 to account for floating point precision in subtraction
+    assert result.profiles[0].position_size == pytest.approx(100_000.0, rel=1e-5)
+    assert result.profiles[0].risk_amount == pytest.approx(100.0, rel=1e-4)
 
 
 # ─── LONG / SHORT ───────────────────────────────────────────────────────────

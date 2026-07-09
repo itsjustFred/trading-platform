@@ -59,13 +59,15 @@ tmp/
 uv.lock
 .accounts.env
 
-# graphify output (generated locally, not versioned)
-graphify-out/
-
-# kimchi tool runtime (ferments, reviews, events)
+# Kimchi runtime data (generated locally, large)
 .kimchi/
+
+# Graphify output (generated locally, not versioned)
+graphify-out/
 
 # Generated backtest/grid artifacts (regenerate locally; curated fixtures live
 # under tests/fixtures/)
+*.trades.json
+reports/*.csv
 reports/*.trades.json
 frontend/public/matrix-grid-overview.json

@@ -30,10 +30,7 @@ from data_tools.resample import resample_file
 from shared.constants import DATA_DIR, normalize_timeframe
 
 DEFAULT_SYMBOLS = ["XAUUSD", "SP500", "NAS100", "EURUSD", "USDJPY", "OIL"]
-DEFAULT_TIMEFRAMES = ["1m", "5m", "15m", "1h", "4h", "1d"]
-# Canonical ordering for every normalized timeframe we support. Used for stable
-# sorting; must stay in sync with shared.constants.VALID_TIMEFRAMES.
-TIMEFRAME_ORDER = ["1m", "5m", "15m", "30m", "1h", "4h", "1d"]
+DEFAULT_TIMEFRAMES = ["1m", "5m", "15m", "30m", "1h", "4h", "1d"]
 DEFAULT_START = "2020-01-01"
 CANONICAL_SYMBOLS = {
     "SP500": "US500",
@@ -78,19 +75,6 @@ def normalize_symbol(symbol: str, oil_alias: str = "USOIL") -> str:
 def normalize_timeframe_value(value: str) -> str:
     lowered = str(value or "").strip().lower()
     return normalize_timeframe(TIMEFRAME_ALIASES.get(lowered, lowered))
-
-
-def _timeframe_sort_key(timeframe: str) -> tuple[int, str]:
-    """Stable sort key for timeframes.
-
-    Unknown timeframes sort after all known ones instead of raising a
-    ``ValueError`` (the previous ``list.index`` based sort aborted the entire
-    download batch when an unmapped timeframe such as ``30m`` slipped through).
-    """
-    try:
-        return (TIMEFRAME_ORDER.index(timeframe), timeframe)
-    except ValueError:
-        return (len(TIMEFRAME_ORDER), timeframe)
 
 
 def normalize_ohlcv_columns(path: Path) -> None:
@@ -161,6 +145,8 @@ def ensure_alias_copy(canonical_path: Path, requested_symbol: str, asset_class: 
     return alias_path
 
 
+VALID_TIMEFRAMES = {"1m", "5m", "15m", "30m", "1h", "4h", "1d"}
+
 def download_symbol(
     *,
     requested_symbol: str,
@@ -175,17 +161,28 @@ def download_symbol(
     pause_ms: int,
     force: bool,
 ) -> dict[str, Any]:
+    # Validate timeframes early - fail fast per symbol/tf
+    invalid_timeframes = [tf for tf in timeframes if tf not in VALID_TIMEFRAMES]
+    if invalid_timeframes:
+        return {
+            "symbol": requested_symbol,
+            "canonical_symbol": canonical_symbol,
+            "asset_class": symbol_asset_class(canonical_symbol),
+            "requested_timeframes": timeframes,
+            "source": "dukascopy",
+            "status": "failed",
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "paths": {},
+            "error": f"Invalid timeframes: {invalid_timeframes}. Valid: {sorted(VALID_TIMEFRAMES)}",
+        }
+
     downloader = DukascopyNativeDownloader()
     asset_class = symbol_asset_class(canonical_symbol)
     canonical_dir = output_dir / "ohlcv" / "dukascopy" / asset_class / canonical_symbol
     requested_dir = output_dir / "ohlcv" / "dukascopy" / asset_class / requested_symbol
     source_path = canonical_dir / "1m.parquet"
-    # _timeframe_sort_key never raises, so an unmapped timeframe (e.g. a stray
-    # "30m" alias) can no longer abort the whole batch before error handling.
-    requested_timeframes = sorted(set(timeframes), key=_timeframe_sort_key)
-    unknown_timeframes = [tf for tf in requested_timeframes if tf not in TIMEFRAME_ORDER]
-    supported_timeframes = [tf for tf in requested_timeframes if tf in TIMEFRAME_ORDER]
-    higher_timeframes = [tf for tf in supported_timeframes if tf != "1m"]
+    requested_timeframes = sorted(set(timeframes), key=lambda tf: ["1m", "5m", "15m", "30m", "1h", "4h", "1d"].index(tf))
+    higher_timeframes = [tf for tf in requested_timeframes if tf != "1m"]
 
     started_at = datetime.now(timezone.utc).isoformat()
     result: dict[str, Any] = {
@@ -198,12 +195,9 @@ def download_symbol(
         "started_at": started_at,
         "paths": {},
     }
-    timeframe_errors: dict[str, str] = {
-        tf: f"Unsupported timeframe '{tf}'" for tf in unknown_timeframes
-    }
 
     try:
-        if "1m" in supported_timeframes:
+        if "1m" in requested_timeframes:
             if not source_path.exists() or force:
                 dl_result = downloader.download(
                     canonical_symbol,
@@ -227,28 +221,21 @@ def download_symbol(
             result["paths"]["rows_1m"] = parquet_rows(requested_1m)
 
         for tf in higher_timeframes:
-            # Isolate per-timeframe failures so one bad resample does not drop
-            # the timeframes that already succeeded for this symbol.
-            try:
-                target_path = requested_dir / f"{tf}.parquet"
-                if target_path.exists() and not force and parquet_non_null_ohlcv(target_path) == parquet_rows(target_path):
-                    result["paths"][tf] = str(target_path)
-                    result["paths"][f"rows_{tf}"] = parquet_rows(target_path)
-                    continue
-                resampled_paths = resample_file(source_path, [tf], output_dir=requested_dir)
-                target_path = resampled_paths[0]
+            target_path = requested_dir / f"{tf}.parquet"
+            if target_path.exists() and not force and parquet_non_null_ohlcv(target_path) == parquet_rows(target_path):
                 result["paths"][tf] = str(target_path)
                 result["paths"][f"rows_{tf}"] = parquet_rows(target_path)
-            except Exception as exc:
-                timeframe_errors[tf] = str(exc)
+                continue
+            resampled_paths = resample_file(source_path, [tf], output_dir=requested_dir)
+            target_path = resampled_paths[0]
+            result["paths"][tf] = str(target_path)
+            result["paths"][f"rows_{tf}"] = parquet_rows(target_path)
 
-        result["status"] = "failed" if timeframe_errors else "ok"
+        result["status"] = "ok"
     except Exception as exc:
         result["status"] = "failed"
         result["error"] = str(exc)
 
-    if timeframe_errors:
-        result["timeframe_errors"] = timeframe_errors
     result["finished_at"] = datetime.now(timezone.utc).isoformat()
     return result
 

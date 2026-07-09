@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import datetime, timezone, tzinfo
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +12,6 @@ from bs4 import BeautifulSoup
 
 from shared.models import Trade, TradeExit
 from validation.importers.base import BaseImporter
-from validation.importers.mt5_xlsx import _resolve_source_timezone
 from validation.reference import ValidationReference
 
 logger = logging.getLogger(__name__)
@@ -71,63 +70,55 @@ for label, key in _STAT_LABELS:
 class MT5HTMLImporter(BaseImporter):
     """Import MT5 Strategy Tester HTML reports (German UI)."""
 
-    def load(
-        self,
-        source: str | Path,
-        *,
-        source_timezone: str = "UTC",
-        **kwargs: Any,
-    ) -> ValidationReference:
-        """Read an MT5 HTML report and return a ``ValidationReference``.
+    def load(self, source: str | Path, source_timezone: str | None = None, **kwargs: Any) -> ValidationReference:
+            """Read an MT5 HTML report and return a ``ValidationReference``.
 
-        Parameters
-        ----------
-        source:
-            Path to the ``.html`` file.
-        source_timezone:
-            Timezone the (naive) MT5 timestamps are recorded in. Defaults to
-            ``"UTC"`` (legacy behavior); pass e.g. ``"Europe/Athens"`` for a
-            broker server time so timestamps are converted to UTC.
-        **kwargs:
-            Forwarded to ``BeautifulSoup`` parser selection.
-        """
-        path = Path(source)
-        if not path.exists():
-            raise FileNotFoundError(f"MT5 HTML report not found: {path}")
+            Parameters
+            ----------
+            source:
+                Path to the ``.html`` file.
+            source_timezone:
+                Optional IANA timezone name (e.g. \"Europe/Athens\") of the report's timestamps.
+                If provided, naive timestamps will be interpreted in this timezone and
+                converted to UTC. Defaults to UTC if not provided.
+            **kwargs:
+                Forwarded to ``BeautifulSoup`` parser selection.
+            """
+            path = Path(source)
+            if not path.exists():
+                raise FileNotFoundError(f"MT5 HTML report not found: {path}")
 
-        source_tz = _resolve_source_timezone(source_timezone)
-        html_text = path.read_text(encoding="utf-8", errors="replace")
-        soup = BeautifulSoup(html_text, kwargs.pop("features", "lxml"))
+            html_text = path.read_text(encoding="utf-8", errors="replace")
+            soup = BeautifulSoup(html_text, kwargs.pop("features", "lxml"))
 
-        meta = self._parse_meta(soup)
-        settings = meta.pop("settings", {})
-        stats = self._parse_stats(soup)
-        raw_metadata = {"parsed_meta": meta, "parsed_stats": stats}
+            meta = self._parse_meta(soup)
+            settings = meta.pop("settings", {})
+            stats = self._parse_stats(soup)
+            raw_metadata = {"parsed_meta": meta, "parsed_stats": stats}
 
-        # Locate Orders and Trades tables
-        orders_table = self._find_table_by_header_keywords(soup, _ORDERS_LABELS, required_cols=["Auftrag"])
-        trades_table = self._find_table_by_header_keywords(soup, _TRADES_LABELS, required_cols=["Zeit", "Richtung"])
+            # Locate Orders and Trades tables
+            orders_table = self._find_table_by_header_keywords(soup, _ORDERS_LABELS, required_cols=["Auftrag"])
+            trades_table = self._find_table_by_header_keywords(soup, _TRADES_LABELS, required_cols=["Zeit", "Richtung"])
 
-        if orders_table is None:
-            raise ValueError("Could not locate 'Orders' table in the HTML report.")
-        if trades_table is None:
-            raise ValueError("Could not locate 'Trades' table in the HTML report.")
+            if orders_table is None:
+                raise ValueError("Could not locate 'Orders' table in the HTML report.")
+            if trades_table is None:
+                raise ValueError("Could not locate 'Trades' table in the HTML report.")
 
-        sltp_map = self._build_sltp_map(orders_table)
-        trades = self._build_trades(trades_table, sltp_map, source_tz=source_tz)
+            sltp_map = self._build_sltp_map(orders_table)
+            trades = self._build_trades(trades_table, sltp_map, source_timezone)
 
-        return ValidationReference(
-            strategy_name=meta.get("strategy_name", "unknown"),
-            source_framework="mt5_html",
-            symbol=meta.get("symbol", ""),
-            timeframe=meta.get("timeframe", ""),
-            settings=settings,
-            trades=trades,
-            stats=stats,
-            raw_metadata=raw_metadata,
-            source_path=str(path.resolve()),
-        )
-
+            return ValidationReference(
+                strategy_name=meta.get("strategy_name", "unknown"),
+                source_framework="mt5_html",
+                symbol=meta.get("symbol", ""),
+                timeframe=meta.get("timeframe", ""),
+                settings=settings,
+                trades=trades,
+                stats=stats,
+                raw_metadata=raw_metadata,
+                source_path=str(path.resolve()),
+            )
     # ── helpers ───────────────────────────────────────────────────────────
 
     @staticmethod
@@ -415,7 +406,7 @@ class MT5HTMLImporter(BaseImporter):
     def _build_trades(
         trades_table: BeautifulSoup,
         sltp_map: dict[str, dict[str, float | None]],
-        source_tz: tzinfo = timezone.utc,
+        source_timezone: str | None = None,
     ) -> list[Trade]:
         rows = MT5HTMLImporter._table_to_rows(trades_table)
         if not rows:
@@ -425,6 +416,7 @@ class MT5HTMLImporter(BaseImporter):
         data_rows = rows[1:]
 
         col_time = MT5HTMLImporter._find_col_index(header, ["Zeit"])
+        col_trade_id = MT5HTMLImporter._find_col_index(header, ["Auftrag", "Trade"])
         col_typ = MT5HTMLImporter._find_col_index(header, ["Typ"])
         col_direction = MT5HTMLImporter._find_col_index(header, ["Richtung"])
         col_symbol = MT5HTMLImporter._find_col_index(header, ["Symbol"])
@@ -439,44 +431,35 @@ class MT5HTMLImporter(BaseImporter):
         if col_time is None or col_direction is None:
             raise ValueError("Trades table is missing required columns (Zeit / Richtung).")
 
-        trades: list[Trade] = []
-        i = 0
-        trade_id_counter = 1
-        n = len(data_rows)
+        # Build mapping: trade_id -> {entry_row, exit_row}
+        # MT5 exports each trade as two rows: entry (in) and exit (out) with same Trade/Order ID
+        trade_rows: dict[str, dict[str, list[str]]] = {}
 
-        while i < n:
-            row = data_rows[i]
+        for row in data_rows:
             typ = MT5HTMLImporter._get_str(row, col_typ, "").lower()
             direction = MT5HTMLImporter._get_str(row, col_direction, "").lower()
 
             if typ == "balance" or direction not in ("in", "out"):
-                i += 1
                 continue
 
-            if direction != "in":
-                i += 1
+            tid = MT5HTMLImporter._get_str(row, col_trade_id, "") if col_trade_id is not None else ""
+            if not tid:
                 continue
 
-            entry_row = row
-            j = i + 1
-            exit_row = None
-            while j < n:
-                nxt = data_rows[j]
-                nxt_typ = MT5HTMLImporter._get_str(nxt, col_typ, "").lower()
-                nxt_dir = MT5HTMLImporter._get_str(nxt, col_direction, "").lower()
-                if nxt_typ == "balance":
-                    j += 1
-                    continue
-                if nxt_dir == "out":
-                    exit_row = nxt
-                    break
-                if nxt_dir == "in":
-                    break
-                j += 1
+            if tid not in trade_rows:
+                trade_rows[tid] = {}
+            trade_rows[tid][direction] = row
 
-            if exit_row is None:
-                i = j if j > i else i + 1
-                continue
+        trades: list[Trade] = []
+        trade_id_counter = 1
+
+        # Pair entry/exit by trade_id
+        for tid, pair in trade_rows.items():
+            entry_row = pair.get("in")
+            exit_row = pair.get("out")
+
+            if entry_row is None or exit_row is None:
+                continue  # Incomplete trade pair
 
             symbol = MT5HTMLImporter._get_str(entry_row, col_symbol, "")
             entry_time_raw = MT5HTMLImporter._get_str(entry_row, col_time, "")
@@ -508,7 +491,7 @@ class MT5HTMLImporter(BaseImporter):
                 tp = mapped.get("tp")
 
             exit_obj = TradeExit(
-                time=MT5HTMLImporter._to_iso(exit_time_raw, source_tz),
+                time=MT5HTMLImporter._to_iso(exit_time_raw, source_timezone),
                 price=exit_price if exit_price is not None else 0.0,
                 quantity=volume if volume is not None else 0.0,
                 pnl=pnl,
@@ -520,7 +503,7 @@ class MT5HTMLImporter(BaseImporter):
                 id=trade_id_counter,
                 symbol=symbol,
                 direction=direction_str,
-                entry_time=MT5HTMLImporter._to_iso(entry_time_raw, source_tz),
+                entry_time=MT5HTMLImporter._to_iso(entry_time_raw, source_timezone),
                 entry_price=entry_price if entry_price is not None else 0.0,
                 quantity=volume if volume is not None else 0.0,
                 exits=[exit_obj],
@@ -539,7 +522,6 @@ class MT5HTMLImporter(BaseImporter):
             )
             trades.append(trade)
             trade_id_counter += 1
-            i = j + 1
 
         return trades
 
@@ -571,13 +553,18 @@ class MT5HTMLImporter(BaseImporter):
             return default
 
     @staticmethod
-    def _to_iso(raw: str, source_tz: tzinfo = timezone.utc) -> str:
-        """Convert a naive MT5 datetime string from ``source_tz`` to ISO-8601 UTC."""
+    def _to_iso(raw: str, source_tz: str | None = None) -> str:
         text = raw.strip() if raw else ""
         for fmt in ("%Y.%m.%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
             try:
                 dt = datetime.strptime(text, fmt)
-                dt = dt.replace(tzinfo=source_tz).astimezone(timezone.utc)
+                if source_tz:
+                    import zoneinfo
+                    tz = zoneinfo.ZoneInfo(source_tz)
+                    dt = dt.replace(tzinfo=tz)
+                    dt = dt.astimezone(timezone.utc)
+                else:
+                    dt = dt.replace(tzinfo=timezone.utc)
                 return dt.isoformat().replace("+00:00", "Z")
             except ValueError:
                 continue

@@ -222,6 +222,24 @@ def _detect_date_range(symbol: str, timeframe: str, data_dir: str) -> tuple[str,
     return ts.min().strftime("%Y-%m-%d"), ts.max().strftime("%Y-%m-%d")
 
 
+def _resolve_dates_for_equity(
+    symbol: str,
+    timeframe: str,
+    data_dir: str,
+    start: str,
+    end: str,
+) -> tuple[str, str]:
+    """Resolve start/end dates for equity curve attachment."""
+    start_date = start
+    end_date = end
+    normalized_timeframe = normalize_timeframe_value(timeframe)
+    if not start_date or not end_date:
+        detected_start, detected_end = _detect_date_range(symbol, normalized_timeframe, data_dir)
+        start_date = start_date or detected_start
+        end_date = end_date or detected_end
+    return start_date, end_date
+
+
 def run_one_backtest_in_process(
     *,
     strategy: str,
@@ -259,13 +277,17 @@ def run_one_backtest_in_process(
     if skip_existing and path.exists():
         try:
             backtest_result = BacktestResult.load(path)
-            attach_daily_equity(backtest_result, start_date=start, end_date=end)
+            # Resolve dates for equity attachment if not provided
+            resolved_start, resolved_end = _resolve_dates_for_equity(
+                symbol, timeframe, data_dir, start, end
+            )
+            attach_daily_equity(backtest_result, start=resolved_start, end=resolved_end)
             backtest_result.stats = {**backtest_result.stats, **compute_stats_for_result(backtest_result)}
             backtest_result.save(path)
             result.update(read_backtest_stats(path))
             result.update({"status": "skipped_existing", "finished_at": datetime.now(timezone.utc).isoformat()})
             return result
-        except Exception as exc:
+        except (json.JSONDecodeError, ValidationError, OSError, ValueError) as exc:
             result.update({"status": "failed", "error": f"existing output is invalid: {exc}"})
             return result
 
@@ -284,10 +306,6 @@ def run_one_backtest_in_process(
             detected_start, detected_end = _detect_date_range(symbol, normalized_timeframe, data_dir)
             start_date = start_date or detected_start
             end_date = end_date or detected_end
-        # Record the date range actually used so the result metadata and daily
-        # equity window match the backtest window.
-        result["start"] = start_date
-        result["end"] = end_date
 
         downloaded = ensure_backtest_data(
             symbols=[symbol],
@@ -325,7 +343,8 @@ def run_one_backtest_in_process(
         backtest_result.meta.id = run_id
         if not keep_indicators:
             backtest_result.indicators = []
-        attach_daily_equity(backtest_result, start_date=start_date, end_date=end_date)
+        # Use resolved dates for daily equity attachment
+        attach_daily_equity(backtest_result, start=start_date, end=end_date)
         backtest_result.stats = {**backtest_result.stats, **compute_stats_for_result(backtest_result)}
         output_dir.mkdir(parents=True, exist_ok=True)
         backtest_result.save(path)
@@ -406,22 +425,31 @@ def run_one_backtest(
     if skip_existing and path.exists():
         try:
             backtest_result = BacktestResult.load(path)
-            attach_daily_equity(backtest_result, start_date=start, end_date=end)
+            # Resolve dates for equity attachment if not provided
+            resolved_start, resolved_end = _resolve_dates_for_equity(
+                symbol, timeframe, data_dir, start, end
+            )
+            attach_daily_equity(backtest_result, start=resolved_start, end=resolved_end)
             backtest_result.stats = {**backtest_result.stats, **compute_stats_for_result(backtest_result)}
             backtest_result.save(path)
             result.update(read_backtest_stats(path))
             result.update({"status": "skipped_existing", "finished_at": datetime.now(timezone.utc).isoformat()})
             return result
-        except Exception as exc:
+        except (json.JSONDecodeError, ValidationError, OSError, ValueError) as exc:
             result.update({"status": "failed", "error": f"existing output is invalid: {exc}"})
             return result
+
+    # Resolve dates for CLI command and equity attachment
+    resolved_start, resolved_end = _resolve_dates_for_equity(
+        symbol, timeframe, data_dir, start, end
+    )
 
     cmd = build_cli_command(
         strategy=strategy,
         symbol=symbol,
         timeframe=timeframe,
-        start=start,
-        end=end,
+        start=resolved_start,
+        end=resolved_end,
         engine=engine,
         capital=capital,
         risk_pct=risk_pct,
@@ -448,44 +476,20 @@ def run_one_backtest(
             timeout=timeout_seconds,
             env=env,
         )
-    except subprocess.TimeoutExpired as exc:
-        # Isolate the timeout to this grid cell. Without this the exception would
-        # propagate through future.result()/the serial loop and abort the entire
-        # grid run.
-        partial = exc.stdout or ""
-        if isinstance(partial, bytes):
-            partial = partial.decode("utf-8", "replace")
-        result.update(
-            {
-                "status": "failed",
-                "error_class": "timeout",
-                "returncode": None,
-                "error": f"grid cell timed out after {timeout_seconds}s\n{partial[-2000:]}".strip(),
-                "finished_at": datetime.now(timezone.utc).isoformat(),
-            }
-        )
-        return result
-    except (OSError, subprocess.SubprocessError) as exc:
-        result.update(
-            {
-                "status": "failed",
-                "error_class": "subprocess_error",
-                "returncode": None,
-                "error": f"grid cell subprocess failed to run: {exc}",
-                "finished_at": datetime.now(timezone.utc).isoformat(),
-            }
-        )
-        return result
+        result["returncode"] = proc.returncode
+        result["finished_at"] = datetime.now(timezone.utc).isoformat()
 
-    result["returncode"] = proc.returncode
-    result["finished_at"] = datetime.now(timezone.utc).isoformat()
-
-    if proc.returncode == 0 and path.exists():
-        result.update(read_backtest_stats(path))
-        result["status"] = "ok"
-    else:
+        if proc.returncode == 0 and path.exists():
+            result.update(read_backtest_stats(path))
+            result["status"] = "ok"
+        else:
+            result["status"] = "failed"
+            result["error"] = proc.stdout[-4000:] if proc.stdout else "no output captured"
+    except subprocess.TimeoutExpired:
         result["status"] = "failed"
-        result["error"] = proc.stdout[-4000:] if proc.stdout else "no output captured"
+        result["returncode"] = -1
+        result["finished_at"] = datetime.now(timezone.utc).isoformat()
+        result["error"] = f"timeout after {timeout_seconds}s"
     return result
 
 

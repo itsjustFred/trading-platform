@@ -279,9 +279,6 @@ class TradeComparator:
         diff_abs = _abs_diff(expected, actual)
         passed_pct = diff_pct <= tolerance_pct
         passed_abs = diff_abs <= tolerance_abs
-        # Percentage and absolute tolerances are alternatives: a match passes
-        # when EITHER is satisfied (e.g. a tiny absolute diff on a near-zero
-        # expected PnL has a huge relative diff but is still effectively equal).
         passed = passed_pct or passed_abs
         return FieldComparisonResult(
             field="pnl",

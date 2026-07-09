@@ -27,6 +27,29 @@ from validation.reference import ValidationReference
 from validation.stats.calculator import TradeStatistics, compute_trade_statistics
 
 
+class _SafeJSONEncoder(json.JSONEncoder):
+    """JSON encoder that converts non-finite floats to None."""
+
+    def encode(self, o: Any) -> str:
+        return super().encode(_sanitize_for_json(o))
+
+    def iterencode(self, o: Any, **kwargs: Any):
+        return super().iterencode(_sanitize_for_json(o), **kwargs)
+
+
+def _sanitize_for_json(obj: Any) -> Any:
+    """Recursively sanitize non-finite floats to None for JSON serialization."""
+    if isinstance(obj, float):
+        if math.isfinite(obj):
+            return obj
+        return None  # Convert nan, inf, -inf to None
+    if isinstance(obj, dict):
+        return {k: _sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [_sanitize_for_json(v) for v in obj]
+    return obj
+
+
 def _stats_from_reference(reference: ValidationReference) -> TradeStatistics:
     """Build TradeStatistics from reference.stats when no trades are present."""
     allowed_fields = set(TradeStatistics.model_fields.keys())
@@ -476,34 +499,12 @@ def generate_json_report(
         explanations=explanations,
     )
 
-    payload = _sanitize_json_numbers(report.model_dump(mode="json"))
-    try:
-        return json.dumps(
-            payload,
-            indent=2,
-            ensure_ascii=False,
-            allow_nan=False,
-        )
-    except ValueError as exc:  # pragma: no cover - defensive guard
-        raise ValueError(
-            "Validation report contains values that cannot be encoded as strict "
-            f"JSON (nan/inf leaked past sanitization): {exc}"
-        ) from exc
-
-
-def _sanitize_json_numbers(value: Any) -> Any:
-    """Recursively replace non-finite floats (nan/inf/-inf) with ``None``.
-
-    ``json.dumps`` would otherwise emit ``NaN``/``Infinity`` tokens, which are
-    not valid strict JSON and break strict parsers downstream.
-    """
-    if isinstance(value, float):
-        return value if math.isfinite(value) else None
-    if isinstance(value, dict):
-        return {key: _sanitize_json_numbers(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_sanitize_json_numbers(item) for item in value]
-    return value
+    return json.dumps(
+        report.model_dump(mode="json"),
+        indent=2,
+        ensure_ascii=False,
+        cls=_SafeJSONEncoder,
+    )
 
 
 def _build_recommendation(data: dict[str, Any]) -> list[str]:

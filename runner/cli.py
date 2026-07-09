@@ -212,7 +212,7 @@ def cmd_run(args):
         result.meta.id = result_id
     if engine.name != "native":
         _emit_progress(progress_callback, 90.0, "Calculating statistics...")
-    attach_daily_equity(result, start_date=start, end_date=end)
+    attach_daily_equity(result, start=start, end=end)
     result.stats = {**result.stats, **compute_stats_for_result(result)}
 
     # Save result

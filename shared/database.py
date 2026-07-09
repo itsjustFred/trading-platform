@@ -304,19 +304,6 @@ class GridRecord(SQLModel, table=True):
     engine: str = Field(default="vectorbt", index=True)
 
 
-def _normalize_optional_id(value: Any) -> str | None:
-    """Normalize an optional external id to a real ``None`` or a clean string.
-
-    Missing values (``None``), empty strings and whitespace-only strings all
-    collapse to ``None`` so they stay real SQL ``NULL`` (never the literal
-    ``"None"``). Any present value becomes its stripped string form.
-    """
-    if value is None:
-        return None
-    normalized = str(value).strip()
-    return normalized or None
-
-
 class LiveSignalModel(SQLModel, table=True):
     __tablename__ = "live_signals"
 
@@ -338,6 +325,19 @@ class LiveSignalModel(SQLModel, table=True):
 
     @classmethod
     def from_live_signal(cls, signal: LiveSignal) -> "LiveSignalModel":
+        discord_msg_id = signal.metadata.get("discord_message_id")
+        # Normalize: keep None as None (real SQL NULL), convert empty/whitespace to None
+        if discord_msg_id is not None:
+            discord_msg_id = str(discord_msg_id).strip()
+            if not discord_msg_id:
+                discord_msg_id = None
+
+        broker_order_id = signal.metadata.get("broker_order_id")
+        if broker_order_id is not None:
+            broker_order_id = str(broker_order_id).strip()
+            if not broker_order_id:
+                broker_order_id = ""
+
         return cls(
             id=str(signal.id),
             deployment_id=signal.deployment_id,
@@ -346,10 +346,8 @@ class LiveSignalModel(SQLModel, table=True):
             theoretical_price=signal.theoretical_price,
             timestamp=signal.timestamp,
             source=str(signal.metadata.get("source", "internal")),
-            broker_order_id=str(signal.metadata.get("broker_order_id") or ""),
-            discord_message_id=_normalize_optional_id(
-                signal.metadata.get("discord_message_id")
-            ),
+            broker_order_id=broker_order_id or "",
+            discord_message_id=discord_msg_id,
             metadata_json=signal.metadata,
         )
 
@@ -798,134 +796,6 @@ def _table_column_names(connection: Connection, table_name: str) -> set[str]:
     return {str(row[1]) for row in rows}
 
 
-def _backfill_live_signal_discord_ids(connection: Connection) -> None:
-    """Backfill ``live_signals.discord_message_id`` from JSON metadata.
-
-    Idempotent: rows that already carry a discord_message_id are left untouched,
-    so a second migration run changes nothing. Duplicate ids found across rows
-    are resolved deterministically (earliest timestamp, then lowest id wins);
-    the losers stay NULL so the unique index can be created safely.
-    """
-    rows = connection.execute(
-        text(
-            "SELECT id, timestamp, metadata FROM live_signals "
-            "WHERE discord_message_id IS NULL"
-        )
-    ).fetchall()
-    if not rows:
-        return
-
-    # Map normalized discord id -> list of (timestamp, id) candidates.
-    candidates: dict[str, list[tuple[str, str]]] = {}
-    for row in rows:
-        row_id = str(row[0])
-        timestamp = str(row[1] or "")
-        raw_metadata = row[2]
-        try:
-            metadata = json.loads(raw_metadata) if isinstance(raw_metadata, str) else (raw_metadata or {})
-        except (TypeError, ValueError):
-            metadata = {}
-        if not isinstance(metadata, dict):
-            continue
-        discord_id = _normalize_optional_id(metadata.get("discord_message_id"))
-        if discord_id is None:
-            continue
-        candidates.setdefault(discord_id, []).append((timestamp, row_id))
-
-    if not candidates:
-        return
-
-    # Exclude ids already present on other rows so we never collide with an
-    # already-backfilled record (keeps a re-run idempotent).
-    for discord_id in list(candidates):
-        already = connection.execute(
-            text(
-                "SELECT 1 FROM live_signals "
-                "WHERE discord_message_id = :discord_id LIMIT 1"
-            ),
-            {"discord_id": discord_id},
-        ).first()
-        if already is not None:
-            candidates.pop(discord_id, None)
-
-    for discord_id, entries in candidates.items():
-        # Deterministic canonical pick: earliest timestamp, then lowest id.
-        winner_id = min(entries, key=lambda item: (item[0], item[1]))[1]
-        connection.execute(
-            text(
-                "UPDATE live_signals SET discord_message_id = :discord_id "
-                "WHERE id = :row_id"
-            ),
-            {"discord_id": discord_id, "row_id": winner_id},
-        )
-
-
-def _backfill_backtest_equity_curves(connection: Connection) -> None:
-    """Backfill empty ``backtests.equity_curve`` values.
-
-    Priority order per backtest: (1) relational ``equity_points`` rows, then
-    (2) the associated ``*.trades.json`` file. Otherwise the curve is left empty
-    and a warning is logged. Idempotent and never overwrites a non-empty curve.
-    """
-    rows = connection.execute(
-        text("SELECT id, equity_curve FROM backtests")
-    ).fetchall()
-    if not rows:
-        return
-
-    backtests_dir = DATA_DIR / "backtests"
-    for row in rows:
-        backtest_id = str(row[0])
-        raw_curve = row[1]
-        try:
-            curve = json.loads(raw_curve) if isinstance(raw_curve, str) else (raw_curve or [])
-        except (TypeError, ValueError):
-            curve = []
-        if isinstance(curve, list) and curve:
-            continue  # already populated — never overwrite
-
-        # (1) relational equity_points
-        point_rows = connection.execute(
-            text(
-                "SELECT time, equity FROM equity_points "
-                "WHERE backtest_id = :backtest_id ORDER BY id ASC"
-            ),
-            {"backtest_id": backtest_id},
-        ).fetchall()
-        new_curve = [{"time": pr[0], "equity": pr[1]} for pr in point_rows]
-
-        # (2) associated JSON backtest file
-        if not new_curve:
-            json_path = backtests_dir / f"{backtest_id}.trades.json"
-            if json_path.exists():
-                try:
-                    payload = json.loads(json_path.read_text(encoding="utf-8"))
-                    json_curve = payload.get("equity_curve", []) if isinstance(payload, dict) else []
-                    if isinstance(json_curve, list):
-                        new_curve = [
-                            {"time": pt.get("time"), "equity": pt.get("equity")}
-                            for pt in json_curve
-                            if isinstance(pt, dict)
-                        ]
-                except (OSError, ValueError) as exc:
-                    logger.warning(
-                        "Could not read equity_curve from %s: %s", json_path, exc
-                    )
-
-        if new_curve:
-            connection.execute(
-                text(
-                    "UPDATE backtests SET equity_curve = :curve WHERE id = :backtest_id"
-                ),
-                {"curve": json.dumps(new_curve), "backtest_id": backtest_id},
-            )
-        else:
-            logger.warning(
-                "No equity_curve source found for backtest %s (left empty)",
-                backtest_id,
-            )
-
-
 def _migrate_schema() -> None:
     with ENGINE.begin() as connection:
         deployment_column_names = _table_column_names(connection, "live_deployments")
@@ -1049,9 +919,6 @@ def _migrate_schema() -> None:
                 text("ALTER TABLE live_signals ADD COLUMN discord_message_id TEXT")
             )
         if _table_column_names(connection, "live_signals") and "discord_message_id" in _table_column_names(connection, "live_signals"):
-            # Backfill discord_message_id from JSON metadata for legacy rows BEFORE
-            # creating the unique index so existing duplicates do not abort it.
-            _backfill_live_signal_discord_ids(connection)
             connection.execute(
                 text(
                     "CREATE UNIQUE INDEX IF NOT EXISTS uq_live_signals_discord_msg_id "
@@ -1063,10 +930,46 @@ def _migrate_schema() -> None:
         backtest_column_names = _table_column_names(connection, "backtests")
         if backtest_column_names and "equity_curve" not in backtest_column_names:
             connection.execute(text("ALTER TABLE backtests ADD COLUMN equity_curve TEXT DEFAULT '[]'"))
-        if _table_column_names(connection, "backtests") and "equity_curve" in _table_column_names(connection, "backtests"):
-            # Backfill equity_curve for legacy rows that migrated in with an empty
-            # curve, so the portfolio optimizer can read it straight from SQLite.
-            _backfill_backtest_equity_curves(connection)
+
+        # Backfill equity_curve for existing backtests with empty equity_curve
+        if backtest_column_names and "equity_curve" in backtest_column_names:
+            backtests_to_fill = connection.execute(
+                text("SELECT id, equity_curve FROM backtests WHERE equity_curve IS NULL OR equity_curve = '[]' OR equity_curve = ''")
+            ).fetchall()
+            for row in backtests_to_fill:
+                bt_id, eq_curve = row
+                if eq_curve and eq_curve != '[]':
+                    try:
+                        import json
+                        eq_list = json.loads(eq_curve)
+                        if eq_list:
+                            connection.execute(
+                                text("UPDATE backtests SET equity_curve = :eq WHERE id = :id"),
+                                {"eq": json.dumps(eq_list), "id": bt_id},
+                            )
+                    except Exception:
+                        pass  # Skip invalid JSON
+
+        # Backfill discord_message_id from metadata for existing live_signals
+        live_signal_column_names = _table_column_names(connection, "live_signals")
+        if live_signal_column_names and "discord_message_id" in live_signal_column_names:
+            signals_to_fill = connection.execute(
+                text("SELECT id, metadata FROM live_signals WHERE discord_message_id IS NULL OR discord_message_id = ''")
+            ).fetchall()
+            for row in signals_to_fill:
+                sig_id, meta_json = row
+                if meta_json:
+                    try:
+                        import json
+                        meta = json.loads(meta_json)
+                        discord_msg_id = meta.get("discord_message_id")
+                        if discord_msg_id:
+                            connection.execute(
+                                text("UPDATE live_signals SET discord_message_id = :dmid WHERE id = :id"),
+                                {"dmid": str(discord_msg_id), "id": sig_id},
+                            )
+                    except Exception:
+                        pass  # Skip invalid JSON
 
         execution_column_names = _table_column_names(connection, "live_executions")
         if execution_column_names and "dedupe_key" not in execution_column_names:
@@ -1078,37 +981,6 @@ def _migrate_schema() -> None:
                     "ON live_executions(dedupe_key) WHERE dedupe_key IS NOT NULL"
                 )
             )
-
-
-def _handle_duplicate_live_signal(
-    session: Session, existing: LiveSignalModel, record: LiveSignalModel
-) -> None:
-    """Resolve a duplicate live signal in favour of the persisted record.
-
-    Core signal data is never overwritten, but a missing ``broker_order_id`` on
-    the existing record is backfilled from the incoming one so a late order link
-    is not lost. An already-set broker_order_id is never replaced.
-    """
-    discord_msg_id = existing.discord_message_id
-    incoming_order_id = str(record.broker_order_id or "").strip()
-    existing_order_id = str(existing.broker_order_id or "").strip()
-    if incoming_order_id and not existing_order_id:
-        existing.broker_order_id = incoming_order_id
-        metadata = dict(existing.metadata_json or {})
-        metadata["broker_order_id"] = incoming_order_id
-        existing.metadata_json = metadata
-        session.add(existing)
-        session.commit()
-        logger.info(
-            "Backfilled broker_order_id=%s on existing live signal "
-            "(discord_message_id=%s)",
-            incoming_order_id,
-            discord_msg_id,
-        )
-    else:
-        logger.info(
-            "Skipping duplicate live signal (discord_message_id=%s)", discord_msg_id
-        )
 
 
 def save_live_signal(signal: LiveSignal) -> None:
@@ -1124,25 +996,28 @@ def save_live_signal(signal: LiveSignal) -> None:
                 .limit(1)
             ).first()
             if existing is not None:
-                _handle_duplicate_live_signal(session, existing, record)
+                # Reconcile broker_order_id: if existing lacks it but new record has it, update
+                new_broker_id = (record.broker_order_id or "").strip()
+                existing_broker_id = (existing.broker_order_id or "").strip()
+                if new_broker_id and not existing_broker_id:
+                    existing.broker_order_id = new_broker_id
+                    # Also update metadata_json for consistency
+                    metadata = dict(existing.metadata_json or {})
+                    metadata["broker_order_id"] = new_broker_id
+                    existing.metadata_json = metadata
+                    session.add(existing)
+                    session.commit()
+                    logger.info(
+                        "Updated existing live signal with broker_order_id (discord_message_id=%s)",
+                        discord_msg_id,
+                    )
+                else:
+                    logger.info(
+                        "Skipping duplicate live signal (discord_message_id=%s)", discord_msg_id
+                    )
                 return
         session.add(record)
-        try:
-            session.commit()
-        except IntegrityError:
-            # Lost a race against a concurrent writer on the unique index; reload
-            # the winning record and treat this as a duplicate.
-            session.rollback()
-            if not discord_msg_id:
-                raise
-            existing = session.exec(
-                select(LiveSignalModel)
-                .where(LiveSignalModel.discord_message_id == discord_msg_id)
-                .limit(1)
-            ).first()
-            if existing is None:
-                raise
-            _handle_duplicate_live_signal(session, existing, record)
+        session.commit()
 
 
 def save_live_execution(execution: LiveExecution) -> bool:
@@ -1903,30 +1778,6 @@ def save_result_to_sqlite(result: BacktestResult) -> None:
         session.commit()
 
 
-def _topup_existing_equity_curve(result: BacktestResult) -> bool:
-    """Fill an empty equity_curve on an already-persisted backtest from JSON data.
-
-    Returns ``True`` if the row was updated. Never overwrites a non-empty curve,
-    so repeated calls are idempotent.
-    """
-    new_curve = [point.to_dict() for point in result.equity_curve]
-    if not new_curve:
-        return False
-    with get_session() as session:
-        record = session.get(BacktestRecord, result.meta.id)
-        if record is None or (record.equity_curve and len(record.equity_curve) > 0):
-            return False
-        record.equity_curve = new_curve
-        session.add(record)
-        session.commit()
-    logger.info(
-        "Backfilled equity_curve (%d points) for existing backtest %s",
-        len(new_curve),
-        result.meta.id,
-    )
-    return True
-
-
 def migrate_json_to_sqlite(*, skip_existing: bool = True) -> dict[str, int]:
     """Migrate legacy ``*.trades.json`` files into SQLite.
 
@@ -1961,13 +1812,7 @@ def migrate_json_to_sqlite(*, skip_existing: bool = True) -> dict[str, int]:
             payload = json.loads(path.read_text(encoding="utf-8"))
             result = BacktestResult.from_dict(payload)
             if skip_existing and result.meta.id in existing_ids:
-                # Even when skipping a full re-write, top up an existing row whose
-                # equity_curve is still empty so the portfolio optimizer can read
-                # it from SQLite. Never overwrite a non-empty curve.
-                if _topup_existing_equity_curve(result):
-                    summary["migrated"] += 1
-                else:
-                    summary["skipped"] += 1
+                summary["skipped"] += 1
                 continue
             save_result_to_sqlite(result)
             existing_ids.add(result.meta.id)

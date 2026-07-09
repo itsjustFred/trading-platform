@@ -6,10 +6,10 @@ Saves results to SQLite for portfolio optimizer consumption.
 from __future__ import annotations
 
 import json
-import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+from uuid import uuid4
 
 from runner.cli import get_engine
 from runner.engines.base import BacktestConfig
@@ -37,21 +37,21 @@ def run_strategy_grid(
     progress_callback: Callable[[float, str], None] | None = None,
 ) -> dict[str, Any]:
     """Run a strategy across all symbol/timeframe combinations.
-
+    
     Returns a grid matrix showing which combinations work best.
     """
     entry = find_strategy_entry(strategy_slug)
     if entry is None:
         return {"status": "error", "message": f"Strategy {strategy_slug} not found"}
-
+    
     engine = get_engine(engine_name)
     results_matrix: dict[str, dict[str, dict[str, Any]]] = {
         sym: {} for sym in symbols
     }
-
+    
     total_runs = len(symbols) * len(timeframes)
     completed = 0
-
+    
     for symbol in symbols:
         for timeframe in timeframes:
             completed += 1
@@ -59,7 +59,7 @@ def run_strategy_grid(
             msg = f"{symbol}/{timeframe}"
             if progress_callback:
                 progress_callback(progress, msg)
-
+            
             # Try to run backtest
             try:
                 config = BacktestConfig(
@@ -72,7 +72,7 @@ def run_strategy_grid(
                     risk_per_trade_pct=risk_per_trade_pct,
                 )
                 result = engine.run(config)
-
+                
                 # Collect stats
                 stats = result.stats if result.stats else {}
                 results_matrix[symbol][timeframe] = {
@@ -89,13 +89,12 @@ def run_strategy_grid(
                     "status": "error",
                     "error": str(e),
                 }
-
+    
     # Save grid results
     GRID_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     now = datetime.now(timezone.utc)
-    # Include microseconds and a short random suffix so two grid runs started in
-    # the same second cannot collide on the same id (and overwrite each other).
-    grid_id = f"grid_{strategy_slug}_{now.strftime('%Y%m%d_%H%M%S_%f')}_{uuid.uuid4().hex[:8]}"
+    # Use microseconds + UUID to avoid collisions in parallel runs
+    grid_id = f"grid_{strategy_slug}_{now.strftime('%Y%m%d_%H%M%S_%f')}_{uuid4().hex[:8]}"
     output_path = GRID_RESULTS_DIR / f"{grid_id}.json"
 
     payload = {

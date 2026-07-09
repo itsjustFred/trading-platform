@@ -52,7 +52,7 @@ def _split_equity_curves_by_time(
 
     Args:
         curves: List of equity curves for each strategy
-        train_months: Currently unused - reserved for future walk-forward implementation.
+        train_months: Number of months for training period (from start). If None, use all data before test period.
         test_months: Number of months for testing period (from end). If None, no OOS split.
 
     Returns:
@@ -71,11 +71,21 @@ def _split_equity_curves_by_time(
     if not all_timestamps:
         return curves, []
 
+    min_ts = min(all_timestamps)
     max_ts = max(all_timestamps)
 
-    # Calculate split point for test period
+    # Calculate split points
     seconds_per_month = 30 * 24 * 60 * 60
     test_start_ts = max_ts - (test_months * seconds_per_month)
+
+    # If train_months specified, limit training data to first N months
+    if train_months is not None and train_months > 0:
+        train_end_ts = min_ts + (train_months * seconds_per_month)
+        # Ensure train period doesn't overlap with test period
+        if train_end_ts >= test_start_ts:
+            train_end_ts = test_start_ts
+    else:
+        train_end_ts = test_start_ts
 
     train_curves: list[list[StrategyEquityPoint]] = []
     test_curves: list[list[StrategyEquityPoint]] = []
@@ -85,10 +95,11 @@ def _split_equity_curves_by_time(
         test_curve = []
         for pt in curve:
             ts = _parse_time_to_ts(pt.time)
-            if ts < test_start_ts:
+            if ts < train_end_ts:
                 train_curve.append(pt)
-            else:
+            elif ts >= test_start_ts:
                 test_curve.append(pt)
+            # Points between train_end_ts and test_start_ts are excluded (gap)
         train_curves.append(train_curve)
         test_curves.append(test_curve)
 
@@ -116,77 +127,67 @@ def _load_strategy_equity(backtest_id: str) -> list[StrategyEquityPoint]:
     return []
 
 
-def _normalize_weights(weights: np.ndarray) -> np.ndarray:
-    """Normalize weights onto the simplex (sum == 1).
-
-    Falls back to equal weighting when the raw weights sum to a non-finite or
-    non-positive value (e.g. Optuna drawing all-zero weights), which would
-    otherwise produce ``nan``/``inf`` through division by zero.
-    """
-    weights = np.asarray(weights, dtype=float)
-    if weights.size == 0:
-        return weights
-    total = weights.sum()
-    if not np.isfinite(total) or total <= 0:
-        return np.ones(weights.size) / weights.size
-    return weights / total
-
-
 def _align_equity_curves(
     curves: list[list[StrategyEquityPoint]],
-    min_overlap_points: int = 2,
+    require_overlap: bool = False,
 ) -> np.ndarray:
-    """Align equity curves on their common overlap window, return as 2D array.
-
-    Only the time range where *every* strategy already has data is used, so
-    strategies that start later than others no longer get synthetic flat
-    pre-inception equity (which would distort both correlation and Sharpe).
-    Returns an empty array when there is no sufficient common overlap.
+    """Align equity curves to common timestamps, return as 2D array.
+    
+    Args:
+        curves: List of equity curves for each strategy
+        require_overlap: If True, only use timestamps present in ALL curves (overlap window).
+                         If False (default), use union of all timestamps with forward-fill.
     """
     if not curves:
         return np.array([]).reshape(0, 0)
-
-    # Determine each strategy's covered [start, end] window (valid points only).
-    starts: list[int] = []
-    ends: list[int] = []
-    for curve in curves:
-        valid_times = [pt.time for pt in curve if pt.equity]
-        if not valid_times:
-            return np.array([]).reshape(0, 0)
-        starts.append(min(valid_times))
-        ends.append(max(valid_times))
-
-    window_start = max(starts)
-    window_end = min(ends)
-    if window_start > window_end:
-        # The strategies never trade at the same time — no common overlap.
-        return np.array([]).reshape(0, 0)
-
-    all_times = {
-        pt.time
-        for curve in curves
-        for pt in curve
-        if window_start <= pt.time <= window_end
-    }
-    sorted_times = sorted(all_times)
-    if len(sorted_times) < min_overlap_points:
-        return np.array([]).reshape(0, 0)
-
+    
+    if require_overlap:
+        # Find timestamps present in ALL curves (intersection)
+        common_times = None
+        for curve in curves:
+            curve_times = {pt.time for pt in curve}
+            if common_times is None:
+                common_times = curve_times
+            else:
+                common_times &= curve_times
+        sorted_times = sorted(common_times) if common_times else []
+    else:
+        # Find all unique timestamps across all curves (union)
+        all_times = set()
+        for curve in curves:
+            for pt in curve:
+                all_times.add(pt.time)
+        sorted_times = sorted(all_times)
+    
     n_points = len(sorted_times)
     n_strategies = len(curves)
     aligned = np.zeros((n_points, n_strategies))
-
+    
+    if n_points == 0:
+        return aligned
+    
     for col, curve in enumerate(curves):
-        equity_values = {pt.time: pt.equity for pt in curve}
-        # Seed with the latest known equity at or before the overlap window so
-        # the first row reflects real (not zero) equity for every strategy.
-        prior_times = sorted(t for t in equity_values if t <= window_start)
-        last_val = equity_values[prior_times[-1]] if prior_times else 0.0
-        for row, t in enumerate(sorted_times):
-            if t in equity_values:
-                last_val = equity_values[t]
-            aligned[row, col] = last_val
-
+        equity_values = {}
+        for pt in curve:
+            equity_values[pt.time] = pt.equity
+        
+        if require_overlap:
+            # No forward-fill needed in overlap window - all timestamps exist
+            for row, t in enumerate(sorted_times):
+                aligned[row, col] = equity_values.get(t, 0.0)
+        else:
+            # Fill values, forward-fill missing values. Start from the first known
+            # point for this strategy so missing leading days do not create a bogus
+            # zero-equity row and an artificial return spike.
+            last_val: float | None = None
+            first_valid = next((pt.equity for pt in curve if pt.equity), None)
+            if first_valid is None:
+                first_valid = 0.0
+            for row, t in enumerate(sorted_times):
+                if t in equity_values:
+                    last_val = equity_values[t]
+                aligned[row, col] = first_valid if last_val is None else last_val
+    
     return aligned
 
 
@@ -205,21 +206,21 @@ def _portfolio_sharpe_from_weights(
     """Compute portfolio Sharpe and max drawdown from weights."""
     if equity_matrix.size == 0 or len(weights) == 0:
         return 0.0, 1.0
-
+    
     # Weighted combination
     portfolio_eq = equity_matrix @ weights
     returns = np.diff(portfolio_eq) / (portfolio_eq[:-1] + 1e-10)
-
+    
     mean_ret = np.mean(returns)
     std_ret = np.std(returns) + 1e-10
-
+    
     sharpe = float(mean_ret / std_ret)  # Raw Sharpe
-
+    
     # Max drawdown
     peak = np.maximum.accumulate(portfolio_eq)
     drawdown = (peak - portfolio_eq) / (peak + 1e-10)
     max_dd = float(np.max(drawdown))
-
+    
     return sharpe, max_dd
 
 
@@ -235,7 +236,7 @@ def optimize_portfolio_allocation(
     test_months: int | None = None,
 ) -> dict[str, Any]:
     """Optimize portfolio weights for maximum Sharpe with negative correlation.
-
+    
     Args:
         backtest_ids: List of backtest IDs to combine
         target_sharpe: Target Sharpe ratio (for constraint)
@@ -243,71 +244,90 @@ def optimize_portfolio_allocation(
         progress_callback: Optional callback for progress updates
         train_months: Number of months for training period (from start). If None, use all data.
         test_months: Number of months for testing/OOS period (from end). If None, no OOS split.
-
+    
     Returns:
         Optimization result with best weights and stats. Includes both IS (in-sample)
         and OOS (out-of-sample) Sharpe when test_months is provided.
     """
     # Load equity curves
     curves = [_load_strategy_equity(bt_id) for bt_id in backtest_ids]
-
+    
     # Split curves by time for OOS validation
     train_curves, test_curves = _split_equity_curves_by_time(curves, train_months, test_months)
-
+    
     # Use train curves if available, otherwise all curves
     curves_to_optimize = train_curves if train_curves else curves
-    equity_matrix = _align_equity_curves(curves_to_optimize)
+    equity_matrix = _align_equity_curves(curves_to_optimize, require_overlap=True)
 
+    # Weight sum guard: ensure we have valid, non-zero weight capacity
     if equity_matrix.size == 0 or equity_matrix.shape[1] < 2:
         return {
             "status": "error",
-            "message": "Need at least 2 valid backtest equity curves",
+            "message": "Need at least 2 valid backtest equity curves with overlapping timestamps",
             "backtest_ids": backtest_ids,
+        }
+
+    # Overlap alignment validation: warn if insufficient common timestamps
+    n_points = equity_matrix.shape[0]
+    n_strategies = equity_matrix.shape[1]
+    if n_points < 10:
+        return {
+            "status": "error",
+            "message": f"Insufficient overlap: only {n_points} common timestamps across {n_strategies} strategies (need >= 10)",
+            "backtest_ids": backtest_ids,
+            "overlap_points": n_points,
         }
 
     # Compute returns for correlation
     returns = np.diff(equity_matrix, axis=0)
 
     def objective(trial: optuna.Trial) -> float:
-        # Sample weights (softmax later)
-        weights_raw = [
-            trial.suggest_float(f"weight_{i}", 0.0, 1.0)
-            for i in range(len(backtest_ids))
-        ]
-        # Normalize to sum=1 (equal-weight fallback guards against all-zero draws)
-        weights = _normalize_weights(np.array(weights_raw, dtype=float))
+            # Sample weights (softmax later)
+            weights_raw = [
+                trial.suggest_float(f"weight_{i}", 0.0, 1.0)
+                for i in range(len(backtest_ids))
+            ]
+            # Normalize to sum=1
+            weights = np.array(weights_raw)
+            w_sum = weights.sum()
+            if not np.isfinite(w_sum) or w_sum <= 0:
+                # All weights are zero - trial should be pruned
+                raise optuna.TrialPruned("All weights are zero")
+            weights = weights / w_sum
 
-        # Portfolio metrics
-        sharpe, max_dd = _portfolio_sharpe_from_weights(weights, equity_matrix)
+            # Portfolio metrics
+            sharpe, max_dd = _portfolio_sharpe_from_weights(weights, equity_matrix)
 
-        # Correlation penalty: encourage negative correlation off-diagonal
-        corr_matrix = _compute_correlation_matrix(returns)
-        avg_off_diag = 0.0
-        n = corr_matrix.shape[0]
-        if n > 1:
-            off_diag_sum = corr_matrix.sum() - np.trace(corr_matrix)
-            avg_off_diag = off_diag_sum / (n * n - n)
+            # Correlation penalty: encourage negative correlation off-diagonal / minimize positive correlation
+            corr_matrix = _compute_correlation_matrix(returns)
+            avg_off_diag = 0.0
+            n = corr_matrix.shape[0]
+            if n > 1:
+                off_diag_sum = corr_matrix.sum() - np.trace(corr_matrix)
+                avg_off_diag = off_diag_sum / (n * n - n)
 
-        # Objective: maximize Sharpe, penalize positive correlation (reward
-        # diversification), penalize deep drawdowns.
-        score = sharpe - (5.0 * avg_off_diag) - (3.0 * max(0.0, max_dd - 0.3))
-        if not np.isfinite(score):
-            # Degenerate trial — push to the worst end of the minimized objective.
-            return float("inf")
+            # Objective: maximize Sharpe, minimize positive correlation, penalize excessive drawdown
+            # Note: avg_off_diag > 0 means positive correlation (bad for diversification), so we SUBTRACT it
+            score = sharpe - (5.0 * avg_off_diag) - (3.0 * max(0, max_dd - 0.3))
 
-        trial.report(sharpe, trial.number)
-        return -score  # Minimize negative score
-
+            trial.report(sharpe, trial.number)
+            return -score  # Minimize negative score
+    
     study = optuna.create_study(direction="minimize")
-
+    
     for i in range(n_trials):
         study.optimize(objective, n_trials=1, catch=(ValueError,))
         if progress_callback and (i + 1) % 10 == 0:
             progress_callback((i + 1) / n_trials * 100, f"Trial {i + 1}/{n_trials}")
-
+    
     # Extract best weights
     best_raw = [study.best_trial._params[f"weight_{i}"] for i in range(len(backtest_ids))]
-    best_weights = _normalize_weights(np.array(best_raw, dtype=float))
+    best_weights = np.array(best_raw)
+    w_sum = best_weights.sum()
+    if not np.isfinite(w_sum) or w_sum <= 0:
+        best_weights = np.ones(len(backtest_ids)) / len(backtest_ids)
+    else:
+        best_weights = best_weights / w_sum
 
     sharpe, max_dd = _portfolio_sharpe_from_weights(best_weights, equity_matrix)
     corr_matrix = _compute_correlation_matrix(returns)
@@ -316,7 +336,7 @@ def optimize_portfolio_allocation(
     oos_sharpe: float | None = None
     oos_max_dd: float | None = None
     if test_curves:
-        oos_equity_matrix = _align_equity_curves(test_curves)
+        oos_equity_matrix = _align_equity_curves(test_curves, require_overlap=True)
         if oos_equity_matrix.size > 0 and oos_equity_matrix.shape[1] >= 2:
             oos_sharpe, oos_max_dd = _portfolio_sharpe_from_weights(best_weights, oos_equity_matrix)
 
@@ -325,7 +345,7 @@ def optimize_portfolio_allocation(
     opt_id = f"portfolio_{len(backtest_ids)}strat_{now.strftime('%Y%m%d_%H%M%S')}"
     output_path = OPTIMIZATIONS_DIR / f"{opt_id}.json"
     OPTIMIZATIONS_DIR.mkdir(parents=True, exist_ok=True)
-
+    
     result: dict[str, Any] = {
         "id": opt_id,
         "file": output_path.name,
@@ -335,13 +355,13 @@ def optimize_portfolio_allocation(
         "sharpe": sharpe,
         "max_drawdown": max_dd,
         "correlation_matrix": {
-            backtest_ids[i]: {backtest_ids[j]: float(corr_matrix[i, j])
+            backtest_ids[i]: {backtest_ids[j]: float(corr_matrix[i, j]) 
                       for j in range(len(backtest_ids))}
             for i in range(len(backtest_ids))
         },
         "n_trials": n_trials,
     }
-
+    
     # Add OOS metrics if applicable
     if oos_sharpe is not None:
         result["oos_sharpe"] = oos_sharpe
@@ -350,9 +370,9 @@ def optimize_portfolio_allocation(
             "train_months": train_months,
             "test_months": test_months,
         }
-
+    
     output_path.write_text(json.dumps(result, indent=2))
-
+    
     return result
 
 
@@ -364,7 +384,7 @@ if __name__ == "__main__":
     parser.add_argument("--train-months", type=int, default=None, help="Months of data for IS training")
     parser.add_argument("--test-months", type=int, default=None, help="Months of data for OOS testing")
     args = parser.parse_args()
-
+    
     result = optimize_portfolio_allocation(
         args.backtest_ids,
         n_trials=args.trials,
