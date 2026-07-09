@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, tzinfo
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pandas as pd
 
@@ -66,6 +67,17 @@ for label, key in _STAT_LABELS:
     _STAT_LABEL_MAP[label.rstrip(":")] = key
     _STAT_LABEL_MAP[label] = key
     _STAT_LABEL_MAP[label.rstrip(" :")] = key
+
+
+def _resolve_source_timezone(source_tz: str | tzinfo | None) -> tzinfo | None:
+    if source_tz is None:
+        return None
+    if isinstance(source_tz, tzinfo):
+        return source_tz
+    try:
+        return ZoneInfo(str(source_tz))
+    except ZoneInfoNotFoundError as exc:
+        raise ValueError(f"Unknown source timezone: {source_tz}") from exc
 
 
 class MT5XLSXImporter(BaseImporter):
@@ -563,15 +575,14 @@ class MT5XLSXImporter(BaseImporter):
             return default
 
     @staticmethod
-    def _to_iso(raw: str, source_tz: str | None = None) -> str:
+    def _to_iso(raw: str, source_tz: str | tzinfo | None = None) -> str:
         """Convert MT5 datetime string to ISO-8601 UTC string."""
         text = raw.strip() if raw else ""
         for fmt in ("%Y.%m.%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
             try:
                 dt = datetime.strptime(text, fmt)
-                if source_tz:
-                    import zoneinfo
-                    tz = zoneinfo.ZoneInfo(source_tz)
+                tz = _resolve_source_timezone(source_tz)
+                if tz:
                     dt = dt.replace(tzinfo=tz)
                     dt = dt.astimezone(timezone.utc)
                 else:

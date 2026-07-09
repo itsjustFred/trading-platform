@@ -5,6 +5,7 @@ import pytest
 from validation.statistics.cross_platform import build_comparison_matrix
 from scripts.regenerate_mt5_parity_artifacts import COMPARISON_CASES
 from scripts.regenerate_qc_risk_parity_artifact import DEFAULT_OUTPUT as QC_RISK_PARITY_OUTPUT
+from shared.models import BacktestMeta, BacktestResult, EquityPoint
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -40,6 +41,9 @@ def test_cross_platform_matrix_includes_reference_metrics():
     assert rows["risk_parity_quantconnect"]["platform_path"].endswith(
         "data/backtests/risk_parity_quantconnect_reimplementation.json"
     )
+    for row in rows.values():
+        assert Path(row["reference_path"]).resolve().is_relative_to(PROJECT_ROOT)
+        assert Path(row["platform_path"]).resolve().is_relative_to(PROJECT_ROOT)
 
 
 def test_cross_platform_matrix_marks_missing_platform_artifact(tmp_path):
@@ -66,6 +70,38 @@ def test_cross_platform_matrix_honors_explicit_platform_data_dir(tmp_path):
     assert rows["risk_parity_quantconnect"]["platform_path"] == str(
         tmp_path.resolve() / "risk_parity_quantconnect_reimplementation.json"
     )
+
+
+def test_cross_platform_matrix_recomputes_sharpe_with_reference_risk_free_rate(tmp_path):
+    equity = [EquityPoint(time="2024-01-01T00:00:00+00:00", equity=100000.0)]
+    value = 100000.0
+    for day in range(1, 31):
+        value *= 1 + (0.00012 + (0.00004 if day % 2 else -0.00003))
+        equity.append(EquityPoint(time=f"2024-01-{day + 1:02d}T00:00:00+00:00", equity=value))
+
+    result = BacktestResult(
+        meta=BacktestMeta(
+            id="intraday_volatility_breakout_sp500_m1",
+            created_at="2026-07-09T00:00:00+00:00",
+            engine="native",
+            strategies=["intraday_volatility_breakout"],
+            initial_capital=100000.0,
+        ),
+        trades=[],
+        equity_curve=equity,
+        stats={"sharpe_ratio": -1.0},
+    )
+    result.save(tmp_path / "intraday_volatility_breakout_sp500_m1.json")
+
+    matrix = build_comparison_matrix(
+        comparisons_dir=PROJECT_ROOT / "strategy-comparisons",
+        reports_dir=PROJECT_ROOT / "reports",
+        platform_data_dir=tmp_path,
+    )
+
+    rows = {row["case_id"]: row for row in matrix["rows"]}
+    assert rows["intraday_volatility_breakout_sp500_m1"]["platform"]["sharpe_ratio"] > 0.0
+    assert "risk_free_rate=0.0" in matrix["risk_free_rate_note"]
 
 
 def test_regenerator_outputs_match_cross_platform_matrix_paths():

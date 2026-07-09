@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-07-08T16:38:24.676396+00:00",
+  "generated_at": "2026-07-09T15:33:10.647732+00:00",
   "metrics": [
     "trade_count",
     "win_rate",
@@ -7,13 +7,13 @@
     "cagr",
     "sharpe_ratio"
   ],
-  "risk_free_rate_note": "Platform canonical Sharpe uses daily equity returns and risk_free_rate=0.04 by default; MT5 and QuantConnect reference reports do not expose a matching risk-free-rate input, so Sharpe deltas include R_f and execution-model effects.",
+  "risk_free_rate_note": "Cross-platform Sharpe recomputation uses daily equity returns and risk_free_rate=0.0 because the MT5 and QuantConnect reference reports do not expose a matching risk-free-rate input. Platform runtime stats may still use a nonzero application default.",
   "rows": [
     {
       "case_id": "intraday_volatility_breakout_sp500_m1",
       "reference_framework": "mt5_xlsx",
-      "reference_path": "/home/ubuntu/Desktop/trading-platform-codex_copy/strategy-comparisons/intraday_volatility_breakout/SP500_M1.xlsx",
-      "platform_path": "/home/ubuntu/Desktop/trading-platform-codex_copy/data/backtests/intraday_volatility_breakout_sp500_m1.json",
+      "reference_path": "/home/ubuntu/Desktop/trading-platform/strategy-comparisons/intraday_volatility_breakout/SP500_M1.xlsx",
+      "platform_path": "/home/ubuntu/Desktop/trading-platform/data/backtests/intraday_volatility_breakout_sp500_m1.json",
       "missing_artifacts": [],
       "reference": {
         "trade_count": 512.0,
@@ -27,7 +27,7 @@
         "win_rate": 0.342,
         "net_profit": 43239.28,
         "cagr": 0.043753,
-        "sharpe_ratio": -0.1551
+        "sharpe_ratio": 0.563
       },
       "deltas": [
         {
@@ -65,9 +65,9 @@
         {
           "metric": "sharpe_ratio",
           "reference": 4.595921,
-          "platform": -0.1551,
-          "absolute_delta": -4.751021,
-          "relative_delta": -1.0337473163703206,
+          "platform": 0.563,
+          "absolute_delta": -4.032921,
+          "relative_delta": -0.877500070170919,
           "note": ""
         }
       ],
@@ -79,8 +79,8 @@
     {
       "case_id": "intraday_volatility_breakout_eurusd_h1",
       "reference_framework": "mt5_xlsx",
-      "reference_path": "/home/ubuntu/Desktop/trading-platform-codex_copy/strategy-comparisons/intraday_volatility_breakout/EURUSD_H1.xlsx",
-      "platform_path": "/home/ubuntu/Desktop/trading-platform-codex_copy/data/backtests/intraday_volatility_breakout_eurusd_h1.json",
+      "reference_path": "/home/ubuntu/Desktop/trading-platform/strategy-comparisons/intraday_volatility_breakout/EURUSD_H1.xlsx",
+      "platform_path": "/home/ubuntu/Desktop/trading-platform/data/backtests/intraday_volatility_breakout_eurusd_h1.json",
       "missing_artifacts": [],
       "reference": {
         "trade_count": 492.0,
@@ -94,7 +94,7 @@
         "win_rate": 0.3851,
         "net_profit": 28130.74,
         "cagr": 0.030148,
-        "sharpe_ratio": -0.3526
+        "sharpe_ratio": 0.4316
       },
       "deltas": [
         {
@@ -132,9 +132,9 @@
         {
           "metric": "sharpe_ratio",
           "reference": 2.711472,
-          "platform": -0.3526,
-          "absolute_delta": -3.0640720000000004,
-          "relative_delta": -1.1300400667976658,
+          "platform": 0.4316,
+          "absolute_delta": -2.279872,
+          "relative_delta": -0.8408244673004184,
           "note": ""
         }
       ],
@@ -146,8 +146,8 @@
     {
       "case_id": "intraday_volatility_breakout_nas100_m15",
       "reference_framework": "mt5_xlsx",
-      "reference_path": "/home/ubuntu/Desktop/trading-platform-codex_copy/strategy-comparisons/intraday_volatility_breakout/NAS100_M15.xlsx",
-      "platform_path": "/home/ubuntu/Desktop/trading-platform-codex_copy/data/backtests/intraday_volatility_breakout_nas100_m15.json",
+      "reference_path": "/home/ubuntu/Desktop/trading-platform/strategy-comparisons/intraday_volatility_breakout/NAS100_M15.xlsx",
+      "platform_path": "/home/ubuntu/Desktop/trading-platform/data/backtests/intraday_volatility_breakout_nas100_m15.json",
       "missing_artifacts": [],
       "reference": {
         "trade_count": 597.0,
@@ -161,7 +161,7 @@
         "win_rate": 0.3243,
         "net_profit": 40873.21,
         "cagr": 0.041447,
-        "sharpe_ratio": -0.1673
+        "sharpe_ratio": 0.5119
       },
       "deltas": [
         {
@@ -199,9 +199,9 @@
         {
           "metric": "sharpe_ratio",
           "reference": 4.67729,
-          "platform": -0.1673,
-          "absolute_delta": -4.84459,
-          "relative_delta": -1.0357685753930161,
+          "platform": 0.5119,
+          "absolute_delta": -4.16539,
+          "relative_delta": -0.8905562836599826,
           "note": ""
         }
       ],
@@ -213,8 +213,8 @@
     {
       "case_id": "risk_parity_quantconnect",
       "reference_framework": "lean",
-      "reference_path": "/home/ubuntu/Desktop/trading-platform-codex_copy/strategy-comparisons/risk_parity/risk_parity_reference.json",
-      "platform_path": "/home/ubuntu/Desktop/trading-platform-codex_copy/data/backtests/risk_parity_quantconnect_reimplementation.json",
+      "reference_path": "/home/ubuntu/Desktop/trading-platform/strategy-comparisons/risk_parity/risk_parity_reference.json",
+      "platform_path": "/home/ubuntu/Desktop/trading-platform/data/backtests/risk_parity_quantconnect_reimplementation.json",
       "missing_artifacts": [],
       "reference": {
         "trade_count": 240.0,

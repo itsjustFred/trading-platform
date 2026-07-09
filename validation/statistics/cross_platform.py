@@ -21,6 +21,7 @@ from shared.models import BacktestResult
 from validation.importers.mt5_xlsx import MT5XLSXImporter
 
 AUDIT_METRICS = ("trade_count", "win_rate", "net_profit", "cagr", "sharpe_ratio")
+REFERENCE_RISK_FREE_RATE = 0.0
 
 
 @dataclass(frozen=True)
@@ -88,9 +89,10 @@ def build_comparison_matrix(
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "metrics": list(AUDIT_METRICS),
         "risk_free_rate_note": (
-            "Platform canonical Sharpe uses daily equity returns and risk_free_rate=0.04 "
-            "by default; MT5 and QuantConnect reference reports do not expose a matching "
-            "risk-free-rate input, so Sharpe deltas include R_f and execution-model effects."
+            "Cross-platform Sharpe recomputation uses daily equity returns and "
+            "risk_free_rate=0.0 because the MT5 and QuantConnect reference reports "
+            "do not expose a matching risk-free-rate input. Platform runtime stats "
+            "may still use a nonzero application default."
         ),
         "rows": rows,
     }
@@ -99,7 +101,7 @@ def build_comparison_matrix(
 def _build_mt5_row(case_id: str, reference_path: Path, platform_path: Path) -> dict[str, Any]:
     reference = MT5XLSXImporter().load(reference_path)
     reference_stats = _normalize_mt5_stats(reference.stats, reference_path, reference.raw_metadata)
-    platform_stats = _load_platform_stats(platform_path)
+    platform_stats = _load_platform_stats(platform_path, risk_free_rate=REFERENCE_RISK_FREE_RATE)
     return _row_payload(
         case_id=case_id,
         reference_framework="mt5_xlsx",
@@ -117,7 +119,7 @@ def _build_mt5_row(case_id: str, reference_path: Path, platform_path: Path) -> d
 def _build_json_reference_row(case_id: str, reference_path: Path, platform_path: Path) -> dict[str, Any]:
     reference_payload = json.loads(reference_path.read_text(encoding="utf-8"))
     reference_stats = _normalize_reference_stats(reference_payload.get("stats", {}))
-    platform_stats = _load_platform_stats(platform_path)
+    platform_stats = _load_platform_stats(platform_path, risk_free_rate=REFERENCE_RISK_FREE_RATE)
     return _row_payload(
         case_id=case_id,
         reference_framework=str(reference_payload.get("source_framework") or "reference_json"),
@@ -202,19 +204,19 @@ def _normalize_reference_stats(stats: dict[str, Any]) -> dict[str, float | None]
         win_rate /= 100.0
 
     return {
-        "trade_count": _safe_float(stats.get("total_trades") or stats.get("trade_count")),
+        "trade_count": _first_metric(stats, "total_trades", "trade_count"),
         "win_rate": win_rate,
-        "net_profit": _safe_float(
-            stats.get("net_profit")
-            if stats.get("net_profit") is not None
-            else stats.get("total_pnl")
-        ),
+        "net_profit": _first_metric(stats, "net_profit", "total_pnl"),
         "cagr": _safe_float(stats.get("cagr")),
-        "sharpe_ratio": _safe_float(stats.get("sharpe_ratio") or stats.get("sharpe")),
+        "sharpe_ratio": _first_metric(stats, "sharpe_ratio", "sharpe"),
     }
 
 
-def _load_platform_stats(platform_path: Path) -> dict[str, float | None]:
+def _load_platform_stats(
+    platform_path: Path,
+    *,
+    risk_free_rate: float = REFERENCE_RISK_FREE_RATE,
+) -> dict[str, float | None]:
     if not platform_path.exists():
         return {metric: None for metric in AUDIT_METRICS}
 
@@ -225,7 +227,10 @@ def _load_platform_stats(platform_path: Path) -> dict[str, float | None]:
     if _prefers_stored_platform_stats(result):
         stats = dict(result.stats or {})
     else:
-        stats = {**dict(result.stats or {}), **compute_stats_for_result(result)}
+        stats = {
+            **dict(result.stats or {}),
+            **compute_stats_for_result(result, risk_free_rate=risk_free_rate),
+        }
     normalized = _normalize_reference_stats(stats)
     if normalized["net_profit"] is None:
         normalized["net_profit"] = _safe_float(stats.get("total_pnl"))
@@ -267,3 +272,10 @@ def _safe_float(value: Any) -> float | None:
     if not math.isfinite(number):
         return None
     return number
+
+
+def _first_metric(stats: dict[str, Any], *keys: str) -> float | None:
+    for key in keys:
+        if stats.get(key) is not None:
+            return _safe_float(stats.get(key))
+    return None
