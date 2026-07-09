@@ -445,6 +445,7 @@ def test_candle_close_signal_emits_previous_bar_for_next_open_execution():
     entry_idx = df.index[df["timestamp"] == pd.Timestamp("2024-01-03 16:45", tz="UTC")][0]
     assert indicators["direction"].iloc[entry_idx] == "LONG"
     assert pd.notna(indicators["sl_price"].iloc[entry_idx])
+    assert pd.notna(indicators["stop_distance"].iloc[entry_idx])
 
 
 def test_native_daily_ohlcv_overrides_intraday_resampled_atr():

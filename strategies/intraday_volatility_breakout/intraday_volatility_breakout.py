@@ -396,8 +396,10 @@ def generate_signals(df: pd.DataFrame, params: dict):
     long_sl_price = (close - stop_distance).where(long_entries)
     short_sl_price = (close + stop_distance).where(short_entries)
     sl_price = long_sl_price.combine_first(short_sl_price)
+    entry_stop_distance = stop_distance.where(long_entries | short_entries)
     if use_candle_close:
         sl_price = sl_price.shift(-1)
+        entry_stop_distance = entry_stop_distance.shift(-1)
 
     # --- Exits (time exit + EOD safety net) ----------------------------------
     exit_time_mask = minute_of_day >= exit_minute
@@ -416,6 +418,7 @@ def generate_signals(df: pd.DataFrame, params: dict):
         "entry_open": entry_open,
         "direction": direction,
         "sl_price": sl_price,
+        "stop_distance": entry_stop_distance,
     }
 
     # --- Drawings ------------------------------------------------------------

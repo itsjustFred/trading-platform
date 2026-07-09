@@ -40,6 +40,7 @@ class Order:
     limit_price: float | None = None
     stop_price: float | None = None
     stop_loss: float | None = None
+    stop_distance: float | None = None
     take_profit: float | None = None
     take_profit_levels: list[dict[str, Any]] = field(default_factory=list)
 
@@ -296,6 +297,8 @@ class TradeEngine:
     def _create_order(self, row: pd.Series, i: int, direction: str) -> None:
         entry_price = float(row["close"])
         stop_loss, tp_levels = self._extract_levels(row)
+        stop_distance_raw = row.get("stop_distance")
+        stop_distance = float(stop_distance_raw) if pd.notna(stop_distance_raw) else None
         take_profit = float(tp_levels[0]["price"]) if tp_levels else None
         qty = self._calculate_position_size(
             entry_price=entry_price,
@@ -315,6 +318,7 @@ class TradeEngine:
             created_time=created_time,
             quantity=qty,
             stop_loss=stop_loss,
+            stop_distance=stop_distance,
             take_profit_levels=tp_levels,
         )
         self.pending_orders.append(order)
@@ -376,6 +380,17 @@ class TradeEngine:
                 fill_price = order.limit_price if order.limit_price is not None else bar_open
 
             if filled:
+                if (
+                    order.order_type == OrderType.MARKET
+                    and order.stop_distance is not None
+                    and order.stop_distance > 0
+                ):
+                    distance = float(order.stop_distance)
+                    order.stop_loss = (
+                        float(fill_price) - distance
+                        if order.direction == "LONG"
+                        else float(fill_price) + distance
+                    )
                 if order.order_type == OrderType.MARKET and order.stop_loss is not None:
                     take_profit = (
                         float(order.take_profit_levels[0]["price"])
