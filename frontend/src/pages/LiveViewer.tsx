@@ -620,7 +620,7 @@ function LiveCandlestickChart({
     }
     for (const trade of trades) {
       if (trade.exit === null) continue;
-      const t = toChartTime(trade.executionTimeUnix || trade.time);
+      const t = toChartTime(Number(trade.executionTimeUnix ?? trade.time));
       if (t === null) continue;
       out.push({
         id: `exit-${trade.id}`,

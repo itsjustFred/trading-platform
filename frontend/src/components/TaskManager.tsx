@@ -4,7 +4,6 @@ import { Link } from "react-router-dom";
 import { Activity } from "lucide-react";
 
 import { listDataTasks } from "../api/client";
-import type { DataTaskStatusResponse } from "../api/types";
 
 const ACTIVE_STATUSES = new Set(["queued", "starting", "running", "paused"]);
 

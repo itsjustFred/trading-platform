@@ -196,7 +196,7 @@ export function CreateBacktestModal({
     setError("");
 
     try {
-      const parameterPayload: Record<string, boolean | number | string> = {};
+      const parameterPayload: Record<string, string | number> = {};
       for (const [key, rawValue] of Object.entries(strategyParameters)) {
         if (parameterTypes[key] === "number") {
           const parsed = parseFloat(rawValue);
@@ -207,7 +207,7 @@ export function CreateBacktestModal({
           }
           parameterPayload[key] = parsed;
         } else if (parameterTypes[key] === "boolean") {
-          parameterPayload[key] = rawValue === "true";
+          parameterPayload[key] = rawValue;
         } else {
           parameterPayload[key] = rawValue;
         }
