@@ -169,25 +169,34 @@ def _convert_ohlcv(
         elif "date" in df.columns:
             ts_col = "date"
 
+        if not ts_col:
+            logger.warning("Missing timestamp/date column in %s", csv_path)
+            return 0
+
+        df[ts_col] = pd.to_datetime(df[ts_col], utc=True, errors="coerce")
+        df = df.rename(columns={ts_col: "timestamp"})
+        df = df.dropna(subset=["timestamp"])
+        if df.empty:
+            logger.warning("No valid timestamp rows in %s", csv_path)
+            return 0
+
         # Convert OHLCV columns to numeric, drop rows that can't be converted
         for col in ("open", "high", "low", "close", "volume"):
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
-        df = df.dropna(subset=["open", "high", "low", "close"])
-
-        if ts_col:
-            df[ts_col] = pd.to_datetime(df[ts_col], utc=True, errors="coerce")
-            df = df.rename(columns={ts_col: "timestamp"})
 
         # Ensure standard OHLCV columns exist
         for col in ("open", "high", "low", "close"):
             if col not in df.columns:
                 logger.warning("Missing column '%s' in %s", col, csv_path)
                 return 0
+        df = df.dropna(subset=["open", "high", "low", "close"])
+        if df.empty:
+            logger.warning("No valid OHLC rows in %s", csv_path)
+            return 0
 
         # Select and order columns
-        keep = ["timestamp"] if "timestamp" in df.columns else []
-        keep += ["open", "high", "low", "close"]
+        keep = ["timestamp", "open", "high", "low", "close"]
         if "volume" in df.columns:
             keep.append("volume")
         df = df[keep]

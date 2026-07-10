@@ -25,6 +25,7 @@ from live_runner.stockkit_routing import (
 )
 from risk import RiskConfig, RiskEngine, TradeSignal
 from scheduler.scheduler import ServiceScheduler
+from shared.constants import normalize_timeframe
 from shared.database import (
     create_service,
     list_live_accounts,
@@ -135,7 +136,17 @@ def _adapter_is_ready(adapter: BaseLiveAdapter) -> bool:
 def _parse_bool_env(value: str | None, *, default: bool = True) -> bool:
     if value is None:
         return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
+    normalized = value.strip().lower()
+    if not normalized:
+        return default
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(
+        f"Invalid boolean value {value!r}; expected one of "
+        "1/0, true/false, yes/no, on/off"
+    )
 
 
 def _load_accounts_env_values(accounts_env: Path) -> dict[str, str]:
@@ -325,13 +336,43 @@ def _deployment_signal_timeframe(deployment: LiveDeploymentConfig) -> str:
     configured = deployment.signal_config or {}
     configured_tf = str(configured.get("timeframe") or deployment.timeframe).strip()
     if configured_tf:
-        return configured_tf
-    return deployment.timeframe
+        return normalize_timeframe(configured_tf)
+    return normalize_timeframe(deployment.timeframe)
 
 
 def _deployment_has_discord_channel(deployment: LiveDeploymentConfig) -> bool:
     configured = deployment.signal_config or {}
     return bool(str(configured.get("channel_id") or "").strip())
+
+
+def _discord_listener_signature(
+    account_id: str,
+    deployments_by_account: Mapping[str, list[LiveDeploymentConfig]],
+    accounts_env_values: Mapping[str, str],
+) -> tuple[tuple[object, ...], ...]:
+    deployments = deployments_by_account.get(account_id, [])
+    deployment_parts = []
+    for deployment in deployments:
+        deployment_parts.append(
+            (
+                str(deployment.id),
+                _normalize_deployment_status(deployment.status),
+                str(deployment.signal_source or "internal").lower(),
+                _deployment_signal_timeframe(deployment),
+                str((deployment.signal_config or {}).get("channel_id") or "").strip(),
+                _deployment_signal_processor_name(deployment),
+            )
+        )
+    return tuple(
+        sorted(deployment_parts)
+        + [
+            (
+                "env",
+                str(accounts_env_values.get("DISCORD_CHANNEL_ID", "")).strip(),
+                str(accounts_env_values.get("DISCORD_WAIT_FOR_CANDLE_CLOSE", "")).strip(),
+            )
+        ]
+    )
 
 
 def _deployment_signal_processor_name(deployment: LiveDeploymentConfig) -> str:
@@ -447,6 +488,7 @@ def size_live_signal_for_submission(
     metadata: dict[str, object] = dict(signal.metadata or {})
     if current_positions is not None:
         metadata["current_positions"] = int(current_positions)
+    explicit_qty = _first_metadata_float(metadata, ("explicit_qty", "qty"))
     stop_loss = _first_metadata_float(metadata, ("stop_loss", "sl_price", "stop_price"))
     take_profit = _first_metadata_float(metadata, ("take_profit", "tp_price"))
     resolved_timeframe = (
@@ -471,8 +513,11 @@ def size_live_signal_for_submission(
         current_exposure=float(current_exposure),
     )
 
-    metadata["qty"] = float(sized_order.position_size)
-    metadata["explicit_qty"] = float(sized_order.position_size)
+    resolved_position_size = (
+        explicit_qty if explicit_qty is not None and explicit_qty > 0 else sized_order.position_size
+    )
+    metadata["qty"] = float(resolved_position_size)
+    metadata["explicit_qty"] = float(resolved_position_size)
     metadata["risk_amount"] = float(sized_order.risk_amount)
     metadata["risk_percent"] = float(sized_order.risk_percent)
     metadata["risk_reward_ratio"] = (
@@ -515,9 +560,23 @@ async def submit_order_with_risk(
             raise ValueError(
                 f"Exit-only signal received for {signal.symbol} but no long position is open"
             )
+        resolved_balance = account_balance
+        if resolved_balance is None:
+            _, equity = await adapter.get_balance()
+            resolved_balance = float(equity)
         metadata["explicit_qty"] = float(target_qty)
+        metadata["qty"] = float(target_qty)
         metadata["risk_sizing_mode"] = "exit_only"
-        return await adapter.submit_order(signal.model_copy(update={"metadata": metadata}))
+        metadata["current_positions"] = 0
+        sized_exit_signal = size_live_signal_for_submission(
+            signal.model_copy(update={"metadata": metadata}),
+            deployment,
+            account_balance=resolved_balance,
+            current_exposure=current_exposure,
+            pip_value=pip_value,
+            current_positions=0,
+        )
+        return await adapter.submit_order(sized_exit_signal)
 
     # Feed broker truth into sizing so max_positions / max_total_exposure actually
     # bind. Without this, every signal is sized as if the account were flat.
@@ -1361,9 +1420,18 @@ def _start_missing_discord_tasks(
     for account_id in sorted(active_discord_account_ids):
         if account_id in _DISCORD_AUTH_BLOCKED_ACCOUNTS:
             continue
+        signature = _discord_listener_signature(
+            account_id, deployments_by_account, accounts_env_values
+        )
         running_task = discord_tasks.get(account_id)
         if running_task is not None and not running_task.done():
-            continue
+            if getattr(running_task, "_routing_signature", None) == signature:
+                continue
+            running_task.cancel()
+            logger.info(
+                "Restarting discord signal listener after routing input change",
+                extra={"data": {"account_id": account_id}},
+            )
         adapter = adapters.get(account_id)
         if adapter is None:
             continue
@@ -1376,6 +1444,7 @@ def _start_missing_discord_tasks(
             ),
             name=_deployment_task_name(account_id, "discord"),
         )
+        setattr(task, "_routing_signature", signature)
         discord_tasks[account_id] = task
         logger.info(
             "Started discord signal listener",
@@ -1636,7 +1705,10 @@ async def sync_deployments_loop(
                 for deployment in deployments
                 if _normalize_deployment_status(deployment.status) == "ACTIVE"
                 and str(deployment.signal_source or "internal").lower() == "discord"
-                and _deployment_has_discord_channel(deployment)
+                and (
+                    _deployment_has_discord_channel(deployment)
+                    or bool(str(accounts_env_values.get("DISCORD_CHANNEL_ID", "")).strip())
+                )
             }
 
             for account_id in sorted(runnable_account_ids):
@@ -1717,19 +1789,25 @@ async def run_daemon(
                 exc,
                 service_name="live-runner",
                 context={"component": "live_daemon", "phase": "run_daemon"},
-            )
+        )
         raise
     finally:
-        if not service_sync_task.done():
-            service_sync_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await service_sync_task
-        for task in list(active_discord_tasks.values()):
+        owned_tasks = [
+            sync_task,
+            service_sync_task,
+            balance_task,
+            *active_listener_tasks.values(),
+            *active_discord_tasks.values(),
+            *active_discord_bot_tasks.values(),
+        ]
+        for task in owned_tasks:
             if not task.done():
                 task.cancel()
-        for task in list(active_discord_bot_tasks.values()):
-            if not task.done():
-                task.cancel()
+        if owned_tasks:
+            await asyncio.gather(*owned_tasks, return_exceptions=True)
+        for adapter in list(active_adapters.values()):
+            with contextlib.suppress(Exception):
+                await adapter.disconnect()
         for source in list(active_discord_bots.values()):
             with contextlib.suppress(Exception):
                 await source.disconnect(failed=False)

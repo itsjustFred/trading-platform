@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import { Activity } from "lucide-react";
 
@@ -8,36 +9,12 @@ import type { DataTaskStatusResponse } from "../api/types";
 const ACTIVE_STATUSES = new Set(["queued", "starting", "running", "paused"]);
 
 export function TaskManager() {
-  const [tasks, setTasks] = useState<DataTaskStatusResponse[]>([]);
-
-  useEffect(() => {
-    let active = true;
-    let intervalId = 0;
-
-    const poll = async () => {
-      try {
-        const payload = await listDataTasks();
-        if (!active) {
-          return;
-        }
-        setTasks(payload.tasks || []);
-      } catch {
-        if (!active) {
-          return;
-        }
-      }
-    };
-
-    void poll();
-    intervalId = window.setInterval(() => {
-      void poll();
-    }, 3000);
-
-    return () => {
-      active = false;
-      window.clearInterval(intervalId);
-    };
-  }, []);
+  const tasksQuery = useQuery({
+    queryKey: ["dataTasks"],
+    queryFn: listDataTasks,
+    refetchInterval: 3000,
+  });
+  const tasks = tasksQuery.data?.tasks ?? [];
 
   const activeTasks = useMemo(
     () =>
@@ -55,7 +32,9 @@ export function TaskManager() {
       ).length,
     [activeTasks],
   );
-  const summaryLabel = `${runningCount} running · ${tasks.length} total`;
+  const summaryLabel = tasksQuery.isError
+    ? "Task sync failed"
+    : `${runningCount} running · ${tasks.length} total`;
 
   return (
     <div style={{ display: "grid", gap: "10px", alignSelf: "start" }}>
@@ -107,6 +86,11 @@ export function TaskManager() {
             <div style={{ marginTop: "4px", fontSize: "0.9rem", fontWeight: 700 }}>
               {summaryLabel}
             </div>
+            {tasksQuery.isError ? (
+              <div style={{ marginTop: "3px", color: "#fca5a5", fontSize: "0.76rem" }}>
+                Could not refresh task status.
+              </div>
+            ) : null}
           </div>
         </div>
         <div style={{ color: "#7dd3fc", fontWeight: 700, fontSize: "0.8rem" }}>Open</div>

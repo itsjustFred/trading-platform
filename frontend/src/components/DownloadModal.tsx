@@ -27,6 +27,7 @@ const TIMEFRAME_OPTIONS = [
   "d1",
   "mn1",
 ];
+const DEFAULT_DOWNLOAD_TIMEFRAMES = ["d1"];
 
 const DUKASCOPY_INSTRUMENTS = [
   "EURUSD",
@@ -145,15 +146,17 @@ export function DownloadModal({
   onTaskFinished,
   defaultSource = "dukascopy",
   defaultSymbols = "",
-  defaultTimeframes = ["d1"],
+  defaultTimeframes = DEFAULT_DOWNLOAD_TIMEFRAMES,
 }: DownloadModalProps) {
   const { showToast } = useToast();
+  const defaultTimeframesKey = (
+    defaultTimeframes.length > 0 ? defaultTimeframes : DEFAULT_DOWNLOAD_TIMEFRAMES
+  )
+    .map(normalizeGenesisTimeframe)
+    .join("|");
   const normalizedDefaultTimeframes = useMemo(
-    () =>
-      (defaultTimeframes.length > 0 ? defaultTimeframes : ["d1"]).map(
-        normalizeGenesisTimeframe,
-      ),
-    [defaultTimeframes],
+    () => defaultTimeframesKey.split("|").filter(Boolean),
+    [defaultTimeframesKey],
   );
   const [source, setSource] = useState(defaultSource);
   const [symbols, setSymbols] = useState(defaultSymbols);
@@ -181,7 +184,6 @@ export function DownloadModal({
   const isJForex = source === "jforex";
   const isDukascopyOrJForex = isDukascopy || isJForex;
   const isStreaming = jobId !== null;
-  const defaultTimeframesKey = normalizedDefaultTimeframes.join("|");
   const parsedSymbols = useMemo(
     () =>
       symbols
@@ -307,7 +309,6 @@ export function DownloadModal({
     defaultSource,
     defaultSymbols,
     defaultTimeframesKey,
-    normalizedDefaultTimeframes,
     open,
   ]);
 

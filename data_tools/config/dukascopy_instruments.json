@@ -995,7 +995,7 @@
     "start_tick": "2006-03-01"
   },
   "audcnh": {
-    "decimal_factor": 999999.9999999999,
+    "decimal_factor": 1000000,
     "name": "AUD/CNH",
     "start_tick": "2023-04-17"
   },
@@ -2270,12 +2270,12 @@
     "start_tick": "2024-05-15"
   },
   "czkthb": {
-    "decimal_factor": 999999.9999999999,
+    "decimal_factor": 1000000,
     "name": "CZK/THB",
     "start_tick": "2024-09-16"
   },
   "czktry": {
-    "decimal_factor": 999999.9999999999,
+    "decimal_factor": 1000000,
     "name": "CZK/TRY",
     "start_tick": "2024-05-15"
   },
@@ -4790,7 +4790,7 @@
     "start_tick": "2015-04-21"
   },
   "mxnczk": {
-    "decimal_factor": 999999.9999999999,
+    "decimal_factor": 1000000,
     "name": "MXN/CZK",
     "start_tick": "2024-05-15"
   },
@@ -4805,7 +4805,7 @@
     "start_tick": "2007-06-04"
   },
   "mxnthb": {
-    "decimal_factor": 999999.9999999999,
+    "decimal_factor": 1000000,
     "name": "MXN/THB",
     "start_tick": "2024-09-17"
   },

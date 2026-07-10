@@ -134,6 +134,8 @@ class YFinanceDownloader(Downloader):
         symbol: str,
         timeframe: str,
     ) -> Path:
+        symbol = self._safe_path_segment(symbol, "symbol")
+        timeframe = self._safe_path_segment(timeframe, "timeframe")
         path = output_dir / "ohlcv" / self.source_name / "equity" / "US" / symbol / f"{timeframe}.parquet"
         path.parent.mkdir(parents=True, exist_ok=True)
         return path
@@ -151,6 +153,7 @@ class YFinanceDownloader(Downloader):
         normalized_symbol = str(symbol or "").strip().upper()
         if not normalized_symbol:
             raise ValueError("symbol is required")
+        self._safe_path_segment(normalized_symbol, "symbol")
 
         canonical_tf = _normalize_supported_timeframe(normalize_timeframe(timeframe))
         yf_interval = YF_INTERVAL_MAP[canonical_tf]
@@ -181,6 +184,11 @@ class YFinanceDownloader(Downloader):
             warnings.extend(resume_warnings)
             resolved_start = adjusted_resume.strftime("%Y-%m-%d") if adjusted_resume is not None else ""
         resolved_end = bounded_end.strftime("%Y-%m-%d")
+        yf_end = (
+            (bounded_end + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+            if parsed_end is not None
+            else resolved_end
+        )
 
         logger.info(
             "Downloading yfinance OHLCV",
@@ -190,7 +198,7 @@ class YFinanceDownloader(Downloader):
                     "timeframe": canonical_tf,
                     "interval": yf_interval,
                     "start": resolved_start,
-                    "end": resolved_end,
+                    "end": yf_end,
                 }
             },
         )
@@ -198,7 +206,7 @@ class YFinanceDownloader(Downloader):
         df = yf.download(
             tickers=normalized_symbol,
             start=resolved_start,
-            end=resolved_end,
+            end=yf_end,
             interval=yf_interval,
             auto_adjust=False,
             progress=False,

@@ -59,7 +59,7 @@ export function CreateBacktestModal({
   const [modelingResolution, setModelingResolution] = useState<string>("1d");
   const [strategyParameters, setStrategyParameters] = useState<Record<string, string>>({});
   // Track original type to decide input type and payload conversion
-  const [parameterTypes, setParameterTypes] = useState<Record<string, "number" | "string">>({});
+  const [parameterTypes, setParameterTypes] = useState<Record<string, "boolean" | "number" | "string">>({});
   const [running, setRunning] = useState(false);
   const [error, setError] = useState("");
   const [checkingDataAvailability, setCheckingDataAvailability] = useState(false);
@@ -96,11 +96,14 @@ export function CreateBacktestModal({
       return;
     }
     const values: Record<string, string> = {};
-    const types: Record<string, "number" | "string"> = {};
+    const types: Record<string, "boolean" | "number" | "string"> = {};
     for (const [key, value] of Object.entries(detail.parameters || {})) {
       if (typeof value === "number" && Number.isFinite(value)) {
         values[key] = String(value);
         types[key] = "number";
+      } else if (typeof value === "boolean") {
+        values[key] = value ? "true" : "false";
+        types[key] = "boolean";
       } else if (typeof value === "string") {
         values[key] = value;
         types[key] = "string";
@@ -193,7 +196,7 @@ export function CreateBacktestModal({
     setError("");
 
     try {
-      const parameterPayload: Record<string, number | string> = {};
+      const parameterPayload: Record<string, boolean | number | string> = {};
       for (const [key, rawValue] of Object.entries(strategyParameters)) {
         if (parameterTypes[key] === "number") {
           const parsed = parseFloat(rawValue);
@@ -203,9 +206,18 @@ export function CreateBacktestModal({
             return;
           }
           parameterPayload[key] = parsed;
+        } else if (parameterTypes[key] === "boolean") {
+          parameterPayload[key] = rawValue === "true";
         } else {
           parameterPayload[key] = rawValue;
         }
+      }
+
+      const capitalValue = parseFloat(capital);
+      if (!Number.isFinite(capitalValue) || capitalValue <= 0) {
+        setError("Initial capital must be a positive number");
+        setRunning(false);
+        return;
       }
 
       const leverageValue = parseFloat(maxLeverage);
@@ -222,7 +234,7 @@ export function CreateBacktestModal({
         timeframe,
         start,
         end,
-        capital: parseFloat(capital),
+        capital: capitalValue,
         risk_per_trade_pct: riskPct ? parseFloat(riskPct) / 100 : undefined,
         max_leverage: leverageValue,
         modeling_resolution: modelingResolution,
@@ -509,18 +521,34 @@ export function CreateBacktestModal({
             {parameterEntries.map(([key, value]) => (
               <div key={key}>
                 <label style={labelStyle}>{key}</label>
-                <input
-                  type={parameterTypes[key] === "string" ? "text" : "number"}
-                  value={value}
-                  onChange={(e) =>
-                    setStrategyParameters((current) => ({
-                      ...current,
-                      [key]: e.target.value,
-                    }))
-                  }
-                  step={parameterTypes[key] === "string" ? undefined : "any"}
-                  style={inputStyle}
-                />
+                {parameterTypes[key] === "boolean" ? (
+                  <select
+                    value={value}
+                    onChange={(e) =>
+                      setStrategyParameters((current) => ({
+                        ...current,
+                        [key]: e.target.value,
+                      }))
+                    }
+                    style={inputStyle}
+                  >
+                    <option value="true">true</option>
+                    <option value="false">false</option>
+                  </select>
+                ) : (
+                  <input
+                    type={parameterTypes[key] === "string" ? "text" : "number"}
+                    value={value}
+                    onChange={(e) =>
+                      setStrategyParameters((current) => ({
+                        ...current,
+                        [key]: e.target.value,
+                      }))
+                    }
+                    step={parameterTypes[key] === "string" ? undefined : "any"}
+                    style={inputStyle}
+                  />
+                )}
               </div>
             ))}
           </div>

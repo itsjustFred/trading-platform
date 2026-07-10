@@ -105,6 +105,7 @@ const PortfolioCard = memo(function PortfolioCard({
         <div style={{ fontWeight: 600, fontSize: "0.95rem" }}>{portfolio.name}</div>
         <button
           onClick={(event) => onDelete(portfolio.id, event)}
+          aria-label={`Delete portfolio ${portfolio.name || portfolio.id}`}
           style={{
             background: "none",
             border: "none",
@@ -262,7 +263,7 @@ export function PortfoliosPage() {
 
   const loadPortfolios = useCallback(() => {
     setLoading(true);
-    getPortfolios({ name: nameFilter, sort: sortBy, order: sortOrder })
+    return getPortfolios({ name: nameFilter, sort: sortBy, order: sortOrder })
       .then((portfolioRows) => {
         setPortfolios(portfolioRows as PortfolioSummary[]);
         setSelectedIds((current) => {
@@ -451,6 +452,9 @@ export function PortfoliosPage() {
   };
 
   const handleRemoveEmpty = async () => {
+    if (!window.confirm("Remove all empty portfolios?")) {
+      return;
+    }
     try {
       const payload = await removeEmptyPortfolios();
       showToast(`Removed ${payload.removed} empty portfolio(s).`, "success");

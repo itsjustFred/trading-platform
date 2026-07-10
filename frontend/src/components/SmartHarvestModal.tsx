@@ -42,6 +42,7 @@ export function SmartHarvestModal({
   const [jobId, setJobId] = useState<string | null>(null);
   const [jobStatus, setJobStatus] = useState("idle");
   const [completionNotified, setCompletionNotified] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
 
   useEffect(() => {
     if (!open) {
@@ -55,6 +56,7 @@ export function SmartHarvestModal({
     setJobId(null);
     setJobStatus("idle");
     setCompletionNotified(false);
+    setSubmitting(false);
   }, [defaultAssetClass, defaultSource, defaultStartDate, defaultSymbol, open]);
 
   useEffect(() => {
@@ -81,9 +83,13 @@ export function SmartHarvestModal({
     setJobStatus("idle");
     setCompletionNotified(false);
     setError("");
+    setSubmitting(false);
   };
 
   const handleSubmit = async () => {
+    if (submitting) {
+      return;
+    }
     setError("");
     const normalizedSymbol = symbol.trim().toUpperCase();
     const normalizedSource = source.trim().toLowerCase();
@@ -93,6 +99,7 @@ export function SmartHarvestModal({
     }
 
     try {
+      setSubmitting(true);
       const res = await harvestData({
         source: normalizedSource || "dukascopy",
         symbol: normalizedSymbol,
@@ -105,6 +112,8 @@ export function SmartHarvestModal({
       onTaskStarted?.(res.task_id);
     } catch (err: any) {
       setError(err.message || "Failed to start Smart Harvest task.");
+    } finally {
+      setSubmitting(false);
     }
   };
 
@@ -277,6 +286,7 @@ export function SmartHarvestModal({
                 <button
                   type="button"
                   onClick={handleSubmit}
+                  disabled={submitting}
                   style={{
                     display: "inline-flex",
                     alignItems: "center",
@@ -286,11 +296,17 @@ export function SmartHarvestModal({
                     border: "none",
                     background: "linear-gradient(135deg, #0f766e, #0891b2)",
                     color: "#ecfeff",
-                    cursor: "pointer",
+                    cursor: submitting ? "wait" : "pointer",
                     fontWeight: 700,
+                    opacity: submitting ? 0.72 : 1,
                   }}
                 >
-                  <Sparkles size={16} /> Start Smart Harvest
+                  {submitting ? (
+                    <Loader2 size={16} className="animate-spin" />
+                  ) : (
+                    <Sparkles size={16} />
+                  )}
+                  Start Smart Harvest
                 </button>
               </div>
             </div>

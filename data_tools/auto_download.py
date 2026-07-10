@@ -199,8 +199,8 @@ def _has_required_coverage(data_root: Path, requirement: DataRequirement) -> boo
     if coverage is None:
         return False
 
-    required_start = _normalize_coverage_date(requirement.start)
-    required_end = _normalize_coverage_date(requirement.end)
+    required_start = _normalize_coverage_timestamp(requirement.start)
+    required_end = _normalize_coverage_timestamp(requirement.end)
     if required_start is None and required_end is None:
         return True
 
@@ -212,14 +212,14 @@ def _has_required_coverage(data_root: Path, requirement: DataRequirement) -> boo
     return True
 
 
-def _coverage_for(data_root: Path, symbol: str, timeframe: str) -> tuple[str, str] | None:
+def _coverage_for(data_root: Path, symbol: str, timeframe: str) -> tuple[pd.Timestamp, pd.Timestamp] | None:
     ohlcv_root = data_root / "ohlcv"
     matches = sorted(ohlcv_root.rglob(f"**/{symbol}/{timeframe}.parquet"))
     if not matches:
         return None
 
-    starts: list[str] = []
-    ends: list[str] = []
+    starts: list[pd.Timestamp] = []
+    ends: list[pd.Timestamp] = []
     for path in matches:
         try:
             df = pd.read_parquet(path, columns=["timestamp"])
@@ -231,12 +231,21 @@ def _coverage_for(data_root: Path, symbol: str, timeframe: str) -> tuple[str, st
         timestamps = pd.to_datetime(df["timestamp"], utc=True, errors="coerce").dropna()
         if timestamps.empty:
             continue
-        starts.append(pd.Timestamp(timestamps.min()).date().isoformat())
-        ends.append(pd.Timestamp(timestamps.max()).date().isoformat())
+        starts.append(pd.Timestamp(timestamps.min()))
+        ends.append(pd.Timestamp(timestamps.max()))
 
     if not starts or not ends:
         return None
     return min(starts), max(ends)
+
+
+def _normalize_coverage_timestamp(value: str | None) -> pd.Timestamp | None:
+    if value is None or not str(value).strip():
+        return None
+    parsed = pd.to_datetime(str(value), utc=True, errors="coerce")
+    if pd.isna(parsed):
+        return None
+    return pd.Timestamp(parsed)
 
 
 def _normalize_coverage_date(value: str | None) -> str | None:

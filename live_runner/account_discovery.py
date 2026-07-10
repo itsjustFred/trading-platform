@@ -191,7 +191,10 @@ def discover_alpaca_accounts(api_key: str, secret_key: str, paper: bool) -> list
 
 
 def _trader_balance(trader: Any) -> float:
-    money_digits = int(getattr(trader, "moneyDigits", 2) or 2)
+    try:
+        money_digits = int(getattr(trader, "moneyDigits", 2))
+    except (TypeError, ValueError):
+        money_digits = 2
     scale = 10**money_digits if 0 <= money_digits <= 12 else 100
     return _safe_float(getattr(trader, "balance", 0.0), default=0.0) / scale
 

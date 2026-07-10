@@ -1,7 +1,7 @@
 import { memo, useCallback, useEffect, useMemo, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate } from "react-router-dom";
-import { Activity, Pause, Plus, Square, X } from "lucide-react";
+import { Activity, Pause, Play, Plus, Square, X } from "lucide-react";
 
 import {
   createLiveDeployment,
@@ -91,12 +91,14 @@ const LiveDeploymentCard = memo(function LiveDeploymentCard({
   card,
   busy,
   onPause,
+  onPlay,
   onStop,
   onDelete,
 }: {
   card: DeploymentCard;
   busy: boolean;
   onPause: (card: DeploymentCard, event: React.MouseEvent<HTMLButtonElement>) => void;
+  onPlay: (card: DeploymentCard, event: React.MouseEvent<HTMLButtonElement>) => void;
   onStop: (card: DeploymentCard, event: React.MouseEvent<HTMLButtonElement>) => void;
   onDelete: (card: DeploymentCard, event: React.MouseEvent<HTMLButtonElement>) => void;
 }) {
@@ -146,7 +148,18 @@ const LiveDeploymentCard = memo(function LiveDeploymentCard({
           return ` · Wait Candle Close: ${waitValue ? "On" : "Off"}`;
         })()}
       </div>
-      <div style={{ display: "flex", gap: "8px" }}>
+      <div style={{ display: "flex", gap: "8px", position: "relative", zIndex: 2 }}>
+        {card.status === "PAUSED" ? (
+          <button
+            type="button"
+            onClick={(event) => onPlay(card, event)}
+            title="Set status ACTIVE"
+            style={controlBtnStyle("play", false)}
+            disabled={busy}
+          >
+            <Play size={14} />
+          </button>
+        ) : null}
         <button
           type="button"
           onClick={(event) => onPause(card, event)}
@@ -640,6 +653,10 @@ export function LiveHubPage() {
 
   const handlePauseControl = useCallback((card: DeploymentCard, event: React.MouseEvent<HTMLButtonElement>) => {
     void handleControl("pause", card, event);
+  }, [handleControl]);
+
+  const handlePlayControl = useCallback((card: DeploymentCard, event: React.MouseEvent<HTMLButtonElement>) => {
+    void handleControl("play", card, event);
   }, [handleControl]);
 
   const handleStopControl = useCallback((card: DeploymentCard, event: React.MouseEvent<HTMLButtonElement>) => {
@@ -1354,6 +1371,7 @@ export function LiveHubPage() {
                         card={card}
                         busy={updatingDeploymentIds.has(card.id)}
                         onPause={handlePauseControl}
+                        onPlay={handlePlayControl}
                         onStop={handleStopControl}
                         onDelete={handleDelete}
                       />

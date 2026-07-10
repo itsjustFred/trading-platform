@@ -1092,7 +1092,23 @@ class JForexDownloader(Downloader):
             _raise_jforex_runtime_error("JForex instrument resolution failed", exc)
         out_path = self._make_output_path(output_dir, asset_class, normalized_symbol, target_tf)
 
-        effective_start = self._resolve_resume_start(out_path, start) or "2003-01-01"
+        if offer_side == "both":
+            bid_out_path = _build_offer_side_output_path(out_path, target_tf, "bid")
+            ask_out_path = _build_offer_side_output_path(out_path, target_tf, "ask")
+            if start:
+                effective_start = start
+            else:
+                resume_starts = [
+                    value
+                    for value in (
+                        self._resolve_resume_start(bid_out_path, None),
+                        self._resolve_resume_start(ask_out_path, None),
+                    )
+                    if value
+                ]
+                effective_start = min(resume_starts) if resume_starts else "2003-01-01"
+        else:
+            effective_start = self._resolve_resume_start(out_path, start) or "2003-01-01"
         effective_end = end or datetime.now(timezone.utc).date().isoformat()
 
         start_dt = _parse_datetime(effective_start, is_end=False)
@@ -1107,8 +1123,6 @@ class JForexDownloader(Downloader):
                 raise ValueError(
                     "offer_side='both' is not supported for tick-derived outputs with JForex"
                 )
-            bid_out_path = _build_offer_side_output_path(out_path, target_tf, "bid")
-            ask_out_path = _build_offer_side_output_path(out_path, target_tf, "ask")
             bid_df = _query_bars_for_offer_side(
                 java_instrument=java_instrument,
                 base_tf=base_tf,
@@ -1145,7 +1159,7 @@ class JForexDownloader(Downloader):
 
             merged_bid = self._merge_and_store_single_file(bid_out_path, bid_result_df)
             merged_ask = self._merge_and_store_single_file(ask_out_path, ask_result_df)
-            result_df = bid_result_df.merge(ask_result_df, on="timestamp", how="inner")
+            result_df = merged_bid.merge(merged_ask, on="timestamp", how="inner")
             result_df = (
                 result_df.sort_values("timestamp")
                 .drop_duplicates(subset=["timestamp"])

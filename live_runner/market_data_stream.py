@@ -161,16 +161,22 @@ class _StreamWorker:
     def set_symbols(self, symbols: set[str]) -> None:
         normalized = {_normalize_symbol(symbol) for symbol in symbols if _normalize_symbol(symbol)}
         with self._lock:
+            previous = set(self._symbols)
             self._symbols = normalized
         if self.stream is None:
             return
         if hasattr(self.stream, "unsubscribe_bars"):
+            removed = sorted(previous - normalized)
             try:
-                self.stream.unsubscribe_bars()
+                if removed:
+                    self.stream.unsubscribe_bars(*removed)
+                elif not normalized and previous:
+                    self.stream.unsubscribe_bars("*")
             except Exception:
                 pass
-        if normalized:
-            self._subscribe_symbols(sorted(normalized))
+        added = sorted(normalized - previous)
+        if added:
+            self._subscribe_symbols(added)
 
     def stop(self) -> None:
         self._running = False

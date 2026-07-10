@@ -77,6 +77,17 @@ def _export_table_csv(repo_path: Path, table: str, output_csv: Path):
         subprocess.check_call(["dolt", "table", "export", "-f", table], cwd=repo_path, stdout=f)
 
 
+def _quote_sql_identifier(value: str) -> str:
+    identifier = str(value or "").strip()
+    if not identifier:
+        raise ValueError("SQL identifier must not be empty")
+    return "`" + identifier.replace("`", "``") + "`"
+
+
+def _quote_sql_literal(value: str) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
+
+
 def _stock_export_path(target_dir: Path, symbol: str) -> Path:
     """Return the canonical OHLCV output path and migrate legacy flat exports."""
     legacy_path = target_dir / f"{symbol}.parquet"
@@ -109,7 +120,14 @@ def export_data():
 
             # Get symbols
             result = subprocess.run(
-                ["dolt", "sql", "-q", f"SELECT DISTINCT act_symbol FROM {table_name}", "-r", "csv"],
+                [
+                    "dolt",
+                    "sql",
+                    "-q",
+                    f"SELECT DISTINCT act_symbol FROM {_quote_sql_identifier(table_name)}",
+                    "-r",
+                    "csv",
+                ],
                 cwd=stocks_repo,
                 capture_output=True,
                 text=True,
@@ -135,7 +153,11 @@ def export_data():
                                 "dolt",
                                 "sql",
                                 "-q",
-                                f"SELECT date, open, high, low, close, volume FROM {table_name} WHERE act_symbol='{symbol}' ORDER BY date",
+                                (
+                                    "SELECT date, open, high, low, close, volume FROM "
+                                    f"{_quote_sql_identifier(table_name)} "
+                                    f"WHERE act_symbol={_quote_sql_literal(symbol)} ORDER BY date"
+                                ),
                                 "-r",
                                 "csv",
                             ],

@@ -147,16 +147,22 @@ def probe_single_day(
         return False
 
 
+def _previous_weekday(candidate: date) -> date:
+    while candidate.weekday() >= 5:
+        candidate -= timedelta(days=1)
+    return candidate
+
+
 def _year_probe_date(year: int) -> date:
     today = date.today()
     candidate = min(date(year, 12, 31), today)
-    return candidate - timedelta(days=1) if candidate.weekday() == 5 else candidate
+    return _previous_weekday(candidate)
 
 
 def _month_probe_date(year: int, month: int) -> date:
     today = date.today()
     candidate = min(date(year, month, calendar.monthrange(year, month)[1]), today)
-    return candidate - timedelta(days=1) if candidate.weekday() == 5 else candidate
+    return _previous_weekday(candidate)
 
 
 def _year_has_data(symbol: str, year: int, *, timeframe: str, price_type: str) -> bool:

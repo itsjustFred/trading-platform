@@ -26,7 +26,7 @@ import pandas as pd
 import requests
 
 from data_tools.downloaders.base import Downloader, DownloadResult, SourceMeta
-from shared.constants import DATA_DIR
+from shared.constants import DATA_DIR, normalize_timeframe
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +88,9 @@ class DolthubDownloader(Downloader):
     ) -> DownloadResult:
         owner, repo_name = repo.split("/", 1)
         symbol = symbol.upper()
+        timeframe = normalize_timeframe(timeframe)
+        if timeframe != "1d":
+            raise ValueError("DoltHub downloader currently supports timeframe '1d' only")
         out_path = self._make_output_path(output_dir, "equity", symbol, timeframe)
         effective_start = self._resolve_resume_start(out_path, start)
 

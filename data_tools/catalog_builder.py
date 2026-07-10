@@ -96,9 +96,17 @@ def _load_catalog_cache(data_dir: Path) -> dict[str, dict]:
 
 def _detect_storage(parquet_path: Path, data_dir: Path) -> str:
     """Determine storage mode: local, cached, or remote."""
-    cache_dir = data_dir / "cache"
-    if str(parquet_path).startswith(str(cache_dir)):
-        return "cached"
+    cache_dir = (data_dir / "cache").resolve()
+    try:
+        if parquet_path.resolve().is_relative_to(cache_dir):
+            return "cached"
+    except OSError:
+        pass
+    try:
+        if parquet_path.is_relative_to(cache_dir):
+            return "cached"
+    except ValueError:
+        pass
     return "local"
 
 

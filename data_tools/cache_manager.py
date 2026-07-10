@@ -24,6 +24,7 @@ logger = get_logger("data_tools.cache")
 CacheKey = tuple[str, bool]
 
 _CACHE_LOCK = threading.RLock()
+_BUILD_LOCKS: dict[CacheKey, threading.Lock] = {}
 _CATALOG_CACHE: dict[CacheKey, dict[str, Any]] = {}
 _OVERVIEW_CACHE: dict[CacheKey, dict[str, Any]] = {}
 _CACHE_STATS: dict[str, Any] = {
@@ -244,15 +245,26 @@ def get_catalog(
             return deepcopy(cached_catalog)
 
         _CACHE_STATS["misses"] += 1
+        build_lock = _BUILD_LOCKS.setdefault(key, threading.Lock())
+
+    with build_lock:
+        with _CACHE_LOCK:
+            cached_catalog = _CATALOG_CACHE.get(key)
+            if cached_catalog is not None:
+                _CACHE_STATS["hits"] += 1
+                return deepcopy(cached_catalog)
+
         root = Path(key[0])
         catalog = _load_catalog_from_disk(root, include_validation=include_validation)
         if catalog is None:
             catalog = build_catalog(root, include_validation=include_validation)
         catalog = _normalize_catalog_payload(catalog, root)
-        _CATALOG_CACHE[key] = catalog
-        _OVERVIEW_CACHE[key] = _build_overview_metadata(catalog)
-        _CACHE_STATS["builds"] += 1
-        _CACHE_STATS["last_build_at"] = _utc_now_iso()
+
+        with _CACHE_LOCK:
+            _CATALOG_CACHE[key] = catalog
+            _OVERVIEW_CACHE[key] = _build_overview_metadata(catalog)
+            _CACHE_STATS["builds"] += 1
+            _CACHE_STATS["last_build_at"] = _utc_now_iso()
 
     logger.debug(
         "Catalog cache populated",

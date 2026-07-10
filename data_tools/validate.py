@@ -163,11 +163,15 @@ def validate_parquet(path: Path) -> ValidationResult:
         diffs = ts.diff().dropna()
         threshold = pd.Timedelta(minutes=GAP_THRESHOLD_MINUTES.get(timeframe, 180))
 
-        large_gaps = diffs[diffs > threshold]
-        for idx in large_gaps.index[:20]:  # limit to 20 gaps
-            gap_start = ts.iloc[idx - 1] if idx > 0 else ts.iloc[0]
-            gap_end = ts.iloc[idx]
-            gap_minutes = diffs.iloc[idx].total_seconds() / 60
+        large_gap_positions = [
+            (position, gap_delta)
+            for position, gap_delta in enumerate(diffs, start=1)
+            if gap_delta > threshold
+        ]
+        for position, gap_delta in large_gap_positions[:20]:  # limit to 20 gaps
+            gap_start = ts.iloc[position - 1] if position > 0 else ts.iloc[0]
+            gap_end = ts.iloc[position]
+            gap_minutes = gap_delta.total_seconds() / 60
 
             # Skip weekends for non-forex
             if gap_start.weekday() == 4 and gap_end.weekday() == 0:

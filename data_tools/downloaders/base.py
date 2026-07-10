@@ -125,10 +125,27 @@ class Downloader(ABC):
             downloaded_at=datetime.now(timezone.utc).isoformat(),
         )
 
+    @staticmethod
+    def _safe_path_segment(value: str, field: str) -> str:
+        segment = str(value or "").strip()
+        if (
+            not segment
+            or segment in {".", ".."}
+            or "/" in segment
+            or "\\" in segment
+            or ".." in segment
+            or Path(segment).is_absolute()
+        ):
+            raise ValueError(f"Invalid {field}: {value!r}")
+        return segment
+
     def _make_output_path(
         self, output_dir: Path, asset_class: str, symbol: str, timeframe: str
     ) -> Path:
         """Build standardised output path: {output_dir}/ohlcv/{source}/{asset_class}/{symbol}/{tf}.parquet"""
+        asset_class = self._safe_path_segment(asset_class, "asset_class")
+        symbol = self._safe_path_segment(symbol, "symbol")
+        timeframe = self._safe_path_segment(timeframe, "timeframe")
         path = (
             output_dir / "ohlcv" / self.source_name / asset_class / symbol / f"{timeframe}.parquet"
         )
@@ -176,9 +193,15 @@ class Downloader(ABC):
         else:
             combined = combined.drop_duplicates().reset_index(drop=True)
 
+        temp_path = output_path.with_name(f".{output_path.name}.tmp")
         try:
-            combined.to_parquet(output_path, index=False)
+            combined.to_parquet(temp_path, index=False)
+            temp_path.replace(output_path)
         except (OSError, ValueError) as exc:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                logger.warning("Could not remove temporary parquet '%s'", temp_path)
             raise RuntimeError(f"Could not write parquet '{output_path}': {exc}") from exc
 
         return combined

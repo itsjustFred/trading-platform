@@ -128,9 +128,6 @@ def _write_env_key(path: Path, key: str, value: str) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     # Harden file permissions: tokens grant full trading access
     path.chmod(0o600)
-    # Ensure parent directory is also private
-    if path.parent.exists():
-        path.parent.chmod(0o700)
 
 
 def _ensure_asyncio_twisted_reactor(loop: asyncio.AbstractEventLoop) -> None:
@@ -180,7 +177,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self.access_token = access_token or os.environ.get("CTRADER_ACCESS_TOKEN", "")
         self.refresh_token = refresh_token or os.environ.get("CTRADER_REFRESH_TOKEN", "")
         self.accounts_env_path = Path(accounts_env_path) if accounts_env_path else DEFAULT_ACCOUNTS_ENV
-        raw_account_id = str(account_id or account_config_id).strip()
+        raw_account_id = str(account_id or "").strip()
         self.ctid_trader_account_id = int(raw_account_id) if raw_account_id else 0
         self.demo = (
             _parse_bool_env(os.environ.get("CTRADER_DEMO"), default=True)
@@ -197,7 +194,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             raise ValueError("Missing CTRADER_ACCESS_TOKEN.")
         if self.ctid_trader_account_id <= 0:
             raise ValueError(
-                "Missing or invalid cTrader account id. Provide account_id/account_config_id."
+                "Missing or invalid cTrader account id. Provide numeric account_id."
             )
 
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -993,12 +990,15 @@ class CTraderLiveAdapter(BaseLiveAdapter):
 
         broker_order_id = ""
         order_id = self._extract_order_id_from_payload(response)
-        if order_id is not None:
-            broker_order_id = str(order_id)
-            self._order_id_to_signal_id[order_id] = str(signal.id)
-            await asyncio.to_thread(
-                set_live_signal_broker_order_id, str(signal.id), broker_order_id
+        if order_id is None:
+            raise RuntimeError(
+                f"cTrader order response did not include an order id: {type(response).__name__}"
             )
+        broker_order_id = str(order_id)
+        self._order_id_to_signal_id[order_id] = str(signal.id)
+        await asyncio.to_thread(
+            set_live_signal_broker_order_id, str(signal.id), broker_order_id
+        )
 
         logger.info(
             "Submitted cTrader live order",

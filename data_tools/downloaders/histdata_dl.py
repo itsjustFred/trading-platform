@@ -147,6 +147,9 @@ class HistdataDownloader(Downloader):
         if timeframe != "1m":
             combined = self._resample(combined, timeframe)
 
+        if combined.empty:
+            raise RuntimeError(f"No data for {symbol} after applying filters")
+
         combined = self._merge_and_store_single_file(out_path, combined)
 
         return DownloadResult(

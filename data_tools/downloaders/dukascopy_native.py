@@ -784,63 +784,25 @@ async def _download_and_assemble_merged_ticks(
     pause_event: Event | None = None,
     log_callback: Callable[[str], None] | None = None,
 ) -> pd.DataFrame:
-    """Download both bid and ask ticks, merge into a single DataFrame."""
+    """Download tick files once; each tick row already contains ask and bid."""
     decimal_factor = _get_decimal_factor(instrument)
 
-    bid_urls = generate_tick_urls(instrument, start_dt, end_dt)
-    ask_urls = generate_tick_urls(instrument, start_dt, end_dt)
-    bid_results = await download_bi5_files(
-        bid_urls,
+    tick_urls = generate_tick_urls(instrument, start_dt, end_dt)
+    tick_results = await download_bi5_files(
+        tick_urls,
         batch_size,
         max_retries,
         batch_size=batch_size,
         pipeline_batches=pipeline_batches,
         pause_ms=pause_ms,
-        report_progress=(
-            (lambda pct, msg: _report_progress(report_progress, pct * 0.45, f"Bid {msg}"))
-            if report_progress
-            else None
-        ),
+        report_progress=report_progress,
         progress_unit="files",
         stop_event=stop_event,
         pause_event=pause_event,
         log_callback=log_callback,
     )
-    bid_df = _assemble_tick_dataframe(bid_results, decimal_factor)
-
-    ask_results = await download_bi5_files(
-        ask_urls,
-        batch_size,
-        max_retries,
-        batch_size=batch_size,
-        pipeline_batches=pipeline_batches,
-        pause_ms=pause_ms,
-        report_progress=(
-            (lambda pct, msg: _report_progress(report_progress, 45.0 + (pct * 0.45), f"Ask {msg}"))
-            if report_progress
-            else None
-        ),
-        progress_unit="files",
-        stop_event=stop_event,
-        pause_event=pause_event,
-        log_callback=log_callback,
-    )
-    ask_df = _assemble_tick_dataframe(ask_results, decimal_factor)
-    _report_progress(report_progress, 95.0, "Merging bid/ask data")
-
-    if bid_df.empty and ask_df.empty:
-        return pd.DataFrame()
-
-    if bid_df.empty:
-        return ask_df
-    if ask_df.empty:
-        return bid_df
-
-    merged = pd.merge(
-        bid_df, ask_df,
-        on="timestamp", how="inner", suffixes=("_bid", "_ask"),
-    ).sort_values("timestamp").reset_index(drop=True)
-    return merged
+    _report_progress(report_progress, 95.0, "Assembling bid/ask tick data")
+    return _assemble_tick_dataframe(tick_results, decimal_factor)
 
 
 # ─── Genesis helpers ─────────────────────────────────────────────────────────

@@ -64,17 +64,19 @@ def _parse_decimal(value: Any) -> float | None:
     return numeric
 
 
-def _parse_action(value: Any) -> str:
+def _parse_action(value: Any) -> str | None:
     action = str(value or "").strip().lower()
-    if action in {"buy", "long", "entry"}:
+    if action in {"buy", "long", "entry", "enter", "open", "open_long"}:
         return "buy"
-    if action in {"sell", "short"}:
+    if action in {"sell", "short", "exit", "close", "close_long", "open_short"}:
         return "sell"
     if "short" in action:
         return "sell"
     if "sell" in action:
         return "sell"
-    return "buy"
+    if "buy" in action or "long" in action:
+        return "buy"
+    return None
 
 
 def _is_intraday_timestamp(value: pd.Timestamp) -> bool:
@@ -109,8 +111,8 @@ def _parse_timestamp(
     ts = pd.Timestamp(parsed)
     if ts.tzinfo is None:
         ts = ts.tz_localize(source_timezone)
+    timeframe = "1m" if _is_intraday_timestamp(ts) or bool(time_value) else "1d"
     ts_utc = ts.tz_convert("UTC")
-    timeframe = "1m" if _is_intraday_timestamp(ts_utc) else "1d"
     return ts_utc.to_pydatetime(), timeframe
 
 
@@ -167,6 +169,8 @@ def load_signals_from_csv(filepath: str) -> list[dict[str, Any]]:
             continue
 
         action = _parse_action(row.get(action_column)) if action_column else "buy"
+        if action is None:
+            continue
         metadata: dict[str, Any] = {
             "csv_file": str(path),
             "csv_row": int(index) + 2,

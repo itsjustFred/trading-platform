@@ -13,6 +13,7 @@ from dotenv import dotenv_values
 from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credentials
 from live_runner.config_parser import parse_live_deployments_config
 from live_runner.ctrader_adapter import CTraderLiveAdapter, DEFAULT_ACCOUNTS_ENV
+from shared.constants import VALID_TIMEFRAMES, normalize_timeframe
 from shared.logging import get_logger
 from shared.models import LiveAccountConfig, LiveDeploymentConfig
 
@@ -148,12 +149,17 @@ def _preflight_account(
                         pass
 
     elif account.broker == "ctrader":
-        credentials = _resolve_ctrader_credentials(env_values)
+        try:
+            credentials = _resolve_ctrader_credentials(env_values)
+        except ValueError as exc:
+            credentials = None
+            errors.append(str(exc))
         if credentials is None:
-            errors.append(
-                "Missing cTrader credentials. Configure CTRADER_APP_ID, "
-                "CTRADER_APP_SECRET, and CTRADER_ACCESS_TOKEN."
-            )
+            if not errors:
+                errors.append(
+                    "Missing cTrader credentials. Configure CTRADER_APP_ID, "
+                    "CTRADER_APP_SECRET, and CTRADER_ACCESS_TOKEN."
+                )
         else:
             _, _, _, refresh_token, demo = credentials
             if not demo:
@@ -236,8 +242,11 @@ def _validate_deployments(
             errors.append(f"{label}: references unknown account_id.")
         if not deployment.symbols:
             errors.append(f"{label}: has no symbols configured.")
-        if not str(deployment.timeframe).strip():
+        timeframe = normalize_timeframe(str(deployment.timeframe).strip())
+        if not timeframe:
             errors.append(f"{label}: has no timeframe configured.")
+        elif timeframe not in VALID_TIMEFRAMES:
+            errors.append(f"{label}: invalid timeframe {deployment.timeframe!r}.")
         if deployment.signal_source == "discord":
             channel_id = str(deployment.signal_config.get("channel_id") or "").strip()
             if not channel_id:

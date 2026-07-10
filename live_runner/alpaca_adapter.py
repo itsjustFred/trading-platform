@@ -29,7 +29,14 @@ _ALPACA_ACC_RE = re.compile(r"^ALPACA_API_KEY_ACC(?P<index>\d+)$")
 def _parse_bool_env(value: str | None, default: bool = True) -> bool:
     if value is None:
         return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
+    normalized = value.strip().lower()
+    if not normalized:
+        return default
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Invalid boolean value: {value!r}")
 
 
 def _to_float(value: Any, *, default: float = 0.0) -> float:
@@ -63,12 +70,6 @@ def resolve_alpaca_credentials(
     """Resolve Alpaca credentials from env (default or ACC{N} blocks)."""
     values = dict(env) if env is not None else dict(os.environ)
 
-    default_api_key = str(values.get("ALPACA_API_KEY", "")).strip()
-    default_secret_key = str(values.get("ALPACA_SECRET_KEY", "")).strip()
-    if default_api_key and default_secret_key:
-        paper = _parse_bool_env(str(values.get("ALPACA_PAPER", "")).strip(), default=True)
-        return default_api_key, default_secret_key, paper
-
     indexes = sorted(
         {
             int(match.group("index"))
@@ -77,6 +78,11 @@ def resolve_alpaca_credentials(
         }
     )
     if not indexes:
+        default_api_key = str(values.get("ALPACA_API_KEY", "")).strip()
+        default_secret_key = str(values.get("ALPACA_SECRET_KEY", "")).strip()
+        if default_api_key and default_secret_key:
+            paper = _parse_bool_env(str(values.get("ALPACA_PAPER", "")).strip(), default=True)
+            return default_api_key, default_secret_key, paper
         return None
 
     blocks: list[dict[str, str | bool]] = []
@@ -105,6 +111,11 @@ def resolve_alpaca_credentials(
         )
 
     if not blocks:
+        default_api_key = str(values.get("ALPACA_API_KEY", "")).strip()
+        default_secret_key = str(values.get("ALPACA_SECRET_KEY", "")).strip()
+        if default_api_key and default_secret_key:
+            paper = _parse_bool_env(str(values.get("ALPACA_PAPER", "")).strip(), default=True)
+            return default_api_key, default_secret_key, paper
         return None
 
     normalized_account_id = str(account_id or "").strip().lower()
@@ -140,6 +151,11 @@ def resolve_alpaca_credentials(
             },
         )
         return None
+    default_api_key = str(values.get("ALPACA_API_KEY", "")).strip()
+    default_secret_key = str(values.get("ALPACA_SECRET_KEY", "")).strip()
+    if default_api_key and default_secret_key:
+        paper = _parse_bool_env(str(values.get("ALPACA_PAPER", "")).strip(), default=True)
+        return default_api_key, default_secret_key, paper
     first = blocks[0]
     return (
         str(first["api_key"]),
@@ -188,7 +204,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         self._trading_client = TradingClient(self.api_key, self.secret_key, paper=self.paper)
         self._trading_stream = TradingStream(self.api_key, self.secret_key, paper=self.paper)
         try:
-            self._trading_client.get_account()
+            await asyncio.to_thread(self._trading_client.get_account)
         except Exception:
             await self.disconnect()
             raise
@@ -302,7 +318,10 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 "alpaca-py is required for AlpacaLiveAdapter. Install package 'alpaca-py'."
             ) from exc
 
-        side = OrderSide.BUY if signal.action == "buy" else OrderSide.SELL
+        action = str(signal.action or "").strip().lower()
+        if action not in {"buy", "sell"}:
+            raise ValueError(f"Unsupported signal action: {signal.action}")
+        side = OrderSide.BUY if action == "buy" else OrderSide.SELL
         await asyncio.to_thread(save_live_signal, signal)
 
         request = MarketOrderRequest(
@@ -411,6 +430,12 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             actual_price = _to_float(fill_price)
             filled_qty = _to_float(filled_qty_value)
             commission = _to_float(commission_value)
+            if actual_price <= 0 or filled_qty <= 0:
+                logger.warning(
+                    "Alpaca fill missing positive price or quantity; skipping",
+                    extra={"data": {"client_order_id": str(client_order_id)}},
+                )
+                return
             fill_ts = _to_datetime(getattr(data, "timestamp", None))
             broker_order_id = str(getattr(order, "id", ""))
 

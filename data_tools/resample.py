@@ -19,6 +19,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from shared.constants import normalize_timeframe
+
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -48,6 +50,7 @@ def resample_ohlcv(df: pd.DataFrame, target_tf: str) -> pd.DataFrame:
     Returns:
         Resampled DataFrame.
     """
+    target_tf = normalize_timeframe(target_tf)
     if target_tf not in TIMEFRAME_MAP:
         raise ValueError(f"Unknown timeframe '{target_tf}'. Use: {list(TIMEFRAME_MAP.keys())}")
 
@@ -89,6 +92,9 @@ def resample_file(
         List of output file paths.
     """
     df = pd.read_parquet(source_path)
+    source_tf = normalize_timeframe(source_path.stem)
+    if source_tf not in TIMEFRAME_ORDER:
+        raise ValueError(f"Unknown source timeframe '{source_path.stem}'")
 
     # Normalize columns
     df.columns = [c.lower() for c in df.columns]
@@ -98,13 +104,21 @@ def resample_file(
         raise ValueError(f"Missing columns: {missing}")
 
     out_dir = output_dir or source_path.parent
+    out_dir.mkdir(parents=True, exist_ok=True)
     results = []
 
     for tf in timeframes:
-        out_path = out_dir / f"{tf}.parquet"
-        resampled = resample_ohlcv(df, tf)
+        normalized_tf = normalize_timeframe(tf)
+        if normalized_tf not in TIMEFRAME_ORDER:
+            raise ValueError(f"Unknown timeframe '{tf}'. Use: {TIMEFRAME_ORDER}")
+        if TIMEFRAME_ORDER.index(normalized_tf) <= TIMEFRAME_ORDER.index(source_tf):
+            raise ValueError(
+                f"Target timeframe '{normalized_tf}' must be higher than source '{source_tf}'"
+            )
+        out_path = out_dir / f"{normalized_tf}.parquet"
+        resampled = resample_ohlcv(df, normalized_tf)
         resampled.to_parquet(out_path, index=False)
-        logger.info("  %s: %d → %d rows → %s", tf, len(df), len(resampled), out_path)
+        logger.info("  %s: %d → %d rows → %s", normalized_tf, len(df), len(resampled), out_path)
         results.append(out_path)
 
     return results
@@ -115,6 +129,7 @@ def resample_directory(source_dir: Path, from_tf: str, timeframes: list[str]) ->
 
     Finds all {from_tf}.parquet files under source_dir and resamples each.
     """
+    from_tf = normalize_timeframe(from_tf)
     pattern = f"**/{from_tf}.parquet"
     source_files = sorted(source_dir.rglob(f"{from_tf}.parquet"))
 

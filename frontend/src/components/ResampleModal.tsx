@@ -38,6 +38,7 @@ export function ResampleModal({
   const [jobId, setJobId] = useState<string | null>(null);
   const [jobStatus, setJobStatus] = useState("idle");
   const [completionNotified, setCompletionNotified] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
 
   useEffect(() => {
     if (!open) {
@@ -49,6 +50,7 @@ export function ResampleModal({
     setJobId(null);
     setJobStatus("idle");
     setCompletionNotified(false);
+    setSubmitting(false);
   }, [defaultSourcePath, defaultTargetTimeframes, open]);
 
   useEffect(() => {
@@ -75,9 +77,13 @@ export function ResampleModal({
     setJobStatus("idle");
     setCompletionNotified(false);
     setError("");
+    setSubmitting(false);
   };
 
   const handleSubmit = async () => {
+    if (submitting) {
+      return;
+    }
     setError("");
     if (!sourcePath.trim()) {
       setError("Please provide the source parquet path to resample.");
@@ -85,6 +91,7 @@ export function ResampleModal({
     }
 
     try {
+      setSubmitting(true);
       const res = await resampleData({
         source_path: sourcePath,
         target_timeframes: targetTimeframes,
@@ -95,6 +102,8 @@ export function ResampleModal({
       onTaskStarted?.(res.task_id);
     } catch (err: any) {
       setError(err.message || "Failed to start resample task.");
+    } finally {
+      setSubmitting(false);
     }
   };
 
@@ -249,6 +258,7 @@ export function ResampleModal({
                 <button
                   type="button"
                   onClick={handleSubmit}
+                  disabled={submitting}
                   style={{
                     display: "inline-flex",
                     alignItems: "center",
@@ -258,11 +268,17 @@ export function ResampleModal({
                     border: "none",
                     background: "linear-gradient(135deg, #0f766e, #0891b2)",
                     color: "#ecfeff",
-                    cursor: "pointer",
+                    cursor: submitting ? "wait" : "pointer",
                     fontWeight: 700,
+                    opacity: submitting ? 0.72 : 1,
                   }}
                 >
-                  <RefreshCw size={16} /> Start resample
+                  {submitting ? (
+                    <Loader2 size={16} className="animate-spin" />
+                  ) : (
+                    <RefreshCw size={16} />
+                  )}
+                  Start resample
                 </button>
               </div>
             </div>

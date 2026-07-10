@@ -27,6 +27,17 @@ export const Sparkline = memo(function Sparkline({
   );
   const [hoverIndex, setHoverIndex] = useState<number | null>(null);
 
+  const drawdowns = useMemo(() => {
+    let peak = Number.NEGATIVE_INFINITY;
+    return normalized.map((value) => {
+      peak = Math.max(peak, value);
+      if (!Number.isFinite(peak) || Math.abs(peak) < 1e-9) {
+        return 0;
+      }
+      return ((value - peak) / Math.abs(peak)) * 100;
+    });
+  }, [normalized]);
+
   if (normalized.length < 2) return null;
 
   const min = Math.min(...normalized);
@@ -50,17 +61,6 @@ export const Sparkline = memo(function Sparkline({
 
   // Fill area under the line
   const fillPoints = `0,${height} ${points} ${width},${height}`;
-  const drawdowns = useMemo(() => {
-    let peak = Number.NEGATIVE_INFINITY;
-    return normalized.map((value) => {
-      peak = Math.max(peak, value);
-      if (!Number.isFinite(peak) || Math.abs(peak) < 1e-9) {
-        return 0;
-      }
-      return ((value - peak) / Math.abs(peak)) * 100;
-    });
-  }, [normalized]);
-
   const hoverIdx = hoverIndex == null ? null : Math.max(0, Math.min(normalized.length - 1, hoverIndex));
   const hoverX = hoverIdx == null ? 0 : (hoverIdx / (normalized.length - 1)) * width;
   const hoverY =
@@ -83,9 +83,9 @@ export const Sparkline = memo(function Sparkline({
     hoverIdx == null
       ? ""
       : hasDateRange
-        ? new Date(parsedStart + ((parsedEnd - parsedStart) * hoverIdx) / (normalized.length - 1)).toLocaleDateString("de-DE")
+        ? new Date(parsedStart + ((parsedEnd - parsedStart) * hoverIdx) / (normalized.length - 1)).toLocaleDateString("en-US")
         : "";
-  const hoverPointLabel = hoverIdx == null ? "" : `Punkt ${hoverIdx + 1}`;
+  const hoverPointLabel = hoverIdx == null ? "" : `Point ${hoverIdx + 1}`;
 
   return (
     <div style={{ position: "relative", width, height, overflow: "visible" }}>

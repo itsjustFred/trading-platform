@@ -14,6 +14,7 @@ interface DataTableProps<T> {
   data: T[];
   onRowClick?: (row: T) => void;
   maxHeight?: string;
+  getRowKey?: (row: T) => string | number;
 }
 
 export function DataTable<T extends Record<string, any>>({
@@ -21,6 +22,7 @@ export function DataTable<T extends Record<string, any>>({
   data,
   onRowClick,
   maxHeight = "600px",
+  getRowKey,
 }: DataTableProps<T>) {
   const [sortKey, setSortKey] = useState<string | null>(null);
   const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
@@ -38,6 +40,24 @@ export function DataTable<T extends Record<string, any>>({
       return sortDir === "asc" ? cmp : -cmp;
     });
   }, [data, sortKey, sortDir]);
+
+  const rowKeys = useMemo(() => {
+    const counts = new Map<string, number>();
+    return sorted.map((row) => {
+      const base = String(
+        getRowKey?.(row) ??
+          row.id ??
+          row.key ??
+          row.slug ??
+          row.name ??
+          row.symbol ??
+          JSON.stringify(row),
+      );
+      const duplicateIndex = counts.get(base) ?? 0;
+      counts.set(base, duplicateIndex + 1);
+      return duplicateIndex === 0 ? base : `${base}:${duplicateIndex}`;
+    });
+  }, [getRowKey, sorted]);
 
   const handleSort = (key: string) => {
     if (sortKey === key) setSortDir((d) => (d === "asc" ? "desc" : "asc"));
@@ -96,7 +116,7 @@ export function DataTable<T extends Record<string, any>>({
         <tbody>
           {sorted.map((row, i) => (
             <tr
-              key={i}
+              key={rowKeys[i]}
               onClick={() => onRowClick?.(row)}
               style={{ cursor: onRowClick ? "pointer" : "default" }}
               onMouseEnter={(e) =>

@@ -132,6 +132,8 @@ class AlpacaDownloader(Downloader):
         ]
 
     def _make_us_equity_output_path(self, output_dir: Path, symbol: str, timeframe: str) -> Path:
+        symbol = self._safe_path_segment(symbol, "symbol")
+        timeframe = self._safe_path_segment(timeframe, "timeframe")
         path = output_dir / "ohlcv" / self.source_name / "equity" / "US" / symbol / f"{timeframe}.parquet"
         path.parent.mkdir(parents=True, exist_ok=True)
         return path

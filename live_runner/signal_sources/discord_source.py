@@ -485,6 +485,9 @@ class DiscordSignalSource(BaseSignalSource):
             await self.connect()
         while not self._paused:
             if self._run_task is not None and self._run_task.done():
+                if self._run_task.cancelled():
+                    await self._set_service_status(ServiceStatus.FAILED)
+                    raise RuntimeError("Discord client task was cancelled")
                 exception = self._run_task.exception()
                 if exception is not None:
                     if _is_discord_auth_error(exception):

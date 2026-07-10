@@ -146,6 +146,15 @@ def ensure_alias_copy(canonical_path: Path, requested_symbol: str, asset_class: 
 
 
 VALID_TIMEFRAMES = {"1m", "5m", "15m", "30m", "1h", "4h", "1d"}
+TIMEFRAME_ORDER = ["1m", "5m", "15m", "30m", "1h", "4h", "1d"]
+
+
+def _timeframe_sort_key(timeframe: str) -> int:
+    try:
+        return TIMEFRAME_ORDER.index(timeframe)
+    except ValueError:
+        return len(TIMEFRAME_ORDER)
+
 
 def download_symbol(
     *,
@@ -173,6 +182,7 @@ def download_symbol(
             "status": "failed",
             "started_at": datetime.now(timezone.utc).isoformat(),
             "paths": {},
+            "timeframe_errors": invalid_timeframes,
             "error": f"Invalid timeframes: {invalid_timeframes}. Valid: {sorted(VALID_TIMEFRAMES)}",
         }
 
@@ -181,7 +191,7 @@ def download_symbol(
     canonical_dir = output_dir / "ohlcv" / "dukascopy" / asset_class / canonical_symbol
     requested_dir = output_dir / "ohlcv" / "dukascopy" / asset_class / requested_symbol
     source_path = canonical_dir / "1m.parquet"
-    requested_timeframes = sorted(set(timeframes), key=lambda tf: ["1m", "5m", "15m", "30m", "1h", "4h", "1d"].index(tf))
+    requested_timeframes = sorted(set(timeframes), key=_timeframe_sort_key)
     higher_timeframes = [tf for tf in requested_timeframes if tf != "1m"]
 
     started_at = datetime.now(timezone.utc).isoformat()
@@ -197,7 +207,8 @@ def download_symbol(
     }
 
     try:
-        if "1m" in requested_timeframes:
+        needs_1m_source = "1m" in requested_timeframes or bool(higher_timeframes)
+        if needs_1m_source:
             if not source_path.exists() or force:
                 dl_result = downloader.download(
                     canonical_symbol,
@@ -216,6 +227,8 @@ def download_symbol(
                 result["download"] = {"symbol": canonical_symbol, "timeframe": "1m", "rows": rows, "path": str(source_path), "status": "cached"}
 
             normalize_ohlcv_columns(source_path)
+
+        if "1m" in requested_timeframes:
             requested_1m = ensure_alias_copy(source_path, requested_symbol, asset_class, output_dir)
             result["paths"]["1m"] = str(requested_1m)
             result["paths"]["rows_1m"] = parquet_rows(requested_1m)

@@ -1,5 +1,6 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import { Activity, ArrowRight, Pause, RefreshCw, Square } from "lucide-react";
 
@@ -68,37 +69,14 @@ function cardStyle(): CSSProperties {
 
 export function TaskHubPage() {
   const { showToast } = useToast();
-  const [tasks, setTasks] = useState<DataTaskStatusResponse[]>([]);
   const [busy, setBusy] = useState<Record<string, boolean>>({});
-  const [loading, setLoading] = useState(true);
   const statusRef = useRef<Record<string, string>>({});
-
-  useEffect(() => {
-    let active = true;
-    let id = 0;
-
-    const poll = async () => {
-      try {
-        const payload = await listTasks();
-        if (!active) return;
-        setTasks(payload.tasks || []);
-      } catch {
-        if (!active) return;
-      } finally {
-        if (active) setLoading(false);
-      }
-    };
-
-    void poll();
-    id = window.setInterval(() => {
-      void poll();
-    }, TASK_POLL_MS);
-
-    return () => {
-      active = false;
-      window.clearInterval(id);
-    };
-  }, []);
+  const tasksQuery = useQuery({
+    queryKey: ["tasks"],
+    queryFn: listTasks,
+    refetchInterval: TASK_POLL_MS,
+  });
+  const tasks = tasksQuery.data?.tasks ?? [];
 
   useEffect(() => {
     const previous = statusRef.current;
@@ -153,10 +131,8 @@ export function TaskHubPage() {
   ) => {
     setBusy((current) => ({ ...current, [taskId]: true }));
     try {
-      const updated = await action();
-      setTasks((current) =>
-        current.map((task) => (task.id === updated.id ? updated : task)),
-      );
+      await action();
+      await tasksQuery.refetch();
       showToast(success, "info");
     } catch (error: any) {
       showToast(error.message || "Task action failed.", "error");
@@ -202,8 +178,12 @@ export function TaskHubPage() {
 
       <section style={{ display: "grid", gap: "10px" }}>
         <div style={{ fontWeight: 700, fontSize: "1.03rem" }}>Active Tasks</div>
-        {loading ? (
+        {tasksQuery.isLoading ? (
           <div style={cardStyle()}>Loading tasks...</div>
+        ) : tasksQuery.isError ? (
+          <div style={cardStyle()}>
+            <span style={{ color: "#fecaca" }}>Could not load task status.</span>
+          </div>
         ) : activeTasks.length === 0 ? (
           <div style={cardStyle()}>No active tasks.</div>
         ) : (

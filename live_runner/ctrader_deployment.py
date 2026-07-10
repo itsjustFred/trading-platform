@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from shared.constants import normalize_timeframe
 from shared.models import LiveAccountConfig, LiveDeploymentConfig
 
 
@@ -53,7 +54,7 @@ def top_backtests_for_ctrader(
         ),
         reverse=True,
     )
-    return candidates[: max(1, int(limit))]
+    return candidates[: max(0, int(limit))]
 
 
 def build_ctrader_deployment_plan(
@@ -70,7 +71,7 @@ def build_ctrader_deployment_plan(
     deployments: list[LiveDeploymentConfig] = []
     for row in top_backtests_for_ctrader(backtests, limit=limit):
         strategy_name = str(row.get("strategy_name") or "").strip() or str(row.get("id") or "")
-        timeframe = str(row.get("timeframe") or "").strip() or "1h"
+        timeframe = normalize_timeframe(str(row.get("timeframe") or "").strip() or "1h")
         deployments.append(
             LiveDeploymentConfig(
                 strategy_name=strategy_name,

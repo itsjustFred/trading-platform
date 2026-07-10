@@ -60,6 +60,9 @@ export function ServicesPage() {
   };
 
   const handleDelete = async (service: Service) => {
+    if (!window.confirm(`Delete service "${service.name}"?`)) {
+      return;
+    }
     try {
       await deleteService(service.id);
       await servicesQuery.refetch();

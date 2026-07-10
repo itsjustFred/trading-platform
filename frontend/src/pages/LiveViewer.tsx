@@ -55,6 +55,7 @@ type ViewerTrade = {
   pnl: number | null;
   exitReason: string;
   time: string;
+  executionTimeUnix: number;
   signalTimeUnix: number;
 };
 
@@ -619,7 +620,7 @@ function LiveCandlestickChart({
     }
     for (const trade of trades) {
       if (trade.exit === null) continue;
-      const t = toChartTime(trade.signalTimeUnix);
+      const t = toChartTime(trade.executionTimeUnix || trade.time);
       if (t === null) continue;
       out.push({
         id: `exit-${trade.id}`,
@@ -836,7 +837,7 @@ function SignalLogTable({ signals, loading }: { signals: LiveSignalLog[]; loadin
               <td style={tdStyle}>
                 <span style={statusBadgeStyle(signal.status)}>
                   {signal.status}
-                  {signal.status === "Waiting" && signal.waiting_countdown_seconds != null
+                  {String(signal.status || "").toLowerCase() === "waiting" && signal.waiting_countdown_seconds != null
                     ? ` (${formatCountdown(signal.waiting_countdown_seconds)})`
                     : ""}
                 </span>
@@ -962,6 +963,7 @@ function toTradeHistoryRows(rows: LiveTradeSlippage[]): ViewerTrade[] {
       pnl,
       exitReason: row.exit_reason || String(row.signal_metadata?.exit_reason || ""),
       time: row.execution_timestamp || row.signal_timestamp,
+      executionTimeUnix: asFinite(row.execution_time, 0),
       signalTimeUnix: asFinite(row.signal_time, 0),
     };
   });
@@ -976,17 +978,21 @@ function uniqueSymbols(
   const values = new Set<string>();
   for (const deployment of deployments) {
     for (const symbol of deployment.symbols) {
-      if (symbol.trim()) values.add(symbol.trim().toUpperCase());
+      const normalized = symbol.trim().toUpperCase();
+      if (normalized && normalized !== "*") values.add(normalized);
     }
   }
   for (const fill of fills) {
-    if (fill.symbol.trim()) values.add(fill.symbol.trim().toUpperCase());
+    const normalized = fill.symbol.trim().toUpperCase();
+    if (normalized && normalized !== "*") values.add(normalized);
   }
   for (const position of positions) {
-    if (position.symbol.trim()) values.add(position.symbol.trim().toUpperCase());
+    const normalized = position.symbol.trim().toUpperCase();
+    if (normalized && normalized !== "*") values.add(normalized);
   }
   for (const signal of signals) {
-    if (signal.symbol.trim()) values.add(signal.symbol.trim().toUpperCase());
+    const normalized = signal.symbol.trim().toUpperCase();
+    if (normalized && normalized !== "*") values.add(normalized);
   }
   return [...values].sort();
 }

@@ -145,15 +145,31 @@ export function LiveDetailPage() {
   }, [accountId]);
 
   useEffect(() => {
-    if (!replayModalOpen || signalProcessorsLoading) {
+    if (!replayModalOpen) {
       return;
     }
+    let cancelled = false;
     setSignalProcessorsLoading(true);
     getSignalProcessors()
-      .then((payload) => setSignalProcessors(payload))
-      .catch(() => setSignalProcessors([]))
-      .finally(() => setSignalProcessorsLoading(false));
-  }, [replayModalOpen, signalProcessorsLoading]);
+      .then((payload) => {
+        if (!cancelled) {
+          setSignalProcessors(payload);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setSignalProcessors([]);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setSignalProcessorsLoading(false);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [replayModalOpen]);
 
   const equitySeries = useMemo(
     () =>
