@@ -18,7 +18,7 @@
 | Re-Run 3 | 2 | `0065879` | daemon.py ×2 (signal_config None-Guard, normalize_timeframe) gefixt |
 | Re-Run 4 | **0 ✓** | — | CLEAN — `findings:0` (review_completed, COMPLETED_OK) |
 
-### Batch 2 (150 Dateien) — `findings: 50 → fix`
+### Batch 2 (150 Dateien) — `findings: 50 → 6 → 15 → 0 ✓` (CLEAN)
 | Schritt | Findings | Commit | Notes |
 |--------|----------|--------|-------|
 | Initial-Review | 50 (3 critical, 26 major, 21 minor) | — | |
@@ -26,7 +26,7 @@
 | Test-Align | — | `2d4fe89`, `cbebf74` | Tests an CR-verändertes Verhalten angepasst (walkforward + ctrader) — keine Code-Regressionen |
 | Re-Run 1 | 6 | `bdd53f5` | 1 critical + 3 major + 2 minor gefixt (argparse, run_trial resilience, signal_replay ValueError/progress, position_size, migration doc) |
 | Re-Run 2 | 15 | `12b755c` + pynecore/risk_parity | 14 major + 1 minor gefixt (build_run_id hash, timeout-reject, dedupe, keep_indicators; pynecore: failure-propagation, end-date intraday, notional min, sidecar-deps, all_stats-accum, cross-symbol sizing, equity exit_time; risk_parity: combo-cap, dropna(any), explicit infeasibility, vol-epsilon) |
-| Re-Run 3 | pending | — | CR-Review läuft |
+| Re-Run 3 | **0 ✓** | — | CLEAN — `findings:0` (review_completed, COMPLETED_OK) |
 
 Critical Findings behandelt:
 - `runner/engines/lean_adapter.py` — fehlendes `import os` (CRITICAL)
