@@ -491,7 +491,7 @@ def size_live_signal_for_submission(
     explicit_qty = _first_metadata_float(metadata, ("explicit_qty", "qty"))
     stop_loss = _first_metadata_float(metadata, ("stop_loss", "sl_price", "stop_price"))
     take_profit = _first_metadata_float(metadata, ("take_profit", "tp_price"))
-    resolved_timeframe = (
+    resolved_timeframe = normalize_timeframe(
         str(metadata.get("timeframe") or deployment.timeframe).strip() or deployment.timeframe
     )
     pip = pip_value if pip_value is not None else metadata.get("pip_value", 1.0)
@@ -665,7 +665,7 @@ async def _run_discord_signal_listener_for_account(
     channel_to_deployments: dict[str, list[LiveDeploymentConfig]] = {}
     for deployment in active_discord_deployments:
         configured_channel = str(
-            deployment.signal_config.get("channel_id")
+            (deployment.signal_config or {}).get("channel_id")
             or accounts_env_values.get("DISCORD_CHANNEL_ID", "")
         ).strip()
         if not configured_channel:
