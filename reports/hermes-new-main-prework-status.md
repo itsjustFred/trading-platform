@@ -15,7 +15,7 @@
 | Fix-Runde 1 | — | `ff695ee` | 41 Dateien; u.a. `histdata_dl` 12-Monats-Loop, `alpaca_dl` Client-Pagination |
 | Re-Run 1 | 4 | `fc23d21` | `resample.py` output_dir, `Modal.tsx` focus-ref, `OptimizationsPage.tsx` a11y/String |
 | Re-Run 2 | 3 | `8cb7be0` | alle in `data_tools/dolthub_manager.py`: `DOLT_BIN` statt hardcoded `dolt`, returncode-Check, `normalize_timeframe('1d')` |
-| Re-Run 3 | läuft (proc_0bbdbf08e89c) | — | **CR-Free-Tier-Rate-Limit** → Harness retried automatisch um 08:17 UTC |
+| Re-Run 3 | läuft (proc_0bbdbf08e89c) | — | Attempt 3 *summarizing* — CR-Rate-Limit-Reset erreicht, Review läuft jetzt |
 
 ### Batch 2 (150 Dateien) — `findings: 50 → fix`
 | Schritt | Findings | Commit | Notes |
@@ -47,6 +47,7 @@ Hinweis: G4-Subagent hatte `server_planning/01_current_state.md` irrtümlich kom
 - `pytest` (valide Subset, 15 broken Module ausgeschlossen):
   - Run 1: 826 passed, 44 failed.
   - Walkforward-Regressionen (3) behoben in `2d4fe89` → Run 2: 829 passed, 41 failed.
+  - ctrader-Regression (1) behoben in `cbebf74` → Run 3 (final): 830 passed, 40 failed.
   - **4 Failures waren echte Regressionen** durch CR-korrekte Code-Änderungen, alle behoben:
     - `walkforward.py` (3): `step_months` aus Portfolio-Config entfernt, `n_profitable_folds`
       zählt OOS-Return statt Sharpe, kollisions-sicheres Dateiformat `wf_..._<micro>_<uuid8>`.
@@ -59,7 +60,7 @@ Hinweis: G4-Subagent hatte `server_planning/01_current_state.md` irrtümlich kom
     `validation.reporting._sanitize_json_numbers`; `portfolio_optimizer.align_equity_curves`/
     `_normalize_weights` (Datei von mir **nicht** geändert) schlägt mit Shape-Assertions fehl
     (präexistente Logik/NumPy-Version); `grid_tester`/`live_smoke` via `sentry_sdk`/`apscheduler` env.
-  - Finaler Re-Run (proc_55c…) bestätigt: nur noch env/präexistente Fehler.
+  - Finaler Re-Run (proc_ab9…): 830 passed, 40 failed — alle verbleibenden Fehler env/präexistent, **keine Regression** durch die CR-Fixes.
 
 ---
 
