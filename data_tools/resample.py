@@ -124,7 +124,9 @@ def resample_file(
     return results
 
 
-def resample_directory(source_dir: Path, from_tf: str, timeframes: list[str]) -> list[Path]:
+def resample_directory(
+    source_dir: Path, from_tf: str, timeframes: list[str], output_dir: Path | None = None
+) -> list[Path]:
     """Resample all parquet files in a directory tree.
 
     Finds all {from_tf}.parquet files under source_dir and resamples each.
@@ -142,7 +144,7 @@ def resample_directory(source_dir: Path, from_tf: str, timeframes: list[str]) ->
         symbol = src.parent.name
         logger.info("Resampling %s (%s)...", symbol, src)
         try:
-            results = resample_file(src, timeframes)
+            results = resample_file(src, timeframes, output_dir)
             all_results.extend(results)
         except Exception as e:
             logger.error("  Failed: %s", e)
@@ -187,11 +189,12 @@ def main():
 
     timeframes = [t.strip() for t in args.timeframes.split(",")]
 
+    output_dir = Path(args.output) if args.output else None
+
     if args.source:
         source = Path(args.source)
         if not source.exists():
             parser.error(f"Source file not found: {source}")
-        output_dir = Path(args.output) if args.output else None
         logger.info("Resampling %s → %s", source, timeframes)
         resample_file(source, timeframes, output_dir)
 
@@ -200,13 +203,13 @@ def main():
         if not source_dir.exists():
             parser.error(f"Source directory not found: {source_dir}")
         logger.info("Resampling all %s files under %s → %s", args.from_tf, source_dir, timeframes)
-        resample_directory(source_dir, args.from_tf, timeframes)
+        resample_directory(source_dir, args.from_tf, timeframes, output_dir)
 
     else:
         parser.error("Either --source or --source-dir required")
 
     if args.update_catalog:
-        update_catalog()
+        update_catalog(output_dir)
 
 
 if __name__ == "__main__":

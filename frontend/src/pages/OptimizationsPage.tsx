@@ -54,7 +54,7 @@ export function OptimizationsPage() {
         ...Object.keys(optimization.best_params || {}),
       ]
         .filter(Boolean)
-        .some((value) => value.toLowerCase().includes(query));
+        .some((value) => String(value).toLowerCase().includes(query));
     });
   }, [optimizations, search]);
 
@@ -131,6 +131,7 @@ export function OptimizationsPage() {
           </div>
           <div style={{ minWidth: "240px", width: "min(100%, 320px)" }}>
             <label
+              htmlFor="optimization-search"
               style={{
                 display: "block",
                 marginBottom: "8px",
@@ -143,6 +144,7 @@ export function OptimizationsPage() {
               Search runs
             </label>
             <input
+              id="optimization-search"
               value={search}
               onChange={(event) => setSearch(event.target.value)}
               placeholder="base backtest, metric, parameter..."
