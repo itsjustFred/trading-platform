@@ -8,6 +8,7 @@ import os
 import re
 import signal
 import subprocess
+import select
 import sys
 import threading
 import time
@@ -7739,7 +7740,27 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
                 _update_task_fields(task_id, pid=proc.pid, process=proc)
 
                 if proc.stdout is not None:
-                    for raw_line in proc.stdout:
+                    # Iterate stdout with an independent wall-clock deadline so a
+                    # silent hang (no output emitted) cannot block forever before
+                    # proc.wait() runs. Kill and raise the timeout error once the
+                    # deadline expires.
+                    _deadline = time.monotonic() + 300
+                    while True:
+                        _remaining = _deadline - time.monotonic()
+                        if _remaining <= 0:
+                            if proc.poll() is None:
+                                proc.kill()
+                            raise subprocess.SubprocessError(
+                                "Backtest timed out after 300 seconds"
+                            )
+                        _readable, _, _ = select.select(
+                            [proc.stdout], [], [], min(_remaining, 1.0)
+                        )
+                        if not _readable:
+                            continue
+                        raw_line = proc.stdout.readline()
+                        if raw_line == "":
+                            break
                         line = raw_line.rstrip("\n")
                         if line:
                             _write_task_log_line(
@@ -7772,11 +7793,11 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
                                             meta_id = str(getattr(loaded_result.meta, "id", "") or "").strip()
                                             if meta_id:
                                                 backtest_id = meta_id
-                                _update_task_fields(
-                                    task_id,
-                                    output_path=output_path,
-                                    backtest_id=backtest_id or None,
-                                )
+                                    _update_task_fields(
+                                        task_id,
+                                        output_path=output_path,
+                                        backtest_id=backtest_id or None,
+                                    )
 
                 try:
                     returncode = proc.wait(timeout=300)
