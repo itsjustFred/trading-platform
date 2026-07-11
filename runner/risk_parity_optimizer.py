@@ -15,6 +15,8 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
 
+MAX_CANDIDATE_UNIVERSES = 2000
+
 
 @dataclass(frozen=True)
 class RiskParitySelection:
@@ -91,7 +93,7 @@ def solve_risk_parity_weights(
     if lower * n_assets > 1.0:
         raise ValueError("min_weight is infeasible for the number of assets")
     if upper * n_assets < 1.0:
-        upper = 1.0
+        raise ValueError("max_weight is too small for the weights to sum to 1.0")
 
     target = np.full(n_assets, 1.0 / n_assets)
     initial = np.full(n_assets, 1.0 / n_assets)
@@ -135,7 +137,7 @@ def score_risk_parity_universe(
     weights_array = solve_risk_parity_weights(cov, min_weight=min_weight, max_weight=max_weight)
     portfolio_returns = returns @ weights_array
     mean_return = float(np.mean(portfolio_returns)) if len(portfolio_returns) else 0.0
-    volatility = float(np.std(portfolio_returns) + 1e-12)
+    volatility = float(np.std(portfolio_returns))
     sharpe = float(mean_return / volatility) if volatility > 0 else 0.0
 
     asset_vols = np.sqrt(np.maximum(np.diag(cov), 1e-12))
@@ -182,7 +184,10 @@ def candidate_universes(
     upper = min(len(normalized), int(max_assets or len(normalized)))
     universes: list[list[str]] = []
     for size in range(max(2, min_assets), upper + 1):
-        universes.extend([list(combo) for combo in itertools.combinations(normalized, size)])
+        for combo in itertools.combinations(normalized, size):
+            universes.append(list(combo))
+            if len(universes) >= MAX_CANDIDATE_UNIVERSES:
+                return universes
     return universes
 
 
@@ -211,7 +216,7 @@ def select_best_risk_parity_universe(
         columns = [symbol for symbol in universe if symbol in returns_frame.columns]
         if len(columns) < 2:
             continue
-        subset = returns_frame[columns].dropna(how="all").fillna(0.0)
+        subset = returns_frame[columns].dropna(how="any")
         if len(subset) < 2:
             continue
         selections.append(

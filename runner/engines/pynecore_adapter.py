@@ -63,6 +63,7 @@ class PyneCoreAdapter(EngineAdapter):
         all_drawings: list[dict[str, Any]] = []
         trade_counter = 0
         total_bars = 0
+        asset_class = "unknown"
         strategy_name, context_builder, drawings_builder = _load_strategy_artifacts(
             strategy_path, config.strategy_name
         )
@@ -102,8 +103,9 @@ class PyneCoreAdapter(EngineAdapter):
                     if venv_bin.exists():
                         pyne_bin = str(venv_bin)
                     else:
-                        logger.error("pyne CLI not found in PATH")
-                        continue
+                        raise RuntimeError(
+                            "pyne CLI not found in PATH or venv bin; cannot run PyneCore backtest"
+                        )
 
                 cmd = [
                     pyne_bin,
@@ -135,20 +137,23 @@ class PyneCoreAdapter(EngineAdapter):
                 )
 
                 if result.returncode != 0:
-                    logger.error("PyneCore failed for %s: %s", symbol, result.stderr[-500:])
-                    continue
+                    raise RuntimeError(
+                        f"PyneCore failed for {symbol}: {result.stderr[-500:]}"
+                    )
 
                 if trade_csv.exists():
                     trades = _parse_trade_csv(trade_csv, symbol, trade_counter)
                     if trade_context:
                         _enrich_trades_with_context(trades, trade_context, df)
                     _normalize_trade_exits(trades)
-                    _apply_risk_sizing(trades, config, asset_class)
                     trade_counter += len(trades)
                     all_trades.extend(trades)
 
                 if stats_csv.exists():
-                    all_stats = _parse_stats_csv(stats_csv)
+                    symbol_stats = _parse_stats_csv(stats_csv)
+                    if all_stats is None:
+                        all_stats = {}
+                    all_stats[symbol] = symbol_stats
 
             symbol_drawings = _build_drawings(
                 drawings_builder,
@@ -159,10 +164,12 @@ class PyneCoreAdapter(EngineAdapter):
             )
             all_drawings.extend(symbol_drawings)
 
+        _apply_risk_sizing(all_trades, config, asset_class)
+
         equity = config.initial_capital
-        for trade in sorted(all_trades, key=lambda item: item.entry_time):
+        for trade in sorted(all_trades, key=lambda item: item.last_exit_time):
             equity += trade.pnl
-            all_equity.append(EquityPoint(time=trade.entry_time, equity=round(equity, 2)))
+            all_equity.append(EquityPoint(time=trade.last_exit_time, equity=round(equity, 2)))
 
         duration_days = 0
         try:
@@ -196,7 +203,11 @@ class PyneCoreAdapter(EngineAdapter):
             meta=meta,
             trades=all_trades,
             equity_curve=all_equity,
-            stats=all_stats,
+            stats=(
+                next(iter(all_stats.values()))
+                if all_stats and len(all_stats) == 1
+                else all_stats
+            ),
             drawings=all_drawings,
         )
 
@@ -237,7 +248,7 @@ def _load_strategy_helper_namespace(strategy_path: Path, source: str) -> dict[st
 
     helper_path = strategy_path.with_name(f"{strategy_path.stem}_context.py")
     if helper_path.exists():
-        namespace.update(_compile_helper_namespace(helper_path, helper_path.read_text()))
+        namespace.update(_compile_helper_namespace(helper_path, helper_path.read_text(), include_sidecar_deps=True))
 
     source_namespace = _compile_helper_namespace(
         strategy_path,
@@ -253,6 +264,7 @@ def _compile_helper_namespace(
     source: str,
     *,
     function_names: set[str] | None = None,
+    include_sidecar_deps: bool = False,
 ) -> dict[str, Any]:
     tree = ast.parse(source, filename=str(source_path))
     helper_nodes: list[ast.stmt] = []
@@ -261,6 +273,12 @@ def _compile_helper_namespace(
         if isinstance(node, (ast.Import, ast.ImportFrom)):
             helper_nodes.append(node)
         elif isinstance(node, ast.FunctionDef) and node.name in allowed_names:
+            helper_nodes.append(node)
+        elif include_sidecar_deps and isinstance(node, ast.Assign):
+            # module-level constants referenced by the builder functions
+            helper_nodes.append(node)
+        elif include_sidecar_deps and isinstance(node, ast.FunctionDef):
+            # local helper functions referenced by the builder functions
             helper_nodes.append(node)
 
     if not helper_nodes:
@@ -532,6 +550,10 @@ def _load_ohlcv(
             df = df[df["timestamp"] >= start_ts]
         if end_date:
             end_ts = pd.to_datetime(end_date, utc=True)
+            # A date-only end bound parses as midnight, which would exclude all
+            # intraday records on the end date. Extend it to the end of that day.
+            if end_ts == end_ts.normalize():
+                end_ts = end_ts + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1)
             df = df[df["timestamp"] <= end_ts]
 
     return df.reset_index(drop=True)
@@ -609,7 +631,7 @@ def _apply_risk_sizing(trades: list[Trade], config: BacktestConfig, asset_class:
 
     equity = config.initial_capital
     max_position_pct = _resolve_max_position_pct(config.max_position_pct, asset_class)
-    max_leverage = max(_resolve_max_leverage(config.max_leverage), max_position_pct)
+    max_leverage = min(_resolve_max_leverage(config.max_leverage), max_position_pct)
 
     for trade in sorted(trades, key=lambda item: item.entry_time):
         meta = trade.meta or {}
