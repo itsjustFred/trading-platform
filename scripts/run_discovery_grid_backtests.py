@@ -16,6 +16,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import argparse
+
 import pandas as pd
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -96,6 +98,19 @@ def params_for(trial: dict[str, Any]) -> dict[str, Any]:
 
 
 def run_trial(trial: dict[str, Any]) -> dict[str, Any]:
+    required = ("id", "strategy", "symbol", "timeframe")
+    missing = [k for k in required if k not in trial]
+    if missing:
+        return {
+            "id": trial.get("id", "<unknown>"),
+            "strategy": trial.get("strategy", "<unknown>"),
+            "symbol": trial.get("symbol", "<unknown>"),
+            "timeframe": trial.get("timeframe", "<unknown>"),
+            "status": "failed",
+            "reason": f"missing required fields: {', '.join(missing)}",
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+        }
+
     trial_id = trial["id"]
     strategy = trial["strategy"]
     symbol = trial["symbol"]
@@ -120,7 +135,17 @@ def run_trial(trial: dict[str, Any]) -> dict[str, Any]:
         return result
 
     start, end = date_bounds(symbol, timeframe)
-    params = params_for(trial)
+    try:
+        params = params_for(trial)
+    except (ValueError, KeyError, TypeError) as exc:
+        result.update(
+            {
+                "status": "failed",
+                "reason": f"failed to build params: {exc}",
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        return result
     cmd = [
         sys.executable,
         "-m",
@@ -220,7 +245,18 @@ def main() -> None:
     summary_started = datetime.now(timezone.utc).isoformat()
     results: list[dict[str, Any]] = []
     for trial in trials:
-        result = run_trial(trial)
+        try:
+            result = run_trial(trial)
+        except Exception as exc:
+            result = {
+                "id": trial.get("id", "<unknown>"),
+                "strategy": trial.get("strategy", "<unknown>"),
+                "symbol": trial.get("symbol", "<unknown>"),
+                "timeframe": trial.get("timeframe", "<unknown>"),
+                "status": "failed",
+                "reason": f"unexpected error: {exc}",
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+            }
         results.append(result)
         print(json.dumps(result, ensure_ascii=False), flush=True)
     summary = {

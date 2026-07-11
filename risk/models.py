@@ -66,3 +66,5 @@ class SizedOrder:
             raise ValueError("risk_amount must be >= 0")
         if self.risk_percent < 0:
             raise ValueError("risk_percent must be >= 0")
+        if self.position_size < 0:
+            raise ValueError("position_size must be >= 0")

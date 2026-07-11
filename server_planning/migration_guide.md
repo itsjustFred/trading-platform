@@ -63,9 +63,18 @@ Alle bestehenden Pfade (Runner CLI, Viewer, catalog_builder, etc.) funktionieren
 
 ### 5. Verifizierung
 
+> **Wichtig:** Nach dem Setzen des Symlinks ist ein **System-Reboot erforderlich**, damit
+> Mount und Symlink (`~/data/` → `/mnt/block-volume-data/`) nach dem Neustart korrekt
+> wiederhergestellt und lesbar sind (gemäß der dokumentierten `/etc/fstab`-Persistenz-Vorgabe).
+
+- ✅ System-Reboot durchgeführt
+- ✅ Nach Reboot: `~/data/` zeigt auf `/mnt/block-volume-data/` und ist lesbar
 - ✅ `catalog.json` lesbar via Symlink (97 OHLCV-Dateien)
 - ✅ Backtest-Ergebnisse in `~/data/backtests/` erreichbar
 - ✅ Validierungs-Report lesbar
+
+> Erst nach Bestehen aller Post-Reboot-Checks darf `~/data.rollback` gelöscht werden
+> (siehe Rollback-Hinweis oben).
 
 ---
 

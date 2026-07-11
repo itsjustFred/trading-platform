@@ -388,24 +388,23 @@ class SignalReplayAdapter:
         }
         try:
             processed = self.signal_processor.process_signal(raw_signal, context)
+            processed_metadata = dict(signal.metadata)
+            processed_metadata.update(dict(processed.metadata or {}))
+            if self.signal_processor_name:
+                processed_metadata["signal_processor"] = self.signal_processor_name
+            return ReplaySignal(
+                timestamp=signal.timestamp,
+                symbol=signal.symbol,
+                action=_coerce_action(processed.action),
+                entry_price=float(processed.entry_price),
+                stop_loss=processed.stop_loss,
+                take_profit=processed.take_profit,
+                timeframe=processed.timeframe or signal.timeframe,
+                source=signal.source,
+                metadata=processed_metadata,
+            )
         except ValueError:
             return None
-
-        processed_metadata = dict(signal.metadata)
-        processed_metadata.update(dict(processed.metadata or {}))
-        if self.signal_processor_name:
-            processed_metadata["signal_processor"] = self.signal_processor_name
-        return ReplaySignal(
-            timestamp=signal.timestamp,
-            symbol=signal.symbol,
-            action=_coerce_action(processed.action),
-            entry_price=float(processed.entry_price),
-            stop_loss=processed.stop_loss,
-            take_profit=processed.take_profit,
-            timeframe=processed.timeframe or signal.timeframe,
-            source=signal.source,
-            metadata=processed_metadata,
-        )
 
     def run(
         self,
@@ -472,6 +471,7 @@ class SignalReplayAdapter:
 
             filled = self._find_fill_bar(frame, effective_signal.timestamp)
             if filled is None:
+                emit(10.0 + ((index / total_signals) * 80.0), "Replaying signals...")
                 continue
             fill_index, fill_bar = filled
             fill_price = float(fill_bar["close"])
