@@ -24,7 +24,8 @@
 | Initial-Review | 50 (3 critical, 26 major, 21 minor) | — | |
 | Fix-Runde 1 | — | `4be53d3` | alle 50 gefixt (scripts/runner/risk/shared/scheduler/server_planning/reports) |
 | Test-Align | — | `2d4fe89`, `cbebf74` | Tests an CR-verändertes Verhalten angepasst (walkforward + ctrader) — keine Code-Regressionen |
-| Re-Run | pending | — | wartet auf CR-Rate-Limit-Reset |
+| Re-Run 1 | 6 | `bdd53f5` | 1 critical + 3 major + 2 minor gefixt (argparse, run_trial resilience, signal_replay ValueError/progress, position_size, migration doc) |
+| Re-Run 2 | pending | — | CR-Review läuft (Rate-Limit-Retry) |
 
 Critical Findings behandelt:
 - `runner/engines/lean_adapter.py` — fehlendes `import os` (CRITICAL)
