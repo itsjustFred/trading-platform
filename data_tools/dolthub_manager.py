@@ -14,7 +14,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("dolthub_manager")
 
-from shared.constants import DATA_DIR, resolve_executable
+from shared.constants import DATA_DIR, normalize_timeframe, resolve_executable
 
 DOLT_BIN = resolve_executable("dolt")
 
@@ -94,7 +94,7 @@ def _quote_sql_literal(value: str) -> str:
 def _stock_export_path(target_dir: Path, symbol: str) -> Path:
     """Return the canonical OHLCV output path and migrate legacy flat exports."""
     legacy_path = target_dir / f"{symbol}.parquet"
-    canonical_path = target_dir / symbol / "1d.parquet"
+    canonical_path = target_dir / symbol / f"{normalize_timeframe('1d')}.parquet"
 
     if legacy_path.exists() and not canonical_path.exists():
         canonical_path.parent.mkdir(parents=True, exist_ok=True)
@@ -124,7 +124,7 @@ def export_data():
             # Get symbols
             result = subprocess.run(
                 [
-                    "dolt",
+                    DOLT_BIN,
                     "sql",
                     "-q",
                     f"SELECT DISTINCT act_symbol FROM {_quote_sql_identifier(table_name)}",
@@ -135,8 +135,12 @@ def export_data():
                 capture_output=True,
                 text=True,
             )
-            lines = result.stdout.strip().split("\n")[1:]  # skip header
-            symbols = [l.strip() for l in lines if l.strip()]
+            if result.returncode != 0:
+                logger.error(f"Failed to list symbols in {stocks_repo}: {result.stderr}")
+                symbols = []
+            else:
+                lines = result.stdout.strip().split("\n")[1:]  # skip header
+                symbols = [l.strip() for l in lines if l.strip()]
             logger.info(f"Found {len(symbols)} symbols to export.")
 
             for i, symbol in enumerate(symbols):
@@ -153,7 +157,7 @@ def export_data():
                     with open(sym_csv, "w") as f:
                         subprocess.check_call(
                             [
-                                "dolt",
+                                DOLT_BIN,
                                 "sql",
                                 "-q",
                                 (
