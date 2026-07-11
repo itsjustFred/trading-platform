@@ -17,8 +17,14 @@ class ValidationResult:
 
 
 class AICodeValidator:
-    _FORBIDDEN_CALLS = {"eval", "exec"}
-    _FORBIDDEN_ATTR_CALLS = {("os", "system")}
+    _FORBIDDEN_CALLS = {"eval", "exec", "compile"}
+    _FORBIDDEN_ATTR_CALLS = {
+        ("os", "system"),
+        ("os", "popen"),
+        ("subprocess", "Popen"),
+        ("subprocess", "run"),
+        ("subprocess", "call"),
+    }
     _REQUIRED_METHODS = {"generate_signals", "get_name", "get_parameters"}
 
     def validate(self, code: str, strategy_name: str) -> ValidationResult:
@@ -35,7 +41,11 @@ class AICodeValidator:
             self._validate_security(tree, errors)
             self._validate_interface(tree, errors, warnings)
 
-        self._validate_subprocess_import(code, strategy_name, errors, warnings)
+        # Only run the subprocess import check on code that already passed
+        # security validation. Executing untrusted code that tripped a
+        # forbidden-API rule risks running the very call we just flagged.
+        if not errors:
+            self._validate_subprocess_import(code, strategy_name, errors, warnings)
 
         score = self._score(errors, warnings)
         return ValidationResult(
@@ -45,19 +55,49 @@ class AICodeValidator:
             score=score,
         )
 
-    def _validate_security(self, tree: ast.AST, errors: list[str]) -> None:
+    @staticmethod
+    def _alias_map(tree: ast.AST) -> dict[str, str]:
+        """Map local import names to their real module (handles `import os as o`)."""
+        aliases: dict[str, str] = {}
         for node in ast.walk(tree):
-            if isinstance(node, ast.Call):
-                if isinstance(node.func, ast.Name) and node.func.id in self._FORBIDDEN_CALLS:
-                    errors.append(f"Forbidden call detected: {node.func.id}()")
-                if (
-                    isinstance(node.func, ast.Attribute)
-                    and isinstance(node.func.value, ast.Name)
-                    and (node.func.value.id, node.func.attr) in self._FORBIDDEN_ATTR_CALLS
-                ):
-                    errors.append(
-                        f"Forbidden call detected: {node.func.value.id}.{node.func.attr}()"
-                    )
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    aliases[alias.asname or alias.name] = alias.name
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    aliases[alias.asname or alias.name] = node.module or alias.name
+        return aliases
+
+    def _validate_security(self, tree: ast.AST, errors: list[str]) -> None:
+        aliases = self._alias_map(tree)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            # Direct calls: eval(), exec(), compile()
+            if isinstance(func, ast.Name) and func.id in self._FORBIDDEN_CALLS:
+                errors.append(f"Forbidden call detected: {func.id}()")
+                continue
+            # Attribute calls resolved through import aliases:
+            #   import os as o; o.system(...)
+            if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+                mod = aliases.get(func.value.id, func.value.id)
+                if (mod, func.attr) in self._FORBIDDEN_ATTR_CALLS:
+                    errors.append(f"Forbidden call detected: {mod}.{func.attr}()")
+            # Indirect access on a dangerous module: getattr(os, 'system')
+            if isinstance(func, ast.Name) and func.id in {"getattr", "__getattribute__"}:
+                if node.args:
+                    subj = node.args[0]
+                    if isinstance(subj, ast.Name):
+                        subj_name = aliases.get(subj.id, subj.id)
+                    elif isinstance(subj, ast.Constant) and isinstance(subj.value, str):
+                        subj_name = subj.value
+                    else:
+                        subj_name = None
+                    if subj_name in {"os", "subprocess"}:
+                        errors.append(
+                            f"Forbidden indirect access detected: {subj_name}.<attr>()"
+                        )
 
     def _validate_interface(self, tree: ast.AST, errors: list[str], warnings: list[str]) -> None:
         module_functions = {

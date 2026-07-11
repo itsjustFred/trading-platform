@@ -4732,12 +4732,12 @@ def delete_symbol_data():
         return jsonify({"error": "Path required"}), 400
 
     p = Path(path_str)
-    # Security check: must be inside DATA_DIR
+    # Security check: must be inside DATA_DIR (path-aware, not string prefix)
     try:
         p = p.resolve()
         # resolve DATA_DIR too
         dd = DATA_DIR.resolve()
-        if not str(p).startswith(str(dd)):
+        if p != dd and dd not in p.parents:
             return jsonify({"error": "Access denied"}), 403
     except (OSError, ValueError):
         return jsonify({"error": "Invalid path"}), 400

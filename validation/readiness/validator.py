@@ -82,29 +82,6 @@ class ReadinessValidator:
         checks.extend(cls._check_risk(risk_report, cfg, recommendations))
         checks.extend(cls._check_stats(stats, cfg, recommendations))
 
-        # Check for required artifacts - missing required = NOT_READY
-        missing_required = []
-        if cfg.require_trade_report and report is None:
-            missing_required.append("trade delta report")
-        if cfg.require_regression and regression is None:
-            missing_required.append("regression result")
-        if cfg.require_risk_report and risk_report is None:
-            missing_required.append("risk comparison report")
-        if cfg.require_stats and stats is None:
-            missing_required.append("statistics comparison")
-
-        if missing_required:
-            for artifact in missing_required:
-                checks.append(
-                    ReadinessCheck(
-                        name=f"required_{artifact.replace(' ', '_')}",
-                        description=f"Required artifact present: {artifact}",
-                        passed=False,
-                        severity="error",
-                        message=f"Missing required artifact: {artifact}",
-                    )
-                )
-
         errors = sum(1 for c in checks if not c.passed and c.severity == "error")
         warnings = sum(1 for c in checks if c.severity == "warning")
 

@@ -93,7 +93,7 @@
 
 - [x] `pytest tests/validation/` bleuft grün (443 passed)
   - Hinweis: `pytest tests/` enthält 13 vorbestehende, nicht-Validation-bezogene Fehler (Strategie-Regressionen, fehlende Alpaca-Module, Walkforward), die außerhalb dieses Ferment liegen.
-  - Verifikation: `pytest tests/ -q` exit code 0
+  - Hinweis: `pytest tests/ -q` exitet NICHT mit 0 (13 vorbestehende, nicht-Validation-bezogene Fehler); nur `pytest tests/validation/` ist grün.
 
 ---
 

@@ -770,7 +770,7 @@ function addTradeMarkers(trade) {
     // Exit markers (partial exits)
     if (trade.exits && trade.exits.length > 0) {
         trade.exits.forEach((ex, i) => {
-            if (!ex.time) return;
+            if (!ex.time || ex.price == null) return;
             const exitColor = (ex.pnl != null && ex.pnl >= 0) ? '#00ff88' : '#ff4466';
             const label = trade.exits.length > 1
                 ? `Exit ${i+1}/${trade.exits.length} @ ${ex.price.toFixed(2)}${ex.reason ? ' ('+ex.reason+')' : ''}`

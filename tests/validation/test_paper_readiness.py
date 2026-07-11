@@ -508,8 +508,8 @@ class TestReportMeta:
         assert ready_result.level == PaperReadinessLevel.READY
 
     def test_empty_inputs(self) -> None:
-        """All optional inputs omitted → NOT_READY because required artifacts missing."""
-        # Empty inputs with default config (require all artifacts) should be NOT_READY
+        """All optional inputs omitted with all require_* flags disabled → READY."""
+        # Empty inputs with requirements disabled should be READY (no artifacts to fail on)
         config = ReadinessConfig(
             require_trade_report=False,
             require_regression=False,

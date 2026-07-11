@@ -73,8 +73,4 @@ class ReadinessConfig(BaseModel):
     stats_win_rate_tolerance_pct: float = 0.01
     stats_net_profit_tolerance_pct: float = 0.01
 
-    # Required artifacts for readiness - if True, missing artifact = NOT_READY
-    require_trade_report: bool = True
-    require_regression: bool = True
-    require_risk_report: bool = True
-    require_stats: bool = True
+

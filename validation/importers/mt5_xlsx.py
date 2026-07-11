@@ -211,7 +211,9 @@ class MT5XLSXImporter(BaseImporter):
                 continue
             if label_str == "Ersteinlage:":
                 val = row[3] if len(row) > 3 and pd.notna(row[3]) else None
-                meta["initial_capital"] = float(val) if val is not None else None
+                meta["initial_capital"] = (
+                    MT5XLSXImporter._coerce_stat(val) if val is not None else None
+                )
                 continue
             if label_str == "Hebel:":
                 val = row[3] if len(row) > 3 and pd.notna(row[3]) else None
@@ -308,7 +310,7 @@ class MT5XLSXImporter(BaseImporter):
                         stats["max_drawdown_max_pct"] = pct
                     abs_val = MT5XLSXImporter._extract_parenthesized_number(val)
                     if abs_val is not None:
-                        stats["max_drawdown_abs"] = abs_val
+                        stats["max_drawdown_max_abs"] = abs_val
                     continue
 
                 parsed = MT5XLSXImporter._coerce_stat(val)

@@ -99,6 +99,22 @@ def build_comparison_matrix(
 
 
 def _build_mt5_row(case_id: str, reference_path: Path, platform_path: Path) -> dict[str, Any]:
+    if not reference_path.exists():
+        reference_stats: dict[str, float | None] = {metric: None for metric in AUDIT_METRICS}
+        platform_stats = _load_platform_stats(platform_path, risk_free_rate=REFERENCE_RISK_FREE_RATE)
+        return _row_payload(
+            case_id=case_id,
+            reference_framework="mt5_xlsx",
+            reference_path=reference_path,
+            platform_path=platform_path,
+            reference_stats=reference_stats,
+            platform_stats=platform_stats,
+            notes=[
+                "MT5 fills, spread/commission, contract sizing and fixed-risk execution differ from platform fills.",
+                "MT5 CAGR is derived from report period, initial deposit and net profit because the XLSX summary omits CAGR.",
+                "Reference artifact was missing; comparison could not be performed.",
+            ],
+        )
     reference = MT5XLSXImporter().load(reference_path)
     reference_stats = _normalize_mt5_stats(reference.stats, reference_path, reference.raw_metadata)
     platform_stats = _load_platform_stats(platform_path, risk_free_rate=REFERENCE_RISK_FREE_RATE)
@@ -117,6 +133,22 @@ def _build_mt5_row(case_id: str, reference_path: Path, platform_path: Path) -> d
 
 
 def _build_json_reference_row(case_id: str, reference_path: Path, platform_path: Path) -> dict[str, Any]:
+    if not reference_path.exists():
+        reference_stats: dict[str, float | None] = {metric: None for metric in AUDIT_METRICS}
+        platform_stats = _load_platform_stats(platform_path, risk_free_rate=REFERENCE_RISK_FREE_RATE)
+        return _row_payload(
+            case_id=case_id,
+            reference_framework="reference_json",
+            reference_path=reference_path,
+            platform_path=platform_path,
+            reference_stats=reference_stats,
+            platform_stats=platform_stats,
+            notes=[
+                "QuantConnect PDF summary has limited extractable trade detail; JSON reference carries the auditable fields.",
+                "Risk Parity implementations may differ in universe, rebalance timing, covariance estimator and R_f convention.",
+                "Reference artifact was missing; comparison could not be performed.",
+            ],
+        )
     reference_payload = json.loads(reference_path.read_text(encoding="utf-8"))
     reference_stats = _normalize_reference_stats(reference_payload.get("stats", {}))
     platform_stats = _load_platform_stats(platform_path, risk_free_rate=REFERENCE_RISK_FREE_RATE)

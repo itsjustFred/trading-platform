@@ -392,11 +392,11 @@ class MT5HTMLImporter(BaseImporter):
             oid = row[col_order_id]
             if not oid:
                 continue
-            sl = row[col_sl] if (col_sl is not None and col_sl < len(row)) else ""
-            tp = row[col_tp] if (col_tp is not None and col_tp < len(row)) else ""
+            sl = MT5HTMLImporter._to_float(row, col_sl, default=None)
+            tp = MT5HTMLImporter._to_float(row, col_tp, default=None)
             mapping[oid] = {
-                "sl": float(sl.replace(",", ".")) if sl else None,
-                "tp": float(tp.replace(",", ".")) if tp else None,
+                "sl": sl,
+                "tp": tp,
             }
         return mapping
 
@@ -428,8 +428,10 @@ class MT5HTMLImporter(BaseImporter):
         col_profit = MT5HTMLImporter._find_col_index(header, ["Gewinn"])
         col_comment = MT5HTMLImporter._find_col_index(header, ["Kommentar"])
 
-        if col_time is None or col_direction is None:
-            raise ValueError("Trades table is missing required columns (Zeit / Richtung).")
+        if col_time is None or col_direction is None or col_trade_id is None:
+            raise ValueError(
+                "Trades table is missing required columns (Zeit / Richtung / Auftrag)."
+            )
 
         # Build mapping: trade_id -> {entry_row, exit_row}
         # MT5 exports each trade as two rows: entry (in) and exit (out) with same Trade/Order ID

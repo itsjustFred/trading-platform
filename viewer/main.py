@@ -632,7 +632,7 @@ app = FastAPI(title="trading-platform viewer", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -10359,7 +10359,7 @@ async def delete_symbol_data(path: str = Query(default="")) -> dict[str, Any]:
     try:
         file_path = file_path.resolve()
         data_root = DATA_DIR.resolve()
-        if not str(file_path).startswith(str(data_root)):
+        if not file_path.is_relative_to(data_root):
             raise HTTPException(status_code=403, detail="Access denied")
     except HTTPException:
         raise

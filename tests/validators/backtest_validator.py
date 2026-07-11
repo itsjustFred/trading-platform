@@ -34,7 +34,7 @@ class BacktestResultValidator:
             stats = {}
 
         for key in expectation.required_stats_keys:
-            if key not in stats:
+            if key not in stats or stats.get(key) is None:
                 errors.append(f"Missing required stats key: {key}")
 
         for key, value in stats.items():
