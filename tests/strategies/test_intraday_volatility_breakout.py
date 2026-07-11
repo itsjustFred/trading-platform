@@ -218,6 +218,46 @@ def test_reverse_mode_flips_signals():
     assert (dirs_reverse == "LONG").any(), "Expected a LONG entry in reverse mode"
 
 
+def test_reverse_mode_applied_before_direction_filter():
+    """reverse_mode must be applied BEFORE the trade_direction filter so the
+    directional restriction acts on the flipped candidates (mirrors the MQL5
+    EA's EvaluateReverseSignals behaviour)."""
+    mod = _load_module()
+    base_params = mod.STRATEGY_META["parameters"].copy()
+    base_params.update(
+        {
+            "use_candle_close": False,
+            "entry_time": "16:30",
+            "max_entry_time": "18:00",
+            "exit_time": "20:00",
+            "atr_regime_factor": 2.0,
+            "reverse_mode": True,
+        }
+    )
+
+    # Down-data -> normal SHORT breakouts. After reverse_mode they become LONG.
+    # long_only must keep only those flipped LONG entries.
+    df_down = _two_day_breakout_df(direction="down")
+    params_long = {**base_params, "trade_direction": "long_only"}
+    entries_long, _, ind_long, _ = mod.generate_signals(df_down, params_long)
+    dirs_long = ind_long["direction"].dropna()
+    assert entries_long.any()
+    assert (dirs_long == "LONG").all(), (
+        f"reverse+long_only expected only LONG entries, got {set(dirs_long)}"
+    )
+
+    # Up-data -> normal LONG breakouts. After reverse_mode they become SHORT.
+    # short_only must keep only those flipped SHORT entries.
+    df_up = _two_day_breakout_df(direction="up")
+    params_short = {**base_params, "trade_direction": "short_only"}
+    entries_short, _, ind_short, _ = mod.generate_signals(df_up, params_short)
+    dirs_short = ind_short["direction"].dropna()
+    assert entries_short.any()
+    assert (dirs_short == "SHORT").all(), (
+        f"reverse+short_only expected only SHORT entries, got {set(dirs_short)}"
+    )
+
+
 def test_mt5_numeric_direction_and_regime_settings_are_normalized():
     mod = _load_module()
     df = _two_day_breakout_df(direction="down")

@@ -137,52 +137,58 @@ def test_download_symbol_skip_balance_rows():
         assert "timestamp" in df_result.columns
 
 
-def test_main_dry_run():
-    """Test dry-run mode outputs planned downloads."""
+def test_main_dry_run(capsys):
+    """Dry-run prints the planned downloads and returns without fetching.
+
+    main() returns (it does not call sys.exit), so we invoke it directly and
+    assert the plan is emitted rather than expecting a SystemExit.
+    """
     from data_tools.download_grid_market_data import main
 
     with tempfile.TemporaryDirectory() as tmpdir:
         output_dir = Path(tmpdir)
         import sys
         old_argv = sys.argv
+        sys.argv = [
+            "download_grid_market_data.py",
+            "--symbols", "EURUSD,GBPUSD",
+            "--timeframes", "1h,4h",
+            "--start", "2024-01-01",
+            "--end", "2024-01-02",
+            "--output", str(output_dir),
+            "--dry-run",
+        ]
         try:
-            sys.argv = [
-                "download_grid_market_data.py",
-                "--symbols", "EURUSD,GBPUSD",
-                "--timeframes", "1h,4h",
-                "--start", "2024-01-01",
-                "--end", "2024-01-02",
-                "--output", str(output_dir),
-                "--dry-run",
-            ]
             main()
-        except SystemExit as e:
-            assert e.code == 0
         finally:
             sys.argv = old_argv
+    assert "planned" in capsys.readouterr().out
 
 
 def test_main_validates_workers():
-    """Test that workers argument is validated."""
+    """--workers -1 must be clamped to 1 (max(1, workers)) and not crash.
+
+    main() returns rather than calling sys.exit, so we invoke it directly and
+    assert it completes; the clamp is applied internally at
+    `workers = max(1, args.workers)` before the executor is created.
+    """
     from data_tools.download_grid_market_data import main
 
     with tempfile.TemporaryDirectory() as tmpdir:
         output_dir = Path(tmpdir)
         import sys
         old_argv = sys.argv
+        sys.argv = [
+            "download_grid_market_data.py",
+            "--symbols", "EURUSD",
+            "--timeframes", "1h",
+            "--start", "2024-01-01",
+            "--output", str(output_dir),
+            "--workers", "-1",  # Invalid, must be clamped to 1 internally
+            "--dry-run",
+        ]
         try:
-            sys.argv = [
-                "download_grid_market_data.py",
-                "--symbols", "EURUSD",
-                "--timeframes", "1h",
-                "--start", "2024-01-01",
-                "--output", str(output_dir),
-                "--workers", "-1",  # Invalid, should be clamped to 1
-                "--dry-run",
-            ]
             main()
-        except SystemExit as e:
-            assert e.code == 0
         finally:
             sys.argv = old_argv
 

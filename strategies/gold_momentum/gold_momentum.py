@@ -75,7 +75,11 @@ def generate_signals(df: pd.DataFrame, params: dict):
     active_stop = np.nan
 
     for i in range(len(df)):
-        if not in_trade and bool(raw_entries.iloc[i]):
+        if (
+            not in_trade
+            and bool(raw_entries.iloc[i])
+            and pd.notna(atr.iloc[i])
+        ):
             in_trade = True
             entries.iloc[i] = True
             atr_value = atr.iloc[i]

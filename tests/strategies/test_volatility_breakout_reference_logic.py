@@ -27,4 +27,4 @@ def test_reference_defaults_enter_only_during_window_and_emit_direction_and_stop
     assert indicators["direction"].iloc[8] == "SHORT"
     assert pd.notna(indicators["sl_price"].iloc[5])
     assert pd.notna(indicators["stop_loss"].iloc[8])
-    assert exits.any()
+    assert exits[exits].index.tolist() == [6, 11]

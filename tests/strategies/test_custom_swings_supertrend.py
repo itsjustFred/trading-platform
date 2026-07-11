@@ -129,18 +129,20 @@ class TestStrategyRegression:
 
     def test_no_trade_exceeds_risk_limit(self, backtest_result):
         """Kein Trade darf mehr als 1.5% des Eigenkapitals riskieren."""
+        import math
+
         equity = 100_000.0
         for trade in backtest_result.trades:
             sl = trade.meta.get("sl_price")
-            if sl is not None:
-                import math as _math
-                if not _math.isnan(float(sl)):
-                    stop_dist = abs(trade.entry_price - float(sl))
-                    risk_usd = stop_dist * trade.quantity
-                    risk_pct = risk_usd / equity
-                    assert risk_pct <= 0.015, (
-                        f"Trade {trade.id}: Risk {risk_pct * 100:.2f}% überschreitet Limit von 1.5%"
-                    )
+            assert sl is not None, f"Trade {trade.id}: 'sl_price' fehlt in trade.meta"
+            sl_val = float(sl)
+            assert not math.isnan(sl_val), f"Trade {trade.id}: 'sl_price' ist NaN"
+            stop_dist = abs(trade.entry_price - sl_val)
+            risk_usd = stop_dist * trade.quantity
+            risk_pct = risk_usd / equity
+            assert risk_pct <= 0.015, (
+                f"Trade {trade.id}: Risk {risk_pct * 100:.2f}% überschreitet Limit von 1.5%"
+            )
             equity += trade.pnl
 
     def test_indicators_dict_has_required_keys(self):

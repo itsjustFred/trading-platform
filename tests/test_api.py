@@ -36,15 +36,13 @@ class TestStrategiesAPI:
             assert "file" in s
 
     def test_get_strategy_detail(self, client):
-        # First get list of strategies
-        resp = client.get("/api/strategies")
-        strategies = resp.json()
-        if strategies:
-            name = strategies[0]["name"]
-            resp2 = client.get(f"/api/strategies/{name}")
-            assert resp2.status_code == 200
-            detail = resp2.json()
-            assert "name" in detail
+        # Use a known seeded strategy instead of conditionally relying on the
+        # list endpoint, so the detail assertion always runs.
+        resp2 = client.get("/api/strategies/example_sma")
+        assert resp2.status_code == 200
+        detail = resp2.json()
+        assert "name" in detail
+        assert detail.get("name") == "example_sma"
 
     def test_get_strategy_detail_includes_parameters(self, client):
         resp = client.get("/api/strategies")

@@ -351,15 +351,18 @@ def generate_signals(df: pd.DataFrame, params: dict):
     long_candidates = in_entry_window & confirmation_eval_mask & regime_ok & (signal_price_long >= upper_level)
     short_candidates = in_entry_window & confirmation_eval_mask & regime_ok & (signal_price_short <= lower_level)
 
+    # Reverse mode (flip long / short) must happen BEFORE the directional
+    # filter so that trade_direction is applied to the resulting action,
+    # matching the MQL5 EA (EvaluateReverseSignals checks Trade_Direction
+    # against the actual OpenLong/OpenShort call, not the raw breakout type).
+    if reverse_mode:
+        long_candidates, short_candidates = short_candidates.copy(), long_candidates.copy()
+
     # Trade direction
     if trade_direction == "long_only":
         short_candidates = pd.Series(False, index=idx)
     elif trade_direction == "short_only":
         long_candidates = pd.Series(False, index=idx)
-
-    # Reverse mode (flip long / short)
-    if reverse_mode:
-        long_candidates, short_candidates = short_candidates.copy(), long_candidates.copy()
 
     # --- One trade per day ---------------------------------------------------
     any_candidate = long_candidates | short_candidates

@@ -62,17 +62,7 @@ def generate_signals(df: pd.DataFrame, params: dict):
     for i in range(warmup, len(df)):
         should_rebalance = i % rebalance == 0
         rebalance_eligible.iloc[i] = should_rebalance
-        if not should_rebalance and not (in_trade and not calm_regime.iloc[i]):
-            continue
-        if not in_trade:
-            if bool(calm_regime.iloc[i]) and bool(uptrend.iloc[i]):
-                entries.iloc[i] = True
-                in_trade = True
-                atr_value = atr.iloc[i]
-                if pd.notna(atr_value):
-                    active_stop = float(close.iloc[i]) - float(atr_value) * atr_stop_mult
-                    sl_price.iloc[i] = active_stop
-        elif in_trade:
+        if in_trade:
             stop_hit = pd.notna(active_stop) and float(low.iloc[i]) <= float(active_stop)
             regime_break = not bool(calm_regime.iloc[i])
             trend_break = not bool(uptrend.iloc[i])
@@ -89,6 +79,14 @@ def generate_signals(df: pd.DataFrame, params: dict):
                     exit_reason.iloc[i] = "trend_break"
                 in_trade = False
                 active_stop = np.nan
+        elif should_rebalance:
+            if bool(calm_regime.iloc[i]) and bool(uptrend.iloc[i]):
+                entries.iloc[i] = True
+                in_trade = True
+                atr_value = atr.iloc[i]
+                if pd.notna(atr_value):
+                    active_stop = float(close.iloc[i]) - float(atr_value) * atr_stop_mult
+                    sl_price.iloc[i] = active_stop
 
     indicators_dict = {
         "Rolling_Vol": vol,

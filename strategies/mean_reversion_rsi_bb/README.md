@@ -11,7 +11,7 @@ Long-Entry, wenn der Schlusskurs unter das untere Bollinger Band faellt und RSI 
 Signal: `close < BB_Lower(20, 2.0)` und `RSI(14) < 30`.
 
 ### Exit
-Vollausstieg bei einem von drei Events:
+Vollausstieg bei einem von vier Events:
 1. Stop-Loss-Hit auf dem ATR-Stop.
 2. RSI-Recovery: `RSI(14) > 70`.
 3. Mean-Reversion zur Mitte: `close > BB_Mid(20)`.

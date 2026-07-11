@@ -64,7 +64,7 @@ def generate_signals(df: pd.DataFrame, params: dict):
     warmup = max(lookbacks) + vol_window
 
     for i in range(warmup, len(df)):
-        if not in_trade and bool(entry_cond.iloc[i]):
+        if not in_trade and bool(entry_cond.iloc[i]) and pd.notna(atr.iloc[i]):
             entries.iloc[i] = True
             in_trade = True
             atr_value = atr.iloc[i]

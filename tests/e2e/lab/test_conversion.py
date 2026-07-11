@@ -73,9 +73,6 @@ def test_lab_conversion_generates_valid_python(page: Page) -> None:
 
     output_text = output_area.inner_text().strip()
     generated_code = _extract_generated_code(output_text)
-    if not generated_code:
-        if VALID_FALLBACK_PATH.exists():
-            generated_code = VALID_FALLBACK_PATH.read_text(encoding="utf-8")
 
     assert generated_code.strip(), (
         f"No generated code could be extracted from output:\n{output_text}"

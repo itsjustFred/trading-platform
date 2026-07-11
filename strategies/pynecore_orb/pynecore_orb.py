@@ -1,7 +1,9 @@
 """
 @pyne
-Opening Range Breakout Strategy (PyneCore).
-Converted from NinjaTrader 8 (C#).
+SMA Crossover Strategy (PyneCore).
+Fast/Slow SMA crossover with ATR-based take-profit / stop-loss.
+NOTE: despite the original 'ORB' naming, this implements an SMA crossover
+(fast = or_length, slow = or_length * 4), not an Opening Range Breakout.
 """
 
 from pynecore import Series
@@ -9,10 +11,10 @@ from pynecore.lib import script, input, strategy, ta, plot, color
 
 
 STRATEGY_META = {
-    "name": "Opening Range Breakout",
+    "name": "SMA Crossover (PyneCore)",
     "version": "1.0.0",
     "tags": {
-        "type": ["breakout"],
+        "type": ["trend-following"],
         "source": "zenomtrader-discord",
         "link": "",
         "asset_class": ["equities"],
@@ -22,8 +24,8 @@ STRATEGY_META = {
 
 
 @script.strategy(
-    title="Opening Range Breakout",
-    shorttitle="ORB",
+    title="SMA Crossover (PyneCore)",
+    shorttitle="SMA-ORB",
     overlay=True,
     default_qty_type=strategy.percent_of_equity,
     default_qty_value=100,

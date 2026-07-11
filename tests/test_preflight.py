@@ -111,7 +111,7 @@ accounts:
     broker: "alpaca"
 deployments: []
 """)
-        result = run_live_preflight(config, check_connectivity=False)
+        result = run_live_preflight(config, check_connectivity=False, env={})
         assert result.ok is False
         assert len(result.accounts) == 1
         assert result.accounts[0].ok is False

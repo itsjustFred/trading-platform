@@ -40,14 +40,13 @@ def main(
     slow_sma = ta.sma(src, slow_len)
     atr_val = ta.atr(atr_period)
 
-    if ta.crossover(fast_sma, slow_sma):
+    if ta.crossover(fast_sma, slow_sma) and strategy.position_size <= 0:
         strategy.entry("Long", strategy.long)
+        if atr_val:
+            sl_price = src - atr_val * sl_mult
+            strategy.exit("Long SL", "Long", stop=sl_price)
 
-    if strategy.position_size > 0 and atr_val:
-        sl_price = strategy.position_avg_price - atr_val * sl_mult
-        strategy.exit("Long SL", "Long", stop=sl_price)
-
-    if ta.crossunder(fast_sma, slow_sma):
+    if ta.crossunder(fast_sma, slow_sma) and strategy.position_size > 0:
         strategy.close("Long")
 
     plot(fast_sma, title="Fast SMA", color=color.blue)

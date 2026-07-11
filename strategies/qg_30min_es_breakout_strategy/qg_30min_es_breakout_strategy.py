@@ -83,6 +83,14 @@ def _calc_adx(
     dx = 100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0.0, np.nan)
     adx = _wilder_rma(dx.fillna(0.0), smooth)
 
+    # Keep ADX/DI undefined through the warmup period so entry checks never
+    # act on premature (near-zero) values. The first `length` bars seed the
+    # Wilder RMA and the next `smooth` bars let it converge.
+    warmup = length + smooth
+    if len(adx) > warmup:
+        adx.iloc[:warmup] = np.nan
+        plus_di.iloc[:warmup] = np.nan
+        minus_di.iloc[:warmup] = np.nan
     return adx, plus_di, minus_di
 
 
@@ -119,7 +127,7 @@ def generate_signals(df: pd.DataFrame, params: dict):
     close_minutes = market_close_hour * 60 + market_close_minute
     forced_exit_minutes = forced_exit_hour * 60 + forced_exit_minute
 
-    in_time = (ny_minutes >= open_minutes) & (ny_minutes < close_minutes)
+    in_time = (ny_minutes >= open_minutes) & (ny_minutes < forced_exit_minutes)
     exit_now = ny_minutes >= forced_exit_minutes
 
     entries = pd.Series(False, index=df.index)
@@ -157,7 +165,7 @@ def generate_signals(df: pd.DataFrame, params: dict):
                 exits.iloc[i] = True
                 exit_price.iloc[i] = float(close.iloc[i])
                 sl_price_at_exit.iloc[i] = float(active_sl)
-                exit_reason.iloc[i] = "time_exit_1455_ny"
+                exit_reason.iloc[i] = "time_exit"
                 in_trade = False
                 active_direction = None
                 active_sl = np.nan

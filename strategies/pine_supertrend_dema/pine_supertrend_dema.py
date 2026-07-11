@@ -83,6 +83,7 @@ def generate_signals(df: pd.DataFrame, params: dict):
     exits = pd.Series(False, index=df.index)
     sl_price = pd.Series(np.nan, index=df.index)
     trailing_stop_at_exit = pd.Series(np.nan, index=df.index)
+    supertrend_trend_at_exit = pd.Series(index=df.index, dtype="object")
     exit_price = pd.Series(np.nan, index=df.index)
     exit_reason = pd.Series(index=df.index, dtype="object")
     in_trade = False
@@ -96,11 +97,11 @@ def generate_signals(df: pd.DataFrame, params: dict):
             sl_price.iloc[i] = active_stop
         elif in_trade:
             active_stop = max(float(active_stop), float(lower_band.iloc[i]))
-            trailing_stop_at_exit.iloc[i] = active_stop
             stop_hit = float(df["low"].iloc[i]) <= active_stop
             if stop_hit or bool(exit_cond.iloc[i]):
                 exits.iloc[i] = True
                 trailing_stop_at_exit.iloc[i] = active_stop
+                supertrend_trend_at_exit.iloc[i] = trend.iloc[i]
                 if stop_hit:
                     exit_price.iloc[i] = active_stop
                     exit_reason.iloc[i] = "trailing_stop"
@@ -113,7 +114,7 @@ def generate_signals(df: pd.DataFrame, params: dict):
     indicators_dict = {
         "DEMA": dema,
         "Supertrend_Trend": trend,
-        "Supertrend_Trend_at_exit": trend,
+        "Supertrend_Trend_at_exit": supertrend_trend_at_exit,
         "Supertrend_Lower": lower_band,
         "Supertrend_Upper": upper_band,
         "sl_price": sl_price,

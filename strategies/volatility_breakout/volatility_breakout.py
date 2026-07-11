@@ -58,10 +58,12 @@ def generate_signals(df: pd.DataFrame, params: dict):
         ts = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
         day = ts.dt.date
         minute_of_day = ts.dt.hour * 60 + ts.dt.minute
+    elif isinstance(df.index, pd.DatetimeIndex):
+        ts = pd.Series(pd.to_datetime(df.index, utc=True), index=df.index)
+        day = ts.dt.date
+        minute_of_day = ts.dt.hour * 60 + ts.dt.minute
     else:
-        ts = pd.Series(pd.NaT, index=df.index)
-        day = pd.Series(range(len(df)), index=df.index) // 7
-        minute_of_day = pd.Series(range(len(df)), index=df.index)
+        raise ValueError("generate_signals requires a timestamp column or DatetimeIndex")
 
     def parse_minutes(value: str) -> int:
         hour, minute = value.split(":", 1)
@@ -73,7 +75,7 @@ def generate_signals(df: pd.DataFrame, params: dict):
 
     session_open = close.copy()
     prev_day = None
-    current_open = float(close.iloc[0])
+    current_open = float(close.iloc[0]) if len(close) > 0 else float("nan")
     for i in range(len(df)):
         d = day.iloc[i]
         if d != prev_day:

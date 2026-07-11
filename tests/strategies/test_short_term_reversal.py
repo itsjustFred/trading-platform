@@ -70,7 +70,7 @@ class TestStrategyRegression:
             stop_dist = abs(trade.entry_price - sl)
             risk_usd = stop_dist * trade.quantity
             risk_pct = risk_usd / equity
-            assert risk_pct <= 0.015, (
-                f"Trade {trade.id}: Risk {risk_pct*100:.2f}% ueberschreitet Limit von 1.5%"
+            assert risk_pct <= 0.01, (
+                f"Trade {trade.id}: Risk {risk_pct*100:.2f}% ueberschreitet Limit von 1%"
             )
             equity += trade.pnl

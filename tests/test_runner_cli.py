@@ -40,10 +40,10 @@ class _DummyEngine:
                             time=config.end_date,
                             price=105.0,
                             quantity=10.0,
-                            pnl=5000.0,
+                            pnl=50.0,
                         )
                     ],
-                    pnl=5000.0,
+                    pnl=50.0,
                 )
             ],
             equity_curve=[

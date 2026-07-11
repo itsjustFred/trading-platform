@@ -62,7 +62,10 @@ def _run_layer(layer: str) -> LayerResult:
 
         summary = {}
         if report_path.exists():
-            payload = json.loads(report_path.read_text(encoding="utf-8"))
+            try:
+                payload = json.loads(report_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                payload = {}
             summary = payload.get("summary", {}) if isinstance(payload, dict) else {}
 
         return LayerResult(

@@ -77,6 +77,7 @@ def generate_signals(df: pd.DataFrame, params: dict):
     atr = tr.rolling(atr_period).mean()
     vix = _load_vix_data()
 
+    used_fallback = vix is None or "timestamp" not in df.columns
     vix_aligned = pd.Series(np.nan, index=df.index)
     vix_data_available = pd.Series(vix is not None, index=df.index)
     if vix is not None and "timestamp" in df.columns:
@@ -89,7 +90,7 @@ def generate_signals(df: pd.DataFrame, params: dict):
     else:
         vix_aligned = pd.Series(vix_threshold + 1, index=df.index)
 
-    vix_fallback_used = pd.Series(vix is None, index=df.index)
+    vix_fallback_used = pd.Series(used_fallback, index=df.index)
     entry_cond = (vix_aligned > vix_threshold) & (rsi < rsi_entry) & (close < sma)
 
     entries = pd.Series(False, index=df.index)

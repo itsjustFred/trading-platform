@@ -20,7 +20,7 @@ Trendfolgestrategie basierend auf dem klassischen Moving Average Crossover zweie
 - **Trigger**: `ta.crossunder(fast, slow)`
 - **Bedingung**: EMA(9) schneidet EMA(21) von oben nach unten
 - **Mechanismus**: `strategy.close("Long")` - vollständige Positionsschließung
-- **Exit-Typ**: Signal-basierter Reverse-Exit
+- **Exit-Typ**: Signal-basierter Close-Only-Exit
 
 ### Stop-Loss
 Nicht implementiert. Kein fester Stop-Loss, kein ATR-basierter oder technischer Stop definiert.

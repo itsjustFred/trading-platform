@@ -63,7 +63,7 @@ class RiskParityStrategy(QCAlgorithm):
         self.last_weights = {}
         self.last_rebalance = self.Time
 
-        self.SetWarmUp(timedelta(days=150))
+        self.SetWarmUp(timedelta(days=210))
 
         # Monthly rebalancing
         self.Schedule.On(

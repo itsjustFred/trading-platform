@@ -338,8 +338,10 @@ def test_live_preflight_threads_accounts_env_path_to_ctrader_adapter(
 
     monkeypatch.setattr(preflight, "CTraderLiveAdapter", _FakeCTraderAdapter)
 
-    # Ensure the default accounts file would be detectable if wrongly written.
-    default_path = Path(preflight.DEFAULT_ACCOUNTS_ENV)
+    # Redirect the default accounts path into tmp_path so the preflight run
+    # never touches a real developer accounts file.
+    default_path = tmp_path / "default.accounts.env"
+    monkeypatch.setattr(preflight, "DEFAULT_ACCOUNTS_ENV", default_path)
     default_before = default_path.read_text(encoding="utf-8") if default_path.exists() else None
 
     result = run_live_preflight(

@@ -35,7 +35,7 @@ def generate_signals(df: pd.DataFrame, params: dict):
     close = df["close"]
     high = df["high"]
     low = df["low"]
-    ret_5d = close.pct_change(lookback)
+    ret_lookback = close.pct_change(lookback)
     tr = pd.concat(
         [
             high - low,
@@ -54,8 +54,8 @@ def generate_signals(df: pd.DataFrame, params: dict):
     rs = avg_gain / avg_loss.replace(0, 1e-10)
     rsi = 100 - (100 / (1 + rs))
 
-    raw_entries = (ret_5d < entry_threshold) & (rsi < rsi_entry)
-    raw_exits = ret_5d > exit_threshold
+    raw_entries = (ret_lookback < entry_threshold) & (rsi < rsi_entry)
+    raw_exits = ret_lookback > exit_threshold
 
     in_trade = False
     bars_held = 0
@@ -68,7 +68,11 @@ def generate_signals(df: pd.DataFrame, params: dict):
     active_stop = np.nan
 
     for i in range(len(df)):
-        if not in_trade and bool(raw_entries.iloc[i]):
+        if (
+            not in_trade
+            and bool(raw_entries.iloc[i])
+            and pd.notna(atr.iloc[i])
+        ):
             in_trade = True
             bars_held = 0
             entries.iloc[i] = True
@@ -97,8 +101,8 @@ def generate_signals(df: pd.DataFrame, params: dict):
                 active_stop = np.nan
 
     indicators_dict = {
-        "Return_5D": ret_5d,
-        "Return_5D_at_exit": ret_5d,
+        "Return_Lookback": ret_lookback,
+        "Return_Lookback_at_exit": ret_lookback,
         "RSI": rsi,
         "ATR": atr,
         "sl_price": sl_price,

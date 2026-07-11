@@ -44,10 +44,10 @@ def _make_partial_exit_trade() -> Trade:
             TradeExit(time="2026-02-23T15:20:00Z", price=387.22, quantity=69, reason="tp1", fees=0.82, tags=["tp1"]),
             TradeExit(time="2026-02-23T16:45:00Z", price=382.10, quantity=69, reason="supertrend_flip", fees=0.82, tags=["runner"]),
         ],
-        pnl=1143.67,
+        pnl=1144.02,
         pnl_pct=2.20,
         fees=1.64,
-        net_pnl=1142.03,
+        net_pnl=1142.38,
         tags=["tp1_reached"],
         meta={"sl_price": 369.14, "tp1_price": 387.22},
     )

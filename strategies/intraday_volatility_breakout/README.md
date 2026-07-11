@@ -121,7 +121,7 @@ Hinweis: Die EA-Logik berechnet ATR und Regime-Filter immer auf `PERIOD_D1`, una
 | `PositionSelect(_Symbol)` | In vectorbt: Engine verwaltet Position; in `generate_signals` nur Entry/Exit-Booleans liefern. Maximal ein Trade pro Tag via `~entries.cumsum().groupby(df.index.date).diff().gt(0)` oder ähnlich sicherstellen. | `g_trade_taken`-Flag mappen auf „nur erster Entry-Signal pro Tag". |
 | `Reverse_Mode` | Vertausche Long/Short-Bedingungen: `entries_long = lower_hit, entries_short = upper_hit` statt umgekehrt. | Einfache boolean-Flip. |
 | `Fixed_Risk_Amount` / `CalculateLotSize` | Im Adapter via `sl_stop` / `size`-Parameter oder manuell: `size = Fixed_Risk_Amount / (sl_distance * (tick_value / tick_size))` | In `vectorbt` wird Sizing oft über `size` und `sl_stop` gesteuert. |
-| `Magic_Number` | Strategie-Name in `STRATEGY_META["name"]"` | Dient nur zur Zuordnung/Filterung. |
+| `Magic_Number` | Strategie-Name in `STRATEGY_META["name"]` | Dient nur zur Zuordnung/Filterung. |
 | `ParseTime("HH:MM")` | Python `datetime.strptime` oder direkt als `params["entry_hour"], params["entry_min"]` | Parameter als ints übergeben. |
 | `IsNewDay()` / `ResetDailyState()` | In vektorbasiertem Backtest: Gruppierung nach `df.index.date`; nur erstes Signal pro Tag erlauben; Levels pro Tag einmalig berechnen. | `groupby(date)`-Pattern. |
 

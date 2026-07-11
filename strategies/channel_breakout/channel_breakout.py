@@ -1,8 +1,8 @@
 """
 Intraday Channel Breakout Strategy
 
-N-Bar High/Low channel breakout with 200 EMA trend filter,
-gap filter, and ATR trailing stop.
+N-Bar High/Low channel breakout with 200 EMA trend filter
+and ATR trailing stop.
 """
 
 import numpy as np
@@ -63,17 +63,18 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
 
     for i in range(warmup, len(df)):
         if in_trade:
-            atr_value = atr.iloc[i]
-            if pd.notna(atr_value):
-                new_stop = float(close.iloc[i]) - float(atr_value) * atr_multiplier
-                trailing_stop_value = max(trailing_stop_value, new_stop)
-                trailing_stop_at_exit.iloc[i] = trailing_stop_value
-            if float(close.iloc[i]) <= trailing_stop_value:
+            if float(low.iloc[i]) <= trailing_stop_value:
                 exits.iloc[i] = True
                 exit_price.iloc[i] = trailing_stop_value
                 exit_reason.iloc[i] = "trailing_stop"
                 in_trade = False
                 trailing_stop_value = 0.0
+            else:
+                atr_value = atr.iloc[i]
+                if pd.notna(atr_value):
+                    new_stop = float(close.iloc[i]) - float(atr_value) * atr_multiplier
+                    trailing_stop_value = max(trailing_stop_value, new_stop)
+                    trailing_stop_at_exit.iloc[i] = trailing_stop_value
         else:
             ema_long_ok = (not use_ema_filter) or (float(close.iloc[i]) > float(ema200.iloc[i]))
             if ema_long_ok and float(close.iloc[i]) > float(upper_channel.iloc[i - 1]):

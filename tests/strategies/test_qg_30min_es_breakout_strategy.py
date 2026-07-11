@@ -4,7 +4,7 @@ Regression-Test fuer Strategie: QG-30Min ES Breakout Strategy
 Smoke-Test: stellt sicher, dass zukuenftige Core-Updates die Strategie-Logik
 nicht unbemerkt brechen. Getestet auf einem festen, kurzen Zeitraum.
 
-Validiert am: 2026-05-07
+Validiert am: 2026-07-11 (korrigierte Strategie-Logik nach CR-Fixes)
 Symbol/Timeframe: XAUUSD / 1h
 """
 
@@ -32,8 +32,10 @@ TEST_END = "2006-03-31"
 TEST_SYMBOL = "XAUUSD"
 TEST_TIMEFRAME = "1h"
 
-EXPECTED_TRADE_COUNT = 62
-EXPECTED_NET_PROFIT = 9408.30
+# Re-validiert 2026-07-11 nach CR-Fixes: ADX-Warm-up-Maske + korrigiertes
+# forced-exit Zeitfenster aendern Entry/Exit-Timing (62 -> 61 Trades).
+EXPECTED_TRADE_COUNT = 61
+EXPECTED_NET_PROFIT = 9509.78
 
 
 @pytest.fixture(scope="module")
