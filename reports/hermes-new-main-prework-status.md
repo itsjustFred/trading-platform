@@ -34,9 +34,12 @@ Critical Findings behandelt:
 
 Hinweis: G4-Subagent hatte `server_planning/01_current_state.md` irrtümlich komplett in CRLF umgewandelt (472-Zeilen-Spamm-Diff). Revertet; echter Finding (klare E-Mail im `.gitconfig`-Eintrag) manuell redigiert.
 
-### Batch 3 (150 Dateien)
-- Temp-Repo gebaut (`/tmp/cr-b03`, 150 Dateien, leerer Base).
-- CR-Initial-Review **pending** (CR-Rate-Limit).
+### Batch 3 (150 Dateien) — `findings: 36 → 0 ✓` (CLEAN)
+| Schritt | Findings | Commit | Notes |
+|--------|----------|--------|-------|
+| Initial-Review | 36 (1 critical, 17 major, 18 minor) | — | |
+| Fix-Runde | — | `dbf7030` | 1 critical + 16 major + 15+ minor gefixt (reverse_mode vor Filter, ADX-Warmup, Zeitfenster, ATR-Guards, Exit-Logik, README/Fixture-Hermetizität) |
+| Re-Run | **0 ✓** | — | CLEAN — `findings:0` (review_completed, COMPLETED_OK) |
 
 ### Batch 4 (72 Dateien)
 - Temp-Repo gebaut (`/tmp/cr-b04`, 72 Dateien, leerer Base).
@@ -75,7 +78,8 @@ nach Reset getriggert — erwartetes Gesamttempo ~3 Reviews / 42 min.
 ---
 
 ## Nächste Schritte
-1. Batch-1-Re-Run 3 abwarten (Retry 08:17 UTC) → ggf. Rest-Findings fixen bis `findings:0`.
-2. Batch-2-Re-Run nach Rate-Limit-Reset → bei Rest-Findings fixen + erneut.
-3. Batch-3/4 Initial-Reviews + Fix-Runden + Re-Runs bis clean.
-4. Finaler Abschlussreport, sobald alle 4 Batches `findings:0`.
+1. Batch-1 CLEAN ✓ (rerun4, 0 findings).
+2. Batch-2 CLEAN ✓ (rerun3, 0 findings).
+3. Batch-3 CLEAN ✓ (rerun, 0 findings; Fix `dbf7030`).
+4. Batch-4 Initial-Review + Fix-Runden + Re-Runs bis `findings:0` (läuft).
+5. Finaler Abschlussreport, sobald alle 4 Batches `findings:0`.
