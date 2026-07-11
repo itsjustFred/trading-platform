@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 import re
@@ -119,9 +120,31 @@ def read_backtest_stats(path: Path) -> dict[str, Any]:
     }
 
 
-def build_run_id(strategy: str, symbol: str, timeframe: str) -> str:
+def build_run_id(
+    strategy: str,
+    symbol: str,
+    timeframe: str,
+    *,
+    config: dict[str, Any] | None = None,
+) -> str:
     strategy_slug = sanitize(Path(strategy).stem)
-    return f"grid_{strategy_slug}_{symbol.lower()}_{timeframe}"
+    base = f"grid_{strategy_slug}_{symbol.lower()}_{timeframe}"
+    if not config:
+        return base
+    canonical = {
+        "engine": config.get("engine"),
+        "start": config.get("start"),
+        "end": config.get("end"),
+        "capital": config.get("capital"),
+        "risk_pct": config.get("risk_pct"),
+        "max_position_pct": config.get("max_position_pct"),
+        "max_leverage": config.get("max_leverage"),
+        "params": config.get("params"),
+    }
+    digest = hashlib.sha256(
+        json.dumps(canonical, sort_keys=True, default=str).encode()
+    ).hexdigest()[:12]
+    return f"{base}_{digest}"
 
 
 def build_cli_command(
@@ -260,7 +283,21 @@ def run_one_backtest_in_process(
     save_sqlite: bool = True,
     keep_indicators: bool = False,
 ) -> dict[str, Any]:
-    run_id = build_run_id(strategy, symbol, timeframe)
+    run_id = build_run_id(
+        strategy,
+        symbol,
+        timeframe,
+        config={
+            "engine": engine,
+            "start": start,
+            "end": end,
+            "capital": capital,
+            "risk_pct": risk_pct,
+            "max_position_pct": max_position_pct,
+            "max_leverage": max_leverage,
+            "params": params,
+        },
+    )
     path = output_path_for(output_dir, run_id)
     started_at = datetime.now(timezone.utc).isoformat()
     result: dict[str, Any] = {
@@ -388,6 +425,11 @@ def run_one_backtest(
     keep_indicators: bool = False,
 ) -> dict[str, Any]:
     if not use_subprocess:
+        if timeout_seconds and timeout_seconds > 0:
+            raise ValueError(
+                "timeout_seconds requires use_subprocess=True; the in-process "
+                "execution path cannot enforce a wall-clock timeout"
+            )
         return run_one_backtest_in_process(
             strategy=strategy,
             symbol=symbol,
@@ -408,7 +450,21 @@ def run_one_backtest(
             keep_indicators=keep_indicators,
         )
 
-    run_id = build_run_id(strategy, symbol, timeframe)
+    run_id = build_run_id(
+        strategy,
+        symbol,
+        timeframe,
+        config={
+            "engine": engine,
+            "start": start,
+            "end": end,
+            "capital": capital,
+            "risk_pct": risk_pct,
+            "max_position_pct": max_position_pct,
+            "max_leverage": max_leverage,
+            "params": params,
+        },
+    )
     path = output_path_for(output_dir, run_id)
     started_at = datetime.now(timezone.utc).isoformat()
     result: dict[str, Any] = {
@@ -544,8 +600,16 @@ def run_backtest_grid(
     keep_indicators: bool = False,
 ) -> dict[str, Any]:
     """Run one strategy across every symbol/timeframe combination."""
-    normalized_symbols = [normalize_symbol(symbol) for symbol in (symbols or GRID_SYMBOLS)]
-    normalized_timeframes = [normalize_timeframe_value(tf) for tf in (timeframes or GRID_TIMEFRAMES)]
+    normalized_symbols = []
+    for symbol in (symbols or GRID_SYMBOLS):
+        s = normalize_symbol(symbol)
+        if s not in normalized_symbols:
+            normalized_symbols.append(s)
+    normalized_timeframes = []
+    for tf in (timeframes or GRID_TIMEFRAMES):
+        t = normalize_timeframe_value(tf)
+        if t not in normalized_timeframes:
+            normalized_timeframes.append(t)
     if not normalized_symbols:
         raise ValueError("At least one symbol is required")
     if not normalized_timeframes:
@@ -598,6 +662,7 @@ def run_backtest_grid(
             "skip_existing": skip_existing,
             "use_subprocess": use_subprocess,
             "save_sqlite": save_sqlite,
+            "keep_indicators": keep_indicators,
         }
         for symbol in normalized_symbols
         for timeframe in normalized_timeframes
