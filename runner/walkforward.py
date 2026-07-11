@@ -196,6 +196,7 @@ def _run_portfolio_walkforward(
         "fold": 1,
         "is_sharpe": result.get("sharpe"),
         "oos_sharpe": result.get("oos_sharpe"),
+        "oos_return": result.get("total_return") or result.get("total_pnl"),
         "oos_max_drawdown": result.get("oos_max_drawdown"),
     }
     payload = {

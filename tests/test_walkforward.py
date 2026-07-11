@@ -78,9 +78,9 @@ class TestWalkforwardOutputStructure:
         assert result["backtest_ids"] == ["strat1", "strat2"]
 
         # Verify config is preserved
+        # NOTE: portfolio-mode config intentionally omits step_months (single train/test split, no rolling window)
         assert result["config"]["train_months"] == 12
         assert result["config"]["test_months"] == 3
-        assert result["config"]["step_months"] == 1
         assert result["config"]["n_trials"] == 10
 
         # Verify fold metrics
@@ -122,8 +122,9 @@ class TestWalkforwardSummaryMetrics:
         def mock_optimize(*args: Any, **kwargs: Any) -> dict[str, Any]:
             return {
                 "sharpe": 1.5,
-                "oos_sharpe": 1.2,  # Positive Sharpe
+                "oos_sharpe": 1.2,
                 "oos_max_drawdown": 0.15,
+                "total_return": 0.10,  # Positive OOS return -> counted as profitable fold
             }
 
         monkeypatch.setattr(wf_module, "optimize_portfolio_allocation", mock_optimize)
@@ -134,7 +135,7 @@ class TestWalkforwardSummaryMetrics:
             test_months=3,
         )
 
-        # With positive OOS Sharpe, fold should be profitable
+        # With positive OOS return, fold should be profitable
         assert result["summary"]["avg_oos_sharpe"] == 1.2
         assert result["summary"]["n_profitable_folds"] == 1
         assert result["summary"]["profitable_fold_pct"] == 100.0
@@ -263,11 +264,15 @@ class TestWalkforwardFileOutput:
         assert len(json_files) == 1
 
         filename = json_files[0].stem
-        # Should match pattern: wf_YYYYMMDD_HHMMSS
-        assert filename.startswith("wf_")
-        # Extract timestamp part - format is YYYYMMDD_HHMMSS (15 chars total)
-        ts_part = filename.split("_", 1)[1] if "_" in filename else ""
-        assert len(ts_part) == 15  # YYYYMMDD_HHMMSS format (8 + 1 + 6 = 15)
+        # Format: wf_YYYYMMDD_HHMMSS_<microseconds>_<uuid8>
+        # (microseconds + random suffix prevent concurrent-run filename collisions; see _write_payload)
+        parts = filename.split("_")
+        assert parts[0] == "wf"
+        assert len(parts) == 5, filename
+        assert len(parts[1]) == 8 and parts[1].isdigit()  # YYYYMMDD
+        assert len(parts[2]) == 6 and parts[2].isdigit()  # HHMMSS
+        assert len(parts[3]) == 6 and parts[3].isdigit()  # microseconds
+        assert len(parts[4]) == 8  # uuid8 hex suffix
 
 
 class TestWalkforwardEdgeCases:
