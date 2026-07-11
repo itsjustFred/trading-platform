@@ -56,16 +56,22 @@ class AICodeValidator:
         )
 
     @staticmethod
-    def _alias_map(tree: ast.AST) -> dict[str, str]:
-        """Map local import names to their real module (handles `import os as o`)."""
-        aliases: dict[str, str] = {}
+    def _alias_map(tree: ast.AST) -> dict[str, str | tuple[str, str]]:
+        """Map local import names to their real module (and attribute).
+
+        `import os as o`             -> {"o": "os"}
+        `from os import system as s` -> {"s": ("os", "system")}
+        so both `o.system()` and `s()` resolve to the forbidden `("os", "system")`.
+        """
+        aliases: dict[str, str | tuple[str, str]] = {}
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
                     aliases[alias.asname or alias.name] = alias.name
             elif isinstance(node, ast.ImportFrom):
                 for alias in node.names:
-                    aliases[alias.asname or alias.name] = node.module or alias.name
+                    local = alias.asname or alias.name
+                    aliases[local] = (node.module or "", alias.name)
         return aliases
 
     def _validate_security(self, tree: ast.AST, errors: list[str]) -> None:
@@ -81,23 +87,39 @@ class AICodeValidator:
             # Attribute calls resolved through import aliases:
             #   import os as o; o.system(...)
             if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
-                mod = aliases.get(func.value.id, func.value.id)
+                resolved = aliases.get(func.value.id, func.value.id)
+                mod = resolved[0] if isinstance(resolved, tuple) else resolved
                 if (mod, func.attr) in self._FORBIDDEN_ATTR_CALLS:
                     errors.append(f"Forbidden call detected: {mod}.{func.attr}()")
-            # Indirect access on a dangerous module: getattr(os, 'system')
-            if isinstance(func, ast.Name) and func.id in {"getattr", "__getattribute__"}:
-                if node.args:
-                    subj = node.args[0]
-                    if isinstance(subj, ast.Name):
-                        subj_name = aliases.get(subj.id, subj.id)
-                    elif isinstance(subj, ast.Constant) and isinstance(subj.value, str):
-                        subj_name = subj.value
-                    else:
-                        subj_name = None
-                    if subj_name in {"os", "subprocess"}:
-                        errors.append(
-                            f"Forbidden indirect access detected: {subj_name}.<attr>()"
-                        )
+                continue
+            # Imported-function calls resolved through `from` aliases:
+            #   from os import system as s; s()  ->  os.system()
+            if isinstance(func, ast.Name):
+                resolved = aliases.get(func.id)
+                if (
+                    isinstance(resolved, tuple)
+                    and (resolved[0], resolved[1]) in self._FORBIDDEN_ATTR_CALLS
+                ):
+                    errors.append(f"Forbidden call detected: {resolved[0]}.{resolved[1]}()")
+                    continue
+                if func.id in {"getattr", "__getattribute__"}:
+                    if node.args:
+                        subj = node.args[0]
+                        if isinstance(subj, ast.Name):
+                            subj_resolved = aliases.get(subj.id, subj.id)
+                            subj_name = (
+                                subj_resolved[0]
+                                if isinstance(subj_resolved, tuple)
+                                else subj_resolved
+                            )
+                        elif isinstance(subj, ast.Constant) and isinstance(subj.value, str):
+                            subj_name = subj.value
+                        else:
+                            subj_name = None
+                        if subj_name in {"os", "subprocess"}:
+                            errors.append(
+                                f"Forbidden indirect access detected: {subj_name}.<attr>()"
+                            )
 
     def _validate_interface(self, tree: ast.AST, errors: list[str], warnings: list[str]) -> None:
         module_functions = {

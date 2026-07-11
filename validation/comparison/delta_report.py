@@ -285,7 +285,7 @@ class DeltaReportBuilder:
         total_expected = len(reference.trades)
         total_actual = len(platform_result.trades)
         total_matched = sum(
-            1 for d in matched_trades if d.anomaly_type not in ("duplicate_match",)
+            1 for d in matched_trades if d.anomaly_type is None
         )
 
         summary: dict[str, Any] = {
