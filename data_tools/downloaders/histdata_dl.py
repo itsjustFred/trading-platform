@@ -167,8 +167,11 @@ class HistdataDownloader(Downloader):
     def _download_year(self, symbol: str, year: int) -> pd.DataFrame | None:
         """Download one year of M1 data from histdata.com.
 
-        histdata.com requires a POST with specific form data + referer.
-        The response is a ZIP containing a CSV.
+        histdata.com serves the year as 12 monthly ZIP archives. We perform the
+        year-page GET once to obtain the form token (``tk``), then issue a
+        separate download POST per month (``datemonth=YYYYMM``), parse each
+        returned ZIP into a DataFrame, and concatenate the successful monthly
+        frames before returning. A failing month does not discard the others.
         """
         try:
             session = requests.Session()
@@ -191,38 +194,53 @@ class HistdataDownloader(Downloader):
 
             tk = tk_match.group(1)
 
-            # Step 2: POST to download
-            data = {
-                "tk": tk,
-                "date": str(year),
-                "datemonth": f"{year}01",
-                "platform": "ASCII",
-                "timeframe": "M1",
-            }
-            headers = {"Referer": page_url}
-            resp = session.post(DOWNLOAD_URL, data=data, headers=headers, timeout=60)
+            # Step 2: download each month separately
+            monthly_frames: list[pd.DataFrame] = []
+            for month in range(1, 13):
+                datemonth = f"{year}{month:02d}"
+                data = {
+                    "tk": tk,
+                    "date": str(year),
+                    "datemonth": datemonth,
+                    "platform": "ASCII",
+                    "timeframe": "M1",
+                }
+                headers = {"Referer": page_url}
+                try:
+                    resp = session.post(DOWNLOAD_URL, data=data, headers=headers, timeout=60)
+                except Exception as exc:
+                    logger.warning("Download POST failed for %s/%s: %s", symbol, datemonth, exc)
+                    continue
 
-            if resp.status_code != 200 or len(resp.content) < 100:
-                logger.warning("Download failed for %s/%d", symbol, year)
+                if resp.status_code != 200 or len(resp.content) < 100:
+                    logger.warning("Download failed for %s/%s", symbol, datemonth)
+                    continue
+
+                # Step 3: unzip and parse CSV
+                try:
+                    with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+                        csv_name = zf.namelist()[0]
+                        with zf.open(csv_name) as f:
+                            # histdata M1 format: YYYYMMDD HHMMSS;OPEN;HIGH;LOW;CLOSE;VOLUME
+                            df = pd.read_csv(
+                                f,
+                                sep=";",
+                                header=None,
+                                names=["datetime", "open", "high", "low", "close", "volume"],
+                            )
+                except Exception as exc:
+                    logger.warning("Failed to parse ZIP for %s/%s: %s", symbol, datemonth, exc)
+                    continue
+
+                df["timestamp"] = pd.to_datetime(
+                    df["datetime"].str.strip(), format="%Y%m%d %H%M%S", utc=True
+                )
+                df = df[["timestamp", "open", "high", "low", "close", "volume"]]
+                monthly_frames.append(df)
+
+            if not monthly_frames:
                 return None
-
-            # Step 3: Unzip and parse CSV
-            with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
-                csv_name = zf.namelist()[0]
-                with zf.open(csv_name) as f:
-                    # histdata M1 format: YYYYMMDD HHMMSS;OPEN;HIGH;LOW;CLOSE;VOLUME
-                    df = pd.read_csv(
-                        f,
-                        sep=";",
-                        header=None,
-                        names=["datetime", "open", "high", "low", "close", "volume"],
-                    )
-
-            df["timestamp"] = pd.to_datetime(
-                df["datetime"].str.strip(), format="%Y%m%d %H%M%S", utc=True
-            )
-            df = df[["timestamp", "open", "high", "low", "close", "volume"]]
-            return df
+            return pd.concat(monthly_frames, ignore_index=True)
 
         except Exception as e:
             logger.warning("Error downloading %s/%d: %s", symbol, year, e)

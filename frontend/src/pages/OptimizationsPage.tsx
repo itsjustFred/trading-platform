@@ -1,9 +1,8 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { ArrowUpRight, Target, Telescope } from "lucide-react";
 
-import { getOptimizations } from "../api/client";
-import type { OptimizationSummary } from "../api/types";
+import { useOptimizations } from "../api/queries";
 
 function formatMetricValue(metric: string, value: number | string | boolean | null | undefined) {
   if (typeof value !== "number") {
@@ -29,22 +28,15 @@ function formatSymbols(symbols: string[] | null | undefined) {
 }
 
 export function OptimizationsPage() {
-  const [optimizations, setOptimizations] = useState<OptimizationSummary[]>([]);
   const [search, setSearch] = useState("");
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState("");
-
-  useEffect(() => {
-    getOptimizations()
-      .then((payload) => {
-        setOptimizations(payload);
-        setLoading(false);
-      })
-      .catch((caughtError) => {
-        setError(caughtError instanceof Error ? caughtError.message : "Could not load optimizations.");
-        setLoading(false);
-      });
-  }, []);
+  const optimizationsQuery = useOptimizations();
+  const optimizations = optimizationsQuery.data ?? [];
+  const loading = optimizationsQuery.isLoading;
+  const error = optimizationsQuery.isError
+    ? optimizationsQuery.error instanceof Error
+      ? optimizationsQuery.error.message
+      : "Could not load optimizations."
+    : "";
 
   const filtered = useMemo(() => {
     const query = search.trim().toLowerCase();

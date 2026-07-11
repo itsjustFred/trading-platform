@@ -27,6 +27,9 @@ signal_bots/<bot_name>/
 ### Pflichtklasse
 
 ```python
+import pandas as pd
+
+
 class <BotName>SignalProcessor:
     def __init__(self, config: dict): ...
     def process_signal(self, raw_signal: dict, market_data: pd.DataFrame) -> TradeSignal: ...
@@ -58,6 +61,7 @@ class <BotName>SignalProcessor:
 
 ```python
 from risk.models import TradeSignal
+from shared.constants import normalize_timeframe
 
 
 class ExampleSignalProcessor:
@@ -74,7 +78,7 @@ class ExampleSignalProcessor:
             entry_price=123.45,
             stop_loss=120.0,
             take_profit=130.0,
-            timeframe="5m",
+            timeframe=normalize_timeframe("5m"),
             metadata={
                 "source": "converted-signal-bot",
                 "trailing_sl_config": {

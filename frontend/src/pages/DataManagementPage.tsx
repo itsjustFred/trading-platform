@@ -371,7 +371,7 @@ export function DataManagementPage() {
       if (!categoryName) {
         return;
       }
-      if (loadingCategoriesRef.current[categoryName]) {
+      if (loadingCategoriesRef.current[categoryName] && !force) {
         return;
       }
       if (!force && categoryEntriesRef.current[categoryName]) {

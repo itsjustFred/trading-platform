@@ -45,6 +45,7 @@ export function Sidebar() {
       {/* Collapse toggle — top */}
       <button
         onClick={() => setCollapsed((c) => !c)}
+        aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
         className="flex items-center justify-center h-11 border-b border-border text-text-muted hover:text-text hover:bg-surface2 transition-colors"
         title={collapsed ? "Expand" : "Collapse"}
       >
@@ -75,6 +76,8 @@ export function Sidebar() {
             <NavLink
               key={item.path}
               to={item.path}
+              aria-label={item.label}
+              title={collapsed ? item.label : undefined}
               className={({ isActive }) =>
                 `flex items-center gap-3 h-10 transition-colors ${
                   collapsed ? "justify-center px-0" : "px-4"

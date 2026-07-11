@@ -118,7 +118,7 @@ export function FilterBar({
               style={{ color: "var(--color-text-muted)" }}
             />
             <select
-              value={sortValue}
+              value={sortValue ?? ""}
               onChange={(e) => onSortChange(e.target.value)}
               style={inputStyle}
             >

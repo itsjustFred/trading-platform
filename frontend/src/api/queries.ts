@@ -9,6 +9,7 @@ import {
   getLivePositions,
   getLiveQuote,
   getLiveSignalLog,
+  getOptimizations,
   getServiceLogs,
   getServices,
   getStrategies,
@@ -21,6 +22,7 @@ import type {
   LiveQuoteResponse,
   LiveSignalLogResponse,
   LogContent,
+  OptimizationSummary,
   Service,
   ServiceStatus,
   ServiceType,
@@ -40,6 +42,17 @@ export function useStrategies(
     queryKey: ["strategies"],
     queryFn: getStrategies,
     staleTime: 300_000,
+    ...options,
+  });
+}
+
+export function useOptimizations(
+  options?: Omit<UseQueryOptions<OptimizationSummary[], Error>, "queryKey" | "queryFn">,
+) {
+  return useQuery({
+    queryKey: ["optimizations"],
+    queryFn: getOptimizations,
+    staleTime: 60_000,
     ...options,
   });
 }

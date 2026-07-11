@@ -196,7 +196,7 @@ export function CreateBacktestModal({
     setError("");
 
     try {
-      const parameterPayload: Record<string, string | number> = {};
+      const parameterPayload: Record<string, string | number | boolean> = {};
       for (const [key, rawValue] of Object.entries(strategyParameters)) {
         if (parameterTypes[key] === "number") {
           const parsed = parseFloat(rawValue);
@@ -207,7 +207,7 @@ export function CreateBacktestModal({
           }
           parameterPayload[key] = parsed;
         } else if (parameterTypes[key] === "boolean") {
-          parameterPayload[key] = rawValue;
+          parameterPayload[key] = rawValue === "true";
         } else {
           parameterPayload[key] = rawValue;
         }
@@ -227,6 +227,17 @@ export function CreateBacktestModal({
         return;
       }
 
+      let riskPctValue: number | undefined;
+      if (riskPct) {
+        const parsedRisk = parseFloat(riskPct);
+        if (!Number.isFinite(parsedRisk) || parsedRisk <= 0 || parsedRisk > 100) {
+          setError("Risk per trade must be between 0 and 100%");
+          setRunning(false);
+          return;
+        }
+        riskPctValue = parsedRisk / 100;
+      }
+
       const res = await runBacktest({
         strategy,
         engine,
@@ -235,7 +246,7 @@ export function CreateBacktestModal({
         start,
         end,
         capital: capitalValue,
-        risk_per_trade_pct: riskPct ? parseFloat(riskPct) / 100 : undefined,
+        risk_per_trade_pct: riskPctValue,
         max_leverage: leverageValue,
         modeling_resolution: modelingResolution,
         parameters: parameterPayload,

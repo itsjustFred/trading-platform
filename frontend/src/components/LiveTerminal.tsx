@@ -16,6 +16,12 @@ export function LiveTerminal({
   const [status, setStatus] = useState("idle");
   const viewportRef = useRef<HTMLDivElement>(null);
 
+  const onStatusChangeRef = useRef(onStatusChange);
+
+  useEffect(() => {
+    onStatusChangeRef.current = onStatusChange;
+  }, [onStatusChange]);
+
   useEffect(() => {
     if (!jobId) {
       setLogs("");
@@ -25,14 +31,16 @@ export function LiveTerminal({
 
     setLogs("");
     setStatus("connecting");
-    onStatusChange?.("connecting");
+    onStatusChangeRef.current?.("connecting");
 
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const ws = new WebSocket(`${protocol}//${window.location.host}/ws/tasks/${jobId}`);
+    const ws = new WebSocket(
+      `${protocol}//${window.location.host}/ws/tasks/${encodeURIComponent(jobId)}`,
+    );
 
     ws.onopen = () => {
       setStatus("connected");
-      onStatusChange?.("connected");
+      onStatusChangeRef.current?.("connected");
     };
 
     ws.onmessage = (event) => {
@@ -43,13 +51,13 @@ export function LiveTerminal({
       if (statusMatch?.[1]) {
         const nextStatus = statusMatch[1].toLowerCase();
         setStatus(nextStatus);
-        onStatusChange?.(nextStatus);
+        onStatusChangeRef.current?.(nextStatus);
       }
     };
 
     ws.onerror = () => {
       setStatus("disconnected");
-      onStatusChange?.("disconnected");
+      onStatusChangeRef.current?.("disconnected");
     };
 
     ws.onclose = () => {
@@ -58,13 +66,13 @@ export function LiveTerminal({
           ? prev
           : "disconnected",
       );
-      onStatusChange?.("disconnected");
+      onStatusChangeRef.current?.("disconnected");
     };
 
     return () => {
       ws.close();
     };
-  }, [jobId, onStatusChange]);
+  }, [jobId]);
 
   useEffect(() => {
     const viewport = viewportRef.current;

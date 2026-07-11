@@ -29,7 +29,7 @@ import pandas as pd
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 logger = logging.getLogger(__name__)
 
-from shared.constants import DATA_DIR
+from shared.constants import DATA_DIR, normalize_timeframe
 
 # Expected bars per timeframe per trading day (forex ~24h, equities ~7h)
 EXPECTED_BARS_PER_DAY = {
@@ -97,7 +97,7 @@ def validate_parquet(path: Path) -> ValidationResult:
     # Extract metadata from path: {source}/{asset_class}/.../{symbol}/{tf}.parquet
     source = parts[0] if len(parts) >= 4 else "unknown"
     symbol = path.parent.name
-    timeframe = path.stem
+    timeframe = normalize_timeframe(path.stem)
 
     result = ValidationResult(
         path=str(rel),

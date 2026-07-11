@@ -25,13 +25,17 @@ python -m runner.grid_tester --strategy my_strategy --symbols BTCUSDT ETHUSDT --
 ## GridRecord Model
 
 ```python
+from sqlmodel import Field, SQLModel
+from sqlalchemy import JSON, Column
+
+
 class GridRecord(SQLModel, table=True):
-    id: str  # Unique grid run ID
+    id: str = Field(default=None, primary_key=True)  # Unique grid run ID
     strategy: str  # Strategy name
     created_at: str  # ISO timestamp
-    symbols_json: list[str]  # Tested symbols
-    timeframes_json: list[str]  # Tested timeframes
-    results_json: dict[str, Any]  # {symbol: {timeframe: {metrics}}}
+    symbols_json: list[str] = Field(sa_column=Column(JSON))  # Tested symbols
+    timeframes_json: list[str] = Field(sa_column=Column(JSON))  # Tested timeframes
+    results_json: dict[str, Any] = Field(sa_column=Column(JSON))  # {symbol: {timeframe: {metrics}}}
     engine: str  # Backtest engine used
 ```
 

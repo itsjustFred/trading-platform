@@ -390,7 +390,7 @@ from runner.engines.base import BacktestConfig
 from runner.engines.vectorbt_adapter import VectorbtAdapter  # oder pynecore_adapter
 
 
-STRATEGY_PATH = str(Path(__file__).parent.parent.parent / "strategies" / "<name>.py")
+STRATEGY_PATH = str(Path(__file__).parent.parent.parent / "strategies" / "<name>" / "<name>.py")
 
 # Fester, kurzer Zeitraum (ca. 3 Monate) — NICHT verändern
 TEST_START = "<YYYY-MM-DD>"  # Startdatum des Regressionszeitraums

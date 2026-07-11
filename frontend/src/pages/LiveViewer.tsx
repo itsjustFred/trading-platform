@@ -80,7 +80,13 @@ function resolveChartLocale(): string {
 export function LiveViewerPage() {
   const { accountId: rawAccountId } = useParams<{ accountId: string }>();
   const queryClient = useQueryClient();
-  const accountId = decodeURIComponent(rawAccountId ?? "");
+  const accountId = (() => {
+    try {
+      return decodeURIComponent(rawAccountId ?? "");
+    } catch {
+      return rawAccountId ?? "";
+    }
+  })();
   const positionsStream = useLivePositionsStream(accountId);
   const signalsStream = useLiveSignalsStream(accountId);
   const executionsStream = useLiveExecutionsStream(accountId);

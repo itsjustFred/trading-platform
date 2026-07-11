@@ -75,10 +75,10 @@ function formatNumber(value: unknown, digits = 2): string {
 function formatPrice(value: unknown): string {
   const numeric = toFiniteNumber(value);
   if (numeric == null) return "—";
-  return `$${numeric.toLocaleString("en-US", {
+  return numeric.toLocaleString("en-US", {
     minimumFractionDigits: 2,
     maximumFractionDigits: 5,
-  })}`;
+  });
 }
 
 function formatPnl(value: unknown): string {

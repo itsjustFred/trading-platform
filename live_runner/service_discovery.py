@@ -30,6 +30,8 @@ def discover_discord_bots_from_env() -> list[dict[str, str]]:
             continue
         bot_name = token_match.group("name")
         token_env_key = f"DISCORD_BOT_{bot_name}_TOKEN"
+        if not env_values.get(key, "").strip():
+            continue
         channel_key = f"DISCORD_BOT_{bot_name}_CHANNEL_ID"
         channel_id = str(env_values.get(channel_key, "")).strip()
         if not channel_id:

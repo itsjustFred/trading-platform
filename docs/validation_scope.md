@@ -29,9 +29,9 @@
 |---------|------------|
 | **Live-Trading-Implementierung** | Nicht Teil dieses Frameworks; es geht ausschließlich um Validierung und Vergleich von Backtest-Ergebnissen. |
 | **Paper-Trading-Implementierung** | Die Readiness wird geprüft, aber keine Order-Routing-, Broker- oder Live-Ausführungslogik wird gebaut. |
-| **Änderung bestehender Ausführungslogik** | `runner/engine.py`, `live_runner/` und Broker-Integrationen bleiben unverändert. |
+| **Änderung bestehender Ausführungslogik** | `runner/engine.py`, `live_runner/` und Broker-Integrationen werden im Rahmen der MT5-Alignment-Arbeit gezielt angepasst (Fixed-Risk-Sizing, Confirmation-Timeframe, Execution-Semantik); bestehende Percent-Risk-Backtests dürfen dabei nicht regressieren. |
 | **Frontend / UI** | Reports werden als Dateien (JSON/Markdown) erzeugt; keine Web-Oberfläche. |
-| **Weitere externe Frameworks außer MT5** | LEAN, Stockkit, QuantConnect etc. sind als spätere Erweiterungen vorgesehen, werden aber nicht in diesem Ferment implementiert. |
+| **Weitere externe Frameworks außer MT5** | LEAN, Stockkit, QuantConnect etc. sind als spätere Erweiterungen vorgesehen, werden aber nicht in diesem Framework implementiert. |
 | **Echtzeit-Validierung während des Backtests** | Das Framework vergleicht fertige Backtest-Reports, nicht laufende Backtests. |
 
 ---

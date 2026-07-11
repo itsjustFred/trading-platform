@@ -3,6 +3,8 @@ import { memo } from "react";
 export const LoadingSpinner = memo(function LoadingSpinner() {
   return (
     <div
+      role="status"
+      aria-live="polite"
       style={{
         minHeight: "40vh",
         display: "flex",
@@ -13,6 +15,7 @@ export const LoadingSpinner = memo(function LoadingSpinner() {
     >
       <div style={{ display: "inline-flex", alignItems: "center", gap: "10px" }}>
         <span
+          aria-hidden="true"
           className="animate-spin"
           style={{
             width: "16px",

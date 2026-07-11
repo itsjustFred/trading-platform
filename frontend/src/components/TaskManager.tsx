@@ -24,10 +24,8 @@ export function TaskManager() {
   );
   const runningCount = useMemo(
     () =>
-      activeTasks.filter((task) =>
-        ["queued", "starting", "running"].includes(
-          String(task.status || "").toLowerCase(),
-        ),
+      activeTasks.filter(
+        (task) => String(task.status || "").toLowerCase() === "running",
       ).length,
     [activeTasks],
   );

@@ -549,7 +549,16 @@ def _ensure_jvm_started() -> None:
                     jpype_mod.startJVM(jvm_path, classpath=classpath, convertStrings=False)
                     break
                 except _java_exception_types() as exc:
-                    _raise_jforex_runtime_error("Failed to start JVM for JForex SDK", exc)
+                    java_type = getattr(type(exc), "__name__", "JException")
+                    detail = str(exc) or repr(exc)
+                    logger.debug(
+                        "JVM candidate failed (Java error): %s -> %s: %s",
+                        jvm_path,
+                        java_type,
+                        detail,
+                    )
+                    startup_errors.append((jvm_path, f"{java_type}: {detail}"))
+                    continue
                 except Exception as exc:  # noqa: BLE001
                     logger.debug("JVM candidate failed: %s", jvm_path, exc_info=True)
                     startup_errors.append((jvm_path, str(exc)))

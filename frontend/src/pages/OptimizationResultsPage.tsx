@@ -77,7 +77,7 @@ export function OptimizationResultsPage() {
 
   const topTrialColumns = useMemo(() => {
     const parameterKeys = Array.from(
-      new Set(optimization?.top_trials.flatMap((trial) => Object.keys(trial.params || {})) || []),
+      new Set((optimization?.top_trials || []).flatMap((trial) => Object.keys(trial.params || {}))),
     );
 
     return [

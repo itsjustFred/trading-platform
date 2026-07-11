@@ -131,7 +131,7 @@ const PortfolioCard = memo(function PortfolioCard({
           : `No components • $${(portfolio.account_capital || 100000).toLocaleString()}`}
       </div>
       {portfolio.equity_mini && portfolio.equity_mini.length > 1 && (
-        <div style={{ margin: "6px 0" }}>
+        <div style={{ margin: "6px 0", position: "relative", zIndex: 2 }}>
           <Sparkline data={portfolio.equity_mini} width={260} height={44} interactive />
         </div>
       )}

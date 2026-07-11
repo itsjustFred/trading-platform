@@ -71,7 +71,7 @@ python -m runner.cli grid \
   --skip-sqlite
 ```
 
-Outputs are written to `data/backtests/grid_runner/`:
+Outputs are written to `$DATA_DIR/backtests/grid_runner/`:
 
 - `grid_summary.json` — full per-cell status, return codes, stats, and errors.
 - `grid_matrix.csv` — compact matrix for comparing assets/timeframes.

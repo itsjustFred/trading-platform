@@ -26,7 +26,7 @@ from pathlib import Path
 import pandas as pd
 
 from data_tools.downloaders.base import Downloader, DownloadResult, SourceMeta
-from shared.constants import DATA_DIR
+from shared.constants import DATA_DIR, normalize_timeframe
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +116,7 @@ class CTraderDownloader(Downloader):
         **kwargs,
     ) -> DownloadResult:
         symbol = symbol.upper()
+        timeframe = normalize_timeframe(timeframe)
 
         if timeframe not in RESAMPLE_MAP and timeframe != "tick":
             raise ValueError(f"Unsupported timeframe: {timeframe}")

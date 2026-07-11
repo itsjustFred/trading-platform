@@ -230,39 +230,28 @@ class AlpacaDownloader(Downloader):
         client = self._build_client()
         alpaca_tf = self._to_alpaca_timeframe(canonical_tf)
 
-        page_token: str | None = None
-        seen_tokens: set[str] = set()
-        pages: list[pd.DataFrame] = []
-
-        while True:
-            request = StockBarsRequest(
-                symbol_or_symbols=[normalized_symbol],
-                timeframe=alpaca_tf,
-                start=parsed_start.to_pydatetime() if parsed_start is not None else None,
-                end=parsed_end.to_pydatetime() if parsed_end is not None else None,
-                limit=ALPACA_MAX_LIMIT,
-                page_token=page_token,
+        # alpaca-py paginates internally: StockBarsRequest has no ``page_token``
+        # field (it is silently ignored), but the historical client loops over
+        # ``next_page_token`` automatically. A single request returns the full,
+        # de-duplicated series; the ``drop_duplicates`` below guards against any
+        # repeated timestamps.
+        request = StockBarsRequest(
+            symbol_or_symbols=[normalized_symbol],
+            timeframe=alpaca_tf,
+            start=parsed_start.to_pydatetime() if parsed_start is not None else None,
+            end=parsed_end.to_pydatetime() if parsed_end is not None else None,
+            limit=ALPACA_MAX_LIMIT,
+        )
+        response = client.get_stock_bars(request)
+        frame = getattr(response, "df", None)
+        pages = [
+            self._normalize_response_frame(
+                frame,
+                symbol=normalized_symbol,
+                start=parsed_start,
+                end=parsed_end,
             )
-            response = client.get_stock_bars(request)
-            frame = getattr(response, "df", None)
-            if isinstance(frame, pd.DataFrame) and not frame.empty:
-                pages.append(
-                    self._normalize_response_frame(
-                        frame,
-                        symbol=normalized_symbol,
-                        start=parsed_start,
-                        end=parsed_end,
-                    )
-                )
-
-            next_page_token = str(getattr(response, "next_page_token", "") or "").strip()
-            if not next_page_token:
-                break
-            if next_page_token == page_token or next_page_token in seen_tokens:
-                logger.warning("Stopping Alpaca pagination due to repeated page token.")
-                break
-            seen_tokens.add(next_page_token)
-            page_token = next_page_token
+        ]
 
         frames = [frame for frame in pages if isinstance(frame, pd.DataFrame) and not frame.empty]
         if not frames:

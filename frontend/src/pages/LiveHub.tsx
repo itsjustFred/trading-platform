@@ -115,7 +115,7 @@ const LiveDeploymentCard = memo(function LiveDeploymentCard({
     >
       <Link
         to={"/live/" + encodeURIComponent(card.account_id)}
-        aria-label={`Open live account `}
+        aria-label={`Open live account ${card.account_id}`}
         style={{ position: "absolute", inset: 0, zIndex: 1, borderRadius: "10px" }}
       />
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>

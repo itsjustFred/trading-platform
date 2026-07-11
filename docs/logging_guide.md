@@ -79,7 +79,6 @@ from shared.logging import get_logger
 logger = get_logger("stockkit")
 ```
 
-Das erzeugt `~/logs/stockkit.log` mit dem gleichen JSON-Format.
 Das erzeugt `./logs/stockkit.log` (oder `LOG_DIR/stockkit.log`) mit dem gleichen JSON-Format.
 
 ### 3. Bestehende print()-Aufrufe ersetzen

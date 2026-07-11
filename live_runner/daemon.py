@@ -518,8 +518,13 @@ def size_live_signal_for_submission(
     )
     metadata["qty"] = float(resolved_position_size)
     metadata["explicit_qty"] = float(resolved_position_size)
-    metadata["risk_amount"] = float(sized_order.risk_amount)
-    metadata["risk_percent"] = float(sized_order.risk_percent)
+    if explicit_qty is not None and explicit_qty > 0 and sized_order.position_size > 0:
+        scale = resolved_position_size / sized_order.position_size
+        metadata["risk_amount"] = float(sized_order.risk_amount) * scale
+        metadata["risk_percent"] = float(sized_order.risk_percent) * scale
+    else:
+        metadata["risk_amount"] = float(sized_order.risk_amount)
+        metadata["risk_percent"] = float(sized_order.risk_percent)
     metadata["risk_reward_ratio"] = (
         float(sized_order.risk_reward_ratio)
         if sized_order.risk_reward_ratio is not None
@@ -551,9 +556,7 @@ async def submit_order_with_risk(
             symbol = str(position.get("symbol") or "").strip().upper()
             if symbol != signal.symbol.upper():
                 continue
-            resolved_qty = _coerce_live_float(
-                position.get("qty"), field_name="qty", minimum=0.0
-            )
+            resolved_qty = _coerce_live_float(position.get("qty"), field_name="qty")
             target_qty = max(resolved_qty, 0.0)
             break
         if target_qty <= 0:
@@ -785,7 +788,7 @@ async def _run_discord_signal_listener_for_account(
 def _create_adapter_for_account(
     account: LiveAccountConfig, *, accounts_env_values: Mapping[str, str] | None = None
 ) -> BaseLiveAdapter | None:
-    env_values = accounts_env_values or os.environ
+    env_values = accounts_env_values if accounts_env_values is not None else os.environ
     if account.broker == "alpaca":
         credentials = resolve_alpaca_credentials(
             account_id=account.id,

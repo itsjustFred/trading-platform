@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useId, useState } from "react";
 import { Loader2, PencilLine } from "lucide-react";
 import { Modal } from "./Modal";
 
@@ -24,6 +24,8 @@ export function RenameModal({
   onSave,
 }: RenameModalProps) {
   const [draft, setDraft] = useState(value);
+  const [focused, setFocused] = useState(false);
+  const inputId = useId();
 
   useEffect(() => {
     if (open) {
@@ -57,6 +59,7 @@ export function RenameModal({
 
         <div style={{ display: "grid", gap: "6px" }}>
           <label
+            htmlFor={inputId}
             style={{
               color: "var(--color-text-muted)",
               fontSize: "0.75rem",
@@ -67,11 +70,15 @@ export function RenameModal({
             {label}
           </label>
           <input
+            id={inputId}
             type="text"
             value={draft}
             onChange={(event) => setDraft(event.target.value)}
             placeholder={value}
             autoFocus
+            aria-describedby={helperText ? `${inputId}-helper` : undefined}
+            onFocus={() => setFocused(true)}
+            onBlur={() => setFocused(false)}
             style={{
               background: "var(--color-surface2)",
               border: "1px solid var(--color-border)",
@@ -79,11 +86,17 @@ export function RenameModal({
               padding: "10px 12px",
               borderRadius: "8px",
               fontSize: "0.9rem",
-              outline: "none",
+              outline: focused
+                ? "2px solid var(--color-blue)"
+                : "2px solid transparent",
+              outlineOffset: "1px",
             }}
           />
           {helperText ? (
-            <div style={{ color: "var(--color-text-muted)", fontSize: "0.76rem" }}>
+            <div
+              id={`${inputId}-helper`}
+              style={{ color: "var(--color-text-muted)", fontSize: "0.76rem" }}
+            >
               {helperText}
             </div>
           ) : null}

@@ -81,7 +81,13 @@ Ziel: uncommittete Aenderungen (oder Diff seit letztem Commit) rigoros pruefen, 
 
 ## Phase 6: PR-Tagging & Abschluss
 1. Labels mit GitHub CLI verwalten (`gh pr edit --add-label ...`).
-2. Vor dem Hinzufügen eines Labels immer ein Pre-Check durchführen:
+2. Ziel-Label zuerst anhand des in Phase 5 festgestellten Falls (A/B/C) bestimmen — nicht umgekehrt:
+   - **Fall A (alles gut):** zulässiges Ziel-Label = `Ready for Merge`.
+   - **Fall B (kleine Fehler/Nits):** zulässiges Ziel-Label = `Fixed - Not Re-reviewed` (oder nächstes Human-Review-Label). **Fall B darf NIEMALS auf `Ready for Merge` fallen.**
+   - **Fall C (kritische Architektur/Logik):** zulässiges Ziel-Label = ausschließlich `Critical Fix - Not Re-reviewed` (oder Eskalations-/Human-Review-Label). **Fall C erhält niemals einen Merge-ready-Status.**
+   Die unten stehende Label-Prioritätsliste dient NUR als Fallback innerhalb derselben Review-Stufe (wenn das bevorzugte Fall-Label nicht existiert); sie darf das Fall-basierte Ziel-Label nicht überschreiben.
+
+   Vor dem Hinzufügen eines Labels immer ein Pre-Check durchführen:
    - Liste vorhandener Labels abfragen mit `gh label list` (oder via API: `gh api repos/:owner/:repo/labels`).
    - Bevorzugte Labels in dieser Reihenfolge testen und das erste existente anwenden:
      1. `Ready for Merge`
@@ -89,6 +95,7 @@ Ziel: uncommittete Aenderungen (oder Diff seit letztem Commit) rigoros pruefen, 
      3. `Critical Fix - Not Re-reviewed`
      4. `Human Testing Needed`
      5. `Needs Human Fix`
+   - Für Fall B/C wird `Ready for Merge` bei diesem Pre-Check bewusst übersprungen, damit kein Merge-ready-Status vergeben wird.
    - Wenn eines der bevorzugten Labels gefunden wird, anwenden mit `gh pr edit --add-label "<label>"` und danach Schritt 4 (Summary).
 3. Wenn keines der bevorzugten Labels existiert:
    - Prüfe die Repo-Label-Policy (z.B. **GitHub: Settings → Labels** oder projektspezifische Richtlinien wie `CONTRIBUTING.md`, `.github/labels.md` oder `docs/`-Ordner).

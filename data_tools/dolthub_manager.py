@@ -16,6 +16,8 @@ logger = logging.getLogger("dolthub_manager")
 
 from shared.constants import DATA_DIR, resolve_executable
 
+DOLT_BIN = resolve_executable("dolt")
+
 DOLT_DIR = DATA_DIR / "dolthub"
 EXPORT_DIR = DATA_DIR / "ohlcv" / "dolthub"
 
@@ -42,7 +44,7 @@ def update_repos():
             # Check if it is a dolt repo
             if (repo_path / ".dolt").exists():
                 try:
-                    run_cmd(["dolt", "pull"], cwd=repo_path)
+                    run_cmd([DOLT_BIN, "pull"], cwd=repo_path)
                 except subprocess.CalledProcessError:
                     logger.error(f"Failed to pull {name}. Manual intervention required.")
             else:
@@ -50,7 +52,7 @@ def update_repos():
         else:
             logger.info(f"Cloning {remote} to {repo_path}...")
             try:
-                run_cmd(["dolt", "clone", remote, str(repo_path)])
+                run_cmd([DOLT_BIN, "clone", remote, str(repo_path)])
             except subprocess.CalledProcessError:
                 logger.error(f"Failed to clone {remote}.")
 
@@ -58,7 +60,7 @@ def update_repos():
 def _list_tables(repo_path: Path) -> list[str]:
     """List tables in a dolt repo using 'dolt sql -r csv'."""
     result = subprocess.run(
-        ["dolt", "sql", "-q", "SHOW TABLES", "-r", "csv"],
+        [DOLT_BIN, "sql", "-q", "SHOW TABLES", "-r", "csv"],
         cwd=repo_path,
         capture_output=True,
         text=True,
@@ -74,7 +76,7 @@ def _list_tables(repo_path: Path) -> list[str]:
 def _export_table_csv(repo_path: Path, table: str, output_csv: Path):
     """Export a dolt table to CSV using 'dolt table export'."""
     with open(output_csv, "w") as f:
-        subprocess.check_call(["dolt", "table", "export", "-f", table], cwd=repo_path, stdout=f)
+        subprocess.check_call([DOLT_BIN, "table", "export", "-f", table], cwd=repo_path, stdout=f)
 
 
 def _quote_sql_identifier(value: str) -> str:
@@ -85,7 +87,8 @@ def _quote_sql_identifier(value: str) -> str:
 
 
 def _quote_sql_literal(value: str) -> str:
-    return "'" + str(value).replace("'", "''") + "'"
+    escaped = str(value).replace("\\", "\\\\").replace("'", "''")
+    return "'" + escaped + "'"
 
 
 def _stock_export_path(target_dir: Path, symbol: str) -> Path:

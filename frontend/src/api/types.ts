@@ -38,7 +38,7 @@ export interface RunBacktestRequest {
   risk_per_trade_pct?: number;
   max_leverage?: number;
   modeling_resolution?: string;
-  parameters?: Record<string, number | string>;
+  parameters?: Record<string, number | string | boolean>;
 }
 
 export interface RunBacktestResponse {

@@ -715,8 +715,8 @@ function ContributionTable({
           {rows.map((row, index) => (
             <tr key={`${row.group_value}-${index}`}>
               <td style={tdStyle}>{row.group_value || row.strategy_name || "—"}</td>
-              <td style={tdStyle}>{(row.return_contribution * 100).toFixed(2)}%</td>
-              <td style={{ ...tdStyle, color: "#f85149" }}>{(row.drawdown_contribution * 100).toFixed(2)}%</td>
+              <td style={tdStyle}>{(Number(row.return_contribution ?? 0) * 100).toFixed(2)}%</td>
+              <td style={{ ...tdStyle, color: "#f85149" }}>{(Number(row.drawdown_contribution ?? 0) * 100).toFixed(2)}%</td>
               <td style={tdStyle}>{Number(row.sharpe_ratio ?? 0).toFixed(3)}</td>
               <td style={tdStyle}>{row.psr != null ? `${(Number(row.psr) * 100).toFixed(1)}%` : "—"}</td>
               <td style={tdStyle}>{row.p_value != null ? Number(row.p_value).toFixed(4) : "—"}</td>
@@ -726,7 +726,7 @@ function ContributionTable({
               <td style={{ ...tdStyle, color: Number(row.cagr || 0) >= 0 ? "#3fb950" : "#f85149" }}>
                 {row.cagr != null ? `${(Number(row.cagr) * 100).toFixed(2)}%` : "—"}
               </td>
-              <td style={tdStyle}>{row.win_rate.toFixed(2)}%</td>
+              <td style={tdStyle}>{Number(row.win_rate ?? 0).toFixed(2)}%</td>
               <td style={tdStyle}>{row.trade_count}</td>
               <td style={{ ...tdStyle, color: row.pnl_total >= 0 ? "#3fb950" : "#f85149" }}>
                 {row.pnl_total >= 0 ? "+" : ""}${Math.abs(row.pnl_total).toLocaleString("en-US", { maximumFractionDigits: 2 })}

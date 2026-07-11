@@ -196,10 +196,15 @@ def _preflight_account(
                 account_config_id=account.id,
                 accounts_env_path=accounts_env_path,
             )
+
+            async def _check_ctrader_connectivity() -> tuple[float, float, list]:
+                await adapter.connect()
+                bal, eq = await adapter.get_balance()
+                positions = await adapter.get_positions()
+                return bal, eq, positions
+
             try:
-                asyncio.run(adapter.connect())
-                balance, equity = asyncio.run(adapter.get_balance())
-                positions = asyncio.run(adapter.get_positions())
+                balance, equity, positions = asyncio.run(_check_ctrader_connectivity())
                 positions_count = len(positions)
                 connected = True
             except Exception as exc:

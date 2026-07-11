@@ -53,7 +53,13 @@ export function LiveDetailPage() {
   const { accountId: rawAccountId } = useParams<{ accountId: string }>();
   const navigate = useNavigate();
   const { showToast } = useToast();
-  const accountId = decodeURIComponent(rawAccountId ?? "");
+  const accountId = (() => {
+    try {
+      return decodeURIComponent(rawAccountId ?? "");
+    } catch {
+      return rawAccountId ?? "";
+    }
+  })();
 
   const [balances, setBalances] = useState<LiveBalanceRecord[]>([]);
   const [trades, setTrades] = useState<LiveTradeSlippage[]>([]);

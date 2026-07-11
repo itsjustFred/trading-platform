@@ -26,6 +26,10 @@ _ASYNCIO_REACTOR_VALIDATED = False
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_ACCOUNTS_ENV = PROJECT_ROOT / ".accounts.env"
 
+# Process-wide lock serializing OAuth token refreshes across all adapter
+# instances, so accounts that share the same token cannot refresh concurrently.
+_REFRESH_TOKEN_LOCK = asyncio.Lock()
+
 
 class CTraderApiError(RuntimeError):
     def __init__(self, error_code: str, description: str) -> None:
@@ -128,6 +132,26 @@ def _write_env_key(path: Path, key: str, value: str) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     # Harden file permissions: tokens grant full trading access
     path.chmod(0o600)
+
+
+def _write_env_keys(path: Path, mapping: dict[str, str]) -> None:
+    """Persist multiple dotenv keys without logging secret material."""
+    for key, value in mapping.items():
+        _write_env_key(path, key, value)
+
+
+def _read_env_pairs(path: Path) -> dict[str, str]:
+    """Read key=value pairs from a dotenv file without logging secret material."""
+    pairs: dict[str, str] = {}
+    if not path.exists():
+        return pairs
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        pairs[key.strip()] = value.strip()
+    return pairs
 
 
 def _ensure_asyncio_twisted_reactor(loop: asyncio.AbstractEventLoop) -> None:
@@ -337,30 +361,55 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._authenticated = False
 
     async def _refresh_access_token(self) -> bool:
-        """Refresh cTrader OAuth tokens via Open API and persist them safely."""
+        """Refresh cTrader OAuth tokens via Open API and persist them safely.
+
+        Refreshes are serialized process-wide via ``_REFRESH_TOKEN_LOCK`` so
+        accounts that share the same token cannot refresh concurrently. After
+        acquiring the lock we re-read ``CTRADER_REFRESH_TOKEN`` from the
+        environment; if another instance already refreshed and persisted new
+        tokens, we adopt those and skip the network round-trip.
+        """
         if not self.refresh_token or self._ProtoOARefreshTokenReq is None:
             logger.warning(
                 "cTrader access token refresh unavailable: missing refresh token or OpenAPI type",
                 extra={"data": {"account_id": self.ctid_trader_account_id}},
             )
             return False
-        refresh_req = self._ProtoOARefreshTokenReq()
-        refresh_req.refreshToken = self.refresh_token
-        try:
-            refresh_res = await self._send_request(refresh_req, timeout_seconds=15)
-        except CTraderApiError as exc:
-            # Use non-refresh version to avoid infinite recursion
-            logger.warning(
-                "cTrader access token refresh failed",
-                extra={
-                    "data": {
-                        "account_id": self.ctid_trader_account_id,
-                        "error_code": exc.error_code,
-                        "error": exc.description,
-                    }
-                },
-            )
-            return False
+        # Capture the refresh token we started with so a concurrent refresh that
+        # already persisted new tokens (and mutated self) is still detected.
+        original_refresh_token = self.refresh_token
+        async with _REFRESH_TOKEN_LOCK:
+            # Another instance may have already refreshed and persisted tokens
+            # to the shared accounts env file. Adopt those instead of issuing a
+            # redundant network refresh.
+            shared = _read_env_pairs(self.accounts_env_path)
+            shared_refresh = shared.get("CTRADER_REFRESH_TOKEN", "").strip()
+            if shared_refresh and shared_refresh != original_refresh_token:
+                shared_access = shared.get("CTRADER_ACCESS_TOKEN", "").strip()
+                self.access_token = shared_access
+                self.refresh_token = shared_refresh
+                logger.info(
+                    "cTrader access token adopted from concurrent refresh",
+                    extra={"data": {"account_id": self.ctid_trader_account_id}},
+                )
+                return True
+            refresh_req = self._ProtoOARefreshTokenReq()
+            refresh_req.refreshToken = self.refresh_token
+            try:
+                refresh_res = await self._send_request(refresh_req, timeout_seconds=15)
+            except CTraderApiError as exc:
+                # Use non-refresh version to avoid infinite recursion
+                logger.warning(
+                    "cTrader access token refresh failed",
+                    extra={
+                        "data": {
+                            "account_id": self.ctid_trader_account_id,
+                            "error_code": exc.error_code,
+                            "error": exc.description,
+                        }
+                    },
+                )
+                return False
         if not isinstance(refresh_res, self._ProtoOARefreshTokenRes):
             logger.warning(
                 "Unexpected cTrader refresh response",
@@ -380,13 +429,16 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 extra={"data": {"account_id": self.ctid_trader_account_id}},
             )
             return False
-        self.access_token = access_token
-        self.refresh_token = refresh_token
-        os.environ["CTRADER_ACCESS_TOKEN"] = access_token
-        os.environ["CTRADER_REFRESH_TOKEN"] = refresh_token
+        # Persist before adopting into process/environment state so a failed
+        # write never leaves in-memory tokens inconsistent with the on-disk pair.
         try:
-            _write_env_key(self.accounts_env_path, "CTRADER_ACCESS_TOKEN", access_token)
-            _write_env_key(self.accounts_env_path, "CTRADER_REFRESH_TOKEN", refresh_token)
+            _write_env_keys(
+                self.accounts_env_path,
+                {
+                    "CTRADER_ACCESS_TOKEN": access_token,
+                    "CTRADER_REFRESH_TOKEN": refresh_token,
+                },
+            )
         except Exception as exc:
             logger.warning(
                 "cTrader tokens refreshed but could not be persisted",
@@ -398,6 +450,11 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                     }
                 },
             )
+            return False
+        self.access_token = access_token
+        self.refresh_token = refresh_token
+        os.environ["CTRADER_ACCESS_TOKEN"] = access_token
+        os.environ["CTRADER_REFRESH_TOKEN"] = refresh_token
         self._terminal_auth_failure_reason = ""
         self._terminal_auth_failure_code = ""
         logger.info(
@@ -556,7 +613,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             error_code = _normalize_error_code(exc.error_code)
             error_text = str(exc)
             if _is_terminal_auth_error(error_code, error_text) and await self._refresh_access_token():
-                # Token was refreshed successfully; retry once with new token
+                # Token was refreshed successfully; re-authorize the account
+                # with the new token before retrying the business request.
+                await self._send_account_auth_request(timeout_seconds=timeout_seconds)
                 return await self._send_request_with_refresh_retry(
                     request, timeout_seconds=timeout_seconds, _depth=_depth + 1
                 )

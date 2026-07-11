@@ -6,6 +6,8 @@ from typing import Any
 
 import pandas as pd
 
+from shared.constants import normalize_timeframe
+
 _SYMBOL_KEYS = ("symbol", "ticker", "instrument")
 _ACTION_KEYS = ("action", "side", "signal_type", "signal")
 _PRICE_KEYS = ("entry_price", "signal_price", "price")
@@ -106,12 +108,12 @@ def _parse_timestamp(
         parsed = pd.to_datetime(date_value, errors="coerce")
 
     if pd.isna(parsed):
-        return None, "1d"
+        return None, normalize_timeframe("1d")
 
     ts = pd.Timestamp(parsed)
     if ts.tzinfo is None:
         ts = ts.tz_localize(source_timezone)
-    timeframe = "1m" if _is_intraday_timestamp(ts) or bool(time_value) else "1d"
+    timeframe = normalize_timeframe("1m") if _is_intraday_timestamp(ts) or bool(time_value) else normalize_timeframe("1d")
     ts_utc = ts.tz_convert("UTC")
     return ts_utc.to_pydatetime(), timeframe
 
@@ -126,7 +128,7 @@ def load_signals_from_csv(filepath: str) -> list[dict[str, Any]]:
         raise FileNotFoundError(f"Signal CSV not found: {path}")
 
     separator = _detect_separator(path)
-    frame = pd.read_csv(path, sep=separator, dtype=str, encoding="utf-8-sig")
+    frame = pd.read_csv(path, sep=separator, dtype=str, encoding="utf-8-sig", keep_default_na=False, na_filter=False)
     if frame.empty:
         return []
 
