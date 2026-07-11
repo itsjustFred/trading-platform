@@ -8,7 +8,7 @@
 
 ## Fortschritt
 
-### Batch 1 (150 Dateien) — `findings: 51 → 4 → 3 → ?`
+### Batch 1 (150 Dateien) — `findings: 51 → 4 → 3 → 2 → 0 ✓` (CLEAN)
 | Schritt | Findings | Commit | Notes |
 |--------|----------|--------|-------|
 | Initial-Review | 51 (1 critical, 29 major, 21 minor) | — | |
@@ -16,7 +16,7 @@
 | Re-Run 1 | 4 | `fc23d21` | `resample.py` output_dir, `Modal.tsx` focus-ref, `OptimizationsPage.tsx` a11y/String |
 | Re-Run 2 | 3 | `8cb7be0` | alle in `data_tools/dolthub_manager.py`: `DOLT_BIN` statt hardcoded `dolt`, returncode-Check, `normalize_timeframe('1d')` |
 | Re-Run 3 | 2 | `0065879` | daemon.py ×2 (signal_config None-Guard, normalize_timeframe) gefixt |
-| Re-Run 4 | pending | — | Temp-Repo neu gebaut (HEAD 0065879); CR-Review läuft (Rate-Limit-Retry) |
+| Re-Run 4 | **0 ✓** | — | CLEAN — `findings:0` (review_completed, COMPLETED_OK) |
 
 ### Batch 2 (150 Dateien) — `findings: 50 → fix`
 | Schritt | Findings | Commit | Notes |
