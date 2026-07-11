@@ -15,7 +15,8 @@
 | Fix-Runde 1 | — | `ff695ee` | 41 Dateien; u.a. `histdata_dl` 12-Monats-Loop, `alpaca_dl` Client-Pagination |
 | Re-Run 1 | 4 | `fc23d21` | `resample.py` output_dir, `Modal.tsx` focus-ref, `OptimizationsPage.tsx` a11y/String |
 | Re-Run 2 | 3 | `8cb7be0` | alle in `data_tools/dolthub_manager.py`: `DOLT_BIN` statt hardcoded `dolt`, returncode-Check, `normalize_timeframe('1d')` |
-| Re-Run 3 | läuft (proc_0bbdbf08e89c) | — | Attempt 3 *summarizing* — CR-Rate-Limit-Reset erreicht, Review läuft jetzt |
+| Re-Run 3 | 2 | `0065879` | daemon.py ×2 (signal_config None-Guard, normalize_timeframe) gefixt |
+| Re-Run 4 | pending | — | Temp-Repo neu gebaut (HEAD 0065879); CR-Review läuft (Rate-Limit-Retry) |
 
 ### Batch 2 (150 Dateien) — `findings: 50 → fix`
 | Schritt | Findings | Commit | Notes |
