@@ -154,6 +154,12 @@ def test_send_request_with_refresh_retry_retries_once_after_token_refresh() -> N
     adapter._send_request = _fake_send
     adapter._refresh_access_token = _fake_refresh
 
+    async def _fake_account_auth(**_kwargs):
+        # Re-auth after token refresh is an internal step; no-op in this unit test.
+        return object()
+
+    adapter._send_account_auth_request = _fake_account_auth
+
     assert asyncio.run(adapter._send_request_with_refresh_retry(request)) is response
     assert calls == [request, request]
 
