@@ -25,7 +25,8 @@
 | Fix-Runde 1 | — | `4be53d3` | alle 50 gefixt (scripts/runner/risk/shared/scheduler/server_planning/reports) |
 | Test-Align | — | `2d4fe89`, `cbebf74` | Tests an CR-verändertes Verhalten angepasst (walkforward + ctrader) — keine Code-Regressionen |
 | Re-Run 1 | 6 | `bdd53f5` | 1 critical + 3 major + 2 minor gefixt (argparse, run_trial resilience, signal_replay ValueError/progress, position_size, migration doc) |
-| Re-Run 2 | pending | — | CR-Review läuft (Rate-Limit-Retry) |
+| Re-Run 2 | 15 | `12b755c` + pynecore/risk_parity | 14 major + 1 minor gefixt (build_run_id hash, timeout-reject, dedupe, keep_indicators; pynecore: failure-propagation, end-date intraday, notional min, sidecar-deps, all_stats-accum, cross-symbol sizing, equity exit_time; risk_parity: combo-cap, dropna(any), explicit infeasibility, vol-epsilon) |
+| Re-Run 3 | pending | — | CR-Review läuft |
 
 Critical Findings behandelt:
 - `runner/engines/lean_adapter.py` — fehlendes `import os` (CRITICAL)
