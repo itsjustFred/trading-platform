@@ -54,7 +54,7 @@ def size_live_signal(
             symbol=str(signal.symbol),
             entry_price=_to_float(
                 metadata.get("entry_price"),
-                default=float(signal.theoretical_price),
+                default=_to_float(signal.theoretical_price, default=0.0),
             ),
             stop_loss=_to_optional_float(metadata.get("stop_loss")),
             take_profit=_to_optional_float(metadata.get("take_profit")),
@@ -98,7 +98,7 @@ def size_live_signal(
     trade_signal = TradeSignal(
         action=str(signal.action),
         symbol=str(signal.symbol),
-        entry_price=_to_float(metadata.get("entry_price"), default=float(signal.theoretical_price)),
+        entry_price=_to_float(metadata.get("entry_price"), default=_to_float(signal.theoretical_price, default=0.0)),
         stop_loss=_to_optional_float(metadata.get("stop_loss")),
         take_profit=_to_optional_float(metadata.get("take_profit")),
         timeframe=str(metadata.get("timeframe") or "1m"),

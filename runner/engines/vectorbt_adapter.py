@@ -108,10 +108,11 @@ def _process_symbol(
     strategy_path: str,
     resolved_parameters: dict[str, Any],
     data_root: Path,
-) -> tuple[list[Trade], list[str], DrawingList, list[IndicatorSeries]]:
+) -> tuple[list[Trade], list[str], DrawingList, list[IndicatorSeries], int]:
     """Process a single symbol: load data, generate signals, extract trades.
 
-    Returns (trades_with_temp_ids, used_intrabar_timeframes, drawings).
+    Returns (trades_with_temp_ids, used_intrabar_timeframes, drawings,
+    indicator_series, bar_count).
     Runs in its own process when parallelized.
     """
     strategy_mod = _load_strategy_module(strategy_path)
@@ -120,7 +121,7 @@ def _process_symbol(
     )
     if df is None or df.empty:
         logger.warning("No data for %s/%s, skipping", symbol, config.timeframe)
-        return [], [], [], []
+        return [], [], [], [], 0
 
     asset_class = _infer_asset_class_from_path(data_path)
     intrabar_df, intrabar_timeframe = _load_intrabar_ohlcv(
@@ -331,7 +332,7 @@ def _process_symbol(
             trades.append(trade)
             equity += pnl
 
-    return trades, extra_timeframes, drawings, indicator_series
+    return trades, extra_timeframes, drawings, indicator_series, len(df)
 
 
 class VectorbtAdapter(EngineAdapter):
@@ -357,6 +358,7 @@ class VectorbtAdapter(EngineAdapter):
         all_drawings: DrawingList = []
         all_indicators: list[IndicatorSeries] = []
         used_timeframes = [config.timeframe]
+        total_bars = 0
 
         num_symbols = len(config.symbols)
         use_parallel = num_symbols > 1
@@ -377,10 +379,11 @@ class VectorbtAdapter(EngineAdapter):
                 for future in as_completed(futures):
                     sym = futures[future]
                     try:
-                        trades, extra_tfs, drawings, indicator_series = future.result()
+                        trades, extra_tfs, drawings, indicator_series, bar_count = future.result()
                         all_trades.extend(trades)
                         all_drawings.extend(drawings)
                         all_indicators.extend(indicator_series)
+                        total_bars += bar_count
                         for tf in extra_tfs:
                             if tf not in used_timeframes:
                                 used_timeframes.append(tf)
@@ -394,12 +397,13 @@ class VectorbtAdapter(EngineAdapter):
                 ) from symbol_errors[0][1]
         else:
             for symbol in config.symbols:
-                trades, extra_tfs, drawings, indicator_series = _process_symbol(
+                trades, extra_tfs, drawings, indicator_series, bar_count = _process_symbol(
                     symbol, config, strategy_path, resolved_parameters, data_root
                 )
                 all_trades.extend(trades)
                 all_drawings.extend(drawings)
                 all_indicators.extend(indicator_series)
+                total_bars += bar_count
                 for tf in extra_tfs:
                     if tf not in used_timeframes:
                         used_timeframes.append(tf)
@@ -441,7 +445,7 @@ class VectorbtAdapter(EngineAdapter):
             backtest_start=config.start_date,
             backtest_end=config.end_date,
             duration_days=duration_days,
-            total_bars=sum(1 for _ in all_trades),
+            total_bars=total_bars,
             data={
                 "timeframes": used_timeframes,
                 "symbols": config.symbols,

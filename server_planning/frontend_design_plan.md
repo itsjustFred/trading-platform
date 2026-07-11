@@ -1,6 +1,5 @@
 
 
-```markdown
 # Frontend Redesign — Trading Platform Dashboard
 
 > Ersetzt den aktuellen Trade-Viewer (viewer/static/index.html).

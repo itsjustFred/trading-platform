@@ -252,6 +252,11 @@ def run_backtest(
     max_weight = 0.30
 
     # Rebalance on the first trading day of each month after warm-up
+    if len(prices) <= warm_up_days:
+        raise ValueError(
+            f"Downloaded price history has only {len(prices)} rows, which is shorter "
+            f"than warm_up_days={warm_up_days}; cannot determine the warm-up cutoff."
+        )
     rebalance_dates = pd.date_range(start=prices.index[0], end=prices.index[-1], freq="MS")
     rebalance_dates = rebalance_dates[rebalance_dates > prices.index[warm_up_days]]
     rebalance_dates = first_available_trading_dates(prices.index, rebalance_dates)

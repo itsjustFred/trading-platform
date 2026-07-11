@@ -6,4 +6,9 @@ if (-not (Test-Path $python)) {
     Write-Error "Virtual environment Python not found: $python`nCreate it first: python -m venv .venv"
 }
 
-& $python -m uvicorn viewer.main:app --host 0.0.0.0 --port 5556 --no-access-log @args
+Push-Location $root
+try {
+    & $python -m uvicorn viewer.main:app --host 0.0.0.0 --port 5556 --no-access-log @args
+} finally {
+    Pop-Location
+}

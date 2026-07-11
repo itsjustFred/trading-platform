@@ -120,7 +120,7 @@ def main() -> None:
         "--data-dir",
         type=Path,
         default=DATA_DIR,
-        help="Data directory containing backtests.db and backtests/*.trades.json",
+        help="Data directory target (must equal the resolved DATA_DIR; set DATA_DIR/TRADING_DATA_DIR to change it).",
     )
     parser.add_argument(
         "--dry-run",

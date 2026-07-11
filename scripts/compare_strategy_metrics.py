@@ -19,25 +19,25 @@ def main() -> int:
     parser.add_argument(
         "--comparisons-dir",
         type=Path,
-        default=Path("strategy-comparisons"),
+        default=PROJECT_ROOT / "strategy-comparisons",
         help="Directory containing external reference reports.",
     )
     parser.add_argument(
         "--reports-dir",
         type=Path,
-        default=Path("reports"),
+        default=PROJECT_ROOT / "reports",
         help="Directory containing legacy platform report artifacts.",
     )
     parser.add_argument(
         "--platform-data-dir",
         type=Path,
-        default=Path("data/backtests"),
+        default=PROJECT_ROOT / "data/backtests",
         help="Directory containing regenerated platform backtest artifacts.",
     )
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("reports/strategy_metric_comparison_matrix_20260630.json"),
+        default=PROJECT_ROOT / "reports/strategy_metric_comparison_matrix_20260630.json",
         help="Output JSON matrix path.",
     )
     args = parser.parse_args()

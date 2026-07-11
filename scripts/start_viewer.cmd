@@ -9,4 +9,6 @@ if not exist "%PY%" (
   exit /b 1
 )
 
+pushd "%ROOT%"
 "%PY%" -m uvicorn viewer.main:app --host 0.0.0.0 --port 5556 --no-access-log %*
+popd

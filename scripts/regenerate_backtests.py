@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import os
 import re
 from pathlib import Path
@@ -219,6 +220,20 @@ def _purge_json_backtests(backtests_dir: Path) -> int:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Regenerate all backtests (destructive purge of existing data)."
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm the destructive purge of existing SQLite and JSON backtests.",
+    )
+    args = parser.parse_args()
+    if not args.yes and os.environ.get("REGENERATE_BACKTESTS_CONFIRM") != "yes":
+        raise SystemExit(
+            "Refusing to purge backtests without confirmation. "
+            "Pass --yes or set REGENERATE_BACKTESTS_CONFIRM=yes."
+        )
     print(f"Regenerating backtests with DATA_DIR={DATA_DIR}")
     init_db()
     _purge_sqlite_backtests()

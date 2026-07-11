@@ -31,11 +31,16 @@ def _normalize_timeframe(stem: str, symbol: str) -> str:
     return cleaned
 
 
-def _normalize_frame(df: pd.DataFrame) -> pd.DataFrame:
+def _normalize_frame(df: pd.DataFrame, fragment_path: Path | None = None) -> pd.DataFrame:
     normalized = df.copy()
     if "timestamp" in normalized.columns:
+        before = len(normalized)
         normalized["timestamp"] = pd.to_datetime(normalized["timestamp"], utc=True, errors="coerce")
         normalized = normalized.dropna(subset=["timestamp"])
+        dropped = before - len(normalized)
+        if dropped:
+            label = str(fragment_path) if fragment_path is not None else "<unknown>"
+            print(f"Dropped {dropped} row(s) with unparsable timestamps from fragment {label}")
     return normalized
 
 
@@ -43,6 +48,12 @@ def _canonical_target(parquet_path: Path) -> Path:
     symbol = parquet_path.parent.name
     timeframe = _normalize_timeframe(parquet_path.stem, symbol)
     return parquet_path.parent / f"{timeframe}.parquet"
+
+
+def _fragment_sort_key(path):
+    """Natural-numeric sort key so 'part2' precedes 'part10'."""
+    text = str(path)
+    return [int(tok) if tok.isdigit() else tok for tok in re.split(r"(\d+)", text)]
 
 
 def consolidate(root: Path) -> tuple[int, int]:
@@ -55,14 +66,14 @@ def consolidate(root: Path) -> tuple[int, int]:
     deleted_fragments = 0
 
     for target_path, members in sorted(groups.items(), key=lambda item: str(item[0])):
-        unique_members = sorted(set(members), key=lambda path: str(path))
+        unique_members = sorted(set(members), key=_fragment_sort_key)
         if len(unique_members) == 1 and unique_members[0] == target_path:
             continue
 
         frames = []
         for member in unique_members:
             frame = pd.read_parquet(member)
-            frames.append(_normalize_frame(frame))
+            frames.append(_normalize_frame(frame, member))
 
         combined = pd.concat(frames, ignore_index=True, sort=False)
         if "timestamp" in combined.columns:

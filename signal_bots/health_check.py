@@ -30,7 +30,8 @@ def check_signal_bots() -> dict[str, Any]:
             "errors": [],
         }
 
-        if name not in SIGNAL_PROCESSORS:
+        factory = SIGNAL_PROCESSORS.get(name)
+        if factory is None or not callable(factory):
             result["status"] = "error"
             result["errors"].append(f"Processor factory not found: {name}")
 

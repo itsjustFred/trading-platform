@@ -7,6 +7,8 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -145,13 +147,18 @@ def _summary_from_folds(folds: list[dict[str, Any]]) -> dict[str, Any]:
         for value in (_float_or_none(fold.get("oos_max_drawdown")) for fold in folds)
         if value is not None
     ]
-    profitable = [value for value in oos_sharpes if value > 0]
+    oos_returns = [
+        value
+        for value in (_float_or_none(fold.get("oos_return")) for fold in folds)
+        if value is not None
+    ]
+    profitable = [value for value in oos_returns if value > 0]
     return {
         "fold_count": len(folds),
         "avg_oos_sharpe": round(sum(oos_sharpes) / len(oos_sharpes), 6) if oos_sharpes else None,
         "worst_oos_drawdown": round(max(drawdowns), 6) if drawdowns else None,
         "n_profitable_folds": len(profitable),
-        "profitable_fold_pct": round((len(profitable) / len(oos_sharpes)) * 100, 4) if oos_sharpes else 0.0,
+        "profitable_fold_pct": round((len(profitable) / len(oos_returns)) * 100, 4) if oos_returns else 0.0,
     }
 
 
@@ -159,9 +166,15 @@ def _write_payload(payload: dict[str, Any], output_dir: str | Path | None = None
     target_dir = Path(output_dir) if output_dir else WALKFORWARD_OUTPUT_DIR
     target_dir.mkdir(parents=True, exist_ok=True)
     now = datetime.now(timezone.utc)
-    out_path = target_dir / f"wf_{now.strftime('%Y%m%d_%H%M%S')}.json"
+    # Include microseconds plus a random suffix so concurrent runs cannot collide.
+    unique_suffix = uuid.uuid4().hex[:8]
+    out_path = target_dir / f"wf_{now.strftime('%Y%m%d_%H%M%S_%f')}_{unique_suffix}.json"
     payload["output_path"] = str(out_path)
-    out_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    data = json.dumps(payload, indent=2, ensure_ascii=False)
+    # Exclusive create (O_EXCL) so an existing result file is never overwritten.
+    fd = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(data)
     return out_path
 
 
@@ -170,7 +183,6 @@ def _run_portfolio_walkforward(
     backtest_ids: list[str],
     train_months: int,
     test_months: int,
-    step_months: int,
     n_trials: int,
     output_dir: str | Path | None,
 ) -> dict[str, Any]:
@@ -192,7 +204,6 @@ def _run_portfolio_walkforward(
         "config": {
             "train_months": train_months,
             "test_months": test_months,
-            "step_months": step_months,
             "n_trials": n_trials,
         },
         "folds": [fold],
@@ -236,7 +247,6 @@ def run_walkforward(
             backtest_ids=backtest_ids,
             train_months=train_months,
             test_months=test_months,
-            step_months=step_months,
             n_trials=n_trials,
             output_dir=output_dir,
         )
@@ -303,6 +313,7 @@ def run_walkforward(
                 **window,
                 "is_sharpe": _metric(train_stats, "sharpe_ratio", "sharpe"),
                 "oos_sharpe": _metric(test_stats, "sharpe_ratio", "sharpe"),
+                "oos_return": _metric(test_stats, "total_return", "total_pnl"),
                 "oos_max_drawdown": _metric(test_stats, "max_drawdown_pct"),
                 "is_stats": train_stats,
                 "oos_stats": test_stats,
@@ -342,6 +353,7 @@ if __name__ == "__main__":
     parser.add_argument("--backtest-ids", nargs="*", default=[])
     parser.add_argument("--symbols", default="")
     parser.add_argument("--timeframe", default="1d")
+    parser.add_argument("--engine", default="vectorbt")
     parser.add_argument("--start", default="")
     parser.add_argument("--end", default="")
     parser.add_argument("--train-months", type=int, default=12)
@@ -353,6 +365,7 @@ if __name__ == "__main__":
     result = run_walkforward(
         strategy=args.strategy,
         backtest_ids=args.backtest_ids,
+        engine_name=args.engine,
         symbols=[item.strip() for item in args.symbols.split(",") if item.strip()],
         timeframe=args.timeframe,
         start=args.start,

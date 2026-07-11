@@ -29,20 +29,35 @@ Kopiert alle Dateien mit Verzeichnisstruktur. rsync statt cp wegen:
 ### 3. Checksummen verifizieren
 
 ```bash
-diff <(find ~/data/ -type f | sort | xargs md5sum | awk '{print $1}') \
-     <(find /mnt/block-volume-data/ -type f | sort | xargs md5sum | awk '{print $1}')
+rsync -aHAXn --delete --checksum ~/data/ /mnt/block-volume-data/
 ```
 
-Alle Checksummen identisch → Kopie ist korrekt.
+`rsync` vergleicht relative Dateinamen und Inhalte per Checksumme, ohne unsicheres `xargs`-Parsing. Der Befehl läuft im Dry-Run (`-n`); er listet nur Unterschiede. Die Verifikation ist erfolgreich, wenn `rsync` **keine** Differenzen ausgibt (kein Output, Exit-Status 0).
 
 ### 4. Altes Verzeichnis durch Symlink ersetzen
 
 ```bash
-rm -rf ~/data
+# 1. Sicherstellen, dass das Ziel gemountet ist - sonst abbrechen
+if ! mountpoint -q /mnt/block-volume-data; then
+  echo "FEHLER: /mnt/block-volume-data ist kein aktiver Mount. Abbruch." >&2
+  exit 1
+fi
+
+# 2. Originalverzeichnis sichern statt sofort loeschen
+if [ -e ~/data ] && [ ! -L ~/data ]; then
+  mv ~/data ~/data.rollback
+fi
+
+# 3. Symlink setzen
 ln -s /mnt/block-volume-data ~/data
 ```
 
 Ergebnis: `~/data/` → `/mnt/block-volume-data/`
+
+> **Rollback:** Das Original liegt unter `~/data.rollback`. Erst nach erfolgreicher Post-Reboot-Verifikation (Schritt 5) darf dieses Verzeichnis gelöscht werden:
+```bash
+rm -rf ~/data.rollback
+```
 
 Alle bestehenden Pfade (Runner CLI, Viewer, catalog_builder, etc.) funktionieren weiterhin, da sie `~/data/` verwenden.
 

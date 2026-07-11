@@ -21,15 +21,17 @@ class NIMProvider:
         timeout_seconds: float = 600.0,
         client: Any | None = None,
     ) -> None:
-        resolved_api_key = (api_key or os.getenv("NVIDIA_API_KEY") or "").strip()
-        if not resolved_api_key:
-            raise RuntimeError("NVIDIA_API_KEY environment variable is not set.")
-
-        self._client = client or OpenAI(
-            base_url=base_url,
-            api_key=resolved_api_key,
-            timeout=float(timeout_seconds),
-        )
+        if client is not None:
+            self._client = client
+        else:
+            resolved_api_key = (api_key or os.getenv("NVIDIA_API_KEY") or "").strip()
+            if not resolved_api_key:
+                raise RuntimeError("NVIDIA_API_KEY environment variable is not set.")
+            self._client = OpenAI(
+                base_url=base_url,
+                api_key=resolved_api_key,
+                timeout=float(timeout_seconds),
+            )
 
     def generate(
         self,
@@ -107,5 +109,7 @@ def _apply_metadata(
         metadata["duration_seconds"] = round(float(duration_seconds), 3)
     if error:
         metadata["error"] = error
+    else:
+        metadata.pop("error", None)
     if temperature is not None:
         metadata["temperature"] = float(temperature)

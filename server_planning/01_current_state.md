@@ -95,7 +95,7 @@ Diese werden später katalogisiert wenn sie tatsächlich integriert werden.
 | `config.json` | `~/Desktop/custom_lean_integration/config.json` | LEAN local-id |
 | `backtest_config.json` | `~/Desktop/custom_lean_integration/backtest_config.json` | Backtest-Parameter (Zeitraum, Cash, Strategie-Config) |
 | `strategy_comparison.json` | `~/Desktop/custom_lean_integration/strategy_comparison.json` | Vergleich der Equity Curves verschiedener Strategien |
-| `.gitconfig` | `~/.gitconfig` | Git User: itsjustFred, Email: justfred.business@gmail.com |
+| `.gitconfig` | `~/.gitconfig` | Git User: itsjustFred, Email: <redacted> |
 
 ### 3.3 Genutzte Services (Zusammenfassung)
 

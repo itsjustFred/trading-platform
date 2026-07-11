@@ -528,9 +528,11 @@ def _load_ohlcv(
     if "timestamp" in df.columns:
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
         if start_date:
-            df = df[df["timestamp"] >= start_date]
+            start_ts = pd.to_datetime(start_date, utc=True)
+            df = df[df["timestamp"] >= start_ts]
         if end_date:
-            df = df[df["timestamp"] <= end_date]
+            end_ts = pd.to_datetime(end_date, utc=True)
+            df = df[df["timestamp"] <= end_ts]
 
     return df.reset_index(drop=True)
 
@@ -624,15 +626,11 @@ def _apply_risk_sizing(trades: list[Trade], config: BacktestConfig, asset_class:
         risk_amount = equity * config.risk_per_trade_pct
         base_qty = risk_amount / stop_distance
         required_notional = base_qty * trade.entry_price
-        cap_notional = equity * max_position_pct
         leverage_notional_limit = equity * max_leverage
 
-        if required_notional <= cap_notional:
-            final_notional = required_notional
-        elif required_notional <= leverage_notional_limit:
-            final_notional = required_notional
-        else:
-            final_notional = leverage_notional_limit
+        # Hard-cap the notional at the leverage limit so max_position_pct /
+        # max_leverage actually constrain the position size.
+        final_notional = min(required_notional, leverage_notional_limit)
 
         qty = round(final_notional / trade.entry_price, 4)
         exit_price = trade.exits[-1].price

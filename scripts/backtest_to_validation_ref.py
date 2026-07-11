@@ -40,11 +40,24 @@ def main() -> None:
     args = parser.parse_args()
 
     res = _load_backtest_result(args.input)
+    data = res.meta.data
+    symbols = data.get("symbols")
+    timeframes = data.get("timeframes")
+    if not symbols:
+        raise ValueError(
+            "BacktestResult metadata 'data' is missing 'symbols' or it is empty; "
+            "cannot convert to ValidationReference."
+        )
+    if not timeframes:
+        raise ValueError(
+            "BacktestResult metadata 'data' is missing 'timeframes' or it is empty; "
+            "cannot convert to ValidationReference."
+        )
     ref = ValidationReference(
         strategy_name=res.meta.strategies[0] if res.meta.strategies else "unknown",
         source_framework=res.meta.engine,
-        symbol=res.meta.data["symbols"][0],
-        timeframe=res.meta.data["timeframes"][0],
+        symbol=symbols[0],
+        timeframe=timeframes[0],
         settings=res.meta.parameters,
         trades=res.trades,
         stats=res.stats,

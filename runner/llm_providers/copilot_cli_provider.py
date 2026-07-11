@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 import time
@@ -36,7 +37,12 @@ class CopilotCLIProvider:
         self._executable = (
             executable or os.getenv("COPILOT_CLI_EXECUTABLE") or "copilot"
         ).strip() or "copilot"
-        self._timeout_seconds = float(timeout_seconds)
+        timeout_value = float(timeout_seconds)
+        if not math.isfinite(timeout_value) or timeout_value <= 0:
+            raise ValueError(
+                "timeout_seconds must be a finite value greater than zero."
+            )
+        self._timeout_seconds = timeout_value
         self._output_format = str(output_format or "json").strip().lower() or "json"
 
     def generate(
@@ -188,5 +194,9 @@ def _apply_metadata(
         metadata["duration_seconds"] = round(float(duration_seconds), 3)
     if error:
         metadata["error"] = error
+    else:
+        metadata.pop("error", None)
     if temperature is not None:
         metadata["temperature"] = float(temperature)
+    else:
+        metadata.pop("temperature", None)

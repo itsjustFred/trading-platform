@@ -69,6 +69,9 @@ class ServiceScheduler:
             cron_expr = str(config.get("cron") or "").strip()
             job_type = str(config.get("job_type") or "").strip().lower()
             if not cron_expr or not job_type:
+                if self._scheduler.get_job(service_id) is not None:
+                    self._scheduler.remove_job(service_id)
+                self._job_signatures.pop(service_id, None)
                 await asyncio.to_thread(update_service_status, service_id, ServiceStatus.FAILED)
                 logger.warning(
                     "Scheduled service config missing cron/job_type",
@@ -77,6 +80,9 @@ class ServiceScheduler:
                 continue
 
             if job_type not in _SCHEDULED_JOB_HANDLERS:
+                if self._scheduler.get_job(service_id) is not None:
+                    self._scheduler.remove_job(service_id)
+                self._job_signatures.pop(service_id, None)
                 await asyncio.to_thread(update_service_status, service_id, ServiceStatus.FAILED)
                 logger.warning(
                     "Unknown scheduled service job_type",
@@ -100,6 +106,9 @@ class ServiceScheduler:
             try:
                 trigger = CronTrigger.from_crontab(cron_expr, timezone=timezone.utc)
             except ValueError:
+                if self._scheduler.get_job(service_id) is not None:
+                    self._scheduler.remove_job(service_id)
+                self._job_signatures.pop(service_id, None)
                 await asyncio.to_thread(update_service_status, service_id, ServiceStatus.FAILED)
                 logger.warning(
                     "Invalid cron for scheduled service",

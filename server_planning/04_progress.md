@@ -59,7 +59,7 @@
 | `runner/converters/stockkit_converter.py` | Stockkit CSV → Universal Format |
 | `viewer/app.py` | Flask Backend (List, Load, Stats, OHLCV, Compare) |
 | `viewer/static/index.html` | Frontend (lightweight-charts, Equity Curve, Trade Table) |
-| `data_tools/migrate_csv.py` | CSV → Parquet Migration (98 Dateien) |
+| `data_tools/migrate_csv.py` | CSV → Parquet Migration (98 CSV-Quelldateien → 97 Parquet-Datasets) |
 | `data_tools/catalog_builder.py` | Data Catalog Scanner → catalog.json |
 | `strategies/example_sma.py` | SMA Crossover Beispielstrategie |
 | `tests/test_models.py` | 12 Tests für Models |

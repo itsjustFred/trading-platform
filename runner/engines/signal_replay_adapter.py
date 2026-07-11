@@ -84,7 +84,10 @@ class ReplaySignal:
 
         timestamp = _to_timestamp(payload.get("timestamp"))
         action = _coerce_action(payload.get("action"))
-        entry_price = float(payload.get("entry_price"))
+        raw_entry_price = payload.get("entry_price")
+        if raw_entry_price is None or raw_entry_price == "":
+            raise ValueError("entry_price is required")
+        entry_price = float(raw_entry_price)
         if entry_price <= 0:
             raise ValueError("entry_price must be > 0")
 

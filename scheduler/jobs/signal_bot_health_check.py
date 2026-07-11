@@ -44,7 +44,7 @@ async def run(*, task_id: str, service_id: str, service_name: str) -> None:
         errors = []
         for r in bot_results:
             if r.get("errors"):
-                errors.extend([f"{r['name']}: {e}" for e in r["errors"]])
+                errors.extend([f"{r.get('name', '<unknown>')}: {e}" for e in r["errors"]])
 
         if overall_status == "ok":
             status = "completed"

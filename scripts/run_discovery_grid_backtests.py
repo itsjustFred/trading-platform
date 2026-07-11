@@ -19,7 +19,7 @@ from typing import Any
 import pandas as pd
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DISCOVERY_PATH = Path("/mnt/block-volume-data/discovered_strategies/discovery_20260618_0752.json")
+DISCOVERY_PATH = Path(os.environ.get("DISCOVERY_PATH", "/mnt/block-volume-data/discovered_strategies/discovery_20260618_0752.json"))
 DATA_DIR = PROJECT_ROOT / "data"
 BACKTEST_DIR = PROJECT_ROOT / "data" / "backtests"
 LOG_DIR = PROJECT_ROOT / "logs"
@@ -31,8 +31,8 @@ STRATEGY_PATHS = {
 }
 
 
-def load_trials() -> list[dict[str, Any]]:
-    with DISCOVERY_PATH.open("r", encoding="utf-8") as f:
+def load_trials(discovery_path: Path = DISCOVERY_PATH) -> list[dict[str, Any]]:
+    with discovery_path.open("r", encoding="utf-8") as f:
         return json.load(f)
 
 
@@ -147,19 +147,35 @@ def run_trial(trial: dict[str, Any]) -> dict[str, Any]:
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
 
-    with log_path.open("w", encoding="utf-8") as log:
-        proc = subprocess.run(
-            cmd,
-            cwd=PROJECT_ROOT,
-            env=env,
-            text=True,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            timeout=900,
+    # Remove any stale output from a previous run so we never parse old results.
+    if output.exists():
+        output.unlink()
+
+    try:
+        with log_path.open("w", encoding="utf-8") as log:
+            proc = subprocess.run(
+                cmd,
+                cwd=PROJECT_ROOT,
+                env=env,
+                text=True,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                timeout=900,
+            )
+    except subprocess.TimeoutExpired:
+        result.update(
+            {
+                "status": "failed",
+                "returncode": None,
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+                "reason": "timed out after 900s",
+                "cmd": " ".join(cmd),
+            }
         )
+        return result
 
     stats = {}
-    if output.exists():
+    if proc.returncode == 0 and output.exists():
         try:
             with output.open("r", encoding="utf-8") as f:
                 payload = json.load(f)
@@ -171,6 +187,8 @@ def run_trial(trial: dict[str, Any]) -> dict[str, Any]:
             }
         except Exception as exc:
             result["parse_error"] = str(exc)
+    elif proc.returncode != 0:
+        result["reason"] = result.get("reason") or "subprocess failed"
 
     result.update(
         {
@@ -185,16 +203,28 @@ def run_trial(trial: dict[str, Any]) -> dict[str, Any]:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Run discovery grid trials as real vectorbt backtests."
+    )
+    parser.add_argument(
+        "--discovery-path",
+        type=Path,
+        default=DISCOVERY_PATH,
+        help="Path to the discovery JSON file describing the trials to run.",
+    )
+    args = parser.parse_args()
+
     BACKTEST_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    trials = load_trials()
+    trials = load_trials(args.discovery_path)
+    summary_started = datetime.now(timezone.utc).isoformat()
     results: list[dict[str, Any]] = []
     for trial in trials:
         result = run_trial(trial)
         results.append(result)
         print(json.dumps(result, ensure_ascii=False), flush=True)
     summary = {
-        "started_at": datetime.now(timezone.utc).isoformat(),
+        "started_at": summary_started,
         "finished_at": datetime.now(timezone.utc).isoformat(),
         "requested": len(trials),
         "ok": sum(1 for r in results if r["status"] == "ok"),

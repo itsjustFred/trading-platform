@@ -13,6 +13,11 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 SERVICE_USER="${SUDO_USER:-${USER:-ubuntu}}"
+if [[ "${SERVICE_USER}" == "root" ]]; then
+  echo "Error: refusing to configure services to run as root." >&2
+  echo "Run via sudo as a non-root user (so SUDO_USER is set) or export SERVICE_USER to a dedicated unprivileged account." >&2
+  exit 1
+fi
 
 if [[ ! -d "${PROJECT_ROOT}/frontend" ]]; then
   echo "Error: frontend directory not found at ${PROJECT_ROOT}/frontend" >&2

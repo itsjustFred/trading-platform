@@ -12,8 +12,8 @@
     {
       "case_id": "intraday_volatility_breakout_sp500_m1",
       "reference_framework": "mt5_xlsx",
-      "reference_path": "/home/ubuntu/Desktop/trading-platform/strategy-comparisons/intraday_volatility_breakout/SP500_M1.xlsx",
-      "platform_path": "/home/ubuntu/Desktop/trading-platform/data/backtests/intraday_volatility_breakout_sp500_m1.json",
+      "reference_path": "strategy-comparisons/intraday_volatility_breakout/SP500_M1.xlsx",
+      "platform_path": "data/backtests/intraday_volatility_breakout_sp500_m1.json",
       "missing_artifacts": [],
       "reference": {
         "trade_count": 512.0,
@@ -35,7 +35,7 @@
           "reference": 512.0,
           "platform": 576.0,
           "absolute_delta": 64.0,
-          "relative_delta": 0.1111111111111111,
+          "relative_delta": 0.125,
           "note": ""
         },
         {
@@ -51,7 +51,7 @@
           "reference": 39255.92,
           "platform": 43239.28,
           "absolute_delta": 3983.3600000000006,
-          "relative_delta": 0.09212364313189306,
+          "relative_delta": 0.10147157422370946,
           "note": ""
         },
         {
@@ -59,7 +59,7 @@
           "reference": 0.03985281380821437,
           "platform": 0.043753,
           "absolute_delta": 0.003900186191785629,
-          "relative_delta": 0.08914100042935637,
+          "relative_delta": 0.0978647633402922,
           "note": ""
         },
         {
@@ -79,8 +79,8 @@
     {
       "case_id": "intraday_volatility_breakout_eurusd_h1",
       "reference_framework": "mt5_xlsx",
-      "reference_path": "/home/ubuntu/Desktop/trading-platform/strategy-comparisons/intraday_volatility_breakout/EURUSD_H1.xlsx",
-      "platform_path": "/home/ubuntu/Desktop/trading-platform/data/backtests/intraday_volatility_breakout_eurusd_h1.json",
+      "reference_path": "strategy-comparisons/intraday_volatility_breakout/EURUSD_H1.xlsx",
+      "platform_path": "data/backtests/intraday_volatility_breakout_eurusd_h1.json",
       "missing_artifacts": [],
       "reference": {
         "trade_count": 492.0,
@@ -102,7 +102,7 @@
           "reference": 492.0,
           "platform": 496.0,
           "absolute_delta": 4.0,
-          "relative_delta": 0.008064516129032258,
+          "relative_delta": 0.008130081300813009,
           "note": ""
         },
         {
@@ -118,7 +118,7 @@
           "reference": 21868.81,
           "platform": 28130.74,
           "absolute_delta": 6261.93,
-          "relative_delta": 0.2226009696154456,
+          "relative_delta": 0.2863406833750899,
           "note": ""
         },
         {
@@ -126,7 +126,7 @@
           "reference": 0.023614509760820024,
           "platform": 0.030148,
           "absolute_delta": 0.006533490239179977,
-          "relative_delta": 0.21671388613440284,
+          "relative_delta": 0.2766727027304207,
           "note": ""
         },
         {
@@ -146,8 +146,8 @@
     {
       "case_id": "intraday_volatility_breakout_nas100_m15",
       "reference_framework": "mt5_xlsx",
-      "reference_path": "/home/ubuntu/Desktop/trading-platform/strategy-comparisons/intraday_volatility_breakout/NAS100_M15.xlsx",
-      "platform_path": "/home/ubuntu/Desktop/trading-platform/data/backtests/intraday_volatility_breakout_nas100_m15.json",
+      "reference_path": "strategy-comparisons/intraday_volatility_breakout/NAS100_M15.xlsx",
+      "platform_path": "data/backtests/intraday_volatility_breakout_nas100_m15.json",
       "missing_artifacts": [],
       "reference": {
         "trade_count": 597.0,
@@ -213,8 +213,8 @@
     {
       "case_id": "risk_parity_quantconnect",
       "reference_framework": "lean",
-      "reference_path": "/home/ubuntu/Desktop/trading-platform/strategy-comparisons/risk_parity/risk_parity_reference.json",
-      "platform_path": "/home/ubuntu/Desktop/trading-platform/data/backtests/risk_parity_quantconnect_reimplementation.json",
+      "reference_path": "strategy-comparisons/risk_parity/risk_parity_reference.json",
+      "platform_path": "data/backtests/risk_parity_quantconnect_reimplementation.json",
       "missing_artifacts": [],
       "reference": {
         "trade_count": 240.0,
@@ -236,7 +236,7 @@
           "reference": 240.0,
           "platform": 241.0,
           "absolute_delta": 1.0,
-          "relative_delta": 0.004149377593360996,
+          "relative_delta": 0.004166666666666667,
           "note": ""
         },
         {
@@ -252,7 +252,7 @@
           "reference": 126183.49,
           "platform": 133658.14,
           "absolute_delta": 7474.650000000009,
-          "relative_delta": 0.055923642211391,
+          "relative_delta": 0.05923635493042718,
           "note": ""
         },
         {
@@ -277,5 +277,6 @@
         "Risk Parity implementations may differ in universe, rebalance timing, covariance estimator and R_f convention."
       ]
     }
-  ]
+  ],
+  "relative_delta_note": "relative_delta is computed consistently for every metric as (platform - reference) / reference, expressing platform deviation from the reference benchmark with a single documented denominator."
 }

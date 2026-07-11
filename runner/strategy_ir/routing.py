@@ -24,7 +24,10 @@ def _normalize_rollout_mode(rollout_mode: str | None) -> str:
         return "ir-only"
     if normalized in IR_ROLLOUT_MODES:
         return normalized
-    return IR_ROLLOUT_DEFAULT
+    raise ValueError(
+        f"Unsupported IR rollout mode: {rollout_mode!r}. "
+        f"Expected one of {sorted(IR_ROLLOUT_MODES)} or a recognized alias."
+    )
 
 
 @dataclass(frozen=True)

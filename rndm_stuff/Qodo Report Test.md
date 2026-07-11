@@ -31,7 +31,7 @@ Environment & commands I ran
   - risk/engine.py
   - shared/database.py (reviewed earlier in the session)
   - viewer/main.py (reviewed earlier in session)
-- Note: I did not modify repository files.
+- Note: I did not make any source-code modifications to the repository; the only artifacts generated were screenshots saved under temp/.
 
 Phase 1 — Unit tests (logic layer)
 - Command executed:
@@ -89,7 +89,7 @@ Phase 4 — Quick static review and focused file checks
   - risk/engine.py — reviewed RiskEngine implementation; the code includes sensible numeric guards (balance > 0, pip > 0), fallback stop-loss logic, trailing stops and risk sizing; tests cover it.
   - shared/database.py — earlier PR diff review had changes to preview extraction and SQL; I flagged possible issues (timestamp falsiness, ordering semantics) in a prior audit and retained that advice (still applicable).
   - viewer/main.py — contribution aggregation and metric_weight handling previously flagged for small-denominator stability — still recommended to guard before dividing by metric_weight.
-- Observations from static review (no code edits performed):
+- Observations from static review (no source-code modifications were made; screenshots were generated under temp/):
   - There are many Date.parse usages across frontend; many are guarded, but some use `Date.parse(x) || 0` pattern which can hide malformed dates by coercing to 0.
   - Some navigator.language usages are not consistently guarded (use `globalThis?.navigator` helper).
   - getBacktestsAll default change in PR set include_equity_preview to true; that increases payload sizes unless opt-in.
@@ -113,7 +113,7 @@ Findings & issues (summary)
      - Suggested action: adjust numeric checks to use Number.isFinite-like logic and guard denominators.
   4) Performance / UX: getBacktestsAll default now includes equity previews (payload heavier).
      - Suggested action: consider making it opt-in.
-- No automatic code changes were performed by me; I only executed tests and checks and pointed out issues for manual or PR changes.
+- No source-code modifications were performed by me; I only executed tests and checks (and generated screenshots under temp/) and pointed out issues for manual or PR changes.
 
 Artifact index (screenshots)
 - All screenshots saved to repository temp/ directory (already created). Filenames & sizes:
@@ -167,7 +167,7 @@ Actionable remediation plan (short)
 
 Limitations / Out of scope
 - I did not:
-  - Change any code or make automated fixes (per your instruction to confirm code changes first).
+  - Make any source-code modifications or automated fixes (per your instruction to confirm code changes first).
   - Run Playwright with a full, logged-in user flow or interactions requiring authentication, nor did I interact with external broker or discord systems (those need external credentials).
   - Validate chart correctness (visual regression), AG Grid content correctness beyond presence of keywords; visual verification requires opening PNGs locally.
 - External services not validated here:

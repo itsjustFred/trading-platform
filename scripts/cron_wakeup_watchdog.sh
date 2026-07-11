@@ -21,9 +21,8 @@ while true; do
 
   cron_raw="$LOG_DIR/cron_wakeup_watchdog_cron.json"
   printf '%s\n' "$cron_json" > "$cron_raw"
-  # Use mktemp for safe temporary file
+  # Use mktemp for safe temporary file (cleaned up explicitly each iteration)
   failed_ids_file=$(mktemp)
-  trap 'rm -f "$failed_ids_file"' EXIT
   if python3 - "$cron_raw" "$failed_ids_file" <<'PY'
 import json, sys
 path = sys.argv[1]
@@ -50,6 +49,7 @@ PY
   else
     log 'could not inspect cron jobs for failed statuses'
   fi
+  rm -f "$failed_ids_file"
 
   if case "$gateway_status" in *"Gateway is running"*) true;; *) false;; esac; then
     printf '{"ok":true,"checked_at":"%s"}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$STATUS"

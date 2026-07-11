@@ -10,7 +10,19 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 SERVICE_PATH="/etc/systemd/system/trading-viewer.service"
 VENV_UVICORN="${PROJECT_ROOT}/.venv/bin/uvicorn"
-SERVICE_USER="${SUDO_USER:-root}"
+SERVICE_USER="${SERVICE_USER:-${SUDO_USER:-}}"
+if [[ -z "${SERVICE_USER}" ]]; then
+  echo "Error: SERVICE_USER must be explicitly set to a dedicated unprivileged account." >&2
+  exit 1
+fi
+if [[ "${SERVICE_USER}" == "root" ]]; then
+  echo "Error: SERVICE_USER must not be root; provide a dedicated unprivileged account." >&2
+  exit 1
+fi
+if ! id -u "${SERVICE_USER}" >/dev/null 2>&1; then
+  echo "Error: service user '${SERVICE_USER}' does not exist on this system." >&2
+  exit 1
+fi
 
 if [[ ! -x "${VENV_UVICORN}" ]]; then
   echo "Missing executable: ${VENV_UVICORN}" >&2

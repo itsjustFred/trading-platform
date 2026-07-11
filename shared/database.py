@@ -931,25 +931,6 @@ def _migrate_schema() -> None:
         if backtest_column_names and "equity_curve" not in backtest_column_names:
             connection.execute(text("ALTER TABLE backtests ADD COLUMN equity_curve TEXT DEFAULT '[]'"))
 
-        # Backfill equity_curve for existing backtests with empty equity_curve
-        if backtest_column_names and "equity_curve" in backtest_column_names:
-            backtests_to_fill = connection.execute(
-                text("SELECT id, equity_curve FROM backtests WHERE equity_curve IS NULL OR equity_curve = '[]' OR equity_curve = ''")
-            ).fetchall()
-            for row in backtests_to_fill:
-                bt_id, eq_curve = row
-                if eq_curve and eq_curve != '[]':
-                    try:
-                        import json
-                        eq_list = json.loads(eq_curve)
-                        if eq_list:
-                            connection.execute(
-                                text("UPDATE backtests SET equity_curve = :eq WHERE id = :id"),
-                                {"eq": json.dumps(eq_list), "id": bt_id},
-                            )
-                    except Exception:
-                        pass  # Skip invalid JSON
-
         # Backfill discord_message_id from metadata for existing live_signals
         live_signal_column_names = _table_column_names(connection, "live_signals")
         if live_signal_column_names and "discord_message_id" in live_signal_column_names:
@@ -1017,7 +998,15 @@ def save_live_signal(signal: LiveSignal) -> None:
                     )
                 return
         session.add(record)
-        session.commit()
+        try:
+            session.commit()
+        except IntegrityError:
+            session.rollback()
+            logger.info(
+                "Skipping duplicate live signal on unique constraint (discord_message_id=%s)",
+                discord_msg_id,
+            )
+            return
 
 
 def save_live_execution(execution: LiveExecution) -> bool:
@@ -2651,7 +2640,7 @@ def load_backtest_equity_preview_points_map(
         )
 
     with get_session() as session:
-        rows = session.exec(ranked_query, params=params).all()
+        rows = session.execute(ranked_query, params=params).all()
 
     previews: dict[str, list[EquityPointModel]] = {backtest_id: [] for backtest_id in normalized_ids}
     for row in rows:

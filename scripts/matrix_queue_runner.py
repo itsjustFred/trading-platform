@@ -90,8 +90,12 @@ def acquire_lock() -> bool:
         except Exception:
             return False
     try:
-        LOCK_PATH.write_text(now_iso(), encoding="utf-8")
+        fd = os.open(str(LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(now_iso())
         return True
+    except FileExistsError:
+        return False
     except Exception:
         return False
 
