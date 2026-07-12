@@ -448,3 +448,97 @@ Exit-mix movement after the fix:
     existing chunk-size warnings.
 - `git diff --check`
   - Result: passed.
+
+## 2026-07-12 - Continuation Baseline And Residual MT5 Stop-Path Audit
+
+Branch at continuation start: `codex/new-main`
+Head at continuation start: `6e0b809` (`Anchor MT5 parity stops from stop distance`)
+Initial worktree state: clean.
+
+### Baseline Re-Verification
+
+Commands:
+
+```bash
+python scripts/compare_strategy_metrics.py --output reports/strategy_metric_comparison_matrix.json
+pytest tests/validation/ tests/validators/ -q
+cd frontend && npm ci && npm run build
+```
+
+Results:
+
+- Comparison matrix regenerated successfully. Numeric values were unchanged
+  from the stop-distance anchoring slice; only `generated_at` changed.
+- Validation/validator suite: `467 passed`.
+- Frontend build: passed. `npm ci` still reports 4 existing audit findings,
+  and Vite still reports existing chunk-size warnings.
+
+Current matrix deltas:
+
+| Case | Trade Count Delta | Win Rate Delta | Net Profit Delta | CAGR Delta | Sharpe Delta |
+|---|---:|---:|---:|---:|---:|
+| SP500 M1 MT5 | +64 | -10.20 pp | +16,469.81 | +1.4975 pp | -3.926321 |
+| EURUSD H1 MT5 | +4 | -5.00 pp | +6,506.21 | +0.7385 pp | -2.215672 |
+| NAS100 M15 MT5 | -8 | -10.44 pp | -8,883.73 | -0.7064 pp | -4.209890 |
+| Risk Parity QC JSON | +1 | -3.3015 pp | +330,088.56 | -1.5288 pp | -0.121887 |
+
+### Reference Branch Review
+
+The `hermes-overnight-new-main-prework` branch was reviewed as evidence only.
+It is a broad CodeRabbit cleanup branch and is not directly mergeable into this
+parity slice. In the MT5 diagnostic path it removes the Athens-local
+`source_timezone` import behavior now required by the current matrix, so no MT5
+timezone or stop-path change was adopted from that branch.
+
+### Residual Stop-Path Evidence
+
+After importing MT5 XLSX timestamps as `Europe/Athens` and matching greedily by
+exact UTC entry timestamp plus direction, the matched trade subsets remain:
+
+| Case | Matched Trades | Reference Trades | Platform Trades |
+|---|---:|---:|---:|
+| EURUSD H1 | 176 | 492 | 496 |
+| NAS100 M15 | 127 | 597 | 589 |
+| SP500 M1 | 113 | 512 | 576 |
+
+Matched reason pairs:
+
+| Case | MT5 Signal -> Platform Signal | MT5 Signal -> Platform SL | MT5 SL -> Platform SL | MT5 SL -> Platform Signal |
+|---|---:|---:|---:|---:|
+| EURUSD H1 | 76 | 23 | 74 | 3 |
+| NAS100 M15 | 55 | 19 | 50 | 3 |
+| SP500 M1 | 52 | 11 | 49 | 1 |
+
+The remaining `MT5 signal/blank -> platform stop_loss` bucket still shows
+platform stops tighter than MT5 stop-implied distances:
+
+| Case | Bad Bucket Count | Median Platform/MT5 Stop-Distance Ratio |
+|---|---:|---:|
+| EURUSD H1 | 23 | 0.7672 |
+| NAS100 M15 | 19 | 0.7068 |
+| SP500 M1 | 11 | 0.7109 |
+
+Local OHLC replay over the same windows shows that the platform stop was
+touched more often; OHLC bars do not establish intrabar exit ordering:
+
+| Case | Windows Tested | Local OHLC Touched MT5 Stop | Local OHLC Touched Platform Stop |
+|---|---:|---:|---:|
+| EURUSD H1 | 23 | 3 | 23 |
+| NAS100 M15 | 19 | 1 | 19 |
+| SP500 M1 | 11 | 2 | 11 |
+
+This audit found no additional execution-code defect. The bar-level evidence is
+consistent with the platform applying its own generated ATR/stop levels to the
+local OHLC path, but it does not prove which stop level triggered first. The
+mismatches occur because those stop levels are materially closer than the MT5
+stops inferred from the XLSX trade rows. This is consistent with remaining
+Dukascopy website-vs-MT5 data-source, bid/ask, and daily ATR construction
+differences. A stronger fix would require MT5 tick/M1 bid-ask exports, or a
+reference export containing the EA's per-trade ATR and stop-distance values.
+
+### Risk Parity Check
+
+The current branch still retains the QuantConnect 2% rebalance materiality
+threshold and uses scheduled open prices for accepted rebalance fills. This
+matches the checked QuantConnect source behavior and should not be removed
+without a genuine QC trade export showing different semantics.
