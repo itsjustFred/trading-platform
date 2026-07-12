@@ -264,6 +264,10 @@ def _build_trades(
     fixed_risk_amount = float(indicators.get("fixed_risk_amount", 500.0) or 500.0)
     direction = indicators.get("direction", pd.Series(index=df.index, dtype=object))
     sl_price = pd.to_numeric(indicators.get("sl_price", pd.Series(index=df.index)), errors="coerce")
+    stop_distance_raw = indicators.get("stop_distance", pd.Series(index=df.index))
+    if not isinstance(stop_distance_raw, pd.Series):
+        stop_distance_raw = pd.Series(stop_distance_raw, index=df.index)
+    stop_distance_series = pd.to_numeric(stop_distance_raw, errors="coerce")
 
     for entry_index in entry_indices:
         fill_index = int(entry_index) + 1
@@ -283,7 +287,20 @@ def _build_trades(
             side = "LONG"
         entry_price = _side_price(entry_row, side, "close")
         stop_loss = signal_stop_loss
-        if pd.notna(signal_stop_loss):
+        signal_stop_distance = (
+            stop_distance_series.iloc[int(entry_index)]
+            if int(entry_index) < len(stop_distance_series)
+            else float("nan")
+        )
+        has_valid_stop_distance = (
+            pd.notna(signal_stop_distance)
+            and math.isfinite(float(signal_stop_distance))
+            and float(signal_stop_distance) > 0
+        )
+        if has_valid_stop_distance:
+            distance = float(signal_stop_distance)
+            stop_loss = entry_price - distance if side == "LONG" else entry_price + distance
+        elif pd.notna(signal_stop_loss):
             stop_distance_from_signal = abs(signal_close - float(signal_stop_loss))
             stop_loss = entry_price - stop_distance_from_signal if side == "LONG" else entry_price + stop_distance_from_signal
 
@@ -304,9 +321,9 @@ def _build_trades(
                 exit_price = stop
                 exit_reason = "stop_loss"
 
-        stop_distance = abs(entry_price - float(stop_loss)) if pd.notna(stop_loss) else entry_price * 0.02
+        risk_stop_distance = abs(entry_price - float(stop_loss)) if pd.notna(stop_loss) else entry_price * 0.02
         risk_unit_value = _price_unit_value(str(case["symbol"]), entry_row["timestamp"], conversion)
-        qty = fixed_risk_amount / (stop_distance * risk_unit_value) if stop_distance > 0 else equity / entry_price
+        qty = fixed_risk_amount / (risk_stop_distance * risk_unit_value) if risk_stop_distance > 0 else equity / entry_price
         qty = _round_mt5_lots(str(case["symbol"]), qty)
         if qty <= 0:
             continue
@@ -437,7 +454,7 @@ def regenerate_case(
         equity_curve=_build_equity_curve(trades, capital),
         drawings=drawings,
     )
-    attach_daily_equity(result, start_date=str(case["start"]), end_date=str(case["end"]))
+    attach_daily_equity(result, start=str(case["start"]), end=str(case["end"]))
     result.stats = {**result.stats, **compute_stats_for_result(result)}
     output.parent.mkdir(parents=True, exist_ok=True)
     result.save(output)

@@ -315,3 +315,136 @@ Current code was checked against the specific open questions:
     existing chunk-size warnings.
 - `python scripts/compare_strategy_metrics.py --output reports/strategy_metric_comparison_matrix.json`
   - Result: passed; regenerated the matrix with MT5 source-timezone metadata.
+
+## 2026-07-12 - MT5 Parity Stop-Distance Artifact Anchoring
+
+Branch at start of this slice: `codex/new-main`
+Head at start of this slice: `495c19a` (`Align MT5 reference timezone loading`)
+
+### Investigation
+
+After timestamp alignment, the strongest remaining intraday gap was the
+platform's higher stop-loss count and lower win rate. The direct trade matching
+showed that `MT5 signal/blank -> platform stop_loss` mismatches were caused by
+platform stop levels being tighter than the MT5 stop levels:
+
+- EURUSD H1: local OHLC hit the MT5 stop before the MT5 signal exit in only
+  `1/25` matched `MT5 signal -> platform SL` cases, but hit the platform stop
+  in `25/25`.
+- NAS100 M15: local OHLC hit the MT5 stop before the MT5 signal exit in only
+  `1/23` cases, but hit the platform stop in `22/23` cases.
+- SP500 M1: local OHLC hit the MT5 stop before the MT5 signal exit in only
+  `1/11` cases, but hit the platform stop in `11/11` cases.
+
+The stop-distance ratio confirmed the same issue. In the bad
+`MT5 signal/blank -> platform stop_loss` bucket, platform stop distance was
+materially smaller than MT5 stop distance:
+
+| Case | Matched Bad Bucket | Median Platform/MT5 Stop-Distance Ratio |
+|---|---:|---:|
+| EURUSD H1 | 25 | 0.6304 |
+| NAS100 M15 | 23 | 0.5231 |
+| SP500 M1 | 11 | 0.5634 |
+
+Rejected hypotheses:
+
+- Replacing the end-of-day safety exit with first-next-day stale exits did not
+  improve the exit mix or win rate.
+- Filling entries at the bar open aligned entry prices better to MT5, but moved
+  net profit materially away from the reference, especially for the index cases.
+- SMA-seeded Wilder ATR barely changed the metrics and did not reduce the stop
+  count.
+
+Root cause found in `scripts/regenerate_mt5_parity_artifacts.py`:
+
+- The strategy already emits a shifted `stop_distance` indicator for
+  candle-close signals so market-order stops can be re-anchored to the actual
+  fill price.
+- The artifact generator ignored that field and reconstructed stop distance as
+  `abs(signal_close - sl_price)`.
+- Because `sl_price` is shifted for next-open/next-bar execution, comparing it
+  to the pre-fill signal row close can shrink the stop distance and create
+  artificial platform stop-outs.
+
+### Changes
+
+- `scripts/regenerate_mt5_parity_artifacts.py`
+  - `_build_trades()` now prefers the explicit shifted `stop_distance` series
+    when re-anchoring stops to the fill price.
+  - It falls back to the old `sl_price` reconstruction only when
+    `stop_distance` is absent.
+  - The regenerator call to `attach_daily_equity()` was updated to the current
+    `start=` / `end=` API so the artifacts can actually be regenerated.
+- `tests/test_mt5_parity_artifact_loader.py`
+  - Added a regression where a shifted absolute `sl_price` would imply a
+    too-tight stop, while the explicit `stop_distance` correctly preserves the
+    source-faithful stop and avoids a false stop-out.
+  - Added a regression that non-positive `stop_distance` values are ignored and
+    fall back to the absolute `sl_price` reconstruction.
+- Regenerated:
+  - `data/backtests/intraday_volatility_breakout_eurusd_h1.json`
+  - `data/backtests/intraday_volatility_breakout_nas100_m15.json`
+  - `data/backtests/intraday_volatility_breakout_sp500_m1.json`
+  - `reports/strategy_metric_comparison_matrix.json`
+
+### Before/After Matrix
+
+Before values are from the matrix generated in the previous timestamp-alignment
+slice. After values are from the regenerated matrix after the stop-distance
+artifact fix.
+
+| Case | Metric | Reference | Before Platform | After Platform | Before Delta | After Delta |
+|---|---:|---:|---:|---:|---:|---:|
+| SP500 M1 | Trade Count | 512 | 576 | 576 | +64 | +64 |
+| SP500 M1 | Win Rate | 44.92% | 34.20% | 34.72% | -10.72 pp | -10.20 pp |
+| SP500 M1 | Net Profit | 39,255.92 | 43,239.28 | 55,725.73 | +3,983.36 | +16,469.81 |
+| SP500 M1 | CAGR | 3.9853% | 4.3753% | 5.4828% | +0.3900 pp | +1.4975 pp |
+| SP500 M1 | Sharpe | 4.595921 | 0.5630 | 0.6696 | -4.032921 | -3.926321 |
+| EURUSD H1 | Trade Count | 492 | 496 | 496 | +4 | +4 |
+| EURUSD H1 | Win Rate | 45.12% | 38.51% | 40.12% | -6.61 pp | -5.00 pp |
+| EURUSD H1 | Net Profit | 21,868.81 | 28,130.74 | 28,375.02 | +6,261.93 | +6,506.21 |
+| EURUSD H1 | CAGR | 2.3615% | 3.0148% | 3.1000% | +0.6533 pp | +0.7385 pp |
+| EURUSD H1 | Sharpe | 2.711472 | 0.4316 | 0.4958 | -2.279872 | -2.215672 |
+| NAS100 M15 | Trade Count | 597 | 589 | 589 | -8 | -8 |
+| NAS100 M15 | Win Rate | 43.55% | 32.43% | 33.11% | -11.12 pp | -10.44 pp |
+| NAS100 M15 | Net Profit | 43,791.14 | 40,873.21 | 34,907.41 | -2,917.93 | -8,883.73 |
+| NAS100 M15 | CAGR | 4.3793% | 4.1447% | 3.6729% | -0.2346 pp | -0.7064 pp |
+| NAS100 M15 | Sharpe | 4.677290 | 0.5119 | 0.4674 | -4.165390 | -4.209890 |
+
+Exit-mix movement after the fix:
+
+| Case | MT5 Exit Mix | Before Platform Exit Mix | After Platform Exit Mix |
+|---|---|---|---|
+| SP500 M1 | SL 238 / signal-or-none 274 | SL 356 / signal 220 | SL 357 / signal 219 |
+| EURUSD H1 | SL 198 / signal-or-none 294 | SL 267 / signal 229 | SL 260 / signal 236 |
+| NAS100 M15 | SL 293 / signal-or-none 304 | SL 379 / signal 210 | SL 375 / signal 214 |
+
+### Remaining Residuals
+
+- The stop-distance fix is directionally correct for EURUSD and modestly
+  improves win rate for all intraday cases, but it does not eliminate the exit
+  mix gap.
+- SP500 net profit moved farther above the MT5 reference and NAS100 moved below
+  the MT5 reference, which reinforces that residuals are not a single stop
+  anchoring bug.
+- Further reduction likely requires MT5 tick/M1 bid-ask exports for the
+  mismatched stop windows, or a richer reference that exposes the exact MT5 ATR
+  values and broker-side stop triggering path.
+
+### Verification For This Slice
+
+- `pytest -q tests/test_mt5_parity_artifact_loader.py`
+  - Result: `6 passed`.
+- `python -m py_compile scripts/regenerate_mt5_parity_artifacts.py tests/test_mt5_parity_artifact_loader.py`
+  - Result: passed.
+- `python scripts/regenerate_mt5_parity_artifacts.py`
+  - Result: passed; regenerated all three MT5 platform artifacts.
+- `python scripts/compare_strategy_metrics.py --output reports/strategy_metric_comparison_matrix.json`
+  - Result: passed; regenerated the matrix.
+- `pytest tests/validation/ tests/validators/ -q`
+  - Result: `467 passed`.
+- `cd frontend && npm ci && npm run build`
+  - Result: passed. `npm ci` reported 4 existing audit findings; Vite reported
+    existing chunk-size warnings.
+- `git diff --check`
+  - Result: passed.

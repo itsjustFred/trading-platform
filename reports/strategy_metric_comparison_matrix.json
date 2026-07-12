@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-07-12T17:34:20.172450+00:00",
+  "generated_at": "2026-07-12T19:09:51.440822+00:00",
   "metrics": [
     "trade_count",
     "win_rate",
@@ -24,10 +24,10 @@
       },
       "platform": {
         "trade_count": 576.0,
-        "win_rate": 0.342,
-        "net_profit": 43239.28,
-        "cagr": 0.043753,
-        "sharpe_ratio": 0.563
+        "win_rate": 0.3472,
+        "net_profit": 55725.73,
+        "cagr": 0.054828,
+        "sharpe_ratio": 0.6696
       },
       "deltas": [
         {
@@ -41,33 +41,33 @@
         {
           "metric": "win_rate",
           "reference": 0.44920000000000004,
-          "platform": 0.342,
-          "absolute_delta": -0.10720000000000002,
-          "relative_delta": -0.238646482635797,
+          "platform": 0.3472,
+          "absolute_delta": -0.10200000000000004,
+          "relative_delta": -0.22707034728406061,
           "note": ""
         },
         {
           "metric": "net_profit",
           "reference": 39255.92,
-          "platform": 43239.28,
-          "absolute_delta": 3983.3600000000006,
-          "relative_delta": 0.09212364313189306,
+          "platform": 55725.73,
+          "absolute_delta": 16469.810000000005,
+          "relative_delta": 0.2955512650978283,
           "note": ""
         },
         {
           "metric": "cagr",
           "reference": 0.03985281380821437,
-          "platform": 0.043753,
-          "absolute_delta": 0.003900186191785629,
-          "relative_delta": 0.08914100042935637,
+          "platform": 0.054828,
+          "absolute_delta": 0.01497518619178563,
+          "relative_delta": 0.2731302654079235,
           "note": ""
         },
         {
           "metric": "sharpe_ratio",
           "reference": 4.595921,
-          "platform": 0.563,
-          "absolute_delta": -4.032921,
-          "relative_delta": -0.877500070170919,
+          "platform": 0.6696,
+          "absolute_delta": -3.9263209999999997,
+          "relative_delta": -0.854305589673974,
           "note": ""
         }
       ],
@@ -93,10 +93,10 @@
       },
       "platform": {
         "trade_count": 496.0,
-        "win_rate": 0.3851,
-        "net_profit": 28130.74,
-        "cagr": 0.030148,
-        "sharpe_ratio": 0.4316
+        "win_rate": 0.4012,
+        "net_profit": 28375.02,
+        "cagr": 0.031,
+        "sharpe_ratio": 0.4958
       },
       "deltas": [
         {
@@ -110,33 +110,33 @@
         {
           "metric": "win_rate",
           "reference": 0.4512,
-          "platform": 0.3851,
-          "absolute_delta": -0.06609999999999999,
-          "relative_delta": -0.14649822695035458,
+          "platform": 0.4012,
+          "absolute_delta": -0.04999999999999999,
+          "relative_delta": -0.11081560283687941,
           "note": ""
         },
         {
           "metric": "net_profit",
           "reference": 21868.81,
-          "platform": 28130.74,
-          "absolute_delta": 6261.93,
-          "relative_delta": 0.2226009696154456,
+          "platform": 28375.02,
+          "absolute_delta": 6506.209999999999,
+          "relative_delta": 0.22929358287676974,
           "note": ""
         },
         {
           "metric": "cagr",
           "reference": 0.023614509760820024,
-          "platform": 0.030148,
-          "absolute_delta": 0.006533490239179977,
-          "relative_delta": 0.21671388613440284,
+          "platform": 0.031,
+          "absolute_delta": 0.007385490239179976,
+          "relative_delta": 0.2382416206187089,
           "note": ""
         },
         {
           "metric": "sharpe_ratio",
           "reference": 2.711472,
-          "platform": 0.4316,
-          "absolute_delta": -2.279872,
-          "relative_delta": -0.8408244673004184,
+          "platform": 0.4958,
+          "absolute_delta": -2.215672,
+          "relative_delta": -0.8171472912130385,
           "note": ""
         }
       ],
@@ -162,10 +162,10 @@
       },
       "platform": {
         "trade_count": 589.0,
-        "win_rate": 0.3243,
-        "net_profit": 40873.21,
-        "cagr": 0.041447,
-        "sharpe_ratio": 0.5119
+        "win_rate": 0.3311,
+        "net_profit": 34907.41,
+        "cagr": 0.036729,
+        "sharpe_ratio": 0.4674
       },
       "deltas": [
         {
@@ -179,33 +179,33 @@
         {
           "metric": "win_rate",
           "reference": 0.4355,
-          "platform": 0.3243,
-          "absolute_delta": -0.11120000000000002,
-          "relative_delta": -0.25533869115958674,
+          "platform": 0.3311,
+          "absolute_delta": -0.10439999999999999,
+          "relative_delta": -0.23972445464982778,
           "note": ""
         },
         {
           "metric": "net_profit",
           "reference": 43791.14,
-          "platform": 40873.21,
-          "absolute_delta": -2917.9300000000003,
-          "relative_delta": -0.06663288509958865,
+          "platform": 34907.41,
+          "absolute_delta": -8883.729999999996,
+          "relative_delta": -0.20286592219339336,
           "note": ""
         },
         {
           "metric": "cagr",
           "reference": 0.043793118964499556,
-          "platform": 0.041447,
-          "absolute_delta": -0.002346118964499558,
-          "relative_delta": -0.05357277627111728,
+          "platform": 0.036729,
+          "absolute_delta": -0.007064118964499558,
+          "relative_delta": -0.16130659636793657,
           "note": ""
         },
         {
           "metric": "sharpe_ratio",
           "reference": 4.67729,
-          "platform": 0.5119,
-          "absolute_delta": -4.16539,
-          "relative_delta": -0.8905562836599826,
+          "platform": 0.4674,
+          "absolute_delta": -4.209890000000001,
+          "relative_delta": -0.900070339876296,
           "note": ""
         }
       ],
