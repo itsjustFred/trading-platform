@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
@@ -150,6 +151,111 @@ def _format_stats(stats: dict[str, float | int | None]) -> str:
         f"median={float(stats['median']):.6g} "
         f"p25={float(stats['p25']):.6g} p75={float(stats['p75']):.6g}"
     )
+
+
+def _annualized_sharpe(values: pd.Series, periods: float) -> float | None:
+    series = pd.to_numeric(values, errors="coerce").dropna()
+    if len(series) < 2:
+        return None
+    std = float(series.std(ddof=1))
+    if std == 0.0 or not math.isfinite(std):
+        return None
+    return float(series.mean()) / std * math.sqrt(periods)
+
+
+def _annualized_sortino_like(values: pd.Series, periods: float) -> float | None:
+    series = pd.to_numeric(values, errors="coerce").dropna()
+    if len(series) < 2:
+        return None
+    downside = series[series < 0.0]
+    if downside.empty:
+        return None
+    downside_deviation = math.sqrt(float((downside**2).mean()))
+    if downside_deviation == 0.0 or not math.isfinite(downside_deviation):
+        return None
+    return float(series.mean()) / downside_deviation * math.sqrt(periods)
+
+
+def _trade_return_frame(reference: Any) -> pd.DataFrame:
+    initial_capital = float(
+        reference.raw_metadata.get("parsed_meta", {}).get("initial_capital") or 100000.0
+    )
+    rows: list[dict[str, Any]] = []
+    equity = initial_capital
+    for trade in reference.trades:
+        pnl = float(trade.pnl)
+        exit_time = _trade_exit_time(trade)
+        if exit_time is None:
+            continue
+        before = equity
+        equity += pnl
+        rows.append(
+            {
+                "time": _utc_timestamp(exit_time),
+                "pnl": pnl,
+                "equity_before": before,
+                "equity_after": equity,
+                "return_on_prior_equity": pnl / before if before else 0.0,
+                "return_on_initial_capital": pnl / initial_capital if initial_capital else 0.0,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _daily_returns_from_reference_trades(reference: Any, *, business_days: bool = False) -> pd.Series:
+    frame = _trade_return_frame(reference)
+    if frame.empty:
+        return pd.Series(dtype=float)
+    initial_capital = float(
+        reference.raw_metadata.get("parsed_meta", {}).get("initial_capital") or 100000.0
+    )
+    daily_equity = frame.set_index("time").groupby(pd.Grouper(freq="D"))["equity_after"].last()
+    full_index = pd.date_range(
+        frame["time"].min().normalize(),
+        frame["time"].max().normalize(),
+        freq="B" if business_days else "D",
+        tz="UTC",
+    )
+    if full_index.empty:
+        return pd.Series(dtype=float)
+    daily_equity = daily_equity.reindex(full_index).ffill().fillna(initial_capital)
+    return daily_equity.pct_change().dropna()
+
+
+def _sharpe_convention_candidates(reference: Any) -> dict[str, float | None]:
+    frame = _trade_return_frame(reference)
+    if frame.empty:
+        return {}
+    trade_count = len(frame)
+    total_deals = float(reference.stats.get("total_deals") or trade_count)
+    daily_returns = _daily_returns_from_reference_trades(reference)
+    business_returns = _daily_returns_from_reference_trades(reference, business_days=True)
+    active_daily_returns = daily_returns[daily_returns != 0.0]
+    monthly_returns = (
+        frame.set_index("time")["equity_after"].resample("ME").last().pct_change().dropna()
+    )
+    return {
+        "trade_pnl_sqrt_trades": _annualized_sharpe(frame["pnl"], trade_count),
+        "trade_pnl_sqrt_deals": _annualized_sharpe(frame["pnl"], total_deals),
+        "trade_pnl_sqrt_252": _annualized_sharpe(frame["pnl"], 252.0),
+        "trade_return_prior_equity_sqrt_trades": _annualized_sharpe(
+            frame["return_on_prior_equity"],
+            trade_count,
+        ),
+        "trade_return_prior_equity_unannualized": _annualized_sharpe(
+            frame["return_on_prior_equity"],
+            1.0,
+        ),
+        "daily_calendar_sqrt_252": _annualized_sharpe(daily_returns, 252.0),
+        "daily_business_sqrt_252": _annualized_sharpe(business_returns, 252.0),
+        "daily_nonzero_sqrt_252": _annualized_sharpe(active_daily_returns, 252.0),
+        "daily_nonzero_sqrt_active_days": _annualized_sharpe(
+            active_daily_returns,
+            float(len(active_daily_returns)),
+        ),
+        "monthly_sqrt_12": _annualized_sharpe(monthly_returns, 12.0),
+        "trade_pnl_sortino_like_sqrt_trades": _annualized_sortino_like(frame["pnl"], trade_count),
+    }
 
 
 def _local_stop_touch_counts(
@@ -422,6 +528,24 @@ def matched_stop_path(args: argparse.Namespace) -> None:
         )
 
 
+def sharpe_conventions(args: argparse.Namespace) -> None:
+    importer = MT5XLSXImporter()
+    for label, mt5_path in MT5_REPORTS.items():
+        reference = importer.load(mt5_path, source_timezone=MT5_SOURCE_TIMEZONE)
+        report_sharpe = float(reference.stats.get("sharpe_ratio") or 0.0)
+        candidates = _sharpe_convention_candidates(reference)
+        print(f"\n{label}")
+        print(
+            f"report_sharpe={report_sharpe:.6f} "
+            f"trades={len(reference.trades)} deals={reference.stats.get('total_deals')}"
+        )
+        for name, value in candidates.items():
+            if value is None:
+                print(f"{name}: unavailable")
+                continue
+            print(f"{name}: {value:.6f} delta={value - report_sharpe:+.6f}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, default=Path("/mnt/block-volume-data"))
@@ -442,6 +566,7 @@ def main() -> None:
     p_match = sub.add_parser("matched-stop-path")
     p_match.add_argument("--skip-ohlc", action="store_true", help="Skip local OHLC stop-touch replay.")
     p_match.set_defaults(func=matched_stop_path)
+    sub.add_parser("sharpe-conventions").set_defaults(func=sharpe_conventions)
     args = parser.parse_args()
     args.func(args)
 

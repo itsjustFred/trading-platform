@@ -3,6 +3,7 @@ from scripts.analyze_mt5_parity import (
     _match_by_entry_and_direction,
     _mt5_exit_reason,
     _platform_exit_reason,
+    _sharpe_convention_candidates,
     _series_stats,
     _utc_timestamp,
 )
@@ -37,6 +38,18 @@ def _trade(
         pnl=0.0,
         meta=meta,
     )
+
+
+class _Reference:
+    def __init__(
+        self,
+        trades: list[Trade],
+        stats: dict[str, float],
+        initial_capital: float = 1000.0,
+    ):
+        self.trades = trades
+        self.stats = stats
+        self.raw_metadata = {"parsed_meta": {"initial_capital": initial_capital}}
 
 
 def test_utc_timestamp_normalizes_equivalent_iso_spellings():
@@ -78,3 +91,34 @@ def test_series_stats_handles_empty_and_quartiles():
     assert stats["n"] == 3
     assert stats["mean"] == 2.0
     assert stats["median"] == 2.0
+
+
+def test_sharpe_convention_candidates_include_trade_and_daily_variants():
+    trades = [
+        _trade(
+            entry_time="2024-01-01T10:00:00Z",
+            exit_price=101.0,
+        ),
+        _trade(
+            entry_time="2024-01-02T10:00:00Z",
+            exit_price=99.0,
+        ),
+        _trade(
+            entry_time="2024-01-03T10:00:00Z",
+            exit_price=102.0,
+        ),
+    ]
+    trades[0].pnl = 10.0
+    trades[0].exits[0].time = "2024-01-01T13:00:00Z"
+    trades[1].pnl = -5.0
+    trades[1].exits[0].time = "2024-01-02T13:00:00Z"
+    trades[2].pnl = 15.0
+    trades[2].exits[0].time = "2024-01-03T13:00:00Z"
+    ref = _Reference(trades, {"total_deals": 6.0})
+
+    candidates = _sharpe_convention_candidates(ref)
+
+    assert candidates["trade_pnl_sqrt_trades"] is not None
+    assert candidates["trade_pnl_sqrt_deals"] is not None
+    assert candidates["daily_calendar_sqrt_252"] is not None
+    assert candidates["trade_pnl_sqrt_deals"] > candidates["trade_pnl_sqrt_trades"]

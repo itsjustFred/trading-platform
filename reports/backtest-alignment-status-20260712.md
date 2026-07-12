@@ -546,6 +546,41 @@ The diagnostic helper is covered by `tests/test_analyze_mt5_parity.py`, includin
 UTC timestamp normalization, entry/direction matching, exit-reason
 classification, and summary-stat formatting for the stop-path report.
 
+### MT5 Sharpe Convention Audit
+
+The MT5 Sharpe residual is now reproducible with:
+
+```bash
+python scripts/analyze_mt5_parity.py sharpe-conventions
+```
+
+The command compares the XLSX header Sharpe against variants computed only from
+the imported MT5 trade stream: trade-PnL Sharpe, per-trade return Sharpe,
+calendar-day and business-day equity-return Sharpe, nonzero-day Sharpe, monthly
+Sharpe, and a Sortino-like downside deviation check.
+
+Closest candidates still do not match all three MT5 header values:
+
+| Case | MT5 Header Sharpe | Closest Tested Candidate | Candidate Value | Delta |
+|---|---:|---|---:|---:|
+| EURUSD H1 | 2.711472 | `trade_pnl_sortino_like_sqrt_trades` | 2.239170 | -0.472302 |
+| NAS100 M15 | 4.677290 | `trade_pnl_sortino_like_sqrt_trades` | 4.757198 | +0.079908 |
+| SP500 M1 | 4.595921 | `trade_pnl_sortino_like_sqrt_trades` | 4.457836 | -0.138085 |
+
+The nearest true Sharpe-style candidate using trade PnL annualized by MT5 deal
+count remains lower for every case:
+
+| Case | MT5 Header Sharpe | `trade_pnl_sqrt_deals` | Delta |
+|---|---:|---:|---:|
+| EURUSD H1 | 2.711472 | 2.203054 | -0.508418 |
+| NAS100 M15 | 4.677290 | 4.153598 | -0.523692 |
+| SP500 M1 | 4.595921 | 4.002309 | -0.593612 |
+
+No platform Sharpe formula was changed. The available XLSX trade stream is not
+enough to prove MT5's exact Sharpe denominator or return basis; the comparison
+matrix should continue using the XLSX header as the MT5 reference and the
+platform's documented daily-equity convention for platform rows.
+
 ### Risk Parity Check
 
 The current branch still retains the QuantConnect 2% rebalance materiality
