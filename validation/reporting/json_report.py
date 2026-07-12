@@ -50,6 +50,11 @@ def _sanitize_for_json(obj: Any) -> Any:
     return obj
 
 
+def _sanitize_json_numbers(obj: Any) -> Any:
+    """Backward-compatible alias for strict JSON number sanitization."""
+    return _sanitize_for_json(obj)
+
+
 def _stats_from_reference(reference: ValidationReference) -> TradeStatistics:
     """Build TradeStatistics from reference.stats when no trades are present."""
     allowed_fields = set(TradeStatistics.model_fields.keys())
