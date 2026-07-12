@@ -20,6 +20,8 @@ from strategies.intraday_volatility_breakout.intraday_volatility_breakout import
 from runner.engines.base import resolve_strategy_parameters
 from scripts.regenerate_mt5_parity_artifacts import COMPARISON_CASES, STRATEGY_PATH, _load_ohlcv
 
+MT5_SOURCE_TIMEZONE = "Europe/Athens"
+
 
 @dataclass(frozen=True)
 class CasePaths:
@@ -50,7 +52,7 @@ def _load_platform(path: Path) -> dict[str, Any]:
 def summary(args: argparse.Namespace) -> None:
     importer = MT5XLSXImporter()
     for label, mt5_path in MT5_REPORTS.items():
-        ref = importer.load(mt5_path)
+        ref = importer.load(mt5_path, source_timezone=MT5_SOURCE_TIMEZONE)
         platform = _load_platform(_platform_path(label))
         mt5_pnl = float(ref.stats.get("total_pnl") or 0.0)
         platform_pnl = float(platform.get("stats", {}).get("total_pnl") or 0.0)
@@ -71,7 +73,7 @@ def summary(args: argparse.Namespace) -> None:
 def entry_minutes(args: argparse.Namespace) -> None:
     importer = MT5XLSXImporter()
     for label, mt5_path in MT5_REPORTS.items():
-        ref = importer.load(mt5_path)
+        ref = importer.load(mt5_path, source_timezone=MT5_SOURCE_TIMEZONE)
         times = pd.to_datetime([trade.entry_time for trade in ref.trades], utc=True, errors="coerce")
         minutes = pd.Series(times.hour * 60 + times.minute)
         print(f"\n{label} entry minutes")
@@ -83,7 +85,7 @@ def stop_atr(args: argparse.Namespace) -> None:
     cases = _case_by_label()
     params = resolve_strategy_parameters(STRATEGY_PATH, {"session_timezone_offset_hours": args.session_offset})
     for label, mt5_path in MT5_REPORTS.items():
-        ref = importer.load(mt5_path)
+        ref = importer.load(mt5_path, source_timezone=MT5_SOURCE_TIMEZONE)
         case = cases[label]
         df = _load_ohlcv(args.data_dir, case["execution_symbol"], case["execution_timeframe"], case["start"], case["end"])
         entries, exits, indicators, _ = generate_signals(df, params)
@@ -164,7 +166,7 @@ def data_quality(args: argparse.Namespace) -> None:
         print("time", df["timestamp"].min(), df["timestamp"].max())
         for col in ohlc_cols:
             print(col, "nan", int(pd.to_numeric(df[col], errors="coerce").isna().sum()))
-        ref = importer.load(MT5_REPORTS[label])
+        ref = importer.load(MT5_REPORTS[label], source_timezone=MT5_SOURCE_TIMEZONE)
         times = pd.to_datetime([trade.entry_time for trade in ref.trades], utc=True, errors="coerce")
         ts = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
         ts_index = pd.Series(df.index, index=ts)

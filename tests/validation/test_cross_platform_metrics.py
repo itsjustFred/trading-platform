@@ -1,8 +1,10 @@
+import json
 from pathlib import Path
 
 import pytest
 
 from validation.statistics.cross_platform import build_comparison_matrix
+from validation.importers.mt5_xlsx import MT5XLSXImporter
 from scripts.regenerate_mt5_parity_artifacts import COMPARISON_CASES
 from scripts.regenerate_qc_risk_parity_artifact import DEFAULT_OUTPUT as QC_RISK_PARITY_OUTPUT
 from shared.models import BacktestMeta, BacktestResult, EquityPoint
@@ -102,6 +104,28 @@ def test_cross_platform_matrix_recomputes_sharpe_with_reference_risk_free_rate(t
     rows = {row["case_id"]: row for row in matrix["rows"]}
     assert rows["intraday_volatility_breakout_sp500_m1"]["platform"]["sharpe_ratio"] > 0.0
     assert "risk_free_rate=0.0" in matrix["risk_free_rate_note"]
+
+
+def test_cross_platform_matrix_loads_mt5_reference_timestamps_in_report_timezone():
+    matrix = build_comparison_matrix(
+        comparisons_dir=PROJECT_ROOT / "strategy-comparisons",
+        reports_dir=PROJECT_ROOT / "reports",
+    )
+    row = {
+        item["case_id"]: item
+        for item in matrix["rows"]
+    }["intraday_volatility_breakout_sp500_m1"]
+
+    assert row["reference_source_timezone"] == "Europe/Athens"
+    reference = MT5XLSXImporter().load(
+        Path(row["reference_path"]),
+        source_timezone=row["reference_source_timezone"],
+    )
+    platform = json.loads(Path(row["platform_path"]).read_text(encoding="utf-8"))
+
+    first_reference_entry = reference.trades[0].entry_time
+    first_platform_entry = platform["trades"][0]["entry_time"].replace("+00:00", "Z")
+    assert first_reference_entry == first_platform_entry == "2018-01-16T14:45:00Z"
 
 
 def test_cross_platform_matrix_uses_qc_rebalance_attribution_stats(tmp_path):

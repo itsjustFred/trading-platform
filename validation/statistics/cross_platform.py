@@ -22,6 +22,7 @@ from validation.importers.mt5_xlsx import MT5XLSXImporter
 
 AUDIT_METRICS = ("trade_count", "win_rate", "net_profit", "cagr", "sharpe_ratio")
 REFERENCE_RISK_FREE_RATE = 0.0
+MT5_REPORT_SOURCE_TIMEZONE = "Europe/Athens"
 
 
 @dataclass(frozen=True)
@@ -44,6 +45,14 @@ class MetricDelta:
         }
 
 
+@dataclass(frozen=True)
+class MT5ComparisonCase:
+    case_id: str
+    reference_path: Path
+    platform_path: Path
+    source_timezone: str
+
+
 def build_comparison_matrix(
     *,
     comparisons_dir: Path,
@@ -57,25 +66,28 @@ def build_comparison_matrix(
     rows: list[dict[str, Any]] = []
 
     mt5_cases = [
-        (
-            "intraday_volatility_breakout_sp500_m1",
-            comparisons_dir / "intraday_volatility_breakout" / "SP500_M1.xlsx",
-            platform_data_dir / "intraday_volatility_breakout_sp500_m1.json",
+        MT5ComparisonCase(
+            case_id="intraday_volatility_breakout_sp500_m1",
+            reference_path=comparisons_dir / "intraday_volatility_breakout" / "SP500_M1.xlsx",
+            platform_path=platform_data_dir / "intraday_volatility_breakout_sp500_m1.json",
+            source_timezone=MT5_REPORT_SOURCE_TIMEZONE,
         ),
-        (
-            "intraday_volatility_breakout_eurusd_h1",
-            comparisons_dir / "intraday_volatility_breakout" / "EURUSD_H1.xlsx",
-            platform_data_dir / "intraday_volatility_breakout_eurusd_h1.json",
+        MT5ComparisonCase(
+            case_id="intraday_volatility_breakout_eurusd_h1",
+            reference_path=comparisons_dir / "intraday_volatility_breakout" / "EURUSD_H1.xlsx",
+            platform_path=platform_data_dir / "intraday_volatility_breakout_eurusd_h1.json",
+            source_timezone=MT5_REPORT_SOURCE_TIMEZONE,
         ),
-        (
-            "intraday_volatility_breakout_nas100_m15",
-            comparisons_dir / "intraday_volatility_breakout" / "NAS100_M15.xlsx",
-            platform_data_dir / "intraday_volatility_breakout_nas100_m15.json",
+        MT5ComparisonCase(
+            case_id="intraday_volatility_breakout_nas100_m15",
+            reference_path=comparisons_dir / "intraday_volatility_breakout" / "NAS100_M15.xlsx",
+            platform_path=platform_data_dir / "intraday_volatility_breakout_nas100_m15.json",
+            source_timezone=MT5_REPORT_SOURCE_TIMEZONE,
         ),
     ]
 
-    for case_id, reference_path, platform_path in mt5_cases:
-        rows.append(_build_mt5_row(case_id, reference_path, platform_path))
+    for case in mt5_cases:
+        rows.append(_build_mt5_row(case))
 
     rows.append(
         _build_json_reference_row(
@@ -98,22 +110,25 @@ def build_comparison_matrix(
     }
 
 
-def _build_mt5_row(case_id: str, reference_path: Path, platform_path: Path) -> dict[str, Any]:
-    reference = MT5XLSXImporter().load(reference_path)
-    reference_stats = _normalize_mt5_stats(reference.stats, reference_path, reference.raw_metadata)
-    platform_stats = _load_platform_stats(platform_path, risk_free_rate=REFERENCE_RISK_FREE_RATE)
-    return _row_payload(
-        case_id=case_id,
+def _build_mt5_row(case: MT5ComparisonCase) -> dict[str, Any]:
+    reference = MT5XLSXImporter().load(case.reference_path, source_timezone=case.source_timezone)
+    reference_stats = _normalize_mt5_stats(reference.stats, case.reference_path, reference.raw_metadata)
+    platform_stats = _load_platform_stats(case.platform_path, risk_free_rate=REFERENCE_RISK_FREE_RATE)
+    row = _row_payload(
+        case_id=case.case_id,
         reference_framework="mt5_xlsx",
-        reference_path=reference_path,
-        platform_path=platform_path,
+        reference_path=case.reference_path,
+        platform_path=case.platform_path,
         reference_stats=reference_stats,
         platform_stats=platform_stats,
         notes=[
             "MT5 fills, spread/commission, contract sizing and fixed-risk execution differ from platform fills.",
+            f"MT5 trade timestamps are interpreted as {case.source_timezone} local time and converted to UTC.",
             "MT5 CAGR is derived from report period, initial deposit and net profit because the XLSX summary omits CAGR.",
         ],
     )
+    row["reference_source_timezone"] = case.source_timezone
+    return row
 
 
 def _build_json_reference_row(case_id: str, reference_path: Path, platform_path: Path) -> dict[str, Any]:

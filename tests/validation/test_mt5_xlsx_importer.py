@@ -106,6 +106,7 @@ class TestEURUSDH1:
         ref = importer.load(_eurusd_path())
         assert "parsed_meta" in ref.raw_metadata
         assert "parsed_stats" in ref.raw_metadata
+        assert ref.raw_metadata["source_timezone"] == "UTC"
 
     def test_trade_pnl_consistent(self, importer: MT5XLSXImporter):
         ref = importer.load(_eurusd_path())
@@ -267,3 +268,7 @@ class TestSourceTimezone:
 
         with pytest.raises(ValueError):
             _resolve_source_timezone("Not/AZone")
+
+    def test_to_iso_rejects_unknown_source_timezone(self):
+        with pytest.raises(ValueError):
+            MT5XLSXImporter._to_iso("2024.01.01 10:00:00", "Not/AZone")

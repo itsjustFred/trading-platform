@@ -165,3 +165,153 @@ treated as a complete independent QC trade export.
 3. Intraday win-rate gaps remain around 6.6 to 11.1 percentage points despite
    close trade-count and net-profit alignment, so trade outcome classification
    and partial/zero-PnL handling should be audited next.
+
+## 2026-07-12 - MT5 Reference Timestamp Alignment
+
+Branch at start of this slice: `codex/new-main`
+Head at start of this slice: `11e398f` (`Clarify risk parity attribution metrics`)
+Initial worktree state: clean, except for the matrix regenerated during this
+slice.
+
+### Baseline Matrix
+
+Command:
+
+```bash
+python scripts/compare_strategy_metrics.py --output reports/strategy_metric_comparison_matrix.json
+```
+
+The command completed successfully. Header-based MT5 reference metrics and
+platform summary metrics were numerically unchanged by the timestamp work:
+
+| Case | Trade Count Delta | Win Rate Delta | Net Profit Delta | CAGR Delta | Sharpe Delta |
+|---|---:|---:|---:|---:|---:|
+| SP500 M1 MT5 | +64 | -10.72 pp | +3,983.36 | +0.39 pp | -4.032921 |
+| EURUSD H1 MT5 | +4 | -6.61 pp | +6,261.93 | +0.65 pp | -2.279872 |
+| NAS100 M15 MT5 | -8 | -11.12 pp | -2,917.93 | -0.23 pp | -4.165390 |
+| Risk Parity QC JSON | +1 | -3.3015 pp | +330,088.56 | -1.5288 pp | -0.121887 |
+
+Risk Parity net profit in this matrix intentionally uses
+`rebalance_attribution_net_profit` for the `qc-parity` artifact, per the prior
+attribution clarification.
+
+### Timestamp Root Cause And Fix
+
+`validation/statistics/cross_platform.py` loaded MT5 XLSX references without
+passing a `source_timezone`. The importer therefore interpreted report times as
+UTC. The MT5 reports are generated from an Athens-local MT5 session, while the
+platform artifacts store UTC timestamps.
+
+Evidence before the fix:
+
+- Exact entry-timestamp overlaps between MT5 and platform artifacts were zero
+  when MT5 rows were imported as UTC.
+- Importing the same XLSX rows with `source_timezone="Europe/Athens"` produced
+  exact entry overlaps:
+  - EURUSD H1: `177` platform/ref entry timestamp overlaps.
+  - NAS100 M15: `132` platform/ref entry timestamp overlaps.
+  - SP500 M1: `118` platform/ref entry timestamp overlaps.
+- The first SP500 MT5 trade changes from `2018-01-16T16:45:00Z` under the old
+  UTC-default import to `2018-01-16T14:45:00Z` with Athens-local import, matching
+  the first platform trade timestamp.
+
+Changes:
+
+- `validation/statistics/cross_platform.py`
+  - Added MT5 case metadata with `source_timezone="Europe/Athens"`.
+  - Passes that timezone to `MT5XLSXImporter.load()`.
+  - Records `reference_source_timezone` and a timestamp-conversion note on MT5
+    rows.
+  - Keeps matrix metrics header/stat based; only imported trade timestamps and
+    row metadata change.
+- `validation/importers/mt5_xlsx.py`
+  - Updated type annotations to reflect existing `tzinfo` support.
+  - Resolves `source_timezone` once before timestamp parsing so unknown
+    timezones raise `ValueError` instead of being swallowed as datetime parse
+    failures.
+  - Records the effective `source_timezone` in raw metadata for auditability,
+    including the `UTC` fallback when none is provided.
+- `scripts/analyze_mt5_parity.py`
+  - Uses the same MT5 source timezone for its diagnostics.
+- `tests/validation/test_cross_platform_metrics.py`
+  - Added a regression proving the SP500 XLSX reference loaded with the matrix
+    timezone aligns to the platform UTC entry time
+    `2018-01-16T14:45:00Z`.
+- `tests/validation/test_mt5_xlsx_importer.py`
+  - Added coverage for effective timezone metadata and unknown-timezone
+    rejection in `_to_iso()`.
+
+### Trade-Level Diagnostics After Timestamp Alignment
+
+Trades were greedily matched by exact UTC entry timestamp and direction after
+Athens-local MT5 import. Direct matches remain a subset because the platform
+and MT5 artifacts still differ in data source, signal generation details, and
+some entry timestamps.
+
+| Case | MT5 Trades | Platform Trades | Matched By Entry+Direction | MT5 Exit Mix | Platform Exit Mix |
+|---|---:|---:|---:|---|---|
+| SP500 M1 | 512 | 576 | 113 | SL 238 / signal-or-none 274 | SL 356 / signal 220 |
+| EURUSD H1 | 492 | 496 | 176 | SL 198 / signal-or-none 294 | SL 267 / signal 229 |
+| NAS100 M15 | 597 | 589 | 127 | SL 293 / signal-or-none 304 | SL 379 / signal 210 |
+
+Matched reason-pair summaries:
+
+| Case | MT5 Signal -> Platform Signal | MT5 Signal -> Platform SL | MT5 SL -> Platform SL | MT5 SL -> Platform Signal |
+|---|---:|---:|---:|---:|
+| SP500 M1 | 52 | 11 | 46 | 4 |
+| EURUSD H1 | 74 | 25 | 71 | 6 |
+| NAS100 M15 | 51 | 23 | 50 | 3 |
+
+When MT5 exited by signal/blank but the platform exited by stop, the platform
+stop occurred before the MT5 signal exit in every matched case:
+
+- SP500 M1: `11/11` before, median `-19,920` seconds.
+- EURUSD H1: `25/25` before, median `-17,460` seconds.
+- NAS100 M15: `23/23` before, median `-20,250` seconds.
+
+Price-difference evidence:
+
+- EURUSD matched entry, stop, and exit prices are very close on average
+  (`entry mean diff -0.000017`, `stop mean diff -0.000075`,
+  `exit mean diff -0.000052`), yet platform stops still occur earlier. This
+  points to stop-path/data-source differences in intrabar high/low/tick history
+  rather than a simple timestamp or direction bug.
+- Index matched price differences are much larger, especially NAS100
+  (`entry mean diff +4.085`, `stop mean diff +9.710`), consistent with the
+  known Dukascopy website-vs-MT5 data-source and bid/ask convention gap.
+
+No further stop/exit code change was made in this slice because the evidence
+does not identify a clear remaining platform execution bug. The next useful
+artifact would be an MT5 tick or M1 bid/ask export for the mismatched stop
+windows so the exact stop path can be replayed against the platform data.
+
+### Risk Parity Re-Verification
+
+Current code was checked against the specific open questions:
+
+- `scripts/run_risk_parity_backtest.py` still skips accepted trade rows when
+  `abs(delta) <= rebalance_threshold`, with default `rebalance_threshold=0.02`.
+- This is intentional and matches
+  `strategy-comparisons/risk_parity/risk_parity_strategy.py`, where
+  `ExecuteTrades()` calls `SetHoldings()` only when
+  `abs(current_weight - target_weight) > 0.02`.
+- Removing the threshold is not parity-improving: local reruns produced `1098`
+  trade rows at threshold `0.0`, versus reference `240` and current platform
+  `241`.
+- Current execution pricing already prefers rebalance-day opens through
+  `execution_price()` when `open_prices` is available. Close prices remain in
+  the attribution mark-to-market path, not the accepted trade fill path.
+
+### Verification For This Slice
+
+- `python -m py_compile validation/statistics/cross_platform.py validation/importers/mt5_xlsx.py scripts/analyze_mt5_parity.py scripts/compare_strategy_metrics.py`
+  - Result: passed.
+- `pytest -q tests/validation/test_cross_platform_metrics.py tests/validation/test_mt5_xlsx_importer.py`
+  - Result: `48 passed`.
+- `pytest tests/validation/ tests/validators/ -q`
+  - Result: `467 passed`.
+- `cd frontend && npm ci && npm run build`
+  - Result: passed. `npm ci` reported 4 existing audit findings; Vite reported
+    existing chunk-size warnings.
+- `python scripts/compare_strategy_metrics.py --output reports/strategy_metric_comparison_matrix.json`
+  - Result: passed; regenerated the matrix with MT5 source-timezone metadata.

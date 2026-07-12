@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-07-12T15:35:32.922872+00:00",
+  "generated_at": "2026-07-12T17:34:20.172450+00:00",
   "metrics": [
     "trade_count",
     "win_rate",
@@ -73,8 +73,10 @@
       ],
       "notes": [
         "MT5 fills, spread/commission, contract sizing and fixed-risk execution differ from platform fills.",
+        "MT5 trade timestamps are interpreted as Europe/Athens local time and converted to UTC.",
         "MT5 CAGR is derived from report period, initial deposit and net profit because the XLSX summary omits CAGR."
-      ]
+      ],
+      "reference_source_timezone": "Europe/Athens"
     },
     {
       "case_id": "intraday_volatility_breakout_eurusd_h1",
@@ -140,8 +142,10 @@
       ],
       "notes": [
         "MT5 fills, spread/commission, contract sizing and fixed-risk execution differ from platform fills.",
+        "MT5 trade timestamps are interpreted as Europe/Athens local time and converted to UTC.",
         "MT5 CAGR is derived from report period, initial deposit and net profit because the XLSX summary omits CAGR."
-      ]
+      ],
+      "reference_source_timezone": "Europe/Athens"
     },
     {
       "case_id": "intraday_volatility_breakout_nas100_m15",
@@ -207,8 +211,10 @@
       ],
       "notes": [
         "MT5 fills, spread/commission, contract sizing and fixed-risk execution differ from platform fills.",
+        "MT5 trade timestamps are interpreted as Europe/Athens local time and converted to UTC.",
         "MT5 CAGR is derived from report period, initial deposit and net profit because the XLSX summary omits CAGR."
-      ]
+      ],
+      "reference_source_timezone": "Europe/Athens"
     },
     {
       "case_id": "risk_parity_quantconnect",

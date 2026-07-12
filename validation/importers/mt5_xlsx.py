@@ -83,7 +83,7 @@ def _resolve_source_timezone(source_tz: str | tzinfo | None) -> tzinfo | None:
 class MT5XLSXImporter(BaseImporter):
     """Import MT5 Strategy Tester XLSX reports (German UI)."""
 
-    def load(self, source: str | Path, source_timezone: str | None = None, **kwargs: Any) -> ValidationReference:
+    def load(self, source: str | Path, source_timezone: str | tzinfo | None = None, **kwargs: Any) -> ValidationReference:
         """Read an MT5 XLSX report and return a ``ValidationReference``.
 
         Parameters
@@ -91,7 +91,7 @@ class MT5XLSXImporter(BaseImporter):
         source:
             Path to the ``.xlsx`` file.
         source_timezone:
-            Optional IANA timezone name (e.g. "Europe/Athens") of the report's timestamps.
+            Optional IANA timezone name (e.g. "Europe/Athens") or ``tzinfo`` of the report's timestamps.
             If provided, naive timestamps will be interpreted in this timezone and
             converted to UTC. Defaults to UTC if not provided.
         **kwargs:
@@ -101,6 +101,7 @@ class MT5XLSXImporter(BaseImporter):
         if not path.exists():
             raise FileNotFoundError(f"MT5 XLSX report not found: {path}")
 
+        resolved_timezone = _resolve_source_timezone(source_timezone)
         df_raw = pd.read_excel(path, header=None, sheet_name=0, **kwargs)
         rows = df_raw.values.tolist()
 
@@ -117,7 +118,11 @@ class MT5XLSXImporter(BaseImporter):
         meta = self._parse_meta(rows, orders_header_idx)
         settings = meta.pop("settings", {})
         stats = self._parse_stats(rows, orders_header_idx)
-        raw_metadata = {"parsed_meta": meta, "parsed_stats": stats}
+        raw_metadata = {
+            "parsed_meta": meta,
+            "parsed_stats": stats,
+            "source_timezone": str(resolved_timezone or timezone.utc),
+        }
 
         # Parse Orders table for SL/TP from Orders table
         orders_df = self._extract_table(df_raw, orders_header_idx, end_idx=trades_header_idx)
@@ -125,7 +130,7 @@ class MT5XLSXImporter(BaseImporter):
 
         # Parse Trades / Deals table
         trades_df = self._extract_table(df_raw, trades_header_idx, end_idx=None)
-        trades = self._build_trades(trades_df, sltp_map, source_timezone)
+        trades = self._build_trades(trades_df, sltp_map, resolved_timezone)
 
         return ValidationReference(
             strategy_name=meta.get("strategy_name", "unknown"),
@@ -423,7 +428,7 @@ class MT5XLSXImporter(BaseImporter):
     def _build_trades(
         trades_df: pd.DataFrame,
         sltp_map: dict[Any, dict[str, float | None]],
-        source_timezone: str | None = None,
+        source_timezone: str | tzinfo | None = None,
     ) -> list[Trade]:
         if trades_df.empty:
             return []
@@ -578,10 +583,10 @@ class MT5XLSXImporter(BaseImporter):
     def _to_iso(raw: str, source_tz: str | tzinfo | None = None) -> str:
         """Convert MT5 datetime string to ISO-8601 UTC string."""
         text = raw.strip() if raw else ""
+        tz = _resolve_source_timezone(source_tz)
         for fmt in ("%Y.%m.%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
             try:
                 dt = datetime.strptime(text, fmt)
-                tz = _resolve_source_timezone(source_tz)
                 if tz:
                     dt = dt.replace(tzinfo=tz)
                     dt = dt.astimezone(timezone.utc)
