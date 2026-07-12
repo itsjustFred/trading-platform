@@ -28,6 +28,7 @@ from scripts.run_risk_parity_backtest import (
     detect_correlation_regime,
     first_available_trading_dates,
     latest_correlation_regime,
+    run_backtest,
     weekly_correlation_regimes,
 )
 
@@ -146,3 +147,75 @@ def test_weekly_correlation_regimes_returns_scheduled_state():
     assert regimes
     assert all(date in returns.index for date in regimes)
     assert set(regimes.values()).issubset({"normal", "elevated", "crisis"})
+
+
+def test_run_backtest_skips_small_rebalance_changes_and_fills_material_changes_at_open(monkeypatch):
+    dates = pd.bdate_range("2023-12-29", "2024-03-15")
+    dates = dates[dates != pd.Timestamp("2024-01-01")]
+    close_prices = pd.DataFrame(100.0, index=dates, columns=TICKERS)
+    open_prices = close_prices + 1.0
+
+    baseline = {ticker: 1.0 / len(TICKERS) for ticker in TICKERS}
+    small_shift = dict(baseline)
+    small_shift["SPY"] += 0.01
+    small_shift["QQQ"] -= 0.01
+    material_shift = dict(baseline)
+    material_shift["SPY"] += 0.03
+    material_shift["QQQ"] -= 0.03
+    weight_sequence = iter([baseline, small_shift, material_shift])
+
+    import scripts.run_risk_parity_backtest as risk_parity
+
+    monkeypatch.setattr(risk_parity, "calculate_covariance", lambda *args, **kwargs: np.eye(len(TICKERS)))
+    monkeypatch.setattr(risk_parity, "calculate_risk_parity_weights", lambda *args, **kwargs: next(weight_sequence))
+    monkeypatch.setattr(risk_parity, "adjust_for_regime", lambda weights, regime: dict(weights))
+    monkeypatch.setattr(
+        risk_parity,
+        "apply_volatility_scaling",
+        lambda weights, cov, target_vol, max_leverage, max_weight, tickers: dict(weights),
+    )
+    monkeypatch.setattr(risk_parity, "apply_tail_risk_hedge", lambda weights: dict(weights))
+    monkeypatch.setattr(risk_parity, "weekly_correlation_regimes", lambda returns: {})
+
+    result = run_backtest(
+        start_date=str(dates[0].date()),
+        end_date=str(dates[-1].date()),
+        prices=close_prices,
+        open_prices=open_prices,
+        warm_up_days=0,
+    )
+
+    trades = result["trades"]
+    jan_trades = [trade for trade in trades if trade["exit_time"].startswith("2024-01-02")]
+    feb_trades = [trade for trade in trades if trade["exit_time"].startswith("2024-02-01")]
+    mar_trades = [trade for trade in trades if trade["exit_time"].startswith("2024-03-01")]
+
+    assert len(jan_trades) == len(TICKERS)
+    assert len(feb_trades) == 0
+    assert len(mar_trades) == 2
+    assert result["stats"]["total_trades"] == len(TICKERS) + 2
+
+    mar_spy = next(trade for trade in mar_trades if trade["symbol"] == "SPY")
+    mar_qqq = next(trade for trade in mar_trades if trade["symbol"] == "QQQ")
+    assert mar_spy["quantity"] == pytest.approx(0.03, abs=1e-6)
+    assert mar_qqq["quantity"] == pytest.approx(0.03, abs=1e-6)
+    assert mar_spy["entry_time"].startswith("2024-01-02")
+    assert mar_qqq["entry_time"].startswith("2024-01-02")
+    assert mar_spy["entry_price"] == pytest.approx(open_prices.loc[pd.Timestamp("2024-01-02"), "SPY"])
+    assert mar_qqq["entry_price"] == pytest.approx(open_prices.loc[pd.Timestamp("2024-01-02"), "QQQ"])
+    assert mar_spy["exit_price"] == pytest.approx(open_prices.loc[pd.Timestamp("2024-03-01"), "SPY"])
+    assert mar_qqq["exit_price"] == pytest.approx(open_prices.loc[pd.Timestamp("2024-03-01"), "QQQ"])
+
+
+def test_run_backtest_rejects_warmup_longer_than_prices():
+    dates = pd.bdate_range("2024-01-02", periods=3)
+    prices = pd.DataFrame(100.0, index=dates, columns=TICKERS)
+
+    with pytest.raises(ValueError, match="warm_up_days"):
+        run_backtest(
+            start_date=str(dates[0].date()),
+            end_date=str(dates[-1].date()),
+            prices=prices,
+            open_prices=prices,
+            warm_up_days=len(prices),
+        )

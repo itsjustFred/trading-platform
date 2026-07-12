@@ -3,7 +3,7 @@
 
 This script runs a close Python reimplementation of the QuantConnect
 `risk_parity_strategy.py` algorithm.  It uses yfinance to download daily
-adjusted close prices and rebalances monthly.  The resulting trades and
+adjusted close and open prices and rebalances monthly.  The resulting trades and
 statistics are written to `data/backtests/` as both a raw trades JSON and a
 `ValidationReference` JSON for comparison with the PDF reference report.
 
@@ -49,13 +49,15 @@ ASSETS: dict[str, dict[str, str]] = {
 TICKERS = list(ASSETS.keys())
 
 
-def download_prices(start: str, end: str) -> pd.DataFrame:
-    """Download adjusted daily close prices from yfinance."""
+def download_prices(start: str, end: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Download adjusted daily close and open prices from yfinance."""
     data = yf.download(TICKERS, start=start, end=end, auto_adjust=True, progress=False)
     # yfinance returns a MultiIndex when multiple tickers
     closes = data["Close"].copy() if "Close" in data.columns else data.copy()
+    opens = data["Open"].copy() if "Open" in data.columns else closes.copy()
     closes = closes.dropna(how="all")
-    return closes
+    opens = opens.reindex(closes.index)
+    return closes, opens
 
 
 def calculate_covariance(returns_matrix: np.ndarray, shrinkage: float = 0.2) -> np.ndarray:
@@ -230,9 +232,18 @@ def run_backtest(
     start_date: str = "2016-01-01",
     end_date: str = "2024-12-31",
     initial_cash: float = 1_000_000.0,
+    prices: pd.DataFrame | None = None,
+    open_prices: pd.DataFrame | None = None,
+    warm_up_days: int = 150,
+    rebalance_threshold: float = 0.02,
 ) -> dict[str, Any]:
     """Run the risk parity backtest and return result dict."""
-    prices = download_prices(start_date, end_date)
+    if prices is None:
+        prices, open_prices = download_prices(start_date, end_date)
+    elif open_prices is None:
+        open_prices = prices
+    if not 0 <= warm_up_days < len(prices):
+        raise ValueError("warm_up_days must be non-negative and less than the number of price rows")
     returns = prices.pct_change().dropna()
     returns = returns[TICKERS]  # ensure column order
 
@@ -244,13 +255,14 @@ def run_backtest(
     max_weight = 0.30
 
     # Rebalance on the first trading day of each month after warm-up
-    warm_up_days = 150
     rebalance_dates = pd.date_range(start=prices.index[0], end=prices.index[-1], freq="MS")
     rebalance_dates = rebalance_dates[rebalance_dates > prices.index[warm_up_days]]
     rebalance_dates = first_available_trading_dates(prices.index, rebalance_dates)
     regime_schedule = weekly_correlation_regimes(returns)
 
     current_weights: dict[str, float] = {t: 0.0 for t in TICKERS}
+    position_entry_prices: dict[str, float | None] = {t: None for t in TICKERS}
+    position_entry_times: dict[str, pd.Timestamp | None] = {t: None for t in TICKERS}
     rebalance_schedule: dict[pd.Timestamp, dict[str, float]] = {}
     trades: list[dict[str, Any]] = []
     portfolio_value_at_rebalance = float(initial_cash)
@@ -266,6 +278,14 @@ def run_backtest(
             portfolio_value_at_rebalance *= 1 + daily_ret
         last_rebalance_value_date = rebalance_date
         return portfolio_value_at_rebalance
+
+    def execution_price(ticker: str, date: pd.Timestamp) -> float:
+        """Prefer the rebalance-day open when it is available locally."""
+        if open_prices is not None and ticker in open_prices.columns and date in open_prices.index:
+            price = open_prices.at[date, ticker]
+            if pd.notna(price):
+                return float(price)
+        return float(prices.at[date, ticker])
 
     for i, reb_date in enumerate(rebalance_dates):
         current_portfolio_value = advance_portfolio_value(reb_date)
@@ -290,40 +310,54 @@ def run_backtest(
         if spy_price < spy_sma * 0.98:
             weights = apply_tail_risk_hedge(weights)
 
-        # Smooth rebalancing: only trade if weight change > 2%
         for ticker in TICKERS:
-            if abs(current_weights.get(ticker, 0.0) - weights[ticker]) > 0.02:
-                direction = "LONG" if weights[ticker] >= 0 else "SHORT"
-                price = float(prices[ticker].loc[reb_date])
-                prev_weight = current_weights.get(ticker, 0.0)
-                prev_price = price if i == 0 else float(prices[ticker].loc[rebalance_dates[i - 1]])
-                pnl = (
-                    (price - prev_price)
-                    / prev_price
-                    * prev_weight
-                    * current_portfolio_value
-                    if prev_weight and i > 0
-                    else 0.0
-                )
-                trades.append(
-                    {
-                        "entry_time": reb_date.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                        "symbol": ticker,
-                        "exit_time": (
-                            rebalance_dates[i + 1].strftime("%Y-%m-%dT%H:%M:%SZ")
-                            if i + 1 < len(rebalance_dates)
-                            else prices.index[-1].strftime("%Y-%m-%dT%H:%M:%SZ")
-                        ),
-                        "direction": direction,
-                        "entry_price": round(price, 6),
-                        "exit_price": None,
-                        "quantity": round(abs(weights[ticker] - prev_weight), 6),
-                        "position_size": round(abs(weights[ticker]) * current_portfolio_value, 2),
-                        "pnl": round(pnl, 2),
-                        "meta": {"regime": regime, "hedge_active": bool(spy_price < spy_sma * 0.98)},
-                    }
-                )
-                current_weights[ticker] = weights[ticker]
+            prev_weight = current_weights.get(ticker, 0.0)
+            delta = weights[ticker] - prev_weight
+            if abs(delta) <= rebalance_threshold:
+                continue
+
+            price = execution_price(ticker, reb_date)
+            entry_price = position_entry_prices.get(ticker)
+            entry_time = position_entry_times.get(ticker)
+            if entry_price is None or entry_time is None:
+                entry_price = price
+                entry_time = reb_date
+            direction = "LONG" if prev_weight >= 0 else "SHORT"
+            if not prev_weight:
+                direction = "LONG" if delta >= 0 else "SHORT"
+            realizes_pnl = bool(bool(prev_weight) and abs(weights[ticker]) < abs(prev_weight))
+            pnl = (
+                (price - entry_price)
+                / entry_price
+                * prev_weight
+                * current_portfolio_value
+                if realizes_pnl and entry_price
+                else 0.0
+            )
+            trades.append(
+                {
+                    "entry_time": entry_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "symbol": ticker,
+                    "exit_time": reb_date.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "direction": direction,
+                    "entry_price": round(entry_price, 6),
+                    "exit_price": round(price, 6),
+                    "quantity": round(abs(delta), 6),
+                    "position_size": round(abs(weights[ticker]) * current_portfolio_value, 2),
+                    "pnl": round(pnl, 2),
+                    "meta": {
+                        "regime": regime,
+                        "hedge_active": bool(spy_price < spy_sma * 0.98),
+                        "previous_weight": round(prev_weight, 8),
+                        "target_weight": round(weights[ticker], 8),
+                        "delta_weight": round(delta, 8),
+                        "realizes_pnl": realizes_pnl,
+                    },
+                }
+            )
+            current_weights[ticker] = weights[ticker]
+            position_entry_prices[ticker] = price
+            position_entry_times[ticker] = reb_date
 
         rebalance_schedule[reb_date] = dict(current_weights)
 
@@ -340,6 +374,7 @@ def run_backtest(
             portfolio_value.loc[date] = portfolio_value.iloc[prev_idx] * (1 + daily_ret)
 
     total_return = float(portfolio_value.iloc[-1] / portfolio_value.iloc[0] - 1)
+    equity_net_profit = float(portfolio_value.iloc[-1] - portfolio_value.iloc[0])
     years = (portfolio_value.index[-1] - portfolio_value.index[0]).days / 365.25
     cagr = float((portfolio_value.iloc[-1] / portfolio_value.iloc[0]) ** (1 / years) - 1)
 
@@ -359,7 +394,7 @@ def run_backtest(
     gross_profit = sum(t["pnl"] for t in winning_trades)
     gross_loss = sum(t["pnl"] for t in losing_trades)
     profit_factor = abs(gross_profit / gross_loss) if gross_loss else 0.0
-    net_profit = gross_profit + gross_loss
+    realized_trade_net_profit = gross_profit + gross_loss
 
     stats = {
         "total_return": round(total_return, 6),
@@ -369,7 +404,8 @@ def run_backtest(
         "sortino_ratio": round(sortino, 6),
         "max_drawdown": round(max_drawdown, 6),
         "max_drawdown_pct": round(max_drawdown * 100, 6),
-        "net_profit": round(net_profit, 2),
+        "net_profit": round(equity_net_profit, 2),
+        "realized_trade_net_profit": round(realized_trade_net_profit, 2),
         "gross_profit": round(gross_profit, 2),
         "gross_loss": round(gross_loss, 2),
         "profit_factor": round(profit_factor, 6),

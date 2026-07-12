@@ -23,9 +23,10 @@ DEFAULT_OUTPUT = Path("data/backtests/risk_parity_quantconnect_reimplementation.
 DEFAULT_SOURCE = Path("ohlcv/yfinance/equity/US")
 
 
-def _load_local_prices(data_dir: Path, source: Path, start: str, end: str) -> pd.DataFrame:
+def _load_local_prices(data_dir: Path, source: Path, start: str, end: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     root = data_dir / source
-    columns: dict[str, pd.Series] = {}
+    close_columns: dict[str, pd.Series] = {}
+    open_columns: dict[str, pd.Series] = {}
     start_ts = pd.Timestamp(start, tz="UTC")
     end_ts = pd.Timestamp(end, tz="UTC")
 
@@ -35,21 +36,27 @@ def _load_local_prices(data_dir: Path, source: Path, start: str, end: str) -> pd
             raise FileNotFoundError(f"Missing local Risk Parity data for {ticker}: {path}")
         frame = pd.read_parquet(path)
         frame.columns = [str(col).lower() for col in frame.columns]
-        required = {"timestamp", "close"}
+        required = {"timestamp", "close", "open"}
         missing = required.difference(frame.columns)
         if missing:
             raise ValueError(f"{path} missing columns: {', '.join(sorted(missing))}")
         timestamps = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
         closes = pd.to_numeric(frame["close"], errors="coerce")
-        series = pd.Series(closes.values, index=timestamps).dropna().sort_index()
-        series = series[(series.index >= start_ts) & (series.index <= end_ts)]
-        if series.empty:
+        opens = pd.to_numeric(frame["open"], errors="coerce")
+        close_series = pd.Series(closes.values, index=timestamps).dropna().sort_index()
+        open_series = pd.Series(opens.values, index=timestamps).dropna().sort_index()
+        close_series = close_series[(close_series.index >= start_ts) & (close_series.index <= end_ts)]
+        open_series = open_series[(open_series.index >= start_ts) & (open_series.index <= end_ts)]
+        if close_series.empty:
             raise ValueError(f"No usable local Risk Parity rows for {ticker}: {path}")
-        columns[ticker] = series
+        close_columns[ticker] = close_series
+        open_columns[ticker] = open_series
 
-    prices = pd.DataFrame(columns).dropna(how="all")
+    prices = pd.DataFrame(close_columns).dropna(how="all")
+    open_prices = pd.DataFrame(open_columns).reindex(prices.index)
     prices.index = prices.index.tz_convert(None)
-    return prices
+    open_prices.index = open_prices.index.tz_convert(None)
+    return prices, open_prices
 
 
 def _to_iso(value: Any) -> str:
@@ -143,10 +150,10 @@ def _build_result(result: dict[str, Any], prices: pd.DataFrame, *, start: str, e
 
 
 def regenerate(*, data_dir: Path, source: Path, output: Path, start: str, end: str) -> BacktestResult:
-    prices = _load_local_prices(data_dir, source, start, end)
+    prices, open_prices = _load_local_prices(data_dir, source, start, end)
 
-    def local_prices(_: str, __: str) -> pd.DataFrame:
-        return prices.copy()
+    def local_prices(_: str, __: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+        return prices.copy(), open_prices.copy()
 
     original = risk_parity.download_prices
     risk_parity.download_prices = local_prices

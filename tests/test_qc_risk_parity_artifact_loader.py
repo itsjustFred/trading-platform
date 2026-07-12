@@ -23,8 +23,11 @@ def test_load_local_prices_reads_complete_local_parquet_universe(tmp_path: Path)
             }
         ).to_parquet(symbol_dir / "1d.parquet", index=False)
 
-    prices = _load_local_prices(tmp_path, source, "2020-01-01", "2020-01-03")
+    prices, open_prices = _load_local_prices(tmp_path, source, "2020-01-01", "2020-01-03")
 
     assert list(prices.columns) == TICKERS
     assert len(prices) == 3
     assert prices["SPY"].iloc[0] == 100.5
+    assert list(open_prices.columns) == TICKERS
+    assert len(open_prices) == 3
+    assert open_prices["SPY"].iloc[0] == 100
