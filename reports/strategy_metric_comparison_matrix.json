@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-07-12T13:45:55.704762+00:00",
+  "generated_at": "2026-07-12T15:35:32.922872+00:00",
   "metrics": [
     "trade_count",
     "win_rate",
@@ -225,8 +225,8 @@
       },
       "platform": {
         "trade_count": 241.0,
-        "win_rate": 0.20332,
-        "net_profit": 464381.17,
+        "win_rate": 0.541985,
+        "net_profit": 456272.05,
         "cagr": 0.043363,
         "sharpe_ratio": 0.4228
       },
@@ -242,17 +242,17 @@
         {
           "metric": "win_rate",
           "reference": 0.575,
-          "platform": 0.20332,
-          "absolute_delta": -0.37167999999999995,
-          "relative_delta": -0.6464,
+          "platform": 0.541985,
+          "absolute_delta": -0.033014999999999906,
+          "relative_delta": -0.05741739130434766,
           "note": ""
         },
         {
           "metric": "net_profit",
           "reference": 126183.49,
-          "platform": 464381.17,
-          "absolute_delta": 338197.68,
-          "relative_delta": 0.7282760409945132,
+          "platform": 456272.05,
+          "absolute_delta": 330088.56,
+          "relative_delta": 0.7234468120499601,
           "note": ""
         },
         {
@@ -274,6 +274,7 @@
       ],
       "notes": [
         "QuantConnect PDF summary has limited extractable trade detail; JSON reference carries the auditable fields.",
+        "For qc-parity platform artifacts, win_rate and net_profit use explicit rebalance-attribution fields when present.",
         "Risk Parity implementations may differ in universe, rebalance timing, covariance estimator and R_f convention."
       ]
     }

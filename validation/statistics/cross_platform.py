@@ -129,6 +129,7 @@ def _build_json_reference_row(case_id: str, reference_path: Path, platform_path:
         platform_stats=platform_stats,
         notes=[
             "QuantConnect PDF summary has limited extractable trade detail; JSON reference carries the auditable fields.",
+            "For qc-parity platform artifacts, win_rate and net_profit use explicit rebalance-attribution fields when present.",
             "Risk Parity implementations may differ in universe, rebalance timing, covariance estimator and R_f convention.",
         ],
     )
@@ -232,6 +233,11 @@ def _load_platform_stats(
             **compute_stats_for_result(result, risk_free_rate=risk_free_rate),
         }
     normalized = _normalize_reference_stats(stats)
+    attribution_win_rate = _safe_float(stats.get("rebalance_attribution_win_rate"))
+    attribution_net_profit = _safe_float(stats.get("rebalance_attribution_net_profit"))
+    if _prefers_rebalance_attribution_stats(result, attribution_win_rate, attribution_net_profit):
+        normalized["win_rate"] = attribution_win_rate
+        normalized["net_profit"] = attribution_net_profit
     if normalized["net_profit"] is None:
         normalized["net_profit"] = _safe_float(stats.get("total_pnl"))
     return normalized
@@ -242,6 +248,20 @@ def _prefers_stored_platform_stats(result: BacktestResult) -> bool:
     tags = {str(tag).lower() for tag in (result.meta.tags or [])}
     engine = str(result.meta.engine or "").strip().lower()
     return "qc-parity" in tags or engine == "python-reimplementation"
+
+
+def _prefers_rebalance_attribution_stats(
+    result: BacktestResult,
+    attribution_win_rate: float | None,
+    attribution_net_profit: float | None,
+) -> bool:
+    tags = {str(tag).lower() for tag in (result.meta.tags or [])}
+    return (
+        "qc-parity" in tags
+        and attribution_net_profit is not None
+        and attribution_win_rate is not None
+    )
+
 
 def _extract_mt5_period(path: Path) -> tuple[datetime, datetime] | None:
     try:

@@ -265,6 +265,7 @@ def run_backtest(
     position_entry_times: dict[str, pd.Timestamp | None] = {t: None for t in TICKERS}
     rebalance_schedule: dict[pd.Timestamp, dict[str, float]] = {}
     trades: list[dict[str, Any]] = []
+    rebalance_attribution_pnls: list[float] = []
     portfolio_value_at_rebalance = float(initial_cash)
     last_rebalance_value_date = returns.index[0]
 
@@ -288,6 +289,7 @@ def run_backtest(
         return float(prices.at[date, ticker])
 
     for i, reb_date in enumerate(rebalance_dates):
+        interval_start_portfolio_value = portfolio_value_at_rebalance
         current_portfolio_value = advance_portfolio_value(reb_date)
         loc = returns.index.get_loc(reb_date)
         hist_start = max(0, loc - lookback_corr + 1)
@@ -312,6 +314,17 @@ def run_backtest(
 
         for ticker in TICKERS:
             prev_weight = current_weights.get(ticker, 0.0)
+            if i > 0 and prev_weight:
+                attribution_price = float(prices[ticker].loc[reb_date])
+                attribution_prev_price = float(prices[ticker].loc[rebalance_dates[i - 1]])
+                attribution_pnl = (
+                    (attribution_price - attribution_prev_price)
+                    / attribution_prev_price
+                    * prev_weight
+                    * interval_start_portfolio_value
+                )
+                rebalance_attribution_pnls.append(round(attribution_pnl, 2))
+
             delta = weights[ticker] - prev_weight
             if abs(delta) <= rebalance_threshold:
                 continue
@@ -395,6 +408,16 @@ def run_backtest(
     gross_loss = sum(t["pnl"] for t in losing_trades)
     profit_factor = abs(gross_profit / gross_loss) if gross_loss else 0.0
     realized_trade_net_profit = gross_profit + gross_loss
+    attribution_winners = [pnl for pnl in rebalance_attribution_pnls if pnl > 0]
+    attribution_losers = [pnl for pnl in rebalance_attribution_pnls if pnl < 0]
+    attribution_gross_profit = sum(attribution_winners)
+    attribution_gross_loss = sum(attribution_losers)
+    attribution_net_profit = attribution_gross_profit + attribution_gross_loss
+    attribution_win_rate = (
+        len(attribution_winners) / len(rebalance_attribution_pnls)
+        if rebalance_attribution_pnls
+        else 0.0
+    )
 
     stats = {
         "total_return": round(total_return, 6),
@@ -410,6 +433,10 @@ def run_backtest(
         "gross_loss": round(gross_loss, 2),
         "profit_factor": round(profit_factor, 6),
         "win_rate": round(win_rate, 6),
+        "rebalance_attribution_net_profit": round(attribution_net_profit, 2),
+        "rebalance_attribution_gross_profit": round(attribution_gross_profit, 2),
+        "rebalance_attribution_gross_loss": round(attribution_gross_loss, 2),
+        "rebalance_attribution_win_rate": round(attribution_win_rate, 6),
         "total_trades": len(trades),
     }
 

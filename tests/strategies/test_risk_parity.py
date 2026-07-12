@@ -194,6 +194,8 @@ def test_run_backtest_skips_small_rebalance_changes_and_fills_material_changes_a
     assert len(feb_trades) == 0
     assert len(mar_trades) == 2
     assert result["stats"]["total_trades"] == len(TICKERS) + 2
+    assert result["stats"]["rebalance_attribution_win_rate"] == pytest.approx(0.0)
+    assert result["stats"]["rebalance_attribution_net_profit"] == pytest.approx(0.0)
 
     mar_spy = next(trade for trade in mar_trades if trade["symbol"] == "SPY")
     mar_qqq = next(trade for trade in mar_trades if trade["symbol"] == "QQQ")

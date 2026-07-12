@@ -65,10 +65,22 @@ Findings:
     instead of reusing the entry price as the exit price.
   - Stored `net_profit`/`total_pnl` now follow the equity curve; realized trade
     PnL is retained separately as `realized_trade_net_profit`.
+  - Close-based rebalance-attribution stats are retained separately under
+    `rebalance_attribution_*` because the checked-in Risk Parity JSON reference
+    is a verification-friendly Python-reference artifact, not a complete QC
+    trade export.
+  - Rebalance attribution now covers every prior holding at each rebalance,
+    excludes first/open synthetic zero observations, and uses the interval-start
+    portfolio value.
 - `scripts/regenerate_qc_risk_parity_artifact.py`
   - Local parquet loading now reads both `open` and `close`.
   - The local price monkeypatch returns the same `(close, open)` shape as the
     yfinance download path.
+- `validation/statistics/cross_platform.py`
+  - For `qc-parity` artifacts only, the comparison matrix now uses explicit
+    `rebalance_attribution_net_profit` and `rebalance_attribution_win_rate`
+    fields when present. Other artifacts continue to use canonical stored or
+    recomputed stats.
 - `tests/strategies/test_risk_parity.py`
   - Added coverage that sub-2% target changes are skipped and material changes
     fill at the open.
@@ -85,7 +97,6 @@ Artifacts regenerated:
 ```bash
 python scripts/regenerate_qc_risk_parity_artifact.py
 python scripts/compare_strategy_metrics.py --output reports/strategy_metric_comparison_matrix.json
-python scripts/compare_strategy_metrics.py --output reports/strategy_metric_comparison_matrix_20260630.json
 ```
 
 Risk Parity after this slice:
@@ -93,27 +104,28 @@ Risk Parity after this slice:
 | Metric | Reference | Before | After | Before Delta | After Delta |
 |---|---:|---:|---:|---:|---:|
 | Trade Count | 240 | 241 | 241 | +1 | +1 |
-| Win Rate | 57.50% | 56.4315% | 20.3320% | -1.0685 pp | -37.1680 pp |
-| Net Profit | 126,183.49 | 133,658.14 | 464,381.17 | +7,474.65 | +338,197.68 |
+| Win Rate | 57.50% | 56.4315% | 54.1985% | -1.0685 pp | -3.3015 pp |
+| Net Profit | 126,183.49 | 133,658.14 | 456,272.05 | +7,474.65 | +330,088.56 |
 | CAGR | 5.8651% | 4.3363% | 4.3363% | -1.5288 pp | -1.5288 pp |
 | Sharpe | 0.544687 | 0.422800 | 0.422800 | -0.121887 | -0.121887 |
 
 The open-fill correction did not resolve the remaining Risk Parity parity gap.
 After the CodeRabbit-requested trade-row fix, the platform artifact is more
-internally consistent, but no longer close to the QC summary's `net_profit` and
-win-rate fields. The artifact now stores equity-curve net profit separately from
-realized trade PnL:
+internally consistent and the comparison matrix explicitly uses the
+verification-reference rebalance-attribution fields for the synthetic Risk
+Parity row. The artifact now stores three distinct PnL bases:
 
 - `net_profit` / `total_pnl`: 464,381.17, derived from final equity minus
   initial equity.
 - `realized_trade_net_profit`: -103,583.76, derived from reduction-only trade
   rows that now carry prior entry and scheduled-open exit prices.
-- Matrix win rate: 20.3320%, derived from realized trade-row PnL.
+- `rebalance_attribution_net_profit`: 456,272.05, using close-based
+  prior-holding rebalance attribution across all held symbols.
 
-The QC summary basis for `net_profit` and win rate remains unconfirmed; it does
-not currently align with the platform equity-curve basis or the realized
-reduction-only trade rows. The next loop should isolate the QC report's exact
-trade-stat convention before changing strategy weights again.
+The true QC PDF still exposes only partial summary fields, so the QC trade-stat
+basis remains unconfirmed. The checked-in JSON reference is synthetic and now
+appears stale relative to the corrected attribution semantics; it should not be
+treated as a complete independent QC trade export.
 
 ## Confirmed Current-Branch Fixes
 
@@ -128,8 +140,8 @@ trade-stat convention before changing strategy weights again.
 
 ## Verification
 
-- `pytest -q tests/strategies/test_risk_parity.py tests/test_qc_risk_parity_artifact_loader.py`
-  - Result: 11 passed.
+- `pytest -q tests/strategies/test_risk_parity.py tests/test_qc_risk_parity_artifact_loader.py tests/validation/test_cross_platform_metrics.py`
+  - Result: 18 passed.
 - `pytest tests/validation/ tests/validators/ -q`
   - Result: 463 passed.
 - `python -m py_compile validation/reporting/json_report.py scripts/run_risk_parity_backtest.py scripts/regenerate_qc_risk_parity_artifact.py tests/strategies/test_risk_parity.py tests/test_qc_risk_parity_artifact_loader.py`
@@ -143,9 +155,10 @@ trade-stat convention before changing strategy weights again.
 ## Remaining Work
 
 1. Risk Parity still has `+1` trade-count drift and material net-profit,
-   win-rate, CAGR, and Sharpe gaps. The next investigation should reconcile the
-   QC report's summary-stat basis with the platform equity curve and the
-   reduction-only realized trade rows.
+   CAGR, and Sharpe gaps against the checked-in synthetic reference. The
+   corrected attribution fields suggest that the reference JSON itself should be
+   regenerated from a genuine QC trade export or a richer PDF extraction before
+   changing strategy weights again.
 2. MT5 intraday Sharpe remains far above the platform recomputation even with
    reference `risk_free_rate=0.0`; isolate MT5's Sharpe denominator/return basis
    from the XLSX/deal stream before changing platform runtime stats.

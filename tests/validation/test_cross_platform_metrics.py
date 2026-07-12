@@ -104,6 +104,80 @@ def test_cross_platform_matrix_recomputes_sharpe_with_reference_risk_free_rate(t
     assert "risk_free_rate=0.0" in matrix["risk_free_rate_note"]
 
 
+def test_cross_platform_matrix_uses_qc_rebalance_attribution_stats(tmp_path):
+    result = BacktestResult(
+        meta=BacktestMeta(
+            id="risk_parity_quantconnect_reimplementation",
+            created_at="2026-07-12T00:00:00+00:00",
+            engine="python-reimplementation",
+            strategies=["RiskParityStrategy"],
+            tags=["qc-parity", "risk-parity"],
+            initial_capital=1_000_000.0,
+        ),
+        trades=[],
+        equity_curve=[],
+        stats={
+            "total_trades": 3,
+            "win_rate": 0.1,
+            "net_profit": 999.0,
+            "cagr": 0.2,
+            "sharpe_ratio": 0.3,
+            "rebalance_attribution_win_rate": 0.75,
+            "rebalance_attribution_net_profit": 123.45,
+        },
+    )
+    result.save(tmp_path / "risk_parity_quantconnect_reimplementation.json")
+
+    matrix = build_comparison_matrix(
+        comparisons_dir=PROJECT_ROOT / "strategy-comparisons",
+        reports_dir=PROJECT_ROOT / "reports",
+        platform_data_dir=tmp_path,
+    )
+
+    rows = {row["case_id"]: row for row in matrix["rows"]}
+    platform = rows["risk_parity_quantconnect"]["platform"]
+    assert platform["win_rate"] == pytest.approx(0.75)
+    assert platform["net_profit"] == pytest.approx(123.45)
+    assert platform["cagr"] == pytest.approx(0.2)
+    assert platform["sharpe_ratio"] == pytest.approx(0.3)
+
+
+def test_cross_platform_matrix_ignores_malformed_qc_attribution_stats(tmp_path):
+    result = BacktestResult(
+        meta=BacktestMeta(
+            id="risk_parity_quantconnect_reimplementation",
+            created_at="2026-07-12T00:00:00+00:00",
+            engine="python-reimplementation",
+            strategies=["RiskParityStrategy"],
+            tags=["qc-parity", "risk-parity"],
+            initial_capital=1_000_000.0,
+        ),
+        trades=[],
+        equity_curve=[],
+        stats={
+            "total_trades": 3,
+            "win_rate": 0.1,
+            "net_profit": 999.0,
+            "cagr": 0.2,
+            "sharpe_ratio": 0.3,
+            "rebalance_attribution_win_rate": "not-a-number",
+            "rebalance_attribution_net_profit": "not-a-number",
+        },
+    )
+    result.save(tmp_path / "risk_parity_quantconnect_reimplementation.json")
+
+    matrix = build_comparison_matrix(
+        comparisons_dir=PROJECT_ROOT / "strategy-comparisons",
+        reports_dir=PROJECT_ROOT / "reports",
+        platform_data_dir=tmp_path,
+    )
+
+    rows = {row["case_id"]: row for row in matrix["rows"]}
+    platform = rows["risk_parity_quantconnect"]["platform"]
+    assert platform["win_rate"] == pytest.approx(0.1)
+    assert platform["net_profit"] == pytest.approx(999.0)
+
+
 def test_regenerator_outputs_match_cross_platform_matrix_paths():
     matrix = build_comparison_matrix(
         comparisons_dir=PROJECT_ROOT / "strategy-comparisons",
