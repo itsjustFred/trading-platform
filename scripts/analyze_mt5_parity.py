@@ -10,6 +10,7 @@ from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -28,6 +29,7 @@ from scripts.regenerate_mt5_parity_artifacts import (
 )
 
 MT5_SOURCE_TIMEZONE = "Europe/Athens"
+SESSION_TIMEZONE = ZoneInfo("Europe/Athens")
 
 
 @dataclass(frozen=True)
@@ -117,17 +119,67 @@ def _match_by_entry_and_direction(
     reference_trades: list[Any],
     platform_trades: list[dict[str, Any]],
 ) -> list[tuple[Any, dict[str, Any]]]:
+    matches, _, _ = _split_by_entry_and_direction(reference_trades, platform_trades)
+    return matches
+
+
+def _split_by_entry_and_direction(
+    reference_trades: list[Any],
+    platform_trades: list[dict[str, Any]],
+) -> tuple[list[tuple[Any, dict[str, Any]]], list[Any], list[dict[str, Any]]]:
     platform_by_key: dict[tuple[pd.Timestamp, str], deque[dict[str, Any]]] = defaultdict(deque)
     for trade in platform_trades:
         key = (_utc_timestamp(trade["entry_time"]), str(trade.get("direction", "")).upper())
         platform_by_key[key].append(trade)
 
     matched: list[tuple[Any, dict[str, Any]]] = []
+    unmatched_reference: list[Any] = []
     for trade in reference_trades:
         key = (_utc_timestamp(trade.entry_time), str(trade.direction).upper())
         if platform_by_key[key]:
             matched.append((trade, platform_by_key[key].popleft()))
-    return matched
+        else:
+            unmatched_reference.append(trade)
+    unmatched_platform = [trade for queue in platform_by_key.values() for trade in queue]
+    return matched, unmatched_reference, unmatched_platform
+
+
+def _timestamp_only_overlap_count(reference_trades: list[Any], platform_trades: list[dict[str, Any]]) -> int:
+    reference_counts = Counter(_utc_timestamp(trade.entry_time) for trade in reference_trades)
+    platform_counts = Counter(_utc_timestamp(trade["entry_time"]) for trade in platform_trades)
+    return sum(min(count, platform_counts.get(timestamp, 0)) for timestamp, count in reference_counts.items())
+
+
+def _direction_counts(trades: list[Any]) -> dict[str, int]:
+    counts: Counter[str] = Counter()
+    for trade in trades:
+        if isinstance(trade, dict):
+            direction = str(trade.get("direction", "")).upper()
+        else:
+            direction = str(getattr(trade, "direction", "")).upper()
+        counts[direction or "UNKNOWN"] += 1
+    return dict(sorted(counts.items()))
+
+
+def _entry_timestamp(trade: Any) -> pd.Timestamp:
+    if isinstance(trade, dict):
+        return _utc_timestamp(trade["entry_time"])
+    return _utc_timestamp(trade.entry_time)
+
+
+def _session_minute_label(timestamp: pd.Timestamp) -> str:
+    session_timestamp = timestamp.tz_convert(SESSION_TIMEZONE)
+    return f"{session_timestamp.hour:02d}:{session_timestamp.minute:02d}"
+
+
+def _top_session_minutes(trades: list[Any], limit: int) -> list[tuple[str, int]]:
+    counts = Counter(_session_minute_label(_entry_timestamp(trade)) for trade in trades)
+    return counts.most_common(limit)
+
+
+def _year_counts(trades: list[Any]) -> dict[int, int]:
+    counts = Counter(_entry_timestamp(trade).year for trade in trades)
+    return dict(sorted(counts.items()))
 
 
 def _series_stats(values: list[float]) -> dict[str, float | int | None]:
@@ -546,6 +598,43 @@ def sharpe_conventions(args: argparse.Namespace) -> None:
             print(f"{name}: {value:.6f} delta={value - report_sharpe:+.6f}")
 
 
+def unmatched_entries(args: argparse.Namespace) -> None:
+    importer = MT5XLSXImporter()
+    for label, mt5_path in MT5_REPORTS.items():
+        reference = importer.load(mt5_path, source_timezone=MT5_SOURCE_TIMEZONE)
+        platform = _load_platform(_platform_path(label))
+        platform_trades = list(platform.get("trades", []))
+        matches, unmatched_reference, unmatched_platform = _split_by_entry_and_direction(
+            reference.trades,
+            platform_trades,
+        )
+        timestamp_overlap = _timestamp_only_overlap_count(reference.trades, platform_trades)
+        direction_conflicts = max(0, timestamp_overlap - len(matches))
+
+        print(f"\n{label}")
+        print(
+            f"entry_direction_matches={len(matches)} "
+            f"timestamp_only_overlap={timestamp_overlap} "
+            f"direction_conflicts={direction_conflicts}"
+        )
+        print(
+            f"unmatched_mt5={len(unmatched_reference)} "
+            f"unmatched_platform={len(unmatched_platform)}"
+        )
+        print(f"unmatched_mt5_directions={_direction_counts(unmatched_reference)}")
+        print(f"unmatched_platform_directions={_direction_counts(unmatched_platform)}")
+        print(f"unmatched_mt5_years={_year_counts(unmatched_reference)}")
+        print(f"unmatched_platform_years={_year_counts(unmatched_platform)}")
+        print(
+            "unmatched_mt5_session_minutes="
+            f"{_top_session_minutes(unmatched_reference, args.top)}"
+        )
+        print(
+            "unmatched_platform_session_minutes="
+            f"{_top_session_minutes(unmatched_platform, args.top)}"
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, default=Path("/mnt/block-volume-data"))
@@ -567,6 +656,9 @@ def main() -> None:
     p_match.add_argument("--skip-ohlc", action="store_true", help="Skip local OHLC stop-touch replay.")
     p_match.set_defaults(func=matched_stop_path)
     sub.add_parser("sharpe-conventions").set_defaults(func=sharpe_conventions)
+    p_unmatched = sub.add_parser("unmatched-entries")
+    p_unmatched.add_argument("--top", type=int, default=5, help="Number of top session-minute buckets to print.")
+    p_unmatched.set_defaults(func=unmatched_entries)
     args = parser.parse_args()
     args.func(args)
 

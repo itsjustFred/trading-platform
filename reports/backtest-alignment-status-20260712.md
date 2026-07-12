@@ -546,6 +546,47 @@ The diagnostic helper is covered by `tests/test_analyze_mt5_parity.py`, includin
 UTC timestamp normalization, entry/direction matching, exit-reason
 classification, and summary-stat formatting for the stop-path report.
 
+### MT5 Unmatched Entry Audit
+
+The trade-count and direction residuals are now reproducible with:
+
+```bash
+python scripts/analyze_mt5_parity.py unmatched-entries --top 3
+```
+
+Exact entry timestamp plus direction matches remain a minority of trades; pure
+timestamp-only direction conflicts are small:
+
+| Case | Entry+Direction Matches | Timestamp-Only Overlap | Direction Conflicts |
+|---|---:|---:|---:|
+| EURUSD H1 | 176 | 177 | 1 |
+| NAS100 M15 | 127 | 132 | 5 |
+| SP500 M1 | 113 | 118 | 5 |
+
+Unmatched counts and direction mix:
+
+| Case | Unmatched MT5 | Unmatched Platform | Unmatched MT5 Direction Mix | Unmatched Platform Direction Mix |
+|---|---:|---:|---|---|
+| EURUSD H1 | 316 | 320 | LONG 165 / SHORT 151 | LONG 164 / SHORT 156 |
+| NAS100 M15 | 470 | 462 | LONG 227 / SHORT 243 | LONG 254 / SHORT 208 |
+| SP500 M1 | 399 | 463 | LONG 189 / SHORT 210 | LONG 242 / SHORT 221 |
+
+The index cases show a strong platform-only early-session cluster at `16:45`
+Athens local time:
+
+| Case | Top Unmatched MT5 Session-Minute Buckets | Top Unmatched Platform Session-Minute Buckets |
+|---|---|---|
+| EURUSD H1 | 17:15 (76), 17:30 (64), 17:45 (61) | 17:15 (67), 17:00 (59), 17:45 (54) |
+| NAS100 M15 | 17:15 (109), 17:00 (97), 17:30 (86) | 16:45 (178), 17:00 (101), 17:15 (79) |
+| SP500 M1 | 17:15 (84), 17:00 (77), 17:30 (74) | 16:45 (147), 17:00 (112), 17:15 (64) |
+
+This narrows the count residual to signal/data timing rather than trade
+aggregation: the platform frequently sees valid early index breakouts at
+`16:45` that are absent from the MT5 trade stream, while later MT5 entries are
+not one-for-one present in the platform artifacts. This is consistent with the
+known Dukascopy website-vs-MT5 data-source and confirmation-bar input
+differences; it is not yet enough to prove a safe strategy timing code change.
+
 ### MT5 Sharpe Convention Audit
 
 The MT5 Sharpe residual is now reproducible with:

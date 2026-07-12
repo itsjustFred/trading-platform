@@ -1,10 +1,14 @@
 from shared.models import Trade, TradeExit
 from scripts.analyze_mt5_parity import (
+    _direction_counts,
     _match_by_entry_and_direction,
     _mt5_exit_reason,
     _platform_exit_reason,
     _sharpe_convention_candidates,
     _series_stats,
+    _split_by_entry_and_direction,
+    _timestamp_only_overlap_count,
+    _top_session_minutes,
     _utc_timestamp,
 )
 
@@ -73,6 +77,49 @@ def test_match_by_entry_and_direction_uses_utc_timestamp_not_string_spelling():
 
     assert len(matches) == 1
     assert matches[0][1] is platform[0]
+
+
+def test_split_by_entry_and_direction_preserves_unmatched_and_direction_conflicts():
+    reference = [
+        _trade(entry_time="2024-01-01T10:00:00Z", direction="LONG"),
+        _trade(entry_time="2024-01-01T11:00:00Z", direction="SHORT"),
+    ]
+    platform = [
+        {
+            "entry_time": "2024-01-01T10:00:00+00:00",
+            "direction": "LONG",
+            "entry_price": 100.0,
+            "exits": [{"time": "2024-01-01T10:30:00+00:00", "price": 101.0}],
+        },
+        {
+            "entry_time": "2024-01-01T11:00:00+00:00",
+            "direction": "LONG",
+            "entry_price": 100.0,
+            "exits": [{"time": "2024-01-01T11:30:00+00:00", "price": 101.0}],
+        },
+    ]
+
+    matches, unmatched_reference, unmatched_platform = _split_by_entry_and_direction(
+        reference,
+        platform,
+    )
+
+    assert len(matches) == 1
+    assert unmatched_reference == [reference[1]]
+    assert unmatched_platform == [platform[1]]
+    assert _timestamp_only_overlap_count(reference, platform) == 2
+    assert _direction_counts(unmatched_reference) == {"SHORT": 1}
+    assert _direction_counts(unmatched_platform) == {"LONG": 1}
+
+
+def test_top_session_minutes_uses_athens_local_time():
+    trades = [
+        _trade(entry_time="2024-01-01T14:45:00Z"),
+        _trade(entry_time="2024-01-02T14:45:00Z"),
+        _trade(entry_time="2024-01-03T15:00:00Z"),
+    ]
+
+    assert _top_session_minutes(trades, 2) == [("16:45", 2), ("17:00", 1)]
 
 
 def test_exit_reason_helpers_classify_stop_and_platform_signal():
