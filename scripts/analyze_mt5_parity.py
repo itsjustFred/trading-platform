@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -18,7 +19,12 @@ if str(PROJECT_ROOT) not in sys.path:
 from validation.importers.mt5_xlsx import MT5XLSXImporter
 from strategies.intraday_volatility_breakout.intraday_volatility_breakout import generate_signals
 from runner.engines.base import resolve_strategy_parameters
-from scripts.regenerate_mt5_parity_artifacts import COMPARISON_CASES, STRATEGY_PATH, _load_ohlcv
+from scripts.regenerate_mt5_parity_artifacts import (
+    COMPARISON_CASES,
+    STRATEGY_PATH,
+    _load_ohlcv,
+    _opposite_side_series,
+)
 
 MT5_SOURCE_TIMEZONE = "Europe/Athens"
 
@@ -47,6 +53,150 @@ def _platform_path(label: str) -> Path:
 
 def _load_platform(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _utc_timestamp(value: Any) -> pd.Timestamp:
+    ts = pd.Timestamp(value)
+    if ts.tzinfo is None:
+        return ts.tz_localize("UTC")
+    return ts.tz_convert("UTC")
+
+
+def _trade_exit(trade: Any) -> Any | None:
+    exits = getattr(trade, "exits", None)
+    if exits:
+        return exits[-1]
+    if isinstance(trade, dict):
+        raw_exits = trade.get("exits") or []
+        return raw_exits[-1] if raw_exits else None
+    return None
+
+
+def _trade_exit_price(trade: Any) -> float | None:
+    exit_obj = _trade_exit(trade)
+    if exit_obj is None:
+        return None
+    if isinstance(exit_obj, dict):
+        value = exit_obj.get("price")
+    else:
+        value = getattr(exit_obj, "price", None)
+    return float(value) if value is not None else None
+
+
+def _trade_exit_time(trade: Any) -> str | None:
+    exit_obj = _trade_exit(trade)
+    if exit_obj is None:
+        return None
+    if isinstance(exit_obj, dict):
+        return exit_obj.get("time")
+    return getattr(exit_obj, "time", None)
+
+
+def _platform_exit_reason(trade: dict[str, Any]) -> str:
+    exit_obj = _trade_exit(trade)
+    if isinstance(exit_obj, dict):
+        return str(exit_obj.get("reason") or trade.get("exit_reason") or "")
+    return str(trade.get("exit_reason") or "")
+
+
+def _mt5_exit_reason(trade: Any) -> str:
+    reason = str(getattr(trade, "exit_reason", "") or "")
+    if reason:
+        return reason
+    stop_loss = getattr(trade, "meta", {}).get("stop_loss")
+    exit_price = _trade_exit_price(trade)
+    if stop_loss is None or exit_price is None:
+        return "signal_or_none"
+    stop = float(stop_loss)
+    tolerance = max(1e-5, abs(stop) * 1e-7)
+    return "stop_loss" if abs(exit_price - stop) <= tolerance else "signal_or_none"
+
+
+def _match_by_entry_and_direction(
+    reference_trades: list[Any],
+    platform_trades: list[dict[str, Any]],
+) -> list[tuple[Any, dict[str, Any]]]:
+    platform_by_key: dict[tuple[pd.Timestamp, str], deque[dict[str, Any]]] = defaultdict(deque)
+    for trade in platform_trades:
+        key = (_utc_timestamp(trade["entry_time"]), str(trade.get("direction", "")).upper())
+        platform_by_key[key].append(trade)
+
+    matched: list[tuple[Any, dict[str, Any]]] = []
+    for trade in reference_trades:
+        key = (_utc_timestamp(trade.entry_time), str(trade.direction).upper())
+        if platform_by_key[key]:
+            matched.append((trade, platform_by_key[key].popleft()))
+    return matched
+
+
+def _series_stats(values: list[float]) -> dict[str, float | int | None]:
+    if not values:
+        return {"n": 0, "mean": None, "median": None, "p25": None, "p75": None}
+    series = pd.Series(values, dtype=float)
+    return {
+        "n": int(series.count()),
+        "mean": float(series.mean()),
+        "median": float(series.median()),
+        "p25": float(series.quantile(0.25)),
+        "p75": float(series.quantile(0.75)),
+    }
+
+
+def _format_stats(stats: dict[str, float | int | None]) -> str:
+    if not stats["n"]:
+        return "n=0"
+    return (
+        f"n={stats['n']} mean={float(stats['mean']):.6g} "
+        f"median={float(stats['median']):.6g} "
+        f"p25={float(stats['p25']):.6g} p75={float(stats['p75']):.6g}"
+    )
+
+
+def _local_stop_touch_counts(
+    *,
+    case: dict[str, Any],
+    data_dir: Path,
+    bad_matches: list[tuple[Any, dict[str, Any]]],
+) -> tuple[int, int, int]:
+    if not bad_matches:
+        return 0, 0, 0
+
+    df = _load_ohlcv(
+        data_dir,
+        str(case["execution_symbol"]),
+        str(case["execution_timeframe"]),
+        str(case["start"]),
+        str(case["end"]),
+    )
+    timestamps = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+    windows = 0
+    mt5_stop_touches = 0
+    platform_stop_touches = 0
+    for reference_trade, platform_trade in bad_matches:
+        mt5_stop = getattr(reference_trade, "meta", {}).get("stop_loss")
+        platform_stop = platform_trade.get("meta", {}).get("sl_price")
+        reference_exit_time = _trade_exit_time(reference_trade)
+        if mt5_stop is None or platform_stop is None or reference_exit_time is None:
+            continue
+
+        start = timestamps.searchsorted(_utc_timestamp(platform_trade["entry_time"]), side="right")
+        end = timestamps.searchsorted(_utc_timestamp(reference_exit_time), side="right")
+        if end <= start:
+            continue
+
+        windows += 1
+        side = str(platform_trade.get("direction", "")).upper()
+        if side == "LONG":
+            prices = _opposite_side_series(df, side, "low").iloc[start:end]
+            mt5_touched = bool((prices <= float(mt5_stop)).any())
+            platform_touched = bool((prices <= float(platform_stop)).any())
+        else:
+            prices = _opposite_side_series(df, side, "high").iloc[start:end]
+            mt5_touched = bool((prices >= float(mt5_stop)).any())
+            platform_touched = bool((prices >= float(platform_stop)).any())
+        mt5_stop_touches += int(mt5_touched)
+        platform_stop_touches += int(platform_touched)
+    return windows, mt5_stop_touches, platform_stop_touches
 
 
 def summary(args: argparse.Namespace) -> None:
@@ -195,6 +345,83 @@ def data_quality(args: argparse.Namespace) -> None:
             )
 
 
+def matched_stop_path(args: argparse.Namespace) -> None:
+    cases = _case_by_label()
+    importer = MT5XLSXImporter()
+    for label, mt5_path in MT5_REPORTS.items():
+        case = cases[label]
+        reference = importer.load(mt5_path, source_timezone=MT5_SOURCE_TIMEZONE)
+        platform = _load_platform(_platform_path(label))
+        platform_trades = list(platform.get("trades", []))
+        matches = _match_by_entry_and_direction(reference.trades, platform_trades)
+
+        print(f"\n{label}")
+        print(f"matched={len(matches)} mt5_trades={len(reference.trades)} platform_trades={len(platform_trades)}")
+
+        reason_pairs = Counter((_mt5_exit_reason(ref), _platform_exit_reason(plat)) for ref, plat in matches)
+        for pair, count in sorted(reason_pairs.items()):
+            print(f"reason_pair {pair[0]} -> {pair[1]}: {count}")
+
+        stop_ratios: list[float] = []
+        bad_bucket_ratios: list[float] = []
+        bad_matches: list[tuple[Any, dict[str, Any]]] = []
+        entry_diffs: list[float] = []
+        exit_diffs: list[float] = []
+        exit_time_diffs: list[float] = []
+        for reference_trade, platform_trade in matches:
+            platform_exit = _trade_exit(platform_trade)
+            mt5_exit_price = _trade_exit_price(reference_trade)
+            platform_exit_price = _trade_exit_price(platform_trade)
+            mt5_stop = getattr(reference_trade, "meta", {}).get("stop_loss")
+            platform_stop = platform_trade.get("meta", {}).get("sl_price")
+            mt5_reason = _mt5_exit_reason(reference_trade)
+            platform_reason = _platform_exit_reason(platform_trade)
+
+            entry_diffs.append(float(platform_trade["entry_price"]) - float(reference_trade.entry_price))
+            if mt5_exit_price is not None and platform_exit_price is not None:
+                exit_diffs.append(platform_exit_price - mt5_exit_price)
+            if platform_exit is not None:
+                reference_exit_time = _trade_exit_time(reference_trade)
+                platform_exit_time = _trade_exit_time(platform_trade)
+                if reference_exit_time and platform_exit_time:
+                    exit_time_diffs.append(
+                        (
+                            _utc_timestamp(platform_exit_time)
+                            - _utc_timestamp(reference_exit_time)
+                        ).total_seconds()
+                    )
+
+            if mt5_stop is None or platform_stop is None:
+                continue
+            mt5_distance = abs(float(reference_trade.entry_price) - float(mt5_stop))
+            platform_distance = abs(float(platform_trade["entry_price"]) - float(platform_stop))
+            if mt5_distance <= 0:
+                continue
+            ratio = platform_distance / mt5_distance
+            stop_ratios.append(ratio)
+            if mt5_reason != "stop_loss" and platform_reason == "stop_loss":
+                bad_matches.append((reference_trade, platform_trade))
+                bad_bucket_ratios.append(ratio)
+
+        print(f"entry_price_diff {_format_stats(_series_stats(entry_diffs))}")
+        print(f"exit_price_diff {_format_stats(_series_stats(exit_diffs))}")
+        print(f"exit_time_diff_seconds {_format_stats(_series_stats(exit_time_diffs))}")
+        print(f"stop_distance_ratio {_format_stats(_series_stats(stop_ratios))}")
+        print(f"bad_bucket_stop_distance_ratio {_format_stats(_series_stats(bad_bucket_ratios))}")
+
+        if args.skip_ohlc:
+            continue
+        windows, mt5_touches, platform_touches = _local_stop_touch_counts(
+            case=case,
+            data_dir=args.data_dir,
+            bad_matches=bad_matches,
+        )
+        print(
+            "bad_bucket_local_ohlc_touches "
+            f"windows={windows} mt5_stop={mt5_touches} platform_stop={platform_touches}"
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, default=Path("/mnt/block-volume-data"))
@@ -212,6 +439,9 @@ def main() -> None:
     p_quality.add_argument("--offsets", type=float, nargs="+", default=[-4, -3, -2, -1, 0, 1, 2, 3, 4])
     p_quality.add_argument("--tolerance-seconds", type=int, default=60)
     p_quality.set_defaults(func=data_quality)
+    p_match = sub.add_parser("matched-stop-path")
+    p_match.add_argument("--skip-ohlc", action="store_true", help="Skip local OHLC stop-touch replay.")
+    p_match.set_defaults(func=matched_stop_path)
     args = parser.parse_args()
     args.func(args)
 

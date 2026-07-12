@@ -492,6 +492,12 @@ timezone or stop-path change was adopted from that branch.
 
 ### Residual Stop-Path Evidence
 
+The residual stop-path audit is now reproducible with:
+
+```bash
+python scripts/analyze_mt5_parity.py matched-stop-path
+```
+
 After importing MT5 XLSX timestamps as `Europe/Athens` and matching greedily by
 exact UTC entry timestamp plus direction, the matched trade subsets remain:
 
@@ -535,6 +541,10 @@ stops inferred from the XLSX trade rows. This is consistent with remaining
 Dukascopy website-vs-MT5 data-source, bid/ask, and daily ATR construction
 differences. A stronger fix would require MT5 tick/M1 bid-ask exports, or a
 reference export containing the EA's per-trade ATR and stop-distance values.
+
+The diagnostic helper is covered by `tests/test_analyze_mt5_parity.py`, including
+UTC timestamp normalization, entry/direction matching, exit-reason
+classification, and summary-stat formatting for the stop-path report.
 
 ### Risk Parity Check
 
