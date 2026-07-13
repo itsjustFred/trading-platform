@@ -132,6 +132,21 @@ def test_trade_engine_market_entry_and_signal_exit_price_model():
 
     expected_entry_price = float(data.iloc[11]["open"])
     assert trade.entry_price == expected_entry_price
+    assert trade.meta["execution_model"] == {
+        "market_order_timing": "next_bar_open",
+        "entry_price_side": "open",
+        "stop_trigger_side": "bar_low_high",
+        "take_profit_trigger_side": "bar_high_low",
+        "same_bar_order": "stop_first",
+        "intrabar_resolution": None,
+        "lower_timeframe_replay": False,
+    }
+    assert trade.meta["entry_fill"] == {
+        "order_type": "market",
+        "price_side": "open",
+        "timestamp": trade.entry_time,
+        "price": trade.entry_price,
+    }
 
 
 def test_trade_engine_stop_uses_bar_low_and_risk_sizing_1pct():
@@ -262,6 +277,48 @@ def test_trade_engine_can_anchor_market_stop_to_fill_price_with_stop_distance():
     assert trade.exits[-1].price == pytest.approx(118.0)
     assert trade.exits[-1].reason == "stop_loss"
     assert trade.pnl == pytest.approx(-1000.0, abs=0.5)
+
+
+def test_trade_engine_can_configure_same_bar_take_profit_priority():
+    data = _synthetic_ohlcv(100)
+    data.loc[12, "high"] = 113.0
+    data.loc[12, "low"] = 109.0
+
+    def strategy_fn(df: pd.DataFrame, params: dict):
+        entries = pd.Series(False, index=df.index)
+        exits = pd.Series(False, index=df.index)
+        entries.iloc[10] = True
+        indicators = {
+            "direction": pd.Series("LONG", index=df.index),
+            "stop_loss": pd.Series(pd.NA, index=df.index),
+            "take_profit": pd.Series(pd.NA, index=df.index),
+        }
+        indicators["stop_loss"].iloc[10] = 109.0
+        indicators["take_profit"].iloc[10] = 112.0
+        return entries, exits, indicators, []
+
+    cfg = BacktestConfig(
+        strategy_name="execution-test",
+        symbols=["TEST"],
+        timeframe="1h",
+        start_date="2024-01-01",
+        end_date="2024-01-31",
+        initial_capital=100_000,
+        risk_per_trade_pct=0.01,
+        max_leverage=3.0,
+        modeling_resolution="main_timeframe",
+        parameters={"same_bar_order": "take_profit_first"},
+    )
+
+    engine = TradeEngine(cfg, symbol="TEST")
+    result = engine.run(data, strategy_fn)
+
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    assert trade.exits[-1].price == pytest.approx(112.0)
+    assert trade.exits[-1].reason == "tp"
+    assert trade.meta["execution_model"]["same_bar_order"] == "take_profit_first"
+    assert trade.pnl > 0
 
 
 def test_example_sma_native_vs_vectorbt_trade_count_similarity():

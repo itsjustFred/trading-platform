@@ -29,6 +29,69 @@ class OrderType(Enum):
     STOP_LIMIT = "stop_limit"
 
 
+@dataclass(frozen=True)
+class ExecutionModelSettings:
+    """Native execution-model assumptions recorded with each trade.
+
+    The native engine currently enforces ``same_bar_order``. The other fields
+    document existing runtime behavior for auditability; they are metadata-only
+    until a later branch wires them into fill or trigger mechanics.
+    """
+
+    market_order_timing: str = "next_bar_open"
+    entry_price_side: str = "open"
+    stop_trigger_side: str = "bar_low_high"
+    take_profit_trigger_side: str = "bar_high_low"
+    same_bar_order: str = "stop_first"
+    intrabar_resolution: str | None = None
+    lower_timeframe_replay: bool = False
+
+    @classmethod
+    def from_config(cls, config: BacktestConfig) -> "ExecutionModelSettings":
+        params = dict(config.parameters or {})
+        nested = params.get("execution_model")
+        if isinstance(nested, dict):
+            params = {**params, **nested}
+
+        modeling_resolution = str(config.modeling_resolution or "").strip()
+        intrabar_resolution = (
+            modeling_resolution
+            if modeling_resolution
+            and modeling_resolution not in {"main_timeframe", "open_close", config.timeframe}
+            else None
+        )
+        same_bar_order = str(params.get("same_bar_order") or "stop_first").strip().lower()
+        if same_bar_order in {"tp_first", "take_profit_first"}:
+            same_bar_order = "take_profit_first"
+        elif same_bar_order in {"stop", "stop_loss_first"}:
+            same_bar_order = "stop_first"
+        if same_bar_order not in {"stop_first", "take_profit_first"}:
+            raise ValueError("same_bar_order must be 'stop_first' or 'take_profit_first'")
+
+        return cls(
+            market_order_timing=str(params.get("market_order_timing") or "next_bar_open"),
+            entry_price_side=str(params.get("entry_price_side") or "open"),
+            stop_trigger_side=str(params.get("stop_trigger_side") or "bar_low_high"),
+            take_profit_trigger_side=str(
+                params.get("take_profit_trigger_side") or "bar_high_low"
+            ),
+            same_bar_order=same_bar_order,
+            intrabar_resolution=intrabar_resolution,
+            lower_timeframe_replay=intrabar_resolution is not None,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "market_order_timing": self.market_order_timing,
+            "entry_price_side": self.entry_price_side,
+            "stop_trigger_side": self.stop_trigger_side,
+            "take_profit_trigger_side": self.take_profit_trigger_side,
+            "same_bar_order": self.same_bar_order,
+            "intrabar_resolution": self.intrabar_resolution,
+            "lower_timeframe_replay": self.lower_timeframe_replay,
+        }
+
+
 @dataclass
 class Order:
     symbol: str
@@ -52,6 +115,7 @@ class Position:
     entry_index: int
     entry_time: str
     entry_price: float
+    order_type: str
     quantity: float
     remaining_qty: float
     stop_loss: float | None = None
@@ -81,6 +145,7 @@ class TradeEngine:
         self.equity_curve: list[EquityPoint] = []
         self.drawings: list[dict[str, Any]] = []
         self._indicator_series: list[IndicatorSeries] = []
+        self._execution_model = ExecutionModelSettings.from_config(config)
         self._realized_pnl = 0.0
         self._trade_counter = 0
         self._signals_frame: pd.DataFrame | None = None
@@ -331,6 +396,7 @@ class TradeEngine:
                 entry_index=i,
                 entry_time=fill_time,
                 entry_price=float(fill_price),
+                order_type=order.order_type.value,
                 quantity=float(order.quantity),
                 remaining_qty=float(order.quantity),
                 stop_loss=order.stop_loss,
@@ -471,7 +537,16 @@ class TradeEngine:
             mae=float(position.mae),
             mfe=float(position.mfe),
             holding_bars=max(0, int(exit_index - position.entry_index)),
-            meta={"exit_reason": last_exit.reason or "signal"},
+            meta={
+                "exit_reason": last_exit.reason or "signal",
+                "execution_model": self._execution_model.to_dict(),
+                "entry_fill": {
+                    "order_type": position.order_type,
+                    "price_side": self._execution_model.entry_price_side,
+                    "timestamp": position.entry_time,
+                    "price": position.entry_price,
+                },
+            },
             tags=["native"],
         )
         self.closed_trades.append(trade)
@@ -536,7 +611,11 @@ class TradeEngine:
                 tp_hit = tp_price is not None and sub_low <= tp_price
 
             if stop_hit and tp_hit:
-                return "stop"
+                return (
+                    "tp"
+                    if self._execution_model.same_bar_order == "take_profit_first"
+                    else "stop"
+                )
             if stop_hit:
                 return "stop"
             if tp_hit:
@@ -575,7 +654,7 @@ class TradeEngine:
             first_tp_price = float(pending_tp[0]["price"]) if pending_tp else None
             first_event = None
             if stop_hit and tp_hit:
-                if self.config.modeling_resolution and self.config.modeling_resolution != self.config.timeframe:
+                if self._execution_model.intrabar_resolution is not None:
                     first_event = self._intrabar_first_trigger(
                         position,
                         position.stop_loss,
@@ -584,7 +663,11 @@ class TradeEngine:
                         next_time,
                     )
                 if first_event is None:
-                    first_event = "stop"
+                    first_event = (
+                        "tp"
+                        if self._execution_model.same_bar_order == "take_profit_first"
+                        else "stop"
+                    )
             elif stop_hit:
                 first_event = "stop"
             elif tp_hit:
