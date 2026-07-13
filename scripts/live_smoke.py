@@ -22,6 +22,10 @@ if str(PROJECT_ROOT) not in sys.path:
 
 DEFAULT_ACCOUNTS_ENV = PROJECT_ROOT / ".accounts.env"
 DEFAULT_REPORTS_DIR = PROJECT_ROOT / "reports"
+_SMOKE_MODE_ALIASES = {
+    "alpaca": "alpaca-crypto-roundtrip",
+    "ctrader": "ctrader-demo-roundtrip",
+}
 
 
 @dataclass
@@ -675,7 +679,9 @@ async def run_smoke(
     env = _env_values(accounts_env)
     checks: list[SmokeCheck] = []
 
-    if mode in {"account-check", "all"}:
+    normalized_mode = _SMOKE_MODE_ALIASES.get(mode, mode)
+
+    if normalized_mode in {"account-check", "all"}:
         checks.extend(await _alpaca_account_checks(env))
         checks.extend(
             await _ctrader_account_checks(
@@ -684,7 +690,7 @@ async def run_smoke(
                 timeout_seconds=timeout_seconds,
             )
         )
-    if mode in {"alpaca-crypto-roundtrip", "all"}:
+    if normalized_mode in {"alpaca-crypto-roundtrip", "all"}:
         checks.extend(
             await _alpaca_crypto_roundtrip(
                 env,
@@ -693,7 +699,7 @@ async def run_smoke(
                 timeout_seconds=timeout_seconds,
             )
         )
-    if mode in {"ctrader-demo-roundtrip", "all"}:
+    if normalized_mode in {"ctrader-demo-roundtrip", "all"}:
         checks.extend(
             await _ctrader_demo_roundtrip(
                 env,
@@ -703,11 +709,11 @@ async def run_smoke(
                 timeout_seconds=timeout_seconds,
             )
         )
-    if mode in {"discord-replay", "all"}:
+    if normalized_mode in {"discord-replay", "all"}:
         checks.extend(await _discord_replay_smoke())
 
     return SmokeReport(
-        mode=mode,
+        mode=normalized_mode,
         ok=all(check.ok for check in checks) and bool(checks),
         started_at=started_at,
         finished_at=_utc_now(),
@@ -721,7 +727,9 @@ def main(argv: list[str] | None = None) -> int:
         "--mode",
         choices=[
             "account-check",
+            "alpaca",
             "alpaca-crypto-roundtrip",
+            "ctrader",
             "ctrader-demo-roundtrip",
             "discord-replay",
             "all",
@@ -746,6 +754,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     os.environ.setdefault("PYTHONUNBUFFERED", "1")
+    args.mode = _SMOKE_MODE_ALIASES.get(args.mode, args.mode)
     if args.mode == "ctrader-adapter-worker":
         try:
             payload = asyncio.run(

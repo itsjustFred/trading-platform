@@ -52,6 +52,28 @@ def test_live_smoke_help_exposes_ctrader_broker_minimum_default(capsys) -> None:
     output = capsys.readouterr().out
     assert "--ctrader-volume" in output
     assert "100000" in output
+    assert "alpaca" in output
+    assert "ctrader" in output
+
+
+def test_live_smoke_accepts_broker_mode_aliases(tmp_path: Path, monkeypatch) -> None:
+    seen_modes: list[str] = []
+
+    async def fake_run_smoke(**kwargs):
+        seen_modes.append(kwargs["mode"])
+        return SmokeReport(
+            mode=kwargs["mode"],
+            ok=True,
+            started_at="2026-07-13T00:00:00+00:00",
+            finished_at="2026-07-13T00:00:01+00:00",
+            checks=[SmokeCheck(name="alias", ok=True)],
+        )
+
+    monkeypatch.setattr("scripts.live_smoke.run_smoke", fake_run_smoke)
+
+    assert main(["--mode", "alpaca", "--reports-dir", str(tmp_path)]) == 0
+    assert main(["--mode", "ctrader", "--reports-dir", str(tmp_path)]) == 0
+    assert seen_modes == ["alpaca-crypto-roundtrip", "ctrader-demo-roundtrip"]
 
 
 def test_discord_replay_smoke_routes_to_fake_order() -> None:
