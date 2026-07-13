@@ -65,8 +65,13 @@ Result: `26 passed`, compile checks passed, whitespace check passed.
 - Branch is ahead of `origin/codex/new-main` by 7 commits.
 - Remaining uncommitted pre-existing change: `reports/strategy_metric_comparison_matrix.json`, timestamp-only matrix regeneration diff. It was intentionally not included in either slice commit.
 
+## Broad Post-Merge Gates
+
+- `pytest tests/validation/ tests/validators/ -q`: `467 passed`
+- `cd frontend && npm ci && npm run build`: passed. NPM reported 4 existing audit findings; no frontend source or lockfile changes were produced.
+
 ## Remaining Work
 
-- Full broad gates are still pending for the overall program, including validation-suite and frontend build if required by the final integration pass.
 - External worktree branches `codex/intraday-signal-contract` and `codex/risk-parity-target-contract` still point at the pre-recovery commit `699ecc3`; the merged recovery branches contain the authoritative completed work in `codex/new-main`.
+- Remaining uncommitted pre-existing change: `reports/strategy_metric_comparison_matrix.json`, timestamp-only matrix regeneration diff.
 - No new external MT5/QC evidence was introduced in this architecture slice; parity-sensitive metric semantics were not changed.
