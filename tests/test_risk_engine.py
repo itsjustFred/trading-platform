@@ -1,12 +1,15 @@
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import math
+
+import pytest
 
 from live_runner.base_adapter import BaseLiveAdapter
 from live_runner.daemon import submit_order_with_risk
 from risk.engine import RiskEngine
 from risk.config import RiskConfig
-from risk.models import TradeSignal
+from risk.models import RiskDecision, TradeSignal
 from shared.models import LiveDeploymentConfig, LiveSignal
 
 
@@ -40,6 +43,15 @@ def test_calculate_position_size_normal_case():
     assert sized.risk_amount == 100.0
     assert sized.position_size == 50.0
     assert sized.risk_reward_ratio == 2.0
+    assert sized.decision is not None
+    assert sized.decision.accepted is True
+    assert sized.decision.signal_id.startswith("legacy:EURUSD:1h:buy:")
+    assert sized.decision.quantity == 50.0
+    assert sized.decision.risk_distance == 2.0
+    assert sized.decision.stop_price_used == 98.0
+    assert sized.decision.take_profit_used == 104.0
+    assert sized.decision.rejection_reason is None
+    assert sized.decision.metadata["stop_source"] == "signal"
 
 
 def test_calculate_position_size_exposure_limit_hit():
@@ -72,6 +84,9 @@ def test_calculate_position_size_exposure_limit_hit():
     assert sized.risk_amount == 0.0
     assert sized.risk_percent == 0.0
     assert sized.risk_reward_ratio is None
+    assert sized.decision is not None
+    assert sized.decision.accepted is False
+    assert sized.decision.rejection_reason == "max_total_exposure"
 
 
 def test_calculate_position_size_blocks_stop_on_wrong_side():
@@ -103,6 +118,10 @@ def test_calculate_position_size_blocks_stop_on_wrong_side():
     assert sized.position_size == 0.0
     assert sized.risk_amount == 0.0
     assert sized.risk_percent == 0.0
+    assert sized.decision is not None
+    assert sized.decision.accepted is False
+    assert sized.decision.rejection_reason == "bad_stop_direction"
+    assert sized.decision.stop_price_used == 102.0
 
 
 def test_calculate_position_size_missing_stop_loss_uses_fallback():
@@ -135,6 +154,72 @@ def test_calculate_position_size_missing_stop_loss_uses_fallback():
     assert signal.metadata.get("resolved_stop_loss") == signal.stop_loss
     assert sized.position_size > 0.0
     assert sized.risk_amount == 100.0
+    assert sized.decision is not None
+    assert sized.decision.accepted is True
+    assert sized.decision.stop_price_used == signal.stop_loss
+    assert sized.decision.metadata["stop_source"] == "fallback_atr"
+    assert ":none:" in sized.decision.signal_id
+
+
+def test_calculate_position_size_uses_explicit_signal_id_in_decision():
+    engine = RiskEngine()
+    signal = TradeSignal(
+        action="sell",
+        symbol="ES",
+        entry_price=5000.0,
+        stop_loss=5010.0,
+        take_profit=None,
+        timeframe="1m",
+        metadata={"signal_id": "intraday-es-001"},
+    )
+
+    sized = engine.calculate_position_size(
+        signal=signal,
+        account_balance=10000.0,
+        pip_value=1.0,
+        current_exposure=0.0,
+    )
+
+    assert sized.decision is not None
+    assert sized.decision.signal_id == "intraday-es-001"
+
+
+def test_risk_decision_rejects_malformed_wire_values():
+    with pytest.raises(ValueError, match="signal_id"):
+        RiskDecision(
+            signal_id="",
+            accepted=True,
+            quantity=0.0,
+            risk_amount=0.0,
+            risk_percent=0.0,
+            risk_distance=None,
+            stop_price_used=None,
+            take_profit_used=None,
+        )
+
+    with pytest.raises(ValueError, match="accepted"):
+        RiskDecision(
+            signal_id="risk-1",
+            accepted="maybe",  # type: ignore[arg-type]
+            quantity=0.0,
+            risk_amount=0.0,
+            risk_percent=0.0,
+            risk_distance=None,
+            stop_price_used=None,
+            take_profit_used=None,
+        )
+
+    with pytest.raises(ValueError, match="quantity"):
+        RiskDecision(
+            signal_id="risk-1",
+            accepted=True,
+            quantity=math.inf,
+            risk_amount=0.0,
+            risk_percent=0.0,
+            risk_distance=None,
+            stop_price_used=None,
+            take_profit_used=None,
+        )
 
 
 @dataclass(slots=True)

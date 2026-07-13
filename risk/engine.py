@@ -4,7 +4,7 @@ import math
 from dataclasses import dataclass
 
 from risk.config import RiskConfig
-from risk.models import SizedOrder, TradeSignal
+from risk.models import RiskDecision, SizedOrder, TradeSignal
 
 
 @dataclass(slots=True)
@@ -44,6 +44,72 @@ class RiskEngine:
             return stop_loss < signal.entry_price
         return stop_loss > signal.entry_price
 
+    @staticmethod
+    def _signal_id(signal: TradeSignal) -> str:
+        explicit = signal.metadata.get("signal_id") or signal.metadata.get("source_signal_id")
+        if explicit:
+            return str(explicit)
+        stop = "none" if signal.stop_loss is None else f"{float(signal.stop_loss):.12g}"
+        take_profit = (
+            "none" if signal.take_profit is None else f"{float(signal.take_profit):.12g}"
+        )
+        return (
+            "legacy:"
+            f"{signal.symbol}:{signal.timeframe}:{signal.action}:"
+            f"{signal.entry_price:.12g}:{stop}:{take_profit}"
+        )
+
+    def _decision(
+        self,
+        signal: TradeSignal,
+        *,
+        signal_id: str,
+        accepted: bool,
+        quantity: float,
+        risk_amount: float,
+        risk_percent: float,
+        risk_distance: float | None,
+        stop_price_used: float | None,
+        rejection_reason: str | None = None,
+        metadata: dict[str, object] | None = None,
+    ) -> RiskDecision:
+        return RiskDecision(
+            signal_id=signal_id,
+            accepted=accepted,
+            quantity=quantity,
+            risk_amount=risk_amount,
+            risk_percent=risk_percent,
+            risk_distance=risk_distance,
+            stop_price_used=stop_price_used,
+            take_profit_used=signal.take_profit,
+            rejection_reason=rejection_reason,
+            metadata={
+                "max_risk_per_trade": self.config.max_risk_per_trade,
+                "max_total_exposure": self.config.max_total_exposure,
+                "max_positions": self.config.max_positions,
+                **dict(metadata or {}),
+            },
+        )
+
+    def _sized_order(
+        self,
+        signal: TradeSignal,
+        *,
+        position_size: float,
+        risk_amount: float,
+        risk_percent: float,
+        risk_reward_ratio: float | None,
+        decision: RiskDecision,
+    ) -> SizedOrder:
+        return SizedOrder(
+            signal=signal,
+            position_size=position_size,
+            risk_amount=risk_amount,
+            risk_percent=risk_percent,
+            risk_reward_ratio=risk_reward_ratio,
+            decision=decision,
+        )
+
     def calculate_position_size(
         self,
         signal: TradeSignal,
@@ -59,40 +125,88 @@ class RiskEngine:
             raise ValueError("pip_value must be > 0")
         exposure = max(0.0, float(current_exposure))
         current_positions = int(float(signal.metadata.get("current_positions", 0) or 0))
+        decision_signal_id = self._signal_id(signal)
 
         if current_positions >= self.config.max_positions:
-            return SizedOrder(
+            return self._sized_order(
                 signal=signal,
                 position_size=0.0,
                 risk_amount=0.0,
                 risk_percent=0.0,
                 risk_reward_ratio=None,
+                decision=self._decision(
+                    signal,
+                    signal_id=decision_signal_id,
+                    accepted=False,
+                    quantity=0.0,
+                    risk_amount=0.0,
+                    risk_percent=0.0,
+                    risk_distance=None,
+                    stop_price_used=signal.stop_loss,
+                    rejection_reason="max_positions",
+                    metadata={"current_positions": current_positions},
+                ),
             )
 
         remaining_exposure = max(0.0, self.config.max_total_exposure - exposure)
         risk_percent = min(self.config.max_risk_per_trade, remaining_exposure)
         if risk_percent <= 0:
-            return SizedOrder(
+            return self._sized_order(
                 signal=signal,
                 position_size=0.0,
                 risk_amount=0.0,
                 risk_percent=0.0,
                 risk_reward_ratio=None,
+                decision=self._decision(
+                    signal,
+                    signal_id=decision_signal_id,
+                    accepted=False,
+                    quantity=0.0,
+                    risk_amount=0.0,
+                    risk_percent=0.0,
+                    risk_distance=None,
+                    stop_price_used=signal.stop_loss,
+                    rejection_reason="max_total_exposure",
+                    metadata={"current_exposure": exposure},
+                ),
             )
 
         stop_loss = signal.stop_loss
+        stop_source = "signal"
         if stop_loss is None:
+            stop_source = (
+                "fallback_atr"
+                if signal.metadata.get("atr") is not None
+                else "fallback_percent"
+            )
             stop_loss = self._fallback_stop_loss(signal)
             signal.stop_loss = stop_loss
             signal.metadata["resolved_stop_loss"] = stop_loss
         enforce_stop_direction = bool(signal.metadata.get("enforce_stop_direction", False))
         if enforce_stop_direction and not self._stop_matches_direction(signal, stop_loss):
-            return SizedOrder(
+            risk_distance = abs(signal.entry_price - stop_loss)
+            return self._sized_order(
                 signal=signal,
                 position_size=0.0,
                 risk_amount=0.0,
                 risk_percent=0.0,
                 risk_reward_ratio=None,
+                decision=self._decision(
+                    signal,
+                    signal_id=decision_signal_id,
+                    accepted=False,
+                    quantity=0.0,
+                    risk_amount=0.0,
+                    risk_percent=0.0,
+                    risk_distance=risk_distance,
+                    stop_price_used=stop_loss,
+                    rejection_reason="bad_stop_direction",
+                    metadata={
+                        "current_exposure": exposure,
+                        "enforce_stop_direction": enforce_stop_direction,
+                        "stop_source": stop_source,
+                    },
+                ),
             )
 
         risk_distance = abs(signal.entry_price - stop_loss)
@@ -104,12 +218,27 @@ class RiskEngine:
         position_size = max(0.0, raw_size)
         risk_reward_ratio = self._risk_reward_ratio(signal, stop_loss)
 
-        return SizedOrder(
+        return self._sized_order(
             signal=signal,
             position_size=position_size,
             risk_amount=risk_amount,
             risk_percent=risk_percent,
             risk_reward_ratio=risk_reward_ratio,
+            decision=self._decision(
+                signal,
+                signal_id=decision_signal_id,
+                accepted=True,
+                quantity=position_size,
+                risk_amount=risk_amount,
+                risk_percent=risk_percent,
+                risk_distance=risk_distance,
+                stop_price_used=stop_loss,
+                metadata={
+                    "current_exposure": exposure,
+                    "pip_value": pip,
+                    "stop_source": stop_source,
+                },
+            ),
         )
 
     def apply_trailing_stop(
