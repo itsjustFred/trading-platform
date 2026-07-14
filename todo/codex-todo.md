@@ -172,9 +172,7 @@ Ursprungs-Goal erfüllt: Strategien führen **live echte Trades** aus. Verifizie
 
 pytest: **82 passed**, keine neue Regression. Codex hat bewusst nicht committet/pusht — separat nachgeholt.
 
-**Video-Beweis (Trades werden live genommen):** `reports/videos/live_integration_trades_20260714.mp4`
-(Typewriter-Playback des echten Trade-Logs, 1280×720, ~54 s). Reports:
-`live_integration_report.json`, `reports/live_smoke_live-stockkit-e2e_20260714T111634Z.json`.
+Reports: `live_integration_report.json`, `reports/live_smoke_live-stockkit-e2e_20260714T111634Z.json`.
 
 Code-Änderungen (dieser Branch): `live_runner/alpaca_adapter.py` (extended-hours LimitOrder),
 `live_runner/ctrader_adapter.py` (Token-Refresh-Safety), `scripts/live_smoke.py`
