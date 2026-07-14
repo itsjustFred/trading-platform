@@ -160,6 +160,23 @@
 
 ---
 
+## 🔧 Offene Punkte (2026-07-14)
+
+**Discord:** Tokens in `.accounts.env` sind **Account-Tokens (User-Tokens)**, keine Bot-Tokens.
+`discord.py 2.5.2` Bot-Client lehnt sie ab ("Improper token"). Gegen die **Discord-REST-API**
+funktionieren sie aber (GET /channels/{id}/messages → HTTP 200, echte Signale: ENLT overbought,
+APLD oversold/Buy). Fix: `DiscordSignalSource` von discord.py-Gateway auf REST-Polling umstellen
+(Vorbild `stockkit_ai_bot/src/common/discord.py` `fetch_recent_messages`). Parser (`discord_source.py`)
+ist bereits OK (getestet). → Codex-Implementierung nötig + Channel→Account-Mapping klären.
+
+**cTrader-Verify:** `scripts/verify_ctrader_order.py` angelegt (ProtoOAOrderDetailsReq by order id,
+Retry-Logik). Unabhängige Re-Query am 14:21 UTC gescheitert: `demo.ctraderapi.com:5035` **Timeout**
+(Endpoint flaky, nicht Code). Execution-Time-Beweis steht: Deal `27678592`, Position `38833309`,
+filled 100000, Close `ProtoOAExecutionEvent` (11:16 UTC). Verifier bei Endpoint-Verfügbarkeit erneut
+starten → Ergebnis in PR.
+
+---
+
 ## ✅ Live-Trading E2E — echte Broker-Trades (2026-07-14)
 
 Ursprungs-Goal erfüllt: Strategien führen **live echte Trades** aus. Verifiziert mit
