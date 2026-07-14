@@ -3,6 +3,7 @@
 Date: 2026-07-13  
 Branch: `codex/live-integration`  
 Base: `codex/new-main`  
+Draft PR: https://github.com/itsjustFred/trading-platform/pull/6  
 Mode: live execution gated; all broker connections/orders remain paper/demo-only.
 
 ## Credential Gate
