@@ -621,8 +621,22 @@ async def _run_discord_signal_listener_for_account(
         )
         return
 
+    # Resolve a real account token (account/user tokens, not a generic bot token).
+    discord_token = ""
+    for _token_env_key in (
+        "DISCORD_BOT_NITRO_TOKEN",
+        "DISCORD_BOT_RAMJET_TOKEN",
+        "DISCORD_BOT_ROCKETFUEL_TOKEN",
+    ):
+        _resolved = str(accounts_env_values.get(_token_env_key) or "").strip()
+        if _resolved:
+            discord_token = _resolved
+            break
+    if not discord_token:
+        discord_token = str(os.environ.get("DISCORD_BOT_TOKEN", "")).strip()
+
     source = DiscordSignalSource(
-        token=accounts_env_values.get("DISCORD_BOT_TOKEN", ""),
+        token=discord_token,
         channel_ids=set(channel_to_deployments.keys()),
         timeframe=_deployment_signal_timeframe(next(iter(active_discord_deployments))),
     )

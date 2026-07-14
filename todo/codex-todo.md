@@ -162,12 +162,11 @@
 
 ## 🔧 Offene Punkte (2026-07-14)
 
-**Discord:** Tokens in `.accounts.env` sind **Account-Tokens (User-Tokens)**, keine Bot-Tokens.
-`discord.py 2.5.2` Bot-Client lehnt sie ab ("Improper token"). Gegen die **Discord-REST-API**
-funktionieren sie aber (GET /channels/{id}/messages → HTTP 200, echte Signale: ENLT overbought,
-APLD oversold/Buy). Fix: `DiscordSignalSource` von discord.py-Gateway auf REST-Polling umstellen
-(Vorbild `stockkit_ai_bot/src/common/discord.py` `fetch_recent_messages`). Parser (`discord_source.py`)
-ist bereits OK (getestet). → Codex-Implementierung nötig + Channel→Account-Mapping klären.
+**Discord:** ✅ ERLEDIGT. `DiscordSignalSource` auf REST-Polling mit Account-Token umgestellt
+(Vorbild `stockkit_ai_bot/src/common/discord.py` `fetch_recent_messages`). `discord.py`-Gateway
+entfernt; Daemon löst echten Token (`DISCORD_BOT_*_TOKEN`, war vorher leer `DISCORD_BOT_TOKEN`).
+Verifiziert live: connect via REST → echte Signale geparst (z.B. `sell CIEN 467.79`,
+`buy AGX 644.95`). Bestehende Discord-Tests grün (2 + 5 passed).
 
 **cTrader-Verify:** `scripts/verify_ctrader_order.py` angelegt (ProtoOAOrderDetailsReq by order id,
 Retry-Logik). Unabhängige Re-Query am 14:21 UTC gescheitert: `demo.ctraderapi.com:5035` **Timeout**
