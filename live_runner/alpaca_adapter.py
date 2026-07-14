@@ -296,7 +296,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
 
         try:
             from alpaca.trading.enums import OrderSide, TimeInForce
-            from alpaca.trading.requests import MarketOrderRequest
+            from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest
         except ModuleNotFoundError as exc:
             raise RuntimeError(
                 "alpaca-py is required for AlpacaLiveAdapter. Install package 'alpaca-py'."
@@ -305,13 +305,27 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         side = OrderSide.BUY if signal.action == "buy" else OrderSide.SELL
         await asyncio.to_thread(save_live_signal, signal)
 
-        request = MarketOrderRequest(
-            symbol=signal.symbol,
-            qty=qty,
-            side=side,
-            time_in_force=TimeInForce.DAY,
-            client_order_id=str(signal.id),
-        )
+        extended_hours = bool((signal.metadata or {}).get("extended_hours"))
+        limit_price = _to_float((signal.metadata or {}).get("limit_price"), default=0.0)
+        if extended_hours and limit_price > 0:
+            request = LimitOrderRequest(
+                symbol=signal.symbol,
+                qty=qty,
+                side=side,
+                time_in_force=TimeInForce.DAY,
+                extended_hours=True,
+                limit_price=limit_price,
+                client_order_id=str(signal.id),
+            )
+        else:
+            request = MarketOrderRequest(
+                symbol=signal.symbol,
+                qty=qty,
+                side=side,
+                time_in_force=TimeInForce.DAY,
+                extended_hours=extended_hours,
+                client_order_id=str(signal.id),
+            )
         order = await asyncio.to_thread(self._trading_client.submit_order, order_data=request)
         broker_order_id = str(getattr(order, "id", ""))
         if broker_order_id:

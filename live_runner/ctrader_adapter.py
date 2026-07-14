@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -114,23 +115,39 @@ def _is_terminal_auth_error(error_code: str, error_text: str) -> bool:
     }
 
 
+def _write_env_keys(path: Path, updates: dict[str, str]) -> None:
+    """Persist dotenv keys atomically without logging secret material."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(f"{path.name}.lock")
+    with lock_path.open("a+", encoding="utf-8") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+            seen: set[str] = set()
+            for index, line in enumerate(lines):
+                key, separator, _value = line.partition("=")
+                if not separator or key not in updates:
+                    continue
+                lines[index] = f"{key}={updates[key]}"
+                seen.add(key)
+            for key, value in updates.items():
+                if key not in seen:
+                    lines.append(f"{key}={value}")
+
+            tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+            tmp_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            tmp_path.chmod(0o600)
+            os.replace(tmp_path, path)
+            path.chmod(0o600)
+            if path.parent.exists():
+                path.parent.chmod(0o700)
+        finally:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+
+
 def _write_env_key(path: Path, key: str, value: str) -> None:
     """Persist one dotenv key without logging secret material."""
-    lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
-    prefix = f"{key}="
-    replacement = f"{key}={value}"
-    for index, line in enumerate(lines):
-        if line.startswith(prefix):
-            lines[index] = replacement
-            break
-    else:
-        lines.append(replacement)
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    # Harden file permissions: tokens grant full trading access
-    path.chmod(0o600)
-    # Ensure parent directory is also private
-    if path.parent.exists():
-        path.parent.chmod(0o700)
+    _write_env_keys(path, {key: value})
 
 
 def _ensure_asyncio_twisted_reactor(loop: asyncio.AbstractEventLoop) -> None:
@@ -207,6 +224,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._connected = False
         self._authenticated = False
         self._connect_lock = asyncio.Lock()
+        self._refresh_lock = asyncio.Lock()
         self._symbol_name_to_id: dict[str, int] = {}
         self._order_id_to_signal_id: dict[int, str] = {}
         self._terminal_auth_failure_reason = ""
@@ -347,72 +365,84 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 extra={"data": {"account_id": self.ctid_trader_account_id}},
             )
             return False
-        refresh_req = self._ProtoOARefreshTokenReq()
-        refresh_req.refreshToken = self.refresh_token
-        try:
-            refresh_res = await self._send_request(refresh_req, timeout_seconds=15)
-        except CTraderApiError as exc:
-            # Use non-refresh version to avoid infinite recursion
-            logger.warning(
-                "cTrader access token refresh failed",
+        refresh_token_before_lock = self.refresh_token
+        async with self._refresh_lock:
+            if self.refresh_token != refresh_token_before_lock and self.access_token:
+                return True
+
+            refresh_req = self._ProtoOARefreshTokenReq()
+            refresh_req.refreshToken = self.refresh_token
+            try:
+                refresh_res = await self._send_request(refresh_req, timeout_seconds=15)
+            except CTraderApiError as exc:
+                # Use non-refresh version to avoid infinite recursion
+                logger.warning(
+                    "cTrader access token refresh failed",
+                    extra={
+                        "data": {
+                            "account_id": self.ctid_trader_account_id,
+                            "error_code": exc.error_code,
+                            "error": exc.description,
+                        }
+                    },
+                )
+                return False
+            if not isinstance(refresh_res, self._ProtoOARefreshTokenRes):
+                logger.warning(
+                    "Unexpected cTrader refresh response",
+                    extra={
+                        "data": {
+                            "account_id": self.ctid_trader_account_id,
+                            "response_type": type(refresh_res).__name__,
+                        }
+                    },
+                )
+                return False
+            access_token = str(getattr(refresh_res, "accessToken", "") or "").strip()
+            refresh_token = str(getattr(refresh_res, "refreshToken", "") or "").strip()
+            if not access_token or not refresh_token:
+                logger.warning(
+                    "cTrader refresh response did not contain both tokens",
+                    extra={"data": {"account_id": self.ctid_trader_account_id}},
+                )
+                return False
+            try:
+                _write_env_keys(
+                    self.accounts_env_path,
+                    {
+                        "CTRADER_ACCESS_TOKEN": access_token,
+                        "CTRADER_REFRESH_TOKEN": refresh_token,
+                    },
+                )
+            except Exception as exc:
+                logger.warning(
+                    "cTrader tokens refreshed but could not be persisted",
+                    extra={
+                        "data": {
+                            "account_id": self.ctid_trader_account_id,
+                            "env_path": str(self.accounts_env_path),
+                            "error": str(exc),
+                        }
+                    },
+                )
+                return False
+
+            self.access_token = access_token
+            self.refresh_token = refresh_token
+            os.environ["CTRADER_ACCESS_TOKEN"] = access_token
+            os.environ["CTRADER_REFRESH_TOKEN"] = refresh_token
+            self._terminal_auth_failure_reason = ""
+            self._terminal_auth_failure_code = ""
+            logger.info(
+                "cTrader access token refreshed",
                 extra={
                     "data": {
                         "account_id": self.ctid_trader_account_id,
-                        "error_code": exc.error_code,
-                        "error": exc.description,
+                        "expires_in": int(getattr(refresh_res, "expiresIn", 0) or 0),
                     }
                 },
             )
-            return False
-        if not isinstance(refresh_res, self._ProtoOARefreshTokenRes):
-            logger.warning(
-                "Unexpected cTrader refresh response",
-                extra={
-                    "data": {
-                        "account_id": self.ctid_trader_account_id,
-                        "response_type": type(refresh_res).__name__,
-                    }
-                },
-            )
-            return False
-        access_token = str(getattr(refresh_res, "accessToken", "") or "").strip()
-        refresh_token = str(getattr(refresh_res, "refreshToken", "") or "").strip()
-        if not access_token or not refresh_token:
-            logger.warning(
-                "cTrader refresh response did not contain both tokens",
-                extra={"data": {"account_id": self.ctid_trader_account_id}},
-            )
-            return False
-        self.access_token = access_token
-        self.refresh_token = refresh_token
-        os.environ["CTRADER_ACCESS_TOKEN"] = access_token
-        os.environ["CTRADER_REFRESH_TOKEN"] = refresh_token
-        try:
-            _write_env_key(self.accounts_env_path, "CTRADER_ACCESS_TOKEN", access_token)
-            _write_env_key(self.accounts_env_path, "CTRADER_REFRESH_TOKEN", refresh_token)
-        except Exception as exc:
-            logger.warning(
-                "cTrader tokens refreshed but could not be persisted",
-                extra={
-                    "data": {
-                        "account_id": self.ctid_trader_account_id,
-                        "env_path": str(self.accounts_env_path),
-                        "error": str(exc),
-                    }
-                },
-            )
-        self._terminal_auth_failure_reason = ""
-        self._terminal_auth_failure_code = ""
-        logger.info(
-            "cTrader access token refreshed",
-            extra={
-                "data": {
-                    "account_id": self.ctid_trader_account_id,
-                    "expires_in": int(getattr(refresh_res, "expiresIn", 0) or 0),
-                }
-            },
-        )
-        return True
+            return True
 
     def _raise_terminal_auth_from_api_error(self, exc: CTraderApiError) -> None:
         error_code = _normalize_error_code(exc.error_code)
@@ -559,7 +589,16 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             error_code = _normalize_error_code(exc.error_code)
             error_text = str(exc)
             if _is_terminal_auth_error(error_code, error_text) and await self._refresh_access_token():
-                # Token was refreshed successfully; retry once with new token
+                # Token was refreshed successfully; re-authorize the account and
+                # retry once with the new token.
+                if self._ProtoOAAccountAuthReq is not None and self._ProtoOAAccountAuthRes is not None:
+                    account_auth_res = await self._send_account_auth_request(timeout_seconds=15)
+                    if not isinstance(account_auth_res, self._ProtoOAAccountAuthRes):
+                        raise RuntimeError(
+                            "Unexpected account auth response after refresh: "
+                            f"{type(account_auth_res).__name__}"
+                        )
+                    self._authenticated = True
                 return await self._send_request_with_refresh_retry(
                     request, timeout_seconds=timeout_seconds, _depth=_depth + 1
                 )

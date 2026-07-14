@@ -157,3 +157,25 @@
 - **`todo/todo.md` ist outdated** (Stand 18. Juni, basierend auf Unit-Tests).
 - Diese Datei (`todo/codex-todo.md`) ist der **realistischere** Status.
 - Für den ChatGPT-Planning-Prompt siehe `docs/planning-prompt-for-external-model.md`.
+
+---
+
+## ✅ Live-Trading E2E — echte Broker-Trades (2026-07-14)
+
+Ursprungs-Goal erfüllt: Strategien führen **live echte Trades** aus. Verifiziert mit
+`scripts/live_smoke.py --mode live-stockkit-e2e` (Codex-CLI orchestriert, eigenständig verifiziert):
+
+- **Alpaca PAPER (Discord StockKit → `submit_order_with_risk`):** AAPL Pre-Market, Buy+Sell gefillt,
+  `filled_qty=0.6302`, `remaining_qty=0`, `extended_hours=true`. Route `nitro` (PA3E767TJ91D).
+- **cTrader DEMO (Strategie `volatility_breakout` → `submit_order_with_risk`):** EURUSD,
+  `filled_volume=100000`, Position geschlossen (`ProtoOAExecutionEvent`), `remaining_volume=0`.
+
+pytest: **82 passed**, keine neue Regression. Codex hat bewusst nicht committet/pusht — separat nachgeholt.
+
+**Video-Beweis (Trades werden live genommen):** `reports/videos/live_integration_trades_20260714.mp4`
+(Typewriter-Playback des echten Trade-Logs, 1280×720, ~54 s). Reports:
+`live_integration_report.json`, `reports/live_smoke_live-stockkit-e2e_20260714T111634Z.json`.
+
+Code-Änderungen (dieser Branch): `live_runner/alpaca_adapter.py` (extended-hours LimitOrder),
+`live_runner/ctrader_adapter.py` (Token-Refresh-Safety), `scripts/live_smoke.py`
+(`live-stockkit-e2e` + cTrader-Subprocess-Worker).
