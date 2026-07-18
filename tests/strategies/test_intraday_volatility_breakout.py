@@ -102,6 +102,20 @@ def test_module_loads():
     assert hasattr(mod, "generate_signals")
 
 
+def test_mt5_atr_uses_sma_seed_then_wilder_recurrence():
+    mod = _load_module()
+    true_range = pd.Series([1.0, 2.0, 3.0, 4.0, 5.0, 10.0])
+
+    atr_full = mod._mt5_atr(true_range, period=5)
+    assert atr_full.iloc[:4].isna().all()
+
+    atr = atr_full.dropna()
+    seed = true_range.iloc[:5].mean()
+
+    assert atr.iloc[0] == pytest.approx(seed)
+    assert atr.iloc[1] == pytest.approx(((seed * 4) + true_range.iloc[5]) / 5)
+
+
 # ---------------------------------------------------------------------------
 # Parameter defaults
 # ---------------------------------------------------------------------------
@@ -202,6 +216,8 @@ def test_reverse_mode_flips_signals():
     base_params["max_entry_time"] = "18:00"
     base_params["exit_time"] = "20:00"
     base_params["atr_regime_factor"] = 2.0
+    base_params["atr_period"] = 1
+    base_params["atr_long_period"] = 1
 
     # Normal mode: short should trigger (price drops below lower)
     params_normal = {**base_params, "reverse_mode": False}
@@ -231,6 +247,8 @@ def test_mt5_numeric_direction_and_regime_settings_are_normalized():
             "max_entry_time": "18:05",
             "exit_time": "20:00",
             "atr_regime_factor": 2.0,
+            "atr_period": 1,
+            "atr_long_period": 1,
         }
     )
 
@@ -330,6 +348,8 @@ def test_sl_price_present_in_indicators():
     # Day 1 has a wide range, so short-term ATR == long-term ATR. Loosen the
     # regime factor to make the low-volatility filter pass on day 2.
     params["atr_regime_factor"] = 2.0
+    params["atr_period"] = 1
+    params["atr_long_period"] = 1
     entries, exits, indicators, _ = mod.generate_signals(df, params)
     assert "sl_price" in indicators
     sl = indicators["sl_price"]
@@ -434,6 +454,8 @@ def test_candle_close_signal_emits_previous_bar_for_next_open_execution():
             "exit_time": "22:55",
             "atr_multiplier": 0.25,
             "atr_regime_factor": 2.0,
+            "atr_period": 1,
+            "atr_long_period": 1,
         }
     )
 
@@ -462,6 +484,8 @@ def test_entry_indicators_include_signal_contract_metadata():
             "max_entry_time": "18:00",
             "exit_time": "20:00",
             "atr_regime_factor": 2.0,
+            "atr_period": 1,
+            "atr_long_period": 1,
         }
     )
 

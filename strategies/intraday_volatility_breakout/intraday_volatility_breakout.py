@@ -101,7 +101,20 @@ def _mt5_atr(true_range: pd.Series, period: int) -> pd.Series:
     values = pd.to_numeric(true_range, errors="coerce").astype(float)
     if period == 1:
         return values.copy()
-    return values.ewm(alpha=1.0 / period, adjust=False, min_periods=1).mean()
+
+    atr = pd.Series(np.nan, index=values.index, name=values.name, dtype=float)
+    valid_positions = np.flatnonzero(values.notna().to_numpy())
+    if len(valid_positions) < period:
+        return atr
+
+    previous_atr = values.iloc[valid_positions[:period]].mean()
+    atr.iloc[valid_positions[period - 1]] = previous_atr
+    for position in valid_positions[period:]:
+        previous_atr = (
+            (previous_atr * (period - 1)) + values.iloc[position]
+        ) / period
+        atr.iloc[position] = previous_atr
+    return atr
 
 
 def generate_signals(df: pd.DataFrame, params: dict):
