@@ -127,6 +127,18 @@ def _load_strategy_equity(backtest_id: str) -> list[StrategyEquityPoint]:
     return []
 
 
+def _normalize_weights(weights: np.ndarray) -> np.ndarray:
+    """Normalize weights to sum to one with a finite equal-weight fallback."""
+    weights = np.asarray(weights, dtype=float)
+    if weights.size == 0:
+        return weights
+
+    total = weights.sum()
+    if not np.isfinite(total) or total <= 0:
+        return np.ones(weights.size) / weights.size
+    return weights / total
+
+
 def _align_equity_curves(
     curves: list[list[StrategyEquityPoint]],
     require_overlap: bool = False,
@@ -135,10 +147,14 @@ def _align_equity_curves(
     
     Args:
         curves: List of equity curves for each strategy
-        require_overlap: If True, only use timestamps present in ALL curves (overlap window).
-                         If False (default), use union of all timestamps with forward-fill.
+        require_overlap: If True, only use timestamps present in ALL curves.
+                         If False (default), use the union of timestamps within
+                         the common covered time window, with forward-fill.
     """
     if not curves:
+        return np.array([]).reshape(0, 0)
+
+    if any(not curve for curve in curves):
         return np.array([]).reshape(0, 0)
     
     if require_overlap:
@@ -152,12 +168,18 @@ def _align_equity_curves(
                 common_times &= curve_times
         sorted_times = sorted(common_times) if common_times else []
     else:
-        # Find all unique timestamps across all curves (union)
-        all_times = set()
-        for curve in curves:
-            for pt in curve:
-                all_times.add(pt.time)
-        sorted_times = sorted(all_times)
+        # Restrict the union to the time window covered by every strategy so
+        # forward-fill cannot invent pre-inception or post-end equity.
+        window_start = max(min(pt.time for pt in curve) for curve in curves)
+        window_end = min(max(pt.time for pt in curve) for curve in curves)
+        if window_start > window_end:
+            return np.array([]).reshape(0, 0)
+        sorted_times = sorted({
+            pt.time
+            for curve in curves
+            for pt in curve
+            if window_start <= pt.time <= window_end
+        })
     
     n_points = len(sorted_times)
     n_strategies = len(curves)
@@ -176,17 +198,14 @@ def _align_equity_curves(
             for row, t in enumerate(sorted_times):
                 aligned[row, col] = equity_values.get(t, 0.0)
         else:
-            # Fill values, forward-fill missing values. Start from the first known
-            # point for this strategy so missing leading days do not create a bogus
-            # zero-equity row and an artificial return spike.
-            last_val: float | None = None
-            first_valid = next((pt.equity for pt in curve if pt.equity), None)
-            if first_valid is None:
-                first_valid = 0.0
+            # Seed from a real value at or before the common window, then
+            # forward-fill only gaps inside that window.
+            prior_times = [t for t in equity_values if t <= sorted_times[0]]
+            last_val = equity_values[max(prior_times)]
             for row, t in enumerate(sorted_times):
                 if t in equity_values:
                     last_val = equity_values[t]
-                aligned[row, col] = first_valid if last_val is None else last_val
+                aligned[row, col] = last_val
     
     return aligned
 
@@ -288,12 +307,7 @@ def optimize_portfolio_allocation(
                 for i in range(len(backtest_ids))
             ]
             # Normalize to sum=1
-            weights = np.array(weights_raw)
-            w_sum = weights.sum()
-            if not np.isfinite(w_sum) or w_sum <= 0:
-                # All weights are zero - trial should be pruned
-                raise optuna.TrialPruned("All weights are zero")
-            weights = weights / w_sum
+            weights = _normalize_weights(np.array(weights_raw))
 
             # Portfolio metrics
             sharpe, max_dd = _portfolio_sharpe_from_weights(weights, equity_matrix)
@@ -322,12 +336,7 @@ def optimize_portfolio_allocation(
     
     # Extract best weights
     best_raw = [study.best_trial._params[f"weight_{i}"] for i in range(len(backtest_ids))]
-    best_weights = np.array(best_raw)
-    w_sum = best_weights.sum()
-    if not np.isfinite(w_sum) or w_sum <= 0:
-        best_weights = np.ones(len(backtest_ids)) / len(backtest_ids)
-    else:
-        best_weights = best_weights / w_sum
+    best_weights = _normalize_weights(np.array(best_raw))
 
     sharpe, max_dd = _portfolio_sharpe_from_weights(best_weights, equity_matrix)
     corr_matrix = _compute_correlation_matrix(returns)
