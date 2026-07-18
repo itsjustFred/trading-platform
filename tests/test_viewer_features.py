@@ -1387,6 +1387,61 @@ def test_download_registry_coalesces_concurrent_identical_requests(viewer_client
     assert len(viewer_app_module.legacy_viewer.DATA_TASKS) == 1
 
 
+def test_singleflight_starter_failure_leaves_failed_record_for_coalesced_id(
+    viewer_client,
+):
+    import viewer.main as viewer_app_module
+
+    entered = threading.Event()
+    release = threading.Event()
+    starter_errors: list[BaseException] = []
+
+    def failing_starter(task_id: str) -> dict:
+        entered.set()
+        assert release.wait(timeout=2)
+        raise RuntimeError("worker launch failed")
+
+    def launch() -> None:
+        try:
+            viewer_app_module.legacy_viewer._start_singleflight_download(
+                "task-primary", "same-request", failing_starter
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            starter_errors.append(exc)
+
+    worker = threading.Thread(target=launch)
+    worker.start()
+    assert entered.wait(timeout=2)
+
+    coalesced = viewer_app_module.legacy_viewer._start_singleflight_download(
+        "task-coalesced",
+        "same-request",
+        lambda _task_id: {"task_id": _task_id, "status": "running"},
+    )
+    assert coalesced == {
+        "task_id": "task-primary",
+        "status": "starting",
+        "coalesced": True,
+    }
+
+    release.set()
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+    assert [str(error) for error in starter_errors] == ["worker launch failed"]
+
+    failed = viewer_app_module.legacy_viewer.DATA_TASKS["task-primary"]
+    assert failed["status"] == "failed"
+    assert failed["error"] == "worker launch failed"
+    assert "download_request_key" not in failed
+
+    retry = viewer_app_module.legacy_viewer._start_singleflight_download(
+        "task-retry",
+        "same-request",
+        lambda task_id: {"task_id": task_id, "status": "running"},
+    )
+    assert retry == {"task_id": "task-retry", "status": "running"}
+
+
 def test_data_download_does_not_coalesce_different_options_or_finished_task(
     viewer_client, monkeypatch
 ):

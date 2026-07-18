@@ -10086,24 +10086,23 @@ def _start_jforex_download(
         name=name,
         description=description,
     )
-    if result.get("coalesced"):
-        return result
-    _apply_recovery_data_metadata(
-        task_id,
-        command=[str(part) for part in cmd],
-        downloader=source_label,
-        symbols=request.symbol_list,
-        timeframes=request.timeframe_list,
-        start=request.start or None,
-        end=request.end or None,
-        offer_side=request.offer_side,
-        price_type=request.offer_side,
-        merge_tick=request.merge_tick,
-        merge_s1=request.merge_s1,
-        batch_size=request.batch_size,
-        pause_ms=request.pause_ms,
-        query_timeout_seconds=request.query_timeout_seconds,
-    )
+    if not result.get("coalesced"):
+        _apply_recovery_data_metadata(
+            task_id,
+            command=[str(part) for part in cmd],
+            downloader=source_label,
+            symbols=request.symbol_list,
+            timeframes=request.timeframe_list,
+            start=request.start or None,
+            end=request.end or None,
+            offer_side=request.offer_side,
+            price_type=request.offer_side,
+            merge_tick=request.merge_tick,
+            merge_s1=request.merge_s1,
+            batch_size=request.batch_size,
+            pause_ms=request.pause_ms,
+            query_timeout_seconds=request.query_timeout_seconds,
+        )
     return result
 
 
@@ -10151,21 +10150,23 @@ def _start_generic_download(
         description=description,
         source=request.source,
     )
-    if result.get("coalesced"):
-        return result
-    _apply_recovery_data_metadata(
-        task_id,
-        command=[str(part) for part in cmd],
-        downloader=request.source,
-        symbols=request.symbol_list,
-        timeframes=request.timeframe_list,
-        start=request.start or None,
-        end=request.end or None,
-    )
+    if not result.get("coalesced"):
+        _apply_recovery_data_metadata(
+            task_id,
+            command=[str(part) for part in cmd],
+            downloader=request.source,
+            symbols=request.symbol_list,
+            timeframes=request.timeframe_list,
+            start=request.start or None,
+            end=request.end or None,
+        )
     return result
 
 
-@app.post("/api/data/download", response_model=dict[str, Any])
+@app.post(
+    "/api/data/download",
+    responses={400: {"description": "Invalid download request"}},
+)
 async def data_download(payload: DataDownloadRequest) -> dict[str, Any]:
     request = _prepare_download_request(payload)
     task_id = str(uuid.uuid4())

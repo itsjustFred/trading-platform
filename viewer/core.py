@@ -2895,9 +2895,6 @@ def _start_singleflight_download(
     except Exception as exc:
         with DATA_TASKS_LOCK:
             current = DATA_TASKS.get(task_id)
-            if current is reservation:
-                DATA_TASKS.pop(task_id, None)
-                current = None
         if current is not None:
             _mark_task_finished(task_id, status="failed", returncode=1, error=str(exc))
         raise
