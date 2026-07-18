@@ -1285,6 +1285,79 @@ def test_data_download_coalesces_identical_active_request(viewer_client, monkeyp
     }
 
 
+def test_data_download_does_not_apply_recovery_metadata_to_coalesced_registration(
+    viewer_client, monkeypatch
+):
+    import viewer.main as viewer_app_module
+
+    class _NoStartThread:
+        def __init__(self, *args, **kwargs):
+            self.target = kwargs.get("target")
+
+        def start(self) -> None:
+            # Recovery metadata is tested without launching a worker thread.
+            pass
+
+    recovery_task_ids: list[str] = []
+    monkeypatch.setattr(viewer_app_module.legacy_viewer.threading, "Thread", _NoStartThread)
+    monkeypatch.setattr(
+        viewer_app_module,
+        "_apply_recovery_data_metadata",
+        lambda task_id, **kwargs: recovery_task_ids.append(task_id),
+    )
+    payload = {
+        "source": "yfinance",
+        "symbols": "AAPL",
+        "timeframes": "m1",
+        "start": "2026-01-01",
+        "end": "2026-01-02",
+    }
+
+    first = viewer_client.post("/api/data/download", json=payload)
+    second = viewer_client.post("/api/data/download", json=payload)
+
+    assert first.status_code == second.status_code == 200
+    assert second.json()["coalesced"] is True
+    assert second.json()["task_id"] == first.json()["task_id"]
+    assert recovery_task_ids == [first.json()["task_id"]]
+
+
+def test_data_download_coalesces_equivalent_timeframe_aliases(
+    viewer_client, monkeypatch
+):
+    import viewer.main as viewer_app_module
+
+    starts = 0
+
+    class _NoStartThread:
+        def __init__(self, *args, **kwargs):
+            self.target = kwargs.get("target")
+
+        def start(self) -> None:
+            nonlocal starts
+            starts += 1
+
+    monkeypatch.setattr(viewer_app_module.legacy_viewer.threading, "Thread", _NoStartThread)
+    payload = {
+        "source": "yfinance",
+        "symbols": "AAPL",
+        "start": "2026-01-01",
+        "end": "2026-01-02",
+    }
+
+    first = viewer_client.post(
+        "/api/data/download", json={**payload, "timeframes": "1m"}
+    )
+    second = viewer_client.post(
+        "/api/data/download", json={**payload, "timeframes": "m1"}
+    )
+
+    assert first.status_code == second.status_code == 200
+    assert starts == 1
+    assert second.json()["task_id"] == first.json()["task_id"]
+    assert second.json()["coalesced"] is True
+
+
 def test_download_registry_coalesces_concurrent_identical_requests(viewer_client):
     import viewer.main as viewer_app_module
 
@@ -1323,6 +1396,7 @@ def test_data_download_does_not_coalesce_different_options_or_finished_task(
 
     class _NoStartThread:
         def __init__(self, *args, **kwargs):
+            # This test double intentionally ignores Thread construction arguments.
             pass
 
         def start(self) -> None:
@@ -1368,15 +1442,6 @@ def test_data_download_does_not_coalesce_different_options_or_finished_task(
                 "query_timeout_seconds": 1200,
             },
         ),
-        (
-            "jforex",
-            {
-                "merge_tick": True,
-                "merge_s1": True,
-                "batch_size": 23,
-                "pause_ms": 4000,
-            },
-        ),
     ],
 )
 def test_data_download_coalesces_options_irrelevant_to_source(
@@ -1388,6 +1453,7 @@ def test_data_download_coalesces_options_irrelevant_to_source(
 
     class _NoStartThread:
         def __init__(self, *args, **kwargs):
+            # This test double intentionally ignores Thread construction arguments.
             pass
 
         def start(self) -> None:
@@ -1414,6 +1480,40 @@ def test_data_download_coalesces_options_irrelevant_to_source(
     assert second.json()["coalesced"] is True
 
 
+@pytest.mark.parametrize(
+    ("option", "different_value"),
+    [
+        ("merge_tick", True),
+        ("merge_s1", True),
+        ("batch_size", 23),
+        ("pause_ms", 4000),
+    ],
+)
+def test_jforex_request_key_includes_execution_options(option, different_value):
+    import viewer.main as viewer_app_module
+
+    identity = {
+        "source": "jforex",
+        "symbols": ["EURUSD"],
+        "timeframes": ["m1"],
+        "start": "2026-01-01",
+        "end": "2026-01-02",
+        "offer_side": "bid",
+        "merge_tick": False,
+        "merge_s1": False,
+        "batch_size": 10,
+        "pause_ms": 1000,
+        "query_timeout_seconds": 900,
+    }
+
+    baseline_key = viewer_app_module._download_request_key_for_source(identity)
+    different_key = viewer_app_module._download_request_key_for_source(
+        {**identity, option: different_value}
+    )
+
+    assert different_key != baseline_key
+
+
 def test_data_download_coalesces_dolthub_requests_with_unused_fields(
     viewer_client, monkeypatch
 ):
@@ -1423,6 +1523,7 @@ def test_data_download_coalesces_dolthub_requests_with_unused_fields(
 
     class _NoStartThread:
         def __init__(self, *args, **kwargs):
+            # This test double intentionally ignores Thread construction arguments.
             pass
 
         def start(self) -> None:
@@ -1465,6 +1566,7 @@ def test_data_download_thread_start_failure_allows_retry(viewer_client, monkeypa
 
     class _FailThenStartThread:
         def __init__(self, *args, **kwargs):
+            # Failure is injected by start(), so construction is intentionally empty.
             pass
 
         def start(self) -> None:
@@ -1508,6 +1610,7 @@ def test_data_download_thread_construction_failure_allows_retry(
                 raise ValueError("thread construction unavailable")
 
         def start(self) -> None:
+            # A successful retry only needs to return without launching a real thread.
             pass
 
     monkeypatch.setattr(
@@ -1538,9 +1641,11 @@ def test_data_download_releases_request_key_when_task_finishes(
 
     class _NoStartThread:
         def __init__(self, *args, **kwargs):
+            # This test double intentionally ignores Thread construction arguments.
             pass
 
         def start(self) -> None:
+            # The lifecycle transition is driven explicitly by the test.
             pass
 
     monkeypatch.setattr(viewer_app_module.legacy_viewer.threading, "Thread", _NoStartThread)
@@ -1577,9 +1682,11 @@ def test_data_download_discards_persisted_record_for_coalesced_request(
 
     class _NoStartThread:
         def __init__(self, *args, **kwargs):
+            # This test double intentionally ignores Thread construction arguments.
             pass
 
         def start(self) -> None:
+            # Persistence behavior is tested without launching a worker thread.
             pass
 
     monkeypatch.setattr(viewer_app_module.legacy_viewer.threading, "Thread", _NoStartThread)
