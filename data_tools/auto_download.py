@@ -132,6 +132,47 @@ def _resolve_data_root(data_dir: str | Path) -> Path:
     return DATA_DIR
 
 
+def has_ohlcv_bars_in_range(
+    *,
+    symbol: str,
+    timeframe: str,
+    start: str,
+    end: str,
+    data_dir: str | Path = "",
+) -> bool:
+    """Return whether canonical OHLCV data contains a valid bar in ``[start, end]``."""
+    normalized_symbol = str(symbol or "").strip().upper()
+    normalized_timeframe = normalize_timeframe(str(timeframe or "").strip())
+    if not normalized_symbol or not normalized_timeframe:
+        return False
+
+    start_ts = pd.to_datetime(str(start or ""), utc=True, errors="coerce")
+    end_ts = pd.to_datetime(str(end or ""), utc=True, errors="coerce")
+    if pd.isna(start_ts) or pd.isna(end_ts) or start_ts > end_ts:
+        return False
+
+    ohlcv_root = _resolve_data_root(data_dir) / "ohlcv"
+    matches = sorted(
+        path
+        for path in ohlcv_root.rglob(f"**/{normalized_timeframe}.parquet")
+        if path.parent.name.upper() == normalized_symbol
+    )
+    for path in matches:
+        try:
+            frame = pd.read_parquet(path, columns=["timestamp"])
+        except Exception as exc:
+            logger.warning("Could not inspect OHLCV timestamps for %s: %s", path, exc)
+            continue
+        if "timestamp" not in frame.columns or frame.empty:
+            continue
+        timestamps = pd.to_datetime(
+            frame["timestamp"], utc=True, errors="coerce", format="mixed"
+        ).dropna()
+        if ((timestamps >= start_ts) & (timestamps <= end_ts)).any():
+            return True
+    return False
+
+
 def _build_requirements(
     *,
     symbols: list[str],

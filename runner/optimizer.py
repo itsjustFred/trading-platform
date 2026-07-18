@@ -12,7 +12,7 @@ import optuna
 import pandas as pd
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from data_tools.auto_download import ensure_backtest_data
+from data_tools.auto_download import ensure_backtest_data, has_ohlcv_bars_in_range
 from runner.cli import _detect_date_range
 from runner.engines.base import BacktestConfig
 from runner.engines.vectorbt_adapter import VectorbtAdapter
@@ -61,7 +61,7 @@ class OptimizationConfig(BaseModel):
     base_backtest_id: str
     target_metric: str
     n_trials: int = Field(default=100, gt=0)
-    train_split_pct: float = Field(default=0.7, gt=0.0, le=1.0)
+    train_split_pct: float = Field(default=0.7, ge=0.1, le=0.95)
     parameter_ranges: dict[str, dict[str, Any]] = Field(default_factory=dict)
     optimization_mode: str = "parameter"
     symbol_universes: list[list[str]] = Field(default_factory=list)
@@ -212,6 +212,35 @@ def run_optimization(
             base_parameters=base_parameters,
             progress_callback=progress_callback,
         )
+
+    required_symbols = list(
+        dict.fromkeys(
+            symbol
+            for universe in [symbols, *candidate_universes]
+            for symbol in universe
+        )
+    )
+    data_dir = str(base_result.meta.data.get("data_dir") or "")
+    ensure_backtest_data(
+        symbols=required_symbols,
+        timeframe=timeframe,
+        start=backtest_start,
+        end=backtest_end,
+        data_dir=data_dir,
+    )
+    for segment_name, period in (("train", train_period), ("test", test_period)):
+        for symbol in required_symbols:
+            if not has_ohlcv_bars_in_range(
+                symbol=symbol,
+                timeframe=timeframe,
+                start=period["start"],
+                end=period["end"],
+                data_dir=data_dir,
+            ):
+                raise ValueError(
+                    f"Optimization {segment_name} segment has no OHLCV bars for "
+                    f"{symbol} {timeframe} ({period['start']} -> {period['end']})"
+                )
 
     _emit_progress(progress_callback, 0.0, "Starting Optuna optimization.")
 
@@ -376,9 +405,15 @@ def _split_backtest_period(
             "train_split_pct produces an empty train or test period for the base backtest range"
         )
 
+    test_start_ts = split_ts + pd.Timedelta(microseconds=1)
+    if split_ts <= start_ts or test_start_ts >= end_ts:
+        raise ValueError(
+            "train_split_pct produces an empty train or test period for the base backtest range"
+        )
+
     train_period = {"start": start_ts.isoformat(), "end": split_ts.isoformat()}
     test_period = {
-        "start": (split_ts + pd.Timedelta(microseconds=1)).isoformat(),
+        "start": test_start_ts.isoformat(),
         "end": end_ts.isoformat(),
     }
     return train_period, test_period

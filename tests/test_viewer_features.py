@@ -2061,6 +2061,34 @@ def test_optimization_run_starts_background_task(viewer_client, monkeypatch, tmp
     assert "Optimization saved to opt_base-demo_20260311_100000.json" in log_text
 
 
+def test_optimization_run_rejects_train_split_above_max_before_queueing(viewer_client, monkeypatch):
+    import viewer.main as viewer_app_module
+
+    monkeypatch.setattr(
+        viewer_app_module.threading,
+        "Thread",
+        lambda *args, **kwargs: SimpleNamespace(start=lambda: None),
+    )
+
+    response = viewer_client.post(
+        "/api/optimizations/run",
+        json={
+            "base_backtest_id": "base-demo",
+            "target_metric": "sharpe",
+            "n_trials": 2,
+            "train_split_pct": 0.96,
+            "parameter_ranges": {
+                "window": {"type": "int", "min": 5, "max": 10, "step": 1},
+            },
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"]["error"] == "Invalid optimization payload"
+    assert response.json()["detail"]["details"][0]["loc"] == ["train_split_pct"]
+    assert viewer_app_module.DATA_TASKS == {}
+
+
 def test_backtest_run_registers_task_manager_progress(viewer_client, monkeypatch, tmp_path):
     import viewer.main as viewer_app_module
 
