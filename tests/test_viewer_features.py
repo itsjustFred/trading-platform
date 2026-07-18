@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1244,6 +1245,367 @@ def test_data_download_passes_price_type_and_merge_flags(viewer_client, monkeypa
     assert captured["timeframes"] == ["tick", "s1", "m1"]
     assert captured["batch_size"] == 7
     assert captured["pause_ms"] == 2500
+
+
+def test_data_download_coalesces_identical_active_request(viewer_client, monkeypatch):
+    import viewer.main as viewer_app_module
+
+    starts: list[str] = []
+
+    class _NoStartThread:
+        def __init__(self, *args, **kwargs):
+            self.target = kwargs.get("target")
+
+        def start(self) -> None:
+            starts.append("started")
+
+    monkeypatch.setattr(viewer_app_module.legacy_viewer.threading, "Thread", _NoStartThread)
+    payload = {
+        "source": "dukascopy",
+        "symbols": "EURUSD",
+        "timeframes": "m1",
+        "start": "2026-01-01",
+        "end": "2026-01-02",
+        "price_type": "bid",
+    }
+
+    first = viewer_client.post("/api/data/download", json=payload)
+    second = viewer_client.post(
+        "/api/data/download",
+        json={**payload, "symbols": " eurusd ", "timeframes": "M1"},
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert len(starts) == 1
+    assert second.json() == {
+        "task_id": first.json()["task_id"],
+        "status": "starting",
+        "coalesced": True,
+    }
+
+
+def test_download_registry_coalesces_concurrent_identical_requests(viewer_client):
+    import viewer.main as viewer_app_module
+
+    request_key = "concurrent-request"
+    barrier = threading.Barrier(2)
+    results: list[dict | None] = []
+    results_lock = threading.Lock()
+
+    def register(index: int) -> None:
+        barrier.wait()
+        record = {"id": f"task-{index}", "status": "starting"}
+        existing = viewer_app_module.legacy_viewer._register_download_task(
+            record, request_key
+        )
+        with results_lock:
+            results.append(existing)
+
+    workers = [threading.Thread(target=register, args=(index,)) for index in range(2)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=2)
+
+    assert all(not worker.is_alive() for worker in workers)
+    assert sum(result is None for result in results) == 1
+    assert sum(result is not None for result in results) == 1
+    assert len(viewer_app_module.legacy_viewer.DATA_TASKS) == 1
+
+
+def test_data_download_does_not_coalesce_different_options_or_finished_task(
+    viewer_client, monkeypatch
+):
+    import viewer.main as viewer_app_module
+
+    starts: list[str] = []
+
+    class _NoStartThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self) -> None:
+            starts.append("started")
+
+    monkeypatch.setattr(viewer_app_module.legacy_viewer.threading, "Thread", _NoStartThread)
+    payload = {
+        "source": "dukascopy",
+        "symbols": "EURUSD",
+        "timeframes": "m1",
+        "start": "2026-01-01",
+        "end": "2026-01-02",
+        "price_type": "bid",
+    }
+
+    first = viewer_client.post("/api/data/download", json=payload)
+    different = viewer_client.post(
+        "/api/data/download", json={**payload, "price_type": "ask"}
+    )
+    viewer_app_module._mark_task_finished(
+        first.json()["task_id"], status="completed", returncode=0
+    )
+    retried = viewer_client.post("/api/data/download", json=payload)
+
+    assert first.status_code == different.status_code == retried.status_code == 200
+    assert len(starts) == 3
+    assert different.json()["task_id"] != first.json()["task_id"]
+    assert retried.json()["task_id"] != first.json()["task_id"]
+    assert "coalesced" not in different.json()
+    assert "coalesced" not in retried.json()
+
+
+@pytest.mark.parametrize(
+    ("source", "irrelevant_options"),
+    [
+        (
+            "yfinance",
+            {
+                "price_type": "ask",
+                "merge_tick": True,
+                "batch_size": 23,
+                "pause_ms": 4000,
+                "query_timeout_seconds": 1200,
+            },
+        ),
+        (
+            "jforex",
+            {
+                "merge_tick": True,
+                "merge_s1": True,
+                "batch_size": 23,
+                "pause_ms": 4000,
+            },
+        ),
+    ],
+)
+def test_data_download_coalesces_options_irrelevant_to_source(
+    viewer_client, monkeypatch, source, irrelevant_options
+):
+    import viewer.main as viewer_app_module
+
+    starts = 0
+
+    class _NoStartThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self) -> None:
+            nonlocal starts
+            starts += 1
+
+    monkeypatch.setattr(viewer_app_module.legacy_viewer.threading, "Thread", _NoStartThread)
+    payload = {
+        "source": source,
+        "symbols": "EURUSD",
+        "timeframes": "m1",
+        "start": "2026-01-01",
+        "end": "2026-01-02",
+    }
+
+    first = viewer_client.post("/api/data/download", json=payload)
+    second = viewer_client.post(
+        "/api/data/download", json={**payload, **irrelevant_options}
+    )
+
+    assert first.status_code == second.status_code == 200
+    assert starts == 1
+    assert second.json()["task_id"] == first.json()["task_id"]
+    assert second.json()["coalesced"] is True
+
+
+def test_data_download_coalesces_dolthub_requests_with_unused_fields(
+    viewer_client, monkeypatch
+):
+    import viewer.main as viewer_app_module
+
+    starts = 0
+
+    class _NoStartThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self) -> None:
+            nonlocal starts
+            starts += 1
+
+    monkeypatch.setattr(viewer_app_module.legacy_viewer.threading, "Thread", _NoStartThread)
+
+    first = viewer_client.post(
+        "/api/data/download",
+        json={
+            "source": "dolthub",
+            "symbols": "AAPL",
+            "timeframes": "1d",
+            "start": "2025-01-01",
+            "end": "2025-01-31",
+        },
+    )
+    second = viewer_client.post(
+        "/api/data/download",
+        json={
+            "source": "dolthub",
+            "symbols": "MSFT",
+            "timeframes": "1h",
+            "start": "2026-06-01",
+            "end": "2026-06-30",
+        },
+    )
+
+    assert first.status_code == second.status_code == 200
+    assert starts == 1
+    assert second.json()["task_id"] == first.json()["task_id"]
+    assert second.json()["coalesced"] is True
+
+
+def test_data_download_thread_start_failure_allows_retry(viewer_client, monkeypatch):
+    import viewer.main as viewer_app_module
+
+    starts = 0
+
+    class _FailThenStartThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self) -> None:
+            nonlocal starts
+            starts += 1
+            if starts == 1:
+                raise RuntimeError("thread unavailable")
+
+    monkeypatch.setattr(
+        viewer_app_module.legacy_viewer.threading, "Thread", _FailThenStartThread
+    )
+    payload = {
+        "source": "dukascopy",
+        "symbols": "EURUSD",
+        "timeframes": "m1",
+        "start": "2026-01-01",
+        "end": "2026-01-02",
+    }
+
+    with pytest.raises(RuntimeError, match="thread unavailable"):
+        viewer_client.post("/api/data/download", json=payload)
+    retry = viewer_client.post("/api/data/download", json=payload)
+
+    assert retry.status_code == 200
+    assert starts == 2
+    assert "coalesced" not in retry.json()
+
+
+def test_data_download_thread_construction_failure_allows_retry(
+    viewer_client, monkeypatch
+):
+    import viewer.main as viewer_app_module
+
+    constructions = 0
+
+    class _FailThenConstructThread:
+        def __init__(self, *args, **kwargs):
+            nonlocal constructions
+            constructions += 1
+            if constructions == 1:
+                raise ValueError("thread construction unavailable")
+
+        def start(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        viewer_app_module.legacy_viewer.threading, "Thread", _FailThenConstructThread
+    )
+    payload = {
+        "source": "yfinance",
+        "symbols": "AAPL",
+        "timeframes": "1d",
+        "start": "2026-01-01",
+        "end": "2026-01-02",
+    }
+
+    with pytest.raises(ValueError, match="thread construction unavailable"):
+        viewer_client.post("/api/data/download", json=payload)
+    retry = viewer_client.post("/api/data/download", json=payload)
+
+    assert retry.status_code == 200
+    assert constructions == 2
+    assert "coalesced" not in retry.json()
+
+
+@pytest.mark.parametrize("status", ["completed", "failed", "cancelled"])
+def test_data_download_releases_request_key_when_task_finishes(
+    viewer_client, monkeypatch, status
+):
+    import viewer.main as viewer_app_module
+
+    class _NoStartThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self) -> None:
+            pass
+
+    monkeypatch.setattr(viewer_app_module.legacy_viewer.threading, "Thread", _NoStartThread)
+    response = viewer_client.post(
+        "/api/data/download",
+        json={
+            "source": "dukascopy",
+            "symbols": "EURUSD",
+            "timeframes": "m1",
+            "start": "2026-01-01",
+            "end": "2026-01-02",
+        },
+    )
+    task_id = response.json()["task_id"]
+
+    assert "download_request_key" in viewer_app_module.DATA_TASKS[task_id]
+
+    viewer_app_module._mark_task_finished(
+        task_id,
+        status=status,
+        returncode=0 if status == "completed" else 1,
+    )
+
+    assert "download_request_key" not in viewer_app_module.DATA_TASKS[task_id]
+
+
+def test_data_download_discards_persisted_record_for_coalesced_request(
+    viewer_client, monkeypatch
+):
+    import viewer.main as viewer_app_module
+
+    persisted: set[str] = set()
+    deleted: set[str] = set()
+
+    class _NoStartThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self) -> None:
+            pass
+
+    monkeypatch.setattr(viewer_app_module.legacy_viewer.threading, "Thread", _NoStartThread)
+    monkeypatch.setattr(
+        viewer_app_module,
+        "_persist_task_snapshot",
+        lambda task_id, _task: persisted.add(task_id),
+    )
+    monkeypatch.setattr(
+        viewer_app_module,
+        "delete_background_task_record",
+        lambda task_id: deleted.add(task_id) or True,
+    )
+    payload = {
+        "source": "dukascopy",
+        "symbols": "EURUSD",
+        "timeframes": "m1",
+        "start": "2026-01-01",
+        "end": "2026-01-02",
+    }
+
+    first = viewer_client.post("/api/data/download", json=payload)
+    second = viewer_client.post("/api/data/download", json=payload)
+
+    assert second.json()["task_id"] == first.json()["task_id"]
+    assert persisted - deleted == {first.json()["task_id"]}
 
 
 def test_data_download_accepts_jforex_source(viewer_client, monkeypatch):

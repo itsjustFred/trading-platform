@@ -2905,6 +2905,16 @@ def _mark_task_finished(
     return task
 
 
+def _discard_coalesced_download_registration(task_id: str) -> None:
+    """Remove the provisional task created by a request that coalesced."""
+    with DATA_TASKS_LOCK:
+        DATA_TASKS.pop(task_id, None)
+    try:
+        delete_background_task_record(task_id)
+    except Exception as exc:
+        logger.warning("Could not remove provisional coalesced task %s: %s", task_id, exc)
+
+
 def _serialize_task(
     task_id: str,
     task: dict[str, Any],
@@ -9849,6 +9859,33 @@ async def data_download(payload: DataDownloadRequest) -> dict[str, Any]:
 
     task_id = str(uuid.uuid4())
     name, description = _download_task_labels(source, symbol_list, timeframe_list)
+    request_price_type = offer_side if source in {"dukascopy", "jforex"} else ""
+    request_merge_tick = merge_tick if source == "dukascopy" else False
+    request_merge_s1 = merge_s1 if source == "dukascopy" else False
+    request_batch_size = batch_size if source == "dukascopy" else 0
+    request_pause_ms = pause_ms if source == "dukascopy" else 0
+    request_options = (
+        {"query_timeout_seconds": query_timeout_seconds}
+        if source in {"dukascopy", "jforex"}
+        else {}
+    )
+    request_symbols = [] if source == "dolthub" else symbol_list
+    request_timeframes = [] if source == "dolthub" else timeframe_list
+    request_start = None if source == "dolthub" else start or None
+    request_end = None if source == "dolthub" else end or None
+    request_key = legacy_viewer._download_request_key(
+        source=source,
+        symbols=request_symbols,
+        timeframes=request_timeframes,
+        start=request_start,
+        end=request_end,
+        price_type=request_price_type,
+        merge_tick=request_merge_tick,
+        merge_s1=request_merge_s1,
+        batch_size=request_batch_size,
+        pause_ms=request_pause_ms,
+        options=request_options,
+    )
 
     if source in {"dukascopy", "jforex"}:
         source_label = "dukascopy" if source == "dukascopy" else "jforex"
@@ -9892,7 +9929,11 @@ async def data_download(payload: DataDownloadRequest) -> dict[str, Any]:
             total_items=total_items,
             name=name,
             description=description,
+            request_key=request_key,
         )
+        if result.get("coalesced"):
+            _discard_coalesced_download_registration(task_id)
+            return result
         _apply_recovery_data_metadata(
             task_id,
             command=[str(part) for part in cmd],
@@ -9944,7 +9985,11 @@ async def data_download(payload: DataDownloadRequest) -> dict[str, Any]:
         name=name,
         description=description,
         source=source,
+        request_key=request_key,
     )
+    if result.get("coalesced"):
+        _discard_coalesced_download_registration(task_id)
+        return result
     _apply_recovery_data_metadata(
         task_id,
         command=[str(part) for part in cmd],

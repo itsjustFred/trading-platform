@@ -2814,6 +2814,61 @@ ACTIVE_TASK_STATUSES = {"starting", "running", "paused"}
 FINAL_TASK_STATUSES = {"completed", "failed", "cancelled"}
 
 
+def _download_request_key(
+    *,
+    source: str,
+    symbols: list[str],
+    timeframes: list[str],
+    start: str | None,
+    end: str | None,
+    price_type: str,
+    merge_tick: bool,
+    merge_s1: bool,
+    batch_size: int,
+    pause_ms: int,
+    options: dict[str, Any] | None = None,
+) -> str:
+    payload = {
+        "source": str(source or "").strip().lower(),
+        "symbols": tuple(sorted({str(symbol).strip().upper() for symbol in symbols})),
+        "timeframes": tuple(sorted({str(timeframe).strip().lower() for timeframe in timeframes})),
+        "start": start or None,
+        "end": end or None,
+        "price_type": str(price_type or "").strip().lower(),
+        "merge_tick": bool(merge_tick),
+        "merge_s1": bool(merge_s1),
+        "batch_size": int(batch_size),
+        "pause_ms": int(pause_ms),
+        "options": options or {},
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _find_active_download_task(request_key: str) -> dict[str, Any] | None:
+    with DATA_TASKS_LOCK:
+        for task in DATA_TASKS.values():
+            if task.get("download_request_key") != request_key:
+                continue
+            if task.get("status") in ACTIVE_TASK_STATUSES:
+                return dict(task)
+    return None
+
+
+def _register_download_task(
+    record: dict[str, Any], request_key: str | None
+) -> dict[str, Any] | None:
+    with DATA_TASKS_LOCK:
+        if request_key:
+            for task in DATA_TASKS.values():
+                if task.get("download_request_key") != request_key:
+                    continue
+                if task.get("status") in ACTIVE_TASK_STATUSES:
+                    return dict(task)
+            record["download_request_key"] = request_key
+        DATA_TASKS[record["id"]] = record
+        return None
+
+
 def _task_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -3136,6 +3191,12 @@ def _mark_task_finished(
     if error is not None:
         updates["error"] = error
     task = _update_task_fields(task_id, **updates)
+    if status in FINAL_TASK_STATUSES:
+        with DATA_TASKS_LOCK:
+            finished_task = DATA_TASKS.get(task_id)
+            if finished_task is not None:
+                finished_task.pop("download_request_key", None)
+                task = dict(finished_task)
     if status == "completed":
         _update_task_progress(task_id, percent=100.0)
         task = _snapshot_task(task_id)
@@ -3218,6 +3279,7 @@ def _start_data_task(
     description: str = "",
     kind: str = "data",
     source: str = "system",
+    request_key: str | None = None,
 ) -> dict:
     """Launch a background data-management subprocess with streamed task logs."""
     TASK_LOGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -3233,8 +3295,9 @@ def _start_data_task(
         control_mode="process",
         supports_control=True,
     )
-    with DATA_TASKS_LOCK:
-        DATA_TASKS[task_id] = record
+    existing = _register_download_task(record, request_key)
+    if existing is not None:
+        return {"task_id": existing["id"], "status": existing.get("status", "starting"), "coalesced": True}
 
     def run_proc() -> None:
         env = os.environ.copy()
@@ -3319,9 +3382,13 @@ def _start_data_task(
         finally:
             _update_task_fields(task_id, process=None)
 
-    thread = threading.Thread(target=run_proc, daemon=True)
-    _update_task_fields(task_id, thread=thread)
-    thread.start()
+    try:
+        thread = threading.Thread(target=run_proc, daemon=True)
+        _update_task_fields(task_id, thread=thread)
+        thread.start()
+    except Exception as exc:
+        _mark_task_finished(task_id, status="failed", returncode=1, error=str(exc))
+        raise
     return {"task_id": task_id, "status": "starting"}
 
 
@@ -3341,6 +3408,7 @@ def _start_dukascopy_task(
     total_items: int,
     name: str,
     description: str,
+    request_key: str | None = None,
 ) -> dict[str, Any]:
     from data_tools.downloaders.dukascopy_native import DownloadCancelled, DukascopyNativeDownloader
 
@@ -3357,8 +3425,9 @@ def _start_dukascopy_task(
         control_mode="thread",
         supports_control=True,
     )
-    with DATA_TASKS_LOCK:
-        DATA_TASKS[task_id] = record
+    existing = _register_download_task(record, request_key)
+    if existing is not None:
+        return {"task_id": existing["id"], "status": existing.get("status", "starting"), "coalesced": True}
 
     def run_download() -> None:
         command_display = " ".join(str(part) for part in cmd)
@@ -3550,9 +3619,13 @@ def _start_dukascopy_task(
                 extra={"data": {"task_id": task_id, "stream": "task", "source": "data-task"}},
             )
 
-    thread = threading.Thread(target=run_download, daemon=True)
-    _update_task_fields(task_id, thread=thread)
-    thread.start()
+    try:
+        thread = threading.Thread(target=run_download, daemon=True)
+        _update_task_fields(task_id, thread=thread)
+        thread.start()
+    except Exception as exc:
+        _mark_task_finished(task_id, status="failed", returncode=1, error=str(exc))
+        raise
     return {"task_id": task_id, "status": "starting"}
 
 
@@ -3575,6 +3648,7 @@ def _start_jforex_task(
     total_items: int,
     name: str,
     description: str,
+    request_key: str | None = None,
 ) -> dict[str, Any]:
     from data_tools.downloaders.dukascopy_native import DownloadCancelled, DukascopyNativeDownloader
     from data_tools.downloaders.jforex_dl import JForexDownloader
@@ -3592,8 +3666,9 @@ def _start_jforex_task(
         control_mode="thread",
         supports_control=True,
     )
-    with DATA_TASKS_LOCK:
-        DATA_TASKS[task_id] = record
+    existing = _register_download_task(record, request_key)
+    if existing is not None:
+        return {"task_id": existing["id"], "status": existing.get("status", "starting"), "coalesced": True}
 
     def run_download() -> None:
         command_display = " ".join(str(part) for part in cmd)
@@ -3920,9 +3995,13 @@ def _start_jforex_task(
                 extra={"data": {"task_id": task_id, "stream": "task", "source": "data-task"}},
             )
 
-    thread = threading.Thread(target=run_download, daemon=True)
-    _update_task_fields(task_id, thread=thread)
-    thread.start()
+    try:
+        thread = threading.Thread(target=run_download, daemon=True)
+        _update_task_fields(task_id, thread=thread)
+        thread.start()
+    except Exception as exc:
+        _mark_task_finished(task_id, status="failed", returncode=1, error=str(exc))
+        raise
     return {"task_id": task_id, "status": "starting"}
 
 
