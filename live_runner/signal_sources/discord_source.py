@@ -14,9 +14,9 @@ import requests
 from live_runner.signal_sources.base_source import BaseSignalSource
 from risk.models import TradeSignal
 from shared.constants import normalize_timeframe
-from shared.database import save_live_signal, update_service_status
+from shared.database import update_service_status
 from shared.logging import get_logger
-from shared.models import LiveSignal, ServiceStatus
+from shared.models import ServiceStatus
 
 logger = get_logger("live-runner")
 
@@ -126,6 +126,16 @@ def _extract_symbol(content: str) -> str | None:
             candidate = normalize_candidate(matched.group(1))
             if candidate:
                 return candidate
+
+    action_symbol = re.search(
+        r"(?i:\b(?:buy|sell|long|short)\b)\s+"
+        r"(?:(?i:signal)\s+)?\**\$?([A-Z]{1,10})\**\b",
+        content,
+    )
+    if action_symbol:
+        candidate = normalize_candidate(action_symbol.group(1))
+        if candidate:
+            return candidate
 
     for matched in re.findall(r"\$([A-Za-z]{1,10})\b", content):
         candidate = normalize_candidate(matched)
@@ -329,23 +339,6 @@ class DiscordSignalSource(BaseSignalSource):
                 },
             )
 
-    async def _persist_trade_signal(self, signal: TradeSignal) -> None:
-        metadata = dict(signal.metadata or {})
-        metadata["source"] = self.source_name
-        metadata["discord_bot_name"] = self.bot_name
-        if self.service_id:
-            metadata["service_id"] = self.service_id
-        signal_time = _parse_timestamp(str(metadata.get("received_at") or ""))
-        live_signal = LiveSignal(
-            deployment_id=self.service_id or self.bot_name,
-            symbol=signal.symbol,
-            action="buy" if signal.action in {"buy", "long"} else "sell",
-            theoretical_price=float(signal.entry_price),
-            timestamp=signal_time,
-            metadata=metadata,
-        )
-        await asyncio.to_thread(save_live_signal, live_signal)
-
     async def _fetch_messages(self, channel_id: str) -> list[dict[str, Any]]:
         headers = {"authorization": self.token}
         url = f"https://discord.com/api/v9/channels/{channel_id}/messages?limit={POLL_LIMIT}"
@@ -421,19 +414,6 @@ class DiscordSignalSource(BaseSignalSource):
             parsed.metadata["discord_bot_name"] = self.bot_name
             if self.service_id:
                 parsed.metadata["service_id"] = self.service_id
-            try:
-                await self._persist_trade_signal(parsed)
-            except Exception as exc:
-                logger.warning(
-                    "Failed to persist discord signal",
-                    extra={
-                        "data": {
-                            "bot_name": self.bot_name,
-                            "service_id": self.service_id,
-                            "error": str(exc),
-                        }
-                    },
-                )
             await self._set_service_status(
                 ServiceStatus.RUNNING,
                 last_activity=datetime.now(timezone.utc),

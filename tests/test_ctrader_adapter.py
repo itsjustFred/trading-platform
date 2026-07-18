@@ -43,6 +43,58 @@ def test_is_terminal_auth_error_ignores_transient_timeout() -> None:
     assert not _is_terminal_auth_error("TIMEOUT", "Connection timeout")
 
 
+def test_adapter_uses_strict_canonical_demo_switch(monkeypatch) -> None:
+    monkeypatch.setenv("CTRADER_DEMO", "false")
+
+    adapter = CTraderLiveAdapter(
+        app_id="app",
+        app_secret="secret",
+        access_token="token",
+        account_id="46736452",
+    )
+
+    assert adapter.demo is False
+
+
+def test_adapter_rejects_invalid_canonical_demo_switch(monkeypatch) -> None:
+    monkeypatch.setenv("CTRADER_DEMO", "tru")
+
+    with pytest.raises(ValueError, match="CTRADER_DEMO"):
+        CTraderLiveAdapter(
+            app_id="app",
+            app_secret="secret",
+            access_token="token",
+            account_id="46736452",
+        )
+
+
+def test_connect_override_limits_attempts(monkeypatch) -> None:
+    adapter = CTraderLiveAdapter(
+        app_id="app",
+        app_secret="secret",
+        access_token="token",
+        account_id="46736452",
+        connect_max_attempts=1,
+        connect_timeout_seconds=0.01,
+    )
+    attempts = 0
+
+    class _Client:
+        running = False
+
+        def startService(self) -> None:
+            nonlocal attempts
+            attempts += 1
+
+    monkeypatch.setattr(adapter, "_load_openapi_types", lambda: None)
+    monkeypatch.setattr(adapter, "_create_client", lambda: _Client())
+
+    with pytest.raises(asyncio.TimeoutError):
+        asyncio.run(adapter.connect())
+
+    assert attempts == 1
+
+
 def test_on_message_marks_terminal_auth_failure_for_not_authorized() -> None:
     adapter = CTraderLiveAdapter(
         app_id="app",
@@ -91,6 +143,106 @@ def test_on_message_keeps_terminal_state_clear_for_already_logged_in() -> None:
     assert adapter._terminal_auth_failure_reason == ""
 
 
+def test_execution_queue_overflow_requests_broker_reconciliation() -> None:
+    adapter = CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="1"
+    )
+    current_client = object()
+    payload = SimpleNamespace(executionType=1)
+    adapter._client = current_client
+    adapter._execution_payload_type = 200
+    adapter._heartbeat_payload_type = -1
+    adapter._Protobuf = SimpleNamespace(extract=lambda _message: payload)
+    adapter._execution_queue = asyncio.Queue(maxsize=1)
+    adapter._execution_queue.put_nowait(object())
+
+    adapter._on_message(current_client, SimpleNamespace(payloadType=200))
+
+    assert adapter._reconciliation_required is True
+
+
+def test_stale_execution_callback_cannot_request_reconciliation() -> None:
+    adapter = CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="1"
+    )
+    current_client = object()
+    adapter._client = current_client
+    adapter._execution_payload_type = 200
+    adapter._heartbeat_payload_type = -1
+    adapter._Protobuf = SimpleNamespace(extract=lambda _message: object())
+    adapter._execution_queue = asyncio.Queue(maxsize=1)
+    adapter._execution_queue.put_nowait(object())
+
+    adapter._on_message(object(), SimpleNamespace(payloadType=200))
+
+    assert adapter._reconciliation_required is False
+
+
+def test_listener_keeps_processing_queue_when_reconciliation_fails(monkeypatch) -> None:
+    adapter = CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="1"
+    )
+    adapter._connected = True
+    adapter._authenticated = True
+    adapter._reconciliation_required = True
+    event = object()
+    attempts = 0
+    persisted: list[object] = []
+
+    async def reconcile_executions(*, max_signals: int = 200) -> int:
+        nonlocal attempts
+        assert max_signals == 200
+        attempts += 1
+        raise RuntimeError("temporary broker failure")
+
+    async def persist_execution(received: object) -> None:
+        persisted.append(received)
+        raise asyncio.CancelledError
+
+    adapter._execution_queue.put_nowait(event)
+    monkeypatch.setattr(adapter, "reconcile_executions", reconcile_executions)
+    monkeypatch.setattr(adapter, "_persist_execution_event", persist_execution)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(adapter.listen_executions())
+
+    assert attempts == 1
+    assert persisted == [event]
+    assert adapter._reconciliation_required is True
+    assert adapter._reconciliation_retry_at > 0
+
+
+def test_listener_clears_reconciliation_flag_after_success(monkeypatch) -> None:
+    adapter = CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="1"
+    )
+    adapter._connected = True
+    adapter._authenticated = True
+    adapter._reconciliation_required = True
+    event = object()
+    attempts = 0
+
+    async def reconcile_executions(*, max_signals: int = 200) -> int:
+        nonlocal attempts
+        assert max_signals == 200
+        attempts += 1
+        return 0
+
+    async def persist_execution(_event: object) -> None:
+        raise asyncio.CancelledError
+
+    adapter._execution_queue.put_nowait(event)
+    monkeypatch.setattr(adapter, "reconcile_executions", reconcile_executions)
+    monkeypatch.setattr(adapter, "_persist_execution_event", persist_execution)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(adapter.listen_executions())
+
+    assert attempts == 1
+    assert adapter._reconciliation_required is False
+    assert adapter._reconciliation_retry_at == 0.0
+
+
 def test_refresh_access_token_updates_runtime_and_dotenv(tmp_path) -> None:
     env_path = tmp_path / ".accounts.env"
     env_path.write_text("CTRADER_ACCESS_TOKEN=old\nCTRADER_REFRESH_TOKEN=old_refresh\n", encoding="utf-8")
@@ -129,6 +281,27 @@ def test_refresh_access_token_updates_runtime_and_dotenv(tmp_path) -> None:
     assert "CTRADER_REFRESH_TOKEN=new_refresh" in contents
 
 
+def test_stale_client_callbacks_cannot_change_current_connection_state() -> None:
+    adapter = CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="1"
+    )
+    current_client = object()
+    stale_client = object()
+    adapter._client = current_client
+
+    adapter._on_connected(stale_client)
+    assert adapter._connected is False
+    assert adapter._connected_event.is_set() is False
+
+    adapter._connected = True
+    adapter._authenticated = True
+    adapter._connected_event.set()
+    adapter._on_disconnected(stale_client, "late disconnect")
+    assert adapter._connected is True
+    assert adapter._authenticated is True
+    assert adapter._connected_event.is_set() is True
+
+
 def test_send_request_with_refresh_retry_retries_once_after_token_refresh() -> None:
     adapter = CTraderLiveAdapter(
         app_id="app",
@@ -147,7 +320,7 @@ def test_send_request_with_refresh_retry_retries_once_after_token_refresh() -> N
             raise CTraderApiError("CH_ACCESS_TOKEN_INVALID", "expired")
         return response
 
-    async def _fake_refresh():
+    async def _fake_refresh(**_kwargs):
         adapter.access_token = "new"
         return True
 
@@ -156,6 +329,108 @@ def test_send_request_with_refresh_retry_retries_once_after_token_refresh() -> N
 
     assert asyncio.run(adapter._send_request_with_refresh_retry(request)) is response
     assert calls == [request, request]
+
+
+def test_delayed_old_token_error_does_not_rotate_refresh_token_twice(tmp_path) -> None:
+    adapter = CTraderLiveAdapter(
+        app_id="app",
+        app_secret="secret",
+        access_token="old_access",
+        refresh_token="old_refresh",
+        account_id="46736452",
+        accounts_env_path=tmp_path / ".accounts.env",
+    )
+    both_requests_started = asyncio.Event()
+    first_refresh_complete = asyncio.Event()
+    request_attempts: dict[object, int] = {}
+    first_attempts_started = 0
+    class RefreshRequest:
+        def __init__(self) -> None:
+            self.refreshToken = ""
+
+    class RefreshResponse:
+        accessToken = "new_access"
+        refreshToken = "new_refresh"
+        expiresIn = 2628000
+
+    refresh_requests: list[str] = []
+    request_a = object()
+    request_b = object()
+
+    async def send_request(request, **_kwargs):
+        nonlocal first_attempts_started
+        if isinstance(request, RefreshRequest):
+            refresh_requests.append(request.refreshToken)
+            first_refresh_complete.set()
+            return RefreshResponse()
+        attempt = request_attempts.get(request, 0) + 1
+        request_attempts[request] = attempt
+        if attempt > 1:
+            return request
+        first_attempts_started += 1
+        if first_attempts_started == 2:
+            both_requests_started.set()
+        await both_requests_started.wait()
+        if request is request_a:
+            raise CTraderApiError("CH_ACCESS_TOKEN_INVALID", "expired old token")
+        await first_refresh_complete.wait()
+        raise CTraderApiError("CH_ACCESS_TOKEN_INVALID", "delayed old token error")
+
+    adapter._ProtoOARefreshTokenReq = RefreshRequest
+    adapter._ProtoOARefreshTokenRes = RefreshResponse
+    adapter._send_request = send_request
+
+    async def run_requests():
+        return await asyncio.gather(
+            adapter._send_request_with_refresh_retry(request_a),
+            adapter._send_request_with_refresh_retry(request_b),
+        )
+
+    assert asyncio.run(run_requests()) == [request_a, request_b]
+    assert refresh_requests == ["old_refresh"]
+
+
+def test_waiter_does_not_treat_failed_token_refresh_as_success(tmp_path) -> None:
+    adapter = CTraderLiveAdapter(
+        app_id="app",
+        app_secret="secret",
+        access_token="old_access",
+        refresh_token="old_refresh",
+        account_id="46736452",
+        accounts_env_path=tmp_path / ".accounts.env",
+    )
+
+    class RefreshRequest:
+        def __init__(self) -> None:
+            self.refreshToken = ""
+
+    class InvalidRefreshResponse:
+        accessToken = ""
+        refreshToken = ""
+
+    refresh_attempts = 0
+
+    async def send_request(request, **_kwargs):
+        nonlocal refresh_attempts
+        if isinstance(request, RefreshRequest):
+            refresh_attempts += 1
+            return InvalidRefreshResponse()
+        raise AssertionError("Only refresh requests are expected")
+
+    adapter._ProtoOARefreshTokenReq = RefreshRequest
+    adapter._ProtoOARefreshTokenRes = InvalidRefreshResponse
+    adapter._send_request = send_request
+
+    async def refresh_twice():
+        return await asyncio.gather(
+            adapter._refresh_access_token(failed_access_token="old_access"),
+            adapter._refresh_access_token(failed_access_token="old_access"),
+        )
+
+    assert asyncio.run(refresh_twice()) == [False, False]
+    assert refresh_attempts == 2
+    assert adapter.access_token == "old_access"
+    assert adapter.refresh_token == "old_refresh"
 
 
 def test_auth_refresh_rebuilds_account_auth_request_with_new_access_token() -> None:
@@ -202,6 +477,50 @@ def test_auth_refresh_rebuilds_account_auth_request_with_new_access_token() -> N
 
     assert isinstance(asyncio.run(_run()), _AccountAuthRes)
     assert sent_tokens == ["old_access", "new_access"]
+
+
+def test_connect_cancellation_tears_down_started_client(monkeypatch) -> None:
+    async def _run() -> tuple[CTraderLiveAdapter, int]:
+        adapter = CTraderLiveAdapter(
+            app_id="app",
+            app_secret="secret",
+            access_token="token",
+            account_id="46736452",
+            connect_max_attempts=1,
+            connect_timeout_seconds=60,
+        )
+        client_started = asyncio.Event()
+        stop_calls = 0
+
+        class _Client:
+            running = False
+
+            def startService(self) -> None:
+                self.running = True
+                client_started.set()
+
+            def stopService(self) -> None:
+                nonlocal stop_calls
+                stop_calls += 1
+                self.running = False
+
+        monkeypatch.setattr(adapter, "_load_openapi_types", lambda: None)
+        monkeypatch.setattr(adapter, "_create_client", lambda: _Client())
+
+        connect_task = asyncio.create_task(adapter.connect())
+        await asyncio.wait_for(client_started.wait(), timeout=0.1)
+        connect_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await connect_task
+        return adapter, stop_calls
+
+    adapter, stop_calls = asyncio.run(_run())
+
+    assert stop_calls == 1
+    assert adapter._client is None
+    assert adapter._connected is False
+    assert adapter._authenticated is False
+    assert adapter._connected_event.is_set() is False
 
 
 def test_disconnect_times_out_instead_of_hanging() -> None:

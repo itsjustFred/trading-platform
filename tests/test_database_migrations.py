@@ -378,10 +378,9 @@ def test_migration_backfills_discord_id_from_metadata(legacy_db) -> None:
     assert rows["s2"] is None  # no metadata id => stays NULL
 
 
-def test_migration_handles_duplicate_discord_ids_before_index(legacy_db) -> None:
+def test_migration_fails_closed_for_duplicate_discord_ids_within_deployment(legacy_db) -> None:
     database, engine, _data_dir = legacy_db
     _legacy_signals_db(engine)
-    # Two rows share the same discord id; deterministic winner = earliest ts.
     _insert_legacy_signal(
         engine, row_id="dup_b", timestamp="2024-01-02T00:00:00", metadata={"discord_message_id": "DUP"}
     )
@@ -389,16 +388,33 @@ def test_migration_handles_duplicate_discord_ids_before_index(legacy_db) -> None
         engine, row_id="dup_a", timestamp="2024-01-01T00:00:00", metadata={"discord_message_id": "DUP"}
     )
 
-    database.init_db()  # must not raise creating the unique index
+    with pytest.raises(RuntimeError, match="No rows were deleted"):
+        database.init_db()
 
     with engine.connect() as conn:
-        rows = dict(conn.execute(text("SELECT id, discord_message_id FROM live_signals")).fetchall())
+        columns = {
+            str(row[1]) for row in conn.execute(text("PRAGMA table_info('live_signals')")).fetchall()
+        }
+        rows = dict(conn.execute(text("SELECT id, metadata FROM live_signals")).fetchall())
         idx = conn.execute(
-            text("SELECT name FROM sqlite_master WHERE type='index' AND name='uq_live_signals_discord_msg_id'")
+            text(
+                "SELECT name FROM sqlite_master WHERE type='index' "
+                "AND name='uq_live_signals_deployment_discord_msg'"
+            )
         ).first()
-    assert idx is not None
-    assert rows["dup_a"] == "DUP"  # earliest timestamp wins
-    assert rows["dup_b"] is None
+        legacy_table = conn.execute(
+            text(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name='live_signals__discord_legacy'"
+            )
+        ).first()
+    assert idx is None
+    assert legacy_table is None
+    assert "discord_message_id" not in columns
+    assert {row_id: json.loads(metadata)["discord_message_id"] for row_id, metadata in rows.items()} == {
+        "dup_a": "DUP",
+        "dup_b": "DUP",
+    }
 
 
 def test_migration_discord_backfill_is_idempotent(legacy_db) -> None:
@@ -421,6 +437,39 @@ def test_migration_discord_backfill_is_idempotent(legacy_db) -> None:
 
 
 # ─── Finding 8: equity_curve backfill ────────────────────────────────────────
+
+
+def test_equity_curve_column_add_and_backfill_happen_in_same_migration(isolated_db) -> None:
+    database, engine, _data_dir, _backtests_dir = isolated_db
+    with engine.begin() as connection:
+        connection.execute(text("ALTER TABLE backtests DROP COLUMN equity_curve"))
+        connection.execute(
+            text(
+                "INSERT INTO backtests ("
+                "id, strategies, engine, backtest_start, backtest_end, data, "
+                "initial_capital, parameters, tags, stats, notes, created_at"
+                ") VALUES ("
+                ":id, :strategies, :engine, '', '', '{}', 100000, '{}', '[]', '{}', '', ''"
+                ")"
+            ),
+            {"id": "bt_legacy", "strategies": "[]", "engine": "native"},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO equity_points (backtest_id, time, equity) "
+                "VALUES (:id, :time, :equity)"
+            ),
+            {"id": "bt_legacy", "time": "2024-01-01", "equity": 123.0},
+        )
+
+    database._migrate_schema()
+
+    with engine.connect() as connection:
+        curve = connection.execute(
+            text("SELECT equity_curve FROM backtests WHERE id = :id"),
+            {"id": "bt_legacy"},
+        ).scalar_one()
+    assert json.loads(curve) == [{"time": "2024-01-01", "equity": 123.0}]
 
 
 def test_equity_curve_backfill_from_equity_points(isolated_db) -> None:
@@ -474,6 +523,34 @@ def test_equity_curve_backfill_from_json_file(isolated_db) -> None:
         record = session.get(BacktestRecord, "bt_json")
     assert len(record.equity_curve) == 2
     assert record.equity_curve[1]["equity"] == 250.0
+
+
+def test_equity_curve_backfill_rejects_json_with_mismatched_id(isolated_db) -> None:
+    database, engine, _data_dir, backtests_dir = isolated_db
+    database.init_db()
+    with get_session() as session:
+        session.add(
+            BacktestRecord(id="bt_target", strategies=["s"], engine="native", equity_curve=[])
+        )
+        session.commit()
+
+    (backtests_dir / "bt_target.trades.json").write_text(
+        json.dumps(
+            {
+                "meta": {"id": "bt_other"},
+                "equity_curve": [{"time": "2024-01-01", "equity": 999.0}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    database._DB_INITIALIZED = False
+    database._migrate_schema()
+
+    with get_session() as session:
+        record = session.get(BacktestRecord, "bt_target")
+    assert record is not None
+    assert record.equity_curve == []
 
 
 def test_equity_curve_backfill_does_not_overwrite_non_empty(isolated_db) -> None:

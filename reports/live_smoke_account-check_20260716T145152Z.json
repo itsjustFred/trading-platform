@@ -1,0 +1,64 @@
+{
+  "checks": [
+    {
+      "details": {
+        "account_hint": "PA3FRGH7D9LI",
+        "cash": 99999.64,
+        "equity": 99999.64,
+        "paper": true,
+        "positions": 0
+      },
+      "error": "",
+      "name": "alpaca-nitro-account",
+      "ok": true
+    },
+    {
+      "details": {
+        "account_hint": "PA3KBEX2IDYH",
+        "cash": 100000.0,
+        "equity": 100000.0,
+        "paper": true,
+        "positions": 0
+      },
+      "error": "",
+      "name": "alpaca-ramjet-account",
+      "ok": true
+    },
+    {
+      "details": {
+        "account_hint": "PA35HB6T7815",
+        "cash": 100000.0,
+        "equity": 100000.0,
+        "paper": true,
+        "positions": 0
+      },
+      "error": "",
+      "name": "alpaca-rocketfuel-account",
+      "ok": true
+    },
+    {
+      "details": {
+        "accounts": 5,
+        "demo_accounts": 5
+      },
+      "error": "",
+      "name": "ctrader-discovery",
+      "ok": true
+    },
+    {
+      "details": {
+        "account_id": "47644617",
+        "balance": 99999.47,
+        "equity": 99999.47,
+        "positions": 0
+      },
+      "error": "",
+      "name": "ctrader-demo-adapter",
+      "ok": true
+    }
+  ],
+  "finished_at": "2026-07-16T14:51:52.300928+00:00",
+  "mode": "account-check",
+  "ok": true,
+  "started_at": "2026-07-16T14:51:42.243822+00:00"
+}

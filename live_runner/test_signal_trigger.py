@@ -8,7 +8,6 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from live_runner.alpaca_adapter import AlpacaLiveAdapter
-from shared.database import save_live_signal
 from shared.models import LiveSignal
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -48,7 +47,6 @@ async def _run(symbol: str, deployment_id: str, qty: float) -> None:
             "timeframe": "1m",
         },
     )
-    save_live_signal(signal)
     broker_order_id = await adapter.submit_order(signal)
     print(f"signal_id={signal.id}")
     print(f"broker_order_id={broker_order_id}")

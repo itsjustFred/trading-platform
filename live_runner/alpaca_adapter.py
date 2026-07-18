@@ -13,8 +13,12 @@ from uuid import UUID
 from live_runner.base_adapter import BaseLiveAdapter
 from risk.live import size_live_signal
 from shared.database import (
-    list_live_signal_ids_missing_executions,
+    get_live_signal_broker_order_id,
+    get_live_signal_filled_qty,
+    get_live_signal_reconciliation_cursor,
+    list_live_signal_ids_for_reconciliation,
     save_live_execution,
+    save_live_execution_up_to_cumulative,
     save_live_signal,
     set_live_signal_broker_order_id,
 )
@@ -206,52 +210,89 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             )
 
     async def reconcile_executions(self, *, max_signals: int = 200) -> int:
-        """Backfill fills for persisted signals that never received an execution record.
+        """Backfill missing fill quantity for recent signals in this Alpaca account.
 
         Recovers fills that completed while the daemon was down or crashed between
         broker submit and stream-event persistence. Uses the client_order_id == signal.id
-        convention. Only signals with zero recorded executions are considered, so
-        partially-streamed fills are never double-counted.
+        convention. Broker order quantities are cumulative, while local executions are
+        stored as event deltas, so only the positive cumulative difference is persisted.
         """
         if self._trading_client is None:
             return 0
-        signal_ids = await asyncio.to_thread(
-            list_live_signal_ids_missing_executions, max_signals
-        )
         recovered = 0
-        for signal_id in signal_ids:
-            try:
-                order = await asyncio.to_thread(
-                    self._trading_client.get_order_by_client_id, signal_id
+        before: tuple[datetime, str] | None = None
+        while True:
+            if before is None:
+                signal_ids = await asyncio.to_thread(
+                    list_live_signal_ids_for_reconciliation,
+                    self.account_id,
+                    max_signals,
                 )
-            except Exception:
-                # Unknown to this account (other broker/account) or not found.
-                continue
-            filled_qty = _to_float(getattr(order, "filled_qty", None), default=0.0)
-            if filled_qty <= 0:
-                continue
-            broker_order_id = str(getattr(order, "id", ""))
-            execution = LiveExecution(
-                signal_id=UUID(signal_id),
-                actual_price=_to_float(getattr(order, "filled_avg_price", None), default=0.0),
-                filled_qty=filled_qty,
-                commission=0.0,
-                timestamp=_to_datetime(getattr(order, "filled_at", None)),
-                broker_order_id=broker_order_id,
-                dedupe_key=f"alpaca:order:{broker_order_id}:reconciled",
+            else:
+                signal_ids = await asyncio.to_thread(
+                    list_live_signal_ids_for_reconciliation,
+                    self.account_id,
+                    max_signals,
+                    before=before,
+                )
+            if not signal_ids:
+                break
+            for signal_id in signal_ids:
+                try:
+                    order = await asyncio.to_thread(
+                        self._trading_client.get_order_by_client_id, signal_id
+                    )
+                except Exception:
+                    # Unknown to this account or not found.
+                    continue
+                broker_filled_qty = _to_float(
+                    getattr(order, "filled_qty", None), default=0.0
+                )
+                local_filled_qty = await asyncio.to_thread(
+                    get_live_signal_filled_qty, signal_id
+                )
+                missing_filled_qty = broker_filled_qty - local_filled_qty
+                if missing_filled_qty <= 0:
+                    continue
+                broker_order_id = str(getattr(order, "id", ""))
+                execution = LiveExecution(
+                    signal_id=UUID(signal_id),
+                    actual_price=_to_float(
+                        getattr(order, "filled_avg_price", None), default=0.0
+                    ),
+                    filled_qty=missing_filled_qty,
+                    commission=0.0,
+                    timestamp=_to_datetime(getattr(order, "filled_at", None)),
+                    broker_order_id=broker_order_id,
+                    dedupe_key=(
+                        f"alpaca:order:{broker_order_id}:reconciled:{broker_filled_qty}"
+                    ),
+                )
+                persisted_qty = await asyncio.to_thread(
+                    save_live_execution_up_to_cumulative, execution, broker_filled_qty
+                )
+                if persisted_qty > 0.0:
+                    recovered += 1
+                    logger.info(
+                        "Reconciled missed Alpaca fill",
+                        extra={
+                            "data": {
+                                "signal_id": signal_id,
+                                "broker_order_id": broker_order_id,
+                                "filled_qty": persisted_qty,
+                                "broker_cumulative_filled_qty": broker_filled_qty,
+                                "local_cumulative_filled_qty": local_filled_qty,
+                            }
+                        },
+                    )
+            if len(signal_ids) < max_signals:
+                break
+            next_before = await asyncio.to_thread(
+                get_live_signal_reconciliation_cursor, signal_ids[-1]
             )
-            if await asyncio.to_thread(save_live_execution, execution):
-                recovered += 1
-                logger.info(
-                    "Reconciled missed Alpaca fill",
-                    extra={
-                        "data": {
-                            "signal_id": signal_id,
-                            "broker_order_id": broker_order_id,
-                            "filled_qty": filled_qty,
-                        }
-                    },
-                )
+            if next_before is None or next_before == before:
+                break
+            before = next_before
         return recovered
 
     async def disconnect(self) -> None:
@@ -282,6 +323,9 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
     async def submit_order(self, signal: LiveSignal) -> str:
         if not self._connected or self._trading_client is None:
             await self.connect()
+        trading_client = self._trading_client
+        if trading_client is None:
+            raise RuntimeError("Alpaca trading client is unavailable after connect.")
 
         # Use equity (not cash) for risk sizing so margin accounts with negative cash
         # still pass sizing validation when total account value is positive.
@@ -303,7 +347,46 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             ) from exc
 
         side = OrderSide.BUY if signal.action == "buy" else OrderSide.SELL
-        await asyncio.to_thread(save_live_signal, signal)
+        canonical_signal_id, created = await asyncio.to_thread(save_live_signal, signal)
+        if not created:
+            existing_order_id = await asyncio.to_thread(
+                get_live_signal_broker_order_id, canonical_signal_id
+            )
+            if existing_order_id:
+                return existing_order_id
+            try:
+                recovered_order = await asyncio.to_thread(
+                    trading_client.get_order_by_client_id,
+                    canonical_signal_id,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "Alpaca canonical signal already exists and broker recovery failed; "
+                    "refusing possible duplicate submission."
+                ) from exc
+            recovered_order_id = str(getattr(recovered_order, "id", "")).strip()
+            if not recovered_order_id:
+                raise RuntimeError(
+                    "Alpaca canonical signal already exists without a recoverable broker "
+                    "order id; refusing possible duplicate submission."
+                )
+            persisted = await asyncio.to_thread(
+                set_live_signal_broker_order_id,
+                canonical_signal_id,
+                recovered_order_id,
+            )
+            if not persisted:
+                raise RuntimeError("Failed to persist recovered Alpaca broker order id.")
+            logger.info(
+                "Recovered accepted Alpaca order without resubmitting",
+                extra={
+                    "data": {
+                        "signal_id": canonical_signal_id,
+                        "broker_order_id": recovered_order_id,
+                    }
+                },
+            )
+            return recovered_order_id
 
         extended_hours = bool((signal.metadata or {}).get("extended_hours"))
         limit_price = _to_float((signal.metadata or {}).get("limit_price"), default=0.0)
@@ -315,7 +398,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 time_in_force=TimeInForce.DAY,
                 extended_hours=True,
                 limit_price=limit_price,
-                client_order_id=str(signal.id),
+                client_order_id=canonical_signal_id,
             )
         else:
             request = MarketOrderRequest(
@@ -324,19 +407,21 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 side=side,
                 time_in_force=TimeInForce.DAY,
                 extended_hours=extended_hours,
-                client_order_id=str(signal.id),
+                client_order_id=canonical_signal_id,
             )
-        order = await asyncio.to_thread(self._trading_client.submit_order, order_data=request)
+        order = await asyncio.to_thread(trading_client.submit_order, order_data=request)
         broker_order_id = str(getattr(order, "id", ""))
         if broker_order_id:
-            await asyncio.to_thread(
-                set_live_signal_broker_order_id, str(signal.id), broker_order_id
+            persisted = await asyncio.to_thread(
+                set_live_signal_broker_order_id, canonical_signal_id, broker_order_id
             )
+            if not persisted:
+                raise RuntimeError("Failed to persist Alpaca broker order id.")
         logger.info(
             "Submitted Alpaca live order",
             extra={
                 "data": {
-                    "signal_id": str(signal.id),
+                    "signal_id": canonical_signal_id,
                     "broker_order_id": broker_order_id,
                     "symbol": signal.symbol,
                     "action": signal.action,
@@ -446,9 +531,25 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 broker_order_id=broker_order_id,
                 dedupe_key=dedupe_key,
             )
-            await asyncio.to_thread(save_live_execution, execution)
+            broker_cumulative_filled_qty = _to_float(
+                getattr(order, "filled_qty", None), default=0.0
+            )
+            if broker_cumulative_filled_qty > 0.0:
+                persisted_qty = await asyncio.to_thread(
+                    save_live_execution_up_to_cumulative,
+                    execution,
+                    broker_cumulative_filled_qty,
+                )
+            else:
+                persisted_qty = filled_qty if await asyncio.to_thread(
+                    save_live_execution, execution
+                ) else 0.0
             logger.info(
-                "Persisted Alpaca execution fill",
+                (
+                    "Persisted Alpaca execution fill"
+                    if persisted_qty > 0.0
+                    else "Skipped duplicate Alpaca execution fill"
+                ),
                 extra={
                     "data": {
                         "signal_id": str(execution.signal_id),
@@ -456,6 +557,8 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                         "event": event,
                         "actual_price": actual_price,
                         "filled_qty": filled_qty,
+                        "persisted_qty": persisted_qty,
+                        "broker_cumulative_filled_qty": broker_cumulative_filled_qty,
                         "broker_order_id": broker_order_id,
                     }
                 }

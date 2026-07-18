@@ -10,6 +10,7 @@ from typing import Any
 
 from dotenv import dotenv_values
 
+from live_runner.account_routing import ctrader_account_identifier
 from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credentials
 from live_runner.config_parser import parse_live_deployments_config
 from live_runner.ctrader_adapter import CTraderLiveAdapter, DEFAULT_ACCOUNTS_ENV
@@ -148,19 +149,24 @@ def _preflight_account(
                         pass
 
     elif account.broker == "ctrader":
-        credentials = _resolve_ctrader_credentials(env_values)
+        try:
+            credentials = _resolve_ctrader_credentials(env_values)
+        except ValueError as exc:
+            credentials = None
+            errors.append(str(exc))
         if credentials is None:
-            errors.append(
-                "Missing cTrader credentials. Configure CTRADER_APP_ID, "
-                "CTRADER_APP_SECRET, and CTRADER_ACCESS_TOKEN."
-            )
+            if not errors:
+                errors.append(
+                    "Missing cTrader credentials. Configure CTRADER_APP_ID, "
+                    "CTRADER_APP_SECRET, and CTRADER_ACCESS_TOKEN."
+                )
         else:
             _, _, _, refresh_token, demo = credentials
             if not demo:
                 warnings.append("cTrader account resolves to live mode, not demo mode.")
             if not refresh_token:
                 warnings.append("CTRADER_REFRESH_TOKEN is missing; token refresh cannot be verified.")
-        account_identifier = str(account.ctid or account.broker_login or account.id).strip()
+        account_identifier = ctrader_account_identifier(account)
         try:
             if int(account_identifier) <= 0:
                 errors.append(

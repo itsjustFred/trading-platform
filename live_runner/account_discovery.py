@@ -11,6 +11,9 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+# Discovery uses raw TLS sockets and must not install or mutate a process-wide
+# Twisted reactor at import time. The live adapter bootstraps its asyncio reactor
+# lazily against the running event loop before importing OpenApiPy's Client.
 from ctrader_open_api import Protobuf
 from ctrader_open_api.messages import OpenApiMessages_pb2 as _OpenApiMessages_pb2
 from ctrader_open_api.messages.OpenApiCommonMessages_pb2 import ProtoHeartbeatEvent, ProtoMessage

@@ -36,6 +36,7 @@ pynecore = ["pynesys-pynecore>=0.1.0"]
 ctrader = [
     "ctrader-open-api>=0.9.2",
     "twisted>=24.3.0",
+    "service-identity>=24.1.0",
 ]
 dev = [
     "pytest>=8.0",

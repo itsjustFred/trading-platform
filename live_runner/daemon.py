@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import inspect
 import os
 import re
@@ -13,6 +14,10 @@ from pathlib import Path
 import pandas as pd
 from dotenv import dotenv_values
 
+from live_runner.account_routing import (
+    ctrader_account_identifier,
+    validate_live_account_routes,
+)
 from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credentials
 from live_runner.base_adapter import BaseLiveAdapter
 from live_runner.ctrader_adapter import CTraderAuthTerminalError, CTraderLiveAdapter
@@ -60,6 +65,7 @@ _DISCORD_SERVICE_AUTH_BLOCKED_IDS: set[str] = set()
 _DISCORD_SERVICE_AUTH_BLOCKED_REASONS: dict[str, str] = {}
 _CTRADER_AUTH_BLOCKED_ACCOUNTS: set[str] = set()
 _CTRADER_AUTH_BLOCKED_REASONS: dict[str, str] = {}
+_CTRADER_ACCOUNT_CREDENTIAL_SIGNATURES: dict[str, str] = {}
 
 
 def _is_terminal_discord_runtime_error(exc: BaseException) -> bool:
@@ -110,12 +116,6 @@ def _is_ctrader_pending_deferred_error(exc: BaseException) -> bool:
     return message.startswith("(15")
 
 
-def _block_ctrader_account(account_id: str, exc: BaseException | str) -> None:
-    reason = str(exc).strip() or "cTrader authorization failed"
-    _CTRADER_AUTH_BLOCKED_ACCOUNTS.add(account_id)
-    _CTRADER_AUTH_BLOCKED_REASONS[account_id] = reason
-
-
 def _block_discord_service(service_id: str, exc: BaseException | str) -> None:
     reason = str(exc).strip() or "Discord authentication failed"
     _DISCORD_SERVICE_AUTH_BLOCKED_IDS.add(service_id)
@@ -136,6 +136,24 @@ def _parse_bool_env(value: str | None, *, default: bool = True) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+_TRUE_BOOL_TOKENS = {"1", "true", "yes", "y", "on"}
+_FALSE_BOOL_TOKENS = {"0", "false", "no", "n", "off"}
+
+
+def _parse_strict_bool_env(name: str, value: str | None, *, default: bool = True) -> bool:
+    if value is None:
+        return default
+    token = value.strip().lower()
+    if token in _TRUE_BOOL_TOKENS:
+        return True
+    if token in _FALSE_BOOL_TOKENS:
+        return False
+    valid = ", ".join(sorted(_TRUE_BOOL_TOKENS | _FALSE_BOOL_TOKENS))
+    raise ValueError(
+        f"Invalid boolean value for {name}: {value!r}. Valid values are: {valid}."
+    )
 
 
 def _load_accounts_env_values(accounts_env: Path) -> dict[str, str]:
@@ -228,8 +246,55 @@ def _resolve_ctrader_credentials(
         return None
     raw_demo_value = env_values.get("CTRADER_DEMO")
     demo_value = raw_demo_value.strip() if isinstance(raw_demo_value, str) else None
-    demo = _parse_bool_env(demo_value, default=True)
+    demo = _parse_strict_bool_env("CTRADER_DEMO", demo_value, default=True)
     return app_id, app_secret, access_token, refresh_token, demo
+
+
+def _ctrader_credentials_signature(env_values: Mapping[str, str]) -> str:
+    credentials = _resolve_ctrader_credentials(env_values)
+    if credentials is None:
+        return "missing"
+    app_id, app_secret, access_token, refresh_token, demo = credentials
+    payload = "\0".join((app_id, app_secret, access_token, refresh_token, str(demo)))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _refresh_ctrader_blocked_state_for_accounts(
+    accounts: list[LiveAccountConfig],
+    env_values: Mapping[str, str],
+) -> set[str]:
+    changed_account_ids: set[str] = set()
+    for account in accounts:
+        if account.broker != "ctrader":
+            continue
+        account_id = account.id
+        signature = _ctrader_credentials_signature(env_values)
+        previous = _CTRADER_ACCOUNT_CREDENTIAL_SIGNATURES.get(account_id)
+        _CTRADER_ACCOUNT_CREDENTIAL_SIGNATURES[account_id] = signature
+        if previous is None or previous == signature:
+            continue
+        changed_account_ids.add(account_id)
+        if account_id in _CTRADER_AUTH_BLOCKED_ACCOUNTS:
+            logger.info(
+                "cTrader account credentials changed; clearing auth block",
+                extra={"data": {"account_id": account_id}},
+            )
+        _CTRADER_AUTH_BLOCKED_ACCOUNTS.discard(account_id)
+        _CTRADER_AUTH_BLOCKED_REASONS.pop(account_id, None)
+    return changed_account_ids
+
+
+def _clear_ctrader_blocked_state(account_id: str) -> None:
+    _CTRADER_AUTH_BLOCKED_ACCOUNTS.discard(account_id)
+    _CTRADER_AUTH_BLOCKED_REASONS.pop(account_id, None)
+
+
+def _block_ctrader_account(account_id: str, exc: BaseException | str) -> None:
+    if not isinstance(exc, CTraderAuthTerminalError) and not _is_terminal_ctrader_runtime_error(exc):
+        return
+    reason = str(exc).strip() or "cTrader authorization failed"
+    _CTRADER_AUTH_BLOCKED_ACCOUNTS.add(account_id)
+    _CTRADER_AUTH_BLOCKED_REASONS[account_id] = reason
 
 
 def _coerce_live_float(
@@ -318,7 +383,7 @@ def _deployment_wait_for_candle_close(
         return _parse_bool_env(str(configured.get("wait_candle_close")), default=False)
     if "wait_for_candle_close" in configured:
         return _parse_bool_env(str(configured.get("wait_for_candle_close")), default=False)
-    return _parse_bool_env(str(env_values.get("DISCORD_WAIT_FOR_CANDLE_CLOSE", "")), default=True)
+    return _parse_bool_env(env_values.get("DISCORD_WAIT_FOR_CANDLE_CLOSE"), default=True)
 
 
 def _deployment_signal_timeframe(deployment: LiveDeploymentConfig) -> str:
@@ -738,7 +803,10 @@ async def _run_discord_signal_listener_for_account(
 
 
 def _create_adapter_for_account(
-    account: LiveAccountConfig, *, accounts_env_values: Mapping[str, str] | None = None
+    account: LiveAccountConfig,
+    *,
+    accounts_env_values: Mapping[str, str] | None = None,
+    accounts_env_path: Path | str | None = None,
 ) -> BaseLiveAdapter | None:
     env_values = accounts_env_values or os.environ
     if account.broker == "alpaca":
@@ -776,7 +844,7 @@ def _create_adapter_for_account(
             )
             return None
         app_id, app_secret, access_token, refresh_token, demo = credentials
-        account_identifier = str(account.ctid or account.broker_login or account.id).strip()
+        account_identifier = ctrader_account_identifier(account)
         try:
             return CTraderLiveAdapter(
                 app_id=app_id,
@@ -786,6 +854,8 @@ def _create_adapter_for_account(
                 account_id=account_identifier,
                 demo=demo,
                 account_config_id=account.id,
+                accounts_env_path=accounts_env_path or DEFAULT_ACCOUNTS_ENV,
+                connect_max_attempts=1,
             )
         except Exception as exc:
             logger.warning(
@@ -855,8 +925,7 @@ async def _disconnect_inactive_adapters(
             account_id=account_id,
             reason="inactive_deployment",
         )
-        _CTRADER_AUTH_BLOCKED_ACCOUNTS.discard(account_id)
-        _CTRADER_AUTH_BLOCKED_REASONS.pop(account_id, None)
+        _clear_ctrader_blocked_state(account_id)
         logger.info(
             "Stopped adapter for inactive account",
             extra={
@@ -1525,6 +1594,7 @@ async def _ensure_adapter_for_active_account(
     active_adapters: dict[str, BaseLiveAdapter],
     *,
     accounts_env_values: Mapping[str, str],
+    accounts_env_path: Path | str | None = None,
 ) -> None:
     if account_id in _CTRADER_AUTH_BLOCKED_ACCOUNTS:
         return
@@ -1540,7 +1610,11 @@ async def _ensure_adapter_for_active_account(
                 extra={"data": {"account_id": account_id}},
             )
             return
-        adapter = _create_adapter_for_account(account, accounts_env_values=accounts_env_values)
+        adapter = _create_adapter_for_account(
+            account,
+            accounts_env_values=accounts_env_values,
+            accounts_env_path=accounts_env_path,
+        )
         if adapter is None:
             return
         active_adapters[account_id] = adapter
@@ -1586,6 +1660,60 @@ async def _ensure_adapter_for_active_account(
     )
 
 
+async def _connect_active_accounts(
+    account_ids: set[str],
+    account_lookup: dict[str, LiveAccountConfig],
+    active_adapters: dict[str, BaseLiveAdapter],
+    *,
+    accounts_env_values: Mapping[str, str],
+    accounts_env_path: Path | str | None = None,
+) -> None:
+    await asyncio.gather(
+        *(
+            _ensure_adapter_for_active_account(
+                account_id,
+                account_lookup,
+                active_adapters,
+                accounts_env_values=accounts_env_values,
+                accounts_env_path=accounts_env_path,
+            )
+            for account_id in sorted(account_ids)
+        )
+    )
+
+
+async def _rotate_changed_ctrader_adapters(
+    changed_account_ids: set[str],
+    active_adapters: dict[str, BaseLiveAdapter],
+    active_tasks: dict[str, asyncio.Task[None]],
+    active_discord_tasks: dict[str, asyncio.Task[None]],
+) -> None:
+    cancelled_tasks: list[asyncio.Task[None]] = []
+    for account_id in sorted(changed_account_ids):
+        for tasks in (active_tasks, active_discord_tasks):
+            task = tasks.pop(account_id, None)
+            if task is not None and not task.done():
+                task.cancel()
+                cancelled_tasks.append(task)
+
+    if cancelled_tasks:
+        await asyncio.gather(*cancelled_tasks, return_exceptions=True)
+
+    for account_id in sorted(changed_account_ids):
+        adapter = active_adapters.pop(account_id, None)
+        if adapter is None:
+            continue
+        await _disconnect_adapter(
+            adapter,
+            account_id=account_id,
+            reason="credentials_changed",
+        )
+        logger.info(
+            "Rotated cTrader adapter after credential change",
+            extra={"data": {"account_id": account_id}},
+        )
+
+
 async def sync_deployments_loop(
     active_adapters: dict[str, BaseLiveAdapter],
     active_tasks: dict[str, asyncio.Task[None]],
@@ -1604,13 +1732,8 @@ async def sync_deployments_loop(
             if current_mtime != accounts_env_mtime:
                 accounts_env_values = _load_accounts_env_values(accounts_env)
                 accounts_env_mtime = current_mtime
-                if _CTRADER_AUTH_BLOCKED_ACCOUNTS:
-                    logger.info(
-                        "Credentials changed; clearing blocked cTrader accounts",
-                        extra={"data": {"account_ids": sorted(_CTRADER_AUTH_BLOCKED_ACCOUNTS)}},
-                    )
-                _CTRADER_AUTH_BLOCKED_ACCOUNTS.clear()
-                _CTRADER_AUTH_BLOCKED_REASONS.clear()
+                # cTrader blocks are cleared below only for accounts whose
+                # selected credential signature actually changed.
                 if _DISCORD_AUTH_BLOCKED_ACCOUNTS:
                     logger.info(
                         "Credentials changed; clearing blocked Discord listener accounts",
@@ -1619,6 +1742,16 @@ async def sync_deployments_loop(
                 _DISCORD_AUTH_BLOCKED_ACCOUNTS.clear()
                 _DISCORD_AUTH_BLOCKED_REASONS.clear()
             accounts, deployments = await _load_db_accounts_and_deployments()
+            validate_live_account_routes(accounts)
+            changed_ctrader_account_ids = _refresh_ctrader_blocked_state_for_accounts(
+                accounts, accounts_env_values
+            )
+            await _rotate_changed_ctrader_adapters(
+                changed_ctrader_account_ids,
+                active_adapters,
+                active_tasks,
+                active_discord_tasks,
+            )
             deployments_by_account: dict[str, list[LiveDeploymentConfig]] = {}
             for deployment in deployments:
                 deployments_by_account.setdefault(deployment.account_id, []).append(deployment)
@@ -1632,6 +1765,15 @@ async def sync_deployments_loop(
                 for deployment in deployments
                 if _normalize_deployment_status(deployment.status) == "ACTIVE"
             }
+            blocked_active_account_ids = active_account_ids & _CTRADER_AUTH_BLOCKED_ACCOUNTS
+            for blocked_account_id in sorted(blocked_active_account_ids):
+                adapter = active_adapters.pop(blocked_account_id, None)
+                if adapter is not None:
+                    await _disconnect_adapter(
+                        adapter,
+                        account_id=blocked_account_id,
+                        reason="terminal_auth_blocked",
+                    )
             logger.debug(
                 "Evaluating deployment activation state",
                 extra={
@@ -1643,7 +1785,7 @@ async def sync_deployments_loop(
             )
             runnable_account_ids = set(active_account_ids) - _CTRADER_AUTH_BLOCKED_ACCOUNTS
 
-            await _disconnect_inactive_adapters(active_adapters, runnable_account_ids)
+            await _disconnect_inactive_adapters(active_adapters, active_account_ids)
 
             active_discord_account_ids = {
                 deployment.account_id
@@ -1653,13 +1795,13 @@ async def sync_deployments_loop(
                 and _deployment_has_discord_channel(deployment)
             }
 
-            for account_id in sorted(runnable_account_ids):
-                await _ensure_adapter_for_active_account(
-                    account_id,
-                    account_lookup,
-                    active_adapters,
-                    accounts_env_values=accounts_env_values,
-                )
+            await _connect_active_accounts(
+                runnable_account_ids,
+                account_lookup,
+                active_adapters,
+                accounts_env_values=accounts_env_values,
+                accounts_env_path=accounts_env,
+            )
 
             _cancel_inactive_tasks(active_tasks, runnable_account_ids)
             _start_missing_tasks(active_adapters, active_tasks, runnable_account_ids)

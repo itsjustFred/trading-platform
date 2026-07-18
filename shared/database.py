@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import threading
 from contextlib import contextmanager
@@ -304,6 +305,11 @@ class GridRecord(SQLModel, table=True):
     engine: str = Field(default="vectorbt", index=True)
 
 
+def _normalize_optional_id(value: Any) -> str | None:
+    normalized = str(value).strip() if value is not None else ""
+    return normalized or None
+
+
 class LiveSignalModel(SQLModel, table=True):
     __tablename__ = "live_signals"
 
@@ -317,7 +323,7 @@ class LiveSignalModel(SQLModel, table=True):
     broker_order_id: str = Field(default="", index=True)
     discord_message_id: str | None = Field(
         default=None,
-        sa_column=Column("discord_message_id", String, nullable=True, unique=True, index=True),
+        sa_column=Column("discord_message_id", String, nullable=True, index=True),
     )
     metadata_json: dict[str, Any] = Field(
         default_factory=dict, sa_column=Column("metadata", JSON, nullable=False)
@@ -325,18 +331,8 @@ class LiveSignalModel(SQLModel, table=True):
 
     @classmethod
     def from_live_signal(cls, signal: LiveSignal) -> "LiveSignalModel":
-        discord_msg_id = signal.metadata.get("discord_message_id")
-        # Normalize: keep None as None (real SQL NULL), convert empty/whitespace to None
-        if discord_msg_id is not None:
-            discord_msg_id = str(discord_msg_id).strip()
-            if not discord_msg_id:
-                discord_msg_id = None
-
-        broker_order_id = signal.metadata.get("broker_order_id")
-        if broker_order_id is not None:
-            broker_order_id = str(broker_order_id).strip()
-            if not broker_order_id:
-                broker_order_id = ""
+        discord_msg_id = _normalize_optional_id(signal.metadata.get("discord_message_id"))
+        broker_order_id = _normalize_optional_id(signal.metadata.get("broker_order_id")) or ""
 
         return cls(
             id=str(signal.id),
@@ -344,7 +340,11 @@ class LiveSignalModel(SQLModel, table=True):
             symbol=signal.symbol,
             action=signal.action,
             theoretical_price=signal.theoretical_price,
-            timestamp=signal.timestamp,
+            timestamp=(
+                signal.timestamp.replace(tzinfo=timezone.utc)
+                if signal.timestamp.tzinfo is None
+                else signal.timestamp.astimezone(timezone.utc)
+            ),
             source=str(signal.metadata.get("source", "internal")),
             broker_order_id=broker_order_id or "",
             discord_message_id=discord_msg_id,
@@ -796,8 +796,207 @@ def _table_column_names(connection: Connection, table_name: str) -> set[str]:
     return {str(row[1]) for row in rows}
 
 
+def _rebuild_live_signals_without_global_discord_unique(connection: Connection) -> None:
+    """Remove a SQLite table-backed global Discord UNIQUE without losing rows."""
+    table_sql = connection.execute(
+        text(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'live_signals'"
+        )
+    ).scalar_one_or_none()
+    if not table_sql:
+        raise RuntimeError("Cannot rebuild live_signals: table definition is missing")
+
+    discord_unique = re.compile(
+        r",?\s*(?:CONSTRAINT\s+(?:\"[^\"]+\"|`[^`]+`|\[[^\]]+\]|\w+)\s+)?"
+        r"UNIQUE\s*\(\s*(?:\"discord_message_id\"|`discord_message_id`|"
+        r"\[discord_message_id\]|discord_message_id)\s*\)",
+        flags=re.IGNORECASE,
+    )
+    rebuilt_sql, replacements = discord_unique.subn("", str(table_sql))
+    if replacements != 1:
+        raise RuntimeError(
+            "Cannot safely rebuild live_signals: expected exactly one table-backed "
+            "UNIQUE(discord_message_id) constraint"
+        )
+
+    index_sql = [
+        str(row[0])
+        for row in connection.execute(
+            text(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' "
+                "AND tbl_name = 'live_signals' AND sql IS NOT NULL"
+            )
+        ).fetchall()
+        if row[0]
+    ]
+    column_names = [
+        str(row[1])
+        for row in connection.execute(text("PRAGMA table_info('live_signals')")).fetchall()
+    ]
+    quoted_columns = ", ".join(
+        connection.dialect.identifier_preparer.quote(column) for column in column_names
+    )
+
+    legacy_alter_table = int(
+        connection.execute(text("PRAGMA legacy_alter_table")).scalar_one()
+    )
+    try:
+        connection.execute(text("PRAGMA legacy_alter_table = ON"))
+        connection.execute(text("ALTER TABLE live_signals RENAME TO live_signals__discord_legacy"))
+        connection.execute(text(rebuilt_sql))
+        connection.execute(
+            text(
+                f"INSERT INTO live_signals ({quoted_columns}) "
+                f"SELECT {quoted_columns} FROM live_signals__discord_legacy"
+            )
+        )
+        connection.execute(text("DROP TABLE live_signals__discord_legacy"))
+    finally:
+        connection.execute(
+            text(f"PRAGMA legacy_alter_table = {legacy_alter_table}")
+        )
+    for statement in index_sql:
+        connection.execute(text(statement))
+
+
+def _migrate_live_signal_discord_identity(connection: Connection) -> None:
+    """Migrate Discord execution identity from global to deployment scope."""
+    column_names = _table_column_names(connection, "live_signals")
+    if not column_names:
+        return
+
+    if "source" not in column_names:
+        connection.execute(
+            text("ALTER TABLE live_signals ADD COLUMN source TEXT NOT NULL DEFAULT 'internal'")
+        )
+    if "broker_order_id" not in column_names:
+        connection.execute(
+            text(
+                "ALTER TABLE live_signals "
+                "ADD COLUMN broker_order_id TEXT NOT NULL DEFAULT ''"
+            )
+        )
+    if "discord_message_id" not in column_names:
+        connection.execute(text("ALTER TABLE live_signals ADD COLUMN discord_message_id TEXT"))
+
+    # Remove every Discord-only global unique constraint. Named indexes can be
+    # dropped directly; SQLite table-backed constraints require one controlled
+    # transactional rebuild before the remaining migration continues.
+    table_rebuild_required = False
+    for row in connection.execute(text("PRAGMA index_list('live_signals')")).fetchall():
+        index_name = str(row[1])
+        is_unique = bool(row[2])
+        origin = str(row[3]) if len(row) > 3 else "c"
+        index_columns = [
+            str(info[2])
+            for info in connection.execute(
+                text(f"PRAGMA index_info({connection.dialect.identifier_preparer.quote(index_name)})")
+            ).fetchall()
+        ]
+        if is_unique and index_columns == ["discord_message_id"]:
+            if origin != "c":
+                table_rebuild_required = True
+                continue
+            quoted_name = connection.dialect.identifier_preparer.quote(index_name)
+            connection.execute(text(f"DROP INDEX {quoted_name}"))
+    if table_rebuild_required:
+        _rebuild_live_signals_without_global_discord_unique(connection)
+
+    # Backfill only after global uniqueness is gone so legitimate historical
+    # fan-out rows in different deployments are not rejected mid-migration.
+    signals_to_fill = connection.execute(
+        text(
+            "SELECT id, metadata FROM live_signals "
+            "WHERE discord_message_id IS NULL OR discord_message_id = ''"
+        )
+    ).fetchall()
+    for sig_id, meta_json in signals_to_fill:
+        if not meta_json:
+            continue
+        try:
+            metadata = json.loads(meta_json) if isinstance(meta_json, str) else meta_json
+            discord_msg_id = metadata.get("discord_message_id")
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if discord_msg_id:
+            connection.execute(
+                text(
+                    "UPDATE live_signals SET discord_message_id = :discord_message_id "
+                    "WHERE id = :id"
+                ),
+                {"discord_message_id": str(discord_msg_id), "id": sig_id},
+            )
+
+    duplicate = connection.execute(
+        text(
+            "SELECT deployment_id, discord_message_id, COUNT(*) AS duplicate_count "
+            "FROM live_signals WHERE discord_message_id IS NOT NULL "
+            "GROUP BY deployment_id, discord_message_id HAVING COUNT(*) > 1 "
+            "LIMIT 1"
+        )
+    ).first()
+    if duplicate is not None:
+        raise RuntimeError(
+            "Cannot create deployment-scoped Discord uniqueness: live_signals "
+            "contains duplicate (deployment_id, discord_message_id) execution intents. "
+            "No rows were deleted; resolve the conflicting records explicitly."
+        )
+
+    connection.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_live_signals_discord_message_id "
+            "ON live_signals(discord_message_id)"
+        )
+    )
+    connection.execute(
+        text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS "
+            "uq_live_signals_deployment_discord_msg "
+            "ON live_signals(deployment_id, discord_message_id) "
+            "WHERE discord_message_id IS NOT NULL"
+        )
+    )
+
+
+@contextmanager
+def _schema_migration_connection() -> Iterator[Connection]:
+    """Run SQLite schema changes with FK DDL disabled, then validate before commit."""
+    with ENGINE.connect() as connection:
+        foreign_keys_enabled = int(
+            connection.execute(text("PRAGMA foreign_keys")).scalar_one()
+        )
+        connection.commit()
+        if foreign_keys_enabled:
+            connection.execute(text("PRAGMA foreign_keys = OFF"))
+            connection.commit()
+        try:
+            # Python's sqlite3 legacy transaction mode does not necessarily emit
+            # BEGIN for DDL. Start the transaction explicitly so ALTER/DROP INDEX
+            # statements roll back together with data backfills on any failure.
+            connection.exec_driver_sql("BEGIN IMMEDIATE")
+            try:
+                yield connection
+                violations = connection.execute(text("PRAGMA foreign_key_check")).fetchall()
+                if violations:
+                    raise RuntimeError(
+                        "Cannot safely migrate schema: foreign key violations remain"
+                    )
+            except BaseException:
+                connection.rollback()
+                raise
+            else:
+                connection.commit()
+        finally:
+            if connection.in_transaction():
+                connection.rollback()
+            if foreign_keys_enabled:
+                connection.execute(text("PRAGMA foreign_keys = ON"))
+                connection.commit()
+
+
 def _migrate_schema() -> None:
-    with ENGINE.begin() as connection:
+    with _schema_migration_connection() as connection:
         deployment_column_names = _table_column_names(connection, "live_deployments")
         if "settings" not in deployment_column_names:
             connection.execute(
@@ -902,74 +1101,52 @@ def _migrate_schema() -> None:
             if "exit_reason" not in trade_column_names:
                 connection.execute(text("ALTER TABLE trades ADD COLUMN exit_reason TEXT"))
 
-        live_signal_column_names = _table_column_names(connection, "live_signals")
-        if live_signal_column_names and "source" not in live_signal_column_names:
-            connection.execute(
-                text("ALTER TABLE live_signals ADD COLUMN source TEXT NOT NULL DEFAULT 'internal'")
-            )
-        if live_signal_column_names and "broker_order_id" not in live_signal_column_names:
-            connection.execute(
-                text(
-                    "ALTER TABLE live_signals "
-                    "ADD COLUMN broker_order_id TEXT NOT NULL DEFAULT ''"
-                )
-            )
-        if live_signal_column_names and "discord_message_id" not in live_signal_column_names:
-            connection.execute(
-                text("ALTER TABLE live_signals ADD COLUMN discord_message_id TEXT")
-            )
-        if _table_column_names(connection, "live_signals") and "discord_message_id" in _table_column_names(connection, "live_signals"):
-            connection.execute(
-                text(
-                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_live_signals_discord_msg_id "
-                    "ON live_signals(discord_message_id) WHERE discord_message_id IS NOT NULL"
-                )
-            )
+        _migrate_live_signal_discord_identity(connection)
 
         # Add equity_curve column to backtests (for portfolio optimizer to read from SQLite)
         backtest_column_names = _table_column_names(connection, "backtests")
         if backtest_column_names and "equity_curve" not in backtest_column_names:
             connection.execute(text("ALTER TABLE backtests ADD COLUMN equity_curve TEXT DEFAULT '[]'"))
+            backtest_column_names = _table_column_names(connection, "backtests")
 
-        # Backfill equity_curve for existing backtests with empty equity_curve
+        # Backfill equity_curve for existing backtests with empty equity_curve.
+        # Prefer normalized equity_points; fall back to the matching legacy JSON artifact.
         if backtest_column_names and "equity_curve" in backtest_column_names:
             backtests_to_fill = connection.execute(
-                text("SELECT id, equity_curve FROM backtests WHERE equity_curve IS NULL OR equity_curve = '[]' OR equity_curve = ''")
+                text(
+                    "SELECT id FROM backtests "
+                    "WHERE equity_curve IS NULL OR equity_curve = '[]' OR equity_curve = ''"
+                )
             ).fetchall()
-            for row in backtests_to_fill:
-                bt_id, eq_curve = row
-                if eq_curve and eq_curve != '[]':
-                    try:
-                        import json
-                        eq_list = json.loads(eq_curve)
-                        if eq_list:
-                            connection.execute(
-                                text("UPDATE backtests SET equity_curve = :eq WHERE id = :id"),
-                                {"eq": json.dumps(eq_list), "id": bt_id},
-                            )
-                    except Exception:
-                        pass  # Skip invalid JSON
+            backtests_dir = DATA_DIR / "backtests"
+            for (bt_id,) in backtests_to_fill:
+                equity_curve = [
+                    {"time": row[0], "equity": row[1]}
+                    for row in connection.execute(
+                        text(
+                            "SELECT time, equity FROM equity_points "
+                            "WHERE backtest_id = :id ORDER BY time, id"
+                        ),
+                        {"id": bt_id},
+                    ).fetchall()
+                ]
 
-        # Backfill discord_message_id from metadata for existing live_signals
-        live_signal_column_names = _table_column_names(connection, "live_signals")
-        if live_signal_column_names and "discord_message_id" in live_signal_column_names:
-            signals_to_fill = connection.execute(
-                text("SELECT id, metadata FROM live_signals WHERE discord_message_id IS NULL OR discord_message_id = ''")
-            ).fetchall()
-            for row in signals_to_fill:
-                sig_id, meta_json = row
-                if meta_json:
+                if not equity_curve and Path(str(bt_id)).name == str(bt_id):
+                    artifact_path = backtests_dir / f"{bt_id}.trades.json"
                     try:
-                        import json
-                        meta = json.loads(meta_json)
-                        discord_msg_id = meta.get("discord_message_id")
-                        if discord_msg_id:
-                            connection.execute(
-                                text("UPDATE live_signals SET discord_message_id = :dmid WHERE id = :id"),
-                                {"dmid": str(discord_msg_id), "id": sig_id},
-                            )
-                    except Exception:
-                        pass  # Skip invalid JSON
+                        payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+                        artifact_id = str(payload.get("meta", {}).get("id", ""))
+                        candidate = payload.get("equity_curve", [])
+                        if artifact_id == str(bt_id) and isinstance(candidate, list):
+                            equity_curve = candidate
+                    except (OSError, TypeError, ValueError):
+                        pass
+
+                if equity_curve:
+                    connection.execute(
+                        text("UPDATE backtests SET equity_curve = :eq WHERE id = :id"),
+                        {"eq": json.dumps(equity_curve), "id": bt_id},
+                    )
 
         execution_column_names = _table_column_names(connection, "live_executions")
         if execution_column_names and "dedupe_key" not in execution_column_names:
@@ -983,15 +1160,23 @@ def _migrate_schema() -> None:
             )
 
 
-def save_live_signal(signal: LiveSignal) -> None:
+def save_live_signal(signal: LiveSignal) -> tuple[str, bool]:
+    """Persist a signal and return ``(canonical_signal_id, created)``.
+
+    Discord redeliveries can carry a new in-memory UUID. Returning the canonical
+    persisted id lets callers fail closed before submitting another broker order.
+    """
     init_db()
     with get_session() as session:
         record = LiveSignalModel.from_live_signal(signal)
-        # Deduplicate by discord_message_id to prevent duplicate signals on bot reconnect
+        # Deduplicate redeliveries within one deployment while allowing an
+        # intentional Discord fan-out to independent deployments.
         discord_msg_id = record.discord_message_id
+        deployment_id = record.deployment_id
         if discord_msg_id:
             existing = session.exec(
                 select(LiveSignalModel)
+                .where(LiveSignalModel.deployment_id == deployment_id)
                 .where(LiveSignalModel.discord_message_id == discord_msg_id)
                 .limit(1)
             ).first()
@@ -1015,9 +1200,29 @@ def save_live_signal(signal: LiveSignal) -> None:
                     logger.info(
                         "Skipping duplicate live signal (discord_message_id=%s)", discord_msg_id
                     )
-                return
+                return str(existing.id), False
+        record_id = str(record.id)
         session.add(record)
-        session.commit()
+        try:
+            session.commit()
+        except IntegrityError:
+            session.rollback()
+            if not discord_msg_id:
+                raise
+            existing = session.exec(
+                select(LiveSignalModel)
+                .where(LiveSignalModel.deployment_id == deployment_id)
+                .where(LiveSignalModel.discord_message_id == discord_msg_id)
+                .limit(1)
+            ).first()
+            if existing is None:
+                raise
+            logger.info(
+                "Skipping concurrent duplicate live signal (discord_message_id=%s)",
+                discord_msg_id,
+            )
+            return str(existing.id), False
+    return record_id, True
 
 
 def save_live_execution(execution: LiveExecution) -> bool:
@@ -1047,6 +1252,73 @@ def save_live_execution(execution: LiveExecution) -> bool:
             )
             return False
     return True
+
+
+def save_live_execution_up_to_cumulative(
+    execution: LiveExecution, broker_cumulative_filled_qty: float
+) -> float:
+    """Atomically persist only the quantity still missing up to a broker cumulative fill."""
+    normalized_signal_id = str(execution.signal_id or "").strip()
+    cumulative_qty = float(broker_cumulative_filled_qty or 0.0)
+    requested_qty = float(execution.filled_qty or 0.0)
+    if not normalized_signal_id or cumulative_qty <= 0.0 or requested_qty <= 0.0:
+        return 0.0
+
+    init_db()
+    with get_session() as session:
+        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        try:
+            record = LiveExecutionModel.from_live_execution(execution)
+            if record.dedupe_key:
+                existing = session.exec(
+                    select(LiveExecutionModel)
+                    .where(LiveExecutionModel.dedupe_key == record.dedupe_key)
+                    .limit(1)
+                ).first()
+                if existing is not None:
+                    session.rollback()
+                    return 0.0
+
+            local_filled_qty = float(
+                session.exec(
+                    select(func.coalesce(func.sum(LiveExecutionModel.filled_qty), 0.0)).where(
+                        LiveExecutionModel.signal_id == normalized_signal_id
+                    )
+                ).one()
+                or 0.0
+            )
+            persisted_qty = min(requested_qty, cumulative_qty - local_filled_qty)
+            if persisted_qty <= 0.0:
+                session.rollback()
+                return 0.0
+
+            record.filled_qty = persisted_qty
+            if requested_qty != persisted_qty and record.commission:
+                record.commission *= persisted_qty / requested_qty
+            session.add(record)
+            session.commit()
+            return persisted_qty
+        except IntegrityError:
+            session.rollback()
+            return 0.0
+        except Exception:
+            session.rollback()
+            raise
+
+
+def get_live_signal_filled_qty(signal_id: str) -> float:
+    """Return the cumulative quantity persisted across execution events for a signal."""
+    normalized_signal_id = str(signal_id or "").strip()
+    if not normalized_signal_id:
+        return 0.0
+    init_db()
+    with get_session() as session:
+        filled_qty = session.exec(
+            select(func.coalesce(func.sum(LiveExecutionModel.filled_qty), 0.0)).where(
+                LiveExecutionModel.signal_id == normalized_signal_id
+            )
+        ).one()
+    return float(filled_qty or 0.0)
 
 
 def set_live_signal_broker_order_id(signal_id: str, broker_order_id: str) -> bool:
@@ -1083,19 +1355,104 @@ def get_live_signal_broker_order_id(signal_id: str) -> str | None:
     return broker_order_id or None
 
 
-def find_live_signal_id_by_broker_order_id(broker_order_id: str) -> str | None:
-    normalized = str(broker_order_id or "").strip()
-    if not normalized:
+def get_live_signal_timestamp(signal_id: str) -> datetime | None:
+    """Return the persisted signal timestamp used for bounded broker recovery."""
+    normalized_signal_id = str(signal_id or "").strip()
+    if not normalized_signal_id:
+        return None
+    init_db()
+    with get_session() as session:
+        record = session.get(LiveSignalModel, normalized_signal_id)
+        if record is None:
+            return None
+        timestamp = record.timestamp
+    if timestamp is None:
+        return None
+    if timestamp.tzinfo is None:
+        return timestamp.replace(tzinfo=timezone.utc)
+    return timestamp.astimezone(timezone.utc)
+
+
+def find_live_signal_id_by_broker_order_id(
+    account_id: str, broker_order_id: str
+) -> str | None:
+    normalized_account_id = str(account_id or "").strip()
+    normalized_order_id = str(broker_order_id or "").strip()
+    if not normalized_account_id or not normalized_order_id:
         return None
     init_db()
     with get_session() as session:
         row = session.exec(
             select(LiveSignalModel)
-            .where(LiveSignalModel.broker_order_id == normalized)
+            .join(
+                LiveDeploymentModel,
+                LiveSignalModel.deployment_id == LiveDeploymentModel.id,
+            )
+            .where(LiveDeploymentModel.account_id == normalized_account_id)
+            .where(LiveSignalModel.broker_order_id == normalized_order_id)
             .order_by(LiveSignalModel.timestamp.desc())
             .limit(1)
         ).first()
     return str(row.id) if row is not None else None
+
+
+def get_live_signal_reconciliation_cursor(signal_id: str) -> tuple[datetime, str] | None:
+    normalized_signal_id = str(signal_id or "").strip()
+    if not normalized_signal_id:
+        return None
+    init_db()
+    with get_session() as session:
+        row = session.get(LiveSignalModel, normalized_signal_id)
+    if row is None:
+        return None
+    return row.timestamp, str(row.id)
+
+
+def list_live_signal_ids_for_reconciliation(
+    account_id: str,
+    limit: int = 200,
+    *,
+    before: tuple[datetime, str] | None = None,
+) -> list[str]:
+    """Persisted account signals in stable pages for fill reconciliation.
+
+    Includes partially executed signals so broker deals missed during a disconnect
+    can be backfilled. ``save_live_execution`` provides deal-level idempotency.
+    """
+    normalized_account_id = str(account_id or "").strip()
+    if not normalized_account_id:
+        return []
+    try:
+        bounded_limit = max(1, min(int(limit), 2000))
+    except (TypeError, ValueError):
+        bounded_limit = 200
+    init_db()
+    with get_session() as session:
+        statement = (
+            select(LiveSignalModel)
+            .join(
+                LiveDeploymentModel,
+                LiveSignalModel.deployment_id == LiveDeploymentModel.id,
+            )
+            .where(LiveDeploymentModel.account_id == normalized_account_id)
+        )
+        if before is not None:
+            cursor_timestamp, cursor_id = before
+            statement = statement.where(
+                or_(
+                    LiveSignalModel.timestamp < cursor_timestamp,
+                    (
+                        (LiveSignalModel.timestamp == cursor_timestamp)
+                        & (LiveSignalModel.id < str(cursor_id))
+                    ),
+                )
+            )
+        rows = session.exec(
+            statement.order_by(
+                LiveSignalModel.timestamp.desc(), LiveSignalModel.id.desc()
+            ).limit(bounded_limit)
+        ).all()
+    return [str(row.id) for row in rows]
 
 
 def list_live_signal_ids_missing_executions(limit: int = 200) -> list[str]:
@@ -1815,6 +2172,14 @@ def migrate_json_to_sqlite(*, skip_existing: bool = True) -> dict[str, int]:
             payload = json.loads(path.read_text(encoding="utf-8"))
             result = BacktestResult.from_dict(payload)
             if skip_existing and result.meta.id in existing_ids:
+                with get_session() as session:
+                    existing = session.get(BacktestRecord, result.meta.id)
+                    if existing is not None and not existing.equity_curve and result.equity_curve:
+                        existing.equity_curve = [point.to_dict() for point in result.equity_curve]
+                        session.add(existing)
+                        session.commit()
+                        summary["migrated"] += 1
+                        continue
                 summary["skipped"] += 1
                 continue
             save_result_to_sqlite(result)

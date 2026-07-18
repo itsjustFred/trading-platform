@@ -7,30 +7,30 @@
         "asset_status": "assetstatus.active",
         "asset_tradable": true,
         "broker_order_ids": [
-          "335b3b24-86ca-4bad-af86-4c9fbc8662d7",
-          "729bb267-c4cf-452f-af37-2bb005c04785"
+          "666212b9-57c6-4361-b7f9-33426f75d330",
+          "547f9ae8-2354-48b0-b79c-19d15721968a"
         ],
         "buy_status": "OrderStatus.FILLED",
-        "clock_timestamp": "2026-07-14T07:16:20.275170-04:00",
-        "clock_timestamp_et": "2026-07-14T07:16:20.275170-04:00",
+        "clock_timestamp": "2026-07-16T10:50:27.101919-04:00",
+        "clock_timestamp_et": "2026-07-16T10:50:27.101919-04:00",
         "close_status": "OrderStatus.FILLED",
         "error": "",
-        "extended_hours": true,
-        "filled_qty": 0.630238608,
+        "extended_hours": false,
+        "filled_qty": 0.60583824,
         "market_closed_skipped": false,
         "market_data": {
-          "ask": 0.0,
-          "bid": 293.43,
-          "buy_limit": 333.21,
-          "last": 317.34,
-          "reference": 317.34,
-          "sell_limit": 278.76
+          "ask": 330.14,
+          "bid": 330.07,
+          "buy_limit": 346.65,
+          "last": 330.12,
+          "reference": 330.12,
+          "sell_limit": 313.57
         },
-        "next_open": "2026-07-14T09:30:00-04:00",
+        "next_open": "2026-07-17T09:30:00-04:00",
         "paper": true,
-        "premarket_eligible": true,
-        "premarket_window": true,
-        "regular_market_open": false,
+        "premarket_eligible": false,
+        "premarket_window": false,
+        "regular_market_open": true,
         "remaining_qty": 0.0,
         "status": "passed",
         "stockkit_route": "nitro",
@@ -42,26 +42,20 @@
     },
     {
       "details": {
-        "account_id": "47644617",
-        "balance": 99999.78,
-        "broker_order_ids": [
-          "27678592"
-        ],
-        "close_response": "ProtoOAExecutionEvent",
-        "error": "",
-        "filled_volume": 100000,
-        "position_id": 38833309,
-        "remaining_volume": 0,
-        "status": "passed",
+        "broker_order_ids": [],
+        "error": "RuntimeError: No cTrader demo account found.",
+        "filled_volume": 0,
+        "remaining_volume": null,
+        "status": "failed",
         "symbol": "EURUSD"
       },
-      "error": "",
+      "error": "RuntimeError: No cTrader demo account found.",
       "name": "ctrader-strategy-e2e",
-      "ok": true
+      "ok": false
     }
   ],
-  "finished_at": "2026-07-14T11:16:34.898222+00:00",
+  "finished_at": "2026-07-16T14:50:41.352242+00:00",
   "mode": "live-stockkit-e2e",
-  "ok": true,
-  "started_at": "2026-07-14T11:16:19.027461+00:00"
+  "ok": false,
+  "started_at": "2026-07-16T14:50:25.786080+00:00"
 }

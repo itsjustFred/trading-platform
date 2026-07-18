@@ -4,6 +4,7 @@ from pathlib import Path
 
 import yaml
 
+from live_runner.account_routing import validate_live_account_routes
 from shared.logging import get_logger
 from shared.models import LiveAccountConfig, LiveDeploymentConfig
 
@@ -29,6 +30,7 @@ def parse_live_deployments_config(
 
     accounts = [LiveAccountConfig.model_validate(item) for item in raw_accounts]
     deployments = [LiveDeploymentConfig.model_validate(item) for item in raw_deployments]
+    validate_live_account_routes(accounts)
 
     account_ids = {account.id for account in accounts}
     for deployment in deployments:

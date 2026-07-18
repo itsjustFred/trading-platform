@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 import fcntl
 import os
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -13,7 +14,9 @@ from risk.live import size_live_signal
 from shared.database import (
     find_live_signal_id_by_broker_order_id,
     get_live_signal_broker_order_id,
-    list_live_signal_ids_missing_executions,
+    get_live_signal_reconciliation_cursor,
+    get_live_signal_timestamp,
+    list_live_signal_ids_for_reconciliation,
     save_live_execution,
     save_live_signal,
     set_live_signal_broker_order_id,
@@ -42,10 +45,22 @@ class CTraderAuthTerminalError(RuntimeError):
         super().__init__(message)
 
 
-def _parse_bool_env(value: str | None, *, default: bool) -> bool:
+_TRUE_BOOL_TOKENS = {"1", "true", "yes", "y", "on"}
+_FALSE_BOOL_TOKENS = {"0", "false", "no", "n", "off"}
+
+
+def _parse_bool_env(name: str, value: str | None, *, default: bool) -> bool:
     if value is None:
         return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
+    token = value.strip().lower()
+    if token in _TRUE_BOOL_TOKENS:
+        return True
+    if token in _FALSE_BOOL_TOKENS:
+        return False
+    valid = ", ".join(sorted(_TRUE_BOOL_TOKENS | _FALSE_BOOL_TOKENS))
+    raise ValueError(
+        f"Invalid boolean value for {name}: {value!r}. Valid values are: {valid}."
+    )
 
 
 def _to_datetime_from_ms(timestamp_ms: int | float | None) -> datetime:
@@ -191,6 +206,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         demo: bool | None = None,
         account_config_id: str = "",
         accounts_env_path: Path | str | None = None,
+        connect_max_attempts: int | None = None,
+        connect_timeout_seconds: float | None = None,
     ):
         self.app_id = app_id or os.environ.get("CTRADER_APP_ID", "")
         self.app_secret = app_secret or os.environ.get("CTRADER_APP_SECRET", "")
@@ -200,11 +217,13 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         raw_account_id = str(account_id or account_config_id).strip()
         self.ctid_trader_account_id = int(raw_account_id) if raw_account_id else 0
         self.demo = (
-            _parse_bool_env(os.environ.get("CTRADER_DEMO"), default=True)
+            _parse_bool_env("CTRADER_DEMO", os.environ.get("CTRADER_DEMO"), default=True)
             if demo is None
             else demo
         )
         self.account_config_id = account_config_id or raw_account_id
+        self.connect_max_attempts = connect_max_attempts
+        self.connect_timeout_seconds = connect_timeout_seconds
 
         if not self.app_id:
             raise ValueError("Missing CTRADER_APP_ID.")
@@ -221,6 +240,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._client: Any | None = None
         self._connected_event = asyncio.Event()
         self._execution_queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=5000)
+        self._reconciliation_required = False
+        self._reconciliation_retry_at = 0.0
         self._connected = False
         self._authenticated = False
         self._connect_lock = asyncio.Lock()
@@ -251,6 +272,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._ProtoOATraderRes: Any = None
         self._ProtoOAOrderDetailsReq: Any = None
         self._ProtoOAOrderDetailsRes: Any = None
+        self._ProtoOAOrderListReq: Any = None
+        self._ProtoOAOrderListRes: Any = None
         self._ProtoOAReconcileReq: Any = None
         self._ProtoOAReconcileRes: Any = None
         self._ProtoOARefreshTokenReq: Any = None
@@ -285,6 +308,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 ProtoOANewOrderReq,
                 ProtoOAOrderDetailsReq,
                 ProtoOAOrderDetailsRes,
+                ProtoOAOrderListReq,
+                ProtoOAOrderListRes,
                 ProtoOAOrderErrorEvent,
                 ProtoOAReconcileReq,
                 ProtoOAReconcileRes,
@@ -327,6 +352,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._ProtoOATraderRes = ProtoOATraderRes
         self._ProtoOAOrderDetailsReq = ProtoOAOrderDetailsReq
         self._ProtoOAOrderDetailsRes = ProtoOAOrderDetailsRes
+        self._ProtoOAOrderListReq = ProtoOAOrderListReq
+        self._ProtoOAOrderListRes = ProtoOAOrderListRes
         self._ProtoOAReconcileReq = ProtoOAReconcileReq
         self._ProtoOAReconcileRes = ProtoOAReconcileRes
         self._ProtoOARefreshTokenReq = ProtoOARefreshTokenReq
@@ -357,7 +384,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._terminal_auth_failure_code = _normalize_error_code(error_code)
         self._authenticated = False
 
-    async def _refresh_access_token(self) -> bool:
+    async def _refresh_access_token(self, *, failed_access_token: str | None = None) -> bool:
         """Refresh cTrader OAuth tokens via Open API and persist them safely."""
         if not self.refresh_token or self._ProtoOARefreshTokenReq is None:
             logger.warning(
@@ -367,6 +394,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             return False
         refresh_token_before_lock = self.refresh_token
         async with self._refresh_lock:
+            if failed_access_token is not None and self.access_token != failed_access_token:
+                return True
             if self.refresh_token != refresh_token_before_lock and self.access_token:
                 return True
 
@@ -454,6 +483,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         raise CTraderAuthTerminalError(reason, error_code=error_code) from exc
 
     def _on_connected(self, client: Any) -> None:
+        if client is not self._client:
+            return
         self._connected = True
         self._connected_event.set()
         logger.info(
@@ -468,6 +499,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         )
 
     def _on_disconnected(self, client: Any, reason: Any) -> None:
+        if client is not self._client:
+            return
         self._connected = False
         self._authenticated = False
         self._already_logged_in_notified = False
@@ -483,6 +516,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         )
 
     def _on_message(self, client: Any, message: Any) -> None:
+        if client is not self._client:
+            return
         payload_type = int(getattr(message, "payloadType", -1))
         if payload_type == self._heartbeat_payload_type:
             return
@@ -496,7 +531,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             try:
                 self._execution_queue.put_nowait(payload)
             except asyncio.QueueFull:
-                logger.warning("cTrader execution queue is full, dropping execution event")
+                self._reconciliation_required = True
+                logger.warning(
+                    "cTrader execution queue is full; broker reconciliation required"
+                )
             return
 
         if payload_type == self._error_payload_type:
@@ -583,12 +621,15 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             # Already attempted refresh; don't loop infinitely
             return await self._send_request(request, timeout_seconds=timeout_seconds)
 
+        access_token_before_send = self.access_token
         try:
             return await self._send_request(request, timeout_seconds=timeout_seconds)
         except CTraderApiError as exc:
             error_code = _normalize_error_code(exc.error_code)
             error_text = str(exc)
-            if _is_terminal_auth_error(error_code, error_text) and await self._refresh_access_token():
+            if _is_terminal_auth_error(error_code, error_text) and await self._refresh_access_token(
+                failed_access_token=access_token_before_send
+            ):
                 # Token was refreshed successfully; re-authorize the account and
                 # retry once with the new token.
                 if self._ProtoOAAccountAuthReq is not None and self._ProtoOAAccountAuthRes is not None:
@@ -724,134 +765,278 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             self._loop = asyncio.get_running_loop()
             self._load_openapi_types()
 
-            if self._client is None:
-                host = (
-                    self._EndPoints.PROTOBUF_DEMO_HOST
-                    if self.demo
-                    else self._EndPoints.PROTOBUF_LIVE_HOST
-                )
-                self._client = self._Client(host, self._EndPoints.PROTOBUF_PORT, self._TcpProtocol)
-                self._client.setConnectedCallback(self._on_connected)
-                self._client.setDisconnectedCallback(self._on_disconnected)
-                self._client.setMessageReceivedCallback(self._on_message)
-                logger.info(
-                    "cTrader client initialized "
-                    "(OpenApiPy TcpProtocol handles heartbeat keepalive)",
-                    extra={"data": {"host": host, "port": self._EndPoints.PROTOBUF_PORT}},
-                )
+            # Retry transient connect/auth failures (the cTrader demo endpoint
+            # flaps: raw TCP is sometimes reachable, sometimes times out). Each
+            # attempt builds a fresh Twisted client so a half-dead service from a
+            # prior attempt can't poison the next one. Terminal auth errors
+            # (bad/expired token, account not authorized) are NOT retried.
+            max_attempts = (
+                self.connect_max_attempts
+                if self.connect_max_attempts is not None
+                else int(os.environ.get("CTRADER_CONNECT_MAX_ATTEMPTS", "5"))
+            )
+            base_delay = float(os.environ.get("CTRADER_CONNECT_BACKOFF_S", "2.0"))
+            connect_timeout = (
+                self.connect_timeout_seconds
+                if self.connect_timeout_seconds is not None
+                else 20.0
+            )
+            if max_attempts < 1:
+                max_attempts = 1
 
-            if not self._client.running:
-                self._client.startService()
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    self._connected_event.clear()
+                    client = self._create_client()
+                    self._client = client
+                    if not client.running:
+                        client.startService()
+                    await asyncio.wait_for(
+                        self._connected_event.wait(), timeout=connect_timeout
+                    )
+                    await self._authenticate()
+                    logger.info(
+                        "cTrader account authenticated",
+                        extra={
+                            "data": {
+                                "account_id": self.ctid_trader_account_id,
+                                "symbols_loaded": len(self._symbol_name_to_id),
+                                "attempt": attempt,
+                            }
+                        },
+                    )
+                    try:
+                        await self.reconcile_executions()
+                    except CTraderAuthTerminalError:
+                        raise
+                    except Exception as exc:
+                        logger.warning(
+                            "cTrader execution reconciliation failed; "
+                            "fills may be missing until retry",
+                            extra={
+                                "data": {
+                                    "account_id": self.ctid_trader_account_id,
+                                    "error": str(exc),
+                                }
+                            },
+                        )
+                    return
+                except asyncio.CancelledError:
+                    self._teardown_client()
+                    raise
+                except CTraderAuthTerminalError as exc:
+                    reason = str(exc).strip() or "cTrader authorization failed"
+                    self._mark_terminal_auth_failure(
+                        reason,
+                        error_code=getattr(exc, "error_code", ""),
+                    )
+                    self._teardown_client()
+                    if "not authorized" in reason.lower():
+                        logger.warning(
+                            "Account %s not authorized for token, skipping",
+                            self.ctid_trader_account_id,
+                            extra={
+                                "data": {
+                                    "account_id": self.ctid_trader_account_id,
+                                    "account_config_id": self.account_config_id,
+                                    "error_code": getattr(exc, "error_code", ""),
+                                    "error": reason,
+                                }
+                            },
+                        )
+                    else:
+                        logger.warning(
+                            "cTrader auth failed for account; "
+                            "skipping retries until credentials are updated",
+                            extra={
+                                "data": {
+                                    "account_id": self.ctid_trader_account_id,
+                                    "account_config_id": self.account_config_id,
+                                    "error_code": getattr(exc, "error_code", ""),
+                                    "error": reason,
+                                }
+                            },
+                        )
+                    raise
+                except Exception as exc:
+                    self._authenticated = False
+                    self._teardown_client()
+                    error_text = str(exc).strip() or exc.__class__.__name__
+                    message = error_text.lower()
+                    if attempt < max_attempts:
+                        delay = base_delay * (2 ** (attempt - 1))
+                        logger.info(
+                            "cTrader connect attempt %d/%d failed; retrying in %.0fs",
+                            attempt,
+                            max_attempts,
+                            delay,
+                            extra={
+                                "data": {
+                                    "account_id": self.ctid_trader_account_id,
+                                    "error": error_text,
+                                    "next_attempt_in_s": delay,
+                                }
+                            },
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+                    if "token" in message or "auth" in message:
+                        logger.info(
+                            "cTrader authentication unavailable; verify token/credentials, "
+                            "daemon will retry",
+                            extra={
+                                "data": {
+                                    "account_id": self.ctid_trader_account_id,
+                                    "error": error_text,
+                                }
+                            },
+                        )
+                    elif isinstance(exc, asyncio.TimeoutError) or "timeout" in message:
+                        logger.info(
+                            "cTrader connect timeout; endpoint may be unreachable, daemon will retry",
+                            extra={
+                                "data": {
+                                    "account_id": self.ctid_trader_account_id,
+                                    "error": error_text,
+                                }
+                            },
+                        )
+                    else:
+                        logger.info(
+                            "cTrader connect/auth unavailable; daemon will retry",
+                            extra={
+                                "data": {
+                                    "account_id": self.ctid_trader_account_id,
+                                    "error": error_text,
+                                }
+                            },
+                        )
+                    raise
 
+    def _create_client(self):
+        """Build a fresh OpenApiPy client with callbacks wired.
+
+        Extracted from connect() so every retry attempt starts from a clean
+        Twisted service instead of reusing a client left in a half-connected
+        state after a transient failure.
+        """
+        host = (
+            self._EndPoints.PROTOBUF_DEMO_HOST
+            if self.demo
+            else self._EndPoints.PROTOBUF_LIVE_HOST
+        )
+        client = self._Client(host, self._EndPoints.PROTOBUF_PORT, self._TcpProtocol)
+        client.setConnectedCallback(self._on_connected)
+        client.setDisconnectedCallback(self._on_disconnected)
+        client.setMessageReceivedCallback(self._on_message)
+        return client
+
+    def _teardown_client(self) -> None:
+        """Drop the current client and ask Twisted to stop its service so a later
+        connect() attempt can build a fresh one. Safe to call when no client exists.
+        """
+        client = self._client
+        self._client = None
+        self._connected = False
+        self._authenticated = False
+        self._already_logged_in_notified = False
+        if client is not None:
             try:
-                await asyncio.wait_for(self._connected_event.wait(), timeout=20)
-                await self._authenticate()
-                logger.info(
-                    "cTrader account authenticated",
+                stop = getattr(client, "stopService", None)
+                if stop is not None:
+                    stop()
+            except Exception:
+                pass
+        try:
+            self._connected_event.clear()
+        except Exception:
+            pass
+
+    async def _recover_broker_order_id(
+        self,
+        signal_id: str,
+        signal_timestamp: datetime | None,
+    ) -> str | None:
+        """Find exactly one account-scoped order by its stable client order id."""
+        if signal_timestamp is None:
+            return None
+        if signal_timestamp.tzinfo is None:
+            signal_timestamp = signal_timestamp.replace(tzinfo=timezone.utc)
+        signal_timestamp = signal_timestamp.astimezone(timezone.utc)
+
+        request = self._ProtoOAOrderListReq()
+        request.ctidTraderAccountId = self.ctid_trader_account_id
+        request.fromTimestamp = int(
+            (signal_timestamp - timedelta(minutes=15)).timestamp() * 1000
+        )
+        request.toTimestamp = int(
+            (signal_timestamp + timedelta(minutes=15)).timestamp() * 1000
+        )
+        response = await self._send_request_with_refresh_retry(
+            request, timeout_seconds=15
+        )
+        if not isinstance(response, self._ProtoOAOrderListRes):
+            return None
+        if bool(getattr(response, "hasMore", False)):
+            logger.warning(
+                "cTrader recovery order window is incomplete; refusing ambiguous match",
+                extra={"data": {"signal_id": signal_id}},
+            )
+            return None
+        matches = [
+            order
+            for order in getattr(response, "order", [])
+            if str(getattr(order, "clientOrderId", "") or "").strip() == signal_id
+            and int(getattr(order, "orderId", 0) or 0) > 0
+        ]
+        if len(matches) != 1:
+            if len(matches) > 1:
+                logger.error(
+                    "Multiple cTrader orders matched one signal; refusing recovery",
                     extra={
-                        "data": {
-                            "account_id": self.ctid_trader_account_id,
-                            "symbols_loaded": len(self._symbol_name_to_id),
-                        }
+                        "data": {"signal_id": signal_id, "match_count": len(matches)}
                     },
                 )
-                try:
-                    await self.reconcile_executions()
-                except Exception as exc:
-                    logger.warning(
-                        "cTrader execution reconciliation failed; "
-                        "fills may be missing until retry",
-                        extra={
-                            "data": {
-                                "account_id": self.ctid_trader_account_id,
-                                "error": str(exc),
-                            }
-                        },
-                    )
-            except CTraderAuthTerminalError as exc:
-                reason = str(exc).strip() or "cTrader authorization failed"
-                self._mark_terminal_auth_failure(
-                    reason,
-                    error_code=getattr(exc, "error_code", ""),
-                )
-                if "not authorized" in reason.lower():
-                    logger.warning(
-                        "Account %s not authorized for token, skipping",
-                        self.ctid_trader_account_id,
-                        extra={
-                            "data": {
-                                "account_id": self.ctid_trader_account_id,
-                                "account_config_id": self.account_config_id,
-                                "error_code": getattr(exc, "error_code", ""),
-                                "error": reason,
-                            }
-                        },
-                    )
-                else:
-                    logger.warning(
-                        "cTrader auth failed for account; "
-                        "skipping retries until credentials are updated",
-                        extra={
-                            "data": {
-                                "account_id": self.ctid_trader_account_id,
-                                "account_config_id": self.account_config_id,
-                                "error_code": getattr(exc, "error_code", ""),
-                                "error": reason,
-                            }
-                        },
-                    )
-                raise
-            except Exception as exc:
-                self._authenticated = False
-                error_text = str(exc).strip() or exc.__class__.__name__
-                message = error_text.lower()
-                if "token" in message or "auth" in message:
-                    logger.info(
-                        "cTrader authentication unavailable; verify token/credentials, "
-                        "daemon will retry",
-                        extra={
-                            "data": {
-                                "account_id": self.ctid_trader_account_id,
-                                "error": error_text,
-                            }
-                        },
-                    )
-                elif isinstance(exc, asyncio.TimeoutError) or "timeout" in message:
-                    logger.info(
-                        "cTrader connect timeout; endpoint may be unreachable, daemon will retry",
-                        extra={
-                            "data": {
-                                "account_id": self.ctid_trader_account_id,
-                                "error": error_text,
-                            }
-                        },
-                    )
-                else:
-                    logger.info(
-                        "cTrader connect/auth unavailable; daemon will retry",
-                        extra={
-                            "data": {
-                                "account_id": self.ctid_trader_account_id,
-                                "error": error_text,
-                            }
-                        },
-                    )
-                raise
+            return None
+        return str(int(matches[0].orderId))
 
     async def reconcile_executions(self, *, max_signals: int = 200) -> int:
         """Backfill fills for persisted signals that never received an execution record.
 
         Recovers fills that completed while the daemon was down or crashed between
         broker submit and stream-event persistence. Uses the broker_order_id persisted
-        at submit time to fetch the order's deals via ProtoOAOrderDetailsReq. Only
-        signals with zero recorded executions are considered, so partially-streamed
-        fills are never double-counted.
+        at submit time to fetch the order's deals via ProtoOAOrderDetailsReq. Partially
+        executed signals remain eligible; deal-id dedupe prevents double-counting.
         """
         if self._client is None or not self._authenticated:
             return 0
-        signal_ids = await asyncio.to_thread(
-            list_live_signal_ids_missing_executions, max_signals
-        )
+        signal_ids: list[str] = []
+        before: tuple[datetime, str] | None = None
+        while True:
+            if before is None:
+                page = await asyncio.to_thread(
+                    list_live_signal_ids_for_reconciliation,
+                    self.account_config_id,
+                    max_signals,
+                )
+            else:
+                page = await asyncio.to_thread(
+                    list_live_signal_ids_for_reconciliation,
+                    self.account_config_id,
+                    max_signals,
+                    before=before,
+                )
+            if not page:
+                break
+            signal_ids.extend(page)
+            if len(page) < max_signals:
+                break
+            next_before = await asyncio.to_thread(
+                get_live_signal_reconciliation_cursor, page[-1]
+            )
+            if next_before is None or next_before == before:
+                break
+            before = next_before
         recovered = 0
         for signal_id in signal_ids:
             try:
@@ -862,9 +1047,24 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 get_live_signal_broker_order_id, signal_id
             )
             if not broker_order_id:
-                # Signal never reached the broker (or predates broker_order_id
-                # persistence); nothing to reconcile against.
-                continue
+                signal_timestamp = await asyncio.to_thread(
+                    get_live_signal_timestamp, signal_id
+                )
+                broker_order_id = await self._recover_broker_order_id(
+                    signal_id, signal_timestamp
+                )
+                if not broker_order_id:
+                    continue
+                persisted = await asyncio.to_thread(
+                    set_live_signal_broker_order_id, signal_id, broker_order_id
+                )
+                if not persisted:
+                    logger.error(
+                        "Recovered cTrader order but could not persist broker order id",
+                        extra={"data": {"signal_id": signal_id}},
+                    )
+                    continue
+                self._order_id_to_signal_id[int(broker_order_id)] = signal_id
             try:
                 order_id = int(broker_order_id)
             except (TypeError, ValueError):
@@ -935,7 +1135,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                     commission=_to_float(getattr(deal, "commission", 0)),
                     timestamp=_to_datetime_from_ms(timestamp_ms),
                     broker_order_id=broker_order_id,
-                    dedupe_key=f"ctrader:deal:{deal_id}:reconciled",
+                    dedupe_key=f"ctrader:deal:{deal_id}",
                 )
                 if await asyncio.to_thread(save_live_execution, execution):
                     recovered += 1
@@ -986,6 +1186,17 @@ class CTraderLiveAdapter(BaseLiveAdapter):
 
     async def submit_order(self, signal: LiveSignal) -> str:
         self._raise_if_terminal_auth_failed()
+        signal_id = str(signal.id)
+        existing_order_id = await asyncio.to_thread(
+            get_live_signal_broker_order_id, signal_id
+        )
+        if existing_order_id:
+            try:
+                self._order_id_to_signal_id[int(existing_order_id)] = signal_id
+            except (TypeError, ValueError):
+                pass
+            return existing_order_id
+
         if not self._connected or not self._authenticated:
             await self.connect()
 
@@ -998,7 +1209,62 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 f"(risk_percent={sized_order.risk_percent:.4f})."
             )
 
-        await asyncio.to_thread(save_live_signal, signal)
+        persisted_timestamp = await asyncio.to_thread(
+            get_live_signal_timestamp, signal_id
+        )
+        if persisted_timestamp is not None:
+            recovered_order_id = await self._recover_broker_order_id(
+                signal_id, persisted_timestamp
+            )
+            if not recovered_order_id:
+                raise RuntimeError(
+                    "Persisted cTrader signal has no unique recoverable broker order; "
+                    "refusing possible duplicate submission."
+                )
+            persisted = await asyncio.to_thread(
+                set_live_signal_broker_order_id, signal_id, recovered_order_id
+            )
+            if not persisted:
+                raise RuntimeError(
+                    "Recovered cTrader order but failed to persist broker order id."
+                )
+            self._order_id_to_signal_id[int(recovered_order_id)] = signal_id
+            return recovered_order_id
+
+        canonical_signal_id, created = await asyncio.to_thread(save_live_signal, signal)
+        if not created:
+            existing_order_id = await asyncio.to_thread(
+                get_live_signal_broker_order_id, canonical_signal_id
+            )
+            if existing_order_id:
+                try:
+                    self._order_id_to_signal_id[int(existing_order_id)] = canonical_signal_id
+                except (TypeError, ValueError):
+                    pass
+                return existing_order_id
+            canonical_timestamp = await asyncio.to_thread(
+                get_live_signal_timestamp, canonical_signal_id
+            )
+            recovered_order_id = await self._recover_broker_order_id(
+                canonical_signal_id, canonical_timestamp
+            )
+            if not recovered_order_id:
+                raise RuntimeError(
+                    "Duplicate Discord signal has no unique recoverable broker order; "
+                    "refusing possible duplicate submission."
+                )
+            persisted = await asyncio.to_thread(
+                set_live_signal_broker_order_id,
+                canonical_signal_id,
+                recovered_order_id,
+            )
+            if not persisted:
+                raise RuntimeError(
+                    "Recovered duplicate Discord order but failed to persist broker order id."
+                )
+            self._order_id_to_signal_id[int(recovered_order_id)] = canonical_signal_id
+            return recovered_order_id
+
         symbol_id = self._symbol_name_to_id.get(signal.symbol.upper())
         if symbol_id is None:
             await self._authenticate()
@@ -1034,10 +1300,12 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         order_id = self._extract_order_id_from_payload(response)
         if order_id is not None:
             broker_order_id = str(order_id)
-            self._order_id_to_signal_id[order_id] = str(signal.id)
-            await asyncio.to_thread(
-                set_live_signal_broker_order_id, str(signal.id), broker_order_id
+            persisted = await asyncio.to_thread(
+                set_live_signal_broker_order_id, canonical_signal_id, broker_order_id
             )
+            if not persisted:
+                raise RuntimeError("Failed to persist cTrader broker order id.")
+            self._order_id_to_signal_id[order_id] = canonical_signal_id
 
         logger.info(
             "Submitted cTrader live order",
@@ -1164,7 +1432,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         if not client_order_id and order_id is not None:
             client_order_id = (
                 await asyncio.to_thread(
-                    find_live_signal_id_by_broker_order_id, str(order_id)
+                    find_live_signal_id_by_broker_order_id,
+                    self.account_config_id,
+                    str(order_id),
                 )
                 or ""
             )
@@ -1258,6 +1528,30 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             try:
                 if not self._connected or not self._authenticated:
                     await self.connect()
+
+                if (
+                    self._reconciliation_required
+                    and time.monotonic() >= self._reconciliation_retry_at
+                ):
+                    try:
+                        await self.reconcile_executions()
+                    except CTraderAuthTerminalError:
+                        raise
+                    except Exception as exc:
+                        self._reconciliation_retry_at = time.monotonic() + backoff_seconds
+                        logger.warning(
+                            "cTrader overflow reconciliation failed; queue processing continues",
+                            extra={
+                                "data": {
+                                    "account_id": self.ctid_trader_account_id,
+                                    "error": str(exc),
+                                    "retry_in_seconds": backoff_seconds,
+                                }
+                            },
+                        )
+                    else:
+                        self._reconciliation_required = False
+                        self._reconciliation_retry_at = 0.0
 
                 event = await asyncio.wait_for(self._execution_queue.get(), timeout=30)
                 await self._persist_execution_event(event)

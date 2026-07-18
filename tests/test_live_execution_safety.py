@@ -8,12 +8,16 @@ and fail-closed recovery decisions.
 from __future__ import annotations
 
 import asyncio
+import io
+import json
+import logging
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -247,6 +251,208 @@ def test_alpaca_submit_order_blocks_non_positive_quantity(monkeypatch):
         asyncio.run(adapter.submit_order(signal))
 
 
+def test_alpaca_discord_redelivery_submits_once_with_canonical_signal_id(monkeypatch):
+    from live_runner import alpaca_adapter as module
+
+    adapter = module.AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True)
+    adapter._connected = True
+    canonical_signal_id = str(uuid4())
+    submitted_requests: list[Any] = []
+
+    def _submit_order(*, order_data):
+        if submitted_requests:
+            pytest.fail(
+                "Discord redelivery submitted a second Alpaca order with "
+                f"client_order_id={order_data.client_order_id}"
+            )
+        submitted_requests.append(order_data)
+        return SimpleNamespace(id="alpaca-order-1")
+
+    adapter._trading_client = SimpleNamespace(
+        get_account=lambda: SimpleNamespace(cash="100000", equity="100000"),
+        submit_order=_submit_order,
+    )
+    monkeypatch.setattr(
+        module,
+        "size_live_signal",
+        lambda _signal, *, account_balance: SimpleNamespace(risk_percent=0.01),
+    )
+    save_results = iter(
+        [(canonical_signal_id, True), (canonical_signal_id, False)]
+    )
+    monkeypatch.setattr(module, "save_live_signal", lambda _signal: next(save_results))
+    persisted_order_ids: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        module,
+        "set_live_signal_broker_order_id",
+        lambda sid, oid: persisted_order_ids.append((sid, oid)) or True,
+    )
+
+    first = LiveSignal(
+        id=UUID(canonical_signal_id),
+        deployment_id="dep-1",
+        symbol="AAPL",
+        action="buy",
+        theoretical_price=100.0,
+        timestamp=datetime(2026, 7, 15, 10, 0, tzinfo=timezone.utc),
+        metadata={"qty": 1.0, "discord_message_id": "discord-123"},
+    )
+    redelivery = LiveSignal(
+        id=uuid4(),
+        deployment_id="dep-1",
+        symbol="AAPL",
+        action="buy",
+        theoretical_price=100.0,
+        timestamp=datetime(2026, 7, 15, 10, 1, tzinfo=timezone.utc),
+        metadata={"qty": 1.0, "discord_message_id": "discord-123"},
+    )
+
+    assert asyncio.run(adapter.submit_order(first)) == "alpaca-order-1"
+    with pytest.raises(RuntimeError, match="canonical signal already exists"):
+        asyncio.run(adapter.submit_order(redelivery))
+
+    assert len(submitted_requests) == 1
+    assert submitted_requests[0].client_order_id == canonical_signal_id
+    assert persisted_order_ids == [(canonical_signal_id, "alpaca-order-1")]
+
+
+def test_alpaca_redelivery_recovers_accepted_order_without_resubmitting(monkeypatch):
+    """A timeout after broker acceptance must recover by canonical client order id."""
+    from live_runner import alpaca_adapter as module
+
+    adapter = module.AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True)
+    adapter._connected = True
+    canonical_signal_id = str(uuid4())
+    signal = LiveSignal(
+        id=uuid4(),
+        deployment_id="dep-1",
+        symbol="AAPL",
+        action="buy",
+        theoretical_price=100.0,
+        timestamp=datetime(2026, 7, 15, 10, 1, tzinfo=timezone.utc),
+        metadata={"qty": 1.0, "discord_message_id": "discord-timeout"},
+    )
+    submit_calls: list[Any] = []
+    lookup_calls: list[str] = []
+
+    def _lookup(client_order_id: str):
+        lookup_calls.append(client_order_id)
+        return SimpleNamespace(id="alpaca-accepted-before-timeout")
+
+    adapter._trading_client = SimpleNamespace(
+        get_account=lambda: SimpleNamespace(cash="100000", equity="100000"),
+        get_order_by_client_id=_lookup,
+        submit_order=lambda *, order_data: submit_calls.append(order_data),
+    )
+    monkeypatch.setattr(
+        module,
+        "size_live_signal",
+        lambda _signal, *, account_balance: SimpleNamespace(risk_percent=0.01),
+    )
+    monkeypatch.setattr(
+        module, "save_live_signal", lambda _signal: (canonical_signal_id, False)
+    )
+    persisted_order_ids: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        module,
+        "set_live_signal_broker_order_id",
+        lambda sid, oid: persisted_order_ids.append((sid, oid)) or True,
+    )
+
+    assert asyncio.run(adapter.submit_order(signal)) == "alpaca-accepted-before-timeout"
+    assert lookup_calls == [canonical_signal_id]
+    assert submit_calls == []
+    assert persisted_order_ids == [
+        (canonical_signal_id, "alpaca-accepted-before-timeout")
+    ]
+
+
+def test_alpaca_redelivery_uses_persisted_order_id_without_broker_call(monkeypatch):
+    from live_runner import alpaca_adapter as module
+
+    adapter = module.AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True)
+    adapter._connected = True
+    canonical_signal_id = str(uuid4())
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="AAPL",
+        action="buy",
+        theoretical_price=100.0,
+        timestamp=datetime(2026, 7, 15, 10, 2, tzinfo=timezone.utc),
+        metadata={"qty": 1.0, "discord_message_id": "discord-persisted"},
+    )
+
+    def _forbidden(*_args, **_kwargs):
+        pytest.fail("Persisted Alpaca order id must avoid broker lookup and resubmit")
+
+    adapter._trading_client = SimpleNamespace(
+        get_account=lambda: SimpleNamespace(cash="100000", equity="100000"),
+        get_order_by_client_id=_forbidden,
+        submit_order=_forbidden,
+    )
+    monkeypatch.setattr(
+        module,
+        "size_live_signal",
+        lambda _signal, *, account_balance: SimpleNamespace(risk_percent=0.01),
+    )
+    monkeypatch.setattr(
+        module, "save_live_signal", lambda _signal: (canonical_signal_id, False)
+    )
+    monkeypatch.setattr(
+        module,
+        "get_live_signal_broker_order_id",
+        lambda signal_id: "alpaca-already-persisted"
+        if signal_id == canonical_signal_id
+        else None,
+    )
+
+    assert asyncio.run(adapter.submit_order(signal)) == "alpaca-already-persisted"
+
+
+def test_alpaca_broker_order_id_persistence_failure_is_not_success(monkeypatch):
+    from live_runner import alpaca_adapter as module
+
+    adapter = module.AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True)
+    adapter._connected = True
+    canonical_signal_id = str(uuid4())
+    signal = LiveSignal(
+        id=uuid4(),
+        deployment_id="dep-1",
+        symbol="AAPL",
+        action="buy",
+        theoretical_price=100.0,
+        timestamp=datetime(2026, 7, 15, 10, 0, tzinfo=timezone.utc),
+        metadata={"qty": 1.0, "discord_message_id": "discord-456"},
+    )
+    adapter._trading_client = SimpleNamespace(
+        get_account=lambda: SimpleNamespace(cash="100000", equity="100000"),
+        submit_order=lambda *, order_data: SimpleNamespace(id="alpaca-order-2"),
+    )
+    monkeypatch.setattr(
+        module,
+        "size_live_signal",
+        lambda _signal, *, account_balance: SimpleNamespace(risk_percent=0.01),
+    )
+    monkeypatch.setattr(
+        module, "save_live_signal", lambda _signal: (canonical_signal_id, True)
+    )
+    persistence_calls: list[tuple[str, str]] = []
+
+    def _fail_persistence(signal_id: str, broker_order_id: str) -> bool:
+        assert signal_id == canonical_signal_id, (
+            "Alpaca broker order id was persisted against the noncanonical signal row"
+        )
+        persistence_calls.append((signal_id, broker_order_id))
+        return False
+
+    monkeypatch.setattr(module, "set_live_signal_broker_order_id", _fail_persistence)
+
+    with pytest.raises(RuntimeError, match="Failed to persist Alpaca broker order id"):
+        asyncio.run(adapter.submit_order(signal))
+
+    assert persistence_calls == [(canonical_signal_id, "alpaca-order-2")]
+
+
 def test_ctrader_volume_rejects_missing_and_below_minimum_qty():
     """Volume floor must not silently override risk sizing; no default size."""
     from live_runner.ctrader_adapter import CTraderLiveAdapter
@@ -297,6 +503,7 @@ def isolated_db(monkeypatch, tmp_path: Path):
         f"sqlite:///{(tmp_path / 'test.db').as_posix()}",
         connect_args={"check_same_thread": False},
     )
+    database.event.listen(engine, "connect", database._configure_sqlite_connection)
     monkeypatch.setattr(database, "ENGINE", engine)
     monkeypatch.setattr(database, "DATA_DIR", tmp_path)
     monkeypatch.setattr(database, "_DB_INITIALIZED", False)
@@ -315,6 +522,509 @@ def _persist_signal(database: Any) -> LiveSignal:
     )
     database.save_live_signal(signal)
     return signal
+
+
+def test_save_live_signal_returns_canonical_discord_claim(isolated_db):
+    database = isolated_db
+    discord_message_id = "discord-123"
+    first = LiveSignal(
+        deployment_id="dep-1",
+        symbol="EURUSD",
+        action="buy",
+        theoretical_price=1.1,
+        timestamp=datetime(2026, 7, 15, 10, 0, tzinfo=timezone.utc),
+        metadata={"discord_message_id": discord_message_id},
+    )
+    second = LiveSignal(
+        deployment_id="dep-1",
+        symbol="EURUSD",
+        action="buy",
+        theoretical_price=1.1,
+        timestamp=datetime(2026, 7, 15, 10, 1, tzinfo=timezone.utc),
+        metadata={"discord_message_id": discord_message_id},
+    )
+
+    assert database.save_live_signal(first) == (str(first.id), True)
+    assert database.save_live_signal(second) == (str(first.id), False)
+
+    with database.get_session() as session:
+        rows = session.exec(database.select(database.LiveSignalModel)).all()
+    assert [row.id for row in rows] == [str(first.id)]
+
+
+def test_save_live_signal_scopes_discord_claim_by_deployment(isolated_db):
+    database = isolated_db
+    discord_message_id = "discord-fanout-123"
+    first = LiveSignal(
+        deployment_id="dep-1",
+        symbol="EURUSD",
+        action="buy",
+        theoretical_price=1.1,
+        timestamp=datetime(2026, 7, 15, 10, 0, tzinfo=timezone.utc),
+        metadata={"discord_message_id": discord_message_id},
+    )
+    second = LiveSignal(
+        deployment_id="dep-2",
+        symbol="EURUSD",
+        action="buy",
+        theoretical_price=1.1,
+        timestamp=datetime(2026, 7, 15, 10, 0, tzinfo=timezone.utc),
+        metadata={"discord_message_id": discord_message_id},
+    )
+
+    assert database.save_live_signal(first) == (str(first.id), True)
+    assert database.save_live_signal(second) == (str(second.id), True)
+
+    with database.get_session() as session:
+        rows = session.exec(
+            database.select(database.LiveSignalModel).where(
+                database.LiveSignalModel.discord_message_id == discord_message_id
+            )
+        ).all()
+    assert {(row.deployment_id, row.id) for row in rows} == {
+        ("dep-1", str(first.id)),
+        ("dep-2", str(second.id)),
+    }
+
+
+def _legacy_live_signal_table(database: Any, *, table_unique: bool = False) -> None:
+    unique_clause = ", UNIQUE(discord_message_id)" if table_unique else ""
+    with database.ENGINE.begin() as connection:
+        connection.execute(
+            database.text(
+                "CREATE TABLE live_signals ("
+                "id TEXT PRIMARY KEY, deployment_id TEXT NOT NULL, symbol TEXT NOT NULL, "
+                "action TEXT NOT NULL, theoretical_price FLOAT NOT NULL, timestamp TEXT NOT NULL, "
+                "source TEXT NOT NULL DEFAULT 'internal', broker_order_id TEXT NOT NULL DEFAULT '', "
+                f"discord_message_id TEXT, metadata TEXT NOT NULL{unique_clause})"
+            )
+        )
+        if not table_unique:
+            connection.execute(
+                database.text(
+                    "CREATE UNIQUE INDEX uq_live_signals_discord_msg_id "
+                    "ON live_signals(discord_message_id) WHERE discord_message_id IS NOT NULL"
+                )
+            )
+
+
+def _insert_legacy_live_signal(
+    database: Any,
+    *,
+    row_id: str,
+    deployment_id: str,
+    discord_message_id: str | None,
+) -> None:
+    metadata = {"discord_message_id": discord_message_id} if discord_message_id else {}
+    with database.ENGINE.begin() as connection:
+        connection.execute(
+            database.text(
+                "INSERT INTO live_signals (id, deployment_id, symbol, action, theoretical_price, "
+                "timestamp, source, broker_order_id, discord_message_id, metadata) "
+                "VALUES (:id, :deployment_id, 'EURUSD', 'buy', 1.1, :timestamp, "
+                "'discord', '', :discord_message_id, :metadata)"
+            ),
+            {
+                "id": row_id,
+                "deployment_id": deployment_id,
+                "timestamp": "2026-07-15T10:00:00+00:00",
+                "discord_message_id": discord_message_id,
+                "metadata": json.dumps(metadata),
+            },
+        )
+
+
+def _run_legacy_live_signal_migration(database: Any) -> None:
+    database.SQLModel.metadata.create_all(database.ENGINE)
+    database._migrate_schema()
+
+
+def _discord_unique_indexes(database: Any) -> dict[str, list[str]]:
+    with database.ENGINE.connect() as connection:
+        indexes = connection.execute(database.text("PRAGMA index_list('live_signals')")).fetchall()
+        result = {}
+        for row in indexes:
+            if not bool(row[2]):
+                continue
+            name = str(row[1])
+            columns = connection.execute(
+                database.text(f'PRAGMA index_info("{name}")')
+            ).fetchall()
+            result[name] = [str(column[2]) for column in columns]
+        return {
+            name: columns
+            for name, columns in result.items()
+            if "discord_message_id" in columns
+        }
+
+
+def test_migration_replaces_global_discord_index_with_deployment_scope(isolated_db):
+    database = isolated_db
+    _legacy_live_signal_table(database)
+    _insert_legacy_live_signal(
+        database,
+        row_id="dep-1-signal",
+        deployment_id="dep-1",
+        discord_message_id="fanout-message",
+    )
+
+    _run_legacy_live_signal_migration(database)
+    _run_legacy_live_signal_migration(database)
+
+    indexes = _discord_unique_indexes(database)
+    assert indexes == {
+        "uq_live_signals_deployment_discord_msg": [
+            "deployment_id",
+            "discord_message_id",
+        ]
+    }
+    with database.ENGINE.connect() as connection:
+        sql = connection.execute(
+            database.text(
+                "SELECT sql FROM sqlite_master WHERE type='index' "
+                "AND name='uq_live_signals_deployment_discord_msg'"
+            )
+        ).scalar_one()
+    assert "WHERE discord_message_id IS NOT NULL" in sql
+
+
+def test_migration_allows_legacy_fanout_across_deployments(isolated_db):
+    database = isolated_db
+    _legacy_live_signal_table(database)
+    _insert_legacy_live_signal(
+        database,
+        row_id="dep-1-signal",
+        deployment_id="dep-1",
+        discord_message_id="fanout-message",
+    )
+    # Simulate the second deployment arriving through legacy metadata after the
+    # global index was created; migration must backfill it after dropping that index.
+    _insert_legacy_live_signal(
+        database,
+        row_id="dep-2-signal",
+        deployment_id="dep-2",
+        discord_message_id=None,
+    )
+    with database.ENGINE.begin() as connection:
+        connection.execute(
+            database.text("UPDATE live_signals SET metadata = :metadata WHERE id = 'dep-2-signal'"),
+            {"metadata": json.dumps({"discord_message_id": "fanout-message"})},
+        )
+
+    _run_legacy_live_signal_migration(database)
+
+    with database.ENGINE.connect() as connection:
+        rows = connection.execute(
+            database.text(
+                "SELECT deployment_id, discord_message_id FROM live_signals ORDER BY deployment_id"
+            )
+        ).fetchall()
+    assert rows == [("dep-1", "fanout-message"), ("dep-2", "fanout-message")]
+
+
+def test_migration_fails_closed_for_duplicate_composite_claim(isolated_db):
+    database = isolated_db
+    _legacy_live_signal_table(database)
+    _insert_legacy_live_signal(
+        database,
+        row_id="duplicate-a",
+        deployment_id="dep-1",
+        discord_message_id="duplicate-message",
+    )
+    _insert_legacy_live_signal(
+        database,
+        row_id="duplicate-b",
+        deployment_id="dep-1",
+        discord_message_id=None,
+    )
+    with database.ENGINE.begin() as connection:
+        connection.execute(
+            database.text("UPDATE live_signals SET metadata = :metadata WHERE id = 'duplicate-b'"),
+            {"metadata": json.dumps({"discord_message_id": "duplicate-message"})},
+        )
+
+    with pytest.raises(RuntimeError, match="No rows were deleted"):
+        _run_legacy_live_signal_migration(database)
+
+    with database.ENGINE.connect() as connection:
+        foreign_keys_enabled = int(
+            connection.execute(database.text("PRAGMA foreign_keys")).scalar_one()
+        )
+        row_count = connection.execute(database.text("SELECT COUNT(*) FROM live_signals")).scalar_one()
+        rolled_back_claim = connection.execute(
+            database.text(
+                "SELECT discord_message_id FROM live_signals WHERE id = 'duplicate-b'"
+            )
+        ).scalar_one()
+        legacy_table_count = connection.execute(
+            database.text(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'live_signals__discord_legacy'"
+            )
+        ).scalar_one()
+    assert foreign_keys_enabled == 1
+    assert row_count == 2
+    assert rolled_back_claim is None
+    assert legacy_table_count == 0
+    assert _discord_unique_indexes(database) == {
+        "uq_live_signals_discord_msg_id": ["discord_message_id"]
+    }
+
+
+def test_migration_rebuilds_table_backed_global_unique_constraint(isolated_db):
+    database = isolated_db
+    _legacy_live_signal_table(database, table_unique=True)
+    _insert_legacy_live_signal(
+        database,
+        row_id="dep-1-signal",
+        deployment_id="dep-1",
+        discord_message_id="table-unique",
+    )
+
+    _run_legacy_live_signal_migration(database)
+    _insert_legacy_live_signal(
+        database,
+        row_id="dep-2-signal",
+        deployment_id="dep-2",
+        discord_message_id="table-unique",
+    )
+
+    assert _discord_unique_indexes(database) == {
+        "uq_live_signals_deployment_discord_msg": [
+            "deployment_id",
+            "discord_message_id",
+        ]
+    }
+    with database.ENGINE.connect() as connection:
+        rows = connection.execute(
+            database.text(
+                "SELECT id, deployment_id, discord_message_id FROM live_signals "
+                "ORDER BY deployment_id"
+            )
+        ).fetchall()
+    assert rows == [
+        ("dep-1-signal", "dep-1", "table-unique"),
+        ("dep-2-signal", "dep-2", "table-unique"),
+    ]
+
+
+def test_migration_rebuild_preserves_live_execution_foreign_key(isolated_db):
+    database = isolated_db
+    _legacy_live_signal_table(database, table_unique=True)
+    _insert_legacy_live_signal(
+        database,
+        row_id="signal-with-execution",
+        deployment_id="dep-1",
+        discord_message_id="fk-message",
+    )
+    with database.ENGINE.begin() as connection:
+        connection.execute(
+            database.text(
+                "CREATE TABLE live_executions ("
+                "id TEXT PRIMARY KEY, signal_id TEXT NOT NULL, "
+                "FOREIGN KEY(signal_id) REFERENCES live_signals(id))"
+            )
+        )
+        connection.execute(
+            database.text(
+                "INSERT INTO live_executions (id, signal_id) "
+                "VALUES ('execution-1', 'signal-with-execution')"
+            )
+        )
+
+    with database.ENGINE.connect() as connection:
+        foreign_keys_before = int(
+            connection.execute(database.text("PRAGMA foreign_keys")).scalar_one()
+        )
+
+    _run_legacy_live_signal_migration(database)
+    _run_legacy_live_signal_migration(database)
+
+    with database.ENGINE.connect() as connection:
+        foreign_keys_after = int(
+            connection.execute(database.text("PRAGMA foreign_keys")).scalar_one()
+        )
+        foreign_keys = connection.execute(
+            database.text("PRAGMA foreign_key_list('live_executions')")
+        ).fetchall()
+        violations = connection.execute(database.text("PRAGMA foreign_key_check")).fetchall()
+        execution = connection.execute(
+            database.text("SELECT id, signal_id FROM live_executions")
+        ).one()
+    assert foreign_keys_before == 1
+    assert foreign_keys_after == foreign_keys_before
+    assert {str(row[2]) for row in foreign_keys} == {"live_signals"}
+    assert violations == []
+    assert execution == ("execution-1", "signal-with-execution")
+
+
+def _concurrent_discord_claims(database: Any, deployments: list[str]) -> list[tuple[str, bool]]:
+    def persist(deployment_id: str) -> tuple[str, bool]:
+        signal = LiveSignal(
+            deployment_id=deployment_id,
+            symbol="EURUSD",
+            action="buy",
+            theoretical_price=1.1,
+            timestamp=datetime(2026, 7, 15, 10, 0, tzinfo=timezone.utc),
+            metadata={"discord_message_id": "concurrent-message"},
+        )
+        return database.save_live_signal(signal)
+
+    database.init_db()
+    with ThreadPoolExecutor(max_workers=len(deployments)) as executor:
+        return list(executor.map(persist, deployments))
+
+
+def test_concurrent_discord_claim_is_atomic_within_deployment(isolated_db):
+    database = isolated_db
+    results = _concurrent_discord_claims(database, ["dep-1", "dep-1"])
+
+    assert sorted(created for _signal_id, created in results) == [False, True]
+    assert len({signal_id for signal_id, _created in results}) == 1
+
+
+def test_concurrent_discord_claims_are_independent_across_deployments(isolated_db):
+    database = isolated_db
+    results = _concurrent_discord_claims(database, ["dep-1", "dep-2"])
+
+    assert [created for _signal_id, created in results] == [True, True]
+    assert len({signal_id for signal_id, _created in results}) == 2
+
+
+def test_ctrader_reconciliation_candidates_include_partially_executed_signal(isolated_db):
+    database = isolated_db
+    deployment = _deployment()
+    database.ensure_live_account("acc-1", "ctrader")
+    database.create_live_deployment(deployment)
+    signal = LiveSignal(
+        deployment_id=str(deployment.id),
+        symbol="EURUSD",
+        action="buy",
+        theoretical_price=1.1,
+        timestamp=datetime(2026, 7, 15, 10, 0, tzinfo=timezone.utc),
+        metadata={"broker_order_id": "45678"},
+    )
+    database.save_live_signal(signal)
+    database.save_live_execution(
+        LiveExecution(
+            signal_id=signal.id,
+            actual_price=1.1,
+            filled_qty=0.5,
+            commission=0.0,
+            timestamp=datetime(2026, 7, 15, 10, 1, tzinfo=timezone.utc),
+            broker_order_id="45678",
+            dedupe_key="ctrader:deal:1",
+        )
+    )
+
+    assert str(signal.id) in database.list_live_signal_ids_for_reconciliation("acc-1")
+
+
+def test_reconciliation_candidates_are_scoped_to_account(isolated_db):
+    database = isolated_db
+    deployment_a = _deployment()
+    deployment_b = LiveDeploymentConfig(
+        **{**deployment_a.model_dump(), "id": str(uuid4()), "account_id": "acc-2"}
+    )
+    database.ensure_live_account("acc-1", "ctrader")
+    database.ensure_live_account("acc-2", "ctrader")
+    database.create_live_deployment(deployment_a)
+    database.create_live_deployment(deployment_b)
+
+    signal_a = LiveSignal(
+        deployment_id=str(deployment_a.id),
+        symbol="EURUSD",
+        action="buy",
+        theoretical_price=1.1,
+        timestamp=datetime.now(timezone.utc),
+    )
+    signal_b = LiveSignal(
+        deployment_id=str(deployment_b.id),
+        symbol="EURUSD",
+        action="sell",
+        theoretical_price=1.1,
+        timestamp=datetime.now(timezone.utc),
+    )
+    database.save_live_signal(signal_a)
+    database.save_live_signal(signal_b)
+
+    assert database.list_live_signal_ids_for_reconciliation("acc-1") == [str(signal_a.id)]
+    assert database.list_live_signal_ids_for_reconciliation("acc-2") == [str(signal_b.id)]
+    assert database.list_live_signal_ids_for_reconciliation("") == []
+
+
+def test_reconciliation_candidates_support_keyset_pagination(isolated_db):
+    database = isolated_db
+    deployment = _deployment()
+    database.ensure_live_account("acc-1", "alpaca")
+    database.create_live_deployment(deployment)
+    timestamps = [
+        datetime(2026, 7, 15, 10, minute, tzinfo=timezone.utc)
+        for minute in range(5)
+    ]
+    signals = []
+    for timestamp in timestamps:
+        signal = LiveSignal(
+            deployment_id=str(deployment.id),
+            symbol="AAPL",
+            action="buy",
+            theoretical_price=200.0,
+            timestamp=timestamp,
+        )
+        database.save_live_signal(signal)
+        signals.append(signal)
+
+    first_page = database.list_live_signal_ids_for_reconciliation("acc-1", limit=2)
+    first_cursor = database.get_live_signal_reconciliation_cursor(first_page[-1])
+    second_page = database.list_live_signal_ids_for_reconciliation(
+        "acc-1", limit=2, before=first_cursor
+    )
+    second_cursor = database.get_live_signal_reconciliation_cursor(second_page[-1])
+    third_page = database.list_live_signal_ids_for_reconciliation(
+        "acc-1", limit=2, before=second_cursor
+    )
+
+    assert first_page == [str(signals[4].id), str(signals[3].id)]
+    assert second_page == [str(signals[2].id), str(signals[1].id)]
+    assert third_page == [str(signals[0].id)]
+    assert len(set(first_page + second_page + third_page)) == 5
+
+
+def test_reconciliation_keyset_is_stable_when_newer_signal_arrives(isolated_db):
+    database = isolated_db
+    deployment = _deployment()
+    database.ensure_live_account("acc-1", "alpaca")
+    database.create_live_deployment(deployment)
+    shared_timestamp = datetime(2026, 7, 15, 10, 0, tzinfo=timezone.utc)
+    original_ids = []
+    for _ in range(4):
+        signal = LiveSignal(
+            deployment_id=str(deployment.id),
+            symbol="AAPL",
+            action="buy",
+            theoretical_price=200.0,
+            timestamp=shared_timestamp,
+        )
+        database.save_live_signal(signal)
+        original_ids.append(str(signal.id))
+
+    first_page = database.list_live_signal_ids_for_reconciliation("acc-1", limit=2)
+    first_cursor = database.get_live_signal_reconciliation_cursor(first_page[-1])
+    newer_signal = LiveSignal(
+        deployment_id=str(deployment.id),
+        symbol="AAPL",
+        action="buy",
+        theoretical_price=201.0,
+        timestamp=shared_timestamp + timedelta(minutes=1),
+    )
+    database.save_live_signal(newer_signal)
+    second_page = database.list_live_signal_ids_for_reconciliation(
+        "acc-1", limit=2, before=first_cursor
+    )
+
+    assert first_page + second_page == sorted(original_ids, reverse=True)
+    assert str(newer_signal.id) not in second_page
+    assert len(set(first_page + second_page)) == 4
 
 
 def test_save_live_execution_is_durable(isolated_db):
@@ -363,13 +1073,55 @@ def test_save_live_execution_skips_duplicate_dedupe_key(isolated_db):
     assert len(rows) == 1
 
 
+def test_live_signal_timestamp_lookup_normalizes_to_utc(isolated_db):
+    database = isolated_db
+
+    assert database.get_live_signal_timestamp("") is None
+    assert database.get_live_signal_timestamp(str(uuid4())) is None
+
+    naive_timestamp = datetime(2026, 7, 15, 10, 30)
+    naive_signal = LiveSignal(
+        deployment_id="dep-naive",
+        symbol="EURUSD",
+        action="buy",
+        theoretical_price=1.1,
+        timestamp=naive_timestamp,
+        metadata={},
+    )
+    database.save_live_signal(naive_signal)
+    assert database.get_live_signal_timestamp(str(naive_signal.id)) == naive_timestamp.replace(
+        tzinfo=timezone.utc
+    )
+
+    plus_two = timezone(timedelta(hours=2))
+    aware_signal = LiveSignal(
+        deployment_id="dep-aware",
+        symbol="EURUSD",
+        action="buy",
+        theoretical_price=1.1,
+        timestamp=datetime(2026, 7, 15, 12, 30, tzinfo=plus_two),
+        metadata={},
+    )
+    database.save_live_signal(aware_signal)
+    assert database.get_live_signal_timestamp(str(aware_signal.id)) == datetime(
+        2026, 7, 15, 10, 30, tzinfo=timezone.utc
+    )
+
+
 def test_broker_order_id_roundtrip_and_missing_execution_lookup(isolated_db):
     database = isolated_db
-    signal = _persist_signal(database)
+    deployment = _deployment()
+    database.ensure_live_account("acc-1", "ctrader")
+    database.create_live_deployment(deployment)
+    signal = LiveSignal(
+        deployment_id=str(deployment.id), symbol="AAPL", action="buy",
+        theoretical_price=100.0, timestamp=datetime.now(timezone.utc), metadata={},
+    )
+    database.save_live_signal(signal)
 
     assert database.set_live_signal_broker_order_id(str(signal.id), "bo-42") is True
-    assert database.find_live_signal_id_by_broker_order_id("bo-42") == str(signal.id)
-    assert database.find_live_signal_id_by_broker_order_id("missing") is None
+    assert database.find_live_signal_id_by_broker_order_id("acc-1", "bo-42") == str(signal.id)
+    assert database.find_live_signal_id_by_broker_order_id("acc-1", "missing") is None
 
     # Signal has no execution yet -> reported for reconciliation.
     assert database.list_live_signal_ids_missing_executions() == [str(signal.id)]
@@ -388,17 +1140,141 @@ def test_broker_order_id_roundtrip_and_missing_execution_lookup(isolated_db):
     assert database.list_live_signal_ids_missing_executions() == []
 
 
+def test_live_execution_filled_qty_sum_tracks_partial_events(isolated_db):
+    database = isolated_db
+    deployment = _deployment()
+    database.ensure_live_account("acc-1", "alpaca")
+    database.create_live_deployment(deployment)
+    signal = LiveSignal(
+        deployment_id=str(deployment.id), symbol="AAPL", action="buy",
+        theoretical_price=100.0, timestamp=datetime.now(timezone.utc), metadata={},
+    )
+    database.save_live_signal(signal)
+    for index, qty in enumerate((1.0, 1.5), start=1):
+        database.save_live_execution(
+            LiveExecution(
+                signal_id=signal.id,
+                actual_price=100.0 + index,
+                filled_qty=qty,
+                commission=0.0,
+                timestamp=datetime.now(timezone.utc),
+                broker_order_id="bo-partial",
+                dedupe_key=f"alpaca:exec:partial-{index}",
+            )
+        )
+
+    assert database.get_live_signal_filled_qty(str(signal.id)) == pytest.approx(2.5)
+    assert database.get_live_signal_filled_qty(str(uuid4())) == 0.0
+
+
+def test_live_execution_cumulative_cap_rejects_delayed_duplicate_fill(isolated_db):
+    database = isolated_db
+    deployment = _deployment()
+    database.ensure_live_account("acc-1", "alpaca")
+    database.create_live_deployment(deployment)
+    signal = LiveSignal(
+        deployment_id=str(deployment.id), symbol="AAPL", action="buy",
+        theoretical_price=100.0, timestamp=datetime.now(timezone.utc), metadata={},
+    )
+    database.save_live_signal(signal)
+    reconciled = LiveExecution(
+        signal_id=signal.id,
+        actual_price=101.0,
+        filled_qty=3.0,
+        commission=0.0,
+        timestamp=datetime.now(timezone.utc),
+        broker_order_id="bo-capped",
+        dedupe_key="alpaca:order:bo-capped:reconciled:3.0",
+    )
+    delayed_stream = LiveExecution(
+        signal_id=signal.id,
+        actual_price=100.0,
+        filled_qty=1.0,
+        commission=0.0,
+        timestamp=datetime.now(timezone.utc),
+        broker_order_id="bo-capped",
+        dedupe_key="alpaca:exec:delayed-first-fill",
+    )
+
+    assert database.save_live_execution_up_to_cumulative(reconciled, 3.0) == pytest.approx(3.0)
+    assert database.save_live_execution_up_to_cumulative(delayed_stream, 1.0) == 0.0
+    assert database.save_live_execution_up_to_cumulative(delayed_stream, 3.0) == 0.0
+    assert database.get_live_signal_filled_qty(str(signal.id)) == pytest.approx(3.0)
+
+
+def test_live_execution_cumulative_cap_serializes_concurrent_writers(isolated_db):
+    database = isolated_db
+    deployment = _deployment()
+    database.ensure_live_account("acc-1", "alpaca")
+    database.create_live_deployment(deployment)
+    signal = LiveSignal(
+        deployment_id=str(deployment.id), symbol="AAPL", action="buy",
+        theoretical_price=100.0, timestamp=datetime.now(timezone.utc), metadata={},
+    )
+    database.save_live_signal(signal)
+
+    def _persist(index: int) -> float:
+        return database.save_live_execution_up_to_cumulative(
+            LiveExecution(
+                signal_id=signal.id,
+                actual_price=100.0 + index,
+                filled_qty=3.0,
+                commission=0.0,
+                timestamp=datetime.now(timezone.utc),
+                broker_order_id="bo-concurrent-cap",
+                dedupe_key=f"alpaca:concurrent:{index}",
+            ),
+            3.0,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(_persist, (1, 2)))
+
+    assert sorted(results) == [0.0, 3.0]
+    assert database.get_live_signal_filled_qty(str(signal.id)) == pytest.approx(3.0)
+
+
+def test_broker_order_id_lookup_is_scoped_to_account(isolated_db):
+    database = isolated_db
+    deployment_a = _deployment()
+    deployment_b = LiveDeploymentConfig(
+        **{**deployment_a.model_dump(), "id": str(uuid4()), "account_id": "acc-2"}
+    )
+    database.ensure_live_account("acc-1", "ctrader")
+    database.ensure_live_account("acc-2", "ctrader")
+    database.create_live_deployment(deployment_a)
+    database.create_live_deployment(deployment_b)
+    signal_a = LiveSignal(
+        deployment_id=str(deployment_a.id), symbol="EURUSD", action="buy",
+        theoretical_price=1.1, timestamp=datetime(2026, 7, 15, 10, 0, tzinfo=timezone.utc),
+        metadata={},
+    )
+    signal_b = LiveSignal(
+        deployment_id=str(deployment_b.id), symbol="EURUSD", action="sell",
+        theoretical_price=1.2, timestamp=datetime(2026, 7, 15, 10, 1, tzinfo=timezone.utc),
+        metadata={},
+    )
+    database.save_live_signal(signal_a)
+    database.save_live_signal(signal_b)
+    assert database.set_live_signal_broker_order_id(str(signal_a.id), "45678") is True
+    assert database.set_live_signal_broker_order_id(str(signal_b.id), "45678") is True
+
+    assert database.find_live_signal_id_by_broker_order_id("acc-1", "45678") == str(signal_a.id)
+    assert database.find_live_signal_id_by_broker_order_id("acc-2", "45678") == str(signal_b.id)
+    assert database.find_live_signal_id_by_broker_order_id("", "45678") is None
+
+
 def test_alpaca_partial_fill_persists_event_qty_not_cumulative(monkeypatch):
     from live_runner import alpaca_adapter as module
 
     adapter = module.AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True)
-    saved: list[LiveExecution] = []
+    saved: list[tuple[LiveExecution, float]] = []
 
-    def _capture(execution: LiveExecution) -> bool:
-        saved.append(execution)
-        return True
+    def _capture(execution: LiveExecution, cumulative_qty: float) -> float:
+        saved.append((execution, cumulative_qty))
+        return execution.filled_qty
 
-    monkeypatch.setattr(module, "save_live_execution", _capture)
+    monkeypatch.setattr(module, "save_live_execution_up_to_cumulative", _capture)
 
     signal_id = str(uuid4())
     update = SimpleNamespace(
@@ -419,9 +1295,53 @@ def test_alpaca_partial_fill_persists_event_qty_not_cumulative(monkeypatch):
     asyncio.run(adapter._on_trade_update(update))
 
     assert len(saved) == 1
-    assert saved[0].filled_qty == 100.0
-    assert saved[0].dedupe_key == "alpaca:exec:exec-9"
-    assert saved[0].broker_order_id == "bo-9"
+    assert saved[0][0].filled_qty == 100.0
+    assert saved[0][0].dedupe_key == "alpaca:exec:exec-9"
+    assert saved[0][0].broker_order_id == "bo-9"
+    assert saved[0][1] == 3500.0
+
+
+def test_alpaca_delayed_stream_fill_is_reported_as_duplicate(monkeypatch):
+    from live_runner import alpaca_adapter as module
+
+    adapter = module.AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True)
+    output = io.StringIO()
+    stdout_handler = next(
+        handler
+        for handler in module.logger.handlers
+        if isinstance(handler, logging.StreamHandler)
+        and not isinstance(handler, logging.FileHandler)
+    )
+    monkeypatch.setattr(stdout_handler, "stream", output)
+    monkeypatch.setattr(
+        module, "save_live_execution_up_to_cumulative", lambda _execution, _cumulative: 0.0
+    )
+    update = SimpleNamespace(
+        event="fill",
+        qty="1",
+        price="50.0",
+        timestamp=datetime.now(timezone.utc),
+        execution_id="exec-delayed",
+        order=SimpleNamespace(
+            client_order_id=str(uuid4()),
+            id="bo-delayed",
+            filled_qty="3",
+            filled_avg_price="50.0",
+            commission=None,
+        ),
+    )
+
+    asyncio.run(adapter._on_trade_update(update))
+
+    records = [
+        json.loads(line)
+        for line in output.getvalue().splitlines()
+        if line.strip()
+    ]
+    assert any(
+        record.get("message") == "Skipped duplicate Alpaca execution fill"
+        for record in records
+    )
 
 
 def test_alpaca_partial_fill_without_event_qty_is_skipped(monkeypatch):
@@ -451,14 +1371,23 @@ def test_alpaca_partial_fill_without_event_qty_is_skipped(monkeypatch):
 def test_alpaca_reconcile_backfills_missing_fill(monkeypatch):
     from live_runner import alpaca_adapter as module
 
-    adapter = module.AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True)
-    signal_id = str(uuid4())
-
-    monkeypatch.setattr(
-        module, "list_live_signal_ids_missing_executions", lambda _limit: [signal_id]
+    adapter = module.AlpacaLiveAdapter(
+        api_key="k", secret_key="s", paper=True, account_id="alpaca-acc-1"
     )
-    saved: list[LiveExecution] = []
-    monkeypatch.setattr(module, "save_live_execution", lambda e: saved.append(e) or True)
+    signal_id = str(uuid4())
+    queried: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        module,
+        "list_live_signal_ids_for_reconciliation",
+        lambda account_id, limit: queried.append((account_id, limit)) or [signal_id],
+    )
+    monkeypatch.setattr(module, "get_live_signal_filled_qty", lambda _signal_id: 0.0)
+    saved: list[tuple[LiveExecution, float]] = []
+    monkeypatch.setattr(
+        module,
+        "save_live_execution_up_to_cumulative",
+        lambda e, cumulative: saved.append((e, cumulative)) or e.filled_qty,
+    )
 
     _client = SimpleNamespace(
         get_order_by_client_id=lambda _cid: SimpleNamespace(
@@ -473,13 +1402,174 @@ def test_alpaca_reconcile_backfills_missing_fill(monkeypatch):
     recovered = asyncio.run(adapter.reconcile_executions())
 
     assert recovered == 1
-    assert saved[0].filled_qty == 25.0
-    assert saved[0].broker_order_id == "bo-77"
-    assert saved[0].dedupe_key == "alpaca:order:bo-77:reconciled"
-    assert str(saved[0].signal_id) == signal_id
+    assert queried == [("alpaca-acc-1", 200)]
+    assert saved[0][0].filled_qty == 25.0
+    assert saved[0][0].broker_order_id == "bo-77"
+    assert saved[0][0].dedupe_key == "alpaca:order:bo-77:reconciled:25.0"
+    assert str(saved[0][0].signal_id) == signal_id
+    assert saved[0][1] == 25.0
+
+
+def test_alpaca_reconcile_pages_past_candidate_limit(monkeypatch):
+    from live_runner import alpaca_adapter as module
+
+    adapter = module.AlpacaLiveAdapter(
+        api_key="k", secret_key="s", paper=True, account_id="alpaca-acc-1"
+    )
+    signal_ids = [str(uuid4()) for _ in range(5)]
+    cursors = {
+        signal_id: (datetime(2026, 7, 15, 10, minute, tzinfo=timezone.utc), signal_id)
+        for minute, signal_id in enumerate(signal_ids)
+    }
+    queried: list[tuple[str, int, tuple[datetime, str] | None]] = []
+
+    def list_page(account_id, limit, *, before=None):
+        queried.append((account_id, limit, before))
+        if before is None:
+            return signal_ids[:2]
+        if before == cursors[signal_ids[1]]:
+            return signal_ids[2:4]
+        if before == cursors[signal_ids[3]]:
+            return signal_ids[4:]
+        return []
+
+    monkeypatch.setattr(module, "list_live_signal_ids_for_reconciliation", list_page)
+    monkeypatch.setattr(
+        module,
+        "get_live_signal_reconciliation_cursor",
+        lambda signal_id: cursors[signal_id],
+        raising=False,
+    )
+    monkeypatch.setattr(module, "get_live_signal_filled_qty", lambda _signal_id: 0.0)
+    monkeypatch.setattr(
+        module, "save_live_execution_up_to_cumulative", lambda execution, _cap: execution.filled_qty
+    )
+    broker_queries: list[str] = []
+    adapter._trading_client = SimpleNamespace(
+        get_order_by_client_id=lambda signal_id: broker_queries.append(signal_id)
+        or SimpleNamespace(
+            id=f"order-{signal_id}",
+            filled_qty="1",
+            filled_avg_price="200",
+            filled_at=datetime.now(timezone.utc),
+        )
+    )
+
+    recovered = asyncio.run(adapter.reconcile_executions(max_signals=2))
+
+    assert recovered == 5
+    assert broker_queries == signal_ids
+    assert queried == [
+        ("alpaca-acc-1", 2, None),
+        ("alpaca-acc-1", 2, cursors[signal_ids[1]]),
+        ("alpaca-acc-1", 2, cursors[signal_ids[3]]),
+    ]
+
+
+def test_alpaca_reconcile_backfills_only_missing_partial_fill_delta(monkeypatch):
+    from live_runner import alpaca_adapter as module
+
+    adapter = module.AlpacaLiveAdapter(
+        api_key="k", secret_key="s", paper=True, account_id="alpaca-acc-1"
+    )
+    signal_id = str(uuid4())
+    queried: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        module,
+        "list_live_signal_ids_for_reconciliation",
+        lambda account_id, limit: queried.append((account_id, limit)) or [signal_id],
+        raising=False,
+    )
+    monkeypatch.setattr(
+        module, "get_live_signal_filled_qty", lambda _signal_id: 1.0, raising=False
+    )
+    saved: list[tuple[LiveExecution, float]] = []
+    monkeypatch.setattr(
+        module,
+        "save_live_execution_up_to_cumulative",
+        lambda e, cumulative: saved.append((e, cumulative)) or e.filled_qty,
+    )
+    adapter._trading_client = SimpleNamespace(
+        get_order_by_client_id=lambda _cid: SimpleNamespace(
+            id="bo-partial-recovery",
+            filled_qty="3",
+            filled_avg_price="101.5",
+            filled_at=datetime.now(timezone.utc),
+        )
+    )
+
+    recovered = asyncio.run(adapter.reconcile_executions())
+
+    assert queried == [("alpaca-acc-1", 200)]
+    assert recovered == 1
+    assert len(saved) == 1
+    assert saved[0][0].filled_qty == pytest.approx(2.0)
+    assert saved[0][0].dedupe_key == "alpaca:order:bo-partial-recovery:reconciled:3.0"
+    assert saved[0][1] == 3.0
+
+
+@pytest.mark.parametrize("local_filled_qty", [3.0, 4.0])
+def test_alpaca_reconcile_skips_non_positive_partial_fill_delta(
+    monkeypatch, local_filled_qty
+):
+    from live_runner import alpaca_adapter as module
+
+    adapter = module.AlpacaLiveAdapter(
+        api_key="k", secret_key="s", paper=True, account_id="alpaca-acc-1"
+    )
+    signal_id = str(uuid4())
+    monkeypatch.setattr(
+        module,
+        "list_live_signal_ids_for_reconciliation",
+        lambda _account_id, _limit: [signal_id],
+    )
+    monkeypatch.setattr(
+        module, "get_live_signal_filled_qty", lambda _signal_id: local_filled_qty
+    )
+    saved: list[LiveExecution] = []
+    monkeypatch.setattr(module, "save_live_execution", lambda e: saved.append(e) or True)
+    adapter._trading_client = SimpleNamespace(
+        get_order_by_client_id=lambda _cid: SimpleNamespace(
+            id="bo-no-delta",
+            filled_qty="3",
+            filled_avg_price="101.5",
+            filled_at=datetime.now(timezone.utc),
+        )
+    )
+
+    recovered = asyncio.run(adapter.reconcile_executions())
+
+    assert recovered == 0
+    assert saved == []
 
 
 # ── cTrader adapter specific tests ──────────────────────────────────────────────
+
+
+def test_ctrader_fill_fallback_lookup_uses_canonical_account_scope(monkeypatch):
+    from live_runner import ctrader_adapter as module
+
+    adapter = module.CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token",
+        account_id="123", account_config_id="local-account-123",
+    )
+    adapter._ProtoOAExecutionType = SimpleNamespace(ORDER_FILLED=1, ORDER_PARTIAL_FILL=2)
+    queried: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        module,
+        "find_live_signal_id_by_broker_order_id",
+        lambda account_id, order_id: queried.append((account_id, order_id)) or None,
+    )
+    event = SimpleNamespace(
+        executionType=1,
+        order=SimpleNamespace(orderId=45678, clientOrderId=""),
+        deal=None,
+        HasField=lambda field: field == "order",
+    )
+
+    asyncio.run(adapter._persist_execution_event(event))
+
+    assert queried == [("local-account-123", "45678")]
 
 
 def test_ctrader_reconcile_backfills_missing_fill(monkeypatch):
@@ -493,8 +1583,11 @@ def test_ctrader_reconcile_backfills_missing_fill(monkeypatch):
     adapter._authenticated = True
     signal_id = str(uuid4())
 
+    queried_scopes: list[tuple[str, int]] = []
     monkeypatch.setattr(
-        module, "list_live_signal_ids_missing_executions", lambda _limit: [signal_id]
+        module,
+        "list_live_signal_ids_for_reconciliation",
+        lambda account_id, limit: queried_scopes.append((account_id, limit)) or [signal_id],
     )
     monkeypatch.setattr(
         module, "get_live_signal_broker_order_id", lambda _sid: "45678"
@@ -532,7 +1625,461 @@ def test_ctrader_reconcile_backfills_missing_fill(monkeypatch):
     assert len(saved) == 1
     assert saved[0].filled_qty == 5000.0
     assert saved[0].broker_order_id == "45678"
-    assert "ctrader:deal:999:reconciled" in saved[0].dedupe_key
+    assert saved[0].dedupe_key == "ctrader:deal:999"
+    assert queried_scopes == [("123", 200)]
+
+
+def test_ctrader_reconcile_pages_past_candidate_limit(monkeypatch):
+    from live_runner import ctrader_adapter as module
+
+    adapter = module.CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="123",
+    )
+    adapter._client = object()
+    adapter._authenticated = True
+    signal_ids = [str(uuid4()) for _ in range(5)]
+    cursors = {
+        signal_id: (datetime(2026, 7, 15, 10, minute, tzinfo=timezone.utc), signal_id)
+        for minute, signal_id in enumerate(signal_ids)
+    }
+    queried: list[tuple[str, int, tuple[datetime, str] | None]] = []
+
+    def list_page(account_id, limit, *, before=None):
+        queried.append((account_id, limit, before))
+        if before is None:
+            return signal_ids[:2]
+        if before == cursors[signal_ids[1]]:
+            return signal_ids[2:4]
+        if before == cursors[signal_ids[3]]:
+            return signal_ids[4:]
+        return []
+
+    monkeypatch.setattr(module, "list_live_signal_ids_for_reconciliation", list_page)
+    monkeypatch.setattr(
+        module,
+        "get_live_signal_reconciliation_cursor",
+        lambda signal_id: cursors[signal_id],
+        raising=False,
+    )
+    order_ids = {signal_id: str(45000 + index) for index, signal_id in enumerate(signal_ids)}
+    monkeypatch.setattr(
+        module, "get_live_signal_broker_order_id", lambda signal_id: order_ids[signal_id]
+    )
+
+    class _OrderDetailsReq:
+        def __init__(self) -> None:
+            self.ctidTraderAccountId = 0
+            self.orderId = 0
+
+    class _OrderDetailsRes:
+        deal = []
+
+    requested_order_ids: list[int] = []
+
+    async def _send(request, *, timeout_seconds=15):
+        requested_order_ids.append(request.orderId)
+        return _OrderDetailsRes()
+
+    adapter._send_request_with_refresh_retry = _send
+    adapter._ProtoOAOrderDetailsReq = _OrderDetailsReq
+    adapter._ProtoOAOrderDetailsRes = _OrderDetailsRes
+    adapter._ProtoOADealStatus = SimpleNamespace(FILLED=1, PARTIALLY_FILLED=2)
+
+    recovered = asyncio.run(adapter.reconcile_executions(max_signals=2))
+
+    assert recovered == 0
+    assert requested_order_ids == [int(order_ids[signal_id]) for signal_id in signal_ids]
+    assert queried == [
+        ("123", 2, None),
+        ("123", 2, cursors[signal_ids[1]]),
+        ("123", 2, cursors[signal_ids[3]]),
+    ]
+
+
+def test_ctrader_reconcile_recovers_accepted_order_before_local_id_persistence(monkeypatch):
+    """Restart recovery finds an accepted order by the stable signal client id."""
+    from live_runner import ctrader_adapter as module
+
+    adapter = module.CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="123",
+    )
+    adapter._client = object()
+    adapter._authenticated = True
+    signal_id = str(uuid4())
+    signal_timestamp = datetime(2026, 7, 15, 10, 0, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(
+        module, "list_live_signal_ids_for_reconciliation", lambda _account_id, _limit: [signal_id]
+    )
+    monkeypatch.setattr(module, "get_live_signal_broker_order_id", lambda _sid: "")
+    monkeypatch.setattr(
+        module,
+        "get_live_signal_timestamp",
+        lambda _sid: signal_timestamp,
+        raising=False,
+    )
+    persisted_order_ids: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        module,
+        "set_live_signal_broker_order_id",
+        lambda sid, oid: persisted_order_ids.append((sid, oid)) or True,
+    )
+    saved: list[LiveExecution] = []
+    monkeypatch.setattr(module, "save_live_execution", lambda e: saved.append(e) or True)
+
+    class _OrderListReq:
+        def __init__(self) -> None:
+            self.ctidTraderAccountId = 0
+            self.fromTimestamp = 0
+            self.toTimestamp = 0
+
+    class _OrderDetailsReq:
+        def __init__(self) -> None:
+            self.ctidTraderAccountId = 0
+            self.orderId = 0
+
+    class _OrderListRes:
+        def __init__(self) -> None:
+            self.order = [SimpleNamespace(orderId=45678, clientOrderId=signal_id)]
+            self.hasMore = False
+
+    deal = SimpleNamespace(
+        dealId=999,
+        dealStatus=1,
+        filledVolume=5000,
+        executionPrice=1.2345,
+        executionTimestamp=1700000000000,
+        commission=0.0,
+    )
+
+    class _OrderDetailsRes:
+        def __init__(self) -> None:
+            self.deal = [deal]
+
+    requests: list[object] = []
+
+    async def _send(request, *, timeout_seconds=15):
+        requests.append(request)
+        if isinstance(request, _OrderListReq):
+            return _OrderListRes()
+        if isinstance(request, _OrderDetailsReq):
+            return _OrderDetailsRes()
+        raise AssertionError(f"Unexpected request: {type(request).__name__}")
+
+    adapter._send_request_with_refresh_retry = _send
+    adapter._ProtoOAOrderListReq = _OrderListReq
+    adapter._ProtoOAOrderListRes = _OrderListRes
+    adapter._ProtoOAOrderDetailsReq = _OrderDetailsReq
+    adapter._ProtoOAOrderDetailsRes = _OrderDetailsRes
+    adapter._ProtoOADealStatus = SimpleNamespace(FILLED=1, PARTIALLY_FILLED=2)
+
+    recovered = asyncio.run(adapter.reconcile_executions())
+
+    assert recovered == 1
+    assert persisted_order_ids == [(signal_id, "45678")]
+    assert adapter._order_id_to_signal_id == {45678: signal_id}
+    assert len(requests) == 2
+    lookup = requests[0]
+    assert isinstance(lookup, _OrderListReq)
+    assert lookup.ctidTraderAccountId == 123
+    assert lookup.fromTimestamp < int(signal_timestamp.timestamp() * 1000)
+    assert lookup.toTimestamp > int(signal_timestamp.timestamp() * 1000)
+    assert saved[0].signal_id == UUID(signal_id)
+    assert saved[0].broker_order_id == "45678"
+    assert saved[0].dedupe_key == "ctrader:deal:999"
+
+
+def test_ctrader_discord_redelivery_uses_canonical_signal_without_resubmitting(monkeypatch):
+    """A repeated Discord message with a new UUID must reuse the canonical order."""
+    from live_runner import ctrader_adapter as module
+
+    adapter = module.CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="123",
+    )
+    adapter._client = object()
+    adapter._connected = True
+    adapter._authenticated = True
+    adapter._symbol_name_to_id = {"EURUSD": 1}
+    canonical_signal_id = str(uuid4())
+    signal = LiveSignal(
+        id=uuid4(),
+        deployment_id="dep-1",
+        symbol="EURUSD",
+        action="buy",
+        theoretical_price=1.1,
+        timestamp=datetime(2026, 7, 15, 10, 0, tzinfo=timezone.utc),
+        metadata={"qty": 1.0, "discord_message_id": "discord-123"},
+    )
+
+    async def _balance() -> tuple[float, float]:
+        return 10_000.0, 10_000.0
+
+    adapter.get_balance = _balance
+    monkeypatch.setattr(
+        module,
+        "size_live_signal",
+        lambda _signal, *, account_balance: SimpleNamespace(risk_percent=0.01),
+    )
+    monkeypatch.setattr(
+        module, "get_live_signal_broker_order_id",
+        lambda sid: "45678" if sid == canonical_signal_id else "",
+    )
+    monkeypatch.setattr(module, "get_live_signal_timestamp", lambda _sid: None)
+    monkeypatch.setattr(
+        module, "save_live_signal", lambda _signal: (canonical_signal_id, False)
+    )
+
+    async def _unexpected_send(*_args, **_kwargs):
+        raise AssertionError("Discord redelivery submitted a second broker order")
+
+    adapter._send_request_with_refresh_retry = _unexpected_send
+
+    assert asyncio.run(adapter.submit_order(signal)) == "45678"
+    assert adapter._order_id_to_signal_id == {45678: canonical_signal_id}
+
+
+def test_ctrader_redelivery_with_persisted_order_id_needs_no_broker_connection(
+    monkeypatch,
+):
+    """Local broker confirmation must short-circuit even while broker is unavailable."""
+    from live_runner import ctrader_adapter as module
+
+    adapter = module.CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="123",
+    )
+    signal = LiveSignal(
+        id=uuid4(),
+        deployment_id="dep-1",
+        symbol="EURUSD",
+        action="buy",
+        theoretical_price=1.1,
+        timestamp=datetime(2026, 7, 15, 10, 0, tzinfo=timezone.utc),
+        metadata={"qty": 1.0},
+    )
+    monkeypatch.setattr(
+        module, "get_live_signal_broker_order_id", lambda _sid: "45678"
+    )
+
+    async def _unexpected_connect():
+        raise AssertionError("persisted order redelivery attempted broker connection")
+
+    adapter.connect = _unexpected_connect
+
+    broker_order_id = asyncio.run(adapter.submit_order(signal))
+
+    assert broker_order_id == "45678"
+    assert adapter._order_id_to_signal_id == {45678: str(signal.id)}
+
+
+def test_ctrader_redelivery_recovers_accepted_order_without_resubmitting(monkeypatch):
+    """A persisted signal with an accepted broker order must not submit twice."""
+    from live_runner import ctrader_adapter as module
+
+    adapter = module.CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="123",
+    )
+    adapter._client = object()
+    adapter._connected = True
+    adapter._authenticated = True
+    adapter._symbol_name_to_id = {"EURUSD": 1}
+    signal = LiveSignal(
+        id=uuid4(),
+        deployment_id="dep-1",
+        symbol="EURUSD",
+        action="buy",
+        theoretical_price=1.1,
+        timestamp=datetime(2026, 7, 15, 10, 0, tzinfo=timezone.utc),
+        metadata={"qty": 1.0},
+    )
+
+    async def _balance() -> tuple[float, float]:
+        return 10_000.0, 10_000.0
+
+    adapter.get_balance = _balance
+    monkeypatch.setattr(
+        module,
+        "size_live_signal",
+        lambda _signal, *, account_balance: SimpleNamespace(risk_percent=0.01),
+    )
+    monkeypatch.setattr(module, "save_live_signal", lambda _signal: None)
+    monkeypatch.setattr(module, "get_live_signal_broker_order_id", lambda _sid: "")
+    monkeypatch.setattr(
+        module,
+        "get_live_signal_timestamp",
+        lambda _sid: signal.timestamp,
+        raising=False,
+    )
+    persisted_order_ids: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        module,
+        "set_live_signal_broker_order_id",
+        lambda sid, oid: persisted_order_ids.append((sid, oid)) or True,
+    )
+
+    class _OrderListReq:
+        def __init__(self) -> None:
+            self.ctidTraderAccountId = 0
+            self.fromTimestamp = 0
+            self.toTimestamp = 0
+
+    class _OrderListRes:
+        def __init__(self) -> None:
+            self.order = [
+                SimpleNamespace(orderId=45678, clientOrderId=str(signal.id))
+            ]
+            self.hasMore = False
+
+    class _NewOrderReq:
+        def __init__(self) -> None:
+            self.ctidTraderAccountId = 0
+            self.symbolId = 0
+            self.orderType = 0
+            self.tradeSide = 0
+            self.volume = 0
+            self.timeInForce = 0
+            self.clientOrderId = ""
+
+    async def _send(request, *, timeout_seconds=15):
+        if isinstance(request, _OrderListReq):
+            return _OrderListRes()
+        if isinstance(request, _NewOrderReq):
+            raise AssertionError("redelivery submitted a duplicate broker order")
+        raise AssertionError(f"Unexpected request: {type(request).__name__}")
+
+    adapter._send_request_with_refresh_retry = _send
+    adapter._ProtoOAOrderListReq = _OrderListReq
+    adapter._ProtoOAOrderListRes = _OrderListRes
+    adapter._ProtoOANewOrderReq = _NewOrderReq
+    adapter._ProtoOAOrderErrorEvent = type("_OrderError", (), {})
+    adapter._ProtoOAOrderType = SimpleNamespace(MARKET=1)
+    adapter._ProtoOATradeSide = SimpleNamespace(BUY=1, SELL=2)
+    adapter._ProtoOATimeInForce = SimpleNamespace(IMMEDIATE_OR_CANCEL=1)
+
+    broker_order_id = asyncio.run(adapter.submit_order(signal))
+
+    assert broker_order_id == "45678"
+    assert persisted_order_ids == [(str(signal.id), "45678")]
+    assert adapter._order_id_to_signal_id == {45678: str(signal.id)}
+
+
+def test_ctrader_accepted_order_fails_closed_when_local_id_persistence_fails(monkeypatch):
+    """Broker acceptance must not be reported as durable when DB confirmation fails."""
+    from live_runner import ctrader_adapter as module
+
+    adapter = module.CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="123",
+    )
+    adapter._client = object()
+    adapter._connected = True
+    adapter._authenticated = True
+    adapter._symbol_name_to_id = {"EURUSD": 1}
+    signal = LiveSignal(
+        id=uuid4(),
+        deployment_id="dep-1",
+        symbol="EURUSD",
+        action="buy",
+        theoretical_price=1.1,
+        timestamp=datetime(2026, 7, 15, 10, 0, tzinfo=timezone.utc),
+        metadata={"qty": 1.0},
+    )
+
+    async def _balance() -> tuple[float, float]:
+        return 10_000.0, 10_000.0
+
+    adapter.get_balance = _balance
+    monkeypatch.setattr(
+        module,
+        "size_live_signal",
+        lambda _signal, *, account_balance: SimpleNamespace(risk_percent=0.01),
+    )
+    monkeypatch.setattr(module, "get_live_signal_broker_order_id", lambda _sid: "")
+    monkeypatch.setattr(module, "get_live_signal_timestamp", lambda _sid: None)
+    monkeypatch.setattr(module, "save_live_signal", lambda _signal: (str(signal.id), True))
+    monkeypatch.setattr(
+        module, "set_live_signal_broker_order_id", lambda _sid, _order_id: False
+    )
+
+    class _NewOrderReq:
+        def __init__(self) -> None:
+            self.ctidTraderAccountId = 0
+            self.symbolId = 0
+            self.orderType = 0
+            self.tradeSide = 0
+            self.volume = 0
+            self.timeInForce = 0
+            self.clientOrderId = ""
+
+    class _AcceptedOrderRes:
+        orderId = 45678
+
+    async def _send(request, *, timeout_seconds=20, _depth=0):
+        assert isinstance(request, _NewOrderReq)
+        return _AcceptedOrderRes()
+
+    adapter._send_request_with_refresh_retry = _send
+    adapter._ProtoOANewOrderReq = _NewOrderReq
+    adapter._ProtoOAExecutionEvent = type("_ExecutionEvent", (), {})
+    adapter._ProtoOAOrderErrorEvent = type("_OrderError", (), {})
+    adapter._ProtoOAOrderType = SimpleNamespace(MARKET=1)
+    adapter._ProtoOATradeSide = SimpleNamespace(BUY=1, SELL=2)
+    adapter._ProtoOATimeInForce = SimpleNamespace(IMMEDIATE_OR_CANCEL=1)
+
+    with pytest.raises(RuntimeError, match="persist cTrader broker order id"):
+        asyncio.run(adapter.submit_order(signal))
+
+    assert adapter._order_id_to_signal_id == {}
+
+
+@pytest.mark.parametrize(
+    ("orders", "has_more"),
+    [
+        ([], False),
+        (
+            [
+                SimpleNamespace(orderId=45678, clientOrderId="signal-1"),
+                SimpleNamespace(orderId=45679, clientOrderId="signal-1"),
+            ],
+            False,
+        ),
+        ([SimpleNamespace(orderId=45678, clientOrderId="signal-1")], True),
+    ],
+)
+def test_ctrader_order_recovery_fails_closed_when_match_is_not_unique(
+    orders, has_more
+):
+    """Zero, duplicate, or incomplete broker results must never select an order."""
+    from live_runner import ctrader_adapter as module
+
+    adapter = module.CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="123",
+    )
+
+    class _OrderListReq:
+        def __init__(self) -> None:
+            self.ctidTraderAccountId = 0
+            self.fromTimestamp = 0
+            self.toTimestamp = 0
+
+    class _OrderListRes:
+        def __init__(self) -> None:
+            self.order = orders
+            self.hasMore = has_more
+
+    async def _send(request, *, timeout_seconds=15):
+        assert isinstance(request, _OrderListReq)
+        return _OrderListRes()
+
+    adapter._send_request_with_refresh_retry = _send
+    adapter._ProtoOAOrderListReq = _OrderListReq
+    adapter._ProtoOAOrderListRes = _OrderListRes
+
+    recovered = asyncio.run(
+        adapter._recover_broker_order_id(
+            "signal-1", datetime(2026, 7, 15, 10, 0, tzinfo=timezone.utc)
+        )
+    )
+
+    assert recovered is None
 
 
 def test_ctrader_reconcile_skips_signals_without_broker_order_id(monkeypatch):
@@ -547,12 +2094,13 @@ def test_ctrader_reconcile_skips_signals_without_broker_order_id(monkeypatch):
     signal_id = str(uuid4())
 
     monkeypatch.setattr(
-        module, "list_live_signal_ids_missing_executions", lambda _limit: [signal_id]
+        module, "list_live_signal_ids_for_reconciliation", lambda _account_id, _limit: [signal_id]
     )
     # Return empty string for broker_order_id -> signal never reached broker
     monkeypatch.setattr(
         module, "get_live_signal_broker_order_id", lambda _sid: ""
     )
+    monkeypatch.setattr(module, "get_live_signal_timestamp", lambda _sid: None)
     saved: list[LiveExecution] = []
     monkeypatch.setattr(module, "save_live_execution", lambda e: saved.append(e) or True)
 
@@ -574,7 +2122,7 @@ def test_ctrader_reconcile_skips_non_numeric_broker_order_ids(monkeypatch):
     signal_id = str(uuid4())
 
     monkeypatch.setattr(
-        module, "list_live_signal_ids_missing_executions", lambda _limit: [signal_id]
+        module, "list_live_signal_ids_for_reconciliation", lambda _account_id, _limit: [signal_id]
     )
     # Alpaca UUID format - not numeric, should be skipped
     monkeypatch.setattr(

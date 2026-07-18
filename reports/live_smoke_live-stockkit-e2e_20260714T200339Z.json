@@ -1,0 +1,54 @@
+{
+  "checks": [
+    {
+      "details": {
+        "account_id": "PA3E767TJ91D",
+        "asset_class": "assetclass.us_equity",
+        "asset_status": "assetstatus.active",
+        "asset_tradable": true,
+        "broker_order_ids": [],
+        "clock_timestamp": "2026-07-14T16:03:24.397901-04:00",
+        "clock_timestamp_et": "2026-07-14T16:03:24.397901-04:00",
+        "error": "",
+        "extended_hours": false,
+        "filled_qty": 0.0,
+        "market_closed_skipped": true,
+        "next_open": "2026-07-15T09:30:00-04:00",
+        "paper": true,
+        "premarket_eligible": false,
+        "premarket_window": false,
+        "regular_market_open": false,
+        "remaining_qty": 0.0,
+        "status": "skipped (market closed)",
+        "stockkit_route": "nitro",
+        "symbol": "AAPL"
+      },
+      "error": "",
+      "name": "alpaca-stockkit-e2e",
+      "ok": true
+    },
+    {
+      "details": {
+        "account_id": "47644617",
+        "balance": 99999.6,
+        "broker_order_ids": [
+          "27711767"
+        ],
+        "close_response": "ProtoOAExecutionEvent",
+        "error": "",
+        "filled_volume": 100000,
+        "position_id": 38857780,
+        "remaining_volume": 0,
+        "status": "passed",
+        "symbol": "EURUSD"
+      },
+      "error": "",
+      "name": "ctrader-strategy-e2e",
+      "ok": true
+    }
+  ],
+  "finished_at": "2026-07-14T20:03:39.059626+00:00",
+  "mode": "live-stockkit-e2e",
+  "ok": true,
+  "started_at": "2026-07-14T20:03:23.041340+00:00"
+}
