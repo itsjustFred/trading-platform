@@ -9941,13 +9941,24 @@ async def invalidate_data_cache(
     )
 
 
-@app.post("/api/data/download", response_model=dict[str, Any])
-async def data_download(payload: DataDownloadRequest) -> dict[str, Any]:
-    source = str(payload.source or "dukascopy").strip().lower()
-    symbols = payload.symbols
-    timeframes = payload.timeframes
-    start = payload.start
-    end = payload.end
+@dataclass(frozen=True)
+class _PreparedDownloadRequest:
+    source: str
+    symbols: str
+    timeframes: str
+    start: str
+    end: str
+    offer_side: str
+    merge_tick: bool
+    merge_s1: bool
+    batch_size: int
+    pause_ms: int
+    query_timeout_seconds: int
+    symbol_list: list[str]
+    timeframe_list: list[str]
+
+
+def _resolve_download_offer_side(payload: DataDownloadRequest) -> str:
     provided_fields = (
         payload.model_fields_set
         if hasattr(payload, "model_fields_set")
@@ -9959,156 +9970,211 @@ async def data_download(payload: DataDownloadRequest) -> dict[str, Any]:
     offer_side = str(offer_side_value or "bid").strip().lower()
     if offer_side not in {"bid", "ask", "both"}:
         raise HTTPException(status_code=400, detail="offer_side must be one of: bid, ask, both")
-    merge_tick = bool(payload.merge_tick or payload.merge_bid_ask)
-    merge_s1 = bool(payload.merge_s1 or payload.merge_bid_ask)
-    batch_size = _safe_int(payload.batch_size if payload.batch_size is not None else payload.concurrency, 10)
-    pause_ms = _safe_int(payload.pause_ms, 1000)
-    query_timeout_seconds = _safe_int(payload.query_timeout_seconds, 900)
-    symbol_list = _parse_symbol_list(symbols)
-    timeframe_list = [
-        _normalize_dukascopy_genesis_timeframe(timeframe)
-        for timeframe in _parse_timeframe_list(timeframes)
-    ]
+    return offer_side
 
-    if batch_size < 1 or batch_size > 50:
+
+def _validate_download_limits(request: _PreparedDownloadRequest) -> None:
+    if request.batch_size < 1 or request.batch_size > 50:
         raise HTTPException(status_code=400, detail="batch_size must be between 1 and 50")
-    if pause_ms < 0 or pause_ms > 60000:
+    if request.pause_ms < 0 or request.pause_ms > 60000:
         raise HTTPException(status_code=400, detail="pause_ms must be between 0 and 60000")
-    if source in {"dukascopy", "jforex"} and (
-        query_timeout_seconds < 30 or query_timeout_seconds > 7200
+    if request.source in {"dukascopy", "jforex"} and (
+        request.query_timeout_seconds < 30 or request.query_timeout_seconds > 7200
     ):
-        raise HTTPException(status_code=400, detail="query_timeout_seconds must be between 30 and 7200")
-
-    if source in {"dukascopy", "jforex"} and start:
-        genesis_index = _load_dukascopy_genesis()
-        too_early: dict[str, str] = {}
-        for symbol in symbol_list:
-            symbol_data = genesis_index.get(symbol, {})
-            for timeframe in timeframe_list:
-                genesis = symbol_data.get(timeframe)
-                if genesis and start < genesis:
-                    too_early[f"{symbol}/{timeframe}"] = genesis
-        if too_early:
-            details = ", ".join(
-                f"{symbol_tf} >= {genesis}" for symbol_tf, genesis in sorted(too_early.items())
-            )
-            raise HTTPException(
-                status_code=400,
-                detail=f"Start date {start} precedes Dukascopy genesis for: {details}",
-            )
-
-    task_id = str(uuid.uuid4())
-    name, description = _download_task_labels(source, symbol_list, timeframe_list)
-
-    if source in {"dukascopy", "jforex"}:
-        source_label = "dukascopy" if source == "dukascopy" else "jforex"
-        normalized_symbols = ",".join(symbol_list)
-        normalized_timeframes = ",".join(timeframe_list)
-        cmd = [
-            sys.executable,
-            "-u",
-            "-m",
-            "data_tools.downloaders.jforex_dl",
-            "--symbols",
-            normalized_symbols,
-            "--timeframes",
-            normalized_timeframes,
-            "--query-timeout-seconds",
-            str(query_timeout_seconds),
-        ]
-        if start:
-            cmd.extend(["--start", start])
-        if end:
-            cmd.extend(["--end", end])
-        if offer_side:
-            cmd.extend(["--price-type", offer_side])
-
-        total_items = max(len(symbol_list) * len(timeframe_list), 1)
-        result = _start_jforex_task(
-            task_id,
-            cmd,
-            source_label=source_label,
-            allow_native_fallback=(source_label == "dukascopy"),
-            symbols=symbol_list,
-            timeframes=timeframe_list,
-            start=start or None,
-            end=end or None,
-            offer_side=offer_side,
-            merge_tick=merge_tick,
-            merge_s1=merge_s1,
-            batch_size=batch_size,
-            pause_ms=pause_ms,
-            query_timeout_seconds=query_timeout_seconds,
-            total_items=total_items,
-            name=name,
-            description=description,
+        raise HTTPException(
+            status_code=400, detail="query_timeout_seconds must be between 30 and 7200"
         )
-        if result.get("coalesced"):
-            return result
-        _apply_recovery_data_metadata(
-            task_id,
-            command=[str(part) for part in cmd],
-            downloader=source_label,
-            symbols=symbol_list,
-            timeframes=timeframe_list,
-            start=start or None,
-            end=end or None,
-            offer_side=offer_side,
-            price_type=offer_side,
-            merge_tick=merge_tick,
-            merge_s1=merge_s1,
-            batch_size=batch_size,
-            pause_ms=pause_ms,
-            query_timeout_seconds=query_timeout_seconds,
-        )
-        return result
 
-    if source in {"yfinance", "huggingface", "alpaca"}:
-        module_name = {
-            "yfinance": "data_tools.downloaders.yfinance_dl",
-            "huggingface": "data_tools.downloaders.huggingface_dl",
-            "alpaca": "data_tools.downloaders.alpaca_dl",
-        }[source]
-        cmd = [
-            sys.executable,
-            "-u",
-            "-m",
-            module_name,
-            "--symbols",
-            symbols,
-            "--timeframes",
-            timeframes,
-        ]
-        if start:
-            cmd.extend(["--start", start])
-        if end:
-            cmd.extend(["--end", end])
-    elif source == "dolthub":
-        cmd = [sys.executable, "-u", "-m", "data_tools.dolthub_manager", "update"]
-    else:
-        raise HTTPException(status_code=400, detail="Unknown source")
 
-    total_items = max(len(symbol_list) * len(timeframe_list), 1)
-    result = _start_data_task(
+def _validate_download_genesis(request: _PreparedDownloadRequest) -> None:
+    if request.source not in {"dukascopy", "jforex"} or not request.start:
+        return
+
+    genesis_index = _load_dukascopy_genesis()
+    too_early: dict[str, str] = {}
+    for symbol in request.symbol_list:
+        symbol_data = genesis_index.get(symbol, {})
+        for timeframe in request.timeframe_list:
+            genesis = symbol_data.get(timeframe)
+            if genesis and request.start < genesis:
+                too_early[f"{symbol}/{timeframe}"] = genesis
+    if not too_early:
+        return
+
+    details = ", ".join(
+        f"{symbol_tf} >= {genesis}" for symbol_tf, genesis in sorted(too_early.items())
+    )
+    raise HTTPException(
+        status_code=400,
+        detail=f"Start date {request.start} precedes Dukascopy genesis for: {details}",
+    )
+
+
+def _prepare_download_request(payload: DataDownloadRequest) -> _PreparedDownloadRequest:
+    request = _PreparedDownloadRequest(
+        source=str(payload.source or "dukascopy").strip().lower(),
+        symbols=payload.symbols,
+        timeframes=payload.timeframes,
+        start=payload.start,
+        end=payload.end,
+        offer_side=_resolve_download_offer_side(payload),
+        merge_tick=bool(payload.merge_tick or payload.merge_bid_ask),
+        merge_s1=bool(payload.merge_s1 or payload.merge_bid_ask),
+        batch_size=_safe_int(
+            payload.batch_size if payload.batch_size is not None else payload.concurrency, 10
+        ),
+        pause_ms=_safe_int(payload.pause_ms, 1000),
+        query_timeout_seconds=_safe_int(payload.query_timeout_seconds, 900),
+        symbol_list=_parse_symbol_list(payload.symbols),
+        timeframe_list=[
+            _normalize_dukascopy_genesis_timeframe(timeframe)
+            for timeframe in _parse_timeframe_list(payload.timeframes)
+        ],
+    )
+    _validate_download_limits(request)
+    _validate_download_genesis(request)
+    return request
+
+
+def _jforex_download_command(request: _PreparedDownloadRequest) -> list[str]:
+    cmd = [
+        sys.executable,
+        "-u",
+        "-m",
+        "data_tools.downloaders.jforex_dl",
+        "--symbols",
+        ",".join(request.symbol_list),
+        "--timeframes",
+        ",".join(request.timeframe_list),
+        "--query-timeout-seconds",
+        str(request.query_timeout_seconds),
+    ]
+    if request.start:
+        cmd.extend(["--start", request.start])
+    if request.end:
+        cmd.extend(["--end", request.end])
+    if request.offer_side:
+        cmd.extend(["--price-type", request.offer_side])
+    return cmd
+
+
+def _start_jforex_download(
+    task_id: str,
+    request: _PreparedDownloadRequest,
+    *,
+    name: str,
+    description: str,
+) -> dict[str, Any]:
+    source_label = "dukascopy" if request.source == "dukascopy" else "jforex"
+    cmd = _jforex_download_command(request)
+    result = _start_jforex_task(
         task_id,
         cmd,
-        total_items=total_items,
+        source_label=source_label,
+        allow_native_fallback=(source_label == "dukascopy"),
+        symbols=request.symbol_list,
+        timeframes=request.timeframe_list,
+        start=request.start or None,
+        end=request.end or None,
+        offer_side=request.offer_side,
+        merge_tick=request.merge_tick,
+        merge_s1=request.merge_s1,
+        batch_size=request.batch_size,
+        pause_ms=request.pause_ms,
+        query_timeout_seconds=request.query_timeout_seconds,
+        total_items=max(len(request.symbol_list) * len(request.timeframe_list), 1),
         name=name,
         description=description,
-        source=source,
     )
     if result.get("coalesced"):
         return result
     _apply_recovery_data_metadata(
         task_id,
         command=[str(part) for part in cmd],
-        downloader=source,
-        symbols=symbol_list,
-        timeframes=timeframe_list,
-        start=start or None,
-        end=end or None,
+        downloader=source_label,
+        symbols=request.symbol_list,
+        timeframes=request.timeframe_list,
+        start=request.start or None,
+        end=request.end or None,
+        offer_side=request.offer_side,
+        price_type=request.offer_side,
+        merge_tick=request.merge_tick,
+        merge_s1=request.merge_s1,
+        batch_size=request.batch_size,
+        pause_ms=request.pause_ms,
+        query_timeout_seconds=request.query_timeout_seconds,
     )
     return result
+
+
+def _generic_download_command(request: _PreparedDownloadRequest) -> list[str]:
+    module_names = {
+        "yfinance": "data_tools.downloaders.yfinance_dl",
+        "huggingface": "data_tools.downloaders.huggingface_dl",
+        "alpaca": "data_tools.downloaders.alpaca_dl",
+    }
+    if request.source == "dolthub":
+        return [sys.executable, "-u", "-m", "data_tools.dolthub_manager", "update"]
+    if request.source not in module_names:
+        raise HTTPException(status_code=400, detail="Unknown source")
+
+    cmd = [
+        sys.executable,
+        "-u",
+        "-m",
+        module_names[request.source],
+        "--symbols",
+        request.symbols,
+        "--timeframes",
+        request.timeframes,
+    ]
+    if request.start:
+        cmd.extend(["--start", request.start])
+    if request.end:
+        cmd.extend(["--end", request.end])
+    return cmd
+
+
+def _start_generic_download(
+    task_id: str,
+    request: _PreparedDownloadRequest,
+    *,
+    name: str,
+    description: str,
+) -> dict[str, Any]:
+    cmd = _generic_download_command(request)
+    result = _start_data_task(
+        task_id,
+        cmd,
+        total_items=max(len(request.symbol_list) * len(request.timeframe_list), 1),
+        name=name,
+        description=description,
+        source=request.source,
+    )
+    if result.get("coalesced"):
+        return result
+    _apply_recovery_data_metadata(
+        task_id,
+        command=[str(part) for part in cmd],
+        downloader=request.source,
+        symbols=request.symbol_list,
+        timeframes=request.timeframe_list,
+        start=request.start or None,
+        end=request.end or None,
+    )
+    return result
+
+
+@app.post("/api/data/download", response_model=dict[str, Any])
+async def data_download(payload: DataDownloadRequest) -> dict[str, Any]:
+    request = _prepare_download_request(payload)
+    task_id = str(uuid.uuid4())
+    name, description = _download_task_labels(
+        request.source, request.symbol_list, request.timeframe_list
+    )
+    if request.source in {"dukascopy", "jforex"}:
+        return _start_jforex_download(task_id, request, name=name, description=description)
+    return _start_generic_download(task_id, request, name=name, description=description)
 
 
 def _manual_cache_invalidation_payload(

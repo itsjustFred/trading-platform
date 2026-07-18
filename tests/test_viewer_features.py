@@ -1483,10 +1483,12 @@ def test_data_download_coalesces_options_irrelevant_to_source(
 @pytest.mark.parametrize(
     ("option", "different_value"),
     [
+        ("offer_side", "ask"),
         ("merge_tick", True),
         ("merge_s1", True),
         ("batch_size", 23),
         ("pause_ms", 4000),
+        ("query_timeout_seconds", 1200),
     ],
 )
 def test_jforex_request_key_includes_execution_options(option, different_value):
@@ -1649,16 +1651,14 @@ def test_data_download_releases_request_key_when_task_finishes(
             pass
 
     monkeypatch.setattr(viewer_app_module.legacy_viewer.threading, "Thread", _NoStartThread)
-    response = viewer_client.post(
-        "/api/data/download",
-        json={
-            "source": "dukascopy",
-            "symbols": "EURUSD",
-            "timeframes": "m1",
-            "start": "2026-01-01",
-            "end": "2026-01-02",
-        },
-    )
+    payload = {
+        "source": "dukascopy",
+        "symbols": "EURUSD",
+        "timeframes": "m1",
+        "start": "2026-01-01",
+        "end": "2026-01-02",
+    }
+    response = viewer_client.post("/api/data/download", json=payload)
     task_id = response.json()["task_id"]
 
     assert "download_request_key" in viewer_app_module.DATA_TASKS[task_id]
@@ -1670,6 +1670,12 @@ def test_data_download_releases_request_key_when_task_finishes(
     )
 
     assert "download_request_key" not in viewer_app_module.DATA_TASKS[task_id]
+
+    retry = viewer_client.post("/api/data/download", json=payload)
+
+    assert retry.status_code == 200
+    assert retry.json()["task_id"] != task_id
+    assert "coalesced" not in retry.json()
 
 
 def test_data_download_discards_persisted_record_for_coalesced_request(
@@ -1711,8 +1717,12 @@ def test_data_download_discards_persisted_record_for_coalesced_request(
     first = viewer_client.post("/api/data/download", json=payload)
     second = viewer_client.post("/api/data/download", json=payload)
 
-    assert second.json()["task_id"] == first.json()["task_id"]
-    assert persisted - deleted == {first.json()["task_id"]}
+    first_id = first.json()["task_id"]
+    assert second.json()["task_id"] == first_id
+    assert persisted == {first_id}
+    assert len(deleted) == 1
+    assert first_id not in deleted
+    assert deleted.isdisjoint(persisted)
 
 
 def test_data_download_accepts_jforex_source(viewer_client, monkeypatch):
