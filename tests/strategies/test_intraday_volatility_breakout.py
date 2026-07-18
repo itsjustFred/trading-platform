@@ -446,6 +446,41 @@ def test_candle_close_signal_emits_previous_bar_for_next_open_execution():
     assert indicators["direction"].iloc[entry_idx] == "LONG"
     assert pd.notna(indicators["sl_price"].iloc[entry_idx])
     assert pd.notna(indicators["stop_distance"].iloc[entry_idx])
+    assert indicators["entry_reference_price"].iloc[entry_idx] == pytest.approx(
+        df["close"].iloc[entry_idx + 1]
+    )
+
+
+def test_entry_indicators_include_signal_contract_metadata():
+    mod = _load_module()
+    df = _two_day_breakout_df(direction="up")
+    params = mod.STRATEGY_META["parameters"].copy()
+    params.update(
+        {
+            "use_candle_close": False,
+            "entry_time": "16:30",
+            "max_entry_time": "18:00",
+            "exit_time": "20:00",
+            "atr_regime_factor": 2.0,
+        }
+    )
+
+    entries, exits, indicators, _ = mod.generate_signals(df, params)
+    entry_idx = entries[entries].index[0]
+
+    assert indicators["strategy_id"].iloc[entry_idx] == "intraday_volatility_breakout"
+    assert indicators["order_timing"].iloc[entry_idx] == "next_bar_open"
+    assert indicators["order_type"].iloc[entry_idx] == "market"
+    assert indicators["entry_reference_price"].iloc[entry_idx] == pytest.approx(
+        df["close"].iloc[entry_idx]
+    )
+    assert indicators["signal_id"].iloc[entry_idx].startswith(
+        "intraday_volatility_breakout:"
+    )
+    assert indicators["direction"].iloc[entry_idx] in {"LONG", "SHORT"}
+
+    exit_idx = exits[exits].index[0]
+    assert indicators["exit_reason"].iloc[exit_idx] in {"time_exit", "end_of_day"}
 
 
 def test_native_daily_ohlcv_overrides_intraday_resampled_atr():
