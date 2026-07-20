@@ -716,16 +716,57 @@ def test_trades_csv_missing_fees_fails_closed(tmp_path: Path):
         importer.load(source, trades_csv=csv_path)
 
 
+def test_trades_csv_rejects_escaped_tab_order_ids(tmp_path: Path):
+    source = _write_result(tmp_path, _valid_result())
+    csv_path = tmp_path / "trades.csv"
+    fieldnames = [
+        "Entry Time",
+        "Symbols",
+        "Exit Time",
+        "Direction",
+        "Entry Price",
+        "Exit Price",
+        "Quantity",
+        "P&L",
+        "Fees",
+        "MAE",
+        "MFE",
+        "Drawdown",
+        "IsWin",
+        "Order Ids",
+    ]
+    row = {
+        "Entry Time": "2024-01-02T21:00:00Z",
+        "Symbols": "SPY",
+        "Exit Time": "2024-02-01T21:00:00Z",
+        "Direction": "Buy",
+        "Entry Price": "100.25",
+        "Exit Price": "110",
+        "Quantity": "10",
+        "P&L": "97.5",
+        "Fees": "2.5",
+        "MAE": "-10",
+        "MFE": "120",
+        "Drawdown": "22",
+        "IsWin": "1",
+        "Order Ids": r"\t1",
+    }
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerow(row)
+
+    importer = QuantConnectResultImporter()
+    with pytest.raises(ValueError, match="trades CSV does not match result JSON"):
+        importer.load(source, trades_csv=csv_path)
+
+
 def test_orders_csv_accepts_qc_decimal_truncation_but_rejects_material_change(
     tmp_path: Path,
 ):
-    source = _write_result(tmp_path, _valid_result())
-    source.write_text(
-        source.read_text(encoding="utf-8").replace(
-            '"value": 1002.5', '"value": 103828.272132545', 1
-        ),
-        encoding="utf-8",
-    )
+    payload = _valid_result()
+    payload["orders"]["1"]["value"] = 103828.272132545
+    source = _write_result(tmp_path, payload)
     csv_path = tmp_path / "orders.csv"
     fieldnames = ["Time", "Symbol", "Price", "Quantity", "Type", "Status", "Value", "Tag"]
     row = {

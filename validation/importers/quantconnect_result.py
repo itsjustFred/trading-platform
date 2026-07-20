@@ -125,16 +125,20 @@ def _snake_case(name: str) -> str:
             result.append("_")
             continue
         if character.isupper():
-            previous = name[index - 1] if index else ""
-            following = name[index + 1] if index + 1 < len(name) else ""
-            starts_word = previous.islower() or previous.isdigit()
-            ends_acronym = previous.isupper() and following.islower()
-            if result and result[-1] != "_" and (starts_word or ends_acronym):
+            if result and result[-1] != "_" and _starts_snake_word(name, index):
                 result.append("_")
             result.append(character.lower())
             continue
         result.append(character)
     return "".join(result)
+
+
+def _starts_snake_word(name: str, index: int) -> bool:
+    previous = name[index - 1] if index else ""
+    following = name[index + 1] if index + 1 < len(name) else ""
+    return previous.islower() or previous.isdigit() or (
+        previous.isupper() and following.islower()
+    )
 
 
 def _decimal(value: Any, name: str) -> Decimal:
@@ -227,9 +231,10 @@ def _normal_bool(value: Any) -> bool:
 def _normal_ids(value: Any) -> tuple[int, ...]:
     if isinstance(value, (list, tuple)):
         return tuple(sorted(_int(item, "order id") for item in value))
-    text = str(value or "").strip()
-    if text.startswith(r"\t"):
-        text = text[2:]
+    text = str(value or "")
+    if text.startswith("\t"):
+        text = text[1:]
+    text = text.strip()
     tokens = text.replace(",", " ").split()
     return tuple(sorted(_int(item, "order id") for item in tokens))
 
@@ -465,27 +470,12 @@ class QuantConnectResultImporter(BaseImporter):
     def _normalize_trades(
         self, raw_trades: list[Any]
     ) -> tuple[list[Trade], list[dict[str, Any]]]:
-        prepared: list[tuple[tuple[str, ...], Mapping[str, Any]]] = []
-        for value in raw_trades:
-            raw = _required_mapping(value, "closedTrade")
-            symbols = _required_list(raw.get("symbols"), "closedTrade.symbols")
-            if not symbols:
-                raise ValueError("closedTrade.symbols must not be empty")
-            symbol_names = tuple(sorted(_symbol_value(symbol) for symbol in symbols))
-            if any(not symbol for symbol in symbol_names):
-                raise ValueError("closedTrade.symbols must not contain empty symbols")
-            key = (
-                _canonical_time(raw.get("entryTime")),
-                _canonical_time(raw.get("exitTime")),
-                ",".join(symbol_names),
-                str(raw.get("id") or ""),
-            )
-            prepared.append((key, raw))
+        prepared = self._prepare_trades(raw_trades)
 
         trades: list[Trade] = []
         comparison_rows: list[dict[str, Any]] = []
         seen_qc_ids: set[str] = set()
-        for index, (_, raw) in enumerate(sorted(prepared, key=lambda item: item[0]), start=1):
+        for index, (_, raw) in enumerate(prepared, start=1):
             symbols = sorted(
                 _symbol_value(symbol)
                 for symbol in _required_list(raw.get("symbols"), "closedTrade.symbols")
@@ -572,6 +562,27 @@ class QuantConnectResultImporter(BaseImporter):
                 }
             )
         return trades, comparison_rows
+
+    def _prepare_trades(
+        self, raw_trades: list[Any]
+    ) -> list[tuple[tuple[str, ...], Mapping[str, Any]]]:
+        prepared: list[tuple[tuple[str, ...], Mapping[str, Any]]] = []
+        for value in raw_trades:
+            raw = _required_mapping(value, "closedTrade")
+            symbols = _required_list(raw.get("symbols"), "closedTrade.symbols")
+            if not symbols:
+                raise ValueError("closedTrade.symbols must not be empty")
+            symbol_names = tuple(sorted(_symbol_value(symbol) for symbol in symbols))
+            if any(not symbol for symbol in symbol_names):
+                raise ValueError("closedTrade.symbols must not contain empty symbols")
+            key = (
+                _canonical_time(raw.get("entryTime")),
+                _canonical_time(raw.get("exitTime")),
+                ",".join(symbol_names),
+                str(raw.get("id") or ""),
+            )
+            prepared.append((key, raw))
+        return sorted(prepared, key=lambda item: item[0])
 
     def _submission_clusters(
         self, orders: list[dict[str, Any]]
