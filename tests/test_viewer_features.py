@@ -1875,11 +1875,14 @@ def test_coalesced_cleanup_marker_failure_retries_from_memory(
         delete_attempts.append(value)
         raise RuntimeError("database unavailable")
 
+    def fail_upsert(**_record) -> None:
+        raise RuntimeError("database unavailable")
+
     monkeypatch.setattr(viewer_app_module, "delete_background_task_record", fail_delete)
     monkeypatch.setattr(
         viewer_app_module,
         "upsert_background_task_record",
-        lambda **_record: (_ for _ in ()).throw(RuntimeError("database unavailable")),
+        fail_upsert,
     )
 
     viewer_app_module._discard_coalesced_download_registration(task_id)

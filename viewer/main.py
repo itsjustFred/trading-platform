@@ -2860,38 +2860,45 @@ def _snapshot_task(task_id: str) -> dict[str, Any] | None:
     return dict(current) if current is not None else None
 
 
+def _evict_coalesced_cleanup_tasks() -> tuple[set[str], int]:
+    with DATA_TASKS_LOCK:
+        cleanup_ids = set(_COALESCED_CLEANUP_PENDING)
+        for task_id in cleanup_ids:
+            DATA_TASKS.pop(task_id, None)
+        return cleanup_ids, len(DATA_TASKS)
+
+
+def _hydrate_background_task_records(
+    records: list[dict[str, Any]],
+) -> tuple[set[str], int]:
+    with DATA_TASKS_LOCK:
+        cleanup_ids = set(_COALESCED_CLEANUP_PENDING)
+        for task_id in cleanup_ids:
+            DATA_TASKS.pop(task_id, None)
+        for record in records:
+            task_id = str(record.get("id") or "").strip()
+            if not task_id:
+                continue
+            if _is_coalesced_cleanup_marker(record):
+                DATA_TASKS.pop(task_id, None)
+                cleanup_ids.add(task_id)
+                continue
+            if task_id in cleanup_ids or task_id in DATA_TASKS:
+                continue
+            DATA_TASKS[task_id] = _build_task_from_record(record)
+        return cleanup_ids, len(DATA_TASKS)
+
+
 def _hydrate_task_cache_once(force: bool = False) -> int:
     global _TASK_CACHE_HYDRATED
     with _TASK_CACHE_HYDRATION_LOCK:
         if _TASK_CACHE_HYDRATED and not force:
-            with DATA_TASKS_LOCK:
-                cleanup_ids = set(_COALESCED_CLEANUP_PENDING)
-                for task_id in cleanup_ids:
-                    DATA_TASKS.pop(task_id, None)
-                size = len(DATA_TASKS)
+            cleanup_ids, size = _evict_coalesced_cleanup_tasks()
             for task_id in cleanup_ids:
                 _retry_coalesced_cleanup(task_id)
             return size
         records = list_background_task_records()
-        cleanup_ids: set[str] = set()
-        with DATA_TASKS_LOCK:
-            cleanup_ids.update(_COALESCED_CLEANUP_PENDING)
-            for task_id in cleanup_ids:
-                DATA_TASKS.pop(task_id, None)
-            for record in records:
-                task_id = str(record.get("id") or "").strip()
-                if not task_id:
-                    continue
-                if _is_coalesced_cleanup_marker(record):
-                    DATA_TASKS.pop(task_id, None)
-                    cleanup_ids.add(task_id)
-                    continue
-                if task_id in cleanup_ids:
-                    continue
-                if task_id in DATA_TASKS:
-                    continue
-                DATA_TASKS[task_id] = _build_task_from_record(record)
-            size = len(DATA_TASKS)
+        cleanup_ids, size = _hydrate_background_task_records(records)
         for task_id in cleanup_ids:
             _retry_coalesced_cleanup(task_id)
         _TASK_CACHE_HYDRATED = True
@@ -2981,7 +2988,7 @@ def _discard_coalesced_download_registration(task_id: str) -> None:
                 source=str((task or {}).get("source") or ""),
             )
         except Exception as marker_exc:
-            logger.error(
+            logger.exception(
                 "Could not persist cleanup marker for provisional coalesced task %s; "
                 "cleanup remains pending in memory: %s",
                 task_id,
