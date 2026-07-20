@@ -48,6 +48,7 @@ def viewer_client(monkeypatch, tmp_path):
     monkeypatch.setattr(viewer_app_module, "save_result_to_sqlite", lambda _result: None)
     monkeypatch.setattr(viewer_app_module, "migrate_json_to_sqlite", lambda: {"migrated": 0, "failed": 0, "total": 0})
     viewer_app_module.DATA_TASKS.clear()
+    viewer_app_module._COALESCED_CLEANUP_PENDING.clear()
     return TestClient(viewer_app_module.app)
 
 
@@ -1840,11 +1841,102 @@ def test_coalesced_cleanup_failure_persists_retryable_marker(
         "delete_background_task_record",
         lambda task_id: delete_attempts.append(task_id) or True,
     )
+    with viewer_app_module.DATA_TASKS_LOCK:
+        viewer_app_module.DATA_TASKS["task-provisional"] = {
+            "id": "task-provisional",
+            "kind": "data",
+            "source": "yfinance",
+            "status": "running",
+        }
 
     viewer_app_module._hydrate_task_cache_once(force=True)
 
     assert delete_attempts == ["task-provisional", "task-provisional"]
     assert "task-provisional" not in viewer_app_module.DATA_TASKS
+
+
+def test_coalesced_cleanup_marker_failure_retries_from_memory(
+    viewer_client, monkeypatch
+):
+    import viewer.main as viewer_app_module
+
+    task_id = "task-provisional"
+    with viewer_app_module.DATA_TASKS_LOCK:
+        viewer_app_module.DATA_TASKS[task_id] = {
+            "id": task_id,
+            "kind": "data",
+            "source": "yfinance",
+            "status": "starting",
+        }
+
+    delete_attempts: list[str] = []
+
+    def fail_delete(value: str) -> bool:
+        delete_attempts.append(value)
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(viewer_app_module, "delete_background_task_record", fail_delete)
+    monkeypatch.setattr(
+        viewer_app_module,
+        "upsert_background_task_record",
+        lambda **_record: (_ for _ in ()).throw(RuntimeError("database unavailable")),
+    )
+
+    viewer_app_module._discard_coalesced_download_registration(task_id)
+
+    assert delete_attempts == [task_id]
+    assert task_id not in viewer_app_module.DATA_TASKS
+    assert task_id in viewer_app_module._COALESCED_CLEANUP_PENDING
+
+    monkeypatch.setattr(
+        viewer_app_module,
+        "list_background_task_records",
+        lambda: [
+            {
+                "id": task_id,
+                "type": "data",
+                "status": "starting",
+                "config_json": {},
+                "source": "yfinance",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        viewer_app_module,
+        "delete_background_task_record",
+        lambda value: delete_attempts.append(value) or True,
+    )
+
+    viewer_app_module._hydrate_task_cache_once(force=True)
+
+    assert delete_attempts == [task_id, task_id]
+    assert task_id not in viewer_app_module.DATA_TASKS
+    assert task_id not in viewer_app_module._COALESCED_CLEANUP_PENDING
+
+
+def test_hydrated_cache_retries_pending_coalesced_cleanup(viewer_client, monkeypatch):
+    import viewer.main as viewer_app_module
+
+    task_id = "task-provisional-hydrated"
+    deleted: list[str] = []
+    with viewer_app_module.DATA_TASKS_LOCK:
+        viewer_app_module.DATA_TASKS[task_id] = {
+            "id": task_id,
+            "kind": "data",
+            "status": "starting",
+        }
+        viewer_app_module._COALESCED_CLEANUP_PENDING.add(task_id)
+    monkeypatch.setattr(viewer_app_module, "_TASK_CACHE_HYDRATED", True)
+    monkeypatch.setattr(
+        viewer_app_module,
+        "delete_background_task_record",
+        lambda deleted_task_id: deleted.append(deleted_task_id) or True,
+    )
+
+    assert viewer_app_module._hydrate_task_cache_once() == 0
+    assert deleted == [task_id]
+    assert task_id not in viewer_app_module.DATA_TASKS
+    assert task_id not in viewer_app_module._COALESCED_CLEANUP_PENDING
 
 
 def test_task_lookup_retries_pending_coalesced_cleanup_without_hydrating(
@@ -1875,6 +1967,76 @@ def test_task_lookup_retries_pending_coalesced_cleanup_without_hydrating(
     assert viewer_app_module._get_task("task-provisional") is None
     assert delete_attempts == ["task-provisional"]
     assert "task-provisional" not in viewer_app_module.DATA_TASKS
+
+
+def test_task_lookup_evicts_cached_task_when_persisted_cleanup_marker_appears(
+    viewer_client, monkeypatch
+):
+    import viewer.main as viewer_app_module
+
+    task_id = "task-stale"
+    with viewer_app_module.DATA_TASKS_LOCK:
+        viewer_app_module.DATA_TASKS[task_id] = {
+            "id": task_id,
+            "kind": "data",
+            "source": "yfinance",
+            "status": "running",
+        }
+
+    monkeypatch.setattr(
+        viewer_app_module,
+        "get_background_task_record",
+        lambda _task_id: {
+            "id": task_id,
+            "type": "data",
+            "status": "cleanup_pending",
+            "config_json": {"coalesced_cleanup_pending": True},
+        },
+    )
+    delete_attempts: list[str] = []
+    monkeypatch.setattr(
+        viewer_app_module,
+        "delete_background_task_record",
+        lambda value: delete_attempts.append(value) or True,
+    )
+
+    assert viewer_app_module._get_task(task_id) is None
+    assert delete_attempts == [task_id]
+    assert task_id not in viewer_app_module.DATA_TASKS
+
+
+def test_task_snapshot_hides_cached_task_when_cleanup_marker_appears(
+    viewer_client, monkeypatch
+):
+    import viewer.main as viewer_app_module
+
+    task_id = "task-stale-snapshot"
+    with viewer_app_module.DATA_TASKS_LOCK:
+        viewer_app_module.DATA_TASKS[task_id] = {
+            "id": task_id,
+            "kind": "data",
+            "source": "yfinance",
+            "status": "running",
+        }
+
+    monkeypatch.setattr(
+        viewer_app_module,
+        "get_background_task_record",
+        lambda _task_id: {
+            "id": task_id,
+            "type": "data",
+            "status": "cleanup_pending",
+            "config_json": {"coalesced_cleanup_pending": True},
+        },
+    )
+    monkeypatch.setattr(
+        viewer_app_module,
+        "delete_background_task_record",
+        lambda _task_id: True,
+    )
+
+    assert viewer_app_module._snapshot_task(task_id) is None
+    assert task_id not in viewer_app_module.DATA_TASKS
 
 
 def test_data_download_accepts_jforex_source(viewer_client, monkeypatch):

@@ -2799,20 +2799,43 @@ def _is_coalesced_cleanup_marker(record: dict[str, Any]) -> bool:
     return bool(dict(record.get("config_json") or {}).get("coalesced_cleanup_pending"))
 
 
-def _retry_coalesced_cleanup(task_id: str) -> None:
+_COALESCED_CLEANUP_PENDING: set[str] = set()
+
+
+def _retry_coalesced_cleanup(task_id: str) -> bool:
     try:
         delete_background_task_record(task_id)
     except Exception as exc:
+        with DATA_TASKS_LOCK:
+            _COALESCED_CLEANUP_PENDING.add(task_id)
         logger.warning(
             "Could not retry provisional coalesced task cleanup %s: %s",
             task_id,
             exc,
         )
+        return False
+    with DATA_TASKS_LOCK:
+        _COALESCED_CLEANUP_PENDING.discard(task_id)
+    return True
 
 
 def _get_task(task_id: str) -> dict[str, Any] | None:
+    with DATA_TASKS_LOCK:
+        cleanup_pending = task_id in _COALESCED_CLEANUP_PENDING
+        if cleanup_pending:
+            DATA_TASKS.pop(task_id, None)
+    if cleanup_pending:
+        _retry_coalesced_cleanup(task_id)
+        return None
+
     task = _LEGACY_GET_TASK(task_id)
     if task is not None:
+        record = get_background_task_record(task_id)
+        if record is not None and _is_coalesced_cleanup_marker(record):
+            with DATA_TASKS_LOCK:
+                DATA_TASKS.pop(task_id, None)
+            _retry_coalesced_cleanup(task_id)
+            return None
         _decorate_task_from_record(task_id, task)
         return task
 
@@ -2833,12 +2856,8 @@ def _get_task(task_id: str) -> dict[str, Any] | None:
 
 
 def _snapshot_task(task_id: str) -> dict[str, Any] | None:
-    snapshot = _LEGACY_SNAPSHOT_TASK(task_id)
-    if snapshot is None:
-        current = _get_task(task_id)
-        return dict(current) if current is not None else None
-    _decorate_task_from_record(task_id, snapshot)
-    return snapshot
+    current = _get_task(task_id)
+    return dict(current) if current is not None else None
 
 
 def _hydrate_task_cache_once(force: bool = False) -> int:
@@ -2846,18 +2865,35 @@ def _hydrate_task_cache_once(force: bool = False) -> int:
     with _TASK_CACHE_HYDRATION_LOCK:
         if _TASK_CACHE_HYDRATED and not force:
             with DATA_TASKS_LOCK:
-                return len(DATA_TASKS)
+                cleanup_ids = set(_COALESCED_CLEANUP_PENDING)
+                for task_id in cleanup_ids:
+                    DATA_TASKS.pop(task_id, None)
+                size = len(DATA_TASKS)
+            for task_id in cleanup_ids:
+                _retry_coalesced_cleanup(task_id)
+            return size
         records = list_background_task_records()
+        cleanup_ids: set[str] = set()
         with DATA_TASKS_LOCK:
+            cleanup_ids.update(_COALESCED_CLEANUP_PENDING)
+            for task_id in cleanup_ids:
+                DATA_TASKS.pop(task_id, None)
             for record in records:
                 task_id = str(record.get("id") or "").strip()
-                if not task_id or task_id in DATA_TASKS:
+                if not task_id:
                     continue
                 if _is_coalesced_cleanup_marker(record):
-                    _retry_coalesced_cleanup(task_id)
+                    DATA_TASKS.pop(task_id, None)
+                    cleanup_ids.add(task_id)
+                    continue
+                if task_id in cleanup_ids:
+                    continue
+                if task_id in DATA_TASKS:
                     continue
                 DATA_TASKS[task_id] = _build_task_from_record(record)
             size = len(DATA_TASKS)
+        for task_id in cleanup_ids:
+            _retry_coalesced_cleanup(task_id)
         _TASK_CACHE_HYDRATED = True
         return size
 
@@ -2933,6 +2969,8 @@ def _discard_coalesced_download_registration(task_id: str) -> None:
     try:
         delete_background_task_record(task_id)
     except Exception as exc:
+        with DATA_TASKS_LOCK:
+            _COALESCED_CLEANUP_PENDING.add(task_id)
         try:
             upsert_background_task_record(
                 task_id=task_id,
@@ -2943,9 +2981,13 @@ def _discard_coalesced_download_registration(task_id: str) -> None:
                 source=str((task or {}).get("source") or ""),
             )
         except Exception as marker_exc:
-            raise RuntimeError(
-                f"Could not establish durable cleanup for provisional task {task_id}"
-            ) from marker_exc
+            logger.error(
+                "Could not persist cleanup marker for provisional coalesced task %s; "
+                "cleanup remains pending in memory: %s",
+                task_id,
+                marker_exc,
+            )
+            return
         logger.warning(
             "Could not remove provisional coalesced task %s; persisted cleanup marker: %s",
             task_id,
