@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 from decimal import Decimal
 from pathlib import Path
 
@@ -9,10 +10,17 @@ import pytest
 
 from validation.importers.quantconnect_result import QuantConnectResultImporter
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
-REFERENCE_DIR = Path(
-    "/home/ubuntu/trading-platform-references/quantconnect-reference"
-)
+
+def _reference_dir() -> Path:
+    configured = os.environ.get("QUANTCONNECT_REFERENCE_DIR", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return REPO_ROOT / "tests/fixtures/validation/quantconnect-reference"
+
+
+REFERENCE_DIR = _reference_dir()
 RESULT_JSON = REFERENCE_DIR / "Sleepy Tan Coyote.json"
 ORDERS_CSV = REFERENCE_DIR / "Sleepy Tan Coyote_orders.csv"
 TRADES_CSV = REFERENCE_DIR / "Sleepy Tan Coyote_trades.csv"
@@ -152,6 +160,30 @@ def _write_result(tmp_path: Path, payload: dict[str, object]) -> Path:
     return path
 
 
+def test_reference_dir_uses_environment_override(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    monkeypatch.setenv("QUANTCONNECT_REFERENCE_DIR", str(tmp_path))
+
+    assert _reference_dir() == tmp_path
+
+
+@pytest.mark.parametrize("configured", [None, "", "  "])
+def test_reference_dir_defaults_to_repo_fixture(
+    monkeypatch: pytest.MonkeyPatch,
+    configured: str | None,
+):
+    if configured is None:
+        monkeypatch.delenv("QUANTCONNECT_REFERENCE_DIR", raising=False)
+    else:
+        monkeypatch.setenv("QUANTCONNECT_REFERENCE_DIR", configured)
+
+    assert _reference_dir() == (
+        REPO_ROOT / "tests/fixtures/validation/quantconnect-reference"
+    )
+
+
 def test_closed_trade_net_pnl_subtracts_fees(tmp_path: Path):
     reference = QuantConnectResultImporter().load(
         _write_result(tmp_path, _valid_result())
@@ -167,43 +199,81 @@ def test_closed_trade_net_pnl_subtracts_fees(tmp_path: Path):
 def test_non_finite_closed_trade_profit_loss_fails_closed(tmp_path: Path):
     payload = _valid_result()
     payload["totalPerformance"]["closedTrades"][0]["profitLoss"] = float("nan")
+    source = _write_result(tmp_path, payload)
+    importer = QuantConnectResultImporter()
 
     with pytest.raises(
         ValueError,
         match=r"^closedTrade\.profitLoss must be finite$",
     ):
-        QuantConnectResultImporter().load(_write_result(tmp_path, payload))
+        importer.load(source)
+
+
+def test_fractional_numeric_order_id_fails_closed(tmp_path: Path):
+    payload = _valid_result()
+    payload["orders"]["1"]["id"] = 1.5
+    source = _write_result(tmp_path, payload)
+    importer = QuantConnectResultImporter()
+
+    with pytest.raises(ValueError, match=r"^order\.id must be an integer$"):
+        importer.load(source)
+
+
+def test_order_numeric_value_with_trailing_text_fails_closed(tmp_path: Path):
+    payload = _valid_result()
+    payload["orders"]["1"]["price"] = "100.25 USD"
+    source = _write_result(tmp_path, payload)
+    importer = QuantConnectResultImporter()
+
+    with pytest.raises(ValueError, match=r"^order\.price must be numeric$"):
+        importer.load(source)
+
+
+def test_closed_trade_without_symbol_fails_closed(tmp_path: Path):
+    payload = _valid_result()
+    payload["totalPerformance"]["closedTrades"][0]["symbols"] = []
+    source = _write_result(tmp_path, payload)
+    importer = QuantConnectResultImporter()
+
+    with pytest.raises(ValueError, match=r"^closedTrade\.symbols must not be empty$"):
+        importer.load(source)
 
 
 def test_empty_closed_trade_id_fails_closed(tmp_path: Path):
     payload = _valid_result()
     payload["totalPerformance"]["closedTrades"][0]["id"] = ""
+    source = _write_result(tmp_path, payload)
+    importer = QuantConnectResultImporter()
 
     with pytest.raises(ValueError, match=r"^closedTrade\.id must not be empty$"):
-        QuantConnectResultImporter().load(_write_result(tmp_path, payload))
+        importer.load(source)
 
 
 def test_empty_closed_trade_order_ids_fails_closed(tmp_path: Path):
     payload = _valid_result()
     payload["totalPerformance"]["closedTrades"][0]["orderIds"] = []
     payload["statistics"]["Total Fees"] = "$3.50"
+    source = _write_result(tmp_path, payload)
+    importer = QuantConnectResultImporter()
 
     with pytest.raises(
         ValueError,
         match=r"^closedTrade\.orderIds must not be empty$",
     ):
-        QuantConnectResultImporter().load(_write_result(tmp_path, payload))
+        importer.load(source)
 
 
 def test_duplicate_closed_trade_order_ids_fail_closed(tmp_path: Path):
     payload = _valid_result()
     payload["totalPerformance"]["closedTrades"][0]["orderIds"] = [1, 1]
+    source = _write_result(tmp_path, payload)
+    importer = QuantConnectResultImporter()
 
     with pytest.raises(
         ValueError,
         match=r"^closedTrade\.orderIds must not contain duplicates$",
     ):
-        QuantConnectResultImporter().load(_write_result(tmp_path, payload))
+        importer.load(source)
 
 
 def test_duplicate_closed_trade_id_fails_closed(tmp_path: Path):
@@ -219,9 +289,11 @@ def test_duplicate_closed_trade_id_fails_closed(tmp_path: Path):
         _closed_trade(),
         _closed_trade(order_ids=[2]),
     ]
+    source = _write_result(tmp_path, payload)
+    importer = QuantConnectResultImporter()
 
     with pytest.raises(ValueError, match=r"^duplicate closedTrade\.id: closed-1$"):
-        QuantConnectResultImporter().load(_write_result(tmp_path, payload))
+        importer.load(source)
 
 
 @pytest.fixture(scope="module")
@@ -455,16 +527,19 @@ def test_fill_events_are_explicitly_not_observable(golden_reference):
 
 
 def test_missing_file_fails_closed():
+    importer = QuantConnectResultImporter()
+
     with pytest.raises(FileNotFoundError, match="QuantConnect result not found"):
-        QuantConnectResultImporter().load("/does/not/exist.json")
+        importer.load("/does/not/exist.json")
 
 
 def test_malformed_json_fails_closed(tmp_path: Path):
     source = tmp_path / "broken.json"
     source.write_text("{not-json", encoding="utf-8")
+    importer = QuantConnectResultImporter()
 
     with pytest.raises(ValueError, match="Invalid QuantConnect result JSON"):
-        QuantConnectResultImporter().load(source)
+        importer.load(source)
 
 
 @pytest.mark.parametrize(
@@ -482,25 +557,31 @@ def test_unsuccessful_result_fails_closed(
 ):
     payload = _valid_result()
     payload["state"][state_field] = value
+    source = _write_result(tmp_path, payload)
+    importer = QuantConnectResultImporter()
 
     with pytest.raises(ValueError, match=message):
-        QuantConnectResultImporter().load(_write_result(tmp_path, payload))
+        importer.load(source)
 
 
 def test_missing_orders_fail_closed(tmp_path: Path):
     payload = _valid_result()
     payload["orders"] = {}
+    source = _write_result(tmp_path, payload)
+    importer = QuantConnectResultImporter()
 
     with pytest.raises(ValueError, match="orders must not be empty"):
-        QuantConnectResultImporter().load(_write_result(tmp_path, payload))
+        importer.load(source)
 
 
 def test_duplicate_order_id_fails_closed(tmp_path: Path):
     payload = _valid_result()
     payload["orders"] = {"1": _order(1), "2": _order(1)}
+    source = _write_result(tmp_path, payload)
+    importer = QuantConnectResultImporter()
 
     with pytest.raises(ValueError, match="duplicate order id: 1"):
-        QuantConnectResultImporter().load(_write_result(tmp_path, payload))
+        importer.load(source)
 
 
 def test_unknown_closed_trade_order_id_fails_closed(tmp_path: Path):
@@ -508,27 +589,31 @@ def test_unknown_closed_trade_order_id_fails_closed(tmp_path: Path):
     payload["totalPerformance"]["closedTrades"] = [
         _closed_trade(order_ids=[1, 999])
     ]
+    source = _write_result(tmp_path, payload)
+    importer = QuantConnectResultImporter()
 
     with pytest.raises(
         ValueError,
         match=r"^closedTrades reference unknown order IDs: \[999\]$",
     ):
-        QuantConnectResultImporter().load(_write_result(tmp_path, payload))
+        importer.load(source)
 
 
 def test_empty_closed_trades_fail_closed(tmp_path: Path):
     payload = _valid_result()
     payload["totalPerformance"]["closedTrades"] = []
+    source = _write_result(tmp_path, payload)
+    importer = QuantConnectResultImporter()
 
     with pytest.raises(ValueError, match="closedTrades must not be empty"):
-        QuantConnectResultImporter().load(_write_result(tmp_path, payload))
+        importer.load(source)
 
 
 @pytest.mark.parametrize("csv_kind", ["orders", "trades"])
 def test_csv_mismatch_fails_closed(tmp_path: Path, csv_kind: str):
     source = _write_result(tmp_path, _valid_result())
-    csv_path = tmp_path / f"bad_{csv_kind}.csv"
     if csv_kind == "orders":
+        csv_path = tmp_path / "bad_orders.csv"
         fieldnames = ["Time", "Symbol", "Price", "Quantity", "Type", "Status", "Value", "Tag"]
         row = {
             "Time": "2024-01-02T15:00:00Z",
@@ -541,6 +626,7 @@ def test_csv_mismatch_fails_closed(tmp_path: Path, csv_kind: str):
             "Tag": "rebalance",
         }
     else:
+        csv_path = tmp_path / "bad_trades.csv"
         fieldnames = [
             "Entry Time",
             "Symbols",
@@ -579,8 +665,9 @@ def test_csv_mismatch_fails_closed(tmp_path: Path, csv_kind: str):
         writer.writerow(row)
 
     kwargs = {f"{csv_kind}_csv": csv_path}
+    importer = QuantConnectResultImporter()
     with pytest.raises(ValueError, match=f"{csv_kind} CSV does not match result JSON"):
-        QuantConnectResultImporter().load(source, **kwargs)
+        importer.load(source, **kwargs)
 
 
 def test_trades_csv_missing_fees_fails_closed(tmp_path: Path):
@@ -621,11 +708,12 @@ def test_trades_csv_missing_fees_fails_closed(tmp_path: Path):
         writer.writeheader()
         writer.writerow(row)
 
+    importer = QuantConnectResultImporter()
     with pytest.raises(
         ValueError,
         match="trades CSV missing required columns: fees",
     ):
-        QuantConnectResultImporter().load(source, trades_csv=csv_path)
+        importer.load(source, trades_csv=csv_path)
 
 
 def test_orders_csv_accepts_qc_decimal_truncation_but_rejects_material_change(
@@ -668,5 +756,6 @@ def test_orders_csv_accepts_qc_decimal_truncation_but_rejects_material_change(
         writer.writeheader()
         writer.writerow(row)
 
+    importer = QuantConnectResultImporter()
     with pytest.raises(ValueError, match="orders CSV does not match result JSON"):
-        QuantConnectResultImporter().load(source, orders_csv=csv_path)
+        importer.load(source, orders_csv=csv_path)

@@ -5,19 +5,17 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
-import re
 from collections import Counter, defaultdict
 from copy import deepcopy
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP
+from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal, InvalidOperation
 from math import isfinite
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Mapping
 
 from shared.models import Trade, TradeExit
 from validation.importers.base import BaseImporter
 from validation.reference import ValidationReference
-
 
 _ORDER_TYPE_LABELS = {
     0: "Market",
@@ -48,6 +46,24 @@ _ORDER_STATUS_LABELS = {
 
 _ORDER_DIRECTIONS = {-1: "Hold", 0: "Buy", 1: "Sell"}
 _TRADE_DIRECTIONS = {0: "LONG", 1: "SHORT"}
+_UTC_OFFSET = "+00:00"
+_CURRENCY_PREFIXES = frozenset({"$", "€", "£"})
+_CSV_NUMERIC_FIELDS = frozenset(
+    {
+        "id",
+        "price",
+        "quantity",
+        "value",
+        "entry_price",
+        "exit_price",
+        "pnl",
+        "fees",
+        "mae",
+        "mfe",
+        "drawdown",
+    }
+)
+_CSV_TIME_FIELDS = frozenset({"time", "entry_time", "exit_time"})
 
 
 def _required_mapping(value: Any, name: str) -> Mapping[str, Any]:
@@ -66,9 +82,12 @@ def _int(value: Any, name: str) -> int:
     if isinstance(value, bool):
         raise ValueError(f"{name} must be an integer")
     try:
-        return int(value)
-    except (TypeError, ValueError) as exc:
+        number = Decimal(str(value).strip())
+    except (InvalidOperation, ValueError) as exc:
         raise ValueError(f"{name} must be an integer") from exc
+    if not number.is_finite() or number != number.to_integral_value():
+        raise ValueError(f"{name} must be an integer")
+    return int(number)
 
 
 def _float(value: Any, name: str) -> float:
@@ -100,20 +119,37 @@ def _symbol_details(value: Any) -> tuple[str, str, str]:
 
 
 def _snake_case(name: str) -> str:
-    step = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", name)
-    return re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", step).replace(" ", "_").lower()
+    result: list[str] = []
+    for index, character in enumerate(name):
+        if character == " ":
+            result.append("_")
+            continue
+        if character.isupper():
+            previous = name[index - 1] if index else ""
+            following = name[index + 1] if index + 1 < len(name) else ""
+            starts_word = previous.islower() or previous.isdigit()
+            ends_acronym = previous.isupper() and following.islower()
+            if result and result[-1] != "_" and (starts_word or ends_acronym):
+                result.append("_")
+            result.append(character.lower())
+            continue
+        result.append(character)
+    return "".join(result)
 
 
 def _decimal(value: Any, name: str) -> Decimal:
     if isinstance(value, bool):
         raise ValueError(f"{name} must be numeric")
     text = str(value).strip().replace(",", "")
-    text = re.sub(r"^[^0-9+\-.]*", "", text)
-    text = re.sub(r"[^0-9.]+$", "", text)
+    if text[:1] in _CURRENCY_PREFIXES:
+        text = text[1:].strip()
     try:
-        return Decimal(text)
+        number = Decimal(text)
     except (InvalidOperation, ValueError) as exc:
         raise ValueError(f"{name} must be numeric") from exc
+    if not number.is_finite():
+        raise ValueError(f"{name} must be finite")
+    return number
 
 
 def _stat_value(value: Any) -> Any:
@@ -148,9 +184,9 @@ def _canonical_time(value: Any) -> str:
     text = str(value or "").strip()
     if not text:
         return ""
-    candidate = text.replace(" UTC", "+00:00")
+    candidate = text.replace(" UTC", _UTC_OFFSET)
     if candidate.endswith("Z"):
-        candidate = candidate[:-1] + "+00:00"
+        candidate = candidate[:-1] + _UTC_OFFSET
     parsed: datetime | None = None
     try:
         parsed = datetime.fromisoformat(candidate)
@@ -171,11 +207,11 @@ def _canonical_time(value: Any) -> str:
         parsed = parsed.replace(tzinfo=timezone.utc)
     parsed = parsed.astimezone(timezone.utc)
     rendered = parsed.isoformat(timespec="microseconds" if parsed.microsecond else "seconds")
-    return rendered.replace("+00:00", "Z")
+    return rendered.replace(_UTC_OFFSET, "Z")
 
 
 def _header_key(value: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", value.lower())
+    return "".join(character for character in value.lower() if character.isalnum())
 
 
 def _normal_string(value: Any) -> str:
@@ -189,9 +225,13 @@ def _normal_bool(value: Any) -> bool:
 
 
 def _normal_ids(value: Any) -> tuple[int, ...]:
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple)):
         return tuple(sorted(_int(item, "order id") for item in value))
-    return tuple(sorted(int(item) for item in re.findall(r"-?\d+", str(value or ""))))
+    text = str(value or "").strip()
+    if text.startswith(r"\t"):
+        text = text[2:]
+    tokens = text.replace(",", " ").split()
+    return tuple(sorted(_int(item, "order id") for item in tokens))
 
 
 def _decimal_export_matches(json_value: Any, csv_value: Any) -> bool:
@@ -371,34 +411,38 @@ class QuantConnectResultImporter(BaseImporter):
             source_quantities[order_id] = quantity
             value = _decimal(raw.get("value", 0), "order.value")
             order = {
-                    "id": order_id,
-                    "type": type_code,
-                    "type_label": _ORDER_TYPE_LABELS.get(type_code, f"Unknown ({type_code})"),
-                    "status": status_code,
-                    "status_label": _ORDER_STATUS_LABELS.get(status_code, f"Unknown ({status_code})"),
-                    "direction": direction_code,
-                    "direction_label": _ORDER_DIRECTIONS.get(direction_code, f"Unknown ({direction_code})"),
-                    "contingent_id": _int(raw.get("contingentId", 0), "order.contingentId"),
-                    "broker_ids": broker_ids,
-                    "symbol": symbol,
-                    "symbol_id": symbol_id,
-                    "permanent_ticker": permanent_ticker,
-                    "price": float(price),
-                    "currency": str(raw.get("priceCurrency") or ""),
-                    "time": _canonical_time(raw.get("time")),
-                    "created_time": _canonical_time(raw.get("createdTime")),
-                    "fill_time": _canonical_time(raw.get("lastFillTime")),
-                    "quantity": float(quantity),
-                    "tag": str(raw.get("tag") or ""),
-                    "properties": _sorted_copy(raw.get("properties", {})),
-                    "security_type": _int(raw.get("securityType", 0), "order.securityType"),
-                    "value": float(value),
-                    "order_submission_data": _sorted_copy(raw.get("orderSubmissionData")),
-                    "is_marketable": bool(raw.get("isMarketable", False)),
-                    "price_adjustment_mode": _int(
-                        raw.get("priceAdjustmentMode", 0), "order.priceAdjustmentMode"
-                    ),
-                }
+                "id": order_id,
+                "type": type_code,
+                "type_label": _ORDER_TYPE_LABELS.get(type_code, f"Unknown ({type_code})"),
+                "status": status_code,
+                "status_label": _ORDER_STATUS_LABELS.get(
+                    status_code, f"Unknown ({status_code})"
+                ),
+                "direction": direction_code,
+                "direction_label": _ORDER_DIRECTIONS.get(
+                    direction_code, f"Unknown ({direction_code})"
+                ),
+                "contingent_id": _int(raw.get("contingentId", 0), "order.contingentId"),
+                "broker_ids": broker_ids,
+                "symbol": symbol,
+                "symbol_id": symbol_id,
+                "permanent_ticker": permanent_ticker,
+                "price": float(price),
+                "currency": str(raw.get("priceCurrency") or ""),
+                "time": _canonical_time(raw.get("time")),
+                "created_time": _canonical_time(raw.get("createdTime")),
+                "fill_time": _canonical_time(raw.get("lastFillTime")),
+                "quantity": float(quantity),
+                "tag": str(raw.get("tag") or ""),
+                "properties": _sorted_copy(raw.get("properties", {})),
+                "security_type": _int(raw.get("securityType", 0), "order.securityType"),
+                "value": float(value),
+                "order_submission_data": _sorted_copy(raw.get("orderSubmissionData")),
+                "is_marketable": bool(raw.get("isMarketable", False)),
+                "price_adjustment_mode": _int(
+                    raw.get("priceAdjustmentMode", 0), "order.priceAdjustmentMode"
+                ),
+            }
             normalized.append(order)
             comparison_rows.append(
                 {
@@ -425,7 +469,11 @@ class QuantConnectResultImporter(BaseImporter):
         for value in raw_trades:
             raw = _required_mapping(value, "closedTrade")
             symbols = _required_list(raw.get("symbols"), "closedTrade.symbols")
+            if not symbols:
+                raise ValueError("closedTrade.symbols must not be empty")
             symbol_names = tuple(sorted(_symbol_value(symbol) for symbol in symbols))
+            if any(not symbol for symbol in symbol_names):
+                raise ValueError("closedTrade.symbols must not contain empty symbols")
             key = (
                 _canonical_time(raw.get("entryTime")),
                 _canonical_time(raw.get("exitTime")),
@@ -776,44 +824,34 @@ class QuantConnectResultImporter(BaseImporter):
         json_row: Mapping[str, Any],
         headers: Mapping[str, str],
     ) -> bool:
-        numeric_fields = {
-            "id",
-            "price",
-            "quantity",
-            "value",
-            "entry_price",
-            "exit_price",
-            "pnl",
-            "fees",
-            "mae",
-            "mfe",
-            "drawdown",
-        }
-        time_fields = {"time", "entry_time", "exit_time"}
         for header, field in headers.items():
             csv_value = csv_row.get(header, "")
             json_value = json_row.get(field, "")
-            if field in numeric_fields:
-                if not _decimal_export_matches(json_value, csv_value):
-                    return False
-            elif field in time_fields:
-                if _canonical_time(csv_value) != _canonical_time(json_value):
-                    return False
-            elif field == "order_ids":
-                if _normal_ids(csv_value) != _normal_ids(json_value):
-                    return False
-            elif field == "is_win":
-                if _normal_bool(csv_value) != _normal_bool(json_value):
-                    return False
-            elif field == "direction":
-                csv_direction = _normal_string(csv_value).upper()
-                json_direction = _normal_string(json_value).upper()
-                equivalents = {"BUY": "LONG", "SELL": "SHORT"}
-                if equivalents.get(csv_direction, csv_direction) != equivalents.get(
-                    json_direction, json_direction
-                ):
-                    return False
-            else:
-                if _normal_string(csv_value) != _normal_string(json_value):
-                    return False
+            if not self._csv_field_matches(field, csv_value, json_value):
+                return False
         return True
+
+    def _csv_field_matches(self, field: str, csv_value: Any, json_value: Any) -> bool:
+        if field in _CSV_NUMERIC_FIELDS:
+            return _decimal_export_matches(json_value, csv_value)
+        if field in _CSV_TIME_FIELDS:
+            return _canonical_time(csv_value) == _canonical_time(json_value)
+        if field == "order_ids":
+            try:
+                return _normal_ids(csv_value) == _normal_ids(json_value)
+            except ValueError:
+                return False
+        if field == "is_win":
+            return _normal_bool(csv_value) == _normal_bool(json_value)
+        if field == "direction":
+            return self._csv_directions_match(csv_value, json_value)
+        return _normal_string(csv_value) == _normal_string(json_value)
+
+    @staticmethod
+    def _csv_directions_match(csv_value: Any, json_value: Any) -> bool:
+        equivalents = {"BUY": "LONG", "SELL": "SHORT"}
+        csv_direction = _normal_string(csv_value).upper()
+        json_direction = _normal_string(json_value).upper()
+        return equivalents.get(csv_direction, csv_direction) == equivalents.get(
+            json_direction, json_direction
+        )
