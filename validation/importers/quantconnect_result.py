@@ -47,6 +47,7 @@ _ORDER_STATUS_LABELS = {
 
 _ORDER_DIRECTIONS = {-1: "Hold", 0: "Buy", 1: "Sell"}
 _TRADE_DIRECTIONS = {0: "LONG", 1: "SHORT"}
+_ORDER_QUANTITY_SOURCE = "orders[].quantity"
 _UTC_OFFSET = "+00:00"
 _CURRENCY_PREFIXES = frozenset({"$", "€", "£"})
 _CSV_NUMERIC_FIELDS = frozenset(
@@ -754,7 +755,7 @@ class QuantConnectResultImporter(BaseImporter):
                     "fee_model": (
                         self._fee_model.metadata() if self._fee_model else None
                     ),
-                    "quantity_source": "orders[].quantity",
+                    "quantity_source": _ORDER_QUANTITY_SOURCE,
                     "derived_order_fees": [],
                     "derived_total": "0",
                     "portfolio_minus_closed_trade_remainder": "0.00",
@@ -774,7 +775,7 @@ class QuantConnectResultImporter(BaseImporter):
                     "evidence_classification": "unresolved",
                     "resolution_status": "fee_model_not_supplied",
                     "fee_model": None,
-                    "quantity_source": "orders[].quantity",
+                    "quantity_source": _ORDER_QUANTITY_SOURCE,
                     "derived_order_fees": [],
                     "derived_total": None,
                     "portfolio_minus_closed_trade_remainder": format(
@@ -827,7 +828,7 @@ class QuantConnectResultImporter(BaseImporter):
                 "rate_per_unit": format(rate_per_unit, "f"),
                 "minimum_fee": format(minimum_fee, "f"),
                 "currency": self._fee_model.currency,
-                "quantity_source": "orders[].quantity",
+                "quantity_source": _ORDER_QUANTITY_SOURCE,
                 "derived_order_fees": derived_order_fees,
                 "derived_total": format(derived_total, "f"),
                 "portfolio_minus_closed_trade_remainder": format(

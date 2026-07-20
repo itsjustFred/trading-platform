@@ -494,6 +494,7 @@ def test_explicit_fee_model_mismatch_fails_closed(tmp_path: Path):
     importer = QuantConnectResultImporter(
         fee_model=QuantConnectFeeModel.interactive_brokers_us_equities()
     )
+    source = _write_result(tmp_path, payload)
 
     with pytest.raises(
         ValueError,
@@ -503,7 +504,7 @@ def test_explicit_fee_model_mismatch_fails_closed(tmp_path: Path):
             r"remainder=7\.00$"
         ),
     ):
-        importer.load(_write_result(tmp_path, payload))
+        importer.load(source)
 
 
 def test_negative_fee_remainder_fails_closed_without_model(tmp_path: Path):
@@ -512,6 +513,7 @@ def test_negative_fee_remainder_fails_closed_without_model(tmp_path: Path):
     payload["state"]["OrderCount"] = "2"
     payload["statistics"]["Total Orders"] = "2"
     payload["statistics"]["Total Fees"] = "$2.00"
+    source = _write_result(tmp_path, payload)
 
     with pytest.raises(
         ValueError,
@@ -520,7 +522,7 @@ def test_negative_fee_remainder_fails_closed_without_model(tmp_path: Path):
             r"remainder=-0\.50$"
         ),
     ):
-        QuantConnectResultImporter().load(_write_result(tmp_path, payload))
+        QuantConnectResultImporter().load(source)
 
 
 @pytest.mark.parametrize(
