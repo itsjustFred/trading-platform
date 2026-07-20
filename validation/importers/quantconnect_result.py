@@ -7,6 +7,7 @@ import hashlib
 import json
 from collections import Counter, defaultdict
 from copy import deepcopy
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal, InvalidOperation
 from math import isfinite
@@ -253,8 +254,71 @@ def _decimal_export_matches(json_value: Any, csv_value: Any) -> bool:
     }
 
 
+@dataclass(frozen=True)
+class QuantConnectFeeModel:
+    """Explicit per-order fee assumptions used for reconciliation."""
+
+    identity: str
+    rate_per_unit: Decimal | str
+    minimum_fee: Decimal | str
+    currency: str
+
+    def __post_init__(self) -> None:
+        identity = str(self.identity).strip()
+        if not identity:
+            raise ValueError("fee_model.identity must not be empty")
+        rate_per_unit = _decimal(
+            self.rate_per_unit, "fee_model.rate_per_unit"
+        )
+        if rate_per_unit < 0:
+            raise ValueError("fee_model.rate_per_unit must not be negative")
+        minimum_fee = _decimal(self.minimum_fee, "fee_model.minimum_fee")
+        if minimum_fee < 0:
+            raise ValueError("fee_model.minimum_fee must not be negative")
+        currency = str(self.currency).strip()
+        if (
+            len(currency) != 3
+            or not currency.isascii()
+            or not currency.isalpha()
+            or currency != currency.upper()
+        ):
+            raise ValueError(
+                "fee_model.currency must be a three-letter uppercase code"
+            )
+        object.__setattr__(self, "identity", identity)
+        object.__setattr__(self, "rate_per_unit", rate_per_unit)
+        object.__setattr__(self, "minimum_fee", minimum_fee)
+        object.__setattr__(self, "currency", currency)
+
+    @classmethod
+    def interactive_brokers_us_equities(cls) -> QuantConnectFeeModel:
+        return cls(
+            identity="interactive_brokers_us_equities",
+            rate_per_unit="0.005",
+            minimum_fee="1.00",
+            currency="USD",
+        )
+
+    def metadata(self) -> dict[str, str]:
+        return {
+            "identity": self.identity,
+            "rate_per_unit": format(self.rate_per_unit, "f"),
+            "minimum_fee": format(self.minimum_fee, "f"),
+            "currency": self.currency,
+        }
+
+
 class QuantConnectResultImporter(BaseImporter):
     """Load a completed QuantConnect result export without inventing evidence."""
+
+    def __init__(self, fee_model: QuantConnectFeeModel | None = None) -> None:
+        if fee_model is not None and not isinstance(
+            fee_model, QuantConnectFeeModel
+        ):
+            raise ValueError(
+                "fee_model must be a QuantConnectFeeModel or None"
+            )
+        self._fee_model = fee_model
 
     def load(
         self,
@@ -663,8 +727,64 @@ class QuantConnectResultImporter(BaseImporter):
             )
         referenced_ids = sorted(referenced_order_ids)
         unreferenced_ids = sorted(all_order_ids.difference(referenced_ids))
-        rate_per_unit = Decimal("0.005")
-        minimum_fee = Decimal("1.00")
+        fee_remainder = portfolio_total - closed_total
+        if fee_remainder < 0:
+            raise ValueError(
+                "closed-trade fees exceed portfolio total fees: "
+                f"remainder={format(fee_remainder, 'f')}"
+            )
+        if not unreferenced_ids:
+            if fee_remainder != Decimal("0"):
+                raise ValueError(
+                    "portfolio total fees do not reconcile with closed-trade "
+                    "fees when every order is referenced: "
+                    f"remainder={format(fee_remainder, 'f')}"
+                )
+            return {
+                "portfolio_total_fees": float(portfolio_total),
+                "closed_trade_total_fees": float(closed_total),
+                "fee_remainder": float(fee_remainder),
+                "referenced_order_count": len(referenced_ids),
+                "referenced_order_ids": referenced_ids,
+                "unreferenced_order_count": 0,
+                "unreferenced_order_ids": [],
+                "unreferenced_order_fee_derivation": {
+                    "evidence_classification": "not_applicable",
+                    "resolution_status": "no_unreferenced_orders",
+                    "fee_model": (
+                        self._fee_model.metadata() if self._fee_model else None
+                    ),
+                    "quantity_source": "orders[].quantity",
+                    "derived_order_fees": [],
+                    "derived_total": "0",
+                    "portfolio_minus_closed_trade_remainder": "0.00",
+                    "reconciliation_delta": "0",
+                },
+            }
+        if self._fee_model is None:
+            return {
+                "portfolio_total_fees": float(portfolio_total),
+                "closed_trade_total_fees": float(closed_total),
+                "fee_remainder": float(fee_remainder),
+                "referenced_order_count": len(referenced_ids),
+                "referenced_order_ids": referenced_ids,
+                "unreferenced_order_count": len(unreferenced_ids),
+                "unreferenced_order_ids": unreferenced_ids,
+                "unreferenced_order_fee_derivation": {
+                    "evidence_classification": "unresolved",
+                    "resolution_status": "fee_model_not_supplied",
+                    "fee_model": None,
+                    "quantity_source": "orders[].quantity",
+                    "derived_order_fees": [],
+                    "derived_total": None,
+                    "portfolio_minus_closed_trade_remainder": format(
+                        fee_remainder, "f"
+                    ),
+                    "reconciliation_delta": None,
+                },
+            }
+        rate_per_unit = self._fee_model.rate_per_unit
+        minimum_fee = self._fee_model.minimum_fee
         derived_order_fees: list[dict[str, Any]] = []
         derived_total = Decimal("0")
         for order_id in unreferenced_ids:
@@ -678,7 +798,6 @@ class QuantConnectResultImporter(BaseImporter):
                     "derived_fee": format(derived_fee, "f"),
                 }
             )
-        fee_remainder = portfolio_total - closed_total
         reconciliation_delta = derived_total - fee_remainder
         if reconciliation_delta != Decimal("0"):
             raise ValueError(
@@ -697,10 +816,17 @@ class QuantConnectResultImporter(BaseImporter):
             "unreferenced_order_ids": unreferenced_ids,
             "unreferenced_order_fee_derivation": {
                 "evidence_classification": "derived_strong",
-                "formula": "max(1 USD, abs(quantity) * 0.005 USD)",
+                "resolution_status": "reconciled",
+                "fee_model": self._fee_model.metadata(),
+                "formula": (
+                    f"max({format(minimum_fee.normalize(), 'f')} "
+                    f"{self._fee_model.currency}, abs(quantity) * "
+                    f"{format(rate_per_unit, 'f')} "
+                    f"{self._fee_model.currency})"
+                ),
                 "rate_per_unit": format(rate_per_unit, "f"),
                 "minimum_fee": format(minimum_fee, "f"),
-                "currency": "USD",
+                "currency": self._fee_model.currency,
                 "quantity_source": "orders[].quantity",
                 "derived_order_fees": derived_order_fees,
                 "derived_total": format(derived_total, "f"),

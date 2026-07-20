@@ -8,7 +8,10 @@ from pathlib import Path
 
 import pytest
 
-from validation.importers.quantconnect_result import QuantConnectResultImporter
+from validation.importers.quantconnect_result import (
+    QuantConnectFeeModel,
+    QuantConnectResultImporter,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -299,7 +302,9 @@ def test_duplicate_closed_trade_id_fails_closed(tmp_path: Path):
 @pytest.fixture(scope="module")
 def golden_reference():
     assert RESULT_JSON.is_file(), f"Missing external QC reference: {RESULT_JSON}"
-    return QuantConnectResultImporter().load(
+    return QuantConnectResultImporter(
+        fee_model=QuantConnectFeeModel.interactive_brokers_us_equities()
+    ).load(
         RESULT_JSON,
         orders_csv=ORDERS_CSV,
         trades_csv=TRADES_CSV,
@@ -429,6 +434,13 @@ def test_real_export_derives_unreferenced_order_fees_from_source_quantities(
         264,
     ]
     assert derivation["evidence_classification"] == "derived_strong"
+    assert derivation["resolution_status"] == "reconciled"
+    assert derivation["fee_model"] == {
+        "identity": "interactive_brokers_us_equities",
+        "rate_per_unit": "0.005",
+        "minimum_fee": "1.00",
+        "currency": "USD",
+    }
     assert derivation["formula"] == "max(1 USD, abs(quantity) * 0.005 USD)"
     assert derivation["rate_per_unit"] == "0.005"
     assert derivation["minimum_fee"] == "1.00"
@@ -442,6 +454,99 @@ def test_real_export_derives_unreferenced_order_fees_from_source_quantities(
         observed_remainder
     )
     assert Decimal(derivation["reconciliation_delta"]) == Decimal("0")
+
+
+def test_default_fee_reconciliation_leaves_unreferenced_fees_unresolved(
+    tmp_path: Path,
+):
+    payload = _valid_result()
+    payload["orders"]["2"] = _order(2)
+    payload["state"]["OrderCount"] = "2"
+    payload["statistics"]["Total Orders"] = "2"
+    payload["statistics"]["Total Fees"] = "$9.50"
+
+    reference = QuantConnectResultImporter().load(_write_result(tmp_path, payload))
+    fees = reference.raw_metadata["fee_reconciliation"]
+    derivation = fees["unreferenced_order_fee_derivation"]
+
+    assert fees["portfolio_total_fees"] == pytest.approx(9.5)
+    assert fees["closed_trade_total_fees"] == pytest.approx(2.5)
+    assert fees["fee_remainder"] == pytest.approx(7.0)
+    assert fees["unreferenced_order_ids"] == [2]
+    assert derivation == {
+        "evidence_classification": "unresolved",
+        "resolution_status": "fee_model_not_supplied",
+        "fee_model": None,
+        "quantity_source": "orders[].quantity",
+        "derived_order_fees": [],
+        "derived_total": None,
+        "portfolio_minus_closed_trade_remainder": "7.00",
+        "reconciliation_delta": None,
+    }
+
+
+def test_explicit_fee_model_mismatch_fails_closed(tmp_path: Path):
+    payload = _valid_result()
+    payload["orders"]["2"] = _order(2)
+    payload["state"]["OrderCount"] = "2"
+    payload["statistics"]["Total Orders"] = "2"
+    payload["statistics"]["Total Fees"] = "$9.50"
+    importer = QuantConnectResultImporter(
+        fee_model=QuantConnectFeeModel.interactive_brokers_us_equities()
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"^derived unreferenced-order fees do not reconcile with "
+            r"portfolio total minus closed-trade total: derived=1\.00, "
+            r"remainder=7\.00$"
+        ),
+    ):
+        importer.load(_write_result(tmp_path, payload))
+
+
+def test_negative_fee_remainder_fails_closed_without_model(tmp_path: Path):
+    payload = _valid_result()
+    payload["orders"]["2"] = _order(2)
+    payload["state"]["OrderCount"] = "2"
+    payload["statistics"]["Total Orders"] = "2"
+    payload["statistics"]["Total Fees"] = "$2.00"
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"^closed-trade fees exceed portfolio total fees: "
+            r"remainder=-0\.50$"
+        ),
+    ):
+        QuantConnectResultImporter().load(_write_result(tmp_path, payload))
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"identity": ""},
+        {"rate_per_unit": "-0.001"},
+        {"rate_per_unit": "NaN"},
+        {"minimum_fee": "-1"},
+        {"minimum_fee": "Infinity"},
+        {"currency": ""},
+        {"currency": "US"},
+        {"currency": "usd"},
+    ],
+)
+def test_fee_model_rejects_invalid_parameters(overrides: dict[str, str]):
+    parameters = {
+        "identity": "custom_fee_model",
+        "rate_per_unit": "0.005",
+        "minimum_fee": "1.00",
+        "currency": "USD",
+    }
+    parameters.update(overrides)
+
+    with pytest.raises(ValueError, match=r"^fee_model\."):
+        QuantConnectFeeModel(**parameters)
 
 
 def test_fee_derivation_preserves_source_decimal_quantity(tmp_path: Path):
@@ -463,7 +568,9 @@ def test_fee_derivation_preserves_source_decimal_quantity(tmp_path: Path):
         encoding="utf-8",
     )
 
-    reference = QuantConnectResultImporter().load(source)
+    reference = QuantConnectResultImporter(
+        fee_model=QuantConnectFeeModel.interactive_brokers_us_equities()
+    ).load(source)
     derivation = reference.raw_metadata["fee_reconciliation"][
         "unreferenced_order_fee_derivation"
     ]
