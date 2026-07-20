@@ -514,6 +514,7 @@ def test_negative_fee_remainder_fails_closed_without_model(tmp_path: Path):
     payload["statistics"]["Total Orders"] = "2"
     payload["statistics"]["Total Fees"] = "$2.00"
     source = _write_result(tmp_path, payload)
+    importer = QuantConnectResultImporter()
 
     with pytest.raises(
         ValueError,
@@ -522,7 +523,7 @@ def test_negative_fee_remainder_fails_closed_without_model(tmp_path: Path):
             r"remainder=-0\.50$"
         ),
     ):
-        QuantConnectResultImporter().load(source)
+        importer.load(source)
 
 
 @pytest.mark.parametrize(
