@@ -377,7 +377,9 @@ def _persist_optimization_result(result: dict[str, Any], output_path: Path) -> N
         raise ValueError("Optimization output path must stay inside OPTIMIZATIONS_DIR")
 
     output_directory.mkdir(parents=True, exist_ok=True)
-    validated_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    output_filename = validated_path.name
+    with (output_directory / output_filename).open("w", encoding="utf-8") as output_file:
+        json.dump(result, output_file, indent=2)
 
 
 def optimize_portfolio_allocation(
