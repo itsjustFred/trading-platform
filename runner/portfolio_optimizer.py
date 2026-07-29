@@ -143,6 +143,50 @@ def _normalize_weights(weights: np.ndarray) -> np.ndarray:
     return weights / total
 
 
+def _common_timestamps(
+    curves: list[list[StrategyEquityPoint]],
+    require_overlap: bool,
+) -> list[int]:
+    """Return timestamps that are valid for all strategy lifetimes."""
+    if require_overlap:
+        common_times = {point.time for point in curves[0]}
+        for curve in curves[1:]:
+            common_times &= {point.time for point in curve}
+        return sorted(common_times)
+
+    window_start = max(min(point.time for point in curve) for curve in curves)
+    window_end = min(max(point.time for point in curve) for curve in curves)
+    if window_start > window_end:
+        return []
+    return sorted(
+        {
+            point.time
+            for curve in curves
+            for point in curve
+            if window_start <= point.time <= window_end
+        }
+    )
+
+
+def _aligned_curve_values(
+    curve: list[StrategyEquityPoint],
+    sorted_times: list[int],
+    require_overlap: bool,
+) -> list[float]:
+    """Align one curve to prepared timestamps without crossing its lifetime."""
+    equity_values = {point.time: point.equity for point in curve}
+    if require_overlap:
+        return [equity_values[timestamp] for timestamp in sorted_times]
+
+    prior_times = [timestamp for timestamp in equity_values if timestamp <= sorted_times[0]]
+    last_value = equity_values[max(prior_times)]
+    aligned_values = []
+    for timestamp in sorted_times:
+        last_value = equity_values.get(timestamp, last_value)
+        aligned_values.append(last_value)
+    return aligned_values
+
+
 def _align_equity_curves(
     curves: list[list[StrategyEquityPoint]],
     require_overlap: bool = False,
@@ -155,63 +199,18 @@ def _align_equity_curves(
                          If False (default), use the union of timestamps within
                          the common covered time window, with forward-fill.
     """
-    if not curves:
-        return np.array([]).reshape(0, 0)
+    if not curves or any(not curve for curve in curves):
+        return np.empty((0, 0))
 
-    if any(not curve for curve in curves):
-        return np.array([]).reshape(0, 0)
+    sorted_times = _common_timestamps(curves, require_overlap)
+    if not sorted_times:
+        return np.empty((0, len(curves)))
 
-    if require_overlap:
-        # Find timestamps present in ALL curves (intersection)
-        common_times = None
-        for curve in curves:
-            curve_times = {pt.time for pt in curve}
-            if common_times is None:
-                common_times = curve_times
-            else:
-                common_times &= curve_times
-        sorted_times = sorted(common_times) if common_times else []
-    else:
-        # Restrict the union to the time window covered by every strategy so
-        # forward-fill cannot invent pre-inception or post-end equity.
-        window_start = max(min(pt.time for pt in curve) for curve in curves)
-        window_end = min(max(pt.time for pt in curve) for curve in curves)
-        if window_start > window_end:
-            return np.array([]).reshape(0, 0)
-        sorted_times = sorted({
-            pt.time
-            for curve in curves
-            for pt in curve
-            if window_start <= pt.time <= window_end
-        })
-
-    n_points = len(sorted_times)
-    n_strategies = len(curves)
-    aligned = np.zeros((n_points, n_strategies))
-
-    if n_points == 0:
-        return aligned
-
-    for col, curve in enumerate(curves):
-        equity_values = {}
-        for pt in curve:
-            equity_values[pt.time] = pt.equity
-
-        if require_overlap:
-            # No forward-fill needed in overlap window - all timestamps exist
-            for row, t in enumerate(sorted_times):
-                aligned[row, col] = equity_values.get(t, 0.0)
-        else:
-            # Seed from a real value at or before the common window, then
-            # forward-fill only gaps inside that window.
-            prior_times = [t for t in equity_values if t <= sorted_times[0]]
-            last_val = equity_values[max(prior_times)]
-            for row, t in enumerate(sorted_times):
-                if t in equity_values:
-                    last_val = equity_values[t]
-                aligned[row, col] = last_val
-
-    return aligned
+    aligned_columns = [
+        _aligned_curve_values(curve, sorted_times, require_overlap)
+        for curve in curves
+    ]
+    return np.array(aligned_columns, dtype=float).T
 
 
 def _compute_correlation_matrix(returns: np.ndarray) -> np.ndarray:
@@ -370,6 +369,17 @@ def _build_optimization_result(
 OPTIMIZATIONS_DIR = Path(__file__).resolve().parent.parent / "data" / "optimizations"
 
 
+def _persist_optimization_result(result: dict[str, Any], output_path: Path) -> None:
+    """Persist a result only inside the configured optimization directory."""
+    output_directory = OPTIMIZATIONS_DIR.resolve()
+    validated_path = output_path.resolve()
+    if validated_path.parent != output_directory:
+        raise ValueError("Optimization output path must stay inside OPTIMIZATIONS_DIR")
+
+    output_directory.mkdir(parents=True, exist_ok=True)
+    validated_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+
+
 def optimize_portfolio_allocation(
     backtest_ids: list[str],
     target_sharpe: float = 1.5,
@@ -463,8 +473,7 @@ def optimize_portfolio_allocation(
         oos_metrics,
     )
 
-    OPTIMIZATIONS_DIR.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(result, indent=2))
+    _persist_optimization_result(result, output_path)
     return result
 
 

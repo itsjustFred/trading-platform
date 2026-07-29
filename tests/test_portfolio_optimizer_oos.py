@@ -9,6 +9,7 @@ from runner.portfolio_optimizer import (
     _compute_correlation_matrix,
     _compute_oos_metrics,
     _parse_time_to_ts,
+    _persist_optimization_result,
     _portfolio_sharpe_from_weights,
     _split_equity_curves_by_time,
     optimize_portfolio_allocation,
@@ -488,6 +489,21 @@ def test_optimize_portfolio_allocation_handles_all_failed_trials(
         "message": "No optimization trial completed successfully",
         "backtest_ids": ["strategy_1", "strategy_2"],
     }
+
+
+def test_persist_optimization_result_rejects_path_outside_directory(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """Persistence refuses paths outside the configured optimization directory."""
+    import runner.portfolio_optimizer as po_module
+
+    monkeypatch.setattr(po_module, "OPTIMIZATIONS_DIR", tmp_path / "optimizations")
+
+    with np.testing.assert_raises(ValueError):
+        _persist_optimization_result({}, tmp_path / "outside.json")
+
+    assert not (tmp_path / "outside.json").exists()
 
 
 def test_portfolio_optimizer_with_train_months_oos_split(monkeypatch, tmp_path) -> None:
