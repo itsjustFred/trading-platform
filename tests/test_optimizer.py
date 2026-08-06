@@ -165,6 +165,15 @@ def test_has_ohlcv_bars_in_range_does_not_treat_glob_metacharacters_as_wildcards
     )
 
 
+def _forbid_call(message: str, exc_type: type[Exception] = AssertionError):
+    """Return a callable that raises if the patched function is invoked."""
+
+    def _forbidden(*args, **kwargs):
+        raise exc_type(message)
+
+    return _forbidden
+
+
 def _allow_bar_coverage_preflight(monkeypatch) -> None:
     monkeypatch.setattr(optimizer_module, "ensure_backtest_data", lambda **kwargs: [])
     monkeypatch.setattr(optimizer_module, "has_ohlcv_bars_in_range", lambda **kwargs: True)
@@ -301,9 +310,7 @@ def test_run_optimization_rejects_empty_test_bar_segment_before_study(
     monkeypatch.setattr(
         optimizer_module,
         "_run_vectorbt_backtest",
-        lambda config, strategy_path: (_ for _ in ()).throw(
-            AssertionError("Backtest started before exact bar coverage validation")
-        ),
+        _forbid_call("Backtest started before exact bar coverage validation"),
     )
 
     with pytest.raises(ValueError, match=r"test.*AAPL 1d"):
@@ -339,9 +346,7 @@ def test_run_optimization_rejects_empty_train_bar_segment_before_study(
     monkeypatch.setattr(
         optimizer_module.optuna,
         "create_study",
-        lambda **kwargs: (_ for _ in ()).throw(
-            AssertionError("Optuna study started before train coverage validation")
-        ),
+        _forbid_call("Optuna study started before train coverage validation"),
     )
 
     with pytest.raises(ValueError, match=r"train.*AAPL 1d"):
@@ -381,9 +386,7 @@ def test_run_optimization_checks_every_candidate_universe_symbol_before_study(
     monkeypatch.setattr(
         optimizer_module.optuna,
         "create_study",
-        lambda **kwargs: (_ for _ in ()).throw(
-            AssertionError("Optuna study started before candidate coverage validation")
-        ),
+        _forbid_call("Optuna study started before candidate coverage validation"),
     )
 
     with pytest.raises(ValueError, match=r"test.*MSFT 1d"):
@@ -515,7 +518,7 @@ def test_run_optimization_propagates_backtest_errors(monkeypatch, tmp_path: Path
     monkeypatch.setattr(
         optimizer_module,
         "_run_vectorbt_backtest",
-        lambda config, strategy_path: (_ for _ in ()).throw(RuntimeError("strategy blew up")),
+        _forbid_call("strategy blew up", RuntimeError),
     )
 
     with pytest.raises(RuntimeError, match="strategy blew up"):
