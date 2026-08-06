@@ -30,7 +30,7 @@ const TARGET_METRIC_ALIASES: Record<string, string> = {
 
 export function resolveOptimizationMetricKey(targetMetric: string): string {
   const normalized = String(targetMetric || "").trim().toLowerCase();
-  return Object.prototype.hasOwnProperty.call(TARGET_METRIC_ALIASES, normalized)
+  return Object.hasOwn(TARGET_METRIC_ALIASES, normalized)
     ? TARGET_METRIC_ALIASES[normalized]
     : normalized;
 }
