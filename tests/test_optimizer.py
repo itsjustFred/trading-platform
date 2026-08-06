@@ -39,7 +39,7 @@ def test_optimization_config_accepts_current_train_test_splits(train_split_pct: 
 
 
 def test_optimization_config_enforces_inclusive_train_split_upper_bound():
-    assert _optimization_config(train_split_pct=0.95).train_split_pct == 0.95
+    assert _optimization_config(train_split_pct=0.95).train_split_pct == pytest.approx(0.95)
 
     with pytest.raises(ValidationError) as exc_info:
         _optimization_config(train_split_pct=0.96)
@@ -572,7 +572,8 @@ def test_run_risk_parity_covariance_optimization_saves_weights(monkeypatch, tmp_
     assert payload["target_metric"] == "risk_parity_score"
     assert set(payload["best_symbols"]) <= {"SPY", "TLT", "GLD"}
     assert payload["effective_best_parameters"]["risk_parity_weights"]
-    assert sum(payload["effective_best_parameters"]["risk_parity_weights"].values()) == pytest.approx(1.0)
+    weights = payload["effective_best_parameters"]["risk_parity_weights"].values()
+    assert sum(weights) == pytest.approx(1.0)
     assert payload["risk_parity"]["evaluated_universes"]
     saved_files = list(optimizations_dir.glob("rp_cov_rp-base_*.json"))
     assert len(saved_files) == 1

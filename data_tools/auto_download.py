@@ -132,6 +132,21 @@ def _resolve_data_root(data_dir: str | Path) -> Path:
     return DATA_DIR
 
 
+def _parquet_has_bar_in_range(path: Path, start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> bool:
+    """Return whether the parquet at ``path`` has any timestamp within ``[start_ts, end_ts]``."""
+    try:
+        frame = pd.read_parquet(path, columns=["timestamp"])
+    except Exception as exc:
+        logger.warning("Could not inspect OHLCV timestamps for %s: %s", path, exc)
+        return False
+    if "timestamp" not in frame.columns or frame.empty:
+        return False
+    timestamps = pd.to_datetime(
+        frame["timestamp"], utc=True, errors="coerce", format="mixed"
+    ).dropna()
+    return ((timestamps >= start_ts) & (timestamps <= end_ts)).any()
+
+
 def has_ohlcv_bars_in_range(
     *,
     symbol: str,
@@ -157,20 +172,7 @@ def has_ohlcv_bars_in_range(
         for path in ohlcv_root.rglob(f"**/{normalized_timeframe}.parquet")
         if path.parent.name.upper() == normalized_symbol
     )
-    for path in matches:
-        try:
-            frame = pd.read_parquet(path, columns=["timestamp"])
-        except Exception as exc:
-            logger.warning("Could not inspect OHLCV timestamps for %s: %s", path, exc)
-            continue
-        if "timestamp" not in frame.columns or frame.empty:
-            continue
-        timestamps = pd.to_datetime(
-            frame["timestamp"], utc=True, errors="coerce", format="mixed"
-        ).dropna()
-        if ((timestamps >= start_ts) & (timestamps <= end_ts)).any():
-            return True
-    return False
+    return any(_parquet_has_bar_in_range(path, start_ts, end_ts) for path in matches)
 
 
 def _build_requirements(
@@ -209,7 +211,14 @@ def _build_requirements(
 
 def _resolve_intrabar_timeframe(base_timeframe: str, modeling_resolution: str | None) -> str | None:
     normalized = str(modeling_resolution or "").strip().lower()
-    if normalized in {"", "main", "main_timeframe", "open_close", "open-close", base_timeframe.lower()}:
+    if normalized in {
+        "",
+        "main",
+        "main_timeframe",
+        "open_close",
+        "open-close",
+        base_timeframe.lower(),
+    }:
         return None
     if normalized in {"m1", "1min", "min1"}:
         normalized = "1m"
@@ -423,7 +432,9 @@ def _download_missing_ohlcv_data(
         except RuntimeError as exc:
             if "Missing Alpaca credentials" not in str(exc):
                 raise
-            logger.warning("Alpaca credentials missing; falling back to yfinance for %s", normalized_symbol)
+            logger.warning(
+                "Alpaca credentials missing; falling back to yfinance for %s", normalized_symbol
+            )
             from data_tools.downloaders.yfinance_dl import YFinanceDownloader
 
             YFinanceDownloader().download(
@@ -472,7 +483,9 @@ def _download_missing_ohlcv_data(
         )
         return
 
-    raise ValueError(f"Unsupported auto-download source '{selected_source}' for {normalized_symbol}")
+    raise ValueError(
+        f"Unsupported auto-download source '{selected_source}' for {normalized_symbol}"
+    )
 
 
 def _invalidate_catalog_cache(data_root: Path) -> None:

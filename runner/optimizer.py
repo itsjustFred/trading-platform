@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 import logging
 import math
-from itertools import combinations
 from datetime import datetime, timezone
+from itertools import combinations
 from pathlib import Path
 from typing import Any, Callable
 
@@ -551,7 +551,9 @@ def _run_risk_parity_covariance_optimization(
             data_dir=str(base_result.meta.data.get("data_dir") or ""),
         )
     if returns_frame.empty or len(returns_frame.columns) < 2:
-        raise ValueError("Risk parity covariance optimization requires at least two asset return series")
+        raise ValueError(
+            "Risk parity covariance optimization requires at least two asset return series"
+        )
 
     _emit_progress(progress_callback, 35.0, "Solving covariance risk parity weights.")
     selection = select_best_risk_parity_universe(
@@ -563,7 +565,9 @@ def _run_risk_parity_covariance_optimization(
     effective_best_params["asset_weights"] = dict(selection["best_weights"])
     effective_best_params["risk_parity_weights"] = dict(selection["best_weights"])
 
-    _emit_progress(progress_callback, 70.0, "Running OOS backtest for selected risk parity universe.")
+    _emit_progress(
+        progress_callback, 70.0, "Running OOS backtest for selected risk parity universe."
+    )
     test_result = _run_vectorbt_backtest(
         BacktestConfig(
             strategy_name=strategy_slug,
@@ -621,7 +625,9 @@ def _run_risk_parity_covariance_optimization(
 
     OPTIMIZATIONS_DIR.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(_json_safe(payload), indent=2), encoding="utf-8")
-    _emit_progress(progress_callback, 100.0, f"Risk parity optimization finished: {output_path.name}")
+    _emit_progress(
+        progress_callback, 100.0, f"Risk parity optimization finished: {output_path.name}"
+    )
     return payload
 
 
