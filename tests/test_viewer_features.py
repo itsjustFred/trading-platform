@@ -7,6 +7,7 @@ import logging
 import sys
 import threading
 import time
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -1252,12 +1253,27 @@ def test_data_download_coalesces_identical_active_request(viewer_client, monkeyp
     import viewer.main as viewer_app_module
 
     starts: list[str] = []
+    real_thread = threading.Thread
 
     class _NoStartThread:
         def __init__(self, *args, **kwargs):
             self.target = kwargs.get("target")
+            intercept = False
+            for frame_info in traceback.extract_stack():
+                if frame_info.filename.endswith("viewer/core.py") and frame_info.name in {
+                    "_start_data_task",
+                    "_start_dukascopy_task",
+                    "_start_jforex_task",
+                }:
+                    intercept = True
+                    break
+            if not intercept:
+                self._real = real_thread(*args, **kwargs)
 
         def start(self) -> None:
+            if hasattr(self, "_real"):
+                self._real.start()
+                return
             starts.append("started")
 
     monkeypatch.setattr(viewer_app_module.legacy_viewer.threading, "Thread", _NoStartThread)
@@ -1621,14 +1637,32 @@ def test_data_download_thread_start_failure_allows_retry(viewer_client, monkeypa
     import viewer.main as viewer_app_module
 
     starts = 0
+    real_thread = threading.Thread
 
     class _FailThenStartThread:
         def __init__(self, *args, **kwargs):
-            # Failure is injected by start(), so construction is intentionally empty.
-            pass
+            # Only intercept threads launched by the viewer task machinery; let
+            # other libraries (e.g. sentry) create their own real threads.
+            intercept = False
+            for frame_info in traceback.extract_stack():
+                if frame_info.filename.endswith("viewer/core.py") and frame_info.name in {
+                    "_start_data_task",
+                    "_start_dukascopy_task",
+                    "_start_jforex_task",
+                }:
+                    intercept = True
+                    break
+            if intercept:
+                self._intercepted = True
+            else:
+                self._intercepted = False
+                self._real = real_thread(*args, **kwargs)
 
         def start(self) -> None:
             nonlocal starts
+            if not self._intercepted:
+                self._real.start()
+                return
             starts += 1
             if starts == 1:
                 raise RuntimeError("thread unavailable")
@@ -1659,17 +1693,31 @@ def test_data_download_thread_construction_failure_allows_retry(
     import viewer.main as viewer_app_module
 
     constructions = 0
+    real_thread = threading.Thread
 
     class _FailThenConstructThread:
         def __init__(self, *args, **kwargs):
             nonlocal constructions
+            intercept = False
+            for frame_info in traceback.extract_stack():
+                if frame_info.filename.endswith("viewer/core.py") and frame_info.name in {
+                    "_start_data_task",
+                    "_start_dukascopy_task",
+                    "_start_jforex_task",
+                }:
+                    intercept = True
+                    break
+            if not intercept:
+                self._real = real_thread(*args, **kwargs)
+                return
             constructions += 1
             if constructions == 1:
                 raise ValueError("thread construction unavailable")
 
         def start(self) -> None:
             # A successful retry only needs to return without launching a real thread.
-            pass
+            if hasattr(self, "_real"):
+                self._real.start()
 
     monkeypatch.setattr(
         viewer_app_module.legacy_viewer.threading, "Thread", _FailThenConstructThread
