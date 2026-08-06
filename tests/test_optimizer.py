@@ -313,8 +313,9 @@ def test_run_optimization_rejects_empty_test_bar_segment_before_study(
         _forbid_call("Backtest started before exact bar coverage validation"),
     )
 
+    config = _optimization_config(train_split_pct=0.7)
     with pytest.raises(ValueError, match=r"test.*AAPL 1d"):
-        optimizer_module.run_optimization(_optimization_config(train_split_pct=0.7))
+        optimizer_module.run_optimization(config)
 
     assert study_calls == []
     assert len(ensure_calls) == 1
@@ -349,8 +350,9 @@ def test_run_optimization_rejects_empty_train_bar_segment_before_study(
         _forbid_call("Optuna study started before train coverage validation"),
     )
 
+    config = _optimization_config(train_split_pct=0.7)
     with pytest.raises(ValueError, match=r"train.*AAPL 1d"):
-        optimizer_module.run_optimization(_optimization_config(train_split_pct=0.7))
+        optimizer_module.run_optimization(config)
 
 
 def test_run_optimization_checks_every_candidate_universe_symbol_before_study(
@@ -389,17 +391,16 @@ def test_run_optimization_checks_every_candidate_universe_symbol_before_study(
         _forbid_call("Optuna study started before candidate coverage validation"),
     )
 
+    config = optimizer_module.OptimizationConfig(
+        base_backtest_id="base-demo",
+        target_metric="sharpe",
+        n_trials=1,
+        train_split_pct=0.7,
+        parameter_ranges={"window": {"type": "int", "min": 2, "max": 2}},
+        symbol_universes=[["AAPL", "MSFT"]],
+    )
     with pytest.raises(ValueError, match=r"test.*MSFT 1d"):
-        optimizer_module.run_optimization(
-            optimizer_module.OptimizationConfig(
-                base_backtest_id="base-demo",
-                target_metric="sharpe",
-                n_trials=1,
-                train_split_pct=0.7,
-                parameter_ranges={"window": {"type": "int", "min": 2, "max": 2}},
-                symbol_universes=[["AAPL", "MSFT"]],
-            )
-        )
+        optimizer_module.run_optimization(config)
 
     assert len(ensure_calls) == 1
     assert ensure_calls[0]["symbols"] == ["AAPL", "MSFT"]
