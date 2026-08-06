@@ -50,29 +50,31 @@ export function OptimizationResultsPage() {
   const { id } = useParams<{ id: string }>();
   const [optimization, setOptimization] = useState<OptimizationDetail | null>(null);
   const [backtestInfo, setBacktestInfo] = useState<BacktestInfo | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [loadedId, setLoadedId] = useState<string | null>(null);
   const [error, setError] = useState("");
+
+  const loading = loadedId !== id;
 
   useEffect(() => {
     if (!id) {
       return;
     }
 
-    setLoading(true);
     getOptimization(id)
       .then(async (payload) => {
+        setError("");
         setOptimization(payload);
+        setLoadedId(id);
         try {
           const info = await getBacktestInfo(payload.base_backtest_id);
           setBacktestInfo(info);
         } catch {
           setBacktestInfo(null);
         }
-        setLoading(false);
       })
       .catch((caughtError) => {
         setError(caughtError instanceof Error ? caughtError.message : "Could not load optimization.");
-        setLoading(false);
+        setLoadedId(id);
       });
   }, [id]);
 
