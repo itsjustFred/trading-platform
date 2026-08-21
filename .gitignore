@@ -46,6 +46,7 @@ frontend/dist/
 *.parquet
 *.csv
 !tests/fixtures/*.csv
+!tests/fixtures/validation/quantconnect-reference/*.csv
 !tests/fixtures/*.json
 
 # Cache/temp
