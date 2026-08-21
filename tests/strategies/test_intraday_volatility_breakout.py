@@ -503,6 +503,9 @@ def test_candle_close_signal_emits_previous_bar_for_next_open_execution():
     )
     assert pd.notna(indicators["sl_price"].iloc[entry_idx])
     assert pd.notna(indicators["stop_distance"].iloc[entry_idx])
+    assert indicators["entry_reference_price"].iloc[entry_idx] == pytest.approx(
+        df["close"].iloc[entry_idx + 1]
+    )
 
 
 def test_entry_indicators_include_signal_contract_metadata():
