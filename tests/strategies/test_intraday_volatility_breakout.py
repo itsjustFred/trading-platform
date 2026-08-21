@@ -444,6 +444,9 @@ def test_candle_close_signal_emits_previous_bar_for_next_open_execution():
     assert pd.Timestamp("2024-01-03 16:45", tz="UTC") in entry_times
     entry_idx = df.index[df["timestamp"] == pd.Timestamp("2024-01-03 16:45", tz="UTC")][0]
     assert indicators["direction"].iloc[entry_idx] == "LONG"
+    assert indicators["entry_reference_price"].iloc[entry_idx] == pytest.approx(
+        df["close"].iloc[entry_idx + 1]
+    )
     assert pd.notna(indicators["sl_price"].iloc[entry_idx])
     assert pd.notna(indicators["stop_distance"].iloc[entry_idx])
     assert indicators["entry_reference_price"].iloc[entry_idx] == pytest.approx(
@@ -466,21 +469,23 @@ def test_entry_indicators_include_signal_contract_metadata():
     )
 
     entries, exits, indicators, _ = mod.generate_signals(df, params)
+
+    assert entries.any()
     entry_idx = entries[entries].index[0]
-
-    assert indicators["strategy_id"].iloc[entry_idx] == "intraday_volatility_breakout"
-    assert indicators["order_timing"].iloc[entry_idx] == "next_bar_open"
-    assert indicators["order_type"].iloc[entry_idx] == "market"
-    assert indicators["entry_reference_price"].iloc[entry_idx] == pytest.approx(
-        df["close"].iloc[entry_idx]
+    entry_timestamp = pd.Timestamp(df.loc[entry_idx, "timestamp"], tz="UTC")
+    assert indicators["signal_id"].loc[entry_idx] == (
+        f"intraday_volatility_breakout:{entry_timestamp.isoformat()}:LONG"
     )
-    assert indicators["signal_id"].iloc[entry_idx].startswith(
-        "intraday_volatility_breakout:"
+    assert indicators["strategy_id"].loc[entry_idx] == "intraday_volatility_breakout"
+    assert indicators["order_timing"].loc[entry_idx] == "next_bar_open"
+    assert indicators["order_type"].loc[entry_idx] == "market"
+    assert indicators["entry_reference_price"].loc[entry_idx] == pytest.approx(
+        df.loc[entry_idx, "high"]
     )
-    assert indicators["direction"].iloc[entry_idx] in {"LONG", "SHORT"}
 
+    assert exits.any()
     exit_idx = exits[exits].index[0]
-    assert indicators["exit_reason"].iloc[exit_idx] in {"time_exit", "end_of_day"}
+    assert indicators["exit_reason"].loc[exit_idx] == "time_exit"
 
 
 def test_native_daily_ohlcv_overrides_intraday_resampled_atr():

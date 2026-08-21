@@ -264,6 +264,7 @@ def run_backtest(
     position_entry_prices: dict[str, float | None] = {t: None for t in TICKERS}
     position_entry_times: dict[str, pd.Timestamp | None] = {t: None for t in TICKERS}
     rebalance_schedule: dict[pd.Timestamp, dict[str, float]] = {}
+    portfolio_target_signals: list[dict[str, Any]] = []
     trades: list[dict[str, Any]] = []
     rebalance_attribution_pnls: list[float] = []
     portfolio_value_at_rebalance = float(initial_cash)
@@ -309,8 +310,33 @@ def run_backtest(
         spy_window = prices["SPY"].iloc[max(0, spy_idx - 199) : spy_idx + 1]
         spy_sma = spy_window.mean()
         spy_price = prices["SPY"].iloc[spy_idx]
-        if spy_price < spy_sma * 0.98:
+        hedge_active = bool(spy_price < spy_sma * 0.98)
+        if hedge_active:
             weights = apply_tail_risk_hedge(weights)
+
+        portfolio_target_signal_id = f"risk_parity:{reb_date.strftime('%Y-%m-%dT%H:%M:%SZ')}"
+        portfolio_target_signals.append(
+            {
+                "signal_id": portfolio_target_signal_id,
+                "strategy_id": "risk_parity",
+                "timestamp": reb_date.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "target_weights": {
+                    ticker: round(float(weights[ticker]), 8) for ticker in TICKERS
+                },
+                "rebalance_threshold": rebalance_threshold,
+                "cash_target": round(1.0 - sum(float(weights[ticker]) for ticker in TICKERS), 8),
+                "metadata": {
+                    "regime": regime,
+                    "hedge_active": hedge_active,
+                    "universe": list(TICKERS),
+                    "covariance_lookback_days": lookback_corr,
+                    "target_volatility": target_vol,
+                    "max_leverage": max_leverage,
+                    "min_weight": min_weight,
+                    "max_weight": max_weight,
+                },
+            }
+        )
 
         for ticker in TICKERS:
             prev_weight = current_weights.get(ticker, 0.0)
@@ -359,8 +385,9 @@ def run_backtest(
                     "position_size": round(abs(weights[ticker]) * current_portfolio_value, 2),
                     "pnl": round(pnl, 2),
                     "meta": {
+                        "portfolio_target_signal_id": portfolio_target_signal_id,
                         "regime": regime,
-                        "hedge_active": bool(spy_price < spy_sma * 0.98),
+                        "hedge_active": hedge_active,
                         "previous_weight": round(prev_weight, 8),
                         "target_weight": round(weights[ticker], 8),
                         "delta_weight": round(delta, 8),
@@ -442,6 +469,7 @@ def run_backtest(
 
     return {
         "portfolio_value": portfolio_value,
+        "portfolio_target_signals": portfolio_target_signals,
         "trades": trades,
         "stats": stats,
     }

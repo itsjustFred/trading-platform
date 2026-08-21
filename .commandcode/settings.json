@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Shell(python -m ruff check tests/test_risk_engine.py)"
+    ],
+    "deny": [],
+    "defaultMode": "default"
+  }
+}

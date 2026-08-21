@@ -186,9 +186,22 @@ def test_run_backtest_skips_small_rebalance_changes_and_fills_material_changes_a
     )
 
     trades = result["trades"]
+    target_signals = result["portfolio_target_signals"]
     jan_trades = [trade for trade in trades if trade["exit_time"].startswith("2024-01-02")]
     feb_trades = [trade for trade in trades if trade["exit_time"].startswith("2024-02-01")]
     mar_trades = [trade for trade in trades if trade["exit_time"].startswith("2024-03-01")]
+
+    assert [signal["timestamp"] for signal in target_signals] == [
+        "2024-01-02T00:00:00Z",
+        "2024-02-01T00:00:00Z",
+        "2024-03-01T00:00:00Z",
+    ]
+    mar_target = target_signals[-1]
+    assert mar_target["signal_id"] == "risk_parity:2024-03-01T00:00:00Z"
+    assert mar_target["strategy_id"] == "risk_parity"
+    assert mar_target["rebalance_threshold"] == pytest.approx(0.02)
+    assert set(mar_target["target_weights"]) == set(TICKERS)
+    assert mar_target["metadata"]["universe"] == list(TICKERS)
 
     assert len(jan_trades) == len(TICKERS)
     assert len(feb_trades) == 0
@@ -199,6 +212,8 @@ def test_run_backtest_skips_small_rebalance_changes_and_fills_material_changes_a
 
     mar_spy = next(trade for trade in mar_trades if trade["symbol"] == "SPY")
     mar_qqq = next(trade for trade in mar_trades if trade["symbol"] == "QQQ")
+    assert mar_spy["meta"]["portfolio_target_signal_id"] == mar_target["signal_id"]
+    assert mar_qqq["meta"]["portfolio_target_signal_id"] == mar_target["signal_id"]
     assert mar_spy["quantity"] == pytest.approx(0.03, abs=1e-6)
     assert mar_qqq["quantity"] == pytest.approx(0.03, abs=1e-6)
     assert mar_spy["entry_time"].startswith("2024-01-02")

@@ -34,7 +34,7 @@ COMPARISON_CASES: tuple[dict[str, Any], ...] = (
         "report_timeframe": "1h",
         "execution_timeframe": "1m",
         "start": "2018-01-01",
-        "end": "2026-05-28",
+        "end": "2026-06-23",
         "output": Path("data/backtests/intraday_volatility_breakout_eurusd_h1.json"),
         "use_native_daily_ohlcv": True,
     },
@@ -44,8 +44,8 @@ COMPARISON_CASES: tuple[dict[str, Any], ...] = (
         "execution_symbol": "USTEC",
         "report_timeframe": "15m",
         "execution_timeframe": "1m",
-        "start": "2018-01-02",
-        "end": "2026-06-22",
+        "start": "2018-01-01",
+        "end": "2026-06-23",
         "output": Path("data/backtests/intraday_volatility_breakout_nas100_m15.json"),
     },
     {
@@ -54,8 +54,8 @@ COMPARISON_CASES: tuple[dict[str, Any], ...] = (
         "execution_symbol": "US500",
         "report_timeframe": "1m",
         "execution_timeframe": "1m",
-        "start": "2018-01-02",
-        "end": "2026-06-22",
+        "start": "2018-01-01",
+        "end": "2026-06-23",
         "output": Path("data/backtests/intraday_volatility_breakout_sp500_m1.json"),
     },
 )
@@ -479,7 +479,7 @@ def main() -> None:
     parser.add_argument("--risk-pct", type=float, default=0.01)
     args = parser.parse_args()
 
-    conversion = _conversion_series(args.data_dir, "2018-01-01", "2026-06-22")
+    conversion = _conversion_series(args.data_dir, "2018-01-01", "2026-06-23")
     summary = [
         regenerate_case(case, data_dir=args.data_dir, capital=args.capital, risk_pct=args.risk_pct, conversion=conversion)
         for case in COMPARISON_CASES

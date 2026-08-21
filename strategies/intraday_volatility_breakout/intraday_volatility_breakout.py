@@ -409,39 +409,41 @@ def generate_signals(df: pd.DataFrame, params: dict):
     eod_exit_mask = is_last_bar
     exits = exit_time_mask | eod_exit_mask
 
-    # --- Contract metadata ---------------------------------------------------
+    # --- Signal/risk/execution contract metadata -------------------------------
     strategy_id = "intraday_volatility_breakout"
+    strategy_id_series = pd.Series(index=idx, dtype=object)
+    strategy_id_series.loc[entries] = strategy_id
+
     order_timing = pd.Series(index=idx, dtype=object)
     order_timing.loc[entries] = "next_bar_open"
     order_type = pd.Series(index=idx, dtype=object)
     order_type.loc[entries] = "market"
-    strategy_id_series = pd.Series(index=idx, dtype=object)
-    strategy_id_series.loc[entries] = strategy_id
-    raw_entries = long_entries | short_entries
-    entry_reference_price = close.where(raw_entries)
+
+    entry_reference_price = signal_price_long.where(long_entries).combine_first(
+        signal_price_short.where(short_entries)
+    )
     if use_candle_close:
         entry_reference_price = entry_reference_price.shift(-1)
 
+    signal_timestamps = pd.Series(idx, index=idx, dtype=object)
     if "timestamp" in df.columns:
-        signal_timestamps = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
-    elif hasattr(idx, "hour"):
-        signal_timestamps = pd.Series(pd.to_datetime(idx, utc=True, errors="coerce"), index=idx)
-    else:
-        signal_timestamps = pd.Series(idx.astype(str), index=idx)
+        timestamp_values = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+        signal_timestamps = pd.Series(
+            timestamp_values.to_list(),
+            index=idx,
+            dtype=object,
+        )
 
     signal_id = pd.Series(index=idx, dtype=object)
     for entry_idx in entries[entries].index:
         ts = signal_timestamps.loc[entry_idx]
-        if hasattr(ts, "isoformat") and pd.notna(ts):
-            timestamp_part = ts.isoformat()
-        else:
-            timestamp_part = str(ts)
+        timestamp_part = ts.isoformat() if hasattr(ts, "isoformat") and pd.notna(ts) else str(ts)
         side = direction.loc[entry_idx]
         signal_id.loc[entry_idx] = f"{strategy_id}:{timestamp_part}:{side}"
 
     exit_reason = pd.Series(index=idx, dtype=object)
     exit_reason.loc[exit_time_mask] = "time_exit"
-    exit_reason.loc[eod_exit_mask] = "end_of_day"
+    exit_reason.loc[eod_exit_mask & ~exit_time_mask] = "end_of_day"
 
     # --- Indicators ----------------------------------------------------------
     indicators_dict = {
