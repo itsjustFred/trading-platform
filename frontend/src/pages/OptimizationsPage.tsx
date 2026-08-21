@@ -4,6 +4,7 @@ import { ArrowUpRight, Target, Telescope } from "lucide-react";
 
 import { getOptimizations } from "../api/client";
 import type { OptimizationSummary } from "../api/types";
+import { classifyOptimizationOosEvidence } from "../lib/optimizationEvidence";
 
 function formatMetricValue(metric: string, value: number | string | boolean | null | undefined) {
   if (typeof value !== "number") {
@@ -198,6 +199,11 @@ export function OptimizationsPage() {
               optimization.target_metric === "net_profit" ? "total_pnl" : optimization.target_metric,
               optimization.best_value,
             );
+            const oosEvidence = classifyOptimizationOosEvidence(
+              optimization.target_metric,
+              optimization.best_value,
+              optimization.test_stats,
+            );
             return (
               <Link
                 key={optimization.id}
@@ -281,7 +287,7 @@ export function OptimizationsPage() {
                     }}
                   >
                     <div style={{ fontSize: "0.72rem", textTransform: "uppercase", letterSpacing: "0.12em", color: "#7dd3fc" }}>
-                      Best score
+                      In-sample selected score
                     </div>
                     <div style={{ marginTop: "8px", fontSize: "1.4rem", fontWeight: 700 }}>{bestMetric}</div>
                   </div>
@@ -299,6 +305,23 @@ export function OptimizationsPage() {
                     <div style={{ marginTop: "8px", fontSize: "1.4rem", fontWeight: 700 }}>
                       {formatMetricValue("sharpe_ratio", optimization.test_stats?.sharpe_ratio)}
                     </div>
+                  </div>
+                </div>
+
+                <div
+                  data-oos-evidence-state={oosEvidence.state}
+                  style={{
+                    borderRadius: "14px",
+                    border: `1px solid ${oosEvidence.border}`,
+                    background: oosEvidence.background,
+                    padding: "11px 12px",
+                  }}
+                >
+                  <div style={{ color: oosEvidence.tone, fontSize: "0.72rem", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.1em" }}>
+                    {oosEvidence.label}
+                  </div>
+                  <div style={{ marginTop: "5px", color: "#cbd5e1", fontSize: "0.76rem", lineHeight: 1.45 }}>
+                    {oosEvidence.message}
                   </div>
                 </div>
 
