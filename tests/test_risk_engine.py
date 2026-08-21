@@ -1,14 +1,14 @@
 import asyncio
+import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import math
 
 import pytest
 
 from live_runner.base_adapter import BaseLiveAdapter
 from live_runner.daemon import submit_order_with_risk
-from risk.engine import RiskEngine
 from risk.config import RiskConfig
+from risk.engine import RiskEngine
 from risk.models import RiskDecision, TradeSignal
 from shared.models import LiveDeploymentConfig, LiveSignal
 
@@ -46,10 +46,10 @@ def test_calculate_position_size_normal_case():
     assert sized.decision is not None
     assert sized.decision.accepted is True
     assert sized.decision.signal_id.startswith("legacy:EURUSD:1h:buy:")
-    assert sized.decision.quantity == 50.0
-    assert sized.decision.risk_distance == 2.0
-    assert sized.decision.stop_price_used == 98.0
-    assert sized.decision.take_profit_used == 104.0
+    assert sized.decision.quantity == pytest.approx(50.0)
+    assert sized.decision.risk_distance == pytest.approx(2.0)
+    assert sized.decision.stop_price_used == pytest.approx(98.0)
+    assert sized.decision.take_profit_used == pytest.approx(104.0)
     assert sized.decision.rejection_reason is None
     assert sized.decision.metadata["stop_source"] == "signal"
 
@@ -121,7 +121,7 @@ def test_calculate_position_size_blocks_stop_on_wrong_side():
     assert sized.decision is not None
     assert sized.decision.accepted is False
     assert sized.decision.rejection_reason == "bad_stop_direction"
-    assert sized.decision.stop_price_used == 102.0
+    assert sized.decision.stop_price_used == pytest.approx(102.0)
 
 
 def test_calculate_position_size_missing_stop_loss_uses_fallback():

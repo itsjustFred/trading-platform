@@ -1,19 +1,20 @@
 """Tests for portfolio optimizer OOS (Out-of-Sample) validation feature."""
 
-import pytest
 import numpy as np
 from sqlmodel import SQLModel, create_engine
 
-from shared.models import BacktestMeta, BacktestResult, EquityPoint
 from runner.portfolio_optimizer import (
-    _split_equity_curves_by_time,
-    _portfolio_sharpe_from_weights,
+    StrategyEquityPoint,
     _align_equity_curves,
     _compute_correlation_matrix,
-    StrategyEquityPoint,
+    _compute_oos_metrics,
     _parse_time_to_ts,
+    _persist_optimization_result,
+    _portfolio_sharpe_from_weights,
+    _split_equity_curves_by_time,
     optimize_portfolio_allocation,
 )
+from shared.models import BacktestMeta, BacktestResult, EquityPoint
 
 
 def test_strategy_equity_point_creation() -> None:
@@ -67,7 +68,7 @@ def test_split_equity_curves_basic() -> None:
 
     # Test period = last 3 months from end (max - 3 months = month 14)
     # train_end_ts = min + 12 months = month 12
-    # With 18 points (months 0-17): 
+    # With 18 points (months 0-17):
     #   train gets months 0-11 = 12 points (ts < month 12)
     #   gap: months 12-13 = 2 points (excluded)
     #   test gets months 14-17 = 4 points (ts >= month 14)
@@ -82,8 +83,11 @@ def test_split_equity_curves_empty() -> None:
     assert test == []
 
 
-def test_optimize_portfolio_allocation_returns_oos_sharpe_with_test_months(monkeypatch, tmp_path) -> None:
-    """Test that optimize_portfolio_allocation returns oos_sharpe when test_months is provided."""
+def test_optimize_portfolio_allocation_returns_oos_sharpe_with_test_months(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """OOS metrics are returned when test_months is provided."""
     # Create mock equity curves spanning 18 months for each strategy
     seconds_per_month = 30 * 24 * 60 * 60
     base_ts = 1700000000  # Starting timestamp
@@ -127,14 +131,18 @@ def test_optimize_portfolio_allocation_returns_oos_sharpe_with_test_months(monke
     )
 
     # Verify result structure
-    assert "status" not in result or result.get("status") != "error", f"Optimization failed: {result}"
+    assert "status" not in result or result.get("status") != "error", (
+        f"Optimization failed: {result}"
+    )
     assert "weights" in result
     assert "sharpe" in result
     assert len(result["weights"]) == 2
 
     # Verify OOS metrics are present when test_months is provided
     assert "oos_sharpe" in result, "oos_sharpe should be present when test_months is provided"
-    assert "oos_max_drawdown" in result, "oos_max_drawdown should be present when test_months is provided"
+    assert "oos_max_drawdown" in result, (
+        "oos_max_drawdown should be present when test_months is provided"
+    )
     assert "oos_split" in result
     assert result["oos_split"]["train_months"] is None  # train_months was None
     assert result["oos_split"]["test_months"] == 3
@@ -190,9 +198,8 @@ def test_optimize_portfolio_allocation_no_oos_without_test_months(monkeypatch, t
 def test_split_equity_curves_with_train_months() -> None:
     """Test that train_months correctly limits training period from start.
 
-    NOTE: train_months is currently reserved for future walk-forward implementation.
-    The function accepts train_months but the train/test split is determined solely by test_months.
-    This test documents current behavior and should be updated when train_months is fully implemented.
+    The function accepts train_months only when a test period creates an OOS
+    split. This test documents that current behavior.
     """
     seconds_per_month = 30 * 24 * 60 * 60
     base_ts = 1700000000
@@ -336,7 +343,6 @@ def test_objective_penalizes_positive_correlation() -> None:
     off-diagonal correlation, so positive correlation can no longer inflate the
     score.
     """
-    import runner.portfolio_optimizer as po_module
 
     seconds_per_day = 24 * 60 * 60
     base = 1700000000
@@ -395,6 +401,27 @@ def test_portfolio_sharpe_from_weights_empty() -> None:
     assert max_dd == 1.0  # Default drawdown
 
 
+def test_portfolio_sharpe_from_weights_single_row_is_neutral() -> None:
+    """A single equity observation cannot produce a finite return series."""
+    sharpe, max_dd = _portfolio_sharpe_from_weights(
+        np.array([0.5, 0.5]),
+        np.array([[100.0, 50.0]]),
+    )
+
+    assert sharpe == 0.0
+    assert max_dd == 1.0
+
+
+def test_compute_oos_metrics_rejects_single_timestamp() -> None:
+    """OOS metrics require at least two common timestamps."""
+    test_curves = [
+        [StrategyEquityPoint(time=1, equity=100.0)],
+        [StrategyEquityPoint(time=1, equity=50.0)],
+    ]
+
+    assert _compute_oos_metrics(test_curves, np.array([0.5, 0.5])) == (None, None)
+
+
 def test_portfolio_sharpe_from_weights_positive() -> None:
     """Test Sharpe calculation with positive returns."""
     # Create equity curve with steady positive growth
@@ -421,6 +448,62 @@ def test_portfolio_sharpe_from_weights_unequal_weights() -> None:
 
     # Higher weight on faster-growing strategy should yield higher Sharpe
     assert sharpe_high > sharpe_low
+
+
+def test_optimize_portfolio_allocation_handles_all_failed_trials(
+    monkeypatch,
+) -> None:
+    """All failed Optuna trials produce a structured error instead of raising."""
+    points = [
+        StrategyEquityPoint(time=index, equity=100.0 + index)
+        for index in range(10)
+    ]
+
+    import runner.portfolio_optimizer as po_module
+
+    class FailedTrial:
+        state = po_module.optuna.trial.TrialState.FAIL
+
+    class FailedStudy:
+        trials = [FailedTrial()]
+
+        def get_trials(self, *, states=None, **_kwargs):
+            if states is None:
+                return self.trials
+            return [trial for trial in self.trials if trial.state in states]
+
+    monkeypatch.setattr(po_module, "_load_strategy_equity", lambda _backtest_id: points)
+    monkeypatch.setattr(
+        po_module,
+        "_run_optimization",
+        lambda _objective, _n_trials, _progress_callback: FailedStudy(),
+    )
+
+    result = optimize_portfolio_allocation(
+        backtest_ids=["strategy_1", "strategy_2"],
+        n_trials=1,
+    )
+
+    assert result == {
+        "status": "error",
+        "message": "No optimization trial completed successfully",
+        "backtest_ids": ["strategy_1", "strategy_2"],
+    }
+
+
+def test_persist_optimization_result_rejects_path_outside_directory(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """Persistence refuses paths outside the configured optimization directory."""
+    import runner.portfolio_optimizer as po_module
+
+    monkeypatch.setattr(po_module, "OPTIMIZATIONS_DIR", tmp_path / "optimizations")
+
+    with np.testing.assert_raises(ValueError):
+        _persist_optimization_result({}, tmp_path / "outside.json")
+
+    assert not (tmp_path / "outside.json").exists()
 
 
 def test_portfolio_optimizer_with_train_months_oos_split(monkeypatch, tmp_path) -> None:
@@ -473,8 +556,8 @@ def test_portfolio_optimizer_with_train_months_oos_split(monkeypatch, tmp_path) 
 
 def test_load_strategy_equity_reads_sqlite_first(monkeypatch, tmp_path) -> None:
     """Portfolio optimizer should read canonical SQLite backtest results."""
-    import shared.database as database
     import runner.portfolio_optimizer as po_module
+    import shared.database as database
 
     engine = create_engine(
         f"sqlite:///{(tmp_path / 'backtests.db').as_posix()}",
