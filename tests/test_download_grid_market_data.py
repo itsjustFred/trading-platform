@@ -83,11 +83,13 @@ def test_symbol_asset_class():
 
 
 def test_download_symbol_invalid_timeframes():
-    """Test that invalid timeframes are caught early."""
+    """Invalid timeframes are isolated per timeframe and never abort the batch."""
+    import data_tools.download_grid_market_data as dl
     from data_tools.download_grid_market_data import download_symbol
 
     with tempfile.TemporaryDirectory() as tmpdir:
         output_dir = Path(tmpdir)
+        dl.DukascopyNativeDownloader = MagicMock()
         result = download_symbol(
             requested_symbol="EURUSD",
             canonical_symbol="EURUSD",
@@ -103,8 +105,8 @@ def test_download_symbol_invalid_timeframes():
         )
 
     assert result["status"] == "failed"
-    assert "Invalid timeframes" in result["error"]
-    assert "invalid_tf" in result["error"]
+    assert "invalid_tf" in result["timeframe_errors"]
+    assert result["timeframe_errors"]["invalid_tf"]
 
 
 def test_download_symbol_skip_balance_rows():

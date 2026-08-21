@@ -31,6 +31,9 @@ from shared.constants import DATA_DIR, normalize_timeframe
 
 DEFAULT_SYMBOLS = ["XAUUSD", "SP500", "NAS100", "EURUSD", "USDJPY", "OIL"]
 DEFAULT_TIMEFRAMES = ["1m", "5m", "15m", "30m", "1h", "4h", "1d"]
+# Canonical ordering for every normalized timeframe we support. Used for stable
+# sorting; must stay in sync with shared.constants.VALID_TIMEFRAMES.
+TIMEFRAME_ORDER = ["1m", "5m", "15m", "30m", "1h", "4h", "1d"]
 DEFAULT_START = "2020-01-01"
 CANONICAL_SYMBOLS = {
     "SP500": "US500",
@@ -75,6 +78,19 @@ def normalize_symbol(symbol: str, oil_alias: str = "USOIL") -> str:
 def normalize_timeframe_value(value: str) -> str:
     lowered = str(value or "").strip().lower()
     return normalize_timeframe(TIMEFRAME_ALIASES.get(lowered, lowered))
+
+
+def _timeframe_sort_key(timeframe: str) -> tuple[int, str]:
+    """Stable sort key for timeframes.
+
+    Unknown timeframes sort after all known ones instead of raising a
+    ``ValueError`` (the previous ``list.index`` based sort aborted the entire
+    download batch when an unmapped timeframe such as ``30m`` slipped through).
+    """
+    try:
+        return (TIMEFRAME_ORDER.index(timeframe), timeframe)
+    except ValueError:
+        return (len(TIMEFRAME_ORDER), timeframe)
 
 
 def normalize_ohlcv_columns(path: Path) -> None:
@@ -161,28 +177,19 @@ def download_symbol(
     pause_ms: int,
     force: bool,
 ) -> dict[str, Any]:
-    # Validate timeframes early - fail fast per symbol/tf
-    invalid_timeframes = [tf for tf in timeframes if tf not in VALID_TIMEFRAMES]
-    if invalid_timeframes:
-        return {
-            "symbol": requested_symbol,
-            "canonical_symbol": canonical_symbol,
-            "asset_class": symbol_asset_class(canonical_symbol),
-            "requested_timeframes": timeframes,
-            "source": "dukascopy",
-            "status": "failed",
-            "started_at": datetime.now(timezone.utc).isoformat(),
-            "paths": {},
-            "error": f"Invalid timeframes: {invalid_timeframes}. Valid: {sorted(VALID_TIMEFRAMES)}",
-        }
-
     downloader = DukascopyNativeDownloader()
     asset_class = symbol_asset_class(canonical_symbol)
     canonical_dir = output_dir / "ohlcv" / "dukascopy" / asset_class / canonical_symbol
     requested_dir = output_dir / "ohlcv" / "dukascopy" / asset_class / requested_symbol
     source_path = canonical_dir / "1m.parquet"
-    requested_timeframes = sorted(set(timeframes), key=lambda tf: ["1m", "5m", "15m", "30m", "1h", "4h", "1d"].index(tf))
-    higher_timeframes = [tf for tf in requested_timeframes if tf != "1m"]
+    requested_timeframes = sorted(set(timeframes), key=_timeframe_sort_key)
+    known_timeframes = [tf for tf in requested_timeframes if tf in VALID_TIMEFRAMES]
+    higher_timeframes = [tf for tf in known_timeframes if tf != "1m"]
+    timeframe_errors: dict[str, str] = {
+        tf: f"unsupported timeframe {tf!r}. Valid: {sorted(VALID_TIMEFRAMES)}"
+        for tf in requested_timeframes
+        if tf not in VALID_TIMEFRAMES
+    }
 
     started_at = datetime.now(timezone.utc).isoformat()
     result: dict[str, Any] = {
@@ -197,7 +204,7 @@ def download_symbol(
     }
 
     try:
-        if "1m" in requested_timeframes:
+        if "1m" in known_timeframes:
             if not source_path.exists() or force:
                 dl_result = downloader.download(
                     canonical_symbol,
@@ -231,10 +238,16 @@ def download_symbol(
             result["paths"][tf] = str(target_path)
             result["paths"][f"rows_{tf}"] = parquet_rows(target_path)
 
-        result["status"] = "ok"
+        if timeframe_errors:
+            result["timeframe_errors"] = timeframe_errors
+            result["status"] = "failed" if not result["paths"] else "partial"
+        else:
+            result["status"] = "ok"
     except Exception as exc:
         result["status"] = "failed"
         result["error"] = str(exc)
+        if timeframe_errors:
+            result["timeframe_errors"] = timeframe_errors
 
     result["finished_at"] = datetime.now(timezone.utc).isoformat()
     return result
