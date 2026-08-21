@@ -209,9 +209,9 @@ FINAL_TASK_STATUSES = legacy_viewer.FINAL_TASK_STATUSES
 _running_jobs = legacy_viewer._running_jobs
 
 _refresh_catalog = legacy_viewer._refresh_catalog
-_start_data_task = legacy_viewer._start_data_task
-_start_dukascopy_task = legacy_viewer._start_dukascopy_task
-_start_jforex_task = legacy_viewer._start_jforex_task
+_LEGACY_START_DATA_TASK = legacy_viewer._start_data_task
+_LEGACY_START_DUKASCOPY_TASK = legacy_viewer._start_dukascopy_task
+_LEGACY_START_JFOREX_TASK = legacy_viewer._start_jforex_task
 _create_task_record = legacy_viewer._create_task_record
 _set_task_status = legacy_viewer._set_task_status
 _update_task_progress = legacy_viewer._update_task_progress
@@ -2795,14 +2795,55 @@ def _create_task_record(*args: Any, **kwargs: Any) -> dict[str, Any]:
     return task
 
 
+def _is_coalesced_cleanup_marker(record: dict[str, Any]) -> bool:
+    return bool(dict(record.get("config_json") or {}).get("coalesced_cleanup_pending"))
+
+
+_COALESCED_CLEANUP_PENDING: set[str] = set()
+
+
+def _retry_coalesced_cleanup(task_id: str) -> bool:
+    try:
+        delete_background_task_record(task_id)
+    except Exception as exc:
+        with DATA_TASKS_LOCK:
+            _COALESCED_CLEANUP_PENDING.add(task_id)
+        logger.warning(
+            "Could not retry provisional coalesced task cleanup %s: %s",
+            task_id,
+            exc,
+        )
+        return False
+    with DATA_TASKS_LOCK:
+        _COALESCED_CLEANUP_PENDING.discard(task_id)
+    return True
+
+
 def _get_task(task_id: str) -> dict[str, Any] | None:
+    with DATA_TASKS_LOCK:
+        cleanup_pending = task_id in _COALESCED_CLEANUP_PENDING
+        if cleanup_pending:
+            DATA_TASKS.pop(task_id, None)
+    if cleanup_pending:
+        _retry_coalesced_cleanup(task_id)
+        return None
+
     task = _LEGACY_GET_TASK(task_id)
     if task is not None:
+        record = get_background_task_record(task_id)
+        if record is not None and _is_coalesced_cleanup_marker(record):
+            with DATA_TASKS_LOCK:
+                DATA_TASKS.pop(task_id, None)
+            _retry_coalesced_cleanup(task_id)
+            return None
         _decorate_task_from_record(task_id, task)
         return task
 
     record = get_background_task_record(task_id)
     if record is None:
+        return None
+    if _is_coalesced_cleanup_marker(record):
+        _retry_coalesced_cleanup(task_id)
         return None
     hydrated = _build_task_from_record(record)
     with DATA_TASKS_LOCK:
@@ -2815,28 +2856,51 @@ def _get_task(task_id: str) -> dict[str, Any] | None:
 
 
 def _snapshot_task(task_id: str) -> dict[str, Any] | None:
-    snapshot = _LEGACY_SNAPSHOT_TASK(task_id)
-    if snapshot is None:
-        current = _get_task(task_id)
-        return dict(current) if current is not None else None
-    _decorate_task_from_record(task_id, snapshot)
-    return snapshot
+    current = _get_task(task_id)
+    return dict(current) if current is not None else None
+
+
+def _evict_coalesced_cleanup_tasks() -> tuple[set[str], int]:
+    with DATA_TASKS_LOCK:
+        cleanup_ids = set(_COALESCED_CLEANUP_PENDING)
+        for task_id in cleanup_ids:
+            DATA_TASKS.pop(task_id, None)
+        return cleanup_ids, len(DATA_TASKS)
+
+
+def _hydrate_background_task_records(
+    records: list[dict[str, Any]],
+) -> tuple[set[str], int]:
+    with DATA_TASKS_LOCK:
+        cleanup_ids = set(_COALESCED_CLEANUP_PENDING)
+        for task_id in cleanup_ids:
+            DATA_TASKS.pop(task_id, None)
+        for record in records:
+            task_id = str(record.get("id") or "").strip()
+            if not task_id:
+                continue
+            if _is_coalesced_cleanup_marker(record):
+                DATA_TASKS.pop(task_id, None)
+                cleanup_ids.add(task_id)
+                continue
+            if task_id in cleanup_ids or task_id in DATA_TASKS:
+                continue
+            DATA_TASKS[task_id] = _build_task_from_record(record)
+        return cleanup_ids, len(DATA_TASKS)
 
 
 def _hydrate_task_cache_once(force: bool = False) -> int:
     global _TASK_CACHE_HYDRATED
     with _TASK_CACHE_HYDRATION_LOCK:
         if _TASK_CACHE_HYDRATED and not force:
-            with DATA_TASKS_LOCK:
-                return len(DATA_TASKS)
+            cleanup_ids, size = _evict_coalesced_cleanup_tasks()
+            for task_id in cleanup_ids:
+                _retry_coalesced_cleanup(task_id)
+            return size
         records = list_background_task_records()
-        with DATA_TASKS_LOCK:
-            for record in records:
-                task_id = str(record.get("id") or "").strip()
-                if not task_id or task_id in DATA_TASKS:
-                    continue
-                DATA_TASKS[task_id] = _build_task_from_record(record)
-            size = len(DATA_TASKS)
+        cleanup_ids, size = _hydrate_background_task_records(records)
+        for task_id in cleanup_ids:
+            _retry_coalesced_cleanup(task_id)
         _TASK_CACHE_HYDRATED = True
         return size
 
@@ -2903,6 +2967,179 @@ def _mark_task_finished(
         _append_task_progress_history(task, task.get("progress"))
         _persist_task_snapshot(task_id, task)
     return task
+
+
+def _discard_coalesced_download_registration(task_id: str) -> None:
+    """Remove the provisional task created by a request that coalesced."""
+    with DATA_TASKS_LOCK:
+        task = DATA_TASKS.pop(task_id, None)
+    try:
+        delete_background_task_record(task_id)
+    except Exception as exc:
+        with DATA_TASKS_LOCK:
+            _COALESCED_CLEANUP_PENDING.add(task_id)
+        try:
+            upsert_background_task_record(
+                task_id=task_id,
+                task_type=str((task or {}).get("kind") or "data"),
+                status="cleanup_pending",
+                config_json={"coalesced_cleanup_pending": True},
+                progress_message="Pending cleanup of coalesced provisional task",
+                source=str((task or {}).get("source") or ""),
+            )
+        except Exception as marker_exc:
+            logger.exception(
+                "Could not persist cleanup marker for provisional coalesced task %s; "
+                "cleanup remains pending in memory: %s",
+                task_id,
+                marker_exc,
+            )
+            return
+        logger.warning(
+            "Could not remove provisional coalesced task %s; persisted cleanup marker: %s",
+            task_id,
+            exc,
+        )
+
+
+def _download_request_key_for_source(identity: dict[str, Any]) -> str:
+    source = str(identity.get("source") or "")
+    request_identity = {
+        "source": source,
+        "symbols": identity.get("symbols", []),
+        "timeframes": identity.get("timeframes", []),
+        "start": identity.get("start") or None,
+        "end": identity.get("end") or None,
+        "price_type": "",
+        "merge_tick": False,
+        "merge_s1": False,
+        "batch_size": 0,
+        "pause_ms": 0,
+        "options": {},
+    }
+    if source == "dolthub":
+        request_identity.update(symbols=[], timeframes=[], start=None, end=None)
+    if source in {"dukascopy", "jforex"}:
+        request_identity["price_type"] = identity.get("offer_side", "")
+        request_identity["options"] = {
+            "query_timeout_seconds": identity.get("query_timeout_seconds", 900)
+        }
+    if source in {"dukascopy", "jforex"}:
+        request_identity.update(
+            merge_tick=bool(identity.get("merge_tick")),
+            merge_s1=bool(identity.get("merge_s1")),
+            batch_size=identity.get("batch_size", 0),
+            pause_ms=identity.get("pause_ms", 0),
+        )
+    return legacy_viewer._download_request_key(request_identity)
+
+
+def _command_argument(cmd: list[str], flag: str) -> str:
+    try:
+        return str(cmd[cmd.index(flag) + 1])
+    except (ValueError, IndexError):
+        return ""
+
+
+def _download_command_timeframes(cmd: list[str]) -> list[str]:
+    return [
+        _normalize_dukascopy_genesis_timeframe(timeframe)
+        for timeframe in _parse_timeframe_list(_command_argument(cmd, "--timeframes"))
+    ]
+
+
+def _start_singleflight_download(
+    task_id: str,
+    request_key: str,
+    starter: Callable[..., dict[str, Any]],
+    *args: Any,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    try:
+        result = legacy_viewer._start_singleflight_download(
+            task_id, request_key, starter, *args, **kwargs
+        )
+    except Exception:
+        with DATA_TASKS_LOCK:
+            registration_exists = task_id in DATA_TASKS
+        if not registration_exists:
+            _discard_coalesced_download_registration(task_id)
+        raise
+    if result.get("coalesced"):
+        _discard_coalesced_download_registration(task_id)
+    return result
+
+
+def _start_data_task(
+    task_id: str,
+    cmd: list[str],
+    **kwargs: Any,
+) -> dict[str, Any]:
+    source = str(kwargs.get("source") or "system")
+    if source not in {"yfinance", "huggingface", "alpaca", "dolthub"}:
+        return _LEGACY_START_DATA_TASK(task_id, cmd, **kwargs)
+    request_key = _download_request_key_for_source(
+        {
+            "source": source,
+            "symbols": _command_argument(cmd, "--symbols").split(","),
+            "timeframes": _download_command_timeframes(cmd),
+            "start": _command_argument(cmd, "--start"),
+            "end": _command_argument(cmd, "--end"),
+        }
+    )
+    return _start_singleflight_download(
+        task_id,
+        request_key,
+        _LEGACY_START_DATA_TASK,
+        cmd,
+        **kwargs,
+    )
+
+
+def _start_dukascopy_task(
+    task_id: str, cmd: list[str], **kwargs: Any
+) -> dict[str, Any]:
+    request_key = _download_request_key_for_source(
+        {
+            "source": "dukascopy",
+            "symbols": kwargs.get("symbols", []),
+            "timeframes": kwargs.get("timeframes", []),
+            "start": kwargs.get("start"),
+            "end": kwargs.get("end"),
+            "offer_side": kwargs.get("price_type", "bid"),
+            "merge_tick": kwargs.get("merge_tick", False),
+            "merge_s1": kwargs.get("merge_s1", False),
+            "batch_size": kwargs.get("batch_size", 10),
+            "pause_ms": kwargs.get("pause_ms", 1000),
+            "query_timeout_seconds": kwargs.get("query_timeout_seconds", 900),
+        }
+    )
+    return _start_singleflight_download(
+        task_id, request_key, _LEGACY_START_DUKASCOPY_TASK, cmd, **kwargs
+    )
+
+
+def _start_jforex_task(
+    task_id: str, cmd: list[str], **kwargs: Any
+) -> dict[str, Any]:
+    request_key = _download_request_key_for_source(
+        {
+            "source": kwargs.get("source_label", "jforex"),
+            "symbols": kwargs.get("symbols", []),
+            "timeframes": kwargs.get("timeframes", []),
+            "start": kwargs.get("start"),
+            "end": kwargs.get("end"),
+            "offer_side": kwargs.get("offer_side", "bid"),
+            "merge_tick": kwargs.get("merge_tick", False),
+            "merge_s1": kwargs.get("merge_s1", False),
+            "batch_size": kwargs.get("batch_size", 10),
+            "pause_ms": kwargs.get("pause_ms", 1000),
+            "query_timeout_seconds": kwargs.get("query_timeout_seconds", 900),
+        }
+    )
+    return _start_singleflight_download(
+        task_id, request_key, _LEGACY_START_JFOREX_TASK, cmd, **kwargs
+    )
 
 
 def _serialize_task(
@@ -9791,13 +10028,24 @@ async def invalidate_data_cache(
     )
 
 
-@app.post("/api/data/download", response_model=dict[str, Any])
-async def data_download(payload: DataDownloadRequest) -> dict[str, Any]:
-    source = str(payload.source or "dukascopy").strip().lower()
-    symbols = payload.symbols
-    timeframes = payload.timeframes
-    start = payload.start
-    end = payload.end
+@dataclass(frozen=True)
+class _PreparedDownloadRequest:
+    source: str
+    symbols: str
+    timeframes: str
+    start: str
+    end: str
+    offer_side: str
+    merge_tick: bool
+    merge_s1: bool
+    batch_size: int
+    pause_ms: int
+    query_timeout_seconds: int
+    symbol_list: list[str]
+    timeframe_list: list[str]
+
+
+def _resolve_download_offer_side(payload: DataDownloadRequest) -> str:
     provided_fields = (
         payload.model_fields_set
         if hasattr(payload, "model_fields_set")
@@ -9809,152 +10057,212 @@ async def data_download(payload: DataDownloadRequest) -> dict[str, Any]:
     offer_side = str(offer_side_value or "bid").strip().lower()
     if offer_side not in {"bid", "ask", "both"}:
         raise HTTPException(status_code=400, detail="offer_side must be one of: bid, ask, both")
-    merge_tick = bool(payload.merge_tick or payload.merge_bid_ask)
-    merge_s1 = bool(payload.merge_s1 or payload.merge_bid_ask)
-    batch_size = _safe_int(payload.batch_size if payload.batch_size is not None else payload.concurrency, 10)
-    pause_ms = _safe_int(payload.pause_ms, 1000)
-    query_timeout_seconds = _safe_int(payload.query_timeout_seconds, 900)
-    symbol_list = _parse_symbol_list(symbols)
-    timeframe_list = [
-        _normalize_dukascopy_genesis_timeframe(timeframe)
-        for timeframe in _parse_timeframe_list(timeframes)
-    ]
+    return offer_side
 
-    if batch_size < 1 or batch_size > 50:
+
+def _validate_download_limits(request: _PreparedDownloadRequest) -> None:
+    if request.batch_size < 1 or request.batch_size > 50:
         raise HTTPException(status_code=400, detail="batch_size must be between 1 and 50")
-    if pause_ms < 0 or pause_ms > 60000:
+    if request.pause_ms < 0 or request.pause_ms > 60000:
         raise HTTPException(status_code=400, detail="pause_ms must be between 0 and 60000")
-    if source in {"dukascopy", "jforex"} and (
-        query_timeout_seconds < 30 or query_timeout_seconds > 7200
+    if request.source in {"dukascopy", "jforex"} and (
+        request.query_timeout_seconds < 30 or request.query_timeout_seconds > 7200
     ):
-        raise HTTPException(status_code=400, detail="query_timeout_seconds must be between 30 and 7200")
-
-    if source in {"dukascopy", "jforex"} and start:
-        genesis_index = _load_dukascopy_genesis()
-        too_early: dict[str, str] = {}
-        for symbol in symbol_list:
-            symbol_data = genesis_index.get(symbol, {})
-            for timeframe in timeframe_list:
-                genesis = symbol_data.get(timeframe)
-                if genesis and start < genesis:
-                    too_early[f"{symbol}/{timeframe}"] = genesis
-        if too_early:
-            details = ", ".join(
-                f"{symbol_tf} >= {genesis}" for symbol_tf, genesis in sorted(too_early.items())
-            )
-            raise HTTPException(
-                status_code=400,
-                detail=f"Start date {start} precedes Dukascopy genesis for: {details}",
-            )
-
-    task_id = str(uuid.uuid4())
-    name, description = _download_task_labels(source, symbol_list, timeframe_list)
-
-    if source in {"dukascopy", "jforex"}:
-        source_label = "dukascopy" if source == "dukascopy" else "jforex"
-        normalized_symbols = ",".join(symbol_list)
-        normalized_timeframes = ",".join(timeframe_list)
-        cmd = [
-            sys.executable,
-            "-u",
-            "-m",
-            "data_tools.downloaders.jforex_dl",
-            "--symbols",
-            normalized_symbols,
-            "--timeframes",
-            normalized_timeframes,
-            "--query-timeout-seconds",
-            str(query_timeout_seconds),
-        ]
-        if start:
-            cmd.extend(["--start", start])
-        if end:
-            cmd.extend(["--end", end])
-        if offer_side:
-            cmd.extend(["--price-type", offer_side])
-
-        total_items = max(len(symbol_list) * len(timeframe_list), 1)
-        result = _start_jforex_task(
-            task_id,
-            cmd,
-            source_label=source_label,
-            allow_native_fallback=(source_label == "dukascopy"),
-            symbols=symbol_list,
-            timeframes=timeframe_list,
-            start=start or None,
-            end=end or None,
-            offer_side=offer_side,
-            merge_tick=merge_tick,
-            merge_s1=merge_s1,
-            batch_size=batch_size,
-            pause_ms=pause_ms,
-            query_timeout_seconds=query_timeout_seconds,
-            total_items=total_items,
-            name=name,
-            description=description,
+        raise HTTPException(
+            status_code=400, detail="query_timeout_seconds must be between 30 and 7200"
         )
+
+
+def _validate_download_genesis(request: _PreparedDownloadRequest) -> None:
+    if request.source not in {"dukascopy", "jforex"} or not request.start:
+        return
+
+    genesis_index = _load_dukascopy_genesis()
+    too_early: dict[str, str] = {}
+    for symbol in request.symbol_list:
+        symbol_data = genesis_index.get(symbol, {})
+        for timeframe in request.timeframe_list:
+            genesis = symbol_data.get(timeframe)
+            if genesis and request.start < genesis:
+                too_early[f"{symbol}/{timeframe}"] = genesis
+    if not too_early:
+        return
+
+    details = ", ".join(
+        f"{symbol_tf} >= {genesis}" for symbol_tf, genesis in sorted(too_early.items())
+    )
+    raise HTTPException(
+        status_code=400,
+        detail=f"Start date {request.start} precedes Dukascopy genesis for: {details}",
+    )
+
+
+def _prepare_download_request(payload: DataDownloadRequest) -> _PreparedDownloadRequest:
+    request = _PreparedDownloadRequest(
+        source=str(payload.source or "dukascopy").strip().lower(),
+        symbols=payload.symbols,
+        timeframes=payload.timeframes,
+        start=payload.start,
+        end=payload.end,
+        offer_side=_resolve_download_offer_side(payload),
+        merge_tick=bool(payload.merge_tick or payload.merge_bid_ask),
+        merge_s1=bool(payload.merge_s1 or payload.merge_bid_ask),
+        batch_size=_safe_int(
+            payload.batch_size if payload.batch_size is not None else payload.concurrency, 10
+        ),
+        pause_ms=_safe_int(payload.pause_ms, 1000),
+        query_timeout_seconds=_safe_int(payload.query_timeout_seconds, 900),
+        symbol_list=_parse_symbol_list(payload.symbols),
+        timeframe_list=[
+            _normalize_dukascopy_genesis_timeframe(timeframe)
+            for timeframe in _parse_timeframe_list(payload.timeframes)
+        ],
+    )
+    _validate_download_limits(request)
+    _validate_download_genesis(request)
+    return request
+
+
+def _jforex_download_command(request: _PreparedDownloadRequest) -> list[str]:
+    cmd = [
+        sys.executable,
+        "-u",
+        "-m",
+        "data_tools.downloaders.jforex_dl",
+        "--symbols",
+        ",".join(request.symbol_list),
+        "--timeframes",
+        ",".join(request.timeframe_list),
+        "--query-timeout-seconds",
+        str(request.query_timeout_seconds),
+    ]
+    if request.start:
+        cmd.extend(["--start", request.start])
+    if request.end:
+        cmd.extend(["--end", request.end])
+    if request.offer_side:
+        cmd.extend(["--price-type", request.offer_side])
+    return cmd
+
+
+def _start_jforex_download(
+    task_id: str,
+    request: _PreparedDownloadRequest,
+    *,
+    name: str,
+    description: str,
+) -> dict[str, Any]:
+    source_label = "dukascopy" if request.source == "dukascopy" else "jforex"
+    cmd = _jforex_download_command(request)
+    result = _start_jforex_task(
+        task_id,
+        cmd,
+        source_label=source_label,
+        allow_native_fallback=(source_label == "dukascopy"),
+        symbols=request.symbol_list,
+        timeframes=request.timeframe_list,
+        start=request.start or None,
+        end=request.end or None,
+        offer_side=request.offer_side,
+        merge_tick=request.merge_tick,
+        merge_s1=request.merge_s1,
+        batch_size=request.batch_size,
+        pause_ms=request.pause_ms,
+        query_timeout_seconds=request.query_timeout_seconds,
+        total_items=max(len(request.symbol_list) * len(request.timeframe_list), 1),
+        name=name,
+        description=description,
+    )
+    if not result.get("coalesced"):
         _apply_recovery_data_metadata(
             task_id,
             command=[str(part) for part in cmd],
             downloader=source_label,
-            symbols=symbol_list,
-            timeframes=timeframe_list,
-            start=start or None,
-            end=end or None,
-            offer_side=offer_side,
-            price_type=offer_side,
-            merge_tick=merge_tick,
-            merge_s1=merge_s1,
-            batch_size=batch_size,
-            pause_ms=pause_ms,
-            query_timeout_seconds=query_timeout_seconds,
+            symbols=request.symbol_list,
+            timeframes=request.timeframe_list,
+            start=request.start or None,
+            end=request.end or None,
+            offer_side=request.offer_side,
+            price_type=request.offer_side,
+            merge_tick=request.merge_tick,
+            merge_s1=request.merge_s1,
+            batch_size=request.batch_size,
+            pause_ms=request.pause_ms,
+            query_timeout_seconds=request.query_timeout_seconds,
         )
-        return result
+    return result
 
-    if source in {"yfinance", "huggingface", "alpaca"}:
-        module_name = {
-            "yfinance": "data_tools.downloaders.yfinance_dl",
-            "huggingface": "data_tools.downloaders.huggingface_dl",
-            "alpaca": "data_tools.downloaders.alpaca_dl",
-        }[source]
-        cmd = [
-            sys.executable,
-            "-u",
-            "-m",
-            module_name,
-            "--symbols",
-            symbols,
-            "--timeframes",
-            timeframes,
-        ]
-        if start:
-            cmd.extend(["--start", start])
-        if end:
-            cmd.extend(["--end", end])
-    elif source == "dolthub":
-        cmd = [sys.executable, "-u", "-m", "data_tools.dolthub_manager", "update"]
-    else:
+
+def _generic_download_command(request: _PreparedDownloadRequest) -> list[str]:
+    module_names = {
+        "yfinance": "data_tools.downloaders.yfinance_dl",
+        "huggingface": "data_tools.downloaders.huggingface_dl",
+        "alpaca": "data_tools.downloaders.alpaca_dl",
+    }
+    if request.source == "dolthub":
+        return [sys.executable, "-u", "-m", "data_tools.dolthub_manager", "update"]
+    if request.source not in module_names:
         raise HTTPException(status_code=400, detail="Unknown source")
 
-    total_items = max(len(symbol_list) * len(timeframe_list), 1)
+    cmd = [
+        sys.executable,
+        "-u",
+        "-m",
+        module_names[request.source],
+        "--symbols",
+        request.symbols,
+        "--timeframes",
+        request.timeframes,
+    ]
+    if request.start:
+        cmd.extend(["--start", request.start])
+    if request.end:
+        cmd.extend(["--end", request.end])
+    return cmd
+
+
+def _start_generic_download(
+    task_id: str,
+    request: _PreparedDownloadRequest,
+    *,
+    name: str,
+    description: str,
+) -> dict[str, Any]:
+    cmd = _generic_download_command(request)
     result = _start_data_task(
         task_id,
         cmd,
-        total_items=total_items,
+        total_items=max(len(request.symbol_list) * len(request.timeframe_list), 1),
         name=name,
         description=description,
-        source=source,
+        source=request.source,
     )
-    _apply_recovery_data_metadata(
-        task_id,
-        command=[str(part) for part in cmd],
-        downloader=source,
-        symbols=symbol_list,
-        timeframes=timeframe_list,
-        start=start or None,
-        end=end or None,
-    )
+    if not result.get("coalesced"):
+        _apply_recovery_data_metadata(
+            task_id,
+            command=[str(part) for part in cmd],
+            downloader=request.source,
+            symbols=request.symbol_list,
+            timeframes=request.timeframe_list,
+            start=request.start or None,
+            end=request.end or None,
+        )
     return result
+
+
+@app.post(
+    "/api/data/download",
+    responses={400: {"description": "Invalid download request"}},
+)
+async def data_download(payload: DataDownloadRequest) -> dict[str, Any]:
+    request = _prepare_download_request(payload)
+    task_id = str(uuid.uuid4())
+    name, description = _download_task_labels(
+        request.source, request.symbol_list, request.timeframe_list
+    )
+    if request.source in {"dukascopy", "jforex"}:
+        return _start_jforex_download(task_id, request, name=name, description=description)
+    return _start_generic_download(task_id, request, name=name, description=description)
 
 
 def _manual_cache_invalidation_payload(

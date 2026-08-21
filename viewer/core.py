@@ -2814,6 +2814,92 @@ ACTIVE_TASK_STATUSES = {"starting", "running", "paused"}
 FINAL_TASK_STATUSES = {"completed", "failed", "cancelled"}
 
 
+def _download_request_key(identity: dict[str, Any]) -> str:
+    payload = {
+        "source": str(identity.get("source") or "").strip().lower(),
+        "symbols": tuple(
+            sorted(
+                {
+                    str(symbol).strip().upper()
+                    for symbol in identity.get("symbols", [])
+                }
+            )
+        ),
+        "timeframes": tuple(
+            sorted(
+                {
+                    str(timeframe).strip().lower()
+                    for timeframe in identity.get("timeframes", [])
+                }
+            )
+        ),
+        "start": identity.get("start") or None,
+        "end": identity.get("end") or None,
+        "price_type": str(identity.get("price_type") or "").strip().lower(),
+        "merge_tick": bool(identity.get("merge_tick")),
+        "merge_s1": bool(identity.get("merge_s1")),
+        "batch_size": int(identity.get("batch_size") or 0),
+        "pause_ms": int(identity.get("pause_ms") or 0),
+        "options": identity.get("options") or {},
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _find_active_download_task(request_key: str) -> dict[str, Any] | None:
+    with DATA_TASKS_LOCK:
+        for task in DATA_TASKS.values():
+            if task.get("download_request_key") != request_key:
+                continue
+            if task.get("status") in ACTIVE_TASK_STATUSES:
+                return dict(task)
+    return None
+
+
+def _register_download_task(
+    record: dict[str, Any], request_key: str | None
+) -> dict[str, Any] | None:
+    with DATA_TASKS_LOCK:
+        if request_key:
+            for task in DATA_TASKS.values():
+                if task.get("download_request_key") != request_key:
+                    continue
+                if task.get("status") in ACTIVE_TASK_STATUSES:
+                    return dict(task)
+            record["download_request_key"] = request_key
+        DATA_TASKS[record["id"]] = record
+        return None
+
+
+def _start_singleflight_download(
+    task_id: str,
+    request_key: str,
+    starter: Callable[..., dict[str, Any]],
+    *args: Any,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    reservation = {
+        "id": task_id,
+        "status": "starting",
+        "download_request_key": request_key,
+    }
+    existing = _register_download_task(reservation, request_key)
+    if existing is not None:
+        return {
+            "task_id": existing["id"],
+            "status": existing.get("status", "starting"),
+            "coalesced": True,
+        }
+
+    try:
+        return starter(task_id, *args, **kwargs)
+    except Exception as exc:
+        with DATA_TASKS_LOCK:
+            current = DATA_TASKS.get(task_id)
+        if current is not None:
+            _mark_task_finished(task_id, status="failed", returncode=1, error=str(exc))
+        raise
+
+
 def _task_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -2955,7 +3041,7 @@ def _create_task_record(
     supports_control: bool = True,
 ) -> dict[str, Any]:
     now = _task_now_iso()
-    return {
+    record = {
         "id": task_id,
         "name": name,
         "description": description,
@@ -2973,6 +3059,11 @@ def _create_task_record(
         "created_at": now,
         "updated_at": now,
     }
+    with DATA_TASKS_LOCK:
+        reservation = DATA_TASKS.get(task_id)
+        if reservation is not None and reservation.get("download_request_key"):
+            record["download_request_key"] = reservation["download_request_key"]
+    return record
 
 
 def _get_task(task_id: str) -> dict[str, Any] | None:
@@ -2992,6 +3083,8 @@ def _update_task_fields(task_id: str, **updates: Any) -> dict[str, Any] | None:
         if task is None:
             return None
         task.update(updates)
+        if task.get("status") in FINAL_TASK_STATUSES:
+            task.pop("download_request_key", None)
         task["updated_at"] = _task_now_iso()
         return dict(task)
 
