@@ -5,6 +5,7 @@ import { ArrowLeft, ArrowUpRight, Gauge, Layers3, Target } from "lucide-react";
 import { getBacktestInfo, getOptimization } from "../api/client";
 import { DataTable } from "../components/DataTable";
 import type { BacktestInfo, OptimizationDetail } from "../api/types";
+import { classifyOptimizationOosEvidence } from "../lib/optimizationEvidence";
 
 const COMPARISON_ROWS = [
   { key: "sharpe_ratio", label: "Sharpe" },
@@ -49,29 +50,31 @@ export function OptimizationResultsPage() {
   const { id } = useParams<{ id: string }>();
   const [optimization, setOptimization] = useState<OptimizationDetail | null>(null);
   const [backtestInfo, setBacktestInfo] = useState<BacktestInfo | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [loadedId, setLoadedId] = useState<string | null>(null);
   const [error, setError] = useState("");
+
+  const loading = loadedId !== id;
 
   useEffect(() => {
     if (!id) {
       return;
     }
 
-    setLoading(true);
     getOptimization(id)
       .then(async (payload) => {
+        setError("");
         setOptimization(payload);
+        setLoadedId(id);
         try {
           const info = await getBacktestInfo(payload.base_backtest_id);
           setBacktestInfo(info);
         } catch {
           setBacktestInfo(null);
         }
-        setLoading(false);
       })
       .catch((caughtError) => {
         setError(caughtError instanceof Error ? caughtError.message : "Could not load optimization.");
-        setLoading(false);
+        setLoadedId(id);
       });
   }, [id]);
 
@@ -138,6 +141,12 @@ export function OptimizationResultsPage() {
       </div>
     );
   }
+
+  const oosEvidence = classifyOptimizationOosEvidence(
+    optimization.target_metric,
+    optimization.best_value,
+    optimization.test_stats,
+  );
 
   return (
     <div style={{ padding: "24px", display: "grid", gap: "18px" }}>
@@ -235,7 +244,7 @@ export function OptimizationResultsPage() {
 
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: "12px" }}>
             {[
-              { label: "Best score", value: formatComparisonValue(optimization.target_metric, optimization.best_value), tone: "#7dd3fc" },
+              { label: "In-sample selected score", value: formatComparisonValue(optimization.target_metric, optimization.best_value), tone: "#7dd3fc" },
               { label: "Mode", value: formatMode(optimization.optimization_mode), tone: "#c4b5fd" },
               { label: "Train split", value: `${Math.round(optimization.train_split_pct * 100)}%`, tone: "#fbbf24" },
               { label: "OOS window", value: `${optimization.test_period.start.slice(0, 10)} → ${optimization.test_period.end.slice(0, 10)}`, tone: "#86efac" },
@@ -258,6 +267,23 @@ export function OptimizationResultsPage() {
               </div>
             ))}
           </div>
+        </div>
+      </section>
+
+      <section
+        data-oos-evidence-state={oosEvidence.state}
+        style={{
+          borderRadius: "18px",
+          border: `1px solid ${oosEvidence.border}`,
+          background: oosEvidence.background,
+          padding: "16px 18px",
+        }}
+      >
+        <div style={{ color: oosEvidence.tone, fontSize: "0.76rem", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.12em" }}>
+          {oosEvidence.label}
+        </div>
+        <div style={{ marginTop: "7px", color: "#e2e8f0", lineHeight: 1.55 }}>
+          {oosEvidence.message}
         </div>
       </section>
 
@@ -332,10 +358,10 @@ export function OptimizationResultsPage() {
         <div style={{ display: "flex", justifyContent: "space-between", gap: "12px", alignItems: "center", marginBottom: "14px", flexWrap: "wrap" }}>
           <div>
             <div style={{ fontSize: "0.72rem", textTransform: "uppercase", letterSpacing: "0.14em", color: "#93c5fd" }}>
-              Winning envelope
+              In-sample selection
             </div>
             <div style={{ marginTop: "4px", fontSize: "1.02rem", fontWeight: 700 }}>
-              Best parameters card
+              In-sample selected parameters
             </div>
           </div>
           <div style={{ display: "inline-flex", alignItems: "center", gap: "8px", color: "#f8fafc" }}>

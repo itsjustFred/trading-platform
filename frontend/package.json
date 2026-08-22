@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "test:optimization-evidence": "node --test tests/optimizationEvidence.test.ts",
     "lint": "eslint .",
     "preview": "vite preview"
   },

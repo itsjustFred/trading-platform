@@ -256,8 +256,8 @@ export function OptimizeModal({
       }
 
       const parsedSplit = parseNumericField(trainSplitPct, "Train/Test split");
-      if (parsedSplit < 0.1 || parsedSplit > 1.0) {
-        throw new Error("Train/Test split must be between 0.1 and 1.0.");
+      if (parsedSplit < 0.1 || parsedSplit > 0.95) {
+        throw new Error("Train/Test split must be between 0.1 and 0.95.");
       }
 
       const parameterRanges = buildRangePayload(parameterDrafts);
@@ -653,7 +653,7 @@ export function OptimizeModal({
             <input
               type="number"
               min="0.1"
-              max="1.0"
+              max="0.95"
               step="0.05"
               value={trainSplitPct}
               onChange={(event) => setTrainSplitPct(event.target.value)}

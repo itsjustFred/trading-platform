@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import logging
 import sys
+import threading
 import time
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -47,6 +49,7 @@ def viewer_client(monkeypatch, tmp_path):
     monkeypatch.setattr(viewer_app_module, "save_result_to_sqlite", lambda _result: None)
     monkeypatch.setattr(viewer_app_module, "migrate_json_to_sqlite", lambda: {"migrated": 0, "failed": 0, "total": 0})
     viewer_app_module.DATA_TASKS.clear()
+    viewer_app_module._COALESCED_CLEANUP_PENDING.clear()
     return TestClient(viewer_app_module.app)
 
 
@@ -1246,6 +1249,847 @@ def test_data_download_passes_price_type_and_merge_flags(viewer_client, monkeypa
     assert captured["pause_ms"] == 2500
 
 
+def test_data_download_coalesces_identical_active_request(viewer_client, monkeypatch):
+    import viewer.main as viewer_app_module
+
+    starts: list[str] = []
+    real_thread = threading.Thread
+
+    class _NoStartThread:
+        def __init__(self, *args, **kwargs):
+            self.target = kwargs.get("target")
+            intercept = False
+            for frame_info in traceback.extract_stack():
+                if frame_info.filename.endswith("viewer/core.py") and frame_info.name in {
+                    "_start_data_task",
+                    "_start_dukascopy_task",
+                    "_start_jforex_task",
+                }:
+                    intercept = True
+                    break
+            if not intercept:
+                self._real = real_thread(*args, **kwargs)
+
+        def start(self) -> None:
+            if hasattr(self, "_real"):
+                self._real.start()
+                return
+            starts.append("started")
+
+    monkeypatch.setattr(viewer_app_module.legacy_viewer.threading, "Thread", _NoStartThread)
+    payload = {
+        "source": "dukascopy",
+        "symbols": "EURUSD",
+        "timeframes": "m1",
+        "start": "2026-01-01",
+        "end": "2026-01-02",
+        "price_type": "bid",
+    }
+
+    first = viewer_client.post("/api/data/download", json=payload)
+    second = viewer_client.post(
+        "/api/data/download",
+        json={**payload, "symbols": " eurusd ", "timeframes": "M1"},
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert len(starts) == 1
+    assert second.json() == {
+        "task_id": first.json()["task_id"],
+        "status": "starting",
+        "coalesced": True,
+    }
+
+
+def test_data_download_does_not_apply_recovery_metadata_to_coalesced_registration(
+    viewer_client, monkeypatch
+):
+    import viewer.main as viewer_app_module
+
+    class _NoStartThread:
+        def __init__(self, *args, **kwargs):
+            self.target = kwargs.get("target")
+
+        def start(self) -> None:
+            # Recovery metadata is tested without launching a worker thread.
+            pass
+
+    recovery_task_ids: list[str] = []
+    monkeypatch.setattr(viewer_app_module.legacy_viewer.threading, "Thread", _NoStartThread)
+    monkeypatch.setattr(
+        viewer_app_module,
+        "_apply_recovery_data_metadata",
+        lambda task_id, **kwargs: recovery_task_ids.append(task_id),
+    )
+    payload = {
+        "source": "yfinance",
+        "symbols": "AAPL",
+        "timeframes": "m1",
+        "start": "2026-01-01",
+        "end": "2026-01-02",
+    }
+
+    first = viewer_client.post("/api/data/download", json=payload)
+    second = viewer_client.post("/api/data/download", json=payload)
+
+    assert first.status_code == second.status_code == 200
+    assert second.json()["coalesced"] is True
+    assert second.json()["task_id"] == first.json()["task_id"]
+    assert recovery_task_ids == [first.json()["task_id"]]
+
+
+def test_data_download_coalesces_equivalent_timeframe_aliases(
+    viewer_client, monkeypatch
+):
+    import viewer.main as viewer_app_module
+
+    starts = 0
+
+    class _NoStartThread:
+        def __init__(self, *args, **kwargs):
+            self.target = kwargs.get("target")
+
+        def start(self) -> None:
+            nonlocal starts
+            starts += 1
+
+    monkeypatch.setattr(viewer_app_module.legacy_viewer.threading, "Thread", _NoStartThread)
+    payload = {
+        "source": "yfinance",
+        "symbols": "AAPL",
+        "start": "2026-01-01",
+        "end": "2026-01-02",
+    }
+
+    first = viewer_client.post(
+        "/api/data/download", json={**payload, "timeframes": "1m"}
+    )
+    second = viewer_client.post(
+        "/api/data/download", json={**payload, "timeframes": "m1"}
+    )
+
+    assert first.status_code == second.status_code == 200
+    assert starts == 1
+    assert second.json()["task_id"] == first.json()["task_id"]
+    assert second.json()["coalesced"] is True
+
+
+def test_download_registry_coalesces_concurrent_identical_requests(viewer_client):
+    import viewer.main as viewer_app_module
+
+    request_key = "concurrent-request"
+    barrier = threading.Barrier(2)
+    results: list[dict | None] = []
+    results_lock = threading.Lock()
+
+    def register(index: int) -> None:
+        barrier.wait()
+        record = {"id": f"task-{index}", "status": "starting"}
+        existing = viewer_app_module.legacy_viewer._register_download_task(
+            record, request_key
+        )
+        with results_lock:
+            results.append(existing)
+
+    workers = [threading.Thread(target=register, args=(index,)) for index in range(2)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=2)
+
+    assert all(not worker.is_alive() for worker in workers)
+    assert sum(result is None for result in results) == 1
+    assert sum(result is not None for result in results) == 1
+    assert len(viewer_app_module.legacy_viewer.DATA_TASKS) == 1
+
+
+def test_singleflight_starter_failure_leaves_failed_record_for_coalesced_id(
+    viewer_client,
+):
+    import viewer.main as viewer_app_module
+
+    entered = threading.Event()
+    release = threading.Event()
+    starter_errors: list[BaseException] = []
+
+    def failing_starter(task_id: str) -> dict:
+        entered.set()
+        assert release.wait(timeout=2)
+        raise RuntimeError("worker launch failed")
+
+    def launch() -> None:
+        try:
+            viewer_app_module.legacy_viewer._start_singleflight_download(
+                "task-primary", "same-request", failing_starter
+            )
+        except RuntimeError as exc:  # pragma: no cover - asserted below
+            starter_errors.append(exc)
+
+    worker = threading.Thread(target=launch)
+    worker.start()
+    assert entered.wait(timeout=2)
+
+    coalesced = viewer_app_module.legacy_viewer._start_singleflight_download(
+        "task-coalesced",
+        "same-request",
+        lambda _task_id: {"task_id": _task_id, "status": "running"},
+    )
+    assert coalesced == {
+        "task_id": "task-primary",
+        "status": "starting",
+        "coalesced": True,
+    }
+
+    release.set()
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+    assert [str(error) for error in starter_errors] == ["worker launch failed"]
+
+    failed = viewer_app_module.legacy_viewer.DATA_TASKS["task-primary"]
+    assert failed["status"] == "failed"
+    assert failed["error"] == "worker launch failed"
+    assert "download_request_key" not in failed
+
+    retry = viewer_app_module.legacy_viewer._start_singleflight_download(
+        "task-retry",
+        "same-request",
+        lambda task_id: {"task_id": task_id, "status": "running"},
+    )
+    assert retry == {"task_id": "task-retry", "status": "running"}
+
+
+def test_data_download_does_not_coalesce_different_options_or_finished_task(
+    viewer_client, monkeypatch
+):
+    import viewer.main as viewer_app_module
+
+    starts: list[str] = []
+
+    class _NoStartThread:
+        def __init__(self, *args, **kwargs):
+            # This test double intentionally ignores Thread construction arguments.
+            pass
+
+        def start(self) -> None:
+            starts.append("started")
+
+    monkeypatch.setattr(viewer_app_module.legacy_viewer.threading, "Thread", _NoStartThread)
+    payload = {
+        "source": "dukascopy",
+        "symbols": "EURUSD",
+        "timeframes": "m1",
+        "start": "2026-01-01",
+        "end": "2026-01-02",
+        "price_type": "bid",
+    }
+
+    first = viewer_client.post("/api/data/download", json=payload)
+    different = viewer_client.post(
+        "/api/data/download", json={**payload, "price_type": "ask"}
+    )
+    viewer_app_module._mark_task_finished(
+        first.json()["task_id"], status="completed", returncode=0
+    )
+    retried = viewer_client.post("/api/data/download", json=payload)
+
+    assert first.status_code == different.status_code == retried.status_code == 200
+    assert len(starts) == 3
+    assert different.json()["task_id"] != first.json()["task_id"]
+    assert retried.json()["task_id"] != first.json()["task_id"]
+    assert "coalesced" not in different.json()
+    assert "coalesced" not in retried.json()
+
+
+@pytest.mark.parametrize(
+    ("source", "irrelevant_options"),
+    [
+        (
+            "yfinance",
+            {
+                "price_type": "ask",
+                "merge_tick": True,
+                "batch_size": 23,
+                "pause_ms": 4000,
+                "query_timeout_seconds": 1200,
+            },
+        ),
+    ],
+)
+def test_data_download_coalesces_options_irrelevant_to_source(
+    viewer_client, monkeypatch, source, irrelevant_options
+):
+    import viewer.main as viewer_app_module
+
+    starts = 0
+
+    class _NoStartThread:
+        def __init__(self, *args, **kwargs):
+            # This test double intentionally ignores Thread construction arguments.
+            pass
+
+        def start(self) -> None:
+            nonlocal starts
+            starts += 1
+
+    monkeypatch.setattr(viewer_app_module.legacy_viewer.threading, "Thread", _NoStartThread)
+    payload = {
+        "source": source,
+        "symbols": "EURUSD",
+        "timeframes": "m1",
+        "start": "2026-01-01",
+        "end": "2026-01-02",
+    }
+
+    first = viewer_client.post("/api/data/download", json=payload)
+    second = viewer_client.post(
+        "/api/data/download", json={**payload, **irrelevant_options}
+    )
+
+    assert first.status_code == second.status_code == 200
+    assert starts == 1
+    assert second.json()["task_id"] == first.json()["task_id"]
+    assert second.json()["coalesced"] is True
+
+
+@pytest.mark.parametrize(
+    ("option", "different_value"),
+    [
+        ("offer_side", "ask"),
+        ("merge_tick", True),
+        ("merge_s1", True),
+        ("batch_size", 23),
+        ("pause_ms", 4000),
+        ("query_timeout_seconds", 1200),
+    ],
+)
+def test_jforex_request_key_includes_execution_options(option, different_value):
+    import viewer.main as viewer_app_module
+
+    identity = {
+        "source": "jforex",
+        "symbols": ["EURUSD"],
+        "timeframes": ["m1"],
+        "start": "2026-01-01",
+        "end": "2026-01-02",
+        "offer_side": "bid",
+        "merge_tick": False,
+        "merge_s1": False,
+        "batch_size": 10,
+        "pause_ms": 1000,
+        "query_timeout_seconds": 900,
+    }
+
+    baseline_key = viewer_app_module._download_request_key_for_source(identity)
+    different_key = viewer_app_module._download_request_key_for_source(
+        {**identity, option: different_value}
+    )
+
+    assert different_key != baseline_key
+
+
+def test_data_download_coalesces_dolthub_requests_with_unused_fields(
+    viewer_client, monkeypatch
+):
+    import viewer.main as viewer_app_module
+
+    starts = 0
+
+    class _NoStartThread:
+        def __init__(self, *args, **kwargs):
+            # This test double intentionally ignores Thread construction arguments.
+            pass
+
+        def start(self) -> None:
+            nonlocal starts
+            starts += 1
+
+    monkeypatch.setattr(viewer_app_module.legacy_viewer.threading, "Thread", _NoStartThread)
+
+    first = viewer_client.post(
+        "/api/data/download",
+        json={
+            "source": "dolthub",
+            "symbols": "AAPL",
+            "timeframes": "1d",
+            "start": "2025-01-01",
+            "end": "2025-01-31",
+        },
+    )
+    second = viewer_client.post(
+        "/api/data/download",
+        json={
+            "source": "dolthub",
+            "symbols": "MSFT",
+            "timeframes": "1h",
+            "start": "2026-06-01",
+            "end": "2026-06-30",
+        },
+    )
+
+    assert first.status_code == second.status_code == 200
+    assert starts == 1
+    assert second.json()["task_id"] == first.json()["task_id"]
+    assert second.json()["coalesced"] is True
+
+
+def test_data_download_thread_start_failure_allows_retry(viewer_client, monkeypatch):
+    import viewer.main as viewer_app_module
+
+    starts = 0
+    real_thread = threading.Thread
+
+    class _FailThenStartThread:
+        def __init__(self, *args, **kwargs):
+            # Only intercept threads launched by the viewer task machinery; let
+            # other libraries (e.g. sentry) create their own real threads.
+            intercept = False
+            for frame_info in traceback.extract_stack():
+                if frame_info.filename.endswith("viewer/core.py") and frame_info.name in {
+                    "_start_data_task",
+                    "_start_dukascopy_task",
+                    "_start_jforex_task",
+                }:
+                    intercept = True
+                    break
+            if intercept:
+                self._intercepted = True
+            else:
+                self._intercepted = False
+                self._real = real_thread(*args, **kwargs)
+
+        def start(self) -> None:
+            nonlocal starts
+            if not self._intercepted:
+                self._real.start()
+                return
+            starts += 1
+            if starts == 1:
+                raise RuntimeError("thread unavailable")
+
+    monkeypatch.setattr(
+        viewer_app_module.legacy_viewer.threading, "Thread", _FailThenStartThread
+    )
+    payload = {
+        "source": "dukascopy",
+        "symbols": "EURUSD",
+        "timeframes": "m1",
+        "start": "2026-01-01",
+        "end": "2026-01-02",
+    }
+
+    with pytest.raises(RuntimeError, match="thread unavailable"):
+        viewer_client.post("/api/data/download", json=payload)
+    retry = viewer_client.post("/api/data/download", json=payload)
+
+    assert retry.status_code == 200
+    assert starts == 2
+    assert "coalesced" not in retry.json()
+
+
+def test_data_download_thread_construction_failure_allows_retry(
+    viewer_client, monkeypatch
+):
+    import viewer.main as viewer_app_module
+
+    constructions = 0
+    real_thread = threading.Thread
+
+    class _FailThenConstructThread:
+        def __init__(self, *args, **kwargs):
+            nonlocal constructions
+            intercept = False
+            for frame_info in traceback.extract_stack():
+                if frame_info.filename.endswith("viewer/core.py") and frame_info.name in {
+                    "_start_data_task",
+                    "_start_dukascopy_task",
+                    "_start_jforex_task",
+                }:
+                    intercept = True
+                    break
+            if not intercept:
+                self._real = real_thread(*args, **kwargs)
+                return
+            constructions += 1
+            if constructions == 1:
+                raise ValueError("thread construction unavailable")
+
+        def start(self) -> None:
+            # A successful retry only needs to return without launching a real thread.
+            if hasattr(self, "_real"):
+                self._real.start()
+
+    monkeypatch.setattr(
+        viewer_app_module.legacy_viewer.threading, "Thread", _FailThenConstructThread
+    )
+    payload = {
+        "source": "yfinance",
+        "symbols": "AAPL",
+        "timeframes": "1d",
+        "start": "2026-01-01",
+        "end": "2026-01-02",
+    }
+
+    with pytest.raises(ValueError, match="thread construction unavailable"):
+        viewer_client.post("/api/data/download", json=payload)
+    retry = viewer_client.post("/api/data/download", json=payload)
+
+    assert retry.status_code == 200
+    assert constructions == 2
+    assert "coalesced" not in retry.json()
+
+
+@pytest.mark.parametrize("status", ["completed", "failed", "cancelled"])
+def test_data_download_releases_request_key_when_task_finishes(
+    viewer_client, monkeypatch, status
+):
+    import viewer.main as viewer_app_module
+
+    class _NoStartThread:
+        def __init__(self, *args, **kwargs):
+            # This test double intentionally ignores Thread construction arguments.
+            pass
+
+        def start(self) -> None:
+            # The lifecycle transition is driven explicitly by the test.
+            pass
+
+    monkeypatch.setattr(viewer_app_module.legacy_viewer.threading, "Thread", _NoStartThread)
+    payload = {
+        "source": "dukascopy",
+        "symbols": "EURUSD",
+        "timeframes": "m1",
+        "start": "2026-01-01",
+        "end": "2026-01-02",
+    }
+    response = viewer_client.post("/api/data/download", json=payload)
+    task_id = response.json()["task_id"]
+
+    assert "download_request_key" in viewer_app_module.DATA_TASKS[task_id]
+
+    viewer_app_module._mark_task_finished(
+        task_id,
+        status=status,
+        returncode=0 if status == "completed" else 1,
+    )
+
+    assert "download_request_key" not in viewer_app_module.DATA_TASKS[task_id]
+
+    retry = viewer_client.post("/api/data/download", json=payload)
+
+    assert retry.status_code == 200
+    assert retry.json()["task_id"] != task_id
+    assert "coalesced" not in retry.json()
+
+
+def test_data_download_discards_persisted_record_for_coalesced_request(
+    viewer_client, monkeypatch
+):
+    import viewer.main as viewer_app_module
+
+    persisted: set[str] = set()
+    deleted: set[str] = set()
+
+    class _NoStartThread:
+        def __init__(self, *args, **kwargs):
+            # This test double intentionally ignores Thread construction arguments.
+            pass
+
+        def start(self) -> None:
+            # Persistence behavior is tested without launching a worker thread.
+            pass
+
+    monkeypatch.setattr(viewer_app_module.legacy_viewer.threading, "Thread", _NoStartThread)
+    monkeypatch.setattr(
+        viewer_app_module,
+        "_persist_task_snapshot",
+        lambda task_id, _task: persisted.add(task_id),
+    )
+    monkeypatch.setattr(
+        viewer_app_module,
+        "delete_background_task_record",
+        lambda task_id: deleted.add(task_id) or True,
+    )
+    payload = {
+        "source": "dukascopy",
+        "symbols": "EURUSD",
+        "timeframes": "m1",
+        "start": "2026-01-01",
+        "end": "2026-01-02",
+    }
+
+    first = viewer_client.post("/api/data/download", json=payload)
+    second = viewer_client.post("/api/data/download", json=payload)
+
+    first_id = first.json()["task_id"]
+    assert second.json()["task_id"] == first_id
+    assert persisted == {first_id}
+    assert len(deleted) == 1
+    assert first_id not in deleted
+    assert deleted.isdisjoint(persisted)
+
+
+def test_coalesced_cleanup_failure_persists_retryable_marker(
+    viewer_client, monkeypatch
+):
+    import viewer.main as viewer_app_module
+
+    persisted_markers: list[dict] = []
+    delete_attempts: list[str] = []
+
+    with viewer_app_module.DATA_TASKS_LOCK:
+        viewer_app_module.DATA_TASKS["task-provisional"] = {
+            "id": "task-provisional",
+            "kind": "data",
+            "source": "yfinance",
+            "status": "starting",
+        }
+
+    def fail_delete(task_id: str) -> bool:
+        delete_attempts.append(task_id)
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(viewer_app_module, "delete_background_task_record", fail_delete)
+    monkeypatch.setattr(
+        viewer_app_module,
+        "upsert_background_task_record",
+        lambda **record: persisted_markers.append(record),
+    )
+
+    viewer_app_module._discard_coalesced_download_registration("task-provisional")
+
+    assert delete_attempts == ["task-provisional"]
+    assert "task-provisional" not in viewer_app_module.DATA_TASKS
+    assert persisted_markers == [
+        {
+            "task_id": "task-provisional",
+            "task_type": "data",
+            "status": "cleanup_pending",
+            "config_json": {"coalesced_cleanup_pending": True},
+            "progress_message": "Pending cleanup of coalesced provisional task",
+            "source": "yfinance",
+        }
+    ]
+
+    monkeypatch.setattr(
+        viewer_app_module,
+        "list_background_task_records",
+        lambda: [
+            {
+                "id": "task-provisional",
+                "type": "data",
+                "status": "cleanup_pending",
+                "config_json": {"coalesced_cleanup_pending": True},
+                "source": "yfinance",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        viewer_app_module,
+        "delete_background_task_record",
+        lambda task_id: delete_attempts.append(task_id) or True,
+    )
+    with viewer_app_module.DATA_TASKS_LOCK:
+        viewer_app_module.DATA_TASKS["task-provisional"] = {
+            "id": "task-provisional",
+            "kind": "data",
+            "source": "yfinance",
+            "status": "running",
+        }
+
+    viewer_app_module._hydrate_task_cache_once(force=True)
+
+    assert delete_attempts == ["task-provisional", "task-provisional"]
+    assert "task-provisional" not in viewer_app_module.DATA_TASKS
+
+
+def test_coalesced_cleanup_marker_failure_retries_from_memory(
+    viewer_client, monkeypatch
+):
+    import viewer.main as viewer_app_module
+
+    task_id = "task-provisional"
+    with viewer_app_module.DATA_TASKS_LOCK:
+        viewer_app_module.DATA_TASKS[task_id] = {
+            "id": task_id,
+            "kind": "data",
+            "source": "yfinance",
+            "status": "starting",
+        }
+
+    delete_attempts: list[str] = []
+
+    def fail_delete(value: str) -> bool:
+        delete_attempts.append(value)
+        raise RuntimeError("database unavailable")
+
+    def fail_upsert(**_record) -> None:
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(viewer_app_module, "delete_background_task_record", fail_delete)
+    monkeypatch.setattr(
+        viewer_app_module,
+        "upsert_background_task_record",
+        fail_upsert,
+    )
+
+    viewer_app_module._discard_coalesced_download_registration(task_id)
+
+    assert delete_attempts == [task_id]
+    assert task_id not in viewer_app_module.DATA_TASKS
+    assert task_id in viewer_app_module._COALESCED_CLEANUP_PENDING
+
+    monkeypatch.setattr(
+        viewer_app_module,
+        "list_background_task_records",
+        lambda: [
+            {
+                "id": task_id,
+                "type": "data",
+                "status": "starting",
+                "config_json": {},
+                "source": "yfinance",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        viewer_app_module,
+        "delete_background_task_record",
+        lambda value: delete_attempts.append(value) or True,
+    )
+
+    viewer_app_module._hydrate_task_cache_once(force=True)
+
+    assert delete_attempts == [task_id, task_id]
+    assert task_id not in viewer_app_module.DATA_TASKS
+    assert task_id not in viewer_app_module._COALESCED_CLEANUP_PENDING
+
+
+def test_hydrated_cache_retries_pending_coalesced_cleanup(viewer_client, monkeypatch):
+    import viewer.main as viewer_app_module
+
+    task_id = "task-provisional-hydrated"
+    deleted: list[str] = []
+    with viewer_app_module.DATA_TASKS_LOCK:
+        viewer_app_module.DATA_TASKS[task_id] = {
+            "id": task_id,
+            "kind": "data",
+            "status": "starting",
+        }
+        viewer_app_module._COALESCED_CLEANUP_PENDING.add(task_id)
+    monkeypatch.setattr(viewer_app_module, "_TASK_CACHE_HYDRATED", True)
+    monkeypatch.setattr(
+        viewer_app_module,
+        "delete_background_task_record",
+        lambda deleted_task_id: deleted.append(deleted_task_id) or True,
+    )
+
+    assert viewer_app_module._hydrate_task_cache_once() == 0
+    assert deleted == [task_id]
+    assert task_id not in viewer_app_module.DATA_TASKS
+    assert task_id not in viewer_app_module._COALESCED_CLEANUP_PENDING
+
+
+def test_task_lookup_retries_pending_coalesced_cleanup_without_hydrating(
+    viewer_client, monkeypatch
+):
+    import viewer.main as viewer_app_module
+
+    cleanup_record = {
+        "id": "task-provisional",
+        "type": "data",
+        "status": "cleanup_pending",
+        "config_json": {"coalesced_cleanup_pending": True},
+        "source": "yfinance",
+    }
+    delete_attempts: list[str] = []
+
+    monkeypatch.setattr(
+        viewer_app_module,
+        "get_background_task_record",
+        lambda _task_id: cleanup_record,
+    )
+    monkeypatch.setattr(
+        viewer_app_module,
+        "delete_background_task_record",
+        lambda task_id: delete_attempts.append(task_id) or True,
+    )
+
+    assert viewer_app_module._get_task("task-provisional") is None
+    assert delete_attempts == ["task-provisional"]
+    assert "task-provisional" not in viewer_app_module.DATA_TASKS
+
+
+def test_task_lookup_evicts_cached_task_when_persisted_cleanup_marker_appears(
+    viewer_client, monkeypatch
+):
+    import viewer.main as viewer_app_module
+
+    task_id = "task-stale"
+    with viewer_app_module.DATA_TASKS_LOCK:
+        viewer_app_module.DATA_TASKS[task_id] = {
+            "id": task_id,
+            "kind": "data",
+            "source": "yfinance",
+            "status": "running",
+        }
+
+    monkeypatch.setattr(
+        viewer_app_module,
+        "get_background_task_record",
+        lambda _task_id: {
+            "id": task_id,
+            "type": "data",
+            "status": "cleanup_pending",
+            "config_json": {"coalesced_cleanup_pending": True},
+        },
+    )
+    delete_attempts: list[str] = []
+    monkeypatch.setattr(
+        viewer_app_module,
+        "delete_background_task_record",
+        lambda value: delete_attempts.append(value) or True,
+    )
+
+    assert viewer_app_module._get_task(task_id) is None
+    assert delete_attempts == [task_id]
+    assert task_id not in viewer_app_module.DATA_TASKS
+
+
+def test_task_snapshot_hides_cached_task_when_cleanup_marker_appears(
+    viewer_client, monkeypatch
+):
+    import viewer.main as viewer_app_module
+
+    task_id = "task-stale-snapshot"
+    with viewer_app_module.DATA_TASKS_LOCK:
+        viewer_app_module.DATA_TASKS[task_id] = {
+            "id": task_id,
+            "kind": "data",
+            "source": "yfinance",
+            "status": "running",
+        }
+
+    monkeypatch.setattr(
+        viewer_app_module,
+        "get_background_task_record",
+        lambda _task_id: {
+            "id": task_id,
+            "type": "data",
+            "status": "cleanup_pending",
+            "config_json": {"coalesced_cleanup_pending": True},
+        },
+    )
+    monkeypatch.setattr(
+        viewer_app_module,
+        "delete_background_task_record",
+        lambda _task_id: True,
+    )
+
+    assert viewer_app_module._snapshot_task(task_id) is None
+    assert task_id not in viewer_app_module.DATA_TASKS
+
+
 def test_data_download_accepts_jforex_source(viewer_client, monkeypatch):
     import viewer.main as viewer_app_module
 
@@ -2059,6 +2903,34 @@ def test_optimization_run_starts_background_task(viewer_client, monkeypatch, tmp
     assert "Starting optimization for base-demo" in log_text
     assert "✅ Trial 1/2" in log_text
     assert "Optimization saved to opt_base-demo_20260311_100000.json" in log_text
+
+
+def test_optimization_run_rejects_train_split_above_max_before_queueing(viewer_client, monkeypatch):
+    import viewer.main as viewer_app_module
+
+    monkeypatch.setattr(
+        viewer_app_module.threading,
+        "Thread",
+        lambda *args, **kwargs: SimpleNamespace(start=lambda: None),
+    )
+
+    response = viewer_client.post(
+        "/api/optimizations/run",
+        json={
+            "base_backtest_id": "base-demo",
+            "target_metric": "sharpe",
+            "n_trials": 2,
+            "train_split_pct": 0.96,
+            "parameter_ranges": {
+                "window": {"type": "int", "min": 5, "max": 10, "step": 1},
+            },
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"]["error"] == "Invalid optimization payload"
+    assert response.json()["detail"]["details"][0]["loc"] == ["train_split_pct"]
+    assert viewer_app_module.DATA_TASKS == {}
 
 
 def test_backtest_run_registers_task_manager_progress(viewer_client, monkeypatch, tmp_path):

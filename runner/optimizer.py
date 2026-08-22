@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 import logging
 import math
-from itertools import combinations
 from datetime import datetime, timezone
+from itertools import combinations
 from pathlib import Path
 from typing import Any, Callable
 
@@ -12,7 +12,7 @@ import optuna
 import pandas as pd
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from data_tools.auto_download import ensure_backtest_data
+from data_tools.auto_download import ensure_backtest_data, has_ohlcv_bars_in_range
 from runner.cli import _detect_date_range
 from runner.engines.base import BacktestConfig
 from runner.engines.vectorbt_adapter import VectorbtAdapter
@@ -61,7 +61,7 @@ class OptimizationConfig(BaseModel):
     base_backtest_id: str
     target_metric: str
     n_trials: int = Field(default=100, gt=0)
-    train_split_pct: float = Field(default=0.7, gt=0.0, le=1.0)
+    train_split_pct: float = Field(default=0.7, ge=0.1, le=0.95)
     parameter_ranges: dict[str, dict[str, Any]] = Field(default_factory=dict)
     optimization_mode: str = "parameter"
     symbol_universes: list[list[str]] = Field(default_factory=list)
@@ -212,6 +212,35 @@ def run_optimization(
             base_parameters=base_parameters,
             progress_callback=progress_callback,
         )
+
+    required_symbols = list(
+        dict.fromkeys(
+            symbol
+            for universe in [symbols, *candidate_universes]
+            for symbol in universe
+        )
+    )
+    data_dir = str(base_result.meta.data.get("data_dir") or "")
+    ensure_backtest_data(
+        symbols=required_symbols,
+        timeframe=timeframe,
+        start=backtest_start,
+        end=backtest_end,
+        data_dir=data_dir,
+    )
+    for segment_name, period in (("train", train_period), ("test", test_period)):
+        for symbol in required_symbols:
+            if not has_ohlcv_bars_in_range(
+                symbol=symbol,
+                timeframe=timeframe,
+                start=period["start"],
+                end=period["end"],
+                data_dir=data_dir,
+            ):
+                raise ValueError(
+                    f"Optimization {segment_name} segment has no OHLCV bars for "
+                    f"{symbol} {timeframe} ({period['start']} -> {period['end']})"
+                )
 
     _emit_progress(progress_callback, 0.0, "Starting Optuna optimization.")
 
@@ -376,9 +405,15 @@ def _split_backtest_period(
             "train_split_pct produces an empty train or test period for the base backtest range"
         )
 
+    test_start_ts = split_ts + pd.Timedelta(microseconds=1)
+    if split_ts <= start_ts or test_start_ts >= end_ts:
+        raise ValueError(
+            "train_split_pct produces an empty train or test period for the base backtest range"
+        )
+
     train_period = {"start": start_ts.isoformat(), "end": split_ts.isoformat()}
     test_period = {
-        "start": (split_ts + pd.Timedelta(microseconds=1)).isoformat(),
+        "start": test_start_ts.isoformat(),
         "end": end_ts.isoformat(),
     }
     return train_period, test_period
@@ -516,7 +551,9 @@ def _run_risk_parity_covariance_optimization(
             data_dir=str(base_result.meta.data.get("data_dir") or ""),
         )
     if returns_frame.empty or len(returns_frame.columns) < 2:
-        raise ValueError("Risk parity covariance optimization requires at least two asset return series")
+        raise ValueError(
+            "Risk parity covariance optimization requires at least two asset return series"
+        )
 
     _emit_progress(progress_callback, 35.0, "Solving covariance risk parity weights.")
     selection = select_best_risk_parity_universe(
@@ -528,7 +565,9 @@ def _run_risk_parity_covariance_optimization(
     effective_best_params["asset_weights"] = dict(selection["best_weights"])
     effective_best_params["risk_parity_weights"] = dict(selection["best_weights"])
 
-    _emit_progress(progress_callback, 70.0, "Running OOS backtest for selected risk parity universe.")
+    _emit_progress(
+        progress_callback, 70.0, "Running OOS backtest for selected risk parity universe."
+    )
     test_result = _run_vectorbt_backtest(
         BacktestConfig(
             strategy_name=strategy_slug,
@@ -586,7 +625,9 @@ def _run_risk_parity_covariance_optimization(
 
     OPTIMIZATIONS_DIR.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(_json_safe(payload), indent=2), encoding="utf-8")
-    _emit_progress(progress_callback, 100.0, f"Risk parity optimization finished: {output_path.name}")
+    _emit_progress(
+        progress_callback, 100.0, f"Risk parity optimization finished: {output_path.name}"
+    )
     return payload
 
 

@@ -15,9 +15,10 @@ Logic:
 - sl_price is emitted per entry bar as ATR-based distance from the entry close.
 """
 
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
 import numpy as np
 import pandas as pd
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 STRATEGY_META = {
     "name": "intraday_volatility_breakout",
@@ -101,7 +102,20 @@ def _mt5_atr(true_range: pd.Series, period: int) -> pd.Series:
     values = pd.to_numeric(true_range, errors="coerce").astype(float)
     if period == 1:
         return values.copy()
-    return values.ewm(alpha=1.0 / period, adjust=False, min_periods=1).mean()
+
+    atr = pd.Series(np.nan, index=values.index, name=values.name, dtype=float)
+    valid_positions = np.flatnonzero(values.notna().to_numpy())
+    if len(valid_positions) < period:
+        return atr
+
+    previous_atr = values.iloc[valid_positions[:period]].mean()
+    atr.iloc[valid_positions[period - 1]] = previous_atr
+    for position in valid_positions[period:]:
+        previous_atr = (
+            (previous_atr * (period - 1)) + values.iloc[position]
+        ) / period
+        atr.iloc[position] = previous_atr
+    return atr
 
 
 def generate_signals(df: pd.DataFrame, params: dict):
@@ -243,7 +257,12 @@ def generate_signals(df: pd.DataFrame, params: dict):
     elif _has_datetime_index():
         dt_idx = _to_datetime_index()
         temp_df = pd.DataFrame(
-            {"open": open_.values, "high": df["high"].values, "low": df["low"].values, "close": close.values},
+            {
+                "open": open_.values,
+                "high": df["high"].values,
+                "low": df["low"].values,
+                "close": close.values,
+            },
             index=dt_idx,
         )
         daily = (
@@ -348,8 +367,18 @@ def generate_signals(df: pd.DataFrame, params: dict):
     in_entry_window = (minute_of_day >= entry_minute) & (minute_of_day < max_entry_minute)
 
     # --- Raw entry candidates ------------------------------------------------
-    long_candidates = in_entry_window & confirmation_eval_mask & regime_ok & (signal_price_long >= upper_level)
-    short_candidates = in_entry_window & confirmation_eval_mask & regime_ok & (signal_price_short <= lower_level)
+    long_candidates = (
+        in_entry_window
+        & confirmation_eval_mask
+        & regime_ok
+        & (signal_price_long >= upper_level)
+    )
+    short_candidates = (
+        in_entry_window
+        & confirmation_eval_mask
+        & regime_ok
+        & (signal_price_short <= lower_level)
+    )
 
     # Trade direction
     if trade_direction == "long_only":

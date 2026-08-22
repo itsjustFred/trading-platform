@@ -306,7 +306,15 @@ class GridRecord(SQLModel, table=True):
 
 
 def _normalize_optional_id(value: Any) -> str | None:
-    normalized = str(value).strip() if value is not None else ""
+    """Normalize an optional external id to a real ``None`` or a clean string.
+
+    Missing values (``None``), empty strings and whitespace-only strings all
+    collapse to ``None`` so they stay real SQL ``NULL`` (never the literal
+    ``"None"``). Any present value becomes its stripped string form.
+    """
+    if value is None:
+        return None
+    normalized = str(value).strip()
     return normalized or None
 
 
@@ -995,6 +1003,34 @@ def _schema_migration_connection() -> Iterator[Connection]:
                 connection.commit()
 
 
+def _backfill_curve_for_id(connection: Connection, bt_id: str) -> list[dict[str, Any]]:
+    """Build a missing equity_curve from equity_points, else the JSON file."""
+    if _table_column_names(connection, "equity_points"):
+        points = connection.execute(
+            text(
+                "SELECT time, equity FROM equity_points "
+                "WHERE backtest_id = :id ORDER BY id"
+            ),
+            {"id": bt_id},
+        ).fetchall()
+        if points:
+            return [
+                {"time": str(time), "equity": float(equity)}
+                for time, equity in points
+            ]
+
+    json_path = DATA_DIR / "backtests" / f"{bt_id}.trades.json"
+    if json_path.exists():
+        try:
+            payload = json.loads(json_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return []
+        curve = payload.get("equity_curve")
+        if isinstance(curve, list) and curve:
+            return [dict(point) for point in curve if isinstance(point, dict)]
+    return []
+
+
 def _migrate_schema() -> None:
     with _schema_migration_connection() as connection:
         deployment_column_names = _table_column_names(connection, "live_deployments")
@@ -1147,6 +1183,8 @@ def _migrate_schema() -> None:
                         text("UPDATE backtests SET equity_curve = :eq WHERE id = :id"),
                         {"eq": json.dumps(equity_curve), "id": bt_id},
                     )
+
+        execution_column_names = _table_column_names(connection, "live_executions")
 
         execution_column_names = _table_column_names(connection, "live_executions")
         if execution_column_names and "dedupe_key" not in execution_column_names:
@@ -2138,6 +2176,26 @@ def save_result_to_sqlite(result: BacktestResult) -> None:
         session.commit()
 
 
+def _top_up_equity_curve(result: BacktestResult) -> bool:
+    """Fill an existing record's empty equity_curve from a migrated result.
+
+    Returns True when the curve was topped up, False when the row was
+    genuinely up to date (non-empty curve or nothing to fill from).
+    """
+    if not result.equity_curve:
+        return False
+    with get_session() as session:
+        record = session.get(BacktestRecord, result.meta.id)
+        if record is None:
+            return False
+        if record.equity_curve:
+            return False
+        record.equity_curve = [point.to_dict() for point in result.equity_curve]
+        session.add(record)
+        session.commit()
+    return True
+
+
 def migrate_json_to_sqlite(*, skip_existing: bool = True) -> dict[str, int]:
     """Migrate legacy ``*.trades.json`` files into SQLite.
 
@@ -2172,15 +2230,10 @@ def migrate_json_to_sqlite(*, skip_existing: bool = True) -> dict[str, int]:
             payload = json.loads(path.read_text(encoding="utf-8"))
             result = BacktestResult.from_dict(payload)
             if skip_existing and result.meta.id in existing_ids:
-                with get_session() as session:
-                    existing = session.get(BacktestRecord, result.meta.id)
-                    if existing is not None and not existing.equity_curve and result.equity_curve:
-                        existing.equity_curve = [point.to_dict() for point in result.equity_curve]
-                        session.add(existing)
-                        session.commit()
-                        summary["migrated"] += 1
-                        continue
-                summary["skipped"] += 1
+                if _top_up_equity_curve(result):
+                    summary["migrated"] += 1  # topped up rather than plain skipped
+                else:
+                    summary["skipped"] += 1
                 continue
             save_result_to_sqlite(result)
             existing_ids.add(result.meta.id)
