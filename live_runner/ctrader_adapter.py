@@ -137,16 +137,16 @@ def _is_terminal_auth_error(error_code: str, error_text: str) -> bool:
 def _write_env_keys(path: Path, updates: dict[str, str]) -> None:
     """Persist dotenv keys atomically without logging secret material."""
     resolved = path.resolve()
-    if resolved.name != path.name or not path.parent.is_dir():
+    if not path.parent.is_dir():
         raise FileNotFoundError(
-            f"Accounts env target must be a regular file in an existing directory: {path}"
+            f"Accounts env target must live in an existing directory: {path}"
         )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = path.with_name(f"{path.name}.lock")
+    target = Path(resolved)
+    lock_path = target.with_name(f"{target.name}.lock")
     with lock_path.open("a+", encoding="utf-8") as lock_handle:
         fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
         try:
-            lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+            lines = target.read_text(encoding="utf-8").splitlines() if target.exists() else []
             seen: set[str] = set()
             for index, line in enumerate(lines):
                 key, separator, _value = line.partition("=")
@@ -158,13 +158,13 @@ def _write_env_keys(path: Path, updates: dict[str, str]) -> None:
                 if key not in seen:
                     lines.append(f"{key}={value}")
 
-            tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+            tmp_path = target.with_name(f".{target.name}.{os.getpid()}.tmp")
             tmp_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
             tmp_path.chmod(0o600)
-            os.replace(tmp_path, path)
-            path.chmod(0o600)
-            if path.parent.exists():
-                path.parent.chmod(0o700)
+            os.replace(tmp_path, target)
+            target.chmod(0o600)
+            if target.parent.exists():
+                target.parent.chmod(0o700)
         finally:
             fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
 
