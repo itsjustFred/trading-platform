@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import subprocess
@@ -305,6 +306,11 @@ class GridRecord(SQLModel, table=True):
     engine: str = Field(default="vectorbt", index=True)
 
 
+def _utcnow_naive() -> datetime:
+    """Timezone-aware UTC now, stored naive to keep the existing schema."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
 def _normalize_optional_id(value: Any) -> str | None:
     """Normalize an optional external id to a real ``None`` or a clean string.
 
@@ -493,12 +499,12 @@ class ServiceModel(SQLModel, table=True):
         sa_column=Column("config", JSON, nullable=False),
     )
     last_activity: datetime | None = Field(default=None, index=True)
-    created_at: datetime = Field(default_factory=datetime.utcnow, index=True)
-    updated_at: datetime = Field(default_factory=datetime.utcnow, index=True)
+    created_at: datetime = Field(default_factory=_utcnow_naive, index=True)
+    updated_at: datetime = Field(default_factory=_utcnow_naive, index=True)
 
     @classmethod
     def from_service(cls, service: Service) -> "ServiceModel":
-        now = datetime.utcnow()
+        now = _utcnow_naive()
         return cls(
             id=str(service.id),
             name=str(service.name or "").strip(),
@@ -563,12 +569,12 @@ class LiveDeploymentModel(SQLModel, table=True):
         default_factory=dict,
         sa_column=Column("settings", JSON, nullable=False),
     )
-    created_at: datetime = Field(default_factory=datetime.utcnow, index=True)
-    updated_at: datetime = Field(default_factory=datetime.utcnow, index=True)
+    created_at: datetime = Field(default_factory=_utcnow_naive, index=True)
+    updated_at: datetime = Field(default_factory=_utcnow_naive, index=True)
 
     @classmethod
     def from_live_deployment(cls, deployment: LiveDeploymentConfig) -> "LiveDeploymentModel":
-        now = datetime.utcnow()
+        now = _utcnow_naive()
         source_type = str(deployment.signal_source_type or "").lower()
         source_name = str(deployment.signal_source or "").lower()
         if source_type not in {"internal", "discord"}:
@@ -1703,7 +1709,7 @@ def update_service_status(
         record.status = normalized_status
         if last_activity is not None:
             record.last_activity = last_activity
-        record.updated_at = datetime.utcnow()
+        record.updated_at = _utcnow_naive()
         session.add(record)
         session.commit()
         session.refresh(record)
@@ -1802,7 +1808,7 @@ def update_live_deployment_status(
         if record is None:
             return None
         record.status = next_status
-        record.updated_at = datetime.utcnow()
+        record.updated_at = _utcnow_naive()
         session.add(record)
         session.commit()
         session.refresh(record)
@@ -2289,7 +2295,7 @@ def _safe_stat_number(value: Any, default: float = 0.0) -> float:
         numeric = float(value)
     except (TypeError, ValueError):
         return default
-    if numeric != numeric:  # NaN guard
+    if math.isnan(numeric):
         return default
     return numeric
 

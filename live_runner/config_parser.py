@@ -11,10 +11,17 @@ from shared.models import LiveAccountConfig, LiveDeploymentConfig
 logger = get_logger("live-runner")
 
 
+def _validated_config_file(config_path: str | Path) -> Path:
+    path = Path(config_path).resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Live deployment config not found: {config_path}")
+    return path
+
+
 def parse_live_deployments_config(
     config_path: str | Path,
 ) -> tuple[list[LiveAccountConfig], list[LiveDeploymentConfig]]:
-    path = Path(config_path)
+    path = _validated_config_file(config_path)
     payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     if not isinstance(payload, dict):
         raise ValueError(

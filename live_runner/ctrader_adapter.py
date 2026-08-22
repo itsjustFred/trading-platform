@@ -82,6 +82,10 @@ def _to_float(value: Any, *, default: float = 0.0) -> float:
         return default
 
 
+_NOT_AUTHORIZED_MARKER = "not authorized"
+_CTRADER_AUTH_FAILURE_FALLBACK = "cTrader account authorization failed"
+
+
 def _reason_to_text(reason: Any) -> str:
     if hasattr(reason, "getErrorMessage"):
         try:
@@ -113,7 +117,7 @@ def _is_already_logged_in_error(error_code: str, error_text: str) -> bool:
 def _is_terminal_auth_error(error_code: str, error_text: str) -> bool:
     code = _normalize_error_code(error_code)
     message = str(error_text or "").lower()
-    if "not authorized" in message:
+    if _NOT_AUTHORIZED_MARKER in message:
         return True
     if "invalid token" in message or "token invalid" in message:
         return True
@@ -379,7 +383,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         )
 
     def _mark_terminal_auth_failure(self, reason: str, *, error_code: str = "") -> None:
-        normalized_reason = str(reason or "").strip() or "cTrader account authorization failed"
+        normalized_reason = str(reason or "").strip() or _CTRADER_AUTH_FAILURE_FALLBACK
         self._terminal_auth_failure_reason = normalized_reason
         self._terminal_auth_failure_code = _normalize_error_code(error_code)
         self._authenticated = False
@@ -478,7 +482,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         error_text = str(exc)
         if not _is_terminal_auth_error(error_code, error_text):
             return
-        reason = exc.description or error_text or "cTrader account authorization failed"
+        reason = exc.description or error_text or _CTRADER_AUTH_FAILURE_FALLBACK
         self._mark_terminal_auth_failure(reason, error_code=error_code)
         raise CTraderAuthTerminalError(reason, error_code=error_code) from exc
 
@@ -555,7 +559,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 return
             if _is_terminal_auth_error(error_code, description):
                 self._mark_terminal_auth_failure(
-                    description or str(error_code or "not authorized"),
+                    description or str(error_code or _NOT_AUTHORIZED_MARKER),
                     error_code=error_code,
                 )
                 logger.warning(
@@ -684,7 +688,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                             f"{type(account_auth_res).__name__}"
                         )
                 else:
-                    reason = exc.description or error_text or "cTrader account authorization failed"
+                    reason = exc.description or error_text or _CTRADER_AUTH_FAILURE_FALLBACK
                     self._mark_terminal_auth_failure(reason, error_code=error_code)
                     raise CTraderAuthTerminalError(reason, error_code=error_code) from exc
             else:
@@ -831,7 +835,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                         error_code=getattr(exc, "error_code", ""),
                     )
                     self._teardown_client()
-                    if "not authorized" in reason.lower():
+                    if _NOT_AUTHORIZED_MARKER in reason.lower():
                         logger.warning(
                             "Account %s not authorized for token, skipping",
                             self.ctid_trader_account_id,

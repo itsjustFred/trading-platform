@@ -61,6 +61,9 @@ def _env_values(path: Path) -> dict[str, str]:
     }
 
 
+_WORKER_NO_JSON_ERROR = "worker returned no JSON payload"
+
+
 def _public_error(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"
 
@@ -81,9 +84,12 @@ def _position_qty_for_symbol(positions: list[Any], symbol: str) -> float:
 
 
 def _write_report(report: SmokeReport, reports_dir: Path) -> Path:
-    reports_dir.mkdir(parents=True, exist_ok=True)
+    target = reports_dir.resolve()
+    if not target.is_dir():
+        raise ValueError(f"Reports directory does not exist or is not a directory: {reports_dir}")
+    target.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    path = reports_dir / f"live_smoke_{report.mode}_{timestamp}.json"
+    path = target / f"live_smoke_{report.mode}_{timestamp}.json"
     path.write_text(json.dumps(asdict(report), indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return path
 
@@ -223,7 +229,7 @@ async def _run_ctrader_adapter_subprocess(
     lines = [line.strip() for line in (completed.stdout or "").splitlines() if line.strip()]
     payload_line = next((line for line in reversed(lines) if line.startswith("{")), "")
     if not payload_line:
-        raise RuntimeError("worker returned no JSON payload")
+        raise RuntimeError(_WORKER_NO_JSON_ERROR)
     return json.loads(payload_line)
 
 
@@ -267,7 +273,7 @@ async def _run_ctrader_order_subprocess(
     lines = [line.strip() for line in (completed.stdout or "").splitlines() if line.strip()]
     payload_line = next((line for line in reversed(lines) if line.startswith("{")), "")
     if not payload_line:
-        raise RuntimeError("worker returned no JSON payload")
+        raise RuntimeError(_WORKER_NO_JSON_ERROR)
     return json.loads(payload_line)
 
 
@@ -305,7 +311,7 @@ async def _run_ctrader_strategy_e2e_subprocess(
     lines = [line.strip() for line in (completed.stdout or "").splitlines() if line.strip()]
     payload_line = next((line for line in reversed(lines) if line.startswith("{")), "")
     if not payload_line:
-        raise RuntimeError("worker returned no JSON payload")
+        raise RuntimeError(_WORKER_NO_JSON_ERROR)
     return json.loads(payload_line)
 
 

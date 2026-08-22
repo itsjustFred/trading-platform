@@ -54,6 +54,8 @@ from signal_bots.registry import get_signal_processor
 initialize_sentry("live-runner")
 logger = get_logger("live-runner")
 
+_ACCOUNT_NOT_AUTHORIZED_LOG = "Account %s not authorized for token, skipping"
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_ACCOUNTS_ENV = PROJECT_ROOT / ".accounts.env"
 BALANCE_POLL_INTERVAL_SECONDS = 60
@@ -1300,7 +1302,7 @@ async def _poll_balances(
                 _block_ctrader_account(account_id, exc)
                 adapters.pop(account_id, None)
                 logger.warning(
-                    "Account %s not authorized for token, skipping",
+                    _ACCOUNT_NOT_AUTHORIZED_LOG,
                     account_id,
                     extra={
                         "data": {
@@ -1332,7 +1334,7 @@ async def _poll_balances(
                     _block_ctrader_account(account_id, exc)
                     adapters.pop(account_id, None)
                     logger.warning(
-                        "Account %s not authorized for token, skipping",
+                        _ACCOUNT_NOT_AUTHORIZED_LOG,
                         account_id,
                         extra={
                             "data": {
@@ -1631,7 +1633,7 @@ async def _ensure_adapter_for_active_account(
                 reason="terminal_auth_failure",
             )
             logger.warning(
-                "Account %s not authorized for token, skipping",
+                _ACCOUNT_NOT_AUTHORIZED_LOG,
                 account_id,
                 extra={
                     "data": {

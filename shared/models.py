@@ -15,7 +15,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Literal
@@ -100,7 +100,9 @@ class Service(BaseModel):
     status: ServiceStatus
     config: dict[str, Any] = Field(default_factory=dict)
     last_activity: datetime | None = None
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc).replace(tzinfo=None)
+    )
 
 
 class VerificationEvidenceStatus(str, Enum):

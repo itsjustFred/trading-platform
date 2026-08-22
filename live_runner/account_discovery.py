@@ -378,6 +378,7 @@ async def _discover_ctrader_accounts_on_host(
             return payload
 
     context = ssl.create_default_context()
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
     with socket.create_connection((host, 5035), timeout=12) as raw_socket:
         with context.wrap_socket(raw_socket, server_hostname=host) as sock:
             app_auth_req = ProtoOAApplicationAuthReq()
