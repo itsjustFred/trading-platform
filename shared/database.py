@@ -13,7 +13,18 @@ from typing import Any, Iterator
 from uuid import uuid4
 
 from dotenv import load_dotenv
-from sqlalchemy import JSON, Column, String, UniqueConstraint, delete, event, func, or_, text
+from sqlalchemy import (
+    JSON,
+    Column,
+    String,
+    TextClause,
+    UniqueConstraint,
+    delete,
+    event,
+    func,
+    or_,
+    text,
+)
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Field, Session, SQLModel, create_engine, select
@@ -877,12 +888,8 @@ def _rebuild_live_signals_without_global_discord_unique(connection: Connection) 
         connection.execute(text(statement))
 
 
-def _migrate_live_signal_discord_identity(connection: Connection) -> None:
-    """Migrate Discord execution identity from global to deployment scope."""
-    column_names = _table_column_names(connection, "live_signals")
-    if not column_names:
-        return
-
+def _add_live_signal_identity_columns(connection: Connection, column_names: set[str]) -> None:
+    """Add the columns required for deployment-scoped Discord identity."""
     if "source" not in column_names:
         connection.execute(
             text("ALTER TABLE live_signals ADD COLUMN source TEXT NOT NULL DEFAULT 'internal'")
@@ -897,9 +904,12 @@ def _migrate_live_signal_discord_identity(connection: Connection) -> None:
     if "discord_message_id" not in column_names:
         connection.execute(text("ALTER TABLE live_signals ADD COLUMN discord_message_id TEXT"))
 
-    # Remove every Discord-only global unique constraint. Named indexes can be
-    # dropped directly; SQLite table-backed constraints require one controlled
-    # transactional rebuild before the remaining migration continues.
+
+def _drop_live_signals_global_discord_unique_indexes(connection: Connection) -> bool:
+    """Drop every Discord-only global unique constraint on live_signals."""
+    # Named indexes can be dropped directly; SQLite table-backed constraints
+    # require one controlled transactional rebuild before the remaining
+    # migration continues.
     table_rebuild_required = False
     for row in connection.execute(text("PRAGMA index_list('live_signals')")).fetchall():
         index_name = str(row[1])
@@ -919,7 +929,11 @@ def _migrate_live_signal_discord_identity(connection: Connection) -> None:
             connection.execute(text(f"DROP INDEX {quoted_name}"))
     if table_rebuild_required:
         _rebuild_live_signals_without_global_discord_unique(connection)
+    return True
 
+
+def _backfill_live_signal_discord_message_ids(connection: Connection) -> None:
+    """Backfill discord_message_id from signal metadata after uniqueness drops."""
     # Backfill only after global uniqueness is gone so legitimate historical
     # fan-out rows in different deployments are not rejected mid-migration.
     signals_to_fill = connection.execute(
@@ -945,6 +959,9 @@ def _migrate_live_signal_discord_identity(connection: Connection) -> None:
                 {"discord_message_id": str(discord_msg_id), "id": sig_id},
             )
 
+
+def _raise_on_duplicate_live_signal_discord_ids(connection: Connection) -> None:
+    """Refuse to create deployment-scoped uniqueness over conflicting rows."""
     duplicate = connection.execute(
         text(
             "SELECT deployment_id, discord_message_id, COUNT(*) AS duplicate_count "
@@ -960,6 +977,9 @@ def _migrate_live_signal_discord_identity(connection: Connection) -> None:
             "No rows were deleted; resolve the conflicting records explicitly."
         )
 
+
+def _create_live_signal_discord_indexes(connection: Connection) -> None:
+    """Create the non-unique and deployment-scoped unique Discord indexes."""
     connection.execute(
         text(
             "CREATE INDEX IF NOT EXISTS ix_live_signals_discord_message_id "
@@ -974,6 +994,19 @@ def _migrate_live_signal_discord_identity(connection: Connection) -> None:
             "WHERE discord_message_id IS NOT NULL"
         )
     )
+
+
+def _migrate_live_signal_discord_identity(connection: Connection) -> None:
+    """Migrate Discord execution identity from global to deployment scope."""
+    column_names = _table_column_names(connection, "live_signals")
+    if not column_names:
+        return
+
+    _add_live_signal_identity_columns(connection, column_names)
+    _drop_live_signals_global_discord_unique_indexes(connection)
+    _backfill_live_signal_discord_message_ids(connection)
+    _raise_on_duplicate_live_signal_discord_ids(connection)
+    _create_live_signal_discord_indexes(connection)
 
 
 @contextmanager
@@ -1040,171 +1073,257 @@ def _backfill_curve_for_id(connection: Connection, bt_id: str) -> list[dict[str,
     return []
 
 
+def _add_live_deployment_columns(connection: Connection, column_names: set[str]) -> None:
+    """Add live_deployments signal-source and filter columns when missing."""
+    if "settings" not in column_names:
+        connection.execute(
+            text(
+                "ALTER TABLE live_deployments "
+                "ADD COLUMN settings JSON NOT NULL DEFAULT '{}'"
+            )
+        )
+    if "signal_source" not in column_names:
+        connection.execute(
+            text(
+                "ALTER TABLE live_deployments "
+                "ADD COLUMN signal_source TEXT NOT NULL DEFAULT 'internal'"
+            )
+        )
+    if "signal_config" not in column_names:
+        connection.execute(
+            text(
+                "ALTER TABLE live_deployments "
+                "ADD COLUMN signal_config JSON NOT NULL DEFAULT '{}'"
+            )
+        )
+    if "signal_source_type" not in column_names:
+        connection.execute(
+            text(
+                "ALTER TABLE live_deployments "
+                "ADD COLUMN signal_source_type TEXT NOT NULL DEFAULT 'internal'"
+            )
+        )
+        connection.execute(
+            text(
+                "UPDATE live_deployments "
+                "SET signal_source_type = LOWER(COALESCE(signal_source, 'internal')) "
+                "WHERE signal_source_type = 'internal'"
+            )
+        )
+    if "signal_source_id" not in column_names:
+        connection.execute(
+            text(
+                "ALTER TABLE live_deployments "
+                "ADD COLUMN signal_source_id TEXT NOT NULL DEFAULT ''"
+            )
+        )
+    if "symbol_filter" not in column_names:
+        connection.execute(
+            text(
+                "ALTER TABLE live_deployments "
+                "ADD COLUMN symbol_filter JSON NOT NULL DEFAULT '[]'"
+            )
+        )
+
+
+def _add_backtests_tags_column(connection: Connection) -> None:
+    """Add the tags column to legacy backtests tables."""
+    column_names = _table_column_names(connection, "backtests")
+    if column_names and "tags" not in column_names:
+        connection.execute(
+            text(
+                "ALTER TABLE backtests "
+                "ADD COLUMN tags JSON NOT NULL DEFAULT '[]'"
+            )
+        )
+
+
+def _add_live_account_columns(connection: Connection) -> None:
+    """Add broker identity columns to legacy live_accounts tables."""
+    column_names = _table_column_names(connection, "live_accounts")
+    if "ctid" not in column_names:
+        connection.execute(text("ALTER TABLE live_accounts ADD COLUMN ctid TEXT"))
+    if "broker_login" not in column_names:
+        connection.execute(text("ALTER TABLE live_accounts ADD COLUMN broker_login TEXT"))
+
+
+def _add_background_task_columns(connection: Connection) -> None:
+    """Add tracking columns to legacy background_tasks tables."""
+    column_names = _table_column_names(connection, "background_tasks")
+    if not column_names:
+        return
+    if "progress_message" not in column_names:
+        connection.execute(
+            text("ALTER TABLE background_tasks ADD COLUMN progress_message TEXT NOT NULL DEFAULT ''")
+        )
+    if "name" not in column_names:
+        connection.execute(
+            text("ALTER TABLE background_tasks ADD COLUMN name TEXT NOT NULL DEFAULT ''")
+        )
+    if "description" not in column_names:
+        connection.execute(
+            text("ALTER TABLE background_tasks ADD COLUMN description TEXT NOT NULL DEFAULT ''")
+        )
+    if "source" not in column_names:
+        connection.execute(
+            text("ALTER TABLE background_tasks ADD COLUMN source TEXT NOT NULL DEFAULT ''")
+        )
+    if "created_at" not in column_names:
+        connection.execute(
+            text("ALTER TABLE background_tasks ADD COLUMN created_at TEXT NOT NULL DEFAULT ''")
+        )
+    if "updated_at" not in column_names:
+        connection.execute(
+            text("ALTER TABLE background_tasks ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''")
+        )
+
+
+def _add_trade_columns(connection: Connection) -> None:
+    """Add risk and exit columns to legacy trades tables."""
+    column_names = _table_column_names(connection, "trades")
+    if not column_names:
+        return
+    if "position_size" not in column_names:
+        connection.execute(text("ALTER TABLE trades ADD COLUMN position_size FLOAT"))
+    if "risk_amount" not in column_names:
+        connection.execute(text("ALTER TABLE trades ADD COLUMN risk_amount FLOAT"))
+    if "risk_percent" not in column_names:
+        connection.execute(text("ALTER TABLE trades ADD COLUMN risk_percent FLOAT"))
+    if "exit_reason" not in column_names:
+        connection.execute(text("ALTER TABLE trades ADD COLUMN exit_reason TEXT"))
+
+
+def _add_backtests_equity_curve_column(connection: Connection) -> bool:
+    """Add equity_curve to backtests (for portfolio optimizer to read from SQLite)."""
+    column_names = _table_column_names(connection, "backtests")
+    if column_names and "equity_curve" not in column_names:
+        connection.execute(text("ALTER TABLE backtests ADD COLUMN equity_curve TEXT DEFAULT '[]'"))
+        return True
+    return "equity_curve" in column_names
+
+
+def _artifact_equity_curve(bt_id: str) -> list[Any]:
+    """Load an id-matched equity_curve payload from the legacy JSON artifact."""
+    artifact_path = DATA_DIR / "backtests" / f"{bt_id}.trades.json"
+    try:
+        payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+        artifact_id = str(payload.get("meta", {}).get("id", ""))
+        candidate = payload.get("equity_curve", [])
+        if artifact_id == str(bt_id) and isinstance(candidate, list):
+            return candidate
+    except (OSError, TypeError, ValueError):
+        pass
+    return []
+
+
+def _equity_points_curve(connection: Connection, bt_id: str) -> list[dict[str, Any]]:
+    """Build a curve from normalized equity_points ordered by time then id."""
+    return [
+        {"time": row[0], "equity": row[1]}
+        for row in connection.execute(
+            text(
+                "SELECT time, equity FROM equity_points "
+                "WHERE backtest_id = :id ORDER BY time, id"
+            ),
+            {"id": bt_id},
+        ).fetchall()
+    ]
+
+
+def _backfill_backtest_equity_curves(connection: Connection) -> None:
+    """Backfill equity_curve for existing backtests with empty equity_curve."""
+    # Prefer normalized equity_points; fall back to the matching legacy JSON artifact.
+    backtests_to_fill = connection.execute(
+        text(
+            "SELECT id FROM backtests "
+            "WHERE equity_curve IS NULL OR equity_curve = '[]' OR equity_curve = ''"
+        )
+    ).fetchall()
+    for (bt_id,) in backtests_to_fill:
+        equity_curve = _equity_points_curve(connection, bt_id)
+        if not equity_curve and Path(str(bt_id)).name == str(bt_id):
+            equity_curve = _artifact_equity_curve(str(bt_id))
+        if equity_curve:
+            connection.execute(
+                text("UPDATE backtests SET equity_curve = :eq WHERE id = :id"),
+                {"eq": json.dumps(equity_curve), "id": bt_id},
+            )
+
+
+def _migrate_backtests_equity_curve(connection: Connection) -> None:
+    """Ensure the backtests.equity_curve column exists and is backfilled."""
+    has_equity_curve = _add_backtests_equity_curve_column(connection)
+    if has_equity_curve:
+        _backfill_backtest_equity_curves(connection)
+
+
+def _migrate_live_executions_dedupe_key(connection: Connection) -> None:
+    """Add the dedupe_key column and its unique index to live_executions."""
+    execution_column_names = _table_column_names(connection, "live_executions")
+
+    execution_column_names = _table_column_names(connection, "live_executions")
+    if execution_column_names and "dedupe_key" not in execution_column_names:
+        connection.execute(text("ALTER TABLE live_executions ADD COLUMN dedupe_key TEXT"))
+    if _table_column_names(connection, "live_executions"):
+        connection.execute(
+            text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_live_executions_dedupe_key "
+                "ON live_executions(dedupe_key) WHERE dedupe_key IS NOT NULL"
+            )
+        )
+
+
 def _migrate_schema() -> None:
     with _schema_migration_connection() as connection:
-        deployment_column_names = _table_column_names(connection, "live_deployments")
-        if "settings" not in deployment_column_names:
-            connection.execute(
-                text(
-                    "ALTER TABLE live_deployments "
-                    "ADD COLUMN settings JSON NOT NULL DEFAULT '{}'"
-                )
-            )
-        if "signal_source" not in deployment_column_names:
-            connection.execute(
-                text(
-                    "ALTER TABLE live_deployments "
-                    "ADD COLUMN signal_source TEXT NOT NULL DEFAULT 'internal'"
-                )
-            )
-        if "signal_config" not in deployment_column_names:
-            connection.execute(
-                text(
-                    "ALTER TABLE live_deployments "
-                    "ADD COLUMN signal_config JSON NOT NULL DEFAULT '{}'"
-                )
-            )
-        if "signal_source_type" not in deployment_column_names:
-            connection.execute(
-                text(
-                    "ALTER TABLE live_deployments "
-                    "ADD COLUMN signal_source_type TEXT NOT NULL DEFAULT 'internal'"
-                )
-            )
-            connection.execute(
-                text(
-                    "UPDATE live_deployments "
-                    "SET signal_source_type = LOWER(COALESCE(signal_source, 'internal')) "
-                    "WHERE signal_source_type = 'internal'"
-                )
-            )
-        if "signal_source_id" not in deployment_column_names:
-            connection.execute(
-                text(
-                    "ALTER TABLE live_deployments "
-                    "ADD COLUMN signal_source_id TEXT NOT NULL DEFAULT ''"
-                )
-            )
-        if "symbol_filter" not in deployment_column_names:
-            connection.execute(
-                text(
-                    "ALTER TABLE live_deployments "
-                    "ADD COLUMN symbol_filter JSON NOT NULL DEFAULT '[]'"
-                )
-            )
-
-        backtest_column_names = _table_column_names(connection, "backtests")
-        if backtest_column_names and "tags" not in backtest_column_names:
-            connection.execute(
-                text(
-                    "ALTER TABLE backtests "
-                    "ADD COLUMN tags JSON NOT NULL DEFAULT '[]'"
-                )
-            )
-
-        account_column_names = _table_column_names(connection, "live_accounts")
-        if "ctid" not in account_column_names:
-            connection.execute(text("ALTER TABLE live_accounts ADD COLUMN ctid TEXT"))
-        if "broker_login" not in account_column_names:
-            connection.execute(text("ALTER TABLE live_accounts ADD COLUMN broker_login TEXT"))
-
-        task_column_names = _table_column_names(connection, "background_tasks")
-        if task_column_names:
-            if "progress_message" not in task_column_names:
-                connection.execute(
-                    text("ALTER TABLE background_tasks ADD COLUMN progress_message TEXT NOT NULL DEFAULT ''")
-                )
-            if "name" not in task_column_names:
-                connection.execute(
-                    text("ALTER TABLE background_tasks ADD COLUMN name TEXT NOT NULL DEFAULT ''")
-                )
-            if "description" not in task_column_names:
-                connection.execute(
-                    text("ALTER TABLE background_tasks ADD COLUMN description TEXT NOT NULL DEFAULT ''")
-                )
-            if "source" not in task_column_names:
-                connection.execute(
-                    text("ALTER TABLE background_tasks ADD COLUMN source TEXT NOT NULL DEFAULT ''")
-                )
-            if "created_at" not in task_column_names:
-                connection.execute(
-                    text("ALTER TABLE background_tasks ADD COLUMN created_at TEXT NOT NULL DEFAULT ''")
-                )
-            if "updated_at" not in task_column_names:
-                connection.execute(
-                    text("ALTER TABLE background_tasks ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''")
-                )
-
-        trade_column_names = _table_column_names(connection, "trades")
-        if trade_column_names:
-            if "position_size" not in trade_column_names:
-                connection.execute(text("ALTER TABLE trades ADD COLUMN position_size FLOAT"))
-            if "risk_amount" not in trade_column_names:
-                connection.execute(text("ALTER TABLE trades ADD COLUMN risk_amount FLOAT"))
-            if "risk_percent" not in trade_column_names:
-                connection.execute(text("ALTER TABLE trades ADD COLUMN risk_percent FLOAT"))
-            if "exit_reason" not in trade_column_names:
-                connection.execute(text("ALTER TABLE trades ADD COLUMN exit_reason TEXT"))
+        _add_live_deployment_columns(
+            connection, _table_column_names(connection, "live_deployments")
+        )
+        _add_backtests_tags_column(connection)
+        _add_live_account_columns(connection)
+        _add_background_task_columns(connection)
+        _add_trade_columns(connection)
 
         _migrate_live_signal_discord_identity(connection)
 
-        # Add equity_curve column to backtests (for portfolio optimizer to read from SQLite)
-        backtest_column_names = _table_column_names(connection, "backtests")
-        if backtest_column_names and "equity_curve" not in backtest_column_names:
-            connection.execute(text("ALTER TABLE backtests ADD COLUMN equity_curve TEXT DEFAULT '[]'"))
-            backtest_column_names = _table_column_names(connection, "backtests")
+        _migrate_backtests_equity_curve(connection)
+        _migrate_live_executions_dedupe_key(connection)
 
-        # Backfill equity_curve for existing backtests with empty equity_curve.
-        # Prefer normalized equity_points; fall back to the matching legacy JSON artifact.
-        if backtest_column_names and "equity_curve" in backtest_column_names:
-            backtests_to_fill = connection.execute(
-                text(
-                    "SELECT id FROM backtests "
-                    "WHERE equity_curve IS NULL OR equity_curve = '[]' OR equity_curve = ''"
-                )
-            ).fetchall()
-            backtests_dir = DATA_DIR / "backtests"
-            for (bt_id,) in backtests_to_fill:
-                equity_curve = [
-                    {"time": row[0], "equity": row[1]}
-                    for row in connection.execute(
-                        text(
-                            "SELECT time, equity FROM equity_points "
-                            "WHERE backtest_id = :id ORDER BY time, id"
-                        ),
-                        {"id": bt_id},
-                    ).fetchall()
-                ]
 
-                if not equity_curve and Path(str(bt_id)).name == str(bt_id):
-                    artifact_path = backtests_dir / f"{bt_id}.trades.json"
-                    try:
-                        payload = json.loads(artifact_path.read_text(encoding="utf-8"))
-                        artifact_id = str(payload.get("meta", {}).get("id", ""))
-                        candidate = payload.get("equity_curve", [])
-                        if artifact_id == str(bt_id) and isinstance(candidate, list):
-                            equity_curve = candidate
-                    except (OSError, TypeError, ValueError):
-                        pass
+def _find_existing_live_signal(
+    session: Session, deployment_id: str, discord_msg_id: str
+) -> LiveSignalModel | None:
+    """Find a persisted signal for one (deployment, discord_message_id) pair."""
+    return session.exec(
+        select(LiveSignalModel)
+        .where(LiveSignalModel.deployment_id == deployment_id)
+        .where(LiveSignalModel.discord_message_id == discord_msg_id)
+        .limit(1)
+    ).first()
 
-                if equity_curve:
-                    connection.execute(
-                        text("UPDATE backtests SET equity_curve = :eq WHERE id = :id"),
-                        {"eq": json.dumps(equity_curve), "id": bt_id},
-                    )
 
-        execution_column_names = _table_column_names(connection, "live_executions")
-
-        execution_column_names = _table_column_names(connection, "live_executions")
-        if execution_column_names and "dedupe_key" not in execution_column_names:
-            connection.execute(text("ALTER TABLE live_executions ADD COLUMN dedupe_key TEXT"))
-        if _table_column_names(connection, "live_executions"):
-            connection.execute(
-                text(
-                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_live_executions_dedupe_key "
-                    "ON live_executions(dedupe_key) WHERE dedupe_key IS NOT NULL"
-                )
-            )
+def _reconcile_existing_live_signal(
+    session: Session, existing: LiveSignalModel, record: LiveSignalModel
+) -> None:
+    """Backfill broker_order_id onto an existing duplicate signal."""
+    # Reconcile broker_order_id: if existing lacks it but new record has it, update
+    new_broker_id = (record.broker_order_id or "").strip()
+    existing_broker_id = (existing.broker_order_id or "").strip()
+    if new_broker_id and not existing_broker_id:
+        existing.broker_order_id = new_broker_id
+        # Also update metadata_json for consistency
+        metadata = dict(existing.metadata_json or {})
+        metadata["broker_order_id"] = new_broker_id
+        existing.metadata_json = metadata
+        session.add(existing)
+        session.commit()
+        logger.info(
+            "Updated existing live signal with broker_order_id (discord_message_id=%s)",
+            record.discord_message_id,
+        )
+    else:
+        logger.info(
+            "Skipping duplicate live signal (discord_message_id=%s)", record.discord_message_id
+        )
 
 
 def save_live_signal(signal: LiveSignal) -> tuple[str, bool]:
@@ -1221,32 +1340,9 @@ def save_live_signal(signal: LiveSignal) -> tuple[str, bool]:
         discord_msg_id = record.discord_message_id
         deployment_id = record.deployment_id
         if discord_msg_id:
-            existing = session.exec(
-                select(LiveSignalModel)
-                .where(LiveSignalModel.deployment_id == deployment_id)
-                .where(LiveSignalModel.discord_message_id == discord_msg_id)
-                .limit(1)
-            ).first()
+            existing = _find_existing_live_signal(session, deployment_id, discord_msg_id)
             if existing is not None:
-                # Reconcile broker_order_id: if existing lacks it but new record has it, update
-                new_broker_id = (record.broker_order_id or "").strip()
-                existing_broker_id = (existing.broker_order_id or "").strip()
-                if new_broker_id and not existing_broker_id:
-                    existing.broker_order_id = new_broker_id
-                    # Also update metadata_json for consistency
-                    metadata = dict(existing.metadata_json or {})
-                    metadata["broker_order_id"] = new_broker_id
-                    existing.metadata_json = metadata
-                    session.add(existing)
-                    session.commit()
-                    logger.info(
-                        "Updated existing live signal with broker_order_id (discord_message_id=%s)",
-                        discord_msg_id,
-                    )
-                else:
-                    logger.info(
-                        "Skipping duplicate live signal (discord_message_id=%s)", discord_msg_id
-                    )
+                _reconcile_existing_live_signal(session, existing, record)
                 return str(existing.id), False
         record_id = str(record.id)
         session.add(record)
@@ -1256,12 +1352,7 @@ def save_live_signal(signal: LiveSignal) -> tuple[str, bool]:
             session.rollback()
             if not discord_msg_id:
                 raise
-            existing = session.exec(
-                select(LiveSignalModel)
-                .where(LiveSignalModel.deployment_id == deployment_id)
-                .where(LiveSignalModel.discord_message_id == discord_msg_id)
-                .limit(1)
-            ).first()
+            existing = _find_existing_live_signal(session, deployment_id, discord_msg_id)
             if existing is None:
                 raise
             logger.info(
@@ -1546,6 +1637,68 @@ def get_live_account(account_id: str) -> LiveAccountConfig | None:
     return row.to_live_account()
 
 
+def _optional_trimmed(value: str | None) -> str | None:
+    """Return a stripped non-empty string, else ``None``."""
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _create_live_account_record(
+    session: Session,
+    account_id: str,
+    broker: str,
+    *,
+    name: str,
+    ctid: str | None,
+    broker_login: str | None,
+) -> LiveAccountConfig:
+    """Insert a brand-new live account row."""
+    account = LiveAccountModel(
+        id=account_id,
+        broker=broker,
+        name=name or account_id,
+        ctid=_optional_trimmed(ctid),
+        broker_login=_optional_trimmed(broker_login),
+    )
+    session.add(account)
+    session.commit()
+    session.refresh(account)
+    return account.to_live_account()
+
+
+def _apply_live_account_updates(
+    session: Session,
+    current: LiveAccountModel,
+    *,
+    broker: str,
+    name: str,
+    ctid: str | None,
+    broker_login: str | None,
+) -> bool:
+    """Overwrite non-empty fields on an existing live account row."""
+    changed = False
+    if broker and current.broker != broker:
+        current.broker = broker
+        changed = True
+    if name and current.name != name:
+        current.name = name
+        changed = True
+    normalized_ctid = _optional_trimmed(ctid)
+    if ctid is not None and current.ctid != normalized_ctid:
+        current.ctid = normalized_ctid
+        changed = True
+    normalized_broker_login = _optional_trimmed(broker_login)
+    if broker_login is not None and current.broker_login != normalized_broker_login:
+        current.broker_login = normalized_broker_login
+        changed = True
+    if changed:
+        session.add(current)
+        session.commit()
+        session.refresh(current)
+    return changed
+
+
 def ensure_live_account(
     account_id: str,
     broker: str,
@@ -1558,45 +1711,23 @@ def ensure_live_account(
     with get_session() as session:
         current = session.get(LiveAccountModel, account_id)
         if current is None:
-            account = LiveAccountModel(
-                id=account_id,
-                broker=broker,
-                name=name or account_id,
-                ctid=(ctid.strip() if isinstance(ctid, str) and ctid.strip() else None),
-                broker_login=(
-                    broker_login.strip()
-                    if isinstance(broker_login, str) and broker_login.strip()
-                    else None
-                ),
+            return _create_live_account_record(
+                session,
+                account_id,
+                broker,
+                name=name,
+                ctid=ctid,
+                broker_login=broker_login,
             )
-            session.add(account)
-            session.commit()
-            session.refresh(account)
-            return account.to_live_account()
 
-        changed = False
-        if broker and current.broker != broker:
-            current.broker = broker
-            changed = True
-        if name and current.name != name:
-            current.name = name
-            changed = True
-        normalized_ctid = ctid.strip() if isinstance(ctid, str) and ctid.strip() else None
-        if ctid is not None and current.ctid != normalized_ctid:
-            current.ctid = normalized_ctid
-            changed = True
-        normalized_broker_login = (
-            broker_login.strip()
-            if isinstance(broker_login, str) and broker_login.strip()
-            else None
+        _apply_live_account_updates(
+            session,
+            current,
+            broker=broker,
+            name=name,
+            ctid=ctid,
+            broker_login=broker_login,
         )
-        if broker_login is not None and current.broker_login != normalized_broker_login:
-            current.broker_login = normalized_broker_login
-            changed = True
-        if changed:
-            session.add(current)
-            session.commit()
-            session.refresh(current)
         return current.to_live_account()
 
 
@@ -1754,6 +1885,35 @@ def get_live_deployment(deployment_id: str) -> LiveDeploymentConfig | None:
     return row.to_live_deployment()
 
 
+def _resolve_deployment_signal_source(deployment: LiveDeploymentConfig) -> tuple[str, str]:
+    """Validate and normalize the deployment signal source type and source."""
+    signal_source_type = str(deployment.signal_source_type or "").lower()
+    signal_source_name = str(deployment.signal_source or "").lower()
+    if signal_source_type not in {"internal", "discord"}:
+        signal_source_type = (
+            signal_source_name if signal_source_name in {"internal", "discord"} else "internal"
+        )
+    elif signal_source_type == "internal" and signal_source_name == "discord":
+        signal_source_type = "discord"
+    if signal_source_type not in {"internal", "discord"}:
+        raise ValueError(
+            f"Invalid signal source type '{deployment.signal_source_type or deployment.signal_source}'"
+        )
+    signal_source = signal_source_name if signal_source_name in {"internal", "discord"} else signal_source_type
+    if signal_source not in {"internal", "discord"}:
+        signal_source = signal_source_type
+    return signal_source_type, signal_source
+
+
+def _normalized_symbol_filter(symbols: list[str]) -> list[str]:
+    """Uppercase stripped symbol entries, dropping blanks."""
+    return [
+        str(symbol).strip().upper()
+        for symbol in (symbols or [])
+        if str(symbol).strip()
+    ]
+
+
 def create_live_deployment(deployment: LiveDeploymentConfig) -> LiveDeploymentConfig:
     from live_runner.stockkit_routing import validate_stockkit_deployment_route
 
@@ -1766,27 +1926,9 @@ def create_live_deployment(deployment: LiveDeploymentConfig) -> LiveDeploymentCo
         deployment_status = str(deployment.status or "ACTIVE").upper()
         if deployment_status not in {"ACTIVE", "PAUSED", "STOPPED"}:
             raise ValueError(f"Invalid deployment status '{deployment.status}'")
-        signal_source_type = str(deployment.signal_source_type or "").lower()
-        signal_source_name = str(deployment.signal_source or "").lower()
-        if signal_source_type not in {"internal", "discord"}:
-            signal_source_type = (
-                signal_source_name if signal_source_name in {"internal", "discord"} else "internal"
-            )
-        elif signal_source_type == "internal" and signal_source_name == "discord":
-            signal_source_type = "discord"
-        if signal_source_type not in {"internal", "discord"}:
-            raise ValueError(
-                f"Invalid signal source type '{deployment.signal_source_type or deployment.signal_source}'"
-            )
-        signal_source = signal_source_name if signal_source_name in {"internal", "discord"} else signal_source_type
-        if signal_source not in {"internal", "discord"}:
-            signal_source = signal_source_type
+        signal_source_type, signal_source = _resolve_deployment_signal_source(deployment)
         signal_source_id = str(deployment.signal_source_id or "").strip()
-        symbol_filter = [
-            str(symbol).strip().upper()
-            for symbol in (deployment.symbol_filter or [])
-            if str(symbol).strip()
-        ]
+        symbol_filter = _normalized_symbol_filter(deployment.symbol_filter)
         record = LiveDeploymentModel.from_live_deployment(deployment)
         record.status = deployment_status
         record.signal_source = signal_source
@@ -2262,6 +2404,22 @@ def migrate_json_to_sqlite(*, skip_existing: bool = True) -> dict[str, int]:
     return summary
 
 
+def _coerce_backtest_row_id(row: Any) -> str | None:
+    """Extract a backtest id string from str/mapping/tuple query rows."""
+    if isinstance(row, str):
+        return row
+    if row is None:
+        return None
+    if hasattr(row, "_mapping"):
+        mapping = getattr(row, "_mapping")
+        value = mapping.get("id")
+        return str(value) if value else None
+    if isinstance(row, (tuple, list)) and row:
+        if row[0]:
+            return str(row[0])
+    return None
+
+
 def list_backtest_ids() -> list[str]:
     init_db()
     with get_session() as session:
@@ -2270,20 +2428,9 @@ def list_backtest_ids() -> list[str]:
         ).all()
     ids: list[str] = []
     for row in rows:
-        if isinstance(row, str):
-            ids.append(row)
-            continue
-        if row is None:
-            continue
-        if hasattr(row, "_mapping"):
-            mapping = getattr(row, "_mapping")
-            value = mapping.get("id")
-            if value:
-                ids.append(str(value))
-                continue
-        if isinstance(row, (tuple, list)) and row:
-            if row[0]:
-                ids.append(str(row[0]))
+        row_id = _coerce_backtest_row_id(row)
+        if row_id is not None:
+            ids.append(row_id)
     return ids
 
 
@@ -2450,6 +2597,78 @@ def load_backtest_metadata_row(backtest_id: str) -> dict[str, Any] | None:
     return _backtest_metadata_payload(backtest, int(trade_count or 0))
 
 
+def _validated_evidence_identifiers(
+    *,
+    component: str,
+    flow_name: str,
+    category: str,
+) -> tuple[str, str, str]:
+    """Validate and normalize the required evidence identifier fields."""
+    normalized_component = str(component or "").strip()
+    if not normalized_component:
+        raise ValueError("component is required")
+    normalized_flow_name = str(flow_name or "").strip()
+    if not normalized_flow_name:
+        raise ValueError("flow_name is required")
+    normalized_category = str(category or "").strip().lower()
+    if not normalized_category:
+        raise ValueError("category is required")
+    return normalized_component, normalized_flow_name, normalized_category
+
+
+def _verification_evidence_run_record(
+    session: Session,
+    *,
+    run_id: str,
+    now_iso: str,
+) -> VerificationEvidenceModel:
+    """Load the existing evidence row for a run or create a fresh one."""
+    existing = session.exec(
+        select(VerificationEvidenceModel)
+        .where(VerificationEvidenceModel.run_id == run_id)
+        .limit(1)
+    ).first()
+    record = existing if isinstance(existing, VerificationEvidenceModel) else None
+    if record is None:
+        record = VerificationEvidenceModel(
+            id=str(uuid4()),
+            run_id=run_id,
+            created_at=now_iso,
+        )
+    return record
+
+
+def _verification_evidence_schedule(
+    record: VerificationEvidenceModel,
+    *,
+    started_at: str | None,
+    finished_at: str | None,
+    duration_seconds: float | None,
+    now_iso: str,
+) -> tuple[str, str, float]:
+    """Resolve started/finished timestamps and duration for an evidence upsert."""
+    started_value = str(started_at or "").strip()
+    if not started_value:
+        started_value = str(record.started_at or "").strip() or now_iso
+    finished_value = str(finished_at or "").strip()
+    if not finished_value:
+        finished_value = str(record.finished_at or "").strip() or now_iso
+
+    safe_duration = _safe_duration_seconds(
+        started_at=started_value,
+        finished_at=finished_value,
+        duration_seconds=duration_seconds,
+    )
+    if (
+        duration_seconds is None
+        and not str(started_at or "").strip()
+        and not str(finished_at or "").strip()
+        and record.duration_seconds is not None
+    ):
+        safe_duration = float(record.duration_seconds)
+    return started_value, finished_value, safe_duration
+
+
 def upsert_verification_evidence(
     *,
     component: str,
@@ -2469,15 +2688,9 @@ def upsert_verification_evidence(
     source: str = "",
     run_id: str | None = None,
 ) -> VerificationEvidenceRecord:
-    normalized_component = str(component or "").strip()
-    if not normalized_component:
-        raise ValueError("component is required")
-    normalized_flow_name = str(flow_name or "").strip()
-    if not normalized_flow_name:
-        raise ValueError("flow_name is required")
-    normalized_category = str(category or "").strip().lower()
-    if not normalized_category:
-        raise ValueError("category is required")
+    normalized_component, normalized_flow_name, normalized_category = (
+        _validated_evidence_identifiers(component=component, flow_name=flow_name, category=category)
+    )
 
     status_value = status.value if isinstance(status, VerificationEvidenceStatus) else str(status)
     normalized_status = _normalize_evidence_status(status_value)
@@ -2492,38 +2705,15 @@ def upsert_verification_evidence(
     normalized_evidence_ref = str(evidence_ref or "").strip()
     init_db()
     with get_session() as session:
-        existing = session.exec(
-            select(VerificationEvidenceModel)
-            .where(VerificationEvidenceModel.run_id == normalized_run_id)
-            .limit(1)
-        ).first()
-        record = existing if isinstance(existing, VerificationEvidenceModel) else None
-        if record is None:
-            record = VerificationEvidenceModel(
-                id=str(uuid4()),
-                run_id=normalized_run_id,
-                created_at=now_iso,
-            )
+        record = _verification_evidence_run_record(session, run_id=normalized_run_id, now_iso=now_iso)
 
-        started_value = str(started_at or "").strip()
-        if not started_value:
-            started_value = str(record.started_at or "").strip() or now_iso
-        finished_value = str(finished_at or "").strip()
-        if not finished_value:
-            finished_value = str(record.finished_at or "").strip() or now_iso
-
-        safe_duration = _safe_duration_seconds(
-            started_at=started_value,
-            finished_at=finished_value,
+        started_value, finished_value, safe_duration = _verification_evidence_schedule(
+            record,
+            started_at=started_at,
+            finished_at=finished_at,
             duration_seconds=duration_seconds,
+            now_iso=now_iso,
         )
-        if (
-            duration_seconds is None
-            and not str(started_at or "").strip()
-            and not str(finished_at or "").strip()
-            and record.duration_seconds is not None
-        ):
-            safe_duration = float(record.duration_seconds)
 
         record.component = normalized_component
         record.flow_name = normalized_flow_name
@@ -2712,6 +2902,98 @@ def _record_verification_evidence_for_task(
     )
 
 
+def _build_background_task_record(
+    *,
+    task_id: str,
+    task_type: str,
+    status: str,
+    config_json: dict[str, Any],
+    progress_message: str,
+    name: str,
+    description: str,
+    source: str,
+    created_at: str,
+    updated_at: str,
+) -> BackgroundTaskRecord:
+    """Create a fresh background task row with all fields populated."""
+    return BackgroundTaskRecord(
+        id=task_id,
+        type=task_type,
+        status=status,
+        config_json=config_json,
+        progress_message=str(progress_message or ""),
+        name=str(name or ""),
+        description=str(description or ""),
+        source=str(source or ""),
+        created_at=created_at,
+        updated_at=updated_at,
+    )
+
+
+def _update_background_task_record(
+    record: BackgroundTaskRecord,
+    *,
+    task_type: str,
+    status: str,
+    config_json: dict[str, Any],
+    progress_message: str,
+    name: str,
+    description: str,
+    source: str,
+    created_at: str | None,
+    created_value: str,
+    updated_value: str,
+) -> None:
+    """Overwrite an existing background task row in place."""
+    record.type = task_type
+    record.status = status
+    record.config_json = config_json
+    record.progress_message = str(progress_message or "")
+    record.name = str(name or "")
+    record.description = str(description or "")
+    record.source = str(source or "")
+    if created_at:
+        record.created_at = created_value
+    elif not str(record.created_at or "").strip():
+        record.created_at = created_value
+    record.updated_at = updated_value
+
+
+def _record_task_completion_evidence(
+    *,
+    task_id: str,
+    task_type: str,
+    status: str,
+    config_json: dict[str, Any],
+    progress_message: str,
+    name: str,
+    description: str,
+    source: str,
+    created_value: str,
+    updated_value: str,
+) -> None:
+    """Mirror a finished task into verification evidence, logging on failure."""
+    try:
+        _record_verification_evidence_for_task(
+            task_id=task_id,
+            task_type=task_type,
+            status=status,
+            config_json=config_json,
+            progress_message=str(progress_message or ""),
+            name=str(name or ""),
+            description=str(description or ""),
+            source=str(source or ""),
+            created_at=created_value,
+            updated_at=updated_value,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Failed to record verification evidence for task %s: %s",
+            task_id,
+            exc,
+        )
+
+
 def upsert_background_task_record(
     *,
     task_id: str,
@@ -2740,54 +3022,48 @@ def upsert_background_task_record(
     with get_session() as session:
         record = session.get(BackgroundTaskRecord, normalized_id)
         if record is None:
-            record = BackgroundTaskRecord(
-                id=normalized_id,
-                type=normalized_type,
-                status=normalized_status,
-                config_json=normalized_config,
-                progress_message=str(progress_message or ""),
-                name=str(name or ""),
-                description=str(description or ""),
-                source=str(source or ""),
-                created_at=created_value,
-                updated_at=updated_value,
-            )
-        else:
-            record.type = normalized_type
-            record.status = normalized_status
-            record.config_json = normalized_config
-            record.progress_message = str(progress_message or "")
-            record.name = str(name or "")
-            record.description = str(description or "")
-            record.source = str(source or "")
-            if created_at:
-                record.created_at = created_value
-            elif not str(record.created_at or "").strip():
-                record.created_at = created_value
-            record.updated_at = updated_value
-        session.add(record)
-        session.commit()
-
-    if normalized_status in _FINAL_TASK_STATUSES:
-        try:
-            _record_verification_evidence_for_task(
+            record = _build_background_task_record(
                 task_id=normalized_id,
                 task_type=normalized_type,
                 status=normalized_status,
                 config_json=normalized_config,
-                progress_message=str(progress_message or ""),
-                name=str(name or ""),
-                description=str(description or ""),
-                source=str(source or ""),
+                progress_message=progress_message,
+                name=name,
+                description=description,
+                source=source,
                 created_at=created_value,
                 updated_at=updated_value,
             )
-        except Exception as exc:
-            logger.warning(
-                "Failed to record verification evidence for task %s: %s",
-                normalized_id,
-                exc,
+        else:
+            _update_background_task_record(
+                record,
+                task_type=normalized_type,
+                status=normalized_status,
+                config_json=normalized_config,
+                progress_message=progress_message,
+                name=name,
+                description=description,
+                source=source,
+                created_at=created_at,
+                created_value=created_value,
+                updated_value=updated_value,
             )
+        session.add(record)
+        session.commit()
+
+    if normalized_status in _FINAL_TASK_STATUSES:
+        _record_task_completion_evidence(
+            task_id=normalized_id,
+            task_type=normalized_type,
+            status=normalized_status,
+            config_json=normalized_config,
+            progress_message=progress_message,
+            name=name,
+            description=description,
+            source=source,
+            created_value=created_value,
+            updated_value=updated_value,
+        )
 
 
 def get_background_task_record(task_id: str) -> dict[str, Any] | None:
@@ -2923,6 +3199,22 @@ def delete_backtest(backtest_id: str) -> bool:
     return True
 
 
+def _unwrap_equity_point_row(raw_row: Any) -> EquityPoint | None:
+    """Coerce str/mapping/tuple/model query rows to an EquityPoint model."""
+    if raw_row is None:
+        return None
+    if isinstance(raw_row, EquityPoint):
+        row = raw_row
+    elif hasattr(raw_row, "_mapping"):
+        values = list(getattr(raw_row, "_mapping").values())
+        row = values[0] if values else None
+    elif isinstance(raw_row, (tuple, list)):
+        row = raw_row[0] if raw_row else None
+    else:
+        row = raw_row
+    return row if isinstance(row, EquityPoint) else None
+
+
 def load_backtest_equity_points(backtest_id: str) -> list[EquityPointModel]:
     normalized_id = str(backtest_id or "").strip()
     if not normalized_id:
@@ -2938,18 +3230,8 @@ def load_backtest_equity_points(backtest_id: str) -> list[EquityPointModel]:
 
     points: list[EquityPointModel] = []
     for raw_row in rows:
-        if raw_row is None:
-            continue
-        if isinstance(raw_row, EquityPoint):
-            row = raw_row
-        elif hasattr(raw_row, "_mapping"):
-            values = list(getattr(raw_row, "_mapping").values())
-            row = values[0] if values else None
-        elif isinstance(raw_row, (tuple, list)):
-            row = raw_row[0] if raw_row else None
-        else:
-            row = raw_row
-        if not isinstance(row, EquityPoint):
+        row = _unwrap_equity_point_row(raw_row)
+        if row is None:
             continue
         points.append(EquityPointModel(time=row.time, equity=row.equity))
     return points
@@ -2974,21 +3256,10 @@ def load_backtest_equity_preview_map(
     }
 
 
-def load_backtest_equity_preview_points_map(
-    backtest_ids: list[str],
-    limit: int = 50,
-) -> dict[str, list[EquityPointModel]]:
-    normalized_ids = [str(backtest_id).strip() for backtest_id in backtest_ids if str(backtest_id).strip()]
-    if not normalized_ids:
-        return {}
-
-    try:
-        normalized_limit = int(limit)
-    except (TypeError, ValueError):
-        normalized_limit = 50
-    normalized_limit = max(1, min(normalized_limit, 200))
-
-    init_db()
+def _equity_preview_query_params(
+    normalized_ids: list[str], normalized_limit: int
+) -> tuple[TextClause, dict[str, Any]]:
+    """Build the ranked/bucketed preview SQL and its bound parameters."""
     params: dict[str, Any] = {"limit": normalized_limit}
     placeholders: list[str] = []
     for index, backtest_id in enumerate(normalized_ids):
@@ -3076,29 +3347,55 @@ def load_backtest_equity_preview_points_map(
             ORDER BY time ASC, backtest_id ASC
             """
         )
+    return ranked_query, params
+
+
+def _append_equity_preview_row(
+    previews: dict[str, list[EquityPointModel]], row: Any
+) -> None:
+    """Append one query row to its backtest's preview list, skipping bad rows."""
+    if hasattr(row, "_mapping"):
+        mapping = getattr(row, "_mapping")
+        backtest_id = str(mapping.get("backtest_id") or "").strip()
+        timestamp = str(mapping.get("time") or "").strip()
+        equity_value = mapping.get("equity")
+    elif isinstance(row, (tuple, list)):
+        backtest_id = str(row[0] or "").strip() if len(row) > 0 else ""
+        timestamp = str(row[1] or "").strip() if len(row) > 1 else ""
+        equity_value = row[2] if len(row) > 2 else None
+    else:
+        return
+    if not backtest_id or backtest_id not in previews or not timestamp:
+        return
+    try:
+        previews[backtest_id].append(EquityPointModel(time=timestamp, equity=float(equity_value)))
+    except (TypeError, ValueError):
+        return
+
+
+def load_backtest_equity_preview_points_map(
+    backtest_ids: list[str],
+    limit: int = 50,
+) -> dict[str, list[EquityPointModel]]:
+    normalized_ids = [str(backtest_id).strip() for backtest_id in backtest_ids if str(backtest_id).strip()]
+    if not normalized_ids:
+        return {}
+
+    try:
+        normalized_limit = int(limit)
+    except (TypeError, ValueError):
+        normalized_limit = 50
+    normalized_limit = max(1, min(normalized_limit, 200))
+
+    init_db()
+    ranked_query, params = _equity_preview_query_params(normalized_ids, normalized_limit)
 
     with get_session() as session:
         rows = session.exec(ranked_query, params=params).all()
 
     previews: dict[str, list[EquityPointModel]] = {backtest_id: [] for backtest_id in normalized_ids}
     for row in rows:
-        if hasattr(row, "_mapping"):
-            mapping = getattr(row, "_mapping")
-            backtest_id = str(mapping.get("backtest_id") or "").strip()
-            timestamp = str(mapping.get("time") or "").strip()
-            equity_value = mapping.get("equity")
-        elif isinstance(row, (tuple, list)):
-            backtest_id = str(row[0] or "").strip() if len(row) > 0 else ""
-            timestamp = str(row[1] or "").strip() if len(row) > 1 else ""
-            equity_value = row[2] if len(row) > 2 else None
-        else:
-            continue
-        if not backtest_id or backtest_id not in previews or not timestamp:
-            continue
-        try:
-            previews[backtest_id].append(EquityPointModel(time=timestamp, equity=float(equity_value)))
-        except (TypeError, ValueError):
-            continue
+        _append_equity_preview_row(previews, row)
 
     return previews
 
@@ -3238,6 +3535,22 @@ def load_backtest_result(backtest_id: str) -> BacktestResult | None:
     )
 
 
+def _portfolio_component_id(settings: dict[str, Any], index: int) -> str:
+    """Prefer a caller-supplied component id, else the positional default."""
+    component_id = f"component-{index:03d}"
+    raw_component_id = settings.get("component_id")
+    if isinstance(raw_component_id, str) and raw_component_id.strip():
+        component_id = raw_component_id.strip()
+    return component_id
+
+
+def _portfolio_component_settings(component: PortfolioComponentModel) -> dict[str, Any]:
+    """Copy component settings without the transient component_id key."""
+    settings = dict(component.settings or {})
+    settings.pop("component_id", None)
+    return settings
+
+
 def save_portfolio(portfolio: PortfolioModel) -> None:
     normalized_id = str(portfolio.id or "").strip()
     if not normalized_id:
@@ -3264,13 +3577,8 @@ def save_portfolio(portfolio: PortfolioModel) -> None:
         session.flush()
 
         for index, component in enumerate(portfolio.components, start=1):
-            component_id = f"component-{index:03d}"
-            if isinstance(component.settings, dict):
-                raw_component_id = component.settings.get("component_id")
-                if isinstance(raw_component_id, str) and raw_component_id.strip():
-                    component_id = raw_component_id.strip()
-            settings = dict(component.settings or {})
-            settings.pop("component_id", None)
+            component_settings = _portfolio_component_settings(component)
+            component_id = _portfolio_component_id(component.settings, index)
             session.add(
                 PortfolioComponentRecord.from_model(
                     portfolio_id=normalized_id,
@@ -3281,7 +3589,7 @@ def save_portfolio(portfolio: PortfolioModel) -> None:
                         timeframe=component.timeframe,
                         weight=component.weight,
                         risk_config=component.risk_config or {},
-                        settings=settings,
+                        settings=component_settings,
                         backtest_id=component.backtest_id,
                     ),
                 )

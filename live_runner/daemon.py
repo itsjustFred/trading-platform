@@ -7,7 +7,7 @@ import inspect
 import os
 import re
 import uuid
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -553,6 +553,78 @@ def size_live_signal_for_submission(
     return signal.model_copy(update={"metadata": metadata})
 
 
+def _resolve_exit_only_target_qty(
+    positions: Iterable[Mapping[str, object]],
+    symbol: str,
+) -> float:
+    target_qty = 0.0
+    for position in positions:
+        position_symbol = str(position.get("symbol") or "").strip().upper()
+        if position_symbol != symbol.upper():
+            continue
+        resolved_qty = _coerce_live_float(position.get("qty"), field_name="qty", minimum=0.0)
+        target_qty = max(resolved_qty, 0.0)
+        break
+    return target_qty
+
+
+async def _metadata_for_exit_only_order(
+    signal: LiveSignal,
+    adapter: BaseLiveAdapter,
+    metadata: dict[str, object],
+) -> dict[str, object]:
+    get_positions = getattr(adapter, "get_positions", None)
+    if not callable(get_positions):
+        raise ValueError("Exit-only signal requires broker adapter with get_positions support")
+    positions = await get_positions()
+    target_qty = _resolve_exit_only_target_qty(positions, signal.symbol)
+    if target_qty <= 0:
+        raise ValueError(
+            f"Exit-only signal received for {signal.symbol} but no long position is open"
+        )
+    metadata["explicit_qty"] = float(target_qty)
+    metadata["risk_sizing_mode"] = "exit_only"
+    return metadata
+
+
+def _count_open_broker_positions(positions: Iterable[Mapping[str, object]]) -> int:
+    open_positions_count = 0
+    for position in positions:
+        try:
+            position_qty = float(position.get("qty") or 0.0)
+        except (TypeError, ValueError):
+            position_qty = 0.0
+        if abs(position_qty) > 0:
+            open_positions_count += 1
+    return open_positions_count
+
+
+async def _broker_exposure_estimate(
+    adapter: BaseLiveAdapter,
+    deployment: LiveDeploymentConfig,
+) -> tuple[int | None, float]:
+    open_positions_count: int | None = None
+    broker_exposure = 0.0
+    get_positions = getattr(adapter, "get_positions", None)
+    if callable(get_positions):
+        positions = await get_positions()
+        open_positions_count = _count_open_broker_positions(positions)
+        # Conservative estimate: each open position was sized at max_risk_per_trade.
+        risk_config = _risk_config_for_deployment(deployment)
+        broker_exposure = open_positions_count * risk_config.max_risk_per_trade
+    return open_positions_count, broker_exposure
+
+
+async def _resolve_account_balance(
+    adapter: BaseLiveAdapter,
+    account_balance: float | None,
+) -> float:
+    if account_balance is None:
+        _, equity = await adapter.get_balance()
+        return float(equity)
+    return account_balance
+
+
 async def submit_order_with_risk(
     adapter: BaseLiveAdapter,
     deployment: LiveDeploymentConfig,
@@ -564,52 +636,15 @@ async def submit_order_with_risk(
 ) -> str:
     metadata = dict(signal.metadata or {})
     if signal.action == "sell" and bool(metadata.get("exit_only")):
-        get_positions = getattr(adapter, "get_positions", None)
-        if not callable(get_positions):
-            raise ValueError("Exit-only signal requires broker adapter with get_positions support")
-        positions = await get_positions()
-        target_qty = 0.0
-        for position in positions:
-            symbol = str(position.get("symbol") or "").strip().upper()
-            if symbol != signal.symbol.upper():
-                continue
-            resolved_qty = _coerce_live_float(
-                position.get("qty"), field_name="qty", minimum=0.0
-            )
-            target_qty = max(resolved_qty, 0.0)
-            break
-        if target_qty <= 0:
-            raise ValueError(
-                f"Exit-only signal received for {signal.symbol} but no long position is open"
-            )
-        metadata["explicit_qty"] = float(target_qty)
-        metadata["risk_sizing_mode"] = "exit_only"
+        metadata = await _metadata_for_exit_only_order(signal, adapter, metadata)
         return await adapter.submit_order(signal.model_copy(update={"metadata": metadata}))
 
     # Feed broker truth into sizing so max_positions / max_total_exposure actually
     # bind. Without this, every signal is sized as if the account were flat.
-    open_positions_count: int | None = None
-    broker_exposure = 0.0
-    get_positions = getattr(adapter, "get_positions", None)
-    if callable(get_positions):
-        positions = await get_positions()
-        open_positions_count = 0
-        for position in positions:
-            try:
-                position_qty = float(position.get("qty") or 0.0)
-            except (TypeError, ValueError):
-                position_qty = 0.0
-            if abs(position_qty) > 0:
-                open_positions_count += 1
-        # Conservative estimate: each open position was sized at max_risk_per_trade.
-        risk_config = _risk_config_for_deployment(deployment)
-        broker_exposure = open_positions_count * risk_config.max_risk_per_trade
-
-    resolved_balance = account_balance
-    if resolved_balance is None:
-        _, equity = await adapter.get_balance()
-        resolved_balance = float(equity)
-
+    open_positions_count, broker_exposure = await _broker_exposure_estimate(
+        adapter, deployment
+    )
+    resolved_balance = await _resolve_account_balance(adapter, account_balance)
     sized_signal = size_live_signal_for_submission(
         signal,
         deployment,
@@ -1264,6 +1299,98 @@ async def sync_services_loop(
         await asyncio.sleep(interval_seconds)
 
 
+def _log_terminal_balance_auth_failure(
+    account_id: str,
+    adapter: BaseLiveAdapter,
+    exc: BaseException,
+) -> None:
+    logger.warning(
+        _ACCOUNT_NOT_AUTHORIZED_LOG,
+        account_id,
+        extra={
+            "data": {
+                "account_id": account_id,
+                "adapter": type(adapter).__name__,
+                "error": str(exc),
+            }
+        },
+    )
+
+
+async def _handle_terminal_balance_error(
+    adapters: dict[str, BaseLiveAdapter],
+    account_id: str,
+    adapter: BaseLiveAdapter,
+    exc: BaseException,
+) -> None:
+    _block_ctrader_account(account_id, exc)
+    adapters.pop(account_id, None)
+    _log_terminal_balance_auth_failure(account_id, adapter, exc)
+    await _disconnect_adapter(
+        adapter,
+        account_id=account_id,
+        reason="terminal_auth_failure",
+    )
+
+
+async def _poll_adapter_balance(
+    adapters: dict[str, BaseLiveAdapter],
+    account_id: str,
+    adapter: BaseLiveAdapter,
+    snapshot_time: datetime,
+) -> None:
+    try:
+        balance, equity = await adapter.get_balance()
+        record = LiveBalanceRecord(
+            account_id=account_id,
+            timestamp=snapshot_time,
+            balance=float(balance),
+            equity=float(equity),
+        )
+        await asyncio.to_thread(save_live_balance, record)
+        logger.debug(
+            "Saved live balance snapshot",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "balance": float(balance),
+                    "equity": float(equity),
+                    "snapshot_time": snapshot_time.isoformat(),
+                }
+            },
+        )
+    except asyncio.CancelledError:
+        raise
+    except CTraderAuthTerminalError as exc:
+        await _handle_terminal_balance_error(adapters, account_id, adapter, exc)
+    except Exception as exc:
+        if _is_ctrader_pending_deferred_error(exc):
+            logger.debug(
+                "Skipping cTrader balance snapshot while request is pending",
+                extra={
+                    "data": {
+                        "account_id": account_id,
+                        "adapter": type(adapter).__name__,
+                        "error": str(exc),
+                    }
+                },
+            )
+            return
+        if _is_terminal_ctrader_runtime_error(exc):
+            await _handle_terminal_balance_error(adapters, account_id, adapter, exc)
+            return
+        logger.warning(
+            "Live balance polling failed",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "adapter": type(adapter).__name__,
+                    "error": str(exc),
+                }
+            },
+        )
+
+
 async def _poll_balances(
     adapters: dict[str, BaseLiveAdapter], *, interval_seconds: int = BALANCE_POLL_INTERVAL_SECONDS
 ) -> None:
@@ -1276,90 +1403,7 @@ async def _poll_balances(
         for account_id, adapter in list(adapters.items()):
             if not _adapter_is_ready(adapter):
                 continue
-            try:
-                balance, equity = await adapter.get_balance()
-                record = LiveBalanceRecord(
-                    account_id=account_id,
-                    timestamp=snapshot_time,
-                    balance=float(balance),
-                    equity=float(equity),
-                )
-                await asyncio.to_thread(save_live_balance, record)
-                logger.debug(
-                    "Saved live balance snapshot",
-                    extra={
-                        "data": {
-                            "account_id": account_id,
-                            "balance": float(balance),
-                            "equity": float(equity),
-                            "snapshot_time": snapshot_time.isoformat(),
-                        }
-                    },
-                )
-            except asyncio.CancelledError:
-                raise
-            except CTraderAuthTerminalError as exc:
-                _block_ctrader_account(account_id, exc)
-                adapters.pop(account_id, None)
-                logger.warning(
-                    _ACCOUNT_NOT_AUTHORIZED_LOG,
-                    account_id,
-                    extra={
-                        "data": {
-                            "account_id": account_id,
-                            "adapter": type(adapter).__name__,
-                            "error": str(exc),
-                        }
-                    },
-                )
-                await _disconnect_adapter(
-                    adapter,
-                    account_id=account_id,
-                    reason="terminal_auth_failure",
-                )
-            except Exception as exc:
-                if _is_ctrader_pending_deferred_error(exc):
-                    logger.debug(
-                        "Skipping cTrader balance snapshot while request is pending",
-                        extra={
-                            "data": {
-                                "account_id": account_id,
-                                "adapter": type(adapter).__name__,
-                                "error": str(exc),
-                            }
-                        },
-                    )
-                    continue
-                if _is_terminal_ctrader_runtime_error(exc):
-                    _block_ctrader_account(account_id, exc)
-                    adapters.pop(account_id, None)
-                    logger.warning(
-                        _ACCOUNT_NOT_AUTHORIZED_LOG,
-                        account_id,
-                        extra={
-                            "data": {
-                                "account_id": account_id,
-                                "adapter": type(adapter).__name__,
-                                "error": str(exc),
-                            }
-                        },
-                    )
-                    await _disconnect_adapter(
-                        adapter,
-                        account_id=account_id,
-                        reason="terminal_auth_failure",
-                    )
-                    continue
-                logger.warning(
-                    "Live balance polling failed",
-                    extra={
-                        "data": {
-                            "account_id": account_id,
-                            "adapter": type(adapter).__name__,
-                            "error": str(exc),
-                        }
-                    },
-                )
+            await _poll_adapter_balance(adapters, account_id, adapter, snapshot_time)
         await asyncio.sleep(interval_seconds)
 
 
@@ -1716,6 +1760,61 @@ async def _rotate_changed_ctrader_adapters(
         )
 
 
+def _clear_discord_auth_blocked_accounts() -> None:
+    if _DISCORD_AUTH_BLOCKED_ACCOUNTS:
+        logger.info(
+            "Credentials changed; clearing blocked Discord listener accounts",
+            extra={"data": {"account_ids": sorted(_DISCORD_AUTH_BLOCKED_ACCOUNTS)}},
+        )
+    _DISCORD_AUTH_BLOCKED_ACCOUNTS.clear()
+    _DISCORD_AUTH_BLOCKED_REASONS.clear()
+
+
+def _group_deployments_by_account(
+    deployments: list[LiveDeploymentConfig],
+) -> dict[str, list[LiveDeploymentConfig]]:
+    deployments_by_account: dict[str, list[LiveDeploymentConfig]] = {}
+    for deployment in deployments:
+        deployments_by_account.setdefault(deployment.account_id, []).append(deployment)
+    return deployments_by_account
+
+
+def _deployment_active_account_ids(
+    deployments: list[LiveDeploymentConfig],
+) -> set[str]:
+    return {
+        deployment.account_id
+        for deployment in deployments
+        if _normalize_deployment_status(deployment.status) == "ACTIVE"
+    }
+
+
+def _discord_active_account_ids(
+    deployments: list[LiveDeploymentConfig],
+) -> set[str]:
+    return {
+        deployment.account_id
+        for deployment in deployments
+        if _normalize_deployment_status(deployment.status) == "ACTIVE"
+        and str(deployment.signal_source or "internal").lower() == "discord"
+        and _deployment_has_discord_channel(deployment)
+    }
+
+
+async def _disconnect_blocked_adapters(
+    active_adapters: dict[str, BaseLiveAdapter],
+    blocked_account_ids: Iterable[str],
+) -> None:
+    for blocked_account_id in sorted(blocked_account_ids):
+        adapter = active_adapters.pop(blocked_account_id, None)
+        if adapter is not None:
+            await _disconnect_adapter(
+                adapter,
+                account_id=blocked_account_id,
+                reason="terminal_auth_blocked",
+            )
+
+
 async def sync_deployments_loop(
     active_adapters: dict[str, BaseLiveAdapter],
     active_tasks: dict[str, asyncio.Task[None]],
@@ -1736,13 +1835,7 @@ async def sync_deployments_loop(
                 accounts_env_mtime = current_mtime
                 # cTrader blocks are cleared below only for accounts whose
                 # selected credential signature actually changed.
-                if _DISCORD_AUTH_BLOCKED_ACCOUNTS:
-                    logger.info(
-                        "Credentials changed; clearing blocked Discord listener accounts",
-                        extra={"data": {"account_ids": sorted(_DISCORD_AUTH_BLOCKED_ACCOUNTS)}},
-                    )
-                _DISCORD_AUTH_BLOCKED_ACCOUNTS.clear()
-                _DISCORD_AUTH_BLOCKED_REASONS.clear()
+                _clear_discord_auth_blocked_accounts()
             accounts, deployments = await _load_db_accounts_and_deployments()
             validate_live_account_routes(accounts)
             changed_ctrader_account_ids = _refresh_ctrader_blocked_state_for_accounts(
@@ -1754,28 +1847,16 @@ async def sync_deployments_loop(
                 active_tasks,
                 active_discord_tasks,
             )
-            deployments_by_account: dict[str, list[LiveDeploymentConfig]] = {}
-            for deployment in deployments:
-                deployments_by_account.setdefault(deployment.account_id, []).append(deployment)
+            deployments_by_account = _group_deployments_by_account(deployments)
             account_lookup = {account.id: account for account in accounts}
             _cleanup_finished_listener_tasks(active_tasks)
             _cleanup_finished_discord_tasks(active_discord_tasks)
             _log_deployment_status_observations(deployments, known_deployment_statuses)
 
-            active_account_ids = {
-                deployment.account_id
-                for deployment in deployments
-                if _normalize_deployment_status(deployment.status) == "ACTIVE"
-            }
-            blocked_active_account_ids = active_account_ids & _CTRADER_AUTH_BLOCKED_ACCOUNTS
-            for blocked_account_id in sorted(blocked_active_account_ids):
-                adapter = active_adapters.pop(blocked_account_id, None)
-                if adapter is not None:
-                    await _disconnect_adapter(
-                        adapter,
-                        account_id=blocked_account_id,
-                        reason="terminal_auth_blocked",
-                    )
+            active_account_ids = _deployment_active_account_ids(deployments)
+            await _disconnect_blocked_adapters(
+                active_adapters, active_account_ids & _CTRADER_AUTH_BLOCKED_ACCOUNTS
+            )
             logger.debug(
                 "Evaluating deployment activation state",
                 extra={
@@ -1789,13 +1870,7 @@ async def sync_deployments_loop(
 
             await _disconnect_inactive_adapters(active_adapters, active_account_ids)
 
-            active_discord_account_ids = {
-                deployment.account_id
-                for deployment in deployments
-                if _normalize_deployment_status(deployment.status) == "ACTIVE"
-                and str(deployment.signal_source or "internal").lower() == "discord"
-                and _deployment_has_discord_channel(deployment)
-            }
+            active_discord_account_ids = _discord_active_account_ids(deployments)
 
             await _connect_active_accounts(
                 runnable_account_ids,

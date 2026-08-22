@@ -958,20 +958,207 @@ def _stockkit_route_with_credentials(env: Mapping[str, str]) -> tuple[str, str, 
     raise RuntimeError("No Alpaca credentials matched a configured StockKit route.")
 
 
+async def _stockkit_market_context(
+    env: Mapping[str, str],
+    *,
+    symbol: str,
+    details: dict[str, Any],
+) -> tuple[str, str, tuple[str, str, bool], bool] | None:
+    from alpaca.trading.client import TradingClient
+
+    route, account_id, credentials = _stockkit_route_with_credentials(env)
+    api_key, secret_key, paper = credentials
+    details.update({"stockkit_route": route, "account_id": account_id, "paper": paper})
+    if not paper:
+        raise RuntimeError("Refusing non-paper Alpaca account for live-stockkit-e2e.")
+
+    client = TradingClient(api_key, secret_key, paper=True)
+    clock = await asyncio.to_thread(client.get_clock)
+    asset = await asyncio.to_thread(client.get_asset, symbol)
+    premarket_eligible, market_details = _is_alpaca_premarket_eligible(clock, asset)
+    regular_open = bool(getattr(clock, "is_open", False))
+    extended_hours = bool(not regular_open and premarket_eligible)
+    details.update(
+        {
+            **market_details,
+            "regular_market_open": regular_open,
+            "premarket_eligible": premarket_eligible,
+            "extended_hours": extended_hours,
+        }
+    )
+    if not regular_open and not premarket_eligible:
+        details["status"] = "skipped (market closed)"
+        details["market_closed_skipped"] = True
+        details["remaining_qty"] = 0.0
+        return None
+    return route, account_id, credentials, extended_hours
+
+
+def _stockkit_deployment_and_signal(
+    env: Mapping[str, str],
+    *,
+    route: str,
+    account_id: str,
+    symbol: str,
+    message_price: float,
+    stock_prices: dict[str, float],
+    extended_hours: bool,
+) -> tuple[Any, Any, Any]:
+    from types import SimpleNamespace
+
+    from live_runner.daemon import _trade_signal_to_live_signal
+    from live_runner.signal_sources.discord_source import _parse_trade_signal_from_message
+    from live_runner.stockkit_routing import validate_stockkit_deployment_route
+    from shared.models import LiveDeploymentConfig, LiveSignal
+
+    message = SimpleNamespace(
+        content=f"**$AAPL** is now oversold - buy signal\nPrice: ${message_price:.2f}",
+        id=f"stockkit-e2e-{uuid4().hex}",
+        channel=SimpleNamespace(id=str(env.get(f"DISCORD_BOT_{route.upper()}_CHANNEL_ID", ""))),
+        author=SimpleNamespace(id=f"stockkit-{route}", bot=True),
+        created_at=datetime.now(timezone.utc),
+    )
+    trade_signal = _parse_trade_signal_from_message(message, default_timeframe="1h")
+    if trade_signal is None:
+        raise RuntimeError("StockKit Discord parser returned no signal.")
+
+    deployment = LiveDeploymentConfig(
+        strategy_name="stockkit_discord_e2e",
+        account_id=account_id,
+        symbols=[symbol],
+        timeframe="1h",
+        status="ACTIVE",
+        signal_source_type="discord",
+        signal_source="discord",
+        signal_source_id=route.upper(),
+        signal_config={"service_name": route, "channel_id": str(message.channel.id)},
+        settings={
+            "max_risk_per_trade": 0.00004,
+            "max_total_exposure": 0.00008,
+            "max_positions": 20,
+        },
+    )
+    validate_stockkit_deployment_route(deployment)
+    live_signal = _trade_signal_to_live_signal(trade_signal, deployment)
+    live_signal.metadata.update({"entry_price": float(trade_signal.entry_price)})
+    if extended_hours:
+        live_signal.metadata["extended_hours"] = True
+        live_signal.metadata["limit_price"] = float(stock_prices["buy_limit"])
+    return trade_signal, deployment, live_signal
+
+
+async def _verify_stockkit_buy_fill(
+    adapter: Any,
+    *,
+    symbol: str,
+    buy_order_id: str,
+    timeout_seconds: int,
+    details: dict[str, Any],
+) -> float:
+    order = await _wait_for_alpaca_order_terminal(
+        adapter._trading_client,
+        buy_order_id,
+        timeout_seconds,
+    )
+    filled_qty = float(getattr(order, "filled_qty", 0.0) or 0.0)
+    details["buy_status"] = str(getattr(order, "status", ""))
+    details["filled_qty"] = filled_qty
+    if filled_qty <= 0:
+        raise RuntimeError(f"Alpaca buy did not fill; status={details['buy_status']}")
+
+    position_qty = await _wait_for_alpaca_position_qty(
+        adapter,
+        symbol=symbol,
+        should_be_flat=False,
+        timeout_seconds=timeout_seconds,
+    )
+    if position_qty <= 0:
+        raise RuntimeError("Alpaca buy filled but no AAPL position appeared.")
+    return position_qty
+
+
+async def _stockkit_close_phase(
+    adapter: Any,
+    *,
+    deployment: Any,
+    trade_signal: Any,
+    symbol: str,
+    position_qty: float,
+    stock_prices: dict[str, float],
+    extended_hours: bool,
+    timeout_seconds: int,
+    broker_order_ids: list[str],
+    details: dict[str, Any],
+) -> float:
+    from shared.models import LiveSignal
+
+    close_signal = LiveSignal(
+        deployment_id=str(deployment.id),
+        symbol=symbol,
+        action="sell",
+        theoretical_price=float(trade_signal.entry_price),
+        timestamp=datetime.now(timezone.utc),
+        metadata={
+            "qty": float(position_qty),
+            "explicit_qty": float(position_qty),
+            "entry_price": float(trade_signal.entry_price),
+            "timeframe": deployment.timeframe,
+            "exit_only": True,
+            "risk_sizing_mode": "flatten",
+            "extended_hours": extended_hours,
+        },
+    )
+    if extended_hours:
+        close_signal.metadata["limit_price"] = float(stock_prices["sell_limit"])
+    close_order_id = await asyncio.wait_for(
+        adapter.submit_order(close_signal),
+        timeout=timeout_seconds,
+    )
+    if close_order_id:
+        broker_order_ids.append(str(close_order_id))
+    close_order = await _wait_for_alpaca_order_terminal(
+        adapter._trading_client,
+        str(close_order_id),
+        timeout_seconds,
+    )
+    details["close_status"] = str(getattr(close_order, "status", ""))
+    remaining_qty = await _wait_for_alpaca_position_qty(
+        adapter,
+        symbol=symbol,
+        should_be_flat=True,
+        timeout_seconds=timeout_seconds,
+    )
+    details["remaining_qty"] = remaining_qty
+    if abs(remaining_qty) > 1e-9:
+        raise RuntimeError(f"Alpaca flatten left remaining AAPL qty={remaining_qty}")
+    return remaining_qty
+
+
+async def _cancel_stockkit_buy_order(
+    adapter: Any,
+    *,
+    symbol: str,
+    buy_order_id: str,
+    details: dict[str, Any],
+) -> None:
+    try:
+        await asyncio.to_thread(adapter._trading_client.cancel_order_by_id, buy_order_id)
+    except Exception:
+        pass
+    try:
+        remaining = _position_qty_for_symbol(await adapter.get_positions(), symbol)
+        details["remaining_qty"] = remaining
+    except Exception:
+        pass
+
+
 async def _alpaca_stockkit_e2e(
     env: Mapping[str, str],
     *,
     timeout_seconds: int,
 ) -> SmokeCheck:
-    from types import SimpleNamespace
-
-    from alpaca.trading.client import TradingClient
     from live_runner.alpaca_adapter import AlpacaLiveAdapter
-    from live_runner.daemon import _trade_signal_to_live_signal
     from live_runner.daemon import submit_order_with_risk
-    from live_runner.signal_sources.discord_source import _parse_trade_signal_from_message
-    from live_runner.stockkit_routing import validate_stockkit_deployment_route
-    from shared.models import LiveDeploymentConfig, LiveSignal
 
     symbol = "AAPL"
     broker_order_ids: list[str] = []
@@ -987,68 +1174,23 @@ async def _alpaca_stockkit_e2e(
     adapter: AlpacaLiveAdapter | None = None
     buy_order_id = ""
     try:
-        route, account_id, credentials = _stockkit_route_with_credentials(env)
-        api_key, secret_key, paper = credentials
-        details.update({"stockkit_route": route, "account_id": account_id, "paper": paper})
-        if not paper:
-            raise RuntimeError("Refusing non-paper Alpaca account for live-stockkit-e2e.")
-
-        client = TradingClient(api_key, secret_key, paper=True)
-        clock = await asyncio.to_thread(client.get_clock)
-        asset = await asyncio.to_thread(client.get_asset, symbol)
-        premarket_eligible, market_details = _is_alpaca_premarket_eligible(clock, asset)
-        regular_open = bool(getattr(clock, "is_open", False))
-        extended_hours = bool(not regular_open and premarket_eligible)
-        details.update(
-            {
-                **market_details,
-                "regular_market_open": regular_open,
-                "premarket_eligible": premarket_eligible,
-                "extended_hours": extended_hours,
-            }
-        )
-        if not regular_open and not premarket_eligible:
-            details["status"] = "skipped (market closed)"
-            details["market_closed_skipped"] = True
-            details["remaining_qty"] = 0.0
+        context = await _stockkit_market_context(env, symbol=symbol, details=details)
+        if context is None:
             return SmokeCheck("alpaca-stockkit-e2e", True, details)
+        route, account_id, credentials, extended_hours = context
+        api_key, secret_key, _ = credentials
 
         stock_prices = await asyncio.to_thread(_alpaca_stock_prices, api_key, secret_key, symbol)
         details["market_data"] = stock_prices
-        message_price = stock_prices["reference"]
-        message = SimpleNamespace(
-            content=f"**$AAPL** is now oversold - buy signal\nPrice: ${message_price:.2f}",
-            id=f"stockkit-e2e-{uuid4().hex}",
-            channel=SimpleNamespace(id=str(env.get(f"DISCORD_BOT_{route.upper()}_CHANNEL_ID", ""))),
-            author=SimpleNamespace(id=f"stockkit-{route}", bot=True),
-            created_at=datetime.now(timezone.utc),
-        )
-        trade_signal = _parse_trade_signal_from_message(message, default_timeframe="1h")
-        if trade_signal is None:
-            raise RuntimeError("StockKit Discord parser returned no signal.")
-
-        deployment = LiveDeploymentConfig(
-            strategy_name="stockkit_discord_e2e",
+        trade_signal, deployment, live_signal = _stockkit_deployment_and_signal(
+            env,
+            route=route,
             account_id=account_id,
-            symbols=[symbol],
-            timeframe="1h",
-            status="ACTIVE",
-            signal_source_type="discord",
-            signal_source="discord",
-            signal_source_id=route.upper(),
-            signal_config={"service_name": route, "channel_id": str(message.channel.id)},
-            settings={
-                "max_risk_per_trade": 0.00004,
-                "max_total_exposure": 0.00008,
-                "max_positions": 20,
-            },
+            symbol=symbol,
+            message_price=stock_prices["reference"],
+            stock_prices=stock_prices,
+            extended_hours=extended_hours,
         )
-        validate_stockkit_deployment_route(deployment)
-        live_signal = _trade_signal_to_live_signal(trade_signal, deployment)
-        live_signal.metadata.update({"entry_price": float(trade_signal.entry_price)})
-        if extended_hours:
-            live_signal.metadata["extended_hours"] = True
-            live_signal.metadata["limit_price"] = float(stock_prices["buy_limit"])
 
         adapter = AlpacaLiveAdapter(
             api_key=api_key,
@@ -1062,80 +1204,37 @@ async def _alpaca_stockkit_e2e(
         )
         if buy_order_id:
             broker_order_ids.append(str(buy_order_id))
-        order = await _wait_for_alpaca_order_terminal(
-            adapter._trading_client,
-            str(buy_order_id),
-            timeout_seconds,
-        )
-        filled_qty = float(getattr(order, "filled_qty", 0.0) or 0.0)
-        details["buy_status"] = str(getattr(order, "status", ""))
-        details["filled_qty"] = filled_qty
-        if filled_qty <= 0:
-            raise RuntimeError(f"Alpaca buy did not fill; status={details['buy_status']}")
-
-        position_qty = await _wait_for_alpaca_position_qty(
+        position_qty = await _verify_stockkit_buy_fill(
             adapter,
             symbol=symbol,
-            should_be_flat=False,
+            buy_order_id=str(buy_order_id),
             timeout_seconds=timeout_seconds,
+            details=details,
         )
-        if position_qty <= 0:
-            raise RuntimeError("Alpaca buy filled but no AAPL position appeared.")
-
-        close_signal = LiveSignal(
-            deployment_id=str(deployment.id),
-            symbol=symbol,
-            action="sell",
-            theoretical_price=float(trade_signal.entry_price),
-            timestamp=datetime.now(timezone.utc),
-            metadata={
-                "qty": float(position_qty),
-                "explicit_qty": float(position_qty),
-                "entry_price": float(trade_signal.entry_price),
-                "timeframe": deployment.timeframe,
-                "exit_only": True,
-                "risk_sizing_mode": "flatten",
-                "extended_hours": extended_hours,
-            },
-        )
-        if extended_hours:
-            close_signal.metadata["limit_price"] = float(stock_prices["sell_limit"])
-        close_order_id = await asyncio.wait_for(
-            adapter.submit_order(close_signal),
-            timeout=timeout_seconds,
-        )
-        if close_order_id:
-            broker_order_ids.append(str(close_order_id))
-        close_order = await _wait_for_alpaca_order_terminal(
-            adapter._trading_client,
-            str(close_order_id),
-            timeout_seconds,
-        )
-        details["close_status"] = str(getattr(close_order, "status", ""))
-        remaining_qty = await _wait_for_alpaca_position_qty(
+        await _stockkit_close_phase(
             adapter,
+            deployment=deployment,
+            trade_signal=trade_signal,
             symbol=symbol,
-            should_be_flat=True,
+            position_qty=position_qty,
+            stock_prices=stock_prices,
+            extended_hours=extended_hours,
             timeout_seconds=timeout_seconds,
+            broker_order_ids=broker_order_ids,
+            details=details,
         )
-        details["remaining_qty"] = remaining_qty
-        if abs(remaining_qty) > 1e-9:
-            raise RuntimeError(f"Alpaca flatten left remaining AAPL qty={remaining_qty}")
         details["status"] = "passed"
         return SmokeCheck("alpaca-stockkit-e2e", True, details)
     except Exception as exc:
         details["status"] = "failed"
         details["error"] = _public_error(exc)
         if adapter is not None and buy_order_id:
-            try:
-                await asyncio.to_thread(adapter._trading_client.cancel_order_by_id, buy_order_id)
-            except Exception:
-                pass
-            try:
-                remaining = _position_qty_for_symbol(await adapter.get_positions(), symbol)
-                details["remaining_qty"] = remaining
-            except Exception:
-                pass
+            await _cancel_stockkit_buy_order(
+                adapter,
+                symbol=symbol,
+                buy_order_id=str(buy_order_id),
+                details=details,
+            )
         return SmokeCheck("alpaca-stockkit-e2e", False, details, details["error"])
     finally:
         if adapter is not None:

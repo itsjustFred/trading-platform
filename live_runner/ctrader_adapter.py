@@ -664,7 +664,11 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._raise_if_terminal_auth_failed()
         if self._authenticated and self._symbol_name_to_id:
             return
+        await self._send_application_auth()
+        await self._send_account_auth_with_recovery()
+        await self._load_symbols_into_cache()
 
+    async def _send_application_auth(self) -> None:
         app_auth_req = self._ProtoOAApplicationAuthReq()
         app_auth_req.clientId = self.app_id
         app_auth_req.clientSecret = self.app_secret
@@ -674,36 +678,40 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 f"Unexpected application auth response: {type(app_auth_res).__name__}"
             )
 
+    async def _send_account_auth_with_recovery(self) -> None:
         try:
             account_auth_res = await self._send_account_auth_request(timeout_seconds=15)
         except CTraderApiError as exc:
-            error_code = _normalize_error_code(exc.error_code)
-            error_text = str(exc)
-            if _is_already_logged_in_error(error_code, error_text):
-                logger.info(
-                    "cTrader account already authenticated; reusing current session",
-                    extra={"data": {"account_id": self.ctid_trader_account_id}},
-                )
-            elif _is_terminal_auth_error(error_code, error_text):
-                if await self._refresh_access_token():
-                    account_auth_res = await self._send_account_auth_request(timeout_seconds=15)
-                    if not isinstance(account_auth_res, self._ProtoOAAccountAuthRes):
-                        raise RuntimeError(
-                            "Unexpected account auth response after refresh: "
-                            f"{type(account_auth_res).__name__}"
-                        )
-                else:
-                    reason = exc.description or error_text or _CTRADER_AUTH_FAILURE_FALLBACK
-                    self._mark_terminal_auth_failure(reason, error_code=error_code)
-                    raise CTraderAuthTerminalError(reason, error_code=error_code) from exc
-            else:
-                raise
+            await self._recover_account_auth_failure(exc)
         else:
             if not isinstance(account_auth_res, self._ProtoOAAccountAuthRes):
                 raise RuntimeError(
                     f"Unexpected account auth response: {type(account_auth_res).__name__}"
                 )
 
+    async def _recover_account_auth_failure(self, exc: CTraderApiError) -> None:
+        error_code = _normalize_error_code(exc.error_code)
+        error_text = str(exc)
+        if _is_already_logged_in_error(error_code, error_text):
+            logger.info(
+                "cTrader account already authenticated; reusing current session",
+                extra={"data": {"account_id": self.ctid_trader_account_id}},
+            )
+            return
+        if not _is_terminal_auth_error(error_code, error_text):
+            raise exc
+        if not await self._refresh_access_token():
+            reason = exc.description or error_text or _CTRADER_AUTH_FAILURE_FALLBACK
+            self._mark_terminal_auth_failure(reason, error_code=error_code)
+            raise CTraderAuthTerminalError(reason, error_code=error_code) from exc
+        account_auth_res = await self._send_account_auth_request(timeout_seconds=15)
+        if not isinstance(account_auth_res, self._ProtoOAAccountAuthRes):
+            raise RuntimeError(
+                "Unexpected account auth response after refresh: "
+                f"{type(account_auth_res).__name__}"
+            )
+
+    async def _load_symbols_into_cache(self) -> None:
         symbols_req = self._ProtoOASymbolsListReq()
         symbols_req.ctidTraderAccountId = self.ctid_trader_account_id
         symbols_req.includeArchivedSymbols = False
@@ -1019,6 +1027,51 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         """
         if self._client is None or not self._authenticated:
             return 0
+        signal_ids = await self._list_reconciliation_signal_ids(max_signals)
+        recovered = 0
+        for signal_id in signal_ids:
+            signal_uuid = self._parse_signal_uuid(signal_id)
+            if signal_uuid is None:
+                continue
+            broker_order_id = await asyncio.to_thread(
+                get_live_signal_broker_order_id, signal_id
+            )
+            if not broker_order_id:
+                broker_order_id = await self._recover_and_persist_broker_order_id(signal_id)
+                if not broker_order_id:
+                    continue
+            order_id = self._coerce_broker_order_id(broker_order_id)
+            if order_id is None:
+                continue
+            details_res = await self._fetch_reconciliation_order_details(
+                signal_id=signal_id,
+                broker_order_id=broker_order_id,
+                order_id=order_id,
+            )
+            if details_res is None:
+                continue
+            recovered += await self._persist_recovered_deals(
+                signal_id=signal_id,
+                signal_uuid=signal_uuid,
+                broker_order_id=broker_order_id,
+                details_res=details_res,
+            )
+        return recovered
+
+    def _parse_signal_uuid(self, signal_id: str) -> UUID | None:
+        try:
+            return UUID(signal_id)
+        except ValueError:
+            return None
+
+    def _coerce_broker_order_id(self, broker_order_id: str) -> int | None:
+        try:
+            return int(broker_order_id)
+        except (TypeError, ValueError):
+            # Order id belongs to another broker (e.g. Alpaca UUIDs).
+            return None
+
+    async def _list_reconciliation_signal_ids(self, max_signals: int) -> list[str]:
         signal_ids: list[str] = []
         before: tuple[datetime, str] | None = None
         while True:
@@ -1046,119 +1099,138 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             if next_before is None or next_before == before:
                 break
             before = next_before
-        recovered = 0
-        for signal_id in signal_ids:
-            try:
-                signal_uuid = UUID(signal_id)
-            except ValueError:
-                continue
-            broker_order_id = await asyncio.to_thread(
-                get_live_signal_broker_order_id, signal_id
+        return signal_ids
+
+    async def _recover_and_persist_broker_order_id(self, signal_id: str) -> str | None:
+        signal_timestamp = await asyncio.to_thread(
+            get_live_signal_timestamp, signal_id
+        )
+        broker_order_id = await self._recover_broker_order_id(
+            signal_id, signal_timestamp
+        )
+        if not broker_order_id:
+            return None
+        persisted = await asyncio.to_thread(
+            set_live_signal_broker_order_id, signal_id, broker_order_id
+        )
+        if not persisted:
+            logger.error(
+                "Recovered cTrader order but could not persist broker order id",
+                extra={"data": {"signal_id": signal_id}},
             )
-            if not broker_order_id:
-                signal_timestamp = await asyncio.to_thread(
-                    get_live_signal_timestamp, signal_id
-                )
-                broker_order_id = await self._recover_broker_order_id(
-                    signal_id, signal_timestamp
-                )
-                if not broker_order_id:
-                    continue
-                persisted = await asyncio.to_thread(
-                    set_live_signal_broker_order_id, signal_id, broker_order_id
-                )
-                if not persisted:
-                    logger.error(
-                        "Recovered cTrader order but could not persist broker order id",
-                        extra={"data": {"signal_id": signal_id}},
-                    )
-                    continue
-                self._order_id_to_signal_id[int(broker_order_id)] = signal_id
-            try:
-                order_id = int(broker_order_id)
-            except (TypeError, ValueError):
-                # Order id belongs to another broker (e.g. Alpaca UUIDs).
-                continue
+            return None
+        self._order_id_to_signal_id[int(broker_order_id)] = signal_id
+        return broker_order_id
 
-            details_req = self._ProtoOAOrderDetailsReq()
-            details_req.ctidTraderAccountId = self.ctid_trader_account_id
-            details_req.orderId = order_id
-            try:
-                details_res = await self._send_request_with_refresh_retry(
-                    details_req,
-                    timeout_seconds=15,
-                )
-            except CTraderApiError as exc:
-                self._raise_terminal_auth_from_api_error(exc)
-                # Unknown to this account (other account/broker) or not found.
+    async def _fetch_reconciliation_order_details(
+        self,
+        *,
+        signal_id: str,
+        broker_order_id: str,
+        order_id: int,
+    ) -> Any | None:
+        details_req = self._ProtoOAOrderDetailsReq()
+        details_req.ctidTraderAccountId = self.ctid_trader_account_id
+        details_req.orderId = order_id
+        try:
+            details_res = await self._send_request_with_refresh_retry(
+                details_req,
+                timeout_seconds=15,
+            )
+        except CTraderApiError as exc:
+            self._raise_terminal_auth_from_api_error(exc)
+            # Unknown to this account (other account/broker) or not found.
+            logger.info(
+                "cTrader reconciliation could not fetch order details",
+                extra={
+                    "data": {
+                        "signal_id": signal_id,
+                        "broker_order_id": broker_order_id,
+                        "error": str(exc),
+                    }
+                },
+            )
+            return None
+        if not isinstance(details_res, self._ProtoOAOrderDetailsRes):
+            logger.warning(
+                "Unexpected order details response during reconciliation",
+                extra={
+                    "data": {
+                        "signal_id": signal_id,
+                        "broker_order_id": broker_order_id,
+                        "response_type": type(details_res).__name__,
+                    }
+                },
+            )
+            return None
+        return details_res
+
+    def _build_reconciled_execution(
+        self,
+        deal: Any,
+        *,
+        signal_uuid: UUID,
+        broker_order_id: str,
+    ) -> LiveExecution | None:
+        deal_status = int(getattr(deal, "dealStatus", 0) or 0)
+        if deal_status not in {
+            self._ProtoOADealStatus.FILLED,
+            self._ProtoOADealStatus.PARTIALLY_FILLED,
+        }:
+            return None
+        deal_id = int(getattr(deal, "dealId", 0) or 0)
+        if deal_id <= 0:
+            return None
+        filled_volume = _to_float(getattr(deal, "filledVolume", 0))
+        if filled_volume <= 0:
+            filled_volume = _to_float(getattr(deal, "volume", 0))
+        if filled_volume <= 0:
+            return None
+
+        timestamp_ms = 0
+        if int(getattr(deal, "executionTimestamp", 0) or 0) > 0:
+            timestamp_ms = int(deal.executionTimestamp)
+        elif int(getattr(deal, "utcLastUpdateTimestamp", 0) or 0) > 0:
+            timestamp_ms = int(deal.utcLastUpdateTimestamp)
+
+        return LiveExecution(
+            signal_id=signal_uuid,
+            actual_price=_to_float(getattr(deal, "executionPrice", 0)),
+            filled_qty=filled_volume,
+            commission=_to_float(getattr(deal, "commission", 0)),
+            timestamp=_to_datetime_from_ms(timestamp_ms),
+            broker_order_id=broker_order_id,
+            dedupe_key=f"ctrader:deal:{deal_id}",
+        )
+
+    async def _persist_recovered_deals(
+        self,
+        *,
+        signal_id: str,
+        signal_uuid: UUID,
+        broker_order_id: str,
+        details_res: Any,
+    ) -> int:
+        recovered = 0
+        for deal in getattr(details_res, "deal", []):
+            execution = self._build_reconciled_execution(
+                deal, signal_uuid=signal_uuid, broker_order_id=broker_order_id
+            )
+            if execution is None:
+                continue
+            if await asyncio.to_thread(save_live_execution, execution):
+                recovered += 1
                 logger.info(
-                    "cTrader reconciliation could not fetch order details",
+                    "Reconciled missed cTrader fill",
                     extra={
                         "data": {
                             "signal_id": signal_id,
                             "broker_order_id": broker_order_id,
-                            "error": str(exc),
+                            "deal_id": int(getattr(deal, "dealId", 0) or 0),
+                            "filled_qty": execution.filled_qty,
                         }
                     },
                 )
-                continue
-            if not isinstance(details_res, self._ProtoOAOrderDetailsRes):
-                logger.warning(
-                    "Unexpected order details response during reconciliation",
-                    extra={
-                        "data": {
-                            "signal_id": signal_id,
-                            "broker_order_id": broker_order_id,
-                            "response_type": type(details_res).__name__,
-                        }
-                    },
-                )
-                continue
-
-            for deal in getattr(details_res, "deal", []):
-                deal_status = int(getattr(deal, "dealStatus", 0) or 0)
-                if deal_status not in {
-                    self._ProtoOADealStatus.FILLED,
-                    self._ProtoOADealStatus.PARTIALLY_FILLED,
-                }:
-                    continue
-                deal_id = int(getattr(deal, "dealId", 0) or 0)
-                if deal_id <= 0:
-                    continue
-                filled_volume = _to_float(getattr(deal, "filledVolume", 0))
-                if filled_volume <= 0:
-                    filled_volume = _to_float(getattr(deal, "volume", 0))
-                if filled_volume <= 0:
-                    continue
-
-                timestamp_ms = 0
-                if int(getattr(deal, "executionTimestamp", 0) or 0) > 0:
-                    timestamp_ms = int(deal.executionTimestamp)
-                elif int(getattr(deal, "utcLastUpdateTimestamp", 0) or 0) > 0:
-                    timestamp_ms = int(deal.utcLastUpdateTimestamp)
-
-                execution = LiveExecution(
-                    signal_id=signal_uuid,
-                    actual_price=_to_float(getattr(deal, "executionPrice", 0)),
-                    filled_qty=filled_volume,
-                    commission=_to_float(getattr(deal, "commission", 0)),
-                    timestamp=_to_datetime_from_ms(timestamp_ms),
-                    broker_order_id=broker_order_id,
-                    dedupe_key=f"ctrader:deal:{deal_id}",
-                )
-                if await asyncio.to_thread(save_live_execution, execution):
-                    recovered += 1
-                    logger.info(
-                        "Reconciled missed cTrader fill",
-                        extra={
-                            "data": {
-                                "signal_id": signal_id,
-                                "broker_order_id": broker_order_id,
-                                "deal_id": deal_id,
-                                "filled_qty": filled_volume,
-                            }
-                        },
-                    )
         return recovered
 
     async def disconnect(self) -> None:
@@ -1222,88 +1294,28 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             get_live_signal_timestamp, signal_id
         )
         if persisted_timestamp is not None:
-            recovered_order_id = await self._recover_broker_order_id(
-                signal_id, persisted_timestamp
-            )
-            if not recovered_order_id:
-                raise RuntimeError(
+            return await self._recover_persisted_signal_order_id(
+                signal_id,
+                signal_timestamp=persisted_timestamp,
+                unrecovered_error=(
                     "Persisted cTrader signal has no unique recoverable broker order; "
                     "refusing possible duplicate submission."
-                )
-            persisted = await asyncio.to_thread(
-                set_live_signal_broker_order_id, signal_id, recovered_order_id
-            )
-            if not persisted:
-                raise RuntimeError(
+                ),
+                unpersisted_error=(
                     "Recovered cTrader order but failed to persist broker order id."
-                )
-            self._order_id_to_signal_id[int(recovered_order_id)] = signal_id
-            return recovered_order_id
+                ),
+            )
 
         canonical_signal_id, created = await asyncio.to_thread(save_live_signal, signal)
         if not created:
-            existing_order_id = await asyncio.to_thread(
-                get_live_signal_broker_order_id, canonical_signal_id
-            )
-            if existing_order_id:
-                try:
-                    self._order_id_to_signal_id[int(existing_order_id)] = canonical_signal_id
-                except (TypeError, ValueError):
-                    pass
-                return existing_order_id
-            canonical_timestamp = await asyncio.to_thread(
-                get_live_signal_timestamp, canonical_signal_id
-            )
-            recovered_order_id = await self._recover_broker_order_id(
-                canonical_signal_id, canonical_timestamp
-            )
-            if not recovered_order_id:
-                raise RuntimeError(
-                    "Duplicate Discord signal has no unique recoverable broker order; "
-                    "refusing possible duplicate submission."
-                )
-            persisted = await asyncio.to_thread(
-                set_live_signal_broker_order_id,
-                canonical_signal_id,
-                recovered_order_id,
-            )
-            if not persisted:
-                raise RuntimeError(
-                    "Recovered duplicate Discord order but failed to persist broker order id."
-                )
-            self._order_id_to_signal_id[int(recovered_order_id)] = canonical_signal_id
-            return recovered_order_id
+            return await self._recover_duplicate_signal_order_id(canonical_signal_id)
 
-        symbol_id = self._symbol_name_to_id.get(signal.symbol.upper())
-        if symbol_id is None:
-            await self._authenticate()
-            symbol_id = self._symbol_name_to_id.get(signal.symbol.upper())
-        if symbol_id is None:
-            raise ValueError(f"Unknown cTrader symbol: {signal.symbol}")
-
+        symbol_id = await self._resolve_symbol_id(signal.symbol)
         if signal.action not in {"buy", "sell"}:
             raise ValueError(f"Unsupported signal action: {signal.action}")
 
-        request = self._ProtoOANewOrderReq()
-        request.ctidTraderAccountId = self.ctid_trader_account_id
-        request.symbolId = int(symbol_id)
-        request.orderType = self._ProtoOAOrderType.MARKET
-        request.tradeSide = (
-            self._ProtoOATradeSide.BUY if signal.action == "buy" else self._ProtoOATradeSide.SELL
-        )
-        request.volume = self._resolve_order_volume(signal)
-        request.timeInForce = self._ProtoOATimeInForce.IMMEDIATE_OR_CANCEL
-        request.clientOrderId = str(signal.id)
-
-        try:
-            response = await self._send_request_with_refresh_retry(request, timeout_seconds=20)
-        except CTraderApiError as exc:
-            self._raise_terminal_auth_from_api_error(exc)
-            raise
-        if isinstance(response, self._ProtoOAOrderErrorEvent):
-            raise RuntimeError(
-                f"Order rejected ({response.errorCode}): {response.description or 'no description'}"
-            )
+        request = self._build_new_order_request(signal, symbol_id=symbol_id)
+        response = await self._submit_new_order_request(request)
 
         broker_order_id = ""
         order_id = self._extract_order_id_from_payload(response)
@@ -1331,6 +1343,84 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             },
         )
         return broker_order_id
+
+    async def _recover_persisted_signal_order_id(
+        self,
+        signal_id: str,
+        *,
+        signal_timestamp: datetime | None,
+        unrecovered_error: str,
+        unpersisted_error: str,
+    ) -> str:
+        recovered_order_id = await self._recover_broker_order_id(
+            signal_id, signal_timestamp
+        )
+        if not recovered_order_id:
+            raise RuntimeError(unrecovered_error)
+        persisted = await asyncio.to_thread(
+            set_live_signal_broker_order_id, signal_id, recovered_order_id
+        )
+        if not persisted:
+            raise RuntimeError(unpersisted_error)
+        self._order_id_to_signal_id[int(recovered_order_id)] = signal_id
+        return recovered_order_id
+
+    async def _recover_duplicate_signal_order_id(self, canonical_signal_id: str) -> str:
+        existing_order_id = await asyncio.to_thread(
+            get_live_signal_broker_order_id, canonical_signal_id
+        )
+        if existing_order_id:
+            try:
+                self._order_id_to_signal_id[int(existing_order_id)] = canonical_signal_id
+            except (TypeError, ValueError):
+                pass
+            return existing_order_id
+        canonical_timestamp = await asyncio.to_thread(
+            get_live_signal_timestamp, canonical_signal_id
+        )
+        return await self._recover_persisted_signal_order_id(
+            canonical_signal_id,
+            signal_timestamp=canonical_timestamp,
+            unrecovered_error=(
+                "Duplicate Discord signal has no unique recoverable broker order; "
+                "refusing possible duplicate submission."
+            ),
+            unpersisted_error=(
+                "Recovered duplicate Discord order but failed to persist broker order id."
+            ),
+        )
+
+    async def _resolve_symbol_id(self, symbol: str) -> int | None:
+        symbol_id = self._symbol_name_to_id.get(symbol.upper())
+        if symbol_id is None:
+            await self._authenticate()
+            symbol_id = self._symbol_name_to_id.get(symbol.upper())
+        return symbol_id
+
+    def _build_new_order_request(self, signal: LiveSignal, *, symbol_id: int) -> Any:
+        request = self._ProtoOANewOrderReq()
+        request.ctidTraderAccountId = self.ctid_trader_account_id
+        request.symbolId = int(symbol_id)
+        request.orderType = self._ProtoOAOrderType.MARKET
+        request.tradeSide = (
+            self._ProtoOATradeSide.BUY if signal.action == "buy" else self._ProtoOATradeSide.SELL
+        )
+        request.volume = self._resolve_order_volume(signal)
+        request.timeInForce = self._ProtoOATimeInForce.IMMEDIATE_OR_CANCEL
+        request.clientOrderId = str(signal.id)
+        return request
+
+    async def _submit_new_order_request(self, request: Any) -> Any:
+        try:
+            response = await self._send_request_with_refresh_retry(request, timeout_seconds=20)
+        except CTraderApiError as exc:
+            self._raise_terminal_auth_from_api_error(exc)
+            raise
+        if isinstance(response, self._ProtoOAOrderErrorEvent):
+            raise RuntimeError(
+                f"Order rejected ({response.errorCode}): {response.description or 'no description'}"
+            )
+        return response
 
     async def get_balance(self) -> tuple[float, float]:
         self._raise_if_terminal_auth_failed()
@@ -1427,17 +1517,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         order = event.order if event.HasField("order") else None
         deal = event.deal if event.HasField("deal") else None
 
-        order_id: int | None = None
-        client_order_id = ""
-        if order is not None:
-            if order.orderId > 0:
-                order_id = int(order.orderId)
-            if order.clientOrderId:
-                client_order_id = str(order.clientOrderId)
-        if order_id is None and deal is not None and deal.orderId > 0:
-            order_id = int(deal.orderId)
-        if not client_order_id and order_id is not None:
-            client_order_id = self._order_id_to_signal_id.get(order_id, "")
+        order_id, client_order_id = self._extract_order_and_client_ids(order, deal)
         if not client_order_id and order_id is not None:
             client_order_id = (
                 await asyncio.to_thread(
@@ -1448,73 +1528,25 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 or ""
             )
 
-        if not client_order_id:
-            logger.warning(
-                "cTrader fill missing clientOrderId mapping",
-                extra={
-                    "data": {
-                        "account_id": self.ctid_trader_account_id,
-                        "order_id": str(order_id or ""),
-                        "execution_type": execution_type,
-                    }
-                },
-            )
+        signal_id = self._parse_client_order_id(
+            client_order_id, order_id=order_id, execution_type=execution_type
+        )
+        if signal_id is None:
             return
 
-        try:
-            signal_id = UUID(client_order_id)
-        except ValueError:
-            logger.warning(
-                "cTrader fill has non-UUID clientOrderId",
-                extra={
-                    "data": {
-                        "client_order_id": client_order_id,
-                        "order_id": str(order_id or ""),
-                    }
-                },
-            )
-            return
-
-        execution_price = 0.0
-        if deal is not None and deal.executionPrice:
-            execution_price = _to_float(deal.executionPrice)
-        elif order is not None and order.executionPrice:
-            execution_price = _to_float(order.executionPrice)
-
-        filled_volume = 0.0
-        if deal is not None:
-            if deal.filledVolume > 0:
-                filled_volume = _to_float(deal.filledVolume)
-            elif deal.volume > 0:
-                filled_volume = _to_float(deal.volume)
-        elif order is not None and order.executedVolume > 0:
-            filled_volume = _to_float(order.executedVolume)
-
-        commission = _to_float(deal.commission) if deal is not None else 0.0
-        timestamp_ms = 0
-        if deal is not None and deal.executionTimestamp > 0:
-            timestamp_ms = int(deal.executionTimestamp)
-        elif deal is not None and deal.utcLastUpdateTimestamp > 0:
-            timestamp_ms = int(deal.utcLastUpdateTimestamp)
-        elif order is not None and order.utcLastUpdateTimestamp > 0:
-            timestamp_ms = int(order.utcLastUpdateTimestamp)
-
-        deal_id = int(getattr(deal, "dealId", 0) or 0) if deal is not None else 0
-        if deal_id > 0:
-            dedupe_key = f"ctrader:deal:{deal_id}"
-        else:
-            dedupe_key = (
-                f"ctrader:order:{order_id or ''}:{timestamp_ms}:{filled_volume}"
-            )
-
+        timestamp_ms = self._resolve_execution_timestamp_ms(order=order, deal=deal)
+        filled_volume = self._resolve_filled_volume(order=order, deal=deal)
         execution = LiveExecution(
             signal_id=signal_id,
-            actual_price=execution_price,
+            actual_price=self._resolve_execution_price(order=order, deal=deal),
             filled_qty=filled_volume,
-            commission=commission,
+            commission=_to_float(deal.commission) if deal is not None else 0.0,
             timestamp=_to_datetime_from_ms(timestamp_ms),
             broker_order_id=str(order_id or ""),
-            dedupe_key=dedupe_key,
+            dedupe_key=self._build_dedupe_key(
+                deal, order_id=order_id, timestamp_ms=timestamp_ms,
+                filled_volume=filled_volume,
+            ),
         )
         await asyncio.to_thread(save_live_execution, execution)
         logger.info(
@@ -1531,6 +1563,97 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             },
         )
 
+    def _extract_order_and_client_ids(
+        self, order: Any | None, deal: Any | None
+    ) -> tuple[int | None, str]:
+        order_id: int | None = None
+        client_order_id = ""
+        if order is not None:
+            if order.orderId > 0:
+                order_id = int(order.orderId)
+            if order.clientOrderId:
+                client_order_id = str(order.clientOrderId)
+        if order_id is None and deal is not None and deal.orderId > 0:
+            order_id = int(deal.orderId)
+        if not client_order_id and order_id is not None:
+            client_order_id = self._order_id_to_signal_id.get(order_id, "")
+        return order_id, client_order_id
+
+    def _parse_client_order_id(
+        self,
+        client_order_id: str,
+        *,
+        order_id: int | None,
+        execution_type: int,
+    ) -> UUID | None:
+        if not client_order_id:
+            logger.warning(
+                "cTrader fill missing clientOrderId mapping",
+                extra={
+                    "data": {
+                        "account_id": self.ctid_trader_account_id,
+                        "order_id": str(order_id or ""),
+                        "execution_type": execution_type,
+                    }
+                },
+            )
+            return None
+        try:
+            return UUID(client_order_id)
+        except ValueError:
+            logger.warning(
+                "cTrader fill has non-UUID clientOrderId",
+                extra={
+                    "data": {
+                        "client_order_id": client_order_id,
+                        "order_id": str(order_id or ""),
+                    }
+                },
+            )
+            return None
+
+    @staticmethod
+    def _resolve_execution_price(*, order: Any | None, deal: Any | None) -> float:
+        if deal is not None and deal.executionPrice:
+            return _to_float(deal.executionPrice)
+        if order is not None and order.executionPrice:
+            return _to_float(order.executionPrice)
+        return 0.0
+
+    @staticmethod
+    def _resolve_filled_volume(*, order: Any | None, deal: Any | None) -> float:
+        if deal is not None:
+            if deal.filledVolume > 0:
+                return _to_float(deal.filledVolume)
+            if deal.volume > 0:
+                return _to_float(deal.volume)
+        elif order is not None and order.executedVolume > 0:
+            return _to_float(order.executedVolume)
+        return 0.0
+
+    @staticmethod
+    def _resolve_execution_timestamp_ms(*, order: Any | None, deal: Any | None) -> int:
+        if deal is not None and deal.executionTimestamp > 0:
+            return int(deal.executionTimestamp)
+        if deal is not None and deal.utcLastUpdateTimestamp > 0:
+            return int(deal.utcLastUpdateTimestamp)
+        if order is not None and order.utcLastUpdateTimestamp > 0:
+            return int(order.utcLastUpdateTimestamp)
+        return 0
+
+    @staticmethod
+    def _build_dedupe_key(
+        deal: Any | None,
+        *,
+        order_id: int | None,
+        timestamp_ms: int,
+        filled_volume: float,
+    ) -> str:
+        deal_id = int(getattr(deal, "dealId", 0) or 0) if deal is not None else 0
+        if deal_id > 0:
+            return f"ctrader:deal:{deal_id}"
+        return f"ctrader:order:{order_id or ''}:{timestamp_ms}:{filled_volume}"
+
     async def listen_executions(self) -> None:
         backoff_seconds = 2
         while True:
@@ -1538,29 +1661,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 if not self._connected or not self._authenticated:
                     await self.connect()
 
-                if (
-                    self._reconciliation_required
-                    and time.monotonic() >= self._reconciliation_retry_at
-                ):
-                    try:
-                        await self.reconcile_executions()
-                    except CTraderAuthTerminalError:
-                        raise
-                    except Exception as exc:
-                        self._reconciliation_retry_at = time.monotonic() + backoff_seconds
-                        logger.warning(
-                            "cTrader overflow reconciliation failed; queue processing continues",
-                            extra={
-                                "data": {
-                                    "account_id": self.ctid_trader_account_id,
-                                    "error": str(exc),
-                                    "retry_in_seconds": backoff_seconds,
-                                }
-                            },
-                        )
-                    else:
-                        self._reconciliation_required = False
-                        self._reconciliation_retry_at = 0.0
+                await self._run_pending_reconciliation(backoff_seconds)
 
                 event = await asyncio.wait_for(self._execution_queue.get(), timeout=30)
                 await self._persist_execution_event(event)
@@ -1570,20 +1671,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             except asyncio.CancelledError:
                 raise
             except CTraderAuthTerminalError as exc:
-                # Terminate so the daemon can start a fresh listener once a new
-                # adapter is created after credential rotation. Parking forever
-                # leaves a zombie task that blocks fill persistence silently.
-                logger.warning(
-                    "cTrader listener terminating after terminal auth failure",
-                    extra={
-                        "data": {
-                            "account_id": self.ctid_trader_account_id,
-                            "account_config_id": self.account_config_id,
-                            "error_code": getattr(exc, "error_code", ""),
-                            "error": str(exc),
-                        }
-                    },
-                )
+                self._log_listener_terminal_auth_failure(exc)
                 return
             except Exception as exc:
                 logger.warning(
@@ -1598,3 +1686,45 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 )
                 await asyncio.sleep(backoff_seconds)
                 backoff_seconds = min(backoff_seconds * 2, 30)
+
+    async def _run_pending_reconciliation(self, backoff_seconds: int) -> None:
+        if not (
+            self._reconciliation_required
+            and time.monotonic() >= self._reconciliation_retry_at
+        ):
+            return
+        try:
+            await self.reconcile_executions()
+        except CTraderAuthTerminalError:
+            raise
+        except Exception as exc:
+            self._reconciliation_retry_at = time.monotonic() + backoff_seconds
+            logger.warning(
+                "cTrader overflow reconciliation failed; queue processing continues",
+                extra={
+                    "data": {
+                        "account_id": self.ctid_trader_account_id,
+                        "error": str(exc),
+                        "retry_in_seconds": backoff_seconds,
+                    }
+                },
+            )
+        else:
+            self._reconciliation_required = False
+            self._reconciliation_retry_at = 0.0
+
+    def _log_listener_terminal_auth_failure(self, exc: CTraderAuthTerminalError) -> None:
+        # Terminate so the daemon can start a fresh listener once a new
+        # adapter is created after credential rotation. Parking forever
+        # leaves a zombie task that blocks fill persistence silently.
+        logger.warning(
+            "cTrader listener terminating after terminal auth failure",
+            extra={
+                "data": {
+                    "account_id": self.ctid_trader_account_id,
+                    "account_config_id": self.account_config_id,
+                    "error_code": getattr(exc, "error_code", ""),
+                    "error": str(exc),
+                }
+            },
+        )
