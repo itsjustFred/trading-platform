@@ -137,8 +137,10 @@ def _is_terminal_auth_error(error_code: str, error_text: str) -> bool:
 def _write_env_keys(path: Path, updates: dict[str, str]) -> None:
     """Persist dotenv keys atomically without logging secret material."""
     resolved = path.resolve()
-    if not resolved.parent.is_dir():
-        raise FileNotFoundError(f"Accounts env directory does not exist: {resolved.parent}")
+    if resolved.name != path.name or not path.parent.is_dir():
+        raise FileNotFoundError(
+            f"Accounts env target must be a regular file in an existing directory: {path}"
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_name(f"{path.name}.lock")
     with lock_path.open("a+", encoding="utf-8") as lock_handle:
