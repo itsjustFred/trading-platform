@@ -721,7 +721,9 @@ class BacktestResult:
 
     def save(self, path: str | Path) -> Path:
         """Save to JSON file. Returns the path written to."""
-        p = Path(path)
+        p = Path(path).resolve()
+        if not p.parent.is_dir():
+            raise FileNotFoundError(f"Target directory does not exist: {p.parent}")
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(self.to_json(), encoding="utf-8")
         logger.info("Saved backtest result to %s", p)
@@ -731,6 +733,8 @@ class BacktestResult:
     def load(cls, path: str | Path) -> BacktestResult:
         """Load from JSON file."""
         p = Path(path)
+        if not p.is_file():
+            raise FileNotFoundError(f"Backtest result file not found: {path}")
         return cls.from_json(p.read_text(encoding="utf-8"))
 
     @property

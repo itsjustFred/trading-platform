@@ -225,11 +225,14 @@ class PortfolioComponentRecord(SQLModel, table=True):
         )
 
 
+_BACKTESTS_FK = "backtests.id"
+
+
 class TradeRecord(SQLModel, table=True):
     __tablename__ = "trades"
 
     id: int | None = Field(default=None, primary_key=True)
-    backtest_id: str = Field(foreign_key="backtests.id", index=True)
+    backtest_id: str = Field(foreign_key=_BACKTESTS_FK, index=True)
     trade_nr: int = Field(index=True)
     symbol: str = Field(default="", index=True)
     direction: str = Field(default="LONG")
@@ -259,7 +262,7 @@ class EquityPoint(SQLModel, table=True):
     __tablename__ = "equity_points"
 
     id: int | None = Field(default=None, primary_key=True)
-    backtest_id: str = Field(foreign_key="backtests.id", index=True)
+    backtest_id: str = Field(foreign_key=_BACKTESTS_FK, index=True)
     time: str = Field(sa_column=Column(String, index=True))
     equity: float = Field(default=0.0)
 
@@ -268,7 +271,7 @@ class DrawingRecord(SQLModel, table=True):
     __tablename__ = "drawings"
 
     id: int | None = Field(default=None, primary_key=True)
-    backtest_id: str = Field(foreign_key="backtests.id", index=True)
+    backtest_id: str = Field(foreign_key=_BACKTESTS_FK, index=True)
     trade_nr: int | None = Field(default=None, index=True)
     type: str = Field(default="", index=True)
     data: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))
@@ -278,7 +281,7 @@ class IndicatorRecord(SQLModel, table=True):
     __tablename__ = "indicators"
 
     id: int | None = Field(default=None, primary_key=True)
-    backtest_id: str = Field(foreign_key="backtests.id", index=True)
+    backtest_id: str = Field(foreign_key=_BACKTESTS_FK, index=True)
     series_nr: int = Field(default=0, index=True)
     data: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))
 

@@ -28,6 +28,16 @@ from risk.models import TradeSignal
 from shared.models import LiveDeploymentConfig, LiveExecution, LiveSignal
 
 
+def _make_ctrader_adapter():
+    """Bootstrap a detached cTrader adapter for unit-scoped tests."""
+    from live_runner import ctrader_adapter as module
+
+    adapter = module.CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="123",
+    )
+    return module, adapter
+
+
 # ── Risk engine boundaries ─────────────────────────────────────────────────────
 
 
@@ -455,11 +465,7 @@ def test_alpaca_broker_order_id_persistence_failure_is_not_success(monkeypatch):
 
 def test_ctrader_volume_rejects_missing_and_below_minimum_qty():
     """Volume floor must not silently override risk sizing; no default size."""
-    from live_runner.ctrader_adapter import CTraderLiveAdapter
-
-    adapter = CTraderLiveAdapter(
-        app_id="app", app_secret="secret", access_token="token", account_id="123",
-    )
+    _module, adapter = _make_ctrader_adapter()
 
     def _signal(metadata: dict[str, Any]) -> LiveSignal:
         return LiveSignal(
@@ -1547,12 +1553,8 @@ def test_alpaca_reconcile_skips_non_positive_partial_fill_delta(
 
 
 def test_ctrader_fill_fallback_lookup_uses_canonical_account_scope(monkeypatch):
-    from live_runner import ctrader_adapter as module
-
-    adapter = module.CTraderLiveAdapter(
-        app_id="app", app_secret="secret", access_token="token",
-        account_id="123", account_config_id="local-account-123",
-    )
+    module, adapter = _make_ctrader_adapter()
+    adapter.account_config_id = "local-account-123"
     adapter._ProtoOAExecutionType = SimpleNamespace(ORDER_FILLED=1, ORDER_PARTIAL_FILL=2)
     queried: list[tuple[str, str]] = []
     monkeypatch.setattr(
@@ -1574,11 +1576,7 @@ def test_ctrader_fill_fallback_lookup_uses_canonical_account_scope(monkeypatch):
 
 def test_ctrader_reconcile_backfills_missing_fill(monkeypatch):
     """cTrader reconcile_executions backfills fills for signals with broker_order_id."""
-    from live_runner import ctrader_adapter as module
-
-    adapter = module.CTraderLiveAdapter(
-        app_id="app", app_secret="secret", access_token="token", account_id="123",
-    )
+    module, adapter = _make_ctrader_adapter()
     adapter._client = object()
     adapter._authenticated = True
     signal_id = str(uuid4())
@@ -1630,11 +1628,7 @@ def test_ctrader_reconcile_backfills_missing_fill(monkeypatch):
 
 
 def test_ctrader_reconcile_pages_past_candidate_limit(monkeypatch):
-    from live_runner import ctrader_adapter as module
-
-    adapter = module.CTraderLiveAdapter(
-        app_id="app", app_secret="secret", access_token="token", account_id="123",
-    )
+    module, adapter = _make_ctrader_adapter()
     adapter._client = object()
     adapter._authenticated = True
     signal_ids = [str(uuid4()) for _ in range(5)]
@@ -1698,11 +1692,7 @@ def test_ctrader_reconcile_pages_past_candidate_limit(monkeypatch):
 
 def test_ctrader_reconcile_recovers_accepted_order_before_local_id_persistence(monkeypatch):
     """Restart recovery finds an accepted order by the stable signal client id."""
-    from live_runner import ctrader_adapter as module
-
-    adapter = module.CTraderLiveAdapter(
-        app_id="app", app_secret="secret", access_token="token", account_id="123",
-    )
+    module, adapter = _make_ctrader_adapter()
     adapter._client = object()
     adapter._authenticated = True
     signal_id = str(uuid4())
@@ -1791,11 +1781,7 @@ def test_ctrader_reconcile_recovers_accepted_order_before_local_id_persistence(m
 
 def test_ctrader_discord_redelivery_uses_canonical_signal_without_resubmitting(monkeypatch):
     """A repeated Discord message with a new UUID must reuse the canonical order."""
-    from live_runner import ctrader_adapter as module
-
-    adapter = module.CTraderLiveAdapter(
-        app_id="app", app_secret="secret", access_token="token", account_id="123",
-    )
+    module, adapter = _make_ctrader_adapter()
     adapter._client = object()
     adapter._connected = True
     adapter._authenticated = True
@@ -1842,11 +1828,7 @@ def test_ctrader_redelivery_with_persisted_order_id_needs_no_broker_connection(
     monkeypatch,
 ):
     """Local broker confirmation must short-circuit even while broker is unavailable."""
-    from live_runner import ctrader_adapter as module
-
-    adapter = module.CTraderLiveAdapter(
-        app_id="app", app_secret="secret", access_token="token", account_id="123",
-    )
+    module, adapter = _make_ctrader_adapter()
     signal = LiveSignal(
         id=uuid4(),
         deployment_id="dep-1",
@@ -1873,11 +1855,7 @@ def test_ctrader_redelivery_with_persisted_order_id_needs_no_broker_connection(
 
 def test_ctrader_redelivery_recovers_accepted_order_without_resubmitting(monkeypatch):
     """A persisted signal with an accepted broker order must not submit twice."""
-    from live_runner import ctrader_adapter as module
-
-    adapter = module.CTraderLiveAdapter(
-        app_id="app", app_secret="secret", access_token="token", account_id="123",
-    )
+    module, adapter = _make_ctrader_adapter()
     adapter._client = object()
     adapter._connected = True
     adapter._authenticated = True
@@ -1964,11 +1942,7 @@ def test_ctrader_redelivery_recovers_accepted_order_without_resubmitting(monkeyp
 
 def test_ctrader_accepted_order_fails_closed_when_local_id_persistence_fails(monkeypatch):
     """Broker acceptance must not be reported as durable when DB confirmation fails."""
-    from live_runner import ctrader_adapter as module
-
-    adapter = module.CTraderLiveAdapter(
-        app_id="app", app_secret="secret", access_token="token", account_id="123",
-    )
+    module, adapter = _make_ctrader_adapter()
     adapter._client = object()
     adapter._connected = True
     adapter._authenticated = True
@@ -2048,11 +2022,7 @@ def test_ctrader_order_recovery_fails_closed_when_match_is_not_unique(
     orders, has_more
 ):
     """Zero, duplicate, or incomplete broker results must never select an order."""
-    from live_runner import ctrader_adapter as module
-
-    adapter = module.CTraderLiveAdapter(
-        app_id="app", app_secret="secret", access_token="token", account_id="123",
-    )
+    module, adapter = _make_ctrader_adapter()
 
     class _OrderListReq:
         def __init__(self) -> None:
@@ -2084,11 +2054,7 @@ def test_ctrader_order_recovery_fails_closed_when_match_is_not_unique(
 
 def test_ctrader_reconcile_skips_signals_without_broker_order_id(monkeypatch):
     """cTrader reconcile must skip signals that have no broker_order_id persisted."""
-    from live_runner import ctrader_adapter as module
-
-    adapter = module.CTraderLiveAdapter(
-        app_id="app", app_secret="secret", access_token="token", account_id="123",
-    )
+    module, adapter = _make_ctrader_adapter()
     adapter._client = object()
     adapter._authenticated = True
     signal_id = str(uuid4())
@@ -2112,11 +2078,7 @@ def test_ctrader_reconcile_skips_signals_without_broker_order_id(monkeypatch):
 
 def test_ctrader_reconcile_skips_non_numeric_broker_order_ids(monkeypatch):
     """cTrader reconcile must skip Alpaca-style UUID broker_order_ids (non-numeric)."""
-    from live_runner import ctrader_adapter as module
-
-    adapter = module.CTraderLiveAdapter(
-        app_id="app", app_secret="secret", access_token="token", account_id="123",
-    )
+    module, adapter = _make_ctrader_adapter()
     adapter._client = object()
     adapter._authenticated = True
     signal_id = str(uuid4())
