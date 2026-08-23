@@ -571,6 +571,196 @@ async def _ctrader_strategy_e2e_worker(
     }
 
 
+def _cancel_unfilled_alpaca_order(client: Any, order_id: str) -> str:
+    try:
+        client.cancel_order_by_id(order_id)
+        return "buy_order_cancelled"
+    except Exception as cancel_exc:
+        return f"cancel_failed:{type(cancel_exc).__name__}"
+
+
+async def _wait_for_alpaca_fill(
+    client: Any,
+    order_id: str,
+    *,
+    timeout_seconds: int,
+    initial_status: str,
+    initial_filled_qty: float,
+) -> tuple[float, str]:
+    from alpaca.trading.enums import OrderStatus
+
+    deadline = time.monotonic() + timeout_seconds
+    filled_qty = initial_filled_qty
+    status = initial_status
+    while time.monotonic() < deadline:
+        latest = client.get_order_by_id(order_id)
+        raw_filled = getattr(latest, "filled_qty", None)
+        if raw_filled is not None:
+            filled_qty = float(raw_filled or 0.0)
+        status = str(getattr(latest, "status", status))
+        if getattr(latest, "status", None) in {
+            OrderStatus.FILLED,
+            OrderStatus.CANCELED,
+            OrderStatus.REJECTED,
+            OrderStatus.EXPIRED,
+        }:
+            break
+        await asyncio.sleep(1)
+    return filled_qty, status
+
+
+async def _await_alpaca_terminal_status(
+    client: Any,
+    order_id: str,
+    *,
+    timeout_seconds: int,
+    initial_status: str,
+) -> str:
+    _filled_qty, status = await _wait_for_alpaca_fill(
+        client,
+        order_id,
+        timeout_seconds=timeout_seconds,
+        initial_status=initial_status,
+        initial_filled_qty=0.0,
+    )
+    return status
+
+
+async def _close_filled_alpaca_position(
+    client: Any,
+    *,
+    symbol: str,
+    close_qty: float,
+    timeout_seconds: int,
+) -> str:
+    from alpaca.trading.enums import OrderSide, OrderType, TimeInForce
+    from alpaca.trading.requests import MarketOrderRequest
+
+    close_order = client.submit_order(
+        MarketOrderRequest(
+            symbol=symbol,
+            qty=close_qty,
+            side=OrderSide.SELL,
+            type=OrderType.MARKET,
+            time_in_force=TimeInForce.GTC,
+            client_order_id=f"codex-close-{uuid4().hex[:20]}",
+        )
+    )
+    return await _await_alpaca_terminal_status(
+        client,
+        str(getattr(close_order, "id", "")),
+        timeout_seconds=timeout_seconds,
+        initial_status=str(getattr(close_order, "status", "submitted")),
+    )
+
+
+async def _alpaca_roundtrip_check(
+    client: Any,
+    *,
+    check_name: str,
+    symbol: str,
+    notional: float,
+    timeout_seconds: int,
+) -> SmokeCheck:
+    from alpaca.trading.requests import MarketOrderRequest
+    from alpaca.trading.enums import OrderSide, OrderType, TimeInForce
+
+    order_id = ""
+    close_status = "not_started"
+    try:
+        before_positions = client.get_all_positions()
+        order = client.submit_order(
+            MarketOrderRequest(
+                symbol=symbol,
+                notional=notional,
+                side=OrderSide.BUY,
+                type=OrderType.MARKET,
+                time_in_force=TimeInForce.GTC,
+                client_order_id=f"codex-smoke-{uuid4().hex[:20]}",
+            )
+        )
+        order_id = str(getattr(order, "id", ""))
+        filled_qty, status = await _wait_for_alpaca_fill(
+            client,
+            order_id,
+            timeout_seconds=timeout_seconds,
+            initial_status=str(getattr(order, "status", "")),
+            initial_filled_qty=float(getattr(order, "filled_qty", 0.0) or 0.0),
+        )
+
+        if filled_qty > 0:
+            positions_before_close = client.get_all_positions()
+            close_qty = _position_qty_for_symbol(positions_before_close, symbol)
+            if close_qty <= 0:
+                raise RuntimeError("Buy filled but no matching position was available to close.")
+            close_status = await _close_filled_alpaca_position(
+                client,
+                symbol=symbol,
+                close_qty=close_qty,
+                timeout_seconds=timeout_seconds,
+            )
+        else:
+            close_status = _cancel_unfilled_alpaca_order(client, order_id)
+
+        after_positions = client.get_all_positions()
+        remaining_qty = _position_qty_for_symbol(after_positions, symbol)
+        ok = filled_qty > 0 and "filled" in close_status.lower() and remaining_qty == 0
+        return SmokeCheck(
+            check_name,
+            ok,
+            {
+                "symbol": symbol,
+                "notional": notional,
+                "order_id": order_id,
+                "buy_status": status,
+                "filled_qty": filled_qty,
+                "close_status": close_status,
+                "remaining_qty": remaining_qty,
+                "positions_before": len(before_positions),
+                "positions_after": len(after_positions),
+            },
+            ""
+            if ok
+            else "Roundtrip did not fill and flatten cleanly.",
+        )
+    except Exception as exc:
+        if order_id:
+            with contextlib_suppress():
+                client.cancel_order_by_id(order_id)
+        return SmokeCheck(check_name, False, {"order_id": order_id}, _public_error(exc))
+
+
+async def _run_alpaca_crypto_iteration(
+    env: dict[str, str],
+    *,
+    index: int,
+    symbol: str,
+    notional: float,
+    timeout_seconds: int,
+) -> SmokeCheck:
+    from alpaca.trading.client import TradingClient
+    from live_runner.alpaca_adapter import resolve_alpaca_credentials
+
+    account_name = env.get(f"ALPACA_ACCOUNT_NAME_ACC{index}", f"ACC{index}")
+    account_number = env.get(f"ALPACA_ACCOUNT_NUMBER_ACC{index}", "")
+    check_name = f"alpaca-{account_name.lower()}-crypto-roundtrip"
+    credentials = resolve_alpaca_credentials(broker_login=account_number, env=env)
+    if credentials is None:
+        return SmokeCheck(check_name, False, error="No matching credentials.")
+    api_key, secret_key, paper = credentials
+    if not paper:
+        return SmokeCheck(check_name, False, error="Refusing non-paper Alpaca account.")
+
+    client = TradingClient(api_key, secret_key, paper=True)
+    return await _alpaca_roundtrip_check(
+        client,
+        check_name=check_name,
+        symbol=symbol,
+        notional=notional,
+        timeout_seconds=timeout_seconds,
+    )
+
+
 async def _alpaca_crypto_roundtrip(
     env: dict[str, str],
     *,
@@ -578,120 +768,17 @@ async def _alpaca_crypto_roundtrip(
     notional: float,
     timeout_seconds: int,
 ) -> list[SmokeCheck]:
-    from alpaca.trading.client import TradingClient
-    from alpaca.trading.enums import OrderSide, OrderStatus, OrderType, TimeInForce
-    from alpaca.trading.requests import MarketOrderRequest
-    from live_runner.alpaca_adapter import resolve_alpaca_credentials
-
     checks: list[SmokeCheck] = []
     for index in (1, 2, 3):
-        account_name = env.get(f"ALPACA_ACCOUNT_NAME_ACC{index}", f"ACC{index}")
-        account_number = env.get(f"ALPACA_ACCOUNT_NUMBER_ACC{index}", "")
-        check_name = f"alpaca-{account_name.lower()}-crypto-roundtrip"
-        credentials = resolve_alpaca_credentials(broker_login=account_number, env=env)
-        if credentials is None:
-            checks.append(SmokeCheck(check_name, False, error="No matching credentials."))
-            continue
-        api_key, secret_key, paper = credentials
-        if not paper:
-            checks.append(SmokeCheck(check_name, False, error="Refusing non-paper Alpaca account."))
-            continue
-
-        client = TradingClient(api_key, secret_key, paper=True)
-        client_order_id = f"codex-smoke-{uuid4().hex[:20]}"
-        order_id = ""
-        close_status = "not_started"
-        try:
-            before_positions = client.get_all_positions()
-            order = client.submit_order(
-                    MarketOrderRequest(
-                        symbol=symbol,
-                        notional=notional,
-                        side=OrderSide.BUY,
-                        type=OrderType.MARKET,
-                        time_in_force=TimeInForce.GTC,
-                    client_order_id=client_order_id,
-                )
+        checks.append(
+            await _run_alpaca_crypto_iteration(
+                env,
+                index=index,
+                symbol=symbol,
+                notional=notional,
+                timeout_seconds=timeout_seconds,
             )
-            order_id = str(getattr(order, "id", ""))
-            deadline = time.monotonic() + timeout_seconds
-            latest = order
-            while time.monotonic() < deadline:
-                latest = client.get_order_by_id(order_id)
-                if getattr(latest, "status", None) in {
-                    OrderStatus.FILLED,
-                    OrderStatus.CANCELED,
-                    OrderStatus.REJECTED,
-                    OrderStatus.EXPIRED,
-                }:
-                    break
-                await asyncio.sleep(1)
-
-            filled_qty = float(getattr(latest, "filled_qty", 0.0) or 0.0)
-            status = str(getattr(latest, "status", ""))
-            if filled_qty > 0:
-                positions_before_close = client.get_all_positions()
-                close_qty = _position_qty_for_symbol(positions_before_close, symbol)
-                if close_qty <= 0:
-                    raise RuntimeError("Buy filled but no matching position was available to close.")
-                close_order = client.submit_order(
-                    MarketOrderRequest(
-                        symbol=symbol,
-                        qty=close_qty,
-                        side=OrderSide.SELL,
-                        type=OrderType.MARKET,
-                        time_in_force=TimeInForce.GTC,
-                        client_order_id=f"codex-close-{uuid4().hex[:20]}",
-                    )
-                )
-                close_status = str(getattr(close_order, "status", "submitted"))
-                close_order_id = str(getattr(close_order, "id", ""))
-                deadline = time.monotonic() + timeout_seconds
-                while time.monotonic() < deadline:
-                    close_latest = client.get_order_by_id(close_order_id)
-                    close_status = str(getattr(close_latest, "status", close_status))
-                    if getattr(close_latest, "status", None) in {
-                        OrderStatus.FILLED,
-                        OrderStatus.CANCELED,
-                        OrderStatus.REJECTED,
-                        OrderStatus.EXPIRED,
-                    }:
-                        break
-                    await asyncio.sleep(1)
-            else:
-                try:
-                    client.cancel_order_by_id(order_id)
-                    close_status = "buy_order_cancelled"
-                except Exception as cancel_exc:
-                    close_status = f"cancel_failed:{type(cancel_exc).__name__}"
-
-            after_positions = client.get_all_positions()
-            remaining_qty = _position_qty_for_symbol(after_positions, symbol)
-            checks.append(
-                SmokeCheck(
-                    check_name,
-                    filled_qty > 0 and "filled" in close_status.lower() and remaining_qty == 0,
-                    {
-                        "symbol": symbol,
-                        "notional": notional,
-                        "order_id": order_id,
-                        "buy_status": status,
-                        "filled_qty": filled_qty,
-                        "close_status": close_status,
-                        "remaining_qty": remaining_qty,
-                        "positions_before": len(before_positions),
-                        "positions_after": len(after_positions),
-                    },
-                    ""
-                    if filled_qty > 0 and "filled" in close_status.lower() and remaining_qty == 0
-                    else "Roundtrip did not fill and flatten cleanly.",
-                )
-            )
-        except Exception as exc:
-            if order_id:
-                with contextlib_suppress():
-                    client.cancel_order_by_id(order_id)
-            checks.append(SmokeCheck(check_name, False, {"order_id": order_id}, _public_error(exc)))
+        )
     return checks
 
 

@@ -8,6 +8,7 @@ import ssl
 import struct
 import time
 import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -222,23 +223,29 @@ def _ctrader_message_name_sources(message: Any) -> list[Any]:
     return sources
 
 
+def _ctrader_ignored_labels(ignored_values: set[str] | None) -> set[str]:
+    return {value.strip() for value in (ignored_values or set()) if value and value.strip()}
+
+
+def _ctrader_label_candidate(source: Any, field_name: str, ignored: set[str]) -> str:
+    raw_value = getattr(source, field_name, "")
+    candidate = str(raw_value or "").strip()
+    if not candidate or candidate in ignored or candidate.isdigit():
+        return ""
+    return candidate
+
+
 def _ctrader_extract_account_label(
     *sources: Any, ignored_values: set[str] | None = None
 ) -> str:
-    ignored = {value.strip() for value in (ignored_values or set()) if value and value.strip()}
+    ignored = _ctrader_ignored_labels(ignored_values)
     for source in sources:
         if source is None:
             continue
         for field_name in _CTRADER_ACCOUNT_NAME_FIELDS:
-            raw_value = getattr(source, field_name, "")
-            candidate = str(raw_value or "").strip()
-            if not candidate:
-                continue
-            if candidate in ignored:
-                continue
-            if candidate.isdigit():
-                continue
-            return candidate
+            candidate = _ctrader_label_candidate(source, field_name, ignored)
+            if candidate:
+                return candidate
     return ""
 
 
@@ -324,6 +331,345 @@ def _message_to_debug_fields(message: Any) -> dict[str, Any]:
     return payload
 
 
+def _ctrader_recv_exact(sock_obj: ssl.SSLSocket, size: int) -> bytes:
+    buf = b""
+    while len(buf) < size:
+        chunk = sock_obj.recv(size - len(buf))
+        if not chunk:
+            raise ConnectionError("cTrader socket closed unexpectedly.")
+        buf += chunk
+    return buf
+
+
+def _ctrader_send_message(sock_obj: ssl.SSLSocket, message: Any, client_msg_id: str) -> None:
+    envelope = ProtoMessage(
+        payloadType=int(message.payloadType),
+        payload=message.SerializeToString(),
+        clientMsgId=client_msg_id,
+    )
+    raw = envelope.SerializeToString()
+    sock_obj.sendall(struct.pack(">I", len(raw)) + raw)
+
+
+def _ctrader_wait_response(
+    sock_obj: ssl.SSLSocket, client_msg_id: str, timeout_seconds: float
+) -> Any:
+    deadline = time.time() + timeout_seconds
+    heartbeat_payload_type = ProtoHeartbeatEvent().payloadType
+
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            raise TimeoutError()
+        sock_obj.settimeout(remaining)
+        frame_size = struct.unpack(">I", _ctrader_recv_exact(sock_obj, 4))[0]
+        frame_payload = _ctrader_recv_exact(sock_obj, frame_size)
+        envelope = ProtoMessage()
+        envelope.ParseFromString(frame_payload)
+
+        if envelope.payloadType == heartbeat_payload_type:
+            heartbeat = ProtoHeartbeatEvent()
+            _ctrader_send_message(sock_obj, heartbeat, "")
+            continue
+
+        payload = Protobuf.extract(envelope)
+        if envelope.clientMsgId != client_msg_id:
+            continue
+        if isinstance(payload, ProtoOAErrorRes):
+            raise RuntimeError(f"{payload.errorCode}: {payload.description}")
+        return payload
+
+
+def _authenticate_ctrader_application(
+    sock: ssl.SSLSocket,
+    *,
+    app_id: str,
+    app_secret: str,
+) -> None:
+    app_auth_req = ProtoOAApplicationAuthReq()
+    app_auth_req.clientId = app_id
+    app_auth_req.clientSecret = app_secret
+    app_auth_client_msg_id = str(uuid.uuid4())
+    _ctrader_send_message(sock, app_auth_req, app_auth_client_msg_id)
+    app_auth_res = _ctrader_wait_response(sock, app_auth_client_msg_id, 20)
+    if not isinstance(app_auth_res, ProtoOAApplicationAuthRes):
+        raise RuntimeError(f"Unexpected application auth response: {type(app_auth_res).__name__}")
+
+
+def _request_ctrader_account_list(
+    sock: ssl.SSLSocket,
+    *,
+    access_token: str,
+) -> Any:
+    list_req = ProtoOAGetAccountListByAccessTokenReq()
+    list_req.accessToken = access_token
+    list_client_msg_id = str(uuid.uuid4())
+    _ctrader_send_message(sock, list_req, list_client_msg_id)
+    list_res = _ctrader_wait_response(sock, list_client_msg_id, 20)
+    if not isinstance(list_res, ProtoOAGetAccountListByAccessTokenRes):
+        raise RuntimeError(f"Unexpected account list response: {type(list_res).__name__}")
+    return list_res
+
+
+@dataclass
+class _CtraderAccountContext:
+    host: str
+    sock: ssl.SSLSocket
+    access_token: str
+    balance: float = 0.0
+    broker_name: str = ""
+    trader_login: str = ""
+    account_name_hint: str = ""
+    ignored_name_values: set[str] = field(default_factory=set)
+
+
+def _ctrader_account_context(
+    host: str,
+    sock: ssl.SSLSocket,
+    access_token: str,
+    account_id: int,
+    account_item: Any,
+) -> _CtraderAccountContext:
+    broker_name = _ctrader_extract_broker_name(*_ctrader_message_name_sources(account_item))
+    trader_login = _ctrader_extract_login(*_ctrader_message_name_sources(account_item))
+    ignored_name_values = {str(account_id)}
+    if trader_login:
+        ignored_name_values.add(trader_login)
+    account_name_hint = _ctrader_extract_account_label(
+        *_ctrader_message_name_sources(account_item),
+        ignored_values=ignored_name_values,
+    )
+    return _CtraderAccountContext(
+        host=host,
+        sock=sock,
+        access_token=access_token,
+        broker_name=broker_name,
+        trader_login=trader_login,
+        account_name_hint=account_name_hint,
+        ignored_name_values=ignored_name_values,
+    )
+
+
+def _ctrader_resolved_account_id(account_item: Any) -> int:
+    return int(
+        getattr(account_item, "ctidTraderAccountId", 0)
+        or getattr(account_item, "traderAccountId", 0)
+        or 0
+    )
+
+
+def _log_ctrader_account_missing_ctid(host: str, account_item: Any) -> None:
+    logger.debug(
+        "Skipping cTrader account without ctidTraderAccountId",
+        extra={
+            "data": {
+                "host": host,
+                "account_fields": _message_to_debug_fields(account_item),
+            }
+        },
+    )
+
+
+def _log_ctrader_host_environment_mismatch(host: str, account_id: int, is_demo: bool) -> None:
+    logger.debug(
+        "Skipping cTrader account on host with mismatched environment",
+        extra={
+            "data": {
+                "account_id": str(account_id),
+                "host": host,
+                "is_demo": is_demo,
+            }
+        },
+    )
+
+
+def _apply_ctrader_account_detail(
+    ctx: _CtraderAccountContext,
+    account_id: int,
+    account_detail_res: Any,
+) -> None:
+    logger.debug(
+        "Resolved cTrader account detail payload",
+        extra={
+            "data": {
+                "host": ctx.host,
+                "ctid": str(account_id),
+                "account_detail_fields": _message_to_debug_fields(account_detail_res),
+            }
+        },
+    )
+    ctx.broker_name = ctx.broker_name or _ctrader_extract_broker_name(
+        *_ctrader_message_name_sources(account_detail_res)
+    )
+    if not ctx.account_name_hint:
+        ctx.account_name_hint = _ctrader_extract_account_label(
+            *_ctrader_message_name_sources(account_detail_res),
+            ignored_values=ctx.ignored_name_values,
+        )
+    detail_login = _ctrader_extract_login(*_ctrader_message_name_sources(account_detail_res))
+    if detail_login:
+        ctx.trader_login = detail_login
+        ctx.ignored_name_values.add(detail_login)
+
+
+def _request_ctrader_account_detail(ctx: _CtraderAccountContext, account_id: int) -> None:
+    try:
+        if _PROTO_OA_CTID_TRADER_ACCOUNT_REQ is None:
+            return
+        account_detail_req = _PROTO_OA_CTID_TRADER_ACCOUNT_REQ()
+        if hasattr(account_detail_req, "ctidTraderAccountId"):
+            account_detail_req.ctidTraderAccountId = account_id
+        if hasattr(account_detail_req, "accessToken"):
+            account_detail_req.accessToken = ctx.access_token
+        account_detail_client_msg_id = str(uuid.uuid4())
+        _ctrader_send_message(ctx.sock, account_detail_req, account_detail_client_msg_id)
+        account_detail_res = _ctrader_wait_response(ctx.sock, account_detail_client_msg_id, 20)
+        if _PROTO_OA_CTID_TRADER_ACCOUNT_RES is None or isinstance(
+            account_detail_res, _PROTO_OA_CTID_TRADER_ACCOUNT_RES
+        ):
+            _apply_ctrader_account_detail(ctx, account_id, account_detail_res)
+    except Exception as exc:
+        logger.debug(
+            "Optional cTrader account detail request failed",
+            extra={
+                "data": {
+                    "account_id": str(account_id),
+                    "host": ctx.host,
+                    "error": repr(exc),
+                }
+            },
+        )
+
+
+def _load_ctrader_trader_details(ctx: _CtraderAccountContext, account_id: int) -> None:
+    account_auth_req = ProtoOAAccountAuthReq()
+    account_auth_req.ctidTraderAccountId = account_id
+    account_auth_req.accessToken = ctx.access_token
+    account_auth_client_msg_id = str(uuid.uuid4())
+    _ctrader_send_message(ctx.sock, account_auth_req, account_auth_client_msg_id)
+    account_auth_res = _ctrader_wait_response(ctx.sock, account_auth_client_msg_id, 20)
+    if not isinstance(account_auth_res, ProtoOAAccountAuthRes):
+        raise RuntimeError(f"Unexpected account auth response: {type(account_auth_res).__name__}")
+
+    trader_req = ProtoOATraderReq()
+    trader_req.ctidTraderAccountId = account_id
+    trader_client_msg_id = str(uuid.uuid4())
+    _ctrader_send_message(ctx.sock, trader_req, trader_client_msg_id)
+    trader_res = _ctrader_wait_response(ctx.sock, trader_client_msg_id, 20)
+    if not isinstance(trader_res, ProtoOATraderRes):
+        return
+    logger.debug(
+        "Resolved cTrader trader payload",
+        extra={
+            "data": {
+                "host": ctx.host,
+                "ctid": str(account_id),
+                "trader_fields": _message_to_debug_fields(trader_res.trader),
+            }
+        },
+    )
+    trader = trader_res.trader
+    ctx.balance = _trader_balance(trader)
+    ctx.broker_name = ctx.broker_name or _ctrader_extract_broker_name(
+        *_ctrader_message_name_sources(trader_res),
+        *_ctrader_message_name_sources(trader),
+    )
+    resolved_login = _ctrader_extract_login(
+        *_ctrader_message_name_sources(trader_res),
+        *_ctrader_message_name_sources(trader),
+    )
+    if resolved_login:
+        ctx.trader_login = resolved_login
+        ctx.ignored_name_values.add(resolved_login)
+    ctx.account_name_hint = ctx.account_name_hint or _ctrader_extract_account_label(
+        *_ctrader_message_name_sources(trader_res),
+        *_ctrader_message_name_sources(trader),
+        ignored_values=ctx.ignored_name_values,
+    )
+
+
+def _handle_ctrader_trader_error(error_text: str, host: str, account_id: int) -> str:
+    if _is_expected_ctrader_host_route_error(error_text):
+        logger.debug(
+            "cTrader trader details unavailable on this host",
+            extra={
+                "data": {
+                    "account_id": str(account_id),
+                    "host": host,
+                    "error": error_text,
+                }
+            },
+        )
+        return "keep"
+    if _is_ctrader_account_not_authorized_error(error_text):
+        logger.info(
+            "Account %s not authorized for token, skipping",
+            account_id,
+            extra={
+                "data": {
+                    "account_id": str(account_id),
+                    "host": host,
+                    "error": error_text,
+                }
+            },
+        )
+        return "skip"
+    logger.warning(
+        "Could not load cTrader trader details for discovered account",
+        extra={
+            "data": {
+                "account_id": str(account_id),
+                "host": host,
+                "error": error_text,
+            }
+        },
+    )
+    return "keep"
+
+
+def _build_ctrader_live_account(
+    host: str,
+    sock: ssl.SSLSocket,
+    access_token: str,
+    account_item: Any,
+) -> LiveAccount | None:
+    logger.debug(
+        "Discovered raw cTrader account payload",
+        extra={
+            "data": {
+                "host": host,
+                "account_fields": _message_to_debug_fields(account_item),
+            }
+        },
+    )
+    account_id = _ctrader_resolved_account_id(account_item)
+    if account_id <= 0:
+        _log_ctrader_account_missing_ctid(host, account_item)
+        return None
+    is_demo = not bool(getattr(account_item, "isLive", False))
+    if not _ctrader_host_matches_environment(host=host, is_live=not is_demo):
+        _log_ctrader_host_environment_mismatch(host, account_id, is_demo)
+        return None
+    ctx = _ctrader_account_context(host, sock, access_token, account_id, account_item)
+    try:
+        _request_ctrader_account_detail(ctx, account_id)
+        _load_ctrader_trader_details(ctx, account_id)
+    except Exception as exc:
+        error_text = repr(exc)
+        if _handle_ctrader_trader_error(error_text, host, account_id) == "skip":
+            return None
+    account_name = _ctrader_account_name(account_id=account_id, account_label=ctx.account_name_hint)
+    return LiveAccount(
+        id=str(account_id),
+        name=account_name,
+        broker="ctrader",
+        balance=ctx.balance,
+        is_demo=is_demo,
+        broker_login=ctx.trader_login or None,
+        ctid=str(account_id),
+    )
+
+
 async def _discover_ctrader_accounts_on_host(
     *,
     host: str,
@@ -331,74 +677,12 @@ async def _discover_ctrader_accounts_on_host(
     app_secret: str,
     access_token: str,
 ) -> list[LiveAccount]:
-    def _recv_exact(sock_obj: ssl.SSLSocket, size: int) -> bytes:
-        buf = b""
-        while len(buf) < size:
-            chunk = sock_obj.recv(size - len(buf))
-            if not chunk:
-                raise ConnectionError("cTrader socket closed unexpectedly.")
-            buf += chunk
-        return buf
-
-    def _send_message(sock_obj: ssl.SSLSocket, message: Any, client_msg_id: str) -> None:
-        envelope = ProtoMessage(
-            payloadType=int(message.payloadType),
-            payload=message.SerializeToString(),
-            clientMsgId=client_msg_id,
-        )
-        raw = envelope.SerializeToString()
-        sock_obj.sendall(struct.pack(">I", len(raw)) + raw)
-
-    def _wait_response(
-        sock_obj: ssl.SSLSocket, client_msg_id: str, timeout_seconds: float
-    ) -> Any:
-        deadline = time.time() + timeout_seconds
-        heartbeat_payload_type = ProtoHeartbeatEvent().payloadType
-
-        while True:
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                raise TimeoutError()
-            sock_obj.settimeout(remaining)
-            frame_size = struct.unpack(">I", _recv_exact(sock_obj, 4))[0]
-            frame_payload = _recv_exact(sock_obj, frame_size)
-            envelope = ProtoMessage()
-            envelope.ParseFromString(frame_payload)
-
-            if envelope.payloadType == heartbeat_payload_type:
-                heartbeat = ProtoHeartbeatEvent()
-                _send_message(sock_obj, heartbeat, "")
-                continue
-
-            payload = Protobuf.extract(envelope)
-            if envelope.clientMsgId != client_msg_id:
-                continue
-            if isinstance(payload, ProtoOAErrorRes):
-                raise RuntimeError(f"{payload.errorCode}: {payload.description}")
-            return payload
-
     context = ssl.create_default_context()
     context.minimum_version = ssl.TLSVersion.TLSv1_2
     with socket.create_connection((host, 5035), timeout=12) as raw_socket:
         with context.wrap_socket(raw_socket, server_hostname=host) as sock:
-            app_auth_req = ProtoOAApplicationAuthReq()
-            app_auth_req.clientId = app_id
-            app_auth_req.clientSecret = app_secret
-            app_auth_client_msg_id = str(uuid.uuid4())
-            _send_message(sock, app_auth_req, app_auth_client_msg_id)
-            app_auth_res = _wait_response(sock, app_auth_client_msg_id, 20)
-            if not isinstance(app_auth_res, ProtoOAApplicationAuthRes):
-                raise RuntimeError(
-                    f"Unexpected application auth response: {type(app_auth_res).__name__}"
-                )
-
-            list_req = ProtoOAGetAccountListByAccessTokenReq()
-            list_req.accessToken = access_token
-            list_client_msg_id = str(uuid.uuid4())
-            _send_message(sock, list_req, list_client_msg_id)
-            list_res = _wait_response(sock, list_client_msg_id, 20)
-            if not isinstance(list_res, ProtoOAGetAccountListByAccessTokenRes):
-                raise RuntimeError(f"Unexpected account list response: {type(list_res).__name__}")
+            _authenticate_ctrader_application(sock, app_id=app_id, app_secret=app_secret)
+            list_res = _request_ctrader_account_list(sock, access_token=access_token)
 
             accounts: list[LiveAccount] = []
             account_items = sorted(
@@ -406,216 +690,11 @@ async def _discover_ctrader_accounts_on_host(
                 key=lambda item: int(getattr(item, "ctidTraderAccountId", 0) or 0),
             )
             for account_item in account_items:
-                logger.debug(
-                    "Discovered raw cTrader account payload",
-                    extra={
-                        "data": {
-                            "host": host,
-                            "account_fields": _message_to_debug_fields(account_item),
-                        }
-                    },
-                )
-                account_id = int(
-                    getattr(account_item, "ctidTraderAccountId", 0)
-                    or getattr(account_item, "traderAccountId", 0)
-                    or 0
-                )
-                if account_id <= 0:
-                    logger.debug(
-                        "Skipping cTrader account without ctidTraderAccountId",
-                        extra={
-                            "data": {
-                                "host": host,
-                                "account_fields": _message_to_debug_fields(account_item),
-                            }
-                        },
-                    )
+                account = _build_ctrader_live_account(host, sock, access_token, account_item)
+                if account is None:
                     continue
-                is_demo = not bool(getattr(account_item, "isLive", False))
-                if not _ctrader_host_matches_environment(
-                    host=host,
-                    is_live=not is_demo,
-                ):
-                    logger.debug(
-                        "Skipping cTrader account on host with mismatched environment",
-                        extra={
-                            "data": {
-                                "account_id": str(account_id),
-                                "host": host,
-                                "is_demo": is_demo,
-                            }
-                        },
-                    )
-                    continue
-                balance = 0.0
-                broker_name = _ctrader_extract_broker_name(
-                    *_ctrader_message_name_sources(account_item)
-                )
-                trader_login = _ctrader_extract_login(*_ctrader_message_name_sources(account_item))
-                ignored_name_values = {str(account_id)}
-                if trader_login:
-                    ignored_name_values.add(trader_login)
-                account_name_hint = _ctrader_extract_account_label(
-                    *_ctrader_message_name_sources(account_item),
-                    ignored_values=ignored_name_values,
-                )
-
-                try:
-                    if _PROTO_OA_CTID_TRADER_ACCOUNT_REQ is not None:
-                        try:
-                            account_detail_req = _PROTO_OA_CTID_TRADER_ACCOUNT_REQ()
-                            if hasattr(account_detail_req, "ctidTraderAccountId"):
-                                account_detail_req.ctidTraderAccountId = account_id
-                            if hasattr(account_detail_req, "accessToken"):
-                                account_detail_req.accessToken = access_token
-                            account_detail_client_msg_id = str(uuid.uuid4())
-                            _send_message(sock, account_detail_req, account_detail_client_msg_id)
-                            account_detail_res = _wait_response(
-                                sock, account_detail_client_msg_id, 20
-                            )
-                            if _PROTO_OA_CTID_TRADER_ACCOUNT_RES is None or isinstance(
-                                account_detail_res, _PROTO_OA_CTID_TRADER_ACCOUNT_RES
-                            ):
-                                logger.debug(
-                                    "Resolved cTrader account detail payload",
-                                    extra={
-                                        "data": {
-                                            "host": host,
-                                            "ctid": str(account_id),
-                                            "account_detail_fields": _message_to_debug_fields(
-                                                account_detail_res
-                                            ),
-                                        }
-                                    },
-                                )
-                                broker_name = broker_name or _ctrader_extract_broker_name(
-                                    *_ctrader_message_name_sources(account_detail_res)
-                                )
-                                if not account_name_hint:
-                                    account_name_hint = _ctrader_extract_account_label(
-                                        *_ctrader_message_name_sources(account_detail_res),
-                                        ignored_values=ignored_name_values,
-                                    )
-                                detail_login = _ctrader_extract_login(
-                                    *_ctrader_message_name_sources(account_detail_res)
-                                )
-                                if detail_login:
-                                    trader_login = detail_login
-                                    ignored_name_values.add(detail_login)
-                        except Exception as exc:
-                            logger.debug(
-                                "Optional cTrader account detail request failed",
-                                extra={
-                                    "data": {
-                                        "account_id": str(account_id),
-                                        "host": host,
-                                        "error": repr(exc),
-                                    }
-                                },
-                            )
-
-                    account_auth_req = ProtoOAAccountAuthReq()
-                    account_auth_req.ctidTraderAccountId = account_id
-                    account_auth_req.accessToken = access_token
-                    account_auth_client_msg_id = str(uuid.uuid4())
-                    _send_message(sock, account_auth_req, account_auth_client_msg_id)
-                    account_auth_res = _wait_response(sock, account_auth_client_msg_id, 20)
-                    if not isinstance(account_auth_res, ProtoOAAccountAuthRes):
-                        raise RuntimeError(
-                            f"Unexpected account auth response: {type(account_auth_res).__name__}"
-                        )
-
-                    trader_req = ProtoOATraderReq()
-                    trader_req.ctidTraderAccountId = account_id
-                    trader_client_msg_id = str(uuid.uuid4())
-                    _send_message(sock, trader_req, trader_client_msg_id)
-                    trader_res = _wait_response(sock, trader_client_msg_id, 20)
-                    if isinstance(trader_res, ProtoOATraderRes):
-                        logger.debug(
-                            "Resolved cTrader trader payload",
-                            extra={
-                                "data": {
-                                    "host": host,
-                                    "ctid": str(account_id),
-                                    "trader_fields": _message_to_debug_fields(trader_res.trader),
-                                }
-                            },
-                        )
-                        trader = trader_res.trader
-                        balance = _trader_balance(trader)
-                        broker_name = broker_name or _ctrader_extract_broker_name(
-                            *_ctrader_message_name_sources(trader_res),
-                            *_ctrader_message_name_sources(trader),
-                        )
-                        resolved_login = _ctrader_extract_login(
-                            *_ctrader_message_name_sources(trader_res),
-                            *_ctrader_message_name_sources(trader),
-                        )
-                        if resolved_login:
-                            trader_login = resolved_login
-                            ignored_name_values.add(resolved_login)
-                        account_name_hint = account_name_hint or _ctrader_extract_account_label(
-                            *_ctrader_message_name_sources(trader_res),
-                            *_ctrader_message_name_sources(trader),
-                            ignored_values=ignored_name_values,
-                        )
-                except Exception as exc:
-                    error_text = repr(exc)
-                    # This is expected for accounts discovered on a broker environment that
-                    # does not provide trader details through this route; keep discovery non-noisy.
-                    if _is_expected_ctrader_host_route_error(error_text):
-                        logger.debug(
-                            "cTrader trader details unavailable on this host",
-                            extra={
-                                "data": {
-                                    "account_id": str(account_id),
-                                    "host": host,
-                                    "error": error_text,
-                                }
-                            },
-                        )
-                    elif _is_ctrader_account_not_authorized_error(error_text):
-                        logger.info(
-                            "Account %s not authorized for token, skipping",
-                            account_id,
-                            extra={
-                                "data": {
-                                    "account_id": str(account_id),
-                                    "host": host,
-                                    "error": error_text,
-                                }
-                            },
-                        )
-                        continue
-                    else:
-                        logger.warning(
-                            "Could not load cTrader trader details for discovered account",
-                            extra={
-                                "data": {
-                                    "account_id": str(account_id),
-                                    "host": host,
-                                    "error": error_text,
-                                }
-                            },
-                        )
-
-                account_name = _ctrader_account_name(
-                    account_id=account_id,
-                    account_label=account_name_hint,
-                )
-                accounts.append(
-                    LiveAccount(
-                        id=str(account_id),
-                        name=account_name,
-                        broker="ctrader",
-                        balance=balance,
-                        is_demo=is_demo,
-                        broker_login=trader_login or None,
-                        ctid=str(account_id),
-                    )
-                )
+                accounts.append(account)
             return accounts
-
 
 async def discover_ctrader_accounts(
     app_id: str, app_secret: str, access_token: str

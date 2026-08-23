@@ -4,7 +4,7 @@ import asyncio
 import contextlib
 import os
 import re
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterable
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
@@ -106,56 +106,83 @@ def _is_discord_auth_error(exc: BaseException | None) -> bool:
     )
 
 
-def _extract_symbol(content: str) -> str | None:
-    def normalize_candidate(candidate: str) -> str | None:
-        normalized = candidate.strip().strip("*$").upper()
-        if not normalized or normalized in _SKIP_WORDS:
-            return None
-        return normalized
+def _normalize_symbol_candidate(candidate: str) -> str | None:
+    normalized = candidate.strip().strip("*$").upper()
+    if not normalized or normalized in _SKIP_WORDS:
+        return None
+    return normalized
 
-    for matched in re.findall(r"\*\* \$?([A-Za-z]{1,10})\*\*", content):
-        candidate = normalize_candidate(matched)
+
+def _first_normalized_symbol(matches: Iterable[str]) -> str | None:
+    for matched in matches:
+        candidate = _normalize_symbol_candidate(matched)
         if candidate:
             return candidate
+    return None
 
+
+def _extract_bold_symbol(content: str) -> str | None:
+    return _first_normalized_symbol(re.findall(r"\*\* \$?([A-Za-z]{1,10})\*\*", content))
+
+
+def _extract_labeled_symbol(content: str) -> str | None:
     for pattern in (
         r"(?:ticker|symbol|stock)\s*[:\-]\s*\**\$?([A-Za-z]{1,10})\**",
         r"(?:for|on)\s+\**\$?([A-Za-z]{1,10})\**",
     ):
-        for matched in re.finditer(pattern, content, re.IGNORECASE):
-            candidate = normalize_candidate(matched.group(1))
-            if candidate:
-                return candidate
+        symbol = _first_normalized_symbol(
+            matched.group(1) for matched in re.finditer(pattern, content, re.IGNORECASE)
+        )
+        if symbol:
+            return symbol
+    return None
 
+
+def _extract_action_symbol(content: str) -> str | None:
     action_symbol = re.search(
         r"(?i:\b(?:buy|sell|long|short)\b)\s+"
         r"(?:(?i:signal)\s+)?\**\$?([A-Z]{1,10})\**\b",
         content,
     )
     if action_symbol:
-        candidate = normalize_candidate(action_symbol.group(1))
-        if candidate:
-            return candidate
+        return _normalize_symbol_candidate(action_symbol.group(1))
+    return None
 
-    for matched in re.findall(r"\$([A-Za-z]{1,10})\b", content):
-        candidate = normalize_candidate(matched)
-        if candidate:
-            return candidate
 
+def _extract_dollar_symbol(content: str) -> str | None:
+    return _first_normalized_symbol(re.findall(r"\$([A-Za-z]{1,10})\b", content))
+
+
+def _price_prefixed_symbol(content: str) -> str | None:
     ticker_price = re.search(r"\b([A-Za-z]{1,10})\s+\$\d+", content)
     if ticker_price:
-        candidate = normalize_candidate(ticker_price.group(1))
-        if candidate:
-            return candidate
+        return _normalize_symbol_candidate(ticker_price.group(1))
+    return None
 
+
+def _fallback_uppercase_symbol(content: str) -> str | None:
     for line in content.split("\n"):
         line_stripped = line.strip()
         if not line_stripped:
             continue
-        for matched in re.findall(r"\b([A-Z]{1,10})\b", line_stripped):
-            candidate = normalize_candidate(matched)
-            if candidate:
-                return candidate
+        symbol = _first_normalized_symbol(re.findall(r"\b([A-Z]{1,10})\b", line_stripped))
+        if symbol:
+            return symbol
+    return None
+
+
+def _extract_symbol(content: str) -> str | None:
+    for extract_stage in (
+        _extract_bold_symbol,
+        _extract_labeled_symbol,
+        _extract_action_symbol,
+        _extract_dollar_symbol,
+        _price_prefixed_symbol,
+        _fallback_uppercase_symbol,
+    ):
+        symbol = extract_stage(content)
+        if symbol:
+            return symbol
     return None
 
 

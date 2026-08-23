@@ -681,29 +681,27 @@ def _trade_signal_to_live_signal(
     )
 
 
-async def _run_discord_signal_listener_for_account(
+def _active_discord_deployments_for_account(
     account_id: str,
-    adapter: BaseLiveAdapter,
     deployments: list[LiveDeploymentConfig],
-    *,
-    accounts_env_values: Mapping[str, str],
-) -> None:
-    active_discord_deployments = [
+) -> list[LiveDeploymentConfig]:
+    return [
         deployment
         for deployment in deployments
         if deployment.account_id == account_id
         and _normalize_deployment_status(deployment.status) == "ACTIVE"
         and str(deployment.signal_source or "internal").lower() == "discord"
     ]
-    if not active_discord_deployments:
-        logger.info(
-            "No active discord deployments for account; discord listener idle",
-            extra={"data": {"account_id": account_id}},
-        )
-        return
 
+
+def _group_discord_deployments_by_channel(
+    account_id: str,
+    deployments: list[LiveDeploymentConfig],
+    *,
+    accounts_env_values: Mapping[str, str],
+) -> dict[str, list[LiveDeploymentConfig]]:
     channel_to_deployments: dict[str, list[LiveDeploymentConfig]] = {}
-    for deployment in active_discord_deployments:
+    for deployment in deployments:
         configured_channel = str(
             deployment.signal_config.get("channel_id")
             or accounts_env_values.get("DISCORD_CHANNEL_ID", "")
@@ -715,15 +713,10 @@ async def _run_discord_signal_listener_for_account(
             )
             continue
         channel_to_deployments.setdefault(configured_channel, []).append(deployment)
+    return channel_to_deployments
 
-    if not channel_to_deployments:
-        logger.warning(
-            "No valid discord channels configured for active discord deployments",
-            extra={"data": {"account_id": account_id}},
-        )
-        return
 
-    # Resolve a real account token (account/user tokens, not a generic bot token).
+def _resolve_account_discord_token(accounts_env_values: Mapping[str, str]) -> str:
     discord_token = ""
     for _token_env_key in (
         "DISCORD_BOT_NITRO_TOKEN",
@@ -736,9 +729,154 @@ async def _run_discord_signal_listener_for_account(
             break
     if not discord_token:
         discord_token = str(os.environ.get("DISCORD_BOT_TOKEN", "")).strip()
+    return discord_token
 
+
+def _deployment_covers_discord_symbol(
+    deployment: LiveDeploymentConfig,
+    symbol: str,
+) -> bool:
+    deployment_symbols = {item.upper() for item in deployment.symbols}
+    return not deployment_symbols or symbol.upper() in deployment_symbols
+
+
+async def _submit_normalized_discord_signal(
+    account_id: str,
+    adapter: BaseLiveAdapter,
+    deployment: LiveDeploymentConfig,
+    trade_signal: TradeSignal,
+    *,
+    signal_timeframe: str,
+    wait_enabled: bool,
+) -> None:
+    normalized_signal = TradeSignal(
+        action=trade_signal.action,
+        symbol=trade_signal.symbol,
+        entry_price=trade_signal.entry_price,
+        stop_loss=trade_signal.stop_loss,
+        take_profit=trade_signal.take_profit,
+        timeframe=signal_timeframe,
+        metadata={**trade_signal.metadata, "wait_for_candle_close": wait_enabled},
+    )
+    try:
+        normalized_signal = _apply_signal_processor(normalized_signal, deployment)
+    except ValueError as exc:
+        logger.warning(
+            "Signal processor rejected discord signal",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "deployment_id": str(deployment.id),
+                    "symbol": trade_signal.symbol,
+                    "error": str(exc),
+                }
+            },
+        )
+        return
+    if wait_enabled:
+        await wait_for_candle_close(
+            normalized_signal,
+            normalized_signal.timeframe or signal_timeframe,
+        )
+
+    live_signal = _trade_signal_to_live_signal(normalized_signal, deployment)
+    try:
+        broker_order_id = await submit_order_with_risk(adapter, deployment, live_signal)
+    except Exception as exc:
+        logger.warning(
+            "Discord signal submission failed",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "deployment_id": str(deployment.id),
+                    "symbol": live_signal.symbol,
+                    "error": str(exc),
+                }
+            },
+        )
+        return
+
+    logger.info(
+        "Discord signal submitted",
+        extra={
+            "data": {
+                "account_id": account_id,
+                "deployment_id": str(deployment.id),
+                "signal_id": str(live_signal.id),
+                "broker_order_id": broker_order_id,
+                "symbol": live_signal.symbol,
+                "action": live_signal.action,
+            }
+        },
+    )
+
+
+async def _dispatch_discord_trade_signal(
+    account_id: str,
+    adapter: BaseLiveAdapter,
+    deployments_for_channel: list[LiveDeploymentConfig],
+    trade_signal: TradeSignal,
+    *,
+    accounts_env_values: Mapping[str, str],
+) -> None:
+    for deployment in deployments_for_channel:
+        if not _deployment_matches_stockkit_route(deployment, trade_signal.metadata):
+            continue
+        if not _deployment_covers_discord_symbol(deployment, trade_signal.symbol):
+            continue
+
+        await _submit_normalized_discord_signal(
+            account_id,
+            adapter,
+            deployment,
+            trade_signal,
+            signal_timeframe=_deployment_signal_timeframe(deployment),
+            wait_enabled=_deployment_wait_for_candle_close(deployment, accounts_env_values),
+        )
+        break
+    else:
+        logger.debug(
+            "Skipping discord signal with symbol not covered by deployment",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "channel_id": str(trade_signal.metadata.get("discord_channel_id", "")).strip(),
+                    "symbol": trade_signal.symbol,
+                }
+            },
+        )
+
+
+async def _run_discord_signal_listener_for_account(
+    account_id: str,
+    adapter: BaseLiveAdapter,
+    deployments: list[LiveDeploymentConfig],
+    *,
+    accounts_env_values: Mapping[str, str],
+) -> None:
+    active_discord_deployments = _active_discord_deployments_for_account(account_id, deployments)
+    if not active_discord_deployments:
+        logger.info(
+            "No active discord deployments for account; discord listener idle",
+            extra={"data": {"account_id": account_id}},
+        )
+        return
+
+    channel_to_deployments = _group_discord_deployments_by_channel(
+        account_id,
+        active_discord_deployments,
+        accounts_env_values=accounts_env_values,
+    )
+    if not channel_to_deployments:
+        logger.warning(
+            "No valid discord channels configured for active discord deployments",
+            extra={"data": {"account_id": account_id}},
+        )
+        return
+
+    # Resolve a real account token (account/user tokens, not a generic bot token).
     source = DiscordSignalSource(
-        token=discord_token,
+        token=_resolve_account_discord_token(accounts_env_values),
         channel_ids=set(channel_to_deployments.keys()),
         timeframe=_deployment_signal_timeframe(next(iter(active_discord_deployments))),
     )
@@ -754,87 +892,13 @@ async def _run_discord_signal_listener_for_account(
                 )
                 continue
 
-            for deployment in deployments_for_channel:
-                if not _deployment_matches_stockkit_route(deployment, trade_signal.metadata):
-                    continue
-                deployment_symbols = {item.upper() for item in deployment.symbols}
-                if deployment_symbols and trade_signal.symbol.upper() not in deployment_symbols:
-                    continue
-
-                signal_timeframe = _deployment_signal_timeframe(deployment)
-                wait_enabled = _deployment_wait_for_candle_close(deployment, accounts_env_values)
-                normalized_signal = TradeSignal(
-                    action=trade_signal.action,
-                    symbol=trade_signal.symbol,
-                    entry_price=trade_signal.entry_price,
-                    stop_loss=trade_signal.stop_loss,
-                    take_profit=trade_signal.take_profit,
-                    timeframe=signal_timeframe,
-                    metadata={**trade_signal.metadata, "wait_for_candle_close": wait_enabled},
-                )
-                try:
-                    normalized_signal = _apply_signal_processor(normalized_signal, deployment)
-                except ValueError as exc:
-                    logger.warning(
-                        "Signal processor rejected discord signal",
-                        extra={
-                            "data": {
-                                "account_id": account_id,
-                                "deployment_id": str(deployment.id),
-                                "symbol": trade_signal.symbol,
-                                "error": str(exc),
-                            }
-                        },
-                    )
-                    continue
-                if wait_enabled:
-                    await wait_for_candle_close(
-                        normalized_signal,
-                        normalized_signal.timeframe or signal_timeframe,
-                    )
-
-                live_signal = _trade_signal_to_live_signal(normalized_signal, deployment)
-                try:
-                    broker_order_id = await submit_order_with_risk(adapter, deployment, live_signal)
-                except Exception as exc:
-                    logger.warning(
-                        "Discord signal submission failed",
-                        extra={
-                            "data": {
-                                "account_id": account_id,
-                                "deployment_id": str(deployment.id),
-                                "symbol": live_signal.symbol,
-                                "error": str(exc),
-                            }
-                        },
-                    )
-                    continue
-
-                logger.info(
-                    "Discord signal submitted",
-                    extra={
-                        "data": {
-                            "account_id": account_id,
-                            "deployment_id": str(deployment.id),
-                            "signal_id": str(live_signal.id),
-                            "broker_order_id": broker_order_id,
-                            "symbol": live_signal.symbol,
-                            "action": live_signal.action,
-                        }
-                    },
-                )
-                break
-            else:
-                logger.debug(
-                    "Skipping discord signal with symbol not covered by deployment",
-                    extra={
-                        "data": {
-                            "account_id": account_id,
-                            "channel_id": channel_id,
-                            "symbol": trade_signal.symbol,
-                        }
-                    },
-                )
+            await _dispatch_discord_trade_signal(
+                account_id,
+                adapter,
+                deployments_for_channel,
+                trade_signal,
+                accounts_env_values=accounts_env_values,
+            )
     finally:
         await source.disconnect()
 
@@ -1122,6 +1186,175 @@ async def _stop_discord_bot_service(
     _DISCORD_SERVICE_AUTH_BLOCKED_REASONS.pop(service_id, None)
 
 
+def _running_discord_service_ids(discord_services: list[Service]) -> set[str]:
+    return {
+        str(service.id)
+        for service in discord_services
+        if service.status == ServiceStatus.RUNNING
+    }
+
+
+def _prune_stale_discord_service_blocks(
+    discord_services: list[Service],
+    running_service_ids: set[str],
+) -> None:
+    for service_id in list(_DISCORD_SERVICE_AUTH_BLOCKED_IDS):
+        if service_id in running_service_ids:
+            continue
+        _DISCORD_SERVICE_AUTH_BLOCKED_IDS.discard(service_id)
+        _DISCORD_SERVICE_AUTH_BLOCKED_REASONS.pop(service_id, None)
+
+
+async def _stop_inactive_discord_bots(
+    discord_services: list[Service],
+    running_service_ids: set[str],
+    *,
+    active_discord_bots: dict[str, DiscordSignalSource],
+    active_discord_bot_tasks: dict[str, asyncio.Task[None]],
+) -> None:
+    service_by_id = {str(service.id): service for service in discord_services}
+    for service_id in sorted(set(active_discord_bots) - running_service_ids):
+        service = service_by_id.get(service_id)
+        await _stop_discord_bot_service(
+            service_id,
+            active_discord_bots=active_discord_bots,
+            active_discord_bot_tasks=active_discord_bot_tasks,
+            paused=bool(service and service.status == ServiceStatus.PAUSED),
+        )
+
+
+async def _reconnect_discord_bot_source(
+    service: Service,
+    source: DiscordSignalSource,
+    service_id: str,
+    *,
+    running_task: asyncio.Task[None] | None,
+) -> None:
+    if source.is_connected or (running_task is not None and not running_task.done()):
+        return
+    try:
+        await source.reconnect()
+        await asyncio.to_thread(
+            update_service_status,
+            service_id,
+            ServiceStatus.RUNNING,
+            last_activity=datetime.now(timezone.utc),
+        )
+        logger.info(
+            "Reconnected Discord bot %s",
+            service.name,
+        )
+    except Exception as exc:
+        if _is_terminal_discord_runtime_error(exc):
+            _block_discord_service(service_id, exc)
+            logger.warning(
+                "Discord bot auth failed; skipping reconnect until credentials change",
+                extra={
+                    "data": {
+                        "service_id": service_id,
+                        "service_name": service.name,
+                        "error": str(exc),
+                    }
+                },
+            )
+            await asyncio.to_thread(update_service_status, service_id, ServiceStatus.FAILED)
+            return
+        logger.warning(
+            "Discord bot reconnect failed",
+            extra={
+                "data": {
+                    "service_id": service_id,
+                    "service_name": service.name,
+                    "error": str(exc),
+                }
+            },
+        )
+        await asyncio.to_thread(update_service_status, service_id, ServiceStatus.FAILED)
+
+
+async def _ensure_discord_bot_source(
+    service: Service,
+    token: str,
+    channel_id: str,
+    *,
+    active_discord_bots: dict[str, DiscordSignalSource],
+    active_discord_bot_tasks: dict[str, asyncio.Task[None]],
+) -> None:
+    service_id = str(service.id)
+    source = active_discord_bots.get(service_id)
+    expected_channel_ids = {channel_id}
+    if source is None or source.token != token or source.channel_ids != expected_channel_ids:
+        _DISCORD_SERVICE_AUTH_BLOCKED_IDS.discard(service_id)
+        _DISCORD_SERVICE_AUTH_BLOCKED_REASONS.pop(service_id, None)
+        if source is not None:
+            await _stop_discord_bot_service(
+                service_id,
+                active_discord_bots=active_discord_bots,
+                active_discord_bot_tasks=active_discord_bot_tasks,
+            )
+        source = DiscordSignalSource(
+            bot_name=service.name,
+            token=token,
+            channel_id=channel_id,
+            service_id=service_id,
+        )
+        active_discord_bots[service_id] = source
+
+    running_task = active_discord_bot_tasks.get(service_id)
+    if running_task is None or running_task.done():
+        task = asyncio.create_task(
+            _run_discord_bot_service_listener(service, source),
+            name=_service_task_name(service_id),
+        )
+        active_discord_bot_tasks[service_id] = task
+        logger.info("Started Discord bot %s", service.name)
+
+    running_task = active_discord_bot_tasks.get(service_id)
+    await _reconnect_discord_bot_source(
+        service,
+        source,
+        service_id,
+        running_task=running_task,
+    )
+
+
+async def _sync_running_discord_bot(
+    service: Service,
+    *,
+    active_discord_bots: dict[str, DiscordSignalSource],
+    active_discord_bot_tasks: dict[str, asyncio.Task[None]],
+    accounts_env_values: Mapping[str, str],
+) -> None:
+    service_id = str(service.id)
+    token_env_key, token, channel_id = _resolve_discord_bot_runtime(
+        service,
+        accounts_env_values=accounts_env_values,
+    )
+    if not token or not channel_id:
+        logger.warning(
+            "Discord service missing runtime credentials",
+            extra={
+                "data": {
+                    "service_id": service_id,
+                    "service_name": service.name,
+                    "token_env_key": token_env_key,
+                    "has_token": bool(token),
+                    "has_channel_id": bool(channel_id),
+                }
+            },
+        )
+        await asyncio.to_thread(update_service_status, service_id, ServiceStatus.FAILED)
+        return
+
+    await _ensure_discord_bot_source(
+        service,
+        token,
+        channel_id,
+        active_discord_bots=active_discord_bots,
+        active_discord_bot_tasks=active_discord_bot_tasks,
+    )
+
+
 async def _sync_discord_bot_services(
     services: list[Service],
     *,
@@ -1134,122 +1367,27 @@ async def _sync_discord_bot_services(
     discord_services = [
         service for service in services if service.type == ServiceType.DISCORD_BOT
     ]
-    service_by_id = {str(service.id): service for service in discord_services}
-    running_service_ids = {
-        str(service.id)
-        for service in discord_services
-        if service.status == ServiceStatus.RUNNING
-    }
-    for service_id in list(_DISCORD_SERVICE_AUTH_BLOCKED_IDS):
-        if service_id in running_service_ids:
-            continue
-        _DISCORD_SERVICE_AUTH_BLOCKED_IDS.discard(service_id)
-        _DISCORD_SERVICE_AUTH_BLOCKED_REASONS.pop(service_id, None)
+    running_service_ids = _running_discord_service_ids(discord_services)
+    _prune_stale_discord_service_blocks(discord_services, running_service_ids)
 
-    for service_id in sorted(set(active_discord_bots) - running_service_ids):
-        service = service_by_id.get(service_id)
-        await _stop_discord_bot_service(
-            service_id,
-            active_discord_bots=active_discord_bots,
-            active_discord_bot_tasks=active_discord_bot_tasks,
-            paused=bool(service and service.status == ServiceStatus.PAUSED),
-        )
+    await _stop_inactive_discord_bots(
+        discord_services,
+        running_service_ids,
+        active_discord_bots=active_discord_bots,
+        active_discord_bot_tasks=active_discord_bot_tasks,
+    )
 
     for service in discord_services:
-        service_id = str(service.id)
         if service.status != ServiceStatus.RUNNING:
             continue
-        if service_id in _DISCORD_SERVICE_AUTH_BLOCKED_IDS:
+        if str(service.id) in _DISCORD_SERVICE_AUTH_BLOCKED_IDS:
             continue
-        token_env_key, token, channel_id = _resolve_discord_bot_runtime(
+        await _sync_running_discord_bot(
             service,
+            active_discord_bots=active_discord_bots,
+            active_discord_bot_tasks=active_discord_bot_tasks,
             accounts_env_values=accounts_env_values,
         )
-        if not token or not channel_id:
-            logger.warning(
-                "Discord service missing runtime credentials",
-                extra={
-                    "data": {
-                        "service_id": service_id,
-                        "service_name": service.name,
-                        "token_env_key": token_env_key,
-                        "has_token": bool(token),
-                        "has_channel_id": bool(channel_id),
-                    }
-                },
-            )
-            await asyncio.to_thread(update_service_status, service_id, ServiceStatus.FAILED)
-            continue
-
-        source = active_discord_bots.get(service_id)
-        expected_channel_ids = {channel_id}
-        if source is None or source.token != token or source.channel_ids != expected_channel_ids:
-            _DISCORD_SERVICE_AUTH_BLOCKED_IDS.discard(service_id)
-            _DISCORD_SERVICE_AUTH_BLOCKED_REASONS.pop(service_id, None)
-            if source is not None:
-                await _stop_discord_bot_service(
-                    service_id,
-                    active_discord_bots=active_discord_bots,
-                    active_discord_bot_tasks=active_discord_bot_tasks,
-                )
-            source = DiscordSignalSource(
-                bot_name=service.name,
-                token=token,
-                channel_id=channel_id,
-                service_id=service_id,
-            )
-            active_discord_bots[service_id] = source
-
-        running_task = active_discord_bot_tasks.get(service_id)
-        if running_task is None or running_task.done():
-            task = asyncio.create_task(
-                _run_discord_bot_service_listener(service, source),
-                name=_service_task_name(service_id),
-            )
-            active_discord_bot_tasks[service_id] = task
-            logger.info("Started Discord bot %s", service.name)
-
-        running_task = active_discord_bot_tasks.get(service_id)
-        if source.is_connected or (running_task is not None and not running_task.done()):
-            continue
-        try:
-            await source.reconnect()
-            await asyncio.to_thread(
-                update_service_status,
-                service_id,
-                ServiceStatus.RUNNING,
-                last_activity=datetime.now(timezone.utc),
-            )
-            logger.info(
-                "Reconnected Discord bot %s",
-                service.name,
-            )
-        except Exception as exc:
-            if _is_terminal_discord_runtime_error(exc):
-                _block_discord_service(service_id, exc)
-                logger.warning(
-                    "Discord bot auth failed; skipping reconnect until credentials change",
-                    extra={
-                        "data": {
-                            "service_id": service_id,
-                            "service_name": service.name,
-                            "error": str(exc),
-                        }
-                    },
-                )
-                await asyncio.to_thread(update_service_status, service_id, ServiceStatus.FAILED)
-                continue
-            logger.warning(
-                "Discord bot reconnect failed",
-                extra={
-                    "data": {
-                        "service_id": service_id,
-                        "service_name": service.name,
-                        "error": str(exc),
-                    }
-                },
-            )
-            await asyncio.to_thread(update_service_status, service_id, ServiceStatus.FAILED)
 
 
 async def sync_services_loop(

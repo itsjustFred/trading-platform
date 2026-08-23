@@ -205,6 +205,20 @@ def _ensure_asyncio_twisted_reactor(loop: asyncio.AbstractEventLoop) -> None:
         reactor.startRunning(installSignalHandlers=False)
 
 
+def _explicit_metadata_volume(metadata: dict[str, Any]) -> int | None:
+    for key in ("ctrader_volume", "volume"):
+        if key not in metadata:
+            continue
+        try:
+            explicit = int(float(metadata[key]))
+        except (TypeError, ValueError):
+            raise ValueError(f"Invalid '{key}' in signal metadata.")
+        if explicit <= 0:
+            raise ValueError(f"'{key}' must be > 0.")
+        return explicit
+    return None
+
+
 class CTraderLiveAdapter(BaseLiveAdapter):
     """cTrader live adapter backed by OpenApiPy."""
 
@@ -741,22 +755,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
 
     def _resolve_order_volume(self, signal: LiveSignal) -> int:
         metadata = signal.metadata or {}
-        if "ctrader_volume" in metadata:
-            try:
-                explicit = int(float(metadata["ctrader_volume"]))
-            except (TypeError, ValueError):
-                raise ValueError("Invalid 'ctrader_volume' in signal metadata.")
-            if explicit <= 0:
-                raise ValueError("'ctrader_volume' must be > 0.")
-            return explicit
-
-        if "volume" in metadata:
-            try:
-                explicit = int(float(metadata["volume"]))
-            except (TypeError, ValueError):
-                raise ValueError("Invalid 'volume' in signal metadata.")
-            if explicit <= 0:
-                raise ValueError("'volume' must be > 0.")
+        explicit = _explicit_metadata_volume(metadata)
+        if explicit is not None:
             return explicit
 
         if "qty" in metadata:
@@ -791,20 +791,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             # attempt builds a fresh Twisted client so a half-dead service from a
             # prior attempt can't poison the next one. Terminal auth errors
             # (bad/expired token, account not authorized) are NOT retried.
-            max_attempts = (
-                self.connect_max_attempts
-                if self.connect_max_attempts is not None
-                else int(os.environ.get("CTRADER_CONNECT_MAX_ATTEMPTS", "5"))
-            )
-            base_delay = float(os.environ.get("CTRADER_CONNECT_BACKOFF_S", "2.0"))
-            connect_timeout = (
-                self.connect_timeout_seconds
-                if self.connect_timeout_seconds is not None
-                else 20.0
-            )
-            if max_attempts < 1:
-                max_attempts = 1
-
+            max_attempts, base_delay, connect_timeout = self._connect_retry_parameters()
             for attempt in range(1, max_attempts + 1):
                 try:
                     self._connected_event.clear()
@@ -826,113 +813,158 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                             }
                         },
                     )
-                    try:
-                        await self.reconcile_executions()
-                    except CTraderAuthTerminalError:
-                        raise
-                    except Exception as exc:
-                        logger.warning(
-                            "cTrader execution reconciliation failed; "
-                            "fills may be missing until retry",
-                            extra={
-                                "data": {
-                                    "account_id": self.ctid_trader_account_id,
-                                    "error": str(exc),
-                                }
-                            },
-                        )
+                    await self._reconcile_after_connect()
                     return
                 except asyncio.CancelledError:
                     self._teardown_client()
                     raise
                 except CTraderAuthTerminalError as exc:
-                    reason = str(exc).strip() or "cTrader authorization failed"
-                    self._mark_terminal_auth_failure(
-                        reason,
-                        error_code=getattr(exc, "error_code", ""),
-                    )
-                    self._teardown_client()
-                    if _NOT_AUTHORIZED_MARKER in reason.lower():
-                        logger.warning(
-                            "Account %s not authorized for token, skipping",
-                            self.ctid_trader_account_id,
-                            extra={
-                                "data": {
-                                    "account_id": self.ctid_trader_account_id,
-                                    "account_config_id": self.account_config_id,
-                                    "error_code": getattr(exc, "error_code", ""),
-                                    "error": reason,
-                                }
-                            },
-                        )
-                    else:
-                        logger.warning(
-                            "cTrader auth failed for account; "
-                            "skipping retries until credentials are updated",
-                            extra={
-                                "data": {
-                                    "account_id": self.ctid_trader_account_id,
-                                    "account_config_id": self.account_config_id,
-                                    "error_code": getattr(exc, "error_code", ""),
-                                    "error": reason,
-                                }
-                            },
-                        )
+                    self._handle_terminal_auth_failure(exc)
                     raise
                 except Exception as exc:
-                    self._authenticated = False
-                    self._teardown_client()
-                    error_text = str(exc).strip() or exc.__class__.__name__
-                    message = error_text.lower()
-                    if attempt < max_attempts:
-                        delay = base_delay * (2 ** (attempt - 1))
-                        logger.info(
-                            "cTrader connect attempt %d/%d failed; retrying in %.0fs",
-                            attempt,
-                            max_attempts,
-                            delay,
-                            extra={
-                                "data": {
-                                    "account_id": self.ctid_trader_account_id,
-                                    "error": error_text,
-                                    "next_attempt_in_s": delay,
-                                }
-                            },
-                        )
-                        await asyncio.sleep(delay)
-                        continue
-                    if "token" in message or "auth" in message:
-                        logger.info(
-                            "cTrader authentication unavailable; verify token/credentials, "
-                            "daemon will retry",
-                            extra={
-                                "data": {
-                                    "account_id": self.ctid_trader_account_id,
-                                    "error": error_text,
-                                }
-                            },
-                        )
-                    elif isinstance(exc, asyncio.TimeoutError) or "timeout" in message:
-                        logger.info(
-                            "cTrader connect timeout; endpoint may be unreachable, daemon will retry",
-                            extra={
-                                "data": {
-                                    "account_id": self.ctid_trader_account_id,
-                                    "error": error_text,
-                                }
-                            },
-                        )
-                    else:
-                        logger.info(
-                            "cTrader connect/auth unavailable; daemon will retry",
-                            extra={
-                                "data": {
-                                    "account_id": self.ctid_trader_account_id,
-                                    "error": error_text,
-                                }
-                            },
-                        )
-                    raise
+                    await self._retry_or_raise_connect_failure(
+                        exc, attempt, max_attempts, base_delay
+                    )
+
+    def _connect_retry_parameters(self) -> tuple[int, float, float]:
+        max_attempts = (
+            self.connect_max_attempts
+            if self.connect_max_attempts is not None
+            else int(os.environ.get("CTRADER_CONNECT_MAX_ATTEMPTS", "5"))
+        )
+        base_delay = float(os.environ.get("CTRADER_CONNECT_BACKOFF_S", "2.0"))
+        connect_timeout = (
+            self.connect_timeout_seconds
+            if self.connect_timeout_seconds is not None
+            else 20.0
+        )
+        if max_attempts < 1:
+            max_attempts = 1
+        return max_attempts, base_delay, connect_timeout
+
+    async def _reconcile_after_connect(self) -> None:
+        try:
+            await self.reconcile_executions()
+        except CTraderAuthTerminalError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "cTrader execution reconciliation failed; "
+                "fills may be missing until retry",
+                extra={
+                    "data": {
+                        "account_id": self.ctid_trader_account_id,
+                        "error": str(exc),
+                    }
+                },
+            )
+
+    def _handle_terminal_auth_failure(self, exc: CTraderAuthTerminalError) -> None:
+        reason = str(exc).strip() or "cTrader authorization failed"
+        self._mark_terminal_auth_failure(
+            reason,
+            error_code=getattr(exc, "error_code", ""),
+        )
+        self._teardown_client()
+        self._log_terminal_auth_failure(
+            reason, error_code=getattr(exc, "error_code", "")
+        )
+
+    def _log_terminal_auth_failure(
+        self, reason: str, *, error_code: str
+    ) -> None:
+        if _NOT_AUTHORIZED_MARKER in reason.lower():
+            logger.warning(
+                "Account %s not authorized for token, skipping",
+                self.ctid_trader_account_id,
+                extra={
+                    "data": {
+                        "account_id": self.ctid_trader_account_id,
+                        "account_config_id": self.account_config_id,
+                        "error_code": error_code,
+                        "error": reason,
+                    }
+                },
+            )
+        else:
+            logger.warning(
+                "cTrader auth failed for account; "
+                "skipping retries until credentials are updated",
+                extra={
+                    "data": {
+                        "account_id": self.ctid_trader_account_id,
+                        "account_config_id": self.account_config_id,
+                        "error_code": error_code,
+                        "error": reason,
+                    }
+                },
+            )
+
+    async def _retry_or_raise_connect_failure(
+        self,
+        exc: Exception,
+        attempt: int,
+        max_attempts: int,
+        base_delay: float,
+    ) -> None:
+        self._authenticated = False
+        self._teardown_client()
+        error_text = str(exc).strip() or exc.__class__.__name__
+        message = error_text.lower()
+        if attempt < max_attempts:
+            delay = base_delay * (2 ** (attempt - 1))
+            logger.info(
+                "cTrader connect attempt %d/%d failed; retrying in %.0fs",
+                attempt,
+                max_attempts,
+                delay,
+                extra={
+                    "data": {
+                        "account_id": self.ctid_trader_account_id,
+                        "error": error_text,
+                        "next_attempt_in_s": delay,
+                    }
+                },
+            )
+            await asyncio.sleep(delay)
+            return
+        self._log_connect_failure(exc, error_text, message)
+        raise
+
+    def _log_connect_failure(
+        self, exc: Exception, error_text: str, message: str
+    ) -> None:
+        if "token" in message or "auth" in message:
+            logger.info(
+                "cTrader authentication unavailable; verify token/credentials, "
+                "daemon will retry",
+                extra={
+                    "data": {
+                        "account_id": self.ctid_trader_account_id,
+                        "error": error_text,
+                    }
+                },
+            )
+        elif isinstance(exc, asyncio.TimeoutError) or "timeout" in message:
+            logger.info(
+                "cTrader connect timeout; endpoint may be unreachable, daemon will retry",
+                extra={
+                    "data": {
+                        "account_id": self.ctid_trader_account_id,
+                        "error": error_text,
+                    }
+                },
+            )
+        else:
+            logger.info(
+                "cTrader connect/auth unavailable; daemon will retry",
+                extra={
+                    "data": {
+                        "account_id": self.ctid_trader_account_id,
+                        "error": error_text,
+                    }
+                },
+            )
 
     def _create_client(self):
         """Build a fresh OpenApiPy client with callbacks wired.

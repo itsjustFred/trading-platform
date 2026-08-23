@@ -9,7 +9,7 @@ import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import TYPE_CHECKING, Any, Iterator
 from uuid import uuid4
 
 from dotenv import load_dotenv
@@ -55,6 +55,9 @@ from shared.models import (
 )
 
 logger = get_logger("database")
+
+if TYPE_CHECKING:
+    from sqlmodel import SelectOf  # noqa: F401
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(PROJECT_ROOT / ".env")
@@ -758,7 +761,7 @@ def _normalize_evidence_status(value: str) -> str:
     return normalized
 
 
-def _serialize_verification_evidence(row: VerificationEvidenceModel) -> dict[str, Any]:
+def _verification_evidence_core_fields(row: VerificationEvidenceModel) -> dict[str, Any]:
     return {
         "id": str(row.id),
         "run_id": str(row.run_id or ""),
@@ -772,6 +775,13 @@ def _serialize_verification_evidence(row: VerificationEvidenceModel) -> dict[str
             float(row.duration_seconds) if row.duration_seconds is not None else None
         ),
         "git_sha": str(row.git_sha or ""),
+    }
+
+
+def _verification_evidence_context_fields(
+    row: VerificationEvidenceModel,
+) -> dict[str, Any]:
+    return {
         "environment": str(row.environment or ""),
         "mode": str(row.mode or ""),
         "metadata": dict(row.metadata_json or {}),
@@ -782,6 +792,16 @@ def _serialize_verification_evidence(row: VerificationEvidenceModel) -> dict[str
         "created_at": str(row.created_at or ""),
         "updated_at": str(row.updated_at or ""),
     }
+
+
+def _verification_evidence_payload(row: VerificationEvidenceModel) -> dict[str, Any]:
+    payload = _verification_evidence_core_fields(row)
+    payload.update(_verification_evidence_context_fields(row))
+    return payload
+
+
+def _serialize_verification_evidence(row: VerificationEvidenceModel) -> dict[str, Any]:
+    return _verification_evidence_payload(row)
 
 
 def _normalize_task_record(row: Any) -> BackgroundTaskRecord | None:
@@ -2030,6 +2050,77 @@ def list_live_signal_executions_for_deployments(
     return _serialize_live_signal_execution_rows(rows)
 
 
+def _bounded_query_limit(
+    raw_limit: Any, *, default: int, maximum: int
+) -> int:
+    try:
+        return max(1, min(int(raw_limit), maximum))
+    except (TypeError, ValueError):
+        return default
+
+
+def _latest_executions_by_signal(
+    execution_rows: list[LiveExecutionModel],
+) -> dict[str, LiveExecutionModel]:
+    latest_execution_by_signal: dict[str, LiveExecutionModel] = {}
+    for execution in execution_rows:
+        signal_id = str(execution.signal_id)
+        if signal_id not in latest_execution_by_signal:
+            latest_execution_by_signal[signal_id] = execution
+    return latest_execution_by_signal
+
+
+def _live_signal_deployment_base_fields(
+    signal: LiveSignalModel,
+) -> dict[str, Any]:
+    return {
+        "signal_id": str(signal.id),
+        "deployment_id": str(signal.deployment_id),
+        "symbol": str(signal.symbol or ""),
+        "action": str(signal.action or ""),
+        "source": str(signal.source or "internal"),
+        "theoretical_price": float(signal.theoretical_price or 0.0),
+        "signal_timestamp": signal.timestamp,
+        "signal_metadata": signal.metadata_json or {},
+    }
+
+
+def _live_signal_deployment_execution_fields(
+    execution: LiveExecutionModel | None,
+) -> dict[str, Any]:
+    return {
+        "execution_id": str(execution.id) if execution is not None else None,
+        "execution_timestamp": (
+            execution.timestamp if execution is not None else None
+        ),
+        "actual_price": (
+            float(execution.actual_price or 0.0) if execution is not None else None
+        ),
+        "filled_qty": (
+            float(execution.filled_qty or 0.0) if execution is not None else None
+        ),
+        "commission": (
+            float(execution.commission or 0.0) if execution is not None else None
+        ),
+        "broker_order_id": (
+            str(execution.broker_order_id or "") if execution is not None else None
+        ),
+    }
+
+
+def _live_signal_deployment_payload(
+    signal_rows: list[LiveSignalModel],
+    latest_execution_by_signal: dict[str, LiveExecutionModel],
+) -> list[dict[str, Any]]:
+    payload: list[dict[str, Any]] = []
+    for signal in signal_rows:
+        execution = latest_execution_by_signal.get(str(signal.id))
+        entry = _live_signal_deployment_base_fields(signal)
+        entry.update(_live_signal_deployment_execution_fields(execution))
+        payload.append(entry)
+    return payload
+
+
 def list_live_signals_for_deployments(
     deployment_ids: list[str],
     *,
@@ -2039,10 +2130,7 @@ def list_live_signals_for_deployments(
     if not normalized_ids:
         return []
 
-    try:
-        bounded_limit = max(1, min(int(limit), 1000))
-    except (TypeError, ValueError):
-        bounded_limit = 200
+    bounded_limit = _bounded_query_limit(limit, default=200, maximum=1000)
 
     init_db()
     with get_session() as session:
@@ -2062,94 +2150,58 @@ def list_live_signals_for_deployments(
             .order_by(LiveExecutionModel.timestamp.desc(), LiveExecutionModel.id.desc())
         ).all()
 
-    latest_execution_by_signal: dict[str, LiveExecutionModel] = {}
-    for execution in execution_rows:
-        signal_id = str(execution.signal_id)
-        if signal_id not in latest_execution_by_signal:
-            latest_execution_by_signal[signal_id] = execution
-
-    payload: list[dict[str, Any]] = []
-    for signal in signal_rows:
-        execution = latest_execution_by_signal.get(str(signal.id))
-        payload.append(
-            {
-                "signal_id": str(signal.id),
-                "deployment_id": str(signal.deployment_id),
-                "symbol": str(signal.symbol or ""),
-                "action": str(signal.action or ""),
-                "source": str(signal.source or "internal"),
-                "theoretical_price": float(signal.theoretical_price or 0.0),
-                "signal_timestamp": signal.timestamp,
-                "signal_metadata": signal.metadata_json or {},
-                "execution_id": str(execution.id) if execution is not None else None,
-                "execution_timestamp": (
-                    execution.timestamp if execution is not None else None
-                ),
-                "actual_price": (
-                    float(execution.actual_price or 0.0) if execution is not None else None
-                ),
-                "filled_qty": (
-                    float(execution.filled_qty or 0.0) if execution is not None else None
-                ),
-                "commission": (
-                    float(execution.commission or 0.0) if execution is not None else None
-                ),
-                "broker_order_id": (
-                    str(execution.broker_order_id or "") if execution is not None else None
-                ),
-            }
-        )
-    return payload
+    latest_execution_by_signal = _latest_executions_by_signal(execution_rows)
+    return _live_signal_deployment_payload(signal_rows, latest_execution_by_signal)
 
 
-def list_live_signals_for_replay(
-    *,
-    deployment_ids: list[str] | None = None,
-    source: str | None = None,
-    start: datetime | None = None,
-    end: datetime | None = None,
-    limit: int = 5000,
-) -> list[dict[str, Any]]:
-    normalized_ids = sorted(
+def _normalized_replay_deployment_ids(
+    deployment_ids: list[str] | None,
+) -> list[str]:
+    return sorted(
         {str(item).strip() for item in (deployment_ids or []) if str(item).strip()}
     )
 
+
+def _validate_replay_source(source: str | None) -> str:
     normalized_source = str(source or "").strip().lower()
     if normalized_source and (
         normalized_source != "internal" and not normalized_source.startswith("discord")
     ):
         raise ValueError(f"Invalid signal source '{source}'")
+    return normalized_source
 
-    try:
-        bounded_limit = max(1, min(int(limit), 20000))
-    except (TypeError, ValueError):
-        bounded_limit = 5000
 
-    init_db()
-    with get_session() as session:
-        statement = select(LiveSignalModel).order_by(
-            LiveSignalModel.timestamp.asc(),
-            LiveSignalModel.id.asc(),
-        )
-        if normalized_ids:
-            statement = statement.where(LiveSignalModel.deployment_id.in_(normalized_ids))
-        if normalized_source == "internal":
-            statement = statement.where(LiveSignalModel.source == "internal")
-        elif normalized_source == "discord":
-            statement = statement.where(
-                or_(
-                    LiveSignalModel.source == "discord",
-                    LiveSignalModel.source.like("discord_%"),
-                )
+def _replay_signal_statement(
+    normalized_ids: list[str],
+    normalized_source: str,
+    start: datetime | None,
+    end: datetime | None,
+) -> SelectOf[LiveSignalModel]:
+    statement = select(LiveSignalModel).order_by(
+        LiveSignalModel.timestamp.asc(),
+        LiveSignalModel.id.asc(),
+    )
+    if normalized_ids:
+        statement = statement.where(LiveSignalModel.deployment_id.in_(normalized_ids))
+    if normalized_source == "internal":
+        statement = statement.where(LiveSignalModel.source == "internal")
+    elif normalized_source == "discord":
+        statement = statement.where(
+            or_(
+                LiveSignalModel.source == "discord",
+                LiveSignalModel.source.like("discord_%"),
             )
-        elif normalized_source:
-            statement = statement.where(LiveSignalModel.source == normalized_source)
-        if start is not None:
-            statement = statement.where(LiveSignalModel.timestamp >= start)
-        if end is not None:
-            statement = statement.where(LiveSignalModel.timestamp <= end)
-        rows = session.exec(statement.limit(bounded_limit)).all()
+        )
+    elif normalized_source:
+        statement = statement.where(LiveSignalModel.source == normalized_source)
+    if start is not None:
+        statement = statement.where(LiveSignalModel.timestamp >= start)
+    if end is not None:
+        statement = statement.where(LiveSignalModel.timestamp <= end)
+    return statement
 
+
+def _replay_signal_payload(rows: list[LiveSignalModel]) -> list[dict[str, Any]]:
     payload: list[dict[str, Any]] = []
     for row in rows:
         metadata = dict(row.metadata_json or {})
@@ -2169,6 +2221,28 @@ def list_live_signals_for_replay(
             }
         )
     return payload
+
+
+def list_live_signals_for_replay(
+    *,
+    deployment_ids: list[str] | None = None,
+    source: str | None = None,
+    start: datetime | None = None,
+    end: datetime | None = None,
+    limit: int = 5000,
+) -> list[dict[str, Any]]:
+    normalized_ids = _normalized_replay_deployment_ids(deployment_ids)
+
+    normalized_source = _validate_replay_source(source)
+
+    bounded_limit = _bounded_query_limit(limit, default=5000, maximum=20000)
+
+    init_db()
+    with get_session() as session:
+        statement = _replay_signal_statement(normalized_ids, normalized_source, start, end)
+        rows = session.exec(statement.limit(bounded_limit)).all()
+
+    return _replay_signal_payload(rows)
 
 
 def _serialize_live_signal_execution_rows(rows: list[Any]) -> list[dict[str, Any]]:
@@ -3350,21 +3424,31 @@ def _equity_preview_query_params(
     return ranked_query, params
 
 
+def _equity_preview_row_fields(row: Any) -> tuple[str, str, Any] | None:
+    if hasattr(row, "_mapping"):
+        mapping = getattr(row, "_mapping")
+        return (
+            str(mapping.get("backtest_id") or "").strip(),
+            str(mapping.get("time") or "").strip(),
+            mapping.get("equity"),
+        )
+    if isinstance(row, (tuple, list)):
+        return (
+            str(row[0] or "").strip() if len(row) > 0 else "",
+            str(row[1] or "").strip() if len(row) > 1 else "",
+            row[2] if len(row) > 2 else None,
+        )
+    return None
+
+
 def _append_equity_preview_row(
     previews: dict[str, list[EquityPointModel]], row: Any
 ) -> None:
     """Append one query row to its backtest's preview list, skipping bad rows."""
-    if hasattr(row, "_mapping"):
-        mapping = getattr(row, "_mapping")
-        backtest_id = str(mapping.get("backtest_id") or "").strip()
-        timestamp = str(mapping.get("time") or "").strip()
-        equity_value = mapping.get("equity")
-    elif isinstance(row, (tuple, list)):
-        backtest_id = str(row[0] or "").strip() if len(row) > 0 else ""
-        timestamp = str(row[1] or "").strip() if len(row) > 1 else ""
-        equity_value = row[2] if len(row) > 2 else None
-    else:
+    fields = _equity_preview_row_fields(row)
+    if fields is None:
         return
+    backtest_id, timestamp, equity_value = fields
     if not backtest_id or backtest_id not in previews or not timestamp:
         return
     try:
@@ -3400,45 +3484,74 @@ def load_backtest_equity_preview_points_map(
     return previews
 
 
-def load_backtest_result(backtest_id: str) -> BacktestResult | None:
-    init_db()
-    with get_session() as session:
-        backtest = session.get(BacktestRecord, backtest_id)
-        if backtest is None:
-            return None
+def _unwrap_model_row(row: Any) -> Any:
+    if row is None:
+        return None
+    if hasattr(row, "_mapping"):
+        mapping = getattr(row, "_mapping")
+        values = list(mapping.values())
+        return values[0] if values else None
+    if isinstance(row, (tuple, list)):
+        return row[0] if row else None
+    return row
 
-        trade_rows = session.exec(
-            select(TradeRecord)
-            .where(TradeRecord.backtest_id == backtest_id)
-            .order_by(TradeRecord.trade_nr.asc(), TradeRecord.id.asc())
-        ).all()
-        equity_rows = session.exec(
-            select(EquityPoint)
-            .where(EquityPoint.backtest_id == backtest_id)
-            .order_by(EquityPoint.time.asc(), EquityPoint.id.asc())
-        ).all()
-        drawing_rows = session.exec(
-            select(DrawingRecord)
-            .where(DrawingRecord.backtest_id == backtest_id)
-            .order_by(DrawingRecord.id.asc())
-        ).all()
-        indicator_rows = session.exec(
-            select(IndicatorRecord)
-            .where(IndicatorRecord.backtest_id == backtest_id)
-            .order_by(IndicatorRecord.series_nr.asc(), IndicatorRecord.id.asc())
-        ).all()
 
-    def _unwrap_model_row(row: Any) -> Any:
-        if row is None:
-            return None
-        if hasattr(row, "_mapping"):
-            mapping = getattr(row, "_mapping")
-            values = list(mapping.values())
-            return values[0] if values else None
-        if isinstance(row, (tuple, list)):
-            return row[0] if row else None
-        return row
+def _load_backtest_child_rows(
+    session: Session, backtest_id: str
+) -> tuple[
+    list[TradeRecord],
+    list[EquityPoint],
+    list[DrawingRecord],
+    list[IndicatorRecord],
+]:
+    trade_rows = session.exec(
+        select(TradeRecord)
+        .where(TradeRecord.backtest_id == backtest_id)
+        .order_by(TradeRecord.trade_nr.asc(), TradeRecord.id.asc())
+    ).all()
+    equity_rows = session.exec(
+        select(EquityPoint)
+        .where(EquityPoint.backtest_id == backtest_id)
+        .order_by(EquityPoint.time.asc(), EquityPoint.id.asc())
+    ).all()
+    drawing_rows = session.exec(
+        select(DrawingRecord)
+        .where(DrawingRecord.backtest_id == backtest_id)
+        .order_by(DrawingRecord.id.asc())
+    ).all()
+    indicator_rows = session.exec(
+        select(IndicatorRecord)
+        .where(IndicatorRecord.backtest_id == backtest_id)
+        .order_by(IndicatorRecord.series_nr.asc(), IndicatorRecord.id.asc())
+    ).all()
+    return trade_rows, equity_rows, drawing_rows, indicator_rows
 
+
+def _apply_backtest_trade_risk_fallbacks(
+    row: TradeRecord,
+    position_size: float | None,
+    risk_amount: float | None,
+    risk_percent: float | None,
+) -> tuple[float | None, float | None, float | None]:
+    if not isinstance(row.meta, dict):
+        return position_size, risk_amount, risk_percent
+    risk_math = row.meta.get("risk_math")
+    if not isinstance(risk_math, dict):
+        return position_size, risk_amount, risk_percent
+    if position_size is None:
+        position_size = risk_math.get("position_size")
+    if risk_amount is None:
+        risk_amount = risk_math.get("risk_target_usd")
+    if risk_percent is None:
+        risk_percent = risk_math.get("risk_target_pct")
+        if risk_percent is None:
+            max_position_pct = risk_math.get("max_position_pct")
+            if max_position_pct is not None:
+                risk_percent = max_position_pct
+    return position_size, risk_amount, risk_percent
+
+
+def _build_backtest_trades(trade_rows: list[Any]) -> list[Trade]:
     trades: list[Trade] = []
     for raw_row in trade_rows:
         row = _unwrap_model_row(raw_row)
@@ -3446,22 +3559,9 @@ def load_backtest_result(backtest_id: str) -> BacktestResult | None:
             continue
         exits_payload = row.exits or []
         exits = [TradeExit.from_dict(item) for item in exits_payload]
-        position_size = row.position_size
-        risk_amount = row.risk_amount
-        risk_percent = row.risk_percent
-        if isinstance(row.meta, dict):
-            risk_math = row.meta.get("risk_math")
-            if isinstance(risk_math, dict):
-                if position_size is None:
-                    position_size = risk_math.get("position_size")
-                if risk_amount is None:
-                    risk_amount = risk_math.get("risk_target_usd")
-                if risk_percent is None:
-                    risk_percent = risk_math.get("risk_target_pct")
-                    if risk_percent is None:
-                        max_position_pct = risk_math.get("max_position_pct")
-                        if max_position_pct is not None:
-                            risk_percent = max_position_pct
+        position_size, risk_amount, risk_percent = _apply_backtest_trade_risk_fallbacks(
+            row, row.position_size, row.risk_amount, row.risk_percent
+        )
         trades.append(
             Trade(
                 id=row.trade_nr,
@@ -3487,15 +3587,21 @@ def load_backtest_result(backtest_id: str) -> BacktestResult | None:
                 meta=row.meta or {},
             )
         )
+    return trades
 
+
+def _build_backtest_equity_curve(equity_rows: list[Any]) -> list[EquityPointModel]:
     equity_curve = []
     for raw_row in equity_rows:
         row = _unwrap_model_row(raw_row)
         if row is None:
             continue
         equity_curve.append(EquityPointModel(time=row.time, equity=row.equity))
+    return equity_curve
 
-    meta = BacktestMeta(
+
+def _backtest_meta_from_record(backtest: BacktestRecord) -> BacktestMeta:
+    return BacktestMeta(
         id=backtest.id,
         created_at=backtest.created_at,
         engine=backtest.engine,
@@ -3509,21 +3615,38 @@ def load_backtest_result(backtest_id: str) -> BacktestResult | None:
         notes=backtest.notes or "",
     )
 
-    drawings: list[dict[str, Any]] = []
-    for raw_row in drawing_rows:
-        row = _unwrap_model_row(raw_row)
-        if row is None:
-            continue
-        if row.data:
-            drawings.append(row.data)
 
-    indicators = []
-    for raw_row in indicator_rows:
+def _collect_backtest_data_payloads(raw_rows: list[Any]) -> list[dict[str, Any]]:
+    payloads: list[dict[str, Any]] = []
+    for raw_row in raw_rows:
         row = _unwrap_model_row(raw_row)
         if row is None:
             continue
         if row.data:
-            indicators.append(row.data)
+            payloads.append(row.data)
+    return payloads
+
+
+def load_backtest_result(backtest_id: str) -> BacktestResult | None:
+    init_db()
+    with get_session() as session:
+        backtest = session.get(BacktestRecord, backtest_id)
+        if backtest is None:
+            return None
+
+        trade_rows, equity_rows, drawing_rows, indicator_rows = _load_backtest_child_rows(
+            session, backtest_id
+        )
+
+    trades = _build_backtest_trades(trade_rows)
+
+    equity_curve = _build_backtest_equity_curve(equity_rows)
+
+    meta = _backtest_meta_from_record(backtest)
+
+    drawings = _collect_backtest_data_payloads(drawing_rows)
+
+    indicators = _collect_backtest_data_payloads(indicator_rows)
 
     return BacktestResult(
         meta=meta,
