@@ -2439,15 +2439,11 @@ def migrate_json_to_sqlite(*, skip_existing: bool = True) -> dict[str, int]:
     if skip_existing:
         with get_session() as session:
             rows = session.exec(select(BacktestRecord.id)).all()
-        for row in rows:
-            if isinstance(row, str):
-                existing_ids.add(row)
-            elif hasattr(row, "_mapping"):
-                value = getattr(row, "_mapping").get("id")
-                if value:
-                    existing_ids.add(str(value))
-            elif isinstance(row, (tuple, list)) and row and row[0]:
-                existing_ids.add(str(row[0]))
+        existing_ids = {
+            row_id
+            for row in rows
+            if (row_id := _coerce_backtest_row_id(row)) is not None
+        }
 
     for path in sorted(backtests_dir.glob("*.trades.json")):
         summary["total"] += 1

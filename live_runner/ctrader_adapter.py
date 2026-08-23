@@ -565,49 +565,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             return
 
         if payload_type == self._error_payload_type:
-            error_code = str(getattr(payload, "errorCode", ""))
-            description = str(getattr(payload, "description", ""))
-            if _is_already_logged_in_error(error_code, description):
-                if not self._already_logged_in_notified:
-                    logger.info(
-                        "cTrader account already authenticated; ignoring duplicate auth response",
-                        extra={
-                            "data": {
-                                "account_id": self.ctid_trader_account_id,
-                                "error_code": error_code,
-                            }
-                        },
-                    )
-                    self._already_logged_in_notified = True
-                return
-            if _is_terminal_auth_error(error_code, description):
-                self._mark_terminal_auth_failure(
-                    description or str(error_code or _NOT_AUTHORIZED_MARKER),
-                    error_code=error_code,
-                )
-                logger.warning(
-                    "Account %s not authorized for token, skipping",
-                    self.ctid_trader_account_id,
-                    extra={
-                        "data": {
-                            "account_id": self.ctid_trader_account_id,
-                            "account_config_id": self.account_config_id,
-                            "error_code": error_code,
-                            "error": description,
-                        }
-                    },
-                )
-                return
-            logger.warning(
-                "cTrader API error response",
-                extra={
-                    "data": {
-                        "account_id": self.ctid_trader_account_id,
-                        "error_code": error_code,
-                        "description": description,
-                    }
-                },
-            )
+            self._handle_error_response_payload(payload)
             return
 
         if payload_type == self._order_error_payload_type:
@@ -622,6 +580,51 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                     }
                 },
             )
+
+    def _handle_error_response_payload(self, payload: Any) -> None:
+        error_code = str(getattr(payload, "errorCode", ""))
+        description = str(getattr(payload, "description", ""))
+        if _is_already_logged_in_error(error_code, description):
+            if not self._already_logged_in_notified:
+                logger.info(
+                    "cTrader account already authenticated; ignoring duplicate auth response",
+                    extra={
+                        "data": {
+                            "account_id": self.ctid_trader_account_id,
+                            "error_code": error_code,
+                        }
+                    },
+                )
+                self._already_logged_in_notified = True
+            return
+        if _is_terminal_auth_error(error_code, description):
+            self._mark_terminal_auth_failure(
+                description or str(error_code or _NOT_AUTHORIZED_MARKER),
+                error_code=error_code,
+            )
+            logger.warning(
+                "Account %s not authorized for token, skipping",
+                self.ctid_trader_account_id,
+                extra={
+                    "data": {
+                        "account_id": self.ctid_trader_account_id,
+                        "account_config_id": self.account_config_id,
+                        "error_code": error_code,
+                        "error": description,
+                    }
+                },
+            )
+            return
+        logger.warning(
+            "cTrader API error response",
+            extra={
+                "data": {
+                    "account_id": self.ctid_trader_account_id,
+                    "error_code": error_code,
+                    "description": description,
+                }
+            },
+        )
 
     async def _send_request(self, request: Any, *, timeout_seconds: int = 10) -> Any:
         if self._client is None or self._loop is None:
