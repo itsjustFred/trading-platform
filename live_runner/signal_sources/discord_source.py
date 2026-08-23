@@ -379,8 +379,9 @@ class DiscordSignalSource(BaseSignalSource):
             )
 
     async def _fetch_messages(self, channel_id: str) -> list[dict[str, Any]]:
-        headers = {"authorization": self.token}
-        url = f"https://discord.com/api/v9/channels/{channel_id}/messages?limit={POLL_LIMIT}"
+        token = self.token if self.token.lower().startswith("bot ") else f"Bot {self.token}"
+        headers = {"Authorization": token}
+        url = f"https://discord.com/api/v10/channels/{channel_id}/messages?limit={POLL_LIMIT}"
 
         def _do_request() -> requests.Response:
             return requests.get(url, headers=headers, timeout=10)
@@ -484,6 +485,7 @@ class DiscordSignalSource(BaseSignalSource):
         newest = str(messages[0].get("id"))
         if not last_seen or int(newest) > int(last_seen):
             self._last_seen_message_ids[channel_id] = newest
+        self._seen_ids[channel_id] = {str(m.get("id")) for m in messages}
 
     async def _prime_cursors(self, channel_ids: Iterable[str]) -> None:
         for channel_id in channel_ids:
@@ -505,7 +507,7 @@ class DiscordSignalSource(BaseSignalSource):
                         }
                     },
                 )
-                return
+                continue
             if not messages:
                 continue
             seen = self._seen_ids.setdefault(channel_id, set())

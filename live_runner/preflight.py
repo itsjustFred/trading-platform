@@ -107,19 +107,20 @@ def _run_broker_connectivity_check(
 
     async def _check() -> tuple[float | None, float | None, int]:
         nonlocal connected
-        await adapter.connect()
-        fetched_balance, fetched_equity = await adapter.get_balance()
-        positions = await adapter.get_positions()
-        connected = True
-        return fetched_balance, fetched_equity, len(positions)
+        try:
+            await adapter.connect()
+            fetched_balance, fetched_equity = await adapter.get_balance()
+            positions = await adapter.get_positions()
+            connected = True
+            return fetched_balance, fetched_equity, len(positions)
+        finally:
+            with contextlib.suppress(Exception):
+                await adapter.disconnect()
 
     try:
         balance, equity, positions_count = asyncio.run(_check())
     except Exception as exc:
         errors.append(f"{broker_label} connectivity check failed: {type(exc).__name__}: {exc}")
-    finally:
-        with contextlib.suppress(Exception):
-            asyncio.run(adapter.disconnect())
     return connected, balance, equity, positions_count
 
 

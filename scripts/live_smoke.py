@@ -85,8 +85,8 @@ def _position_qty_for_symbol(positions: list[Any], symbol: str) -> float:
 
 def _write_report(report: SmokeReport, reports_dir: Path) -> Path:
     target = reports_dir.resolve()
-    if not target.is_dir():
-        raise ValueError(f"Reports directory does not exist or is not a directory: {reports_dir}")
+    if target.exists() and not target.is_dir():
+        raise ValueError(f"Reports directory path is not a directory: {reports_dir}")
     target.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     path = target / f"live_smoke_{report.mode}_{timestamp}.json"
@@ -531,32 +531,66 @@ async def _ctrader_strategy_e2e_worker(
         submit_order_with_risk(adapter, deployment, signal),
         timeout=timeout_seconds,
     )
-    opened_position = await _wait_for_ctrader_position(
-        adapter,
-        symbol=symbol,
-        should_exist=True,
-        timeout_seconds=timeout_seconds,
-    )
-    if opened_position is None:
-        raise RuntimeError("cTrader order submitted but no open position appeared.")
 
-    close_req = ProtoOAClosePositionReq()
-    close_req.ctidTraderAccountId = adapter.ctid_trader_account_id
-    close_req.positionId = int(opened_position["position_id"])
-    close_req.volume = int(opened_position["volume"])
-    close_res = await asyncio.wait_for(
-        adapter._send_request(close_req, timeout_seconds=20),
-        timeout=25,
-    )
-    remaining_position = await _wait_for_ctrader_position(
-        adapter,
-        symbol=symbol,
-        should_exist=False,
-        timeout_seconds=timeout_seconds,
-    )
-    remaining_volume = int(remaining_position["volume"]) if remaining_position else 0
-    if remaining_volume != 0:
-        raise RuntimeError(f"cTrader flatten left remaining {symbol} volume={remaining_volume}")
+    async def _best_effort_close_open_position() -> None:
+        try:
+            leftover_position = await _find_ctrader_open_position(adapter, symbol=symbol)
+            if leftover_position is None:
+                return
+            cleanup_req = ProtoOAClosePositionReq()
+            cleanup_req.ctidTraderAccountId = adapter.ctid_trader_account_id
+            cleanup_req.positionId = int(leftover_position["position_id"])
+            cleanup_req.volume = int(leftover_position["volume"])
+            await asyncio.wait_for(
+                adapter._send_request(cleanup_req, timeout_seconds=20),
+                timeout=25,
+            )
+        except Exception as cleanup_exc:
+            print(
+                json.dumps(
+                    {
+                        "warning": (
+                            "cTrader e2e best-effort close failed: "
+                            f"{_public_error(cleanup_exc)}"
+                        )
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+
+    try:
+        opened_position = await _wait_for_ctrader_position(
+            adapter,
+            symbol=symbol,
+            should_exist=True,
+            timeout_seconds=timeout_seconds,
+        )
+        if opened_position is None:
+            raise RuntimeError("cTrader order submitted but no open position appeared.")
+
+        close_req = ProtoOAClosePositionReq()
+        close_req.ctidTraderAccountId = adapter.ctid_trader_account_id
+        close_req.positionId = int(opened_position["position_id"])
+        close_req.volume = int(opened_position["volume"])
+        close_res = await asyncio.wait_for(
+            adapter._send_request(close_req, timeout_seconds=20),
+            timeout=25,
+        )
+        remaining_position = await _wait_for_ctrader_position(
+            adapter,
+            symbol=symbol,
+            should_exist=False,
+            timeout_seconds=timeout_seconds,
+        )
+        remaining_volume = int(remaining_position["volume"]) if remaining_position else 0
+        if remaining_volume != 0:
+            raise RuntimeError(f"cTrader flatten left remaining {symbol} volume={remaining_volume}")
+    except BaseException:
+        # Never leave the demo position open: the next run refuses to start while
+        # an open position exists, so flatten best-effort before propagating.
+        await _best_effort_close_open_position()
+        raise
 
     return {
         "status": "passed",
@@ -593,7 +627,7 @@ async def _wait_for_alpaca_fill(
     filled_qty = initial_filled_qty
     status = initial_status
     while time.monotonic() < deadline:
-        latest = client.get_order_by_id(order_id)
+        latest = await asyncio.to_thread(client.get_order_by_id, order_id)
         raw_filled = getattr(latest, "filled_qty", None)
         if raw_filled is not None:
             filled_qty = float(raw_filled or 0.0)
@@ -636,7 +670,8 @@ async def _close_filled_alpaca_position(
     from alpaca.trading.enums import OrderSide, OrderType, TimeInForce
     from alpaca.trading.requests import MarketOrderRequest
 
-    close_order = client.submit_order(
+    close_order = await asyncio.to_thread(
+        client.submit_order,
         MarketOrderRequest(
             symbol=symbol,
             qty=close_qty,
@@ -644,7 +679,7 @@ async def _close_filled_alpaca_position(
             type=OrderType.MARKET,
             time_in_force=TimeInForce.GTC,
             client_order_id=f"codex-close-{uuid4().hex[:20]}",
-        )
+        ),
     )
     return await _await_alpaca_terminal_status(
         client,
@@ -668,8 +703,9 @@ async def _alpaca_roundtrip_check(
     order_id = ""
     close_status = "not_started"
     try:
-        before_positions = client.get_all_positions()
-        order = client.submit_order(
+        before_positions = await asyncio.to_thread(client.get_all_positions)
+        order = await asyncio.to_thread(
+            client.submit_order,
             MarketOrderRequest(
                 symbol=symbol,
                 notional=notional,
@@ -677,7 +713,7 @@ async def _alpaca_roundtrip_check(
                 type=OrderType.MARKET,
                 time_in_force=TimeInForce.GTC,
                 client_order_id=f"codex-smoke-{uuid4().hex[:20]}",
-            )
+            ),
         )
         order_id = str(getattr(order, "id", ""))
         filled_qty, status = await _wait_for_alpaca_fill(
@@ -689,7 +725,7 @@ async def _alpaca_roundtrip_check(
         )
 
         if filled_qty > 0:
-            positions_before_close = client.get_all_positions()
+            positions_before_close = await asyncio.to_thread(client.get_all_positions)
             close_qty = _position_qty_for_symbol(positions_before_close, symbol)
             if close_qty <= 0:
                 raise RuntimeError("Buy filled but no matching position was available to close.")
@@ -702,9 +738,13 @@ async def _alpaca_roundtrip_check(
         else:
             close_status = _cancel_unfilled_alpaca_order(client, order_id)
 
-        after_positions = client.get_all_positions()
+        after_positions = await asyncio.to_thread(client.get_all_positions)
         remaining_qty = _position_qty_for_symbol(after_positions, symbol)
-        ok = filled_qty > 0 and "filled" in close_status.lower() and remaining_qty == 0
+        # Exact terminal-status comparison: `"filled" in close_status` also matched
+        # "partially_filled" and misreported partial closes as success. Real fills
+        # surface as OrderStatus.FILLED ("filled") or its str() form.
+        close_status_key = close_status.lower().rsplit(".", 1)[-1]
+        ok = filled_qty > 0 and close_status_key == "filled" and remaining_qty == 0
         return SmokeCheck(
             check_name,
             ok,
