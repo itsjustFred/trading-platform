@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import fcntl
 import os
+import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -158,11 +159,14 @@ def _write_env_keys(path: Path, updates: dict[str, str]) -> None:
                 if key not in seen:
                     lines.append(f"{key}={value}")
 
-            tmp_path = target.with_name(f".{target.name}.{os.getpid()}.tmp")
-            tmp_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            tmp_fd, tmp_name = tempfile.mkstemp(
+                prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent)
+            )
+            tmp_path = Path(tmp_name)
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as tmp_handle:
+                tmp_handle.write("\n".join(lines) + "\n")
             tmp_path.chmod(0o600)
             os.replace(tmp_path, target)
-            target.chmod(0o600)
             if target.parent.exists():
                 target.parent.chmod(0o700)
         finally:
@@ -262,7 +266,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._already_logged_in_notified = False
         self._refresh_flow = False
 
-        self._Client: Any = None
+        self._client_class: Any = None
         self._TcpProtocol: Any = None
         self._EndPoints: Any = None
         self._Protobuf: Any = None
@@ -300,7 +304,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._order_error_payload_type: int | None = None
 
     def _load_openapi_types(self) -> None:
-        if self._Client is not None:
+        if self._client_class is not None:
             return
         assert self._loop is not None
         _ensure_asyncio_twisted_reactor(self._loop)
@@ -342,7 +346,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 "ctrader-open-api package is required for CTraderLiveAdapter."
             ) from exc
 
-        self._Client = Client
+        self._client_class = Client
         self._TcpProtocol = TcpProtocol
         self._EndPoints = EndPoints
         self._Protobuf = Protobuf
@@ -942,7 +946,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             if self.demo
             else self._EndPoints.PROTOBUF_LIVE_HOST
         )
-        client = self._Client(host, self._EndPoints.PROTOBUF_PORT, self._TcpProtocol)
+        client = self._client_class(host, self._EndPoints.PROTOBUF_PORT, self._TcpProtocol)
         client.setConnectedCallback(self._on_connected)
         client.setDisconnectedCallback(self._on_disconnected)
         client.setMessageReceivedCallback(self._on_message)
