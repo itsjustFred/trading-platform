@@ -147,34 +147,38 @@ def resolve_alpaca_credentials(
     """Resolve Alpaca credentials from env (default or ACC{N} blocks)."""
     values = dict(env) if env is not None else dict(os.environ)
 
+    indexes = _alpaca_acc_indexes(values)
+    blocks: list[dict[str, str | bool]] = []
+    if indexes:
+        blocks = _alpaca_credential_blocks(values, indexes)
+
+    normalized_account_id = str(account_id or "").strip().lower()
+    normalized_login = str(broker_login or "").strip().lower()
+    if blocks:
+        matched = _matching_alpaca_block(blocks, normalized_account_id, normalized_login)
+        if matched is not None:
+            return matched
+        if (normalized_account_id or normalized_login) and _alpaca_blocks_have_hints(
+            blocks
+        ):
+            logger.warning(
+                "No exact Alpaca credential block match; refusing ambiguous fallback",
+                extra={
+                    "data": {
+                        "account_id": account_id,
+                        "broker_login": broker_login,
+                    }
+                },
+            )
+            return None
+
+    # Default pair applies only when no hints were given (or no ACC{N} blocks
+    # exist), otherwise every account would silently resolve to it.
     default_credentials = _default_alpaca_credentials(values)
     if default_credentials is not None:
         return default_credentials
 
-    indexes = _alpaca_acc_indexes(values)
-    if not indexes:
-        return None
-
-    blocks = _alpaca_credential_blocks(values, indexes)
     if not blocks:
-        return None
-
-    normalized_account_id = str(account_id or "").strip().lower()
-    normalized_login = str(broker_login or "").strip().lower()
-    matched = _matching_alpaca_block(blocks, normalized_account_id, normalized_login)
-    if matched is not None:
-        return matched
-
-    if (normalized_account_id or normalized_login) and _alpaca_blocks_have_hints(blocks):
-        logger.warning(
-            "No exact Alpaca credential block match; refusing ambiguous fallback",
-            extra={
-                "data": {
-                    "account_id": account_id,
-                    "broker_login": broker_login,
-                }
-            },
-        )
         return None
     return _alpaca_block_credentials(blocks[0])
 
@@ -427,7 +431,12 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
     ) -> Any:
         extended_hours = bool((signal.metadata or {}).get("extended_hours"))
         limit_price = _to_float((signal.metadata or {}).get("limit_price"), default=0.0)
-        if extended_hours and limit_price > 0:
+        if extended_hours:
+            if limit_price <= 0:
+                raise ValueError(
+                    "Extended-hours orders require a positive 'limit_price' in "
+                    "signal metadata."
+                )
             return limit_request_cls(
                 symbol=signal.symbol,
                 qty=qty,
@@ -442,7 +451,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             qty=qty,
             side=order_side.BUY if signal.action == "buy" else order_side.SELL,
             time_in_force=time_in_force.DAY,
-            extended_hours=extended_hours,
+            extended_hours=False,
             client_order_id=client_order_id,
         )
 

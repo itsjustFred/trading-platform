@@ -562,7 +562,7 @@ def _resolve_exit_only_target_qty(
         position_symbol = str(position.get("symbol") or "").strip().upper()
         if position_symbol != symbol.upper():
             continue
-        resolved_qty = _coerce_live_float(position.get("qty"), field_name="qty", minimum=0.0)
+        resolved_qty = _coerce_live_float(position.get("qty"), field_name="qty")
         target_qty = max(resolved_qty, 0.0)
         break
     return target_qty
@@ -716,17 +716,31 @@ def _group_discord_deployments_by_channel(
     return channel_to_deployments
 
 
-def _resolve_account_discord_token(accounts_env_values: Mapping[str, str]) -> str:
+def _deployment_service_name(deployment: LiveDeploymentConfig) -> str:
+    config = deployment.signal_config if isinstance(deployment.signal_config, dict) else {}
+    return str(
+        deployment.signal_source_id
+        or _service_config_string(config, "service_name")
+        or ""
+    ).strip()
+
+
+def _resolve_account_discord_token(
+    accounts_env_values: Mapping[str, str],
+    deployment: LiveDeploymentConfig,
+) -> str:
+    service_name = _deployment_service_name(deployment)
+    token_env_key = ""
+    if service_name:
+        canonical_name = re.sub(r"[^A-Z0-9_]+", "_", service_name.upper())
+        token_env_key = f"DISCORD_BOT_{canonical_name}_TOKEN"
     discord_token = ""
-    for _token_env_key in (
-        "DISCORD_BOT_NITRO_TOKEN",
-        "DISCORD_BOT_RAMJET_TOKEN",
-        "DISCORD_BOT_ROCKETFUEL_TOKEN",
-    ):
-        _resolved = str(accounts_env_values.get(_token_env_key) or "").strip()
+    if token_env_key:
+        _resolved = str(accounts_env_values.get(token_env_key) or "").strip()
+        if not _resolved:
+            _resolved = str(os.environ.get(token_env_key, "")).strip()
         if _resolved:
             discord_token = _resolved
-            break
     if not discord_token:
         discord_token = str(os.environ.get("DISCORD_BOT_TOKEN", "")).strip()
     return discord_token
@@ -875,10 +889,14 @@ async def _run_discord_signal_listener_for_account(
         return
 
     # Resolve a real account token (account/user tokens, not a generic bot token).
+    primary_deployment = next(iter(active_discord_deployments))
     source = DiscordSignalSource(
-        token=_resolve_account_discord_token(accounts_env_values),
+        token=_resolve_account_discord_token(
+            accounts_env_values,
+            primary_deployment,
+        ),
         channel_ids=set(channel_to_deployments.keys()),
-        timeframe=_deployment_signal_timeframe(next(iter(active_discord_deployments))),
+        timeframe=_deployment_signal_timeframe(primary_deployment),
     )
     await source.connect()
     try:

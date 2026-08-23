@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field
@@ -103,19 +104,22 @@ def _run_broker_connectivity_check(
     balance: float | None = None
     equity: float | None = None
     positions_count: int | None = None
-    try:
-        asyncio.run(adapter.connect())
-        balance, equity = asyncio.run(adapter.get_balance())
-        positions = asyncio.run(adapter.get_positions())
-        positions_count = len(positions)
+
+    async def _check() -> tuple[float | None, float | None, int]:
+        nonlocal connected
+        await adapter.connect()
+        fetched_balance, fetched_equity = await adapter.get_balance()
+        positions = await adapter.get_positions()
         connected = True
+        return fetched_balance, fetched_equity, len(positions)
+
+    try:
+        balance, equity, positions_count = asyncio.run(_check())
     except Exception as exc:
         errors.append(f"{broker_label} connectivity check failed: {type(exc).__name__}: {exc}")
     finally:
-        try:
+        with contextlib.suppress(Exception):
             asyncio.run(adapter.disconnect())
-        except Exception:
-            pass
     return connected, balance, equity, positions_count
 
 

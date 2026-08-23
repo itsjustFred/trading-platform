@@ -107,7 +107,9 @@ async def main() -> dict:
 if __name__ == "__main__":
     res = asyncio.run(main())
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    out_path = os.path.join(_ROOT, "reports", f"ctrader_order_verification_{stamp}.json")
+    reports_dir = os.path.join(_ROOT, "reports")
+    os.makedirs(reports_dir, exist_ok=True)
+    out_path = os.path.join(reports_dir, f"ctrader_order_verification_{stamp}.json")
     with open(out_path, "w") as fh:
         json.dump(res, fh, indent=2)
     print("report:", out_path)

@@ -167,8 +167,6 @@ def _write_env_keys(path: Path, updates: dict[str, str]) -> None:
                 tmp_handle.write("\n".join(lines) + "\n")
             tmp_path.chmod(0o600)
             os.replace(tmp_path, target)
-            if target.parent.exists():
-                target.parent.chmod(0o700)
         finally:
             fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
 

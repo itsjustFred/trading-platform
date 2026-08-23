@@ -261,6 +261,124 @@ def test_alpaca_submit_order_blocks_non_positive_quantity(monkeypatch):
         asyncio.run(adapter.submit_order(signal))
 
 
+def test_alpaca_extended_hours_without_positive_limit_price_raises(monkeypatch):
+    """Alpaca only accepts extended-hours sessions as LIMIT orders; a market
+    request flagged extended_hours=True is rejected by the broker and strands
+    the signal."""
+    from live_runner import alpaca_adapter as module
+
+    adapter = module.AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True)
+    market_requests: list[Any] = []
+
+    def _market_request_cls(**kwargs):
+        market_requests.append(kwargs)
+        return SimpleNamespace(kind="market")
+
+    def _fail_limit_request_cls(**_kwargs):
+        pytest.fail("limit order must not be constructed without limit_price")
+
+    base_kwargs = dict(
+        qty=1.0,
+        order_side=SimpleNamespace(BUY="buy", SELL="sell"),
+        time_in_force=SimpleNamespace(DAY="day"),
+        limit_request_cls=_fail_limit_request_cls,
+        market_request_cls=_market_request_cls,
+        client_order_id="cid-eh",
+    )
+    missing_limit = LiveSignal(
+        deployment_id="dep-1",
+        symbol="AAPL",
+        action="buy",
+        theoretical_price=100.0,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"qty": 1.0, "extended_hours": True},
+    )
+    non_positive_limit = LiveSignal(
+        deployment_id="dep-1",
+        symbol="AAPL",
+        action="sell",
+        theoretical_price=100.0,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"qty": 1.0, "extended_hours": True, "limit_price": -1.5},
+    )
+
+    with pytest.raises(ValueError, match="positive 'limit_price'"):
+        adapter._build_order_request(missing_limit, **base_kwargs)
+    with pytest.raises(ValueError, match="positive 'limit_price'"):
+        adapter._build_order_request(non_positive_limit, **base_kwargs)
+
+    # Nothing may reach the broker for the invalid signals.
+    assert market_requests == []
+
+
+def test_alpaca_extended_hours_limit_and_regular_market_orders(monkeypatch):
+    """Valid extended-hours signals keep the LIMIT/DAY path; regular-session
+    signals always build market orders with extended_hours disabled."""
+    from live_runner import alpaca_adapter as module
+
+    adapter = module.AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True)
+    order_side = SimpleNamespace(BUY="buy", SELL="sell")
+    time_in_force = SimpleNamespace(DAY="day")
+
+    def _limit_request_cls(**kwargs):
+        return ("limit", kwargs)
+
+    def _market_request_cls(**kwargs):
+        return ("market", kwargs)
+
+    def _build(signal, client_order_id):
+        return adapter._build_order_request(
+            signal,
+            qty=2.0,
+            order_side=order_side,
+            time_in_force=time_in_force,
+            limit_request_cls=_limit_request_cls,
+            market_request_cls=_market_request_cls,
+            client_order_id=client_order_id,
+        )
+
+    extended_hours = LiveSignal(
+        deployment_id="dep-1",
+        symbol="AAPL",
+        action="buy",
+        theoretical_price=100.0,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"qty": 2.0, "extended_hours": True, "limit_price": 101.5},
+    )
+    assert _build(extended_hours, "cid-eh") == (
+        "limit",
+        {
+            "symbol": "AAPL",
+            "qty": 2.0,
+            "side": "buy",
+            "time_in_force": "day",
+            "extended_hours": True,
+            "limit_price": 101.5,
+            "client_order_id": "cid-eh",
+        },
+    )
+
+    regular = LiveSignal(
+        deployment_id="dep-1",
+        symbol="MSFT",
+        action="sell",
+        theoretical_price=300.0,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"qty": 2.0},
+    )
+    assert _build(regular, "cid-regular") == (
+        "market",
+        {
+            "symbol": "MSFT",
+            "qty": 2.0,
+            "side": "sell",
+            "time_in_force": "day",
+            "extended_hours": False,
+            "client_order_id": "cid-regular",
+        },
+    )
+
+
 def test_alpaca_discord_redelivery_submits_once_with_canonical_signal_id(monkeypatch):
     from live_runner import alpaca_adapter as module
 

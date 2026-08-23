@@ -512,6 +512,10 @@ def _apply_ctrader_account_detail(
         ctx.ignored_name_values.add(detail_login)
 
 
+class _CtraderStreamError(RuntimeError):
+    pass
+
+
 def _request_ctrader_account_detail(ctx: _CtraderAccountContext, account_id: int) -> None:
     try:
         if _PROTO_OA_CTID_TRADER_ACCOUNT_REQ is None:
@@ -528,6 +532,18 @@ def _request_ctrader_account_detail(ctx: _CtraderAccountContext, account_id: int
             account_detail_res, _PROTO_OA_CTID_TRADER_ACCOUNT_RES
         ):
             _apply_ctrader_account_detail(ctx, account_id, account_detail_res)
+    except (TimeoutError, ConnectionError, OSError) as exc:
+        logger.warning(
+            "cTrader account detail request desynchronized the socket",
+            extra={
+                "data": {
+                    "account_id": str(account_id),
+                    "host": ctx.host,
+                    "error": repr(exc),
+                }
+            },
+        )
+        raise _CtraderStreamError(str(exc)) from exc
     except Exception as exc:
         logger.debug(
             "Optional cTrader account detail request failed",
@@ -654,6 +670,8 @@ def _build_ctrader_live_account(
     try:
         _request_ctrader_account_detail(ctx, account_id)
         _load_ctrader_trader_details(ctx, account_id)
+    except _CtraderStreamError:
+        raise
     except Exception as exc:
         error_text = repr(exc)
         if _handle_ctrader_trader_error(error_text, host, account_id) == "skip":

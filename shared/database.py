@@ -9,7 +9,7 @@ import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterator
+from typing import Any, Iterator
 from uuid import uuid4
 
 from dotenv import load_dotenv
@@ -28,6 +28,7 @@ from sqlalchemy import (
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Field, Session, SQLModel, create_engine, select
+from sqlmodel.sql.expression import SelectOfScalar
 
 from shared.constants import DATA_DIR as RESOLVED_DATA_DIR
 from shared.logging import get_logger
@@ -55,9 +56,6 @@ from shared.models import (
 )
 
 logger = get_logger("database")
-
-if TYPE_CHECKING:
-    from sqlmodel import SelectOf  # noqa: F401
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(PROJECT_ROOT / ".env")
@@ -2176,7 +2174,7 @@ def _replay_signal_statement(
     normalized_source: str,
     start: datetime | None,
     end: datetime | None,
-) -> SelectOf[LiveSignalModel]:
+) -> "SelectOfScalar[LiveSignalModel]":
     statement = select(LiveSignalModel).order_by(
         LiveSignalModel.timestamp.asc(),
         LiveSignalModel.id.asc(),

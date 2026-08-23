@@ -29,6 +29,17 @@ class DiscordAuthenticationError(RuntimeError):
     """Raised when Discord returns a terminal authentication error (401/403)."""
 
 
+class DiscordRateLimitError(RuntimeError):
+    """Raised when Discord returns a 429 rate limit response."""
+
+    def __init__(self, channel_id: str, retry_after: float) -> None:
+        super().__init__(
+            f"Discord rate limited channel {channel_id}; retry after {retry_after}s"
+        )
+        self.channel_id = channel_id
+        self.retry_after = retry_after
+
+
 _RAMJET_OVERSOLD_RE = re.compile(r"is now oversold", re.IGNORECASE)
 _BUY_SIGNAL_RE = re.compile(r"buy signal", re.IGNORECASE)
 _PRICE_LABEL_RE = re.compile(r"Price:\s*\$\s*(\d+(?:[.,]\d+)?)", re.IGNORECASE)
@@ -330,6 +341,7 @@ class DiscordSignalSource(BaseSignalSource):
         self._paused = False
         self._run_task: asyncio.Task[None] | None = None
         self._seen_ids: dict[str, set[str]] = {}
+        self._last_seen_message_ids: dict[str, str] = {}
 
     @property
     def is_connected(self) -> bool:
@@ -393,6 +405,23 @@ class DiscordSignalSource(BaseSignalSource):
             raise DiscordAuthenticationError(
                 f"Discord auth failed ({response.status_code}) for {channel_id}"
             )
+        if response.status_code == 429:
+            try:
+                retry_after = float(response.json().get("retry_after", 5.0))
+            except (ValueError, AttributeError, TypeError):
+                retry_after = 5.0
+            logger.warning(
+                "Discord REST rate limited",
+                extra={
+                    "data": {
+                        "bot_name": self.bot_name,
+                        "service_id": self.service_id,
+                        "channel_id": channel_id,
+                        "retry_after": retry_after,
+                    }
+                },
+            )
+            raise DiscordRateLimitError(channel_id, retry_after)
         if response.status_code != 200:
             logger.warning(
                 "Discord REST returned non-200",
@@ -418,18 +447,24 @@ class DiscordSignalSource(BaseSignalSource):
 
         return body if isinstance(body, list) else []
 
-    async def _poll_once(self, channel_id: str) -> None:
+    async def _poll_once(self, channel_id: str, *, emit: bool = True) -> None:
         messages = await self._fetch_messages(channel_id)
         if not messages:
             return
         seen = self._seen_ids.setdefault(channel_id, set())
         # Messages arrive newest-first; iterate reversed so the queue receives
         # them in chronological (oldest -> newest) order.
+        last_seen = self._last_seen_message_ids.get(channel_id, "")
         for message in reversed(messages):
             message_id = str(message.get("id"))
             if message_id in seen:
                 continue
+            if emit and last_seen and int(message_id) <= int(last_seen):
+                seen.add(message_id)
+                continue
             seen.add(message_id)
+            if not emit:
+                continue
             wrapped = _DiscordMessageAdapter(message)
             parsed = _parse_trade_signal_from_message(
                 wrapped,
@@ -446,14 +481,60 @@ class DiscordSignalSource(BaseSignalSource):
                 last_activity=datetime.now(timezone.utc),
             )
             await self._queue.put(parsed)
+        newest = str(messages[0].get("id"))
+        if not last_seen or int(newest) > int(last_seen):
+            self._last_seen_message_ids[channel_id] = newest
+
+    async def _prime_cursors(self, channel_ids: Iterable[str]) -> None:
+        for channel_id in channel_ids:
+            if channel_id in self._last_seen_message_ids:
+                continue
+            try:
+                messages = await self._fetch_messages(channel_id)
+            except DiscordAuthenticationError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "Discord cursor priming failed",
+                    extra={
+                        "data": {
+                            "bot_name": self.bot_name,
+                            "service_id": self.service_id,
+                            "channel_id": channel_id,
+                            "error": str(exc),
+                        }
+                    },
+                )
+                return
+            if not messages:
+                continue
+            seen = self._seen_ids.setdefault(channel_id, set())
+            for message in messages:
+                message_id = str(message.get("id"))
+                seen.add(message_id)
+            self._last_seen_message_ids[channel_id] = str(messages[0].get("id"))
 
     async def _poll_loop(self) -> None:
         while not self._paused:
+            rate_limit_retry_after = 0.0
             for channel_id in self.channel_ids:
                 try:
                     await self._poll_once(channel_id)
                 except DiscordAuthenticationError:
                     raise
+                except DiscordRateLimitError as exc:
+                    rate_limit_retry_after = max(rate_limit_retry_after, exc.retry_after)
+                    logger.warning(
+                        "Discord poll iteration failed",
+                        extra={
+                            "data": {
+                                "bot_name": self.bot_name,
+                                "service_id": self.service_id,
+                                "channel_id": channel_id,
+                                "error": str(exc),
+                            }
+                        },
+                    )
                 except Exception as exc:
                     logger.warning(
                         "Discord poll iteration failed",
@@ -467,7 +548,7 @@ class DiscordSignalSource(BaseSignalSource):
                         },
                     )
             try:
-                await asyncio.sleep(POLL_INTERVAL)
+                await asyncio.sleep(max(rate_limit_retry_after, POLL_INTERVAL))
             except asyncio.CancelledError:
                 raise
 
@@ -480,10 +561,12 @@ class DiscordSignalSource(BaseSignalSource):
             raise ValueError("Missing Discord channel id")
         self._paused = False
         self._ready.clear()
-        self._seen_ids = {channel_id: set() for channel_id in self.channel_ids}
+        for channel_id in self.channel_ids:
+            self._seen_ids.setdefault(channel_id, set())
 
         # Verify auth with an initial poll before starting the background loop.
         try:
+            await self._prime_cursors(self.channel_ids)
             await self._poll_once(next(iter(self.channel_ids)))
         except DiscordAuthenticationError as exc:
             await self.disconnect(failed=True)
