@@ -15,7 +15,7 @@ import pytest
 from datetime import datetime, timezone
 from typing import Any
 
-from shared.models import LiveExecution, LiveSignal
+from shared.models import LiveDeploymentConfig, LiveExecution, LiveSignal
 
 
 # ─── cTrader token refresh: re-auth + serialize + atomic persistence ──────────
@@ -301,8 +301,14 @@ def test_ctrader_positions_excludes_closed_positions():
 def test_get_live_signal_broker_order_id_roundtrip(isolated_db):
     """Saving and reading broker_order_id must be symmetric."""
     database = isolated_db
+    database.ensure_live_account("acc-1", "ctrader")
+    deployment = LiveDeploymentConfig(
+        id=uuid4(), strategy_name="demo", account_id="acc-1",
+        symbols=["AAPL"], timeframe="1h", status="ACTIVE", signal_source="internal",
+    )
+    database.create_live_deployment(deployment)
     signal = LiveSignal(
-        deployment_id="dep-1",
+        deployment_id=str(deployment.id),
         symbol="AAPL",
         action="buy",
         theoretical_price=100.0,
@@ -316,14 +322,20 @@ def test_get_live_signal_broker_order_id_roundtrip(isolated_db):
 
     # Retrieve
     assert database.get_live_signal_broker_order_id(str(signal.id)) == "bo-123"
-    assert database.find_live_signal_id_by_broker_order_id("bo-123") == str(signal.id)
+    assert database.find_live_signal_id_by_broker_order_id("acc-1", "bo-123") == str(signal.id)
 
 
 def test_get_live_signal_broker_order_id_missing(isolated_db):
     """Missing broker_order_id must return None or empty."""
     database = isolated_db
+    database.ensure_live_account("acc-1", "ctrader")
+    deployment = LiveDeploymentConfig(
+        id=uuid4(), strategy_name="demo", account_id="acc-1",
+        symbols=["AAPL"], timeframe="1h", status="ACTIVE", signal_source="internal",
+    )
+    database.create_live_deployment(deployment)
     signal = LiveSignal(
-        deployment_id="dep-1",
+        deployment_id=str(deployment.id),
         symbol="AAPL",
         action="buy",
         theoretical_price=100.0,
@@ -333,7 +345,7 @@ def test_get_live_signal_broker_order_id_missing(isolated_db):
     database.save_live_signal(signal)
 
     assert not database.get_live_signal_broker_order_id(str(signal.id))
-    assert database.find_live_signal_id_by_broker_order_id("missing") is None
+    assert database.find_live_signal_id_by_broker_order_id("acc-1", "missing") is None
 
 
 # ─── dedupe_executions script ─────────────────────────────────────────────────

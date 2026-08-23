@@ -57,7 +57,6 @@ temp/
 tmp/
 
 # uv
-uv.lock
 .accounts.env
 
 # Kimchi runtime data (generated locally, large)
@@ -72,3 +71,7 @@ graphify-out/
 reports/*.csv
 reports/*.trades.json
 frontend/public/matrix-grid-overview.json
+
+# Live smoke integration report (generated at repo root, contains account
+# ids/balances - never commit)
+live_integration_report.json

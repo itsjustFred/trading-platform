@@ -4,22 +4,40 @@ import asyncio
 import contextlib
 import os
 import re
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterable
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any
+
+import requests
 
 from live_runner.signal_sources.base_source import BaseSignalSource
 from risk.models import TradeSignal
 from shared.constants import normalize_timeframe
-from shared.database import save_live_signal, update_service_status
+from shared.database import update_service_status
 from shared.logging import get_logger
-from shared.models import LiveSignal, ServiceStatus
+from shared.models import ServiceStatus
 
 logger = get_logger("live-runner")
 
+# Polling cadence for the REST-based signal source (seconds).
+POLL_INTERVAL = 8
+POLL_LIMIT = 20
+
 
 class DiscordAuthenticationError(RuntimeError):
-    """Raised when discord.py fails with terminal authentication errors."""
+    """Raised when Discord returns a terminal authentication error (401/403)."""
+
+
+class DiscordRateLimitError(RuntimeError):
+    """Raised when Discord returns a 429 rate limit response."""
+
+    def __init__(self, channel_id: str, retry_after: float) -> None:
+        super().__init__(
+            f"Discord rate limited channel {channel_id}; retry after {retry_after}s"
+        )
+        self.channel_id = channel_id
+        self.retry_after = retry_after
 
 
 _RAMJET_OVERSOLD_RE = re.compile(r"is now oversold", re.IGNORECASE)
@@ -99,46 +117,83 @@ def _is_discord_auth_error(exc: BaseException | None) -> bool:
     )
 
 
-def _extract_symbol(content: str) -> str | None:
-    def normalize_candidate(candidate: str) -> str | None:
-        normalized = candidate.strip().strip("*$").upper()
-        if not normalized or normalized in _SKIP_WORDS:
-            return None
-        return normalized
+def _normalize_symbol_candidate(candidate: str) -> str | None:
+    normalized = candidate.strip().strip("*$").upper()
+    if not normalized or normalized in _SKIP_WORDS:
+        return None
+    return normalized
 
-    for matched in re.findall(r"\*\*\$?([A-Za-z]{1,10})\*\*", content):
-        candidate = normalize_candidate(matched)
+
+def _first_normalized_symbol(matches: Iterable[str]) -> str | None:
+    for matched in matches:
+        candidate = _normalize_symbol_candidate(matched)
         if candidate:
             return candidate
+    return None
 
+
+def _extract_bold_symbol(content: str) -> str | None:
+    return _first_normalized_symbol(re.findall(r"\*\* \$?([A-Za-z]{1,10})\*\*", content))
+
+
+def _extract_labeled_symbol(content: str) -> str | None:
     for pattern in (
         r"(?:ticker|symbol|stock)\s*[:\-]\s*\**\$?([A-Za-z]{1,10})\**",
         r"(?:for|on)\s+\**\$?([A-Za-z]{1,10})\**",
     ):
-        for matched in re.finditer(pattern, content, re.IGNORECASE):
-            candidate = normalize_candidate(matched.group(1))
-            if candidate:
-                return candidate
+        symbol = _first_normalized_symbol(
+            matched.group(1) for matched in re.finditer(pattern, content, re.IGNORECASE)
+        )
+        if symbol:
+            return symbol
+    return None
 
-    for matched in re.findall(r"\$([A-Za-z]{1,10})\b", content):
-        candidate = normalize_candidate(matched)
-        if candidate:
-            return candidate
 
+def _extract_action_symbol(content: str) -> str | None:
+    action_symbol = re.search(
+        r"(?i:\b(?:buy|sell|long|short)\b)\s+"
+        r"(?:(?i:signal)\s+)?\**\$?([A-Z]{1,10})\**\b",
+        content,
+    )
+    if action_symbol:
+        return _normalize_symbol_candidate(action_symbol.group(1))
+    return None
+
+
+def _extract_dollar_symbol(content: str) -> str | None:
+    return _first_normalized_symbol(re.findall(r"\$([A-Za-z]{1,10})\b", content))
+
+
+def _price_prefixed_symbol(content: str) -> str | None:
     ticker_price = re.search(r"\b([A-Za-z]{1,10})\s+\$\d+", content)
     if ticker_price:
-        candidate = normalize_candidate(ticker_price.group(1))
-        if candidate:
-            return candidate
+        return _normalize_symbol_candidate(ticker_price.group(1))
+    return None
 
+
+def _fallback_uppercase_symbol(content: str) -> str | None:
     for line in content.split("\n"):
         line_stripped = line.strip()
         if not line_stripped:
             continue
-        for matched in re.findall(r"\b([A-Z]{1,10})\b", line_stripped):
-            candidate = normalize_candidate(matched)
-            if candidate:
-                return candidate
+        symbol = _first_normalized_symbol(re.findall(r"\b([A-Z]{1,10})\b", line_stripped))
+        if symbol:
+            return symbol
+    return None
+
+
+def _extract_symbol(content: str) -> str | None:
+    for extract_stage in (
+        _extract_bold_symbol,
+        _extract_labeled_symbol,
+        _extract_action_symbol,
+        _extract_dollar_symbol,
+        _price_prefixed_symbol,
+        _fallback_uppercase_symbol,
+    ):
+        symbol = extract_stage(content)
+        if symbol:
+            return symbol
     return None
 
 
@@ -244,6 +299,20 @@ def _parse_trade_signal_from_message(
     )
 
 
+class _DiscordMessageAdapter:
+    """Minimal adapter exposing the attributes the parser relies on."""
+
+    __slots__ = ("content", "id", "created_at", "channel", "author")
+
+    def __init__(self, message: dict[str, Any]) -> None:
+        self.content = str(message.get("content") or "")
+        self.id = str(message.get("id"))
+        self.created_at = _parse_timestamp(message.get("timestamp"))
+        self.channel = SimpleNamespace(id=str(message.get("channel_id")))
+        author = message.get("author") or {}
+        self.author = SimpleNamespace(id=str(author.get("id")))
+
+
 class DiscordSignalSource(BaseSignalSource):
     def __init__(
         self,
@@ -266,12 +335,13 @@ class DiscordSignalSource(BaseSignalSource):
             resolved_channel_ids.add(fallback_channel_id)
         self.channel_ids = {value for value in resolved_channel_ids if value}
         self.timeframe = normalize_timeframe(timeframe) or timeframe
-        self._client: Any | None = None
         self._queue: asyncio.Queue[TradeSignal] = asyncio.Queue()
         self._ready = asyncio.Event()
         self._connected = False
         self._paused = False
         self._run_task: asyncio.Task[None] | None = None
+        self._seen_ids: dict[str, set[str]] = {}
+        self._last_seen_message_ids: dict[str, str] = {}
 
     @property
     def is_connected(self) -> bool:
@@ -308,161 +378,245 @@ class DiscordSignalSource(BaseSignalSource):
                 },
             )
 
-    async def _persist_trade_signal(self, signal: TradeSignal) -> None:
-        metadata = dict(signal.metadata or {})
-        metadata["source"] = self.source_name
-        metadata["discord_bot_name"] = self.bot_name
-        if self.service_id:
-            metadata["service_id"] = self.service_id
-        signal_time = _parse_timestamp(str(metadata.get("received_at") or ""))
-        live_signal = LiveSignal(
-            deployment_id=self.service_id or self.bot_name,
-            symbol=signal.symbol,
-            action="buy" if signal.action in {"buy", "long"} else "sell",
-            theoretical_price=float(signal.entry_price),
-            timestamp=signal_time,
-            metadata=metadata,
-        )
-        await asyncio.to_thread(save_live_signal, live_signal)
+    async def _fetch_messages(self, channel_id: str) -> list[dict[str, Any]]:
+        token = self.token if self.token.lower().startswith("bot ") else f"Bot {self.token}"
+        headers = {"Authorization": token}
+        url = f"https://discord.com/api/v10/channels/{channel_id}/messages?limit={POLL_LIMIT}"
+
+        def _do_request() -> requests.Response:
+            return requests.get(url, headers=headers, timeout=10)
+
+        try:
+            response = await asyncio.to_thread(_do_request)
+        except requests.exceptions.RequestException as exc:
+            logger.warning(
+                "Discord REST request failed",
+                extra={
+                    "data": {
+                        "bot_name": self.bot_name,
+                        "service_id": self.service_id,
+                        "channel_id": channel_id,
+                        "error": str(exc),
+                    }
+                },
+            )
+            return []
+
+        if response.status_code in (401, 403):
+            raise DiscordAuthenticationError(
+                f"Discord auth failed ({response.status_code}) for {channel_id}"
+            )
+        if response.status_code == 429:
+            try:
+                retry_after = float(response.json().get("retry_after", 5.0))
+            except (ValueError, AttributeError, TypeError):
+                retry_after = 5.0
+            logger.warning(
+                "Discord REST rate limited",
+                extra={
+                    "data": {
+                        "bot_name": self.bot_name,
+                        "service_id": self.service_id,
+                        "channel_id": channel_id,
+                        "retry_after": retry_after,
+                    }
+                },
+            )
+            raise DiscordRateLimitError(channel_id, retry_after)
+        if response.status_code != 200:
+            logger.warning(
+                "Discord REST returned non-200",
+                extra={
+                    "data": {
+                        "bot_name": self.bot_name,
+                        "service_id": self.service_id,
+                        "channel_id": channel_id,
+                        "status_code": response.status_code,
+                    }
+                },
+            )
+            return []
+
+        try:
+            body = response.json()
+        except ValueError as exc:
+            logger.warning(
+                "Discord REST returned non-JSON body",
+                extra={"data": {"channel_id": channel_id, "error": str(exc)}},
+            )
+            return []
+
+        return body if isinstance(body, list) else []
+
+    async def _poll_once(self, channel_id: str, *, emit: bool = True) -> None:
+        messages = await self._fetch_messages(channel_id)
+        if not messages:
+            return
+        seen = self._seen_ids.setdefault(channel_id, set())
+        # Messages arrive newest-first; iterate reversed so the queue receives
+        # them in chronological (oldest -> newest) order.
+        last_seen = self._last_seen_message_ids.get(channel_id, "")
+        for message in reversed(messages):
+            message_id = str(message.get("id"))
+            if message_id in seen:
+                continue
+            if emit and last_seen and int(message_id) <= int(last_seen):
+                seen.add(message_id)
+                continue
+            seen.add(message_id)
+            if not emit:
+                continue
+            wrapped = _DiscordMessageAdapter(message)
+            parsed = _parse_trade_signal_from_message(
+                wrapped,
+                default_timeframe=self.timeframe,
+            )
+            if parsed is None:
+                continue
+            parsed.metadata["source"] = self.source_name
+            parsed.metadata["discord_bot_name"] = self.bot_name
+            if self.service_id:
+                parsed.metadata["service_id"] = self.service_id
+            await self._set_service_status(
+                ServiceStatus.RUNNING,
+                last_activity=datetime.now(timezone.utc),
+            )
+            await self._queue.put(parsed)
+        newest = str(messages[0].get("id"))
+        if not last_seen or int(newest) > int(last_seen):
+            self._last_seen_message_ids[channel_id] = newest
+        self._seen_ids[channel_id] = {str(m.get("id")) for m in messages}
+
+    async def _prime_cursors(self, channel_ids: Iterable[str]) -> None:
+        for channel_id in channel_ids:
+            if channel_id in self._last_seen_message_ids:
+                continue
+            try:
+                messages = await self._fetch_messages(channel_id)
+            except DiscordAuthenticationError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "Discord cursor priming failed",
+                    extra={
+                        "data": {
+                            "bot_name": self.bot_name,
+                            "service_id": self.service_id,
+                            "channel_id": channel_id,
+                            "error": str(exc),
+                        }
+                    },
+                )
+                continue
+            if not messages:
+                continue
+            seen = self._seen_ids.setdefault(channel_id, set())
+            for message in messages:
+                message_id = str(message.get("id"))
+                seen.add(message_id)
+            self._last_seen_message_ids[channel_id] = str(messages[0].get("id"))
+
+    async def _poll_loop(self) -> None:
+        while not self._paused:
+            rate_limit_retry_after = 0.0
+            for channel_id in self.channel_ids:
+                try:
+                    await self._poll_once(channel_id)
+                except DiscordAuthenticationError:
+                    raise
+                except DiscordRateLimitError as exc:
+                    rate_limit_retry_after = max(rate_limit_retry_after, exc.retry_after)
+                    logger.warning(
+                        "Discord poll iteration failed",
+                        extra={
+                            "data": {
+                                "bot_name": self.bot_name,
+                                "service_id": self.service_id,
+                                "channel_id": channel_id,
+                                "error": str(exc),
+                            }
+                        },
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Discord poll iteration failed",
+                        extra={
+                            "data": {
+                                "bot_name": self.bot_name,
+                                "service_id": self.service_id,
+                                "channel_id": channel_id,
+                                "error": str(exc),
+                            }
+                        },
+                    )
+            try:
+                await asyncio.sleep(max(rate_limit_retry_after, POLL_INTERVAL))
+            except asyncio.CancelledError:
+                raise
 
     async def connect(self) -> None:
         if self._connected:
             return
         if not self.token:
-            raise ValueError("Missing DISCORD_BOT_TOKEN")
+            raise ValueError("Missing Discord token")
         if not self.channel_ids:
-            raise ValueError("Missing DISCORD_CHANNEL_ID")
+            raise ValueError("Missing Discord channel id")
         self._paused = False
         self._ready.clear()
+        for channel_id in self.channel_ids:
+            self._seen_ids.setdefault(channel_id, set())
 
+        # Verify auth with an initial poll before starting the background loop.
         try:
-            import discord
-        except ModuleNotFoundError as exc:
-            raise RuntimeError(
-                "discord.py is required for DiscordSignalSource. Install package 'discord.py'."
-            ) from exc
-
-        intents = discord.Intents.default()
-        intents.message_content = True
-
-        source = self
-
-        class _SignalClient(discord.Client):
-            async def on_ready(self) -> None:
-                logger.info(
-                    "Discord signal source connected",
-                    extra={
-                        "data": {
-                            "bot_name": source.bot_name,
-                            "service_id": source.service_id,
-                            "channel_ids": sorted(source.channel_ids),
-                            "bot_user": str(self.user),
-                        }
-                    },
-                )
-                source._connected = True
-                source._ready.set()
-                await source._set_service_status(
-                    ServiceStatus.RUNNING,
-                    last_activity=datetime.now(timezone.utc),
-                )
-
-            async def on_disconnect(self) -> None:
-                source._connected = False
-                if source._paused:
-                    return
-                await source._set_service_status(ServiceStatus.FAILED)
-
-            async def on_message(self, message: Any) -> None:
-                if getattr(message.author, "bot", False):
-                    return
-                channel_id = str(getattr(message.channel, "id", ""))
-                if channel_id not in source.channel_ids:
-                    return
-                parsed = _parse_trade_signal_from_message(
-                    message,
-                    default_timeframe=source.timeframe,
-                )
-                if parsed is None:
-                    return
-                parsed.metadata["source"] = source.source_name
-                parsed.metadata["discord_bot_name"] = source.bot_name
-                if source.service_id:
-                    parsed.metadata["service_id"] = source.service_id
-                try:
-                    await source._persist_trade_signal(parsed)
-                except Exception as exc:
-                    logger.warning(
-                        "Failed to persist discord signal",
-                        extra={
-                            "data": {
-                                "bot_name": source.bot_name,
-                                "service_id": source.service_id,
-                                "error": str(exc),
-                            }
-                        },
-                    )
-                await source._set_service_status(
-                    ServiceStatus.RUNNING,
-                    last_activity=datetime.now(timezone.utc),
-                )
-                await source._queue.put(parsed)
-
-        self._client = _SignalClient(intents=intents)
-        self._run_task = asyncio.create_task(
-            self._client.start(self.token, reconnect=True),
-            name=f"discord-source-client-{self.bot_name.lower()}",
-        )
-        try:
-            await asyncio.wait_for(self._ready.wait(), timeout=30)
-        except Exception as exc:
-            task_error: BaseException | None = None
-            if self._run_task is not None and self._run_task.done():
-                with contextlib.suppress(asyncio.CancelledError):
-                    task_error = self._run_task.exception()
-            detected_error = task_error or exc
-            if _is_discord_auth_error(detected_error):
-                message = f"Discord bot {self.bot_name} auth failed: Invalid token"
-                logger.warning(
-                    message,
-                    extra={
-                        "data": {
-                            "bot_name": self.bot_name,
-                            "service_id": self.service_id,
-                            "error": str(detected_error),
-                        }
-                    },
-                )
-                await self.disconnect(failed=True)
-                raise DiscordAuthenticationError(message) from detected_error
+            await self._prime_cursors(self.channel_ids)
+            await self._poll_once(next(iter(self.channel_ids)))
+        except DiscordAuthenticationError as exc:
             await self.disconnect(failed=True)
-            raise
+            message = f"Discord bot {self.bot_name} auth failed: Invalid token"
+            logger.warning(
+                message,
+                extra={
+                    "data": {
+                        "bot_name": self.bot_name,
+                        "service_id": self.service_id,
+                        "error": str(exc),
+                    }
+                },
+            )
+            raise DiscordAuthenticationError(message) from exc
+        except Exception as exc:
+            logger.warning(
+                "Initial discord poll failed; continuing with background loop",
+                extra={
+                    "data": {
+                        "bot_name": self.bot_name,
+                        "service_id": self.service_id,
+                        "error": str(exc),
+                    }
+                },
+            )
+
+        self._connected = True
+        self._ready.set()
+        await self._set_service_status(
+            ServiceStatus.RUNNING,
+            last_activity=datetime.now(timezone.utc),
+        )
+        self._run_task = asyncio.create_task(
+            self._poll_loop(),
+            name=f"discord-source-poll-{self.bot_name.lower()}",
+        )
 
     async def disconnect(self, *, failed: bool = True) -> None:
-        if self._client is not None:
-            await self._client.close()
+        self._connected = False
+        self._ready.clear()
         if self._run_task is not None:
             run_task = self._run_task
             if not run_task.done():
                 run_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await run_task
-            except asyncio.CancelledError:
-                pass
-            except Exception as exc:
-                logger.debug(
-                    "Discord client task ended during disconnect",
-                    extra={
-                        "data": {
-                            "bot_name": self.bot_name,
-                            "service_id": self.service_id,
-                            "error": str(exc),
-                        }
-                    },
-                )
-        self._connected = False
-        self._ready.clear()
-        self._run_task = None
+            self._run_task = None
         if self._paused:
             await self._set_service_status(ServiceStatus.PAUSED)
         elif failed:

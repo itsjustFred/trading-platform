@@ -2,17 +2,22 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import inspect
 import os
 import re
 import uuid
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
 from dotenv import dotenv_values
 
+from live_runner.account_routing import (
+    ctrader_account_identifier,
+    validate_live_account_routes,
+)
 from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credentials
 from live_runner.base_adapter import BaseLiveAdapter
 from live_runner.ctrader_adapter import CTraderAuthTerminalError, CTraderLiveAdapter
@@ -49,6 +54,8 @@ from signal_bots.registry import get_signal_processor
 initialize_sentry("live-runner")
 logger = get_logger("live-runner")
 
+_ACCOUNT_NOT_AUTHORIZED_LOG = "Account %s not authorized for token, skipping"
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_ACCOUNTS_ENV = PROJECT_ROOT / ".accounts.env"
 BALANCE_POLL_INTERVAL_SECONDS = 60
@@ -60,6 +67,7 @@ _DISCORD_SERVICE_AUTH_BLOCKED_IDS: set[str] = set()
 _DISCORD_SERVICE_AUTH_BLOCKED_REASONS: dict[str, str] = {}
 _CTRADER_AUTH_BLOCKED_ACCOUNTS: set[str] = set()
 _CTRADER_AUTH_BLOCKED_REASONS: dict[str, str] = {}
+_CTRADER_ACCOUNT_CREDENTIAL_SIGNATURES: dict[str, str] = {}
 
 
 def _is_terminal_discord_runtime_error(exc: BaseException) -> bool:
@@ -110,12 +118,6 @@ def _is_ctrader_pending_deferred_error(exc: BaseException) -> bool:
     return message.startswith("(15")
 
 
-def _block_ctrader_account(account_id: str, exc: BaseException | str) -> None:
-    reason = str(exc).strip() or "cTrader authorization failed"
-    _CTRADER_AUTH_BLOCKED_ACCOUNTS.add(account_id)
-    _CTRADER_AUTH_BLOCKED_REASONS[account_id] = reason
-
-
 def _block_discord_service(service_id: str, exc: BaseException | str) -> None:
     reason = str(exc).strip() or "Discord authentication failed"
     _DISCORD_SERVICE_AUTH_BLOCKED_IDS.add(service_id)
@@ -136,6 +138,24 @@ def _parse_bool_env(value: str | None, *, default: bool = True) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+_TRUE_BOOL_TOKENS = {"1", "true", "yes", "y", "on"}
+_FALSE_BOOL_TOKENS = {"0", "false", "no", "n", "off"}
+
+
+def _parse_strict_bool_env(name: str, value: str | None, *, default: bool = True) -> bool:
+    if value is None:
+        return default
+    token = value.strip().lower()
+    if token in _TRUE_BOOL_TOKENS:
+        return True
+    if token in _FALSE_BOOL_TOKENS:
+        return False
+    valid = ", ".join(sorted(_TRUE_BOOL_TOKENS | _FALSE_BOOL_TOKENS))
+    raise ValueError(
+        f"Invalid boolean value for {name}: {value!r}. Valid values are: {valid}."
+    )
 
 
 def _load_accounts_env_values(accounts_env: Path) -> dict[str, str]:
@@ -228,8 +248,55 @@ def _resolve_ctrader_credentials(
         return None
     raw_demo_value = env_values.get("CTRADER_DEMO")
     demo_value = raw_demo_value.strip() if isinstance(raw_demo_value, str) else None
-    demo = _parse_bool_env(demo_value, default=True)
+    demo = _parse_strict_bool_env("CTRADER_DEMO", demo_value, default=True)
     return app_id, app_secret, access_token, refresh_token, demo
+
+
+def _ctrader_credentials_signature(env_values: Mapping[str, str]) -> str:
+    credentials = _resolve_ctrader_credentials(env_values)
+    if credentials is None:
+        return "missing"
+    app_id, app_secret, access_token, refresh_token, demo = credentials
+    payload = "\0".join((app_id, app_secret, access_token, refresh_token, str(demo)))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _refresh_ctrader_blocked_state_for_accounts(
+    accounts: list[LiveAccountConfig],
+    env_values: Mapping[str, str],
+) -> set[str]:
+    changed_account_ids: set[str] = set()
+    for account in accounts:
+        if account.broker != "ctrader":
+            continue
+        account_id = account.id
+        signature = _ctrader_credentials_signature(env_values)
+        previous = _CTRADER_ACCOUNT_CREDENTIAL_SIGNATURES.get(account_id)
+        _CTRADER_ACCOUNT_CREDENTIAL_SIGNATURES[account_id] = signature
+        if previous is None or previous == signature:
+            continue
+        changed_account_ids.add(account_id)
+        if account_id in _CTRADER_AUTH_BLOCKED_ACCOUNTS:
+            logger.info(
+                "cTrader account credentials changed; clearing auth block",
+                extra={"data": {"account_id": account_id}},
+            )
+        _CTRADER_AUTH_BLOCKED_ACCOUNTS.discard(account_id)
+        _CTRADER_AUTH_BLOCKED_REASONS.pop(account_id, None)
+    return changed_account_ids
+
+
+def _clear_ctrader_blocked_state(account_id: str) -> None:
+    _CTRADER_AUTH_BLOCKED_ACCOUNTS.discard(account_id)
+    _CTRADER_AUTH_BLOCKED_REASONS.pop(account_id, None)
+
+
+def _block_ctrader_account(account_id: str, exc: BaseException | str) -> None:
+    if not isinstance(exc, CTraderAuthTerminalError) and not _is_terminal_ctrader_runtime_error(exc):
+        return
+    reason = str(exc).strip() or "cTrader authorization failed"
+    _CTRADER_AUTH_BLOCKED_ACCOUNTS.add(account_id)
+    _CTRADER_AUTH_BLOCKED_REASONS[account_id] = reason
 
 
 def _coerce_live_float(
@@ -318,7 +385,7 @@ def _deployment_wait_for_candle_close(
         return _parse_bool_env(str(configured.get("wait_candle_close")), default=False)
     if "wait_for_candle_close" in configured:
         return _parse_bool_env(str(configured.get("wait_for_candle_close")), default=False)
-    return _parse_bool_env(str(env_values.get("DISCORD_WAIT_FOR_CANDLE_CLOSE", "")), default=True)
+    return _parse_bool_env(env_values.get("DISCORD_WAIT_FOR_CANDLE_CLOSE"), default=True)
 
 
 def _deployment_signal_timeframe(deployment: LiveDeploymentConfig) -> str:
@@ -486,6 +553,78 @@ def size_live_signal_for_submission(
     return signal.model_copy(update={"metadata": metadata})
 
 
+def _resolve_exit_only_target_qty(
+    positions: Iterable[Mapping[str, object]],
+    symbol: str,
+) -> float:
+    target_qty = 0.0
+    for position in positions:
+        position_symbol = str(position.get("symbol") or "").strip().upper()
+        if position_symbol != symbol.upper():
+            continue
+        resolved_qty = _coerce_live_float(position.get("qty"), field_name="qty")
+        target_qty = max(resolved_qty, 0.0)
+        break
+    return target_qty
+
+
+async def _metadata_for_exit_only_order(
+    signal: LiveSignal,
+    adapter: BaseLiveAdapter,
+    metadata: dict[str, object],
+) -> dict[str, object]:
+    get_positions = getattr(adapter, "get_positions", None)
+    if not callable(get_positions):
+        raise ValueError("Exit-only signal requires broker adapter with get_positions support")
+    positions = await get_positions()
+    target_qty = _resolve_exit_only_target_qty(positions, signal.symbol)
+    if target_qty <= 0:
+        raise ValueError(
+            f"Exit-only signal received for {signal.symbol} but no long position is open"
+        )
+    metadata["explicit_qty"] = float(target_qty)
+    metadata["risk_sizing_mode"] = "exit_only"
+    return metadata
+
+
+def _count_open_broker_positions(positions: Iterable[Mapping[str, object]]) -> int:
+    open_positions_count = 0
+    for position in positions:
+        try:
+            position_qty = float(position.get("qty") or 0.0)
+        except (TypeError, ValueError):
+            position_qty = 0.0
+        if abs(position_qty) > 0:
+            open_positions_count += 1
+    return open_positions_count
+
+
+async def _broker_exposure_estimate(
+    adapter: BaseLiveAdapter,
+    deployment: LiveDeploymentConfig,
+) -> tuple[int | None, float]:
+    open_positions_count: int | None = None
+    broker_exposure = 0.0
+    get_positions = getattr(adapter, "get_positions", None)
+    if callable(get_positions):
+        positions = await get_positions()
+        open_positions_count = _count_open_broker_positions(positions)
+        # Conservative estimate: each open position was sized at max_risk_per_trade.
+        risk_config = _risk_config_for_deployment(deployment)
+        broker_exposure = open_positions_count * risk_config.max_risk_per_trade
+    return open_positions_count, broker_exposure
+
+
+async def _resolve_account_balance(
+    adapter: BaseLiveAdapter,
+    account_balance: float | None,
+) -> float:
+    if account_balance is None:
+        _, equity = await adapter.get_balance()
+        return float(equity)
+    return account_balance
+
+
 async def submit_order_with_risk(
     adapter: BaseLiveAdapter,
     deployment: LiveDeploymentConfig,
@@ -497,52 +636,15 @@ async def submit_order_with_risk(
 ) -> str:
     metadata = dict(signal.metadata or {})
     if signal.action == "sell" and bool(metadata.get("exit_only")):
-        get_positions = getattr(adapter, "get_positions", None)
-        if not callable(get_positions):
-            raise ValueError("Exit-only signal requires broker adapter with get_positions support")
-        positions = await get_positions()
-        target_qty = 0.0
-        for position in positions:
-            symbol = str(position.get("symbol") or "").strip().upper()
-            if symbol != signal.symbol.upper():
-                continue
-            resolved_qty = _coerce_live_float(
-                position.get("qty"), field_name="qty", minimum=0.0
-            )
-            target_qty = max(resolved_qty, 0.0)
-            break
-        if target_qty <= 0:
-            raise ValueError(
-                f"Exit-only signal received for {signal.symbol} but no long position is open"
-            )
-        metadata["explicit_qty"] = float(target_qty)
-        metadata["risk_sizing_mode"] = "exit_only"
+        metadata = await _metadata_for_exit_only_order(signal, adapter, metadata)
         return await adapter.submit_order(signal.model_copy(update={"metadata": metadata}))
 
     # Feed broker truth into sizing so max_positions / max_total_exposure actually
     # bind. Without this, every signal is sized as if the account were flat.
-    open_positions_count: int | None = None
-    broker_exposure = 0.0
-    get_positions = getattr(adapter, "get_positions", None)
-    if callable(get_positions):
-        positions = await get_positions()
-        open_positions_count = 0
-        for position in positions:
-            try:
-                position_qty = float(position.get("qty") or 0.0)
-            except (TypeError, ValueError):
-                position_qty = 0.0
-            if abs(position_qty) > 0:
-                open_positions_count += 1
-        # Conservative estimate: each open position was sized at max_risk_per_trade.
-        risk_config = _risk_config_for_deployment(deployment)
-        broker_exposure = open_positions_count * risk_config.max_risk_per_trade
-
-    resolved_balance = account_balance
-    if resolved_balance is None:
-        _, equity = await adapter.get_balance()
-        resolved_balance = float(equity)
-
+    open_positions_count, broker_exposure = await _broker_exposure_estimate(
+        adapter, deployment
+    )
+    resolved_balance = await _resolve_account_balance(adapter, account_balance)
     sized_signal = size_live_signal_for_submission(
         signal,
         deployment,
@@ -579,29 +681,27 @@ def _trade_signal_to_live_signal(
     )
 
 
-async def _run_discord_signal_listener_for_account(
+def _active_discord_deployments_for_account(
     account_id: str,
-    adapter: BaseLiveAdapter,
     deployments: list[LiveDeploymentConfig],
-    *,
-    accounts_env_values: Mapping[str, str],
-) -> None:
-    active_discord_deployments = [
+) -> list[LiveDeploymentConfig]:
+    return [
         deployment
         for deployment in deployments
         if deployment.account_id == account_id
         and _normalize_deployment_status(deployment.status) == "ACTIVE"
         and str(deployment.signal_source or "internal").lower() == "discord"
     ]
-    if not active_discord_deployments:
-        logger.info(
-            "No active discord deployments for account; discord listener idle",
-            extra={"data": {"account_id": account_id}},
-        )
-        return
 
+
+def _group_discord_deployments_by_channel(
+    account_id: str,
+    deployments: list[LiveDeploymentConfig],
+    *,
+    accounts_env_values: Mapping[str, str],
+) -> dict[str, list[LiveDeploymentConfig]]:
     channel_to_deployments: dict[str, list[LiveDeploymentConfig]] = {}
-    for deployment in active_discord_deployments:
+    for deployment in deployments:
         configured_channel = str(
             deployment.signal_config.get("channel_id")
             or accounts_env_values.get("DISCORD_CHANNEL_ID", "")
@@ -613,7 +713,174 @@ async def _run_discord_signal_listener_for_account(
             )
             continue
         channel_to_deployments.setdefault(configured_channel, []).append(deployment)
+    return channel_to_deployments
 
+
+def _deployment_service_name(deployment: LiveDeploymentConfig) -> str:
+    config = deployment.signal_config if isinstance(deployment.signal_config, dict) else {}
+    return str(
+        deployment.signal_source_id
+        or _service_config_string(config, "service_name")
+        or ""
+    ).strip()
+
+
+def _resolve_account_discord_token(
+    accounts_env_values: Mapping[str, str],
+    deployment: LiveDeploymentConfig,
+) -> str:
+    service_name = _deployment_service_name(deployment)
+    token_env_key = ""
+    if service_name:
+        canonical_name = re.sub(r"[^A-Z0-9_]+", "_", service_name.upper())
+        token_env_key = f"DISCORD_BOT_{canonical_name}_TOKEN"
+    discord_token = ""
+    if token_env_key:
+        _resolved = str(accounts_env_values.get(token_env_key) or "").strip()
+        if not _resolved:
+            _resolved = str(os.environ.get(token_env_key, "")).strip()
+        if _resolved:
+            discord_token = _resolved
+    if not discord_token:
+        discord_token = str(os.environ.get("DISCORD_BOT_TOKEN", "")).strip()
+    return discord_token
+
+
+def _deployment_covers_discord_symbol(
+    deployment: LiveDeploymentConfig,
+    symbol: str,
+) -> bool:
+    deployment_symbols = {item.upper() for item in deployment.symbols}
+    return not deployment_symbols or symbol.upper() in deployment_symbols
+
+
+async def _submit_normalized_discord_signal(
+    account_id: str,
+    adapter: BaseLiveAdapter,
+    deployment: LiveDeploymentConfig,
+    trade_signal: TradeSignal,
+    *,
+    signal_timeframe: str,
+    wait_enabled: bool,
+) -> None:
+    normalized_signal = TradeSignal(
+        action=trade_signal.action,
+        symbol=trade_signal.symbol,
+        entry_price=trade_signal.entry_price,
+        stop_loss=trade_signal.stop_loss,
+        take_profit=trade_signal.take_profit,
+        timeframe=signal_timeframe,
+        metadata={**trade_signal.metadata, "wait_for_candle_close": wait_enabled},
+    )
+    try:
+        normalized_signal = _apply_signal_processor(normalized_signal, deployment)
+    except ValueError as exc:
+        logger.warning(
+            "Signal processor rejected discord signal",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "deployment_id": str(deployment.id),
+                    "symbol": trade_signal.symbol,
+                    "error": str(exc),
+                }
+            },
+        )
+        return
+    if wait_enabled:
+        await wait_for_candle_close(
+            normalized_signal,
+            normalized_signal.timeframe or signal_timeframe,
+        )
+
+    live_signal = _trade_signal_to_live_signal(normalized_signal, deployment)
+    try:
+        broker_order_id = await submit_order_with_risk(adapter, deployment, live_signal)
+    except Exception as exc:
+        logger.warning(
+            "Discord signal submission failed",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "deployment_id": str(deployment.id),
+                    "symbol": live_signal.symbol,
+                    "error": str(exc),
+                }
+            },
+        )
+        return
+
+    logger.info(
+        "Discord signal submitted",
+        extra={
+            "data": {
+                "account_id": account_id,
+                "deployment_id": str(deployment.id),
+                "signal_id": str(live_signal.id),
+                "broker_order_id": broker_order_id,
+                "symbol": live_signal.symbol,
+                "action": live_signal.action,
+            }
+        },
+    )
+
+
+async def _dispatch_discord_trade_signal(
+    account_id: str,
+    adapter: BaseLiveAdapter,
+    deployments_for_channel: list[LiveDeploymentConfig],
+    trade_signal: TradeSignal,
+    *,
+    accounts_env_values: Mapping[str, str],
+) -> None:
+    for deployment in deployments_for_channel:
+        if not _deployment_matches_stockkit_route(deployment, trade_signal.metadata):
+            continue
+        if not _deployment_covers_discord_symbol(deployment, trade_signal.symbol):
+            continue
+
+        await _submit_normalized_discord_signal(
+            account_id,
+            adapter,
+            deployment,
+            trade_signal,
+            signal_timeframe=_deployment_signal_timeframe(deployment),
+            wait_enabled=_deployment_wait_for_candle_close(deployment, accounts_env_values),
+        )
+        break
+    else:
+        logger.debug(
+            "Skipping discord signal with symbol not covered by deployment",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "channel_id": str(trade_signal.metadata.get("discord_channel_id", "")).strip(),
+                    "symbol": trade_signal.symbol,
+                }
+            },
+        )
+
+
+async def _run_discord_signal_listener_for_account(
+    account_id: str,
+    adapter: BaseLiveAdapter,
+    deployments: list[LiveDeploymentConfig],
+    *,
+    accounts_env_values: Mapping[str, str],
+) -> None:
+    active_discord_deployments = _active_discord_deployments_for_account(account_id, deployments)
+    if not active_discord_deployments:
+        logger.info(
+            "No active discord deployments for account; discord listener idle",
+            extra={"data": {"account_id": account_id}},
+        )
+        return
+
+    channel_to_deployments = _group_discord_deployments_by_channel(
+        account_id,
+        active_discord_deployments,
+        accounts_env_values=accounts_env_values,
+    )
     if not channel_to_deployments:
         logger.warning(
             "No valid discord channels configured for active discord deployments",
@@ -621,10 +888,15 @@ async def _run_discord_signal_listener_for_account(
         )
         return
 
+    # Resolve a real account token (account/user tokens, not a generic bot token).
+    primary_deployment = next(iter(active_discord_deployments))
     source = DiscordSignalSource(
-        token=accounts_env_values.get("DISCORD_BOT_TOKEN", ""),
+        token=_resolve_account_discord_token(
+            accounts_env_values,
+            primary_deployment,
+        ),
         channel_ids=set(channel_to_deployments.keys()),
-        timeframe=_deployment_signal_timeframe(next(iter(active_discord_deployments))),
+        timeframe=_deployment_signal_timeframe(primary_deployment),
     )
     await source.connect()
     try:
@@ -638,93 +910,22 @@ async def _run_discord_signal_listener_for_account(
                 )
                 continue
 
-            for deployment in deployments_for_channel:
-                if not _deployment_matches_stockkit_route(deployment, trade_signal.metadata):
-                    continue
-                deployment_symbols = {item.upper() for item in deployment.symbols}
-                if deployment_symbols and trade_signal.symbol.upper() not in deployment_symbols:
-                    continue
-
-                signal_timeframe = _deployment_signal_timeframe(deployment)
-                wait_enabled = _deployment_wait_for_candle_close(deployment, accounts_env_values)
-                normalized_signal = TradeSignal(
-                    action=trade_signal.action,
-                    symbol=trade_signal.symbol,
-                    entry_price=trade_signal.entry_price,
-                    stop_loss=trade_signal.stop_loss,
-                    take_profit=trade_signal.take_profit,
-                    timeframe=signal_timeframe,
-                    metadata={**trade_signal.metadata, "wait_for_candle_close": wait_enabled},
-                )
-                try:
-                    normalized_signal = _apply_signal_processor(normalized_signal, deployment)
-                except ValueError as exc:
-                    logger.warning(
-                        "Signal processor rejected discord signal",
-                        extra={
-                            "data": {
-                                "account_id": account_id,
-                                "deployment_id": str(deployment.id),
-                                "symbol": trade_signal.symbol,
-                                "error": str(exc),
-                            }
-                        },
-                    )
-                    continue
-                if wait_enabled:
-                    await wait_for_candle_close(
-                        normalized_signal,
-                        normalized_signal.timeframe or signal_timeframe,
-                    )
-
-                live_signal = _trade_signal_to_live_signal(normalized_signal, deployment)
-                try:
-                    broker_order_id = await submit_order_with_risk(adapter, deployment, live_signal)
-                except Exception as exc:
-                    logger.warning(
-                        "Discord signal submission failed",
-                        extra={
-                            "data": {
-                                "account_id": account_id,
-                                "deployment_id": str(deployment.id),
-                                "symbol": live_signal.symbol,
-                                "error": str(exc),
-                            }
-                        },
-                    )
-                    continue
-
-                logger.info(
-                    "Discord signal submitted",
-                    extra={
-                        "data": {
-                            "account_id": account_id,
-                            "deployment_id": str(deployment.id),
-                            "signal_id": str(live_signal.id),
-                            "broker_order_id": broker_order_id,
-                            "symbol": live_signal.symbol,
-                            "action": live_signal.action,
-                        }
-                    },
-                )
-                break
-            else:
-                logger.debug(
-                    "Skipping discord signal with symbol not covered by deployment",
-                    extra={
-                        "data": {
-                            "account_id": account_id,
-                            "channel_id": channel_id,
-                            "symbol": trade_signal.symbol,
-                        }
-                    },
-                )
+            await _dispatch_discord_trade_signal(
+                account_id,
+                adapter,
+                deployments_for_channel,
+                trade_signal,
+                accounts_env_values=accounts_env_values,
+            )
     finally:
         await source.disconnect()
 
 
 def _create_adapter_for_account(
-    account: LiveAccountConfig, *, accounts_env_values: Mapping[str, str] | None = None
+    account: LiveAccountConfig,
+    *,
+    accounts_env_values: Mapping[str, str] | None = None,
+    accounts_env_path: Path | str | None = None,
 ) -> BaseLiveAdapter | None:
     env_values = accounts_env_values or os.environ
     if account.broker == "alpaca":
@@ -762,7 +963,7 @@ def _create_adapter_for_account(
             )
             return None
         app_id, app_secret, access_token, refresh_token, demo = credentials
-        account_identifier = str(account.ctid or account.broker_login or account.id).strip()
+        account_identifier = ctrader_account_identifier(account)
         try:
             return CTraderLiveAdapter(
                 app_id=app_id,
@@ -772,6 +973,8 @@ def _create_adapter_for_account(
                 account_id=account_identifier,
                 demo=demo,
                 account_config_id=account.id,
+                accounts_env_path=accounts_env_path or DEFAULT_ACCOUNTS_ENV,
+                connect_max_attempts=1,
             )
         except Exception as exc:
             logger.warning(
@@ -841,8 +1044,7 @@ async def _disconnect_inactive_adapters(
             account_id=account_id,
             reason="inactive_deployment",
         )
-        _CTRADER_AUTH_BLOCKED_ACCOUNTS.discard(account_id)
-        _CTRADER_AUTH_BLOCKED_REASONS.pop(account_id, None)
+        _clear_ctrader_blocked_state(account_id)
         logger.info(
             "Stopped adapter for inactive account",
             extra={
@@ -1002,6 +1204,175 @@ async def _stop_discord_bot_service(
     _DISCORD_SERVICE_AUTH_BLOCKED_REASONS.pop(service_id, None)
 
 
+def _running_discord_service_ids(discord_services: list[Service]) -> set[str]:
+    return {
+        str(service.id)
+        for service in discord_services
+        if service.status == ServiceStatus.RUNNING
+    }
+
+
+def _prune_stale_discord_service_blocks(
+    discord_services: list[Service],
+    running_service_ids: set[str],
+) -> None:
+    for service_id in list(_DISCORD_SERVICE_AUTH_BLOCKED_IDS):
+        if service_id in running_service_ids:
+            continue
+        _DISCORD_SERVICE_AUTH_BLOCKED_IDS.discard(service_id)
+        _DISCORD_SERVICE_AUTH_BLOCKED_REASONS.pop(service_id, None)
+
+
+async def _stop_inactive_discord_bots(
+    discord_services: list[Service],
+    running_service_ids: set[str],
+    *,
+    active_discord_bots: dict[str, DiscordSignalSource],
+    active_discord_bot_tasks: dict[str, asyncio.Task[None]],
+) -> None:
+    service_by_id = {str(service.id): service for service in discord_services}
+    for service_id in sorted(set(active_discord_bots) - running_service_ids):
+        service = service_by_id.get(service_id)
+        await _stop_discord_bot_service(
+            service_id,
+            active_discord_bots=active_discord_bots,
+            active_discord_bot_tasks=active_discord_bot_tasks,
+            paused=bool(service and service.status == ServiceStatus.PAUSED),
+        )
+
+
+async def _reconnect_discord_bot_source(
+    service: Service,
+    source: DiscordSignalSource,
+    service_id: str,
+    *,
+    running_task: asyncio.Task[None] | None,
+) -> None:
+    if source.is_connected or (running_task is not None and not running_task.done()):
+        return
+    try:
+        await source.reconnect()
+        await asyncio.to_thread(
+            update_service_status,
+            service_id,
+            ServiceStatus.RUNNING,
+            last_activity=datetime.now(timezone.utc),
+        )
+        logger.info(
+            "Reconnected Discord bot %s",
+            service.name,
+        )
+    except Exception as exc:
+        if _is_terminal_discord_runtime_error(exc):
+            _block_discord_service(service_id, exc)
+            logger.warning(
+                "Discord bot auth failed; skipping reconnect until credentials change",
+                extra={
+                    "data": {
+                        "service_id": service_id,
+                        "service_name": service.name,
+                        "error": str(exc),
+                    }
+                },
+            )
+            await asyncio.to_thread(update_service_status, service_id, ServiceStatus.FAILED)
+            return
+        logger.warning(
+            "Discord bot reconnect failed",
+            extra={
+                "data": {
+                    "service_id": service_id,
+                    "service_name": service.name,
+                    "error": str(exc),
+                }
+            },
+        )
+        await asyncio.to_thread(update_service_status, service_id, ServiceStatus.FAILED)
+
+
+async def _ensure_discord_bot_source(
+    service: Service,
+    token: str,
+    channel_id: str,
+    *,
+    active_discord_bots: dict[str, DiscordSignalSource],
+    active_discord_bot_tasks: dict[str, asyncio.Task[None]],
+) -> None:
+    service_id = str(service.id)
+    source = active_discord_bots.get(service_id)
+    expected_channel_ids = {channel_id}
+    if source is None or source.token != token or source.channel_ids != expected_channel_ids:
+        _DISCORD_SERVICE_AUTH_BLOCKED_IDS.discard(service_id)
+        _DISCORD_SERVICE_AUTH_BLOCKED_REASONS.pop(service_id, None)
+        if source is not None:
+            await _stop_discord_bot_service(
+                service_id,
+                active_discord_bots=active_discord_bots,
+                active_discord_bot_tasks=active_discord_bot_tasks,
+            )
+        source = DiscordSignalSource(
+            bot_name=service.name,
+            token=token,
+            channel_id=channel_id,
+            service_id=service_id,
+        )
+        active_discord_bots[service_id] = source
+
+    running_task = active_discord_bot_tasks.get(service_id)
+    if running_task is None or running_task.done():
+        task = asyncio.create_task(
+            _run_discord_bot_service_listener(service, source),
+            name=_service_task_name(service_id),
+        )
+        active_discord_bot_tasks[service_id] = task
+        logger.info("Started Discord bot %s", service.name)
+
+    running_task = active_discord_bot_tasks.get(service_id)
+    await _reconnect_discord_bot_source(
+        service,
+        source,
+        service_id,
+        running_task=running_task,
+    )
+
+
+async def _sync_running_discord_bot(
+    service: Service,
+    *,
+    active_discord_bots: dict[str, DiscordSignalSource],
+    active_discord_bot_tasks: dict[str, asyncio.Task[None]],
+    accounts_env_values: Mapping[str, str],
+) -> None:
+    service_id = str(service.id)
+    token_env_key, token, channel_id = _resolve_discord_bot_runtime(
+        service,
+        accounts_env_values=accounts_env_values,
+    )
+    if not token or not channel_id:
+        logger.warning(
+            "Discord service missing runtime credentials",
+            extra={
+                "data": {
+                    "service_id": service_id,
+                    "service_name": service.name,
+                    "token_env_key": token_env_key,
+                    "has_token": bool(token),
+                    "has_channel_id": bool(channel_id),
+                }
+            },
+        )
+        await asyncio.to_thread(update_service_status, service_id, ServiceStatus.FAILED)
+        return
+
+    await _ensure_discord_bot_source(
+        service,
+        token,
+        channel_id,
+        active_discord_bots=active_discord_bots,
+        active_discord_bot_tasks=active_discord_bot_tasks,
+    )
+
+
 async def _sync_discord_bot_services(
     services: list[Service],
     *,
@@ -1014,122 +1385,27 @@ async def _sync_discord_bot_services(
     discord_services = [
         service for service in services if service.type == ServiceType.DISCORD_BOT
     ]
-    service_by_id = {str(service.id): service for service in discord_services}
-    running_service_ids = {
-        str(service.id)
-        for service in discord_services
-        if service.status == ServiceStatus.RUNNING
-    }
-    for service_id in list(_DISCORD_SERVICE_AUTH_BLOCKED_IDS):
-        if service_id in running_service_ids:
-            continue
-        _DISCORD_SERVICE_AUTH_BLOCKED_IDS.discard(service_id)
-        _DISCORD_SERVICE_AUTH_BLOCKED_REASONS.pop(service_id, None)
+    running_service_ids = _running_discord_service_ids(discord_services)
+    _prune_stale_discord_service_blocks(discord_services, running_service_ids)
 
-    for service_id in sorted(set(active_discord_bots) - running_service_ids):
-        service = service_by_id.get(service_id)
-        await _stop_discord_bot_service(
-            service_id,
-            active_discord_bots=active_discord_bots,
-            active_discord_bot_tasks=active_discord_bot_tasks,
-            paused=bool(service and service.status == ServiceStatus.PAUSED),
-        )
+    await _stop_inactive_discord_bots(
+        discord_services,
+        running_service_ids,
+        active_discord_bots=active_discord_bots,
+        active_discord_bot_tasks=active_discord_bot_tasks,
+    )
 
     for service in discord_services:
-        service_id = str(service.id)
         if service.status != ServiceStatus.RUNNING:
             continue
-        if service_id in _DISCORD_SERVICE_AUTH_BLOCKED_IDS:
+        if str(service.id) in _DISCORD_SERVICE_AUTH_BLOCKED_IDS:
             continue
-        token_env_key, token, channel_id = _resolve_discord_bot_runtime(
+        await _sync_running_discord_bot(
             service,
+            active_discord_bots=active_discord_bots,
+            active_discord_bot_tasks=active_discord_bot_tasks,
             accounts_env_values=accounts_env_values,
         )
-        if not token or not channel_id:
-            logger.warning(
-                "Discord service missing runtime credentials",
-                extra={
-                    "data": {
-                        "service_id": service_id,
-                        "service_name": service.name,
-                        "token_env_key": token_env_key,
-                        "has_token": bool(token),
-                        "has_channel_id": bool(channel_id),
-                    }
-                },
-            )
-            await asyncio.to_thread(update_service_status, service_id, ServiceStatus.FAILED)
-            continue
-
-        source = active_discord_bots.get(service_id)
-        expected_channel_ids = {channel_id}
-        if source is None or source.token != token or source.channel_ids != expected_channel_ids:
-            _DISCORD_SERVICE_AUTH_BLOCKED_IDS.discard(service_id)
-            _DISCORD_SERVICE_AUTH_BLOCKED_REASONS.pop(service_id, None)
-            if source is not None:
-                await _stop_discord_bot_service(
-                    service_id,
-                    active_discord_bots=active_discord_bots,
-                    active_discord_bot_tasks=active_discord_bot_tasks,
-                )
-            source = DiscordSignalSource(
-                bot_name=service.name,
-                token=token,
-                channel_id=channel_id,
-                service_id=service_id,
-            )
-            active_discord_bots[service_id] = source
-
-        running_task = active_discord_bot_tasks.get(service_id)
-        if running_task is None or running_task.done():
-            task = asyncio.create_task(
-                _run_discord_bot_service_listener(service, source),
-                name=_service_task_name(service_id),
-            )
-            active_discord_bot_tasks[service_id] = task
-            logger.info("Started Discord bot %s", service.name)
-
-        running_task = active_discord_bot_tasks.get(service_id)
-        if source.is_connected or (running_task is not None and not running_task.done()):
-            continue
-        try:
-            await source.reconnect()
-            await asyncio.to_thread(
-                update_service_status,
-                service_id,
-                ServiceStatus.RUNNING,
-                last_activity=datetime.now(timezone.utc),
-            )
-            logger.info(
-                "Reconnected Discord bot %s",
-                service.name,
-            )
-        except Exception as exc:
-            if _is_terminal_discord_runtime_error(exc):
-                _block_discord_service(service_id, exc)
-                logger.warning(
-                    "Discord bot auth failed; skipping reconnect until credentials change",
-                    extra={
-                        "data": {
-                            "service_id": service_id,
-                            "service_name": service.name,
-                            "error": str(exc),
-                        }
-                    },
-                )
-                await asyncio.to_thread(update_service_status, service_id, ServiceStatus.FAILED)
-                continue
-            logger.warning(
-                "Discord bot reconnect failed",
-                extra={
-                    "data": {
-                        "service_id": service_id,
-                        "service_name": service.name,
-                        "error": str(exc),
-                    }
-                },
-            )
-            await asyncio.to_thread(update_service_status, service_id, ServiceStatus.FAILED)
 
 
 async def sync_services_loop(
@@ -1179,6 +1455,98 @@ async def sync_services_loop(
         await asyncio.sleep(interval_seconds)
 
 
+def _log_terminal_balance_auth_failure(
+    account_id: str,
+    adapter: BaseLiveAdapter,
+    exc: BaseException,
+) -> None:
+    logger.warning(
+        _ACCOUNT_NOT_AUTHORIZED_LOG,
+        account_id,
+        extra={
+            "data": {
+                "account_id": account_id,
+                "adapter": type(adapter).__name__,
+                "error": str(exc),
+            }
+        },
+    )
+
+
+async def _handle_terminal_balance_error(
+    adapters: dict[str, BaseLiveAdapter],
+    account_id: str,
+    adapter: BaseLiveAdapter,
+    exc: BaseException,
+) -> None:
+    _block_ctrader_account(account_id, exc)
+    adapters.pop(account_id, None)
+    _log_terminal_balance_auth_failure(account_id, adapter, exc)
+    await _disconnect_adapter(
+        adapter,
+        account_id=account_id,
+        reason="terminal_auth_failure",
+    )
+
+
+async def _poll_adapter_balance(
+    adapters: dict[str, BaseLiveAdapter],
+    account_id: str,
+    adapter: BaseLiveAdapter,
+    snapshot_time: datetime,
+) -> None:
+    try:
+        balance, equity = await adapter.get_balance()
+        record = LiveBalanceRecord(
+            account_id=account_id,
+            timestamp=snapshot_time,
+            balance=float(balance),
+            equity=float(equity),
+        )
+        await asyncio.to_thread(save_live_balance, record)
+        logger.debug(
+            "Saved live balance snapshot",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "balance": float(balance),
+                    "equity": float(equity),
+                    "snapshot_time": snapshot_time.isoformat(),
+                }
+            },
+        )
+    except asyncio.CancelledError:
+        raise
+    except CTraderAuthTerminalError as exc:
+        await _handle_terminal_balance_error(adapters, account_id, adapter, exc)
+    except Exception as exc:
+        if _is_ctrader_pending_deferred_error(exc):
+            logger.debug(
+                "Skipping cTrader balance snapshot while request is pending",
+                extra={
+                    "data": {
+                        "account_id": account_id,
+                        "adapter": type(adapter).__name__,
+                        "error": str(exc),
+                    }
+                },
+            )
+            return
+        if _is_terminal_ctrader_runtime_error(exc):
+            await _handle_terminal_balance_error(adapters, account_id, adapter, exc)
+            return
+        logger.warning(
+            "Live balance polling failed",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "adapter": type(adapter).__name__,
+                    "error": str(exc),
+                }
+            },
+        )
+
+
 async def _poll_balances(
     adapters: dict[str, BaseLiveAdapter], *, interval_seconds: int = BALANCE_POLL_INTERVAL_SECONDS
 ) -> None:
@@ -1191,90 +1559,7 @@ async def _poll_balances(
         for account_id, adapter in list(adapters.items()):
             if not _adapter_is_ready(adapter):
                 continue
-            try:
-                balance, equity = await adapter.get_balance()
-                record = LiveBalanceRecord(
-                    account_id=account_id,
-                    timestamp=snapshot_time,
-                    balance=float(balance),
-                    equity=float(equity),
-                )
-                await asyncio.to_thread(save_live_balance, record)
-                logger.debug(
-                    "Saved live balance snapshot",
-                    extra={
-                        "data": {
-                            "account_id": account_id,
-                            "balance": float(balance),
-                            "equity": float(equity),
-                            "snapshot_time": snapshot_time.isoformat(),
-                        }
-                    },
-                )
-            except asyncio.CancelledError:
-                raise
-            except CTraderAuthTerminalError as exc:
-                _block_ctrader_account(account_id, exc)
-                adapters.pop(account_id, None)
-                logger.warning(
-                    "Account %s not authorized for token, skipping",
-                    account_id,
-                    extra={
-                        "data": {
-                            "account_id": account_id,
-                            "adapter": type(adapter).__name__,
-                            "error": str(exc),
-                        }
-                    },
-                )
-                await _disconnect_adapter(
-                    adapter,
-                    account_id=account_id,
-                    reason="terminal_auth_failure",
-                )
-            except Exception as exc:
-                if _is_ctrader_pending_deferred_error(exc):
-                    logger.debug(
-                        "Skipping cTrader balance snapshot while request is pending",
-                        extra={
-                            "data": {
-                                "account_id": account_id,
-                                "adapter": type(adapter).__name__,
-                                "error": str(exc),
-                            }
-                        },
-                    )
-                    continue
-                if _is_terminal_ctrader_runtime_error(exc):
-                    _block_ctrader_account(account_id, exc)
-                    adapters.pop(account_id, None)
-                    logger.warning(
-                        "Account %s not authorized for token, skipping",
-                        account_id,
-                        extra={
-                            "data": {
-                                "account_id": account_id,
-                                "adapter": type(adapter).__name__,
-                                "error": str(exc),
-                            }
-                        },
-                    )
-                    await _disconnect_adapter(
-                        adapter,
-                        account_id=account_id,
-                        reason="terminal_auth_failure",
-                    )
-                    continue
-                logger.warning(
-                    "Live balance polling failed",
-                    extra={
-                        "data": {
-                            "account_id": account_id,
-                            "adapter": type(adapter).__name__,
-                            "error": str(exc),
-                        }
-                    },
-                )
+            await _poll_adapter_balance(adapters, account_id, adapter, snapshot_time)
         await asyncio.sleep(interval_seconds)
 
 
@@ -1511,6 +1796,7 @@ async def _ensure_adapter_for_active_account(
     active_adapters: dict[str, BaseLiveAdapter],
     *,
     accounts_env_values: Mapping[str, str],
+    accounts_env_path: Path | str | None = None,
 ) -> None:
     if account_id in _CTRADER_AUTH_BLOCKED_ACCOUNTS:
         return
@@ -1526,7 +1812,11 @@ async def _ensure_adapter_for_active_account(
                 extra={"data": {"account_id": account_id}},
             )
             return
-        adapter = _create_adapter_for_account(account, accounts_env_values=accounts_env_values)
+        adapter = _create_adapter_for_account(
+            account,
+            accounts_env_values=accounts_env_values,
+            accounts_env_path=accounts_env_path,
+        )
         if adapter is None:
             return
         active_adapters[account_id] = adapter
@@ -1543,7 +1833,7 @@ async def _ensure_adapter_for_active_account(
                 reason="terminal_auth_failure",
             )
             logger.warning(
-                "Account %s not authorized for token, skipping",
+                _ACCOUNT_NOT_AUTHORIZED_LOG,
                 account_id,
                 extra={
                     "data": {
@@ -1572,6 +1862,115 @@ async def _ensure_adapter_for_active_account(
     )
 
 
+async def _connect_active_accounts(
+    account_ids: set[str],
+    account_lookup: dict[str, LiveAccountConfig],
+    active_adapters: dict[str, BaseLiveAdapter],
+    *,
+    accounts_env_values: Mapping[str, str],
+    accounts_env_path: Path | str | None = None,
+) -> None:
+    await asyncio.gather(
+        *(
+            _ensure_adapter_for_active_account(
+                account_id,
+                account_lookup,
+                active_adapters,
+                accounts_env_values=accounts_env_values,
+                accounts_env_path=accounts_env_path,
+            )
+            for account_id in sorted(account_ids)
+        )
+    )
+
+
+async def _rotate_changed_ctrader_adapters(
+    changed_account_ids: set[str],
+    active_adapters: dict[str, BaseLiveAdapter],
+    active_tasks: dict[str, asyncio.Task[None]],
+    active_discord_tasks: dict[str, asyncio.Task[None]],
+) -> None:
+    cancelled_tasks: list[asyncio.Task[None]] = []
+    for account_id in sorted(changed_account_ids):
+        for tasks in (active_tasks, active_discord_tasks):
+            task = tasks.pop(account_id, None)
+            if task is not None and not task.done():
+                task.cancel()
+                cancelled_tasks.append(task)
+
+    if cancelled_tasks:
+        await asyncio.gather(*cancelled_tasks, return_exceptions=True)
+
+    for account_id in sorted(changed_account_ids):
+        adapter = active_adapters.pop(account_id, None)
+        if adapter is None:
+            continue
+        await _disconnect_adapter(
+            adapter,
+            account_id=account_id,
+            reason="credentials_changed",
+        )
+        logger.info(
+            "Rotated cTrader adapter after credential change",
+            extra={"data": {"account_id": account_id}},
+        )
+
+
+def _clear_discord_auth_blocked_accounts() -> None:
+    if _DISCORD_AUTH_BLOCKED_ACCOUNTS:
+        logger.info(
+            "Credentials changed; clearing blocked Discord listener accounts",
+            extra={"data": {"account_ids": sorted(_DISCORD_AUTH_BLOCKED_ACCOUNTS)}},
+        )
+    _DISCORD_AUTH_BLOCKED_ACCOUNTS.clear()
+    _DISCORD_AUTH_BLOCKED_REASONS.clear()
+
+
+def _group_deployments_by_account(
+    deployments: list[LiveDeploymentConfig],
+) -> dict[str, list[LiveDeploymentConfig]]:
+    deployments_by_account: dict[str, list[LiveDeploymentConfig]] = {}
+    for deployment in deployments:
+        deployments_by_account.setdefault(deployment.account_id, []).append(deployment)
+    return deployments_by_account
+
+
+def _deployment_active_account_ids(
+    deployments: list[LiveDeploymentConfig],
+) -> set[str]:
+    return {
+        deployment.account_id
+        for deployment in deployments
+        if _normalize_deployment_status(deployment.status) == "ACTIVE"
+    }
+
+
+def _discord_active_account_ids(
+    deployments: list[LiveDeploymentConfig],
+) -> set[str]:
+    return {
+        deployment.account_id
+        for deployment in deployments
+        if _normalize_deployment_status(deployment.status) == "ACTIVE"
+        and str(deployment.signal_source or "internal").lower() == "discord"
+        and _deployment_has_discord_channel(deployment)
+    }
+
+
+async def _disconnect_blocked_adapters(
+    active_adapters: dict[str, BaseLiveAdapter],
+    blocked_account_ids: Iterable[str],
+) -> None:
+    for blocked_account_id in sorted(blocked_account_ids):
+        adapter = active_adapters.pop(blocked_account_id, None)
+        if adapter is not None:
+            await _disconnect_adapter(
+                adapter,
+                account_id=blocked_account_id,
+                reason="terminal_auth_blocked",
+            )
+
+
 async def sync_deployments_loop(
     active_adapters: dict[str, BaseLiveAdapter],
     active_tasks: dict[str, asyncio.Task[None]],
@@ -1590,34 +1989,30 @@ async def sync_deployments_loop(
             if current_mtime != accounts_env_mtime:
                 accounts_env_values = _load_accounts_env_values(accounts_env)
                 accounts_env_mtime = current_mtime
-                if _CTRADER_AUTH_BLOCKED_ACCOUNTS:
-                    logger.info(
-                        "Credentials changed; clearing blocked cTrader accounts",
-                        extra={"data": {"account_ids": sorted(_CTRADER_AUTH_BLOCKED_ACCOUNTS)}},
-                    )
-                _CTRADER_AUTH_BLOCKED_ACCOUNTS.clear()
-                _CTRADER_AUTH_BLOCKED_REASONS.clear()
-                if _DISCORD_AUTH_BLOCKED_ACCOUNTS:
-                    logger.info(
-                        "Credentials changed; clearing blocked Discord listener accounts",
-                        extra={"data": {"account_ids": sorted(_DISCORD_AUTH_BLOCKED_ACCOUNTS)}},
-                    )
-                _DISCORD_AUTH_BLOCKED_ACCOUNTS.clear()
-                _DISCORD_AUTH_BLOCKED_REASONS.clear()
+                # cTrader blocks are cleared below only for accounts whose
+                # selected credential signature actually changed.
+                _clear_discord_auth_blocked_accounts()
             accounts, deployments = await _load_db_accounts_and_deployments()
-            deployments_by_account: dict[str, list[LiveDeploymentConfig]] = {}
-            for deployment in deployments:
-                deployments_by_account.setdefault(deployment.account_id, []).append(deployment)
+            validate_live_account_routes(accounts)
+            changed_ctrader_account_ids = _refresh_ctrader_blocked_state_for_accounts(
+                accounts, accounts_env_values
+            )
+            await _rotate_changed_ctrader_adapters(
+                changed_ctrader_account_ids,
+                active_adapters,
+                active_tasks,
+                active_discord_tasks,
+            )
+            deployments_by_account = _group_deployments_by_account(deployments)
             account_lookup = {account.id: account for account in accounts}
             _cleanup_finished_listener_tasks(active_tasks)
             _cleanup_finished_discord_tasks(active_discord_tasks)
             _log_deployment_status_observations(deployments, known_deployment_statuses)
 
-            active_account_ids = {
-                deployment.account_id
-                for deployment in deployments
-                if _normalize_deployment_status(deployment.status) == "ACTIVE"
-            }
+            active_account_ids = _deployment_active_account_ids(deployments)
+            await _disconnect_blocked_adapters(
+                active_adapters, active_account_ids & _CTRADER_AUTH_BLOCKED_ACCOUNTS
+            )
             logger.debug(
                 "Evaluating deployment activation state",
                 extra={
@@ -1629,23 +2024,17 @@ async def sync_deployments_loop(
             )
             runnable_account_ids = set(active_account_ids) - _CTRADER_AUTH_BLOCKED_ACCOUNTS
 
-            await _disconnect_inactive_adapters(active_adapters, runnable_account_ids)
+            await _disconnect_inactive_adapters(active_adapters, active_account_ids)
 
-            active_discord_account_ids = {
-                deployment.account_id
-                for deployment in deployments
-                if _normalize_deployment_status(deployment.status) == "ACTIVE"
-                and str(deployment.signal_source or "internal").lower() == "discord"
-                and _deployment_has_discord_channel(deployment)
-            }
+            active_discord_account_ids = _discord_active_account_ids(deployments)
 
-            for account_id in sorted(runnable_account_ids):
-                await _ensure_adapter_for_active_account(
-                    account_id,
-                    account_lookup,
-                    active_adapters,
-                    accounts_env_values=accounts_env_values,
-                )
+            await _connect_active_accounts(
+                runnable_account_ids,
+                account_lookup,
+                active_adapters,
+                accounts_env_values=accounts_env_values,
+                accounts_env_path=accounts_env,
+            )
 
             _cancel_inactive_tasks(active_tasks, runnable_account_ids)
             _start_missing_tasks(active_adapters, active_tasks, runnable_account_ids)

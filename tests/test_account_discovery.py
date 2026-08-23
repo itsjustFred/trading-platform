@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import live_runner.account_discovery as account_discovery
+from shared.models import LiveAccount
 
 
 def test_ctrader_account_name_prefers_resolved_account_label():
@@ -116,3 +118,30 @@ def test_is_ctrader_account_not_authorized_error_detects_phrase():
 def test_is_ctrader_account_not_authorized_error_ignores_other_errors():
     error_text = "RuntimeError('TIMEOUT: endpoint unavailable')"
     assert not account_discovery._is_ctrader_account_not_authorized_error(error_text)
+
+
+def test_discover_configured_accounts_uses_shared_ctrader_credentials(monkeypatch):
+    monkeypatch.setenv("CTRADER_APP_ID", "app")
+    monkeypatch.setenv("CTRADER_APP_SECRET", "secret")
+    monkeypatch.setenv("CTRADER_ACCESS_TOKEN", "token")
+    monkeypatch.setattr(account_discovery, "_iter_alpaca_credentials", lambda _env: [])
+    captured: list[tuple[str, str, str]] = []
+
+    async def _discover(app_id, app_secret, access_token):
+        captured.append((app_id, app_secret, access_token))
+        return [
+            LiveAccount(
+                id="47644617",
+                name="cTrader Demo",
+                broker="ctrader",
+                is_demo=True,
+                ctid="47644617",
+            )
+        ]
+
+    monkeypatch.setattr(account_discovery, "discover_ctrader_accounts", _discover)
+
+    accounts = asyncio.run(account_discovery.discover_configured_accounts())
+
+    assert captured == [("app", "secret", "token")]
+    assert [account.id for account in accounts] == ["47644617"]

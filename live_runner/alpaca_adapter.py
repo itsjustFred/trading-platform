@@ -13,8 +13,12 @@ from uuid import UUID
 from live_runner.base_adapter import BaseLiveAdapter
 from risk.live import size_live_signal
 from shared.database import (
-    list_live_signal_ids_missing_executions,
+    get_live_signal_broker_order_id,
+    get_live_signal_filled_qty,
+    get_live_signal_reconciliation_cursor,
+    list_live_signal_ids_for_reconciliation,
     save_live_execution,
+    save_live_execution_up_to_cumulative,
     save_live_signal,
     set_live_signal_broker_order_id,
 )
@@ -54,31 +58,29 @@ def _to_datetime(value: Any) -> datetime:
     return datetime.now(timezone.utc)
 
 
-def resolve_alpaca_credentials(
-    *,
-    account_id: str = "",
-    broker_login: str | None = None,
-    env: Mapping[str, str] | None = None,
-) -> tuple[str, str, bool] | None:
-    """Resolve Alpaca credentials from env (default or ACC{N} blocks)."""
-    values = dict(env) if env is not None else dict(os.environ)
-
-    default_api_key = str(values.get("ALPACA_API_KEY", "")).strip()
-    default_secret_key = str(values.get("ALPACA_SECRET_KEY", "")).strip()
-    if default_api_key and default_secret_key:
+def _default_alpaca_credentials(values: Mapping[str, str]) -> tuple[str, str, bool] | None:
+    api_key = str(values.get("ALPACA_API_KEY", "")).strip()
+    secret_key = str(values.get("ALPACA_SECRET_KEY", "")).strip()
+    if api_key and secret_key:
         paper = _parse_bool_env(str(values.get("ALPACA_PAPER", "")).strip(), default=True)
-        return default_api_key, default_secret_key, paper
+        return api_key, secret_key, paper
+    return None
 
-    indexes = sorted(
+
+def _alpaca_acc_indexes(values: Mapping[str, str]) -> list[int]:
+    return sorted(
         {
             int(match.group("index"))
             for key in values
             if (match := _ALPACA_ACC_RE.match(str(key)))
         }
     )
-    if not indexes:
-        return None
 
+
+def _alpaca_credential_blocks(
+    values: Mapping[str, str],
+    indexes: list[int],
+) -> list[dict[str, str | bool]]:
     blocks: list[dict[str, str | bool]] = []
     for idx in indexes:
         api_key = str(values.get(f"ALPACA_API_KEY_ACC{idx}", "")).strip()
@@ -103,49 +105,82 @@ def resolve_alpaca_credentials(
                 ),
             }
         )
+    return blocks
 
-    if not blocks:
-        return None
 
-    normalized_account_id = str(account_id or "").strip().lower()
-    normalized_login = str(broker_login or "").strip().lower()
+def _alpaca_block_credentials(block: dict[str, str | bool]) -> tuple[str, str, bool]:
+    return (
+        str(block["api_key"]),
+        str(block["secret_key"]),
+        bool(block["paper"]),
+    )
+
+
+def _matching_alpaca_block(
+    blocks: list[dict[str, str | bool]],
+    normalized_account_id: str,
+    normalized_login: str,
+) -> tuple[str, str, bool] | None:
     for block in blocks:
         account_id_hint = str(block.get("account_id_hint", "")).strip().lower()
         if account_id_hint and account_id_hint == normalized_account_id:
-            return (
-                str(block["api_key"]),
-                str(block["secret_key"]),
-                bool(block["paper"]),
-            )
+            return _alpaca_block_credentials(block)
         login_hint = str(block.get("login_hint", "")).strip().lower()
         if login_hint and normalized_login and login_hint == normalized_login:
-            return (
-                str(block["api_key"]),
-                str(block["secret_key"]),
-                bool(block["paper"]),
-            )
+            return _alpaca_block_credentials(block)
+    return None
 
-    has_configured_hints = any(
+
+def _alpaca_blocks_have_hints(blocks: list[dict[str, str | bool]]) -> bool:
+    return any(
         str(block.get("account_id_hint", "")).strip() or str(block.get("login_hint", "")).strip()
         for block in blocks
     )
-    if (normalized_account_id or normalized_login) and has_configured_hints:
-        logger.warning(
-            "No exact Alpaca credential block match; refusing ambiguous fallback",
-            extra={
-                "data": {
-                    "account_id": account_id,
-                    "broker_login": broker_login,
-                }
-            },
-        )
+
+
+def resolve_alpaca_credentials(
+    *,
+    account_id: str = "",
+    broker_login: str | None = None,
+    env: Mapping[str, str] | None = None,
+) -> tuple[str, str, bool] | None:
+    """Resolve Alpaca credentials from env (default or ACC{N} blocks)."""
+    values = dict(env) if env is not None else dict(os.environ)
+
+    indexes = _alpaca_acc_indexes(values)
+    blocks: list[dict[str, str | bool]] = []
+    if indexes:
+        blocks = _alpaca_credential_blocks(values, indexes)
+
+    normalized_account_id = str(account_id or "").strip().lower()
+    normalized_login = str(broker_login or "").strip().lower()
+    if blocks:
+        matched = _matching_alpaca_block(blocks, normalized_account_id, normalized_login)
+        if matched is not None:
+            return matched
+        if (normalized_account_id or normalized_login) and _alpaca_blocks_have_hints(
+            blocks
+        ):
+            logger.warning(
+                "No exact Alpaca credential block match; refusing ambiguous fallback",
+                extra={
+                    "data": {
+                        "account_id": account_id,
+                        "broker_login": broker_login,
+                    }
+                },
+            )
+            return None
+
+    # Default pair applies only when no hints were given (or no ACC{N} blocks
+    # exist), otherwise every account would silently resolve to it.
+    default_credentials = _default_alpaca_credentials(values)
+    if default_credentials is not None:
+        return default_credentials
+
+    if not blocks:
         return None
-    first = blocks[0]
-    return (
-        str(first["api_key"]),
-        str(first["secret_key"]),
-        bool(first["paper"]),
-    )
+    return _alpaca_block_credentials(blocks[0])
 
 
 class AlpacaLiveAdapter(BaseLiveAdapter):
@@ -205,53 +240,101 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 extra={"data": {"account_id": self.account_id, "error": str(exc)}},
             )
 
+    async def _fetch_reconciliation_page(
+        self,
+        before: tuple[datetime, str] | None,
+        max_signals: int,
+    ) -> list[str]:
+        if before is None:
+            return await asyncio.to_thread(
+                list_live_signal_ids_for_reconciliation,
+                self.account_id,
+                max_signals,
+            )
+        return await asyncio.to_thread(
+            list_live_signal_ids_for_reconciliation,
+            self.account_id,
+            max_signals,
+            before=before,
+        )
+
+    async def _reconcile_signal_fill(self, signal_id: str) -> bool:
+        try:
+            order = await asyncio.to_thread(
+                self._trading_client.get_order_by_client_id, signal_id
+            )
+        except Exception:
+            # Unknown to this account or not found.
+            return False
+        broker_filled_qty = _to_float(
+            getattr(order, "filled_qty", None), default=0.0
+        )
+        local_filled_qty = await asyncio.to_thread(
+            get_live_signal_filled_qty, signal_id
+        )
+        missing_filled_qty = broker_filled_qty - local_filled_qty
+        if missing_filled_qty <= 0:
+            return False
+        broker_order_id = str(getattr(order, "id", ""))
+        execution = LiveExecution(
+            signal_id=UUID(signal_id),
+            actual_price=_to_float(
+                getattr(order, "filled_avg_price", None), default=0.0
+            ),
+            filled_qty=missing_filled_qty,
+            commission=0.0,
+            timestamp=_to_datetime(getattr(order, "filled_at", None)),
+            broker_order_id=broker_order_id,
+            dedupe_key=(
+                f"alpaca:order:{broker_order_id}:reconciled:{broker_filled_qty}"
+            ),
+        )
+        persisted_qty = await asyncio.to_thread(
+            save_live_execution_up_to_cumulative, execution, broker_filled_qty
+        )
+        if persisted_qty <= 0.0:
+            return False
+        logger.info(
+            "Reconciled missed Alpaca fill",
+            extra={
+                "data": {
+                    "signal_id": signal_id,
+                    "broker_order_id": broker_order_id,
+                    "filled_qty": persisted_qty,
+                    "broker_cumulative_filled_qty": broker_filled_qty,
+                    "local_cumulative_filled_qty": local_filled_qty,
+                }
+            },
+        )
+        return True
+
     async def reconcile_executions(self, *, max_signals: int = 200) -> int:
-        """Backfill fills for persisted signals that never received an execution record.
+        """Backfill missing fill quantity for recent signals in this Alpaca account.
 
         Recovers fills that completed while the daemon was down or crashed between
         broker submit and stream-event persistence. Uses the client_order_id == signal.id
-        convention. Only signals with zero recorded executions are considered, so
-        partially-streamed fills are never double-counted.
+        convention. Broker order quantities are cumulative, while local executions are
+        stored as event deltas, so only the positive cumulative difference is persisted.
         """
         if self._trading_client is None:
             return 0
-        signal_ids = await asyncio.to_thread(
-            list_live_signal_ids_missing_executions, max_signals
-        )
         recovered = 0
-        for signal_id in signal_ids:
-            try:
-                order = await asyncio.to_thread(
-                    self._trading_client.get_order_by_client_id, signal_id
-                )
-            except Exception:
-                # Unknown to this account (other broker/account) or not found.
-                continue
-            filled_qty = _to_float(getattr(order, "filled_qty", None), default=0.0)
-            if filled_qty <= 0:
-                continue
-            broker_order_id = str(getattr(order, "id", ""))
-            execution = LiveExecution(
-                signal_id=UUID(signal_id),
-                actual_price=_to_float(getattr(order, "filled_avg_price", None), default=0.0),
-                filled_qty=filled_qty,
-                commission=0.0,
-                timestamp=_to_datetime(getattr(order, "filled_at", None)),
-                broker_order_id=broker_order_id,
-                dedupe_key=f"alpaca:order:{broker_order_id}:reconciled",
+        before: tuple[datetime, str] | None = None
+        while True:
+            signal_ids = await self._fetch_reconciliation_page(before, max_signals)
+            if not signal_ids:
+                break
+            for signal_id in signal_ids:
+                if await self._reconcile_signal_fill(signal_id):
+                    recovered += 1
+            if len(signal_ids) < max_signals:
+                break
+            next_before = await asyncio.to_thread(
+                get_live_signal_reconciliation_cursor, signal_ids[-1]
             )
-            if await asyncio.to_thread(save_live_execution, execution):
-                recovered += 1
-                logger.info(
-                    "Reconciled missed Alpaca fill",
-                    extra={
-                        "data": {
-                            "signal_id": signal_id,
-                            "broker_order_id": broker_order_id,
-                            "filled_qty": filled_qty,
-                        }
-                    },
-                )
+            if next_before is None or next_before == before:
+                break
+            before = next_before
         return recovered
 
     async def disconnect(self) -> None:
@@ -279,9 +362,118 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 extra={"data": {"account_id": self.account_id, "error": str(exc)}},
             )
 
+    def _load_alpaca_order_types(
+        self,
+    ) -> tuple[Any, Any, Any, Any]:
+        try:
+            from alpaca.trading.enums import OrderSide, TimeInForce
+            from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "alpaca-py is required for AlpacaLiveAdapter. Install package 'alpaca-py'."
+            ) from exc
+        return OrderSide, TimeInForce, LimitOrderRequest, MarketOrderRequest
+
+    async def _recover_existing_signal_order(
+        self,
+        trading_client: Any,
+        canonical_signal_id: str,
+    ) -> str:
+        existing_order_id = await asyncio.to_thread(
+            get_live_signal_broker_order_id, canonical_signal_id
+        )
+        if existing_order_id:
+            return existing_order_id
+        try:
+            recovered_order = await asyncio.to_thread(
+                trading_client.get_order_by_client_id,
+                canonical_signal_id,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Alpaca canonical signal already exists and broker recovery failed; "
+                "refusing possible duplicate submission."
+            ) from exc
+        recovered_order_id = str(getattr(recovered_order, "id", "")).strip()
+        if not recovered_order_id:
+            raise RuntimeError(
+                "Alpaca canonical signal already exists without a recoverable broker "
+                "order id; refusing possible duplicate submission."
+            )
+        persisted = await asyncio.to_thread(
+            set_live_signal_broker_order_id,
+            canonical_signal_id,
+            recovered_order_id,
+        )
+        if not persisted:
+            raise RuntimeError("Failed to persist recovered Alpaca broker order id.")
+        logger.info(
+            "Recovered accepted Alpaca order without resubmitting",
+            extra={
+                "data": {
+                    "signal_id": canonical_signal_id,
+                    "broker_order_id": recovered_order_id,
+                }
+            },
+        )
+        return recovered_order_id
+
+    def _build_order_request(
+        self,
+        signal: LiveSignal,
+        *,
+        qty: float,
+        order_side: Any,
+        time_in_force: Any,
+        limit_request_cls: Any,
+        market_request_cls: Any,
+        client_order_id: str,
+    ) -> Any:
+        extended_hours = bool((signal.metadata or {}).get("extended_hours"))
+        limit_price = _to_float((signal.metadata or {}).get("limit_price"), default=0.0)
+        if extended_hours:
+            if limit_price <= 0:
+                raise ValueError(
+                    "Extended-hours orders require a positive 'limit_price' in "
+                    "signal metadata."
+                )
+            return limit_request_cls(
+                symbol=signal.symbol,
+                qty=qty,
+                side=order_side.BUY if signal.action == "buy" else order_side.SELL,
+                time_in_force=time_in_force.DAY,
+                extended_hours=True,
+                limit_price=limit_price,
+                client_order_id=client_order_id,
+            )
+        return market_request_cls(
+            symbol=signal.symbol,
+            qty=qty,
+            side=order_side.BUY if signal.action == "buy" else order_side.SELL,
+            time_in_force=time_in_force.DAY,
+            extended_hours=False,
+            client_order_id=client_order_id,
+        )
+
+    async def _persist_submitted_order_id(
+        self,
+        canonical_signal_id: str,
+        broker_order_id: str,
+    ) -> None:
+        if not broker_order_id:
+            return
+        persisted = await asyncio.to_thread(
+            set_live_signal_broker_order_id, canonical_signal_id, broker_order_id
+        )
+        if not persisted:
+            raise RuntimeError("Failed to persist Alpaca broker order id.")
+
     async def submit_order(self, signal: LiveSignal) -> str:
         if not self._connected or self._trading_client is None:
             await self.connect()
+        trading_client = self._trading_client
+        if trading_client is None:
+            raise RuntimeError("Alpaca trading client is unavailable after connect.")
 
         # Use equity (not cash) for risk sizing so margin accounts with negative cash
         # still pass sizing validation when total account value is positive.
@@ -294,35 +486,36 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 f"(risk_percent={sized_order.risk_percent:.4f})."
             )
 
-        try:
-            from alpaca.trading.enums import OrderSide, TimeInForce
-            from alpaca.trading.requests import MarketOrderRequest
-        except ModuleNotFoundError as exc:
-            raise RuntimeError(
-                "alpaca-py is required for AlpacaLiveAdapter. Install package 'alpaca-py'."
-            ) from exc
+        (
+            order_side,
+            time_in_force,
+            limit_request_cls,
+            market_request_cls,
+        ) = self._load_alpaca_order_types()
 
-        side = OrderSide.BUY if signal.action == "buy" else OrderSide.SELL
-        await asyncio.to_thread(save_live_signal, signal)
-
-        request = MarketOrderRequest(
-            symbol=signal.symbol,
-            qty=qty,
-            side=side,
-            time_in_force=TimeInForce.DAY,
-            client_order_id=str(signal.id),
-        )
-        order = await asyncio.to_thread(self._trading_client.submit_order, order_data=request)
-        broker_order_id = str(getattr(order, "id", ""))
-        if broker_order_id:
-            await asyncio.to_thread(
-                set_live_signal_broker_order_id, str(signal.id), broker_order_id
+        canonical_signal_id, created = await asyncio.to_thread(save_live_signal, signal)
+        if not created:
+            return await self._recover_existing_signal_order(
+                trading_client, canonical_signal_id
             )
+
+        request = self._build_order_request(
+            signal,
+            qty=qty,
+            order_side=order_side,
+            time_in_force=time_in_force,
+            limit_request_cls=limit_request_cls,
+            market_request_cls=market_request_cls,
+            client_order_id=canonical_signal_id,
+        )
+        order = await asyncio.to_thread(trading_client.submit_order, order_data=request)
+        broker_order_id = str(getattr(order, "id", ""))
+        await self._persist_submitted_order_id(canonical_signal_id, broker_order_id)
         logger.info(
             "Submitted Alpaca live order",
             extra={
                 "data": {
-                    "signal_id": str(signal.id),
+                    "signal_id": canonical_signal_id,
                     "broker_order_id": broker_order_id,
                     "symbol": signal.symbol,
                     "action": signal.action,
@@ -358,30 +551,77 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             )
         return payload
 
-    async def _on_trade_update(self, data: Any) -> None:
+    def _parse_trade_update_event(
+        self, data: Any
+    ) -> tuple[str, Any, Any, UUID] | None:
+        event = str(getattr(data, "event", "")).lower()
+        if event not in {"fill", "partial_fill"}:
+            return None
+
+        order = getattr(data, "order", None)
+        if order is None:
+            logger.warning("Trade update without order payload")
+            return None
+
+        client_order_id = getattr(order, "client_order_id", "")
+        if not client_order_id:
+            logger.warning("Trade update missing client_order_id")
+            return None
+
         try:
-            event = str(getattr(data, "event", "")).lower()
-            if event not in {"fill", "partial_fill"}:
-                return
+            signal_uuid = UUID(str(client_order_id))
+        except ValueError:
+            logger.warning(
+                "Trade update client_order_id is not a UUID",
+                extra={"data": {"client_order_id": str(client_order_id)}},
+            )
+            return None
+        return event, order, client_order_id, signal_uuid
 
-            order = getattr(data, "order", None)
-            if order is None:
-                logger.warning("Trade update without order payload")
-                return
-
-            client_order_id = getattr(order, "client_order_id", "")
-            if not client_order_id:
-                logger.warning("Trade update missing client_order_id")
-                return
-
-            try:
-                signal_uuid = UUID(str(client_order_id))
-            except ValueError:
+    def _resolve_trade_update_qty(
+        self,
+        data: Any,
+        order: Any,
+        *,
+        event: str,
+        client_order_id: Any,
+    ) -> tuple[bool, Any]:
+        filled_qty_value = getattr(data, "qty", None)
+        if filled_qty_value is None:
+            filled_qty_value = getattr(data, "filled_qty", None)
+        if filled_qty_value is None:
+            # Per-event quantity. `order.filled_qty` is CUMULATIVE in alpaca-py and
+            # must not be persisted per partial-fill event (double counting).
+            if event == "partial_fill":
                 logger.warning(
-                    "Trade update client_order_id is not a UUID",
+                    "Partial fill without per-event qty; skipping to avoid "
+                    "double-counting cumulative order.filled_qty",
                     extra={"data": {"client_order_id": str(client_order_id)}},
                 )
+                return True, None
+            filled_qty_value = getattr(order, "filled_qty", None)
+        return False, filled_qty_value
+
+    async def _persist_execution_fill(
+        self,
+        execution: LiveExecution,
+        broker_cumulative_filled_qty: float,
+    ) -> float:
+        if broker_cumulative_filled_qty > 0.0:
+            return await asyncio.to_thread(
+                save_live_execution_up_to_cumulative,
+                execution,
+                broker_cumulative_filled_qty,
+            )
+        persisted = await asyncio.to_thread(save_live_execution, execution)
+        return execution.filled_qty if persisted else 0.0
+
+    async def _on_trade_update(self, data: Any) -> None:
+        try:
+            parsed = self._parse_trade_update_event(data)
+            if parsed is None:
                 return
+            event, order, client_order_id, signal_uuid = parsed
 
             fill_price = getattr(data, "fill_price", None)
             if fill_price is None:
@@ -389,20 +629,11 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             if fill_price is None:
                 fill_price = getattr(order, "filled_avg_price", None)
 
-            # Per-event quantity. `order.filled_qty` is CUMULATIVE in alpaca-py and
-            # must not be persisted per partial-fill event (double counting).
-            filled_qty_value = getattr(data, "qty", None)
-            if filled_qty_value is None:
-                filled_qty_value = getattr(data, "filled_qty", None)
-            if filled_qty_value is None:
-                if event == "partial_fill":
-                    logger.warning(
-                        "Partial fill without per-event qty; skipping to avoid "
-                        "double-counting cumulative order.filled_qty",
-                        extra={"data": {"client_order_id": str(client_order_id)}},
-                    )
-                    return
-                filled_qty_value = getattr(order, "filled_qty", None)
+            skip, filled_qty_value = self._resolve_trade_update_qty(
+                data, order, event=event, client_order_id=client_order_id
+            )
+            if skip:
+                return
 
             commission_value = getattr(data, "commission", None)
             if commission_value is None:
@@ -432,9 +663,18 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 broker_order_id=broker_order_id,
                 dedupe_key=dedupe_key,
             )
-            await asyncio.to_thread(save_live_execution, execution)
+            broker_cumulative_filled_qty = _to_float(
+                getattr(order, "filled_qty", None), default=0.0
+            )
+            persisted_qty = await self._persist_execution_fill(
+                execution, broker_cumulative_filled_qty
+            )
             logger.info(
-                "Persisted Alpaca execution fill",
+                (
+                    "Persisted Alpaca execution fill"
+                    if persisted_qty > 0.0
+                    else "Skipped duplicate Alpaca execution fill"
+                ),
                 extra={
                     "data": {
                         "signal_id": str(execution.signal_id),
@@ -442,6 +682,8 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                         "event": event,
                         "actual_price": actual_price,
                         "filled_qty": filled_qty,
+                        "persisted_qty": persisted_qty,
+                        "broker_cumulative_filled_qty": broker_cumulative_filled_qty,
                         "broker_order_id": broker_order_id,
                     }
                 }

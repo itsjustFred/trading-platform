@@ -28,6 +28,27 @@ def test_discord_parser_parses_ramjet_oversold_buy() -> None:
     assert signal.metadata["discord_channel_id"] == "123"
 
 
+def test_discord_parser_prefers_symbol_after_action_over_ramjet_label() -> None:
+    signal = _parse_trade_signal_from_message(
+        _message("RAM JET BUY AAPL @ 190.50"),
+        default_timeframe="1h",
+    )
+
+    assert signal is not None
+    assert signal.symbol == "AAPL"
+    assert signal.action == "buy"
+    assert signal.entry_price == 190.5
+
+
+def test_discord_parser_does_not_treat_lowercase_word_after_action_as_symbol() -> None:
+    signal = _parse_trade_signal_from_message(
+        _message("RAM JET buy at market @ 190.50"),
+        default_timeframe="1h",
+    )
+
+    assert signal is None or signal.symbol != "AT"
+
+
 def test_discord_parser_parses_rocketfuel_momentum_reversal_sell() -> None:
     signal = _parse_trade_signal_from_message(
         _message("Rocket Fuel momentum reversal for **$TSLA** @ 180.25"),
