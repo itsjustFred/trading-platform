@@ -75,3 +75,6 @@ frontend/public/matrix-grid-overview.json
 # Live smoke integration report (generated at repo root, contains account
 # ids/balances - never commit)
 live_integration_report.json
+
+# Command Code local state
+.commandcode/
