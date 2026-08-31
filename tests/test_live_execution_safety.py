@@ -230,13 +230,24 @@ def test_submit_order_with_risk_sizes_normally_when_flat():
     assert adapter.submitted_signal.metadata["qty"] == pytest.approx(200.0)
 
 
-def test_submit_order_with_risk_fails_closed_without_stop_loss():
+def test_submit_order_with_risk_fails_closed_without_resolved_stop(monkeypatch):
     """A position sized against a computed stop must not open naked at the broker.
 
-    Sizing divides the risk budget by the stop distance. Without a stop the order
-    is either rejected by the risk engine or sized on an invented distance; either
-    way the broker order must be refused instead of submitted without SL/TP.
+    The risk engine resolves a fallback stop (ATR/percent) when the signal carries
+    none. The fail-closed guard fires when sizing produced no resolvable stop/TP —
+    simulated here by a sizing regression — so a future contract change cannot
+    silently reopen unbounded positions.
     """
+    import live_runner.daemon as daemon_module
+
+    def _sizing_without_stop(signal, deployment, **_kwargs):
+        return signal.model_copy(
+            update={"metadata": {**signal.metadata, "qty": 1.0, "explicit_qty": 1.0}}
+        )
+
+    monkeypatch.setattr(
+        daemon_module, "size_live_signal_for_submission", _sizing_without_stop
+    )
     from live_runner.daemon import submit_order_with_risk
 
     deployment = _deployment()
@@ -254,6 +265,31 @@ def test_submit_order_with_risk_fails_closed_without_stop_loss():
         asyncio.run(submit_order_with_risk(adapter, deployment, signal))
 
     assert adapter.submitted_signal is None
+
+
+def test_submit_order_with_risk_resolves_stop_for_stopless_signals():
+    """A stopless signal is sized on the engine's fallback stop and the broker
+    order carries that resolved stop plus a 1:1 take profit."""
+    from live_runner.daemon import submit_order_with_risk
+
+    deployment = _deployment()
+    adapter = _PositionsAdapter(positions=[])
+    signal = LiveSignal(
+        deployment_id=str(deployment.id),
+        symbol="EURUSD",
+        action="buy",
+        theoretical_price=100.0,
+        timestamp=datetime.now(timezone.utc),
+        metadata={},
+    )
+
+    asyncio.run(submit_order_with_risk(adapter, deployment, signal, pip_value=1.0))
+
+    assert adapter.submitted_signal is not None
+    metadata = adapter.submitted_signal.metadata
+    assert metadata["qty"] == pytest.approx(500.0)  # 10 / (2 * 1) on 1% of 100k
+    assert metadata["stop_loss"] == pytest.approx(98.0)
+    assert metadata["take_profit"] == pytest.approx(102.0)
 
 
 def test_submit_order_with_risk_forwards_sl_tp_to_broker_metadata():
@@ -2538,3 +2574,31 @@ def test_exit_only_orders_still_bypass_sizing_but_close_exact_position():
     assert adapter.submitted_signal is not None
     assert adapter.submitted_signal.metadata["explicit_qty"] == pytest.approx(3.0)
     assert adapter.submitted_signal.metadata["risk_sizing_mode"] == "exit_only"
+
+
+def test_submit_order_with_risk_resolves_fallback_sl_tp_into_metadata():
+    """A signal without explicit SL/TP gets the risk engine's resolved stop and a
+    TP derived from the engine's risk-reward geometry, so the broker always
+    receives bounded prices."""
+    from live_runner.daemon import submit_order_with_risk
+
+    deployment = _deployment()
+    adapter = _PositionsAdapter(positions=[])
+    signal = LiveSignal(
+        deployment_id=str(deployment.id),
+        symbol="AAPL",
+        action="buy",
+        theoretical_price=100.0,
+        timestamp=datetime.now(timezone.utc),
+        metadata={},
+    )
+
+    asyncio.run(submit_order_with_risk(adapter, deployment, signal, pip_value=1.0))
+
+    assert adapter.submitted_signal is not None
+    metadata = adapter.submitted_signal.metadata
+    stop_loss = float(metadata["stop_loss"])
+    take_profit = float(metadata["take_profit"])
+    assert stop_loss == pytest.approx(98.0)  # fallback: entry * (1 - 0.02)
+    # risk_reward_ratio of the fallback geometry is 1.0 -> TP mirrors the stop distance
+    assert take_profit == pytest.approx(102.0)

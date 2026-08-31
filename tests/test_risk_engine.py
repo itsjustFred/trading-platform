@@ -259,7 +259,7 @@ def test_submit_order_with_risk_applies_qty_before_submit():
         action="buy",
         theoretical_price=100.0,
         timestamp=datetime.now(timezone.utc),
-        metadata={"stop_loss": 95.0},
+        metadata={"stop_loss": 95.0, "take_profit": 110.0},
     )
 
     order_id = asyncio.run(submit_order_with_risk(adapter, deployment, signal))

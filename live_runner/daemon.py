@@ -644,29 +644,6 @@ async def submit_order_with_risk(
         return await adapter.submit_order(
             signal.model_copy(update={"metadata": metadata})
         )
-    # Fail closed: sizing divides the risk budget by the stop distance, so an
-    # order without a stop is either rejected by the risk engine or sized on
-    # an invented distance. Never open a broker position without SL/TP.
-    stop_loss = _first_metadata_float(
-        metadata, ("stop_loss", "sl_price", "stop_price", "resolved_stop_loss")
-    )
-    take_profit = _first_metadata_float(metadata, ("take_profit", "tp_price"))
-    missing: list[str] = []
-    if stop_loss is None:
-        missing.append("stop loss")
-    if take_profit is None:
-        missing.append("take profit")
-    if missing:
-        raise ValueError(
-            "Refusing to submit live order without "
-            f"{' and '.join(missing)} (deployment_id={deployment.id}, "
-            f"symbol={signal.symbol}); opening an unbounded position is "
-            "not allowed."
-        )
-    metadata["stop_loss"] = float(stop_loss)
-    metadata["take_profit"] = float(take_profit)
-    signal = signal.model_copy(update={"metadata": metadata})
-
     # Feed broker truth into sizing so max_positions / max_total_exposure actually
     # bind. Without this, every signal is sized as if the account were flat.
     open_positions_count, broker_exposure = await _broker_exposure_estimate(
@@ -681,6 +658,48 @@ async def submit_order_with_risk(
         pip_value=pip_value,
         current_positions=open_positions_count,
     )
+    # Sizing may have resolved a fallback stop (ATR/percent). Persist that
+    # resolution so the broker order carries the stop sizing actually assumed,
+    # and derive the take profit from the same geometry (1:1 risk-reward) so a
+    # signal without an explicit TP still opens a bounded bracket at the broker.
+    sized_metadata = dict(sized_signal.metadata or {})
+    if "resolved_stop_loss" in sized_metadata:
+        metadata["stop_loss"] = float(sized_metadata["resolved_stop_loss"])
+    stop_loss = _first_metadata_float(
+        metadata, ("stop_loss", "sl_price", "stop_price", "resolved_stop_loss")
+    )
+    take_profit = _first_metadata_float(metadata, ("take_profit", "tp_price"))
+    if take_profit is None and stop_loss is not None:
+        risk_distance = abs(float(signal.theoretical_price) - float(stop_loss))
+        reward_distance = risk_distance * (
+            float(sized_metadata.get("risk_reward_ratio") or 1.0)
+        )
+        take_profit = (
+            float(signal.theoretical_price) + reward_distance
+            if signal.action == "buy"
+            else float(signal.theoretical_price) - reward_distance
+        )
+    # Fail closed: sizing divides the risk budget by the stop distance, so an
+    # order without SL/TP would be sized on an invented distance and open an
+    # unbounded position. Both broker adapters enforce the same guard.
+    missing: list[str] = []
+    if stop_loss is None:
+        missing.append("stop loss")
+    if take_profit is None:
+        missing.append("take profit")
+    if missing:
+        raise ValueError(
+            "Refusing to submit live order without "
+            f"{' and '.join(missing)} (deployment_id={deployment.id}, "
+            f"symbol={signal.symbol}); opening an unbounded position is "
+            "not allowed."
+        )
+    metadata["stop_loss"] = float(stop_loss)
+    metadata["take_profit"] = float(take_profit)
+    # Merge onto the SIZED metadata (qty/explicit_qty/risk_*) — not the original —
+    # so the risk sizing result survives into the broker submission.
+    final_metadata = {**sized_metadata, **metadata}
+    sized_signal = sized_signal.model_copy(update={"metadata": final_metadata})
     return await adapter.submit_order(sized_signal)
 
 
