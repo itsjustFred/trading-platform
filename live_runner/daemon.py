@@ -32,6 +32,7 @@ from risk import RiskConfig, RiskEngine, TradeSignal
 from scheduler.scheduler import ServiceScheduler
 from shared.database import (
     create_service,
+    get_live_deployment,
     list_live_accounts,
     list_live_deployments,
     list_services,
@@ -636,8 +637,35 @@ async def submit_order_with_risk(
 ) -> str:
     metadata = dict(signal.metadata or {})
     if signal.action == "sell" and bool(metadata.get("exit_only")):
+        # Exit-only orders close an existing position at the broker-observed
+        # quantity. They bypass risk sizing and the entry fail-closed SL/TP
+        # guard: they reduce exposure instead of opening a new position.
         metadata = await _metadata_for_exit_only_order(signal, adapter, metadata)
-        return await adapter.submit_order(signal.model_copy(update={"metadata": metadata}))
+        return await adapter.submit_order(
+            signal.model_copy(update={"metadata": metadata})
+        )
+    # Fail closed: sizing divides the risk budget by the stop distance, so an
+    # order without a stop is either rejected by the risk engine or sized on
+    # an invented distance. Never open a broker position without SL/TP.
+    stop_loss = _first_metadata_float(
+        metadata, ("stop_loss", "sl_price", "stop_price", "resolved_stop_loss")
+    )
+    take_profit = _first_metadata_float(metadata, ("take_profit", "tp_price"))
+    missing: list[str] = []
+    if stop_loss is None:
+        missing.append("stop loss")
+    if take_profit is None:
+        missing.append("take profit")
+    if missing:
+        raise ValueError(
+            "Refusing to submit live order without "
+            f"{' and '.join(missing)} (deployment_id={deployment.id}, "
+            f"symbol={signal.symbol}); opening an unbounded position is "
+            "not allowed."
+        )
+    metadata["stop_loss"] = float(stop_loss)
+    metadata["take_profit"] = float(take_profit)
+    signal = signal.model_copy(update={"metadata": metadata})
 
     # Feed broker truth into sizing so max_positions / max_total_exposure actually
     # bind. Without this, every signal is sized as if the account were flat.
@@ -692,6 +720,58 @@ def _active_discord_deployments_for_account(
         and _normalize_deployment_status(deployment.status) == "ACTIVE"
         and str(deployment.signal_source or "internal").lower() == "discord"
     ]
+
+
+def _deployment_is_currently_active(deployment: LiveDeploymentConfig) -> bool:
+    """Re-check deployment status against the DB right before submitting.
+
+    The listener holds a snapshot taken when the sync loop last ran. If an
+    operator pauses or stops one deployment on an account whose other Discord
+    deployments stay active, the stale snapshot would keep the paused
+    deployment trading until the next poll. The DB read here is the
+    authority at the moment an order is actually dispatched.
+    """
+    try:
+        current = get_live_deployment(str(deployment.id))
+    except Exception as exc:
+        logger.warning(
+            "Deployment status recheck failed; refusing to trade from stale snapshot",
+            extra={
+                "data": {
+                    "deployment_id": str(deployment.id),
+                    "account_id": deployment.account_id,
+                    "snapshot_status": deployment.status,
+                    "error": str(exc),
+                }
+            },
+        )
+        return False
+    if current is None:
+        logger.info(
+            "Deployment removed from DB; refusing to trade from stale snapshot",
+            extra={
+                "data": {
+                    "deployment_id": str(deployment.id),
+                    "account_id": deployment.account_id,
+                    "snapshot_status": deployment.status,
+                }
+            },
+        )
+        return False
+    if _normalize_deployment_status(current.status) != "ACTIVE":
+        logger.info(
+            "Deployment is not ACTIVE; refusing to trade from stale snapshot",
+            extra={
+                "data": {
+                    "deployment_id": str(deployment.id),
+                    "account_id": deployment.account_id,
+                    "snapshot_status": deployment.status,
+                    "current_status": current.status,
+                }
+            },
+        )
+        return False
+    return True
 
 
 def _group_discord_deployments_by_channel(
@@ -834,6 +914,8 @@ async def _dispatch_discord_trade_signal(
     accounts_env_values: Mapping[str, str],
 ) -> None:
     for deployment in deployments_for_channel:
+        if not _deployment_is_currently_active(deployment):
+            continue
         if not _deployment_matches_stockkit_route(deployment, trade_signal.metadata):
             continue
         if not _deployment_covers_discord_symbol(deployment, trade_signal.symbol):

@@ -10,6 +10,9 @@ from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
+from alpaca.trading.enums import OrderClass
+from alpaca.trading.requests import StopLossRequest, TakeProfitRequest
+
 from live_runner.base_adapter import BaseLiveAdapter
 from risk.live import size_live_signal
 from shared.database import (
@@ -29,6 +32,9 @@ logger = get_logger("live-runner")
 
 _ALPACA_ACC_RE = re.compile(r"^ALPACA_API_KEY_ACC(?P<index>\d+)$")
 
+_SL_METADATA_KEYS = ("stop_loss", "sl_price", "stop_price", "resolved_stop_loss")
+_TP_METADATA_KEYS = ("take_profit", "tp_price")
+
 
 def _parse_bool_env(value: str | None, default: bool = True) -> bool:
     if value is None:
@@ -45,6 +51,21 @@ def _to_float(value: Any, *, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _resolve_optional_float(metadata: Mapping[str, Any], keys: tuple[str, ...]) -> float | None:
+    """Return the first parseable positive-precision float from metadata keys."""
+    for key in keys:
+        if key not in metadata:
+            continue
+        value = metadata.get(key)
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
 
 
 def _to_datetime(value: Any) -> datetime:
@@ -418,6 +439,34 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         )
         return recovered_order_id
 
+    def _resolve_broker_sl_tp(self, signal: LiveSignal) -> tuple[float, float]:
+        """Resolve absolute SL/TP prices from signal metadata.
+
+        Fail closed: sizing divided the risk budget by the stop distance, so an
+        order without SL/TP would open an unbounded position.
+        """
+        metadata = signal.metadata or {}
+        stop_loss = _resolve_optional_float(metadata, _SL_METADATA_KEYS)
+        take_profit = _resolve_optional_float(metadata, _TP_METADATA_KEYS)
+        missing = [
+            name
+            for name, value in (("stop_loss", stop_loss), ("take_profit", take_profit))
+            if value is None
+        ]
+        if missing:
+            raise ValueError(
+                "Refusing to submit Alpaca order without "
+                f"{' and '.join(missing)} (signal_id={signal.id}, "
+                f"symbol={signal.symbol}); opening an unbounded position is not allowed."
+            )
+        for name, value in (("stop_loss", stop_loss), ("take_profit", take_profit)):
+            if value <= 0 or value in (float("inf"), float("-inf")):
+                raise ValueError(
+                    f"Invalid {name} price for {signal.symbol}: {value!r}; "
+                    "refusing to submit."
+                )
+        return float(stop_loss), float(take_profit)
+
     def _build_order_request(
         self,
         signal: LiveSignal,
@@ -429,8 +478,25 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         market_request_cls: Any,
         client_order_id: str,
     ) -> Any:
+        if signal.action not in {"buy", "sell"}:
+            # Fail closed: an unmapped action must never fall through to SELL.
+            raise ValueError(f"Unsupported signal action: {signal.action}")
+        stop_loss_price, take_profit_price = self._resolve_broker_sl_tp(signal)
         extended_hours = bool((signal.metadata or {}).get("extended_hours"))
         limit_price = _to_float((signal.metadata or {}).get("limit_price"), default=0.0)
+        if signal.action == "buy":
+            side = order_side.BUY
+        else:
+            side = order_side.SELL
+        base_kwargs: dict[str, Any] = {
+            "symbol": signal.symbol,
+            "qty": qty,
+            "side": side,
+            "client_order_id": client_order_id,
+            "order_class": OrderClass.BRACKET,
+            "take_profit": TakeProfitRequest(limit_price=take_profit_price),
+            "stop_loss": StopLossRequest(stop_price=stop_loss_price),
+        }
         if extended_hours:
             if limit_price <= 0:
                 raise ValueError(
@@ -438,21 +504,15 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                     "signal metadata."
                 )
             return limit_request_cls(
-                symbol=signal.symbol,
-                qty=qty,
-                side=order_side.BUY if signal.action == "buy" else order_side.SELL,
                 time_in_force=time_in_force.DAY,
                 extended_hours=True,
                 limit_price=limit_price,
-                client_order_id=client_order_id,
+                **base_kwargs,
             )
         return market_request_cls(
-            symbol=signal.symbol,
-            qty=qty,
-            side=order_side.BUY if signal.action == "buy" else order_side.SELL,
             time_in_force=time_in_force.DAY,
             extended_hours=False,
-            client_order_id=client_order_id,
+            **base_kwargs,
         )
 
     async def _persist_submitted_order_id(

@@ -5,6 +5,7 @@ import fcntl
 import os
 import tempfile
 import time
+from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -81,6 +82,22 @@ def _to_float(value: Any, *, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _first_metadata_float(
+    metadata: Mapping[str, Any], keys: tuple[str, ...]
+) -> float | None:
+    for key in keys:
+        if key not in metadata:
+            continue
+        value = metadata.get(key)
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
 
 
 _NOT_AUTHORIZED_MARKER = "not authorized"
@@ -1435,6 +1452,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         return symbol_id
 
     def _build_new_order_request(self, signal: LiveSignal, *, symbol_id: int) -> Any:
+        if signal.action not in {"buy", "sell"}:
+            # Fail closed: an unmapped action must never fall through to SELL.
+            raise ValueError(f"Unsupported signal action: {signal.action}")
         request = self._ProtoOANewOrderReq()
         request.ctidTraderAccountId = self.ctid_trader_account_id
         request.symbolId = int(symbol_id)
@@ -1445,7 +1465,36 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         request.volume = self._resolve_order_volume(signal)
         request.timeInForce = self._ProtoOATimeInForce.IMMEDIATE_OR_CANCEL
         request.clientOrderId = str(signal.id)
+        metadata = signal.metadata or {}
+        stop_loss = _first_metadata_float(
+            metadata, ("stop_loss", "sl_price", "stop_price", "resolved_stop_loss")
+        )
+        take_profit = _first_metadata_float(metadata, ("take_profit", "tp_price"))
+        if stop_loss is None or take_profit is None:
+            # Fail closed: never open a position naked; sizing assumed a stop.
+            missing = [
+                name
+                for name, value in (("stop_loss", stop_loss), ("take_profit", take_profit))
+                if value is None
+            ]
+            raise ValueError(
+                "Refusing to submit cTrader order without "
+                f"{' and '.join(missing)} (signal_id={signal.id}, "
+                f"symbol={signal.symbol}); opening an unbounded position is not allowed."
+            )
+        request.stopLoss = self._to_broker_price(signal.symbol, stop_loss)
+        request.takeProfit = self._to_broker_price(signal.symbol, take_profit)
         return request
+
+    def _to_broker_price(self, symbol: str, price: float) -> float:
+        """cTrader expects absolute prices; digits conversion is handled by the
+        server for absolute SL/TP on NewOrderReq. Keep the price as provided but
+        validate it is finite and positive."""
+        if not price > 0 or price != price or price in (float("inf"), float("-inf")):
+            raise ValueError(
+                f"Invalid SL/TP price for {symbol}: {price!r}; refusing to submit."
+            )
+        return float(price)
 
     async def _submit_new_order_request(self, request: Any) -> Any:
         try:
