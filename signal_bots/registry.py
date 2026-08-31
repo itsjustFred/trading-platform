@@ -1,3 +1,12 @@
+"""Signal processor registry.
+
+Each signal bot/strategy owns its processor factory and config file. There are
+no cross-bot aliases: StockKit is the Discord source/server these bots trade
+on, not a processor, so it is deliberately absent from this registry.
+
+Adding a bot means adding one option entry, one factory and one config path —
+all explicit, all derived from code, never from a user-supplied string.
+"""
 from __future__ import annotations
 
 from pathlib import Path
@@ -23,48 +32,76 @@ def _load_yaml(path: Path) -> dict[str, Any]:
     return payload
 
 
+def _build_from_config(
+    config_path: Path,
+    factory: Callable[[dict[str, Any]], object],
+    config: dict[str, Any],
+) -> object:
+    """Merge the bot's own config file with caller overrides and build it.
+
+    `config` is caller-controlled data used as *values* only; it never selects
+    a file path, module or factory. Overrides apply at the top level and — when
+    the file nests settings under a single bot section (e.g. ``ram_jet:``) —
+    inside that section, so per-bot tuning always wins over file defaults.
+    """
+    payload = _load_yaml(config_path)
+    merged = dict(payload)
+    overrides = dict(config or {})
+    merged.update(overrides)
+    sections = [key for key, value in payload.items() if isinstance(value, dict)]
+    if len(sections) == 1:
+        section = dict(payload[sections[0]])
+        section.update(overrides)
+        merged[sections[0]] = section
+    return factory(merged)
+
+
+def _ramjet_config_path() -> Path:
+    return _ROOT / "ramjet" / "config.yaml"
+
+
+def _rocketfuel_config_path() -> Path:
+    return _ROOT / "rocketfuel" / "config.yaml"
+
+
+def _nitro_config_path() -> Path:
+    return _ROOT / "nitro" / "config.yaml"
+
+
 def _build_ramjet(config: dict[str, Any]) -> RamJetSignalProcessor:
-    merged = dict(_load_yaml(_ROOT / "ramjet" / "config.yaml"))
-    merged.update(dict(config or {}))
-    return RamJetSignalProcessor(merged)
+    return _build_from_config(_ramjet_config_path(), RamJetSignalProcessor, config)
 
 
 def _build_nitro(config: dict[str, Any]) -> NitroSignalProcessor:
-    merged = dict(_load_yaml(_ROOT / "ramjet" / "config.yaml"))
-    merged.update(dict(config or {}))
-    return NitroSignalProcessor(merged)
+    return _build_from_config(_nitro_config_path(), NitroSignalProcessor, config)
+
+
+def _build_rocketfuel(variant: str, config: dict[str, Any]) -> RocketFuelSignalProcessor:
+    def _factory(merged: dict[str, Any]) -> RocketFuelSignalProcessor:
+        if isinstance(merged.get("rocket_fuel"), dict):
+            rocket_fuel = dict(merged["rocket_fuel"])
+        else:
+            rocket_fuel = {
+                key: value
+                for key, value in merged.items()
+                if key in {"atr_period", "sl_multiplier", "candle_timeframe", "variant"}
+            }
+        rocket_fuel["variant"] = variant
+        merged["rocket_fuel"] = rocket_fuel
+        return RocketFuelSignalProcessor(merged)
+
+    return _build_from_config(_rocketfuel_config_path(), _factory, config)
 
 
 def _build_rocketfuel_longsonly(config: dict[str, Any]) -> RocketFuelSignalProcessor:
-    merged = dict(_load_yaml(_ROOT / "rocketfuel" / "config.yaml"))
-    merged.update(dict(config or {}))
-    if isinstance(merged.get("rocket_fuel"), dict):
-        rocket_fuel = dict(merged["rocket_fuel"])
-        rocket_fuel["variant"] = "longsonly"
-        merged["rocket_fuel"] = rocket_fuel
-    else:
-        merged["variant"] = "longsonly"
-    return RocketFuelSignalProcessor(merged)
+    return _build_rocketfuel("longsonly", config)
 
 
 def _build_rocketfuel_longandshort(config: dict[str, Any]) -> RocketFuelSignalProcessor:
-    merged = dict(_load_yaml(_ROOT / "rocketfuel" / "config.yaml"))
-    merged.update(dict(config or {}))
-    if isinstance(merged.get("rocket_fuel"), dict):
-        rocket_fuel = dict(merged["rocket_fuel"])
-        rocket_fuel["variant"] = "longandshort"
-        merged["rocket_fuel"] = rocket_fuel
-    else:
-        merged["variant"] = "longandshort"
-    return RocketFuelSignalProcessor(merged)
+    return _build_rocketfuel("longandshort", config)
 
 
 SIGNAL_PROCESSOR_OPTIONS: list[dict[str, str]] = [
-    {
-        "id": "stockkit",
-        "label": "StockKit",
-        "description": "StockKit-compatible processor (SL/TP + trailing metadata).",
-    },
     {
         "id": "ramjet",
         "label": "RamJet",
@@ -89,13 +126,30 @@ SIGNAL_PROCESSOR_OPTIONS: list[dict[str, str]] = [
 
 
 SIGNAL_PROCESSORS: dict[str, SignalProcessorFactory] = {
-    "stockkit": _build_ramjet,
     "ramjet": _build_ramjet,
+    # "rocketfuel" is the RocketFuel Discord-bot id (live_deployments.yaml); it
+    # maps to the long-only variant explicitly, not via an undocumented alias.
     "rocketfuel": _build_rocketfuel_longsonly,
     "rocketfuel_longsonly": _build_rocketfuel_longsonly,
     "rocketfuel_longandshort": _build_rocketfuel_longandshort,
     "nitro": _build_nitro,
 }
+
+
+def get_signal_processor_config_path(name: str) -> Path:
+    """Return the config file that backs a registered processor id.
+
+    Derived from code, not from the requested string: an unknown id raises
+    instead of producing a filesystem path.
+    """
+    normalized = str(name or "").strip().lower()
+    if normalized == "ramjet":
+        return _ramjet_config_path()
+    if normalized == "nitro":
+        return _nitro_config_path()
+    if normalized in {"rocketfuel_longsonly", "rocketfuel_longandshort"}:
+        return _rocketfuel_config_path()
+    raise ValueError(f"Unknown signal processor: {name}")
 
 
 def list_signal_processor_options() -> list[dict[str, str]]:

@@ -31,7 +31,7 @@ async def run(*, task_id: str, service_id: str, service_name: str) -> None:
         },
         progress_message="Checking signal bot processors...",
         name=f"{service_name} · Signal Bot Health Check",
-        description="Validates signal processor registry and config files for stockkit, ramjet, rocketfuel, and nitro bots.",
+        description="Validates signal processor registry and config files for ramjet, rocketfuel, and nitro bots.",
         source="scheduler",
         updated_at=datetime.now(timezone.utc).isoformat(),
     )
@@ -73,7 +73,7 @@ async def run(*, task_id: str, service_id: str, service_name: str) -> None:
             },
             progress_message=f"Signal bot health check: {overall_status}",
             name=f"{service_name} · Signal Bot Health Check",
-            description="Validates signal processor registry and config files for stockkit, ramjet, rocketfuel, and nitro bots.",
+            description="Validates signal processor registry and config files for ramjet, rocketfuel, and nitro bots.",
             source="scheduler",
             updated_at=datetime.now(timezone.utc).isoformat(),
         )
@@ -95,7 +95,7 @@ async def run(*, task_id: str, service_id: str, service_name: str) -> None:
             },
             progress_message=f"Signal bot health check error: {str(exc)[:100]}",
             name=f"{service_name} · Signal Bot Health Check",
-            description="Validates signal processor registry and config files for stockkit, ramjet, rocketfuel, and nitro bots.",
+            description="Validates signal processor registry and config files for ramjet, rocketfuel, and nitro bots.",
             source="scheduler",
             updated_at=datetime.now(timezone.utc).isoformat(),
         )

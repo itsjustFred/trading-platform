@@ -11,10 +11,13 @@ Run with:
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from typing import Any
 
-from signal_bots.registry import SIGNAL_PROCESSORS, SIGNAL_PROCESSOR_OPTIONS
+from signal_bots.registry import (
+    SIGNAL_PROCESSORS,
+    SIGNAL_PROCESSOR_OPTIONS,
+    get_signal_processor_config_path,
+)
 
 
 def check_signal_bots() -> dict[str, Any]:
@@ -34,15 +37,17 @@ def check_signal_bots() -> dict[str, Any]:
             result["status"] = "error"
             result["errors"].append(f"Processor factory not found: {name}")
 
-        config_path = Path(__file__).parent / name.split("_")[0] / "config.yaml"
-        if name in {"rocketfuel_longsonly", "rocketfuel_longandshort"}:
-            config_path = Path(__file__).parent / "rocketfuel" / "config.yaml"
-        elif name in {"stockkit", "nitro"}:
-            config_path = Path(__file__).parent / "ramjet" / "config.yaml"
-
-        if not config_path.exists():
+        # The registry owns per-bot config paths; unknown ids raise instead of
+        # producing a path from the option string.
+        try:
+            config_path = get_signal_processor_config_path(name)
+        except ValueError as exc:
             result["status"] = "error"
-            result["errors"].append(f"Config file not found: {config_path}")
+            result["errors"].append(str(exc))
+        else:
+            if not config_path.exists():
+                result["status"] = "error"
+                result["errors"].append(f"Config file not found: {config_path}")
 
         results.append(result)
 

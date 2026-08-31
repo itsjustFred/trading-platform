@@ -20,6 +20,10 @@ function defaultDateRange(): { start: string; end: string } {
   };
 }
 
+// Default signal processor for "backtest from signals". StockKit is the Discord
+// source, not a processor, so the fallback is RamJet.
+const DEFAULT_SIGNAL_PROCESSOR = "ramjet";
+
 const inputStyle: React.CSSProperties = {
   background: "var(--color-surface2)",
   border: "1px solid var(--color-border)",
@@ -50,7 +54,7 @@ export function BacktestFromSignalsModal({
   const [signalSource, setSignalSource] = useState<BacktestFromSignalsSource>("csv");
   const [filepath, setFilepath] = useState("");
   const [accountId, setAccountId] = useState("");
-  const [signalProcessor, setSignalProcessor] = useState("stockkit");
+  const [signalProcessor, setSignalProcessor] = useState(DEFAULT_SIGNAL_PROCESSOR);
   const [timeframe, setTimeframe] = useState("");
   const [startDate, setStartDate] = useState(range.start);
   const [endDate, setEndDate] = useState(range.end);
@@ -68,8 +72,8 @@ export function BacktestFromSignalsModal({
       .then((options) => {
         const normalized = Array.isArray(options) ? options : [];
         setProcessors(normalized);
-        if (normalized.some((item) => item.id === "stockkit")) {
-          setSignalProcessor("stockkit");
+        if (normalized.some((item) => item.id === DEFAULT_SIGNAL_PROCESSOR)) {
+          setSignalProcessor(DEFAULT_SIGNAL_PROCESSOR);
           return;
         }
         if (normalized.length > 0) {

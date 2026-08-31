@@ -29,11 +29,10 @@ def _sample_market_data(rows: int = 80) -> pd.DataFrame:
 def test_registry_options_expose_all_expected_ids() -> None:
     options = list_signal_processor_options()
     ids = {item["id"] for item in options}
-    assert {"stockkit", "ramjet", "rocketfuel_longsonly", "rocketfuel_longandshort", "nitro"} <= ids
+    assert {"ramjet", "rocketfuel_longsonly", "rocketfuel_longandshort", "nitro"} == ids
 
 
 def test_registry_returns_expected_processor_classes() -> None:
-    assert isinstance(get_signal_processor("stockkit", {}), RamJetSignalProcessor)
     assert isinstance(get_signal_processor("ramjet", {}), RamJetSignalProcessor)
     assert isinstance(get_signal_processor("rocketfuel_longsonly", {}), RocketFuelSignalProcessor)
     assert isinstance(

@@ -7,7 +7,17 @@ from signal_bots.ramjet.processor import RamJetSignalProcessor
 
 
 class NitroSignalProcessor(RamJetSignalProcessor):
-    """Nitro processor: RamJet formulas, but BUY-only signal intake."""
+    """Nitro processor: RamJet formulas, but BUY-only signal intake.
+
+    Nitro reads its own ``nitro/config.yaml`` (top-level ``nitro:`` section);
+    it never falls back to RamJet's config file.
+    """
+
+    def __init__(self, config: dict[str, Any]):
+        loaded = dict(config or {})
+        if isinstance(loaded.get("nitro"), dict):
+            loaded = dict(loaded["nitro"])
+        super().__init__(loaded)
 
     @staticmethod
     def _normalize_buy_action(raw_action: Any) -> str:

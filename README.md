@@ -93,7 +93,7 @@ python -m runner.cli walkforward --strategy example_sma --train-months 12 --test
 - **Grid Testing:** `runner/grid_tester.py` - Automated strategy matrices (Symbol × Timeframe × ParamSet)
 - **Portfolio Optimization:** `runner/portfolio_optimizer.py` - Multi-strategy allocation with OOS validation
 - **Walk-Forward Analysis:** Anti-overfitting validation with train/test splits
-- **Signal Bots:** `signal_bots/health_check.py` - Registry/config validation for stockkit, ramjet, rocketfuel, and nitro processors
+- **Signal Bots:** `signal_bots/health_check.py` - Registry/config validation for ramjet, rocketfuel, and nitro processors
 - **Live Risk Consistency:** Backtest vs live position sizing behavior and stop-direction validation
 
 Documentation: See `docs/grid_tester.md`, `docs/portfolio_optimizer.md`, `docs/walk_forward.md`, `docs/signal_bots.md`, and `docs/live-risk-consistency.md`

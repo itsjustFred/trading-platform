@@ -3194,7 +3194,7 @@ def test_backtest_run_from_signals_csv_forwards_to_replay(viewer_client, monkeyp
         json={
             "signal_source": "csv",
             "filepath": str(csv_path),
-            "signal_processor": "stockkit",
+            "signal_processor": "ramjet",
             "start_date": "2026-02-23",
             "end_date": "2026-02-24",
             "auto_download": True,
@@ -3207,7 +3207,7 @@ def test_backtest_run_from_signals_csv_forwards_to_replay(viewer_client, monkeyp
     forwarded = captured["payload"]
     assert forwarded is not None
     assert forwarded.timeframe == "1m"
-    assert forwarded.signal_processor == "stockkit"
+    assert forwarded.signal_processor == "ramjet"
     assert forwarded.signal_source is None
     assert len(forwarded.signals) == 2
     assert str(forwarded.signals[0].source).startswith("csv:")
@@ -3239,7 +3239,7 @@ def test_backtest_run_from_signals_csv_date_only_end_is_inclusive(viewer_client,
         json={
             "signal_source": "csv",
             "filepath": str(csv_path),
-            "signal_processor": "stockkit",
+            "signal_processor": "ramjet",
             "start_date": "2026-02-23",
             "end_date": "2026-02-23",
         },
@@ -3289,7 +3289,7 @@ def test_signal_processors_endpoint_exposes_registry(viewer_client):
     assert response.status_code == 200
     payload = response.json()
     ids = {item["id"] for item in payload}
-    assert {"stockkit", "ramjet", "rocketfuel_longsonly", "rocketfuel_longandshort", "nitro"} <= ids
+    assert {"ramjet", "rocketfuel_longsonly", "rocketfuel_longandshort", "nitro"} == ids
 
 
 def test_optimizations_list_and_detail_endpoints(viewer_client, tmp_path):

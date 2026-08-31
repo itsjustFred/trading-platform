@@ -19,10 +19,11 @@ def test_check_signal_bots_detects_config_files() -> None:
     """Test signal bot health check includes config paths."""
     result = check_signal_bots()
 
-    assert len(result["results"]) >= 5  # stockkit, ramjet, rocketfuel variants, nitro
+    assert len(result["results"]) >= 4  # ramjet, rocketfuel variants, nitro
     assert any(r["name"] == "nitro" for r in result["results"])
     assert any(r["name"] == "ramjet" for r in result["results"])
     assert any(r["name"].startswith("rocketfuel") for r in result["results"])
+    assert not any(r["name"] == "stockkit" for r in result["results"])
 
 
 def test_signal_bot_health_check_main_returns_json(capsys) -> None:
@@ -31,5 +32,5 @@ def test_signal_bot_health_check_main_returns_json(capsys) -> None:
 
     captured = capsys.readouterr()
     assert '"status": "ok"' in captured.out
-    assert "stockkit" in captured.out
     assert "nitro" in captured.out
+    assert "stockkit" not in captured.out
