@@ -5,8 +5,10 @@ Environment (.env) loading happens exactly once here, before any module reads
 configuration regardless of import order.
 """
 
+import contextlib
 import os
 import shutil
+import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -85,14 +87,26 @@ def reset_data_dir() -> None:
 
 
 def _sync_database_paths() -> None:
-    """Mirror DATA_DIR/DB_PATH into shared.database (no-op before it is imported)."""
-    try:
-        import shared.database as database
+    """Mirror DATA_DIR/DB_PATH into an already-imported shared.database.
 
-        database.DATA_DIR = DATA_DIR
-        database.DB_PATH = DATA_DIR / "backtests.db"
-    except ImportError:
-        pass
+    Only synchronizes when ``shared.database`` is already in ``sys.modules``
+    (importing it here would be a second, circular initialization path). The
+    lazily created engine is disposed and reset so the next ``get_engine()``
+    binds to the new DB_PATH — a cached engine must never keep pointing at the
+    previous data directory while ``database.DB_PATH`` already claims the new
+    one. The schema-initialization flag is reset too, so the tables are
+    (re-)created in the new location on the next ``init_db()``. An explicit
+    ``database.ENGINE`` override is left untouched.
+    """
+    database = sys.modules.get("shared.database")
+    if database is None:
+        return
+    database.DATA_DIR = DATA_DIR
+    database.DB_PATH = DATA_DIR / "backtests.db"
+    with contextlib.suppress(Exception):
+        database.reset_engine()
+    with contextlib.suppress(Exception):
+        database.reset_initialized()
 
 
 DATA_DIR = _resolve_data_dir(_data_dir_env)

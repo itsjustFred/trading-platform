@@ -110,14 +110,17 @@ async def run(*, task_id: str, service_id: str, service_name: str) -> dict[str, 
     if missing:
         # Only the missing symbols are requested for download; covered symbols
         # are left untouched so the refresh stays a cheap incremental no-op.
+        total_missing = max(len(missing), 1)
         for index, symbol in enumerate(missing, start=1):
-            progress_percent = round((index / max(len(missing), 1)) * 95.0, 2)
+            # The pre-download record reports the symbols finished so far
+            # (index - 1); the post-download record below reports index.
+            progress_percent = round(((index - 1) / total_missing) * 95.0, 2)
             progress_config = dict(base_config)
             progress_config.update(
                 {
                     "progress_percent": progress_percent,
                     "progress_detail": {
-                        "completed": index,
+                        "completed": index - 1,
                         "failed": 0,
                         "total": len(missing),
                         "percent": progress_percent,
@@ -143,6 +146,15 @@ async def run(*, task_id: str, service_id: str, service_name: str) -> dict[str, 
                         end=end.strftime("%Y-%m-%d"),
                         modeling_resolution="main_timeframe",
                     )
+                _record_progress_sync(
+                    task_id=task_id,
+                    service_id=service_id,
+                    service_name=service_name,
+                    base_config=base_config,
+                    completed=index,
+                    total_missing=total_missing,
+                    message=f"Downloaded {symbol}",
+                )
                 if _symbol_is_fresh(symbol):
                     refreshed.append(symbol)
                 else:
@@ -274,4 +286,38 @@ def _write_progress_sync(
         description=_DESCRIPTION,
         source="scheduler",
         updated_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+
+def _record_progress_sync(
+    *,
+    task_id: str,
+    service_id: str,
+    service_name: str,
+    base_config: dict[str, Any],
+    completed: int,
+    total_missing: int,
+    message: str,
+) -> None:
+    """Write a running record reporting ``completed`` finished symbols."""
+    percent = round((completed / max(total_missing, 1)) * 95.0, 2)
+    config = dict(base_config)
+    config.update(
+        {
+            "progress_percent": percent,
+            "progress_detail": {
+                "completed": completed,
+                "failed": 0,
+                "total": total_missing,
+                "percent": percent,
+                "current": message,
+            },
+        }
+    )
+    _write_progress_sync(
+        task_id=task_id,
+        service_id=service_id,
+        service_name=service_name,
+        config=config,
+        progress_message=message,
     )

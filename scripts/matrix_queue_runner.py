@@ -14,7 +14,6 @@ import json
 import os
 import subprocess
 import sys
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -26,7 +25,9 @@ LOCK_PATH = MATRIX_DIR / "queue.lock"
 MAX_WORKERS = os.environ.get("MATRIX_MAX_WORKERS", "2")
 TIMEOUT_SECONDS = os.environ.get("MATRIX_TIMEOUT_SECONDS", "3600")
 ENGINE = os.environ.get("MATRIX_ENGINE", "vectorbt")
-LOCK_TTL_SECONDS = int(os.environ.get("MATRIX_LOCK_TTL_SECONDS", "7200"))
+
+# Handle for the flock currently held by this process (None when unlocked).
+_LOCK_HANDLE = None
 
 sys.path.insert(0, str(REPO))
 # Ensure this script's own checkout wins over the hardcoded REPO default when the
@@ -87,34 +88,14 @@ def any_matrix_process_running() -> bool:
         return False
 
 
-def _lock_age_seconds(path: Path) -> float:
-    """Return the age of a lock file in seconds (infinitely old on error)."""
-    try:
-        return time.time() - path.stat().st_mtime
-    except OSError:
-        return float("inf")
-
-
-def _owns_fresh_stale_lock() -> bool:
-    """True when a fresh lock file with a timestamp exists but is unheld."""
-    if not LOCK_PATH.exists():
-        return False
-    if _lock_age_seconds(LOCK_PATH) >= LOCK_TTL_SECONDS:
-        return False
-    try:
-        return bool(LOCK_PATH.read_text(encoding="utf-8").strip())
-    except OSError:
-        return False
-
-
 def acquire_lock() -> bool:
     """Take the queue lock for this process.
 
     The lock is an exclusive ``flock`` on ``queue.lock``: the kernel arbitrates
-    acquisition, so there is no check-then-create race. A lock held by a live
-    process is never deleted; a stale lock file (older than
-    ``LOCK_TTL_SECONDS``) whose owner died releases its flock automatically and
-    any leftover file is simply re-locked and refreshed.
+    acquisition, so there is no check-then-create race and no mtime/TTL
+    heuristic. A lock held by a live process is never deleted; a file left
+    behind by a crashed writer is simply re-locked (its owner died, so the OS
+    released the flock) and its timestamp refreshed.
     """
     MATRIX_DIR.mkdir(parents=True, exist_ok=True)
     try:
@@ -129,21 +110,14 @@ def acquire_lock() -> bool:
             lock_handle.close()
             return False
 
-        if _owns_fresh_stale_lock() and globals().get("_LOCK_HANDLE") is None:
-            # A fresh lock file with a timestamp exists but nobody holds a
-            # flock on it (a crashed writer left it behind recently). Never
-            # delete another session's lock: skip this tick instead.
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
-            lock_handle.close()
-            return False
-
         lock_handle.seek(0)
         lock_handle.truncate()
         lock_handle.write(now_iso() + "\n")
         lock_handle.flush()
         # Keep the handle open for the lifetime of the lock: closing it would
         # release the flock.
-        globals()["_LOCK_HANDLE"] = lock_handle
+        global _LOCK_HANDLE
+        _LOCK_HANDLE = lock_handle
         return True
     except Exception:
         with contextlib.suppress(Exception):
@@ -155,7 +129,8 @@ def acquire_lock() -> bool:
 
 def release_lock() -> None:
     """Release the queue lock held by this process, if any."""
-    handle = globals().get("_LOCK_HANDLE")
+    global _LOCK_HANDLE
+    handle = _LOCK_HANDLE
     if handle is None:
         return
     try:
@@ -165,27 +140,7 @@ def release_lock() -> None:
     finally:
         with contextlib.suppress(Exception):
             handle.close()
-        globals()["_LOCK_HANDLE"] = None
-
-
-def _remove_lock_file() -> None:
-    """Remove the lock file only while this process no longer holds its flock.
-
-    Called exclusively from ``main()``'s ``finally`` after :func:`release_lock`,
-    so the current process cannot be the flock owner. Unlinking while another
-    session may have acquired the flock in the meantime is still racy: that
-    session then holds a lock on an unlinked inode and a third session can take
-    a flock on a new file. The stale leftover file is harmless (a later
-    ``acquire_lock`` takes the flock over it and truncates it), so removal is a
-    best-effort tidy-up only — never relied on for correctness. Currently unused;
-    kept as the documented, safe way to tidy the lock path if a caller ever needs
-    it.
-    """
-    if globals().get("_LOCK_HANDLE") is not None:
-        return
-    with contextlib.suppress(OSError):
-        LOCK_PATH.unlink(missing_ok=True)
-
+        _LOCK_HANDLE = None
 
 
 def grid_summary(strategy: str) -> dict | None:

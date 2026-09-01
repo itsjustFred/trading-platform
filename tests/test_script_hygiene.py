@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
+import sys
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -84,16 +87,41 @@ def test_acquire_lock_never_deletes_a_live_lock(queue_runner) -> None:
     """A fresh lock file written by another session blocks acquisition untouched."""
     module = queue_runner
     module.MATRIX_DIR.mkdir(parents=True, exist_ok=True)
-    module.LOCK_PATH.write_text("2099-01-01T00:00:00+00:00", encoding="utf-8")
-    fresh_age = 1.0  # far below the TTL, so the file looks freshly written
 
-    with patch.object(module, "_lock_age_seconds", return_value=fresh_age):
+    # A real second flock participant holds the lock from a subprocess: the
+    # kernel must arbitrate, and the live lock file must stay untouched.
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import fcntl, sys, time\n"
+                "f = open(sys.argv[1], 'a+')\n"
+                "fcntl.flock(f.fileno(), fcntl.LOCK_EX)\n"
+                "f.write('held\\n'); f.flush()\n"
+                "time.sleep(15)\n"
+            ),
+            str(module.LOCK_PATH),
+        ]
+    )
+    try:
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            try:
+                if module.LOCK_PATH.read_text(encoding="utf-8") == "held\n":
+                    break
+            except FileNotFoundError:
+                pass
+            time.sleep(0.05)
+
         acquired = module.acquire_lock()
+    finally:
+        holder.kill()
+        holder.wait()
 
-    assert acquired is False
+    assert acquired is False, "a live flock must block a second acquirer"
     assert module.LOCK_PATH.exists(), "a live lock must never be deleted"
-    assert module.LOCK_PATH.read_text(encoding="utf-8") == "2099-01-01T00:00:00+00:00"
-    module.release_lock()
+    assert module.LOCK_PATH.read_text(encoding="utf-8").startswith("held\n")
 
 
 def test_release_lock_removes_only_own_lock(queue_runner) -> None:
@@ -106,17 +134,16 @@ def test_release_lock_removes_only_own_lock(queue_runner) -> None:
     module.release_lock()
 
 
-def test_lock_survives_after_ttl_without_process(queue_runner) -> None:
-    """A stale lock with no running process can be taken over."""
+def test_lock_left_by_crashed_writer_is_retaken(queue_runner) -> None:
+    """A leftover lock file with no flock owner can be taken over."""
     module = queue_runner
     module.MATRIX_DIR.mkdir(parents=True, exist_ok=True)
     module.LOCK_PATH.write_text("2020-01-01T00:00:00+00:00", encoding="utf-8")
 
-    with patch.object(module, "_lock_age_seconds", return_value=module.LOCK_TTL_SECONDS + 60):
-        with patch.object(module, "any_matrix_process_running", return_value=False):
-            acquired = module.acquire_lock()
+    acquired = module.acquire_lock()
 
-    assert acquired is True
+    assert acquired is True, "an unheld leftover lock must not block the next tick"
+    module.release_lock()
 
 
 # ─── dedupe_executions ────────────────────────────────────────────────────────

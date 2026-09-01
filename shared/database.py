@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import threading
+import contextlib
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -117,10 +118,20 @@ def get_engine() -> Any:
 
 
 def reset_engine() -> None:
-    """Forget the lazily created engine (test isolation helper)."""
+    """Dispose and forget the lazily created engine (test isolation helper)."""
     global _ENGINE
     with _ENGINE_LOCK:
+        if _ENGINE is not None:
+            with contextlib.suppress(Exception):
+                _ENGINE.dispose()
         _ENGINE = None
+
+
+def reset_initialized() -> None:
+    """Forget that the schema was initialized (test isolation helper)."""
+    global _DB_INITIALIZED
+    with _DB_INIT_LOCK:
+        _DB_INITIALIZED = False
 
 
 def _configure_sqlite_connection(dbapi_connection: Any, _connection_record: Any) -> None:
@@ -871,6 +882,9 @@ def get_session() -> Iterator[Session]:
 def init_db() -> None:
     global _DB_INITIALIZED
     if _DB_INITIALIZED:
+        # The data directory may have moved (set_data_dir) since the last
+        # initialization; make sure it exists before any session touches it.
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
         return
 
     with _DB_INIT_LOCK:

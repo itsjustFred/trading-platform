@@ -51,7 +51,12 @@ def test_database_engine_is_lazy_and_cached(monkeypatch, tmp_path: Path) -> None
 
 
 def test_database_engine_reflects_data_dir_override(monkeypatch, tmp_path: Path) -> None:
-    """Changing DATA_DIR via set_data_dir must move the DB path, not the engine identity."""
+    """Changing DATA_DIR via set_data_dir must move the DB path AND the engine.
+
+    DB_PATH and the active engine must never disagree about the SQLite file:
+    set_data_dir disposes the cached engine so the next get_engine() binds to
+    the new path.
+    """
     import shared.constants as constants
     import shared.database as database
 
@@ -60,7 +65,14 @@ def test_database_engine_reflects_data_dir_override(monkeypatch, tmp_path: Path)
     try:
         assert database.DB_PATH == tmp_path / "backtests.db"
         engine_after = database.get_engine()
-        assert engine_after is engine_before, "engine identity must stay stable in-process"
+        assert engine_after is not engine_before, "stale engine must be replaced"
+        assert engine_after.url.render_as_string(hide_password=False) == (
+            f"sqlite:///{(tmp_path / 'backtests.db').as_posix()}"
+        )
+        with database.get_session() as session:
+            assert str(session.bind.url.render_as_string(hide_password=False)) == (
+                f"sqlite:///{(tmp_path / 'backtests.db').as_posix()}"
+            )
     finally:
         constants.reset_data_dir()
 
