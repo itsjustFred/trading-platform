@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
+from math import isfinite
 from pathlib import Path
 from typing import Any, Callable
 from uuid import uuid4
@@ -43,15 +44,16 @@ def run_strategy_grid(
     entry = find_strategy_entry(strategy_slug)
     if entry is None:
         return {"status": "error", "message": f"Strategy {strategy_slug} not found"}
-    
+
+    strategy_path = str(Path(entry.file_path).resolve())
     engine = get_engine(engine_name)
     results_matrix: dict[str, dict[str, dict[str, Any]]] = {
         sym: {} for sym in symbols
     }
-    
+
     total_runs = len(symbols) * len(timeframes)
     completed = 0
-    
+
     for symbol in symbols:
         for timeframe in timeframes:
             completed += 1
@@ -59,7 +61,7 @@ def run_strategy_grid(
             msg = f"{symbol}/{timeframe}"
             if progress_callback:
                 progress_callback(progress, msg)
-            
+
             # Try to run backtest
             try:
                 config = BacktestConfig(
@@ -71,19 +73,37 @@ def run_strategy_grid(
                     initial_capital=capital,
                     risk_per_trade_pct=risk_per_trade_pct,
                 )
-                result = engine.run(config)
-                
-                # Collect stats
+                validate = getattr(engine, "validate_config", None)
+                if callable(validate):
+                    errors = validate(config)
+                    if errors:
+                        raise ValueError("; ".join(errors))
+                result = engine.run(config, strategy_path)
+
+                # Canonical stats keys only — never fabricate zero metrics for
+                # missing keys, and keep no-trade runs distinguishable.
                 stats = result.stats if result.stats else {}
-                results_matrix[symbol][timeframe] = {
-                    "status": "success",
-                    "sharpe": float(stats.get("sharpe", 0)),
-                    "cagr": float(stats.get("cagr", 0)),
-                    "max_drawdown_pct": float(stats.get("max_drawdown_pct", 0)),
-                    "win_rate": float(stats.get("win_rate", 0)),
-                    "total_trades": int(stats.get("total_trades", 0)),
-                    "net_profit_pct": float(stats.get("net_profit_pct", 0)),
+                total_trades = int(stats.get("total_trades", 0) or 0)
+                cell: dict[str, Any] = {
+                    "status": "no_trades" if total_trades == 0 else "success",
+                    "total_trades": total_trades,
                 }
+                for source_key, canonical_key in (
+                    ("sharpe_ratio", "sharpe_ratio"),
+                    ("sharpe", "sharpe_ratio"),
+                    ("cagr", "cagr"),
+                    ("max_drawdown_pct", "max_drawdown_pct"),
+                    ("win_rate", "win_rate"),
+                    ("total_return", "total_return"),
+                ):
+                    value = stats.get(source_key)
+                    if value is None:
+                        continue
+                    numeric = float(value)
+                    if not isfinite(numeric):
+                        continue
+                    cell[canonical_key] = numeric
+                results_matrix[symbol][timeframe] = cell
             except Exception as e:
                 results_matrix[symbol][timeframe] = {
                     "status": "error",

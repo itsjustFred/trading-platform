@@ -87,7 +87,7 @@ def _load_daily_rows(path: Path, *, strategy: str, symbol: str, timeframe: str) 
                 "symbol": symbol,
                 "timeframe": timeframe,
                 "run_id": run_id,
-                "time": row.get("time", ""),
+                "time": row.get("date", row.get("time", "")),
                 "equity": row.get("equity", ""),
                 "daily_return": row.get("return", ""),
             }
