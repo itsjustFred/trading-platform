@@ -80,3 +80,16 @@ export function psrTone(psr: number): string {
   if (psr >= 0.5) return PSR_TONES.mid;
   return PSR_TONES.low;
 }
+
+const SHARPE_TONES = {
+  strong: "#3fb950",
+  weak: "#d29922",
+  negative: "#f85149",
+} as const;
+
+/** Tier color for Sharpe ratio values. */
+export function sharpeTone(sharpe: number): string {
+  if (sharpe > 1) return SHARPE_TONES.strong;
+  if (sharpe > 0) return SHARPE_TONES.weak;
+  return SHARPE_TONES.negative;
+}
