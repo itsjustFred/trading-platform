@@ -4,6 +4,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+
 def sample_signal_market_data(rows: int = 80) -> "pd.DataFrame":
     """Deterministic OHLCV frame shared by the signal-processor test suites."""
     timestamps = pd.date_range("2026-01-01", periods=rows, freq="5min", tz="UTC")

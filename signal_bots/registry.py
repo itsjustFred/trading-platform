@@ -41,14 +41,15 @@ def _build_from_config(
     """Merge the bot's own config file with caller overrides and build it.
 
     `config` is caller-controlled data used as *values* only; it never selects
-    a file path, module or factory. Overrides apply at the top level and — when
-    the file nests settings under a single bot section (e.g. ``ram_jet:``) —
-    inside that section, so per-bot tuning always wins over file defaults.
+    a file path, module or factory. When the file nests settings under a single
+    bot section (e.g. ``ram_jet:``), overrides merge into that section — the
+    processor unwraps it, so a top-level copy would be discarded. Only a
+    sectionless file merges at the top level, where per-bot tuning always wins
+    over file defaults.
     """
     payload = _load_yaml(config_path)
     merged = dict(payload)
     overrides = dict(config or {})
-    merged.update(overrides)
     sections = [key for key, value in payload.items() if isinstance(value, dict)]
     if len(sections) > 1:
         raise ValueError(
@@ -59,6 +60,8 @@ def _build_from_config(
         section = dict(payload[sections[0]])
         section.update(overrides)
         merged[sections[0]] = section
+    else:
+        merged.update(overrides)
     return factory(merged)
 
 
@@ -112,19 +115,12 @@ def _build_nitro(config: dict[str, Any]) -> NitroSignalProcessor:
 
 def _build_rocketfuel(variant: str, config: dict[str, Any]) -> RocketFuelSignalProcessor:
     def _factory(merged: dict[str, Any]) -> RocketFuelSignalProcessor:
-        if isinstance(merged.get("rocket_fuel"), dict):
-            rocket_fuel = dict(merged["rocket_fuel"])
-        else:
-            # Fallback for a sectionless file: collect the known tuning keys.
-            # `variant` is owned by this factory and always overwritten below,
-            # so it is deliberately absent from the allowlist.
-            rocket_fuel = {
-                key: value
-                for key, value in merged.items()
-                if key in {"atr_period", "sl_multiplier", "candle_timeframe"}
-            }
-        rocket_fuel["variant"] = variant
-        merged["rocket_fuel"] = rocket_fuel
+        # Shipped configs always carry a `rocket_fuel:` section (pinned by
+        # test_shipped_config_files_have_a_single_bot_section). A missing one
+        # is a malformed file, not a layout to accommodate: leave the payload
+        # untouched and let the processor's variant/tuning validation speak.
+        merged.setdefault("rocket_fuel", {})
+        merged["rocket_fuel"]["variant"] = variant
         return RocketFuelSignalProcessor(merged)
 
     return _build_from_bot_dir("rocketfuel", _factory, config)

@@ -77,16 +77,17 @@ def test_nitro_uses_its_own_config_file() -> None:
 
 
 def test_nitro_config_is_independent_from_ramjet() -> None:
-    """Each bot reads only its own config file, never the other bot's."""
+    """Each bot reads only its own config file, never the other bot's.
+
+    The bots are allowed to diverge — assert each file's own documented value,
+    not equality between the bots (equal values today are coincidence).
+    """
     ramjet = get_signal_processor("ramjet", {})
     nitro = get_signal_processor("nitro", {})
     assert isinstance(ramjet, RamJetSignalProcessor)
     assert isinstance(nitro, NitroSignalProcessor)
-    # Both config files use a top-level bot section (`ram_jet:` / `nitro:`) and
-    # the processors unwrap it. Tuning one file must not move the other bot.
-    assert ramjet.config.get("sl_multiplier") == 2.0
-    assert nitro.config.get("sl_multiplier") == 2.0
-    assert ramjet.config.get("atr_period") == nitro.config.get("atr_period")
+    assert ramjet.config.get("sl_multiplier") == 2.0  # ramjet/config.yaml
+    assert nitro.config.get("sl_multiplier") == 2.0  # nitro/config.yaml
 
 
 def test_nitro_merges_requested_config_over_file_defaults() -> None:
@@ -156,7 +157,4 @@ def test_ramjet_reads_its_shipped_config_values() -> None:
     processor = get_signal_processor("ramjet", {})
     assert isinstance(processor, RamJetSignalProcessor)
     assert processor.config.get("sl_multiplier") == 2.0
-    nitro_payload = yaml.safe_load(
-        get_signal_processor_config_path("nitro").read_text(encoding="utf-8")
-    )
-    assert processor.config.get("atr_period") == nitro_payload["nitro"]["atr_period"]
+    assert processor.config.get("atr_period") == 14
