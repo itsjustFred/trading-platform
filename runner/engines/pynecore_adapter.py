@@ -160,8 +160,10 @@ class PyneCoreAdapter(EngineAdapter):
                     if venv_bin.exists():
                         pyne_bin = str(venv_bin)
                     else:
-                        logger.error("pyne CLI not found in PATH")
-                        continue
+                        raise RuntimeError(
+                            "PyneCore CLI ('pyne') not found on PATH. "
+                            "Install with: pip install pynesys-pynecore"
+                        )
 
                 cmd = [
                     pyne_bin,
@@ -191,17 +193,25 @@ class PyneCoreAdapter(EngineAdapter):
                 logger.info(
                     "Running PyneCore: %s on %s (%d bars)", config.strategy_name, symbol, len(df)
                 )
-                result = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    cwd=str(tmpdir_path),
-                    timeout=300,
-                )
+                try:
+                    result = subprocess.run(
+                        cmd,
+                        capture_output=True,
+                        text=True,
+                        cwd=str(tmpdir_path),
+                        timeout=300,
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    raise RuntimeError(
+                        f"PyneCore run for {symbol} timed out after {exc.timeout} seconds"
+                    ) from exc
 
                 if result.returncode != 0:
-                    logger.error("PyneCore failed for %s: %s", symbol, result.stderr[-500:])
-                    continue
+                    raise RuntimeError(
+                        f"PyneCore run failed for {config.strategy_name}/{symbol} "
+                        f"(exit code {result.returncode}): "
+                        f"{(result.stderr or result.stdout or '')[-2000:]}"
+                    )
 
                 if trade_csv.exists():
                     trades = _parse_trade_csv(trade_csv, symbol, trade_counter)
@@ -213,7 +223,7 @@ class PyneCoreAdapter(EngineAdapter):
                     all_trades.extend(trades)
 
                 if stats_csv.exists():
-                    all_stats = _parse_stats_csv(stats_csv)
+                    all_stats.update(_parse_stats_csv(stats_csv))
 
             symbol_drawings = _build_drawings(
                 drawings_builder,
