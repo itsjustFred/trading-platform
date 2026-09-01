@@ -2139,6 +2139,29 @@ def get_latest_live_balance(account_id: str) -> LiveBalanceRecord | None:
     return row.to_live_balance()
 
 
+def get_latest_live_balances(account_ids: list[str]) -> dict[str, LiveBalanceRecord]:
+    """Latest balance per account in one query (avoids N+1 polling access)."""
+    normalized_ids = sorted(
+        {str(item or "").strip() for item in account_ids if str(item or "").strip()}
+    )
+    if not normalized_ids:
+        return {}
+
+    init_db()
+    with get_session() as session:
+        rows = session.exec(
+            select(LiveBalanceModel)
+            .where(LiveBalanceModel.account_id.in_(normalized_ids))
+            .order_by(LiveBalanceModel.timestamp.desc(), LiveBalanceModel.id.desc())
+        ).all()
+
+    latest: dict[str, LiveBalanceRecord] = {}
+    for row in rows:
+        record = row.to_live_balance()
+        latest.setdefault(record.account_id, record)
+    return latest
+
+
 def list_live_signal_executions_for_deployments(
     deployment_ids: list[str],
 ) -> list[dict[str, Any]]:

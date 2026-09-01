@@ -91,6 +91,7 @@ from shared.database import (
     get_live_account,
     get_service,
     get_latest_live_balance,
+    get_latest_live_balances,
     init_db,
     list_backtest_ids,
     list_backtest_fingerprint_rows,
@@ -1441,10 +1442,12 @@ _STRATEGIES_CACHE: dict[str, Any] = {"expires_at": 0.0, "payload": []}
 _STRATEGIES_CACHE_TTL_SECONDS = 60.0
 _LIVE_WS_QUEUE_MAX_SIZE = 64
 _LIVE_WS_HEARTBEAT_SECONDS = 15.0
-_LIVE_WS_ACCOUNTS_POLL_SECONDS = 1.0
-_LIVE_WS_SIGNALS_POLL_SECONDS = 1.0
-_LIVE_WS_EXECUTIONS_POLL_SECONDS = 1.0
-_LIVE_WS_POSITIONS_POLL_SECONDS = 1.0
+# Live streams refresh every few seconds (not 1 Hz): each poll fans out DB
+# and broker requests, and the previous 1 Hz default rate-limited brokers.
+_LIVE_WS_ACCOUNTS_POLL_SECONDS = 5.0
+_LIVE_WS_SIGNALS_POLL_SECONDS = 3.0
+_LIVE_WS_EXECUTIONS_POLL_SECONDS = 3.0
+_LIVE_WS_POSITIONS_POLL_SECONDS = 3.0
 _BACKTEST_META_CACHE_LOCK = threading.RLock()
 _BACKTEST_META_CACHE: dict[str, dict[str, Any]] = {}
 _BACKTEST_META_CACHE_SOURCE_MTIME_NS = 0
@@ -3651,10 +3654,15 @@ def _cached_live_accounts_payload(*, force_refresh: bool = False) -> list[dict[s
 def _live_accounts_stream_payload() -> dict[str, Any]:
     accounts = _cached_live_accounts_payload(force_refresh=True)
     enriched_accounts: list[dict[str, Any]] = []
+    # One batched query for all accounts instead of get_latest_live_balance
+    # per account (N+1) on every stream tick.
+    balances_by_account = get_latest_live_balances(
+        [str(item.get("id") or "").strip() for item in accounts]
+    )
     for account in accounts:
         item = dict(account)
         account_id = str(item.get("id") or "").strip()
-        latest_balance = get_latest_live_balance(account_id) if account_id else None
+        latest_balance = balances_by_account.get(account_id) if account_id else None
         if latest_balance is not None:
             timestamp_iso, timestamp_unix = _serialize_live_timestamp(latest_balance.timestamp)
             item["balance"] = float(latest_balance.balance)
