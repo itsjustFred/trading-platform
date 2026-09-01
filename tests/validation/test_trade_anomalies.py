@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from shared.models import Trade, TradeExit
+from shared.models import Trade
 from validation.comparison.anomalies import (
     AnomalyDetector,
     AnomalyType,
@@ -18,40 +18,12 @@ from validation.comparison.comparison import (
     TradeComparator,
 )
 from validation.comparison.matcher import MatchKey
-from validation.reference import ValidationReference
 
 
-def _make_trade(
-    trade_id: int = 1,
-    symbol: str = "EURUSD",
-    direction: str = "LONG",
-    entry_time: str = "2024-01-01T10:00:00Z",
-    exit_time: str = "2024-01-01T11:00:00Z",
-    entry_price: float = 1.1000,
-    exit_price: float = 1.1050,
-    quantity: float = 1000.0,
-    position_size: float | None = None,
-    pnl: float = 50.0,
-    stop_loss: float | None = None,
-    take_profit: float | None = None,
-) -> Trade:
-    meta: dict[str, object] = {}
-    if stop_loss is not None:
-        meta["stop_loss"] = stop_loss
-    if take_profit is not None:
-        meta["take_profit"] = take_profit
-    return Trade(
-        id=trade_id,
-        symbol=symbol,
-        direction=direction,
-        entry_time=entry_time,
-        entry_price=entry_price,
-        quantity=quantity,
-        exits=[TradeExit(time=exit_time, price=exit_price, quantity=quantity)],
-        pnl=pnl,
-        position_size=position_size,
-        meta=meta,
-    )
+from tests.validation.data_factory import (
+    make_reference as _make_reference,
+    make_trade as _make_trade,
+)
 
 
 def _make_matched(
@@ -67,20 +39,6 @@ def _make_matched(
         direction=r.direction,
     )
     return MatchedTrade(reference=r, actual=a, key=key)
-
-
-def _make_reference(trades: list[Trade]) -> ValidationReference:
-    return ValidationReference(
-        strategy_name="test",
-        source_framework="unknown",
-        symbol="EURUSD",
-        timeframe="1h",
-        settings={},
-        trades=trades,
-        stats={},
-        raw_metadata={},
-        allow_empty=True,
-    )
 
 
 class TestDetectMissing:

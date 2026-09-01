@@ -39,9 +39,8 @@ def _is_missing_browser_error(message: str) -> bool:
     )
 
 
-@pytest.fixture
-def isolated_db(monkeypatch, tmp_path: Path):
-    """Redirect ``shared.database`` at a throwaway SQLite database.
+def _make_sandbox_db(monkeypatch, tmp_path: Path, *, create_schema: bool):
+    """Build a throwaway ``shared.database`` sandbox and restore state after.
 
     The production engine URL is built from ``DB_PATH`` at import time, so the
     engine swap below is what actually isolates database access; patching
@@ -49,15 +48,11 @@ def isolated_db(monkeypatch, tmp_path: Path):
     consistent, and ``DATA_DIR`` stays patched because ``init_db()`` mkdirs it
     and the artifact writers (``DATA_DIR / "backtests"``) must land in the
     sandbox too.
-
-    Yields ``(database_module, engine, data_dir)`` and restores module state on
-    teardown via ``monkeypatch``.
     """
     import shared.database as database
 
     data_dir = tmp_path / "data"
-    backtests_dir = data_dir / "backtests"
-    backtests_dir.mkdir(parents=True)
+    data_dir.mkdir(parents=True)
     db_path = data_dir / "backtests.db"
 
     engine = database.create_engine(
@@ -65,19 +60,33 @@ def isolated_db(monkeypatch, tmp_path: Path):
         connect_args={"check_same_thread": False},
     )
     database.event.listen(engine, "connect", database._configure_sqlite_connection)
-    database.SQLModel.metadata.create_all(engine)
+    if create_schema:
+        database.SQLModel.metadata.create_all(engine)
 
     monkeypatch.setattr(database, "ENGINE", engine)
     monkeypatch.setattr(database, "DB_PATH", db_path)
     monkeypatch.setattr(database, "DATA_DIR", data_dir)
-    # False on purpose: schema is pre-created above, but tests (and production
-    # code paths) must still be able to call init_db() and run _migrate_schema()
-    # — e.g. the per-deployment UNIQUE index migrations in shared/database.py.
+    # False on purpose: tests (and production code paths) must still be able to
+    # call init_db() and run _migrate_schema() — e.g. the per-deployment UNIQUE
+    # index migrations in shared/database.py.
     monkeypatch.setattr(database, "_DB_INITIALIZED", False)
 
     yield database, engine, data_dir
 
     engine.dispose()
+
+
+@pytest.fixture
+def isolated_db_sandbox(monkeypatch, tmp_path: Path):
+    """Redirect ``shared.database`` at a throwaway SQLite database (pre-created
+    schema). Yields ``(database_module, engine, data_dir)``."""
+    yield from _make_sandbox_db(monkeypatch, tmp_path, create_schema=True)
+
+
+@pytest.fixture
+def isolated_db(isolated_db_sandbox):
+    """Alias of :func:`isolated_db_sandbox`."""
+    yield isolated_db_sandbox
 
 
 @lru_cache(maxsize=None)

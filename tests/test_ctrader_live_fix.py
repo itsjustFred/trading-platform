@@ -233,20 +233,13 @@ def test_env_key_persistence_serializes_concurrent_writers(tmp_path: Path) -> No
     }
 
 
-@pytest.fixture()
-def isolated_db(monkeypatch, tmp_path: Path):
-    import shared.database as database
-
-    engine = database.create_engine(
-        f"sqlite:///{(tmp_path / 'test.db').as_posix()}",
-        connect_args={"check_same_thread": False},
-    )
-    monkeypatch.setattr(database, "ENGINE", engine)
-    # Isolation comes from the ENGINE swap: the production engine URL is built
-    # from DB_PATH at import time, not from DATA_DIR. (B-48)
-    monkeypatch.setattr(database, "_DB_INITIALIZED", False)
+@pytest.fixture
+def isolated_db(isolated_db_sandbox):
+    """Delegates to the shared sandbox fixture but yields the database module
+    directly, so these persistence tests keep their ``database = isolated_db``
+    style."""
+    database, _engine, _data_dir = isolated_db_sandbox
     yield database
-    engine.dispose()
 
 
 # ─── cTrader get_positions helpers ────────────────────────────────────────────
