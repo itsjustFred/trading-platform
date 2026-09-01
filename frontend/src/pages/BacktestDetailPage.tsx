@@ -223,22 +223,26 @@ export function BacktestDetailPage() {
   const statsAreWholeBacktest =
     typeof stats?.total_trades === "number" &&
     (stats.total_trades ?? 0) <= trades.length;
+  const totalTradesFromStats =
+    typeof stats?.total_trades === "number" ? stats.total_trades : trades.length;
+  const totalPnlFromStats =
+    typeof stats?.net_profit === "number"
+      ? stats.net_profit
+      : trades.reduce((sum, trade) => sum + (trade.pnl || 0), 0);
+  // Fallback only when the stats payload omits the average: net profit over
+  // the reported trade count, else 0 when neither is usable.
+  const avgPnlFromStats =
+    typeof stats?.avg_trade_pnl === "number"
+      ? stats.avg_trade_pnl
+      : typeof stats?.total_trades === "number" && stats.total_trades > 0
+        ? totalPnlFromStats / stats.total_trades
+        : 0;
   const wholeBacktestStats = {
-    totalPnl:
-      typeof stats?.net_profit === "number"
-        ? stats.net_profit
-        : trades.reduce((sum, trade) => sum + (trade.pnl || 0), 0),
-    totalTrades:
-      typeof stats?.total_trades === "number" ? stats.total_trades : trades.length,
+    totalPnl: totalPnlFromStats,
+    totalTrades: totalTradesFromStats,
     wins: typeof stats?.winners === "number" ? stats.winners : trades.filter((t) => t.pnl > 0).length,
     losses: typeof stats?.losers === "number" ? stats.losers : trades.filter((t) => t.pnl <= 0).length,
-    avgPnl:
-      typeof stats?.avg_trade_pnl === "number"
-        ? stats.avg_trade_pnl
-        : (typeof stats?.total_trades === "number" && stats.total_trades > 0
-            ? (typeof stats?.net_profit === "number" ? stats.net_profit : 0) /
-              stats.total_trades
-            : 0),
+    avgPnl: avgPnlFromStats,
     bestTrade:
       typeof stats?.best_trade === "number" ? stats.best_trade : null,
     worstTrade:

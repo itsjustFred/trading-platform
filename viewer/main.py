@@ -444,8 +444,9 @@ def _run_coroutine_sync(coroutine_factory: Callable[[], Any]) -> Any:
     def _runner() -> None:
         try:
             result["payload"] = asyncio.run(coroutine_factory())
-        except BaseException as exc:  # re-raised on the joining thread
+        except BaseException as exc:  # noqa: BLE001 - re-raised verbatim on the joining thread
             result["error"] = exc
+            raise
         finally:
             done.set()
 
@@ -7547,6 +7548,34 @@ def _replay_keep_mask_from_trades(df: pd.DataFrame, trade_payloads: list[dict[st
     return keep
 
 
+def _replay_timeframe(result: BacktestResult) -> str:
+    """First configured timeframe for a result, normalized (default "1h")."""
+    configured = result.meta.data.get("timeframes")
+    raw = configured[0] if configured else "1h"
+    return normalize_timeframe(str(raw or "1h"))
+
+
+def _load_symbol_ohlcv_with_details(
+    symbol: str, timeframe: str, result: BacktestResult
+) -> tuple[pd.DataFrame | None, dict[str, Any] | None]:
+    """Load a symbol frame, or the user-facing missing-data details for it."""
+    df = legacy_viewer._load_ohlcv_df(symbol, timeframe)
+    if df is None or len(df) == 0:
+        return None, legacy_viewer._missing_ohlcv_details(
+            symbol,
+            timeframe,
+            backtest_start=str(result.meta.backtest_start or ""),
+            backtest_end=str(result.meta.backtest_end or ""),
+        )
+    return df, None
+
+
+def _detect_or_empty(result: BacktestResult) -> dict[str, Any]:
+    """Indicators detected from the result's first strategy, if any."""
+    strategy_identifier = result.meta.strategies[0] if result.meta.strategies else ""
+    return legacy_viewer._detect_indicators(strategy_identifier)
+
+
 def _slice_replay_ohlcv(df: pd.DataFrame, trade_payloads: list[dict[str, Any]]) -> pd.DataFrame:
     if df is None or len(df) == 0:
         return df
@@ -7598,54 +7627,72 @@ async def get_trade_with_context(backtest_id: str, trade_nr: int) -> dict[str, A
     return await asyncio.to_thread(_trade_context_payload, backtest_id, trade_nr)
 
 
+def _resolve_trade(result: BacktestResult, trade_nr: int) -> tuple[Any, dict[str, Any]]:
+    """Locate a trade on the result and build its viewer payload."""
+    trade = next((item for item in result.trades if item.id == trade_nr), None)
+    if trade is None:
+        raise HTTPException(status_code=404, detail=f"Trade #{trade_nr} not found")
+    return trade, legacy_viewer._trade_to_viewer(trade)
+
+
+def _trade_window_ohlcv(
+    result: BacktestResult, trade: Any
+) -> tuple[list[dict[str, Any]], pd.DataFrame, int, int]:
+    """OHLCV window around a trade's entry bar, plus the source frame and bounds."""
+    timeframe = _replay_timeframe(result)
+    symbol = str(trade.symbol or "").strip() or "SPY"
+    df, details = _load_symbol_ohlcv_with_details(symbol, timeframe, result)
+    if df is None:
+        raise HTTPException(status_code=404, detail=details)
+
+    ohlcv_start_idx = 0
+    ohlcv_end_idx = 0
+    entry_ts_raw = pd.to_datetime(trade.entry_time, utc=True, errors="coerce")
+    entry_ts = pd.Timestamp(entry_ts_raw) if not pd.isna(entry_ts_raw) else None
+    if entry_ts is not None:
+        idx = df["timestamp"].searchsorted(entry_ts)
+        ohlcv_start_idx = max(0, idx - legacy_viewer.BARS_BEFORE)
+        ohlcv_end_idx = min(len(df), idx + legacy_viewer.BARS_AFTER)
+        ohlcv = legacy_viewer._df_to_ohlcv_records(df.iloc[ohlcv_start_idx:ohlcv_end_idx])
+    else:
+        ohlcv = []
+    return ohlcv, df, ohlcv_start_idx, ohlcv_end_idx
+
+
+def _trade_context_indicators(
+    result: BacktestResult,
+    df: pd.DataFrame,
+    ohlcv: list[dict[str, Any]],
+    ohlcv_start_idx: int,
+    ohlcv_end_idx: int,
+) -> list[dict[str, Any]]:
+    """Indicators for the trade window: payload ones, else auto-detected ones."""
+    indicators = _normalize_indicator_payloads(list(result.indicators))
+    if indicators or not ohlcv:
+        return indicators
+
+    detected = _detect_or_empty(result)
+    if not detected:
+        return indicators
+
+    ohlcv_times = [row["time"] for row in ohlcv]
+    warmup_start = max(0, ohlcv_start_idx - 50)
+    df_slice = df.iloc[warmup_start:ohlcv_end_idx].reset_index(drop=True)
+    return legacy_viewer._compute_indicators(df_slice, detected, ohlcv_times)
+
+
 def _trade_context_payload(backtest_id: str, trade_nr: int) -> dict[str, Any]:
     result = _load_result(backtest_id)
     if result is None:
         raise HTTPException(status_code=404, detail="Not found")
     try:
-        trade = next((item for item in result.trades if item.id == trade_nr), None)
-        if trade is None:
-            raise HTTPException(status_code=404, detail=f"Trade #{trade_nr} not found")
-
-        trade_payload = legacy_viewer._trade_to_viewer(trade)
-        timeframe = (
-            result.meta.data.get("timeframes", ["1h"])[0] if result.meta.data.get("timeframes") else "1h"
-        )
-        timeframe = normalize_timeframe(timeframe)
+        trade, trade_payload = _resolve_trade(result, trade_nr)
         symbol = str(trade.symbol or "").strip() or "SPY"
-
-        ohlcv: list[dict[str, Any]] = []
-        df = legacy_viewer._load_ohlcv_df(symbol, timeframe)
-        if df is None or len(df) == 0:
-            details = legacy_viewer._missing_ohlcv_details(
-                symbol,
-                timeframe,
-                backtest_start=str(result.meta.backtest_start or ""),
-                backtest_end=str(result.meta.backtest_end or ""),
-            )
-            raise HTTPException(status_code=404, detail=details)
-
-        ohlcv_start_idx = 0
-        ohlcv_end_idx = 0
-        entry_ts_raw = pd.to_datetime(trade.entry_time, utc=True, errors="coerce")
-        entry_ts = pd.Timestamp(entry_ts_raw) if not pd.isna(entry_ts_raw) else None
-        if entry_ts is not None:
-            idx = df["timestamp"].searchsorted(entry_ts)
-            ohlcv_start_idx = max(0, idx - legacy_viewer.BARS_BEFORE)
-            ohlcv_end_idx = min(len(df), idx + legacy_viewer.BARS_AFTER)
-            ohlcv = legacy_viewer._df_to_ohlcv_records(df.iloc[ohlcv_start_idx:ohlcv_end_idx])
-
-        indicators = _normalize_indicator_payloads(list(result.indicators))
+        ohlcv, df, ohlcv_start_idx, ohlcv_end_idx = _trade_window_ohlcv(result, trade)
+        indicators = _trade_context_indicators(
+            result, df, ohlcv, ohlcv_start_idx, ohlcv_end_idx
+        )
         drawings = _collect_viewer_drawings(result, symbol)
-
-        if not indicators and ohlcv and df is not None:
-            strategy_identifier = result.meta.strategies[0] if result.meta.strategies else ""
-            detected = legacy_viewer._detect_indicators(strategy_identifier)
-            if detected:
-                ohlcv_times = [row["time"] for row in ohlcv]
-                warmup_start = max(0, ohlcv_start_idx - 50)
-                df_slice = df.iloc[warmup_start:ohlcv_end_idx].reset_index(drop=True)
-                indicators = legacy_viewer._compute_indicators(df_slice, detected, ohlcv_times)
 
         if ohlcv and indicators:
             time_start = ohlcv[0]["time"]
@@ -7656,7 +7703,7 @@ def _trade_context_payload(backtest_id: str, trade_nr: int) -> dict[str, Any]:
             "trade": trade_payload,
             "ohlcv": ohlcv,
             "symbol": symbol,
-            "timeframe": timeframe,
+            "timeframe": _replay_timeframe(result),
             "indicators": indicators,
             "drawings": drawings,
             "total_trades": len(result.trades),
@@ -7678,56 +7725,78 @@ async def get_backtest_replay(backtest_id: str) -> dict[str, Any]:
     return await asyncio.to_thread(_replay_payload, backtest_id)
 
 
+def _replay_symbols(result: BacktestResult) -> list[str]:
+    """Symbols to load for a replay: from trades, else the configured ones."""
+    from_trades = sorted({trade.symbol for trade in result.trades if trade.symbol})
+    return from_trades or list(result.meta.data.get("symbols", []))
+
+
+def _replay_ohlcv_by_symbol(
+    result: BacktestResult, timeframe: str, trades: list[dict[str, Any]], symbols: list[str]
+) -> tuple[dict[str, list[dict[str, Any]]], dict[str, dict[str, Any]]]:
+    """Per-symbol replay OHLCV; symbols without data are reported separately."""
+    ohlcv_by_symbol: dict[str, list[dict[str, Any]]] = {}
+    missing_ohlcv: dict[str, dict[str, Any]] = {}
+
+    for symbol in symbols:
+        df, details = _load_symbol_ohlcv_with_details(symbol, timeframe, result)
+        if df is None:
+            missing_ohlcv[symbol] = details
+            continue
+        symbol_trades = [
+            trade for trade in trades if str(trade.get("symbol") or "").upper() == symbol.upper()
+        ]
+        replay_df = _slice_replay_ohlcv(df, symbol_trades)
+        ohlcv_by_symbol[symbol] = legacy_viewer._df_to_ohlcv_records(replay_df)
+    return ohlcv_by_symbol, missing_ohlcv
+
+
+def _replay_indicators(
+    result: BacktestResult,
+    timeframe: str,
+    trades: list[dict[str, Any]],
+    ohlcv_by_symbol: dict[str, list[dict[str, Any]]],
+    primary_symbol: str,
+) -> list[dict[str, Any]]:
+    """Indicators for the replay: payload ones, else auto-detected on the primary symbol."""
+    indicators = _normalize_indicator_payloads(list(result.indicators))
+    if indicators:
+        return indicators
+
+    detected = _detect_or_empty(result)
+    if not detected:
+        return indicators
+
+    df = legacy_viewer._load_ohlcv_df(primary_symbol, timeframe)
+    if df is None or len(df) == 0:
+        return indicators
+
+    primary_trades = [
+        trade for trade in trades if str(trade.get("symbol") or "").upper() == primary_symbol.upper()
+    ]
+    replay_df = _slice_replay_ohlcv(df, primary_trades)
+    ohlcv_times = [row["time"] for row in ohlcv_by_symbol[primary_symbol]]
+    return legacy_viewer._compute_indicators(replay_df, detected, ohlcv_times)
+
+
 def _replay_payload(backtest_id: str) -> dict[str, Any]:
     result = _load_result(backtest_id)
     if result is None:
         raise HTTPException(status_code=404, detail="Not found")
     try:
         trades = [legacy_viewer._trade_to_viewer(trade) for trade in result.trades]
-        timeframe = (
-            result.meta.data.get("timeframes", ["1h"])[0] if result.meta.data.get("timeframes") else "1h"
+        timeframe = _replay_timeframe(result)
+        symbols = _replay_symbols(result)
+
+        ohlcv_by_symbol, missing_ohlcv = _replay_ohlcv_by_symbol(
+            result, timeframe, trades, symbols
         )
-        timeframe = normalize_timeframe(timeframe)
-        symbols = sorted({trade.symbol for trade in result.trades if trade.symbol}) or list(
-            result.meta.data.get("symbols", [])
-        )
-
-        ohlcv_by_symbol: dict[str, list[dict[str, Any]]] = {}
-        missing_ohlcv: dict[str, dict[str, Any]] = {}
-
-        for symbol in symbols:
-            df = legacy_viewer._load_ohlcv_df(symbol, timeframe)
-            if df is None or len(df) == 0:
-                missing_ohlcv[symbol] = legacy_viewer._missing_ohlcv_details(
-                    symbol,
-                    timeframe,
-                    backtest_start=str(result.meta.backtest_start or ""),
-                    backtest_end=str(result.meta.backtest_end or ""),
-                )
-                continue
-            symbol_trades = [trade for trade in trades if str(trade.get("symbol") or "").upper() == symbol.upper()]
-            replay_df = _slice_replay_ohlcv(df, symbol_trades)
-            ohlcv_by_symbol[symbol] = legacy_viewer._df_to_ohlcv_records(replay_df)
-
         if not ohlcv_by_symbol:
             detail = next(iter(missing_ohlcv.values()), {"message": "No OHLCV data available"})
             raise HTTPException(status_code=404, detail=detail)
 
         primary_symbol = next(iter(ohlcv_by_symbol))
-        indicators = _normalize_indicator_payloads(list(result.indicators))
-
-        if not indicators:
-            df = legacy_viewer._load_ohlcv_df(primary_symbol, timeframe)
-            if df is not None and len(df) > 0:
-                strategy_identifier = result.meta.strategies[0] if result.meta.strategies else ""
-                detected = legacy_viewer._detect_indicators(strategy_identifier)
-                if detected:
-                    primary_trades = [
-                        trade for trade in trades if str(trade.get("symbol") or "").upper() == primary_symbol.upper()
-                    ]
-                    replay_df = _slice_replay_ohlcv(df, primary_trades)
-                    ohlcv_times = [row["time"] for row in ohlcv_by_symbol[primary_symbol]]
-                    indicators = legacy_viewer._compute_indicators(replay_df, detected, ohlcv_times)
+        indicators = _replay_indicators(result, timeframe, trades, ohlcv_by_symbol, primary_symbol)
 
         if indicators and ohlcv_by_symbol.get(primary_symbol):
             symbol_ohlcv = ohlcv_by_symbol[primary_symbol]
@@ -10188,7 +10257,7 @@ def _data_overview_payload() -> dict[str, Any]:
     return {"categories": sorted(result, key=lambda item: str(item.get("name") or ""))}
 
 
-@app.get("/api/data/overview", response_model=dict[str, Any])
+@app.get("/api/data/overview")
 async def data_overview() -> dict[str, Any]:
     return await asyncio.to_thread(_data_overview_payload)
 
@@ -10236,7 +10305,7 @@ def _data_category_payload(category_name: str) -> dict[str, Any]:
     }
 
 
-@app.get("/api/data/category/{category_name}", response_model=dict[str, Any])
+@app.get("/api/data/category/{category_name}")
 async def data_category_details(category_name: str) -> dict[str, Any]:
     return await asyncio.to_thread(_data_category_payload, category_name)
 
@@ -11013,54 +11082,58 @@ async def list_symbols() -> SymbolsResponse:
     )
 
 
-def _benchmark_payload(
-    symbol: str,
-    start: str,
-    end: str,
-    timeframe: str,
-) -> BenchmarkResponse:
-    timeframe = normalize_timeframe(timeframe)
+_BENCHMARK_AGG = {
+    "open": "first",
+    "high": "max",
+    "low": "min",
+    "close": "last",
+    "volume": "sum",
+}
+
+
+def _resample_to_daily(df: pd.DataFrame) -> pd.DataFrame:
+    """Resample an intraday frame to daily bars keyed by a `timestamp` column."""
+    daily = (
+        df.set_index("timestamp")
+        .resample("1D")
+        .agg(_BENCHMARK_AGG)
+        .dropna()
+        .reset_index()
+    )
+    return daily.rename(columns={"index": "timestamp"})
+
+
+def _load_benchmark_daily_df(symbol: str, timeframe: str) -> tuple[pd.DataFrame | None, str]:
+    """Frame for a benchmark request; intraday sources are resampled to 1d."""
     df = legacy_viewer._load_ohlcv_df(symbol, timeframe)
-    if df is None and timeframe == "1d":
-        for fallback_tf in ["4h", "1h", "15m"]:
-            df = legacy_viewer._load_ohlcv_df(symbol, fallback_tf)
-            if df is None:
-                continue
+    if df is not None:
+        return df, timeframe
 
-            if "timestamp" in df.columns:
-                df = df.set_index("timestamp")
-            df = (
-                df.resample("1D")
-                .agg(
-                    {
-                        "open": "first",
-                        "high": "max",
-                        "low": "min",
-                        "close": "last",
-                        "volume": "sum",
-                    }
-                )
-                .dropna()
-                .reset_index()
-            )
-            df.rename(columns={"index": "timestamp"} if "index" in df.columns else {}, inplace=True)
-            if "timestamp" not in df.columns and df.index.name == "timestamp":
-                df = df.reset_index()
-            timeframe = "1d"
-            logger.info("Benchmark %s: using %s resampled to 1d", symbol, fallback_tf)
-            break
+    if timeframe != "1d":
+        return None, timeframe
 
-    if df is None:
-        raise HTTPException(status_code=404, detail=f"No data for {symbol}/{timeframe}")
+    for fallback_tf in ["4h", "1h", "15m"]:
+        intraday = legacy_viewer._load_ohlcv_df(symbol, fallback_tf)
+        if intraday is None:
+            continue
+        logger.info("Benchmark %s: using %s resampled to 1d", symbol, fallback_tf)
+        return _resample_to_daily(intraday), "1d"
+    return None, timeframe
 
+
+def _filter_benchmark_df(
+    df: pd.DataFrame, start: str, end: str
+) -> pd.DataFrame:
+    """Restrict a benchmark frame to the requested window."""
     if start and "timestamp" in df.columns:
         df = df[df["timestamp"] >= start]
     if end and "timestamp" in df.columns:
         df = df[df["timestamp"] <= end]
-    if df.empty:
-        raise HTTPException(status_code=404, detail="No data in range")
+    return df
 
-    initial = 100000.0
+
+def _benchmark_equity_points(df: pd.DataFrame, initial: float = 100000.0) -> list[BenchmarkPoint]:
+    """Buy-and-hold equity curve over the frame's closes."""
     first_close = float(df.iloc[0]["close"])
     shares = initial / first_close
 
@@ -11069,11 +11142,30 @@ def _benchmark_payload(
         ts = row["timestamp"]
         unix_ts = ts.timestamp() if hasattr(ts, "timestamp") else pd.Timestamp(ts).timestamp()
         equity.append(BenchmarkPoint(time=float(unix_ts), equity=round(float(row["close"]) * shares, 2)))
+    return equity
 
-    return BenchmarkResponse(symbol=symbol, timeframe=timeframe, equity=equity)
+
+def _benchmark_payload(
+    symbol: str,
+    start: str,
+    end: str,
+    timeframe: str,
+) -> BenchmarkResponse:
+    timeframe = normalize_timeframe(timeframe)
+    df, timeframe = _load_benchmark_daily_df(symbol, timeframe)
+    if df is None:
+        raise HTTPException(status_code=404, detail=f"No data for {symbol}/{timeframe}")
+
+    df = _filter_benchmark_df(df, start, end)
+    if df.empty:
+        raise HTTPException(status_code=404, detail="No data in range")
+
+    return BenchmarkResponse(
+        symbol=symbol, timeframe=timeframe, equity=_benchmark_equity_points(df)
+    )
 
 
-@app.get("/api/benchmark/{symbol}", response_model=BenchmarkResponse)
+@app.get("/api/benchmark/{symbol}")
 async def get_benchmark(
     symbol: str,
     start: str = Query(default=""),

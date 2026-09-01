@@ -12,6 +12,24 @@ interface StatCardProps {
   percentScale?: PercentScale;
 }
 
+const NEUTRAL_COLOR = "#c9d1d9";
+const POSITIVE_COLOR = "#3fb950";
+const NEGATIVE_COLOR = "#f85149";
+
+/** Auto-detect the value color when the caller did not pin one. */
+function resolveStatColor(
+  color: string | undefined,
+  format: StatCardProps["format"],
+  numVal: number,
+  finite: boolean,
+): string {
+  if (color) return color;
+  if (!finite || (format !== "currency" && format !== "percent")) return NEUTRAL_COLOR;
+  if (numVal > 0) return POSITIVE_COLOR;
+  if (numVal < 0) return NEGATIVE_COLOR;
+  return NEUTRAL_COLOR;
+}
+
 export const StatCard = memo(function StatCard({
   label,
   value,
@@ -21,7 +39,7 @@ export const StatCard = memo(function StatCard({
   percentScale = "points",
 }: StatCardProps) {
   const numVal = typeof value === "number" ? value : parseFloat(String(value));
-  const finite = !isNaN(numVal);
+  const finite = !Number.isNaN(numVal);
   let formatted = String(value);
 
   if (format === "currency" && finite) {
@@ -36,17 +54,6 @@ export const StatCard = memo(function StatCard({
   } else if (format === "number" && finite) {
     formatted = numVal.toLocaleString("en-US", { maximumFractionDigits: 2 });
   }
-
-  // Auto-detect color from value
-  const resolvedColor =
-    color ||
-    (finite && (format === "currency" || format === "percent")
-      ? numVal > 0
-        ? "#3fb950"
-        : numVal < 0
-          ? "#f85149"
-          : "#c9d1d9"
-      : "#c9d1d9");
 
   return (
     <div
@@ -73,7 +80,7 @@ export const StatCard = memo(function StatCard({
           fontSize: "1.25rem",
           fontWeight: 700,
           fontVariantNumeric: "tabular-nums",
-          color: resolvedColor,
+          color: resolveStatColor(color, format, numVal, finite),
         }}
       >
         {formatted}
