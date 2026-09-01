@@ -33,7 +33,14 @@ def _has_ohlcv_file(symbol: str, timeframe: str, data_dir: Any = None) -> bool:
 
 
 def _symbol_is_fresh(symbol: str) -> bool:
-    """A symbol counts as covered when every requested timeframe has a data file."""
+    """A symbol counts as covered when every requested timeframe has a data file.
+
+    "Covered" means a non-empty local parquet exists — it deliberately does not
+    check the data's age. A stale file is still treated as covered so the
+    refresh stays a cheap incremental no-op instead of re-downloading the whole
+    window on every tick; the advertised 7-day window is requested from the
+    downloader whenever a symbol is *not* covered.
+    """
     return all(_has_ohlcv_file(symbol, timeframe) for timeframe in REFRESH_TIMEFRAMES)
 
 
