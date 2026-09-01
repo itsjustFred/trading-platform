@@ -435,6 +435,41 @@ async def _prewarm_jforex_jvm_background() -> None:
         logger.warning("JForex JVM prewarm failed: %s", exc)
 
 
+def _run_coroutine_sync(coroutine_factory: Callable[[], Any]) -> Any:
+    """Drive an async helper from sync code without `asyncio.run()`.
+
+    The coroutine runs on its own worker thread with a private loop, so this
+    stays safe whether the caller is a worker thread or the event loop itself
+    (`asyncio.run()` would raise `RuntimeError` in the latter case and each
+    call would otherwise spin a throwaway loop).
+    """
+    result: dict[str, Any] = {}
+    done = threading.Event()
+
+    def _runner() -> None:
+        try:
+            result["payload"] = asyncio.run(coroutine_factory())
+        except BaseException as exc:  # re-raised on the joining thread
+            result["error"] = exc
+        finally:
+            done.set()
+
+    thread = threading.Thread(target=_runner, daemon=True, name="coro-sync-dispatch")
+    thread.start()
+    done.wait()
+    if "error" in result:
+        raise result["error"]
+    return result.get("payload")
+
+
+def _run_backtest_sync(runner: Callable[[Any], Any], payload: Any) -> Any:
+    """Invoke the async `run_backtest` route logic from sync helpers."""
+    async def _invoke() -> Any:
+        return await runner(payload)
+
+    return _run_coroutine_sync(lambda: _invoke())
+
+
 def _resume_interrupted_tasks() -> None:
     records = list_background_task_records(statuses=["interrupted", "queued"])
     for record in records:
@@ -488,7 +523,7 @@ def _resume_interrupted_tasks() -> None:
                     ),
                     parameters=dict(backtest_config.get("parameters") or {}),
                 )
-                restarted = asyncio.run(run_backtest(request_payload))
+                restarted = _run_backtest_sync(run_backtest, request_payload)
                 restarted_task_id = restarted.get("task_id") if isinstance(restarted, dict) else None
                 upsert_background_task_record(
                     task_id=task_id,
@@ -1298,7 +1333,7 @@ def _restart_interrupted_task(task_id: str) -> dict[str, Any]:
             ),
             parameters=dict(config_payload.get("parameters") or {}),
         )
-        restarted = asyncio.run(run_backtest(request_payload))
+        restarted = _run_backtest_sync(run_backtest, request_payload)
         _update_task_fields(
             task_id,
             status="completed",
@@ -3531,7 +3566,7 @@ def _serialize_service_payload(service: Service) -> dict[str, Any]:
 
 
 def _discover_live_accounts_payload() -> list[dict[str, Any]]:
-    discovered = asyncio.run(discover_configured_accounts())
+    discovered = _run_coroutine_sync(discover_configured_accounts)
     payload: list[dict[str, Any]] = []
     for account in discovered:
         if isinstance(account, dict):
