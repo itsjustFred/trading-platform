@@ -1665,6 +1665,13 @@ _DATA_SEGMENT_METADATA_KEYS = {
 }
 
 
+# Residual position size below this threshold is treated as flat. Broker
+# fills and aggregated quantities are floats; exact-zero equality (S1244)
+# leaves dust positions open and pollutes the average price of the next fill.
+# 1e-6 also absorbs the float error of closing fills that overshoot by dust.
+LIVE_POSITION_FLAT_THRESHOLD = 1e-6
+
+
 def _safe_float(value: object, default: float = 0.0) -> float:
     try:
         numeric = float(value)
@@ -3941,7 +3948,7 @@ def _calculate_realized_live_pnl(
         current_qty = state["qty"]
         current_avg = state["avg"]
 
-        if current_qty == 0.0:
+        if abs(current_qty) < LIVE_POSITION_FLAT_THRESHOLD:
             state["qty"] = delta
             state["avg"] = price
             continue
@@ -3964,7 +3971,7 @@ def _calculate_realized_live_pnl(
                 losses += 1
 
         new_qty = current_qty + delta
-        if new_qty == 0.0:
+        if abs(new_qty) < LIVE_POSITION_FLAT_THRESHOLD:
             state["qty"] = 0.0
             state["avg"] = 0.0
         elif current_qty * new_qty > 0:
