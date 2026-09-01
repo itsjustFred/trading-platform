@@ -110,11 +110,6 @@ def get_engine() -> Any:
     return _ENGINE
 
 
-def _get_engine_or_none() -> Any:
-    """Return the engine without creating it (used by read-only paths)."""
-    return globals().get("ENGINE") or _ENGINE
-
-
 # Backwards-compatible alias. New code should call get_engine(); importing
 # ENGINE no longer forces engine creation at import time.
 def __getattr__(name: str) -> Any:

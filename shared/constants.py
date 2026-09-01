@@ -45,69 +45,6 @@ _data_dir_env = os.environ.get("DATA_DIR") or os.environ.get("TRADING_DATA_DIR")
 _log_dir_env = os.environ.get("LOG_DIR")
 
 
-def _safe_path_exists(path: Path) -> bool:
-    try:
-        return path.exists()
-    except OSError:
-        return False
-
-
-def _home_candidates() -> list[Path]:
-    candidates: list[Path] = []
-    seen: set[str] = set()
-
-    def _add(path: Path | None) -> None:
-        if path is None:
-            return
-        normalized = str(path)
-        if not normalized or normalized in seen:
-            return
-        seen.add(normalized)
-        candidates.append(path)
-
-    home_env = os.environ.get("HOME")
-    if home_env:
-        _add(Path(home_env).expanduser())
-
-    if pwd is not None:
-        try:
-            _add(Path(pwd.getpwuid(os.getuid()).pw_dir))
-        except (KeyError, OSError):
-            pass
-
-        try:
-            project_owner_home = Path(pwd.getpwuid(PROJECT_ROOT.stat().st_uid).pw_dir)
-            _add(project_owner_home)
-        except (KeyError, OSError):
-            pass
-
-        for env_key in ("SUDO_USER", "USER"):
-            username = str(os.environ.get(env_key) or "").strip()
-            if not username:
-                continue
-            try:
-                _add(Path(pwd.getpwnam(username).pw_dir))
-            except (KeyError, OSError):
-                continue
-
-    return candidates
-
-
-def _data_dir_score(path: Path) -> int:
-    score = 0
-    if _safe_path_exists(path):
-        score += 1
-    if _safe_path_exists(path / "ohlcv"):
-        score += 100
-    if _safe_path_exists(path / "backtests.db"):
-        score += 30
-    if _safe_path_exists(path / "backtests"):
-        score += 20
-    if _safe_path_exists(path / "catalog.json"):
-        score += 10
-    return score
-
-
 def _resolve_data_dir(raw_value: str | None) -> Path:
     """Resolve DATA_DIR deterministically.
 
@@ -126,18 +63,14 @@ def _resolve_data_dir(raw_value: str | None) -> Path:
     return configured.resolve()
 
 
-_DATA_DIR_OVERRIDE: Path | None = None
-
-
 def set_data_dir(path: str | Path) -> None:
     """Override DATA_DIR for the current process (test isolation hook).
 
     Keeps the derived module-level constants (DATA_DIR, OPTIMIZATIONS_DIR)
     and the already-imported ``shared.database`` bindings in sync.
     """
-    global DATA_DIR, OPTIMIZATIONS_DIR, _DATA_DIR_OVERRIDE
+    global DATA_DIR, OPTIMIZATIONS_DIR
     resolved = Path(path).expanduser().resolve()
-    _DATA_DIR_OVERRIDE = resolved
     DATA_DIR = resolved
     OPTIMIZATIONS_DIR = DATA_DIR / "optimizations"
     try:
@@ -151,8 +84,7 @@ def set_data_dir(path: str | Path) -> None:
 
 def reset_data_dir() -> None:
     """Restore the process-wide DATA_DIR resolved from the environment."""
-    global DATA_DIR, OPTIMIZATIONS_DIR, _DATA_DIR_OVERRIDE
-    _DATA_DIR_OVERRIDE = None
+    global DATA_DIR, OPTIMIZATIONS_DIR
     DATA_DIR = _resolve_data_dir(os.environ.get("DATA_DIR") or os.environ.get("TRADING_DATA_DIR"))
     OPTIMIZATIONS_DIR = DATA_DIR / "optimizations"
     try:

@@ -37,28 +37,6 @@ def _symbol_is_fresh(symbol: str, start: datetime, end: datetime) -> bool:
     return all(_has_ohlcv_file(symbol, timeframe) for timeframe in REFRESH_TIMEFRAMES)
 
 
-def _write_progress(
-    *,
-    task_id: str,
-    service_id: str,
-    service_name: str,
-    config: dict[str, Any],
-    progress_message: str,
-) -> None:
-    asyncio.to_thread(
-        upsert_background_task_record,
-        task_id=task_id,
-        task_type="service",
-        status="running",
-        config_json=config,
-        progress_message=progress_message,
-        name=f"{service_name} · Weekly Data Refresh",
-        description=_DESCRIPTION,
-        source="scheduler",
-        updated_at=datetime.now(timezone.utc).isoformat(),
-    )
-
-
 async def run(*, task_id: str, service_id: str, service_name: str) -> dict[str, Any]:
     """Refresh the weekly data window and report the truthful outcome.
 
