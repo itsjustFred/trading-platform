@@ -8603,7 +8603,10 @@ async def _load_and_filter_csv_signals(
 @app.post(
     "/api/backtests/run-from-signals",
     status_code=202,
-    responses={403: {"description": "Signal CSV is outside the OHLCV data directory"}},
+    responses={
+        400: {"description": "Invalid signal_source, filepath, date range or no replayable signals"},
+        403: {"description": "Signal CSV is outside the OHLCV data directory"},
+    },
 )
 async def run_backtest_from_signals(payload: BacktestRunFromSignalsRequest) -> dict[str, Any]:
     source = str(payload.signal_source or "csv").strip().lower()
