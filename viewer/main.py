@@ -204,6 +204,44 @@ REPLAY_MAX_BARS_WITHOUT_TRADES = 15_000
 REPLAY_TARGET_BARS = 50_000
 REPLAY_MIN_BARS_PER_EVENT = 4
 REPLAY_MAX_BARS_PER_EVENT = (BARS_BEFORE * 2) + (BARS_AFTER * 3)
+BACKTEST_WATCHDOG_TIMEOUT_SECONDS = float(os.environ.get("BACKTEST_TIMEOUT_SECONDS", "300"))
+BACKTEST_WATCHDOG_POLL_SECONDS = 2.0
+
+
+def _monitor_backtest_process(
+    proc: subprocess.Popen,
+    *,
+    timeout_seconds: float = BACKTEST_WATCHDOG_TIMEOUT_SECONDS,
+    poll_interval: float = BACKTEST_WATCHDOG_POLL_SECONDS,
+) -> bool:
+    """Bound the whole child process lifetime.
+
+    Runs alongside the stdout pump; unlike a `proc.wait(timeout=...)` after
+    EOF, this watchdog fires even when a hung child never closes its stdout.
+    Kills the child when the deadline expires. Returns True when the child
+    exited inside the budget, False when the watchdog killed it.
+    """
+    deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+    while True:
+        if proc.poll() is not None:
+            return True
+        if time.monotonic() >= deadline:
+            logger.warning(
+                "Backtest watchdog: child pid %s exceeded %.0fs; terminating",
+                proc.pid,
+                timeout_seconds,
+            )
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                pass
+            return False
+        time.sleep(max(0.01, float(poll_interval)))
+
 
 DATA_TASKS = legacy_viewer.DATA_TASKS
 DATA_TASKS_LOCK = legacy_viewer.DATA_TASKS_LOCK
@@ -8058,6 +8096,20 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
                 )
                 _update_task_fields(task_id, pid=proc.pid, process=proc)
 
+                # Watchdog bounds the whole child lifetime: it fires even if
+                # a hung child never closes stdout (a post-EOF proc.wait()
+                # timeout would never cover that case).
+                watchdog = threading.Thread(
+                    target=_monitor_backtest_process,
+                    args=(proc,),
+                    kwargs={
+                        "timeout_seconds": BACKTEST_WATCHDOG_TIMEOUT_SECONDS,
+                    },
+                    daemon=True,
+                    name=f"backtest-watchdog-{task_id}",
+                )
+                watchdog.start()
+
                 if proc.stdout is not None:
                     for raw_line in proc.stdout:
                         line = raw_line.rstrip("\n")
@@ -8098,12 +8150,16 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
                                     backtest_id=backtest_id or None,
                                 )
 
+                # The watchdog owns the child-lifetime deadline; this wait only
+                # collects the exit status after EOF (or after the kill).
                 try:
-                    returncode = proc.wait(timeout=300)
+                    returncode = proc.wait(timeout=30)
                 except subprocess.TimeoutExpired:
                     if proc.poll() is None:
                         proc.kill()
-                    raise subprocess.SubprocessError("Backtest timed out after 300 seconds")
+                    raise subprocess.SubprocessError(
+                        "Backtest timed out after 300 seconds"
+                    )
                 if returncode == 0:
                     report_stage(handle, percent=96.0, message="Saving results...")
                     result_payload = {
