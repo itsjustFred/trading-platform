@@ -9,7 +9,13 @@ const appVersion = require('./package.json').version
 
 let gitSha = 'unknown'
 try {
-  gitSha = execSync('git rev-parse --short HEAD', { stdio: ['ignore', 'pipe', 'ignore'] })
+  // Minimal, fixed environment (no inherited, potentially writeable PATH
+  // entries): only the standard fixed system directories are searched, and
+  // git is resolved with an absolute binary path. SonarCloud S4036.
+  gitSha = execSync('git rev-parse --short HEAD', {
+    stdio: ['ignore', 'pipe', 'ignore'],
+    env: { PATH: '/usr/bin:/bin:/usr/local/bin' },
+  })
     .toString()
     .trim()
 } catch {

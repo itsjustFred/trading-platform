@@ -9,9 +9,11 @@ import { ToastProvider } from "./components/ToastProvider";
 import { initFrontendSentry } from "./lib/sentryConfig";
 import { queryClient } from "./lib/queryClient";
 
-initFrontendSentry().catch((error) => {
+try {
+  await initFrontendSentry();
+} catch (error) {
   console.error("Sentry initialization failed", error);
-});
+}
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
