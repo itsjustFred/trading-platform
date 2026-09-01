@@ -32,7 +32,7 @@ def _has_ohlcv_file(symbol: str, timeframe: str, data_dir: Any = None) -> bool:
     return any(path.stat().st_size > 0 for path in matches if path.is_file())
 
 
-def _symbol_is_fresh(symbol: str, start: datetime, end: datetime) -> bool:
+def _symbol_is_fresh(symbol: str) -> bool:
     """A symbol counts as covered when every requested timeframe has a data file."""
     return all(_has_ohlcv_file(symbol, timeframe) for timeframe in REFRESH_TIMEFRAMES)
 
@@ -94,7 +94,7 @@ async def run(*, task_id: str, service_id: str, service_name: str) -> dict[str, 
         updated_at=end.isoformat(),
     )
 
-    covered = [symbol for symbol in REFRESH_SYMBOLS if _symbol_is_fresh(symbol, start, end)]
+    covered = [symbol for symbol in REFRESH_SYMBOLS if _symbol_is_fresh(symbol)]
     missing = [symbol for symbol in REFRESH_SYMBOLS if symbol not in covered]
 
     refreshed: list[str] = []
@@ -136,7 +136,7 @@ async def run(*, task_id: str, service_id: str, service_name: str) -> dict[str, 
                         end=end.strftime("%Y-%m-%d"),
                         modeling_resolution="main_timeframe",
                     )
-                if _symbol_is_fresh(symbol, start, end):
+                if _symbol_is_fresh(symbol):
                     refreshed.append(symbol)
                 else:
                     errors.append(

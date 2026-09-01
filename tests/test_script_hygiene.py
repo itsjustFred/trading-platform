@@ -8,8 +8,6 @@ from __future__ import annotations
 
 import importlib.util
 import json
-import os
-import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -30,7 +28,6 @@ def _load_script(name: str):
 
 def test_discovery_does_not_write_mock_results(tmp_path: Path, monkeypatch) -> None:
     """The discovery script must not publish mock rows into the consumed directory."""
-    monkeypatch.setattr(sys, "path", sys.path.copy())
     module = _load_script("overnight_strategy_discovery.py")
     output_dir = tmp_path / "discovered_strategies"
     monkeypatch.setattr(module, "DISCOVERED_DIR", output_dir)
@@ -61,7 +58,7 @@ def test_discovery_requires_explicit_flag_to_write(tmp_path: Path, monkeypatch) 
 # ─── matrix_queue_runner lock ─────────────────────────────────────────────────
 
 
-@pytest.fixture()
+@pytest.fixture
 def queue_runner(tmp_path: Path, monkeypatch):
     module = _load_script("matrix_queue_runner.py")
     matrix_dir = tmp_path / "matrix"

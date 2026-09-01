@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 
 
-@pytest.fixture()
+@pytest.fixture
 def no_strategy_imports(monkeypatch):
     """Block exec/import of strategy files for the duration of a test."""
 
