@@ -202,13 +202,18 @@ async def run(*, task_id: str, service_id: str, service_name: str) -> dict[str, 
         current = "Skipped: no data downloaded"
     else:
         # Some symbols were not fresh and a download was attempted. `refreshed`
-        # is a subset of `missing` that actually produced window coverage.
-        status = "completed" if len(refreshed) == len(REFRESH_SYMBOLS) else "partial"
+        # is the subset of `missing` whose download produced real window
+        # coverage; `covered` are the symbols that were already fresh before
+        # the run, so "completed" requires both groups to cover every symbol.
+        fully_covered = len(covered) + len(refreshed)
+        status = "completed" if fully_covered == len(REFRESH_SYMBOLS) else "partial"
         progress_message = (
-            f"Weekly data refresh {status}: refreshed {len(refreshed)} of "
-            f"{len(REFRESH_SYMBOLS)} symbols"
+            f"Weekly data refresh {status}: {fully_covered} of "
+            f"{len(REFRESH_SYMBOLS)} symbols cover the window"
         )
-        current = f"{status.capitalize()}: {len(refreshed)}/{len(REFRESH_SYMBOLS)} refreshed"
+        current = (
+            f"{status.capitalize()}: {fully_covered}/{len(REFRESH_SYMBOLS)} refreshed"
+        )
 
     completed_count = len(refreshed) if status in {"completed", "partial"} else 0
     failed_count = len(errors) if errors else 0
@@ -370,19 +375,21 @@ async def _download_missing_symbols(
                     end=end.strftime("%Y-%m-%d"),
                     modeling_resolution="main_timeframe",
                 )
-            _record_progress_sync(
-                task_id=task_id,
-                service_id=service_id,
-                service_name=service_name,
-                base_config=base_config,
-                completed=index,
-                total_missing=total_missing,
-                message=f"Downloaded {symbol}",
-            )
             if _symbol_is_fresh(
                 symbol, start=start.strftime("%Y-%m-%d"), end=end.strftime("%Y-%m-%d")
             ):
+                # Only count the symbol as finished (and record the progress)
+                # once the coverage check actually passed.
                 refreshed.append(symbol)
+                _record_progress_sync(
+                    task_id=task_id,
+                    service_id=service_id,
+                    service_name=service_name,
+                    base_config=base_config,
+                    completed=index,
+                    total_missing=total_missing,
+                    message=f"Downloaded {symbol}",
+                )
             else:
                 errors.append(
                     f"{symbol}: download completed but no OHLCV data covering "

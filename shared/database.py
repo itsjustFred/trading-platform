@@ -82,16 +82,22 @@ def _default_database_url() -> str:
     return _sqlite_url(DATA_DIR / "backtests.db")
 
 
+def _is_sqlite_url(url: str) -> bool:
+    return url.strip().lower().startswith("sqlite")
+
+
 def _create_database_engine() -> Any:
     url = os.environ.get("DATABASE_URL") or _default_database_url()
-    return create_engine(
-        url,
-        echo=False,
-        connect_args={
-            "check_same_thread": False,
-            "timeout": 30.0,
-        },
+    # SQLite-specific connect args (and the WAL pragma listener) are only
+    # meaningful for SQLite: passing check_same_thread/timeout to another
+    # dialect is an error.
+    connect_args = (
+        {"check_same_thread": False, "timeout": 30.0} if _is_sqlite_url(url) else {}
     )
+    engine = create_engine(url, echo=False, connect_args=connect_args)
+    if _is_sqlite_url(url):
+        event.listen(engine, "connect", _configure_sqlite_connection)
+    return engine
 
 
 _ENGINE: Any = None
@@ -145,8 +151,9 @@ def get_engine() -> Any:
     if _ENGINE is None:
         with _ENGINE_LOCK:
             if _ENGINE is None:
+                # _create_database_engine registers the SQLite pragma listener
+                # itself; no second listener here (it would fire twice).
                 _ENGINE = _create_database_engine()
-                event.listen(_ENGINE, "connect", _configure_sqlite_connection)
     return _ENGINE
 
 
@@ -198,7 +205,7 @@ def is_final_task_status(status: object) -> bool:
     reported outcome) do not have to import the private ``_FINAL_TASK_STATUSES``
     set.
     """
-    return status in _FINAL_TASK_STATUSES
+    return isinstance(status, str) and status in _FINAL_TASK_STATUSES
 _TASK_STATUS_TO_EVIDENCE_STATUS = {
     "completed": VerificationEvidenceStatus.SUCCESS.value,
     "failed": VerificationEvidenceStatus.FAILED.value,

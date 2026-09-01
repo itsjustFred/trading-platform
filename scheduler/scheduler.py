@@ -223,6 +223,7 @@ class ServiceScheduler:
                     handler_result = result
             complete_config = dict(base_config)
             final_status = str(handler_status or "completed")
+            succeeded = final_status == "completed"
             if handler_result is not None:
                 complete_config["result"] = dict(handler_result)
                 detail = handler_result.get("errors") or []
@@ -232,21 +233,23 @@ class ServiceScheduler:
                     else f"Completed ({final_status})"
                 )
             else:
-                current = "Completed"
+                current = "Completed" if succeeded else final_status
             complete_config.update(
                 {
                     "finished_at": finished.isoformat(),
                     "progress_percent": 100.0,
                     "progress_detail": {
-                        "completed": 1,
-                        "failed": 0,
+                        "completed": 1 if succeeded else 0,
+                        "failed": 1 if final_status == "failed" else 0,
                         "total": 1,
                         "percent": 100.0,
                         "current": current,
                     },
-                    "result": complete_config.get("result") or {"status": "completed"},
+                    "result": complete_config.get("result") or {"status": final_status},
                 }
             )
+            if not succeeded:
+                complete_config["error"] = current
             await asyncio.to_thread(
                 upsert_background_task_record,
                 task_id=task_id,
