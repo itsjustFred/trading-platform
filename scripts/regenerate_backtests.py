@@ -452,6 +452,7 @@ def plan_regeneration(
         plan.entries.append(
             {
                 "strategy": strategy_path.stem,
+                "path": str(strategy_path),
                 "engine": engine_name,
                 "symbol": symbol,
                 "timeframe": timeframe,
@@ -568,11 +569,9 @@ def _snapshot_corpus(resolved_backup_dir: Path) -> None:
     print(f"Backup snapshot: {resolved_backup_dir} ({json_backed_up} JSON file(s))")
 
 
-def _execute_runs(
-    strategies: list[str] | None, plan: RegenerationPlan
-) -> tuple[int, int, list[str]]:
+def _execute_runs(plan: RegenerationPlan) -> tuple[int, int, list[str]]:
     """Run the planned strategies, returning (successes, skipped, failures)."""
-    failures: list[str] = list(plan.skipped)
+    failures: list[str] = []
     successes = 0
     skipped = 0
 
@@ -582,19 +581,15 @@ def _execute_runs(
             print(f"  - {message}")
         return successes, skipped, failures
 
-    strategy_paths = _strategy_paths(strategies)
-    for strategy_path, entry in zip(strategy_paths, plan.entries, strict=False):
-        strategy_type = detect_strategy_type(strategy_path, DEFAULT_STRATEGIES_DIR)
-        if strategy_type == StrategyType.SIGNAL_PROCESSOR:
-            skipped += 1
-            continue
+    for entry in plan.entries:
+        strategy_path = Path(entry["path"])
         try:
             _run_strategy(entry, strategy_path, data_dir=DATA_DIR, backtests_dir=BACKTESTS_DIR)
             successes += 1
         except BacktestRunError as exc:
             failures.append(str(exc))
         except (OSError, RuntimeError, ValueError, KeyError, ImportError) as exc:
-            failures.append(f"{strategy_path.stem}: run failed ({exc})")
+            failures.append(f"{entry['strategy']}: run failed ({exc})")
     return successes, skipped, failures
 
 
@@ -645,7 +640,7 @@ def regenerate(
     print(f"Purged existing corpus: sqlite backtests + {purged_json} JSON file(s)")
 
     plan = plan_regeneration(strategies=strategies)
-    successes, skipped, failures = _execute_runs(strategies, plan)
+    successes, skipped, failures = _execute_runs(plan)
 
     outcome.successes = successes
     outcome.skipped = skipped

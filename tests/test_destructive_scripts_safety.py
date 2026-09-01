@@ -84,7 +84,9 @@ def _seed_corpus(database, tmp_path: Path) -> Path:
 
 
 def _parquet_frame(start_hour: int, rows: int) -> pd.DataFrame:
-    stamps = pd.date_range("2024-01-01", periods=rows, freq="1h", tz="UTC")
+    stamps = pd.date_range("2024-01-01", periods=rows, freq="1h", tz="UTC") + pd.Timedelta(
+        hours=start_hour
+    )
     return pd.DataFrame(
         {
             "timestamp": stamps,
@@ -101,9 +103,11 @@ def _parquet_frame(start_hour: int, rows: int) -> pd.DataFrame:
 def ohlcv_root(tmp_path: Path) -> Path:
     root = tmp_path / "ohlcv" / "EURUSD"
     root.mkdir(parents=True)
+    # Disjoint timestamps so the deduped merge of both fragments is 5 rows.
     frame = _parquet_frame(0, 3)
     frame.to_parquet(root / "1h.parquet", index=False)
-    frame.iloc[:2].to_parquet(root / "1h_part2.parquet", index=False)
+    frame = _parquet_frame(10, 2)
+    frame.to_parquet(root / "1h_part2.parquet", index=False)
     return tmp_path / "ohlcv"
 
 
@@ -160,7 +164,7 @@ def test_consolidate_is_reversible_from_backup(ohlcv_root):
     assert restored == snapshot
 
 
-def test_consolidate_unreadable_fragment_aborts_without_changes(ohlcv_root):
+def test_consolidate_unreadable_fragment_aborts_before_deleting_fragments(ohlcv_root):
     from scripts.consolidate_parquets import consolidate
 
     (ohlcv_root / "EURUSD" / "broken_part3.parquet").write_bytes(b"not a parquet file")
@@ -168,10 +172,12 @@ def test_consolidate_unreadable_fragment_aborts_without_changes(ohlcv_root):
     with pytest.raises(pyarrow.lib.ArrowInvalid):
         consolidate(ohlcv_root, backup_dir=ohlcv_root.parent / "backup")
 
+    # All original fragments survive: deletion happens only after every merge
+    # succeeded, so a failure while reading one fragment aborts the whole run.
     names = sorted(p.name for p in ohlcv_root.rglob("*.parquet"))
     assert "1h.parquet" in names
     assert "1h_part2.parquet" in names
-    assert (ohlcv_root / "EURUSD" / "1h.parquet").read_bytes() != b""
+    assert "broken_part3.parquet" in names
 
 
 def test_consolidate_confirmed_run_merges_fragments(ohlcv_root):
@@ -182,7 +188,8 @@ def test_consolidate_confirmed_run_merges_fragments(ohlcv_root):
     assert (merged, deleted) == (1, 1)
     merged_frame = pd.read_parquet(ohlcv_root / "EURUSD" / "1h.parquet")
     assert list(merged_frame["timestamp"]) == list(merged_frame["timestamp"].sort_values())
-    assert len(merged_frame) == 3
+    # 3 rows from 1h.parquet + 2 non-overlapping rows from 1h_part2.parquet.
+    assert len(merged_frame) == 5
 
 
 def test_consolidate_refuses_backup_dir_inside_tree(ohlcv_root):

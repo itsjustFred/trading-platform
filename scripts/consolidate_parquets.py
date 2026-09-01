@@ -109,10 +109,12 @@ def _validate_backup_dir(backup_dir: Path, root: Path) -> Path:
     ``--backup-dir`` arrives from the command line, so it is resolved and checked
     before anything touches the file system: it must not be the OHLCV tree itself
     or live inside it — a snapshot inside ``root`` would be picked up as parquet
-    fragments (and deleted) by the very next consolidation run.
+    fragments (and deleted) by the very next consolidation run. ``root`` is
+    resolved as well, so relative or symlinked roots compare correctly.
     """
     resolved = backup_dir.expanduser().resolve()
-    if resolved == root or root in resolved.parents:
+    resolved_root = root.expanduser().resolve()
+    if resolved == resolved_root or resolved_root in resolved.parents:
         raise ValueError(
             f"Backup directory {resolved} must live outside the OHLCV tree {root} — "
             "a snapshot inside the tree would be consolidated and deleted by the next run."
