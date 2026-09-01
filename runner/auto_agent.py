@@ -795,6 +795,9 @@ def _build_backtest_command(
     return cmd
 
 
+BACKTEST_TIMEOUT_SECONDS = 1800
+
+
 def _run_backtest(cmd: list[str], *, log: TaskLogger | None) -> tuple[int, str]:
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
@@ -817,7 +820,15 @@ def _run_backtest(cmd: list[str], *, log: TaskLogger | None) -> tuple[int, str]:
                 output_lines.append(line)
                 _log(log, line.rstrip("\n"), stream="stdout")
     finally:
-        returncode = proc.wait()
+        try:
+            returncode = proc.wait(timeout=BACKTEST_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=30)
+            raise RuntimeError(
+                f"Generated-strategy backtest timed out after "
+                f"{BACKTEST_TIMEOUT_SECONDS} seconds: {' '.join(cmd)}"
+            )
 
     return returncode, "".join(output_lines)
 
