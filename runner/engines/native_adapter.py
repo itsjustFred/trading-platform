@@ -114,7 +114,11 @@ class NativeAdapter(EngineAdapter):
         for symbol_index, symbol in enumerate(config.symbols):
             data = _load_ohlcv(data_root, symbol, config.timeframe, config.start_date, config.end_date)
             if data is None or data.empty:
-                continue
+                raise RuntimeError(
+                    f"No OHLCV data for {symbol}/{config.timeframe} in "
+                    f"{config.start_date}..{config.end_date} under {data_root}; "
+                    "refusing to run a silent empty backtest"
+                )
             total_loaded_bars += len(data)
 
             symbol_start = 10.0 + (80.0 * symbol_index / symbols_total)
