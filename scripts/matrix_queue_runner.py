@@ -29,6 +29,13 @@ ENGINE = os.environ.get("MATRIX_ENGINE", "vectorbt")
 LOCK_TTL_SECONDS = int(os.environ.get("MATRIX_LOCK_TTL_SECONDS", "7200"))
 
 sys.path.insert(0, str(REPO))
+# Ensure this script's own checkout wins over the hardcoded REPO default when the
+# script is executed from a different worktree (tests import it via importlib).
+_HERE = str(Path(__file__).resolve().parent.parent)
+if _HERE != str(REPO) and _HERE in sys.path:
+    sys.path.remove(_HERE)
+    sys.path.insert(0, _HERE)
+    sys.path.insert(1, str(REPO))
 
 from shared.strategy_registry import iter_strategy_files, strategy_slug_for_path  # noqa: E402
 

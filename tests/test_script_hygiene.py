@@ -139,3 +139,13 @@ def test_dedupe_dry_run_reports_without_deleting() -> None:
         deleted = module.dedupe_executions(dry_run=True)
 
     assert deleted == 0
+
+
+def test_dedupe_reports_without_confirm_too() -> None:
+    """The no-flag default (missing --confirm) is also a non-deleting dry run."""
+    module = _load_script("dedupe_executions.py")
+
+    with patch.object(module, "init_db"), patch.object(module, "get_session"):
+        deleted = module.dedupe_executions(confirm=False)
+
+    assert deleted == 0

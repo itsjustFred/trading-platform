@@ -88,9 +88,13 @@ def dedupe_executions(*, dry_run: bool = False, confirm: bool = False) -> int:
 
         if effective_dry_run:
             logger.info(
-                "Dry run: would delete %d duplicate rows%s",
-                len(duplicate_rowids),
-                "" if dry_run else " (pass --confirm to delete)",
+                "Dry run: no rows deleted",
+                extra={
+                    "data": {
+                        "would_delete": len(duplicate_rowids),
+                        "reason": "explicit_dry_run" if dry_run else "missing_confirm",
+                    }
+                },
             )
             return len(duplicate_rowids)
 

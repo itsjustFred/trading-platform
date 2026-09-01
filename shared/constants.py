@@ -73,13 +73,7 @@ def set_data_dir(path: str | Path) -> None:
     resolved = Path(path).expanduser().resolve()
     DATA_DIR = resolved
     OPTIMIZATIONS_DIR = DATA_DIR / "optimizations"
-    try:
-        import shared.database as database
-
-        database.DATA_DIR = DATA_DIR
-        database.DB_PATH = DATA_DIR / "backtests.db"
-    except ImportError:
-        pass
+    _sync_database_paths()
 
 
 def reset_data_dir() -> None:
@@ -87,6 +81,11 @@ def reset_data_dir() -> None:
     global DATA_DIR, OPTIMIZATIONS_DIR
     DATA_DIR = _resolve_data_dir(os.environ.get("DATA_DIR") or os.environ.get("TRADING_DATA_DIR"))
     OPTIMIZATIONS_DIR = DATA_DIR / "optimizations"
+    _sync_database_paths()
+
+
+def _sync_database_paths() -> None:
+    """Mirror DATA_DIR/DB_PATH into shared.database (no-op before it is imported)."""
     try:
         import shared.database as database
 
