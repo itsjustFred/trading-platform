@@ -208,3 +208,36 @@ def test_session_finish_summary_is_silent_without_skips(gate, capsys):
     )
 
     assert capsys.readouterr().out == ""
+
+
+def _config_without_terminalreporter() -> object:
+    return type(
+        "Config",
+        (),
+        {"pluginmanager": type("PM", (), {"get_plugin": lambda self, name: None})()},
+    )()
+
+
+def test_strict_mode_failures_are_not_counted_as_skips(gate, tmp_path, capsys):
+    """A strict-mode gate failure must not be reported as a skip.
+
+    The summary has to agree with the exit status: if it labelled a hard
+    failure a "skip", an operator reading the CI log would triage a broken
+    run as a data-limited one.
+    """
+    _write_shard(tmp_path / "ohlcv" / "US500" / "1h.parquet", "2025-01-01", "2025-02-01")
+    gate.FAIL_ON_MISSING_DATA = True
+
+    with pytest.raises(gate.pytest.fail.Exception if hasattr(gate, "pytest") else Exception):
+        gate._require_ohlcv_coverage("US500", "1h", "2025-01-01", "2025-12-31")
+
+    assert gate._DATA_SKIP_REASONS == []
+    assert len(gate._DATA_GATE_FAILURES) == 1
+    assert "insufficient OHLCV coverage" in gate._DATA_GATE_FAILURES[0]
+
+    gate.summarize_data_skips(config=_config_without_terminalreporter())
+
+    output = capsys.readouterr().out
+    assert "FAILED by the data gate" in output
+    assert "skipped on missing" not in output
+

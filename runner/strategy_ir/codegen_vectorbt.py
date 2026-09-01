@@ -55,6 +55,10 @@ def _strategy_meta_from_ir(strategy_ir: StrategyIR) -> dict[str, Any]:
 
 
 def _indicator_defaults(indicator: IndicatorRef) -> tuple[str, int]:
+    # Heuristic: the FIRST positive numeric param (alphabetically by key) is
+    # taken as the indicator's window. This assumes each IR indicator carries
+    # at most one positive numeric param; adding a second one (e.g. "smooth")
+    # silently changes which value is used as the window.
     for key in sorted(indicator.params):
         value = indicator.params[key]
         if isinstance(value, bool):

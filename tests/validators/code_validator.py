@@ -5,6 +5,14 @@ versions wrote the code to a temp file and ran ``exec_module`` in a
 subprocess to check the interface, which ran module-level statements
 with full user privileges (``python -I`` isolates sys.path/env, not the
 OS). Every check below works on the parse tree only.
+
+This module is a POLICY GATE, not a sandbox. The denylists below inspect
+the *submitted* code; they say nothing about what this file itself may do.
+Executing generated strategy code is the engine adapter's job, inside its
+own worker isolation — if you are about to add an ``importlib`` /
+``exec_module`` call here to "just read the interface", that is the exact
+bug this module was rewritten to remove. The sentinel test
+``test_validator_never_executes_submitted_code`` guards this contract.
 """
 
 from __future__ import annotations

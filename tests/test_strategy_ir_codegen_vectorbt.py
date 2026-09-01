@@ -350,3 +350,97 @@ def test_generated_code_metadata_round_trips_quotes_and_backslashes():
     exec(code, namespace)
 
     assert namespace["STRATEGY_META"]["name"] == tricky_name
+
+
+# ─── Condition-expression keyword contract (pre-mortem 17-B #1) ────────────────
+#
+# `_rule_from_text` classifies free-text IR expressions by SUBSTRING probing.
+# That is a contract between the IR producer (builder/prompts) and this
+# generator that no type enforces: if the producer's wording changes, the
+# chain silently falls through to `default_rule` and the strategy trades a
+# different rule without any error. These tests pin the accepted vocabulary
+# so a wording change shows up as a test failure, not as drifted backtests.
+
+
+@pytest.mark.parametrize(
+    ("expression", "expected_fragment"),
+    [
+        # explicit compound keywords
+        ("Fast EMA crossunder Slow EMA", "_cross_under("),
+        ("Fast EMA crossover Slow EMA", "_cross_over("),
+        # split keyword family
+        ("Fast EMA cross below Slow EMA", "_cross_under("),
+        ("Fast EMA cross above Slow EMA", "_cross_over("),
+        # overbought / take-profit family
+        ("RSI overbought", "(indicator_rsi_fast > 70)"),
+        ("RSI take profit", "(indicator_rsi_fast > 70)"),
+        # oversold / stop family
+        ("RSI oversold", "(indicator_rsi_fast < 30)"),
+        ("RSI risk-off", "(indicator_rsi_fast < 30)"),
+    ],
+)
+def test_rule_keyword_families_are_pinned(expression: str, expected_fragment: str):
+    strategy_ir = _injection_ir(
+        name="Contract Demo",
+        indicator_label="RSI Fast",
+        expression=expression,
+        tag_value="contract",
+    )
+    strategy_ir.exit_signals = []
+
+    code = generate_vectorbt_strategy_code(strategy_ir)
+
+    assert expected_fragment in code, (
+        f"Expression {expression!r} no longer compiles to the pinned rule "
+        f"(expected {expected_fragment!r}). If the IR wording changed on "
+        "purpose, update _rule_from_text AND this contract test together."
+    )
+
+
+@pytest.mark.parametrize(
+    ("expression", "expected_fragment"),
+    [
+        # plain comparison families (two indicators: primary vs secondary)
+        ("Fast EMA greater than Slow EMA", "(indicator_fast_ema > indicator_slow_ema)"),
+        ("Fast EMA less than Slow EMA", "(indicator_fast_ema < indicator_slow_ema)"),
+        # threshold wording with a single indicator falls back to the
+        # documented (primary > secondary) rule
+        ("Fast EMA greater than Slow EMA", "(indicator_fast_ema > close.shift(1))"),
+    ],
+)
+def test_comparison_families_are_pinned(expression: str, expected_fragment: str):
+    strategy_ir = _injection_ir(
+        name="Contract Demo",
+        indicator_label="Fast EMA",
+        expression=expression,
+        tag_value="contract",
+    )
+    strategy_ir.exit_signals = []
+    if expected_fragment.startswith("(indicator_fast_ema > indicator_slow_ema)") or (
+        expected_fragment.startswith("(indicator_fast_ema < indicator_slow_ema)")
+    ):
+        strategy_ir.indicators.append(IndicatorRef(name="Slow EMA", params={"slow": 30}))
+
+    code = generate_vectorbt_strategy_code(strategy_ir)
+
+    assert expected_fragment in code, (
+        f"Expression {expression!r} no longer compiles to the pinned rule "
+        f"(expected {expected_fragment!r}). If the IR wording changed on "
+        "purpose, update _rule_from_text AND this contract test together."
+    )
+
+
+def test_unrecognized_expression_falls_back_and_is_detectable():
+    """An unknown wording must produce the documented fallback, not a crash."""
+    strategy_ir = _injection_ir(
+        name="Fallback Demo",
+        indicator_label="Fast EMA",
+        expression="the moon is in retrograde",
+        tag_value="fallback",
+    )
+    strategy_ir.exit_signals = []
+
+    code = generate_vectorbt_strategy_code(strategy_ir)
+
+    # Documented fallback: entry uses (primary > secondary).
+    assert "(indicator_fast_ema > close.shift(1))" in code

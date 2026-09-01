@@ -34,6 +34,9 @@ FAIL_ON_MISSING_DATA = str(os.environ.get("FAIL_ON_MISSING_DATA", "")).strip() i
 }
 
 _DATA_SKIP_REASONS: list[str] = []
+# Outcomes of the gate under FAIL_ON_MISSING_DATA=1. Kept separate from the
+# skips so the session summary cannot describe a hard failure as a skip.
+_DATA_GATE_FAILURES: list[str] = []
 
 
 def record_data_skip(reason: str) -> None:
@@ -41,24 +44,40 @@ def record_data_skip(reason: str) -> None:
     _DATA_SKIP_REASONS.append(str(reason))
 
 
-def summarize_data_skips(config: pytest.Config) -> None:
-    """Print one aggregated summary line for all data-gate skips."""
-    if not _DATA_SKIP_REASONS:
-        return
-    message = (
-        f"{len(_DATA_SKIP_REASONS)} strategy test(s) skipped on missing/unreadable "
-        "local market data (set FAIL_ON_MISSING_DATA=1 to fail instead):"
-    )
+def record_data_gate_failure(reason: str) -> None:
+    """Register a data-gate failure raised under FAIL_ON_MISSING_DATA=1."""
+    _DATA_GATE_FAILURES.append(str(reason))
+
+
+def _emit_summary_lines(lines: list[str], config: pytest.Config) -> None:
     terminalreporter = config.pluginmanager.get_plugin("terminalreporter")
     write_line = getattr(terminalreporter, "write_line", None)
     if callable(write_line):
-        write_line(message)
-        for reason in _DATA_SKIP_REASONS:
-            write_line(f"  - {reason}")
+        for line in lines:
+            write_line(line)
         return
-    print(message)
-    for reason in _DATA_SKIP_REASONS:
-        print(f"  - {reason}")
+    for line in lines:
+        print(line)
+
+
+def summarize_data_skips(config: pytest.Config) -> None:
+    """Print one aggregated summary line for all data-gate skips/failures."""
+    if not _DATA_SKIP_REASONS and not _DATA_GATE_FAILURES:
+        return
+    lines: list[str] = []
+    if _DATA_SKIP_REASONS:
+        lines.append(
+            f"{len(_DATA_SKIP_REASONS)} strategy test(s) skipped on missing/unreadable "
+            "local market data (set FAIL_ON_MISSING_DATA=1 to fail instead):"
+        )
+        lines.extend(f"  - {reason}" for reason in _DATA_SKIP_REASONS)
+    if _DATA_GATE_FAILURES:
+        lines.append(
+            f"{len(_DATA_GATE_FAILURES)} strategy test(s) FAILED by the data gate "
+            "(FAIL_ON_MISSING_DATA=1):"
+        )
+        lines.extend(f"  - {reason}" for reason in _DATA_GATE_FAILURES)
+    _emit_summary_lines(lines, config)
 
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
@@ -66,10 +85,16 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
 
 
 def _data_gate_result(reason: str) -> None:
-    """Skip or fail with the given reason, depending on strict mode."""
-    record_data_skip(reason)
+    """Skip or fail with the given reason, depending on strict mode.
+
+    The outcome is recorded *after* the branch: a strict-mode failure must not
+    land in the skip summary (it is a failure, and the summary has to agree
+    with the exit status).
+    """
     if FAIL_ON_MISSING_DATA:
+        record_data_gate_failure(reason)
         pytest.fail(f"{reason} (FAIL_ON_MISSING_DATA=1)")
+    record_data_skip(reason)
     pytest.skip(reason)
 
 
@@ -160,6 +185,11 @@ def _covers_requested_period(symbol: str, timeframe: str, start: str, end: str) 
     "every file must cover everything" rule (which rejected legitimate
     year-sharded datasets): the shard extents are sorted and must chain
     together without a hole across the requested window.
+
+    This is the boolean twin of :func:`_require_ohlcv_coverage` — the same
+    coverage policy, expressed as a predicate for tests. If you change the
+    tolerance, the shard-chaining rule or the bound handling here, change it
+    there too (they must never disagree).
     """
     start_bound = _parse_date_bound(start, is_end=False) if start else None
     end_bound = _parse_date_bound(end, is_end=True) if end else None
@@ -189,7 +219,12 @@ def _covers_requested_period(symbol: str, timeframe: str, start: str, end: str) 
 
 
 def _require_ohlcv_coverage(symbol: str, timeframe: str, start: str, end: str) -> None:
-    """Skip or fail when the local dataset cannot serve the requested window."""
+    """Skip or fail when the local dataset cannot serve the requested window.
+
+    Enforcement twin of :func:`_covers_requested_period` (same policy: sorted
+    shard extents must chain without a hole across the window). Keep the two
+    in sync — the gate's own tests assert through the boolean twin.
+    """
     paths = _candidate_ohlcv_paths(symbol, timeframe)
     if not paths:
         _data_gate_result(
