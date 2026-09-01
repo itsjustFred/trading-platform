@@ -40,6 +40,14 @@ class BacktestResultValidator:
         for key, value in stats.items():
             if isinstance(value, bool):
                 continue
+            # String-typed "NaN"/"Infinity" must not bypass the numeric
+            # checks: coerce every scalar stat through float().
+            if isinstance(value, str):
+                try:
+                    value = float(value.strip())
+                except ValueError:
+                    errors.append(f"Stat '{key}' is not a finite number: {value!r}")
+                    continue
             if isinstance(value, (int, float)) and not math.isfinite(float(value)):
                 errors.append(f"Stat '{key}' contains NaN/Inf.")
 
