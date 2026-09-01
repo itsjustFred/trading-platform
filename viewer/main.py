@@ -164,6 +164,7 @@ logger = get_logger("viewer")
 AGENT_CONVERT_PROVIDER_NAMES: tuple[str, ...] = ("nim", "copilot_sdk")
 
 BACKTEST_TRADES_SUFFIX = ".trades.json"
+OHLCV_PARQUET_SUFFIX = ".parquet"
 
 BACKTESTS_DIR = DATA_DIR / "backtests"
 MATRIX_RESULTS_DIR = DATA_DIR / "backtests" / "matrix_runner"
@@ -5700,7 +5701,7 @@ def _cached_catalog_ohlcv_entries() -> list[dict[str, Any]]:
             return [
                 dict(entry)
                 for entry in legacy_entries
-                if isinstance(entry, dict) and str(entry.get("path", "")).endswith(".parquet")
+                if isinstance(entry, dict) and str(entry.get("path", "")).endswith(OHLCV_PARQUET_SUFFIX)
             ]
         return _scan_single_file_ohlcv_entries({})
 
@@ -5709,7 +5710,7 @@ def _cached_catalog_ohlcv_entries() -> list[dict[str, Any]]:
         normalized_entries = [
             entry
             for entry in entries
-            if isinstance(entry, dict) and str(entry.get("path", "")).endswith(".parquet")
+            if isinstance(entry, dict) and str(entry.get("path", "")).endswith(OHLCV_PARQUET_SUFFIX)
         ]
         if normalized_entries:
             return normalized_entries
@@ -5718,7 +5719,7 @@ def _cached_catalog_ohlcv_entries() -> list[dict[str, Any]]:
     for entry in entries:
         if not isinstance(entry, dict):
             continue
-        if not str(entry.get("path", "")).endswith(".parquet"):
+        if not str(entry.get("path", "")).endswith(OHLCV_PARQUET_SUFFIX):
             continue
         normalized = dict(entry)
         normalized.pop("last_updated", None)
@@ -10487,7 +10488,7 @@ async def data_check(
 async def data_resample(payload: DataResampleRequest) -> dict[str, Any]:
     target_timeframes = payload.target_timeframes
     source_path = _contained_client_data_file(
-        payload.source_path, allowed_suffix=".parquet"
+        payload.source_path, allowed_suffix=OHLCV_PARQUET_SUFFIX
     )
     if source_path is None:
         raise HTTPException(
@@ -10784,7 +10785,7 @@ async def delete_symbol_data(path: str = Query(default="")) -> dict[str, Any]:
     # Containment must be checked on resolved paths (prefix strings can be
     # spoofed with ".." components) and deletion is restricted to the parquet
     # files the catalog manages.
-    file_path = _contained_client_data_file(path, allowed_suffix=".parquet")
+    file_path = _contained_client_data_file(path, allowed_suffix=OHLCV_PARQUET_SUFFIX)
     if file_path is None:
         raise HTTPException(status_code=403, detail="Access denied")
 
