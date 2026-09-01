@@ -440,3 +440,86 @@ def test_resample_accepts_source_path_inside_data_dir(
         if str(part) == "--source"
     ]
     assert source_arguments == [str(source.resolve())]
+
+
+# ---------------------------------------------------------------------------
+# Pre-mortem hardening (PR #50 review pipeline)
+# Pin the containment helper contracts and the middleware configuration as
+# CI-enforced invariants, so a future refactor cannot quietly weaken them.
+# ---------------------------------------------------------------------------
+
+
+def test_safe_asset_id_rejects_traversal_and_separators():
+    import viewer.main as viewer_app_module
+
+    for raw in ("..", ".", "", "  ", "a/b", "a\\b", "../secret", "id/../x", "a\nb"):
+        assert viewer_app_module._safe_asset_id(raw) == "", f"{raw!r} must be rejected"
+    assert viewer_app_module._safe_asset_id(" valid-id_1.2 ") == "valid-id_1.2"
+
+
+def test_contained_asset_path_never_leaves_base_dir(security_client, tmp_path):
+    import viewer.main as viewer_app_module
+
+    backtests_dir = tmp_path / "backtests"
+    backtests_dir.mkdir(parents=True, exist_ok=True)
+    secret = backtests_dir.parent / "secret.trades.json"
+    secret.write_text("{}", encoding="utf-8")
+
+    contained = viewer_app_module._contained_asset_path(
+        backtests_dir, "abc123", viewer_app_module.BACKTEST_TRADES_SUFFIX
+    )
+    assert contained == (backtests_dir / "abc123.trades.json").resolve()
+    assert contained.parent == backtests_dir.resolve()
+
+    for raw in ("../secret", "..%2Fsecret", "a/b", "", None, "sub/dir/id"):
+        assert (
+            viewer_app_module._contained_asset_path(backtests_dir, raw, ".json") is None
+        ), f"{raw!r} must not resolve to an unlink path"
+    assert secret.exists()
+
+
+def test_contained_client_data_file_rejects_escape_via_dotdot(tmp_path):
+    import viewer.main as viewer_app_module
+
+    data_root = tmp_path / "ohlcv"
+    data_root.mkdir(parents=True, exist_ok=True)
+    outside = tmp_path / "outside.csv"
+    outside.write_text("x", encoding="utf-8")
+
+    (data_root / "sub").mkdir(parents=True, exist_ok=True)
+    real = data_root / "sub" / "file.csv"
+    real.write_text("x", encoding="utf-8")
+    resolved = viewer_app_module._contained_client_data_file(
+        str(real), allowed_suffix=".csv", base_dir=data_root
+    )
+    assert resolved == real.resolve()
+
+    for raw in (
+        str(outside),
+        f"{data_root}/sub/../../outside.csv",
+        f"{data_root}/sub/file.csv/../../../outside.csv",
+        str(data_root / "sub" / "file.parquet"),
+        "",
+        None,
+    ):
+        assert (
+            viewer_app_module._contained_client_data_file(
+                raw, allowed_suffix=".csv", base_dir=data_root
+            )
+            is None
+        ), f"{raw!r} must not pass containment"
+    assert outside.exists()
+
+
+def test_cors_middleware_disallows_wildcard_origins_and_credentials():
+    """The CORS decision must stay CI-enforced, not just documented in prose."""
+    import viewer.main as viewer_app_module
+
+    cors = next(
+        m
+        for m in viewer_app_module.app.user_middleware
+        if m.cls.__name__ == "CORSMiddleware"
+    )
+    kwargs = cors.kwargs
+    assert kwargs["allow_origins"] == []
+    assert kwargs["allow_credentials"] is False
