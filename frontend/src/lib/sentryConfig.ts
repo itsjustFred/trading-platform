@@ -15,7 +15,12 @@ type SentryClient = NonNullable<ReturnType<typeof import("@sentry/react").init>>
 const DEFAULT_APP_VERSION = "0.1.0";
 const DEFAULT_ENVIRONMENT = "local";
 const DEFAULT_SAMPLE_RATE = 1.0;
-const UNKNOWN_GIT_SHA = "unknown";
+/**
+ * Sentinel written by `vite.config.ts` when `git rev-parse` fails (no git or
+ * not a work tree). Must match the literal the build config writes — the
+ * release falls back to the version-only form on this value.
+ */
+export const UNKNOWN_GIT_SHA = "unknown";
 
 export interface FrontendSentryEnv {
   readonly VITE_SENTRY_DSN?: string;
@@ -80,7 +85,7 @@ export function resolveFrontendSentryOptions(
       appVersion: typeof __APP_VERSION__ === "string" ? __APP_VERSION__ : "",
       gitSha: typeof __GIT_SHA__ === "string" ? __GIT_SHA__ : "",
     }),
-    sampleRate: sampleRate ?? DEFAULT_SAMPLE_RATE,
+    sampleRate,
     tracesSampleRate,
     initialScope: { tags: { service: FRONTEND_SERVICE_TAG } },
   };

@@ -3,23 +3,26 @@ import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import { execSync } from 'node:child_process'
 import { createRequire } from 'node:module'
+import { UNKNOWN_GIT_SHA } from './src/lib/sentryConfig.ts'
 
 const require = createRequire(import.meta.url)
 const appVersion = require('./package.json').version
 
-let gitSha = 'unknown'
+// This sentinel must stay in sync with sentryConfig.ts's UNKNOWN_GIT_SHA: it
+// decides whether the Sentry release is version-only or version+sha.
+let gitSha: string = UNKNOWN_GIT_SHA
 try {
   // Minimal, fixed environment (no inherited, potentially writeable PATH
-  // entries): only the standard fixed system directories are searched, and
-  // git is resolved with an absolute binary path. SonarCloud S4036.
+  // entries): only the standard fixed system directories are searched.
+  // SonarCloud S4036.
   gitSha = execSync('git rev-parse --short HEAD', {
     stdio: ['ignore', 'pipe', 'ignore'],
     env: { PATH: '/usr/bin:/bin:/usr/local/bin' },
   })
     .toString()
-    .trim()
+    .trim() || UNKNOWN_GIT_SHA
 } catch {
-  gitSha = 'unknown'
+  gitSha = UNKNOWN_GIT_SHA
 }
 
 // Injected as compile-time globals so the Sentry release can follow the

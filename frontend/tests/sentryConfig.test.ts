@@ -118,10 +118,13 @@ test("vite injects the app version and git sha define globals used for the Sentr
   assert.match(config, /require\('\.\/package\.json'\)/);
 });
 
-test("main.tsx initializes Sentry before rendering the app", async () => {
+test("main.tsx awaits Sentry init before rendering the app", async () => {
   const source = await mainTsx;
 
-  assert.match(source, /initFrontendSentry\(\)/);
+  // The call must be awaited, not fire-and-forget: the SDK's global-handlers
+  // integration only captures errors raised after init resolves, so a dropped
+  // or backgrounded init silently loses the session's errors.
+  assert.match(source, /await\s+initFrontendSentry\(\)/);
   const initIndex = source.indexOf("initFrontendSentry()");
   const renderIndex = source.indexOf("createRoot(");
   assert.ok(initIndex >= 0 && renderIndex > initIndex);
