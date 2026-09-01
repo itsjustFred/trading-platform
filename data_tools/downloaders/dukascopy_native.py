@@ -1206,7 +1206,12 @@ class DukascopyNativeDownloader(Downloader):
                     bid_prefixed = _resample_side_prefixed_ohlcv(bid_prefixed, normalized_tf, "bid")
                     ask_prefixed = _resample_side_prefixed_ohlcv(ask_prefixed, normalized_tf, "ask")
                 df = (
-                    bid_prefixed.merge(ask_prefixed, on="timestamp", how="inner")
+                    bid_prefixed.merge(
+                        ask_prefixed,
+                        on="timestamp",
+                        how="inner",
+                        validate="one_to_one",
+                    )
                     .sort_values("timestamp")
                     .drop_duplicates(subset=["timestamp"])
                     .reset_index(drop=True)
