@@ -125,11 +125,9 @@ def test_rocketfuel_and_ramjet_read_their_own_config_files() -> None:
 
 def test_nitro_rejects_sell_signals() -> None:
     processor = get_signal_processor("nitro", {})
+    sell_signal = {"symbol": "AAPL", "action": "SELL", "timestamp": "2026-01-01T12:00:00Z"}
     with pytest.raises(ValueError, match="BUY/LONG"):
-        processor.process_signal(
-            {"symbol": "AAPL", "action": "SELL", "timestamp": "2026-01-01T12:00:00Z"},
-            _sample_market_data(),
-        )
+        processor.process_signal(sell_signal, _sample_market_data())
 
 
 def test_nitro_stamps_its_own_metadata() -> None:

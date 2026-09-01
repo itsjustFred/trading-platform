@@ -3289,7 +3289,7 @@ def test_signal_processors_endpoint_exposes_registry(viewer_client):
     assert response.status_code == 200
     payload = response.json()
     ids = {item["id"] for item in payload}
-    assert {"ramjet", "rocketfuel_longsonly", "rocketfuel_longandshort", "nitro"} == ids
+    assert ids == {"ramjet", "rocketfuel_longsonly", "rocketfuel_longandshort", "nitro"}
 
 
 def test_optimizations_list_and_detail_endpoints(viewer_client, tmp_path):

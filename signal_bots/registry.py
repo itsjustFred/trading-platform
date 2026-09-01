@@ -21,6 +21,7 @@ from signal_bots.rocketfuel import RocketFuelSignalProcessor
 SignalProcessorFactory = Callable[[dict[str, Any]], object]
 
 _ROOT = Path(__file__).resolve().parent
+CONFIG_FILENAME = "config.yaml"
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
@@ -56,16 +57,21 @@ def _build_from_config(
     return factory(merged)
 
 
+def _bot_config_path(bot_dir: str) -> Path:
+    """Config file for a bot directory; ids are code-owned, never user input."""
+    return _ROOT / bot_dir / CONFIG_FILENAME
+
+
 def _ramjet_config_path() -> Path:
-    return _ROOT / "ramjet" / "config.yaml"
+    return _bot_config_path("ramjet")
 
 
 def _rocketfuel_config_path() -> Path:
-    return _ROOT / "rocketfuel" / "config.yaml"
+    return _bot_config_path("rocketfuel")
 
 
 def _nitro_config_path() -> Path:
-    return _ROOT / "nitro" / "config.yaml"
+    return _bot_config_path("nitro")
 
 
 def _build_ramjet(config: dict[str, Any]) -> RamJetSignalProcessor:
