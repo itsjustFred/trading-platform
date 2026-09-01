@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pandas as pd
+import pyarrow.lib
 import pytest
 from sqlmodel import select
 
@@ -128,10 +129,13 @@ def test_consolidate_keeps_backup_dir_outside_tree(ohlcv_root):
     merged, deleted, backup = consolidate(ohlcv_root, backup_dir=backup_dir)
 
     assert (merged, deleted) == (1, 1)
-    assert backup is not None and backup.is_dir()
-    assert backup_dir not in ohlcv_root.rglob("*") and backup != ohlcv_root
+    assert backup is not None
+    assert backup.is_dir()
+    assert backup_dir not in ohlcv_root.rglob("*")
+    assert backup != ohlcv_root
     restored = {p.name for p in backup.rglob("*.parquet")}
-    assert "1h.parquet" in restored and "1h_part2.parquet" in restored
+    assert "1h.parquet" in restored
+    assert "1h_part2.parquet" in restored
     assert not list(ohlcv_root.rglob("*.backup"))
 
 
@@ -161,11 +165,12 @@ def test_consolidate_unreadable_fragment_aborts_without_changes(ohlcv_root):
 
     (ohlcv_root / "EURUSD" / "broken_part3.parquet").write_bytes(b"not a parquet file")
 
-    with pytest.raises(Exception):
+    with pytest.raises(pyarrow.lib.ArrowInvalid):
         consolidate(ohlcv_root, backup_dir=ohlcv_root.parent / "backup")
 
     names = sorted(p.name for p in ohlcv_root.rglob("*.parquet"))
-    assert "1h.parquet" in names and "1h_part2.parquet" in names
+    assert "1h.parquet" in names
+    assert "1h_part2.parquet" in names
     assert (ohlcv_root / "EURUSD" / "1h.parquet").read_bytes() != b""
 
 
@@ -195,7 +200,7 @@ def test_regenerate_dry_run_reports_plan_without_destroying(isolated_db, monkeyp
     with database.get_session() as session:
         assert session.exec(select(database.BacktestRecord)).all()
     assert (backtests_dir / "bt-seed.trades.json").exists()
-    assert plan is not None and hasattr(plan, "entries")
+    assert hasattr(plan, "entries")
 
 
 def test_regenerate_confirmed_run_restores_corpus_when_all_runs_fail(
@@ -218,6 +223,7 @@ def test_regenerate_confirmed_run_restores_corpus_when_all_runs_fail(
     assert outcome.failures >= 1
     with database.get_session() as session:
         assert len(session.exec(select(database.BacktestRecord)).all()) == 1
+    assert outcome.restored is True
     assert (backtests_dir / "bt-seed.trades.json").exists()
 
 
@@ -250,6 +256,7 @@ def test_regenerate_keeps_json_backup_outside_backtests_dir(isolated_db, monkeyp
     outcome = script.regenerate(dry_run=False, assume_yes=True, strategies=[])
 
     assert outcome.successes == 0
+    assert outcome.restored is True
     backups = [p for p in tmp_path.rglob("*.trades.json") if p.parent != backtests_dir]
     assert any(p.name == "bt-seed.trades.json" for p in backups)
     assert (backtests_dir / "bt-seed.trades.json").exists()

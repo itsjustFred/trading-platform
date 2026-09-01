@@ -125,39 +125,38 @@ def _build_symbol_index(data_dir: Path) -> dict[str, dict[str, list[Path]]]:
     return index
 
 
-def _candidate_symbols(meta: dict[str, Any]) -> list[str]:
+ASSET_CLASS_CANDIDATES: list[tuple[tuple[str, ...], list[str]]] = [
+    (("forex", "metal"), ["XAUUSD", "EURUSD", "GBPUSD", "USDJPY"]),
+    (("equit", "stock"), ["SPY", "AAPL", "QQQ"]),
+    (("etf",), ["SPY", "QQQ", "GLD"]),
+    (("index", "future"), ["US500", "SPY", "VIX"]),
+    (("multi",), ["SPY", "QQQ", "EURUSD", "XAUUSD"]),
+]
+DEFAULT_CANDIDATE_SYMBOLS = ["EURUSD", "XAUUSD", "SPY", "AAPL"]
+
+
+def _asset_class_tokens(meta: dict[str, Any]) -> list[str]:
+    """Normalize the strategy's ``asset_class`` tags into lowercase tokens."""
     tags = meta.get("tags", {}) if isinstance(meta, dict) else {}
     raw_assets = tags.get("asset_class", []) if isinstance(tags, dict) else []
     if isinstance(raw_assets, str):
-        assets = [raw_assets.lower()]
-    elif isinstance(raw_assets, list):
-        assets = [str(item).lower() for item in raw_assets]
-    else:
-        assets = []
+        return [raw_assets.lower()]
+    if isinstance(raw_assets, list):
+        return [str(item).lower() for item in raw_assets]
+    return []
 
+
+def _candidate_symbols(meta: dict[str, Any]) -> list[str]:
+    assets = _asset_class_tokens(meta)
     ordered: list[str] = []
-
-    if any("forex" in asset or "metal" in asset for asset in assets):
-        ordered.extend(["XAUUSD", "EURUSD", "GBPUSD", "USDJPY"])
-    if any("equit" in asset or "stock" in asset for asset in assets):
-        ordered.extend(["SPY", "AAPL", "QQQ"])
-    if any("etf" in asset for asset in assets):
-        ordered.extend(["SPY", "QQQ", "GLD"])
-    if any("index" in asset or "future" in asset for asset in assets):
-        ordered.extend(["US500", "SPY", "VIX"])
-    if any("multi" in asset for asset in assets):
-        ordered.extend(["SPY", "QQQ", "EURUSD", "XAUUSD"])
+    for tokens, symbols in ASSET_CLASS_CANDIDATES:
+        if any(token in asset for asset in assets for token in tokens):
+            ordered.extend(symbols)
     if not ordered:
-        ordered.extend(["EURUSD", "XAUUSD", "SPY", "AAPL"])
+        ordered.extend(DEFAULT_CANDIDATE_SYMBOLS)
 
-    deduped: list[str] = []
     seen: set[str] = set()
-    for symbol in ordered:
-        if symbol in seen:
-            continue
-        seen.add(symbol)
-        deduped.append(symbol)
-    return deduped
+    return [symbol for symbol in ordered if not (symbol in seen or seen.add(symbol))]
 
 
 def _select_symbol_timeframe(
@@ -170,17 +169,17 @@ def _select_symbol_timeframe(
         for timeframe in TIMEFRAME_PRIORITY:
             if timeframe in timeframe_map and timeframe_map[timeframe]:
                 return symbol, timeframe, timeframe_map[timeframe][0]
-        first_timeframe = sorted(timeframe_map)[0]
+        first_timeframe = min(timeframe_map)
         return symbol, first_timeframe, timeframe_map[first_timeframe][0]
 
     if not symbol_index:
         return None
 
-    fallback_symbol = sorted(symbol_index)[0]
+    fallback_symbol = min(symbol_index)
     timeframe_map = symbol_index[fallback_symbol]
     if not timeframe_map:
         return None
-    first_timeframe = sorted(timeframe_map)[0]
+    first_timeframe = min(timeframe_map)
     return fallback_symbol, first_timeframe, timeframe_map[first_timeframe][0]
 
 
@@ -264,12 +263,15 @@ class RegenerationOutcome:
     restored: bool = False
 
 
-def _existing_db_path(data_dir: Path) -> Path:
-    """Resolve the SQLite database file backing ``data_dir``.
+TRADES_JSON_GLOB = "*.trades.json"
+
+
+def _existing_db_path() -> Path:
+    """Resolve the SQLite database file backing the active engine.
 
     The engine is created at import time from the resolved DATA_DIR, so tests that
-    swap ``shared.database.ENGINE``/``DATA_DIR`` need the path derived from the
-    engine URL rather than the module-level ``DB_PATH`` constant.
+    swap ``shared.database.ENGINE`` need the path derived from the engine URL
+    rather than the module-level ``DB_PATH`` constant.
     """
     from shared.database import DB_PATH, ENGINE
 
@@ -337,7 +339,7 @@ def _backup_json_files(backtests_dir: Path, backup_dir: Path) -> int:
     if not backtests_dir.exists():
         return 0
     copied = 0
-    for path in backtests_dir.glob("*.trades.json"):
+    for path in backtests_dir.glob(TRADES_JSON_GLOB):
         destination = backup_dir / "backtests" / path.name
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(path, destination)
@@ -351,7 +353,7 @@ def _restore_json_backups(backtests_dir: Path, backup_dir: Path) -> int:
         return 0
     backtests_dir.mkdir(parents=True, exist_ok=True)
     restored = 0
-    for path in source_dir.glob("*.trades.json"):
+    for path in source_dir.glob(TRADES_JSON_GLOB):
         shutil.copy2(path, backtests_dir / path.name)
         restored += 1
     return restored
@@ -360,7 +362,7 @@ def _restore_json_backups(backtests_dir: Path, backup_dir: Path) -> int:
 def restore_backups(backup_dir: Path, *, data_dir: Path | None = None) -> tuple[int, int]:
     """Restore a regeneration backup into ``data_dir``. Returns (sqlite, json) counts."""
     resolved_data_dir = data_dir if data_dir is not None else DATA_DIR
-    db_path = _existing_db_path(resolved_data_dir)
+    db_path = _existing_db_path()
     sqlite_restored = 0
     json_restored = _restore_json_backups(resolved_data_dir / "backtests", backup_dir)
     backup_db = backup_dir / db_path.name
@@ -384,7 +386,7 @@ def _purge_json_backtests(backtests_dir: Path) -> int:
     if not backtests_dir.exists():
         return 0
     deleted = 0
-    for path in backtests_dir.glob("*.trades.json"):
+    for path in backtests_dir.glob(TRADES_JSON_GLOB):
         path.unlink()
         deleted += 1
     return deleted
@@ -406,7 +408,7 @@ def plan_regeneration(
     backtests_dir = resolved_data_dir / "backtests"
     plan = RegenerationPlan(
         sqlite_backtests=_count_sqlite_backtests(),
-        json_backtests=len(list(backtests_dir.glob("*.trades.json")))
+        json_backtests=len(list(backtests_dir.glob(TRADES_JSON_GLOB)))
         if backtests_dir.exists()
         else 0,
     )
@@ -502,7 +504,6 @@ def _run_strategy(
         ValueError,
         KeyError,
         ImportError,
-        TimeoutError,
         ArithmeticError,
     ) as exc:
         raise BacktestRunError(f"{strategy_name}: run failed ({exc})") from exc
@@ -516,6 +517,69 @@ def _run_strategy(
 
 class BacktestRunError(Exception):
     """A single strategy regeneration failed."""
+
+
+def _confirm_regeneration(_input: Callable[[str], str]) -> None:
+    """Abort unless the operator explicitly confirms the destructive purge."""
+    answer = _input(
+        "Regenerating deletes ALL existing SQLite backtests and *.trades.json files. "
+        "Continue? [y/N] "
+    )
+    if answer.strip().lower() not in {"y", "yes"}:
+        raise SystemExit("Aborted — the existing backtest corpus is unchanged.")
+
+
+def _snapshot_corpus(resolved_backup_dir: Path) -> None:
+    """Copy the SQLite backtest tables and JSON artifacts into ``resolved_backup_dir``."""
+    resolved_backup_dir.mkdir(parents=True, exist_ok=True)
+    db_path = _existing_db_path()
+    _dump_sqlite_backup(db_path, resolved_backup_dir)
+    json_backed_up = _backup_json_files(BACKTESTS_DIR, resolved_backup_dir)
+    print(f"Backup snapshot: {resolved_backup_dir} ({json_backed_up} JSON file(s))")
+
+
+def _execute_runs(
+    strategies: list[str] | None, plan: RegenerationPlan
+) -> tuple[int, int, list[str]]:
+    """Run the planned strategies, returning (successes, skipped, failures)."""
+    failures: list[str] = list(plan.skipped)
+    successes = 0
+    skipped = 0
+
+    if plan.no_data:
+        skipped += len(plan.skipped)
+        for message in plan.skipped:
+            print(f"  - {message}")
+        return successes, skipped, failures
+
+    strategy_paths = _strategy_paths(strategies)
+    for strategy_path, entry in zip(strategy_paths, plan.entries, strict=False):
+        strategy_type = detect_strategy_type(strategy_path, DEFAULT_STRATEGIES_DIR)
+        if strategy_type == StrategyType.SIGNAL_PROCESSOR:
+            skipped += 1
+            continue
+        try:
+            _run_strategy(entry, strategy_path, data_dir=DATA_DIR, backtests_dir=BACKTESTS_DIR)
+            successes += 1
+        except BacktestRunError as exc:
+            failures.append(str(exc))
+        except (OSError, RuntimeError, ValueError, KeyError, ImportError) as exc:
+            failures.append(f"{strategy_path.stem}: run failed ({exc})")
+    return successes, skipped, failures
+
+
+def _restore_empty_run(
+    resolved_backup_dir: Path, outcome: RegenerationOutcome
+) -> RegenerationOutcome:
+    """Put the previous corpus back when not a single strategy regenerated."""
+    restored_sqlite, restored_json = restore_backups(resolved_backup_dir, data_dir=DATA_DIR)
+    outcome.restored = True
+    print(
+        "⚠️  No strategy regenerated successfully — previous corpus restored from backup "
+        f"(sqlite={restored_sqlite}, json={restored_json})."
+    )
+    print(f"Backup kept for inspection: {resolved_backup_dir}")
+    return outcome
 
 
 def regenerate(
@@ -536,50 +600,20 @@ def regenerate(
         return plan_regeneration(strategies=strategies)
 
     if not assume_yes:
-        answer = _input(
-            "Regenerating deletes ALL existing SQLite backtests and *.trades.json files. "
-            "Continue? [y/N] "
-        )
-        if answer.strip().lower() not in {"y", "yes"}:
-            raise SystemExit("Aborted — the existing backtest corpus is unchanged.")
+        _confirm_regeneration(_input)
 
     outcome = RegenerationOutcome()
     resolved_backup_dir = backup_dir if backup_dir is not None else _default_backup_dir()
-    resolved_backup_dir.mkdir(parents=True, exist_ok=True)
-
-    db_path = _existing_db_path(DATA_DIR)
-    _dump_sqlite_backup(db_path, resolved_backup_dir)
-    json_backed_up = _backup_json_files(BACKTESTS_DIR, resolved_backup_dir)
+    _snapshot_corpus(resolved_backup_dir)
     outcome.backup_dir = resolved_backup_dir
-    print(f"Backup snapshot: {resolved_backup_dir} ({json_backed_up} JSON file(s))")
 
     _purge_sqlite_backtests()
     BACKTESTS_DIR.mkdir(parents=True, exist_ok=True)
-    _purge_json_backtests(BACKTESTS_DIR)
+    purged_json = _purge_json_backtests(BACKTESTS_DIR)
+    print(f"Purged existing corpus: sqlite backtests + {purged_json} JSON file(s)")
 
     plan = plan_regeneration(strategies=strategies)
-    failures: list[str] = list(plan.skipped)
-    successes = 0
-    skipped = 0
-
-    if plan.no_data:
-        skipped += len(plan.skipped)
-        for message in plan.skipped:
-            print(f"  - {message}")
-    else:
-        strategy_paths = _strategy_paths(strategies)
-        for strategy_path, entry in zip(strategy_paths, plan.entries, strict=False):
-            strategy_type = detect_strategy_type(strategy_path, DEFAULT_STRATEGIES_DIR)
-            if strategy_type == StrategyType.SIGNAL_PROCESSOR:
-                skipped += 1
-                continue
-            try:
-                _run_strategy(entry, strategy_path, data_dir=DATA_DIR, backtests_dir=BACKTESTS_DIR)
-                successes += 1
-            except BacktestRunError as exc:
-                failures.append(str(exc))
-            except (OSError, RuntimeError, ValueError, KeyError, ImportError) as exc:
-                failures.append(f"{strategy_path.stem}: run failed ({exc})")
+    successes, skipped, failures = _execute_runs(strategies, plan)
 
     outcome.successes = successes
     outcome.skipped = skipped
@@ -596,14 +630,7 @@ def regenerate(
         print(f"  - {message}")
 
     if successes == 0:
-        restored_sqlite, restored_json = restore_backups(resolved_backup_dir, data_dir=DATA_DIR)
-        outcome.restored = True
-        print(
-            "⚠️  No strategy regenerated successfully — previous corpus restored from backup "
-            f"(sqlite={restored_sqlite}, json={restored_json})."
-        )
-        print(f"Backup kept for inspection: {resolved_backup_dir}")
-        return outcome
+        return _restore_empty_run(resolved_backup_dir, outcome)
 
     return outcome
 

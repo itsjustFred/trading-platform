@@ -24,6 +24,7 @@ import argparse
 import os
 import re
 import shutil
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -40,7 +41,7 @@ DATA_DIR = (
     else (PROJECT_ROOT / "data").resolve()
 )
 
-FRAGMENT_SUFFIX = re.compile(r"(?:_|-)(?:part|chunk|fragment)\d+$", re.IGNORECASE)
+FRAGMENT_SUFFIX = re.compile(r"[_-](?:part|chunk|fragment)\d+$", re.IGNORECASE)
 KNOWN_TIMEFRAMES = {"tick", "s1", "1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w", "mn1"}
 TIMEFRAME_PATTERN = re.compile(r"^(?:tick|s1|mn1|\d+[smhdw])$", re.IGNORECASE)
 
@@ -136,6 +137,32 @@ def restore_backup(backup_dir: Path, root: Path) -> int:
     return restored
 
 
+def _merge_group(target_path: Path, members: list[Path]) -> None:
+    """Atomically write the merged frame for one group to ``target_path``."""
+    combined = _merge_members(members)
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = target_path.parent / f".{target_path.name}.consolidating-{uuid.uuid4().hex[:8]}"
+    try:
+        combined.to_parquet(temp_path, index=False)
+        os.replace(temp_path, target_path)
+    except Exception:
+        if temp_path.exists():
+            temp_path.unlink()
+        raise
+
+
+def _delete_replaced_fragments(actions: list[tuple[Path, list[Path]]]) -> int:
+    """Delete the fragments that were merged into their canonical target."""
+    deleted_fragments = 0
+    for target_path, members in actions:
+        for member in members:
+            if member == target_path:
+                continue
+            member.unlink()
+            deleted_fragments += 1
+    return deleted_fragments
+
+
 def consolidate(
     root: Path,
     *,
@@ -165,27 +192,10 @@ def consolidate(
     _stage_backup(actions, root, resolved_backup_dir)
     print(f"Backup snapshot: {resolved_backup_dir}")
 
-    merged_groups = 0
     for target_path, members in actions:
-        combined = _merge_members(members)
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = target_path.parent / f".{target_path.name}.consolidating"
-        try:
-            combined.to_parquet(temp_path, index=False)
-            os.replace(temp_path, target_path)
-        except Exception:
-            if temp_path.exists():
-                temp_path.unlink()
-            raise
-        merged_groups += 1
-
-    deleted_fragments = 0
-    for target_path, members in actions:
-        for member in members:
-            if member == target_path:
-                continue
-            member.unlink()
-            deleted_fragments += 1
+        _merge_group(target_path, members)
+    merged_groups = len(actions)
+    deleted_fragments = _delete_replaced_fragments(actions)
 
     print(
         "Consolidation complete:",
