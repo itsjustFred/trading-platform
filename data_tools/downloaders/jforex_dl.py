@@ -224,11 +224,6 @@ def _resolve_jnlp_url() -> str:
     return jnlp_url
 
 
-def _discover_jars(root: Path) -> list[Path]:
-    if not root.exists():
-        return []
-
-
 def _is_allowed_dukascopy_url(url: str) -> bool:
     """Return True only for Dukascopy-hosted remote resources (DV-B6a)."""
     try:
@@ -304,6 +299,11 @@ def _verify_jar_digest(path: Path, url: str, expected_digests: dict[str, str]) -
         f"expected sha256 {expected}, got {actual}. The file was removed and "
         "will not be added to the classpath."
     )
+
+
+def _discover_jars(root: Path) -> list[Path]:
+    if not root.exists():
+        return []
 
     search_roots = [root]
     if (root / "lib").exists():

@@ -279,6 +279,35 @@ def test_ensure_jvm_started_raises_with_diagnostics_when_all_fail(monkeypatch):
         jforex_dl._ensure_jvm_started()
 
 
+# ─── local JAR discovery (regression: helper definitions broke _discover_jars)
+
+
+def test_discover_jars_finds_local_jars(tmp_path: Path):
+    """Local SDK jars must still be discovered after the DV-B6 helper insert."""
+    from data_tools.downloaders import jforex_dl
+
+    (tmp_path / "sdk.jar").write_bytes(b"jar")
+    lib_dir = tmp_path / "lib"
+    lib_dir.mkdir()
+    (lib_dir / "api.jar").write_bytes(b"jar")
+    dup = tmp_path / "copy"
+    dup.mkdir()
+    (dup / "api.jar").write_bytes(b"jar")  # same relative name, other root
+    (tmp_path / "not_a_jar.txt").write_bytes(b"x")
+
+    discovered = jforex_dl._discover_jars(tmp_path)
+
+    names = [path.name for path in discovered]
+    assert "sdk.jar" in names and "api.jar" in names
+    assert len(discovered) == len(set(discovered)), "duplicates must be deduped"
+
+
+def test_discover_jars_returns_empty_for_missing_root(tmp_path: Path):
+    from data_tools.downloaders import jforex_dl
+
+    assert jforex_dl._discover_jars(tmp_path / "does-not-exist") == []
+
+
 # ─── DV-B7: bootstrap failures must not be swallowed ────────────────────────
 
 

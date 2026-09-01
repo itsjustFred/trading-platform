@@ -57,27 +57,6 @@ def test_download_bi5_files_positional_params_are_batch_size_and_max_retries():
     assert "batch_size" not in kwonly
 
 
-class _RecordingDownloader:
-    """Captures download_bi5_files calls and returns distinguishable frames."""
-
-    def __init__(self, bid_frame: pd.DataFrame, ask_frame: pd.DataFrame):
-        self.bid_frame = bid_frame
-        self.ask_frame = ask_frame
-        self.calls: list[dict] = []
-
-    def __call__(self, urls, *args, **kwargs):
-        call = {
-            "urls": list(urls),
-            "args": args,
-            "kwargs": kwargs,
-            "report_progress": kwargs.get("report_progress"),
-        }
-        self.calls.append(call)
-        if len(self.calls) == 1:
-            return [("2024-01-01T00:00:00Z", b"bid")]
-        return [("2024-01-01T00:00:00Z", b"ask")]
-
-
 def test_merged_ticks_download_side_specific_urls():
     """DV-C2: the ask side must request ask URLs, not the bid URL set.
 
