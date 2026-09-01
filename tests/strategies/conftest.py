@@ -45,16 +45,16 @@ def summarize_data_skips(config: pytest.Config) -> None:
     """Print one aggregated summary line for all data-gate skips."""
     if not _DATA_SKIP_REASONS:
         return
-    writer = getattr(config, "_outerrunner", None) or config
-    terminal = getattr(writer, "write_line", None)
     message = (
         f"{len(_DATA_SKIP_REASONS)} strategy test(s) skipped on missing/unreadable "
         "local market data (set FAIL_ON_MISSING_DATA=1 to fail instead):"
     )
-    if callable(terminal):
-        terminal(message)
+    terminalreporter = config.pluginmanager.get_plugin("terminalreporter")
+    write_line = getattr(terminalreporter, "write_line", None)
+    if callable(write_line):
+        write_line(message)
         for reason in _DATA_SKIP_REASONS:
-            terminal(f"  - {reason}")
+            write_line(f"  - {reason}")
         return
     print(message)
     for reason in _DATA_SKIP_REASONS:

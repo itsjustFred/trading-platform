@@ -7,8 +7,9 @@ These cover the three silent-skip defects of Cleanup 17-B:
       failures (Decision Record 2026-08-31: skip locally allowed, CI can
       opt into strict mode).
 - M2: the coverage check unioned shard extents, so Jan-Mar + Dec shards
-      satisfied an Apr-Nov request. Every candidate file must cover the
-      window on its own.
+      satisfied an Apr-Nov request. Coverage is now verified by shard
+      contiguity: sorted extents must chain without a hole across the
+      requested window (so year-sharded datasets stay valid).
 - M3: unreadable/corrupt parquet files were swallowed into "no coverage".
       Corruption must surface in the skip/failure reason.
 """
@@ -193,7 +194,7 @@ def test_session_finish_summary_counts_data_skips(gate, tmp_path, capsys):
     gate.record_data_skip("missing OHLCV dataset for SPY/1d")
 
     gate.summarize_data_skips(
-        config=type("Config", (), {"getoption": lambda self, name: False})()
+        config=type("Config", (), {"pluginmanager": type("PM", (), {"get_plugin": lambda self, name: None})()})()
     )
 
     output = capsys.readouterr().out
@@ -203,7 +204,7 @@ def test_session_finish_summary_counts_data_skips(gate, tmp_path, capsys):
 
 def test_session_finish_summary_is_silent_without_skips(gate, capsys):
     gate.summarize_data_skips(
-        config=type("Config", (), {"getoption": lambda self, name: False})()
+        config=type("Config", (), {"pluginmanager": type("PM", (), {"get_plugin": lambda self, name: None})()})()
     )
 
     assert capsys.readouterr().out == ""
