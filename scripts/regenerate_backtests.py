@@ -366,11 +366,12 @@ def _restore_json_backups(backtests_dir: Path, backup_dir: Path) -> int:
 
 def restore_backups(backup_dir: Path, *, data_dir: Path | None = None) -> tuple[int, int]:
     """Restore a regeneration backup into ``data_dir``. Returns (sqlite, json) counts."""
+    resolved_backup_dir = _validate_backup_dir(backup_dir)
     resolved_data_dir = data_dir if data_dir is not None else DATA_DIR
     db_path = _existing_db_path()
     sqlite_restored = 0
-    json_restored = _restore_json_backups(resolved_data_dir / "backtests", backup_dir)
-    backup_db = backup_dir / db_path.name
+    json_restored = _restore_json_backups(resolved_data_dir / "backtests", resolved_backup_dir)
+    backup_db = resolved_backup_dir / db_path.name
     if backup_db.exists():
         _restore_sqlite_backup(db_path, backup_db)
         sqlite_restored = 1
@@ -539,6 +540,27 @@ def _confirm_regeneration(_input: Callable[[str], str]) -> None:
         raise SystemExit("Aborted — the existing backtest corpus is unchanged.")
 
 
+def _validate_backup_dir(backup_dir: Path) -> Path:
+    """Validate a backup directory before it is used for writes.
+
+    ``--backup-dir`` arrives from the command line (or from an LLM-driven caller),
+    so it is resolved and checked before anything touches the file system: it must
+    be an absolute path that is not the repository root, not ``DATA_DIR`` itself,
+    and not inside the live ``DATA_DIR/backtests`` corpus it is supposed to back up.
+    """
+    resolved = backup_dir.expanduser().resolve()
+    if not resolved.is_absolute():
+        raise ValueError(f"Backup directory must be an absolute path: {resolved}")
+    if resolved == Path.cwd() or resolved == DATA_DIR:
+        raise ValueError(f"Refusing to use {resolved} as backup directory")
+    if resolved == BACKTESTS_DIR or BACKTESTS_DIR in resolved.parents:
+        raise ValueError(
+            f"Backup directory {resolved} must live outside {BACKTESTS_DIR} — a snapshot "
+            "inside the corpus would be deleted by the purge it precedes."
+        )
+    return resolved
+
+
 def _snapshot_corpus(resolved_backup_dir: Path) -> None:
     """Copy the SQLite backtest tables and JSON artifacts into ``resolved_backup_dir``."""
     resolved_backup_dir.mkdir(parents=True, exist_ok=True)
@@ -613,7 +635,9 @@ def regenerate(
         _confirm_regeneration(_input)
 
     outcome = RegenerationOutcome()
-    resolved_backup_dir = backup_dir if backup_dir is not None else _default_backup_dir()
+    resolved_backup_dir = _validate_backup_dir(
+        backup_dir if backup_dir is not None else _default_backup_dir()
+    )
     _snapshot_corpus(resolved_backup_dir)
     outcome.backup_dir = resolved_backup_dir
 
