@@ -240,9 +240,21 @@ def _resolve_symbol_and_instrument(raw_symbol: str) -> tuple[str, str, str]:
 
 
 def generate_tick_urls(
-    instrument: str, start_dt: datetime, end_dt: datetime
+    instrument: str,
+    start_dt: datetime,
+    end_dt: datetime,
+    price_type: str = "both",
 ) -> list[tuple[datetime, str]]:
-    """Generate hourly tick-data URLs. CRITICAL: months are 0-based in URLs."""
+    """Generate hourly tick-data URLs. CRITICAL: months are 0-based in URLs.
+
+    Hourly tick files contain both offer sides per record, so ``price_type``
+    only documents the requested side; ``bid``/``ask`` map to the same shared
+    file. Anything else raises to keep callers honest (DV-C2).
+    """
+    normalized_price_type = str(price_type or "both").strip().lower()
+    if normalized_price_type not in {"bid", "ask", "both"}:
+        raise ValueError("price_type must be one of: bid, ask, both")
+
     urls = []
     current = datetime(start_dt.year, start_dt.month, start_dt.day, tzinfo=timezone.utc)
     while current < end_dt:
@@ -411,10 +423,9 @@ async def _fetch_one(
 
 async def download_bi5_files(
     urls: list[tuple[datetime, str]],
-    concurrency: int = 10,
+    batch_size: int = 10,
     max_retries: int = 3,
     *,
-    batch_size: int | None = None,
     pipeline_batches: int = 1,
     pause_ms: int = 1000,
     report_progress: Callable[[float, str], None] | None = None,
@@ -423,11 +434,17 @@ async def download_bi5_files(
     pause_event: Event | None = None,
     log_callback: Callable[[str], None] | None = None,
 ) -> list[tuple[datetime, bytes]]:
-    """Download .bi5 files asynchronously in controllable batches."""
+    """Download .bi5 files asynchronously in controllable batches.
+
+    ``batch_size`` is the number of files fetched per batch window and
+    ``max_retries`` the per-file retry count; both are positional-compatible
+    so call sites cannot pass them twice. ``pipeline_batches`` multiplies the
+    in-flight window (``batch_size * pipeline_batches``).
+    """
     import aiohttp
 
-    effective_batch_size = max(1, int(batch_size or concurrency or 10))
-    effective_pipeline_batches = max(1, int(pipeline_batches or 1))
+    effective_batch_size = max(1, int(batch_size))
+    effective_pipeline_batches = max(1, int(pipeline_batches))
     window_size = effective_batch_size * effective_pipeline_batches
     base_pause_ms = max(0, int(pause_ms))
     current_pause_ms = base_pause_ms
@@ -645,6 +662,81 @@ def _normalize_offer_side(value: str | None) -> str:
     return normalized
 
 
+def _split_tick_sides(tick_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Split a shared tick frame into (bid, ask) frames keyed by timestamp.
+
+    Dukascopy hourly tick files already contain both sides per record, so the
+    merged pipeline derives each side from the same fetch instead of pulling
+    the identical URL twice (DV-C2).
+    """
+    if tick_df.empty:
+        empty = tick_df.copy()
+        return empty, empty.copy()
+
+    bid = tick_df[["timestamp", "bid", "bid_vol"]].copy()
+    ask = tick_df[["timestamp", "ask", "ask_vol"]].copy()
+    return bid.reset_index(drop=True), ask.reset_index(drop=True)
+
+
+def _merge_tick_sides(bid_df: pd.DataFrame, ask_df: pd.DataFrame) -> pd.DataFrame:
+    """Join side frames back onto a single bid+ask frame with explicit prefixes."""
+    if bid_df.empty and ask_df.empty:
+        return pd.DataFrame(
+            columns=["timestamp", "ask", "bid", "ask_vol", "bid_vol"]
+        )
+
+    if ask_df.empty:
+        # Keep the bid side without inventing ask values (DV-C2: no silent
+        # substitution of bid data into ask columns).
+        merged = bid_df.rename(columns={})
+        merged["ask"] = pd.Series(dtype="float64")
+        merged["ask_vol"] = pd.Series(dtype="float64")
+        return (
+            merged[["timestamp", "ask", "bid", "ask_vol", "bid_vol"]]
+            .sort_values("timestamp")
+            .drop_duplicates(subset=["timestamp"])
+            .reset_index(drop=True)
+        )
+
+    if bid_df.empty:
+        merged = ask_df.copy()
+        merged["bid"] = pd.Series(dtype="float64")
+        merged["bid_vol"] = pd.Series(dtype="float64")
+        return (
+            merged[["timestamp", "ask", "bid", "ask_vol", "bid_vol"]]
+            .sort_values("timestamp")
+            .drop_duplicates(subset=["timestamp"])
+            .reset_index(drop=True)
+        )
+
+    merged = pd.merge(
+        bid_df,
+        ask_df,
+        on="timestamp",
+        how="inner",
+        suffixes=("_dup", "_dup"),
+    )
+    merged = merged.rename(
+        columns={
+            "bid_dup": "bid",
+            "bid_vol_dup": "bid_vol",
+            "ask_dup": "ask",
+            "ask_vol_dup": "ask_vol",
+        }
+    )
+    missing = {"bid", "bid_vol", "ask", "ask_vol"} - set(merged.columns)
+    if missing:
+        raise RuntimeError(
+            f"Merged tick frame is missing side columns after join: {sorted(missing)}"
+        )
+    return (
+        merged[["timestamp", "ask", "bid", "ask_vol", "bid_vol"]]
+        .sort_values("timestamp")
+        .drop_duplicates(subset=["timestamp"])
+        .reset_index(drop=True)
+    )
+
+
 def _prefix_ohlcv_columns(df: pd.DataFrame, side: str) -> pd.DataFrame:
     if df.empty:
         return df.copy()
@@ -701,7 +793,6 @@ async def _download_minute_side_dataframe(
         urls,
         batch_size,
         max_retries,
-        batch_size=batch_size,
         pipeline_batches=pipeline_batches,
         pause_ms=pause_ms,
         report_progress=report_progress,
@@ -777,72 +868,49 @@ async def _download_and_assemble_merged_ticks(
     start_dt: datetime,
     end_dt: datetime,
     batch_size: int,
+    max_retries: int,
     *,
     pipeline_batches: int = 1,
     pause_ms: int = 1000,
-    max_retries: int = 3,
     report_progress: Callable[[float, str], None] | None = None,
     stop_event: Event | None = None,
     pause_event: Event | None = None,
     log_callback: Callable[[str], None] | None = None,
 ) -> pd.DataFrame:
-    """Download both bid and ask ticks, merge into a single DataFrame."""
+    """Download shared tick files and merge bid+ask into a single DataFrame.
+
+    Dukascopy hourly tick files carry both sides per record, so each file is
+    fetched once and the bid/ask columns are split out afterwards (DV-C2).
+    """
     decimal_factor = _get_decimal_factor(instrument)
 
-    bid_urls = generate_tick_urls(instrument, start_dt, end_dt)
-    ask_urls = generate_tick_urls(instrument, start_dt, end_dt)
-    bid_results = await download_bi5_files(
-        bid_urls,
+    urls = generate_tick_urls(instrument, start_dt, end_dt)
+    _emit_log_message(
+        f"Downloading {len(urls)} shared hourly tick files for bid+ask...",
+        log_callback=log_callback,
+    )
+    bi5_results = await download_bi5_files(
+        urls,
         batch_size,
         max_retries,
-        batch_size=batch_size,
         pipeline_batches=pipeline_batches,
         pause_ms=pause_ms,
-        report_progress=(
-            (lambda pct, msg: _report_progress(report_progress, pct * 0.45, f"Bid {msg}"))
-            if report_progress
-            else None
-        ),
+        report_progress=report_progress,
         progress_unit="files",
         stop_event=stop_event,
         pause_event=pause_event,
         log_callback=log_callback,
     )
-    bid_df = _assemble_tick_dataframe(bid_results, decimal_factor)
+    shared_df = _assemble_tick_dataframe(bi5_results, decimal_factor)
 
-    ask_results = await download_bi5_files(
-        ask_urls,
-        batch_size,
-        max_retries,
-        batch_size=batch_size,
-        pipeline_batches=pipeline_batches,
-        pause_ms=pause_ms,
-        report_progress=(
-            (lambda pct, msg: _report_progress(report_progress, 45.0 + (pct * 0.45), f"Ask {msg}"))
-            if report_progress
-            else None
-        ),
-        progress_unit="files",
-        stop_event=stop_event,
-        pause_event=pause_event,
-        log_callback=log_callback,
-    )
-    ask_df = _assemble_tick_dataframe(ask_results, decimal_factor)
+    if shared_df.empty:
+        return pd.DataFrame(
+            columns=["timestamp", "ask", "bid", "ask_vol", "bid_vol"]
+        )
+
+    bid_df, ask_df = _split_tick_sides(shared_df)
     _report_progress(report_progress, 95.0, "Merging bid/ask data")
-
-    if bid_df.empty and ask_df.empty:
-        return pd.DataFrame()
-
-    if bid_df.empty:
-        return ask_df
-    if ask_df.empty:
-        return bid_df
-
-    merged = pd.merge(
-        bid_df, ask_df,
-        on="timestamp", how="inner", suffixes=("_bid", "_ask"),
-    ).sort_values("timestamp").reset_index(drop=True)
-    return merged
+    return _merge_tick_sides(bid_df, ask_df)
 
 
 # ─── Genesis helpers ─────────────────────────────────────────────────────────
@@ -1025,9 +1093,9 @@ class DukascopyNativeDownloader(Downloader):
                     start_dt,
                     end_dt,
                     batch_size,
+                    max_retries,
                     pipeline_batches=pipeline_batches,
                     pause_ms=pause_ms,
-                    max_retries=max_retries,
                     report_progress=report_progress,
                     stop_event=stop_event,
                     pause_event=pause_event,
@@ -1044,7 +1112,6 @@ class DukascopyNativeDownloader(Downloader):
                     urls,
                     batch_size,
                     max_retries,
-                    batch_size=batch_size,
                     pipeline_batches=pipeline_batches,
                     pause_ms=pause_ms,
                     report_progress=(

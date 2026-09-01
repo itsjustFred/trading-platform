@@ -32,10 +32,9 @@ def test_native_downloader_accepts_control_events_and_reports_progress(
 
     async def fake_download_bi5_files(
         urls,
-        concurrency=10,
+        batch_size=10,
         max_retries=3,
         *,
-        batch_size=None,
         pipeline_batches=1,
         pause_ms=1000,
         report_progress=None,
