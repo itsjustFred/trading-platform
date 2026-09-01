@@ -321,7 +321,19 @@ def test_trade_engine_can_configure_same_bar_take_profit_priority():
     assert trade.pnl > 0
 
 
-def test_example_sma_native_vs_vectorbt_trade_count_similarity():
+def test_example_sma_native_vs_vectorbt_smoke_on_local_data():
+    """Smoke test on whatever local 1h dataset exists (Decision Record 2026-08-31).
+
+    Named explicitly as a SMOKE test: on real/local data the engines use
+    different signal-exit fill conventions (ox-alpha F10), so exact parity
+    is not promised here. The deterministic-fixture parity test with exact
+    trade-count equality lives in tests/test_engine_parity.py.
+
+    Guards that were previously vacuous:
+    - an empty store no longer passes the test (both engines returning zero
+      trades is a failure, not "assert True");
+    - divergence is capped at one trade, not 30%.
+    """
     strategy_path = Path("strategies/example_sma/example_sma.py").resolve()
     if not strategy_path.exists():
         pytest.skip("example_sma strategy not found")
@@ -360,9 +372,11 @@ def test_example_sma_native_vs_vectorbt_trade_count_similarity():
     native_count = len(native_result.trades)
     vectorbt_count = len(vectorbt_result.trades)
 
-    if vectorbt_count == 0 and native_count == 0:
-        assert True
-        return
-
-    tolerance = max(2, int(vectorbt_count * 0.3))
-    assert abs(native_count - vectorbt_count) <= tolerance
+    assert (native_count, vectorbt_count) != (0, 0), (
+        f"Both engines produced zero trades on {symbol}/1h — the smoke test "
+        "must exercise at least one engine, not pass vacuously"
+    )
+    assert abs(native_count - vectorbt_count) <= 1, (
+        f"Trade-count divergence on real data must be at most one trade: "
+        f"native={native_count}, vectorbt={vectorbt_count} on {symbol}/1h"
+    )
