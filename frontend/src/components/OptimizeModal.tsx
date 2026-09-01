@@ -47,9 +47,15 @@ function detectParameterKind(value: StrategyParameterValue): ParameterKind {
   return "categorical";
 }
 
+/** Removes trailing fractional zeros without regex backtracking. */
+function trimTrailingZeros(text: string): string {
+  const trimmed = text.replace(/0+$/, "");
+  return trimmed.endsWith(".") ? trimmed.slice(0, -1) : trimmed;
+}
+
 function formatCurrentValue(value: StrategyParameterValue) {
   if (typeof value === "number") {
-    return Number.isInteger(value) ? String(value) : value.toFixed(4).replace(/0+$/, "").replace(/\.$/, "");
+    return Number.isInteger(value) ? String(value) : trimTrailingZeros(value.toFixed(4));
   }
   if (typeof value === "boolean") {
     return value ? "true" : "false";
@@ -63,7 +69,7 @@ function formatCurrentValue(value: StrategyParameterValue) {
 function parseNumericField(raw: string, label: string) {
   const numeric = Number.parseFloat(raw);
   if (!Number.isFinite(numeric)) {
-    throw new Error(`${label} must be a valid number.`);
+    throw new TypeError(`${label} must be a valid number.`);
   }
   return numeric;
 }
@@ -87,6 +93,19 @@ function normalizeChoices(raw: string, currentValue: StrategyParameterValue) {
       }
       return choice;
     });
+}
+
+/** Builds the numeric range payload honouring integer truncation. */
+function buildNumericRange(
+  kind: "int" | "float",
+  minValue: number,
+  maxValue: number,
+): OptimizationParameterRange {
+  return {
+    type: kind,
+    min: kind === "int" ? Math.trunc(minValue) : minValue,
+    max: kind === "int" ? Math.trunc(maxValue) : maxValue,
+  };
 }
 
 function buildRangePayload(
@@ -116,11 +135,7 @@ function buildRangePayload(
       throw new Error(`${name}: min cannot be greater than max.`);
     }
 
-    const range: OptimizationParameterRange = {
-      type: draft.kind,
-      min: draft.kind === "int" ? Math.trunc(minValue) : minValue,
-      max: draft.kind === "int" ? Math.trunc(maxValue) : maxValue,
-    };
+    const range: OptimizationParameterRange = buildNumericRange(draft.kind, minValue, maxValue);
 
     if (draft.step.trim()) {
       const stepValue = parseNumericField(draft.step, `${name} step`);
@@ -162,7 +177,7 @@ export function OptimizeModal({
   backtestTitle,
   parameters,
   onTaskStarted,
-}: OptimizeModalProps) {
+}: Readonly<OptimizeModalProps>) {
   const { showToast } = useToast();
   const [parameterDrafts, setParameterDrafts] = useState<Record<string, ParameterDraft>>({});
   const [targetMetric, setTargetMetric] = useState<MetricOption>("sharpe");
@@ -210,7 +225,7 @@ export function OptimizeModal({
     () =>
       parameterEntries.reduce((count, [, draft]) => {
         if (draft.kind === "categorical") {
-          return count + (draft.choices.split(",").map((item) => item.trim()).filter(Boolean).length > 0 ? 1 : 0);
+          return count + (draft.choices.split(",").some((item) => item.trim().length > 0) ? 1 : 0);
         }
         return count + (draft.min.trim() && draft.max.trim() ? 1 : 0);
       }, 0),
@@ -470,7 +485,7 @@ export function OptimizeModal({
                     <div
                       style={{
                         display: "grid",
-                        gridTemplateColumns: isCategorical ? "240px minmax(0, 1fr)" : "240px minmax(0, 1fr)",
+                        gridTemplateColumns: "240px minmax(0, 1fr)",
                         gap: "16px",
                         alignItems: "start",
                       }}
@@ -525,9 +540,9 @@ export function OptimizeModal({
 
                       {isCategorical ? (
                         <div>
-                          <label style={labelStyle}>Categories (comma-separated)</label>
+                          <label htmlFor="optimize-categories" style={labelStyle}>Categories (comma-separated)</label>
                           <input
-                            value={draft.choices}
+                            id="optimize-categories"                            value={draft.choices}
                             onChange={(event) => updateDraft(name, { choices: event.target.value })}
                             placeholder={typeof draft.currentValue === "boolean" ? "true, false" : "sma, ema, wma"}
                             style={inputStyle}
@@ -539,9 +554,9 @@ export function OptimizeModal({
                       ) : (
                         <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: "12px" }}>
                           <div>
-                            <label style={labelStyle}>Min</label>
+                            <label htmlFor="optimize-min" style={labelStyle}>Min</label>
                             <input
-                              type="number"
+                              id="optimize-min"                              type="number"
                               value={draft.min}
                               onChange={(event) => updateDraft(name, { min: event.target.value })}
                               placeholder={typeof draft.currentValue === "number" ? String(draft.currentValue) : "0"}
@@ -550,9 +565,9 @@ export function OptimizeModal({
                             />
                           </div>
                           <div>
-                            <label style={labelStyle}>Max</label>
+                            <label htmlFor="optimize-max" style={labelStyle}>Max</label>
                             <input
-                              type="number"
+                              id="optimize-max"                              type="number"
                               value={draft.max}
                               onChange={(event) => updateDraft(name, { max: event.target.value })}
                               placeholder={typeof draft.currentValue === "number" ? String(draft.currentValue) : "0"}
@@ -561,9 +576,9 @@ export function OptimizeModal({
                             />
                           </div>
                           <div>
-                            <label style={labelStyle}>Step</label>
+                            <label htmlFor="optimize-step" style={labelStyle}>Step</label>
                             <input
-                              type="number"
+                              id="optimize-step"                              type="number"
                               value={draft.step}
                               onChange={(event) => updateDraft(name, { step: event.target.value })}
                               placeholder={draft.kind === "int" ? "1" : "optional"}
@@ -593,9 +608,9 @@ export function OptimizeModal({
           }}
         >
           <div>
-            <label style={labelStyle}>Optimization Mode</label>
+            <label htmlFor="optimize-mode" style={labelStyle}>Optimization Mode</label>
             <select
-              value={optimizationMode}
+              id="optimize-mode"              value={optimizationMode}
               onChange={(event) => setOptimizationMode(event.target.value as OptimizationMode)}
               style={inputStyle}
             >
@@ -605,9 +620,9 @@ export function OptimizeModal({
             </select>
           </div>
           <div>
-            <label style={labelStyle}>Fixed Symbol Lists</label>
+            <label htmlFor="optimize-symbol-universes" style={labelStyle}>Fixed Symbol Lists</label>
             <textarea
-              value={symbolUniversesText}
+              id="optimize-symbol-universes"              value={symbolUniversesText}
               onChange={(event) => setSymbolUniversesText(event.target.value)}
               placeholder={"SPY, TLT, GLD\nSPY, IEF, DBC, GLD"}
               rows={3}
@@ -628,8 +643,8 @@ export function OptimizeModal({
           }}
         >
           <div>
-            <label style={labelStyle}>Target Metric</label>
-            <select value={targetMetric} onChange={(event) => setTargetMetric(event.target.value as MetricOption)} style={inputStyle}>
+            <label htmlFor="optimize-target-metric" style={labelStyle}>Target Metric</label>
+            <select id="optimize-target-metric" value={targetMetric} onChange={(event) => setTargetMetric(event.target.value as MetricOption)} style={inputStyle}>
               {TARGET_OPTIONS.map((option) => (
                 <option key={option.value} value={option.value}>
                   {option.label}
@@ -638,9 +653,9 @@ export function OptimizeModal({
             </select>
           </div>
           <div>
-            <label style={labelStyle}>Number of Trials</label>
+            <label htmlFor="optimize-trials" style={labelStyle}>Number of Trials</label>
             <input
-              type="number"
+              id="optimize-trials"              type="number"
               min="1"
               step="1"
               value={nTrials}
@@ -649,9 +664,9 @@ export function OptimizeModal({
             />
           </div>
           <div>
-            <label style={labelStyle}>Train / Test Split %</label>
+            <label htmlFor="optimize-train-split" style={labelStyle}>Train / Test Split %</label>
             <input
-              type="number"
+              id="optimize-train-split"              type="number"
               min="0.1"
               max="0.95"
               step="0.05"
