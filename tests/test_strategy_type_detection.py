@@ -21,7 +21,8 @@ def test_detect_strategy_type_from_meta_field(tmp_path: Path):
     assert detected == StrategyType.SIGNAL_PROCESSOR
 
 
-def test_detect_strategy_type_from_class_pattern(tmp_path: Path):
+def test_detect_strategy_type_requires_explicit_meta(tmp_path: Path):
+    """Detection is static: a bare *SignalProcessor class is not enough."""
     strategy_path = tmp_path / "class_signal_processor.py"
     strategy_path.write_text(
         "\n".join(
@@ -36,7 +37,7 @@ def test_detect_strategy_type_from_class_pattern(tmp_path: Path):
     )
 
     detected = detect_strategy_type(strategy_path, tmp_path)
-    assert detected == StrategyType.SIGNAL_PROCESSOR
+    assert detected == StrategyType.MARKET_DATA
 
 
 def test_detect_strategy_type_defaults_to_market_data(tmp_path: Path):
