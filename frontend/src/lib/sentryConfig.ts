@@ -98,6 +98,11 @@ export function resolveFrontendSentryRelease(options: {
 /**
  * Initialize the shared Sentry project for the frontend. A missing
  * `VITE_SENTRY_DSN` keeps Sentry disabled so local development stays silent.
+ *
+ * The SDK's default GlobalHandlers integration instruments
+ * `window.onerror` / `window.onunhandledrejection`, so uncaught errors and
+ * unhandled rejections are reported automatically once this resolves — no
+ * manual `addEventListener("error")` hooks (those would double-report).
  * Returns the active client, or null when Sentry is disabled.
  */
 export async function initFrontendSentry(): Promise<SentryClient | null> {
@@ -119,17 +124,4 @@ export async function initFrontendSentry(): Promise<SentryClient | null> {
   });
 
   return client ?? null;
-}
-
-/**
- * Report an uncaught error or unhandled rejection to Sentry. Used by the
- * global handlers registered in `main.tsx` because Vite's dev-mode overlay
- * swallows some of these before the SDK's own hooks see them.
- */
-export function captureFrontendException(reason: unknown): void {
-  void import("@sentry/react").then(({ captureException }) => {
-    captureException(reason, {
-      tags: { service: FRONTEND_SERVICE_TAG, origin: "global_handler" },
-    });
-  });
 }

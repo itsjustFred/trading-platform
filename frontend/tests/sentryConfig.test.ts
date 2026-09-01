@@ -125,9 +125,9 @@ test("main.tsx initializes Sentry before rendering the app", async () => {
   assert.ok(initIndex >= 0 && renderIndex > initIndex);
 });
 
-test("main.tsx registers a global error handler that reports to Sentry", async () => {
+test("main.tsx does not register manual global handlers that would double-report", async () => {
   const source = await mainTsx;
 
-  assert.match(source, /window\.addEventListener\(\s*"error"/);
-  assert.match(source, /window\.addEventListener\(\s*"unhandledrejection"/);
+  assert.doesNotMatch(source, /addEventListener\(\s*"error"/);
+  assert.doesNotMatch(source, /addEventListener\(\s*"unhandledrejection"/);
 });
