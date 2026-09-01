@@ -13,7 +13,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 from pathlib import Path
 
@@ -143,8 +142,9 @@ def update_catalog(data_dir: Path | None = None):
 
         root = data_dir or _DEFAULT_DATA_DIR
         catalog = build_catalog(root)
-        catalog_path = root / "catalog.json"
-        catalog_path.write_text(json.dumps(catalog, indent=2, default=str))
+        from data_tools.catalog_builder import write_catalog_json
+
+        write_catalog_json(root / "catalog.json", catalog)
         logger.info("Catalog updated: %d datasets", catalog["summary"]["total_datasets"])
     except Exception as e:
         logger.warning("Could not update catalog: %s", e)
