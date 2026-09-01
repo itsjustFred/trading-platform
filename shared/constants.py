@@ -1,4 +1,9 @@
-"""Shared constants for the trading platform."""
+"""Shared constants for the trading platform.
+
+Environment (.env) loading happens exactly once here, before any module reads
+``os.environ`` for configuration, so every entry point resolves the same
+configuration regardless of import order.
+"""
 
 import os
 import shutil
@@ -104,38 +109,59 @@ def _data_dir_score(path: Path) -> int:
 
 
 def _resolve_data_dir(raw_value: str | None) -> Path:
+    """Resolve DATA_DIR deterministically.
+
+    The configured value is authoritative: it is used verbatim (after
+    ``~`` expansion) without filesystem-based candidate scoring, so two
+    processes given the same configuration always agree on DATA_DIR. An
+    unset configuration falls back to ``<repo>/data``.
+    """
     default_path = (PROJECT_ROOT / "data").resolve()
     if not raw_value:
         return default_path
 
-    candidates: list[Path] = []
-    seen: set[str] = set()
-
-    def _add(path: Path) -> None:
-        key = str(path)
-        if key in seen:
-            return
-        seen.add(key)
-        candidates.append(path)
-
     configured = Path(raw_value).expanduser()
-    _add(configured)
+    if not configured.is_absolute():
+        configured = (PROJECT_ROOT / configured).resolve()
+    return configured.resolve()
 
-    # If config uses "~", prefer the candidate that actually contains runtime data.
-    if raw_value == "~" or raw_value.startswith("~/"):
-        suffix = raw_value[2:] if raw_value.startswith("~/") else ""
-        for home in _home_candidates():
-            _add(home / suffix if suffix else home)
 
-    best = candidates[0]
-    best_score = _data_dir_score(best)
-    for candidate in candidates[1:]:
-        score = _data_dir_score(candidate)
-        if score > best_score:
-            best = candidate
-            best_score = score
+_DATA_DIR_OVERRIDE: Path | None = None
 
-    return best.resolve()
+
+def set_data_dir(path: str | Path) -> None:
+    """Override DATA_DIR for the current process (test isolation hook).
+
+    Keeps the derived module-level constants (DATA_DIR, OPTIMIZATIONS_DIR)
+    and the already-imported ``shared.database`` bindings in sync.
+    """
+    global DATA_DIR, OPTIMIZATIONS_DIR, _DATA_DIR_OVERRIDE
+    resolved = Path(path).expanduser().resolve()
+    _DATA_DIR_OVERRIDE = resolved
+    DATA_DIR = resolved
+    OPTIMIZATIONS_DIR = DATA_DIR / "optimizations"
+    try:
+        import shared.database as database
+
+        database.DATA_DIR = DATA_DIR
+        database.DB_PATH = DATA_DIR / "backtests.db"
+    except ImportError:
+        pass
+
+
+def reset_data_dir() -> None:
+    """Restore the process-wide DATA_DIR resolved from the environment."""
+    global DATA_DIR, OPTIMIZATIONS_DIR, _DATA_DIR_OVERRIDE
+    _DATA_DIR_OVERRIDE = None
+    DATA_DIR = _resolve_data_dir(os.environ.get("DATA_DIR") or os.environ.get("TRADING_DATA_DIR"))
+    OPTIMIZATIONS_DIR = DATA_DIR / "optimizations"
+    try:
+        import shared.database as database
+
+        database.DATA_DIR = DATA_DIR
+        database.DB_PATH = DATA_DIR / "backtests.db"
+    except ImportError:
+        pass
 
 
 DATA_DIR = _resolve_data_dir(_data_dir_env)

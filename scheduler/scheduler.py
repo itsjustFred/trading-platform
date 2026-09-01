@@ -8,6 +8,7 @@ from typing import Awaitable, Callable
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
+from scheduler.jobs.signal_bot_health_check import run as run_signal_bot_health_check
 from scheduler.jobs.weekly_data_refresh import run as run_weekly_data_refresh
 from shared.database import list_services, update_service_status, upsert_background_task_record
 from shared.logging import get_logger
@@ -18,6 +19,7 @@ logger = get_logger("scheduler")
 
 _SCHEDULED_JOB_HANDLERS: dict[str, Callable[..., Awaitable[None]]] = {
     "weekly_data_refresh": run_weekly_data_refresh,
+    "signal_bot_health_check": run_signal_bot_health_check,
 }
 
 
