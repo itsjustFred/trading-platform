@@ -27,7 +27,10 @@ import { useToast } from "../components/ToastProvider";
 import { formatPValue, pValueColor } from "../utils/stats";
 
 function componentId(): string {
-  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+  if (
+    typeof crypto !== "undefined" &&
+    typeof crypto.randomUUID === "function"
+  ) {
     return crypto.randomUUID();
   }
   return `component-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -51,7 +54,10 @@ type StrategyOption = {
 
 const DEFAULT_TIMEFRAMES = ["1m", "5m", "15m", "30m", "1h", "4h", "1d"];
 
-const PORTFOLIO_SORT_OPTIONS: Array<{ label: string; value: PortfoliosSortField }> = [
+const PORTFOLIO_SORT_OPTIONS: Array<{
+  label: string;
+  value: PortfoliosSortField;
+}> = [
   { label: "Created Date", value: "created_at" },
   { label: "Total Return", value: "total_return" },
   { label: "Sharpe (higher = better)", value: "sharpe_ratio" },
@@ -73,7 +79,11 @@ const PortfolioCard = memo(function PortfolioCard({
   portfolio,
   onDelete,
 }: {
-  portfolio: PortfolioSummary & { equity_mini?: number[]; max_drawdown_pct?: number; net_profit_pct?: number };
+  portfolio: PortfolioSummary & {
+    equity_mini?: number[];
+    max_drawdown_pct?: number;
+    net_profit_pct?: number;
+  };
   onDelete: (id: string, event: React.MouseEvent) => void;
 }) {
   const componentCount = Number(portfolio.strategy_count || 0);
@@ -88,8 +98,12 @@ const PortfolioCard = memo(function PortfolioCard({
         cursor: "pointer",
         position: "relative",
       }}
-      onMouseEnter={(e) => (e.currentTarget.style.borderColor = "rgba(88,166,255,0.4)")}
-      onMouseLeave={(e) => (e.currentTarget.style.borderColor = "var(--color-border)")}
+      onMouseEnter={(e) =>
+        (e.currentTarget.style.borderColor = "rgba(88,166,255,0.4)")
+      }
+      onMouseLeave={(e) =>
+        (e.currentTarget.style.borderColor = "var(--color-border)")
+      }
     >
       <Link
         to={`/portfolios/${portfolio.id}`}
@@ -108,7 +122,9 @@ const PortfolioCard = memo(function PortfolioCard({
           alignItems: "start",
         }}
       >
-        <div style={{ fontWeight: 600, fontSize: "0.95rem" }}>{portfolio.name}</div>
+        <div style={{ fontWeight: 600, fontSize: "0.95rem" }}>
+          {portfolio.name}
+        </div>
         <button
           type="button"
           onClick={(event) => onDelete(portfolio.id, event)}
@@ -138,7 +154,12 @@ const PortfolioCard = memo(function PortfolioCard({
       </div>
       {portfolio.equity_mini && portfolio.equity_mini.length > 1 && (
         <div style={{ margin: "6px 0" }}>
-          <Sparkline data={portfolio.equity_mini} width={260} height={44} interactive />
+          <Sparkline
+            data={portfolio.equity_mini}
+            width={260}
+            height={44}
+            interactive
+          />
         </div>
       )}
       {hasComponents ? (
@@ -154,7 +175,12 @@ const PortfolioCard = memo(function PortfolioCard({
           {portfolio.sharpe !== 0 && (
             <span>
               Sharpe (higher = better){" "}
-              <b style={{ color: portfolio.sharpe >= 1 ? "#3fb950" : "var(--color-text)" }}>
+              <b
+                style={{
+                  color:
+                    portfolio.sharpe >= 1 ? "#3fb950" : "var(--color-text)",
+                }}
+              >
                 {Number(portfolio.sharpe).toFixed(2)}
               </b>
             </span>
@@ -167,21 +193,30 @@ const PortfolioCard = memo(function PortfolioCard({
               </b>
             </span>
           )}
-          {portfolio.max_drawdown_pct != null && portfolio.max_drawdown_pct !== 0 && (
-            <span>
-              Max DD (lower = better){" "}
-              <b style={{ color: "#f85149" }}>-{Math.abs(Number(portfolio.max_drawdown_pct)).toFixed(1)}%</b>
-            </span>
-          )}
-          {portfolio.net_profit_pct != null && portfolio.net_profit_pct !== 0 && (
-            <span>
-              PnL{" "}
-              <b style={{ color: portfolio.net_profit_pct >= 0 ? "#3fb950" : "#f85149" }}>
-                {portfolio.net_profit_pct >= 0 ? "+" : ""}
-                {Number(portfolio.net_profit_pct).toFixed(1)}%
-              </b>
-            </span>
-          )}
+          {portfolio.max_drawdown_pct != null &&
+            portfolio.max_drawdown_pct !== 0 && (
+              <span>
+                Max DD (lower = better){" "}
+                <b style={{ color: "#f85149" }}>
+                  -{Math.abs(Number(portfolio.max_drawdown_pct)).toFixed(1)}%
+                </b>
+              </span>
+            )}
+          {portfolio.net_profit_pct != null &&
+            portfolio.net_profit_pct !== 0 && (
+              <span>
+                PnL{" "}
+                <b
+                  style={{
+                    color:
+                      portfolio.net_profit_pct >= 0 ? "#3fb950" : "#f85149",
+                  }}
+                >
+                  {portfolio.net_profit_pct >= 0 ? "+" : ""}
+                  {Number(portfolio.net_profit_pct).toFixed(1)}%
+                </b>
+              </span>
+            )}
           {portfolio.psr != null && (
             <span>
               PSR (higher = better){" "}
@@ -193,18 +228,31 @@ const PortfolioCard = memo(function PortfolioCard({
           {portfolio.win_rate != null && (
             <span>
               Win Rate (higher = better){" "}
-              <b style={{ color: Number(portfolio.win_rate) >= 50 ? "#3fb950" : "#f85149" }}>
+              <b
+                style={{
+                  color:
+                    Number(portfolio.win_rate) >= 50 ? "#3fb950" : "#f85149",
+                }}
+              >
                 {Number(portfolio.win_rate).toFixed(1)}%
               </b>
             </span>
           )}
           <span>
             p-Value (lower = better){" "}
-            <b style={{ color: pValueColor(portfolio.p_value) }}>{formatPValue(portfolio.p_value)}</b>
+            <b style={{ color: pValueColor(portfolio.p_value) }}>
+              {formatPValue(portfolio.p_value)}
+            </b>
           </span>
         </div>
       ) : (
-        <div style={{ marginTop: "8px", color: "var(--color-text-muted)", fontSize: "0.74rem" }}>
+        <div
+          style={{
+            marginTop: "8px",
+            color: "var(--color-text-muted)",
+            fontSize: "0.74rem",
+          }}
+        >
           No components
         </div>
       )}
@@ -241,7 +289,9 @@ export function PortfoliosPage() {
 
   const [portfolios, setPortfolios] = useState<PortfolioSummary[]>([]);
   const [strategies, setStrategies] = useState<StrategyOption[]>([]);
-  const [signalProcessors, setSignalProcessors] = useState<SignalProcessorOption[]>([]);
+  const [signalProcessors, setSignalProcessors] = useState<
+    SignalProcessorOption[]
+  >([]);
   const [symbols, setSymbols] = useState<string[]>([]);
   const [nameFilter, setNameFilter] = useState("");
   const [sortBy, setSortBy] = useState<PortfoliosSortField>("created_at");
@@ -249,14 +299,17 @@ export function PortfoliosPage() {
   const [loading, setLoading] = useState(true);
   const [showCreate, setShowCreate] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
-  const [duplicatesInfo, setDuplicatesInfo] = useState<PortfoliosDuplicatesResponse | null>(null);
+  const [duplicatesInfo, setDuplicatesInfo] =
+    useState<PortfoliosDuplicatesResponse | null>(null);
   const [showDuplicatesModal, setShowDuplicatesModal] = useState(false);
   const [loadingDuplicates, setLoadingDuplicates] = useState(false);
   const [runningDeduplicate, setRunningDeduplicate] = useState(false);
 
   const [formName, setFormName] = useState("");
   const [formCapital, setFormCapital] = useState("100000");
-  const [componentsDraft, setComponentsDraft] = useState<ComponentDraft[]>([createDefaultComponent(0)]);
+  const [componentsDraft, setComponentsDraft] = useState<ComponentDraft[]>([
+    createDefaultComponent(0),
+  ]);
 
   const loadPortfolios = useCallback(() => {
     setLoading(true);
@@ -265,7 +318,9 @@ export function PortfoliosPage() {
         setPortfolios(portfolioRows as PortfolioSummary[]);
         setSelectedIds((current) => {
           if (current.size === 0) return current;
-          const valid = new Set((portfolioRows || []).map((item) => String(item.id)));
+          const valid = new Set(
+            (portfolioRows || []).map((item) => String(item.id)),
+          );
           const next = new Set<string>();
           current.forEach((id) => {
             if (valid.has(id)) next.add(id);
@@ -274,7 +329,8 @@ export function PortfoliosPage() {
         });
       })
       .catch((error: unknown) => {
-        const message = error instanceof Error ? error.message : "Failed to load portfolios";
+        const message =
+          error instanceof Error ? error.message : "Failed to load portfolios";
         showToast(message, "error");
       })
       .finally(() => setLoading(false));
@@ -292,19 +348,30 @@ export function PortfoliosPage() {
         setSignalProcessors(signalProcessorRows || []);
       })
       .catch((error: unknown) => {
-        const message = error instanceof Error ? error.message : "Failed to load strategy references";
+        const message =
+          error instanceof Error
+            ? error.message
+            : "Failed to load strategy references";
         showToast(message, "error");
       });
   }, [showToast]);
 
   const selectedCount = selectedIds.size;
 
-  const setComponentField = useCallback((id: string, field: keyof ComponentDraft, value: string) => {
-    setComponentsDraft((prev) => prev.map((row) => (row.id === id ? { ...row, [field]: value } : row)));
-  }, []);
+  const setComponentField = useCallback(
+    (id: string, field: keyof ComponentDraft, value: string) => {
+      setComponentsDraft((prev) =>
+        prev.map((row) => (row.id === id ? { ...row, [field]: value } : row)),
+      );
+    },
+    [],
+  );
 
   const addComponentRow = useCallback(() => {
-    setComponentsDraft((prev) => [...prev, createDefaultComponent(prev.length)]);
+    setComponentsDraft((prev) => [
+      ...prev,
+      createDefaultComponent(prev.length),
+    ]);
   }, []);
 
   const removeComponentRow = useCallback((id: string) => {
@@ -342,9 +409,12 @@ export function PortfoliosPage() {
         const symbol = row.symbol.trim().toUpperCase();
         const timeframe = row.timeframe.trim() || "1h";
         const weightValue = Number(row.weight);
-        const weight = Number.isFinite(weightValue) && weightValue > 0 ? weightValue : 1.0;
-        if (!strategy_name) throw new Error(`Component #${index + 1}: strategy is required`);
-        if (!symbol) throw new Error(`Component #${index + 1}: symbol is required`);
+        const weight =
+          Number.isFinite(weightValue) && weightValue > 0 ? weightValue : 1.0;
+        if (!strategy_name)
+          throw new Error(`Component #${index + 1}: strategy is required`);
+        if (!symbol)
+          throw new Error(`Component #${index + 1}: symbol is required`);
         const settings = parseOptionalJson(row.settings);
         if (signal_processor) {
           settings.signal_processor = signal_processor;
@@ -372,7 +442,8 @@ export function PortfoliosPage() {
         loadPortfolios();
       }
     } catch (error: unknown) {
-      const message = error instanceof Error ? error.message : "Failed to create portfolio";
+      const message =
+        error instanceof Error ? error.message : "Failed to create portfolio";
       showToast(message, "error");
     }
   };
@@ -390,7 +461,8 @@ export function PortfoliosPage() {
       showToast("Portfolio deleted.", "success");
       loadPortfolios();
     } catch (error: unknown) {
-      const message = error instanceof Error ? error.message : "Failed to delete portfolio";
+      const message =
+        error instanceof Error ? error.message : "Failed to delete portfolio";
       showToast(message, "error");
     }
   };
@@ -414,7 +486,8 @@ export function PortfoliosPage() {
       setSelectedIds(new Set());
       loadPortfolios();
     } catch (error: unknown) {
-      const message = error instanceof Error ? error.message : "Bulk delete failed";
+      const message =
+        error instanceof Error ? error.message : "Bulk delete failed";
       showToast(message, "error");
     }
   };
@@ -426,7 +499,8 @@ export function PortfoliosPage() {
       setDuplicatesInfo(payload);
       setShowDuplicatesModal(true);
     } catch (error: unknown) {
-      const message = error instanceof Error ? error.message : "Could not check duplicates";
+      const message =
+        error instanceof Error ? error.message : "Could not check duplicates";
       showToast(message, "error");
     } finally {
       setLoadingDuplicates(false);
@@ -437,11 +511,15 @@ export function PortfoliosPage() {
     setRunningDeduplicate(true);
     try {
       const payload = await deduplicatePortfolios();
-      showToast(`Removed ${payload.deleted_ids.length} duplicate portfolio(s).`, "success");
+      showToast(
+        `Removed ${payload.deleted_ids.length} duplicate portfolio(s).`,
+        "success",
+      );
       setShowDuplicatesModal(false);
       loadPortfolios();
     } catch (error: unknown) {
-      const message = error instanceof Error ? error.message : "Could not remove duplicates";
+      const message =
+        error instanceof Error ? error.message : "Could not remove duplicates";
       showToast(message, "error");
     } finally {
       setRunningDeduplicate(false);
@@ -455,7 +533,10 @@ export function PortfoliosPage() {
       setSelectedIds(new Set());
       loadPortfolios();
     } catch (error: unknown) {
-      const message = error instanceof Error ? error.message : "Could not remove empty portfolios";
+      const message =
+        error instanceof Error
+          ? error.message
+          : "Could not remove empty portfolios";
       showToast(message, "error");
     }
   };
@@ -554,13 +635,26 @@ export function PortfoliosPage() {
               flexWrap: "wrap",
             }}
           >
-            <span style={{ color: "var(--color-text-muted)", fontSize: "0.78rem" }}>
+            <span
+              style={{ color: "var(--color-text-muted)", fontSize: "0.78rem" }}
+            >
               {portfolios.length} result(s)
             </span>
-            <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: "8px",
+                flexWrap: "wrap",
+              }}
+            >
               <button
                 type="button"
-                onClick={() => setSortOrder((current) => (current === "desc" ? "asc" : "desc"))}
+                onClick={() =>
+                  setSortOrder((current) =>
+                    current === "desc" ? "asc" : "desc",
+                  )
+                }
                 style={{
                   borderRadius: "8px",
                   border: "1px solid rgba(143,154,184,0.34)",
@@ -668,9 +762,15 @@ export function PortfoliosPage() {
         width="520px"
       >
         <div style={{ display: "grid", gap: "14px" }}>
-          <div style={{ color: "var(--color-text-muted)", fontSize: "0.84rem", lineHeight: 1.45 }}>
-            Found <b>{duplicatesInfo?.total_groups ?? 0}</b> duplicate group(s) across{" "}
-            <b>{duplicatesInfo?.total_portfolios ?? 0}</b> portfolios.
+          <div
+            style={{
+              color: "var(--color-text-muted)",
+              fontSize: "0.84rem",
+              lineHeight: 1.45,
+            }}
+          >
+            Found <b>{duplicatesInfo?.total_groups ?? 0}</b> duplicate group(s)
+            across <b>{duplicatesInfo?.total_portfolios ?? 0}</b> portfolios.
           </div>
           {duplicatesInfo && duplicatesInfo.total_groups > 0 ? (
             <div
@@ -685,13 +785,22 @@ export function PortfoliosPage() {
               }}
             >
               {duplicatesInfo.groups.slice(0, 8).map((group) => (
-                <div key={group.fingerprint} style={{ padding: "5px 0", borderBottom: "1px solid rgba(255,255,255,0.06)" }}>
-                  {group.name || "Untitled"} · {group.component_count} components · {group.portfolios.length} entries
+                <div
+                  key={group.fingerprint}
+                  style={{
+                    padding: "5px 0",
+                    borderBottom: "1px solid rgba(255,255,255,0.06)",
+                  }}
+                >
+                  {group.name || "Untitled"} · {group.component_count}{" "}
+                  components · {group.portfolios.length} entries
                 </div>
               ))}
             </div>
           ) : null}
-          <div style={{ display: "flex", justifyContent: "flex-end", gap: "8px" }}>
+          <div
+            style={{ display: "flex", justifyContent: "flex-end", gap: "8px" }}
+          >
             <button
               type="button"
               onClick={() => setShowDuplicatesModal(false)}
@@ -710,7 +819,9 @@ export function PortfoliosPage() {
             <button
               type="button"
               onClick={() => void handleDeduplicate()}
-              disabled={runningDeduplicate || (duplicatesInfo?.total_groups ?? 0) === 0}
+              disabled={
+                runningDeduplicate || (duplicatesInfo?.total_groups ?? 0) === 0
+              }
               style={{
                 borderRadius: "8px",
                 border: "1px solid rgba(248,113,113,0.4)",
@@ -718,7 +829,11 @@ export function PortfoliosPage() {
                 color: "#fecaca",
                 padding: "8px 12px",
                 cursor: runningDeduplicate ? "not-allowed" : "pointer",
-                opacity: runningDeduplicate || (duplicatesInfo?.total_groups ?? 0) === 0 ? 0.6 : 1,
+                opacity:
+                  runningDeduplicate ||
+                  (duplicatesInfo?.total_groups ?? 0) === 0
+                    ? 0.6
+                    : 1,
               }}
             >
               {runningDeduplicate ? "Removing..." : "Confirm Remove Duplicates"}
@@ -727,9 +842,20 @@ export function PortfoliosPage() {
         </div>
       </Modal>
 
-      <Modal open={showCreate} onClose={() => setShowCreate(false)} title="Create Portfolio" width="1100px">
+      <Modal
+        open={showCreate}
+        onClose={() => setShowCreate(false)}
+        title="Create Portfolio"
+        width="1100px"
+      >
         <div style={{ display: "flex", flexDirection: "column", gap: "14px" }}>
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 240px", gap: "10px" }}>
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "1fr 240px",
+              gap: "10px",
+            }}
+          >
             <div>
               <label
                 htmlFor="portfolio-name-input"
@@ -808,7 +934,8 @@ export function PortfoliosPage() {
                   key={row.id}
                   style={{
                     display: "grid",
-                    gridTemplateColumns: "1.2fr 1fr 1fr 110px 100px 1fr 1fr 44px",
+                    gridTemplateColumns:
+                      "1.2fr 1fr 1fr 110px 100px 1fr 1fr 44px",
                     gap: "8px",
                     padding: "10px",
                     borderBottom: "1px solid rgba(255,255,255,0.04)",
@@ -818,7 +945,13 @@ export function PortfoliosPage() {
                     <input
                       list="portfolio-strategy-options"
                       value={row.strategy_name}
-                      onChange={(e) => setComponentField(row.id, "strategy_name", e.target.value)}
+                      onChange={(e) =>
+                        setComponentField(
+                          row.id,
+                          "strategy_name",
+                          e.target.value,
+                        )
+                      }
                       style={inputStyle}
                       placeholder="Select strategy"
                     />
@@ -826,7 +959,13 @@ export function PortfoliosPage() {
                   <div>
                     <select
                       value={row.signal_processor}
-                      onChange={(e) => setComponentField(row.id, "signal_processor", e.target.value)}
+                      onChange={(e) =>
+                        setComponentField(
+                          row.id,
+                          "signal_processor",
+                          e.target.value,
+                        )
+                      }
                       style={inputStyle}
                     >
                       <option value="">None</option>
@@ -841,7 +980,13 @@ export function PortfoliosPage() {
                     <input
                       list="portfolio-symbol-options"
                       value={row.symbol}
-                      onChange={(e) => setComponentField(row.id, "symbol", e.target.value.toUpperCase())}
+                      onChange={(e) =>
+                        setComponentField(
+                          row.id,
+                          "symbol",
+                          e.target.value.toUpperCase(),
+                        )
+                      }
                       style={inputStyle}
                       placeholder="EURUSD"
                     />
@@ -849,7 +994,9 @@ export function PortfoliosPage() {
                   <div>
                     <select
                       value={row.timeframe}
-                      onChange={(e) => setComponentField(row.id, "timeframe", e.target.value)}
+                      onChange={(e) =>
+                        setComponentField(row.id, "timeframe", e.target.value)
+                      }
                       style={inputStyle}
                     >
                       {DEFAULT_TIMEFRAMES.map((tf) => (
@@ -865,7 +1012,9 @@ export function PortfoliosPage() {
                       step="0.01"
                       min="0.01"
                       value={row.weight}
-                      onChange={(e) => setComponentField(row.id, "weight", e.target.value)}
+                      onChange={(e) =>
+                        setComponentField(row.id, "weight", e.target.value)
+                      }
                       style={inputStyle}
                       placeholder="1.0"
                     />
@@ -873,7 +1022,9 @@ export function PortfoliosPage() {
                   <div>
                     <input
                       value={row.risk_config}
-                      onChange={(e) => setComponentField(row.id, "risk_config", e.target.value)}
+                      onChange={(e) =>
+                        setComponentField(row.id, "risk_config", e.target.value)
+                      }
                       style={inputStyle}
                       placeholder='{"max_positions": 3}'
                     />
@@ -881,7 +1032,9 @@ export function PortfoliosPage() {
                   <div>
                     <input
                       value={row.settings}
-                      onChange={(e) => setComponentField(row.id, "settings", e.target.value)}
+                      onChange={(e) =>
+                        setComponentField(row.id, "settings", e.target.value)
+                      }
                       style={inputStyle}
                       placeholder='{"variant":"A"}'
                     />
@@ -894,7 +1047,8 @@ export function PortfoliosPage() {
                       borderRadius: "6px",
                       background: "transparent",
                       color: "var(--color-text-muted)",
-                      cursor: componentsDraft.length <= 1 ? "not-allowed" : "pointer",
+                      cursor:
+                        componentsDraft.length <= 1 ? "not-allowed" : "pointer",
                       opacity: componentsDraft.length <= 1 ? 0.4 : 1,
                     }}
                     disabled={componentsDraft.length <= 1}
@@ -918,7 +1072,14 @@ export function PortfoliosPage() {
             ))}
           </datalist>
 
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "10px" }}>
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+              gap: "10px",
+            }}
+          >
             <button
               type="button"
               onClick={addComponentRow}

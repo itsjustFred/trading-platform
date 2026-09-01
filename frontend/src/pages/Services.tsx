@@ -1,7 +1,11 @@
 import { useMemo, useState, type CSSProperties } from "react";
 
 import { createService, deleteService } from "../api/client";
-import { useServiceLogs, useServices, useUpdateServiceStatus } from "../api/queries";
+import {
+  useServiceLogs,
+  useServices,
+  useUpdateServiceStatus,
+} from "../api/queries";
 import type { Service, ServiceStatus } from "../api/types";
 import { Modal } from "../components/Modal";
 import { useToast } from "../components/ToastProvider";
@@ -10,7 +14,10 @@ function relativeTime(value?: string | null): string {
   if (!value) return "—";
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "—";
-  const deltaSeconds = Math.max(0, Math.floor((Date.now() - date.getTime()) / 1000));
+  const deltaSeconds = Math.max(
+    0,
+    Math.floor((Date.now() - date.getTime()) / 1000),
+  );
   if (deltaSeconds < 60) return `${deltaSeconds}s ago`;
   if (deltaSeconds < 3600) return `${Math.floor(deltaSeconds / 60)}m ago`;
   if (deltaSeconds < 86400) return `${Math.floor(deltaSeconds / 3600)}h ago`;
@@ -53,7 +60,8 @@ export function ServicesPage() {
   const services = servicesQuery.data ?? [];
   const summary = useMemo(
     () => ({
-      running: services.filter((service) => service.status === "running").length,
+      running: services.filter((service) => service.status === "running")
+        .length,
       paused: services.filter((service) => service.status === "paused").length,
       failed: services.filter((service) => service.status === "failed").length,
     }),
@@ -65,7 +73,12 @@ export function ServicesPage() {
       await statusMutation.mutateAsync({ serviceId: service.id, status });
       showToast(`${service.name} set to ${status}.`, "success");
     } catch (error) {
-      showToast(error instanceof Error ? error.message : "Could not update service status.", "error");
+      showToast(
+        error instanceof Error
+          ? error.message
+          : "Could not update service status.",
+        "error",
+      );
     }
   };
 
@@ -75,11 +88,16 @@ export function ServicesPage() {
       await servicesQuery.refetch();
       showToast(`${service.name} deleted.`, "success");
     } catch (error) {
-      showToast(error instanceof Error ? error.message : "Could not delete service.", "error");
+      showToast(
+        error instanceof Error ? error.message : "Could not delete service.",
+        "error",
+      );
     }
   };
 
-  const handleCreateScheduledJob = async (event: React.SubmitEvent<HTMLFormElement>) => {
+  const handleCreateScheduledJob = async (
+    event: React.SubmitEvent<HTMLFormElement>,
+  ) => {
     event.preventDefault();
     const name = newName.trim();
     const cron = newCron.trim();
@@ -106,7 +124,12 @@ export function ServicesPage() {
       await servicesQuery.refetch();
       showToast(`Scheduled job ${name} added.`, "success");
     } catch (error) {
-      showToast(error instanceof Error ? error.message : "Could not create scheduled job.", "error");
+      showToast(
+        error instanceof Error
+          ? error.message
+          : "Could not create scheduled job.",
+        "error",
+      );
     } finally {
       setIsSubmitting(false);
     }
@@ -120,10 +143,12 @@ export function ServicesPage() {
         title="Add Scheduled Job"
         width="520px"
       >
-        <form onSubmit={handleCreateScheduledJob} style={{ display: "grid", gap: "12px" }}>
+        <form
+          onSubmit={handleCreateScheduledJob}
+          style={{ display: "grid", gap: "12px" }}
+        >
           <label style={fieldLabelStyle}>
-            Name
-            {" "}
+            Name{" "}
             <input
               value={newName}
               onChange={(event) => setNewName(event.target.value)}
@@ -132,8 +157,7 @@ export function ServicesPage() {
             />
           </label>
           <label style={fieldLabelStyle}>
-            Job Type
-            {" "}
+            Job Type{" "}
             <select
               value={newJobType}
               onChange={(event) => setNewJobType(event.target.value)}
@@ -144,8 +168,7 @@ export function ServicesPage() {
             </select>
           </label>
           <label style={fieldLabelStyle}>
-            Cron
-            {" "}
+            Cron{" "}
             <input
               value={newCron}
               onChange={(event) => setNewCron(event.target.value)}
@@ -153,11 +176,21 @@ export function ServicesPage() {
               style={fieldInputStyle}
             />
           </label>
-          <div style={{ display: "flex", justifyContent: "flex-end", gap: "8px" }}>
-            <button type="button" style={secondaryButtonStyle} onClick={() => setAddingOpen(false)}>
+          <div
+            style={{ display: "flex", justifyContent: "flex-end", gap: "8px" }}
+          >
+            <button
+              type="button"
+              style={secondaryButtonStyle}
+              onClick={() => setAddingOpen(false)}
+            >
               Cancel
             </button>
-            <button type="submit" style={primaryButtonStyle} disabled={isSubmitting}>
+            <button
+              type="submit"
+              style={primaryButtonStyle}
+              disabled={isSubmitting}
+            >
               {isSubmitting ? "Saving..." : "Create"}
             </button>
           </div>
@@ -186,7 +219,8 @@ export function ServicesPage() {
         >
           {logsQuery.isLoading
             ? "Loading..."
-            : (logsQuery.data?.lines ?? []).join("\n") || "No matching log lines."}
+            : (logsQuery.data?.lines ?? []).join("\n") ||
+              "No matching log lines."}
         </div>
       </Modal>
 
@@ -200,17 +234,35 @@ export function ServicesPage() {
         }}
       >
         <div>
-          <h1 style={{ margin: 0, fontSize: "1.4rem", fontWeight: 700 }}>Services</h1>
-          <p style={{ margin: "4px 0 0", color: "var(--color-text-muted)", fontSize: "0.85rem" }}>
+          <h1 style={{ margin: 0, fontSize: "1.4rem", fontWeight: 700 }}>
+            Services
+          </h1>
+          <p
+            style={{
+              margin: "4px 0 0",
+              color: "var(--color-text-muted)",
+              fontSize: "0.85rem",
+            }}
+          >
             Persistent bot and scheduled task services.
           </p>
         </div>
-        <button type="button" style={primaryButtonStyle} onClick={() => setAddingOpen(true)}>
+        <button
+          type="button"
+          style={primaryButtonStyle}
+          onClick={() => setAddingOpen(true)}
+        >
           + Add Scheduled Job
         </button>
       </div>
 
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: "10px" }}>
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
+          gap: "10px",
+        }}
+      >
         <div style={summaryCardStyle}>
           <div style={summaryLabelStyle}>Running</div>
           <div style={summaryValueStyle}>{summary.running}</div>
@@ -236,10 +288,19 @@ export function ServicesPage() {
           {services.map((service) => {
             const isRunning = service.status === "running";
             const cron = stringifyServiceConfigValue(service.config?.cron);
-            const channelId = stringifyServiceConfigValue(service.config?.channel_id);
+            const channelId = stringifyServiceConfigValue(
+              service.config?.channel_id,
+            );
             return (
               <div key={service.id} style={serviceCardStyle}>
-                <div style={{ display: "flex", justifyContent: "space-between", gap: "10px", flexWrap: "wrap" }}>
+                <div
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    gap: "10px",
+                    flexWrap: "wrap",
+                  }}
+                >
                   <div>
                     <div style={{ fontWeight: 700, fontSize: "0.92rem" }}>
                       {service.type === "discord_bot" ? "Discord Bot: " : ""}
@@ -251,7 +312,14 @@ export function ServicesPage() {
                         : `Schedule: ${cron || "—"} · Next Run: cron-based · Last Run: ${relativeTime(service.last_activity)}`}
                     </div>
                   </div>
-                  <div style={{ display: "inline-flex", alignItems: "center", gap: "8px", color: "var(--color-text-muted)" }}>
+                  <div
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: "8px",
+                      color: "var(--color-text-muted)",
+                    }}
+                  >
                     <span
                       style={{
                         width: "10px",
@@ -260,22 +328,46 @@ export function ServicesPage() {
                         background: statusDot(service.status),
                       }}
                     />
-                    <span style={{ textTransform: "capitalize", fontWeight: 600 }}>{service.status}</span>
+                    <span
+                      style={{ textTransform: "capitalize", fontWeight: 600 }}
+                    >
+                      {service.status}
+                    </span>
                   </div>
                 </div>
-                <div style={{ display: "flex", gap: "8px", marginTop: "10px", flexWrap: "wrap" }}>
+                <div
+                  style={{
+                    display: "flex",
+                    gap: "8px",
+                    marginTop: "10px",
+                    flexWrap: "wrap",
+                  }}
+                >
                   <button
                     type="button"
                     style={secondaryButtonStyle}
-                    onClick={() => void handleStatus(service, isRunning ? "paused" : "running")}
+                    onClick={() =>
+                      void handleStatus(
+                        service,
+                        isRunning ? "paused" : "running",
+                      )
+                    }
                     disabled={statusMutation.isPending}
                   >
                     {isRunning ? "Pause" : "Start"}
                   </button>
-                  <button type="button" style={secondaryButtonStyle} onClick={() => setLogsService(service)}>
+                  <button
+                    type="button"
+                    style={secondaryButtonStyle}
+                    onClick={() => setLogsService(service)}
+                  >
                     Logs
                   </button>
-                  <button type="button" style={dangerButtonStyle} onClick={() => void handleDelete(service)}>
+                  <button
+                    type="button"
+                    style={dangerButtonStyle}
+                    onClick={() => void handleDelete(service)}
+                  >
                     Delete
                   </button>
                 </div>

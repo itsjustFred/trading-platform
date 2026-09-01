@@ -117,8 +117,8 @@ export function useWebSocket<TMessage = unknown>(
         return;
       }
       if (
-        currentSocket.readyState === WebSocket.OPEN
-        || currentSocket.readyState === WebSocket.CONNECTING
+        currentSocket.readyState === WebSocket.OPEN ||
+        currentSocket.readyState === WebSocket.CONNECTING
       ) {
         currentSocket.close();
       }
@@ -151,15 +151,23 @@ export function useWebSocket<TMessage = unknown>(
       rawMessage: unknown,
       activeSocket: WebSocket,
     ): boolean => {
-      if (!rawMessage || typeof rawMessage !== "object" || !("type" in rawMessage)) {
+      if (
+        !rawMessage ||
+        typeof rawMessage !== "object" ||
+        !("type" in rawMessage)
+      ) {
         return false;
       }
       const rawType = (rawMessage as { type?: unknown }).type;
-      const msgType = (typeof rawType === "string" ? rawType : "").toLowerCase();
+      const msgType = (
+        typeof rawType === "string" ? rawType : ""
+      ).toLowerCase();
       if (msgType === "ping") {
         lastActivityAt = Date.now();
         if (activeSocket.readyState === WebSocket.OPEN) {
-          activeSocket.send(JSON.stringify({ type: "pong", ts: Date.now() / 1000 }));
+          activeSocket.send(
+            JSON.stringify({ type: "pong", ts: Date.now() / 1000 }),
+          );
         }
         return true;
       }
@@ -176,7 +184,11 @@ export function useWebSocket<TMessage = unknown>(
         return;
       }
       heartbeatTimer = window.setInterval(() => {
-        if (disposed || socket == null || socket.readyState !== WebSocket.OPEN) {
+        if (
+          disposed ||
+          socket == null ||
+          socket.readyState !== WebSocket.OPEN
+        ) {
           return;
         }
         if (Date.now() - lastActivityAt > heartbeatTimeoutMs) {

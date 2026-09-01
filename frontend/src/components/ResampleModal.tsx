@@ -30,7 +30,13 @@ export function renderTaskStatusIcon(
   if (status === "failed") {
     return <XCircle size={size} color={STATUS_ICON_COLORS.failed} />;
   }
-  return <Loader2 size={size} className="animate-spin" color={STATUS_ICON_COLORS.running} />;
+  return (
+    <Loader2
+      size={size}
+      className="animate-spin"
+      color={STATUS_ICON_COLORS.running}
+    />
+  );
 }
 
 interface ResampleModalProps {

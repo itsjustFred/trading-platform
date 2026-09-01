@@ -8,14 +8,20 @@
 
 export type StatCardFormat = "currency" | "percent" | "number" | "none";
 
-const CURRENCY_DIGITS = { minimumFractionDigits: 0, maximumFractionDigits: 0 } as const;
+const CURRENCY_DIGITS = {
+  minimumFractionDigits: 0,
+  maximumFractionDigits: 0,
+} as const;
 
 function toNumber(value: string | number): number {
   return typeof value === "number" ? value : Number.parseFloat(String(value));
 }
 
 /** Renders a stat value for the requested display format, falling back to `String(value)`. */
-export function formatStatCardValue(value: string | number, format: StatCardFormat): string {
+export function formatStatCardValue(
+  value: string | number,
+  format: StatCardFormat,
+): string {
   const numVal = toNumber(value);
 
   if (format === "currency" && Number.isFinite(numVal)) {
