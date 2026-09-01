@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import random
+import secrets
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,6 +30,12 @@ except ImportError:
 
 DISCOVERED_DIR = DATA_DIR / "discovered_strategies"
 
+# Parameter sampling uses the OS CSPRNG (``secrets.SystemRandom``) instead of the
+# ``random`` module default: the search space is small, and reproducibility of a
+# candidate generator is worthless — but Sonar/auditors flag the Mersenne Twister
+# (S2245) in every security scan, which masks real findings.
+_RNG = secrets.SystemRandom()
+
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT"]
 TIMEFRAMES = ["1h", "4h", "1d"]
 
@@ -45,23 +51,23 @@ KELTNER_MULT_RANGE = (1.0, 4.0)
 
 def random_sma_params() -> dict:
     """Generate random SMA crossover params."""
-    fast = random.randint(*SMA_FAST_RANGE)
-    slow = random.randint(max(fast + 10, SMA_SLOW_RANGE[0]), SMA_SLOW_RANGE[1])
+    fast = _RNG.randint(*SMA_FAST_RANGE)
+    slow = _RNG.randint(max(fast + 10, SMA_SLOW_RANGE[0]), SMA_SLOW_RANGE[1])
     return {"sma_fast": fast, "sma_slow": slow}
 
 
 def random_rsi_params() -> dict:
     """Generate random RSI params."""
-    period = random.randint(*RSI_PERIOD_RANGE)
-    oversold = random.randint(*RSI_OVERSOLD_RANGE)
-    overbought = random.randint(*RSI_OVERBOUGHT_RANGE)
+    period = _RNG.randint(*RSI_PERIOD_RANGE)
+    oversold = _RNG.randint(*RSI_OVERSOLD_RANGE)
+    overbought = _RNG.randint(*RSI_OVERBOUGHT_RANGE)
     return {"rsi_period": period, "rsi_oversold": oversold, "rsi_overbought": overbought}
 
 
 def random_keltner_params() -> dict:
     """Generate random Keltner Channel params."""
-    period = random.randint(*KELTNER_PERIOD_RANGE)
-    mult = round(random.uniform(*KELTNER_MULT_RANGE), 1)
+    period = _RNG.randint(*KELTNER_PERIOD_RANGE)
+    mult = round(_RNG.uniform(*KELTNER_MULT_RANGE), 1)
     return {"keltner_period": period, "keltner_mult": mult}
 
 
@@ -76,12 +82,12 @@ def run_discovery_batch(n_trials: int = 10, publish: bool = False) -> list[dict]
     results = []
 
     for i in range(n_trials):
-        symbol = random.choice(SYMBOLS)
-        tf = random.choice(TIMEFRAMES)
+        symbol = _RNG.choice(SYMBOLS)
+        tf = _RNG.choice(TIMEFRAMES)
 
         # Pick random strategy type
         strategy_types = ["sma", "rsi", "keltner"]
-        strat_type = random.choice(strategy_types)
+        strat_type = _RNG.choice(strategy_types)
 
         params = {}
         if strat_type == "sma":

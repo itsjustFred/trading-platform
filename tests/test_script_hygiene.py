@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import secrets
 import subprocess
 import sys
 import time
@@ -41,6 +42,20 @@ def test_discovery_does_not_write_mock_results(tmp_path: Path, monkeypatch) -> N
     assert not output_dir.exists(), "mock results must not be written for downstream runs"
     for row in results:
         assert row.get("status") == "mock"
+
+
+def test_discovery_sampling_uses_csprng() -> None:
+    """Parameter sampling must not use the Mersenne Twister (Sonar S2245)."""
+    module = _load_script("overnight_strategy_discovery.py")
+    assert not hasattr(module, "random"), (
+        "the discovery script must not import the `random` module; "
+        "use `secrets.SystemRandom` (CSPRNG) instead"
+    )
+    assert isinstance(module._RNG, secrets.SystemRandom)
+    results = module.run_discovery_batch(n_trials=5)
+    assert len(results) == 5
+    for row in results:
+        assert row["params"], "every trial must carry sampled parameters"
 
 
 def test_discovery_requires_explicit_flag_to_write(tmp_path: Path, monkeypatch) -> None:
