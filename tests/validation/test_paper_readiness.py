@@ -523,3 +523,86 @@ class TestReportMeta:
         assert result.errors == 0
         assert result.warnings == 0
         assert all(c.severity == "info" for c in result.checks)
+
+
+class TestRiskGateStructuralFailures:
+    """DV-B37: the risk gate must fail closed on structurally failed reports."""
+
+    def test_failed_report_with_non_numeric_fields_fails(self) -> None:
+        """A failed risk result without numeric field deltas must not pass."""
+        risk_result = RiskComparisonResult(
+            expected_trade=_make_trade(trade_id=1),
+            actual_trade=_make_trade(trade_id=2),
+            expected_risk_profile=None,
+            actual_risk_profile=None,
+            field_results={},
+            passed=False,
+            severity="warning",
+            explanation="Could not compute risk profile for one or both trades",
+        )
+        risk = RiskComparisonReport(
+            trade_results=[risk_result],
+            passed=False,
+            explanation="Risk validation failed",
+        )
+        result = ReadinessValidator.validate(
+            report=_make_delta_report(),
+            regression=_make_regression_result(passed=True),
+            risk_report=risk,
+            stats=(_make_stats(), _make_stats()),
+        )
+
+        failed_check = next(
+            c for c in result.checks if c.name == "risk_failed_results"
+        )
+        assert failed_check.passed is False
+        assert failed_check.severity == "error"
+        assert result.level == PaperReadinessLevel.NOT_READY
+
+    def test_failed_report_verdict_is_consulted(self) -> None:
+        """risk_report.passed == False must fail the readiness gate."""
+        risk = _make_risk_report()  # individual fields pass
+        risk.passed = False
+        risk.explanation = "Risk validation failed: 1 failed trade(s)."
+
+        result = ReadinessValidator.validate(
+            report=_make_delta_report(),
+            regression=_make_regression_result(passed=True),
+            risk_report=risk,
+            stats=(_make_stats(), _make_stats()),
+        )
+
+        verdict_check = next(
+            c for c in result.checks if c.name == "risk_report_verdict"
+        )
+        assert verdict_check.passed is False
+        assert verdict_check.severity == "error"
+        assert result.level == PaperReadinessLevel.NOT_READY
+
+    def test_empty_report_marked_failed_fails(self) -> None:
+        """Empty trade_results with passed=False must not pass vacuously."""
+        risk = RiskComparisonReport(
+            trade_results=[],
+            passed=False,
+            explanation="Risk validation failed: no trades compared.",
+        )
+        result = ReadinessValidator.validate(
+            report=_make_delta_report(),
+            regression=_make_regression_result(passed=True),
+            risk_report=risk,
+            stats=(_make_stats(), _make_stats()),
+        )
+
+        assert result.level == PaperReadinessLevel.NOT_READY
+
+    def test_empty_report_marked_passed_stays_informational(self) -> None:
+        """An empty report the producer marked as passed stays a pass."""
+        risk = RiskComparisonReport(trade_results=[], passed=True, explanation="")
+        result = ReadinessValidator.validate(
+            report=_make_delta_report(),
+            regression=_make_regression_result(passed=True),
+            risk_report=risk,
+            stats=(_make_stats(), _make_stats()),
+        )
+
+        assert result.level == PaperReadinessLevel.READY
