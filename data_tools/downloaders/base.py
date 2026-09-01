@@ -11,7 +11,6 @@ Usage:
 from __future__ import annotations
 
 import logging
-import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -19,6 +18,8 @@ from pathlib import Path
 
 import pandas as pd
 import pyarrow.parquet as pq
+
+from shared.atomic_io import atomic_replace
 
 logger = logging.getLogger(__name__)
 
@@ -129,7 +130,10 @@ class Downloader(ABC):
     def _make_output_path(
         self, output_dir: Path, asset_class: str, symbol: str, timeframe: str
     ) -> Path:
-        """Build standardised output path: {output_dir}/ohlcv/{source}/{asset_class}/{symbol}/{tf}.parquet"""
+        """Build the standardised output path.
+
+        Layout: {output_dir}/ohlcv/{source}/{asset_class}/{symbol}/{tf}.parquet
+        """
         path = (
             output_dir / "ohlcv" / self.source_name / asset_class / symbol / f"{timeframe}.parquet"
         )
@@ -149,7 +153,9 @@ class Downloader(ABC):
         logger.info("Smart resume enabled for %s from %s", output_path, resume_start)
         return resume_start
 
-    def _merge_and_store_single_file(self, output_path: Path, new_data: pd.DataFrame) -> pd.DataFrame:
+    def _merge_and_store_single_file(
+        self, output_path: Path, new_data: pd.DataFrame
+    ) -> pd.DataFrame:
         """Persist data in a single parquet file per symbol/timeframe.
 
         If the file exists, it is loaded and merged with incoming rows.
@@ -165,9 +171,13 @@ class Downloader(ABC):
             try:
                 existing_data = pd.read_parquet(output_path)
             except (OSError, ValueError) as exc:
-                raise RuntimeError(f"Could not read existing parquet '{output_path}': {exc}") from exc
+                raise RuntimeError(
+                    f"Could not read existing parquet '{output_path}': {exc}"
+                ) from exc
             normalized_existing = self._normalize_timestamps(existing_data)
-            combined = pd.concat([normalized_existing, normalized_new], ignore_index=True, sort=False)
+            combined = pd.concat(
+                [normalized_existing, normalized_new], ignore_index=True, sort=False
+            )
         else:
             combined = normalized_new.copy()
 
@@ -180,17 +190,13 @@ class Downloader(ABC):
         else:
             combined = combined.drop_duplicates().reset_index(drop=True)
 
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = output_path.with_name(f"{output_path.name}.tmp-{os.getpid()}")
-        try:
+        def _write(target: Path) -> None:
             try:
-                combined.to_parquet(temp_path, index=False)
+                combined.to_parquet(target, index=False)
             except (OSError, ValueError) as exc:
                 raise RuntimeError(f"Could not write parquet '{output_path}': {exc}") from exc
-            os.replace(temp_path, output_path)
-        except BaseException:
-            temp_path.unlink(missing_ok=True)
-            raise
+
+        atomic_replace(output_path, _write)
 
         return combined
 
@@ -234,7 +240,9 @@ class Downloader(ABC):
                 stats_latest = pd.Timestamp(latest)
                 break
 
-        row_group = parquet_file.read_row_group(metadata.num_row_groups - 1, columns=[timestamp_column])
+        row_group = parquet_file.read_row_group(
+            metadata.num_row_groups - 1, columns=[timestamp_column]
+        )
         if row_group.num_rows == 0:
             return stats_latest
 
@@ -260,6 +268,8 @@ class Downloader(ABC):
     def _normalize_timestamps(df: pd.DataFrame) -> pd.DataFrame:
         normalized = df.copy()
         if "timestamp" in normalized.columns:
-            normalized["timestamp"] = pd.to_datetime(normalized["timestamp"], utc=True, errors="coerce")
+            normalized["timestamp"] = pd.to_datetime(
+                normalized["timestamp"], utc=True, errors="coerce"
+            )
             normalized = normalized.dropna(subset=["timestamp"])
         return normalized

@@ -246,9 +246,12 @@ def _parquet_timestamp_bounds(path: Path) -> tuple[pd.Timestamp, pd.Timestamp] |
             parsed = pd.to_datetime(first.column(0)[0].as_py(), utc=True, errors="coerce")
             start = None if pd.isna(parsed) else pd.Timestamp(parsed)
     if end is None:
-        last = parquet_file.read_row_group(metadata.num_row_groups - 1, columns=[columns[column_index]])
+        last = parquet_file.read_row_group(
+            metadata.num_row_groups - 1, columns=[columns[column_index]]
+        )
         if last.num_rows:
-            parsed = pd.to_datetime(last.column(0)[last.num_rows - 1].as_py(), utc=True, errors="coerce")
+            value = last.column(0)[last.num_rows - 1].as_py()
+            parsed = pd.to_datetime(value, utc=True, errors="coerce")
             end = None if pd.isna(parsed) else pd.Timestamp(parsed)
 
     if start is None or end is None:
@@ -319,9 +322,15 @@ def find_internal_gaps(
             return True
         stem = path.stem.lower()
         normalized = timeframe.lower()
-        return stem == normalized or stem.startswith(f"{normalized}_") or stem.startswith(f"{normalized}-")
+        return (
+            stem == normalized
+            or stem.startswith(f"{normalized}_")
+            or stem.startswith(f"{normalized}-")
+        )
 
-    parquet_paths = sorted(path for path in symbol_dir.rglob("*.parquet") if _matches_timeframe(path))
+    parquet_paths = sorted(
+        path for path in symbol_dir.rglob("*.parquet") if _matches_timeframe(path)
+    )
     bounds: list[tuple[pd.Timestamp, pd.Timestamp, Path]] = []
     for path in parquet_paths:
         file_bounds = _parquet_timestamp_bounds(path)
@@ -526,7 +535,9 @@ def analyze_ohlcv_coverage(data_root: Path, requirement: DataRequirement) -> dic
         elif required_end is not None and required_end > bounds[1]:
             error = f"Requested end {required_end} is after stored coverage end {bounds[1]}"
 
-    significant_gaps = [gap for gap in gaps if float(gap.get("gap_days", 0)) > INTERNAL_GAP_FAIL_DAYS]
+    significant_gaps = [
+        gap for gap in gaps if float(gap.get("gap_days", 0)) > INTERNAL_GAP_FAIL_DAYS
+    ]
 
     if error or significant_gaps:
         status = "failed"

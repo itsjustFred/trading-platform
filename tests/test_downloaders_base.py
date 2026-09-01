@@ -6,8 +6,8 @@ import json
 from pathlib import Path
 
 import pandas as pd
-import pytest
 import pyarrow.parquet as pq
+import pytest
 
 from data_tools.downloaders.base import Downloader, DownloadResult
 

@@ -26,6 +26,7 @@ import pyarrow.parquet as pq
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 logger = logging.getLogger(__name__)
 
+from shared.atomic_io import write_text_atomically
 from shared.constants import DATA_DIR, normalize_timeframe
 
 CATALOG_FILE = "catalog.json"
@@ -37,19 +38,10 @@ SOURCE_META_FILE = "source_meta.json"
 def write_json_atomically(path: Path, payload: str) -> None:
     """Write serialized JSON to ``path`` atomically.
 
-    The payload is written to a temporary file in the same directory and moved
-    into place with :func:`os.replace`, so readers never observe a truncated
-    catalog and a crash mid-write leaves the previous file intact.
+    Readers never observe a truncated catalog, and a crash mid-write leaves
+    the previous file intact.
     """
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = path.with_name(f"{path.name}.tmp-{os.getpid()}")
-    try:
-        temp_path.write_text(payload)
-        os.replace(temp_path, path)
-    except BaseException:
-        temp_path.unlink(missing_ok=True)
-        raise
+    write_text_atomically(Path(path), payload)
 
 
 def write_catalog_json(path: Path, catalog: dict) -> None:

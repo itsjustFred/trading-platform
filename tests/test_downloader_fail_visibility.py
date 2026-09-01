@@ -13,7 +13,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from data_tools.downloaders.base import DownloadResult, Downloader
+from data_tools.downloaders.base import Downloader, DownloadResult
 
 
 class _BareDownloader(Downloader):
@@ -58,7 +58,6 @@ class TestDownloadResultContract:
     def test_jforex_merged_download_reports_file_not_directory(self, tmp_path):
         """JForex bid/ask merges store two parquets; the result must point at a
         real file path, not the symbol directory."""
-        from data_tools.downloaders import jforex_dl
 
         symbol_dir = tmp_path / "ohlcv" / "jforex" / "forex" / "EURUSD"
         symbol_dir.mkdir(parents=True)

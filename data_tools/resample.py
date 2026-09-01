@@ -14,10 +14,11 @@ from __future__ import annotations
 
 import argparse
 import logging
-import os
 from pathlib import Path
 
 import pandas as pd
+
+from shared.atomic_io import write_parquet_atomically
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 logger = logging.getLogger(__name__)
@@ -73,19 +74,6 @@ def resample_ohlcv(df: pd.DataFrame, target_tf: str) -> pd.DataFrame:
 
     resampled = resampled.reset_index()
     return resampled
-
-
-def write_parquet_atomically(path: Path, frame: pd.DataFrame) -> None:
-    """Write ``frame`` to ``path`` atomically (temp file + os.replace)."""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = path.with_name(f"{path.name}.tmp-{os.getpid()}")
-    try:
-        frame.to_parquet(temp_path, index=False)
-        os.replace(temp_path, path)
-    except BaseException:
-        temp_path.unlink(missing_ok=True)
-        raise
 
 
 def merge_resampled_history(existing_path: Path, resampled: pd.DataFrame) -> pd.DataFrame:

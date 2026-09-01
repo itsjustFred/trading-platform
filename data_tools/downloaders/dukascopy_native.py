@@ -20,9 +20,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import lzma
 import logging
-import os
+import lzma
 import struct
 import sys
 from dataclasses import dataclass
@@ -33,7 +32,8 @@ from typing import Any, Callable
 
 import pandas as pd
 
-from data_tools.downloaders.base import DownloadResult, Downloader, SourceMeta
+from data_tools.downloaders.base import Downloader, DownloadResult, SourceMeta
+from shared.atomic_io import write_text_atomically
 from shared.constants import DATA_DIR, resolve_genesis_path
 
 logger = logging.getLogger(__name__)
@@ -874,13 +874,7 @@ def _write_source_meta_index(index: dict) -> None:
     means a crash mid-write truncates metadata for the whole catalog.
     """
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    temp_path = SOURCE_META_PATH.with_name(f"{SOURCE_META_PATH.name}.tmp-{os.getpid()}")
-    try:
-        temp_path.write_text(json.dumps(index, indent=2, sort_keys=True))
-        os.replace(temp_path, SOURCE_META_PATH)
-    except BaseException:
-        temp_path.unlink(missing_ok=True)
-        raise
+    write_text_atomically(SOURCE_META_PATH, json.dumps(index, indent=2, sort_keys=True))
 
 
 def _resolve_requested_start(

@@ -114,7 +114,9 @@ class TestInternalGapDetection:
 
 
 class TestFailedDownloadVisibility:
-    def test_ensure_backtest_data_raises_when_download_produces_nothing(self, tmp_path, monkeypatch):
+    def test_ensure_backtest_data_raises_when_download_produces_nothing(
+        self, tmp_path, monkeypatch
+    ):
         """A failed download must surface as an error, not as silent coverage."""
         calls: list[dict] = []
 
@@ -122,7 +124,9 @@ class TestFailedDownloadVisibility:
             calls.append(kwargs)
 
         monkeypatch.setattr(
-            auto_download, "_download_missing_ohlcv_data", lambda **kwargs: failing_download(**kwargs)
+            auto_download,
+            "_download_missing_ohlcv_data",
+            lambda **kwargs: failing_download(**kwargs),
         )
 
         with pytest.raises(RuntimeError, match="did not provide required OHLCV coverage"):
