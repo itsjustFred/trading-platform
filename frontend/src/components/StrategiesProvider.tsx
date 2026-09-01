@@ -21,7 +21,7 @@ interface StrategiesContextValue {
 
 const StrategiesContext = createContext<StrategiesContextValue | null>(null);
 
-export function StrategiesProvider({ children }: { children: ReactNode }) {
+export function StrategiesProvider({ children }: Readonly<{ children: ReactNode }>) {
   const queryClient = useQueryClient();
   const strategiesQuery = useStrategies({ enabled: false });
   const strategies = strategiesQuery.data ?? [];

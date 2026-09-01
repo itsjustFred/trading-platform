@@ -25,7 +25,7 @@ export function RangeFilterControl({
   step = 0.01,
   onChange,
   numberSuffix = "",
-}: RangeFilterControlProps) {
+}: Readonly<RangeFilterControlProps>) {
   const updateMin = (nextMin: number) => {
     if (!Number.isFinite(nextMin)) return;
     const normalized = clamp(nextMin, bounds.min, value.max);

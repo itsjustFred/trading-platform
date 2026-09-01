@@ -12,7 +12,7 @@ const colorMap: Record<string, string> = {
   muted: "bg-surface2 text-text-muted border-border",
 };
 
-export function Badge({ children, color = "muted" }: BadgeProps) {
+export function Badge({ children, color = "muted" }: Readonly<BadgeProps>) {
   return (
     <span
       className={`inline-flex items-center px-2 py-0.5 text-xs rounded-full border ${colorMap[color]}`}

@@ -22,7 +22,7 @@ export function RenameModal({
   saving = false,
   onClose,
   onSave,
-}: RenameModalProps) {
+}: Readonly<RenameModalProps>) {
   const [draft, setDraft] = useState(value);
 
   useEffect(() => {
