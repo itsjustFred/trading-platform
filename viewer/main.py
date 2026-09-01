@@ -629,10 +629,15 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="trading-platform viewer", lifespan=lifespan)
+# The viewer serves its own SPA from the same origin (and the Vite dev server
+# proxies /api), so no cross-origin browser access is needed. A wildcard
+# origin combined with allow_credentials=True would reflect any Origin header
+# and made every mutating endpoint drive-by reachable; credentials are now
+# explicitly disabled and no wildcard origin is advertised.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=[],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -906,6 +911,68 @@ class BacktestsBulkDeleteRequest(SQLModel):
 
 class PortfoliosBulkDeleteRequest(SQLModel):
     ids: list[str]
+
+
+_SAFE_ASSET_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _safe_asset_id(raw_id: object) -> str:
+    """Normalize a client-supplied asset id for file-backed operations.
+
+    Returns an empty string for ids that are blank or that could participate
+    in a path traversal (path separators, ``..`` segments). Ids are only ever
+    joined onto a fixed directory below, and the join is containment-checked
+    again by :func:`_contained_asset_path`.
+    """
+    normalized = str(raw_id or "").strip()
+    if not normalized:
+        return ""
+    if normalized in {".", ".."}:
+        return ""
+    if not _SAFE_ASSET_ID_RE.match(normalized):
+        return ""
+    return normalized
+
+
+def _contained_asset_path(base_dir: Path, asset_id: str, suffix: str) -> Path | None:
+    """Join ``asset_id`` onto ``base_dir`` if the result stays inside it.
+
+    Mirrors the ``_resolve_grid_result_path`` pattern: the resolved candidate
+    must be contained in the resolved base directory, otherwise ``None`` is
+    returned so the caller never builds an unlink path from raw input.
+    """
+    normalized = _safe_asset_id(asset_id)
+    if not normalized:
+        return None
+    base = base_dir.resolve()
+    candidate = (base / f"{normalized}{suffix}").resolve()
+    if candidate.parent != base:
+        return None
+    return candidate
+
+
+def _contained_client_data_file(
+    raw_path: str, *, allowed_suffix: str, base_dir: Path | None = None
+) -> Path | None:
+    """Validate a client-supplied data file path for reading or subprocess use.
+
+    The resolved path must stay inside the OHLCV data tree and must carry the
+    expected suffix, so requests can neither read arbitrary files nor point a
+    subprocess at code outside the data directory.
+    """
+    normalized = str(raw_path or "").strip()
+    if not normalized:
+        return None
+    base = (base_dir or DATA_DIR).resolve()
+    try:
+        candidate = Path(normalized).expanduser().resolve()
+    except (OSError, ValueError):
+        return None
+    if not candidate.is_relative_to(base):
+        return None
+    if candidate.suffix.lower() != allowed_suffix.lower():
+        return None
+    return candidate
 
 
 _QUIET_EXACT_PATHS = {
@@ -2017,7 +2084,7 @@ def _group_duplicate_portfolios() -> tuple[list[dict[str, Any]], int]:
 
 
 def _delete_portfolio_with_artifacts(portfolio_id: str) -> bool:
-    normalized_id = str(portfolio_id or "").strip()
+    normalized_id = _safe_asset_id(portfolio_id)
     if not normalized_id:
         return False
 
@@ -2027,9 +2094,9 @@ def _delete_portfolio_with_artifacts(portfolio_id: str) -> bool:
     except Exception as exc:
         logger.warning("Could not delete portfolio %s from DB: %s", normalized_id, exc)
 
-    path = PORTFOLIOS_DIR / f"{normalized_id}.json"
+    path = _contained_asset_path(PORTFOLIOS_DIR, normalized_id, ".json")
     deleted_file = False
-    if path.exists():
+    if path is not None and path.exists():
         try:
             path.unlink()
             deleted_file = True
@@ -2522,15 +2589,15 @@ def _group_duplicate_backtests() -> tuple[list[dict[str, Any]], int]:
 
 
 def _delete_backtest_with_artifacts(backtest_id: str) -> bool:
-    normalized_id = str(backtest_id or "").strip()
+    normalized_id = _safe_asset_id(backtest_id)
     if not normalized_id:
         return False
 
     deleted_in_db = delete_backtest(normalized_id)
     _remove_backtest_meta_cache(normalized_id)
-    json_path = BACKTESTS_DIR / f"{normalized_id}.trades.json"
+    json_path = _contained_asset_path(BACKTESTS_DIR, normalized_id, ".trades.json")
     deleted_json = False
-    if json_path.exists():
+    if json_path is not None and json_path.exists():
         try:
             json_path.unlink()
             deleted_json = True
@@ -8481,6 +8548,14 @@ async def run_backtest_from_signals(payload: BacktestRunFromSignalsRequest) -> d
     if not file_path:
         raise HTTPException(status_code=400, detail="filepath is required for csv signal_source")
 
+    csv_path = _contained_client_data_file(file_path, allowed_suffix=".csv")
+    if csv_path is None:
+        raise HTTPException(
+            status_code=403,
+            detail="Signal CSV must be inside the OHLCV data directory",
+        )
+    file_path = str(csv_path)
+
     try:
         loaded_signals = await asyncio.to_thread(load_signals_from_csv, file_path)
     except FileNotFoundError as exc:
@@ -10380,8 +10455,15 @@ async def data_check(
 
 @app.post("/api/data/resample", response_model=dict[str, Any])
 async def data_resample(payload: DataResampleRequest) -> dict[str, Any]:
-    source_path = payload.source_path
     target_timeframes = payload.target_timeframes
+    source_path = _contained_client_data_file(
+        payload.source_path, allowed_suffix=".parquet"
+    )
+    if source_path is None:
+        raise HTTPException(
+            status_code=400,
+            detail="source_path must be a parquet file inside the OHLCV data directory",
+        )
     task_id = str(uuid.uuid4())
     cmd = [
         sys.executable,
@@ -10389,7 +10471,7 @@ async def data_resample(payload: DataResampleRequest) -> dict[str, Any]:
         "-m",
         "data_tools.resample",
         "--source",
-        source_path,
+        str(source_path),
         "--timeframes",
         target_timeframes,
     ]
@@ -10398,7 +10480,7 @@ async def data_resample(payload: DataResampleRequest) -> dict[str, Any]:
         cmd,
         total_items=1,
         name="Resample data",
-        description=f"Resample {Path(source_path).name or source_path} into {target_timeframes}.",
+        description=f"Resample {source_path.name or source_path} into {target_timeframes}.",
         source="resample",
     )
     _apply_recovery_data_metadata(
@@ -10667,8 +10749,13 @@ async def delete_symbol_data(path: str = Query(default="")) -> dict[str, Any]:
     try:
         file_path = file_path.resolve()
         data_root = DATA_DIR.resolve()
-        if not str(file_path).startswith(str(data_root)):
+        # Containment must be checked on resolved paths (prefix strings can be
+        # spoofed with ".." components) and deletion is restricted to the
+        # parquet files the catalog manages.
+        if not file_path.is_relative_to(data_root):
             raise HTTPException(status_code=403, detail="Access denied")
+        if file_path.suffix.lower() != ".parquet":
+            raise HTTPException(status_code=400, detail="Only parquet files can be deleted")
     except HTTPException:
         raise
     except (OSError, ValueError) as exc:
