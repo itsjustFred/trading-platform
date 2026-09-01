@@ -122,6 +122,20 @@ function timeframeRank(timeframe: string) {
   return rank === -1 ? 99 : rank;
 }
 
+/** Renders an unknown table cell as a comparable string without `[object Object]`. */
+function stringifySortableCell(value: unknown): string {
+  if (value == null) {
+    return "";
+  }
+  if (typeof value === "string") {
+    return value;
+  }
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  return JSON.stringify(value) ?? "";
+}
+
 function compareMaybeString(a: string | number, b: string | number) {
   if (typeof a === "number" && typeof b === "number") {
     return a - b;
@@ -199,12 +213,16 @@ function deriveValidation(
 
 function minDate(values: Array<string | null | undefined>) {
   const filtered = values.filter((value): value is string => Boolean(value));
-  return filtered.length > 0 ? [...filtered].sort()[0] : null;
+  return filtered.length > 0
+    ? [...filtered].sort((a, b) => a.localeCompare(b))[0]
+    : null;
 }
 
 function maxDate(values: Array<string | null | undefined>) {
   const filtered = values.filter((value): value is string => Boolean(value));
-  return filtered.length > 0 ? [...filtered].sort()[filtered.length - 1] : null;
+  return filtered.length > 0
+    ? [...filtered].sort((a, b) => a.localeCompare(b))[filtered.length - 1]
+    : null;
 }
 
 function formatDateLabel(dateValue: string | null | undefined) {
@@ -261,7 +279,7 @@ function buildSymbolGroups(entries: DataSymbolEntry[]): SymbolGroup[] {
         end: maxDate(groupEntries.map((item) => item.end)),
         sources: [
           ...new Set(groupEntries.map((item) => item.source).filter(Boolean)),
-        ].sort(),
+        ].sort((a, b) => a.localeCompare(b)),
         validation,
         warningMessage: mergeWarningMessages(
           groupEntries.map(
@@ -477,7 +495,7 @@ export function DataManagementPage() {
   }, [categoryEntries]);
 
   useEffect(() => {
-    if (!selection || selection.kind !== "symbol") {
+    if (selection?.kind !== "symbol") {
       return;
     }
     const currentCategoryGroups = groupedByCategory[selection.category] || [];
@@ -661,7 +679,9 @@ export function DataManagementPage() {
           : selection,
       );
     } catch (err: unknown) {
-      window.alert(err instanceof Error ? err.message : "Failed to delete file.");
+      window.alert(
+        err instanceof Error ? err.message : "Failed to delete file.",
+      );
     }
   };
 
@@ -1029,31 +1049,35 @@ export function DataManagementPage() {
                     {isExpanded && (
                       <div style={{ padding: "6px 0 4px 24px" }}>
                         {loadingCategories[category.name] &&
-                        symbols.length === 0 ? (
-                          <div
-                            style={{
-                              display: "flex",
-                              alignItems: "center",
-                              gap: "8px",
-                              padding: "10px 0",
-                              color: "var(--color-text-muted)",
-                              fontSize: "0.78rem",
-                            }}
-                          >
-                            <Loader2 size={14} className="animate-spin" />{" "}
-                            Indexing symbols...
-                          </div>
-                        ) : visibleSymbols.length === 0 ? (
-                          <div
-                            style={{
-                              padding: "10px 0",
-                              color: "var(--color-text-muted)",
-                              fontSize: "0.78rem",
-                            }}
-                          >
-                            No symbol matches in this category.
-                          </div>
-                        ) : (
+                          symbols.length === 0 && (
+                            <div
+                              style={{
+                                display: "flex",
+                                alignItems: "center",
+                                gap: "8px",
+                                padding: "10px 0",
+                                color: "var(--color-text-muted)",
+                                fontSize: "0.78rem",
+                              }}
+                            >
+                              <Loader2 size={14} className="animate-spin" />{" "}
+                              Indexing symbols...
+                            </div>
+                          )}
+                        {!loadingCategories[category.name] &&
+                          visibleSymbols.length === 0 && (
+                            <div
+                              style={{
+                                padding: "10px 0",
+                                color: "var(--color-text-muted)",
+                                fontSize: "0.78rem",
+                              }}
+                            >
+                              No symbol matches in this category.
+                            </div>
+                          )}
+                        {(!loadingCategories[category.name] ||
+                          symbols.length > 0) &&
                           visibleSymbols.map((group) => {
                             const isSelectedSymbol =
                               selection?.kind === "symbol" &&
@@ -1070,51 +1094,31 @@ export function DataManagementPage() {
                                   )
                                 }
                                 style={{
-                                  width: "100%",
                                   display: "flex",
-                                  alignItems: "center",
                                   justifyContent: "space-between",
+                                  alignItems: "center",
                                   gap: "10px",
-                                  padding: "10px 12px",
-                                  borderRadius: "12px",
-                                  border: "1px solid transparent",
+                                  padding: "8px 10px",
+                                  borderRadius: "8px",
+                                  border: isSelectedSymbol
+                                    ? "1px solid var(--color-blue)"
+                                    : "1px solid transparent",
                                   background: isSelectedSymbol
-                                    ? "rgba(14, 165, 233, 0.14)"
+                                    ? "rgba(88, 166, 255, 0.12)"
                                     : "transparent",
-                                  color: "var(--color-text)",
                                   cursor: "pointer",
                                   textAlign: "left",
+                                  width: "100%",
                                 }}
                               >
-                                <div>
-                                  <div
-                                    style={{
-                                      display: "flex",
-                                      alignItems: "center",
-                                      gap: "8px",
-                                    }}
-                                  >
-                                    <span style={{ fontWeight: 700 }}>
-                                      {group.symbol}
-                                    </span>
-                                    <ValidationIndicator
-                                      status={group.validation}
-                                      warningMessage={group.warningMessage}
-                                      compact
-                                    />
-                                  </div>
-                                  <div
-                                    style={{
-                                      fontSize: "0.74rem",
-                                      color: "var(--color-text-muted)",
-                                    }}
-                                  >
-                                    {group.entries.length} timeframe
-                                    {group.entries.length === 1 ? "" : "s"} •{" "}
-                                    {group.sources.length} source
-                                    {group.sources.length === 1 ? "" : "s"}
-                                  </div>
-                                </div>
+                                <span
+                                  style={{
+                                    fontSize: "0.82rem",
+                                    color: "var(--color-text)",
+                                  }}
+                                >
+                                  {group.symbol}
+                                </span>
                                 <div
                                   style={{
                                     fontSize: "0.72rem",
@@ -1125,8 +1129,7 @@ export function DataManagementPage() {
                                 </div>
                               </button>
                             );
-                          })
-                        )}
+                          })}
                       </div>
                     )}
                   </div>
@@ -1146,9 +1149,8 @@ export function DataManagementPage() {
             overflow: "hidden",
           }}
         >
-          {!selection || !selectedCategory ? (
-            <EmptyDataPanel />
-          ) : selection.kind === "category" ? (
+          {(!selection || !selectedCategory) && <EmptyDataPanel />}
+          {selection && selectedCategory && selection.kind === "category" && (
             <CategoryDetailPanel
               category={selectedCategory}
               rows={categoryInventoryRows}
@@ -1163,20 +1165,26 @@ export function DataManagementPage() {
                 handleSelectSymbol(selectedCategory.name, symbol)
               }
             />
-          ) : selectedGroup ? (
-            <SymbolDetailPanel
-              category={selectedCategory}
-              group={selectedGroup}
-              rows={symbolRows}
-              onDownload={openDownloadForCurrent}
-              onResample={openResampleForCurrent}
-              onHarvest={openSmartHarvestForCurrent}
-              onDeleteAll={() => handleDeleteAllForSymbol(selectedGroup)}
-              onDeleteRow={handleDeleteEntry}
-            />
-          ) : (
-            <EmptyDataPanel />
           )}
+          {selection &&
+            selectedCategory &&
+            selection.kind !== "category" &&
+            selectedGroup && (
+              <SymbolDetailPanel
+                category={selectedCategory}
+                group={selectedGroup}
+                rows={symbolRows}
+                onDownload={openDownloadForCurrent}
+                onResample={openResampleForCurrent}
+                onHarvest={openSmartHarvestForCurrent}
+                onDeleteAll={() => handleDeleteAllForSymbol(selectedGroup)}
+                onDeleteRow={handleDeleteEntry}
+              />
+            )}
+          {selection &&
+            selectedCategory &&
+            selection.kind !== "category" &&
+            !selectedGroup && <EmptyDataPanel />}
         </main>
       </div>
 
@@ -1258,7 +1266,7 @@ function CategoryDetailPanel({
   onResample,
   onHarvest,
   onSelectSymbol,
-}: {
+}: Readonly<{
   category: DataCategorySummary;
   rows: CategoryInventoryRow[];
   loading: boolean;
@@ -1266,7 +1274,7 @@ function CategoryDetailPanel({
   onResample: () => void;
   onHarvest: () => void;
   onSelectSymbol: (symbol: string) => void;
-}) {
+}>) {
   const columns: TableColumn<CategoryInventoryRow>[] = [
     {
       key: "symbol",
@@ -1431,7 +1439,7 @@ function SymbolDetailPanel({
   onHarvest,
   onDeleteAll,
   onDeleteRow,
-}: {
+}: Readonly<{
   category: DataCategorySummary;
   group: SymbolGroup;
   rows: SymbolTableRow[];
@@ -1443,7 +1451,7 @@ function SymbolDetailPanel({
     entry: DataSymbolEntry,
     event?: MouseEvent<HTMLButtonElement>,
   ) => Promise<void>;
-}) {
+}>) {
   const sourceLabel =
     group.sources.length === 1
       ? humanizeSource(group.sources[0])
@@ -1646,13 +1654,13 @@ function HeaderBlock({
   breadcrumbs,
   actions,
   children,
-}: {
+}: Readonly<{
   eyebrow: string;
   title: string;
   breadcrumbs: string[];
   actions?: ReactNode;
   children?: ReactNode;
-}) {
+}>) {
   return (
     <div
       style={{
@@ -1733,13 +1741,13 @@ function ActionButton({
   onClick,
   tone,
   disabled = false,
-}: {
+}: Readonly<{
   icon: ReactNode;
   label: string;
   onClick: () => void;
   tone: "primary" | "secondary" | "danger";
   disabled?: boolean;
-}) {
+}>) {
   const tones: Record<string, CSSProperties> = {
     primary: {
       background: "linear-gradient(135deg, #2563eb, #0ea5e9)",
@@ -1785,11 +1793,11 @@ const MetricTile = memo(function MetricTile({
   label,
   value,
   accent,
-}: {
+}: Readonly<{
   label: string;
   value: string;
   accent: string;
-}) {
+}>) {
   return (
     <div
       style={{
@@ -1821,11 +1829,11 @@ function SectionPanel({
   title,
   subtitle,
   children,
-}: {
+}: Readonly<{
   title: string;
   subtitle?: string;
   children: ReactNode;
-}) {
+}>) {
   return (
     <div
       style={{
@@ -1892,12 +1900,12 @@ function ValidationIndicator({
   warningMessage,
   compact = false,
   showMessage = false,
-}: {
+}: Readonly<{
   status: ValidationState;
   warningMessage?: string | null;
   compact?: boolean;
   showMessage?: boolean;
-}) {
+}>) {
   const hasMessage = Boolean(warningMessage) && status !== "OK";
 
   return (
@@ -1940,10 +1948,10 @@ function ValidationIndicator({
 function ValidationBadge({
   status,
   compact = false,
-}: {
+}: Readonly<{
   status: ValidationState;
   compact?: boolean;
-}) {
+}>) {
   const tone =
     status === "OK"
       ? {
@@ -1988,7 +1996,7 @@ function PanelTable<T>({
   defaultSortDirection = "asc",
   onRowClick,
   emptyMessage,
-}: {
+}: Readonly<{
   rows: T[];
   columns: TableColumn<T>[];
   getRowKey: (row: T) => string;
@@ -1996,7 +2004,7 @@ function PanelTable<T>({
   defaultSortDirection?: SortDirection;
   onRowClick?: (row: T) => void;
   emptyMessage: string;
-}) {
+}>) {
   const [sortKey, setSortKey] = useState(defaultSortKey || "");
   const [sortDirection, setSortDirection] =
     useState<SortDirection>(defaultSortDirection);
@@ -2014,10 +2022,10 @@ function PanelTable<T>({
     const sorted = [...rows].sort((a, b) => {
       const aValue = column.sortValue
         ? column.sortValue(a)
-        : String((a as Record<string, unknown>)[sortKey] ?? "");
+        : stringifySortableCell((a as Record<string, unknown>)[sortKey]);
       const bValue = column.sortValue
         ? column.sortValue(b)
-        : String((b as Record<string, unknown>)[sortKey] ?? "");
+        : stringifySortableCell((b as Record<string, unknown>)[sortKey]);
       return compareMaybeString(aValue, bValue);
     });
     return sortDirection === "asc" ? sorted : sorted.reverse();
@@ -2150,16 +2158,19 @@ function PanelTable<T>({
             background: "rgba(15, 23, 42, 0.9)",
           }}
         >
-          <div style={{ color: "var(--color-text-muted)", fontSize: "0.76rem" }}>
-            Showing{" "}
-            {Math.min(safePageIndex * pageSize + 1, sortedRows.length)}–
+          <div
+            style={{ color: "var(--color-text-muted)", fontSize: "0.76rem" }}
+          >
+            Showing {Math.min(safePageIndex * pageSize + 1, sortedRows.length)}–
             {Math.min((safePageIndex + 1) * pageSize, sortedRows.length)} of{" "}
             {sortedRows.length}
           </div>
           <div style={{ display: "flex", gap: "8px" }}>
             <button
               type="button"
-              onClick={() => setPageIndex((current) => Math.max(current - 1, 0))}
+              onClick={() =>
+                setPageIndex((current) => Math.max(current - 1, 0))
+              }
               disabled={safePageIndex === 0}
               style={{
                 padding: "8px 12px",
@@ -2185,7 +2196,8 @@ function PanelTable<T>({
                 border: "1px solid rgba(148, 163, 184, 0.18)",
                 background: "rgba(15, 23, 42, 0.82)",
                 color: "var(--color-text)",
-                cursor: safePageIndex >= pageCount - 1 ? "not-allowed" : "pointer",
+                cursor:
+                  safePageIndex >= pageCount - 1 ? "not-allowed" : "pointer",
                 opacity: safePageIndex >= pageCount - 1 ? 0.45 : 1,
               }}
             >
