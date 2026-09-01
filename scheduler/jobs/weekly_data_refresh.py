@@ -127,14 +127,15 @@ async def run(*, task_id: str, service_id: str, service_name: str) -> dict[str, 
                 progress_message=f"Downloading {symbol} for {', '.join(REFRESH_TIMEFRAMES)}",
             )
             try:
-                await asyncio.to_thread(
-                    ensure_backtest_data,
-                    symbols=[symbol],
-                    timeframe=REFRESH_TIMEFRAMES[-1],
-                    start=start.strftime("%Y-%m-%d"),
-                    end=end.strftime("%Y-%m-%d"),
-                    modeling_resolution="main_timeframe",
-                )
+                for timeframe in REFRESH_TIMEFRAMES:
+                    await asyncio.to_thread(
+                        ensure_backtest_data,
+                        symbols=[symbol],
+                        timeframe=timeframe,
+                        start=start.strftime("%Y-%m-%d"),
+                        end=end.strftime("%Y-%m-%d"),
+                        modeling_resolution="main_timeframe",
+                    )
                 if _symbol_is_fresh(symbol, start, end):
                     refreshed.append(symbol)
                 else:
