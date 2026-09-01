@@ -129,8 +129,9 @@ def _run_fold_backtest(
         raise ValueError("; ".join(errors))
     result = engine.run(config, strategy)
     if not result.equity_curve:
-        attach_daily_equity(result, start_date=start, end_date=end)
-    result.stats = {**compute_stats_for_result(result), **result.stats}
+        attach_daily_equity(result, start=start, end=end)
+    # Freshly computed canonical stats win over stale engine-provided stats.
+    result.stats = {**result.stats, **compute_stats_for_result(result)}
     return dict(result.stats)
 
 

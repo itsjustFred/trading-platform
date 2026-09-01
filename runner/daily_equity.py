@@ -10,6 +10,63 @@ from typing import Any
 from shared.models import BacktestResult, EquityPoint
 
 
+def _parse_day_bound(value: str | None, *, is_end: bool) -> str | None:
+    """Normalize a YYYY-MM-DD (or ISO) boundary for trade-time comparison."""
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    normalized = raw.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    if is_end and "T" not in raw and ":" not in raw:
+        parsed = parsed.replace(hour=23, minute=59, second=59, microsecond=999999)
+    return parsed.isoformat()
+
+
+def _trade_in_window(trade, start_bound: str | None, end_bound: str | None) -> bool:
+    exit_time = None
+    for exit_ in trade.exits:
+        if exit_.time:
+            exit_time = exit_.time
+    if not exit_time:
+        return False
+    if start_bound and exit_time < start_bound:
+        return False
+    if end_bound and exit_time > end_bound:
+        return False
+    return True
+
+
+def _scoped_view(
+    result: BacktestResult, start_bound: str | None, end_bound: str | None
+) -> BacktestResult:
+    """Return a shallow copy of the result limited to the requested window."""
+    if not start_bound and not end_bound:
+        return result
+
+    trades = [trade for trade in result.trades if _trade_in_window(trade, start_bound, end_bound)]
+    equity_curve = result.equity_curve
+    if equity_curve:
+        equity_curve = [
+            point
+            for point in equity_curve
+            if (not start_bound or point.time >= start_bound)
+            and (not end_bound or point.time <= end_bound)
+        ]
+    return BacktestResult(
+        meta=result.meta,
+        trades=trades,
+        equity_curve=equity_curve,
+        stats=dict(result.stats or {}),
+        indicators=list(result.indicators or []),
+        drawings=list(result.drawings or []),
+    )
+
+
 def build_daily_equity_curve(result: BacktestResult) -> tuple[list[EquityPoint], list[dict[str, Any]]]:
     """
     Build a daily equity curve from trade PnL.
@@ -74,12 +131,17 @@ def attach_daily_equity(
 
     Args:
         result: BacktestResult to update
-        start: Optional start date filter (YYYY-MM-DD)
-        end: Optional end date filter (YYYY-MM-DD)
+        start: Optional start date filter (YYYY-MM-DD); trades and equity
+            points before this date are excluded from the daily aggregation.
+        end: Optional end date filter (YYYY-MM-DD); trades and equity points
+            after this date are excluded from the daily aggregation.
 
     Returns:
         The same result object with daily equity attached
     """
+    start_bound = _parse_day_bound(start, is_end=False)
+    end_bound = _parse_day_bound(end, is_end=True)
+
     # If there are no trades and no existing equity curve, mark as unknown frequency
     if not result.trades and not result.equity_curve:
         result.meta.data = result.meta.data or {}
@@ -88,8 +150,9 @@ def attach_daily_equity(
         result.stats["daily_return_count"] = 0
         return result
 
-    # Build daily equity from trades
-    daily_points, daily_returns = build_daily_equity_curve(result)
+    # Build daily equity from trades, restricted to the requested window
+    scoped_result = _scoped_view(result, start_bound, end_bound)
+    daily_points, daily_returns = build_daily_equity_curve(scoped_result)
 
     # If no daily points could be built (e.g., no valid exit times), fallback to existing curve
     if not daily_points:

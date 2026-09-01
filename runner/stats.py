@@ -241,7 +241,9 @@ def _daily_returns_series_from_equity_curve(equity_curve: list[EquityPoint]) -> 
 
     equities = [point.equity for point in equity_curve]
     try:
-        timestamps = pd.to_datetime([point.time for point in equity_curve], utc=True)
+        timestamps = pd.to_datetime(
+            [point.time for point in equity_curve], utc=True, format="ISO8601"
+        )
         series = pd.Series(equities, index=timestamps, dtype=float).sort_index()
         series = series.groupby(level=0).last()
         daily_equity = series.resample("D").last().ffill()
