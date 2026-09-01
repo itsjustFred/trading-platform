@@ -39,6 +39,19 @@ def _symbol_is_fresh(symbol: str, *, start: str, end: str) -> bool:
     )
 
 
+def _covered_symbols(*, start: str, end: str) -> list[str]:
+    """Return the refresh symbols whose local data already covers [start, end].
+
+    Blocking (reads parquet timestamps) — callers must run it via
+    ``asyncio.to_thread``.
+    """
+    return [
+        symbol
+        for symbol in REFRESH_SYMBOLS
+        if _symbol_is_fresh(symbol, start=start, end=end)
+    ]
+
+
 async def run(*, task_id: str, service_id: str, service_name: str) -> dict[str, Any]:
     """Refresh the weekly data window and report the truthful outcome.
 
@@ -98,13 +111,15 @@ async def run(*, task_id: str, service_id: str, service_name: str) -> dict[str, 
 
     start_str = start.strftime("%Y-%m-%d")
     end_str = end.strftime("%Y-%m-%d")
-    covered = [
-        symbol
-        for symbol in REFRESH_SYMBOLS
-        if _symbol_is_fresh(symbol, start=start_str, end=end_str)
-    ]
+    # The freshness scan reads up to len(REFRESH_SYMBOLS) * len(REFRESH_TIMEFRAMES)
+    # parquet files; run it off the event loop like every other blocking call.
+    covered = list(
+        await asyncio.to_thread(_covered_symbols, start=start_str, end=end_str)
+    )
     missing = [symbol for symbol in REFRESH_SYMBOLS if symbol not in covered]
 
+    refreshed: list[str] = []
+    errors: list[str] = []
     if missing:
         # Only the missing symbols are requested for download; covered symbols
         # are left untouched so the refresh stays a cheap incremental no-op.
@@ -117,12 +132,12 @@ async def run(*, task_id: str, service_id: str, service_name: str) -> dict[str, 
             service_name=service_name,
             base_config=base_config,
         )
-    else:
+
+    finished = datetime.now(timezone.utc)
+    if not missing:
         # Every symbol already has data covering the advertised window: nothing
         # was downloaded, so the job reports a no-op ("skipped"), never a
         # completed refresh.
-        refreshed = []
-        errors = []
         status = "skipped"
         progress_message = (
             "Weekly data refresh skipped: all "
@@ -130,65 +145,93 @@ async def run(*, task_id: str, service_id: str, service_name: str) -> dict[str, 
             f"{start_str}..{end_str}; nothing to download"
         )
         current = f"Skipped: {len(covered)}/{len(REFRESH_SYMBOLS)} symbols already fresh"
+    elif errors:
+        status = "failed"
+        progress_message = f"Weekly data refresh failed: {'; '.join(errors)}"
+        current = errors[0]
+    elif missing and not refreshed:
+        status = "skipped"
+        progress_message = (
+            "Weekly data refresh skipped: no data downloaded for "
+            f"{', '.join(missing)}"
+        )
+        current = "Skipped: no data downloaded"
+    else:
+        # `refreshed` is the subset of `missing` whose download produced real
+        # window coverage; `covered` are the symbols that were already fresh
+        # before the run, so "completed" requires both groups to cover every
+        # symbol.
+        fully_covered = len(covered) + len(refreshed)
+        status = "completed" if fully_covered == len(REFRESH_SYMBOLS) else "partial"
+        progress_message = (
+            f"Weekly data refresh {status}: {fully_covered} of "
+            f"{len(REFRESH_SYMBOLS)} symbols cover the window"
+        )
+        current = (
+            f"{status.capitalize()}: {fully_covered}/{len(REFRESH_SYMBOLS)} refreshed"
+        )
 
-        finished = datetime.now(timezone.utc)
-        result_config = dict(base_config)
-        result_config.update(
-            {
-                "finished_at": finished.isoformat(),
-                "progress_percent": 100.0,
-                "progress_detail": {
-                    "completed": 0,
-                    "failed": 0,
-                    "total": len(REFRESH_SYMBOLS),
-                    "percent": 100.0,
-                    "current": current,
-                },
-                "result": {
-                    "status": status,
-                    "refreshed": refreshed,
-                    "missing": missing,
-                    "errors": errors,
-                    "already_fresh": covered,
-                    "window": window,
-                },
-            }
-        )
-        await asyncio.to_thread(
-            upsert_background_task_record,
-            task_id=task_id,
-            task_type="service",
-            status=status,
-            config_json=result_config,
-            progress_message=progress_message,
-            name=f"{service_name} · Weekly Data Refresh",
-            description=_DESCRIPTION,
-            source="scheduler",
-            updated_at=finished.isoformat(),
-        )
-        logger.info(
-            "Weekly data refresh finished",
-            extra={
-                "data": {
-                    "service_id": service_id,
-                    "service_name": service_name,
-                    "status": status,
-                    "refreshed": refreshed,
-                    "missing": missing,
-                    "already_fresh": covered,
-                }
+    completed_count = len(refreshed) if status in {"completed", "partial"} else 0
+    failed_count = len(errors) if errors else 0
+    result_config = _progress_config(
+        base_config,
+        total=len(REFRESH_SYMBOLS),
+        completed=completed_count,
+        failed=failed_count,
+        current=current,
+        percent=100.0,
+    )
+    result_config.update(
+        {
+            "finished_at": finished.isoformat(),
+            "result": {
+                "status": status,
+                "refreshed": refreshed,
+                "missing": missing,
+                "errors": errors,
+                "already_fresh": covered,
+                "window": window,
             },
-        )
-        return {
-            "status": status,
-            "refreshed": refreshed,
-            "missing": missing,
-            "errors": errors,
-            "already_fresh": covered,
-            "window": window,
         }
+    )
+    if errors:
+        result_config["error"] = "; ".join(errors)
 
-    finished = datetime.now(timezone.utc)
+    await asyncio.to_thread(
+        upsert_background_task_record,
+        task_id=task_id,
+        task_type="service",
+        status=status,
+        config_json=result_config,
+        progress_message=progress_message,
+        name=f"{service_name} · Weekly Data Refresh",
+        description=_DESCRIPTION,
+        source="scheduler",
+        updated_at=finished.isoformat(),
+    )
+
+    logger.info(
+        "Weekly data refresh finished",
+        extra={
+            "data": {
+                "service_id": service_id,
+                "service_name": service_name,
+                "status": status,
+                "refreshed": refreshed,
+                "missing": missing,
+                "already_fresh": covered,
+            }
+        },
+    )
+
+    return {
+        "status": status,
+        "refreshed": refreshed,
+        "missing": missing,
+        "errors": errors,
+        "already_fresh": covered,
+        "window": window,
+    }
     if errors:
         status = "failed"
         progress_message = f"Weekly data refresh failed: {'; '.join(errors)}"
