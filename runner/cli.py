@@ -89,6 +89,8 @@ def _detect_date_range(symbols: list[str], timeframe: str, data_dir: str = "") -
     """Auto-detect date range from available OHLCV data files.
 
     For multiple symbols, returns the intersection (common period).
+    Raises ValueError when no data is found or the symbols' covered periods
+    are disjoint — fabricated ranges must never flow into backtests.
     """
     ohlcv_root = Path(data_dir) / "ohlcv" if data_dir else DATA_DIR / "ohlcv"
     normalized_timeframe = normalize_timeframe(timeframe)
@@ -100,7 +102,10 @@ def _detect_date_range(symbols: list[str], timeframe: str, data_dir: str = "") -
             # Try without exact timeframe match — find any parquet for symbol
             matches = list(ohlcv_root.rglob(f"**/{symbol}/*.parquet"))
         if not matches:
-            continue
+            raise ValueError(
+                f"No OHLCV data found for {symbol}/{normalized_timeframe} under "
+                f"{ohlcv_root}; refusing to fabricate a backtest date range"
+            )
         try:
             import pandas as pd
 
@@ -113,10 +118,21 @@ def _detect_date_range(symbols: list[str], timeframe: str, data_dir: str = "") -
         except Exception as e:
             logger.warning("Could not read date range from %s: %s", matches[0], e)
 
-    if starts and ends:
-        # Intersection: latest start, earliest end
-        return max(starts), min(ends)
-    return "2023-01-01", "2025-12-31"  # fallback
+    if not starts or not ends:
+        raise ValueError(
+            f"OHLCV data for {symbols} under {ohlcv_root} has no readable "
+            "timestamps; refusing to fabricate a backtest date range"
+        )
+
+    # Intersection: latest start, earliest end
+    detected_start, detected_end = max(starts), min(ends)
+    if detected_start > detected_end:
+        raise ValueError(
+            f"Symbols {symbols} have disjoint data coverage "
+            f"({detected_start} > {detected_end}); refusing to backtest an "
+            "empty intersection"
+        )
+    return detected_start, detected_end
 
 
 def cmd_run(args):

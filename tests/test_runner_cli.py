@@ -167,3 +167,35 @@ def test_cmd_walkforward_maps_cli_args_and_prints_json(monkeypatch, capsys, tmp_
     assert captured["params"] == {"window": 20}
     payload = json.loads(capsys.readouterr().out)
     assert payload["summary"]["fold_count"] == 2
+
+
+def test_detect_date_range_rejects_missing_data(tmp_path):
+    """Regression (F19): no fabricated 2023..2025 fallback."""
+    import pytest
+
+    with pytest.raises(ValueError, match="No OHLCV data"):
+        runner_cli._detect_date_range(["NOSUCHSYMBOL"], "1d", str(tmp_path))
+
+
+def test_detect_date_range_rejects_disjoint_symbol_ranges(tmp_path):
+    """Regression (F19): disjoint ranges must not flow start>end into configs."""
+    import pandas as pd
+    import pytest
+
+    for symbol, month in (("AAA", "2020-01"), ("BBB", "2024-06")):
+        path = tmp_path / "ohlcv" / "test" / symbol / "1d.parquet"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        stamps = pd.date_range(f"{month}-01", periods=5, freq="D", tz="UTC")
+        pd.DataFrame(
+            {
+                "timestamp": stamps,
+                "open": [1.0] * 5,
+                "high": [1.0] * 5,
+                "low": [1.0] * 5,
+                "close": [1.0] * 5,
+                "volume": [1.0] * 5,
+            }
+        ).to_parquet(path, index=False)
+
+    with pytest.raises(ValueError, match="disjoint"):
+        runner_cli._detect_date_range(["AAA", "BBB"], "1d", str(tmp_path))

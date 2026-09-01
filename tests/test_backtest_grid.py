@@ -229,3 +229,53 @@ def test_in_process_uses_resolved_dates_for_daily_equity(monkeypatch, tmp_path):
     assert captured["end_date"] == "2024-02-01"
     assert result["start"] == "2024-01-01"
     assert result["end"] == "2024-02-01"
+
+
+def test_subprocess_command_does_not_pass_grid_only_flags(tmp_path):
+    """Regression (F3): runner.cli run has no --keep-indicators flag."""
+    cmd = build_cli_command(
+        strategy=str(tmp_path / "trend_following.py"),
+        symbol="SP500",
+        timeframe="1h",
+        start="2025-01-01",
+        end="2025-12-31",
+        engine="vectorbt",
+        capital=10000.0,
+        risk_pct=0.01,
+        max_position_pct=None,
+        max_leverage=None,
+        intrabar_resolution="open_close",
+        params=None,
+        output_path=tmp_path / "out.trades.json",
+        data_dir="/tmp/data",
+        save_sqlite=False,
+        keep_indicators=True,
+    )
+
+    assert "--keep-indicators" not in cmd
+
+
+def test_no_date_range_is_fabricated_when_data_missing(tmp_path):
+    """Regression (F19): missing data must fail loudly, not invent 2023..2025."""
+    import pytest as _pytest
+
+    with _pytest.raises(ValueError, match="No OHLCV data"):
+        bg._detect_date_range("NOSUCHSYMBOL", "1h", str(tmp_path / "data"))
+
+
+def test_read_backtest_stats_exposes_canonical_keys(tmp_path):
+    """Regression (F40): total_return is surfaced under its canonical key."""
+    path = tmp_path / "run.trades.json"
+    path.write_text(
+        json.dumps(
+            {
+                "meta": {"id": "run-1"},
+                "trades": [{}],
+                "stats": {"total_return": 0.05, "sharpe_ratio": 1.5},
+            }
+        ),
+        encoding="utf-8",
+    )
+    stats = bg.read_backtest_stats(path)
+    assert stats["net_profit_pct"] == 0.05
+    assert stats["sharpe"] == 1.5

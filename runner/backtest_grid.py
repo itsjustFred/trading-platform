@@ -180,8 +180,6 @@ def build_cli_command(
         cmd.extend(["--data-dir", data_dir])
     if not save_sqlite:
         cmd.append("--skip-sqlite")
-    if keep_indicators:
-        cmd.append("--keep-indicators")
     if result_id:
         cmd.extend(["--result-id", result_id])
     return cmd
@@ -214,11 +212,17 @@ def _detect_date_range(symbol: str, timeframe: str, data_dir: str) -> tuple[str,
     if not matches:
         matches = list(root.rglob(f"**/{symbol}/*.parquet"))
     if not matches:
-        return "2023-01-01", "2025-12-31"
+        raise ValueError(
+            f"No OHLCV data found for {symbol}/{timeframe} under {root}; "
+            "refusing to fabricate a backtest date range"
+        )
     df = pd.read_parquet(matches[0], columns=["timestamp"])
     ts = pd.to_datetime(df["timestamp"], utc=True, errors="coerce").dropna()
     if ts.empty:
-        return "2023-01-01", "2025-12-31"
+        raise ValueError(
+            f"OHLCV data for {symbol}/{timeframe} under {root} has no valid "
+            "timestamps; refusing to fabricate a backtest date range"
+        )
     return ts.min().strftime("%Y-%m-%d"), ts.max().strftime("%Y-%m-%d")
 
 
