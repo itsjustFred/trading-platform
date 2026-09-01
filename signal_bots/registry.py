@@ -67,6 +67,9 @@ def _build_from_config(
 # ids listed here; adding a bot means one entry here plus its factory.
 _BOT_DIRS: dict[str, str] = {
     "ramjet": "ramjet",
+    # "rocketfuel" is the RocketFuel Discord-bot id (live_deployments.yaml) and
+    # maps to the long-only variant's config file, like its explicit variants.
+    "rocketfuel": "rocketfuel",
     "rocketfuel_longsonly": "rocketfuel",
     "rocketfuel_longandshort": "rocketfuel",
     "nitro": "nitro",
