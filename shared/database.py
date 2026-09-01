@@ -63,7 +63,11 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 # with the DATA_DIR this module already resolved.
 DATA_DIR = RESOLVED_DATA_DIR
 DB_PATH = DATA_DIR / "backtests.db"
-DEFAULT_DATABASE_URL: str | None = None  # resolved lazily via __getattr__
+# Optional engine override. New code should call get_engine(); importing
+# ENGINE no longer forces engine creation at import time. Tests that need a
+# bespoke engine set this attribute directly (it is part of the module
+# contract, so monkeypatching it does not materialize hidden state).
+ENGINE: Any = None
 
 
 def _sqlite_url(path: Path) -> str:
@@ -95,13 +99,12 @@ def get_engine() -> Any:
 
     Lazy creation keeps imports side-effect free (no engine bound to a
     possibly stale DATA_DIR) while guaranteeing a single engine per process.
-    An explicit module-level ``ENGINE`` override (set by tests or embedders
-    via ``shared.database.ENGINE = engine``) always wins.
+    An explicit ``ENGINE`` override (set by tests or embedders via
+    ``shared.database.ENGINE = engine``) always wins.
     """
-    override = globals().get("ENGINE")
-    if override is not None:
-        return override
     global _ENGINE
+    if ENGINE is not None:
+        return ENGINE
     if _ENGINE is None:
         with _ENGINE_LOCK:
             if _ENGINE is None:
@@ -110,14 +113,11 @@ def get_engine() -> Any:
     return _ENGINE
 
 
-# Backwards-compatible alias. New code should call get_engine(); importing
-# ENGINE no longer forces engine creation at import time.
-def __getattr__(name: str) -> Any:
-    if name == "ENGINE":
-        return get_engine()
-    if name == "DEFAULT_DATABASE_URL":
-        return _default_database_url()
-    raise AttributeError(f"module 'shared.database' has no attribute {name!r}")
+def reset_engine() -> None:
+    """Forget the lazily created engine (test isolation helper)."""
+    global _ENGINE
+    with _ENGINE_LOCK:
+        _ENGINE = None
 
 
 def _configure_sqlite_connection(dbapi_connection: Any, _connection_record: Any) -> None:

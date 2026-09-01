@@ -12,6 +12,7 @@ import pytest
 from sqlalchemy import text
 
 from shared.database import (
+    get_engine,
     BacktestRecord,
     EquityPointModel,
     save_result_to_sqlite,
