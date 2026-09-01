@@ -9,7 +9,6 @@ from typing import Any
 # The full prompt is piped via stdin (`-p -`) instead of being passed as a
 # single argv element: prompts here routinely exceed platform argv limits
 # (Windows ~32k chars) and would otherwise be readable process-wide via `ps`.
-PROMPT_VIA_STDIN = True
 
 
 def _extract_content(payload: Any) -> str:
