@@ -428,8 +428,13 @@ class MT5HTMLImporter(BaseImporter):
         col_profit = MT5HTMLImporter._find_col_index(header, ["Gewinn"])
         col_comment = MT5HTMLImporter._find_col_index(header, ["Kommentar"])
 
-        if col_time is None or col_direction is None:
-            raise ValueError("Trades table is missing required columns (Zeit / Richtung).")
+        # DV-B42: direction is derived from the Typ column, so it must be
+        # present.  Without this check a missing or locale-variant Typ column
+        # silently relabels every trade as SHORT.
+        if col_time is None or col_direction is None or col_typ is None:
+            raise ValueError(
+                "Trades table is missing required columns (Zeit / Typ / Richtung)."
+            )
 
         # Build mapping: trade_id -> {entry_row, exit_row}
         # MT5 exports each trade as two rows: entry (in) and exit (out) with same Trade/Order ID
@@ -471,7 +476,19 @@ class MT5HTMLImporter(BaseImporter):
             pnl = MT5HTMLImporter._to_float(exit_row, col_profit)
 
             typ_entry = MT5HTMLImporter._get_str(entry_row, col_typ, "").lower()
-            direction_str = "LONG" if typ_entry == "buy" else "SHORT"
+            # DV-B42: only plain buy/sell entries carry a derivable direction.
+            # Anything else (pending-order types, locale variants) must fail
+            # the import instead of silently becoming SHORT.
+            if typ_entry == "buy":
+                direction_str = "LONG"
+            elif typ_entry == "sell":
+                direction_str = "SHORT"
+            else:
+                raise ValueError(
+                    f"Unsupported entry Typ {typ_entry!r} for trade "
+                    f"{trade_id_counter} (expected 'buy' or 'sell'); cannot "
+                    "derive trade direction."
+                )
 
             commission = MT5HTMLImporter._to_float(exit_row, col_commission, default=0.0)
             swap = MT5HTMLImporter._to_float(exit_row, col_swap, default=0.0)

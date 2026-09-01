@@ -446,8 +446,13 @@ class MT5XLSXImporter(BaseImporter):
         col_profit = MT5XLSXImporter._find_col(trades_df, ["Gewinn"])
         col_comment = MT5XLSXImporter._find_col(trades_df, ["Kommentar"])
 
-        if col_time is None or col_direction is None:
-            raise ValueError("Trades table is missing required columns (Zeit / Richtung).")
+        # DV-B42: direction is derived from the Typ column, so it must be
+        # present.  Without this check a missing or locale-variant Typ column
+        # silently relabels every trade as SHORT.
+        if col_time is None or col_direction is None or col_typ is None:
+            raise ValueError(
+                "Trades table is missing required columns (Zeit / Typ / Richtung)."
+            )
 
         trades: list[Trade] = []
         i = 0
@@ -504,7 +509,19 @@ class MT5XLSXImporter(BaseImporter):
             pnl = MT5XLSXImporter._to_float(exit_row.get(col_profit))
 
             typ_entry = MT5XLSXImporter._get_str(entry_row, col_typ, "").lower()
-            direction_str = "LONG" if typ_entry == "buy" else "SHORT"
+            # DV-B42: only plain buy/sell entries carry a derivable direction.
+            # Anything else (pending-order types, locale variants) must fail
+            # the import instead of silently becoming SHORT.
+            if typ_entry == "buy":
+                direction_str = "LONG"
+            elif typ_entry == "sell":
+                direction_str = "SHORT"
+            else:
+                raise ValueError(
+                    f"Unsupported entry Typ {typ_entry!r} for trade "
+                    f"{trade_id_counter} (expected 'buy' or 'sell'); cannot "
+                    "derive trade direction."
+                )
 
             commission = MT5XLSXImporter._to_float(exit_row.get(col_commission), default=0.0)
             swap = MT5XLSXImporter._to_float(exit_row.get(col_swap), default=0.0)

@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
 import pytest
 
 from shared.models import Trade, VALID_DIRECTIONS
@@ -272,3 +273,61 @@ class TestSourceTimezone:
     def test_to_iso_rejects_unknown_source_timezone(self):
         with pytest.raises(ValueError):
             MT5XLSXImporter._to_iso("2024.01.01 10:00:00", "Not/AZone")
+
+
+class TestDirectionRequiresTypColumn:
+    """DV-B42: direction must never be inferred from a missing Typ column."""
+
+    def _write_report(self, tmp_path: Path, include_typ: bool, typ_value: str = "buy") -> Path:
+        data: dict[str, object] = {
+            "A": ["Orders", None, "Auftrag", 1001],
+            "B": [None, None, "Zeit", "2024.01.03 08:00:00"],
+            "C": [None, None, "Symbol", "EURUSD"],
+            "D": [None, None, "Typ", typ_value],
+            "E": [None, None, "Volumen", "0.10"],
+            "F": [None, None, "Preis", 1.085],
+            "G": [None, None, "S / L", 1.08],
+            "H": [None, None, "T / P", 1.095],
+            "I": [None, None, "Kommentar", "Entry"],
+        }
+        if not include_typ:
+            data.pop("D")
+            # Re-align remaining columns so the Orders table keeps Zeit..Kommentar
+            data["D"] = data.pop("E")
+            data["E"] = data.pop("F")
+            data["F"] = data.pop("G")
+            data["G"] = data.pop("H")
+            data["H"] = data.pop("I")
+
+        orders = pd.DataFrame(data)
+        trades_rows = [
+            ["Trades"] + [None] * 11,
+            ["Zeit", "Trade", "Symbol"]
+            + (["Typ"] if include_typ else [])
+            + ["Richtung", "Volumen", "Preis", "Auftrag", "Kommission", "Swap", "Gewinn", "Kontostand", "Kommentar"],
+            ["2024.01.03 08:00:00", 2, "EURUSD"]
+            + ([typ_value] if include_typ else [])
+            + ["in", "0.10", 1.085, 1001, 0, 0, 0, 100000, "Entry"],
+            ["2024.01.03 16:00:00", 3, "EURUSD"]
+            + (["sell"] if include_typ else [])
+            + ["out", "0.10", 1.09, 1002, 0, 0, 500.0, 100500, "TP 1.09000"],
+        ]
+        trades = pd.DataFrame(trades_rows)
+
+        path = tmp_path / (
+            f"report_{'with' if include_typ else 'no'}_typ_{typ_value.replace(' ', '_')}.xlsx"
+        )
+        with pd.ExcelWriter(path, engine="openpyxl") as writer:
+            orders.to_excel(writer, index=False, header=False, startrow=0)
+            trades.to_excel(writer, index=False, header=False, startrow=20)
+        return path
+
+    def test_missing_typ_column_raises(self, tmp_path: Path):
+        path = self._write_report(tmp_path, include_typ=False)
+        with pytest.raises(ValueError, match="Typ"):
+            MT5XLSXImporter().load(path)
+
+    def test_unsupported_entry_typ_raises(self, tmp_path: Path):
+        path = self._write_report(tmp_path, include_typ=True, typ_value="buy limit")
+        with pytest.raises(ValueError, match="buy limit"):
+            MT5XLSXImporter().load(path)

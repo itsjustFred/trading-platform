@@ -202,3 +202,19 @@ class TestHelpers:
     def test_infer_exit_reason_none(self):
         assert MT5HTMLImporter._infer_exit_reason("") is None
         assert MT5HTMLImporter._infer_exit_reason("some comment") is None
+
+
+class TestDirectionRequiresTypColumn:
+    """DV-B42: direction must never be inferred from a missing Typ column."""
+
+    def test_missing_typ_column_raises(self, tmp_path: Path):
+        with pytest.raises(ValueError, match="Typ"):
+            MT5HTMLImporter().load(
+                Path("tests/fixtures/validation/mt5_html/missing_typ.html")
+            )
+
+    def test_unsupported_entry_typ_raises(self):
+        with pytest.raises(ValueError, match="buy limit"):
+            MT5HTMLImporter().load(
+                Path("tests/fixtures/validation/mt5_html/bad_typ.html")
+            )
