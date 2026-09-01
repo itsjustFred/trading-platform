@@ -231,7 +231,7 @@ export interface IndicatorStyle {
 
 export interface IndicatorSeriesView {
   name: string;
-  type: "overlay" | "panel" | string;
+  type: string;
   data: IndicatorPoint[];
   style?: IndicatorStyle;
   color?: string;
@@ -277,7 +277,10 @@ export interface OptimizationRunRequest {
   n_trials: number;
   train_split_pct: number;
   parameter_ranges: Record<string, OptimizationParameterRange>;
-  optimization_mode?: "parameter" | "risk_parity_universe" | "risk_parity_covariance";
+  optimization_mode?:
+    | "parameter"
+    | "risk_parity_universe"
+    | "risk_parity_covariance";
   symbol_universes?: string[][];
 }
 
@@ -301,8 +304,13 @@ export interface OptimizationTrial {
   symbols?: string[];
   trade_count: number;
   penalty_applied: boolean;
-  train_stats: Record<string, number | string | boolean | null>;
+  train_stats: OptimizationTrainStat;
 }
+
+export type OptimizationTrainStat = Record<
+  string,
+  number | string | boolean | null
+>;
 
 export interface OptimizationSummary {
   id: string;
@@ -321,7 +329,7 @@ export interface OptimizationSummary {
   symbol_universes?: string[][];
   train_period: OptimizationPeriod;
   test_period: OptimizationPeriod;
-  train_stats: Record<string, number | string | boolean | null>;
+  train_stats: OptimizationTrainStat;
   test_stats: Record<string, number | string | boolean | null>;
 }
 
@@ -351,7 +359,7 @@ export interface OptimizationDetail {
   best_value: number | null;
   train_period: OptimizationPeriod;
   test_period: OptimizationPeriod;
-  train_stats: Record<string, number | string | boolean | null>;
+  train_stats: OptimizationTrainStat;
   test_stats: Record<string, number | string | boolean | null>;
   top_trials: OptimizationTrial[];
 }
@@ -420,7 +428,11 @@ export type LiveDeploymentStatus = "ACTIVE" | "PAUSED" | "STOPPED";
 export type LiveSignalSource = "internal" | "discord";
 export type ServiceType = "discord_bot" | "scheduled_job";
 export type ServiceStatus = "running" | "paused" | "failed" | "stopped";
-export type VerificationEvidenceStatus = "success" | "failed" | "partial" | "skipped";
+export type VerificationEvidenceStatus =
+  | "success"
+  | "failed"
+  | "partial"
+  | "skipped";
 
 export interface Service {
   id: string;
@@ -561,7 +573,7 @@ export interface LiveTradeSlippage {
   deployment_id: string;
   account_id: string;
   symbol: string;
-  action: "buy" | "sell" | string;
+  action: string;
   theoretical_price: number;
   actual_price: number;
   slippage: number;
@@ -647,7 +659,12 @@ export interface LivePositionsResponse {
   positions: LivePosition[];
 }
 
-export type LiveSignalStatus = "Pending" | "Waiting" | "Executed" | "Filled" | "Failed";
+export type LiveSignalStatus =
+  | "Pending"
+  | "Waiting"
+  | "Executed"
+  | "Filled"
+  | "Failed";
 
 export interface LiveSignalLog {
   signal_id: string;
@@ -999,8 +1016,8 @@ export interface TradeDetail extends Trade {
 export interface ChartMarkerDrawing {
   type: "marker";
   time: number;
-  position?: "aboveBar" | "belowBar" | "inBar" | string;
-  shape?: "arrowUp" | "arrowDown" | "circle" | "square" | string;
+  position?: string;
+  shape?: string;
   color?: string;
   text?: string;
   symbol?: string;
@@ -1356,7 +1373,7 @@ export interface DataTaskStatusResponse {
   duration_seconds?: number | null;
   error?: string | null;
   error_message?: string | null;
-  provider?: AgentProviderId | string | null;
+  provider?: string | null;
   model?: string | null;
   log?: string;
   progress?: DataTaskProgress;

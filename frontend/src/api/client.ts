@@ -96,16 +96,8 @@ async function fetchJSON<T>(url: string, options?: RequestInit): Promise<T> {
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: res.statusText }));
     const detail = err?.detail ?? err;
-    const messageFromDetail =
-      typeof detail === "string"
-        ? detail
-        : typeof detail === "object" && detail && "message" in detail
-          ? String((detail as { message?: unknown }).message ?? "")
-          : "";
-    const message =
-      messageFromDetail ||
-      err?.error ||
-      res.statusText;
+    const messageFromDetail = describeErrorDetail(detail);
+    const message = messageFromDetail || err?.error || res.statusText;
     throw new ApiError(message, res.status, detail);
   }
   return res.json();
@@ -115,28 +107,28 @@ async function supportsLiveStatsEndpoint(): Promise<boolean> {
   if (liveStatsSupported !== null) {
     return liveStatsSupported;
   }
-  if (!liveStatsSupportPromise) {
-    liveStatsSupportPromise = (async () => {
-      try {
-        const response = await fetch("/openapi.json");
-        if (!response.ok) {
-          return true;
-        }
-        const payload = (await response.json()) as { paths?: Record<string, unknown> };
-        const paths = Object.keys(payload?.paths ?? {});
-        return paths.some((path) => path.includes(LIVE_STATS_PATH_FRAGMENT));
-      } catch {
+  liveStatsSupportPromise ??= (async () => {
+    try {
+      const response = await fetch("/openapi.json");
+      if (!response.ok) {
         return true;
       }
-    })()
-      .then((supported) => {
-        liveStatsSupported = supported;
-        return supported;
-      })
-      .finally(() => {
-        liveStatsSupportPromise = null;
-      });
-  }
+      const payload = (await response.json()) as {
+        paths?: Record<string, unknown>;
+      };
+      const paths = Object.keys(payload?.paths ?? {});
+      return paths.some((path) => path.includes(LIVE_STATS_PATH_FRAGMENT));
+    } catch {
+      return true;
+    }
+  })()
+    .then((supported) => {
+      liveStatsSupported = supported;
+      return supported;
+    })
+    .finally(() => {
+      liveStatsSupportPromise = null;
+    });
   return liveStatsSupportPromise;
 }
 
@@ -153,35 +145,72 @@ export const renameStrategy = (name: string, displayName: string) =>
   });
 
 // Backtests
+/** Renders an unknown error-detail value as a human-readable string. */
+function describeErrorDetail(detail: unknown): string {
+  if (typeof detail === "string") {
+    return detail;
+  }
+  if (typeof detail === "object" && detail !== null && "message" in detail) {
+    const message = (detail as { message?: unknown }).message;
+    if (typeof message === "string") {
+      return message;
+    }
+    if (message != null) {
+      return JSON.stringify(message);
+    }
+  }
+  return "";
+}
+
+/** Appends a query string to a path only when one is present. */
+function withQuery(path: string, query: string): string {
+  return query ? `${path}?${query}` : path;
+}
+
+const BACKTESTS_QUERY_PARAMS: ReadonlyArray<{
+  key: keyof BacktestsQueryParams;
+  name: string;
+  kind: "string" | "number";
+}> = [
+  { key: "page", name: "page", kind: "number" },
+  { key: "per_page", name: "per_page", kind: "number" },
+  { key: "sort", name: "sort", kind: "string" },
+  { key: "order", name: "order", kind: "string" },
+  { key: "name", name: "name", kind: "string" },
+  { key: "strategy", name: "strategy", kind: "string" },
+  { key: "symbol", name: "symbol", kind: "string" },
+  { key: "timeframe", name: "timeframe", kind: "string" },
+  { key: "search", name: "search", kind: "string" },
+  { key: "total_return_min", name: "total_return_min", kind: "number" },
+  { key: "total_return_max", name: "total_return_max", kind: "number" },
+  { key: "sharpe_min", name: "sharpe_min", kind: "number" },
+  { key: "sharpe_max", name: "sharpe_max", kind: "number" },
+  { key: "psr_min", name: "psr_min", kind: "number" },
+  { key: "psr_max", name: "psr_max", kind: "number" },
+  { key: "p_value_min", name: "p_value_min", kind: "number" },
+  { key: "p_value_max", name: "p_value_max", kind: "number" },
+  { key: "cagr_min", name: "cagr_min", kind: "number" },
+  { key: "cagr_max", name: "cagr_max", kind: "number" },
+  { key: "win_rate_min", name: "win_rate_min", kind: "number" },
+  { key: "win_rate_max", name: "win_rate_max", kind: "number" },
+  { key: "drawdown_min", name: "drawdown_min", kind: "number" },
+  { key: "drawdown_max", name: "drawdown_max", kind: "number" },
+  { key: "max_drawdown_min", name: "max_drawdown_min", kind: "number" },
+  { key: "max_drawdown_max", name: "max_drawdown_max", kind: "number" },
+];
+
 export const getBacktests = (params?: BacktestsQueryParams) => {
   const query = new URLSearchParams();
-  if (params?.page != null) query.set("page", String(params.page));
-  if (params?.per_page != null) query.set("per_page", String(params.per_page));
-  if (params?.sort) query.set("sort", params.sort);
-  if (params?.order) query.set("order", params.order);
-  if (params?.name) query.set("name", params.name);
-  if (params?.strategy) query.set("strategy", params.strategy);
-  if (params?.symbol) query.set("symbol", params.symbol);
-  if (params?.timeframe) query.set("timeframe", params.timeframe);
-  if (params?.search) query.set("search", params.search);
-  if (params?.total_return_min != null) query.set("total_return_min", String(params.total_return_min));
-  if (params?.total_return_max != null) query.set("total_return_max", String(params.total_return_max));
-  if (params?.sharpe_min != null) query.set("sharpe_min", String(params.sharpe_min));
-  if (params?.sharpe_max != null) query.set("sharpe_max", String(params.sharpe_max));
-  if (params?.psr_min != null) query.set("psr_min", String(params.psr_min));
-  if (params?.psr_max != null) query.set("psr_max", String(params.psr_max));
-  if (params?.p_value_min != null) query.set("p_value_min", String(params.p_value_min));
-  if (params?.p_value_max != null) query.set("p_value_max", String(params.p_value_max));
-  if (params?.cagr_min != null) query.set("cagr_min", String(params.cagr_min));
-  if (params?.cagr_max != null) query.set("cagr_max", String(params.cagr_max));
-  if (params?.win_rate_min != null) query.set("win_rate_min", String(params.win_rate_min));
-  if (params?.win_rate_max != null) query.set("win_rate_max", String(params.win_rate_max));
-  if (params?.drawdown_min != null) query.set("drawdown_min", String(params.drawdown_min));
-  if (params?.drawdown_max != null) query.set("drawdown_max", String(params.drawdown_max));
-  if (params?.max_drawdown_min != null) query.set("max_drawdown_min", String(params.max_drawdown_min));
-  if (params?.max_drawdown_max != null) query.set("max_drawdown_max", String(params.max_drawdown_max));
-  const queryString = query.toString();
-  return fetchJSON<BacktestsListResponse>(`/backtests${queryString ? `?${queryString}` : ""}`);
+  for (const { key, name, kind } of BACKTESTS_QUERY_PARAMS) {
+    const value = params?.[key];
+    if (value == null || value === "") {
+      continue;
+    }
+    query.set(name, kind === "number" ? String(value) : String(value));
+  }
+  return fetchJSON<BacktestsListResponse>(
+    withQuery(`/backtests`, query.toString()),
+  );
 };
 export const getBacktestsAll = (
   name?: string,
@@ -190,10 +219,15 @@ export const getBacktestsAll = (
   const query = new URLSearchParams();
   if (options?.includeEquityPreview) {
     query.set("include_equity_preview", "true");
-    query.set("preview_limit", String(Math.max(1, Math.min(100, options.previewLimit ?? 48))));
+    query.set(
+      "preview_limit",
+      String(Math.max(1, Math.min(100, options.previewLimit ?? 48))),
+    );
   }
-  if (name && name.trim()) query.set("name", name.trim());
-  return fetchJSON<BacktestMetadataItem[]>(`/backtests/all?${query.toString()}`);
+  if (name?.trim()) query.set("name", name.trim());
+  return fetchJSON<BacktestMetadataItem[]>(
+    `/backtests/all?${query.toString()}`,
+  );
 };
 export const getBacktestEquityPreview = (id: string, limit = 80) =>
   fetchJSON<number[]>(
@@ -203,7 +237,9 @@ export const getBacktestEquityPreviews = (ids: string[], limit = 48) => {
   const query = new URLSearchParams();
   query.set("ids", ids.join(","));
   query.set("limit", String(Math.max(1, Math.min(100, limit))));
-  return fetchJSON<Record<string, number[]>>(`/backtests/equity-preview/batch?${query.toString()}`);
+  return fetchJSON<Record<string, number[]>>(
+    `/backtests/equity-preview/batch?${query.toString()}`,
+  );
 };
 export const getBacktestInfo = (id: string) =>
   fetchJSON<BacktestInfo>(`/backtest/${id}/info`);
@@ -214,10 +250,15 @@ export const getBacktestTrades = (
   params?: { offset?: number; limit?: number },
 ) => {
   const query = new URLSearchParams();
-  if (params?.offset != null) query.set("offset", String(Math.max(0, Math.trunc(params.offset))));
-  if (params?.limit != null) query.set("limit", String(Math.max(1, Math.min(100, Math.trunc(params.limit)))));
+  if (params?.offset != null)
+    query.set("offset", String(Math.max(0, Math.trunc(params.offset))));
+  if (params?.limit != null)
+    query.set(
+      "limit",
+      String(Math.max(1, Math.min(100, Math.trunc(params.limit)))),
+    );
   const queryString = query.toString();
-  return fetchJSON<Trade[]>(`/backtest/${id}/trades${queryString ? `?${queryString}` : ""}`);
+  return fetchJSON<Trade[]>(withQuery(`/backtest/${id}/trades`, queryString));
 };
 export const getBacktestTrade = (id: string, nr: number) =>
   fetchJSON<TradeChartResponse>(`/backtest/${id}/trade/${nr}`);
@@ -236,13 +277,15 @@ export const getBacktestEquity = (
     query.set("sampling", params.sampling);
   }
   const queryString = query.toString();
-  return fetchJSON<any>(`/backtest/${id}/equity${queryString ? `?${queryString}` : ""}`);
+  return fetchJSON<any>(withQuery(`/backtest/${id}/equity`, queryString));
 };
 export const getBacktestCapm = (id: string, benchmark?: string) => {
   const params = new URLSearchParams();
   if (benchmark) params.set("benchmark", benchmark);
   const query = params.toString();
-  return fetchJSON<BacktestCapmResponse>(`/backtest/${id}/capm${query ? `?${query}` : ""}`);
+  return fetchJSON<BacktestCapmResponse>(
+    withQuery(`/backtest/${id}/capm`, query),
+  );
 };
 export const getBacktestOHLCV = (id: string) =>
   fetchJSON<any>(`/backtest/${id}/ohlcv`);
@@ -252,12 +295,17 @@ export const renameBacktest = (id: string, title: string) =>
     body: JSON.stringify({ name: title }),
   });
 export const compareBacktests = (ids: string[]) =>
-  fetchJSON<BacktestsCompareResponse>(`/backtests/compare?ids=${ids.join(",")}`);
+  fetchJSON<BacktestsCompareResponse>(
+    `/backtests/compare?ids=${ids.join(",")}`,
+  );
 export const getBacktestDuplicates = () =>
   fetchJSON<BacktestsDuplicatesResponse>("/backtests/duplicates");
-export const getBacktestMatrix = () => fetchJSON<BacktestMatrixSummary>("/backtests/matrix/summary");
-export const getBacktestMatrixMatrixCsvUrl = () => "/api/backtests/matrix/matrix.csv";
-export const getBacktestMatrixDailyEquityCsvUrl = () => "/api/backtests/matrix/daily-equity.csv";
+export const getBacktestMatrix = () =>
+  fetchJSON<BacktestMatrixSummary>("/backtests/matrix/summary");
+export const getBacktestMatrixMatrixCsvUrl = () =>
+  "/api/backtests/matrix/matrix.csv";
+export const getBacktestMatrixDailyEquityCsvUrl = () =>
+  "/api/backtests/matrix/daily-equity.csv";
 export const getMatrixGrid = (strategyId = "all", tradesLimit = 3) =>
   fetchJSON<MatrixGridOverview>(
     `/grid/${encodeURIComponent(strategyId)}?trades_limit=${Math.max(0, Math.min(20, Math.trunc(tradesLimit)))}`,
@@ -271,9 +319,12 @@ export const removeEmptyBacktests = () =>
     method: "POST",
   });
 export const deleteBacktest = (id: string) =>
-  fetchJSON<{ id: string; status: string }>(`/backtests/${encodeURIComponent(id)}`, {
-    method: "DELETE",
-  });
+  fetchJSON<{ id: string; status: string }>(
+    `/backtests/${encodeURIComponent(id)}`,
+    {
+      method: "DELETE",
+    },
+  );
 export const deleteBacktestsBulk = (ids: string[]) =>
   fetchJSON<BacktestsBulkDeleteResponse>("/backtests/delete-bulk", {
     method: "POST",
@@ -291,18 +342,26 @@ export const getLiveStats = async (accountId: string) => {
       endpoint: "/api/live/stats/{account_id}",
     });
   }
-  return fetchJSON<LiveAccountStats>(`/live/stats/${encodeURIComponent(accountId)}`);
+  return fetchJSON<LiveAccountStats>(
+    `/live/stats/${encodeURIComponent(accountId)}`,
+  );
 };
 export const getLiveBalances = (accountId: string) =>
-  fetchJSON<LiveBalancesResponse>(`/live/balances/${encodeURIComponent(accountId)}`);
+  fetchJSON<LiveBalancesResponse>(
+    `/live/balances/${encodeURIComponent(accountId)}`,
+  );
 export const getLiveTrades = (accountId: string) =>
-  fetchJSON<LiveTradesResponse>(`/live/trades/${encodeURIComponent(accountId)}`);
+  fetchJSON<LiveTradesResponse>(
+    `/live/trades/${encodeURIComponent(accountId)}`,
+  );
 export const getLiveDashboard = () =>
   fetchJSON<LiveDashboardResponse>("/live/dashboard");
 export const getLiveQuote = (symbol: string) =>
   fetchJSON<LiveQuoteResponse>(`/live/quotes/${encodeURIComponent(symbol)}`);
 export const getLivePositions = (accountId: string) =>
-  fetchJSON<LivePositionsResponse>(`/live/positions/${encodeURIComponent(accountId)}`);
+  fetchJSON<LivePositionsResponse>(
+    `/live/positions/${encodeURIComponent(accountId)}`,
+  );
 export const getLiveSignalLog = (accountId: string, limit = 200) => {
   const params = new URLSearchParams();
   if (Number.isFinite(limit)) {
@@ -310,7 +369,7 @@ export const getLiveSignalLog = (accountId: string, limit = 200) => {
   }
   const query = params.toString();
   return fetchJSON<LiveSignalLogResponse>(
-    `/live/signals/${encodeURIComponent(accountId)}${query ? `?${query}` : ""}`,
+    withQuery(`/live/signals/${encodeURIComponent(accountId)}`, query),
   );
 };
 export const getSignalProcessors = () =>
@@ -320,11 +379,17 @@ export const createLiveDeployment = (payload: LiveDeploymentCreateRequest) =>
     method: "POST",
     body: JSON.stringify(payload),
   });
-export const updateLiveDeploymentStatus = (deploymentId: string, status: LiveDeploymentStatus) =>
-  fetchJSON<LiveDeploymentConfig>(`/live/deployments/${encodeURIComponent(deploymentId)}/status`, {
-    method: "PUT",
-    body: JSON.stringify({ status }),
-  });
+export const updateLiveDeploymentStatus = (
+  deploymentId: string,
+  status: LiveDeploymentStatus,
+) =>
+  fetchJSON<LiveDeploymentConfig>(
+    `/live/deployments/${encodeURIComponent(deploymentId)}/status`,
+    {
+      method: "PUT",
+      body: JSON.stringify({ status }),
+    },
+  );
 export const deleteLiveDeployment = (deploymentId: string) =>
   fetchJSON<{ status: string; id: string }>(
     `/live/deployments/${encodeURIComponent(deploymentId)}`,
@@ -336,7 +401,7 @@ export const getServices = (type?: ServiceType) => {
   const params = new URLSearchParams();
   if (type) params.set("type", type);
   const query = params.toString();
-  return fetchJSON<Service[]>(`/services${query ? `?${query}` : ""}`);
+  return fetchJSON<Service[]>(withQuery(`/services`, query));
 };
 export const getService = (serviceId: string) =>
   fetchJSON<Service>(`/services/${encodeURIComponent(serviceId)}`);
@@ -356,9 +421,12 @@ export const updateServiceStatus = (serviceId: string, status: ServiceStatus) =>
     body: JSON.stringify({ status }),
   });
 export const deleteService = (serviceId: string) =>
-  fetchJSON<{ status: string; id: string }>(`/services/${encodeURIComponent(serviceId)}`, {
-    method: "DELETE",
-  });
+  fetchJSON<{ status: string; id: string }>(
+    `/services/${encodeURIComponent(serviceId)}`,
+    {
+      method: "DELETE",
+    },
+  );
 export const getServiceLogs = (
   serviceId: string,
   lines?: number,
@@ -371,7 +439,7 @@ export const getServiceLogs = (
   if (search) params.set("search", search);
   const query = params.toString();
   return fetchJSON<LogContent>(
-    `/services/${encodeURIComponent(serviceId)}/logs${query ? `?${query}` : ""}`,
+    withQuery(`/services/${encodeURIComponent(serviceId)}/logs`, query),
   );
 };
 
@@ -389,7 +457,7 @@ export const getVerificationEvidence = (params?: {
   if (params?.limit != null) query.set("limit", String(params.limit));
   const queryString = query.toString();
   return fetchJSON<VerificationEvidenceRecord[]>(
-    `/verification/evidence${queryString ? `?${queryString}` : ""}`,
+    withQuery(`/verification/evidence`, queryString),
   );
 };
 
@@ -404,11 +472,13 @@ export const getVerificationEvidenceSummary = (params?: {
   if (params?.limit != null) query.set("limit", String(params.limit));
   const queryString = query.toString();
   return fetchJSON<VerificationEvidenceSummary[]>(
-    `/verification/evidence/summary${queryString ? `?${queryString}` : ""}`,
+    withQuery(`/verification/evidence/summary`, queryString),
   );
 };
 
-export const createVerificationEvidence = (payload: VerificationEvidenceCreateRequest) =>
+export const createVerificationEvidence = (
+  payload: VerificationEvidenceCreateRequest,
+) =>
   fetchJSON<VerificationEvidenceRecord>("/verification/evidence", {
     method: "POST",
     body: JSON.stringify(payload),
@@ -451,16 +521,20 @@ export const getPortfolios = (params?: PortfoliosQueryParams) => {
   if (params?.sort) query.set("sort", params.sort);
   if (params?.order) query.set("order", params.order);
   const queryString = query.toString();
-  return fetchJSON<PortfolioSummary[]>(`/portfolios${queryString ? `?${queryString}` : ""}`);
+  return fetchJSON<PortfolioSummary[]>(withQuery(`/portfolios`, queryString));
 };
-export const getPortfolio = (id: string) => fetchJSON<PortfolioDetail>(`/portfolios/${id}`);
+export const getPortfolio = (id: string) =>
+  fetchJSON<PortfolioDetail>(`/portfolios/${id}`);
 export const getPortfolioDetail = (id: string) =>
   fetchJSON<PortfolioDetail>(`/portfolios/${id}`);
 export const renamePortfolio = (id: string, name: string) =>
-  fetchJSON<{ id: string; name: string; status: string }>(`/portfolios/${encodeURIComponent(id)}/name`, {
-    method: "PUT",
-    body: JSON.stringify({ name }),
-  });
+  fetchJSON<{ id: string; name: string; status: string }>(
+    `/portfolios/${encodeURIComponent(id)}/name`,
+    {
+      method: "PUT",
+      body: JSON.stringify({ name }),
+    },
+  );
 export const getPortfolioContributions = (
   id: string,
   groupBy: "component" | "strategy" | "symbol" | "timeframe" = "component",
@@ -478,7 +552,7 @@ export const getPortfolioTrades = (
   if (filters?.timeframe) params.set("timeframe", filters.timeframe);
   const query = params.toString();
   return fetchJSON<PortfolioDetail["trades"]>(
-    `/portfolios/${encodeURIComponent(id)}/trades${query ? `?${query}` : ""}`,
+    withQuery(`/portfolios/${encodeURIComponent(id)}/trades`, query),
   );
 };
 export const createPortfolio = (data: {
@@ -487,7 +561,12 @@ export const createPortfolio = (data: {
   components: Array<
     Pick<
       PortfolioComponent,
-      "strategy_name" | "symbol" | "timeframe" | "weight" | "risk_config" | "settings"
+      | "strategy_name"
+      | "symbol"
+      | "timeframe"
+      | "weight"
+      | "risk_config"
+      | "settings"
     > & { backtest_id?: string | null }
   >;
 }) =>
@@ -496,7 +575,9 @@ export const createPortfolio = (data: {
     body: JSON.stringify(data),
   });
 export const deletePortfolio = (id: string) =>
-  fetchJSON<{ status: string; id: string }>(`/portfolios/${id}`, { method: "DELETE" });
+  fetchJSON<{ status: string; id: string }>(`/portfolios/${id}`, {
+    method: "DELETE",
+  });
 export const deletePortfoliosBulk = (ids: string[]) =>
   fetchJSON<PortfoliosBulkDeleteResponse>("/portfolios/delete-bulk", {
     method: "POST",
@@ -513,7 +594,9 @@ export const removeEmptyPortfolios = () =>
     method: "POST",
   });
 export const comparePortfolios = (ids: string[]) =>
-  fetchJSON<{ portfolios: PortfolioDetail[] }>(`/portfolios/compare?ids=${ids.join(",")}`);
+  fetchJSON<{ portfolios: PortfolioDetail[] }>(
+    `/portfolios/compare?ids=${ids.join(",")}`,
+  );
 
 // Logs
 export const getLogs = () => fetchJSON<LogFile[]>("/logs");
@@ -561,7 +644,7 @@ export const getDukascopyGenesis = (
   if (timeframes?.length) params.set("timeframes", timeframes.join(","));
   const query = params.toString();
   return fetchJSON<DukascopyGenesisResponse>(
-    `/data/dukascopy/genesis${query ? `?${query}` : ""}`,
+    withQuery(`/data/dukascopy/genesis`, query),
   );
 };
 export const downloadData = (data: DataDownloadRequest) =>
@@ -599,7 +682,8 @@ export const startAgentConvert = (data: AgentConvertRequest) =>
     body: JSON.stringify(data),
   });
 export const listTasks = () => fetchJSON<DataTaskListResponse>("/tasks");
-export const listDataTasks = () => fetchJSON<DataTaskListResponse>("/data/tasks");
+export const listDataTasks = () =>
+  fetchJSON<DataTaskListResponse>("/data/tasks");
 export const getDataTask = (taskId: string) =>
   fetchJSON<DataTaskStatusResponse>(`/data/tasks/${taskId}`);
 export const getDataTaskLogs = (taskId: string) =>
@@ -635,7 +719,7 @@ export const invalidateDataCache = (
   }
   const query = params.toString();
   return fetchJSON<DataCacheInvalidationResponse>(
-    `/data/cache/invalidate${query ? `?${query}` : ""}`,
+    withQuery(`/data/cache/invalidate`, query),
     { method: "POST" },
   );
 };
