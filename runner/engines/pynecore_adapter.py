@@ -393,7 +393,13 @@ def _load_strategy_helper_namespace(strategy_path: Path, source: str) -> dict[st
 
     helper_path = strategy_path.with_name(f"{strategy_path.stem}_context.py")
     if helper_path.exists():
-        namespace.update(_compile_helper_namespace(helper_path, helper_path.read_text()))
+        namespace.update(
+            _compile_helper_namespace(
+                helper_path,
+                helper_path.read_text(),
+                strict_structure=True,
+            )
+        )
 
     source_namespace = _compile_helper_namespace(
         strategy_path,
@@ -404,11 +410,67 @@ def _load_strategy_helper_namespace(strategy_path: Path, source: str) -> dict[st
     return namespace
 
 
+HELPER_ALLOWED_IMPORT_ROOTS = frozenset(
+    {
+        "pandas",
+        "numpy",
+        "math",
+        "statistics",
+        "decimal",
+        "datetime",
+        "typing",
+        "collections",
+        "itertools",
+        "functools",
+        "dataclasses",
+    }
+)
+
+HELPER_ALLOWED_FUNCTION_NAMES = frozenset({"build_trade_context", "build_drawings"})
+
+HELPER_BANNED_CALL_NAMES = frozenset(
+    {"eval", "exec", "compile", "open", "__import__", "globals", "locals", "vars", "breakpoint"}
+)
+
+
+def _helper_import_root(node: ast.Import | ast.ImportFrom) -> str:
+    if isinstance(node, ast.Import):
+        return node.names[0].name.split(".")[0] if node.names else ""
+    return (node.module or "").split(".")[0]
+
+
+def _helper_screen_nodes(nodes: list[ast.stmt], source_path: Path) -> None:
+    """Reject helper constructs the runner process must not execute."""
+    for node in nodes:
+        for inner in ast.walk(node):
+            if isinstance(inner, (ast.Import, ast.ImportFrom)):
+                root = _helper_import_root(inner)
+                if root not in HELPER_ALLOWED_IMPORT_ROOTS:
+                    raise RuntimeError(
+                        f"Import '{root}' is not allowed in strategy helper code "
+                        f"({source_path.name}). Allowed: "
+                        + ", ".join(sorted(HELPER_ALLOWED_IMPORT_ROOTS))
+                    )
+            elif isinstance(inner, ast.Call) and isinstance(inner.func, ast.Name):
+                if inner.func.id in HELPER_BANNED_CALL_NAMES:
+                    raise RuntimeError(
+                        f"Call to '{inner.func.id}()' is not allowed in strategy "
+                        f"helper code ({source_path.name})."
+                    )
+            elif isinstance(inner, ast.Attribute):
+                if inner.attr.startswith("__") and inner.attr.endswith("__"):
+                    raise RuntimeError(
+                        f"Dunder attribute access '{inner.attr}' is not allowed in "
+                        f"strategy helper code ({source_path.name})."
+                    )
+
+
 def _compile_helper_namespace(
     source_path: Path,
     source: str,
     *,
     function_names: set[str] | None = None,
+    strict_structure: bool = False,
 ) -> dict[str, Any]:
     tree = ast.parse(source, filename=str(source_path))
     helper_nodes: list[ast.stmt] = []
@@ -418,9 +480,17 @@ def _compile_helper_namespace(
             helper_nodes.append(node)
         elif isinstance(node, ast.FunctionDef) and node.name in allowed_names:
             helper_nodes.append(node)
+        elif strict_structure:
+            raise RuntimeError(
+                f"Only imports and helper functions ({', '.join(sorted(allowed_names))}) "
+                f"are allowed in strategy helper code ({source_path.name}); found "
+                f"{type(node).__name__} at line {getattr(node, 'lineno', 0)}."
+            )
 
     if not helper_nodes:
         return {}
+
+    _helper_screen_nodes(helper_nodes, source_path)
 
     helper_module = ast.Module(body=helper_nodes, type_ignores=[])
     ast.fix_missing_locations(helper_module)

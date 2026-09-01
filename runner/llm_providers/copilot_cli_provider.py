@@ -6,6 +6,11 @@ import subprocess
 import time
 from typing import Any
 
+# The full prompt is piped via stdin (`-p -`) instead of being passed as a
+# single argv element: prompts here routinely exceed platform argv limits
+# (Windows ~32k chars) and would otherwise be readable process-wide via `ps`.
+PROMPT_VIA_STDIN = True
+
 
 def _extract_content(payload: Any) -> str:
     if isinstance(payload, str):
@@ -62,7 +67,7 @@ class CopilotCLIProvider:
                 f"{user_prompt}"
             )
 
-        command = [self._executable, "-p", composed_prompt, "--output-format", self._output_format]
+        command = [self._executable, "-p", "-", "--output-format", self._output_format]
         selected_model = str(model or "").strip()
         _apply_metadata(
             metadata,
@@ -76,6 +81,7 @@ class CopilotCLIProvider:
         try:
             completed = subprocess.run(
                 command,
+                input=composed_prompt,
                 capture_output=True,
                 text=True,
                 check=False,

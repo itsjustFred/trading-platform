@@ -88,6 +88,17 @@ Execution and conversion layer.
     `execution_model.py` (fill/trigger assumptions recorded per trade),
     `orders.py` (Order/Position dataclasses), `result.py`
     (indicator presentation + `BacktestResult` assembly)
+  - refuses to overwrite an existing strategy slug
+  - removes the generated module when validation fails, so no broken file stays registry-runnable
+  - validation runs with an allowlisted child environment (no API keys) and a wall-clock timeout
+- `runner/codegen_safety.py`
+  - static screening of LLM-generated strategy code before it is written or executed
+  - denies process spawning, dynamic execution, network egress, untrusted deserialization, and reflection escape hatches
+- `runner/approval_gate.py`
+  - human review gate for generated strategy code (Decision Record 2026-08-31)
+  - approvals live beside the code as `<file>.approved.json` and are bound to the file's SHA256 hash
+  - any change to the file after approval invalidates the approval
+  - REST surface: `GET /api/strategies/{file}/approval` and `POST /api/strategies/{file}/approve`
 - `runner/engines/`
   - `vectorbt_adapter.py`: fast vectorized backtests (per-symbol processing in
     `_process_symbol`, per-trade sizing in `_size_trade`; drawing and
@@ -188,7 +199,22 @@ Conventions:
 - the main Python file is `<slug>.py`
 - optional documentation lives in `README.md`
 - helper context files stay beside the main module
+- helper context files may only contain imports (pandas, numpy, math, statistics, decimal, datetime, typing, collections, itertools, functools, dataclasses) plus `build_trade_context` / `build_drawings` functions — they are compiled in the runner process
 - backtests usually store the slug in `meta.strategies`
+
+### LLM-generated strategies (trust boundary)
+
+Strategy code produced by the auto-conversion agent is untrusted until a human
+has reviewed it:
+
+1. the generated module is statically screened (`runner/codegen_safety.py`);
+   unscreenable or banned code never reaches disk,
+2. the module is written without an approval file, so it is never runnable
+   through the normal backtest path,
+3. `POST /api/strategies/{file}/approve` records a SHA256-bound approval after
+   human review, and
+4. only then can the strategy run; if the file changes afterwards, the
+   approval is void and the gate refuses execution.
 
 ## Metrics and chart semantics
 

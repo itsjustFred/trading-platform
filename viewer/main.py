@@ -6682,6 +6682,57 @@ async def list_signal_processors() -> list[dict[str, str]]:
     return await asyncio.to_thread(list_signal_processor_options)
 
 
+def _codegen_gate_strategy_path(relative_file: str) -> Path:
+    """Resolve a strategy relative file inside the strategies dir (traversal-safe)."""
+    normalized = str(relative_file or "").strip()
+    if not normalized or ".." in normalized or normalized.startswith("/"):
+        raise HTTPException(status_code=400, detail="Invalid strategy file path")
+    candidate = (STRATEGIES_DIR / normalized).resolve()
+    try:
+        candidate.relative_to(STRATEGIES_DIR.resolve())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid strategy file path") from exc
+    return candidate
+
+
+@app.get("/api/strategies/{relative_file:path}/approval", response_model=dict[str, Any])
+async def get_strategy_approval(relative_file: str) -> dict[str, Any]:
+    """Report whether a strategy file's current content is covered by a human approval."""
+    from runner.approval_gate import is_strategy_approved
+
+    path = _codegen_gate_strategy_path(relative_file)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail=f"Strategy '{relative_file}' not found")
+    approved = await asyncio.to_thread(
+        is_strategy_approved, path, strategies_root=STRATEGIES_DIR
+    )
+    return {"approved": approved}
+
+
+@app.post("/api/strategies/{relative_file:path}/approve", response_model=dict[str, Any])
+async def approve_strategy(relative_file: str) -> dict[str, Any]:
+    """Record a SHA256-bound human approval for a generated strategy file."""
+    from runner.approval_gate import approve_strategy as record_approval
+
+    path = _codegen_gate_strategy_path(relative_file)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail=f"Strategy '{relative_file}' not found")
+    try:
+        record = await asyncio.to_thread(
+            record_approval, path, approved_by="human", strategies_root=STRATEGIES_DIR
+        )
+    except OSError as exc:
+        logger.exception("Failed to approve strategy %s: %s", relative_file, exc)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return {
+        "approved": True,
+        "file": record["file"],
+        "sha256": record["sha256"],
+        "approved_by": record["approved_by"],
+        "approved_at": record["approved_at"],
+    }
+
+
 @app.get("/api/strategies/{name:path}", response_model=dict[str, Any])
 async def get_strategy(name: str) -> dict[str, Any]:
     entry = _safe_strategy_entry(name)
@@ -11290,3 +11341,6 @@ async def task_log_socket(websocket: WebSocket, job_id: str) -> None:
             await asyncio.sleep(0.5)
     except WebSocketDisconnect:
         return
+
+
+
