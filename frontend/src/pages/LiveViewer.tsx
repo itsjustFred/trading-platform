@@ -450,15 +450,16 @@ export function LiveViewerPage() {
             signals={selectedSignals}
             trades={selectedTrades}
           />
-          {quoteError ? (
+          {quoteError && (
             <div style={{ marginTop: "8px", color: "#fca5a5", fontSize: "0.76rem" }}>
               {(quoteError as Error).message || "No live quote bars available"}
             </div>
-          ) : quoteFetching ? (
+          )}
+          {!quoteError && quoteFetching && (
             <div style={{ marginTop: "8px", color: "var(--color-text-muted)", fontSize: "0.76rem" }}>
               Refreshing chart...
             </div>
-          ) : null}
+          )}
         </div>
 
         <div
@@ -563,12 +564,12 @@ function LiveCandlestickChart({
   bars,
   signals,
   trades,
-}: {
+}: Readonly<{
   symbol: string;
   bars: LiveQuoteBar[];
   signals: LiveSignalLog[];
   trades: ViewerTrade[];
-}) {
+}>) {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const candleSeriesRef = useRef<ISeriesApi<"Candlestick", Time> | null>(null);
@@ -812,7 +813,32 @@ function LiveCandlestickChart({
   );
 }
 
-function SignalLogTable({ signals, loading }: { signals: LiveSignalLog[]; loading: boolean }) {
+/** Shared tone color for viewer status chips. */
+function viewerToneColor(tone: "neutral" | "positive" | "negative" | undefined): string {
+  if (tone === "positive") {
+    return "#86efac";
+  }
+  if (tone === "negative") {
+    return "#fecaca";
+  }
+  return "#dbeafe";
+}
+
+/** Renders an unknown metadata cell without `[object Object]`. */
+function stringifyViewerCell(value: unknown): string {
+  if (typeof value === "string") {
+    return value;
+  }
+  if (value == null) {
+    return "";
+  }
+  return JSON.stringify(value) ?? "";
+}
+
+function SignalLogTable({
+  signals,
+  loading,
+}: Readonly<{ signals: LiveSignalLog[]; loading: boolean }>) {
   return (
     <div style={{ maxHeight: "350px", overflowY: "auto", border: "1px solid var(--color-border)", borderRadius: "10px" }}>
       <table style={tableStyle}>
@@ -843,7 +869,9 @@ function SignalLogTable({ signals, loading }: { signals: LiveSignalLog[]; loadin
               </td>
               <td style={tdStyleMessage}>
                 {signal.raw_message ||
-                  String(signal.signal_metadata?.discord_content || signal.signal_metadata?.source || "—")}
+                  stringifyViewerCell(
+                    signal.signal_metadata?.discord_content ?? signal.signal_metadata?.source,
+                  ) || "—"}
               </td>
             </tr>
           ))}
@@ -869,7 +897,7 @@ const HeaderStatCard = memo(function HeaderStatCard({
   subtitle?: string;
   tone?: "neutral" | "positive" | "negative";
 }) {
-  const toneColor = tone === "positive" ? "#86efac" : tone === "negative" ? "#fecaca" : "#dbeafe";
+  const toneColor = viewerToneColor(tone);
   return (
     <div
       style={{
@@ -911,7 +939,7 @@ const MiniMetric = memo(function MiniMetric({
       <span
         style={{
           fontSize: "0.82rem",
-          color: tone === "positive" ? "#86efac" : tone === "negative" ? "#fecaca" : "#dbeafe",
+          color: viewerToneColor(tone),
           fontWeight: 600,
         }}
       >
@@ -948,10 +976,8 @@ function toTradeHistoryRows(rows: LiveTradeSlippage[]): ViewerTrade[] {
     const entry = asFinite(row.theoretical_price, 0);
     const exit = Number.isFinite(row.actual_price) ? asFinite(row.actual_price, 0) : null;
     const side = String(row.action || "").toLowerCase() === "sell" ? "SELL" : "BUY";
-    const pnl =
-      exit == null
-        ? null
-        : (exit - entry) * asFinite(row.filled_qty, 0) * (side === "BUY" ? 1 : -1);
+    const sideFactor = side === "BUY" ? 1 : -1;
+    const pnl = exit == null ? null : (exit - entry) * asFinite(row.filled_qty, 0) * sideFactor;
     return {
       id: `${row.execution_id || row.signal_id}`,
       symbol: row.symbol,
@@ -960,7 +986,7 @@ function toTradeHistoryRows(rows: LiveTradeSlippage[]): ViewerTrade[] {
       entry,
       exit,
       pnl,
-      exitReason: row.exit_reason || String(row.signal_metadata?.exit_reason || ""),
+      exitReason: row.exit_reason || stringifyViewerCell(row.signal_metadata?.exit_reason),
       time: row.execution_timestamp || row.signal_timestamp,
       signalTimeUnix: asFinite(row.signal_time, 0),
     };
@@ -988,7 +1014,7 @@ function uniqueSymbols(
   for (const signal of signals) {
     if (signal.symbol.trim()) values.add(signal.symbol.trim().toUpperCase());
   }
-  return [...values].sort();
+  return [...values].sort((a, b) => a.localeCompare(b));
 }
 
 function positionCardStyle(position: LivePosition, selectedSymbol: string): React.CSSProperties {
