@@ -959,16 +959,17 @@ def _contained_client_data_file(
 ) -> Path | None:
     """Validate a client-supplied data file path for reading or subprocess use.
 
-    The resolved path must stay inside the OHLCV data tree
-    (``DATA_DIR / "ohlcv"``) and must carry the expected suffix, so requests
-    can neither read arbitrary files nor point a subprocess at code outside
-    the data directory. ``base_dir`` widens the tree for callers that manage
-    non-OHLCV files.
+    The resolved path must stay inside the client data tree (``DATA_DIR`` by
+    default — signal CSVs live under ``DATA_DIR / "signals"`` and OHLCV
+    parquet under ``DATA_DIR / "ohlcv"``) and must carry the expected suffix,
+    so requests can neither read arbitrary files nor point a subprocess at
+    code outside the data directory. ``base_dir`` narrows the tree for
+    callers that manage a single subtree.
     """
     normalized = str(raw_path or "").strip()
     if not normalized:
         return None
-    base = (base_dir or DATA_DIR / "ohlcv").resolve()
+    base = (base_dir or DATA_DIR).resolve()
     try:
         candidate = Path(normalized).expanduser().resolve()
     except (OSError, ValueError):

@@ -310,7 +310,7 @@ def test_signal_replay_accepts_csv_inside_data_dir(
 ):
     import viewer.main as viewer_app_module
 
-    csv_path = tmp_path / "ohlcv" / "signals" / "signals_demo.csv"
+    csv_path = tmp_path / "signals" / "signals_demo.csv"
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     csv_path.write_text(
         "Symbol;Signal Price;Datum;Zeit (NY);Signal Type\n"
@@ -484,9 +484,9 @@ def test_contained_client_data_file_rejects_escape_via_dotdot(
     import viewer.main as viewer_app_module
 
     monkeypatch.setattr(viewer_app_module, "DATA_DIR", tmp_path)
-    data_root = tmp_path / "ohlcv"
+    data_root = tmp_path / "signals"
     data_root.mkdir(parents=True, exist_ok=True)
-    outside = tmp_path / "outside.csv"
+    outside = Path(tempfile.mkdtemp()) / "outside.csv"
     outside.write_text("x", encoding="utf-8")
 
     (data_root / "sub").mkdir(parents=True, exist_ok=True)
@@ -499,8 +499,8 @@ def test_contained_client_data_file_rejects_escape_via_dotdot(
 
     for raw in (
         str(outside),
-        f"{data_root}/sub/../../outside.csv",
-        f"{data_root}/sub/file.csv/../../../outside.csv",
+        str(data_root / "sub" / ".." / ".." / ".." / "outside.csv"),
+        str(data_root / "sub" / "file.csv" / ".." / ".." / ".." / ".." / "outside.csv"),
         str(data_root / "sub" / "file.parquet"),
         "",
         None,
@@ -556,3 +556,42 @@ def test_strategy_path_resolves_only_regular_files_inside_strategies_dir(
     assert legacy_module._strategy_path("   ") is None
     # missing identifier must not resolve
     assert legacy_module._strategy_path("missing.py") is None
+
+
+def test_contained_client_data_file_accepts_signals_dir_and_widened_trees(
+    monkeypatch, tmp_path
+):
+    """The default containment base is the whole DATA_DIR: production keeps
+    signal CSVs under DATA_DIR / "signals" (server_planning/01_current_state.md,
+    frontend placeholder /home/ubuntu/data/signals/...), which is NOT inside
+    DATA_DIR / "ohlcv". Callers that manage a single subtree narrow via
+    base_dir — the resample and symbol-delete seams do exactly that.
+    """
+    import viewer.main as viewer_app_module
+
+    monkeypatch.setattr(viewer_app_module, "DATA_DIR", tmp_path)
+    signals_csv = tmp_path / "signals" / "signals_demo.csv"
+    signals_csv.parent.mkdir(parents=True, exist_ok=True)
+    signals_csv.write_text("Symbol;Action\nAAPL;buy\n", encoding="utf-8")
+    outside = tmp_path.parent / "outside.csv"
+    outside.write_text("x", encoding="utf-8")
+
+    # Default base: the whole DATA_DIR tree, so the signals directory works.
+    assert viewer_app_module._contained_client_data_file(
+        str(signals_csv), allowed_suffix=".csv"
+    ) == signals_csv.resolve()
+    # Narrowed base (resample / symbol-delete seam): ohlcv only.
+    assert (
+        viewer_app_module._contained_client_data_file(
+            str(signals_csv), allowed_suffix=".csv", base_dir=tmp_path / "ohlcv"
+        )
+        is None
+    )
+    # Anything outside DATA_DIR is still rejected under the default base.
+    assert (
+        viewer_app_module._contained_client_data_file(
+            str(outside), allowed_suffix=".csv"
+        )
+        is None
+    )
+    assert outside.exists()
