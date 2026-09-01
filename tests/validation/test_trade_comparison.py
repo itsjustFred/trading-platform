@@ -259,17 +259,20 @@ class TestPnL:
         assert not result.is_match
         assert "pnl" in result.mismatches
 
-    def test_pnl_outside_abs_tolerance_only(self):
-        # ref=100000, act=100000.1: pct diff ~0.000001 (0.0001%), abs diff=0.1
-        # With OR logic: pct diff passes (0.0001% <= 0.1%)
+    def test_pnl_drift_inside_rel_band_but_outside_abs_band(self):
+        # ref=100000, act=100000.1: rel diff 1e-6 (inside 0.001), abs diff 0.1
+        # (outside the 0.01 abs band). DV-B35: both bands must hold, so this
+        # fails - loosen the abs band explicitly when drift of this size is
+        # acceptable.
         ref = _make_trade(pnl=100000.0)
         act = _make_trade(pnl=100000.1)
         result = TradeComparator().compare(_make_matched(ref, act))
-        # pct diff is 0.000001 (0.0001%), inside 0.1%
-        # abs diff is 0.1, outside 0.01
-        # With OR logic: passes because pct is within tolerance
-        _assert_field_passed(result, "pnl")
-        assert result.is_match
+        _assert_field_failed(result, "pnl")
+        assert not result.is_match
+
+        config = TradeComparisonConfig(pnl_abs=1.0)
+        loosened = TradeComparator(config).compare(_make_matched(ref, act))
+        _assert_field_passed(loosened, "pnl")
 
     def test_zero_pnl_exact_match(self):
         ref = _make_trade(pnl=0.0)
@@ -279,16 +282,13 @@ class TestPnL:
         assert result.is_match
 
     def test_zero_vs_nonzero_pnl_mismatch(self):
-        # ref=0, act=0.001: pct diff=1.0 (100%), abs diff=0.001
-        # With OR logic: abs diff 0.001 <= 0.01 passes
+        # ref=0, act=0.001: pct diff=1.0 (100%), abs diff=0.001.
+        # DV-B35: a completely wrong PnL is not rescued by the abs band.
         ref = _make_trade(pnl=0.0)
         act = _make_trade(pnl=0.001)
         result = TradeComparator().compare(_make_matched(ref, act))
-        # pct diff is 1.0 (100%), outside 0.1%
-        # abs diff is 0.001, inside 0.01
-        # With OR logic: passes because abs is within tolerance
-        _assert_field_passed(result, "pnl")
-        assert result.is_match
+        _assert_field_failed(result, "pnl")
+        assert not result.is_match
 
 
 class TestStopLoss:
@@ -393,7 +393,7 @@ class TestConfigCustomization:
         ref = _make_trade(pnl=100.0)
         act = _make_trade(pnl=100.2)
         default = TradeComparator().compare(_make_matched(ref, act))
-        # default abs tol 0.01, diff 0.2 -> fail
+        # default abs tol 0.01, diff 0.2 -> fail (both bands must hold)
         assert not default.is_match
 
         config = TradeComparisonConfig(pnl_pct=0.01, pnl_abs=1.0)
@@ -415,3 +415,37 @@ class TestStructure:
         act = _make_trade(direction="SHORT", entry_price=1.1000)
         result = TradeComparator().compare(_make_matched(ref, act))
         assert result.mismatches == ["direction"]
+
+
+class TestPnLAndGate:
+    """DV-B35: the PnL gate must require both tolerances to hold (AND)."""
+
+    def test_zero_vs_tiny_pnl_fails_under_default_bands(self):
+        # abs diff 0.001 <= 0.01 but relative diff is 1.0 (one side exactly 0)
+        ref = _make_trade(pnl=0.0)
+        act = _make_trade(pnl=0.001)
+        result = TradeComparator().compare(_make_matched(ref, act))
+        _assert_field_failed(result, "pnl")
+        assert not result.is_match
+
+    def test_large_pnl_drift_inside_abs_band_fails(self):
+        # abs diff 5.0 <= 10.0 abs band, but rel diff ~10% > 0.001
+        config = TradeComparisonConfig(pnl_abs=10.0)
+        ref = _make_trade(pnl=50.0)
+        act = _make_trade(pnl=55.0)
+        result = TradeComparator(config).compare(_make_matched(ref, act))
+        _assert_field_failed(result, "pnl")
+
+    def test_both_bands_satisfied_passes(self):
+        config = TradeComparisonConfig(pnl_pct=0.01, pnl_abs=1.0)
+        ref = _make_trade(pnl=100.0)
+        act = _make_trade(pnl=100.2)
+        result = TradeComparator(config).compare(_make_matched(ref, act))
+        _assert_field_passed(result, "pnl")
+        assert result.is_match
+
+    def test_zero_pnl_exact_match_still_passes(self):
+        ref = _make_trade(pnl=0.0)
+        act = _make_trade(pnl=0.0)
+        result = TradeComparator().compare(_make_matched(ref, act))
+        _assert_field_passed(result, "pnl")
