@@ -69,7 +69,8 @@ def test_load_benchmark_daily_df_resamples_intraday_fallback_for_1d():
         df, resolved = _load_benchmark_daily_df("SPY", "1d")
 
     assert resolved == "1d"
-    assert df is not None and len(df) == 2
+    assert df is not None
+    assert len(df) == 2
 
 
 def test_load_benchmark_daily_df_returns_direct_hit_without_resampling():
@@ -82,7 +83,8 @@ def test_load_benchmark_daily_df_returns_direct_hit_without_resampling():
         df, resolved = _load_benchmark_daily_df("SPY", "1d")
 
     assert resolved == "1d"
-    assert df is not None and len(df) == 2
+    assert df is not None
+    assert len(df) == 2
 
 
 def test_load_benchmark_daily_df_returns_none_when_no_timeframe_has_data():

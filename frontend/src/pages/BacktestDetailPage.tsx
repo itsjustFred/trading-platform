@@ -231,12 +231,14 @@ export function BacktestDetailPage() {
       : trades.reduce((sum, trade) => sum + (trade.pnl || 0), 0);
   // Fallback only when the stats payload omits the average: net profit over
   // the reported trade count, else 0 when neither is usable.
-  const avgPnlFromStats =
-    typeof stats?.avg_trade_pnl === "number"
-      ? stats.avg_trade_pnl
-      : typeof stats?.total_trades === "number" && stats.total_trades > 0
-        ? totalPnlFromStats / stats.total_trades
-        : 0;
+  const canDeriveAvgPnl =
+    typeof stats?.total_trades === "number" && stats.total_trades > 0;
+  let avgPnlFromStats = 0;
+  if (typeof stats?.avg_trade_pnl === "number") {
+    avgPnlFromStats = stats.avg_trade_pnl;
+  } else if (canDeriveAvgPnl) {
+    avgPnlFromStats = totalPnlFromStats / (stats?.total_trades as number);
+  }
   const wholeBacktestStats = {
     totalPnl: totalPnlFromStats,
     totalTrades: totalTradesFromStats,
