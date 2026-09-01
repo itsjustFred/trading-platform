@@ -11,6 +11,7 @@ Usage:
 from __future__ import annotations
 
 import logging
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -153,7 +154,10 @@ class Downloader(ABC):
 
         If the file exists, it is loaded and merged with incoming rows.
         Duplicate timestamps are removed (keeping newest row), data is sorted,
-        and the target parquet is overwritten.
+        and the target parquet is replaced atomically: the merged frame is
+        written to a temporary file in the same directory and moved into place
+        with :func:`os.replace`, so a crash mid-write can never truncate or
+        corrupt the previously stored canonical data.
         """
         normalized_new = self._normalize_timestamps(new_data)
 
@@ -176,15 +180,31 @@ class Downloader(ABC):
         else:
             combined = combined.drop_duplicates().reset_index(drop=True)
 
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = output_path.with_name(f"{output_path.name}.tmp-{os.getpid()}")
         try:
-            combined.to_parquet(output_path, index=False)
-        except (OSError, ValueError) as exc:
-            raise RuntimeError(f"Could not write parquet '{output_path}': {exc}") from exc
+            try:
+                combined.to_parquet(temp_path, index=False)
+            except (OSError, ValueError) as exc:
+                raise RuntimeError(f"Could not write parquet '{output_path}': {exc}") from exc
+            os.replace(temp_path, output_path)
+        except BaseException:
+            temp_path.unlink(missing_ok=True)
+            raise
 
         return combined
 
     def _read_latest_timestamp(self, output_path: Path) -> pd.Timestamp | None:
-        """Read max timestamp from an existing parquet without loading full OHLCV payload."""
+        """Read max timestamp from an existing parquet without loading full OHLCV payload.
+
+        Row-group max statistics are only a *lower bound* for the newest stored
+        timestamp: writers may disable statistics, drop them per row group, or
+        (for a file that was appended out of order) report a max below the
+        actual newest row. The statistics are therefore used as a fast path and
+        are always cross-checked against the last row of the final row group;
+        whichever value is newer wins, so resume can never rewind to a stale
+        point and re-download data that is already stored.
+        """
         if not output_path.exists():
             return None
 
@@ -204,23 +224,29 @@ class Downloader(ABC):
 
         column_index = columns.index(timestamp_column)
 
+        stats_latest: pd.Timestamp | None = None
         for row_group_index in range(metadata.num_row_groups - 1, -1, -1):
             stats = metadata.row_group(row_group_index).column(column_index).statistics
             if stats is None or not getattr(stats, "has_min_max", False):
                 continue
             latest = pd.to_datetime(stats.max, utc=True, errors="coerce")
             if not pd.isna(latest):
-                return pd.Timestamp(latest)
+                stats_latest = pd.Timestamp(latest)
+                break
 
         row_group = parquet_file.read_row_group(metadata.num_row_groups - 1, columns=[timestamp_column])
         if row_group.num_rows == 0:
-            return None
+            return stats_latest
 
         latest_value = row_group.column(0)[row_group.num_rows - 1].as_py()
-        latest = pd.to_datetime(latest_value, utc=True, errors="coerce")
-        if pd.isna(latest):
-            return None
-        return pd.Timestamp(latest)
+        row_latest = pd.to_datetime(latest_value, utc=True, errors="coerce")
+        if pd.isna(row_latest):
+            return stats_latest
+
+        row_latest = pd.Timestamp(row_latest)
+        if stats_latest is None or row_latest > stats_latest:
+            return row_latest
+        return stats_latest
 
     @staticmethod
     def _select_timestamp_column(columns: list[str]) -> str | None:
