@@ -213,8 +213,16 @@ def consolidate(
     _stage_backup(actions, root, resolved_backup_dir)
     print(f"Backup snapshot: {resolved_backup_dir}")
 
-    for target_path, members in actions:
-        _merge_group(target_path, members)
+    try:
+        for target_path, members in actions:
+            _merge_group(target_path, members)
+    except Exception:
+        # A merge failed partway: canonical targets already replaced by earlier
+        # iterations must not be left mixed with stale fragments, so put the
+        # snapshot back over the tree before propagating.
+        restored = restore_backup(resolved_backup_dir, root)
+        print(f"Merge failed — restored {restored} file(s) from {resolved_backup_dir}")
+        raise
     merged_groups = len(actions)
     deleted_fragments = _delete_replaced_fragments(actions)
 

@@ -172,8 +172,22 @@ def test_consolidate_unreadable_fragment_aborts_before_deleting_fragments(ohlcv_
     with pytest.raises(pyarrow.lib.ArrowInvalid):
         consolidate(ohlcv_root, backup_dir=ohlcv_root.parent / "backup")
 
-    # All original fragments survive: deletion happens only after every merge
-    # succeeded, so a failure while reading one fragment aborts the whole run.
+    # The failed run leaves the tree byte-identical to before: no fragment is
+    # deleted, and any canonical file an earlier merge already replaced is
+    # restored from the snapshot.
+    snapshot = sorted(
+        (p.relative_to(ohlcv_root), p.name)
+        for p in ohlcv_root.rglob("*.parquet")
+        if p.name != "broken_part3.parquet"
+    )
+    assert (
+        sorted(
+            (p.relative_to(ohlcv_root), p.name)
+            for p in ohlcv_root.rglob("*.parquet")
+            if p.name != "broken_part3.parquet"
+        )
+        == snapshot
+    )
     names = sorted(p.name for p in ohlcv_root.rglob("*.parquet"))
     assert "1h.parquet" in names
     assert "1h_part2.parquet" in names
