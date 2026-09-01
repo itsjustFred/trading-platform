@@ -172,3 +172,15 @@ def test_ramjet_reads_its_shipped_config_values() -> None:
     assert isinstance(processor, RamJetSignalProcessor)
     assert processor.config.get("sl_multiplier") == 2.0
     assert processor.config.get("atr_period") == 14
+
+def test_rocketfuel_rejects_sectionless_config_file(monkeypatch) -> None:
+    """A config file losing its rocket_fuel section is a config error.
+
+    Caller overrides merge INSIDE the bot section, so they cannot remove it;
+    the guard fires when the shipped file itself regresses to sectionless.
+    """
+    import signal_bots.registry as registry_module
+
+    monkeypatch.setattr(registry_module, "_load_yaml", lambda path: {})
+    with pytest.raises(ValueError, match="rocket_fuel mapping"):
+        get_signal_processor("rocketfuel", {})

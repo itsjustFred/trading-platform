@@ -116,11 +116,14 @@ def _build_nitro(config: dict[str, Any]) -> NitroSignalProcessor:
 def _build_rocketfuel(variant: str, config: dict[str, Any]) -> RocketFuelSignalProcessor:
     def _factory(merged: dict[str, Any]) -> RocketFuelSignalProcessor:
         # Shipped configs always carry a `rocket_fuel:` section (pinned by
-        # test_shipped_config_files_have_a_single_bot_section). A missing one
-        # is a malformed file, not a layout to accommodate: leave the payload
-        # untouched and let the processor's variant/tuning validation speak.
-        merged.setdefault("rocket_fuel", {})
-        merged["rocket_fuel"]["variant"] = variant
+        # test_shipped_config_files_have_a_single_bot_section). A missing or
+        # malformed one is a config error, not a layout to accommodate: the
+        # override merge nests the section back under `rocket_fuel`, so check
+        # the effective payload at both levels.
+        rocket_fuel = merged.get("rocket_fuel")
+        if not isinstance(rocket_fuel, dict):
+            raise ValueError("RocketFuel config must contain a rocket_fuel mapping")
+        rocket_fuel["variant"] = variant
         return RocketFuelSignalProcessor(merged)
 
     return _build_from_bot_dir("rocketfuel", _factory, config)
