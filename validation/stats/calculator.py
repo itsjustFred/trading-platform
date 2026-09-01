@@ -14,6 +14,12 @@ Mathematical conventions (kept explicit so results are reproducible):
 * **Annualization:** ``sqrt(252)`` (daily-trade assumption).
 * **Drawdown:** absolute is in account currency; ``max_drawdown_pct`` is a
   fraction (0..1) of the running peak.
+* **PnL basis (DV-B46):** win/loss classification, ``net_profit``, Sharpe,
+  Sortino, drawdown, ``avg_trade`` and the largest winner/loser use the
+  *net* per-trade PnL (``net_pnl`` when set, else gross PnL minus ``fees``,
+  else the exit PnL sum).  ``gross_profit``/``gross_loss``/``avg_winner``/
+  ``avg_loser`` stay gross so they remain comparable with MT5's
+  Bruttogewinn/Bruttoverlust labels.
 """
 
 from __future__ import annotations
@@ -54,6 +60,22 @@ def _realized_pnl(trade: Trade) -> float:
     if not trade.exits:
         return 0.0
     return sum((exit_.pnl or 0.0) for exit_ in trade.exits)
+
+
+def _net_realized_pnl(trade: Trade) -> float:
+    """Net realized PnL for one trade after fees (DV-B46).
+
+    Preference order: explicit ``net_pnl`` (the trade already carries the
+    net figure), else gross PnL minus ``fees``, else the sum of exit PnLs
+    (fee-free trades and normalized inputs where fees are already deducted
+    from the exit PnLs).
+    """
+    if trade.net_pnl is not None:
+        return float(trade.net_pnl)
+    gross = _realized_pnl(trade)
+    if trade.fees is not None:
+        return gross - float(trade.fees)
+    return gross
 
 
 def _compute_drawdowns(realized_pnls: List[float]) -> tuple[float, float]:
@@ -112,7 +134,10 @@ def compute_trade_statistics(trades: List[Trade]) -> TradeStatistics:
     if not trades:
         return TradeStatistics()
 
-    realized_pnls = [_realized_pnl(t) for t in trades]
+    realized_pnls = [_net_realized_pnl(t) for t in trades]
+    # Gross figures stay gross (fees excluded) so they remain comparable with
+    # MT5's Bruttogewinn/Bruttoverlust labels (DV-B46).
+    gross_pnls = [_realized_pnl(t) for t in trades]
 
     total_trades = len(trades)
     winning_trades = sum(1 for p in realized_pnls if p > 0)
@@ -120,8 +145,8 @@ def compute_trade_statistics(trades: List[Trade]) -> TradeStatistics:
     win_rate = winning_trades / total_trades if total_trades > 0 else 0.0
 
     net_profit = sum(realized_pnls)
-    gross_profit = sum(p for p in realized_pnls if p > 0)
-    gross_loss = sum(p for p in realized_pnls if p < 0)
+    gross_profit = sum(p for p in gross_pnls if p > 0)
+    gross_loss = sum(p for p in gross_pnls if p < 0)
 
     if gross_loss != 0.0:
         profit_factor = abs(gross_profit / gross_loss)

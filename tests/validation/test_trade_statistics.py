@@ -411,3 +411,76 @@ def test_break_even_trade_not_counted_as_winner_or_loser() -> None:
     assert stats.winning_trades == 1
     assert stats.losing_trades == 1
     assert stats.win_rate == pytest.approx(1 / 3)
+
+
+# ── 17. Fees / net PnL (DV-B46) ────────────────────────────────────────────
+
+
+def _make_fee_trade(trade_id: int, exit_pnl: float, fees: float | None, net_pnl: float | None = None) -> Trade:
+    exits = [TradeExit(time="2024-01-01T00:00:00Z", price=100.0, quantity=1.0, pnl=exit_pnl)]
+    total = exit_pnl
+    return Trade(
+        id=trade_id,
+        symbol="TEST",
+        direction="LONG",
+        entry_time="2024-01-01T00:00:00Z",
+        entry_price=100.0,
+        quantity=1.0,
+        exits=exits,
+        pnl=total,
+        fees=fees,
+        net_pnl=net_pnl,
+    )
+
+
+def test_net_pnl_preferred_over_gross_exits() -> None:
+    trades = [
+        _make_fee_trade(1, 100.0, fees=2.0, net_pnl=98.0),
+        _make_fee_trade(2, -50.0, fees=2.0, net_pnl=-52.0),
+    ]
+    stats = compute_trade_statistics(trades)
+    assert stats.net_profit == pytest.approx(46.0)
+    assert stats.gross_profit == pytest.approx(100.0)
+    assert stats.gross_loss == pytest.approx(-50.0)
+    assert stats.avg_trade == pytest.approx(23.0)
+
+
+def test_fees_subtracted_from_gross_when_no_net() -> None:
+    trades = [_make_fee_trade(1, 100.0, fees=2.0)]
+    stats = compute_trade_statistics(trades)
+    assert stats.net_profit == pytest.approx(98.0)
+    assert stats.gross_profit == pytest.approx(100.0)
+
+
+def test_fees_alone_do_not_make_a_winner_a_loser() -> None:
+    trades = [_make_fee_trade(1, 10.0, fees=1.0)]
+    stats = compute_trade_statistics(trades)
+    assert stats.winning_trades == 1
+    assert stats.losing_trades == 0
+    assert stats.win_rate == pytest.approx(1.0)
+
+
+def test_fees_can_turn_gross_winner_into_net_loser() -> None:
+    trades = [_make_fee_trade(1, 1.0, fees=5.0)]
+    stats = compute_trade_statistics(trades)
+    assert stats.net_profit == pytest.approx(-4.0)
+    assert stats.winning_trades == 0
+    assert stats.losing_trades == 1
+
+
+def test_no_fees_means_gross_equals_net() -> None:
+    trades = [_make_fee_trade(1, 100.0, fees=None)]
+    stats = compute_trade_statistics(trades)
+    assert stats.net_profit == pytest.approx(100.0)
+
+
+def test_break_even_counted_in_denominator() -> None:
+    """DV-B46 (denominator skew): a break-even trade counts in total_trades."""
+    trades = [
+        _make_fee_trade(1, 10.0, fees=None),
+        _make_fee_trade(2, 0.0, fees=None),
+        _make_fee_trade(3, -5.0, fees=None),
+    ]
+    stats = compute_trade_statistics(trades)
+    assert stats.total_trades == 3
+    assert stats.win_rate == pytest.approx(1 / 3)
