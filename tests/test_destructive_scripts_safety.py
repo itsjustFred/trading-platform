@@ -169,20 +169,22 @@ def test_consolidate_unreadable_fragment_aborts_before_deleting_fragments(ohlcv_
 
     (ohlcv_root / "EURUSD" / "broken_part3.parquet").write_bytes(b"not a parquet file")
 
+    # Captured before the run, so the post-failure comparison is not tautological.
+    snapshot = sorted(
+        (p.relative_to(ohlcv_root), p.read_bytes())
+        for p in ohlcv_root.rglob("*.parquet")
+        if p.name != "broken_part3.parquet"
+    )
+
     with pytest.raises(pyarrow.lib.ArrowInvalid):
         consolidate(ohlcv_root, backup_dir=ohlcv_root.parent / "backup")
 
     # The failed run leaves the tree byte-identical to before: no fragment is
     # deleted, and any canonical file an earlier merge already replaced is
     # restored from the snapshot.
-    snapshot = sorted(
-        (p.relative_to(ohlcv_root), p.name)
-        for p in ohlcv_root.rglob("*.parquet")
-        if p.name != "broken_part3.parquet"
-    )
     assert (
         sorted(
-            (p.relative_to(ohlcv_root), p.name)
+            (p.relative_to(ohlcv_root), p.read_bytes())
             for p in ohlcv_root.rglob("*.parquet")
             if p.name != "broken_part3.parquet"
         )

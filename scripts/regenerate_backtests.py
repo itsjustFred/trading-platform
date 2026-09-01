@@ -543,14 +543,16 @@ def _validate_backup_dir(backup_dir: Path) -> Path:
     """Validate a backup directory before it is used for writes.
 
     ``--backup-dir`` arrives from the command line (or from an LLM-driven caller),
-    so it is resolved and checked before anything touches the file system: it must
-    be an absolute path that is not the repository root, not ``DATA_DIR`` itself,
-    and not inside the live ``DATA_DIR/backtests`` corpus it is supposed to back up.
+    so it is checked before it is resolved and before anything touches the file
+    system: it must be an absolute path, must not be the repository root, not
+    ``DATA_DIR`` itself, and not inside the live ``DATA_DIR/backtests`` corpus it
+    is supposed to back up.
     """
-    resolved = backup_dir.expanduser().resolve()
-    if not resolved.is_absolute():
-        raise ValueError(f"Backup directory must be an absolute path: {resolved}")
-    if resolved == Path.cwd() or resolved == DATA_DIR:
+    expanded = backup_dir.expanduser()
+    if not expanded.is_absolute():
+        raise ValueError(f"Backup directory must be an absolute path: {backup_dir}")
+    resolved = expanded.resolve()
+    if resolved in (PROJECT_ROOT, DATA_DIR):
         raise ValueError(f"Refusing to use {resolved} as backup directory")
     if resolved == BACKTESTS_DIR or BACKTESTS_DIR in resolved.parents:
         raise ValueError(
@@ -573,12 +575,11 @@ def _execute_runs(plan: RegenerationPlan) -> tuple[int, int, list[str]]:
     """Run the planned strategies, returning (successes, skipped, failures)."""
     failures: list[str] = []
     successes = 0
-    skipped = 0
+    skipped = len(plan.skipped)
+    for message in plan.skipped:
+        print(f"  - {message}")
 
     if plan.no_data:
-        skipped += len(plan.skipped)
-        for message in plan.skipped:
-            print(f"  - {message}")
         return successes, skipped, failures
 
     for entry in plan.entries:
