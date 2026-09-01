@@ -7,7 +7,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any
 
-from shared.models import BacktestResult, EquityPoint
+from shared.models import BacktestResult, EquityPoint, Trade
 
 
 def _parse_day_bound(value: str | None, *, is_end: bool) -> str | None:
@@ -27,7 +27,7 @@ def _parse_day_bound(value: str | None, *, is_end: bool) -> str | None:
     return parsed.isoformat()
 
 
-def _trade_in_window(trade, start_bound: str | None, end_bound: str | None) -> bool:
+def _trade_in_window(trade: Trade, start_bound: str | None, end_bound: str | None) -> bool:
     exit_time = None
     for exit_ in trade.exits:
         if exit_.time:
