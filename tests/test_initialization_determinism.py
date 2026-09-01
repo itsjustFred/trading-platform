@@ -8,6 +8,7 @@ every process resolves identical configuration.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -18,30 +19,42 @@ import pytest
 
 def test_database_import_does_not_create_engine(monkeypatch, tmp_path: Path) -> None:
     """Importing shared.database must not eagerly create a SQLAlchemy engine."""
-    monkeypatch.setenv("DATA_DIR", str(tmp_path))
-    monkeypatch.setenv("TRADING_DATA_DIR", str(tmp_path))
-    monkeypatch.delenv("DATABASE_URL", raising=False)
-
     import shared.database as database
 
-    monkeypatch.setattr(database, "_ENGINE", None)
+    # Restore the process-global module state this test touches (the memoized
+    # engine and the create_engine/event indirections) so later tests see the
+    # same state regardless of execution order.
+    original_engine = database._ENGINE
+    original_create_engine = database.create_engine
+    original_event = database.event
+    try:
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("TRADING_DATA_DIR", str(tmp_path))
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+        monkeypatch.setattr(database, "_ENGINE", None)
 
-    created: list[str] = []
+        created: list[str] = []
 
-    class _RecordingEngine:
-        def __init__(self, url: str, **_kwargs) -> None:
-            self.url = url
-            created.append(url)
+        class _RecordingEngine:
+            def __init__(self, url: str, **_kwargs) -> None:
+                self.url = url
+                created.append(url)
 
-    monkeypatch.setattr(database, "create_engine", _RecordingEngine)
-    monkeypatch.setattr(database, "event", SimpleNamespace(listen=lambda *a, **k: None))
+        monkeypatch.setattr(database, "create_engine", _RecordingEngine)
+        monkeypatch.setattr(
+            database, "event", SimpleNamespace(listen=lambda *a, **k: None)
+        )
 
-    # No engine may exist before the first get_engine() call...
-    assert database._ENGINE is None
-    assert not created
-    # ...and the first call creates exactly one.
-    engine = database.get_engine()
-    assert created == [engine.url]
+        # No engine may exist before the first get_engine() call...
+        assert database._ENGINE is None
+        assert not created
+        # ...and the first call creates exactly one.
+        engine = database.get_engine()
+        assert created == [engine.url]
+    finally:
+        database.create_engine = original_create_engine
+        database.event = original_event
+        database._ENGINE = original_engine
 
 
 def test_database_engine_is_lazy_and_cached(monkeypatch, tmp_path: Path) -> None:
@@ -197,8 +210,18 @@ def test_reset_data_dir_restores_environment_resolution(
     """reset_data_dir() re-resolves DATA_DIR from the environment."""
     import shared.constants as constants
 
-    monkeypatch.setenv("DATA_DIR", str(tmp_path))
-    constants.set_data_dir(tmp_path / "override")
-    assert constants.DATA_DIR == (tmp_path / "override").resolve()
+    # Reset inside a nested context and once more after it exits: the outer
+    # undo restores the original environment first, so the final reset_data_dir
+    # re-resolves against that original env and constants.DATA_DIR is left as
+    # the environment baseline (DATA_DIR is set by tests/conftest.py) after
+    # teardown.
+    with monkeypatch.context() as inner:
+        inner.setenv("DATA_DIR", str(tmp_path))
+        constants.set_data_dir(tmp_path / "override")
+        assert constants.DATA_DIR == (tmp_path / "override").resolve()
+        constants.reset_data_dir()
+        assert constants.DATA_DIR == tmp_path.resolve()
     constants.reset_data_dir()
-    assert constants.DATA_DIR == tmp_path.resolve()
+    assert constants.DATA_DIR == constants._resolve_data_dir(
+        os.environ.get("DATA_DIR") or os.environ.get("TRADING_DATA_DIR")
+    )
