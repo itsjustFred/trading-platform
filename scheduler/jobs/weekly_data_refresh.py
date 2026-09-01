@@ -104,80 +104,22 @@ async def run(*, task_id: str, service_id: str, service_name: str) -> dict[str, 
     covered = [symbol for symbol in REFRESH_SYMBOLS if _symbol_is_fresh(symbol)]
     missing = [symbol for symbol in REFRESH_SYMBOLS if symbol not in covered]
 
-    refreshed: list[str] = []
-    errors: list[str] = []
-
     if missing:
         # Only the missing symbols are requested for download; covered symbols
         # are left untouched so the refresh stays a cheap incremental no-op.
-        total_missing = max(len(missing), 1)
-        for index, symbol in enumerate(missing, start=1):
-            # The pre-download record reports the symbols finished so far
-            # (index - 1); the post-download record below reports index.
-            progress_percent = round(((index - 1) / total_missing) * 95.0, 2)
-            progress_config = dict(base_config)
-            progress_config.update(
-                {
-                    "progress_percent": progress_percent,
-                    "progress_detail": {
-                        "completed": index - 1,
-                        "failed": 0,
-                        "total": len(missing),
-                        "percent": progress_percent,
-                        "current": f"Downloading {symbol}",
-                    },
-                }
-            )
-            await asyncio.to_thread(
-                _write_progress_sync,
-                task_id=task_id,
-                service_id=service_id,
-                service_name=service_name,
-                config=progress_config,
-                progress_message=f"Downloading {symbol} for {', '.join(REFRESH_TIMEFRAMES)}",
-            )
-            try:
-                for timeframe in REFRESH_TIMEFRAMES:
-                    await asyncio.to_thread(
-                        ensure_backtest_data,
-                        symbols=[symbol],
-                        timeframe=timeframe,
-                        start=start.strftime("%Y-%m-%d"),
-                        end=end.strftime("%Y-%m-%d"),
-                        modeling_resolution="main_timeframe",
-                    )
-                _record_progress_sync(
-                    task_id=task_id,
-                    service_id=service_id,
-                    service_name=service_name,
-                    base_config=base_config,
-                    completed=index,
-                    total_missing=total_missing,
-                    message=f"Downloaded {symbol}",
-                )
-                if _symbol_is_fresh(symbol):
-                    refreshed.append(symbol)
-                else:
-                    errors.append(
-                        f"{symbol}: download completed but no OHLCV files present "
-                        f"for {', '.join(REFRESH_TIMEFRAMES)}"
-                    )
-            except (RuntimeError, OSError, ValueError) as exc:
-                errors.append(f"{symbol}: {exc}")
-                logger.warning(
-                    "Weekly data refresh download failed",
-                    extra={
-                        "data": {
-                            "service_id": service_id,
-                            "service_name": service_name,
-                            "symbol": symbol,
-                            "error": str(exc),
-                        }
-                    },
-                )
+        refreshed, errors = await _download_missing_symbols(
+            missing,
+            start=start,
+            end=end,
+            task_id=task_id,
+            service_id=service_id,
+            service_name=service_name,
+            base_config=base_config,
+        )
     else:
         # Everything already has local coverage; verify instead of re-downloading.
         refreshed = list(covered)
+        errors = []
 
     finished = datetime.now(timezone.utc)
     if errors:
@@ -287,6 +229,92 @@ def _write_progress_sync(
         source="scheduler",
         updated_at=datetime.now(timezone.utc).isoformat(),
     )
+
+
+async def _download_missing_symbols(
+    missing: list[str],
+    *,
+    start: datetime,
+    end: datetime,
+    task_id: str,
+    service_id: str,
+    service_name: str,
+    base_config: dict[str, Any],
+) -> tuple[list[str], list[str]]:
+    """Download every missing symbol and report per-symbol progress.
+
+    Returns ``(refreshed, errors)``: symbols whose download produced real OHLCV
+    coverage, and the per-symbol failure messages for everything else.
+    """
+    refreshed: list[str] = []
+    errors: list[str] = []
+    total_missing = max(len(missing), 1)
+
+    for index, symbol in enumerate(missing, start=1):
+        # The pre-download record reports the symbols finished so far
+        # (index - 1); the post-download record below reports index.
+        progress_percent = round(((index - 1) / total_missing) * 95.0, 2)
+        progress_config = dict(base_config)
+        progress_config.update(
+            {
+                "progress_percent": progress_percent,
+                "progress_detail": {
+                    "completed": index - 1,
+                    "failed": 0,
+                    "total": len(missing),
+                    "percent": progress_percent,
+                    "current": f"Downloading {symbol}",
+                },
+            }
+        )
+        await asyncio.to_thread(
+            _write_progress_sync,
+            task_id=task_id,
+            service_id=service_id,
+            service_name=service_name,
+            config=progress_config,
+            progress_message=f"Downloading {symbol} for {', '.join(REFRESH_TIMEFRAMES)}",
+        )
+        try:
+            for timeframe in REFRESH_TIMEFRAMES:
+                await asyncio.to_thread(
+                    ensure_backtest_data,
+                    symbols=[symbol],
+                    timeframe=timeframe,
+                    start=start.strftime("%Y-%m-%d"),
+                    end=end.strftime("%Y-%m-%d"),
+                    modeling_resolution="main_timeframe",
+                )
+            _record_progress_sync(
+                task_id=task_id,
+                service_id=service_id,
+                service_name=service_name,
+                base_config=base_config,
+                completed=index,
+                total_missing=total_missing,
+                message=f"Downloaded {symbol}",
+            )
+            if _symbol_is_fresh(symbol):
+                refreshed.append(symbol)
+            else:
+                errors.append(
+                    f"{symbol}: download completed but no OHLCV files present "
+                    f"for {', '.join(REFRESH_TIMEFRAMES)}"
+                )
+        except (RuntimeError, OSError, ValueError) as exc:
+            errors.append(f"{symbol}: {exc}")
+            logger.warning(
+                "Weekly data refresh download failed",
+                extra={
+                    "data": {
+                        "service_id": service_id,
+                        "service_name": service_name,
+                        "symbol": symbol,
+                        "error": str(exc),
+                    }
+                },
+            )
+    return refreshed, errors
 
 
 def _record_progress_sync(
