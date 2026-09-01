@@ -8,7 +8,6 @@ actual backtests may import a module.
 from __future__ import annotations
 
 import builtins
-import sys
 from pathlib import Path
 
 import pytest
@@ -119,8 +118,8 @@ def test_detect_strategy_type_is_static(tmp_path: Path) -> None:
     detected = detect_strategy_type(strategy_dir / "typed_strategy.py", strategy_dir)
     assert detected == StrategyType.SIGNAL_PROCESSOR
 
-    # A signal-processor *class* can no longer be detected by executing the file;
-    # static detection requires the explicit strategy_type metadata.
+    # A signal-processor *class* is detected statically from the AST class shape
+    # (name + process_signal method) — the file is still never executed.
     class_dir = tmp_path / "class_strategy"
     class_dir.mkdir()
     (class_dir / "class_strategy.py").write_text(
@@ -130,6 +129,19 @@ def test_detect_strategy_type_is_static(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     assert detect_strategy_type(class_dir / "class_strategy.py", class_dir) == (
+        StrategyType.SIGNAL_PROCESSOR
+    )
+
+    # A class without the process_signal method is not a signal processor.
+    bare_dir = tmp_path / "bare_strategy"
+    bare_dir.mkdir()
+    (bare_dir / "bare_strategy.py").write_text(
+        "class ExampleSignalProcessor:\n"
+        "    def run(self):\n"
+        "        return None\n",
+        encoding="utf-8",
+    )
+    assert detect_strategy_type(bare_dir / "bare_strategy.py", bare_dir) == (
         StrategyType.MARKET_DATA
     )
 

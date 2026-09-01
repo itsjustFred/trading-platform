@@ -134,7 +134,9 @@ def get_engine() -> Any:
     Lazy creation keeps imports side-effect free (no engine bound to a
     possibly stale DATA_DIR) while guaranteeing a single engine per process.
     An explicit ``ENGINE`` override (set by tests or embedders via
-    ``shared.database.ENGINE = engine``) always wins.
+    ``shared.database.ENGINE = engine``) always wins — it is used as handed
+    over, so the override owns its own pragmas (the test fixtures register
+    ``_configure_sqlite_connection`` themselves).
     """
     global _ENGINE
     if ENGINE is not None:

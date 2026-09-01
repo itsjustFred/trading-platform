@@ -21,8 +21,9 @@ def test_detect_strategy_type_from_meta_field(tmp_path: Path):
     assert detected == StrategyType.SIGNAL_PROCESSOR
 
 
-def test_detect_strategy_type_requires_explicit_meta(tmp_path: Path):
-    """Detection is static: a bare *SignalProcessor class is not enough."""
+def test_detect_strategy_type_detects_signal_processor_class_statically(tmp_path: Path):
+    """A *SignalProcessor class with process_signal is detected from the AST —
+    the file is never executed, so dynamic/dangerous module code stays inert."""
     strategy_path = tmp_path / "class_signal_processor.py"
     strategy_path.write_text(
         "\n".join(
@@ -37,7 +38,27 @@ def test_detect_strategy_type_requires_explicit_meta(tmp_path: Path):
     )
 
     detected = detect_strategy_type(strategy_path, tmp_path)
-    assert detected == StrategyType.MARKET_DATA
+    assert detected == StrategyType.SIGNAL_PROCESSOR
+
+
+def test_detect_strategy_type_static_detection_never_executes(tmp_path: Path):
+    """Detection must not execute the strategy file (no import side effects)."""
+    strategy_path = tmp_path / "side_effect_signal_processor.py"
+    strategy_path.write_text(
+        "\n".join(
+            [
+                "raise RuntimeError('strategy file must never be executed on lookup')",
+                "class ExampleSignalProcessor:",
+                "    def process_signal(self, raw_signal, market_data):",
+                "        return raw_signal",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    detected = detect_strategy_type(strategy_path, tmp_path)
+    assert detected == StrategyType.SIGNAL_PROCESSOR
 
 
 def test_detect_strategy_type_defaults_to_market_data(tmp_path: Path):

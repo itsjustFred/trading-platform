@@ -25,6 +25,10 @@ def test_weekly_refresh_reports_skip_when_config_missing(tmp_path: Path) -> None
             weekly_data_refresh, "upsert_background_task_record"
         ), patch.object(
             weekly_data_refresh,
+            "has_ohlcv_bars_in_range",
+            return_value=False,
+        ), patch.object(
+            weekly_data_refresh,
             "ensure_backtest_data",
             side_effect=RuntimeError("no route to host"),
         ) as mock_download:
@@ -44,8 +48,8 @@ def test_weekly_refresh_reports_skip_when_config_missing(tmp_path: Path) -> None
     assert mock_download.called, "the job must attempt the advertised refresh"
 
 
-def test_weekly_refresh_refreshes_symbols_with_coverage(tmp_path: Path) -> None:
-    """Symbols whose OHLCV coverage is sufficient are refreshed (no-op) and reported."""
+def test_weekly_refresh_reports_noop_when_everything_already_fresh(tmp_path: Path) -> None:
+    """Full window coverage means a no-op: reported as skipped, never completed."""
     from scheduler.jobs import weekly_data_refresh
 
     data_dir = tmp_path / "data"
@@ -57,18 +61,30 @@ def test_weekly_refresh_refreshes_symbols_with_coverage(tmp_path: Path) -> None:
 
     constants_module.set_data_dir(data_dir)
     try:
-        result = asyncio.run(
-            weekly_data_refresh.run(
-                task_id="task-ok",
-                service_id="svc-2",
-                service_name="Weekly Data Refresh",
+        with patch.object(
+            weekly_data_refresh,
+            "has_ohlcv_bars_in_range",
+            return_value=True,
+        ), patch.object(
+            weekly_data_refresh,
+            "ensure_backtest_data",
+            side_effect=AssertionError("nothing must be downloaded when all fresh"),
+        ):
+            result = asyncio.run(
+                weekly_data_refresh.run(
+                    task_id="task-ok",
+                    service_id="svc-2",
+                    service_name="Weekly Data Refresh",
+                )
             )
-        )
     finally:
         constants_module.reset_data_dir()
 
-    assert result["status"] == "completed"
-    assert sorted(result["refreshed"]) == sorted(weekly_data_refresh.REFRESH_SYMBOLS)
+    # Nothing was missing, so nothing was downloaded: the job must report a
+    # truthful no-op, not a completed refresh.
+    assert result["status"] == "skipped"
+    assert result["refreshed"] == []
+    assert sorted(result["already_fresh"]) == sorted(weekly_data_refresh.REFRESH_SYMBOLS)
     assert result["missing"] == []
     reported_start = datetime.fromisoformat(result["window"]["start"])
     reported_end = datetime.fromisoformat(result["window"]["end"])
@@ -83,6 +99,10 @@ def test_weekly_refresh_download_failure_fails_the_run(tmp_path: Path) -> None:
     constants_module.set_data_dir(data_dir)
     try:
         with patch.object(
+            weekly_data_refresh,
+            "has_ohlcv_bars_in_range",
+            return_value=False,
+        ), patch.object(
             weekly_data_refresh,
             "ensure_backtest_data",
             side_effect=RuntimeError("download failed"),
@@ -111,6 +131,10 @@ def test_weekly_refresh_writes_skipped_task_record(tmp_path: Path) -> None:
         with patch.object(
             weekly_data_refresh, "upsert_background_task_record"
         ) as upsert, patch.object(
+            weekly_data_refresh,
+            "has_ohlcv_bars_in_range",
+            return_value=False,
+        ), patch.object(
             weekly_data_refresh,
             "ensure_backtest_data",
             side_effect=RuntimeError("offline"),

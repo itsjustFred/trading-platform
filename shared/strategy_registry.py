@@ -134,7 +134,9 @@ def _strategy_meta_literal(source: str) -> dict[str, Any] | None:
             targets = node.targets
         elif isinstance(node, ast.AnnAssign):
             targets = [node.target]
-        if not any(isinstance(target, ast.Name) and target.id == "STRATEGY_META" for target in targets):
+        if not any(
+            isinstance(target, ast.Name) and target.id == "STRATEGY_META" for target in targets
+        ):
             continue
         try:
             value = ast.literal_eval(node.value)
@@ -183,20 +185,53 @@ def _strategy_type_from_meta(meta: dict[str, Any]) -> StrategyType | None:
     return None
 
 
+def _source_declares_signal_processor(source: str) -> bool:
+    """Return whether the source statically defines a signal-processor class.
+
+    Pure AST check (never executes the file): a class whose name ends with
+    ``SignalProcessor`` and that defines a ``process_signal`` method. Preserves
+    detection for strategies whose STRATEGY_META lacks a literal
+    ``strategy_type`` without reintroducing module execution.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return False
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        if not node.name.lower().endswith("signalprocessor"):
+            continue
+        for item in node.body:
+            if (
+                isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and item.name == "process_signal"
+            ):
+                return True
+    return False
+
+
 def detect_strategy_type(
     path: Path,
     strategies_dir: Path = DEFAULT_STRATEGIES_DIR,
 ) -> StrategyType:
     """Detect the strategy type from parsed metadata, without executing the file.
 
-    Signal processors must declare themselves via STRATEGY_META
-    (``strategy_type``/``type``, optionally under ``tags``). Executing strategy
-    files just to sniff a class name is intentionally not done here.
+    Resolution order: literal ``STRATEGY_META`` (``strategy_type``/``type``,
+    optionally under ``tags``), then a statically detected signal-processor
+    class shape (``*SignalProcessor`` with a ``process_signal`` method).
+    Executing the strategy file is intentionally never done here.
     """
-    meta = load_strategy_meta(path, strategies_dir)
-    detected = _strategy_type_from_meta(meta)
+    try:
+        source = path.read_text(encoding="utf-8")
+    except OSError:
+        return StrategyType.MARKET_DATA
+    meta = _strategy_meta_literal(source)
+    detected = _strategy_type_from_meta(dict(meta)) if isinstance(meta, dict) else None
     if detected is not None:
         return detected
+    if _source_declares_signal_processor(source):
+        return StrategyType.SIGNAL_PROCESSOR
     return StrategyType.MARKET_DATA
 
 

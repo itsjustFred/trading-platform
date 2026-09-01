@@ -75,6 +75,7 @@ def save_state(state: dict) -> None:
 
 
 def any_matrix_process_running() -> bool:
+    """Liveness probe (diagnostics only — never used for lock decisions)."""
     try:
         proc = subprocess.run(
             ["pgrep", "-f", r"python.*runner\.cli matrix"],

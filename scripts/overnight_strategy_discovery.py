@@ -22,11 +22,14 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from runner.engines.base import BacktestConfig
+from shared.logging import get_logger
 
 try:
     from shared.constants import DATA_DIR
 except ImportError:
     DATA_DIR = PROJECT_ROOT / "data"
+
+logger = get_logger("scripts.discovery")
 
 DISCOVERED_DIR = DATA_DIR / "discovered_strategies"
 
@@ -148,12 +151,17 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    print("Overnight Strategy Discovery - Experimental")
-    print("=" * 50)
-
+    logger.info("Overnight strategy discovery started")
     results = run_discovery_batch(n_trials=args.trials, publish=args.publish)
-    print(f"Generated {len(results)} trial candidate configurations")
-    if args.publish:
-        print(f"Results saved to {DISCOVERED_DIR}")
-    else:
-        print("Dry run: results were NOT published (pass --publish to write them).")
+    logger.info(
+        "Overnight strategy discovery finished",
+        extra={
+            "data": {
+                "trials": len(results),
+                "published": args.publish,
+                "output_dir": str(DISCOVERED_DIR) if args.publish else None,
+            }
+        },
+    )
+    if not args.publish:
+        logger.info("Dry run: results were NOT published (pass --publish to write them)")

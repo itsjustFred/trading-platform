@@ -12,9 +12,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from data_tools.auto_download import ensure_backtest_data
-from shared import constants as shared_constants
-from shared.constants import normalize_timeframe
+from data_tools.auto_download import ensure_backtest_data, has_ohlcv_bars_in_range
 from shared.database import upsert_background_task_record
 from shared.logging import get_logger
 
@@ -26,22 +24,19 @@ REFRESH_TIMEFRAMES = ["1m", "5m", "1h", "4h", "1d"]
 _DESCRIPTION = "Refreshes core symbols for the last 7 days across standard timeframes."
 
 
-def _has_ohlcv_file(symbol: str, timeframe: str, data_dir: Any = None) -> bool:
-    root = (data_dir or shared_constants.DATA_DIR) / "ohlcv"
-    matches = list(root.rglob(f"**/{symbol}/{normalize_timeframe(timeframe)}.parquet"))
-    return any(path.stat().st_size > 0 for path in matches if path.is_file())
+def _symbol_is_fresh(symbol: str, *, start: str, end: str) -> bool:
+    """A symbol counts as fresh when every requested timeframe has a bar in the window.
 
-
-def _symbol_is_fresh(symbol: str) -> bool:
-    """A symbol counts as covered when every requested timeframe has a data file.
-
-    "Covered" means a non-empty local parquet exists — it deliberately does not
-    check the data's age. A stale file is still treated as covered so the
-    refresh stays a cheap incremental no-op instead of re-downloading the whole
-    window on every tick; the advertised 7-day window is requested from the
-    downloader whenever a symbol is *not* covered.
+    Freshness is checked against the advertised 7-day window via
+    ``has_ohlcv_bars_in_range`` (which reads the parquet timestamps), not merely
+    file existence — a months-old file does not count as a refreshed week.
     """
-    return all(_has_ohlcv_file(symbol, timeframe) for timeframe in REFRESH_TIMEFRAMES)
+    return all(
+        has_ohlcv_bars_in_range(
+            symbol=symbol, timeframe=timeframe, start=start, end=end
+        )
+        for timeframe in REFRESH_TIMEFRAMES
+    )
 
 
 async def run(*, task_id: str, service_id: str, service_name: str) -> dict[str, Any]:
@@ -101,7 +96,13 @@ async def run(*, task_id: str, service_id: str, service_name: str) -> dict[str, 
         updated_at=end.isoformat(),
     )
 
-    covered = [symbol for symbol in REFRESH_SYMBOLS if _symbol_is_fresh(symbol)]
+    start_str = start.strftime("%Y-%m-%d")
+    end_str = end.strftime("%Y-%m-%d")
+    covered = [
+        symbol
+        for symbol in REFRESH_SYMBOLS
+        if _symbol_is_fresh(symbol, start=start_str, end=end_str)
+    ]
     missing = [symbol for symbol in REFRESH_SYMBOLS if symbol not in covered]
 
     if missing:
@@ -117,9 +118,75 @@ async def run(*, task_id: str, service_id: str, service_name: str) -> dict[str, 
             base_config=base_config,
         )
     else:
-        # Everything already has local coverage; verify instead of re-downloading.
-        refreshed = list(covered)
+        # Every symbol already has data covering the advertised window: nothing
+        # was downloaded, so the job reports a no-op ("skipped"), never a
+        # completed refresh.
+        refreshed = []
         errors = []
+        status = "skipped"
+        progress_message = (
+            "Weekly data refresh skipped: all "
+            f"{len(REFRESH_SYMBOLS)} symbols already cover the window "
+            f"{start_str}..{end_str}; nothing to download"
+        )
+        current = f"Skipped: {len(covered)}/{len(REFRESH_SYMBOLS)} symbols already fresh"
+
+        finished = datetime.now(timezone.utc)
+        result_config = dict(base_config)
+        result_config.update(
+            {
+                "finished_at": finished.isoformat(),
+                "progress_percent": 100.0,
+                "progress_detail": {
+                    "completed": 0,
+                    "failed": 0,
+                    "total": len(REFRESH_SYMBOLS),
+                    "percent": 100.0,
+                    "current": current,
+                },
+                "result": {
+                    "status": status,
+                    "refreshed": refreshed,
+                    "missing": missing,
+                    "errors": errors,
+                    "already_fresh": covered,
+                    "window": window,
+                },
+            }
+        )
+        await asyncio.to_thread(
+            upsert_background_task_record,
+            task_id=task_id,
+            task_type="service",
+            status=status,
+            config_json=result_config,
+            progress_message=progress_message,
+            name=f"{service_name} · Weekly Data Refresh",
+            description=_DESCRIPTION,
+            source="scheduler",
+            updated_at=finished.isoformat(),
+        )
+        logger.info(
+            "Weekly data refresh finished",
+            extra={
+                "data": {
+                    "service_id": service_id,
+                    "service_name": service_name,
+                    "status": status,
+                    "refreshed": refreshed,
+                    "missing": missing,
+                    "already_fresh": covered,
+                }
+            },
+        )
+        return {
+            "status": status,
+            "refreshed": refreshed,
+            "missing": missing,
+            "errors": errors,
+            "already_fresh": covered,
+            "window": window,
+        }
 
     finished = datetime.now(timezone.utc)
     if errors:
@@ -133,36 +200,29 @@ async def run(*, task_id: str, service_id: str, service_name: str) -> dict[str, 
             f"{', '.join(missing)}"
         )
         current = "Skipped: no data downloaded"
-    elif missing:
-        status = "partial"
+    else:
+        # Some symbols were not fresh and a download was attempted. `refreshed`
+        # is a subset of `missing` that actually produced window coverage.
+        status = "completed" if len(refreshed) == len(REFRESH_SYMBOLS) else "partial"
         progress_message = (
-            f"Weekly data refresh partial: refreshed {len(refreshed)} of "
+            f"Weekly data refresh {status}: refreshed {len(refreshed)} of "
             f"{len(REFRESH_SYMBOLS)} symbols"
         )
-        current = f"Partial: {len(refreshed)}/{len(REFRESH_SYMBOLS)} refreshed"
-    else:
-        status = "completed"
-        progress_message = (
-            f"Weekly data refresh completed for {len(refreshed)} symbols "
-            f"across {', '.join(REFRESH_TIMEFRAMES)}"
-        )
-        current = "Completed"
+        current = f"{status.capitalize()}: {len(refreshed)}/{len(REFRESH_SYMBOLS)} refreshed"
 
     completed_count = len(refreshed) if status in {"completed", "partial"} else 0
     failed_count = len(errors) if errors else 0
-    percent = 100.0
-    result_config = dict(base_config)
+    result_config = _progress_config(
+        base_config,
+        total=len(REFRESH_SYMBOLS),
+        completed=completed_count,
+        failed=failed_count,
+        current=current,
+        percent=100.0,
+    )
     result_config.update(
         {
             "finished_at": finished.isoformat(),
-            "progress_percent": percent,
-            "progress_detail": {
-                "completed": completed_count,
-                "failed": failed_count,
-                "total": len(REFRESH_SYMBOLS),
-                "percent": percent,
-                "current": current,
-            },
             "result": {
                 "status": status,
                 "refreshed": refreshed,
@@ -210,6 +270,36 @@ async def run(*, task_id: str, service_id: str, service_name: str) -> dict[str, 
     }
 
 
+def _progress_config(
+    base_config: dict[str, Any],
+    *,
+    total: int,
+    completed: int,
+    failed: int,
+    current: str,
+    percent: float,
+) -> dict[str, Any]:
+    """Build the task-record config for one progress point.
+
+    Single source of the progress_detail shape used by every progress write in
+    this job (pre-download, post-download and the final record).
+    """
+    config = dict(base_config)
+    config.update(
+        {
+            "progress_percent": percent,
+            "progress_detail": {
+                "completed": completed,
+                "failed": failed,
+                "total": total,
+                "percent": percent,
+                "current": current,
+            },
+        }
+    )
+    return config
+
+
 def _write_progress_sync(
     *,
     task_id: str,
@@ -254,18 +344,13 @@ async def _download_missing_symbols(
         # The pre-download record reports the symbols finished so far
         # (index - 1); the post-download record below reports index.
         progress_percent = round(((index - 1) / total_missing) * 95.0, 2)
-        progress_config = dict(base_config)
-        progress_config.update(
-            {
-                "progress_percent": progress_percent,
-                "progress_detail": {
-                    "completed": index - 1,
-                    "failed": 0,
-                    "total": len(missing),
-                    "percent": progress_percent,
-                    "current": f"Downloading {symbol}",
-                },
-            }
+        progress_config = _progress_config(
+            base_config,
+            total=len(missing),
+            completed=index - 1,
+            failed=0,
+            current=f"Downloading {symbol}",
+            percent=progress_percent,
         )
         await asyncio.to_thread(
             _write_progress_sync,
@@ -294,11 +379,14 @@ async def _download_missing_symbols(
                 total_missing=total_missing,
                 message=f"Downloaded {symbol}",
             )
-            if _symbol_is_fresh(symbol):
+            if _symbol_is_fresh(
+                symbol, start=start.strftime("%Y-%m-%d"), end=end.strftime("%Y-%m-%d")
+            ):
                 refreshed.append(symbol)
             else:
                 errors.append(
-                    f"{symbol}: download completed but no OHLCV files present "
+                    f"{symbol}: download completed but no OHLCV data covering "
+                    f"{start.strftime('%Y-%m-%d')}..{end.strftime('%Y-%m-%d')} "
                     f"for {', '.join(REFRESH_TIMEFRAMES)}"
                 )
         except (RuntimeError, OSError, ValueError) as exc:
@@ -329,18 +417,13 @@ def _record_progress_sync(
 ) -> None:
     """Write a running record reporting ``completed`` finished symbols."""
     percent = round((completed / max(total_missing, 1)) * 95.0, 2)
-    config = dict(base_config)
-    config.update(
-        {
-            "progress_percent": percent,
-            "progress_detail": {
-                "completed": completed,
-                "failed": 0,
-                "total": total_missing,
-                "percent": percent,
-                "current": message,
-            },
-        }
+    config = _progress_config(
+        base_config,
+        total=total_missing,
+        completed=completed,
+        failed=0,
+        current=message,
+        percent=percent,
     )
     _write_progress_sync(
         task_id=task_id,
