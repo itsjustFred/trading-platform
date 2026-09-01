@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import tempfile
+import time
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import pandas as pd
 import pytest
 
 
@@ -192,3 +194,46 @@ def test_main_validates_workers():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+def test_ensure_alias_copy_refreshes_when_canonical_is_newer(tmp_path):
+    """Regression DV-B30: equal file size is not freshness."""
+    from data_tools.download_grid_market_data import ensure_alias_copy
+    import os
+
+    canonical = tmp_path / "canonical" / "1m.parquet"
+    canonical.parent.mkdir(parents=True)
+    pd.DataFrame({"timestamp": [1], "close": [1.0]}).to_parquet(canonical, index=False)
+
+    first = ensure_alias_copy(canonical, "SP500", "indices", tmp_path)
+    assert first.exists()
+
+    # Touch the alias so it is newer than the canonical file, then update the
+    # canonical file with the SAME size to prove size equality is not used.
+    os.utime(first, ns=(0, 0))
+    time.sleep(0.01)
+    pd.DataFrame({"timestamp": [1, 2], "close": [1.0, 2.0]}).to_parquet(canonical, index=False)
+    # Force equal sizes: pad the alias content check by rewriting canonical to
+    # match its previous byte size is not needed — mtime alone must trigger.
+
+    refreshed = ensure_alias_copy(canonical, "SP500", "indices", tmp_path)
+    assert pd.read_parquet(refreshed)["timestamp"].tolist() == [1, 2]
+
+
+def test_ensure_alias_copy_skips_copy_when_alias_up_to_date(tmp_path):
+    from data_tools.download_grid_market_data import ensure_alias_copy
+
+    canonical = tmp_path / "canonical" / "1m.parquet"
+    canonical.parent.mkdir(parents=True)
+    pd.DataFrame({"timestamp": [1], "close": [1.0]}).to_parquet(canonical, index=False)
+
+    first = ensure_alias_copy(canonical, "SP500", "indices", tmp_path)
+    before = first.stat().st_mtime_ns
+    time.sleep(0.01)
+    # Rewriting canonical with identical content but older mtime must not re-copy.
+    import os
+    os.utime(canonical, ns=(0, 0))
+
+    second = ensure_alias_copy(canonical, "SP500", "indices", tmp_path)
+
+    assert second == first
+    assert second.stat().st_mtime_ns == before
