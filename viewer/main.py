@@ -210,6 +210,44 @@ DATA_TASKS_LOCK = legacy_viewer.DATA_TASKS_LOCK
 ACTIVE_TASK_STATUSES = legacy_viewer.ACTIVE_TASK_STATUSES
 FINAL_TASK_STATUSES = legacy_viewer.FINAL_TASK_STATUSES
 _running_jobs = legacy_viewer._running_jobs
+_JOBS_LOCK = legacy_viewer._JOBS_LOCK
+_JOBS_TIMESTAMP = legacy_viewer._JOBS_TIMESTAMP
+
+
+def _set_job_status(job_id: str, status: str) -> None:
+    """Lock-guarded single-field job status transition (never registers)."""
+    with _JOBS_LOCK:
+        job = _running_jobs.get(job_id)
+        if job is None:
+            return
+        job["status"] = status
+        _JOBS_TIMESTAMP[job_id] = time.monotonic()
+
+
+def _mark_job_result(job_id: str, result: Any | None) -> None:
+    with _JOBS_LOCK:
+        job = _running_jobs.get(job_id)
+        if job is None:
+            return
+        job["result"] = result
+        _JOBS_TIMESTAMP[job_id] = time.monotonic()
+
+
+def _mark_job_error(job_id: str, error: str | None) -> None:
+    with _JOBS_LOCK:
+        job = _running_jobs.get(job_id)
+        if job is None:
+            return
+        job["error"] = error
+        _JOBS_TIMESTAMP[job_id] = time.monotonic()
+
+
+def _register_job(job_id: str, job: dict[str, Any]) -> None:
+    """Register a job payload under the shared lock."""
+    with _JOBS_LOCK:
+        _running_jobs[job_id] = job
+        _JOBS_TIMESTAMP[job_id] = time.monotonic()
+
 
 _refresh_catalog = legacy_viewer._refresh_catalog
 _LEGACY_START_DATA_TASK = legacy_viewer._start_data_task
@@ -596,6 +634,7 @@ async def lifespan(app: FastAPI):
     app.state.live_market_data_sync_task = live_market_data_sync_task
     await asyncio.to_thread(mark_background_tasks_interrupted, from_statuses=["queued", "running"])
     await asyncio.to_thread(_resume_interrupted_tasks)
+    await asyncio.to_thread(legacy_viewer.evict_jobs)
     try:
         yield
     finally:
@@ -7828,13 +7867,16 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
         DATA_TASKS[task_id] = record
     _set_task_status(task_id, "queued")
 
-    _running_jobs[task_id] = {
-        "status": "queued",
-        "result": None,
-        "error": None,
-        "task_id": task_id,
-        "job_id": task_id,
-    }
+    _register_job(
+        task_id,
+        {
+            "status": "queued",
+            "result": None,
+            "error": None,
+            "task_id": task_id,
+            "job_id": task_id,
+        },
+    )
     _update_task_fields(
         task_id,
         restart_config={
@@ -7973,7 +8015,7 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
         with log_file.open("a", encoding="utf-8", buffering=1) as handle:
             try:
                 _set_task_status(task_id, "running")
-                _running_jobs[task_id]["status"] = "running"
+                _set_job_status(task_id, "running")
                 report_stage(handle, percent=10.0, message="Loading market data...")
 
                 missing_downloads = _ensure_backtest_data_availability(
@@ -8097,9 +8139,9 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
                         ingest_task_progress=False,
                     )
                     _mark_task_finished(task_id, status="completed", returncode=0)
-                    _running_jobs[task_id]["status"] = "completed"
-                    _running_jobs[task_id]["result"] = compact_result
-                    _running_jobs[task_id]["error"] = None
+                    _set_job_status(task_id, "completed")
+                    _mark_job_result(task_id, compact_result)
+                    _mark_job_error(task_id, None)
                 else:
                     error_text = latest_message or f"Backtest command exited with code {returncode}"
                     _write_task_log_line(
@@ -8117,9 +8159,9 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
                         returncode=returncode,
                         error=error_text,
                     )
-                    _running_jobs[task_id]["status"] = "failed"
-                    _running_jobs[task_id]["result"] = None
-                    _running_jobs[task_id]["error"] = error_text
+                    _set_job_status(task_id, "failed")
+                    _mark_job_result(task_id, None)
+                    _mark_job_error(task_id, error_text)
             except (subprocess.SubprocessError, OSError, RuntimeError, ValueError) as exc:
                 _write_task_log_line(
                     handle,
@@ -8132,9 +8174,9 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
                 )
                 _write_task_traceback(handle, task_id, traceback.format_exc(), source="backtest")
                 _mark_task_finished(task_id, status="failed", returncode=1, error=str(exc))
-                _running_jobs[task_id]["status"] = "failed"
-                _running_jobs[task_id]["result"] = None
-                _running_jobs[task_id]["error"] = str(exc)
+                _set_job_status(task_id, "failed")
+                _mark_job_result(task_id, None)
+                _mark_job_error(task_id, str(exc))
             finally:
                 _update_task_fields(task_id, process=None)
 
@@ -8313,13 +8355,16 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
             "signal_count": len(normalized_signals),
         },
     )
-    _running_jobs[task_id] = {
-        "status": "queued",
-        "result": None,
-        "error": None,
-        "task_id": task_id,
-        "job_id": task_id,
-    }
+    _register_job(
+        task_id,
+        {
+            "status": "queued",
+            "result": None,
+            "error": None,
+            "task_id": task_id,
+            "job_id": task_id,
+        },
+    )
 
     def _run_signal_replay() -> None:
         stage_progress = 0.0
@@ -8354,7 +8399,7 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
         with log_file.open("a", encoding="utf-8", buffering=1) as handle:
             try:
                 _set_task_status(task_id, "running")
-                _running_jobs[task_id]["status"] = "running"
+                _set_job_status(task_id, "running")
                 report_stage(handle, percent=10.0, message="Preparing signal replay...")
 
                 if bool(payload.auto_download):
@@ -8471,9 +8516,9 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
                     message=f"Completed - {len(result.trades)} trades found",
                 )
                 _mark_task_finished(task_id, status="completed", returncode=0)
-                _running_jobs[task_id]["status"] = "completed"
-                _running_jobs[task_id]["result"] = compact_result
-                _running_jobs[task_id]["error"] = None
+                _set_job_status(task_id, "completed")
+                _mark_job_result(task_id, compact_result)
+                _mark_job_error(task_id, None)
             except (RuntimeError, ValueError, OSError) as exc:
                 _write_task_log_line(
                     handle,
@@ -8486,9 +8531,9 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
                 )
                 _write_task_traceback(handle, task_id, traceback.format_exc(), source="backtest")
                 _mark_task_finished(task_id, status="failed", returncode=1, error=str(exc))
-                _running_jobs[task_id]["status"] = "failed"
-                _running_jobs[task_id]["result"] = None
-                _running_jobs[task_id]["error"] = str(exc)
+                _set_job_status(task_id, "failed")
+                _mark_job_result(task_id, None)
+                _mark_job_error(task_id, str(exc))
 
     thread = threading.Thread(target=_run_signal_replay, daemon=True)
     _update_task_fields(task_id, thread=thread)
@@ -8656,10 +8701,11 @@ async def get_backtest_run_status(job_id: str) -> dict[str, Any]:
             "progress": progress,
         }
 
-    job = _running_jobs.get(job_id)
+    legacy_viewer.evict_jobs()
+    job = legacy_viewer.get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
-    return dict(job)
+    return job
 
 
 @app.post("/api/optimizations/run", response_model=dict[str, Any], status_code=202)
