@@ -2122,7 +2122,7 @@ def _snapshot_portfolio_payloads() -> list[dict[str, Any]]:
     for file_path in sorted(PORTFOLIOS_DIR.glob("*.json")):
         try:
             data = _normalize_portfolio_payload(json.loads(file_path.read_text(encoding="utf-8")))
-        except (json.JSONDecodeError, OSError, TypeError, ValueError) as exc:
+        except (OSError, TypeError, ValueError) as exc:
             logger.warning("Could not read portfolio %s: %s", file_path.name, exc)
             continue
         portfolio_id = str(data.get("id") or file_path.stem).strip()
@@ -6679,12 +6679,12 @@ def _aggregate_symbol_timeframe_entries(
     return logical_entries
 
 
-@app.get("/api/strategies", response_model=list[dict[str, Any]])
+@app.get("/api/strategies")
 async def list_strategies() -> list[dict[str, Any]]:
     return await asyncio.to_thread(_cached_strategies_payload)
 
 
-@app.get("/api/signal-processors", response_model=list[dict[str, str]])
+@app.get("/api/signal-processors")
 async def list_signal_processors() -> list[dict[str, str]]:
     return await asyncio.to_thread(list_signal_processor_options)
 
@@ -6777,7 +6777,7 @@ async def get_strategy(name: str) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@app.patch("/api/strategies/{name:path}", response_model=dict[str, Any])
+@app.patch("/api/strategies/{name:path}")
 async def rename_strategy(name: str, payload: NameUpdateRequest) -> dict[str, Any]:
     entry = _safe_strategy_entry(name)
     if entry is None:
@@ -6887,7 +6887,7 @@ def _matrix_grid_row_with_trades(row: dict[str, Any], *, trades_limit: int) -> d
     return enriched
 
 
-@app.get("/api/backtests/matrix/summary", response_model=dict[str, Any])
+@app.get("/api/backtests/matrix/summary")
 async def get_backtest_matrix_summary() -> dict[str, Any]:
     return _matrix_summary_payload()
 
@@ -6908,7 +6908,7 @@ async def get_backtest_matrix_daily_equity_csv() -> FileResponse:
     return FileResponse(path, media_type="text/csv", filename=path.name)
 
 
-@app.get("/api/grid/{strategy_id:path}", response_model=dict[str, Any])
+@app.get("/api/grid/{strategy_id:path}")
 async def get_grid_strategy_detail(
     strategy_id: str,
     trades_limit: int = Query(default=3, ge=0, le=20),
@@ -6952,7 +6952,7 @@ async def get_grid_strategy_detail(
     return payload
 
 
-@app.get("/api/backtests", response_model=BacktestsListResponse)
+@app.get("/api/backtests")
 async def list_backtests(
     page: int = Query(default=1, ge=1),
     per_page: int = Query(default=50, ge=1, le=50),
@@ -7019,7 +7019,7 @@ async def list_backtests(
     )
 
 
-@app.get("/api/backtests/all", response_model=list[dict[str, Any]])
+@app.get("/api/backtests/all")
 async def list_backtests_all(
     include_equity_preview: bool = Query(default=False),
     preview_limit: int = Query(default=50, ge=1, le=100),
@@ -7041,7 +7041,7 @@ async def list_backtests_all(
     return [_backtest_all_item_from_meta(item) for item in items]
 
 
-@app.get("/api/backtests/duplicates", response_model=BacktestsDuplicatesResponse)
+@app.get("/api/backtests/duplicates")
 async def list_backtest_duplicates() -> BacktestsDuplicatesResponse:
     groups, total_backtests = _group_duplicate_backtests()
     return BacktestsDuplicatesResponse(
@@ -7051,7 +7051,7 @@ async def list_backtest_duplicates() -> BacktestsDuplicatesResponse:
     )
 
 
-@app.post("/api/backtests/deduplicate", response_model=BacktestsDeduplicateResponse)
+@app.post("/api/backtests/deduplicate")
 async def deduplicate_backtests() -> BacktestsDeduplicateResponse:
     groups, _ = _group_duplicate_backtests()
     deleted_ids: list[str] = []
@@ -7084,7 +7084,7 @@ async def deduplicate_backtests() -> BacktestsDeduplicateResponse:
     )
 
 
-@app.post("/api/backtests/remove-empty", response_model=dict[str, int])
+@app.post("/api/backtests/remove-empty")
 async def remove_empty_backtests() -> dict[str, int]:
     removed = 0
     for item in _snapshot_backtest_meta_cache():
@@ -7099,7 +7099,7 @@ async def remove_empty_backtests() -> dict[str, int]:
     return {"removed": removed}
 
 
-@app.post("/api/backtests/delete-bulk", response_model=dict[str, int])
+@app.post("/api/backtests/delete-bulk")
 async def delete_backtests_bulk(payload: BacktestsBulkDeleteRequest) -> dict[str, int]:
     deleted = 0
     seen: set[str] = set()
@@ -7113,7 +7113,7 @@ async def delete_backtests_bulk(payload: BacktestsBulkDeleteRequest) -> dict[str
     return {"deleted": deleted}
 
 
-@app.get("/api/backtests/compare", response_model=dict[str, Any])
+@app.get("/api/backtests/compare")
 async def compare_two_backtests(ids: str = Query(default="")) -> dict[str, Any]:
     if not ids:
         raise HTTPException(status_code=400, detail="Provide ?ids=id1,id2")
@@ -7156,8 +7156,8 @@ async def compare_two_backtests(ids: str = Query(default="")) -> dict[str, Any]:
     }
 
 
-@app.get("/api/backtest/{backtest_id}", response_model=dict[str, Any])
-@app.get("/api/backtests/{backtest_id}", response_model=dict[str, Any])
+@app.get("/api/backtest/{backtest_id}")
+@app.get("/api/backtests/{backtest_id}")
 async def get_backtest(
     backtest_id: str,
     include_trades: bool = Query(default=True),
@@ -7185,14 +7185,14 @@ async def get_backtest(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@app.delete("/api/backtests/{backtest_id}", response_model=dict[str, Any])
+@app.delete("/api/backtests/{backtest_id}")
 async def delete_single_backtest(backtest_id: str) -> dict[str, Any]:
     if not _delete_backtest_with_artifacts(backtest_id):
         raise HTTPException(status_code=404, detail=f"Backtest '{backtest_id}' not found")
     return {"id": backtest_id, "status": "deleted"}
 
 
-@app.patch("/api/backtests/{backtest_id}", response_model=dict[str, Any])
+@app.patch("/api/backtests/{backtest_id}")
 async def rename_backtest(backtest_id: str, payload: NameUpdateRequest) -> dict[str, Any]:
     result = _load_result(backtest_id)
     if result is None:
@@ -7220,13 +7220,13 @@ async def rename_backtest(backtest_id: str, payload: NameUpdateRequest) -> dict[
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@app.put("/api/backtests/{backtest_id}/name", response_model=dict[str, Any])
+@app.put("/api/backtests/{backtest_id}/name")
 async def rename_backtest_name(backtest_id: str, payload: NameUpdateRequest) -> dict[str, Any]:
     return await rename_backtest(backtest_id, payload)
 
 
-@app.get("/api/backtest/{backtest_id}/info", response_model=dict[str, Any])
-@app.get("/api/backtests/{backtest_id}/info", response_model=dict[str, Any])
+@app.get("/api/backtest/{backtest_id}/info")
+@app.get("/api/backtests/{backtest_id}/info")
 async def get_backtest_info(backtest_id: str) -> dict[str, Any]:
     result = _load_result(backtest_id)
     if result is None:
@@ -7234,8 +7234,8 @@ async def get_backtest_info(backtest_id: str) -> dict[str, Any]:
     return legacy_viewer._backtest_info_payload(result)
 
 
-@app.get("/api/backtest/{backtest_id}/stats", response_model=dict[str, Any])
-@app.get("/api/backtests/{backtest_id}/stats", response_model=dict[str, Any])
+@app.get("/api/backtest/{backtest_id}/stats")
+@app.get("/api/backtests/{backtest_id}/stats")
 async def get_backtest_stats(backtest_id: str) -> dict[str, Any]:
     result = _load_result(backtest_id)
     if result is None:
@@ -7248,8 +7248,8 @@ async def get_backtest_stats(backtest_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@app.get("/api/backtest/{backtest_id}/equity", response_model=list[dict[str, float]])
-@app.get("/api/backtests/{backtest_id}/equity", response_model=list[dict[str, float]])
+@app.get("/api/backtest/{backtest_id}/equity")
+@app.get("/api/backtests/{backtest_id}/equity")
 async def get_equity_curve(
     backtest_id: str,
     max_points: int = Query(default=0, ge=0, le=20000),
@@ -7362,7 +7362,7 @@ def _downsample_equity_curve_minmax(
     return deduped
 
 
-@app.get("/api/backtests/{backtest_id}/equity-preview", response_model=list[float])
+@app.get("/api/backtests/{backtest_id}/equity-preview")
 async def get_backtest_equity_preview(
     backtest_id: str,
     limit: int = Query(default=50, ge=1, le=100),
@@ -7379,7 +7379,7 @@ async def get_backtest_equity_preview(
     return _cached_backtest_equity_preview(normalized_id, limit=limit)
 
 
-@app.get("/api/backtests/equity-preview/batch", response_model=dict[str, list[float]])
+@app.get("/api/backtests/equity-preview/batch")
 async def get_backtest_equity_preview_batch(
     ids: str = Query(default=""),
     limit: int = Query(default=48, ge=1, le=100),
@@ -7411,7 +7411,7 @@ async def get_backtest_equity_preview_batch(
     }
 
 
-@app.get("/api/backtest/{backtest_id}/capm", response_model=CapmResponse)
+@app.get("/api/backtest/{backtest_id}/capm")
 async def get_backtest_capm(
     backtest_id: str,
     benchmark: str = Query(default=""),
@@ -7470,8 +7470,8 @@ async def get_backtest_capm(
     )
 
 
-@app.get("/api/backtest/{backtest_id}/trades", response_model=list[dict[str, Any]])
-@app.get("/api/backtests/{backtest_id}/trades", response_model=list[dict[str, Any]])
+@app.get("/api/backtest/{backtest_id}/trades")
+@app.get("/api/backtests/{backtest_id}/trades")
 async def get_backtest_trades(
     backtest_id: str,
     offset: int = Query(default=0, ge=0),
@@ -7741,7 +7741,7 @@ def _collect_viewer_drawings(result: BacktestResult, symbol: str | None = None) 
     return drawings
 
 
-@app.get("/api/backtest/{backtest_id}/trade/{trade_nr}", response_model=dict[str, Any])
+@app.get("/api/backtest/{backtest_id}/trade/{trade_nr}")
 async def get_trade_with_context(backtest_id: str, trade_nr: int) -> dict[str, Any]:
     return await asyncio.to_thread(_trade_context_payload, backtest_id, trade_nr)
 
@@ -7841,7 +7841,7 @@ def _trade_context_payload(backtest_id: str, trade_nr: int) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail="Failed to load trade context") from exc
 
 
-@app.get("/api/backtest/{backtest_id}/replay", response_model=dict[str, Any])
+@app.get("/api/backtest/{backtest_id}/replay")
 async def get_backtest_replay(backtest_id: str) -> dict[str, Any]:
     return await asyncio.to_thread(_replay_payload, backtest_id)
 
@@ -7946,7 +7946,7 @@ def _replay_payload(backtest_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail="Failed to load trade replay") from exc
 
 
-@app.get("/api/backtest/{backtest_id}/ohlcv", response_model=dict[str, Any])
+@app.get("/api/backtest/{backtest_id}/ohlcv")
 async def get_backtest_ohlcv(backtest_id: str) -> dict[str, Any]:
     return await asyncio.to_thread(_backtest_ohlcv_payload, backtest_id)
 
@@ -7970,7 +7970,7 @@ def _backtest_ohlcv_payload(backtest_id: str) -> dict[str, Any]:
     return ohlcv_data
 
 
-@app.get("/api/compare", response_model=dict[str, Any])
+@app.get("/api/compare")
 async def compare_backtests_endpoint(ids: str = Query(default="")) -> dict[str, Any]:
     return await asyncio.to_thread(_compare_backtests_payload, ids)
 
@@ -8072,7 +8072,7 @@ def _backtest_compare_payload(backtest_id: str) -> dict[str, Any]:
     }
 
 
-@app.post("/api/backtests/run", response_model=dict[str, Any], status_code=202)
+@app.post("/api/backtests/run", status_code=202)
 async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
     try:
         threading.Thread(target=_dolthub_pull, daemon=True).start()
@@ -8467,7 +8467,7 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
     return {"task_id": task_id, "job_id": task_id, "status": "queued"}
 
 
-@app.post("/api/backtests/run-signals", response_model=dict[str, Any], status_code=202)
+@app.post("/api/backtests/run-signals", status_code=202)
 async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, Any]:
     requested_timeframe = normalize_timeframe(str(payload.timeframe or "").strip()) or ""
     start_dt = _parse_request_date(payload.start_date, field_name="start_date")
@@ -8963,7 +8963,7 @@ async def run_backtest_from_signals(payload: BacktestRunFromSignalsRequest) -> d
     return await run_backtest_signals(replay_payload)
 
 
-@app.get("/api/backtests/run/{job_id}/status", response_model=dict[str, Any])
+@app.get("/api/backtests/run/{job_id}/status")
 async def get_backtest_run_status(job_id: str) -> dict[str, Any]:
     task = _snapshot_task(job_id)
     if task is not None and task.get("kind") == "backtest":
@@ -8985,7 +8985,7 @@ async def get_backtest_run_status(job_id: str) -> dict[str, Any]:
     return job
 
 
-@app.post("/api/optimizations/run", response_model=dict[str, Any], status_code=202)
+@app.post("/api/optimizations/run", status_code=202)
 async def run_optimization_job(payload: dict[str, Any]) -> dict[str, Any]:
     try:
         config = OptimizationConfig.model_validate(payload)
@@ -9091,7 +9091,7 @@ async def run_optimization_job(payload: dict[str, Any]) -> dict[str, Any]:
     return {"task_id": task_id, "job_id": task_id, "status": "queued"}
 
 
-@app.get("/api/optimizations", response_model=list[dict[str, Any]])
+@app.get("/api/optimizations")
 async def list_optimizations() -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     if not OPTIMIZATIONS_DIR.exists():
@@ -9101,7 +9101,7 @@ async def list_optimizations() -> list[dict[str, Any]]:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
             results.append(_optimization_summary_payload(payload, path))
-        except (json.JSONDecodeError, OSError, TypeError, ValueError) as exc:
+        except (OSError, TypeError, ValueError) as exc:
             logger.warning("Could not read optimization %s: %s", path, exc)
 
     results.sort(
@@ -9114,11 +9114,11 @@ async def list_optimizations() -> list[dict[str, Any]]:
     return results
 
 
-@app.get("/api/optimizations/{optimization_id}", response_model=dict[str, Any])
+@app.get("/api/optimizations/{optimization_id}")
 async def get_optimization(optimization_id: str) -> dict[str, Any]:
     try:
         payload = _load_optimization_payload(optimization_id)
-    except (json.JSONDecodeError, OSError, TypeError, ValueError) as exc:
+    except (OSError, TypeError, ValueError) as exc:
         logger.exception("Failed to load optimization '%s': %s", optimization_id, exc)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -9127,7 +9127,7 @@ async def get_optimization(optimization_id: str) -> dict[str, Any]:
     return payload
 
 
-@app.get("/api/portfolios/compare", response_model=dict[str, Any])
+@app.get("/api/portfolios/compare")
 async def compare_portfolios(ids: str = Query(default="")) -> dict[str, Any]:
     if not ids:
         raise HTTPException(status_code=400, detail="Provide ?ids=id1,id2")
@@ -9145,7 +9145,7 @@ async def compare_portfolios(ids: str = Query(default="")) -> dict[str, Any]:
     return {"portfolios": portfolios}
 
 
-@app.get("/api/portfolios", response_model=list[dict[str, Any]])
+@app.get("/api/portfolios")
 async def list_portfolios(
     name: str = Query(default=""),
     sort: str = Query(default="created_at"),
@@ -9162,7 +9162,7 @@ async def list_portfolios(
     return summaries
 
 
-@app.get("/api/portfolios/duplicates", response_model=PortfoliosDuplicatesResponse)
+@app.get("/api/portfolios/duplicates")
 async def list_portfolio_duplicates() -> PortfoliosDuplicatesResponse:
     groups, total_portfolios = _group_duplicate_portfolios()
     return PortfoliosDuplicatesResponse(
@@ -9172,7 +9172,7 @@ async def list_portfolio_duplicates() -> PortfoliosDuplicatesResponse:
     )
 
 
-@app.post("/api/portfolios/deduplicate", response_model=PortfoliosDeduplicateResponse)
+@app.post("/api/portfolios/deduplicate")
 async def deduplicate_portfolios() -> PortfoliosDeduplicateResponse:
     groups, _ = _group_duplicate_portfolios()
     deleted_ids: list[str] = []
@@ -9205,7 +9205,7 @@ async def deduplicate_portfolios() -> PortfoliosDeduplicateResponse:
     )
 
 
-@app.post("/api/portfolios/remove-empty", response_model=dict[str, Any])
+@app.post("/api/portfolios/remove-empty")
 async def remove_empty_portfolios() -> dict[str, Any]:
     portfolios = _snapshot_portfolio_payloads()
     removed_ids: list[str] = []
@@ -9226,7 +9226,7 @@ async def remove_empty_portfolios() -> dict[str, Any]:
     }
 
 
-@app.post("/api/portfolios", response_model=dict[str, Any], status_code=201)
+@app.post("/api/portfolios", status_code=201)
 async def create_portfolio(payload: CreatePortfolioRequest) -> dict[str, Any]:
     name = str(payload.name or "Untitled").strip() or "Untitled"
     account_capital = float(payload.account_capital or 100000.0)
@@ -9475,7 +9475,7 @@ def _load_portfolio_payload(portfolio_id: str) -> dict[str, Any]:
     return _portfolio_record_to_payload(record)
 
 
-@app.post("/api/portfolios/delete-bulk", response_model=dict[str, int])
+@app.post("/api/portfolios/delete-bulk")
 async def delete_portfolios_bulk(payload: PortfoliosBulkDeleteRequest) -> dict[str, int]:
     deleted = 0
     seen: set[str] = set()
@@ -9489,7 +9489,7 @@ async def delete_portfolios_bulk(payload: PortfoliosBulkDeleteRequest) -> dict[s
     return {"deleted": deleted}
 
 
-@app.get("/api/portfolios/{portfolio_id}", response_model=dict[str, Any])
+@app.get("/api/portfolios/{portfolio_id}")
 async def get_portfolio(portfolio_id: str) -> dict[str, Any]:
     payload = _load_portfolio_payload(portfolio_id)
     payload["combined_stats"] = legacy_viewer.PortfolioStats.from_dict(
@@ -9498,7 +9498,7 @@ async def get_portfolio(portfolio_id: str) -> dict[str, Any]:
     return payload
 
 
-@app.patch("/api/portfolios/{portfolio_id}", response_model=dict[str, Any])
+@app.patch("/api/portfolios/{portfolio_id}")
 async def rename_portfolio(portfolio_id: str, payload: NameUpdateRequest) -> dict[str, Any]:
     updated_name = str(payload.name or "").strip()
     if not updated_name:
@@ -9522,12 +9522,12 @@ async def rename_portfolio(portfolio_id: str, payload: NameUpdateRequest) -> dic
     return {"id": portfolio_id, "name": updated_name, "status": "updated"}
 
 
-@app.put("/api/portfolios/{portfolio_id}/name", response_model=dict[str, Any])
+@app.put("/api/portfolios/{portfolio_id}/name")
 async def rename_portfolio_name(portfolio_id: str, payload: NameUpdateRequest) -> dict[str, Any]:
     return await rename_portfolio(portfolio_id, payload)
 
 
-@app.get("/api/portfolios/{portfolio_id}/contributions", response_model=list[dict[str, Any]])
+@app.get("/api/portfolios/{portfolio_id}/contributions")
 async def get_portfolio_contributions(
     portfolio_id: str,
     group_by: str = Query(default="component"),
@@ -9536,7 +9536,7 @@ async def get_portfolio_contributions(
     return _compute_portfolio_contributions(portfolio=portfolio, group_by=group_by)
 
 
-@app.get("/api/portfolios/{portfolio_id}/trades", response_model=list[dict[str, Any]])
+@app.get("/api/portfolios/{portfolio_id}/trades")
 async def get_portfolio_trades(
     portfolio_id: str,
     strategy: str = Query(default=""),
@@ -9552,7 +9552,7 @@ async def get_portfolio_trades(
     )
 
 
-@app.delete("/api/portfolios/{portfolio_id}", response_model=dict[str, Any])
+@app.delete("/api/portfolios/{portfolio_id}")
 async def delete_portfolio(portfolio_id: str) -> dict[str, Any]:
     if not _delete_portfolio_with_artifacts(portfolio_id):
         raise HTTPException(status_code=404, detail="Portfolio not found")
@@ -9746,13 +9746,13 @@ async def _live_positions_payload(account_id: str) -> dict[str, Any]:
     return {"account_id": account_id, "positions": positions}
 
 
-@app.get("/api/live/accounts", response_model=list[dict[str, Any]])
+@app.get("/api/live/accounts")
 async def get_live_accounts() -> list[dict[str, Any]]:
     _log_live_endpoint_request("/api/live/accounts")
     return await asyncio.to_thread(_cached_live_accounts_payload)
 
 
-@app.get("/api/services", response_model=list[dict[str, Any]])
+@app.get("/api/services")
 async def get_services_endpoint(
     type: str | None = Query(default=None),  # noqa: A002 - follows API contract
 ) -> list[dict[str, Any]]:
@@ -9766,7 +9766,7 @@ async def get_services_endpoint(
     return [_serialize_service_payload(service) for service in services]
 
 
-@app.post("/api/services", response_model=dict[str, Any], status_code=201)
+@app.post("/api/services", status_code=201)
 async def create_service_endpoint(payload: ServiceCreateRequest) -> dict[str, Any]:
     try:
         service = Service(
@@ -9782,7 +9782,7 @@ async def create_service_endpoint(payload: ServiceCreateRequest) -> dict[str, An
     return _serialize_service_payload(created)
 
 
-@app.get("/api/services/{service_id}", response_model=dict[str, Any])
+@app.get("/api/services/{service_id}")
 async def get_service_endpoint(service_id: str) -> dict[str, Any]:
     service = await asyncio.to_thread(get_service, service_id)
     if service is None:
@@ -9790,7 +9790,7 @@ async def get_service_endpoint(service_id: str) -> dict[str, Any]:
     return _serialize_service_payload(service)
 
 
-@app.put("/api/services/{service_id}/status", response_model=dict[str, Any])
+@app.put("/api/services/{service_id}/status")
 async def update_service_status_endpoint(
     service_id: str,
     payload: ServiceStatusUpdateRequest,
@@ -9804,7 +9804,7 @@ async def update_service_status_endpoint(
     return _serialize_service_payload(updated)
 
 
-@app.delete("/api/services/{service_id}", response_model=dict[str, Any])
+@app.delete("/api/services/{service_id}")
 async def delete_service_endpoint(service_id: str) -> dict[str, Any]:
     deleted = await asyncio.to_thread(delete_service, service_id)
     if not deleted:
@@ -9861,7 +9861,7 @@ def _entry_matches_service_log(entry: dict[str, Any], *, service: Service, token
     return False
 
 
-@app.get("/api/services/{service_id}/logs", response_model=LogContentModel)
+@app.get("/api/services/{service_id}/logs")
 async def get_service_logs_endpoint(
     service_id: str,
     lines: int = Query(default=200, ge=1, le=100000),
@@ -9897,7 +9897,7 @@ async def get_service_logs_endpoint(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@app.get("/api/verification/evidence", response_model=list[VerificationEvidenceRecord])
+@app.get("/api/verification/evidence")
 async def get_verification_evidence(
     component: str = Query(default=""),
     category: str = Query(default=""),
@@ -9916,7 +9916,7 @@ async def get_verification_evidence(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.get("/api/verification/evidence/summary", response_model=list[VerificationEvidenceSummary])
+@app.get("/api/verification/evidence/summary")
 async def get_verification_evidence_summary(
     component: str = Query(default=""),
     category: str = Query(default=""),
@@ -9935,7 +9935,7 @@ async def get_verification_evidence_summary(
 
 @app.post(
     "/api/verification/evidence",
-    response_model=VerificationEvidenceRecord,
+
     status_code=201,
 )
 async def create_verification_evidence(
@@ -9965,14 +9965,14 @@ async def create_verification_evidence(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.get("/api/live/deployments", response_model=list[dict[str, Any]])
+@app.get("/api/live/deployments")
 async def get_live_deployments() -> list[dict[str, Any]]:
     _log_live_endpoint_request("/api/live/deployments")
     deployments = await asyncio.to_thread(list_live_deployments)
     return [_serialize_live_deployment_payload(deployment) for deployment in deployments]
 
 
-@app.get("/api/live/dashboard", response_model=dict[str, Any])
+@app.get("/api/live/dashboard")
 async def get_live_dashboard() -> dict[str, Any]:
     _log_live_endpoint_request("/api/live/dashboard")
     accounts, deployments = await asyncio.gather(
@@ -10049,7 +10049,7 @@ async def get_live_dashboard() -> dict[str, Any]:
     }
 
 
-@app.post("/api/live/deployments/ctrader/top5", response_model=dict[str, Any])
+@app.post("/api/live/deployments/ctrader/top5")
 async def deploy_top_ctrader_strategies(payload: CTraderTopDeployRequest) -> dict[str, Any]:
     limit = max(1, min(int(payload.limit or 5), 20))
     status = "ACTIVE" if payload.activate else "PAUSED"
@@ -10096,7 +10096,7 @@ async def deploy_top_ctrader_strategies(payload: CTraderTopDeployRequest) -> dic
     }
 
 
-@app.post("/api/live/deployments", response_model=dict[str, Any], status_code=201)
+@app.post("/api/live/deployments", status_code=201)
 async def create_live_deployment_endpoint(
     payload: LiveDeploymentCreateRequest,
 ) -> dict[str, Any]:
@@ -10213,7 +10213,7 @@ async def create_live_deployment_endpoint(
     return _serialize_live_deployment_payload(created)
 
 
-@app.put("/api/live/deployments/{deployment_id}/status", response_model=dict[str, Any])
+@app.put("/api/live/deployments/{deployment_id}/status")
 async def update_live_deployment_status_endpoint(
     deployment_id: str, payload: LiveDeploymentStatusUpdateRequest
 ) -> dict[str, Any]:
@@ -10233,7 +10233,7 @@ async def update_live_deployment_status_endpoint(
     return _serialize_live_deployment_payload(updated)
 
 
-@app.delete("/api/live/deployments/{deployment_id}", response_model=dict[str, Any])
+@app.delete("/api/live/deployments/{deployment_id}")
 async def delete_live_deployment_endpoint(deployment_id: str) -> dict[str, Any]:
     _log_live_endpoint_request(
         "/api/live/deployments/{deployment_id}",
@@ -10245,7 +10245,7 @@ async def delete_live_deployment_endpoint(deployment_id: str) -> dict[str, Any]:
     return {"status": "deleted", "id": deployment_id}
 
 
-@app.get("/api/live/balances/{account_id}", response_model=dict[str, Any])
+@app.get("/api/live/balances/{account_id}")
 async def get_live_balances(account_id: str) -> dict[str, Any]:
     _log_live_endpoint_request(
         "/api/live/balances/{account_id}",
@@ -10268,7 +10268,7 @@ async def get_live_balances(account_id: str) -> dict[str, Any]:
     return {"account_id": account_id, "series": series}
 
 
-@app.get("/api/live/trades/{account_id}", response_model=dict[str, Any])
+@app.get("/api/live/trades/{account_id}")
 async def get_live_trades(account_id: str) -> dict[str, Any]:
     _log_live_endpoint_request(
         "/api/live/trades/{account_id}",
@@ -10277,7 +10277,7 @@ async def get_live_trades(account_id: str) -> dict[str, Any]:
     return await _live_trades_payload(account_id)
 
 
-@app.get("/api/live/signals/{account_id}", response_model=dict[str, Any])
+@app.get("/api/live/signals/{account_id}")
 async def get_live_signals(account_id: str, limit: int = Query(default=200, ge=1, le=1000)) -> dict[str, Any]:
     _log_live_endpoint_request(
         "/api/live/signals/{account_id}",
@@ -10287,7 +10287,7 @@ async def get_live_signals(account_id: str, limit: int = Query(default=200, ge=1
     return await _live_signals_payload(account_id, limit=limit)
 
 
-@app.get("/api/live/stats/{account_id}", response_model=dict[str, Any])
+@app.get("/api/live/stats/{account_id}")
 async def get_live_stats(account_id: str) -> dict[str, Any]:
     _log_live_endpoint_request(
         "/api/live/stats/{account_id}",
@@ -10332,7 +10332,7 @@ def _fallback_live_quote_payload(symbol: str, *, limit: int = 500) -> dict[str, 
     return None
 
 
-@app.get("/api/live/quotes/{symbol}", response_model=dict[str, Any])
+@app.get("/api/live/quotes/{symbol}")
 async def get_live_quotes(symbol: str) -> dict[str, Any]:
     _log_live_endpoint_request(
         "/api/live/quotes/{symbol}",
@@ -10347,7 +10347,7 @@ async def get_live_quotes(symbol: str) -> dict[str, Any]:
     return payload
 
 
-@app.get("/api/live/positions/{account_id}", response_model=dict[str, Any])
+@app.get("/api/live/positions/{account_id}")
 async def get_live_positions(account_id: str) -> dict[str, Any]:
     _log_live_endpoint_request(
         "/api/live/positions/{account_id}",
@@ -10699,7 +10699,7 @@ def _manual_cache_invalidation_payload(
     }
 
 
-@app.post("/api/agent/convert", response_model=dict[str, Any], status_code=202)
+@app.post("/api/agent/convert", status_code=202)
 async def agent_convert(payload: AgentConvertRequest, background_tasks: BackgroundTasks) -> dict[str, Any]:
     code = str(payload.code or "")
     if not code.strip():
@@ -10747,7 +10747,7 @@ async def agent_convert(payload: AgentConvertRequest, background_tasks: Backgrou
     return queued
 
 
-@app.get("/api/data/dukascopy/genesis", response_model=dict[str, Any])
+@app.get("/api/data/dukascopy/genesis")
 async def get_dukascopy_genesis(
     symbols: str = Query(default=""),
     timeframes: str = Query(default=""),
@@ -10766,7 +10766,7 @@ async def get_dukascopy_genesis(
     }
 
 
-@app.get("/api/data/check", response_model=dict[str, Any])
+@app.get("/api/data/check")
 async def data_check(
     symbol: str = Query(default=""),
     timeframe: str = Query(default="1d"),
@@ -10833,7 +10833,7 @@ async def data_resample(payload: DataResampleRequest) -> dict[str, Any]:
     return result
 
 
-@app.post("/api/data/harvest", response_model=dict[str, Any])
+@app.post("/api/data/harvest")
 async def data_harvest(payload: DataHarvestRequest) -> dict[str, Any]:
     source = str(payload.source or "dukascopy").strip().lower()
     if source != "dukascopy":
@@ -10878,7 +10878,7 @@ async def data_harvest(payload: DataHarvestRequest) -> dict[str, Any]:
     return result
 
 
-@app.post("/api/data/validate", response_model=dict[str, Any])
+@app.post("/api/data/validate")
 async def data_validate(payload: DataValidateRequest) -> dict[str, Any]:
     task_id = str(uuid.uuid4())
     cmd = [sys.executable, "-u", "-m", "data_tools.validate", "--data-dir", str(DATA_DIR)]
@@ -10903,7 +10903,7 @@ async def data_validate(payload: DataValidateRequest) -> dict[str, Any]:
     return result
 
 
-@app.post("/api/data/calibrate", response_model=dict[str, Any])
+@app.post("/api/data/calibrate")
 async def data_calibrate(payload: DataCalibrateRequest) -> dict[str, Any]:
     symbols = str(payload.symbols or "").strip()
     if not symbols:
@@ -10953,7 +10953,7 @@ async def data_calibrate(payload: DataCalibrateRequest) -> dict[str, Any]:
     return result
 
 
-@app.get("/api/data/tasks", response_model=dict[str, Any])
+@app.get("/api/data/tasks")
 async def list_data_tasks() -> dict[str, Any]:
     await asyncio.to_thread(_hydrate_task_cache_once)
 
@@ -10975,12 +10975,12 @@ async def list_data_tasks() -> dict[str, Any]:
     return {"tasks": payload}
 
 
-@app.get("/api/tasks", response_model=dict[str, Any])
+@app.get("/api/tasks")
 async def list_tasks() -> dict[str, Any]:
     return await list_data_tasks()
 
 
-@app.get("/api/data/tasks/{task_id}", response_model=dict[str, Any])
+@app.get("/api/data/tasks/{task_id}")
 async def get_data_task(task_id: str) -> dict[str, Any]:
     task = _snapshot_task(task_id)
     if not task:
@@ -10988,12 +10988,12 @@ async def get_data_task(task_id: str) -> dict[str, Any]:
     return _serialize_task(task_id, task, include_log=True)
 
 
-@app.post("/api/data/tasks/{task_id}/restart", response_model=dict[str, Any])
+@app.post("/api/data/tasks/{task_id}/restart")
 async def restart_data_task(task_id: str) -> dict[str, Any]:
     return await asyncio.to_thread(_restart_interrupted_task, task_id)
 
 
-@app.post("/api/data/tasks/{task_id}/pause", response_model=dict[str, Any])
+@app.post("/api/data/tasks/{task_id}/pause")
 async def pause_data_task(task_id: str) -> dict[str, Any]:
     task = _get_task(task_id)
     if task is None:
@@ -11013,7 +11013,7 @@ async def pause_data_task(task_id: str) -> dict[str, Any]:
     return _task_action_payload(task_id)
 
 
-@app.post("/api/data/tasks/{task_id}/resume", response_model=dict[str, Any])
+@app.post("/api/data/tasks/{task_id}/resume")
 async def resume_data_task(task_id: str) -> dict[str, Any]:
     task = _get_task(task_id)
     if task is None:
@@ -11033,7 +11033,7 @@ async def resume_data_task(task_id: str) -> dict[str, Any]:
     return _task_action_payload(task_id)
 
 
-@app.post("/api/data/tasks/{task_id}/cancel", response_model=dict[str, Any])
+@app.post("/api/data/tasks/{task_id}/cancel")
 async def cancel_data_task(task_id: str) -> dict[str, Any]:
     task = _get_task(task_id)
     if task is None:
@@ -11054,7 +11054,7 @@ async def cancel_data_task(task_id: str) -> dict[str, Any]:
     return _task_action_payload(task_id)
 
 
-@app.get("/api/data/tasks/{task_id}/logs", response_model=dict[str, Any])
+@app.get("/api/data/tasks/{task_id}/logs")
 async def get_data_task_logs(task_id: str) -> dict[str, Any]:
     task = _snapshot_task(task_id)
     log_file = _task_log_path(task_id)
@@ -11066,7 +11066,7 @@ async def get_data_task_logs(task_id: str) -> dict[str, Any]:
     }
 
 
-@app.delete("/api/data/tasks/{task_id}", response_model=dict[str, Any])
+@app.delete("/api/data/tasks/{task_id}")
 async def delete_data_task(task_id: str) -> dict[str, Any]:
     with DATA_TASKS_LOCK:
         task = DATA_TASKS.get(task_id)
@@ -11109,11 +11109,11 @@ async def delete_symbol_data(path: str = Query(default="")) -> dict[str, Any]:
         _invalidate_data_views_cache()
         _refresh_catalog()
         return {"status": "deleted"}
-    except (FileNotFoundError, OSError) as exc:
+    except OSError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@app.get("/api/logs", response_model=list[LogFileModel])
+@app.get("/api/logs")
 async def list_logs() -> list[LogFileModel]:
     log_files = legacy_viewer._available_log_files()
     total_size = sum(path.stat().st_size for path in log_files) if log_files else 0
@@ -11137,7 +11137,7 @@ async def list_logs() -> list[LogFileModel]:
     return logs
 
 
-@app.get("/api/logs/{log_name}", response_model=LogContentModel)
+@app.get("/api/logs/{log_name}")
 async def get_log(
     log_name: str,
     lines: int = Query(default=200, ge=1, le=100000),
