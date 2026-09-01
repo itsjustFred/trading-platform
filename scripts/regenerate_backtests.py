@@ -726,13 +726,13 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
-    regenerate(
+    outcome = regenerate(
         dry_run=False,
         assume_yes=True,
         strategies=args.strategies or None,
         backup_dir=args.backup_dir,
     )
-    return 0
+    return 1 if isinstance(outcome, RegenerationOutcome) and outcome.failures else 0
 
 
 if __name__ == "__main__":
