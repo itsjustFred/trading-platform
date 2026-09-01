@@ -91,7 +91,11 @@ def get_signal_processor_config_path(name: str) -> Path:
     return _bot_config_path(bot_dir)
 
 
-def _build_from_bot_dir(bot_dir: str, factory: Callable[[dict[str, Any]], object], config: dict[str, Any]) -> object:
+def _build_from_bot_dir(
+    bot_dir: str,
+    factory: Callable[[dict[str, Any]], object],
+    config: dict[str, Any],
+) -> object:
     return _build_from_config(_bot_config_path(bot_dir), factory, config)
 
 
