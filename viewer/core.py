@@ -56,7 +56,6 @@ STATIC_DIR = REACT_DIST if REACT_DIST.exists() else Path(__file__).parent / "sta
 
 STRATEGIES_DIR = DEFAULT_STRATEGIES_DIR
 PORTFOLIOS_DIR = DATA_DIR / "portfolios"
-GRID_RESULTS_DIR = DATA_DIR / "grid_results"
 LOGS_DIR = LOG_DIR
 TASK_LOGS_DIR = LOGS_DIR / "tasks"
 ALL_LOGS_NAME = "ALL_LOGS"

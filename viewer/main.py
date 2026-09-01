@@ -939,9 +939,10 @@ def _safe_asset_id(raw_id: object) -> str:
 def _contained_asset_path(base_dir: Path, asset_id: str, suffix: str) -> Path | None:
     """Join ``asset_id`` onto ``base_dir`` if the result stays inside it.
 
-    Mirrors the ``_resolve_grid_result_path`` pattern: the resolved candidate
-    must be contained in the resolved base directory, otherwise ``None`` is
-    returned so the caller never builds an unlink path from raw input.
+    The resolved candidate must be contained in the resolved base directory,
+    otherwise ``None`` is returned so the caller never builds an unlink path
+    from raw input. See :func:`_contained_client_data_file` for the
+    client-path variant of the same containment contract.
     """
     normalized = _safe_asset_id(asset_id)
     if not normalized:
@@ -10763,21 +10764,12 @@ async def delete_symbol_data(path: str = Query(default="")) -> dict[str, Any]:
     if not path:
         raise HTTPException(status_code=400, detail="Path required")
 
-    file_path = Path(path)
-    try:
-        file_path = file_path.resolve()
-        data_root = DATA_DIR.resolve()
-        # Containment must be checked on resolved paths (prefix strings can be
-        # spoofed with ".." components) and deletion is restricted to the
-        # parquet files the catalog manages.
-        if not file_path.is_relative_to(data_root):
-            raise HTTPException(status_code=403, detail="Access denied")
-        if file_path.suffix.lower() != ".parquet":
-            raise HTTPException(status_code=400, detail="Only parquet files can be deleted")
-    except HTTPException:
-        raise
-    except (OSError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail="Invalid path") from exc
+    # Containment must be checked on resolved paths (prefix strings can be
+    # spoofed with ".." components) and deletion is restricted to the parquet
+    # files the catalog manages.
+    file_path = _contained_client_data_file(path, allowed_suffix=".parquet")
+    if file_path is None:
+        raise HTTPException(status_code=403, detail="Access denied")
 
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="File not found")

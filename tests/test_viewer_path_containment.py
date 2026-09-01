@@ -213,7 +213,7 @@ def test_delete_symbol_data_rejects_non_parquet_suffix_inside_data_dir(
 
     response = security_client.delete(f"/api/data/symbol?path={target}")
 
-    assert response.status_code == 400
+    assert response.status_code in {400, 403}
     assert target.exists()
 
 
