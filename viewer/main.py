@@ -255,32 +255,26 @@ _JOBS_LOCK = legacy_viewer._JOBS_LOCK
 _JOBS_TIMESTAMP = legacy_viewer._JOBS_TIMESTAMP
 
 
-def _set_job_status(job_id: str, status: str) -> None:
-    """Lock-guarded single-field job status transition (never registers)."""
+def _update_job_field(job_id: str, field: str, value: Any) -> None:
+    """Lock-guarded single-field job update (never registers a missing job)."""
     with _JOBS_LOCK:
         job = _running_jobs.get(job_id)
         if job is None:
             return
-        job["status"] = status
+        job[field] = value
         _JOBS_TIMESTAMP[job_id] = time.monotonic()
+
+
+def _set_job_status(job_id: str, status: str) -> None:
+    _update_job_field(job_id, "status", status)
 
 
 def _mark_job_result(job_id: str, result: Any | None) -> None:
-    with _JOBS_LOCK:
-        job = _running_jobs.get(job_id)
-        if job is None:
-            return
-        job["result"] = result
-        _JOBS_TIMESTAMP[job_id] = time.monotonic()
+    _update_job_field(job_id, "result", result)
 
 
 def _mark_job_error(job_id: str, error: str | None) -> None:
-    with _JOBS_LOCK:
-        job = _running_jobs.get(job_id)
-        if job is None:
-            return
-        job["error"] = error
-        _JOBS_TIMESTAMP[job_id] = time.monotonic()
+    _update_job_field(job_id, "error", error)
 
 
 def _register_job(job_id: str, job: dict[str, Any]) -> None:

@@ -235,10 +235,10 @@ export function BacktestDetailPage() {
     avgPnl:
       typeof stats?.avg_trade_pnl === "number"
         ? stats.avg_trade_pnl
-        : trades.length > 0
-          ? (typeof stats?.net_profit === "number" ? stats.net_profit : 0) /
-            Math.max(trades.length, 1)
-          : 0,
+        : (typeof stats?.total_trades === "number" && stats.total_trades > 0
+            ? (typeof stats?.net_profit === "number" ? stats.net_profit : 0) /
+              stats.total_trades
+            : 0),
     bestTrade:
       typeof stats?.best_trade === "number" ? stats.best_trade : null,
     worstTrade:
