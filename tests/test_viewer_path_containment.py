@@ -523,3 +523,33 @@ def test_cors_middleware_disallows_wildcard_origins_and_credentials():
     kwargs = cors.kwargs
     assert kwargs["allow_origins"] == []
     assert kwargs["allow_credentials"] is False
+
+
+def test_strategy_path_resolves_only_regular_files_inside_strategies_dir(
+    monkeypatch, tmp_path
+):
+    """CodeRabbit hardening: the registry fallback must stay file-only and contained.
+
+    An absolute identifier must not resolve (pathlib drops the base when
+    joining an absolute path), and directories must not resolve even when
+    they exist, because the value is handed to a subprocess as a code file.
+    """
+    from viewer import core as legacy_module
+
+    strategies_dir = tmp_path / "strategies"
+    strategies_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(legacy_module, "STRATEGIES_DIR", strategies_dir)
+
+    (strategies_dir / "demo.py").write_text("STRATEGY_META = {'name': 'D'}\n")
+    nested = strategies_dir / "nested"
+    nested.mkdir()
+
+    assert legacy_module._strategy_path("demo.py") == (strategies_dir / "demo.py").resolve()
+    # absolute identifier must not resolve even though /etc/hosts exists
+    assert legacy_module._strategy_path("/etc/hosts") is None
+    # directories must not resolve
+    assert legacy_module._strategy_path("nested") is None
+    # blank identifier must not resolve
+    assert legacy_module._strategy_path("   ") is None
+    # missing identifier must not resolve
+    assert legacy_module._strategy_path("missing.py") is None

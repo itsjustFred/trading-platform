@@ -161,9 +161,11 @@ def _strategy_path(identifier: str) -> Path | None:
     """Resolve a strategy identifier to a file inside ``STRATEGIES_DIR``.
 
     Only registry identifiers (slug, relative file, module name, display name)
-    resolve to a path. Absolute client paths and traversal escapes such as
-    ``../x.py`` are rejected so the value can be handed to a subprocess
-    without letting a request select arbitrary code on disk.
+    resolve to a path. The fallback branch resolves relative identifiers that
+    name an existing regular file inside the strategies tree; absolute client
+    paths and traversal escapes such as ``../x.py`` are rejected so the value
+    can be handed to a subprocess without letting a request select arbitrary
+    code on disk.
     """
     entry = _strategy_entry(identifier)
     if entry is not None:
@@ -172,8 +174,15 @@ def _strategy_path(identifier: str) -> Path | None:
     normalized = str(identifier or "").strip()
     if not normalized:
         return None
+    # Reject anything with path separators or ".." segments before joining:
+    # the registry matcher normalizes identifiers aggressively (punctuation
+    # is stripped, so "../demo.py" can alias "demo.py"), and pathlib also
+    # drops the base when joining an absolute path. Only a bare relative
+    # file name inside STRATEGIES_DIR may pass this branch.
+    if "/" in normalized or "\\" in normalized or normalized in {".", ".."}:
+        return None
     candidate = (STRATEGIES_DIR / normalized).resolve()
-    if not candidate.exists():
+    if not candidate.is_file():
         return None
     if not candidate.is_relative_to(STRATEGIES_DIR.resolve()):
         return None
