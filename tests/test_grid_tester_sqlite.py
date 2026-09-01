@@ -293,3 +293,44 @@ def test_run_strategy_grid_passes_strategy_path_and_reports_errors(monkeypatch, 
     # Canonical stats keys are used (F40): no fabricated zeros for missing metrics
     assert "sharpe_ratio" not in cells["1h"]
     assert "net_profit_pct" not in cells["1h"]
+
+
+def test_all_error_grid_is_not_persisted(monkeypatch, tmp_path) -> None:
+    """AC: never persist successful-looking artifacts for failed runs."""
+    import runner.grid_tester as grid_tester_module
+
+    class FailingEngine:
+        name = "fake"
+
+        def run(self, config, strategy_path, progress_callback=None):
+            raise RuntimeError("engine blew up")
+
+    strategy_file = tmp_path / "strategies" / "broken.py"
+    strategy_file.parent.mkdir(parents=True, exist_ok=True)
+    strategy_file.write_text("STRATEGY_META = {'name': 'broken'}\n", encoding="utf-8")
+
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        grid_tester_module,
+        "find_strategy_entry",
+        lambda slug: SimpleNamespace(slug=slug, file_path=strategy_file),
+    )
+    monkeypatch.setattr(grid_tester_module, "get_engine", lambda engine_name: FailingEngine())
+    monkeypatch.setattr(grid_tester_module, "GRID_RESULTS_DIR", tmp_path / "grid_results")
+    persisted: list[dict] = []
+    monkeypatch.setattr("shared.database.save_grid_result", lambda **kw: persisted.append(kw))
+
+    result = grid_tester_module.run_strategy_grid(
+        strategy_slug="broken",
+        symbols=["AAPL"],
+        timeframes=["1h"],
+        start="2024-01-01",
+        end="2024-01-31",
+        engine_name="fake_engine",
+    )
+
+    assert result["status"] == "error"
+    assert "All 1 grid cells failed" in result["message"]
+    assert persisted == []
+    assert not (tmp_path / "grid_results").exists()

@@ -110,6 +110,26 @@ def run_strategy_grid(
                     "error": str(e),
                 }
     
+    # A grid where every cell failed is a failed run, not a completed one:
+    # never persist a successful-looking artifact for it (Decision Record).
+    total_cells = sum(len(cells) for cells in results_matrix.values())
+    error_cells = sum(
+        1
+        for cells in results_matrix.values()
+        for cell in cells.values()
+        if cell.get("status") == "error"
+    )
+    if total_cells and error_cells == total_cells:
+        return {
+            "status": "error",
+            "message": (
+                f"All {total_cells} grid cells failed for {strategy_slug}; "
+                "refusing to persist the all-error matrix as a completed run"
+            ),
+            "results": results_matrix,
+            "engine": engine_name,
+        }
+
     # Save grid results
     GRID_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     now = datetime.now(timezone.utc)
@@ -130,9 +150,9 @@ def run_strategy_grid(
     output_path.write_text(json.dumps(payload, indent=2))
 
     # Also save to SQLite
-    from shared.database import save_grid_result
+    from shared.database import save_grid_result as _save_grid_result
 
-    save_grid_result(
+    _save_grid_result(
         grid_id=grid_id,
         strategy=strategy_slug,
         symbols=symbols,

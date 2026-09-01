@@ -249,10 +249,10 @@ def test_subprocess_command_does_not_pass_grid_only_flags(tmp_path):
         output_path=tmp_path / "out.trades.json",
         data_dir="/tmp/data",
         save_sqlite=False,
-        keep_indicators=True,
     )
 
     assert "--keep-indicators" not in cmd
+    assert "--skip-sqlite" in cmd
 
 
 def test_no_date_range_is_fabricated_when_data_missing(tmp_path):

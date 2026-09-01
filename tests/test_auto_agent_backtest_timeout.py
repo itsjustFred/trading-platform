@@ -26,6 +26,9 @@ def test_run_backtest_kills_hung_child_after_timeout(monkeypatch):
         def kill(self):
             created["killed"] = True
 
+        def poll(self):
+            return None if not created.get("killed") else -9
+
     monkeypatch.setattr(auto_agent.subprocess, "Popen", lambda *a, **k: FakeProc())
 
     with pytest.raises(RuntimeError, match="timed out"):
@@ -40,6 +43,9 @@ def test_run_backtest_returns_output_on_success(monkeypatch):
             self.stdout = iter(["hello\n"])
 
         def wait(self, timeout=None):
+            return 0
+
+        def poll(self):
             return 0
 
     monkeypatch.setattr(auto_agent.subprocess, "Popen", lambda *a, **k: FakeProc())

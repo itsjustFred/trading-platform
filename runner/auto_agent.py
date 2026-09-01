@@ -819,7 +819,6 @@ def _run_backtest(cmd: list[str], *, log: TaskLogger | None) -> tuple[int, str]:
             for line in proc.stdout:
                 output_lines.append(line)
                 _log(log, line.rstrip("\n"), stream="stdout")
-    finally:
         try:
             returncode = proc.wait(timeout=BACKTEST_TIMEOUT_SECONDS)
         except subprocess.TimeoutExpired:
@@ -828,7 +827,11 @@ def _run_backtest(cmd: list[str], *, log: TaskLogger | None) -> tuple[int, str]:
             raise RuntimeError(
                 f"Generated-strategy backtest timed out after "
                 f"{BACKTEST_TIMEOUT_SECONDS} seconds: {' '.join(cmd)}"
-            )
+            ) from None
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=30)
 
     return returncode, "".join(output_lines)
 

@@ -141,7 +141,6 @@ def build_cli_command(
     output_path: Path,
     data_dir: str,
     save_sqlite: bool = True,
-    keep_indicators: bool = False,
     result_id: str = "",
 ) -> list[str]:
     cmd = [
@@ -470,7 +469,6 @@ def run_one_backtest(
         output_path=path,
         data_dir=data_dir,
         save_sqlite=save_sqlite,
-        keep_indicators=keep_indicators,
         result_id=run_id,
     )
     result["cmd"] = " ".join(cmd)
