@@ -679,7 +679,21 @@ def _split_tick_sides(tick_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame
 
 
 def _merge_tick_sides(bid_df: pd.DataFrame, ask_df: pd.DataFrame) -> pd.DataFrame:
-    """Join side frames back onto a single bid+ask frame with explicit prefixes."""
+    """Join side frames back onto a single bid+ask frame with explicit prefixes.
+
+    Raises when an input frame does not carry the expected side columns
+    (schema drift must surface as an error, not as silently dropped sides).
+    """
+    expected_by_side = {"bid": ("bid", "bid_vol"), "ask": ("ask", "ask_vol")}
+    for name, frame in (("bid", bid_df), ("ask", ask_df)):
+        if frame.empty:
+            continue
+        missing = [column for column in expected_by_side[name] if column not in frame.columns]
+        if missing:
+            raise RuntimeError(
+                f"{name} tick frame is missing required side columns: {missing}"
+            )
+
     if bid_df.empty and ask_df.empty:
         return pd.DataFrame(
             columns=["timestamp", "ask", "bid", "ask_vol", "bid_vol"]
@@ -709,20 +723,14 @@ def _merge_tick_sides(bid_df: pd.DataFrame, ask_df: pd.DataFrame) -> pd.DataFram
             .reset_index(drop=True)
         )
 
+    # The side frames carry disjoint column sets (built by _split_tick_sides
+    # or the per-side assemblers), so the join needs no suffix handling.
     merged = pd.merge(
         bid_df,
         ask_df,
         on="timestamp",
         how="inner",
-        suffixes=("_dup", "_dup"),
-    )
-    merged = merged.rename(
-        columns={
-            "bid_dup": "bid",
-            "bid_vol_dup": "bid_vol",
-            "ask_dup": "ask",
-            "ask_vol_dup": "ask_vol",
-        }
+        validate="one_to_one",
     )
     missing = {"bid", "bid_vol", "ask", "ask_vol"} - set(merged.columns)
     if missing:

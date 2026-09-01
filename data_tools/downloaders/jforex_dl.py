@@ -71,6 +71,46 @@ DUKASCOPY_ALLOWED_HOST_SUFFIXES = (
 # Format: "<url>=<hex sha256>[,<url>=<hex sha256>...]"
 EXPECTED_JAR_DIGEST_ENV = "JFOREX_EXPECTED_JAR_SHA256"
 
+# Error fragments that mark the JForex SDK as unavailable so the viewer can
+# fall back to the native Dukascopy downloader instead of failing the task.
+# The bootstrap hard-raises on these (DV-B6/DV-B7), so the viewer's
+# `_jforex_fallback_reason` must keep matching them — extend this list when a
+# new bootstrap failure surface is added; do not swallow the errors inside the
+# downloader itself.
+UNAVAILABLE_ERROR_FRAGMENTS: tuple[str, ...] = (
+    "jpype is required",
+    "no module named 'jpype'",
+    "failed to import 'com.dukascopy'",
+    "classnotfoundexception",
+    "com.dukascopy",
+    "failed to start jvm",
+    "could not resolve jforex sdk classpath",
+    "jforex sdk classpath",
+    "jvm shared library",
+    "jvm dll not found",
+    "no jvm shared library file",
+    "nullpointerexception",
+    "jforex sdk request execution failed",
+    "jforex connection timed out",
+    "jforex data request timed out",
+    "jforex history query failed",
+    "interval from [",
+    "not valid for period",
+    "dukascopy credentials",
+    # Bootstrap surfaces (DV-B6/DV-B7):
+    "non-dukascopy host",
+    "integrity check failed",
+    "failed to fetch jnlp",
+    "invalid jnlp payload",
+    "no jar resources found in jnlp",
+    "failed to download jar",
+    "did not resolve any downloadable jar files",
+    "jvm candidates tried",
+    "failed to initialize jvm thread context class loader",
+    "jforex sdk import failed",
+    "jforex sdk prewarm failed",
+)
+
 TIMEFRAME_ALIASES: dict[str, str] = {
     "tick": "tick",
     "m1": "1m",
@@ -408,6 +448,9 @@ def _download_jforex_jars_from_jnlp(
                     output_path.write_bytes(response.read())
             except URLError as exc:
                 raise RuntimeError(f"Failed to download JAR '{jar_url}': {exc}") from exc
+        # DV-B6b: the digest check runs on the artifact that actually ends up
+        # on the classpath — also when the file was already cached on disk
+        # from an earlier (possibly different or tampered) download.
         _verify_jar_digest(output_path, jar_url, expected_digests)
         downloaded.append(output_path)
 

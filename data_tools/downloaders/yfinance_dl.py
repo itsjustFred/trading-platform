@@ -88,7 +88,9 @@ def _to_utc_timestamp(value: str | None) -> pd.Timestamp | None:
     return pd.Timestamp(ts)
 
 
-def _resample_4h_utc_grid(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
+def _resample_4h_utc_grid(
+    df: pd.DataFrame, source_bucket: str = "60m"
+) -> tuple[pd.DataFrame, str]:
     """Resample intraday rows onto the canonical 4h/UTC-aligned grid.
 
     The input must carry a UTC ``timestamp`` column. Buckets start at the
@@ -99,9 +101,8 @@ def _resample_4h_utc_grid(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
     ``source_bucket_timeframe``.
     """
     if df.empty:
-        return df.copy(), "60m"
+        return df.copy(), source_bucket
 
-    source_bucket = "60m"
     indexed = df.set_index("timestamp")
     resampled = (
         indexed.resample("4h", origin="start_day", label="left", closed="left")
@@ -291,10 +292,10 @@ class YFinanceDownloader(Downloader):
             raise RuntimeError(f"yfinance returned only empty/NaN rows for {normalized_symbol} ({canonical_tf})")
 
         if canonical_tf == "4h":
-            df, bucket_origin = _resample_4h_utc_grid(df)
+            df, bucket_origin = _resample_4h_utc_grid(df, source_bucket=yf_interval)
             warnings.append(
                 (
-                    f"Resampled yfinance 60m bars onto the UTC-aligned 4h grid "
+                    f"Resampled yfinance {yf_interval} bars onto the UTC-aligned 4h grid "
                     f"(origin={bucket_origin}); source bucket metadata kept in "
                     f"'{BUCKET_METADATA_COLUMN}'."
                 )

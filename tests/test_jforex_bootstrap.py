@@ -123,6 +123,42 @@ def test_verify_jar_digest_skips_when_no_digests_configured(tmp_path: Path):
     assert jforex_dl._verify_jar_digest(jar, "https://platform.dukascopy.com/api.jar", {}) is True
 
 
+def test_bootstrap_verifies_cached_jar_from_earlier_download(monkeypatch, tmp_path: Path):
+    """DV-B6b: the digest check must run on the file that hits the classpath.
+
+    A JAR that already exists on disk (e.g. cached by an earlier bootstrap run,
+    or placed there by other means) must be verified as well — not only freshly
+    downloaded bytes.
+    """
+    from data_tools.downloaders import jforex_dl
+
+    jar_urls = ["https://platform.dukascopy.com/api.jar"]
+    monkeypatch.setattr(
+        jforex_dl,
+        "_parse_jnlp_jar_urls",
+        lambda jnlp_url: jar_urls,
+    )
+
+    def fake_urlopen(url, timeout=0):  # pragma: no cover - must not be called
+        raise AssertionError("cached JAR must be verified without re-downloading")
+
+    monkeypatch.setattr(jforex_dl, "urlopen", fake_urlopen)
+    monkeypatch.setenv(
+        "JFOREX_EXPECTED_JAR_SHA256",
+        f"{jar_urls[0]}={_sha256(b'expected')}",
+    )
+
+    cached = tmp_path / "api.jar"
+    cached.write_bytes(b"tampered-cache")
+
+    with pytest.raises(RuntimeError, match="Integrity check failed"):
+        jforex_dl._download_jforex_jars_from_jnlp(
+            "https://platform.dukascopy.com/demo/jforex.jnlp", tmp_path
+        )
+
+    assert not cached.exists(), "tampered cached JAR must be quarantined"
+
+
 def test_bootstrap_uses_expected_digests(monkeypatch, tmp_path: Path):
     """The JNLP bootstrap must pass the expected digest map into verification."""
     from data_tools.downloaders import jforex_dl
@@ -277,6 +313,53 @@ def test_ensure_jvm_started_raises_with_diagnostics_when_all_fail(monkeypatch):
 
     with pytest.raises(RuntimeError, match="JVM candidates tried"):
         jforex_dl._ensure_jvm_started()
+
+
+# ─── viewer fallback compatibility: bootstrap errors must stay recognizable ─
+
+
+def test_viewer_fallback_fragments_cover_all_bootstrap_error_strings():
+    """Bootstrap hard-failures must remain fallback-eligible in the viewer.
+
+    The viewer's `_jforex_fallback_reason` (viewer/core.py) matches error
+    fragments to decide whether to fall back to the native Dukascopy
+    downloader. Every bootstrap error surface added for DV-B6/DV-B7 must be
+    reachable through `jforex_dl.UNAVAILABLE_ERROR_FRAGMENTS` so a bootstrap
+    failure degrades to the fallback instead of killing the download task.
+    """
+    from data_tools.downloaders import jforex_dl
+
+    fragments = " | ".join(fragment.lower() for fragment in jforex_dl.UNAVAILABLE_ERROR_FRAGMENTS)
+    bootstrap_errors = [
+        # DV-B6a host allowlist:
+        "Refusing to fetch JNLP descriptor from non-Dukascopy host: 'https://evil.example/x.jnlp'",
+        # DV-B6b digest verification:
+        "Integrity check failed for downloaded JAR 'https://platform.dukascopy.com/api.jar'",
+        # JNLP fetch/parse:
+        "Failed to fetch JNLP 'https://platform.dukascopy.com/demo/jforex.jnlp': timed out",
+        "Invalid JNLP payload from 'https://platform.dukascopy.com/demo/jforex.jnlp': no root",
+        # JAR download:
+        "No jar resources found in JNLP 'https://platform.dukascopy.com/demo/jforex.jnlp'.",
+        "Failed to download JAR 'https://platform.dukascopy.com/api.jar': timed out",
+        "JNLP 'https://platform.dukascopy.com/demo/jforex.jnlp' did not resolve any downloadable JAR files.",
+        # DV-B5 JVM startup:
+        "Failed to start JVM for JForex SDK.\nJVM candidates tried (2):",
+        "Failed to initialize JVM thread context class loader: boom",
+        # Prewarm:
+        "JForex SDK import failed for prewarm: boom",
+        "JForex SDK prewarm failed: Instrument class is unavailable",
+    ]
+
+    missing = [
+        error for error in bootstrap_errors
+        if not any(fragment in error.lower() for fragment in jforex_dl.UNAVAILABLE_ERROR_FRAGMENTS)
+    ]
+    assert not missing, (
+        "Bootstrap errors not covered by UNAVAILABLE_ERROR_FRAGMENTS "
+        f"(viewer fallback would not trigger): {missing}"
+    )
+    assert "integrity check failed" in fragments
+    assert "non-dukascopy host" in fragments
 
 
 # ─── local JAR discovery (regression: helper definitions broke _discover_jars)

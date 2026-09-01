@@ -51,8 +51,6 @@ def test_resample_4h_utc_grid_aligns_to_00_00_utc():
 
     resampled, origin = yfinance_dl._resample_4h_utc_grid(payload)
 
-    resampled, origin = yfinance_dl._resample_4h_utc_grid(payload)
-
     assert origin == "UTC"
     assert [ts.isoformat() for ts in resampled["timestamp"]] == [
         "2024-03-04T00:00:00+00:00",
@@ -106,6 +104,41 @@ def test_download_4h_stores_utc_aligned_buckets_and_metadata(monkeypatch, tmp_pa
     assert set(stored["source_bucket_timeframe"]) == {"60m"}
     assert any("bucket" in warning.lower() for warning in result.warnings)
     assert any("UTC" in warning for warning in result.warnings)
+
+
+def test_resample_4h_derives_source_bucket_from_provider_interval(
+    monkeypatch, tmp_path: Path
+):
+    """The recorded source bucket must come from the provider interval.
+
+    yfinance ships 60m bars for 4h today, but if the provider map changes
+    (e.g. a future 4h interval or a 30m fallback), the metadata must follow
+    the interval actually requested — not a hardcoded "60m".
+    """
+    from data_tools.downloaders import yfinance_dl
+
+    payload = _hourly_payload("2024-03-04T01:00:00Z", 7)
+    requested: list[str] = []
+
+    def fake_download(**kwargs):
+        requested.append(kwargs.get("interval"))
+        return payload
+
+    monkeypatch.setattr(yfinance_dl.yf, "download", fake_download)
+    monkeypatch.setitem(yfinance_dl.YF_INTERVAL_MAP, "4h", "30m")
+
+    downloader = yfinance_dl.YFinanceDownloader()
+    result = downloader.download(
+        symbol="AAPL",
+        timeframe="4h",
+        output_dir=tmp_path,
+        start="2024-03-04",
+        end="2024-03-05",
+    )
+
+    assert requested == ["30m"]
+    stored = pd.read_parquet(result.path)
+    assert set(stored["source_bucket_timeframe"]) == {"30m"}
 
 
 def test_download_non_4h_timeframes_keep_native_buckets(monkeypatch, tmp_path: Path):

@@ -249,6 +249,34 @@ def test_split_tick_sides_keeps_disjoint_values():
     assert float(ask.loc[0, "ask"]) == 2.0
 
 
+def test_merge_tick_sides_raises_on_schema_drift():
+    """Schema drift must surface as an error, not silently drop the ask side.
+
+    With a suffix-based inner join, a renamed bid column simply produced a
+    frame without an ask/bid column and the post-merge check was unreachable;
+    the explicit side-column validation makes the failure loud (DV-C2).
+    """
+    import data_tools.downloaders.dukascopy_native as native
+
+    drifted_bid = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(["2024-01-01T00:00:10Z"], utc=True),
+            "bid_price": [1.0],  # renamed: no 'bid'/'bid_vol' columns
+            "bid_vol": [1.0],
+        }
+    )
+    ask_only = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(["2024-01-01T00:00:10Z"], utc=True),
+            "ask": [2.0],
+            "ask_vol": [20.0],
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="missing required side columns"):
+        native._merge_tick_sides(drifted_bid, ask_only)
+
+
 def test_download_async_merged_tick_persists_bid_and_ask_columns(
     monkeypatch, tmp_path: Path
 ):
@@ -297,7 +325,7 @@ def test_download_async_merged_tick_persists_bid_and_ask_columns(
             pipeline_batches=3,
             batch_size=5,
             max_retries=2,
-            pause_ms=10,
+            pause_ms=777,
         )
     )
 
@@ -305,6 +333,9 @@ def test_download_async_merged_tick_persists_bid_and_ask_columns(
     assert recorded[0]["args"] == (5, 2)
     assert recorded[0]["kwargs"].get("pipeline_batches") == 3
     assert "batch_size" not in recorded[0]["kwargs"]
+    # DV-C1 follow-up: the merged path must forward the configured pause too
+    # (it previously dropped the keyword and silently fell back to 1000 ms).
+    assert recorded[0]["kwargs"].get("pause_ms") == 777
     assert len(assemble_calls) == 1
 
     stored = pd.read_parquet(result.path)
