@@ -2,7 +2,7 @@
 
 Checks:
 - Bot processors import successfully
-- Config files exist
+- Config files exist (explicit registry mapping)
 - Registry entries are valid
 
 Run with:

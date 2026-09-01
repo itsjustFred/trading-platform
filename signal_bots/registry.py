@@ -171,6 +171,17 @@ SIGNAL_PROCESSORS: dict[str, SignalProcessorFactory] = {
     "nitro": _build_nitro,
 }
 
+# Explicit bot -> config file mapping. The health check validates these paths;
+# no bot name may be mapped to a config by string convention.
+BOT_CONFIG_PATHS: dict[str, Path] = {
+    "stockkit": _ROOT / "ramjet" / "config.yaml",
+    "ramjet": _ROOT / "ramjet" / "config.yaml",
+    "nitro": _ROOT / "ramjet" / "config.yaml",
+    "rocketfuel": _ROOT / "rocketfuel" / "config.yaml",
+    "rocketfuel_longsonly": _ROOT / "rocketfuel" / "config.yaml",
+    "rocketfuel_longandshort": _ROOT / "rocketfuel" / "config.yaml",
+}
+
 
 def list_signal_processor_options() -> list[dict[str, str]]:
     return [dict(item) for item in SIGNAL_PROCESSOR_OPTIONS]
