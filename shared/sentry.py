@@ -11,11 +11,9 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import sentry_sdk
-from dotenv import load_dotenv
 from sentry_sdk.integrations.logging import LoggingIntegration
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-load_dotenv(PROJECT_ROOT / ".env")
 
 _INITIALIZED = False
 _INITIALIZED_SERVICE: str | None = None

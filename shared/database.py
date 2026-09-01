@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import Any, Iterator
 from uuid import uuid4
 
-from dotenv import load_dotenv
 from sqlalchemy import (
     JSON,
     Column,
@@ -58,26 +57,74 @@ from shared.models import (
 logger = get_logger("database")
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-load_dotenv(PROJECT_ROOT / ".env")
+# .env is loaded exactly once, in shared.constants, before any module reads
+# os.environ for configuration. Do not add load_dotenv() here: it would freeze
+# configuration at a different point in the import order and could disagree
+# with the DATA_DIR this module already resolved.
 DATA_DIR = RESOLVED_DATA_DIR
 DB_PATH = DATA_DIR / "backtests.db"
+DEFAULT_DATABASE_URL: str | None = None  # resolved lazily via __getattr__
 
 
 def _sqlite_url(path: Path) -> str:
     return f"sqlite:///{path.as_posix()}"
 
 
-ENGINE = create_engine(
-    _sqlite_url(DB_PATH),
-    echo=False,
-    connect_args={
-        "check_same_thread": False,
-        "timeout": 30.0,
-    },
-)
+def _default_database_url() -> str:
+    return _sqlite_url(DATA_DIR / "backtests.db")
 
 
-@event.listens_for(ENGINE, "connect")
+def _create_database_engine() -> Any:
+    url = os.environ.get("DATABASE_URL") or _default_database_url()
+    return create_engine(
+        url,
+        echo=False,
+        connect_args={
+            "check_same_thread": False,
+            "timeout": 30.0,
+        },
+    )
+
+
+_ENGINE: Any = None
+_ENGINE_LOCK = threading.Lock()
+
+
+def get_engine() -> Any:
+    """Return the process-wide SQLAlchemy engine, creating it on first use.
+
+    Lazy creation keeps imports side-effect free (no engine bound to a
+    possibly stale DATA_DIR) while guaranteeing a single engine per process.
+    An explicit module-level ``ENGINE`` override (set by tests or embedders
+    via ``shared.database.ENGINE = engine``) always wins.
+    """
+    override = globals().get("ENGINE")
+    if override is not None:
+        return override
+    global _ENGINE
+    if _ENGINE is None:
+        with _ENGINE_LOCK:
+            if _ENGINE is None:
+                _ENGINE = _create_database_engine()
+                event.listen(_ENGINE, "connect", _configure_sqlite_connection)
+    return _ENGINE
+
+
+def _get_engine_or_none() -> Any:
+    """Return the engine without creating it (used by read-only paths)."""
+    return globals().get("ENGINE") or _ENGINE
+
+
+# Backwards-compatible alias. New code should call get_engine(); importing
+# ENGINE no longer forces engine creation at import time.
+def __getattr__(name: str) -> Any:
+    if name == "ENGINE":
+        return get_engine()
+    if name == "DEFAULT_DATABASE_URL":
+        return _default_database_url()
+    raise AttributeError(f"module 'shared.database' has no attribute {name!r}")
+
+
 def _configure_sqlite_connection(dbapi_connection: Any, _connection_record: Any) -> None:
     cursor = dbapi_connection.cursor()
     try:
@@ -819,7 +866,7 @@ def _normalize_task_record(row: Any) -> BackgroundTaskRecord | None:
 
 @contextmanager
 def get_session() -> Iterator[Session]:
-    with Session(ENGINE) as session:
+    with Session(get_engine()) as session:
         yield session
 
 
@@ -832,7 +879,7 @@ def init_db() -> None:
         if _DB_INITIALIZED:
             return
         DATA_DIR.mkdir(parents=True, exist_ok=True)
-        SQLModel.metadata.create_all(ENGINE)
+        SQLModel.metadata.create_all(get_engine())
         _migrate_schema()
         _DB_INITIALIZED = True
 
@@ -1030,7 +1077,7 @@ def _migrate_live_signal_discord_identity(connection: Connection) -> None:
 @contextmanager
 def _schema_migration_connection() -> Iterator[Connection]:
     """Run SQLite schema changes with FK DDL disabled, then validate before commit."""
-    with ENGINE.connect() as connection:
+    with get_engine().connect() as connection:
         foreign_keys_enabled = int(
             connection.execute(text("PRAGMA foreign_keys")).scalar_one()
         )
