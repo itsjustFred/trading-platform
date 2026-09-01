@@ -217,40 +217,40 @@ export function BacktestDetailPage() {
       </div>
     );
 
-  const totalPnl =
-    typeof stats?.net_profit === "number"
-      ? stats.net_profit
-      : trades.reduce((sum, trade) => sum + (trade.pnl || 0), 0);
-  const totalTrades =
-    typeof stats?.total_trades === "number" ? stats.total_trades : trades.length;
-  const winners = typeof stats?.winners === "number" ? stats.winners : trades.filter((t) => t.pnl > 0).length;
-  const losers = typeof stats?.losers === "number" ? stats.losers : trades.filter((t) => t.pnl <= 0).length;
-  const avgPnl =
-    typeof stats?.avg_trade_pnl === "number"
-      ? stats.avg_trade_pnl
-      : trades.length > 0
-        ? totalPnl / trades.length
-        : 0;
-  const tradeStats = {
-    wins: winners,
-    losses: losers,
-    totalPnl,
-    avgPnl,
+  // Whole-backtest figures come from the stats payload; the loaded trade
+  // table is a single page (TRADE_PAGE_SIZE rows), so page-derived values
+  // must be labeled as page-scoped, never presented as whole-backtest stats.
+  const statsAreWholeBacktest =
+    typeof stats?.total_trades === "number" &&
+    (stats.total_trades ?? 0) <= trades.length;
+  const wholeBacktestStats = {
+    totalPnl:
+      typeof stats?.net_profit === "number"
+        ? stats.net_profit
+        : trades.reduce((sum, trade) => sum + (trade.pnl || 0), 0),
+    totalTrades:
+      typeof stats?.total_trades === "number" ? stats.total_trades : trades.length,
+    wins: typeof stats?.winners === "number" ? stats.winners : trades.filter((t) => t.pnl > 0).length,
+    losses: typeof stats?.losers === "number" ? stats.losers : trades.filter((t) => t.pnl <= 0).length,
+    avgPnl:
+      typeof stats?.avg_trade_pnl === "number"
+        ? stats.avg_trade_pnl
+        : trades.length > 0
+          ? (typeof stats?.net_profit === "number" ? stats.net_profit : 0) /
+            Math.max(trades.length, 1)
+          : 0,
     bestTrade:
-      typeof stats?.best_trade === "number"
-        ? stats.best_trade
-        : trades.length > 0
-          ? Math.max(...trades.map((trade) => trade.pnl || 0))
-          : 0,
+      typeof stats?.best_trade === "number" ? stats.best_trade : null,
     worstTrade:
-      typeof stats?.worst_trade === "number"
-        ? stats.worst_trade
-        : trades.length > 0
-          ? Math.min(...trades.map((trade) => trade.pnl || 0))
-          : 0,
+      typeof stats?.worst_trade === "number" ? stats.worst_trade : null,
+  };
+  const tradeStats = {
+    ...wholeBacktestStats,
+    // Page-scoped observations from the loaded table only.
     longTrades: trades.filter((trade) => trade.direction === "LONG").length,
     shortTrades: trades.filter((trade) => trade.direction === "SHORT").length,
-    totalTrades,
+    pageTrades: trades.length,
+    statsAreWholeBacktest,
   };
 
   const toNumberOrNull = (value: unknown): number | null => {
@@ -799,6 +799,19 @@ export function BacktestDetailPage() {
       >
         <h2 style={{ fontSize: "1rem", fontWeight: 600, marginBottom: "16px" }}>
           Trade Statistics
+          {!tradeStats.statsAreWholeBacktest && tradeStats.pageTrades < tradeStats.totalTrades ? (
+            <span
+              style={{
+                marginLeft: "10px",
+                fontSize: "0.72rem",
+                fontWeight: 400,
+                color: "var(--color-text-muted)",
+              }}
+            >
+              (whole-backtest stats; long/short counts cover the {tradeStats.pageTrades} loaded trades of{" "}
+              {tradeStats.totalTrades})
+            </span>
+          ) : null}
         </h2>
         <div
           style={{
@@ -830,12 +843,20 @@ export function BacktestDetailPage() {
           />
           <SummaryItem
             label="Best Trade"
-            value={`$${tradeStats.bestTrade.toLocaleString("en-US", { maximumFractionDigits: 2 })}`}
+            value={
+              tradeStats.bestTrade != null
+                ? `$${tradeStats.bestTrade.toLocaleString("en-US", { maximumFractionDigits: 2 })}`
+                : "N/A"
+            }
             color="#3fb950"
           />
           <SummaryItem
             label="Worst Trade"
-            value={`$${tradeStats.worstTrade.toLocaleString("en-US", { maximumFractionDigits: 2 })}`}
+            value={
+              tradeStats.worstTrade != null
+                ? `$${tradeStats.worstTrade.toLocaleString("en-US", { maximumFractionDigits: 2 })}`
+                : "N/A"
+            }
             color="#f85149"
           />
         </div>
