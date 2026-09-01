@@ -1,4 +1,9 @@
-"""Tests for BacktestRecord equity_curve migration and column functionality."""
+"""Tests for BacktestRecord equity_curve migration and column functionality.
+
+Every test here runs against the shared ``isolated_db`` sandbox (see
+tests/conftest.py) — none of them may call ``init_db()`` on the production
+engine or read/write the real ``data/backtests.db``.
+"""
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -9,20 +14,19 @@ from sqlalchemy import text
 from shared.database import (
     BacktestRecord,
     EquityPointModel,
-    init_db,
     save_result_to_sqlite,
     get_session,
     _table_column_names,
-    ENGINE,
 )
 from shared.models import BacktestMeta, BacktestResult, EquityPoint
 
 
-def test_equity_curve_column_exists_in_backtests_table() -> None:
+def test_equity_curve_column_exists_in_backtests_table(isolated_db) -> None:
     """Test that equity_curve column exists in backtests table after migration."""
-    init_db()
+    database_module, engine, _data_dir = isolated_db
+    database_module.init_db()
 
-    with ENGINE.connect() as connection:
+    with engine.connect() as connection:
         columns = _table_column_names(connection, "backtests")
 
     assert "equity_curve" in columns, (
@@ -31,9 +35,10 @@ def test_equity_curve_column_exists_in_backtests_table() -> None:
     )
 
 
-def test_backtest_record_equity_curve_can_store_list_of_dicts() -> None:
+def test_backtest_record_equity_curve_can_store_list_of_dicts(isolated_db) -> None:
     """Test that equity_curve field can store and retrieve equity curve data."""
-    init_db()
+    database_module, _engine, _data_dir = isolated_db
+    database_module.init_db()
 
     # Create sample equity curve data
     equity_curve_data = [
@@ -81,9 +86,10 @@ def test_backtest_record_equity_curve_can_store_list_of_dicts() -> None:
             )
 
 
-def test_backtest_record_equity_curve_defaults_to_empty_list() -> None:
+def test_backtest_record_equity_curve_defaults_to_empty_list(isolated_db) -> None:
     """Test that equity_curve defaults to an empty list when not provided."""
-    init_db()
+    database_module, _engine, _data_dir = isolated_db
+    database_module.init_db()
 
     backtest_id = f"test_equity_curve_default_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')}"
 
@@ -112,9 +118,10 @@ def test_backtest_record_equity_curve_defaults_to_empty_list() -> None:
         )
 
 
-def test_save_result_to_sqlite_includes_equity_curve() -> None:
+def test_save_result_to_sqlite_includes_equity_curve(isolated_db) -> None:
     """Test that save_result_to_sqlite stores equity_curve data correctly."""
-    init_db()
+    database_module, _engine, _data_dir = isolated_db
+    database_module.init_db()
 
     # Create a BacktestResult with equity curve
     equity_curve = [
@@ -157,19 +164,20 @@ def test_save_result_to_sqlite_includes_equity_curve() -> None:
         )
 
 
-def test_equity_curve_migration_on_existing_table() -> None:
+def test_equity_curve_migration_on_existing_table(isolated_db) -> None:
     """Test that migration adds equity_curve column to existing backtests table."""
-    init_db()
+    database_module, engine, _data_dir = isolated_db
+    database_module.init_db()
 
     # The migration runs automatically in init_db()
-    with ENGINE.connect() as connection:
+    with engine.connect() as connection:
         columns = _table_column_names(connection, "backtests")
 
     # Verify column exists and can be queried
     assert "equity_curve" in columns, "Migration should add equity_curve column"
 
     # Verify we can read from the column
-    with ENGINE.connect() as connection:
+    with engine.connect() as connection:
         result = connection.execute(text("SELECT equity_curve FROM backtests LIMIT 1")).fetchone()
         # This should not raise - column exists and is readable
         # May be None or empty list if no records exist

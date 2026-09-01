@@ -6,7 +6,6 @@ from uuid import uuid4
 
 import pytest
 from sqlalchemy import func, text
-from sqlmodel import SQLModel, create_engine
 
 from shared.database import (
     BacktestRecord,
@@ -15,7 +14,6 @@ from shared.database import (
     TradeRecord,
     _normalize_optional_id,
     get_session,
-    init_db,
     migrate_json_to_sqlite,
     save_live_signal,
 )
@@ -30,9 +28,10 @@ from shared.models import (
 from sqlmodel import select
 
 
-def test_backtest_record_equity_curve_persistence() -> None:
+def test_backtest_record_equity_curve_persistence(isolated_db) -> None:
     """Test that equity_curve can be stored and retrieved from SQLite."""
-    init_db()
+    database_module, _engine, _data_dir, _backtests_dir = isolated_db
+    database_module.init_db()
 
     record_id = f"test_equity_curve_record_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')}"
 
@@ -63,18 +62,22 @@ def test_migrate_json_to_sqlite_is_idempotent(monkeypatch, tmp_path: Path) -> No
     """Legacy JSON migration should skip existing backtest IDs on later runs."""
     import shared.database as database
 
-    engine = create_engine(
-        f"sqlite:///{(tmp_path / 'backtests.db').as_posix()}",
-        connect_args={"check_same_thread": False},
-    )
     data_dir = tmp_path / "data"
     backtests_dir = data_dir / "backtests"
     backtests_dir.mkdir(parents=True)
+    db_path = data_dir / "backtests.db"
+
+    engine = database.create_engine(
+        f"sqlite:///{db_path.as_posix()}",
+        connect_args={"check_same_thread": False},
+    )
+    database.event.listen(engine, "connect", database._configure_sqlite_connection)
 
     monkeypatch.setattr(database, "ENGINE", engine)
+    monkeypatch.setattr(database, "DB_PATH", db_path)
     monkeypatch.setattr(database, "DATA_DIR", data_dir)
     monkeypatch.setattr(database, "_DB_INITIALIZED", False)
-    SQLModel.metadata.create_all(engine)
+    database.SQLModel.metadata.create_all(engine)
 
     result = BacktestResult(
         meta=BacktestMeta(
@@ -134,30 +137,40 @@ def test_migrate_json_to_sqlite_is_idempotent(monkeypatch, tmp_path: Path) -> No
     assert equity_count == 2
 
 
-# ─── Shared isolation fixture ────────────────────────────────────────────────
+# ─── Isolation fixture ────────────────────────────────────────────────────────
 
 
 @pytest.fixture
 def isolated_db(monkeypatch, tmp_path: Path):
-    """Point shared.database at a throwaway SQLite DB + data dir for one test."""
+    """Conftest-style sandbox (same patch set) plus a pre-created ``backtests/`` dir.
+
+    The extra ``backtests/`` directory is what this module's legacy-JSON
+    backfill tests write into; the engine swap, PRAGMA listener and
+    DB_PATH/DATA_DIR/_DB_INITIALIZED patches mirror tests/conftest.py::isolated_db.
+    Yields ``(database_module, engine, data_dir, backtests_dir)``.
+    """
     import shared.database as database
 
     data_dir = tmp_path / "data"
     backtests_dir = data_dir / "backtests"
     backtests_dir.mkdir(parents=True)
     db_path = data_dir / "backtests.db"
-    engine = create_engine(
+
+    engine = database.create_engine(
         f"sqlite:///{db_path.as_posix()}",
         connect_args={"check_same_thread": False},
     )
+    database.event.listen(engine, "connect", database._configure_sqlite_connection)
+    database.SQLModel.metadata.create_all(engine)
 
     monkeypatch.setattr(database, "ENGINE", engine)
-    monkeypatch.setattr(database, "DATA_DIR", data_dir)
     monkeypatch.setattr(database, "DB_PATH", db_path)
+    monkeypatch.setattr(database, "DATA_DIR", data_dir)
     monkeypatch.setattr(database, "_DB_INITIALIZED", False)
-    SQLModel.metadata.create_all(engine)
 
-    return database, engine, data_dir, backtests_dir
+    yield database, engine, data_dir, backtests_dir
+
+    engine.dispose()
 
 
 def _make_live_signal(*, discord_message_id=None, broker_order_id=None, **extra) -> LiveSignal:
@@ -344,20 +357,24 @@ def _insert_legacy_signal(engine, *, row_id, timestamp, metadata) -> None:
 
 @pytest.fixture
 def legacy_db(monkeypatch, tmp_path: Path):
+    """Sandbox without pre-created schema: these tests exercise init_db()'s
+    migration path over a pre-existing legacy live_signals table."""
     import shared.database as database
 
     data_dir = tmp_path / "data"
     data_dir.mkdir(parents=True)
     db_path = data_dir / "backtests.db"
-    engine = create_engine(
+    engine = database.create_engine(
         f"sqlite:///{db_path.as_posix()}",
         connect_args={"check_same_thread": False},
     )
+    database.event.listen(engine, "connect", database._configure_sqlite_connection)
     monkeypatch.setattr(database, "ENGINE", engine)
     monkeypatch.setattr(database, "DATA_DIR", data_dir)
     monkeypatch.setattr(database, "DB_PATH", db_path)
     monkeypatch.setattr(database, "_DB_INITIALIZED", False)
-    return database, engine, data_dir
+    yield database, engine, data_dir
+    engine.dispose()
 
 
 def test_migration_backfills_discord_id_from_metadata(legacy_db) -> None:

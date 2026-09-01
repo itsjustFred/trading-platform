@@ -1,7 +1,6 @@
 """Tests for portfolio optimizer OOS (Out-of-Sample) validation feature."""
 
 import numpy as np
-from sqlmodel import SQLModel, create_engine
 
 from runner.portfolio_optimizer import (
     StrategyEquityPoint,
@@ -559,14 +558,15 @@ def test_load_strategy_equity_reads_sqlite_first(monkeypatch, tmp_path) -> None:
     import runner.portfolio_optimizer as po_module
     import shared.database as database
 
-    engine = create_engine(
+    engine = database.create_engine(
         f"sqlite:///{(tmp_path / 'backtests.db').as_posix()}",
         connect_args={"check_same_thread": False},
     )
+    database.event.listen(engine, "connect", database._configure_sqlite_connection)
     monkeypatch.setattr(database, "ENGINE", engine)
     monkeypatch.setattr(database, "DATA_DIR", tmp_path / "data")
     monkeypatch.setattr(database, "_DB_INITIALIZED", False)
-    SQLModel.metadata.create_all(engine)
+    database.SQLModel.metadata.create_all(engine)
 
     database.save_result_to_sqlite(
         BacktestResult(

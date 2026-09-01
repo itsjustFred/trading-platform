@@ -214,9 +214,12 @@ class TestIdenticalTimestamps:
         assert result.missing == []
         assert result.extra == []
         # Verify order preservation
-        assert result.matched[0][0].id == 1 and result.matched[0][1].id == 10
-        assert result.matched[1][0].id == 2 and result.matched[1][1].id == 20
-        assert result.matched[2][0].id == 3 and result.matched[2][1].id == 30
+        assert result.matched[0][0].id == 1
+        assert result.matched[0][1].id == 10
+        assert result.matched[1][0].id == 2
+        assert result.matched[1][1].id == 20
+        assert result.matched[2][0].id == 3
+        assert result.matched[2][1].id == 30
 
     def test_identical_timestamps_with_missing(self):
         ref = [

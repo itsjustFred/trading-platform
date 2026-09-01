@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import json
 import tempfile
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -82,14 +81,16 @@ def test_symbol_asset_class():
     assert symbol_asset_class("UNKNOWN") == "forex"
 
 
-def test_download_symbol_invalid_timeframes():
+def test_download_symbol_invalid_timeframes(monkeypatch):
     """Invalid timeframes are isolated per timeframe and never abort the batch."""
     import data_tools.download_grid_market_data as dl
     from data_tools.download_grid_market_data import download_symbol
 
     with tempfile.TemporaryDirectory() as tmpdir:
         output_dir = Path(tmpdir)
-        dl.DukascopyNativeDownloader = MagicMock()
+        # monkeypatch restores the production module attribute when the test ends;
+        # a bare assignment here leaks the mock for the rest of the pytest session.
+        monkeypatch.setattr(dl, "DukascopyNativeDownloader", MagicMock())
         result = download_symbol(
             requested_symbol="EURUSD",
             canonical_symbol="EURUSD",

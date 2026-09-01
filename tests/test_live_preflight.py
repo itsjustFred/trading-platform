@@ -49,7 +49,8 @@ def test_parse_bool_env_garbage_raises_naming_var_and_valid_values(value: str) -
         _parse_bool_env("CTRADER_DEMO", value, default=True)
     message = str(excinfo.value)
     assert "CTRADER_DEMO" in message
-    assert "true" in message and "false" in message
+    assert "true" in message
+    assert "false" in message
 
 
 def test_live_preflight_passes_for_demo_and_paper_accounts(tmp_path: Path) -> None:

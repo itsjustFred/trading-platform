@@ -242,7 +242,8 @@ def isolated_db(monkeypatch, tmp_path: Path):
         connect_args={"check_same_thread": False},
     )
     monkeypatch.setattr(database, "ENGINE", engine)
-    monkeypatch.setattr(database, "DATA_DIR", tmp_path)
+    # Isolation comes from the ENGINE swap: the production engine URL is built
+    # from DB_PATH at import time, not from DATA_DIR. (B-48)
     monkeypatch.setattr(database, "_DB_INITIALIZED", False)
     yield database
     engine.dispose()

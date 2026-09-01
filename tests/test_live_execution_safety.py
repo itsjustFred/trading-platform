@@ -96,8 +96,10 @@ def test_fallback_stop_is_below_entry_for_buys_and_above_for_sells():
         signal=sell, account_balance=10_000.0, pip_value=1.0, current_exposure=0.0
     )
 
-    assert buy.stop_loss is not None and buy.stop_loss < buy.entry_price
-    assert sell.stop_loss is not None and sell.stop_loss > sell.entry_price
+    assert buy.stop_loss is not None
+    assert buy.stop_loss < buy.entry_price
+    assert sell.stop_loss is not None
+    assert sell.stop_loss > sell.entry_price
 
 
 def test_fallback_stop_without_atr_is_percent_of_price():
@@ -629,7 +631,8 @@ def isolated_db(monkeypatch, tmp_path: Path):
     )
     database.event.listen(engine, "connect", database._configure_sqlite_connection)
     monkeypatch.setattr(database, "ENGINE", engine)
-    monkeypatch.setattr(database, "DATA_DIR", tmp_path)
+    # Isolation comes from the ENGINE swap: the production engine URL is built
+    # from DB_PATH at import time, not from DATA_DIR. (B-48)
     monkeypatch.setattr(database, "_DB_INITIALIZED", False)
     yield database
     engine.dispose()

@@ -422,7 +422,8 @@ class TestStrictJsonCompatibility:
         assert clean["nested"]["x"] is None
         assert clean["list"] == [None, 2, 3.0]
         text = json.dumps(clean, allow_nan=False)
-        assert "Infinity" not in text and "NaN" not in text
+        assert "Infinity" not in text
+        assert "NaN" not in text
 
     def test_report_with_infinite_profit_factor_is_strict_json(self):
         # A platform result with only winners yields profit_factor == inf; the

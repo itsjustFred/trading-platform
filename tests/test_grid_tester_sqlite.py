@@ -1,5 +1,8 @@
-"""Tests for grid strategy tester SQLite integration."""
-import json
+"""Tests for grid strategy tester SQLite integration.
+
+Database-touching tests opt into the shared ``isolated_db`` fixture (see
+tests/conftest.py) so they never read or write the production database.
+"""
 import sys
 import types
 import uuid
@@ -10,7 +13,6 @@ import pytest
 from shared.database import (
     GridRecord,
     get_grid_results,
-    init_db,
     save_grid_result,
     save_grid_result_to_sqlite,
 )
@@ -34,8 +36,12 @@ def test_grid_record_model_creation() -> None:
     assert len(record.timeframes_json) == 2
 
 
-def test_run_strategy_grid_persists_to_sqlite(monkeypatch, tmp_path) -> None:
-    """Test run_strategy_grid writes grid results to SQLite through GridRecord."""
+def test_run_strategy_grid_persists_to_sqlite(monkeypatch, tmp_path, isolated_db) -> None:
+    """Test run_strategy_grid writes grid results to SQLite through GridRecord.
+
+    The SQLite leg goes through the sandbox database, so the read-back below
+    never depends on (or pollutes) the production database.
+    """
     scipy_module = types.ModuleType("scipy")
     scipy_stats_module = types.ModuleType("scipy.stats")
     setattr(scipy_stats_module, "norm", lambda *args, **kwargs: 0.5)
@@ -90,9 +96,10 @@ def test_run_strategy_grid_persists_to_sqlite(monkeypatch, tmp_path) -> None:
     assert matching[0]["results"]["AAPL"]["1h"]["sharpe"] == 1.25
 
 
-def test_save_grid_result_to_sqlite() -> None:
-    """Test saving grid result to SQLite database."""
-    init_db()
+def test_save_grid_result_to_sqlite(isolated_db) -> None:
+    """Test saving grid result to SQLite database (in the isolated sandbox DB)."""
+    database_module, _engine, _data_dir = isolated_db
+    database_module.init_db()
 
     payload = {
         "id": f"test_grid_sqlite_save_{datetime.now(timezone.utc).strftime('%H%M%S')}",
@@ -127,9 +134,10 @@ def test_save_grid_result_to_sqlite() -> None:
     assert "GOOGL" in saved_record["symbols"]
 
 
-def test_save_grid_result_function() -> None:
-    """Test save_grid_result convenience function."""
-    init_db()
+def test_save_grid_result_function(isolated_db) -> None:
+    """Test save_grid_result convenience function (in the isolated sandbox DB)."""
+    database_module, _engine, _data_dir = isolated_db
+    database_module.init_db()
 
     grid_id = f"test_grid_func_{datetime.now(timezone.utc).strftime('%H%M%S')}"
 
@@ -149,9 +157,10 @@ def test_save_grid_result_function() -> None:
     assert saved[0]["results"]["TSLA"]["1d"]["sharpe"] == 2.0
 
 
-def test_get_grid_results_returns_newest_first() -> None:
-    """Test that get_grid_results orders by created_at descending."""
-    init_db()
+def test_get_grid_results_returns_newest_first(isolated_db) -> None:
+    """Test that get_grid_results orders by created_at descending (sandbox DB)."""
+    database_module, _engine, _data_dir = isolated_db
+    database_module.init_db()
 
     # Use unique IDs to avoid collision
     timestamp = datetime.now(timezone.utc).strftime("%H%M%S%f")
