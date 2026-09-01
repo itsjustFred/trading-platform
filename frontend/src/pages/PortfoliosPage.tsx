@@ -63,6 +63,12 @@ const PORTFOLIO_SORT_OPTIONS: Array<{ label: string; value: PortfoliosSortField 
   { label: "Trade Count", value: "trade_count" },
 ];
 
+function psrTone(psr: number): string {
+  if (psr > 0.95) return "#3fb950";
+  if (psr > 0.5) return "#d29922";
+  return "#f85149";
+}
+
 const PortfolioCard = memo(function PortfolioCard({
   portfolio,
   onDelete,
@@ -104,6 +110,7 @@ const PortfolioCard = memo(function PortfolioCard({
       >
         <div style={{ fontWeight: 600, fontSize: "0.95rem" }}>{portfolio.name}</div>
         <button
+          type="button"
           onClick={(event) => onDelete(portfolio.id, event)}
           style={{
             background: "none",
@@ -178,16 +185,7 @@ const PortfolioCard = memo(function PortfolioCard({
           {portfolio.psr != null && (
             <span>
               PSR (higher = better){" "}
-              <b
-                style={{
-                  color:
-                    Number(portfolio.psr) > 0.95
-                      ? "#3fb950"
-                      : Number(portfolio.psr) > 0.5
-                        ? "#d29922"
-                        : "#f85149",
-                }}
-              >
+              <b style={{ color: psrTone(Number(portfolio.psr)) }}>
                 {(Number(portfolio.psr) * 100).toFixed(0)}%
               </b>
             </span>
@@ -441,7 +439,7 @@ export function PortfoliosPage() {
       const payload = await deduplicatePortfolios();
       showToast(`Removed ${payload.deleted_ids.length} duplicate portfolio(s).`, "success");
       setShowDuplicatesModal(false);
-      await loadPortfolios();
+      loadPortfolios();
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : "Could not remove duplicates";
       showToast(message, "error");
@@ -455,7 +453,7 @@ export function PortfoliosPage() {
       const payload = await removeEmptyPortfolios();
       showToast(`Removed ${payload.removed} empty portfolio(s).`, "success");
       setSelectedIds(new Set());
-      await loadPortfolios();
+      loadPortfolios();
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : "Could not remove empty portfolios";
       showToast(message, "error");
@@ -486,6 +484,7 @@ export function PortfoliosPage() {
       >
         <h1 style={{ fontSize: "1.5rem", fontWeight: 600 }}>Portfolios</h1>
         <button
+          type="button"
           onClick={() => setShowCreate(true)}
           style={{
             display: "flex",
@@ -521,7 +520,7 @@ export function PortfoliosPage() {
         }}
       />
 
-      {loading ? (
+      {loading && (
         <div
           style={{
             textAlign: "center",
@@ -531,7 +530,8 @@ export function PortfoliosPage() {
         >
           Loading...
         </div>
-      ) : portfolios.length === 0 ? (
+      )}
+      {!loading && portfolios.length === 0 && (
         <div
           style={{
             textAlign: "center",
@@ -541,7 +541,8 @@ export function PortfoliosPage() {
         >
           No portfolios yet. Create one!
         </div>
-      ) : (
+      )}
+      {!loading && portfolios.length > 0 && (
         <>
           <div
             style={{
@@ -731,6 +732,7 @@ export function PortfoliosPage() {
           <div style={{ display: "grid", gridTemplateColumns: "1fr 240px", gap: "10px" }}>
             <div>
               <label
+                htmlFor="portfolio-name-input"
                 style={{
                   color: "var(--color-text-muted)",
                   fontSize: "0.75rem",
@@ -741,6 +743,7 @@ export function PortfoliosPage() {
                 Portfolio Name
               </label>
               <input
+                id="portfolio-name-input"
                 value={formName}
                 onChange={(e) => setFormName(e.target.value)}
                 style={inputStyle}
@@ -749,6 +752,7 @@ export function PortfoliosPage() {
             </div>
             <div>
               <label
+                htmlFor="portfolio-capital-input"
                 style={{
                   color: "var(--color-text-muted)",
                   fontSize: "0.75rem",
@@ -759,6 +763,7 @@ export function PortfoliosPage() {
                 Account Capital ($)
               </label>
               <input
+                id="portfolio-capital-input"
                 type="number"
                 value={formCapital}
                 onChange={(e) => setFormCapital(e.target.value)}
@@ -930,6 +935,7 @@ export function PortfoliosPage() {
               + Add Component
             </button>
             <button
+              type="button"
               onClick={() => void handleCreate()}
               disabled={createDisabled}
               style={{

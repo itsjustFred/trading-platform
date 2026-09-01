@@ -149,7 +149,8 @@ function formatLotSize(value: number | null | undefined): string {
 }
 
 function normalizeExitReason(reason: unknown): string {
-  const value = String(reason || "").trim().toLowerCase();
+  const raw = typeof reason === "string" ? reason : reason == null ? "" : JSON.stringify(reason);
+  const value = raw.trim().toLowerCase();
   if (!value) {
     return "Signal";
   }
@@ -588,12 +589,10 @@ export function TradingViewChart({
         );
       }
 
-      const exits =
-        trade.exits && trade.exits.length
-          ? trade.exits
-          : trade.exit_time !== undefined && trade.exit_price !== undefined
-            ? [{ time: trade.exit_time, price: trade.exit_price, pnl: trade.pnl }]
-            : [];
+      let exits = trade.exits ?? [];
+      if (exits.length === 0 && trade.exit_time !== undefined && trade.exit_price !== undefined) {
+        exits = [{ time: trade.exit_time, price: trade.exit_price, pnl: trade.pnl }];
+      }
 
       exits.forEach((exit, exitIndex) => {
         const exitTime = toChartTime(exit.time);
@@ -705,6 +704,7 @@ export function TradingViewChart({
             ].map((preset) => (
               <button
                 key={preset.value}
+                type="button"
                 onClick={() => handleRangeSelect(preset.value)}
                 style={{
                   border: `1px solid ${rangePreset === preset.value ? "rgba(88,166,255,0.45)" : "var(--color-border)"}`,
@@ -725,6 +725,7 @@ export function TradingViewChart({
 
           <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
             <button
+              type="button"
               onClick={handleScreenshot}
               style={{
                 border: "1px solid var(--color-border)",
@@ -741,6 +742,7 @@ export function TradingViewChart({
             </button>
             {onToggleFullscreen ? (
               <button
+                type="button"
                 onClick={onToggleFullscreen}
                 style={{
                   border: "1px solid var(--color-border)",

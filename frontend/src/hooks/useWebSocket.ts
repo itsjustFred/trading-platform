@@ -154,7 +154,8 @@ export function useWebSocket<TMessage = unknown>(
       if (!rawMessage || typeof rawMessage !== "object" || !("type" in rawMessage)) {
         return false;
       }
-      const msgType = String((rawMessage as { type?: unknown }).type || "").toLowerCase();
+      const rawType = (rawMessage as { type?: unknown }).type;
+      const msgType = (typeof rawType === "string" ? rawType : "").toLowerCase();
       if (msgType === "ping") {
         lastActivityAt = Date.now();
         if (activeSocket.readyState === WebSocket.OPEN) {

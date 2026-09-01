@@ -1,5 +1,10 @@
 import { memo, useMemo, useState } from "react";
 
+function formatSignedPercent(value: number): string {
+  const sign = value >= 0 ? "+" : "";
+  return `${sign}${value.toFixed(2)}%`;
+}
+
 /**
  * Sparkline — tiny SVG equity curve for card previews.
  * Green if last > first (profitable), red otherwise.
@@ -20,9 +25,9 @@ export const Sparkline = memo(function Sparkline({
   interactive?: boolean;
   startDate?: string;
   endDate?: string;
-}) {
+}): React.ReactElement | null {
   const normalized = useMemo(
-    () => (Array.isArray(data) ? data.filter((value) => Number.isFinite(value)).map((value) => Number(value)) : []),
+    () => (Array.isArray(data) ? data.filter((value) => Number.isFinite(value)).map(Number) : []),
     [data],
   );
   const [hoverIndex, setHoverIndex] = useState<number | null>(null);
@@ -32,10 +37,8 @@ export const Sparkline = memo(function Sparkline({
   const min = Math.min(...normalized);
   const max = Math.max(...normalized);
   const range = max - min || 1;
-  const profitable =
-    trend != null
-      ? trend === "up"
-      : normalized[normalized.length - 1] >= normalized[0];
+  const lastValue = normalized.at(-1) ?? normalized[0];
+  const profitable = trend != null ? trend === "up" : lastValue >= normalized[0];
   const color = profitable ? "#3fb950" : "#f85149";
 
   const padding = 6;
@@ -79,12 +82,12 @@ export const Sparkline = memo(function Sparkline({
   const parsedStart = Date.parse(startDate || "");
   const parsedEnd = Date.parse(endDate || "");
   const hasDateRange = Number.isFinite(parsedStart) && Number.isFinite(parsedEnd) && parsedEnd >= parsedStart;
-  const hoverDate =
-    hoverIdx == null
-      ? ""
-      : hasDateRange
-        ? new Date(parsedStart + ((parsedEnd - parsedStart) * hoverIdx) / (normalized.length - 1)).toLocaleDateString("de-DE")
-        : "";
+  let hoverDate = "";
+  if (hoverIdx != null && hasDateRange) {
+    hoverDate = new Date(
+      parsedStart + ((parsedEnd - parsedStart) * hoverIdx) / (normalized.length - 1),
+    ).toLocaleDateString("de-DE");
+  }
   const hoverPointLabel = hoverIdx == null ? "" : `Punkt ${hoverIdx + 1}`;
 
   return (
@@ -156,7 +159,7 @@ export const Sparkline = memo(function Sparkline({
           <div>{hoverDate || hoverPointLabel}</div>
           <div>
             {hoverValue.toLocaleString("en-US", { maximumFractionDigits: 0 })}
-            {hoverReturnPct != null ? ` · ${hoverReturnPct >= 0 ? "+" : ""}${hoverReturnPct.toFixed(2)}%` : ""}
+            {hoverReturnPct != null ? ` · ${formatSignedPercent(hoverReturnPct)}` : ""}
             {hoverDrawdown != null ? ` · DD ${hoverDrawdown.toFixed(2)}%` : ""}
           </div>
         </div>

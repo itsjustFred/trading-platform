@@ -1,4 +1,4 @@
-import { useMemo, useState, type CSSProperties, type FormEvent } from "react";
+import { useMemo, useState, type CSSProperties } from "react";
 
 import { createService, deleteService } from "../api/client";
 import { useServiceLogs, useServices, useUpdateServiceStatus } from "../api/queries";
@@ -22,6 +22,16 @@ function statusDot(status: ServiceStatus) {
   if (status === "paused") return "#f59e0b";
   if (status === "failed") return "#ef4444";
   return "#64748b";
+}
+
+function stringifyServiceConfigValue(value: unknown): string {
+  if (typeof value === "string") {
+    return value;
+  }
+  if (value == null) {
+    return "";
+  }
+  return JSON.stringify(value) ?? "";
 }
 
 export function ServicesPage() {
@@ -69,7 +79,7 @@ export function ServicesPage() {
     }
   };
 
-  const handleCreateScheduledJob = async (event: FormEvent<HTMLFormElement>) => {
+  const handleCreateScheduledJob = async (event: React.SubmitEvent<HTMLFormElement>) => {
     event.preventDefault();
     const name = newName.trim();
     const cron = newCron.trim();
@@ -113,6 +123,7 @@ export function ServicesPage() {
         <form onSubmit={handleCreateScheduledJob} style={{ display: "grid", gap: "12px" }}>
           <label style={fieldLabelStyle}>
             Name
+            {" "}
             <input
               value={newName}
               onChange={(event) => setNewName(event.target.value)}
@@ -122,6 +133,7 @@ export function ServicesPage() {
           </label>
           <label style={fieldLabelStyle}>
             Job Type
+            {" "}
             <select
               value={newJobType}
               onChange={(event) => setNewJobType(event.target.value)}
@@ -133,6 +145,7 @@ export function ServicesPage() {
           </label>
           <label style={fieldLabelStyle}>
             Cron
+            {" "}
             <input
               value={newCron}
               onChange={(event) => setNewCron(event.target.value)}
@@ -222,8 +235,8 @@ export function ServicesPage() {
         <div style={{ display: "grid", gap: "10px" }}>
           {services.map((service) => {
             const isRunning = service.status === "running";
-            const cron = String(service.config?.cron || "");
-            const channelId = String(service.config?.channel_id || "");
+            const cron = stringifyServiceConfigValue(service.config?.cron);
+            const channelId = stringifyServiceConfigValue(service.config?.channel_id);
             return (
               <div key={service.id} style={serviceCardStyle}>
                 <div style={{ display: "flex", justifyContent: "space-between", gap: "10px", flexWrap: "wrap" }}>
@@ -232,16 +245,11 @@ export function ServicesPage() {
                       {service.type === "discord_bot" ? "Discord Bot: " : ""}
                       {service.name}
                     </div>
-                    {service.type === "discord_bot" ? (
-                      <div style={metaLineStyle}>
-                        Channel: {channelId ? `#${channelId}` : "—"} · Last Signal:{" "}
-                        {relativeTime(service.last_activity)}
-                      </div>
-                    ) : (
-                      <div style={metaLineStyle}>
-                        Schedule: {cron || "—"} · Next Run: cron-based · Last Run: {relativeTime(service.last_activity)}
-                      </div>
-                    )}
+                    <div style={metaLineStyle}>
+                      {service.type === "discord_bot"
+                        ? `Channel: ${channelId ? `#${channelId}` : "—"} · Last Signal: ${relativeTime(service.last_activity)}`
+                        : `Schedule: ${cron || "—"} · Next Run: cron-based · Last Run: ${relativeTime(service.last_activity)}`}
+                    </div>
                   </div>
                   <div style={{ display: "inline-flex", alignItems: "center", gap: "8px", color: "var(--color-text-muted)" }}>
                     <span

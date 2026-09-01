@@ -119,12 +119,7 @@ export function LiveTerminal({
     viewport.scrollTop = viewport.scrollHeight;
   }, [logs]);
 
-  const statusTone =
-    status === "completed"
-      ? "#86efac"
-      : status === "failed" || status === "disconnected"
-        ? "#fda4af"
-        : "#67e8f9";
+  const statusTone = TERMINAL_STATUS_TONES[status] ?? "#67e8f9";
 
   return (
     <div

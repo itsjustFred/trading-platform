@@ -29,7 +29,12 @@ function formatDuration(seconds?: number | null) {
 function taskPercent(task: DataTaskStatusResponse) {
   const primary = task.progress_percent;
   const fallback = task.progress?.percent;
-  const value = typeof primary === "number" ? primary : typeof fallback === "number" ? fallback : 0;
+  let value = 0;
+  if (typeof primary === "number") {
+    value = primary;
+  } else if (typeof fallback === "number") {
+    value = fallback;
+  }
   return Math.max(0, Math.min(100, value));
 }
 
@@ -202,11 +207,10 @@ export function TaskHubPage() {
 
       <section style={{ display: "grid", gap: "10px" }}>
         <div style={{ fontWeight: 700, fontSize: "1.03rem" }}>Active Tasks</div>
-        {loading ? (
-          <div style={cardStyle()}>Loading tasks...</div>
-        ) : activeTasks.length === 0 ? (
-          <div style={cardStyle()}>No active tasks.</div>
-        ) : (
+        {loading && <div style={cardStyle()}>Loading tasks...</div>}
+        {!loading && activeTasks.length === 0 && <div style={cardStyle()}>No active tasks.</div>}
+        {!loading &&
+          activeTasks.length > 0 &&
           activeTasks.map((task) => {
             const taskId = task.id || "";
             const status = String(task.status || "").toLowerCase();
@@ -290,8 +294,7 @@ export function TaskHubPage() {
                 </div>
               </div>
             );
-          })
-        )}
+          })}
       </section>
 
       <section style={{ display: "grid", gap: "10px" }}>

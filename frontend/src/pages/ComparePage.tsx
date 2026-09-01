@@ -163,6 +163,7 @@ export function ComparePage() {
     <div style={{ padding: "24px", display: "grid", gap: "18px" }}>
       <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
         <button
+          type="button"
           onClick={() => navigate(-1)}
           style={{
             background: "none",
@@ -227,12 +228,13 @@ export function ComparePage() {
                 const right = Number(data.backtest2.stats[metric.key] || 0);
                 const delta = right - left;
                 const betterSecond = metric.better === "higher" ? right > left : right < left;
+                const deltaColor = delta === 0 ? "#c9d1d9" : betterSecond ? "#3fb950" : "#f85149";
                 return (
                   <tr key={metric.key}>
                     <td style={tdStyle}>{metric.label}</td>
                     <td style={tdStyle}>{formatMetricRaw(left, metric.format)}</td>
                     <td style={tdStyle}>{formatMetricRaw(right, metric.format)}</td>
-                    <td style={{ ...tdStyle, color: betterSecond ? "#3fb950" : delta === 0 ? "#c9d1d9" : "#f85149" }}>
+                    <td style={{ ...tdStyle, color: deltaColor }}>
                       {formatMetric(delta, metric.format)}
                     </td>
                   </tr>

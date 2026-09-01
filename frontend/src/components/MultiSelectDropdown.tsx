@@ -74,6 +74,9 @@ export function MultiSelectDropdown({
     return preview.join(", ");
   }, [normalizedOptions, selectedSet]);
 
+  const buttonLabel = selected.length === 0 ? label : `${label} (${selected.length})`;
+  const buttonSuffix = selected.length > 0 && selectedPreview ? ` • ${selectedPreview}` : "";
+
   const toggleOption = (value: string) => {
     const next = new Set(selected);
     if (next.has(value)) {
@@ -113,9 +116,8 @@ export function MultiSelectDropdown({
             whiteSpace: "nowrap",
           }}
         >
-          {selected.length === 0
-            ? label
-            : `${label} (${selected.length})${selectedPreview ? ` • ${selectedPreview}` : ""}`}
+          {buttonLabel}
+          {buttonSuffix}
         </span>
         <ChevronDown size={14} />
       </button>

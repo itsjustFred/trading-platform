@@ -17,8 +17,21 @@ const COMPARISON_ROWS = [
   { key: "total_trades", label: "Trades" },
 ];
 
-function formatComparisonValue(key: string, value: number | string | boolean | null | undefined) {
+/** Renders an unknown parameter cell without falling back to `[object Object]`. */
+function stringifyCell(value: unknown): string {
   if (value == null) {
+    return "—";
+  }
+  if (typeof value === "string") {
+    return value;
+  }
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  return JSON.stringify(value) ?? "—";
+}
+
+function formatComparisonValue(key: string, value: number | string | boolean | null | undefined) {  if (value == null) {
     return "—";
   }
   if (typeof value !== "number") {
@@ -109,7 +122,7 @@ export function OptimizationResultsPage() {
       ...parameterKeys.map((key) => ({
         key,
         label: key,
-        render: (row: Record<string, unknown>) => String(row[key] ?? "—"),
+        render: (row: Record<string, unknown>) => stringifyCell(row[key]),
       })),
       {
         key: "trade_count",

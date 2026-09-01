@@ -28,11 +28,16 @@ export function Modal({
         justifyContent: "center",
       }}
     >
-      <div
+      <button
+        type="button"
+        aria-label="Close dialog"
         style={{
           position: "absolute",
           inset: 0,
           background: "rgba(0,0,0,0.7)",
+          border: "none",
+          padding: 0,
+          cursor: "default",
         }}
         onClick={onClose}
       />
@@ -59,6 +64,8 @@ export function Modal({
         >
           <h2 style={{ fontSize: "1.1rem", fontWeight: 600 }}>{title}</h2>
           <button
+            type="button"
+            aria-label="Close"
             onClick={onClose}
             style={{
               background: "none",

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import type { CSSProperties } from "react";
+import type { CSSProperties, ReactElement } from "react";
 import {
   ArrowRight,
   CheckCircle2,
@@ -12,6 +12,26 @@ import {
 import { resampleData } from "../api/client";
 import { LiveTerminal } from "./LiveTerminal";
 import { Modal } from "./Modal";
+
+const STATUS_ICON_COLORS = {
+  ok: "#86efac",
+  failed: "#fda4af",
+  running: "#67e8f9",
+} as const;
+
+/** Shared task-status glyph used by the data-task modals. */
+export function renderTaskStatusIcon(
+  status: string | null | undefined,
+  size = 18,
+): ReactElement {
+  if (status === "completed") {
+    return <CheckCircle2 size={size} color={STATUS_ICON_COLORS.ok} />;
+  }
+  if (status === "failed") {
+    return <XCircle size={size} color={STATUS_ICON_COLORS.failed} />;
+  }
+  return <Loader2 size={size} className="animate-spin" color={STATUS_ICON_COLORS.running} />;
+}
 
 interface ResampleModalProps {
   open: boolean;
@@ -98,14 +118,7 @@ export function ResampleModal({
     }
   };
 
-  const statusIcon =
-    jobStatus === "completed" ? (
-      <CheckCircle2 size={18} color="#86efac" />
-    ) : jobStatus === "failed" ? (
-      <XCircle size={18} color="#fda4af" />
-    ) : (
-      <Loader2 size={18} className="animate-spin" color="#67e8f9" />
-    );
+  const statusIcon = renderTaskStatusIcon(jobStatus);
 
   return (
     <Modal
@@ -166,6 +179,7 @@ export function ResampleModal({
 
               <div style={{ display: "grid", gap: "8px" }}>
                 <label
+                  htmlFor="resample-source-path"
                   style={{
                     fontSize: "0.76rem",
                     letterSpacing: "0.08em",
@@ -176,6 +190,7 @@ export function ResampleModal({
                   Source parquet path
                 </label>
                 <input
+                  id="resample-source-path"
                   value={sourcePath}
                   onChange={(event) => setSourcePath(event.target.value)}
                   placeholder="/home/ubuntu/data/ohlcv/.../1m.parquet"
@@ -194,6 +209,7 @@ export function ResampleModal({
 
               <div style={{ display: "grid", gap: "8px" }}>
                 <label
+                  htmlFor="resample-target-timeframes"
                   style={{
                     fontSize: "0.76rem",
                     letterSpacing: "0.08em",
@@ -204,6 +220,7 @@ export function ResampleModal({
                   Target timeframes
                 </label>
                 <input
+                  id="resample-target-timeframes"
                   value={targetTimeframes}
                   onChange={(event) => setTargetTimeframes(event.target.value)}
                   placeholder="5m,15m,30m,1h,4h"
