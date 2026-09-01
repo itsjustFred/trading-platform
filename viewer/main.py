@@ -7544,6 +7544,10 @@ def _collect_viewer_drawings(result: BacktestResult, symbol: str | None = None) 
 
 @app.get("/api/backtest/{backtest_id}/trade/{trade_nr}", response_model=dict[str, Any])
 async def get_trade_with_context(backtest_id: str, trade_nr: int) -> dict[str, Any]:
+    return await asyncio.to_thread(_trade_context_payload, backtest_id, trade_nr)
+
+
+def _trade_context_payload(backtest_id: str, trade_nr: int) -> dict[str, Any]:
     result = _load_result(backtest_id)
     if result is None:
         raise HTTPException(status_code=404, detail="Not found")
@@ -7620,6 +7624,10 @@ async def get_trade_with_context(backtest_id: str, trade_nr: int) -> dict[str, A
 
 @app.get("/api/backtest/{backtest_id}/replay", response_model=dict[str, Any])
 async def get_backtest_replay(backtest_id: str) -> dict[str, Any]:
+    return await asyncio.to_thread(_replay_payload, backtest_id)
+
+
+def _replay_payload(backtest_id: str) -> dict[str, Any]:
     result = _load_result(backtest_id)
     if result is None:
         raise HTTPException(status_code=404, detail="Not found")
@@ -7699,6 +7707,10 @@ async def get_backtest_replay(backtest_id: str) -> dict[str, Any]:
 
 @app.get("/api/backtest/{backtest_id}/ohlcv", response_model=dict[str, Any])
 async def get_backtest_ohlcv(backtest_id: str) -> dict[str, Any]:
+    return await asyncio.to_thread(_backtest_ohlcv_payload, backtest_id)
+
+
+def _backtest_ohlcv_payload(backtest_id: str) -> dict[str, Any]:
     result = _load_result(backtest_id)
     if result is None:
         raise HTTPException(status_code=404, detail="Not found")
@@ -7719,6 +7731,10 @@ async def get_backtest_ohlcv(backtest_id: str) -> dict[str, Any]:
 
 @app.get("/api/compare", response_model=dict[str, Any])
 async def compare_backtests_endpoint(ids: str = Query(default="")) -> dict[str, Any]:
+    return await asyncio.to_thread(_compare_backtests_payload, ids)
+
+
+def _compare_backtests_payload(ids: str) -> dict[str, Any]:
     if not ids:
         raise HTTPException(status_code=400, detail="Provide ?ids=id1,id2,id3")
 
@@ -10099,8 +10115,7 @@ async def get_live_positions(account_id: str) -> dict[str, Any]:
     return await _live_positions_payload(account_id)
 
 
-@app.get("/api/data/overview", response_model=dict[str, Any])
-async def data_overview() -> dict[str, Any]:
+def _data_overview_payload() -> dict[str, Any]:
     data_views = _get_data_views()
     result = [dict(item) for item in data_views.get("overview_categories", [])]
 
@@ -10122,8 +10137,12 @@ async def data_overview() -> dict[str, Any]:
     return {"categories": sorted(result, key=lambda item: str(item.get("name") or ""))}
 
 
-@app.get("/api/data/category/{category_name}", response_model=dict[str, Any])
-async def data_category_details(category_name: str) -> dict[str, Any]:
+@app.get("/api/data/overview", response_model=dict[str, Any])
+async def data_overview() -> dict[str, Any]:
+    return await asyncio.to_thread(_data_overview_payload)
+
+
+def _data_category_payload(category_name: str) -> dict[str, Any]:
     target = category_name.lower()
     if target == "dolthub repos":
         repos = []
@@ -10164,6 +10183,11 @@ async def data_category_details(category_name: str) -> dict[str, Any]:
             key=lambda item: (item.get("symbol") or "", item.get("timeframe") or ""),
         )
     }
+
+
+@app.get("/api/data/category/{category_name}", response_model=dict[str, Any])
+async def data_category_details(category_name: str) -> dict[str, Any]:
+    return await asyncio.to_thread(_data_category_payload, category_name)
 
 
 @app.post("/api/data/cache/invalidate", response_model=dict[str, Any])
@@ -10925,21 +10949,24 @@ async def get_log(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+def _symbols_payload() -> dict[str, Any]:
+    return _get_data_views().get("symbols_payload", {"symbols": [], "categories": {}})
+
+
 @app.get("/api/symbols", response_model=SymbolsResponse)
 async def list_symbols() -> SymbolsResponse:
-    payload = _get_data_views().get("symbols_payload", {"symbols": [], "categories": {}})
+    payload = await asyncio.to_thread(_symbols_payload)
     return SymbolsResponse(
         symbols=list(payload.get("symbols", [])),
         categories=dict(payload.get("categories", {})),
     )
 
 
-@app.get("/api/benchmark/{symbol}", response_model=BenchmarkResponse)
-async def get_benchmark(
+def _benchmark_payload(
     symbol: str,
-    start: str = Query(default=""),
-    end: str = Query(default=""),
-    timeframe: str = Query(default="1d"),
+    start: str,
+    end: str,
+    timeframe: str,
 ) -> BenchmarkResponse:
     timeframe = normalize_timeframe(timeframe)
     df = legacy_viewer._load_ohlcv_df(symbol, timeframe)
@@ -10993,6 +11020,16 @@ async def get_benchmark(
         equity.append(BenchmarkPoint(time=float(unix_ts), equity=round(float(row["close"]) * shares, 2)))
 
     return BenchmarkResponse(symbol=symbol, timeframe=timeframe, equity=equity)
+
+
+@app.get("/api/benchmark/{symbol}", response_model=BenchmarkResponse)
+async def get_benchmark(
+    symbol: str,
+    start: str = Query(default=""),
+    end: str = Query(default=""),
+    timeframe: str = Query(default="1d"),
+) -> BenchmarkResponse:
+    return await asyncio.to_thread(_benchmark_payload, symbol, start, end, timeframe)
 
 
 @app.websocket("/ws/live/accounts")
