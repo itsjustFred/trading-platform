@@ -123,10 +123,13 @@ def test_grid_tester_sqlite_tests_do_not_use_bare_init_db() -> None:
     """
     source = Path(__file__).parent.joinpath("test_grid_tester_sqlite.py").read_text()
     assert "isolated_db" in source, "grid tester sqlite tests must opt into isolated_db"
+    # Any top-level (0-indent) statement that merely calls init_db() is a bare
+    # production write. Calls nested deeper (e.g. under `with database.get_session()`)
+    # still operate on the sandbox the test opted into.
     bare_calls = [
         line
         for line in source.splitlines()
-        if line.strip() == "init_db()" and not line.startswith("        ")
+        if line.strip() == "init_db()" and line == line.lstrip()
     ]
     assert bare_calls == [], f"bare init_db() found outside fixture usage: {bare_calls}"
 

@@ -231,7 +231,7 @@ def test_submit_order_with_risk_sizes_normally_when_flat():
     assert adapter.submitted_signal.metadata["qty"] == pytest.approx(200.0)
 
 
-def _submit_signal(module, adapter, signal):
+def _submit_signal(adapter, signal):
     """Single possibly-throwing invocation for S5778-clean exception tests:
     ``pytest.raises`` blocks below call this helper instead of nesting
     ``asyncio.run`` inside argument construction."""
@@ -266,7 +266,7 @@ def test_alpaca_submit_order_blocks_non_positive_quantity(monkeypatch):
     )
 
     with pytest.raises(ValueError, match="non-positive quantity"):
-        _submit_signal(module, adapter, signal)
+        _submit_signal(adapter, signal)
 
 
 def test_alpaca_extended_hours_without_positive_limit_price_raises(monkeypatch):
@@ -445,7 +445,7 @@ def test_alpaca_discord_redelivery_submits_once_with_canonical_signal_id(monkeyp
 
     assert asyncio.run(adapter.submit_order(first)) == "alpaca-order-1"
     with pytest.raises(RuntimeError, match="canonical signal already exists"):
-        _submit_signal(module, adapter, redelivery)
+        _submit_signal(adapter, redelivery)
 
     assert len(submitted_requests) == 1
     assert submitted_requests[0].client_order_id == canonical_signal_id
@@ -584,7 +584,7 @@ def test_alpaca_broker_order_id_persistence_failure_is_not_success(monkeypatch):
     monkeypatch.setattr(module, "set_live_signal_broker_order_id", _fail_persistence)
 
     with pytest.raises(RuntimeError, match="Failed to persist Alpaca broker order id"):
-        _submit_signal(module, adapter, signal)
+        _submit_signal(adapter, signal)
 
     assert persistence_calls == [(canonical_signal_id, "alpaca-order-2")]
 
@@ -2096,7 +2096,7 @@ def test_ctrader_accepted_order_fails_closed_when_local_id_persistence_fails(mon
     adapter._ProtoOATimeInForce = SimpleNamespace(IMMEDIATE_OR_CANCEL=1)
 
     with pytest.raises(RuntimeError, match="persist cTrader broker order id"):
-        _submit_signal(module, adapter, signal)
+        _submit_signal(adapter, signal)
 
     assert adapter._order_id_to_signal_id == {}
 

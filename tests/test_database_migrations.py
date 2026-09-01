@@ -1,7 +1,6 @@
 """Tests for database migrations and model persistence."""
 import json
 from datetime import datetime, timezone
-from pathlib import Path
 from uuid import uuid4
 
 import pytest
@@ -318,25 +317,12 @@ def _insert_legacy_signal(engine, *, row_id, timestamp, metadata) -> None:
 
 
 @pytest.fixture
-def legacy_db(monkeypatch, tmp_path: Path):
-    """Sandbox without pre-created schema: these tests exercise init_db()'s
-    migration path over a pre-existing legacy live_signals table."""
-    import shared.database as database
-
-    data_dir = tmp_path / "data"
-    data_dir.mkdir(parents=True)
-    db_path = data_dir / "backtests.db"
-    engine = database.create_engine(
-        f"sqlite:///{db_path.as_posix()}",
-        connect_args={"check_same_thread": False},
-    )
-    database.event.listen(engine, "connect", database._configure_sqlite_connection)
-    monkeypatch.setattr(database, "ENGINE", engine)
-    monkeypatch.setattr(database, "DATA_DIR", data_dir)
-    monkeypatch.setattr(database, "DB_PATH", db_path)
-    monkeypatch.setattr(database, "_DB_INITIALIZED", False)
-    yield database, engine, data_dir
-    engine.dispose()
+def legacy_db(isolated_db_no_schema):
+    """No-schema sandbox (see tests/conftest.py::isolated_db_no_schema): these
+    tests exercise init_db()'s migration path over a pre-existing legacy
+    live_signals table. Yields ``(database_module, engine, data_dir)``."""
+    database, engine, data_dir = isolated_db_no_schema
+    return database, engine, data_dir
 
 
 def test_migration_backfills_discord_id_from_metadata(legacy_db) -> None:

@@ -71,9 +71,10 @@ def _make_sandbox_db(monkeypatch, tmp_path: Path, *, create_schema: bool):
     # index migrations in shared/database.py.
     monkeypatch.setattr(database, "_DB_INITIALIZED", False)
 
-    yield database, engine, data_dir
-
-    engine.dispose()
+    try:
+        yield database, engine, data_dir
+    finally:
+        engine.dispose()
 
 
 @pytest.fixture
@@ -87,6 +88,13 @@ def isolated_db_sandbox(monkeypatch, tmp_path: Path):
 def isolated_db(isolated_db_sandbox):
     """Alias of :func:`isolated_db_sandbox`."""
     return isolated_db_sandbox
+
+
+@pytest.fixture
+def isolated_db_no_schema(monkeypatch, tmp_path: Path):
+    """Sandbox without pre-created schema: for tests that exercise
+    ``init_db()``'s migration path over a hand-built legacy layout."""
+    yield from _make_sandbox_db(monkeypatch, tmp_path, create_schema=False)
 
 
 @lru_cache(maxsize=None)
