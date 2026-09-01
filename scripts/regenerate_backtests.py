@@ -39,6 +39,7 @@ import pyarrow.parquet as pq
 from dotenv import load_dotenv
 from pydantic import ValidationError
 from sqlalchemy import delete
+from sqlalchemy.engine import make_url
 
 from runner.cli import get_engine
 from runner.engines.base import BacktestConfig, resolve_strategy_parameters
@@ -271,13 +272,17 @@ def _existing_db_path() -> Path:
 
     The engine is created at import time from the resolved DATA_DIR, so tests that
     swap ``shared.database.ENGINE`` need the path derived from the engine URL
-    rather than the module-level ``DB_PATH`` constant.
+    rather than the module-level ``DB_PATH`` constant. The URL is parsed with
+    SQLAlchemy's own parser instead of string surgery — URL renderings differ
+    between versions (relative ``sqlite:///x.db`` vs absolute
+    ``sqlite:////abs/x.db``), and mis-deriving the path would silently back up
+    and restore the wrong database file.
     """
     from shared.database import DB_PATH, ENGINE
 
-    url = str(ENGINE.url)
-    if url.startswith("sqlite:///"):
-        engine_path = Path(url.removeprefix("sqlite:///"))
+    database = make_url(str(ENGINE.url)).database
+    if database:
+        engine_path = Path(database)
         if engine_path.is_absolute():
             return engine_path
     return DB_PATH
@@ -403,7 +408,12 @@ def plan_regeneration(
     strategies: list[str] | None = None,
     data_dir: Path | None = None,
 ) -> RegenerationPlan:
-    """Dry-run helper: describe the planned runs and the corpus at risk."""
+    """Dry-run helper: describe the planned runs and the corpus at risk.
+
+    Must be called *before* ``_purge_sqlite_backtests()``/``_purge_json_backtests()``
+    for the reported ``sqlite_backtests``/``json_backtests`` counts to describe the
+    live corpus — counting them afterwards always yields 0.
+    """
     resolved_data_dir = data_dir if data_dir is not None else DATA_DIR
     backtests_dir = resolved_data_dir / "backtests"
     plan = RegenerationPlan(

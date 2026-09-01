@@ -188,6 +188,28 @@ def test_consolidate_confirmed_run_merges_fragments(ohlcv_root):
 # ─── scripts/regenerate_backtests.py ─────────────────────────────────────────
 
 
+def test_existing_db_path_prefers_absolute_engine_url(monkeypatch, tmp_path):
+    from scripts import regenerate_backtests as script
+
+    engine = database.create_engine(f"sqlite:///{(tmp_path / 'engine.db').as_posix()}")
+    monkeypatch.setattr(database, "ENGINE", engine)
+
+    assert script._existing_db_path() == tmp_path / "engine.db"
+    engine.dispose()
+
+
+def test_existing_db_path_falls_back_when_engine_url_is_not_absolute(monkeypatch):
+    from scripts import regenerate_backtests as script
+
+    engine = database.create_engine("sqlite:///relative.db")
+    monkeypatch.setattr(database, "ENGINE", engine)
+
+    # A relative engine URL cannot be trusted to point at the live corpus, so the
+    # resolver must fall back to shared.database.DB_PATH.
+    assert script._existing_db_path() == database.DB_PATH
+    engine.dispose()
+
+
 def test_regenerate_dry_run_reports_plan_without_destroying(isolated_db, monkeypatch, tmp_path):
     from scripts import regenerate_backtests as script
 
