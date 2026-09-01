@@ -522,7 +522,7 @@ def test_run_optimization_propagates_backtest_errors(monkeypatch, tmp_path: Path
         _forbid_call("strategy blew up", RuntimeError),
     )
 
-    with pytest.raises(RuntimeError, match="strategy blew up"):
+    with pytest.raises(RuntimeError) as exc_info:
         optimizer_module.run_optimization(
             optimizer_module.OptimizationConfig(
                 base_backtest_id="base-demo",
@@ -532,6 +532,8 @@ def test_run_optimization_propagates_backtest_errors(monkeypatch, tmp_path: Path
                 parameter_ranges={"window": {"type": "int", "min": 2, "max": 2, "step": 1}},
             )
         )
+    assert "No optimization trial completed successfully" in str(exc_info.value)
+    assert "strategy blew up" in str(exc_info.value.__cause__)
 
 
 def test_run_risk_parity_covariance_optimization_saves_weights(monkeypatch, tmp_path: Path):
@@ -581,3 +583,107 @@ def test_run_risk_parity_covariance_optimization_saves_weights(monkeypatch, tmp_
     assert payload["risk_parity"]["evaluated_universes"]
     saved_files = list(optimizations_dir.glob("rp_cov_rp-base_*.json"))
     assert len(saved_files) == 1
+
+
+def test_no_trade_trials_lose_against_honest_negative_trials(monkeypatch, tmp_path: Path):
+    """A no-trade trial must not return penalty 0.0 and beat honest negatives."""
+    backtests_dir = tmp_path / "backtests"
+    optimizations_dir = tmp_path / "optimizations"
+    backtests_dir.mkdir(parents=True, exist_ok=True)
+    _write_base_backtest(backtests_dir)
+
+    monkeypatch.setattr(optimizer_module, "BACKTESTS_DIR", backtests_dir)
+    monkeypatch.setattr(optimizer_module, "OPTIMIZATIONS_DIR", optimizations_dir)
+    _allow_bar_coverage_preflight(monkeypatch)
+    monkeypatch.setattr(
+        optimizer_module,
+        "find_strategy_entry",
+        lambda _: SimpleNamespace(
+            file_path=tmp_path / "strategies" / "example_sma.py",
+            slug="example_sma",
+        ),
+    )
+    monkeypatch.setattr(
+        optimizer_module,
+        "compute_stats_for_result",
+        lambda result: dict(result.stats),
+    )
+    original_create_study = optuna.create_study
+    monkeypatch.setattr(
+        optimizer_module.optuna,
+        "create_study",
+        lambda direction="maximize": original_create_study(
+            direction=direction,
+            sampler=optuna.samplers.GridSampler({"window": [1, 2]}),
+        ),
+    )
+
+    def fake_run_backtest(config, strategy_path):
+        window = int(config.parameters["window"])
+        # window=1 -> no trades (honest metric would be very negative)
+        # window=2 -> trades with a small but real loss
+        if window == 1:
+            return _trial_result(config, metric=-50.0, trade_count=0)
+        return _trial_result(config, metric=-0.5, trade_count=1)
+
+    monkeypatch.setattr(optimizer_module, "_run_vectorbt_backtest", fake_run_backtest)
+
+    payload = optimizer_module.run_optimization(
+        optimizer_module.OptimizationConfig(
+            base_backtest_id="base-demo",
+            target_metric="sharpe",
+            n_trials=2,
+            train_split_pct=0.7,
+            parameter_ranges={"window": {"type": "int", "min": 1, "max": 2, "step": 1}},
+        ),
+    )
+
+    assert payload["best_params"] == {"window": 2}
+    assert payload["best_value"] == -0.5
+    penalties = {trial["params"]["window"]: trial["penalty_applied"] for trial in payload["top_trials"]}
+    assert penalties == {1: True, 2: False}
+    no_trade_trial = next(t for t in payload["top_trials"] if t["params"]["window"] == 1)
+    assert no_trade_trial["value"] is None or no_trade_trial["value"] < -0.5
+
+
+def test_all_trials_failing_raises_informative_error(monkeypatch, tmp_path: Path):
+    backtests_dir = tmp_path / "backtests"
+    backtests_dir.mkdir(parents=True, exist_ok=True)
+    _write_base_backtest(backtests_dir)
+
+    monkeypatch.setattr(optimizer_module, "BACKTESTS_DIR", backtests_dir)
+    monkeypatch.setattr(optimizer_module, "OPTIMIZATIONS_DIR", tmp_path / "optimizations")
+    _allow_bar_coverage_preflight(monkeypatch)
+    monkeypatch.setattr(
+        optimizer_module,
+        "find_strategy_entry",
+        lambda _: SimpleNamespace(
+            file_path=tmp_path / "strategies" / "example_sma.py",
+            slug="example_sma",
+        ),
+    )
+    original_create_study = optuna.create_study
+    monkeypatch.setattr(
+        optimizer_module.optuna,
+        "create_study",
+        lambda direction="maximize": original_create_study(
+            direction=direction,
+            sampler=optuna.samplers.GridSampler({"window": [2]}),
+        ),
+    )
+    monkeypatch.setattr(
+        optimizer_module,
+        "_run_vectorbt_backtest",
+        _forbid_call("strategy blew up", RuntimeError),
+    )
+
+    with pytest.raises(RuntimeError, match="No optimization trial completed successfully"):
+        optimizer_module.run_optimization(
+            optimizer_module.OptimizationConfig(
+                base_backtest_id="base-demo",
+                target_metric="sharpe",
+                n_trials=1,
+                train_split_pct=0.7,
+                parameter_ranges={"window": {"type": "int", "min": 2, "max": 2, "step": 1}},
+            )
+        )
