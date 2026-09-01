@@ -11,7 +11,9 @@ import {
 const viteConfig = readFile(new URL("../vite.config.ts", import.meta.url), "utf8");
 const mainTsx = readFile(new URL("../src/main.tsx", import.meta.url), "utf8");
 
-const SHARED_DSN = "https://e24e7ee5930cdd0bb0b84799c46fe6e7@o4511659559944192.ingest.de.sentry.io/4511955579437136";
+// Sentry DSNs are public-by-design (project IDs, not credentials), but tests
+// use a Sentry-published dummy DSN instead of the live shared project.
+const SHARED_DSN = "https://public@sentry.example.com/1";
 
 test("frontend Sentry init is disabled without a DSN so local dev stays silent", () => {
   const options = resolveFrontendSentryOptions({});
@@ -111,9 +113,9 @@ test("malformed and out-of-range rates fall back to safe defaults instead of rea
 test("vite injects the app version and git sha define globals used for the Sentry release", async () => {
   const config = await viteConfig;
 
-  assert.match(config, /__APP_VERSION__/);
-  assert.match(config, /__GIT_SHA__/);
-  assert.match(config, /resolveFrontendSentryGlobals|package\.json/);
+  assert.match(config, /__APP_VERSION__:\s*JSON\.stringify\(appVersion\)/);
+  assert.match(config, /__GIT_SHA__:\s*JSON\.stringify\(gitSha\)/);
+  assert.match(config, /require\('\.\/package\.json'\)/);
 });
 
 test("main.tsx initializes Sentry before rendering the app", async () => {

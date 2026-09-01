@@ -37,6 +37,10 @@ function clean(value: string | undefined): string {
   return (value ?? "").trim();
 }
 
+/**
+ * Parse a rate from env. Returns null for blank, malformed, or
+ * out-of-range values (the caller decides the fallback).
+ */
 function parseRate(value: string | undefined): number | null {
   const raw = clean(value);
   if (raw === "") {
@@ -51,7 +55,11 @@ function parseRate(value: string | undefined): number | null {
 
 /**
  * Build the options passed to `Sentry.init`, or null when Sentry is
- * disabled (no DSN configured, or an unusable error sample rate).
+ * disabled (no DSN configured).
+ *
+ * Deliberately diverges from the backend on malformed rates: the backend
+ * raises `SentryConfigError`, here a malformed/out-of-range value falls back
+ * to the documented default instead of silently disabling error reporting.
  */
 export function resolveFrontendSentryOptions(
   env: FrontendSentryEnv,
@@ -62,9 +70,8 @@ export function resolveFrontendSentryOptions(
   }
 
   const rawSampleRate = clean(env.VITE_SENTRY_SAMPLE_RATE);
-  const sampleRate = rawSampleRate === "" ? null : parseRate(rawSampleRate);
-  const tracesRaw = clean(env.VITE_SENTRY_TRACES_SAMPLE_RATE);
-  const tracesSampleRate = tracesRaw === "" ? undefined : (parseRate(tracesRaw) ?? undefined);
+  const sampleRate = parseRate(rawSampleRate) ?? DEFAULT_SAMPLE_RATE;
+  const tracesSampleRate = parseRate(env.VITE_SENTRY_TRACES_SAMPLE_RATE) ?? undefined;
 
   return {
     dsn,

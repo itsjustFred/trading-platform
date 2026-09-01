@@ -183,8 +183,9 @@ globals).
 - Configure via `frontend/.env` (see `frontend/.env.example`): `VITE_SENTRY_DSN`
   (blank disables Sentry locally), `VITE_SENTRY_ENVIRONMENT`,
   `VITE_SENTRY_SAMPLE_RATE`, `VITE_SENTRY_TRACES_SAMPLE_RATE`.
-- Initialization lives in `frontend/src/lib/sentryConfig.ts` and is called from
-  `frontend/src/main.tsx` before the app renders.
+- Initialization lives in `frontend/src/lib/sentryConfig.ts` and is kicked off
+  from `frontend/src/main.tsx`. The SDK's default global-handlers integration
+  then reports uncaught errors and unhandled rejections automatically.
 
 ## Writing a Strategy (vectorbt)
 
