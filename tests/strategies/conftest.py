@@ -154,21 +154,36 @@ def _path_time_coverage(path: Path) -> tuple[datetime | None, datetime | None, s
 
 
 def _covers_requested_period(symbol: str, timeframe: str, start: str, end: str) -> bool:
-    """True only if every candidate file covers the requested window.
+    """True when the shards provide gapless coverage of the requested window.
 
-    Deliberately *not* a union of extents: shard A covering Jan-Mar plus
-    shard B covering Dec must not satisfy an Apr-Nov request.
+    Neither a bare union of extents (which hid holes between shards) nor a
+    "every file must cover everything" rule (which rejected legitimate
+    year-sharded datasets): the shard extents are sorted and must chain
+    together without a hole across the requested window.
     """
     start_bound = _parse_date_bound(start, is_end=False) if start else None
     end_bound = _parse_date_bound(end, is_end=True) if end else None
 
+    extents: list[tuple[datetime, datetime]] = []
     for path in _candidate_ohlcv_paths(symbol, timeframe):
-        path_start, path_end, _error = _path_time_coverage(path)
-        if path_start is None or path_end is None:
+        path_start, path_end, error = _path_time_coverage(path)
+        if error is not None or path_start is None or path_end is None:
             return False
-        if start_bound is not None and path_start > start_bound:
-            return False
-        if end_bound is not None and path_end < end_bound:
+        extents.append((path_start, path_end))
+
+    if not extents:
+        return False
+
+    extents.sort()
+    if start_bound is not None and extents[0][0] > start_bound:
+        return False
+    if end_bound is not None and extents[-1][1] < end_bound:
+        return False
+
+    # No hole between consecutive shards (a 1µs overlap tolerance absorbs
+    # inclusive end bounds).
+    for (prev_start, prev_end), (next_start, _next_end) in zip(extents, extents[1:]):
+        if next_start > prev_end + timedelta(microseconds=1):
             return False
     return True
 
@@ -186,17 +201,14 @@ def _require_ohlcv_coverage(symbol: str, timeframe: str, start: str, end: str) -
     end_bound = _parse_date_bound(end, is_end=True) if end else None
 
     unreadable: list[str] = []
-    uncovered: list[str] = []
+    extents: list[tuple[datetime, datetime, str]] = []
     for path in paths:
         relative = _relative_candidate_label(path)
         path_start, path_end, error = _path_time_coverage(path)
         if error is not None or path_start is None or path_end is None:
             unreadable.append(f"{relative} ({error or 'no coverage'})")
             continue
-        if start_bound is not None and path_start > start_bound:
-            uncovered.append(f"{relative} (starts {path_start.isoformat()})")
-        if end_bound is not None and path_end < end_bound:
-            uncovered.append(f"{relative} (ends {path_end.isoformat()})")
+        extents.append((path_start, path_end, relative))
 
     if unreadable:
         _data_gate_result(
@@ -204,6 +216,22 @@ def _require_ohlcv_coverage(symbol: str, timeframe: str, start: str, end: str) -
             + "; ".join(unreadable)
         )
         return
+
+    extents.sort()
+    uncovered: list[str] = []
+    if start_bound is not None and extents and extents[0][0] > start_bound:
+        uncovered.append(f"dataset starts {extents[0][0].isoformat()}")
+    if end_bound is not None and extents and extents[-1][1] < end_bound:
+        uncovered.append(f"dataset ends {extents[-1][1].isoformat()}")
+    for (prev_start, prev_end, prev_label), (next_start, _n_end, next_label) in zip(
+        extents, extents[1:]
+    ):
+        if next_start > prev_end + timedelta(microseconds=1):
+            uncovered.append(
+                f"gap between {prev_label} (ends {prev_end.isoformat()}) and "
+                f"{next_label} (starts {next_start.isoformat()})"
+            )
+
     if uncovered:
         _data_gate_result(
             f"insufficient OHLCV coverage for {symbol}/{timeframe} "

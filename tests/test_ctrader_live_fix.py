@@ -194,11 +194,14 @@ def test_persisted_accounts_file_has_0600_permissions(tmp_path: Path) -> None:
     assert pairs == {"CTRADER_ACCESS_TOKEN": "a", "CTRADER_REFRESH_TOKEN": "r"}
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="cross-process flock locking is POSIX-only (fcntl)",
+)
 def test_env_key_persistence_serializes_concurrent_writers(tmp_path: Path) -> None:
     """The env read-modify-write path must wait on the cross-process file lock."""
     import fcntl
     import subprocess
-    import sys
     import time
 
     accounts_env = tmp_path / ".accounts.env"

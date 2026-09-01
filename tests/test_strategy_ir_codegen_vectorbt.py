@@ -188,7 +188,7 @@ def _injection_ir(name: str, indicator_label: str, expression: str, tag_value: s
     "payload",
     [
         ").__import__('os').system('id') #",
-        "" + __import__('os').getcwd() + "",
+        "\" + __import__('os').getcwd() + \"",
         "__import__('subprocess').run(['ls'])",
     ],
 )
@@ -257,7 +257,13 @@ def _executable_code_is_clean(code: str) -> bool:
 
 
 def _code_without_string_literals(segment: str) -> str:
-    """Mask string literal contents, keeping the quoting structure."""
+    """Replace string-literal payloads with empty quotes of the same kind.
+
+    Using the token stream (via ``ast.unparse`` of a stripped tree) keeps
+    the quoting structure intact, so escaped quotes inside adversarial
+    payloads cannot leave orphan quote characters behind that would make
+    data look like executable syntax.
+    """
     try:
         tree = ast.parse(segment)
     except SyntaxError:
@@ -266,14 +272,15 @@ def _code_without_string_literals(segment: str) -> str:
         except SyntaxError:
             return segment
 
-    pieces: list[str] = []
-    for token in ast.walk(tree):
-        if isinstance(token, ast.Constant) and isinstance(token.value, str):
-            pieces.append(token.value)
-    masked = segment
-    for literal in sorted(pieces, key=len, reverse=True):
-        masked = masked.replace(literal, "")
-    return masked
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            node.value = ""
+        elif isinstance(node, ast.Constant) and isinstance(node.value, bytes):
+            node.value = b""
+    try:
+        return ast.unparse(tree)
+    except Exception:
+        return segment
 
 
 @pytest.mark.parametrize(

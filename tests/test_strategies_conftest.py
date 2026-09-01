@@ -96,7 +96,7 @@ def test_strict_mode_fails_on_insufficient_coverage(gate, monkeypatch, tmp_path)
 
 
 def test_coverage_check_does_not_union_shard_extents(gate, tmp_path):
-    """M2: two shards that individually miss the window must not pass together."""
+    """M2: shards with a hole between them must not pass as 'covered'."""
     _write_shard(
         tmp_path / "ohlcv" / "US500" / "shard-a" / "1h.parquet",
         "2025-01-01",
@@ -109,33 +109,45 @@ def test_coverage_check_does_not_union_shard_extents(gate, tmp_path):
     )
 
     assert not gate._covers_requested_period(
-        "US500", "1h", "2025-06-01", "2025-09-30"
+        "US500", "1h", "2025-01-01", "2025-12-31"
     )
 
 
-def test_every_candidate_file_must_cover_the_window(gate, tmp_path):
-    """Even two covering shards are not enough if a third candidate has a hole."""
+def test_contiguous_year_shards_cover_the_window(gate, tmp_path):
+    """Year-sharded datasets are legitimate: sorted extents must chain."""
+    _write_shard(
+        tmp_path / "ohlcv" / "US500" / "2024" / "1h.parquet",
+        "2024-01-01",
+        "2025-01-01",
+    )
+    _write_shard(
+        tmp_path / "ohlcv" / "US500" / "2025" / "1h.parquet",
+        "2025-01-01",
+        "2025-09-30",
+    )
+
+    gate._require_ohlcv_coverage("US500", "1h", "2024-01-01", "2025-06-30")
+
+
+def test_gap_between_shards_is_reported_with_labels(gate, tmp_path):
+    """A hole between shards is a coverage failure naming both shards."""
     _write_shard(
         tmp_path / "ohlcv" / "US500" / "a" / "1h.parquet",
         "2025-01-01",
-        "2025-09-30",
+        "2025-03-01",
     )
     _write_shard(
         tmp_path / "ohlcv" / "US500" / "b" / "1h.parquet",
-        "2025-01-01",
-        "2025-09-30",
-    )
-    _write_shard(
-        tmp_path / "ohlcv" / "US500" / "c" / "1h.parquet",
-        "2025-01-01",
-        "2025-03-01",
+        "2025-09-01",
+        "2025-12-31",
     )
 
     with pytest.raises(pytest.skip.Exception) as excinfo:
-        gate._require_ohlcv_coverage("US500", "1h", "2025-01-01", "2025-09-30")
+        gate._require_ohlcv_coverage("US500", "1h", "2025-01-01", "2025-12-31")
 
-    assert "insufficient OHLCV coverage" in str(excinfo.value)
-    assert "shard-c" in str(excinfo.value) or "c" in str(excinfo.value)
+    message = str(excinfo.value)
+    assert "insufficient OHLCV coverage" in message
+    assert "gap between" in message
 
 
 def test_corrupt_parquet_is_surfaced_not_silently_ignored(gate, tmp_path):
@@ -169,7 +181,7 @@ def test_corrupt_parquet_fails_with_strict_mode(gate, monkeypatch, tmp_path):
 
 def test_fully_covering_single_file_passes(gate, tmp_path):
     _write_shard(
-        tmp_path / "ohlcv" / "US500" / "1h.parquet", "2025-01-01", "2025-03-31"
+        tmp_path / "ohlcv" / "US500" / "1h.parquet", "2025-01-01", "2025-04-01"
     )
 
     gate._require_ohlcv_coverage("US500", "1h", "2025-01-01", "2025-03-31")

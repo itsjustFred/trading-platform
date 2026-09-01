@@ -5,10 +5,20 @@ string-"NaN" bypass in ``BacktestResultValidator`` — plus the missing
 negative control: until now the fixture gate asserted only that fixtures
 PASS, so a validator regressing to accepting garbage would go unnoticed
 (ox-alpha C5/M18, M12).
+
+Containment note (code review finding, Cleanup 17-B self-review):
+``AICodeValidator`` historically EXECUTED the submitted code in a
+subprocess to check the interface. Module-level statements therefore ran
+with full user privileges (``python -I`` isolates sys.path/env, not the
+OS) — validating a strategy containing ``shutil.rmtree(...,
+ignore_errors=True)`` executed it. The validator is now static: it
+parses and AST-checks the code and verifies the interface by
+inspection, never by running it.
 """
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -88,6 +98,33 @@ def test_negative_fixtures_fail(fixture_path: Path):
     )
 
 
+def test_validator_never_executes_submitted_code(tmp_path):
+    """Containment: module-level statements must not run during validation.
+
+    Historically the validator wrote the code to a file and ran
+    ``spec.loader.exec_module`` in a subprocess; module-level destructive
+    code executed with full user privileges. The validator must decide
+    from the AST only — proven here by a module-level payload that writes
+    a sentinel file IF it is ever executed.
+    """
+    sentinel = tmp_path / "executed.sentinel"
+    assert not sentinel.exists()
+
+    payload = (
+        "from pathlib import Path\n"
+        f"Path({str(sentinel)!r}).write_text('executed')\n\n"
+        + _valid_strategy_code()
+    )
+    result = _result_for(payload)
+
+    assert not sentinel.exists(), (
+        "The validator executed the submitted code: module-level statements "
+        "must never run during validation"
+    )
+    # The dangerous top-level side effect must itself be flagged.
+    assert not result.passed, f"Validator accepted module-level side effects: {result.errors}"
+
+
 # ─── AICodeValidator: basic detection ────────────────────────────────────────
 
 
@@ -114,7 +151,8 @@ def test_missing_required_method_fails():
         "import subprocess\nsubprocess.run(['ls'])",
         "getattr(__builtins__, 'eval')",
         "__import__('os').system('id')",
-        "import shutil\nshutil.rmtree('x')",
+        "import shutil\nshutil.rmtree('x', ignore_errors=True)",
+        "import socket\nsocket.socket()",
     ],
 )
 def test_dangerous_code_fails(code: str):
@@ -122,9 +160,10 @@ def test_dangerous_code_fails(code: str):
     assert not result.passed, f"Validator accepted dangerous code:\n{code}"
 
 
-def test_direct_import_of_risky_module_is_an_error():
-    """os/socket/shutil imports must be hard errors, not silent passes."""
-    result = _result_for("import socket\n" + _valid_strategy_code())
+@pytest.mark.parametrize("module", ["os", "socket", "shutil", "subprocess"])
+def test_direct_import_of_risky_module_is_an_error(module: str):
+    """Risky imports must be hard errors decided by AST, not by crashing."""
+    result = _result_for(f"import {module}\n" + _valid_strategy_code())
     assert not result.passed
 
 
