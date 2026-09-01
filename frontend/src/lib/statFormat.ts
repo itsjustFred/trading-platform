@@ -67,3 +67,16 @@ export function resolveStatCardColor(
   }
   return SIGN_COLORS.neutral;
 }
+
+const PSR_TONES = {
+  high: "#3fb950",
+  mid: "#d29922",
+  low: "#f85149",
+} as const;
+
+/** Sign/tier color for Probability of Sharpe Ratio values (0..1). */
+export function psrTone(psr: number): string {
+  if (psr >= 0.95) return PSR_TONES.high;
+  if (psr >= 0.5) return PSR_TONES.mid;
+  return PSR_TONES.low;
+}
