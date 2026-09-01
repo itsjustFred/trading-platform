@@ -29,6 +29,36 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 SEED_BACKTEST_ID = "seed-example-sma-20240101"
 
 
+def _seed_benchmark_ohlcv(data_dir: Path) -> None:
+    """Write a deterministic AAPL/1d parquet so /api/benchmark has real data.
+
+    Without this the benchmark endpoint 404s for every test in this module,
+    so a 200-with-body branch could never be exercised — the conditional
+    "200 or 404" contract tests passed vacuously. The legacy viewer also
+    caches loaded frames per (symbol, timeframe), so the cache is cleared
+    for the seeded symbol.
+    """
+    import pandas as pd
+
+    import viewer.core as viewer_core
+
+    symbol_dir = data_dir / "ohlcv" / "AAPL"
+    symbol_dir.mkdir(parents=True, exist_ok=True)
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=30, freq="1D", tz="UTC"),
+            "open": 100.0,
+            "high": 101.0,
+            "low": 99.0,
+            "close": 100.5,
+            "volume": 1000.0,
+        }
+    )
+    frame.to_parquet(symbol_dir / "1d.parquet", index=False)
+    with viewer_core._OHLCV_DF_CACHE_LOCK:
+        viewer_core._OHLCV_DF_CACHE.pop(("AAPL", "1d"), None)
+
+
 def _seeded_backtest_result() -> BacktestResult:
     """A minimal, fully valid backtest result used as the seeded store row."""
     entry_time = "2024-01-02T14:30:00+00:00"
@@ -105,6 +135,7 @@ def isolated_viewer(monkeypatch, tmp_path):
     backtests_dir.mkdir(parents=True, exist_ok=True)
     result.save(backtests_dir / f"{SEED_BACKTEST_ID}.trades.json")
     database.save_result_to_sqlite(result)
+    _seed_benchmark_ohlcv(tmp_path)
     viewer_main_module._BACKTEST_META_CACHE.clear()
 
     yield viewer_main_module
@@ -205,7 +236,11 @@ class TestBacktestsAPI:
         trades = resp2.json()
         assert isinstance(trades, list)
         assert len(trades) == 1
-        assert trades[0]["symbol"] == "AAPL"
+        trade = trades[0]
+        assert trade["symbol"] == "AAPL"
+        assert trade["direction"] == "LONG"
+        assert trade["quantity"] == 10.0
+        assert trade["pnl"] == 20.0
 
     def test_get_backtest_equity(self, client):
         resp = client.get(f"/api/backtest/{SEED_BACKTEST_ID}/equity")
@@ -227,10 +262,14 @@ class TestBacktestsAPI:
 
 class TestPortfoliosAPI:
     def test_list_portfolios_is_empty_but_wellformed(self, client):
+        """Isolated store: the list is well-formed AND empty (no bleed-in)."""
         resp = client.get("/api/portfolios")
         assert resp.status_code == 200
         data = resp.json()
         assert isinstance(data, list)
+        assert data == [], (
+            f"Isolated store must not leak portfolios from other tests: {data}"
+        )
 
     def test_get_nonexistent_portfolio(self, client):
         resp = client.get("/api/portfolios/nonexistent_portfolio_xyz")
@@ -260,24 +299,26 @@ class TestLogsAPI:
 
 
 class TestBenchmarkAPI:
-    def test_benchmark_endpoint_contract(self, client):
-        """The endpoint must be either 200-with-body or a documented 404.
+    def test_benchmark_returns_payload_for_seeded_data(self, client):
+        """The seeded AAPL/1d parquet must produce a 200 with a real payload.
 
-        A 404 is only acceptable when the local dataset for AAPL is absent;
-        a 200 response must carry the documented payload shape.
+        Previously this test accepted "200 or 404"; on the isolated store the
+        endpoint always 404'd (no local OHLCV), so the 200-with-body branch
+        was never executed and the test asserted nothing.
         """
         resp = client.get("/api/benchmark/AAPL")
-        if resp.status_code == 200:
-            data = resp.json()
-            assert "symbol" in data
-            assert "equity" in data
-            assert isinstance(data["equity"], list)
-        else:
-            assert resp.status_code == 404
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["symbol"] == "AAPL"
+        assert isinstance(data["equity"], list)
+        assert data["equity"], "Benchmark equity must not be empty for seeded data"
 
-    def test_benchmark_with_dates(self, client):
-        resp = client.get("/api/benchmark/AAPL?start=2023-01-01&end=2024-01-01")
+    def test_benchmark_with_date_window_outside_data_is_empty_or_404(self, client):
+        """A window entirely before the seeded data yields 404 or empty equity."""
+        resp = client.get("/api/benchmark/AAPL?start=2023-01-01&end=2023-06-01")
         assert resp.status_code in (200, 404)
+        if resp.status_code == 200:
+            assert isinstance(resp.json().get("equity"), list)
 
     def test_benchmark_nonexistent(self, client):
         resp = client.get("/api/benchmark/ZZZZZ_FAKE")

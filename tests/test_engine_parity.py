@@ -126,7 +126,10 @@ def test_native_and_vectorbt_agree_exactly_on_bundled_fixture(parity_data_dir):
         assert pd.Timestamp(native_trade.entry_time) == pd.Timestamp(vectorbt_trade.entry_time), (
             f"Trade {index}: entry time diverges between engines"
         )
-        assert native_trade.entry_price == pytest.approx(vectorbt_trade.entry_price), (
+        # Entry price is EXACT (rel=1e-9): both engines fill the next bar's
+        # open of the same deterministic series, so any difference is a real
+        # divergence, not a floating-point artifact of the tolerance decision.
+        assert native_trade.entry_price == pytest.approx(vectorbt_trade.entry_price, rel=1e-9), (
             f"Trade {index}: entry price diverges between engines"
         )
         assert native_trade.pnl == pytest.approx(vectorbt_trade.pnl, rel=0.05), (

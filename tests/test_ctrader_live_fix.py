@@ -286,7 +286,8 @@ def _make_reconcile_adapter(tmp_path: Path, response):
         assert request.ctidTraderAccountId == adapter.ctid_trader_account_id
         return response
 
-    adapter._send_request_with_refresh_retry = _fake_send_request_with_refresh_retry  # type: ignore[assignment]
+    # type: ignore[method-assign]: the real method is replaced by the stub.
+    adapter._send_request_with_refresh_retry = _fake_send_request_with_refresh_retry
     return adapter
 
 
@@ -406,11 +407,15 @@ def test_get_positions_excludes_closed_positions(tmp_path: Path):
     positions = _run_get_positions(adapter)
 
     symbols_and_qty = [(p["symbol"], p["qty"]) for p in positions]
-    assert ("EURUSD", 5.0) in symbols_and_qty
-    assert all(qty != 99.99 for _sym, qty in symbols_and_qty), (
+    assert ("EURUSD", 5.0) in symbols_and_qty, (
+        f"Open BUY position (volume 5000) missing from get_positions: {positions}"
+    )
+    # The closed position carried volume 9999 (qty 9.999); if it leaked, the
+    # result would hold two rows. Assert on the closed volume directly.
+    assert all(qty != 9.999 for _sym, qty in symbols_and_qty), (
         f"Closed position (volume 9999) leaked into open positions: {positions}"
     )
-    assert len(positions) == 1
+    assert len(positions) == 1, f"Expected only the open position: {positions}"
 
 
 def test_get_positions_maps_symbol_ids_to_names(tmp_path: Path):

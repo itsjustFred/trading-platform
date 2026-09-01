@@ -188,14 +188,21 @@ def test_fully_covering_single_file_passes(gate, tmp_path):
     gate._require_ohlcv_coverage("US500", "1h", "2025-01-01", "2025-03-31")
 
 
+def _config_without_terminalreporter() -> object:
+    """A pytest.Config stand-in whose pluginmanager has no terminalreporter."""
+    return type(
+        "Config",
+        (),
+        {"pluginmanager": type("PM", (), {"get_plugin": lambda self, name: None})()},
+    )()
+
+
 def test_session_finish_summary_counts_data_skips(gate, tmp_path, capsys):
     """M1 visibility: the gate must report how many modules it skipped."""
     gate.record_data_skip("missing OHLCV dataset for US500/1h")
     gate.record_data_skip("missing OHLCV dataset for SPY/1d")
 
-    gate.summarize_data_skips(
-        config=type("Config", (), {"pluginmanager": type("PM", (), {"get_plugin": lambda self, name: None})()})()
-    )
+    gate.summarize_data_skips(config=_config_without_terminalreporter())
 
     output = capsys.readouterr().out
     assert "2" in output
@@ -203,19 +210,9 @@ def test_session_finish_summary_counts_data_skips(gate, tmp_path, capsys):
 
 
 def test_session_finish_summary_is_silent_without_skips(gate, capsys):
-    gate.summarize_data_skips(
-        config=type("Config", (), {"pluginmanager": type("PM", (), {"get_plugin": lambda self, name: None})()})()
-    )
+    gate.summarize_data_skips(config=_config_without_terminalreporter())
 
     assert capsys.readouterr().out == ""
-
-
-def _config_without_terminalreporter() -> object:
-    return type(
-        "Config",
-        (),
-        {"pluginmanager": type("PM", (), {"get_plugin": lambda self, name: None})()},
-    )()
 
 
 def test_strict_mode_failures_are_not_counted_as_skips(gate, tmp_path, capsys):
