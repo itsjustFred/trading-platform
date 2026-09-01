@@ -8580,7 +8580,6 @@ async def _load_and_filter_csv_signals(
             continue
         if _safe_float(signal.get("entry_price"), 0.0) <= 0:
             continue
-        entry_price = _safe_float(signal.get("entry_price"), 0.0)
 
         signal_payload = _replay_signal_payload(signal, signal_time, source_label, file_path)
         filtered_signals.append(signal_payload)
