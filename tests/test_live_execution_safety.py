@@ -14,7 +14,6 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from uuid import UUID, uuid4
@@ -232,6 +231,13 @@ def test_submit_order_with_risk_sizes_normally_when_flat():
     assert adapter.submitted_signal.metadata["qty"] == pytest.approx(200.0)
 
 
+def _submit_signal(module, adapter, signal):
+    """Single possibly-throwing invocation for S5778-clean exception tests:
+    ``pytest.raises`` blocks below call this helper instead of nesting
+    ``asyncio.run`` inside argument construction."""
+    return asyncio.run(adapter.submit_order(signal))
+
+
 def test_alpaca_submit_order_blocks_non_positive_quantity(monkeypatch):
     """Kills mutant: relaxing the qty <= 0 guard to qty < 0."""
     from live_runner import alpaca_adapter as module
@@ -260,7 +266,7 @@ def test_alpaca_submit_order_blocks_non_positive_quantity(monkeypatch):
     )
 
     with pytest.raises(ValueError, match="non-positive quantity"):
-        asyncio.run(adapter.submit_order(signal))
+        _submit_signal(module, adapter, signal)
 
 
 def test_alpaca_extended_hours_without_positive_limit_price_raises(monkeypatch):
@@ -439,7 +445,7 @@ def test_alpaca_discord_redelivery_submits_once_with_canonical_signal_id(monkeyp
 
     assert asyncio.run(adapter.submit_order(first)) == "alpaca-order-1"
     with pytest.raises(RuntimeError, match="canonical signal already exists"):
-        asyncio.run(adapter.submit_order(redelivery))
+        _submit_signal(module, adapter, redelivery)
 
     assert len(submitted_requests) == 1
     assert submitted_requests[0].client_order_id == canonical_signal_id
@@ -578,7 +584,7 @@ def test_alpaca_broker_order_id_persistence_failure_is_not_success(monkeypatch):
     monkeypatch.setattr(module, "set_live_signal_broker_order_id", _fail_persistence)
 
     with pytest.raises(RuntimeError, match="Failed to persist Alpaca broker order id"):
-        asyncio.run(adapter.submit_order(signal))
+        _submit_signal(module, adapter, signal)
 
     assert persistence_calls == [(canonical_signal_id, "alpaca-order-2")]
 
@@ -597,10 +603,12 @@ def test_ctrader_volume_rejects_missing_and_below_minimum_qty():
             metadata=metadata,
         )
 
+    missing_qty = _signal({})
     with pytest.raises(ValueError, match="no positive quantity"):
-        adapter._resolve_order_volume(_signal({}))
+        adapter._resolve_order_volume(missing_qty)
+    below_minimum = _signal({"qty": 0.07})
     with pytest.raises(ValueError, match="below the broker minimum"):
-        adapter._resolve_order_volume(_signal({"qty": 0.07}))
+        adapter._resolve_order_volume(below_minimum)
     assert adapter._resolve_order_volume(_signal({"qty": 5.0})) == 5000
     assert adapter._resolve_order_volume(_signal({"ctrader_volume": 2000})) == 2000
     assert adapter._resolve_order_volume(_signal({"qty": 499.999, "ctrader_volume": 100000})) == 100000
@@ -2088,7 +2096,7 @@ def test_ctrader_accepted_order_fails_closed_when_local_id_persistence_fails(mon
     adapter._ProtoOATimeInForce = SimpleNamespace(IMMEDIATE_OR_CANCEL=1)
 
     with pytest.raises(RuntimeError, match="persist cTrader broker order id"):
-        asyncio.run(adapter.submit_order(signal))
+        _submit_signal(module, adapter, signal)
 
     assert adapter._order_id_to_signal_id == {}
 
