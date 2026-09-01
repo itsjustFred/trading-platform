@@ -132,7 +132,7 @@ def isolated_db(isolated_db_sandbox):
     database, engine, data_dir = isolated_db_sandbox
     backtests_dir = data_dir / "backtests"
     backtests_dir.mkdir(parents=True)
-    yield database, engine, data_dir, backtests_dir
+    return database, engine, data_dir, backtests_dir
 
 
 def _make_live_signal(*, discord_message_id=None, broker_order_id=None, **extra) -> LiveSignal:

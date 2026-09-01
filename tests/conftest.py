@@ -86,7 +86,7 @@ def isolated_db_sandbox(monkeypatch, tmp_path: Path):
 @pytest.fixture
 def isolated_db(isolated_db_sandbox):
     """Alias of :func:`isolated_db_sandbox`."""
-    yield isolated_db_sandbox
+    return isolated_db_sandbox
 
 
 @lru_cache(maxsize=None)

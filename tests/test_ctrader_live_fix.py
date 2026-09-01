@@ -239,7 +239,7 @@ def isolated_db(isolated_db_sandbox):
     directly, so these persistence tests keep their ``database = isolated_db``
     style."""
     database, _engine, _data_dir = isolated_db_sandbox
-    yield database
+    return database
 
 
 # ─── cTrader get_positions helpers ────────────────────────────────────────────
