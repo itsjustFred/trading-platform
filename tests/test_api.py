@@ -70,7 +70,7 @@ def _seeded_backtest_result() -> BacktestResult:
     )
 
 
-@pytest.fixture()
+@pytest.fixture
 def isolated_viewer(monkeypatch, tmp_path):
     """viewer app bound to a tmp data dir with one seeded backtest.
 
@@ -113,7 +113,7 @@ def isolated_viewer(monkeypatch, tmp_path):
     viewer_main_module._BACKTEST_META_CACHE.clear()
 
 
-@pytest.fixture()
+@pytest.fixture
 def client(isolated_viewer):
     """Create a test FastAPI app client on the isolated viewer."""
     return TestClient(isolated_viewer.app)

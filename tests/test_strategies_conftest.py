@@ -33,7 +33,7 @@ def _load_gate():
     return module
 
 
-@pytest.fixture()
+@pytest.fixture
 def gate(monkeypatch, tmp_path):
     module = _load_gate()
     monkeypatch.setattr(module, "DATA_DIR", tmp_path)
