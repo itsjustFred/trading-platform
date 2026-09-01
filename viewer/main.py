@@ -7540,7 +7540,9 @@ def _slice_replay_ohlcv(df: pd.DataFrame, trade_payloads: list[dict[str, Any]]) 
     keep_mask = _replay_keep_mask_from_trades(df, trade_payloads)
     if keep_mask.size != len(df) or np.all(keep_mask):
         return df
-    return df.iloc[np.flatnonzero(keep_mask)]
+    # reset_index so downstream consumers (indicator computation) never
+    # confuse the preserved original labels with positional row indexes.
+    return df.iloc[np.flatnonzero(keep_mask)].reset_index(drop=True)
 
 
 def _slice_indicators_to_timestamps(indicators: list[dict[str, Any]], *, ohlcv_times: list[float]) -> None:

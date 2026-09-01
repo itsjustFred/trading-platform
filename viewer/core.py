@@ -1436,14 +1436,23 @@ def _compute_indicators(
 
 
 def _indicator_to_points(df: pd.DataFrame, series: pd.Series, time_set: set[float]) -> list[dict]:
-    """Convert a pandas Series to time/value points filtered to the OHLCV window."""
+    """Convert a pandas Series to time/value points filtered to the OHLCV window.
+
+    The series may carry non-contiguous labels (e.g. a row slice that keeps its
+    original index), so values are paired with timestamps positionally: iterate
+    the series values in order and index the frame positions with `.iloc`,
+    never treating a label as a position.
+    """
     points = []
-    for i, val in series.items():
-        if pd.notna(val) and i < len(df):
-            ts = df.iloc[i]["timestamp"]
-            unix_ts = ts.timestamp() if hasattr(ts, "timestamp") else pd.Timestamp(ts).timestamp()
-            if unix_ts in time_set:
-                points.append({"time": unix_ts, "value": round(float(val), 6)})
+    values = series.reset_index(drop=True)
+    for i in range(len(values)):
+        val = values.iloc[i]
+        if i >= len(df) or not pd.notna(val):
+            continue
+        ts = df.iloc[i]["timestamp"]
+        unix_ts = ts.timestamp() if hasattr(ts, "timestamp") else pd.Timestamp(ts).timestamp()
+        if unix_ts in time_set:
+            points.append({"time": unix_ts, "value": round(float(val), 6)})
     return points
 
 
