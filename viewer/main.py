@@ -8528,6 +8528,28 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
     return {"task_id": task_id, "job_id": task_id, "status": "queued"}
 
 
+def _replay_signal_payload(
+    signal: dict[str, Any], signal_time: pd.Timestamp, source_label: str, file_path: str
+) -> dict[str, Any]:
+    """Normalise one raw CSV signal row into the replay payload shape."""
+    action = str(signal.get("action") or "").strip().lower()
+    entry_price = _safe_float(signal.get("entry_price"), 0.0)
+    metadata = dict(signal.get("metadata") or {})
+    metadata["signal_source_label"] = f"CSV: {Path(file_path).name}"
+    metadata["signal_filepath"] = str(Path(file_path).expanduser())
+    return {
+        "timestamp": pd.Timestamp(signal_time).isoformat(),
+        "symbol": str(signal.get("symbol") or "").strip().upper(),
+        "action": action,
+        "entry_price": entry_price,
+        "stop_loss": signal.get("stop_loss"),
+        "take_profit": signal.get("take_profit"),
+        "timeframe": normalize_timeframe(str(signal.get("timeframe") or "")) or "",
+        "source": source_label,
+        "metadata": metadata,
+    }
+
+
 async def _load_and_filter_csv_signals(
     file_path: str, start_dt: datetime, end_dt: datetime
 ) -> tuple[list[dict[str, Any]], list[SignalReplayInput]]:
@@ -8556,24 +8578,11 @@ async def _load_and_filter_csv_signals(
         action = str(signal.get("action") or "").strip().lower()
         if action not in {"buy", "sell", "long", "short"}:
             continue
-        entry_price = _safe_float(signal.get("entry_price"), 0.0)
-        if entry_price <= 0:
+        if _safe_float(signal.get("entry_price"), 0.0) <= 0:
             continue
+        entry_price = _safe_float(signal.get("entry_price"), 0.0)
 
-        metadata = dict(signal.get("metadata") or {})
-        metadata["signal_source_label"] = f"CSV: {Path(file_path).name}"
-        metadata["signal_filepath"] = str(Path(file_path).expanduser())
-        signal_payload = {
-            "timestamp": pd.Timestamp(signal_time).isoformat(),
-            "symbol": str(signal.get("symbol") or "").strip().upper(),
-            "action": action,
-            "entry_price": entry_price,
-            "stop_loss": signal.get("stop_loss"),
-            "take_profit": signal.get("take_profit"),
-            "timeframe": normalize_timeframe(str(signal.get("timeframe") or "")) or "",
-            "source": source_label,
-            "metadata": metadata,
-        }
+        signal_payload = _replay_signal_payload(signal, signal_time, source_label, file_path)
         filtered_signals.append(signal_payload)
         signal_inputs.append(
             SignalReplayInput(
@@ -8585,7 +8594,7 @@ async def _load_and_filter_csv_signals(
                 take_profit=signal_payload.get("take_profit"),
                 timeframe=str(signal_payload["timeframe"] or ""),
                 source=str(signal_payload["source"]),
-                metadata=dict(metadata),
+                metadata=dict(signal_payload["metadata"]),
             )
         )
     return filtered_signals, signal_inputs
