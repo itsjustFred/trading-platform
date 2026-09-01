@@ -54,7 +54,9 @@ export function BacktestFromSignalsModal({
   const [signalSource, setSignalSource] = useState<BacktestFromSignalsSource>("csv");
   const [filepath, setFilepath] = useState("");
   const [accountId, setAccountId] = useState("");
-  const [signalProcessor, setSignalProcessor] = useState(DEFAULT_SIGNAL_PROCESSOR);
+  // Start empty (matches the placeholder option) and let the registry
+  // reconciliation below select the default or first advertised processor.
+  const [signalProcessor, setSignalProcessor] = useState("");
   const [timeframe, setTimeframe] = useState("");
   const [startDate, setStartDate] = useState(range.start);
   const [endDate, setEndDate] = useState(range.end);
