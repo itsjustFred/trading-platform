@@ -169,10 +169,17 @@ def release_lock() -> None:
 
 
 def _remove_lock_file() -> None:
-    """Remove the lock file only while this process still holds its flock.
+    """Remove the lock file only while this process no longer holds its flock.
 
-    Unlinking under flock is safe (no other session can hold the lock while we
-    do this), so a fresh-looking leftover cannot block the next tick.
+    Called exclusively from ``main()``'s ``finally`` after :func:`release_lock`,
+    so the current process cannot be the flock owner. Unlinking while another
+    session may have acquired the flock in the meantime is still racy: that
+    session then holds a lock on an unlinked inode and a third session can take
+    a flock on a new file. The stale leftover file is harmless (a later
+    ``acquire_lock`` takes the flock over it and truncates it), so removal is a
+    best-effort tidy-up only — never relied on for correctness. Currently unused;
+    kept as the documented, safe way to tidy the lock path if a caller ever needs
+    it.
     """
     if globals().get("_LOCK_HANDLE") is not None:
         return
@@ -327,7 +334,6 @@ def main() -> int:
             continue
     finally:
         release_lock()
-        _remove_lock_file()
 
 
 def render_state(state: dict) -> str:
