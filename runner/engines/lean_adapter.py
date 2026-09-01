@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import shutil
 import subprocess
 import tempfile
 from datetime import datetime, timezone
@@ -88,15 +90,19 @@ class LeanAdapter(EngineAdapter):
         return config_path
 
     def _run_lean(self, config_path: Path) -> Path:
-        """Execute LEAN backtest via subprocess."""
+        """Execute LEAN backtest via the ``lean`` CLI console script."""
         output_dir = self.project_dir / "output" / datetime.now().strftime("%Y%m%d_%H%M%S")
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Try to run via the lean CLI or Python entry point
+        lean_bin = shutil.which("lean")
+        if not lean_bin:
+            raise RuntimeError(
+                "LEAN CLI not found on PATH. Install with: pip install lean\n"
+                "Or pass an existing LEAN result JSON as strategy_path."
+            )
+
         cmd = [
-            "python",
-            "-m",
-            "lean",
+            lean_bin,
             "backtest",
             str(config_path),
             "--output",
@@ -112,13 +118,20 @@ class LeanAdapter(EngineAdapter):
                 timeout=600,
                 cwd=str(self.project_dir),
             )
-            if result.returncode != 0:
-                logger.error("LEAN failed:\n%s\n%s", result.stdout, result.stderr)
-                raise RuntimeError(f"LEAN exited with code {result.returncode}")
-        except FileNotFoundError:
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"LEAN backtest timed out after {exc.timeout} seconds"
+            ) from exc
+        except FileNotFoundError as exc:
             raise RuntimeError(
                 "LEAN CLI not found. Install with: pip install lean\n"
                 "Or pass an existing LEAN result JSON as strategy_path."
+            ) from exc
+        if result.returncode != 0:
+            logger.error("LEAN failed:\n%s\n%s", result.stdout, result.stderr)
+            raise RuntimeError(
+                f"LEAN exited with code {result.returncode}: "
+                f"{(result.stderr or result.stdout or '')[-2000:]}"
             )
 
         return output_dir
