@@ -127,27 +127,45 @@ def _default_backup_dir(root: Path) -> Path:
     return root.parent / f"{root.name}-consolidation-backup-{stamp}"
 
 
-def _stage_backup(actions: list[tuple[Path, list[Path]]], root: Path, backup_dir: Path) -> Path:
+def _stage_backup(
+    actions: list[tuple[Path, list[Path]]], root: Path, backup_dir: Path
+) -> tuple[Path, set[Path]]:
     """Copy every file that will be written or deleted into ``backup_dir``.
 
     Paths inside the snapshot mirror their location relative to ``root``, so the
-    snapshot can be copied straight back over the tree to undo a run.
+    snapshot can be copied straight back over the tree to undo a run. Also
+    returns the set of canonical targets that already existed before the run, so
+    a rollback can delete targets that were newly created by it.
     """
     if backup_dir.exists():
         raise FileExistsError(
             f"Backup directory {backup_dir} already exists. Remove it or pass --backup-dir."
         )
-    for _target, members in actions:
+    pre_existing_targets: set[Path] = set()
+    for target, members in actions:
+        if target.exists():
+            pre_existing_targets.add(target)
         for member in members:
             destination = backup_dir / member.relative_to(root)
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(member, destination)
-    return backup_dir
+    return backup_dir, pre_existing_targets
 
 
-def restore_backup(backup_dir: Path, root: Path) -> int:
-    """Copy a consolidation backup back into the OHLCV tree. Returns files restored."""
+def restore_backup(
+    backup_dir: Path, root: Path, *, created_targets: set[Path] | None = None
+) -> int:
+    """Copy a consolidation backup back into the OHLCV tree. Returns files restored.
+
+    ``created_targets`` lists canonical files the failed run itself produced (for
+    example a ``1h.parquet`` that only existed as fragments before); those are
+    removed before the snapshot is copied back, so the restored tree matches the
+    pre-run state exactly.
+    """
     restored = 0
+    for target in sorted(created_targets or ()):
+        if target.exists():
+            target.unlink()
     for source in sorted(backup_dir.rglob("*.parquet")):
         destination = root / source.relative_to(backup_dir)
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -210,7 +228,7 @@ def consolidate(
     resolved_backup_dir = _validate_backup_dir(
         backup_dir if backup_dir is not None else _default_backup_dir(root), root
     )
-    _stage_backup(actions, root, resolved_backup_dir)
+    _, pre_existing_targets = _stage_backup(actions, root, resolved_backup_dir)
     print(f"Backup snapshot: {resolved_backup_dir}")
 
     try:
@@ -219,12 +237,20 @@ def consolidate(
     except Exception:
         # A merge failed partway: canonical targets already replaced by earlier
         # iterations must not be left mixed with stale fragments, so put the
-        # snapshot back over the tree before propagating.
-        restored = restore_backup(resolved_backup_dir, root)
+        # snapshot back over the tree before propagating. Targets the failed run
+        # itself created (no canonical file existed before) are removed first.
+        created_targets = {target for target, _ in actions} - pre_existing_targets
+        restored = restore_backup(resolved_backup_dir, root, created_targets=created_targets)
         print(f"Merge failed — restored {restored} file(s) from {resolved_backup_dir}")
         raise
     merged_groups = len(actions)
-    deleted_fragments = _delete_replaced_fragments(actions)
+    try:
+        deleted_fragments = _delete_replaced_fragments(actions)
+    except Exception:
+        created_targets = {target for target, _ in actions} - pre_existing_targets
+        restored = restore_backup(resolved_backup_dir, root, created_targets=created_targets)
+        print(f"Fragment cleanup failed — restored {restored} file(s) from {resolved_backup_dir}")
+        raise
 
     print(
         "Consolidation complete:",
@@ -240,13 +266,6 @@ def main(argv: list[str] | None = None) -> int:
         description="Consolidate OHLCV parquet fragments (dry run unless --yes is passed)."
     )
     parser.add_argument(
-        "--dry-run",
-        dest="dry_run",
-        action="store_true",
-        default=True,
-        help="Print the plan without changing anything (default).",
-    )
-    parser.add_argument(
         "--yes",
         action="store_true",
         help="Run for real (still writes a restorable backup snapshot first).",
@@ -260,6 +279,8 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     args = parser.parse_args(argv)
+    # Dry run is the default and always wins unless --yes is passed.
+    dry_run = not args.yes
 
     ohlcv_root = DATA_DIR / "ohlcv"
     if not ohlcv_root.exists():
@@ -281,7 +302,7 @@ def main(argv: list[str] | None = None) -> int:
 
     consolidate(
         ohlcv_root,
-        dry_run=not args.yes,
+        dry_run=dry_run,
         backup_dir=args.backup_dir,
     )
     return 0
