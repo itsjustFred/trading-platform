@@ -343,9 +343,12 @@ class TestTolerances:
         golden_path = tmp_path / "golden.json"
         _write_golden(golden, golden_path)
 
+        # DV-B35: every enabled tolerance band must hold, so a rel-band-only
+        # check must widen the abs band instead of relying on the OR-rescue
+        # the old gate semantics allowed.
         cfg = RegressionConfig(
             stats_relative_tolerance={"net_profit": 0.02},
-            stats_absolute_tolerance={"net_profit": 0.0},
+            stats_absolute_tolerance={"net_profit": 2.0},
         )
         current = _make_reference(act_trades)
         result = run_regression(golden_path, current_data=current, config=cfg)

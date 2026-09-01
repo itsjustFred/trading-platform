@@ -15,7 +15,11 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from shared.models import BacktestMeta, BacktestResult, Trade
 from validation.comparison.anomalies import AnomalyDetector
-from validation.comparison.comparison import MatchedTrade, TradeComparator
+from validation.comparison.comparison import (
+    MatchedTrade,
+    TradeComparisonConfig,
+    TradeComparator,
+)
 from validation.comparison.delta_report import (
     DeltaReportBuilder,
     FieldDelta,
@@ -121,66 +125,77 @@ def _build_stat_explanation(
     return f"{field} {issues}: expected {expected}, actual {actual}"
 
 
+def _infinite_like(value: Any) -> bool:
+    """True when *value* is a non-numeric or infinite float (+inf or -inf)."""
+    return isinstance(value, float) and not math.isfinite(value)
+
+
 def _compare_stats(
     expected: TradeStatistics,
     actual: TradeStatistics,
     abs_tol: float = 0.01,
     rel_tol: float = 0.001,
 ) -> list[StatDelta]:
-    """Compare two TradeStatistics objects and return StatDeltas."""
+    """Compare two TradeStatistics objects and return StatDeltas.
+
+    Gate semantics (DV-B35): a field only passes when *every* computed
+    tolerance holds (AND).  Infinite values (DV-B34) compare symmetrically:
+    identical infinities match, any other infinite combination fails.
+    """
     deltas: list[StatDelta] = []
     for field in _STATS_FIELDS:
         exp_val = getattr(expected, field)
         act_val = getattr(actual, field)
 
-        # Gracefully handle infinities
-        if exp_val == float("inf") and act_val == float("inf"):
-            deltas.append(
-                StatDelta(
-                    field=field,
-                    expected=exp_val,
-                    actual=act_val,
-                    absolute_diff=0.0,
-                    relative_diff=0.0,
-                    passed=True,
-                    explanation=f"{field} matches (both infinite)",
-                    severity="info",
+        # Gracefully handle infinities in either direction
+        exp_inf = _infinite_like(exp_val)
+        act_inf = _infinite_like(act_val)
+        if exp_inf or act_inf:
+            if exp_inf and act_inf and exp_val == act_val:
+                deltas.append(
+                    StatDelta(
+                        field=field,
+                        expected=exp_val,
+                        actual=act_val,
+                        absolute_diff=0.0,
+                        relative_diff=0.0,
+                        passed=True,
+                        explanation=f"{field} matches (both infinite: {exp_val})",
+                        severity="info",
+                    )
                 )
-            )
-            continue
-        if exp_val == float("inf") or act_val == float("inf"):
-            deltas.append(
-                StatDelta(
-                    field=field,
-                    expected=exp_val,
-                    actual=act_val,
-                    absolute_diff=None,
-                    relative_diff=None,
-                    passed=False,
-                    explanation=f"{field} differs (expected {exp_val}, actual {act_val})",
-                    severity="warning",
+            else:
+                deltas.append(
+                    StatDelta(
+                        field=field,
+                        expected=exp_val,
+                        actual=act_val,
+                        absolute_diff=None,
+                        relative_diff=None,
+                        passed=False,
+                        explanation=f"{field} differs (expected {exp_val}, actual {act_val})",
+                        severity="warning",
+                    )
                 )
-            )
             continue
 
         abs_diff: float | None = None
         rel_diff: float | None = None
         if _is_numeric(exp_val) and _is_numeric(act_val):
             abs_diff = _abs_diff(float(exp_val), float(act_val))
-            denom = max(abs(float(exp_val)), abs(float(act_val)))
-            if denom == 0.0:
-                rel_diff = 0.0 if exp_val == act_val else 1.0
-            else:
-                rel_diff = abs(float(exp_val) - float(act_val)) / denom
+            rel_diff = _rel_diff(float(exp_val), float(act_val))
 
+        # Tolerance bands: every computed band must hold (DV-B35 - AND, not
+        # OR).  A relative diff of 1.0 (one side exactly zero) is therefore
+        # never rescued by the absolute band.
         passed = False
         checks = 0
         if abs_diff is not None:
             checks += 1
-            passed = passed or (abs_diff <= abs_tol)
+            passed = abs_diff <= abs_tol
         if rel_diff is not None:
             checks += 1
-            passed = passed or (rel_diff <= rel_tol)
+            passed = passed and (rel_diff <= rel_tol)
         if checks == 0:
             passed = exp_val == act_val
 

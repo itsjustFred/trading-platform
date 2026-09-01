@@ -270,21 +270,51 @@ class TestCliStatsToleranceArgument:
             "--platform", str(platform_path),
             "--format", "json",
             "--stats-tolerance", "0.001",
+            "--pnl-absolute-tolerance", "0.01",
         ])
         assert result_strict.returncode == 1
         data_strict = json.loads(result_strict.stdout)
         assert data_strict["stat_passed"] is False
 
-        # With loose stats tolerance (1.0), should pass
+        # With both tolerances loosened, should pass. The stat gate requires
+        # every computed tolerance to hold (DV-B35), so the absolute band is
+        # widened here as well; loosening only the relative band must not be
+        # enough on its own.
         result_loose = _invoke_cli([
             "--reference", str(ref_path),
             "--platform", str(platform_path),
             "--format", "json",
             "--stats-tolerance", "1.0",
+            "--pnl-absolute-tolerance", "1000.0",
         ])
         assert result_loose.returncode == 0
         data_loose = json.loads(result_loose.stdout)
         assert data_loose["stat_passed"] is True
+
+    def test_loose_relative_tolerance_alone_does_not_pass(self, tmp_path: Path):
+        """DV-B35: the abs tolerance must not be bypassed by a loose rel band."""
+        ref_trade = _make_sample_trade()
+        ref_trade.exits[0].pnl = 100.0
+        ref = _make_reference(trades=[ref_trade])
+        plat_trade = _make_sample_trade()
+        plat_trade.exits[0].pnl = 200.0
+        platform = _make_reference(trades=[plat_trade])
+
+        ref_path = tmp_path / "ref.json"
+        platform_path = tmp_path / "platform.json"
+        ref_path.write_text(ref.model_dump_json(indent=2), encoding="utf-8")
+        platform_path.write_text(platform.model_dump_json(indent=2), encoding="utf-8")
+
+        result = _invoke_cli([
+            "--reference", str(ref_path),
+            "--platform", str(platform_path),
+            "--format", "json",
+            "--stats-tolerance", "1.0",
+            "--pnl-absolute-tolerance", "0.01",
+        ])
+        assert result.returncode == 1
+        data = json.loads(result.stdout)
+        assert data["stat_passed"] is False
 
 
 class TestCliHtmlImporter:
