@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Strategietesterbericht</title></head>
+<body>
+<h1>Strategietesterbericht</h1>
+<div class="meta">
+  <table>
+    <tr><td>Expertenprogramm:</td><td colspan="3">GermanSLTPStrategy</td></tr>
+    <tr><td>Symbol:</td><td colspan="3">EURUSD</td></tr>
+    <tr><td>Periode:</td><td colspan="3">H1 (2024.01.02 - 2024.02.01)</td></tr>
+  </table>
+</div>
+<div class="orders">
+  <h2>Orders</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Auftrag</th><th>Zeit</th><th>Symbol</th><th>Typ</th><th>Richtung</th>
+        <th>Volumen</th><th>Preis</th><th>S / L</th><th>T / P</th><th>Kommentar</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>2001</td><td>2024.01.03 08:00:00</td><td>EURUSD</td><td>buy</td><td>in</td>
+        <td>0.10</td><td>1.08500</td><td>2.500</td><td>1.09500</td><td>Entry</td>
+      </tr>
+      <tr>
+        <td>2002</td><td>2024.01.04 08:00:00</td><td>EURUSD</td><td>sell</td><td>in</td>
+        <td>0.20</td><td>1.09200</td><td>1.234,56</td><td>2.5</td><td>Entry</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+<div class="trades">
+  <h2>Trades</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Trade</th><th>Zeit</th><th>Symbol</th><th>Typ</th><th>Richtung</th>
+        <th>Volumen</th><th>Preis</th><th>Auftrag</th><th>Kommission</th>
+        <th>Swap</th><th>Gewinn</th><th>Kommentar</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>1</td><td>2024.01.03 08:00:00</td><td>EURUSD</td><td>buy</td><td>in</td>
+        <td>0.10</td><td>1.08500</td><td>2001</td><td>-1.00</td>
+        <td>0.00</td><td></td><td>Entry</td>
+      </tr>
+      <tr>
+        <td>1</td><td>2024.01.03 16:00:00</td><td>EURUSD</td><td>sell</td><td>out</td>
+        <td>0.10</td><td>1.09000</td><td>2001</td><td>-1.00</td>
+        <td>0.00</td><td>500.00</td><td>TP 1.09000</td>
+      </tr>
+      <tr>
+        <td>2</td><td>2024.01.04 08:00:00</td><td>EURUSD</td><td>sell</td><td>in</td>
+        <td>0.20</td><td>1.09200</td><td>2002</td><td>-2.00</td>
+        <td>0.00</td><td></td><td>Entry</td>
+      </tr>
+      <tr>
+        <td>2</td><td>2024.01.04 16:00:00</td><td>EURUSD</td><td>buy</td><td>out</td>
+        <td>0.20</td><td>1.09000</td><td>2002</td><td>-2.00</td>
+        <td>0.00</td><td>400.00</td><td>TP 1.09000</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+</body>
+</html>

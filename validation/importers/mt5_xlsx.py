@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import pandas as pd
 
 from shared.models import Trade, TradeExit
+from validation.importers._numbers import detect_decimal_comma, parse_locale_number
 from validation.importers.base import BaseImporter
 from validation.reference import ValidationReference
 
@@ -410,6 +411,20 @@ class MT5XLSXImporter(BaseImporter):
         if col_order_id is None:
             return mapping
 
+        # DV-B44: the xlsx SL/TP cells go through the same locale-aware
+        # parser as the HTML importer; "2.500" is 2500, not 2.5.
+        cell_values: list[str | None] = []
+        for _, row in orders_df.iterrows():
+            for col in (col_sl, col_tp):
+                if col is not None and col in row and pd.notna(row[col]):
+                    cell_values.append(str(row[col]))
+        decimal_comma = detect_decimal_comma(cell_values)
+
+        def _parse(cell: Any) -> float | None:
+            if cell is None or (isinstance(cell, float) and pd.isna(cell)):
+                return None
+            return parse_locale_number(str(cell), decimal_comma)
+
         for _, row in orders_df.iterrows():
             oid = row[col_order_id]
             if pd.isna(oid):
@@ -417,8 +432,8 @@ class MT5XLSXImporter(BaseImporter):
             sl = row.get(col_sl, None) if col_sl else None
             tp = row.get(col_tp, None) if col_tp else None
             mapping[oid] = {
-                "sl": float(sl) if pd.notna(sl) else None,
-                "tp": float(tp) if pd.notna(tp) else None,
+                "sl": _parse(sl),
+                "tp": _parse(tp),
             }
         return mapping
 

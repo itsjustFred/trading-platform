@@ -11,6 +11,7 @@ from typing import Any
 from bs4 import BeautifulSoup
 
 from shared.models import Trade, TradeExit
+from validation.importers._numbers import detect_decimal_comma, parse_locale_number
 from validation.importers.base import BaseImporter
 from validation.reference import ValidationReference
 
@@ -386,6 +387,13 @@ class MT5HTMLImporter(BaseImporter):
         if col_order_id is None:
             return mapping
 
+        # DV-B44: "2.500" alone is ambiguous (2.5 ASCII vs 2500 German), so
+        # the report locale is detected from grouped values across the whole
+        # table before parsing any single cell.
+        decimal_comma = detect_decimal_comma(
+            [row[col] for row in data_rows for col in range(len(row))]
+        )
+
         for row in data_rows:
             if col_order_id >= len(row):
                 continue
@@ -394,9 +402,11 @@ class MT5HTMLImporter(BaseImporter):
                 continue
             sl = row[col_sl] if (col_sl is not None and col_sl < len(row)) else ""
             tp = row[col_tp] if (col_tp is not None and col_tp < len(row)) else ""
+            # Unparseable values stay None instead of raising (aborting the
+            # whole import) or being silently corrupted.
             mapping[oid] = {
-                "sl": float(sl.replace(",", ".")) if sl else None,
-                "tp": float(tp.replace(",", ".")) if tp else None,
+                "sl": parse_locale_number(sl, decimal_comma),
+                "tp": parse_locale_number(tp, decimal_comma),
             }
         return mapping
 
@@ -564,10 +574,8 @@ class MT5HTMLImporter(BaseImporter):
         val = row[col]
         if not val:
             return default
-        try:
-            return float(val.replace(",", ".").replace(" ", ""))
-        except (ValueError, TypeError):
-            return default
+        parsed = parse_locale_number(val, decimal_comma=False)
+        return default if parsed is None else parsed
 
     @staticmethod
     def _to_iso(raw: str, source_tz: str | None = None) -> str:
@@ -597,3 +605,13 @@ class MT5HTMLImporter(BaseImporter):
         if comment.startswith("trailing "):
             return "trailing_stop"
         return None
+
+
+def _parse_german_number(raw: str | None) -> float | None:
+    """Parse a number using the German convention (dot = thousands group)."""
+    from validation.importers._numbers import parse_locale_number
+
+    return parse_locale_number(raw, decimal_comma=True)
+
+
+__all__ = ["MT5HTMLImporter", "_parse_german_number"]

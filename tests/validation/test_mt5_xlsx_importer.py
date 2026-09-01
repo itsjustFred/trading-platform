@@ -331,3 +331,19 @@ class TestDirectionRequiresTypColumn:
         path = self._write_report(tmp_path, include_typ=True, typ_value="buy limit")
         with pytest.raises(ValueError, match="buy limit"):
             MT5XLSXImporter().load(path)
+
+
+class TestGermanNumberParsing:
+    """DV-B44: xlsx SL/TP cells parse German-formatted numbers exactly."""
+
+    def test_sltp_map_german_thousands(self):
+        """A German-grouped report parses "2.500" as 2500, not 2.5."""
+        orders = pd.DataFrame(
+            [
+                [1001, "2024.01.03 08:00:00", "EURUSD", "buy", "0.10", 1.085, "1.234,56", "2.500", "filled", "Entry"],
+            ],
+            columns=["Auftrag", "Zeit", "Symbol", "Typ", "Volumen", "Preis", "S / L", "T / P", "Status", "Kommentar"],
+        )
+        mapping = MT5XLSXImporter._build_sltp_map(orders)
+        assert mapping[1001]["sl"] == pytest.approx(1234.56)
+        assert mapping[1001]["tp"] == pytest.approx(2500.0)

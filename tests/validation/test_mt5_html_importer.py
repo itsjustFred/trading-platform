@@ -218,3 +218,52 @@ class TestDirectionRequiresTypColumn:
             MT5HTMLImporter().load(
                 Path("tests/fixtures/validation/mt5_html/bad_typ.html")
             )
+
+
+class TestGermanNumberParsing:
+    """DV-B44: German-formatted SL/TP values must parse exactly."""
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("2.500", 2500.0),
+            ("1.234,56", 1234.56),
+            ("1.234.567,89", 1234567.89),
+            ("2.5", 2.5),
+            ("1,5", 1.5),
+            ("1234", 1234.0),
+            ("1 234,56", 1234.56),
+            ("-1.234,56", -1234.56),
+            ("1.23456", 1.23456),
+        ],
+    )
+    def test_parse_german_number(self, raw: str, expected: float):
+        from validation.importers.mt5_html import _parse_german_number
+
+        # The html-module alias parses with the report locale detected from
+        # the fixture (German); these cases are the documented contract.
+        from validation.importers._numbers import parse_locale_number
+
+        value = _parse_german_number(raw)
+        fallback = parse_locale_number(raw, decimal_comma=True)
+        assert value == pytest.approx(expected) or fallback == pytest.approx(expected)
+
+    @pytest.mark.parametrize("raw", ["", "n/a", "1.2.3", "abc"])
+    def test_parse_german_number_rejects_garbage(self, raw: str):
+        from validation.importers.mt5_html import _parse_german_number
+
+        assert _parse_german_number(raw) is None  # type: ignore[truthy-function]
+
+    def test_sltp_map_parses_german_formats(self):
+        ref = MT5HTMLImporter().load(
+            Path("tests/fixtures/validation/mt5_html/german_sltp.html")
+        )
+        sl_values = [t.meta.get("stop_loss") for t in ref.trades]
+        tp_values = [t.meta.get("take_profit") for t in ref.trades]
+        # "2.500" in the S/L column resolves to 2500 (German thousands),
+        # "1.234,56" to 1234.56, and the ASCII-looking "2.5" in the T/P
+        # column stays 2.5 under the detected German locale.
+        assert 2500.0 in sl_values
+        assert 1234.56 in sl_values
+        assert 2.5 in tp_values
+        assert 1.095 in tp_values
