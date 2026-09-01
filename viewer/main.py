@@ -710,6 +710,7 @@ async def lifespan(app: FastAPI):
     await asyncio.to_thread(mark_background_tasks_interrupted, from_statuses=["queued", "running"])
     await asyncio.to_thread(_resume_interrupted_tasks)
     await asyncio.to_thread(legacy_viewer.evict_jobs)
+    install_legacy_task_hooks()
     try:
         yield
     finally:
@@ -3379,15 +3380,28 @@ def _serialize_task(
     return payload
 
 
-# Route legacy core task lifecycle through persistence-aware wrappers.
-legacy_viewer._create_task_record = _create_task_record
-legacy_viewer._get_task = _get_task
-legacy_viewer._snapshot_task = _snapshot_task
-legacy_viewer._update_task_fields = _update_task_fields
-legacy_viewer._set_task_status = _set_task_status
-legacy_viewer._update_task_progress = _update_task_progress
-legacy_viewer._mark_task_finished = _mark_task_finished
-legacy_viewer._serialize_task = _serialize_task
+_LEGACY_HOOKS_INSTALLED = False
+
+
+def install_legacy_task_hooks() -> None:
+    """Wire the persistence-aware task wrappers into the legacy core module.
+
+    Explicit injection (called from lifespan startup) instead of import-time
+    attribute reassignment: behavior no longer depends on which module was
+    imported first and the wrapper chain is visible to static analysis.
+    """
+    global _LEGACY_HOOKS_INSTALLED
+    if _LEGACY_HOOKS_INSTALLED:
+        return
+    legacy_viewer._create_task_record = _create_task_record
+    legacy_viewer._get_task = _get_task
+    legacy_viewer._snapshot_task = _snapshot_task
+    legacy_viewer._update_task_fields = _update_task_fields
+    legacy_viewer._set_task_status = _set_task_status
+    legacy_viewer._update_task_progress = _update_task_progress
+    legacy_viewer._mark_task_finished = _mark_task_finished
+    legacy_viewer._serialize_task = _serialize_task
+    _LEGACY_HOOKS_INSTALLED = True
 
 
 def _serialize_live_timestamp(value: datetime | str | None) -> tuple[str, float]:

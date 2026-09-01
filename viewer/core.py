@@ -3119,6 +3119,17 @@ def _launch_agent_task(task_id: str, payload: dict) -> None:
     def run_agent() -> None:
         started_at = datetime.now(timezone.utc)
         with log_file.open("a", encoding="utf-8", buffering=1) as handle:
+            # Thread-bound log capture: route root-logger records from this
+            # thread into the task log instead of swapping the process-global
+            # sys.stdout/sys.stderr (which would swallow concurrent request
+            # logging from other threads into this task's file).
+            log_handler = _ThreadBoundTaskLogHandler(
+                task_id=task_id,
+                handle=handle,
+                source="agent-task",
+            )
+            root_logger = logging.getLogger()
+            root_logger.addHandler(log_handler)
             try:
                 _write_task_log_line(
                     handle,
@@ -3143,20 +3154,19 @@ def _launch_agent_task(task_id: str, payload: dict) -> None:
                         source="agent-task",
                     )
 
-                with redirect_stdout(handle), redirect_stderr(handle):
-                    result = run_auto_agent(
-                        payload["code"],
-                        strategy_name=payload.get("strategy_name"),
-                        requested_engine=payload.get("engine"),
-                        provider=provider,
-                        model=model,
-                        symbols=payload.get("symbols"),
-                        timeframe=payload.get("timeframe"),
-                        start=payload.get("start"),
-                        end=payload.get("end"),
-                        capital=_safe_float(payload.get("capital"), 100000.0),
-                        log=task_log,
-                    )
+                result = run_auto_agent(
+                    payload["code"],
+                    strategy_name=payload.get("strategy_name"),
+                    requested_engine=payload.get("engine"),
+                    provider=provider,
+                    model=model,
+                    symbols=payload.get("symbols"),
+                    timeframe=payload.get("timeframe"),
+                    start=payload.get("start"),
+                    end=payload.get("end"),
+                    capital=_safe_float(payload.get("capital"), 100000.0),
+                    log=task_log,
+                )
                 duration_seconds = max(0.0, (datetime.now(timezone.utc) - started_at).total_seconds())
                 _update_task_fields(
                     task_id,
@@ -3173,9 +3183,11 @@ def _launch_agent_task(task_id: str, payload: dict) -> None:
                     source="agent-task",
                 )
                 _mark_task_finished(task_id, status="completed", returncode=0)
+                root_logger.removeHandler(log_handler)
             except Exception as exc:
                 duration_seconds = max(0.0, (datetime.now(timezone.utc) - started_at).total_seconds())
                 traceback_text = traceback.format_exc()
+                root_logger.removeHandler(log_handler)
                 _write_task_log_line(
                     handle,
                     task_id,
