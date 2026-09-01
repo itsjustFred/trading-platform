@@ -1,11 +1,15 @@
 import { memo } from "react";
 
+import { toPercentPoints, type PercentScale } from "../api/metricScale";
+
 interface StatCardProps {
   label: string;
-  value: string | number;
+  value: string | number | null | undefined;
   subtitle?: string;
   color?: string;
   format?: "currency" | "percent" | "number" | "none";
+  /** Required whenever format="percent": the scale the value arrives in. */
+  percentScale?: PercentScale;
 }
 
 export const StatCard = memo(function StatCard({
@@ -14,26 +18,29 @@ export const StatCard = memo(function StatCard({
   subtitle,
   color,
   format = "none",
+  percentScale = "points",
 }: StatCardProps) {
   const numVal = typeof value === "number" ? value : parseFloat(String(value));
+  const finite = !isNaN(numVal);
   let formatted = String(value);
 
-  if (format === "currency" && !isNaN(numVal)) {
+  if (format === "currency" && finite) {
     const abs = Math.abs(numVal);
     formatted =
       numVal >= 0
         ? `$${abs.toLocaleString("en-US", { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`
         : `-$${abs.toLocaleString("en-US", { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`;
-  } else if (format === "percent" && !isNaN(numVal)) {
-    formatted = `${numVal.toFixed(2)}%`;
-  } else if (format === "number" && !isNaN(numVal)) {
+  } else if (format === "percent" && finite) {
+    const points = toPercentPoints(numVal, percentScale) ?? 0;
+    formatted = `${points.toFixed(2)}%`;
+  } else if (format === "number" && finite) {
     formatted = numVal.toLocaleString("en-US", { maximumFractionDigits: 2 });
   }
 
   // Auto-detect color from value
   const resolvedColor =
     color ||
-    (!isNaN(numVal) && (format === "currency" || format === "percent")
+    (finite && (format === "currency" || format === "percent")
       ? numVal > 0
         ? "#3fb950"
         : numVal < 0

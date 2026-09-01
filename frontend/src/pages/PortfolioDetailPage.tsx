@@ -37,6 +37,7 @@ import { StatCard } from "../components/StatCard";
 import { TradeTable, type TradeTableRow } from "../components/TradeTable";
 import { useToast } from "../components/ToastProvider";
 import { formatPValue, pValueColor } from "../utils/stats";
+import { toPercentPoints } from "../api/metricScale";
 
 type GroupBy = "component" | "strategy" | "symbol" | "timeframe";
 
@@ -437,7 +438,12 @@ export function PortfolioDetailPage() {
           gap: "12px",
         }}
       >
-        <StatCard label="Total Return" value={((stats.total_return || 0) * 100).toFixed(2)} format="percent" />
+        <StatCard
+          label="Total Return"
+          value={toPercentPoints(stats.total_return, "fraction") ?? 0}
+          format="percent"
+          percentScale="points"
+        />
         <StatCard label="Net Profit" value={stats.net_profit || 0} format="currency" />
         <StatCard
           label="Sharpe (higher = better)"
@@ -445,23 +451,36 @@ export function PortfolioDetailPage() {
           color={stats.sharpe > 1 ? "#3fb950" : "#d29922"}
         />
         <StatCard label="Sortino" value={(stats.sortino || 0).toFixed(3)} color="#58a6ff" />
-        <StatCard label="CAGR (higher = better)" value={((stats.cagr || 0) * 100).toFixed(2)} format="percent" />
+        <StatCard
+          label="CAGR (higher = better)"
+          value={toPercentPoints(stats.cagr, "fraction") ?? 0}
+          format="percent"
+          percentScale="points"
+        />
         <StatCard
           label="PSR (higher = better)"
-          value={stats.psr != null ? `${(Number(stats.psr) * 100).toFixed(1)}%` : "N/A"}
+          value={toPercentPoints(Number(stats.psr), "fraction")}
+          format="percent"
+          percentScale="points"
           color={Number(stats.psr) > 0.95 ? "#3fb950" : Number(stats.psr) > 0.5 ? "#d29922" : "#f85149"}
         />
-        <StatCard label="p-Value (lower = better)" value={formatPValue(stats.p_value)} color={pValueColor(stats.p_value)} />
+        <StatCard
+          label="p-Value (lower = better)"
+          value={formatPValue(stats.p_value)}
+          color={pValueColor(stats.p_value)}
+        />
         <StatCard
           label="Max DD (lower = better)"
-          value={((stats.max_drawdown || 0) * 100).toFixed(2)}
+          value={toPercentPoints(stats.max_drawdown, "fraction") ?? 0}
           format="percent"
+          percentScale="points"
           color="#f85149"
         />
         <StatCard
           label="Win Rate (higher = better)"
-          value={(stats.win_rate || 0) * 100}
+          value={toPercentPoints(stats.win_rate, "fraction") ?? 0}
           format="percent"
+          percentScale="points"
           color={(stats.win_rate || 0) >= 0.5 ? "#3fb950" : "#f85149"}
         />
       </div>

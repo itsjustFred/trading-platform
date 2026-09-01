@@ -19,6 +19,7 @@ import {
   runBacktestSignals,
   updateLiveDeploymentStatus,
 } from "../api/client";
+import { normalizeWinRate, toPercentPoints } from "../api/metricScale";
 import { Modal } from "../components/Modal";
 import { Sparkline } from "../components/Sparkline";
 import { SymbolInput } from "../components/SymbolInput";
@@ -1492,7 +1493,7 @@ function normalizeLiveHubStats(
   openPositions: number,
 ): LiveHubAccountStats {
   const tradesCount = asFiniteNumber(stats.total_trades, 0);
-  const winRate = toWinRatePercent(stats.win_rate);
+  const winRate = (toPercentPoints(normalizeWinRate(stats.win_rate), "fraction") ?? 0);
   const totalPnl = asFiniteNumber(stats.total_pnl, 0);
   return {
     tradesCount,
@@ -1596,13 +1597,7 @@ function calculateRealizedTradeStats(trades: LiveTradeSlippage[]): {
   return { totalPnl, winningTrades, losingTrades };
 }
 
-function toWinRatePercent(value: unknown): number {
-  const numeric = asFiniteNumber(value, 0);
-  if (numeric > 0 && numeric <= 1) {
-    return numeric * 100;
-  }
-  return numeric;
-}
+
 
 function asFiniteNumber(value: unknown, fallback: number): number {
   if (typeof value === "number" && Number.isFinite(value)) {

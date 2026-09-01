@@ -41,6 +41,7 @@ import type {
   Trade,
 } from "../api/types";
 import { formatPValue, pValueColor } from "../utils/stats";
+import { toPercentPoints } from "../api/metricScale";
 import { useToast } from "../components/ToastProvider";
 
 const BENCHMARK_SYMBOLS = ["SPY", "QQQ", "IWM", "DIA", "GLD", "TLT", "XAUUSD"];
@@ -566,10 +567,16 @@ export function BacktestDetailPage() {
           />
           <StatCard
             label="Net Profit %"
-            value={stats.net_profit_pct}
+            value={toPercentPoints(stats.net_profit_pct, "points")}
             format="percent"
+            percentScale="points"
           />
-          <StatCard label="CAGR (higher = better)" value={stats.cagr} format="percent" />
+          <StatCard
+            label="CAGR (higher = better)"
+            value={toPercentPoints(stats.cagr, "points")}
+            format="percent"
+            percentScale="points"
+          />
           <StatCard
             label="Sharpe (higher = better)"
             value={stats.sharpe?.toFixed(3)}
@@ -588,14 +595,16 @@ export function BacktestDetailPage() {
           />
           <StatCard
             label="Max DD (lower = better)"
-            value={stats.max_drawdown_pct}
+            value={toPercentPoints(stats.max_drawdown_pct, "points")}
             format="percent"
+            percentScale="points"
             color="#f85149"
           />
           <StatCard
             label="Win Rate (higher = better)"
-            value={stats.win_rate}
+            value={toPercentPoints(stats.win_rate, "points")}
             format="percent"
+            percentScale="points"
             color={stats.win_rate > 50 ? "#3fb950" : "#f85149"}
           />
           <StatCard
@@ -610,9 +619,9 @@ export function BacktestDetailPage() {
           />
           <StatCard
             label="PSR (higher = better)"
-            value={
-              stats.psr != null ? `${(stats.psr * 100).toFixed(1)}%` : "N/A"
-            }
+            value={toPercentPoints(stats.psr, "fraction") ?? undefined}
+            format="percent"
+            percentScale="points"
             color={
               (stats.psr ?? 0) > 0.95
                 ? "#3fb950"
