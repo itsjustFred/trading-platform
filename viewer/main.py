@@ -8528,44 +8528,10 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
     return {"task_id": task_id, "job_id": task_id, "status": "queued"}
 
 
-@app.post(
-    "/api/backtests/run-from-signals",
-    status_code=202,
-    responses={403: {"description": "Signal CSV is outside the OHLCV data directory"}},
-)
-async def run_backtest_from_signals(payload: BacktestRunFromSignalsRequest) -> dict[str, Any]:
-    source = str(payload.signal_source or "csv").strip().lower()
-    if source in {"discord-history", "discord"}:
-        replay_payload = BacktestRunSignalsRequest(
-            signal_source="discord",
-            signal_processor=payload.signal_processor,
-            account_id=payload.account_id,
-            start_date=payload.start_date,
-            end_date=payload.end_date,
-            timeframe=normalize_timeframe(str(payload.timeframe or "1m")) or "1m",
-            capital=float(payload.capital or 100000.0),
-            risk_per_trade_pct=payload.risk_per_trade_pct,
-            max_position_pct=payload.max_position_pct,
-            max_positions=payload.max_positions,
-            auto_download=payload.auto_download,
-        )
-        return await run_backtest_signals(replay_payload)
-
-    if source != "csv":
-        raise HTTPException(status_code=400, detail="signal_source must be 'csv' or 'discord-history'")
-
-    file_path = str(payload.filepath or "").strip()
-    if not file_path:
-        raise HTTPException(status_code=400, detail="filepath is required for csv signal_source")
-
-    csv_path = _contained_client_data_file(file_path, allowed_suffix=".csv")
-    if csv_path is None:
-        raise HTTPException(
-            status_code=403,
-            detail="Signal CSV must be inside the OHLCV data directory",
-        )
-    file_path = str(csv_path)
-
+async def _load_and_filter_csv_signals(
+    file_path: str, start_dt: datetime, end_dt: datetime
+) -> tuple[list[dict[str, Any]], list[SignalReplayInput]]:
+    """Load a contained signal CSV and keep only replayable rows in range."""
     try:
         loaded_signals = await asyncio.to_thread(load_signals_from_csv, file_path)
     except FileNotFoundError as exc:
@@ -8575,11 +8541,6 @@ async def run_backtest_from_signals(payload: BacktestRunFromSignalsRequest) -> d
 
     if not loaded_signals:
         raise HTTPException(status_code=400, detail="CSV file contains no replayable signals")
-
-    start_dt = _parse_request_date(payload.start_date, field_name="start_date")
-    end_dt = _parse_request_date(payload.end_date, field_name="end_date", end_of_day=True)
-    if start_dt > end_dt:
-        raise HTTPException(status_code=400, detail="start_date must be <= end_date")
 
     source_label = f"csv:{Path(file_path).name}"
     filtered_signals: list[dict[str, Any]] = []
@@ -8627,7 +8588,55 @@ async def run_backtest_from_signals(payload: BacktestRunFromSignalsRequest) -> d
                 metadata=dict(metadata),
             )
         )
+    return filtered_signals, signal_inputs
 
+
+@app.post(
+    "/api/backtests/run-from-signals",
+    status_code=202,
+    responses={403: {"description": "Signal CSV is outside the OHLCV data directory"}},
+)
+async def run_backtest_from_signals(payload: BacktestRunFromSignalsRequest) -> dict[str, Any]:
+    source = str(payload.signal_source or "csv").strip().lower()
+    if source in {"discord-history", "discord"}:
+        replay_payload = BacktestRunSignalsRequest(
+            signal_source="discord",
+            signal_processor=payload.signal_processor,
+            account_id=payload.account_id,
+            start_date=payload.start_date,
+            end_date=payload.end_date,
+            timeframe=normalize_timeframe(str(payload.timeframe or "1m")) or "1m",
+            capital=float(payload.capital or 100000.0),
+            risk_per_trade_pct=payload.risk_per_trade_pct,
+            max_position_pct=payload.max_position_pct,
+            max_positions=payload.max_positions,
+            auto_download=payload.auto_download,
+        )
+        return await run_backtest_signals(replay_payload)
+
+    if source != "csv":
+        raise HTTPException(status_code=400, detail="signal_source must be 'csv' or 'discord-history'")
+
+    file_path = str(payload.filepath or "").strip()
+    if not file_path:
+        raise HTTPException(status_code=400, detail="filepath is required for csv signal_source")
+
+    csv_path = _contained_client_data_file(file_path, allowed_suffix=".csv")
+    if csv_path is None:
+        raise HTTPException(
+            status_code=403,
+            detail="Signal CSV must be inside the OHLCV data directory",
+        )
+    file_path = str(csv_path)
+
+    start_dt = _parse_request_date(payload.start_date, field_name="start_date")
+    end_dt = _parse_request_date(payload.end_date, field_name="end_date", end_of_day=True)
+    if start_dt > end_dt:
+        raise HTTPException(status_code=400, detail="start_date must be <= end_date")
+
+    filtered_signals, signal_inputs = await _load_and_filter_csv_signals(
+        file_path, start_dt, end_dt
+    )
     if not signal_inputs:
         raise HTTPException(status_code=400, detail="No replayable CSV signals in selected date range")
 
