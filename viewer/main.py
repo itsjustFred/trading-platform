@@ -44,6 +44,8 @@ from starlette.middleware.gzip import GZipMiddleware
 
 from data_tools.catalog_builder import merge_ohlcv_entries
 from data_tools import cache_manager
+from data_tools import auto_download as _auto_download_config
+from data_tools.auto_download import reload_coverage_windows
 from data_tools.signal_import import load_signals_from_csv
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -6082,8 +6084,11 @@ def _data_check_result(
 
 
 US_INTRADAY_TIMEFRAMES = {"1m", "5m", "15m", "30m", "1h"}
-HF_INTRADAY_COVERAGE_END = "2025-07-31"
-ALPACA_INTRADAY_START = "2025-07-01"
+# Vendor intraday coverage windows live in data_tools.auto_download and are
+# configurable via HF_INTRADAY_COVERAGE_END / ALPACA_INTRADAY_START env vars.
+reload_coverage_windows()
+HF_INTRADAY_COVERAGE_END = _auto_download_config.HF_INTRADAY_COVERAGE_END
+ALPACA_INTRADAY_START = _auto_download_config.ALPACA_INTRADAY_START
 _US_STOCK_SYMBOL_PATTERN = re.compile(r"^[A-Z][A-Z.\-]{0,9}$")
 
 
@@ -6149,62 +6154,17 @@ def _auto_download_source_plan(
     start: str | None,
     end: str | None,
 ) -> list[dict[str, str | None]]:
-    normalized_symbol = str(symbol or "").strip().upper()
-    normalized_timeframe = normalize_timeframe(str(timeframe or "").strip())
-    default_source = _auto_download_source(normalized_symbol, normalized_timeframe)
-    if default_source != "huggingface":
-        return [{"source": default_source, "start": start or None, "end": end or None}]
-
-    normalized_start = _normalize_coverage_date(start)
-    normalized_end = _normalize_coverage_date(end)
-    if normalized_start and normalized_end and normalized_start > normalized_end:
-        normalized_start, normalized_end = normalized_end, normalized_start
-
-    if normalized_start is None and normalized_end is None:
-        return [{"source": "alpaca", "start": None, "end": None}]
-
-    plan: list[dict[str, str | None]] = []
-
-    hf_start = normalized_start or normalized_end
-    hf_end = normalized_end
-    if hf_start is not None and hf_start > HF_INTRADAY_COVERAGE_END:
-        hf_start = None
-        hf_end = None
-    elif hf_end is None or hf_end > HF_INTRADAY_COVERAGE_END:
-        hf_end = HF_INTRADAY_COVERAGE_END
-    if hf_start and hf_end and hf_start > hf_end:
-        hf_start = None
-        hf_end = None
-    if hf_end is not None:
-        plan.append(
-            {
-                "source": "huggingface",
-                "start": hf_start,
-                "end": hf_end,
-            }
-        )
-
-    alpaca_start = normalized_start or normalized_end
-    alpaca_end = normalized_end
-    if alpaca_end is not None and alpaca_end < ALPACA_INTRADAY_START:
-        alpaca_start = None
-    else:
-        if alpaca_start is None or alpaca_start < ALPACA_INTRADAY_START:
-            alpaca_start = ALPACA_INTRADAY_START
-        if alpaca_end is not None and alpaca_start > alpaca_end:
-            alpaca_start = None
-    if alpaca_start is not None:
-        plan.append(
-            {
-                "source": "alpaca",
-                "start": alpaca_start,
-                "end": alpaca_end or end or None,
-            }
-        )
-
-    if not plan:
-        return [{"source": "alpaca", "start": start or None, "end": end or None}]
-    return plan
+    """Shared vendor plan from data_tools.auto_download (env-configurable)."""
+    reload_coverage_windows()
+    global HF_INTRADAY_COVERAGE_END, ALPACA_INTRADAY_START
+    HF_INTRADAY_COVERAGE_END = _auto_download_config.HF_INTRADAY_COVERAGE_END
+    ALPACA_INTRADAY_START = _auto_download_config.ALPACA_INTRADAY_START
+    return _auto_download_config._auto_download_source_plan(
+        symbol=symbol,
+        timeframe=timeframe,
+        start=start or None,
+        end=end or None,
+    )
 
 
 def _download_missing_ohlcv_data(

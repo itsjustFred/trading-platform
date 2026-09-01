@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,9 +19,41 @@ LogCallback = Callable[[str], None]
 
 TIMEFRAME_ORDER = ["tick", "s1", "1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"]
 US_INTRADAY_TIMEFRAMES = {"1m", "5m", "15m", "30m", "1h"}
-HF_INTRADAY_COVERAGE_END = "2025-07-31"
-ALPACA_INTRADAY_START = "2025-07-01"
+DEFAULT_HF_INTRADAY_COVERAGE_END = "2025-07-31"
+DEFAULT_ALPACA_INTRADAY_START = "2025-07-01"
 _US_STOCK_SYMBOL_PATTERN = re.compile(r"^[A-Z][A-Z.\-]{0,9}$")
+
+
+def _coverage_window_from_env(env_value: str | None, default: str) -> str:
+    text = str(env_value or "").strip()
+    if not text:
+        return default
+    parsed = pd.to_datetime(text, utc=True, errors="coerce")
+    if pd.isna(parsed):
+        logger.warning("Ignoring invalid coverage window value %r; using %s", env_value, default)
+        return default
+    return parsed.date().isoformat()
+
+
+def reload_coverage_windows() -> tuple[str, str]:
+    """(Re)load the vendor coverage windows from the environment.
+
+    Called at import and after tests change the env, so the bounds stay
+    configurable without a code change when a vendor extends coverage.
+    """
+    global HF_INTRADAY_COVERAGE_END, ALPACA_INTRADAY_START
+    HF_INTRADAY_COVERAGE_END = _coverage_window_from_env(
+        os.environ.get("HF_INTRADAY_COVERAGE_END"),
+        DEFAULT_HF_INTRADAY_COVERAGE_END,
+    )
+    ALPACA_INTRADAY_START = _coverage_window_from_env(
+        os.environ.get("ALPACA_INTRADAY_START"),
+        DEFAULT_ALPACA_INTRADAY_START,
+    )
+    return HF_INTRADAY_COVERAGE_END, ALPACA_INTRADAY_START
+
+
+reload_coverage_windows()
 
 
 @dataclass(frozen=True)
@@ -390,7 +423,25 @@ def _auto_download_source_plan(
         if alpaca_end is None or alpaca_start <= alpaca_end:
             plan.append({"source": "alpaca", "start": alpaca_start, "end": alpaca_end or end})
 
-    return plan or [{"source": "alpaca", "start": start, "end": end}]
+    if not plan:
+        # No known vendor window covers this range: say so explicitly instead
+        # of silently re-routing to a daily-grade fallback.
+        logger.warning(
+            "No configured vendor coverage for %s %s %s..%s; coverage unknown",
+            normalized_symbol,
+            normalized_timeframe,
+            normalized_start,
+            normalized_end,
+        )
+        return [
+            {
+                "source": "alpaca",
+                "start": start,
+                "end": end,
+                "coverage": "unknown",
+            }
+        ]
+    return plan
 
 
 def _download_missing_ohlcv_data(
