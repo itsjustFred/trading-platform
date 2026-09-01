@@ -163,6 +163,8 @@ initialize_sentry(
 logger = get_logger("viewer")
 AGENT_CONVERT_PROVIDER_NAMES: tuple[str, ...] = ("nim", "copilot_sdk")
 
+BACKTEST_TRADES_SUFFIX = ".trades.json"
+
 BACKTESTS_DIR = DATA_DIR / "backtests"
 MATRIX_RESULTS_DIR = DATA_DIR / "backtests" / "matrix_runner"
 MATRIX_GRID_OVERVIEW_PATH = PROJECT_ROOT / "frontend" / "public" / "matrix-grid-overview.json"
@@ -2595,7 +2597,7 @@ def _delete_backtest_with_artifacts(backtest_id: str) -> bool:
 
     deleted_in_db = delete_backtest(normalized_id)
     _remove_backtest_meta_cache(normalized_id)
-    json_path = _contained_asset_path(BACKTESTS_DIR, normalized_id, ".trades.json")
+    json_path = _contained_asset_path(BACKTESTS_DIR, normalized_id, BACKTEST_TRADES_SUFFIX)
     deleted_json = False
     if json_path is not None and json_path.exists():
         try:
@@ -8067,8 +8069,8 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
                             output_path = parsed_message[len("saved to:"):].strip()
                             if output_path:
                                 filename = Path(output_path).name
-                                if filename.endswith(".trades.json"):
-                                    filename_id = filename[: -len(".trades.json")]
+                                if filename.endswith(BACKTEST_TRADES_SUFFIX):
+                                    filename_id = filename[: -len(BACKTEST_TRADES_SUFFIX)]
                                     backtest_id = filename_id
                                     if filename_id:
                                         loaded_result = _load_result(filename_id)
@@ -8522,7 +8524,12 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
     return {"task_id": task_id, "job_id": task_id, "status": "queued"}
 
 
-@app.post("/api/backtests/run-from-signals", response_model=dict[str, Any], status_code=202)
+@app.post(
+    "/api/backtests/run-from-signals",
+    response_model=dict[str, Any],
+    status_code=202,
+    responses={403: {"description": "Signal CSV is outside the OHLCV data directory"}},
+)
 async def run_backtest_from_signals(payload: BacktestRunFromSignalsRequest) -> dict[str, Any]:
     source = str(payload.signal_source or "csv").strip().lower()
     if source in {"discord-history", "discord"}:
@@ -10453,7 +10460,11 @@ async def data_check(
     }
 
 
-@app.post("/api/data/resample", response_model=dict[str, Any])
+@app.post(
+    "/api/data/resample",
+    response_model=dict[str, Any],
+    responses={400: {"description": "source_path is not a parquet file in the data directory"}},
+)
 async def data_resample(payload: DataResampleRequest) -> dict[str, Any]:
     target_timeframes = payload.target_timeframes
     source_path = _contained_client_data_file(
@@ -10740,7 +10751,14 @@ async def delete_data_task(task_id: str) -> dict[str, Any]:
     return {"task_id": task_id, "status": "deleted"}
 
 
-@app.delete("/api/data/symbol", response_model=dict[str, Any])
+@app.delete(
+    "/api/data/symbol",
+    response_model=dict[str, Any],
+    responses={
+        400: {"description": "Invalid path or non-parquet file"},
+        403: {"description": "Path is outside the OHLCV data directory"},
+    },
+)
 async def delete_symbol_data(path: str = Query(default="")) -> dict[str, Any]:
     if not path:
         raise HTTPException(status_code=400, detail="Path required")
