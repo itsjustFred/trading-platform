@@ -147,10 +147,10 @@ function assert(cond, msg) {
 
   await test('No critical console errors', async () => {
     const critical = consoleErrors.filter(e => !e.includes('favicon'));
-    if (critical.length > 0) {
-      console.log('    Warnings:', critical.slice(0, 3));
-    }
-    // We don't fail on console errors — just report
+    // Cleanup 17-B (C2): this test asserted nothing and could never fail.
+    // Uncaught page errors are regressions and must fail the run.
+    assert(critical.length === 0,
+      `Uncaught page errors: ${critical.slice(0, 3).join(' | ')}`);
   });
 
   // ─── Summary ─────────────────────────────────────────────────────────

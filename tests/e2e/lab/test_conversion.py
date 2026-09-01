@@ -11,12 +11,6 @@ from tests.validators.code_validator import AICodeValidator
 
 BASE_URL = "http://localhost:5556"
 SAMPLE_STRATEGY_PATH = Path(__file__).resolve().parents[2] / "fixtures" / "sample_strategy.py"
-VALID_FALLBACK_PATH = (
-    Path(__file__).resolve().parents[2]
-    / "fixtures"
-    / "ai_generated_strategies"
-    / "valid_trend_strategy.py"
-)
 SCREENSHOT_DIR = Path(__file__).resolve().parents[2] / "artifacts" / "screenshots"
 
 pytestmark = [pytest.mark.e2e, pytest.mark.slow, pytest.mark.ai_code]
@@ -73,10 +67,9 @@ def test_lab_conversion_generates_valid_python(page: Page) -> None:
 
     output_text = output_area.inner_text().strip()
     generated_code = _extract_generated_code(output_text)
-    if not generated_code:
-        if VALID_FALLBACK_PATH.exists():
-            generated_code = VALID_FALLBACK_PATH.read_text(encoding="utf-8")
-
+    # Cleanup 17-B (C4): the previous fallback validated a checked-in
+    # fixture whenever extraction came up empty, so a broken Auto-Convert
+    # pipeline reported green. Extraction failure is a failure.
     assert generated_code.strip(), (
         f"No generated code could be extracted from output:\n{output_text}"
     )
