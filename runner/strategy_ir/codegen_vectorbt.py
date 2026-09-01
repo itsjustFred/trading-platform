@@ -16,6 +16,12 @@ def _safe_identifier(raw: str, *, fallback: str, used: set[str]) -> str:
     if base[0].isdigit():
         base = f"_{base}"
 
+    # Collapse dunder sequences: an IR-provided name must never be able to
+    # smuggle dunder attributes (e.g. "__import__") into generated code, not
+    # even as an inert identifier.
+    while "__" in base:
+        base = base.replace("__", "_")
+
     candidate = base
     suffix = 2
     while candidate in used:
