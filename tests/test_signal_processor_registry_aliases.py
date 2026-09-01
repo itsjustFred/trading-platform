@@ -128,8 +128,9 @@ def test_rocketfuel_and_ramjet_read_their_own_config_files() -> None:
 def test_nitro_rejects_sell_signals() -> None:
     processor = get_signal_processor("nitro", {})
     sell_signal = {"symbol": "AAPL", "action": "SELL", "timestamp": "2026-01-01T12:00:00Z"}
+    market_data = _sample_market_data()
     with pytest.raises(ValueError, match="BUY/LONG"):
-        processor.process_signal(sell_signal, _sample_market_data())
+        processor.process_signal(sell_signal, market_data)
 
 
 def test_nitro_stamps_its_own_metadata() -> None:
@@ -162,7 +163,8 @@ def test_shipped_config_files_have_a_single_bot_section() -> None:
     for option in SIGNAL_PROCESSOR_OPTIONS:
         path = get_signal_processor_config_path(option["id"])
         payload = yaml.safe_load(path.read_text(encoding="utf-8"))
-        assert isinstance(payload, dict) and len(payload) == 1, (
+        assert isinstance(payload, dict), f"{path} must decode to a mapping"
+        assert len(payload) == 1, (
             f"{path} must contain exactly one top-level bot section"
         )
 

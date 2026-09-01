@@ -60,5 +60,6 @@ def test_rocketfuel_variants_differ_on_sell_signal() -> None:
 def test_nitro_rejects_sell_signals() -> None:
     processor = get_signal_processor("nitro", {})
     sell_signal = {"symbol": "AAPL", "action": "SELL", "timestamp": "2026-01-01T12:00:00Z"}
+    market_data = _sample_market_data()
     with pytest.raises(ValueError, match="BUY/LONG"):
-        processor.process_signal(sell_signal, _sample_market_data())
+        processor.process_signal(sell_signal, market_data)
