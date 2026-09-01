@@ -1,6 +1,21 @@
+"""Data gate for the strategy regression block under tests/strategies/.
+
+Local strategy smoke/regression tests need real OHLCV parquet datasets that
+are not part of the repository. The gate below skips a module when its
+dataset is missing locally — but the skip is never silent:
+
+- every skip reason is surfaced (and counted in a session-end summary);
+- ``FAIL_ON_MISSING_DATA=1`` (opt-in, e.g. CI) turns those skips into hard
+  failures, so a dataset loss cannot quietly zero out the regression block
+  (Decision Record 2026-08-31);
+- coverage is verified per candidate file (no union of shard extents) and
+  unreadable/corrupt parquet files are reported instead of swallowed.
+"""
+
 from __future__ import annotations
 
 import importlib.util
+import os
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 
@@ -9,6 +24,53 @@ import pyarrow.compute as pc
 import pytest
 
 from shared.constants import DATA_DIR
+
+# Opt-in strict mode: missing local market data fails instead of skipping.
+FAIL_ON_MISSING_DATA = str(os.environ.get("FAIL_ON_MISSING_DATA", "")).strip() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+_DATA_SKIP_REASONS: list[str] = []
+
+
+def record_data_skip(reason: str) -> None:
+    """Register a data-gate skip so the session summary can surface it."""
+    _DATA_SKIP_REASONS.append(str(reason))
+
+
+def summarize_data_skips(config: pytest.Config) -> None:
+    """Print one aggregated summary line for all data-gate skips."""
+    if not _DATA_SKIP_REASONS:
+        return
+    writer = getattr(config, "_outerrunner", None) or config
+    terminal = getattr(writer, "write_line", None)
+    message = (
+        f"{len(_DATA_SKIP_REASONS)} strategy test(s) skipped on missing/unreadable "
+        "local market data (set FAIL_ON_MISSING_DATA=1 to fail instead):"
+    )
+    if callable(terminal):
+        terminal(message)
+        for reason in _DATA_SKIP_REASONS:
+            terminal(f"  - {reason}")
+        return
+    print(message)
+    for reason in _DATA_SKIP_REASONS:
+        print(f"  - {reason}")
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    summarize_data_skips(session.config)
+
+
+def _data_gate_result(reason: str) -> None:
+    """Skip or fail with the given reason, depending on strict mode."""
+    record_data_skip(reason)
+    if FAIL_ON_MISSING_DATA:
+        pytest.fail(f"{reason} (FAIL_ON_MISSING_DATA=1)")
+    pytest.skip(reason)
 
 
 def _candidate_ohlcv_paths(symbol: str, timeframe: str) -> list[Path]:
@@ -21,12 +83,12 @@ def _candidate_ohlcv_paths(symbol: str, timeframe: str) -> list[Path]:
     if not symbol or not timeframe:
         return []
 
-    paths = list(root.rglob(f"**/{symbol}/{timeframe}.parquet"))
+    paths = list(root.rglob(f"{symbol}/**/{timeframe}.parquet"))
 
     # Canonical layout: .../<symbol>/<timeframe>.parquet
     if timeframe == "1d":
         # Some datasets are exported as .../<symbol>.parquet (typically 1d).
-        paths.extend(root.rglob(f"**/{symbol}.parquet"))
+        paths.extend(root.rglob(f"{symbol}.parquet"))
 
     return sorted({path.resolve() for path in paths})
 
@@ -65,53 +127,95 @@ def _parse_date_bound(value: str, *, is_end: bool) -> datetime:
     return parsed
 
 
-def _path_time_coverage(path: Path) -> tuple[datetime | None, datetime | None]:
+def _path_time_coverage(path: Path) -> tuple[datetime | None, datetime | None, str | None]:
+    """Return (start, end, error) for one parquet file.
+
+    ``error`` is set when the file cannot be read — the caller must surface
+    that instead of silently treating the shard as "no coverage".
+    """
     try:
         table = pq.read_table(path, columns=["timestamp"])
-    except Exception:
-        return None, None
+    except Exception as exc:
+        return None, None, f"{type(exc).__name__}: {exc}"
     if table.num_rows == 0:
-        return None, None
+        return None, None, "file contains no rows"
 
     column = table["timestamp"]
     try:
         min_scalar = pc.min(column)
         max_scalar = pc.max(column)
-    except Exception:
-        return None, None
+    except Exception as exc:
+        return None, None, f"{type(exc).__name__}: {exc}"
     start = _to_utc_datetime(min_scalar.as_py() if min_scalar is not None else None)
     end = _to_utc_datetime(max_scalar.as_py() if max_scalar is not None else None)
-    return start, end
+    if start is None or end is None:
+        return None, None, "timestamp column has no parseable values"
+    return start, end, None
 
 
 def _covers_requested_period(symbol: str, timeframe: str, start: str, end: str) -> bool:
-    paths = _candidate_ohlcv_paths(symbol, timeframe)
-    if not paths:
-        return False
+    """True only if every candidate file covers the requested window.
 
-    coverage_start: datetime | None = None
-    coverage_end: datetime | None = None
-    for path in paths:
-        path_start, path_end = _path_time_coverage(path)
+    Deliberately *not* a union of extents: shard A covering Jan-Mar plus
+    shard B covering Dec must not satisfy an Apr-Nov request.
+    """
+    start_bound = _parse_date_bound(start, is_end=False) if start else None
+    end_bound = _parse_date_bound(end, is_end=True) if end else None
+
+    for path in _candidate_ohlcv_paths(symbol, timeframe):
+        path_start, path_end, _error = _path_time_coverage(path)
         if path_start is None or path_end is None:
-            continue
-        if coverage_start is None or path_start < coverage_start:
-            coverage_start = path_start
-        if coverage_end is None or path_end > coverage_end:
-            coverage_end = path_end
-
-    if coverage_start is None or coverage_end is None:
-        return False
-
-    if start:
-        start_bound = _parse_date_bound(start, is_end=False)
-        if coverage_start > start_bound:
             return False
-    if end:
-        end_bound = _parse_date_bound(end, is_end=True)
-        if coverage_end < end_bound:
+        if start_bound is not None and path_start > start_bound:
+            return False
+        if end_bound is not None and path_end < end_bound:
             return False
     return True
+
+
+def _require_ohlcv_coverage(symbol: str, timeframe: str, start: str, end: str) -> None:
+    """Skip or fail when the local dataset cannot serve the requested window."""
+    paths = _candidate_ohlcv_paths(symbol, timeframe)
+    if not paths:
+        _data_gate_result(
+            f"missing OHLCV dataset for {symbol}/{timeframe} under {Path(DATA_DIR) / 'ohlcv'}"
+        )
+        return
+
+    start_bound = _parse_date_bound(start, is_end=False) if start else None
+    end_bound = _parse_date_bound(end, is_end=True) if end else None
+
+    unreadable: list[str] = []
+    uncovered: list[str] = []
+    for path in paths:
+        relative = _relative_candidate_label(path)
+        path_start, path_end, error = _path_time_coverage(path)
+        if error is not None or path_start is None or path_end is None:
+            unreadable.append(f"{relative} ({error or 'no coverage'})")
+            continue
+        if start_bound is not None and path_start > start_bound:
+            uncovered.append(f"{relative} (starts {path_start.isoformat()})")
+        if end_bound is not None and path_end < end_bound:
+            uncovered.append(f"{relative} (ends {path_end.isoformat()})")
+
+    if unreadable:
+        _data_gate_result(
+            f"unreadable OHLCV dataset(s) for {symbol}/{timeframe}: "
+            + "; ".join(unreadable)
+        )
+        return
+    if uncovered:
+        _data_gate_result(
+            f"insufficient OHLCV coverage for {symbol}/{timeframe} "
+            f"within requested range {start}..{end}: " + "; ".join(uncovered)
+        )
+
+
+def _relative_candidate_label(path: Path) -> str:
+    try:
+        return str(path.relative_to(Path(DATA_DIR)))
+    except ValueError:
+        return str(path)
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -120,19 +224,12 @@ def skip_when_required_data_or_dependency_missing(request: pytest.FixtureRequest
     module_name = str(getattr(module, "__name__", "") or "").lower()
 
     if "pynecore" in module_name and importlib.util.find_spec("pynecore") is None:
+        record_data_skip("pynecore is not installed in this environment")
         pytest.skip("pynecore is not installed in this environment")
 
     symbol = getattr(module, "TEST_SYMBOL", None)
     timeframe = getattr(module, "TEST_TIMEFRAME", None)
-    if symbol and timeframe and not _has_ohlcv_data(str(symbol), str(timeframe)):
-        pytest.skip(
-            f"missing OHLCV dataset for {symbol}/{timeframe} under {Path(DATA_DIR) / 'ohlcv'}"
-        )
-    start = getattr(module, "TEST_START", None)
-    end = getattr(module, "TEST_END", None)
-    if symbol and timeframe and (start or end):
-        if not _covers_requested_period(str(symbol), str(timeframe), str(start or ""), str(end or "")):
-            pytest.skip(
-                f"insufficient OHLCV coverage for {symbol}/{timeframe} "
-                f"within requested range {start}..{end}"
-            )
+    if symbol and timeframe:
+        start = str(getattr(module, "TEST_START", "") or "")
+        end = str(getattr(module, "TEST_END", "") or "")
+        _require_ohlcv_coverage(str(symbol), str(timeframe), start, end)
