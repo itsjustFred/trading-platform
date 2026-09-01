@@ -982,6 +982,60 @@ def _downsample_numeric_minmax(values: list[float], *, limit: int) -> list[float
     return sampled
 
 
+def _stats_payload_from_result(result: BacktestResult) -> dict:
+    """Normalize field names for the frontend stats contract.
+
+    `best_trade`/`worst_trade` are exact per-trade extremes computed from the
+    closed trades; `avg_winner`/`avg_loser` stay available under their own
+    names. Win/loss counts are whole-backtest values from the canonical stats.
+    """
+    raw = _canonical_stats_from_result(result)
+
+    pnls = [
+        _safe_float(trade.pnl, 0.0)
+        for trade in (result.trades or [])
+        if _safe_float(trade.pnl, 0.0) != 0.0
+    ]
+    best_trade = max(pnls) if pnls else 0
+    worst_trade = min(pnls) if pnls else 0
+
+    stats = {
+        "net_profit": raw.get("total_pnl", 0),
+        "net_profit_pct": round(
+            raw.get("total_pnl", 0) / (result.meta.initial_capital or 100000) * 100, 2
+        ),
+        "sharpe": raw.get("sharpe_ratio", 0),
+        "sortino": raw.get("sortino_ratio", 0),
+        "calmar": raw.get("calmar_ratio", 0),
+        "max_drawdown_pct": round(raw.get("max_drawdown_pct", 0) * 100, 2),
+        "win_rate": round(raw.get("win_rate", 0) * 100, 1),
+        "profit_factor": raw.get("profit_factor", 0),
+        "total_trades": raw.get("total_trades", 0),
+        "winners": raw.get("winners", 0),
+        "losers": raw.get("losers", 0),
+        "avg_winner": raw.get("avg_winner", 0),
+        "avg_loser": raw.get("avg_loser", 0),
+        "avg_trade_pnl": round(raw.get("total_pnl", 0) / max(raw.get("total_trades", 1), 1), 2),
+        "avg_bars_held": raw.get("avg_holding_bars", 0),
+        "max_consecutive_losses": raw.get("max_consecutive_losses", 0),
+        "best_trade": best_trade,
+        "worst_trade": worst_trade,
+        "cagr": round(_safe_float(raw.get("cagr")) * 100, 2),
+        "expectancy": 0,  # computed below
+    }
+    # Expectancy
+    wr = raw.get("win_rate", 0)
+    stats["expectancy"] = round(
+        wr * raw.get("avg_winner", 0) + (1 - wr) * raw.get("avg_loser", 0), 2
+    )
+    # PSR / p-value
+    stats["psr"] = raw.get("psr")
+    stats["p_value"] = raw.get("p_value", 1.0)
+    return stats
+
+
+@app.route("/api/backtest/<backtest_id>/stats")
+
 def _detect_indicators(strategy_file: str) -> list[dict]:
     """Detect indicators used by a strategy from source code with basic parameter extraction."""
     path = _strategy_path(strategy_file)

@@ -113,6 +113,36 @@ def _playwright_browser_launchable(browser_name: str) -> tuple[bool, str]:
         return False, str(exc)
 
 
+@pytest.fixture
+def viewer_client(monkeypatch, tmp_path):
+    """Shared viewer TestClient with DATA_DIR-scoped storage paths."""
+    from fastapi.testclient import TestClient as _TestClient
+
+    import viewer.main as viewer_app_module
+
+    legacy_module = viewer_app_module.legacy_viewer
+
+    for module in (viewer_app_module, legacy_module):
+        monkeypatch.setattr(module, "DATA_DIR", tmp_path)
+        monkeypatch.setattr(module, "BACKTESTS_DIR", tmp_path / "backtests")
+        monkeypatch.setattr(module, "LOGS_DIR", tmp_path / "logs")
+        monkeypatch.setattr(module, "TASK_LOGS_DIR", tmp_path / "logs" / "tasks")
+        monkeypatch.setattr(module, "OPTIMIZATIONS_DIR", tmp_path / "optimizations")
+        monkeypatch.setattr(module, "PORTFOLIOS_DIR", tmp_path / "portfolios")
+
+    monkeypatch.setattr(viewer_app_module, "list_backtest_ids", lambda: [])
+    monkeypatch.setattr(viewer_app_module, "load_backtest_result", lambda _backtest_id: None)
+    monkeypatch.setattr(viewer_app_module, "save_result_to_sqlite", lambda _result: None)
+    monkeypatch.setattr(
+        viewer_app_module,
+        "migrate_json_to_sqlite",
+        lambda: {"migrated": 0, "failed": 0, "total": 0},
+    )
+    viewer_app_module.DATA_TASKS.clear()
+    viewer_app_module._COALESCED_CLEANUP_PENDING.clear()
+    return _TestClient(viewer_app_module.app)
+
+
 def pytest_runtest_setup(item: pytest.Item) -> None:
     if item.get_closest_marker("e2e") is None:
         return

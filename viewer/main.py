@@ -7032,40 +7032,7 @@ async def get_backtest_stats(backtest_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=f"Backtest '{backtest_id}' not found")
 
     try:
-        raw = legacy_viewer._canonical_stats_from_result(result)
-        stats = {
-            "net_profit": raw.get("total_pnl", 0),
-            "net_profit_pct": round(
-                raw.get("total_pnl", 0) / (result.meta.initial_capital or 100000) * 100,
-                2,
-            ),
-            "sharpe": raw.get("sharpe_ratio", 0),
-            "sortino": raw.get("sortino_ratio", 0),
-            "calmar": raw.get("calmar_ratio", 0),
-            "max_drawdown_pct": round(raw.get("max_drawdown_pct", 0) * 100, 2),
-            "win_rate": round(raw.get("win_rate", 0) * 100, 1),
-            "profit_factor": raw.get("profit_factor", 0),
-            "total_trades": raw.get("total_trades", 0),
-            "winners": raw.get("winners", 0),
-            "losers": raw.get("losers", 0),
-            "avg_winner": raw.get("avg_winner", 0),
-            "avg_loser": raw.get("avg_loser", 0),
-            "avg_trade_pnl": round(raw.get("total_pnl", 0) / max(raw.get("total_trades", 1), 1), 2),
-            "avg_bars_held": raw.get("avg_holding_bars", 0),
-            "max_consecutive_losses": raw.get("max_consecutive_losses", 0),
-            "best_trade": raw.get("avg_winner", 0),
-            "worst_trade": raw.get("avg_loser", 0),
-            "cagr": round(_safe_float(raw.get("cagr")) * 100, 2),
-            "expectancy": 0,
-        }
-        win_rate = raw.get("win_rate", 0)
-        stats["expectancy"] = round(
-            win_rate * raw.get("avg_winner", 0) + (1 - win_rate) * raw.get("avg_loser", 0),
-            2,
-        )
-        stats["psr"] = raw.get("psr")
-        stats["p_value"] = raw.get("p_value", 1.0)
-        return stats
+        return await asyncio.to_thread(legacy_viewer._stats_payload_from_result, result)
     except Exception as exc:
         logger.exception("Failed to compute stats for '%s': %s", backtest_id, exc)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
