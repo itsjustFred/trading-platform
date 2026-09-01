@@ -177,7 +177,7 @@ def test_dedupe_rejects_unguarded_deletes_without_explicit_confirm() -> None:
 def test_dedupe_dry_run_reports_without_deleting() -> None:
     module = _load_script("dedupe_executions.py")
 
-    with patch.object(module, "init_db"), patch.object(module, "get_session") as session_ctx:
+    with patch.object(module, "init_db"), patch.object(module, "get_session"):
         deleted = module.dedupe_executions(dry_run=True)
 
     assert deleted == 0
@@ -191,3 +191,15 @@ def test_dedupe_reports_without_confirm_too() -> None:
         deleted = module.dedupe_executions(confirm=False)
 
     assert deleted == 0
+
+
+def test_signal_bot_registry_mapping_is_complete_and_loadable() -> None:
+    """Every registered bot must have a mapped config that yields a non-empty mapping."""
+    from signal_bots.registry import BOT_CONFIG_PATHS, SIGNAL_PROCESSORS
+
+    assert set(SIGNAL_PROCESSORS) == set(BOT_CONFIG_PATHS), (
+        "SIGNAL_PROCESSORS and BOT_CONFIG_PATHS must not drift apart"
+    )
+    for name, path in BOT_CONFIG_PATHS.items():
+        assert path.exists(), f"{name}: mapped config missing: {path}"
+        assert path.read_text(encoding="utf-8").strip(), f"{name}: mapped config is empty: {path}"

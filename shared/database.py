@@ -96,6 +96,36 @@ def _create_database_engine() -> Any:
 
 _ENGINE: Any = None
 _ENGINE_LOCK = threading.Lock()
+_WARNED_DRIFT = False
+
+
+def _warn_if_data_dir_drifted() -> None:
+    """Warn when this module's DATA_DIR diverged from shared.constants'.
+
+    ``shared.constants.set_data_dir()`` is the only supported way to move the
+    data directory: it re-binds ``database.DATA_DIR``/``DB_PATH`` and resets the
+    engine. A direct ``constants.DATA_DIR = ...`` assignment (or any future
+    second writer) leaves this module's by-value copy behind — every engine and
+    session then silently keeps reading/writing the OLD directory. The check is
+    warn-once and never raises: production behaviour must not depend on it, but
+    the drift must be visible in the logs.
+    """
+    global _WARNED_DRIFT
+    if _WARNED_DRIFT:
+        return
+    try:
+        from shared import constants as _constants
+    except Exception:  # pragma: no cover - constants is always importable here
+        return
+    if DATA_DIR != _constants.DATA_DIR:
+        _WARNED_DRIFT = True
+        logger.warning(
+            "DATA_DIR drift detected: shared.database is using %s while "
+            "shared.constants uses %s. Rebind via shared.constants.set_data_dir() "
+            "only — direct assignment does not update the database paths.",
+            DATA_DIR,
+            _constants.DATA_DIR,
+        )
 
 
 def get_engine() -> Any:
@@ -109,6 +139,7 @@ def get_engine() -> Any:
     global _ENGINE
     if ENGINE is not None:
         return ENGINE
+    _warn_if_data_dir_drifted()
     if _ENGINE is None:
         with _ENGINE_LOCK:
             if _ENGINE is None:
@@ -156,6 +187,16 @@ _FINAL_TASK_STATUSES = {
     "partial",
     "skipped",
 }
+
+
+def is_final_task_status(status: object) -> bool:
+    """True when ``status`` is a final background-task status.
+
+    Public predicate so callers (e.g. the scheduler consuming a job handler's
+    reported outcome) do not have to import the private ``_FINAL_TASK_STATUSES``
+    set.
+    """
+    return status in _FINAL_TASK_STATUSES
 _TASK_STATUS_TO_EVIDENCE_STATUS = {
     "completed": VerificationEvidenceStatus.SUCCESS.value,
     "failed": VerificationEvidenceStatus.FAILED.value,
@@ -881,6 +922,7 @@ def get_session() -> Iterator[Session]:
 
 def init_db() -> None:
     global _DB_INITIALIZED
+    _warn_if_data_dir_drifted()
     if _DB_INITIALIZED:
         # The data directory may have moved (set_data_dir) since the last
         # initialization; make sure it exists before any session touches it.

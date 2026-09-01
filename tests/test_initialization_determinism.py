@@ -7,6 +7,9 @@ every process resolves identical configuration.
 
 from __future__ import annotations
 
+import json
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -96,6 +99,58 @@ def test_only_constants_loads_dotenv(monkeypatch, tmp_path: Path) -> None:
 
     assert getattr(database, "load_dotenv", None) is None
     assert getattr(sentry, "load_dotenv", None) is None
+
+
+def test_env_loaded_for_fresh_interpreter_imports(tmp_path: Path) -> None:
+    """A fresh interpreter must see .env values after importing shared.sentry/database.
+
+    Pins the "single load site" guarantee end-to-end: importing shared.sentry (which
+    does not load .env itself) must still make a .env-provided value visible, because
+    it imports shared.constants first — regardless of the order the embedder chose.
+    The sandbox project is a real copy of ``shared/`` (``PROJECT_ROOT`` is derived
+    from ``shared/__file__``, so a symlink would resolve back into the repo); only
+    ``.env`` and the environment are sandboxed.
+    """
+    import shutil
+
+    repo_root = Path(__file__).resolve().parents[1]
+    sandbox = tmp_path / "sandbox"
+    shutil.copytree(
+        repo_root / "shared",
+        sandbox / "shared",
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
+    (sandbox / ".env").write_text(
+        f"DATA_DIR={tmp_path / 'data'}\nWP_TEST_MARKER=loaded\n", encoding="utf-8"
+    )
+
+    env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)}
+    for name in ("DATA_DIR", "TRADING_DATA_DIR", "DATABASE_URL", "SENTRY_DSN", "SENTRY_ENABLED"):
+        env.pop(name, None)
+
+    code = (
+        "import json, os\n"
+        "# embedder order: sentry first — constants is never imported by the embedder\n"
+        "import shared.sentry\n"
+        "import shared.database\n"
+        "import shared.constants as c\n"
+        "print(json.dumps({'data_dir': str(c.DATA_DIR),"
+        " 'saw_env': os.environ.get('WP_TEST_MARKER')}))\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=str(sandbox),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert proc.returncode == 0, f"subprocess failed: {proc.stderr[-2000:]}"
+    payload = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert payload["data_dir"] == str(tmp_path / "data"), (
+        "shared.constants must resolve DATA_DIR from the sandbox .env in a fresh interpreter"
+    )
+    assert payload["saw_env"] == "loaded", ".env must be loaded by shared.constants on import"
 
 
 def test_database_url_from_env_is_used_without_dotenv_reload(

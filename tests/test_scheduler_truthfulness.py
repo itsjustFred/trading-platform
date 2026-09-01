@@ -7,12 +7,11 @@ skip/failure — never record a completed refresh that never happened.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
 import shared.constants as constants_module
-from shared.database import get_background_task_record
 
 
 def test_weekly_refresh_reports_skip_when_config_missing(tmp_path: Path) -> None:
@@ -50,8 +49,6 @@ def test_weekly_refresh_refreshes_symbols_with_coverage(tmp_path: Path) -> None:
     from scheduler.jobs import weekly_data_refresh
 
     data_dir = tmp_path / "data"
-    end = datetime.now(timezone.utc)
-    start = end - timedelta(days=7)
     for symbol in weekly_data_refresh.REFRESH_SYMBOLS:
         root = data_dir / "ohlcv" / "yfinance" / "equity" / "US" / symbol
         root.mkdir(parents=True, exist_ok=True)
@@ -191,3 +188,80 @@ def test_scheduler_sync_registers_health_check_service(tmp_path: Path) -> None:
     asyncio.run(_scenario())
 
     assert job_ids, "expected at least one registered job"
+
+
+def test_scheduler_wrapper_records_handler_reported_status(tmp_path: Path) -> None:
+    """_run_service_job must not overwrite a handler's truthful non-success status."""
+    from scheduler.scheduler import ServiceScheduler
+
+    async def _scenario() -> list[dict]:
+        scheduler = ServiceScheduler()
+        scheduler._scheduler.start()
+        scheduler._started = True
+        records: list[dict] = []
+
+        async def _handler(**kwargs):
+            # Simulate a handler that reports "skipped" and returns without
+            # writing its own final record (the wrapper must record "skipped").
+            return {"status": "skipped", "refreshed": [], "missing": ["EURUSD"]}
+
+        try:
+            with patch(
+                "scheduler.scheduler.update_service_status"
+            ), patch("scheduler.scheduler.upsert_background_task_record") as upsert, patch.dict(
+                "scheduler.scheduler._SCHEDULED_JOB_HANDLERS",
+                {"weekly_data_refresh": _handler},
+            ):
+                upsert.side_effect = lambda **kwargs: records.append(dict(kwargs))
+                await scheduler._run_service_job(
+                    service_id="svc-wrapper",
+                    service_name="Weekly Data Refresh",
+                    job_type="weekly_data_refresh",
+                )
+        finally:
+            await scheduler.stop()
+        return records
+
+    records = asyncio.run(_scenario())
+
+    assert records, "wrapper must write a final task record"
+    assert records[-1]["status"] == "skipped", (
+        "the wrapper must not downgrade a handler-reported skip to completed"
+    )
+    assert records[-1]["config_json"]["result"]["status"] == "skipped"
+
+
+def test_scheduler_wrapper_defaults_to_completed_when_handler_returns_none() -> None:
+    """Handlers that return nothing keep the plain completed record."""
+    from scheduler.scheduler import ServiceScheduler
+
+    async def _scenario() -> list[dict]:
+        scheduler = ServiceScheduler()
+        scheduler._scheduler.start()
+        scheduler._started = True
+        records: list[dict] = []
+
+        async def _handler(**kwargs):
+            return None
+
+        try:
+            with patch(
+                "scheduler.scheduler.update_service_status"
+            ), patch("scheduler.scheduler.upsert_background_task_record") as upsert, patch.dict(
+                "scheduler.scheduler._SCHEDULED_JOB_HANDLERS",
+                {"signal_bot_health_check": _handler},
+            ):
+                upsert.side_effect = lambda **kwargs: records.append(dict(kwargs))
+                await scheduler._run_service_job(
+                    service_id="svc-none",
+                    service_name="Signal Bot Health Check",
+                    job_type="signal_bot_health_check",
+                )
+        finally:
+            await scheduler.stop()
+        return records
+
+    records = asyncio.run(_scenario())
+
+    assert records, "wrapper must write a final task record"
+    assert records[-1]["status"] == "completed"
