@@ -7,9 +7,13 @@ order (SQLite rowid): the first-inserted row is kept, all later rows are deleted
 Such duplicates were produced before dedupe_key-based idempotency existed, e.g. when
 a fill was persisted both from the live stream and from a replayed/duplicate event.
 
+Dry-run discipline: without ``--confirm`` nothing is deleted — the script only
+reports what it would remove.
+
 Usage:
-    python -m scripts.dedupe_executions            # delete duplicates
-    python -m scripts.dedupe_executions --dry-run  # report only, delete nothing
+    python -m scripts.dedupe_executions                  # report only
+    python -m scripts.dedupe_executions --dry-run        # report only (explicit)
+    python -m scripts.dedupe_executions --confirm        # delete duplicates
 """
 
 from __future__ import annotations
@@ -40,11 +44,14 @@ HAVING COUNT(*) > 1
 """
 
 
-def dedupe_executions(*, dry_run: bool = False) -> int:
+def dedupe_executions(*, dry_run: bool = False, confirm: bool = False) -> int:
     """Delete duplicate live_executions rows, keeping the oldest row per group.
 
-    Returns the number of rows deleted (or that would be deleted with --dry-run).
+    Rows are only deleted when ``confirm=True`` and ``dry_run`` is not set.
+    Returns the number of rows deleted (or that would be deleted in dry-run).
     """
+    effective_dry_run = dry_run or not confirm
+
     init_db()
     with get_session() as session:
         groups = session.connection().execute(text(_DUPLICATE_GROUPS_SQL)).fetchall()
@@ -79,9 +86,11 @@ def dedupe_executions(*, dry_run: bool = False) -> int:
                 row_count - 1,
             )
 
-        if dry_run:
+        if effective_dry_run:
             logger.info(
-                "Dry run: would delete %d duplicate rows", len(duplicate_rowids)
+                "Dry run: would delete %d duplicate rows%s",
+                len(duplicate_rowids),
+                "" if dry_run else " (pass --confirm to delete)",
             )
             return len(duplicate_rowids)
 
@@ -101,10 +110,17 @@ def main() -> int:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Report duplicates without deleting anything.",
+        help="Report duplicates without deleting anything (default).",
+    )
+    parser.add_argument(
+        "--confirm",
+        action="store_true",
+        help="Actually delete the reported duplicate rows.",
     )
     args = parser.parse_args()
-    dedupe_executions(dry_run=args.dry_run)
+    if args.dry_run and args.confirm:
+        parser.error("--dry-run and --confirm are mutually exclusive")
+    dedupe_executions(dry_run=args.dry_run, confirm=args.confirm)
     return 0
 
 

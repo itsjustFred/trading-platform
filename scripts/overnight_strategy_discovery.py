@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
-"""Auto-discover trading strategies overnight.
+"""Auto-discover trading strategy parameter candidates (experimental).
 
-Random parameter search across SMA/RSI/Keltner combinations.
-Saves top performers to data/discovered_strategies/ for morning review.
+Random parameter search across SMA/RSI/Keltner combinations. The generated
+rows are candidates with ``"status": "mock"`` — no backtest has been run for
+them. They are NOT written to the discovery directory consumed by
+``scripts/run_discovery_grid_backtests.py`` unless ``--publish`` is passed
+explicitly, because the real grid runner treats everything it finds there as
+an executable discovery.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import random
 import sys
@@ -24,7 +29,6 @@ except ImportError:
     DATA_DIR = PROJECT_ROOT / "data"
 
 DISCOVERED_DIR = DATA_DIR / "discovered_strategies"
-DISCOVERED_DIR.mkdir(parents=True, exist_ok=True)
 
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT"]
 TIMEFRAMES = ["1h", "4h", "1d"]
@@ -61,8 +65,14 @@ def random_keltner_params() -> dict:
     return {"keltner_period": period, "keltner_mult": mult}
 
 
-def run_discovery_batch(n_trials: int = 10) -> list[dict]:
-    """Run random strategy discovery."""
+def run_discovery_batch(n_trials: int = 10, publish: bool = False) -> list[dict]:
+    """Generate random trial candidates.
+
+    Results are candidates only (``status: mock``); no backtest is executed.
+    They are only written to ``DISCOVERED_DIR`` when ``publish=True`` — the
+    real grid runner consumes that directory and would otherwise treat mock
+    rows as executable discoveries.
+    """
     results = []
 
     for i in range(n_trials):
@@ -82,7 +92,7 @@ def run_discovery_batch(n_trials: int = 10) -> list[dict]:
             params = random_keltner_params()
 
         try:
-            config = BacktestConfig(
+            BacktestConfig(
                 strategy_name=f"{strat_type}_cross",  # Simplified
                 symbols=[symbol],
                 timeframe=tf,
@@ -91,8 +101,8 @@ def run_discovery_batch(n_trials: int = 10) -> list[dict]:
                 initial_capital=100000.0,
                 risk_per_trade_pct=0.01,
             )
-            # Note: Real implementation would need actual strategy files
-            # This is experimental skeleton
+            # Note: Real implementation would need actual strategy files.
+            # This is an experimental skeleton; rows stay marked as mock.
             result = {
                 "id": f"disc_{i:04d}",
                 "strategy": f"{strat_type}",
@@ -107,20 +117,37 @@ def run_discovery_batch(n_trials: int = 10) -> list[dict]:
             results.append({
                 "id": f"disc_{i:04d}",
                 "strategy": strat_type,
+                "status": "mock",
                 "error": str(e),
             })
 
-    # Save results
-    out_path = DISCOVERED_DIR / f"discovery_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.json"
-    out_path.write_text(json.dumps(results, indent=2))
+    if publish:
+        DISCOVERED_DIR.mkdir(parents=True, exist_ok=True)
+        out_path = (
+            DISCOVERED_DIR
+            / f"discovery_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.json"
+        )
+        out_path.write_text(json.dumps(results, indent=2))
 
     return results
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--trials", type=int, default=20, help="Number of trial candidates")
+    parser.add_argument(
+        "--publish",
+        action="store_true",
+        help="Write the candidates to the discovery directory consumed by the grid runner.",
+    )
+    args = parser.parse_args()
+
     print("Overnight Strategy Discovery - Experimental")
     print("=" * 50)
 
-    results = run_discovery_batch(n_trials=20)
-    print(f"Completed {len(results)} trial configurations")
-    print(f"Results saved to {DISCOVERED_DIR}")
+    results = run_discovery_batch(n_trials=args.trials, publish=args.publish)
+    print(f"Generated {len(results)} trial candidate configurations")
+    if args.publish:
+        print(f"Results saved to {DISCOVERED_DIR}")
+    else:
+        print("Dry run: results were NOT published (pass --publish to write them).")

@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Run the backtest matrix strategy queue conservatively.
 
-Two cron sessions can call this script. A lock file guarantees that only one
-session runs at a time, so if one session dies/crashes the other session wakes
-the queue again on the next tick.
+Two cron sessions can call this script. A flock-held lock file guarantees that
+only one session runs at a time: acquisition is race-free (the kernel arbitrates
+the lock), and a lock belonging to a live process is never removed. If a session
+dies, the OS releases its flock and the next cron tick retakes the lock.
 """
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
 import subprocess
@@ -77,30 +80,98 @@ def any_matrix_process_running() -> bool:
         return False
 
 
-def acquire_lock() -> bool:
-    MATRIX_DIR.mkdir(parents=True, exist_ok=True)
-    if LOCK_PATH.exists():
-        try:
-            age = time.time() - LOCK_PATH.stat().st_mtime
-            if age < LOCK_TTL_SECONDS:
-                return False
-            if any_matrix_process_running():
-                return False
-            LOCK_PATH.unlink()
-        except Exception:
-            return False
+def _lock_age_seconds(path: Path) -> float:
+    """Return the age of a lock file in seconds (infinitely old on error)."""
     try:
-        LOCK_PATH.write_text(now_iso(), encoding="utf-8")
+        return time.time() - path.stat().st_mtime
+    except OSError:
+        return float("inf")
+
+
+def _owns_fresh_stale_lock() -> bool:
+    """True when a fresh lock file with a timestamp exists but is unheld."""
+    if not LOCK_PATH.exists():
+        return False
+    if _lock_age_seconds(LOCK_PATH) >= LOCK_TTL_SECONDS:
+        return False
+    try:
+        return bool(LOCK_PATH.read_text(encoding="utf-8").strip())
+    except OSError:
+        return False
+
+
+def acquire_lock() -> bool:
+    """Take the queue lock for this process.
+
+    The lock is an exclusive ``flock`` on ``queue.lock``: the kernel arbitrates
+    acquisition, so there is no check-then-create race. A lock held by a live
+    process is never deleted; a stale lock file (older than
+    ``LOCK_TTL_SECONDS``) whose owner died releases its flock automatically and
+    any leftover file is simply re-locked and refreshed.
+    """
+    MATRIX_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        lock_handle = LOCK_PATH.open("a+", encoding="utf-8")
+    except OSError:
+        return False
+
+    try:
+        try:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            lock_handle.close()
+            return False
+
+        if _owns_fresh_stale_lock() and globals().get("_LOCK_HANDLE") is None:
+            # A fresh lock file with a timestamp exists but nobody holds a
+            # flock on it (a crashed writer left it behind recently). Never
+            # delete another session's lock: skip this tick instead.
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+            lock_handle.close()
+            return False
+
+        lock_handle.seek(0)
+        lock_handle.truncate()
+        lock_handle.write(now_iso() + "\n")
+        lock_handle.flush()
+        # Keep the handle open for the lifetime of the lock: closing it would
+        # release the flock.
+        globals()["_LOCK_HANDLE"] = lock_handle
         return True
     except Exception:
+        with contextlib.suppress(Exception):
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        with contextlib.suppress(Exception):
+            lock_handle.close()
         return False
 
 
 def release_lock() -> None:
+    """Release the queue lock held by this process, if any."""
+    handle = globals().get("_LOCK_HANDLE")
+    if handle is None:
+        return
     try:
-        LOCK_PATH.unlink(missing_ok=True)
-    except Exception:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except OSError:
         pass
+    finally:
+        with contextlib.suppress(Exception):
+            handle.close()
+        globals()["_LOCK_HANDLE"] = None
+
+
+def _remove_lock_file() -> None:
+    """Remove the lock file only while this process still holds its flock.
+
+    Unlinking under flock is safe (no other session can hold the lock while we
+    do this), so a fresh-looking leftover cannot block the next tick.
+    """
+    if globals().get("_LOCK_HANDLE") is not None:
+        return
+    with contextlib.suppress(OSError):
+        LOCK_PATH.unlink(missing_ok=True)
+
 
 
 def grid_summary(strategy: str) -> dict | None:
@@ -249,6 +320,7 @@ def main() -> int:
             continue
     finally:
         release_lock()
+        _remove_lock_file()
 
 
 def render_state(state: dict) -> str:
