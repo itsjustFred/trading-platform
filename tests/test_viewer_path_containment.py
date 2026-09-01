@@ -310,7 +310,7 @@ def test_signal_replay_accepts_csv_inside_data_dir(
 ):
     import viewer.main as viewer_app_module
 
-    csv_path = tmp_path / "signals" / "signals_demo.csv"
+    csv_path = tmp_path / "ohlcv" / "signals" / "signals_demo.csv"
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     csv_path.write_text(
         "Symbol;Signal Price;Datum;Zeit (NY);Signal Type\n"
@@ -478,9 +478,12 @@ def test_contained_asset_path_never_leaves_base_dir(security_client, tmp_path):
     assert secret.exists()
 
 
-def test_contained_client_data_file_rejects_escape_via_dotdot(tmp_path):
+def test_contained_client_data_file_rejects_escape_via_dotdot(
+    monkeypatch, tmp_path
+):
     import viewer.main as viewer_app_module
 
+    monkeypatch.setattr(viewer_app_module, "DATA_DIR", tmp_path)
     data_root = tmp_path / "ohlcv"
     data_root.mkdir(parents=True, exist_ok=True)
     outside = tmp_path / "outside.csv"
@@ -490,7 +493,7 @@ def test_contained_client_data_file_rejects_escape_via_dotdot(tmp_path):
     real = data_root / "sub" / "file.csv"
     real.write_text("x", encoding="utf-8")
     resolved = viewer_app_module._contained_client_data_file(
-        str(real), allowed_suffix=".csv", base_dir=data_root
+        str(real), allowed_suffix=".csv"
     )
     assert resolved == real.resolve()
 
@@ -504,7 +507,7 @@ def test_contained_client_data_file_rejects_escape_via_dotdot(tmp_path):
     ):
         assert (
             viewer_app_module._contained_client_data_file(
-                raw, allowed_suffix=".csv", base_dir=data_root
+                raw, allowed_suffix=".csv"
             )
             is None
         ), f"{raw!r} must not pass containment"

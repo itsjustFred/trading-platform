@@ -959,14 +959,16 @@ def _contained_client_data_file(
 ) -> Path | None:
     """Validate a client-supplied data file path for reading or subprocess use.
 
-    The resolved path must stay inside the OHLCV data tree and must carry the
-    expected suffix, so requests can neither read arbitrary files nor point a
-    subprocess at code outside the data directory.
+    The resolved path must stay inside the OHLCV data tree
+    (``DATA_DIR / "ohlcv"``) and must carry the expected suffix, so requests
+    can neither read arbitrary files nor point a subprocess at code outside
+    the data directory. ``base_dir`` widens the tree for callers that manage
+    non-OHLCV files.
     """
     normalized = str(raw_path or "").strip()
     if not normalized:
         return None
-    base = (base_dir or DATA_DIR).resolve()
+    base = (base_dir or DATA_DIR / "ohlcv").resolve()
     try:
         candidate = Path(normalized).expanduser().resolve()
     except (OSError, ValueError):
@@ -10756,8 +10758,8 @@ async def delete_data_task(task_id: str) -> dict[str, Any]:
     "/api/data/symbol",
     response_model=dict[str, Any],
     responses={
-        400: {"description": "Invalid path or non-parquet file"},
-        403: {"description": "Path is outside the OHLCV data directory"},
+        400: {"description": "Path query parameter is missing"},
+        403: {"description": "Path is outside the OHLCV data directory or is not a parquet file"},
     },
 )
 async def delete_symbol_data(path: str = Query(default="")) -> dict[str, Any]:
