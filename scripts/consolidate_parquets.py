@@ -103,6 +103,23 @@ def _merge_members(members: list[Path]) -> pd.DataFrame:
     return combined
 
 
+def _validate_backup_dir(backup_dir: Path, root: Path) -> Path:
+    """Validate a consolidation backup directory before it is used.
+
+    ``--backup-dir`` arrives from the command line, so it is resolved and checked
+    before anything touches the file system: it must not be the OHLCV tree itself
+    or live inside it — a snapshot inside ``root`` would be picked up as parquet
+    fragments (and deleted) by the very next consolidation run.
+    """
+    resolved = backup_dir.expanduser().resolve()
+    if resolved == root or root in resolved.parents:
+        raise ValueError(
+            f"Backup directory {resolved} must live outside the OHLCV tree {root} — "
+            "a snapshot inside the tree would be consolidated and deleted by the next run."
+        )
+    return resolved
+
+
 def _default_backup_dir(root: Path) -> Path:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     return root.parent / f"{root.name}-consolidation-backup-{stamp}"
@@ -188,7 +205,9 @@ def consolidate(
         print(f"Nothing to consolidate under {root}")
         return 0, 0, None
 
-    resolved_backup_dir = backup_dir if backup_dir is not None else _default_backup_dir(root)
+    resolved_backup_dir = _validate_backup_dir(
+        backup_dir if backup_dir is not None else _default_backup_dir(root), root
+    )
     _stage_backup(actions, root, resolved_backup_dir)
     print(f"Backup snapshot: {resolved_backup_dir}")
 

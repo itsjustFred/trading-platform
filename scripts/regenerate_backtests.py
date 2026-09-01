@@ -407,7 +407,6 @@ def _strategy_paths(strategies: list[str] | None) -> list[Path]:
 def plan_regeneration(
     *,
     strategies: list[str] | None = None,
-    data_dir: Path | None = None,
 ) -> RegenerationPlan:
     """Dry-run helper: describe the planned runs and the corpus at risk.
 
@@ -415,7 +414,7 @@ def plan_regeneration(
     for the reported ``sqlite_backtests``/``json_backtests`` counts to describe the
     live corpus — counting them afterwards always yields 0.
     """
-    resolved_data_dir = data_dir if data_dir is not None else DATA_DIR
+    resolved_data_dir = DATA_DIR
     backtests_dir = resolved_data_dir / "backtests"
     plan = RegenerationPlan(
         sqlite_backtests=_count_sqlite_backtests(),
@@ -475,8 +474,8 @@ def _run_strategy(
     *,
     data_dir: Path,
     backtests_dir: Path,
-) -> bool:
-    """Run one planned strategy entry. Returns True on success."""
+) -> None:
+    """Run one planned strategy entry. Raises BacktestRunError on failure."""
     engine_name = entry["engine"]
     strategy_name = entry["strategy"]
     engine = get_engine(engine_name)
@@ -523,7 +522,6 @@ def _run_strategy(
         f"✅ {strategy_name} ({engine_name}) symbol={entry['symbol']} "
         f"timeframe={entry['timeframe']} rows={len(result.trades)} id={result.meta.id}"
     )
-    return True
 
 
 class BacktestRunError(Exception):

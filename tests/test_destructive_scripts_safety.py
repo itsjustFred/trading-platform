@@ -185,6 +185,18 @@ def test_consolidate_confirmed_run_merges_fragments(ohlcv_root):
     assert len(merged_frame) == 3
 
 
+def test_consolidate_refuses_backup_dir_inside_tree(ohlcv_root):
+    from scripts.consolidate_parquets import consolidate
+
+    inside = ohlcv_root / "EURUSD" / "backup"
+
+    with pytest.raises(ValueError, match="outside the OHLCV tree"):
+        consolidate(ohlcv_root, backup_dir=inside)
+
+    assert not inside.exists()
+    assert (ohlcv_root / "EURUSD" / "1h.parquet").exists()
+
+
 # ─── scripts/regenerate_backtests.py ─────────────────────────────────────────
 
 
@@ -233,19 +245,48 @@ def test_regenerate_confirmed_run_restores_corpus_when_all_runs_fail(
     backtests_dir = _seed_corpus(isolated_db, tmp_path)
     monkeypatch.setattr(script, "DATA_DIR", tmp_path)
     monkeypatch.setattr(script, "BACKTESTS_DIR", backtests_dir)
+
+    def failing_run(*_args, **_kwargs):
+        raise script.BacktestRunError("demo_strategy: run failed (boom)")
+
+    monkeypatch.setattr(script, "_run_strategy", failing_run)
     monkeypatch.setattr(
         script, "iter_strategy_files", lambda _root: [Path("strategies/demo/demo_strategy.py")]
     )
-    monkeypatch.setattr(script, "_run_strategy", lambda *_a, **_k: False)
-
-    outcome = script.regenerate(
-        dry_run=False, assume_yes=True, strategies=["strategies/demo/demo_strategy.py"]
+    monkeypatch.setattr(script, "detect_strategy_type", lambda _p, _root: object())
+    monkeypatch.setattr(script, "load_strategy_meta", lambda _p, _root: {"tags": {}})
+    monkeypatch.setattr(
+        script, "_build_symbol_index", lambda _d: {"EURUSD": {"1h": [tmp_path / "x.parquet"]}}
     )
+    monkeypatch.setattr(script, "_read_parquet_date_range", lambda _p: ("2024-01-01", "2024-02-01"))
 
+    outcome = script.regenerate(dry_run=False, assume_yes=True, strategies=[])
+
+    assert outcome.successes == 0
     assert outcome.failures >= 1
     with database.get_session() as session:
         assert len(session.exec(select(database.BacktestRecord)).all()) == 1
     assert outcome.restored is True
+    assert (backtests_dir / "bt-seed.trades.json").exists()
+
+
+def test_regenerate_refuses_backup_dir_inside_backtests_dir(isolated_db, monkeypatch, tmp_path):
+    from scripts import regenerate_backtests as script
+
+    backtests_dir = _seed_corpus(isolated_db, tmp_path)
+    monkeypatch.setattr(script, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(script, "BACKTESTS_DIR", backtests_dir)
+
+    with pytest.raises(ValueError, match="outside"):
+        script.regenerate(
+            dry_run=False,
+            assume_yes=True,
+            backup_dir=backtests_dir / "snapshot",
+        )
+
+    # Nothing was purged: the validation runs before the destructive steps.
+    with database.get_session() as session:
+        assert len(session.exec(select(database.BacktestRecord)).all()) == 1
     assert (backtests_dir / "bt-seed.trades.json").exists()
 
 
