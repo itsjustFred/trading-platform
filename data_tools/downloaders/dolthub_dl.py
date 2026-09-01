@@ -27,10 +27,21 @@ import requests
 
 from data_tools.downloaders.base import Downloader, DownloadResult, SourceMeta
 from shared.constants import DATA_DIR
+from shared.sql import quote_identifier, quote_literal
 
 logger = logging.getLogger(__name__)
 
 DOLTHUB_API = "https://www.dolthub.com/api/v1alpha1"
+
+
+def _validate_date(value: str) -> str:
+    """Validate a user-supplied date bound (YYYY-MM-DD) before SQL assembly."""
+    import re
+
+    text = str(value).strip()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        raise ValueError(f"invalid date bound (expected YYYY-MM-DD): {value!r}")
+    return text
 
 # Well-known trading data repos
 KNOWN_REPOS = [
@@ -92,14 +103,18 @@ class DolthubDownloader(Downloader):
         effective_start = self._resolve_resume_start(out_path, start)
 
         if query is None:
-            # Default query for stock data
-            conditions = [f"act_symbol = '{symbol}'"]
+            # Default query for stock data — table and symbol are validated
+            # through the shared SQL helpers, never interpolated raw (DV-B27).
+            conditions = [f"act_symbol = {quote_literal(symbol)}"]
             if effective_start:
-                conditions.append(f"date >= '{effective_start}'")
+                conditions.append(f"date >= '{_validate_date(effective_start)}'")
             if end:
-                conditions.append(f"date <= '{end}'")
+                conditions.append(f"date <= '{_validate_date(end)}'")
             where = " AND ".join(conditions)
-            query = f"SELECT date, open, high, low, close, volume FROM `{table}` WHERE {where} ORDER BY date"
+            query = (
+                f"SELECT date, open, high, low, close, volume FROM "
+                f"{quote_identifier(table)} WHERE {where} ORDER BY date"
+            )
 
         logger.info("Querying DoltHub %s/%s: %s", owner, repo_name, query[:100])
 
