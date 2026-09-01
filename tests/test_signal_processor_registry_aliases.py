@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import yaml
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -138,3 +140,39 @@ def test_nitro_stamps_its_own_metadata() -> None:
     )
     assert signal.metadata["signal_bot"] == "nitro"
     assert signal.metadata["source"] == "nitro"
+
+def test_every_option_id_resolves_to_a_config_path() -> None:
+    """Every listed option resolves to an existing per-bot config file.
+
+    `get_signal_processor_config_path` is derived from the registry; this pins
+    the invariant so a new bot cannot pass the health check while its config
+    path lookup raises.
+    """
+    for option in SIGNAL_PROCESSOR_OPTIONS:
+        path = get_signal_processor_config_path(option["id"])
+        assert path.exists(), f"missing config file for {option['id']}: {path}"
+
+
+def test_shipped_config_files_have_a_single_bot_section() -> None:
+    """Each bot config has exactly one top-level section.
+
+    `_build_from_config` merges caller overrides into that section; a second
+    top-level key would silently disable the merge (see registry docstring).
+    """
+    for option in SIGNAL_PROCESSOR_OPTIONS:
+        path = get_signal_processor_config_path(option["id"])
+        payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+        assert isinstance(payload, dict) and len(payload) == 1, (
+            f"{path} must contain exactly one top-level bot section"
+        )
+
+
+def test_ramjet_reads_its_shipped_config_values() -> None:
+    """RamJet picks up tuned values from its own config file, not defaults."""
+    processor = get_signal_processor("ramjet", {})
+    assert isinstance(processor, RamJetSignalProcessor)
+    assert processor.config.get("sl_multiplier") == 2.0
+    nitro_payload = yaml.safe_load(
+        get_signal_processor_config_path("nitro").read_text(encoding="utf-8")
+    )
+    assert processor.config.get("atr_period") == nitro_payload["nitro"]["atr_period"]

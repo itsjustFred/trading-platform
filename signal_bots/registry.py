@@ -50,6 +50,11 @@ def _build_from_config(
     overrides = dict(config or {})
     merged.update(overrides)
     sections = [key for key, value in payload.items() if isinstance(value, dict)]
+    if len(sections) > 1:
+        raise ValueError(
+            "Signal processor config must have exactly one bot section: "
+            f"{config_path}"
+        )
     if len(sections) == 1:
         section = dict(payload[sections[0]])
         section.update(overrides)
@@ -57,29 +62,45 @@ def _build_from_config(
     return factory(merged)
 
 
+# Single source of truth for "which config file backs which registered id".
+# Options list, factories and config-path lookups are all derived views of the
+# ids listed here; adding a bot means one entry here plus its factory.
+_BOT_DIRS: dict[str, str] = {
+    "ramjet": "ramjet",
+    "rocketfuel_longsonly": "rocketfuel",
+    "rocketfuel_longandshort": "rocketfuel",
+    "nitro": "nitro",
+}
+
+
 def _bot_config_path(bot_dir: str) -> Path:
     """Config file for a bot directory; ids are code-owned, never user input."""
     return _ROOT / bot_dir / CONFIG_FILENAME
 
 
-def _ramjet_config_path() -> Path:
-    return _bot_config_path("ramjet")
+def get_signal_processor_config_path(name: str) -> Path:
+    """Return the config file that backs a registered processor id.
+
+    Derived from `_BOT_DIRS`, not from the requested string: an unknown id
+    raises instead of producing a filesystem path.
+    """
+    normalized = str(name or "").strip().lower()
+    bot_dir = _BOT_DIRS.get(normalized)
+    if bot_dir is None:
+        raise ValueError(f"Unknown signal processor: {name}")
+    return _bot_config_path(bot_dir)
 
 
-def _rocketfuel_config_path() -> Path:
-    return _bot_config_path("rocketfuel")
-
-
-def _nitro_config_path() -> Path:
-    return _bot_config_path("nitro")
+def _build_from_bot_dir(bot_dir: str, factory: Callable[[dict[str, Any]], object], config: dict[str, Any]) -> object:
+    return _build_from_config(_bot_config_path(bot_dir), factory, config)
 
 
 def _build_ramjet(config: dict[str, Any]) -> RamJetSignalProcessor:
-    return _build_from_config(_ramjet_config_path(), RamJetSignalProcessor, config)
+    return _build_from_bot_dir("ramjet", RamJetSignalProcessor, config)
 
 
 def _build_nitro(config: dict[str, Any]) -> NitroSignalProcessor:
-    return _build_from_config(_nitro_config_path(), NitroSignalProcessor, config)
+    return _build_from_bot_dir("nitro", NitroSignalProcessor, config)
 
 
 def _build_rocketfuel(variant: str, config: dict[str, Any]) -> RocketFuelSignalProcessor:
@@ -87,16 +108,19 @@ def _build_rocketfuel(variant: str, config: dict[str, Any]) -> RocketFuelSignalP
         if isinstance(merged.get("rocket_fuel"), dict):
             rocket_fuel = dict(merged["rocket_fuel"])
         else:
+            # Fallback for a sectionless file: collect the known tuning keys.
+            # `variant` is owned by this factory and always overwritten below,
+            # so it is deliberately absent from the allowlist.
             rocket_fuel = {
                 key: value
                 for key, value in merged.items()
-                if key in {"atr_period", "sl_multiplier", "candle_timeframe", "variant"}
+                if key in {"atr_period", "sl_multiplier", "candle_timeframe"}
             }
         rocket_fuel["variant"] = variant
         merged["rocket_fuel"] = rocket_fuel
         return RocketFuelSignalProcessor(merged)
 
-    return _build_from_config(_rocketfuel_config_path(), _factory, config)
+    return _build_from_bot_dir("rocketfuel", _factory, config)
 
 
 def _build_rocketfuel_longsonly(config: dict[str, Any]) -> RocketFuelSignalProcessor:
@@ -140,22 +164,6 @@ SIGNAL_PROCESSORS: dict[str, SignalProcessorFactory] = {
     "rocketfuel_longandshort": _build_rocketfuel_longandshort,
     "nitro": _build_nitro,
 }
-
-
-def get_signal_processor_config_path(name: str) -> Path:
-    """Return the config file that backs a registered processor id.
-
-    Derived from code, not from the requested string: an unknown id raises
-    instead of producing a filesystem path.
-    """
-    normalized = str(name or "").strip().lower()
-    if normalized == "ramjet":
-        return _ramjet_config_path()
-    if normalized == "nitro":
-        return _nitro_config_path()
-    if normalized in {"rocketfuel_longsonly", "rocketfuel_longandshort"}:
-        return _rocketfuel_config_path()
-    raise ValueError(f"Unknown signal processor: {name}")
 
 
 def list_signal_processor_options() -> list[dict[str, str]]:

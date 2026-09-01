@@ -1,6 +1,7 @@
 """Tests for signal bot health check."""
 from signal_bots.health_check import main
 from signal_bots.health_check import check_signal_bots
+from signal_bots.registry import SIGNAL_PROCESSOR_OPTIONS
 
 
 def test_check_signal_bots_returns_registry_status() -> None:
@@ -19,7 +20,7 @@ def test_check_signal_bots_detects_config_files() -> None:
     """Test signal bot health check includes config paths."""
     result = check_signal_bots()
 
-    assert len(result["results"]) >= 4  # ramjet, rocketfuel variants, nitro
+    assert len(result["results"]) == len(SIGNAL_PROCESSOR_OPTIONS)
     assert any(r["name"] == "nitro" for r in result["results"])
     assert any(r["name"] == "ramjet" for r in result["results"])
     assert any(r["name"].startswith("rocketfuel") for r in result["results"])

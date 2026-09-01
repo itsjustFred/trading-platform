@@ -72,13 +72,19 @@ export function BacktestFromSignalsModal({
       .then((options) => {
         const normalized = Array.isArray(options) ? options : [];
         setProcessors(normalized);
-        if (normalized.some((item) => item.id === DEFAULT_SIGNAL_PROCESSOR)) {
-          setSignalProcessor(DEFAULT_SIGNAL_PROCESSOR);
-          return;
-        }
-        if (normalized.length > 0) {
-          setSignalProcessor(normalized[0].id);
-        }
+        // Reconcile the current selection against the registry. An id that is
+        // no longer advertised (e.g. a processor was removed) falls back to
+        // the documented default, then to the first advertised option — never
+        // silently to an unrelated entry's position in the list.
+        setSignalProcessor((current) => {
+          if (normalized.some((item) => item.id === current)) {
+            return current;
+          }
+          if (normalized.some((item) => item.id === DEFAULT_SIGNAL_PROCESSOR)) {
+            return DEFAULT_SIGNAL_PROCESSOR;
+          }
+          return normalized.length > 0 ? normalized[0].id : current;
+        });
       })
       .catch(() => {
         setProcessors([]);
