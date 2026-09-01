@@ -8529,7 +8529,6 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
 
 @app.post(
     "/api/backtests/run-from-signals",
-    response_model=dict[str, Any],
     status_code=202,
     responses={403: {"description": "Signal CSV is outside the OHLCV data directory"}},
 )
@@ -10465,7 +10464,6 @@ async def data_check(
 
 @app.post(
     "/api/data/resample",
-    response_model=dict[str, Any],
     responses={400: {"description": "source_path is not a parquet file in the data directory"}},
 )
 async def data_resample(payload: DataResampleRequest) -> dict[str, Any]:
@@ -10756,7 +10754,6 @@ async def delete_data_task(task_id: str) -> dict[str, Any]:
 
 @app.delete(
     "/api/data/symbol",
-    response_model=dict[str, Any],
     responses={
         400: {"description": "Path query parameter is missing"},
         403: {"description": "Path is outside the OHLCV data directory or is not a parquet file"},
