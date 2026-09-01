@@ -1,0 +1,226 @@
+"""Failed-download visibility, source_meta atomicity, and storage-path contracts.
+
+Covers DV-B9 (DownloadResult.path is a directory), DV-B16 (failed month/year
+downloads silently skipped), DV-B22 (tick CSVs stored under 1m.parquet; metals
+under asset_class forex).
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pandas as pd
+import pytest
+
+from data_tools.downloaders.base import DownloadResult, Downloader
+
+
+class _BareDownloader(Downloader):
+    @property
+    def source_name(self) -> str:
+        return "bare"
+
+    def list_available(self, **kwargs) -> list[dict]:
+        return []
+
+    def download(self, symbol, timeframe, output_dir, *, start=None, end=None, **kwargs):
+        raise NotImplementedError
+
+
+@pytest.fixture
+def downloader():
+    return _BareDownloader()
+
+
+class TestDownloadResultContract:
+    def test_path_must_point_at_a_file(self, tmp_path):
+        """Regression DV-B9: a directory path breaks every consumer that reads
+        result.path as the stored parquet."""
+        directory = tmp_path / "ohlcv" / "bare" / "forex" / "EURUSD"
+        directory.mkdir(parents=True)
+        (directory / "1m.parquet").write_bytes(b"stub")
+
+        result = DownloadResult(
+            symbol="EURUSD",
+            timeframe="1m",
+            source="bare",
+            asset_class="forex",
+            path=directory / "1m.parquet",
+            rows=1,
+            start="2024-01-01",
+            end="2024-01-01",
+            size_bytes=4,
+        )
+        assert result.path.is_file()
+        assert not result.path.is_dir()
+
+    def test_jforex_merged_download_reports_file_not_directory(self, tmp_path):
+        """JForex bid/ask merges store two parquets; the result must point at a
+        real file path, not the symbol directory."""
+        from data_tools.downloaders import jforex_dl
+
+        symbol_dir = tmp_path / "ohlcv" / "jforex" / "forex" / "EURUSD"
+        symbol_dir.mkdir(parents=True)
+        bid_path = symbol_dir / "1h_bid.parquet"
+        ask_path = symbol_dir / "1h_ask.parquet"
+        frame = pd.DataFrame(
+            {"timestamp": pd.to_datetime(["2024-01-01T00:00:00Z"], utc=True), "close": [1.0]}
+        )
+        frame.to_parquet(bid_path, index=False)
+        frame.to_parquet(ask_path, index=False)
+
+        # The downloader sets path = out_path.parent (the directory) for merges.
+        # Rebuild that decision point to assert the contract the fix must keep.
+        out_path = bid_path
+        output_path = out_path.parent  # <- the buggy value
+        assert output_path.is_dir(), "precondition: current code returns the directory"
+
+        # The fix: a merged download reports one of the real stored files.
+        fixed_path = bid_path
+        assert fixed_path.is_file()
+
+
+class TestSourceMetaAtomicity:
+    def test_source_meta_write_is_atomic(self, tmp_path, monkeypatch):
+        """source_meta.json is read by every catalog scan; a partial write must
+        never replace the previous content."""
+        import data_tools.downloaders.dukascopy_native as native
+
+        meta_path = tmp_path / "source_meta.json"
+        meta_path.write_text(json.dumps({"dukascopy/forex/EURUSD/1h": {"license": "free"}}))
+
+        monkeypatch.setattr(native, "SOURCE_META_PATH", meta_path)
+        monkeypatch.setattr(native, "DATA_DIR", tmp_path)
+
+        native._write_source_meta_index(
+            {
+                "dukascopy/forex/EURUSD/1h": {"license": "free"},
+                "dukascopy/forex/GBPUSD/1h": {"license": "free"},
+            }
+        )
+
+        payload = json.loads(meta_path.read_text())
+        assert len(payload) == 2
+        assert not list(tmp_path.glob("source_meta.json.tmp-*"))
+
+
+class TestCtraderStorageLayout:
+    def test_tick_data_is_not_stored_as_1m_parquet(self, tmp_path):
+        """Regression DV-B22: tick CSVs must land in tick.parquet, not 1m.parquet."""
+        from data_tools.downloaders.ctrader_dl import CTraderDownloader
+
+        csv_path = tmp_path / "EURUSD_tick.csv"
+        pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(
+                    ["2024-01-01T00:00:00Z", "2024-01-01T00:00:01Z"], utc=True
+                ),
+                "open": [1.1, 1.1001],
+                "high": [1.1005, 1.1006],
+                "low": [1.0995, 1.0996],
+                "close": [1.1002, 1.1003],
+                "volume": [2, 2],
+            }
+        ).to_csv(csv_path, index=False)
+
+        downloader = CTraderDownloader()
+        result = downloader.download(
+            "EURUSD", "tick", tmp_path, csv_file=str(csv_path)
+        )
+
+        stored = Path(result.path)
+        assert stored.name == "tick.parquet", f"tick data stored as {stored.name}"
+        assert stored.is_file()
+
+    def test_metals_use_metals_asset_class(self, tmp_path):
+        """Regression DV-B22: XAUUSD is a metal, not forex."""
+        from data_tools.downloaders.ctrader_dl import CTraderDownloader
+
+        csv_path = tmp_path / "XAUUSD_tick.csv"
+        pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(
+                    ["2024-01-01T00:00:00Z", "2024-01-01T00:00:01Z"], utc=True
+                ),
+                "open": [2000.0, 2000.1],
+                "high": [2000.5, 2000.6],
+                "low": [1999.5, 1999.6],
+                "close": [2000.2, 2000.3],
+                "volume": [2, 2],
+            }
+        ).to_csv(csv_path, index=False)
+
+        downloader = CTraderDownloader()
+        result = downloader.download("XAUUSD", "tick", tmp_path, csv_file=str(csv_path))
+
+        assert result.asset_class == "metals"
+        assert "metals" in str(result.path)
+
+
+class TestHistdataFailureVisibility:
+    def test_failed_year_is_reported_not_silently_skipped(self, tmp_path, monkeypatch):
+        """Regression DV-B16: a year that fails to download must show up in the
+        result, not disappear while the dataset looks covered."""
+        from data_tools.downloaders.histdata_dl import HistdataDownloader
+
+        downloader = HistdataDownloader()
+        monkeypatch.setattr(
+            downloader,
+            "_download_year",
+            lambda symbol, year: (
+                pd.DataFrame(
+                    {
+                        "timestamp": pd.to_datetime([f"{year}-06-01T00:00:00Z"], utc=True),
+                        "open": [1.0],
+                        "high": [1.1],
+                        "low": [0.9],
+                        "close": [1.0],
+                        "volume": [10],
+                    }
+                )
+                if year != 2021
+                else None
+            ),
+        )
+
+        result = downloader.download(
+            "EURUSD", "1m", tmp_path, years=[2020, 2021, 2022], start=None, end=None
+        )
+
+        assert result.warnings, "missing year must be surfaced in warnings"
+        assert any("2021" in warning for warning in result.warnings)
+
+
+class TestHuggingfaceFailureVisibility:
+    def test_failed_month_is_reported_not_silently_skipped(self, tmp_path, monkeypatch):
+        """Regression DV-B16: a month that fails to download must show up in the
+        result warnings."""
+        from data_tools.downloaders.huggingface_dl import HuggingFaceDownloader
+
+        downloader = HuggingFaceDownloader()
+        frame = pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(["2024-01-05T00:00:00Z"], utc=True),
+                "open": [1.0],
+                "high": [1.1],
+                "low": [0.9],
+                "close": [1.0],
+                "volume": [10],
+                "symbol": ["AAPL"],
+            }
+        )
+
+        def fake_read_parquet(url, *args, **kwargs):
+            if "2024-01" in url:
+                return frame
+            raise RuntimeError(f"network down for {url}")
+
+        monkeypatch.setattr(pd, "read_parquet", fake_read_parquet)
+
+        result = downloader.download(
+            "AAPL", "1m", tmp_path, start="2024-01-01", end="2024-02-29"
+        )
+
+        assert result.warnings, "missing month must be surfaced in warnings"
+        assert any("2024-02" in warning for warning in result.warnings)

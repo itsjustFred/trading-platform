@@ -249,6 +249,7 @@ class HuggingFaceDownloader(Downloader):
 
         months = _month_sequence(parsed_start, parsed_end)
         monthly_frames: list[pd.DataFrame] = []
+        failed_months: list[str] = []
 
         for index, (year, month) in enumerate(months, start=1):
             month_label = f"{year:04d}-{month:02d}"
@@ -257,7 +258,10 @@ class HuggingFaceDownloader(Downloader):
             try:
                 month_frame = pd.read_parquet(url)
             except Exception as exc:
-                warnings.append(f"Skipping {month_label}: {exc}")
+                # A failed month must stay visible: silently skipping it makes
+                # the dataset look covered while the month is missing (DV-B16).
+                failed_months.append(month_label)
+                warnings.append(f"month {month_label}: download failed ({exc})")
                 continue
 
             normalized = self._normalize_month_frame(
@@ -287,6 +291,10 @@ class HuggingFaceDownloader(Downloader):
             )
 
         stored = self._merge_and_store_single_file(out_path, prepared)
+        if failed_months:
+            warnings.append(
+                f"failed months ({len(failed_months)}): {', '.join(failed_months)}"
+            )
         return DownloadResult(
             symbol=normalized_symbol,
             timeframe=canonical_tf,

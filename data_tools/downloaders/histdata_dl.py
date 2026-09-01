@@ -121,11 +121,21 @@ class HistdataDownloader(Downloader):
         logger.info("Downloading %s from histdata.com for years %s", symbol, years)
 
         all_dfs = []
+        failed_years: list[int] = []
         for year in years:
             df = self._download_year(symbol, year)
             if df is not None and not df.empty:
                 all_dfs.append(df)
                 logger.info("  %s %d: %d bars", symbol, year, len(df))
+            else:
+                # A failed year must stay visible: silently skipping it makes the
+                # dataset look covered while the year is simply missing (DV-B16).
+                failed_years.append(year)
+                logger.warning("  %s %d: no data returned", symbol, year)
+
+        warnings: list[str] = [
+            f"year {year}: download failed, no data returned" for year in failed_years
+        ]
 
         if not all_dfs:
             raise RuntimeError(f"No data downloaded for {symbol}")
@@ -159,6 +169,7 @@ class HistdataDownloader(Downloader):
             start=str(combined["timestamp"].iloc[0]),
             end=str(combined["timestamp"].iloc[-1]),
             size_bytes=out_path.stat().st_size,
+            warnings=warnings,
         )
 
     def _download_year(self, symbol: str, year: int) -> pd.DataFrame | None:

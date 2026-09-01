@@ -22,6 +22,7 @@ import asyncio
 import json
 import lzma
 import logging
+import os
 import struct
 import sys
 from dataclasses import dataclass
@@ -867,8 +868,19 @@ def _load_source_meta_index() -> dict:
 
 
 def _write_source_meta_index(index: dict) -> None:
+    """Persist the source-meta index atomically.
+
+    The catalog reads source_meta.json on every scan; writing it in place
+    means a crash mid-write truncates metadata for the whole catalog.
+    """
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    SOURCE_META_PATH.write_text(json.dumps(index, indent=2, sort_keys=True))
+    temp_path = SOURCE_META_PATH.with_name(f"{SOURCE_META_PATH.name}.tmp-{os.getpid()}")
+    try:
+        temp_path.write_text(json.dumps(index, indent=2, sort_keys=True))
+        os.replace(temp_path, SOURCE_META_PATH)
+    except BaseException:
+        temp_path.unlink(missing_ok=True)
+        raise
 
 
 def _resolve_requested_start(

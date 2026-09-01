@@ -1186,7 +1186,10 @@ class JForexDownloader(Downloader):
                 size_bytes += bid_out_path.stat().st_size
             if ask_out_path.exists():
                 size_bytes += ask_out_path.stat().st_size
-            output_path = out_path.parent
+            # DownloadResult.path must be a file, never a directory: every
+            # consumer reads it as the stored parquet (DV-B9). The bid side is
+            # the canonical stored file for merged downloads.
+            output_path = bid_out_path
         else:
             combined = self._merge_and_store_single_file(out_path, result_df)
             size_bytes = out_path.stat().st_size
