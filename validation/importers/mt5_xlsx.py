@@ -13,6 +13,7 @@ import pandas as pd
 
 from shared.models import Trade, TradeExit
 from validation.importers._numbers import detect_decimal_comma, parse_locale_number
+from validation.importers._pairing import closed_positions, group_position_fills
 from validation.importers.base import BaseImporter
 from validation.reference import ValidationReference
 
@@ -469,59 +470,72 @@ class MT5XLSXImporter(BaseImporter):
                 "Trades table is missing required columns (Zeit / Typ / Richtung)."
             )
 
-        trades: list[Trade] = []
-        i = 0
-        trade_id_counter = 1
+        # DV-B43: group all fills per position id (the Trade column; the
+        # Auftrag order id differs per fill), then reconstruct one Trade per
+        # position with one TradeExit per out row.  The positional walker
+        # previously dropped every fill after a second consecutive "in".
+        #
+        # The Trade column numbers *deals*, not positions, so a position is
+        # identified by its consecutive deal ids (order of in/out rows) when
+        # the report has no dedicated position id: the k-th "in" opens
+        # position k and subsequent "out" rows close it.  Grouping by raw
+        # Trade id would strand every entry (in) with no exit.
+        col_position_id = col_trade_id
 
         rows_list = trades_df.to_dict(orient="records")
-        n = len(rows_list)
 
-        while i < n:
-            row = rows_list[i]
-            typ = MT5XLSXImporter._get_str(row, col_typ, "").lower()
-            direction = MT5XLSXImporter._get_str(row, col_direction, "").lower()
+        def _row_direction(row: dict[str, Any]) -> str:
+            return MT5XLSXImporter._get_str(row, col_direction, "").lower()
 
-            # Skip balance / non-trade rows
-            if typ == "balance" or direction not in ("in", "out"):
-                i += 1
-                continue
+        deal_counter = 0
+        open_entries = 0
+        position_of_deal: dict[str, str] = {}
 
-            # We expect an "in" row here
-            if direction != "in":
-                i += 1
-                continue
+        def _row_position_id(row: dict[str, Any]) -> str:
+            nonlocal deal_counter, open_entries
+            if col_position_id is None:
+                return ""
+            deal_id = _deal_id(row)
+            if deal_id in position_of_deal:
+                return position_of_deal[deal_id]
+            deal_counter += 1
+            direction = _row_direction(row)
+            if direction == "in":
+                open_entries += 1
+                position_of_deal[deal_id] = f"position-{open_entries}"
+            else:
+                position_of_deal[deal_id] = f"position-{open_entries or 1}"
+            return position_of_deal[deal_id]
 
-            entry_row = row
-            j = i + 1
-            exit_row = None
-            while j < n:
-                nxt = rows_list[j]
-                nxt_typ = MT5XLSXImporter._get_str(nxt, col_typ, "").lower()
-                nxt_dir = MT5XLSXImporter._get_str(nxt, col_direction, "").lower()
-                if nxt_typ == "balance":
-                    j += 1
-                    continue
-                if nxt_dir == "out":
-                    exit_row = nxt
-                    break
-                if nxt_dir == "in":
-                    # Unexpected next entry without exit — skip current entry
-                    break
-                j += 1
+        def _deal_id(row: dict[str, Any]) -> str:
+            if col_position_id is None:
+                return ""
+            value = row.get(col_position_id)
+            if value is None or (isinstance(value, float) and pd.isna(value)):
+                return ""
+            return str(value).strip()
 
-            if exit_row is None:
-                i = j if j > i else i + 1
-                continue
+        position_fills = group_position_fills(
+            rows_list,
+            position_id_of=_row_position_id,
+            direction_of=_row_direction,
+            is_trade_row=lambda row: MT5XLSXImporter._get_str(row, col_typ, "").lower() != "balance",
+        )
 
-            # Build Trade
+        trades: list[Trade] = []
+        trade_id_counter = 1
+
+        for fills in closed_positions(position_fills):
+            entry_row = fills.entries[0]
+            exit_rows = fills.exits
+
             symbol = MT5XLSXImporter._get_str(entry_row, col_symbol, "")
             entry_time_raw = MT5XLSXImporter._get_str(entry_row, col_time, "")
-            exit_time_raw = MT5XLSXImporter._get_str(exit_row, col_time, "")
 
             entry_price = MT5XLSXImporter._to_float(entry_row.get(col_price))
-            exit_price = MT5XLSXImporter._to_float(exit_row.get(col_price))
-            volume = MT5XLSXImporter._to_float(entry_row.get(col_volume))
-            pnl = MT5XLSXImporter._to_float(exit_row.get(col_profit))
+            entry_volume = sum(
+                (MT5XLSXImporter._to_float(r.get(col_volume)) or 0.0) for r in fills.entries
+            )
 
             typ_entry = MT5XLSXImporter._get_str(entry_row, col_typ, "").lower()
             # DV-B42: only plain buy/sell entries carry a derivable direction.
@@ -538,18 +552,45 @@ class MT5XLSXImporter(BaseImporter):
                     "derive trade direction."
                 )
 
-            commission = MT5XLSXImporter._to_float(exit_row.get(col_commission), default=0.0)
-            swap = MT5XLSXImporter._to_float(exit_row.get(col_swap), default=0.0)
+            # DV-B43: commission/swap accumulate over every fill of the
+            # position (entry fills included), not just the last exit row.
+            commission = sum(
+                (MT5XLSXImporter._to_float(r.get(col_commission), default=0.0) or 0.0)
+                for r in fills.entries + exit_rows
+            )
+            swap = sum(
+                (MT5XLSXImporter._to_float(r.get(col_swap), default=0.0) or 0.0)
+                for r in fills.entries + exit_rows
+            )
             fees = commission + swap
 
-            # Exit reason heuristics
-            exit_comment = MT5XLSXImporter._get_str(exit_row, col_comment, "")
-            exit_reason = MT5XLSXImporter._infer_exit_reason(exit_comment)
+            exits: list[TradeExit] = []
+            for exit_row in exit_rows:
+                exit_time_raw = MT5XLSXImporter._get_str(exit_row, col_time, "")
+                exit_price = MT5XLSXImporter._to_float(exit_row.get(col_price))
+                exit_volume = MT5XLSXImporter._to_float(exit_row.get(col_volume))
+                exit_pnl = MT5XLSXImporter._to_float(exit_row.get(col_profit))
+
+                exit_comment = MT5XLSXImporter._get_str(exit_row, col_comment, "")
+                exit_reason = MT5XLSXImporter._infer_exit_reason(exit_comment)
+                exits.append(
+                    TradeExit(
+                        time=MT5XLSXImporter._to_iso(exit_time_raw, source_timezone),
+                        price=exit_price if exit_price is not None else 0.0,
+                        quantity=exit_volume if exit_volume is not None else 0.0,
+                        pnl=exit_pnl,
+                        reason=exit_reason,
+                    )
+                )
+            last_exit_comment = MT5XLSXImporter._get_str(exit_rows[-1], col_comment, "")
+            exit_reason = MT5XLSXImporter._infer_exit_reason(last_exit_comment)
+
+            pnl = sum((e.pnl or 0.0) for e in exits)
 
             entry_comment = MT5XLSXImporter._get_str(entry_row, col_comment, "")
             tags = [entry_comment] if entry_comment else []
 
-            # SL/TP lookup via order id
+            # SL/TP lookup via the entry fill's order id
             order_id = entry_row.get(col_order_id) if col_order_id else None
             sl = tp = None
             if order_id is not None and pd.notna(order_id):
@@ -557,29 +598,21 @@ class MT5XLSXImporter(BaseImporter):
                 sl = mapped.get("sl")
                 tp = mapped.get("tp")
 
-            exit_obj = TradeExit(
-                time=MT5XLSXImporter._to_iso(exit_time_raw, source_timezone),
-                price=exit_price,
-                quantity=volume if volume is not None else 0.0,
-                pnl=pnl,
-                fees=fees if fees != 0.0 else None,
-                reason=exit_reason,
-            )
-
             trade = Trade(
                 id=trade_id_counter,
                 symbol=symbol,
                 direction=direction_str,
                 entry_time=MT5XLSXImporter._to_iso(entry_time_raw, source_timezone),
                 entry_price=entry_price if entry_price is not None else 0.0,
-                quantity=volume if volume is not None else 0.0,
-                exits=[exit_obj],
-                pnl=pnl if pnl is not None else 0.0,
+                quantity=entry_volume,
+                exits=exits,
+                pnl=pnl,
                 fees=fees if fees != 0.0 else None,
-                net_pnl=(pnl - fees) if (pnl is not None and fees is not None) else None,
+                net_pnl=pnl - fees,
                 exit_reason=exit_reason,
                 tags=tags,
                 meta={
+                    "position_id": fills.position_id,
                     "order_id": order_id,
                     "stop_loss": sl,
                     "take_profit": tp,
@@ -589,7 +622,6 @@ class MT5XLSXImporter(BaseImporter):
             )
             trades.append(trade)
             trade_id_counter += 1
-            i = j + 1
 
         return trades
 

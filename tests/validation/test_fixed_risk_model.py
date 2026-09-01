@@ -186,13 +186,13 @@ def test_lot_size_zero_disables_rounding() -> None:
 
 
 def test_min_position_size_clamping_zero() -> None:
+    """DV-B48: a size below min_position_size fails closed (raises)."""
     config = FixedRiskConfig(risk_amount=100.0, min_position_size=50.0)
     model = FixedRiskModel(config)
-    # distance = 10 -> size = 10, below min 50 -> clamped to 0
+    # distance = 10 -> size = 10, below min 50 -> raises instead of 0
     inp = _make_input(entry_price=100.0, stop_loss=90.0)
-    result = model.size(inp)
-    assert result.profiles[0].position_size == 0.0
-    assert result.total_risk_amount == 0.0
+    with pytest.raises(ValueError, match="minimum position size"):
+        model.size(inp)
 
 
 def test_min_position_size_not_clamped_when_above() -> None:
@@ -364,3 +364,28 @@ def test_config_defaults() -> None:
     assert config.max_position_size is None
     assert config.round_lots is True
     assert config.lot_size == 1.0
+
+
+# ─── Min-size fail-closed (DV-B48) ─────────────────────────────────────────
+
+
+def test_sub_minimum_size_raises_instead_of_silent_zero() -> None:
+    """DV-B48: a computed size below min_position_size must raise, not zero."""
+    config = FixedRiskConfig(risk_amount=100.0, min_position_size=50.0)
+    model = FixedRiskModel(config)
+    # distance = 10 -> raw size 10 < min 50
+    inp = _make_input(entry_price=100.0, stop_loss=90.0)
+    with pytest.raises(ValueError, match="minimum position size"):
+        model.size(inp)
+
+
+def test_lot_rounded_to_zero_below_minimum_raises() -> None:
+    """Lot rounding must not silently produce a zero-size profile."""
+    # raw = 100/3 ≈ 33.3 -> floored to a multiple of lot 100 -> 0 < min 1
+    config = FixedRiskConfig(
+        risk_amount=100.0, round_lots=True, lot_size=100.0, min_position_size=1.0
+    )
+    model = FixedRiskModel(config)
+    inp = _make_input(entry_price=100.0, stop_loss=97.0)
+    with pytest.raises(ValueError, match="minimum position size"):
+        model.size(inp)

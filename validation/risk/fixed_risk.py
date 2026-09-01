@@ -90,7 +90,13 @@ class FixedRiskModel:
             )
 
         if position_size < self.config.min_position_size:
-            position_size = 0.0
+            # DV-B48: fail closed.  Silently flooring to 0 produced a
+            # zero-size profile that trivially "matched" in the risk
+            # comparison instead of surfacing the undersized position.
+            raise ValueError(
+                f"computed position size {position_size} is below the "
+                f"minimum position size {self.config.min_position_size}"
+            )
 
         max_size = self.config.max_position_size
         if max_size is not None and position_size > max_size:
