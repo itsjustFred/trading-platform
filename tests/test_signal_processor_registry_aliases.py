@@ -61,11 +61,14 @@ def test_rocketfuel_deployment_id_maps_to_longonly_variant() -> None:
 
 def test_registry_returns_expected_processor_classes() -> None:
     assert isinstance(get_signal_processor("ramjet", {}), RamJetSignalProcessor)
-    assert isinstance(get_signal_processor("rocketfuel_longsonly", {}), RocketFuelSignalProcessor)
-    assert isinstance(
-        get_signal_processor("rocketfuel_longandshort", {}),
-        RocketFuelSignalProcessor,
-    )
+    long_only = get_signal_processor("rocketfuel_longsonly", {})
+    long_short = get_signal_processor("rocketfuel_longandshort", {})
+    assert isinstance(long_only, RocketFuelSignalProcessor)
+    assert isinstance(long_short, RocketFuelSignalProcessor)
+    # Each option id resolves to its distinct intended variant, not just to the
+    # shared RocketFuel class.
+    assert long_only.variant == "longsonly"
+    assert long_short.variant == "longandshort"
     assert isinstance(get_signal_processor("nitro", {}), NitroSignalProcessor)
 
 
@@ -76,18 +79,29 @@ def test_nitro_uses_its_own_config_file() -> None:
     assert path.exists(), "nitro must ship its own config.yaml"
 
 
+def _bot_section(bot_dir: str) -> dict:
+    payload = yaml.safe_load(
+        get_signal_processor_config_path(bot_dir).read_text(encoding="utf-8")
+    )
+    return next(iter(payload.values()))
+
+
 def test_nitro_config_is_independent_from_ramjet() -> None:
     """Each bot reads only its own config file, never the other bot's.
 
-    The bots are allowed to diverge — assert each file's own documented value,
-    not equality between the bots (equal values today are coincidence).
+    The processors are checked against their OWN file's values, so the bots may
+    diverge freely; only the file->processor wiring is pinned here.
     """
     ramjet = get_signal_processor("ramjet", {})
     nitro = get_signal_processor("nitro", {})
     assert isinstance(ramjet, RamJetSignalProcessor)
     assert isinstance(nitro, NitroSignalProcessor)
-    assert ramjet.config.get("sl_multiplier") == 2.0  # ramjet/config.yaml
-    assert nitro.config.get("sl_multiplier") == 2.0  # nitro/config.yaml
+    ramjet_section = _bot_section("ramjet")
+    nitro_section = _bot_section("nitro")
+    assert ramjet.config.get("sl_multiplier") == ramjet_section["sl_multiplier"]
+    assert nitro.config.get("sl_multiplier") == nitro_section["sl_multiplier"]
+    assert ramjet.config.get("atr_period") == ramjet_section["atr_period"]
+    assert nitro.config.get("atr_period") == nitro_section["atr_period"]
 
 
 def test_nitro_merges_requested_config_over_file_defaults() -> None:
