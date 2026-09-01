@@ -37,6 +37,7 @@ import { StatCard } from "../components/StatCard";
 import { TradeTable, type TradeTableRow } from "../components/TradeTable";
 import { useToast } from "../components/ToastProvider";
 import { formatPValue, pValueColor } from "../utils/stats";
+import { psrTone } from "../lib/statFormat";
 
 type GroupBy = "component" | "strategy" | "symbol" | "timeframe";
 
@@ -66,7 +67,9 @@ function toFiniteNumber(value: unknown): number | null {
 }
 
 function filterUnique(values: string[]): string[] {
-  return [...new Set(values.filter((value) => value.trim()))].sort((a, b) => a.localeCompare(b));
+  return [...new Set(values.filter((value) => value.trim()))].sort((a, b) =>
+    a.localeCompare(b),
+  );
 }
 
 function resolveChartLocale(): string {
@@ -90,7 +93,9 @@ export function PortfolioDetailPage() {
   const { showToast } = useToast();
 
   const [detail, setDetail] = useState<PortfolioDetail | null>(null);
-  const [contributions, setContributions] = useState<PortfolioContribution[]>([]);
+  const [contributions, setContributions] = useState<PortfolioContribution[]>(
+    [],
+  );
   const [trades, setTrades] = useState<PortfolioTrade[]>([]);
   const [loading, setLoading] = useState(true);
   const [deleting, setDeleting] = useState(false);
@@ -124,7 +129,8 @@ export function PortfolioDetailPage() {
       })
       .catch((error: unknown) => {
         if (!active) return;
-        const message = error instanceof Error ? error.message : "Failed to load portfolio";
+        const message =
+          error instanceof Error ? error.message : "Failed to load portfolio";
         showToast(message, "error");
       })
       .finally(() => {
@@ -145,7 +151,10 @@ export function PortfolioDetailPage() {
       })
       .catch((error: unknown) => {
         if (!active) return;
-        const message = error instanceof Error ? error.message : "Failed to load contributions";
+        const message =
+          error instanceof Error
+            ? error.message
+            : "Failed to load contributions";
         showToast(message, "error");
       });
     return () => {
@@ -167,7 +176,10 @@ export function PortfolioDetailPage() {
       })
       .catch((error: unknown) => {
         if (!active) return;
-        const message = error instanceof Error ? error.message : "Failed to load filtered trades";
+        const message =
+          error instanceof Error
+            ? error.message
+            : "Failed to load filtered trades";
         showToast(message, "error");
       });
     return () => {
@@ -193,7 +205,9 @@ export function PortfolioDetailPage() {
     () =>
       filterUnique([
         ...components.map((item) => String(item.strategy_name || "")),
-        ...trades.map((item) => String(item.strategy_name || item.strategy || "")),
+        ...trades.map((item) =>
+          String(item.strategy_name || item.strategy || ""),
+        ),
       ]),
     [components, trades],
   );
@@ -220,10 +234,13 @@ export function PortfolioDetailPage() {
     const timeframeNeedle = timeframeFilter.trim().toLowerCase();
     return contributions
       .filter((item) => {
-        const strategyName = String(item.strategy_name || item.group_value || "").toLowerCase();
+        const strategyName = String(
+          item.strategy_name || item.group_value || "",
+        ).toLowerCase();
         const symbol = String(item.symbol || "").toUpperCase();
         const timeframe = String(item.timeframe || "").toLowerCase();
-        if (strategyNeedle && !strategyName.includes(strategyNeedle)) return false;
+        if (strategyNeedle && !strategyName.includes(strategyNeedle))
+          return false;
         if (symbolNeedle && symbol !== symbolNeedle) return false;
         if (timeframeNeedle && timeframe !== timeframeNeedle) return false;
         return true;
@@ -234,7 +251,9 @@ export function PortfolioDetailPage() {
         const leftNum = toFiniteNumber(left);
         const rightNum = toFiniteNumber(right);
         if (leftNum != null && rightNum != null) {
-          return contributionSort.direction === "asc" ? leftNum - rightNum : rightNum - leftNum;
+          return contributionSort.direction === "asc"
+            ? leftNum - rightNum
+            : rightNum - leftNum;
         }
         const leftText = String(left || "");
         const rightText = String(right || "");
@@ -242,7 +261,13 @@ export function PortfolioDetailPage() {
           ? leftText.localeCompare(rightText)
           : rightText.localeCompare(leftText);
       });
-  }, [contributions, strategyFilter, symbolFilter, timeframeFilter, contributionSort]);
+  }, [
+    contributions,
+    strategyFilter,
+    symbolFilter,
+    timeframeFilter,
+    contributionSort,
+  ]);
 
   const chartData = useMemo(
     () =>
@@ -258,11 +283,19 @@ export function PortfolioDetailPage() {
   const tradeRows = useMemo<TradeTableRow[]>(
     () =>
       trades.map((trade, index) => {
-        const timestamp = String(trade.time || trade.exit_time_iso || trade.entry_time_iso || "");
+        const timestamp = String(
+          trade.time || trade.exit_time_iso || trade.entry_time_iso || "",
+        );
         const parsed = Date.parse(timestamp);
-        const date = Number.isFinite(parsed) ? new Date(parsed).toISOString().slice(0, 10) : "";
-        const time = Number.isFinite(parsed) ? new Date(parsed).toISOString().slice(11, 19) : timestamp;
-        const strategyName = String(trade.strategy_name || trade.strategy || "").trim();
+        const date = Number.isFinite(parsed)
+          ? new Date(parsed).toISOString().slice(0, 10)
+          : "";
+        const time = Number.isFinite(parsed)
+          ? new Date(parsed).toISOString().slice(11, 19)
+          : timestamp;
+        const strategyName = String(
+          trade.strategy_name || trade.strategy || "",
+        ).trim();
         const symbol = String(trade.symbol || "").toUpperCase();
         const timeframe = String(trade.timeframe || "").trim();
         const strategyLabel =
@@ -271,13 +304,18 @@ export function PortfolioDetailPage() {
             ? `${strategyName} (${[symbol, timeframe].filter(Boolean).join(", ")})`
             : strategyName);
         return {
-          id: String(trade.id || `${trade.symbol || "trade"}-${trade.time || index}-${index}`),
+          id: String(
+            trade.id ||
+              `${trade.symbol || "trade"}-${trade.time || index}-${index}`,
+          ),
           date,
           time,
           symbol,
           strategy: strategyLabel,
           side: String(trade.direction || "LONG"),
-          size: toFiniteNumber(trade.size ?? trade.position_size ?? trade.quantity),
+          size: toFiniteNumber(
+            trade.size ?? trade.position_size ?? trade.quantity,
+          ),
           entryPrice: toFiniteNumber(trade.entry_price),
           exitPrice: toFiniteNumber(trade.exit_price),
           pnl: toFiniteNumber(trade.pnl),
@@ -298,7 +336,8 @@ export function PortfolioDetailPage() {
       showToast("Portfolio deleted.", "success");
       navigate("/portfolios", { replace: true });
     } catch (error: unknown) {
-      const message = error instanceof Error ? error.message : "Failed to delete portfolio";
+      const message =
+        error instanceof Error ? error.message : "Failed to delete portfolio";
       showToast(message, "error");
       setDeleting(false);
     }
@@ -314,7 +353,8 @@ export function PortfolioDetailPage() {
       setDetail(refreshed);
       setShowRenameModal(false);
     } catch (error: unknown) {
-      const message = error instanceof Error ? error.message : "Failed to rename portfolio";
+      const message =
+        error instanceof Error ? error.message : "Failed to rename portfolio";
       setRenameError(message);
     } finally {
       setSavingRename(false);
@@ -345,7 +385,14 @@ export function PortfolioDetailPage() {
   }
 
   return (
-    <div style={{ padding: "24px", display: "flex", flexDirection: "column", gap: "20px" }}>
+    <div
+      style={{
+        padding: "24px",
+        display: "flex",
+        flexDirection: "column",
+        gap: "20px",
+      }}
+    >
       <div
         style={{
           background: "var(--color-surface)",
@@ -365,6 +412,7 @@ export function PortfolioDetailPage() {
         >
           <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
             <button
+              type="button"
               onClick={() => navigate(-1)}
               style={{
                 background: "none",
@@ -376,8 +424,17 @@ export function PortfolioDetailPage() {
               <ArrowLeft size={20} />
             </button>
             <div>
-              <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap" }}>
-                <h1 style={{ fontSize: "1.5rem", fontWeight: 600 }}>{detail.name || id}</h1>
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "10px",
+                  flexWrap: "wrap",
+                }}
+              >
+                <h1 style={{ fontSize: "1.5rem", fontWeight: 600 }}>
+                  {detail.name || id}
+                </h1>
                 <button
                   type="button"
                   onClick={() => setShowRenameModal(true)}
@@ -398,18 +455,19 @@ export function PortfolioDetailPage() {
                   <PencilLine size={14} />
                 </button>
               </div>
-                <div
-                  style={{
-                    color: "var(--color-text-muted)",
-                    fontSize: "0.82rem",
-                    marginTop: "4px",
-                  }}
-                >
-                  {components.length} components • ${(detail.account_capital || 100000).toLocaleString()} capital •{" "}
-                  {trades.length} trades
-                </div>
+              <div
+                style={{
+                  color: "var(--color-text-muted)",
+                  fontSize: "0.82rem",
+                  marginTop: "4px",
+                }}
+              >
+                {components.length} components • $
+                {(detail.account_capital || 100000).toLocaleString()} capital •{" "}
+                {trades.length} trades
               </div>
             </div>
+          </div>
           <button
             type="button"
             onClick={() => void handleDelete()}
@@ -492,7 +550,9 @@ export function PortfolioDetailPage() {
           padding: "20px",
         }}
       >
-        <h2 style={{ fontSize: "1rem", fontWeight: 600, marginBottom: "16px" }}>Combined Equity Curve</h2>
+        <h2 style={{ fontSize: "1rem", fontWeight: 600, marginBottom: "16px" }}>
+          Combined Equity Curve
+        </h2>
         {equity.length > 1 ? (
           <PortfolioEquityChart data={equity} />
         ) : (
@@ -528,17 +588,23 @@ export function PortfolioDetailPage() {
             marginBottom: "14px",
           }}
         >
-          <h2 style={{ fontSize: "1rem", fontWeight: 600 }}>Contribution Analysis</h2>
+          <h2 style={{ fontSize: "1rem", fontWeight: 600 }}>
+            Contribution Analysis
+          </h2>
           <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
-            {(["component", "strategy", "symbol", "timeframe"] as GroupBy[]).map((option) => (
+            {(
+              ["component", "strategy", "symbol", "timeframe"] as GroupBy[]
+            ).map((option) => (
               <button
                 key={option}
                 type="button"
                 onClick={() => setGroupBy(option)}
                 style={{
                   border: "1px solid var(--color-border)",
-                  background: option === groupBy ? "rgba(88,166,255,0.2)" : "transparent",
-                  color: option === groupBy ? "#9ecbff" : "var(--color-text-muted)",
+                  background:
+                    option === groupBy ? "rgba(88,166,255,0.2)" : "transparent",
+                  color:
+                    option === groupBy ? "#9ecbff" : "var(--color-text-muted)",
                   borderRadius: "999px",
                   padding: "5px 10px",
                   fontSize: "0.72rem",
@@ -552,7 +618,14 @@ export function PortfolioDetailPage() {
           </div>
         </div>
 
-        <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", marginBottom: "12px" }}>
+        <div
+          style={{
+            display: "flex",
+            gap: "8px",
+            flexWrap: "wrap",
+            marginBottom: "12px",
+          }}
+        >
           <select
             value={strategyFilter}
             onChange={(event) => setStrategyFilter(event.target.value)}
@@ -565,7 +638,11 @@ export function PortfolioDetailPage() {
               </option>
             ))}
           </select>
-          <select value={symbolFilter} onChange={(event) => setSymbolFilter(event.target.value)} style={filterSelectStyle}>
+          <select
+            value={symbolFilter}
+            onChange={(event) => setSymbolFilter(event.target.value)}
+            style={filterSelectStyle}
+          >
             <option value="">All Symbols</option>
             {symbolOptions.map((option) => (
               <option key={option} value={option}>
@@ -597,9 +674,17 @@ export function PortfolioDetailPage() {
         </div>
 
         <div style={{ height: "310px", width: "100%" }}>
-          <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={1}>
+          <ResponsiveContainer
+            width="100%"
+            height="100%"
+            minWidth={0}
+            minHeight={1}
+          >
             <BarChart data={chartData}>
-              <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.06)" />
+              <CartesianGrid
+                strokeDasharray="3 3"
+                stroke="rgba(255,255,255,0.06)"
+              />
               <XAxis dataKey="name" stroke="#8b949e" tick={{ fontSize: 12 }} />
               <YAxis stroke="#8b949e" tick={{ fontSize: 12 }} />
               <RechartsTooltip
@@ -610,9 +695,24 @@ export function PortfolioDetailPage() {
                 }}
               />
               <Legend />
-              <Bar dataKey="pnl" name="PnL" fill="#58a6ff" radius={[4, 4, 0, 0]} />
-              <Bar dataKey="return" name="Return" fill="#3fb950" radius={[4, 4, 0, 0]} />
-              <Bar dataKey="drawdown" name="Drawdown" fill="#f85149" radius={[4, 4, 0, 0]} />
+              <Bar
+                dataKey="pnl"
+                name="PnL"
+                fill="#58a6ff"
+                radius={[4, 4, 0, 0]}
+              />
+              <Bar
+                dataKey="return"
+                name="Return"
+                fill="#3fb950"
+                radius={[4, 4, 0, 0]}
+              />
+              <Bar
+                dataKey="drawdown"
+                name="Drawdown"
+                fill="#f85149"
+                radius={[4, 4, 0, 0]}
+              />
             </BarChart>
           </ResponsiveContainer>
         </div>
@@ -636,15 +736,21 @@ export function PortfolioDetailPage() {
             gap: "10px",
           }}
         >
-          <h2 style={{ fontSize: "1rem", fontWeight: 600 }}>Trades ({trades.length})</h2>
-          <div style={{ color: "var(--color-text-muted)", fontSize: "0.76rem" }}>
+          <h2 style={{ fontSize: "1rem", fontWeight: 600 }}>
+            Trades ({trades.length})
+          </h2>
+          <div
+            style={{ color: "var(--color-text-muted)", fontSize: "0.76rem" }}
+          >
             Click trade row to open the trade chart context.
           </div>
         </div>
         <TradeTable
           trades={tradeRows}
           onTradeClick={(row) => {
-            const sourceTrade = trades.find((item) => String(item.id || "") === row.id);
+            const sourceTrade = trades.find(
+              (item) => String(item.id || "") === row.id,
+            );
             const target = sourceTrade ? tradeChartLink(sourceTrade) : null;
             if (!target) {
               showToast("Trade has no linked backtest chart.", "error");
@@ -660,7 +766,10 @@ export function PortfolioDetailPage() {
         title="Rename Portfolio"
         label="Portfolio name"
         value={detail.name || id || ""}
-        helperText={renameError || "This updates the portfolio display name without changing its ID."}
+        helperText={
+          renameError ||
+          "This updates the portfolio display name without changing its ID."
+        }
         saving={savingRename}
         onClose={() => {
           setShowRenameModal(false);
@@ -672,17 +781,28 @@ export function PortfolioDetailPage() {
   );
 }
 
+/** Arrow suffix for the active sort column. */
+function sortArrow(
+  sort: { key: keyof PortfolioContribution; direction: "asc" | "desc" },
+  key: keyof PortfolioContribution,
+): string {
+  if (sort.key !== key) {
+    return "";
+  }
+  return sort.direction === "asc" ? " ↑" : " ↓";
+}
+
 function ContributionTable({
   rows,
   groupBy,
   sort,
   onSort,
-}: {
+}: Readonly<{
   rows: PortfolioContribution[];
   groupBy: GroupBy;
   sort: { key: keyof PortfolioContribution; direction: "asc" | "desc" };
   onSort: (key: keyof PortfolioContribution) => void;
-}) {
+}>) {
   const groupLabel: Record<GroupBy, string> = {
     component: "Component",
     strategy: "Strategy",
@@ -707,24 +827,54 @@ function ContributionTable({
       }}
     >
       {label}
-      {sort.key === key ? (sort.direction === "asc" ? " ↑" : " ↓") : ""}
+      {sortArrow(sort, key)}
     </button>
   );
 
   return (
-    <div style={{ overflowX: "auto", border: "1px solid var(--color-border)", borderRadius: "8px" }}>
-      <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.78rem" }}>
+    <div
+      style={{
+        overflowX: "auto",
+        border: "1px solid var(--color-border)",
+        borderRadius: "8px",
+      }}
+    >
+      <table
+        style={{
+          width: "100%",
+          borderCollapse: "collapse",
+          fontSize: "0.78rem",
+        }}
+      >
         <thead style={{ background: "var(--color-surface2)" }}>
           <tr>
-            <th style={thStyle}>{headerButton(groupLabel[groupBy], "group_value")}</th>
-            <th style={thStyle}>{headerButton("Return", "return_contribution")}</th>
-            <th style={thStyle}>{headerButton("Drawdown", "drawdown_contribution")}</th>
-            <th style={thStyle}>{headerButton("Sharpe (higher = better)", "sharpe_ratio")}</th>
-            <th style={thStyle}>{headerButton("PSR (higher = better)", "psr")}</th>
-            <th style={thStyle}>{headerButton("p-Value (lower = better)", "p_value")}</th>
-            <th style={thStyle}>{headerButton("Max DD (lower = better)", "max_drawdown")}</th>
-            <th style={thStyle}>{headerButton("CAGR (higher = better)", "cagr")}</th>
-            <th style={thStyle}>{headerButton("Win Rate (higher = better)", "win_rate")}</th>
+            <th style={thStyle}>
+              {headerButton(groupLabel[groupBy], "group_value")}
+            </th>
+            <th style={thStyle}>
+              {headerButton("Return", "return_contribution")}
+            </th>
+            <th style={thStyle}>
+              {headerButton("Drawdown", "drawdown_contribution")}
+            </th>
+            <th style={thStyle}>
+              {headerButton("Sharpe (higher = better)", "sharpe_ratio")}
+            </th>
+            <th style={thStyle}>
+              {headerButton("PSR (higher = better)", "psr")}
+            </th>
+            <th style={thStyle}>
+              {headerButton("p-Value (lower = better)", "p_value")}
+            </th>
+            <th style={thStyle}>
+              {headerButton("Max DD (lower = better)", "max_drawdown")}
+            </th>
+            <th style={thStyle}>
+              {headerButton("CAGR (higher = better)", "cagr")}
+            </th>
+            <th style={thStyle}>
+              {headerButton("Win Rate (higher = better)", "win_rate")}
+            </th>
             <th style={thStyle}>{headerButton("Trades", "trade_count")}</th>
             <th style={thStyle}>{headerButton("PnL", "pnl_total")}</th>
           </tr>
@@ -732,28 +882,62 @@ function ContributionTable({
         <tbody>
           {rows.map((row, index) => (
             <tr key={`${row.group_value}-${index}`}>
-              <td style={tdStyle}>{row.group_value || row.strategy_name || "—"}</td>
-              <td style={tdStyle}>{(row.return_contribution * 100).toFixed(2)}%</td>
-              <td style={{ ...tdStyle, color: "#f85149" }}>{(row.drawdown_contribution * 100).toFixed(2)}%</td>
-              <td style={tdStyle}>{Number(row.sharpe_ratio ?? 0).toFixed(3)}</td>
-              <td style={tdStyle}>{row.psr != null ? `${(Number(row.psr) * 100).toFixed(1)}%` : "—"}</td>
-              <td style={tdStyle}>{row.p_value != null ? Number(row.p_value).toFixed(4) : "—"}</td>
-              <td style={{ ...tdStyle, color: "#f85149" }}>
-                {row.max_drawdown != null ? `-${(Number(row.max_drawdown) * 100).toFixed(2)}%` : "—"}
+              <td style={tdStyle}>
+                {row.group_value || row.strategy_name || "—"}
               </td>
-              <td style={{ ...tdStyle, color: Number(row.cagr || 0) >= 0 ? "#3fb950" : "#f85149" }}>
-                {row.cagr != null ? `${(Number(row.cagr) * 100).toFixed(2)}%` : "—"}
+              <td style={tdStyle}>
+                {(row.return_contribution * 100).toFixed(2)}%
+              </td>
+              <td style={{ ...tdStyle, color: "#f85149" }}>
+                {(row.drawdown_contribution * 100).toFixed(2)}%
+              </td>
+              <td style={tdStyle}>
+                {Number(row.sharpe_ratio ?? 0).toFixed(3)}
+              </td>
+              <td style={tdStyle}>
+                {row.psr != null
+                  ? `${(Number(row.psr) * 100).toFixed(1)}%`
+                  : "—"}
+              </td>
+              <td style={tdStyle}>
+                {row.p_value != null ? Number(row.p_value).toFixed(4) : "—"}
+              </td>
+              <td style={{ ...tdStyle, color: "#f85149" }}>
+                {row.max_drawdown != null
+                  ? `-${(Number(row.max_drawdown) * 100).toFixed(2)}%`
+                  : "—"}
+              </td>
+              <td
+                style={{
+                  ...tdStyle,
+                  color: Number(row.cagr || 0) >= 0 ? "#3fb950" : "#f85149",
+                }}
+              >
+                {row.cagr != null
+                  ? `${(Number(row.cagr) * 100).toFixed(2)}%`
+                  : "—"}
               </td>
               <td style={tdStyle}>{row.win_rate.toFixed(2)}%</td>
               <td style={tdStyle}>{row.trade_count}</td>
-              <td style={{ ...tdStyle, color: row.pnl_total >= 0 ? "#3fb950" : "#f85149" }}>
-                {row.pnl_total >= 0 ? "+" : ""}${Math.abs(row.pnl_total).toLocaleString("en-US", { maximumFractionDigits: 2 })}
+              <td
+                style={{
+                  ...tdStyle,
+                  color: row.pnl_total >= 0 ? "#3fb950" : "#f85149",
+                }}
+              >
+                {row.pnl_total >= 0 ? "+" : ""}$
+                {Math.abs(row.pnl_total).toLocaleString("en-US", {
+                  maximumFractionDigits: 2,
+                })}
               </td>
             </tr>
           ))}
           {rows.length === 0 && (
             <tr>
-              <td colSpan={11} style={{ ...tdStyle, color: "var(--color-text-muted)" }}>
+              <td
+                colSpan={11}
+                style={{ ...tdStyle, color: "var(--color-text-muted)" }}
+              >
                 No contribution rows match current filters.
               </td>
             </tr>
@@ -784,11 +968,7 @@ const filterSelectStyle: React.CSSProperties = {
   padding: "6px 10px",
 };
 
-function PortfolioEquityChart({
-  data,
-}: {
-  data: EquityPoint[];
-}) {
+function PortfolioEquityChart({ data }: Readonly<{ data: EquityPoint[] }>) {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const [tooltip, setTooltip] = useState<ChartTooltip | null>(null);
@@ -827,14 +1007,17 @@ function PortfolioEquityChart({
         time: (new Date(d.time).getTime() / 1000) as Time,
         equity: d.equity,
       }))
-      .filter((item) => Number.isFinite(item.time as number) && Number.isFinite(item.equity));
+      .filter(
+        (item) =>
+          Number.isFinite(item.time as number) && Number.isFinite(item.equity),
+      );
     if (parsed.length < 2) {
       chart.remove();
       chartRef.current = null;
       return;
     }
 
-    const isProfit = parsed[parsed.length - 1].equity >= parsed[0].equity;
+    const isProfit = (parsed.at(-1)?.equity ?? 0) >= (parsed[0]?.equity ?? 0);
     const lineColor = isProfit ? "#3fb950" : "#f85149";
 
     const equitySeries = chart.addSeries(AreaSeries, {
@@ -844,10 +1027,13 @@ function PortfolioEquityChart({
       lineWidth: 2,
       priceFormat: {
         type: "custom",
-        formatter: (p: number) => "$" + p.toLocaleString("en-US", { maximumFractionDigits: 0 }),
+        formatter: (p: number) =>
+          "$" + p.toLocaleString("en-US", { maximumFractionDigits: 0 }),
       },
     });
-    equitySeries.setData(parsed.map((d) => ({ time: d.time, value: d.equity })));
+    equitySeries.setData(
+      parsed.map((d) => ({ time: d.time, value: d.equity })),
+    );
 
     let peak = parsed[0].equity;
     const ddData = parsed.map((d) => {
@@ -867,7 +1053,9 @@ function PortfolioEquityChart({
       },
     });
     ddSeries.setData(ddData);
-    chart.priceScale("dd").applyOptions({ scaleMargins: { top: 0.85, bottom: 0 } });
+    chart
+      .priceScale("dd")
+      .applyOptions({ scaleMargins: { top: 0.85, bottom: 0 } });
 
     chart.subscribeCrosshairMove((param) => {
       if (!param.time || !param.point) {
@@ -892,7 +1080,9 @@ function PortfolioEquityChart({
         if (d.equity > p) p = d.equity;
       }
       const dd = (((eq - p) / p) * 100).toFixed(2);
-      const dateStr = new Date((param.time as number) * 1000).toISOString().slice(0, 10);
+      const dateStr = new Date((param.time as number) * 1000)
+        .toISOString()
+        .slice(0, 10);
       setTooltip({
         x: param.point.x,
         y: param.point.y,
@@ -923,7 +1113,10 @@ function PortfolioEquityChart({
         <div
           style={{
             position: "absolute",
-            left: Math.min(tooltip.x + 16, (containerRef.current?.clientWidth || 800) - 180),
+            left: Math.min(
+              tooltip.x + 16,
+              (containerRef.current?.clientWidth || 800) - 180,
+            ),
             top: Math.max(tooltip.y - 80, 4),
             background: "rgba(22,27,34,0.95)",
             border: "1px solid var(--color-border)",
@@ -942,7 +1135,14 @@ function PortfolioEquityChart({
           </div>
           <div>
             <span style={{ color: "#8b949e" }}>Return: </span>
-            <span style={{ color: parseFloat(tooltip.ret) >= 0 ? "#3fb950" : "#f85149" }}>{tooltip.ret}</span>
+            <span
+              style={{
+                color:
+                  Number.parseFloat(tooltip.ret) >= 0 ? "#3fb950" : "#f85149",
+              }}
+            >
+              {tooltip.ret}
+            </span>
           </div>
           <div>
             <span style={{ color: "#8b949e" }}>Drawdown: </span>

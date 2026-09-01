@@ -1,7 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
 
 import { getSignalProcessors, runBacktestFromSignals } from "../api/client";
-import type { BacktestFromSignalsSource, SignalProcessorOption } from "../api/types";
+import type {
+  BacktestFromSignalsSource,
+  SignalProcessorOption,
+} from "../api/types";
 import { Modal } from "./Modal";
 import { useToast } from "./ToastProvider";
 
@@ -13,7 +16,7 @@ interface BacktestFromSignalsModalProps {
 
 function defaultDateRange(): { start: string; end: string } {
   const end = new Date();
-  const start = new Date(end.getTime() - (30 * 24 * 60 * 60 * 1000));
+  const start = new Date(end.getTime() - 30 * 24 * 60 * 60 * 1000);
   return {
     start: start.toISOString().slice(0, 10),
     end: end.toISOString().slice(0, 10),
@@ -48,10 +51,11 @@ export function BacktestFromSignalsModal({
   open,
   onClose,
   onTaskStarted,
-}: BacktestFromSignalsModalProps) {
+}: Readonly<BacktestFromSignalsModalProps>) {
   const { showToast } = useToast();
   const range = useMemo(() => defaultDateRange(), []);
-  const [signalSource, setSignalSource] = useState<BacktestFromSignalsSource>("csv");
+  const [signalSource, setSignalSource] =
+    useState<BacktestFromSignalsSource>("csv");
   const [filepath, setFilepath] = useState("");
   const [accountId, setAccountId] = useState("");
   // Start empty (matches the placeholder option) and let the registry
@@ -113,7 +117,10 @@ export function BacktestFromSignalsModal({
       const response = await runBacktestFromSignals({
         signal_source: signalSource,
         filepath: signalSource === "csv" ? filepath.trim() : undefined,
-        account_id: signalSource === "discord-history" ? accountId.trim() || undefined : undefined,
+        account_id:
+          signalSource === "discord-history"
+            ? accountId.trim() || undefined
+            : undefined,
         signal_processor: signalProcessor || undefined,
         start_date: startDate,
         end_date: endDate,
@@ -125,7 +132,10 @@ export function BacktestFromSignalsModal({
       showToast(`Signal backtest started (task ${taskId}).`, "success");
       onClose();
     } catch (issue: unknown) {
-      const message = issue instanceof Error ? issue.message : "Could not start signal backtest";
+      const message =
+        issue instanceof Error
+          ? issue.message
+          : "Could not start signal backtest";
       showToast(message, "error");
     } finally {
       setRunning(false);
@@ -133,13 +143,23 @@ export function BacktestFromSignalsModal({
   };
 
   return (
-    <Modal open={open} onClose={onClose} title="Backtest from Signals" width="560px">
+    <Modal
+      open={open}
+      onClose={onClose}
+      title="Backtest from Signals"
+      width="560px"
+    >
       <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
         <div>
-          <label style={labelStyle}>Signal Source</label>
+          <label htmlFor="signals-backtest-source" style={labelStyle}>
+            Signal Source
+          </label>
           <select
+            id="signals-backtest-source"
             value={signalSource}
-            onChange={(event) => setSignalSource(event.target.value as BacktestFromSignalsSource)}
+            onChange={(event) =>
+              setSignalSource(event.target.value as BacktestFromSignalsSource)
+            }
             style={inputStyle}
           >
             <option value="csv">CSV File Path</option>
@@ -149,8 +169,11 @@ export function BacktestFromSignalsModal({
 
         {signalSource === "csv" ? (
           <div>
-            <label style={labelStyle}>CSV File Path</label>
+            <label htmlFor="signals-backtest-csv" style={labelStyle}>
+              CSV File Path
+            </label>
             <input
+              id="signals-backtest-csv"
               value={filepath}
               onChange={(event) => setFilepath(event.target.value)}
               placeholder="/home/ubuntu/data/signals/signals_ram_jet.csv"
@@ -159,8 +182,11 @@ export function BacktestFromSignalsModal({
           </div>
         ) : (
           <div>
-            <label style={labelStyle}>Account ID (optional)</label>
+            <label htmlFor="signals-backtest-account" style={labelStyle}>
+              Account ID (optional)
+            </label>
             <input
+              id="signals-backtest-account"
               value={accountId}
               onChange={(event) => setAccountId(event.target.value)}
               placeholder="acct-123"
@@ -170,14 +196,19 @@ export function BacktestFromSignalsModal({
         )}
 
         <div>
-          <label style={labelStyle}>Signal Processor</label>
+          <label htmlFor="signals-backtest-processor" style={labelStyle}>
+            Signal Processor
+          </label>
           <select
+            id="signals-backtest-processor"
             value={signalProcessor}
             onChange={(event) => setSignalProcessor(event.target.value)}
             style={inputStyle}
           >
             <option value="">
-              {loadingProcessors ? "Loading processors..." : "No processor override"}
+              {loadingProcessors
+                ? "Loading processors..."
+                : "No processor override"}
             </option>
             {processors.map((processor) => (
               <option key={processor.id} value={processor.id}>
@@ -188,8 +219,11 @@ export function BacktestFromSignalsModal({
         </div>
 
         <div>
-          <label style={labelStyle}>Replay Timeframe</label>
+          <label htmlFor="signals-backtest-timeframe" style={labelStyle}>
+            Replay Timeframe
+          </label>
           <select
+            id="signals-backtest-timeframe"
             value={timeframe}
             onChange={(event) => setTimeframe(event.target.value)}
             style={inputStyle}
@@ -200,10 +234,19 @@ export function BacktestFromSignalsModal({
           </select>
         </div>
 
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: "10px" }}>
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
+            gap: "10px",
+          }}
+        >
           <div>
-            <label style={labelStyle}>Start Date</label>
+            <label htmlFor="signals-backtest-start" style={labelStyle}>
+              Start Date
+            </label>
             <input
+              id="signals-backtest-start"
               type="date"
               value={startDate}
               onChange={(event) => setStartDate(event.target.value)}
@@ -211,8 +254,11 @@ export function BacktestFromSignalsModal({
             />
           </div>
           <div>
-            <label style={labelStyle}>End Date</label>
+            <label htmlFor="signals-backtest-end" style={labelStyle}>
+              End Date
+            </label>
             <input
+              id="signals-backtest-end"
               type="date"
               value={endDate}
               onChange={(event) => setEndDate(event.target.value)}
@@ -234,7 +280,7 @@ export function BacktestFromSignalsModal({
             background: "var(--color-surface2)",
           }}
         >
-          Auto-download missing market data
+          Auto-download missing market data{" "}
           <input
             type="checkbox"
             checked={autoDownload}
@@ -242,7 +288,14 @@ export function BacktestFromSignalsModal({
           />
         </label>
 
-        <div style={{ display: "flex", justifyContent: "flex-end", gap: "8px", marginTop: "4px" }}>
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "flex-end",
+            gap: "8px",
+            marginTop: "4px",
+          }}
+        >
           <button
             type="button"
             onClick={onClose}
