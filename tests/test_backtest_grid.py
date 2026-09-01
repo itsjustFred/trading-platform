@@ -177,9 +177,9 @@ def test_in_process_uses_resolved_dates_for_daily_equity(monkeypatch, tmp_path):
 
     captured: dict[str, str | None] = {}
 
-    def fake_attach(result, *, start_date=None, end_date=None):
-        captured["start_date"] = start_date
-        captured["end_date"] = end_date
+    def fake_attach(result, *, start=None, end=None):
+        captured["start_date"] = start
+        captured["end_date"] = end
         return result
 
     monkeypatch.setattr(bg, "attach_daily_equity", fake_attach)

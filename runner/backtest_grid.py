@@ -267,12 +267,15 @@ def run_one_backtest_in_process(
     run_id = build_run_id(strategy, symbol, timeframe)
     path = output_path_for(output_dir, run_id)
     started_at = datetime.now(timezone.utc).isoformat()
+    resolved_start, resolved_end = _resolve_dates_for_equity(
+        symbol, timeframe, data_dir, start, end
+    )
     result: dict[str, Any] = {
         "run_id": run_id,
         "symbol": symbol,
         "timeframe": timeframe,
-        "start": start,
-        "end": end,
+        "start": resolved_start,
+        "end": resolved_end,
         "output": str(path),
         "started_at": started_at,
         "status": "pending",
@@ -415,12 +418,15 @@ def run_one_backtest(
     run_id = build_run_id(strategy, symbol, timeframe)
     path = output_path_for(output_dir, run_id)
     started_at = datetime.now(timezone.utc).isoformat()
+    resolved_start, resolved_end = _resolve_dates_for_equity(
+        symbol, timeframe, data_dir, start, end
+    )
     result: dict[str, Any] = {
         "run_id": run_id,
         "symbol": symbol,
         "timeframe": timeframe,
-        "start": start,
-        "end": end,
+        "start": resolved_start,
+        "end": resolved_end,
         "output": str(path),
         "started_at": started_at,
         "status": "pending",
@@ -492,8 +498,17 @@ def run_one_backtest(
     except subprocess.TimeoutExpired:
         result["status"] = "failed"
         result["returncode"] = -1
+        result["error_class"] = "timeout"
         result["finished_at"] = datetime.now(timezone.utc).isoformat()
-        result["error"] = f"timeout after {timeout_seconds}s"
+        result["error"] = f"subprocess cell timed out after {timeout_seconds}s"
+        return result
+    except OSError as exc:
+        result["status"] = "failed"
+        result["returncode"] = -1
+        result["error_class"] = "subprocess_error"
+        result["finished_at"] = datetime.now(timezone.utc).isoformat()
+        result["error"] = f"subprocess could not be launched: {exc}"
+        return result
     return result
 
 
