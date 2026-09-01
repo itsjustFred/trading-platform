@@ -8162,7 +8162,7 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
                     _set_job_status(task_id, "failed")
                     _mark_job_result(task_id, None)
                     _mark_job_error(task_id, error_text)
-            except (subprocess.SubprocessError, OSError, RuntimeError, ValueError) as exc:
+            except Exception as exc:
                 _write_task_log_line(
                     handle,
                     task_id,
@@ -8519,7 +8519,7 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
                 _set_job_status(task_id, "completed")
                 _mark_job_result(task_id, compact_result)
                 _mark_job_error(task_id, None)
-            except (RuntimeError, ValueError, OSError) as exc:
+            except Exception as exc:
                 _write_task_log_line(
                     handle,
                     task_id,
