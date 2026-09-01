@@ -3890,7 +3890,9 @@ def _live_account_stats_payload(account_id: str) -> dict[str, Any]:
     balances, execution_rows = load_live_account_stats_inputs(account_id)
 
     total_pnl_realized, wins, losses = _calculate_realized_live_pnl(execution_rows)
-    total_trades = len(execution_rows)
+    # Win rate denominators are closed round trips (a win or a loss), never raw
+    # execution rows: partial fills would otherwise deflate the ratio.
+    total_trades = wins + losses
     win_rate = (wins / total_trades * 100.0) if total_trades else 0.0
 
     max_drawdown = 0.0
@@ -9768,8 +9770,19 @@ async def get_live_dashboard() -> dict[str, Any]:
         deployment for deployment in deployments if str(deployment.status).upper() == "ACTIVE"
     ]
 
-    for account in accounts:
-        stats = await asyncio.to_thread(_live_account_stats_payload, account.id)
+    # Fetch stats and trades for all accounts concurrently instead of
+    # serially awaiting a full stats+trades scan per account.
+    stats_list = await asyncio.gather(
+        *(
+            asyncio.to_thread(_live_account_stats_payload, account.id)
+            for account in accounts
+        )
+    )
+    trades_payloads = await asyncio.gather(
+        *(_live_trades_payload(account.id) for account in accounts)
+    )
+
+    for account, stats, trades_payload in zip(accounts, stats_list, trades_payloads):
         equity = _safe_float(stats.get("current_equity"), 0.0) or 0.0
         total_equity += equity
         account_payloads.append(
@@ -9781,7 +9794,6 @@ async def get_live_dashboard() -> dict[str, Any]:
                 "total_pnl": stats.get("total_pnl", 0.0),
             }
         )
-        trades_payload = await _live_trades_payload(account.id)
         recent_fills.extend(trades_payload.get("trades", [])[:10])
 
     for deployment in active_deployments:
