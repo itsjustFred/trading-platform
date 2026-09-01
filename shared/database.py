@@ -56,6 +56,9 @@ from shared.models import (
 
 logger = get_logger("database")
 
+# shared.constants loads .env exactly once (see its module docstring); importing
+# DATA_DIR from it here makes that ordering dependency explicit instead of
+# relying on callers importing shared.constants first.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 # .env is loaded exactly once, in shared.constants, before any module reads
 # os.environ for configuration. Do not add load_dotenv() here: it would freeze
