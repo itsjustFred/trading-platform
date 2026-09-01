@@ -13,9 +13,9 @@ destructive — fragments are deleted after a successful merge — so it is guar
   canonical target is never observed half-written.
 
 Usage:
-    python -m scripts.consolidate_parquets              # dry run (default)
-    python -m scripts.consolidate_parquets --yes        # consolidate, with backup
-    python -m scripts.consolidate_parquets --backup-dir # custom snapshot location
+    python -m scripts.consolidate_parquets                          # dry run (default)
+    python -m scripts.consolidate_parquets --yes                    # consolidate, with backup
+    python -m scripts.consolidate_parquets --yes --backup-dir DIR   # custom snapshot location
 """
 
 from __future__ import annotations
