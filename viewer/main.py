@@ -221,7 +221,9 @@ def _kill_process_group(proc: subprocess.Popen) -> None:
     """
     try:
         pgid = os.getpgid(proc.pid)
-    except (ProcessLookupError, PermissionError, OSError):
+    except OSError:
+        # ProcessLookupError (child gone) and PermissionError both derive
+        # from OSError, which covers every killpg precondition failure.
         pgid = None
     if pgid is not None and pgid == proc.pid:
         # Only signal the group when the child actually leads it (it was
@@ -230,7 +232,7 @@ def _kill_process_group(proc: subprocess.Popen) -> None:
         try:
             os.killpg(pgid, signal.SIGKILL)
             return
-        except (ProcessLookupError, PermissionError, OSError):
+        except OSError:
             pass
     try:
         proc.kill()
