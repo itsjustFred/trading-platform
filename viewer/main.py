@@ -6735,26 +6735,20 @@ def _download_missing_ohlcv_data(
     raise ValueError(f"Unsupported auto-download source '{selected_source}' for {normalized_symbol}")
 
 
-def _ensure_backtest_data_availability(
+def _collect_missing_backtest_data(
     *,
-    symbols: list[str],
+    symbol_list: list[str],
     timeframe: str,
-    start: str = "",
-    end: str = "",
-    progress_callback: Callable[[float, str], None] | None = None,
-    log_callback: Callable[[str], None] | None = None,
+    start: str,
+    end: str,
 ) -> list[dict[str, Any]]:
-    normalized_timeframe = normalize_timeframe(timeframe)
-    symbol_list = [str(symbol or "").strip().upper() for symbol in symbols if str(symbol or "").strip()]
-    if not symbol_list or not normalized_timeframe:
-        return []
-
+    """Return the per-symbol missing-range entries for the requested data."""
     availability_index = _build_ohlcv_availability_index()
     missing_items: list[dict[str, Any]] = []
     for symbol in symbol_list:
         availability = _data_check_result(
             symbol=symbol,
-            timeframe=normalized_timeframe,
+            timeframe=timeframe,
             start=start,
             end=end,
             availability_index=availability_index,
@@ -6764,15 +6758,68 @@ def _ensure_backtest_data_availability(
         missing_items.append(
             {
                 "symbol": symbol,
-                "timeframe": normalized_timeframe,
+                "timeframe": timeframe,
                 "missing_range": availability.get("missing_range"),
-                "source": _auto_download_source(symbol, normalized_timeframe),
+                "source": _auto_download_source(symbol, timeframe),
             }
         )
+    return missing_items
 
-    if not missing_items:
-        return []
 
+def _verify_missing_download_coverage(
+    *,
+    symbol: str,
+    timeframe: str,
+    start: str,
+    end: str,
+    log_callback: Callable[[str], None] | None = None,
+) -> None:
+    """Re-check coverage after an auto-download; tolerate only small boundary gaps."""
+    availability_index = _build_ohlcv_availability_index()
+    verification = _data_check_result(
+        symbol=symbol,
+        timeframe=timeframe,
+        start=start,
+        end=end,
+        availability_index=availability_index,
+    )
+    if verification.get("available"):
+        return
+    coverage_entry = availability_index.get((symbol, timeframe))
+    tolerated_gap = False
+    tolerated_reason: str | None = None
+    if isinstance(coverage_entry, dict):
+        tolerated_gap, tolerated_reason = _allow_small_backtest_boundary_gap(
+            requested_start=start,
+            requested_end=end,
+            available_start=str(coverage_entry.get("start") or ""),
+            available_end=str(coverage_entry.get("end") or ""),
+        )
+    if tolerated_gap:
+        if log_callback is not None:
+            available_start = str((coverage_entry or {}).get("start") or "unknown")
+            available_end = str((coverage_entry or {}).get("end") or "unknown")
+            log_callback(
+                (
+                    f"Auto-download coverage tolerance for {symbol} {timeframe}: "
+                    f"{tolerated_reason}; available range {available_start} → {available_end}."
+                )
+            )
+    else:
+        raise RuntimeError(
+            f"Auto-download did not provide required data range for {symbol} {timeframe}"
+        )
+
+
+def _download_and_verify_missing_data(
+    missing_items: list[dict[str, Any]],
+    *,
+    timeframe: str,
+    start: str,
+    end: str,
+    progress_callback: Callable[[float, str], None] | None = None,
+    log_callback: Callable[[str], None] | None = None,
+) -> None:
     total_missing = len(missing_items)
     for index, missing in enumerate(missing_items, start=1):
         progress_before = 10.0 + ((index - 1) / total_missing) * 35.0
@@ -6823,43 +6870,51 @@ def _ensure_backtest_data_availability(
         _invalidate_data_views_cache()
         _refresh_catalog()
 
-        availability_index = _build_ohlcv_availability_index()
-        verification = _data_check_result(
+        _verify_missing_download_coverage(
             symbol=symbol,
-            timeframe=normalized_timeframe,
+            timeframe=timeframe,
             start=start,
             end=end,
-            availability_index=availability_index,
+            log_callback=log_callback,
         )
-        if not verification.get("available"):
-            coverage_entry = availability_index.get((symbol, normalized_timeframe))
-            tolerated_gap = False
-            tolerated_reason: str | None = None
-            if isinstance(coverage_entry, dict):
-                tolerated_gap, tolerated_reason = _allow_small_backtest_boundary_gap(
-                    requested_start=start,
-                    requested_end=end,
-                    available_start=str(coverage_entry.get("start") or ""),
-                    available_end=str(coverage_entry.get("end") or ""),
-                )
-            if tolerated_gap:
-                if log_callback is not None:
-                    available_start = str((coverage_entry or {}).get("start") or "unknown")
-                    available_end = str((coverage_entry or {}).get("end") or "unknown")
-                    log_callback(
-                        (
-                            f"Auto-download coverage tolerance for {symbol} {normalized_timeframe}: "
-                            f"{tolerated_reason}; available range {available_start} → {available_end}."
-                        )
-                    )
-            else:
-                raise RuntimeError(
-                    f"Auto-download did not provide required data range for {symbol} {normalized_timeframe}"
-                )
 
         progress_after = 10.0 + (index / total_missing) * 35.0
         if progress_callback is not None:
             progress_callback(progress_after, f"Downloading data... {int(round(progress_after))}%")
+
+
+def _ensure_backtest_data_availability(
+    *,
+    symbols: list[str],
+    timeframe: str,
+    start: str = "",
+    end: str = "",
+    progress_callback: Callable[[float, str], None] | None = None,
+    log_callback: Callable[[str], None] | None = None,
+) -> list[dict[str, Any]]:
+    normalized_timeframe = normalize_timeframe(timeframe)
+    symbol_list = [str(symbol or "").strip().upper() for symbol in symbols if str(symbol or "").strip()]
+    if not symbol_list or not normalized_timeframe:
+        return []
+
+    missing_items = _collect_missing_backtest_data(
+        symbol_list=symbol_list,
+        timeframe=normalized_timeframe,
+        start=start,
+        end=end,
+    )
+
+    if not missing_items:
+        return []
+
+    _download_and_verify_missing_data(
+        missing_items,
+        timeframe=normalized_timeframe,
+        start=start,
+        end=end,
+        progress_callback=progress_callback,
+        log_callback=log_callback,
+    )
 
     return missing_items
 
