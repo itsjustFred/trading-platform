@@ -8,6 +8,11 @@ This module wraps ``runner.backtest_grid.run_backtest_grid`` and produces:
 
 The daily equity file is intended for downstream portfolio allocation / BayesOpt:
 each row is a strategy cell at a calendar date with equity and pct return.
+
+It also hosts the legacy single-strategy quick grid (``run_strategy_grid``),
+which persists its matrix to SQLite for portfolio optimizer consumption.
+``runner/backtest_grid.py`` remains the canonical grid execution engine; this
+module is the multi-strategy orchestration/aggregation wrapper over it.
 """
 from __future__ import annotations
 
@@ -19,13 +24,15 @@ import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
+from uuid import uuid4
 
 from runner.backtest_grid import (
     DEFAULT_OUTPUT_DIR,
     GRID_SYMBOLS,
     GRID_TIMEFRAMES,
     build_run_id,
+    get_engine,
     normalize_symbol,
     normalize_timeframe_value,
     output_path_for,
@@ -34,12 +41,128 @@ from runner.backtest_grid import (
     run_backtest_grid,
 )
 from shared.constants import DATA_DIR
+from shared.database import save_grid_result
 from shared.logging import get_logger
-from shared.strategy_registry import iter_strategy_files, load_strategy_meta, strategy_documentation_path, strategy_relative_file, strategy_slug_for_path, StrategyEntry
+from shared.strategy_registry import (
+    StrategyEntry,
+    find_strategy_entry,
+    iter_strategy_files,
+    load_strategy_meta,
+    strategy_documentation_path,
+    strategy_relative_file,
+    strategy_slug_for_path,
+)
 
 logger = get_logger("runner.matrix")
 
 MATRIX_OUTPUT_DIR = DATA_DIR / "backtests" / "matrix_runner"
+GRID_RESULTS_DIR = DATA_DIR / "grid_results"
+
+
+def load_grid_results(limit: int = 100) -> list[dict[str, Any]]:
+    """Load persisted grid results from SQLite."""
+    from shared.database import get_grid_results
+
+    return get_grid_results(limit=limit)
+
+
+def run_strategy_grid(
+    strategy_slug: str,
+    symbols: list[str],
+    timeframes: list[str],
+    start: str,
+    end: str,
+    engine_name: str = "vectorbt",
+    capital: float = 100_000.0,
+    risk_per_trade_pct: float = 0.01,
+    progress_callback: Callable[[float, str], None] | None = None,
+) -> dict[str, Any]:
+    """Run a strategy across all symbol/timeframe combinations.
+
+    Returns a grid matrix showing which combinations work best.
+    """
+    entry = find_strategy_entry(strategy_slug)
+    if entry is None:
+        return {"status": "error", "message": f"Strategy {strategy_slug} not found"}
+
+    engine = get_engine(engine_name)
+    results_matrix: dict[str, dict[str, dict[str, Any]]] = {
+        sym: {} for sym in symbols
+    }
+
+    total_runs = len(symbols) * len(timeframes)
+    completed = 0
+
+    for symbol in symbols:
+        for timeframe in timeframes:
+            completed += 1
+            progress = completed / total_runs * 100
+            msg = f"{symbol}/{timeframe}"
+            if progress_callback:
+                progress_callback(progress, msg)
+
+            # Try to run backtest
+            try:
+                from runner.engines.base import BacktestConfig
+
+                config = BacktestConfig(
+                    strategy_name=strategy_slug,
+                    symbols=[symbol],
+                    timeframe=timeframe,
+                    start_date=start,
+                    end_date=end,
+                    initial_capital=capital,
+                    risk_per_trade_pct=risk_per_trade_pct,
+                )
+                result = engine.run(config)
+
+                # Collect stats
+                stats = result.stats if result.stats else {}
+                results_matrix[symbol][timeframe] = {
+                    "status": "success",
+                    "sharpe": float(stats.get("sharpe", 0)),
+                    "cagr": float(stats.get("cagr", 0)),
+                    "max_drawdown_pct": float(stats.get("max_drawdown_pct", 0)),
+                    "win_rate": float(stats.get("win_rate", 0)),
+                    "total_trades": int(stats.get("total_trades", 0)),
+                    "net_profit_pct": float(stats.get("net_profit_pct", 0)),
+                }
+            except Exception as e:
+                results_matrix[symbol][timeframe] = {
+                    "status": "error",
+                    "error": str(e),
+                }
+
+    # Save grid results
+    GRID_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(timezone.utc)
+    # Use microseconds + UUID to avoid collisions in parallel runs
+    grid_id = f"grid_{strategy_slug}_{now.strftime('%Y%m%d_%H%M%S_%f')}_{uuid4().hex[:8]}"
+    output_path = GRID_RESULTS_DIR / f"{grid_id}.json"
+
+    payload = {
+        "id": grid_id,
+        "strategy": strategy_slug,
+        "created_at": now.isoformat(),
+        "symbols": symbols,
+        "timeframes": timeframes,
+        "results": results_matrix,
+        "engine": engine_name,
+    }
+
+    output_path.write_text(json.dumps(payload, indent=2))
+
+    # Also save to SQLite
+    save_grid_result(
+        grid_id=grid_id,
+        strategy=strategy_slug,
+        symbols=symbols,
+        timeframes=timeframes,
+        results=results_matrix,
+        engine=engine_name,
+    )
+
+    return payload
 
 
 def _strategy_matches(entry, identifiers: Iterable[str] | None) -> bool:
