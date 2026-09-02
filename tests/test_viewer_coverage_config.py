@@ -80,18 +80,10 @@ def test_plan_inside_known_windows_has_no_unknown_marker(monkeypatch):
 
 
 def test_viewer_module_uses_configurable_windows(viewer_client):
-    import viewer.main as viewer_app_module
-
-    assert viewer_app_module.HF_INTRADAY_COVERAGE_END == "2025-07-31"
-    assert viewer_app_module.ALPACA_INTRADAY_START == "2025-07-01"
-    assert viewer_app_module.HF_INTRADAY_COVERAGE_END == auto_coverage()["hf"]
-    assert viewer_app_module.ALPACA_INTRADAY_START == auto_coverage()["alpaca"]
-
-
-def auto_coverage() -> dict[str, str]:
+    """viewer.main reads the windows through data_tools.auto_download, so the
+    shared module's values (not a stale mirror) drive the vendor plan."""
     from data_tools import auto_download
 
-    return {
-        "hf": auto_download.HF_INTRADAY_COVERAGE_END,
-        "alpaca": auto_download.ALPACA_INTRADAY_START,
-    }
+    assert auto_download.HF_INTRADAY_COVERAGE_END == "2025-07-31"
+    assert auto_download.ALPACA_INTRADAY_START == "2025-07-01"
+

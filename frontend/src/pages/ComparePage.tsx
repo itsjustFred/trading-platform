@@ -1,5 +1,4 @@
 import { useEffect, useMemo, useState } from "react";
-import type { PercentScale } from "../api/metricScale";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { ArrowLeft } from "lucide-react";
 import {
@@ -27,17 +26,18 @@ type MetricConfig = {
   format: "number" | "percent" | "currency" | "integer";
 };
 
-// Scales declared by the shared metric contract. The /api/backtests/compare
-// payload serves these metrics in percent points (see _backtest_compare_payload).
-const METRICS: (MetricConfig & { scale?: PercentScale })[] = [
-  { key: "total_return", label: "Total Return", better: "higher", format: "percent", scale: "points" },
+// The /api/backtests/compare payload serves every percent-like metric here in
+// percent points (see _backtest_compare_payload in viewer/main.py), so no
+// per-metric scale is needed on this page.
+const METRICS: MetricConfig[] = [
+  { key: "total_return", label: "Total Return", better: "higher", format: "percent" },
   { key: "net_profit", label: "Net Profit", better: "higher", format: "currency" },
   { key: "sharpe_ratio", label: "Sharpe (higher = better)", better: "higher", format: "number" },
-  { key: "psr", label: "PSR (higher = better)", better: "higher", format: "percent", scale: "points" },
+  { key: "psr", label: "PSR (higher = better)", better: "higher", format: "percent" },
   { key: "p_value", label: "p-Value (lower = better)", better: "lower", format: "number" },
-  { key: "cagr", label: "CAGR (higher = better)", better: "higher", format: "percent", scale: "points" },
-  { key: "max_drawdown", label: "Max DD (lower = better)", better: "lower", format: "percent", scale: "points" },
-  { key: "win_rate", label: "Win Rate (higher = better)", better: "higher", format: "percent", scale: "points" },
+  { key: "cagr", label: "CAGR (higher = better)", better: "higher", format: "percent" },
+  { key: "max_drawdown", label: "Max DD (lower = better)", better: "lower", format: "percent" },
+  { key: "win_rate", label: "Win Rate (higher = better)", better: "higher", format: "percent" },
   { key: "trade_count", label: "Trade Count", better: "higher", format: "integer" },
 ];
 

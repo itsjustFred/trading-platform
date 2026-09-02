@@ -3145,6 +3145,9 @@ def _launch_agent_task(task_id: str, payload: dict) -> None:
             root_logger = logging.getLogger()
             root_logger.addHandler(log_handler)
             try:
+                # `finally` below guarantees removal: a BaseException escaping
+                # the handler body must not leave this task's handler attached
+                # to the process-wide root logger.
                 _write_task_log_line(
                     handle,
                     task_id,
@@ -3197,11 +3200,9 @@ def _launch_agent_task(task_id: str, payload: dict) -> None:
                     source="agent-task",
                 )
                 _mark_task_finished(task_id, status="completed", returncode=0)
-                root_logger.removeHandler(log_handler)
             except Exception as exc:
                 duration_seconds = max(0.0, (datetime.now(timezone.utc) - started_at).total_seconds())
                 traceback_text = traceback.format_exc()
-                root_logger.removeHandler(log_handler)
                 _write_task_log_line(
                     handle,
                     task_id,
@@ -3223,6 +3224,8 @@ def _launch_agent_task(task_id: str, payload: dict) -> None:
                     exc,
                     extra={"data": {"task_id": task_id, "stream": "task", "source": "agent-task"}},
                 )
+            finally:
+                root_logger.removeHandler(log_handler)
 
     thread = threading.Thread(target=run_agent, daemon=True, name=f"agent-convert-{task_id[:8]}")
     _update_task_fields(task_id, thread=thread)

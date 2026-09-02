@@ -53,6 +53,14 @@ export function normalizeWinRate(
   return value;
 }
 
+/** Win rate for the live payloads: normalize the raw value, then to points. */
+export function liveWinRateToPoints(
+  value: number | null | undefined,
+): number | null {
+  const fraction = normalizeWinRate(value);
+  return fraction == null ? null : toPercentPoints(fraction, "fraction");
+}
+
 /** Format percent points as a signed percentage string. */
 export function formatPercentPoints(
   points: number | null | undefined,

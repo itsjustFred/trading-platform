@@ -112,3 +112,58 @@ def test_timeout_error_message_reports_configured_budget(monkeypatch):
     message = f"Backtest timed out after {viewer_main.BACKTEST_WATCHDOG_TIMEOUT_SECONDS:.0f} seconds"
     assert "60" in message
     assert "300" not in message
+
+
+def test_watchdog_does_not_kill_its_own_process_group():
+    """A child that is NOT a group leader must fall back to proc.kill():
+    killpg on our own pgid would kill the caller (observed as SIGKILL to the
+    whole pytest run when the runner is spawned without start_new_session)."""
+    from viewer import main as viewer_main
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    import os
+
+    try:
+        # The child shares our process group here (no start_new_session).
+        assert os.getpgid(proc.pid) != proc.pid
+        viewer_main._kill_process_group(proc)
+        proc.wait(timeout=10)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10)
+
+    assert proc.returncode is not None
+
+
+def test_watchdog_kills_child_group_when_child_is_group_leader():
+    """A start_new_session child leads its own group; the watchdog must kill
+    the whole group (and survive doing so)."""
+    from viewer import main as viewer_main
+    import os
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        assert os.getpgid(proc.pid) == proc.pid
+        outcome = viewer_main._monitor_backtest_process(
+            proc, timeout_seconds=0.5, poll_interval=0.05
+        )
+        proc.wait(timeout=10)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10)
+
+    assert outcome is False
+    assert proc.returncode is not None

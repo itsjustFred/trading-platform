@@ -211,6 +211,33 @@ BACKTEST_WATCHDOG_TIMEOUT_SECONDS = float(os.environ.get("BACKTEST_TIMEOUT_SECON
 BACKTEST_WATCHDOG_POLL_SECONDS = 2.0
 
 
+def _kill_process_group(proc: subprocess.Popen) -> None:
+    """Kill the child and everything it spawned.
+
+    The runner is started with `start_new_session=True`, so it leads its own
+    process group. A bare `proc.kill()` (SIGKILL to the direct child only)
+    leaves grandchildren alive holding the inherited stdout pipe, which would
+    keep the pump loop hanging and strand the task anyway.
+    """
+    try:
+        pgid = os.getpgid(proc.pid)
+    except (ProcessLookupError, PermissionError, OSError):
+        pgid = None
+    if pgid is not None and pgid == proc.pid:
+        # Only signal the group when the child actually leads it (it was
+        # started with start_new_session=True). Otherwise the pgid is OUR
+        # group and killpg would kill this process and its siblings.
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+            return
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
 def _monitor_backtest_process(
     proc: subprocess.Popen,
     *,
@@ -221,8 +248,8 @@ def _monitor_backtest_process(
 
     Runs alongside the stdout pump; unlike a `proc.wait(timeout=...)` after
     EOF, this watchdog fires even when a hung child never closes its stdout.
-    Kills the child when the deadline expires. Returns True when the child
-    exited inside the budget, False when the watchdog killed it.
+    Kills the child's whole process group when the deadline expires. Returns
+    True when the child exited inside the budget, False when it was killed.
     """
     deadline = time.monotonic() + max(0.0, float(timeout_seconds))
     while True:
@@ -234,10 +261,7 @@ def _monitor_backtest_process(
                 proc.pid,
                 timeout_seconds,
             )
-            try:
-                proc.kill()
-            except OSError:
-                pass
+            _kill_process_group(proc)
             try:
                 proc.wait(timeout=30)
             except subprocess.TimeoutExpired:
@@ -255,26 +279,20 @@ _JOBS_LOCK = legacy_viewer._JOBS_LOCK
 _JOBS_TIMESTAMP = legacy_viewer._JOBS_TIMESTAMP
 
 
-def _update_job_field(job_id: str, field: str, value: Any) -> None:
-    """Lock-guarded single-field job update (never registers a missing job)."""
-    with _JOBS_LOCK:
-        job = _running_jobs.get(job_id)
-        if job is None:
-            return
-        job[field] = value
-        _JOBS_TIMESTAMP[job_id] = time.monotonic()
-
-
 def _set_job_status(job_id: str, status: str) -> None:
-    _update_job_field(job_id, "status", status)
+    """Single lock-guarded status write (no-op for an unregistered job)."""
+    legacy_viewer.set_job_status(job_id, status)
 
 
-def _mark_job_result(job_id: str, result: Any | None) -> None:
-    _update_job_field(job_id, "result", result)
-
-
-def _mark_job_error(job_id: str, error: str | None) -> None:
-    _update_job_field(job_id, "error", error)
+def _finish_job(
+    job_id: str,
+    *,
+    status: str,
+    result: Any | None,
+    error: str | None,
+) -> None:
+    """Finalize status/result/error in one lock-guarded write on core's helper."""
+    legacy_viewer.finish_job(job_id, status=status, result=result, error=error)
 
 
 def _register_job(job_id: str, job: dict[str, Any]) -> None:
@@ -6147,10 +6165,8 @@ def _data_check_result(
 
 US_INTRADAY_TIMEFRAMES = {"1m", "5m", "15m", "30m", "1h"}
 # Vendor intraday coverage windows live in data_tools.auto_download and are
-# configurable via HF_INTRADAY_COVERAGE_END / ALPACA_INTRADAY_START env vars.
-reload_coverage_windows()
-HF_INTRADAY_COVERAGE_END = _auto_download_config.HF_INTRADAY_COVERAGE_END
-ALPACA_INTRADAY_START = _auto_download_config.ALPACA_INTRADAY_START
+# configurable via HF_INTRADAY_COVERAGE_END / ALPACA_INTRADAY_START env vars;
+# _auto_download_source_plan re-reads them, so no module-level mirror here.
 _US_STOCK_SYMBOL_PATTERN = re.compile(r"^[A-Z][A-Z.\-]{0,9}$")
 
 
@@ -6218,9 +6234,6 @@ def _auto_download_source_plan(
 ) -> list[dict[str, str | None]]:
     """Shared vendor plan from data_tools.auto_download (env-configurable)."""
     reload_coverage_windows()
-    global HF_INTRADAY_COVERAGE_END, ALPACA_INTRADAY_START
-    HF_INTRADAY_COVERAGE_END = _auto_download_config.HF_INTRADAY_COVERAGE_END
-    ALPACA_INTRADAY_START = _auto_download_config.ALPACA_INTRADAY_START
     return _auto_download_config._auto_download_source_plan(
         symbol=symbol,
         timeframe=timeframe,
@@ -6402,10 +6415,15 @@ def _ensure_backtest_data_availability(
                     if len(source_plan) > 1
                     else ""
                 )
+                coverage_note = (
+                    " [coverage unknown: no configured vendor window covers this range]"
+                    if str(step.get("coverage") or "") == "unknown"
+                    else ""
+                )
                 log_callback(
                     (
                         f"Auto-download{suffix}: {symbol} {normalized_timeframe} via {step_source} "
-                        f"({step_start or 'auto'} → {step_end or 'latest'})"
+                        f"({step_start or 'auto'} → {step_end or 'latest'}){coverage_note}"
                     )
                 )
             _download_missing_ohlcv_data(
@@ -7580,8 +7598,8 @@ def _load_symbol_ohlcv_with_details(
     return df, None
 
 
-def _detect_or_empty(result: BacktestResult) -> dict[str, Any]:
-    """Indicators detected from the result's first strategy, if any."""
+def _detect_indicators_for_result(result: BacktestResult) -> dict[str, Any]:
+    """Indicator specs detected from the result's first strategy, if any."""
     strategy_identifier = result.meta.strategies[0] if result.meta.strategies else ""
     return legacy_viewer._detect_indicators(strategy_identifier)
 
@@ -7645,9 +7663,17 @@ def _resolve_trade(result: BacktestResult, trade_nr: int) -> tuple[Any, dict[str
     return trade, legacy_viewer._trade_to_viewer(trade)
 
 
-def _trade_window_ohlcv(
-    result: BacktestResult, trade: Any
-) -> tuple[list[dict[str, Any]], pd.DataFrame, int, int]:
+@dataclass(frozen=True)
+class _TradeWindow:
+    """OHLCV window around a trade's entry bar plus its source-frame bounds."""
+
+    ohlcv: list[dict[str, Any]]
+    df: pd.DataFrame
+    start_idx: int
+    end_idx: int
+
+
+def _trade_window_ohlcv(result: BacktestResult, trade: Any) -> _TradeWindow:
     """OHLCV window around a trade's entry bar, plus the source frame and bounds."""
     timeframe = _replay_timeframe(result)
     symbol = str(trade.symbol or "").strip() or "SPY"
@@ -7666,28 +7692,24 @@ def _trade_window_ohlcv(
         ohlcv = legacy_viewer._df_to_ohlcv_records(df.iloc[ohlcv_start_idx:ohlcv_end_idx])
     else:
         ohlcv = []
-    return ohlcv, df, ohlcv_start_idx, ohlcv_end_idx
+    return _TradeWindow(ohlcv=ohlcv, df=df, start_idx=ohlcv_start_idx, end_idx=ohlcv_end_idx)
 
 
 def _trade_context_indicators(
-    result: BacktestResult,
-    df: pd.DataFrame,
-    ohlcv: list[dict[str, Any]],
-    ohlcv_start_idx: int,
-    ohlcv_end_idx: int,
+    result: BacktestResult, window: _TradeWindow
 ) -> list[dict[str, Any]]:
     """Indicators for the trade window: payload ones, else auto-detected ones."""
     indicators = _normalize_indicator_payloads(list(result.indicators))
-    if indicators or not ohlcv:
+    if indicators or not window.ohlcv:
         return indicators
 
-    detected = _detect_or_empty(result)
+    detected = _detect_indicators_for_result(result)
     if not detected:
         return indicators
 
-    ohlcv_times = [row["time"] for row in ohlcv]
-    warmup_start = max(0, ohlcv_start_idx - 50)
-    df_slice = df.iloc[warmup_start:ohlcv_end_idx].reset_index(drop=True)
+    ohlcv_times = [row["time"] for row in window.ohlcv]
+    warmup_start = max(0, window.start_idx - 50)
+    df_slice = window.df.iloc[warmup_start:window.end_idx].reset_index(drop=True)
     return legacy_viewer._compute_indicators(df_slice, detected, ohlcv_times)
 
 
@@ -7698,20 +7720,18 @@ def _trade_context_payload(backtest_id: str, trade_nr: int) -> dict[str, Any]:
     try:
         trade, trade_payload = _resolve_trade(result, trade_nr)
         symbol = str(trade.symbol or "").strip() or "SPY"
-        ohlcv, df, ohlcv_start_idx, ohlcv_end_idx = _trade_window_ohlcv(result, trade)
-        indicators = _trade_context_indicators(
-            result, df, ohlcv, ohlcv_start_idx, ohlcv_end_idx
-        )
+        window = _trade_window_ohlcv(result, trade)
+        indicators = _trade_context_indicators(result, window)
         drawings = _collect_viewer_drawings(result, symbol)
 
-        if ohlcv and indicators:
+        if window.ohlcv and indicators:
             time_start = ohlcv[0]["time"]
             time_end = ohlcv[-1]["time"]
             _slice_indicators_to_time_range(indicators, time_start=time_start, time_end=time_end)
 
         return {
             "trade": trade_payload,
-            "ohlcv": ohlcv,
+            "ohlcv": window.ohlcv,
             "symbol": symbol,
             "timeframe": _replay_timeframe(result),
             "indicators": indicators,
@@ -7773,7 +7793,7 @@ def _replay_indicators(
     if indicators:
         return indicators
 
-    detected = _detect_or_empty(result)
+    detected = _detect_indicators_for_result(result)
     if not detected:
         return indicators
 
@@ -8203,6 +8223,7 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
                     env=env,
                     text=True,
                     bufsize=1,
+                    start_new_session=True,
                 )
                 _update_task_fields(task_id, pid=proc.pid, process=proc)
 
@@ -8266,7 +8287,7 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
                     returncode = proc.wait(timeout=30)
                 except subprocess.TimeoutExpired:
                     if proc.poll() is None:
-                        proc.kill()
+                        _kill_process_group(proc)
                     raise subprocess.SubprocessError(
                         f"Backtest timed out after {BACKTEST_WATCHDOG_TIMEOUT_SECONDS:.0f} seconds"
                     )
@@ -8305,9 +8326,7 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
                         ingest_task_progress=False,
                     )
                     _mark_task_finished(task_id, status="completed", returncode=0)
-                    _set_job_status(task_id, "completed")
-                    _mark_job_result(task_id, compact_result)
-                    _mark_job_error(task_id, None)
+                    _finish_job(task_id, status="completed", result=compact_result, error=None)
                 else:
                     error_text = latest_message or f"Backtest command exited with code {returncode}"
                     _write_task_log_line(
@@ -8325,9 +8344,7 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
                         returncode=returncode,
                         error=error_text,
                     )
-                    _set_job_status(task_id, "failed")
-                    _mark_job_result(task_id, None)
-                    _mark_job_error(task_id, error_text)
+                    _finish_job(task_id, status="failed", result=None, error=error_text)
             except Exception as exc:
                 _write_task_log_line(
                     handle,
@@ -8340,9 +8357,7 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
                 )
                 _write_task_traceback(handle, task_id, traceback.format_exc(), source="backtest")
                 _mark_task_finished(task_id, status="failed", returncode=1, error=str(exc))
-                _set_job_status(task_id, "failed")
-                _mark_job_result(task_id, None)
-                _mark_job_error(task_id, str(exc))
+                _finish_job(task_id, status="failed", result=None, error=str(exc))
             finally:
                 _update_task_fields(task_id, process=None)
 
@@ -8682,9 +8697,7 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
                     message=f"Completed - {len(result.trades)} trades found",
                 )
                 _mark_task_finished(task_id, status="completed", returncode=0)
-                _set_job_status(task_id, "completed")
-                _mark_job_result(task_id, compact_result)
-                _mark_job_error(task_id, None)
+                _finish_job(task_id, status="completed", result=compact_result, error=None)
             except Exception as exc:
                 _write_task_log_line(
                     handle,
@@ -8697,9 +8710,7 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
                 )
                 _write_task_traceback(handle, task_id, traceback.format_exc(), source="backtest")
                 _mark_task_finished(task_id, status="failed", returncode=1, error=str(exc))
-                _set_job_status(task_id, "failed")
-                _mark_job_result(task_id, None)
-                _mark_job_error(task_id, str(exc))
+                _finish_job(task_id, status="failed", result=None, error=str(exc))
 
     thread = threading.Thread(target=_run_signal_replay, daemon=True)
     _update_task_fields(task_id, thread=thread)

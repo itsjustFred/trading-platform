@@ -17,7 +17,7 @@ import {
   getSignalProcessors,
   runBacktestSignals,
 } from "../api/client";
-import { normalizeWinRate, toPercentPoints } from "../api/metricScale";
+import { liveWinRateToPoints } from "../api/metricScale";
 import type {
   LiveAccountStats,
   LiveBalanceRecord,
@@ -691,7 +691,7 @@ function normalizeStats(
     totalTrades: asFiniteNumber(stats.total_trades, fallback.totalTrades),
     winningTrades: asFiniteNumber(stats.winning_trades, fallback.winningTrades),
     losingTrades: asFiniteNumber(stats.losing_trades, fallback.losingTrades),
-    winRate: (toPercentPoints(normalizeWinRate(stats.win_rate), "fraction") ?? fallback.winRate),
+    winRate: liveWinRateToPoints(stats.win_rate) ?? fallback.winRate,
     totalPnl: asFiniteNumber(stats.total_pnl, fallback.totalPnl),
     maxDrawdown: toDrawdownPercent(
       stats.max_drawdown_pct ?? stats.max_drawdown,

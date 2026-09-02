@@ -120,9 +120,15 @@ def ensure_backtest_data(
             step_end = str(step.get("end") or "").strip() or None
             if log_callback is not None:
                 suffix = f" [{source_index}/{len(source_plan)}]" if len(source_plan) > 1 else ""
+                coverage_note = (
+                    " [coverage unknown: no configured vendor window covers this range]"
+                    if str(step.get("coverage") or "") == "unknown"
+                    else ""
+                )
                 log_callback(
                     f"Auto-download{suffix}: {requirement.symbol} {requirement.timeframe} "
                     f"via {source} ({step_start or 'auto'} -> {step_end or 'latest'})"
+                    f"{coverage_note}"
                 )
             _download_missing_ohlcv_data(
                 data_root=data_root,

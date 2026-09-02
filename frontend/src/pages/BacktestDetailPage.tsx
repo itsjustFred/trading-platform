@@ -41,7 +41,6 @@ import type {
   Trade,
 } from "../api/types";
 import { formatPValue, pValueColor } from "../utils/stats";
-import { toPercentPoints } from "../api/metricScale";
 import { useToast } from "../components/ToastProvider";
 
 const BENCHMARK_SYMBOLS = ["SPY", "QQQ", "IWM", "DIA", "GLD", "TLT", "XAUUSD"];
@@ -221,6 +220,8 @@ export function BacktestDetailPage() {
   // table is a single page (TRADE_PAGE_SIZE rows), so page-derived values
   // must be labeled as page-scoped, never presented as whole-backtest stats.
   const statsAreWholeBacktest =
+    typeof stats?.winners === "number" &&
+    typeof stats?.losers === "number" &&
     typeof stats?.total_trades === "number" &&
     (stats.total_trades ?? 0) <= trades.length;
   const totalTradesFromStats =
@@ -573,13 +574,13 @@ export function BacktestDetailPage() {
           />
           <StatCard
             label="Net Profit %"
-            value={toPercentPoints(stats.net_profit_pct, "points")}
+            value={stats.net_profit_pct}
             format="percent"
             percentScale="points"
           />
           <StatCard
             label="CAGR (higher = better)"
-            value={toPercentPoints(stats.cagr, "points")}
+            value={stats.cagr}
             format="percent"
             percentScale="points"
           />
@@ -601,14 +602,14 @@ export function BacktestDetailPage() {
           />
           <StatCard
             label="Max DD (lower = better)"
-            value={toPercentPoints(stats.max_drawdown_pct, "points")}
+            value={stats.max_drawdown_pct}
             format="percent"
             percentScale="points"
             color="#f85149"
           />
           <StatCard
             label="Win Rate (higher = better)"
-            value={toPercentPoints(stats.win_rate, "points")}
+            value={stats.win_rate}
             format="percent"
             percentScale="points"
             color={stats.win_rate > 50 ? "#3fb950" : "#f85149"}
@@ -625,7 +626,7 @@ export function BacktestDetailPage() {
           />
           <StatCard
             label="PSR (higher = better)"
-            value={toPercentPoints(stats.psr, "fraction") ?? undefined}
+            value={stats.psr}
             format="percent"
             percentScale="points"
             color={

@@ -172,6 +172,21 @@ def compare_backtests(strategies: list[dict[str, Any]]) -> dict[str, Any]:
         combined_view["errors"].append(
             f"compare_backtests requires exactly 2 strategies, got {len(strategies)}"
         )
+        # No combined 50/50 blend when the arity is wrong: silently blending
+        # the first two is exactly the behavior this guard replaces.
+        return {
+            "strategies": [
+                {
+                    "name": s.get("name", "Unknown"),
+                    "equity_curve": s.get("equity_curve", []),
+                    "drawdown_curve": s.get("drawdown_curve", []),
+                    "stats": s.get("stats", {}),
+                    "trades": s.get("trades", {}),
+                }
+                for s in strategies
+            ],
+            "combined_view": combined_view,
+        }
 
     if len(strategies) >= 2:
         eq_a = strategies[0].get("equity_curve", [])

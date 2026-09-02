@@ -2139,8 +2139,17 @@ def get_latest_live_balance(account_id: str) -> LiveBalanceRecord | None:
     return row.to_live_balance()
 
 
+_LATEST_BALANCES_ROW_BUDGET = 50
+
+
 def get_latest_live_balances(account_ids: list[str]) -> dict[str, LiveBalanceRecord]:
-    """Latest balance per account in one query (avoids N+1 polling access)."""
+    """Latest balance per account in one query (avoids N+1 polling access).
+
+    Reads only the newest window of balance rows (`max(account_ids) *
+    _LATEST_BALANCES_ROW_BUDGET`) instead of every historical row for the
+    account, then keeps the first (newest) record per account. An account with
+    no row inside the window still falls back to the per-account query path.
+    """
     normalized_ids = sorted(
         {str(item or "").strip() for item in account_ids if str(item or "").strip()}
     )
@@ -2148,17 +2157,25 @@ def get_latest_live_balances(account_ids: list[str]) -> dict[str, LiveBalanceRec
         return {}
 
     init_db()
+    latest: dict[str, LiveBalanceRecord] = {}
     with get_session() as session:
+        row_budget = max(len(normalized_ids) * _LATEST_BALANCES_ROW_BUDGET, 1)
         rows = session.exec(
             select(LiveBalanceModel)
             .where(LiveBalanceModel.account_id.in_(normalized_ids))
             .order_by(LiveBalanceModel.timestamp.desc(), LiveBalanceModel.id.desc())
+            .limit(row_budget)
         ).all()
 
-    latest: dict[str, LiveBalanceRecord] = {}
     for row in rows:
         record = row.to_live_balance()
         latest.setdefault(record.account_id, record)
+
+    missing_ids = [account_id for account_id in normalized_ids if account_id not in latest]
+    for account_id in missing_ids:
+        record = get_latest_live_balance(account_id)
+        if record is not None:
+            latest[account_id] = record
     return latest
 
 

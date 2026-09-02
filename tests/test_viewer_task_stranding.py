@@ -127,6 +127,6 @@ def test_worker_closures_finalize_lifecycle_status_in_except_path():
         assert "_mark_task_finished" in calls, (
             f"{closure_name} except path must call _mark_task_finished"
         )
-        assert "_set_job_status" in calls, (
+        assert "_finish_job" in calls or "_set_job_status" in calls, (
             f"{closure_name} except path must fail the job record"
         )
