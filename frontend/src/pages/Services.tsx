@@ -147,6 +147,8 @@ export function ServicesPage() {
     }
   };
 
+  // Rendered below; keep this const AFTER every state/handler it closes over.
+  // If it grows further, extract it to a component with explicit props.
   const servicesBody = servicesQuery.isLoading ? (
     <div style={emptyStyle}>Loading services...</div>
   ) : servicesQuery.isError ? (

@@ -184,17 +184,22 @@ export function useWebSocket<TMessage = unknown>(
         return;
       }
       heartbeatTimer = window.setInterval(() => {
+        // Ownership guard: this timer must only touch the socket this effect
+        // instance opened, never one from a later mount that reused the ref.
+        const current = socket;
         if (
           disposed ||
-          socket?.readyState !== WebSocket.OPEN
+          current == null ||
+          current.readyState !== WebSocket.OPEN ||
+          socketRef.current !== current
         ) {
           return;
         }
         if (Date.now() - lastActivityAt > heartbeatTimeoutMs) {
-          socket.close(4000, "heartbeat-timeout");
+          current.close(4000, "heartbeat-timeout");
           return;
         }
-        socket.send(JSON.stringify({ type: "ping", ts: Date.now() / 1000 }));
+        current.send(JSON.stringify({ type: "ping", ts: Date.now() / 1000 }));
       }, heartbeatIntervalMs);
     };
 

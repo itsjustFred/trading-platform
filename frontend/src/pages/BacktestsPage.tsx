@@ -324,6 +324,10 @@ async function loadBacktestsAllCached(
   if (force) {
     backtestsAllCache = null;
   }
+  // Ordering matters: this warm-cache check must stay ABOVE the
+  // `backtestsAllPromise ??=` below, or a force refresh would start a fetch
+  // and immediately return the stale cached rows instead of them.
+  if (backtestsAllCache) return cloneRows(backtestsAllCache);
   backtestsAllPromise ??= getBacktestsAll()
     .then((rows) => {
       const normalized = (rows ?? []).map((row) =>
@@ -337,7 +341,6 @@ async function loadBacktestsAllCached(
     .finally(() => {
       backtestsAllPromise = null;
     });
-  if (backtestsAllCache) return cloneRows(backtestsAllCache);
   return backtestsAllPromise;
 }
 
