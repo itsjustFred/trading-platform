@@ -117,7 +117,6 @@ def _build_supertrend_series(
         if component == "down" and down_series is None:
             down_series = pd.to_numeric(series, errors="coerce")
             consumed.add(name)
-            continue
 
     if up_series is None and down_series is None:
         return [], set()

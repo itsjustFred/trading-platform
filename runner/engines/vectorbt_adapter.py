@@ -292,7 +292,6 @@ def _process_symbol(
             final_notional: float | None = None
             capped_by_max_position = False
             capped_by_max_leverage = False
-            sizing_mode = "full_equity"
 
             intrabar_exit = _resolve_intrabar_exit(
                 intrabar_df=intrabar_df,
