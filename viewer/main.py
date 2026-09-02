@@ -6701,7 +6701,6 @@ def _invalid_strategy_path() -> HTTPException:
 
 @app.get(
     "/api/strategies/{relative_file:path}/approval",
-    response_model=dict[str, Any],
     responses={
         400: {"description": "Invalid strategy file path"},
         404: {"description": "Strategy not found"},
@@ -6722,7 +6721,6 @@ async def get_strategy_approval(relative_file: str) -> dict[str, Any]:
 
 @app.post(
     "/api/strategies/{relative_file:path}/approve",
-    response_model=dict[str, Any],
     responses={
         400: {"description": "Invalid strategy file path"},
         404: {"description": "Strategy not found"},
@@ -6741,7 +6739,7 @@ async def approve_strategy(relative_file: str) -> dict[str, Any]:
             record_approval, path, approved_by="human", strategies_root=STRATEGIES_DIR
         )
     except OSError:
-        logger.exception("Failed to record approval for strategy '%s'", relative_file)
+        logger.exception("Failed to record approval for the requested strategy file")
         raise HTTPException(
             status_code=500,
             detail="Could not record the strategy approval; see server logs.",
