@@ -229,7 +229,12 @@ def _equity_to_returns_series(equity_curve: list[EquityPoint]) -> pd.Series | No
     dates = []
     for e in equity_curve:
         equities.append(e.equity)
-        ts = e.time if hasattr(e, "time") else e.timestamp if hasattr(e, "timestamp") else None
+        if hasattr(e, "time"):
+            ts = e.time
+        elif hasattr(e, "timestamp"):
+            ts = e.timestamp
+        else:
+            ts = None
         dates.append(ts)
 
     if dates[0] is not None:

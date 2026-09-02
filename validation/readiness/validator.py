@@ -27,6 +27,16 @@ def _abs_pct_diff(expected: float, actual: float) -> float:
     return abs(expected - actual) / denom
 
 
+_NO_TRADE_DELTA_REPORT_MESSAGE = "No trade delta report provided; skipping."
+
+
+def _threshold_severity(count: int, threshold: int) -> str:
+    """Severity for a counted deviation against its allowed threshold."""
+    if count > threshold:
+        return "error"
+    return "warning" if count > 0 else "info"
+
+
 class ReadinessValidator:
     """Validate platform backtest results for paper-trading readiness.
 
@@ -203,42 +213,22 @@ class ReadinessValidator:
         checks: list[ReadinessCheck] = []
 
         if report is None:
-            checks.append(
-                ReadinessCheck(
-                    name="trade_errors",
-                    description="No error-level deviations in matched trades",
-                    passed=True,
-                    severity="info",
-                    message="No trade delta report provided; skipping.",
-                )
+            skipped_names = (
+                ("trade_errors", "No error-level deviations in matched trades"),
+                ("missing_trades", "Number of missing trades within threshold"),
+                ("extra_trades", "Number of extra trades within threshold"),
+                ("critical_mismatches", "No critical mismatches in direction or PnL"),
             )
-            checks.append(
-                ReadinessCheck(
-                    name="missing_trades",
-                    description="Number of missing trades within threshold",
-                    passed=True,
-                    severity="info",
-                    message="No trade delta report provided; skipping.",
+            for name, description in skipped_names:
+                checks.append(
+                    ReadinessCheck(
+                        name=name,
+                        description=description,
+                        passed=True,
+                        severity="info",
+                        message=_NO_TRADE_DELTA_REPORT_MESSAGE,
+                    )
                 )
-            )
-            checks.append(
-                ReadinessCheck(
-                    name="extra_trades",
-                    description="Number of extra trades within threshold",
-                    passed=True,
-                    severity="info",
-                    message="No trade delta report provided; skipping.",
-                )
-            )
-            checks.append(
-                ReadinessCheck(
-                    name="critical_mismatches",
-                    description="No critical mismatches in direction or PnL",
-                    passed=True,
-                    severity="info",
-                    message="No trade delta report provided; skipping.",
-                )
-            )
             return checks
 
         all_deltas = report.matched_trades + report.missing_trades + report.extra_trades
@@ -257,11 +247,7 @@ class ReadinessValidator:
         )
 
         # Check a: No error-level deviations
-        trade_error_sev = (
-            "error"
-            if error_count > cfg.max_error_count
-            else ("warning" if error_count > 0 else "info")
-        )
+        trade_error_sev = _threshold_severity(error_count, cfg.max_error_count)
         trade_error_passed = error_count <= cfg.max_error_count
         checks.append(
             ReadinessCheck(
@@ -284,11 +270,7 @@ class ReadinessValidator:
             )
 
         # Check b: Missing trades within threshold
-        missing_sev = (
-            "error"
-            if missing_count > cfg.max_missing_trades
-            else ("warning" if missing_count > 0 else "info")
-        )
+        missing_sev = _threshold_severity(missing_count, cfg.max_missing_trades)
         missing_passed = missing_count <= cfg.max_missing_trades
         checks.append(
             ReadinessCheck(
@@ -311,11 +293,7 @@ class ReadinessValidator:
             )
 
         # Check b: Extra trades within threshold
-        extra_sev = (
-            "error"
-            if extra_count > cfg.max_extra_trades
-            else ("warning" if extra_count > 0 else "info")
-        )
+        extra_sev = _threshold_severity(extra_count, cfg.max_extra_trades)
         extra_passed = extra_count <= cfg.max_extra_trades
         checks.append(
             ReadinessCheck(
@@ -338,11 +316,7 @@ class ReadinessValidator:
             )
 
         # Check c: No critical mismatches in direction or PnL
-        crit_sev = (
-            "error"
-            if critical_mismatch_count > cfg.max_mismatched_trades
-            else ("warning" if critical_mismatch_count > 0 else "info")
-        )
+        crit_sev = _threshold_severity(critical_mismatch_count, cfg.max_mismatched_trades)
         critical_mismatch_passed = critical_mismatch_count <= cfg.max_mismatched_trades
         checks.append(
             ReadinessCheck(

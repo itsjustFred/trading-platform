@@ -317,7 +317,15 @@ def render_state(state: dict) -> str:
         "Strategies:",
     ]
     for r in rows:
-        emoji = "✅" if r.get("status") == "done" else "❌" if r.get("status") == "failed" else "⚠️" if r.get("status") == "partial" else "⏳"
+        status = r.get("status")
+        if status == "done":
+            emoji = "✅"
+        elif status == "failed":
+            emoji = "❌"
+        elif status == "partial":
+            emoji = "⚠️"
+        else:
+            emoji = "⏳"
         suffix = f" · {r.get('trades', 0)} trades"
         if r.get("status") == "done":
             suffix += f" · {r.get('ok', 0)}/{r.get('requested', 0)} ok"

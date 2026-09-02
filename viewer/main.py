@@ -3934,8 +3934,11 @@ def _calculate_realized_live_pnl(
     for row in ordered_rows:
         symbol = str(row.get("symbol") or "UNKNOWN").upper()
         action = str(row.get("action") or "").strip().lower()
-        direction = 1.0 if action == "buy" else -1.0 if action == "sell" else 0.0
-        if direction == 0.0:
+        if action == "buy":
+            direction = 1.0
+        elif action == "sell":
+            direction = -1.0
+        else:
             continue
 
         quantity = abs(_safe_float(row.get("filled_qty"), 0.0))
@@ -7487,11 +7490,12 @@ async def get_backtest_trades(
 def _normalize_indicator_payloads(indicators: list[Any]) -> list[dict[str, Any]]:
     normalized: list[dict[str, Any]] = []
     for raw_indicator in indicators:
-        indicator = (
-            raw_indicator.to_dict()
-            if hasattr(raw_indicator, "to_dict")
-            else dict(raw_indicator) if isinstance(raw_indicator, dict) else None
-        )
+        if hasattr(raw_indicator, "to_dict"):
+            indicator = raw_indicator.to_dict()
+        elif isinstance(raw_indicator, dict):
+            indicator = dict(raw_indicator)
+        else:
+            indicator = None
         if not isinstance(indicator, dict):
             continue
 
@@ -9559,6 +9563,19 @@ async def delete_portfolio(portfolio_id: str) -> dict[str, Any]:
     return {"status": "deleted", "id": portfolio_id}
 
 
+def _execution_risk_value(
+    row: dict[str, Any], metadata: dict[str, Any], field: str
+) -> float | None:
+    """Prefer the execution row's risk value; fall back to signal metadata."""
+    row_value = row.get(field)
+    if row_value is not None:
+        return _safe_float(row_value)
+    metadata_value = metadata.get(field)
+    if metadata_value is not None:
+        return _safe_float(metadata_value)
+    return None
+
+
 async def _live_trades_payload(account_id: str) -> dict[str, Any]:
     deployments = await asyncio.to_thread(list_live_deployments_for_account, account_id)
     deployment_ids = _deployment_ids_for_account(account_id, deployments)
@@ -9583,33 +9600,9 @@ async def _live_trades_payload(account_id: str) -> dict[str, Any]:
                 "slippage": float(row.get("slippage", 0.0)),
                 "slippage_bps": float(row.get("slippage_bps", 0.0)),
                 "filled_qty": float(row.get("filled_qty", 0.0)),
-                "position_size": (
-                    _safe_float(row.get("position_size"))
-                    if row.get("position_size") is not None
-                    else (
-                        _safe_float(metadata.get("position_size"))
-                        if metadata.get("position_size") is not None
-                        else None
-                    )
-                ),
-                "risk_amount": (
-                    _safe_float(row.get("risk_amount"))
-                    if row.get("risk_amount") is not None
-                    else (
-                        _safe_float(metadata.get("risk_amount"))
-                        if metadata.get("risk_amount") is not None
-                        else None
-                    )
-                ),
-                "risk_percent": (
-                    _safe_float(row.get("risk_percent"))
-                    if row.get("risk_percent") is not None
-                    else (
-                        _safe_float(metadata.get("risk_percent"))
-                        if metadata.get("risk_percent") is not None
-                        else None
-                    )
-                ),
+                "position_size": _execution_risk_value(row, metadata, "position_size"),
+                "risk_amount": _execution_risk_value(row, metadata, "risk_amount"),
+                "risk_percent": _execution_risk_value(row, metadata, "risk_percent"),
                 "exit_reason": (
                     str(row.get("exit_reason")).strip()
                     if row.get("exit_reason") not in (None, "")

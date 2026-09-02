@@ -181,7 +181,10 @@ def export_data():
         target_dir.mkdir(parents=True, exist_ok=True)
 
         tables = _list_tables(stocks_repo)
-        table_name = "ohlcv" if "ohlcv" in tables else (tables[0] if tables else None)
+        if "ohlcv" in tables:
+            table_name: str | None = "ohlcv"
+        else:
+            table_name = tables[0] if tables else None
         if not table_name:
             logger.error("No tables found in stocks repo")
         else:

@@ -2972,11 +2972,11 @@ def list_verification_evidence_records(
 
     normalized_component = str(component or "").strip()
     normalized_category = str(category or "").strip().lower()
-    normalized_status = (
-        _normalize_evidence_status(status.value if isinstance(status, VerificationEvidenceStatus) else str(status))
-        if status is not None and str(status).strip()
-        else ""
-    )
+    if status is not None and str(status).strip():
+        raw_status = status.value if isinstance(status, VerificationEvidenceStatus) else str(status)
+        normalized_status = _normalize_evidence_status(raw_status)
+    else:
+        normalized_status = ""
 
     with get_session() as session:
         statement = select(VerificationEvidenceModel)

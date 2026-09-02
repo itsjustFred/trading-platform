@@ -696,20 +696,19 @@ def _group_ohlcv_entries(entries: list[dict]) -> list[dict]:
             aggregate["segments"], key=lambda segment: str(segment.get("path") or "")
         )
 
+        def _single_or_label(values: list[str], default: str) -> str:
+            if len(values) == 1:
+                return values[0]
+            return "mixed" if values else default
+
         grouped_entry = {
-            "source": source_values[0] if len(source_values) == 1 else (
-                "mixed" if source_values else ""
-            ),
-            "asset_class": asset_class_values[0] if len(asset_class_values) == 1 else (
-                "mixed" if asset_class_values else ""
-            ),
+            "source": _single_or_label(source_values, ""),
+            "asset_class": _single_or_label(asset_class_values, ""),
             "symbol": aggregate["symbol"],
             "timeframe": aggregate["timeframe"],
             "path": _canonical_group_path(aggregate["paths"], aggregate["timeframe"]),
             "format": format_values[0] if len(format_values) == 1 else "parquet",
-            "storage": storage_values[0] if len(storage_values) == 1 else (
-                "mixed" if storage_values else "local"
-            ),
+            "storage": _single_or_label(storage_values, "local"),
             "rows": rows,
             "row_count": aggregate["rows_total"],
             "size_bytes": aggregate["size_bytes"],
