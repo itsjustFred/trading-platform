@@ -105,6 +105,7 @@ def test_vectorbt_parallel_branch_preserves_loud_failure(monkeypatch):
     )
 
     config = _config(Path("/tmp"), ["SPY", "QQQ"])
+    adapter = VectorbtAdapter()
     with pytest.raises(RuntimeError, match="QQQ") as exc_info:
-        VectorbtAdapter().run(config, "unused.py")
+        adapter.run(config, "unused.py")
     assert "No OHLCV data" in str(exc_info.value.__cause__)

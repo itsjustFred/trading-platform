@@ -328,7 +328,6 @@ def run_one_backtest_in_process(
 
     run_id = result["run_id"]
     path = Path(result["output"])
-    resolved_start, resolved_end = result["start"], result["end"]
 
     try:
         strategy_type = detect_strategy_type(Path(strategy).resolve())
