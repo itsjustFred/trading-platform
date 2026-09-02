@@ -78,7 +78,10 @@ def _cell_from_stats(stats: dict[str, Any]) -> dict[str, Any]:
     Canonical stats keys only — never fabricate zero metrics for missing keys,
     and keep no-trade runs distinguishable from successes.
     """
-    total_trades = int(stats.get("total_trades", 0) or 0)
+    try:
+        total_trades = int(stats.get("total_trades", 0) or 0)
+    except (TypeError, ValueError):
+        total_trades = 0
     cell: dict[str, Any] = {
         "status": "no_trades" if total_trades == 0 else "success",
         "total_trades": total_trades,
@@ -87,7 +90,11 @@ def _cell_from_stats(stats: dict[str, Any]) -> dict[str, Any]:
         value = stats.get(source_key)
         if value is None:
             continue
-        numeric = float(value)
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            # A non-numeric engine stat is skipped, not a grid-wide failure.
+            continue
         if not isfinite(numeric):
             continue
         cell[canonical_key] = numeric

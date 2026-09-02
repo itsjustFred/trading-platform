@@ -115,13 +115,21 @@ def _detect_date_range(symbols: list[str], timeframe: str, data_dir: str = "") -
                 ts = pd.to_datetime(df["timestamp"])
                 starts.append(ts.min().strftime("%Y-%m-%d"))
                 ends.append(ts.max().strftime("%Y-%m-%d"))
+            else:
+                logger.warning(
+                    "No timestamp column in %s; symbol %s cannot contribute a date range",
+                    matches[0], symbol,
+                )
         except Exception as e:
             logger.warning("Could not read date range from %s: %s", matches[0], e)
 
-    if not starts or not ends:
+    # A symbol whose file could not be read must not silently shrink the
+    # intersection — every requested symbol has to contribute a range.
+    if len(starts) != len(symbols) or len(ends) != len(symbols):
         raise ValueError(
             f"OHLCV data for {symbols} under {ohlcv_root} has no readable "
-            "timestamps; refusing to fabricate a backtest date range"
+            "timestamps for every symbol; refusing to fabricate a backtest "
+            "date range"
         )
 
     # Intersection: latest start, earliest end

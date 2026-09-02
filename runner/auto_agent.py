@@ -15,6 +15,7 @@ import json
 import os
 import re
 import subprocess
+import time
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -823,26 +824,41 @@ def _run_backtest(cmd: list[str], *, log: TaskLogger | None) -> tuple[int, str]:
         bufsize=1,
     )
 
+    deadline = time.monotonic() + BACKTEST_TIMEOUT_SECONDS
     try:
-        if proc.stdout is not None:
-            for line in proc.stdout:
-                output_lines.append(line)
-                _log(log, line.rstrip("\n"), stream="stdout")
+        # Read with a deadline: a child that streams forever (or blocks on a
+        # full pipe) must not outlive BACKTEST_TIMEOUT_SECONDS any more than a
+        # child that sits silent — the wall-clock bound has to cover output
+        # streaming too, not just the final wait().
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _timeout(proc, cmd)
+            line = proc.stdout.readline() if proc.stdout is not None else ""
+            if not line:
+                break
+            output_lines.append(line)
+            _log(log, line.rstrip("\n"), stream="stdout")
         try:
-            returncode = proc.wait(timeout=BACKTEST_TIMEOUT_SECONDS)
+            returncode = proc.wait(timeout=max(0.0, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=30)
-            raise RuntimeError(
-                f"Generated-strategy backtest timed out after "
-                f"{BACKTEST_TIMEOUT_SECONDS} seconds: {' '.join(cmd)}"
-            ) from None
+            _timeout(proc, cmd)
     finally:
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=30)
 
     return returncode, "".join(output_lines)
+
+
+def _timeout(proc: subprocess.Popen, cmd: list[str]) -> None:
+    """Kill a hung child and raise the timeout error for the caller."""
+    proc.kill()
+    proc.wait(timeout=30)
+    raise RuntimeError(
+        f"Generated-strategy backtest timed out after "
+        f"{BACKTEST_TIMEOUT_SECONDS} seconds: {' '.join(cmd)}"
+    ) from None
 
 
 def _truncate(text: str, limit: int) -> str:

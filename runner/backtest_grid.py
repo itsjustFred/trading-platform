@@ -372,8 +372,9 @@ def _run_backtest_in_process_body(request: CellRequest) -> dict[str, Any]:
     # Use the resolved dates for daily equity attachment
     attach_daily_equity(backtest_result, start=start_date, end=end_date)
     merge_canonical_stats(backtest_result)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    backtest_result.save(Path(output_dir) / f"{backtest_result.meta.id}.trades.json")
+    # Save to the exact path the cell record reports (result["output"]), so the
+    # persisted artifact and the grid row can never diverge.
+    backtest_result.save(output_path_for(request.output_dir, backtest_result.meta.id))
     if save_sqlite:
         try:
             save_result_to_sqlite(backtest_result)

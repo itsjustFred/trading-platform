@@ -7,12 +7,26 @@ import pytest
 import runner.auto_agent as auto_agent
 
 
+class _HangReader:
+    """A stdout stand-in whose readline blocks forever: the deadline in
+    _run_backtest must fire while streaming, not only during wait()."""
+
+    def readline(self):
+        import time
+
+        time.sleep(3600)
+        return ""
+
+
 def test_run_backtest_kills_hung_child_after_timeout(monkeypatch):
     created: dict = {}
+    # Shrink the deadline to nothing so the streaming check trips immediately
+    # instead of waiting for a real 1800 s.
+    monkeypatch.setattr(auto_agent, "BACKTEST_TIMEOUT_SECONDS", 0)
 
     class FakeProc:
         def __init__(self):
-            self.stdout = iter([])
+            self.stdout = _HangReader()
             self.returncode = None
             created["proc"] = self
 
@@ -38,9 +52,16 @@ def test_run_backtest_kills_hung_child_after_timeout(monkeypatch):
 
 
 def test_run_backtest_returns_output_on_success(monkeypatch):
+    class _EagerReader:
+        def __init__(self, lines):
+            self._lines = list(lines)
+
+        def readline(self):
+            return self._lines.pop(0) if self._lines else ""
+
     class FakeProc:
         def __init__(self):
-            self.stdout = iter(["hello\n"])
+            self.stdout = _EagerReader(["hello\n"])
 
         def wait(self, timeout=None):
             return 0

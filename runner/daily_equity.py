@@ -24,25 +24,54 @@ def _parse_day_bound(value: str | None, *, is_end: bool) -> str | None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     if is_end and "T" not in raw and ":" not in raw:
         parsed = parsed.replace(hour=23, minute=59, second=59, microsecond=999999)
-    return parsed.isoformat()
+    return parsed
 
 
-def _trade_in_window(trade: Trade, start_bound: str | None, end_bound: str | None) -> bool:
+def _parse_ts(value: str | None) -> datetime | None:
+    """Parse a trade/equity timestamp; None when it cannot be understood."""
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _trade_in_window(trade: Trade, start_bound: datetime | None, end_bound: datetime | None) -> bool:
     exit_time = None
     for exit_ in trade.exits:
         if exit_.time:
             exit_time = exit_.time
     if not exit_time:
         return False
-    if start_bound and exit_time < start_bound:
+    parsed = _parse_ts(exit_time)
+    if parsed is None:
+        # A timestamp we cannot understand must not silently pass the filter.
         return False
-    if end_bound and exit_time > end_bound:
+    if start_bound and parsed < start_bound:
+        return False
+    if end_bound and parsed > end_bound:
+        return False
+    return True
+
+
+def _in_window(value: str, start_bound: datetime | None, end_bound: datetime | None) -> bool:
+    parsed = _parse_ts(value)
+    if parsed is None:
+        return False
+    if start_bound and parsed < start_bound:
+        return False
+    if end_bound and parsed > end_bound:
         return False
     return True
 
 
 def _scoped_view(
-    result: BacktestResult, start_bound: str | None, end_bound: str | None
+    result: BacktestResult, start_bound: datetime | None, end_bound: datetime | None
 ) -> BacktestResult:
     """Return a shallow copy of the result limited to the requested window."""
     if not start_bound and not end_bound:
@@ -54,8 +83,7 @@ def _scoped_view(
         equity_curve = [
             point
             for point in equity_curve
-            if (not start_bound or point.time >= start_bound)
-            and (not end_bound or point.time <= end_bound)
+            if _in_window(point.time, start_bound, end_bound)
         ]
     return BacktestResult(
         meta=result.meta,

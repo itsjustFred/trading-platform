@@ -62,6 +62,7 @@ class PyneCoreAdapter(EngineAdapter):
         all_drawings: list[dict[str, Any]] = []
         trade_counter = 0
         total_bars = 0
+        symbols_with_data: list[str] = []
         strategy_name, context_builder, drawings_builder = _load_strategy_artifacts(
             strategy_path, config.strategy_name
         )
@@ -73,6 +74,7 @@ class PyneCoreAdapter(EngineAdapter):
             if df is None or df.empty:
                 logger.warning("No data for %s/%s, skipping", symbol, config.timeframe)
                 continue
+            symbols_with_data.append(symbol)
 
             total_bars += len(df)
             trades, symbol_stats = self._run_pyne_for_symbol(
@@ -90,6 +92,16 @@ class PyneCoreAdapter(EngineAdapter):
                     trades,
                     symbol,
                 )
+            )
+
+        if not symbols_with_data:
+            # Every symbol was skipped for missing data: an empty BacktestResult
+            # must not look like a successful run (same rule as the native and
+            # vectorbt adapters).
+            raise RuntimeError(
+                f"No OHLCV data for any of {config.symbols} at "
+                f"{config.timeframe} under {data_root}; refusing to run a "
+                "silent empty PyneCore backtest"
             )
 
         return BacktestResult(
