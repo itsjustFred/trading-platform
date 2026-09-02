@@ -52,7 +52,11 @@ function trimTrailingZeros(text: string): string {
   if (!text.includes(".")) {
     return text;
   }
-  const trimmed = text.replace(/0+$/, "");
+  let end = text.length;
+  while (end > 0 && text[end - 1] === "0") {
+    end -= 1;
+  }
+  const trimmed = text.slice(0, end);
   return trimmed.endsWith(".") ? trimmed.slice(0, -1) : trimmed;
 }
 

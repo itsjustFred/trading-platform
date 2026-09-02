@@ -32,8 +32,8 @@ const CANONICAL_TIMESTAMP_RE =
 const TIMESTAMP_RE = /(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})/;
 const LOG_LEVEL_RE = /\b(ERROR|WARNING|WARN|INFO|DEBUG)\b/i;
 const MODULE_FUNC_RE = /\b([A-Za-z_][\w.-]*)\.([A-Za-z_][\w<>-]*)\b/;
-const TRACEBACK_FILE_RE = /File "(.*)\/([\w]+)\.py", line \d+, in ([\w<>-]+)/;
-const UVICORN_PREFIX_RE = /^\s*(INFO|ERROR|WARNING|DEBUG)\s*:\s*(.*?)\s*$/i;
+const TRACEBACK_FILE_RE = /File "(.*)\/(\w+)\.py", line \d+, in ([\w<>-]+)/;
+const UVICORN_PREFIX_RE = /^\s*(INFO|ERROR|WARNING|DEBUG)\s*:\s*(.+)\s*$/i;
 const LOG_FETCH_LIMIT = 5000;
 const LOG_REFRESH_MS = 5000;
 // Keeps keystrokes in the search box from refetching LOG_FETCH_LIMIT lines each time.
