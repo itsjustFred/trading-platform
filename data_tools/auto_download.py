@@ -277,9 +277,8 @@ def _parquet_timestamp_bounds(path: Path) -> tuple[pd.Timestamp, pd.Timestamp] |
     start = _stat_boundary(metadata, column_index, 0, "min")
     end = _stat_boundary(metadata, column_index, last_group, "max")
 
-    # Statistics are only a lower bound: cross-check the last-group max
-    # against its actual last row, and fall back to real rows when the
-    # statistics are absent.
+    # The last-group statistic understates the newest row for out-of-order
+    # appends, so it is cross-checked against the group's actual last row.
     row_end = _row_group_edge_timestamp(
         parquet_file, columns, column_index, last_group, last=True
     )
@@ -395,9 +394,7 @@ def find_internal_gaps(
                 )
             )
 
-    # Holes inside a single file: scan the file's timestamps (bounded by row
-    # group when statistics are usable) to find the largest hole between
-    # consecutive bars. A one-row-group file is scanned fully.
+    # Largest hole inside each file; see _find_gaps_inside_file for the cost.
     for _, _, path in bounds:
         file_gaps = _find_gaps_inside_file(path, threshold_days=threshold_days)
         gaps.extend(file_gaps)

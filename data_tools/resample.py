@@ -167,8 +167,8 @@ def resample_directory(source_dir: Path, from_tf: str, timeframes: list[str]) ->
         try:
             results = resample_file(src, timeframes)
             all_results.extend(results)
-        except Exception as e:
-            logger.error("  Failed: %s", e)
+        except Exception:
+            logger.exception("  Resampling %s failed", symbol)
 
     return all_results
 
