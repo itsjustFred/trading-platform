@@ -9090,6 +9090,48 @@ async def _collect_source_signals(
     return normalized_signals, normalized_source
 
 
+async def _gather_replay_signals(
+    *,
+    payload_signals: list[dict[str, Any]],
+    source_name: str,
+    normalized_source: str,
+    account_id: str,
+    start_dt: datetime,
+    end_dt: datetime,
+    default_timeframe: str,
+) -> tuple[list[dict[str, Any]], str]:
+    """Collect, normalize and validate the signals to replay; returns (signals, source)."""
+    if payload_signals:
+        normalized_signals: list[dict[str, Any]] = [
+            _normalize_replay_signal_payload(item, default_timeframe=default_timeframe)
+            for item in payload_signals
+        ]
+        replay_source_label = source_name or str(
+            normalized_signals[0].get("source") if normalized_signals else "manual"
+        )
+        replay_source_label = replay_source_label.strip().lower() or "manual"
+    else:
+        normalized_signals, replay_source_label = await _collect_source_signals(
+            normalized_source=normalized_source,
+            account_id=account_id,
+            start_dt=start_dt,
+            end_dt=end_dt,
+            default_timeframe=default_timeframe,
+        )
+        replay_source_label = replay_source_label or normalized_source
+
+    normalized_signals = [
+        item
+        for item in normalized_signals
+        if str(item.get("symbol") or "").strip()
+        and str(item.get("action") or "") in {"buy", "sell"}
+        and _safe_float(item.get("entry_price"), 0.0) > 0
+    ]
+    if not normalized_signals:
+        raise HTTPException(status_code=400, detail="No valid signals to replay")
+    return normalized_signals, replay_source_label
+
+
 @app.post("/api/backtests/run-signals", status_code=202)
 async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, Any]:
     requested_timeframe = normalize_timeframe(str(payload.timeframe or "").strip()) or ""
@@ -9126,35 +9168,15 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
         raise HTTPException(status_code=400, detail="max_positions must be > 0")
 
     default_timeframe = requested_timeframe or "1h"
-    if direct_signals_payload:
-        normalized_signals: list[dict[str, Any]] = [
-            _normalize_replay_signal_payload(item, default_timeframe=default_timeframe)
-            for item in direct_signals_payload
-        ]
-        replay_source_label = source_name or str(
-            normalized_signals[0].get("source") if normalized_signals else "manual"
-        )
-        replay_source_label = replay_source_label.strip().lower() or "manual"
-    else:
-        normalized_signals, replay_source_label = await _collect_source_signals(
-            normalized_source=normalized_source,
-            account_id=account_id,
-            start_dt=start_dt,
-            end_dt=end_dt,
-            default_timeframe=default_timeframe,
-        )
-        replay_source_label = replay_source_label or normalized_source
-
-    normalized_signals = [
-        item
-        for item in normalized_signals
-        if str(item.get("symbol") or "").strip()
-        and str(item.get("action") or "") in {"buy", "sell"}
-        and _safe_float(item.get("entry_price"), 0.0) > 0
-    ]
-    if not normalized_signals:
-        raise HTTPException(status_code=400, detail="No valid signals to replay")
-
+    normalized_signals, replay_source_label = await _gather_replay_signals(
+        payload_signals=direct_signals_payload,
+        source_name=source_name,
+        normalized_source=normalized_source,
+        account_id=account_id,
+        start_dt=start_dt,
+        end_dt=end_dt,
+        default_timeframe=default_timeframe,
+    )
     timeframe = _resolve_signal_replay_timeframe(
         requested_timeframe=requested_timeframe,
         normalized_signals=normalized_signals,
