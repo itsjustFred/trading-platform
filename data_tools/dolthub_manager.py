@@ -171,6 +171,111 @@ def _stock_export_path(target_dir: Path, symbol: str) -> Path:
     return canonical_path
 
 
+def _stocks_table_name(stocks_repo: Path) -> str | None:
+    tables = _list_tables(stocks_repo)
+    if "ohlcv" in tables:
+        return "ohlcv"
+    return tables[0] if tables else None
+
+
+def _export_stocks() -> None:
+    """Export Stocks (Daily OHLCV) as per-symbol parquet files."""
+    stocks_repo = DOLT_DIR / "stocks"
+    if not stocks_repo.exists() or not (stocks_repo / DOLT_METADATA_DIR).exists():
+        return
+
+    logger.info("Exporting stocks OHLCV...")
+    target_dir = EXPORT_DIR / "equity" / "US"
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    table_name = _stocks_table_name(stocks_repo)
+    if not table_name:
+        logger.error("No tables found in stocks repo")
+        return
+
+    logger.info(f"Using table: {table_name}")
+    symbols = _list_symbols(stocks_repo, table_name)
+    logger.info(f"Found {len(symbols)} symbols to export.")
+
+    for i, symbol in enumerate(symbols):
+        out_parquet = _stock_export_path(target_dir, symbol)
+        if out_parquet.exists():
+            continue  # skip already exported
+
+        if i % 500 == 0:
+            logger.info(f"  Progress: {i}/{len(symbols)} symbols...")
+
+        _export_symbol_csv(stocks_repo, table_name, symbol, target_dir, out_parquet)
+
+
+def _list_symbols(stocks_repo: Path, table_name: str) -> list[str]:
+    result = subprocess.run(
+        ["dolt", "sql", "-q", f"SELECT DISTINCT act_symbol FROM {table_name}", "-r", "csv"],
+        cwd=stocks_repo,
+        capture_output=True,
+        text=True,
+    )
+    lines = result.stdout.strip().split("\n")[1:]  # skip header
+    return [l.strip() for l in lines if l.strip()]
+
+
+def _export_symbol_csv(
+    stocks_repo: Path, table_name: str, symbol: str, target_dir: Path, out_parquet: Path
+) -> None:
+    try:
+        out_parquet.parent.mkdir(parents=True, exist_ok=True)
+        sym_csv = target_dir / f"{symbol}.csv"
+        with open(sym_csv, "w") as f:
+            subprocess.check_call(
+                [
+                    "dolt",
+                    "sql",
+                    "-q",
+                    f"SELECT date, open, high, low, close, volume FROM {table_name} WHERE act_symbol='{symbol}' ORDER BY date",
+                    "-r",
+                    "csv",
+                ],
+                cwd=stocks_repo,
+                stdout=f,
+            )
+        df = pd.read_csv(sym_csv)
+        if not df.empty:
+            df.rename(columns={"date": "timestamp"}, inplace=True)
+            df["timestamp"] = pd.to_datetime(df["timestamp"])
+            df.to_parquet(out_parquet, index=False)
+    except Exception as e:
+        logger.warning(f"Failed to export {symbol}: {e}")
+    finally:
+        csv_path = target_dir / f"{symbol}.csv"
+        if csv_path.exists():
+            csv_path.unlink()
+
+
+def _export_repo_tables(repo_name: str, output_dir: Path) -> None:
+    """Export every table of a dolt repo as one parquet file per table."""
+    repo_path = DOLT_DIR / repo_name
+    if not repo_path.exists() or not (repo_path / DOLT_METADATA_DIR).exists():
+        return
+
+    logger.info(f"Exporting {repo_name} tables...")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    for table in _list_tables(repo_path):
+        out_parquet = output_dir / f"{table}.parquet"
+        if out_parquet.exists():
+            continue
+        try:
+            csv_path = output_dir / f"{table}.csv"
+            _export_table_csv(repo_path, table, csv_path)
+            df = pd.read_csv(csv_path)
+            if not df.empty:
+                df.to_parquet(out_parquet, index=False)
+                logger.info(f"  Exported {table}: {len(df)} rows")
+            csv_path.unlink()
+        except Exception as e:
+            logger.warning(f"Failed to export {repo_name}/{table}: {e}")
+
+
 def export_data():
     EXPORT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -238,48 +343,12 @@ def export_data():
                         csv_path.unlink()
 
     # Export Earnings — whole tables as parquet
-    earnings_repo = DOLT_DIR / "earnings"
-    if earnings_repo.exists() and (earnings_repo / DOLT_METADATA_DIR).exists():
-        logger.info("Exporting earnings tables...")
-        earnings_dir = DATA_DIR / "fundamentals" / "dolthub" / "earnings"
-        earnings_dir.mkdir(parents=True, exist_ok=True)
-
-        for table in _list_tables(earnings_repo):
-            out_parquet = earnings_dir / f"{table}.parquet"
-            if out_parquet.exists():
-                continue
-            try:
-                csv_path = earnings_dir / f"{table}.csv"
-                _export_table_csv(earnings_repo, table, csv_path)
-                df = pd.read_csv(csv_path)
-                if not df.empty:
-                    df.to_parquet(out_parquet, index=False)
-                    logger.info(f"  Exported {table}: {len(df)} rows")
-                csv_path.unlink()
-            except Exception as e:
-                logger.warning(f"Failed to export earnings/{table}: {e}")
+    _export_repo_tables(
+        "earnings", DATA_DIR / "fundamentals" / "dolthub" / "earnings"
+    )
 
     # Export Rates
-    rates_repo = DOLT_DIR / "rates"
-    if rates_repo.exists() and (rates_repo / DOLT_METADATA_DIR).exists():
-        logger.info("Exporting rates...")
-        rates_dir = DATA_DIR / "fundamentals" / "dolthub" / "rates"
-        rates_dir.mkdir(parents=True, exist_ok=True)
-
-        for table in _list_tables(rates_repo):
-            out_parquet = rates_dir / f"{table}.parquet"
-            if out_parquet.exists():
-                continue
-            try:
-                csv_path = rates_dir / f"{table}.csv"
-                _export_table_csv(rates_repo, table, csv_path)
-                df = pd.read_csv(csv_path)
-                if not df.empty:
-                    df.to_parquet(out_parquet, index=False)
-                    logger.info(f"  Exported {table}: {len(df)} rows")
-                csv_path.unlink()
-            except Exception as e:
-                logger.warning(f"Failed to export rates/{table}: {e}")
+    _export_repo_tables("rates", DATA_DIR / "fundamentals" / "dolthub" / "rates")
 
     logger.info("Export completed.")
 
