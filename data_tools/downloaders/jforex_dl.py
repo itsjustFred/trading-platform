@@ -360,13 +360,18 @@ def _discover_jars(root: Path) -> list[Path]:
     for search_root in search_roots:
         jars.extend(sorted(path for path in search_root.rglob("*.jar") if path.is_file()))
 
-    deduped: list[Path] = []
-    seen: set[Path] = set()
-    for jar in jars:
-        if jar in seen:
+    return [Path(entry) for entry in _dedupe_preserving_order(str(jar) for jar in jars)]
+
+
+def _dedupe_preserving_order(entries: list[str]) -> list[str]:
+    """First-occurrence dedupe used for JAR URL and JAR path collections."""
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for entry in entries:
+        if entry in seen:
             continue
-        deduped.append(jar)
-        seen.add(jar)
+        deduped.append(entry)
+        seen.add(entry)
     return deduped
 
 
@@ -415,14 +420,7 @@ def _parse_jnlp_jar_urls(jnlp_url: str, *, _visited: set[str] | None = None) -> 
             _require_allowed_dukascopy_url(extension_url, "JNLP extension")
             jar_urls.extend(_parse_jnlp_jar_urls(extension_url, _visited=visited))
 
-    deduped: list[str] = []
-    seen: set[str] = set()
-    for entry in jar_urls:
-        if entry in seen:
-            continue
-        deduped.append(entry)
-        seen.add(entry)
-    return deduped
+    return _dedupe_preserving_order(jar_urls)
 
 
 def _download_jforex_jars_from_jnlp(
