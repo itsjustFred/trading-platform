@@ -21,6 +21,7 @@ from shared.models import BacktestMeta, BacktestResult, Trade, TradeExit
 logger = logging.getLogger(__name__)
 
 # Stockkit CSV columns (;-separated)
+TP1_PRICE_COLUMN = "TP1 Price"
 EXPECTED_HEADERS = [
     "Symbol",
     "Direction",
@@ -34,7 +35,7 @@ EXPECTED_HEADERS = [
     "Qty TP1",
     "Qty Runner",
     "TP1 Reached",
-    "TP1 Price",
+    TP1_PRICE_COLUMN,
     "SL Price",
     "Initial SL",
     "Exit Reason",
@@ -110,7 +111,7 @@ def _build_trades(rows: list[dict], strategy_name: str) -> list[Trade]:
             qty_tp1 = int(row["Qty TP1"])
             qty_runner = int(row["Qty Runner"])
             tp1_reached = row["TP1 Reached"].strip().lower() == "yes"
-            tp1_price = float(row["TP1 Price"]) if row["TP1 Price"].strip() else None
+            tp1_price = float(row[TP1_PRICE_COLUMN]) if row[TP1_PRICE_COLUMN].strip() else None
             exit_reason = row["Exit Reason"].strip()
             total_pnl = float(row["PnL ($)"])
             slippage = float(row["Slippage"]) if row["Slippage"].strip() else 0.0

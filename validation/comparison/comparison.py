@@ -23,6 +23,10 @@ def _normalize_timestamp(ts: str) -> datetime:
     return dt.astimezone(timezone.utc)
 
 
+_MATCH_SUFFIX = " (match)"
+_MISMATCH_SUFFIX = " (mismatch)"
+
+
 def _pct_diff(a: float, b: float) -> float:
     """Return the relative difference, using max(|a|, |b|) as denominator."""
     denom = max(abs(a), abs(b))
@@ -181,7 +185,7 @@ class TradeComparator:
             tolerance=None,
             passed=passed,
             message=f"Direction: expected {expected!r}, got {actual!r}"
-            + (" (match)" if passed else " (mismatch)"),
+            + (_MATCH_SUFFIX if passed else _MISMATCH_SUFFIX),
         )
 
     def _compare_time(
@@ -196,7 +200,7 @@ class TradeComparator:
             tolerance=tolerance,
             passed=passed,
             message=f"{field_name} difference is {diff:.3f}s (tolerance {tolerance}s)"
-            + (" (match)" if passed else " (mismatch)"),
+            + (_MATCH_SUFFIX if passed else _MISMATCH_SUFFIX),
         )
 
     def _compare_pct(
@@ -211,7 +215,7 @@ class TradeComparator:
             tolerance=tolerance,
             passed=passed,
             message=f"{field_name} relative difference is {diff:.6f} (tolerance {tolerance:.6f})"
-            + (" (match)" if passed else " (mismatch)"),
+            + (_MATCH_SUFFIX if passed else _MISMATCH_SUFFIX),
         )
 
     def _compare_optional_pct(
@@ -263,5 +267,5 @@ class TradeComparator:
             passed=passed,
             message=f"PnL relative diff {diff_pct:.6f} (tol {tolerance_pct:.6f}), "
             f"absolute diff {diff_abs:.6f} (tol {tolerance_abs:.6f})"
-            + (" (match)" if passed else " (mismatch)"),
+            + (_MATCH_SUFFIX if passed else _MISMATCH_SUFFIX),
         )

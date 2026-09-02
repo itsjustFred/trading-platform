@@ -27,6 +27,8 @@ from scipy.optimize import minimize
 # Ensure project root is importable when called directly
 import sys
 
+_ISO_UTC_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -319,7 +321,7 @@ def run_backtest(
             {
                 "signal_id": portfolio_target_signal_id,
                 "strategy_id": "risk_parity",
-                "timestamp": reb_date.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "timestamp": reb_date.strftime(_ISO_UTC_FORMAT),
                 "target_weights": {
                     ticker: round(float(weights[ticker]), 8) for ticker in TICKERS
                 },
@@ -375,9 +377,9 @@ def run_backtest(
             )
             trades.append(
                 {
-                    "entry_time": entry_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "entry_time": entry_time.strftime(_ISO_UTC_FORMAT),
                     "symbol": ticker,
-                    "exit_time": reb_date.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "exit_time": reb_date.strftime(_ISO_UTC_FORMAT),
                     "direction": direction,
                     "entry_price": round(entry_price, 6),
                     "exit_price": round(price, 6),

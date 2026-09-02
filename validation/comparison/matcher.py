@@ -16,6 +16,11 @@ from pydantic import BaseModel, ConfigDict, Field
 from shared.models import Trade
 
 
+# datetime.fromisoformat does not understand "Z" in Python < 3.11
+_UTC_SUFFIX_Z = "Z"
+_UTC_SUFFIX_OFFSET = "+00:00"
+
+
 def _normalize_timestamp(ts: str) -> datetime:
     """Parse an ISO-8601 timestamp and return a timezone-aware UTC datetime.
 
@@ -24,7 +29,7 @@ def _normalize_timestamp(ts: str) -> datetime:
     from different time zones can be compared.
     """
     # datetime.fromisoformat does not understand "Z" in Python < 3.11
-    normalized = ts.replace("Z", "+00:00")
+    normalized = ts.replace(_UTC_SUFFIX_Z, _UTC_SUFFIX_OFFSET)
     dt = datetime.fromisoformat(normalized)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
@@ -148,8 +153,8 @@ class TradeMatcher:
                 act_data[found_idx]["matched"] = True
                 act_trade = act_data[found_idx]["trade"]
                 key = MatchKey(
-                    entry_time=ref["entry"].isoformat().replace("+00:00", "Z"),
-                    exit_time=ref["exit"].isoformat().replace("+00:00", "Z"),
+                    entry_time=ref["entry"].isoformat().replace(_UTC_SUFFIX_OFFSET, _UTC_SUFFIX_Z),
+                    exit_time=ref["exit"].isoformat().replace(_UTC_SUFFIX_OFFSET, _UTC_SUFFIX_Z),
                     symbol=ref["trade"].symbol,
                     direction=ref["trade"].direction,
                 )

@@ -59,6 +59,15 @@ STRATEGIES_DIR = DEFAULT_STRATEGIES_DIR
 PORTFOLIOS_DIR = DATA_DIR / "portfolios"
 LOGS_DIR = LOG_DIR
 TASK_LOGS_DIR = LOGS_DIR / "tasks"
+TRADES_SUFFIX = ".trades"
+TRADES_FILE_GLOB = "*.trades.json"
+JSON_FILE_GLOB = "*.json"
+NOT_FOUND_ERROR = "Not found"
+JSON_BODY_REQUIRED_ERROR = "JSON body required"
+CATALOG_FILE_NAME = "catalog.json"
+TASK_NOT_FOUND_ERROR = "Task not found"
+JFOREX_SDK_UNAVAILABLE_ERROR = "JForex SDK classes unavailable"
+JAVA_RUNTIME_UNAVAILABLE_ERROR = "Java/JVM runtime unavailable"
 ALL_LOGS_NAME = "ALL_LOGS"
 _running_jobs: dict[str, dict] = {}  # job_id -> {status, result, error}
 _JOBS_LOCK = threading.RLock()
@@ -1339,7 +1348,7 @@ def _strategy_backtests(entry: StrategyEntry) -> list[dict]:
     if not BACKTESTS_DIR.exists():
         return backtests
 
-    for bt_file in sorted(BACKTESTS_DIR.glob("*.trades.json")):
+    for bt_file in sorted(BACKTESTS_DIR.glob(TRADES_FILE_GLOB)):
         try:
             bt_data = json.loads(bt_file.read_text(encoding="utf-8"))
             bt_meta = bt_data.get("meta", {})
@@ -1355,7 +1364,7 @@ def _strategy_backtests(entry: StrategyEntry) -> list[dict]:
             strategy_slug, strategy_display_name, _ = _strategy_labels(raw_strategy)
             backtests.append(
                 {
-                    "id": bt_file.stem.replace(".trades", ""),
+                    "id": bt_file.stem.replace(TRADES_SUFFIX, ""),
                     "title": notes or strategy_display_name,
                     "notes": notes,
                     "strategy_slug": strategy_slug,
@@ -1380,7 +1389,7 @@ def _strategy_portfolios(entry: StrategyEntry) -> list[dict]:
     if not PORTFOLIOS_DIR.exists():
         return portfolios
 
-    for pf_file in PORTFOLIOS_DIR.glob("*.json"):
+    for pf_file in PORTFOLIOS_DIR.glob(JSON_FILE_GLOB):
         try:
             pf_data = json.loads(pf_file.read_text(encoding="utf-8"))
             strategies = pf_data.get("strategies", [])
@@ -1723,7 +1732,7 @@ def _scan_ohlcv_filesystem() -> list[dict]:
 
 def _load_catalog_ohlcv_entries() -> tuple[list[dict], bool]:
     """Load cached OHLCV catalog entries if catalog.json is available."""
-    catalog_path = DATA_DIR / "catalog.json"
+    catalog_path = DATA_DIR / CATALOG_FILE_NAME
     if not catalog_path.exists():
         return [], False
 
@@ -1756,7 +1765,7 @@ def _refresh_catalog() -> None:
     """Rebuild the data catalog after file mutations."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     catalog = build_catalog(DATA_DIR)
-    (DATA_DIR / "catalog.json").write_text(json.dumps(catalog, indent=2, default=str))
+    (DATA_DIR / CATALOG_FILE_NAME).write_text(json.dumps(catalog, indent=2, default=str))
 
 
 DATA_TASKS: dict[str, dict[str, Any]] = {}
@@ -3226,15 +3235,15 @@ def _jforex_fallback_reason(exc: Exception) -> str | None:
     availability_reason_by_fragment = {
         "jpype is required": "JPype dependency missing",
         "no module named 'jpype'": "JPype dependency missing",
-        "failed to import 'com.dukascopy'": "JForex SDK classes unavailable",
-        "classnotfoundexception": "JForex SDK classes unavailable",
-        "com.dukascopy": "JForex SDK classes unavailable",
+        "failed to import 'com.dukascopy'": JFOREX_SDK_UNAVAILABLE_ERROR,
+        "classnotfoundexception": JFOREX_SDK_UNAVAILABLE_ERROR,
+        "com.dukascopy": JFOREX_SDK_UNAVAILABLE_ERROR,
         "failed to start jvm": "Java/JVM startup failed",
         "could not resolve jforex sdk classpath": "JForex SDK classpath unavailable",
         "jforex sdk classpath": "JForex SDK classpath unavailable",
-        "jvm shared library": "Java/JVM runtime unavailable",
-        "jvm dll not found": "Java/JVM runtime unavailable",
-        "no jvm shared library file": "Java/JVM runtime unavailable",
+        "jvm shared library": JAVA_RUNTIME_UNAVAILABLE_ERROR,
+        "jvm dll not found": JAVA_RUNTIME_UNAVAILABLE_ERROR,
+        "no jvm shared library file": JAVA_RUNTIME_UNAVAILABLE_ERROR,
         "nullpointerexception": "JForex runtime classloader failure",
         "jforex sdk request execution failed": "JForex request execution failed",
         "jforex connection timed out": "JForex connection timed out",

@@ -171,7 +171,15 @@ OHLCV_PARQUET_SUFFIX = ".parquet"
 
 BACKTESTS_DIR = DATA_DIR / "backtests"
 MATRIX_RESULTS_DIR = DATA_DIR / "backtests" / "matrix_runner"
-MATRIX_GRID_OVERVIEW_PATH = PROJECT_ROOT / "frontend" / "public" / "matrix-grid-overview.json"
+MATRIX_GRID_OVERVIEW_FILE = "matrix-grid-overview.json"
+MATRIX_GRID_OVERVIEW_PATH = PROJECT_ROOT / "frontend" / "public" / MATRIX_GRID_OVERVIEW_FILE
+LIVE_DEPLOYMENTS_PATH = "/api/live/deployments"
+TASK_NOT_FOUND_DETAIL = "Task not found"
+PARQUET_SUFFIX = ".parquet"
+NOT_FOUND_DETAIL = "Not found"
+SAVED_TO_PREFIX = "saved to:"
+SAVING_RESULTS_MESSAGE = "Saving results..."
+SERVICE_NOT_FOUND_DETAIL = "Service not found"
 PORTFOLIOS_DIR = DATA_DIR / "portfolios"
 STRATEGIES_DIR = DEFAULT_STRATEGIES_DIR
 REACT_DIST = PROJECT_ROOT / "frontend" / "dist"
@@ -1133,7 +1141,7 @@ _QUIET_EXACT_PATHS = {
     "/api/tasks",
     "/api/data/tasks",
     "/api/live/accounts",
-    "/api/live/deployments",
+    LIVE_DEPLOYMENTS_PATH,
 }
 _QUIET_PREFIX_PATHS = (
     "/api/tasks/",
@@ -1317,14 +1325,14 @@ def _task_status(task_id: str) -> str | None:
 def _task_action_payload(task_id: str) -> dict[str, Any]:
     task = _snapshot_task(task_id)
     if task is None:
-        raise HTTPException(status_code=404, detail="Task not found")
+        raise HTTPException(status_code=404, detail=TASK_NOT_FOUND_DETAIL)
     return _serialize_task(task_id, task, include_log=True)
 
 
 def _restart_interrupted_task(task_id: str) -> dict[str, Any]:
     task = _get_task(task_id)
     if task is None:
-        raise HTTPException(status_code=404, detail="Task not found")
+        raise HTTPException(status_code=404, detail=TASK_NOT_FOUND_DETAIL)
     current_status = str(task.get("status") or "").lower()
     if current_status not in {"interrupted", "failed"}:
         raise HTTPException(status_code=409, detail="Only interrupted or failed tasks can be restarted")
@@ -6828,8 +6836,8 @@ def _matrix_summary_payload() -> dict[str, Any]:
 def _matrix_grid_overview_path() -> Path:
     candidates = [
         MATRIX_GRID_OVERVIEW_PATH,
-        STATIC_DIR / "matrix-grid-overview.json",
-        PROJECT_ROOT / "frontend" / "public" / "matrix-grid-overview.json",
+        STATIC_DIR / MATRIX_GRID_OVERVIEW_FILE,
+        PROJECT_ROOT / "frontend" / "public" / MATRIX_GRID_OVERVIEW_FILE,
     ]
     for path in candidates:
         if path.exists():
@@ -7233,7 +7241,7 @@ async def rename_backtest_name(backtest_id: str, payload: NameUpdateRequest) -> 
 async def get_backtest_info(backtest_id: str) -> dict[str, Any]:
     result = _load_result(backtest_id)
     if result is None:
-        raise HTTPException(status_code=404, detail="Not found")
+        raise HTTPException(status_code=404, detail=NOT_FOUND_DETAIL)
     return legacy_viewer._backtest_info_payload(result)
 
 
@@ -7260,7 +7268,7 @@ async def get_equity_curve(
 ) -> list[dict[str, float]]:
     result = _load_result(backtest_id)
     if result is None:
-        raise HTTPException(status_code=404, detail="Not found")
+        raise HTTPException(status_code=404, detail=NOT_FOUND_DETAIL)
     equity_curve = legacy_viewer._equity_to_viewer(result)
     equity_curve.sort(key=lambda point: _safe_float(point.get("time"), 0.0))
     if max_points and max_points > 0 and str(sampling or "").strip().lower() in {"minmax", "min_max"}:
@@ -7482,7 +7490,7 @@ async def get_backtest_trades(
 ) -> list[dict[str, Any]]:
     result = _load_result(backtest_id)
     if result is None:
-        raise HTTPException(status_code=404, detail="Not found")
+        raise HTTPException(status_code=404, detail=NOT_FOUND_DETAIL)
     paged_trades = result.trades[offset : offset + limit]
     return [legacy_viewer._trade_to_viewer(trade) for trade in paged_trades]
 
@@ -7811,7 +7819,7 @@ def _trade_context_indicators(
 def _trade_context_payload(backtest_id: str, trade_nr: int) -> dict[str, Any]:
     result = _load_result(backtest_id)
     if result is None:
-        raise HTTPException(status_code=404, detail="Not found")
+        raise HTTPException(status_code=404, detail=NOT_FOUND_DETAIL)
     try:
         trade, trade_payload = _resolve_trade(result, trade_nr)
         symbol = str(trade.symbol or "").strip() or "SPY"
@@ -7907,7 +7915,7 @@ def _replay_indicators(
 def _replay_payload(backtest_id: str) -> dict[str, Any]:
     result = _load_result(backtest_id)
     if result is None:
-        raise HTTPException(status_code=404, detail="Not found")
+        raise HTTPException(status_code=404, detail=NOT_FOUND_DETAIL)
     try:
         trades = [legacy_viewer._trade_to_viewer(trade) for trade in result.trades]
         timeframe = _replay_timeframe(result)
@@ -7958,7 +7966,7 @@ async def get_backtest_ohlcv(backtest_id: str) -> dict[str, Any]:
 def _backtest_ohlcv_payload(backtest_id: str) -> dict[str, Any]:
     result = _load_result(backtest_id)
     if result is None:
-        raise HTTPException(status_code=404, detail="Not found")
+        raise HTTPException(status_code=404, detail=NOT_FOUND_DETAIL)
 
     symbols = result.meta.data.get("symbols", [])
     timeframe = (
@@ -8199,8 +8207,8 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
             return (82.0, "Processing trades...")
         if normalized.startswith("result:"):
             return (90.0, "Calculating statistics...")
-        if normalized.startswith("saved to:"):
-            return (96.0, "Saving results...")
+        if normalized.startswith(SAVED_TO_PREFIX):
+            return (96.0, SAVING_RESULTS_MESSAGE)
         return None
 
     def _run() -> None:
@@ -8360,7 +8368,7 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
                             report_stage(handle, percent=percent, message=message)
 
                         if parsed_message.lower().startswith("saved to:"):
-                            output_path = parsed_message[len("saved to:"):].strip()
+                            output_path = parsed_message[len(SAVED_TO_PREFIX):].strip()
                             if output_path:
                                 filename = Path(output_path).name
                                 if filename.endswith(BACKTEST_TRADES_SUFFIX):
@@ -8396,7 +8404,7 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
                         f"Backtest timed out after {BACKTEST_WATCHDOG_TIMEOUT_SECONDS:.0f} seconds"
                     )
                 if returncode == 0:
-                    report_stage(handle, percent=96.0, message="Saving results...")
+                    report_stage(handle, percent=96.0, message=SAVING_RESULTS_MESSAGE)
                     result_payload = {
                         "output_path": output_path or None,
                         "backtest_id": backtest_id or None,
@@ -8783,7 +8791,7 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
                     result.meta.tags.append(f"account:{account_id}")
                 result.meta.tags = sorted({str(tag).strip() for tag in result.meta.tags if str(tag).strip()})
 
-                report_stage(handle, percent=96.0, message="Saving results...")
+                report_stage(handle, percent=96.0, message=SAVING_RESULTS_MESSAGE)
                 BACKTESTS_DIR.mkdir(parents=True, exist_ok=True)
                 output_path = BACKTESTS_DIR / f"{result.meta.id}.trades.json"
                 result.save(output_path)
@@ -9779,7 +9787,7 @@ async def create_service_endpoint(payload: ServiceCreateRequest) -> dict[str, An
 async def get_service_endpoint(service_id: str) -> dict[str, Any]:
     service = await asyncio.to_thread(get_service, service_id)
     if service is None:
-        raise HTTPException(status_code=404, detail="Service not found")
+        raise HTTPException(status_code=404, detail=SERVICE_NOT_FOUND_DETAIL)
     return _serialize_service_payload(service)
 
 
@@ -9793,7 +9801,7 @@ async def update_service_status_endpoint(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if updated is None:
-        raise HTTPException(status_code=404, detail="Service not found")
+        raise HTTPException(status_code=404, detail=SERVICE_NOT_FOUND_DETAIL)
     return _serialize_service_payload(updated)
 
 
@@ -9801,7 +9809,7 @@ async def update_service_status_endpoint(
 async def delete_service_endpoint(service_id: str) -> dict[str, Any]:
     deleted = await asyncio.to_thread(delete_service, service_id)
     if not deleted:
-        raise HTTPException(status_code=404, detail="Service not found")
+        raise HTTPException(status_code=404, detail=SERVICE_NOT_FOUND_DETAIL)
     return {"status": "deleted", "id": service_id}
 
 
@@ -9863,7 +9871,7 @@ async def get_service_logs_endpoint(
 ) -> LogContentModel:
     service = await asyncio.to_thread(get_service, service_id)
     if service is None:
-        raise HTTPException(status_code=404, detail="Service not found")
+        raise HTTPException(status_code=404, detail=SERVICE_NOT_FOUND_DETAIL)
     try:
         entries = legacy_viewer._collect_log_entries(legacy_viewer._available_log_files())
         level_filter = legacy_viewer._normalize_log_levels(level)
@@ -9958,9 +9966,9 @@ async def create_verification_evidence(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.get("/api/live/deployments")
+@app.get(LIVE_DEPLOYMENTS_PATH)
 async def get_live_deployments() -> list[dict[str, Any]]:
-    _log_live_endpoint_request("/api/live/deployments")
+    _log_live_endpoint_request(LIVE_DEPLOYMENTS_PATH)
     deployments = await asyncio.to_thread(list_live_deployments)
     return [_serialize_live_deployment_payload(deployment) for deployment in deployments]
 
@@ -10089,7 +10097,7 @@ async def deploy_top_ctrader_strategies(payload: CTraderTopDeployRequest) -> dic
     }
 
 
-@app.post("/api/live/deployments", status_code=201)
+@app.post(LIVE_DEPLOYMENTS_PATH, status_code=201)
 async def create_live_deployment_endpoint(
     payload: LiveDeploymentCreateRequest,
 ) -> dict[str, Any]:
@@ -10097,7 +10105,7 @@ async def create_live_deployment_endpoint(
         payload.signal_source_type or payload.signal_source or "internal"
     ).strip().lower()
     _log_live_endpoint_request(
-        "/api/live/deployments",
+        LIVE_DEPLOYMENTS_PATH,
         strategy_name=payload.strategy_name,
         account_id=payload.account_id,
         symbols=payload.symbols,
@@ -10977,7 +10985,7 @@ async def list_tasks() -> dict[str, Any]:
 async def get_data_task(task_id: str) -> dict[str, Any]:
     task = _snapshot_task(task_id)
     if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
+        raise HTTPException(status_code=404, detail=TASK_NOT_FOUND_DETAIL)
     return _serialize_task(task_id, task, include_log=True)
 
 
@@ -10990,7 +10998,7 @@ async def restart_data_task(task_id: str) -> dict[str, Any]:
 async def pause_data_task(task_id: str) -> dict[str, Any]:
     task = _get_task(task_id)
     if task is None:
-        raise HTTPException(status_code=404, detail="Task not found")
+        raise HTTPException(status_code=404, detail=TASK_NOT_FOUND_DETAIL)
     if not task.get("supports_control", False):
         raise HTTPException(status_code=409, detail="Task cannot be paused")
     if task.get("status") in FINAL_TASK_STATUSES:
@@ -11010,7 +11018,7 @@ async def pause_data_task(task_id: str) -> dict[str, Any]:
 async def resume_data_task(task_id: str) -> dict[str, Any]:
     task = _get_task(task_id)
     if task is None:
-        raise HTTPException(status_code=404, detail="Task not found")
+        raise HTTPException(status_code=404, detail=TASK_NOT_FOUND_DETAIL)
     if not task.get("supports_control", False):
         raise HTTPException(status_code=409, detail="Task cannot be resumed")
     if task.get("status") in FINAL_TASK_STATUSES:
@@ -11030,7 +11038,7 @@ async def resume_data_task(task_id: str) -> dict[str, Any]:
 async def cancel_data_task(task_id: str) -> dict[str, Any]:
     task = _get_task(task_id)
     if task is None:
-        raise HTTPException(status_code=404, detail="Task not found")
+        raise HTTPException(status_code=404, detail=TASK_NOT_FOUND_DETAIL)
     if not task.get("supports_control", False):
         raise HTTPException(status_code=409, detail="Task cannot be cancelled")
     if task.get("status") in FINAL_TASK_STATUSES:
@@ -11052,7 +11060,7 @@ async def get_data_task_logs(task_id: str) -> dict[str, Any]:
     task = _snapshot_task(task_id)
     log_file = _task_log_path(task_id)
     if task is None and not log_file.exists():
-        raise HTTPException(status_code=404, detail="Task not found")
+        raise HTTPException(status_code=404, detail=TASK_NOT_FOUND_DETAIL)
     return {
         "logs": _read_task_log(task.get("log_file", log_file) if task else log_file),
         "status": task.get("status", "unknown") if task else "unknown",
@@ -11064,7 +11072,7 @@ async def delete_data_task(task_id: str) -> dict[str, Any]:
     with DATA_TASKS_LOCK:
         task = DATA_TASKS.get(task_id)
         if task is None:
-            raise HTTPException(status_code=404, detail="Task not found")
+            raise HTTPException(status_code=404, detail=TASK_NOT_FOUND_DETAIL)
         if task.get("status") not in FINAL_TASK_STATUSES:
             raise HTTPException(
                 status_code=409,

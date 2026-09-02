@@ -9,6 +9,11 @@ from signal_bots.health_check import check_signal_bots
 
 logger = get_logger("scheduler")
 
+_HEALTH_CHECK_DESCRIPTION = (
+    "Validates signal processor registry and config files for stockkit, "
+    "ramjet, rocketfuel, and nitro bots."
+)
+
 
 HEALTH_CHECK_DESCRIPTION = "Validates signal processor registry and config files for ramjet, rocketfuel, and nitro bots."
 

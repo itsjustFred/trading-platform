@@ -19,6 +19,8 @@ from signal_bots.registry import (
     get_signal_processor_config_path,
 )
 
+_BOT_CONFIG_FILE = "config.yaml"
+
 
 def check_signal_bots() -> dict[str, Any]:
     """Run signal bot health checks."""

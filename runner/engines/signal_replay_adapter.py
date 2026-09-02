@@ -504,7 +504,7 @@ class SignalReplayAdapter:
             frame = frames[signal.symbol]
             effective_signal = self._apply_signal_processor(signal, frame)
             if effective_signal is None:
-                emit(10.0 + ((index / total_signals) * 80.0), "Replaying signals...")
+                emit(10.0 + ((index / total_signals) * 80.0), _REPLAY_PROGRESS_MESSAGE)
                 continue
             # Settle protective exits for ALL open positions up to this
             # signal's fill time (CodeRabbit round): previously only the
@@ -553,7 +553,7 @@ class SignalReplayAdapter:
             if current_position is not None:
                 if current_position.direction == target_direction:
                     current_position.last_checked_at = fill_time
-                    emit(10.0 + ((index / total_signals) * 80.0), "Replaying signals...")
+                    emit(10.0 + ((index / total_signals) * 80.0), _REPLAY_PROGRESS_MESSAGE)
                     continue
                 flip_trade = self._close_position(
                     current_position,
@@ -566,10 +566,10 @@ class SignalReplayAdapter:
                 realized_pnl += float(flip_trade.pnl)
                 open_positions.pop(signal.symbol, None)
                 if exit_only:
-                    emit(10.0 + ((index / total_signals) * 80.0), "Replaying signals...")
+                    emit(10.0 + ((index / total_signals) * 80.0), _REPLAY_PROGRESS_MESSAGE)
                     continue
             elif exit_only:
-                emit(10.0 + ((index / total_signals) * 80.0), "Replaying signals...")
+                emit(10.0 + ((index / total_signals) * 80.0), _REPLAY_PROGRESS_MESSAGE)
                 continue
 
             account_balance = self._sizing_account_balance(
@@ -599,7 +599,7 @@ class SignalReplayAdapter:
             )
             quantity = float(sized.position_size)
             if quantity <= 0:
-                emit(10.0 + ((index / total_signals) * 80.0), "Replaying signals...")
+                emit(10.0 + ((index / total_signals) * 80.0), _REPLAY_PROGRESS_MESSAGE)
                 continue
 
             open_positions[signal.symbol] = _OpenPosition(
@@ -622,7 +622,7 @@ class SignalReplayAdapter:
                 signal_metadata=dict(effective_signal.metadata),
                 last_checked_at=fill_time,
             )
-            emit(10.0 + ((index / total_signals) * 80.0), "Replaying signals...")
+            emit(10.0 + ((index / total_signals) * 80.0), _REPLAY_PROGRESS_MESSAGE)
 
         emit(92.0, "Finalizing open positions...")
         for symbol, position in list(open_positions.items()):
@@ -701,6 +701,9 @@ class SignalReplayAdapter:
         result.stats = compute_stats_for_result(result)
         emit(100.0, f"Completed - {len(closed_trades)} trades found")
         return result
+
+
+_REPLAY_PROGRESS_MESSAGE = "Replaying signals..."
 
 
 class SignalReplayEngine:

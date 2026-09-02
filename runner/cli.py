@@ -42,6 +42,11 @@ logger = get_logger("runner")
 
 BACKTESTS_DIR = DATA_DIR / "backtests"
 
+HELP_INITIAL_CAPITAL = "Initial capital"
+HELP_OVERRIDE_DATA_DIR = "Override data directory"
+HELP_COMMA_SEPARATED_SYMBOLS = "Comma-separated symbols"
+HELP_RISK_PER_TRADE = "Risk per trade"
+
 
 def _emit_progress(
     callback: Callable[[float, str], None] | None,
@@ -488,7 +493,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--result-id", help="Persisted BacktestMeta.id override")
     run_p.add_argument("--skip-sqlite", action="store_true", help="Do not persist this run to SQLite")
     run_p.add_argument("--params", help="Parameters JSON, e.g. '{\"fast\": 10, \"slow\": 30}'")
-    run_p.add_argument("--data-dir", help="Override data directory")
+    run_p.add_argument("--data-dir", help=HELP_OVERRIDE_DATA_DIR)
     run_p.add_argument(
         "--keep-indicators",
         action="store_true",
@@ -509,11 +514,11 @@ def build_parser() -> argparse.ArgumentParser:
     wf_p = subparsers.add_parser("walkforward", help="Run walk-forward validation")
     wf_p.add_argument("--strategy", "-s", required=True, help="Strategy name or path")
     wf_p.add_argument("--engine", default="vectorbt", help="Backtest engine")
-    wf_p.add_argument("--symbols", required=True, help="Comma-separated symbols")
+    wf_p.add_argument("--symbols", required=True, help=HELP_COMMA_SEPARATED_SYMBOLS)
     wf_p.add_argument("--timeframe", "-tf", default="1d", help="Data timeframe")
     wf_p.add_argument("--start", required=True, help="Walk-forward start date")
     wf_p.add_argument("--end", required=True, help="Walk-forward end date")
-    wf_p.add_argument("--capital", type=float, default=100000, help="Initial capital")
+    wf_p.add_argument("--capital", type=float, default=100000, help=HELP_INITIAL_CAPITAL)
     wf_p.add_argument("--train-months", type=int, default=12, help="Training window in months")
     wf_p.add_argument("--test-months", type=int, default=3, help="Out-of-sample test window in months")
     wf_p.add_argument("--step-months", type=int, default=1, help="Rolling step in months")
@@ -521,13 +526,13 @@ def build_parser() -> argparse.ArgumentParser:
     _add_sizing_flags(wf_p, risk_default=None)
     wf_p.add_argument("--intrabar-resolution", default="open_close")
     wf_p.add_argument("--params", default="", help="Strategy params JSON")
-    wf_p.add_argument("--data-dir", default="", help="Override data directory")
+    wf_p.add_argument("--data-dir", default="", help=HELP_OVERRIDE_DATA_DIR)
     wf_p.set_defaults(func=cmd_walkforward)
 
     # Backtest grid command
     grid_p = subparsers.add_parser("grid", help="Run one strategy across a symbol/timeframe grid")
     grid_p.add_argument("--strategy", "-s", required=True, help="Path to strategy file")
-    grid_p.add_argument("--symbols", default="XAUUSD,SP500,NAS100,EURUSD,USDJPY,OIL", help="Comma-separated symbols")
+    grid_p.add_argument("--symbols", default="XAUUSD,SP500,NAS100,EURUSD,USDJPY,OIL", help=HELP_COMMA_SEPARATED_SYMBOLS)
     grid_p.add_argument("--timeframes", default="1m,5m,15m,1h,4h,1d", help="Comma-separated timeframes")
     grid_p.add_argument("--start", default="2020-01-01", help="Start date")
     grid_p.add_argument("--end", default="", help="End date, empty = auto-detect")
@@ -537,7 +542,7 @@ def build_parser() -> argparse.ArgumentParser:
     grid_p.add_argument("--intrabar-resolution", default="open_close")
     grid_p.add_argument("--params", default="", help='Strategy params JSON')
     grid_p.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
-    grid_p.add_argument("--data-dir", default="", help="Override data directory")
+    grid_p.add_argument("--data-dir", default="", help=HELP_OVERRIDE_DATA_DIR)
     grid_p.add_argument("--max-workers", type=int, default=1, help="Parallel grid cells")
     grid_p.add_argument("--timeout-seconds", type=int, default=1800, help="Timeout per grid cell")
     grid_p.add_argument("--resume", action="store_true", help="Skip cells with existing output JSON")
@@ -550,7 +555,7 @@ def build_parser() -> argparse.ArgumentParser:
     matrix_p = subparsers.add_parser("matrix", help="Run all strategies across a symbol/timeframe grid")
     matrix_p.add_argument("--strategy", "-s", action="append", default=[], help="Strategy slug/name/path to include; repeatable. Default: all.")
     matrix_p.add_argument("--strategies-dir", type=Path, default=Path("strategies"))
-    matrix_p.add_argument("--symbols", default="XAUUSD,SP500,NAS100,EURUSD,USDJPY,OIL", help="Comma-separated symbols")
+    matrix_p.add_argument("--symbols", default="XAUUSD,SP500,NAS100,EURUSD,USDJPY,OIL", help=HELP_COMMA_SEPARATED_SYMBOLS)
     matrix_p.add_argument("--timeframes", default="1m,5m,15m,1h,4h,1d", help="Comma-separated timeframes")
     matrix_p.add_argument("--start", default="2020-01-01", help="Start date")
     matrix_p.add_argument("--end", default="", help="End date, empty = auto-detect")
@@ -560,7 +565,7 @@ def build_parser() -> argparse.ArgumentParser:
     matrix_p.add_argument("--intrabar-resolution", default="open_close")
     matrix_p.add_argument("--params", default="", help='Strategy params JSON')
     matrix_p.add_argument("--output-dir", type=Path, default=MATRIX_OUTPUT_DIR)
-    matrix_p.add_argument("--data-dir", default="", help="Override data directory")
+    matrix_p.add_argument("--data-dir", default="", help=HELP_OVERRIDE_DATA_DIR)
     matrix_p.add_argument("--max-workers", type=int, default=1, help="Parallel grid cells per strategy")
     matrix_p.add_argument("--timeout-seconds", type=int, default=1800, help="Timeout per grid cell")
     matrix_p.add_argument("--resume", action="store_true", help="Skip/rehydrate cells with existing output JSON")

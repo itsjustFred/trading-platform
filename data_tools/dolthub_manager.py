@@ -17,6 +17,7 @@ from shared.sql import quote_identifier, quote_literal
 
 DOLT_DIR = DATA_DIR / "dolthub"
 EXPORT_DIR = DATA_DIR / "ohlcv" / "dolthub"
+DOLT_METADATA_DIR = ".dolt"
 
 REPOS = {
     "stocks": "post-no-preference/stocks",
@@ -112,7 +113,7 @@ def update_repos():
         if repo_path.exists():
             logger.info(f"Updating {name} in {repo_path}...")
             # Check if it is a dolt repo
-            if (repo_path / ".dolt").exists():
+            if (repo_path / DOLT_METADATA_DIR).exists():
                 try:
                     run_dolt(["dolt", "pull"], cwd=repo_path)
                 except (subprocess.CalledProcessError, DoltTimeoutError) as exc:
@@ -175,7 +176,7 @@ def export_data():
 
     # Export Stocks (Daily OHLCV) — per-symbol parquet files
     stocks_repo = DOLT_DIR / "stocks"
-    if stocks_repo.exists() and (stocks_repo / ".dolt").exists():
+    if stocks_repo.exists() and (stocks_repo / DOLT_METADATA_DIR).exists():
         logger.info("Exporting stocks OHLCV...")
         target_dir = EXPORT_DIR / "equity" / "US"
         target_dir.mkdir(parents=True, exist_ok=True)
@@ -238,7 +239,7 @@ def export_data():
 
     # Export Earnings — whole tables as parquet
     earnings_repo = DOLT_DIR / "earnings"
-    if earnings_repo.exists() and (earnings_repo / ".dolt").exists():
+    if earnings_repo.exists() and (earnings_repo / DOLT_METADATA_DIR).exists():
         logger.info("Exporting earnings tables...")
         earnings_dir = DATA_DIR / "fundamentals" / "dolthub" / "earnings"
         earnings_dir.mkdir(parents=True, exist_ok=True)
@@ -260,7 +261,7 @@ def export_data():
 
     # Export Rates
     rates_repo = DOLT_DIR / "rates"
-    if rates_repo.exists() and (rates_repo / ".dolt").exists():
+    if rates_repo.exists() and (rates_repo / DOLT_METADATA_DIR).exists():
         logger.info("Exporting rates...")
         rates_dir = DATA_DIR / "fundamentals" / "dolthub" / "rates"
         rates_dir.mkdir(parents=True, exist_ok=True)

@@ -30,6 +30,7 @@ from shared.atomic_io import write_text_atomically
 from shared.constants import DATA_DIR, normalize_timeframe
 
 CATALOG_FILE = "catalog.json"
+_COULD_NOT_READ_MESSAGE = "Could not read %s: %s"
 
 # Path to persisted source metadata (written by downloaders)
 SOURCE_META_FILE = "source_meta.json"
@@ -71,7 +72,7 @@ def _load_source_meta(data_dir: Path) -> dict[str, dict]:
         try:
             return json.loads(meta_path.read_text())
         except (json.JSONDecodeError, OSError) as exc:
-            logger.warning("Could not read %s: %s", meta_path, exc)
+            logger.warning(_COULD_NOT_READ_MESSAGE, meta_path, exc)
     return {}
 
 
@@ -84,7 +85,7 @@ def _load_catalog_cache(data_dir: Path) -> dict[str, dict]:
     try:
         payload = json.loads(cache_path.read_text())
     except (json.JSONDecodeError, OSError) as exc:
-        logger.warning("Could not read %s: %s", cache_path, exc)
+        logger.warning(_COULD_NOT_READ_MESSAGE, cache_path, exc)
         return {}
 
     cached_entries = payload.get("ohlcv", []) if isinstance(payload, dict) else []
@@ -812,7 +813,7 @@ def scan_ohlcv(data_dir: Path, include_validation: bool = False) -> list[dict]:
             else:
                 entry.update(read_parquet_summary(parquet_file))
         except (OSError, ValueError) as e:
-            logger.warning("Could not read %s: %s", parquet_file, e)
+            logger.warning(_COULD_NOT_READ_MESSAGE, parquet_file, e)
             try:
                 file_mtime = os.path.getmtime(parquet_file)
                 entry["size_bytes"] = os.path.getsize(parquet_file)

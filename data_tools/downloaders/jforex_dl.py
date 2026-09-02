@@ -545,18 +545,26 @@ def _trusted_java_home_roots() -> list[Path]:
         Path("/opt/java"),
     ]
 
+_JVM_LIBRARY_FILENAMES = ("jvm.dll", "libjvm.so", "libjvm.dylib")
+# (relative path segments) of the JVM shared library per platform, probed
+# against both flat JDK layouts and legacy "jre"-prefixed layouts.
+_JVM_LIBRARY_PATHS = (
+    ("bin", "server", _JVM_LIBRARY_FILENAMES[0]),  # Windows
+    ("lib", "server", _JVM_LIBRARY_FILENAMES[1]),  # Linux
+    ("lib", "server", _JVM_LIBRARY_FILENAMES[2]),  # macOS
+)
+_JAVA_HOME_LAYOUTS = ("", "jre")
+
+
 def _jvm_candidates_from_java_home(java_home: str | None) -> list[str]:
     if not java_home:
         return []
 
     root = Path(java_home).expanduser().resolve(strict=False)
     candidates = [
-        root / "bin" / "server" / "jvm.dll",  # Windows JDK/JRE
-        root / "jre" / "bin" / "server" / "jvm.dll",  # Legacy Windows layouts
-        root / "lib" / "server" / "libjvm.so",  # Linux JDK/JRE
-        root / "jre" / "lib" / "server" / "libjvm.so",  # Legacy Linux layouts
-        root / "lib" / "server" / "libjvm.dylib",  # macOS JDK/JRE
-        root / "jre" / "lib" / "server" / "libjvm.dylib",  # Legacy macOS layouts
+        Path(root, layout, *library_path)
+        for layout in _JAVA_HOME_LAYOUTS
+        for library_path in _JVM_LIBRARY_PATHS
     ]
     resolved_candidates: list[str] = []
     seen: set[str] = set()
@@ -591,7 +599,7 @@ def _is_trusted_custom_jvm_path(jvm_path: Path) -> bool:
     if resolved_path is None:
         return False
     file_name = resolved_path.name.lower()
-    if file_name not in {"jvm.dll", "libjvm.so", "libjvm.dylib"}:
+    if file_name not in _JVM_LIBRARY_FILENAMES:
         return False
 
     parents = resolved_path.parents
