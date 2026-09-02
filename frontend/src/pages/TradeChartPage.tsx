@@ -43,6 +43,9 @@ function formatTradeMetaValue(value: unknown): string {
   if (Array.isArray(value)) {
     return value.map(formatTradeMetaValue).join(", ");
   }
+  if (typeof value === "string") {
+    return value;
+  }
   if (value == null || typeof value === "number") {
     return String(value);
   }

@@ -84,11 +84,12 @@ function parseTimestamp(input: unknown): { short: string; long: string } {
     return { short: "--:--:--", long: "Unknown timestamp" };
   }
   // Normalise common ISO variants so the canonical pattern stays simple:
-  // "T" separator -> space, compact "+HHMM" zone -> "+HH:MM", "z" -> "Z".
+  // "T" separator -> space, compact "+HHMM" zone -> "+HH:MM", bare
+  // UTC suffix (Z/z) -> " Z" so the canonical pattern keeps matching.
   const normalized = raw
     .replace("T", " ")
     .replace(/([+-]\d{2})(\d{2})$/, "$1:$2")
-    .replace(/ z$/i, " Z");
+    .replace(/ ?[Zz]$/, " Z");
   const canonicalMatch = CANONICAL_TIMESTAMP_RE.exec(normalized);
   if (canonicalMatch) {
     const datePart = canonicalMatch[1];
@@ -825,10 +826,11 @@ export function LoggingPage() {
                         >
                           <span>{row.entry.message}</span>
                           {row.entry.data ? (
-                            <ChevronUp size={13} color="#93c5fd" />
-                          ) : null}
-                          {row.entry.data && !expanded ? (
-                            <ChevronDown size={13} color="#93c5fd" />
+                            expanded ? (
+                              <ChevronUp size={13} color="#93c5fd" />
+                            ) : (
+                              <ChevronDown size={13} color="#93c5fd" />
+                            )
                           ) : null}
                         </div>
                       </div>
