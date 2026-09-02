@@ -393,45 +393,8 @@ def _run_backtest_in_process_body(request: CellRequest) -> dict[str, Any]:
     return {"auto_downloaded_data": downloaded} if downloaded else {}
 
 
-def run_one_backtest_in_process(
-    *,
-    strategy: str,
-    symbol: str,
-    timeframe: str,
-    start: str,
-    end: str,
-    engine: str,
-    capital: float,
-    risk_pct: float | None,
-    max_position_pct: float | None,
-    max_leverage: float | None,
-    intrabar_resolution: str,
-    params: dict[str, Any] | None,
-    output_dir: Path,
-    data_dir: str,
-    skip_existing: bool,
-    save_sqlite: bool = True,
-    keep_indicators: bool = False,
-) -> dict[str, Any]:
-    request = CellRequest(
-        strategy=strategy,
-        symbol=symbol,
-        timeframe=timeframe,
-        start=start,
-        end=end,
-        engine=engine,
-        capital=capital,
-        risk_pct=risk_pct,
-        max_position_pct=max_position_pct,
-        max_leverage=max_leverage,
-        intrabar_resolution=intrabar_resolution,
-        params=params,
-        output_dir=output_dir,
-        data_dir=data_dir,
-        skip_existing=skip_existing,
-        save_sqlite=save_sqlite,
-        keep_indicators=keep_indicators,
-    )
+def run_one_backtest_in_process(request: CellRequest) -> dict[str, Any]:
+    """Run one grid cell in-process; ``request`` carries the whole cell."""
     result, _skipped = _init_cell_result(
         strategy=request.strategy,
         symbol=request.symbol,
@@ -480,37 +443,6 @@ def run_one_backtest(
     save_sqlite: bool = True,
     keep_indicators: bool = False,
 ) -> dict[str, Any]:
-    if not use_subprocess:
-        return run_one_backtest_in_process(
-            strategy=strategy,
-            symbol=symbol,
-            timeframe=timeframe,
-            start=start,
-            end=end,
-            engine=engine,
-            capital=capital,
-            risk_pct=risk_pct,
-            max_position_pct=max_position_pct,
-            max_leverage=max_leverage,
-            intrabar_resolution=intrabar_resolution,
-            params=params,
-            output_dir=output_dir,
-            data_dir=data_dir,
-            skip_existing=skip_existing,
-            save_sqlite=save_sqlite,
-            keep_indicators=keep_indicators,
-        )
-
-    result, _skipped = _init_cell_result(
-        strategy=strategy,
-        symbol=symbol,
-        timeframe=timeframe,
-        data_dir=data_dir,
-        start=start,
-        end=end,
-        output_dir=output_dir,
-        skip_existing=skip_existing,
-    )
     request = CellRequest(
         strategy=strategy,
         symbol=symbol,
@@ -546,6 +478,9 @@ def run_one_backtest(
     run_id = result["run_id"]
     path = Path(result["output"])
     resolved_start, resolved_end = result["start"], result["end"]
+
+    if not use_subprocess:
+        return run_one_backtest_in_process(request)
 
     cmd = build_cli_command(
         strategy=strategy,

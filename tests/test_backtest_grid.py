@@ -209,22 +209,24 @@ def test_in_process_uses_resolved_dates_for_daily_equity(monkeypatch, tmp_path):
     monkeypatch.setattr(bg, "get_engine", lambda e: FakeEngine())
 
     result = bg.run_one_backtest_in_process(
-        strategy=str(strategy),
-        symbol="SP500",
-        timeframe="1h",
-        start="",
-        end="",
-        engine="native",
-        capital=10000.0,
-        risk_pct=0.01,
-        max_position_pct=None,
-        max_leverage=None,
-        intrabar_resolution="open_close",
-        params=None,
-        output_dir=tmp_path / "out",
-        data_dir="/tmp/data",
-        skip_existing=False,
-        save_sqlite=False,
+        bg.CellRequest(
+            strategy=str(strategy),
+            symbol="SP500",
+            timeframe="1h",
+            start="",
+            end="",
+            engine="native",
+            capital=10000.0,
+            risk_pct=0.01,
+            max_position_pct=None,
+            max_leverage=None,
+            intrabar_resolution="open_close",
+            params=None,
+            output_dir=tmp_path / "out",
+            data_dir="/tmp/data",
+            skip_existing=False,
+            save_sqlite=False,
+        )
     )
 
     assert captured["start_date"] == "2024-01-01"
