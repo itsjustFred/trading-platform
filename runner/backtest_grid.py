@@ -16,6 +16,7 @@ import subprocess
 import sys
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -293,40 +294,52 @@ def _init_cell_result(
     return result, None
 
 
-def _run_backtest_in_process_body(
-    *,
-    strategy: str,
-    symbol: str,
-    timeframe: str,
-    start: str,
-    end: str,
-    engine: str,
-    capital: float,
-    risk_pct: float | None,
-    max_position_pct: float | None,
-    max_leverage: float | None,
-    intrabar_resolution: str,
-    params: dict[str, Any] | None,
-    output_dir: Path,
-    data_dir: str,
-    keep_indicators: bool,
-    save_sqlite: bool,
-) -> tuple[dict[str, Any], Any]:
+@dataclass(frozen=True)
+class CellRequest:
+    """One grid cell's request: the knobs that always travel together between
+    the grid runner, the shared cell preamble and the engine call."""
+
+    strategy: str
+    symbol: str
+    timeframe: str
+    start: str
+    end: str
+    engine: str
+    capital: float
+    risk_pct: float | None
+    max_position_pct: float | None
+    max_leverage: float | None
+    intrabar_resolution: str
+    params: dict[str, Any] | None
+    output_dir: Path
+    data_dir: str
+    skip_existing: bool = False
+    save_sqlite: bool = True
+    keep_indicators: bool = False
+
+
+def _run_backtest_in_process_body(request: CellRequest) -> dict[str, Any]:
     """Run the engine for one cell and persist the result.
 
-    Returns ``(stats_and_status_updates, backtest_result)``; raising propagates
-    to the caller's failure classification.
+    Returns the extra cell fields (e.g. ``auto_downloaded_data``); raising
+    propagates to the caller's failure classification.
     """
+    strategy = request.strategy
+    symbol = request.symbol
+    timeframe = request.timeframe
+    data_dir = request.data_dir
+    keep_indicators = request.keep_indicators
+    save_sqlite = request.save_sqlite
     strategy_type = detect_strategy_type(Path(strategy).resolve())
     if strategy_type == StrategyType.SIGNAL_PROCESSOR:
         raise ValueError(
             "Detected signal_processor strategy. runner.cli run currently supports market_data strategies only."
         )
 
-    resolved_parameters = resolve_strategy_parameters(strategy, dict(params or {}))
+    resolved_parameters = resolve_strategy_parameters(strategy, dict(request.params or {}))
     normalized_timeframe = normalize_timeframe_value(timeframe)
-    start_date = start
-    end_date = end
+    start_date = request.start
+    end_date = request.end
     if not start_date or not end_date:
         detected_start, detected_end = _detect_date_range(symbol, normalized_timeframe, data_dir)
         start_date = start_date or detected_start
@@ -338,7 +351,7 @@ def _run_backtest_in_process_body(
         start=start_date,
         end=end_date,
         data_dir=data_dir,
-        modeling_resolution=intrabar_resolution or "open_close",
+        modeling_resolution=request.intrabar_resolution or "open_close",
         log_callback=logger.info,
     )
 
@@ -348,20 +361,20 @@ def _run_backtest_in_process_body(
         timeframe=normalized_timeframe,
         start_date=start_date,
         end_date=end_date,
-        initial_capital=capital,
-        risk_per_trade_pct=risk_pct,
-        max_position_pct=max_position_pct,
-        max_leverage=max_leverage,
-        modeling_resolution=intrabar_resolution or "open_close",
+        initial_capital=request.capital,
+        risk_per_trade_pct=request.risk_pct,
+        max_position_pct=request.max_position_pct,
+        max_leverage=request.max_leverage,
+        modeling_resolution=request.intrabar_resolution or "open_close",
         data_dir=data_dir,
         parameters=resolved_parameters,
     )
-    engine_adapter = get_engine(engine)
+    engine_adapter = get_engine(request.engine)
     errors = engine_adapter.validate_config(config)
     if errors:
         raise ValueError("; ".join(errors))
 
-    logger.info("Running grid cell: engine=%s strategy=%s symbol=%s timeframe=%s", engine, strategy, symbol, timeframe)
+    logger.info("Running grid cell: engine=%s strategy=%s symbol=%s timeframe=%s", request.engine, strategy, symbol, timeframe)
     backtest_result = engine_adapter.run(config, strategy)
     backtest_result.meta.id = build_run_id(strategy, symbol, timeframe)
     if not keep_indicators:
@@ -377,7 +390,7 @@ def _run_backtest_in_process_body(
         except Exception as exc:
             logger.warning("Could not persist grid cell to SQLite: %s", exc)
 
-    return {"auto_downloaded_data": downloaded} if downloaded else {}, backtest_result
+    return {"auto_downloaded_data": downloaded} if downloaded else {}
 
 
 def run_one_backtest_in_process(
@@ -400,39 +413,40 @@ def run_one_backtest_in_process(
     save_sqlite: bool = True,
     keep_indicators: bool = False,
 ) -> dict[str, Any]:
-    result, _skipped = _init_cell_result(
+    request = CellRequest(
         strategy=strategy,
         symbol=symbol,
         timeframe=timeframe,
-        data_dir=data_dir,
         start=start,
         end=end,
+        engine=engine,
+        capital=capital,
+        risk_pct=risk_pct,
+        max_position_pct=max_position_pct,
+        max_leverage=max_leverage,
+        intrabar_resolution=intrabar_resolution,
+        params=params,
         output_dir=output_dir,
+        data_dir=data_dir,
         skip_existing=skip_existing,
+        save_sqlite=save_sqlite,
+        keep_indicators=keep_indicators,
+    )
+    result, _skipped = _init_cell_result(
+        strategy=request.strategy,
+        symbol=request.symbol,
+        timeframe=request.timeframe,
+        data_dir=request.data_dir,
+        start=request.start,
+        end=request.end,
+        output_dir=request.output_dir,
+        skip_existing=request.skip_existing,
     )
     if result["status"] != "pending":
         return result
 
     try:
-        extra, backtest_result = _run_backtest_in_process_body(
-            strategy=strategy,
-            symbol=symbol,
-            timeframe=timeframe,
-            start=start,
-            end=end,
-            engine=engine,
-            capital=capital,
-            risk_pct=risk_pct,
-            max_position_pct=max_position_pct,
-            max_leverage=max_leverage,
-            intrabar_resolution=intrabar_resolution,
-            params=params,
-            output_dir=output_dir,
-            data_dir=data_dir,
-            keep_indicators=keep_indicators,
-            save_sqlite=save_sqlite,
-        )
-        result.update(extra)
+        result.update(_run_backtest_in_process_body(request))
         result.update(read_backtest_stats(Path(result["output"])))
         result.update({"status": "ok", "returncode": 0})
     except ValidationError as exc:
@@ -496,6 +510,35 @@ def run_one_backtest(
         end=end,
         output_dir=output_dir,
         skip_existing=skip_existing,
+    )
+    request = CellRequest(
+        strategy=strategy,
+        symbol=symbol,
+        timeframe=timeframe,
+        start=start,
+        end=end,
+        engine=engine,
+        capital=capital,
+        risk_pct=risk_pct,
+        max_position_pct=max_position_pct,
+        max_leverage=max_leverage,
+        intrabar_resolution=intrabar_resolution,
+        params=params,
+        output_dir=output_dir,
+        data_dir=data_dir,
+        skip_existing=skip_existing,
+        save_sqlite=save_sqlite,
+        keep_indicators=keep_indicators,
+    )
+    result, _skipped = _init_cell_result(
+        strategy=request.strategy,
+        symbol=request.symbol,
+        timeframe=request.timeframe,
+        data_dir=request.data_dir,
+        start=request.start,
+        end=request.end,
+        output_dir=request.output_dir,
+        skip_existing=request.skip_existing,
     )
     if result["status"] != "pending":
         return result
