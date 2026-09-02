@@ -10,6 +10,7 @@ commit it with :func:`os.replace`, which is atomic on POSIX and Windows.
 from __future__ import annotations
 
 import os
+import uuid
 from pathlib import Path
 from typing import Callable, TypeVar
 
@@ -39,7 +40,10 @@ def atomic_replace(path: Path, writer: Callable[[Path], T]) -> T:
     if not resolved.is_absolute():
         raise ValueError(f"atomic writes require an absolute path, got: {resolved!s}")
     resolved.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = resolved.with_name(f"{resolved.name}.tmp-{os.getpid()}")
+    # PID alone is not unique across containers sharing a volume (PIDs are
+    # per-namespace and get recycled); the uuid suffix prevents two writers
+    # from staging into the same temp file.
+    temp_path = resolved.with_name(f"{resolved.name}.tmp-{os.getpid()}-{uuid.uuid4().hex[:8]}")
     try:
         result = writer(temp_path)
         os.replace(temp_path, resolved)

@@ -214,6 +214,12 @@ def _parquet_timestamp_bounds(path: Path) -> tuple[pd.Timestamp, pd.Timestamp] |
     Row-group min/max statistics are used when present; only the boundary row
     groups are read as a fallback. This keeps repeated coverage checks cheap
     instead of scanning the full timestamp column every time (DV-B17).
+
+    Statistics are only a *lower bound* for the true max: a writer that
+    appended rows out of order (or disabled statistics) reports a max below
+    the newest stored row. The last-group statistic is therefore
+    cross-checked against the actual last row of that group — the same rule
+    as :meth:`data_tools.downloaders.base.Downloader._read_latest_timestamp`.
     """
     try:
         parquet_file = pq.ParquetFile(path)
@@ -240,19 +246,24 @@ def _parquet_timestamp_bounds(path: Path) -> tuple[pd.Timestamp, pd.Timestamp] |
 
     start = _boundary(0, "min")
     end = _boundary(metadata.num_row_groups - 1, "max")
+    last_group_stats_end = end
     if start is None:
         first = parquet_file.read_row_group(0, columns=[columns[column_index]])
         if first.num_rows:
             parsed = pd.to_datetime(first.column(0)[0].as_py(), utc=True, errors="coerce")
             start = None if pd.isna(parsed) else pd.Timestamp(parsed)
-    if end is None:
+    if end is None or end == last_group_stats_end:
+        # Cross-check the last-group max against its actual last row: an
+        # out-of-order append makes the statistic understate the newest row.
         last = parquet_file.read_row_group(
             metadata.num_row_groups - 1, columns=[columns[column_index]]
         )
         if last.num_rows:
             value = last.column(0)[last.num_rows - 1].as_py()
             parsed = pd.to_datetime(value, utc=True, errors="coerce")
-            end = None if pd.isna(parsed) else pd.Timestamp(parsed)
+            row_end = None if pd.isna(parsed) else pd.Timestamp(parsed)
+            if row_end is not None and (end is None or row_end > end):
+                end = row_end
 
     if start is None or end is None:
         return None
@@ -262,6 +273,12 @@ def _parquet_timestamp_bounds(path: Path) -> tuple[pd.Timestamp, pd.Timestamp] |
 def _find_gaps_inside_file(
     path: Path, *, threshold_days: float = INTERNAL_GAP_WARN_DAYS
 ) -> list[InternalGap]:
+    """Find the largest bar-to-bar hole inside one parquet file.
+
+    Internal holes are not derivable from row-group min/max statistics, so
+    this reads the timestamp column of **every** row group. Cost is
+    O(file): fine for coverage checks at download time, not for hot paths.
+    """
     try:
         parquet_file = pq.ParquetFile(path)
     except Exception as exc:
