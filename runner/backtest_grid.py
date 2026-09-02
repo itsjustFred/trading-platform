@@ -15,7 +15,6 @@ import re
 import subprocess
 import sys
 import traceback
-import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -661,21 +660,11 @@ def run_backtest_grid(
     a fraction of equity. ``max_position_pct`` is a deprecated alias of
     ``max_position_exposure_pct``.
     """
-    # Deprecated alias (Cleanup 16-E): keep old invocations working.
-    if max_position_pct is not None:
-        if max_position_exposure_pct is not None:
-            raise ValueError(
-                "Pass either max_position_exposure_pct or its deprecated alias "
-                "max_position_pct, not both."
-            )
-        warnings.warn(
-            "run_backtest_grid(max_position_pct=...) is deprecated; use "
-            "max_position_exposure_pct. The alias will be removed in a future "
-            "release.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        max_position_exposure_pct = max_position_pct
+    max_position_exposure_pct = resolve_legacy_max_position_kwarg(
+        max_position_exposure_pct,
+        max_position_pct,
+        caller="run_backtest_grid",
+    )
 
     normalized_symbols = [normalize_symbol(symbol) for symbol in (symbols or GRID_SYMBOLS)]
     normalized_timeframes = [normalize_timeframe_value(tf) for tf in (timeframes or GRID_TIMEFRAMES)]

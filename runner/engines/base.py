@@ -22,6 +22,33 @@ from shared.strategy_registry import load_strategy_meta
 #: Kept so old invocations keep working during the Cleanup 16-E migration.
 LEGACY_MAX_POSITION_PCT = "max_position_pct"
 
+
+def resolve_legacy_max_position_kwarg(
+    max_position_exposure_pct: float | None, max_position_pct: float | None, *, caller: str
+) -> float | None:
+    """Fold the deprecated ``max_position_pct`` keyword into the canonical one.
+
+    Cleanup 16-E keeps old invocations working: the deprecated spelling maps
+    onto :attr:`BacktestConfig.max_position_exposure_pct` with identical
+    per-position semantics, emitting a ``DeprecationWarning``. Passing both
+    spellings at once is rejected.
+    """
+    if max_position_pct is None:
+        return max_position_exposure_pct
+    if max_position_exposure_pct is not None:
+        raise ValueError(
+            "Pass either max_position_exposure_pct or its deprecated alias "
+            "max_position_pct, not both."
+        )
+    warnings.warn(
+        f"{caller}(max_position_pct=...) is deprecated; use "
+        "max_position_exposure_pct. The alias will be removed in a future "
+        "release.",
+        DeprecationWarning,
+        stacklevel=3,
+    )
+    return max_position_pct
+
 VALID_RESOLUTIONS = (
     "main_timeframe",
     "open_close",

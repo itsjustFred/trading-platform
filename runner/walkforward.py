@@ -7,7 +7,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -15,7 +14,12 @@ from typing import Any
 import pandas as pd
 
 from runner.daily_equity import attach_daily_equity
-from runner.engines.base import BacktestConfig, EngineAdapter, resolve_strategy_parameters
+from runner.engines.base import (
+    BacktestConfig,
+    EngineAdapter,
+    resolve_legacy_max_position_kwarg,
+    resolve_strategy_parameters,
+)
 from runner.portfolio_optimizer import optimize_portfolio_allocation
 from runner.stats import merge_canonical_stats
 from shared.constants import DATA_DIR, normalize_timeframe
@@ -260,21 +264,11 @@ def run_walkforward(
         from runner.cli import get_engine
 
         engine = get_engine(engine_name)
-    # Deprecated alias (Cleanup 16-E): keep old invocations working.
-    if max_position_pct is not None:
-        if max_position_exposure_pct is not None:
-            raise ValueError(
-                "Pass either max_position_exposure_pct or its deprecated alias "
-                "max_position_pct, not both."
-            )
-        warnings.warn(
-            "run_walkforward(max_position_pct=...) is deprecated; use "
-            "max_position_exposure_pct. The alias will be removed in a future "
-            "release.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        max_position_exposure_pct = max_position_pct
+    max_position_exposure_pct = resolve_legacy_max_position_kwarg(
+        max_position_exposure_pct,
+        max_position_pct,
+        caller="run_walkforward",
+    )
     normalized_timeframe = normalize_timeframe(timeframe)
     strategy_name = Path(strategy).stem
     parameters = resolve_strategy_parameters(strategy, params or {})
