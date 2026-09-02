@@ -391,4 +391,5 @@ def test_split_tick_sides_returns_empty_sides_for_empty_input():
     import data_tools.downloaders.dukascopy_native as native
 
     bid, ask = native._split_tick_sides(_empty_tick_frame())
-    assert bid.empty and ask.empty
+    assert bid.empty
+    assert ask.empty
