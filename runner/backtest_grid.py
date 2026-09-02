@@ -293,6 +293,93 @@ def _init_cell_result(
     return result, None
 
 
+def _run_backtest_in_process_body(
+    *,
+    strategy: str,
+    symbol: str,
+    timeframe: str,
+    start: str,
+    end: str,
+    engine: str,
+    capital: float,
+    risk_pct: float | None,
+    max_position_pct: float | None,
+    max_leverage: float | None,
+    intrabar_resolution: str,
+    params: dict[str, Any] | None,
+    output_dir: Path,
+    data_dir: str,
+    keep_indicators: bool,
+    save_sqlite: bool,
+) -> tuple[dict[str, Any], Any]:
+    """Run the engine for one cell and persist the result.
+
+    Returns ``(stats_and_status_updates, backtest_result)``; raising propagates
+    to the caller's failure classification.
+    """
+    strategy_type = detect_strategy_type(Path(strategy).resolve())
+    if strategy_type == StrategyType.SIGNAL_PROCESSOR:
+        raise ValueError(
+            "Detected signal_processor strategy. runner.cli run currently supports market_data strategies only."
+        )
+
+    resolved_parameters = resolve_strategy_parameters(strategy, dict(params or {}))
+    normalized_timeframe = normalize_timeframe_value(timeframe)
+    start_date = start
+    end_date = end
+    if not start_date or not end_date:
+        detected_start, detected_end = _detect_date_range(symbol, normalized_timeframe, data_dir)
+        start_date = start_date or detected_start
+        end_date = end_date or detected_end
+
+    downloaded = ensure_backtest_data(
+        symbols=[symbol],
+        timeframe=normalized_timeframe,
+        start=start_date,
+        end=end_date,
+        data_dir=data_dir,
+        modeling_resolution=intrabar_resolution or "open_close",
+        log_callback=logger.info,
+    )
+
+    config = BacktestConfig(
+        strategy_name=Path(strategy).stem,
+        symbols=[symbol],
+        timeframe=normalized_timeframe,
+        start_date=start_date,
+        end_date=end_date,
+        initial_capital=capital,
+        risk_per_trade_pct=risk_pct,
+        max_position_pct=max_position_pct,
+        max_leverage=max_leverage,
+        modeling_resolution=intrabar_resolution or "open_close",
+        data_dir=data_dir,
+        parameters=resolved_parameters,
+    )
+    engine_adapter = get_engine(engine)
+    errors = engine_adapter.validate_config(config)
+    if errors:
+        raise ValueError("; ".join(errors))
+
+    logger.info("Running grid cell: engine=%s strategy=%s symbol=%s timeframe=%s", engine, strategy, symbol, timeframe)
+    backtest_result = engine_adapter.run(config, strategy)
+    backtest_result.meta.id = build_run_id(strategy, symbol, timeframe)
+    if not keep_indicators:
+        backtest_result.indicators = []
+    # Use the resolved dates for daily equity attachment
+    attach_daily_equity(backtest_result, start=start_date, end=end_date)
+    merge_canonical_stats(backtest_result)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    backtest_result.save(Path(output_dir) / f"{backtest_result.meta.id}.trades.json")
+    if save_sqlite:
+        try:
+            save_result_to_sqlite(backtest_result)
+        except Exception as exc:
+            logger.warning("Could not persist grid cell to SQLite: %s", exc)
+
+    return {"auto_downloaded_data": downloaded} if downloaded else {}, backtest_result
+
+
 def run_one_backtest_in_process(
     *,
     strategy: str,
@@ -326,73 +413,27 @@ def run_one_backtest_in_process(
     if result["status"] != "pending":
         return result
 
-    run_id = result["run_id"]
-    path = Path(result["output"])
-
     try:
-        strategy_type = detect_strategy_type(Path(strategy).resolve())
-        if strategy_type == StrategyType.SIGNAL_PROCESSOR:
-            raise ValueError(
-                "Detected signal_processor strategy. runner.cli run currently supports market_data strategies only."
-            )
-
-        resolved_parameters = resolve_strategy_parameters(strategy, dict(params or {}))
-        normalized_timeframe = normalize_timeframe_value(timeframe)
-        start_date = start
-        end_date = end
-        if not start_date or not end_date:
-            detected_start, detected_end = _detect_date_range(symbol, normalized_timeframe, data_dir)
-            start_date = start_date or detected_start
-            end_date = end_date or detected_end
-
-        downloaded = ensure_backtest_data(
-            symbols=[symbol],
-            timeframe=normalized_timeframe,
-            start=start_date,
-            end=end_date,
-            data_dir=data_dir,
-            modeling_resolution=intrabar_resolution or "open_close",
-            log_callback=logger.info,
-        )
-        if downloaded:
-            result["auto_downloaded_data"] = downloaded
-
-        config = BacktestConfig(
-            strategy_name=Path(strategy).stem,
-            symbols=[symbol],
-            timeframe=normalized_timeframe,
-            start_date=start_date,
-            end_date=end_date,
-            initial_capital=capital,
-            risk_per_trade_pct=risk_pct,
+        extra, backtest_result = _run_backtest_in_process_body(
+            strategy=strategy,
+            symbol=symbol,
+            timeframe=timeframe,
+            start=start,
+            end=end,
+            engine=engine,
+            capital=capital,
+            risk_pct=risk_pct,
             max_position_pct=max_position_pct,
             max_leverage=max_leverage,
-            modeling_resolution=intrabar_resolution or "open_close",
+            intrabar_resolution=intrabar_resolution,
+            params=params,
+            output_dir=output_dir,
             data_dir=data_dir,
-            parameters=resolved_parameters,
+            keep_indicators=keep_indicators,
+            save_sqlite=save_sqlite,
         )
-        engine_adapter = get_engine(engine)
-        errors = engine_adapter.validate_config(config)
-        if errors:
-            raise ValueError("; ".join(errors))
-
-        logger.info("Running grid cell: engine=%s strategy=%s symbol=%s timeframe=%s", engine, strategy, symbol, timeframe)
-        backtest_result = engine_adapter.run(config, strategy)
-        backtest_result.meta.id = run_id
-        if not keep_indicators:
-            backtest_result.indicators = []
-        # Use resolved dates for daily equity attachment
-        attach_daily_equity(backtest_result, start=start_date, end=end_date)
-        merge_canonical_stats(backtest_result)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        backtest_result.save(path)
-        if save_sqlite:
-            try:
-                save_result_to_sqlite(backtest_result)
-            except Exception as exc:
-                logger.warning("Could not persist grid cell to SQLite: %s", exc)
-
-        result.update(read_backtest_stats(path))
+        result.update(extra)
+        result.update(read_backtest_stats(Path(result["output"])))
         result.update({"status": "ok", "returncode": 0})
     except ValidationError as exc:
         result.update({"status": "failed", "returncode": 2, "error": str(exc)})
