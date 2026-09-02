@@ -285,6 +285,7 @@ def run_auto_agent(
                 _log(log, f"Removed failed generated strategy artifacts: {artifacts.strategy_path}")
             continue
 
+        artifacts.strategy_path.parent.mkdir(parents=True, exist_ok=True)
         artifacts.strategy_path.write_text(python_code.rstrip() + "\n", encoding="utf-8")
         _log(log, f"Wrote strategy file: {artifacts.strategy_path}")
         if attempt == 1:

@@ -47,8 +47,16 @@ def test_helper_import_allowlist_is_pinned():
 
 
 def test_helper_banned_call_names_are_pinned():
-    """The banned-call fence must keep the reflection/IO escape hatches."""
-    assert HELPER_BANNED_CALL_NAMES == frozenset(
+    """The banned-call fence must keep the reflection/IO escape hatches.
+
+    The helper screen shares its deny list with runner.codegen_safety (the
+    two lists must not drift apart), so this also pins the shared constant —
+    which is a superset that also bans `input` for generated strategy code.
+    """
+    from runner.codegen_safety import BANNED_CALL_NAMES
+
+    assert HELPER_BANNED_CALL_NAMES is BANNED_CALL_NAMES
+    assert HELPER_BANNED_CALL_NAMES >= frozenset(
         {"eval", "exec", "compile", "open", "__import__", "globals", "locals", "vars", "breakpoint"}
     )
 

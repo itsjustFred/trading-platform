@@ -88,7 +88,10 @@ _BANNED_ROOT_ATTRIBUTES = frozenset(
     }
 )
 
-_BANNED_CALL_NAMES = frozenset(
+# Calls that must never appear in generated code. Shared with the helper-code
+# screen in runner/engines/pynecore_adapter.py so the two deny lists cannot
+# drift apart.
+BANNED_CALL_NAMES = frozenset(
     {
         "eval",
         "exec",
@@ -170,6 +173,13 @@ def _screen_node(node: ast.AST) -> str | None:
     return None
 
 
+def import_root(node: ast.Import | ast.ImportFrom) -> str:
+    """Top-level module name of an import statement (shared screening primitive)."""
+    if isinstance(node, ast.Import):
+        return node.names[0].name.split(".")[0] if node.names else ""
+    return (node.module or "").split(".")[0]
+
+
 def _screen_import(node: ast.Import | ast.ImportFrom) -> str | None:
     if isinstance(node, ast.Import):
         for alias in node.names:
@@ -191,7 +201,7 @@ def _screen_import(node: ast.Import | ast.ImportFrom) -> str | None:
 def _screen_call(node: ast.Call) -> str | None:
     target = node.func
 
-    if isinstance(target, ast.Name) and target.id in _BANNED_CALL_NAMES:
+    if isinstance(target, ast.Name) and target.id in BANNED_CALL_NAMES:
         return f"refuses call to '{target.id}()'"
 
     if isinstance(target, ast.Attribute) and target.attr in _BANNED_DYNAMIC_LOAD_ATTRIBUTES:

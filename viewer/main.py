@@ -6686,17 +6686,26 @@ def _codegen_gate_strategy_path(relative_file: str) -> Path:
     """Resolve a strategy relative file inside the strategies dir (traversal-safe)."""
     normalized = str(relative_file or "").strip()
     if not normalized or ".." in normalized or normalized.startswith("/"):
-        raise _invalid_strategy_path()
+        raise _invalid_strategy_file_path()
     candidate = (STRATEGIES_DIR / normalized).resolve()
     try:
         candidate.relative_to(STRATEGIES_DIR.resolve())
     except ValueError:
-        raise _invalid_strategy_path() from None
+        raise _invalid_strategy_file_path() from None
     return candidate
 
 
-def _invalid_strategy_path() -> HTTPException:
+def _invalid_strategy_file_path() -> HTTPException:
+    """Build the 400 raised when a strategy path fails traversal checks."""
     return HTTPException(status_code=400, detail="Invalid strategy file path")
+
+
+def _require_existing_strategy(relative_file: str) -> Path:
+    """Traversal-safe resolve plus 404 when the file does not exist."""
+    path = _codegen_gate_strategy_path(relative_file)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail=f"Strategy '{relative_file}' not found")
+    return path
 
 
 @app.get(
@@ -6710,9 +6719,7 @@ async def get_strategy_approval(relative_file: str) -> dict[str, Any]:
     """Report whether a strategy file's current content is covered by a human approval."""
     from runner.approval_gate import is_strategy_approved
 
-    path = _codegen_gate_strategy_path(relative_file)
-    if not path.exists():
-        raise HTTPException(status_code=404, detail=f"Strategy '{relative_file}' not found")
+    path = _require_existing_strategy(relative_file)
     approved = await asyncio.to_thread(
         is_strategy_approved, path, strategies_root=STRATEGIES_DIR
     )
@@ -6731,9 +6738,7 @@ async def approve_strategy(relative_file: str) -> dict[str, Any]:
     """Record a SHA256-bound human approval for a generated strategy file."""
     from runner.approval_gate import approve_strategy as record_approval
 
-    path = _codegen_gate_strategy_path(relative_file)
-    if not path.exists():
-        raise HTTPException(status_code=404, detail=f"Strategy '{relative_file}' not found")
+    path = _require_existing_strategy(relative_file)
     try:
         record = await asyncio.to_thread(
             record_approval, path, approved_by="human", strategies_root=STRATEGIES_DIR

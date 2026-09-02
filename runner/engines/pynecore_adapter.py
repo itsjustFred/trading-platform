@@ -19,7 +19,7 @@ import sys
 import tempfile
 from datetime import datetime, timezone, date as _date
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, cast
 
 import pandas as pd
 
@@ -36,7 +36,11 @@ from runner.engines._shared import (
     resolve_max_position_pct as _resolve_max_position_pct,
     serialize_meta_value as _serialize_meta_value,
 )
+<<<<<<< HEAD
 from runner.stats import compute_stats_for_result
+=======
+from runner.codegen_safety import BANNED_CALL_NAMES, import_root
+>>>>>>> a852cd9 (refactor(codegen): Stage-4 review fixes — dedupe kill/screening primitives, slug-retry cleanup)
 from shared.constants import DATA_DIR
 from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, TradeExit
 
@@ -433,19 +437,11 @@ HELPER_ALLOWED_IMPORT_ROOTS = frozenset(
 
 HELPER_ALLOWED_FUNCTION_NAMES = frozenset({"build_trade_context", "build_drawings"})
 
-HELPER_BANNED_CALL_NAMES = frozenset(
-    {"eval", "exec", "compile", "open", "__import__", "globals", "locals", "vars", "breakpoint"}
-)
+HELPER_BANNED_CALL_NAMES = BANNED_CALL_NAMES
 
 
-def _helper_import_root(node: ast.Import | ast.ImportFrom) -> str:
-    if isinstance(node, ast.Import):
-        return node.names[0].name.split(".")[0] if node.names else ""
-    return (node.module or "").split(".")[0]
-
-
-def _reject_helper_import(node: ast.stmt, source_path: Path) -> None:
-    root = _helper_import_root(node)
+def _reject_helper_import(node: ast.Import | ast.ImportFrom, source_path: Path) -> None:
+    root = import_root(node)
     if root not in HELPER_ALLOWED_IMPORT_ROOTS:
         raise RuntimeError(
             f"Import '{root}' is not allowed in strategy helper code "
@@ -454,7 +450,7 @@ def _reject_helper_import(node: ast.stmt, source_path: Path) -> None:
         )
 
 
-def _reject_helper_call(node: ast.stmt, source_path: Path) -> None:
+def _reject_helper_call(node: ast.Call, source_path: Path) -> None:
     func = node.func
     if not isinstance(func, ast.Name) or func.id not in HELPER_BANNED_CALL_NAMES:
         return
@@ -463,7 +459,7 @@ def _reject_helper_call(node: ast.stmt, source_path: Path) -> None:
     )
 
 
-def _reject_dunder_attribute(node: ast.stmt, source_path: Path) -> None:
+def _reject_dunder_attribute(node: ast.Attribute, source_path: Path) -> None:
     if node.attr.startswith("__") and node.attr.endswith("__"):
         raise RuntimeError(
             f"Dunder attribute access '{node.attr}' is not allowed in "
@@ -471,16 +467,16 @@ def _reject_dunder_attribute(node: ast.stmt, source_path: Path) -> None:
         )
 
 
-_SCREEN_RULES: tuple[tuple[type[ast.stmt], callable], ...] = (
-    (ast.Import, _reject_helper_import),
-    (ast.ImportFrom, _reject_helper_import),
-    (ast.Call, _reject_helper_call),
-    (ast.Attribute, _reject_dunder_attribute),
+_SCREEN_RULES: tuple[tuple[type[ast.AST], Callable[[ast.AST, Path], None]], ...] = (
+    (ast.Import, cast(Callable[[ast.AST, Path], None], _reject_helper_import)),
+    (ast.ImportFrom, cast(Callable[[ast.AST, Path], None], _reject_helper_import)),
+    (ast.Call, cast(Callable[[ast.AST, Path], None], _reject_helper_call)),
+    (ast.Attribute, cast(Callable[[ast.AST, Path], None], _reject_dunder_attribute)),
 )
 
 
-def _screen_helper_node(node: ast.stmt, source_path: Path) -> None:
-    """Apply every helper screening rule to one statement."""
+def _screen_helper_node(node: ast.AST, source_path: Path) -> None:
+    """Apply every helper screening rule to one AST node."""
     for node_type, reject in _SCREEN_RULES:
         if isinstance(node, node_type):
             reject(node, source_path)

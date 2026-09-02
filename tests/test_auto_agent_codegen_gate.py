@@ -114,7 +114,48 @@ def test_failed_backtest_removes_last_generated_file(tmp_path, monkeypatch):
 
     strategy_dir = tmp_path / "strategies" / "broken_agent"
     assert not (strategy_dir / "broken_agent.py").exists()
-    assert (strategy_dir / "README.md").exists()
+    # The failed attempt leaves no runnable file and no orphaned slug directory
+    # that would block a retry of the same slug.
+    assert not strategy_dir.exists()
+
+
+def test_retry_of_failed_slug_is_not_blocked_by_leftovers(tmp_path, monkeypatch):
+    """A failed attempt removes its slug directory — a retry of the same slug
+    is not permanently blocked by leftovers of the failed attempt."""
+    _setup_agent(monkeypatch, tmp_path)
+    _install_fake_provider(
+        monkeypatch,
+        [
+            STEP_ONE_MARKDOWN,
+            STEP_TWO_META,
+            STEP_THREE_CODE,
+            # Attempts 2 and 3 only re-ask for the code step (md/meta are reused).
+            FIXED_STEP_THREE_CODE,
+            FIXED_STEP_THREE_CODE,
+        ],
+    )
+    monkeypatch.setattr(
+        auto_agent, "_run_backtest", lambda cmd, *, log=None: (1, "Traceback: boom")
+    )
+    with pytest.raises(RuntimeError, match="Auto-agent failed"):
+        auto_agent.run_auto_agent(
+            "strategy.entry('Long', strategy.long)",
+            strategy_name="Retry Agent",
+            log=lambda *args, **kwargs: None,
+        )
+
+    _install_fake_provider(
+        monkeypatch,
+        [STEP_ONE_MARKDOWN, STEP_TWO_META, FIXED_STEP_THREE_CODE],
+    )
+    monkeypatch.setattr(auto_agent, "_run_backtest", _happy_backtest)
+    result = auto_agent.run_auto_agent(
+        "strategy.entry('Long', strategy.long)",
+        strategy_name="Retry Agent",
+        log=lambda *args, **kwargs: None,
+    )
+    assert result["attempts"] == 1
+    assert Path(result["strategy_file"]).exists()
 
 
 def test_validated_strategy_is_not_approved_until_human_review(tmp_path, monkeypatch):
