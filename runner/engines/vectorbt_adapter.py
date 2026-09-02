@@ -1049,22 +1049,11 @@ def _load_ohlcv(
 
     if "timestamp" in df.columns:
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-        if start_date:
-            df = df[df["timestamp"] >= _parse_date_bound(start_date, is_end=False)]
-        if end_date:
-            df = df[df["timestamp"] <= _parse_date_bound(end_date, is_end=True)]
+        # Conformance (Cleanup 16-A, F9): shared date-filter convention — a
+        # date-only end boundary is inclusive of the full day.
+        df = contract.apply_date_filter(df, start=start_date, end=end_date)
 
     return df.reset_index(drop=True), selected_path
-
-
-def _parse_date_bound(value: str, *, is_end: bool) -> pd.Timestamp:
-    """Conformance (Cleanup 16-A): shared date-filter convention (F9).
-
-    A date-only end boundary is inclusive of the full day; the parsing rules
-    live in ``runner.engines.contract`` so every engine interprets bounds the
-    same way.
-    """
-    return contract.parse_date_bound(value, is_end=is_end)
 
 
 def _normalize_intrabar_resolution(value: str | None) -> str:

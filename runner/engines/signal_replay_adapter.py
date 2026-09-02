@@ -10,6 +10,7 @@ import pandas as pd
 from risk.config import RiskConfig
 from risk.engine import RiskEngine
 from risk.models import TradeSignal as RiskTradeSignal
+from runner.engines import contract
 from runner.engines.contract import resolve_same_bar_exit
 from runner.stats import compute_stats_for_result
 from shared.constants import DATA_DIR, normalize_timeframe
@@ -713,12 +714,11 @@ class SignalReplayEngine:
         merged = pd.concat(frames, ignore_index=True, sort=False)
         merged = merged.drop_duplicates(subset=["timestamp"], keep="last").sort_values("timestamp")
         merged = merged.reset_index(drop=True)
-        if start:
-            start_ts = pd.Timestamp(pd.to_datetime(start, utc=True))
-            merged = merged[merged["timestamp"] >= start_ts]
-        if end:
-            end_ts = pd.Timestamp(pd.to_datetime(end, utc=True))
-            merged = merged[merged["timestamp"] <= end_ts]
+        # Conformance (Cleanup 16-A, F9): shared date-filter convention — a
+        # date-only end boundary is inclusive of the full day. This must be
+        # the ONLY date filter on the frame (a bare-date string comparison
+        # would truncate at midnight and drop the end day).
+        merged = contract.apply_date_filter(merged, start=start, end=end)
         if merged.empty:
             return None
         return merged

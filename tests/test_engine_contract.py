@@ -39,7 +39,11 @@ from runner.engines.contract import (
 )
 from runner.engines.native_adapter import NativeAdapter
 from runner.engines.pynecore_adapter import PyneCoreAdapter
-from runner.engines.signal_replay_adapter import ReplaySignal, SignalReplayAdapter
+from runner.engines.signal_replay_adapter import (
+    ReplaySignal,
+    SignalReplayAdapter,
+    SignalReplayEngine,
+)
 from runner.engines.vectorbt_adapter import VectorbtAdapter
 from runner.stats import compute_stats
 from shared.models import Trade, TradeExit
@@ -205,6 +209,27 @@ class TestDateFilterConvention:
                 f"{result.meta.engine}: end-date boundary kept "
                 f"{result.meta.total_bars} bars, expected the full-day-inclusive window (216)"
             )
+
+    def test_signal_replay_loader_keeps_the_full_end_day(self, tmp_path: Path):
+        """Conformance (F9): signal-replay cuts data with the same convention.
+
+        The replay adapter loads its own OHLCV from disk; a bare-date
+        comparison there would truncate at midnight and silently drop the
+        whole end day, diverging from the other engines.
+        """
+        frame = _deterministic_ohlcv(periods=240, freq="h")  # 2024-01-01 .. 2024-01-10 23:00
+        _write_ohlcv(tmp_path, "PARITY", "1h", frame)
+
+        adapter = SignalReplayEngine(data_dir=tmp_path)
+        loaded = adapter._load_ohlcv(
+            symbol="PARITY", timeframe="1h", start="2024-01-01", end="2024-01-05"
+        )
+
+        assert loaded is not None
+        assert loaded["timestamp"].max() == pd.Timestamp("2024-01-05 23:00", tz="UTC"), (
+            "A date-only end bound must keep the bars of the end date itself"
+        )
+        assert loaded["timestamp"].min() == pd.Timestamp("2024-01-01 00:00", tz="UTC")
 
 
 def tmp_contract_dir(shared_dir: Path) -> Path:

@@ -77,11 +77,12 @@ Decision Record (Cleanup 16-A):
 
 Implementation:
 
-- `runner.engines.contract.SameBarExitPolicy.resolve()` is the single
+- `runner.engines.contract.resolve_same_bar_exit()` is the single
   classification point. Callers that walk intrabar data invoke it per
   sub-bar in chronological order, so the first event seen is the event that
   happened; within one bar/step that hits both levels, the helper's
-  stop-first tie-break applies.
+  stop-first tie-break applies. It only accepts the engine-wide direction
+  spelling `"LONG"`/`"SHORT"`.
 - Native: `_check_stops` uses the intrabar walk when
   `modeling_resolution` requests a finer timeframe; otherwise (and whenever
   the walk cannot order the events) it applies stop-first and sets
@@ -91,13 +92,16 @@ Implementation:
 - Vectorbt: `_match_intrabar_exit_event` routes through the same helper per
   sub-bar. The intrabar resolution itself is honored as requested (`5m`,
   `15m`, `1h`, `1-lower`, …); only unknown spellings fall back to
-  open/close modeling.
+  open/close modeling. vectorbt schedules exits at the next bar's open
+  (F10), so it never faces the same-bar ambiguity on its main frame and
+  therefore needs no fallback flag.
 - Signal replay: `_process_protective_exits` walks bars chronologically and
   classifies each through the shared helper.
 - Configuring `same_bar_order = "take_profit_first"` is **not** part of the
   shared contract: the shared helper has no tp-first mode, and the native
-  setting remains a native-only, explicitly-configured exception (recorded in
-  `trade.meta["execution_model"]["same_bar_order"]`).
+  setting is audit metadata only — stop-first is contractual and no engine
+  implements a tp-first mode (`trade.meta["execution_model"]["same_bar_order"]`
+  stays `"stop_first"` regardless of the configuration).
 
 ## 4. Sizing
 
