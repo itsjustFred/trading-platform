@@ -49,7 +49,7 @@ export function CreateBacktestModal({
   onClose,
   preselectedStrategy,
   onTaskStarted,
-}: CreateBacktestModalProps) {
+}: Readonly<CreateBacktestModalProps>) {
   const { showToast } = useToast();
   const { strategies, ensureLoaded } = useStrategiesCache();
   const [strategy, setStrategy] = useState("");

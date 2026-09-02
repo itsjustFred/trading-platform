@@ -27,7 +27,7 @@ export function SmartHarvestModal({
   defaultSymbol = "",
   defaultAssetClass = "",
   defaultStartDate = "",
-}: SmartHarvestModalProps) {
+}: Readonly<SmartHarvestModalProps>) {
   const [source, setSource] = useState(defaultSource || "dukascopy");
   const [symbol, setSymbol] = useState(defaultSymbol);
   const [assetClass, setAssetClass] = useState(defaultAssetClass);

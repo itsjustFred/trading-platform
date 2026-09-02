@@ -748,7 +748,7 @@ export function DownloadModal({
   defaultSource = "dukascopy",
   defaultSymbols = "",
   defaultTimeframes = ["d1"],
-}: DownloadModalProps) {
+}: Readonly<DownloadModalProps>) {
   const { showToast } = useToast();
   const normalizedDefaultTimeframes = useMemo(
     () =>

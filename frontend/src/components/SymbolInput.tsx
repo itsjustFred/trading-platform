@@ -25,7 +25,7 @@ export function SymbolInput({
   onChange,
   placeholder,
   style,
-}: SymbolInputProps) {
+}: Readonly<SymbolInputProps>) {
   const [categories, setCategories] = useState<Record<string, string[]>>({});
   const [query, setQuery] = useState("");
   const [showDropdown, setShowDropdown] = useState(false);

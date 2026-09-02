@@ -17,7 +17,7 @@ export const Sparkline = memo(function Sparkline({
   interactive = false,
   startDate,
   endDate,
-}: {
+}: Readonly<{
   data: number[];
   width?: number;
   height?: number;
@@ -25,7 +25,7 @@ export const Sparkline = memo(function Sparkline({
   interactive?: boolean;
   startDate?: string;
   endDate?: string;
-}): React.ReactElement | null {
+}>): React.ReactElement | null {
   const normalized = useMemo(
     () =>
       Array.isArray(data)

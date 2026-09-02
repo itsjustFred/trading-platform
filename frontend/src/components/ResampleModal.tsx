@@ -55,7 +55,7 @@ export function ResampleModal({
   onTaskFinished,
   defaultSourcePath = "",
   defaultTargetTimeframes = "5m,15m,30m,1h,4h",
-}: ResampleModalProps) {
+}: Readonly<ResampleModalProps>) {
   const [sourcePath, setSourcePath] = useState(defaultSourcePath);
   const [targetTimeframes, setTargetTimeframes] = useState(
     defaultTargetTimeframes,

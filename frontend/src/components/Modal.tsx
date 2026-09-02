@@ -14,7 +14,7 @@ export function Modal({
   title,
   children,
   width = "640px",
-}: ModalProps) {
+}: Readonly<ModalProps>) {
   if (!open) return null;
 
   return (
