@@ -4392,34 +4392,39 @@ def _normalize_timeframe_key(value: Any) -> str:
     return normalize_timeframe(str(value or "").strip() or "1h")
 
 
-def _resolve_component_backtest_id(
+def _cached_backtest_strategy_matches(
+    item: dict[str, Any],
+    *,
+    strategy_entry: Any,
+    normalized_strategy: str,
+) -> bool:
+    item_strategy = _normalize_strategy_key(item.get("strategy_name"))
+    if strategy_entry is not None and matches_strategy_identifier(
+        strategy_entry, str(item.get("strategy_name") or "")
+    ):
+        return True
+    return item_strategy == normalized_strategy
+
+
+def _latest_matching_cached_backtest(
     *,
     strategy_name: str,
-    symbol: str,
-    timeframe: str,
-    explicit_backtest_id: str = "",
-) -> str:
-    explicit_id = str(explicit_backtest_id or "").strip()
-    if explicit_id:
-        return explicit_id
-
-    strategy_entry = _safe_strategy_entry(strategy_name)
-    normalized_strategy = _normalize_strategy_key(strategy_name)
-    normalized_symbol = _normalize_symbol_key(symbol)
-    normalized_timeframe = _normalize_timeframe_key(timeframe)
-
+    strategy_entry: Any,
+    normalized_strategy: str,
+    normalized_symbol: str,
+    normalized_timeframe: str,
+) -> tuple[str, str] | None:
+    """Newest backtest from the meta cache matching strategy/symbol/timeframe."""
     best_candidate: tuple[str, str] | None = None
     for item in _snapshot_backtest_meta_cache():
         backtest_id = str(item.get("id") or "").strip()
         if not backtest_id:
             continue
-        item_strategy = _normalize_strategy_key(item.get("strategy_name"))
-        strategy_matches = False
-        if strategy_entry is not None:
-            strategy_matches = matches_strategy_identifier(strategy_entry, str(item.get("strategy_name") or ""))
-        if not strategy_matches:
-            strategy_matches = item_strategy == normalized_strategy
-        if not strategy_matches:
+        if not _cached_backtest_strategy_matches(
+            item,
+            strategy_entry=strategy_entry,
+            normalized_strategy=normalized_strategy,
+        ):
             continue
 
         item_symbols = [str(raw).strip().upper() for raw in (item.get("symbols") or []) if str(raw).strip()]
@@ -4432,10 +4437,35 @@ def _resolve_component_backtest_id(
         created_at = str(item.get("created_at") or "")
         if best_candidate is None or created_at > best_candidate[0]:
             best_candidate = (created_at, backtest_id)
+    return best_candidate
 
-    if best_candidate is not None:
-        return best_candidate[1]
 
+def _file_backtest_strategy_matches(
+    raw_strategies: list[Any],
+    *,
+    strategy_entry: Any,
+    normalized_strategy: str,
+) -> bool:
+    if strategy_entry is not None and any(
+        matches_strategy_identifier(strategy_entry, strategy_value)
+        for strategy_value in raw_strategies
+    ):
+        return True
+    return any(
+        _normalize_strategy_key(strategy_value) == normalized_strategy
+        for strategy_value in raw_strategies
+    )
+
+
+def _latest_matching_file_backtest(
+    *,
+    strategy_name: str,
+    strategy_entry: Any,
+    normalized_strategy: str,
+    normalized_symbol: str,
+    normalized_timeframe: str,
+) -> str:
+    """Newest trade file on disk matching strategy/symbol/timeframe (meta cache miss)."""
     if not BACKTESTS_DIR.exists():
         raise HTTPException(
             status_code=404,
@@ -4455,18 +4485,11 @@ def _resolve_component_backtest_id(
         if not isinstance(raw_strategies, list) or not raw_strategies:
             continue
 
-        strategy_matches = False
-        if strategy_entry is not None:
-            strategy_matches = any(
-                matches_strategy_identifier(strategy_entry, strategy_value)
-                for strategy_value in raw_strategies
-            )
-        if not strategy_matches:
-            strategy_matches = any(
-                _normalize_strategy_key(strategy_value) == normalized_strategy
-                for strategy_value in raw_strategies
-            )
-        if not strategy_matches:
+        if not _file_backtest_strategy_matches(
+            raw_strategies,
+            strategy_entry=strategy_entry,
+            normalized_strategy=normalized_strategy,
+        ):
             continue
 
         data_payload = meta.get("data", {}) if isinstance(meta.get("data"), dict) else {}
@@ -4479,15 +4502,59 @@ def _resolve_component_backtest_id(
             continue
 
         timeframes_payload = data_payload.get("timeframes") or []
-        timeframe_match = True
         if isinstance(timeframes_payload, list) and timeframes_payload:
-            timeframe_match = normalized_timeframe in {
+            if normalized_timeframe not in {
                 _normalize_timeframe_key(raw_timeframe) for raw_timeframe in timeframes_payload
-            }
-        if not timeframe_match:
-            continue
+            }:
+                continue
 
         return file_path.stem.replace(".trades", "")
+
+    raise HTTPException(
+        status_code=404,
+        detail=(
+            f"No backtest found for component '{strategy_name}' "
+            f"({normalized_symbol or 'N/A'} {normalized_timeframe})"
+        ),
+    )
+
+
+def _resolve_component_backtest_id(
+    *,
+    strategy_name: str,
+    symbol: str,
+    timeframe: str,
+    explicit_backtest_id: str = "",
+) -> str:
+    explicit_id = str(explicit_backtest_id or "").strip()
+    if explicit_id:
+        return explicit_id
+
+    strategy_entry = _safe_strategy_entry(strategy_name)
+    normalized_strategy = _normalize_strategy_key(strategy_name)
+    normalized_symbol = _normalize_symbol_key(symbol)
+    normalized_timeframe = _normalize_timeframe_key(timeframe)
+
+    best_candidate = _latest_matching_cached_backtest(
+        strategy_name=strategy_name,
+        strategy_entry=strategy_entry,
+        normalized_strategy=normalized_strategy,
+        normalized_symbol=normalized_symbol,
+        normalized_timeframe=normalized_timeframe,
+    )
+
+    if best_candidate is not None:
+        return best_candidate[1]
+
+    file_candidate = _latest_matching_file_backtest(
+        strategy_name=strategy_name,
+        strategy_entry=strategy_entry,
+        normalized_strategy=normalized_strategy,
+        normalized_symbol=normalized_symbol,
+        normalized_timeframe=normalized_timeframe,
+    )
+    if file_candidate:
+        return file_candidate
 
     raise HTTPException(
         status_code=404,
@@ -6874,6 +6941,117 @@ def _canonical_timeframe_path(paths: set[str], timeframe: str) -> str:
     return sorted_paths[0]
 
 
+def _normalize_ohlcv_validation(
+    validation_payload: dict[str, Any],
+    warning_message: str | None,
+    error_message: str | None,
+) -> dict[str, Any]:
+    """Normalize a catalog validation payload; an empty dict means 'omit'."""
+    if not validation_payload and not warning_message and not error_message:
+        return {}
+    normalized_validation = dict(validation_payload)
+    status = str(normalized_validation.get("status") or "").strip().lower()
+    if status not in {"ok", "warning", "error"}:
+        status = "ok"
+    if status == "ok" and (warning_message or error_message):
+        status = "warning"
+    normalized_validation["status"] = status
+    return normalized_validation
+
+
+def _aggregate_ohlcv_entry_payload(
+    entry: dict[str, Any],
+    *,
+    include_category: bool = False,
+    include_size_bytes: bool = False,
+) -> dict[str, Any]:
+    path_value = str(entry.get("path") or "")
+    category = _categorize_path(path_value) if include_category else ""
+    start_value = entry.get("start") or entry.get("start_date")
+    end_value = entry.get("end") or entry.get("end_date")
+    size_bytes = _entry_size_bytes(entry)
+    warning_message = _warning_message_from_entry(entry)
+    error_message = str(entry.get("error") or "").strip() or None
+
+    row_count_raw = entry.get("row_count", entry.get("rows"))
+    try:
+        row_count = int(row_count_raw) if row_count_raw is not None else None
+    except (TypeError, ValueError):
+        row_count = None
+
+    files = [
+        str(file_path).strip()
+        for file_path in (entry.get("files") if isinstance(entry.get("files"), list) else [])
+        if str(file_path).strip()
+    ]
+    if not files and path_value:
+        files = [path_value]
+
+    source_values = [
+        str(item).strip()
+        for item in (entry.get("sources") if isinstance(entry.get("sources"), list) else [])
+        if str(item).strip()
+    ]
+
+    output_entry: dict[str, Any] = {
+        "symbol": str(entry.get("symbol") or "Unknown"),
+        "timeframe": normalize_timeframe(str(entry.get("timeframe") or "unknown")),
+        "path": path_value,
+        "size_mb": round(size_bytes / (1024 * 1024), 2),
+        "start": start_value,
+        "end": end_value,
+        "start_date": start_value,
+        "end_date": end_value,
+        "source": str(entry.get("source") or ""),
+        "files": files,
+        "file_count": len(files),
+    }
+    if row_count is not None:
+        output_entry["row_count"] = row_count
+    if source_values:
+        output_entry["sources"] = sorted(set(source_values))
+    if include_size_bytes:
+        output_entry["size_bytes"] = size_bytes
+
+    if include_category:
+        output_entry["category"] = category
+
+    validation_payload = entry.get("validation")
+    normalized_validation = _normalize_ohlcv_validation(
+        validation_payload if isinstance(validation_payload, dict) else {},
+        warning_message,
+        error_message,
+    )
+    if normalized_validation:
+        output_entry["validation"] = normalized_validation
+    if warning_message:
+        output_entry["warning_message"] = warning_message
+        output_entry["validation_message"] = warning_message
+    if error_message:
+        output_entry["error"] = error_message
+    if entry.get("repo"):
+        output_entry["repo"] = True
+    if entry.get("last_updated") is not None:
+        output_entry["last_updated"] = entry.get("last_updated")
+
+    segment_entries = sorted(
+        [
+            segment
+            for segment in (entry.get("segments") if isinstance(entry.get("segments"), list) else [])
+            if isinstance(segment, dict)
+        ],
+        key=lambda segment: str(segment.get("path") or ""),
+    )
+    include_segments = len(segment_entries) > 1 or any(
+        str(segment.get("segment") or "").strip() for segment in segment_entries
+    )
+    if include_segments:
+        output_entry["segments"] = segment_entries
+        output_entry["segment_count"] = len(segment_entries)
+
+    return output_entry
+
+
 def _aggregate_symbol_timeframe_entries(
     entries: list[dict[str, Any]],
     *,
@@ -6883,93 +7061,13 @@ def _aggregate_symbol_timeframe_entries(
     logical_entries: list[dict[str, Any]] = []
     merged_entries = merge_ohlcv_entries([entry for entry in entries if isinstance(entry, dict)])
     for entry in merged_entries:
-        path_value = str(entry.get("path") or "")
-        category = _categorize_path(path_value) if include_category else ""
-        start_value = entry.get("start") or entry.get("start_date")
-        end_value = entry.get("end") or entry.get("end_date")
-        size_bytes = _entry_size_bytes(entry)
-        warning_message = _warning_message_from_entry(entry)
-        error_message = str(entry.get("error") or "").strip() or None
-
-        row_count_raw = entry.get("row_count", entry.get("rows"))
-        try:
-            row_count = int(row_count_raw) if row_count_raw is not None else None
-        except (TypeError, ValueError):
-            row_count = None
-
-        files = [
-            str(file_path).strip()
-            for file_path in (entry.get("files") if isinstance(entry.get("files"), list) else [])
-            if str(file_path).strip()
-        ]
-        if not files and path_value:
-            files = [path_value]
-
-        source_values = [
-            str(item).strip()
-            for item in (entry.get("sources") if isinstance(entry.get("sources"), list) else [])
-            if str(item).strip()
-        ]
-
-        output_entry: dict[str, Any] = {
-            "symbol": str(entry.get("symbol") or "Unknown"),
-            "timeframe": normalize_timeframe(str(entry.get("timeframe") or "unknown")),
-            "path": path_value,
-            "size_mb": round(size_bytes / (1024 * 1024), 2),
-            "start": start_value,
-            "end": end_value,
-            "start_date": start_value,
-            "end_date": end_value,
-            "source": str(entry.get("source") or ""),
-            "files": files,
-            "file_count": len(files),
-        }
-        if row_count is not None:
-            output_entry["row_count"] = row_count
-        if source_values:
-            output_entry["sources"] = sorted(set(source_values))
-        if include_size_bytes:
-            output_entry["size_bytes"] = size_bytes
-
-        if include_category:
-            output_entry["category"] = category
-
-        validation_payload = entry.get("validation")
-        if isinstance(validation_payload, dict) or warning_message or error_message:
-            normalized_validation = dict(validation_payload) if isinstance(validation_payload, dict) else {}
-            status = str(normalized_validation.get("status") or "").strip().lower()
-            if status not in {"ok", "warning", "error"}:
-                status = "ok"
-            if status == "ok" and (warning_message or error_message):
-                status = "warning"
-            normalized_validation["status"] = status
-            output_entry["validation"] = normalized_validation
-        if warning_message:
-            output_entry["warning_message"] = warning_message
-            output_entry["validation_message"] = warning_message
-        if error_message:
-            output_entry["error"] = error_message
-        if entry.get("repo"):
-            output_entry["repo"] = True
-        if entry.get("last_updated") is not None:
-            output_entry["last_updated"] = entry.get("last_updated")
-
-        segment_entries = sorted(
-            [
-                segment
-                for segment in (entry.get("segments") if isinstance(entry.get("segments"), list) else [])
-                if isinstance(segment, dict)
-            ],
-            key=lambda segment: str(segment.get("path") or ""),
+        logical_entries.append(
+            _aggregate_ohlcv_entry_payload(
+                entry,
+                include_category=include_category,
+                include_size_bytes=include_size_bytes,
+            )
         )
-        include_segments = len(segment_entries) > 1 or any(
-            str(segment.get("segment") or "").strip() for segment in segment_entries
-        )
-        if include_segments:
-            output_entry["segments"] = segment_entries
-            output_entry["segment_count"] = len(segment_entries)
-
-        logical_entries.append(output_entry)
 
     logical_entries.sort(
         key=lambda item: (
