@@ -11,7 +11,46 @@ from pathlib import Path
 
 import pytest
 
-from runner.engines.pynecore_adapter import _compile_helper_namespace
+from runner.engines.pynecore_adapter import (
+    HELPER_ALLOWED_IMPORT_ROOTS,
+    HELPER_BANNED_CALL_NAMES,
+    _compile_helper_namespace,
+)
+
+
+def test_helper_import_allowlist_is_pinned():
+    """The in-process helper import whitelist is the real trust boundary.
+
+    A new entry transitively widens what helper code can reach inside the
+    runner process; this test fails on any silent addition so the change is a
+    conscious, reviewed decision.
+    """
+    assert HELPER_ALLOWED_IMPORT_ROOTS == frozenset(
+        {
+            "pandas",
+            "numpy",
+            "math",
+            "statistics",
+            "decimal",
+            "datetime",
+            "typing",
+            "collections",
+            "itertools",
+            "functools",
+            "dataclasses",
+        }
+    )
+    # Filesystem / process / network roots must never enter the whitelist.
+    assert HELPER_ALLOWED_IMPORT_ROOTS.isdisjoint(
+        {"os", "sys", "pathlib", "io", "shutil", "subprocess", "socket", "json", "csv"}
+    )
+
+
+def test_helper_banned_call_names_are_pinned():
+    """The banned-call fence must keep the reflection/IO escape hatches."""
+    assert HELPER_BANNED_CALL_NAMES == frozenset(
+        {"eval", "exec", "compile", "open", "__import__", "globals", "locals", "vars", "breakpoint"}
+    )
 
 
 def test_helper_allows_pandas_import():

@@ -131,7 +131,8 @@ def test_validated_strategy_is_not_approved_until_human_review(tmp_path, monkeyp
     from runner.approval_gate import StrategyNotApprovedError, approve_strategy, is_strategy_approved
 
     assert not is_strategy_approved(strategy_file, strategies_root=tmp_path / "strategies")
-    with pytest.raises(StrategyNotApprovedError):
+
+    def _run_gate() -> None:
         auto_agent.run_validated_backtest(
             strategy_file,
             engine=result["engine"],
@@ -141,18 +142,13 @@ def test_validated_strategy_is_not_approved_until_human_review(tmp_path, monkeyp
             output_path=Path(result["backtest_output"]),
             log=lambda *args, **kwargs: None,
         )
+
+    with pytest.raises(StrategyNotApprovedError):
+        _run_gate()
     assert backtest_cmd == []
 
     approve_strategy(strategy_file, approved_by="reviewer", strategies_root=tmp_path / "strategies")
-    auto_agent.run_validated_backtest(
-        strategy_file,
-        engine=result["engine"],
-        target=auto_agent.BacktestTarget(
-            symbols=["AAPL"], timeframe="1h", start="2024-01-01", end="2024-01-31"
-        ),
-        output_path=Path(result["backtest_output"]),
-        log=lambda *args, **kwargs: None,
-    )
+    _run_gate()
     assert len(backtest_cmd) == 1
 
 

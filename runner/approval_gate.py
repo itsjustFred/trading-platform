@@ -45,7 +45,7 @@ def approve_strategy(
         "approved_by": str(approved_by or "unspecified").strip() or "unspecified",
         "approved_at": datetime.now(timezone.utc).isoformat(),
     }
-    ledger = approval_path_for(path, strategies_root)
+    ledger = path.with_name(path.name + LEDGER_SUFFIX)
     ledger.parent.mkdir(parents=True, exist_ok=True)
     ledger.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return record
@@ -76,10 +76,8 @@ def require_approval(
     return record
 
 
-def approval_path_for(
-    strategy_path: Path | str,
-    strategies_root: Path | str | None = None,
-) -> Path:
+def approval_path_for(strategy_path: Path | str) -> Path:
+    """Ledger path for ``strategy_path``: the file name plus ``LEDGER_SUFFIX``."""
     path = Path(strategy_path)
     return path.with_name(path.name + LEDGER_SUFFIX)
 
@@ -92,7 +90,7 @@ def _matching_record(
     if not path.exists():
         return None
 
-    ledger = approval_path_for(path, strategies_root)
+    ledger = approval_path_for(path)
     if not ledger.exists():
         return None
 
@@ -101,6 +99,12 @@ def _matching_record(
     except (OSError, json.JSONDecodeError):
         return None
     if not isinstance(record, dict):
+        return None
+
+    # Provenance check: a ledger must name the file it is found beside. A
+    # ledger copied (or left behind) for a different strategy file never
+    # legitimizes this one, even if the hashes happen to match.
+    if str(record.get("file") or "") != _relative_name(path, strategies_root):
         return None
 
     if str(record.get("sha256") or "") != _sha256_of(path):

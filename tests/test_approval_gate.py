@@ -74,7 +74,37 @@ def test_missing_strategy_file_is_not_approved(tmp_path):
 
 
 def test_approval_path_is_deterministic_per_file(tmp_path):
-    assert (
-        approval_path_for(tmp_path / "demo.py", strategies_root=tmp_path).name
-        == "demo.py.approved.json"
-    )
+    assert approval_path_for(tmp_path / "demo.py").name == "demo.py.approved.json"
+
+
+def test_discarded_strategy_leaves_no_orphaned_ledger(tmp_path):
+    """Removing a generated file must remove its approval ledger with it."""
+    from runner.approval_gate import approval_path_for
+
+    strategy = tmp_path / "demo.py"
+    strategy.write_text("x = 1\n")
+    approve_strategy(strategy, strategies_root=tmp_path)
+    assert approval_path_for(strategy).exists()
+
+    strategy.unlink()
+    from runner.auto_agent import _discard_failed_strategy_file
+
+    _discard_failed_strategy_file(strategy)
+    assert not approval_path_for(strategy).exists()
+
+
+def test_ledger_for_a_different_file_is_not_accepted(tmp_path, monkeypatch):
+    """A ledger copied beside another file never legitimizes that file."""
+    from runner.approval_gate import approval_path_for, is_strategy_approved
+
+    first = tmp_path / "first.py"
+    first.write_text("x = 1\n")
+    approve_strategy(first, strategies_root=tmp_path)
+
+    second = tmp_path / "second.py"
+    second.write_text("x = 1\n")  # identical content, identical hash
+    # Simulate a copied/left-behind ledger: same bytes, wrong provenance.
+    (approval_path_for(second)).write_text(approval_path_for(first).read_text())
+
+    assert is_strategy_approved(first, strategies_root=tmp_path)
+    assert not is_strategy_approved(second, strategies_root=tmp_path)

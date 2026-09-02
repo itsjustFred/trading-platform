@@ -6686,16 +6686,27 @@ def _codegen_gate_strategy_path(relative_file: str) -> Path:
     """Resolve a strategy relative file inside the strategies dir (traversal-safe)."""
     normalized = str(relative_file or "").strip()
     if not normalized or ".." in normalized or normalized.startswith("/"):
-        raise HTTPException(status_code=400, detail="Invalid strategy file path")
+        raise _invalid_strategy_path()
     candidate = (STRATEGIES_DIR / normalized).resolve()
     try:
         candidate.relative_to(STRATEGIES_DIR.resolve())
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail="Invalid strategy file path") from exc
+    except ValueError:
+        raise _invalid_strategy_path() from None
     return candidate
 
 
-@app.get("/api/strategies/{relative_file:path}/approval", response_model=dict[str, Any])
+def _invalid_strategy_path() -> HTTPException:
+    return HTTPException(status_code=400, detail="Invalid strategy file path")
+
+
+@app.get(
+    "/api/strategies/{relative_file:path}/approval",
+    response_model=dict[str, Any],
+    responses={
+        400: {"description": "Invalid strategy file path"},
+        404: {"description": "Strategy not found"},
+    },
+)
 async def get_strategy_approval(relative_file: str) -> dict[str, Any]:
     """Report whether a strategy file's current content is covered by a human approval."""
     from runner.approval_gate import is_strategy_approved
@@ -6709,7 +6720,15 @@ async def get_strategy_approval(relative_file: str) -> dict[str, Any]:
     return {"approved": approved}
 
 
-@app.post("/api/strategies/{relative_file:path}/approve", response_model=dict[str, Any])
+@app.post(
+    "/api/strategies/{relative_file:path}/approve",
+    response_model=dict[str, Any],
+    responses={
+        400: {"description": "Invalid strategy file path"},
+        404: {"description": "Strategy not found"},
+        500: {"description": "Could not record the approval"},
+    },
+)
 async def approve_strategy(relative_file: str) -> dict[str, Any]:
     """Record a SHA256-bound human approval for a generated strategy file."""
     from runner.approval_gate import approve_strategy as record_approval
@@ -6721,9 +6740,12 @@ async def approve_strategy(relative_file: str) -> dict[str, Any]:
         record = await asyncio.to_thread(
             record_approval, path, approved_by="human", strategies_root=STRATEGIES_DIR
         )
-    except OSError as exc:
-        logger.exception("Failed to approve strategy %s: %s", relative_file, exc)
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except OSError:
+        logger.exception("Failed to record approval for strategy '%s'", relative_file)
+        raise HTTPException(
+            status_code=500,
+            detail="Could not record the strategy approval; see server logs.",
+        ) from None
     return {
         "approved": True,
         "file": record["file"],

@@ -15,7 +15,7 @@ fastapi_testclient = pytest.importorskip("fastapi.testclient")
 from viewer.main import STRATEGIES_DIR, app  # noqa: E402
 
 
-@pytest.fixture()
+@pytest.fixture
 def client(monkeypatch, tmp_path):
     strategies_dir = tmp_path / "strategies"
     strategies_dir.mkdir()

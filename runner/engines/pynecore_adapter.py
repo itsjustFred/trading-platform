@@ -410,6 +410,11 @@ def _load_strategy_helper_namespace(strategy_path: Path, source: str) -> dict[st
     return namespace
 
 
+# Trust boundary for helper code executed in-process by the runner (see
+# _compile_helper_namespace): this import whitelist is the real gate — every
+# entry transitively widens what helper code can reach. The banned-call list
+# below is only a second fence, not a sandbox. Additions here need a
+# security-review and a test in tests/test_pynecore_helper_containment.py.
 HELPER_ALLOWED_IMPORT_ROOTS = frozenset(
     {
         "pandas",
@@ -439,30 +444,53 @@ def _helper_import_root(node: ast.Import | ast.ImportFrom) -> str:
     return (node.module or "").split(".")[0]
 
 
+def _reject_helper_import(node: ast.stmt, source_path: Path) -> None:
+    root = _helper_import_root(node)
+    if root not in HELPER_ALLOWED_IMPORT_ROOTS:
+        raise RuntimeError(
+            f"Import '{root}' is not allowed in strategy helper code "
+            f"({source_path.name}). Allowed: "
+            + ", ".join(sorted(HELPER_ALLOWED_IMPORT_ROOTS))
+        )
+
+
+def _reject_helper_call(node: ast.stmt, source_path: Path) -> None:
+    func = node.func
+    if not isinstance(func, ast.Name) or func.id not in HELPER_BANNED_CALL_NAMES:
+        return
+    raise RuntimeError(
+        f"Call to '{func.id}()' is not allowed in strategy helper code ({source_path.name})."
+    )
+
+
+def _reject_dunder_attribute(node: ast.stmt, source_path: Path) -> None:
+    if node.attr.startswith("__") and node.attr.endswith("__"):
+        raise RuntimeError(
+            f"Dunder attribute access '{node.attr}' is not allowed in "
+            f"strategy helper code ({source_path.name})."
+        )
+
+
+_SCREEN_RULES: tuple[tuple[type[ast.stmt], callable], ...] = (
+    (ast.Import, _reject_helper_import),
+    (ast.ImportFrom, _reject_helper_import),
+    (ast.Call, _reject_helper_call),
+    (ast.Attribute, _reject_dunder_attribute),
+)
+
+
+def _screen_helper_node(node: ast.stmt, source_path: Path) -> None:
+    """Apply every helper screening rule to one statement."""
+    for node_type, reject in _SCREEN_RULES:
+        if isinstance(node, node_type):
+            reject(node, source_path)
+
+
 def _helper_screen_nodes(nodes: list[ast.stmt], source_path: Path) -> None:
     """Reject helper constructs the runner process must not execute."""
     for node in nodes:
         for inner in ast.walk(node):
-            if isinstance(inner, (ast.Import, ast.ImportFrom)):
-                root = _helper_import_root(inner)
-                if root not in HELPER_ALLOWED_IMPORT_ROOTS:
-                    raise RuntimeError(
-                        f"Import '{root}' is not allowed in strategy helper code "
-                        f"({source_path.name}). Allowed: "
-                        + ", ".join(sorted(HELPER_ALLOWED_IMPORT_ROOTS))
-                    )
-            elif isinstance(inner, ast.Call) and isinstance(inner.func, ast.Name):
-                if inner.func.id in HELPER_BANNED_CALL_NAMES:
-                    raise RuntimeError(
-                        f"Call to '{inner.func.id}()' is not allowed in strategy "
-                        f"helper code ({source_path.name})."
-                    )
-            elif isinstance(inner, ast.Attribute):
-                if inner.attr.startswith("__") and inner.attr.endswith("__"):
-                    raise RuntimeError(
-                        f"Dunder attribute access '{inner.attr}' is not allowed in "
-                        f"strategy helper code ({source_path.name})."
-                    )
+            _screen_helper_node(inner, source_path)
 
 
 def _compile_helper_namespace(
