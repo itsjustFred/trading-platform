@@ -153,6 +153,7 @@ def flag_missing_intrabar(
     *,
     intrabar_resolution: str | None,
     intrabar_coverage: bool,
+    reason: str = "intrabar_data_missing",
 ) -> dict[str, Any] | None:
     """Build the same-bar-ambiguity flag required by the Decision Record.
 
@@ -162,18 +163,21 @@ def flag_missing_intrabar(
     chronological event is authoritative).
 
     Returns a flag payload when an intrabar resolution WAS requested but the
-    data does not cover the bar: the result then silently fell back to the
-    stop-first tie-break and that fact must be visible on the trade/meta.
+    walk could not resolve the chronology: the result then silently fell back
+    to the stop-first tie-break and that fact must be visible on the
+    trade/meta. ``reason`` distinguishes why the walk failed —
+    ``"intrabar_data_missing"`` (no sub-bars for the bar) vs.
+    ``"intrabar_unresolved"`` (sub-bars exist but neither level was touched).
     """
     if intrabar_resolution is None:
         return None
-    if intrabar_coverage:
+    if intrabar_coverage and reason == "intrabar_data_missing":
         return None
     return {
         "same_bar_priority": "stop_first_fallback",
         "intrabar_resolution": intrabar_resolution,
-        "intrabar_available": False,
-        "reason": "intrabar_data_missing",
+        "intrabar_available": intrabar_coverage,
+        "reason": reason,
     }
 
 

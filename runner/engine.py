@@ -594,17 +594,22 @@ class TradeEngine:
         """Record the stop-first fallback flag on the position's future trade.
 
         Decision Record (Cleanup 16-A): when intrabar data was requested but
-        does not cover the ambiguous bar, the stop-first tie-break is used and
-        the result must be flagged. The flag lands in
+        could not order the two same-bar events, the stop-first tie-break is
+        used and the result must be flagged. The flag lands in
         ``trade.meta["same_bar_priority"]`` via ``_finalize_position``; when
-        the intrabar data DOES cover the bar the chronological event already
-        won and no flag (and no ``None`` placeholder) is recorded.
+        the intrabar walk DID resolve the chronology the chronological event
+        already won and no flag is recorded.
+
+        The caller only reaches this method when the intrabar walk produced no
+        ordered event, so a fallback ALWAYS applies here; the reason records
+        whether sub-bars existed at all.
         """
         window = self._intrabar_window(bar_time, next_time)
-        has_coverage = window is not None and not window.empty
+        has_sub_bars = window is not None and not window.empty
         flag = flag_missing_intrabar(
             intrabar_resolution=self._execution_model.intrabar_resolution,
-            intrabar_coverage=has_coverage,
+            intrabar_coverage=has_sub_bars,
+            reason="intrabar_data_missing" if not has_sub_bars else "intrabar_unresolved",
         )
         if flag is not None:
             position.meta["same_bar_priority"] = flag
@@ -696,9 +701,9 @@ class TradeEngine:
                     )
                 if first_event is None:
                     # Conformance (Cleanup 16-A, F8): intrabar data was
-                    # requested but does not cover this bar — fall back to the
-                    # stop-first tie-break and flag the trade so the ambiguity
-                    # is visible downstream.
+                    # requested but could not order the two events — fall
+                    # back to the stop-first tie-break and flag the trade so
+                    # the ambiguity is visible downstream.
                     first_event = "stop"
                     self._flag_same_bar_fallback(position, bar_time, next_time)
             elif stop_hit:

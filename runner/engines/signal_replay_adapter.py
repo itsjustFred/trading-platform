@@ -335,10 +335,18 @@ class SignalReplayAdapter:
             self._apply_trailing_stop(position, bar)
             return None
         if event == "stop":
-            exit_price = float(position.stop_loss or float(bar["close"]))
+            exit_price = (
+                float(position.stop_loss)
+                if position.stop_loss is not None
+                else float(bar["close"])
+            )
             reason = "trailing_stop" if position.trailing_updates > 0 else "stop_loss"
         else:
-            exit_price = float(position.take_profit or float(bar["close"]))
+            exit_price = (
+                float(position.take_profit)
+                if position.take_profit is not None
+                else float(bar["close"])
+            )
             reason = "take_profit"
         return self._close_position(
             position,

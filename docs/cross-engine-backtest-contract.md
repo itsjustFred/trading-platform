@@ -88,7 +88,10 @@ Implementation:
   the walk cannot order the events) it applies stop-first and sets
   `trade.meta["same_bar_priority"]` via `flag_missing_intrabar`:
   `{"same_bar_priority": "stop_first_fallback", "intrabar_resolution": …,
-  "intrabar_available": false, "reason": "intrabar_data_missing"}`.
+  "intrabar_available": …, "reason": …}`. The flag is present ONLY when the
+  fallback was used (never a `null` placeholder), and `reason` distinguishes
+  `"intrabar_data_missing"` (no sub-bars for the bar) from
+  `"intrabar_unresolved"` (sub-bars exist but touch neither level).
 - Vectorbt: `_match_intrabar_exit_event` routes through the same helper per
   sub-bar. The intrabar resolution itself is honored as requested (`5m`,
   `15m`, `1h`, `1-lower`, …); only unknown spellings fall back to

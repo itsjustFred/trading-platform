@@ -310,10 +310,26 @@ class TestSameBarExitPolicy:
         assert flag is not None
         assert flag["same_bar_priority"] == "stop_first_fallback"
         assert flag["intrabar_available"] is False
+        assert flag["reason"] == "intrabar_data_missing"
 
         empty = flag_missing_intrabar(intrabar_resolution="5m", intrabar_coverage=False)
         assert empty is not None
         assert empty["intrabar_available"] is False
+
+    def test_sub_bars_present_but_unresolvable_is_flagged_as_unresolved(self):
+        """Sub-bars exist but the walk found no ordered event: still a fallback.
+
+        Coverage alone is not resolution — the flag must be emitted (so the
+        stop-first fallback stays visible) and must record that the data was
+        there but could not order the two levels.
+        """
+        flag = flag_missing_intrabar(
+            intrabar_resolution="5m", intrabar_coverage=True, reason="intrabar_unresolved"
+        )
+        assert flag is not None
+        assert flag["same_bar_priority"] == "stop_first_fallback"
+        assert flag["intrabar_available"] is True
+        assert flag["reason"] == "intrabar_unresolved"
 
     def test_available_intrabar_data_is_not_flagged(self):
         assert flag_missing_intrabar(intrabar_resolution="5m", intrabar_coverage=True) is None
