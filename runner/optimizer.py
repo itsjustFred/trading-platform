@@ -6,7 +6,7 @@ import math
 from datetime import datetime, timezone
 from itertools import combinations
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, NoReturn
 
 import optuna
 import pandas as pd
@@ -252,7 +252,7 @@ def run_optimization(
 
     last_trial_exception: BaseException | None = None
 
-    def _record_failure(trial: optuna.Trial, exc: BaseException) -> float:
+    def _record_failure(trial: optuna.Trial, exc: BaseException) -> NoReturn:
         nonlocal last_trial_exception
         last_trial_exception = exc
         trial.set_user_attr("failure_reason", f"{type(exc).__name__}: {exc}")

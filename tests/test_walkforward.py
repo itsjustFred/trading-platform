@@ -421,15 +421,13 @@ def test_strategy_walkforward_builds_rolling_folds_and_summary(tmp_path: Path) -
     assert saved == result
 
 
-class _FoldRecordingEngine:
-    name = "fake"
+class _FoldRecordingEngine(_FakeEngine):
+    """Like _FakeEngine but returns the caller's stats and no equity curve, so
+    the canonical-stats recomputation (F15) has a stale value to override."""
 
     def __init__(self, *, stats: dict | None = None) -> None:
+        super().__init__()
         self.stats = dict(stats or {})
-        self.configs: list[BacktestConfig] = []
-
-    def validate_config(self, config: BacktestConfig) -> list[str]:
-        return []
 
     def run(self, config: BacktestConfig, strategy_path: str, progress_callback=None) -> BacktestResult:
         self.configs.append(config)

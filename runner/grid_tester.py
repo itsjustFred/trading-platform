@@ -114,8 +114,8 @@ def _persist_grid_result(
     results_matrix: dict[str, dict[str, dict[str, Any]]],
     engine_name: str,
     now: datetime,
-) -> Path:
-    """Write the grid payload to JSON and SQLite; return the JSON path."""
+) -> None:
+    """Write the grid payload to JSON and SQLite."""
     output_path = GRID_RESULTS_DIR / f"{grid_id}.json"
     payload = {
         "id": grid_id,
@@ -138,7 +138,6 @@ def _persist_grid_result(
         results=results_matrix,
         engine=engine_name,
     )
-    return output_path
 
 
 def run_strategy_grid(

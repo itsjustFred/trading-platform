@@ -243,6 +243,56 @@ def _resolve_dates_for_equity(
     return start_date, end_date
 
 
+def _init_cell_result(
+    *,
+    strategy: str,
+    symbol: str,
+    timeframe: str,
+    data_dir: str,
+    start: str,
+    end: str,
+    output_dir: Path,
+    skip_existing: bool,
+) -> tuple[dict[str, Any], BacktestResult | None]:
+    """Build the shared cell record and honor the skip-existing shortcut.
+
+    Returns ``(cell, skipped)``; ``skipped`` is a fully-processed
+    ``BacktestResult`` when the existing output was reused, else ``None``.
+    The resolved window is computed once here so the reported cell window,
+    the CLI command and ``attach_daily_equity`` all see the same dates.
+    """
+    run_id = build_run_id(strategy, symbol, timeframe)
+    path = output_path_for(output_dir, run_id)
+    resolved_start, resolved_end = _resolve_dates_for_equity(
+        symbol, timeframe, data_dir, start, end
+    )
+    result: dict[str, Any] = {
+        "run_id": run_id,
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "start": resolved_start,
+        "end": resolved_end,
+        "output": str(path),
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "status": "pending",
+    }
+
+    if skip_existing and path.exists():
+        try:
+            backtest_result = BacktestResult.load(path)
+            attach_daily_equity(backtest_result, start=resolved_start, end=resolved_end)
+            merge_canonical_stats(backtest_result)
+            backtest_result.save(path)
+            result.update(read_backtest_stats(path))
+            result.update({"status": "skipped_existing", "finished_at": datetime.now(timezone.utc).isoformat()})
+            return result, backtest_result
+        except (json.JSONDecodeError, ValidationError, OSError, ValueError) as exc:
+            result.update({"status": "failed", "error": f"existing output is invalid: {exc}"})
+            return result, None
+
+    return result, None
+
+
 def run_one_backtest_in_process(
     *,
     strategy: str,
@@ -263,39 +313,22 @@ def run_one_backtest_in_process(
     save_sqlite: bool = True,
     keep_indicators: bool = False,
 ) -> dict[str, Any]:
-    run_id = build_run_id(strategy, symbol, timeframe)
-    path = output_path_for(output_dir, run_id)
-    started_at = datetime.now(timezone.utc).isoformat()
-    resolved_start, resolved_end = _resolve_dates_for_equity(
-        symbol, timeframe, data_dir, start, end
+    result, _skipped = _init_cell_result(
+        strategy=strategy,
+        symbol=symbol,
+        timeframe=timeframe,
+        data_dir=data_dir,
+        start=start,
+        end=end,
+        output_dir=output_dir,
+        skip_existing=skip_existing,
     )
-    result: dict[str, Any] = {
-        "run_id": run_id,
-        "symbol": symbol,
-        "timeframe": timeframe,
-        "start": resolved_start,
-        "end": resolved_end,
-        "output": str(path),
-        "started_at": started_at,
-        "status": "pending",
-    }
+    if result["status"] != "pending":
+        return result
 
-    if skip_existing and path.exists():
-        try:
-            backtest_result = BacktestResult.load(path)
-            # Resolve dates for equity attachment if not provided
-            resolved_start, resolved_end = _resolve_dates_for_equity(
-                symbol, timeframe, data_dir, start, end
-            )
-            attach_daily_equity(backtest_result, start=resolved_start, end=resolved_end)
-            merge_canonical_stats(backtest_result)
-            backtest_result.save(path)
-            result.update(read_backtest_stats(path))
-            result.update({"status": "skipped_existing", "finished_at": datetime.now(timezone.utc).isoformat()})
-            return result
-        except (json.JSONDecodeError, ValidationError, OSError, ValueError) as exc:
-            result.update({"status": "failed", "error": f"existing output is invalid: {exc}"})
-            return result
+    run_id = result["run_id"]
+    path = Path(result["output"])
+    resolved_start, resolved_end = result["start"], result["end"]
 
     try:
         strategy_type = detect_strategy_type(Path(strategy).resolve())
@@ -414,44 +447,22 @@ def run_one_backtest(
             keep_indicators=keep_indicators,
         )
 
-    run_id = build_run_id(strategy, symbol, timeframe)
-    path = output_path_for(output_dir, run_id)
-    started_at = datetime.now(timezone.utc).isoformat()
-    resolved_start, resolved_end = _resolve_dates_for_equity(
-        symbol, timeframe, data_dir, start, end
+    result, _skipped = _init_cell_result(
+        strategy=strategy,
+        symbol=symbol,
+        timeframe=timeframe,
+        data_dir=data_dir,
+        start=start,
+        end=end,
+        output_dir=output_dir,
+        skip_existing=skip_existing,
     )
-    result: dict[str, Any] = {
-        "run_id": run_id,
-        "symbol": symbol,
-        "timeframe": timeframe,
-        "start": resolved_start,
-        "end": resolved_end,
-        "output": str(path),
-        "started_at": started_at,
-        "status": "pending",
-    }
+    if result["status"] != "pending":
+        return result
 
-    if skip_existing and path.exists():
-        try:
-            backtest_result = BacktestResult.load(path)
-            # Resolve dates for equity attachment if not provided
-            resolved_start, resolved_end = _resolve_dates_for_equity(
-                symbol, timeframe, data_dir, start, end
-            )
-            attach_daily_equity(backtest_result, start=resolved_start, end=resolved_end)
-            merge_canonical_stats(backtest_result)
-            backtest_result.save(path)
-            result.update(read_backtest_stats(path))
-            result.update({"status": "skipped_existing", "finished_at": datetime.now(timezone.utc).isoformat()})
-            return result
-        except (json.JSONDecodeError, ValidationError, OSError, ValueError) as exc:
-            result.update({"status": "failed", "error": f"existing output is invalid: {exc}"})
-            return result
-
-    # Resolve dates for CLI command and equity attachment
-    resolved_start, resolved_end = _resolve_dates_for_equity(
-        symbol, timeframe, data_dir, start, end
-    )
+    run_id = result["run_id"]
+    path = Path(result["output"])
+    resolved_start, resolved_end = result["start"], result["end"]
 
     cmd = build_cli_command(
         strategy=strategy,
