@@ -467,7 +467,8 @@ def test_post_vix_duplicate_vix_dates_keep_last_and_tz_naive_bars_rejected(monke
 
     monkeypatch.setattr(module, "_load_vix_data", loader)
     _, _, indicators, _ = _call(module, ny_frame, {"sma_period": 3})
-    assert captured["start"] == "2024-01-02" and captured["end"] == "2024-01-02"
+    assert captured["start"] == "2024-01-02"
+    assert captured["end"] == "2024-01-02"
     assert indicators["VIX"].notna().all(), (
         "non-UTC tz-aware frames must align on UTC calendar dates"
     )
