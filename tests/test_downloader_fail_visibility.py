@@ -323,3 +323,38 @@ class TestDukascopyMergedTickContract:
         result = result_box["result"]
         assert captured == {"pipeline_batches": 3, "pause_ms": 11, "max_retries": 5}
         assert result.rows >= 0
+
+
+class TestAtomicWriteTargetValidation:
+    """Sonar S8707: the shared atomic-write sink validates its target path."""
+
+    def test_write_rejects_parent_traversal(self, tmp_path):
+        from shared.atomic_io import atomic_replace
+
+        with pytest.raises(ValueError, match="traverse upward"):
+            atomic_replace(tmp_path / "sub" / ".." / "evil.parquet", lambda _p: None)
+
+    def test_write_rejects_relative_path(self):
+        from shared.atomic_io import atomic_replace
+
+        with pytest.raises(ValueError, match="absolute path"):
+            atomic_replace(Path("relative/catalog.json"), lambda _p: None)
+
+    def test_write_rejects_symlinked_parent_escape(self, tmp_path):
+        from shared.atomic_io import atomic_replace
+
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        link_dir = tmp_path / "link"
+        link_dir.symlink_to(outside)
+        target = link_dir / "escape" / "data.parquet"
+
+        with pytest.raises(ValueError, match="symlink"):
+            atomic_replace(target, lambda _p: None)
+
+    def test_write_allows_legitimate_target(self, tmp_path):
+        from shared.atomic_io import atomic_replace
+
+        target = tmp_path / "ohlcv" / "x" / "1m.parquet"
+        atomic_replace(target, lambda p: p.write_text("ok"))
+        assert target.read_text() == "ok"
