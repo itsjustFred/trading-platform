@@ -117,11 +117,24 @@ def compute_stats(
         cagr = _cagr_from_backtest_period(equity_curve=equity_curve, trades=trades)
         daily_return_series = _daily_returns_series_from_equity_curve(equity_curve)
 
+        # Environment-independent definitions (Cleanup 16-D1, F17): the two
+        # code paths below previously published DIFFERENT metric definitions
+        # for the same backtest depending on whether quantstats was installed.
+        # Now both paths share one definition per metric:
+        # - total_return: equity endpoints (E_end / E_start - 1), NOT the
+        #   compounded product of resampled daily returns;
+        # - calmar_ratio: CAGR (elapsed-time based, identical on both paths)
+        #   divided by max drawdown;
+        # - sharpe/sortino: daily-resampled returns, annualized with 252
+        #   periods (quantstats when available, manual fallback otherwise).
+        max_drawdown_pct = -_max_drawdown_pct_manual(equities)
+        total_return = (equities[-1] / equities[0]) - 1 if equities[0] > 0 else 0
+        calmar_ratio = _safe_calmar_ratio(cagr, max_drawdown_pct)
+        max_drawdown_duration = _max_drawdown_duration(equities)
+
         if HAS_QUANTSTATS:
             returns_series = daily_return_series
             if returns_series is not None and not returns_series.empty:
-                sharpe_ratio = 0.0
-                sortino_ratio = 0.0
                 if len(returns_series) > 1:
                     sharpe_ratio = _safe_qs(
                         qs.stats.sharpe,
@@ -136,30 +149,9 @@ def compute_stats(
                         periods=DAILY_RETURN_PERIODS_PER_YEAR,
                     )
                     psr = _probabilistic_sharpe(returns_series, sharpe_ratio)
-
-                # Use manual calculation for MaxDD as it is more robust (qs can fail on intraday or non-datetime index)
-                # MaxDD is purely geometric and doesn't require annualization logic like Sharpe
-                equities_series = [e.equity for e in equity_curve]
-                max_drawdown_pct = -_max_drawdown_pct_manual(equities_series)
-                calmar_ratio = _safe_calmar_ratio(cagr, max_drawdown_pct)
-                total_return = float((1 + returns_series).prod() - 1)
-
-                # Max drawdown duration (in periods)
-                dd_dur = _max_drawdown_duration(equities)
-                max_drawdown_duration = dd_dur
         else:
-            # Fallback to manual calculations
-            max_drawdown_pct = -_max_drawdown_pct_manual(equities)
-            total_return = (equities[-1] / equities[0]) - 1 if equities[0] > 0 else 0
-            n_returns = max(len(equities) - 1, 1)
-            periods_per_year = _infer_periods_per_year(equity_curve, n_returns)
-            annualized_return = _annualize_total_return(
-                total_return,
-                periods_per_year=periods_per_year,
-                observations=n_returns,
-            )
-            calmar_ratio = _safe_calmar_ratio(annualized_return, max_drawdown_pct)
-            max_drawdown_duration = _max_drawdown_duration(equities)
+            # Manual fallback mirrors the quantstats definitions above
+            # (daily returns, 252-period annualization).
             if len(daily_returns) > 1:
                 sharpe_ratio = _sharpe_manual(daily_returns, risk_free_rate)
                 sortino_ratio = _sortino_manual(daily_returns, risk_free_rate)

@@ -2,9 +2,22 @@
 
 ## Überblick
 
-Walk-Forward (WF) Validierung ist ein Anti-Overfitting-Mechanismus, der eine Strategie über mehrere Trainings- und Test-Fenster hinweg bewertet.
+Walk-Forward (WF) Validierung ist ein Stabilitäts-Mechanismus, der eine Strategie über mehrere Trainings- und Test-Fenster hinweg bewertet.
 
-**Ziel:** Sicherstellen, dass eine Strategie auch Out-of-Sample profitabel ist, bevor sie live geht.
+> **⚠️ Expectation Gap (Cleanup 16-D1, F31 — dokumentiert statt implementiert):**
+> Der aktuelle Walk-Forward führt **keine echte In-Sample-Parameterauswahl**
+> durch. Die "Trainings"-Folds laufen mit EINEM festen Parametersatz; es wird
+> nichts auf IS-Daten optimiert. `is_sharpe` und `oos_sharpe` sind daher zwei
+> Slices desselben Backtests — die Messung validiert die **Stabilität** der
+> Strategie über verschiedene Zeiträume, **keine** Anti-Overfitting-Robustheit
+> im Sinne einer Parametervalidierung. Für echte Anti-Overfitting-Validierung
+> muss der Parametersatz vor dem Test-Fenster per Optimierung (z. B.
+> `runner.optimizer` mit `train_period` der Fold) je Fold gewählt werden;
+> das ist nicht implementiert. Die README-Beschreibung ("Anti-overfitting
+> validation") ist diesbezüglich zu lesen als "Stabilitätsvalidierung mit
+> Train/Test-Splits".
+
+**Ziel:** Sicherstellen, dass eine Strategie auch Out-of-Sample stabil profitabel ist, bevor sie live geht.
 
 ## CLI Usage
 

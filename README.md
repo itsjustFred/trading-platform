@@ -92,7 +92,7 @@ python -m runner.cli walkforward --strategy example_sma --train-months 12 --test
 
 - **Grid Testing:** `runner/grid_tester.py` - Automated strategy matrices (Symbol × Timeframe × ParamSet)
 - **Portfolio Optimization:** `runner/portfolio_optimizer.py` - Multi-strategy allocation with OOS validation
-- **Walk-Forward Analysis:** Anti-overfitting validation with train/test splits
+- **Walk-Forward Analysis:** Stability validation with train/test splits. Note: folds run one fixed parameter set — no in-sample parameter selection happens (see `docs/walk_forward.md`, "Expectation Gap")
 - **Signal Bots:** `signal_bots/health_check.py` - Registry/config validation for ramjet, rocketfuel, and nitro processors
 - **Live Risk Consistency:** Backtest vs live position sizing behavior and stop-direction validation
 

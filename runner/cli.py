@@ -398,7 +398,12 @@ def main():
         "--max-position-pct",
         type=float,
         default=None,
-        help="Max position notional / equity (e.g. 1.0 = 100%%)",
+        help=(
+            "Per-position notional cap as a fraction of equity (e.g. 1.0 = 100%%). "
+            "Semantics (Cleanup 16-D1): this caps ONE position's notional "
+            "exposure — it is NOT the engine risk-policy exposure limit and "
+            "NOT a leverage grant; --max-leverage controls leverage separately."
+        ),
     )
     run_p.add_argument(
         "--max-leverage",

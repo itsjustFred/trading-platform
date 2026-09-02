@@ -195,6 +195,38 @@ class SignalReplayAdapter:
         )
         return max(0.0, risk_amount / equity)
 
+    def _sizing_account_balance(
+        self,
+        *,
+        open_positions: dict[str, _OpenPosition],
+        realized_pnl: float,
+        frames: dict[str, pd.DataFrame],
+        as_of: pd.Timestamp,
+    ) -> float:
+        """Account balance used for position sizing (Cleanup 16-D1, F39).
+
+        Sizing-time equity must measure the same capital as the reporting
+        equity path: realized cash PLUS the mark-to-market PnL of open
+        positions at ``as_of``. The previous realized-only balance sized new
+        entries as if an open drawdown had not happened — optimistic sizing
+        during drawdown, and a sizing-time equity path that diverged from the
+        reported one.
+        """
+        unrealized = 0.0
+        for symbol, position in open_positions.items():
+            frame = frames.get(symbol)
+            if frame is None or frame.empty:
+                continue
+            bars = frame[frame["timestamp"] <= as_of]
+            if bars.empty:
+                continue
+            mark = float(bars.iloc[-1]["close"])
+            if position.direction == "LONG":
+                unrealized += (mark - position.entry_price) * position.quantity
+            else:
+                unrealized += (position.entry_price - mark) * position.quantity
+        return max(float(self.initial_capital) + float(realized_pnl) + unrealized, 1.0)
+
     @staticmethod
     def _update_excursions(position: _OpenPosition, bar: pd.Series) -> None:
         high = float(bar["high"])
@@ -518,7 +550,12 @@ class SignalReplayAdapter:
                 emit(10.0 + ((index / total_signals) * 80.0), "Replaying signals...")
                 continue
 
-            account_balance = max(self.initial_capital + realized_pnl, 1.0)
+            account_balance = self._sizing_account_balance(
+                open_positions=open_positions,
+                realized_pnl=realized_pnl,
+                frames=frames,
+                as_of=fill_time,
+            )
             exposure = self._current_exposure(open_positions, account_balance)
             risk_signal = RiskTradeSignal(
                 action="buy" if target_direction == "LONG" else "sell",

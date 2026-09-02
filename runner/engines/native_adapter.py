@@ -162,6 +162,12 @@ class NativeAdapter(EngineAdapter):
         for index, trade in enumerate(all_trades, start=1):
             trade.id = index
 
+        # Realized-PnL portfolio curve over EXIT time (Cleanup 16-D1, F5):
+        # per-symbol engines each compound sizing from full capital; a
+        # portfolio curve must not sum those per-symbol equities (it would
+        # multiply capital by the symbol count). The aggregate curve replays
+        # closed PnL once per portfolio, credited at exit — documented in the
+        # cross-engine contract.
         equity_curve: list[EquityPoint] = []
         running = config.initial_capital
         for trade in sorted(all_trades, key=lambda item: item.last_exit_time):

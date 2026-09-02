@@ -30,6 +30,12 @@ class OrderType(Enum):
     STOP_LIMIT = "stop_limit"
 
 
+#: Engine-level concurrent-position policy for the native engine
+#: (Cleanup 16-D1, F22). Deliberately a module constant, not a strategy
+#: parameter: strategy ``parameters`` must not rewrite engine risk policy.
+TRADE_ENGINE_MAX_POSITIONS = 5
+
+
 @dataclass(frozen=True)
 class ExecutionModelSettings:
     """Native execution-model assumptions recorded with each trade.
@@ -160,6 +166,13 @@ class TradeEngine:
         self._indicator_series: list[IndicatorSeries] = []
         self._execution_model = ExecutionModelSettings.from_config(config)
         self._realized_pnl = 0.0
+        # Sizing capital (Cleanup 16-D1, F21): position sizing draws on
+        # realized cash only (initial capital + closed-trade PnL). The
+        # mark-to-market ``self.equity`` stays the *reporting* equity (it
+        # feeds the equity curve), but it is no longer spendable for sizing
+        # — unrealized PnL of open positions must not compound into the
+        # quantity of the next entry.
+        self._sizing_equity = float(config.initial_capital)
         self._trade_counter = 0
         self._signals_frame: pd.DataFrame | None = None
         self._intrabar = self._prepare_intrabar(intrabar_data)
@@ -168,13 +181,17 @@ class TradeEngine:
         self._progress_end = float(progress_end)
         configured_risk_pct = float(self.config.risk_per_trade_pct or 0.0)
         self._risk_enabled = configured_risk_pct > 0
+        # Risk-policy provenance (Cleanup 16-D1, F22): the engine-level risk
+        # policy is engine configuration only. It is intentionally NOT read
+        # from ``config.parameters`` — strategy parameters must not silently
+        # rewrite engine risk policy (undocumented cross-talk). Set
+        # ``risk_per_trade_pct`` / ``max_position_pct`` on the config instead.
         max_total_exposure = float(self.config.max_position_pct or 0.05)
-        max_positions = int(float(self.config.parameters.get("max_positions", 5) or 5))
         self._risk_engine = RiskEngine(
             RiskConfig(
                 max_risk_per_trade=configured_risk_pct if configured_risk_pct > 0 else 0.01,
                 max_total_exposure=max_total_exposure,
-                max_positions=max_positions,
+                max_positions=TRADE_ENGINE_MAX_POSITIONS,
                 default_sl_atr_multiplier=2.0,
             )
         )
@@ -282,7 +299,7 @@ class TradeEngine:
         return "SHORT" if direction == "SHORT" else "LONG"
 
     def _current_risk_exposure(self, reference_price: float) -> float:
-        if self.equity <= 0:
+        if self._sizing_equity <= 0:
             return 0.0
 
         risk_exposure = 0.0
@@ -294,7 +311,9 @@ class TradeEngine:
                 else float(position.entry_price) * 0.98
             )
             risk_distance = abs(float(position.entry_price) - stop_price)
-            risk_exposure += (risk_distance * float(position.remaining_qty)) / float(self.equity)
+            risk_exposure += (risk_distance * float(position.remaining_qty)) / float(
+                self._sizing_equity
+            )
 
         for order in self.pending_orders:
             stop_price = (
@@ -303,7 +322,7 @@ class TradeEngine:
                 else float(reference_price) * 0.98
             )
             risk_distance = abs(float(reference_price) - stop_price)
-            risk_exposure += (risk_distance * float(order.quantity)) / float(self.equity)
+            risk_exposure += (risk_distance * float(order.quantity)) / float(self._sizing_equity)
 
         return max(0.0, risk_exposure)
 
@@ -337,7 +356,7 @@ class TradeEngine:
                 if max_lot > 0:
                     shares = min(shares, max_lot)
                 if bool(self.config.parameters.get("cap_fixed_risk_by_leverage", True)):
-                    max_value = self.equity * max_leverage
+                    max_value = self._sizing_equity * max_leverage
                     shares = min(shares, max_value / entry_price)
                 return max(shares, 0.0)
 
@@ -356,15 +375,15 @@ class TradeEngine:
             )
             sized_order = self._risk_engine.calculate_position_size(
                 signal=signal,
-                account_balance=float(self.equity),
+                account_balance=float(self._sizing_equity),
                 pip_value=1.0,
                 current_exposure=self._current_risk_exposure(float(entry_price)),
             )
             shares = float(sized_order.position_size)
         else:
-            shares = self.equity / entry_price
+            shares = self._sizing_equity / entry_price
 
-        max_value = self.equity * max_leverage
+        max_value = self._sizing_equity * max_leverage
         shares = min(shares, max_value / entry_price)
         return max(shares, 0.0)
 
@@ -473,6 +492,26 @@ class TradeEngine:
                         if order.direction == "LONG"
                         else float(fill_price) + distance
                     )
+                # F23 (Cleanup 16-D1): orders are sized exactly ONCE, at the
+                # price they actually fill. MARKET orders fill at the next
+                # bar's open and are re-sized there below (the creation-price
+                # sizing on the signal bar is only the pending-order estimate).
+                # LIMIT/STOP/STOP_LIMIT orders fill at their trigger price, so
+                # they are re-sized from that trigger price instead of keeping
+                # the creation-price estimate.
+                if order.order_type in {OrderType.LIMIT, OrderType.STOP, OrderType.STOP_LIMIT}:
+                    order.quantity = self._calculate_position_size(
+                        entry_price=float(fill_price),
+                        stop_loss_price=order.stop_loss,
+                        direction=order.direction,
+                        take_profit_price=(
+                            float(order.take_profit_levels[0]["price"])
+                            if order.take_profit_levels
+                            else None
+                        ),
+                    )
+                    if order.quantity <= 0:
+                        continue
                 if order.order_type == OrderType.MARKET and order.stop_loss is not None:
                     take_profit = (
                         float(order.take_profit_levels[0]["price"])
@@ -521,6 +560,8 @@ class TradeEngine:
         )
         position.remaining_qty -= qty
         self._realized_pnl += pnl
+        # F21: realized cash becomes spendable the moment it is realized.
+        self._sizing_equity = self.config.initial_capital + self._realized_pnl
 
     def _finalize_position(self, position: Position, exit_index: int) -> None:
         if position.remaining_qty > 1e-9:
@@ -782,6 +823,11 @@ class TradeEngine:
         self.equity_curve.append(
             EquityPoint(time=self._to_iso(row["timestamp"]), equity=round(float(self.equity), 2))
         )
+        # NOTE (Cleanup 16-D1, F21): ``self.equity`` is the mark-to-market
+        # REPORTING equity; it deliberately no longer feeds position sizing.
+        # Sizing uses ``self._sizing_equity`` (realized cash only), so unrealized
+        # drawdown cannot deflate new sizes and unrealized profit cannot
+        # compound into them either.
 
     def _normalize_strategy_output(
         self, output: Any, data: pd.DataFrame
@@ -909,7 +955,13 @@ class TradeEngine:
             row = frame.iloc[i]
             next_time = frame.iloc[i + 1]["timestamp"] if i + 1 < total_bars else None
             signal_row = self._signals_frame.iloc[i] if self._signals_frame is not None else pd.Series()
-            merged_row = pd.concat([row, signal_row])
+            # F20: overlay the signal values onto the OHLCV row ELEMENT-WISE
+            # (aligned by label). The previous ``pd.concat([row, signal_row])``
+            # stacked the two Series vertically, producing a row of length
+            # len(row) + len(signal_row) with duplicated labels — OHLCV lookups
+            # became ambiguous and colliding signal names ("close", "high", …)
+            # silently corrupted or crashed entry extraction.
+            merged_row = row.combine_first(signal_row)
 
             self._check_stops(row, i, next_time)
             self._fill_pending_orders(row, i)
