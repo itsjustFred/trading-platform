@@ -73,6 +73,21 @@ def test_helper_rejects_subprocess_import():
         _compile_helper_namespace(Path('demo_context.py'), source, strict_structure=True)
 
 
+def test_helper_rejects_every_alias_of_a_multi_alias_import():
+    """`import numpy, os` must not slip through on numpy's root alone.
+
+    import_root only returns the first alias of an ast.Import, so the helper
+    screen must check every alias against the whitelist itself.
+    """
+    for source in (
+        "import numpy, os\n",
+        "import os, numpy\n",
+        "import pandas as pd, socket\n",
+    ):
+        with pytest.raises(RuntimeError, match="'os'|'socket'"):
+            _compile_helper_namespace(Path('demo_context.py'), source, strict_structure=True)
+
+
 def test_helper_rejects_socket_and_urllib_imports():
     for source in (
         "import socket\n",

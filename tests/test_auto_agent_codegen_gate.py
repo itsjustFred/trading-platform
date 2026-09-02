@@ -119,6 +119,41 @@ def test_failed_backtest_removes_last_generated_file(tmp_path, monkeypatch):
     assert not strategy_dir.exists()
 
 
+def test_intermediate_attempts_keep_the_slug_directory(tmp_path, monkeypatch):
+    """Failed intermediate attempts only discard the module and its ledger.
+
+    The next attempt reuses the same artifacts (documentation path, slug
+    directory) to write its README and strategy file, so the directory must
+    survive until the LAST attempt has failed.
+    """
+    _setup_agent(monkeypatch, tmp_path)
+    _install_fake_provider(
+        monkeypatch,
+        [
+            STEP_ONE_MARKDOWN,
+            STEP_TWO_META,
+            STEP_THREE_CODE,
+            # Attempts 2 and 3 only re-ask for the code step (md/meta are reused).
+            FIXED_STEP_THREE_CODE,
+            FIXED_STEP_THREE_CODE,
+        ],
+    )
+    monkeypatch.setattr(
+        auto_agent, "_run_backtest", lambda cmd, *, log=None: (1, "Traceback: boom")
+    )
+
+    with pytest.raises(RuntimeError, match="Auto-agent failed"):
+        auto_agent.run_auto_agent(
+            "strategy.entry('Long', strategy.long)",
+            strategy_name="Mid Agent",
+            log=lambda *args, **kwargs: None,
+        )
+
+    strategy_dir = tmp_path / "strategies" / "mid_agent"
+    # Whole slug directory gone after the final failed attempt.
+    assert not strategy_dir.exists()
+
+
 def test_retry_of_failed_slug_is_not_blocked_by_leftovers(tmp_path, monkeypatch):
     """A failed attempt removes its slug directory — a retry of the same slug
     is not permanently blocked by leftovers of the failed attempt."""
@@ -156,6 +191,8 @@ def test_retry_of_failed_slug_is_not_blocked_by_leftovers(tmp_path, monkeypatch)
     )
     assert result["attempts"] == 1
     assert Path(result["strategy_file"]).exists()
+    # The reused slug directory must end up with a fresh, valid README.
+    assert Path(result["strategy_file"]).with_name("README.md").exists()
 
 
 def test_validated_strategy_is_not_approved_until_human_review(tmp_path, monkeypatch):

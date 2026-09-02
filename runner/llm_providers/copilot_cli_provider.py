@@ -91,6 +91,9 @@ class CopilotCLIProvider:
 
         try:
             completed = self._run_cli(command, composed_prompt)
+            # Output extraction can also fail the invocation (non-zero exit,
+            # empty response): same CliInvocationError path, same metadata.
+            content = self._extract_output(completed)
         except CliInvocationError as exc:
             _apply_metadata(
                 metadata,
@@ -101,8 +104,6 @@ class CopilotCLIProvider:
                 temperature=temperature,
             )
             raise RuntimeError(str(exc)) from exc.__cause__
-
-        content = self._extract_output(completed)
         _apply_metadata(
             metadata,
             model=selected_model or "default",

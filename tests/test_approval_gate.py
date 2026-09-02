@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import pytest
 
+import runner.auto_agent as auto_agent
 from runner.approval_gate import (
     StrategyNotApprovedError,
     approve_strategy,
@@ -80,6 +81,7 @@ def test_approval_path_is_deterministic_per_file(tmp_path):
 def test_discarded_strategy_leaves_no_orphaned_ledger(tmp_path):
     """Removing a generated file must remove its approval ledger with it."""
     from runner.approval_gate import approval_path_for
+    from runner.auto_agent import _discard_failed_attempt
 
     strategy = tmp_path / "demo.py"
     strategy.write_text("x = 1\n")
@@ -87,9 +89,20 @@ def test_discarded_strategy_leaves_no_orphaned_ledger(tmp_path):
     assert approval_path_for(strategy).exists()
 
     strategy.unlink()
-    from runner.auto_agent import _discard_failed_strategy_file
-
-    _discard_failed_strategy_file(strategy)
+    # Last failed attempt: the whole slug directory (ledger included) is gone.
+    _discard_failed_attempt(
+        attempt=3,
+        max_attempts=3,
+        last_error="boom",
+        artifacts=auto_agent.StrategyArtifacts(
+            resolved_name="demo",
+            engine="vectorbt",
+            strategy_dir=tmp_path,
+            strategy_path=strategy,
+            documentation_path=tmp_path / "README.md",
+            output_path=tmp_path / "out.json",
+        ),
+    )
     assert not approval_path_for(strategy).exists()
 
 

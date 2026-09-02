@@ -438,13 +438,19 @@ HELPER_BANNED_CALL_NAMES = BANNED_CALL_NAMES
 
 
 def _reject_helper_import(node: ast.Import | ast.ImportFrom, source_path: Path) -> None:
-    root = import_root(node)
-    if root not in HELPER_ALLOWED_IMPORT_ROOTS:
-        raise RuntimeError(
-            f"Import '{root}' is not allowed in strategy helper code "
-            f"({source_path.name}). Allowed: "
-            + ", ".join(sorted(HELPER_ALLOWED_IMPORT_ROOTS))
-        )
+    # Check EVERY alias: `import numpy, os` must not slip through on numpy's
+    # root alone (import_root only returns the first alias for ast.Import).
+    if isinstance(node, ast.Import):
+        roots = [alias.name.split(".")[0] for alias in node.names]
+    else:
+        roots = [import_root(node)]
+    for root in roots:
+        if root not in HELPER_ALLOWED_IMPORT_ROOTS:
+            raise RuntimeError(
+                f"Import '{root}' is not allowed in strategy helper code "
+                f"({source_path.name}). Allowed: "
+                + ", ".join(sorted(HELPER_ALLOWED_IMPORT_ROOTS))
+            )
 
 
 def _reject_helper_call(node: ast.Call, source_path: Path) -> None:
