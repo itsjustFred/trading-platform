@@ -340,6 +340,32 @@ class TestWalkforwardEdgeCases:
         assert parsed_dt.tzinfo is not None  # Should have timezone info
 
 
+def _fake_result(
+    config: BacktestConfig,
+    strategy_path: str,
+    call_index: int,
+    equity_curve: list[EquityPoint],
+    stats: dict,
+) -> BacktestResult:
+    """Shared BacktestResult factory for the fake walk-forward engines."""
+    return BacktestResult(
+        meta=BacktestMeta(
+            id=f"{Path(strategy_path).stem}-{call_index}",
+            created_at="2026-01-01T00:00:00+00:00",
+            engine="fake",
+            strategies=[Path(strategy_path).stem],
+            backtest_start=config.start_date,
+            backtest_end=config.end_date,
+            initial_capital=config.initial_capital,
+            data={"symbols": config.symbols, "timeframes": [config.timeframe], "source": "test"},
+            parameters=config.parameters,
+        ),
+        trades=[],
+        equity_curve=equity_curve,
+        stats=stats,
+    )
+
+
 class _FakeEngine:
     name = "fake"
 
@@ -368,21 +394,12 @@ class _FakeEngine:
             EquityPoint(time=timestamp.isoformat(), equity=equity)
             for timestamp, equity in zip(timestamps, equities, strict=True)
         ]
-        return BacktestResult(
-            meta=BacktestMeta(
-                id=f"{Path(strategy_path).stem}-{len(self.configs)}",
-                created_at="2026-01-01T00:00:00+00:00",
-                engine="fake",
-                strategies=[Path(strategy_path).stem],
-                backtest_start=config.start_date,
-                backtest_end=config.end_date,
-                initial_capital=config.initial_capital,
-                data={"symbols": config.symbols, "timeframes": [config.timeframe], "source": "test"},
-                parameters=config.parameters,
-            ),
-            trades=[],
-            equity_curve=equity_points,
-            stats={
+        return _fake_result(
+            config,
+            strategy_path,
+            len(self.configs),
+            equity_points,
+            {
                 "sharpe_ratio": sharpe,
                 "max_drawdown_pct": drawdown,
                 "total_trades": 2,
@@ -431,22 +448,7 @@ class _FoldRecordingEngine(_FakeEngine):
 
     def run(self, config: BacktestConfig, strategy_path: str, progress_callback=None) -> BacktestResult:
         self.configs.append(config)
-        return BacktestResult(
-            meta=BacktestMeta(
-                id=f"{Path(strategy_path).stem}-{len(self.configs)}",
-                created_at="2026-01-01T00:00:00+00:00",
-                engine="fake",
-                strategies=[Path(strategy_path).stem],
-                backtest_start=config.start_date,
-                backtest_end=config.end_date,
-                initial_capital=config.initial_capital,
-                data={"symbols": config.symbols, "timeframes": [config.timeframe], "source": "test"},
-                parameters=config.parameters,
-            ),
-            trades=[],
-            equity_curve=[],
-            stats=dict(self.stats),
-        )
+        return _fake_result(config, strategy_path, len(self.configs), [], dict(self.stats))
 
 
 def test_walkforward_passes_correct_kwargs_to_attach_daily_equity(tmp_path, monkeypatch):

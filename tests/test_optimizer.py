@@ -407,36 +407,7 @@ def test_run_optimization_checks_every_candidate_universe_symbol_before_study(
 
 
 def test_run_optimization_saves_best_params_and_oos_stats(monkeypatch, tmp_path: Path):
-    backtests_dir = tmp_path / "backtests"
-    optimizations_dir = tmp_path / "optimizations"
-    backtests_dir.mkdir(parents=True, exist_ok=True)
-    _write_base_backtest(backtests_dir)
-
-    monkeypatch.setattr(optimizer_module, "BACKTESTS_DIR", backtests_dir)
-    monkeypatch.setattr(optimizer_module, "OPTIMIZATIONS_DIR", optimizations_dir)
-    _allow_bar_coverage_preflight(monkeypatch)
-    monkeypatch.setattr(
-        optimizer_module,
-        "find_strategy_entry",
-        lambda _: SimpleNamespace(
-            file_path=tmp_path / "strategies" / "example_sma.py",
-            slug="example_sma",
-        ),
-    )
-    monkeypatch.setattr(
-        optimizer_module,
-        "compute_stats_for_result",
-        lambda result: dict(result.stats),
-    )
-    original_create_study = optuna.create_study
-    monkeypatch.setattr(
-        optimizer_module.optuna,
-        "create_study",
-        lambda direction="maximize": original_create_study(
-            direction=direction,
-            sampler=optuna.samplers.GridSampler({"window": [1, 2, 3, 4]}),
-        ),
-    )
+    _patch_optimizer_env(monkeypatch, tmp_path, grid_choices=[1, 2, 3, 4], pass_through_stats=True)
 
     calls = []
 
@@ -484,7 +455,7 @@ def test_run_optimization_saves_best_params_and_oos_stats(monkeypatch, tmp_path:
     assert progress_updates[-1][0] == 100.0
     assert progress_updates[-1][1].startswith("Optimization finished:")
 
-    saved_files = list(optimizations_dir.glob("opt_base-demo_*.json"))
+    saved_files = list((tmp_path / "optimizations").glob("opt_base-demo_*.json"))
     assert len(saved_files) == 1
     saved_payload = json.loads(saved_files[0].read_text(encoding="utf-8"))
     assert saved_payload["best_params"] == {"window": 3}
@@ -563,36 +534,7 @@ def test_run_risk_parity_covariance_optimization_saves_weights(monkeypatch, tmp_
 
 def test_no_trade_trials_lose_against_honest_negative_trials(monkeypatch, tmp_path: Path):
     """A no-trade trial must not return penalty 0.0 and beat honest negatives."""
-    backtests_dir = tmp_path / "backtests"
-    optimizations_dir = tmp_path / "optimizations"
-    backtests_dir.mkdir(parents=True, exist_ok=True)
-    _write_base_backtest(backtests_dir)
-
-    monkeypatch.setattr(optimizer_module, "BACKTESTS_DIR", backtests_dir)
-    monkeypatch.setattr(optimizer_module, "OPTIMIZATIONS_DIR", optimizations_dir)
-    _allow_bar_coverage_preflight(monkeypatch)
-    monkeypatch.setattr(
-        optimizer_module,
-        "find_strategy_entry",
-        lambda _: SimpleNamespace(
-            file_path=tmp_path / "strategies" / "example_sma.py",
-            slug="example_sma",
-        ),
-    )
-    monkeypatch.setattr(
-        optimizer_module,
-        "compute_stats_for_result",
-        lambda result: dict(result.stats),
-    )
-    original_create_study = optuna.create_study
-    monkeypatch.setattr(
-        optimizer_module.optuna,
-        "create_study",
-        lambda direction="maximize": original_create_study(
-            direction=direction,
-            sampler=optuna.samplers.GridSampler({"window": [1, 2]}),
-        ),
-    )
+    _patch_optimizer_env(monkeypatch, tmp_path, grid_choices=[1, 2], pass_through_stats=True)
 
     def fake_run_backtest(config, strategy_path):
         window = int(config.parameters["window"])
