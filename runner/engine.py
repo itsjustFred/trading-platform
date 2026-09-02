@@ -596,14 +596,18 @@ class TradeEngine:
         Decision Record (Cleanup 16-A): when intrabar data was requested but
         does not cover the ambiguous bar, the stop-first tie-break is used and
         the result must be flagged. The flag lands in
-        ``trade.meta["same_bar_priority"]`` via ``_finalize_position``.
+        ``trade.meta["same_bar_priority"]`` via ``_finalize_position``; when
+        the intrabar data DOES cover the bar the chronological event already
+        won and no flag (and no ``None`` placeholder) is recorded.
         """
         window = self._intrabar_window(bar_time, next_time)
         has_coverage = window is not None and not window.empty
-        position.meta["same_bar_priority"] = flag_missing_intrabar(
+        flag = flag_missing_intrabar(
             intrabar_resolution=self._execution_model.intrabar_resolution,
             intrabar_coverage=has_coverage,
         )
+        if flag is not None:
+            position.meta["same_bar_priority"] = flag
 
     def _intrabar_window(
         self, bar_time: pd.Timestamp, next_time: pd.Timestamp | None
