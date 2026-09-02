@@ -516,8 +516,6 @@ def _resume_interrupted_tasks() -> None:
 
             task_type = str(record.get("type") or "")
             raw_config = dict(record.get("config_json") or {})
-            restart_config = raw_config.get("restart_config")
-            backtest_config = dict(restart_config) if isinstance(restart_config, dict) else dict(raw_config)
 
             if task_type == "backtest":
                 strategy = str(backtest_config.get("strategy") or "").strip()
@@ -580,146 +578,247 @@ def _resume_interrupted_tasks() -> None:
                 continue
 
             if task_type == "data":
-                source = str(record.get("source") or raw_config.get("source") or "").strip().lower()
-                downloader = str(raw_config.get("downloader") or source or "").strip().lower()
-                symbols = [str(item).strip().upper() for item in raw_config.get("symbols", []) if str(item).strip()]
-                timeframes = [
-                    str(item).strip().lower()
-                    for item in raw_config.get("timeframes", [])
-                    if str(item).strip()
-                ]
-                total_items = max(int(raw_config.get("total_items", 0) or 0), 0)
-                name = str(record.get("name") or "Recovered data task")
-                description = str(record.get("description") or "")
-                start = str(raw_config.get("start") or "").strip() or None
-                end = str(raw_config.get("end") or "").strip() or None
-
-                if downloader in {"dukascopy", "jforex"} and symbols and timeframes:
-                    downloader = "dukascopy" if downloader == "dukascopy" else "jforex"
-                    cmd = raw_config.get("command")
-                    if not isinstance(cmd, list) or not cmd:
-                        logger.warning(
-                            "Skipping auto-recovery for data task %s: missing command for %s",
-                            task_id,
-                            downloader,
-                        )
-                        upsert_background_task_record(
-                            task_id=task_id,
-                            task_type=task_type,
-                            status="queued",
-                            config_json=raw_config,
-                            progress_message="Recovery pending manual restart; missing restart command",
-                            name=str(record.get("name") or ""),
-                            description=str(record.get("description") or ""),
-                            source=str(record.get("source") or ""),
-                            created_at=str(record.get("created_at") or ""),
-                            updated_at=_now_iso(),
-                        )
-                        continue
-
-                    logger.info("Auto-restarting %s data task %s", downloader, task_id)
-                    cmd_list = [str(part) for part in cmd]
-                    _start_jforex_task(
-                        task_id,
-                        cmd_list,
-                        source_label=downloader,
-                        allow_native_fallback=(downloader == "dukascopy"),
-                        symbols=symbols,
-                        timeframes=timeframes,
-                        start=start,
-                        end=end,
-                        offer_side=str(raw_config.get("offer_side") or raw_config.get("price_type") or "bid"),
-                        merge_tick=bool(raw_config.get("merge_tick", False)),
-                        merge_s1=bool(raw_config.get("merge_s1", False)),
-                        batch_size=_safe_int(raw_config.get("batch_size"), 10),
-                        pause_ms=_safe_int(raw_config.get("pause_ms"), 1000),
-                        query_timeout_seconds=_safe_int(raw_config.get("query_timeout_seconds"), 900),
-                        total_items=total_items or max(len(symbols) * len(timeframes), 1),
-                        name=name,
-                        description=description,
-                    )
-                    _apply_recovery_data_metadata(
-                        task_id,
-                        command=cmd_list,
-                        downloader=downloader,
-                        symbols=symbols,
-                        timeframes=timeframes,
-                        start=start,
-                        end=end,
-                        offer_side=str(raw_config.get("offer_side") or "bid"),
-                        price_type=str(raw_config.get("price_type") or "bid"),
-                        merge_tick=bool(raw_config.get("merge_tick", False)),
-                        merge_s1=bool(raw_config.get("merge_s1", False)),
-                        batch_size=_safe_int(raw_config.get("batch_size"), 10),
-                        pause_ms=_safe_int(raw_config.get("pause_ms"), 1000),
-                        query_timeout_seconds=_safe_int(raw_config.get("query_timeout_seconds"), 900),
-                    )
-                    continue
-
-                command = raw_config.get("command")
-                if isinstance(command, list) and command:
-                    logger.info("Auto-restarting data task %s via persisted command", task_id)
-                    _start_data_task(
-                        task_id,
-                        [str(part) for part in command],
-                        total_items=total_items,
-                        name=name,
-                        description=description,
-                        kind="data",
-                        source=source or downloader or "data",
-                    )
-                    _apply_recovery_data_metadata(
-                        task_id,
-                        command=[str(part) for part in command],
-                        downloader=downloader or None,
-                        symbols=symbols or None,
-                        timeframes=timeframes or None,
-                        start=start,
-                        end=end,
-                        offer_side=str(raw_config.get("offer_side") or "") or None,
-                        price_type=str(raw_config.get("price_type") or "") or None,
-                        merge_tick=(
-                            bool(raw_config.get("merge_tick"))
-                            if raw_config.get("merge_tick") is not None
-                            else None
-                        ),
-                        merge_s1=(
-                            bool(raw_config.get("merge_s1"))
-                            if raw_config.get("merge_s1") is not None
-                            else None
-                        ),
-                        batch_size=(
-                            _safe_int(raw_config.get("batch_size"))
-                            if raw_config.get("batch_size") is not None
-                            else None
-                        ),
-                        pause_ms=(
-                            _safe_int(raw_config.get("pause_ms"))
-                            if raw_config.get("pause_ms") is not None
-                            else None
-                        ),
-                        query_timeout_seconds=(
-                            _safe_int(raw_config.get("query_timeout_seconds"))
-                            if raw_config.get("query_timeout_seconds") is not None
-                            else None
-                        ),
-                    )
-                    continue
-
-                upsert_background_task_record(
-                    task_id=task_id,
-                    task_type=task_type,
-                    status="queued",
-                    config_json=raw_config,
-                    progress_message="Recovery pending manual restart; missing restart metadata",
-                    name=str(record.get("name") or ""),
-                    description=str(record.get("description") or ""),
-                    source=str(record.get("source") or ""),
-                    created_at=str(record.get("created_at") or ""),
-                    updated_at=_now_iso(),
-                )
+                _resume_interrupted_data_task(record, task_id, raw_config)
         except Exception as exc:
             logger.warning("Failed to recover interrupted task %s: %s", record.get("id"), exc)
+
+
+def _resume_interrupted_backtest_task(
+    record: dict[str, Any], task_id: str, raw_config: dict[str, Any]
+) -> None:
+    restart_config = raw_config.get("restart_config")
+    backtest_config = dict(restart_config) if isinstance(restart_config, dict) else dict(raw_config)
+    strategy = str(backtest_config.get("strategy") or "").strip()
+    symbols = backtest_config.get("symbols")
+    if not strategy or not isinstance(symbols, list) or not symbols:
+        logger.warning(
+            "Skipping auto-recovery for task %s: incomplete backtest restart config",
+            task_id,
+        )
+        return
+
+    logger.info(
+        "Auto-restarting backtest task %s (%s %s %s)",
+        task_id,
+        strategy,
+        ",".join(str(symbol) for symbol in symbols),
+        str(backtest_config.get("timeframe") or "1d"),
+    )
+    request_payload = BacktestRunRequest(
+        strategy=strategy,
+        engine=str(backtest_config.get("engine") or "native"),
+        symbols=[str(symbol) for symbol in symbols if str(symbol).strip()],
+        timeframe=str(backtest_config.get("timeframe") or "1d"),
+        start=str(backtest_config.get("start") or ""),
+        end=str(backtest_config.get("end") or ""),
+        capital=float(backtest_config.get("capital") or 100000.0),
+        risk_per_trade_pct=backtest_config.get("risk_per_trade_pct"),
+        max_position_pct=backtest_config.get("max_position_pct"),
+        max_leverage=backtest_config.get("max_leverage"),
+        modeling_resolution=(
+            str(backtest_config.get("modeling_resolution"))
+            if backtest_config.get("modeling_resolution") is not None
+            else None
+        ),
+        intrabar_resolution=(
+            str(backtest_config.get("intrabar_resolution"))
+            if backtest_config.get("intrabar_resolution") is not None
+            else None
+        ),
+        parameters=dict(backtest_config.get("parameters") or {}),
+    )
+    restarted = asyncio.run(run_backtest(request_payload))
+    restarted_task_id = restarted.get("task_id") if isinstance(restarted, dict) else None
+    upsert_background_task_record(
+        task_id=task_id,
+        task_type=str(record.get("type") or ""),
+        status="completed",
+        config_json=raw_config,
+        progress_message=(
+            f"Auto-restarted as task {restarted_task_id}"
+            if restarted_task_id
+            else "Auto-restarted as new task"
+        ),
+        name=str(record.get("name") or ""),
+        description=str(record.get("description") or ""),
+        source=str(record.get("source") or ""),
+        created_at=str(record.get("created_at") or ""),
+        updated_at=_now_iso(),
+    )
+
+
+def _resume_interrupted_data_task(
+    record: dict[str, Any], task_id: str, raw_config: dict[str, Any]
+) -> None:
+    task_type = str(record.get("type") or "")
+    source = str(record.get("source") or raw_config.get("source") or "").strip().lower()
+    downloader = str(raw_config.get("downloader") or source or "").strip().lower()
+    symbols = [str(item).strip().upper() for item in raw_config.get("symbols", []) if str(item).strip()]
+    timeframes = [
+        str(item).strip().lower()
+        for item in raw_config.get("timeframes", [])
+        if str(item).strip()
+    ]
+    total_items = max(int(raw_config.get("total_items", 0) or 0), 0)
+    name = str(record.get("name") or "Recovered data task")
+    description = str(record.get("description") or "")
+    start = str(raw_config.get("start") or "").strip() or None
+    end = str(raw_config.get("end") or "").strip() or None
+
+    if downloader in {"dukascopy", "jforex"} and symbols and timeframes:
+        _resume_interrupted_downloader_task(
+            record=record,
+            task_id=task_id,
+            raw_config=raw_config,
+            downloader=downloader,
+            symbols=symbols,
+            timeframes=timeframes,
+            total_items=total_items,
+            name=name,
+            description=description,
+            start=start,
+            end=end,
+        )
+        return
+
+    command = raw_config.get("command")
+    if isinstance(command, list) and command:
+        logger.info("Auto-restarting data task %s via persisted command", task_id)
+        _start_data_task(
+            task_id,
+            [str(part) for part in command],
+            total_items=total_items,
+            name=name,
+            description=description,
+            kind="data",
+            source=source or downloader or "data",
+        )
+        _apply_recovery_data_metadata(
+            task_id,
+            command=[str(part) for part in command],
+            downloader=downloader or None,
+            symbols=symbols or None,
+            timeframes=timeframes or None,
+            start=start,
+            end=end,
+            offer_side=str(raw_config.get("offer_side") or "") or None,
+            price_type=str(raw_config.get("price_type") or "") or None,
+            merge_tick=(
+                bool(raw_config.get("merge_tick"))
+                if raw_config.get("merge_tick") is not None
+                else None
+            ),
+            merge_s1=(
+                bool(raw_config.get("merge_s1"))
+                if raw_config.get("merge_s1") is not None
+                else None
+            ),
+            batch_size=(
+                _safe_int(raw_config.get("batch_size"))
+                if raw_config.get("batch_size") is not None
+                else None
+            ),
+            pause_ms=(
+                _safe_int(raw_config.get("pause_ms"))
+                if raw_config.get("pause_ms") is not None
+                else None
+            ),
+            query_timeout_seconds=(
+                _safe_int(raw_config.get("query_timeout_seconds"))
+                if raw_config.get("query_timeout_seconds") is not None
+                else None
+            ),
+        )
+        return
+
+    upsert_background_task_record(
+        task_id=task_id,
+        task_type=task_type,
+        status="queued",
+        config_json=raw_config,
+        progress_message="Recovery pending manual restart; missing restart metadata",
+        name=str(record.get("name") or ""),
+        description=str(record.get("description") or ""),
+        source=str(record.get("source") or ""),
+        created_at=str(record.get("created_at") or ""),
+        updated_at=_now_iso(),
+    )
+
+
+def _resume_interrupted_downloader_task(
+    *,
+    record: dict[str, Any],
+    task_id: str,
+    raw_config: dict[str, Any],
+    downloader: str,
+    symbols: list[str],
+    timeframes: list[str],
+    total_items: int,
+    name: str,
+    description: str,
+    start: str | None,
+    end: str | None,
+) -> None:
+    task_type = str(record.get("type") or "")
+    downloader = "dukascopy" if downloader == "dukascopy" else "jforex"
+    cmd = raw_config.get("command")
+    if not isinstance(cmd, list) or not cmd:
+        logger.warning(
+            "Skipping auto-recovery for data task %s: missing command for %s",
+            task_id,
+            downloader,
+        )
+        upsert_background_task_record(
+            task_id=task_id,
+            task_type=task_type,
+            status="queued",
+            config_json=raw_config,
+            progress_message="Recovery pending manual restart; missing restart command",
+            name=str(record.get("name") or ""),
+            description=str(record.get("description") or ""),
+            source=str(record.get("source") or ""),
+            created_at=str(record.get("created_at") or ""),
+            updated_at=_now_iso(),
+        )
+        return
+
+    logger.info("Auto-restarting %s data task %s", downloader, task_id)
+    cmd_list = [str(part) for part in cmd]
+    _start_jforex_task(
+        task_id,
+        cmd_list,
+        source_label=downloader,
+        allow_native_fallback=(downloader == "dukascopy"),
+        symbols=symbols,
+        timeframes=timeframes,
+        start=start,
+        end=end,
+        offer_side=str(raw_config.get("offer_side") or raw_config.get("price_type") or "bid"),
+        merge_tick=bool(raw_config.get("merge_tick", False)),
+        merge_s1=bool(raw_config.get("merge_s1", False)),
+        batch_size=_safe_int(raw_config.get("batch_size"), 10),
+        pause_ms=_safe_int(raw_config.get("pause_ms"), 1000),
+        query_timeout_seconds=_safe_int(raw_config.get("query_timeout_seconds"), 900),
+        total_items=total_items or max(len(symbols) * len(timeframes), 1),
+        name=name,
+        description=description,
+    )
+    _apply_recovery_data_metadata(
+        task_id,
+        command=cmd_list,
+        downloader=downloader,
+        symbols=symbols,
+        timeframes=timeframes,
+        start=start,
+        end=end,
+        offer_side=str(raw_config.get("offer_side") or "bid"),
+        price_type=str(raw_config.get("price_type") or "bid"),
+        merge_tick=bool(raw_config.get("merge_tick", False)),
+        merge_s1=bool(raw_config.get("merge_s1", False)),
+        batch_size=_safe_int(raw_config.get("batch_size"), 10),
+        pause_ms=_safe_int(raw_config.get("pause_ms"), 1000),
+        query_timeout_seconds=_safe_int(raw_config.get("query_timeout_seconds"), 900),
+    )
 
 
 @asynccontextmanager
@@ -2319,6 +2418,48 @@ def _ensure_backtest_meta_cache() -> None:
         ):
             return
     _refresh_backtest_meta_cache()
+
+
+def _resolve_backtest_output_id(output_path: str) -> tuple[str, str]:
+    """Map a 'saved to' path to (output_path, backtest_id) for a trades result file."""
+    if not output_path:
+        return "", ""
+    filename = Path(output_path).name
+    if not filename.endswith(".trades.json"):
+        return output_path, ""
+    backtest_id = filename[: -len(".trades.json")]
+    if backtest_id:
+        loaded_result = _load_result(backtest_id)
+        if loaded_result is not None:
+            meta_id = str(getattr(loaded_result.meta, "id", "") or "").strip()
+            if meta_id:
+                backtest_id = meta_id
+    return output_path, backtest_id
+
+
+def _update_saved_backtest(
+    output_path: str, prev_output_path: str, prev_backtest_id: str
+) -> tuple[str, str]:
+    """Merge a new 'saved to' path into the tracked output path / backtest id."""
+    new_path, new_id = _resolve_backtest_output_id(output_path)
+    return new_path or prev_output_path, new_id or prev_backtest_id
+
+
+def _count_backtest_trades(backtest_id: str, latest_message: str) -> int:
+    """Count trades of the finished backtest, falling back to the runner log line."""
+    final_trade_count = 0
+    if backtest_id:
+        loaded_result = _load_result(backtest_id)
+        if loaded_result is not None:
+            final_trade_count = len(loaded_result.trades)
+    if final_trade_count == 0 and isinstance(latest_message, str):
+        match = re.search(r"result:\s*(\d+)\s+trades", latest_message.lower())
+        if match:
+            try:
+                final_trade_count = int(match.group(1))
+            except ValueError:
+                final_trade_count = 0
+    return final_trade_count
 
 
 def _upsert_backtest_meta_cache(backtest_id: str) -> None:
@@ -8208,8 +8349,7 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
             return (96.0, SAVING_RESULTS_MESSAGE)
         return None
 
-    def _run() -> None:
-        env = os.environ.copy()
+    def _build_command(env: dict[str, str]) -> list[str]:
         env["PYTHONUNBUFFERED"] = "1"
         cmd = [
             sys.executable,
@@ -8244,6 +8384,11 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
         if modeling_resolution:
             cmd.extend(["--intrabar-resolution", modeling_resolution])
         _update_task_fields(task_id, command=list(cmd))
+        return cmd
+
+    def _run() -> None:
+        env = os.environ.copy()
+        cmd = _build_command(env)
 
         latest_message = ""
         output_path = ""
@@ -8407,18 +8552,7 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
                         "backtest_id": backtest_id or None,
                     }
                     compact_result = {key: value for key, value in result_payload.items() if value}
-                    final_trade_count = 0
-                    if backtest_id:
-                        loaded_result = _load_result(backtest_id)
-                        if loaded_result is not None:
-                            final_trade_count = len(loaded_result.trades)
-                    if final_trade_count == 0 and isinstance(latest_message, str):
-                        match = re.search(r"result:\s*(\d+)\s+trades", latest_message.lower())
-                        if match:
-                            try:
-                                final_trade_count = int(match.group(1))
-                            except ValueError:
-                                final_trade_count = 0
+                    final_trade_count = _count_backtest_trades(backtest_id, latest_message)
                     _upsert_backtest_meta_cache(backtest_id or "")
                     _update_task_fields(task_id, result=compact_result)
                     report_stage(
@@ -8476,6 +8610,85 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
     return {"task_id": task_id, "job_id": task_id, "status": "queued"}
 
 
+def _validate_signal_processor_name(signal_processor: Any) -> str:
+    """Normalize the requested signal processor; raises 400 when unknown."""
+    signal_processor_name = str(signal_processor or "").strip().lower()
+    if signal_processor_name:
+        try:
+            get_signal_processor(signal_processor_name, {})
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return signal_processor_name
+
+
+def _validate_positive_payload_float(value: Any, *, default: float, field: str) -> float:
+    """Normalize an optional positive float payload field; raises 400 when invalid."""
+    normalized = float(value) if value is not None else default
+    if normalized <= 0:
+        raise HTTPException(status_code=400, detail=f"{field} must be > 0")
+    return normalized
+
+
+async def _collect_source_signals(
+    *,
+    normalized_source: str,
+    account_id: str,
+    start_dt: datetime,
+    end_dt: datetime,
+    default_timeframe: str,
+) -> tuple[list[dict[str, Any]], str]:
+    """Load replay signals from a live signal source (discord/internal)."""
+    if normalized_source not in {"discord", "internal"}:
+        raise HTTPException(
+            status_code=400,
+            detail="signal_source must be 'discord' or 'internal' when signals are omitted",
+        )
+    deployments = await asyncio.to_thread(list_live_deployments)
+    candidate_deployment_ids = [
+        str(deployment.id)
+        for deployment in deployments
+        if str(deployment.signal_source or "internal").lower() == normalized_source
+        and (not account_id or str(deployment.account_id) == account_id)
+    ]
+    if not candidate_deployment_ids:
+        raise HTTPException(
+            status_code=404,
+            detail="No deployments found for requested signal_source/account_id",
+        )
+    db_signals = await asyncio.to_thread(
+        list_live_signals_for_replay,
+        deployment_ids=candidate_deployment_ids,
+        source=normalized_source,
+        start=start_dt,
+        end=end_dt,
+        limit=20000,
+    )
+    normalized_signals = []
+    for row in db_signals:
+        signal_time = row.get("timestamp")
+        if not isinstance(signal_time, datetime):
+            continue
+        if signal_time < start_dt or signal_time > end_dt:
+            continue
+        normalized_signals.append(
+            {
+                "timestamp": signal_time,
+                "symbol": str(row.get("symbol") or "").strip().upper(),
+                "action": str(row.get("action") or "").strip().lower(),
+                "entry_price": _safe_float(row.get("entry_price"), 0.0),
+                "stop_loss": row.get("stop_loss"),
+                "take_profit": row.get("take_profit"),
+                "timeframe": normalize_timeframe(str(row.get("timeframe") or default_timeframe))
+                or default_timeframe,
+                "source": str(row.get("source") or normalized_source or "internal").lower(),
+                "metadata": (
+                    dict(row.get("metadata")) if isinstance(row.get("metadata"), dict) else {}
+                ),
+            }
+        )
+    return normalized_signals, normalized_source
+
+
 @app.post("/api/backtests/run-signals", status_code=202)
 async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, Any]:
     requested_timeframe = normalize_timeframe(str(payload.timeframe or "").strip()) or ""
@@ -8494,34 +8707,19 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
         )
     normalized_source = source_name if source_name in {"discord", "internal"} else ""
     account_id = str(payload.account_id or "").strip()
-    signal_processor_name = str(payload.signal_processor or "").strip().lower()
-    if signal_processor_name:
-        try:
-            get_signal_processor(signal_processor_name, {})
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    signal_processor_name = _validate_signal_processor_name(payload.signal_processor)
     if not direct_signals_payload and not normalized_source:
         raise HTTPException(
             status_code=400,
             detail="Provide either 'signals' or 'signal_source'",
         )
 
-    risk_per_trade_pct = (
-        float(payload.risk_per_trade_pct)
-        if payload.risk_per_trade_pct is not None
-        else 0.01
+    risk_per_trade_pct = _validate_positive_payload_float(
+        payload.risk_per_trade_pct, default=0.01, field="risk_per_trade_pct"
     )
-    if risk_per_trade_pct <= 0:
-        raise HTTPException(status_code=400, detail="risk_per_trade_pct must be > 0")
-
-    max_position_pct = (
-        float(payload.max_position_pct)
-        if payload.max_position_pct is not None
-        else 0.05
+    max_position_pct = _validate_positive_payload_float(
+        payload.max_position_pct, default=0.05, field="max_position_pct"
     )
-    if max_position_pct <= 0:
-        raise HTTPException(status_code=400, detail="max_position_pct must be > 0")
-
     max_positions = int(payload.max_positions or 5)
     if max_positions <= 0:
         raise HTTPException(status_code=400, detail="max_positions must be > 0")
@@ -8537,57 +8735,14 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
         )
         replay_source_label = replay_source_label.strip().lower() or "manual"
     else:
-        if normalized_source not in {"discord", "internal"}:
-            raise HTTPException(
-                status_code=400,
-                detail="signal_source must be 'discord' or 'internal' when signals are omitted",
-            )
-        deployments = await asyncio.to_thread(list_live_deployments)
-        candidate_deployment_ids = [
-            str(deployment.id)
-            for deployment in deployments
-            if str(deployment.signal_source or "internal").lower() == normalized_source
-            and (not account_id or str(deployment.account_id) == account_id)
-        ]
-        if not candidate_deployment_ids:
-            raise HTTPException(
-                status_code=404,
-                detail="No deployments found for requested signal_source/account_id",
-            )
-        db_signals = await asyncio.to_thread(
-            list_live_signals_for_replay,
-            deployment_ids=candidate_deployment_ids,
-            source=normalized_source,
-            start=start_dt,
-            end=end_dt,
-            limit=20000,
+        normalized_signals, replay_source_label = await _collect_source_signals(
+            normalized_source=normalized_source,
+            account_id=account_id,
+            start_dt=start_dt,
+            end_dt=end_dt,
+            default_timeframe=default_timeframe,
         )
-        normalized_signals = []
-        for row in db_signals:
-            signal_time = row.get("timestamp")
-            if not isinstance(signal_time, datetime):
-                continue
-            if signal_time < start_dt or signal_time > end_dt:
-                continue
-            normalized_signals.append(
-                {
-                    "timestamp": signal_time,
-                    "symbol": str(row.get("symbol") or "").strip().upper(),
-                    "action": str(row.get("action") or "").strip().lower(),
-                    "entry_price": _safe_float(row.get("entry_price"), 0.0),
-                    "stop_loss": row.get("stop_loss"),
-                    "take_profit": row.get("take_profit"),
-                    "timeframe": normalize_timeframe(str(row.get("timeframe") or default_timeframe))
-                    or default_timeframe,
-                    "source": str(row.get("source") or normalized_source or "internal").lower(),
-                    "metadata": (
-                        dict(row.get("metadata"))
-                        if isinstance(row.get("metadata"), dict)
-                        else {}
-                    ),
-                }
-            )
-        replay_source_label = normalized_source
+        replay_source_label = replay_source_label or normalized_source
 
     normalized_signals = [
         item
