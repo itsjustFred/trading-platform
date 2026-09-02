@@ -5247,30 +5247,29 @@ def _portfolio_trades_filtered(
     return filtered
 
 
-def _normalize_portfolio_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    normalized = dict(payload)
+def _source_components_from_strategies(strategies: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Map legacy 'strategies' rows into component-shaped dicts."""
+    source_components: list[dict[str, Any]] = []
+    for strategy_row in strategies:
+        if not isinstance(strategy_row, dict):
+            continue
+        source_components.append(
+            {
+                "strategy_name": strategy_row.get("strategy_name") or strategy_row.get("name") or "",
+                "symbol": strategy_row.get("symbol") or "",
+                "timeframe": strategy_row.get("timeframe") or "1h",
+                "weight": strategy_row.get("risk_per_trade_pct", 1.0),
+                "risk_config": {"max_positions": strategy_row.get("max_positions", 99)},
+                "settings": {},
+                "backtest_id": strategy_row.get("backtest_id", ""),
+            }
+        )
+    return source_components
 
-    raw_components = normalized.get("components")
+
+def _build_portfolio_components(source_components: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Normalize every raw component dict into a portfolio component payload."""
     components: list[dict[str, Any]] = []
-    if isinstance(raw_components, list) and raw_components:
-        source_components = [item for item in raw_components if isinstance(item, dict)]
-    else:
-        source_components = []
-        for strategy_row in normalized.get("strategies", []):
-            if not isinstance(strategy_row, dict):
-                continue
-            source_components.append(
-                {
-                    "strategy_name": strategy_row.get("strategy_name") or strategy_row.get("name") or "",
-                    "symbol": strategy_row.get("symbol") or "",
-                    "timeframe": strategy_row.get("timeframe") or "1h",
-                    "weight": strategy_row.get("risk_per_trade_pct", 1.0),
-                    "risk_config": {"max_positions": strategy_row.get("max_positions", 99)},
-                    "settings": {},
-                    "backtest_id": strategy_row.get("backtest_id", ""),
-                }
-            )
-
     for index, raw_component in enumerate(source_components, start=1):
         strategy_name = str(raw_component.get("strategy_name") or raw_component.get("name") or "").strip()
         symbol = _normalize_symbol_key(raw_component.get("symbol"))
@@ -5366,9 +5365,37 @@ def _normalize_portfolio_payload(payload: dict[str, Any]) -> dict[str, Any]:
             }
         )
         components.append(component_payload)
+    return components
 
-    normalized["components"] = components
-    normalized["strategies"] = [
+
+def _match_component_for_trade(
+    trade: dict[str, Any],
+    components: list[dict[str, Any]],
+    *,
+    strategy_name: str,
+    symbol: str,
+    timeframe: str,
+) -> dict[str, Any] | None:
+    """Find a component matching a trade by strategy/symbol/timeframe."""
+    if not strategy_name:
+        return None
+    normalized_strategy = _normalize_strategy_key(strategy_name)
+    for candidate in components:
+        if _normalize_strategy_key(candidate.get("strategy_name")) != normalized_strategy:
+            continue
+        candidate_symbol = _normalize_symbol_key(candidate.get("symbol"))
+        candidate_timeframe = _normalize_timeframe_key(candidate.get("timeframe"))
+        if symbol and candidate_symbol and symbol != candidate_symbol:
+            continue
+        if timeframe and candidate_timeframe and timeframe != candidate_timeframe:
+            continue
+        return candidate
+    return None
+
+
+def _portfolio_legacy_strategy_rows(components: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Map components back into the legacy 'strategies' row shape."""
+    return [
         {
             "backtest_id": str(component.get("backtest_id") or ""),
             "strategy_name": str(component.get("strategy_name") or ""),
@@ -5378,6 +5405,11 @@ def _normalize_portfolio_payload(payload: dict[str, Any]) -> dict[str, Any]:
         for component in components
     ]
 
+
+def _normalize_portfolio_trades(
+    raw_trades: list[Any], *, components: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Normalize portfolio trades and enrich them from their source backtests."""
     component_by_id = {
         str(component.get("component_id") or ""): component
         for component in components
@@ -5385,7 +5417,7 @@ def _normalize_portfolio_payload(payload: dict[str, Any]) -> dict[str, Any]:
     }
     backtest_trade_lookup_cache: dict[str, dict[tuple[str, str, str], list[dict[str, Any]]]] = {}
     normalized_trades: list[dict[str, Any]] = []
-    for raw_trade in normalized.get("trades", []):
+    for raw_trade in raw_trades:
         if not isinstance(raw_trade, dict):
             continue
         trade = dict(raw_trade)
@@ -5397,20 +5429,16 @@ def _normalize_portfolio_payload(payload: dict[str, Any]) -> dict[str, Any]:
         timeframe_text = str(trade.get("timeframe") or "").strip()
         timeframe = _normalize_timeframe_key(timeframe_text) if timeframe_text else ""
 
-        if component is None and strategy_name:
-            normalized_strategy = _normalize_strategy_key(strategy_name)
-            for candidate in components:
-                if _normalize_strategy_key(candidate.get("strategy_name")) != normalized_strategy:
-                    continue
-                candidate_symbol = _normalize_symbol_key(candidate.get("symbol"))
-                candidate_timeframe = _normalize_timeframe_key(candidate.get("timeframe"))
-                if symbol and candidate_symbol and symbol != candidate_symbol:
-                    continue
-                if timeframe and candidate_timeframe and timeframe != candidate_timeframe:
-                    continue
-                component = candidate
-                component_id = str(candidate.get("component_id") or "")
-                break
+        if component is None:
+            component = _match_component_for_trade(
+                trade,
+                components,
+                strategy_name=strategy_name,
+                symbol=symbol,
+                timeframe=timeframe,
+            )
+            if component is not None:
+                component_id = str(component.get("component_id") or "")
 
         if component is not None:
             if not strategy_name:
@@ -5442,6 +5470,45 @@ def _normalize_portfolio_payload(payload: dict[str, Any]) -> dict[str, Any]:
             else:
                 trade["id"] = uuid.uuid4().hex[:10]
         normalized_trades.append(trade)
+    return normalized_trades
+
+
+def _compute_strategy_contributions(
+    grouped: list[dict[str, Any]], *, combined_stats: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Derive per-strategy PnL contribution percentages from grouped stats."""
+    total_pnl = _safe_float(combined_stats.get("net_profit"), 0.0)
+    strategy_contributions: list[dict[str, Any]] = []
+    for item in grouped:
+        contribution_pnl = _safe_float(item.get("pnl_total"), 0.0)
+        pct = 0.0 if total_pnl == 0 else (contribution_pnl / total_pnl) * 100.0
+        strategy_contributions.append(
+            {
+                "strategy_name": item.get("group_value", ""),
+                "pnl_contribution": round(contribution_pnl, 2),
+                "pnl_contribution_pct": round(pct, 3),
+            }
+        )
+    return strategy_contributions
+
+
+def _normalize_portfolio_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(payload)
+
+    raw_components = normalized.get("components")
+    if isinstance(raw_components, list) and raw_components:
+        source_components = [item for item in raw_components if isinstance(item, dict)]
+    else:
+        source_components = _source_components_from_strategies(normalized.get("strategies", []))
+
+    components = _build_portfolio_components(source_components)
+    normalized["components"] = components
+    normalized["strategies"] = _portfolio_legacy_strategy_rows(components)
+
+    normalized_trades = _normalize_portfolio_trades(
+        normalized.get("trades", []),
+        components=components,
+    )
 
     normalized_trades.sort(key=_component_trade_time)
     normalized["trades"] = normalized_trades
@@ -5454,21 +5521,12 @@ def _normalize_portfolio_payload(payload: dict[str, Any]) -> dict[str, Any]:
         )
 
     if not isinstance(normalized.get("strategy_contributions"), list):
-        grouped = _compute_portfolio_contributions(portfolio=normalized, group_by="strategy")
-        stats = normalized.get("combined_stats") if isinstance(normalized.get("combined_stats"), dict) else {}
-        total_pnl = _safe_float(stats.get("net_profit"), 0.0)
-        strategy_contributions: list[dict[str, Any]] = []
-        for item in grouped:
-            contribution_pnl = _safe_float(item.get("pnl_total"), 0.0)
-            pct = 0.0 if total_pnl == 0 else (contribution_pnl / total_pnl) * 100.0
-            strategy_contributions.append(
-                {
-                    "strategy_name": item.get("group_value", ""),
-                    "pnl_contribution": round(contribution_pnl, 2),
-                    "pnl_contribution_pct": round(pct, 3),
-                }
-            )
-        normalized["strategy_contributions"] = strategy_contributions
+        normalized["strategy_contributions"] = _compute_strategy_contributions(
+            _compute_portfolio_contributions(portfolio=normalized, group_by="strategy"),
+            combined_stats=normalized.get("combined_stats")
+            if isinstance(normalized.get("combined_stats"), dict)
+            else {},
+        )
 
     combined_stats = normalized.get("combined_stats") if isinstance(normalized.get("combined_stats"), dict) else {}
     if normalized_trades and not _portfolio_stats_have_values(combined_stats):
