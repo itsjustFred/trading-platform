@@ -115,8 +115,9 @@ def generate_signals(df: pd.DataFrame, params: dict):
         frame_start = bar_ts.min()
         frame_end = bar_ts.max()
     elif isinstance(df.index, pd.DatetimeIndex) and df.index.tz is not None:
-        frame_start = df.index.min()
-        frame_end = df.index.max()
+        index_utc = df.index.tz_convert("UTC")
+        frame_start = index_utc.min()
+        frame_end = index_utc.max()
     else:
         frame_start = frame_end = None
     vix = _load_vix_data(
@@ -139,9 +140,9 @@ def generate_signals(df: pd.DataFrame, params: dict):
         if "timestamp" in df.columns:
             bar_dates = bar_ts.dt.date
         elif isinstance(df.index, pd.DatetimeIndex) and df.index.tz is not None:
-            bar_dates = df.index.date
+            bar_dates = pd.Index(df.index.tz_convert("UTC").date)
         else:
-            bar_dates = pd.Series(pd.NaT, index=df.index).dt.date
+            bar_dates = pd.Index([pd.NaT] * len(df))
         vix_aligned = pd.Series(
             vix_by_date.reindex(bar_dates).to_numpy(), index=df.index, dtype=float
         )

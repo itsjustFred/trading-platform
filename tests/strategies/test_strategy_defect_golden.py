@@ -443,6 +443,35 @@ def test_post_vix_duplicate_vix_dates_keep_last_and_tz_naive_bars_rejected(monke
     with pytest.raises(ValueError, match="tz-aware"):
         _call(module, naive, {"sma_period": 3})
 
+    # A tz-aware but non-UTC index must be converted to UTC before deriving
+    # the frame window and bar dates (CodeRabbit cycle-3 finding): local
+    # 2024-01-01 20:00 America/New_York is already 2024-01-02 UTC.
+    ny_index = pd.DatetimeIndex(
+        ["2024-01-01 20:00", "2024-01-02 04:00", "2024-01-02 12:00"],
+        tz="America/New_York",
+    )
+    ny_frame = pd.DataFrame(
+        {
+            "open": [100.0] * 3,
+            "high": [101.0] * 3,
+            "low": [99.0] * 3,
+            "close": [100.0] * 3,
+        },
+        index=ny_index,
+    )
+    captured: dict[str, object] = {}
+
+    def loader(start=None, end=None):
+        captured["start"], captured["end"] = start, end
+        return pd.Series(30.0, index=pd.DatetimeIndex(["2024-01-02"], tz="UTC"))
+
+    monkeypatch.setattr(module, "_load_vix_data", loader)
+    _, _, indicators, _ = _call(module, ny_frame, {"sma_period": 3})
+    assert captured["start"] == "2024-01-02" and captured["end"] == "2024-01-02"
+    assert indicators["VIX"].notna().all(), (
+        "non-UTC tz-aware frames must align on UTC calendar dates"
+    )
+
 
 # ---------------------------------------------------------------------------
 # 4. Signal-bots: Supertrend band recursion must not read uninitialized state
@@ -511,7 +540,7 @@ def test_ramjet_supertrend_flags_are_complete_for_every_bar():
     result = RamJetSignalProcessor._calculate_supertrend(frame, period=5, multiplier=3.0)
     supertrend = result["supertrend"]
     assert len(supertrend) == rows
-    assert supertrend.notna().all() if pd.api.types.is_float_dtype(supertrend) else True
+    assert supertrend.notna().all(), "every bar must carry an explicit Supertrend decision"
 
 
 def test_ramjet_supertrend_warmup_is_flagged_not_bearish():
@@ -603,13 +632,11 @@ def test_ivb_candle_close_fallback_is_reported_in_indicators():
     assert "signal_price_fallback_used" in indicators, (
         "the fallback must be surfaced as an indicator column"
     )
-    fallback = indicators["signal_price_fallback_used"]
-    assert bool(fallback.iloc[-1]) or not bool(fallback.iloc[-1]), "indicator is readable"
-    if bool(fallback.iloc[0]):
-        assert "signal_price" in indicators, (
-            "the fallback must expose the price series actually used"
-        )
-        assert indicators["signal_price"].iloc[1] == pytest.approx(100.0)
+    assert "signal_price" in indicators, (
+        "the price series actually used must be exposed in the indicators"
+    )
+    assert indicators["signal_price"].iloc[1] == pytest.approx(100.0)
+    assert indicators["signal_price_fallback_used"].dtype == bool
 
 
 def test_ivb_confirmation_semantics_are_stable_on_intraday_data():

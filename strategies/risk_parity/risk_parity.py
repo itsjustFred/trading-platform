@@ -18,7 +18,7 @@ STRATEGY_META = {
     "version": "1.1.0",
     "source_url": "https://github.com/desenyon/quantconnect-strategies/blob/main/risk_parity_strategy.py",
     "notes": (
-        "- Insprimiert NICHT die Multi-Asset-Risk-Parity-Allokation des "
+        "- Implementiert NICHT die Multi-Asset-Risk-Parity-Allokation des "
         "Originals; diese Strategie handelt ein einzelnes Instrument "
         "long/flat mit Volatilitaets-Regime- und SMA-Trendfilter.\n"
         "- Die echte Multi-Asset-Risk-Parity-Gewichtung liegt in "
