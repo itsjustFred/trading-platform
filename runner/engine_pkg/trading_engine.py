@@ -23,11 +23,17 @@ import pandas as pd
 from risk.config import RiskConfig
 from risk.engine import RiskEngine
 from risk.models import TradeSignal
+from runner.engine_pkg._time import to_iso_utc
 from runner.engine_pkg.execution_model import ExecutionModelSettings
 from runner.engine_pkg.orders import Order, OrderType, Position
 from runner.engine_pkg.result import build_indicator_series, build_result
 from runner.engines.base import BacktestConfig
 from shared.models import BacktestResult, EquityPoint, IndicatorSeries, Trade, TradeExit
+
+#: Engine-level concurrent-position policy for the native engine
+#: (Cleanup 16-D1, F22). Deliberately a module constant, not a strategy
+#: parameter: strategy ``parameters`` must not rewrite engine risk policy.
+TRADE_ENGINE_MAX_POSITIONS = 5
 
 
 class TradeEngine:
@@ -61,12 +67,16 @@ class TradeEngine:
         configured_risk_pct = float(self.config.risk_per_trade_pct or 0.0)
         self._risk_enabled = configured_risk_pct > 0
         max_total_exposure = float(self.config.max_position_pct or 0.05)
-        max_positions = int(float(self.config.parameters.get("max_positions", 5) or 5))
+        # Risk-policy provenance (Cleanup 16-D1, F22): the engine-level risk
+        # policy is engine configuration only. It is intentionally NOT read
+        # from ``config.parameters`` — strategy parameters must not silently
+        # rewrite engine risk policy (undocumented cross-talk). Set
+        # ``risk_per_trade_pct`` / ``max_position_pct`` on the config instead.
         self._risk_engine = RiskEngine(
             RiskConfig(
                 max_risk_per_trade=configured_risk_pct if configured_risk_pct > 0 else 0.01,
                 max_total_exposure=max_total_exposure,
-                max_positions=max_positions,
+                max_positions=TRADE_ENGINE_MAX_POSITIONS,
                 default_sl_atr_multiplier=2.0,
             )
         )
@@ -259,10 +269,7 @@ class TradeEngine:
 
     @staticmethod
     def _to_iso(value: Any) -> str:
-        ts = pd.Timestamp(value, tz="UTC") if not isinstance(value, pd.Timestamp) else value
-        if ts.tzinfo is None:
-            ts = ts.tz_localize("UTC")
-        return ts.isoformat()
+        return to_iso_utc(value)
 
     def _create_order(self, row: pd.Series, i: int, direction: str) -> None:
         entry_price = float(row["close"])

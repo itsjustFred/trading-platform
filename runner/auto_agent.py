@@ -173,6 +173,8 @@ def run_auto_agent(
     artifacts = build_strategy_artifacts(
         resolved_name=resolved_name,
         engine=engine,
+        strategies_dir=STRATEGIES_DIR,
+        backtests_dir=BACKTESTS_DIR,
     )
     artifacts.strategy_dir.mkdir(parents=True, exist_ok=True)
     BACKTESTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -243,6 +245,7 @@ def run_auto_agent(
             output_path=artifacts.output_path,
             capital=capital,
             default_risk_pct=DEFAULT_RISK_PCT,
+            project_root=PROJECT_ROOT,
         )
         returncode, combined_output = _run_backtest(cmd, log=log)
         if returncode == 0 and artifacts.output_path.exists():
@@ -324,8 +327,12 @@ def _resolve_strategy_name(markdown_doc: str, *, requested_name: str | None) -> 
 
 
 def _run_backtest(cmd: list[str], *, log: TaskLogger | None) -> tuple[int, str]:
-    """Indirection kept so tests (and callers) can stub backtest execution."""
-    return _run_backtest_impl(cmd, log=log)
+    """Indirection kept so tests (and callers) can stub backtest execution.
+
+    Runs in ``PROJECT_ROOT`` (this module's global — the single patch seam);
+    see pre-mortem PM-1 for why the root must not be re-derived elsewhere.
+    """
+    return _run_backtest_impl(cmd, log=log, project_root=PROJECT_ROOT)
 
 
 def _kill(proc: subprocess.Popen) -> None:

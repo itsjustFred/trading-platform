@@ -272,3 +272,51 @@ def test_normalize_strategy_meta_coerces_tag_field_types():
     assert normalized["tags"]["type"] == ["trend"]
     assert normalized["tags"]["asset_class"] == ["forex"]
     assert normalized["tags"]["complexity"] == "2"
+
+
+def test_run_auto_agent_writes_artifacts_inside_patched_dirs(tmp_path, monkeypatch):
+    """Regression (pre-mortem PM-1): generated strategies must land inside the
+    patched directories, never in the live repo registry — even when the
+    artifact/path helpers live in different modules than the patch seam."""
+    _setup_agent(monkeypatch, tmp_path)
+    _install_fake_provider(
+        monkeypatch,
+        [STEP_ONE_MARKDOWN, STEP_TWO_META, STEP_THREE_CODE],
+    )
+
+    def fake_run_backtest(cmd: list[str], *, log=None, project_root=None):
+        output_path = Path(cmd[cmd.index("--output") + 1])
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text('{"status":"ok"}')
+        return 0, "ok"
+
+    monkeypatch.setattr(auto_agent, "_run_backtest", fake_run_backtest)
+
+    result = auto_agent.run_auto_agent(
+        "strategy.entry('Long', strategy.long)",
+        strategy_name="Seam Agent",
+        log=lambda *args, **kwargs: None,
+    )
+
+    strategy_file = Path(result["strategy_file"])
+    documentation_file = Path(result["documentation_file"])
+    backtest_output = Path(result["backtest_output"])
+
+    assert strategy_file.is_relative_to(tmp_path), f"strategy leaked: {strategy_file}"
+    assert documentation_file.is_relative_to(tmp_path), f"docs leaked: {documentation_file}"
+    assert backtest_output.is_relative_to(tmp_path), f"output leaked: {backtest_output}"
+
+    # The CLI command must be launched with the strategy path relative to the
+    # SAME root the subprocess runs in (pre-mortem PM-1 masking defect).
+    strategy_file.relative_to(tmp_path)
+
+
+def test_normalize_markdown_doc_and_extract_engine_roundtrip():
+    """Contract sanity for the parsing module split (16-D2): the helpers moved
+    out of auto_agent must behave identically to their old behavior."""
+    from runner.agent_response_parsing import extract_engine, normalize_markdown_doc
+
+    doc = normalize_markdown_doc("```markdown\n# T\n\nbody\n```", strategy_name=None)
+    assert doc.startswith("# T")
+    assert extract_engine("## Framework-Empfehlung\npynecore", requested_engine=None) == "pynecore"
+    assert extract_engine("no engine here", requested_engine=None) == "vectorbt"

@@ -25,8 +25,15 @@ def build_backtest_command(
     output_path: Path,
     capital: float,
     default_risk_pct: float,
+    project_root: Path = PROJECT_ROOT,
 ) -> list[str]:
-    relative_strategy_path = strategy_path.relative_to(PROJECT_ROOT)
+    """Build the runner.cli command for the validation backtest.
+
+    ``project_root`` is an explicit parameter (defaulting to the module
+    constant) so callers patch a single seam; the strategy path is made
+    relative to exactly the root the subprocess will run in.
+    """
+    relative_strategy_path = strategy_path.relative_to(project_root)
     return [
         sys.executable,
         "-m",
@@ -53,7 +60,12 @@ def build_backtest_command(
     ]
 
 
-def run_backtest(cmd: list[str], *, log: TaskLogger | None) -> tuple[int, str]:
+def run_backtest(
+    cmd: list[str],
+    *,
+    log: TaskLogger | None,
+    project_root: Path = PROJECT_ROOT,
+) -> tuple[int, str]:
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
     log_message(log, "Launching backtest command: " + " ".join(cmd))
@@ -63,7 +75,7 @@ def run_backtest(cmd: list[str], *, log: TaskLogger | None) -> tuple[int, str]:
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        cwd=str(PROJECT_ROOT),
+        cwd=str(project_root),
         env=env,
         text=True,
         bufsize=1,

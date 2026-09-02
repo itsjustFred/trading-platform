@@ -68,15 +68,29 @@ class StrategyArtifacts:
     output_path: Path
 
 
-def build_strategy_artifacts(*, resolved_name: str, engine: str) -> StrategyArtifacts:
-    strategy_dir = STRATEGIES_DIR / resolved_name
+def build_strategy_artifacts(
+    *,
+    resolved_name: str,
+    engine: str,
+    strategies_dir: Path = STRATEGIES_DIR,
+    backtests_dir: Path = BACKTESTS_DIR,
+) -> StrategyArtifacts:
+    """Compute the per-strategy artifact paths.
+
+    ``strategies_dir``/``backtests_dir`` are explicit parameters (defaulting
+    to the module constants) so callers — and the tests that patch them —
+    have exactly one seam: the caller's module globals. Writing generated
+    strategies into the live registry by accident is exactly the failure
+    mode this prevents (see pre-mortem PM-1).
+    """
+    strategy_dir = strategies_dir / resolved_name
     return StrategyArtifacts(
         resolved_name=resolved_name,
         engine=engine,
         strategy_dir=strategy_dir,
         strategy_path=strategy_dir / f"{resolved_name}.py",
         documentation_path=strategy_dir / "README.md",
-        output_path=BACKTESTS_DIR
+        output_path=backtests_dir
         / f"{resolved_name}_auto_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.trades.json",
     )
 

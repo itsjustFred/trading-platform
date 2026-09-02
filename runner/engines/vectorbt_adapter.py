@@ -19,7 +19,7 @@ import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 import pandas as pd
 
@@ -44,6 +44,30 @@ from shared.models import BacktestMeta, BacktestResult, EquityPoint, IndicatorSe
 logger = logging.getLogger(__name__)
 
 _RISK_WARNING_KEYS: set[tuple[str, str, str]] = set()
+
+
+class _SizeRecord(TypedDict):
+    """Per-trade position-sizing record produced by ``_size_trade``.
+
+    These keys are re-serialized into ``trade.meta["risk_math"]`` (minus the
+    qty/bookkeeping fields) and are part of the viewer contract — see
+    ``frontend/src/api/types.ts`` (``TradeRiskMath``). Renaming or dropping a
+    key here without updating the ``risk_math`` assembly breaks the chart
+    silently; the key-set contract test guards this (pre-mortem PM-2).
+    """
+
+    sizing_mode: str
+    risk_target_usd: float | None
+    stop_distance: float | None
+    max_position_pct: float | None
+    max_leverage: float | None
+    required_notional: float | None
+    cap_notional: float | None
+    leverage_notional_limit: float | None
+    final_notional: float | None
+    capped_by_max_position: bool
+    capped_by_max_leverage: bool
+    qty: float
 
 
 def _warn_once(key: tuple[str, str, str], message: str, *args: Any) -> None:
@@ -112,7 +136,7 @@ def _size_trade(
     entry_idx: int,
     symbol: str,
     trade_counter: int,
-) -> dict[str, Any]:
+) -> _SizeRecord:
     """Size one trade and return the full risk-math record.
 
     Mirrors the legacy in-loop sizing logic exactly: risk_pct sizing when
@@ -194,20 +218,20 @@ def _size_trade(
         qty = equity / entry_price
         final_notional = qty * entry_price
 
-    return {
-        "sizing_mode": sizing_mode,
-        "risk_target_usd": risk_target_usd,
-        "stop_distance": stop_distance,
-        "max_position_pct": max_position_pct,
-        "max_leverage": max_leverage,
-        "required_notional": required_notional,
-        "cap_notional": cap_notional,
-        "leverage_notional_limit": leverage_notional_limit,
-        "final_notional": final_notional,
-        "capped_by_max_position": capped_by_max_position,
-        "capped_by_max_leverage": capped_by_max_leverage,
-        "qty": qty,
-    }
+    return _SizeRecord(
+        sizing_mode=sizing_mode,
+        risk_target_usd=risk_target_usd,
+        stop_distance=stop_distance,
+        max_position_pct=max_position_pct,
+        max_leverage=max_leverage,
+        required_notional=required_notional,
+        cap_notional=cap_notional,
+        leverage_notional_limit=leverage_notional_limit,
+        final_notional=final_notional,
+        capped_by_max_position=capped_by_max_position,
+        capped_by_max_leverage=capped_by_max_leverage,
+        qty=qty,
+    )
 
 
 def _process_symbol(

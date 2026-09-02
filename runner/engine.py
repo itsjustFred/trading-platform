@@ -16,12 +16,19 @@ from __future__ import annotations
 
 from runner.engine_pkg.execution_model import ExecutionModelSettings
 from runner.engine_pkg.orders import Order, OrderType, Position
-from runner.engine_pkg.trading_engine import TradeEngine
+from runner.engine_pkg.result import build_indicator_series, build_result
+from runner.engine_pkg.trading_engine import (
+    TRADE_ENGINE_MAX_POSITIONS,
+    TradeEngine,
+)
 
 __all__ = [
     "ExecutionModelSettings",
     "Order",
     "OrderType",
     "Position",
+    "TRADE_ENGINE_MAX_POSITIONS",
     "TradeEngine",
+    "build_indicator_series",
+    "build_result",
 ]

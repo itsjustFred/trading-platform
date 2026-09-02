@@ -11,19 +11,13 @@ from typing import Any
 
 import pandas as pd
 
+from runner.engine_pkg._time import to_iso_utc
 from shared.models import BacktestMeta, BacktestResult, IndicatorSeries
 
 
 def build_indicator_series(indicators: dict[str, Any], data: pd.DataFrame) -> list[IndicatorSeries]:
     """Convert strategy indicator output into viewer IndicatorSeries payloads."""
-
-    def _to_iso(value: Any) -> str:
-        ts = pd.Timestamp(value, tz="UTC") if not isinstance(value, pd.Timestamp) else value
-        if ts.tzinfo is None:
-            ts = ts.tz_localize("UTC")
-        return ts.isoformat()
-
-    points_time = [_to_iso(ts) for ts in data["timestamp"]]
+    points_time = [to_iso_utc(ts) for ts in data["timestamp"]]
     output: list[IndicatorSeries] = []
 
     for name, value in (indicators or {}).items():
