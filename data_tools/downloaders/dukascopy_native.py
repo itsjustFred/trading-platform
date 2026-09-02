@@ -738,9 +738,11 @@ def _merge_tick_sides(bid_df: pd.DataFrame, ask_df: pd.DataFrame) -> pd.DataFram
 
     # The side frames carry disjoint column sets (built by _split_tick_sides
     # or the per-side assemblers), so the join needs no suffix handling.
+    # Deduplicate first: validate="one_to_one" must fail on genuine producer
+    # bugs, not on duplicate timestamps that the final projection would drop.
     merged = pd.merge(
-        bid_df,
-        ask_df,
+        bid_df.drop_duplicates(subset=["timestamp"]),
+        ask_df.drop_duplicates(subset=["timestamp"]),
         on="timestamp",
         how="inner",
         validate="one_to_one",

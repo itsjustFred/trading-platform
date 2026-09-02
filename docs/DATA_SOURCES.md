@@ -188,7 +188,7 @@ python -m data_tools.downloaders.ctrader_dl \
 
 ## yfinance
 
-File: `data_tools/migrate_csv.py`
+Files: `data_tools/downloaders/yfinance_dl.py` (live downloader), `data_tools/migrate_csv.py` (legacy CSV import)
 
 ### Current truth
 
@@ -201,7 +201,7 @@ $TRADING_DATA_DIR/ohlcv/yfinance/equity/US/{symbol}/{timeframe}.parquet
 ```
 
 Existing CSV archives are additionally populated through
-`data_tools.migrate_csv.py`.
+`data_tools/migrate_csv.py`.
 
 ### 4h bucket convention (DV-B20)
 
@@ -243,7 +243,7 @@ The FastAPI viewer uses these source names in `/api/data/download`:
 - `dolthub` -> `python -m data_tools.dolthub_manager update`
 - `yfinance` -> `python -m data_tools.downloaders.yfinance_dl`
   (`YFinanceDownloader`; CSV archives are additionally migrated via
-  `data_tools.migrate_csv.py`)
+  `data_tools/migrate_csv.py`)
 
 The data pages and strategy/backtest runners ultimately consume normalized
 parquet files plus `catalog.json`, not the raw source-specific formats.

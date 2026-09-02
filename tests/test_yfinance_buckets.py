@@ -58,7 +58,7 @@ def test_resample_4h_utc_grid_aligns_to_00_00_utc():
         "2024-03-04T04:00:00+00:00",
     ]
     # First bucket spans [00:00, 04:00) UTC and holds hours 01..03:
-    # open=1.0 (hour 01), close=3.5 (hour 03), volume=10+11+12+13.
+    # open=1.0 (hour 01), close=3.5 (hour 03), volume=10+11+12.
     assert float(resampled.loc[0, "open"]) == 1.0
     assert float(resampled.loc[0, "close"]) == 3.5
     assert float(resampled.loc[0, "high"]) == 4.0
