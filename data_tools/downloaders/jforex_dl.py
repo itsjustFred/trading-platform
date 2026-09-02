@@ -872,8 +872,115 @@ def _align_bar_query_range(base_timeframe: str, start_ms: int, end_ms: int) -> t
     return aligned_start, aligned_end
 
 
-def _query_jforex_history(
+def _collect_jforex_rows(
     *,
+    context: Any,
+    java_instrument: Any,
+    base_timeframe: str,
+    start_ms: int,
+    end_ms: int,
+    offer_side_name: str,
+) -> list[tuple[Any, ...]]:
+    """Collect tick or bar rows from the JForex history service."""
+    from com.dukascopy.api import OfferSide, Period
+
+    history = context.getHistory()
+    data_service = context.getDataService()
+    rows: list[tuple[Any, ...]] = []
+    step_ms = _window_ms(base_timeframe)
+
+    if base_timeframe == "tick":
+        first_ms = int(data_service.getTimeOfFirstTick(java_instrument))
+        if first_ms >= JAVA_LONG_MAX:
+            return []
+        cursor = max(start_ms, first_ms)
+        while cursor <= end_ms:
+            window_end = min(cursor + step_ms - 1, end_ms)
+            ticks = history.getTicks(java_instrument, cursor, window_end)
+            for tick in ticks:
+                rows.append(
+                    (
+                        int(tick.getTime()),
+                        float(tick.getAsk()),
+                        float(tick.getBid()),
+                        float(tick.getAskVolume()),
+                        float(tick.getBidVolume()),
+                    )
+                )
+            cursor = window_end + 1
+        return rows
+
+    period = getattr(Period, JFOREX_PERIOD_ATTR[base_timeframe])
+    offer_side = getattr(OfferSide, offer_side_name)
+    first_ms = int(data_service.getTimeOfFirstCandle(java_instrument, period))
+    if first_ms >= JAVA_LONG_MAX:
+        return []
+    query_start_ms, query_end_ms = _align_bar_query_range(
+        base_timeframe,
+        start_ms,
+        end_ms,
+    )
+    interval_ms = BAR_INTERVAL_MS[base_timeframe]
+    cursor = max(query_start_ms, first_ms)
+    while cursor <= query_end_ms:
+        window_end = min(cursor + step_ms - interval_ms, query_end_ms)
+        bars = history.getBars(
+            java_instrument,
+            period,
+            offer_side,
+            cursor,
+            window_end,
+        )
+        for bar in bars:
+            rows.append(
+                (
+                    int(bar.getTime()),
+                    float(bar.getOpen()),
+                    float(bar.getHigh()),
+                    float(bar.getLow()),
+                    float(bar.getClose()),
+                    float(bar.getVolume()),
+                )
+            )
+        cursor = window_end + interval_ms
+    return rows
+
+
+def _await_jforex_connection(client: Any, state: QueryState, *, deadline_seconds: float = 30) -> None:
+    connect_deadline = time.monotonic() + deadline_seconds
+    while time.monotonic() < connect_deadline:
+        if state.connected.is_set() or bool(client.isConnected()):
+            return
+        time.sleep(0.2)
+    raise TimeoutError("JForex connection timed out.")
+
+
+def _stop_jforex_strategy(client: Any, process_id: int | None) -> None:
+    if client is None or process_id is None:
+        return
+    try:
+        client.stopStrategy(process_id)
+    except _java_exception_types():
+        logger.debug("JForex client.stopStrategy() raised Java exception", exc_info=True)
+    except Exception:  # noqa: BLE001
+        logger.debug("JForex client.stopStrategy() raised exception", exc_info=True)
+
+
+def _disconnect_jforex_client(client: Any) -> None:
+    if client is None:
+        return
+    try:
+        if bool(client.isConnected()):
+            client.disconnect()
+    except _java_exception_types():
+        logger.debug("JForex client.disconnect() raised Java exception", exc_info=True)
+    except Exception:  # noqa: BLE001
+        logger.debug("JForex client.disconnect() raised exception", exc_info=True)
+
+
+def _run_jforex_query_session(
+    *,
+    jpype_mod: Any,
     java_instrument: Any,
     base_timeframe: str,
     start_ms: int,
@@ -882,19 +989,11 @@ def _query_jforex_history(
     offer_side_name: str,
     timeout_seconds: int,
     cache_dir: Path,
-) -> pd.DataFrame:
-    _ensure_jvm_started()
-    jpype_mod = _jpype_module()
-
-    try:
-        from com.dukascopy.api import OfferSide, Period
-        from com.dukascopy.api.system import ClientFactory
-        from java.io import File
-        from java.util import HashSet
-    except _java_exception_types() as exc:
-        _raise_jforex_runtime_error("Failed to import JForex SDK runtime classes", exc)
-    except Exception as exc:  # noqa: BLE001
-        _raise_jforex_runtime_error("Failed to import JForex SDK runtime classes", exc)
+) -> tuple[Any, int | None, QueryState]:
+    """Connect to JForex, run the history strategy and clean up the client."""
+    from com.dukascopy.api.system import ClientFactory
+    from java.io import File
+    from java.util import HashSet
 
     state = QueryState()
 
@@ -921,68 +1020,14 @@ def _query_jforex_history(
         @jpype_mod.JOverride
         def onStart(self, context):  # noqa: N802
             try:
-                history = context.getHistory()
-                data_service = context.getDataService()
-                rows: list[tuple[Any, ...]] = []
-                step_ms = _window_ms(base_timeframe)
-
-                if base_timeframe == "tick":
-                    first_ms = int(data_service.getTimeOfFirstTick(java_instrument))
-                    if first_ms >= JAVA_LONG_MAX:
-                        state.rows = []
-                        return
-                    cursor = max(start_ms, first_ms)
-                    while cursor <= end_ms:
-                        window_end = min(cursor + step_ms - 1, end_ms)
-                        ticks = history.getTicks(java_instrument, cursor, window_end)
-                        for tick in ticks:
-                            rows.append(
-                                (
-                                    int(tick.getTime()),
-                                    float(tick.getAsk()),
-                                    float(tick.getBid()),
-                                    float(tick.getAskVolume()),
-                                    float(tick.getBidVolume()),
-                                )
-                            )
-                        cursor = window_end + 1
-                else:
-                    period = getattr(Period, JFOREX_PERIOD_ATTR[base_timeframe])
-                    offer_side = getattr(OfferSide, offer_side_name)
-                    first_ms = int(data_service.getTimeOfFirstCandle(java_instrument, period))
-                    if first_ms >= JAVA_LONG_MAX:
-                        state.rows = []
-                        return
-                    query_start_ms, query_end_ms = _align_bar_query_range(
-                        base_timeframe,
-                        start_ms,
-                        end_ms,
-                    )
-                    interval_ms = BAR_INTERVAL_MS[base_timeframe]
-                    cursor = max(query_start_ms, first_ms)
-                    while cursor <= query_end_ms:
-                        window_end = min(cursor + step_ms - interval_ms, query_end_ms)
-                        bars = history.getBars(
-                            java_instrument,
-                            period,
-                            offer_side,
-                            cursor,
-                            window_end,
-                        )
-                        for bar in bars:
-                            rows.append(
-                                (
-                                    int(bar.getTime()),
-                                    float(bar.getOpen()),
-                                    float(bar.getHigh()),
-                                    float(bar.getLow()),
-                                    float(bar.getClose()),
-                                    float(bar.getVolume()),
-                                )
-                            )
-                        cursor = window_end + interval_ms
-
-                state.rows = rows
+                state.rows = _collect_jforex_rows(
+                    context=context,
+                    java_instrument=java_instrument,
+                    base_timeframe=base_timeframe,
+                    start_ms=start_ms,
+                    end_ms=end_ms,
+                    offer_side_name=offer_side_name,
+                )
             except _java_exception_types() as exc:
                 logger.exception("JForex history strategy failed with Java exception: %s", exc)
                 state.error = RuntimeError(f"JForex history query failed: {exc}")
@@ -1020,7 +1065,6 @@ def _query_jforex_history(
 
     client = None
     process_id: int | None = None
-
     try:
         client = ClientFactory.getDefaultInstance()
         client.setSystemListener(_SystemListener())
@@ -1030,13 +1074,7 @@ def _query_jforex_history(
 
         client.connect(auth.jnlp_url, auth.username, auth.password)
 
-        connect_deadline = time.monotonic() + 30
-        while time.monotonic() < connect_deadline:
-            if state.connected.is_set() or bool(client.isConnected()):
-                break
-            time.sleep(0.2)
-        else:
-            raise TimeoutError("JForex connection timed out.")
+        _await_jforex_connection(client, state)
 
         subscribed = HashSet()
         subscribed.add(java_instrument)
@@ -1054,21 +1092,46 @@ def _query_jforex_history(
         _raise_jforex_runtime_error("JForex SDK request execution failed", exc)
 
     finally:
-        if client is not None and process_id is not None:
-            try:
-                client.stopStrategy(process_id)
-            except _java_exception_types():
-                logger.debug("JForex client.stopStrategy() raised Java exception", exc_info=True)
-            except Exception:  # noqa: BLE001
-                logger.debug("JForex client.stopStrategy() raised exception", exc_info=True)
-        if client is not None:
-            try:
-                if bool(client.isConnected()):
-                    client.disconnect()
-            except _java_exception_types():
-                logger.debug("JForex client.disconnect() raised Java exception", exc_info=True)
-            except Exception:  # noqa: BLE001
-                logger.debug("JForex client.disconnect() raised exception", exc_info=True)
+        _stop_jforex_strategy(client, process_id)
+        _disconnect_jforex_client(client)
+    return client, process_id, state
+
+
+def _query_jforex_history(
+    *,
+    java_instrument: Any,
+    base_timeframe: str,
+    start_ms: int,
+    end_ms: int,
+    auth: DukascopyAuthConfig,
+    offer_side_name: str,
+    timeout_seconds: int,
+    cache_dir: Path,
+) -> pd.DataFrame:
+    _ensure_jvm_started()
+    _jpype_module()
+
+    try:
+        from com.dukascopy.api import OfferSide, Period  # noqa: F401  (JVM import hook)
+        from com.dukascopy.api.system import ClientFactory  # noqa: F401
+        from java.io import File  # noqa: F401
+        from java.util import HashSet  # noqa: F401
+    except _java_exception_types() as exc:
+        _raise_jforex_runtime_error("Failed to import JForex SDK runtime classes", exc)
+    except Exception as exc:  # noqa: BLE001
+        _raise_jforex_runtime_error("Failed to import JForex SDK runtime classes", exc)
+
+    _client, _process_id, state = _run_jforex_query_session(
+        jpype_mod=_jpype_module(),
+        java_instrument=java_instrument,
+        base_timeframe=base_timeframe,
+        start_ms=start_ms,
+        end_ms=end_ms,
+        auth=auth,
+        offer_side_name=offer_side_name,
+        timeout_seconds=timeout_seconds,
+        cache_dir=cache_dir,
+    )
 
     if base_timeframe == "tick":
         df = pd.DataFrame(
@@ -1087,7 +1150,6 @@ def _query_jforex_history(
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
     df = df.sort_values("timestamp").drop_duplicates(subset=["timestamp"]).reset_index(drop=True)
     return df
-
 
 def _query_jforex_history_with_timeout_retry(
     *,
