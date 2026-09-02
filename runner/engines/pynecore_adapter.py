@@ -19,7 +19,7 @@ import sys
 import tempfile
 from datetime import datetime, timezone, date as _date
 from pathlib import Path
-from typing import Any, Callable, cast
+from typing import Any
 
 import pandas as pd
 
@@ -36,11 +36,7 @@ from runner.engines._shared import (
     resolve_max_position_pct as _resolve_max_position_pct,
     serialize_meta_value as _serialize_meta_value,
 )
-<<<<<<< HEAD
 from runner.stats import compute_stats_for_result
-=======
-from runner.codegen_safety import BANNED_CALL_NAMES, import_root
->>>>>>> a852cd9 (refactor(codegen): Stage-4 review fixes — dedupe kill/screening primitives, slug-retry cleanup)
 from shared.constants import DATA_DIR
 from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, TradeExit
 
@@ -437,6 +433,7 @@ HELPER_ALLOWED_IMPORT_ROOTS = frozenset(
 
 HELPER_ALLOWED_FUNCTION_NAMES = frozenset({"build_trade_context", "build_drawings"})
 
+# Shared with runner.codegen_safety (single source of truth, pinned by test).
 HELPER_BANNED_CALL_NAMES = BANNED_CALL_NAMES
 
 
@@ -467,19 +464,14 @@ def _reject_dunder_attribute(node: ast.Attribute, source_path: Path) -> None:
         )
 
 
-_SCREEN_RULES: tuple[tuple[type[ast.AST], Callable[[ast.AST, Path], None]], ...] = (
-    (ast.Import, cast(Callable[[ast.AST, Path], None], _reject_helper_import)),
-    (ast.ImportFrom, cast(Callable[[ast.AST, Path], None], _reject_helper_import)),
-    (ast.Call, cast(Callable[[ast.AST, Path], None], _reject_helper_call)),
-    (ast.Attribute, cast(Callable[[ast.AST, Path], None], _reject_dunder_attribute)),
-)
-
-
 def _screen_helper_node(node: ast.AST, source_path: Path) -> None:
     """Apply every helper screening rule to one AST node."""
-    for node_type, reject in _SCREEN_RULES:
-        if isinstance(node, node_type):
-            reject(node, source_path)
+    if isinstance(node, (ast.Import, ast.ImportFrom)):
+        _reject_helper_import(node, source_path)
+    elif isinstance(node, ast.Call):
+        _reject_helper_call(node, source_path)
+    elif isinstance(node, ast.Attribute):
+        _reject_dunder_attribute(node, source_path)
 
 
 def _helper_screen_nodes(nodes: list[ast.stmt], source_path: Path) -> None:

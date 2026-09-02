@@ -2,13 +2,13 @@
 
 Generated code is never trusted. Before a generated strategy module is written
 to disk (and therefore before anything can import or execute it), it is parsed
-and screened for constructs that the runner must never execute on behalf of a
-model response: process spawning, dynamic execution, filesystem/database
-access, network egress, deserialization of untrusted data, and reflection
-escape hatches. Screening is a deny-list over the AST — it is a tripwire, not a
-sandbox. The real containment is the human review gate
-(``runner.approval_gate``) plus the fact that generated code only ever runs in
-a short-lived subprocess with timeouts.
+and screened for the constructs this deny-list knows about: process spawning,
+dynamic code loading, network egress, untrusted deserialization, and reflection
+escape hatches. It does NOT cover everything (e.g. ``pathlib``/``shutil`` file
+writes or broad ``os`` use are only partially matched) — screening is a
+deny-list over the AST, a tripwire and not a sandbox. The real containment is
+the human review gate (``runner.approval_gate``) plus the fact that generated
+code only ever runs in a short-lived subprocess with timeouts.
 """
 
 from __future__ import annotations
@@ -180,22 +180,25 @@ def import_root(node: ast.Import | ast.ImportFrom) -> str:
     return (node.module or "").split(".")[0]
 
 
+def _import_ban_reason(root: str, *, from_import: bool) -> str | None:
+    """Message for a banned import root, or None when the root is allowed."""
+    direction = "from" if from_import else "of"
+    if root in _BANNED_MODULES_DYNAMIC_LOADERS:
+        return f"refuses import {direction} the module '{root}' (dynamic code loading)"
+    if root in _BANNED_MODULES:
+        return f"refuses import {direction} the module '{root}' (banned module)"
+    return None
+
+
 def _screen_import(node: ast.Import | ast.ImportFrom) -> str | None:
     if isinstance(node, ast.Import):
         for alias in node.names:
-            root = alias.name.split(".")[0]
-            if root in _BANNED_MODULES_DYNAMIC_LOADERS:
-                return f"refuses import of '{alias.name}' (dynamic code loading)"
-            if root in _BANNED_MODULES:
-                return f"refuses import of '{alias.name}' (banned module)"
+            reason = _import_ban_reason(alias.name.split(".")[0], from_import=False)
+            if reason:
+                return reason
         return None
 
-    module_root = (node.module or "").split(".")[0]
-    if module_root in _BANNED_MODULES_DYNAMIC_LOADERS:
-        return f"refuses import from '{node.module}' (dynamic code loading)"
-    if module_root in _BANNED_MODULES:
-        return f"refuses import from '{node.module}' (banned module)"
-    return None
+    return _import_ban_reason((node.module or "").split(".")[0], from_import=True)
 
 
 def _screen_call(node: ast.Call) -> str | None:
