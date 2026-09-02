@@ -324,15 +324,29 @@ def test_generated_code_is_self_contained_no_risky_imports(tmp_path):
     Simulates an execution environment where os/subprocess/socket/importlib
     cannot be imported — generated code must not reach for them (ox-alpha
     F25/F26: helper namespace exec() is not contained).
+
+    Inspected on the AST (not by substring) so every import form is covered,
+    including ``from os import system``, which a plain ``"import os" not in
+    code`` check would miss.
     """
     strategy_ir = _sample_ir()
     code = generate_vectorbt_strategy_code(strategy_ir)
 
-    assert "import pandas" in code
-    for module in ("os", "subprocess", "socket", "importlib", "shutil", "sys"):
-        assert f"import {module}" not in code, (
-            f"Generated code imports {module!r}; only pandas may be imported\n\n{code}"
-        )
+    tree = ast.parse(code)
+    imported_roots: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported_roots.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                imported_roots.add(node.module.split(".")[0])
+
+    assert imported_roots <= {"__future__", "pandas"}, (
+        f"Generated code imports non-pandas modules "
+        f"{sorted(imported_roots - {'__future__', 'pandas'})}; only pandas "
+        "(plus the inert `from __future__ import annotations`) may be imported\n\n"
+        f"{code}"
+    )
 
 
 def test_generated_code_metadata_round_trips_quotes_and_backslashes():

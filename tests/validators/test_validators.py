@@ -186,6 +186,37 @@ def test_string_and_dunder_tricks_do_not_restore_execution():
         assert not result.passed, f"Validator accepted {payload!r}"
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        # Direct reflective-namespace lookup with a literal key.
+        "vars()['eval']('1+1')",
+        "globals()['__import__']('os')",
+        "locals()['exec']('x=1')",
+        # Computed key: the same bypass with an indirection the denylist
+        # cannot name.
+        "name = 'eval'\nvars()[name]('1+1')",
+    ],
+)
+def test_reflective_namespace_lookups_are_rejected(payload: str):
+    """vars()/globals()/locals()[...] resolve callables by computed name.
+
+    A denylist of call names cannot enumerate what is reachable through the
+    live namespace, so any subscript (literal or computed) on it is rejected
+    as a policy, regardless of the payload.
+    """
+    result = _result_for(payload + "\n" + _valid_strategy_code())
+    assert not result.passed, f"Validator accepted reflective lookup {payload!r}"
+    assert any("reflective" in error for error in result.errors), result.errors
+
+
+def test_harmless_subscripts_still_pass_after_reflective_policy():
+    """The reflective-namespace rejection must not criminalize normal code."""
+    code = "mapping = {'close': 1}\nvalue = mapping['close']\n" + _valid_strategy_code()
+    result = _result_for(code)
+    assert result.passed, result.errors
+
+
 # ─── BacktestResultValidator: numeric hygiene ────────────────────────────────
 
 

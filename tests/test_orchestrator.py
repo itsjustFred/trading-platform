@@ -136,11 +136,17 @@ def test_failed_layer_reports_its_counts(tmp_path):
     assert (result.passed, result.failed, result.skipped, result.errors) == (3, 2, 1, 0)
 
 
-def test_summary_marks_error_rows():
+def test_summary_marks_error_rows(capsys):
+    """M7: an ERROR row must reach the printed summary, not just the status."""
     results = [_result("unit")]
     results[0].errors = 1
 
     assert results[0].status == "ERROR"
+
+    orchestrator._print_summary(results)
+    output = capsys.readouterr().out
+    assert "ERROR" in output
+    assert results[0].layer in output
 
 
 def test_summary_prints_the_pytest_target_of_each_layer(capsys):

@@ -19,6 +19,13 @@ import pytest
 
 from shared.models import LiveDeploymentConfig, LiveExecution, LiveSignal
 
+# The reconcile-payload helpers below build real protobuf messages; without
+# the package every test in that block would fail on import rather than skip.
+pytest.importorskip(
+    "ctrader_open_api.messages.OpenApiModelMessages_pb2",
+    reason="ctrader-open-api package is not installed in this environment",
+)
+
 
 # ─── cTrader token refresh: re-auth + serialize + atomic persistence ──────────
 
@@ -258,17 +265,15 @@ def _make_reconcile_adapter(tmp_path: Path, response):
     """
     from live_runner.ctrader_adapter import CTraderLiveAdapter
 
-    try:
-        from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
-            ProtoOAPositionStatus,
-            ProtoOATradeSide,
-        )
-        from ctrader_open_api.messages.OpenApiMessages_pb2 import (
-            ProtoOAReconcileReq,
-            ProtoOAReconcileRes,
-        )
-    except ModuleNotFoundError:  # pragma: no cover - only when deps missing
-        pytest.skip("ctrader-open-api package is not installed in this environment")
+    # The module-level importorskip guarantees the protobuf package is here.
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAPositionStatus,
+        ProtoOATradeSide,
+    )
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAReconcileReq,
+        ProtoOAReconcileRes,
+    )
 
     adapter = CTraderLiveAdapter(
         app_id="app", app_secret="secret", access_token="token", account_id="123",

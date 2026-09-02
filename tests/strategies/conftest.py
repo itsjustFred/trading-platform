@@ -26,7 +26,7 @@ import pytest
 from shared.constants import DATA_DIR
 
 # Opt-in strict mode: missing local market data fails instead of skipping.
-FAIL_ON_MISSING_DATA = str(os.environ.get("FAIL_ON_MISSING_DATA", "")).strip() in {
+FAIL_ON_MISSING_DATA = str(os.environ.get("FAIL_ON_MISSING_DATA", "")).strip().lower() in {
     "1",
     "true",
     "yes",
@@ -211,10 +211,14 @@ def _covers_requested_period(symbol: str, timeframe: str, start: str, end: str) 
         return False
 
     # No hole between consecutive shards (a 1µs overlap tolerance absorbs
-    # inclusive end bounds).
-    for (prev_start, prev_end), (next_start, _next_end) in zip(extents, extents[1:]):
-        if next_start > prev_end + timedelta(microseconds=1):
+    # inclusive end bounds). The running maximum end guards against a shard
+    # that is fully contained in an earlier one, where a naive
+    # "previous end" comparison would accept a gap after the contained shard.
+    reach = extents[0][1]
+    for next_start, next_end in extents[1:]:
+        if next_start > reach + timedelta(microseconds=1):
             return False
+        reach = max(reach, next_end)
     return True
 
 
@@ -258,14 +262,19 @@ def _require_ohlcv_coverage(symbol: str, timeframe: str, start: str, end: str) -
         uncovered.append(f"dataset starts {extents[0][0].isoformat()}")
     if end_bound is not None and extents and extents[-1][1] < end_bound:
         uncovered.append(f"dataset ends {extents[-1][1].isoformat()}")
-    for (prev_start, prev_end, prev_label), (next_start, _n_end, next_label) in zip(
-        extents, extents[1:]
-    ):
-        if next_start > prev_end + timedelta(microseconds=1):
+    # Running-maximum reach (same rule as _covers_requested_period): guards
+    # against a shard fully contained in an earlier one, where a naive
+    # "previous end" comparison would accept a gap after the contained shard.
+    reach = extents[0][1]
+    reach_label = extents[0][2]
+    for next_start, next_end, next_label in extents[1:]:
+        if next_start > reach + timedelta(microseconds=1):
             uncovered.append(
-                f"gap between {prev_label} (ends {prev_end.isoformat()}) and "
+                f"gap between {reach_label} (ends {reach.isoformat()}) and "
                 f"{next_label} (starts {next_start.isoformat()})"
             )
+        reach = max(reach, next_end)
+        reach_label = next_label
 
     if uncovered:
         _data_gate_result(

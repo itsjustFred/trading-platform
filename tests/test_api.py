@@ -142,6 +142,12 @@ def isolated_viewer(monkeypatch, tmp_path):
 
     engine.dispose()
     viewer_main_module._BACKTEST_META_CACHE.clear()
+    # The seeded AAPL parquet must not leak into other test modules through
+    # the legacy viewer's per-(symbol, timeframe) frame cache.
+    import viewer.core as viewer_core_teardown
+
+    with viewer_core_teardown._OHLCV_DF_CACHE_LOCK:
+        viewer_core_teardown._OHLCV_DF_CACHE.pop(("AAPL", "1d"), None)
 
 
 @pytest.fixture
@@ -176,7 +182,7 @@ class TestStrategiesAPI:
         resp = client.get("/api/strategies")
         strategies = resp.json()
         assert strategies, "Strategy registry must not be empty"
-        target = next((item for item in strategies if item["slug"] == "example_sma"), None)
+        target = next((item for item in strategies if item.get("slug") == "example_sma"), None)
         assert target is not None, (
             f"example_sma missing from strategy list: "
             f"{[item.get('slug') for item in strategies]}"

@@ -32,6 +32,9 @@ class ValidationResult:
 class AICodeValidator:
     _FORBIDDEN_CALLS = {"eval", "exec", "getattr", "__import__"}
     _FORBIDDEN_ATTR_CALLS = {("os", "system"), ("os", "popen")}
+    # Calling through one of these hands back the live namespace and lets a
+    # payload reach any builtin by computed name (vars()['eval'](...)).
+    _REFLECTIVE_NAMESPACES = {"vars", "globals", "locals"}
     # Imports that have no business inside a strategy: any of these is a
     # hard error regardless of how it is called afterwards.
     _FORBIDDEN_IMPORTS = {
@@ -93,6 +96,11 @@ class AICodeValidator:
             elif isinstance(node, ast.Call):
                 if isinstance(node.func, ast.Name) and node.func.id in self._FORBIDDEN_CALLS:
                     errors.append(f"Forbidden call detected: {node.func.id}()")
+                if self._is_reflective_call(node.func):
+                    errors.append(
+                        "Forbidden reflective call: strategy code must not call "
+                        "through vars()/globals()/locals() namespaces"
+                    )
                 if (
                     isinstance(node.func, ast.Attribute)
                     and isinstance(node.func.value, ast.Name)
@@ -114,6 +122,29 @@ class AICodeValidator:
                 base = node.value
                 if isinstance(base, ast.Name) and base.id in self._FORBIDDEN_DUNDER_ATTRS:
                     errors.append(f"Forbidden dunder subscript: {base.id}[...]")
+                # Subscripting a reflective namespace (vars()['eval'],
+                # globals()[name]) resolves callables by computed name and
+                # bypasses every name-based check — rejected as a policy
+                # regardless of whether the key is a literal or an expression.
+                if self._is_reflective_call(base):
+                    errors.append(
+                        "Forbidden reflective namespace lookup: "
+                        "vars()/globals()/locals()[...] must not be used"
+                    )
+
+    def _is_reflective_call(self, node: ast.AST) -> bool:
+        """True when the expression calls vars()/globals()/locals().
+
+        These hand back the live module/frame namespace, so a call or lookup
+        through them (``vars()['eval'](...)``) is a denylist bypass by
+        construction. Rejected as a policy, the same way the dunder
+        indirections above are.
+        """
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in self._REFLECTIVE_NAMESPACES
+        )
 
     def _validate_import(self, node: ast.Import | ast.ImportFrom, errors: list[str]) -> None:
         if isinstance(node, ast.Import):
