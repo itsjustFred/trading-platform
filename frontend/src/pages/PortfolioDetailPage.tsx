@@ -362,11 +362,15 @@ export function PortfolioDetailPage() {
   };
 
   const setSortKey = (key: keyof PortfolioContribution) => {
-    setContributionSort((current) =>
-      current.key === key
-        ? { key, direction: current.direction === "asc" ? "desc" : "asc" }
-        : { key, direction: "desc" },
-    );
+    setContributionSort((current) => {
+      if (current.key !== key) {
+        return { key, direction: "desc" };
+      }
+      return {
+        key,
+        direction: current.direction === "asc" ? "desc" : "asc",
+      };
+    });
   };
 
   if (loading) {

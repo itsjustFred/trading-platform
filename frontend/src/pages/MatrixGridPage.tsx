@@ -626,6 +626,7 @@ export function MatrixGridPage() {
                 </select>
               ))}
               <button
+                type="button"
                 onClick={resetFilters}
                 className="rounded border border-border bg-surface2 px-3 py-2 text-xs text-text hover:text-blue"
               >

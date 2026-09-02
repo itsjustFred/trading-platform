@@ -906,8 +906,15 @@ function stringifyUnknownMetadata(value: unknown): string {
   return (JSON.stringify(value) ?? "").trim();
 }
 
+function signedUsdPrefix(value: number): string {
+  if (value > 0) {
+    return "+";
+  }
+  return value < 0 ? "-" : "";
+}
+
 function formatSignedUsd(value: number): string {
-  const sign = value > 0 ? "+" : value < 0 ? "-" : "";
+  const sign = signedUsdPrefix(value);
   return `${sign}$${Math.abs(value).toLocaleString("en-US", {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,

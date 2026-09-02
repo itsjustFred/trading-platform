@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, type CSSProperties } from "react";
 import { Modal } from "./Modal";
 import {
   getDataCheck,
@@ -30,7 +30,7 @@ function getModelingTimeframes(mainTf: string): string[] {
   const idx = TIMEFRAME_ORDER.indexOf(mainTf as (typeof TIMEFRAME_ORDER)[number]);
   if (idx < 0) return [];
   // Include all timeframes <= mainTf (the main TF itself plus all smaller ones)
-  return [...TIMEFRAME_ORDER.slice(0, idx + 1)];
+  return TIMEFRAME_ORDER.slice(0, idx + 1);
 }
 
 // Availability checks run one request per symbol; debounced so typing a symbol list
@@ -205,7 +205,7 @@ export function CreateBacktestModal({
       const parameterPayload: Record<string, number | string> = {};
       for (const [key, rawValue] of Object.entries(strategyParameters)) {
         if (parameterTypes[key] === "number") {
-          const parsed = parseFloat(rawValue);
+          const parsed = Number.parseFloat(rawValue);
           if (!Number.isFinite(parsed)) {
             setError(`Parameter '${key}' must be a valid number`);
             setRunning(false);
@@ -217,7 +217,7 @@ export function CreateBacktestModal({
         }
       }
 
-      const leverageValue = parseFloat(maxLeverage);
+      const leverageValue = Number.parseFloat(maxLeverage);
       if (!Number.isFinite(leverageValue) || leverageValue <= 0) {
         setError("Max leverage must be a positive number");
         setRunning(false);
@@ -231,8 +231,8 @@ export function CreateBacktestModal({
         timeframe,
         start,
         end,
-        capital: parseFloat(capital),
-        risk_per_trade_pct: riskPct ? parseFloat(riskPct) / 100 : undefined,
+        capital: Number.parseFloat(capital),
+        risk_per_trade_pct: riskPct ? Number.parseFloat(riskPct) / 100 : undefined,
         max_leverage: leverageValue,
         modeling_resolution: modelingResolution,
         parameters: parameterPayload,
@@ -270,27 +270,14 @@ export function CreateBacktestModal({
     marginBottom: "4px",
   };
 
-  const engineBadgeStyle: React.CSSProperties = {
+  const engineBadgeStyle: CSSProperties = {
     display: "inline-block",
     padding: "4px 10px",
     borderRadius: "4px",
     fontSize: "0.78rem",
     fontWeight: 600,
     letterSpacing: "0.5px",
-    background:
-      engine === "pynecore"
-        ? "rgba(163,113,247,0.15)"
-        : engine === "native"
-          ? "rgba(63,185,80,0.16)"
-          : "rgba(88,166,255,0.12)",
-    color: engine === "pynecore" ? "#a371f7" : engine === "native" ? "#3fb950" : "#58a6ff",
-    border: `1px solid ${
-      engine === "pynecore"
-        ? "rgba(163,113,247,0.3)"
-        : engine === "native"
-          ? "rgba(63,185,80,0.35)"
-          : "rgba(88,166,255,0.25)"
-    }`,
+    ...ENGINE_BADGE_TONES[engine] ?? ENGINE_BADGE_TONES.default,
   };
 
   return (
@@ -555,6 +542,7 @@ export function CreateBacktestModal({
 
         {/* Run button */}
         <button
+          type="button"
           onClick={handleRun}
           disabled={running || !strategy || symbolList.length === 0}
           style={{

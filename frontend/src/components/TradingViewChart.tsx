@@ -703,7 +703,7 @@ export function TradingViewChart({
         axisLabelVisible: true,
         title: "Entry",
       });
-      const fallbackExit = activeTrade.exits?.[activeTrade.exits.length - 1];
+      const fallbackExit = activeTrade.exits?.at(-1);
       const exitPrice = fallbackExit?.price ?? activeTrade.exit_price;
       if (exitPrice !== undefined && Number.isFinite(exitPrice)) {
         exitPriceLineRef.current = candleSeries.createPriceLine({

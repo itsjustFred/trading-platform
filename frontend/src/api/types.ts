@@ -307,10 +307,9 @@ export interface OptimizationTrial {
   train_stats: OptimizationTrainStat;
 }
 
-export type OptimizationTrainStat = Record<
-  string,
-  number | string | boolean | null
->;
+export type OptimizationStatValue = number | string | boolean | null;
+export type OptimizationStatMap = Record<string, OptimizationStatValue>;
+export type OptimizationTrainStat = OptimizationStatMap;
 
 export interface OptimizationSummary {
   id: string;
@@ -330,7 +329,7 @@ export interface OptimizationSummary {
   train_period: OptimizationPeriod;
   test_period: OptimizationPeriod;
   train_stats: OptimizationTrainStat;
-  test_stats: Record<string, number | string | boolean | null>;
+  test_stats: OptimizationStatMap;
 }
 
 export interface OptimizationDetail {
@@ -360,7 +359,7 @@ export interface OptimizationDetail {
   train_period: OptimizationPeriod;
   test_period: OptimizationPeriod;
   train_stats: OptimizationTrainStat;
-  test_stats: Record<string, number | string | boolean | null>;
+  test_stats: OptimizationStatMap;
   top_trials: OptimizationTrial[];
 }
 

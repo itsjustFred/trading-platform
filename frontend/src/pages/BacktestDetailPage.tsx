@@ -67,7 +67,8 @@ function normalizeEquityPoints(
 
   const deduped: EquityPoint[] = [];
   for (const point of normalized) {
-    if (deduped.length > 0 && deduped.at(-1)?.time === point.time) {
+    const last = deduped.at(-1);
+    if (last && last.time === point.time) {
       deduped[deduped.length - 1] = point;
       continue;
     }

@@ -41,6 +41,18 @@ function stringifyServiceConfigValue(value: unknown): string {
   return JSON.stringify(value) ?? "";
 }
 
+/** Meta line for a Discord bot service card. */
+function discordMetaLine(channelId: string, lastActivity: string): string {
+  const channel = channelId ? `#${channelId}` : "—";
+  return `Channel: ${channel} · Last Signal: ${lastActivity}`;
+}
+
+/** Meta line for a cron-scheduled service card. */
+function scheduleMetaLine(cron: string, lastActivity: string): string {
+  const schedule = cron || "—";
+  return `Schedule: ${schedule} · Next Run: cron-based · Last Run: ${lastActivity}`;
+}
+
 export function ServicesPage() {
   const { showToast } = useToast();
   const servicesQuery = useServices();
@@ -291,6 +303,10 @@ export function ServicesPage() {
             const channelId = stringifyServiceConfigValue(
               service.config?.channel_id,
             );
+            const metaLine =
+              service.type === "discord_bot"
+                ? discordMetaLine(channelId, relativeTime(service.last_activity))
+                : scheduleMetaLine(cron, relativeTime(service.last_activity));
             return (
               <div key={service.id} style={serviceCardStyle}>
                 <div
@@ -306,11 +322,7 @@ export function ServicesPage() {
                       {service.type === "discord_bot" ? "Discord Bot: " : ""}
                       {service.name}
                     </div>
-                    <div style={metaLineStyle}>
-                      {service.type === "discord_bot"
-                        ? `Channel: ${channelId ? `#${channelId}` : "—"} · Last Signal: ${relativeTime(service.last_activity)}`
-                        : `Schedule: ${cron || "—"} · Next Run: cron-based · Last Run: ${relativeTime(service.last_activity)}`}
-                    </div>
+                    <div style={metaLineStyle}>{metaLine}</div>
                   </div>
                   <div
                     style={{

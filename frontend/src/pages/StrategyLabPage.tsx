@@ -39,11 +39,10 @@ const PROVIDER_OPTIONS: Array<{ label: string; value: AgentProviderId }> = [
   { label: "GitHub Copilot SDK", value: "copilot_sdk" },
 ];
 
-type AgentProvider = "nim" | string;
 
 /** Picks the effective model for the selected conversion provider. */
 function resolveAgentModel(
-  provider: AgentProvider,
+  provider: AgentProviderId,
   model: string,
   customModel: string,
 ): string | undefined {
@@ -68,7 +67,7 @@ function agentRunStatusLine(
 
 /** Renders the parenthesized model suffix for the copy block. */
 function agentModelSuffix(
-  provider: AgentProvider,
+  provider: AgentProviderId,
   model: string,
   customModel: string,
 ): string {

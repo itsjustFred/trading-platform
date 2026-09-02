@@ -211,18 +211,24 @@ function deriveValidation(
   return "OK";
 }
 
-function minDate(values: Array<string | null | undefined>) {
+function boundDate(
+  values: Array<string | null | undefined>,
+  pick: "first" | "last",
+): string | null {
   const filtered = values.filter((value): value is string => Boolean(value));
-  return filtered.length > 0
-    ? [...filtered].sort((a, b) => a.localeCompare(b))[0]
-    : null;
+  if (filtered.length === 0) {
+    return null;
+  }
+  const sorted = filtered.sort((a, b) => a.localeCompare(b));
+  return pick === "first" ? sorted[0] : sorted.at(-1) ?? null;
+}
+
+function minDate(values: Array<string | null | undefined>) {
+  return boundDate(values, "first");
 }
 
 function maxDate(values: Array<string | null | undefined>) {
-  const filtered = values.filter((value): value is string => Boolean(value));
-  return filtered.length > 0
-    ? [...filtered].sort((a, b) => a.localeCompare(b))[filtered.length - 1]
-    : null;
+  return boundDate(values, "last");
 }
 
 function formatDateLabel(dateValue: string | null | undefined) {
