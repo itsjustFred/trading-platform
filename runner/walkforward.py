@@ -286,20 +286,20 @@ def run_walkforward(
         # folds must always receive IDENTICAL sizing/context parameters — a
         # parameter added here must not silently reach only one of the two
         # calls (otherwise OOS folds run with different sizing than IS).
-        fold_kwargs = dict(
-            engine=engine,
-            strategy=strategy,
-            strategy_name=strategy_name,
-            symbols=symbols,
-            timeframe=normalized_timeframe,
-            capital=capital,
-            risk_pct=risk_pct,
-            max_position_exposure_pct=max_position_exposure_pct,
-            max_leverage=max_leverage,
-            modeling_resolution=modeling_resolution,
-            data_dir=data_dir,
-            parameters=parameters,
-        )
+        fold_kwargs = {
+            "engine": engine,
+            "strategy": strategy,
+            "strategy_name": strategy_name,
+            "symbols": symbols,
+            "timeframe": normalized_timeframe,
+            "capital": capital,
+            "risk_pct": risk_pct,
+            "max_position_exposure_pct": max_position_exposure_pct,
+            "max_leverage": max_leverage,
+            "modeling_resolution": modeling_resolution,
+            "data_dir": data_dir,
+            "parameters": parameters,
+        }
         train_stats = _run_fold_backtest(
             start=window["train_start"], end=window["train_end"], **fold_kwargs
         )
