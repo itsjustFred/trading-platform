@@ -628,9 +628,9 @@ def _assemble_tick_dataframe(
             all_ticks.extend(ticks)
 
     if not all_ticks:
-        return pd.DataFrame(columns=["timestamp", "ask", "bid", "ask_vol", "bid_vol"])
+        return pd.DataFrame(columns=MERGED_TICK_COLUMNS)
 
-    df = pd.DataFrame(all_ticks, columns=["timestamp", "ask", "bid", "ask_vol", "bid_vol"])
+    df = pd.DataFrame(all_ticks, columns=MERGED_TICK_COLUMNS)
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
     return df.sort_values("timestamp").reset_index(drop=True)
 
@@ -917,9 +917,7 @@ async def _download_and_assemble_merged_ticks(
     shared_df = _assemble_tick_dataframe(bi5_results, decimal_factor)
 
     if shared_df.empty:
-        return pd.DataFrame(
-            columns=["timestamp", "ask", "bid", "ask_vol", "bid_vol"]
-        )
+        return pd.DataFrame(columns=MERGED_TICK_COLUMNS)
 
     bid_df, ask_df = _split_tick_sides(shared_df)
     _report_progress(report_progress, 95.0, "Merging bid/ask data")
