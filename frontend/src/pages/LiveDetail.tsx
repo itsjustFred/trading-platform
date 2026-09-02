@@ -758,7 +758,7 @@ interface RealizedStats {
 }
 
 /** Folds a fill into an existing position, returning realized PnL from any closed part. */
-function applyFillToPosition(
+export function applyFillToPosition(
   positions: Map<string, PositionState>,
   symbol: string,
   delta: number,

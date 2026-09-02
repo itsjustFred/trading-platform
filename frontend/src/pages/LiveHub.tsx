@@ -38,6 +38,7 @@ import type {
   StrategyMeta,
 } from "../api/types";
 import { useToast } from "../components/ToastProvider";
+import { applyFillToPosition } from "./LiveDetail";
 
 type DeploymentCard = LiveDeploymentConfig & {
   broker: LiveAccount["broker"] | "unknown";
@@ -502,7 +503,7 @@ export function LiveHubPage() {
     }
   }, [refreshDeployments, showToast]);
 
-  const handleCreateDeployment = async (event: React.FormEvent<HTMLFormElement>) => {
+  const handleCreateDeployment = async (event: React.SubmitEvent<HTMLFormElement>) => {
     event.preventDefault();
     const strategyName = createForm.strategy_name.trim();
     const timeframe = createForm.timeframe.trim() || DEFAULT_TIMEFRAME;
@@ -513,12 +514,12 @@ export function LiveHubPage() {
       .filter(Boolean);
     const sourceId = createForm.signal_source_id.trim();
     const selectedProcessor = createForm.signal_processor.trim().toLowerCase();
-    const symbols =
-      symbolFilter.length > 0
-        ? symbolFilter
-        : createForm.signal_source === "discord"
-          ? ["*"]
-          : [];
+    let symbols: string[] = [];
+    if (symbolFilter.length > 0) {
+      symbols = symbolFilter;
+    } else if (createForm.signal_source === "discord") {
+      symbols = ["*"];
+    }
 
     if (createForm.signal_source === "internal" && !strategyName) {
       showToast("Please enter a strategy name.", "warning");
@@ -565,15 +566,11 @@ export function LiveHubPage() {
         signal_source_id: createForm.signal_source === "discord" ? sourceId : undefined,
         symbol_filter: symbolFilter,
         signal_source: createForm.signal_source,
-        signal_config:
-          createForm.signal_source === "discord"
-            ? {
-                service_name: sourceId,
-                ...(selectedProcessor ? { signal_processor: selectedProcessor } : {}),
-              }
-            : selectedProcessor
-              ? { signal_processor: selectedProcessor }
-              : {},
+        signal_config: buildSignalConfig(
+          createForm.signal_source,
+          sourceId,
+          selectedProcessor,
+        ),
         settings: settingsPayload,
       });
       setCreateOpenAccountId("");
@@ -636,7 +633,7 @@ export function LiveHubPage() {
     void refreshSignalProcessors();
   };
 
-  const handleStartSignalReplay = async (event: React.FormEvent<HTMLFormElement>) => {
+  const handleStartSignalReplay = async (event: React.SubmitEvent<HTMLFormElement>) => {
     event.preventDefault();
     const accountId = replayForm.account_id.trim();
     if (!accountId) {
@@ -713,7 +710,7 @@ export function LiveHubPage() {
       >
         <form onSubmit={handleCreateDeployment} style={{ display: "grid", gap: "12px" }}>
           <label style={fieldLabelStyle}>
-            Account
+            Account{" "}
             <select
               value={createForm.account_id}
               onChange={(event) =>
@@ -734,7 +731,7 @@ export function LiveHubPage() {
           </label>
 
           <label style={fieldLabelStyle}>
-            Strategy
+            Strategy{" "}
             <select
               value={createForm.strategy_name}
               onChange={(event) =>
@@ -782,7 +779,7 @@ export function LiveHubPage() {
                       signal_source_id: current.signal_source_id || discordServices[0]?.name || "",
                     }))
                   }
-                />
+                />{" "}
                 Discord Bot
               </label>
               <label style={{ display: "flex", alignItems: "center", gap: "8px", cursor: "pointer" }}>
@@ -796,7 +793,7 @@ export function LiveHubPage() {
                       signal_source: "internal",
                     }))
                   }
-                />
+                />{" "}
                 Internal Strategy
               </label>
             </div>
@@ -804,7 +801,7 @@ export function LiveHubPage() {
 
           {createForm.signal_source === "discord" ? (
             <label style={fieldLabelStyle}>
-              Discord Bot
+              Discord Bot{" "}
               <select
                 value={createForm.signal_source_id}
                 onChange={(event) =>
@@ -829,7 +826,7 @@ export function LiveHubPage() {
           ) : null}
 
           <label style={fieldLabelStyle}>
-            Signal Processor (optional)
+            Signal Processor (optional){" "}
             <select
               value={createForm.signal_processor}
               onChange={(event) =>
@@ -852,7 +849,7 @@ export function LiveHubPage() {
           </label>
 
           <label style={fieldLabelStyle}>
-            Timeframe
+            Timeframe{" "}
             <select
               value={createForm.timeframe}
               onChange={(event) =>
@@ -888,7 +885,7 @@ export function LiveHubPage() {
           </label>
 
           <label style={fieldLabelStyle}>
-            Settings (JSON)
+            Settings (JSON){" "}
             <textarea
               value={createForm.settings_json}
               onChange={(event) =>
@@ -937,7 +934,7 @@ export function LiveHubPage() {
       >
         <form onSubmit={handleStartSignalReplay} style={{ display: "grid", gap: "12px" }}>
           <label style={fieldLabelStyle}>
-            Account
+            Account{" "}
             <select
               value={replayForm.account_id}
               onChange={(event) =>
@@ -959,7 +956,7 @@ export function LiveHubPage() {
 
           <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: "10px" }}>
             <label style={fieldLabelStyle}>
-              Start Date
+              Start Date{" "}
               <input
                 type="date"
                 value={replayForm.start_date}
@@ -974,7 +971,7 @@ export function LiveHubPage() {
               />
             </label>
             <label style={fieldLabelStyle}>
-              End Date
+              End Date{" "}
               <input
                 type="date"
                 value={replayForm.end_date}
@@ -991,7 +988,7 @@ export function LiveHubPage() {
           </div>
 
           <label style={fieldLabelStyle}>
-            Signal Processor (optional)
+            Signal Processor (optional){" "}
             <select
               value={replayForm.signal_processor}
               onChange={(event) =>
@@ -1014,7 +1011,7 @@ export function LiveHubPage() {
           </label>
 
           <label style={fieldLabelStyle}>
-            Replay Timeframe
+            Replay Timeframe{" "}
             <select
               value={replayForm.timeframe}
               onChange={(event) =>
@@ -1041,7 +1038,7 @@ export function LiveHubPage() {
               alignItems: "center",
             }}
           >
-            Auto-download missing OHLCV
+            Auto-download missing OHLCV{" "}
             <input
               type="checkbox"
               checked={replayForm.auto_download}
@@ -1168,19 +1165,22 @@ export function LiveHubPage() {
         </div>
       </div>
 
-      {loading ? (
+      {loading && (
         <div style={{ color: "var(--color-text-muted)", textAlign: "center", padding: "48px 0" }}>
           Loading live deployments...
         </div>
-      ) : error ? (
+      )}
+      {!loading && error && (
         <div style={{ color: "var(--color-red)", textAlign: "center", padding: "48px 0" }}>
           Error: {error}
         </div>
-      ) : accounts.length === 0 ? (
+      )}
+      {!loading && !error && accounts.length === 0 && (
         <div style={{ color: "var(--color-text-muted)", textAlign: "center", padding: "48px 0" }}>
           No broker accounts discovered.
         </div>
-      ) : (
+      )}
+      {!loading && !error && accounts.length > 0 && (
         <div
           style={{
             display: "grid",
@@ -1500,31 +1500,72 @@ const telemetryValueStyle: React.CSSProperties = {
   color: "#e2e8f0",
 };
 
+const WIN_RATE_TONES = {
+  strong: {
+    border: "1px solid rgba(34, 197, 94, 0.34)",
+    background: "rgba(34, 197, 94, 0.14)",
+    color: "#86efac",
+  },
+  weak: {
+    border: "1px solid rgba(248, 113, 113, 0.34)",
+    background: "rgba(248, 113, 113, 0.14)",
+    color: "#fecaca",
+  },
+  neutral: {
+    border: "1px solid rgba(148, 163, 184, 0.35)",
+    background: "rgba(148, 163, 184, 0.14)",
+    color: "#cbd5e1",
+  },
+} as const;
+
+type SignalConfigPayload = Record<string, string>;
+
+/** Builds the per-source signal config for a new deployment. */
+function buildSignalConfig(
+  source: string,
+  sourceId: string,
+  selectedProcessor: string,
+): SignalConfigPayload {
+  const config: SignalConfigPayload = {};
+  if (source === "discord") {
+    config.service_name = sourceId;
+  }
+  if (selectedProcessor) {
+    config.signal_processor = selectedProcessor;
+  }
+  return config;
+}
+
+function winRateTone(rate: number): keyof typeof WIN_RATE_TONES {
+  if (rate >= 55) {
+    return "strong";
+  }
+  if (rate <= 45) {
+    return "weak";
+  }
+  return "neutral";
+}
+
 function winRateBadgeStyle(rate: number): React.CSSProperties {
-  const isStrong = rate >= 55;
-  const isWeak = rate <= 45;
   return {
     justifySelf: "start",
     borderRadius: "999px",
     padding: "2px 8px",
     fontSize: "0.72rem",
     fontWeight: 700,
-    border: isStrong
-      ? "1px solid rgba(34, 197, 94, 0.34)"
-      : isWeak
-        ? "1px solid rgba(248, 113, 113, 0.34)"
-        : "1px solid rgba(148, 163, 184, 0.35)",
-    background: isStrong
-      ? "rgba(34, 197, 94, 0.14)"
-      : isWeak
-        ? "rgba(248, 113, 113, 0.14)"
-        : "rgba(148, 163, 184, 0.14)",
-    color: isStrong ? "#86efac" : isWeak ? "#fecaca" : "#cbd5e1",
+    ...WIN_RATE_TONES[winRateTone(rate)],
   };
 }
 
+function signedUsdPrefix(value: number): string {
+  if (value > 0) {
+    return "+";
+  }
+  return value < 0 ? "-" : "";
+}
+
 function formatSignedUsd(value: number): string {
-  const sign = value > 0 ? "+" : value < 0 ? "-" : "";
+  const sign = signedUsdPrefix(value);
   return `${sign}$${Math.abs(value).toLocaleString("en-US", {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
@@ -1581,14 +1622,17 @@ function calculateRealizedTradeStats(trades: LiveTradeSlippage[]): {
   losingTrades: number;
 } {
   const positions = new Map<string, { qty: number; avg: number }>();
-  let totalPnl = 0;
-  let winningTrades = 0;
-  let losingTrades = 0;
+  const stats = { totalPnl: 0, winningTrades: 0, losingTrades: 0 };
 
   const orderedTrades = [...trades].sort((a, b) => a.execution_time - b.execution_time);
   for (const trade of orderedTrades) {
     const action = String(trade.action || "").toLowerCase();
-    const direction = action === "buy" ? 1 : action === "sell" ? -1 : 0;
+    let direction = 0;
+    if (action === "buy") {
+      direction = 1;
+    } else if (action === "sell") {
+      direction = -1;
+    }
     if (direction === 0) {
       continue;
     }
@@ -1600,49 +1644,13 @@ function calculateRealizedTradeStats(trades: LiveTradeSlippage[]): {
     }
 
     const symbol = String(trade.symbol || "UNKNOWN").toUpperCase();
-    const delta = quantity * direction;
-    const current = positions.get(symbol) ?? { qty: 0, avg: 0 };
-    const currentQty = current.qty;
-    const currentAvg = current.avg;
-
-    if (currentQty === 0) {
-      positions.set(symbol, { qty: delta, avg: price });
-      continue;
-    }
-
-    if (currentQty * delta > 0) {
-      const combinedQty = Math.abs(currentQty) + Math.abs(delta);
-      const nextAvg =
-        combinedQty > 0
-          ? ((Math.abs(currentQty) * currentAvg) + (Math.abs(delta) * price)) / combinedQty
-          : price;
-      positions.set(symbol, { qty: currentQty + delta, avg: nextAvg });
-      continue;
-    }
-
-    const closedQty = Math.min(Math.abs(currentQty), Math.abs(delta));
-    if (closedQty > 0) {
-      const sideSign = currentQty > 0 ? 1 : -1;
-      const realized = (price - currentAvg) * closedQty * sideSign;
-      totalPnl += realized;
-      if (realized > 0) {
-        winningTrades += 1;
-      } else if (realized < 0) {
-        losingTrades += 1;
-      }
-    }
-
-    const newQty = currentQty + delta;
-    if (newQty === 0) {
-      positions.set(symbol, { qty: 0, avg: 0 });
-    } else if (currentQty * newQty > 0) {
-      positions.set(symbol, { qty: newQty, avg: currentAvg });
-    } else {
-      positions.set(symbol, { qty: newQty, avg: price });
-    }
+    const fillStats = applyFillToPosition(positions, symbol, quantity * direction, price);
+    stats.totalPnl += fillStats.totalPnl;
+    stats.winningTrades += fillStats.winningTrades;
+    stats.losingTrades += fillStats.losingTrades;
   }
 
-  return { totalPnl, winningTrades, losingTrades };
+  return stats;
 }
 
 
