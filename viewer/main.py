@@ -8530,6 +8530,91 @@ def _backtest_compare_payload(backtest_id: str) -> dict[str, Any]:
     }
 
 
+def _finalize_backtest_run(
+    *,
+    task_id: str,
+    handle: Any,
+    returncode: int,
+    output_path: str,
+    backtest_id: str,
+    latest_message: str,
+    report_stage: Callable[..., None],
+) -> None:
+    """Record completion or failure of a backtest runner process."""
+    if returncode != 0:
+        error_text = latest_message or f"Backtest command exited with code {returncode}"
+        _write_task_log_line(
+            handle,
+            task_id,
+            f"[{_task_timestamp()}] Backtest failed: {error_text}",
+            stream="stderr",
+            log_level="error",
+            source="backtest",
+            ingest_task_progress=False,
+        )
+        _mark_task_finished(
+            task_id,
+            status="failed",
+            returncode=returncode,
+            error=error_text,
+        )
+        _running_jobs[task_id]["status"] = "failed"
+        _running_jobs[task_id]["result"] = None
+        _running_jobs[task_id]["error"] = error_text
+        return
+
+    report_stage(handle, percent=96.0, message=SAVING_RESULTS_MESSAGE)
+    result_payload = {
+        "output_path": output_path or None,
+        "backtest_id": backtest_id or None,
+    }
+    compact_result = {key: value for key, value in result_payload.items() if value}
+    final_trade_count = _count_backtest_trades(backtest_id, latest_message)
+    _upsert_backtest_meta_cache(backtest_id or "")
+    _update_task_fields(task_id, result=compact_result)
+    report_stage(
+        handle,
+        percent=100.0,
+        message=f"Completed - {final_trade_count} trades found",
+    )
+    _write_task_log_line(
+        handle,
+        task_id,
+        f"[{_task_timestamp()}] Backtest completed successfully.",
+        stream="task",
+        source="backtest",
+        ingest_task_progress=False,
+    )
+    _mark_task_finished(task_id, status="completed", returncode=0)
+    _running_jobs[task_id]["status"] = "completed"
+    _running_jobs[task_id]["result"] = compact_result
+    _running_jobs[task_id]["error"] = None
+
+
+def _consume_backtest_line(
+    line: str,
+    *,
+    output_path: str,
+    backtest_id: str,
+) -> tuple[str, tuple[float, str] | None, str, str] | None:
+    """Parse one runner stdout line.
+
+    Returns ``(message, stage, output_path, backtest_id)`` or ``None`` when the
+    line carries no usable message.
+    """
+    parsed_message = _backtest_runner_log_message(line)
+    if not parsed_message:
+        return None
+    stage = _backtest_runner_stage(parsed_message)
+    if parsed_message.lower().startswith("saved to:"):
+        output_path, backtest_id = _update_saved_backtest(
+            parsed_message[len(SAVED_TO_PREFIX):].strip(),
+            output_path,
+            backtest_id,
+        )
+    return parsed_message, stage, output_path, backtest_id
+
+
 def _backtest_runner_log_message(raw_line: str) -> str:
     text = str(raw_line or "").strip()
     if not text:
@@ -8812,11 +8897,15 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
                                 source="backtest",
                                 ingest_task_progress=False,
                             )
-                        parsed_message = _backtest_runner_log_message(line)
-                        if not parsed_message:
+                        outcome = _consume_backtest_line(
+                            line,
+                            output_path=output_path,
+                            backtest_id=backtest_id,
+                        )
+                        if outcome is None:
                             continue
+                        parsed_message, stage, output_path, backtest_id = outcome
                         latest_message = parsed_message
-                        stage = _backtest_runner_stage(parsed_message)
                         if stage is not None:
                             percent, message = stage
                             report_stage(handle, percent=percent, message=message)
