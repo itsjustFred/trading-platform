@@ -385,7 +385,7 @@ def find_internal_gaps(
     bounds.sort(key=lambda item: item[0])
     for (_, previous_end, _), (next_start, _, _) in zip(bounds, bounds[1:]):
         gap_days = (next_start - previous_end).total_seconds() / 86_400
-        if gap_days > 0:
+        if gap_days > threshold_days:
             gaps.append(
                 InternalGap(
                     start=previous_end.date().isoformat(),

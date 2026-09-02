@@ -72,28 +72,30 @@ class TestDownloadResultContract:
         assert not result.path.is_dir()
 
     def test_jforex_merged_download_reports_file_not_directory(self, tmp_path):
-        """JForex bid/ask merges store two parquets; the result must point at a
-        real file path, not the symbol directory."""
+        """JForex bid/ask merges store two parquets; the result path decision
+        must point at the stored bid file, never the symbol directory."""
+        from data_tools.downloaders.jforex_dl import merged_result_path
 
         symbol_dir = tmp_path / "ohlcv" / "jforex" / "forex" / "EURUSD"
         symbol_dir.mkdir(parents=True)
         bid_path = symbol_dir / "1h_bid.parquet"
-        ask_path = symbol_dir / "1h_ask.parquet"
         frame = pd.DataFrame(
             {"timestamp": pd.to_datetime(["2024-01-01T00:00:00Z"], utc=True), "close": [1.0]}
         )
         frame.to_parquet(bid_path, index=False)
-        frame.to_parquet(ask_path, index=False)
 
-        # The downloader sets path = out_path.parent (the directory) for merges.
-        # Rebuild that decision point to assert the contract the fix must keep.
-        out_path = bid_path
-        output_path = out_path.parent  # <- the buggy value
-        assert output_path.is_dir(), "precondition: current code returns the directory"
+        resolved = merged_result_path(bid_path)
+        assert resolved.is_file()
+        assert not resolved.is_dir()
+        assert resolved == bid_path
 
-        # The fix: a merged download reports one of the real stored files.
-        fixed_path = bid_path
-        assert fixed_path.is_file()
+    def test_jforex_merged_result_path_fails_closed_when_missing(self, tmp_path):
+        """A partial merge (bid parquet absent) must not report a path."""
+        from data_tools.downloaders.jforex_dl import merged_result_path
+
+        with pytest.raises(RuntimeError, match="did not store"):
+            merged_result_path(tmp_path / "ohlcv" / "jforex" / "forex" / "EURUSD"
+                               / "1h_bid.parquet")
 
 
 class TestSourceMetaAtomicity:
@@ -334,11 +336,15 @@ class TestAtomicWriteTargetValidation:
         with pytest.raises(ValueError, match="traverse upward"):
             atomic_replace(tmp_path / "sub" / ".." / "evil.parquet", lambda _p: None)
 
-    def test_write_rejects_relative_path(self):
+    def test_write_anchors_relative_path_to_cwd(self, tmp_path, monkeypatch):
         from shared.atomic_io import atomic_replace
 
-        with pytest.raises(ValueError, match="absolute path"):
-            atomic_replace(Path("relative/catalog.json"), lambda _p: None)
+        # CLI callers (resample --output, catalog_builder --output) pass
+        # relative paths; they are anchored to the working directory.
+        monkeypatch.chdir(tmp_path)
+        target = Path("out/catalog.json")
+        atomic_replace(target, lambda p: p.write_text("ok"))
+        assert (tmp_path / "out" / "catalog.json").read_text() == "ok"
 
     def test_write_rejects_symlinked_parent_escape(self, tmp_path):
         from shared.atomic_io import atomic_replace

@@ -18,23 +18,25 @@ T = TypeVar("T")
 
 # Sonar S8707 flags filesystem sinks fed by user-influenced values. The
 # validation below is the required "validate the constructed path before
-# accessing the file system": an absolute target with no ``..`` components
+# accessing the file system": an anchored target with no ``..`` components
 # and no symlinked ancestor that escapes the intended directory. Relative
-# paths are resolved against the configured data directory so a caller
-# cannot be tricked into writing outside it via crafted components.
+# paths are anchored to the process working directory (CLI callers such as
+# ``resample --output out/`` or ``catalog_builder --output catalog.json``
+# pass relative paths), then resolved so crafted components cannot make the
+# write land outside the caller's intent.
 
 
 def _validated_target(path: Path) -> Path:
     """Validate the write target before any filesystem access (Sonar S8707).
 
-    Rejects relative paths (they must be anchored by the caller), ``..``
-    traversal components, and symlinked parents that redirect the write
+    Anchors relative paths against the current working directory, then rejects
+    ``..`` traversal components and symlinked parents that redirect the write
     outside the directory the caller named.
     """
-    resolved = Path(path).expanduser()
-    if not resolved.is_absolute():
-        raise ValueError(f"atomic writes require an absolute path, got: {resolved!s}")
-    if ".." in Path(path).parts or ".." in resolved.parts:
+    raw = Path(path).expanduser()
+    resolved = raw if raw.is_absolute() else Path.cwd() / raw
+    resolved = Path(os.path.normpath(resolved))
+    if ".." in raw.parts or ".." in resolved.parts:
         raise ValueError(f"atomic write target must not traverse upward: {resolved}")
     # A symlinked directory could redirect the write outside the intended
     # tree; resolving the parent (which follows symlinks) and requiring it to
@@ -55,8 +57,9 @@ def atomic_replace(path: Path, writer: Callable[[Path], T]) -> T:
     stays on one filesystem. If ``writer`` raises (or the process dies), the
     previous file is untouched and the temporary file is removed.
 
-    The target path is validated (:func:`_validated_target`): absolute, no
-    ``..`` traversal, no symlinked parent redirecting the write elsewhere.
+    The target path is validated (:func:`_validated_target`): anchored and
+    normalized, no ``..`` traversal, no symlinked parent redirecting the
+    write elsewhere.
     """
     resolved = _validated_target(path)
     resolved.parent.mkdir(parents=True, exist_ok=True)

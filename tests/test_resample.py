@@ -198,4 +198,4 @@ class TestResampleMerge:
 
         assert observed["path"] != outputs[0], "resample target must be written via temp file"
         assert len(pd.read_parquet(outputs[0])) == 2
-        assert not list(tmp_path.glob("*.tmp-*")), "no temp files left behind"
+        assert not list(tmp_path.rglob("*.tmp-*")), "no temp files left behind"
