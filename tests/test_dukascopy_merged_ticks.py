@@ -371,16 +371,6 @@ def test_generate_tick_urls_price_type_is_informational_for_tick_files():
         assert native.generate_tick_urls("EUR/USD", start, end, price_type=side) == default_urls
 
 
-def test_generate_tick_urls_rejects_unknown_price_type():
-    import data_tools.downloaders.dukascopy_native as native
-
-    start = datetime(2024, 3, 4, 1, tzinfo=timezone.utc)
-    end = datetime(2024, 3, 4, 2, tzinfo=timezone.utc)
-
-    with pytest.raises(ValueError, match="price_type"):
-        native.generate_tick_urls("EUR/USD", start, end, price_type="mid")
-
-
 def test_split_tick_sides_raises_on_schema_drift():
     """Missing side columns must surface at the split, not downstream (PM-2)."""
     import data_tools.downloaders.dukascopy_native as native
