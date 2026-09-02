@@ -8530,6 +8530,52 @@ def _backtest_compare_payload(backtest_id: str) -> dict[str, Any]:
     }
 
 
+def _backtest_runner_log_message(raw_line: str) -> str:
+    text = str(raw_line or "").strip()
+    if not text:
+        return ""
+    try:
+        payload_json = json.loads(text)
+    except json.JSONDecodeError:
+        return text
+
+    if isinstance(payload_json, dict):
+        message = payload_json.get("message")
+        if isinstance(message, str) and message.strip():
+            return message.strip()
+    return text
+
+
+def _backtest_runner_stage(message: str) -> tuple[float, str] | None:
+    normalized = message.lower()
+    if normalized.startswith("progress:"):
+        payload = message.split(":", 2)
+        if len(payload) == 3:
+            try:
+                percent = float(payload[1])
+            except ValueError:
+                return None
+            progress_message = payload[2].strip() or "Running backtest..."
+            scaled = 45.0 + (max(0.0, min(percent, 100.0)) * 0.55)
+            if progress_message:
+                return (scaled, f"Running backtest... {int(round(scaled))}%")
+            return (scaled, "Running backtest...")
+        return None
+    if "auto-detected date range" in normalized:
+        return (50.0, "Running backtest... 50%")
+    if "starting command:" in normalized:
+        return (52.0, "Running backtest... 52%")
+    if "running backtest:" in normalized:
+        return (58.0, "Running backtest... 58%")
+    if "result:" in normalized and "trades" in normalized:
+        return (82.0, "Processing trades...")
+    if normalized.startswith("result:"):
+        return (90.0, "Calculating statistics...")
+    if normalized.startswith(SAVED_TO_PREFIX):
+        return (96.0, SAVING_RESULTS_MESSAGE)
+    return None
+
+
 @app.post("/api/backtests/run", status_code=202)
 async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
     try:
@@ -8613,49 +8659,7 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
         },
     )
 
-    def _runner_log_message(raw_line: str) -> str:
-        text = str(raw_line or "").strip()
-        if not text:
-            return ""
-        try:
-            payload_json = json.loads(text)
-        except json.JSONDecodeError:
-            return text
 
-        if isinstance(payload_json, dict):
-            message = payload_json.get("message")
-            if isinstance(message, str) and message.strip():
-                return message.strip()
-        return text
-
-    def _runner_stage(message: str) -> tuple[float, str] | None:
-        normalized = message.lower()
-        if normalized.startswith("progress:"):
-            payload = message.split(":", 2)
-            if len(payload) == 3:
-                try:
-                    percent = float(payload[1])
-                except ValueError:
-                    return None
-                progress_message = payload[2].strip() or "Running backtest..."
-                scaled = 45.0 + (max(0.0, min(percent, 100.0)) * 0.55)
-                if progress_message:
-                    return (scaled, f"Running backtest... {int(round(scaled))}%")
-                return (scaled, "Running backtest...")
-            return None
-        if "auto-detected date range" in normalized:
-            return (50.0, "Running backtest... 50%")
-        if "starting command:" in normalized:
-            return (52.0, "Running backtest... 52%")
-        if "running backtest:" in normalized:
-            return (58.0, "Running backtest... 58%")
-        if "result:" in normalized and "trades" in normalized:
-            return (82.0, "Processing trades...")
-        if normalized.startswith("result:"):
-            return (90.0, "Calculating statistics...")
-        if normalized.startswith(SAVED_TO_PREFIX):
-            return (96.0, SAVING_RESULTS_MESSAGE)
-        return None
 
     def _build_command(env: dict[str, str]) -> list[str]:
         env["PYTHONUNBUFFERED"] = "1"
@@ -8808,11 +8812,11 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
                                 source="backtest",
                                 ingest_task_progress=False,
                             )
-                        parsed_message = _runner_log_message(line)
+                        parsed_message = _backtest_runner_log_message(line)
                         if not parsed_message:
                             continue
                         latest_message = parsed_message
-                        stage = _runner_stage(parsed_message)
+                        stage = _backtest_runner_stage(parsed_message)
                         if stage is not None:
                             percent, message = stage
                             report_stage(handle, percent=percent, message=message)
