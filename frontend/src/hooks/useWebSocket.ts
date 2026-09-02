@@ -189,8 +189,7 @@ export function useWebSocket<TMessage = unknown>(
         const current = socket;
         if (
           disposed ||
-          current == null ||
-          current.readyState !== WebSocket.OPEN ||
+          current?.readyState !== WebSocket.OPEN ||
           socketRef.current !== current
         ) {
           return;

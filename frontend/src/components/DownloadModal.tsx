@@ -876,7 +876,7 @@ export function DownloadModal({
         .filter((value): value is string => Boolean(value));
       const latestStart =
         starts.length > 0
-          ? starts.reduce((latest, current) => (current > latest ? current : latest))
+          ? [...starts].sort((a, b) => a.localeCompare(b)).at(-1) ?? null
           : null;
 
       return {

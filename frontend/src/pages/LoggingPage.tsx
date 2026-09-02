@@ -28,12 +28,11 @@ const POLLING_PREFIXES = [
   "/api/live/trades/",
 ];
 const CANONICAL_TIMESTAMP_RE =
-  /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})(\.\d+)?(?: ?(Z|[+-]\d{2}:\d{2}))?$/;
+  /^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2})(\.\d+)?( [Zz]|[+-]\d{2}:\d{2})?$/;
 const TIMESTAMP_RE = /(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})/;
 const LOG_LEVEL_RE = /\b(ERROR|WARNING|WARN|INFO|DEBUG)\b/i;
 const MODULE_FUNC_RE = /\b([A-Za-z_][\w.-]*)\.([A-Za-z_][\w<>-]*)\b/;
-const TRACEBACK_FILE_RE =
-  /File "[^"]*\/([\w]*)\.py", line \d+, in ([A-Za-z_][\w<>-]*)/;
+const TRACEBACK_FILE_RE = /File "(.*)\/([\w]+)\.py", line \d+, in ([\w<>-]+)/;
 const UVICORN_PREFIX_RE = /^\s*(INFO|ERROR|WARNING|DEBUG)\s*:\s*(.*?)\s*$/i;
 const LOG_FETCH_LIMIT = 5000;
 const LOG_REFRESH_MS = 5000;
@@ -84,7 +83,13 @@ function parseTimestamp(input: unknown): { short: string; long: string } {
   if (!raw) {
     return { short: "--:--:--", long: "Unknown timestamp" };
   }
-  const canonicalMatch = CANONICAL_TIMESTAMP_RE.exec(raw);
+  // Normalise common ISO variants so the canonical pattern stays simple:
+  // "T" separator -> space, compact "+HHMM" zone -> "+HH:MM", "z" -> "Z".
+  const normalized = raw
+    .replace("T", " ")
+    .replace(/([+-]\d{2})(\d{2})$/, "$1:$2")
+    .replace(/ z$/i, " Z");
+  const canonicalMatch = CANONICAL_TIMESTAMP_RE.exec(normalized);
   if (canonicalMatch) {
     const datePart = canonicalMatch[1];
     const timePart = canonicalMatch[2];
@@ -134,11 +139,11 @@ function parsePlainLine(line: string): ParsedLogLine {
   const level = normalizeLevel(levelMatch?.[1] ?? line);
   const timestamp = parseTimestamp(timestampMatch?.[1] ?? "");
   const moduleName = (
-    tracebackMatch?.[1] ||
+    tracebackMatch?.[2] ||
     moduleFuncMatch?.[1] ||
     (uvicornPrefixMatch ? "uvicorn" : "app")
   ).trim();
-  const funcName = (tracebackMatch?.[2] || moduleFuncMatch?.[2] || "—").trim();
+  const funcName = (tracebackMatch?.[3] || moduleFuncMatch?.[2] || "—").trim();
   const message = (uvicornPrefixMatch?.[2] || line).trim() || line;
   return {
     raw: line,

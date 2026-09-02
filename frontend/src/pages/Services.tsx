@@ -140,14 +140,16 @@ export function ServicesPage() {
 
   // Rendered below; keep this const AFTER every state/handler it closes over.
   // If it grows further, extract it to a component with explicit props.
-  const servicesBody = servicesQuery.isLoading ? (
-    <div style={emptyStyle}>Loading services...</div>
-  ) : servicesQuery.isError ? (
-    <div style={emptyStyle}>Failed to load services.</div>
-  ) : services.length === 0 ? (
-    <div style={emptyStyle}>No services found.</div>
-  ) : (
-    <div style={{ display: "grid", gap: "10px" }}>
+  let servicesBody: React.ReactElement;
+  if (servicesQuery.isLoading) {
+    servicesBody = <div style={emptyStyle}>Loading services...</div>;
+  } else if (servicesQuery.isError) {
+    servicesBody = <div style={emptyStyle}>Failed to load services.</div>;
+  } else if (services.length === 0) {
+    servicesBody = <div style={emptyStyle}>No services found.</div>;
+  } else {
+    servicesBody = (
+      <div style={{ display: "grid", gap: "10px" }}>
       {services.map((service) => {
         const isRunning = service.status === "running";
         const cron = stringifyUnknownValue(service.config?.cron);
@@ -237,8 +239,9 @@ export function ServicesPage() {
           </div>
         );
       })}
-    </div>
-  );
+      </div>
+    );
+  }
 
   return (
     <div style={{ padding: "24px", display: "grid", gap: "14px" }}>

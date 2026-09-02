@@ -52,7 +52,8 @@ function trimTrailingZeros(text: string): string {
   if (!text.includes(".")) {
     return text;
   }
-  return text.replace(/0+$/, "").replace(/\.$/, "");
+  const trimmed = text.replace(/0+$/, "");
+  return trimmed.endsWith(".") ? trimmed.slice(0, -1) : trimmed;
 }
 
 function formatCurrentValue(value: StrategyParameterValue) {
