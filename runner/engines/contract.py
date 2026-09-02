@@ -159,8 +159,9 @@ def flag_missing_intrabar(
 
     Returns ``None`` when no flag is needed — either no intrabar resolution was
     requested (the stop-first fallback is the documented default, nothing to
-    disclose) or the intrabar data actually covers the ambiguous bar (the
-    chronological event is authoritative).
+    disclose) or the walk actually resolved the chronology from sub-bars
+    (``intrabar_coverage=True`` with the default ``reason``; the caller then
+    does not reach the fallback at all).
 
     Returns a flag payload when an intrabar resolution WAS requested but the
     walk could not resolve the chronology: the result then silently fell back
@@ -172,6 +173,10 @@ def flag_missing_intrabar(
     if intrabar_resolution is None:
         return None
     if intrabar_coverage and reason == "intrabar_data_missing":
+        # Sub-bars exist AND the walk went through them without a fallback:
+        # the chronological event won, nothing to disclose. (A caller that
+        # passes a non-default reason explicitly wants the flag emitted even
+        # though data exists.)
         return None
     return {
         "same_bar_priority": "stop_first_fallback",
