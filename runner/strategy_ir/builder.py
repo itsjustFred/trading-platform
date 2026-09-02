@@ -101,16 +101,27 @@ def _parameters_from_meta(strategy_meta: dict[str, Any]) -> list[ParameterSpec]:
     return specs
 
 
+def _extract_markdown_section(markdown_doc: str, heading: str) -> str | None:
+    """Return the body after ``## <heading>`` up to the next ``##`` heading.
+
+    A non-greedy ``.*`` with ``DOTALL`` before a ``\\n##|\\Z`` lookahead makes
+    the regex engine rescan the whole tail on every position (S6019); slicing
+    on the heading and the next heading is equivalent and linear.
+    """
+    heading_match = re.search(rf"##\s*{heading}\s*\n", markdown_doc, flags=re.IGNORECASE)
+    if not heading_match:
+        return None
+    body_start = heading_match.end()
+    next_heading = re.search(r"\n##", markdown_doc[body_start:])
+    body_end = body_start + next_heading.start() if next_heading else len(markdown_doc)
+    return markdown_doc[body_start:body_end]
+
+
 def _indicator_rows_from_markdown(markdown_doc: str) -> list[tuple[str, str, Any]]:
-    section_match = re.search(
-        r"##\s*Indikator-Einstellungen\s*\n(.*?)(?=\n##|\Z)",
-        markdown_doc or "",
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    if not section_match:
+    section = _extract_markdown_section(markdown_doc or "", "Indikator-Einstellungen")
+    if section is None:
         return []
 
-    section = section_match.group(1)
     rows: list[tuple[str, str, Any]] = []
     for line in section.splitlines():
         stripped = line.strip()

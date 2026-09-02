@@ -1,6 +1,7 @@
 """cTrader deployment planning from persisted backtest performance."""
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from shared.models import LiveAccountConfig, LiveDeploymentConfig
@@ -11,7 +12,7 @@ def _metric(row: dict[str, Any], key: str, default: float = 0.0) -> float:
         value = float(row.get(key, default))
     except (TypeError, ValueError):
         return default
-    return value if value == value else default
+    return default if math.isnan(value) else value
 
 
 def score_backtest_for_live(row: dict[str, Any]) -> float:
