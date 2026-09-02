@@ -461,36 +461,41 @@ def _normalize_markdown_doc(markdown_doc: str, *, strategy_name: str | None) -> 
     return content
 
 
-def _extract_markdown_response(content: str) -> str:
-    # No \s* between the fence and the lazy group: on input where the fence is
-    # followed by a long run of whitespace and never closed, the greedy \s*
-    # retries the whole lazy scan at every position (super-linear, Sonar S8786).
-    # The lazy group swallows the leading whitespace and .strip() drops it.
-    for language in ("markdown", "md"):
-        match = re.search(
-            rf"```{language}(.*?)```",
-            content,
-            flags=re.IGNORECASE | re.DOTALL,
-        )
+GENERIC_FENCE: tuple[str, ...] = ()
+
+
+def _extract_fenced_block(content: str, languages: tuple[str, ...]) -> str | None:
+    """Return the body of the first fenced block for one of ``languages``.
+
+    No \s* between the fence and the lazy group: on input where the fence is
+    followed by a long run of whitespace and never closed, the greedy \s*
+    retries the whole lazy scan at every position (super-linear, Sonar S8786).
+    The lazy group swallows the leading whitespace and .strip() drops it.
+    """
+    for language in languages:
+        match = re.search(rf"```{language}(.*?)```", content, flags=re.IGNORECASE | re.DOTALL)
         if match:
             return match.group(1).strip()
-    return (content or "").strip()
+    generic = languages is GENERIC_FENCE
+    if not generic:
+        return None
+    match = re.search(r"```(.*?)```", content, flags=re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    return None
+
+
+def _extract_markdown_response(content: str) -> str:
+    return _extract_fenced_block(content or "", ("markdown", "md")) or (content or "").strip()
 
 
 def _extract_python_response(content: str) -> str:
-    for language in ("python", "py"):
-        match = re.search(
-            rf"```{language}(.*?)```",
-            content,
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-        if match:
-            return match.group(1).strip()
-
-    generic_match = re.search(r"```(.*?)```", content, flags=re.DOTALL)
-    if generic_match:
-        return generic_match.group(1).strip()
-
+    fenced = _extract_fenced_block(content or "", ("python", "py"))
+    if fenced is not None:
+        return fenced
+    generic = _extract_fenced_block(content or "", GENERIC_FENCE)
+    if generic is not None:
+        return generic
     return (content or "").strip()
 
 

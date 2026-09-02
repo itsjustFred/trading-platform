@@ -244,17 +244,7 @@ def _resolve_dates_for_equity(
     return start_date, end_date
 
 
-def _init_cell_result(
-    *,
-    strategy: str,
-    symbol: str,
-    timeframe: str,
-    data_dir: str,
-    start: str,
-    end: str,
-    output_dir: Path,
-    skip_existing: bool,
-) -> tuple[dict[str, Any], BacktestResult | None]:
+def _init_cell_result(request: CellRequest) -> tuple[dict[str, Any], BacktestResult | None]:
     """Build the shared cell record and honor the skip-existing shortcut.
 
     Returns ``(cell, skipped)``; ``skipped`` is a fully-processed
@@ -262,15 +252,15 @@ def _init_cell_result(
     The resolved window is computed once here so the reported cell window,
     the CLI command and ``attach_daily_equity`` all see the same dates.
     """
-    run_id = build_run_id(strategy, symbol, timeframe)
-    path = output_path_for(output_dir, run_id)
+    run_id = build_run_id(request.strategy, request.symbol, request.timeframe)
+    path = output_path_for(request.output_dir, run_id)
     resolved_start, resolved_end = _resolve_dates_for_equity(
-        symbol, timeframe, data_dir, start, end
+        request.symbol, request.timeframe, request.data_dir, request.start, request.end
     )
     result: dict[str, Any] = {
         "run_id": run_id,
-        "symbol": symbol,
-        "timeframe": timeframe,
+        "symbol": request.symbol,
+        "timeframe": request.timeframe,
         "start": resolved_start,
         "end": resolved_end,
         "output": str(path),
@@ -278,7 +268,7 @@ def _init_cell_result(
         "status": "pending",
     }
 
-    if skip_existing and path.exists():
+    if request.skip_existing and path.exists():
         try:
             backtest_result = BacktestResult.load(path)
             attach_daily_equity(backtest_result, start=resolved_start, end=resolved_end)
@@ -395,16 +385,7 @@ def _run_backtest_in_process_body(request: CellRequest) -> dict[str, Any]:
 
 def run_one_backtest_in_process(request: CellRequest) -> dict[str, Any]:
     """Run one grid cell in-process; ``request`` carries the whole cell."""
-    result, _skipped = _init_cell_result(
-        strategy=request.strategy,
-        symbol=request.symbol,
-        timeframe=request.timeframe,
-        data_dir=request.data_dir,
-        start=request.start,
-        end=request.end,
-        output_dir=request.output_dir,
-        skip_existing=request.skip_existing,
-    )
+    result, _skipped = _init_cell_result(request)
     if result["status"] != "pending":
         return result
 
@@ -462,16 +443,7 @@ def run_one_backtest(
         save_sqlite=save_sqlite,
         keep_indicators=keep_indicators,
     )
-    result, _skipped = _init_cell_result(
-        strategy=request.strategy,
-        symbol=request.symbol,
-        timeframe=request.timeframe,
-        data_dir=request.data_dir,
-        start=request.start,
-        end=request.end,
-        output_dir=request.output_dir,
-        skip_existing=request.skip_existing,
-    )
+    result, _skipped = _init_cell_result(request)
     if result["status"] != "pending":
         return result
 
