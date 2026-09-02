@@ -105,6 +105,10 @@ Execution and conversion layer.
     indicator-series presentation shared via `_drawings.py`/`_indicator_series.py`)
   - `pynecore_adapter.py`: Pine-style strategies through PyneCore
   - `lean_adapter.py`: QuantConnect LEAN result ingestion / execution bridge
+- Sizing semantics: `max_position_exposure_pct` (position-size), `risk_per_trade_pct`
+  (max loss per trade) and `max_total_exposure` (aggregate exposure limit) have one
+  documented meaning each — see `docs/sizing-semantics.md`. `max_position_pct` /
+  `--max-position-pct` remain as deprecated aliases.
 
 ### `viewer/`
 

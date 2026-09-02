@@ -15,6 +15,7 @@ import re
 import subprocess
 import sys
 import traceback
+import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -159,7 +160,7 @@ def build_cli_command(
     engine: str,
     capital: float,
     risk_pct: float | None,
-    max_position_pct: float | None,
+    max_position_exposure_pct: float | None,
     max_leverage: float | None,
     intrabar_resolution: str,
     params: dict[str, Any] | None,
@@ -195,8 +196,8 @@ def build_cli_command(
         cmd.extend(["--end", end])
     if risk_pct is not None:
         cmd.extend(["--risk-pct", str(risk_pct)])
-    if max_position_pct is not None:
-        cmd.extend(["--max-position-pct", str(max_position_pct)])
+    if max_position_exposure_pct is not None:
+        cmd.extend(["--max-position-exposure-pct", str(max_position_exposure_pct)])
     if max_leverage is not None:
         cmd.extend(["--max-leverage", str(max_leverage)])
     if params:
@@ -496,7 +497,7 @@ def run_one_backtest(
     engine: str,
     capital: float,
     risk_pct: float | None,
-    max_position_pct: float | None,
+    max_position_exposure_pct: float | None,
     max_leverage: float | None,
     intrabar_resolution: str,
     params: dict[str, Any] | None,
@@ -552,7 +553,7 @@ def run_one_backtest(
         engine=engine,
         capital=capital,
         risk_pct=risk_pct,
-        max_position_pct=max_position_pct,
+        max_position_exposure_pct=max_position_exposure_pct,
         max_leverage=max_leverage,
         intrabar_resolution=intrabar_resolution,
         params=params,
@@ -639,7 +640,7 @@ def run_backtest_grid(
     engine: str = "vectorbt",
     capital: float = 100_000.0,
     risk_pct: float | None = 0.01,
-    max_position_pct: float | None = None,
+    max_position_exposure_pct: float | None = None,
     max_leverage: float | None = None,
     intrabar_resolution: str = "open_close",
     params: dict[str, Any] | None = None,
@@ -651,8 +652,31 @@ def run_backtest_grid(
     use_subprocess: bool = False,
     save_sqlite: bool = True,
     keep_indicators: bool = False,
+    max_position_pct: float | None = None,
 ) -> dict[str, Any]:
-    """Run one strategy across every symbol/timeframe combination."""
+    """Run one strategy across every symbol/timeframe combination.
+
+    Sizing semantics (Cleanup 16-E): ``risk_pct`` is the maximum loss per
+    trade; ``max_position_exposure_pct`` caps the notional of ONE position as
+    a fraction of equity. ``max_position_pct`` is a deprecated alias of
+    ``max_position_exposure_pct``.
+    """
+    # Deprecated alias (Cleanup 16-E): keep old invocations working.
+    if max_position_pct is not None:
+        if max_position_exposure_pct is not None:
+            raise ValueError(
+                "Pass either max_position_exposure_pct or its deprecated alias "
+                "max_position_pct, not both."
+            )
+        warnings.warn(
+            "run_backtest_grid(max_position_pct=...) is deprecated; use "
+            "max_position_exposure_pct. The alias will be removed in a future "
+            "release.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        max_position_exposure_pct = max_position_pct
+
     normalized_symbols = [normalize_symbol(symbol) for symbol in (symbols or GRID_SYMBOLS)]
     normalized_timeframes = [normalize_timeframe_value(tf) for tf in (timeframes or GRID_TIMEFRAMES)]
     if not normalized_symbols:
@@ -674,7 +698,7 @@ def run_backtest_grid(
         "engine": engine,
         "capital": capital,
         "risk_pct": risk_pct,
-        "max_position_pct": max_position_pct,
+        "max_position_exposure_pct": max_position_exposure_pct,
         "max_leverage": max_leverage,
         "intrabar_resolution": intrabar_resolution,
         "params": params,
@@ -697,7 +721,7 @@ def run_backtest_grid(
             "engine": engine,
             "capital": capital,
             "risk_pct": risk_pct,
-            "max_position_pct": max_position_pct,
+            "max_position_exposure_pct": max_position_exposure_pct,
             "max_leverage": max_leverage,
             "intrabar_resolution": intrabar_resolution,
             "params": params,
@@ -768,7 +792,7 @@ def main() -> None:
         engine=args.engine,
         capital=args.capital,
         risk_pct=args.risk_pct,
-        max_position_pct=args.max_position_pct,
+        max_position_exposure_pct=args.max_position_exposure_pct,
         max_leverage=args.max_leverage,
         intrabar_resolution=args.intrabar_resolution,
         params=parse_params(args.params),

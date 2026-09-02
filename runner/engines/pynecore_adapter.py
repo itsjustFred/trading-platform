@@ -34,7 +34,7 @@ from runner.engines.base import (
 from runner.engines._drawings import _normalize_drawings
 from runner.engines._shared import (
     resolve_max_leverage as _resolve_max_leverage,
-    resolve_max_position_pct as _resolve_max_position_pct,
+    resolve_max_position_exposure_pct as _resolve_max_position_exposure_pct,
     serialize_meta_value as _serialize_meta_value,
 )
 from runner.stats import compute_stats_for_result
@@ -834,8 +834,10 @@ def _apply_risk_sizing(trades: list[Trade], config: BacktestConfig, asset_class:
         return
 
     equity = config.initial_capital
-    max_position_pct = _resolve_max_position_pct(config.max_position_pct, asset_class)
-    max_leverage = max(_resolve_max_leverage(config.max_leverage), max_position_pct)
+    max_position_exposure_pct = _resolve_max_position_exposure_pct(
+        config.max_position_exposure_pct, asset_class
+    )
+    max_leverage = max(_resolve_max_leverage(config.max_leverage), max_position_exposure_pct)
 
     for trade in sorted(trades, key=lambda item: item.entry_time):
         meta = trade.meta or {}
@@ -852,7 +854,7 @@ def _apply_risk_sizing(trades: list[Trade], config: BacktestConfig, asset_class:
         risk_amount = equity * config.risk_per_trade_pct
         base_qty = risk_amount / stop_distance
         required_notional = base_qty * trade.entry_price
-        cap_notional = equity * max_position_pct
+        cap_notional = equity * max_position_exposure_pct
         leverage_notional_limit = equity * max_leverage
 
         if required_notional <= cap_notional:

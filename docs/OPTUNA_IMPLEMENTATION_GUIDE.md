@@ -59,8 +59,8 @@ class BacktestConfig(BaseModel):
     start_date: str              # "2021-01-01"
     end_date: str                # "2025-06-30"
     initial_capital: float       # default: 100_000.0
-    risk_per_trade_pct: float | None    # Optional, 0.0–1.0
-    max_position_pct: float | None      # Optional
+    risk_per_trade_pct: float | None    # Optional, 0.0–1.0 — max loss per trade
+    max_position_exposure_pct: float | None  # Optional — max notional of ONE position / equity
     max_leverage: float | None          # Optional
     modeling_resolution: str     # "open_close", "1-lower", "1m", "s1", "tick"
     data_dir: str                # Override default DATA_DIR

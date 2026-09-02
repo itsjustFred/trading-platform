@@ -16,6 +16,7 @@ import importlib.util
 import inspect
 import logging
 import os
+import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -28,7 +29,7 @@ from runner.engines._drawings import DrawingList, _normalize_drawings
 from runner.engines._indicator_series import _build_indicator_series
 from runner.engines._shared import (
     resolve_max_leverage as _resolve_max_leverage,
-    resolve_max_position_pct as _resolve_max_position_pct,
+    resolve_max_position_exposure_pct as _resolve_max_position_exposure_pct,
     serialize_meta_value as _shared_serialize_meta_value,
 )
 from runner.engines.base import (
@@ -59,7 +60,7 @@ class _SizeRecord(TypedDict):
     sizing_mode: str
     risk_target_usd: float | None
     stop_distance: float | None
-    max_position_pct: float | None
+    max_position_exposure_pct: float | None
     max_leverage: float | None
     required_notional: float | None
     cap_notional: float | None
@@ -144,7 +145,7 @@ def _size_trade(
     """
     risk_target_usd: float | None = None
     stop_distance: float | None = None
-    max_position_pct: float | None = None
+    max_position_exposure_pct: float | None = None
     max_leverage: float | None = None
     required_notional: float | None = None
     cap_notional: float | None = None
@@ -156,11 +157,14 @@ def _size_trade(
 
     if config.risk_per_trade_pct is not None and config.risk_per_trade_pct > 0:
         sizing_mode = "risk_pct"
-        max_position_pct = _resolve_max_position_pct(config.max_position_pct, asset_class)
+        max_position_exposure_pct = _resolve_max_position_exposure_pct(
+            config.max_position_exposure_pct, asset_class
+        )
         max_leverage = _resolve_max_leverage(config.max_leverage)
-        # D10 (F7/F35): max_position_pct is the per-position notional cap; it is
-        # an INDEPENDENT cap, not an implicit leverage floor — a conservative
-        # max_leverage < max_position_pct is honored as configured.
+        # D10/16-E (F7/F35): max_position_exposure_pct is the per-position
+        # notional cap; it is an INDEPENDENT cap, not an implicit leverage
+        # floor — a conservative max_leverage < max_position_exposure_pct is
+        # honored as configured.
 
         risk_target_usd = equity * config.risk_per_trade_pct
         stop_distance = _resolve_stop_distance(
@@ -182,7 +186,7 @@ def _size_trade(
 
         base_qty = risk_target_usd / stop_distance
         required_notional = base_qty * entry_price
-        cap_notional = equity * max_position_pct
+        cap_notional = equity * max_position_exposure_pct
         leverage_notional_limit = equity * max_leverage
         capped_by_max_position = required_notional > cap_notional
         capped_by_max_leverage = required_notional > leverage_notional_limit
@@ -221,7 +225,7 @@ def _size_trade(
         sizing_mode=sizing_mode,
         risk_target_usd=risk_target_usd,
         stop_distance=stop_distance,
-        max_position_pct=max_position_pct,
+        max_position_exposure_pct=max_position_exposure_pct,
         max_leverage=max_leverage,
         required_notional=required_notional,
         cap_notional=cap_notional,
@@ -307,7 +311,7 @@ def _process_symbol(
             stop_price = _resolve_level_value(stop_loss_series, entry_idx)
             risk_target_usd: float | None = None
             stop_distance: float | None = None
-            max_position_pct: float | None = None
+            max_position_exposure_pct: float | None = None
             max_leverage: float | None = None
             required_notional: float | None = None
             cap_notional: float | None = None
@@ -347,7 +351,7 @@ def _process_symbol(
             sizing_mode = sizing["sizing_mode"]
             risk_target_usd = sizing["risk_target_usd"]
             stop_distance = sizing["stop_distance"]
-            max_position_pct = sizing["max_position_pct"]
+            max_position_exposure_pct = sizing["max_position_exposure_pct"]
             max_leverage = sizing["max_leverage"]
             required_notional = sizing["required_notional"]
             cap_notional = sizing["cap_notional"]
@@ -391,7 +395,14 @@ def _process_symbol(
                     if leverage_notional_limit is not None
                     else None
                 ),
-                "max_position_pct": round(max_position_pct, 6) if max_position_pct is not None else None,
+                # Persisted key stays "max_position_pct" for artifact
+                # compatibility (frontend TradeRiskMath + SQLite fallback);
+                # its meaning is documented as max_position_exposure_pct.
+                "max_position_pct": (
+                    round(max_position_exposure_pct, 6)
+                    if max_position_exposure_pct is not None
+                    else None
+                ),
                 "max_leverage": round(max_leverage, 6) if max_leverage is not None else None,
                 "capped_by_max_position": capped_by_max_position,
                 "capped_by_max_leverage": capped_by_max_leverage,

@@ -22,6 +22,7 @@ import csv
 import json
 import math
 import os
+import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
@@ -242,7 +243,7 @@ def _run_strategy_matrix_cell(
     engine: str,
     capital: float,
     risk_pct: float | None,
-    max_position_pct: float | None,
+    max_position_exposure_pct: float | None,
     max_leverage: float | None,
     intrabar_resolution: str,
     params: dict[str, Any],
@@ -268,7 +269,7 @@ def _run_strategy_matrix_cell(
         engine=strategy_engine,
         capital=capital,
         risk_pct=risk_pct,
-        max_position_pct=max_position_pct,
+        max_position_exposure_pct=max_position_exposure_pct,
         max_leverage=max_leverage,
         intrabar_resolution=intrabar_resolution,
         params=params,
@@ -413,7 +414,7 @@ def run_backtest_matrix(
     engine: str = "",
     capital: float = 100_000.0,
     risk_pct: float | None = 0.01,
-    max_position_pct: float | None = None,
+    max_position_exposure_pct: float | None = None,
     max_leverage: float | None = None,
     intrabar_resolution: str = "open_close",
     params: dict[str, Any] | None = None,
@@ -427,8 +428,31 @@ def run_backtest_matrix(
     save_sqlite: bool = True,
     keep_indicators: bool = False,
     strategies_dir: Path = Path("strategies"),
+    max_position_pct: float | None = None,
 ) -> dict[str, Any]:
-    """Run every selected strategy over the symbol/timeframe grid."""
+    """Run every selected strategy over the symbol/timeframe grid.
+
+    Sizing semantics (Cleanup 16-E): ``risk_pct`` is the maximum loss per
+    trade; ``max_position_exposure_pct`` caps the notional of ONE position as
+    a fraction of equity. ``max_position_pct`` is a deprecated alias of
+    ``max_position_exposure_pct``.
+    """
+    # Deprecated alias (Cleanup 16-E): keep old invocations working.
+    if max_position_pct is not None:
+        if max_position_exposure_pct is not None:
+            raise ValueError(
+                "Pass either max_position_exposure_pct or its deprecated alias "
+                "max_position_pct, not both."
+            )
+        warnings.warn(
+            "run_backtest_matrix(max_position_pct=...) is deprecated; use "
+            "max_position_exposure_pct. The alias will be removed in a future "
+            "release.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        max_position_exposure_pct = max_position_pct
+
     output_dir = output_dir or MATRIX_OUTPUT_DIR
     output_dir.mkdir(parents=True, exist_ok=True)
     normalized_symbols = [normalize_symbol(symbol) for symbol in (symbols or GRID_SYMBOLS)]
@@ -488,7 +512,7 @@ def run_backtest_matrix(
             "engine": engine,
             "capital": capital,
             "risk_pct": risk_pct,
-            "max_position_pct": max_position_pct,
+            "max_position_exposure_pct": max_position_exposure_pct,
             "max_leverage": max_leverage,
             "intrabar_resolution": intrabar_resolution,
             "params": params,
@@ -577,7 +601,7 @@ def run_backtest_matrix(
         "engine": engine or "auto",
         "capital": capital,
         "risk_pct": risk_pct,
-        "max_position_pct": max_position_pct,
+        "max_position_exposure_pct": max_position_exposure_pct,
         "max_leverage": max_leverage,
         "intrabar_resolution": intrabar_resolution,
         "params": params,
@@ -664,7 +688,7 @@ def main() -> None:
         engine=args.engine,
         capital=args.capital,
         risk_pct=args.risk_pct,
-        max_position_pct=args.max_position_pct,
+        max_position_exposure_pct=args.max_position_exposure_pct,
         max_leverage=args.max_leverage,
         intrabar_resolution=args.intrabar_resolution,
         params=parse_params(args.params),

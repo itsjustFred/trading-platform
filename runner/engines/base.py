@@ -7,6 +7,7 @@ so the Runner CLI can invoke any of them uniformly.
 
 from __future__ import annotations
 
+import warnings
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Callable
@@ -16,6 +17,10 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from runner.engines import contract
 from shared.models import VALID_TIMEFRAMES, BacktestResult
 from shared.strategy_registry import load_strategy_meta
+
+#: Deprecated alias of :attr:`BacktestConfig.max_position_exposure_pct`.
+#: Kept so old invocations keep working during the Cleanup 16-E migration.
+LEGACY_MAX_POSITION_PCT = "max_position_pct"
 
 VALID_RESOLUTIONS = (
     "main_timeframe",
@@ -47,12 +52,47 @@ class BacktestConfig(BaseModel):
     start_date: str  # "2021-01-01"
     end_date: str  # "2025-06-30"
     initial_capital: float = Field(100_000.0, gt=0)
+    # Maximum loss per trade, as a fraction of equity (Cleanup 16-E Decision
+    # Record: "risk_per_trade_pct means maximum loss per trade").
     risk_per_trade_pct: float | None = Field(None, ge=0.0, le=1.0)
-    max_position_pct: float | None = Field(None, gt=0.0)
+    # Position-size semantics (Cleanup 16-E Decision Record): maximum notional
+    # exposure of a single position as a fraction of equity (0.05 = 5%).
+    # Not an aggregate-portfolio limit and not a loss budget — those are
+    # ``max_total_exposure`` (RiskConfig) and ``risk_per_trade_pct``.
+    max_position_exposure_pct: float | None = Field(None, gt=0.0)
     max_leverage: float | None = Field(None, gt=0.0)
     modeling_resolution: str = "main_timeframe"
     data_dir: str = ""
     parameters: dict[str, Any] = Field(default_factory=dict)
+
+    def __init__(self, **data: Any) -> None:
+        if LEGACY_MAX_POSITION_PCT in data and data[LEGACY_MAX_POSITION_PCT] is not None:
+            warnings.warn(
+                "BacktestConfig(max_position_pct=...) is deprecated; use "
+                "max_position_exposure_pct (same per-position notional/equity "
+                "semantics). The alias will be removed in a future release.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if "max_position_exposure_pct" in data and data["max_position_exposure_pct"] is not None:
+                raise ValueError(
+                    "Pass either max_position_exposure_pct or its deprecated alias "
+                    "max_position_pct, not both."
+                )
+            data["max_position_exposure_pct"] = data.pop(LEGACY_MAX_POSITION_PCT)
+        super().__init__(**data)
+
+    @property
+    def max_position_pct(self) -> float | None:
+        """Deprecated alias of :attr:`max_position_exposure_pct` (read-only)."""
+        warnings.warn(
+            "BacktestConfig.max_position_pct is deprecated; read "
+            "max_position_exposure_pct instead. The alias will be removed in a "
+            "future release.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.max_position_exposure_pct
 
     @field_validator("timeframe")
     @classmethod

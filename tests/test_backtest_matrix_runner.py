@@ -49,7 +49,7 @@ def test_run_strategy_matrix_cell_adds_inspection_links(monkeypatch, tmp_path: P
         engine="vectorbt",
         capital=100000.0,
         risk_pct=0.01,
-        max_position_pct=None,
+        max_position_exposure_pct=None,
         max_leverage=None,
         intrabar_resolution="open_close",
         params={},
