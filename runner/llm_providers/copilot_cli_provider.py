@@ -102,7 +102,7 @@ class CopilotCLIProvider:
             )
             raise RuntimeError(str(exc)) from exc.__cause__
 
-        content = self._extract_output(completed, model=selected_model or "default")
+        content = self._extract_output(completed)
         _apply_metadata(
             metadata,
             model=selected_model or "default",
@@ -148,8 +148,6 @@ class CopilotCLIProvider:
     def _extract_output(
         self,
         completed: subprocess.CompletedProcess,
-        *,
-        model: str,
     ) -> str:
         """Decode CLI output into response content, failing loudly on errors."""
         stdout = (completed.stdout or "").strip()
