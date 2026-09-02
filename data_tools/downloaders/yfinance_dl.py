@@ -103,7 +103,19 @@ def _resample_4h_utc_grid(
     if df.empty:
         return df.copy(), source_bucket
 
+    # The resample silently produces a shifted or empty grid when the
+    # timestamp dtype drifts (naive timestamps change the origin, non-datetime
+    # columns break the bucketing), so fail loudly on the contract instead.
+    if not pd.api.types.is_datetime64_any_dtype(df["timestamp"]):
+        raise RuntimeError(
+            "4h resample requires a datetime64 'timestamp' column, got "
+            f"{df['timestamp'].dtype}"
+        )
+    if df["timestamp"].dt.tz is None:
+        raise RuntimeError("4h resample requires tz-aware (UTC) timestamps")
+
     indexed = df.set_index("timestamp")
+    input_rows = len(indexed)
     resampled = (
         indexed.resample("4h", origin="start_day", label="left", closed="left")
         .agg(
@@ -118,6 +130,11 @@ def _resample_4h_utc_grid(
         .dropna(subset=["open", "high", "low", "close"])
         .reset_index()
     )
+    if resampled.empty:
+        raise RuntimeError(
+            f"4h resample produced no rows from {input_rows} input rows "
+            "(all-NaN buckets or misaligned timestamps)"
+        )
     resampled[BUCKET_METADATA_COLUMN] = source_bucket
     return resampled, "UTC"
 

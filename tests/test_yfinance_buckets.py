@@ -10,6 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 
 def _hourly_payload(start: str, hours: int) -> pd.DataFrame:
@@ -159,3 +160,36 @@ def test_download_non_4h_timeframes_keep_native_buckets(monkeypatch, tmp_path: P
     stored = pd.read_parquet(result.path)
     assert list(stored["timestamp"].dt.hour) == [1, 2, 3]
     assert "source_bucket_timeframe" not in stored.columns
+
+
+def test_resample_4h_utc_grid_rejects_naive_timestamps():
+    """Pre-mortem PM-3: the resample silently shifts buckets without tz-aware input."""
+    from data_tools.downloaders import yfinance_dl
+
+    payload = _normalized_hourly("2024-03-04T01:00:00Z", 7).copy()
+    payload["timestamp"] = payload["timestamp"].dt.tz_localize(None)
+
+    with pytest.raises(RuntimeError, match="tz-aware"):
+        yfinance_dl._resample_4h_utc_grid(payload)
+
+
+def test_resample_4h_utc_grid_rejects_non_datetime_timestamp_column():
+    from data_tools.downloaders import yfinance_dl
+
+    payload = _normalized_hourly("2024-03-04T01:00:00Z", 7).copy()
+    payload["timestamp"] = payload["timestamp"].astype(str)
+
+    with pytest.raises(RuntimeError, match="datetime64"):
+        yfinance_dl._resample_4h_utc_grid(payload)
+
+
+def test_resample_4h_utc_grid_raises_when_input_yields_no_rows():
+    """All-NaN buckets must not silently return an empty frame (PM-3)."""
+    from data_tools.downloaders import yfinance_dl
+
+    payload = _normalized_hourly("2024-03-04T01:00:00Z", 3).copy()
+    for column in ("open", "high", "low", "close"):
+        payload[column] = float("nan")
+
+    with pytest.raises(RuntimeError, match="produced no rows"):
+        yfinance_dl._resample_4h_utc_grid(payload)

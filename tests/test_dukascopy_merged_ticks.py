@@ -350,3 +350,55 @@ def test_dukascopy_event_smoke():
 
     assert Event() is not None
     assert native.DukascopyNativeDownloader().source_name == "dukascopy"
+
+
+def test_generate_tick_urls_price_type_is_informational_for_tick_files():
+    """Pre-mortem PM-4: hourly tick files carry both offer sides per record.
+
+    ``price_type`` is accepted for call-site parity with the minute/URL
+    generators but must never change which files are fetched — otherwise a
+    future "unused parameter" cleanup or a side-aware rewrite silently
+    changes tick output. If this test ever needs updating, update
+    ``docs/DATA_SOURCES.md`` (offer-side semantics) in the same change.
+    """
+    import data_tools.downloaders.dukascopy_native as native
+
+    start = datetime(2024, 3, 4, 1, tzinfo=timezone.utc)
+    end = datetime(2024, 3, 4, 5, tzinfo=timezone.utc)
+
+    default_urls = native.generate_tick_urls("EUR/USD", start, end)
+    for side in ("bid", "ask", "both"):
+        assert native.generate_tick_urls("EUR/USD", start, end, price_type=side) == default_urls
+
+
+def test_generate_tick_urls_rejects_unknown_price_type():
+    import data_tools.downloaders.dukascopy_native as native
+
+    start = datetime(2024, 3, 4, 1, tzinfo=timezone.utc)
+    end = datetime(2024, 3, 4, 2, tzinfo=timezone.utc)
+
+    with pytest.raises(ValueError, match="price_type"):
+        native.generate_tick_urls("EUR/USD", start, end, price_type="mid")
+
+
+def test_split_tick_sides_raises_on_schema_drift():
+    """Missing side columns must surface at the split, not downstream (PM-2)."""
+    import data_tools.downloaders.dukascopy_native as native
+
+    shared = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(["2024-03-04T01:00:00Z"], utc=True),
+            "bid": [1.0],
+            "bid_vol": [10.0],
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="missing required bid/ask columns"):
+        native._split_tick_sides(shared)
+
+
+def test_split_tick_sides_returns_empty_sides_for_empty_input():
+    import data_tools.downloaders.dukascopy_native as native
+
+    bid, ask = native._split_tick_sides(_empty_tick_frame())
+    assert bid.empty and ask.empty

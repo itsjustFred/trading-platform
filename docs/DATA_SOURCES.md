@@ -211,6 +211,17 @@ labels 00/04/08/12/16/20 UTC) and keeps the provider's native bucket size in
 the `source_bucket_timeframe` column. Cross-source comparisons must resample
 all sources onto the same bucket convention first.
 
+### Offer-side semantics (Dukascopy tick)
+
+Hourly Dukascopy tick files (`.bi5`) carry **both** offer sides per record, so
+the native downloader fetches each file once and splits bid/ask afterwards.
+For `tick` timeframes the `offer_side`/`price_type` value is therefore
+**informational only**: it is validated (`bid`, `ask`, `both`) but does not
+change which files are downloaded or which columns the output contains. This
+differs from the JForex engine, which rejects `offer_side='both'` for tick
+outputs because it queries one side per request. Bar (`m1`+) downloads use the
+side to pick the per-side URL set, so there `price_type` is load-bearing.
+
 ### What gets migrated
 
 - Legacy LEAN equity CSVs into `1h`, `15m`, and `1d`

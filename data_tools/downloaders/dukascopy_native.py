@@ -673,6 +673,15 @@ def _split_tick_sides(tick_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame
         empty = tick_df.copy()
         return empty, empty.copy()
 
+    missing = {"timestamp", "bid", "bid_vol", "ask", "ask_vol"} - set(tick_df.columns)
+    if missing:
+        # Schema drift must surface here, not as a KeyError far from the parse
+        # step (the tick columns come from _assemble_tick_dataframe's
+        # fixed record layout).
+        raise RuntimeError(
+            f"Tick frame is missing required bid/ask columns: {sorted(missing)}"
+        )
+
     bid = tick_df[["timestamp", "bid", "bid_vol"]].copy()
     ask = tick_df[["timestamp", "ask", "ask_vol"]].copy()
     return bid.reset_index(drop=True), ask.reset_index(drop=True)
