@@ -2,6 +2,8 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
+
 import runner.backtest_grid as bg
 from runner.backtest_grid import (
     build_cli_command,
@@ -257,9 +259,7 @@ def test_subprocess_command_does_not_pass_grid_only_flags(tmp_path):
 
 def test_no_date_range_is_fabricated_when_data_missing(tmp_path):
     """Regression (F19): missing data must fail loudly, not invent 2023..2025."""
-    import pytest as _pytest
-
-    with _pytest.raises(ValueError, match="No OHLCV data"):
+    with pytest.raises(ValueError, match="No OHLCV data"):
         bg._detect_date_range("NOSUCHSYMBOL", "1h", str(tmp_path / "data"))
 
 

@@ -68,5 +68,7 @@ def test_lean_adapter_fails_loudly_when_lean_cli_missing(tmp_path, monkeypatch):
     project_dir.mkdir()
     monkeypatch.setattr(module, "LEAN_PROJECT_DIR", project_dir)
 
+    adapter = LeanAdapter(lean_project_dir=project_dir)
+    config = _config(tmp_path)
     with pytest.raises(RuntimeError, match="LEAN"):
-        LeanAdapter(lean_project_dir=project_dir).run(_config(tmp_path), str(strategy))
+        adapter.run(config, str(strategy))

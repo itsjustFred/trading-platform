@@ -65,13 +65,17 @@ def test_missing_symbol_data_fails_loudly(tmp_path, adapter_factory):
     strategy = _write_strategy(tmp_path)
     _write_ohlcv(tmp_path, "SPY")  # QQQ deliberately missing
 
+    adapter = adapter_factory()
+    config = _config(tmp_path, ["QQQ"])
     with pytest.raises(RuntimeError, match="QQQ"):
-        adapter_factory().run(_config(tmp_path, ["QQQ"]), str(strategy))
+        adapter.run(config, str(strategy))
 
 
 def test_vectorbt_partial_missing_symbol_fails_loudly(tmp_path):
     strategy = _write_strategy(tmp_path)
     _write_ohlcv(tmp_path, "SPY")  # QQQ deliberately missing
 
+    adapter = VectorbtAdapter()
+    config = _config(tmp_path, ["SPY", "QQQ"])
     with pytest.raises(RuntimeError, match="QQQ"):
-        VectorbtAdapter().run(_config(tmp_path, ["SPY", "QQQ"]), str(strategy))
+        adapter.run(config, str(strategy))

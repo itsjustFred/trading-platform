@@ -56,8 +56,9 @@ def test_missing_pyne_binary_fails_loudly(tmp_path, monkeypatch):
     )
 
     adapter = PyneCoreAdapter()
+    config = _config(tmp_path, ["SPY"])
     with pytest.raises(RuntimeError, match="pyne"):
-        adapter.run(_config(tmp_path, ["SPY"]), str(strategy))
+        adapter.run(config, str(strategy))
 
 
 def test_failed_pyne_run_fails_loudly(tmp_path, monkeypatch):
@@ -74,8 +75,10 @@ def test_failed_pyne_run_fails_loudly(tmp_path, monkeypatch):
         "runner.engines.pynecore_adapter.subprocess.run", fake_run
     )
 
+    adapter = PyneCoreAdapter()
+    config = _config(tmp_path, ["SPY"])
     with pytest.raises(RuntimeError, match="pyne_demo"):
-        PyneCoreAdapter().run(_config(tmp_path, ["SPY"]), str(strategy))
+        adapter.run(config, str(strategy))
 
 
 def test_pyne_timeout_is_reported_as_failure(tmp_path, monkeypatch):
@@ -92,8 +95,10 @@ def test_pyne_timeout_is_reported_as_failure(tmp_path, monkeypatch):
         "runner.engines.pynecore_adapter.subprocess.run", fake_run
     )
 
+    adapter = PyneCoreAdapter()
+    config = _config(tmp_path, ["SPY"])
     with pytest.raises(RuntimeError, match="timed out"):
-        PyneCoreAdapter().run(_config(tmp_path, ["SPY"]), str(strategy))
+        adapter.run(config, str(strategy))
 
 
 def test_stats_are_merged_across_symbols(tmp_path, monkeypatch):

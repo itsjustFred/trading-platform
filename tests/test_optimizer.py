@@ -522,16 +522,15 @@ def test_run_optimization_propagates_backtest_errors(monkeypatch, tmp_path: Path
         _forbid_call("strategy blew up", RuntimeError),
     )
 
+    config = optimizer_module.OptimizationConfig(
+        base_backtest_id="base-demo",
+        target_metric="sharpe",
+        n_trials=1,
+        train_split_pct=0.7,
+        parameter_ranges={"window": {"type": "int", "min": 2, "max": 2, "step": 1}},
+    )
     with pytest.raises(RuntimeError) as exc_info:
-        optimizer_module.run_optimization(
-            optimizer_module.OptimizationConfig(
-                base_backtest_id="base-demo",
-                target_metric="sharpe",
-                n_trials=1,
-                train_split_pct=0.7,
-                parameter_ranges={"window": {"type": "int", "min": 2, "max": 2, "step": 1}},
-            )
-        )
+        optimizer_module.run_optimization(config)
     assert "No optimization trial completed successfully" in str(exc_info.value)
     assert "strategy blew up" in str(exc_info.value.__cause__)
 
@@ -677,13 +676,12 @@ def test_all_trials_failing_raises_informative_error(monkeypatch, tmp_path: Path
         _forbid_call("strategy blew up", RuntimeError),
     )
 
+    config = optimizer_module.OptimizationConfig(
+        base_backtest_id="base-demo",
+        target_metric="sharpe",
+        n_trials=1,
+        train_split_pct=0.7,
+        parameter_ranges={"window": {"type": "int", "min": 2, "max": 2, "step": 1}},
+    )
     with pytest.raises(RuntimeError, match="No optimization trial completed successfully"):
-        optimizer_module.run_optimization(
-            optimizer_module.OptimizationConfig(
-                base_backtest_id="base-demo",
-                target_metric="sharpe",
-                n_trials=1,
-                train_split_pct=0.7,
-                parameter_ranges={"window": {"type": "int", "min": 2, "max": 2, "step": 1}},
-            )
-        )
+        optimizer_module.run_optimization(config)
