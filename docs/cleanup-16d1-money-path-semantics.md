@@ -241,3 +241,20 @@ covered by the deterministic regression fixtures instead (this fixture opens
 at most one position at a time, so realized-only vs MTM sizing coincide).
 The changed fields (vectorbt `total_bars`, curve timing) are exactly the
 documented semantics fixes.
+
+## D8 appendix — annualization ceiling
+
+`_infer_portfolio_periods_per_year` caps the inferred periods-per-year at
+`252 × 4` (≈1008): equity points spaced more than ~8.7 hours apart are
+treated as daily-or-coarser and map to the 252 convention; faster cadences
+scale linearly up to the cap. This keeps sub-hourly curves from producing
+absurd sqrt multipliers while still annualizing intraday curves proportionally.
+
+## D11 appendix — vectorbt bar-count reload
+
+`VectorbtAdapter.run` re-loads each symbol's OHLCV once after the per-symbol
+processing loop purely to count bars for `meta.total_bars` (F6). The count
+could be threaded out of `_process_symbol` instead; the second read is
+bounded by the same parquet pages the loop just touched and keeps
+`_process_symbol`'s signature (and its ProcessPoolExecutor pickling surface)
+unchanged. Revisit when 16-D2 touches the adapter.
