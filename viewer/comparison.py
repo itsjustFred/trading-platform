@@ -143,6 +143,35 @@ def compute_combined_stats(
     }
 
 
+def _fill_combined_view(
+    strategies: list[dict[str, Any]], combined_view: dict[str, Any]
+) -> None:
+    """Populate the 50/50 combined view for an already arity-checked pair."""
+    eq_a = strategies[0].get("equity_curve", [])
+    eq_b = strategies[1].get("equity_curve", [])
+
+    if not eq_a:
+        combined_view["errors"].append(
+            f"No equity curve for {strategies[0].get('name', 'Strategy A')}"
+        )
+    if not eq_b:
+        combined_view["errors"].append(
+            f"No equity curve for {strategies[1].get('name', 'Strategy B')}"
+        )
+    if not eq_a or not eq_b:
+        return
+
+    dates, vals_a, vals_b = _align_series(eq_a, eq_b)
+    if not dates:
+        combined_view["errors"].append("No overlapping dates between strategies")
+        return
+
+    combined_eq = compute_combined_equity(dates, vals_a, vals_b)
+    combined_stats = compute_combined_stats(dates, vals_a, vals_b, combined_eq)
+    combined_view["combined_equity_curve"] = combined_eq
+    combined_view["combined_stats"] = combined_stats
+
+
 def compare_backtests(strategies: list[dict[str, Any]]) -> dict[str, Any]:
     """
     Compare exactly two backtest results.
@@ -189,27 +218,7 @@ def compare_backtests(strategies: list[dict[str, Any]]) -> dict[str, Any]:
         }
 
     if len(strategies) >= 2:
-        eq_a = strategies[0].get("equity_curve", [])
-        eq_b = strategies[1].get("equity_curve", [])
-
-        if eq_a and eq_b:
-            dates, vals_a, vals_b = _align_series(eq_a, eq_b)
-            if not dates:
-                combined_view["errors"].append("No overlapping dates between strategies")
-            else:
-                combined_eq = compute_combined_equity(dates, vals_a, vals_b)
-                combined_stats = compute_combined_stats(dates, vals_a, vals_b, combined_eq)
-                combined_view["combined_equity_curve"] = combined_eq
-                combined_view["combined_stats"] = combined_stats
-        else:
-            if not eq_a:
-                combined_view["errors"].append(
-                    f"No equity curve for {strategies[0].get('name', 'Strategy A')}"
-                )
-            if not eq_b:
-                combined_view["errors"].append(
-                    f"No equity curve for {strategies[1].get('name', 'Strategy B')}"
-                )
+        _fill_combined_view(strategies, combined_view)
 
     return {
         "strategies": [
