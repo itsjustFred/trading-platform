@@ -9643,16 +9643,12 @@ async def remove_empty_portfolios() -> dict[str, Any]:
     }
 
 
-@app.post("/api/portfolios", status_code=201)
-async def create_portfolio(payload: CreatePortfolioRequest) -> dict[str, Any]:
-    name = str(payload.name or "Untitled").strip() or "Untitled"
-    account_capital = float(payload.account_capital or 100000.0)
-    if not math.isfinite(account_capital) or account_capital <= 0:
-        raise HTTPException(status_code=400, detail="account_capital must be positive")
-
-    component_payloads = _resolve_component_payloads(payload)
-    allows_empty_portfolio = len(component_payloads) == 0
-
+def _build_portfolio_components_from_backtests(
+    component_payloads: list[dict[str, Any]],
+    *,
+    account_capital: float,
+) -> tuple[list[dict[str, Any]], list[pd.Series], list[dict[str, Any]]]:
+    """Load each component backtest and derive its returns, trades and stats."""
     component_returns: list[pd.Series] = []
     components: list[dict[str, Any]] = []
     all_trades_timed: list[dict[str, Any]] = []
@@ -9756,11 +9752,16 @@ async def create_portfolio(payload: CreatePortfolioRequest) -> dict[str, Any]:
                 ),
             }
         )
+    return components, component_returns, all_trades_timed
 
-    if not component_returns and not allows_empty_portfolio:
-        raise HTTPException(status_code=400, detail="No valid components found")
 
-    now = datetime.now(timezone.utc)
+def _portfolio_combined_metrics(
+    component_returns: list[pd.Series],
+    *,
+    account_capital: float,
+    now: datetime,
+) -> tuple[dict[str, Any], list[legacy_viewer.EquityPoint], dict[str, Any]]:
+    """Combine component return streams into portfolio metrics and equity curve."""
     if component_returns:
         combined_df = pd.concat(component_returns, axis=1).fillna(0.0)
         portfolio_daily_returns = combined_df.sum(axis=1)
@@ -9802,6 +9803,38 @@ async def create_portfolio(payload: CreatePortfolioRequest) -> dict[str, Any]:
             "psr": 0.0,
             "p_value": 1.0,
         }
+
+    return correlation_matrix, combined_equity_points, stats_result
+
+
+@app.post("/api/portfolios", status_code=201)
+async def create_portfolio(payload: CreatePortfolioRequest) -> dict[str, Any]:
+    name = str(payload.name or "Untitled").strip() or "Untitled"
+    account_capital = float(payload.account_capital or 100000.0)
+    if not math.isfinite(account_capital) or account_capital <= 0:
+        raise HTTPException(status_code=400, detail="account_capital must be positive")
+
+    component_payloads = _resolve_component_payloads(payload)
+    allows_empty_portfolio = len(component_payloads) == 0
+
+    component_returns: list[pd.Series] = []
+    components: list[dict[str, Any]] = []
+    all_trades_timed: list[dict[str, Any]] = []
+
+    components, component_returns, all_trades_timed = _build_portfolio_components_from_backtests(
+        component_payloads,
+        account_capital=account_capital,
+    )
+
+    if not component_returns and not allows_empty_portfolio:
+        raise HTTPException(status_code=400, detail="No valid components found")
+
+    now = datetime.now(timezone.utc)
+    correlation_matrix, combined_equity_points, stats_result = _portfolio_combined_metrics(
+        component_returns,
+        account_capital=account_capital,
+        now=now,
+    )
 
     portfolio_id = _portfolio_identifier(name, now=now)
     all_trades_timed.sort(key=_component_trade_time)
