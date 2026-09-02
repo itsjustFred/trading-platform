@@ -25,13 +25,24 @@ import pytest
         "https://platform.dukascopy.com/demo/jforex.jnlp/",
         "https://datafeed.dukascopy.com/datafeed/EURUSD/2024/00/01/00h_ticks.bi5",
         "https://freeserv.dukascopy.com/?x=1",
-        "http://platform.dukascopy.com/insecure.jnlp",
     ],
 )
 def test_is_allowed_dukascopy_url_accepts_dukascopy_hosts(url: str):
     from data_tools.downloaders import jforex_dl
 
     assert jforex_dl._is_allowed_dukascopy_url(url) is True
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://platform.dukascopy.com/insecure.jnlp",
+    ],
+)
+def test_is_allowed_dukascopy_url_rejects_plaintext_http(url: str):
+    from data_tools.downloaders import jforex_dl
+
+    assert jforex_dl._is_allowed_dukascopy_url(url) is False
 
 
 @pytest.mark.parametrize(

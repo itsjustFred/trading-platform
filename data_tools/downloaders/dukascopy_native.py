@@ -687,6 +687,19 @@ def _split_tick_sides(tick_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame
     return bid.reset_index(drop=True), ask.reset_index(drop=True)
 
 
+MERGED_TICK_COLUMNS = ["timestamp", "ask", "bid", "ask_vol", "bid_vol"]
+
+
+def _finalize_merged_ticks(merged: pd.DataFrame) -> pd.DataFrame:
+    """Project onto the merged tick column order, sorted and deduplicated."""
+    return (
+        merged[MERGED_TICK_COLUMNS]
+        .sort_values("timestamp")
+        .drop_duplicates(subset=["timestamp"])
+        .reset_index(drop=True)
+    )
+
+
 def _merge_tick_sides(bid_df: pd.DataFrame, ask_df: pd.DataFrame) -> pd.DataFrame:
     """Join side frames back onto a single bid+ask frame with explicit prefixes.
 
@@ -704,33 +717,21 @@ def _merge_tick_sides(bid_df: pd.DataFrame, ask_df: pd.DataFrame) -> pd.DataFram
             )
 
     if bid_df.empty and ask_df.empty:
-        return pd.DataFrame(
-            columns=["timestamp", "ask", "bid", "ask_vol", "bid_vol"]
-        )
+        return pd.DataFrame(columns=MERGED_TICK_COLUMNS)
 
     if ask_df.empty:
         # Keep the bid side without inventing ask values (DV-C2: no silent
         # substitution of bid data into ask columns).
-        merged = bid_df.rename(columns={})
-        merged["ask"] = pd.Series(dtype="float64")
-        merged["ask_vol"] = pd.Series(dtype="float64")
-        return (
-            merged[["timestamp", "ask", "bid", "ask_vol", "bid_vol"]]
-            .sort_values("timestamp")
-            .drop_duplicates(subset=["timestamp"])
-            .reset_index(drop=True)
-        )
+        merged = bid_df.copy()
+        merged["ask"] = pd.Series(dtype="float64", index=merged.index)
+        merged["ask_vol"] = pd.Series(dtype="float64", index=merged.index)
+        return _finalize_merged_ticks(merged)
 
     if bid_df.empty:
         merged = ask_df.copy()
-        merged["bid"] = pd.Series(dtype="float64")
-        merged["bid_vol"] = pd.Series(dtype="float64")
-        return (
-            merged[["timestamp", "ask", "bid", "ask_vol", "bid_vol"]]
-            .sort_values("timestamp")
-            .drop_duplicates(subset=["timestamp"])
-            .reset_index(drop=True)
-        )
+        merged["bid"] = pd.Series(dtype="float64", index=merged.index)
+        merged["bid_vol"] = pd.Series(dtype="float64", index=merged.index)
+        return _finalize_merged_ticks(merged)
 
     # The side frames carry disjoint column sets (built by _split_tick_sides
     # or the per-side assemblers), so the join needs no suffix handling.
@@ -746,12 +747,7 @@ def _merge_tick_sides(bid_df: pd.DataFrame, ask_df: pd.DataFrame) -> pd.DataFram
         raise RuntimeError(
             f"Merged tick frame is missing side columns after join: {sorted(missing)}"
         )
-    return (
-        merged[["timestamp", "ask", "bid", "ask_vol", "bid_vol"]]
-        .sort_values("timestamp")
-        .drop_duplicates(subset=["timestamp"])
-        .reset_index(drop=True)
-    )
+    return _finalize_merged_ticks(merged)
 
 
 def _prefix_ohlcv_columns(df: pd.DataFrame, side: str) -> pd.DataFrame:

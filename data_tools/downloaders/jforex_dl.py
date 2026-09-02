@@ -265,12 +265,17 @@ def _resolve_jnlp_url() -> str:
 
 
 def _is_allowed_dukascopy_url(url: str) -> bool:
-    """Return True only for Dukascopy-hosted remote resources (DV-B6a)."""
+    """Return True only for Dukascopy-hosted remote resources (DV-B6a).
+
+    HTTPS only: an http:// Dukascopy URL would let an on-path attacker plant a
+    tampered JAR that no digest pin has been configured for, defeating the
+    integrity-check contract.
+    """
     try:
         parsed = urlparse(str(url or "").strip())
     except ValueError:
         return False
-    if parsed.scheme not in {"https", "http"}:
+    if parsed.scheme != "https":
         return False
     host = (parsed.hostname or "").lower()
     if not host:

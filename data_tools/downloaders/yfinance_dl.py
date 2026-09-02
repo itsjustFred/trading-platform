@@ -60,9 +60,10 @@ YF_INTERVAL_MAP: dict[str, str] = {
 }
 
 # DV-B20: yfinance only ships 60m bars for the 4h output timeframe. Those are
-# resampled onto the agreed canonical bucket convention: a UTC-aligned hourly
-# grid with a 00:00 UTC origin (Dukascopy style). The raw provider bucket size
-# is retained in `source_bucket_timeframe` so cross-source comparisons know
+# resampled onto the proposed canonical bucket convention (parent record
+# leaves it open pending confirmation): a UTC-aligned hourly grid with a
+# 00:00 UTC origin (Dukascopy style). The raw provider bucket size is
+# retained in `source_bucket_timeframe` so cross-source comparisons know
 # what the numbers were built from.
 BUCKET_METADATA_COLUMN = "source_bucket_timeframe"
 
