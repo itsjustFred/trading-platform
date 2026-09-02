@@ -12,7 +12,10 @@
 export type PercentScale = "fraction" | "points";
 
 export const PERCENT_METRIC_SCALES = {
-  // /api/backtest/{id}/stats and portfolio combined_stats
+  // /api/backtest/{id}/stats (_stats_payload_from_result) and portfolio
+  // combined_stats. The unit of every key is pinned by
+  // tests/test_viewer_stats_contract.py::test_stats_payload_percent_scale_matches_frontend_contract —
+  // change the backend and that test together with this table.
   net_profit_pct: "points",
   win_rate: "points",
   max_drawdown_pct: "points",

@@ -99,3 +99,26 @@ def test_concurrent_job_updates_do_not_tear_state():
         assert job["status"] in {"completed", "failed", "running"}
     finally:
         core.evict_jobs(max_age_seconds=0)
+
+
+def test_evict_jobs_heals_orphan_timestamps():
+    """A writer that mutates _running_jobs/_JOBS_TIMESTAMP outside the helpers
+    must not corrupt the registry: evict_jobs repairs the divergence instead of
+    computing a wrong eviction age."""
+    from viewer import core
+
+    job_id = "job-orphan-timestamp"
+    try:
+        core.register_job(job_id)
+        # Simulate the divergent writer: job record removed, timestamp left.
+        with core._JOBS_LOCK:
+            core._running_jobs.pop(job_id, None)
+
+        core.evict_jobs(max_age_seconds=0)
+        with core._JOBS_LOCK:
+            assert job_id not in core._JOBS_TIMESTAMP
+        assert core.get_job(job_id) is None
+    finally:
+        with core._JOBS_LOCK:
+            core._running_jobs.pop(job_id, None)
+            core._JOBS_TIMESTAMP.pop(job_id, None)

@@ -115,9 +115,23 @@ def evict_jobs(*, max_age_seconds: float = 3600.0) -> int:
     """Drop terminal jobs whose final transition is older than the grace period.
 
     Returns the number of evicted records. Non-terminal jobs are never evicted.
+    Invariant: `_running_jobs` and `_JOBS_TIMESTAMP` share exactly the same key
+    set; every writer must touch both under `_JOBS_LOCK`. The divergence guard
+    below turns a forgotten timestamp write into a loud warning instead of a
+    silently wrong eviction age.
     """
     now = time.monotonic()
     with _JOBS_LOCK:
+        orphan_ids = _JOBS_TIMESTAMP.keys() - _running_jobs.keys()
+        if orphan_ids:  # pragma: no cover - a writer bypassed the helpers
+            for job_id in orphan_ids:
+                _JOBS_TIMESTAMP.pop(job_id, None)
+            logger.warning(
+                "Job registry: dropped %d orphan timestamp(s) with no job record; "
+                "a writer is mutating _running_jobs/_JOBS_TIMESTAMP outside the "
+                "register/finish/evict helpers",
+                len(orphan_ids),
+            )
         stale_ids = [
             job_id
             for job_id, job in _running_jobs.items()

@@ -467,6 +467,12 @@ def _run_backtest_sync(runner: Callable[[Any], Any], payload: Any) -> Any:
 
 
 def _resume_interrupted_tasks() -> None:
+    if not _LEGACY_HOOKS_INSTALLED:
+        raise RuntimeError(
+            "install_legacy_task_hooks() must run before _resume_interrupted_tasks: "
+            "the resume path writes task records through the persistence-aware "
+            "implementations, which only exist once the hooks are installed."
+        )
     records = list_background_task_records(statuses=["interrupted", "queued"])
     for record in records:
         try:
@@ -704,9 +710,13 @@ async def lifespan(app: FastAPI):
     app.state.jforex_jvm_prewarm_task = jforex_jvm_prewarm_task
     app.state.live_market_data_sync_task = live_market_data_sync_task
     await asyncio.to_thread(mark_background_tasks_interrupted, from_statuses=["queued", "running"])
+    # The hooks swap the persistence-aware task implementations onto the legacy
+    # module; they MUST be installed before any helper that creates or updates
+    # task records (resume below), or those writes land on the in-memory
+    # originals and never persist.
+    install_legacy_task_hooks()
     await asyncio.to_thread(_resume_interrupted_tasks)
     await asyncio.to_thread(legacy_viewer.evict_jobs)
-    install_legacy_task_hooks()
     try:
         yield
     finally:
@@ -8258,7 +8268,7 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
                     if proc.poll() is None:
                         proc.kill()
                     raise subprocess.SubprocessError(
-                        "Backtest timed out after 300 seconds"
+                        f"Backtest timed out after {BACKTEST_WATCHDOG_TIMEOUT_SECONDS:.0f} seconds"
                     )
                 if returncode == 0:
                     report_stage(handle, percent=96.0, message="Saving results...")

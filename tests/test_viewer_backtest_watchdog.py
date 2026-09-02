@@ -102,3 +102,13 @@ def test_watchdog_reports_timed_out_child():
 
     assert outcome is False
     assert proc.returncode is not None
+
+
+def test_timeout_error_message_reports_configured_budget(monkeypatch):
+    """The post-EOF timeout error must name the actual budget, not a hard-coded 300."""
+    from viewer import main as viewer_main
+
+    monkeypatch.setattr(viewer_main, "BACKTEST_WATCHDOG_TIMEOUT_SECONDS", 60.0)
+    message = f"Backtest timed out after {viewer_main.BACKTEST_WATCHDOG_TIMEOUT_SECONDS:.0f} seconds"
+    assert "60" in message
+    assert "300" not in message

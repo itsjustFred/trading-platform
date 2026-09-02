@@ -108,3 +108,27 @@ def test_core_stats_payload_handles_empty_trade_list():
     assert payload["worst_trade"] == 0
     assert payload["winners"] == 0
     assert payload["losers"] == 0
+
+
+def test_stats_payload_percent_scale_matches_frontend_contract():
+    """The frontend `PERCENT_METRIC_SCALES` table claims specific units for each
+    percent-like key. This pins the backend half of that contract so a producer
+    cannot silently flip between fraction (0..1) and percent points (0..100)."""
+    from viewer import core
+
+    payload = core._stats_payload_from_result(_result(_trades()))
+
+    # "points"-scaled keys in frontend/src/api/metricScale.ts.
+    for key in ("net_profit_pct", "win_rate", "max_drawdown_pct", "cagr"):
+        value = payload[key]
+        assert value is None or -100.0 <= value <= 100.0, (
+            f"{key}={value!r} is not in percent points (-100..100); "
+            "update frontend/src/api/metricScale.ts if the unit changed"
+        )
+    # "fraction"-scaled keys: probabilities and bounded ratios in 0..1.
+    for key in ("psr",):
+        value = payload[key]
+        assert value is None or 0.0 <= value <= 1.0, (
+            f"{key}={value!r} is not a fraction (0..1); "
+            "update frontend/src/api/metricScale.ts if the unit changed"
+        )
