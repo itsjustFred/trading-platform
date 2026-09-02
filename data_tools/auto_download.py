@@ -208,6 +208,44 @@ def _parquet_has_bar_in_range(path: Path, start_ts: pd.Timestamp, end_ts: pd.Tim
     return ((timestamps >= start_ts) & (timestamps <= end_ts)).any()
 
 
+def _timestamp_column_index(parquet_file: "pq.ParquetFile") -> int | None:
+    """Index of the (case-insensitive) ``timestamp`` column, or None if absent."""
+    columns = list(parquet_file.schema_arrow.names)
+    lowered = [column.lower() for column in columns]
+    if "timestamp" not in lowered:
+        return None
+    return lowered.index("timestamp")
+
+
+def _stat_boundary(
+    metadata: "pq.FileMetaData", column_index: int, row_group_index: int, boundary: str
+) -> pd.Timestamp | None:
+    """Min/max timestamp statistic of one row group, or None when unavailable."""
+    stats = metadata.row_group(row_group_index).column(column_index).statistics
+    if stats is None or not getattr(stats, "has_min_max", False):
+        return None
+    value = stats.min if boundary == "min" else stats.max
+    parsed = pd.to_datetime(value, utc=True, errors="coerce")
+    return None if pd.isna(parsed) else pd.Timestamp(parsed)
+
+
+def _row_group_edge_timestamp(
+    parquet_file: "pq.ParquetFile",
+    columns: list[str],
+    column_index: int,
+    row_group_index: int,
+    *,
+    last: bool,
+) -> pd.Timestamp | None:
+    """First (``last=False``) or last (``last=True``) timestamp of a row group."""
+    group = parquet_file.read_row_group(row_group_index, columns=[columns[column_index]])
+    if not group.num_rows:
+        return None
+    position = group.num_rows - 1 if last else 0
+    parsed = pd.to_datetime(group.column(0)[position].as_py(), utc=True, errors="coerce")
+    return None if pd.isna(parsed) else pd.Timestamp(parsed)
+
+
 def _parquet_timestamp_bounds(path: Path) -> tuple[pd.Timestamp, pd.Timestamp] | None:
     """Read the min/max timestamp of a parquet without materializing the column.
 
@@ -227,43 +265,29 @@ def _parquet_timestamp_bounds(path: Path) -> tuple[pd.Timestamp, pd.Timestamp] |
         logger.warning("Could not inspect OHLCV timestamps for %s: %s", path, exc)
         return None
 
-    metadata = parquet_file.metadata
-    columns = list(parquet_file.schema_arrow.names)
-    if "timestamp" not in [column.lower() for column in columns]:
+    column_index = _timestamp_column_index(parquet_file)
+    if column_index is None:
         return None
-    column_index = [column.lower() for column in columns].index("timestamp")
-
+    columns = list(parquet_file.schema_arrow.names)
+    metadata = parquet_file.metadata
     if metadata is None or metadata.num_rows == 0 or metadata.num_row_groups == 0:
         return None
 
-    def _boundary(row_group_index: int, boundary: str) -> pd.Timestamp | None:
-        stats = metadata.row_group(row_group_index).column(column_index).statistics
-        if stats is None or not getattr(stats, "has_min_max", False):
-            return None
-        value = stats.min if boundary == "min" else stats.max
-        parsed = pd.to_datetime(value, utc=True, errors="coerce")
-        return None if pd.isna(parsed) else pd.Timestamp(parsed)
+    last_group = metadata.num_row_groups - 1
+    start = _stat_boundary(metadata, column_index, 0, "min")
+    end = _stat_boundary(metadata, column_index, last_group, "max")
 
-    start = _boundary(0, "min")
-    end = _boundary(metadata.num_row_groups - 1, "max")
-    last_group_stats_end = end
+    # Statistics are only a lower bound: cross-check the last-group max
+    # against its actual last row, and fall back to real rows when the
+    # statistics are absent.
+    row_end = _row_group_edge_timestamp(
+        parquet_file, columns, column_index, last_group, last=True
+    )
+    if row_end is not None and (end is None or row_end > end):
+        end = row_end
+
     if start is None:
-        first = parquet_file.read_row_group(0, columns=[columns[column_index]])
-        if first.num_rows:
-            parsed = pd.to_datetime(first.column(0)[0].as_py(), utc=True, errors="coerce")
-            start = None if pd.isna(parsed) else pd.Timestamp(parsed)
-    if end is None or end == last_group_stats_end:
-        # Cross-check the last-group max against its actual last row: an
-        # out-of-order append makes the statistic understate the newest row.
-        last = parquet_file.read_row_group(
-            metadata.num_row_groups - 1, columns=[columns[column_index]]
-        )
-        if last.num_rows:
-            value = last.column(0)[last.num_rows - 1].as_py()
-            parsed = pd.to_datetime(value, utc=True, errors="coerce")
-            row_end = None if pd.isna(parsed) else pd.Timestamp(parsed)
-            if row_end is not None and (end is None or row_end > end):
-                end = row_end
+        start = _row_group_edge_timestamp(parquet_file, columns, column_index, 0, last=False)
 
     if start is None or end is None:
         return None

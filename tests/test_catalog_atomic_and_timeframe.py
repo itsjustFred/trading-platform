@@ -48,11 +48,10 @@ class TestAtomicCatalogWrite:
             raise KeyboardInterrupt("crash while serializing catalog")
 
         monkeypatch.setattr(catalog_builder.json, "dumps", flaky_dumps)
+        rebuilt = catalog_builder.build_catalog(tmp_path)
 
         with pytest.raises(KeyboardInterrupt):
-            catalog_builder.write_catalog_json(
-                catalog_path, catalog_builder.build_catalog(tmp_path)
-            )
+            catalog_builder.write_catalog_json(catalog_path, rebuilt)
 
         # The existing catalog is still valid JSON and unparsed entries survive.
         payload = json.loads(catalog_path.read_text())
