@@ -201,7 +201,8 @@ def test_bootstrap_uses_expected_digests(monkeypatch, tmp_path: Path):
     )
 
     assert [path.name for path in downloaded] == ["api.jar"]
-    assert verified and verified[0][0] == jar_urls[0]
+    assert verified
+    assert verified[0][0] == jar_urls[0]
     assert verified[0][1].get(jar_urls[0]) == _sha256(payload)
 
 
@@ -381,7 +382,8 @@ def test_discover_jars_finds_local_jars(tmp_path: Path):
     discovered = jforex_dl._discover_jars(tmp_path)
 
     names = [path.name for path in discovered]
-    assert "sdk.jar" in names and "api.jar" in names
+    assert "sdk.jar" in names
+    assert "api.jar" in names
     assert len(discovered) == len(set(discovered)), "duplicates must be deduped"
 
 
