@@ -303,6 +303,10 @@ async def _download_missing_symbols(
     refreshed: list[str] = []
     errors: list[str] = []
     total_missing = max(len(missing), 1)
+    # One window definition for the download request and the coverage check:
+    # both must describe the exact same date range.
+    start_date = start.strftime("%Y-%m-%d")
+    end_date = end.strftime("%Y-%m-%d")
 
     for index, symbol in enumerate(missing, start=1):
         # The pre-download record reports the symbols finished so far
@@ -330,13 +334,11 @@ async def _download_missing_symbols(
                     ensure_backtest_data,
                     symbols=[symbol],
                     timeframe=timeframe,
-                    start=start.strftime("%Y-%m-%d"),
-                    end=end.strftime("%Y-%m-%d"),
+                    start=start_date,
+                    end=end_date,
                     modeling_resolution="main_timeframe",
                 )
-            if _symbol_is_fresh(
-                symbol, start=start.strftime("%Y-%m-%d"), end=end.strftime("%Y-%m-%d")
-            ):
+            if _symbol_is_fresh(symbol, start=start_date, end=end_date):
                 # Only count the symbol as finished (and record the progress)
                 # once the coverage check actually passed.
                 refreshed.append(symbol)
@@ -352,7 +354,7 @@ async def _download_missing_symbols(
             else:
                 errors.append(
                     f"{symbol}: download completed but no OHLCV data covering "
-                    f"{start.strftime('%Y-%m-%d')}..{end.strftime('%Y-%m-%d')} "
+                    f"{start_date}..{end_date} "
                     f"for {', '.join(REFRESH_TIMEFRAMES)}"
                 )
         except (RuntimeError, OSError, ValueError) as exc:
