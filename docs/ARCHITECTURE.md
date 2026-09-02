@@ -216,6 +216,14 @@ has reviewed it:
 4. only then can the strategy run; if the file changes afterwards, the
    approval is void and the gate refuses execution.
 
+The gate lives in `runner.auto_agent.run_validated_backtest`, which is the only
+supported way to execute a generated strategy. Engine adapters
+(`runner/engines/*`) intentionally do not check approvals — they cannot tell a
+generated file from a hand-written one. Any new execution route for strategy
+files MUST go through `run_validated_backtest` (or call
+`runner.approval_gate.require_approval` itself); calling
+`EngineAdapter.run(...)` directly bypasses the human review gate.
+
 ## Metrics and chart semantics
 
 - `runner/stats.py` keeps max drawdown as a decimal fraction
