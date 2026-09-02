@@ -220,7 +220,10 @@ function boundDate(
     return null;
   }
   const sorted = filtered.sort((a, b) => a.localeCompare(b));
-  return pick === "first" ? sorted[0] : sorted.at(-1) ?? null;
+  if (pick === "first") {
+    return sorted[0];
+  }
+  return sorted.at(-1) ?? null;
 }
 
 function minDate(values: Array<string | null | undefined>) {
