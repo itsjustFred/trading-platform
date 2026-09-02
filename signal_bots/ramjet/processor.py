@@ -119,6 +119,9 @@ class RamJetSignalProcessor:
             frame["h_pc_st"] = (frame["high"] - frame["close"].shift(1)).abs()
             frame["l_pc_st"] = (frame["low"] - frame["close"].shift(1)).abs()
             frame["tr_st"] = frame[["h_l_st", "h_pc_st", "l_pc_st"]].max(axis=1)
+            # First bar has no previous close: seed its TR with high - low so
+            # the ATR recursion starts from a real range, not 0.
+            frame["tr_st"] = frame["tr_st"].fillna(frame["h_l_st"])
             frame["atr_st"] = frame["tr_st"].ewm(alpha=1 / period, adjust=False).mean()
 
             basic_upper = (hl2 + (multiplier * frame["atr_st"])).to_numpy()
@@ -128,7 +131,12 @@ class RamJetSignalProcessor:
             n_rows = len(frame)
             final_upper = np.full(n_rows, np.nan)
             final_lower = np.full(n_rows, np.nan)
-            supertrend = np.ones(n_rows, dtype=bool)
+            # Fail-closed seeding (Cleanup #35): before the ATR has enough
+            # data the Supertrend direction is unknown and is reported as
+            # bearish/False. The old code seeded an all-True array, so early
+            # bars compared close against uninitialized zero bands and
+            # reported a green Supertrend derived from nothing.
+            supertrend = np.zeros(n_rows, dtype=bool)
 
             first_valid_idx = 0
             for i in range(n_rows):
@@ -139,6 +147,9 @@ class RamJetSignalProcessor:
             if n_rows > first_valid_idx:
                 final_upper[first_valid_idx] = basic_upper[first_valid_idx]
                 final_lower[first_valid_idx] = basic_lower[first_valid_idx]
+                supertrend[first_valid_idx] = bool(
+                    close[first_valid_idx] >= final_lower[first_valid_idx]
+                )
 
             for i in range(first_valid_idx + 1, n_rows):
                 if basic_upper[i] < final_upper[i - 1] or close[i - 1] > final_upper[i - 1]:

@@ -11,6 +11,13 @@ Long-Entry, wenn VIX oberhalb des Regime-Schwellenwerts notiert, RSI oversold is
 Signal: `VIX > 20`, `RSI(14) < 35` und `close < SMA(20)`.
 Die VIX-Reihe wird aus lokalem `VIX/1d.parquet` auf die SPY-Bars gemappt.
 
+> **Cleanup #35:** Fehlende VIX-Daten schliessen das Regime-Gate
+> (**fail-closed**): ohne `VIX/1d.parquet` entstehen keine Entries. Aeltere
+> Versionen ersetzten fehlende VIX-Werte durch `vix_threshold + 1` und
+> degradierten damit still zu einer RSI+SMA-Mean-Reversion ohne VIX-Filter.
+> Die Spalten `VIX_Data_Available` / `VIX_Fallback_Used` in den Indikatoren
+> spiegeln diesen Zustand explizit wider.
+
 ### Exit
 Vollausstieg bei einem von vier Events:
 1. Stop-Loss-Hit auf dem ATR-Stop.

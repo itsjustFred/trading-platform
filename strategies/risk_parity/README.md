@@ -1,8 +1,17 @@
-# Risk Parity
+# Volatility-Regime Long (single instrument) — slug `risk_parity`
+
+> **Naming-Integrity (Cleanup #35 / Settlement S15):** Diese Strategie ist
+> KEINE Multi-Asset-Risk-Parity. Implementiert ist ein single-instrument
+> long/flat-System mit Volatilitaets-Regime- und SMA-Trendfilter. Der
+> Verzeichnis-/Slug-Name `risk_parity` bleibt aus Kompatibilitaetsgruenden
+> mit bestehenden Backtest-Artefakten erhalten. Die echte Multi-Asset-
+> Risk-Parity-Gewichtung liegt in `scripts/run_risk_parity_backtest.py`
+> (QuantConnect-Reimplementierung) und `runner/risk_parity_optimizer.py`.
 
 ## Quelle
 - Original: Python-Strategie im Repository, inspiriert durch `desenyon/RiskParityAlpha`
 - Konvertiert: 2026-03-08
+- Umbenannt/umetikettiert: 2026-09-02 (Cleanup #35)
 
 ## Kernlogik
 

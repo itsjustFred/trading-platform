@@ -1,13 +1,22 @@
-# Statistical Arbitrage Pairs
+# Single-Leg Z-Score Mean Reversion — slug `stat_arb_pairs`
+
+> **Naming-Integrity (Cleanup #35 / Settlement S15):** Diese Strategie ist
+> KEIN Pairs-Trading. Es gibt kein zweites Bein, keinen Spread zwischen zwei
+> Instrumenten und keine Market-Neutral-Absicherung — der Z-Score wird auf
+> den kumulierten Log-Returns des EINZELNEN Instruments berechnet. Der
+> Verzeichnis-/Slug-Name `stat_arb_pairs` bleibt aus Kompatibilitaetsgruenden
+> mit bestehenden Backtest-Artefakten erhalten; die Meta-Tags beschreiben
+> das implementierte Single-Leg-Verhalten.
 
 ## Quelle
 - Original: Python-Strategie im Repository, inspiriert durch `desenyon/quantconnect-strategies`
 - Konvertiert: 2026-03-08
+- Umbenannt/umetikettiert: 2026-09-02 (Cleanup #35)
 
 ## Kernlogik
 
 ### Entry
-Long-Entry, wenn der vereinfachte Spread-Proxy stark negativ vom Mittelwert abweicht.
+Long-Entry, wenn der Z-Score der kumulierten Log-Returns des Instruments stark negativ vom Mittelwert abweicht.
 Signal: `ZScore <= -2.0`.
 Der Z-Score wird auf kumulierten Log-Returns ueber ein `lookback` von 60 Bars berechnet.
 

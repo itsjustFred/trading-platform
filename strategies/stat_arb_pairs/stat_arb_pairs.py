@@ -1,7 +1,14 @@
 """
-Statistical Arbitrage Pairs Trading Strategy
+Single-Leg Z-Score Mean Reversion
 
-Simplified pairs trading: Z-score of a spread proxy. Long-only for vectorbt compatibility.
+Single-instrument mean reversion on the instrument's own cumulative log
+return (z-scored over a rolling window). Long-only for vectorbt
+compatibility.
+
+Naming integrity (Cleanup #35 / Settlement S15): this file does NOT trade a
+pair — there is no second leg, no spread between two instruments and no
+market-neutral hedge. Meta/tags below describe the implemented single-leg
+behavior so discovery/portfolio tooling does not route it as pairs trading.
 """
 
 import numpy as np
@@ -9,15 +16,25 @@ import pandas as pd
 
 
 STRATEGY_META = {
-    "name": "Statistical Arbitrage Pairs",
-    "version": "1.0.0",
+    "name": "Single-Leg Z-Score Mean Reversion",
+    "version": "1.1.0",
     "source_url": "https://github.com/desenyon/quantconnect-strategies/blob/main/statistical_arbitrage_pairs.py",
+    "notes": (
+        "- KEIN Pairs-Trading: der Z-Score wird auf den kumulierten Log-"
+        "Returns des EINZELNEN Instruments berechnet (Single-Leg Mean "
+        "Reversion), nicht auf einem Spread zwischen zwei Instrumenten.\n"
+        "- Long-only; keine Market-Neutral-Absicherung."
+    ),
     "tags": {
-        "type": ["mean-reversion", "pairs-trading"],
+        "type": ["mean-reversion", "single-instrument", "z-score"],
         "source": "desenyon-github",
         "link": "https://github.com/desenyon/quantconnect-strategies",
         "asset_class": ["equities"],
         "complexity": "medium",
+        "naming_note": (
+            "slug retained as stat_arb_pairs for backtest-artifact compatibility; "
+            "implementation is single-leg z-score mean reversion, not a pair"
+        ),
     },
 }
 

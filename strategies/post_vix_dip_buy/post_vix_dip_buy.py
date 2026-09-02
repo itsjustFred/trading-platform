@@ -3,6 +3,12 @@ Strategy: Post VIX Dip Buy
 
 Buys SPY on panic dips: when VIX spikes significantly and SPY drops,
 enter a mean-reversion long trade expecting a bounce.
+
+VIX data dependency (Cleanup #35): the VIX close series is read from
+``<DATA_DIR>/ohlcv/**/VIX/1d.parquet``. When the dataset is missing the
+regime gate is FAIL-CLOSED: no entries are produced (the strategy does not
+degrade to a VIX-less mean-reversion system). ``_load_vix_data`` honours
+its ``start``/``end`` arguments so callers can request a bounded window.
 """
 
 STRATEGY_META = {
@@ -15,6 +21,13 @@ STRATEGY_META = {
         "link": "https://discord.com/channels/zenomtrader",
         "asset_class": ["equities", "etf"],
         "complexity": "medium",
+    },
+    "data_requirements": {
+        "vix": {
+            "symbol": "VIX",
+            "timeframe": "1d",
+            "missing_data_behavior": "fail_closed",
+        }
     },
 }
 
@@ -38,7 +51,15 @@ def _load_vix_data(start: str = None, end: str = None) -> pd.Series | None:
     if "timestamp" in df.columns:
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
         df = df.set_index("timestamp")
-    return df["close"]
+
+    close = df["close"]
+    if start is not None:
+        start_ts = pd.Timestamp(start, tz="UTC")
+        close = close[close.index >= start_ts]
+    if end is not None:
+        end_ts = pd.Timestamp(end, tz="UTC")
+        close = close[close.index <= end_ts]
+    return close
 
 
 def _calc_rsi(series: pd.Series, period: int = 14) -> pd.Series:
@@ -75,22 +96,48 @@ def generate_signals(df: pd.DataFrame, params: dict):
         axis=1,
     ).max(axis=1)
     atr = tr.rolling(atr_period).mean()
-    vix = _load_vix_data()
 
-    vix_aligned = pd.Series(np.nan, index=df.index)
-    vix_data_available = pd.Series(vix is not None, index=df.index)
-    if vix is not None and "timestamp" in df.columns:
-        spy_dates = pd.to_datetime(df["timestamp"]).dt.date
-        for i, current_date in enumerate(spy_dates):
-            vix_on_date = vix.loc[vix.index.date == current_date]
-            if len(vix_on_date) > 0:
-                vix_aligned.iloc[i] = vix_on_date.iloc[0]
-        vix_aligned = vix_aligned.ffill()
+    # VIX range is bounded by the strategy frame so the loader honours
+    # start/end instead of always reading the whole dataset.
+    if "timestamp" in df.columns:
+        frame_start = pd.to_datetime(df["timestamp"], utc=True).min()
+        frame_end = pd.to_datetime(df["timestamp"], utc=True).max()
     else:
-        vix_aligned = pd.Series(vix_threshold + 1, index=df.index)
+        frame_start = frame_end = None
+    vix = _load_vix_data(
+        start=str(frame_start.date()) if frame_start is not None else None,
+        end=str(frame_end.date()) if frame_end is not None else None,
+    )
 
+    vix_data_available = pd.Series(vix is not None, index=df.index)
     vix_fallback_used = pd.Series(vix is None, index=df.index)
-    entry_cond = (vix_aligned > vix_threshold) & (rsi < rsi_entry) & (close < sma)
+
+    # O(N) alignment: map each strategy bar to its date once, then join the
+    # (date -> VIX close) mapping. The old per-bar full-index scan was
+    # O(N x M) and effectively unrunnable on intraday frames.
+    vix_aligned = pd.Series(np.nan, index=df.index, dtype=float)
+    if vix is not None:
+        vix_by_date = pd.Series(
+            vix.to_numpy(), index=pd.to_datetime(vix.index, utc=True).date
+        )
+        vix_by_date = vix_by_date[~vix_by_date.index.duplicated(keep="last")]
+        if "timestamp" in df.columns:
+            bar_dates = pd.to_datetime(df["timestamp"], utc=True).dt.date
+        else:
+            bar_dates = pd.to_datetime(df.index, utc=True).date
+        vix_aligned = pd.Series(
+            vix_by_date.reindex(bar_dates).to_numpy(), index=df.index, dtype=float
+        )
+
+    # Fail-closed regime gate: without VIX data the gate is closed. The old
+    # behaviour fabricated vix_threshold + 1 for every bar, silently turning
+    # the VIX-dip system into plain RSI+SMA mean reversion.
+    entry_cond = (
+        vix_data_available
+        & (vix_aligned > vix_threshold)
+        & (rsi < rsi_entry)
+        & (close < sma)
+    )
 
     entries = pd.Series(False, index=df.index)
     exits = pd.Series(False, index=df.index)

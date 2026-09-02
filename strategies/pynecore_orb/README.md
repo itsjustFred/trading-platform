@@ -1,15 +1,22 @@
-# Opening Range Breakout
+# SMA Crossover ATR Bracket — slug `pynecore_orb`
+
+> **Naming-Integrity (Cleanup #35 / Settlement S15):** Diese Strategie
+> berechnet KEINE Opening Range. Implementiert ist ein SMA-Crossover
+> (schnelle SMA gegen 4x langsame SMA) mit EMA(200)-Trendfilter und
+> ATR-TP/SL-Bracket. Der Verzeichnis-/Slug-Name `pynecore_orb` bleibt aus
+> Kompatibilitaetsgruenden mit bestehenden Backtest-Artefakten erhalten.
 
 ## Quelle
 - Original: PyneCore/Pine-Style Python-Strategie im Repository, manuelle Konvertierung aus NinjaTrader 8 (C#)
 - Konvertiert: 2026-03-08
+- Umbenannt/umetikettiert: 2026-09-02 (Cleanup #35)
 
 ## Kernlogik
 
 ### Entry
-Long-Entry, wenn die schnelle SMA der Opening-Range die langsame SMA von unten nach oben kreuzt und der Preis oberhalb der EMA liegt.
+Long-Entry, wenn die schnelle SMA die langsame SMA von unten nach oben kreuzt und der Preis oberhalb der EMA liegt.
 Short-Entry, wenn die schnelle SMA die langsame SMA von oben nach unten kreuzt und der Preis unterhalb der EMA liegt.
-Standardparameter: `or_length=5`, `slow_sma = sma(or_length * 4)`, `EMA(200)` als Trendfilter.
+Standardparameter: `fast_length=5`, `slow_sma = sma(fast_length * 4)`, `EMA(200)` als Trendfilter.
 
 ### Exit
 Vollausstieg ausschliesslich ueber ATR-basiertes Take-Profit oder Stop-Loss.
@@ -30,8 +37,8 @@ Keine Partial Exits implementiert.
 ## Indikator-Einstellungen
 | Indikator | Parameter | Wert |
 |-----------|-----------|------|
-| Opening Range SMA Fast | Length | 5 |
-| Opening Range SMA Slow | Length | 20 |
+| SMA Fast | Length | 5 |
+| SMA Slow | Length | 20 |
 | EMA Trend Filter | Length | 200 |
 | ATR | Period | 14 |
 | Take Profit | ATR Multiplier | 2.0 |
