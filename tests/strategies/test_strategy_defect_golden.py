@@ -23,7 +23,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 def _load_strategy_module(relative: str, name: str):
     path = PROJECT_ROOT / relative
     spec = importlib.util.spec_from_file_location(name, str(path))
-    assert spec is not None and spec.loader is not None
+    assert spec is not None
+    assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -126,6 +127,39 @@ def test_pine_strategies_4_tuple_output_flows_through_vectorbt_normalization():
     assert set(indicators) == set(output[2])
 
 
+@pytest.mark.parametrize(
+    "relative",
+    sorted(
+        str(path.relative_to(PROJECT_ROOT)).replace("\\", "/")
+        for path in (PROJECT_ROOT / "strategies").rglob("*.py")
+        if not path.name.startswith("__")
+        and not path.stem.endswith("_context")
+        and path.parent.name == path.stem
+        and path.stem not in {"pynecore_orb", "pynecore_sma_crossover"}
+    ),
+)
+def test_every_strategy_module_returns_four_tuple_contract(relative):
+    """Repo-wide arity contract (Pre-mortem strategies #2, PR #61).
+
+    ``vectorbt_adapter._normalize_signal_output`` and the native engine both
+    repair a len-3 output silently, so a refactor that drops ``drawings``
+    from one strategy passes CI and only shows up as missing chart markers /
+    empty annotation exports later. Pinning every module keeps the ambiguity
+    from returning. The PyneCore scripts are excluded: they need the optional
+    ``pynecore`` package and are covered by the sibling test above plus
+    ``test_naming_integrity_meta_matches_implementation``.
+    """
+    module = _load_strategy_module(relative, "arity_" + Path(relative).stem)
+    if not hasattr(module, "generate_signals"):
+        pytest.skip("module exposes no generate_signals")
+    output = _call(module, _trend_frame())
+    assert isinstance(output, tuple), f"{relative}: generate_signals must return a tuple"
+    assert len(output) == 4, (
+        f"{relative}: generate_signals must return the 4-tuple platform contract "
+        "(entries, exits, indicators_dict, drawings)"
+    )
+
+
 # ---------------------------------------------------------------------------
 # 2. QG ES breakout: entries read inverted relative to breakout semantics
 # ---------------------------------------------------------------------------
@@ -134,32 +168,6 @@ def test_pine_strategies_4_tuple_output_flows_through_vectorbt_normalization():
 def _qg_module():
     return _load_strategy_module(
         "strategies/qg_30min_es_breakout_strategy/qg_30min_es_breakout_strategy.py", "qg_es"
-    )
-
-
-def _qg_frame(close_path: np.ndarray, minutes: int = 5) -> pd.DataFrame:
-    """Distribute a close path across many NY sessions at `minutes` after 9:30.
-
-    One bar per session keeps the strategy's in_time window deterministic and
-    makes `trades_today == 0` true on every session, so each session can
-    produce at most one entry.
-    """
-    rows = len(close_path)
-    sessions = pd.date_range("2024-01-02", periods=rows, freq="1D", tz="US/Eastern")
-    timestamps = (
-        sessions.normalize()
-        + pd.Timedelta(hours=9, minutes=30 + minutes)
-    ).tz_convert("UTC")
-    closes = close_path
-    return pd.DataFrame(
-        {
-            "timestamp": timestamps,
-            "open": closes,
-            "high": closes + 0.5,
-            "low": closes - 0.5,
-            "close": closes,
-            "volume": [1000.0] * rows,
-        }
     )
 
 
@@ -405,6 +413,35 @@ def test_post_vix_missing_vix_on_strategy_frame_is_reported(monkeypatch, tmp_pat
     uncovered = indicators["VIX"].isna()
     assert uncovered.iloc[-1], "bars without a VIX observation must not be fabricated"
     assert not entries[uncovered].any(), "no entry may fire on a fabricated VIX value"
+    # Pre-mortem strategies #5: partial coverage must be countable, not only
+    # row-by-row, so artifact reports can surface a half-covered frame even
+    # when the gate never fires.
+    assert indicators["VIX_Uncovered_Bars"] == int(uncovered.sum()) > 0
+
+
+def test_post_vix_duplicate_vix_dates_keep_last_and_tz_naive_bars_rejected(monkeypatch):
+    """Alignment must resolve duplicate VIX dates deterministically and
+    reject tz-naive bar sources (Pre-mortem strategies #5).
+
+    Duplicate dates (e.g. a corrected revision plus the original row in the
+    parquet) silently pick a value; ``keep="last"`` is the documented rule.
+    A naive bar index would be mis-dated against the UTC VIX series, so it
+    must fail loudly instead of trading on the previous day's VIX.
+    """
+    module = _vix_module()
+
+    duplicated = pd.Series(
+        [25.0, 35.0], index=pd.DatetimeIndex(["2024-01-01", "2024-01-01"], tz="UTC")
+    )
+    df = _daily_frame(10)
+    monkeypatch.setattr(module, "_load_vix_data", lambda start=None, end=None: duplicated)
+    _, _, indicators, _ = _call(module, df, {"sma_period": 3})
+    assert float(indicators["VIX"].iloc[0]) == 35.0, 'duplicate dates must keep "last"'
+
+    naive = df.copy()
+    naive["timestamp"] = naive["timestamp"].dt.tz_localize(None)
+    with pytest.raises(ValueError, match="tz-aware"):
+        _call(module, naive, {"sma_period": 3})
 
 
 # ---------------------------------------------------------------------------
@@ -475,6 +512,55 @@ def test_ramjet_supertrend_flags_are_complete_for_every_bar():
     supertrend = result["supertrend"]
     assert len(supertrend) == rows
     assert supertrend.notna().all() if pd.api.types.is_float_dtype(supertrend) else True
+
+
+def test_ramjet_supertrend_warmup_is_flagged_not_bearish():
+    """Pre-warm-up bars must be marked not-ready, not merely False.
+
+    With the fail-closed zero seed a short frame (e.g. period=100 on a
+    40-row live fetch) reads as bearish on every bar; the trailing flip
+    workflow would treat that as genuine direction. ``supertrend_ready``
+    separates "unknown" from "bearish" (Pre-mortem strategies #3).
+    """
+    RamJetSignalProcessor = _ramjet_module()
+    rows = 40
+    closes = np.linspace(100.0, 104.0, rows)
+    frame = pd.DataFrame(
+        {
+            "open": closes,
+            "high": closes + 0.4,
+            "low": closes - 0.4,
+            "close": closes,
+        },
+        index=pd.date_range("2026-01-01", periods=rows, freq="5min"),
+    )
+    result = RamJetSignalProcessor._calculate_supertrend(frame, period=100, multiplier=3.0)
+
+    ready = result["supertrend_ready"].astype(bool).to_numpy()
+    assert not ready.any(), (
+        "a frame shorter than the Supertrend period must be marked not-ready "
+        "so consumers do not read a direction into the fail-closed seed"
+    )
+
+    # A frame longer than the warm-up must become ready at the tail.
+    long_closes = np.linspace(100.0, 110.0, 150)
+    long_frame = pd.DataFrame(
+        {
+            "open": long_closes,
+            "high": long_closes + 0.4,
+            "low": long_closes - 0.4,
+            "close": long_closes,
+        },
+        index=pd.date_range("2026-01-01", periods=150, freq="5min"),
+    )
+    long_result = RamJetSignalProcessor._calculate_supertrend(
+        long_frame, period=100, multiplier=3.0
+    )
+    long_ready = long_result["supertrend_ready"].astype(bool).to_numpy()
+    assert long_ready[-1], "the tail of a long-enough frame must be ready"
+    assert not long_ready[:100].any(), (
+        "the first period bars must stay not-ready"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -575,6 +661,89 @@ def test_ivb_confirmation_semantics_are_stable_on_intraday_data():
     assert indicators["order_timing"].iloc[entry_idx] == "next_bar_open"
     assert indicators["sl_price"].iloc[entry_idx] == pytest.approx(
         float(df["close"].iloc[entry_idx + 1]) - float(indicators["stop_distance"].iloc[entry_idx])
+    )
+
+
+def test_ivb_confirmation_fallback_contract(monkeypatch, caplog):
+    """Forced-resample failure must fall back AND be visible (Pre-mortem #4).
+
+    Pins the except-path as a contract: entries still form on the
+    ``close.shift(1)`` definition, ``signal_price_fallback_used`` is True, the
+    price series actually used is exposed, and the failure is logged — a
+    total-fallback regression (e.g. after a pandas upgrade) must not be silent.
+    """
+    import logging as _logging
+
+    module = _ivb_module()
+    rows = 3 * 24 * 4
+    idx = pd.date_range("2024-01-01", periods=rows, freq="15min", tz="UTC")
+    df = pd.DataFrame(
+        {
+            "timestamp": idx,
+            "open": 100.0,
+            "high": 100.2,
+            "low": 99.8,
+            "close": 100.0,
+        }
+    )
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("resample unavailable")
+
+    monkeypatch.setattr(pd.Series, "resample", _boom)
+    with caplog.at_level(_logging.WARNING):
+        _, _, indicators, _ = _call(module, df)
+
+    fallback = indicators["signal_price_fallback_used"]
+    assert fallback.astype(bool).all(), "forced resample failure must use the fallback"
+    assert indicators["signal_price"].iloc[1] == pytest.approx(100.0)
+    assert any(
+        "close.shift(1)" in record.message and record.levelno >= _logging.WARNING
+        for record in caplog.records
+    ), "the fallback must be logged, not only flagged in indicators"
+
+
+def test_ivb_parity_reference_frame_does_not_use_fallback():
+    """The parity reference frame must run on the intended semantics.
+
+    If the confirmation path ever degrades into the fallback on well-formed
+    data (dependency drift, tz handling change), the golden reference above
+    would silently pin the fallback definition instead of the candle-close
+    convention. This makes that visible instead of coincidental.
+    """
+    module = _ivb_module()
+    breakout_bar = 3 * 24 * 4 + 66
+    rows = breakout_bar + 20
+    idx = pd.date_range("2024-01-01", periods=rows, freq="15min", tz="UTC")
+    close = np.full(rows, 100.0)
+    high = np.full(rows, 100.2)
+    low = np.full(rows, 99.8)
+    close[breakout_bar] = 110.0
+    high[breakout_bar] = 110.2
+    df = pd.DataFrame(
+        {"timestamp": idx, "open": close, "high": high, "low": low, "close": close}
+    )
+    params = dict(module.STRATEGY_META["parameters"])
+    params.update(
+        {
+            "use_candle_close": True,
+            "confirmation_timeframe": "15m",
+            "entry_time": "16:30",
+            "max_entry_time": "18:05",
+            "exit_time": "22:55",
+            "atr_period": 1,
+            "atr_long_period": 1,
+            "atr_regime_factor": 2.0,
+        }
+    )
+
+    _, _, indicators, _ = _call(module, df, params)
+
+    fallback = indicators["signal_price_fallback_used"]
+    assert not fallback.astype(bool).any(), (
+        "the parity reference frame must run the confirmation path, not the "
+        "close.shift(1) fallback — otherwise the pinned convention is the "
+        "fallback, not the documented semantics"
     )
 
 

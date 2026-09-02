@@ -99,9 +99,24 @@ def generate_signals(df: pd.DataFrame, params: dict):
 
     # VIX range is bounded by the strategy frame so the loader honours
     # start/end instead of always reading the whole dataset.
+    # TZ guard (Pre-mortem strategies #5, PR #61): bar dates are matched
+    # against UTC-normalized VIX daily closes. A tz-naive bar source would be
+    # silently re-interpreted as UTC and shift every bar date by the local
+    # offset, gating entries on the wrong day's VIX value — fail loudly
+    # instead.
     if "timestamp" in df.columns:
-        frame_start = pd.to_datetime(df["timestamp"], utc=True).min()
-        frame_end = pd.to_datetime(df["timestamp"], utc=True).max()
+        bar_ts = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+        raw_ts = pd.to_datetime(df["timestamp"], errors="coerce")
+        if raw_ts.notna().any() and (raw_ts.dt.tz is None):
+            raise ValueError(
+                "post_vix_dip_buy requires tz-aware bar timestamps "
+                "(naive timestamps would be mis-dated against the UTC VIX series)"
+            )
+        frame_start = bar_ts.min()
+        frame_end = bar_ts.max()
+    elif isinstance(df.index, pd.DatetimeIndex) and df.index.tz is not None:
+        frame_start = df.index.min()
+        frame_end = df.index.max()
     else:
         frame_start = frame_end = None
     vix = _load_vix_data(
@@ -122,9 +137,11 @@ def generate_signals(df: pd.DataFrame, params: dict):
         )
         vix_by_date = vix_by_date[~vix_by_date.index.duplicated(keep="last")]
         if "timestamp" in df.columns:
-            bar_dates = pd.to_datetime(df["timestamp"], utc=True).dt.date
+            bar_dates = bar_ts.dt.date
+        elif isinstance(df.index, pd.DatetimeIndex) and df.index.tz is not None:
+            bar_dates = df.index.date
         else:
-            bar_dates = pd.to_datetime(df.index, utc=True).date
+            bar_dates = pd.Series(pd.NaT, index=df.index).dt.date
         vix_aligned = pd.Series(
             vix_by_date.reindex(bar_dates).to_numpy(), index=df.index, dtype=float
         )
@@ -193,6 +210,7 @@ def generate_signals(df: pd.DataFrame, params: dict):
         "sl_price": sl_price,
         "VIX_Data_Available": vix_data_available,
         "VIX_Fallback_Used": vix_fallback_used,
+        "VIX_Uncovered_Bars": int(vix_aligned.isna().sum()),
         "bars_held_at_exit": bars_held_at_exit,
         "exit_price": exit_price,
         "exit_reason": exit_reason,

@@ -169,6 +169,16 @@ class RamJetSignalProcessor:
                     supertrend[i] = close[i] >= final_upper[i]
 
             frame["supertrend"] = supertrend
+            # Warm-up marker (Pre-mortem strategies #3, PR #61): with the
+            # fail-closed zero seed, "not yet computable" and "bearish" are
+            # indistinguishable in the bool column. supertrend_ready is False
+            # until the recursion has period bars of history after the first
+            # computable bar; consumers (e.g. the trailing-stop flip workflow)
+            # must not treat pre-warmup values as a genuine direction.
+            warmup_bars = max(int(period), 1)
+            frame["supertrend_ready"] = (
+                np.arange(n_rows) >= first_valid_idx + warmup_bars
+            )
             frame = frame.drop(
                 columns=["h_l_st", "h_pc_st", "l_pc_st", "tr_st", "atr_st"],
                 errors="ignore",
@@ -210,6 +220,11 @@ class RamJetSignalProcessor:
         stop_loss = entry_price - (atr_value * self.sl_multiplier)
         take_profit = entry_price + (atr_value * self.tp1_multiplier)
         latest_supertrend_green = bool(frame["supertrend"].iloc[-1])
+        # False while the frame is shorter than the Supertrend warm-up: in that
+        # regime supertrend=False means "unknown", not "bearish", so consumers
+        # of supertrend_green_at_entry / the trailing flip workflow must not
+        # read a direction into it.
+        supertrend_ready = bool(frame["supertrend_ready"].iloc[-1])
 
         timeframe = _resolve_timeframe(raw_signal.get("timeframe")) or self.default_timeframe
 
@@ -231,6 +246,7 @@ class RamJetSignalProcessor:
                 "tp1_price": take_profit,
                 "tp1_exit_percent": self.tp1_exit_percent,
                 "supertrend_green_at_entry": latest_supertrend_green,
+                "supertrend_ready": supertrend_ready,
                 "trailing_sl_config": {
                     "mode": "supertrend_flip",
                     "breakeven_after_tp1": True,

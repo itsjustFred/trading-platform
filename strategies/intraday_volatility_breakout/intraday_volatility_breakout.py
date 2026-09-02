@@ -17,8 +17,12 @@ Logic:
 
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+import logging
+
 import numpy as np
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 STRATEGY_META = {
     "name": "intraday_volatility_breakout",
@@ -356,11 +360,16 @@ def generate_signals(df: pd.DataFrame, params: dict):
                 signal_price_short = signal_price_long
                 confirmation_eval_mask = pd.Series(True, index=idx)
                 signal_price_fallback_used = pd.Series(True, index=idx)
-        except Exception:
+        except Exception as exc:
             # Cleanup #35: a genuine failure of the confirmation path must be
             # visible, not silently traded. The fallback (previous bar close)
             # is a DIFFERENT signal definition, so it is marked in the
-            # indicators instead of switching semantics invisibly.
+            # indicators AND logged instead of switching semantics invisibly.
+            logger.warning(
+                "intraday_volatility_breakout: confirmation resample failed "
+                f"({type(exc).__name__}: {exc}); falling back to close.shift(1) "
+                "signal prices (signal_price_fallback_used=True)"
+            )
             signal_price_long = close.shift(1)
             signal_price_short = signal_price_long
             confirmation_eval_mask = pd.Series(True, index=idx)
