@@ -6686,16 +6686,16 @@ def _codegen_gate_strategy_path(relative_file: str) -> Path:
     """Resolve a strategy relative file inside the strategies dir (traversal-safe)."""
     normalized = str(relative_file or "").strip()
     if not normalized or ".." in normalized or normalized.startswith("/"):
-        raise _invalid_strategy_file_path()
+        raise _invalid_strategy_file_path_error()
     candidate = (STRATEGIES_DIR / normalized).resolve()
     try:
         candidate.relative_to(STRATEGIES_DIR.resolve())
     except ValueError:
-        raise _invalid_strategy_file_path() from None
+        raise _invalid_strategy_file_path_error() from None
     return candidate
 
 
-def _invalid_strategy_file_path() -> HTTPException:
+def _invalid_strategy_file_path_error() -> HTTPException:
     """Build the 400 raised when a strategy path fails traversal checks."""
     return HTTPException(status_code=400, detail="Invalid strategy file path")
 

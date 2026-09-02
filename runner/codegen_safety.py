@@ -198,7 +198,7 @@ def _screen_import(node: ast.Import | ast.ImportFrom) -> str | None:
                 return reason
         return None
 
-    return _import_ban_reason((node.module or "").split(".")[0], from_import=True)
+    return _import_ban_reason(import_root(node), from_import=True)
 
 
 def _screen_call(node: ast.Call) -> str | None:
