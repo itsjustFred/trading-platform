@@ -175,7 +175,7 @@ def test_in_process_uses_resolved_dates_for_daily_equity(monkeypatch, tmp_path):
     monkeypatch.setattr(bg, "resolve_strategy_parameters", lambda s, p: dict(p or {}))
     monkeypatch.setattr(bg, "_detect_date_range", lambda *a, **k: ("2024-01-01", "2024-02-01"))
     monkeypatch.setattr(bg, "ensure_backtest_data", lambda **k: [])
-    monkeypatch.setattr(bg, "compute_stats_for_result", lambda r: {})
+    monkeypatch.setattr(bg, "merge_canonical_stats", lambda r: None)
 
     captured: dict[str, str | None] = {}
 

@@ -27,7 +27,7 @@ from runner.backtest_grid import DEFAULT_OUTPUT_DIR, parse_csv_list, parse_param
 from runner.backtest_matrix import MATRIX_OUTPUT_DIR, run_backtest_matrix
 from runner.daily_equity import attach_daily_equity
 from runner.engines.base import BacktestConfig, EngineAdapter, resolve_strategy_parameters
-from runner.stats import compute_stats_for_result
+from runner.stats import merge_canonical_stats
 from runner.walkforward import run_walkforward
 from shared.constants import DATA_DIR, normalize_timeframe
 from shared.database import save_result_to_sqlite
@@ -232,7 +232,7 @@ def cmd_run(args):
     if engine.name != "native":
         _emit_progress(progress_callback, 90.0, "Calculating statistics...")
     attach_daily_equity(result, start=start, end=end)
-    result.stats = {**result.stats, **compute_stats_for_result(result)}
+    merge_canonical_stats(result)
 
     # Save result
     _emit_progress(progress_callback, 95.0, "Saving results...")

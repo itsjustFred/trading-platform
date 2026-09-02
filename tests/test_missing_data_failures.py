@@ -79,3 +79,32 @@ def test_vectorbt_partial_missing_symbol_fails_loudly(tmp_path):
     config = _config(tmp_path, ["SPY", "QQQ"])
     with pytest.raises(RuntimeError, match="QQQ"):
         adapter.run(config, str(strategy))
+
+
+class _FailingSymbolProcessor:
+    """Module-level stand-in for _process_symbol: ProcessPoolExecutor needs a
+    picklable callable, so the failing symbol raises inside the worker."""
+
+    def __call__(self, symbol, config, strategy_path, resolved_parameters, data_root):
+        if symbol == "QQQ":
+            raise RuntimeError("No OHLCV data for QQQ/1d")
+        return [], [], [], []
+
+
+def test_vectorbt_parallel_branch_preserves_loud_failure(monkeypatch):
+    """Pre-mortem hardening (16-B #3): in the ProcessPoolExecutor branch a
+    per-symbol failure must still raise, not degrade into a partial success."""
+    from types import SimpleNamespace
+
+    import runner.engines.vectorbt_adapter as module
+
+    monkeypatch.setattr(module, "_process_symbol", _FailingSymbolProcessor())
+    monkeypatch.setattr(module, "resolve_strategy_parameters", lambda *a, **k: {})
+    monkeypatch.setattr(
+        module, "_load_strategy_module", lambda path: SimpleNamespace(generate_signals=None)
+    )
+
+    config = _config(Path("/tmp"), ["SPY", "QQQ"])
+    with pytest.raises(RuntimeError, match="QQQ") as exc_info:
+        VectorbtAdapter().run(config, "unused.py")
+    assert "No OHLCV data" in str(exc_info.value.__cause__)

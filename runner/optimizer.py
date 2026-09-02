@@ -295,6 +295,20 @@ def run_optimization(
             return NO_TRADE_PENALTY
 
         metric_value = _metric_value(train_stats, config.target_metric)
+        # The NO_TRADE_PENALTY floor only steers Optuna correctly while every
+        # honest metric value ranks above it. A metric that reaches the floor
+        # (e.g. a raw-PnL target on a large account) would silently invert the
+        # no-trade steering, so record the failure loudly instead.
+        if metric_value <= NO_TRADE_PENALTY:
+            _record_failure(
+                trial,
+                ValueError(
+                    f"{config.target_metric}={metric_value} is at or below the "
+                    f"no-trade penalty floor ({NO_TRADE_PENALTY}); the floor only "
+                    "holds for metrics bounded above it. Choose a different "
+                    "target_metric or raise NO_TRADE_PENALTY's magnitude."
+                ),
+            )
         trial.set_user_attr("penalty_applied", False)
         trial.set_user_attr("metric_name", _metric_key(config.target_metric, train_stats))
         trial.set_user_attr("metric_value", metric_value)

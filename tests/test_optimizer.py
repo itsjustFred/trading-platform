@@ -645,6 +645,62 @@ def test_no_trade_trials_lose_against_honest_negative_trials(monkeypatch, tmp_pa
     assert no_trade_trial["value"] is None or no_trade_trial["value"] < -0.5
 
 
+def test_metric_reaching_no_trade_penalty_floor_fails_loudly(monkeypatch, tmp_path: Path):
+    """Pre-mortem hardening: the floor only steers correctly while honest metric
+    values rank above it; a metric that reaches it must raise instead of
+    silently inverting the no-trade steering."""
+    backtests_dir = tmp_path / "backtests"
+    optimizations_dir = tmp_path / "optimizations"
+    backtests_dir.mkdir(parents=True, exist_ok=True)
+    _write_base_backtest(backtests_dir)
+
+    monkeypatch.setattr(optimizer_module, "BACKTESTS_DIR", backtests_dir)
+    monkeypatch.setattr(optimizer_module, "OPTIMIZATIONS_DIR", optimizations_dir)
+    _allow_bar_coverage_preflight(monkeypatch)
+    monkeypatch.setattr(
+        optimizer_module,
+        "find_strategy_entry",
+        lambda _: SimpleNamespace(
+            file_path=tmp_path / "strategies" / "example_sma.py",
+            slug="example_sma",
+        ),
+    )
+    monkeypatch.setattr(
+        optimizer_module,
+        "compute_stats_for_result",
+        lambda result: dict(result.stats),
+    )
+    original_create_study = optuna.create_study
+    monkeypatch.setattr(
+        optimizer_module.optuna,
+        "create_study",
+        lambda direction="maximize": original_create_study(
+            direction=direction,
+            sampler=optuna.samplers.GridSampler({"window": [2]}),
+        ),
+    )
+    monkeypatch.setattr(
+        optimizer_module,
+        "_run_vectorbt_backtest",
+        lambda config, strategy_path: _trial_result(
+            config, metric=optimizer_module.NO_TRADE_PENALTY - 1.0, trade_count=1
+        ),
+    )
+
+    config = optimizer_module.OptimizationConfig(
+        base_backtest_id="base-demo",
+        target_metric="sharpe",
+        n_trials=1,
+        train_split_pct=0.7,
+        parameter_ranges={"window": {"type": "int", "min": 2, "max": 2, "step": 1}},
+    )
+    with pytest.raises(RuntimeError, match="No optimization trial completed successfully") as exc_info:
+        optimizer_module.run_optimization(config)
+    # The floor violation is preserved as the trial's failure reason through
+    # the all-failed guard, instead of silently steering the study.
+    assert "at or below the no-trade penalty floor" in str(exc_info.value)
+
+
 def test_all_trials_failing_raises_informative_error(monkeypatch, tmp_path: Path):
     backtests_dir = tmp_path / "backtests"
     backtests_dir.mkdir(parents=True, exist_ok=True)

@@ -26,7 +26,7 @@ from pydantic import ValidationError
 from data_tools.auto_download import ensure_backtest_data
 from runner.daily_equity import attach_daily_equity
 from runner.engines.base import BacktestConfig, resolve_strategy_parameters
-from runner.stats import compute_stats_for_result
+from runner.stats import merge_canonical_stats
 from shared.constants import DATA_DIR, normalize_timeframe
 from shared.database import save_result_to_sqlite
 from shared.logging import get_logger
@@ -288,7 +288,7 @@ def run_one_backtest_in_process(
                 symbol, timeframe, data_dir, start, end
             )
             attach_daily_equity(backtest_result, start=resolved_start, end=resolved_end)
-            backtest_result.stats = {**backtest_result.stats, **compute_stats_for_result(backtest_result)}
+            merge_canonical_stats(backtest_result)
             backtest_result.save(path)
             result.update(read_backtest_stats(path))
             result.update({"status": "skipped_existing", "finished_at": datetime.now(timezone.utc).isoformat()})
@@ -351,7 +351,7 @@ def run_one_backtest_in_process(
             backtest_result.indicators = []
         # Use resolved dates for daily equity attachment
         attach_daily_equity(backtest_result, start=start_date, end=end_date)
-        backtest_result.stats = {**backtest_result.stats, **compute_stats_for_result(backtest_result)}
+        merge_canonical_stats(backtest_result)
         output_dir.mkdir(parents=True, exist_ok=True)
         backtest_result.save(path)
         if save_sqlite:
@@ -439,7 +439,7 @@ def run_one_backtest(
                 symbol, timeframe, data_dir, start, end
             )
             attach_daily_equity(backtest_result, start=resolved_start, end=resolved_end)
-            backtest_result.stats = {**backtest_result.stats, **compute_stats_for_result(backtest_result)}
+            merge_canonical_stats(backtest_result)
             backtest_result.save(path)
             result.update(read_backtest_stats(path))
             result.update({"status": "skipped_existing", "finished_at": datetime.now(timezone.utc).isoformat()})
