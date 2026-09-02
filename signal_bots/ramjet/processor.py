@@ -223,8 +223,14 @@ class RamJetSignalProcessor:
         # False while the frame is shorter than the Supertrend warm-up: in that
         # regime supertrend=False means "unknown", not "bearish", so consumers
         # of supertrend_green_at_entry / the trailing flip workflow must not
-        # read a direction into it.
-        supertrend_ready = bool(frame["supertrend_ready"].iloc[-1])
+        # read a direction into it. The pandas_ta branch (when the library is
+        # available) computes a real direction and emits no marker, so its
+        # output counts as ready.
+        supertrend_ready = (
+            bool(frame["supertrend_ready"].iloc[-1])
+            if "supertrend_ready" in frame.columns
+            else True
+        )
 
         timeframe = _resolve_timeframe(raw_signal.get("timeframe")) or self.default_timeframe
 
