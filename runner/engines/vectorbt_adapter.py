@@ -1161,6 +1161,11 @@ def _resolve_intrabar_exit(
         return None
 
     timestamps = pd.to_datetime(intrabar_df["timestamp"], utc=True, errors="coerce")
+    # The upper bound is EXCLUSIVE because vectorbt schedules exits at the
+    # next bar's open (F10 execution-timing models, contract doc §3) — the
+    # exit bar's own sub-bars are outside the resolution window. If exits are
+    # ever moved onto the signal bar, this slice must become inclusive or the
+    # intrabar resolution silently degrades to main-frame fills.
     window = intrabar_df.loc[(timestamps >= effective_start) & (timestamps < effective_end)]
     if window.empty:
         return None

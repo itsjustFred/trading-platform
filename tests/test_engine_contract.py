@@ -264,6 +264,22 @@ class TestSameBarExitPolicy:
             is None
         )
 
+    def test_unknown_direction_is_rejected_not_treated_as_short(self):
+        """A direction spelling outside the engine convention must fail loudly.
+
+        The helper's LONG/SHORT branch would otherwise silently evaluate an
+        unknown value as SHORT and invert stop/TP logic into plausible-looking
+        wrong exits.
+        """
+        with pytest.raises(ValueError):
+            resolve_same_bar_exit(
+                direction="long", high=110.0, low=109.5, stop_price=108.0, take_profit_price=112.0
+            )
+        with pytest.raises(ValueError):
+            resolve_same_bar_exit(
+                direction="", high=110.0, low=109.5, stop_price=108.0, take_profit_price=112.0
+            )
+
     def test_missing_intrabar_data_is_flagged(self):
         flag = flag_missing_intrabar(intrabar_resolution="1-lower", intrabar_coverage=False)
         assert flag is not None

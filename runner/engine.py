@@ -44,13 +44,19 @@ class ExecutionModelSettings:
     ``take_profit_first`` request: per the Cleanup 16-A Decision Record the
     same-bar ambiguity is resolved stop-first whenever intrabar data is
     unavailable, and chronologically when it is available (see
-    ``docs/cross-engine-backtest-contract.md`` §3).
+    ``docs/cross-engine-backtest-contract.md`` §3). It is therefore AUDIT
+    METADATA ONLY, not a live option — do not wire it into any engine's exit
+    mechanics.
     """
 
     market_order_timing: str = "next_bar_open"
     entry_price_side: str = "open"
     stop_trigger_side: str = "bar_low_high"
     take_profit_trigger_side: str = "bar_high_low"
+    # Audit metadata only (16-A Decision Record): stop-first is contractual
+    # and not configurable. Kept so historical configs with
+    # ``same_bar_order = "take_profit_first"`` still run (and so the audit
+    # output stays comparable), but no engine may implement it.
     same_bar_order: str = "stop_first"
     intrabar_resolution: str | None = None
     lower_timeframe_replay: bool = False
@@ -189,6 +195,9 @@ class TradeEngine:
             return None
         frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
         frame = frame.dropna(subset=["timestamp"]).sort_values("timestamp")
+        # Invariant (16-A): ``_intrabar_window`` compares these timestamps
+        # against tz-aware main-frame bar times; the utc=True normalization
+        # above is what makes that comparison valid. Keep it.
         return frame
 
     @staticmethod

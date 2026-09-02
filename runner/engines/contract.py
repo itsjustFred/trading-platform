@@ -82,6 +82,11 @@ def apply_date_filter(
 
     Empty/None bounds are treated as unbounded on that side. The frame must
     carry a UTC-convertible ``timestamp`` column.
+
+    This must be the ONLY date filter applied to the frame. A caller that
+    pre-filters with a bare-date string comparison (``df[df["timestamp"] <=
+    end_date]``) truncates at midnight and reintroduces the F9 end-day
+    truncation bug before this helper ever sees the data.
     """
     if start:
         frame = frame[
@@ -122,7 +127,14 @@ def resolve_same_bar_exit(
     for sizing decisions. Callers that DO have intrabar data must walk it
     chronologically and call this helper per intrabar step, so the first
     chronological event wins rather than the stop-first tie-break.
+
+    ``direction`` must be exactly ``"LONG"`` or ``"SHORT"`` (the engine-wide
+    convention). Anything else raises ``ValueError``: an unknown direction
+    silently evaluated as SHORT would invert stop and TP logic and produce
+    plausible-looking, wrong exits.
     """
+    if direction not in ("LONG", "SHORT"):
+        raise ValueError(f"direction must be 'LONG' or 'SHORT', got {direction!r}")
     if direction == "LONG":
         stop_hit = stop_price is not None and low <= stop_price
         tp_hit = take_profit_price is not None and high >= take_profit_price
