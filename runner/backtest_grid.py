@@ -665,6 +665,7 @@ def run_backtest_grid(
         max_position_pct,
         caller="run_backtest_grid",
     )
+    max_position_pct = None  # folded; guard the rest of this entry point
 
     normalized_symbols = [normalize_symbol(symbol) for symbol in (symbols or GRID_SYMBOLS)]
     normalized_timeframes = [normalize_timeframe_value(tf) for tf in (timeframes or GRID_TIMEFRAMES)]
@@ -759,10 +760,25 @@ def main() -> None:
     parser.add_argument("--engine", default="vectorbt", help="Backtest engine")
     parser.add_argument("--capital", type=float, default=100_000.0, help="Initial capital")
     parser.add_argument("--risk-pct", type=float, default=0.01, help="Risk per trade, e.g. 0.01")
-    # Deprecated alias only (the canonical --max-position-exposure-pct flag
-    # lives in runner.cli's _add_sizing_flags); both fold onto the canonical
-    # max_position_exposure_pct keyword inside run_backtest_grid().
-    parser.add_argument("--max-position-pct", type=float, default=None)
+    # Sizing flags (Cleanup 16-E semantics): the canonical
+    # --max-position-exposure-pct plus its deprecated alias
+    # --max-position-pct. Both spellings map onto the canonical
+    # max_position_exposure_pct keyword inside run_backtest_grid(); the alias
+    # emits a DeprecationWarning there, and passing both spellings is rejected.
+    parser.add_argument(
+        "--max-position-exposure-pct",
+        dest="max_position_exposure_pct",
+        type=float,
+        default=None,
+        help="Max notional of ONE position / equity (e.g. 1.0 = 100%%)",
+    )
+    parser.add_argument(
+        "--max-position-pct",
+        dest="legacy_max_position_pct",
+        type=float,
+        default=None,
+        help="Deprecated alias of --max-position-exposure-pct",
+    )
     parser.add_argument("--max-leverage", type=float, default=None)
     parser.add_argument("--intrabar-resolution", default="open_close")
     parser.add_argument("--params", default="", help='Strategy params JSON, e.g. \'{"fast": 10}\'')
@@ -784,7 +800,11 @@ def main() -> None:
         engine=args.engine,
         capital=args.capital,
         risk_pct=args.risk_pct,
-        max_position_exposure_pct=getattr(args, "max_position_pct", None),
+        # The alias flag stores under legacy_max_position_pct and is folded
+        # onto the canonical keyword by run_backtest_grid()'s shared resolver
+        # (DeprecationWarning + rejection of a double spelling).
+        max_position_exposure_pct=args.max_position_exposure_pct,
+        max_position_pct=getattr(args, "legacy_max_position_pct", None),
         max_leverage=args.max_leverage,
         intrabar_resolution=args.intrabar_resolution,
         params=parse_params(args.params),

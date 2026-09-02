@@ -384,9 +384,10 @@ def _add_sizing_flags(parser: argparse.ArgumentParser, *, risk_default: float | 
 
     - ``--risk-pct`` is the maximum loss per trade (fraction of equity).
     - ``--max-position-exposure-pct`` caps the notional of ONE position as a
-      fraction of equity (position-size semantics).
-    - ``--max-total-exposure`` limits the aggregate open exposure as a fraction
-      of equity (native engine's risk engine).
+      fraction of equity (position-size semantics). On the native engine this
+      value is applied as the risk engine's aggregate
+      ``RiskConfig.max_total_exposure`` (documented divergence — F7, see
+      ``docs/sizing-semantics.md``).
     ``--max-position-pct`` is a deprecated alias of
     ``--max-position-exposure-pct`` kept so old invocations keep working.
     """

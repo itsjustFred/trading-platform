@@ -93,20 +93,14 @@ class BacktestConfig(BaseModel):
     parameters: dict[str, Any] = Field(default_factory=dict)
 
     def __init__(self, **data: Any) -> None:
-        if LEGACY_MAX_POSITION_PCT in data and data[LEGACY_MAX_POSITION_PCT] is not None:
-            warnings.warn(
-                "BacktestConfig(max_position_pct=...) is deprecated; use "
-                "max_position_exposure_pct (same per-position notional/equity "
-                "semantics). The alias will be removed in a future release.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            if "max_position_exposure_pct" in data and data["max_position_exposure_pct"] is not None:
-                raise ValueError(
-                    "Pass either max_position_exposure_pct or its deprecated alias "
-                    "max_position_pct, not both."
-                )
-            data["max_position_exposure_pct"] = data.pop(LEGACY_MAX_POSITION_PCT)
+        # Fold the deprecated max_position_pct spelling through the same shared
+        # resolver the batch entry points use (conflict check + warning).
+        resolved = resolve_legacy_max_position_kwarg(
+            data.get("max_position_exposure_pct"), data.get(LEGACY_MAX_POSITION_PCT), caller="BacktestConfig"
+        )
+        data.pop(LEGACY_MAX_POSITION_PCT, None)
+        if resolved is not None or data.get("max_position_exposure_pct") is not None:
+            data["max_position_exposure_pct"] = resolved
         super().__init__(**data)
 
     @property

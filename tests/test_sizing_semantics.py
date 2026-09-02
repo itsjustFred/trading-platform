@@ -545,23 +545,35 @@ def test_every_subcommand_exposes_the_new_flag_with_documented_help():
     [
         ("runner.backtest_grid", "--max-position-pct"),
         ("runner.backtest_matrix", "--max-position-pct"),
+        ("runner.backtest_grid", "--max-position-exposure-pct"),
+        ("runner.backtest_matrix", "--max-position-exposure-pct"),
     ],
 )
 def test_standalone_main_wires_the_sizing_flag(
     monkeypatch, tmp_path: Path, module_name: str, flag: str
 ):
     """``python -m runner.backtest_grid --max-position-pct …`` must reach the
-    batch entry point: the standalone mains parse the deprecated flag and pass
-    it on under the canonical keyword (no AttributeError — the canonical flag
-    lives in ``runner.cli``'s sizing-flag builder, not in these parsers)."""
+    batch entry point: the standalone mains parse BOTH spellings and forward
+    them under the canonical + deprecated keywords, so the entry point's shared
+    resolver performs the fold (warning + conflict rejection) exactly as for
+    direct keyword callers."""
     import importlib
+
+    from runner.engines.base import resolve_legacy_max_position_kwarg
 
     module = importlib.import_module(module_name)
     runner_name = "run_backtest_grid" if "grid" in module_name else "run_backtest_matrix"
     captured: dict = {}
 
     def fake_entry(**kwargs):
-        captured.update(kwargs)
+        # Emulate the entry point's alias fold (the real function does this
+        # before any cell runs; stubbing only isolates the wiring).
+        folded = resolve_legacy_max_position_kwarg(
+            kwargs.get("max_position_exposure_pct"),
+            kwargs.get("max_position_pct"),
+            caller=runner_name,
+        )
+        captured["max_position_exposure_pct"] = folded
         # Standalone mains exit non-zero on failed cells/runs.
         return {"runs": [], "cells": [], "failed": 0, "failed_cells": 0}
 
@@ -569,27 +581,66 @@ def test_standalone_main_wires_the_sizing_flag(
     strategy = tmp_path / "sizing_stub.py"
     strategy.write_text("STRATEGY_META = {'name': 'sizing_stub'}\n", encoding="utf-8")
 
-    argv = [
-        module_name.rsplit(".", 1)[-1],
-        "--strategy",
-        str(strategy),
-        "--symbols",
-        "XAUUSD",
-        "--timeframes",
-        "1h",
-        "--start",
-        "2025-01-01",
-        "--end",
-        "2025-01-31",
-        flag,
-        "0.5",
-    ]
-    monkeypatch.setattr("sys.argv", ["prog", *argv[1:]])
-    if flag == "--max-position-pct":
-        monkeypatch.setattr(
-            "warnings.warn",
-            lambda *a, **k: None,
-        )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "prog",
+            "--strategy",
+            str(strategy),
+            "--symbols",
+            "XAUUSD",
+            "--timeframes",
+            "1h",
+            "--start",
+            "2025-01-01",
+            "--end",
+            "2025-01-31",
+            flag,
+            "0.5",
+        ],
+    )
     module.main()
 
     assert captured["max_position_exposure_pct"] == 0.5
+
+
+@pytest.mark.parametrize("module_name", ["runner.backtest_grid", "runner.backtest_matrix"])
+def test_standalone_main_rejects_both_sizing_spellings(
+    monkeypatch, tmp_path: Path, module_name: str
+):
+    """Passing both spellings on a standalone main's command line must fail
+    loudly (the entry point's conflict check), not silently pick one."""
+    import importlib
+
+    module = importlib.import_module(module_name)
+    runner_name = "run_backtest_grid" if "grid" in module_name else "run_backtest_matrix"
+
+    def rejecting_entry(**kwargs):
+        from runner.engines.base import resolve_legacy_max_position_kwarg
+
+        resolve_legacy_max_position_kwarg(
+            kwargs.get("max_position_exposure_pct"),
+            kwargs.get("max_position_pct"),
+            caller=runner_name,
+        )
+        return {"runs": [], "cells": [], "failed": 0, "failed_cells": 0}
+
+    monkeypatch.setattr(module, runner_name, rejecting_entry)
+    strategy = tmp_path / "sizing_stub.py"
+    strategy.write_text("STRATEGY_META = {'name': 'sizing_stub'}\n", encoding="utf-8")
+    # The standalone mains receive argv WITHOUT the module name (that part is
+    # consumed by `python -m` before main() sees it).
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "prog",
+            "--strategy",
+            str(strategy),
+            "--max-position-pct",
+            "0.5",
+            "--max-position-exposure-pct",
+            "0.7",
+        ],
+    )
+    with pytest.raises(ValueError, match="not both"):
+        module.main()
