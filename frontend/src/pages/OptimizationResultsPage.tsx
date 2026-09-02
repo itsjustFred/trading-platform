@@ -6,6 +6,7 @@ import { getBacktestInfo, getOptimization } from "../api/client";
 import { DataTable } from "../components/DataTable";
 import type { BacktestInfo, OptimizationDetail } from "../api/types";
 import { classifyOptimizationOosEvidence } from "../lib/optimizationEvidence";
+import { stringifyUnknownValue } from "../lib/unknownValue";
 
 const COMPARISON_ROWS = [
   { key: "sharpe_ratio", label: "Sharpe" },
@@ -18,19 +19,6 @@ const COMPARISON_ROWS = [
 ];
 
 /** Renders an unknown parameter cell without falling back to `[object Object]`. */
-function stringifyCell(value: unknown): string {
-  if (value == null) {
-    return "—";
-  }
-  if (typeof value === "string") {
-    return value;
-  }
-  if (typeof value === "number" || typeof value === "boolean") {
-    return String(value);
-  }
-  return JSON.stringify(value) ?? "—";
-}
-
 function formatComparisonValue(
   key: string,
   value: number | string | boolean | null | undefined,
@@ -149,7 +137,7 @@ export function OptimizationResultsPage() {
       ...parameterKeys.map((key) => ({
         key,
         label: key,
-        render: (row: Record<string, unknown>) => stringifyCell(row[key]),
+        render: (row: Record<string, unknown>) => stringifyUnknownValue(row[key], "—"),
       })),
       {
         key: "trade_count",

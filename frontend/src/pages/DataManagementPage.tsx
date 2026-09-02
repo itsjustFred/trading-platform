@@ -26,6 +26,7 @@ import {
 } from "../api/client";
 import type { DataCategorySummary, DataSymbolEntry } from "../api/types";
 import { DownloadModal } from "../components/DownloadModal";
+import { stringifyUnknownValue } from "../lib/unknownValue";
 import { ResampleModal } from "../components/ResampleModal";
 import { SmartHarvestModal } from "../components/SmartHarvestModal";
 
@@ -122,19 +123,7 @@ function timeframeRank(timeframe: string) {
   return rank === -1 ? 99 : rank;
 }
 
-/** Renders an unknown table cell as a comparable string without `[object Object]`. */
-function stringifySortableCell(value: unknown): string {
-  if (value == null) {
-    return "";
-  }
-  if (typeof value === "string") {
-    return value;
-  }
-  if (typeof value === "number" || typeof value === "boolean") {
-    return String(value);
-  }
-  return JSON.stringify(value) ?? "";
-}
+
 
 function compareMaybeString(a: string | number, b: string | number) {
   if (typeof a === "number" && typeof b === "number") {
@@ -2031,10 +2020,10 @@ function PanelTable<T>({
     const sorted = [...rows].sort((a, b) => {
       const aValue = column.sortValue
         ? column.sortValue(a)
-        : stringifySortableCell((a as Record<string, unknown>)[sortKey]);
+        : stringifyUnknownValue((a as Record<string, unknown>)[sortKey]);
       const bValue = column.sortValue
         ? column.sortValue(b)
-        : stringifySortableCell((b as Record<string, unknown>)[sortKey]);
+        : stringifyUnknownValue((b as Record<string, unknown>)[sortKey]);
       return compareMaybeString(aValue, bValue);
     });
     return sortDirection === "asc" ? sorted : sorted.reverse();

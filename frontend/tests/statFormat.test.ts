@@ -29,3 +29,15 @@ test("color resolution is sign-based only for numeric currency/percent", () => {
   assert.equal(resolveStatCardColor(undefined, Number.NaN, "currency"), "#c9d1d9");
   assert.equal(resolveStatCardColor(undefined, "abc", "currency"), "#c9d1d9");
 });
+
+import { stringifyUnknownValue } from "../src/lib/unknownValue.ts";
+
+test("unknown-value stringification never yields [object Object]", () => {
+  assert.equal(stringifyUnknownValue("abc"), "abc");
+  assert.equal(stringifyUnknownValue(12), "12");
+  assert.equal(stringifyUnknownValue(true), "true");
+  assert.equal(stringifyUnknownValue(null), "");
+  assert.equal(stringifyUnknownValue(undefined, "—"), "—");
+  assert.equal(stringifyUnknownValue({ a: 1 }), '{"a":1}');
+  assert.equal(stringifyUnknownValue([1, 2]), "[1,2]");
+});

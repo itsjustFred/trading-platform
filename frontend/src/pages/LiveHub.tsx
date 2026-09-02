@@ -39,6 +39,7 @@ import type {
 } from "../api/types";
 import { useToast } from "../components/ToastProvider";
 import { applyFillToPosition } from "./LiveDetail";
+import { stringifyUnknownValue } from "../lib/unknownValue";
 
 type DeploymentCard = LiveDeploymentConfig & {
   broker: LiveAccount["broker"] | "unknown";
@@ -151,21 +152,10 @@ function parseSettingsJson(raw: string): SettingsParseResult {
 function discordSourceLabel(card: DeploymentCard): string {
   const raw =
     card.signal_source_id ||
-    asLogText(card.signal_config?.["service_name"]) ||
-    asLogText(card.signal_config?.["channel_id"]) ||
+    stringifyUnknownValue(card.signal_config?.["service_name"]) ||
+    stringifyUnknownValue(card.signal_config?.["channel_id"]) ||
     "—";
   return raw || "—";
-}
-
-/** Stringify an unknown config value without "[object Object]" output. */
-function asLogText(value: unknown): string {
-  if (typeof value === "string") {
-    return value;
-  }
-  if (typeof value === "number" || typeof value === "boolean") {
-    return String(value);
-  }
-  return "";
 }
 
 const LiveDeploymentCard = memo(function LiveDeploymentCard({

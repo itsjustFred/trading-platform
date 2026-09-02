@@ -22,6 +22,7 @@ import type {
 
 import { getLiveAccounts, getLiveDeployments, getLiveTrades } from "../api/client";
 import { useLivePositions, useLiveQuotes, useLiveSignalLog } from "../api/queries";
+import { stringifyUnknownValue } from "../lib/unknownValue";
 import {
   useLiveExecutionsStream,
   useLivePositionsStream,
@@ -847,16 +848,6 @@ function viewerToneColor(tone: "neutral" | "positive" | "negative" | undefined):
 }
 
 /** Renders an unknown metadata cell without `[object Object]`. */
-function stringifyViewerCell(value: unknown): string {
-  if (typeof value === "string") {
-    return value;
-  }
-  if (value == null) {
-    return "";
-  }
-  return JSON.stringify(value) ?? "";
-}
-
 function SignalLogTable({
   signals,
   loading,
@@ -891,7 +882,7 @@ function SignalLogTable({
               </td>
               <td style={tdStyleMessage}>
                 {signal.raw_message ||
-                  stringifyViewerCell(
+                  stringifyUnknownValue(
                     signal.signal_metadata?.discord_content ?? signal.signal_metadata?.source,
                   ) || "—"}
               </td>
@@ -1008,7 +999,7 @@ function toTradeHistoryRows(rows: LiveTradeSlippage[]): ViewerTrade[] {
       entry,
       exit,
       pnl,
-      exitReason: row.exit_reason || stringifyViewerCell(row.signal_metadata?.exit_reason),
+      exitReason: row.exit_reason || stringifyUnknownValue(row.signal_metadata?.exit_reason),
       time: row.execution_timestamp || row.signal_timestamp,
       signalTimeUnix: asFinite(row.signal_time, 0),
     };

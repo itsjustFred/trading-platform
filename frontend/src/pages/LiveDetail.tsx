@@ -27,6 +27,7 @@ import type {
 import { TradeTable, type TradeTableRow } from "../components/TradeTable";
 import { Modal } from "../components/Modal";
 import { useToast } from "../components/ToastProvider";
+import { stringifyUnknownValue } from "../lib/unknownValue";
 
 const LIVE_DETAIL_POLL_MS = 30000;
 const DEFAULT_REPLAY_TIMEFRAME = "1h";
@@ -894,16 +895,7 @@ function formatUsd(value: number): string {
 }
 
 function stringifyUnknownMetadata(value: unknown): string {
-  if (value == null) {
-    return "";
-  }
-  if (typeof value === "string") {
-    return value.trim();
-  }
-  if (typeof value === "number" || typeof value === "boolean") {
-    return String(value).trim();
-  }
-  return (JSON.stringify(value) ?? "").trim();
+  return stringifyUnknownValue(value).trim();
 }
 
 function signedUsdPrefix(value: number): string {

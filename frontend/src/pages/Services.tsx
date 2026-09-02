@@ -9,6 +9,7 @@ import {
 import type { Service, ServiceStatus } from "../api/types";
 import { Modal } from "../components/Modal";
 import { useToast } from "../components/ToastProvider";
+import { stringifyUnknownValue } from "../lib/unknownValue";
 
 function relativeTime(value?: string | null): string {
   if (!value) return "—";
@@ -29,16 +30,6 @@ function statusDot(status: ServiceStatus) {
   if (status === "paused") return "#f59e0b";
   if (status === "failed") return "#ef4444";
   return "#64748b";
-}
-
-function stringifyServiceConfigValue(value: unknown): string {
-  if (typeof value === "string") {
-    return value;
-  }
-  if (value == null) {
-    return "";
-  }
-  return JSON.stringify(value) ?? "";
 }
 
 /** Meta line for a Discord bot service card. */
@@ -159,8 +150,8 @@ export function ServicesPage() {
     <div style={{ display: "grid", gap: "10px" }}>
       {services.map((service) => {
         const isRunning = service.status === "running";
-        const cron = stringifyServiceConfigValue(service.config?.cron);
-        const channelId = stringifyServiceConfigValue(
+        const cron = stringifyUnknownValue(service.config?.cron);
+        const channelId = stringifyUnknownValue(
           service.config?.channel_id,
         );
         const metaLine =

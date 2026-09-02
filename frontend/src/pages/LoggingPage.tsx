@@ -79,21 +79,8 @@ function levelColor(level: Level): string {
   return "#93c5fd";
 }
 
-function stringifyLogValue(value: unknown): string {
-  if (typeof value === "string") {
-    return value;
-  }
-  if (value == null) {
-    return "";
-  }
-  if (typeof value === "number" || typeof value === "boolean") {
-    return String(value);
-  }
-  return JSON.stringify(value) ?? "";
-}
-
 function parseTimestamp(input: unknown): { short: string; long: string } {
-  const raw = stringifyLogValue(input).trim();
+  const raw = stringifyUnknownValue(input).trim();
   if (!raw) {
     return { short: "--:--:--", long: "Unknown timestamp" };
   }
@@ -173,10 +160,10 @@ function parseLogLine(line: string): ParsedLogLine {
   }
 
   const ts = parseTimestamp(json.timestamp);
-  const level = normalizeLevel(stringifyLogValue(json.level));
-  const moduleName = stringifyLogValue(json.module) || "app";
-  const func = stringifyLogValue(json.function ?? json.func) || "—";
-  const message = stringifyLogValue(json.message ?? line);
+  const level = normalizeLevel(stringifyUnknownValue(json.level));
+  const moduleName = stringifyUnknownValue(json.module) || "app";
+  const func = stringifyUnknownValue(json.function ?? json.func) || "—";
+  const message = stringifyUnknownValue(json.message ?? line);
   const data =
     typeof json.data === "object" && json.data !== null
       ? (json.data as Record<string, unknown>)
