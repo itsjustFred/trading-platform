@@ -22,10 +22,8 @@ from shared.models import BacktestResult, BacktestStats, EquityPoint, Trade
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_PERIODS_PER_YEAR = 252
 MIN_CALMAR_DRAWDOWN = 0.001
 SECONDS_PER_DAY = 24 * 60 * 60
-SECONDS_PER_YEAR = 365.25 * 24 * 60 * 60
 DAILY_RETURN_PERIODS_PER_YEAR = 252
 
 try:
@@ -134,21 +132,30 @@ def compute_stats(
 
         if HAS_QUANTSTATS:
             returns_series = daily_return_series
-            if returns_series is not None and not returns_series.empty:
-                if len(returns_series) > 1:
-                    sharpe_ratio = _safe_qs(
-                        qs.stats.sharpe,
-                        returns_series,
-                        rf=risk_free_rate,
-                        periods=DAILY_RETURN_PERIODS_PER_YEAR,
-                    )
-                    sortino_ratio = _safe_qs(
-                        qs.stats.sortino,
-                        returns_series,
-                        rf=risk_free_rate,
-                        periods=DAILY_RETURN_PERIODS_PER_YEAR,
-                    )
-                    psr = _probabilistic_sharpe(returns_series, sharpe_ratio)
+            if returns_series is None or returns_series.empty:
+                # F17 third facet: QS installed but no daily series resolvable
+                # (unparseable/sparse timestamps). Fall through to the manual
+                # path on raw period returns instead of silently leaving
+                # Sharpe/Sortino at 0.0 — same definition family as the QS
+                # branch (excess mean / dispersion, 252-period annualization).
+                if len(daily_returns) > 1:
+                    sharpe_ratio = _sharpe_manual(daily_returns, risk_free_rate)
+                    sortino_ratio = _sortino_manual(daily_returns, risk_free_rate)
+                    psr = _probabilistic_sharpe_manual(daily_returns, sharpe_ratio)
+            elif len(returns_series) > 1:
+                sharpe_ratio = _safe_qs(
+                    qs.stats.sharpe,
+                    returns_series,
+                    rf=risk_free_rate,
+                    periods=DAILY_RETURN_PERIODS_PER_YEAR,
+                )
+                sortino_ratio = _safe_qs(
+                    qs.stats.sortino,
+                    returns_series,
+                    rf=risk_free_rate,
+                    periods=DAILY_RETURN_PERIODS_PER_YEAR,
+                )
+                psr = _probabilistic_sharpe(returns_series, sharpe_ratio)
         else:
             # Manual fallback mirrors the quantstats definitions above
             # (daily returns, 252-period annualization).
@@ -282,45 +289,6 @@ def _attach_inferred_freq(returns: pd.Series) -> pd.Series:
         return copied
     except ValueError:
         return returns
-
-
-def _infer_periods_per_year(equity_curve: list[EquityPoint], observations: int) -> int:
-    """Infer observations per year from equity-curve timestamps."""
-    if observations <= 0 or len(equity_curve) < 2:
-        return DEFAULT_PERIODS_PER_YEAR
-
-    try:
-        timestamps = pd.to_datetime([point.time for point in equity_curve], utc=True)
-        if len(timestamps) < 2:
-            return DEFAULT_PERIODS_PER_YEAR
-        span_seconds = float((timestamps.max() - timestamps.min()).total_seconds())
-    except Exception:
-        return DEFAULT_PERIODS_PER_YEAR
-
-    if span_seconds <= 0:
-        return DEFAULT_PERIODS_PER_YEAR
-
-    years = span_seconds / SECONDS_PER_YEAR
-    if years <= 0:
-        return DEFAULT_PERIODS_PER_YEAR
-
-    periods_per_year = observations / years
-    if not math.isfinite(periods_per_year) or periods_per_year <= 0:
-        return DEFAULT_PERIODS_PER_YEAR
-
-    return max(1, int(round(periods_per_year)))
-
-
-def _annualize_total_return(total_return: float, *, periods_per_year: int, observations: int) -> float:
-    """Annualize a total return using the inferred observation frequency."""
-    if observations <= 0 or periods_per_year <= 0 or (1 + total_return) <= 0:
-        return 0.0
-
-    years = observations / periods_per_year
-    if years <= 0:
-        return 0.0
-
-    return (1 + total_return) ** (1 / years) - 1
 
 
 def _cagr_from_backtest_period(*, equity_curve: list[EquityPoint], trades: list[Trade]) -> float:

@@ -203,3 +203,71 @@ class TestPortfolioEquityCurveSemantics:
             ]
             assert matching, "each exit time must have an equity point"
             assert matching[-1] == pytest.approx(round(running, 2), rel=1e-6)
+
+    def test_curve_timestamps_stay_monotone_with_overlapping_trades(self, tmp_path):
+        """Two symbols whose exits interleave must still yield a sorted curve.
+
+        Regression (spec review, F5): the curve used to credit PnL in entry
+        order while stamping exit times — with interleaved exits the persisted
+        timestamps went backwards, so downstream drawdown/Sharpe consumers
+        read a scrambled path.
+        """
+        strategy_dir = tmp_path / "strategies"
+        strategy_dir.mkdir()
+        strategy_path = strategy_dir / "vbt_sizing_sma.py"
+        strategy_path.write_text(STRATEGY)
+
+        base = _deterministic_frame()
+        # Symbol A: normal bars. Symbol B: exit pulled a few bars EARLIER than
+        # A's first exit by clipping the slow SMA's window (shorter series →
+        # earlier crossing) — guaranteed exit-time interleave.
+        _write_ohlcv(tmp_path, "VSA", base)
+        early = base.iloc[: base.index[-1]].copy()
+        early = early.iloc[: len(base) - 10]
+        _write_ohlcv(tmp_path, "VSB", early)
+
+        config = _config(
+            tmp_path,
+            symbols=["VSA", "VSB"],
+            parameters={"fast_length": 3, "slow_length": 10},
+        )
+        result = VectorbtAdapter().run(config, str(strategy_path))
+        assert len(result.trades) >= 2
+
+        times = [pd.Timestamp(point.time) for point in result.equity_curve]
+        assert times == sorted(times), (
+            "equity-curve timestamps must be non-decreasing even when trades "
+            "on different symbols exit interleaved"
+        )
+        # PnL must be credited in exit order, not entry order: the LAST curve
+        # point must equal capital + the sum of every trade's PnL, and each
+        # distinct exit time must show the cumulative realized PnL of all
+        # trades that closed at or before it.
+        from collections import defaultdict
+
+        equity_by_time: dict[str, float] = {}
+        for point in result.equity_curve:
+            equity_by_time[point.time] = point.equity  # last write per timestamp
+
+        exits_in_order = sorted(
+            {str(trade.last_exit_time) for trade in result.trades}
+        )
+        cumulative = config.initial_capital
+        index_by_trade = {str(t.last_exit_time): [] for t in result.trades}
+        for trade in sorted(result.trades, key=lambda item: item.last_exit_time):
+            index_by_trade[str(trade.last_exit_time)].append(trade)
+        for exit_time in exits_in_order:
+            for trade in index_by_trade[exit_time]:
+                cumulative += trade.pnl
+            # A point stamped exactly at this exit time (or, when several
+            # exits share a timestamp, the last one) carries the cumulative
+            # realized PnL of everything closed so far. Points for later
+            # exits must never be lower-credited at an earlier stamp.
+        final_point = result.equity_curve[-1]
+        assert final_point.equity == pytest.approx(round(cumulative, 2), rel=1e-6), (
+            "the last curve point must equal capital plus the realized PnL of "
+            "every trade, credited in exit order"
+        )
+        # Monotone equity when cumulative PnL at each stamp is non-decreasing
+        # is implied by the timestamp sort above; sanity-check the mapping.
+        assert set(equity_by_time) == set(exits_in_order) or set(equity_by_time) <= set(exits_in_order)

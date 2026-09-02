@@ -418,12 +418,27 @@ class VectorbtAdapter(EngineAdapter):
         for idx, trade in enumerate(all_trades, start=1):
             trade.id = idx
 
-        # Build equity curve from sorted trades
+        # Build equity curve from sorted trades (Cleanup 16-D1, F5).
+        # Semantics decision: the persisted curve is a REALIZED-PnL portfolio
+        # curve over EXIT time. Each symbol's own sizing compounds from the
+        # shared initial capital inside `_process_symbol`; summing those
+        # per-symbol paths into one "portfolio" equity would multiply capital
+        # by the symbol count, so the aggregate curve here intentionally
+        # replays only closed PnL, once per portfolio, credited at the trade's
+        # exit — and therefore replayed in EXIT order (native/pynecore do the
+        # same). Drawdown/Sharpe computed on this curve describe the realized
+        # portfolio, not an intraday mark-to-market path — the limitation is
+        # documented in the cross-engine contract.
         all_equity: list[EquityPoint] = []
         equity = config.initial_capital
-        for trade in all_trades:
+        for trade in sorted(all_trades, key=lambda item: item.last_exit_time):
             equity += trade.pnl
-            all_equity.append(EquityPoint(time=trade.entry_time, equity=round(equity, 2)))
+            all_equity.append(
+                EquityPoint(
+                    time=trade.last_exit_time or trade.entry_time,
+                    equity=round(equity, 2),
+                )
+            )
 
         now = datetime.now(timezone.utc)
         if hasattr(strategy_mod, "STRATEGY_META"):

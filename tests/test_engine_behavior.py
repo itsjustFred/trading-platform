@@ -277,3 +277,76 @@ class TestOrderTypeSizingSemantics:
             "LIMIT orders must be sized at fill from the trigger price, "
             "not keep the creation-price estimate"
         )
+
+    def test_stop_order_is_resized_to_trigger_price_at_fill(self):
+        """STOP orders (short side, trigger above) size at the trigger price."""
+        frame = _linear_frame(6)
+        # Bar 2 rallies through the stop of a SHORT stop order at 101.5.
+        frame.loc[2, "high"] = 102.5
+        frame.loc[2, "open"] = 101.0
+
+        entries = pd.Series([False] * len(frame), index=frame.index)
+        entries.iloc[0] = True
+        exits = pd.Series([False] * len(frame), index=frame.index)
+        strategy = lambda df, params: (entries, exits)  # noqa: E731
+
+        engine = TradeEngine(_config(Path("/tmp")), symbol="PROBE")
+        original_fill = engine._fill_pending_orders
+        from runner.engine import Order, OrderType
+
+        stop_price = 101.5
+
+        def create_stop(row: pd.Series, i: int) -> None:
+            qty = engine._calculate_position_size(
+                entry_price=100.0,  # deliberately wrong (creation estimate)
+                stop_loss_price=None,
+                direction="SHORT",
+            )
+            engine.pending_orders.append(
+                Order(
+                    symbol="PROBE",
+                    direction="SHORT",
+                    order_type=OrderType.STOP,
+                    created_index=i,
+                    created_time=engine._to_iso(row["timestamp"]),
+                    quantity=qty,
+                    stop_price=stop_price,
+                )
+            )
+
+        def patched_fill(row: pd.Series, i: int) -> None:
+            if not engine.pending_orders:
+                if bool(entries.iloc[i]):
+                    create_stop(row, i)
+                return
+            original_fill(row, i)
+
+        engine._fill_pending_orders = patched_fill  # type: ignore[method-assign]
+        engine.run(frame, strategy)
+
+        assert engine.closed_trades, "stop order must fill"
+        trade = engine.closed_trades[0]
+        assert trade.quantity == pytest.approx(100_000.0 / stop_price, rel=1e-6), (
+            "STOP orders must be sized at fill from the trigger price"
+        )
+
+    def test_market_order_without_stop_keeps_documented_fallback_sizing(self):
+        """Stopless MARKET entries are the documented exception: no re-size.
+
+        Without a stop there is no fill-time risk input, so the creation-time
+        (signal-bar close) estimate stands — pinned here so a future change
+        to that policy has to update this test deliberately.
+        """
+        frame = _linear_frame(4)
+        entries = pd.Series([True] + [False] * 3, index=frame.index)
+        exits = pd.Series([False] * 4, index=frame.index)
+        strategy = lambda df, params: (entries, exits)  # noqa: E731
+
+        engine = TradeEngine(_config(Path("/tmp")), symbol="PROBE")
+        engine.run(frame, strategy)
+
+        assert engine.closed_trades
+        trade = engine.closed_trades[0]
+        # Fill happens on bar 1 (open 101); stopless sizing was computed on
+        # bar 0 close (100) → 100000/100 = 1000 shares.
+        assert trade.quantity == pytest.approx(100_000.0 / 100.0, rel=1e-6)

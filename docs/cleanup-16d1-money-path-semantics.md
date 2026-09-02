@@ -34,18 +34,27 @@ mark-to-market *reporting* equity for the curve. Sizing is therefore
 indifferent to open-trade fluctuations: unrealized profit is not spendable,
 and unrealized loss does not shrink new positions.
 
+**Scope note:** F21 also flags the hidden per-call sizing protocol
+(`fixed_risk_amount`, `tick_value`, `lot_step`, `min_lot`, `max_lot`,
+`cap_fixed_risk_by_leverage` read straight from `config.parameters`). That
+protocol is **deliberately untouched** here — it is a deliberate MT5-alignment
+interface (see `docs/mt5-backtest-alignment-plan.md`), documented rather than
+removed; only the equity base it reads was wrong and is fixed.
+
 **Pinned by:** `tests/test_engine_behavior.py::TestSizingEquityExcludesUnrealizedPnl`.
 
 ## D3 — Engine risk policy is not strategy-configurable (F22)
 
 **Before:** `TradeEngine` read `max_positions` out of
 `config.parameters` — any strategy parameter silently rewrote engine-level
-risk policy.
+concurrency risk policy.
 
 **Decision:** the concurrent-position limit is the module constant
-`TRADE_ENGINE_MAX_POSITIONS = 5`. Strategy `parameters` can no longer reach
-risk policy; engine-level knobs are `BacktestConfig` risk fields
-(`risk_per_trade_pct`, `max_position_pct`, `max_leverage`).
+`TRADE_ENGINE_MAX_POSITIONS = 5`. The concurrency limit specifically can no
+longer be reached from strategy `parameters`. Scope note: the MT5-alignment
+sizing protocol (`fixed_risk_amount`, `tick_value`, `lot_step`, …) is still
+read from `config.parameters` by design — that is a strategy-facing sizing
+interface, documented in D2, not a risk-policy rewrite.
 
 **Pinned by:** `tests/test_engine_behavior.py::TestMaxPositionsPolicy`.
 
@@ -59,9 +68,18 @@ creation-price estimate forever.
 actually fill. MARKET re-sizes at the next-bar open (creation sizing is only
 the pending estimate); LIMIT/STOP/STOP_LIMIT re-size from their trigger price
 at fill. Quantities across order types are now computed from the same rule:
-quantity = sizing rule evaluated at the fill price.
+quantity = sizing rule evaluated at the fill price. One documented exception:
+a MARKET order **without any stop** has no fill-time risk input, so its
+creation-time estimate (signal-bar close) stands.
 
-**Pinned by:** `tests/test_engine_behavior.py::TestOrderTypeSizingSemantics`.
+**Scope note:** F23 also lists the O(n) intrabar replay
+(`engine.py` `iterrows()` window per bar instead of searchsorted). That is a
+performance facet, deliberately **not** addressed here — this branch is
+behavior only; the perf fix lands with the structural cleanup (16-D2) to keep
+the golden-master diffs reviewable.
+
+**Pinned by:** `tests/test_engine_behavior.py::TestOrderTypeSizingSemantics`
+(LIMIT, STOP and the stopless-MARKET exception).
 
 ## D5 — Stats definitions are environment-independent (F17)
 
@@ -75,7 +93,11 @@ Sharpe/Calmar/total_return on different machines.
 equity-endpoint ratio (`E_end / E_start − 1`); `calmar_ratio` = elapsed-time
 CAGR / max drawdown; Sharpe/Sortino on daily-resampled returns annualized with
 252 periods (quantstats when available, manual fallback otherwise). MaxDD and
-duration are computed once, outside the branches.
+duration are computed once, outside the branches. The F17 third facet — QS
+installed but the daily series unresolvable, metrics silently 0.0 — is closed
+by falling through to the manual 252-period path on raw period returns in that
+case instead of staying at 0.0. The dead `_infer_periods_per_year` /
+`_annualize_total_return` helpers of the old fallback path are removed.
 
 **Pinned by:** `tests/test_stats.py` (existing suite, green on both paths) —
 the QS and fallback formulas now provably share the total_return/Calmar
@@ -139,8 +161,15 @@ diverged.
 
 **Decision:** sizing balance = `initial_capital + realized_pnl + unrealized
 MTM PnL of open positions` (marked at the last bar ≤ the signal's fill time),
-floored at $1 as before. The sizing path and the reported equity path now
-measure the same capital.
+floored at $1 as before. Entries opened during a drawdown are no longer sized
+as if nothing had been lost.
+
+**Precision note (residual divergence):** the *reported* equity curve is
+still a realized-PnL replay in exit order (same realized-only convention as
+the other engines, D11). Sizing-time equity now includes unrealized PnL while
+the curve does not — the two paths measure different capital by design, and
+that is the documented distortion. Closing it fully (an MTM-marked replay
+curve) requires the structural replay rework deferred to 16-D2.
 
 **Pinned by:** `tests/test_portfolio_sharpe_annualization.py::TestReplaySizingEquity`.
 
@@ -167,10 +196,10 @@ persisted curve described a trajectory never traded.
 
 **Decision:** `total_bars` is the loaded bar count across symbols (same
 contract as native/pynecore). The portfolio curve is a realized-PnL curve
-over **exit** time (documented limitation: not an intraday mark-to-market
-path — per-symbol sizing compounds from shared capital and summing those
-paths would multiply capital by symbol count). Pynecore's curve is aligned to
-exit time for cross-engine comparability.
+over **exit** time, replayed in exit order (documented limitation: not an
+intraday mark-to-market path — per-symbol sizing compounds from shared
+capital and summing those paths would multiply capital by symbol count).
+Pynecore's curve is aligned to exit time for cross-engine comparability.
 
 **Pinned by:** `tests/test_vectorbt_sizing_semantics.py::TestTotalBarsIsBarCount`,
 `::TestPortfolioEquityCurveSemantics`.

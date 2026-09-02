@@ -513,6 +513,9 @@ class TradeEngine:
                     if order.quantity <= 0:
                         continue
                 if order.order_type == OrderType.MARKET and order.stop_loss is not None:
+                    # MARKET: no stop → no risk-based re-size; the creation
+                    # estimate (signal-bar close) is the documented fallback
+                    # for stopless market entries.
                     take_profit = (
                         float(order.take_profit_levels[0]["price"])
                         if order.take_profit_levels
