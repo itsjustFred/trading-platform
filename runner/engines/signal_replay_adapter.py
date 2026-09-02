@@ -308,6 +308,45 @@ class SignalReplayAdapter:
             },
         )
 
+    def _check_protective_exit_bar(
+        self,
+        position: _OpenPosition,
+        bar: pd.Series,
+        index: int,
+    ) -> Trade | None:
+        """Process one bar of the protective-exit walk.
+
+        Conformance (Cleanup 16-A, F8): bars are walked chronologically and
+        classified through the shared same-bar policy; within a bar the
+        stop-first tie-break applies when both levels are hit.
+        """
+        self._update_excursions(position, bar)
+        event = resolve_same_bar_exit(
+            direction=position.direction,
+            high=float(bar["high"]),
+            low=float(bar["low"]),
+            stop_price=float(position.stop_loss) if position.stop_loss is not None else None,
+            take_profit_price=(
+                float(position.take_profit) if position.take_profit is not None else None
+            ),
+        )
+        if event is None:
+            self._apply_trailing_stop(position, bar)
+            return None
+        if event == "stop":
+            exit_price = float(position.stop_loss or float(bar["close"]))
+            reason = "trailing_stop" if position.trailing_updates > 0 else "stop_loss"
+        else:
+            exit_price = float(position.take_profit or float(bar["close"]))
+            reason = "take_profit"
+        return self._close_position(
+            position,
+            exit_time=pd.Timestamp(bar["timestamp"]),
+            exit_price=exit_price,
+            exit_reason=reason,
+            exit_bar_index=int(index),
+        )
+
     def _process_protective_exits(
         self,
         *,
@@ -327,38 +366,9 @@ class SignalReplayAdapter:
             return None
 
         for index, bar in window.iterrows():
-            self._update_excursions(position, bar)
-            high = float(bar["high"])
-            low = float(bar["low"])
-
-            # Conformance (Cleanup 16-A, F8): bars are walked chronologically
-            # and classified through the shared same-bar policy; within a bar
-            # the stop-first tie-break applies when both levels are hit.
-            event = resolve_same_bar_exit(
-                direction=position.direction,
-                high=high,
-                low=low,
-                stop_price=float(position.stop_loss) if position.stop_loss is not None else None,
-                take_profit_price=(
-                    float(position.take_profit) if position.take_profit is not None else None
-                ),
-            )
-
-            if event is not None:
-                if event == "stop":
-                    exit_price = float(position.stop_loss or float(bar["close"]))
-                    reason = "trailing_stop" if position.trailing_updates > 0 else "stop_loss"
-                else:
-                    exit_price = float(position.take_profit or float(bar["close"]))
-                    reason = "take_profit"
-                return self._close_position(
-                    position,
-                    exit_time=pd.Timestamp(bar["timestamp"]),
-                    exit_price=exit_price,
-                    exit_reason=reason,
-                    exit_bar_index=int(index),
-                )
-            self._apply_trailing_stop(position, bar)
+            trade = self._check_protective_exit_bar(position, bar, int(index))
+            if trade is not None:
+                return trade
             position.last_checked_at = pd.Timestamp(bar["timestamp"])
 
         position.last_checked_at = end_timestamp

@@ -271,7 +271,8 @@ class TestSameBarExitPolicy:
         assert flag["intrabar_available"] is False
 
         empty = flag_missing_intrabar(intrabar_resolution="5m", intrabar_coverage=False)
-        assert empty is not None and empty["intrabar_available"] is False
+        assert empty is not None
+        assert empty["intrabar_available"] is False
 
     def test_available_intrabar_data_is_not_flagged(self):
         assert flag_missing_intrabar(intrabar_resolution="5m", intrabar_coverage=True) is None

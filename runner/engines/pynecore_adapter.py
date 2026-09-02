@@ -194,7 +194,7 @@ class PyneCoreAdapter(EngineAdapter):
             parameters=resolved_parameters,
         )
 
-        return BacktestResult(
+        result = BacktestResult(
             meta=meta,
             trades=all_trades,
             equity_curve=all_equity,
