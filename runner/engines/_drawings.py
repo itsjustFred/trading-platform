@@ -59,9 +59,7 @@ def _normalize_drawings(drawings: Any, *, symbol: str) -> DrawingList:
                 normalized_drawing["val1"] = float(raw_drawing["val1"])
                 normalized_drawing["val2"] = float(raw_drawing["val2"])
             except (TypeError, ValueError) as exc:
-                raise ValueError(
-                    f"drawing #{idx} line values must be numeric"
-                ) from exc
+                raise ValueError(f"drawing #{idx} line values must be numeric") from exc
 
         normalized.append(normalized_drawing)
 
@@ -98,8 +96,4 @@ def _normalize_drawing_time(value: Any, *, field_name: str, drawing_index: int) 
             return pd.Timestamp(parsed).isoformat()
         return value
 
-    raise TypeError(
-        f"drawing #{drawing_index} field {field_name!r} must be a timestamp-like value"
-    )
-
-
+    raise TypeError(f"drawing #{drawing_index} field {field_name!r} must be a timestamp-like value")

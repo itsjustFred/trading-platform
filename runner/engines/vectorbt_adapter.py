@@ -68,6 +68,8 @@ TIMEFRAME_TO_DURATION = {
 }
 
 MAX_PARALLEL_WORKERS = 4
+
+
 def _uses_kwargs_style(func) -> bool:
     """Return True if generate_signals uses keyword-argument style (not params dict)."""
     try:
@@ -96,6 +98,116 @@ def _call_generate_signals(strategy_mod, df: pd.DataFrame, parameters: dict):
         filtered = {k: v for k, v in parameters.items() if k in accepted}
         return strategy_mod.generate_signals(df, **filtered)
     return strategy_mod.generate_signals(df, parameters)
+
+
+def _size_trade(
+    *,
+    config: BacktestConfig,
+    equity: float,
+    entry_price: float,
+    direction: str,
+    asset_class: str,
+    stop_loss_series: pd.Series | None,
+    atr_series: pd.Series | None,
+    entry_idx: int,
+    symbol: str,
+    trade_counter: int,
+) -> dict[str, Any]:
+    """Size one trade and return the full risk-math record.
+
+    Mirrors the legacy in-loop sizing logic exactly: risk_pct sizing when
+    configured, otherwise full-equity sizing. Warnings are emitted once per
+    (symbol, timeframe, reason).
+    """
+    risk_target_usd: float | None = None
+    stop_distance: float | None = None
+    max_position_pct: float | None = None
+    max_leverage: float | None = None
+    required_notional: float | None = None
+    cap_notional: float | None = None
+    leverage_notional_limit: float | None = None
+    final_notional: float | None = None
+    capped_by_max_position = False
+    capped_by_max_leverage = False
+    sizing_mode = "full_equity"
+
+    if config.risk_per_trade_pct is not None and config.risk_per_trade_pct > 0:
+        sizing_mode = "risk_pct"
+        max_position_pct = _resolve_max_position_pct(config.max_position_pct, asset_class)
+        max_leverage = _resolve_max_leverage(config.max_leverage)
+        # D10 (F7/F35): max_position_pct is the per-position notional cap; it is
+        # an INDEPENDENT cap, not an implicit leverage floor — a conservative
+        # max_leverage < max_position_pct is honored as configured.
+
+        risk_target_usd = equity * config.risk_per_trade_pct
+        stop_distance = _resolve_stop_distance(
+            entry_idx,
+            entry_price,
+            stop_loss_series=stop_loss_series,
+            atr_series=atr_series,
+        )
+
+        if not stop_distance or stop_distance <= 0:
+            stop_distance = entry_price * 0.02
+            _warn_once(
+                (symbol, config.timeframe, "fallback_stop"),
+                "Risk sizing fallback for %s/%s: no stop_loss/ATR, using %.2f%% default stop",
+                symbol,
+                config.timeframe,
+                2.0,
+            )
+
+        base_qty = risk_target_usd / stop_distance
+        required_notional = base_qty * entry_price
+        cap_notional = equity * max_position_pct
+        leverage_notional_limit = equity * max_leverage
+        capped_by_max_position = required_notional > cap_notional
+        capped_by_max_leverage = required_notional > leverage_notional_limit
+
+        # D10: the binding notional is min(position cap, leverage limit).
+        binding_notional = min(cap_notional, leverage_notional_limit)
+        if required_notional <= binding_notional:
+            final_notional = required_notional
+        else:
+            final_notional = binding_notional
+            achievable_risk = (final_notional / entry_price) * stop_distance
+            if capped_by_max_leverage and not capped_by_max_position:
+                logger.info(
+                    "Leverage bound notional for %s trade %s: required_notional=%.2f exceeds leverage limit=%.2f (max_leverage=%.2fx)",
+                    symbol,
+                    trade_counter,
+                    required_notional,
+                    leverage_notional_limit,
+                    max_leverage,
+                )
+            _warn_once(
+                (symbol, config.timeframe, "risk_underfilled"),
+                "Risk target underfilled for %s/%s: cap=%.2f, max_leverage=%.2fx",
+                symbol,
+                config.timeframe,
+                cap_notional,
+                max_leverage,
+            )
+
+        qty = final_notional / entry_price
+    else:
+        qty = equity / entry_price
+        final_notional = qty * entry_price
+
+    return {
+        "sizing_mode": sizing_mode,
+        "risk_target_usd": risk_target_usd,
+        "stop_distance": stop_distance,
+        "max_position_pct": max_position_pct,
+        "max_leverage": max_leverage,
+        "required_notional": required_notional,
+        "cap_notional": cap_notional,
+        "leverage_notional_limit": leverage_notional_limit,
+        "final_notional": final_notional,
+        "capped_by_max_position": capped_by_max_position,
+        "capped_by_max_leverage": capped_by_max_leverage,
+        "qty": qty,
+    }
 
 
 def _process_symbol(
@@ -198,74 +310,30 @@ def _process_symbol(
                 exit_reason = intrabar_exit["reason"]
                 trade_meta["modeling_resolution"] = intrabar_exit["resolution"]
 
-            if config.risk_per_trade_pct is not None and config.risk_per_trade_pct > 0:
-                sizing_mode = "risk_pct"
-                # Sizing semantics (Cleanup 16-D1, F7/F35): max_position_pct is
-                # the per-position notional cap (documented in the CLI). It is
-                # an INDEPENDENT cap, not an implicit leverage floor: the
-                # leverage limit is max_leverage alone, and a conservative
-                # max_leverage < max_position_pct is honored as configured.
-                max_position_pct = _resolve_max_position_pct(
-                    config.max_position_pct, asset_class
-                )
-                max_leverage = _resolve_max_leverage(config.max_leverage)
-
-                risk_target_usd = equity * config.risk_per_trade_pct
-                stop_distance = _resolve_stop_distance(
-                    entry_idx,
-                    entry_price,
-                    stop_loss_series=stop_loss_series,
-                    atr_series=atr_series,
-                )
-
-                if not stop_distance or stop_distance <= 0:
-                    stop_distance = entry_price * 0.02
-                    _warn_once(
-                        (symbol, config.timeframe, "fallback_stop"),
-                        "Risk sizing fallback for %s/%s: no stop_loss/ATR, using %.2f%% default stop",
-                        symbol,
-                        config.timeframe,
-                        2.0,
-                    )
-
-                base_qty = risk_target_usd / stop_distance
-                required_notional = base_qty * entry_price
-                cap_notional = equity * max_position_pct
-                leverage_notional_limit = equity * max_leverage
-                capped_by_max_position = required_notional > cap_notional
-                capped_by_max_leverage = required_notional > leverage_notional_limit
-
-                # D10 (F35/F7): the binding notional is
-                # min(position cap, leverage limit); both are independent caps.
-                binding_notional = min(cap_notional, leverage_notional_limit)
-                if required_notional <= binding_notional:
-                    final_notional = required_notional
-                else:
-                    final_notional = binding_notional
-                    achievable_risk = (final_notional / entry_price) * stop_distance
-                    if capped_by_max_leverage and not capped_by_max_position:
-                        logger.info(
-                            "Leverage bound notional for %s trade %s: required_notional=%.2f exceeds leverage limit=%.2f (max_leverage=%.2fx)",
-                            symbol,
-                            trade_counter,
-                            required_notional,
-                            leverage_notional_limit,
-                            max_leverage,
-                        )
-                    else:
-                        _warn_once(
-                            (symbol, config.timeframe, "risk_underfilled"),
-                            "Risk target underfilled for %s/%s: cap=%.2f, max_leverage=%.2fx",
-                            symbol,
-                            config.timeframe,
-                            cap_notional,
-                            max_leverage,
-                        )
-
-                qty = final_notional / entry_price
-            else:
-                qty = equity / entry_price
-                final_notional = qty * entry_price
+            sizing = _size_trade(
+                config=config,
+                equity=equity,
+                entry_price=entry_price,
+                direction=direction,
+                asset_class=asset_class,
+                stop_loss_series=stop_loss_series,
+                atr_series=atr_series,
+                entry_idx=entry_idx,
+                symbol=symbol,
+                trade_counter=trade_counter,
+            )
+            qty = sizing["qty"]
+            sizing_mode = sizing["sizing_mode"]
+            risk_target_usd = sizing["risk_target_usd"]
+            stop_distance = sizing["stop_distance"]
+            max_position_pct = sizing["max_position_pct"]
+            max_leverage = sizing["max_leverage"]
+            required_notional = sizing["required_notional"]
+            cap_notional = sizing["cap_notional"]
+            leverage_notional_limit = sizing["leverage_notional_limit"]
+            final_notional = sizing["final_notional"]
+            capped_by_max_position = sizing["capped_by_max_position"]
+            capped_by_max_leverage = sizing["capped_by_max_leverage"]
 
             if stop_price is None and stop_distance is not None and stop_distance > 0:
                 stop_price = (

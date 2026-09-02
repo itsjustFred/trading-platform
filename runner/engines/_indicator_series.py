@@ -194,5 +194,3 @@ def _build_indicator_series(df: pd.DataFrame, indicators: IndicatorMap) -> list[
         )
 
     return output
-
-
