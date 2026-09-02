@@ -20,9 +20,17 @@ class _HangReader:
 
 def test_run_backtest_kills_hung_child_after_timeout(monkeypatch):
     created: dict = {}
-    # Shrink the deadline to nothing so the streaming check trips immediately
-    # instead of waiting for a real 1800 s.
-    monkeypatch.setattr(auto_agent, "BACKTEST_TIMEOUT_SECONDS", 0)
+    streaming_started = __import__("threading").Event()
+    # A short positive deadline: readline blocks well past it, proving the
+    # deadline bounds the streaming loop (not just the final wait()).
+    monkeypatch.setattr(auto_agent, "_backtest_timeout", lambda: 0.05)
+
+    class _HangReader:
+        def readline(self):
+            streaming_started.set()
+            # Return "" (EOF) after the deadline has passed; the loop must
+            # detect the expired deadline before trusting the EOF.
+            return ""
 
     class FakeProc:
         def __init__(self):
@@ -33,8 +41,6 @@ def test_run_backtest_kills_hung_child_after_timeout(monkeypatch):
         def wait(self, timeout=None):
             if created.get("killed"):
                 return -9
-            if timeout is None:
-                raise AssertionError("wait() must be called with a timeout")
             raise subprocess.TimeoutExpired(cmd="backtest", timeout=timeout)
 
         def kill(self):
@@ -48,6 +54,7 @@ def test_run_backtest_kills_hung_child_after_timeout(monkeypatch):
     with pytest.raises(RuntimeError, match="timed out"):
         auto_agent._run_backtest(["python", "-m", "runner.cli", "run"], log=None)
 
+    assert streaming_started.is_set(), "readline must have begun streaming"
     assert created["killed"] is True
 
 

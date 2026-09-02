@@ -808,6 +808,11 @@ def _build_backtest_command(
 BACKTEST_TIMEOUT_SECONDS = 1800
 
 
+def _backtest_timeout() -> float:
+    """Module indirection so tests can shrink the deadline."""
+    return BACKTEST_TIMEOUT_SECONDS
+
+
 def _run_backtest(cmd: list[str], *, log: TaskLogger | None) -> tuple[int, str]:
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
@@ -824,7 +829,7 @@ def _run_backtest(cmd: list[str], *, log: TaskLogger | None) -> tuple[int, str]:
         bufsize=1,
     )
 
-    deadline = time.monotonic() + BACKTEST_TIMEOUT_SECONDS
+    deadline = time.monotonic() + _backtest_timeout()
     try:
         # Read with a deadline: a child that streams forever (or blocks on a
         # full pipe) must not outlive BACKTEST_TIMEOUT_SECONDS any more than a
@@ -857,7 +862,7 @@ def _timeout(proc: subprocess.Popen, cmd: list[str]) -> None:
     proc.wait(timeout=30)
     raise RuntimeError(
         f"Generated-strategy backtest timed out after "
-        f"{BACKTEST_TIMEOUT_SECONDS} seconds: {' '.join(cmd)}"
+        f"{_backtest_timeout()} seconds: {' '.join(cmd)}"
     ) from None
 
 

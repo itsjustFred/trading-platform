@@ -109,8 +109,22 @@ def test_stats_are_merged_across_symbols(tmp_path, monkeypatch):
         "runner.engines.pynecore_adapter.shutil.which", lambda name: "/usr/bin/pyne"
     )
 
+    seen_symbols: list[str] = []
+
     def fake_run(*args, **kwargs):
-        # both symbols succeed, each producing stats; the adapter must merge them
+        # both symbols succeed; each writes its own stats so the adapter must
+        # merge them (the old all_stats = ... overwrite would keep only QQQ's)
+        cmd = args[0]
+        data_csv = Path(cmd[cmd.index("--trade") - 1])
+        symbol = data_csv.name.split("_")[0]
+        seen_symbols.append(symbol)
+        stats_csv = Path(cmd[cmd.index("--strat") + 1])
+        stats_csv.write_text(
+            "metric,value\n"
+            + f"total_pnl,{100.0 if symbol == 'SPY' else 200.0}\n"
+            + f"sharpe_ratio,{1.0 if symbol == 'SPY' else 2.0}\n",
+            encoding="utf-8",
+        )
         return subprocess.CompletedProcess(args, returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(
@@ -119,3 +133,8 @@ def test_stats_are_merged_across_symbols(tmp_path, monkeypatch):
 
     result = PyneCoreAdapter().run(_config(tmp_path, ["SPY", "QQQ"]), str(strategy))
     assert result.meta.engine == "pynecore"
+    # Both symbols ran and both contributed: the merged stats keep SPY's values
+    # (not overwritten by the last symbol) and add QQQ's.
+    assert sorted(seen_symbols) == ["QQQ", "SPY"]
+    assert result.stats["total_pnl"] == 200.0
+    assert result.stats["sharpe_ratio"] == 2.0
