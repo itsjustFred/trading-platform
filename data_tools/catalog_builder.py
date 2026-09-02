@@ -812,7 +812,7 @@ def scan_ohlcv(data_dir: Path, include_validation: bool = False) -> list[dict]:
                     entry["last_updated"] = _mtime_to_iso(file_mtime)
             else:
                 entry.update(read_parquet_summary(parquet_file))
-        except (OSError, pd.errors.EmptyDataError, ValueError) as e:
+        except (OSError, ValueError) as e:
             logger.warning("Could not read %s: %s", parquet_file, e)
             try:
                 file_mtime = os.path.getmtime(parquet_file)
@@ -886,7 +886,7 @@ def scan_fundamentals(data_dir: Path) -> list[dict]:
             df = pd.read_parquet(parquet_file)
             entry["rows"] = len(df)
             entry["columns"] = list(df.columns)
-        except (OSError, pd.errors.EmptyDataError, ValueError) as e:
+        except (OSError, ValueError) as e:
             entry["rows"] = None
             entry["error"] = str(e)
 

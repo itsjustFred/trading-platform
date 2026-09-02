@@ -765,7 +765,7 @@ class SignalReplayEngine:
         for path in matches:
             try:
                 frame = pd.read_parquet(path)
-            except (ValueError, FileNotFoundError, OSError):
+            except (ValueError, OSError):
                 continue
             frame.columns = [str(column).lower() for column in frame.columns]
             if "timestamp" not in frame.columns:

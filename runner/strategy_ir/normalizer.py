@@ -48,7 +48,7 @@ def _parse_mapping_string(value: str) -> Any | None:
             parsed = parser(text)
             if isinstance(parsed, (dict, list, tuple)):
                 return parsed
-        except (ValueError, SyntaxError, TypeError, json.JSONDecodeError):
+        except (ValueError, SyntaxError, TypeError):
             pass
 
     parts = [part.strip() for part in text.split(",") if part.strip()]

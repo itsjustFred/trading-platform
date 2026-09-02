@@ -474,7 +474,7 @@ def _load_ohlcv_df(symbol: str, timeframe: str) -> pd.DataFrame | None:
                 df = pd.read_parquet(path, columns=_OHLCV_COLUMNS)
             except (ValueError, KeyError):
                 df = pd.read_parquet(path)
-        except (ValueError, KeyError, pd.errors.EmptyDataError, FileNotFoundError, OSError) as exc:
+        except (ValueError, KeyError, OSError) as exc:
             logger.warning("Could not load OHLCV segment for %s/%s from %s: %s", symbol, timeframe, path, exc)
             continue
         df.columns = [str(column).lower() for column in df.columns]
@@ -1124,7 +1124,7 @@ def _detect_indicators(strategy_file: str) -> list[dict]:
         return []
     try:
         source = path.read_text(encoding="utf-8")
-    except (FileNotFoundError, OSError):
+    except OSError:
         return []
 
     import re
@@ -1307,7 +1307,7 @@ def _compute_indicators(
                             results.append(
                                 _indicator_payload("SuperTrend", "overlay", data, "#22c55e")
                             )
-        except (ValueError, KeyError, pd.errors.EmptyDataError) as e:
+        except (ValueError, KeyError) as e:
             logger.warning("Indicator %s computation failed: %s", kind, e)
 
     return results
@@ -1370,7 +1370,7 @@ def _strategy_backtests(entry: StrategyEntry) -> list[dict]:
                     "created_at": bt_meta.get("created_at", ""),
                 }
             )
-        except (json.JSONDecodeError, KeyError, ValueError, TypeError, OSError):
+        except (KeyError, ValueError, TypeError, OSError):
             pass
     return backtests
 
@@ -1413,7 +1413,7 @@ def _extract_ast_parameters(file_path: Path) -> dict:
     try:
         source = file_path.read_text(encoding="utf-8", errors="replace")
         tree = ast.parse(source, filename=str(file_path))
-    except (FileNotFoundError, OSError, SyntaxError):
+    except (OSError, SyntaxError):
         return {}
 
     # --- locate generate_signals FunctionDef ---
@@ -2236,7 +2236,7 @@ def _refresh_catalog_for_task(
                 source=source,
             )
         _refresh_catalog()
-    except (json.JSONDecodeError, FileNotFoundError, OSError) as exc:
+    except OSError as exc:
         _task_log_message(task_id, f"Catalog refresh failed: {exc}", log_level="error", source=source)
         _mark_task_finished(task_id, status="failed", returncode=1, error=str(exc))
         return False
@@ -2506,7 +2506,7 @@ def _start_dukascopy_task(
                         )
                         _mark_task_finished(task_id, status="cancelled", returncode=-9)
                         return
-                    except (OSError, RuntimeError, ValueError, KeyError, json.JSONDecodeError) as exc:
+                    except (OSError, RuntimeError, ValueError, KeyError) as exc:
                         failed_items += 1
                         if first_error is None:
                             first_error = f"{symbol} {timeframe}: {exc}"
@@ -2732,14 +2732,11 @@ def _start_jforex_task(
                         _mark_task_finished(task_id, status="cancelled", returncode=-9)
                         return
                     except (
-                        ModuleNotFoundError,
                         ImportError,
                         OSError,
                         RuntimeError,
-                        TimeoutError,
                         ValueError,
                         KeyError,
-                        json.JSONDecodeError,
                     ) as exc:
                         jforex_traceback = traceback.format_exc()
                         fallback_reason = (
@@ -2814,10 +2811,8 @@ def _start_jforex_task(
                             except (
                                 OSError,
                                 RuntimeError,
-                                TimeoutError,
                                 ValueError,
                                 KeyError,
-                                json.JSONDecodeError,
                             ) as fallback_exc:
                                 failed_items += 1
                                 if first_error is None:
