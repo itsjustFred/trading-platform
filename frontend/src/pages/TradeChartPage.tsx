@@ -46,7 +46,7 @@ function formatTradeMetaValue(value: unknown): string {
   if (value == null || typeof value === "number") {
     return String(value);
   }
-  return JSON.stringify(value) ?? String(value);
+  return JSON.stringify(value);
 }
 
 /** Renders "P&L $x (y%)" without nested template literals. */
@@ -369,6 +369,33 @@ function MissingOhlcvPanel({
   );
 }
 
+/** Result of resolving a requested trade number against loaded trades. */
+type ResolvedTradeNr = { nr: number; changed: boolean };
+
+/** Clamp a requested trade number to one that exists in the replay payload. */
+function resolveRequestedTradeNr(
+  trades: Trade[],
+  requestedNr: number | undefined,
+  fallback: number,
+): ResolvedTradeNr {
+  const requested = Number.isFinite(requestedNr)
+    ? Number(requestedNr)
+    : fallback;
+  const tradeNumbers = trades.map((trade) => trade.nr);
+  const resolvedNr = tradeNumbers.includes(requested)
+    ? requested
+    : (tradeNumbers[0] ?? 1);
+  return { nr: resolvedNr, changed: resolvedNr !== requested };
+}
+
+/** Error text for a failed replay load, with the missing-OHLCV detail. */
+function describeReplayLoadError(err: unknown): string {
+  if (err instanceof ApiError && isMissingOHLCVDetail(err.detail)) {
+    return err.detail.message;
+  }
+  return err instanceof Error ? err.message : "Could not load replay data";
+}
+
 export function TradeChartPage() {
   const { id, nr } = useParams<{ id: string; nr: string }>();
   const navigate = useNavigate();
@@ -403,19 +430,13 @@ export function TradeChartPage() {
         setReplay(replayPayload);
         setTrades(replayPayload.trades || []);
         setInfo(infoPayload);
-
-        const requested = Number.isFinite(requestedNr)
-          ? Number(requestedNr)
-          : currentNrRef.current;
-        const tradeNumbers = (replayPayload.trades || []).map(
-          (trade) => trade.nr,
+        const { nr: resolvedNr } = resolveRequestedTradeNr(
+          replayPayload.trades || [],
+          requestedNr,
+          currentNrRef.current,
         );
-        const fallbackNr = tradeNumbers[0] ?? 1;
-        const resolvedNr = tradeNumbers.includes(requested)
-          ? requested
-          : fallbackNr;
         setCurrentNr(resolvedNr);
-        if (resolvedNr !== requested) {
+        if (resolvedNr !== requestedNr) {
           window.history.replaceState(
             window.history.state,
             "",
@@ -423,13 +444,7 @@ export function TradeChartPage() {
           );
         }
       } catch (err: unknown) {
-        if (err instanceof ApiError && isMissingOHLCVDetail(err.detail)) {
-          setLoadError(err.detail.message);
-        } else {
-          setLoadError(
-            err instanceof Error ? err.message : "Could not load replay data",
-          );
-        }
+        setLoadError(describeReplayLoadError(err));
         setReplay(null);
         setTrades([]);
       } finally {
@@ -787,6 +802,50 @@ export function TradeChartPage() {
     }
   };
 
+  let chartBody: React.ReactElement;
+  if (symbolOHLCV.length > 0) {
+    chartBody = (
+      <TradingViewChart
+        ohlcData={symbolOHLCV}
+        volumeData={chartVolumeData}
+        trades={chartTrades}
+        indicators={chartIndicators}
+        height={chartHeight}
+        dataTestId="trade-chart-canvas"
+        activeTradeId={currentTrade?.nr ?? null}
+        focusTradeTime={chartFocusTime}
+        showToolbar
+        isFullscreen={isFullscreen}
+        onToggleFullscreen={toggleFullscreen}
+      />
+    );
+  } else if (missingData) {
+    chartBody = (
+      <MissingOhlcvPanel
+        missing={missingData}
+        downloadStatus={downloadStatus}
+        downloadTaskId={downloadTaskId}
+        downloadError={downloadError}
+        onDownload={triggerMissingDataDownload}
+        onReload={() => loadReplay(currentNrRef.current)}
+      />
+    );
+  } else {
+    chartBody = (
+      <div
+        style={{
+          minHeight: "460px",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          color: "var(--color-text-muted)",
+        }}
+      >
+        No OHLCV data available for this symbol
+      </div>
+    );
+  }
+
   if (isLoading) {
     return (
       <div style={{ padding: "20px", color: "var(--color-text-muted)" }}>
@@ -1096,42 +1155,8 @@ export function TradeChartPage() {
           overflow: "hidden",
         }}
       >
-        {symbolOHLCV.length ? (
-          <TradingViewChart
-            ohlcData={symbolOHLCV}
-            volumeData={chartVolumeData}
-            trades={chartTrades}
-            indicators={chartIndicators}
-            height={chartHeight}
-            dataTestId="trade-chart-canvas"
-            activeTradeId={currentTrade?.nr ?? null}
-            focusTradeTime={chartFocusTime}
-            showToolbar
-            isFullscreen={isFullscreen}
-            onToggleFullscreen={toggleFullscreen}
-          />
-        ) : missingData ? (
-          <MissingOhlcvPanel
-            missing={missingData}
-            downloadStatus={downloadStatus}
-            downloadTaskId={downloadTaskId}
-            downloadError={downloadError}
-            onDownload={triggerMissingDataDownload}
-            onReload={() => loadReplay(currentNrRef.current)}
-          />
-        ) : (
-          <div
-            style={{
-              minHeight: "460px",
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              color: "var(--color-text-muted)",
-            }}
-          >
-            No OHLCV data available for this symbol
-          </div>
-        )}
+        {chartBody}
+
       </div>
 
       {tradeNumbers.length ? (

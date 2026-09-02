@@ -15,6 +15,7 @@ import {
   removeEmptyBacktests,
 } from "../api/client";
 import type {
+  BacktestMatrixStrategyOverview,
   BacktestMatrixSummary,
   BacktestMetadataItem,
   BacktestsDuplicatesResponse,
@@ -322,25 +323,21 @@ async function loadBacktestsAllCached(
   }
   if (force) {
     backtestsAllCache = null;
-    backtestsAllPromise = null;
   }
+  backtestsAllPromise ??= getBacktestsAll()
+    .then((rows) => {
+      const normalized = (rows ?? []).map((row) =>
+        normalizeBacktestRow(
+          row as BacktestMetadataItem & { equity_preview?: number[] },
+        ),
+      );
+      backtestsAllCache = cloneRows(normalized);
+      return cloneRows(backtestsAllCache);
+    })
+    .finally(() => {
+      backtestsAllPromise = null;
+    });
   if (backtestsAllCache) return cloneRows(backtestsAllCache);
-
-  if (!backtestsAllPromise) {
-    backtestsAllPromise = getBacktestsAll()
-      .then((rows) => {
-        const normalized = (rows ?? []).map((row) =>
-          normalizeBacktestRow(
-            row as BacktestMetadataItem & { equity_preview?: number[] },
-          ),
-        );
-        backtestsAllCache = cloneRows(normalized);
-        return cloneRows(backtestsAllCache);
-      })
-      .finally(() => {
-        backtestsAllPromise = null;
-      });
-  }
   return backtestsAllPromise;
 }
 
@@ -458,28 +455,7 @@ function BacktestMatrixPanel() {
         </div>
       </div>
 
-      <div style={MATRIX_METRIC_GRID_STYLE}>
-        <MatrixMetric
-          label="Cells OK"
-          value={`${summary.ok_cells}/${totalCells}`}
-          tone="positive"
-        />
-        <MatrixMetric
-          label="OK Rate"
-          value={okRate ? `${okRate.toFixed(1)}%` : "0%"}
-          tone={okRate >= 80 ? "positive" : "warning"}
-        />
-        <MatrixMetric
-          label="Failed"
-          value={String(summary.failed_cells)}
-          tone={summary.failed_cells ? "danger" : "positive"}
-        />
-        <MatrixMetric
-          label="Daily equity rows"
-          value={summary.daily_equity_rows.toLocaleString("de-DE")}
-          tone="neutral"
-        />
-      </div>
+      <MatrixMetricGrid summary={summary} totalCells={totalCells} okRate={okRate} />
 
       <div style={{ overflowX: "auto", marginTop: "16px" }}>
         <table style={MATRIX_TABLE_STYLE}>
@@ -498,64 +474,89 @@ function BacktestMatrixPanel() {
           </thead>
           <tbody>
             {overview.map((row) => (
-              <tr key={row.strategy}>
-                <Td>{row.strategy_name || row.strategy}</Td>
-                <Td align="right">{row.ok_cells}</Td>
-                <Td
-                  align="right"
-                  tone={row.failed_cells ? "danger" : "neutral"}
-                >
-                  {row.failed_cells}
-                </Td>
-                <Td align="right">
-                  {row.total_trades.toLocaleString("de-DE")}
-                </Td>
-                <Td
-                  align="right"
-                  tone={metricValue(row.total_pnl) >= 0 ? "positive" : "danger"}
-                >
-                  $
-                  {metricValue(row.total_pnl).toLocaleString("de-DE", {
-                    maximumFractionDigits: 0,
-                  })}
-                </Td>
-                <Td
-                  align="right"
-                  tone={
-                    metricValue(row.avg_sharpe) >= 0 ? "positive" : "danger"
-                  }
-                >
-                  {formatNumber(row.avg_sharpe)}
-                </Td>
-                <Td
-                  align="right"
-                  tone={
-                    metricValue(row.best_sharpe) >= 0 ? "positive" : "danger"
-                  }
-                >
-                  {formatNumber(row.best_sharpe)}
-                </Td>
-                <Td
-                  align="right"
-                  tone={
-                    metricValue(row.best_net_profit_pct) >= 0
-                      ? "positive"
-                      : "danger"
-                  }
-                >
-                  {percentage(row.best_net_profit_pct)}
-                </Td>
-                <Td>
-                  {row.best_symbol || row.best_timeframe
-                    ? `${row.best_symbol || ""} ${row.best_timeframe || ""}`.trim()
-                    : "—"}
-                </Td>
-              </tr>
+              <MatrixOverviewRow key={row.strategy} row={row} />
             ))}
           </tbody>
         </table>
       </div>
     </div>
+  );
+}
+
+/** Four headline metric cards for the matrix summary. */
+function MatrixMetricGrid({
+  summary,
+  totalCells,
+  okRate,
+}: Readonly<{
+  summary: BacktestMatrixSummary;
+  totalCells: number;
+  okRate: number;
+}>) {
+  return (
+    <div style={MATRIX_METRIC_GRID_STYLE}>
+      <MatrixMetric
+        label="Cells OK"
+        value={`${summary.ok_cells}/${totalCells}`}
+        tone="positive"
+      />
+      <MatrixMetric
+        label="OK Rate"
+        value={okRate ? `${okRate.toFixed(1)}%` : "0%"}
+        tone={okRate >= 80 ? "positive" : "warning"}
+      />
+      <MatrixMetric
+        label="Failed"
+        value={String(summary.failed_cells)}
+        tone={summary.failed_cells ? "danger" : "positive"}
+      />
+      <MatrixMetric
+        label="Daily equity rows"
+        value={summary.daily_equity_rows.toLocaleString("de-DE")}
+        tone="neutral"
+      />
+    </div>
+  );
+}
+
+/** Sign-aware tone for a numeric matrix metric. */
+function signTone(value: number): MatrixTone {
+  return value >= 0 ? "positive" : "danger";
+}
+
+/** One strategy summary row of the matrix table. */
+function MatrixOverviewRow({
+  row,
+}: Readonly<{ row: BacktestMatrixStrategyOverview }>) {
+  const bestCell =
+    row.best_symbol || row.best_timeframe
+      ? `${row.best_symbol || ""} ${row.best_timeframe || ""}`.trim()
+      : "—";
+  return (
+    <tr>
+      <Td>{row.strategy_name || row.strategy}</Td>
+      <Td align="right">{row.ok_cells}</Td>
+      <Td align="right" tone={row.failed_cells ? "danger" : "neutral"}>
+        {row.failed_cells}
+      </Td>
+      <Td align="right">{row.total_trades.toLocaleString("de-DE")}</Td>
+      <Td align="right" tone={signTone(metricValue(row.total_pnl))}>
+        $
+        {metricValue(row.total_pnl).toLocaleString("de-DE", {
+          maximumFractionDigits: 0,
+        })}
+      </Td>
+      <Td align="right" tone={signTone(metricValue(row.avg_sharpe))}>
+        {formatNumber(row.avg_sharpe)}
+      </Td>
+      <Td align="right" tone={signTone(metricValue(row.best_sharpe))}>
+        {formatNumber(row.best_sharpe)}
+      </Td>
+      <Td align="right" tone={signTone(metricValue(row.best_net_profit_pct))}>
+        {percentage(row.best_net_profit_pct)}
+      </Td>
+      <Td>{bestCell}</Td>
+    </tr>
   );
 }
 
@@ -609,13 +610,7 @@ const MATRIX_TABLE_STYLE: React.CSSProperties = {
   borderCollapse: "collapse",
   fontSize: "0.78rem",
 };
-type MatrixTone =
-  | "positive"
-  | "warning"
-  | "danger"
-  | "neutral"
-  | string
-  | undefined;
+type MatrixTone = string | undefined;
 
 /** Shared sign/tone color for matrix metric cells. */
 function toneColor(tone: MatrixTone): string {

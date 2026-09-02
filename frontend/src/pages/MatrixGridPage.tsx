@@ -12,11 +12,9 @@ import { getMatrixGrid } from "../api/client";
 import { Badge } from "../components/Badge";
 import type { Trade } from "../api/types";
 
-type MatrixStatus = string;
-
 interface BlockedStrategy {
   strategy: string;
-  status: MatrixStatus;
+  status: string;
   ok?: number | null;
   failed?: number | null;
   requested?: number | null;
@@ -27,7 +25,7 @@ interface BlockedStrategy {
 
 interface StrategySummary {
   strategy: string;
-  status: MatrixStatus;
+  status: string;
   ok: number;
   failed: number;
   skipped_existing: number;
@@ -58,7 +56,7 @@ interface StrategySummary {
 
 interface MatrixRow {
   strategy: string;
-  status: MatrixStatus;
+  status: string;
   symbol: string;
   timeframe: string;
   run_id: string;
@@ -180,7 +178,7 @@ function formatDateTime(value: string | null | undefined): string {
 }
 
 function statusColor(
-  status: MatrixStatus,
+  status: string,
 ): "green" | "red" | "yellow" | "blue" | "purple" | "muted" {
   if (status === "ok") return "green";
   if (status === "failed") return "red";
@@ -1277,6 +1275,19 @@ interface SortableThProps {
   align?: "left" | "right" | "center";
 }
 
+/** Single-direction arrow for the active sort column, label otherwise. */
+function sortIndicator(
+  current: SortKey,
+  sortKey: SortKey,
+  dir: "asc" | "desc",
+  sortLabel: (key: SortKey) => string,
+): string {
+  if (current !== sortKey) {
+    return sortLabel(sortKey);
+  }
+  return dir === "asc" ? "▲" : "▼";
+}
+
 function SortableTh({
   label,
   sortKey,
@@ -1294,7 +1305,7 @@ function SortableTh({
     >
       {label}{" "}
       <span className="text-xs">
-        {current === sortKey ? (dir === "asc" ? "▲" : "▼") : sortLabel(sortKey)}
+        {sortIndicator(current, sortKey, dir, sortLabel)}
       </span>
     </th>
   );

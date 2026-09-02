@@ -304,12 +304,11 @@ export interface OptimizationTrial {
   symbols?: string[];
   trade_count: number;
   penalty_applied: boolean;
-  train_stats: OptimizationTrainStat;
+  train_stats: OptimizationStatMap;
 }
 
 export type OptimizationStatValue = number | string | boolean | null;
 export type OptimizationStatMap = Record<string, OptimizationStatValue>;
-export type OptimizationTrainStat = OptimizationStatMap;
 
 export interface OptimizationSummary {
   id: string;
@@ -328,7 +327,7 @@ export interface OptimizationSummary {
   symbol_universes?: string[][];
   train_period: OptimizationPeriod;
   test_period: OptimizationPeriod;
-  train_stats: OptimizationTrainStat;
+  train_stats: OptimizationStatMap;
   test_stats: OptimizationStatMap;
 }
 
@@ -358,7 +357,7 @@ export interface OptimizationDetail {
   best_value: number | null;
   train_period: OptimizationPeriod;
   test_period: OptimizationPeriod;
-  train_stats: OptimizationTrainStat;
+  train_stats: OptimizationStatMap;
   test_stats: OptimizationStatMap;
   top_trials: OptimizationTrial[];
 }

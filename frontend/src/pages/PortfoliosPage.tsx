@@ -26,6 +26,8 @@ import { Sparkline } from "../components/Sparkline";
 import { useToast } from "../components/ToastProvider";
 import { formatPValue, pValueColor } from "../utils/stats";
 
+let componentIdCounter = 0;
+
 function componentId(): string {
   if (
     typeof crypto !== "undefined" &&
@@ -33,7 +35,10 @@ function componentId(): string {
   ) {
     return crypto.randomUUID();
   }
-  return `component-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  // crypto.randomUUID is unavailable only in insecure contexts; the counter
+  // keeps ids unique without a PRNG (S2245).
+  componentIdCounter += 1;
+  return `component-${Date.now()}-${componentIdCounter}`;
 }
 
 type ComponentDraft = {

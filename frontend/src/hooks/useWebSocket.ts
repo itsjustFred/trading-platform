@@ -186,8 +186,7 @@ export function useWebSocket<TMessage = unknown>(
       heartbeatTimer = window.setInterval(() => {
         if (
           disposed ||
-          socket == null ||
-          socket.readyState !== WebSocket.OPEN
+          socket?.readyState !== WebSocket.OPEN
         ) {
           return;
         }
@@ -298,7 +297,7 @@ export function useWebSocket<TMessage = unknown>(
 
   const sendJson = useCallback((payload: unknown): boolean => {
     const socket = socketRef.current;
-    if (socket == null || socket.readyState !== WebSocket.OPEN) {
+    if (socket?.readyState !== WebSocket.OPEN) {
       return false;
     }
     socket.send(JSON.stringify(payload));

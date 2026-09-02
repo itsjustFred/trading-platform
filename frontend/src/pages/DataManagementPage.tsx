@@ -219,7 +219,7 @@ function boundDate(
   if (filtered.length === 0) {
     return null;
   }
-  const sorted = filtered.sort((a, b) => a.localeCompare(b));
+  const sorted = [...filtered].sort((a, b) => a.localeCompare(b));
   if (pick === "first") {
     return sorted[0];
   }

@@ -68,7 +68,7 @@ function normalizeEquityPoints(
   const deduped: EquityPoint[] = [];
   for (const point of normalized) {
     const last = deduped.at(-1);
-    if (last && last.time === point.time) {
+    if (last?.time === point.time) {
       deduped[deduped.length - 1] = point;
       continue;
     }
@@ -245,10 +245,10 @@ export function BacktestDetailPage() {
       .then((payload) => {
         setCapmData(payload);
       })
-      .catch((capmIssue: unknown) => {
+      .catch((error_: unknown) => {
         const message =
-          capmIssue instanceof Error && capmIssue.message
-            ? capmIssue.message
+          error_ instanceof Error && error_.message
+            ? error_.message
             : "Could not load CAPM data";
         setCapmError(message);
         setCapmData(null);
@@ -283,10 +283,10 @@ export function BacktestDetailPage() {
       await deleteBacktest(id);
       showToast("Backtest deleted.", "success");
       navigate("/backtests", { replace: true });
-    } catch (deleteIssue: unknown) {
+    } catch (error_: unknown) {
       const message =
-        deleteIssue instanceof Error && deleteIssue.message
-          ? deleteIssue.message
+        error_ instanceof Error && error_.message
+          ? error_.message
           : "Could not delete backtest";
       showToast(message, "error");
       setDeleting(false);

@@ -92,6 +92,82 @@ type LiveHubAccountStats = {
 };
 
 
+/** Symbol list for a new deployment: explicit filter, wildcard for Discord. */
+function resolveCreateSymbols(
+  form: CreateDeploymentForm,
+  symbolFilter: string[],
+): string[] {
+  if (symbolFilter.length > 0) {
+    return symbolFilter;
+  }
+  return form.signal_source === "discord" ? ["*"] : [];
+}
+
+/** First validation problem for the create-deployment form, if any. */
+function validateCreateDeploymentForm(
+  source: CreateDeploymentForm["signal_source"],
+  strategyName: string,
+  accountId: string,
+  symbols: string[],
+  sourceId: string,
+): string | null {
+  if (source === "internal" && !strategyName) {
+    return "Please enter a strategy name.";
+  }
+  if (!accountId) {
+    return "Please choose an account.";
+  }
+  if (source === "internal" && symbols.length === 0) {
+    return "Please provide at least one symbol.";
+  }
+  if (source === "discord" && !sourceId) {
+    return "Please select a Discord bot service.";
+  }
+  return null;
+}
+
+type SettingsParseResult =
+  | { ok: true; settings: Record<string, unknown> }
+  | { ok: false; error: string };
+
+/** Parse the settings JSON textarea into an object payload. */
+function parseSettingsJson(raw: string): SettingsParseResult {
+  const settingsRaw = raw.trim();
+  if (!settingsRaw) {
+    return { ok: true, settings: {} };
+  }
+  try {
+    const parsed: unknown = JSON.parse(settingsRaw);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return { ok: true, settings: parsed as Record<string, unknown> };
+    }
+    return { ok: false, error: "Settings JSON must be an object." };
+  } catch {
+    return { ok: false, error: "Settings JSON is invalid." };
+  }
+}
+
+/** Human-readable Discord source label for a deployment card. */
+function discordSourceLabel(card: DeploymentCard): string {
+  const raw =
+    card.signal_source_id ||
+    asLogText(card.signal_config?.["service_name"]) ||
+    asLogText(card.signal_config?.["channel_id"]) ||
+    "—";
+  return raw || "—";
+}
+
+/** Stringify an unknown config value without "[object Object]" output. */
+function asLogText(value: unknown): string {
+  if (typeof value === "string") {
+    return value;
+  }
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  return "";
+}
+
 const LiveDeploymentCard = memo(function LiveDeploymentCard({
   card,
   busy,
@@ -136,14 +212,7 @@ const LiveDeploymentCard = memo(function LiveDeploymentCard({
       <div style={{ color: "var(--color-text-muted)", fontSize: "0.76rem", marginBottom: "8px" }}>
         Source: {card.signal_source === "discord" ? "Discord Bot" : "Internal Strategy"}
         {card.signal_source === "discord"
-          ? ` · ${
-              String(
-                card.signal_source_id ||
-                  card.signal_config?.["service_name"] ||
-                  card.signal_config?.["channel_id"] ||
-                  "—",
-              ) || "—"
-            }`
+          ? ` · ${discordSourceLabel(card)}`
           : ""}
         {(() => {
           if (card.signal_source !== "discord" || !card.signal_config) {
@@ -307,9 +376,9 @@ export function LiveHubPage() {
         setCards(nextCards);
         setStatsByAccount(nextStatsByAccount);
         setError("");
-      } catch (issue: unknown) {
+      } catch (error_: unknown) {
         const message =
-          issue instanceof Error ? issue.message : "Failed to load live deployments";
+          error_ instanceof Error ? error_.message : "Failed to load live deployments";
         setError(message);
       } finally {
         if (!silent) {
@@ -494,9 +563,9 @@ export function LiveHubPage() {
         `${card.strategy_name} switched to ${targetStatus.toLowerCase()}.`,
         "success",
       );
-    } catch (issue: unknown) {
+    } catch (error_: unknown) {
       const message =
-        issue instanceof Error ? issue.message : "Failed to update deployment status";
+        error_ instanceof Error ? error_.message : "Failed to update deployment status";
       showToast(message, "error");
     } finally {
       setDeploymentBusy(card.id, false);
@@ -514,46 +583,25 @@ export function LiveHubPage() {
       .filter(Boolean);
     const sourceId = createForm.signal_source_id.trim();
     const selectedProcessor = createForm.signal_processor.trim().toLowerCase();
-    let symbols: string[] = [];
-    if (symbolFilter.length > 0) {
-      symbols = symbolFilter;
-    } else if (createForm.signal_source === "discord") {
-      symbols = ["*"];
-    }
-
-    if (createForm.signal_source === "internal" && !strategyName) {
-      showToast("Please enter a strategy name.", "warning");
-      return;
-    }
-    if (!accountId) {
-      showToast("Please choose an account.", "warning");
-      return;
-    }
-    if (createForm.signal_source === "internal" && symbols.length === 0) {
-      showToast("Please provide at least one symbol.", "warning");
-      return;
-    }
-    if (createForm.signal_source === "discord" && !sourceId) {
-      showToast("Please select a Discord bot service.", "warning");
+    const symbols = resolveCreateSymbols(createForm, symbolFilter);
+    const validationError = validateCreateDeploymentForm(
+      createForm.signal_source,
+      strategyName,
+      accountId,
+      symbols,
+      sourceId,
+    );
+    if (validationError) {
+      showToast(validationError, "warning");
       return;
     }
 
-    let settingsPayload: Record<string, unknown> = {};
-    const settingsRaw = createForm.settings_json.trim();
-    if (settingsRaw) {
-      try {
-        const parsed = JSON.parse(settingsRaw);
-        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-          settingsPayload = parsed as Record<string, unknown>;
-        } else {
-          showToast("Settings JSON must be an object.", "warning");
-          return;
-        }
-      } catch {
-        showToast("Settings JSON is invalid.", "warning");
-        return;
-      }
+    const settingsParse = parseSettingsJson(createForm.settings_json);
+    if (!settingsParse.ok) {
+      showToast(settingsParse.error, "warning");
+      return;
     }
+    const settingsPayload = settingsParse.settings;
 
     setIsCreating(true);
     try {
@@ -589,9 +637,9 @@ export function LiveHubPage() {
         `Created deployment for ${createForm.signal_source === "discord" ? sourceId : strategyName}.`,
         "success",
       );
-    } catch (issue: unknown) {
+    } catch (error_: unknown) {
       const message =
-        issue instanceof Error ? issue.message : "Failed to create deployment";
+        error_ instanceof Error ? error_.message : "Failed to create deployment";
       showToast(message, "error");
     } finally {
       setIsCreating(false);
@@ -664,8 +712,8 @@ export function LiveHubPage() {
       showToast(`Signal replay started (task ${taskId}).`, "success");
       setReplayOpenAccountId("");
       navigate("/backtests");
-    } catch (issue: unknown) {
-      const message = issue instanceof Error ? issue.message : "Failed to start signal replay";
+    } catch (error_: unknown) {
+      const message = error_ instanceof Error ? error_.message : "Failed to start signal replay";
       showToast(message, "error");
     } finally {
       setIsStartingReplay(false);
@@ -691,9 +739,9 @@ export function LiveHubPage() {
       await deleteLiveDeployment(card.id);
       await refreshDeployments(true);
       showToast(`${card.strategy_name} deleted.`, "success");
-    } catch (issue: unknown) {
+    } catch (error_: unknown) {
       const message =
-        issue instanceof Error ? issue.message : "Failed to delete deployment";
+        error_ instanceof Error ? error_.message : "Failed to delete deployment";
       showToast(message, "error");
     } finally {
       setDeploymentBusy(card.id, false);

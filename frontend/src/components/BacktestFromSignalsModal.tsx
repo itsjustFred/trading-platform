@@ -131,10 +131,10 @@ export function BacktestFromSignalsModal({
       onTaskStarted?.(taskId);
       showToast(`Signal backtest started (task ${taskId}).`, "success");
       onClose();
-    } catch (issue: unknown) {
+    } catch (error_: unknown) {
       const message =
-        issue instanceof Error
-          ? issue.message
+        error_ instanceof Error
+          ? error_.message
           : "Could not start signal backtest";
       showToast(message, "error");
     } finally {

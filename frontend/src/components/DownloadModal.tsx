@@ -180,6 +180,9 @@ function validateDownloadForm(form: DownloadFormSnapshot): string | null {
   return null;
 }
 
+/** Offer side / price type selector values. */
+type DownloadPriceTypeValue = "bid" | "ask" | "both";
+
 interface DownloadSourceFieldsProps {
   source: string;
   symbols: string;
@@ -198,7 +201,7 @@ function DownloadSourceFields({
   inputStyle,
   isDukascopy,
   symbolsPlaceholder,
-}: DownloadSourceFieldsProps) {
+}: Readonly<DownloadSourceFieldsProps>) {
   return (
     <div
       style={{
@@ -266,7 +269,7 @@ function DownloadDateFields({
   onStartDateChange,
   onEndDateChange,
   inputStyle,
-}: DownloadDateFieldsProps) {
+}: Readonly<DownloadDateFieldsProps>) {
   return (
     <div
       style={{
@@ -322,7 +325,7 @@ function DownloadAdvancedSettings({
   onBatchSizeChange,
   onPauseMsChange,
   inputStyle,
-}: DownloadAdvancedSettingsProps) {
+}: Readonly<DownloadAdvancedSettingsProps>) {
   return (
     <div
       style={{
@@ -445,8 +448,8 @@ function DownloadAdvancedSettings({
 }
 
 interface DownloadPriceTypeProps {
-  priceType: "bid" | "ask" | "both";
-  onPriceTypeChange: (value: "bid" | "ask" | "both") => void;
+  priceType: DownloadPriceTypeValue;
+  onPriceTypeChange: (value: DownloadPriceTypeValue) => void;
   mergeTick: boolean;
   mergeS1: boolean;
   hasTickSelected: boolean;
@@ -464,19 +467,21 @@ function DownloadPriceType({
   hasS1Selected,
   onMergeTickChange,
   onMergeS1Change,
-}: DownloadPriceTypeProps) {
+}: Readonly<DownloadPriceTypeProps>) {
   return (
     <div style={{ display: "grid", gap: "8px" }}>
       <span id="download-price-type" style={fieldLabelStyle}>
         Price type
       </span>
-      <div
-        role="group"
+      <fieldset
         aria-labelledby="download-price-type"
         style={{
           display: "flex",
           gap: "10px",
           flexWrap: "wrap",
+          border: "none",
+          margin: 0,
+          padding: 0,
         }}
       >
         {(["bid", "ask", "both"] as const).map((option) => {
@@ -496,7 +501,7 @@ function DownloadPriceType({
             </button>
           );
         })}
-      </div>
+      </fieldset>
       <div
         style={{
           display: "grid",
@@ -582,7 +587,7 @@ function DukascopyCoveragePanel({
   minStart,
   loaded,
   error,
-}: DukascopyCoveragePanelProps) {
+}: Readonly<DukascopyCoveragePanelProps>) {
   if (!loaded) {
     return (
       <div
@@ -764,7 +769,7 @@ export function DownloadModal({
   );
   const [startDate, setStartDate] = useState("");
   const [endDate, setEndDate] = useState("");
-  const [priceType, setPriceType] = useState<"bid" | "ask" | "both">("bid");
+  const [priceType, setPriceType] = useState<DownloadPriceTypeValue>("bid");
   const [mergeTick, setMergeTick] = useState(false);
   const [mergeS1, setMergeS1] = useState(false);
   const [showAdvancedSettings, setShowAdvancedSettings] = useState(false);
@@ -871,10 +876,7 @@ export function DownloadModal({
         .filter((value): value is string => Boolean(value));
       const latestStart =
         starts.length > 0
-          ? starts.reduce(
-              (latest, current) => (current > latest ? current : latest),
-              starts[0],
-            )
+          ? starts.reduce((latest, current) => (current > latest ? current : latest))
           : null;
 
       return {
@@ -1132,10 +1134,16 @@ export function DownloadModal({
                     >
                       Timeframes
                     </span>
-                    <div
-                      role="group"
+                    <fieldset
                       aria-labelledby="download-timeframes"
-                      style={{ display: "flex", flexWrap: "wrap", gap: "8px" }}
+                      style={{
+                        display: "flex",
+                        flexWrap: "wrap",
+                        gap: "8px",
+                        border: "none",
+                        margin: 0,
+                        padding: 0,
+                      }}
                     >
                       {TIMEFRAME_OPTIONS.map((tf) => (
                         <button
@@ -1147,7 +1155,7 @@ export function DownloadModal({
                           {tf}
                         </button>
                       ))}
-                    </div>
+                    </fieldset>
                   </div>
 
                   {isDukascopyOrJForex && (

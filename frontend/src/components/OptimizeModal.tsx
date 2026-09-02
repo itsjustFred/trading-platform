@@ -47,10 +47,12 @@ function detectParameterKind(value: StrategyParameterValue): ParameterKind {
   return "categorical";
 }
 
-/** Removes trailing fractional zeros without regex backtracking. */
+/** Removes trailing fractional zeros from a fixed-precision decimal string. */
 function trimTrailingZeros(text: string): string {
-  const trimmed = text.replace(/0+$/, "");
-  return trimmed.endsWith(".") ? trimmed.slice(0, -1) : trimmed;
+  if (!text.includes(".")) {
+    return text;
+  }
+  return text.replace(/0+$/, "").replace(/\.$/, "");
 }
 
 function formatCurrentValue(value: StrategyParameterValue) {

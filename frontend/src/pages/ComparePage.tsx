@@ -105,6 +105,14 @@ function formatMetric(value: number, format: MetricConfig["format"]): string {
   return value.toFixed(3);
 }
 
+/** Neutral for a flat delta, otherwise green/red by which side is better. */
+function deltaColorFor(delta: number, betterSecond: boolean): string {
+  if (delta === 0) {
+    return "#c9d1d9";
+  }
+  return betterSecond ? "#3fb950" : "#f85149";
+}
+
 function formatMetricRaw(
   value: number,
   format: MetricConfig["format"],
@@ -151,10 +159,10 @@ export function ComparePage() {
       .then((payload) => {
         setData(payload);
       })
-      .catch((issue: unknown) => {
+      .catch((error_: unknown) => {
         const message =
-          issue instanceof Error
-            ? issue.message
+          error_ instanceof Error
+            ? error_.message
             : "Could not load comparison data";
         setError(message);
       })
@@ -317,12 +325,7 @@ export function ComparePage() {
                 const delta = right - left;
                 const betterSecond =
                   metric.better === "higher" ? right > left : right < left;
-                const deltaColor =
-                  delta === 0
-                    ? "#c9d1d9"
-                    : betterSecond
-                      ? "#3fb950"
-                      : "#f85149";
+                const deltaColor = deltaColorFor(delta, betterSecond);
                 return (
                   <tr key={metric.key}>
                     <td style={tdStyle}>{metric.label}</td>

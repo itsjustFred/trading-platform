@@ -125,10 +125,10 @@ export function LiveDetailPage() {
         }
 
         setError("");
-      } catch (issue: unknown) {
+      } catch (error_: unknown) {
         if (ignore) return;
         const message =
-          issue instanceof Error ? issue.message : "Failed to load live account details";
+          error_ instanceof Error ? error_.message : "Failed to load live account details";
         setError(message);
       } finally {
         if (!ignore) {
@@ -232,8 +232,8 @@ export function LiveDetailPage() {
       setReplayModalOpen(false);
       showToast(`Signal replay started (task ${taskId}).`, "success");
       navigate("/backtests");
-    } catch (issue: unknown) {
-      const message = issue instanceof Error ? issue.message : "Failed to start signal replay";
+    } catch (error_: unknown) {
+      const message = error_ instanceof Error ? error_.message : "Failed to start signal replay";
       showToast(message, "error");
     } finally {
       setIsStartingReplay(false);
@@ -332,7 +332,7 @@ export function LiveDetailPage() {
               alignItems: "center",
             }}
           >
-            Auto-download missing OHLCV
+            Auto-download missing OHLCV{" "}
             <input
               type="checkbox"
               checked={replayForm.auto_download}

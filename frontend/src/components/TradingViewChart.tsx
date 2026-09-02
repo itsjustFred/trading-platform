@@ -149,12 +149,12 @@ function formatLotSize(value: number | null | undefined): string {
 }
 
 function normalizeExitReason(reason: unknown): string {
-  const raw =
-    typeof reason === "string"
-      ? reason
-      : reason == null
-        ? ""
-        : JSON.stringify(reason);
+  let raw = JSON.stringify(reason);
+  if (typeof reason === "string") {
+    raw = reason;
+  } else if (reason == null) {
+    raw = "";
+  }
   const value = raw.trim().toLowerCase();
   if (!value) {
     return "Signal";
@@ -236,7 +236,7 @@ export function TradingViewChart({
   showToolbar = true,
   isFullscreen = false,
   onToggleFullscreen,
-}: TradingViewChartProps) {
+}: Readonly<TradingViewChartProps>) {
   const wrapperRef = useRef<HTMLDivElement>(null);
   const chartContainerRef = useRef<HTMLDivElement>(null);
   const tooltipRef = useRef<HTMLDivElement>(null);

@@ -28,11 +28,10 @@ const POLLING_PREFIXES = [
   "/api/live/trades/",
 ];
 const CANONICAL_TIMESTAMP_RE =
-  /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})(\.\d+)?(?: ?(Z|[+-]\d{2}:?\d{2}))?$/;
+  /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})(\.\d+)?(?: ?(Z|[+-]\d{2}:\d{2}))?$/;
 const TIMESTAMP_RE = /(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})/;
 const LOG_LEVEL_RE = /\b(ERROR|WARNING|WARN|INFO|DEBUG)\b/i;
-const MODULE_FUNC_RE =
-  /\b([A-Za-z_][A-Za-z0-9_.-]*)\.([A-Za-z_][A-Za-z0-9_<>-]*)\b/;
+const MODULE_FUNC_RE = /\b([A-Za-z_][\w.-]*)\.([A-Za-z_][\w<>-]*)\b/;
 const TRACEBACK_FILE_RE =
   /File "[^"]*\/([\w]*)\.py", line \d+, in ([A-Za-z_][\w<>-]*)/;
 const UVICORN_PREFIX_RE = /^\s*(INFO|ERROR|WARNING|DEBUG)\s*:\s*(.*?)\s*$/i;
@@ -744,7 +743,15 @@ export function LoggingPage() {
                       key={row.key}
                       data-index={virtualItem.index}
                       ref={rowVirtualizer.measureElement}
+                      role="button"
+                      tabIndex={0}
                       onClick={() => toggleExpanded(row.entry, row.index)}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter" || event.key === " ") {
+                          event.preventDefault();
+                          toggleExpanded(row.entry, row.index);
+                        }
+                      }}
                       style={{
                         position: "absolute",
                         top: 0,

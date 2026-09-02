@@ -26,7 +26,7 @@ export function MultiSelectDropdown({
   searchable = false,
   searchPlaceholder = "Filter options...",
   buttonWidth = "220px",
-}: MultiSelectDropdownProps) {
+}: Readonly<MultiSelectDropdownProps>) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const wrapperRef = useRef<HTMLDivElement>(null);

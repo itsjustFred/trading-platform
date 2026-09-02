@@ -201,12 +201,12 @@ const BACKTESTS_QUERY_PARAMS: ReadonlyArray<{
 
 export const getBacktests = (params?: BacktestsQueryParams) => {
   const query = new URLSearchParams();
-  for (const { key, name, kind } of BACKTESTS_QUERY_PARAMS) {
+  for (const { key, name } of BACKTESTS_QUERY_PARAMS) {
     const value = params?.[key];
     if (value == null || value === "") {
       continue;
     }
-    query.set(name, kind === "number" ? String(value) : String(value));
+    query.set(name, String(value));
   }
   return fetchJSON<BacktestsListResponse>(
     withQuery(`/backtests`, query.toString()),

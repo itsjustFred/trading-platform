@@ -76,6 +76,56 @@ function resolveChartLocale(): string {
   return language && language !== "undefined" ? language : "en-US";
 }
 
+/** Chart marker for one live signal arrow. */
+function signalMarker(signal: LiveSignalLog): TradeMarker | null {
+  const t = toChartTime(signal.signal_time);
+  if (t === null) return null;
+  const side =
+    String(signal.action || "").toLowerCase() === "sell" ? "SELL" : "BUY";
+  const qty = Number(signal.signal_metadata?.qty ?? signal.filled_qty ?? 0);
+  const price = signal.theoretical_price;
+  return {
+    id: `signal-${signal.signal_id}`,
+    time: t,
+    position: side === "BUY" ? "belowBar" : "aboveBar",
+    color: side === "BUY" ? "#22c55e" : "#f87171",
+    shape: side === "BUY" ? "arrowUp" : "arrowDown",
+    text: `${side} ${Number.isFinite(qty) ? qty.toFixed(2) : "0.00"} @ ${formatPrice(price)}`,
+  };
+}
+
+/** Chart marker for one closed-trade exit. */
+function exitMarker(trade: ViewerTrade): TradeMarker | null {
+  if (trade.exit === null) return null;
+  const t = toChartTime(trade.signalTimeUnix);
+  if (t === null) return null;
+  return {
+    id: `exit-${trade.id}`,
+    time: t,
+    position: trade.side === "BUY" ? "aboveBar" : "belowBar",
+    color: "#eab308",
+    shape: trade.side === "BUY" ? "arrowDown" : "arrowUp",
+    text: `EXIT ${trade.size.toFixed(2)} @ ${formatPrice(trade.exit)} · ${trade.exitReason}`,
+  };
+}
+
+/** Sorted chart markers for signals and closed trades. */
+function buildTradeMarkers(
+  signals: LiveSignalLog[],
+  trades: ViewerTrade[],
+): TradeMarker[] {
+  const out: TradeMarker[] = [];
+  for (const signal of signals) {
+    const marker = signalMarker(signal);
+    if (marker) out.push(marker);
+  }
+  for (const trade of trades) {
+    const marker = exitMarker(trade);
+    if (marker) out.push(marker);
+  }
+  return out.sort((left, right) => Number(left.time) - Number(right.time));
+}
+
 export function LiveViewerPage() {
   const { accountId: rawAccountId } = useParams<{ accountId: string }>();
   const queryClient = useQueryClient();
@@ -123,10 +173,10 @@ export function LiveViewerPage() {
           return symbols[0] ?? "";
         });
         setHeaderError("");
-      } catch (issue: unknown) {
+      } catch (error_: unknown) {
         if (ignore) return;
         const message =
-          issue instanceof Error ? issue.message : "Failed to load live viewer context";
+          error_ instanceof Error ? error_.message : "Failed to load live viewer context";
         setHeaderError(message);
       } finally {
         if (!ignore) {
@@ -601,38 +651,10 @@ function LiveCandlestickChart({
     [bars],
   );
 
-  const markers = useMemo<TradeMarker[]>(() => {
-    const out: TradeMarker[] = [];
-    for (const signal of signals) {
-      const t = toChartTime(signal.signal_time);
-      if (t === null) continue;
-      const side = String(signal.action || "").toLowerCase() === "sell" ? "SELL" : "BUY";
-      const qty = Number(signal.signal_metadata?.qty ?? signal.filled_qty ?? 0);
-      const price = signal.theoretical_price;
-      out.push({
-        id: `signal-${signal.signal_id}`,
-        time: t,
-        position: side === "BUY" ? "belowBar" : "aboveBar",
-        color: side === "BUY" ? "#22c55e" : "#f87171",
-        shape: side === "BUY" ? "arrowUp" : "arrowDown",
-        text: `${side} ${Number.isFinite(qty) ? qty.toFixed(2) : "0.00"} @ ${formatPrice(price)}`,
-      });
-    }
-    for (const trade of trades) {
-      if (trade.exit === null) continue;
-      const t = toChartTime(trade.signalTimeUnix);
-      if (t === null) continue;
-      out.push({
-        id: `exit-${trade.id}`,
-        time: t,
-        position: trade.side === "BUY" ? "aboveBar" : "belowBar",
-        color: "#eab308",
-        shape: trade.side === "BUY" ? "arrowDown" : "arrowUp",
-        text: `EXIT ${trade.size.toFixed(2)} @ ${formatPrice(trade.exit)} · ${trade.exitReason}`,
-      });
-    }
-    return out.sort((left, right) => Number(left.time) - Number(right.time));
-  }, [signals, trades]);
+  const markers = useMemo<TradeMarker[]>(
+    () => buildTradeMarkers(signals, trades),
+    [signals, trades],
+  );
 
   useEffect(() => {
     if (!containerRef.current) return;

@@ -147,6 +147,106 @@ export function ServicesPage() {
     }
   };
 
+  const servicesBody = servicesQuery.isLoading ? (
+    <div style={emptyStyle}>Loading services...</div>
+  ) : servicesQuery.isError ? (
+    <div style={emptyStyle}>Failed to load services.</div>
+  ) : services.length === 0 ? (
+    <div style={emptyStyle}>No services found.</div>
+  ) : (
+    <div style={{ display: "grid", gap: "10px" }}>
+      {services.map((service) => {
+        const isRunning = service.status === "running";
+        const cron = stringifyServiceConfigValue(service.config?.cron);
+        const channelId = stringifyServiceConfigValue(
+          service.config?.channel_id,
+        );
+        const metaLine =
+          service.type === "discord_bot"
+            ? discordMetaLine(channelId, relativeTime(service.last_activity))
+            : scheduleMetaLine(cron, relativeTime(service.last_activity));
+        return (
+          <div key={service.id} style={serviceCardStyle}>
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                gap: "10px",
+                flexWrap: "wrap",
+              }}
+            >
+              <div>
+                <div style={{ fontWeight: 700, fontSize: "0.92rem" }}>
+                  {service.type === "discord_bot" ? "Discord Bot: " : ""}
+                  {service.name}
+                </div>
+                <div style={metaLineStyle}>{metaLine}</div>
+              </div>
+              <div
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: "8px",
+                  color: "var(--color-text-muted)",
+                }}
+              >
+                <span
+                  style={{
+                    width: "10px",
+                    height: "10px",
+                    borderRadius: "50%",
+                    background: statusDot(service.status),
+                  }}
+                />
+                <span
+                  style={{ textTransform: "capitalize", fontWeight: 600 }}
+                >
+                  {service.status}
+                </span>
+              </div>
+            </div>
+            <div
+              style={{
+                display: "flex",
+                gap: "8px",
+                marginTop: "10px",
+                flexWrap: "wrap",
+              }}
+            >
+              <button
+                type="button"
+                style={secondaryButtonStyle}
+                onClick={() =>
+                  void handleStatus(
+                    service,
+                    isRunning ? "paused" : "running",
+                  )
+                }
+                disabled={statusMutation.isPending}
+              >
+                {isRunning ? "Pause" : "Start"}
+              </button>
+              <button
+                type="button"
+                style={secondaryButtonStyle}
+                onClick={() => setLogsService(service)}
+              >
+                Logs
+              </button>
+              <button
+                type="button"
+                style={dangerButtonStyle}
+                onClick={() => void handleDelete(service)}
+              >
+                Delete
+              </button>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+
   return (
     <div style={{ padding: "24px", display: "grid", gap: "14px" }}>
       <Modal
@@ -289,105 +389,7 @@ export function ServicesPage() {
         </div>
       </div>
 
-      {servicesQuery.isLoading ? (
-        <div style={emptyStyle}>Loading services...</div>
-      ) : servicesQuery.isError ? (
-        <div style={emptyStyle}>Failed to load services.</div>
-      ) : services.length === 0 ? (
-        <div style={emptyStyle}>No services found.</div>
-      ) : (
-        <div style={{ display: "grid", gap: "10px" }}>
-          {services.map((service) => {
-            const isRunning = service.status === "running";
-            const cron = stringifyServiceConfigValue(service.config?.cron);
-            const channelId = stringifyServiceConfigValue(
-              service.config?.channel_id,
-            );
-            const metaLine =
-              service.type === "discord_bot"
-                ? discordMetaLine(channelId, relativeTime(service.last_activity))
-                : scheduleMetaLine(cron, relativeTime(service.last_activity));
-            return (
-              <div key={service.id} style={serviceCardStyle}>
-                <div
-                  style={{
-                    display: "flex",
-                    justifyContent: "space-between",
-                    gap: "10px",
-                    flexWrap: "wrap",
-                  }}
-                >
-                  <div>
-                    <div style={{ fontWeight: 700, fontSize: "0.92rem" }}>
-                      {service.type === "discord_bot" ? "Discord Bot: " : ""}
-                      {service.name}
-                    </div>
-                    <div style={metaLineStyle}>{metaLine}</div>
-                  </div>
-                  <div
-                    style={{
-                      display: "inline-flex",
-                      alignItems: "center",
-                      gap: "8px",
-                      color: "var(--color-text-muted)",
-                    }}
-                  >
-                    <span
-                      style={{
-                        width: "10px",
-                        height: "10px",
-                        borderRadius: "50%",
-                        background: statusDot(service.status),
-                      }}
-                    />
-                    <span
-                      style={{ textTransform: "capitalize", fontWeight: 600 }}
-                    >
-                      {service.status}
-                    </span>
-                  </div>
-                </div>
-                <div
-                  style={{
-                    display: "flex",
-                    gap: "8px",
-                    marginTop: "10px",
-                    flexWrap: "wrap",
-                  }}
-                >
-                  <button
-                    type="button"
-                    style={secondaryButtonStyle}
-                    onClick={() =>
-                      void handleStatus(
-                        service,
-                        isRunning ? "paused" : "running",
-                      )
-                    }
-                    disabled={statusMutation.isPending}
-                  >
-                    {isRunning ? "Pause" : "Start"}
-                  </button>
-                  <button
-                    type="button"
-                    style={secondaryButtonStyle}
-                    onClick={() => setLogsService(service)}
-                  >
-                    Logs
-                  </button>
-                  <button
-                    type="button"
-                    style={dangerButtonStyle}
-                    onClick={() => void handleDelete(service)}
-                  >
-                    Delete
-                  </button>
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      )}
+      {servicesBody}
     </div>
   );
 }
