@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -219,7 +220,8 @@ def _safe_float(value: Any) -> float | None:
         number = float(value)
     except (TypeError, ValueError):
         return None
-    return number if number == number else None
+    # float("nan") is the only float unequal to itself; read it as "no data".
+    return None if math.isnan(number) else number
 
 
 def build_strategy_overview(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
