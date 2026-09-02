@@ -44,7 +44,9 @@ def existing_frame():
 
 
 class TestAtomicParquetWrites:
-    def test_merge_and_store_writes_via_temp_file(self, downloader, tmp_path, existing_frame):
+    def test_merge_and_store_writes_via_temp_file(
+        self, downloader, tmp_path, existing_frame, monkeypatch
+    ):
         """The canonical parquet is replaced by an atomic rename, never written in place."""
         out_path = tmp_path / "ohlcv" / "bare" / "forex" / "EURUSD" / "1m.parquet"
         out_path.parent.mkdir(parents=True)
@@ -54,18 +56,15 @@ class TestAtomicParquetWrites:
 
         def fake_to_parquet(self, path, *args, **kwargs):
             written["path"] = Path(path)
+            Path(path).touch()  # let the atomic commit succeed
+            return None
 
-        original = pd.DataFrame.to_parquet
+        new_data = existing_frame.iloc[[0]].copy()
         # Only observe where pandas is pointed; the atomic helper does the I/O.
-        try:
-            pd.DataFrame.to_parquet = fake_to_parquet  # type: ignore[method-assign]
-            new_data = existing_frame.iloc[[0]].copy()
-            try:
-                downloader._merge_and_store_single_file(out_path, new_data)
-            except (OSError, RuntimeError):
-                pass
-        finally:
-            pd.DataFrame.to_parquet = original  # type: ignore[method-assign]
+        # The merge succeeds, so exactly one write is attempted and committed.
+        monkeypatch.setattr(pd.DataFrame, "to_parquet", fake_to_parquet)
+
+        downloader._merge_and_store_single_file(out_path, new_data)
 
         target = written.get("path")
         assert target is not None, "helper must write to a staging path, not skip I/O"
@@ -83,10 +82,11 @@ class TestAtomicParquetWrites:
         def boom(*args, **kwargs):
             raise KeyboardInterrupt("simulated crash during write")
 
+        merged = existing_frame.copy()
         monkeypatch.setattr(pd.DataFrame, "to_parquet", boom)
 
         with pytest.raises(KeyboardInterrupt):
-            downloader._merge_and_store_single_file(out_path, existing_frame.copy())
+            downloader._merge_and_store_single_file(out_path, merged)
 
         # Original data still readable and unchanged.
         survivors = pd.read_parquet(out_path)

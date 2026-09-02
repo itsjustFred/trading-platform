@@ -139,12 +139,21 @@ def _jpype_module() -> Any:
 
 
 def _java_exception_types() -> tuple[type[BaseException], ...]:
+    """Java exception types raised by JPype, for ``except`` clauses.
+
+    Without JPype (or before the JVM bridge exposes ``JException``) there is
+    nothing Java-specific to catch: the callers' ``except Exception`` branches
+    handle that state, so an empty tuple here would silently swallow the
+    ``except`` clause. Raising instead keeps the failure explicit.
+    """
     if not JPYPE_AVAILABLE:
-        return ()
+        raise RuntimeError(
+            "JPype is required to catch JForex exceptions. Install with: pip install jpype1"
+        )
     java_exception = getattr(jpype, "JException", None)
     if isinstance(java_exception, type):
         return (java_exception,)
-    return ()
+    raise RuntimeError("JPype did not expose JException; cannot catch JForex exceptions")
 
 
 def _raise_jforex_runtime_error(context: str, exc: BaseException) -> None:

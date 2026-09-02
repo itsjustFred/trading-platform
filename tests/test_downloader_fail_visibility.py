@@ -2,18 +2,34 @@
 
 Covers DV-B9 (DownloadResult.path is a directory), DV-B16 (failed month/year
 downloads silently skipped), DV-B22 (tick CSVs stored under 1m.parquet; metals
-under asset_class forex).
+under asset_class forex), DV-C1 (merged tick download duplicate kwarg).
 """
 
 from __future__ import annotations
 
+import ast
+import inspect
 import json
+import threading
 from pathlib import Path
 
 import pandas as pd
 import pytest
 
 from data_tools.downloaders.base import Downloader, DownloadResult
+
+
+def _merged_tick_call_site(native_module) -> ast.Call:
+    """Return the AST call node of the merged bid+ask tick download in download()."""
+    source_path = Path(inspect.getfile(native_module))
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Await) and isinstance(node.value, ast.Call):
+            func = node.value.func
+            name = getattr(func, "id", None) or getattr(func, "attr", None)
+            if name == "_download_and_assemble_merged_ticks":
+                return node.value
+    raise AssertionError("merged tick call site not found")
 
 
 class _BareDownloader(Downloader):
@@ -223,3 +239,87 @@ class TestHuggingfaceFailureVisibility:
 
         assert result.warnings, "missing month must be surfaced in warnings"
         assert any("2024-02" in warning for warning in result.warnings)
+
+
+class TestDukascopyMergedTickContract:
+    def test_merged_tick_call_passes_pipeline_batches_without_duplication(self):
+        """Regression DV-C1 / Sonar S5549: the merged bid+ask tick call must
+        pass pipeline_batches exactly once. The pre-fix call passed six
+        positional args plus pipeline_batches as keyword, which raises
+        TypeError at download time (never covered by a test until now)."""
+        import data_tools.downloaders.dukascopy_native as native
+
+        signature = inspect.signature(native._download_and_assemble_merged_ticks)
+        positional = [
+            parameter.name
+            for parameter in signature.parameters.values()
+            if parameter.kind
+            in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        ]
+        keyword_names = {
+            name for name in signature.parameters if name not in positional
+        }
+
+        call = _merged_tick_call_site(native)
+        passed_positional = [ast.unparse(arg) for arg in call.args]
+        passed_keyword = {keyword.arg for keyword in call.keywords}
+
+        assert len(passed_positional) == len(positional), (
+            f"call passes {len(passed_positional)} positional args, "
+            f"function defines {len(positional)}: {passed_positional} vs {positional}"
+        )
+        overlap = passed_keyword & set(positional)
+        assert not overlap, f"positional params re-passed as keywords: {sorted(overlap)}"
+        unknown = passed_keyword - set(signature.parameters)
+        assert not unknown, f"call passes unknown keywords: {sorted(unknown)}"
+        assert "pipeline_batches" in keyword_names | passed_keyword
+
+    def test_merged_tick_call_is_executable(self, tmp_path, monkeypatch):
+        """The merged tick path must not raise TypeError when invoked with the
+        arguments the download() method actually passes."""
+        import data_tools.downloaders.dukascopy_native as native
+
+        captured: dict[str, object] = {}
+
+        async def fake_merged(instrument, start_dt, end_dt, batch_size, **kwargs):
+            captured["pipeline_batches"] = kwargs["pipeline_batches"]
+            captured["pause_ms"] = kwargs["pause_ms"]
+            captured["max_retries"] = kwargs["max_retries"]
+            return pd.DataFrame({"timestamp": pd.to_datetime(["2024-01-01T00:00:00Z"], utc=True)})
+
+        monkeypatch.setattr(native, "_download_and_assemble_merged_ticks", fake_merged)
+        monkeypatch.setattr(native, "DATA_DIR", tmp_path)
+        monkeypatch.setattr(native, "SOURCE_META_PATH", tmp_path / "source_meta.json")
+        monkeypatch.setattr(native, "GENESIS_PATH", tmp_path / "genesis.json")
+        monkeypatch.setattr(native, "_load_genesis_index", lambda: {})
+        monkeypatch.setattr(native, "_load_source_meta_index", lambda: {})
+        monkeypatch.setattr(native, "_write_source_meta_index", lambda payload: None)
+
+        downloader = native.DukascopyNativeDownloader()
+        # Run the sync download wrapper in a dedicated thread: the e2e
+        # playwright tests in this suite can leave the main thread's event
+        # loop in a non-runnable state, which makes asyncio.run() raise.
+        result_box: dict[str, object] = {}
+
+        def _run() -> None:
+            result_box["result"] = downloader.download(
+                "EURUSD",
+                "tick",
+                tmp_path,
+                start="2024-01-01",
+                end="2024-01-02",
+                offer_side="both",
+                batch_size=7,
+                pipeline_batches=3,
+                pause_ms=11,
+                max_retries=5,
+            )
+
+        thread = threading.Thread(target=_run)
+        thread.start()
+        thread.join(timeout=30)
+        assert not thread.is_alive(), "merged tick download timed out"
+
+        result = result_box["result"]
+        assert captured == {"pipeline_batches": 3, "pause_ms": 11, "max_retries": 5}
+        assert result.rows >= 0

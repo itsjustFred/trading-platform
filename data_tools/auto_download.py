@@ -551,7 +551,7 @@ def analyze_ohlcv_coverage(data_root: Path, requirement: DataRequirement) -> dic
         "timeframe": timeframe,
         "status": status,
         "gaps": gaps,
-        "failed_downloads": [gap for gap in significant_gaps],
+        "failed_downloads": list(significant_gaps),
     }
     if bounds is not None:
         report["start"] = bounds[0]

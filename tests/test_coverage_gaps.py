@@ -69,7 +69,8 @@ class TestInternalGapDetection:
             DataRequirement(symbol="EURUSD", timeframe="1h", start="2024-01-01", end="2024-01-02"),
         )
         assert report["status"] == "warning"
-        assert report["gaps"] and 0 < report["gaps"][0]["gap_days"] <= 3
+        assert report["gaps"], "a ~1.5-day internal hole must be reported"
+        assert 0 < report["gaps"][0]["gap_days"] <= 3
 
         _write_bars(
             tmp_path / "ohlcv" / "dukascopy" / "forex" / "GBPUSD" / "1h.parquet",
@@ -86,7 +87,8 @@ class TestInternalGapDetection:
             DataRequirement(symbol="GBPUSD", timeframe="1h", start="2024-01-01", end="2024-01-31"),
         )
         assert failed["status"] == "failed"
-        assert failed["gaps"] and failed["gaps"][0]["gap_days"] > 3
+        assert failed["gaps"], "a ~30-day internal hole must be reported"
+        assert failed["gaps"][0]["gap_days"] > 3
 
     def test_no_internal_gap_reports_ok(self, tmp_path):
         _write_bars(
