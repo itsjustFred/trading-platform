@@ -115,6 +115,11 @@ def run_backtest(
             if ready:
                 chunk = os.read(stdout_fd, 65536)
                 if not chunk:
+                    if buffered:  # flush a trailing partial line without newline
+                        line = buffered.decode("utf-8", errors="replace")
+                        buffered = b""
+                        output_lines.append(line + "\n")
+                        log_message(log, line, stream="stdout")
                     break
                 buffered += chunk
                 while b"\n" in buffered:

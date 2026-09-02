@@ -357,8 +357,7 @@ def _safe_float(value: Any) -> float | None:
         number = float(value)
     except (TypeError, ValueError):
         return None
-    # float("nan") is the only float unequal to itself; read it as "no data".
-    return None if math.isnan(number) else number
+    return number if math.isfinite(number) else None
 
 
 def build_strategy_overview(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
