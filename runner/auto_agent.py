@@ -462,9 +462,13 @@ def _normalize_markdown_doc(markdown_doc: str, *, strategy_name: str | None) -> 
 
 
 def _extract_markdown_response(content: str) -> str:
+    # No \s* between the fence and the lazy group: on input where the fence is
+    # followed by a long run of whitespace and never closed, the greedy \s*
+    # retries the whole lazy scan at every position (super-linear, Sonar S8786).
+    # The lazy group swallows the leading whitespace and .strip() drops it.
     for language in ("markdown", "md"):
         match = re.search(
-            rf"```{language}\s*(.*?)```",
+            rf"```{language}(.*?)```",
             content,
             flags=re.IGNORECASE | re.DOTALL,
         )
@@ -476,14 +480,14 @@ def _extract_markdown_response(content: str) -> str:
 def _extract_python_response(content: str) -> str:
     for language in ("python", "py"):
         match = re.search(
-            rf"```{language}\s*(.*?)```",
+            rf"```{language}(.*?)```",
             content,
             flags=re.IGNORECASE | re.DOTALL,
         )
         if match:
             return match.group(1).strip()
 
-    generic_match = re.search(r"```\s*(.*?)```", content, flags=re.DOTALL)
+    generic_match = re.search(r"```(.*?)```", content, flags=re.DOTALL)
     if generic_match:
         return generic_match.group(1).strip()
 
