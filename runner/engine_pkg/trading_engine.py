@@ -425,6 +425,8 @@ class TradeEngine:
     def _finalize_position(self, position: Position, exit_index: int) -> None:
         if position.remaining_qty > 1e-9:
             return
+        if not position.exits:
+            return
 
         self._trade_counter += 1
         pnl = sum(float(item.pnl or 0.0) for item in position.exits)

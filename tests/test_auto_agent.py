@@ -320,3 +320,22 @@ def test_normalize_markdown_doc_and_extract_engine_roundtrip():
     assert doc.startswith("# T")
     assert extract_engine("## Framework-Empfehlung\npynecore", requested_engine=None) == "pynecore"
     assert extract_engine("no engine here", requested_engine=None) == "vectorbt"
+
+
+def test_run_backtest_kills_child_on_timeout(tmp_path):
+    """CodeRabbit round (16-D2): a wedged validation backtest must be killed,
+    not hang the auto-agent loop forever."""
+    import sys
+
+    from runner.agent_process import run_backtest
+
+    script = tmp_path / "sleepy.py"
+    script.write_text("import time\nprint('started', flush=True)\ntime.sleep(60)\n")
+    cmd = [sys.executable, str(script)]
+
+    returncode, output = run_backtest(
+        cmd, log=lambda *a, **k: None, project_root=tmp_path, timeout_seconds=2
+    )
+
+    assert returncode == 124
+    assert "started" in output

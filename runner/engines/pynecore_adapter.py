@@ -34,7 +34,7 @@ from runner.engines._drawings import _normalize_drawings
 from runner.engines._shared import (
     resolve_max_leverage as _resolve_max_leverage,
     resolve_max_position_pct as _resolve_max_position_pct,
-    serialize_meta_value,
+    serialize_meta_value as _serialize_meta_value,
 )
 from runner.stats import compute_stats_for_result
 from shared.constants import DATA_DIR
@@ -587,11 +587,6 @@ def _locate_trade_bar(timestamp_series: pd.Series, raw_time: str) -> int | None:
     if diffs.loc[nearest_idx] <= pd.Timedelta(seconds=1):
         return int(nearest_idx)
     return None
-
-
-def _serialize_meta_value(value: Any) -> Any | None:
-    """Deprecated shim: use runner.engines._shared.serialize_meta_value."""
-    return serialize_meta_value(value)
 
 
 def _promote_directional_price_meta(meta: dict[str, Any], direction: str, key_prefix: str) -> None:

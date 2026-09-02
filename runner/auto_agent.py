@@ -162,7 +162,7 @@ def run_auto_agent(
     markdown_response = _run_llm_step(
         provider_instance,
         model=selected_model,
-        developer_prompt=_step_one_developer_prompt_impl(requested_engine=requested_engine),
+        developer_prompt=_step_one_developer_prompt(requested_engine=requested_engine),
         user_prompt=_step_one_user_prompt(source_code=source_code, strategy_name=strategy_name),
         log=log,
         step_label="Step 1/3",
@@ -218,7 +218,7 @@ def run_auto_agent(
         python_response = _run_llm_step(
             provider_instance,
             model=selected_model,
-            developer_prompt=_step_three_developer_prompt_impl(system_prompt=system_prompt, engine=engine),
+            developer_prompt=_step_three_developer_prompt(system_prompt=system_prompt, engine=engine),
             user_prompt=_step_three_user_prompt(
                 source_code=source_code,
                 markdown_doc=markdown_doc,

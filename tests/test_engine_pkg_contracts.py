@@ -110,7 +110,6 @@ def test_size_trade_returns_typed_record():
         config=config,
         equity=10_000.0,
         entry_price=100.0,
-        direction="LONG",
         asset_class="forex",
         stop_loss_series=None,
         atr_series=None,
