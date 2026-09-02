@@ -61,8 +61,8 @@ def _align_series(
     series_a: list[list], series_b: list[list]
 ) -> tuple[list[str], list[float], list[float]]:
     """Align two [time, value] series to common timestamps."""
-    dict_a = {t: v for t, v in series_a}
-    dict_b = {t: v for t, v in series_b}
+    dict_a = dict(series_a)
+    dict_b = dict(series_b)
     common = sorted(set(dict_a.keys()) & set(dict_b.keys()))
     return common, [dict_a[d] for d in common], [dict_b[d] for d in common]
 

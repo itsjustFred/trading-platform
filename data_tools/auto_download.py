@@ -487,9 +487,7 @@ def _resolve_intrabar_timeframe(base_timeframe: str, modeling_resolution: str | 
         return None
     if normalized in {"m1", "1min", "min1"}:
         normalized = "1m"
-    elif normalized in {"s1", "tick"}:
-        pass
-    else:
+    elif normalized not in {"s1", "tick"}:
         normalized = normalize_timeframe(normalized)
 
     if normalized == "1-lower":

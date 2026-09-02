@@ -66,7 +66,7 @@ def convert_stockkit_trades(
             strategy_name = name
 
     trades = _build_trades(rows, strategy_name)
-    symbols = sorted(set(t.symbol for t in trades))
+    symbols = sorted({t.symbol for t in trades})
 
     now = datetime.now(timezone.utc).isoformat()
     meta = BacktestMeta(

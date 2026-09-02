@@ -200,10 +200,9 @@ def _java_exception_types() -> tuple[type[BaseException], ...]:
     handle that state, so an empty tuple here would silently swallow the
     ``except`` clause. Raising instead keeps the failure explicit.
     """
-    if not JPYPE_AVAILABLE:
-        return ()
-    java_exception = getattr(jpype, "JException", None)
-    if isinstance(java_exception, type):
+    if JPYPE_AVAILABLE and isinstance(
+        java_exception := getattr(jpype, "JException", None), type
+    ):
         return (java_exception,)
     # No JException exposed (e.g. mocked or very old JPype): an empty tuple
     # keeps except-clause evaluation from raising *while raising* the real
@@ -1332,8 +1331,8 @@ class JForexDownloader(Downloader):
                 bid_result_df = _resample_offer_prefixed(bid_df, target_tf, "bid")
                 ask_result_df = _resample_offer_prefixed(ask_df, target_tf, "ask")
 
-            merged_bid = self._merge_and_store_single_file(bid_out_path, bid_result_df)
-            merged_ask = self._merge_and_store_single_file(ask_out_path, ask_result_df)
+            self._merge_and_store_single_file(bid_out_path, bid_result_df)
+            self._merge_and_store_single_file(ask_out_path, ask_result_df)
             result_df = bid_result_df.merge(ask_result_df, on="timestamp", how="inner")
             result_df = (
                 result_df.sort_values("timestamp")

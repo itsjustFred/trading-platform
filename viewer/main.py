@@ -1585,42 +1585,39 @@ class _LiveStreamBroker:
             await _queue_live_ws_message(queue, payload)
 
     async def _run_topic(self, state: _LiveStreamTopicState) -> None:
-        try:
-            while True:
-                await asyncio.sleep(max(0.1, state.poll_seconds))
-                try:
-                    payload = await state.fetch_payload()
-                except Exception as exc:
-                    await self._broadcast(
-                        state,
-                        {
-                            "type": "error",
-                            "topic": state.topic,
-                            "error": _live_ws_error_detail(exc),
-                            "ts": time.time(),
-                        },
-                    )
-                    continue
-
-                signature = _stable_payload_signature(payload)
-                is_initial = state.last_signature is None
-                if signature == state.last_signature:
-                    continue
-                state.last_signature = signature
-                state.last_payload = payload
-                if is_initial:
-                    continue
+        while True:
+            await asyncio.sleep(max(0.1, state.poll_seconds))
+            try:
+                payload = await state.fetch_payload()
+            except Exception as exc:
                 await self._broadcast(
                     state,
                     {
-                        "type": "update",
+                        "type": "error",
                         "topic": state.topic,
-                        "data": payload,
+                        "error": _live_ws_error_detail(exc),
                         "ts": time.time(),
                     },
                 )
-        except asyncio.CancelledError:
-            raise
+                continue
+
+            signature = _stable_payload_signature(payload)
+            is_initial = state.last_signature is None
+            if signature == state.last_signature:
+                continue
+            state.last_signature = signature
+            state.last_payload = payload
+            if is_initial:
+                continue
+            await self._broadcast(
+                state,
+                {
+                    "type": "update",
+                    "topic": state.topic,
+                    "data": payload,
+                    "ts": time.time(),
+                },
+            )
 
     async def shutdown(self) -> None:
         states: list[_LiveStreamTopicState]

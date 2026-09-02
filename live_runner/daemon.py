@@ -1487,9 +1487,8 @@ async def _run_discord_bot_service_listener(service: Service, source: DiscordSig
     while True:
         try:
             async for _signal in source.listen_signals():
-                pass
-            if source.is_paused:
-                return
+                if source.is_paused:
+                    return
             await asyncio.sleep(1)
             backoff_seconds = 2
         except asyncio.CancelledError:

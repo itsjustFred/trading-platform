@@ -143,7 +143,7 @@ class RiskParityStrategy(QCAlgorithm):
         """
         Calculate shrunk covariance matrix (Ledoit-Wolf)
         """
-        n_assets, n_obs = returns_matrix.shape
+        n_assets, _ = returns_matrix.shape
 
         # Sample covariance
         sample_cov = np.cov(returns_matrix)

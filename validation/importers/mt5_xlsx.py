@@ -468,7 +468,6 @@ class MT5XLSXImporter(BaseImporter):
             return []
 
         col_time = MT5XLSXImporter._find_col(trades_df, ["Zeit"])
-        col_trade_id = MT5XLSXImporter._find_col(trades_df, ["Trade"])
         col_symbol = MT5XLSXImporter._find_col(trades_df, ["Symbol"])
         col_typ = MT5XLSXImporter._find_col(trades_df, ["Typ"])
         col_direction = MT5XLSXImporter._find_col(trades_df, ["Richtung"])

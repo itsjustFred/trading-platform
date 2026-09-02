@@ -1017,7 +1017,6 @@ def _quick_stats_and_equity(
     psr_val = derived_stats.get("psr")
     p_value = round(_safe_float(derived_stats.get("p_value"), 1.0), 6)
 
-    n = len(equity)
     equity_mini = _downsample_numeric_minmax([float(v) for v in equity if isinstance(v, (int, float))], limit=50)
 
     return {
@@ -2085,13 +2084,14 @@ def _ingest_task_log_line(task_id: str, text: str) -> None:
         detail["total"] = max(int(detail.get("total") or task.get("total_items", 0) or 0), 0)
         detail["current"] = text
 
-        if text.startswith("✅"):
-            detail["completed"] = int(detail.get("completed", 0) or 0) + 1
-        elif text.startswith("❌"):
-            detail["failed"] = int(detail.get("failed", 0) or 0) + 1
+        if text.startswith(("✅", "❌")):
+            if text.startswith("✅"):
+                detail["completed"] = int(detail.get("completed", 0) or 0) + 1
+            else:
+                detail["failed"] = int(detail.get("failed", 0) or 0) + 1
 
         total = detail["total"]
-        if total > 0 and (text.startswith("✅") or text.startswith("❌")):
+        if total > 0 and text.startswith(("✅", "❌")):
             done = min(int(detail.get("completed", 0) or 0) + int(detail.get("failed", 0) or 0), total)
             detail["percent"] = round(min(100.0, done / total * 100.0), 2)
             task["progress"] = detail["percent"]
@@ -2469,7 +2469,6 @@ def _start_dukascopy_task(
                     _set_task_status(task_id, "running")
                     item_label = f"{symbol} {timeframe}"
                     base_completed = completed_items + failed_items
-                    used_native_backend = False
 
                     def report_progress(pct: float, message: str) -> None:
                         overall = ((base_completed + (max(0.0, min(pct, 100.0)) / 100.0)) / total) * 100.0
@@ -2479,6 +2478,8 @@ def _start_dukascopy_task(
                             current=f"{item_label}: {message}",
                             total=total,
                         )
+
+                    used_native_backend = False
 
                     try:
                         result = downloader.download(
@@ -2710,7 +2711,6 @@ def _start_jforex_task(
                     _set_task_status(task_id, "running")
                     item_label = f"{symbol} {timeframe}"
                     base_completed = completed_items + failed_items
-                    used_native_backend = False
 
                     def report_progress(pct: float, message: str) -> None:
                         overall = ((base_completed + (max(0.0, min(pct, 100.0)) / 100.0)) / total) * 100.0
@@ -2720,6 +2720,8 @@ def _start_jforex_task(
                             current=f"{item_label}: {message}",
                             total=total,
                         )
+
+                    used_native_backend = False
 
                     try:
                         result = jforex_downloader.download(

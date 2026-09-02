@@ -216,7 +216,7 @@ def _guess_asset_class(instrument_key: str, normalized_symbol: str) -> str:
         return "indices"
     if "cmd" in inst or sym in {"UKOIL", "USOIL"}:
         return "energy"
-    if sym.startswith("XAU") or sym.startswith("XAG"):
+    if sym.startswith(("XAU", "XAG")):
         return "metals"
     return "forex"
 
@@ -462,95 +462,92 @@ async def download_bi5_files(
     connector = aiohttp.TCPConnector(limit=window_size, force_close=False)
     timeout = aiohttp.ClientTimeout(total=60, connect=15)
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-        try:
-            for batch_index, offset in enumerate(range(0, total, window_size), start=1):
-                await _wait_for_control(pause_event, stop_event)
-                batch_started_at_cap = current_pause_ms >= MAX_BATCH_PAUSE_MS
-                batch = urls[offset : offset + window_size]
-                tasks = [
-                    asyncio.create_task(
-                        _fetch_one(
-                            session,
-                            dt,
-                            url,
-                            semaphore,
-                            max_retries,
-                            pause_event=pause_event,
-                            stop_event=stop_event,
-                        )
+        for batch_index, offset in enumerate(range(0, total, window_size), start=1):
+            await _wait_for_control(pause_event, stop_event)
+            batch_started_at_cap = current_pause_ms >= MAX_BATCH_PAUSE_MS
+            batch = urls[offset : offset + window_size]
+            tasks = [
+                asyncio.create_task(
+                    _fetch_one(
+                        session,
+                        dt,
+                        url,
+                        semaphore,
+                        max_retries,
+                        pause_event=pause_event,
+                        stop_event=stop_event,
                     )
-                    for dt, url in batch
-                ]
-                try:
-                    batch_results = await asyncio.gather(*tasks)
-                except DownloadCancelled:
-                    for task in tasks:
-                        if not task.done():
-                            task.cancel()
-                    await asyncio.gather(*tasks, return_exceptions=True)
-                    raise
-                finally:
-                    for task in tasks:
-                        if not task.done():
-                            task.cancel()
+                )
+                for dt, url in batch
+            ]
+            try:
+                batch_results = await asyncio.gather(*tasks)
+            except DownloadCancelled:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
 
-                batch_throttled = False
-                cooldown_required = False
-                for result in batch_results:
-                    results.append((result.dt, result.data))
-                    batch_throttled = batch_throttled or result.throttle_signal
-                    cooldown_required = cooldown_required or result.cooldown_required
-                    completed += 1
-                    _report_progress(
-                        report_progress,
-                        (completed / total) * 100.0,
-                        f"Downloaded {completed}/{total} {unit}",
-                    )
+            batch_throttled = False
+            cooldown_required = False
+            for result in batch_results:
+                results.append((result.dt, result.data))
+                batch_throttled = batch_throttled or result.throttle_signal
+                cooldown_required = cooldown_required or result.cooldown_required
+                completed += 1
+                _report_progress(
+                    report_progress,
+                    (completed / total) * 100.0,
+                    f"Downloaded {completed}/{total} {unit}",
+                )
 
-                if batch_throttled:
-                    next_pause_ms = min(
-                        current_pause_ms * 2 if current_pause_ms > 0 else 1000,
-                        MAX_BATCH_PAUSE_MS,
-                    )
-                    if next_pause_ms == MAX_BATCH_PAUSE_MS and current_pause_ms != MAX_BATCH_PAUSE_MS:
-                        _emit_log_message(
-                            (
-                                "Potential Dukascopy rate-limit detected in batch "
-                                f"{batch_index}; backoff cap reached at {MAX_BATCH_PAUSE_MS} ms."
-                            ),
-                            level="warning",
-                            log_callback=log_callback,
-                        )
-                    current_pause_ms = next_pause_ms
+            if batch_throttled:
+                next_pause_ms = min(
+                    current_pause_ms * 2 if current_pause_ms > 0 else 1000,
+                    MAX_BATCH_PAUSE_MS,
+                )
+                if next_pause_ms == MAX_BATCH_PAUSE_MS and current_pause_ms != MAX_BATCH_PAUSE_MS:
                     _emit_log_message(
                         (
                             "Potential Dukascopy rate-limit detected in batch "
-                            f"{batch_index}; increasing pause to {current_pause_ms} ms."
+                            f"{batch_index}; backoff cap reached at {MAX_BATCH_PAUSE_MS} ms."
                         ),
                         level="warning",
                         log_callback=log_callback,
                     )
+                current_pause_ms = next_pause_ms
+                _emit_log_message(
+                    (
+                        "Potential Dukascopy rate-limit detected in batch "
+                        f"{batch_index}; increasing pause to {current_pause_ms} ms."
+                    ),
+                    level="warning",
+                    log_callback=log_callback,
+                )
 
-                if batch_started_at_cap and cooldown_required:
-                    _emit_log_message(
-                        (
-                            "Dukascopy still throttled requests after the 10000 ms backoff cap; "
-                            f"starting {int(HARD_COOLDOWN_SECONDS)}s cooldown and resetting pause."
-                        ),
-                        level="warning",
-                        log_callback=log_callback,
-                    )
-                    await _sleep_with_control(HARD_COOLDOWN_SECONDS, pause_event, stop_event)
-                    current_pause_ms = base_pause_ms
-                    continue
+            if batch_started_at_cap and cooldown_required:
+                _emit_log_message(
+                    (
+                        "Dukascopy still throttled requests after the 10000 ms backoff cap; "
+                        f"starting {int(HARD_COOLDOWN_SECONDS)}s cooldown and resetting pause."
+                    ),
+                    level="warning",
+                    log_callback=log_callback,
+                )
+                await _sleep_with_control(HARD_COOLDOWN_SECONDS, pause_event, stop_event)
+                current_pause_ms = base_pause_ms
+                continue
 
-                has_more_batches = completed < total
-                if not has_more_batches:
-                    continue
+            has_more_batches = completed < total
+            if not has_more_batches:
+                continue
 
-                await _sleep_with_control(current_pause_ms / 1000.0, pause_event, stop_event)
-        except DownloadCancelled:
-            raise
+            await _sleep_with_control(current_pause_ms / 1000.0, pause_event, stop_event)
 
     return results
 

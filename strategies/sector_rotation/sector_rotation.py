@@ -47,7 +47,6 @@ def generate_signals(df: pd.DataFrame, params: dict):
     atr = tr.rolling(atr_period).mean()
 
     entry_cond = (momentum > 0) & (fast_momentum > 0) & (close > sma_200)
-    exit_cond = (momentum < 0) | short_weakness
 
     entries = pd.Series(False, index=df.index)
     exits = pd.Series(False, index=df.index)

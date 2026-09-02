@@ -396,7 +396,7 @@ def stop_atr(args: argparse.Namespace) -> None:
         ref = importer.load(mt5_path, source_timezone=MT5_SOURCE_TIMEZONE)
         case = cases[label]
         df = _load_ohlcv(args.data_dir, case["execution_symbol"], case["execution_timeframe"], case["start"], case["end"])
-        entries, exits, indicators, _ = generate_signals(df, params)
+        _, _, indicators, _ = generate_signals(df, params)
         mt5_rows: list[dict[str, Any]] = []
         our_atr = indicators["daily_atr"]
         our_stop_distance = abs(pd.to_numeric(indicators["sl_price"], errors="coerce") - df["close"])
@@ -457,7 +457,7 @@ def signal_counts(args: argparse.Namespace) -> None:
                         "use_candle_close": use_close,
                     },
                 )
-                entries, exits, indicators, _ = generate_signals(df, params)
+                entries, _, indicators, _ = generate_signals(df, params)
                 dirs = indicators["direction"].dropna().value_counts().to_dict()
                 print(f"offset={offset:+g} use_close={use_close} entries={int(entries.sum())} dirs={dirs}")
 

@@ -249,7 +249,6 @@ def run_backtest(
     returns = prices.pct_change().dropna()
     returns = returns[TICKERS]  # ensure column order
 
-    lookback_vol = 60
     lookback_corr = 120
     target_vol = 0.10
     max_leverage = 1.5

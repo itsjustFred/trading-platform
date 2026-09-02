@@ -58,7 +58,6 @@ def generate_signals(df: pd.DataFrame, params: dict):
     rsi = 100 - (100 / (1 + rs))
 
     raw_entries = (close < lower_bb) & (rsi < rsi_entry)
-    raw_exits = (rsi > rsi_exit) | (close > sma)
 
     in_trade = False
     bars_held = 0

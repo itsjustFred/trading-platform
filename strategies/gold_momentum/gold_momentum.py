@@ -64,7 +64,6 @@ def generate_signals(df: pd.DataFrame, params: dict):
     ).max(axis=1)
     atr = tr.rolling(atr_period).mean()
     raw_entries = macd_cross_up & (rsi > rsi_entry) & (close > bb_mid)
-    raw_exits = macd_cross_down | (rsi < rsi_exit)
 
     in_trade = False
     entries = pd.Series(False, index=df.index)

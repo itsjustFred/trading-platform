@@ -2630,9 +2630,8 @@ def _coerce_backtest_row_id(row: Any) -> str | None:
         mapping = getattr(row, "_mapping")
         value = mapping.get("id")
         return str(value) if value else None
-    if isinstance(row, (tuple, list)) and row:
-        if row[0]:
-            return str(row[0])
+    if isinstance(row, (tuple, list)) and row and row[0]:
+        return str(row[0])
     return None
 
 
