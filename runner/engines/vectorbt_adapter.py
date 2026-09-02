@@ -24,6 +24,7 @@ from typing import Any
 import pandas as pd
 
 from runner.engines import contract
+from runner.engines._shared import serialize_meta_value as _serialize_meta_value
 from runner.engines.base import (
     BacktestConfig,
     EngineAdapter,
@@ -1255,36 +1256,8 @@ def _extract_trade_meta(
 
 
 def _serialize_meta_value(value: Any) -> Any | None:
-    if value is None:
-        return None
-
-    if isinstance(value, dict):
-        return value
-    if isinstance(value, list):
-        return value
-    if isinstance(value, tuple):
-        return list(value)
-    if isinstance(value, pd.Timestamp):
-        return value.isoformat()
-
-    if hasattr(value, "item"):
-        try:
-            value = value.item()
-        except (TypeError, ValueError):
-            pass
-
-    if isinstance(value, float):
-        if pd.isna(value):
-            return None
-        return round(value, 6)
-
-    if isinstance(value, (int, str, bool)):
-        return value
-
-    if pd.isna(value):
-        return None
-
-    return str(value)
+    """Deprecated shim: use runner.engines._shared.serialize_meta_value."""
+    return serialize_meta_value(value)
 
 
 def _resolve_max_position_pct(explicit: float | None, asset_class: str) -> float:

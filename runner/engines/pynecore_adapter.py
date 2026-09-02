@@ -30,6 +30,7 @@ from runner.engines.base import (
     ProgressCallback,
     resolve_strategy_parameters,
 )
+from runner.engines._shared import serialize_meta_value
 from runner.engines.vectorbt_adapter import (
     _normalize_drawings,
     _resolve_max_leverage,
@@ -589,32 +590,8 @@ def _locate_trade_bar(timestamp_series: pd.Series, raw_time: str) -> int | None:
 
 
 def _serialize_meta_value(value: Any) -> Any | None:
-    if value is None:
-        return None
-    if isinstance(value, dict):
-        return value
-    if isinstance(value, list):
-        return value
-    if isinstance(value, tuple):
-        return list(value)
-    if isinstance(value, pd.Timestamp):
-        return value.isoformat()
-
-    if hasattr(value, "item"):
-        try:
-            value = value.item()
-        except (TypeError, ValueError):
-            pass
-
-    if isinstance(value, float):
-        if pd.isna(value):
-            return None
-        return round(value, 6)
-    if isinstance(value, (int, str, bool)):
-        return value
-    if pd.isna(value):
-        return None
-    return str(value)
+    """Deprecated shim: use runner.engines._shared.serialize_meta_value."""
+    return serialize_meta_value(value)
 
 
 def _promote_directional_price_meta(meta: dict[str, Any], direction: str, key_prefix: str) -> None:
