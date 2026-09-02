@@ -93,3 +93,21 @@ export function sharpeTone(sharpe: number): string {
   if (sharpe > 0) return SHARPE_TONES.weak;
   return SHARPE_TONES.negative;
 }
+
+
+/** "+"/"-" prefix for signed USD values (no prefix at zero). */
+export function signedUsdPrefix(value: number): string {
+  if (value > 0) {
+    return "+";
+  }
+  return value < 0 ? "-" : "";
+}
+
+/** Renders a signed USD amount with a fixed 2-decimal magnitude. */
+export function formatSignedUsd(value: number): string {
+  const sign = signedUsdPrefix(value);
+  return `${sign}$${Math.abs(value).toLocaleString("en-US", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  })}`;
+}

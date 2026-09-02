@@ -28,6 +28,7 @@ import { TradeTable, type TradeTableRow } from "../components/TradeTable";
 import { Modal } from "../components/Modal";
 import { useToast } from "../components/ToastProvider";
 import { stringifyUnknownValue } from "../lib/unknownValue";
+import { formatSignedUsd } from "../lib/statFormat";
 
 const LIVE_DETAIL_POLL_MS = 30000;
 const DEFAULT_REPLAY_TIMEFRAME = "1h";
@@ -896,21 +897,6 @@ function formatUsd(value: number): string {
 
 function stringifyUnknownMetadata(value: unknown): string {
   return stringifyUnknownValue(value).trim();
-}
-
-function signedUsdPrefix(value: number): string {
-  if (value > 0) {
-    return "+";
-  }
-  return value < 0 ? "-" : "";
-}
-
-function formatSignedUsd(value: number): string {
-  const sign = signedUsdPrefix(value);
-  return `${sign}$${Math.abs(value).toLocaleString("en-US", {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  })}`;
 }
 
 function formatPercent(value: number): string {

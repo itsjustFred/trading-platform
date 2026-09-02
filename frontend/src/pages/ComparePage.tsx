@@ -30,60 +30,15 @@ type MetricConfig = {
 // percent points (see _backtest_compare_payload in viewer/main.py), so no
 // per-metric scale is needed on this page.
 const METRICS: MetricConfig[] = [
-  {
-    key: "total_return",
-    label: "Total Return",
-    better: "higher",
-    format: "percent",
-  },
-  {
-    key: "net_profit",
-    label: "Net Profit",
-    better: "higher",
-    format: "currency",
-  },
-  {
-    key: "sharpe_ratio",
-    label: "Sharpe (higher = better)",
-    better: "higher",
-    format: "number",
-  },
-  {
-    key: "psr",
-    label: "PSR (higher = better)",
-    better: "higher",
-    format: "percent",
-  },
-  {
-    key: "p_value",
-    label: "p-Value (lower = better)",
-    better: "lower",
-    format: "number",
-  },
-  {
-    key: "cagr",
-    label: "CAGR (higher = better)",
-    better: "higher",
-    format: "percent",
-  },
-  {
-    key: "max_drawdown",
-    label: "Max DD (lower = better)",
-    better: "lower",
-    format: "percent",
-  },
-  {
-    key: "win_rate",
-    label: "Win Rate (higher = better)",
-    better: "higher",
-    format: "percent",
-  },
-  {
-    key: "trade_count",
-    label: "Trade Count",
-    better: "higher",
-    format: "integer",
-  },
+  { key: "total_return", label: "Total Return", better: "higher", format: "percent" },
+  { key: "net_profit", label: "Net Profit", better: "higher", format: "currency" },
+  { key: "sharpe_ratio", label: "Sharpe (higher = better)", better: "higher", format: "number" },
+  { key: "psr", label: "PSR (higher = better)", better: "higher", format: "percent" },
+  { key: "p_value", label: "p-Value (lower = better)", better: "lower", format: "number" },
+  { key: "cagr", label: "CAGR (higher = better)", better: "higher", format: "percent" },
+  { key: "max_drawdown", label: "Max DD (lower = better)", better: "lower", format: "percent" },
+  { key: "win_rate", label: "Win Rate (higher = better)", better: "higher", format: "percent" },
+  { key: "trade_count", label: "Trade Count", better: "higher", format: "integer" },
 ];
 
 function formatMetric(value: number, format: MetricConfig["format"]): string {

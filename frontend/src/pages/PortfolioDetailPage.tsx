@@ -852,18 +852,10 @@ function ContributionTable({
       >
         <thead style={{ background: "var(--color-surface2)" }}>
           <tr>
-            <th style={thStyle}>
-              {headerButton(groupLabel[groupBy], "group_value")}
-            </th>
-            <th style={thStyle}>
-              {headerButton("Return", "return_contribution")}
-            </th>
-            <th style={thStyle}>
-              {headerButton("Drawdown", "drawdown_contribution")}
-            </th>
-            <th style={thStyle}>
-              {headerButton("Sharpe (higher = better)", "sharpe_ratio")}
-            </th>
+            <th style={thStyle}>{headerButton(groupLabel[groupBy], "group_value")}</th>
+            <th style={thStyle}>{headerButton("Return", "return_contribution")}</th>
+            <th style={thStyle}>{headerButton("Drawdown", "drawdown_contribution")}</th>
+            <th style={thStyle}>{headerButton("Sharpe (higher = better)", "sharpe_ratio")}</th>
             <th style={thStyle}>
               {headerButton("PSR (higher = better)", "psr")}
             </th>

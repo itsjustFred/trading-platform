@@ -40,6 +40,7 @@ import type {
 import { useToast } from "../components/ToastProvider";
 import { applyFillToPosition } from "./LiveDetail";
 import { stringifyUnknownValue } from "../lib/unknownValue";
+import { formatSignedUsd } from "../lib/statFormat";
 
 type DeploymentCard = LiveDeploymentConfig & {
   broker: LiveAccount["broker"] | "unknown";
@@ -1593,21 +1594,6 @@ function winRateBadgeStyle(rate: number): React.CSSProperties {
     fontWeight: 700,
     ...WIN_RATE_TONES[winRateTone(rate)],
   };
-}
-
-function signedUsdPrefix(value: number): string {
-  if (value > 0) {
-    return "+";
-  }
-  return value < 0 ? "-" : "";
-}
-
-function formatSignedUsd(value: number): string {
-  const sign = signedUsdPrefix(value);
-  return `${sign}$${Math.abs(value).toLocaleString("en-US", {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  })}`;
 }
 
 function formatPercent(value: number): string {
