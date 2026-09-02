@@ -23,12 +23,14 @@ from typing import Any
 
 import pandas as pd
 
+from runner.engines import contract
 from runner.engines.base import (
     BacktestConfig,
     EngineAdapter,
     ProgressCallback,
     resolve_strategy_parameters,
 )
+from runner.engines.contract import resolve_same_bar_exit
 from shared.constants import DATA_DIR
 from shared.models import BacktestMeta, BacktestResult, EquityPoint, IndicatorSeries, Trade, TradeExit
 
@@ -108,11 +110,12 @@ def _process_symbol(
     strategy_path: str,
     resolved_parameters: dict[str, Any],
     data_root: Path,
-) -> tuple[list[Trade], list[str], DrawingList, list[IndicatorSeries]]:
+) -> tuple[list[Trade], list[str], DrawingList, list[IndicatorSeries], int]:
     """Process a single symbol: load data, generate signals, extract trades.
 
-    Returns (trades_with_temp_ids, used_intrabar_timeframes, drawings).
-    Runs in its own process when parallelized.
+    Returns (trades_with_temp_ids, used_intrabar_timeframes, drawings,
+    indicator_series, loaded_bar_count). Runs in its own process when
+    parallelized.
     """
     strategy_mod = _load_strategy_module(strategy_path)
     df, data_path = _load_ohlcv(
@@ -120,7 +123,7 @@ def _process_symbol(
     )
     if df is None or df.empty:
         logger.warning("No data for %s/%s, skipping", symbol, config.timeframe)
-        return [], [], [], []
+        return [], [], [], [], 0
 
     asset_class = _infer_asset_class_from_path(data_path)
     intrabar_df, intrabar_timeframe = _load_intrabar_ohlcv(
@@ -331,7 +334,7 @@ def _process_symbol(
             trades.append(trade)
             equity += pnl
 
-    return trades, extra_timeframes, drawings, indicator_series
+    return trades, extra_timeframes, drawings, indicator_series, len(df)
 
 
 class VectorbtAdapter(EngineAdapter):
@@ -357,6 +360,7 @@ class VectorbtAdapter(EngineAdapter):
         all_drawings: DrawingList = []
         all_indicators: list[IndicatorSeries] = []
         used_timeframes = [config.timeframe]
+        total_loaded_bars = 0
 
         num_symbols = len(config.symbols)
         use_parallel = num_symbols > 1
@@ -377,7 +381,8 @@ class VectorbtAdapter(EngineAdapter):
                 for future in as_completed(futures):
                     sym = futures[future]
                     try:
-                        trades, extra_tfs, drawings, indicator_series = future.result()
+                        trades, extra_tfs, drawings, indicator_series, loaded_bars = future.result()
+                        total_loaded_bars += loaded_bars
                         all_trades.extend(trades)
                         all_drawings.extend(drawings)
                         all_indicators.extend(indicator_series)
@@ -394,9 +399,10 @@ class VectorbtAdapter(EngineAdapter):
                 ) from symbol_errors[0][1]
         else:
             for symbol in config.symbols:
-                trades, extra_tfs, drawings, indicator_series = _process_symbol(
+                trades, extra_tfs, drawings, indicator_series, loaded_bars = _process_symbol(
                     symbol, config, strategy_path, resolved_parameters, data_root
                 )
+                total_loaded_bars += loaded_bars
                 all_trades.extend(trades)
                 all_drawings.extend(drawings)
                 all_indicators.extend(indicator_series)
@@ -441,7 +447,11 @@ class VectorbtAdapter(EngineAdapter):
             backtest_start=config.start_date,
             backtest_end=config.end_date,
             duration_days=duration_days,
-            total_bars=sum(1 for _ in all_trades),
+            # Conformance (Cleanup 16-A, F6): total_bars is the loaded
+            # main-timeframe bar count summed across symbols — the same
+            # semantic as the native and pynecore adapters — NOT the trade
+            # count it degenerated to previously.
+            total_bars=total_loaded_bars,
             data={
                 "timeframes": used_timeframes,
                 "symbols": config.symbols,
@@ -1048,18 +1058,13 @@ def _load_ohlcv(
 
 
 def _parse_date_bound(value: str, *, is_end: bool) -> pd.Timestamp:
-    raw = str(value or "").strip()
-    if not raw:
-        raise ValueError("Date filter value cannot be empty")
+    """Conformance (Cleanup 16-A): shared date-filter convention (F9).
 
-    parsed = pd.to_datetime(raw, utc=True, errors="coerce")
-    if pd.isna(parsed):
-        raise ValueError(f"Invalid date filter value: {value!r}")
-
-    timestamp = pd.Timestamp(parsed)
-    if is_end and "T" not in raw and ":" not in raw:
-        return timestamp + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
-    return timestamp
+    A date-only end boundary is inclusive of the full day; the parsing rules
+    live in ``runner.engines.contract`` so every engine interprets bounds the
+    same way.
+    """
+    return contract.parse_date_bound(value, is_end=is_end)
 
 
 def _normalize_intrabar_resolution(value: str | None) -> str:
@@ -1070,7 +1075,11 @@ def _normalize_intrabar_resolution(value: str | None) -> str:
         return "1-lower"
     if lowered == "m1":
         return "1m"
-    if lowered in {"1m", "s1", "tick"}:
+    # Conformance (Cleanup 16-A): a named main-timeframe granularity ("1m",
+    # "5m", "15m", "30m", "1h", "4h", "1d") is a request for that intrabar
+    # resolution, not a silent downgrade to open/close modeling. Unknown
+    # spellings keep the conservative default.
+    if lowered in TIMEFRAME_ORDER:
         return lowered
     return "open_close"
 
@@ -1186,16 +1195,22 @@ def _match_intrabar_exit_event(
     stop_price: float | None,
     take_profit_price: float | None,
 ) -> dict[str, Any] | None:
-    if direction == "LONG":
-        stop_hit = stop_price is not None and low <= stop_price
-        tp_hit = take_profit_price is not None and high >= take_profit_price
-    else:
-        stop_hit = stop_price is not None and high >= stop_price
-        tp_hit = take_profit_price is not None and low <= take_profit_price
+    """Conformance (Cleanup 16-A, F8): shared same-bar classification.
 
-    if stop_hit:
+    Called per intrabar step in chronological order, so the first event seen
+    by the caller is the actual chronological event; within a single step the
+    stop-first tie-break applies (Decision Record, Cleanup 16-A).
+    """
+    event_kind = resolve_same_bar_exit(
+        direction=direction,
+        high=high,
+        low=low,
+        stop_price=stop_price,
+        take_profit_price=take_profit_price,
+    )
+    if event_kind == "stop":
         return {"price": float(stop_price), "reason": "stop_loss"}
-    if tp_hit:
+    if event_kind == "tp":
         return {"price": float(take_profit_price), "reason": "take_profit"}
     return None
 

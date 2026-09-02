@@ -23,6 +23,7 @@ from typing import Any
 
 import pandas as pd
 
+from runner.engines import contract
 from runner.engines.base import (
     BacktestConfig,
     EngineAdapter,
@@ -34,6 +35,7 @@ from runner.engines.vectorbt_adapter import (
     _resolve_max_leverage,
     _resolve_max_position_pct,
 )
+from runner.stats import compute_stats_for_result
 from shared.constants import DATA_DIR
 from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, TradeExit
 
@@ -199,6 +201,11 @@ class PyneCoreAdapter(EngineAdapter):
             stats=all_stats,
             drawings=all_drawings,
         )
+        # Conformance (Cleanup 16-A): every engine exposes the canonical
+        # BacktestStats key set; the engine-specific strategy stats are merged
+        # on top of the derived ones.
+        result.stats = {**compute_stats_for_result(result), **result.stats}
+        return result
 
     def validate_config(self, config: BacktestConfig) -> list[str]:
         errors = super().validate_config(config)
@@ -527,10 +534,9 @@ def _load_ohlcv(
 
     if "timestamp" in df.columns:
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-        if start_date:
-            df = df[df["timestamp"] >= start_date]
-        if end_date:
-            df = df[df["timestamp"] <= end_date]
+        # Conformance (Cleanup 16-A): shared date-filter convention (F9) — a
+        # date-only end boundary is inclusive of the full day.
+        df = contract.apply_date_filter(df, start=start_date, end=end_date)
 
     return df.reset_index(drop=True)
 

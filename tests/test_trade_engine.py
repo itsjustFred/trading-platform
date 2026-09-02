@@ -279,7 +279,14 @@ def test_trade_engine_can_anchor_market_stop_to_fill_price_with_stop_distance():
     assert trade.pnl == pytest.approx(-1000.0, abs=0.5)
 
 
-def test_trade_engine_can_configure_same_bar_take_profit_priority():
+def test_trade_engine_configured_same_bar_take_profit_priority_falls_back_to_stop_first():
+    """Cleanup 16-A Decision Record: the stop-first tie-break is contractual.
+
+    A configured ``same_bar_order = "take_profit_first"`` is no longer honored:
+    without intrabar data the stop wins the same-bar ambiguity, and the
+    configured-but-unsupported request stays visible in the audit metadata as
+    ``stop_first``.
+    """
     data = _synthetic_ohlcv(100)
     data.loc[12, "high"] = 113.0
     data.loc[12, "low"] = 109.0
@@ -315,10 +322,10 @@ def test_trade_engine_can_configure_same_bar_take_profit_priority():
 
     assert len(result.trades) == 1
     trade = result.trades[0]
-    assert trade.exits[-1].price == pytest.approx(112.0)
-    assert trade.exits[-1].reason == "tp"
-    assert trade.meta["execution_model"]["same_bar_order"] == "take_profit_first"
-    assert trade.pnl > 0
+    assert trade.exits[-1].price == pytest.approx(109.0)
+    assert trade.exits[-1].reason == "stop_loss"
+    assert trade.meta["execution_model"]["same_bar_order"] == "stop_first"
+    assert trade.pnl < 0
 
 
 def test_example_sma_native_vs_vectorbt_smoke_on_local_data():

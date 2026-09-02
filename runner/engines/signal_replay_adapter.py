@@ -10,6 +10,7 @@ import pandas as pd
 from risk.config import RiskConfig
 from risk.engine import RiskEngine
 from risk.models import TradeSignal as RiskTradeSignal
+from runner.engines.contract import resolve_same_bar_exit
 from runner.stats import compute_stats_for_result
 from shared.constants import DATA_DIR, normalize_timeframe
 from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, TradeExit
@@ -329,22 +330,22 @@ class SignalReplayAdapter:
             self._update_excursions(position, bar)
             high = float(bar["high"])
             low = float(bar["low"])
-            stop_hit = False
-            take_profit_hit = False
 
-            if position.direction == "LONG":
-                stop_hit = position.stop_loss is not None and low <= float(position.stop_loss)
-                take_profit_hit = (
-                    position.take_profit is not None and high >= float(position.take_profit)
-                )
-            else:
-                stop_hit = position.stop_loss is not None and high >= float(position.stop_loss)
-                take_profit_hit = (
-                    position.take_profit is not None and low <= float(position.take_profit)
-                )
+            # Conformance (Cleanup 16-A, F8): bars are walked chronologically
+            # and classified through the shared same-bar policy; within a bar
+            # the stop-first tie-break applies when both levels are hit.
+            event = resolve_same_bar_exit(
+                direction=position.direction,
+                high=high,
+                low=low,
+                stop_price=float(position.stop_loss) if position.stop_loss is not None else None,
+                take_profit_price=(
+                    float(position.take_profit) if position.take_profit is not None else None
+                ),
+            )
 
-            if stop_hit or take_profit_hit:
-                if stop_hit:
+            if event is not None:
+                if event == "stop":
                     exit_price = float(position.stop_loss or float(bar["close"]))
                     reason = "trailing_stop" if position.trailing_updates > 0 else "stop_loss"
                 else:

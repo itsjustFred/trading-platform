@@ -8,6 +8,7 @@ from typing import Any
 import pandas as pd
 
 from runner.engine import TradeEngine
+from runner.engines import contract
 from runner.engines.base import (
     BacktestConfig,
     EngineAdapter,
@@ -41,10 +42,9 @@ def _load_ohlcv(data_root: Path, symbol: str, timeframe: str, start: str, end: s
 
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
     df = df.dropna(subset=["timestamp"]).sort_values("timestamp")
-    if start:
-        df = df[df["timestamp"] >= pd.Timestamp(start, tz="UTC")]
-    if end:
-        df = df[df["timestamp"] <= pd.Timestamp(end, tz="UTC")]
+    # Conformance (Cleanup 16-A): shared date-filter convention (F9) — a
+    # date-only end boundary is inclusive of the full day.
+    df = contract.apply_date_filter(df, start=start, end=end)
     return df.reset_index(drop=True)
 
 

@@ -12,6 +12,7 @@ from risk.config import RiskConfig
 from risk.engine import RiskEngine
 from risk.models import TradeSignal
 from runner.engines.base import BacktestConfig
+from runner.engines.contract import resolve_same_bar_exit, flag_missing_intrabar
 from shared.models import (
     BacktestMeta,
     BacktestResult,
@@ -33,9 +34,17 @@ class OrderType(Enum):
 class ExecutionModelSettings:
     """Native execution-model assumptions recorded with each trade.
 
-    The native engine currently enforces ``same_bar_order``. The other fields
-    document existing runtime behavior for auditability; they are metadata-only
-    until a later branch wires them into fill or trigger mechanics.
+    ``market_order_timing``, ``entry_price_side``, ``stop_trigger_side`` and
+    ``take_profit_trigger_side`` document existing runtime behavior for
+    auditability; they are metadata-only until a later branch wires them into
+    fill or trigger mechanics.
+
+    ``same_bar_order`` is kept for backwards-compatible configuration and
+    audit output, but the engine itself no longer honors a
+    ``take_profit_first`` request: per the Cleanup 16-A Decision Record the
+    same-bar ambiguity is resolved stop-first whenever intrabar data is
+    unavailable, and chronologically when it is available (see
+    ``docs/cross-engine-backtest-contract.md`` §3).
     """
 
     market_order_timing: str = "next_bar_open"
@@ -60,13 +69,10 @@ class ExecutionModelSettings:
             and modeling_resolution not in {"main_timeframe", "open_close", config.timeframe}
             else None
         )
-        same_bar_order = str(params.get("same_bar_order") or "stop_first").strip().lower()
-        if same_bar_order in {"tp_first", "take_profit_first"}:
-            same_bar_order = "take_profit_first"
-        elif same_bar_order in {"stop", "stop_loss_first"}:
-            same_bar_order = "stop_first"
-        if same_bar_order not in {"stop_first", "take_profit_first"}:
-            raise ValueError("same_bar_order must be 'stop_first' or 'take_profit_first'")
+        # Conformance (Cleanup 16-A): same-bar priority is a shared contract
+        # resolved by intrabar chronology or the stop-first fallback — a
+        # configured tp-first order is no longer honored by the native engine.
+        same_bar_order = "stop_first"
 
         return cls(
             market_order_timing=str(params.get("market_order_timing") or "next_bar_open"),
@@ -123,6 +129,7 @@ class Position:
     exits: list[TradeExit] = field(default_factory=list)
     mae: float = 0.0
     mfe: float = 0.0
+    meta: dict[str, Any] = field(default_factory=dict)
 
 
 class TradeEngine:
@@ -546,6 +553,7 @@ class TradeEngine:
                     "timestamp": position.entry_time,
                     "price": position.entry_price,
                 },
+                **dict(getattr(position, "meta", {}) or {}),
             },
             tags=["native"],
         )
@@ -573,7 +581,24 @@ class TradeEngine:
 
         self.positions = next_positions
 
-    def _intrabar_window(self, bar_time: pd.Timestamp, next_time: pd.Timestamp | None) -> pd.DataFrame | None:
+    def _flag_same_bar_fallback(self, position: Position, bar_time: pd.Timestamp, next_time: pd.Timestamp | None) -> None:
+        """Record the stop-first fallback flag on the position's future trade.
+
+        Decision Record (Cleanup 16-A): when intrabar data was requested but
+        does not cover the ambiguous bar, the stop-first tie-break is used and
+        the result must be flagged. The flag lands in
+        ``trade.meta["same_bar_priority"]`` via ``_finalize_position``.
+        """
+        window = self._intrabar_window(bar_time, next_time)
+        has_coverage = window is not None and not window.empty
+        position.meta["same_bar_priority"] = flag_missing_intrabar(
+            intrabar_resolution=self._execution_model.intrabar_resolution,
+            intrabar_coverage=has_coverage,
+        )
+
+    def _intrabar_window(
+        self, bar_time: pd.Timestamp, next_time: pd.Timestamp | None
+    ) -> pd.DataFrame | None:
         if self._intrabar is None or self._intrabar.empty:
             return None
         if next_time is None:
@@ -601,25 +626,19 @@ class TradeEngine:
             sub_high = float(row["high"])
             sub_low = float(row["low"])
 
-            stop_hit = False
-            tp_hit = False
-            if position.direction == "LONG":
-                stop_hit = stop_price is not None and sub_low <= stop_price
-                tp_hit = tp_price is not None and sub_high >= tp_price
-            else:
-                stop_hit = stop_price is not None and sub_high >= stop_price
-                tp_hit = tp_price is not None and sub_low <= tp_price
-
-            if stop_hit and tp_hit:
-                return (
-                    "tp"
-                    if self._execution_model.same_bar_order == "take_profit_first"
-                    else "stop"
-                )
-            if stop_hit:
-                return "stop"
-            if tp_hit:
-                return "tp"
+            # Conformance (Cleanup 16-A, F8): with intrabar data available the
+            # actual chronological event wins — the shared helper classifies
+            # each intrabar step in time order, so the first event seen is the
+            # first event that happened, not the stop-first tie-break.
+            event = resolve_same_bar_exit(
+                direction=position.direction,
+                high=sub_high,
+                low=sub_low,
+                stop_price=stop_price,
+                take_profit_price=tp_price,
+            )
+            if event is not None:
+                return event
 
         return None
 
@@ -663,11 +682,12 @@ class TradeEngine:
                         next_time,
                     )
                 if first_event is None:
-                    first_event = (
-                        "tp"
-                        if self._execution_model.same_bar_order == "take_profit_first"
-                        else "stop"
-                    )
+                    # Conformance (Cleanup 16-A, F8): intrabar data was
+                    # requested but does not cover this bar — fall back to the
+                    # stop-first tie-break and flag the trade so the ambiguity
+                    # is visible downstream.
+                    first_event = "stop"
+                    self._flag_same_bar_fallback(position, bar_time, next_time)
             elif stop_hit:
                 first_event = "stop"
             elif tp_hit:
