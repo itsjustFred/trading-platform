@@ -1388,8 +1388,6 @@ def _migrate_backtests_equity_curve(connection: Connection) -> None:
 def _migrate_live_executions_dedupe_key(connection: Connection) -> None:
     """Add the dedupe_key column and its unique index to live_executions."""
     execution_column_names = _table_column_names(connection, "live_executions")
-
-    execution_column_names = _table_column_names(connection, "live_executions")
     if execution_column_names and "dedupe_key" not in execution_column_names:
         connection.execute(text("ALTER TABLE live_executions ADD COLUMN dedupe_key TEXT"))
     if _table_column_names(connection, "live_executions"):
@@ -3170,9 +3168,7 @@ def _update_background_task_record(
     record.name = str(name or "")
     record.description = str(description or "")
     record.source = str(source or "")
-    if created_at:
-        record.created_at = created_value
-    elif not str(record.created_at or "").strip():
+    if created_at or not str(record.created_at or "").strip():
         record.created_at = created_value
     record.updated_at = updated_value
 

@@ -205,10 +205,11 @@ def next_pending_strategy(state: dict) -> str | None:
     candidates = [r for r in state.get("strategies", []) if r.get("status") in priority]
     if not candidates:
         return None
-    return sorted(candidates, key=lambda r: (priority[r.get("status")], r.get("strategy", "")))[0]["strategy"]
+    return min(candidates, key=lambda r: (priority[r.get("status")], r.get("strategy", "")))["strategy"]
 
 
 def run_strategy(slug: str) -> dict:
+    """Run one strategy matrix cell in a subprocess and return its result payload."""
     cmd = [
         str(VENV_PYTHON),
         "-m",
@@ -264,21 +265,26 @@ def main() -> int:
         print("Matrix queue: another session is already running; skipping this tick.")
         return 0
 
+    ran_any = False
     try:
         while True:
             state = load_state()
             refresh_strategy_states(state)
             slug = next_pending_strategy(state)
             if not slug:
-                print("Matrix queue: all strategies are done or failed.")
+                if ran_any:
+                    print("Matrix queue: all strategies are done or failed.")
+                else:
+                    print("Matrix queue: no pending strategies found.")
                 save_state(state)
                 print(render_state(state))
-                return 0
+                return 0 if ran_any else 1
 
             state["current_strategy"] = slug
             save_state(state)
             print(f"Matrix queue: starting {slug} with max_workers={MAX_WORKERS}")
             result = run_strategy(slug)
+            ran_any = True
             state["last_run"] = result
             state["current_strategy"] = None
             refresh_strategy_states(state)
