@@ -33,7 +33,7 @@ const TIMESTAMP_RE = /(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})/;
 const LOG_LEVEL_RE = /\b(ERROR|WARNING|WARN|INFO|DEBUG)\b/i;
 const MODULE_FUNC_RE = /\b([A-Za-z_][\w.-]*)\.([A-Za-z_][\w<>-]*)\b/;
 const TRACEBACK_FILE_RE = /File "(.*)\/(\w+)\.py", line \d+, in ([\w<>-]+)/;
-const UVICORN_PREFIX_RE = /^\s*(INFO|ERROR|WARNING|DEBUG)\s*:\s*(.+)$/i;
+const UVICORN_PREFIX_RE = /^\s*(INFO|ERROR|WARNING|DEBUG)\s*:\s*/i;
 const LOG_FETCH_LIMIT = 5000;
 const LOG_REFRESH_MS = 5000;
 // Keeps keystrokes in the search box from refetching LOG_FETCH_LIMIT lines each time.
@@ -144,7 +144,10 @@ function parsePlainLine(line: string): ParsedLogLine {
     (uvicornPrefixMatch ? "uvicorn" : "app")
   ).trim();
   const funcName = (tracebackMatch?.[3] || moduleFuncMatch?.[2] || "—").trim();
-  const message = (uvicornPrefixMatch?.[2] || line).trim() || line;
+  const uvicornPrefixLength = uvicornPrefixMatch?.[0].length ?? 0;
+  const message =
+    (uvicornPrefixLength > 0 ? line.slice(uvicornPrefixLength) : line).trim() ||
+    line;
   return {
     raw: line,
     timestampShort: timestamp.short,
