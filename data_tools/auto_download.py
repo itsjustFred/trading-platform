@@ -29,7 +29,13 @@ _US_STOCK_SYMBOL_PATTERN = re.compile(r"^[A-Z][A-Z.\-]{0,9}$")
 # fail. Defaults follow the thresholds proposed in the parent issue: an
 # internal hole longer than INTERNAL_GAP_FAIL_DAYS (3 calendar days) fails the
 # coverage check, a hole longer than INTERNAL_GAP_WARN_DAYS (1 calendar day)
-# warns, and anything shorter is tolerated (weekends, holidays, source downtime).
+# warns, and anything shorter is tolerated (source downtime).
+#
+# Thresholds deliberately count calendar days, not business days (the parent
+# record states the fail threshold in calendar days): a regular FX weekend
+# (~2 days) therefore warns, and only holes beyond 3 calendar days fail.
+# Per-source overrides (crypto, holidays) are an explicit open item of the
+# parent issue and are intentionally not implemented here.
 INTERNAL_GAP_FAIL_DAYS = 3
 INTERNAL_GAP_WARN_DAYS = 1
 
@@ -355,7 +361,8 @@ def find_internal_gaps(
     middle (DV-B15). This compares the bar-to-bar boundaries of every parquet
     that belongs to the symbol: adjacent files (segmented/monthly storage) and
     the bars inside one file. The largest hole longer than ``threshold_days``
-    (default: 1 calendar day, so weekends/holidays are tolerated) is reported.
+    (default: 1 calendar day) is reported — gaps are measured in calendar
+    days, so a regular weekend (~2 days) is reported as a warning.
     """
     def _matches_timeframe(path: Path) -> bool:
         if timeframe is None:
