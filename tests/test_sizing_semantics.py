@@ -384,9 +384,12 @@ class TestBatchEntryPoints:
     def test_run_backtest_grid_both_spellings_conflict_is_rejected(self, tmp_path):
         from runner.backtest_grid import run_backtest_grid
 
+        # Strategy setup runs outside pytest.raises so the guarded block holds
+        # only the invocation that must raise (S5778).
+        strategy = str(self._strategy(tmp_path))
         with pytest.raises(ValueError, match="not both"):
             run_backtest_grid(
-                strategy=str(self._strategy(tmp_path)),
+                strategy=strategy,
                 symbols=["XAUUSD"],
                 timeframes=["1h"],
                 max_position_exposure_pct=0.5,
@@ -435,9 +438,12 @@ class TestBatchEntryPoints:
     def test_walkforward_alias_and_new_name_conflict_is_rejected(self, tmp_path):
         from runner.walkforward import run_walkforward
 
+        # Strategy setup runs outside pytest.raises so the guarded block holds
+        # only the invocation that must raise (S5778).
+        strategy = str(self._strategy(tmp_path))
         with pytest.raises(ValueError, match="not both"):
             run_walkforward(
-                strategy=str(self._strategy(tmp_path)),
+                strategy=strategy,
                 symbols=["XAUUSD"],
                 start="2025-01-01",
                 end="2025-06-30",
