@@ -30,11 +30,11 @@ from runner.engines.base import (
     ProgressCallback,
     resolve_strategy_parameters,
 )
-from runner.engines._shared import serialize_meta_value
-from runner.engines.vectorbt_adapter import (
-    _normalize_drawings,
-    _resolve_max_leverage,
-    _resolve_max_position_pct,
+from runner.engines._drawings import _normalize_drawings
+from runner.engines._shared import (
+    resolve_max_leverage as _resolve_max_leverage,
+    resolve_max_position_pct as _resolve_max_position_pct,
+    serialize_meta_value,
 )
 from runner.stats import compute_stats_for_result
 from shared.constants import DATA_DIR

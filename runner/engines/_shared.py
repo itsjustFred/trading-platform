@@ -44,3 +44,19 @@ def serialize_meta_value(value: Any) -> Any | None:
         return None
 
     return str(value)
+
+
+def resolve_max_position_pct(explicit: float | None, asset_class: str) -> float:
+    """Cap on notional as a fraction of equity; asset-class default 20% (100% equities)."""
+    if explicit is not None and explicit > 0:
+        return float(explicit)
+    if asset_class in {"equity", "equities", "etf", "etfs", "stocks"}:
+        return 1.0
+    return 0.20
+
+
+def resolve_max_leverage(explicit: float | None) -> float:
+    """Leverage ceiling applied to risk-sized notional; default 2.0x."""
+    if explicit is not None and explicit > 0:
+        return float(explicit)
+    return 2.0
