@@ -4954,21 +4954,64 @@ def _compute_portfolio_contributions(
     total_return = _safe_float((portfolio.get("combined_stats") or {}).get("total_return"), 0.0)
     total_drawdown = abs(_safe_float((portfolio.get("combined_stats") or {}).get("max_drawdown"), 0.0))
 
+    component_metrics = _collect_component_contribution_metrics(components)
+
+    grouped = _accumulate_portfolio_buckets(
+        components=components,
+        component_metrics=component_metrics,
+        grouped=grouped,
+        normalized_group=normalized_group,
+    )
+
+    component_ids_by_group = {
+        key: {str(component_id) for component_id in value.get("component_ids", [])}
+        for key, value in grouped.items()
+    }
+
+    _accumulate_trade_pnls(
+        trades=trades,
+        component_ids_by_group=component_ids_by_group,
+        grouped=grouped,
+    )
+
+    total_pnl = _safe_float((portfolio.get("combined_stats") or {}).get("net_profit"), 0.0)
+    contributions = [
+        _portfolio_contribution_payload(
+            grouped[key],
+            group=normalized_group,
+            total_return=total_return,
+            total_drawdown=total_drawdown,
+            total_pnl=total_pnl,
+        )
+        for key in sorted(grouped.keys())
+    ]
+    return contributions
+
+
+def _empty_contribution_metrics() -> dict[str, float]:
+    return {
+        "sharpe_ratio": 0.0,
+        "psr": 0.0,
+        "p_value": 1.0,
+        "max_drawdown": 0.0,
+        "win_rate": 0.0,
+        "cagr": 0.0,
+        "total_return": 0.0,
+    }
+
+
+def _collect_component_contribution_metrics(
+    components: list[dict[str, Any]],
+) -> dict[str, dict[str, float]]:
+    """Load per-component stats from the linked backtest results."""
     component_metrics: dict[str, dict[str, float]] = {}
     for component in components:
         component_id = str(component.get("component_id") or "").strip()
         if not component_id:
             continue
         raw_win_rate = _normalize_win_rate(component.get("win_rate"))
-        metrics = {
-            "sharpe_ratio": 0.0,
-            "psr": 0.0,
-            "p_value": 1.0,
-            "max_drawdown": 0.0,
-            "win_rate": raw_win_rate if raw_win_rate is not None else 0.0,
-            "cagr": 0.0,
-            "total_return": 0.0,
-        }
+        metrics = _empty_contribution_metrics()
+        metrics["win_rate"] = raw_win_rate if raw_win_rate is not None else 0.0
         backtest_id = str(component.get("backtest_id") or "").strip()
         if backtest_id:
             result = _load_result(backtest_id)
@@ -4995,7 +5038,56 @@ def _compute_portfolio_contributions(
                         exc,
                     )
         component_metrics[component_id] = metrics
+    return component_metrics
 
+
+def _new_contribution_bucket(
+    *,
+    normalized_group: str,
+    key: str,
+    component_id: str,
+    strategy_name: str,
+    symbol: str,
+    timeframe: str,
+) -> dict[str, Any]:
+    return {
+        "group": normalized_group,
+        "group_value": key,
+        "component_id": component_id,
+        "component_ids": [],
+        "strategy_name": strategy_name,
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "weight": 0.0,
+        "return_contribution": 0.0,
+        "return_contribution_pct": 0.0,
+        "drawdown_contribution": 0.0,
+        "drawdown_contribution_pct": 0.0,
+        "trade_count": 0,
+        "win_rate": 0.0,
+        "wins": 0,
+        "pnl_total": 0.0,
+        "pnl_contribution": 0.0,
+        "pnl_contribution_pct": 0.0,
+        "metric_weight": 0.0,
+        "sharpe_sum": 0.0,
+        "psr_sum": 0.0,
+        "p_value_sum": 0.0,
+        "max_drawdown_sum": 0.0,
+        "win_rate_sum": 0.0,
+        "cagr_sum": 0.0,
+        "total_return_sum": 0.0,
+    }
+
+
+def _accumulate_portfolio_buckets(
+    *,
+    components: list[dict[str, Any]],
+    component_metrics: dict[str, dict[str, float]],
+    grouped: dict[str, dict[str, Any]],
+    normalized_group: str,
+) -> dict[str, dict[str, Any]]:
+    """Fold every component's weight/contributions/metrics into its group bucket."""
     for component in components:
         component_id = str(component.get("component_id") or "").strip()
         if not component_id:
@@ -5006,34 +5098,14 @@ def _compute_portfolio_contributions(
         key = _component_group_key(component, normalized_group)
         bucket = grouped.setdefault(
             key,
-            {
-                "group": normalized_group,
-                "group_value": key,
-                "component_id": component_id,
-                "component_ids": [],
-                "strategy_name": strategy_name,
-                "symbol": symbol,
-                "timeframe": timeframe,
-                "weight": 0.0,
-                "return_contribution": 0.0,
-                "return_contribution_pct": 0.0,
-                "drawdown_contribution": 0.0,
-                "drawdown_contribution_pct": 0.0,
-                "trade_count": 0,
-                "win_rate": 0.0,
-                "wins": 0,
-                "pnl_total": 0.0,
-                "pnl_contribution": 0.0,
-                "pnl_contribution_pct": 0.0,
-                "metric_weight": 0.0,
-                "sharpe_sum": 0.0,
-                "psr_sum": 0.0,
-                "p_value_sum": 0.0,
-                "max_drawdown_sum": 0.0,
-                "win_rate_sum": 0.0,
-                "cagr_sum": 0.0,
-                "total_return_sum": 0.0,
-            },
+            _new_contribution_bucket(
+                normalized_group=normalized_group,
+                key=key,
+                component_id=component_id,
+                strategy_name=strategy_name,
+                symbol=symbol,
+                timeframe=timeframe,
+            ),
         )
         if not bucket.get("strategy_name"):
             bucket["strategy_name"] = strategy_name
@@ -5045,63 +5117,77 @@ def _compute_portfolio_contributions(
         weight = _safe_float(component.get("weight"), 0.0)
         bucket["weight"] = _safe_float(bucket.get("weight"), 0.0) + weight
 
-        metrics = component_metrics.get(component_id) or {
-            "sharpe_ratio": 0.0,
-            "psr": 0.0,
-            "p_value": 1.0,
-            "max_drawdown": 0.0,
-            "win_rate": 0.0,
-            "cagr": 0.0,
-            "total_return": 0.0,
-        }
-        return_contribution = _safe_float(component.get("return_contribution"), float("nan"))
-        derived_return_contribution = _safe_float(metrics.get("total_return"), 0.0) * weight
-        if (
-            not math.isfinite(return_contribution)
-            or (abs(return_contribution) <= 1e-12 and abs(derived_return_contribution) > 1e-12)
-        ):
-            return_contribution = derived_return_contribution
+        metrics = component_metrics.get(component_id) or _empty_contribution_metrics()
+        _fold_contribution_values(bucket, component, metrics, weight)
+        _fold_metric_sums(bucket, metrics, weight)
+    return grouped
 
-        drawdown_contribution = _safe_float(component.get("drawdown_contribution"), float("nan"))
-        derived_drawdown_contribution = abs(_safe_float(metrics.get("max_drawdown"), 0.0)) * max(weight, 0.0)
-        if (
-            not math.isfinite(drawdown_contribution)
-            or (abs(drawdown_contribution) <= 1e-12 and derived_drawdown_contribution > 1e-12)
-        ):
-            drawdown_contribution = derived_drawdown_contribution
 
-        bucket["return_contribution"] = _safe_float(bucket.get("return_contribution"), 0.0) + return_contribution
-        bucket["drawdown_contribution"] = _safe_float(bucket.get("drawdown_contribution"), 0.0) + abs(
-            drawdown_contribution
-        )
+def _derived_contribution(
+    reported: Any, derived: float
+) -> float:
+    """Use the derived value when the reported one is missing or dust."""
+    value = _safe_float(reported, float("nan"))
+    if (
+        not math.isfinite(value)
+        or (abs(value) <= 1e-12 and abs(derived) > 1e-12)
+    ):
+        return derived
+    return value
 
-        metric_weight = max(weight, 0.000001)
-        bucket["metric_weight"] = _safe_float(bucket.get("metric_weight"), 0.0) + metric_weight
-        bucket["sharpe_sum"] = _safe_float(bucket.get("sharpe_sum"), 0.0) + _safe_float(
-            metrics.get("sharpe_ratio"), 0.0
-        ) * metric_weight
-        bucket["psr_sum"] = _safe_float(bucket.get("psr_sum"), 0.0) + _safe_float(
-            metrics.get("psr"), 0.0
-        ) * metric_weight
-        bucket["p_value_sum"] = _safe_float(bucket.get("p_value_sum"), 0.0) + _safe_float(
-            metrics.get("p_value"), 1.0
-        ) * metric_weight
-        bucket["max_drawdown_sum"] = _safe_float(bucket.get("max_drawdown_sum"), 0.0) + abs(
-            _safe_float(metrics.get("max_drawdown"), 0.0)
-        ) * metric_weight
-        bucket["win_rate_sum"] = _safe_float(bucket.get("win_rate_sum"), 0.0) + (
-            _normalize_win_rate(metrics.get("win_rate")) or 0.0
-        ) * metric_weight
-        bucket["cagr_sum"] = _safe_float(bucket.get("cagr_sum"), 0.0) + _safe_float(metrics.get("cagr"), 0.0) * metric_weight
-        bucket["total_return_sum"] = _safe_float(bucket.get("total_return_sum"), 0.0) + _safe_float(
-            metrics.get("total_return"), 0.0
-        ) * metric_weight
 
-    component_ids_by_group = {
-        key: {str(component_id) for component_id in value.get("component_ids", [])}
-        for key, value in grouped.items()
-    }
+def _fold_contribution_values(
+    bucket: dict[str, Any], component: dict[str, Any], metrics: dict[str, float], weight: float
+) -> None:
+    return_contribution = _derived_contribution(
+        component.get("return_contribution"),
+        _safe_float(metrics.get("total_return"), 0.0) * weight,
+    )
+    drawdown_contribution = _derived_contribution(
+        component.get("drawdown_contribution"),
+        abs(_safe_float(metrics.get("max_drawdown"), 0.0)) * max(weight, 0.0),
+    )
 
+    bucket["return_contribution"] = _safe_float(bucket.get("return_contribution"), 0.0) + return_contribution
+    bucket["drawdown_contribution"] = _safe_float(bucket.get("drawdown_contribution"), 0.0) + abs(
+        drawdown_contribution
+    )
+
+
+def _fold_metric_sums(
+    bucket: dict[str, Any], metrics: dict[str, float], weight: float
+) -> None:
+    """Accumulate weighted metric sums into the group bucket."""
+    metric_weight = max(weight, 0.000001)
+    bucket["metric_weight"] = _safe_float(bucket.get("metric_weight"), 0.0) + metric_weight
+    bucket["sharpe_sum"] = _safe_float(bucket.get("sharpe_sum"), 0.0) + _safe_float(
+        metrics.get("sharpe_ratio"), 0.0
+    ) * metric_weight
+    bucket["psr_sum"] = _safe_float(bucket.get("psr_sum"), 0.0) + _safe_float(
+        metrics.get("psr"), 0.0
+    ) * metric_weight
+    bucket["p_value_sum"] = _safe_float(bucket.get("p_value_sum"), 0.0) + _safe_float(
+        metrics.get("p_value"), 1.0
+    ) * metric_weight
+    bucket["max_drawdown_sum"] = _safe_float(bucket.get("max_drawdown_sum"), 0.0) + abs(
+        _safe_float(metrics.get("max_drawdown"), 0.0)
+    ) * metric_weight
+    bucket["win_rate_sum"] = _safe_float(bucket.get("win_rate_sum"), 0.0) + (
+        _normalize_win_rate(metrics.get("win_rate")) or 0.0
+    ) * metric_weight
+    bucket["cagr_sum"] = _safe_float(bucket.get("cagr_sum"), 0.0) + _safe_float(metrics.get("cagr"), 0.0) * metric_weight
+    bucket["total_return_sum"] = _safe_float(bucket.get("total_return_sum"), 0.0) + _safe_float(
+        metrics.get("total_return"), 0.0
+    ) * metric_weight
+
+
+def _accumulate_trade_pnls(
+    *,
+    trades: list[dict[str, Any]],
+    component_ids_by_group: dict[str, set[str]],
+    grouped: dict[str, dict[str, Any]],
+) -> None:
+    """Add per-trade counts and PnL to the groups owning their component."""
     for trade in trades:
         component_id = str(trade.get("component_id") or "").strip()
         if not component_id:
@@ -5116,63 +5202,74 @@ def _compute_portfolio_contributions(
                 bucket["wins"] = int(bucket.get("wins") or 0) + 1
             bucket["pnl_total"] = _safe_float(bucket.get("pnl_total"), 0.0) + pnl_value
 
-    total_pnl = _safe_float((portfolio.get("combined_stats") or {}).get("net_profit"), 0.0)
-    contributions: list[dict[str, Any]] = []
-    for key in sorted(grouped.keys()):
-        bucket = grouped[key]
-        trade_count = int(bucket.get("trade_count") or 0)
-        wins = int(bucket.get("wins") or 0)
-        return_value = _safe_float(bucket.get("return_contribution"), 0.0)
-        drawdown_value = abs(_safe_float(bucket.get("drawdown_contribution"), 0.0))
-        return_pct = 0.0 if total_return == 0 else (return_value / total_return) * 100.0
-        drawdown_pct = 0.0 if total_drawdown == 0 else (drawdown_value / total_drawdown) * 100.0
-        pnl_value = _safe_float(bucket.get("pnl_total"), 0.0)
-        pnl_pct = 0.0 if total_pnl == 0 else (pnl_value / total_pnl) * 100.0
-        metric_weight = _safe_float(bucket.get("metric_weight"), 0.0) or 1.0
-        sharpe_ratio = _safe_float(bucket.get("sharpe_sum"), 0.0) / metric_weight
-        psr = _safe_float(bucket.get("psr_sum"), 0.0) / metric_weight
-        p_value = _safe_float(bucket.get("p_value_sum"), 1.0) / metric_weight
-        max_drawdown = _safe_float(bucket.get("max_drawdown_sum"), 0.0) / metric_weight
-        metric_win_rate = _safe_float(bucket.get("win_rate_sum"), 0.0) / metric_weight
-        cagr = _safe_float(bucket.get("cagr_sum"), 0.0) / metric_weight
-        display_value = bucket.get("group_value", key)
-        if normalized_group == "component":
-            strategy_name = str(bucket.get("strategy_name") or display_value or "").strip()
-            symbol = _normalize_symbol_key(bucket.get("symbol"))
-            timeframe = _normalize_timeframe_key(bucket.get("timeframe"))
-            suffix_values = [value for value in [symbol, timeframe] if value]
-            if strategy_name and suffix_values:
-                display_value = f"{strategy_name} ({', '.join(suffix_values)})"
-            elif strategy_name:
-                display_value = strategy_name
-        contributions.append(
-            {
-                "group": normalized_group,
-                "group_value": display_value,
-                "component_id": str(bucket.get("component_id") or ""),
-                "component_ids": bucket.get("component_ids", []),
-                "strategy_name": bucket.get("strategy_name", ""),
-                "symbol": bucket.get("symbol", ""),
-                "timeframe": bucket.get("timeframe", ""),
-                "weight": round(_safe_float(bucket.get("weight"), 0.0), 6),
-                "return_contribution": round(return_value, 8),
-                "return_contribution_pct": round(return_pct, 3),
-                "drawdown_contribution": round(drawdown_value, 8),
-                "drawdown_contribution_pct": round(drawdown_pct, 3),
-                "trade_count": trade_count,
-                "win_rate": round(metric_win_rate * 100.0, 2),
-                "wins": wins,
-                "sharpe_ratio": round(sharpe_ratio, 6),
-                "psr": round(psr, 6),
-                "p_value": round(p_value, 6),
-                "max_drawdown": round(max_drawdown, 6),
-                "cagr": round(cagr, 6),
-                "pnl_total": round(pnl_value, 6),
-                "pnl_contribution": round(pnl_value, 6),
-                "pnl_contribution_pct": round(pnl_pct, 3),
-            }
-        )
-    return contributions
+
+def _portfolio_contribution_display_value(
+    bucket: dict[str, Any], group: str, default_value: str
+) -> str:
+    if group != "component":
+        return default_value
+    strategy_name = str(bucket.get("strategy_name") or default_value or "").strip()
+    symbol = _normalize_symbol_key(bucket.get("symbol"))
+    timeframe = _normalize_timeframe_key(bucket.get("timeframe"))
+    suffix_values = [value for value in [symbol, timeframe] if value]
+    if strategy_name and suffix_values:
+        return f"{strategy_name} ({', '.join(suffix_values)})"
+    if strategy_name:
+        return strategy_name
+    return default_value
+
+
+def _portfolio_contribution_payload(
+    bucket: dict[str, Any],
+    *,
+    group: str,
+    total_return: float,
+    total_drawdown: float,
+    total_pnl: float,
+) -> dict[str, Any]:
+    trade_count = int(bucket.get("trade_count") or 0)
+    wins = int(bucket.get("wins") or 0)
+    return_value = _safe_float(bucket.get("return_contribution"), 0.0)
+    drawdown_value = abs(_safe_float(bucket.get("drawdown_contribution"), 0.0))
+    return_pct = 0.0 if total_return == 0 else (return_value / total_return) * 100.0
+    drawdown_pct = 0.0 if total_drawdown == 0 else (drawdown_value / total_drawdown) * 100.0
+    pnl_value = _safe_float(bucket.get("pnl_total"), 0.0)
+    pnl_pct = 0.0 if total_pnl == 0 else (pnl_value / total_pnl) * 100.0
+    metric_weight = _safe_float(bucket.get("metric_weight"), 0.0) or 1.0
+    sharpe_ratio = _safe_float(bucket.get("sharpe_sum"), 0.0) / metric_weight
+    psr = _safe_float(bucket.get("psr_sum"), 0.0) / metric_weight
+    p_value = _safe_float(bucket.get("p_value_sum"), 1.0) / metric_weight
+    max_drawdown = _safe_float(bucket.get("max_drawdown_sum"), 0.0) / metric_weight
+    metric_win_rate = _safe_float(bucket.get("win_rate_sum"), 0.0) / metric_weight
+    cagr = _safe_float(bucket.get("cagr_sum"), 0.0) / metric_weight
+    display_value = _portfolio_contribution_display_value(
+        bucket, group, str(bucket.get("group_value") or "")
+    )
+    return {
+        "group": group,
+        "group_value": display_value,
+        "component_id": str(bucket.get("component_id") or ""),
+        "component_ids": bucket.get("component_ids", []),
+        "strategy_name": bucket.get("strategy_name", ""),
+        "symbol": bucket.get("symbol", ""),
+        "timeframe": bucket.get("timeframe", ""),
+        "weight": round(_safe_float(bucket.get("weight"), 0.0), 6),
+        "return_contribution": round(return_value, 8),
+        "return_contribution_pct": round(return_pct, 3),
+        "drawdown_contribution": round(drawdown_value, 8),
+        "drawdown_contribution_pct": round(drawdown_pct, 3),
+        "trade_count": trade_count,
+        "win_rate": round(metric_win_rate * 100.0, 2),
+        "wins": wins,
+        "sharpe_ratio": round(sharpe_ratio, 6),
+        "psr": round(psr, 6),
+        "p_value": round(p_value, 6),
+        "max_drawdown": round(max_drawdown, 6),
+        "cagr": round(cagr, 6),
+        "pnl_total": round(pnl_value, 6),
+        "pnl_contribution": round(pnl_value, 6),
+        "pnl_contribution_pct": round(pnl_pct, 3),
+    }
 
 
 def _portfolio_trades_filtered(
