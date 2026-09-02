@@ -273,7 +273,7 @@ def test_merge_tick_sides_raises_on_schema_drift():
         }
     )
 
-    with pytest.raises(RuntimeError, match="missing required side columns"):
+    with pytest.raises(RuntimeError, match="missing required columns"):
         native._merge_tick_sides(drifted_bid, ask_only)
 
 
@@ -383,7 +383,7 @@ def test_split_tick_sides_raises_on_schema_drift():
         }
     )
 
-    with pytest.raises(RuntimeError, match="missing required bid/ask columns"):
+    with pytest.raises(RuntimeError, match="missing required columns"):
         native._split_tick_sides(shared)
 
 

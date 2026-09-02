@@ -662,6 +662,13 @@ def _normalize_offer_side(value: str | None) -> str:
     return normalized
 
 
+def _require_columns(frame: pd.DataFrame, columns: set[str], context: str) -> None:
+    """Raise when ``frame`` lacks any of ``columns`` (schema drift must be loud)."""
+    missing = columns - set(frame.columns)
+    if missing:
+        raise RuntimeError(f"{context} is missing required columns: {sorted(missing)}")
+
+
 def _split_tick_sides(tick_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Split a shared tick frame into (bid, ask) frames keyed by timestamp.
 
@@ -673,14 +680,14 @@ def _split_tick_sides(tick_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame
         empty = tick_df.copy()
         return empty, empty.copy()
 
-    missing = {"timestamp", "bid", "bid_vol", "ask", "ask_vol"} - set(tick_df.columns)
-    if missing:
-        # Schema drift must surface here, not as a KeyError far from the parse
-        # step (the tick columns come from _assemble_tick_dataframe's
-        # fixed record layout).
-        raise RuntimeError(
-            f"Tick frame is missing required bid/ask columns: {sorted(missing)}"
-        )
+    # Schema drift must surface here, not as a KeyError far from the parse
+    # step (the tick columns come from _assemble_tick_dataframe's
+    # fixed record layout).
+    _require_columns(
+        tick_df,
+        set(MERGED_TICK_COLUMNS),
+        "Tick frame",
+    )
 
     bid = tick_df[["timestamp", "bid", "bid_vol"]].copy()
     ask = tick_df[["timestamp", "ask", "ask_vol"]].copy()
@@ -710,11 +717,7 @@ def _merge_tick_sides(bid_df: pd.DataFrame, ask_df: pd.DataFrame) -> pd.DataFram
     for name, frame in (("bid", bid_df), ("ask", ask_df)):
         if frame.empty:
             continue
-        missing = [column for column in expected_by_side[name] if column not in frame.columns]
-        if missing:
-            raise RuntimeError(
-                f"{name} tick frame is missing required side columns: {missing}"
-            )
+        _require_columns(frame, set(expected_by_side[name]), f"{name} tick frame")
 
     if bid_df.empty and ask_df.empty:
         return pd.DataFrame(columns=MERGED_TICK_COLUMNS)
@@ -742,11 +745,11 @@ def _merge_tick_sides(bid_df: pd.DataFrame, ask_df: pd.DataFrame) -> pd.DataFram
         how="inner",
         validate="one_to_one",
     )
-    missing = {"bid", "bid_vol", "ask", "ask_vol"} - set(merged.columns)
-    if missing:
-        raise RuntimeError(
-            f"Merged tick frame is missing side columns after join: {sorted(missing)}"
-        )
+    _require_columns(
+        merged,
+        {"bid", "bid_vol", "ask", "ask_vol"},
+        "Merged tick frame after join",
+    )
     return _finalize_merged_ticks(merged)
 
 
