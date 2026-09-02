@@ -10,25 +10,8 @@ from typing import Any
 from shared.models import BacktestResult, EquityPoint, Trade
 
 
-def _parse_day_bound(value: str | None, *, is_end: bool) -> str | None:
-    """Normalize a YYYY-MM-DD (or ISO) boundary for trade-time comparison."""
-    raw = str(value or "").strip()
-    if not raw:
-        return None
-    normalized = raw.replace("Z", "+00:00")
-    try:
-        parsed = datetime.fromisoformat(normalized)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    if is_end and "T" not in raw and ":" not in raw:
-        parsed = parsed.replace(hour=23, minute=59, second=59, microsecond=999999)
-    return parsed
-
-
 def _parse_ts(value: str | None) -> datetime | None:
-    """Parse a trade/equity timestamp; None when it cannot be understood."""
+    """Parse an ISO-ish timestamp; None when it cannot be understood."""
     raw = str(value or "").strip()
     if not raw:
         return None
@@ -38,6 +21,17 @@ def _parse_ts(value: str | None) -> datetime | None:
         return None
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _parse_day_bound(value: str | None, *, is_end: bool) -> datetime | None:
+    """Normalize a YYYY-MM-DD (or ISO) boundary for trade-time comparison."""
+    parsed = _parse_ts(value)
+    if parsed is None:
+        return None
+    raw = str(value or "").strip()
+    if is_end and "T" not in raw and ":" not in raw:
+        parsed = parsed.replace(hour=23, minute=59, second=59, microsecond=999999)
     return parsed
 
 
