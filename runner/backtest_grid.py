@@ -759,6 +759,9 @@ def main() -> None:
     parser.add_argument("--engine", default="vectorbt", help="Backtest engine")
     parser.add_argument("--capital", type=float, default=100_000.0, help="Initial capital")
     parser.add_argument("--risk-pct", type=float, default=0.01, help="Risk per trade, e.g. 0.01")
+    # Deprecated alias only (the canonical --max-position-exposure-pct flag
+    # lives in runner.cli's _add_sizing_flags); both fold onto the canonical
+    # max_position_exposure_pct keyword inside run_backtest_grid().
     parser.add_argument("--max-position-pct", type=float, default=None)
     parser.add_argument("--max-leverage", type=float, default=None)
     parser.add_argument("--intrabar-resolution", default="open_close")
@@ -781,7 +784,7 @@ def main() -> None:
         engine=args.engine,
         capital=args.capital,
         risk_pct=args.risk_pct,
-        max_position_exposure_pct=args.max_position_exposure_pct,
+        max_position_exposure_pct=getattr(args, "max_position_pct", None),
         max_leverage=args.max_leverage,
         intrabar_resolution=args.intrabar_resolution,
         params=parse_params(args.params),

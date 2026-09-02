@@ -94,6 +94,19 @@ class TestResolveHelperRename:
             resolved = vectorbt_adapter._resolve_max_position_pct(0.3, "unknown")
         assert resolved == 0.3
 
+    def test_persisted_risk_math_key_stays_max_position_pct(self):
+        """Artifact-key stability: the emitted key in
+        ``trade.meta["risk_math"]`` must keep the historical spelling
+        (frontend ``TradeRiskMath`` + SQLite fallback read it), even though the
+        config field was renamed in 16-E."""
+        import inspect
+
+        from runner.engines import vectorbt_adapter
+
+        source = inspect.getsource(vectorbt_adapter._process_symbol)
+        assert '"max_position_pct":' in source
+        assert '"max_position_exposure_pct":' not in source
+
 
 # ─── CLI flag alias ─────────────────────────────────────────────────────────
 
@@ -283,6 +296,19 @@ class TestNativeEngineExposureWiring:
         engine = self._engine()
         assert engine._risk_engine.config.max_total_exposure == 0.05
 
+    def test_unset_default_is_pinned_to_risk_config_itself(self):
+        """The fallback must stay RiskConfig's own default, not a literal.
+
+        A literal ``0.05`` here would silently diverge the moment
+        ``risk.RiskConfig.max_total_exposure`` changes its default.
+        """
+        from risk.config import RiskConfig
+
+        engine = self._engine()
+        assert engine._risk_engine.config.max_total_exposure == (
+            RiskConfig().max_total_exposure
+        )
+
     def test_deprecated_alias_feeds_the_same_value(self):
         with pytest.warns(DeprecationWarning):
             engine = self._engine(max_position_pct=0.4)
@@ -435,6 +461,43 @@ class TestBatchEntryPoints:
         assert legacy_payload["config"]["max_position_exposure_pct"] == 0.5
         assert {fold["max_position_exposure_pct"] for fold in captured} == {0.5}
 
+    def test_walkforward_train_and_test_folds_get_identical_sizing_context(
+        self, tmp_path, monkeypatch
+    ):
+        """Both folds of every window must receive byte-identical sizing and
+        context parameters — a parameter reaching only the train call would
+        silently size OOS folds differently from IS folds."""
+        import runner.walkforward as wf
+
+        captured: list[dict] = []
+
+        def _fake_fold(**kwargs):
+            captured.append(kwargs)
+            return {"sharpe_ratio": 0.1, "sharpe": 0.1}
+
+        monkeypatch.setattr(wf, "_run_fold_backtest", _fake_fold)
+        wf.run_walkforward(
+            strategy=str(self._strategy(tmp_path)),
+            symbols=["XAUUSD"],
+            timeframe="1h",
+            start="2025-01-01",
+            end="2025-06-30",
+            capital=100_000.0,
+            risk_pct=0.01,
+            max_position_exposure_pct=0.5,
+            max_leverage=2.0,
+            train_months=1,
+            test_months=1,
+            step_months=1,
+            output_dir=tmp_path / "wf",
+        )
+        assert len(captured) >= 2, captured
+        for train, test in zip(captured[0::2], captured[1::2]):
+            train_fold = {k: v for k, v in train.items() if k not in {"start", "end"}}
+            test_fold = {k: v for k, v in test.items() if k not in {"start", "end"}}
+            assert train_fold == test_fold
+            assert train_fold["max_position_exposure_pct"] == 0.5
+
     def test_walkforward_alias_and_new_name_conflict_is_rejected(self, tmp_path):
         from runner.walkforward import run_walkforward
 
@@ -472,3 +535,61 @@ def test_every_subcommand_exposes_the_new_flag_with_documented_help():
         }
         assert "--max-position-exposure-pct" in option_strings, subcommand
         assert "--max-position-pct" in option_strings, subcommand
+
+
+# ─── standalone module mains (runner -m entry points) ───────────────────────
+
+
+@pytest.mark.parametrize(
+    ("module_name", "flag"),
+    [
+        ("runner.backtest_grid", "--max-position-pct"),
+        ("runner.backtest_matrix", "--max-position-pct"),
+    ],
+)
+def test_standalone_main_wires_the_sizing_flag(
+    monkeypatch, tmp_path: Path, module_name: str, flag: str
+):
+    """``python -m runner.backtest_grid --max-position-pct …`` must reach the
+    batch entry point: the standalone mains parse the deprecated flag and pass
+    it on under the canonical keyword (no AttributeError — the canonical flag
+    lives in ``runner.cli``'s sizing-flag builder, not in these parsers)."""
+    import importlib
+
+    module = importlib.import_module(module_name)
+    runner_name = "run_backtest_grid" if "grid" in module_name else "run_backtest_matrix"
+    captured: dict = {}
+
+    def fake_entry(**kwargs):
+        captured.update(kwargs)
+        # Standalone mains exit non-zero on failed cells/runs.
+        return {"runs": [], "cells": [], "failed": 0, "failed_cells": 0}
+
+    monkeypatch.setattr(module, runner_name, fake_entry)
+    strategy = tmp_path / "sizing_stub.py"
+    strategy.write_text("STRATEGY_META = {'name': 'sizing_stub'}\n", encoding="utf-8")
+
+    argv = [
+        module_name.rsplit(".", 1)[-1],
+        "--strategy",
+        str(strategy),
+        "--symbols",
+        "XAUUSD",
+        "--timeframes",
+        "1h",
+        "--start",
+        "2025-01-01",
+        "--end",
+        "2025-01-31",
+        flag,
+        "0.5",
+    ]
+    monkeypatch.setattr("sys.argv", ["prog", *argv[1:]])
+    if flag == "--max-position-pct":
+        monkeypatch.setattr(
+            "warnings.warn",
+            lambda *a, **k: None,
+        )
+    module.main()
+
+    assert captured["max_position_exposure_pct"] == 0.5

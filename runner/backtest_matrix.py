@@ -678,7 +678,7 @@ def main() -> None:
         engine=args.engine,
         capital=args.capital,
         risk_pct=args.risk_pct,
-        max_position_exposure_pct=args.max_position_exposure_pct,
+        max_position_exposure_pct=getattr(args, "max_position_pct", None),
         max_leverage=args.max_leverage,
         intrabar_resolution=args.intrabar_resolution,
         params=parse_params(args.params),

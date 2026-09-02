@@ -282,14 +282,16 @@ def run_walkforward(
 
     folds: list[dict[str, Any]] = []
     for index, window in enumerate(windows, start=1):
-        train_stats = _run_fold_backtest(
+        # One shared kwargs block for both folds of a window: train and test
+        # folds must always receive IDENTICAL sizing/context parameters — a
+        # parameter added here must not silently reach only one of the two
+        # calls (otherwise OOS folds run with different sizing than IS).
+        fold_kwargs = dict(
             engine=engine,
             strategy=strategy,
             strategy_name=strategy_name,
             symbols=symbols,
             timeframe=normalized_timeframe,
-            start=window["train_start"],
-            end=window["train_end"],
             capital=capital,
             risk_pct=risk_pct,
             max_position_exposure_pct=max_position_exposure_pct,
@@ -298,21 +300,11 @@ def run_walkforward(
             data_dir=data_dir,
             parameters=parameters,
         )
+        train_stats = _run_fold_backtest(
+            start=window["train_start"], end=window["train_end"], **fold_kwargs
+        )
         test_stats = _run_fold_backtest(
-            engine=engine,
-            strategy=strategy,
-            strategy_name=strategy_name,
-            symbols=symbols,
-            timeframe=normalized_timeframe,
-            start=window["test_start"],
-            end=window["test_end"],
-            capital=capital,
-            risk_pct=risk_pct,
-            max_position_exposure_pct=max_position_exposure_pct,
-            max_leverage=max_leverage,
-            modeling_resolution=modeling_resolution,
-            data_dir=data_dir,
-            parameters=parameters,
+            start=window["test_start"], end=window["test_end"], **fold_kwargs
         )
         folds.append(
             {
