@@ -2643,6 +2643,25 @@ def _ensure_fallback_downloader(
 
 
 @dataclass
+class _JForexRequest:
+    """Parameters for one JForex/native download attempt."""
+
+    symbol: str
+    timeframe: str
+    start: str | None
+    end: str | None
+    offer_side: str
+    query_timeout_seconds: int
+    merge_tick: bool
+    merge_s1: bool
+    batch_size: int
+    pause_ms: int
+    pause_event: Any
+    stop_event: Any
+    report_progress: Callable[[float, str], None]
+
+
+@dataclass
 class _JForexAttempt:
     """Outcome of one JForex (or native-fallback) download attempt."""
 
@@ -2660,19 +2679,7 @@ def _attempt_jforex_download(
     *,
     jforex_downloader: Any,
     get_fallback_downloader: Callable[[], Any],
-    symbol: str,
-    timeframe: str,
-    start: str | None,
-    end: str | None,
-    offer_side: str,
-    query_timeout_seconds: int,
-    merge_tick: bool,
-    merge_s1: bool,
-    batch_size: int,
-    pause_ms: int,
-    pause_event: Any,
-    stop_event: Any,
-    report_progress: Callable[[float, str], None],
+    request: _JForexRequest,
     task_log: Callable[..., None],
     fallback_enabled: bool,
 ) -> _JForexAttempt:
@@ -2681,13 +2688,13 @@ def _attempt_jforex_download(
 
     try:
         download = jforex_downloader.download(
-            symbol,
-            timeframe,
+            request.symbol,
+            request.timeframe,
             DATA_DIR,
-            start=start,
-            end=end,
-            offer_side=offer_side,
-            query_timeout_seconds=query_timeout_seconds,
+            start=request.start,
+            end=request.end,
+            offer_side=request.offer_side,
+            query_timeout_seconds=request.query_timeout_seconds,
         )
         return _JForexAttempt(download=download)
     except DownloadCancelled:
@@ -2695,21 +2702,10 @@ def _attempt_jforex_download(
     except (ImportError, OSError, RuntimeError, ValueError, KeyError) as exc:
         fallback_reason = _jforex_fallback_reason(exc) if fallback_enabled else None
         if fallback_reason is None:
-            return _JForexAttempt(error=f"{symbol} {timeframe}: {exc}")
+            return _JForexAttempt(error=f"{request.symbol} {request.timeframe}: {exc}")
         return _attempt_native_fallback(
             get_fallback_downloader=get_fallback_downloader,
-            symbol=symbol,
-            timeframe=timeframe,
-            start=start,
-            end=end,
-            offer_side=offer_side,
-            merge_tick=merge_tick,
-            merge_s1=merge_s1,
-            batch_size=batch_size,
-            pause_ms=pause_ms,
-            pause_event=pause_event,
-            stop_event=stop_event,
-            report_progress=report_progress,
+            request=request,
             task_log=task_log,
             jforex_error=exc,
             fallback_reason=fallback_reason,
@@ -2719,18 +2715,7 @@ def _attempt_jforex_download(
 def _attempt_native_fallback(
     *,
     get_fallback_downloader: Callable[[], Any],
-    symbol: str,
-    timeframe: str,
-    start: str | None,
-    end: str | None,
-    offer_side: str,
-    merge_tick: bool,
-    merge_s1: bool,
-    batch_size: int,
-    pause_ms: int,
-    pause_event: Any,
-    stop_event: Any,
-    report_progress: Callable[[float, str], None],
+    request: _JForexRequest,
     task_log: Callable[..., None],
     jforex_error: Exception,
     fallback_reason: str,
@@ -2738,6 +2723,8 @@ def _attempt_native_fallback(
     """Run the Dukascopy-native fallback download for a failed JForex request."""
     from data_tools.downloaders.dukascopy_native import DownloadCancelled
 
+    symbol = request.symbol
+    timeframe = request.timeframe
     fallback_downloader = get_fallback_downloader()
     task_log(
         (
@@ -2766,16 +2753,16 @@ def _attempt_native_fallback(
             symbol,
             timeframe,
             DATA_DIR,
-            start=start,
-            end=end,
-            offer_side=offer_side,
-            merge_tick=merge_tick,
-            merge_s1=merge_s1,
-            batch_size=batch_size,
-            pause_ms=pause_ms,
-            pause_event=pause_event,
-            stop_event=stop_event,
-            report_progress=report_progress,
+            start=request.start,
+            end=request.end,
+            offer_side=request.offer_side,
+            merge_tick=request.merge_tick,
+            merge_s1=request.merge_s1,
+            batch_size=request.batch_size,
+            pause_ms=request.pause_ms,
+            pause_event=request.pause_event,
+            stop_event=request.stop_event,
+            report_progress=request.report_progress,
             log_callback=task_log,
         )
     except DownloadCancelled:
@@ -2942,19 +2929,21 @@ def _start_jforex_task(
                     outcome = _attempt_jforex_download(
                         jforex_downloader=jforex_downloader,
                         get_fallback_downloader=_get_fallback_downloader,
-                        symbol=symbol,
-                        timeframe=timeframe,
-                        start=start,
-                        end=end,
-                        offer_side=offer_side,
-                        query_timeout_seconds=query_timeout_seconds,
-                        merge_tick=merge_tick,
-                        merge_s1=merge_s1,
-                        batch_size=batch_size,
-                        pause_ms=pause_ms,
-                        pause_event=pause_event,
-                        stop_event=stop_event,
-                        report_progress=report_progress,
+                        request=_JForexRequest(
+                            symbol=symbol,
+                            timeframe=timeframe,
+                            start=start,
+                            end=end,
+                            offer_side=offer_side,
+                            query_timeout_seconds=query_timeout_seconds,
+                            merge_tick=merge_tick,
+                            merge_s1=merge_s1,
+                            batch_size=batch_size,
+                            pause_ms=pause_ms,
+                            pause_event=pause_event,
+                            stop_event=stop_event,
+                            report_progress=report_progress,
+                        ),
                         task_log=task_log,
                         fallback_enabled=fallback_enabled,
                     )

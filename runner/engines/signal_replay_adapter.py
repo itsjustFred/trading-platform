@@ -718,7 +718,6 @@ class SignalReplayAdapter:
         fill_price: float,
         normalized_timeframe: str,
         open_positions: dict[str, _OpenPosition],
-        account_balance: float,
     ) -> RiskTradeSignal:
         return RiskTradeSignal(
             action="buy" if target_direction == "LONG" else "sell",
@@ -753,7 +752,6 @@ class SignalReplayAdapter:
             fill_price=fill_price,
             normalized_timeframe=normalized_timeframe,
             open_positions=open_positions,
-            account_balance=account_balance,
         )
         sized = self.risk_engine.calculate_position_size(
             signal=risk_signal,

@@ -186,6 +186,36 @@ def _end_of_day_inclusive(end_dt: datetime) -> datetime:
         return end_dt.replace(hour=23, minute=59, second=59)
     return end_dt
 
+
+@dataclass
+class _TickDownloadOptions:
+    """Shared download-loop options for the Dukascopy strategy helpers."""
+
+    batch_size: int
+    pipeline_batches: int
+    pause_ms: int
+    max_retries: int
+    stop_event: Any
+    pause_event: Any
+    report_progress: Any
+    log_callback: Any
+
+
+@dataclass
+class _TickRequest:
+    """Per-request parameters for the Dukascopy strategy helpers."""
+
+    instrument: str
+    sym: str
+    normalized_tf: str
+    price_type: str
+    offer_side: str
+    decimal_factor: Any
+    start_dt: datetime
+    end_dt: datetime
+    requested_start: str
+    requested_end: str
+
 # Map normalized timeframes to pandas resample rules
 TF_RESAMPLE_RULE: dict[str, str] = {
     "s1": "1s",
@@ -1105,6 +1135,29 @@ class DukascopyNativeDownloader(Downloader):
         )
         _report_progress(report_progress, 0.0, "Preparing download")
 
+        request = _TickRequest(
+            instrument=instrument,
+            sym=sym,
+            normalized_tf=normalized_tf,
+            price_type=price_type,
+            offer_side=offer_side,
+            decimal_factor=decimal_factor,
+            start_dt=start_dt,
+            end_dt=end_dt,
+            requested_start=requested_start,
+            requested_end=requested_end,
+        )
+        options = _TickDownloadOptions(
+            batch_size=batch_size,
+            pipeline_batches=pipeline_batches,
+            pause_ms=pause_ms,
+            max_retries=max_retries,
+            stop_event=stop_event,
+            pause_event=pause_event,
+            report_progress=report_progress,
+            log_callback=log_callback,
+        )
+
         if strategy == "tick":
             if merge_bid_ask:
                 _emit_log_message("Downloading merged hourly tick files...", log_callback=log_callback)
@@ -1307,264 +1360,181 @@ class DukascopyNativeDownloader(Downloader):
     async def _download_tick_strategy(
         self,
         *,
-        instrument: str,
-        sym: str,
-        normalized_tf: str,
-        price_type: str,
-        offer_side: str,
-        decimal_factor: Any,
+        request: _TickRequest,
+        options: _TickDownloadOptions,
         merge_bid_ask: bool,
-        batch_size: int,
-        pipeline_batches: int,
-        pause_ms: int,
-        max_retries: int,
-        start_dt: datetime,
-        end_dt: datetime,
-        requested_start: str,
-        requested_end: str,
-        stop_event: Any,
-        pause_event: Any,
-        report_progress: Any,
-        log_callback: Any,
     ) -> tuple[pd.DataFrame, list[str]]:
         if merge_bid_ask:
-            _emit_log_message("Downloading merged hourly tick files...", log_callback=log_callback)
+            _emit_log_message("Downloading merged hourly tick files...", log_callback=options.log_callback)
             df = await _download_and_assemble_merged_ticks(
-                instrument,
-                start_dt,
-                end_dt,
-                batch_size,
-                pipeline_batches,
-                pause_ms,
-                max_retries,
-                stop_event=stop_event,
-                pause_event=pause_event,
-                log_callback=log_callback,
+                request.instrument,
+                request.start_dt,
+                request.end_dt,
+                options.batch_size,
+                options.pipeline_batches,
+                options.pause_ms,
+                options.max_retries,
+                stop_event=options.stop_event,
+                pause_event=options.pause_event,
+                log_callback=options.log_callback,
             )
             warnings = ["offer_side:both", "price_type:bid+ask"]
         else:
             df, warnings = await self._download_single_side_ticks(
-                instrument=instrument,
-                offer_side=offer_side,
-                price_type=price_type,
-                decimal_factor=decimal_factor,
-                batch_size=batch_size,
-                pipeline_batches=pipeline_batches,
-                pause_ms=pause_ms,
-                max_retries=max_retries,
-                start_dt=start_dt,
-                end_dt=end_dt,
-                stop_event=stop_event,
-                pause_event=pause_event,
-                report_progress=report_progress,
-                log_callback=log_callback,
+                request=request, options=options
             )
 
         if df.empty:
-            raise RuntimeError(f"No tick data for {sym} in range {requested_start} → {requested_end}")
+            raise RuntimeError(
+                f"No tick data for {request.sym} in range "
+                f"{request.requested_start} → {request.requested_end}"
+            )
 
-        if normalized_tf not in ("tick", "s1"):
-            df = _ticks_to_ohlcv(df, normalized_tf, price_type)
-        elif normalized_tf == "s1":
-            df = _ticks_to_ohlcv(df, "s1", price_type)
+        if request.normalized_tf not in ("tick", "s1"):
+            df = _ticks_to_ohlcv(df, request.normalized_tf, request.price_type)
+        elif request.normalized_tf == "s1":
+            df = _ticks_to_ohlcv(df, "s1", request.price_type)
         return df, warnings
 
     @staticmethod
     async def _download_single_side_ticks(
         *,
-        instrument: str,
-        offer_side: str,
-        price_type: str,
-        decimal_factor: Any,
-        batch_size: int,
-        pipeline_batches: int,
-        pause_ms: int,
-        max_retries: int,
-        start_dt: datetime,
-        end_dt: datetime,
-        stop_event: Any,
-        pause_event: Any,
-        report_progress: Any,
-        log_callback: Any,
+        request: _TickRequest,
+        options: _TickDownloadOptions,
     ) -> tuple[pd.DataFrame, list[str]]:
-        urls = generate_tick_urls(instrument, start_dt, end_dt)
+        urls = generate_tick_urls(request.instrument, request.start_dt, request.end_dt)
         _emit_log_message(
             f"Downloading {len(urls)} hourly tick files...",
-            log_callback=log_callback,
+            log_callback=options.log_callback,
         )
         bi5_results = await download_bi5_files(
             urls,
-            batch_size,
-            max_retries,
-            batch_size=batch_size,
-            pipeline_batches=pipeline_batches,
-            pause_ms=pause_ms,
+            options.batch_size,
+            options.max_retries,
+            batch_size=options.batch_size,
+            pipeline_batches=options.pipeline_batches,
+            pause_ms=options.pause_ms,
             report_progress=(
-                (lambda pct, msg: _report_progress(report_progress, pct * 0.9, msg))
-                if report_progress
+                (lambda pct, msg: _report_progress(options.report_progress, pct * 0.9, msg))
+                if options.report_progress
                 else None
             ),
             progress_unit="files",
-            stop_event=stop_event,
-            pause_event=pause_event,
-            log_callback=log_callback,
+            stop_event=options.stop_event,
+            pause_event=options.pause_event,
+            log_callback=options.log_callback,
         )
         non_empty = sum(1 for _, d in bi5_results if d)
         _emit_log_message(
             f"Received {non_empty}/{len(urls)} non-empty files",
-            log_callback=log_callback,
+            log_callback=options.log_callback,
         )
-        _report_progress(report_progress, 95.0, "Assembling tick data")
-        df = _assemble_tick_dataframe(bi5_results, decimal_factor)
-        return df, [f"offer_side:{offer_side}", f"price_type:{price_type}"]
+        _report_progress(options.report_progress, 95.0, "Assembling tick data")
+        df = _assemble_tick_dataframe(bi5_results, request.decimal_factor)
+        return df, [f"offer_side:{request.offer_side}", f"price_type:{request.price_type}"]
 
     async def _download_minute_strategy(
         self,
         *,
-        instrument: str,
-        sym: str,
-        normalized_tf: str,
-        price_type: str,
-        offer_side: str,
-        decimal_factor: Any,
-        batch_size: int,
-        pipeline_batches: int,
-        pause_ms: int,
-        max_retries: int,
-        start_dt: datetime,
-        end_dt: datetime,
-        requested_start: str,
-        requested_end: str,
-        stop_event: Any,
-        pause_event: Any,
-        report_progress: Any,
-        log_callback: Any,
+        request: _TickRequest,
+        options: _TickDownloadOptions,
     ) -> tuple[pd.DataFrame, list[str]]:
-        if offer_side == "both":
-            df = await self._download_both_minute_sides(
-                instrument=instrument,
-                sym=sym,
-                normalized_tf=normalized_tf,
-                decimal_factor=decimal_factor,
-                batch_size=batch_size,
-                pipeline_batches=pipeline_batches,
-                pause_ms=pause_ms,
-                max_retries=max_retries,
-                start_dt=start_dt,
-                end_dt=end_dt,
-                requested_start=requested_start,
-                requested_end=requested_end,
-                stop_event=stop_event,
-                pause_event=pause_event,
-                report_progress=report_progress,
-                log_callback=log_callback,
-            )
+        if request.offer_side == "both":
+            df = await self._download_both_minute_sides(request=request, options=options)
             warnings = ["offer_side:both", "price_type:bid+ask"]
             return df, warnings
 
         df = await _download_minute_side_dataframe(
-            instrument,
-            start_dt,
-            end_dt,
-            side=price_type,
-            decimal_factor=decimal_factor,
-            batch_size=batch_size,
-            pipeline_batches=pipeline_batches,
-            pause_ms=pause_ms,
-            max_retries=max_retries,
+            request.instrument,
+            request.start_dt,
+            request.end_dt,
+            side=request.price_type,
+            decimal_factor=request.decimal_factor,
+            batch_size=options.batch_size,
+            pipeline_batches=options.pipeline_batches,
+            pause_ms=options.pause_ms,
+            max_retries=options.max_retries,
             report_progress=(
-                (lambda pct, msg: _report_progress(report_progress, pct * 0.9, msg))
-                if report_progress
+                (lambda pct, msg: _report_progress(options.report_progress, pct * 0.9, msg))
+                if options.report_progress
                 else None
             ),
-            stop_event=stop_event,
-            pause_event=pause_event,
-            log_callback=log_callback,
+            stop_event=options.stop_event,
+            pause_event=options.pause_event,
+            log_callback=options.log_callback,
         )
-        _report_progress(report_progress, 95.0, "Assembling candle data")
-        warnings = [f"offer_side:{offer_side}", f"price_type:{price_type}"]
+        _report_progress(options.report_progress, 95.0, "Assembling candle data")
+        warnings = [f"offer_side:{request.offer_side}", f"price_type:{request.price_type}"]
 
         if df.empty:
             raise RuntimeError(
-                f"No candle data for {sym} in range {requested_start} → {requested_end}"
+                f"No candle data for {request.sym} in range "
+                f"{request.requested_start} → {request.requested_end}"
             )
 
-        if normalized_tf != "m1":
-            df = _resample_candles(df, normalized_tf)
+        if request.normalized_tf != "m1":
+            df = _resample_candles(df, request.normalized_tf)
         return df, warnings
 
     @staticmethod
     async def _download_both_minute_sides(
         *,
-        instrument: str,
-        sym: str,
-        normalized_tf: str,
-        decimal_factor: Any,
-        batch_size: int,
-        pipeline_batches: int,
-        pause_ms: int,
-        max_retries: int,
-        start_dt: datetime,
-        end_dt: datetime,
-        requested_start: str,
-        requested_end: str,
-        stop_event: Any,
-        pause_event: Any,
-        report_progress: Any,
-        log_callback: Any,
+        request: _TickRequest,
+        options: _TickDownloadOptions,
     ) -> pd.DataFrame:
         bid_df = await _download_minute_side_dataframe(
-            instrument,
-            start_dt,
-            end_dt,
+            request.instrument,
+            request.start_dt,
+            request.end_dt,
             side="bid",
-            decimal_factor=decimal_factor,
-            batch_size=batch_size,
-            pipeline_batches=pipeline_batches,
-            pause_ms=pause_ms,
-            max_retries=max_retries,
+            decimal_factor=request.decimal_factor,
+            batch_size=options.batch_size,
+            pipeline_batches=options.pipeline_batches,
+            pause_ms=options.pause_ms,
+            max_retries=options.max_retries,
             report_progress=(
-                (lambda pct, msg: _report_progress(report_progress, pct * 0.45, f"Bid {msg}"))
-                if report_progress
+                (lambda pct, msg: _report_progress(options.report_progress, pct * 0.45, f"Bid {msg}"))
+                if options.report_progress
                 else None
             ),
-            stop_event=stop_event,
-            pause_event=pause_event,
-            log_callback=log_callback,
+            stop_event=options.stop_event,
+            pause_event=options.pause_event,
+            log_callback=options.log_callback,
         )
         ask_df = await _download_minute_side_dataframe(
-            instrument,
-            start_dt,
-            end_dt,
+            request.instrument,
+            request.start_dt,
+            request.end_dt,
             side="ask",
-            decimal_factor=decimal_factor,
-            batch_size=batch_size,
-            pipeline_batches=pipeline_batches,
-            pause_ms=pause_ms,
-            max_retries=max_retries,
+            decimal_factor=request.decimal_factor,
+            batch_size=options.batch_size,
+            pipeline_batches=options.pipeline_batches,
+            pause_ms=options.pause_ms,
+            max_retries=options.max_retries,
             report_progress=(
                 (
                     lambda pct, msg: _report_progress(
-                        report_progress, 45.0 + (pct * 0.45), f"Ask {msg}"
+                        options.report_progress, 45.0 + (pct * 0.45), f"Ask {msg}"
                     )
                 )
-                if report_progress
+                if options.report_progress
                 else None
             ),
-            stop_event=stop_event,
-            pause_event=pause_event,
-            log_callback=log_callback,
+            stop_event=options.stop_event,
+            pause_event=options.pause_event,
+            log_callback=options.log_callback,
         )
-        _report_progress(report_progress, 95.0, "Merging bid/ask candle data")
+        _report_progress(options.report_progress, 95.0, "Merging bid/ask candle data")
         if bid_df.empty or ask_df.empty:
             raise RuntimeError(
-                f"No bid/ask candle data for {sym} in range {requested_start} → {requested_end}"
+                f"No bid/ask candle data for {request.sym} in range "
+                f"{request.requested_start} → {request.requested_end}"
             )
         bid_prefixed = _prefix_ohlcv_columns(bid_df, "bid")
         ask_prefixed = _prefix_ohlcv_columns(ask_df, "ask")
-        if normalized_tf != "m1":
-            bid_prefixed = _resample_side_prefixed_ohlcv(bid_prefixed, normalized_tf, "bid")
-            ask_prefixed = _resample_side_prefixed_ohlcv(ask_prefixed, normalized_tf, "ask")
+        if request.normalized_tf != "m1":
+            bid_prefixed = _resample_side_prefixed_ohlcv(bid_prefixed, request.normalized_tf, "bid")
+            ask_prefixed = _resample_side_prefixed_ohlcv(ask_prefixed, request.normalized_tf, "ask")
         return (
             bid_prefixed.merge(ask_prefixed, on="timestamp", how="inner")
             .sort_values("timestamp")

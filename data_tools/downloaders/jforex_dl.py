@@ -234,9 +234,8 @@ def _parse_datetime(value: str | datetime, *, is_end: bool) -> datetime:
     else:
         text = value.strip()
         ts = pd.to_datetime(text, utc=True, errors="raise")
-        if DATE_ONLY_RE.fullmatch(text):
-            if is_end:
-                ts = ts + pd.Timedelta(days=1) - pd.Timedelta(milliseconds=1)
+        if DATE_ONLY_RE.fullmatch(text) and is_end:
+            ts = ts + pd.Timedelta(days=1) - pd.Timedelta(milliseconds=1)
 
     if ts.tzinfo is None:
         ts = ts.tz_localize("UTC")

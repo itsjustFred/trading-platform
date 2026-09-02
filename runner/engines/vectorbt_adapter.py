@@ -440,38 +440,48 @@ def _process_symbol(
     return trades, extra_timeframes, drawings, indicator_series, len(df)
 
 
+@dataclass
+class _VectorbtTradeContext:
+    """Pre-resolved series and frame lookups shared by every trade build."""
+
+    df: pd.DataFrame
+    intrabar_df: pd.DataFrame | None
+    intrabar_timeframe: str | None
+    execution_signals: dict[str, Any]
+    execution_indicators: dict[str, Any]
+    direction_series: Any
+    exit_price_series: Any
+    exit_reason_series: Any
+    stop_loss_series: Any
+    take_profit_series: Any
+    atr_series: Any
+
+
 def _build_vectorbt_trade(
     *,
+    ctx: _VectorbtTradeContext,
     config: BacktestConfig,
     symbol: str,
     i: int,
     entry_idx: int,
-    df: pd.DataFrame,
-    intrabar_df: pd.DataFrame | None,
-    intrabar_timeframe: str | None,
-    execution_signals: dict[str, Any],
-    execution_indicators: dict[str, Any],
-    direction_series: Any,
-    exit_price_series: Any,
-    exit_reason_series: Any,
-    stop_loss_series: Any,
-    take_profit_series: Any,
-    atr_series: Any,
     equity: float,
     trade_counter: int,
     asset_class: str,
 ) -> tuple[Trade, float]:
     """Build one closed vectorbt trade and its realized PnL."""
+    df = ctx.df
+    execution_signals = ctx.execution_signals
+    execution_indicators = ctx.execution_indicators
     entry_row = df.iloc[entry_idx]
     exit_row = df.iloc[i]
-    direction = _resolve_direction(execution_signals, direction_series, entry_idx)
+    direction = _resolve_direction(execution_signals, ctx.direction_series, entry_idx)
     entry_price = _resolve_entry_price(entry_row)
-    exit_price = _resolve_exit_price(exit_row, i, exit_price_series)
-    exit_reason = _resolve_exit_reason(i, exit_reason_series)
+    exit_price = _resolve_exit_price(exit_row, i, ctx.exit_price_series)
+    exit_reason = _resolve_exit_reason(i, ctx.exit_reason_series)
     entry_ts = str(entry_row.get("timestamp", entry_row.name))
     exit_ts = str(exit_row.get("timestamp", exit_row.name))
     trade_meta = _extract_trade_meta(execution_signals, execution_indicators, entry_idx, i)
-    stop_price = _resolve_level_value(stop_loss_series, entry_idx)
+    stop_price = _resolve_level_value(ctx.stop_loss_series, entry_idx)
     risk_target_usd: float | None = None
     stop_distance: float | None = None
     max_position_pct: float | None = None
@@ -485,14 +495,14 @@ def _build_vectorbt_trade(
     sizing_mode = "full_equity"
 
     intrabar_exit = _resolve_intrabar_exit(
-        intrabar_df=intrabar_df,
-        intrabar_timeframe=intrabar_timeframe,
+        intrabar_df=ctx.intrabar_df,
+        intrabar_timeframe=ctx.intrabar_timeframe,
         base_timeframe=config.timeframe,
         direction=direction,
         entry_time=entry_ts,
         scheduled_exit_time=exit_ts,
-        stop_price=_resolve_level_value(stop_loss_series, entry_idx),
-        take_profit_price=_resolve_level_value(take_profit_series, entry_idx),
+        stop_price=_resolve_level_value(ctx.stop_loss_series, entry_idx),
+        take_profit_price=_resolve_level_value(ctx.take_profit_series, entry_idx),
     )
     if intrabar_exit is not None:
         exit_price = intrabar_exit["price"]
@@ -513,8 +523,8 @@ def _build_vectorbt_trade(
         stop_distance = _resolve_stop_distance(
             entry_idx,
             entry_price,
-            stop_loss_series=stop_loss_series,
-            atr_series=atr_series,
+            stop_loss_series=ctx.stop_loss_series,
+            atr_series=ctx.atr_series,
         )
 
         if not stop_distance or stop_distance <= 0:

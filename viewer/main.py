@@ -4408,7 +4408,6 @@ def _cached_backtest_strategy_matches(
 
 def _latest_matching_cached_backtest(
     *,
-    strategy_name: str,
     strategy_entry: Any,
     normalized_strategy: str,
     normalized_symbol: str,
@@ -4502,11 +4501,13 @@ def _latest_matching_file_backtest(
             continue
 
         timeframes_payload = data_payload.get("timeframes") or []
-        if isinstance(timeframes_payload, list) and timeframes_payload:
-            if normalized_timeframe not in {
-                _normalize_timeframe_key(raw_timeframe) for raw_timeframe in timeframes_payload
-            }:
-                continue
+        if (
+            isinstance(timeframes_payload, list)
+            and timeframes_payload
+            and normalized_timeframe
+            not in {_normalize_timeframe_key(raw) for raw in timeframes_payload}
+        ):
+            continue
 
         return file_path.stem.replace(".trades", "")
 
@@ -4536,7 +4537,6 @@ def _resolve_component_backtest_id(
     normalized_timeframe = _normalize_timeframe_key(timeframe)
 
     best_candidate = _latest_matching_cached_backtest(
-        strategy_name=strategy_name,
         strategy_entry=strategy_entry,
         normalized_strategy=normalized_strategy,
         normalized_symbol=normalized_symbol,
