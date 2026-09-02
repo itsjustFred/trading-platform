@@ -23,7 +23,6 @@ from typing import Any
 
 import pandas as pd
 
-from runner.engines import contract
 from runner.engines.base import (
     BacktestConfig,
     EngineAdapter,
@@ -35,69 +34,12 @@ from runner.engines.vectorbt_adapter import (
     _resolve_max_leverage,
     _resolve_max_position_pct,
 )
-from runner.stats import compute_stats_for_result
 from shared.constants import DATA_DIR
 from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, TradeExit
 
 logger = logging.getLogger(__name__)
 
 IndicatorMap = dict[str, tuple[pd.Series, str]]
-
-
-def _pyne_cli_end_bound(end_date: str) -> str:
-    """Translate a config end date into the ``pyne`` CLI's ``--to`` bound.
-
-    Conformance (Cleanup 16-A, F9): a date-only end boundary is inclusive of
-    the whole end day. The adapter's own parquet loader enforces that via
-    :func:`contract.apply_date_filter`, but the external ``pyne`` CLI applies
-    its own window: a date-only ``--to`` value is parsed with
-    ``datetime.fromisoformat`` into a **midnight** bound (bars stamped
-    ``01:00``–``23:00`` of the end date are dropped from the replay). Passing
-    the raw ``end_date`` through therefore re-introduces the exact
-    midnight-truncation the F9 Decision Record removed everywhere else, and
-    pyne's replay window becomes a strict subset of native/vectorbt's for the
-    same configuration.
-
-    A date-only end date is translated to the inclusive end-of-day instant
-    (``"2024-01-01"`` → ``"2024-01-01T23:59:59.999999+00:00"``), which the CLI
-    parses and applies as-is; a value that already carries a time component
-    already states the intended bound and is passed through unchanged.
-
-    Timezone note: the translated instant carries an explicit ``+00:00``
-    offset, so the CLI's host-TZ handling (see
-    :func:`_pyne_cli_start_bound`) can never shift it.
-    """
-    raw = str(end_date or "").strip()
-    if not raw:
-        return raw
-    if "T" not in raw and ":" not in raw:
-        return contract.parse_date_bound(raw, is_end=True).isoformat()
-    return raw
-
-
-def _pyne_cli_start_bound(start_date: str) -> str:
-    """Translate a config start date into the ``pyne`` CLI's ``--from`` bound.
-
-    Conformance (Cleanup 16-A, F9): naive timestamps are interpreted as UTC.
-    The CLI, however, parses ``--from`` with ``datetime.fromisoformat`` and
-    resolves the resulting NAIVE datetime through ``timestamp()`` — i.e. in
-    the HOST timezone. A date-only ``--from 2024-01-01`` therefore lands at
-    ``2024-01-01T05:00Z`` on an ``America/New_York`` host and silently drops
-    the first five UTC bars of the day (verified against pynesys-pynecore
-    6.8.14): the replay window would depend on where the adapter runs, not on
-    the configuration.
-
-    Translating the date-only start to an AWARE UTC start-of-day instant
-    (``"2024-01-01"`` → ``"2024-01-01T00:00:00+00:00"``) makes the bound
-    host-TZ independent; a value that already carries a time component
-    already states the intended bound and is passed through unchanged.
-    """
-    raw = str(start_date or "").strip()
-    if not raw:
-        return raw
-    if "T" not in raw and ":" not in raw:
-        return contract.parse_date_bound(raw, is_end=False).isoformat()
-    return raw
 
 
 class PyneCoreAdapter(EngineAdapter):
@@ -116,7 +58,6 @@ class PyneCoreAdapter(EngineAdapter):
         data_root = Path(config.data_dir) if config.data_dir else DATA_DIR
         resolved_parameters = resolve_strategy_parameters(strategy_path, config.parameters)
         all_trades: list[Trade] = []
-        all_equity: list[EquityPoint] = []
         all_stats: dict[str, Any] = {}
         all_drawings: list[dict[str, Any]] = []
         trade_counter = 0
@@ -134,154 +75,147 @@ class PyneCoreAdapter(EngineAdapter):
                 continue
 
             total_bars += len(df)
-            trade_context = _build_trade_context(context_builder, df, resolved_parameters)
-            asset_class = _infer_asset_class(data_root, symbol, config.timeframe)
-            trades: list[Trade] = []
-
-            with tempfile.TemporaryDirectory(prefix="pynecore_") as tmpdir:
-                tmpdir_path = Path(tmpdir)
-                workdir_path = tmpdir_path / "workdir"
-                workdir_path.mkdir()
-                strategy_copy_path = tmpdir_path / Path(strategy_path).name
-                strategy_copy_path.write_text(Path(strategy_path).read_text())
-
-                csv_path = tmpdir_path / f"{symbol}_{config.timeframe}.csv"
-                df[["timestamp", "open", "high", "low", "close", "volume"]].to_csv(
-                    csv_path,
-                    index=False,
-                )
-
-                trade_csv = tmpdir_path / "trades.csv"
-                stats_csv = tmpdir_path / "stats.csv"
-
-                pyne_bin = shutil.which("pyne")
-                if not pyne_bin:
-                    venv_bin = Path(sys.executable).parent / "pyne"
-                    if venv_bin.exists():
-                        pyne_bin = str(venv_bin)
-                    else:
-                        raise RuntimeError(
-                            "PyneCore CLI ('pyne') not found on PATH. "
-                            "Install with: pip install pynesys-pynecore"
-                        )
-
-                cmd = [
-                    pyne_bin,
-                    "--workdir",
-                    str(workdir_path),
-                    "run",
-                    str(strategy_copy_path),
-                    str(csv_path),
-                    "--trade",
-                    str(trade_csv),
-                    "--strat",
-                    str(stats_csv),
-                ]
-
-                if config.start_date:
-                    # Conformance (Cleanup 16-A, F9): naive timestamps are UTC —
-                    # a date-only start date must reach the CLI as an aware UTC
-                    # instant, not a host-TZ-naive string.
-                    cmd.extend(["--from", _pyne_cli_start_bound(config.start_date)])
-                if config.end_date:
-                    # Conformance (Cleanup 16-A, F9): a date-only end date must
-                    # not hit the CLI as a midnight bound — translate it to the
-                    # inclusive end-of-day instant so pyne replays the same
-                    # window as native/vectorbt.
-                    cmd.extend(["--to", _pyne_cli_end_bound(config.end_date)])
-
-                logger.info(
-                    "Running PyneCore: %s on %s (%d bars)", config.strategy_name, symbol, len(df)
-                )
-                try:
-                    result = subprocess.run(
-                        cmd,
-                        capture_output=True,
-                        text=True,
-                        cwd=str(tmpdir_path),
-                        timeout=300,
-                    )
-                except subprocess.TimeoutExpired as exc:
-                    raise RuntimeError(
-                        f"PyneCore run for {symbol} timed out after {exc.timeout} seconds"
-                    ) from exc
-
-                if result.returncode != 0:
-                    raise RuntimeError(
-                        f"PyneCore run failed for {config.strategy_name}/{symbol} "
-                        f"(exit code {result.returncode}): "
-                        f"{(result.stderr or result.stdout or '')[-2000:]}"
-                    )
-
-                if trade_csv.exists():
-                    trades = _parse_trade_csv(trade_csv, symbol, trade_counter)
-                    if trade_context:
-                        _enrich_trades_with_context(trades, trade_context, df)
-                    _normalize_trade_exits(trades)
-                    _apply_risk_sizing(trades, config, asset_class)
-                    trade_counter += len(trades)
-                    all_trades.extend(trades)
-
-                if stats_csv.exists():
-                    all_stats.update(_parse_stats_csv(stats_csv))
-
-            symbol_drawings = _build_drawings(
-                drawings_builder,
-                df,
-                resolved_parameters,
-                trades,
-                symbol,
+            trades, symbol_stats = self._run_pyne_for_symbol(
+                config, strategy_path, symbol, df, context_builder, trade_counter
             )
-            all_drawings.extend(symbol_drawings)
+            trade_counter += len(trades)
+            all_trades.extend(trades)
+            all_stats.update(symbol_stats)
 
-        equity = config.initial_capital
-        for trade in sorted(all_trades, key=lambda item: item.entry_time):
-            equity += trade.pnl
-            all_equity.append(EquityPoint(time=trade.entry_time, equity=round(equity, 2)))
+            all_drawings.extend(
+                _build_drawings(
+                    drawings_builder,
+                    df,
+                    resolved_parameters,
+                    trades,
+                    symbol,
+                )
+            )
 
-        duration_days = 0
-        try:
-            d_start = _date.fromisoformat(config.start_date)
-            d_end = _date.fromisoformat(config.end_date)
-            duration_days = (d_end - d_start).days
-        except (ValueError, TypeError):
-            pass
-
-        now = datetime.now(timezone.utc)
-        meta = BacktestMeta(
-            id=f"pyne-{config.strategy_name}-{now.strftime('%Y%m%d-%H%M%S')}",
-            created_at=now.isoformat(),
-            engine="pynecore",
-            strategies=[strategy_name],
-            backtest_start=config.start_date,
-            backtest_end=config.end_date,
-            duration_days=duration_days,
-            total_bars=total_bars,
-            data={
-                "timeframes": [config.timeframe],
-                "symbols": config.symbols,
-                "universe": "",
-                "source": "yfinance",
-            },
-            initial_capital=config.initial_capital,
-            parameters=resolved_parameters,
-        )
-
-        result = BacktestResult(
-            meta=meta,
+        return BacktestResult(
+            meta=_pyne_meta(config, strategy_name, resolved_parameters, total_bars),
             trades=all_trades,
-            equity_curve=all_equity,
+            equity_curve=_equity_curve_from_trades(config, all_trades),
             stats=all_stats,
             drawings=all_drawings,
         )
-        # Conformance (Cleanup 16-A): every engine exposes the canonical
-        # BacktestStats key set; the engine-specific strategy stats are merged
-        # on top of the derived ones. Contract §6: engine keys may add, never
-        # remove — canonical keys win a name collision.
-        result.stats = contract.EngineStatsKeys.merge_over_canonical(
-            compute_stats_for_result(result), result.stats
+
+    def _run_pyne_for_symbol(
+        self,
+        config: BacktestConfig,
+        strategy_path: str,
+        symbol: str,
+        df: Any,
+        context_builder: Any,
+        trade_counter: int,
+    ) -> tuple[list[Trade], dict[str, Any]]:
+        """Run the pyne CLI for one symbol and parse its trade/stats output."""
+        resolved_parameters = resolve_strategy_parameters(strategy_path, config.parameters)
+        trade_context = _build_trade_context(context_builder, df, resolved_parameters)
+        asset_class = _infer_asset_class(
+            Path(config.data_dir) if config.data_dir else DATA_DIR,
+            symbol,
+            config.timeframe,
         )
-        return result
+        trades: list[Trade] = []
+        stats: dict[str, Any] = {}
+
+        with tempfile.TemporaryDirectory(prefix="pynecore_") as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            workdir_path = tmpdir_path / "workdir"
+            workdir_path.mkdir()
+            strategy_copy_path = tmpdir_path / Path(strategy_path).name
+            strategy_copy_path.write_text(Path(strategy_path).read_text())
+
+            csv_path = tmpdir_path / f"{symbol}_{config.timeframe}.csv"
+            df[["timestamp", "open", "high", "low", "close", "volume"]].to_csv(
+                csv_path,
+                index=False,
+            )
+
+            trade_csv = tmpdir_path / "trades.csv"
+            stats_csv = tmpdir_path / "stats.csv"
+
+            self._run_pyne_cli(
+                config, symbol, strategy_copy_path, csv_path, trade_csv, stats_csv, workdir_path, tmpdir_path, len(df)
+            )
+
+            if trade_csv.exists():
+                trades = _parse_trade_csv(trade_csv, symbol, trade_counter)
+                if trade_context:
+                    _enrich_trades_with_context(trades, trade_context, df)
+                _normalize_trade_exits(trades)
+                _apply_risk_sizing(trades, config, asset_class)
+
+            if stats_csv.exists():
+                stats.update(_parse_stats_csv(stats_csv))
+
+        return trades, stats
+
+    def _run_pyne_cli(
+        self,
+        config: BacktestConfig,
+        symbol: str,
+        strategy_copy_path: Path,
+        csv_path: Path,
+        trade_csv: Path,
+        stats_csv: Path,
+        workdir_path: Path,
+        tmpdir_path: Path,
+        bar_count: int,
+    ) -> None:
+        """Invoke the pyne CLI once; a missing binary, non-zero exit or timeout
+        raises instead of degrading into an empty success."""
+        pyne_bin = shutil.which("pyne")
+        if not pyne_bin:
+            venv_bin = Path(sys.executable).parent / "pyne"
+            if venv_bin.exists():
+                pyne_bin = str(venv_bin)
+            else:
+                raise RuntimeError(
+                    "PyneCore CLI ('pyne') not found on PATH. "
+                    "Install with: pip install pynesys-pynecore"
+                )
+
+        cmd = [
+            pyne_bin,
+            "--workdir",
+            str(workdir_path),
+            "run",
+            str(strategy_copy_path),
+            str(csv_path),
+            "--trade",
+            str(trade_csv),
+            "--strat",
+            str(stats_csv),
+        ]
+        if config.start_date:
+            cmd.extend(["--from", config.start_date])
+        if config.end_date:
+            cmd.extend(["--to", config.end_date])
+
+        logger.info(
+            "Running PyneCore: %s on %s (%d bars)", config.strategy_name, symbol, bar_count
+        )
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                cwd=str(tmpdir_path),
+                timeout=300,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"PyneCore run for {symbol} timed out after {exc.timeout} seconds"
+            ) from exc
+
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"PyneCore run failed for {config.strategy_name}/{symbol} "
+                f"(exit code {result.returncode}): "
+                f"{(result.stderr or result.stdout or '')[-2000:]}"
+            )
 
     def validate_config(self, config: BacktestConfig) -> list[str]:
         errors = super().validate_config(config)
@@ -292,6 +226,52 @@ class PyneCoreAdapter(EngineAdapter):
                 "PyneCore not installed. Run: pip install pynesys-pynecore"
             )
         return errors
+
+
+def _equity_curve_from_trades(config: BacktestConfig, all_trades: list[Trade]) -> list[EquityPoint]:
+    """Build the equity curve from the merged, time-ordered trades."""
+    equity = config.initial_capital
+    curve: list[EquityPoint] = []
+    for trade in sorted(all_trades, key=lambda item: item.entry_time):
+        equity += trade.pnl
+        curve.append(EquityPoint(time=trade.entry_time, equity=round(equity, 2)))
+    return curve
+
+
+def _pyne_meta(
+    config: BacktestConfig,
+    strategy_name: str,
+    resolved_parameters: dict[str, Any],
+    total_bars: int,
+) -> BacktestMeta:
+    """Assemble the BacktestMeta for a pyne run."""
+    duration_days = 0
+    try:
+        d_start = _date.fromisoformat(config.start_date)
+        d_end = _date.fromisoformat(config.end_date)
+        duration_days = (d_end - d_start).days
+    except (ValueError, TypeError):
+        pass
+
+    now = datetime.now(timezone.utc)
+    return BacktestMeta(
+        id=f"pyne-{config.strategy_name}-{now.strftime('%Y%m%d-%H%M%S')}",
+        created_at=now.isoformat(),
+        engine="pynecore",
+        strategies=[strategy_name],
+        backtest_start=config.start_date,
+        backtest_end=config.end_date,
+        duration_days=duration_days,
+        total_bars=total_bars,
+        data={
+            "timeframes": [config.timeframe],
+            "symbols": config.symbols,
+            "universe": "",
+            "source": "yfinance",
+        },
+        initial_capital=config.initial_capital,
+        parameters=resolved_parameters,
+    )
 
 
 def _load_strategy_artifacts(path: str, fallback_name: str) -> tuple[str, Any, Any]:
@@ -610,9 +590,10 @@ def _load_ohlcv(
 
     if "timestamp" in df.columns:
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-        # Conformance (Cleanup 16-A): shared date-filter convention (F9) — a
-        # date-only end boundary is inclusive of the full day.
-        df = contract.apply_date_filter(df, start=start_date, end=end_date)
+        if start_date:
+            df = df[df["timestamp"] >= start_date]
+        if end_date:
+            df = df[df["timestamp"] <= end_date]
 
     return df.reset_index(drop=True)
 
