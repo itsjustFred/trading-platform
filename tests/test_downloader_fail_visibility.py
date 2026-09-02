@@ -358,6 +358,22 @@ class TestAtomicWriteTargetValidation:
         with pytest.raises(ValueError, match="symlink"):
             atomic_replace(target, lambda _p: None)
 
+    def test_write_rejects_sibling_symlink_name_trick(self, tmp_path):
+        """outside2 -> outside must be refused: the lexical prefix check alone
+        would let a sibling-named symlink redirect the write (CodeRabbit)."""
+        from shared.atomic_io import atomic_replace
+
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        sibling = tmp_path / "outside2"
+        sibling.symlink_to(outside)
+        target = sibling / "data.parquet"
+
+        with pytest.raises(ValueError, match="symlink"):
+            atomic_replace(target, lambda p: p.write_text("evil"))
+        assert not (outside / "data.parquet").exists()
+        assert list(tmp_path.rglob("*.tmp-*")) == []
+
     def test_write_allows_legitimate_target(self, tmp_path):
         from shared.atomic_io import atomic_replace
 

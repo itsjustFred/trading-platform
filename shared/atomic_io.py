@@ -19,31 +19,32 @@ T = TypeVar("T")
 # Sonar S8707 flags filesystem sinks fed by user-influenced values. The
 # validation below is the required "validate the constructed path before
 # accessing the file system": an anchored target with no ``..`` components
-# and no symlinked ancestor that escapes the intended directory. Relative
-# paths are anchored to the process working directory (CLI callers such as
-# ``resample --output out/`` or ``catalog_builder --output catalog.json``
-# pass relative paths), then resolved so crafted components cannot make the
-# write land outside the caller's intent.
+# and no symlinked ancestor at all. Relative paths are anchored to the
+# process working directory (CLI callers such as ``resample --output out/``
+# or ``catalog_builder --output catalog.json`` pass relative paths), then
+# normalized so crafted components cannot make the write land outside the
+# caller's intent.
 
 
 def _validated_target(path: Path) -> Path:
     """Validate the write target before any filesystem access (Sonar S8707).
 
     Anchors relative paths against the current working directory, then rejects
-    ``..`` traversal components and symlinked parents that redirect the write
-    outside the directory the caller named.
+    ``..`` traversal components and any symlinked parent, so the write can
+    never be redirected away from the directory the caller named.
     """
     raw = Path(path).expanduser()
     resolved = raw if raw.is_absolute() else Path.cwd() / raw
     resolved = Path(os.path.normpath(resolved))
     if ".." in raw.parts or ".." in resolved.parts:
         raise ValueError(f"atomic write target must not traverse upward: {resolved}")
-    # A symlinked directory could redirect the write outside the intended
-    # tree; resolving the parent (which follows symlinks) and requiring it to
-    # stay within the named parent catches that case.
+    # A symlinked directory could redirect the write to a different tree than
+    # the caller named; the parent must resolve to itself (no symlinked
+    # ancestors at all), so a sibling-name trick like outside2 -> outside is
+    # rejected as well.
     resolved_parent = resolved.parent
     real_parent = Path(os.path.realpath(resolved_parent))
-    if real_parent != resolved_parent and not str(resolved_parent).startswith(str(real_parent)):
+    if real_parent != resolved_parent:
         raise ValueError(
             f"atomic write target resolves through a symlink outside its parent: {resolved}"
         )
