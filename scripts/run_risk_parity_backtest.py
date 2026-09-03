@@ -230,6 +230,85 @@ def apply_tail_risk_hedge(weights: dict[str, float]) -> dict[str, float]:
     return hedged
 
 
+def _simulate_portfolio_value(
+    returns: pd.DataFrame,
+    initial_cash: float,
+    rebalance_schedule: dict[pd.Timestamp, dict[str, float]],
+) -> pd.Series:
+    """Walk the returns with rebalanced weights to build the portfolio value."""
+    portfolio_value = pd.Series(index=returns.index, dtype=float)
+    portfolio_value.iloc[0] = initial_cash
+    active_weights = {t: 0.0 for t in TICKERS}
+    for date in returns.index:
+        if date in rebalance_schedule:
+            active_weights = rebalance_schedule[date]
+        daily_ret = sum(active_weights[t] * returns[t].loc[date] for t in TICKERS)
+        prev_idx = returns.index.get_loc(date) - 1
+        if prev_idx >= 0:
+            portfolio_value.loc[date] = portfolio_value.iloc[prev_idx] * (1 + daily_ret)
+    return portfolio_value
+
+
+def _portfolio_performance_stats(
+    *,
+    portfolio_value: pd.Series,
+    trades: list[dict[str, Any]],
+    attribution_pnls: list[float],
+) -> dict[str, float]:
+    """Derive the raw return/risk/trade statistics from the simulated value."""
+    total_return = float(portfolio_value.iloc[-1] / portfolio_value.iloc[0] - 1)
+    equity_net_profit = float(portfolio_value.iloc[-1] - portfolio_value.iloc[0])
+    years = (portfolio_value.index[-1] - portfolio_value.index[0]).days / 365.25
+    cagr = float((portfolio_value.iloc[-1] / portfolio_value.iloc[0]) ** (1 / years) - 1)
+
+    port_returns = portfolio_value.pct_change().dropna()
+    vol_ann = float(port_returns.std() * np.sqrt(252))
+    sharpe = float((port_returns.mean() * 252) / (port_returns.std() * np.sqrt(252))) if vol_ann else 0.0
+    downside = port_returns[port_returns < 0]
+    sortino = float((port_returns.mean() * 252) / (downside.std() * np.sqrt(252))) if len(downside) and downside.std() > 0 else 0.0
+
+    rolling_max = portfolio_value.cummax()
+    drawdown = (portfolio_value - rolling_max) / rolling_max
+    max_drawdown = float(drawdown.min())
+
+    winning_trades = [t for t in trades if t["pnl"] > 0]
+    losing_trades = [t for t in trades if t["pnl"] < 0]
+    win_rate = len(winning_trades) / len(trades) if trades else 0.0
+    gross_profit = sum(t["pnl"] for t in winning_trades)
+    gross_loss = sum(t["pnl"] for t in losing_trades)
+    profit_factor = abs(gross_profit / gross_loss) if gross_loss else 0.0
+    realized_trade_net_profit = gross_profit + gross_loss
+    attribution_winners = [pnl for pnl in attribution_pnls if pnl > 0]
+    attribution_losers = [pnl for pnl in attribution_pnls if pnl < 0]
+    attribution_gross_profit = sum(attribution_winners)
+    attribution_gross_loss = sum(attribution_losers)
+    attribution_net_profit = attribution_gross_profit + attribution_gross_loss
+    attribution_win_rate = (
+        len(attribution_winners) / len(attribution_pnls)
+        if attribution_pnls
+        else 0.0
+    )
+    return {
+        "total_return": total_return,
+        "cagr": cagr,
+        "annualized_volatility": vol_ann,
+        "sharpe_ratio": sharpe,
+        "sortino_ratio": sortino,
+        "max_drawdown": max_drawdown,
+        "net_profit": equity_net_profit,
+        "realized_trade_net_profit": realized_trade_net_profit,
+        "gross_profit": gross_profit,
+        "gross_loss": gross_loss,
+        "profit_factor": profit_factor,
+        "win_rate": win_rate,
+        "rebalance_attribution_net_profit": attribution_net_profit,
+        "rebalance_attribution_gross_profit": attribution_gross_profit,
+        "rebalance_attribution_gross_loss": attribution_gross_loss,
+        "rebalance_attribution_win_rate": attribution_win_rate,
+        "total_trades": len(trades),
+    }
+
+
 def run_backtest(
     start_date: str = "2016-01-01",
     end_date: str = "2024-12-31",
@@ -403,69 +482,34 @@ def run_backtest(
         rebalance_schedule[reb_date] = dict(current_weights)
 
     # Build portfolio return series from held weights
-    portfolio_value = pd.Series(index=returns.index, dtype=float)
-    portfolio_value.iloc[0] = initial_cash
-    active_weights = {t: 0.0 for t in TICKERS}
-    for date in returns.index:
-        if date in rebalance_schedule:
-            active_weights = rebalance_schedule[date]
-        daily_ret = sum(active_weights[t] * returns[t].loc[date] for t in TICKERS)
-        prev_idx = returns.index.get_loc(date) - 1
-        if prev_idx >= 0:
-            portfolio_value.loc[date] = portfolio_value.iloc[prev_idx] * (1 + daily_ret)
-
-    total_return = float(portfolio_value.iloc[-1] / portfolio_value.iloc[0] - 1)
-    equity_net_profit = float(portfolio_value.iloc[-1] - portfolio_value.iloc[0])
-    years = (portfolio_value.index[-1] - portfolio_value.index[0]).days / 365.25
-    cagr = float((portfolio_value.iloc[-1] / portfolio_value.iloc[0]) ** (1 / years) - 1)
-
-    port_returns = portfolio_value.pct_change().dropna()
-    vol_ann = float(port_returns.std() * np.sqrt(252))
-    sharpe = float((port_returns.mean() * 252) / (port_returns.std() * np.sqrt(252))) if vol_ann else 0.0
-    downside = port_returns[port_returns < 0]
-    sortino = float((port_returns.mean() * 252) / (downside.std() * np.sqrt(252))) if len(downside) and downside.std() > 0 else 0.0
-
-    rolling_max = portfolio_value.cummax()
-    drawdown = (portfolio_value - rolling_max) / rolling_max
-    max_drawdown = float(drawdown.min())
-
-    winning_trades = [t for t in trades if t["pnl"] > 0]
-    losing_trades = [t for t in trades if t["pnl"] < 0]
-    win_rate = len(winning_trades) / len(trades) if trades else 0.0
-    gross_profit = sum(t["pnl"] for t in winning_trades)
-    gross_loss = sum(t["pnl"] for t in losing_trades)
-    profit_factor = abs(gross_profit / gross_loss) if gross_loss else 0.0
-    realized_trade_net_profit = gross_profit + gross_loss
-    attribution_winners = [pnl for pnl in rebalance_attribution_pnls if pnl > 0]
-    attribution_losers = [pnl for pnl in rebalance_attribution_pnls if pnl < 0]
-    attribution_gross_profit = sum(attribution_winners)
-    attribution_gross_loss = sum(attribution_losers)
-    attribution_net_profit = attribution_gross_profit + attribution_gross_loss
-    attribution_win_rate = (
-        len(attribution_winners) / len(rebalance_attribution_pnls)
-        if rebalance_attribution_pnls
-        else 0.0
+    portfolio_value = _simulate_portfolio_value(
+        returns, initial_cash, rebalance_schedule
+    )
+    stats = _portfolio_performance_stats(
+        portfolio_value=portfolio_value,
+        trades=trades,
+        attribution_pnls=rebalance_attribution_pnls,
     )
 
     stats = {
-        "total_return": round(total_return, 6),
-        "cagr": round(cagr, 6),
-        "annualized_volatility": round(vol_ann, 6),
-        "sharpe_ratio": round(sharpe, 6),
-        "sortino_ratio": round(sortino, 6),
-        "max_drawdown": round(max_drawdown, 6),
-        "max_drawdown_pct": round(max_drawdown * 100, 6),
-        "net_profit": round(equity_net_profit, 2),
-        "realized_trade_net_profit": round(realized_trade_net_profit, 2),
-        "gross_profit": round(gross_profit, 2),
-        "gross_loss": round(gross_loss, 2),
-        "profit_factor": round(profit_factor, 6),
-        "win_rate": round(win_rate, 6),
-        "rebalance_attribution_net_profit": round(attribution_net_profit, 2),
-        "rebalance_attribution_gross_profit": round(attribution_gross_profit, 2),
-        "rebalance_attribution_gross_loss": round(attribution_gross_loss, 2),
-        "rebalance_attribution_win_rate": round(attribution_win_rate, 6),
-        "total_trades": len(trades),
+        "total_return": round(stats["total_return"], 6),
+        "cagr": round(stats["cagr"], 6),
+        "annualized_volatility": round(stats["annualized_volatility"], 6),
+        "sharpe_ratio": round(stats["sharpe_ratio"], 6),
+        "sortino_ratio": round(stats["sortino_ratio"], 6),
+        "max_drawdown": round(stats["max_drawdown"], 6),
+        "max_drawdown_pct": round(stats["max_drawdown"] * 100, 6),
+        "net_profit": round(stats["net_profit"], 2),
+        "realized_trade_net_profit": round(stats["realized_trade_net_profit"], 2),
+        "gross_profit": round(stats["gross_profit"], 2),
+        "gross_loss": round(stats["gross_loss"], 2),
+        "profit_factor": round(stats["profit_factor"], 6),
+        "win_rate": round(stats["win_rate"], 6),
+        "rebalance_attribution_net_profit": round(stats["rebalance_attribution_net_profit"], 2),
+        "rebalance_attribution_gross_profit": round(stats["rebalance_attribution_gross_profit"], 2),
+        "rebalance_attribution_gross_loss": round(stats["rebalance_attribution_gross_loss"], 2),
+        "rebalance_attribution_win_rate": round(stats["rebalance_attribution_win_rate"], 6),
+        "total_trades": stats["total_trades"],
     }
 
     return {
