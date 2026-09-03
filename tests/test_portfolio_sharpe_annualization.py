@@ -210,3 +210,124 @@ def _curves_from_times(times: list[int]):
         ]
         for _ in range(2)
     ]
+
+
+class TestMultiSymbolSettlement:
+    """CodeRabbit round: protective exits settle for ALL symbols, not just
+    the signaled one, before sizing equity is computed."""
+
+    def test_cross_symbol_stop_out_realizes_before_sizing(self):
+        """A stop-out on ANOTHER symbol must reduce the sizing balance.
+
+        Deterministic setup: PROBE (long 1000 @ 100) stopped at 80 → realized
+        −20_000; the open position is removed, so sizing for a GOLD1 signal
+        sees capital − 20k realized and no PROBE MTM leg.
+        """
+        adapter = SignalReplayAdapter(
+            risk_config=RiskConfig(max_risk_per_trade=0.01, max_total_exposure=1.0),
+            initial_capital=100_000.0,
+        )
+        captured: dict[str, object] = {}
+
+        class _FakeRiskEngine:
+            def calculate_position_size(self, signal, account_balance, pip_value, current_exposure):
+                captured["balance"] = account_balance
+                captured["positions"] = len(signal.metadata.get("current_positions", {}))
+                return _FakeSized(1.0)
+
+        adapter.risk_engine = _FakeRiskEngine()
+
+        timestamps = pd.date_range("2024-01-01", periods=6, freq="h", tz="UTC")
+
+        def make_frame(closes):
+            return pd.DataFrame(
+                {
+                    "timestamp": timestamps,
+                    "open": closes,
+                    "high": [c + 1.0 for c in closes],
+                    "low": [c - 1.0 for c in closes],
+                    "close": closes,
+                    "volume": [1000.0] * len(closes),
+                }
+            )
+
+        # PROBE: crashes through the 80 stop on bar 2 (t=02:00).
+        probe_frame = make_frame([100.0, 95.0, 79.0, 79.0, 79.0, 79.0])
+        gold_frame = make_frame([100.0, 100.0, 100.0, 100.0, 100.0, 100.0])
+        frames = {"PROBE": probe_frame, "GOLD1": gold_frame}
+
+        open_positions = {
+            "PROBE": _OpenPosition(
+                symbol="PROBE",
+                direction="LONG",
+                entry_time=timestamps[0],
+                entry_bar_index=0,
+                entry_price=100.0,
+                signal_entry_price=100.0,
+                quantity=1000.0,
+                stop_loss=80.0,
+                take_profit=None,
+                initial_stop_loss=80.0,
+                initial_take_profit=None,
+                risk_amount=None,
+                risk_percent=None,
+                timeframe="1h",
+                source="internal",
+                signal_time=timestamps[0],
+                signal_metadata={},
+                last_checked_at=timestamps[0],
+            )
+        }
+
+        # Post-settlement state (the run loop pops the stopped-out symbol
+        # BEFORE sizing): PROBE removed, its −20k stop-out realized.
+        sizing_balance = adapter._sizing_account_balance(
+            open_positions={},
+            realized_pnl=-20_000.0,
+            frames=frames,
+            as_of=timestamps[3],
+        )
+        assert sizing_balance == pytest.approx(80_000.0), (
+            "sizing must see the realized stop-out loss exactly once; if the "
+            "stopped-out position were still open in the balance, the loss "
+            "would double-count (−40k total)"
+        )
+        # Pre-settlement state (the bug): position still open → MTM leg adds
+        # another −21k, i.e. the loss double-counts.
+        pre_settlement = adapter._sizing_account_balance(
+            open_positions=open_positions,
+            realized_pnl=-20_000.0,
+            frames=frames,
+            as_of=timestamps[3],
+        )
+        assert pre_settlement == pytest.approx(59_000.0), (
+            "sanity: keeping the stopped-out position open double-counts the "
+            "loss — which is exactly why the loop must settle first"
+        )
+
+
+class TestCoarserThanDailyCadence:
+    """CodeRabbit round: weekly/biweekly cadences scale, they don't map to 252."""
+
+    def test_weekly_cadence_annualizes_with_52(self):
+        """A weekly equity curve must annualize with ~52, not 252.
+
+        Pins the CodeRabbit-discussed boundary: mapping anything coarser than
+        daily onto 252 would overstate a weekly Sharpe by sqrt(252/52) ≈ 2.2x.
+        """
+        times = list(range(1_700_000_000, 1_700_000_000 + 300 * 7 * 86_400, 7 * 86_400))
+        portfolio_optimizer._record_portfolio_timestamps(
+            _curves_from_times(times), times
+        )
+        try:
+            equity = np.array([100_000.0 * (1 + 0.002 * math.sin(i)) for i in range(300)])
+            matrix = equity.reshape(-1, 1)
+            sharpe, _ = _portfolio_sharpe_from_weights(np.array([1.0]), matrix)
+            returns = np.diff(equity) / equity[:-1]
+            per_obs = float(np.mean(returns) / (np.std(returns) + 1e-10))
+            assert sharpe == pytest.approx(per_obs * math.sqrt(52.178571), rel=1e-3), (
+                "weekly curves must annualize with the weekly period count "
+                "(~52), not the 252 daily convention"
+            )
+        finally:
+            portfolio_optimizer._LAST_PORTFOLIO_TIMESTAMPS.clear()

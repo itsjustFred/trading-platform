@@ -13,9 +13,8 @@ Walk-Forward (WF) Validierung ist ein Stabilitäts-Mechanismus, der eine Strateg
 > im Sinne einer Parametervalidierung. Für echte Anti-Overfitting-Validierung
 > muss der Parametersatz vor dem Test-Fenster per Optimierung (z. B.
 > `runner.optimizer` mit `train_period` der Fold) je Fold gewählt werden;
-> das ist nicht implementiert. Die README-Beschreibung ("Anti-overfitting
-> validation") ist diesbezüglich zu lesen als "Stabilitätsvalidierung mit
-> Train/Test-Splits".
+> das ist nicht implementiert. Diese Datei beschreibt die Messung daher als Stabilitätsvalidierung mit
+> Train/Test-Splits — nicht als Anti-Overfitting-Validierung.
 
 **Ziel:** Sicherstellen, dass eine Strategie auch Out-of-Sample stabil profitabel ist, bevor sie live geht.
 

@@ -73,7 +73,7 @@ class TestSignalMergeElementWise:
         price. The element-wise overlay keeps ``row["close"]`` authoritative.
         """
         frame = _linear_frame()
-        strategy = lambda df, params: (
+        strategy = lambda df, params: (  # noqa: E731
             pd.Series([True] + [False] * (len(df) - 1), index=df.index),
             pd.Series([False] * len(df), index=df.index),
             {"close": pd.Series([9.99] * len(df), index=df.index)},
@@ -99,7 +99,7 @@ class TestSignalMergeElementWise:
             captured["row"] = row
             return original_extract(self, row)
 
-        strategy = lambda df, params: (
+        strategy = lambda df, params: (  # noqa: E731
             pd.Series([True] + [False] * (len(df) - 1), index=df.index),
             pd.Series([False] * len(df), index=df.index),
             {"close": pd.Series([1.0] * len(df), index=df.index),
@@ -146,7 +146,8 @@ class TestSizingEquityExcludesUnrealizedPnl:
         entries.iloc[0] = True
         entries.iloc[2] = True
         exits = pd.Series([False] * len(frame), index=frame.index)
-        strategy = lambda df, params: (entries, exits)
+        strategy = lambda df, params: (  # noqa: E731
+        entries, exits)
 
         engine = TradeEngine(_config(Path("/tmp")), symbol="PROBE")
         engine.run(frame, strategy)
@@ -174,7 +175,8 @@ class TestSizingEquityExcludesUnrealizedPnl:
         entries.iloc[0] = True
         entries.iloc[2] = True
         exits = pd.Series([False] * len(frame), index=frame.index)
-        strategy = lambda df, params: (entries, exits)
+        strategy = lambda df, params: (  # noqa: E731
+        entries, exits)
 
         engine = TradeEngine(_config(Path("/tmp")), symbol="PROBE")
         engine.run(frame, strategy)
@@ -231,7 +233,8 @@ class TestOrderTypeSizingSemantics:
         entries = pd.Series([False] * len(frame), index=frame.index)
         entries.iloc[0] = True
         exits = pd.Series([False] * len(frame), index=frame.index)
-        strategy = lambda df, params: (entries, exits)
+        strategy = lambda df, params: (  # noqa: E731
+        entries, exits)
 
         engine = TradeEngine(_config(Path("/tmp")), symbol="PROBE")
 
@@ -288,7 +291,8 @@ class TestOrderTypeSizingSemantics:
         entries = pd.Series([False] * len(frame), index=frame.index)
         entries.iloc[0] = True
         exits = pd.Series([False] * len(frame), index=frame.index)
-        strategy = lambda df, params: (entries, exits)  # noqa: E731
+        strategy = lambda df, params: (  # noqa: E731
+        entries, exits)  # noqa: E731
 
         engine = TradeEngine(_config(Path("/tmp")), symbol="PROBE")
         original_fill = engine._fill_pending_orders
@@ -340,7 +344,8 @@ class TestOrderTypeSizingSemantics:
         frame = _linear_frame(4)
         entries = pd.Series([True] + [False] * 3, index=frame.index)
         exits = pd.Series([False] * 4, index=frame.index)
-        strategy = lambda df, params: (entries, exits)  # noqa: E731
+        strategy = lambda df, params: (  # noqa: E731
+        entries, exits)  # noqa: E731
 
         engine = TradeEngine(_config(Path("/tmp")), symbol="PROBE")
         engine.run(frame, strategy)
@@ -367,7 +372,8 @@ class TestReportingEquityCurve:
         frame = _linear_frame(6)
         entries = pd.Series([True] + [False] * 5, index=frame.index)
         exits = pd.Series([False] * 6, index=frame.index)
-        strategy = lambda df, params: (entries, exits)  # noqa: E731
+        strategy = lambda df, params: (  # noqa: E731
+        entries, exits)  # noqa: E731
 
         engine = TradeEngine(_config(Path("/tmp")), symbol="PROBE")
         engine.run(frame, strategy)
@@ -387,7 +393,8 @@ class TestReportingEquityCurve:
         frame = _linear_frame(3)
         entries = pd.Series([True] + [False] * 2, index=frame.index)
         exits = pd.Series([False] * 3, index=frame.index)
-        strategy = lambda df, params: (entries, exits)  # noqa: E731
+        strategy = lambda df, params: (  # noqa: E731
+        entries, exits)  # noqa: E731
 
         engine = TradeEngine(_config(Path("/tmp")), symbol="PROBE")
         engine.run(frame, strategy)
@@ -395,3 +402,50 @@ class TestReportingEquityCurve:
         assert engine.equity_curve[0].equity == pytest.approx(100_000.0), (
             "bar-0 equity must be exactly the initial capital (no seeding drift)"
         )
+
+
+class TestSignalMergeOhlcvAuthority:
+    """CodeRabbit round: OHLCV values are authoritative over signal values."""
+
+    def test_signal_value_never_overwrites_non_na_ohlcv_value(self):
+        """A signal column matching an OHLCV label must not change its value.
+
+        combine_first takes the left (OHLCV) value whenever it is non-NaN, so
+        the only path for a signal value into an OHLCV label is a NaN bar
+        value — and `_prepare`/`dropna` guarantees those never reach the loop.
+        Pinned here so a future merge change cannot silently invert authority.
+        """
+        frame = _linear_frame(4)
+        strategy = lambda df, params: (  # noqa: E731  # noqa: E731
+            pd.Series([True] + [False] * 3, index=df.index),
+            pd.Series([False] * 4, index=df.index),
+            {"close": pd.Series([9.99] * 4, index=df.index),
+             "high": pd.Series([-1.0] * 4, index=df.index)},
+        )
+
+        captured: dict[str, pd.Series] = {}
+        original = TradeEngine._extract_levels
+
+        def spy(self, row):
+            captured["row"] = row
+            return original(self, row)
+
+        TradeEngine._extract_levels = spy  # type: ignore[method-assign]
+        try:
+            engine = TradeEngine(_config(Path("/tmp")), symbol="PROBE")
+            engine.run(frame, strategy)
+        finally:
+            TradeEngine._extract_levels = original  # type: ignore[method-assign]
+
+        row = captured["row"]
+        assert row["close"] == pytest.approx(frame.iloc[0]["close"]), (
+            "the signal 'close' must not overwrite the OHLCV close"
+        )
+        assert row["high"] == pytest.approx(frame.iloc[0]["high"]), (
+            "the signal 'high' must not overwrite the OHLCV high"
+        )
+        # The engine's direction is resolved from the merged row via
+        # _resolve_direction, which defaults to LONG for missing labels —
+        # signal-only columns still surface, but never at the cost of an
+        # OHLCV value.
+        assert row.get("direction", "LONG") in ("LONG", "SHORT")

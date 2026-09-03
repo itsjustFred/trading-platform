@@ -295,6 +295,12 @@ def _infer_portfolio_periods_per_year(equity_matrix: np.ndarray) -> float:
     # comparable with stats.py's daily Sharpe.
     if 350.0 <= periods_per_year <= 380.0:
         return PORTFOLIO_PERIODS_PER_YEAR_DEFAULT
+    # Coarser-than-daily cadences (weekly ≈ 52, biweekly ≈ 26, monthly ≈ 12)
+    # are legitimate period counts and scale proportionally — sqrt(52) for a
+    # weekly curve is the correct annualization, NOT 252 (CodeRabbit round:
+    # the earlier framing suggested anything above ~8.7h should collapse to
+    # 252, which would misstate weekly Sharpe by sqrt(252/52) ≈ 2.2x).
+    # Sub-daily cadences scale too, bounded by the ceiling below.
     return float(min(periods_per_year, PORTFOLIO_PERIODS_PER_YEAR_DEFAULT * 4))
 
 

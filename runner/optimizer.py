@@ -83,11 +83,15 @@ def _no_trade_penalty_value(completed_trading_values: list[float]) -> float:
 
 
 def _best_trial_or_raise(study: optuna.Study) -> optuna.trial.FrozenTrial:
-    """Return the best completed trial, raising a clear error when none exist.
+    """Return the best completed TRADING trial, raising when none exist.
 
     ``study.best_trial`` raises an opaque Optuna ValueError when every trial
     failed (e.g. bad parameter ranges) — surfacing that as a plain message
     keeps the failure distinguishable from "no valid parameter region".
+
+    No-trade (penalized) trials are excluded from selection (Cleanup 16-D1,
+    AC 2): a study whose completed trials are ALL no-trade trials must not
+    hand back a no-trade parameter set as "best".
     """
     completed = study.get_trials(
         deepcopy=False, states=(optuna.trial.TrialState.COMPLETE,)
@@ -97,7 +101,18 @@ def _best_trial_or_raise(study: optuna.Study) -> optuna.trial.FrozenTrial:
             "Optimization produced no completed trials — every trial failed. "
             "Check parameter_ranges/target_metric before retrying."
         )
-    return max(completed, key=lambda trial: float(trial.value or 0.0))
+    trading_trials = [
+        trial
+        for trial in completed
+        if not bool(trial.user_attrs.get("penalty_applied", False))
+    ]
+    if not trading_trials:
+        raise RuntimeError(
+            "Every completed optimization trial was a no-trade trial — no "
+            "parameter region produced trades. Widen parameter_ranges or "
+            "relax position-sizing constraints before retrying."
+        )
+    return max(trading_trials, key=lambda trial: float(trial.value or 0.0))
 
 
 class OptimizationConfig(BaseModel):
@@ -406,13 +421,14 @@ def run_optimization(
     best_trial = _best_trial_or_raise(study)
     best_params = {
         key: value
-        for key, value in dict(study.best_params).items()
+        for key, value in dict(best_trial.params).items()
         if key != _INTERNAL_SYMBOL_UNIVERSE_PARAM
     }
     best_symbols = list(best_trial.user_attrs.get("symbols") or symbols)
     effective_best_params = dict(base_parameters)
     effective_best_params.update(best_params)
     best_train_stats = dict(best_trial.user_attrs.get("train_stats") or {})
+    best_value = best_trial.value
 
     test_result = _run_vectorbt_backtest(
         BacktestConfig(
@@ -454,7 +470,7 @@ def run_optimization(
         "base_parameters": _json_safe(base_parameters),
         "best_params": _json_safe(best_params),
         "effective_best_parameters": _json_safe(effective_best_params),
-        "best_value": _safe_float_or_none(study.best_value),
+        "best_value": _safe_float_or_none(best_value),
         "train_period": train_period,
         "test_period": test_period,
         "train_stats": _json_safe(best_train_stats),

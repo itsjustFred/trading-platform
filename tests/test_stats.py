@@ -300,17 +300,19 @@ class TestCalmarAndQsFallback:
         total return — the two diverge whenever the equity curve's cadence
         differs from 252 points/year.
         """
-        # 2 years of flat-then-pump equity: CAGR ~ sqrt(1.5)-1 ≈ 22.5%
+        # 2 years with a genuine drawdown (peak → -20% trough → recovery → pump)
         equity = [
             EquityPoint(time="2022-01-01T00:00:00+00:00", equity=100_000.0),
+            EquityPoint(time="2022-07-01T00:00:00+00:00", equity=80_000.0),
             EquityPoint(time="2023-01-01T00:00:00+00:00", equity=100_000.0),
             EquityPoint(time="2024-01-01T00:00:00+00:00", equity=150_000.0),
         ]
         stats = compute_stats([], equity_curve=equity)
-        if stats["max_drawdown_pct"] == 0:
-            pytest.skip("fixture needs a drawdown")
+        assert stats["max_drawdown_pct"] != 0, "fixture must contain a drawdown"
         expected_calmar = stats["cagr"] / abs(stats["max_drawdown_pct"])
-        assert stats["calmar_ratio"] == pytest.approx(expected_calmar, rel=1e-6), (
+        # Output values are rounded (calmar 4dp, cagr 6dp); allow the
+        # recomputed ratio to differ by the rounding slack.
+        assert stats["calmar_ratio"] == pytest.approx(expected_calmar, abs=2e-4), (
             "calmar_ratio must equal cagr / |max_drawdown_pct| (elapsed-time "
             "definition, shared by both code paths)"
         )

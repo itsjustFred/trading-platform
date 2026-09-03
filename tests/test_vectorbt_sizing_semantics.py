@@ -175,6 +175,10 @@ class TestPortfolioEquityCurveSemantics:
 
         equity_by_time = {point.time: point.equity for point in result.equity_curve}
         initial = config.initial_capital
+        exit_times = {str(trade.last_exit_time) for trade in result.trades}
+        assert set(equity_by_time) <= exit_times, (
+            "curve points must be stamped only at exit times"
+        )
         for trade in result.trades:
             entry_time = str(trade.entry_time)
             # Entry timestamps that carry a curve point must still be at
@@ -222,9 +226,9 @@ class TestPortfolioEquityCurveSemantics:
         # A's first exit by clipping the slow SMA's window (shorter series →
         # earlier crossing) — guaranteed exit-time interleave.
         _write_ohlcv(tmp_path, "VSA", base)
-        early = base.iloc[: base.index[-1]].copy()
-        early = early.iloc[: len(base) - 10]
-        _write_ohlcv(tmp_path, "VSB", early)
+        # Symbol B: last 10 bars truncated, so B's final exit lands before
+        # A's — guaranteed exit-time interleave.
+        _write_ohlcv(tmp_path, "VSB", base.iloc[:-10].copy())
 
         config = _config(
             tmp_path,
@@ -239,12 +243,9 @@ class TestPortfolioEquityCurveSemantics:
             "equity-curve timestamps must be non-decreasing even when trades "
             "on different symbols exit interleaved"
         )
-        # PnL must be credited in exit order, not entry order: the LAST curve
-        # point must equal capital + the sum of every trade's PnL, and each
-        # distinct exit time must show the cumulative realized PnL of all
-        # trades that closed at or before it.
-        from collections import defaultdict
-
+        # PnL must be credited in exit order, not entry order: each distinct
+        # exit time shows the cumulative realized PnL of everything closed at
+        # or before it, and the last point equals capital + all PnL.
         equity_by_time: dict[str, float] = {}
         for point in result.equity_curve:
             equity_by_time[point.time] = point.equity  # last write per timestamp
@@ -253,24 +254,23 @@ class TestPortfolioEquityCurveSemantics:
             {str(trade.last_exit_time) for trade in result.trades}
         )
         cumulative = config.initial_capital
-        index_by_trade = {str(t.last_exit_time): [] for t in result.trades}
+        trades_by_exit_time: dict[str, list] = {
+            str(t.last_exit_time): [] for t in result.trades
+        }
         for trade in sorted(result.trades, key=lambda item: item.last_exit_time):
-            index_by_trade[str(trade.last_exit_time)].append(trade)
+            trades_by_exit_time[str(trade.last_exit_time)].append(trade)
         for exit_time in exits_in_order:
-            for trade in index_by_trade[exit_time]:
+            for trade in trades_by_exit_time[exit_time]:
                 cumulative += trade.pnl
-            # A point stamped exactly at this exit time (or, when several
-            # exits share a timestamp, the last one) carries the cumulative
-            # realized PnL of everything closed so far. Points for later
-            # exits must never be lower-credited at an earlier stamp.
+            assert exit_time in equity_by_time, f"missing curve point at {exit_time}"
+            assert equity_by_time[exit_time] == pytest.approx(
+                round(cumulative, 2), rel=1e-6
+            )
         final_point = result.equity_curve[-1]
         assert final_point.equity == pytest.approx(round(cumulative, 2), rel=1e-6), (
             "the last curve point must equal capital plus the realized PnL of "
             "every trade, credited in exit order"
         )
-        # Monotone equity when cumulative PnL at each stamp is non-decreasing
-        # is implied by the timestamp sort above; sanity-check the mapping.
-        assert set(equity_by_time) == set(exits_in_order) or set(equity_by_time) <= set(exits_in_order)
 
 
 # ─── Risk-target sizing math (mutation hardening) ───────────────────────────

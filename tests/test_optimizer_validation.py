@@ -271,3 +271,45 @@ class TestPenaltyMarginAndEmptyStudy:
 
         with pytest.raises(RuntimeError, match="no completed trials"):
             optimizer_module._best_trial_or_raise(study)
+
+
+class TestBestTrialExcludesNoTrade:
+    """CodeRabbit round: best-trial selection must skip penalized trials."""
+
+    def _study_with_trials(self, monkeypatch, completed_values_and_penalties):
+        import optuna
+
+        study = optuna.create_study(direction="maximize")
+        for value, penalized in completed_values_and_penalties:
+            trial = study.ask()
+            trial.suggest_float("x", 0.0, 1.0)
+            if penalized:
+                trial.set_user_attr("penalty_applied", True)
+            study.tell(trial, value)
+        return study
+
+    def test_all_no_trade_trials_raise_instead_of_returning_penalized_best(self):
+        """A study of only no-trade trials must fail loudly, not select one.
+
+        Kills the CodeRabbit major: previously the best-trial selection
+        ignored the penalty marker, so a study that never traded handed its
+        (penalized) parameter set back as the winner with a fabricated
+        best_value of −1e9.
+        """
+        study = self._study_with_trials(
+            None, [(-1e9, True), (-1e9, True)]
+        )
+        with pytest.raises(RuntimeError, match="no-trade"):
+            optimizer_module._best_trial_or_raise(study)
+
+    def test_best_trial_is_best_trading_trial_not_global_best(self):
+        """With a penalized trial scoring highest, the best TRADING one wins.
+
+        Only possible through a resumed/foreign study where a penalized trial
+        holds a high value; the selection must still skip it.
+        """
+        study = self._study_with_trials(
+            None, [(5.0, True), (0.5, False), (0.1, False)]
+        )
+        best = optimizer_module._best_trial_or_raise(study)
+        assert best.value == pytest.approx(0.5)

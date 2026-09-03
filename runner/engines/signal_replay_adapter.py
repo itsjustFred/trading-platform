@@ -506,6 +506,28 @@ class SignalReplayAdapter:
             if effective_signal is None:
                 emit(10.0 + ((index / total_signals) * 80.0), "Replaying signals...")
                 continue
+            # Settle protective exits for ALL open positions up to this
+            # signal's fill time (CodeRabbit round): previously only the
+            # signaled symbol's position was settled, so a stop-out on another
+            # symbol stayed unrealized in the sizing balance until an unrelated
+            # signal for that symbol arrived — inflating sizing equity during
+            # multi-symbol drawdowns.
+            settled_symbols: list[str] = []
+            for symbol, position in open_positions.items():
+                if symbol == signal.symbol:
+                    continue
+                protected_exit = self._process_protective_exits(
+                    position=position,
+                    frame=frames[symbol],
+                    end_timestamp=effective_signal.timestamp,
+                )
+                if protected_exit is not None:
+                    closed_trades.append(protected_exit)
+                    realized_pnl += float(protected_exit.pnl)
+                    settled_symbols.append(symbol)
+            for symbol in settled_symbols:
+                open_positions.pop(symbol, None)
+
             current_position = open_positions.get(signal.symbol)
             if current_position is not None:
                 protected_exit = self._process_protective_exits(
