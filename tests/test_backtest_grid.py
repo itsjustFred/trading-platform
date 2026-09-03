@@ -401,4 +401,5 @@ def test_grid_tasks_carry_keep_indicators(tmp_path, monkeypatch):
         max_workers=1, keep_indicators=True,
     )
 
-    assert captured and all(cell["keep_indicators"] is True for cell in captured)
+    assert captured
+    assert all(cell["keep_indicators"] is True for cell in captured)
