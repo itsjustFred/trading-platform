@@ -2717,15 +2717,9 @@ def test_alpaca_entry_guard_still_blocks_naked_non_exit_orders():
         metadata={"qty": 2.0},
     )
 
-    builder = adapter._build_order_request
+    resolve = adapter._resolve_broker_sl_tp
     with pytest.raises(ValueError, match="without stop_loss"):
-        builder(
-            signal,
-            qty=2.0,
-            order_side=SimpleNamespace(BUY="buy", SELL="sell"),
-            time_in_force=SimpleNamespace(DAY="day"),
-            market_request_cls=lambda **kwargs: ("market", kwargs),
-            client_order_id="cid-naked-entry",
+        resolve(signal)
         )
 
 
