@@ -205,6 +205,65 @@ def test_size_live_signal_uses_fallback_stop_when_missing():
     assert signal.metadata["resolved_stop_loss"] == pytest.approx(98.0)
 
 
+def test_size_live_signal_reduce_only_flattens_broker_qty_ignoring_metadata():
+    """The trusted reduce-only path takes its quantity from the caller's broker
+    position list — payload qty/explicit_qty are ignored and stripped."""
+    signal = _signal(
+        {
+            "entry_price": 100.0,
+            "timeframe": "1m",
+            "qty": 500,
+            "explicit_qty": 500,
+            "risk_sizing_mode": "flatten",
+        }
+    )
+
+    sized = size_live_signal(
+        signal,
+        account_balance=10000.0,
+        reduce_only=True,
+        reduce_only_qty=7.0,
+    )
+
+    assert sized.position_size == pytest.approx(7.0)
+    assert signal.metadata["qty"] == pytest.approx(7.0)
+    assert "explicit_qty" not in signal.metadata
+    assert signal.metadata["risk_sizing_mode"] == "reduce_only"
+    assert signal.metadata["risk_rejected"] is False
+    assert signal.metadata["risk_amount"] == 0.0
+
+
+def test_size_live_signal_reduce_only_clamps_to_notional_ceiling():
+    signal = _signal({"entry_price": 100.0, "timeframe": "1m"})
+
+    sized = size_live_signal(
+        signal,
+        account_balance=10000.0,
+        reduce_only=True,
+        reduce_only_qty=1000.0,
+    )
+
+    # Even the internal flatten cannot exceed 0.2 * 10k = 2000 notional.
+    assert sized.position_size == pytest.approx(20.0)
+    assert signal.metadata["qty"] == pytest.approx(20.0)
+
+
+def test_size_live_signal_reduce_only_zero_qty_is_rejected():
+    signal = _signal({"entry_price": 100.0, "timeframe": "1m"})
+
+    sized = size_live_signal(
+        signal,
+        account_balance=10000.0,
+        reduce_only=True,
+        reduce_only_qty=0.0,
+    )
+
+    assert sized.position_size == 0.0
+    assert signal.metadata["risk_rejected"] is True
+    assert signal.metadata["risk_rejection_reason"] == "reduce_only_zero_qty"
+    assert signal.metadata["risk_sizing_mode"] == "reduce_only_blocked"
+
+
 def test_risk_config_rejects_non_positive_notional_cap():
     """The notional bound is a hard policy knob, not an optional hint."""
     with pytest.raises(ValueError, match="max_notional_per_trade"):

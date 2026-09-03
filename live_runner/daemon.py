@@ -600,25 +600,6 @@ def _resolve_exit_only_target_qty(
     return target_qty
 
 
-async def _metadata_for_exit_only_order(
-    signal: LiveSignal,
-    adapter: BaseLiveAdapter,
-    metadata: dict[str, object],
-) -> dict[str, object]:
-    get_positions = getattr(adapter, "get_positions", None)
-    if not callable(get_positions):
-        raise ValueError("Exit-only signal requires broker adapter with get_positions support")
-    positions = await get_positions()
-    target_qty = _resolve_exit_only_target_qty(positions, signal.symbol)
-    if target_qty <= 0:
-        raise ValueError(
-            f"Exit-only signal received for {signal.symbol} but no long position is open"
-        )
-    metadata["explicit_qty"] = float(target_qty)
-    metadata["risk_sizing_mode"] = "exit_only"
-    return metadata
-
-
 def _count_open_broker_positions(positions: Iterable[Mapping[str, object]]) -> int:
     open_positions_count = 0
     for position in positions:
