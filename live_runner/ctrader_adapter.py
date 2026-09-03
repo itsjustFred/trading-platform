@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
+import math
 import os
 import tempfile
 import time
@@ -1490,7 +1491,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         """cTrader expects absolute prices; digits conversion is handled by the
         server for absolute SL/TP on NewOrderReq. Keep the price as provided but
         validate it is finite and positive."""
-        if not price > 0 or price != price or price in (float("inf"), float("-inf")):
+        if math.isnan(price) or math.isinf(price) or price <= 0:
             raise ValueError(
                 f"Invalid SL/TP price for {symbol}: {price!r}; refusing to submit."
             )
