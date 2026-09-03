@@ -198,6 +198,189 @@ def test_wait_for_candle_close_defaults_true_when_env_is_missing() -> None:
 
     assert daemon._deployment_wait_for_candle_close(deployment, {}) is True
 
+def _deployment_with_signal_config(
+    signal_config: dict[str, object],
+    *,
+    settings: dict[str, object] | None = None,
+) -> LiveDeploymentConfig:
+    return LiveDeploymentConfig(
+        strategy_name="fx_breakout",
+        account_id="ctrader-demo",
+        symbols=["EURUSD"],
+        timeframe="15m",
+        signal_source="discord",
+        signal_config=signal_config,
+        settings=settings or {},
+    )
+
+def test_wait_for_candle_close_typo_raises_instead_of_silently_disabling() -> None:
+    """A typo'd boolean must not silently disable candle-close waiting (which
+    forces immediate market orders); the strict parser rejects it."""
+    deployment = _deployment_with_signal_config({"wait_candle_close": "ture"})
+
+    with pytest.raises(ValueError, match="wait_candle_close"):
+        daemon._deployment_wait_for_candle_close(deployment, {})
+
+    deployment = _deployment_with_signal_config({"wait_for_candle_close": "eanbled"})
+
+    with pytest.raises(ValueError, match="wait_for_candle_close"):
+        daemon._deployment_wait_for_candle_close(deployment, {})
+
+def test_wait_for_candle_close_env_typo_raises() -> None:
+    deployment = _deployment_with_signal_config({})
+
+    with pytest.raises(ValueError, match="DISCORD_WAIT_FOR_CANDLE_CLOSE"):
+        daemon._deployment_wait_for_candle_close(
+            deployment, {"DISCORD_WAIT_FOR_CANDLE_CLOSE": "yess"}
+        )
+
+def test_wait_for_candle_close_env_value_with_whitespace_is_recognized() -> None:
+    deployment = _deployment_with_signal_config({})
+
+    assert (
+        daemon._deployment_wait_for_candle_close(
+            deployment, {"DISCORD_WAIT_FOR_CANDLE_CLOSE": " false "}
+        )
+        is False
+    )
+
+def test_wait_for_candle_close_accepts_recognized_tokens() -> None:
+    for raw, expected in (("true", True), ("0", False), ("Yes", True), ("off", False)):
+        deployment = _deployment_with_signal_config({"wait_candle_close": raw})
+        assert daemon._deployment_wait_for_candle_close(deployment, {}) is expected
+
+def test_allow_short_typo_raises_instead_of_silently_disabling() -> None:
+    """A typo'd allow_short must not silently turn shorts into exit-only."""
+    deployment = _deployment_with_signal_config(
+        {"allow_short": "eanbled"},
+        settings={"allow_short": True},
+    )
+
+    with pytest.raises(ValueError, match="allow_short"):
+        daemon._deployment_allows_short(deployment)
+
+def test_allow_short_recognized_tokens() -> None:
+    enabled = _deployment_with_signal_config({"allow_short": "true"})
+    assert daemon._deployment_allows_short(enabled) is True
+    disabled = _deployment_with_signal_config(
+        {},
+        settings={"allow_short": "false"},
+    )
+    assert daemon._deployment_allows_short(disabled) is False
+
+
+def _signal_with_metadata(metadata: dict[str, object] | None = None):
+    from risk import TradeSignal
+
+    return TradeSignal(
+        action="buy",
+        symbol="EURUSD",
+        entry_price=1.1,
+        stop_loss=None,
+        take_profit=None,
+        timeframe="15m",
+        metadata=metadata or {},
+    )
+
+
+def test_dispatch_drops_signal_when_matched_deployment_has_typo_bool(monkeypatch) -> None:
+    """A typo'd wait boolean drops the signal for the matched deployment. It must
+    NOT fall through to a sibling deployment on the same channel: that would leak
+    one strategy's signal into another strategy. Fail-closed beats fail-over."""
+    submitted: list[str] = []
+    bad = _deployment_with_signal_config({"wait_candle_close": "ture"})
+    good = _deployment_with_signal_config(
+        {"wait_candle_close": "true"},
+        settings={"signal_processor": "other"},
+    )
+
+    async def _record_submit(
+        account_id, adapter, deployment, *, trade_signal, signal_timeframe, wait_enabled
+    ):
+        submitted.append(deployment.strategy_name)
+
+    monkeypatch.setattr(daemon, "_submit_normalized_discord_signal", _record_submit)
+
+    asyncio.run(
+        daemon._dispatch_discord_trade_signal(
+            "acc-1",
+            adapter=object(),
+            deployments_for_channel=[bad, good],
+            trade_signal=_signal_with_metadata({"discord_channel_id": "chan"}),
+            accounts_env_values={},
+        )
+    )
+
+    assert submitted == []
+
+
+def test_dispatch_typo_bool_does_not_raise_to_listener_loop(monkeypatch) -> None:
+    bad = _deployment_with_signal_config({"wait_candle_close": "ture"})
+
+    async def _fail_submit(*args, **kwargs):
+        raise AssertionError("submission must never be attempted for a bad config")
+
+    monkeypatch.setattr(daemon, "_submit_normalized_discord_signal", _fail_submit)
+
+    # Must not raise; the listener loop keeps running.
+    asyncio.run(
+        daemon._dispatch_discord_trade_signal(
+            "acc-1",
+            adapter=object(),
+            deployments_for_channel=[bad],
+            trade_signal=_signal_with_metadata({}),
+            accounts_env_values={},
+        )
+    )
+
+
+def test_submit_skips_deployment_with_typo_allow_short(monkeypatch) -> None:
+    """A typo'd allow_short skips the deployment at signal-conversion time."""
+    deployment = _deployment_with_signal_config(
+        {"allow_short": "eanbled"},
+        settings={"allow_short": True},
+    )
+
+    class _NoSubmitAdapter:
+        async def get_positions(self):
+            raise AssertionError("must not be reached")
+
+        async def get_balance(self):
+            raise AssertionError("must not be reached")
+
+    from risk import TradeSignal
+
+    trade_signal = TradeSignal(
+        action="short",
+        symbol="EURUSD",
+        entry_price=1.1,
+        stop_loss=None,
+        take_profit=None,
+        timeframe="15m",
+        metadata={},
+    )
+
+    submitted: list[object] = []
+
+    def _fail_submit_with_risk(adapter, deployment_arg, live_signal):
+        submitted.append(live_signal)
+        raise AssertionError("submission must never be attempted for a bad config")
+
+    monkeypatch.setattr(daemon, "submit_order_with_risk", _fail_submit_with_risk)
+
+    asyncio.run(
+        daemon._submit_normalized_discord_signal(
+            "acc-1",
+            _NoSubmitAdapter(),
+            deployment,
+            trade_signal,
+            signal_timeframe="15m",
+            wait_enabled=False,
+        )
+    )
+
+    assert submitted == []
+
 
 def test_ctrader_auth_block_clears_for_all_accounts_when_shared_credentials_change() -> None:
     accounts = [

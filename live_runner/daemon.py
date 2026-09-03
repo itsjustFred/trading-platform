@@ -159,6 +159,18 @@ def _parse_strict_bool_env(name: str, value: str | None, *, default: bool = True
     )
 
 
+def _raw_bool_text(value: object) -> str | None:
+    """Normalize a config value to text for boolean parsing.
+
+    None means "not configured" so the caller's default applies; an empty
+    string is deliberately NOT collapsed to None — a typo'd/blank value must
+    surface as a strict-parse error instead of silently enabling the default.
+    """
+    if value is None:
+        return None
+    return str(value)
+
+
 def _load_accounts_env_values(accounts_env: Path) -> dict[str, str]:
     loaded = dotenv_values(accounts_env)
     result: dict[str, str] = {}
@@ -375,7 +387,7 @@ def _deployment_allows_short(deployment: LiveDeploymentConfig) -> bool:
     settings = deployment.settings or {}
     configured = deployment.signal_config or {}
     value = configured.get("allow_short", settings.get("allow_short", False))
-    return _parse_bool_env(str(value), default=False)
+    return _parse_strict_bool_env("allow_short", _raw_bool_text(value), default=False)
 
 
 def _deployment_wait_for_candle_close(
@@ -383,10 +395,20 @@ def _deployment_wait_for_candle_close(
 ) -> bool:
     configured = deployment.signal_config or {}
     if "wait_candle_close" in configured:
-        return _parse_bool_env(str(configured.get("wait_candle_close")), default=False)
+        return _parse_strict_bool_env(
+            "wait_candle_close", _raw_bool_text(configured.get("wait_candle_close")), default=False
+        )
     if "wait_for_candle_close" in configured:
-        return _parse_bool_env(str(configured.get("wait_for_candle_close")), default=False)
-    return _parse_bool_env(env_values.get("DISCORD_WAIT_FOR_CANDLE_CLOSE"), default=True)
+        return _parse_strict_bool_env(
+            "wait_for_candle_close",
+            _raw_bool_text(configured.get("wait_for_candle_close")),
+            default=False,
+        )
+    return _parse_strict_bool_env(
+        "DISCORD_WAIT_FOR_CANDLE_CLOSE",
+        env_values.get("DISCORD_WAIT_FOR_CANDLE_CLOSE"),
+        default=True,
+    )
 
 
 def _deployment_signal_timeframe(deployment: LiveDeploymentConfig) -> str:
@@ -939,7 +961,23 @@ async def _submit_normalized_discord_signal(
         )
         return
 
-    live_signal = _trade_signal_to_live_signal(normalized_signal, deployment)
+    try:
+        live_signal = _trade_signal_to_live_signal(normalized_signal, deployment)
+    except ValueError as exc:
+        # Strict-boolean config errors (e.g. typo'd allow_short) must skip this
+        # deployment without dropping the listener loop or sibling deployments.
+        logger.error(
+            "Invalid deployment boolean config; skipping deployment",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "deployment_id": str(deployment.id),
+                    "symbol": trade_signal.symbol,
+                    "error": str(exc),
+                }
+            },
+        )
+        return
     try:
         broker_order_id = await submit_order_with_risk(adapter, deployment, live_signal)
     except Exception as exc:
@@ -987,13 +1025,31 @@ async def _dispatch_discord_trade_signal(
         if not _deployment_covers_discord_symbol(deployment, trade_signal.symbol):
             continue
 
+        try:
+            wait_enabled = _deployment_wait_for_candle_close(deployment, accounts_env_values)
+        except ValueError as exc:
+            # A typo'd boolean must skip the deployment, not kill the listener
+            # loop or other deployments on the same account. It also must not
+            # default into immediate market orders.
+            logger.error(
+                "Invalid deployment boolean config; skipping deployment",
+                extra={
+                    "data": {
+                        "account_id": account_id,
+                        "strategy_name": deployment.strategy_name,
+                        "error": str(exc),
+                    }
+                },
+            )
+            return
+
         await _submit_normalized_discord_signal(
             account_id,
             adapter,
             deployment,
             trade_signal,
             signal_timeframe=_deployment_signal_timeframe(deployment),
-            wait_enabled=_deployment_wait_for_candle_close(deployment, accounts_env_values),
+            wait_enabled=wait_enabled,
         )
         break
     else:
