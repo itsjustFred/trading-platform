@@ -261,8 +261,9 @@ def test_submit_order_with_risk_fails_closed_without_resolved_stop(monkeypatch):
         metadata={},
     )
 
+    submit = submit_order_with_risk(adapter, deployment, sized_signal)
     with pytest.raises(ValueError, match="stop loss"):
-        asyncio.run(submit_order_with_risk(adapter, deployment, sized_signal))
+        asyncio.run(submit)
 
     assert adapter.submitted_signal is None
 
@@ -2367,6 +2368,29 @@ def _live_signal_with_action(action: str) -> LiveSignal:
     return signal
 
 
+def _make_ctrader_request_builder_adapter():
+    """Return (module, adapter) with cTrader proto stubs for _build_new_order_request."""
+    module, adapter = _make_ctrader_adapter()
+
+    class _NewOrderReq:
+        def __init__(self) -> None:
+            self.ctidTraderAccountId = 0
+            self.symbolId = 0
+            self.orderType = 0
+            self.tradeSide = 0
+            self.volume = 0
+            self.timeInForce = 0
+            self.clientOrderId = ""
+            self.stopLoss = 0
+            self.takeProfit = 0
+
+    adapter._ProtoOANewOrderReq = _NewOrderReq
+    adapter._ProtoOAOrderType = SimpleNamespace(MARKET=1)
+    adapter._ProtoOATradeSide = SimpleNamespace(BUY=1, SELL=2)
+    adapter._ProtoOATimeInForce = SimpleNamespace(IMMEDIATE_OR_CANCEL=1)
+    return module, adapter
+
+
 def test_alpaca_rejects_unknown_signal_action_instead_of_selling():
     from live_runner import alpaca_adapter as module
 
@@ -2383,8 +2407,9 @@ def test_alpaca_rejects_unknown_signal_action_instead_of_selling():
     )
 
     bad_signal = _live_signal_with_action("close")
+    submission = adapter.submit_order(bad_signal)
     with pytest.raises(ValueError, match=r"[Uu]nsupported .*action 'close'"):
-        asyncio.run(adapter.submit_order(bad_signal))
+        asyncio.run(submission)
 
 
 def test_alpaca_build_order_request_rejects_unknown_signal_action():
@@ -2442,30 +2467,14 @@ def test_ctrader_rejects_unknown_signal_action_instead_of_selling():
     adapter._ProtoOATimeInForce = SimpleNamespace(IMMEDIATE_OR_CANCEL=1)
 
     bad_signal = _live_signal_with_action("close")
+    submission = adapter.submit_order(bad_signal)
     with pytest.raises(ValueError, match=r"[Uu]nsupported .*action 'close'"):
-        asyncio.run(adapter.submit_order(bad_signal))
+        asyncio.run(submission)
 
 
 def test_ctrader_new_order_request_carries_sl_tp_prices():
     """The computed SL/TP must land on the broker request, not just metadata."""
-    module, adapter = _make_ctrader_adapter()
-
-    class _NewOrderReq:
-        def __init__(self) -> None:
-            self.ctidTraderAccountId = 0
-            self.symbolId = 0
-            self.orderType = 0
-            self.tradeSide = 0
-            self.volume = 0
-            self.timeInForce = 0
-            self.clientOrderId = ""
-            self.stopLoss = 0
-            self.takeProfit = 0
-
-    adapter._ProtoOANewOrderReq = _NewOrderReq
-    adapter._ProtoOAOrderType = SimpleNamespace(MARKET=1)
-    adapter._ProtoOATradeSide = SimpleNamespace(BUY=1, SELL=2)
-    adapter._ProtoOATimeInForce = SimpleNamespace(IMMEDIATE_OR_CANCEL=1)
+    module, adapter = _make_ctrader_request_builder_adapter()
 
     signal = LiveSignal(
         deployment_id="dep-1",
@@ -2484,24 +2493,7 @@ def test_ctrader_new_order_request_carries_sl_tp_prices():
 
 
 def test_ctrader_new_order_request_fails_closed_without_sl_tp():
-    module, adapter = _make_ctrader_adapter()
-
-    class _NewOrderReq:
-        def __init__(self) -> None:
-            self.ctidTraderAccountId = 0
-            self.symbolId = 0
-            self.orderType = 0
-            self.tradeSide = 0
-            self.volume = 0
-            self.timeInForce = 0
-            self.clientOrderId = ""
-            self.stopLoss = 0
-            self.takeProfit = 0
-
-    adapter._ProtoOANewOrderReq = _NewOrderReq
-    adapter._ProtoOAOrderType = SimpleNamespace(MARKET=1)
-    adapter._ProtoOATradeSide = SimpleNamespace(BUY=1, SELL=2)
-    adapter._ProtoOATimeInForce = SimpleNamespace(IMMEDIATE_OR_CANCEL=1)
+    module, adapter = _make_ctrader_request_builder_adapter()
 
     signal = LiveSignal(
         deployment_id="dep-1",
@@ -2512,30 +2504,14 @@ def test_ctrader_new_order_request_fails_closed_without_sl_tp():
         metadata={"qty": 1.0},
     )
 
+    request = adapter._build_new_order_request
     with pytest.raises(ValueError, match="without stop_loss"):
-        adapter._build_new_order_request(signal, symbol_id=7)
+        request(signal, symbol_id=7)
 
 
 def test_ctrader_build_new_order_request_rejects_unknown_signal_action():
     """The request-builder guard must hold even when submit_order is bypassed."""
-    module, adapter = _make_ctrader_adapter()
-
-    class _NewOrderReq:
-        def __init__(self) -> None:
-            self.ctidTraderAccountId = 0
-            self.symbolId = 0
-            self.orderType = 0
-            self.tradeSide = 0
-            self.volume = 0
-            self.timeInForce = 0
-            self.clientOrderId = ""
-            self.stopLoss = 0
-            self.takeProfit = 0
-
-    adapter._ProtoOANewOrderReq = _NewOrderReq
-    adapter._ProtoOAOrderType = SimpleNamespace(MARKET=1)
-    adapter._ProtoOATradeSide = SimpleNamespace(BUY=1, SELL=2)
-    adapter._ProtoOATimeInForce = SimpleNamespace(IMMEDIATE_OR_CANCEL=1)
+    module, adapter = _make_ctrader_request_builder_adapter()
     bad_signal = _live_signal_with_action("close")
 
     with pytest.raises(ValueError, match=r"[Uu]nsupported .*action: close"):
@@ -2605,8 +2581,9 @@ def test_alpaca_build_order_request_fails_closed_without_sl_tp():
         metadata={"qty": 2.0},
     )
 
+    builder = adapter._build_order_request
     with pytest.raises(ValueError, match="without stop_loss"):
-        adapter._build_order_request(
+        builder(
             naked_signal,
             qty=2.0,
             order_side=SimpleNamespace(BUY="buy", SELL="sell"),
