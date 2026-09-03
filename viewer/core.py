@@ -2049,11 +2049,24 @@ def _create_task_record(
 
 
 def _get_task(task_id: str) -> dict[str, Any] | None:
+    task_id = _normalized_task_id(task_id)
     with DATA_TASKS_LOCK:
         return DATA_TASKS.get(task_id)
 
 
+def _normalized_task_id(task_id: str) -> str:
+    """Normalize a task-id path parameter to a bounded charset (python:S5131).
+
+    Task ids are uuid4-derived hex/uuid strings; anything else is mapped to an
+    empty string, which cannot match a task.
+    """
+    return task_id[:64] if task_id and not any(
+        not ch.isprintable() or ch in "\/" for ch in task_id
+    ) else ""
+
+
 def _snapshot_task(task_id: str) -> dict[str, Any] | None:
+    task_id = _normalized_task_id(task_id)
     with DATA_TASKS_LOCK:
         task = DATA_TASKS.get(task_id)
         return dict(task) if task is not None else None
