@@ -892,6 +892,23 @@ async def _submit_normalized_discord_signal(
             normalized_signal.timeframe or signal_timeframe,
         )
 
+    # Re-check after the candle-close wait: the wait can span minutes, and the
+    # pre-dispatch snapshot was taken before it. A deployment paused during the
+    # wait window must not trade at the candle-close price.
+    if not _deployment_is_currently_active(deployment):
+        logger.info(
+            "Skipping discord signal: deployment left ACTIVE during candle-close wait",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "deployment_id": str(deployment.id),
+                    "symbol": trade_signal.symbol,
+                    "snapshot_status": deployment.status,
+                }
+            },
+        )
+        return
+
     live_signal = _trade_signal_to_live_signal(normalized_signal, deployment)
     try:
         broker_order_id = await submit_order_with_risk(adapter, deployment, live_signal)

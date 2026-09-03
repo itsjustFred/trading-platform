@@ -489,31 +489,28 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             side = order_side.BUY
         else:
             side = order_side.SELL
-        base_kwargs: dict[str, Any] = {
-            "symbol": signal.symbol,
-            "qty": qty,
-            "side": side,
-            "client_order_id": client_order_id,
-            "order_class": OrderClass.BRACKET,
-            "take_profit": TakeProfitRequest(limit_price=take_profit_price),
-            "stop_loss": StopLossRequest(stop_price=stop_loss_price),
-        }
         if extended_hours:
-            if limit_price <= 0:
-                raise ValueError(
-                    "Extended-hours orders require a positive 'limit_price' in "
-                    "signal metadata."
-                )
-            return limit_request_cls(
-                time_in_force=time_in_force.DAY,
-                extended_hours=True,
-                limit_price=limit_price,
-                **base_kwargs,
+            # The broker rejects bracket orders with extended_hours enabled
+            # ("bracket order has non-zero extended_hours value", HTTP 422), and
+            # OTO bracket legs cannot execute outside regular hours anyway.
+            # Fail closed rather than silently dropping the SL/TP the risk
+            # sizing assumed: the caller must choose bounded-hours bracket or
+            # naked extended-hours — and naked entries are not allowed.
+            raise ValueError(
+                "Extended-hours entry with mandatory SL/TP is not supported: "
+                "the broker rejects bracket orders with extended_hours enabled "
+                f"(signal_id={signal.id}, symbol={signal.symbol})."
             )
         return market_request_cls(
             time_in_force=time_in_force.DAY,
             extended_hours=False,
-            **base_kwargs,
+            order_class=OrderClass.BRACKET,
+            take_profit=TakeProfitRequest(limit_price=take_profit_price),
+            stop_loss=StopLossRequest(stop_price=stop_loss_price),
+            symbol=signal.symbol,
+            qty=qty,
+            side=side,
+            client_order_id=client_order_id,
         )
 
     async def _persist_submitted_order_id(

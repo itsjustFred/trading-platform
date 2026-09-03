@@ -1483,19 +1483,75 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 f"{' and '.join(missing)} (signal_id={signal.id}, "
                 f"symbol={signal.symbol}); opening an unbounded position is not allowed."
             )
-        request.stopLoss = self._to_broker_price(signal.symbol, stop_loss)
-        request.takeProfit = self._to_broker_price(signal.symbol, take_profit)
+        # MARKET orders ignore absolute stopLoss/takeProfit ("Not supported for
+        # MARKET orders" per the Open API docs); send the distances via the
+        # relative fields, which the protocol accepts for MARKET orders.
+        relative_stop, relative_take = self._resolve_relative_sl_tp(
+            signal, stop_loss, take_profit
+        )
+        request.relativeStopLoss = relative_stop
+        request.relativeTakeProfit = relative_take
         return request
 
-    def _to_broker_price(self, symbol: str, price: float) -> float:
-        """cTrader expects absolute prices; digits conversion is handled by the
-        server for absolute SL/TP on NewOrderReq. Keep the price as provided but
-        validate it is finite and positive."""
-        if math.isnan(price) or math.isinf(price) or price <= 0:
+    def _resolve_relative_sl_tp(
+        self, signal: LiveSignal, stop_loss: float, take_profit: float
+    ) -> tuple[int, int]:
+        """Convert absolute SL/TP prices into cTrader relative units.
+
+        Per the cTrader Open API docs, ProtoOANewOrderReq's absolute
+        stopLoss/takeProfit fields are "Not supported for MARKET orders" — this
+        adapter submits MARKET/IMMEDIATE_OR_CANCEL orders, so the distances are
+        sent via relativeStopLoss/relativeTakeProfit instead: int64 in
+        1/100000 of a price unit (123000 means 1.23), where for BUY
+        stopLoss = entryPrice - relativeStopLoss and takeProfit =
+        entryPrice + relativeTakeProfit (reversed for SELL).
+        """
+        reference_price = float(signal.theoretical_price)
+        if not math.isfinite(reference_price) or reference_price <= 0:
             raise ValueError(
-                f"Invalid SL/TP price for {symbol}: {price!r}; refusing to submit."
+                f"Invalid reference price for {signal.symbol}: "
+                f"{signal.theoretical_price!r}; refusing to submit."
             )
-        return float(price)
+        scale = 100_000
+
+        def _distance(price: float, *, outward: bool) -> int:
+            if math.isnan(price) or math.isinf(price) or price <= 0:
+                raise ValueError(
+                    f"Invalid SL/TP price for {signal.symbol}: {price!r}; "
+                    "refusing to submit."
+                )
+            distance = abs(reference_price - price)
+            if distance <= 0:
+                raise ValueError(
+                    f"SL/TP price {price!r} equals the reference price "
+                    f"{reference_price!r} for {signal.symbol}; refusing to "
+                    "submit a zero-distance SL/TP."
+                )
+            raw = distance * scale
+            if not math.isfinite(raw) or raw < 1:
+                raise ValueError(
+                    f"SL/TP distance for {signal.symbol} resolves to {raw!r} "
+                    "(below one 1/100000 price unit); refusing to submit."
+                )
+            # Distance is signed by direction at the protocol level; the value
+            # sent is always the positive magnitude in 1/100000 units.
+            del outward
+            return int(round(raw))
+
+        buy = signal.action == "buy"
+        stop_outward = reference_price - stop_loss if buy else stop_loss - reference_price
+        take_outward = take_profit - reference_price if buy else reference_price - take_profit
+        if stop_outward <= 0 or take_outward <= 0:
+            raise ValueError(
+                f"SL/TP prices are on the wrong side of the reference price for "
+                f"{signal.symbol} ({signal.action}): stop_loss={stop_loss!r}, "
+                f"take_profit={take_profit!r}, reference={reference_price!r}; "
+                "refusing to submit."
+            )
+        return (
+            _distance(stop_loss, outward=True),
+            _distance(take_profit, outward=True),
+        )
 
     async def _submit_new_order_request(self, request: Any) -> Any:
         try:

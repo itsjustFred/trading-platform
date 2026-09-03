@@ -345,65 +345,43 @@ def test_alpaca_submit_order_blocks_non_positive_quantity(monkeypatch):
         asyncio.run(adapter.submit_order(signal))
 
 
-def test_alpaca_extended_hours_without_positive_limit_price_raises(monkeypatch):
-    """Alpaca only accepts extended-hours sessions as LIMIT orders; a market
-    request flagged extended_hours=True is rejected by the broker and strands
-    the signal."""
+def test_alpaca_extended_hours_entries_fail_closed():
+    """The broker rejects bracket orders with extended_hours enabled ("bracket
+    order has non-zero extended_hours value", HTTP 422), and dropping the
+    SL/TP to work around it would open an unbounded position. Extended-hours
+    entries must therefore fail closed at the request builder."""
     from live_runner import alpaca_adapter as module
 
     adapter = module.AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True)
-    market_requests: list[Any] = []
 
-    def _market_request_cls(**kwargs):
-        market_requests.append(kwargs)
-        return SimpleNamespace(kind="market")
-
-    def _fail_limit_request_cls(**_kwargs):
-        pytest.fail("limit order must not be constructed without limit_price")
+    def _fail_request_cls(**_kwargs):
+        pytest.fail("no broker request may be constructed for extended-hours entries")
 
     base_kwargs = dict(
         qty=1.0,
         order_side=SimpleNamespace(BUY="buy", SELL="sell"),
         time_in_force=SimpleNamespace(DAY="day"),
-        limit_request_cls=_fail_limit_request_cls,
-        market_request_cls=_market_request_cls,
+        limit_request_cls=_fail_request_cls,
+        market_request_cls=_fail_request_cls,
         client_order_id="cid-eh",
     )
-    missing_limit = LiveSignal(
+    with_limit = LiveSignal(
         deployment_id="dep-1",
         symbol="AAPL",
         action="buy",
         theoretical_price=100.0,
         timestamp=datetime.now(timezone.utc),
-        metadata={"qty": 1.0, "extended_hours": True, "stop_loss": 95.0, "take_profit": 110.0},
-    )
-    non_positive_limit = LiveSignal(
-        deployment_id="dep-1",
-        symbol="AAPL",
-        action="sell",
-        theoretical_price=100.0,
-        timestamp=datetime.now(timezone.utc),
-        metadata={
-            "qty": 1.0,
-            "extended_hours": True,
-            "limit_price": -1.5,
-            "stop_loss": 105.0,
-            "take_profit": 90.0,
-        },
+        metadata={"qty": 1.0, "extended_hours": True, "limit_price": 101.5, "stop_loss": 95.0, "take_profit": 110.0},
     )
 
-    with pytest.raises(ValueError, match="positive 'limit_price'"):
-        adapter._build_order_request(missing_limit, **base_kwargs)
-    with pytest.raises(ValueError, match="positive 'limit_price'"):
-        adapter._build_order_request(non_positive_limit, **base_kwargs)
-
-    # Nothing may reach the broker for the invalid signals.
-    assert market_requests == []
+    builder = adapter._build_order_request
+    with pytest.raises(ValueError, match="extended_hours"):
+        builder(with_limit, **base_kwargs)
 
 
-def test_alpaca_extended_hours_limit_and_regular_market_orders(monkeypatch):
-    """Valid extended-hours signals keep the LIMIT/DAY path; regular-session
-    signals always build market orders with extended_hours disabled."""
+def test_alpaca_regular_market_orders_carry_bracket_legs(monkeypatch):
+    """Regular-session signals always build market orders with extended_hours
+    disabled and the mandatory bracket legs attached."""
     from live_runner import alpaca_adapter as module
 
     adapter = module.AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True)
@@ -426,27 +404,6 @@ def test_alpaca_extended_hours_limit_and_regular_market_orders(monkeypatch):
             market_request_cls=_market_request_cls,
             client_order_id=client_order_id,
         )
-
-    extended_hours = LiveSignal(
-        deployment_id="dep-1",
-        symbol="AAPL",
-        action="buy",
-        theoretical_price=100.0,
-        timestamp=datetime.now(timezone.utc),
-        metadata={"qty": 2.0, "extended_hours": True, "limit_price": 101.5, "stop_loss": 95.0, "take_profit": 110.0},
-    )
-    limit_kind, limit_kwargs = _build(extended_hours, "cid-eh")
-    assert limit_kind == "limit"
-    assert limit_kwargs["symbol"] == "AAPL"
-    assert limit_kwargs["qty"] == 2.0
-    assert limit_kwargs["side"] == "buy"
-    assert limit_kwargs["time_in_force"] == "day"
-    assert limit_kwargs["extended_hours"] is True
-    assert limit_kwargs["limit_price"] == 101.5
-    assert limit_kwargs["client_order_id"] == "cid-eh"
-    assert limit_kwargs["order_class"] is module.OrderClass.BRACKET
-    assert limit_kwargs["take_profit"].limit_price == pytest.approx(110.0)
-    assert limit_kwargs["stop_loss"].stop_price == pytest.approx(95.0)
 
     regular = LiveSignal(
         deployment_id="dep-1",
@@ -2488,8 +2445,46 @@ def test_ctrader_new_order_request_carries_sl_tp_prices():
     request = adapter._build_new_order_request(signal, symbol_id=7)
 
     assert request.symbolId == 7
-    assert request.stopLoss == pytest.approx(1.05)
-    assert request.takeProfit == pytest.approx(1.2)
+    # MARKET orders ignore the absolute stopLoss/takeProfit fields; the
+    # distances must arrive via the relative int64 fields (1/100000 units):
+    # BUY stop = entry - relativeStopLoss, take = entry + relativeTakeProfit.
+    assert request.relativeStopLoss == int(round(abs(1.1 - 1.05) * 100_000))
+    assert request.relativeTakeProfit == int(round(abs(1.2 - 1.1) * 100_000))
+
+
+def test_ctrader_relative_sl_tp_direction_and_rejections():
+    """Relative distances are signed by trade side at the protocol level; the
+    sent magnitude must be the positive distance in 1/100000 price units, and
+    wrong-side/non-finite/zero-distance prices must fail closed."""
+    from live_runner import ctrader_adapter as module
+
+    module, adapter = _make_ctrader_request_builder_adapter()
+
+    def _signal(action, stop_loss, take_profit, theoretical_price=1.1):
+        return LiveSignal(
+            deployment_id="dep-1",
+            symbol="EURUSD",
+            action=action,
+            theoretical_price=theoretical_price,
+            timestamp=datetime.now(timezone.utc),
+            metadata={"qty": 1.0, "stop_loss": stop_loss, "take_profit": take_profit},
+        )
+
+    buy_request = adapter._build_new_order_request(_signal("buy", 1.05, 1.2), symbol_id=7)
+    assert buy_request.relativeStopLoss == int(round(0.05 * 100_000))
+    assert buy_request.relativeTakeProfit == int(round(0.1 * 100_000))
+
+    sell_request = adapter._build_new_order_request(_signal("sell", 1.2, 1.0), symbol_id=7)
+    assert sell_request.relativeStopLoss == int(round(0.1 * 100_000))
+    assert sell_request.relativeTakeProfit == int(round(0.1 * 100_000))
+
+    wrong_side = adapter._build_new_order_request
+    with pytest.raises(ValueError, match="wrong side of the reference price"):
+        wrong_side(_signal("buy", 1.2, 1.05), symbol_id=7)
+    with pytest.raises(ValueError, match="Invalid SL/TP price"):
+        wrong_side(_signal("buy", float("nan"), 1.2), symbol_id=7)
+    with pytest.raises(ValueError, match="wrong side of the reference price"):
+        wrong_side(_signal("buy", 1.1, 1.2), symbol_id=7)
 
 
 def test_ctrader_new_order_request_fails_closed_without_sl_tp():
