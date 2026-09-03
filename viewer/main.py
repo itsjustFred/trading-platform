@@ -4335,7 +4335,7 @@ def _benchmark_daily_returns(symbol: str, *, start: str = "", end: str = "") -> 
 
 def _default_benchmark_symbol(result: BacktestResult) -> str:
     data = result.meta.data if isinstance(result.meta.data, dict) else {}
-    symbols = data.get("symbols") if isinstance(data, dict) else None
+    symbols = data.get("symbols") or []
     if isinstance(symbols, list) and symbols:
         return str(symbols[0]).strip().upper()
     return ""

@@ -21,6 +21,8 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+
+from shared.constants import ensure_path_within_workspace
 import yfinance as yf
 from scipy.optimize import minimize
 
@@ -594,7 +596,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    output_dir = Path(args.output_dir)
+    output_dir = ensure_path_within_workspace(Path(args.output_dir))
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("Running Risk Parity backtest (Python reimplementation)...")
