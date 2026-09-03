@@ -76,12 +76,18 @@ def _rule_from_text(
     *,
     primary_signal: str,
     secondary_signal: str,
-    default_rule: str,
     source: str = "",
 ) -> str:
     normalized = (text or "").strip().lower()
+    # An empty condition is just as untranslatable as prose: falling back to a
+    # directional rule here would fabricate trading logic (same rule as F4).
     if not normalized:
-        return default_rule
+        origin = source or repr(text)
+        raise ValueError(
+            "Cannot deterministically translate condition text into vectorbt logic: "
+            f"{origin}. Extend the StrategyIR with an explicit expression instead of "
+            "relying on keyword guessing."
+        )
 
     if "crossunder" in normalized:
         return f"_cross_under({primary_signal}, {secondary_signal})"
@@ -118,7 +124,6 @@ def _entry_rule_expressions(
             condition.expression,
             primary_signal=primary_signal,
             secondary_signal=secondary_signal,
-            default_rule=f"({primary_signal} > {secondary_signal})",
             source=f"entry condition {condition.expression!r}",
         )
         expressions.append(expression)
@@ -137,7 +142,6 @@ def _exit_rule_expressions(
             signal.condition,
             primary_signal=primary_signal,
             secondary_signal=secondary_signal,
-            default_rule=f"({primary_signal} < {secondary_signal})",
             source=f"exit signal {signal.condition!r}",
         )
         expressions.append(expression)

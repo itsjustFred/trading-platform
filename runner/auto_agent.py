@@ -462,9 +462,6 @@ def _normalize_markdown_doc(markdown_doc: str, *, strategy_name: str | None) -> 
     return content
 
 
-GENERIC_FENCE: tuple[str, ...] = ()
-
-
 def _extract_fenced_block(content: str, languages: tuple[str, ...]) -> str | None:
     """Return the body of the first fenced block for one of ``languages``.
 
@@ -477,9 +474,11 @@ def _extract_fenced_block(content: str, languages: tuple[str, ...]) -> str | Non
         match = re.search(rf"```{language}(.*?)```", content, flags=re.IGNORECASE | re.DOTALL)
         if match:
             return match.group(1).strip()
-    generic = languages is GENERIC_FENCE
-    if not generic:
-        return None
+    return None
+
+
+def _extract_generic_fence(content: str) -> str | None:
+    """Return the body of the first fenced block with any language label."""
     match = re.search(r"```(.*?)```", content, flags=re.DOTALL)
     if match:
         return match.group(1).strip()
@@ -491,13 +490,14 @@ def _extract_markdown_response(content: str) -> str:
 
 
 def _extract_python_response(content: str) -> str:
-    fenced = _extract_fenced_block(content or "", ("python", "py"))
+    content = content or ""
+    fenced = _extract_fenced_block(content, ("python", "py"))
     if fenced is not None:
         return fenced
-    generic = _extract_fenced_block(content or "", GENERIC_FENCE)
+    generic = _extract_generic_fence(content)
     if generic is not None:
         return generic
-    return (content or "").strip()
+    return content.strip()
 
 
 def _extract_strategy_meta(
