@@ -6814,7 +6814,7 @@ def _verify_missing_download_coverage(
 def _download_and_verify_missing_data(
     missing_items: list[dict[str, Any]],
     *,
-    timeframe: str,
+    normalized_timeframe: str,
     start: str,
     end: str,
     progress_callback: Callable[[float, str], None] | None = None,

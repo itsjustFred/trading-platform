@@ -2291,7 +2291,7 @@ def _refresh_catalog_for_task(
                 source=source,
             )
         _refresh_catalog()
-    except OSError as exc:
+    except (OSError, ValueError, TypeError) as exc:
         _task_log_message(task_id, f"Catalog refresh failed: {exc}", log_level="error", source=source)
         _mark_task_finished(task_id, status="failed", returncode=1, error=str(exc))
         return False
@@ -2973,6 +2973,14 @@ def _start_jforex_task(
                         failed_items += 1
                         if first_error is None:
                             first_error = outcome.error
+                        _write_task_log_line(
+                            handle,
+                            task_id,
+                            f"❌ {outcome.error}",
+                            stream="stdout",
+                            log_level="error",
+                            source="data-task",
+                        )
                         continue
                     if outcome.used_fallback:
                         used_native_backend = True

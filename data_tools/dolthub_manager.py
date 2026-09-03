@@ -219,9 +219,15 @@ def _list_symbols(stocks_repo: Path, table_name: str) -> list[str]:
     return [l.strip() for l in lines if l.strip()]
 
 
+_SYMBOL_RE = re.compile(r"^[A-Za-z0-9._-]{1,20}$")
+
+
 def _export_symbol_csv(
     stocks_repo: Path, table_name: str, symbol: str, target_dir: Path, out_parquet: Path
 ) -> None:
+    if not _SYMBOL_RE.match(symbol):
+        logger.warning("Skipping unexpected symbol value: %r", symbol)
+        return
     try:
         out_parquet.parent.mkdir(parents=True, exist_ok=True)
         sym_csv = target_dir / f"{symbol}.csv"
