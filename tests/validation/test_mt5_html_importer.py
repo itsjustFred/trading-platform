@@ -209,14 +209,16 @@ class TestDirectionRequiresTypColumn:
 
     def test_missing_typ_column_raises(self, tmp_path: Path):
         report = Path("tests/fixtures/validation/mt5_html/missing_typ.html")
+        importer = MT5HTMLImporter()
         with pytest.raises(ValueError) as excinfo:
-            MT5HTMLImporter().load(report)
+            importer.load(report)
         assert "Typ" in str(excinfo.value)
 
     def test_unsupported_entry_typ_raises(self):
         report = Path("tests/fixtures/validation/mt5_html/bad_typ.html")
+        importer = MT5HTMLImporter()
         with pytest.raises(ValueError) as excinfo:
-            MT5HTMLImporter().load(report)
+            importer.load(report)
         assert "buy limit" in str(excinfo.value)
 
 
