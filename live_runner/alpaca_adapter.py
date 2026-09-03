@@ -603,6 +603,12 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         if trading_client is None:
             raise RuntimeError("Alpaca trading client is unavailable after connect.")
 
+        # B-8: validate the cheap in-memory facts BEFORE the first persistence.
+        # A signal row persisted without a broker order wedges every redelivery
+        # on the duplicate-persisted recovery path.
+        if signal.action not in {"buy", "sell"}:
+            raise ValueError(f"Unsupported signal action: {signal.action}")
+
         if qty is not None:
             # Trusted channel: the caller has already run risk sizing.
             risk_percent = float((signal.metadata or {}).get("risk_percent") or 0.0)
