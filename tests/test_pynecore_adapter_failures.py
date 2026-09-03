@@ -113,7 +113,11 @@ def test_stats_are_merged_across_symbols(tmp_path, monkeypatch):
 
     def fake_run(*args, **kwargs):
         # both symbols succeed; each writes its own stats so the adapter must
-        # merge them (the old all_stats = ... overwrite would keep only QQQ's)
+        # merge them (the old all_stats = ... overwrite would keep only QQQ's).
+        # Every symbol also writes a symbol-unique key: shared keys alone cannot
+        # distinguish merge (`update`) from overwrite (`=`) — the overwrite would
+        # keep QQQ's values for the shared keys and still satisfy the assertions
+        # below. `spy_only` surviving is the actual merge pin.
         cmd = args[0]
         data_csv = Path(cmd[cmd.index("--trade") - 1])
         symbol = data_csv.name.split("_")[0]
@@ -122,7 +126,8 @@ def test_stats_are_merged_across_symbols(tmp_path, monkeypatch):
         stats_csv.write_text(
             "metric,value\n"
             + f"total_pnl,{100.0 if symbol == 'SPY' else 200.0}\n"
-            + f"sharpe_ratio,{1.0 if symbol == 'SPY' else 2.0}\n",
+            + f"sharpe_ratio,{1.0 if symbol == 'SPY' else 2.0}\n"
+            + (f"spy_only,42.0\n" if symbol == "SPY" else "qqq_only,7.0\n"),
             encoding="utf-8",
         )
         return subprocess.CompletedProcess(args, returncode=0, stdout="", stderr="")
@@ -134,7 +139,10 @@ def test_stats_are_merged_across_symbols(tmp_path, monkeypatch):
     result = PyneCoreAdapter().run(_config(tmp_path, ["SPY", "QQQ"]), str(strategy))
     assert result.meta.engine == "pynecore"
     # Both symbols ran and both contributed: the merged stats keep SPY's values
-    # (not overwritten by the last symbol) and add QQQ's.
+    # (not overwritten by the last symbol) and add QQQ's. The symbol-unique keys
+    # are the load-bearing assertions: both must survive the merge.
     assert sorted(seen_symbols) == ["QQQ", "SPY"]
     assert result.stats["total_pnl"] == 200.0
     assert result.stats["sharpe_ratio"] == 2.0
+    assert result.stats["spy_only"] == 42.0
+    assert result.stats["qqq_only"] == 7.0

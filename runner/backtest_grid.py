@@ -425,6 +425,9 @@ def run_one_backtest(
     save_sqlite: bool = True,
     keep_indicators: bool = False,
 ) -> dict[str, Any]:
+    # start/end are resolve-or-detect as a pair: _resolve_dates_for_equity fills
+    # both-or-neither from the same detection, so the reported window and the
+    # engine window can never diverge. Don't fill only one of them at a call site.
     request = CellRequest(
         strategy=strategy,
         symbol=symbol,

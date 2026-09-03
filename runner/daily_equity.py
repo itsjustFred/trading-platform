@@ -188,10 +188,23 @@ def attach_daily_equity(
         result.stats["daily_return_count"] = 0
         return result
 
+    # When a window is active, an engine-provided curve must be scoped to the
+    # same bounds before the length comparison: preserving the full unwindowed
+    # curve next to window-scoped daily_returns would make the curve and the
+    # reported daily returns describe different periods (pre-mortem 16-B #7).
+    preserved_curve = result.equity_curve
+    if start_bound or end_bound:
+        preserved_curve = [
+            point
+            for point in (result.equity_curve or [])
+            if _in_window(point.time, start_bound, end_bound)
+        ]
+
     # Preserve existing equity_curve if it has more points than what we built
     # (e.g., the engine already provided a full equity curve with multiple points)
-    if result.equity_curve and len(result.equity_curve) > len(daily_points):
-        # Keep the original curve, but update metadata
+    if preserved_curve and len(preserved_curve) > len(daily_points):
+        # Keep the (window-scoped) original curve, but update metadata
+        result.equity_curve = preserved_curve
         result.stats = result.stats or {}
         result.stats["daily_return_count"] = len(daily_returns)
         result.stats["daily_returns"] = daily_returns

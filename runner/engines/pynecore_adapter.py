@@ -82,6 +82,8 @@ class PyneCoreAdapter(EngineAdapter):
             )
             trade_counter += len(trades)
             all_trades.extend(trades)
+            # Merge, never overwrite (F11): `all_stats =` here would silently
+            # keep only the last symbol's stats. `update` is load-bearing.
             all_stats.update(symbol_stats)
 
             all_drawings.extend(
