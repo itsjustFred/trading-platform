@@ -252,7 +252,7 @@ def test_submit_order_with_risk_fails_closed_without_resolved_stop(monkeypatch):
 
     deployment = _deployment()
     adapter = _PositionsAdapter(positions=[])
-    signal = LiveSignal(
+    sized_signal = LiveSignal(
         deployment_id=str(deployment.id),
         symbol="EURUSD",
         action="buy",
@@ -262,7 +262,7 @@ def test_submit_order_with_risk_fails_closed_without_resolved_stop(monkeypatch):
     )
 
     with pytest.raises(ValueError, match="stop loss"):
-        asyncio.run(submit_order_with_risk(adapter, deployment, signal))
+        asyncio.run(submit_order_with_risk(adapter, deployment, sized_signal))
 
     assert adapter.submitted_signal is None
 
@@ -2382,8 +2382,9 @@ def test_alpaca_rejects_unknown_signal_action_instead_of_selling():
         submit_order=_forbidden,
     )
 
+    bad_signal = _live_signal_with_action("close")
     with pytest.raises(ValueError, match=r"[Uu]nsupported .*action 'close'"):
-        asyncio.run(adapter.submit_order(_live_signal_with_action("close")))
+        asyncio.run(adapter.submit_order(bad_signal))
 
 
 def test_ctrader_rejects_unknown_signal_action_instead_of_selling():
@@ -2421,8 +2422,9 @@ def test_ctrader_rejects_unknown_signal_action_instead_of_selling():
     adapter._ProtoOATradeSide = SimpleNamespace(BUY=1, SELL=2)
     adapter._ProtoOATimeInForce = SimpleNamespace(IMMEDIATE_OR_CANCEL=1)
 
+    bad_signal = _live_signal_with_action("close")
     with pytest.raises(ValueError, match=r"[Uu]nsupported .*action 'close'"):
-        asyncio.run(adapter.submit_order(_live_signal_with_action("close")))
+        asyncio.run(adapter.submit_order(bad_signal))
 
 
 def test_ctrader_new_order_request_carries_sl_tp_prices():
@@ -2530,7 +2532,7 @@ def test_alpaca_build_order_request_fails_closed_without_sl_tp():
     from live_runner import alpaca_adapter as module
 
     adapter = module.AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True)
-    signal = LiveSignal(
+    naked_signal = LiveSignal(
         deployment_id="dep-1",
         symbol="AAPL",
         action="buy",
@@ -2541,7 +2543,7 @@ def test_alpaca_build_order_request_fails_closed_without_sl_tp():
 
     with pytest.raises(ValueError, match="without stop_loss"):
         adapter._build_order_request(
-            signal,
+            naked_signal,
             qty=2.0,
             order_side=SimpleNamespace(BUY="buy", SELL="sell"),
             time_in_force=SimpleNamespace(DAY="day"),
