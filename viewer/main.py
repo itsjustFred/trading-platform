@@ -2359,7 +2359,7 @@ def _delete_portfolio_with_artifacts(portfolio_id: str) -> bool:
     try:
         deleted_db = delete_portfolio_record(normalized_id)
     except Exception as exc:
-        logger.warning("Could not delete portfolio %s from DB: %s", normalized_id, exc)
+        logger.warning("Could not delete portfolio %s from DB: %s", _log_safe(normalized_id), exc)
 
     path = _contained_asset_path(PORTFOLIOS_DIR, normalized_id, ".json")
     deleted_file = False
@@ -2911,7 +2911,7 @@ def _delete_backtest_with_artifacts(backtest_id: str) -> bool:
             json_path.unlink()
             deleted_json = True
         except OSError as exc:
-            logger.warning("Could not delete JSON backtest %s: %s", normalized_id, exc)
+            logger.warning("Could not delete JSON backtest %s: %s", _log_safe(normalized_id), exc)
     return deleted_in_db or deleted_json
 
 
@@ -4314,7 +4314,7 @@ def _benchmark_daily_returns(symbol: str, *, start: str = "", end: str = "") -> 
             intraday_close = _close_series_from_df(fallback_df, symbol=symbol)
             series = intraday_close.resample("1D").last().dropna()
             if not series.empty:
-                logger.info("CAPM benchmark %s: using %s resampled to 1d", symbol, fallback_timeframe)
+                logger.info("CAPM benchmark %s: using %s resampled to 1d", _log_safe(symbol), _log_safe(fallback_timeframe))
                 break
 
     if series.empty:
@@ -7255,7 +7255,7 @@ async def rename_strategy(name: str, payload: NameUpdateRequest) -> dict[str, An
     except HTTPException:
         raise
     except Exception as exc:
-        logger.exception("Failed to rename strategy %s: %s", name, exc)
+        logger.exception("Failed to rename strategy %s: %s", _log_safe(name), exc)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
@@ -8400,7 +8400,7 @@ def _replay_payload(backtest_id: str) -> dict[str, Any]:
     except HTTPException:
         raise
     except Exception as exc:
-        logger.exception("Trade replay payload failed for backtest '%s': %s", backtest_id, exc)
+        logger.exception("Trade replay payload failed for backtest '%s': %s", _log_safe(backtest_id), exc)
         raise HTTPException(status_code=500, detail="Failed to load trade replay") from exc
 
 
@@ -9174,6 +9174,12 @@ async def _collect_source_signals(
     return normalized_signals, normalized_source
 
 
+def _log_safe(value: object) -> str:
+    """Sanitize user-controlled values before writing them to logs (S5145)."""
+    text = str(value)
+    return "".join(ch if ch.isprintable() else "?" for ch in text)
+
+
 def _validated_signal_replay_request(
     payload: BacktestRunSignalsRequest,
 ) -> tuple[
@@ -9878,7 +9884,7 @@ async def get_optimization(optimization_id: str) -> dict[str, Any]:
     try:
         payload = _load_optimization_payload(optimization_id)
     except (OSError, TypeError, ValueError) as exc:
-        logger.exception("Failed to load optimization '%s': %s", optimization_id, exc)
+        logger.exception("Failed to load optimization '%s': %s", _log_safe(optimization_id), exc)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     if payload is None:
@@ -10307,7 +10313,7 @@ async def rename_portfolio(portfolio_id: str, payload: NameUpdateRequest) -> dic
         output_path = PORTFOLIOS_DIR / f"{portfolio_id}.json"
         output_path.write_text(json.dumps(normalized_portfolio, indent=2), encoding="utf-8")
     except Exception as exc:
-        logger.exception("Failed to rename portfolio '%s': %s", portfolio_id, exc)
+        logger.exception("Failed to rename portfolio '%s': %s", _log_safe(portfolio_id), exc)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     _upsert_portfolio_meta_cache_from_payload(normalized_portfolio)
