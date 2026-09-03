@@ -712,3 +712,37 @@ def test_stale_deployment_removed_from_db_is_not_traded(monkeypatch) -> None:
     )
 
     assert adapter.submitted == []
+
+
+def test_deployment_with_unknown_status_is_not_traded(monkeypatch) -> None:
+    """Deny-by-default: a status outside ACTIVE/PAUSED/STOPPED must not trade.
+
+    Pins that _normalize_deployment_status's UNKNOWN fallback keeps
+    _deployment_is_currently_active fail-closed when a new status value
+    appears upstream before live_runner learns about it.
+    """
+    adapter = _SignalSubmittingAdapter()
+    deployment = _discord_deployment("ACTIVE")
+
+    monkeypatch.setattr(
+        daemon,
+        "get_live_deployment",
+        lambda deployment_id: _discord_deployment("MAINTENANCE"),
+    )
+
+    async def _no_wait(_signal, _timeframe):
+        return None
+
+    monkeypatch.setattr(daemon, "wait_for_candle_close", _no_wait)
+
+    asyncio.run(
+        daemon._dispatch_discord_trade_signal(
+            "acc-1",
+            adapter,
+            [deployment],
+            _trade_signal(),
+            accounts_env_values={},
+        )
+    )
+
+    assert adapter.submitted == []
