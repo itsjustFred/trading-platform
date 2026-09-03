@@ -138,6 +138,31 @@ def test_size_live_signal_ignores_metadata_exposure_state():
     assert sized.position_size == 0.0
 
 
+def test_size_live_signal_trusted_exposure_parameter_wins_over_metadata():
+    """Only the caller-supplied (broker-truth) exposure feeds the cap; payload
+    values can neither raise nor lower it (mutation guard)."""
+    signal = _signal(
+        {
+            "entry_price": 100.0,
+            "stop_loss": 98.0,
+            "timeframe": "1m",
+            # Payload claims a nearly-exhausted budget ...
+            "current_exposure": 0.049,
+        }
+    )
+
+    sized = size_live_signal(
+        signal,
+        account_balance=10000.0,
+        config=RiskConfig(max_total_exposure=0.05),
+        # ... but broker truth says the account is flat: full budget available.
+        current_exposure=0.0,
+    )
+
+    assert sized.position_size > 0
+    assert sized.decision.metadata["current_exposure"] == pytest.approx(0.0)
+
+
 def test_size_live_signal_blocks_when_exposure_cap_reached():
     signal = _signal({"entry_price": 100.0, "stop_loss": 98.0, "timeframe": "1m"})
 
@@ -178,6 +203,14 @@ def test_size_live_signal_uses_fallback_stop_when_missing():
     assert sized.decision.metadata["stop_source"] == "fallback_percent"
     assert sized.position_size == pytest.approx(20.0)
     assert signal.metadata["resolved_stop_loss"] == pytest.approx(98.0)
+
+
+def test_risk_config_rejects_non_positive_notional_cap():
+    """The notional bound is a hard policy knob, not an optional hint."""
+    with pytest.raises(ValueError, match="max_notional_per_trade"):
+        RiskConfig(max_notional_per_trade=0.0)
+    with pytest.raises(ValueError, match="max_notional_per_trade"):
+        RiskConfig(max_notional_per_trade=-0.1)
 
 
 def test_size_live_signal_never_raises_on_out_of_domain_metadata():

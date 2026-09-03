@@ -56,6 +56,76 @@ def test_calculate_position_size_normal_case():
     assert sized.decision.metadata["stop_source"] == "signal"
 
 
+def test_calculate_position_size_notional_cap_respects_entry_price():
+    """The cap converts notional into quantity at the signal's own entry price."""
+    engine = RiskEngine(RiskConfig(max_risk_per_trade=0.01, max_total_exposure=0.05))
+    sized_high = engine.calculate_position_size(
+        signal=TradeSignal(
+            action="buy", symbol="HIGH", entry_price=1000.0, stop_loss=980.0,
+            take_profit=None, timeframe="1h", metadata={},
+        ),
+        account_balance=10_000.0, pip_value=1.0, current_exposure=0.0,
+    )
+    sized_low = engine.calculate_position_size(
+        signal=TradeSignal(
+            action="buy", symbol="LOW", entry_price=100.0, stop_loss=98.0,
+            take_profit=None, timeframe="1h", metadata={},
+        ),
+        account_balance=10_000.0, pip_value=1.0, current_exposure=0.0,
+    )
+
+    # Same notional ceiling (0.2 * 10k = 2000) expressed in each asset's units.
+    assert sized_high.position_size == pytest.approx(2.0)
+    assert sized_low.position_size == pytest.approx(20.0)
+    assert sized_high.position_size * 1000.0 == pytest.approx(
+        sized_low.position_size * 100.0
+    )
+
+
+def test_calculate_position_size_notional_cap_converts_at_sub_unit_entry_price():
+    """Sub-1.0 entry prices must not shortcut the notional conversion: the cap
+    divides by the signal's own entry price, whatever its magnitude."""
+    engine = RiskEngine(
+        RiskConfig(max_risk_per_trade=0.01, max_total_exposure=0.05,
+                   max_notional_per_trade=0.5)
+    )
+    signal = TradeSignal(
+        action="buy", symbol="PENNY", entry_price=0.5, stop_loss=0.4999,
+        take_profit=None, timeframe="1h", metadata={},
+    )
+
+    sized = engine.calculate_position_size(
+        signal=signal, account_balance=10_000.0, pip_value=1.0, current_exposure=0.0,
+    )
+
+    # Ceiling 0.5 * 10k = 5000 notional -> 5000 / 0.5 entry = 10000 units.
+    assert sized.position_size == pytest.approx(10_000.0)
+    assert sized.position_size * 0.5 == pytest.approx(5000.0)
+    assert sized.decision.metadata["capped_by_notional"] is True
+
+
+def test_calculate_position_size_notional_cap_edge_is_inclusive():
+    """A position exactly at the ceiling is accepted unchanged (>= would
+    spuriously re-write the same quantity and flag the cap)."""
+    engine = RiskEngine(
+        RiskConfig(max_risk_per_trade=0.01, max_total_exposure=0.05,
+                   max_notional_per_trade=1.0)
+    )
+    signal = TradeSignal(
+        action="buy", symbol="EDGE", entry_price=100.0, stop_loss=99.0,
+        take_profit=None, timeframe="1h", metadata={},
+    )
+
+    sized = engine.calculate_position_size(
+        signal=signal, account_balance=10_000.0, pip_value=1.0, current_exposure=0.0,
+    )
+
+    # Uncapped risk sizing: 100 / 1 = 100 shares, exactly at the 10_000
+    # notional ceiling (max_notional_per_trade=1.0) but not beyond it.
+    assert sized.position_size == pytest.approx(100.0)
+    assert sized.decision.metadata["capped_by_notional"] is False
+
+
 def test_calculate_position_size_exposure_limit_hit():
     engine = RiskEngine(
         RiskConfig(
