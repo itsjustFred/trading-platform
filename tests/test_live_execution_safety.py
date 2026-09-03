@@ -2377,16 +2377,16 @@ def test_alpaca_build_order_request_rejects_unknown_signal_action():
     bad_signal = _live_signal_with_action("close")
 
     builder = adapter._build_order_request
+    kwargs = dict(
+        qty=1.0,
+        order_side=SimpleNamespace(BUY="buy", SELL="sell"),
+        time_in_force=SimpleNamespace(DAY="day"),
+        limit_request_cls=lambda **kw: ("limit", kw),
+        market_request_cls=lambda **kw: ("market", kw),
+        client_order_id="cid-unknown-action",
+    )
     with pytest.raises(ValueError, match=r"[Uu]nsupported .*action: close"):
-        builder(
-            bad_signal,
-            qty=1.0,
-            order_side=SimpleNamespace(BUY="buy", SELL="sell"),
-            time_in_force=SimpleNamespace(DAY="day"),
-            limit_request_cls=lambda **kwargs: ("limit", kwargs),
-            market_request_cls=lambda **kwargs: ("market", kwargs),
-            client_order_id="cid-unknown-action",
-        )
+        builder(bad_signal, **kwargs)
 
 
 def test_ctrader_rejects_unknown_signal_action_instead_of_selling():
