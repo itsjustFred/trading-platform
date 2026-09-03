@@ -205,7 +205,7 @@ class PyneCoreAdapter(EngineAdapter):
                 timeout=300,
             )
         except subprocess.TimeoutExpired as exc:
-            logger.error(
+            logger.exception(
                 "PyneCore run for %s timed out after %s seconds", symbol, exc.timeout
             )
             raise RuntimeError(
