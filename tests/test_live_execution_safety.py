@@ -690,6 +690,12 @@ def test_submit_order_with_risk_exit_only_flattens_broker_qty():
     # notional ceiling (0.2 * 100k / 1.1 entry) — payload 400.0 is ignored.
     max_qty = 100_000.0 * 0.05 / 1.1
     assert adapter.submitted_qty == pytest.approx(min(3.0, max_qty))
+    # The submitted object is the original LiveSignal (persistable), enriched
+    # with the trusted reduce-only sizing facts — not a SizedOrder shell.
+    assert isinstance(adapter.submitted_signal, LiveSignal)
+    assert adapter.submitted_signal.metadata["risk_sizing_mode"] == "reduce_only"
+    assert adapter.submitted_signal.metadata["qty"] == pytest.approx(min(3.0, max_qty))
+    assert "explicit_qty" not in adapter.submitted_signal.metadata
 
 
 def test_alpaca_submit_order_trusted_qty_channel_overrides_metadata(monkeypatch):

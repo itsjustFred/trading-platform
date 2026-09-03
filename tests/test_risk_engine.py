@@ -104,6 +104,26 @@ def test_calculate_position_size_notional_cap_converts_at_sub_unit_entry_price()
     assert sized.decision.metadata["capped_by_notional"] is True
 
 
+def test_calculate_position_size_reports_realized_risk_when_capped():
+    """risk_amount/risk_percent stay the policy figures; the realized stop-loss
+    amount of the capped position is reported via metadata."""
+    engine = RiskEngine(RiskConfig(max_risk_per_trade=0.01, max_total_exposure=0.05))
+    signal = TradeSignal(
+        action="buy", symbol="CAPPED", entry_price=100.0, stop_loss=98.0,
+        take_profit=None, timeframe="1h", metadata={},
+    )
+
+    sized = engine.calculate_position_size(
+        signal=signal, account_balance=10_000.0, pip_value=1.0, current_exposure=0.0,
+    )
+
+    md = sized.decision.metadata
+    assert md["capped_by_notional"] is True
+    assert sized.risk_amount == pytest.approx(100.0)  # policy figure
+    # Realized: 20 shares * 2.0 distance * 1.0 pip = 40 account currency.
+    assert md["realized_risk_amount"] == pytest.approx(40.0)
+
+
 def test_calculate_position_size_notional_cap_edge_is_inclusive():
     """A position exactly at the ceiling is accepted unchanged (>= would
     spuriously re-write the same quantity and flag the cap)."""
