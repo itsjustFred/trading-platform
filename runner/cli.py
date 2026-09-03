@@ -255,11 +255,12 @@ def cmd_run(args):
         ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         output_path = str(BACKTESTS_DIR / f"{config.strategy_name}_{ts}.trades.json")
 
-    result.save(output_path)
     if not getattr(args, "keep_indicators", False):
-        # Default is indicator-stripped output (F3): the flag exists only on the
+        # Default is indicator-stripped output (F3): strip BEFORE saving so the
+        # serialized JSON omits indicators. The flag exists only on the
         # grid/matrix commands, which opt in explicitly.
         result.indicators = []
+    result.save(output_path)
     if not getattr(args, "skip_sqlite", False):
         try:
             save_result_to_sqlite(result)

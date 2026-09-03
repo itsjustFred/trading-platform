@@ -250,7 +250,15 @@ def _detect_date_range(symbol: str, timeframe: str, data_dir: str) -> tuple[str,
             f"No OHLCV data found for {symbol}/{timeframe} under {root}; "
             "refusing to fabricate a backtest date range"
         )
-    df = pd.read_parquet(matches[0], columns=["timestamp"])
+    df = pd.read_parquet(matches[0])
+    df.columns = [str(c).lower() for c in df.columns]
+    if "timestamp" not in df.columns:
+        # Same contract as runner.cli._detect_date_range: a file without a
+        # readable timestamp column cannot contribute a date range.
+        raise ValueError(
+            f"OHLCV data for {symbol}/{timeframe} under {root} has no "
+            "timestamp column; refusing to fabricate a backtest date range"
+        )
     ts = pd.to_datetime(df["timestamp"], utc=True, errors="coerce").dropna()
     if ts.empty:
         raise ValueError(
@@ -278,6 +286,28 @@ def _resolve_dates_for_equity(
     return start_date, end_date
 
 
+def _failed_cell(
+    request: CellRequest,
+    *,
+    error_class: str,
+    error: str,
+) -> dict[str, Any]:
+    """A minimal failed cell record for preambles that cannot complete."""
+    return {
+        "run_id": build_run_id(request.strategy, request.symbol, request.timeframe),
+        "symbol": request.symbol,
+        "timeframe": request.timeframe,
+        "start": request.start,
+        "end": request.end,
+        "output": str(output_path_for(request.output_dir, build_run_id(request.strategy, request.symbol, request.timeframe))),
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+        "status": "failed",
+        "error_class": error_class,
+        "error": error,
+    }
+
+
 def _init_cell_result(request: CellRequest) -> dict[str, Any]:
     """Build the shared cell record and honor the skip-existing shortcut.
 
@@ -285,13 +315,17 @@ def _init_cell_result(request: CellRequest) -> dict[str, Any]:
     output was reused (``skipped_existing``) or turned out to be unreadable
     (``failed``). The resolved window is computed once here so the reported
     cell window, the CLI command and ``attach_daily_equity`` all see the same
-    dates — callers must not re-resolve.
+    dates — callers must not re-resolve. Resolution errors fail only this cell
+    (like every other preamble error); they must not escape into the grid.
     """
     run_id = build_run_id(request.strategy, request.symbol, request.timeframe)
     path = output_path_for(request.output_dir, run_id)
-    resolved_start, resolved_end = _resolve_dates_for_equity(
-        request.symbol, request.timeframe, request.data_dir, request.start, request.end
-    )
+    try:
+        resolved_start, resolved_end = _resolve_dates_for_equity(
+            request.symbol, request.timeframe, request.data_dir, request.start, request.end
+        )
+    except (OSError, ValueError) as exc:
+        return _failed_cell(request, error_class="no_data", error=str(exc))
     result: dict[str, Any] = {
         "run_id": run_id,
         "symbol": request.symbol,
@@ -665,6 +699,7 @@ def run_backtest_grid(
             "skip_existing": skip_existing,
             "use_subprocess": use_subprocess,
             "save_sqlite": save_sqlite,
+            "keep_indicators": keep_indicators,
         }
         for symbol in normalized_symbols
         for timeframe in normalized_timeframes

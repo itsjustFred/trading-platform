@@ -325,3 +325,80 @@ def test_read_backtest_stats_exposes_canonical_keys(tmp_path):
     )
     poisoned_stats = bg.read_backtest_stats(poisoned)
     assert poisoned_stats["net_profit_pct"] is None
+
+
+def test_missing_data_fails_only_that_cell(monkeypatch, tmp_path):
+    """CodeRabbit (cycle 2, critical): a cell whose data cannot be resolved must
+    produce a failed cell record — not raise out of run_one_backtest and abort
+    the whole grid run."""
+    result = run_one_backtest(
+        strategy=str(tmp_path / "trend_following.py"),
+        symbol="NOSUCHSYMBOL",
+        timeframe="1h",
+        start="",
+        end="",
+        engine="vectorbt",
+        capital=10000.0,
+        risk_pct=0.01,
+        max_position_pct=None,
+        max_leverage=None,
+        intrabar_resolution="open_close",
+        params=None,
+        output_dir=tmp_path / "out",
+        data_dir=str(tmp_path / "data"),
+        timeout_seconds=5,
+        skip_existing=False,
+        use_subprocess=False,
+    )
+
+    assert result["status"] == "failed"
+    assert result["error_class"] == "no_data"
+    assert "refusing to fabricate" in result["error"]
+    assert result["finished_at"]
+
+
+def test_detect_date_range_handles_case_insensitive_timestamp_column(tmp_path):
+    """CodeRabbit (cycle 2, minor): a parquet whose timestamp column is cased
+    differently must still contribute its range (same contract as
+    runner.cli._detect_date_range); a file without any timestamp column fails
+    loudly instead of being projected into a KeyError."""
+    import pandas as pd
+
+    data_dir = tmp_path / "data"
+    cased = data_dir / "ohlcv" / "test" / "AAA" / "1d.parquet"
+    cased.parent.mkdir(parents=True, exist_ok=True)
+    stamps = pd.date_range("2024-01-01", periods=5, freq="D", tz="UTC")
+    pd.DataFrame({"Timestamp": stamps, "close": [1.0] * 5}).to_parquet(cased, index=False)
+
+    start, end = bg._detect_date_range("AAA", "1d", str(data_dir))
+    assert (start, end) == ("2024-01-01", "2024-01-05")
+
+    nots = data_dir / "ohlcv" / "test" / "BBB" / "1d.parquet"
+    nots.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({"px": [1.0, 2.0]}).to_parquet(nots, index=False)
+
+    with pytest.raises(ValueError, match="timestamp column"):
+        bg._detect_date_range("BBB", "1d", str(data_dir))
+
+
+def test_grid_tasks_carry_keep_indicators(tmp_path, monkeypatch):
+    """CodeRabbit (cycle 2, major): run_backtest_grid must forward
+    keep_indicators into each cell request instead of silently dropping it."""
+    strategy = tmp_path / "trend_following.py"
+    strategy.write_text("STRATEGY_META = {'name': 'trend_following'}\n", encoding="utf-8")
+    captured: list[dict] = []
+
+    def fake_run_one(**kwargs):
+        captured.append(kwargs)
+        return {"symbol": kwargs["symbol"], "timeframe": kwargs["timeframe"], "status": "failed",
+                "finished_at": "2026-09-03T00:00:00+00:00"}
+
+    monkeypatch.setattr("runner.backtest_grid.run_one_backtest", fake_run_one)
+
+    run_backtest_grid(
+        strategy=str(strategy), symbols=["XAUUSD"], timeframes=["1h"],
+        start="2025-01-01", end="2025-01-31", output_dir=tmp_path / "out",
+        max_workers=1, keep_indicators=True,
+    )
+
+    assert captured and all(cell["keep_indicators"] is True for cell in captured)
