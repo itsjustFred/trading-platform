@@ -98,11 +98,9 @@ def _windowed_curve(
 ) -> list[EquityPoint] | None:
     """The engine-provided curve scoped to the same window as the aggregation.
 
-    Without a window this is the untouched engine curve; with one it is the
-    windowed view computed by ``_scoped_view`` (pre-mortem 16-B #7).
+    Delegates to ``_scoped_view``: with a window it is the windowed curve,
+    without one the engine curve passes through unchanged (pre-mortem 16-B #7).
     """
-    if not start_bound and not end_bound:
-        return result.equity_curve
     return _scoped_view(result, start_bound, end_bound).equity_curve
 
 

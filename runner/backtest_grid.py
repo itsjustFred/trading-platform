@@ -292,14 +292,19 @@ def _failed_cell(
     error_class: str,
     error: str,
 ) -> dict[str, Any]:
-    """A minimal failed cell record for preambles that cannot complete."""
+    """A minimal failed cell record for preambles that cannot complete.
+
+    ``start``/``end`` carry the *requested* window by construction: resolution
+    failed, so no resolved window exists to report (pre-mortem 16-B #9).
+    """
+    run_id = build_run_id(request.strategy, request.symbol, request.timeframe)
     return {
-        "run_id": build_run_id(request.strategy, request.symbol, request.timeframe),
+        "run_id": run_id,
         "symbol": request.symbol,
         "timeframe": request.timeframe,
         "start": request.start,
         "end": request.end,
-        "output": str(output_path_for(request.output_dir, build_run_id(request.strategy, request.symbol, request.timeframe))),
+        "output": str(output_path_for(request.output_dir, run_id)),
         "started_at": datetime.now(timezone.utc).isoformat(),
         "finished_at": datetime.now(timezone.utc).isoformat(),
         "status": "failed",
@@ -380,8 +385,10 @@ class CellRequest:
 def _run_backtest_in_process_body(request: CellRequest) -> dict[str, Any]:
     """Run the engine for one cell and persist the result.
 
-    Returns the extra cell fields (e.g. ``auto_downloaded_data``); raising
-    propagates to the caller's failure classification.
+    Reads the cell knobs through ``request`` (single source of truth); only the
+    short-lived locals used several times in a row are unpacked. Returns the
+    extra cell fields (e.g. ``auto_downloaded_data``); raising propagates to
+    the caller's failure classification.
     """
     strategy = request.strategy
     symbol = request.symbol
@@ -389,6 +396,7 @@ def _run_backtest_in_process_body(request: CellRequest) -> dict[str, Any]:
     data_dir = request.data_dir
     keep_indicators = request.keep_indicators
     save_sqlite = request.save_sqlite
+    intrabar_resolution = request.intrabar_resolution
     strategy_type = detect_strategy_type(Path(strategy).resolve())
     if strategy_type == StrategyType.SIGNAL_PROCESSOR:
         raise ValueError(
@@ -410,7 +418,7 @@ def _run_backtest_in_process_body(request: CellRequest) -> dict[str, Any]:
         start=start_date,
         end=end_date,
         data_dir=data_dir,
-        modeling_resolution=request.intrabar_resolution or "open_close",
+        modeling_resolution=intrabar_resolution or "open_close",
         log_callback=logger.info,
     )
 
@@ -424,7 +432,7 @@ def _run_backtest_in_process_body(request: CellRequest) -> dict[str, Any]:
         risk_per_trade_pct=request.risk_pct,
         max_position_pct=request.max_position_pct,
         max_leverage=request.max_leverage,
-        modeling_resolution=request.intrabar_resolution or "open_close",
+        modeling_resolution=intrabar_resolution or "open_close",
         data_dir=data_dir,
         parameters=resolved_parameters,
     )
