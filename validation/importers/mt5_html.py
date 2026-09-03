@@ -86,9 +86,11 @@ class MT5HTMLImporter(BaseImporter):
             **kwargs:
                 Forwarded to ``BeautifulSoup`` parser selection.
             """
-            path = Path(source)
+            path = Path(source).resolve()
             if not path.exists():
                 raise FileNotFoundError(f"MT5 HTML report not found: {path}")
+            if not path.is_file():
+                raise ValueError(f"MT5 HTML report is not a file: {path}")
 
             html_text = path.read_text(encoding="utf-8", errors="replace")
             soup = BeautifulSoup(html_text, kwargs.pop("features", "lxml"))
