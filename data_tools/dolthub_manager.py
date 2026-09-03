@@ -119,7 +119,7 @@ def update_repos():
                     # Per-repo update failures are logged and skipped so one
                     # stuck repo does not block the others (DV-B28: the
                     # timeout itself stays mandatory).
-                    logger.error("Failed to pull %s: %s", name, exc)
+                    logger.exception("Failed to pull %s: %s", name, exc)
             else:
                 logger.warning(f"{repo_path} exists but is not a dolt repo. Skipping.")
         else:
@@ -132,7 +132,7 @@ def update_repos():
                     timeout=3 * DEFAULT_DOLT_TIMEOUT_SECONDS,
                 )
             except (subprocess.CalledProcessError, DoltTimeoutError) as exc:
-                logger.error("Failed to clone %s: %s", remote, exc)
+                logger.exception("Failed to clone %s: %s", remote, exc)
 
 
 def _list_tables(repo_path: Path) -> list[str]:

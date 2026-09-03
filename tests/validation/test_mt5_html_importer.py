@@ -208,14 +208,14 @@ class TestDirectionRequiresTypColumn:
     """DV-B42: direction must never be inferred from a missing Typ column."""
 
     def test_missing_typ_column_raises(self, tmp_path: Path):
-        with pytest.raises(ValueError, match="Typ") as excinfo:
+        with pytest.raises(ValueError) as excinfo:
             MT5HTMLImporter().load(
                 Path("tests/fixtures/validation/mt5_html/missing_typ.html")
             )
         assert "Typ" in str(excinfo.value)
 
     def test_unsupported_entry_typ_raises(self):
-        with pytest.raises(ValueError, match="buy limit") as excinfo:
+        with pytest.raises(ValueError) as excinfo:
             MT5HTMLImporter().load(
                 Path("tests/fixtures/validation/mt5_html/bad_typ.html")
             )

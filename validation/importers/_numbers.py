@@ -84,6 +84,20 @@ def _split_ascii(text: str, last_dot: int) -> tuple[str, str] | None:
     digits, _, decimal = text.partition(",")
     return digits, decimal
 
+
+def _split_sign(text: str | None) -> tuple[str | None, bool]:
+    """Strip a leading sign from *text*; return (digits-only text, negative).
+
+    Returns ``(None, False)`` when *text* is empty or sign-only.
+    """
+    if text is None:
+        return None, False
+    negative = text.startswith("-")
+    if negative or text.startswith("+"):
+        text = text[1:]
+    return (text or None), negative
+
+
 def parse_locale_number(raw: str | None, decimal_comma: bool) -> float | None:
     """Parse a locale-formatted number into a float.
 
@@ -100,14 +114,8 @@ def parse_locale_number(raw: str | None, decimal_comma: bool) -> float | None:
     non-numeric, or mixed grouping such as "1.2.3") so callers can skip the
     value instead of storing a corrupted one.
     """
-    text = _normalise_number(raw)
+    text, negative = _split_sign(_normalise_number(raw))
     if text is None:
-        return None
-
-    negative = text.startswith("-")
-    if negative or text.startswith("+"):
-        text = text[1:]
-    if not text:
         return None
 
     last_comma = text.rfind(",")
@@ -133,6 +141,7 @@ def parse_locale_number(raw: str | None, decimal_comma: bool) -> float | None:
 
     value = float(f"{digits}.{decimal}" if decimal else digits)
     return -value if negative else value
+
 
 _GROUPED_DOT = re.compile(r"^\d{1,3}(\.\d{3})+$")
 
