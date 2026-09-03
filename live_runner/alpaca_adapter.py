@@ -15,6 +15,7 @@ from alpaca.trading.enums import OrderClass
 from alpaca.trading.requests import StopLossRequest, TakeProfitRequest
 
 from live_runner.base_adapter import BaseLiveAdapter
+from live_runner.credential_env import parse_bool_env
 from risk.live import size_live_signal
 from shared.database import (
     get_live_signal_broker_order_id,
@@ -37,10 +38,12 @@ _SL_METADATA_KEYS = ("stop_loss", "sl_price", "stop_price", "resolved_stop_loss"
 _TP_METADATA_KEYS = ("take_profit", "tp_price")
 
 
-def _parse_bool_env(value: str | None, default: bool = True) -> bool:
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
+def _parse_bool_env(name: str, value: str | None, *, default: bool = True) -> bool:
+    """Strict boolean parsing shared with live_runner.credential_env.
+
+    A typo'd value raises instead of silently selecting live/paper mode.
+    """
+    return parse_bool_env(name, value, default=default)
 
 
 def _to_float(value: Any, *, default: float = 0.0) -> float:
@@ -84,7 +87,12 @@ def _default_alpaca_credentials(values: Mapping[str, str]) -> tuple[str, str, bo
     api_key = str(values.get("ALPACA_API_KEY", "")).strip()
     secret_key = str(values.get("ALPACA_SECRET_KEY", "")).strip()
     if api_key and secret_key:
-        paper = _parse_bool_env(str(values.get("ALPACA_PAPER", "")).strip(), default=True)
+        raw_paper = values.get("ALPACA_PAPER")
+        paper = _parse_bool_env(
+            "ALPACA_PAPER",
+            str(raw_paper).strip() if raw_paper is not None else None,
+            default=True,
+        )
         return api_key, secret_key, paper
     return None
 
@@ -116,11 +124,13 @@ def _alpaca_credential_blocks(
         else:
             raw_paper = values.get(f"ALPACA_PAPER_ACC{idx}")
             paper = _parse_bool_env(
+                f"ALPACA_PAPER_ACC{idx}",
                 str(raw_paper).strip() if raw_paper is not None else None,
                 default=True,
             )
         blocks.append(
             {
+                "source_index": f"ACC{idx}",
                 "api_key": api_key,
                 "secret_key": secret_key,
                 "paper": paper,
@@ -240,7 +250,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         self.api_key = api_key or os.environ.get("ALPACA_API_KEY", "")
         self.secret_key = secret_key or os.environ.get("ALPACA_SECRET_KEY", "")
         self.paper = (
-            _parse_bool_env(os.environ.get("ALPACA_PAPER"), default=True)
+            _parse_bool_env("ALPACA_PAPER", os.environ.get("ALPACA_PAPER"), default=True)
             if paper is None
             else paper
         )

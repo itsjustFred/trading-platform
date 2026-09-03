@@ -30,6 +30,11 @@ from ctrader_open_api.messages.OpenApiMessages_pb2 import (
 )
 from google.protobuf.json_format import MessageToDict
 
+from live_runner.alpaca_adapter import (
+    _alpaca_acc_indexes,
+    _alpaca_credential_blocks,
+    _default_alpaca_credentials,
+)
 from live_runner.credential_env import load_accounts_env_values
 from shared.logging import get_logger
 from shared.models import LiveAccount
@@ -74,19 +79,6 @@ def _safe_float(value: Any, *, default: float = 0.0) -> float:
     return numeric
 
 
-def _parse_bool_env(value: str | None, *, default: bool = True) -> bool:
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _alpaca_paper_from_endpoint(endpoint: str) -> bool:
-    normalized = endpoint.strip().lower()
-    if not normalized:
-        return True
-    return "paper" in normalized
-
-
 def _ctrader_host_matches_environment(*, host: str, is_live: bool) -> bool:
     normalized_host = host.strip().lower()
     if "demo" in normalized_host:
@@ -111,43 +103,36 @@ def _is_ctrader_account_not_authorized_error(error_text: str) -> bool:
 
 
 def _iter_alpaca_credentials(env: dict[str, str]) -> list[dict[str, Any]]:
-    indexed: list[dict[str, Any]] = []
-    indexes = sorted(
-        {
-            int(match.group("index"))
-            for key in env
-            if (match := _ALPACA_ACC_RE.match(key))
-        }
-    )
+    """Enumerate Alpaca credential sets using the adapter's block parser.
 
-    for idx in indexes:
-        api_key = str(env.get(f"ALPACA_API_KEY_ACC{idx}", "")).strip()
-        secret_key = str(env.get(f"ALPACA_SECRET_KEY_ACC{idx}", "")).strip()
-        endpoint = str(env.get(f"ALPACA_ENDPOINT_ACC{idx}", "")).strip()
-        if not api_key or not secret_key:
-            continue
+    Sharing one parser (live_runner.alpaca_adapter) keeps the discovered
+    `paper` flag identical to the mode the runtime adapter is constructed
+    with, so is_demo can never contradict the actual trading mode.
+    """
+    indexed: list[dict[str, Any]] = []
+    for block in _alpaca_credential_blocks(env, _alpaca_acc_indexes(env)):
         indexed.append(
             {
-                "key": f"ACC{idx}",
-                "api_key": api_key,
-                "secret_key": secret_key,
-                "paper": _alpaca_paper_from_endpoint(endpoint),
+                "key": str(block.get("source_index", "")),
+                "api_key": str(block["api_key"]),
+                "secret_key": str(block["secret_key"]),
+                "paper": bool(block["paper"]),
             }
         )
 
     if indexed:
         return indexed
 
-    api_key = str(env.get("ALPACA_API_KEY", "")).strip()
-    secret_key = str(env.get("ALPACA_SECRET_KEY", "")).strip()
-    if not api_key or not secret_key:
+    default_credentials = _default_alpaca_credentials(env)
+    if default_credentials is None:
         return []
+    api_key, secret_key, paper = default_credentials
     return [
         {
             "key": "DEFAULT",
             "api_key": api_key,
             "secret_key": secret_key,
-            "paper": _parse_bool_env(env.get("ALPACA_PAPER"), default=True),
+            "paper": paper,
         }
     ]
 
