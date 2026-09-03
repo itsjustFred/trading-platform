@@ -19,50 +19,13 @@ import pytest
 
 from runner.engines.base import BacktestConfig
 from runner.engines.native_adapter import NativeAdapter
+from tests.helpers import deterministic_ohlcv_frame, sma_crossover_strategy_text
 
-STRATEGY = """
-import pandas as pd
-
-STRATEGY_META = {"name": "curve_sma", "version": "1.0",
-                 "parameters": {"fast_length": 3, "slow_length": 10}}
-
-def generate_signals(df, params):
-    close = df["close"]
-    fast = close.rolling(int(params.get("fast_length", 3))).mean()
-    slow = close.rolling(int(params.get("slow_length", 10))).mean()
-    entries = (fast > slow) & (fast.shift(1) <= slow.shift(1))
-    exits = (fast < slow) & (fast.shift(1) >= slow.shift(1))
-    indicators = {"direction": pd.Series("LONG", index=df.index)}
-    return entries, exits, indicators
-"""
+STRATEGY = sma_crossover_strategy_text("curve_sma")
 
 
 def _frame(*, periods: int = 300) -> pd.DataFrame:
-    closes: list[float] = []
-    price = 100.0
-    for _ in range(3):
-        for _ in range(30):
-            price += 0.5
-            closes.append(price)
-        for _ in range(20):
-            closes.append(price)
-        for _ in range(30):
-            price -= 0.5
-            closes.append(price)
-        for _ in range(20):
-            closes.append(price)
-    closes = closes[:periods]
-    timestamps = pd.date_range("2024-01-01", periods=len(closes), freq="h", tz="UTC")
-    return pd.DataFrame(
-        {
-            "timestamp": timestamps,
-            "open": closes,
-            "high": [c + 0.25 for c in closes],
-            "low": [c - 0.25 for c in closes],
-            "close": closes,
-            "volume": [1000.0] * len(closes),
-        }
-    )
+    return deterministic_ohlcv_frame(periods=periods)
 
 
 @pytest.fixture()

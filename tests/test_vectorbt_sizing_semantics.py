@@ -22,60 +22,20 @@ import pytest
 
 from runner.engines.base import BacktestConfig
 from runner.engines.vectorbt_adapter import VectorbtAdapter, _resolve_max_leverage
+from tests.helpers import sma_crossover_strategy_text
 
 
-STRATEGY = """
-import pandas as pd
+from tests.helpers import deterministic_ohlcv_frame, write_ohlcv as _write_shared_ohlcv
 
-STRATEGY_META = {"name": "vbt_sizing_sma", "version": "1.0",
-                 "parameters": {"fast_length": 3, "slow_length": 10}}
-
-def generate_signals(df, params):
-    close = df["close"]
-    fast = close.rolling(int(params.get("fast_length", 3))).mean()
-    slow = close.rolling(int(params.get("slow_length", 10))).mean()
-    entries = (fast > slow) & (fast.shift(1) <= slow.shift(1))
-    exits = (fast < slow) & (fast.shift(1) >= slow.shift(1))
-    indicators = {
-        "direction": pd.Series("LONG", index=df.index),
-        "stop_loss": pd.Series([df["close"].iloc[0] * 0.95] * len(df), index=df.index),
-    }
-    return entries, exits, indicators
-"""
+STRATEGY = sma_crossover_strategy_text("vbt_sizing_sma", with_stop_loss=True)
 
 
 def _deterministic_frame(*, periods: int = 300, start: float = 100.0) -> pd.DataFrame:
-    closes: list[float] = []
-    price = start
-    for cycle in range(3):
-        for _ in range(30):
-            price += 0.5
-            closes.append(price)
-        for _ in range(20):
-            closes.append(price)
-        for _ in range(30):
-            price -= 0.5
-            closes.append(price)
-        for _ in range(20):
-            closes.append(price)
-    closes = closes[:periods]
-    timestamps = pd.date_range("2024-01-01", periods=len(closes), freq="h", tz="UTC")
-    return pd.DataFrame(
-        {
-            "timestamp": timestamps,
-            "open": closes,
-            "high": [c + 0.25 for c in closes],
-            "low": [c - 0.25 for c in closes],
-            "close": closes,
-            "volume": [1000.0] * len(closes),
-        }
-    )
+    return deterministic_ohlcv_frame(periods=periods, start=start)
 
 
 def _write_ohlcv(data_dir: Path, symbol: str, frame: pd.DataFrame) -> None:
-    symbol_dir = data_dir / "ohlcv" / "test_source" / "equities" / symbol
-    symbol_dir.mkdir(parents=True, exist_ok=True)
-    frame.to_parquet(symbol_dir / "1h.parquet", index=False)
+    _write_shared_ohlcv(data_dir, symbol, frame)
 
 
 def _config(tmp_path: Path, **overrides: Any) -> BacktestConfig:

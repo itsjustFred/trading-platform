@@ -128,6 +128,30 @@ class TestSignalMergeElementWise:
 class TestSizingEquityExcludesUnrealizedPnl:
     """Positions must be sized from realized cash, not mark-to-market equity."""
 
+    @staticmethod
+    def _run_two_entry_scenario(pump_price: float):
+        """Shared two-entry scenario: entries on bars 0 and 2, bar 2 pumped
+        (or dumped) to ``pump_price`` so the open position carries a large
+        unrealized PnL when entry 2 is sized."""
+        frame = _linear_frame(6, start=100.0)
+        frame.loc[2, "high"] = max(pump_price, 100.5) if pump_price > 100 else frame.loc[2, "high"]
+        frame.loc[2, "low"] = min(pump_price, 99.5) if pump_price < 100 else frame.loc[2, "low"]
+        frame.loc[2, "close"] = pump_price
+        frame.loc[3, "close"] = pump_price
+        frame.loc[3, "open"] = pump_price
+
+        entries = pd.Series([False] * len(frame), index=frame.index)
+        entries.iloc[0] = True
+        entries.iloc[2] = True
+        exits = pd.Series([False] * len(frame), index=frame.index)
+        strategy = lambda df, params: (  # noqa: E731
+        entries, exits)
+
+        engine = TradeEngine(_config(Path("/tmp")), symbol="PROBE")
+        engine.run(frame, strategy)
+        assert len(engine.closed_trades) >= 2
+        return engine.closed_trades[1].quantity
+
     def test_second_entry_sized_on_realized_not_mark_to_market(self):
         """While position 1 rides an open profit, position 2 must not grow.
 
@@ -135,59 +159,24 @@ class TestSizingEquityExcludesUnrealizedPnl:
         (unrealized +30/qty). A second entry on bar 3 sizes from the same
         capital base as the first — the paper profit is not spendable.
         """
-        frame = _linear_frame(6, start=100.0)
-        # Bar closes: 100, 101, 102, 103, 104, 105; pump bar 2's high/close.
-        frame.loc[2, "high"] = 130.0
-        frame.loc[2, "close"] = 130.0
-        frame.loc[3, "close"] = 130.0
-        frame.loc[3, "open"] = 130.0
-
-        entries = pd.Series([False] * len(frame), index=frame.index)
-        entries.iloc[0] = True
-        entries.iloc[2] = True
-        exits = pd.Series([False] * len(frame), index=frame.index)
-        strategy = lambda df, params: (  # noqa: E731
-        entries, exits)
-
-        engine = TradeEngine(_config(Path("/tmp")), symbol="PROBE")
-        engine.run(frame, strategy)
-
-        assert len(engine.closed_trades) >= 2
-        first_qty = engine.closed_trades[0].quantity
-        second_qty = engine.closed_trades[1].quantity
         # Sizing capital is realized cash (100k, unchanged — no trade closed),
         # so the second entry (fill 130) must size 100000/130 ≈ 769.23.
         # Mark-to-market sizing would use equity 100k + 30*1000 = 160k → 1230.77.
-        assert second_qty == pytest.approx(100_000.0 / 130.0, rel=1e-9), (
+        assert self._run_two_entry_scenario(130.0) == pytest.approx(
+            100_000.0 / 130.0, rel=1e-9
+        ), (
             "the second entry must size from realized cash (100k), not from "
-            f"mark-to-market equity ({first_qty * 130 / 1000:.0f}k would be MTM)"
+            "mark-to-market equity (160k would be MTM)"
         )
 
     def test_unrealized_loss_does_not_shrink_sizing(self):
         """The mirror case: open losses must not shrink new position sizes."""
-        frame = _linear_frame(6, start=100.0)
-        frame.loc[2, "low"] = 70.0
-        frame.loc[2, "close"] = 70.0
-        frame.loc[3, "close"] = 70.0
-        frame.loc[3, "open"] = 70.0
-
-        entries = pd.Series([False] * len(frame), index=frame.index)
-        entries.iloc[0] = True
-        entries.iloc[2] = True
-        exits = pd.Series([False] * len(frame), index=frame.index)
-        strategy = lambda df, params: (  # noqa: E731
-        entries, exits)
-
-        engine = TradeEngine(_config(Path("/tmp")), symbol="PROBE")
-        engine.run(frame, strategy)
-
-        assert len(engine.closed_trades) >= 2
-        first_qty = engine.closed_trades[0].quantity
-        second_qty = engine.closed_trades[1].quantity
         # Sizing capital is realized cash (100k), so the second entry (fill 70)
         # sizes 100000/70 ≈ 1428.57. Mark-to-market sizing would use equity
         # 100k − 30*1000 = 40k → 571.43 (paper losses shrinking new sizes).
-        assert second_qty == pytest.approx(100_000.0 / 70.0, rel=1e-9), (
+        assert self._run_two_entry_scenario(70.0) == pytest.approx(
+            100_000.0 / 70.0, rel=1e-9
+        ), (
             "an unrealized drawdown must not reduce the cash available for sizing"
         )
 
