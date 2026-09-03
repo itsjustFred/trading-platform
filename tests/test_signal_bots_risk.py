@@ -67,7 +67,9 @@ def test_signal_with_sl_sizes_from_stop_distance() -> None:
     risk_distance = abs(signal.entry_price - float(signal.stop_loss))
     assert risk_distance > 0
     assert sized.risk_amount == pytest.approx(1_000.0)
-    assert sized.position_size == pytest.approx(1_000.0 / risk_distance)
+    notional_cap = 100_000.0 * engine.config.max_notional_per_trade
+    expected = min(1_000.0 / risk_distance, notional_cap / signal.entry_price)
+    assert sized.position_size == pytest.approx(expected)
 
 
 def test_signal_without_sl_uses_atr_fallback_stop() -> None:

@@ -41,12 +41,14 @@ def test_calculate_position_size_normal_case():
 
     assert sized.risk_percent == 0.01
     assert sized.risk_amount == 100.0
-    assert sized.position_size == 50.0
+    # Notional cap: 50 shares * 100 = 5000 > 0.2 * 10000 -> capped at 20 shares.
+    assert sized.position_size == 20.0
+    assert sized.decision.metadata["capped_by_notional"] is True
     assert sized.risk_reward_ratio == 2.0
     assert sized.decision is not None
     assert sized.decision.accepted is True
     assert sized.decision.signal_id.startswith("legacy:EURUSD:1h:buy:")
-    assert sized.decision.quantity == pytest.approx(50.0)
+    assert sized.decision.quantity == pytest.approx(20.0)
     assert sized.decision.risk_distance == pytest.approx(2.0)
     assert sized.decision.stop_price_used == pytest.approx(98.0)
     assert sized.decision.take_profit_used == pytest.approx(104.0)

@@ -75,7 +75,8 @@ def test_position_size_scales_inversely_with_pip_value():
         current_exposure=0.0,
     )
 
-    assert sized_pip_1.position_size == pytest.approx(50.0)
+    # Notional cap binds: 0.2 * 10k = 2000 / entry 100 = 20 shares.
+    assert sized_pip_1.position_size == pytest.approx(20.0)
     assert sized_pip_10.position_size == pytest.approx(5.0)
 
 
@@ -118,8 +119,10 @@ def test_fallback_stop_without_atr_is_percent_of_price():
 
     expected_distance = 100_000.0 * 0.02
     assert signal.stop_loss == pytest.approx(100_000.0 - expected_distance)
-    # risk_amount (1% of 10k) / distance (2000) = 0.05 units, not hundreds of BTC.
-    assert sized.position_size == pytest.approx(0.05)
+    # risk_amount (1% of 10k) = 100; the 20% notional cap (2000 / 100k entry)
+    # binds at 0.02 units — far below the uncapped 0.05, not hundreds of BTC.
+    assert sized.position_size == pytest.approx(0.02)
+    assert sized.decision.metadata["capped_by_notional"] is True
 
 
 def test_unknown_deployment_status_is_fail_closed():
@@ -362,7 +365,8 @@ def test_alpaca_submit_order_blocks_non_positive_quantity(monkeypatch):
     )
     monkeypatch.setattr(module, "save_live_signal", lambda _signal: None)
 
-    # max positions reached -> risk engine returns qty 0 -> submit must refuse.
+    # A stop on the wrong side of entry makes the live sizing engine return
+    # qty 0 (bad_stop_direction) -> submit must refuse before the broker.
     signal = LiveSignal(
         deployment_id="dep-1",
         symbol="AAPL",
@@ -371,9 +375,7 @@ def test_alpaca_submit_order_blocks_non_positive_quantity(monkeypatch):
         timestamp=datetime.now(timezone.utc),
         metadata={
             "entry_price": 100.0,
-            "stop_loss": 98.0,
-            "max_positions": 1,
-            "current_positions": 1,
+            "stop_loss": 105.0,
         },
     )
 

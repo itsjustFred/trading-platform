@@ -25,6 +25,8 @@ def test_risk_engine_and_live_use_same_defaults() -> None:
 @pytest.mark.parametrize(
     ("action", "entry_price", "stop_loss", "take_profit", "pip_value", "expected_size"),
     [
+        # risk 1% of 100000 = 1000; buy: 1000/(2*10)=50 shares, notional 5000
+        # < cap -> uncapped; sell: 1000/(5*10)=20 shares.
         ("buy", 100.0, 98.0, 110.0, 10.0, 50.0),
         ("sell", 100.0, 105.0, 90.0, 10.0, 20.0),
     ],
@@ -38,7 +40,7 @@ def test_risk_engine_and_live_size_match_for_valid_signals(
     expected_size: float,
 ) -> None:
     """Parametrized parity test for identical valid inputs."""
-    engine = RiskEngine()
+    engine = RiskEngine(RiskConfig(max_notional_per_trade=1.0))
     backtest_signal = TradeSignal(
         action=action,
         entry_price=entry_price,
@@ -57,8 +59,6 @@ def test_risk_engine_and_live_size_match_for_valid_signals(
             "entry_price": entry_price,
             "stop_loss": stop_loss,
             "take_profit": take_profit,
-            "pip_value": pip_value,
-            "current_exposure": 0.0,
         },
     )
 
@@ -68,7 +68,12 @@ def test_risk_engine_and_live_size_match_for_valid_signals(
         pip_value=pip_value,
         current_exposure=0.0,
     )
-    live_result = size_live_signal(live_signal, account_balance=100000.0)
+    live_result = size_live_signal(
+        live_signal,
+        account_balance=100000.0,
+        config=RiskConfig(max_notional_per_trade=1.0),
+        pip_value=pip_value,
+    )
 
     assert backtest_result.position_size == pytest.approx(expected_size)
     assert live_result.position_size == pytest.approx(expected_size)

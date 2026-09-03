@@ -79,6 +79,9 @@ class TradeEngine:
                 max_total_exposure=max_total_exposure,
                 max_positions=TRADE_ENGINE_MAX_POSITIONS,
                 default_sl_atr_multiplier=2.0,
+                # Keep the backtest's notional bound equal to the engine's own
+                # max_leverage cap so sizing and the post-cap do not fight.
+                max_notional_per_trade=max_leverage if max_leverage > 0 else 0.20,
             )
         )
 

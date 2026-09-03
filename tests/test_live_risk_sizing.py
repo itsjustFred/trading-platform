@@ -1,5 +1,15 @@
+"""Live sizing bridge tests: trust boundary and unit contract.
+
+Signal metadata is untrusted publisher payload: it must never set risk limits,
+precomputed quantities, exposure or position counts. Policy comes from the
+RiskConfig passed by the caller (deployment/runtime config).
+"""
+
 from datetime import datetime, timezone
 
+import pytest
+
+from risk.config import RiskConfig
 from risk.live import size_live_signal
 from shared.models import LiveSignal
 
@@ -22,8 +32,6 @@ def test_size_live_signal_sets_qty_for_valid_risk():
             "stop_loss": 98.0,
             "take_profit": 104.0,
             "timeframe": "1m",
-            "pip_value": 1.0,
-            "current_exposure": 0.0,
         }
     )
 
@@ -32,6 +40,8 @@ def test_size_live_signal_sets_qty_for_valid_risk():
     assert sized.position_size > 0
     assert signal.metadata["qty"] == sized.position_size
     assert signal.metadata["risk_amount"] == sized.risk_amount
+    assert signal.metadata["risk_rejected"] is False
+    assert signal.metadata["risk_config_source"] == "deployment_runtime"
 
 
 def test_size_live_signal_blocks_when_max_positions_reached():
@@ -40,29 +50,151 @@ def test_size_live_signal_blocks_when_max_positions_reached():
             "entry_price": 100.0,
             "stop_loss": 98.0,
             "timeframe": "1m",
-            "max_positions": 1,
-            "current_positions": 1,
+        }
+    )
+
+    sized = size_live_signal(
+        signal,
+        account_balance=10000.0,
+        config=RiskConfig(max_positions=1),
+        current_positions=1,
+    )
+
+    assert sized.position_size == 0.0
+    assert signal.metadata["qty"] == 0.0
+    assert signal.metadata["risk_rejected"] is True
+    assert signal.metadata["risk_rejection_reason"] == "max_positions"
+
+
+def test_size_live_signal_ignores_metadata_risk_limits():
+    """Metadata cannot raise risk limits (Decision Record: config from
+    deployment/runtime only, never the signal payload)."""
+    signal = _signal(
+        {
+            "entry_price": 100.0,
+            "stop_loss": 98.0,
+            "timeframe": "1m",
+            "max_risk_per_trade": 1.0,
+            "max_total_exposure": 1.0,
+            "max_positions": 999,
+        }
+    )
+
+    sized = size_live_signal(signal, account_balance=10000.0)
+
+    # Defaults still govern: 1% of 10000 = 100 risk; notional cap applies.
+    assert sized.risk_percent == pytest.approx(0.01)
+    assert sized.risk_amount == pytest.approx(100.0)
+    assert sized.decision is not None
+    assert sized.decision.metadata["max_risk_per_trade"] == pytest.approx(0.01)
+    assert sized.decision.metadata["max_total_exposure"] == pytest.approx(0.05)
+
+
+def test_size_live_signal_ignores_metadata_qty_override():
+    """A publisher-supplied qty must not bypass the risk engine."""
+    signal = _signal(
+        {
+            "qty": 500,
+            "explicit_qty": 500,
+            "risk_amount": 0.0,
+            "risk_percent": 0.0,
+        }
+    )
+
+    sized = size_live_signal(signal, account_balance=10000.0)
+
+    # Sized from the fallback stop (2% of entry), not the metadata qty.
+    # risk 1% of 10000 = 100 -> 100/(2*1) = 50 shares, but the 20% notional
+    # cap (2000/100) binds at 20 shares — the override cannot escape it.
+    assert sized.decision is not None
+    assert sized.decision.accepted is True
+    assert sized.position_size == pytest.approx(20.0)
+    assert sized.decision.metadata["capped_by_notional"] is True
+    assert signal.metadata["qty"] == pytest.approx(20.0)
+    assert "explicit_qty" not in signal.metadata
+
+
+def test_size_live_signal_ignores_metadata_exposure_state():
+    """Exposure/position state is caller-supplied truth, not payload state."""
+    signal = _signal(
+        {
+            "entry_price": 100.0,
+            "stop_loss": 98.0,
+            "timeframe": "1m",
+            "current_positions": 0,
+            "current_exposure": 0.0,
+        }
+    )
+
+    sized = size_live_signal(
+        signal,
+        account_balance=10000.0,
+        config=RiskConfig(max_positions=1),
+        current_positions=1,
+    )
+
+    # The broker truth (1 open position, max 1) binds even though the payload
+    # claims a flat account.
+    assert sized.position_size == 0.0
+
+
+def test_size_live_signal_blocks_when_exposure_cap_reached():
+    signal = _signal({"entry_price": 100.0, "stop_loss": 98.0, "timeframe": "1m"})
+
+    sized = size_live_signal(
+        signal,
+        account_balance=10000.0,
+        config=RiskConfig(max_total_exposure=0.02),
+        current_exposure=0.05,
+    )
+
+    assert sized.position_size == 0.0
+    assert signal.metadata["risk_rejection_reason"] == "max_total_exposure"
+
+
+def test_size_live_signal_enforces_stop_direction():
+    signal = _signal(
+        {
+            "entry_price": 100.0,
+            "stop_loss": 105.0,
+            "timeframe": "1m",
         }
     )
 
     sized = size_live_signal(signal, account_balance=10000.0)
 
     assert sized.position_size == 0.0
-    assert signal.metadata["qty"] == 0.0
+    assert signal.metadata["risk_rejection_reason"] == "bad_stop_direction"
 
 
-def test_size_live_signal_respects_precomputed_qty():
+def test_size_live_signal_uses_fallback_stop_when_missing():
+    signal = _signal({"entry_price": 100.0, "timeframe": "1m"})
+
+    sized = size_live_signal(signal, account_balance=10000.0)
+
+    # fallback_stop_pct 0.02 -> stop at 98; risk 1% -> 100 / (2 * 1) = 50 shares,
+    # capped by the 20% notional bound (2000 / 100 = 20 shares).
+    assert sized.decision is not None
+    assert sized.decision.metadata["stop_source"] == "fallback_percent"
+    assert sized.position_size == pytest.approx(20.0)
+    assert signal.metadata["resolved_stop_loss"] == pytest.approx(98.0)
+
+
+def test_size_live_signal_never_raises_on_out_of_domain_metadata():
+    """Out-of-domain metadata (crash vector from finding r3) is inert."""
     signal = _signal(
         {
-            "qty": 17,
-            "risk_amount": 50,
-            "risk_percent": 0.005,
+            "entry_price": "not-a-number",
+            "stop_loss": {"bad": "type"},
+            "current_exposure": "oops",
+            "current_positions": None,
+            "max_risk_per_trade": 0,
         }
     )
 
     sized = size_live_signal(signal, account_balance=10000.0)
 
-    assert sized.position_size == 17.0
-    assert signal.metadata["qty"] == 17.0
-    assert signal.metadata["explicit_qty"] == 17.0
-    assert signal.metadata["risk_amount"] == 50.0
+    # entry_price falls back to theoretical_price; sizing proceeds normally.
+    assert sized.decision is not None
+    assert sized.decision.accepted is True
+    assert sized.position_size > 0
