@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 /**
  * Returns `value` only after it has stayed unchanged for `delayMs`.
@@ -59,13 +59,21 @@ export function useDebouncedCallback<Args extends unknown[]>(
     [],
   );
 
-  return (...args: Args) => {
-    if (timerRef.current != null) {
-      window.clearTimeout(timerRef.current);
-    }
-    timerRef.current = window.setTimeout(() => {
-      timerRef.current = null;
-      callbackRef.current(...args);
-    }, delayMs);
-  };
+  // Stable identity across renders: consumers may list this in effect deps, and a
+  // per-render identity would re-trigger their effects (and with a setState in the
+  // callback, that becomes a refresh loop).
+  const debounced = useCallback(
+    (...args: Args) => {
+      if (timerRef.current != null) {
+        window.clearTimeout(timerRef.current);
+      }
+      timerRef.current = window.setTimeout(() => {
+        timerRef.current = null;
+        callbackRef.current(...args);
+      }, delayMs);
+    },
+    [delayMs],
+  );
+
+  return debounced;
 }
