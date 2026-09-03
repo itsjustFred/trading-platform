@@ -390,7 +390,10 @@ class MT5HTMLImporter(BaseImporter):
 
         # DV-B44: "2.500" alone is ambiguous (2.5 ASCII vs 2500 German), so
         # the report locale is detected from grouped values across the whole
-        # table before parsing any single cell.
+        # table before parsing any single cell.  Only the SL/TP columns are
+        # parsed with this locale, but a grouped value anywhere in the table
+        # is evidence for it — the XLSX importer must stay in agreement here
+        # (DV-B43), so do not narrow the scan to the SL/TP columns only.
         decimal_comma = detect_decimal_comma(
             [row[col] for row in data_rows for col in range(len(row))]
         )
@@ -404,10 +407,17 @@ class MT5HTMLImporter(BaseImporter):
             sl = row[col_sl] if (col_sl is not None and col_sl < len(row)) else ""
             tp = row[col_tp] if (col_tp is not None and col_tp < len(row)) else ""
             # Unparseable values stay None instead of raising (aborting the
-            # whole import) or being silently corrupted.
+            # whole import) or being silently corrupted.  A non-empty cell
+            # that yields None is logged so the skip stays observable.
+            parsed_sl = parse_locale_number(sl, decimal_comma)
+            parsed_tp = parse_locale_number(tp, decimal_comma)
+            if sl and parsed_sl is None:
+                logger.warning("Order %s: unparseable S/L value %r", oid, sl)
+            if tp and parsed_tp is None:
+                logger.warning("Order %s: unparseable T/P value %r", oid, tp)
             mapping[oid] = {
-                "sl": parse_locale_number(sl, decimal_comma),
-                "tp": parse_locale_number(tp, decimal_comma),
+                "sl": parsed_sl,
+                "tp": parsed_tp,
             }
         return mapping
 

@@ -48,7 +48,11 @@ def group_position_fills(
     Parameters
     ----------
     rows:
-        Report rows in order (already reduced to trade-relevant rows).
+        Report rows in report order (already reduced to trade-relevant rows).
+        The order is load-bearing: callers that derive position ids on the fly
+        (e.g. the XLSX deal walker) rely on every ``in`` row arriving before
+        the ``out`` rows that close it — reshuffling the rows silently
+        reassigns exits to the wrong position.
     position_id_of:
         Returns the position id of a row ("" when the row has none).
     direction_of:

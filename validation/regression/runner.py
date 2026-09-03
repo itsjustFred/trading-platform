@@ -179,6 +179,11 @@ class RegressionConfig(BaseModel):
     trade_config: TradeComparisonConfig = Field(default_factory=TradeComparisonConfig)
     stats_absolute_tolerance: dict[str, float] = Field(default_factory=dict)
     stats_relative_tolerance: dict[str, float] = Field(default_factory=dict)
+    # Tolerance semantics (DV-B35): a band set to 0.0 is *disabled*, not
+    # "exact" — every *enabled* band must hold (AND).  Do not "normalise"
+    # defaults to 0.0 expecting stricter gates: with both bands disabled a
+    # field falls back to exact equality, with one band disabled it degrades
+    # to the other band alone.
     default_stats_absolute_tolerance: float = 0.01
     default_stats_relative_tolerance: float = 0.001
     golden_base_path: str = ""

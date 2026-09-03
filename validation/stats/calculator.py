@@ -24,12 +24,19 @@ Mathematical conventions (kept explicit so results are reproducible):
 
 from __future__ import annotations
 
+import logging
 import math
 from typing import List
 
 from pydantic import BaseModel
 
 from shared.models import Trade, TradeExit
+
+logger = logging.getLogger(__name__)
+
+# Tolerance for the "net_pnl consistent with exit PnLs" invariant check: a
+# few float ulps of drift are fine, a systematic fee double count is not.
+_NET_PNL_EPSILON = 1e-6
 
 
 class TradeStatistics(BaseModel):
@@ -69,13 +76,29 @@ def _net_realized_pnl(trade: Trade) -> float:
     net figure), else gross PnL minus ``fees``, else the sum of exit PnLs
     (fee-free trades and normalized inputs where fees are already deducted
     from the exit PnLs).
+
+    ``net_pnl`` is only trusted when it is consistent with the exit PnLs:
+    importers must store exit PnLs *gross of fees* whenever ``fees`` is set,
+    so ``net_pnl == sum(exit PnLs) - fees``.  A trade that violates this
+    invariant (fee-inclusive exit PnLs *plus* a fees field) would double
+    count, so it falls back to the recomputed gross-minus-fees figure.
     """
-    if trade.net_pnl is not None:
-        return float(trade.net_pnl)
     gross = _realized_pnl(trade)
-    if trade.fees is not None:
-        return gross - float(trade.fees)
-    return gross
+    recomputed = gross - float(trade.fees) if trade.fees is not None else gross
+    if trade.net_pnl is not None:
+        net = float(trade.net_pnl)
+        if trade.fees is None or abs(net - recomputed) <= _NET_PNL_EPSILON:
+            return net
+        logger.warning(
+            "Trade %s: net_pnl %s inconsistent with exit PnLs gross %s and "
+            "fees %s; using recomputed %s",
+            trade.id,
+            net,
+            gross,
+            trade.fees,
+            recomputed,
+        )
+    return recomputed
 
 
 def _compute_drawdowns(realized_pnls: List[float]) -> tuple[float, float]:

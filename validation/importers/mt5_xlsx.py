@@ -115,6 +115,14 @@ class MT5XLSXImporter(BaseImporter):
             raise ValueError("Could not locate 'Orders' section in the report.")
         if trades_header_idx is None:
             raise ValueError("Could not locate 'Trades' section in the report.")
+        # The Trades section must come after the Orders section: every
+        # downstream slice (`_extract_table`, `_parse_meta`, the deal walker)
+        # assumes report order.
+        if trades_header_idx < orders_header_idx:
+            raise ValueError(
+                "Trades section found before Orders section; "
+                "the report layout is not recognisable."
+            )
 
         # Parse meta, settings, stats from header area
         meta = self._parse_meta(rows, orders_header_idx)
@@ -421,10 +429,15 @@ class MT5XLSXImporter(BaseImporter):
                     cell_values.append(str(row[col]))
         decimal_comma = detect_decimal_comma(cell_values)
 
-        def _parse(cell: Any) -> float | None:
+        def _parse(cell: Any, order_id: Any) -> float | None:
             if cell is None or (isinstance(cell, float) and pd.isna(cell)):
                 return None
-            return parse_locale_number(str(cell), decimal_comma)
+            parsed = parse_locale_number(str(cell), decimal_comma)
+            if parsed is None:
+                # A non-empty but unparseable cell keeps the order's SL/TP
+                # unset; log it so the skip stays observable.
+                logger.warning("Order %s: unparseable SL/TP value %r", order_id, cell)
+            return parsed
 
         for _, row in orders_df.iterrows():
             oid = row[col_order_id]
@@ -433,8 +446,8 @@ class MT5XLSXImporter(BaseImporter):
             sl = row.get(col_sl, None) if col_sl else None
             tp = row.get(col_tp, None) if col_tp else None
             mapping[oid] = {
-                "sl": _parse(sl),
-                "tp": _parse(tp),
+                "sl": _parse(sl, oid),
+                "tp": _parse(tp, oid),
             }
         return mapping
 
