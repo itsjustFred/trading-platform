@@ -100,16 +100,23 @@ def _cell_from_stats(stats: dict[str, Any], *, has_trades: bool) -> dict[str, An
     return cell
 
 
-def _total_trades_from(stats: dict[str, Any], has_trades: bool) -> int:
-    """Best-effort trade count from engine stats; falls back to the observed
-    trades on the result, never to a fabricated zero for a trading run."""
-    try:
-        total_trades = int(stats.get("total_trades", 0) or 0)
-    except (TypeError, ValueError):
-        total_trades = 0
-    if total_trades == 0 and has_trades:
+def _total_trades_from(stats: dict[str, Any], has_trades: bool) -> int | None:
+    """Best-effort trade count from engine stats.
+
+    A count present in the stats is surfaced as-is (an explicit zero for a
+    no-trade run is observed, not fabricated). A missing or unparseable count
+    falls back to the observed trades on the result; only when neither source
+    knows is it ``None`` — never a fabricated zero or minimum.
+    """
+    raw = stats.get("total_trades")
+    if raw is not None:
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            pass
+    if has_trades:
         return 1
-    return total_trades
+    return 0 if not stats else None
 
 
 def _all_cells_failed(results_matrix: dict[str, dict[str, dict[str, Any]]]) -> bool:

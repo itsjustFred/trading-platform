@@ -285,7 +285,9 @@ def test_run_strategy_grid_passes_strategy_path_and_reports_errors(monkeypatch, 
     assert engine.calls[0][1] == str(strategy_path)
 
     cells = result["results"]["AAPL"]
-    # Zero-trade run is distinguishable from success (no trades, no error)
+    # Zero-trade run is distinguishable from success (no trades, no error);
+    # a no-trade run reports total_trades=0 — an explicit zero from observed
+    # trades, not a fabricated one for missing stats.
     assert cells["1h"]["status"] == "no_trades"
     assert cells["1h"]["total_trades"] == 0
     # Failed cell is reported with the error, not persisted as success
