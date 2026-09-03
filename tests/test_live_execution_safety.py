@@ -2720,7 +2720,6 @@ def test_alpaca_entry_guard_still_blocks_naked_non_exit_orders():
     resolve = adapter._resolve_broker_sl_tp
     with pytest.raises(ValueError, match="without stop_loss"):
         resolve(signal)
-        )
 
 
 def test_ctrader_exit_only_orders_bypass_entry_sl_tp_guard():
