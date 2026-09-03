@@ -19,6 +19,10 @@ from pathlib import Path
 
 from dotenv import dotenv_values
 
+from shared.logging import get_logger
+
+logger = get_logger("live-runner")
+
 TRUE_BOOL_TOKENS = frozenset({"1", "true", "yes", "y", "on"})
 FALSE_BOOL_TOKENS = frozenset({"0", "false", "no", "n", "off"})
 
@@ -56,7 +60,18 @@ def load_accounts_env_values(
     values: dict[str, str] = {}
     try:
         loaded = dotenv_values(accounts_env)
-    except OSError:
+    except FileNotFoundError:
+        # No file is the normal single-machine setup: env-only credentials.
+        loaded = {}
+    except OSError as exc:
+        # A file that exists but cannot be read is a config error. Discovery
+        # decides from this result which accounts exist, so a silent empty
+        # result would look like "no accounts configured" instead of a
+        # filesystem problem.
+        logger.warning(
+            "Could not read accounts env file; continuing with process env only",
+            extra={"data": {"accounts_env": str(accounts_env), "error": str(exc)}},
+        )
         loaded = {}
     for key, value in loaded.items():
         if key and isinstance(value, str):

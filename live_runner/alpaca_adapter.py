@@ -233,6 +233,19 @@ def resolve_alpaca_credentials(
 
     if not blocks:
         return None
+    # Single remaining block with an unidentified account: the legacy
+    # single-account setup. Keep it working, but make it visible — this is
+    # the one path where an account can trade through keys it did not map to.
+    logger.warning(
+        "Unidentified account using the only configured Alpaca credential block",
+        extra={
+            "data": {
+                "account_id": account_id,
+                "broker_login": broker_login,
+                "block_source_index": str(blocks[0].get("source_index", "")),
+            }
+        },
+    )
     return _alpaca_block_credentials(blocks[0])
 
 
@@ -249,6 +262,14 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
     ):
         self.api_key = api_key or os.environ.get("ALPACA_API_KEY", "")
         self.secret_key = secret_key or os.environ.get("ALPACA_SECRET_KEY", "")
+        # Legacy fallback: with file-first precedence (credential_env) the
+        # caller is expected to pass resolved keys; the os.environ fallback
+        # only covers scripts constructed before that resolution existed.
+        if not api_key or not secret_key:
+            logger.warning(
+                "Alpaca adapter falling back to process-env credentials",
+                extra={"data": {"account_id": account_id}},
+            )
         self.paper = (
             _parse_bool_env("ALPACA_PAPER", os.environ.get("ALPACA_PAPER"), default=True)
             if paper is None

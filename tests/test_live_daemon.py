@@ -186,6 +186,53 @@ def test_resolve_ctrader_credentials_rejects_invalid_demo_value() -> None:
         daemon._resolve_ctrader_credentials(values)
 
 
+def test_ctrader_signature_safe_survives_invalid_bool_config() -> None:
+    """A typo'd CTRADER_DEMO must not abort the deployment sync iteration: the
+    signature degrades to a stable error value instead of raising."""
+    values = {
+        "CTRADER_APP_ID": "app",
+        "CTRADER_APP_SECRET": "secret",
+        "CTRADER_ACCESS_TOKEN": "token",
+        "CTRADER_DEMO": "tru",
+    }
+    assert daemon._ctrader_credentials_signature_safe(values) == "invalid-credentials"
+    assert (
+        daemon._ctrader_credentials_signature_safe({**values, "CTRADER_DEMO": "true"})
+        != "invalid-credentials"
+    )
+
+
+def test_refresh_ctrader_blocked_state_survives_invalid_bool_config() -> None:
+    """The sync loop calls the signature per cTrader account every cycle; a
+    typo in the shared env must keep the loop alive for all accounts."""
+    accounts = [
+        LiveAccountConfig(id="acc-1", broker="ctrader", name="Broker One"),
+        LiveAccountConfig(id="acc-2", broker="ctrader", name="Broker Two"),
+    ]
+    daemon._CTRADER_AUTH_BLOCKED_ACCOUNTS.clear()
+    daemon._CTRADER_AUTH_BLOCKED_REASONS.clear()
+    daemon._CTRADER_ACCOUNT_CREDENTIAL_SIGNATURES.clear()
+    try:
+        assert daemon._refresh_ctrader_blocked_state_for_accounts(accounts, {}) == set()
+        typo_env = {
+            "CTRADER_APP_ID": "app",
+            "CTRADER_APP_SECRET": "secret",
+            "CTRADER_ACCESS_TOKEN": "token",
+            "CTRADER_DEMO": "ture",
+        }
+        # Must not raise; signature flips to the stable error value once.
+        assert daemon._refresh_ctrader_blocked_state_for_accounts(accounts, typo_env) == {
+            "acc-1",
+            "acc-2",
+        }
+        # Stable across cycles: no rotation churn while the typo persists.
+        assert daemon._refresh_ctrader_blocked_state_for_accounts(accounts, typo_env) == set()
+    finally:
+        daemon._CTRADER_AUTH_BLOCKED_ACCOUNTS.clear()
+        daemon._CTRADER_AUTH_BLOCKED_REASONS.clear()
+        daemon._CTRADER_ACCOUNT_CREDENTIAL_SIGNATURES.clear()
+
+
 def test_wait_for_candle_close_defaults_true_when_env_is_missing() -> None:
     deployment = LiveDeploymentConfig(
         strategy_name="fx_breakout",
@@ -298,6 +345,31 @@ def test_ensure_adapter_skips_account_with_invalid_bool_config(monkeypatch) -> N
     )
 
     assert "acc-typo" not in active_adapters
+
+
+def test_ctrader_blocked_state_refresh_survives_demo_bool_typo() -> None:
+    """A typo'd CTRADER_DEMO must not abort the whole deployment sync
+    iteration: the signature refresh skips the account with a warning, so
+    healthy accounts in the same iteration keep being served."""
+    daemon._CTRADER_ACCOUNT_CREDENTIAL_SIGNATURES.clear()
+    accounts = [
+        LiveAccountConfig(id="acc-ctrader", broker="ctrader", name="Demo"),
+        LiveAccountConfig(id="acc-alpaca", broker="alpaca", name="Paper"),
+    ]
+    env_values = {
+        "CTRADER_APP_ID": "app",
+        "CTRADER_APP_SECRET": "secret",
+        "CTRADER_ACCESS_TOKEN": "token",
+        "CTRADER_DEMO": "ture",
+    }
+
+    # Must not raise.
+    changed = daemon._refresh_ctrader_blocked_state_for_accounts(accounts, env_values)
+
+    assert changed == set()
+    # The account is recorded with the invalid signature marker so a later fix
+    # of the typo still triggers the credential-change path.
+    assert "acc-ctrader" in daemon._CTRADER_ACCOUNT_CREDENTIAL_SIGNATURES
 
 
 def _signal_with_metadata(metadata: dict[str, object] | None = None):

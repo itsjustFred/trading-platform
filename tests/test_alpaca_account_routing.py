@@ -166,6 +166,45 @@ def test_resolve_alpaca_credentials_hintless_default_pair_and_block_still_unique
     )
     assert without_default == ("nitro-key", "nitro-secret", True)
 
+    # Same legacy mapping for an account that carries no identity at all: still
+    # resolves, but must log so the unmapped-credential path stays visible.
+    unresolved = resolve_alpaca_credentials(
+        account_id="ACC-UNMAPPED",
+        env={
+            "ALPACA_API_KEY_ACC1": "nitro-key",
+            "ALPACA_SECRET_KEY_ACC1": "nitro-secret",
+        },
+    )
+    assert unresolved == ("nitro-key", "nitro-secret", True)
+
+
+def test_resolve_alpaca_credentials_unidentified_single_block_logs_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An account that identifies against none of the blocks but resolves through
+    the legacy single-block fallback must leave a warning naming no secret."""
+    import live_runner.alpaca_adapter as adapter_module
+
+    messages: list[str] = []
+
+    def _capture_warning(message: str, extra: dict | None = None) -> None:
+        messages.append(message)
+
+    monkeypatch.setattr(adapter_module.logger, "warning", _capture_warning)
+    credentials = resolve_alpaca_credentials(
+        account_id="ACC-UNMAPPED",
+        env={
+            "ALPACA_API_KEY_ACC1": "nitro-key",
+            "ALPACA_SECRET_KEY_ACC1": "nitro-secret",
+        },
+    )
+
+    assert credentials == ("nitro-key", "nitro-secret", True)
+    assert any(
+        "Unidentified account using the only configured Alpaca credential block" in message
+        for message in messages
+    )
+
 
 def test_resolve_alpaca_credentials_hintless_logs_warning_without_secrets(
     monkeypatch: pytest.MonkeyPatch,

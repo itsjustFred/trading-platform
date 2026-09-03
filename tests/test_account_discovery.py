@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -195,6 +197,50 @@ def test_iter_alpaca_credentials_default_block_falls_back_to_adapter_default_pai
         account_discovery._iter_alpaca_credentials(
             {"ALPACA_API_KEY": "k", "ALPACA_SECRET_KEY": "s", "ALPACA_PAPER": "wahr"}
         )
+
+
+def _tmp_accounts_env(content: str) -> Path:
+    import tempfile
+
+    fd, path = tempfile.mkstemp(suffix=".env")
+    with os.fdopen(fd, "w") as handle:
+        handle.write(content)
+    return Path(path)
+
+
+def test_discover_configured_accounts_skips_block_with_invalid_bool(monkeypatch):
+    """A typo'd ALPACA_PAPER_ACC{N} must skip that block with a warning, not
+    abort the whole discovery run (which would also drop cTrader accounts)."""
+    monkeypatch.setenv("CTRADER_APP_ID", "app")
+    monkeypatch.setenv("CTRADER_APP_SECRET", "secret")
+    monkeypatch.setenv("CTRADER_ACCESS_TOKEN", "token")
+    env_path = _tmp_accounts_env(
+        "ALPACA_API_KEY_ACC1=good-key\n"
+        "ALPACA_SECRET_KEY_ACC1=good-secret\n"
+        "ALPACA_PAPER_ACC1=false\n"
+        "ALPACA_API_KEY_ACC2=bad-key\n"
+        "ALPACA_SECRET_KEY_ACC2=bad-secret\n"
+        "ALPACA_PAPER_ACC2=ture\n"
+    )
+
+    async def _discover(app_id, app_secret, access_token):
+        return [
+            LiveAccount(
+                id="47644617",
+                name="cTrader Demo",
+                broker="ctrader",
+                is_demo=True,
+                ctid="47644617",
+            )
+        ]
+
+    monkeypatch.setattr(account_discovery, "discover_ctrader_accounts", _discover)
+
+    accounts = asyncio.run(account_discovery.discover_configured_accounts(accounts_env=env_path))
+
+    # The cTrader account survives; the typo'd block is skipped with a warning
+    # instead of aborting the whole discovery run.
+    assert [account.id for account in accounts if account.broker == "ctrader"] == ["47644617"]
 
 
 def test_discover_configured_accounts_uses_shared_ctrader_credentials(monkeypatch):

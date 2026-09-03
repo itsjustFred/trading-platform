@@ -137,6 +137,51 @@ def _iter_alpaca_credentials(env: dict[str, str]) -> list[dict[str, Any]]:
     ]
 
 
+def _iter_alpaca_credentials_safe(env: dict[str, str]) -> list[dict[str, Any]]:
+    """Enumerate credential sets block-by-block so a strict-parse error (e.g. a
+    typo'd ALPACA_PAPER_ACC{N}) skips that block instead of aborting the whole
+    discovery run, which would also drop accounts from the other broker."""
+    blocks: list[dict[str, Any]] = []
+    try:
+        for block in _alpaca_credential_blocks(env, _alpaca_acc_indexes(env)):
+            blocks.append(
+                {
+                    "key": str(block.get("source_index", "")),
+                    "api_key": str(block["api_key"]),
+                    "secret_key": str(block["secret_key"]),
+                    "paper": bool(block["paper"]),
+                }
+            )
+    except ValueError as exc:
+        logger.warning(
+            "Skipping malformed Alpaca credential blocks during discovery",
+            extra={"data": {"error": str(exc)}},
+        )
+
+    if blocks:
+        return blocks
+
+    try:
+        default_credentials = _default_alpaca_credentials(env)
+    except ValueError as exc:
+        logger.warning(
+            "Skipping malformed default Alpaca credentials during discovery",
+            extra={"data": {"error": str(exc)}},
+        )
+        return []
+    if default_credentials is None:
+        return []
+    api_key, secret_key, paper = default_credentials
+    return [
+        {
+            "key": "DEFAULT",
+            "api_key": api_key,
+            "secret_key": secret_key,
+            "paper": paper,
+        }
+    ]
+
+
 def discover_alpaca_accounts(api_key: str, secret_key: str, paper: bool) -> list[LiveAccount]:
     """Discover Alpaca account details for one credential set."""
     if not api_key.strip() or not secret_key.strip():
@@ -769,7 +814,7 @@ async def discover_configured_accounts(
                 extra={"data": {"error": repr(exc)}},
             )
 
-    for credentials in _iter_alpaca_credentials(env):
+    for credentials in _iter_alpaca_credentials_safe(env):
         try:
             accounts = discover_alpaca_accounts(
                 credentials["api_key"],

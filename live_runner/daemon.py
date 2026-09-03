@@ -266,6 +266,21 @@ def _ctrader_credentials_signature(env_values: Mapping[str, str]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _ctrader_credentials_signature_safe(env_values: Mapping[str, str]) -> str:
+    """Credential signature that survives a strict-parse config error.
+
+    A typo'd boolean in `.accounts.env` must not abort the deployment sync
+    iteration for every account (the loop's only handler is the generic
+    `except Exception`). A stable error signature instead blocks rotation —
+    the account is skipped when its adapter is (re)created, which surfaces
+    the invalid value through the per-account error log.
+    """
+    try:
+        return _ctrader_credentials_signature(env_values)
+    except ValueError:
+        return "invalid-credentials"
+
+
 def _refresh_ctrader_blocked_state_for_accounts(
     accounts: list[LiveAccountConfig],
     env_values: Mapping[str, str],
@@ -275,7 +290,7 @@ def _refresh_ctrader_blocked_state_for_accounts(
         if account.broker != "ctrader":
             continue
         account_id = account.id
-        signature = _ctrader_credentials_signature(env_values)
+        signature = _ctrader_credentials_signature_safe(env_values)
         previous = _CTRADER_ACCOUNT_CREDENTIAL_SIGNATURES.get(account_id)
         _CTRADER_ACCOUNT_CREDENTIAL_SIGNATURES[account_id] = signature
         if previous is None or previous == signature:

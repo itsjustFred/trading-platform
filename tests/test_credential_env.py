@@ -101,6 +101,34 @@ def test_load_accounts_env_values_missing_file_uses_environ_only(tmp_path: Path)
     assert values == {"ALPACA_API_KEY": "os-key"}
 
 
+def test_load_accounts_env_values_unreadable_file_warns_and_uses_environ(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file that exists but cannot be read is a config error: discovery decides
+    which accounts exist from this result, so it must not silently look like
+    "no accounts configured"."""
+    import live_runner.credential_env as credential_env_module
+
+    unreadable = tmp_path / ".accounts.env"
+    unreadable.write_text("ALPACA_API_KEY=file-key\n", encoding="utf-8")
+
+    def _raise_oserror(_path: object) -> dict[str, str]:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(credential_env_module, "dotenv_values", _raise_oserror)
+    warnings: list[str] = []
+
+    def _capture_warning(message: str, extra: dict | None = None) -> None:
+        warnings.append(message)
+
+    monkeypatch.setattr(credential_env_module.logger, "warning", _capture_warning)
+
+    values = load_accounts_env_values(unreadable, environ={"ALPACA_API_KEY": "os-key"})
+
+    assert values == {"ALPACA_API_KEY": "os-key"}
+    assert any("Could not read accounts env file" in message for message in warnings)
+
+
 def test_load_accounts_env_values_strips_and_skips_blank(tmp_path: Path) -> None:
     env_file = _write_env(tmp_path / ".accounts.env", "A = spaced \nB=\n")
 
