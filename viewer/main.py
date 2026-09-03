@@ -9090,6 +9090,113 @@ async def _collect_source_signals(
     return normalized_signals, normalized_source
 
 
+def _validated_signal_replay_request(
+    payload: BacktestRunSignalsRequest,
+) -> tuple[
+    list[dict[str, Any]], str, str, str, str, float, float, int
+]:
+    """Validate a run-signals request; returns the normalized request fields."""
+    direct_signals_payload = list(payload.signals or [])
+    source_name = str(payload.signal_source or "").strip().lower()
+    valid_sources = {"discord", "internal", "csv", "discord-history", "manual"}
+    if source_name and source_name not in valid_sources:
+        raise HTTPException(
+            status_code=400,
+            detail="signal_source must be one of: discord, internal, csv, discord-history, manual",
+        )
+    normalized_source = source_name if source_name in {"discord", "internal"} else ""
+    account_id = str(payload.account_id or "").strip()
+    signal_processor_name = _validate_signal_processor_name(payload.signal_processor)
+    if not direct_signals_payload and not normalized_source:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide either 'signals' or 'signal_source'",
+        )
+
+    risk_per_trade_pct = _validate_positive_payload_float(
+        payload.risk_per_trade_pct, default=0.01, field="risk_per_trade_pct"
+    )
+    max_position_pct = _validate_positive_payload_float(
+        payload.max_position_pct, default=0.05, field="max_position_pct"
+    )
+    max_positions = int(payload.max_positions or 5)
+    if max_positions <= 0:
+        raise HTTPException(status_code=400, detail="max_positions must be > 0")
+    return (
+        direct_signals_payload,
+        source_name,
+        normalized_source,
+        account_id,
+        signal_processor_name,
+        risk_per_trade_pct,
+        max_position_pct,
+        max_positions,
+    )
+
+
+def _register_signal_replay_task(
+    *,
+    payload: BacktestRunSignalsRequest,
+    symbols: list[str],
+    normalized_signals: list[dict[str, Any]],
+    replay_source_label: str,
+    account_id: str,
+    signal_processor_name: str,
+    risk_per_trade_pct: float,
+    max_position_pct: float,
+    max_positions: int,
+    timeframe: str,
+    start_dt: datetime,
+    end_dt: datetime,
+) -> tuple[str, Any, int]:
+    """Create the replay task record, restart config and job placeholder."""
+    task_id = str(uuid.uuid4())[:8]
+    TASK_LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    log_file = _task_log_path(task_id)
+    stage_total = 5
+    record = _create_task_record(
+        task_id,
+        name=_signal_replay_task_name(replay_source_label),
+        description=(
+            f"Replay {len(normalized_signals)} signals "
+            f"for {', '.join(symbols)} ({timeframe})."
+        ),
+        kind="backtest",
+        source="signal-replay",
+        total_items=stage_total,
+        log_file=log_file,
+        control_mode="thread",
+        supports_control=False,
+    )
+    with DATA_TASKS_LOCK:
+        DATA_TASKS[task_id] = record
+    _set_task_status(task_id, "queued")
+    _update_task_fields(
+        task_id,
+        restart_config={
+            "signal_source": replay_source_label,
+            "account_id": account_id,
+            "start_date": start_dt.date().isoformat(),
+            "end_date": end_dt.date().isoformat(),
+            "timeframe": timeframe,
+            "capital": float(payload.capital or 100000.0),
+            "risk_per_trade_pct": risk_per_trade_pct,
+            "max_position_pct": max_position_pct,
+            "max_positions": max_positions,
+            "signal_processor": signal_processor_name or None,
+            "signal_count": len(normalized_signals),
+        },
+    )
+    _running_jobs[task_id] = {
+        "status": "queued",
+        "result": None,
+        "error": None,
+        "task_id": task_id,
+        "job_id": task_id,
+    }
+    return task_id, log_file, stage_total
+
+
 async def _gather_replay_signals(
     *,
     payload_signals: list[dict[str, Any]],
@@ -9140,32 +9247,16 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
     if start_dt > end_dt:
         raise HTTPException(status_code=400, detail="start_date must be <= end_date")
 
-    direct_signals_payload = list(payload.signals or [])
-    source_name = str(payload.signal_source or "").strip().lower()
-    valid_sources = {"discord", "internal", "csv", "discord-history", "manual"}
-    if source_name and source_name not in valid_sources:
-        raise HTTPException(
-            status_code=400,
-            detail="signal_source must be one of: discord, internal, csv, discord-history, manual",
-        )
-    normalized_source = source_name if source_name in {"discord", "internal"} else ""
-    account_id = str(payload.account_id or "").strip()
-    signal_processor_name = _validate_signal_processor_name(payload.signal_processor)
-    if not direct_signals_payload and not normalized_source:
-        raise HTTPException(
-            status_code=400,
-            detail="Provide either 'signals' or 'signal_source'",
-        )
-
-    risk_per_trade_pct = _validate_positive_payload_float(
-        payload.risk_per_trade_pct, default=0.01, field="risk_per_trade_pct"
-    )
-    max_position_pct = _validate_positive_payload_float(
-        payload.max_position_pct, default=0.05, field="max_position_pct"
-    )
-    max_positions = int(payload.max_positions or 5)
-    if max_positions <= 0:
-        raise HTTPException(status_code=400, detail="max_positions must be > 0")
+    (
+        direct_signals_payload,
+        source_name,
+        normalized_source,
+        account_id,
+        signal_processor_name,
+        risk_per_trade_pct,
+        max_position_pct,
+        max_positions,
+    ) = _validated_signal_replay_request(payload)
 
     default_timeframe = requested_timeframe or "1h"
     normalized_signals, replay_source_label = await _gather_replay_signals(
@@ -9186,23 +9277,20 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
     symbols = sorted({str(item["symbol"]).strip().upper() for item in normalized_signals})
     start_str = start_dt.date().isoformat()
     end_str = end_dt.date().isoformat()
-    task_id = str(uuid.uuid4())[:8]
-    TASK_LOGS_DIR.mkdir(parents=True, exist_ok=True)
-    log_file = _task_log_path(task_id)
-    stage_total = 5
-    record = _create_task_record(
-        task_id,
-        name=_signal_replay_task_name(replay_source_label),
-        description=(
-            f"Replay {len(normalized_signals)} signals "
-            f"for {', '.join(symbols)} ({timeframe})."
-        ),
-        kind="backtest",
-        source="signal-replay",
-        total_items=stage_total,
-        log_file=log_file,
-        control_mode="thread",
-        supports_control=False,
+    symbols = sorted({str(item["symbol"]).strip().upper() for item in normalized_signals})
+    task_id, log_file, stage_total = _register_signal_replay_task(
+        payload=payload,
+        symbols=symbols,
+        normalized_signals=normalized_signals,
+        replay_source_label=replay_source_label,
+        account_id=account_id,
+        signal_processor_name=signal_processor_name,
+        risk_per_trade_pct=risk_per_trade_pct,
+        max_position_pct=max_position_pct,
+        max_positions=max_positions,
+        timeframe=timeframe,
+        start_dt=start_dt,
+        end_dt=end_dt,
     )
     with DATA_TASKS_LOCK:
         DATA_TASKS[task_id] = record
