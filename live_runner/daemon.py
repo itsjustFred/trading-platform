@@ -955,17 +955,16 @@ async def _submit_normalized_discord_signal(
 
     try:
         live_signal = _trade_signal_to_live_signal(normalized_signal, deployment)
-    except ValueError as exc:
+    except ValueError:
         # Strict-boolean config errors (e.g. typo'd allow_short) must skip this
         # deployment without dropping the listener loop or sibling deployments.
-        logger.error(
+        logger.exception(
             "Invalid deployment boolean config; skipping deployment",
             extra={
                 "data": {
                     "account_id": account_id,
                     "deployment_id": str(deployment.id),
                     "symbol": trade_signal.symbol,
-                    "error": str(exc),
                 }
             },
         )
@@ -1019,17 +1018,16 @@ async def _dispatch_discord_trade_signal(
 
         try:
             wait_enabled = _deployment_wait_for_candle_close(deployment, accounts_env_values)
-        except ValueError as exc:
+        except ValueError:
             # A typo'd boolean must skip the deployment, not kill the listener
             # loop or other deployments on the same account. It also must not
             # default into immediate market orders.
-            logger.error(
+            logger.exception(
                 "Invalid deployment boolean config; skipping deployment",
                 extra={
                     "data": {
                         "account_id": account_id,
                         "strategy_name": deployment.strategy_name,
-                        "error": str(exc),
                     }
                 },
             )
