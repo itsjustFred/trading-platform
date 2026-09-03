@@ -122,7 +122,7 @@ const LiveDeploymentCard = memo(function LiveDeploymentCard({
           and intercepts the click (see PortfoliosPage.tsx for the same pattern). */}
       <Link
         to={"/live/" + encodeURIComponent(card.account_id)}
-        aria-label={`Open live account`}
+        aria-label={`Open live account ${card.account_id} (${card.strategy_name})`}
         style={overlayLinkStyle}
       />
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>

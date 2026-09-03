@@ -57,11 +57,17 @@ export function LiveTerminal({
     [jobId],
   );
 
+  // The server closes the socket once the task reaches a terminal status; without
+  // this gate the hook would reconnect forever and onOpen's reset would flap the
+  // reported status between "completed" and "connecting".
+  const taskFinished = taskStatus != null && TERMINAL_TASK_STATUSES.has(taskStatus);
+
   const stream = useWebSocket<string>(wsUrl, {
-    enabled: Boolean(wsUrl),
+    enabled: Boolean(wsUrl) && !taskFinished,
     messageFormat: "text",
     onOpen: () => {
-      // New connection (initial or reconnect): start the feed from a clean slate.
+      // Fresh connection: the server replays the log from position 0, so start
+      // from a clean slate to avoid duplicated lines.
       setLogs("");
       setTaskStatus(null);
     },

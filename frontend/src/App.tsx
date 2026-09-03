@@ -94,7 +94,7 @@ export default function App() {
             </div>
           </div>
         ) : null}
-        <ErrorBoundary label="Page">
+        <ErrorBoundary key={location.pathname} label="Page">
           <Suspense fallback={<LoadingSpinner />}>
             <Routes>
             <Route path="/" element={<Navigate to="/strategies" replace />} />

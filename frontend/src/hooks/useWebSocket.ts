@@ -294,7 +294,7 @@ export function useWebSocket<TMessage = unknown>(
     status: resolvedStatus,
     isConnected: resolvedIsConnected,
     lastMessage: active ? lastMessage : null,
-    error,
+    error: active ? error : null,
     sendJson,
   };
 }
