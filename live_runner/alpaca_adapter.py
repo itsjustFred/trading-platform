@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import math
 import os
 import re
 from collections.abc import Mapping
@@ -460,7 +461,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 f"symbol={signal.symbol}); opening an unbounded position is not allowed."
             )
         for name, value in (("stop_loss", stop_loss), ("take_profit", take_profit)):
-            if value <= 0 or value in (float("inf"), float("-inf")):
+            if math.isnan(value) or math.isinf(value) or value <= 0:
                 raise ValueError(
                     f"Invalid {name} price for {signal.symbol}: {value!r}; "
                     "refusing to submit."

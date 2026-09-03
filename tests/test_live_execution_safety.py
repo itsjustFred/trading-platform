@@ -2542,6 +2542,25 @@ def test_ctrader_build_new_order_request_rejects_unknown_signal_action():
         adapter._build_new_order_request(bad_signal, symbol_id=7)
 
 
+def test_alpaca_rejects_non_finite_sl_tp_prices():
+    """NaN/inf prices must fail closed like missing ones — a NaN stop_price
+    reaches the broker as an unvalidatable order and blocks the position."""
+    from live_runner import alpaca_adapter as module
+
+    adapter = module.AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True)
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        signal = LiveSignal(
+            deployment_id="dep-1",
+            symbol="AAPL",
+            action="buy",
+            theoretical_price=100.0,
+            timestamp=datetime.now(timezone.utc),
+            metadata={"stop_loss": bad, "take_profit": 110.0},
+        )
+        with pytest.raises(ValueError, match="Invalid stop_loss price"):
+            adapter._resolve_broker_sl_tp(signal)
+
+
 def test_alpaca_build_order_request_carries_bracket_legs():
     from live_runner import alpaca_adapter as module
 
