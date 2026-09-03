@@ -10662,6 +10662,64 @@ async def create_verification_evidence(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+async def _resolve_live_deployment_signal_source(
+    *,
+    signal_source_type: str,
+    strategy_name: str,
+    symbols: list[str],
+    symbol_filter: list[str],
+    signal_source_id: str,
+    signal_config_payload: dict[str, Any],
+) -> tuple[str, list[str], str, list[str], dict[str, Any]]:
+    """Validate/normalize the signal-source inputs for a live deployment."""
+    if signal_source_type == "internal":
+        if not strategy_name:
+            raise HTTPException(status_code=400, detail="strategy_name is required for internal signal source")
+        if not symbols:
+            raise HTTPException(status_code=400, detail="At least one symbol is required")
+        return "", [], strategy_name, symbols, signal_config_payload
+
+    matched_service: Service | None = None
+    if signal_source_id:
+        discord_services = await asyncio.to_thread(
+            list_services,
+            service_type=ServiceType.DISCORD_BOT,
+        )
+        matched_service = next(
+            (
+                service
+                for service in discord_services
+                if str(service.name or "").strip().lower() == signal_source_id.lower()
+            ),
+            None,
+        )
+        if matched_service is None:
+            raise HTTPException(status_code=404, detail="Discord signal source service not found")
+        signal_source_id = matched_service.name
+    elif not str(signal_config_payload.get("channel_id") or "").strip():
+        raise HTTPException(
+            status_code=400,
+            detail="signal_source_id is required for discord signal source",
+        )
+    if not strategy_name:
+        strategy_name = (
+            f"discord::{signal_source_id.lower()}"
+            if signal_source_id
+            else "discord::legacy"
+        )
+    if not symbols and symbol_filter:
+        symbols = list(symbol_filter)
+    if not symbols:
+        symbols = ["*"]
+    if signal_source_id:
+        signal_config_payload.setdefault("service_name", signal_source_id)
+    if matched_service and isinstance(matched_service.config, dict):
+        channel_id = str(matched_service.config.get("channel_id") or "").strip()
+        if channel_id and not str(signal_config_payload.get("channel_id") or "").strip():
+            signal_config_payload["channel_id"] = channel_id
+    return signal_source_id, symbol_filter, strategy_name, symbols, signal_config_payload
+
+
 @app.get(LIVE_DEPLOYMENTS_PATH)
 async def get_live_deployments() -> list[dict[str, Any]]:
     _log_live_endpoint_request(LIVE_DEPLOYMENTS_PATH)
@@ -10839,52 +10897,20 @@ async def create_live_deployment_endpoint(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         signal_config_payload["signal_processor"] = signal_processor_name
 
-    if signal_source_type == "internal":
-        if not strategy_name:
-            raise HTTPException(status_code=400, detail="strategy_name is required for internal signal source")
-        if not symbols:
-            raise HTTPException(status_code=400, detail="At least one symbol is required")
-        signal_source_id = ""
-        symbol_filter = []
-    else:
-        matched_service: Service | None = None
-        if signal_source_id:
-            discord_services = await asyncio.to_thread(
-                list_services,
-                service_type=ServiceType.DISCORD_BOT,
-            )
-            matched_service = next(
-                (
-                    service
-                    for service in discord_services
-                    if str(service.name or "").strip().lower() == signal_source_id.lower()
-                ),
-                None,
-            )
-            if matched_service is None:
-                raise HTTPException(status_code=404, detail="Discord signal source service not found")
-            signal_source_id = matched_service.name
-        elif not str(signal_config_payload.get("channel_id") or "").strip():
-            raise HTTPException(
-                status_code=400,
-                detail="signal_source_id is required for discord signal source",
-            )
-        if not strategy_name:
-            strategy_name = (
-                f"discord::{signal_source_id.lower()}"
-                if signal_source_id
-                else "discord::legacy"
-            )
-        if not symbols and symbol_filter:
-            symbols = list(symbol_filter)
-        if not symbols:
-            symbols = ["*"]
-        if signal_source_id:
-            signal_config_payload.setdefault("service_name", signal_source_id)
-        if matched_service and isinstance(matched_service.config, dict):
-            channel_id = str(matched_service.config.get("channel_id") or "").strip()
-            if channel_id and not str(signal_config_payload.get("channel_id") or "").strip():
-                signal_config_payload["channel_id"] = channel_id
+    (
+        signal_source_id,
+        symbol_filter,
+        strategy_name,
+        symbols,
+        signal_config_payload,
+    ) = await _resolve_live_deployment_signal_source(
+        signal_source_type=signal_source_type,
+        strategy_name=strategy_name,
+        symbols=symbols,
+        symbol_filter=symbol_filter,
+        signal_source_id=signal_source_id,
+        signal_config_payload=signal_config_payload,
+    )
 
     deployment = LiveDeploymentConfig(
         strategy_name=strategy_name,
