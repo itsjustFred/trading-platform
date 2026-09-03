@@ -1352,6 +1352,21 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                     extra={"data": {"account_id": self.ctid_trader_account_id}},
                 )
 
+    def _validate_pre_persistence(self, signal: LiveSignal) -> None:
+        """B-8: validate symbol/action BEFORE the first persistence.
+
+        A signal persisted without a broker order wedges every redelivery on
+        the duplicate-persisted recovery path, so the cheap in-memory checks
+        run ahead of save_live_signal.
+        """
+        if signal.action not in {"buy", "sell"}:
+            raise ValueError(f"Unsupported signal action: {signal.action}")
+        if self._symbol_name_to_id.get(signal.symbol.upper()) is None:
+            raise ValueError(
+                f"Unknown cTrader symbol: {signal.symbol!r}; refusing to "
+                "persist or submit the signal."
+            )
+
     async def submit_order(self, signal: LiveSignal) -> str:
         self._raise_if_terminal_auth_failed()
         signal_id = str(signal.id)
@@ -1368,18 +1383,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         if not self._connected or not self._authenticated:
             await self.connect()
 
-        # B-8: validate symbol/action BEFORE the first persistence. A signal
-        # persisted without a broker order wedges every redelivery on the
-        # duplicate-persisted recovery path, so the cheap in-memory checks run
-        # ahead of save_live_signal.
-        symbol_id = self._symbol_name_to_id.get(signal.symbol.upper())
-        if symbol_id is None:
-            raise ValueError(
-                f"Unknown cTrader symbol: {signal.symbol!r}; refusing to "
-                "persist or submit the signal."
-            )
-        if signal.action not in {"buy", "sell"}:
-            raise ValueError(f"Unsupported signal action: {signal.action}")
+        self._validate_pre_persistence(signal)
 
         balance, _ = await self.get_balance()
         sized_order = size_live_signal(signal, account_balance=balance)
