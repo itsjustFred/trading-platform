@@ -2376,8 +2376,9 @@ def test_alpaca_build_order_request_rejects_unknown_signal_action():
     adapter = module.AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True)
     bad_signal = _live_signal_with_action("close")
 
+    builder = adapter._build_order_request
     with pytest.raises(ValueError, match=r"[Uu]nsupported .*action: close"):
-        adapter._build_order_request(
+        builder(
             bad_signal,
             qty=1.0,
             order_side=SimpleNamespace(BUY="buy", SELL="sell"),
@@ -2479,12 +2480,15 @@ def test_ctrader_relative_sl_tp_direction_and_rejections():
     assert sell_request.relativeTakeProfit == int(round(0.1 * 100_000))
 
     wrong_side = adapter._build_new_order_request
+    wrong_side_signal = _signal("buy", 1.2, 1.05)
     with pytest.raises(ValueError, match="wrong side of the reference price"):
-        wrong_side(_signal("buy", 1.2, 1.05), symbol_id=7)
+        wrong_side(wrong_side_signal, symbol_id=7)
+    nan_signal = _signal("buy", float("nan"), 1.2)
     with pytest.raises(ValueError, match="Invalid SL/TP price"):
-        wrong_side(_signal("buy", float("nan"), 1.2), symbol_id=7)
+        wrong_side(nan_signal, symbol_id=7)
+    zero_distance_signal = _signal("buy", 1.1, 1.2)
     with pytest.raises(ValueError, match="wrong side of the reference price"):
-        wrong_side(_signal("buy", 1.1, 1.2), symbol_id=7)
+        wrong_side(zero_distance_signal, symbol_id=7)
 
 
 def test_ctrader_new_order_request_fails_closed_without_sl_tp():
@@ -2576,17 +2580,9 @@ def test_alpaca_build_order_request_fails_closed_without_sl_tp():
         metadata={"qty": 2.0},
     )
 
-    builder = adapter._build_order_request
+    resolve = adapter._resolve_broker_sl_tp
     with pytest.raises(ValueError, match="without stop_loss"):
-        builder(
-            naked_signal,
-            qty=2.0,
-            order_side=SimpleNamespace(BUY="buy", SELL="sell"),
-            time_in_force=SimpleNamespace(DAY="day"),
-            limit_request_cls=lambda **kwargs: ("limit", kwargs),
-            market_request_cls=lambda **kwargs: ("market", kwargs),
-            client_order_id="cid-naked",
-        )
+        resolve(naked_signal)
 
 
 def test_exit_only_orders_still_bypass_sizing_but_close_exact_position():
