@@ -147,7 +147,7 @@ class _PositionsAdapter(BaseLiveAdapter):
     async def connect(self) -> None:
         return None
 
-    async def submit_order(self, signal: LiveSignal) -> str:
+    async def submit_order(self, signal: LiveSignal, *, qty: float | None = None) -> str:
         self.submitted_signal = signal
         return "order-1"
 
@@ -481,7 +481,7 @@ def test_alpaca_discord_redelivery_submits_once_with_canonical_signal_id(monkeyp
     monkeypatch.setattr(
         module,
         "size_live_signal",
-        lambda _signal, *, account_balance: SimpleNamespace(risk_percent=0.01),
+        lambda _signal, *, account_balance: SimpleNamespace(position_size=1.0, risk_percent=0.01),
     )
     save_results = iter(
         [(canonical_signal_id, True), (canonical_signal_id, False)]
@@ -553,7 +553,7 @@ def test_alpaca_redelivery_recovers_accepted_order_without_resubmitting(monkeypa
     monkeypatch.setattr(
         module,
         "size_live_signal",
-        lambda _signal, *, account_balance: SimpleNamespace(risk_percent=0.01),
+        lambda _signal, *, account_balance: SimpleNamespace(position_size=1.0, risk_percent=0.01),
     )
     monkeypatch.setattr(
         module, "save_live_signal", lambda _signal: (canonical_signal_id, False)
@@ -599,7 +599,7 @@ def test_alpaca_redelivery_uses_persisted_order_id_without_broker_call(monkeypat
     monkeypatch.setattr(
         module,
         "size_live_signal",
-        lambda _signal, *, account_balance: SimpleNamespace(risk_percent=0.01),
+        lambda _signal, *, account_balance: SimpleNamespace(position_size=1.0, risk_percent=0.01),
     )
     monkeypatch.setattr(
         module, "save_live_signal", lambda _signal: (canonical_signal_id, False)
@@ -637,7 +637,7 @@ def test_alpaca_broker_order_id_persistence_failure_is_not_success(monkeypatch):
     monkeypatch.setattr(
         module,
         "size_live_signal",
-        lambda _signal, *, account_balance: SimpleNamespace(risk_percent=0.01),
+        lambda _signal, *, account_balance: SimpleNamespace(position_size=1.0, risk_percent=0.01),
     )
     monkeypatch.setattr(
         module, "save_live_signal", lambda _signal: (canonical_signal_id, True)
@@ -659,6 +659,69 @@ def test_alpaca_broker_order_id_persistence_failure_is_not_success(monkeypatch):
     assert persistence_calls == [(canonical_signal_id, "alpaca-order-2")]
 
 
+def test_alpaca_submit_order_trusted_qty_channel_overrides_metadata(monkeypatch):
+    """The daemon-sized qty parameter drives the order; metadata qty is inert."""
+    from live_runner import alpaca_adapter as module
+
+    adapter = module.AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True)
+    adapter._connected = True
+    captured: list[dict[str, Any]] = []
+
+    def _submit_order(*, order_data):
+        captured.append(order_data)
+        return SimpleNamespace(id="trusted-qty-order")
+
+    adapter._trading_client = SimpleNamespace(
+        get_account=lambda: pytest.fail(
+            "balance must not be fetched when a trusted qty is supplied"
+        ),
+        submit_order=_submit_order,
+    )
+    monkeypatch.setattr(module, "save_live_signal", lambda _signal: ("cid", True))
+    monkeypatch.setattr(
+        module, "set_live_signal_broker_order_id", lambda _sid, _oid: True
+    )
+
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="AAPL",
+        action="buy",
+        theoretical_price=100.0,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"entry_price": 100.0, "stop_loss": 98.0, "qty": 999.0},
+    )
+
+    asyncio.run(adapter.submit_order(signal, qty=7.0))
+
+    assert captured
+    assert getattr(captured[0], "qty") == pytest.approx(7.0)
+    assert signal.metadata["qty"] == 999.0  # payload untouched, never used
+
+
+def test_alpaca_submit_order_trusted_qty_zero_fails_closed(monkeypatch):
+    """A trusted qty <= 0 must never reach the broker."""
+    from live_runner import alpaca_adapter as module
+
+    adapter = module.AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True)
+    adapter._connected = True
+    adapter._trading_client = SimpleNamespace(
+        get_account=lambda: pytest.fail("balance must not be fetched"),
+        submit_order=lambda **_kwargs: pytest.fail("order must not reach the broker"),
+    )
+
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="AAPL",
+        action="buy",
+        theoretical_price=100.0,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"entry_price": 100.0, "stop_loss": 98.0},
+    )
+
+    with pytest.raises(ValueError, match="non-positive quantity"):
+        asyncio.run(adapter.submit_order(signal, qty=0.0))
+
+
 def test_ctrader_volume_rejects_missing_and_below_minimum_qty():
     """Volume floor must not silently override risk sizing; no default size."""
     _module, adapter = _make_ctrader_adapter()
@@ -673,13 +736,18 @@ def test_ctrader_volume_rejects_missing_and_below_minimum_qty():
             metadata=metadata,
         )
 
-    with pytest.raises(ValueError, match="no positive quantity"):
-        adapter._resolve_order_volume(_signal({}))
+    # Volume derives from the trusted qty parameter, never metadata "qty".
     with pytest.raises(ValueError, match="below the broker minimum"):
-        adapter._resolve_order_volume(_signal({"qty": 0.07}))
-    assert adapter._resolve_order_volume(_signal({"qty": 5.0})) == 5000
-    assert adapter._resolve_order_volume(_signal({"ctrader_volume": 2000})) == 2000
-    assert adapter._resolve_order_volume(_signal({"qty": 499.999, "ctrader_volume": 100000})) == 100000
+        adapter._resolve_order_volume(_signal({}), qty=0.07)
+    with pytest.raises(ValueError, match="below the broker minimum"):
+        adapter._resolve_order_volume(_signal({"qty": 5.0}), qty=0.07)
+    assert adapter._resolve_order_volume(_signal({}), qty=5.0) == 5000
+    # Metadata qty is inert: trusted qty wins even when the payload disagrees.
+    assert adapter._resolve_order_volume(_signal({"qty": 0.07}), qty=5.0) == 5000
+    assert adapter._resolve_order_volume(_signal({"ctrader_volume": 2000}), qty=5.0) == 2000
+    assert (
+        adapter._resolve_order_volume(_signal({"ctrader_volume": 100000}), qty=5.0) == 100000
+    )
 
 
 def test_processor_market_data_refuses_synthetic_fabrication():
@@ -2000,7 +2068,7 @@ def test_ctrader_discord_redelivery_uses_canonical_signal_without_resubmitting(m
     monkeypatch.setattr(
         module,
         "size_live_signal",
-        lambda _signal, *, account_balance: SimpleNamespace(risk_percent=0.01),
+        lambda _signal, *, account_balance: SimpleNamespace(position_size=1.0, risk_percent=0.01),
     )
     monkeypatch.setattr(
         module, "get_live_signal_broker_order_id",
@@ -2073,7 +2141,7 @@ def test_ctrader_redelivery_recovers_accepted_order_without_resubmitting(monkeyp
     monkeypatch.setattr(
         module,
         "size_live_signal",
-        lambda _signal, *, account_balance: SimpleNamespace(risk_percent=0.01),
+        lambda _signal, *, account_balance: SimpleNamespace(position_size=1.0, risk_percent=0.01),
     )
     monkeypatch.setattr(module, "save_live_signal", lambda _signal: None)
     monkeypatch.setattr(module, "get_live_signal_broker_order_id", lambda _sid: "")
@@ -2160,7 +2228,7 @@ def test_ctrader_accepted_order_fails_closed_when_local_id_persistence_fails(mon
     monkeypatch.setattr(
         module,
         "size_live_signal",
-        lambda _signal, *, account_balance: SimpleNamespace(risk_percent=0.01),
+        lambda _signal, *, account_balance: SimpleNamespace(position_size=1.0, risk_percent=0.01),
     )
     monkeypatch.setattr(module, "get_live_signal_broker_order_id", lambda _sid: "")
     monkeypatch.setattr(module, "get_live_signal_timestamp", lambda _sid: None)

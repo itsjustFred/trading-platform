@@ -48,6 +48,8 @@ async def _run(symbol: str, deployment_id: str, qty: float) -> None:
             "timeframe": "1m",
         },
     )
+    # Operator script: no trusted sizing channel, so the adapter falls back to
+    # default-config risk sizing; metadata qty is advisory only.
     broker_order_id = await adapter.submit_order(signal)
     print(f"signal_id={signal.id}")
     print(f"broker_order_id={broker_order_id}")

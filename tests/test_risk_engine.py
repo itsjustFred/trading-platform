@@ -301,7 +301,7 @@ class _DummyAdapter(BaseLiveAdapter):
     async def connect(self) -> None:
         return None
 
-    async def submit_order(self, signal: LiveSignal) -> str:
+    async def submit_order(self, signal: LiveSignal, *, qty: float | None = None) -> str:
         self.submitted_signal = signal
         return "risk-sized-order"
 
