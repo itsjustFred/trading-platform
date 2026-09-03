@@ -69,12 +69,35 @@ def test_framework_statistics_comparison_respects_absolute_tolerance() -> None:
     actual = TradeStatistics(net_profit=100.5)
     config = RegressionConfig(
         default_stats_absolute_tolerance=1.0,
-        default_stats_relative_tolerance=0.0,
+        default_stats_relative_tolerance=0.02,
     )
 
     deltas = _compare_stats(expected, actual, config)
 
     assert next(delta for delta in deltas if delta.field == "net_profit").passed is True
+
+
+def test_framework_statistics_comparison_zero_band_is_exact() -> None:
+    """DV-B35: a configured 0.0 band is exact equality, not "disabled"."""
+    expected = TradeStatistics(net_profit=100.0)
+    identical = TradeStatistics(net_profit=100.0)
+    drifted = TradeStatistics(net_profit=100.5)
+    config = RegressionConfig(
+        default_stats_absolute_tolerance=0.0,
+        default_stats_relative_tolerance=0.0,
+    )
+
+    identical_delta = next(
+        delta for delta in _compare_stats(expected, identical, config)
+        if delta.field == "net_profit"
+    )
+    drifted_delta = next(
+        delta for delta in _compare_stats(expected, drifted, config)
+        if delta.field == "net_profit"
+    )
+
+    assert identical_delta.passed is True
+    assert drifted_delta.passed is False
 
 
 def test_framework_statistics_comparison_handles_infinite_profit_factor() -> None:

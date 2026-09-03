@@ -19,6 +19,7 @@ Usage:
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -36,12 +37,11 @@ DOLTHUB_API = "https://www.dolthub.com/api/v1alpha1"
 
 def _validate_date(value: str) -> str:
     """Validate a user-supplied date bound (YYYY-MM-DD) before SQL assembly."""
-    import re
-
     text = str(value).strip()
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
         raise ValueError(f"invalid date bound (expected YYYY-MM-DD): {value!r}")
     return text
+
 
 # Well-known trading data repos
 KNOWN_REPOS = [

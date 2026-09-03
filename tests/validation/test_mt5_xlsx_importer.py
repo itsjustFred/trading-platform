@@ -349,3 +349,11 @@ class TestGermanNumberParsing:
         mapping = MT5XLSXImporter._build_sltp_map(orders)
         assert mapping[1001]["sl"] == pytest.approx(1234.56)
         assert mapping[1001]["tp"] == pytest.approx(2500.0)
+
+    def test_to_float_parses_german_locale_fallback(self):
+        """PnL/commission cells outside SL/TP also honour the German locale."""
+        assert MT5XLSXImporter._to_float("1.234,56") == pytest.approx(1234.56)
+        assert MT5XLSXImporter._to_float("2.500") == pytest.approx(2.5)
+        assert MT5XLSXImporter._to_float("300.0") == pytest.approx(300.0)
+        assert MT5XLSXImporter._to_float("n/a") is None
+        assert MT5XLSXImporter._to_float(None) is None

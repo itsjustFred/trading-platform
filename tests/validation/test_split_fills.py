@@ -104,6 +104,52 @@ class TestXLSXSplitFills:
         quantities = sorted(t.quantity for t in ref.trades)
         assert quantities == pytest.approx([0.10, 0.15])
 
+    def test_deal_numbered_reports_pair_split_fills(self, tmp_path: Path) -> None:
+        """Real MT5 reports carry a unique deal id per row (docs/mt5_xlsx_schema.md).
+
+        Grouping by that id would strand every entry with no exit; the deal
+        sequence must be used instead, so an in/in/out/out sequence becomes
+        ONE position with the aggregated entry quantity and both exits —
+        the same reconstruction the HTML importer produces.
+        """
+        deals = pd.DataFrame(
+            [
+                ["Trades"] + [None] * 11,
+                ["Zeit", "Trade", "Symbol", "Typ", "Richtung", "Volumen", "Preis", "Auftrag",
+                 "Kommission", "Swap", "Gewinn", "Kontostand", "Kommentar"],
+                ["2024.01.03 08:00:00", 2, "EURUSD", "buy", "in", "0.10", 1.085, 1001, -0.50, 0, 0, 100000, "Entry"],
+                ["2024.01.03 09:00:00", 3, "EURUSD", "buy", "in", "0.05", 1.086, 1002, -0.25, 0, 0, 100000, "Add"],
+                ["2024.01.03 16:00:00", 4, "EURUSD", "sell", "out", "0.10", 1.088, 1003, -0.75, 0, 300.0, 100300, "Partial TP"],
+                ["2024.01.03 17:00:00", 5, "EURUSD", "sell", "out", "0.05", 1.090, 1004, -0.50, 0, 250.0, 100550, "TP 1.09000"],
+                ["2024.01.04 08:00:00", 6, "EURUSD", "sell", "in", "0.10", 1.092, 1005, -0.50, 0, 0, 100550, "Entry Short"],
+                ["2024.01.04 16:00:00", 7, "EURUSD", "buy", "out", "0.10", 1.097, 1006, -0.50, 0, -250.0, 100300, "SL 1.09700"],
+            ]
+        )
+        orders = pd.DataFrame(
+            [
+                ["Orders"] + [None] * 9,
+                ["Auftrag", "Zeit", "Symbol", "Typ", "Richtung", "Volumen", "Preis", "S / L", "T / P", "Kommentar"],
+                [1001, "2024.01.03 08:00:00", "EURUSD", "buy", "in", "0.10", 1.085, 1.08, 1.095, "Entry"],
+                [1002, "2024.01.03 09:00:00", "EURUSD", "buy", "in", "0.05", 1.086, 1.08, 1.095, "Add"],
+                [1003, "2024.01.03 16:00:00", "EURUSD", "sell", "out", "0.10", 1.088, None, None, "Partial TP"],
+                [1004, "2024.01.03 17:00:00", "EURUSD", "sell", "out", "0.05", 1.090, None, None, "TP 1.09000"],
+                [1005, "2024.01.04 08:00:00", "EURUSD", "sell", "in", "0.10", 1.092, 1.097, 1.085, "Entry Short"],
+                [1006, "2024.01.04 16:00:00", "EURUSD", "buy", "out", "0.10", 1.097, None, None, "SL 1.09700"],
+            ]
+        )
+        path = tmp_path / "deal_numbered.xlsx"
+        with pd.ExcelWriter(path, engine="openpyxl") as writer:
+            orders.to_excel(writer, index=False, header=False, startrow=0)
+            deals.to_excel(writer, index=False, header=False, startrow=20)
+
+        ref = MT5XLSXImporter().load(path)
+        assert len(ref.trades) == 2
+        first = ref.trades[0]
+        assert first.quantity == pytest.approx(0.15)
+        assert first.pnl == pytest.approx(550.0)
+        assert len(first.exits) == 2
+        assert ref.trades[1].quantity == pytest.approx(0.10)
+
 
 def _build_split_fill_xlsx(path: Path) -> Path:
     """Deterministic in-repo builder so the binary fixture stays reproducible."""

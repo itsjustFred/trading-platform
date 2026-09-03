@@ -362,14 +362,35 @@ class TestTolerances:
         golden_path = tmp_path / "golden.json"
         _write_golden(golden, golden_path)
 
+        # DV-B35: every configured band must hold (AND).  A 5.0 absolute
+        # drift on a 50.0 base is a 9.09% relative drift, so this needs both
+        # bands widened — the abs band alone no longer rescues it.
         cfg = RegressionConfig(
             stats_absolute_tolerance={"net_profit": 10.0},
-            stats_relative_tolerance={"net_profit": 0.0},
+            stats_relative_tolerance={"net_profit": 0.10},
         )
         current = _make_reference(act_trades)
         result = run_regression(golden_path, current_data=current, config=cfg)
         net_profit_delta = next(d for d in result.stats_delta if d.field == "net_profit")
         assert net_profit_delta.passed is True
+
+    def test_regression_zero_band_is_exact_equality(self, tmp_path: Path) -> None:
+        """A 0.0 band means exact, so identical values pass and any drift fails."""
+        ref_trades = [_make_trade(pnl=100.0), _make_trade(trade_id=2, pnl=-50.0, exit_price=1.0950)]
+        identical = [_make_trade(pnl=100.0), _make_trade(trade_id=2, pnl=-50.0, exit_price=1.0950)]
+        drifted = [_make_trade(pnl=105.0), _make_trade(trade_id=2, pnl=-50.0, exit_price=1.0950)]
+        golden = _make_reference(ref_trades)
+        golden_path = tmp_path / "golden.json"
+        _write_golden(golden, golden_path)
+
+        cfg = RegressionConfig(
+            stats_absolute_tolerance={"net_profit": 0.0},
+            stats_relative_tolerance={"net_profit": 0.0},
+        )
+        identical_result = run_regression(golden_path, current_data=_make_reference(identical), config=cfg)
+        drifted_result = run_regression(golden_path, current_data=_make_reference(drifted), config=cfg)
+        assert next(d for d in identical_result.stats_delta if d.field == "net_profit").passed is True
+        assert next(d for d in drifted_result.stats_delta if d.field == "net_profit").passed is False
 
     def test_regression_with_custom_trade_config(self, tmp_path: Path) -> None:
         ref_trade = _make_trade(entry_price=1.1000)

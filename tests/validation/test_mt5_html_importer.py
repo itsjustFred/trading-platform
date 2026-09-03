@@ -240,21 +240,25 @@ class TestGermanNumberParsing:
         ],
     )
     def test_parse_german_number(self, raw: str, expected: float):
-        from validation.importers.mt5_html import _parse_german_number
+        from validation.importers._numbers import parse_german_number
 
-        # The html-module alias parses with the report locale detected from
-        # the fixture (German); these cases are the documented contract.
-        from validation.importers._numbers import parse_locale_number
-
-        value = _parse_german_number(raw)
-        fallback = parse_locale_number(raw, decimal_comma=True)
-        assert value == pytest.approx(expected) or fallback == pytest.approx(expected)
+        value = parse_german_number(raw)
+        assert value == pytest.approx(expected)
 
     @pytest.mark.parametrize("raw", ["", "n/a", "1.2.3", "abc"])
     def test_parse_german_number_rejects_garbage(self, raw: str):
-        from validation.importers.mt5_html import _parse_german_number
+        from validation.importers._numbers import parse_german_number
 
-        assert _parse_german_number(raw) is None  # type: ignore[truthy-function]
+        assert parse_german_number(raw) is None
+
+    def test_to_float_parses_german_locale_fallback(self):
+        """PnL/commission cells outside SL/TP also honour the German locale."""
+        from validation.importers.mt5_html import MT5HTMLImporter as I
+
+        assert I._to_float(["1.234,56"], 0) == pytest.approx(1234.56)
+        assert I._to_float(["1.08500"], 0) == pytest.approx(1.085)
+        assert I._to_float(["-499.60"], 0) == pytest.approx(-499.60)
+        assert I._to_float(["n/a"], 0) is None
 
     def test_sltp_map_parses_german_formats(self):
         ref = MT5HTMLImporter().load(

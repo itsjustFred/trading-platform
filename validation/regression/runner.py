@@ -140,15 +140,15 @@ def _compare_stats(
             else:
                 rel_diff = abs(float(expected) - float(actual)) / denom
 
-        # Tolerance bands: an explicitly configured 0.0 band is treated as
-        # "band disabled" (this is how RegressionConfig consumers disable one
-        # arm); every enabled band must hold (DV-B35 - AND, not OR).
-        passed = False
+        # Tolerance bands: every *configured* band must hold (DV-B35 - AND,
+        # not OR).  A 0.0 band is therefore exact equality, not "disabled":
+        # only a band that is genuinely absent (None) is skipped.
+        passed = True
         checks = 0
-        if abs_tol and abs_diff is not None:
+        if abs_tol is not None and abs_diff is not None:
             checks += 1
             passed = abs_diff <= abs_tol
-        if rel_tol and rel_diff is not None:
+        if rel_tol is not None and rel_diff is not None:
             checks += 1
             passed = passed and (rel_diff <= rel_tol)
         if checks == 0:
@@ -179,11 +179,9 @@ class RegressionConfig(BaseModel):
     trade_config: TradeComparisonConfig = Field(default_factory=TradeComparisonConfig)
     stats_absolute_tolerance: dict[str, float] = Field(default_factory=dict)
     stats_relative_tolerance: dict[str, float] = Field(default_factory=dict)
-    # Tolerance semantics (DV-B35): a band set to 0.0 is *disabled*, not
-    # "exact" — every *enabled* band must hold (AND).  Do not "normalise"
-    # defaults to 0.0 expecting stricter gates: with both bands disabled a
-    # field falls back to exact equality, with one band disabled it degrades
-    # to the other band alone.
+    # Tolerance semantics (DV-B35): every *configured* band must hold (AND).
+    # A 0.0 band means exact equality, not "disabled"; a field with no band
+    # at all falls back to exact equality.
     default_stats_absolute_tolerance: float = 0.01
     default_stats_relative_tolerance: float = 0.001
     golden_base_path: str = ""

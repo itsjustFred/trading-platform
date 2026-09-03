@@ -600,7 +600,13 @@ class MT5HTMLImporter(BaseImporter):
         val = row[col]
         if not val:
             return default
+        # DV-B44: MT5 reports can be German-locale ("1.234,56", "2.500").
+        # The dot-decimal reading is tried first; when it is ambiguous or
+        # fails, the comma-decimal reading is used, so a PnL or commission
+        # of "1.234,56" is neither dropped nor corrupted.
         parsed = parse_locale_number(val, decimal_comma=False)
+        if parsed is None:
+            parsed = parse_locale_number(val, decimal_comma=True)
         return default if parsed is None else parsed
 
     @staticmethod
@@ -632,12 +638,3 @@ class MT5HTMLImporter(BaseImporter):
             return "trailing_stop"
         return None
 
-
-def _parse_german_number(raw: str | None) -> float | None:
-    """Parse a number using the German convention (dot = thousands group)."""
-    from validation.importers._numbers import parse_locale_number
-
-    return parse_locale_number(raw, decimal_comma=True)
-
-
-__all__ = ["MT5HTMLImporter", "_parse_german_number"]

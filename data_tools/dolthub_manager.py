@@ -83,18 +83,16 @@ def run_dolt(
         ) from exc
 
 
-def build_symbol_select(table_name: str, symbol: str = "") -> str:
+def build_symbol_select(table_name: str, symbol: str) -> str:
     """Build the distinct-symbol query without raw interpolation (DV-B27).
 
-    ``symbol`` is part of the signature for callers that want a literal
-    filter; when given it must pass :func:`shared.sql.validate_symbol`.
+    The symbol filter goes through :func:`shared.sql.quote_literal`, which
+    validates the symbol and raises ``ValueError`` on unsafe input.
     """
-    if symbol:
-        return (
-            "SELECT DISTINCT act_symbol FROM "
-            f"{quote_identifier(table_name)} WHERE act_symbol = {quote_literal(symbol)}"
-        )
-    return f"SELECT DISTINCT act_symbol FROM {quote_identifier(table_name)}"
+    return (
+        "SELECT DISTINCT act_symbol FROM "
+        f"{quote_identifier(table_name)} WHERE act_symbol = {quote_literal(symbol)}"
+    )
 
 
 def build_ohlcv_select(table_name: str, symbol: str) -> str:
@@ -117,10 +115,11 @@ def update_repos():
             if (repo_path / ".dolt").exists():
                 try:
                     run_dolt(["dolt", "pull"], cwd=repo_path)
-                except subprocess.CalledProcessError:
-                    logger.error(
-                        f"Failed to pull {name}. Manual intervention required."
-                    )
+                except (subprocess.CalledProcessError, DoltTimeoutError) as exc:
+                    # Per-repo update failures are logged and skipped so one
+                    # stuck repo does not block the others (DV-B28: the
+                    # timeout itself stays mandatory).
+                    logger.error("Failed to pull %s: %s", name, exc)
             else:
                 logger.warning(f"{repo_path} exists but is not a dolt repo. Skipping.")
         else:
@@ -132,8 +131,8 @@ def update_repos():
                     ["dolt", "clone", remote, str(repo_path)],
                     timeout=3 * DEFAULT_DOLT_TIMEOUT_SECONDS,
                 )
-            except subprocess.CalledProcessError:
-                logger.error(f"Failed to clone {remote}.")
+            except (subprocess.CalledProcessError, DoltTimeoutError) as exc:
+                logger.error("Failed to clone %s: %s", remote, exc)
 
 
 def _list_tables(repo_path: Path) -> list[str]:
@@ -190,7 +189,7 @@ def export_data():
 
             # Get symbols
             result = run_dolt(
-                ["dolt", "sql", "-q", build_symbol_select(table_name), "-r", "csv"],
+                ["dolt", "sql", "-q", f"SELECT DISTINCT act_symbol FROM {quote_identifier(table_name)}", "-r", "csv"],
                 cwd=stocks_repo,
                 capture=True,
             )

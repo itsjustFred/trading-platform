@@ -6,7 +6,7 @@ import logging
 import re
 from datetime import datetime, timezone, tzinfo
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pandas as pd
@@ -483,56 +483,95 @@ class MT5XLSXImporter(BaseImporter):
                 "Trades table is missing required columns (Zeit / Typ / Richtung)."
             )
 
-        # DV-B43: group all fills per position id (the Trade column; the
-        # Auftrag order id differs per fill), then reconstruct one Trade per
-        # position with one TradeExit per out row.  The positional walker
-        # previously dropped every fill after a second consecutive "in".
+        # DV-B43: reconstruct one Trade per position with one TradeExit per
+        # out row; the positional walker previously dropped every fill after
+        # a second consecutive "in".
         #
-        # The Trade column numbers *deals*, not positions, so a position is
-        # identified by its consecutive deal ids (order of in/out rows) when
-        # the report has no dedicated position id: the k-th "in" opens
-        # position k and subsequent "out" rows close it.  Grouping by raw
-        # Trade id would strand every entry (in) with no exit.
-        col_position_id = col_trade_id
-
+        # The Trade column holds *deal* ids (autoincrement, unique per row —
+        # see docs/mt5_xlsx_schema.md), so it cannot group the fills of a
+        # position.  Positions are instead read off the deal sequence: every
+        # "in" opens a new position and the following "out" rows close the
+        # most recently opened one (MT5 reconstructs a position this way;
+        # partial entries/exits keep their order in the report).
+        #
+        # Some exporters repeat the position id instead of the deal id; those
+        # reports are grouped by the shared id first and only fall back to
+        # the sequential walker when the ids are unique per row.
         rows_list = trades_df.to_dict(orient="records")
 
         def _row_direction(row: dict[str, Any]) -> str:
             return MT5XLSXImporter._get_str(row, col_direction, "").lower()
 
-        deal_counter = 0
-        open_entries = 0
-        position_of_deal: dict[str, str] = {}
-
-        def _row_position_id(row: dict[str, Any]) -> str:
-            nonlocal deal_counter, open_entries
-            if col_position_id is None:
-                return ""
-            deal_id = _deal_id(row)
-            if deal_id in position_of_deal:
-                return position_of_deal[deal_id]
-            deal_counter += 1
-            direction = _row_direction(row)
-            if direction == "in":
-                open_entries += 1
-                position_of_deal[deal_id] = f"position-{open_entries}"
-            else:
-                position_of_deal[deal_id] = f"position-{open_entries or 1}"
-            return position_of_deal[deal_id]
-
         def _deal_id(row: dict[str, Any]) -> str:
-            if col_position_id is None:
-                return ""
-            value = row.get(col_position_id)
+            value = row.get(col_trade_id)
             if value is None or (isinstance(value, float) and pd.isna(value)):
                 return ""
             return str(value).strip()
 
+        # Prefer shared position ids when the report has them (every deal of
+        # a position carries the same id); fall back to the sequential deal
+        # walker when the ids are unique per row (a pure deal counter).
+        def _is_trade_row(row: dict[str, Any]) -> bool:
+            return MT5XLSXImporter._get_str(row, col_typ, "").lower() != "balance"
+
+        id_counts: dict[str, int] = {}
+        for row in rows_list:
+            if not _is_trade_row(row):
+                continue
+            deal_id = _deal_id(row)
+            if deal_id:
+                id_counts[deal_id] = id_counts.get(deal_id, 0) + 1
+        shared_ids = any(count > 1 for count in id_counts.values())
+
+        if shared_ids:
+            position_id_of: Callable[[dict[str, Any]], str] = _deal_id
+        else:
+            # Sequential deal walker: an "out" closes the *oldest* position
+            # whose entries are not yet fully exited, so an in/in/out/out
+            # sequence reconstructs one position entered with two fills and
+            # closed with two exits, and the next "in" starts the next
+            # position.
+            entry_volume: list[float] = []  # summed entry volume per position
+            exit_volume: list[float] = []  # summed exit volume per position
+
+            def _assign_sequential_position(row: dict[str, Any]) -> str:
+                """Assign a position id from the deal sequence.
+
+                An "in" deal opens a new position once every existing one is
+                fully exited; an "out" deal closes volume on the oldest open
+                position.  An orphan "out" with no open position is pinned to
+                position 1 so its fills are grouped and then dropped by
+                ``closed_positions``.
+                """
+                if _deal_id(row) == "":
+                    return ""
+                direction = _row_direction(row)
+                volume = MT5XLSXImporter._to_float(row.get(col_volume)) or 0.0
+                if direction == "in":
+                    for index, remaining in enumerate(entry_volume):
+                        if exit_volume[index] < remaining:
+                            break
+                    else:
+                        index = len(entry_volume)
+                        entry_volume.append(0.0)
+                        exit_volume.append(0.0)
+                    entry_volume[index] += volume
+                    return f"position-{index + 1}"
+                if not entry_volume:
+                    return "position-1"
+                for index, remaining in enumerate(entry_volume):
+                    if exit_volume[index] < remaining:
+                        exit_volume[index] += volume
+                        break
+                return f"position-{index + 1}"
+
+            position_id_of = _assign_sequential_position
+
         position_fills = group_position_fills(
             rows_list,
-            position_id_of=_row_position_id,
+            position_id_of=position_id_of,
             direction_of=_row_direction,
-            is_trade_row=lambda row: MT5XLSXImporter._get_str(row, col_typ, "").lower() != "balance",
+            is_trade_row=_is_trade_row,
         )
 
         trades: list[Trade] = []
@@ -654,6 +693,11 @@ class MT5XLSXImporter(BaseImporter):
         try:
             return float(val)
         except (ValueError, TypeError):
+            # DV-B44: German-locale cells ("1.234,56", "2.500") are not
+            # float()-parsable; fall back to the locale-aware parser so the
+            # value is neither dropped nor silently corrupted.
+            if isinstance(val, str):
+                return parse_locale_number(val, decimal_comma=True)
             return default
 
     @staticmethod

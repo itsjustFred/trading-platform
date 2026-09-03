@@ -126,7 +126,7 @@ def _build_stat_explanation(
 
 
 def _infinite_like(value: Any) -> bool:
-    """True when *value* is a non-numeric or infinite float (+inf or -inf)."""
+    """True when *value* is a non-finite float (+inf, -inf or nan)."""
     return isinstance(value, float) and not math.isfinite(value)
 
 

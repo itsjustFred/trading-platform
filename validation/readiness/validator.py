@@ -594,7 +594,7 @@ class ReadinessValidator:
                     "Risk comparison report passed"
                     if report_verdict_passed
                     else "Risk comparison report failed: "
-                    + str(getattr(risk_report, "explanation", "") or "no explanation")
+                    + str(risk_report.explanation or "no explanation")
                 ),
                 details={"report_passed": report_verdict_passed},
             )

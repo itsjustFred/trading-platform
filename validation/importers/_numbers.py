@@ -21,7 +21,6 @@ _GERMAN_GROUPED = re.compile(r"^\d{1,3}(\.\d{3})+,\d{1,4}$")
 # ASCII grouping: "12,345.67".
 _ASCII_GROUPED = re.compile(r"^\d{1,3}(,\d{3})+\.\d{1,4}$")
 
-
 def detect_decimal_comma(values: list[str | None]) -> bool:
     """Return True when any value proves the report uses German formatting.
 
@@ -30,15 +29,21 @@ def detect_decimal_comma(values: list[str | None]) -> bool:
     ASCII convention.  Ambiguous or ungrouped values decide nothing.
     """
     for raw in values:
-        if raw is None:
+        text = _normalise_number(raw)
+        if text is None:
             continue
-        text = str(raw).strip().replace(" ", "").replace(" ", "")
         if _GERMAN_GROUPED.match(text):
             return True
         if _ASCII_GROUPED.match(text):
             return False
     return False
 
+def _normalise_number(raw: str | None) -> str | None:
+    """Return the stripped, separator-free text of *raw* (or None)."""
+    if raw is None:
+        return None
+    text = str(raw).strip().replace(" ", "").replace("\u00a0", "")
+    return text or None
 
 def _split_german(text: str, last_comma: int) -> tuple[str, str] | None:
     """Split a German-convention value into (integer digits, fraction digits).
@@ -62,7 +67,6 @@ def _split_german(text: str, last_comma: int) -> tuple[str, str] | None:
     digits, _, decimal = text.partition(".")
     return digits, decimal
 
-
 def _split_ascii(text: str, last_dot: int) -> tuple[str, str] | None:
     """Split an ASCII-convention value into (integer digits, fraction digits).
 
@@ -80,7 +84,6 @@ def _split_ascii(text: str, last_dot: int) -> tuple[str, str] | None:
     digits, _, decimal = text.partition(",")
     return digits, decimal
 
-
 def parse_locale_number(raw: str | None, decimal_comma: bool) -> float | None:
     """Parse a locale-formatted number into a float.
 
@@ -97,10 +100,8 @@ def parse_locale_number(raw: str | None, decimal_comma: bool) -> float | None:
     non-numeric, or mixed grouping such as "1.2.3") so callers can skip the
     value instead of storing a corrupted one.
     """
-    if raw is None:
-        return None
-    text = str(raw).strip().replace(" ", "").replace(" ", "")
-    if not text:
+    text = _normalise_number(raw)
+    if text is None:
         return None
 
     negative = text.startswith("-")
@@ -133,10 +134,14 @@ def parse_locale_number(raw: str | None, decimal_comma: bool) -> float | None:
     value = float(f"{digits}.{decimal}" if decimal else digits)
     return -value if negative else value
 
-
 _GROUPED_DOT = re.compile(r"^\d{1,3}(\.\d{3})+$")
 
 
 def parse_german_number(raw: str | None) -> float | None:
-    """Backwards-compatible alias for ASCII-convention parsing."""
-    return parse_locale_number(raw, decimal_comma=False)
+    """Parse a German-locale number ("2.500" -> 2500.0).
+
+    Thin convenience wrapper over :func:`parse_locale_number` with
+    ``decimal_comma=True``; use :func:`parse_locale_number` directly when the
+    report locale is detected rather than known.
+    """
+    return parse_locale_number(raw, decimal_comma=True)
