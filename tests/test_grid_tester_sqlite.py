@@ -302,6 +302,8 @@ def test_trading_run_without_trade_count_reports_presence_not_zero(monkeypatch, 
     """Pre-mortem 16-B #11: total_trades precedence — an explicit stats count
     wins, the observed-trades fallback reports presence (1), never a fabricated
     zero or minimum."""
+    from shared.models import BacktestMeta, BacktestResult
+
     import runner.grid_tester as grid_tester_module
 
     class TradingEngineNoCount:
