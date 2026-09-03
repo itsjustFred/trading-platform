@@ -2489,6 +2489,9 @@ def test_ctrader_relative_sl_tp_direction_and_rejections():
     zero_distance_signal = _signal("buy", 1.1, 1.2)
     with pytest.raises(ValueError, match="wrong side of the reference price"):
         wrong_side(zero_distance_signal, symbol_id=7)
+    sub_unit_signal = _signal("buy", 1.099995, 1.2)
+    with pytest.raises(ValueError, match="below one 1/100000 price unit"):
+        wrong_side(sub_unit_signal, symbol_id=7)
 
 
 def test_ctrader_new_order_request_fails_closed_without_sl_tp():
