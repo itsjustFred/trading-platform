@@ -97,7 +97,10 @@ def test_pyne_timeout_is_reported_as_failure(tmp_path, monkeypatch):
 
     adapter = PyneCoreAdapter()
     config = _config(tmp_path, ["SPY"])
-    with pytest.raises(RuntimeError, match="timed out"):
+    with pytest.raises(RuntimeError, match=r"SPY.*timed out after 300 seconds"):
+        # The raise must be self-contained (symbol + timeout in str(exc)): the
+        # logger.exception side channel is a superset, never the only carrier
+        # of the failure detail (pre-mortem 16-B #10).
         adapter.run(config, str(strategy))
 
 
