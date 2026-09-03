@@ -51,6 +51,7 @@ def test_run_strategy_grid_persists_to_sqlite(monkeypatch, tmp_path, isolated_db
     import runner.grid_tester as grid_tester_module
 
     class FakeResult:
+        trades = [object()] * 7
         stats = {
             "sharpe": 1.25,
             "cagr": 0.18,

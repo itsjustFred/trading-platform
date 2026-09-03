@@ -35,33 +35,37 @@ def _parse_day_bound(value: str | None, *, is_end: bool) -> datetime | None:
     return parsed
 
 
-def _trade_in_window(trade: Trade, start_bound: datetime | None, end_bound: datetime | None) -> bool:
+def _last_exit_time(trade: Trade) -> str | None:
+    """The trade's last non-empty exit time, or None when it has none."""
     exit_time = None
     for exit_ in trade.exits:
         if exit_.time:
             exit_time = exit_.time
+    return exit_time
+
+
+def _parsed_in_window(parsed: datetime | None, start_bound: datetime | None, end_bound: datetime | None) -> bool:
+    """Window test on an already-parsed timestamp (None never passes)."""
+    if parsed is None:
+        return False
+    if start_bound and parsed < start_bound:
+        return False
+    if end_bound and parsed > end_bound:
+        return False
+    return True
+
+
+def _trade_in_window(trade: Trade, start_bound: datetime | None, end_bound: datetime | None) -> bool:
+    exit_time = _last_exit_time(trade)
     if not exit_time:
         return False
     parsed = _parse_ts(exit_time)
-    if parsed is None:
-        # A timestamp we cannot understand must not silently pass the filter.
-        return False
-    if start_bound and parsed < start_bound:
-        return False
-    if end_bound and parsed > end_bound:
-        return False
-    return True
+    # A timestamp we cannot understand must not silently pass the filter.
+    return _parsed_in_window(parsed, start_bound, end_bound)
 
 
 def _in_window(value: str, start_bound: datetime | None, end_bound: datetime | None) -> bool:
-    parsed = _parse_ts(value)
-    if parsed is None:
-        return False
-    if start_bound and parsed < start_bound:
-        return False
-    if end_bound and parsed > end_bound:
-        return False
-    return True
+    return _parsed_in_window(_parse_ts(value), start_bound, end_bound)
 
 
 def _scoped_view(
@@ -108,10 +112,7 @@ def build_daily_equity_curve(result: BacktestResult) -> tuple[list[EquityPoint],
             continue
 
         # Determine the day from the last exit
-        exit_time = None
-        for exit_ in trade.exits:
-            if exit_.time:
-                exit_time = exit_.time
+        exit_time = _last_exit_time(trade)
         if exit_time:
             try:
                 dt = datetime.fromisoformat(exit_time.replace("Z", "+00:00"))
@@ -192,13 +193,12 @@ def attach_daily_equity(
     # same bounds before the length comparison: preserving the full unwindowed
     # curve next to window-scoped daily_returns would make the curve and the
     # reported daily returns describe different periods (pre-mortem 16-B #7).
-    preserved_curve = result.equity_curve
-    if start_bound or end_bound:
-        preserved_curve = [
-            point
-            for point in (result.equity_curve or [])
-            if _in_window(point.time, start_bound, end_bound)
-        ]
+    # _scoped_view computes exactly this view; reuse it instead of re-filtering.
+    preserved_curve = (
+        _scoped_view(result, start_bound, end_bound).equity_curve
+        if (start_bound or end_bound)
+        else result.equity_curve
+    )
 
     # Preserve existing equity_curve if it has more points than what we built
     # (e.g., the engine already provided a full equity curve with multiple points)

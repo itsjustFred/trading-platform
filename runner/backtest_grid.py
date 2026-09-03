@@ -101,6 +101,13 @@ def backtest_id_from_output_path(path: Path) -> str:
 
 
 def read_backtest_stats(path: Path) -> dict[str, Any]:
+    """Read the canonical stats from a persisted run JSON.
+
+    One canonical key per metric (F40). ``net_profit_pct`` is **derived** from
+    ``total_return`` explicitly — it is not a ``BacktestStats`` field and must
+    never be read from the stats dict, where an unrelated or missing value
+    would silently masquerade as the derived percentage.
+    """
     payload = json.loads(path.read_text(encoding="utf-8"))
     stats = payload.get("stats", {}) if isinstance(payload, dict) else {}
     trades = payload.get("trades", []) if isinstance(payload, dict) else []
@@ -111,13 +118,30 @@ def read_backtest_stats(path: Path) -> dict[str, Any]:
         "trade_data_available": isinstance(trades, list),
         "total_trades": len(trades) if isinstance(trades, list) else 0,
         "total_pnl": stats.get("total_pnl"),
-        "net_profit_pct": stats.get("net_profit_pct", stats.get("total_return")),
-        "sharpe": stats.get("sharpe", stats.get("sharpe_ratio")),
+        "total_return": stats.get("total_return"),
+        "net_profit_pct": _derive_net_profit_pct(stats.get("total_return")),
+        "sharpe_ratio": stats.get("sharpe_ratio"),
         "cagr": stats.get("cagr"),
         "max_drawdown_pct": stats.get("max_drawdown_pct"),
         "win_rate": stats.get("win_rate"),
         "daily_return_count": stats.get("daily_return_count", 0),
     }
+
+
+def _derive_net_profit_pct(total_return: Any) -> float | None:
+    """Derive net_profit_pct from the canonical total_return stat (F40).
+
+    ``net_profit_pct`` is not a ``BacktestStats`` field; it is always the
+    total-return value expressed as a percentage, or nothing when the run
+    never produced a total return.
+    """
+    if total_return is None:
+        return None
+    try:
+        derived = float(total_return) * 100.0
+    except (TypeError, ValueError):
+        return None
+    return derived
 
 
 def build_run_id(strategy: str, symbol: str, timeframe: str) -> str:
@@ -142,6 +166,7 @@ def build_cli_command(
     output_path: Path,
     data_dir: str,
     save_sqlite: bool = True,
+    keep_indicators: bool = False,
     result_id: str = "",
 ) -> list[str]:
     cmd = [
@@ -180,6 +205,8 @@ def build_cli_command(
         cmd.extend(["--data-dir", data_dir])
     if not save_sqlite:
         cmd.append("--skip-sqlite")
+    if keep_indicators:
+        cmd.append("--keep-indicators")
     if result_id:
         cmd.extend(["--result-id", result_id])
     return cmd
@@ -207,6 +234,13 @@ def get_engine(name: str):
 
 
 def _detect_date_range(symbol: str, timeframe: str, data_dir: str) -> tuple[str, str]:
+    """Detect one symbol's covered period, or raise instead of fabricating one.
+
+    Single-symbol facet of ``runner.cli._detect_date_range`` (which intersects
+    several symbols on top of the same parquet scan). Kept here so grid cells
+    resolve dates without importing runner.cli; both share the loud-failure
+    contract (F19): no fabricated range may ever flow into a backtest.
+    """
     root = Path(data_dir) / "ohlcv" if data_dir else DATA_DIR / "ohlcv"
     matches = list(root.rglob(f"**/{symbol}/{timeframe}.parquet"))
     if not matches:
@@ -244,13 +278,14 @@ def _resolve_dates_for_equity(
     return start_date, end_date
 
 
-def _init_cell_result(request: CellRequest) -> tuple[dict[str, Any], BacktestResult | None]:
+def _init_cell_result(request: CellRequest) -> dict[str, Any]:
     """Build the shared cell record and honor the skip-existing shortcut.
 
-    Returns ``(cell, skipped)``; ``skipped`` is a fully-processed
-    ``BacktestResult`` when the existing output was reused, else ``None``.
-    The resolved window is computed once here so the reported cell window,
-    the CLI command and ``attach_daily_equity`` all see the same dates.
+    Returns the cell record; its ``status`` is ``pending`` unless the existing
+    output was reused (``skipped_existing``) or turned out to be unreadable
+    (``failed``). The resolved window is computed once here so the reported
+    cell window, the CLI command and ``attach_daily_equity`` all see the same
+    dates — callers must not re-resolve.
     """
     run_id = build_run_id(request.strategy, request.symbol, request.timeframe)
     path = output_path_for(request.output_dir, run_id)
@@ -276,12 +311,12 @@ def _init_cell_result(request: CellRequest) -> tuple[dict[str, Any], BacktestRes
             backtest_result.save(path)
             result.update(read_backtest_stats(path))
             result.update({"status": "skipped_existing", "finished_at": datetime.now(timezone.utc).isoformat()})
-            return result, backtest_result
+            return result
         except (json.JSONDecodeError, ValidationError, OSError, ValueError) as exc:
             result.update({"status": "failed", "error": f"existing output is invalid: {exc}"})
-            return result, None
+            return result
 
-    return result, None
+    return result
 
 
 @dataclass(frozen=True)
@@ -384,9 +419,15 @@ def _run_backtest_in_process_body(request: CellRequest) -> dict[str, Any]:
     return {"auto_downloaded_data": downloaded} if downloaded else {}
 
 
-def run_one_backtest_in_process(request: CellRequest) -> dict[str, Any]:
-    """Run one grid cell in-process; ``request`` carries the whole cell."""
-    result, _skipped = _init_cell_result(request)
+def run_one_backtest_in_process(request: CellRequest, cell: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Run one grid cell in-process; ``request`` carries the whole cell.
+
+    ``cell`` may carry a record already built by :func:`_init_cell_result`
+    (skip-existing already honored); when omitted, the preamble runs here.
+    """
+    if cell is None:
+        cell = _init_cell_result(request)
+    result = cell
     if result["status"] != "pending":
         return result
 
@@ -447,7 +488,7 @@ def run_one_backtest(
         save_sqlite=save_sqlite,
         keep_indicators=keep_indicators,
     )
-    result, _skipped = _init_cell_result(request)
+    result = _init_cell_result(request)
     if result["status"] != "pending":
         return result
 
@@ -456,7 +497,9 @@ def run_one_backtest(
     resolved_start, resolved_end = result["start"], result["end"]
 
     if not use_subprocess:
-        return run_one_backtest_in_process(request)
+        # The preamble already ran above; pass it through so dates and the
+        # skip-existing decision are resolved exactly once per cell.
+        return run_one_backtest_in_process(request, cell=result)
 
     cmd = build_cli_command(
         strategy=strategy,
@@ -474,6 +517,7 @@ def run_one_backtest(
         output_path=path,
         data_dir=data_dir,
         save_sqlite=save_sqlite,
+        keep_indicators=keep_indicators,
         result_id=run_id,
     )
     result["cmd"] = " ".join(cmd)
@@ -525,8 +569,9 @@ def write_matrix_csv(output_dir: Path, rows: list[dict[str, Any]]) -> Path:
         "trade_data_available",
         "total_trades",
         "total_pnl",
+        "total_return",
         "net_profit_pct",
-        "sharpe",
+        "sharpe_ratio",
         "cagr",
         "max_drawdown_pct",
         "win_rate",

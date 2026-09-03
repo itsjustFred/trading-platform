@@ -183,7 +183,7 @@ def _run_portfolio_walkforward(
     )
     fold = {
         "fold": 1,
-        "is_sharpe": result.get("sharpe"),
+        "is_sharpe": _metric(result, "sharpe", "sharpe_ratio"),
         "oos_sharpe": result.get("oos_sharpe"),
         "oos_max_drawdown": result.get("oos_max_drawdown"),
     }

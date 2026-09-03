@@ -91,6 +91,10 @@ def _detect_date_range(symbols: list[str], timeframe: str, data_dir: str = "") -
     For multiple symbols, returns the intersection (common period).
     Raises ValueError when no data is found or the symbols' covered periods
     are disjoint — fabricated ranges must never flow into backtests.
+
+    Single-symbol callers with a plain ``data_dir`` may use the cheaper
+    per-symbol facet in ``runner.backtest_grid._detect_date_range``; both share
+    the same loud-failure contract (F19) over the same parquet layout.
     """
     ohlcv_root = Path(data_dir) / "ohlcv" if data_dir else DATA_DIR / "ohlcv"
     normalized_timeframe = normalize_timeframe(timeframe)
@@ -252,6 +256,10 @@ def cmd_run(args):
         output_path = str(BACKTESTS_DIR / f"{config.strategy_name}_{ts}.trades.json")
 
     result.save(output_path)
+    if not getattr(args, "keep_indicators", False):
+        # Default is indicator-stripped output (F3): the flag exists only on the
+        # grid/matrix commands, which opt in explicitly.
+        result.indicators = []
     if not getattr(args, "skip_sqlite", False):
         try:
             save_result_to_sqlite(result)
@@ -408,6 +416,11 @@ def main():
     run_p.add_argument("--skip-sqlite", action="store_true", help="Do not persist this run to SQLite")
     run_p.add_argument("--params", help="Parameters JSON, e.g. '{\"fast\": 10, \"slow\": 30}'")
     run_p.add_argument("--data-dir", help="Override data directory")
+    run_p.add_argument(
+        "--keep-indicators",
+        action="store_true",
+        help="Keep indicator arrays in the output JSON (grids pass this when --keep-indicators is set)",
+    )
     run_p.add_argument(
         "--progress-stdout",
         action="store_true",

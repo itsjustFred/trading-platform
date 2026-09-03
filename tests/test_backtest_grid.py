@@ -63,7 +63,7 @@ def test_run_backtest_grid_runs_all_cells_with_same_risk(monkeypatch, tmp_path):
             "total_trades": 1,
             "total_pnl": 123.45,
             "net_profit_pct": 1.23,
-            "sharpe": 0.5,
+            "sharpe_ratio": 0.5,
             "cagr": 0.1,
             "max_drawdown_pct": -2.0,
             "win_rate": 1.0,
@@ -259,6 +259,32 @@ def test_subprocess_command_does_not_pass_grid_only_flags(tmp_path):
     assert "--skip-sqlite" in cmd
 
 
+def test_subprocess_command_forwards_keep_indicators(tmp_path):
+    """F3 residue: with keep_indicators=True the subprocess cell must pass the
+    flag explicitly (runner.cli run accepts it) instead of silently dropping
+    the knob in subprocess mode."""
+    cmd = build_cli_command(
+        strategy=str(tmp_path / "trend_following.py"),
+        symbol="SP500",
+        timeframe="1h",
+        start="2025-01-01",
+        end="2025-12-31",
+        engine="vectorbt",
+        capital=10000.0,
+        risk_pct=0.01,
+        max_position_pct=None,
+        max_leverage=None,
+        intrabar_resolution="open_close",
+        params=None,
+        output_path=tmp_path / "out.trades.json",
+        data_dir="/tmp/data",
+        save_sqlite=False,
+        keep_indicators=True,
+    )
+
+    assert "--keep-indicators" in cmd
+
+
 def test_no_date_range_is_fabricated_when_data_missing(tmp_path):
     """Regression (F19): missing data must fail loudly, not invent 2023..2025."""
     with pytest.raises(ValueError, match="No OHLCV data"):
@@ -266,7 +292,8 @@ def test_no_date_range_is_fabricated_when_data_missing(tmp_path):
 
 
 def test_read_backtest_stats_exposes_canonical_keys(tmp_path):
-    """Regression (F40): total_return is surfaced under its canonical key."""
+    """Regression (F40): canonical keys only; net_profit_pct is derived from
+    total_return (never read from the stats dict) and the sharpe alias is gone."""
     path = tmp_path / "run.trades.json"
     path.write_text(
         json.dumps(
@@ -279,5 +306,22 @@ def test_read_backtest_stats_exposes_canonical_keys(tmp_path):
         encoding="utf-8",
     )
     stats = bg.read_backtest_stats(path)
-    assert stats["net_profit_pct"] == 0.05
-    assert stats["sharpe"] == 1.5
+    assert stats["total_return"] == 0.05
+    assert stats["net_profit_pct"] == pytest.approx(5.0)
+    assert stats["sharpe_ratio"] == 1.5
+    # The non-canonical alias must not reappear in grid rows.
+    assert "sharpe" not in stats
+    # A stale/foreign net_profit_pct in the stats dict cannot leak through.
+    poisoned = tmp_path / "poisoned.trades.json"
+    poisoned.write_text(
+        json.dumps(
+            {
+                "meta": {"id": "run-2"},
+                "trades": [{}],
+                "stats": {"net_profit_pct": 999.0},
+            }
+        ),
+        encoding="utf-8",
+    )
+    poisoned_stats = bg.read_backtest_stats(poisoned)
+    assert poisoned_stats["net_profit_pct"] is None

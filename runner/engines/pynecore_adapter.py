@@ -57,12 +57,13 @@ class PyneCoreAdapter(EngineAdapter):
     ) -> BacktestResult:
         data_root = Path(config.data_dir) if config.data_dir else DATA_DIR
         resolved_parameters = resolve_strategy_parameters(strategy_path, config.parameters)
+        # Fail before any per-symbol work when the CLI is absent.
+        _resolve_pyne_bin()
         all_trades: list[Trade] = []
         all_stats: dict[str, Any] = {}
         all_drawings: list[dict[str, Any]] = []
         trade_counter = 0
         total_bars = 0
-        symbols_with_data: list[str] = []
         strategy_name, context_builder, drawings_builder = _load_strategy_artifacts(
             strategy_path, config.strategy_name
         )
@@ -72,9 +73,13 @@ class PyneCoreAdapter(EngineAdapter):
                 data_root, symbol, config.timeframe, config.start_date, config.end_date
             )
             if df is None or df.empty:
-                logger.warning("No data for %s/%s, skipping", symbol, config.timeframe)
-                continue
-            symbols_with_data.append(symbol)
+                # Same rule as the native/vectorbt adapters (F24): a symbol with
+                # no data is a failed run, not a silently skipped one.
+                raise RuntimeError(
+                    f"No OHLCV data for {symbol}/{config.timeframe} in "
+                    f"{config.start_date}..{config.end_date} under {data_root}; "
+                    "refusing to run a silent empty PyneCore backtest"
+                )
 
             total_bars += len(df)
             trades, symbol_stats = self._run_pyne_for_symbol(
@@ -94,16 +99,6 @@ class PyneCoreAdapter(EngineAdapter):
                     trades,
                     symbol,
                 )
-            )
-
-        if not symbols_with_data:
-            # Every symbol was skipped for missing data: an empty BacktestResult
-            # must not look like a successful run (same rule as the native and
-            # vectorbt adapters).
-            raise RuntimeError(
-                f"No OHLCV data for any of {config.symbols} at "
-                f"{config.timeframe} under {data_root}; refusing to run a "
-                "silent empty PyneCore backtest"
             )
 
         return BacktestResult(
@@ -178,19 +173,9 @@ class PyneCoreAdapter(EngineAdapter):
         tmpdir_path: Path,
         bar_count: int,
     ) -> None:
-        """Invoke the pyne CLI once; a missing binary, non-zero exit or timeout
-        raises instead of degrading into an empty success."""
-        pyne_bin = shutil.which("pyne")
-        if not pyne_bin:
-            venv_bin = Path(sys.executable).parent / "pyne"
-            if venv_bin.exists():
-                pyne_bin = str(venv_bin)
-            else:
-                raise RuntimeError(
-                    "PyneCore CLI ('pyne') not found on PATH. "
-                    "Install with: pip install pynesys-pynecore"
-                )
-
+        """Invoke the pyne CLI once; a non-zero exit or timeout raises instead
+        of degrading into an empty success."""
+        pyne_bin = _resolve_pyne_bin()
         cmd = [
             pyne_bin,
             "--workdir",
@@ -220,11 +205,20 @@ class PyneCoreAdapter(EngineAdapter):
                 timeout=300,
             )
         except subprocess.TimeoutExpired as exc:
+            logger.error(
+                "PyneCore run for %s timed out after %s seconds", symbol, exc.timeout
+            )
             raise RuntimeError(
                 f"PyneCore run for {symbol} timed out after {exc.timeout} seconds"
             ) from exc
 
         if result.returncode != 0:
+            logger.error(
+                "PyneCore failed for %s (exit code %d): %s",
+                symbol,
+                result.returncode,
+                (result.stderr or result.stdout or "")[-500:],
+            )
             raise RuntimeError(
                 f"PyneCore run failed for {config.strategy_name}/{symbol} "
                 f"(exit code {result.returncode}): "
@@ -240,6 +234,24 @@ class PyneCoreAdapter(EngineAdapter):
                 "PyneCore not installed. Run: pip install pynesys-pynecore"
             )
         return errors
+
+
+def _resolve_pyne_bin() -> str:
+    """Locate the pyne CLI; a missing binary is a loud failure, never a skip.
+
+    Module-level so a run fails before any temp dir is built for its first
+    symbol (the pre-F11 behaviour ran the whole grid, then skipped every cell).
+    """
+    pyne_bin = shutil.which("pyne")
+    if not pyne_bin:
+        venv_bin = Path(sys.executable).parent / "pyne"
+        if venv_bin.exists():
+            return str(venv_bin)
+        raise RuntimeError(
+            "PyneCore CLI ('pyne') not found on PATH. "
+            "Install with: pip install pynesys-pynecore"
+        )
+    return pyne_bin
 
 
 def _equity_curve_from_trades(config: BacktestConfig, all_trades: list[Trade]) -> list[EquityPoint]:

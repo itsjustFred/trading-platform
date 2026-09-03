@@ -38,7 +38,7 @@ def test_run_backtest_matrix_runs_selected_strategies_and_writes_outputs(monkeyp
                     "total_trades": 1,
                     "total_pnl": 12.5,
                     "net_profit_pct": 1.25,
-                    "sharpe": 0.5,
+                    "sharpe_ratio": 0.5,
                     "cagr": 0.1,
                     "max_drawdown_pct": -2.0,
                     "win_rate": 1.0,

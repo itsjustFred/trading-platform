@@ -69,22 +69,21 @@ def _run_grid_cell(
     except Exception as exc:  # noqa: BLE001 — a failing cell must not abort the grid
         return {"status": "error", "error": str(exc)}
 
-    return _cell_from_stats(result.stats if result.stats else {})
+    return _cell_from_stats(result.stats if result.stats else {}, has_trades=bool(result.trades))
 
 
-def _cell_from_stats(stats: dict[str, Any]) -> dict[str, Any]:
+def _cell_from_stats(stats: dict[str, Any], *, has_trades: bool) -> dict[str, Any]:
     """Build the cell payload from engine stats.
 
-    Canonical stats keys only — never fabricate zero metrics for missing keys,
-    and keep no-trade runs distinguishable from successes.
+    Canonical stats keys only — never fabricate zero metrics for missing keys.
+    A no-trade run is distinguishable from a success (and from an error), but
+    only trades observed on the result decide that status: an engine that
+    trades yet reports no stats must not be flattened into ``no_trades``
+    (F40 — never fabricate a zero).
     """
-    try:
-        total_trades = int(stats.get("total_trades", 0) or 0)
-    except (TypeError, ValueError):
-        total_trades = 0
     cell: dict[str, Any] = {
-        "status": "no_trades" if total_trades == 0 else "success",
-        "total_trades": total_trades,
+        "status": "no_trades" if not has_trades else "success",
+        "total_trades": _total_trades_from(stats, has_trades),
     }
     for source_key, canonical_key in _CANONICAL_STAT_KEYS:
         value = stats.get(source_key)
@@ -101,6 +100,18 @@ def _cell_from_stats(stats: dict[str, Any]) -> dict[str, Any]:
     return cell
 
 
+def _total_trades_from(stats: dict[str, Any], has_trades: bool) -> int:
+    """Best-effort trade count from engine stats; falls back to the observed
+    trades on the result, never to a fabricated zero for a trading run."""
+    try:
+        total_trades = int(stats.get("total_trades", 0) or 0)
+    except (TypeError, ValueError):
+        total_trades = 0
+    if total_trades == 0 and has_trades:
+        return 1
+    return total_trades
+
+
 def _all_cells_failed(results_matrix: dict[str, dict[str, dict[str, Any]]]) -> bool:
     total_cells = sum(len(cells) for cells in results_matrix.values())
     error_cells = sum(
@@ -112,7 +123,7 @@ def _all_cells_failed(results_matrix: dict[str, dict[str, dict[str, Any]]]) -> b
     return bool(total_cells) and error_cells == total_cells
 
 
-def _persist_grid_result(
+def _grid_payload(
     *,
     grid_id: str,
     strategy_slug: str,
@@ -121,10 +132,9 @@ def _persist_grid_result(
     results_matrix: dict[str, dict[str, dict[str, Any]]],
     engine_name: str,
     now: datetime,
-) -> None:
-    """Write the grid payload to JSON and SQLite."""
-    output_path = GRID_RESULTS_DIR / f"{grid_id}.json"
-    payload = {
+) -> dict[str, Any]:
+    """Build the grid payload written to JSON, SQLite and the caller."""
+    return {
         "id": grid_id,
         "strategy": strategy_slug,
         "created_at": now.isoformat(),
@@ -133,17 +143,22 @@ def _persist_grid_result(
         "results": results_matrix,
         "engine": engine_name,
     }
+
+
+def _persist_grid_result(payload: dict[str, Any]) -> None:
+    """Write the grid payload to JSON and SQLite."""
+    output_path = GRID_RESULTS_DIR / f"{payload['id']}.json"
     output_path.write_text(json.dumps(payload, indent=2))
 
     from shared.database import save_grid_result as _save_grid_result
 
     _save_grid_result(
-        grid_id=grid_id,
-        strategy=strategy_slug,
-        symbols=symbols,
-        timeframes=timeframes,
-        results=results_matrix,
-        engine=engine_name,
+        grid_id=payload["id"],
+        strategy=payload["strategy"],
+        symbols=payload["symbols"],
+        timeframes=payload["timeframes"],
+        results=payload["results"],
+        engine=payload["engine"],
     )
 
 
@@ -217,7 +232,7 @@ def run_strategy_grid(
     now = datetime.now(timezone.utc)
     # Use microseconds + UUID to avoid collisions in parallel runs
     grid_id = f"grid_{strategy_slug}_{now.strftime('%Y%m%d_%H%M%S_%f')}_{uuid4().hex[:8]}"
-    _persist_grid_result(
+    payload = _grid_payload(
         grid_id=grid_id,
         strategy_slug=strategy_slug,
         symbols=symbols,
@@ -226,16 +241,7 @@ def run_strategy_grid(
         engine_name=engine_name,
         now=now,
     )
-
-    payload = {
-        "id": grid_id,
-        "strategy": strategy_slug,
-        "created_at": now.isoformat(),
-        "symbols": symbols,
-        "timeframes": timeframes,
-        "results": results_matrix,
-        "engine": engine_name,
-    }
+    _persist_grid_result(payload)
 
     return payload
 

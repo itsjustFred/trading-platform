@@ -849,11 +849,19 @@ def _run_backtest(cmd: list[str], *, log: TaskLogger | None) -> tuple[int, str]:
         except subprocess.TimeoutExpired:
             _timeout(proc, cmd)
     finally:
-        if proc.poll() is None:
-            proc.kill()
-            proc.wait(timeout=30)
+        # Belt-and-braces cleanup: every normal exit path leaves the child
+        # reaped, so this only fires if an exception interrupted the loop.
+        _kill(proc)
 
     return returncode, "".join(output_lines)
+
+
+def _kill(proc: subprocess.Popen) -> None:
+    """Kill and reap a child process; safe to call on an exited child."""
+    if proc.poll() is not None:
+        return
+    proc.kill()
+    proc.wait(timeout=30)
 
 
 def _timeout(proc: subprocess.Popen, cmd: list[str]) -> None:

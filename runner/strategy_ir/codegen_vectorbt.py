@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from pprint import pformat
-from typing import Any
+from typing import Any, NoReturn
 
 from runner.strategy_ir.models import Condition, ExitSignal, IndicatorRef, StrategyIR
 
@@ -71,6 +71,15 @@ def _indicator_defaults(indicator: IndicatorRef) -> tuple[str, int]:
     return "window", 14
 
 
+def _untranslatable(text: str, *, source: str) -> NoReturn:
+    """F4: unmatched condition text must fail loudly, never fabricate rules."""
+    raise ValueError(
+        "Cannot deterministically translate condition text into vectorbt logic: "
+        f"{source}. Extend the StrategyIR with an explicit expression instead of "
+        "relying on keyword guessing."
+    )
+
+
 def _rule_from_text(
     text: str,
     *,
@@ -82,12 +91,7 @@ def _rule_from_text(
     # An empty condition is just as untranslatable as prose: falling back to a
     # directional rule here would fabricate trading logic (same rule as F4).
     if not normalized:
-        origin = source or repr(text)
-        raise ValueError(
-            "Cannot deterministically translate condition text into vectorbt logic: "
-            f"{origin}. Extend the StrategyIR with an explicit expression instead of "
-            "relying on keyword guessing."
-        )
+        _untranslatable(text, source=source or repr(text))
 
     if "crossunder" in normalized:
         return f"_cross_under({primary_signal}, {secondary_signal})"
@@ -104,12 +108,7 @@ def _rule_from_text(
     if any(token in normalized for token in ("<", "below", "under", "less", "lower")):
         return f"({primary_signal} < {secondary_signal})"
 
-    origin = source or text
-    raise ValueError(
-        "Cannot deterministically translate condition text into vectorbt logic: "
-        f"{origin!r}. Extend the StrategyIR with an explicit expression instead of "
-        "relying on keyword guessing."
-    )
+    _untranslatable(text, source=source or text)
 
 
 def _entry_rule_expressions(
