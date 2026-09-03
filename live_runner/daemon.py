@@ -696,9 +696,23 @@ async def submit_order_with_risk(
         )
     metadata["stop_loss"] = float(stop_loss)
     metadata["take_profit"] = float(take_profit)
-    # Merge onto the SIZED metadata (qty/explicit_qty/risk_*) — not the original —
-    # so the risk sizing result survives into the broker submission.
-    final_metadata = {**sized_metadata, **metadata}
+    # Overlay the resolved SL/TP onto the SIZED metadata. The sized values for
+    # qty/explicit_qty/risk_* must win: letting incoming metadata re-override
+    # them would let a signal's self-declared qty bypass the risk sizing
+    # entirely. All other (non-sizing) incoming keys are preserved.
+    sizing_keys = frozenset({
+        "qty",
+        "explicit_qty",
+        "risk_amount",
+        "risk_percent",
+        "risk_reward_ratio",
+        "risk_timeframe",
+        "current_positions",
+    })
+    preserved_metadata = {
+        key: value for key, value in metadata.items() if key not in sizing_keys
+    }
+    final_metadata = {**sized_metadata, **preserved_metadata}
     sized_signal = sized_signal.model_copy(update={"metadata": final_metadata})
     return await adapter.submit_order(sized_signal)
 

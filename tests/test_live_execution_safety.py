@@ -268,6 +268,40 @@ def test_submit_order_with_risk_fails_closed_without_resolved_stop(monkeypatch):
     assert adapter.submitted_signal is None
 
 
+def test_submit_order_with_risk_does_not_let_incoming_qty_override_sizing():
+    """A self-declared qty in the signal metadata must not bypass the risk
+    sizing: the sized qty/explicit_qty win, unrelated keys are preserved."""
+    from live_runner.daemon import submit_order_with_risk
+
+    deployment = _deployment()
+    adapter = _PositionsAdapter(positions=[])
+
+    asyncio.run(
+        submit_order_with_risk(
+            adapter,
+            deployment,
+            _live_signal(deployment).model_copy(
+                update={
+                    "metadata": {
+                        "qty": 999_999.0,
+                        "note": "hello",
+                        "stop_loss": 95.0,
+                        "take_profit": 110.0,
+                    }
+                }
+            ),
+        )
+    )
+
+    submitted = adapter.submitted_signal
+    assert submitted is not None
+    assert submitted.metadata["qty"] == pytest.approx(200.0)
+    assert submitted.metadata["explicit_qty"] == pytest.approx(200.0)
+    assert submitted.metadata["note"] == "hello"
+    assert submitted.metadata["stop_loss"] == pytest.approx(95.0)
+    assert submitted.metadata["take_profit"] == pytest.approx(110.0)
+
+
 def test_submit_order_with_risk_resolves_stop_for_stopless_signals():
     """A stopless signal is sized on the engine's fallback stop and the broker
     order carries that resolved stop plus a 1:1 take profit."""
