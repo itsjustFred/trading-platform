@@ -484,7 +484,7 @@ def _load_ohlcv_df(symbol: str, timeframe: str) -> pd.DataFrame | None:
             except (ValueError, KeyError):
                 df = pd.read_parquet(path)
         except (ValueError, KeyError, OSError) as exc:
-            logger.warning("Could not load OHLCV segment for %s/%s from %s: %s", _log_safe(symbol), _log_safe(timeframe), _log_safe(path), exc)
+            logger.warning("Could not load OHLCV segment from %s: %s", _log_safe(path), exc)
             continue
         df.columns = [str(column).lower() for column in df.columns]
         if "timestamp" in df.columns:

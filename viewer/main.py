@@ -4314,7 +4314,7 @@ def _benchmark_daily_returns(symbol: str, *, start: str = "", end: str = "") -> 
             intraday_close = _close_series_from_df(fallback_df, symbol=symbol)
             series = intraday_close.resample("1D").last().dropna()
             if not series.empty:
-                logger.info("CAPM benchmark %s: using %s resampled to 1d", _log_safe(symbol), _log_safe(fallback_timeframe))
+                logger.info("CAPM benchmark: using %s resampled to 1d", _log_safe(fallback_timeframe))
                 break
 
     if series.empty:
