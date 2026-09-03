@@ -2061,7 +2061,7 @@ def _normalized_task_id(task_id: str) -> str:
     empty string, which cannot match a task.
     """
     return task_id[:64] if task_id and not any(
-        not ch.isprintable() or ch in "\/" for ch in task_id
+        not ch.isprintable() or ch in {"/", chr(92)} for ch in task_id
     ) else ""
 
 
