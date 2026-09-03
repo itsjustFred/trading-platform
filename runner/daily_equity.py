@@ -93,6 +93,36 @@ def _scoped_view(
     )
 
 
+def _windowed_curve(
+    result: BacktestResult, start_bound: datetime | None, end_bound: datetime | None
+) -> list[EquityPoint] | None:
+    """The engine-provided curve scoped to the same window as the aggregation.
+
+    Without a window this is the untouched engine curve; with one it is the
+    windowed view computed by ``_scoped_view`` (pre-mortem 16-B #7).
+    """
+    if not start_bound and not end_bound:
+        return result.equity_curve
+    return _scoped_view(result, start_bound, end_bound).equity_curve
+
+
+def _preserves_engine_curve(
+    preserved_curve: list[EquityPoint] | None, daily_points: list[EquityPoint]
+) -> bool:
+    """Keep the engine curve only when it has more points than the daily build."""
+    return bool(preserved_curve) and len(preserved_curve) > len(daily_points)
+
+
+def _attach_daily_stats(result: BacktestResult, daily_returns: list[dict[str, Any]]) -> None:
+    """Record the daily aggregation on stats and meta."""
+    result.stats = result.stats or {}
+    result.stats["daily_return_count"] = len(daily_returns)
+    result.stats["daily_returns"] = daily_returns
+    result.meta.data = result.meta.data or {}
+    result.meta.data["equity_frequency"] = "daily"
+    result.meta.data["daily_return_count"] = len(daily_returns)
+
+
 def build_daily_equity_curve(result: BacktestResult) -> tuple[list[EquityPoint], list[dict[str, Any]]]:
     """
     Build a daily equity curve from trade PnL.
@@ -194,24 +224,17 @@ def attach_daily_equity(
     # curve next to window-scoped daily_returns would make the curve and the
     # reported daily returns describe different periods (pre-mortem 16-B #7).
     # _scoped_view computes exactly this view; reuse it instead of re-filtering.
-    preserved_curve = (
-        _scoped_view(result, start_bound, end_bound).equity_curve
-        if (start_bound or end_bound)
-        else result.equity_curve
-    )
-
-    # Preserve existing equity_curve if it has more points than what we built
-    # (e.g., the engine already provided a full equity curve with multiple points)
-    if preserved_curve and len(preserved_curve) > len(daily_points):
-        # Keep the (window-scoped) original curve, but update metadata
+    preserved_curve = _windowed_curve(result, start_bound, end_bound)
+    if _preserves_engine_curve(preserved_curve, daily_points):
+        _attach_daily_stats(result, daily_returns)
         result.equity_curve = preserved_curve
-        result.stats = result.stats or {}
-        result.stats["daily_return_count"] = len(daily_returns)
-        result.stats["daily_returns"] = daily_returns
-        result.meta.data = result.meta.data or {}
-        result.meta.data["equity_frequency"] = "daily"
-        result.meta.data["daily_return_count"] = len(daily_returns)
         return result
+
+    # Attach the daily equity curve
+    result.equity_curve = daily_points
+    _attach_daily_stats(result, daily_returns)
+
+    return result
 
     # Attach the daily equity curve
     result.equity_curve = daily_points
