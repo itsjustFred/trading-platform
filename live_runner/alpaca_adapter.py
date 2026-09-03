@@ -111,10 +111,14 @@ def _alpaca_credential_blocks(
             continue
 
         endpoint = str(values.get(f"ALPACA_ENDPOINT_ACC{idx}", "")).strip().lower()
-        paper = "paper" in endpoint if endpoint else _parse_bool_env(
-            str(values.get(f"ALPACA_PAPER_ACC{idx}", "")).strip(),
-            default=True,
-        )
+        if endpoint:
+            paper = "paper" in endpoint
+        else:
+            raw_paper = values.get(f"ALPACA_PAPER_ACC{idx}")
+            paper = _parse_bool_env(
+                str(raw_paper).strip() if raw_paper is not None else None,
+                default=True,
+            )
         blocks.append(
             {
                 "api_key": api_key,
@@ -194,8 +198,25 @@ def resolve_alpaca_credentials(
             )
             return None
 
-    # Default pair applies only when no hints were given (or no ACC{N} blocks
-    # exist), otherwise every account would silently resolve to it.
+    # Default pair applies only when the mapping is still unique: the legacy
+    # single-account setup (no ACC{N} blocks, or exactly one block that the
+    # account did not identify itself against). With two or more credential
+    # blocks there is no unique mapping, so an unmatched account must never
+    # silently route through another account's keys.
+    if len(blocks) > 1:
+        logger.warning(
+            "No unique Alpaca credential block mapping; refusing ambiguous fallback",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "broker_login": broker_login,
+                    "candidate_blocks": len(blocks),
+                    "hints_present": _alpaca_blocks_have_hints(blocks),
+                }
+            },
+        )
+        return None
+
     default_credentials = _default_alpaca_credentials(values)
     if default_credentials is not None:
         return default_credentials
