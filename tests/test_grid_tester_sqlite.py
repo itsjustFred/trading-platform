@@ -298,6 +298,63 @@ def test_run_strategy_grid_passes_strategy_path_and_reports_errors(monkeypatch, 
     assert "net_profit_pct" not in cells["1h"]
 
 
+def test_trading_run_without_trade_count_reports_presence_not_zero(monkeypatch, tmp_path) -> None:
+    """Pre-mortem 16-B #11: total_trades precedence — an explicit stats count
+    wins, the observed-trades fallback reports presence (1), never a fabricated
+    zero or minimum."""
+    import runner.grid_tester as grid_tester_module
+
+    class TradingEngineNoCount:
+        name = "fake"
+
+        def run(self, config, strategy_path, progress_callback=None):
+            return BacktestResult(
+                meta=BacktestMeta(
+                    id="x",
+                    created_at="2026-06-17T12:00:00+00:00",
+                    engine="fake",
+                    strategies=["example_sma"],
+                    backtest_start=config.start_date,
+                    backtest_end=config.end_date,
+                    initial_capital=config.initial_capital,
+                    data={"symbols": config.symbols, "timeframes": [config.timeframe]},
+                    parameters={},
+                ),
+                trades=[object(), object(), object()],
+                equity_curve=[],
+                # Stats present but without a total_trades key.
+                stats={"sharpe": 1.1},
+            )
+
+    strategy_file = tmp_path / "strategies" / "example_sma.py"
+    strategy_file.parent.mkdir(parents=True, exist_ok=True)
+    strategy_file.write_text("STRATEGY_META = {'name': 'example_sma'}\n", encoding="utf-8")
+
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        grid_tester_module,
+        "find_strategy_entry",
+        lambda slug: SimpleNamespace(slug=slug, file_path=strategy_file),
+    )
+    monkeypatch.setattr(grid_tester_module, "get_engine", lambda engine_name: TradingEngineNoCount())
+    monkeypatch.setattr(grid_tester_module, "GRID_RESULTS_DIR", tmp_path / "grid_results")
+
+    result = grid_tester_module.run_strategy_grid(
+        strategy_slug="example_sma",
+        symbols=["AAPL"],
+        timeframes=["1h"],
+        start="2024-01-01",
+        end="2024-01-31",
+        engine_name="fake_engine",
+    )
+
+    cell = result["results"]["AAPL"]["1h"]
+    assert cell["status"] == "success"
+    assert cell["total_trades"] == 1
+    assert cell["sharpe_ratio"] == 1.1
+
+
 def test_all_error_grid_is_not_persisted(monkeypatch, tmp_path) -> None:
     """AC: never persist successful-looking artifacts for failed runs."""
     import runner.grid_tester as grid_tester_module
