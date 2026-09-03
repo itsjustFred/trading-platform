@@ -269,6 +269,37 @@ def test_allow_short_recognized_tokens() -> None:
     assert daemon._deployment_allows_short(disabled) is False
 
 
+def test_ensure_adapter_skips_account_with_invalid_bool_config(monkeypatch) -> None:
+    """A typo'd ALPACA_PAPER_ACC{N} raises ValueError inside adapter creation.
+    The account must be skipped with an error log — not propagated, which would
+    abort the whole deployment sync iteration every cycle."""
+    daemon._CTRADER_AUTH_BLOCKED_ACCOUNTS.clear()
+
+    account = LiveAccountConfig(
+        id="acc-typo",
+        broker="alpaca",
+        name="Typo",
+    )
+
+    def _raise_typo(_account, **_kwargs):
+        raise ValueError("Invalid boolean value for ALPACA_PAPER_ACC1: 'ture'.")
+
+    monkeypatch.setattr(daemon, "_create_adapter_for_account", _raise_typo)
+    active_adapters: dict[str, object] = {}
+
+    # Must not raise.
+    asyncio.run(
+        daemon._ensure_adapter_for_active_account(
+            "acc-typo",
+            {"acc-typo": account},
+            active_adapters,
+            accounts_env_values={},
+        )
+    )
+
+    assert "acc-typo" not in active_adapters
+
+
 def _signal_with_metadata(metadata: dict[str, object] | None = None):
     from risk import TradeSignal
 

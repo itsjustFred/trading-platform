@@ -2008,11 +2008,21 @@ async def _ensure_adapter_for_active_account(
                 extra={"data": {"account_id": account_id}},
             )
             return
-        adapter = _create_adapter_for_account(
-            account,
-            accounts_env_values=accounts_env_values,
-            accounts_env_path=accounts_env_path,
-        )
+        try:
+            adapter = _create_adapter_for_account(
+                account,
+                accounts_env_values=accounts_env_values,
+                accounts_env_path=accounts_env_path,
+            )
+        except ValueError as exc:
+            # Strict-boolean config errors (e.g. a typo'd ALPACA_PAPER_ACC{N})
+            # must skip this account, not propagate through asyncio.gather and
+            # abort the whole deployment sync iteration every cycle.
+            logger.error(
+                "Invalid credential config; skipping account",
+                extra={"data": {"account_id": account_id, "error": str(exc)}},
+            )
+            return
         if adapter is None:
             return
         active_adapters[account_id] = adapter
