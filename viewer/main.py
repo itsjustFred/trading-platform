@@ -6909,7 +6909,7 @@ def _ensure_backtest_data_availability(
 
     _download_and_verify_missing_data(
         missing_items,
-        timeframe=normalized_timeframe,
+        normalized_timeframe=normalized_timeframe,
         start=start,
         end=end,
         progress_callback=progress_callback,
