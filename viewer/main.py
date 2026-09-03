@@ -8530,6 +8530,111 @@ def _backtest_compare_payload(backtest_id: str) -> dict[str, Any]:
     }
 
 
+def _run_backtest_process(
+    *,
+    task_id: str,
+    handle: Any,
+    cmd: list[str],
+    env: dict[str, str],
+    output_path: str,
+    backtest_id: str,
+    report_stage: Callable[..., None],
+) -> tuple[Any, str, str, str]:
+    """Launch the runner process and drain its stdout.
+
+    Returns ``(proc, latest_message, output_path, backtest_id)``.
+    """
+    command_display = " ".join(str(part) for part in cmd)
+    _write_task_log_line(
+        handle,
+        task_id,
+        f"[{_task_timestamp()}] Starting command: {command_display}",
+        stream="task",
+        source="backtest",
+        ingest_task_progress=False,
+    )
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        cwd=str(PROJECT_ROOT),
+        env=env,
+        text=True,
+        bufsize=1,
+    )
+    _update_task_fields(task_id, pid=proc.pid, process=proc)
+
+    latest_message = ""
+    if proc.stdout is not None:
+        for raw_line in proc.stdout:
+            line = raw_line.rstrip("\n")
+            if line:
+                _write_task_log_line(
+                    handle,
+                    task_id,
+                    line,
+                    stream="stdout",
+                    source="backtest",
+                    ingest_task_progress=False,
+                )
+            outcome = _consume_backtest_line(
+                line,
+                output_path=output_path,
+                backtest_id=backtest_id,
+            )
+            if outcome is None:
+                continue
+            parsed_message, stage, output_path, backtest_id = outcome
+            latest_message = parsed_message
+            if stage is not None:
+                percent, message = stage
+                report_stage(handle, percent=percent, message=message)
+            if output_path or backtest_id:
+                _update_task_fields(
+                    task_id,
+                    output_path=output_path or None,
+                    backtest_id=backtest_id or None,
+                )
+    return proc, latest_message, output_path, backtest_id
+
+
+def _prepare_backtest_runner_data(
+    *,
+    task_id: str,
+    handle: Any,
+    symbols: list[str],
+    timeframe: str,
+    start: str,
+    end: str,
+    report_stage: Callable[..., None],
+    report_download_phase: Callable[[float, str], None],
+) -> None:
+    """Ensure OHLCV availability, then report the running-backtest stage."""
+    _set_task_status(task_id, "running")
+    _running_jobs[task_id]["status"] = "running"
+    report_stage(handle, percent=10.0, message="Loading market data...")
+
+    missing_downloads = _ensure_backtest_data_availability(
+        symbols=symbols,
+        timeframe=timeframe,
+        start=start,
+        end=end,
+        progress_callback=report_download_phase,
+        log_callback=lambda message: _write_task_log_line(
+            handle,
+            task_id,
+            f"[{_task_timestamp()}] {message}",
+            stream="task",
+            source="backtest",
+            ingest_task_progress=False,
+        ),
+    )
+    if missing_downloads:
+        report_stage(handle, percent=45.0, message="Downloading data... 45%")
+    report_stage(handle, percent=45.0, message="Running backtest... 45%")
+
+
 def _finalize_backtest_run(
     *,
     task_id: str,
@@ -8834,35 +8939,14 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
                     timeframe=timeframe,
                     start=start,
                     end=end,
-                    progress_callback=report_download_phase,
-                    log_callback=lambda message: _write_task_log_line(
-                        handle,
-                        task_id,
-                        f"[{_task_timestamp()}] {message}",
-                        stream="task",
-                        source="backtest",
-                        ingest_task_progress=False,
-                    ),
-                )
-                if missing_downloads:
-                    report_stage(handle, percent=45.0, message="Downloading data... 45%")
-                report_stage(handle, percent=45.0, message="Running backtest... 45%")
-
-                command_display = " ".join(str(part) for part in cmd)
-                _write_task_log_line(
-                    handle,
-                    task_id,
-                    f"[{_task_timestamp()}] Starting command: {command_display}",
-                    stream="task",
-                    source="backtest",
-                    ingest_task_progress=False,
+                    report_stage=report_stage,
+                    report_download_phase=report_download_phase,
                 )
 
-                proc = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    cwd=str(PROJECT_ROOT),
+                proc, latest_message, output_path, backtest_id = _run_backtest_process(
+                    task_id=task_id,
+                    handle=handle,
+                    cmd=cmd,
                     env=env,
                     text=True,
                     bufsize=1,
