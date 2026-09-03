@@ -746,3 +746,33 @@ def test_deployment_with_unknown_status_is_not_traded(monkeypatch) -> None:
     )
 
     assert adapter.submitted == []
+
+
+def test_deployment_paused_during_candle_close_wait_is_not_traded(monkeypatch) -> None:
+    """The pre-wait recheck passes, the deployment is paused during the
+    candle-close wait, and the post-wait recheck must refuse to trade."""
+    adapter = _SignalSubmittingAdapter()
+    deployment = _discord_deployment("ACTIVE")
+    statuses = iter(["ACTIVE", "PAUSED"])
+
+    def _status_after_each_recheck(_deployment_id):
+        return _discord_deployment(next(statuses))
+
+    monkeypatch.setattr(daemon, "get_live_deployment", _status_after_each_recheck)
+
+    async def _no_wait(_signal, _timeframe):
+        return None
+
+    monkeypatch.setattr(daemon, "wait_for_candle_close", _no_wait)
+
+    asyncio.run(
+        daemon._dispatch_discord_trade_signal(
+            "acc-1",
+            adapter,
+            [deployment],
+            _trade_signal(),
+            accounts_env_values={},
+        )
+    )
+
+    assert adapter.submitted == []
