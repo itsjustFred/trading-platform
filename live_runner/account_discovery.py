@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import math
-import os
 import re
 import socket
 import ssl
@@ -29,9 +28,9 @@ from ctrader_open_api.messages.OpenApiMessages_pb2 import (
     ProtoOATraderReq,
     ProtoOATraderRes,
 )
-from dotenv import load_dotenv
 from google.protobuf.json_format import MessageToDict
 
+from live_runner.credential_env import load_accounts_env_values
 from shared.logging import get_logger
 from shared.models import LiveAccount
 
@@ -763,8 +762,9 @@ async def discover_ctrader_accounts(
 async def discover_configured_accounts(
     accounts_env: Path = DEFAULT_ACCOUNTS_ENV,
 ) -> list[LiveAccount]:
-    load_dotenv(accounts_env)
-    env = dict(os.environ)
+    # File-first precedence: .accounts.env wins over the process environment.
+    # Discovery also must not mutate os.environ (no load_dotenv side effects).
+    env = load_accounts_env_values(accounts_env)
 
     discovered_accounts: dict[tuple[str, str], LiveAccount] = {}
 

@@ -12,7 +12,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
-from dotenv import dotenv_values
 
 from live_runner.account_routing import (
     ctrader_account_identifier,
@@ -20,6 +19,7 @@ from live_runner.account_routing import (
 )
 from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credentials
 from live_runner.base_adapter import BaseLiveAdapter
+from live_runner.credential_env import accounts_env_mtime, load_accounts_env_values
 from live_runner.ctrader_adapter import CTraderAuthTerminalError, CTraderLiveAdapter
 from live_runner.service_discovery import discover_discord_bots_from_env
 from live_runner.signal_sources import DiscordSignalSource, wait_for_candle_close
@@ -172,19 +172,11 @@ def _raw_bool_text(value: object) -> str | None:
 
 
 def _load_accounts_env_values(accounts_env: Path) -> dict[str, str]:
-    loaded = dotenv_values(accounts_env)
-    result: dict[str, str] = {}
-    for key, value in loaded.items():
-        if key and isinstance(value, str):
-            result[key] = value.strip()
-    return result
+    return load_accounts_env_values(accounts_env)
 
 
 def _accounts_env_mtime(accounts_env: Path) -> int | None:
-    try:
-        return accounts_env.stat().st_mtime_ns
-    except OSError:
-        return None
+    return accounts_env_mtime(accounts_env)
 
 
 def _discover_and_register_discord_services(*, log_summary: bool = True) -> list[Service]:

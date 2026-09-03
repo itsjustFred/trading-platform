@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import os
 import re
 from pathlib import Path
 
-from dotenv import dotenv_values
+from live_runner.credential_env import load_accounts_env_values
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_ACCOUNTS_ENV = PROJECT_ROOT / ".accounts.env"
@@ -13,15 +12,8 @@ _TOKEN_PATTERN = re.compile(r"^DISCORD_BOT_(?P<name>[A-Z0-9_]+)_TOKEN$")
 
 
 def discover_discord_bots_from_env() -> list[dict[str, str]]:
-    env_values: dict[str, str] = {}
-    if DEFAULT_ACCOUNTS_ENV.exists():
-        loaded = dotenv_values(DEFAULT_ACCOUNTS_ENV)
-        for key, value in loaded.items():
-            if key and isinstance(value, str):
-                env_values[key] = value.strip()
-    for key, value in os.environ.items():
-        if key.startswith("DISCORD_BOT_"):
-            env_values[key] = value.strip()
+    # File-first precedence: .accounts.env wins over the process environment.
+    env_values = load_accounts_env_values(DEFAULT_ACCOUNTS_ENV)
 
     discovered: list[dict[str, str]] = []
     for key in env_values:
