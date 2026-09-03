@@ -6,7 +6,7 @@ import type {
   LiveSignalLogResponse,
   LiveTradesResponse,
 } from "../api/types";
-import { useWebSocket, type WebSocketStatus } from "./useWebSocket";
+import { buildWebSocketUrl, useWebSocket, type WebSocketStatus } from "./useWebSocket";
 
 type LiveStreamEnvelope<TData> = {
   type: string;
@@ -21,7 +21,6 @@ type LiveStreamState<TData> = {
   isConnected: boolean;
   status: WebSocketStatus;
   error: string | null;
-  lastMessage: LiveStreamEnvelope<TData> | null;
 };
 
 type StreamPayloadState<TData> = {
@@ -37,11 +36,6 @@ const STREAM_HEARTBEAT_TIMEOUT_MS = 45_000;
 export type LiveAccountsStreamPayload = {
   accounts: LiveAccount[];
 };
-
-function buildWebSocketUrl(path: string): string {
-  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-  return `${protocol}//${window.location.host}${path}`;
-}
 
 function isDataEnvelopeType(type: string): boolean {
   return type === "snapshot" || type === "update";
@@ -65,6 +59,7 @@ function useLiveStream<TData>(path: string | null): LiveStreamState<TData> {
     heartbeatTimeoutMs: STREAM_HEARTBEAT_TIMEOUT_MS,
     onMessage: (message) => {
       setPayload((current) => {
+        // Replace (not merge) whenever the message arrives for a different topic.
         const base =
           current.url === wsUrl ? current : { url: wsUrl, data: null, error: null };
         const messageType = String(message?.type || "").toLowerCase();
@@ -105,7 +100,6 @@ function useLiveStream<TData>(path: string | null): LiveStreamState<TData> {
     isConnected: stream.isConnected,
     status: stream.status,
     error,
-    lastMessage: stream.lastMessage,
   };
 }
 

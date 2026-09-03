@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { TerminalSquare } from "lucide-react";
 
-import { useWebSocket, type WebSocketStatus } from "../hooks/useWebSocket";
+import { buildWebSocketUrl, useWebSocket, type WebSocketStatus } from "../hooks/useWebSocket";
 
 interface LiveTerminalProps {
   jobId: string | null;
@@ -53,10 +53,7 @@ export function LiveTerminal({
   }, [onStatusChange]);
 
   const wsUrl = useMemo(
-    () =>
-      jobId
-        ? `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.host}/ws/tasks/${jobId}`
-        : null,
+    () => (jobId ? buildWebSocketUrl(`/ws/tasks/${jobId}`) : null),
     [jobId],
   );
 

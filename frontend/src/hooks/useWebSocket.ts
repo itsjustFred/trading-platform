@@ -37,6 +37,12 @@ const DEFAULT_MAX_RECONNECT_DELAY_MS = 15_000;
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 15_000;
 const DEFAULT_HEARTBEAT_TIMEOUT_MS = 45_000;
 
+/** Builds an absolute ws(s):// URL for a same-origin server path. */
+export function buildWebSocketUrl(path: string): string {
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${protocol}//${window.location.host}${path}`;
+}
+
 function parseIncomingMessage<TMessage>(value: unknown): TMessage | null {
   if (typeof value !== "string") {
     return null;
@@ -247,9 +253,7 @@ export function useWebSocket<TMessage = unknown>(
       };
     };
 
-    if (enabled && url) {
-      connect();
-    }
+    connect();
 
     return () => {
       disposed = true;

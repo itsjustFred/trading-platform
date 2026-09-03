@@ -45,6 +45,7 @@ type DeploymentCard = LiveDeploymentConfig & {
 
 const LIVE_FALLBACK_POLL_MS = 30_000;
 const LIVE_REFRESH_DEBOUNCE_MS = 500;
+const LIVE_REFRESH_MAX_WAIT_MS = 2_000;
 const DEFAULT_TIMEFRAME = "1h";
 const LIVE_TIMEFRAMES = [
   "tick",
@@ -400,9 +401,11 @@ export function LiveHubPage() {
 
   // Deployment-dependent data (stats, balances, positions, dashboard) still needs a
   // refetch when accounts change — but debounced, so message bursts coalesce into one.
+  // maxWait keeps a chatty stream from starving the refresh entirely.
   const debouncedRefreshDeployments = useDebouncedCallback(
     () => void refreshDeployments(true),
     LIVE_REFRESH_DEBOUNCE_MS,
+    LIVE_REFRESH_MAX_WAIT_MS,
   );
 
   useEffect(() => {
