@@ -15,6 +15,13 @@ export interface UseWebSocketOptions<TMessage> {
   heartbeatIntervalMs?: number;
   heartbeatTimeoutMs?: number;
   onMessage?: (message: TMessage) => void;
+  /** Invoked on every successful (re)connection, after the socket is open. */
+  onOpen?: () => void;
+  /**
+   * "json" (default) parses frames as JSON and drops non-JSON frames.
+   * "text" delivers every non-empty string frame as-is (plain-text feeds).
+   */
+  messageFormat?: "json" | "text";
 }
 
 export interface UseWebSocketResult<TMessage> {
@@ -52,10 +59,13 @@ export function useWebSocket<TMessage = unknown>(
     heartbeatIntervalMs = DEFAULT_HEARTBEAT_INTERVAL_MS,
     heartbeatTimeoutMs = DEFAULT_HEARTBEAT_TIMEOUT_MS,
     onMessage,
+    onOpen,
+    messageFormat = "json",
   } = options;
 
   const socketRef = useRef<WebSocket | null>(null);
   const onMessageRef = useRef<typeof onMessage>(onMessage);
+  const onOpenRef = useRef<typeof onOpen>(onOpen);
   const [status, setStatus] = useState<WebSocketStatus>("idle");
   const [isConnected, setIsConnected] = useState(false);
   const [lastMessage, setLastMessage] = useState<TMessage | null>(null);
@@ -63,17 +73,14 @@ export function useWebSocket<TMessage = unknown>(
 
   useEffect(() => {
     onMessageRef.current = onMessage;
-  }, [onMessage]);
+    onOpenRef.current = onOpen;
+  }, [onMessage, onOpen]);
 
   useEffect(() => {
     if (!enabled || !url) {
-      setStatus("idle");
-      setIsConnected(false);
-      setLastMessage(null);
       return;
     }
 
-    setLastMessage(null);
     let disposed = false;
     let reconnectAttempts = 0;
     let reconnectTimer: number | null = null;
@@ -189,10 +196,20 @@ export function useWebSocket<TMessage = unknown>(
         setIsConnected(true);
         setError(null);
         startHeartbeat();
+        onOpenRef.current?.();
       };
 
       activeSocket.onmessage = (event) => {
         if (disposed || socketRef.current !== activeSocket) {
+          return;
+        }
+        if (messageFormat === "text") {
+          const line = typeof event.data === "string" ? event.data : "";
+          if (!line) {
+            return;
+          }
+          lastActivityAt = Date.now();
+          onMessageRef.current?.(line as TMessage);
           return;
         }
         const parsed = parseIncomingMessage<TMessage | Record<string, unknown>>(event.data);
@@ -230,7 +247,9 @@ export function useWebSocket<TMessage = unknown>(
       };
     };
 
-    connect();
+    if (enabled && url) {
+      connect();
+    }
 
     return () => {
       disposed = true;
@@ -248,6 +267,7 @@ export function useWebSocket<TMessage = unknown>(
     heartbeatIntervalMs,
     heartbeatTimeoutMs,
     maxReconnectDelayMs,
+    messageFormat,
     reconnectDelayMs,
     url,
   ]);
@@ -261,10 +281,15 @@ export function useWebSocket<TMessage = unknown>(
     return true;
   }, []);
 
+  // Derived: an unmounted/disabled hook reports idle rather than a stale socket state.
+  const active = enabled && url != null;
+  const resolvedStatus: WebSocketStatus = active ? status : "idle";
+  const resolvedIsConnected = active && isConnected;
+
   return {
-    status,
-    isConnected,
-    lastMessage,
+    status: resolvedStatus,
+    isConnected: resolvedIsConnected,
+    lastMessage: active ? lastMessage : null,
     error,
     sendJson,
   };

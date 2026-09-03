@@ -14,6 +14,7 @@ import type { DukascopyGenesisResponse } from "../api/types";
 import { LiveTerminal } from "./LiveTerminal";
 import { Modal } from "./Modal";
 import { useToast } from "./ToastProvider";
+import { useDebouncedValue } from "../hooks/useDebouncedValue";
 
 const TIMEFRAME_OPTIONS = [
   "tick",
@@ -27,6 +28,10 @@ const TIMEFRAME_OPTIONS = [
   "d1",
   "mn1",
 ];
+
+// The genesis-coverage endpoint proxies an external provider; debounced so typing
+// in the symbols field does not fire one request per keystroke.
+const COVERAGE_DEBOUNCE_MS = 400;
 
 const DUKASCOPY_INSTRUMENTS = [
   "EURUSD",
@@ -203,6 +208,7 @@ export function DownloadModal({
     }
     return ordered;
   }, [selectedTimeframes]);
+  const debouncedCoverageSymbols = useDebouncedValue(parsedSymbols, COVERAGE_DEBOUNCE_MS);
 
   const dukascopyMinStart = useMemo(() => {
     if (parsedSymbols.length === 0 || requestedTimeframes.length === 0) {
@@ -315,7 +321,7 @@ export function DownloadModal({
     if (!open || !isDukascopy || isStreaming) {
       return;
     }
-    if (parsedSymbols.length === 0 || requestedTimeframes.length === 0) {
+    if (debouncedCoverageSymbols.length === 0 || requestedTimeframes.length === 0) {
       setDukascopyCoverage({});
       setDukascopyCoverageLoaded(false);
       setDukascopyCoverageError("");
@@ -325,7 +331,7 @@ export function DownloadModal({
     let cancelled = false;
     setDukascopyCoverageLoaded(false);
     setDukascopyCoverageError("");
-    getDukascopyGenesis(parsedSymbols, selectedTimeframes)
+    getDukascopyGenesis(debouncedCoverageSymbols, selectedTimeframes)
       .then((res) => {
         if (!cancelled) {
           setDukascopyCoverage(res.coverage || {});
@@ -347,10 +353,10 @@ export function DownloadModal({
       cancelled = true;
     };
   }, [
+    debouncedCoverageSymbols,
     isDukascopy,
     isStreaming,
     open,
-    parsedSymbols,
     requestedTimeframes,
     selectedTimeframes,
   ]);

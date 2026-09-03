@@ -9,6 +9,7 @@ import { Play, Loader2 } from "lucide-react";
 import { useToast } from "./ToastProvider";
 import { useStrategiesCache } from "./StrategiesProvider";
 import { useStrategyDetail } from "../api/queries";
+import { useDebouncedValue } from "../hooks/useDebouncedValue";
 
 // Canonical timeframe order from smallest to largest (matches shared/constants.py)
 const TIMEFRAME_ORDER = ["tick", "s1", "1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"] as const;
@@ -31,6 +32,10 @@ function getModelingTimeframes(mainTf: string): string[] {
   // Include all timeframes <= mainTf (the main TF itself plus all smaller ones)
   return [...TIMEFRAME_ORDER.slice(0, idx + 1)];
 }
+
+// Availability checks run one request per symbol; debounced so typing a symbol list
+// does not fire N requests per keystroke.
+const AVAILABILITY_CHECK_DEBOUNCE_MS = 400;
 
 interface CreateBacktestModalProps {
   open: boolean;
@@ -131,6 +136,10 @@ export function CreateBacktestModal({
         .filter(Boolean),
     [symbols],
   );
+  const debouncedAvailabilitySymbols = useDebouncedValue(
+    symbolList,
+    AVAILABILITY_CHECK_DEBOUNCE_MS,
+  );
 
   useEffect(() => {
     if (!open) {
@@ -139,7 +148,7 @@ export function CreateBacktestModal({
       return;
     }
 
-    if (!symbolList.length || !timeframe) {
+    if (!debouncedAvailabilitySymbols.length || !timeframe) {
       setDataAvailabilityWarning("");
       setCheckingDataAvailability(false);
       return;
@@ -150,7 +159,7 @@ export function CreateBacktestModal({
     const runCheck = async () => {
       try {
         const results = await Promise.all(
-          symbolList.map(async (symbolValue) => ({
+          debouncedAvailabilitySymbols.map(async (symbolValue) => ({
             symbol: symbolValue,
             ...(await getDataCheck(symbolValue, timeframe, start, end)),
           })),
@@ -183,7 +192,7 @@ export function CreateBacktestModal({
     return () => {
       cancelled = true;
     };
-  }, [open, symbolList, timeframe, start, end]);
+  }, [open, debouncedAvailabilitySymbols, timeframe, start, end]);
 
   const handleRun = async () => {
     if (!strategy || symbolList.length === 0) {

@@ -1,7 +1,7 @@
 import { memo, useCallback, useEffect, useMemo, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate } from "react-router-dom";
-import { Activity, Pause, Plus, Square, X } from "lucide-react";
+import { Activity, Pause, Play, Plus, Square, X } from "lucide-react";
 
 import {
   createLiveDeployment,
@@ -24,6 +24,7 @@ import { Modal } from "../components/Modal";
 import { Sparkline } from "../components/Sparkline";
 import { SymbolInput } from "../components/SymbolInput";
 import { useLiveAccountsStream } from "../hooks/liveStreams";
+import { useDebouncedCallback } from "../hooks/useDebouncedValue";
 import type {
   LiveAccount,
   LiveAccountStats,
@@ -43,6 +44,7 @@ type DeploymentCard = LiveDeploymentConfig & {
 };
 
 const LIVE_FALLBACK_POLL_MS = 30_000;
+const LIVE_REFRESH_DEBOUNCE_MS = 500;
 const DEFAULT_TIMEFRAME = "1h";
 const LIVE_TIMEFRAMES = [
   "tick",
@@ -91,12 +93,14 @@ type LiveHubAccountStats = {
 const LiveDeploymentCard = memo(function LiveDeploymentCard({
   card,
   busy,
+  onPlay,
   onPause,
   onStop,
   onDelete,
 }: {
   card: DeploymentCard;
   busy: boolean;
+  onPlay: (card: DeploymentCard, event: React.MouseEvent<HTMLButtonElement>) => void;
   onPause: (card: DeploymentCard, event: React.MouseEvent<HTMLButtonElement>) => void;
   onStop: (card: DeploymentCard, event: React.MouseEvent<HTMLButtonElement>) => void;
   onDelete: (card: DeploymentCard, event: React.MouseEvent<HTMLButtonElement>) => void;
@@ -112,10 +116,13 @@ const LiveDeploymentCard = memo(function LiveDeploymentCard({
         position: "relative",
       }}
     >
+      {/* Full-card navigation overlay. Every interactive child below must be a
+          positioned sibling with a higher z-index, or this link paints above it
+          and intercepts the click (see PortfoliosPage.tsx for the same pattern). */}
       <Link
         to={"/live/" + encodeURIComponent(card.account_id)}
-        aria-label={`Open live account `}
-        style={{ position: "absolute", inset: 0, zIndex: 1, borderRadius: "10px" }}
+        aria-label={`Open live account`}
+        style={overlayLinkStyle}
       />
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
         <div style={{ fontWeight: 600, fontSize: "0.87rem" }}>{card.strategy_name}</div>
@@ -147,7 +154,18 @@ const LiveDeploymentCard = memo(function LiveDeploymentCard({
           return ` · Wait Candle Close: ${waitValue ? "On" : "Off"}`;
         })()}
       </div>
-      <div style={{ display: "flex", gap: "8px" }}>
+      <div style={{ display: "flex", gap: "8px", position: "relative", zIndex: 2 }}>
+        {card.status === "PAUSED" && (
+          <button
+            type="button"
+            onClick={(event) => onPlay(card, event)}
+            title="Resume (set status ACTIVE)"
+            style={controlBtnStyle("play", false)}
+            disabled={busy}
+          >
+            <Play size={14} />
+          </button>
+        )}
         <button
           type="button"
           onClick={(event) => onPause(card, event)}
@@ -374,10 +392,25 @@ export function LiveHubPage() {
     if (!payload) {
       return;
     }
+    // The push already carries the account data; applying it directly here keeps
+    // every WS message from fanning out into a full 3N+3-request refresh.
     queryClient.setQueryData(["live-accounts"], payload.accounts);
     setAccounts(payload.accounts);
-    void refreshDeployments(true);
-  }, [accountsStream.data, queryClient, refreshDeployments]);
+  }, [accountsStream.data, queryClient]);
+
+  // Deployment-dependent data (stats, balances, positions, dashboard) still needs a
+  // refetch when accounts change — but debounced, so message bursts coalesce into one.
+  const debouncedRefreshDeployments = useDebouncedCallback(
+    () => void refreshDeployments(true),
+    LIVE_REFRESH_DEBOUNCE_MS,
+  );
+
+  useEffect(() => {
+    if (!accountsStream.data) {
+      return;
+    }
+    debouncedRefreshDeployments();
+  }, [accountsStream.data, debouncedRefreshDeployments]);
 
   useEffect(() => {
     if (accountsStream.isConnected) {
@@ -638,6 +671,10 @@ export function LiveHubPage() {
       setIsStartingReplay(false);
     }
   };
+
+  const handlePlayControl = useCallback((card: DeploymentCard, event: React.MouseEvent<HTMLButtonElement>) => {
+    void handleControl("play", card, event);
+  }, [handleControl]);
 
   const handlePauseControl = useCallback((card: DeploymentCard, event: React.MouseEvent<HTMLButtonElement>) => {
     void handleControl("pause", card, event);
@@ -1354,6 +1391,7 @@ export function LiveHubPage() {
                         key={card.id}
                         card={card}
                         busy={updatingDeploymentIds.has(card.id)}
+                        onPlay={handlePlayControl}
                         onPause={handlePauseControl}
                         onStop={handleStopControl}
                         onDelete={handleDelete}
@@ -1403,6 +1441,13 @@ function controlBtnStyle(
     background: active ? "rgba(248, 113, 113, 0.22)" : "rgba(248, 113, 113, 0.1)",
   };
 }
+
+const overlayLinkStyle: React.CSSProperties = {
+  position: "absolute",
+  inset: 0,
+  zIndex: 1,
+  borderRadius: "10px",
+};
 
 const baseControlStyle: React.CSSProperties = {
   width: "32px",

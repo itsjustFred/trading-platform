@@ -4,6 +4,7 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import { getLogContent, getLogs } from "../api/client";
 import { useToast } from "../components/ToastProvider";
 import { MultiSelectDropdown } from "../components/MultiSelectDropdown";
+import { useDebouncedValue } from "../hooks/useDebouncedValue";
 
 const ALL_LOGS = "ALL_LOGS";
 const LEVEL_OPTIONS = ["ERROR", "WARNING", "INFO", "DEBUG"] as const;
@@ -17,6 +18,8 @@ const POLLING_PATHS = ["/api/tasks", "/api/data/tasks", "/api/live/accounts", "/
 const POLLING_PREFIXES = ["/api/tasks/", "/api/data/tasks/", "/api/live/balances/", "/api/live/stats/", "/api/live/trades/"];
 const LOG_FETCH_LIMIT = 5000;
 const LOG_REFRESH_MS = 5000;
+// Keeps keystrokes in the search box from refetching LOG_FETCH_LIMIT lines each time.
+const LOG_SEARCH_DEBOUNCE_MS = 300;
 
 type Level = (typeof LEVEL_OPTIONS)[number];
 
@@ -184,6 +187,7 @@ export function LoggingPage() {
   const [selectedFile, setSelectedFile] = useState(ALL_LOGS);
   const [lines, setLines] = useState<string[]>([]);
   const [search, setSearch] = useState("");
+  const debouncedSearch = useDebouncedValue(search, LOG_SEARCH_DEBOUNCE_MS);
   const [selectedModules, setSelectedModules] = useState<string[]>([]);
   const [selectedLevels, setSelectedLevels] = useState<Record<string, boolean>>(DEFAULT_LEVELS);
   const [hidePolling, setHidePolling] = useState(true);
@@ -233,7 +237,7 @@ export function LoggingPage() {
     let active = true;
 
     const loadLogs = () =>
-      getLogContent(activeLogFile, LOG_FETCH_LIMIT, levelParam, search.trim() || undefined)
+      getLogContent(activeLogFile, LOG_FETCH_LIMIT, levelParam, debouncedSearch.trim() || undefined)
         .then((payload) => {
           if (!active) return;
           setLines(payload.lines ?? []);
@@ -259,7 +263,7 @@ export function LoggingPage() {
       active = false;
       window.clearInterval(interval);
     };
-  }, [activeLogFile, levelParam, search, showToast]);
+  }, [activeLogFile, levelParam, debouncedSearch, showToast]);
 
   const parsedEntries = useMemo(() => {
     return lines.map(parseLogLine);

@@ -3,6 +3,7 @@ import { Routes, Route, Navigate, useLocation } from "react-router-dom";
 import { Sidebar } from "./Sidebar";
 import { TaskManager } from "./components/TaskManager";
 import { LoadingSpinner } from "./components/LoadingSpinner";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 
 const BacktestsPage = lazy(() =>
   import("./pages/BacktestsPage").then((mod) => ({ default: mod.BacktestsPage })),
@@ -93,8 +94,9 @@ export default function App() {
             </div>
           </div>
         ) : null}
-        <Suspense fallback={<LoadingSpinner />}>
-          <Routes>
+        <ErrorBoundary label="Page">
+          <Suspense fallback={<LoadingSpinner />}>
+            <Routes>
             <Route path="/" element={<Navigate to="/strategies" replace />} />
             <Route path="/data" element={<DataManagementPage />} />
             <Route path="/backtests" element={<BacktestsPage />} />
@@ -118,8 +120,9 @@ export default function App() {
             <Route path="/lab" element={<StrategyLabPage />} />
             <Route path="/tasks" element={<TaskHubPage />} />
             <Route path="/logging" element={<LoggingPage />} />
-          </Routes>
-        </Suspense>
+            </Routes>
+          </Suspense>
+        </ErrorBoundary>
       </main>
     </div>
   );

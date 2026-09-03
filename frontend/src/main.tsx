@@ -4,6 +4,7 @@ import { BrowserRouter } from "react-router-dom";
 import { QueryClientProvider } from "@tanstack/react-query";
 import "./index.css";
 import App from "./App";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 import { StrategiesProvider } from "./components/StrategiesProvider";
 import { ToastProvider } from "./components/ToastProvider";
 import { initFrontendSentry } from "./lib/sentryConfig";
@@ -17,14 +18,16 @@ try {
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
-    <QueryClientProvider client={queryClient}>
-      <ToastProvider>
-        <StrategiesProvider>
-          <BrowserRouter>
-            <App />
-          </BrowserRouter>
-        </StrategiesProvider>
-      </ToastProvider>
-    </QueryClientProvider>
+    <ErrorBoundary label="Application">
+      <QueryClientProvider client={queryClient}>
+        <ToastProvider>
+          <StrategiesProvider>
+            <BrowserRouter>
+              <App />
+            </BrowserRouter>
+          </StrategiesProvider>
+        </ToastProvider>
+      </QueryClientProvider>
+    </ErrorBoundary>
   </StrictMode>,
 );
