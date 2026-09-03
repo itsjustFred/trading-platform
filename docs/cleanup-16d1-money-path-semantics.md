@@ -258,3 +258,21 @@ could be threaded out of `_process_symbol` instead; the second read is
 bounded by the same parquet pages the loop just touched and keeps
 `_process_symbol`'s signature (and its ProcessPoolExecutor pickling surface)
 unchanged. Revisit when 16-D2 touches the adapter.
+
+## Changelog note for consumers of the metric definitions (D5)
+
+As of Cleanup 16-D1 the following definitions changed for runs produced by
+this code (older persisted artifacts keep their original numbers):
+
+- `total_return` is the equity-endpoint ratio (`E_end / E_start − 1`). The
+  pre-16-D1 QuantStats path published the compounded product of resampled
+  daily returns, which differs from the endpoint ratio on curves with
+  intraday swings (e.g. 100k → 90k → 111k same day → 121k next day:
+  endpoint 0.21, daily product 0.09).
+- `calmar_ratio` divides elapsed-time CAGR by max drawdown on BOTH paths.
+- Portfolio-optimizer `sharpe`/`oos_sharpe` are annualized (F36); values
+  produced before 16-D1 are per-observation and ~15.9x smaller on daily
+  curves.
+
+If a fresh run's metrics disagree with a persisted pre-16-D1 artifact, this
+is the expected cause — re-run comparisons within one code generation.
