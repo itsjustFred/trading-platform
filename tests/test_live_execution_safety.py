@@ -2387,6 +2387,25 @@ def test_alpaca_rejects_unknown_signal_action_instead_of_selling():
         asyncio.run(adapter.submit_order(bad_signal))
 
 
+def test_alpaca_build_order_request_rejects_unknown_signal_action():
+    """The request-builder guard must hold even when submit_order is bypassed."""
+    from live_runner import alpaca_adapter as module
+
+    adapter = module.AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True)
+    bad_signal = _live_signal_with_action("close")
+
+    with pytest.raises(ValueError, match=r"[Uu]nsupported .*action: close"):
+        adapter._build_order_request(
+            bad_signal,
+            qty=1.0,
+            order_side=SimpleNamespace(BUY="buy", SELL="sell"),
+            time_in_force=SimpleNamespace(DAY="day"),
+            limit_request_cls=lambda **kwargs: ("limit", kwargs),
+            market_request_cls=lambda **kwargs: ("market", kwargs),
+            client_order_id="cid-unknown-action",
+        )
+
+
 def test_ctrader_rejects_unknown_signal_action_instead_of_selling():
     module, adapter = _make_ctrader_adapter()
     adapter._client = object()
@@ -2495,6 +2514,32 @@ def test_ctrader_new_order_request_fails_closed_without_sl_tp():
 
     with pytest.raises(ValueError, match="without stop_loss"):
         adapter._build_new_order_request(signal, symbol_id=7)
+
+
+def test_ctrader_build_new_order_request_rejects_unknown_signal_action():
+    """The request-builder guard must hold even when submit_order is bypassed."""
+    module, adapter = _make_ctrader_adapter()
+
+    class _NewOrderReq:
+        def __init__(self) -> None:
+            self.ctidTraderAccountId = 0
+            self.symbolId = 0
+            self.orderType = 0
+            self.tradeSide = 0
+            self.volume = 0
+            self.timeInForce = 0
+            self.clientOrderId = ""
+            self.stopLoss = 0
+            self.takeProfit = 0
+
+    adapter._ProtoOANewOrderReq = _NewOrderReq
+    adapter._ProtoOAOrderType = SimpleNamespace(MARKET=1)
+    adapter._ProtoOATradeSide = SimpleNamespace(BUY=1, SELL=2)
+    adapter._ProtoOATimeInForce = SimpleNamespace(IMMEDIATE_OR_CANCEL=1)
+    bad_signal = _live_signal_with_action("close")
+
+    with pytest.raises(ValueError, match=r"[Uu]nsupported .*action: close"):
+        adapter._build_new_order_request(bad_signal, symbol_id=7)
 
 
 def test_alpaca_build_order_request_carries_bracket_legs():
