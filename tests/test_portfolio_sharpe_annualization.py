@@ -18,6 +18,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from runner import portfolio_optimizer
 from runner.engines.signal_replay_adapter import (
     ReplaySignal,
     SignalReplayAdapter,
@@ -143,3 +144,69 @@ class TestReplaySizingEquity:
             "realized − 10k unrealized = 90k; using realized-only 100k would "
             "size during drawdown as if nothing were lost"
         )
+
+
+# ─── Mutation hardening: annualization cadence calibration ─────────────────
+
+
+class TestAnnualizationCadenceCalibration:
+    def test_calendar_daily_maps_to_252(self):
+        """Calendar-daily cadence must map onto the 252 trading convention.
+
+        Kills the mutant that skips the 350-380 mapping: a calendar-daily
+        curve would then annualize with 365.25 instead of 252, inflating the
+        Sharpe by ~20% versus runner.stats' daily Sharpe.
+        """
+        times = list(range(1_700_000_000, 1_700_000_000 + 300 * 86_400, 86_400))
+        equity = np.array([100_000.0 * (1 + 0.0005 * math.sin(i)) for i in range(300)])
+        portfolio_optimizer._record_portfolio_timestamps(
+            _curves_from_times(times), times
+        )
+        try:
+            sharpe, _ = _portfolio_sharpe_from_weights(np.array([1.0]), equity.reshape(-1, 1))
+            returns = np.diff(equity) / equity[:-1]
+            per_obs = float(np.mean(returns) / (np.std(returns) + 1e-10))
+            assert sharpe == pytest.approx(per_obs * math.sqrt(252), rel=1e-6), (
+                "calendar-daily curves must annualize with 252, not the "
+                "calendar count"
+            )
+        finally:
+            portfolio_optimizer._LAST_PORTFOLIO_TIMESTAMPS.clear()
+
+    def test_intraday_cadence_scales_but_is_capped(self):
+        """Hourly cadence scales periods-per-year but hits the 252*4 ceiling.
+
+        The ceiling (1008) binds for hourly curves — that IS the documented
+        cap's purpose. Kills the ceiling mutant (40 instead of 252*4) and
+        pins that the cap, not the calendar count (~8766) or the default
+        (252), is returned.
+        """
+        times = list(range(1_700_000_000, 1_700_000_000 + 300 * 3600, 3600))
+        equity = np.array([100_000.0 * (1 + 0.0005 * math.sin(i)) for i in range(300)])
+        portfolio_optimizer._record_portfolio_timestamps(
+            _curves_from_times(times), times
+        )
+        try:
+            equity_matrix = equity.reshape(-1, 1)
+            periods = portfolio_optimizer._infer_portfolio_periods_per_year(
+                equity_matrix
+            )
+            assert periods == pytest.approx(
+                portfolio_optimizer.PORTFOLIO_PERIODS_PER_YEAR_DEFAULT * 4
+            ), (
+                "hourly curves must hit the 252*4 ceiling — a lower value means "
+                "the cap constant was shrunk, a calendar-scale value means the "
+                "cap was dropped"
+            )
+        finally:
+            portfolio_optimizer._LAST_PORTFOLIO_TIMESTAMPS.clear()
+
+
+def _curves_from_times(times: list[int]):
+    return [
+        [
+            portfolio_optimizer.StrategyEquityPoint(time=ts, equity=100_000.0)
+            for ts in times
+        ]
+        for _ in range(2)
+    ]

@@ -277,7 +277,10 @@ def _infer_portfolio_periods_per_year(equity_matrix: np.ndarray) -> float:
     if len(timestamps) != equity_matrix.shape[0]:
         return PORTFOLIO_PERIODS_PER_YEAR_DEFAULT
 
-    spacings = np.diff(timestamps.asi8) / 1_000_000_000  # seconds
+    # Resolution-agnostic: ``asi8`` returns the native unit of the index
+    # (seconds for datetime64[s] stamps, nanoseconds for the pandas default).
+    # Normalize via Timedelta arithmetic instead of a hardcoded 1e9 divisor.
+    spacings = np.diff(timestamps) / np.timedelta64(1, "s")
     spacing = float(np.median(spacings))
     if not math.isfinite(spacing) or spacing <= 0:
         return PORTFOLIO_PERIODS_PER_YEAR_DEFAULT

@@ -3,6 +3,8 @@
 from datetime import datetime, timedelta, timezone
 import math
 
+import pytest
+
 from runner.stats import (
     compute_stats,
     compute_stats_for_result,
@@ -262,3 +264,70 @@ class TestComputeStatsForResult:
         stats = compute_stats_for_result(result)
         assert stats["total_trades"] == 2
         assert stats["total_pnl"] == 50.0
+
+
+class TestTotalReturnDefinitionConsistency:
+    """Mutation hardening (F17): total_return is the equity-endpoint ratio."""
+
+    def test_total_return_uses_equity_endpoints_not_daily_product(self):
+        """Intraday dips must not change total_return.
+
+        The daily-resampled product only sees the LAST point per day, so an
+        intraday drawdown that recovers (100k → 90k → 111k same day) would
+        produce a different number than the documented equity-endpoint
+        definition. Pin the endpoint ratio.
+        """
+        equity = [
+            EquityPoint(time="2024-01-01T00:00:00+00:00", equity=100_000.0),
+            EquityPoint(time="2024-01-01T12:00:00+00:00", equity=90_000.0),
+            EquityPoint(time="2024-01-01T23:00:00+00:00", equity=111_000.0),
+            EquityPoint(time="2024-01-02T00:00:00+00:00", equity=121_000.0),
+        ]
+        stats = compute_stats([], equity_curve=equity)
+        assert stats["total_return"] == pytest.approx(0.21, rel=1e-9), (
+            "total_return must be the equity-endpoint ratio (121k/100k - 1), "
+            "not the daily-resampled compounded product (0.09)"
+        )
+
+
+class TestCalmarAndQsFallback:
+    """Mutation hardening (F17): Calmar definition + QS-without-daily-series."""
+
+    def test_calmar_uses_cagr_not_observation_annualized_return(self):
+        """Calmar must divide elapsed-time CAGR by max drawdown.
+
+        Kills the mutant that swaps CAGR for an observation-count annualized
+        total return — the two diverge whenever the equity curve's cadence
+        differs from 252 points/year.
+        """
+        # 2 years of flat-then-pump equity: CAGR ~ sqrt(1.5)-1 ≈ 22.5%
+        equity = [
+            EquityPoint(time="2022-01-01T00:00:00+00:00", equity=100_000.0),
+            EquityPoint(time="2023-01-01T00:00:00+00:00", equity=100_000.0),
+            EquityPoint(time="2024-01-01T00:00:00+00:00", equity=150_000.0),
+        ]
+        stats = compute_stats([], equity_curve=equity)
+        if stats["max_drawdown_pct"] == 0:
+            pytest.skip("fixture needs a drawdown")
+        expected_calmar = stats["cagr"] / abs(stats["max_drawdown_pct"])
+        assert stats["calmar_ratio"] == pytest.approx(expected_calmar, rel=1e-6), (
+            "calmar_ratio must equal cagr / |max_drawdown_pct| (elapsed-time "
+            "definition, shared by both code paths)"
+        )
+
+    def test_qs_installed_but_unparseable_times_still_yields_sharpe(self):
+        """With QS installed but timestamps unresolvable, Sharpe must not be 0.
+
+        Kills the mutant that disables the manual fall-through: the fallback
+        computes Sharpe/Sortino on raw period returns instead of silently
+        leaving 0.0.
+        """
+        equity = [
+            EquityPoint(time=f"not-a-timestamp-{i}", equity=100_000.0 * (1.001**i))
+            for i in range(40)
+        ]
+        stats = compute_stats([], equity_curve=equity)
+        assert stats["sharpe_ratio"] != 0.0, (
+            "unparseable equity timestamps must fall back to the manual Sharpe "
+            "path (raw period returns), not silently publish 0.0"
+        )

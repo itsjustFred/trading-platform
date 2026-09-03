@@ -232,3 +232,42 @@ def _base_result(tmp_path: Path):
         parameters={"fast_length": 5, "slow_length": 20},
     )
     return BacktestResult(meta=meta, trades=[])
+
+
+# ─── Mutation hardening: penalty margin + empty-study guard ─────────────────
+
+
+class TestPenaltyMarginAndEmptyStudy:
+    def test_penalty_is_strictly_below_worst_trading_trial(self):
+        """The penalty must sit BELOW the worst trading value with margin.
+
+        Kills the mutants that place the penalty above the worst trading
+        trial (which would let a no-trade trial beat honest negative-Sharpe
+        trials again) or that shrink the margin to zero.
+        """
+        values = [-3.0, -1.0, 0.5, 2.0]
+        penalty = optimizer_module._no_trade_penalty_value(values)
+        assert penalty < min(values), "penalty must be below the WORST trading value"
+        assert penalty <= min(values) - 0.5, "penalty must keep a safety margin"
+
+    def test_first_trial_penalty_is_a_large_negative_constant(self):
+        assert optimizer_module._no_trade_penalty_value([]) == optimizer_module._NO_TRADE_PENALTY
+        assert optimizer_module._NO_TRADE_PENALTY < -1e6, (
+            "the seed penalty must be far below any plausible metric value"
+        )
+
+    def test_empty_study_raises_rather_than_selecting_failed_trials(self, tmp_path, monkeypatch):
+        """A study with zero completed trials must fail loudly.
+
+        Kills the mutant that bypasses the completed-trials guard and would
+        select parameters from FAILED trials (whose params are meaningless).
+        """
+        import optuna
+
+        study = optuna.create_study(direction="maximize")
+        # One FAILED trial only (no completed trials).
+        trial = study.ask()
+        study.tell(trial, state=optuna.trial.TrialState.FAIL)
+
+        with pytest.raises(RuntimeError, match="no completed trials"):
+            optimizer_module._best_trial_or_raise(study)

@@ -132,12 +132,17 @@ def compute_stats(
 
         if HAS_QUANTSTATS:
             returns_series = daily_return_series
-            if returns_series is None or returns_series.empty:
-                # F17 third facet: QS installed but no daily series resolvable
-                # (unparseable/sparse timestamps). Fall through to the manual
-                # path on raw period returns instead of silently leaving
-                # Sharpe/Sortino at 0.0 — same definition family as the QS
-                # branch (excess mean / dispersion, 252-period annualization).
+            qs_usable = returns_series is not None and not returns_series.empty
+            if qs_usable and not isinstance(returns_series.index, pd.DatetimeIndex):
+                # F17 third facet: QS needs a datetime index; a resampling
+                # fallback that produced a bare RangeIndex makes every
+                # _safe_qs call return 0.0 silently. Treat QS as unusable.
+                qs_usable = False
+            if not qs_usable:
+                # QS installed but unusable (no daily series resolvable, or a
+                # non-datetime index). Fall through to the manual path on raw
+                # period returns instead of silently leaving Sharpe/Sortino at
+                # 0.0 — same definition family as the QS branch.
                 if len(daily_returns) > 1:
                     sharpe_ratio = _sharpe_manual(daily_returns, risk_free_rate)
                     sortino_ratio = _sortino_manual(daily_returns, risk_free_rate)

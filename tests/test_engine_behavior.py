@@ -350,3 +350,48 @@ class TestOrderTypeSizingSemantics:
         # Fill happens on bar 1 (open 101); stopless sizing was computed on
         # bar 0 close (100) → 100000/100 = 1000 shares.
         assert trade.quantity == pytest.approx(100_000.0 / 100.0, rel=1e-6)
+
+
+# ─── Mutation hardening: reporting equity curve ─────────────────────────────
+
+
+class TestReportingEquityCurve:
+    def test_curve_includes_unrealized_mark_to_market(self):
+        """Reporting equity must move with open-position MTM (F21 report side).
+
+        Kills the mutants that drop unrealized PnL from the reporting equity:
+        a MID-curve bar (position still open) must sit at
+        capital + realized + unrealized — realized-only would stay flat at
+        capital until the trade closes.
+        """
+        frame = _linear_frame(6)
+        entries = pd.Series([True] + [False] * 5, index=frame.index)
+        exits = pd.Series([False] * 6, index=frame.index)
+        strategy = lambda df, params: (entries, exits)  # noqa: E731
+
+        engine = TradeEngine(_config(Path("/tmp")), symbol="PROBE")
+        engine.run(frame, strategy)
+
+        # Position filled on bar 1 at open=101; qty = 100000/101.
+        qty = engine.closed_trades[0].quantity
+        curve = engine.equity_curve
+        # Bar index 2 (close=102): unrealized = (102 - 101) * qty.
+        expected_bar2 = 100_000.0 + (102.0 - 101.0) * qty
+        assert curve[2].equity == pytest.approx(round(expected_bar2, 2), rel=1e-6), (
+            "mid-curve reporting equity must include unrealized MTM PnL "
+            "(realized-only would still be flat at 100000 here)"
+        )
+
+    def test_curve_starts_exactly_at_initial_capital(self):
+        """Before any fill the curve must sit exactly at initial capital."""
+        frame = _linear_frame(3)
+        entries = pd.Series([True] + [False] * 2, index=frame.index)
+        exits = pd.Series([False] * 3, index=frame.index)
+        strategy = lambda df, params: (entries, exits)  # noqa: E731
+
+        engine = TradeEngine(_config(Path("/tmp")), symbol="PROBE")
+        engine.run(frame, strategy)
+
+        assert engine.equity_curve[0].equity == pytest.approx(100_000.0), (
+            "bar-0 equity must be exactly the initial capital (no seeding drift)"
+        )

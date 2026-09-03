@@ -271,3 +271,205 @@ class TestPortfolioEquityCurveSemantics:
         # Monotone equity when cumulative PnL at each stamp is non-decreasing
         # is implied by the timestamp sort above; sanity-check the mapping.
         assert set(equity_by_time) == set(exits_in_order) or set(equity_by_time) <= set(exits_in_order)
+
+
+# ─── Risk-target sizing math (mutation hardening) ───────────────────────────
+
+
+class TestRiskTargetMath:
+    def test_risk_target_sets_quantity_exactly(self, sizing_env):
+        """qty = (equity * risk_pct) / stop_distance when no cap binds.
+
+        Regression (mutation hardening): a doubled/halved risk target must
+        change the quantity — the sizing chain is pinned end-to-end, not just
+        through the cap.
+        """
+        tmp_path, strategy_path = sizing_env
+        config = _config(
+            tmp_path,
+            risk_per_trade_pct=0.02,
+            max_position_pct=10.0,   # no cap binds
+            max_leverage=10.0,
+        )
+        result = VectorbtAdapter().run(config, str(strategy_path))
+        assert result.trades
+        for trade in result.trades:
+            risk_math = trade.meta["risk_math"]
+            stop_distance = risk_math["stop_distance"]
+            equity = risk_math["equity_at_entry"]
+            expected_qty = (equity * 0.02) / stop_distance
+            assert trade.quantity == pytest.approx(expected_qty, rel=1e-6), (
+                "quantity must equal (equity * risk_pct) / stop_distance — "
+                "any drift in the risk-target math silently rescales every position"
+            )
+
+    def test_stopless_market_entry_uses_documented_fallback(self):
+        """No stop → sizing still happens via the 2% fallback, not zero/full."""
+        # Covered at the quantity level by the native engine tests; here we
+        # pin the vectorbt side through risk_math's stop_distance fallback.
+        frame = _deterministic_frame()
+        env = _sizing_env_from(frame, stop=False)
+        tmp_path, strategy_path, config = env
+        result = VectorbtAdapter().run(config, str(strategy_path))
+        assert result.trades
+        risk_math = result.trades[0].meta["risk_math"]
+        assert risk_math["stop_distance"] is not None, (
+            "the fallback stop (2% of price) must feed sizing even without a "
+            "strategy-provided stop"
+        )
+        assert risk_math["position_size"] > 0
+
+
+def _sizing_env_from(frame: pd.DataFrame, *, stop: bool):
+    import tempfile
+
+    tmp_path = Path(tempfile.mkdtemp())
+    strategy_dir = tmp_path / "strategies"
+    strategy_dir.mkdir()
+    strategy_path = strategy_dir / "vbt_sizing_sma.py"
+    text = STRATEGY
+    if not stop:
+        text = text.replace(
+            '        "stop_loss": pd.Series([df["close"].iloc[0] * 0.95] * len(df), index=df.index),\n',
+            "",
+        )
+    strategy_path.write_text(text)
+    _write_ohlcv(tmp_path, "VSZ", frame)
+    config = _config(tmp_path, risk_per_trade_pct=0.02)
+    return tmp_path, strategy_path, config
+
+
+# ─── Curve replay order + no-cap-binding sizing (mutation hardening) ────────
+
+
+class TestCurveReplayOrderAndUncappedSizing:
+    def test_curve_credits_full_pnl_with_interleaved_exits(self, tmp_path):
+        """Multi-symbol run with interleaved exits: exit-order replay, full PnL.
+
+        Kills the mutants that replay in entry order or credit partial PnL —
+        both produce a final equity different from capital + sum(pnl) or a
+        scrambled timestamp sequence.
+        """
+        strategy_dir = tmp_path / "strategies"
+        strategy_dir.mkdir()
+        strategy_path = strategy_dir / "vbt_sizing_sma.py"
+        strategy_path.write_text(STRATEGY)
+
+        base = _deterministic_frame()
+        _write_ohlcv(tmp_path, "VSA", base)
+        _write_ohlcv(tmp_path, "VSB", base.iloc[:-10])
+
+        config = _config(tmp_path, symbols=["VSA", "VSB"])
+        result = VectorbtAdapter().run(config, str(strategy_path))
+        assert len(result.trades) >= 2
+
+        times = [pd.Timestamp(point.time) for point in result.equity_curve]
+        assert times == sorted(times), "curve timestamps must be non-decreasing"
+
+        expected_final = config.initial_capital + sum(t.pnl for t in result.trades)
+        assert result.equity_curve[-1].equity == pytest.approx(round(expected_final, 2)), (
+            "the last curve point must carry the full realized PnL of every trade"
+        )
+
+    def test_uncapped_risk_sizing_matches_risk_math(self, sizing_env):
+        """With no binding cap, the trade's notional equals its risk target.
+
+        Complements TestRiskTargetMath: pins the final_notional branch
+        (required <= binding) rather than only the quantity formula.
+        """
+        tmp_path, strategy_path = sizing_env
+        config = _config(
+            tmp_path,
+            risk_per_trade_pct=0.02,
+            max_position_pct=10.0,
+            max_leverage=10.0,
+        )
+        result = VectorbtAdapter().run(config, str(strategy_path))
+        assert result.trades
+        for trade in result.trades:
+            risk_math = trade.meta["risk_math"]
+            notional = trade.entry_price * trade.quantity
+            assert notional == pytest.approx(risk_math["final_notional"], rel=1e-6), (
+                "with no binding cap the position notional must equal the "
+                "risk-math final notional"
+            )
+            assert risk_math["capped_by_max_position"] is False
+            assert risk_math["capped_by_max_leverage"] is False
+
+
+# ─── Binding-cap and curve semantics with a tight leverage cap ──────────────
+
+
+class TestTightCapSizing:
+    def test_tight_leverage_caps_notional_exactly(self, sizing_env):
+        """max_leverage=1 with max_position_pct=10: notional == equity * 1.0.
+
+        Kills the min→max mutant: with max() the notional would follow the
+        position cap (10x) instead of the leverage limit (1x).
+        """
+        tmp_path, strategy_path = sizing_env
+        config = _config(
+            tmp_path,
+            risk_per_trade_pct=0.5,   # huge risk target, cap must bind
+            max_position_pct=10.0,
+            max_leverage=1.0,
+        )
+        result = VectorbtAdapter().run(config, str(strategy_path))
+        assert result.trades
+        for trade in result.trades:
+            risk_math = trade.meta["risk_math"]
+            notional = trade.entry_price * trade.quantity
+            assert notional <= risk_math["equity_at_entry"] * 1.0 + 1e-6, (
+                "the leverage limit (1x) must bind the notional even when the "
+                "position cap is 10x"
+            )
+            assert risk_math["capped_by_max_leverage"] is True
+
+    def test_tight_position_cap_binds_before_leverage(self, sizing_env):
+        """max_position_pct=0.01 with huge risk target: notional == 1% equity."""
+        tmp_path, strategy_path = sizing_env
+        config = _config(
+            tmp_path,
+            risk_per_trade_pct=0.5,
+            max_position_pct=0.01,
+            max_leverage=10.0,
+        )
+        result = VectorbtAdapter().run(config, str(strategy_path))
+        assert result.trades
+        for trade in result.trades:
+            risk_math = trade.meta["risk_math"]
+            notional = trade.entry_price * trade.quantity
+            slack = 0.01 + 1e-9
+            assert notional <= risk_math["equity_at_entry"] * 0.01 + slack, (
+                "the position cap (1%) must bind the notional even when "
+                "leverage would allow more"
+            )
+            assert risk_math["capped_by_max_position"] is True
+
+
+class TestTightCapSizingTolerance:
+    def test_tight_position_cap_binds_before_leverage_tolerant(self, sizing_env):
+        """Position cap binds the notional within rounding tolerance.
+
+        Rounding tolerance note: ``quantity`` is rounded to 4 decimals and
+        prices to 6, so the notional can exceed the cap by a fraction of a
+        cent; the assertion therefore allows a tiny relative slack.
+        """
+        tmp_path, strategy_path = sizing_env
+        config = _config(
+            tmp_path,
+            risk_per_trade_pct=0.5,
+            max_position_pct=0.01,
+            max_leverage=10.0,
+        )
+        result = VectorbtAdapter().run(config, str(strategy_path))
+        assert result.trades
+        for trade in result.trades:
+            risk_math = trade.meta["risk_math"]
+            notional = trade.entry_price * trade.quantity
+            slack = 0.01 + 1e-9  # one cent for rounding
+            assert notional <= risk_math["equity_at_entry"] * 0.01 + slack, (
+                "the position cap (1%) must bind the notional even when "
+                "leverage would allow more (rounding slack: one cent)"
+            )
+            assert risk_math["capped_by_max_position"] is True
