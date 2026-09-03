@@ -145,7 +145,7 @@ def _list_tables(repo_path: Path) -> list[str]:
             capture=True,
         )
     except (subprocess.CalledProcessError, DoltTimeoutError) as exc:
-        logger.error(f"Failed to list tables in {repo_path}: {exc}")
+        logger.exception("Failed to list tables in %s: %s", repo_path, exc)
         return []
     lines = result.stdout.strip().split("\n")
     # First line is header (Tables_in_{dbname}), rest are table names

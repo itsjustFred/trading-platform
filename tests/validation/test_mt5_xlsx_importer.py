@@ -324,13 +324,15 @@ class TestDirectionRequiresTypColumn:
 
     def test_missing_typ_column_raises(self, tmp_path: Path):
         path = self._write_report(tmp_path, include_typ=False)
-        with pytest.raises(ValueError, match="Typ"):
+        with pytest.raises(ValueError, match="Typ") as excinfo:
             MT5XLSXImporter().load(path)
+        assert "Typ" in str(excinfo.value)
 
     def test_unsupported_entry_typ_raises(self, tmp_path: Path):
         path = self._write_report(tmp_path, include_typ=True, typ_value="buy limit")
-        with pytest.raises(ValueError, match="buy limit"):
+        with pytest.raises(ValueError, match="buy limit") as excinfo:
             MT5XLSXImporter().load(path)
+        assert "buy limit" in str(excinfo.value)
 
 
 class TestGermanNumberParsing:

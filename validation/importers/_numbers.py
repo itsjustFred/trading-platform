@@ -40,6 +40,47 @@ def detect_decimal_comma(values: list[str | None]) -> bool:
     return False
 
 
+def _split_german(text: str, last_comma: int) -> tuple[str, str] | None:
+    """Split a German-convention value into (integer digits, fraction digits).
+
+    Returns ``None`` when the value cannot be split unambiguously.
+    """
+    if last_comma != -1:
+        # The comma is the decimal mark; dots can only be group separators.
+        digits = text[:last_comma].replace(".", "")
+        decimal = text[last_comma + 1 :]
+        if "," in decimal or len(decimal) > 4:
+            return None
+        return digits, decimal
+
+    # Dot only: thousands group when the digits group by three,
+    # decimal mark otherwise ("1.08500" stays 1.085).
+    if _GROUPED_DOT.match(text):
+        return text.replace(".", ""), ""
+    if text.count(".") != 1:
+        return None
+    digits, _, decimal = text.partition(".")
+    return digits, decimal
+
+
+def _split_ascii(text: str, last_dot: int) -> tuple[str, str] | None:
+    """Split an ASCII-convention value into (integer digits, fraction digits).
+
+    Returns ``None`` when the value cannot be split unambiguously.
+    """
+    if last_dot != -1:
+        # The dot is the decimal mark; commas can only be group separators.
+        if text.count(".") != 1:
+            return None
+        digits = text[:last_dot].replace(",", "")
+        decimal = text[last_dot + 1 :]
+        return digits, decimal
+    if text.count(",") != 1:
+        return None
+    digits, _, decimal = text.partition(",")
+    return digits, decimal
+
+
 def parse_locale_number(raw: str | None, decimal_comma: bool) -> float | None:
     """Parse a locale-formatted number into a float.
 
@@ -72,36 +113,17 @@ def parse_locale_number(raw: str | None, decimal_comma: bool) -> float | None:
     last_dot = text.rfind(".")
 
     if last_comma == -1 and last_dot == -1:
-        digits = text
-        decimal = ""
+        digits, decimal = text, ""
     elif decimal_comma:
-        # German convention: comma is the decimal mark when present.
-        if last_comma != -1:
-            digits = text[:last_comma].replace(".", "")
-            decimal = text[last_comma + 1 :]
-            if "," in decimal or len(decimal) > 4:
-                return None
-        else:
-            # Dot only: thousands group when the digits group by three,
-            # decimal mark otherwise ("1.08500" stays 1.085).
-            if _GROUPED_DOT.match(text):
-                digits = text.replace(".", "")
-                decimal = ""
-            else:
-                if text.count(".") != 1:
-                    return None
-                digits, _, decimal = text.partition(".")
+        split = _split_german(text, last_comma)
+        if split is None:
+            return None
+        digits, decimal = split
     else:
-        # ASCII convention: dot is the decimal mark, commas are grouping.
-        if last_dot != -1:
-            if text.count(".") != 1:
-                return None
-            digits = text[:last_dot].replace(",", "")
-            decimal = text[last_dot + 1 :]
-        else:
-            if text.count(",") != 1:
-                return None
-            digits, _, decimal = text.partition(",")
+        split = _split_ascii(text, last_dot)
+        if split is None:
+            return None
+        digits, decimal = split
 
     if not digits or not digits.isdigit():
         return None
