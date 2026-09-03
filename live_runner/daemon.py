@@ -515,7 +515,9 @@ def size_live_signal_for_submission(
     metadata: dict[str, object] = dict(signal.metadata or {})
     if current_positions is not None:
         metadata["current_positions"] = int(current_positions)
-    stop_loss = _first_metadata_float(metadata, ("stop_loss", "sl_price", "stop_price"))
+    stop_loss = _first_metadata_float(
+        metadata, ("stop_loss", "sl_price", "stop_price", "resolved_stop_loss")
+    )
     take_profit = _first_metadata_float(metadata, ("take_profit", "tp_price"))
     resolved_timeframe = (
         str(metadata.get("timeframe") or deployment.timeframe).strip() or deployment.timeframe
