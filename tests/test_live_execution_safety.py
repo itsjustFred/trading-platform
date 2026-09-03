@@ -395,7 +395,6 @@ def test_alpaca_extended_hours_entries_fail_closed():
         qty=1.0,
         order_side=SimpleNamespace(BUY="buy", SELL="sell"),
         time_in_force=SimpleNamespace(DAY="day"),
-        limit_request_cls=_fail_request_cls,
         market_request_cls=_fail_request_cls,
         client_order_id="cid-eh",
     )
@@ -422,9 +421,6 @@ def test_alpaca_regular_market_orders_carry_bracket_legs(monkeypatch):
     order_side = SimpleNamespace(BUY="buy", SELL="sell")
     time_in_force = SimpleNamespace(DAY="day")
 
-    def _limit_request_cls(**kwargs):
-        return ("limit", kwargs)
-
     def _market_request_cls(**kwargs):
         return ("market", kwargs)
 
@@ -434,7 +430,6 @@ def test_alpaca_regular_market_orders_carry_bracket_legs(monkeypatch):
             qty=2.0,
             order_side=order_side,
             time_in_force=time_in_force,
-            limit_request_cls=_limit_request_cls,
             market_request_cls=_market_request_cls,
             client_order_id=client_order_id,
         )
@@ -2415,7 +2410,6 @@ def test_alpaca_build_order_request_rejects_unknown_signal_action():
         qty=1.0,
         order_side=SimpleNamespace(BUY="buy", SELL="sell"),
         time_in_force=SimpleNamespace(DAY="day"),
-        limit_request_cls=lambda **kw: ("limit", kw),
         market_request_cls=lambda **kw: ("market", kw),
         client_order_id="cid-unknown-action",
     )
@@ -2591,7 +2585,6 @@ def test_alpaca_build_order_request_carries_bracket_legs():
         qty=2.0,
         order_side=SimpleNamespace(BUY="buy", SELL="sell"),
         time_in_force=SimpleNamespace(DAY="day"),
-        limit_request_cls=lambda **kwargs: ("limit", kwargs),
         market_request_cls=lambda **kwargs: ("market", kwargs),
         client_order_id="cid-bracket",
     )
@@ -2645,6 +2638,130 @@ def test_exit_only_orders_still_bypass_sizing_but_close_exact_position():
     assert adapter.submitted_signal is not None
     assert adapter.submitted_signal.metadata["explicit_qty"] == pytest.approx(3.0)
     assert adapter.submitted_signal.metadata["risk_sizing_mode"] == "exit_only"
+
+
+def test_trade_signal_conversion_rejects_unknown_action_instead_of_selling():
+    """The daemon-side conversion site must whitelist, not default: an action
+    outside {buy, long, sell, short} is rejected rather than mapped to SELL."""
+    from live_runner.daemon import _trade_signal_to_live_signal
+
+    deployment = _deployment()
+    base = TradeSignal(
+        action="sell", symbol="AAPL", entry_price=100.0, stop_loss=None,
+        take_profit=None, timeframe="1h", metadata={},
+    )
+    close = object.__new__(TradeSignal)
+    for field_name, value in (
+        ("action", "close"),
+        ("symbol", "AAPL"),
+        ("entry_price", 100.0),
+        ("stop_loss", None),
+        ("take_profit", None),
+        ("timeframe", "1h"),
+        ("metadata", {}),
+    ):
+        object.__setattr__(close, field_name, value)
+
+    with pytest.raises(ValueError, match="Unsupported signal action"):
+        _trade_signal_to_live_signal(close, deployment)
+
+    converted = _trade_signal_to_live_signal(base, deployment)
+    assert converted.action == "sell"
+
+
+def test_alpaca_exit_only_orders_bypass_entry_sl_tp_guard():
+    """Exit-only closes reduce exposure and carry no SL/TP; the adapter's
+    entry guard must not block them, and the order must go out as a plain
+    market order without bracket legs."""
+    from live_runner import alpaca_adapter as module
+
+    adapter = module.AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True)
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="AAPL",
+        action="sell",
+        theoretical_price=100.0,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"qty": 3.0, "risk_sizing_mode": "exit_only"},
+    )
+
+    request = adapter._build_order_request(
+        signal,
+        qty=3.0,
+        order_side=SimpleNamespace(BUY="buy", SELL="sell"),
+        time_in_force=SimpleNamespace(DAY="day"),
+        market_request_cls=lambda **kwargs: ("market", kwargs),
+        client_order_id="cid-exit",
+    )
+
+    kind, kwargs = request
+    assert kind == "market"
+    assert kwargs["qty"] == pytest.approx(3.0)
+    assert kwargs["order_class"] is module.OrderClass.SIMPLE
+    assert kwargs["take_profit"] is None
+    assert kwargs["stop_loss"] is None
+
+
+def test_alpaca_entry_guard_still_blocks_naked_non_exit_orders():
+    """The exit-only bypass must not open a hole: a plain entry without SL/TP
+    is still refused."""
+    from live_runner import alpaca_adapter as module
+
+    adapter = module.AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True)
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="AAPL",
+        action="buy",
+        theoretical_price=100.0,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"qty": 2.0},
+    )
+
+    builder = adapter._build_order_request
+    with pytest.raises(ValueError, match="without stop_loss"):
+        builder(
+            signal,
+            qty=2.0,
+            order_side=SimpleNamespace(BUY="buy", SELL="sell"),
+            time_in_force=SimpleNamespace(DAY="day"),
+            market_request_cls=lambda **kwargs: ("market", kwargs),
+            client_order_id="cid-naked-entry",
+        )
+
+
+def test_ctrader_exit_only_orders_bypass_entry_sl_tp_guard():
+    """Exit-only closes carry no SL/TP and must not set relative distances."""
+    module, adapter = _make_ctrader_request_builder_adapter()
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="AAPL",
+        action="sell",
+        theoretical_price=100.0,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"ctrader_volume": 3000, "risk_sizing_mode": "exit_only"},
+    )
+
+    request = adapter._build_new_order_request(signal, symbol_id=7)
+
+    assert not hasattr(request, "relativeStopLoss") or request.relativeStopLoss == 0
+    assert not hasattr(request, "relativeTakeProfit") or request.relativeTakeProfit == 0
+
+
+def test_ctrader_entry_guard_still_blocks_naked_non_exit_orders():
+    """The exit-only bypass must not open a hole on cTrader either."""
+    module, adapter = _make_ctrader_request_builder_adapter()
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="AAPL",
+        action="buy",
+        theoretical_price=100.0,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"qty": 2.0},
+    )
+
+    builder = adapter._build_new_order_request
+    with pytest.raises(ValueError, match="without stop_loss"):
+        builder(signal, symbol_id=7)
 
 
 def test_submit_order_with_risk_resolves_fallback_sl_tp_into_metadata():

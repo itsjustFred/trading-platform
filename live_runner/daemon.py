@@ -731,11 +731,25 @@ def _trade_signal_to_live_signal(
     if signal.action in {"sell", "short"} and not _deployment_allows_short(deployment):
         metadata["exit_only"] = True
         metadata["risk_sizing_mode"] = "exit_only"
+    # Whitelist at the conversion site itself (B-2): never default an unmapped
+    # action to SELL. The TradeSignal Literal gates construction today, but a
+    # future loosening (e.g. adding "close") must not silently become a live
+    # short — reject it here with a structured reason.
+    if signal.action in {"buy", "long"}:
+        live_action = "buy"
+    elif signal.action in {"sell", "short"}:
+        live_action = "sell"
+    else:
+        raise ValueError(
+            f"Unsupported signal action at conversion: {signal.action!r} "
+            f"(symbol={signal.symbol}); refusing to "
+            "default it to a live order side."
+        )
     return LiveSignal(
         id=uuid.uuid4(),
         deployment_id=str(deployment.id),
         symbol=signal.symbol,
-        action="buy" if signal.action in {"buy", "long"} else "sell",
+        action=live_action,
         theoretical_price=float(signal.entry_price),
         timestamp=datetime.now(timezone.utc),
         metadata=metadata,

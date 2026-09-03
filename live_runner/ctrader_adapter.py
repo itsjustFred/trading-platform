@@ -1471,26 +1471,34 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             metadata, ("stop_loss", "sl_price", "stop_price", "resolved_stop_loss")
         )
         take_profit = _first_metadata_float(metadata, ("take_profit", "tp_price"))
+        exit_only = str(metadata.get("risk_sizing_mode") or "") == "exit_only"
         if stop_loss is None or take_profit is None:
-            # Fail closed: never open a position naked; sizing assumed a stop.
-            missing = [
-                name
-                for name, value in (("stop_loss", stop_loss), ("take_profit", take_profit))
-                if value is None
-            ]
-            raise ValueError(
-                "Refusing to submit cTrader order without "
-                f"{' and '.join(missing)} (signal_id={signal.id}, "
-                f"symbol={signal.symbol}); opening an unbounded position is not allowed."
+            if exit_only:
+                # Exit-only orders close an existing position; they reduce
+                # exposure and carry no entry SL/TP. Only OPENING orders are
+                # required to be bounded.
+                pass
+            else:
+                # Fail closed: never open a position naked; sizing assumed a stop.
+                missing = [
+                    name
+                    for name, value in (("stop_loss", stop_loss), ("take_profit", take_profit))
+                    if value is None
+                ]
+                raise ValueError(
+                    "Refusing to submit cTrader order without "
+                    f"{' and '.join(missing)} (signal_id={signal.id}, "
+                    f"symbol={signal.symbol}); opening an unbounded position is not allowed."
+                )
+        elif not exit_only:
+            # MARKET orders ignore absolute stopLoss/takeProfit ("Not supported for
+            # MARKET orders" per the Open API docs); send the distances via the
+            # relative fields, which the protocol accepts for MARKET orders.
+            relative_stop, relative_take = self._resolve_relative_sl_tp(
+                signal, stop_loss, take_profit
             )
-        # MARKET orders ignore absolute stopLoss/takeProfit ("Not supported for
-        # MARKET orders" per the Open API docs); send the distances via the
-        # relative fields, which the protocol accepts for MARKET orders.
-        relative_stop, relative_take = self._resolve_relative_sl_tp(
-            signal, stop_loss, take_profit
-        )
-        request.relativeStopLoss = relative_stop
-        request.relativeTakeProfit = relative_take
+            request.relativeStopLoss = relative_stop
+            request.relativeTakeProfit = relative_take
         return request
 
     def _resolve_relative_sl_tp(
@@ -1514,7 +1522,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             )
         scale = 100_000
 
-        def _distance(price: float, *, outward: bool) -> int:
+        def _distance(price: float) -> int:
             if math.isnan(price) or math.isinf(price) or price <= 0:
                 raise ValueError(
                     f"Invalid SL/TP price for {signal.symbol}: {price!r}; "
@@ -1535,7 +1543,6 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 )
             # Distance is signed by direction at the protocol level; the value
             # sent is always the positive magnitude in 1/100000 units.
-            del outward
             return int(round(raw))
 
         buy = signal.action == "buy"
@@ -1548,10 +1555,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 f"take_profit={take_profit!r}, reference={reference_price!r}; "
                 "refusing to submit."
             )
-        return (
-            _distance(stop_loss, outward=True),
-            _distance(take_profit, outward=True),
-        )
+        return (_distance(stop_loss), _distance(take_profit))
 
     async def _submit_new_order_request(self, request: Any) -> Any:
         try:
