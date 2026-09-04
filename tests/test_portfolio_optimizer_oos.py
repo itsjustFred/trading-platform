@@ -1,7 +1,6 @@
 """Tests for portfolio optimizer OOS (Out-of-Sample) validation feature."""
 
 import numpy as np
-from sqlmodel import SQLModel, create_engine
 
 from runner.portfolio_optimizer import (
     StrategyEquityPoint,
@@ -554,19 +553,12 @@ def test_portfolio_optimizer_with_train_months_oos_split(monkeypatch, tmp_path) 
     assert "sharpe" in result  # In-sample Sharpe
 
 
-def test_load_strategy_equity_reads_sqlite_first(monkeypatch, tmp_path) -> None:
+def test_load_strategy_equity_reads_sqlite_first(isolated_db_sandbox) -> None:
     """Portfolio optimizer should read canonical SQLite backtest results."""
     import runner.portfolio_optimizer as po_module
     import shared.database as database
 
-    engine = create_engine(
-        f"sqlite:///{(tmp_path / 'backtests.db').as_posix()}",
-        connect_args={"check_same_thread": False},
-    )
-    monkeypatch.setattr(database, "ENGINE", engine)
-    monkeypatch.setattr(database, "DATA_DIR", tmp_path / "data")
-    monkeypatch.setattr(database, "_DB_INITIALIZED", False)
-    SQLModel.metadata.create_all(engine)
+    _database_module, engine, _data_dir = isolated_db_sandbox
 
     database.save_result_to_sqlite(
         BacktestResult(

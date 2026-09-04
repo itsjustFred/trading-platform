@@ -30,7 +30,8 @@ def _fetch_latest_price(symbol: str, api_key: str, secret_key: str) -> float:
 async def _run(symbol: str, deployment_id: str, qty: float) -> None:
     adapter = AlpacaLiveAdapter(account_id=deployment_id)
     await adapter.connect()
-    assert adapter.api_key and adapter.secret_key
+    assert adapter.api_key
+    assert adapter.secret_key
     theoretical_price = _fetch_latest_price(symbol, adapter.api_key, adapter.secret_key)
 
     signal = LiveSignal(

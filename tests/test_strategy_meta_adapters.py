@@ -191,7 +191,8 @@ def test_all_vectorbt_strategies_return_entries_exits_and_indicators_dict():
         entries, exits, indicators = output[:3]
         assert len(pd.Series(entries)) == len(df), strategy_path.name
         assert len(pd.Series(exits)) == len(df), strategy_path.name
-        assert isinstance(indicators, dict) and indicators, strategy_path.name
+        assert isinstance(indicators, dict), strategy_path.name
+        assert indicators, strategy_path.name
         if len(output) == 4:
             assert isinstance(output[3], list), strategy_path.name
 

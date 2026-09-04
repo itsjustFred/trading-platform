@@ -14,7 +14,6 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from uuid import UUID, uuid4
@@ -96,8 +95,10 @@ def test_fallback_stop_is_below_entry_for_buys_and_above_for_sells():
         signal=sell, account_balance=10_000.0, pip_value=1.0, current_exposure=0.0
     )
 
-    assert buy.stop_loss is not None and buy.stop_loss < buy.entry_price
-    assert sell.stop_loss is not None and sell.stop_loss > sell.entry_price
+    assert buy.stop_loss is not None
+    assert buy.stop_loss < buy.entry_price
+    assert sell.stop_loss is not None
+    assert sell.stop_loss > sell.entry_price
 
 
 def test_fallback_stop_without_atr_is_percent_of_price():
@@ -230,6 +231,13 @@ def test_submit_order_with_risk_sizes_normally_when_flat():
     assert adapter.submitted_signal.metadata["qty"] == pytest.approx(200.0)
 
 
+def _submit_signal(adapter, signal):
+    """Single possibly-throwing invocation for S5778-clean exception tests:
+    ``pytest.raises`` blocks below call this helper instead of nesting
+    ``asyncio.run`` inside argument construction."""
+    return asyncio.run(adapter.submit_order(signal))
+
+
 def test_alpaca_submit_order_blocks_non_positive_quantity(monkeypatch):
     """Kills mutant: relaxing the qty <= 0 guard to qty < 0."""
     from live_runner import alpaca_adapter as module
@@ -258,7 +266,7 @@ def test_alpaca_submit_order_blocks_non_positive_quantity(monkeypatch):
     )
 
     with pytest.raises(ValueError, match="non-positive quantity"):
-        asyncio.run(adapter.submit_order(signal))
+        _submit_signal(adapter, signal)
 
 
 def test_alpaca_extended_hours_without_positive_limit_price_raises(monkeypatch):
@@ -437,7 +445,7 @@ def test_alpaca_discord_redelivery_submits_once_with_canonical_signal_id(monkeyp
 
     assert asyncio.run(adapter.submit_order(first)) == "alpaca-order-1"
     with pytest.raises(RuntimeError, match="canonical signal already exists"):
-        asyncio.run(adapter.submit_order(redelivery))
+        _submit_signal(adapter, redelivery)
 
     assert len(submitted_requests) == 1
     assert submitted_requests[0].client_order_id == canonical_signal_id
@@ -576,7 +584,7 @@ def test_alpaca_broker_order_id_persistence_failure_is_not_success(monkeypatch):
     monkeypatch.setattr(module, "set_live_signal_broker_order_id", _fail_persistence)
 
     with pytest.raises(RuntimeError, match="Failed to persist Alpaca broker order id"):
-        asyncio.run(adapter.submit_order(signal))
+        _submit_signal(adapter, signal)
 
     assert persistence_calls == [(canonical_signal_id, "alpaca-order-2")]
 
@@ -595,10 +603,12 @@ def test_ctrader_volume_rejects_missing_and_below_minimum_qty():
             metadata=metadata,
         )
 
+    missing_qty = _signal({})
     with pytest.raises(ValueError, match="no positive quantity"):
-        adapter._resolve_order_volume(_signal({}))
+        adapter._resolve_order_volume(missing_qty)
+    below_minimum = _signal({"qty": 0.07})
     with pytest.raises(ValueError, match="below the broker minimum"):
-        adapter._resolve_order_volume(_signal({"qty": 0.07}))
+        adapter._resolve_order_volume(below_minimum)
     assert adapter._resolve_order_volume(_signal({"qty": 5.0})) == 5000
     assert adapter._resolve_order_volume(_signal({"ctrader_volume": 2000})) == 2000
     assert adapter._resolve_order_volume(_signal({"qty": 499.999, "ctrader_volume": 100000})) == 100000
@@ -619,20 +629,13 @@ def test_processor_market_data_refuses_synthetic_fabrication():
 # ── Persistence durability / idempotency / recovery reads ─────────────────────
 
 
-@pytest.fixture()
-def isolated_db(monkeypatch, tmp_path: Path):
-    import shared.database as database
-
-    engine = database.create_engine(
-        f"sqlite:///{(tmp_path / 'test.db').as_posix()}",
-        connect_args={"check_same_thread": False},
-    )
-    database.event.listen(engine, "connect", database._configure_sqlite_connection)
-    monkeypatch.setattr(database, "ENGINE", engine)
-    monkeypatch.setattr(database, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(database, "_DB_INITIALIZED", False)
-    yield database
-    engine.dispose()
+@pytest.fixture
+def isolated_db(isolated_db_sandbox):
+    """Delegates to the shared sandbox fixture but yields the database module
+    directly, so these persistence tests keep their ``database = isolated_db``
+    style."""
+    database, _engine, _data_dir = isolated_db_sandbox
+    return database
 
 
 def _persist_signal(database: Any) -> LiveSignal:
@@ -712,6 +715,9 @@ def test_save_live_signal_scopes_discord_claim_by_deployment(isolated_db):
 
 
 def _legacy_live_signal_table(database: Any, *, table_unique: bool = False) -> None:
+    """Drop any schema the sandbox pre-created, then lay down the legacy table
+    these migration tests start from."""
+    database.SQLModel.metadata.drop_all(database.ENGINE)
     unique_clause = ", UNIQUE(discord_message_id)" if table_unique else ""
     with database.ENGINE.begin() as connection:
         connection.execute(
@@ -1534,12 +1540,9 @@ def test_alpaca_reconcile_backfills_missing_fill(monkeypatch):
     assert saved[0][1] == 25.0
 
 
-def test_alpaca_reconcile_pages_past_candidate_limit(monkeypatch):
-    from live_runner import alpaca_adapter as module
-
-    adapter = module.AlpacaLiveAdapter(
-        api_key="k", secret_key="s", paper=True, account_id="alpaca-acc-1"
-    )
+def _paging_scenario(monkeypatch, module):
+    """Shared five-signal cursor-paging fixture for the two
+    ``reconcile_executions`` paging tests. Returns (signal_ids, cursors, queried)."""
     signal_ids = [str(uuid4()) for _ in range(5)]
     cursors = {
         signal_id: (datetime(2026, 7, 15, 10, minute, tzinfo=timezone.utc), signal_id)
@@ -1564,6 +1567,16 @@ def test_alpaca_reconcile_pages_past_candidate_limit(monkeypatch):
         lambda signal_id: cursors[signal_id],
         raising=False,
     )
+    return signal_ids, cursors, queried
+
+
+def test_alpaca_reconcile_pages_past_candidate_limit(monkeypatch):
+    from live_runner import alpaca_adapter as module
+
+    adapter = module.AlpacaLiveAdapter(
+        api_key="k", secret_key="s", paper=True, account_id="alpaca-acc-1"
+    )
+    signal_ids, cursors, queried = _paging_scenario(monkeypatch, module)
     monkeypatch.setattr(module, "get_live_signal_filled_qty", lambda _signal_id: 0.0)
     monkeypatch.setattr(
         module, "save_live_execution_up_to_cumulative", lambda execution, _cap: execution.filled_qty
@@ -1749,30 +1762,7 @@ def test_ctrader_reconcile_pages_past_candidate_limit(monkeypatch):
     module, adapter = _make_ctrader_adapter()
     adapter._client = object()
     adapter._authenticated = True
-    signal_ids = [str(uuid4()) for _ in range(5)]
-    cursors = {
-        signal_id: (datetime(2026, 7, 15, 10, minute, tzinfo=timezone.utc), signal_id)
-        for minute, signal_id in enumerate(signal_ids)
-    }
-    queried: list[tuple[str, int, tuple[datetime, str] | None]] = []
-
-    def list_page(account_id, limit, *, before=None):
-        queried.append((account_id, limit, before))
-        if before is None:
-            return signal_ids[:2]
-        if before == cursors[signal_ids[1]]:
-            return signal_ids[2:4]
-        if before == cursors[signal_ids[3]]:
-            return signal_ids[4:]
-        return []
-
-    monkeypatch.setattr(module, "list_live_signal_ids_for_reconciliation", list_page)
-    monkeypatch.setattr(
-        module,
-        "get_live_signal_reconciliation_cursor",
-        lambda signal_id: cursors[signal_id],
-        raising=False,
-    )
+    signal_ids, cursors, queried = _paging_scenario(monkeypatch, module)
     order_ids = {signal_id: str(45000 + index) for index, signal_id in enumerate(signal_ids)}
     monkeypatch.setattr(
         module, "get_live_signal_broker_order_id", lambda signal_id: order_ids[signal_id]
@@ -1971,8 +1961,10 @@ def test_ctrader_redelivery_with_persisted_order_id_needs_no_broker_connection(
     assert adapter._order_id_to_signal_id == {45678: str(signal.id)}
 
 
-def test_ctrader_redelivery_recovers_accepted_order_without_resubmitting(monkeypatch):
-    """A persisted signal with an accepted broker order must not submit twice."""
+def _make_ctrader_redelivery_adapter(monkeypatch, *, persist_result):
+    """Authenticated cTrader adapter with balance/sizing/persistence stubs —
+    shared by the two cTrader redelivery tests below. Yields (module, adapter,
+    signal) and lets the caller decide what ``save_live_signal`` returns."""
     module, adapter = _make_ctrader_adapter()
     adapter._client = object()
     adapter._connected = True
@@ -1997,7 +1989,15 @@ def test_ctrader_redelivery_recovers_accepted_order_without_resubmitting(monkeyp
         "size_live_signal",
         lambda _signal, *, account_balance: SimpleNamespace(risk_percent=0.01),
     )
-    monkeypatch.setattr(module, "save_live_signal", lambda _signal: None)
+    monkeypatch.setattr(module, "save_live_signal", lambda _signal: persist_result)
+    return module, adapter, signal
+
+
+def test_ctrader_redelivery_recovers_accepted_order_without_resubmitting(monkeypatch):
+    """A persisted signal with an accepted broker order must not submit twice."""
+    module, adapter, signal = _make_ctrader_redelivery_adapter(
+        monkeypatch, persist_result=None
+    )
     monkeypatch.setattr(module, "get_live_signal_broker_order_id", lambda _sid: "")
     monkeypatch.setattr(
         module,
@@ -2060,29 +2060,8 @@ def test_ctrader_redelivery_recovers_accepted_order_without_resubmitting(monkeyp
 
 def test_ctrader_accepted_order_fails_closed_when_local_id_persistence_fails(monkeypatch):
     """Broker acceptance must not be reported as durable when DB confirmation fails."""
-    module, adapter = _make_ctrader_adapter()
-    adapter._client = object()
-    adapter._connected = True
-    adapter._authenticated = True
-    adapter._symbol_name_to_id = {"EURUSD": 1}
-    signal = LiveSignal(
-        id=uuid4(),
-        deployment_id="dep-1",
-        symbol="EURUSD",
-        action="buy",
-        theoretical_price=1.1,
-        timestamp=datetime(2026, 7, 15, 10, 0, tzinfo=timezone.utc),
-        metadata={"qty": 1.0},
-    )
-
-    async def _balance() -> tuple[float, float]:
-        return 10_000.0, 10_000.0
-
-    adapter.get_balance = _balance
-    monkeypatch.setattr(
-        module,
-        "size_live_signal",
-        lambda _signal, *, account_balance: SimpleNamespace(risk_percent=0.01),
+    module, adapter, signal = _make_ctrader_redelivery_adapter(
+        monkeypatch, persist_result=None
     )
     monkeypatch.setattr(module, "get_live_signal_broker_order_id", lambda _sid: "")
     monkeypatch.setattr(module, "get_live_signal_timestamp", lambda _sid: None)
@@ -2117,7 +2096,7 @@ def test_ctrader_accepted_order_fails_closed_when_local_id_persistence_fails(mon
     adapter._ProtoOATimeInForce = SimpleNamespace(IMMEDIATE_OR_CANCEL=1)
 
     with pytest.raises(RuntimeError, match="persist cTrader broker order id"):
-        asyncio.run(adapter.submit_order(signal))
+        _submit_signal(adapter, signal)
 
     assert adapter._order_id_to_signal_id == {}
 
