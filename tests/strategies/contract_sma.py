@@ -1,4 +1,4 @@
-"""Deterministic EMA-crossover strategy used by the engine conformance tests.
+"""Deterministic SMA-crossover strategy used by the engine conformance tests.
 
 Same shape as ``strategies/example_sma`` but with SMA semantics so the
 bundled trend/consolidation fixture produces several crossover round-trips.
