@@ -107,6 +107,13 @@ def _normalize_author_ids(author_ids: Iterable[str] | None) -> set[str] | None:
     return {str(author_id).strip().lower() for author_id in author_ids if str(author_id).strip()}
 
 
+def _safe_message_id_int(message_id: str) -> int | None:
+    try:
+        return int(message_id)
+    except ValueError:
+        return None
+
+
 def _is_discord_auth_error(exc: BaseException | None) -> bool:
     if exc is None:
         return False
@@ -552,6 +559,34 @@ class DiscordSignalSource(BaseSignalSource):
         self._log_page_gap(channel_id, last_seen, messages)
         if not last_seen or int(newest) > int(last_seen):
             self._last_seen_message_ids[channel_id] = newest
+        self._prune_seen_ids(channel_id, seen, last_seen)
+
+    def _prune_seen_ids(self, channel_id: str, seen: set[str], poll_cursor: str) -> None:
+        """Bound the cumulative seen-set (pre-mortem mitigation).
+
+        The monotonic per-channel cursor makes any tracked id at or below the
+        poll-time cursor redundant: a repeated poll can never re-emit it,
+        because the id falls below the cursor check. Dropping those entries
+        keeps the burst-drain guarantee while the set stays bounded by the
+        live window. The poll-time cursor (not the just-advanced one) is used
+        so ids above it survive for the next poll.
+        """
+        if not poll_cursor:
+            return
+        try:
+            cursor = int(poll_cursor)
+        except ValueError:
+            return
+        seen.intersection_update(
+            message_id
+            for message_id in seen
+            if _safe_message_id_int(message_id) is None
+            or _safe_message_id_int(message_id) > cursor
+        )
+
+    @staticmethod
+    def _safe_message_id_value(message_id: str) -> int | None:
+        return _safe_message_id_int(message_id)
 
     def _log_page_gap(
         self,

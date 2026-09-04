@@ -298,6 +298,7 @@ def test_gap_detection_warns_with_channel_and_count(caplog) -> None:
 def test_no_gap_warning_on_contiguous_page() -> None:
     import asyncio
 
+
     source = _source()
     source._last_seen_message_ids["channel-1"] = "100000000000000099"
 
@@ -332,6 +333,68 @@ def test_no_gap_warning_on_contiguous_page() -> None:
         for record in records
         if "gap" in record.getMessage().lower() or "drop" in record.getMessage().lower()
     ]
+
+
+def test_seen_set_is_pruned_below_cursor_after_poll() -> None:
+    """Pre-mortem mitigation: the cumulative seen-set must not grow without
+    bound. Ids at or below the monotonic per-channel cursor are redundant (a
+    repeat poll can never re-emit them), so they are dropped after each poll
+    while everything above the cursor is retained for burst draining."""
+    import asyncio
+
+    source = _source()
+    source._seen_ids.setdefault("channel-1", set()).update(
+        {"100000000000000010", "100000000000000011", "100000000000000050"}
+    )
+    source._last_seen_message_ids["channel-1"] = "100000000000000050"
+
+    async def _fetch(_channel_id):
+        return [
+            {
+                "id": "100000000000000060",
+                "channel_id": "channel-1",
+                "timestamp": "2026-09-01T12:00:00Z",
+                "content": "RAM JET BUY AAPL @ 100.00",
+                "author": {"id": "bot-1", "bot": True},
+            }
+        ]
+
+    source._fetch_messages = _fetch
+    asyncio.run(source._poll_once("channel-1"))
+
+    assert source._seen_ids["channel-1"] == {
+        "100000000000000060",
+    }
+
+
+def test_seen_set_keeps_ids_above_cursor_for_burst_drain() -> None:
+    import asyncio
+
+    source = _source()
+    # No cursor yet: a first (priming) poll must keep every fetched id in the
+    # seen-set so a burst can drain across the following polls.
+    async def _fetch(_channel_id):
+        return [
+            {
+                "id": message_id,
+                "channel_id": "channel-1",
+                "timestamp": "2026-09-01T12:00:00Z",
+                "content": f"RAM JET BUY AAPL @ 100.0{index % 10}",
+                "author": {"id": "bot-1", "bot": True},
+            }
+            for index, message_id in enumerate(
+                ["100000000000000001", "100000000000000002", "100000000000000003"]
+            )
+        ]
+
+    source._fetch_messages = _fetch
+    asyncio.run(source._poll_once("channel-1", emit=False))
+
+    assert source._seen_ids["channel-1"] == {
+        "100000000000000001",
+        "100000000000000002",
+        "100000000000000003",
+    }
 
 
 # ── B-11: one signal may execute on every matching deployment ─────────────────
