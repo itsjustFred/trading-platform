@@ -59,15 +59,44 @@ def _pyne_cli_end_bound(end_date: str) -> str:
     same configuration.
 
     A date-only end date is translated to the inclusive end-of-day instant
-    (``2024-01-02T23:59:59.999999+00:00``), which the CLI parses and applies
-    as-is; a value that already carries a time component already states the
-    intended bound and is passed through unchanged.
+    (``"2024-01-01"`` → ``"2024-01-01T23:59:59.999999+00:00"``), which the CLI
+    parses and applies as-is; a value that already carries a time component
+    already states the intended bound and is passed through unchanged.
+
+    Timezone note: the translated instant carries an explicit ``+00:00``
+    offset, so the CLI's host-TZ handling (see
+    :func:`_pyne_cli_start_bound`) can never shift it.
     """
     raw = str(end_date or "").strip()
     if not raw:
         return raw
     if "T" not in raw and ":" not in raw:
         return contract.parse_date_bound(raw, is_end=True).isoformat()
+    return raw
+
+
+def _pyne_cli_start_bound(start_date: str) -> str:
+    """Translate a config start date into the ``pyne`` CLI's ``--from`` bound.
+
+    Conformance (Cleanup 16-A, F9): naive timestamps are interpreted as UTC.
+    The CLI, however, parses ``--from`` with ``datetime.fromisoformat`` and
+    resolves the resulting NAIVE datetime through ``timestamp()`` — i.e. in
+    the HOST timezone. A date-only ``--from 2024-01-01`` therefore lands at
+    ``2024-01-01T05:00Z`` on an ``America/New_York`` host and silently drops
+    the first five UTC bars of the day (verified against pynesys-pynecore
+    6.8.14): the replay window would depend on where the adapter runs, not on
+    the configuration.
+
+    Translating the date-only start to an AWARE UTC start-of-day instant
+    (``"2024-01-01"`` → ``"2024-01-01T00:00:00+00:00"``) makes the bound
+    host-TZ independent; a value that already carries a time component
+    already states the intended bound and is passed through unchanged.
+    """
+    raw = str(start_date or "").strip()
+    if not raw:
+        return raw
+    if "T" not in raw and ":" not in raw:
+        return contract.parse_date_bound(raw, is_end=False).isoformat()
     return raw
 
 
@@ -148,7 +177,10 @@ class PyneCoreAdapter(EngineAdapter):
                 ]
 
                 if config.start_date:
-                    cmd.extend(["--from", config.start_date])
+                    # Conformance (Cleanup 16-A, F9): naive timestamps are UTC —
+                    # a date-only start date must reach the CLI as an aware UTC
+                    # instant, not a host-TZ-naive string.
+                    cmd.extend(["--from", _pyne_cli_start_bound(config.start_date)])
                 if config.end_date:
                     # Conformance (Cleanup 16-A, F9): a date-only end date must
                     # not hit the CLI as a midnight bound — translate it to the

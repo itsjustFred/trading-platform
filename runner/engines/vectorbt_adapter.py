@@ -1057,45 +1057,17 @@ def _load_ohlcv(
 
 
 def _normalize_intrabar_resolution(value: str | None) -> str:
-    lowered = str(value or "open_close").strip().lower()
-    if lowered in {"", "open_close", "open-close", "open/close only", "open_close_only"}:
-        return "open_close"
-    if lowered in {"1-lower", "1 timeframe lower", "one-lower"}:
-        return "1-lower"
-    if lowered == "m1":
-        return "1m"
-    # Conformance (Cleanup 16-A): a named main-timeframe granularity ("1m",
-    # "5m", "15m", "30m", "1h", "4h", "1d") is a request for that intrabar
-    # resolution, not a silent downgrade to open/close modeling. Unknown
-    # spellings keep the conservative default.
-    if lowered in TIMEFRAME_ORDER:
-        return lowered
-    return "open_close"
+    # Conformance (Cleanup 16-A): the spelling convention lives in ONE place
+    # (contract.normalize_intrabar_resolution); this delegation keeps the
+    # module's private name for existing callers while guaranteeing vectorbt
+    # and the native engine can never normalize differently.
+    return contract.normalize_intrabar_resolution(value)
 
 
 def _resolve_intrabar_timeframe(base_timeframe: str, intrabar_resolution: str | None) -> str | None:
-    normalized = _normalize_intrabar_resolution(intrabar_resolution)
-    if normalized == "open_close":
-        return None
-
-    if normalized == "1-lower":
-        try:
-            base_index = TIMEFRAME_ORDER.index(base_timeframe)
-        except ValueError:
-            return None
-        if base_index <= 0:
-            return None
-        return TIMEFRAME_ORDER[base_index - 1]
-
-    try:
-        base_index = TIMEFRAME_ORDER.index(base_timeframe)
-        target_index = TIMEFRAME_ORDER.index(normalized)
-    except ValueError:
-        return None
-
-    if target_index >= base_index:
-        return None
-    return normalized
+    # Conformance (Cleanup 16-A, F8): same single-source resolver as native —
+    # the same configuration must load the same intrabar frame everywhere.
+    return contract.resolve_intrabar_timeframe(base_timeframe, intrabar_resolution)
 
 
 def _load_intrabar_ohlcv(

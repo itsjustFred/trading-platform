@@ -63,11 +63,22 @@ The rules are implemented once in
 `runner.engines.contract.parse_date_bound` / `contract.apply_date_filter` and
 consumed by the adapters (native, pynecore, vectorbt and signal-replay all
 filter through the shared helper). A date-only end bound must never drop the
-bars of the end date itself. Pynecore additionally passes the end bound to the
-external `pyne` CLI (`--to`); because the CLI treats a date-only value as a
-midnight bound, the adapter translates a date-only end date into the inclusive
-end-of-day instant before dispatch (`_pyne_cli_end_bound`), so pyne replays the
-same window as the other engines.
+bars of the end date itself.
+
+**Pynecore CLI bounds.** Pynecore additionally hands each symbol's frame to
+the external `pyne` CLI (`--from`/`--to`). The CLI parses those values with
+`datetime.fromisoformat` and resolves a NAIVE result through `timestamp()` —
+i.e. in the **host timezone** — and a date-only `--to` lands on that day's
+midnight (verified against pynesys-pynecore 6.8.14: `--to 2024-01-01` replays
+only the `00:00` bar; under `TZ=America/New_York` a date-only `--from
+2024-01-01` lands on `05:00Z` and drops the first five UTC bars of the day).
+The adapter therefore translates BOTH bounds to timezone-aware UTC instants
+before dispatch — `_pyne_cli_end_bound` (date-only end → inclusive
+end-of-day) and `_pyne_cli_start_bound` (date-only start → UTC start-of-day) —
+so pyne replays the same window as the other engines **regardless of the host
+timezone**. Both translations live in `runner/engines/pynecore_adapter.py`
+and are pinned by `TestPyneCoreCliEndOfDayBoundary`, including a real-CLI run
+under `TZ=America/New_York`.
 
 ## 3. Same-bar stop/take-profit priority
 
@@ -99,13 +110,16 @@ Implementation:
   `"intrabar_unresolved"` (sub-bars exist but touch neither level).
 - Vectorbt: `_match_intrabar_exit_event` routes through the same helper per
   sub-bar. The intrabar resolution itself is honored as requested (`5m`,
-  `15m`, `1h`, `1-lower`, …); only unknown spellings fall back to
-  open/close modeling. Native resolves the SAME spellings the same way
-  (`_load_intrabar_data` maps `1-lower` to the next-lower named granularity,
-  like vectorbt's `_resolve_intrabar_timeframe`), so the same configuration
-  yields the same intrabar frame — and the same exits — on both engines
-  (pinned by conformance test
-  `test_native_engine_resolves_one_lower_like_vectorbt`). vectorbt schedules
+  `15m`, `1h`, `1-lower`, `m1`, …); only unknown spellings fall back to
+  open/close modeling. The spelling convention lives in exactly ONE place —
+  `runner.engines.contract.normalize_intrabar_resolution` /
+  `resolve_intrabar_timeframe` — and BOTH vectorbt and native resolve through
+  it (`BacktestConfig` additionally canonicalizes alias spellings such as
+  `m1`/`M1` at the config boundary, so no adapter can receive a spelling it
+  might interpret differently). The same configuration therefore yields the
+  same intrabar frame — and the same exits — on every engine (pinned by
+  `test_native_and_vectorbt_resolve_the_same_intrabar_spellings` and
+  `test_spellings_pinned_against_one_shared_table`). vectorbt schedules
   exits at the next bar's open (F10), so it never faces the same-bar
   ambiguity on its main frame and therefore needs no fallback flag.
 - Signal replay: `_process_protective_exits` walks bars chronologically and

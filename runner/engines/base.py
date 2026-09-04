@@ -13,6 +13,7 @@ from typing import Any, Callable
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from runner.engines import contract
 from shared.models import VALID_TIMEFRAMES, BacktestResult
 from shared.strategy_registry import load_strategy_meta
 
@@ -63,13 +64,21 @@ class BacktestConfig(BaseModel):
     @field_validator("modeling_resolution")
     @classmethod
     def _validate_resolution(cls, v: str) -> str:
-        if v in VALID_TIMEFRAMES:
+        # Conformance (Cleanup 16-A, F8): the shared intrabar-spelling table in
+        # contract.py is the single authority on what a spelling means. Alias
+        # spellings it resolves to a concrete timeframe ("m1" → "1m") are
+        # accepted and canonicalized HERE so no adapter can ever receive a
+        # spelling it might interpret differently; the documented values
+        # (main_timeframe, open_close, 1-lower, named granularities) pass
+        # through unchanged.
+        if v in VALID_RESOLUTIONS:
             return v
-        if v not in VALID_RESOLUTIONS:
-            raise ValueError(
-                f"Invalid modeling_resolution '{v}', must be one of {VALID_RESOLUTIONS}"
-            )
-        return v
+        normalized = contract.normalize_intrabar_resolution(v)
+        if normalized in VALID_TIMEFRAMES:
+            return normalized
+        raise ValueError(
+            f"Invalid modeling_resolution '{v}', must be one of {VALID_RESOLUTIONS}"
+        )
 
 
 def resolve_strategy_parameters(

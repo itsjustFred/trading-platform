@@ -29,13 +29,99 @@ from typing import Any, Mapping
 
 import pandas as pd
 
+from shared.models import VALID_TIMEFRAMES
+
 __all__ = [
     "apply_date_filter",
     "flag_missing_intrabar",
     "parse_date_bound",
     "resolve_same_bar_exit",
+    "normalize_intrabar_resolution",
+    "resolve_intrabar_timeframe",
     "EngineStatsKeys",
+    "TIMEFRAME_ORDER",
+    "ONE_LOWER_SPELLINGS",
 ]
+
+
+# ─── Intrabar resolution convention (F8) ────────────────────────────────────
+
+# The engine-wide granularity order (coarse "tick" … fine "1w"). Derived from
+# the shared timeframe list so the two can never disagree.
+TIMEFRAME_ORDER: list[str] = list(VALID_TIMEFRAMES)
+
+# Spellings that request the intrabar frame ONE granularity below the main
+# timeframe. This table is the single source of truth: every engine adapter
+# must normalize spellings through :func:`normalize_intrabar_resolution`
+# instead of keeping a private copy (a private copy is how the "m1" alias
+# ended up honored in one engine and dropped in another).
+ONE_LOWER_SPELLINGS = frozenset({"1-lower", "1 timeframe lower", "one-lower"})
+
+# Spellings that request NO intrabar walk (open/close modeling on the main
+# timeframe).
+OPEN_CLOSE_SPELLINGS = frozenset(
+    {"", "open_close", "open-close", "open/close only", "open_close_only"}
+)
+
+
+def normalize_intrabar_resolution(value: str | None) -> str:
+    """Normalize a ``modeling_resolution``/intrabar spelling (F8 convention).
+
+    The single spelling table for every engine:
+
+    - ``""``/``open_close`` and its aliases → ``"open_close"`` (no intrabar
+      walk);
+    - ``"1-lower"`` and aliases → ``"1-lower"`` (one granularity below the
+      main timeframe);
+    - ``"m1"`` → ``"1m"`` (alias honored identically everywhere);
+    - a named main-timeframe granularity → itself (a request for that
+      intrabar resolution, not a silent downgrade);
+    - anything else → ``"open_close"`` (the conservative default; unknown
+      spellings never invent a window).
+    """
+    lowered = str(value or "open_close").strip().lower()
+    if lowered in OPEN_CLOSE_SPELLINGS:
+        return "open_close"
+    if lowered in ONE_LOWER_SPELLINGS:
+        return "1-lower"
+    if lowered == "m1":
+        return "1m"
+    if lowered in TIMEFRAME_ORDER:
+        return lowered
+    return "open_close"
+
+
+def resolve_intrabar_timeframe(base_timeframe: str, intrabar_resolution: str | None) -> str | None:
+    """Resolve an intrabar spelling against a main timeframe (F8 convention).
+
+    Returns the intrabar timeframe to load, or ``None`` when no intrabar frame
+    applies (open/close modeling, an unresolvable spelling, or a resolution
+    not strictly finer than the main timeframe). Every engine resolves its
+    ``modeling_resolution`` through this function so the same configuration
+    loads the same intrabar frame everywhere.
+    """
+    normalized = normalize_intrabar_resolution(intrabar_resolution)
+    if normalized == "open_close":
+        return None
+
+    try:
+        base_index = TIMEFRAME_ORDER.index(str(base_timeframe).lower())
+    except ValueError:
+        return None
+
+    if normalized == "1-lower":
+        if base_index <= 0:
+            return None
+        return TIMEFRAME_ORDER[base_index - 1]
+
+    try:
+        target_index = TIMEFRAME_ORDER.index(normalized)
+    except ValueError:
+        return None
+
+    if target_index >= base_index:
+        return None
+    return normalized
 
 
 # ─── Date filter convention (F9) ────────────────────────────────────────────

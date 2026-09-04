@@ -18,14 +18,14 @@ from runner.engines.base import (
 from shared.constants import DATA_DIR
 from shared.models import BacktestMeta, BacktestResult, EquityPoint
 
-TIMEFRAME_ORDER = ["tick", "s1", "1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"]
+TIMEFRAME_ORDER = contract.TIMEFRAME_ORDER
 
-# Conformance (Cleanup 16-A, F8): spellings that request the intrabar frame one
-# granularity below the main timeframe. vectorbt resolves them in
-# ``_resolve_intrabar_timeframe``; the native loader must resolve them to the
-# same granularity or the same configuration produces stop-first fallback on
-# one engine and chronological resolution on the other.
-ONE_LOWER_SPELLINGS = frozenset({"1-lower", "1 timeframe lower", "one-lower"})
+# Conformance (Cleanup 16-A, F8): the intrabar-resolution convention (spelling
+# table + base→intrabar mapping) lives in ONE place, contract.py, and both the
+# native and vectorbt loaders resolve through it — a private per-adapter copy
+# is how the "m1" alias ended up honored in one engine and dropped in the
+# other.
+ONE_LOWER_SPELLINGS = contract.ONE_LOWER_SPELLINGS
 
 
 def _load_strategy_module(path: str):
@@ -70,22 +70,12 @@ def _load_intrabar_data(
     start: str,
     end: str,
 ) -> pd.DataFrame | None:
-    selected = (modeling_resolution or "").strip().lower()
-    if selected in {"", "main", "main_timeframe", "open_close", base_timeframe.lower()}:
-        return None
-    # Conformance (Cleanup 16-A, F8): "1-lower" requests the intrabar frame one
-    # granularity below the main timeframe — resolved like vectorbt's
-    # `_resolve_intrabar_timeframe` so every engine loads the same frame for
-    # the same input.
-    if selected in ONE_LOWER_SPELLINGS:
-        try:
-            base_index = TIMEFRAME_ORDER.index(base_timeframe.lower())
-        except ValueError:
-            return None
-        if base_index <= 0:
-            return None
-        selected = TIMEFRAME_ORDER[base_index - 1]
-    if not _is_finer(selected, base_timeframe.lower()):
+    # Conformance (Cleanup 16-A, F8): resolve the spelling through the shared
+    # resolver so native and vectorbt always agree on which intrabar frame a
+    # configuration requests ("1-lower" → next-lower granularity, "m1" → "1m",
+    # unknown spellings → no intrabar walk).
+    selected = contract.resolve_intrabar_timeframe(base_timeframe, modeling_resolution)
+    if not selected:
         return None
     return _load_ohlcv(data_root, symbol, selected, start, end)
 

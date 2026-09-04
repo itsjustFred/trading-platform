@@ -40,6 +40,7 @@ from runner.engines.contract import (
     apply_date_filter,
     flag_missing_intrabar,
     parse_date_bound,
+    resolve_intrabar_timeframe,
     resolve_same_bar_exit,
 )
 from runner.engines.native_adapter import NativeAdapter
@@ -47,6 +48,8 @@ from runner.engines.pynecore_adapter import (
     PyneCoreAdapter,
     _parse_stats_csv as _real_parse_stats_csv,
     _parse_trade_csv as _parse_pyne_trade_csv,
+    _pyne_cli_end_bound,
+    _pyne_cli_start_bound,
 )
 from runner.engines.signal_replay_adapter import (
     ReplaySignal,
@@ -55,7 +58,7 @@ from runner.engines.signal_replay_adapter import (
 )
 from runner.engines.vectorbt_adapter import VectorbtAdapter
 from runner.stats import compute_stats
-from shared.models import Trade, TradeExit
+from shared.models import VALID_TIMEFRAMES, Trade, TradeExit
 
 # ─── Shared fixture builders ─────────────────────────────────────────────────
 
@@ -694,6 +697,82 @@ def test_engines_agree_on_unresolvable_intrabar_spellings(tmp_path: Path):
         )
 
 
+def test_native_and_vectorbt_resolve_the_same_intrabar_spellings(tmp_path: Path):
+    """Conformance: native and vectorbt resolve every spelling identically.
+
+    Both adapters must agree for EVERY ``modeling_resolution`` spelling the
+    config validator accepts — including ``m1`` (an alias for ``1m`` that only
+    vectorbt normalized; native fell through to no-intrabar, diverging from
+    the documented "same spellings, same way"). The two engines must resolve
+    each spelling to the same intrabar timeframe (or both to none).
+    """
+    from runner.engines.vectorbt_adapter import _resolve_intrabar_timeframe
+
+    resolutions = [
+        "main_timeframe", "open_close", "1-lower", "m1",
+        *VALID_TIMEFRAMES,
+    ]
+    for resolution in resolutions:
+        for base in ("1h", "1d"):
+            cfg = BacktestConfig(
+                strategy_name="parity",
+                symbols=["X"],
+                timeframe=base,
+                start_date="2024-01-01",
+                end_date="2024-01-02",
+                modeling_resolution=resolution,
+            )
+            # The config validator canonicalizes aliases; both engines then
+            # resolve the SAME canonical spelling through the SAME shared
+            # resolver, so parity is asserted at the resolver level.
+            native_tf = resolve_intrabar_timeframe(base, cfg.modeling_resolution)
+            vectorbt_tf = _resolve_intrabar_timeframe(base, cfg.modeling_resolution)
+            assert (native_tf or None) == (vectorbt_tf or None), (
+                f"modeling_resolution={resolution!r} on {base}: native resolves "
+                f"{native_tf!r} but vectorbt resolves {vectorbt_tf!r} — "
+                "the spellings must resolve identically in every engine"
+            )
+
+    # The m1 alias must actually resolve to the 1m frame (the divergence the
+    # reviewer probed: native None, vectorbt 1m).
+    assert resolve_intrabar_timeframe("1h", "m1") == "1m"
+    assert resolve_intrabar_timeframe("1h", "M1") == "1m"
+
+
+def test_spellings_pinned_against_one_shared_table():
+    """The resolution convention lives in exactly one place.
+
+    Both engines must go through the SAME spelling table
+    (``contract.normalize_intrabar_resolution``); a private per-adapter copy
+    would let the two conventions drift apart again (exactly the ``m1``
+    divergence this test family pins).
+    """
+    import runner.engines.native_adapter as native_module
+    import runner.engines.vectorbt_adapter as vbt_module
+    from runner.engines import contract
+
+    # The shared table exists and behaves per the documented convention.
+    assert contract.normalize_intrabar_resolution("m1") == "1m"
+    assert contract.normalize_intrabar_resolution("1-lower") == "1-lower"
+    assert contract.normalize_intrabar_resolution("main_timeframe") == "open_close"
+    assert contract.normalize_intrabar_resolution("open_close") == "open_close"
+    assert contract.normalize_intrabar_resolution("unknown-spelling") == "open_close"
+    # Both adapters expose the SAME table object (no private copies).
+    assert native_module.ONE_LOWER_SPELLINGS is contract.ONE_LOWER_SPELLINGS
+    assert native_module.TIMEFRAME_ORDER is contract.TIMEFRAME_ORDER
+    # The config validator canonicalizes alias spellings before any adapter
+    # sees them, so per-adapter divergence is structurally impossible.
+    cfg = BacktestConfig(
+        strategy_name="pin",
+        symbols=["X"],
+        timeframe="1h",
+        start_date="2024-01-01",
+        end_date="2024-01-02",
+        modeling_resolution="M1",
+    )
+    assert cfg.modeling_resolution == "1m"
+
+
 # ─── Sizing (F3) ─────────────────────────────────────────────────────────────
 
 
@@ -1008,11 +1087,26 @@ class TestTotalBarsContract:
             )
 
 
-def _format_pyne_end_bound(end: str) -> str:
-    """Mirror of the adapter's CLI end-bound derivation (tested below)."""
-    from runner.engines.pynecore_adapter import _pyne_cli_end_bound
+def _stub_pyne_cli(captured: dict[str, list[str]], *, trade_csv_text: str = "", stats_csv_text: str = ""):
+    """A subprocess.run stand-in for PyneCoreAdapter: records the command and
+    writes the CSV outputs the adapter parses, without invoking the CLI."""
 
-    return _pyne_cli_end_bound(end)
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = list(cmd)
+        if trade_csv_text:
+            Path(cmd[cmd.index("--trade") + 1]).write_text(trade_csv_text)
+        if stats_csv_text:
+            Path(cmd[cmd.index("--strat") + 1]).write_text(stats_csv_text)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    return fake_run
+
+
+PYNE_EMPTY_TRADE_CSV = (
+    "Trade #,Bar Index,Type,Signal,Date/Time,Price USD,Contracts,"
+    "Profit USD,Profit %,Cumulative profit USD,Cumulative profit %,"
+    "Run-up USD,Run-up %,Drawdown USD,Drawdown %\n"
+)
 
 
 @pytest.mark.skipif(
@@ -1026,11 +1120,12 @@ class TestPyneCoreCliEndOfDayBoundary:
     The adapter hands each symbol's (already F9-filtered) frame to the external
     ``pyne`` CLI and passes ``end_date`` through as ``--to``. The CLI treats a
     date-only ``--to`` as a bound at that day's **midnight** (verified against
-    pynecore 0.1.x: ``pyne run … --to 2024-01-01`` replays only the 00:00 bar
-    of the end date, dropping 01:00–23:00) — exactly the midnight-truncation
-    the F9 Decision Record removed everywhere else. The adapter must therefore
-    translate a date-only end date into the CLI's inclusive end-of-day
-    equivalent, so pyne replays the same window as native/vectorbt.
+    pynesys-pynecore 6.8.14: ``pyne run … --to 2024-01-01`` replays only the
+    00:00 bar of the end date, dropping 01:00–23:00) — exactly the
+    midnight-truncation the F9 Decision Record removed everywhere else. The
+    adapter must therefore translate a date-only end date into the CLI's
+    inclusive end-of-day equivalent, so pyne replays the same window as
+    native/vectorbt.
     """
 
     # One round trip that CLOSES inside the end day: entry on the SMA(5/20)
@@ -1103,7 +1198,7 @@ def main(
 
     @staticmethod
     def _run_pyne(
-        tmp_path: Path, strategy_path: Path, csv_path: Path, end_bound: str
+        tmp_path: Path, strategy_path: Path, csv_path: Path, end_bound: str, start_bound: str = "2024-01-01"
     ) -> Path:
         workdir = tmp_path / "workdir"
         workdir.mkdir(exist_ok=True)
@@ -1118,7 +1213,7 @@ def main(
             str(strategy_path),
             str(csv_path),
             "--from",
-            "2024-01-01",
+            start_bound,
             "--to",
             end_bound,
             "--trade",
@@ -1149,10 +1244,10 @@ def main(
 
         # The adapter's end bound for end_date="2024-01-01" must be the
         # end-of-day instant, not the raw date string.
-        assert _format_pyne_end_bound("2024-01-01") == "2024-01-01T23:59:59.999999+00:00"
+        assert _pyne_cli_end_bound("2024-01-01") == "2024-01-01T23:59:59.999999+00:00"
 
         trade_csv = self._run_pyne(
-            tmp_path, strategy_path, csv_path, _format_pyne_end_bound("2024-01-01")
+            tmp_path, strategy_path, csv_path, _pyne_cli_end_bound("2024-01-01")
         )
         trades = _parse_pyne_trade_csv(trade_csv, "PARITY", 0)
         assert trades, "fixture must produce at least one trade"
@@ -1162,8 +1257,6 @@ def main(
         )
 
     def test_date_only_end_bound_translates_to_end_of_day(self):
-        from runner.engines.pynecore_adapter import _pyne_cli_end_bound
-
         assert _pyne_cli_end_bound("2024-01-01") == "2024-01-01T23:59:59.999999+00:00"
         # A bound that already carries a time component is used as-is (F9).
         assert _pyne_cli_end_bound("2024-01-01T14:30:00Z") == "2024-01-01T14:30:00Z"
@@ -1175,27 +1268,12 @@ def main(
         CLI then cuts at midnight, the pyne backtest window is a strict subset
         of the native/vectorbt window for the same configuration.
         """
-        from runner.engines.pynecore_adapter import _pyne_cli_end_bound
-
         data = self._pyne_fixture()
         _write_ohlcv(tmp_path, "PARITY", "1h", data)
         strategy_path = tmp_path / "contract_pyne_sma.py"
         strategy_path.write_text(self.PYNE_FIXTURE_PY)
 
         captured: dict[str, list[str]] = {}
-
-        def fake_run(cmd, **kwargs):
-            captured["cmd"] = cmd
-            trade_csv = Path(cmd[cmd.index("--trade") + 1])
-            trade_csv.write_text(
-                "Trade #,Bar Index,Type,Signal,Date/Time,Price USD,Contracts,"
-                "Profit USD,Profit %,Cumulative profit USD,Cumulative profit %,"
-                "Run-up USD,Run-up %,Drawdown USD,Drawdown %\n"
-            )
-            stats_csv = Path(cmd[cmd.index("--strat") + 1])
-            stats_csv.write_text("Metric,All USD\n")
-            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-
         cfg = _config(
             tmp_path,
             strategy_name="contract_pyne_sma",
@@ -1203,7 +1281,10 @@ def main(
             end_date="2024-01-01",
             parameters={},
         )
-        with patch("runner.engines.pynecore_adapter.subprocess.run", side_effect=fake_run):
+        with patch(
+            "runner.engines.pynecore_adapter.subprocess.run",
+            side_effect=_stub_pyne_cli(captured, stats_csv_text="Metric,All USD\n"),
+        ):
             PyneCoreAdapter().run(cfg, str(strategy_path))
 
         cmd = captured["cmd"]
@@ -1211,6 +1292,122 @@ def main(
         assert end_bound == _pyne_cli_end_bound("2024-01-01"), (
             "the adapter must translate a date-only end date into the CLI's "
             "end-of-day bound, otherwise pyne replays a truncated window"
+        )
+
+    def test_adapter_passes_utc_start_bound_to_the_cli(self, tmp_path: Path):
+        """A date-only start date must reach the CLI as an AWARE UTC instant.
+
+        The CLI parses ``--from`` with ``datetime.fromisoformat`` and resolves
+        the resulting NAIVE datetime through ``timestamp()`` — i.e. in the HOST
+        timezone. Under ``TZ=America/New_York`` a date-only ``--from
+        2024-01-01`` lands on 05:00Z and drops the first five UTC bars of the
+        day; the replay window then depends on where the adapter happens to
+        run. F9 fixes the convention: naive timestamps are UTC, so the adapter
+        must pass an aware UTC start-of-day instant (both bounds aware = host
+        TZ irrelevant).
+        """
+        data = self._pyne_fixture()
+        _write_ohlcv(tmp_path, "PARITY", "1h", data)
+        strategy_path = tmp_path / "contract_pyne_sma.py"
+        strategy_path.write_text(self.PYNE_FIXTURE_PY)
+
+        captured: dict[str, list[str]] = {}
+        cfg = _config(
+            tmp_path,
+            strategy_name="contract_pyne_sma",
+            start_date="2024-01-01",
+            end_date="2024-01-01",
+            parameters={},
+        )
+        with patch(
+            "runner.engines.pynecore_adapter.subprocess.run",
+            side_effect=_stub_pyne_cli(captured, stats_csv_text="Metric,All USD\n"),
+        ):
+            PyneCoreAdapter().run(cfg, str(strategy_path))
+
+        cmd = captured["cmd"]
+        start_bound = cmd[cmd.index("--from") + 1]
+        assert start_bound == _pyne_cli_start_bound("2024-01-01"), (
+            "the adapter must translate a date-only start date into an aware "
+            "UTC start-of-day instant, otherwise the replay window depends on "
+            "the host timezone"
+        )
+        # The instant must carry an explicit offset so the CLI's naive-parse
+        # host-TZ fallback can never apply.
+        assert "+" in start_bound or "Z" in start_bound, (
+            f"start bound {start_bound!r} must be timezone-aware"
+        )
+
+    def test_pyne_replays_the_same_window_in_a_western_tz(self, tmp_path: Path):
+        """Real-CLI TZ pin: the replay window must not move with the host TZ.
+
+        Runs the same fixture the UTC test runs, but with the process timezone
+        set to America/New_York. Pre-fix, the naive date-only ``--from``
+        shifted the window start to 05:00Z and the round trip inside the end
+        day vanished (0 trades instead of 2).
+        """
+        data = self._pyne_fixture()
+        csv_path = tmp_path / "parity_1h.csv"
+        data[["timestamp", "open", "high", "low", "close", "volume"]].to_csv(
+            csv_path, index=False
+        )
+        strategy_path = tmp_path / "contract_pyne_sma.py"
+        strategy_path.write_text(self.PYNE_FIXTURE_PY)
+
+        self._run_with_host_tz(
+            "America/New_York",
+            lambda: self._assert_round_trip_survives(tmp_path, strategy_path, csv_path),
+        )
+
+    # ── helpers ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _run_with_host_tz(tz_name: str, fn) -> None:
+        """Run ``fn`` with the process TZ set to ``tz_name`` (restored after)."""
+        import os
+        import time
+
+        old_tz = os.environ.get("TZ")
+        old_tzset = getattr(time, "tzset", None)
+        os.environ["TZ"] = tz_name
+        if old_tzset is not None:
+            old_tzset()
+        try:
+            fn()
+        finally:
+            if old_tz is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = old_tz
+            if old_tzset is not None:
+                old_tzset()
+
+    def _assert_round_trip_survives(
+        self, tmp_path: Path, strategy_path: Path, csv_path: Path
+    ) -> None:
+        from datetime import timezone
+
+        end_instant = (
+            pd.Timestamp(_pyne_cli_end_bound("2024-01-01"))
+            .to_pydatetime()
+            .astimezone(timezone.utc)
+        )
+        trade_csv = self._run_pyne(
+            tmp_path,
+            strategy_path,
+            csv_path,
+            _pyne_cli_end_bound("2024-01-01"),
+            start_bound=_pyne_cli_start_bound("2024-01-01"),
+        )
+        trades = _parse_pyne_trade_csv(trade_csv, "PARITY", 0)
+        assert trades, (
+            "the round trip inside the end day vanished — the replay window "
+            "moved with the host timezone (naive --from host-TZ resolution)"
+        )
+        last_exit = pd.Timestamp(trades[-1].exits[-1].time)
+        assert last_exit <= pd.Timestamp(end_instant), (
+            f"the last exit {last_exit} must land on the end day "
+            f"(<= {end_instant.isoformat()})"
         )
 
 
