@@ -24,6 +24,12 @@ logger = get_logger("live-runner")
 POLL_INTERVAL = 8
 POLL_LIMIT = 20
 
+# Retention window for the cumulative seen-set, in message ids. It must span
+# several consecutive POLL_LIMIT pages so a burst larger than POLL_LIMIT can
+# still drain across polls, and it must be wide enough that a repeat poll of
+# the live window (POLL_LIMIT ids) can never re-admit a pruned id.
+SEEN_ID_RETENTION = POLL_LIMIT * 10
+
 
 class DiscordAuthenticationError(RuntimeError):
     """Raised when Discord returns a terminal authentication error (401/403)."""
@@ -562,29 +568,35 @@ class DiscordSignalSource(BaseSignalSource):
         self._log_page_gap(channel_id, last_seen, messages)
         if not last_seen or int(newest) > int(last_seen):
             self._last_seen_message_ids[channel_id] = newest
-        self._prune_seen_ids(channel_id, seen, last_seen)
+        self._prune_seen_ids(channel_id, seen)
 
-    def _prune_seen_ids(self, channel_id: str, seen: set[str], poll_cursor: str) -> None:
+    def _prune_seen_ids(self, channel_id: str, seen: set[str]) -> None:
         """Bound the cumulative seen-set (pre-mortem mitigation).
 
-        The monotonic per-channel cursor makes any tracked id at or below the
-        poll-time cursor redundant: a repeated poll can never re-emit it,
-        because the id falls below the cursor check. Dropping those entries
-        keeps the burst-drain guarantee while the set stays bounded by the
-        live window. The poll-time cursor (not the just-advanced one) is used
-        so ids above it survive for the next poll.
+        The seen-set dedupes emits by itself, so it can NOT be pruned against
+        the monotonic cursor: on a quiet channel the newest message id IS the
+        cursor, and dropping ids at/below it re-admits that message on the very
+        next poll (a duplicate emit). Instead the set is bounded by a retention
+        window in message count — wide enough to keep the burst-drain
+        guarantee (several consecutive POLL_LIMIT pages) while still bounded.
+        Non-numeric ids are always kept: they cannot be ordered against the
+        window.
         """
-        if not poll_cursor:
+        if len(seen) <= SEEN_ID_RETENTION:
             return
-        try:
-            cursor = int(poll_cursor)
-        except ValueError:
-            return
-        seen.intersection_update(
+        # Newest-first window; non-numeric ids cannot be ordered against it
+        # and are always kept.
+        numeric = sorted(
+            (message_id for message_id in seen if _safe_message_id_int(message_id)),
+            key=_safe_message_id_int,
+        )
+        survivors = set(numeric[-SEEN_ID_RETENTION:])
+        survivors.update(
             message_id
             for message_id in seen
-            if (_safe_message_id_int(message_id) or cursor + 1) > cursor
+            if _safe_message_id_int(message_id) is None
         )
+        seen.intersection_update(survivors)
 
     def _log_page_gap(
         self,

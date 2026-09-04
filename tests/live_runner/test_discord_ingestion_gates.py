@@ -340,11 +340,12 @@ def test_no_gap_warning_on_contiguous_page() -> None:
     ]
 
 
-def test_seen_set_is_pruned_below_cursor_after_poll() -> None:
-    """Pre-mortem mitigation: the cumulative seen-set must not grow without
-    bound. Ids at or below the monotonic per-channel cursor are redundant (a
-    repeat poll can never re-emit them), so they are dropped after each poll
-    while everything above the cursor is retained for burst draining."""
+def test_seen_set_is_not_pruned_against_the_poll_cursor() -> None:
+    """Regression: pruning ids at/below the monotonic cursor re-admits the
+    newest message on the very next poll on a quiet channel — the newest id IS
+    the cursor, and the emit path dedupes via the seen-set alone (it no longer
+    filters on the cursor). The set must keep every id inside its retention
+    window instead."""
     import asyncio
 
     source = _source()
@@ -353,23 +354,64 @@ def test_seen_set_is_pruned_below_cursor_after_poll() -> None:
     )
     source._last_seen_message_ids["channel-1"] = "100000000000000050"
 
+    def _message(message_id: str) -> dict[str, object]:
+        return {
+            "id": message_id,
+            "channel_id": "channel-1",
+            "timestamp": "2026-09-01T12:00:00Z",
+            "content": "RAM JET BUY AAPL @ 100.00",
+            "author": {"id": "bot-1", "bot": True},
+        }
+
     async def _fetch(_channel_id):
-        return [
-            {
-                "id": "100000000000000060",
-                "channel_id": "channel-1",
-                "timestamp": "2026-09-01T12:00:00Z",
-                "content": "RAM JET BUY AAPL @ 100.00",
-                "author": {"id": "bot-1", "bot": True},
-            }
-        ]
+        # A quiet channel: Discord keeps serving the live window (newest
+        # first), including messages already seen.
+        return [_message("100000000000000060"), _message("100000000000000050")]
 
     source._fetch_messages = _fetch
-    asyncio.run(source._poll_once("channel-1"))
 
+    async def _run() -> None:
+        await source._poll_once("channel-1")
+        # The quiet channel still serves id ...050 (== the cursor): pruning it
+        # out of the seen-set must not make the next poll re-emit it.
+        await source._poll_once("channel-1")
+
+    asyncio.run(_run())
     assert source._seen_ids["channel-1"] == {
+        "100000000000000010",
+        "100000000000000011",
+        "100000000000000050",
         "100000000000000060",
     }
+    assert source._queue.qsize() == 1
+
+
+def test_seen_set_keeps_ids_within_retention_window() -> None:
+    """The seen-set stays bounded by the retention window (POLL_LIMIT * 10),
+    not by the cursor: the newest ids survive, older ones fall out."""
+    source = _source()
+    # One id more than the window; all numeric so they are ordered.
+    total = ds.SEEN_ID_RETENTION + 1
+    ids = {str(100000000000000000 + index) for index in range(total)}
+    source._seen_ids.setdefault("channel-1", set()).update(ids)
+
+    source._prune_seen_ids("channel-1", source._seen_ids["channel-1"])
+
+    assert source._seen_ids["channel-1"] == {
+        str(100000000000000000 + index) for index in range(1, total)
+    }
+
+
+def test_seen_set_prune_keeps_non_numeric_ids() -> None:
+    """Non-numeric ids cannot be ordered against the window, so pruning must
+    never drop them: they would otherwise be re-emitted."""
+    source = _source()
+    numeric = {str(100000000000000000 + index) for index in range(ds.SEEN_ID_RETENTION)}
+    source._seen_ids.setdefault("channel-1", set()).update(numeric | {"not-a-snowflake"})
+
+    source._prune_seen_ids("channel-1", source._seen_ids["channel-1"])
+
+    assert source._seen_ids["channel-1"] == numeric | {"not-a-snowflake"}
 
 
 def test_seen_set_keeps_ids_above_cursor_for_burst_drain() -> None:
