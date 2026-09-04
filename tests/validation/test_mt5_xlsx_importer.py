@@ -359,3 +359,81 @@ class TestGermanNumberParsing:
         assert MT5XLSXImporter._to_float("300.0") == pytest.approx(300.0)
         assert MT5XLSXImporter._to_float("n/a") is None
         assert MT5XLSXImporter._to_float(None) is None
+
+    def test_sltp_locale_scan_covers_only_sltp_cells(self):
+        """A stray ASCII-grouped value outside the SL/TP columns must not
+        flip the report locale and corrupt the SL/TP cells ("2.500" -> 2.5)."""
+        orders = pd.DataFrame(
+            [
+                [1001, "2024.01.03 08:00:00", "EURUSD", "buy", "1,000", 1.085, "1.08500", "2.500", "filled", "10.000 runs"],
+                [1002, "2024.01.03 09:00:00", "EURUSD", "sell", "0,500", 1.090, None, "1.234,56", "filled", "20.000 runs"],
+            ],
+            columns=["Auftrag", "Zeit", "Symbol", "Typ", "Volumen", "Preis", "S / L", "T / P", "Status", "Kommentar"],
+        )
+        mapping = MT5XLSXImporter._build_sltp_map(orders)
+        assert mapping[1001]["sl"] == pytest.approx(1.085)
+        assert mapping[1001]["tp"] == pytest.approx(2500.0)
+        assert mapping[1002]["tp"] == pytest.approx(1234.56)
+
+
+class TestOrphanOutDeal:
+    """An 'out' deal with no open position must be skipped, not merged
+    into the next position's pnl (CodeRabbit batch-review finding)."""
+
+    @staticmethod
+    def _write_report(tmp_path: Path, name: str, deals: pd.DataFrame) -> Path:
+        orders = pd.DataFrame(
+            [
+                ["Orders"] + [None] * 9,
+                ["Auftrag", "Zeit", "Symbol", "Typ", "Richtung", "Volumen", "Preis", "S / L", "T / P", "Kommentar"],
+                [9002, "2024.01.02 08:00:00", "EURUSD", "buy", "in", "0.10", 1.085, 1.08, 1.095, "Entry"],
+                [9003, "2024.01.02 16:00:00", "EURUSD", "sell", "out", "0.10", 1.090, None, None, "TP 1.09000"],
+            ]
+        )
+        path = tmp_path / name
+        with pd.ExcelWriter(path, engine="openpyxl") as writer:
+            orders.to_excel(writer, index=False, header=False, startrow=0)
+            deals.to_excel(writer, index=False, header=False, startrow=20)
+        return path
+
+    @staticmethod
+    def _deals(rows: list[list[Any]]) -> pd.DataFrame:
+        return pd.DataFrame(
+            [["Trades"] + [None] * 11]
+            + [
+                ["Zeit", "Trade", "Symbol", "Typ", "Richtung", "Volumen", "Preis", "Auftrag",
+                 "Kommission", "Swap", "Gewinn", "Kontostand", "Kommentar"]
+            ]
+            + rows
+        )
+
+    def test_leading_orphan_out_is_not_merged_into_next_position(self, tmp_path: Path):
+        """A report that starts mid-position must not inflate the next trade."""
+        deals = self._deals(
+            [
+                ["2024.01.01 09:00:00", 2, "EURUSD", "sell", "out", "0.10", 1.090, 9001, -0.5, 0, 425.0, 104250, "TP 1.09000"],
+                ["2024.01.02 08:00:00", 3, "EURUSD", "buy", "in", "0.10", 1.085, 9002, -0.5, 0, 0, 100000, "Entry"],
+                ["2024.01.02 16:00:00", 4, "EURUSD", "sell", "out", "0.10", 1.090, 9003, -0.5, 0, 500.0, 105000, "TP 1.09000"],
+            ]
+        )
+        ref = MT5XLSXImporter().load(self._write_report(tmp_path, "leading_orphan.xlsx", deals))
+        assert len(ref.trades) == 1
+        trade = ref.trades[0]
+        assert trade.pnl == pytest.approx(500.0)
+        assert [e.pnl for e in trade.exits] == [pytest.approx(500.0)]
+
+    def test_mid_report_orphan_out_does_not_inflate_next_position(self, tmp_path: Path):
+        """An orphan 'out' between two positions keeps their pnl separate."""
+        deals = self._deals(
+            [
+                ["2024.01.01 08:00:00", 2, "EURUSD", "buy", "in", "0.10", 1.085, 9002, -0.5, 0, 0, 100000, "Entry"],
+                ["2024.01.01 16:00:00", 3, "EURUSD", "sell", "out", "0.10", 1.090, 9003, -0.5, 0, 500.0, 105000, "TP 1.09000"],
+                ["2024.01.02 09:00:00", 4, "EURUSD", "buy", "out", "0.05", 1.100, 9004, -0.5, 0, 425.0, 109250, "TP 1.10000"],
+                ["2024.01.03 08:00:00", 5, "EURUSD", "buy", "in", "0.10", 1.085, 9005, -0.5, 0, 0, 100000, "Entry"],
+                ["2024.01.03 16:00:00", 6, "EURUSD", "sell", "out", "0.10", 1.090, 9006, -0.5, 0, 500.0, 105000, "TP 1.09000"],
+            ]
+        )
+        ref = MT5XLSXImporter().load(self._write_report(tmp_path, "mid_orphan.xlsx", deals))
+        assert len(ref.trades) == 2
+        assert [t.pnl for t in ref.trades] == [pytest.approx(500.0), pytest.approx(500.0)]
+        assert [t.meta["position_id"] for t in ref.trades] == ["position-1", "position-2"]

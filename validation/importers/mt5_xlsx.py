@@ -422,6 +422,11 @@ class MT5XLSXImporter(BaseImporter):
 
         # DV-B44: the xlsx SL/TP cells go through the same locale-aware
         # parser as the HTML importer; "2.500" is 2500, not 2.5.
+        #
+        # Only the SL/TP cells feed the locale detector: a grouped value in
+        # another orders column (volume "0.10", comment "10.000 runs") has no
+        # bearing on how the SL/TP columns are formatted, and a stray ASCII
+        # grouping there would flip the convention for the whole report.
         cell_values: list[str | None] = []
         for _, row in orders_df.iterrows():
             for col in (col_sl, col_tp):
@@ -539,9 +544,9 @@ class MT5XLSXImporter(BaseImporter):
 
                 An "in" deal opens a new position once every existing one is
                 fully exited; an "out" deal closes volume on the oldest open
-                position.  An orphan "out" with no open position is pinned to
-                position 1 so its fills are grouped and then dropped by
-                ``closed_positions``.
+                position.  An orphan "out" with no open position gets no
+                position id, so its fill is skipped instead of inflating the
+                pnl of the next reconstructed position.
                 """
                 if _deal_id(row) == "":
                     return ""
@@ -557,13 +562,19 @@ class MT5XLSXImporter(BaseImporter):
                         exit_volume.append(0.0)
                     entry_volume[index] += volume
                     return f"position-{index + 1}"
-                if not entry_volume:
-                    return "position-1"
                 for index, remaining in enumerate(entry_volume):
                     if exit_volume[index] < remaining:
                         exit_volume[index] += volume
-                        break
-                return f"position-{index + 1}"
+                        return f"position-{index + 1}"
+                logger.warning(
+                    "Orphan 'out' deal %r (%s %s at %s): no open position to "
+                    "close; the fill is skipped.",
+                    _deal_id(row),
+                    volume,
+                    MT5XLSXImporter._get_str(row, col_symbol, ""),
+                    MT5XLSXImporter._get_str(row, col_time, ""),
+                )
+                return ""
 
             position_id_of = _assign_sequential_position
 

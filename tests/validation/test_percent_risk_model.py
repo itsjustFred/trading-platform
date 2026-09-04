@@ -475,11 +475,22 @@ def test_sub_minimum_size_raises_instead_of_silent_zero() -> None:
 
 
 def test_lot_rounded_to_zero_below_minimum_raises() -> None:
-    """Lot rounding must not silently produce a zero-size profile."""
+    """A lot-floored zero size must fail closed (not positive)."""
     config = PercentRiskConfig(
         risk_percent=0.01, round_lots=True, lot_size=10_000.0, min_position_size=1.0
     )
     model = PercentRiskModel(config)
     inp = _make_input(entry_price=100.0, stop_loss=97.0, account_balance=10_000.0)
-    with pytest.raises(ValueError, match="minimum position size"):
+    with pytest.raises(ValueError, match="not positive"):
+        model.size(inp)
+
+
+def test_lot_floor_to_zero_raises_even_without_min_size() -> None:
+    """A lot-floored 0.0 size is an empty position, never a valid profile."""
+    config = PercentRiskConfig(
+        risk_percent=0.01, round_lots=True, lot_size=10_000.0
+    )
+    model = PercentRiskModel(config)
+    inp = _make_input(entry_price=100.0, stop_loss=97.0, account_balance=10_000.0)
+    with pytest.raises(ValueError, match="not positive"):
         model.size(inp)

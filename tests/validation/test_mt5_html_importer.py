@@ -237,6 +237,10 @@ class TestGermanNumberParsing:
             ("1 234,56", 1234.56),
             ("-1.234,56", -1234.56),
             ("1.23456", 1.23456),
+            # 5-digit fraction (MT5 price cell "1,08500") must stay a price,
+            # not be dropped as an unparseable grouping.
+            ("1,08500", 1.085),
+            ("-1,08500", -1.085),
         ],
     )
     def test_parse_german_number(self, raw: str, expected: float):

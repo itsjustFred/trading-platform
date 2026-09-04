@@ -54,7 +54,7 @@ def _split_german(text: str, last_comma: int) -> tuple[str, str] | None:
         # The comma is the decimal mark; dots can only be group separators.
         digits = text[:last_comma].replace(".", "")
         decimal = text[last_comma + 1 :]
-        if "," in decimal or len(decimal) > 4:
+        if "," in decimal or len(decimal) > 8:
             return None
         return digits, decimal
 
