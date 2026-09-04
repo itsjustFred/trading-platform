@@ -23,6 +23,7 @@ import pyarrow.parquet as pq
 import pyarrow.compute as pc
 import pytest
 
+from runner.engines.contract import parse_date_bound
 from shared.constants import DATA_DIR
 
 # Opt-in strict mode: missing local market data fails instead of skipping.
@@ -129,27 +130,14 @@ def _to_utc_datetime(value: object) -> datetime | None:
         return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
     if isinstance(value, date):
         return datetime.combine(value, time.min, tzinfo=timezone.utc)
-    if isinstance(value, str):
-        raw = value.strip()
-        if not raw:
-            return None
-        normalized = raw.replace("Z", "+00:00")
-        try:
-            parsed = datetime.fromisoformat(normalized)
-        except ValueError:
-            return None
-        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
     return None
 
 
 def _parse_date_bound(value: str, *, is_end: bool) -> datetime:
-    parsed = _to_utc_datetime(str(value or "").strip())
-    if parsed is None:
-        raise ValueError(f"Invalid date filter value: {value!r}")
-    raw = str(value or "").strip()
-    if is_end and "T" not in raw and ":" not in raw:
-        return parsed + timedelta(days=1) - timedelta(microseconds=1)
-    return parsed
+    """Conformance (Cleanup 16-A, F9): the data-gate coverage check parses its
+    bounds through the SHARED contract parser, so the gate's window arithmetic
+    cannot drift from the engines' date filter."""
+    return parse_date_bound(value or "", is_end=is_end).to_pydatetime()
 
 
 def _path_time_coverage(path: Path) -> tuple[datetime | None, datetime | None, str | None]:

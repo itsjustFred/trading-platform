@@ -60,9 +60,14 @@ full day.**
   interpreted as UTC.
 
 The rules are implemented once in
-`runner.engines.contract.DateFilterConvention` and consumed by the adapters
-(`contract.apply_date_filter` / `contract.parse_date_bound`). A date-only end
-bound must never drop the bars of the end date itself.
+`runner.engines.contract.parse_date_bound` / `contract.apply_date_filter` and
+consumed by the adapters (native, pynecore, vectorbt and signal-replay all
+filter through the shared helper). A date-only end bound must never drop the
+bars of the end date itself. Pynecore additionally passes the end bound to the
+external `pyne` CLI (`--to`); because the CLI treats a date-only value as a
+midnight bound, the adapter translates a date-only end date into the inclusive
+end-of-day instant before dispatch (`_pyne_cli_end_bound`), so pyne replays the
+same window as the other engines.
 
 ## 3. Same-bar stop/take-profit priority
 
@@ -95,9 +100,14 @@ Implementation:
 - Vectorbt: `_match_intrabar_exit_event` routes through the same helper per
   sub-bar. The intrabar resolution itself is honored as requested (`5m`,
   `15m`, `1h`, `1-lower`, …); only unknown spellings fall back to
-  open/close modeling. vectorbt schedules exits at the next bar's open
-  (F10), so it never faces the same-bar ambiguity on its main frame and
-  therefore needs no fallback flag.
+  open/close modeling. Native resolves the SAME spellings the same way
+  (`_load_intrabar_data` maps `1-lower` to the next-lower named granularity,
+  like vectorbt's `_resolve_intrabar_timeframe`), so the same configuration
+  yields the same intrabar frame — and the same exits — on both engines
+  (pinned by conformance test
+  `test_native_engine_resolves_one_lower_like_vectorbt`). vectorbt schedules
+  exits at the next bar's open (F10), so it never faces the same-bar
+  ambiguity on its main frame and therefore needs no fallback flag.
 - Signal replay: `_process_protective_exits` walks bars chronologically and
   classifies each through the shared helper.
 - Configuring `same_bar_order = "take_profit_first"` is **not** part of the
@@ -165,7 +175,9 @@ Every engine's `BacktestResult.stats` must be able to expose the canonical
 Engines satisfy this by routing through `runner.stats.compute_stats` (derived
 from trades + equity curve) rather than emitting a bespoke key set. Engine-
 specific stats (pynecore strategy stats) are merged **on top of** the
-canonical ones; they may add keys but never remove them.
+canonical ones via `EngineStatsKeys.merge_over_canonical`; they may add keys
+but never remove or overwrite them — a same-named engine key loses the
+collision, so consumers always read the canonical value.
 
 ## 7. `total_bars`
 

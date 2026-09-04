@@ -24,8 +24,13 @@ Decision Records (Cleanup 16-A, 2026-08-31):
 
 from __future__ import annotations
 
+import shutil
+import subprocess
+import sys
 from pathlib import Path
+from unittest.mock import patch
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -38,7 +43,11 @@ from runner.engines.contract import (
     resolve_same_bar_exit,
 )
 from runner.engines.native_adapter import NativeAdapter
-from runner.engines.pynecore_adapter import PyneCoreAdapter
+from runner.engines.pynecore_adapter import (
+    PyneCoreAdapter,
+    _parse_stats_csv as _real_parse_stats_csv,
+    _parse_trade_csv as _parse_pyne_trade_csv,
+)
 from runner.engines.signal_replay_adapter import (
     ReplaySignal,
     SignalReplayAdapter,
@@ -306,13 +315,21 @@ class TestSameBarExitPolicy:
             )
 
     def test_missing_intrabar_data_is_flagged(self):
-        flag = flag_missing_intrabar(intrabar_resolution="1-lower", intrabar_coverage=False)
+        flag = flag_missing_intrabar(
+            intrabar_resolution="1-lower",
+            intrabar_coverage=False,
+            reason="intrabar_data_missing",
+        )
         assert flag is not None
         assert flag["same_bar_priority"] == "stop_first_fallback"
         assert flag["intrabar_available"] is False
         assert flag["reason"] == "intrabar_data_missing"
 
-        empty = flag_missing_intrabar(intrabar_resolution="5m", intrabar_coverage=False)
+        empty = flag_missing_intrabar(
+            intrabar_resolution="5m",
+            intrabar_coverage=False,
+            reason="intrabar_data_missing",
+        )
         assert empty is not None
         assert empty["intrabar_available"] is False
 
@@ -331,11 +348,48 @@ class TestSameBarExitPolicy:
         assert flag["intrabar_available"] is True
         assert flag["reason"] == "intrabar_unresolved"
 
-    def test_available_intrabar_data_is_not_flagged(self):
-        assert flag_missing_intrabar(intrabar_resolution="5m", intrabar_coverage=True) is None
+    def test_resolved_walk_does_not_reach_the_helper(self):
+        """A RESOLVED walk returns its event directly — the helper is never called.
+
+        The helper only ever emits or raises; there is no argument combination
+        that silently suppresses the flag (the earlier default-reason shortcut
+        made ``coverage=True`` without an explicit reason read as "resolved"
+        and dropped the flag). The engine's call site proves the resolved path
+        returns before reaching the fallback:
+        ``_check_stops`` → ``_intrabar_first_trigger`` returning an event skips
+        ``_flag_same_bar_fallback`` entirely.
+        """
+        # Both call sites in the engine pass an explicit reason; a resolved
+        # walk short-circuits before either is reachable.
+        resolved_event = resolve_same_bar_exit(
+            direction="LONG", high=112.5, low=104.0, stop_price=100.0, take_profit_price=110.0
+        )
+        assert resolved_event == "tp"
 
     def test_no_intrabar_resolution_requested_is_not_flagged(self):
-        assert flag_missing_intrabar(intrabar_resolution=None, intrabar_coverage=False) is None
+        assert flag_missing_intrabar(
+            intrabar_resolution=None,
+            intrabar_coverage=False,
+            reason="intrabar_data_missing",
+        ) is None
+
+    def test_reason_is_required_not_defaulted(self):
+        """The failure mode must be stated explicitly by every caller.
+
+        A defaulted ``reason`` let ``intrabar_coverage=True`` without a reason
+        silently suppress the flag — the exact unflagged fallback the Decision
+        Record requires to be visible.
+        """
+        with pytest.raises(TypeError):
+            flag_missing_intrabar(intrabar_resolution="5m", intrabar_coverage=True)  # type: ignore[call-arg]
+
+    def test_unknown_reason_is_rejected(self):
+        with pytest.raises(ValueError):
+            flag_missing_intrabar(
+                intrabar_resolution="5m",
+                intrabar_coverage=True,
+                reason="made_up_reason",
+            )
 
 
 def _sl_tp_strategy(path: Path, *, stop: float, take_profit: float, entry: int = 2) -> None:
@@ -546,6 +600,100 @@ def test_native_engine_flags_the_stop_first_fallback_when_intrabar_is_missing(tm
     assert flag["intrabar_available"] is False
 
 
+def test_native_engine_resolves_one_lower_like_vectorbt(tmp_path: Path):
+    """Conformance (F8 parity): ``modeling_resolution="1-lower"`` means the same
+    thing in every engine.
+
+    vectorbt resolves ``1-lower`` on a 1h main timeframe to the 30m intrabar
+    frame (:func:`_resolve_intrabar_timeframe`); the native engine must resolve
+    it to the same granularity. Otherwise the same configuration produces a
+    stop-first fallback on one engine and a chronological exit on the other —
+    a parity divergence for identical input.
+    """
+    # The 1h main frame trades through BOTH levels on bar 4; the 30m sub-bars
+    # order the events (take-profit first) exactly like the 5m fixture above,
+    # scaled to 30-minute steps.
+    data = _deterministic_ohlcv(periods=10, freq="h")
+    data.loc[4, "high"] = 114.0
+    data.loc[4, "low"] = 96.0
+    _write_ohlcv(tmp_path, "PARITY", "1h", data)
+
+    intrabar = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01 04:00", periods=2, freq="30min", tz="UTC"),
+            # 04:00 sub-bar rallies through the TP (110.0) without touching the
+            # stop (100.0); the 04:30 sub-bar trades through both.
+            "open": [104.0, 100.6],
+            "high": [112.5, 104.5],
+            "low": [104.0, 96.0],
+            "close": [112.0, 100.5],
+            "volume": [100.0, 100.0],
+        }
+    )
+    _write_ohlcv(tmp_path, "PARITY", "30m", intrabar)
+
+    strategy = tmp_path / "sl_tp_strategy.py"
+    _sl_tp_strategy(strategy, stop=100.0, take_profit=110.0)
+
+    cfg = _config(
+        tmp_path,
+        strategy_name="sl_tp_strategy",
+        start_date="2024-01-01",
+        end_date="2024-01-01",
+        modeling_resolution="1-lower",
+        parameters={},
+    )
+
+    native = NativeAdapter().run(cfg, str(strategy))
+    assert len(native.trades) == 1
+    native_trade = native.trades[0]
+    assert native_trade.exits[-1].reason in {"tp", "take_profit"}, (
+        "native must resolve '1-lower' to the 30m intrabar frame like vectorbt "
+        "does; a stop-first exit means the intrabar frame was never loaded"
+    )
+    assert native_trade.exits[-1].price == pytest.approx(110.0)
+    flag = native_trade.meta.get("same_bar_priority")
+    assert flag is None, "with the intrabar frame available no fallback flag may be recorded"
+
+    vectorbt = VectorbtAdapter().run(cfg, str(strategy))
+    assert len(vectorbt.trades) == 1
+    assert vectorbt.trades[0].exits[-1].reason == "take_profit", (
+        "vectorbt already resolves '1-lower' chronologically; native must agree"
+    )
+
+
+def test_engines_agree_on_unresolvable_intrabar_spellings(tmp_path: Path):
+    """Conformance: spellings no engine can resolve degrade identically.
+
+    ``main_timeframe`` (and the open/close default) request no intrabar walk in
+    any engine; the stop-first fallback with no flag is the documented behavior
+    everywhere.
+    """
+    data = _deterministic_ohlcv(periods=10, freq="h")
+    data.loc[4, "high"] = 114.0
+    data.loc[4, "low"] = 96.0
+    _write_ohlcv(tmp_path, "PARITY", "1h", data)
+
+    strategy = tmp_path / "sl_tp_strategy.py"
+    _sl_tp_strategy(strategy, stop=100.0, take_profit=110.0)
+
+    for resolution in ("main_timeframe", "open_close"):
+        cfg = _config(
+            tmp_path,
+            strategy_name="sl_tp_strategy",
+            start_date="2024-01-01",
+            end_date="2024-01-01",
+            modeling_resolution=resolution,
+            parameters={},
+        )
+        native_trade = NativeAdapter().run(cfg, str(strategy)).trades[0]
+        assert native_trade.exits[-1].reason == "stop_loss"
+        assert native_trade.meta.get("same_bar_priority") is None, (
+            f"{resolution}: no intrabar resolution was requested, so the "
+            "stop-first fallback is the documented default and is not flagged"
+        )
+
+
 # ─── Sizing (F3) ─────────────────────────────────────────────────────────────
 
 
@@ -636,12 +784,55 @@ class TestStatsKeysContract:
 
     REQUIRED_KEYS = sorted(EngineStatsKeys.REQUIRED)
 
+    # Stubbed ``pyne`` CLI outputs (the subprocess boundary is the one seam the
+    # suite may not cross); everything after it in the adapter runs for real.
+    PYNE_TRADE_CSV = (
+        "Trade #,Bar Index,Type,Signal,Date/Time,Price USD,Contracts,"
+        "Profit USD,Profit %,Cumulative profit USD,Cumulative profit %,"
+        "Run-up USD,Run-up %,Drawdown USD,Drawdown %\n"
+        "1,47,Entry long,Long,2024-01-05T10:00:00+0000,104.0,1.0,0.0,0.00,0.0,"
+        "0.00,0.0,0.0,0.0,0.0\n"
+        "1,72,Exit long,Close entry(s) order Long,2024-01-08T15:00:00+0000,106.5,"
+        "1.0,2.5,0.01,2.5,0.01,3.0,0.02,0.1,0.0\n"
+    )
+    PYNE_STATS_CSV = (
+        "Metric,All USD,All %,Long USD,Long %,Short USD,Short %\n"
+        "Net profit,2.5,0.01,2.5,0.01,0.0,0.0\n"
+        "Total Closed Trades,1,1,1,1,0,0\n"
+    )
+
     def test_contract_key_set_matches_backteststats(self):
         from shared.models import BacktestStats
 
         canonical = BacktestStats().to_dict()
         missing = EngineStatsKeys.missing_from(canonical)
         assert not missing, f"Contract keys must be a subset of BacktestStats: {missing}"
+
+    def test_optional_key_set_matches_backteststats_optional_fields(self):
+        """The OPTIONAL family mirrors BacktestStats's optional fields exactly.
+
+        Pinning the two sets against each other keeps ``OPTIONAL`` from
+        rotating independently: a key added here without a ``BacktestStats``
+        field (or vice versa) is a contract change that must be made
+        deliberately in both places, not a silent drift.
+        """
+        from dataclasses import fields
+
+        from shared.models import BacktestStats
+
+        # Fields of BacktestStats that are NOT part of the required contract
+        # key set are exactly the optional family.
+        required_and_meta = EngineStatsKeys.REQUIRED | {"cagr", "extras"}
+        model_optional = {
+            field.name
+            for field in fields(BacktestStats)
+            if field.name not in required_and_meta
+        }
+        assert model_optional == set(EngineStatsKeys.OPTIONAL), (
+            f"EngineStatsKeys.OPTIONAL {sorted(EngineStatsKeys.OPTIONAL)} drifted from "
+            f"BacktestStats's optional fields {sorted(model_optional)} — update both "
+            "together (see contract.py: OPTIONAL is not an extension point)"
+        )
 
     def test_signal_replay_result_carries_the_canonical_stats_keys(self):
         frame = _deterministic_ohlcv(periods=40, freq="h")
@@ -702,20 +893,73 @@ class TestStatsKeysContract:
     def test_pynecore_result_can_expose_the_canonical_stats_keys(self, contract_data_dir: Path):
         """Conformance: pynecore's stats dict must carry the canonical keys.
 
-        PynecoreAdapter delegates execution to the external ``pyne`` CLI; the
-        contract facet under test here is the *stats contract*, which the
-        adapter satisfies by routing through compute_stats like every other
-        engine. The CLI-independent path is exercised via the same helper the
-        adapter's result is enriched with.
+        Unlike the previous revision of this test (which ran NativeAdapter and
+        called the merge helper itself — exercising no PyneCore code at all),
+        this drives the actual PyneCoreAdapter.run() path: strategy artifact
+        loading, the CLI dispatch (stubbed at the subprocess boundary — the
+        adapter-internal code under test is real), CSV trade parsing,
+        restatement containment, risk sizing, equity derivation, and the
+        canonical-stats merge the contract requires.
         """
-        result = NativeAdapter().run(_config(tmp_contract_dir(contract_data_dir)), STRATEGY_PATH)
-        # PynecoreAdapter.run() merges compute_stats_for_result(result) with the
-        # parsed strategy stats — verify the shared helper covers the key set.
-        from runner.stats import compute_stats_for_result
+        data_dir = tmp_contract_dir(contract_data_dir)
+        cfg = _config(data_dir, parameters={})
 
-        merged = {**compute_stats_for_result(result), **(result.stats or {})}
-        missing = EngineStatsKeys.missing_from(merged)
+        def fake_run(cmd, **kwargs):
+            trade_csv = Path(cmd[cmd.index("--trade") + 1])
+            trade_csv.write_text(self.PYNE_TRADE_CSV)
+            stats_csv = Path(cmd[cmd.index("--strat") + 1])
+            stats_csv.write_text(self.PYNE_STATS_CSV)
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        with patch("runner.engines.pynecore_adapter.subprocess.run", side_effect=fake_run):
+            result = PyneCoreAdapter().run(cfg, STRATEGY_PATH)
+
+        assert len(result.trades) > 0, "the stubbed CLI output must yield trades"
+        missing = EngineStatsKeys.missing_from(result.stats)
         assert not missing, f"pynecore stats are missing canonical keys: {sorted(missing)}"
+        # Engine-specific strategy stats survive the merge (they may add keys
+        # but never remove the canonical ones — contract §6).
+        assert any(k.startswith("net_profit") or k == "strategy_net_profit" for k in result.stats), (
+            "the pynecore strategy stats must be merged on top of the canonical set"
+        )
+
+    def test_engine_specific_stats_may_not_shadow_canonical_keys(self, contract_data_dir: Path):
+        """Contract §6: engine stats are merged ON TOP of the canonical ones.
+
+        The merge direction is canonical-basis + engine-overlay, and an engine
+        stat that happens to share a name with a canonical key must never
+        replace the canonical value — consumers (viewer, walk-forward, live
+        scoring) read ``result.stats`` uniformly and must not see a
+        bespoke/derived value silently take over a canonical one.
+        """
+        data_dir = tmp_contract_dir(contract_data_dir)
+        cfg = _config(data_dir, parameters={})
+
+        # "net_profit" is a pynecore strategy stat; pretend the parsed strategy
+        # stats also carry a canonical key ("total_pnl") with a bogus value to
+        # prove the merge keeps the canonical one underneath.
+        def fake_run(cmd, **kwargs):
+            trade_csv = Path(cmd[cmd.index("--trade") + 1])
+            trade_csv.write_text(self.PYNE_TRADE_CSV)
+            stats_csv = Path(cmd[cmd.index("--strat") + 1])
+            stats_csv.write_text(self.PYNE_STATS_CSV)
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        with patch(
+            "runner.engines.pynecore_adapter.subprocess.run", side_effect=fake_run
+        ), patch(
+            "runner.engines.pynecore_adapter._parse_stats_csv",
+            side_effect=lambda path: {**_real_parse_stats_csv(path), "total_pnl": 99.0},
+        ):
+            result = PyneCoreAdapter().run(cfg, STRATEGY_PATH)
+
+        assert result.stats.get("total_pnl") != 99.0, (
+            "the engine-specific strategy stat must not shadow the canonical "
+            "total_pnl (contract §6: engine stats may add keys, never remove them)"
+        )
+        assert "net_profit" in result.stats, (
+            "engine-specific keys that do not collide are still merged on top"
+        )
 
 
 # ─── total_bars (F6) ─────────────────────────────────────────────────────────
@@ -762,6 +1006,212 @@ class TestTotalBarsContract:
                 f"{result.meta.engine}: total_bars ({result.meta.total_bars}) must not "
                 f"degenerate into the trade count ({len(result.trades)})"
             )
+
+
+def _format_pyne_end_bound(end: str) -> str:
+    """Mirror of the adapter's CLI end-bound derivation (tested below)."""
+    from runner.engines.pynecore_adapter import _pyne_cli_end_bound
+
+    return _pyne_cli_end_bound(end)
+
+
+@pytest.mark.skipif(
+    shutil.which("pyne") is None
+    and not (Path(sys.executable).parent / "pyne").exists(),
+    reason="pyne CLI not installed in this environment",
+)
+class TestPyneCoreCliEndOfDayBoundary:
+    """Conformance (F9): a date-only end bound keeps the whole end day in pyne.
+
+    The adapter hands each symbol's (already F9-filtered) frame to the external
+    ``pyne`` CLI and passes ``end_date`` through as ``--to``. The CLI treats a
+    date-only ``--to`` as a bound at that day's **midnight** (verified against
+    pynecore 0.1.x: ``pyne run … --to 2024-01-01`` replays only the 00:00 bar
+    of the end date, dropping 01:00–23:00) — exactly the midnight-truncation
+    the F9 Decision Record removed everywhere else. The adapter must therefore
+    translate a date-only end date into the CLI's inclusive end-of-day
+    equivalent, so pyne replays the same window as native/vectorbt.
+    """
+
+    # One round trip that CLOSES inside the end day: entry on the SMA(5/20)
+    # crossover at 22:00, exit at the next bar's open 23:00. With the
+    # midnight-truncated bound the exit bar is dropped (the position is then
+    # force-closed by the CLI at the window edge); with the end-of-day bound
+    # the exit lands on the end day like in the other engines.
+    PYNE_FIXTURE_PY = '''\
+"""@pyne
+Contract fixture: SMA crossover entry, next-bar exit (deterministic).
+"""
+
+from pynecore import Series
+from pynecore.lib import script, strategy, input, ta, plot, color
+
+STRATEGY_META = {
+    "name": "Contract Fixture (PyneCore)",
+    "version": "1.0.0",
+    "tags": {
+        "type": ["trend-following"],
+        "source": "internal",
+        "link": "",
+        "asset_class": ["equities"],
+        "complexity": "simple",
+    },
+}
+
+
+@script.strategy(
+    title="Contract Fixture",
+    shorttitle="CFX",
+    overlay=True,
+    default_qty_type=strategy.fixed,
+    default_qty_value=1,
+    initial_capital=100000,
+)
+def main(
+    src: Series[float] = input.source("close", title="Source"),
+    fast_len: int = input.int(5, title="Fast SMA"),
+    slow_len: int = input.int(20, title="Slow SMA"),
+):
+    fast_sma = ta.sma(src, fast_len)
+    slow_sma = ta.sma(src, slow_len)
+
+    if ta.crossover(fast_sma, slow_sma):
+        strategy.entry("Long", strategy.long)
+
+    if ta.crossunder(fast_sma, slow_sma):
+        strategy.close("Long")
+
+    plot(fast_sma, title="Fast SMA", color=color.blue)
+    plot(slow_sma, title="Slow SMA", color=color.red)
+'''
+
+    @staticmethod
+    def _pyne_fixture() -> pd.DataFrame:
+        closes = (
+            100 + np.sin(np.arange(48) / 3.0) * 8  # SMA(5/20) crossovers within 24 bars
+        )
+        return pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2024-01-01", periods=48, freq="h", tz="UTC"),
+                "open": closes,
+                "high": closes + 0.3,
+                "low": closes - 0.3,
+                "close": closes,
+                "volume": [1000.0] * 48,
+            }
+        )
+
+    @staticmethod
+    def _run_pyne(
+        tmp_path: Path, strategy_path: Path, csv_path: Path, end_bound: str
+    ) -> Path:
+        workdir = tmp_path / "workdir"
+        workdir.mkdir(exist_ok=True)
+        trade_csv = tmp_path / "trades.csv"
+        stats_csv = tmp_path / "stats.csv"
+        pyne_bin = shutil.which("pyne") or str(Path(sys.executable).parent / "pyne")
+        cmd = [
+            pyne_bin,
+            "--workdir",
+            str(workdir),
+            "run",
+            str(strategy_path),
+            str(csv_path),
+            "--from",
+            "2024-01-01",
+            "--to",
+            end_bound,
+            "--trade",
+            str(trade_csv),
+            "--strat",
+            str(stats_csv),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if result.returncode != 0:
+            pytest.fail(f"pyne CLI failed: {result.stderr[-500:]}")
+        return trade_csv
+
+    def test_pyne_replays_the_full_end_day(self, tmp_path: Path):
+        """The exit on the end day must survive a date-only end date.
+
+        With the naive date-only ``--to`` (the pre-fix behavior) the CLI cuts
+        at the end date's midnight: the exit bar (23:00) is never replayed and
+        the trade closes one bar late/at the window edge instead.
+        """
+        data = self._pyne_fixture()
+        _write_ohlcv(tmp_path, "PARITY", "1h", data)
+        csv_path = tmp_path / "parity_1h.csv"
+        data[["timestamp", "open", "high", "low", "close", "volume"]].to_csv(
+            csv_path, index=False
+        )
+        strategy_path = tmp_path / "contract_pyne_sma.py"
+        strategy_path.write_text(self.PYNE_FIXTURE_PY)
+
+        # The adapter's end bound for end_date="2024-01-01" must be the
+        # end-of-day instant, not the raw date string.
+        assert _format_pyne_end_bound("2024-01-01") == "2024-01-01T23:59:59.999999+00:00"
+
+        trade_csv = self._run_pyne(
+            tmp_path, strategy_path, csv_path, _format_pyne_end_bound("2024-01-01")
+        )
+        trades = _parse_pyne_trade_csv(trade_csv, "PARITY", 0)
+        assert trades, "fixture must produce at least one trade"
+        exit_time = pd.Timestamp(trades[-1].exits[-1].time)
+        assert exit_time <= pd.Timestamp("2024-01-01 23:59:59.999999", tz="UTC"), (
+            "the end day's exit bar was replayed, so the trade must close on the end day"
+        )
+
+    def test_date_only_end_bound_translates_to_end_of_day(self):
+        from runner.engines.pynecore_adapter import _pyne_cli_end_bound
+
+        assert _pyne_cli_end_bound("2024-01-01") == "2024-01-01T23:59:59.999999+00:00"
+        # A bound that already carries a time component is used as-is (F9).
+        assert _pyne_cli_end_bound("2024-01-01T14:30:00Z") == "2024-01-01T14:30:00Z"
+
+    def test_adapter_passes_translated_bound_to_the_cli(self, tmp_path: Path):
+        """The adapter must not pass the raw date-only string as ``--to``.
+
+        The adapter's own parquet filter keeps the full end day (F9); if the
+        CLI then cuts at midnight, the pyne backtest window is a strict subset
+        of the native/vectorbt window for the same configuration.
+        """
+        from runner.engines.pynecore_adapter import _pyne_cli_end_bound
+
+        data = self._pyne_fixture()
+        _write_ohlcv(tmp_path, "PARITY", "1h", data)
+        strategy_path = tmp_path / "contract_pyne_sma.py"
+        strategy_path.write_text(self.PYNE_FIXTURE_PY)
+
+        captured: dict[str, list[str]] = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            trade_csv = Path(cmd[cmd.index("--trade") + 1])
+            trade_csv.write_text(
+                "Trade #,Bar Index,Type,Signal,Date/Time,Price USD,Contracts,"
+                "Profit USD,Profit %,Cumulative profit USD,Cumulative profit %,"
+                "Run-up USD,Run-up %,Drawdown USD,Drawdown %\n"
+            )
+            stats_csv = Path(cmd[cmd.index("--strat") + 1])
+            stats_csv.write_text("Metric,All USD\n")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        cfg = _config(
+            tmp_path,
+            strategy_name="contract_pyne_sma",
+            start_date="2024-01-01",
+            end_date="2024-01-01",
+            parameters={},
+        )
+        with patch("runner.engines.pynecore_adapter.subprocess.run", side_effect=fake_run):
+            PyneCoreAdapter().run(cfg, str(strategy_path))
+
+        cmd = captured["cmd"]
+        end_bound = cmd[cmd.index("--to") + 1]
+        assert end_bound == _pyne_cli_end_bound("2024-01-01"), (
+            "the adapter must translate a date-only end date into the CLI's "
+            "end-of-day bound, otherwise pyne replays a truncated window"
+        )
 
 
 def _read_parquet(data_dir: Path, symbol: str, timeframe: str) -> pd.DataFrame:

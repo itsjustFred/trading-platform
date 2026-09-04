@@ -44,6 +44,33 @@ logger = logging.getLogger(__name__)
 IndicatorMap = dict[str, tuple[pd.Series, str]]
 
 
+def _pyne_cli_end_bound(end_date: str) -> str:
+    """Translate a config end date into the ``pyne`` CLI's ``--to`` bound.
+
+    Conformance (Cleanup 16-A, F9): a date-only end boundary is inclusive of
+    the whole end day. The adapter's own parquet loader enforces that via
+    :func:`contract.apply_date_filter`, but the external ``pyne`` CLI applies
+    its own window: a date-only ``--to`` value is parsed with
+    ``datetime.fromisoformat`` into a **midnight** bound (bars stamped
+    ``01:00``–``23:00`` of the end date are dropped from the replay). Passing
+    the raw ``end_date`` through therefore re-introduces the exact
+    midnight-truncation the F9 Decision Record removed everywhere else, and
+    pyne's replay window becomes a strict subset of native/vectorbt's for the
+    same configuration.
+
+    A date-only end date is translated to the inclusive end-of-day instant
+    (``2024-01-02T23:59:59.999999+00:00``), which the CLI parses and applies
+    as-is; a value that already carries a time component already states the
+    intended bound and is passed through unchanged.
+    """
+    raw = str(end_date or "").strip()
+    if not raw:
+        return raw
+    if "T" not in raw and ":" not in raw:
+        return contract.parse_date_bound(raw, is_end=True).isoformat()
+    return raw
+
+
 class PyneCoreAdapter(EngineAdapter):
     """Adapter for PyneCore-based Pine-style backtesting."""
 
@@ -123,7 +150,11 @@ class PyneCoreAdapter(EngineAdapter):
                 if config.start_date:
                     cmd.extend(["--from", config.start_date])
                 if config.end_date:
-                    cmd.extend(["--to", config.end_date])
+                    # Conformance (Cleanup 16-A, F9): a date-only end date must
+                    # not hit the CLI as a midnight bound — translate it to the
+                    # inclusive end-of-day instant so pyne replays the same
+                    # window as native/vectorbt.
+                    cmd.extend(["--to", _pyne_cli_end_bound(config.end_date)])
 
                 logger.info(
                     "Running PyneCore: %s on %s (%d bars)", config.strategy_name, symbol, len(df)
@@ -203,8 +234,11 @@ class PyneCoreAdapter(EngineAdapter):
         )
         # Conformance (Cleanup 16-A): every engine exposes the canonical
         # BacktestStats key set; the engine-specific strategy stats are merged
-        # on top of the derived ones.
-        result.stats = {**compute_stats_for_result(result), **result.stats}
+        # on top of the derived ones. Contract §6: engine keys may add, never
+        # remove — canonical keys win a name collision.
+        result.stats = contract.EngineStatsKeys.merge_over_canonical(
+            compute_stats_for_result(result), result.stats
+        )
         return result
 
     def validate_config(self, config: BacktestConfig) -> list[str]:

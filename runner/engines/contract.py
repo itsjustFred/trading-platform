@@ -153,31 +153,36 @@ def flag_missing_intrabar(
     *,
     intrabar_resolution: str | None,
     intrabar_coverage: bool,
-    reason: str = "intrabar_data_missing",
+    reason: str,
 ) -> dict[str, Any] | None:
     """Build the same-bar-ambiguity flag required by the Decision Record.
 
     Returns ``None`` when no flag is needed — either no intrabar resolution was
     requested (the stop-first fallback is the documented default, nothing to
-    disclose) or the walk actually resolved the chronology from sub-bars
-    (``intrabar_coverage=True`` with the default ``reason``; the caller then
-    does not reach the fallback at all).
+    disclose) or the walk actually resolved the chronology from sub-bars (the
+    caller then does not reach the fallback at all and must not call this
+    helper).
 
     Returns a flag payload when an intrabar resolution WAS requested but the
     walk could not resolve the chronology: the result then silently fell back
     to the stop-first tie-break and that fact must be visible on the
-    trade/meta. ``reason`` distinguishes why the walk failed —
+    trade/meta. ``reason`` is REQUIRED and distinguishes why the walk failed —
     ``"intrabar_data_missing"`` (no sub-bars for the bar) vs.
     ``"intrabar_unresolved"`` (sub-bars exist but neither level was touched).
+
+    The default-reason shortcut of the earlier revision was removed: a
+    defaulted ``reason`` made ``intrabar_coverage=True`` without an explicit
+    reason silently suppress the flag (``coverage=True`` + default reason read
+    as "resolved, nothing to disclose"), i.e. exactly the unflagged fallback
+    the Decision Record requires to be visible. Every caller must now state
+    which failure mode it hit.
     """
     if intrabar_resolution is None:
         return None
-    if intrabar_coverage and reason == "intrabar_data_missing":
-        # Sub-bars exist AND the walk went through them without a fallback:
-        # the chronological event won, nothing to disclose. (A caller that
-        # passes a non-default reason explicitly wants the flag emitted even
-        # though data exists.)
-        return None
+    if reason not in ("intrabar_data_missing", "intrabar_unresolved"):
+        raise ValueError(
+            f"reason must be 'intrabar_data_missing' or 'intrabar_unresolved', got {reason!r}"
+        )
     return {
         "same_bar_priority": "stop_first_fallback",
         "intrabar_resolution": intrabar_resolution,
@@ -219,6 +224,13 @@ class EngineStatsKeys:
         }
     )
 
+    # Statistically meaningful extras ``runner.stats.compute_stats`` can emit
+    # on top of REQUIRED. They are pinned to ``BacktestStats``'s optional
+    # fields (shared/models.py: ``avg_holding_bars``, ``psr``,
+    # ``max_drawdown_duration``); both sets are asserted equal by
+    # ``test_optional_key_set_matches_backteststats_optional_fields`` so the
+    # two lists cannot silently drift apart. NOT an extension point: a new
+    # optional stat goes into ``BacktestStats`` (and hence here) explicitly.
     OPTIONAL = frozenset({"avg_holding_bars", "psr", "max_drawdown_duration"})
 
     @classmethod
@@ -227,3 +239,22 @@ class EngineStatsKeys:
         if not stats:
             return cls.REQUIRED
         return frozenset(cls.REQUIRED - set(stats.keys()))
+
+    @classmethod
+    def merge_over_canonical(
+        cls,
+        canonical: Mapping[str, Any] | None,
+        engine_specific: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Merge engine-specific stats ON TOP of the canonical ones (contract §6).
+
+        Engine-specific stats may ADD keys but must never REMOVE or overwrite a
+        canonical one: a same-named engine key would silently replace the
+        canonical value that every consumer (viewer, walk-forward, live
+        scoring) reads uniformly. Canonical keys therefore always win a
+        collision; the engine value under a canonical name is dropped.
+        """
+        merged: dict[str, Any] = dict(engine_specific or {})
+        for key, value in (canonical or {}).items():
+            merged[key] = value
+        return merged
