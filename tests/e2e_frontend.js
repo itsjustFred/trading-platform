@@ -145,12 +145,21 @@ function assert(cond, msg) {
   // ─── Console Errors ──────────────────────────────────────────────────
   console.log('\nConsole Errors:');
 
+  // Known-benign error signatures. Anything not matching here fails the
+  // run; add a signature only with a comment explaining why it is noise.
+  const BENIGN_ERROR_PATTERNS = [
+    /favicon/i,
+    /net::ERR_ABORTED/i,   // aborted speculative requests (preload/cancel)
+    /ResizeObserver loop/i, // browser-internal layout notification
+  ];
+
   await test('No critical console errors', async () => {
-    const critical = consoleErrors.filter(e => !e.includes('favicon'));
-    if (critical.length > 0) {
-      console.log('    Warnings:', critical.slice(0, 3));
-    }
-    // We don't fail on console errors — just report
+    const critical = consoleErrors.filter(
+      e => !BENIGN_ERROR_PATTERNS.some(p => p.test(e)));
+    // Cleanup 17-B (C2): this test asserted nothing and could never fail.
+    // Uncaught page errors are regressions and must fail the run.
+    assert(critical.length === 0,
+      `Uncaught page errors: ${critical.slice(0, 3).join(' | ')}`);
   });
 
   // ─── Summary ─────────────────────────────────────────────────────────

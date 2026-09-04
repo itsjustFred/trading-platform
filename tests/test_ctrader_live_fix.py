@@ -1,21 +1,30 @@
 """Tests for ctrader adapter edge-cases and helper behavior.
 
-Covers: get_positions mapping, broker_order_id roundtrip, and dedupe script.
+Covers: get_positions (sign convention, closed-position exclusion, symbol
+mapping), broker_order_id roundtrip, token refresh persistence and the
+dedupe script.
 """
 
 from __future__ import annotations
 
 import asyncio
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
+
 import pytest
-from datetime import datetime, timezone
-from typing import Any
 
 from shared.models import LiveDeploymentConfig, LiveExecution, LiveSignal
+
+# The reconcile-payload helpers below build real protobuf messages; without
+# the package every test in that block would fail on import rather than skip.
+pytest.importorskip(
+    "ctrader_open_api.messages.OpenApiModelMessages_pb2",
+    reason="ctrader-open-api package is not installed in this environment",
+)
 
 
 # ─── cTrader token refresh: re-auth + serialize + atomic persistence ──────────
@@ -193,11 +202,14 @@ def test_persisted_accounts_file_has_0600_permissions(tmp_path: Path) -> None:
     assert pairs == {"CTRADER_ACCESS_TOKEN": "a", "CTRADER_REFRESH_TOKEN": "r"}
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="cross-process flock locking is POSIX-only (fcntl)",
+)
 def test_env_key_persistence_serializes_concurrent_writers(tmp_path: Path) -> None:
     """The env read-modify-write path must wait on the cross-process file lock."""
     import fcntl
     import subprocess
-    import sys
     import time
 
     accounts_env = tmp_path / ".accounts.env"
@@ -245,48 +257,226 @@ def isolated_db(isolated_db_sandbox):
 # ─── cTrader get_positions helpers ────────────────────────────────────────────
 
 
-def test_ctrader_positions_symbol_id_mapping():
-    """get_positions must map symbol IDs to names."""
+def _make_reconcile_adapter(tmp_path: Path, response):
+    """Adapter wired so get_positions can run fully offline.
+
+    ``response`` is the ProtoOAReconcileRes payload the fake transport
+    returns; build it with :func:`_reconcile_response`.
+    """
     from live_runner.ctrader_adapter import CTraderLiveAdapter
+
+    # The module-level importorskip guarantees the protobuf package is here.
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAPositionStatus,
+        ProtoOATradeSide,
+    )
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAReconcileReq,
+        ProtoOAReconcileRes,
+    )
 
     adapter = CTraderLiveAdapter(
         app_id="app", app_secret="secret", access_token="token", account_id="123",
+        accounts_env_path=tmp_path / ".accounts.env",
     )
-    # Directly test the conversion logic for symbol names.
-    symbol_map = {"EURUSD": 1, "USDJPY": 2}
-    adapter._symbol_name_to_id = symbol_map
-    assert adapter._symbol_name_to_id["EURUSD"] == 1
-    assert adapter._symbol_name_to_id["USDJPY"] == 2
+    adapter._connected = True
+    adapter._authenticated = True
+    adapter._ProtoOAReconcileReq = ProtoOAReconcileReq
+    adapter._ProtoOAReconcileRes = ProtoOAReconcileRes
+    adapter._ProtoOAPositionStatus = ProtoOAPositionStatus
+    adapter._ProtoOATradeSide = ProtoOATradeSide
+
+    async def _fake_send_request_with_refresh_retry(request, **_kwargs):
+        assert isinstance(request, ProtoOAReconcileReq)
+        assert request.ctidTraderAccountId == adapter.ctid_trader_account_id
+        return response
+
+    # type: ignore[method-assign]: the real method is replaced by the stub.
+    adapter._send_request_with_refresh_retry = _fake_send_request_with_refresh_retry
+    return adapter
 
 
-def test_ctrader_positions_signed_qty_for_sell():
-    """SELL side should be stored as negative qty."""
-    from live_runner.ctrader_adapter import CTraderLiveAdapter
+def _reconcile_response(positions: list) -> Any:
+    """Build a ProtoOAReconcileRes carrying the given positions."""
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOAReconcileRes
 
-    adapter = CTraderLiveAdapter(
-        app_id="app", app_secret="secret", access_token="token", account_id="123",
+    response = ProtoOAReconcileRes()
+    response.position.extend(positions)
+    return response
+
+
+def _reconcile_position(*, status: int, trade_side: int, symbol_id: int, volume: int):
+    """Build a real ProtoOAPosition payload for the reconcile response."""
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAPosition, ProtoOATradeData
+
+    trade_data = ProtoOATradeData()
+    trade_data.symbolId = symbol_id
+    trade_data.volume = volume
+    trade_data.tradeSide = trade_side
+    position = ProtoOAPosition()
+    position.positionStatus = status
+    position.tradeData.CopyFrom(trade_data)
+    position.price = 0.0
+    return position
+
+
+def _run_get_positions(adapter) -> list[dict[str, Any]]:
+    return asyncio.run(adapter.get_positions())
+
+
+def test_get_positions_returns_negative_qty_for_sell(tmp_path: Path):
+    """B-10: SELL positions are reported as negative qty in broker volume units."""
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAPositionStatus,
+        ProtoOATradeSide,
     )
-    # 5000 volume in cTrader = 5.0 qty in our system
-    volume = 5000
-    expected = 5.0
-    # For SELL, sign should be negative.
-    assert -expected < 0
-    # For BUY, sign should be positive.
-    assert expected > 0
 
-
-def test_ctrader_positions_excludes_closed_positions():
-    """get_positions from cTrader adapter only returns open positions."""
-    from live_runner.ctrader_adapter import CTraderLiveAdapter
-
-    adapter = CTraderLiveAdapter(
-        app_id="app", app_secret="secret", access_token="token", account_id="123",
+    adapter = _make_reconcile_adapter(
+        tmp_path,
+        _reconcile_response(
+            [
+                _reconcile_position(
+                    status=ProtoOAPositionStatus.POSITION_STATUS_OPEN,
+                    trade_side=ProtoOATradeSide.SELL,
+                    symbol_id=1,
+                    volume=5000,
+                )
+            ],
+        ),
     )
-    # Closed position status must not appear in results.
-    # POSITION_STATUS_CLOSED = 2 (per the adapter code)
-    position_status_open = 1
-    position_status_closed = 2
-    assert position_status_open != position_status_closed
+    adapter._symbol_name_to_id = {"EURUSD": 1}
+
+    positions = _run_get_positions(adapter)
+
+    assert len(positions) == 1, f"SELL position must be returned, got {positions}"
+    assert positions[0]["symbol"] == "EURUSD"
+    # 5000 broker volume units == 5.0 qty, signed negative for SELL.
+    assert positions[0]["qty"] == -5.0
+
+
+def test_get_positions_returns_positive_qty_for_buy(tmp_path: Path):
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAPositionStatus,
+        ProtoOATradeSide,
+    )
+
+    adapter = _make_reconcile_adapter(
+        tmp_path,
+        _reconcile_response(
+            [
+                _reconcile_position(
+                    status=ProtoOAPositionStatus.POSITION_STATUS_OPEN,
+                    trade_side=ProtoOATradeSide.BUY,
+                    symbol_id=1,
+                    volume=5000,
+                )
+            ],
+        ),
+    )
+    adapter._symbol_name_to_id = {"EURUSD": 1}
+
+    positions = _run_get_positions(adapter)
+
+    assert len(positions) == 1
+    assert positions[0]["qty"] == 5.0
+
+
+def test_get_positions_excludes_closed_positions(tmp_path: Path):
+    """B-11: only POSITION_STATUS_OPEN positions may reach the risk engine."""
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAPositionStatus,
+        ProtoOATradeSide,
+    )
+
+    adapter = _make_reconcile_adapter(
+        tmp_path,
+        _reconcile_response(
+            [
+                _reconcile_position(
+                    status=ProtoOAPositionStatus.POSITION_STATUS_OPEN,
+                    trade_side=ProtoOATradeSide.BUY,
+                    symbol_id=1,
+                    volume=5000,
+                ),
+                _reconcile_position(
+                    status=ProtoOAPositionStatus.POSITION_STATUS_CLOSED,
+                    trade_side=ProtoOATradeSide.BUY,
+                    symbol_id=1,
+                    volume=9999,
+                ),
+            ]
+        ),
+    )
+    adapter._symbol_name_to_id = {"EURUSD": 1}
+
+    positions = _run_get_positions(adapter)
+
+    symbols_and_qty = [(p["symbol"], p["qty"]) for p in positions]
+    assert ("EURUSD", 5.0) in symbols_and_qty, (
+        f"Open BUY position (volume 5000) missing from get_positions: {positions}"
+    )
+    # The closed position carried volume 9999 (qty 9.999); if it leaked, the
+    # result would hold two rows. Assert on the closed volume directly.
+    assert all(qty != 9.999 for _sym, qty in symbols_and_qty), (
+        f"Closed position (volume 9999) leaked into open positions: {positions}"
+    )
+    assert len(positions) == 1, f"Expected only the open position: {positions}"
+
+
+def test_get_positions_maps_symbol_ids_to_names(tmp_path: Path):
+    """B-12: the reconcile payload's symbolId must resolve through the map."""
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAPositionStatus,
+        ProtoOATradeSide,
+    )
+
+    adapter = _make_reconcile_adapter(
+        tmp_path,
+        _reconcile_response(
+            [
+                _reconcile_position(
+                    status=ProtoOAPositionStatus.POSITION_STATUS_OPEN,
+                    trade_side=ProtoOATradeSide.BUY,
+                    symbol_id=2,
+                    volume=4000,
+                )
+            ],
+        ),
+    )
+    adapter._symbol_name_to_id = {"EURUSD": 1, "USDJPY": 2}
+
+    positions = _run_get_positions(adapter)
+
+    assert len(positions) == 1
+    assert positions[0]["symbol"] == "USDJPY"
+    assert positions[0]["qty"] == 4.0
+
+
+def test_get_positions_falls_back_to_raw_id_for_unknown_symbol(tmp_path: Path):
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAPositionStatus,
+        ProtoOATradeSide,
+    )
+
+    adapter = _make_reconcile_adapter(
+        tmp_path,
+        _reconcile_response(
+            [
+                _reconcile_position(
+                    status=ProtoOAPositionStatus.POSITION_STATUS_OPEN,
+                    trade_side=ProtoOATradeSide.BUY,
+                    symbol_id=42,
+                    volume=1000,
+                )
+            ],
+        ),
+    )
+    adapter._symbol_name_to_id = {}
+
+    positions = _run_get_positions(adapter)
+
+    assert positions[0]["symbol"] == "42"
+    assert positions[0]["qty"] == 1.0
 
 
 # ─── Broker order ID roundtrip ────────────────────────────────────────────────
