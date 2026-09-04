@@ -69,10 +69,19 @@ def _run_grid_cell(
     except Exception as exc:  # noqa: BLE001 — a failing cell must not abort the grid
         return {"status": "error", "error": str(exc)}
 
-    return _cell_from_stats(result.stats if result.stats else {}, has_trades=bool(result.trades))
+    return _cell_from_stats(
+        result.stats if result.stats else {},
+        has_trades=bool(result.trades),
+        trade_count=len(result.trades),
+    )
 
 
-def _cell_from_stats(stats: dict[str, Any], *, has_trades: bool) -> dict[str, Any]:
+def _cell_from_stats(
+    stats: dict[str, Any],
+    *,
+    has_trades: bool,
+    trade_count: int,
+) -> dict[str, Any]:
     """Build the cell payload from engine stats.
 
     Canonical stats keys only — never fabricate zero metrics for missing keys.
@@ -83,7 +92,7 @@ def _cell_from_stats(stats: dict[str, Any], *, has_trades: bool) -> dict[str, An
     """
     cell: dict[str, Any] = {
         "status": "no_trades" if not has_trades else "success",
-        "total_trades": _total_trades_from(stats, has_trades),
+        "total_trades": _total_trades_from(stats, has_trades, trade_count),
     }
     for source_key, canonical_key in _CANONICAL_STAT_KEYS:
         value = stats.get(source_key)
@@ -100,13 +109,17 @@ def _cell_from_stats(stats: dict[str, Any], *, has_trades: bool) -> dict[str, An
     return cell
 
 
-def _total_trades_from(stats: dict[str, Any], has_trades: bool) -> int | None:
+def _total_trades_from(
+    stats: dict[str, Any],
+    has_trades: bool,
+    trade_count: int,
+) -> int | None:
     """Best-effort trade count from engine stats.
 
     A count present in the stats is surfaced as-is (an explicit zero for a
     no-trade run is observed, not fabricated). A missing or unparseable count
-    falls back to the observed trades on the result; only when neither source
-    knows is it ``None`` — never a fabricated zero or minimum.
+    falls back to the number of trades observed on the result; only when
+    neither source knows is it ``None`` — never a fabricated zero or minimum.
     """
     raw = stats.get("total_trades")
     if raw is not None:
@@ -115,7 +128,7 @@ def _total_trades_from(stats: dict[str, Any], has_trades: bool) -> int | None:
         except (TypeError, ValueError):
             pass
     if has_trades:
-        return 1
+        return trade_count
     return 0 if not stats else None
 
 

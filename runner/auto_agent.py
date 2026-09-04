@@ -14,6 +14,7 @@ import ast
 import json
 import os
 import re
+import selectors
 import subprocess
 import time
 import sys
@@ -806,6 +807,11 @@ def _build_backtest_command(
 
 
 BACKTEST_TIMEOUT_SECONDS = 1800
+# Upper bound on how long the streaming loop waits inside one select() call.
+# Short enough that a deadline shrink mid-run (tests) is honored promptly.
+_DEADLINE_POLL_INTERVAL = 0.5
+# Output is read in bounded chunks after select() reports readiness.
+_READ_CHUNK = 65_536
 
 
 def _backtest_timeout() -> float:
@@ -831,19 +837,38 @@ def _run_backtest(cmd: list[str], *, log: TaskLogger | None) -> tuple[int, str]:
 
     deadline = time.monotonic() + _backtest_timeout()
     try:
-        # Read with a deadline: a child that streams forever (or blocks on a
-        # full pipe) must not outlive BACKTEST_TIMEOUT_SECONDS any more than a
-        # child that sits silent — the wall-clock bound has to cover output
-        # streaming too, not just the final wait().
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                _timeout(proc, cmd)
-            line = proc.stdout.readline() if proc.stdout is not None else ""
-            if not line:
-                break
-            output_lines.append(line)
-            _log(log, line.rstrip("\n"), stream="stdout")
+        # Read with a deadline: a child that streams forever (or hangs on a
+        # partial line) must not outlive BACKTEST_TIMEOUT_SECONDS any more than
+        # a child that sits silent — os.read() after select() never blocks
+        # longer than one deadline slice, unlike a blocking readline().
+        stdout_fd = proc.stdout.fileno() if proc.stdout is not None else None
+        selector = selectors.DefaultSelector()
+        if stdout_fd is not None:
+            selector.register(stdout_fd, selectors.EVENT_READ)
+        pending = ""
+        try:
+            while stdout_fd is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    _timeout(proc, cmd)
+                # select() wakes on output or after the slice, so a child that
+                # stays silent (or hangs mid-line) still comes back here to
+                # re-check the deadline.
+                if not selector.select(timeout=min(remaining, _DEADLINE_POLL_INTERVAL)):
+                    continue
+                chunk = os.read(stdout_fd, _READ_CHUNK)
+                if not chunk:
+                    break
+                pending += chunk.decode(errors="replace")
+                *complete, pending = pending.split("\n")
+                for line in complete:
+                    output_lines.append(line + "\n")
+                    _log(log, line, stream="stdout")
+            if pending:
+                output_lines.append(pending)
+                _log(log, pending, stream="stdout")
+        finally:
+            selector.close()
         try:
             returncode = proc.wait(timeout=max(0.0, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:

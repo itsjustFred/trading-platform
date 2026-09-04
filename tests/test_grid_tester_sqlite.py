@@ -299,9 +299,10 @@ def test_run_strategy_grid_passes_strategy_path_and_reports_errors(monkeypatch, 
 
 
 def test_trading_run_without_trade_count_reports_presence_not_zero(monkeypatch, tmp_path) -> None:
-    """Pre-mortem 16-B #11: total_trades precedence — an explicit stats count
-    wins, the observed-trades fallback reports presence (1), never a fabricated
-    zero or minimum."""
+    """Pre-mortem 16-B #11, batch-review follow-up: total_trades precedence —
+    an explicit stats count wins; the observed-trades fallback surfaces the
+    REAL number of trades on the result, never a fabricated zero, minimum (1)
+    or loss of magnitude (a 50-trade cell must not persist as 1)."""
     from shared.models import BacktestMeta, BacktestResult
 
     import runner.grid_tester as grid_tester_module
@@ -322,9 +323,9 @@ def test_trading_run_without_trade_count_reports_presence_not_zero(monkeypatch, 
                     data={"symbols": config.symbols, "timeframes": [config.timeframe]},
                     parameters={},
                 ),
-                trades=[object(), object(), object()],
+                # 50 observed trades; stats deliberately lack total_trades.
+                trades=[object() for _ in range(50)],
                 equity_curve=[],
-                # Stats present but without a total_trades key.
                 stats={"sharpe": 1.1},
             )
 
@@ -353,8 +354,29 @@ def test_trading_run_without_trade_count_reports_presence_not_zero(monkeypatch, 
 
     cell = result["results"]["AAPL"]["1h"]
     assert cell["status"] == "success"
-    assert cell["total_trades"] == 1
+    # The 50 observed trades, not a fabricated presence-marker of 1.
+    assert cell["total_trades"] == 50
     assert cell["sharpe_ratio"] == 1.1
+
+
+def test_total_trades_fallback_sources() -> None:
+    """Unit-level precedence of _total_trades_from: stats count wins, observed
+    trades are the fallback, an explicit zero stays a zero, unknown is None."""
+    from runner.grid_tester import _total_trades_from
+
+    # Explicit stats count wins over the observed count.
+    assert _total_trades_from({"total_trades": 7}, True, trade_count=50) == 7
+    # No stats count: the real observed count, not a literal 1.
+    assert _total_trades_from({}, True, trade_count=50) == 50
+    assert _total_trades_from({"sharpe": 1.0}, True, trade_count=3) == 3
+    # Unparseable stats count falls through to the observed trades.
+    assert _total_trades_from({"total_trades": "many"}, True, trade_count=4) == 4
+    # An explicit zero in the stats is observed, not fabricated.
+    assert _total_trades_from({"total_trades": 0}, False, trade_count=0) == 0
+    # No-trade run with no stats at all: observed zero.
+    assert _total_trades_from({}, False, trade_count=0) == 0
+    # Neither source knows: None, never a fabricated number.
+    assert _total_trades_from({"sharpe": 1.0}, False, trade_count=0) is None
 
 
 def test_all_error_grid_is_not_persisted(monkeypatch, tmp_path) -> None:
