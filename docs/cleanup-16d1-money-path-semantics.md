@@ -242,13 +242,18 @@ at most one position at a time, so realized-only vs MTM sizing coincide).
 The changed fields (vectorbt `total_bars`, curve timing) are exactly the
 documented semantics fixes.
 
-## D8 appendix — annualization ceiling
+## D8 appendix — annualization cadence
 
-`_infer_portfolio_periods_per_year` caps the inferred periods-per-year at
-`252 × 4` (≈1008): equity points spaced more than ~8.7 hours apart are
-treated as daily-or-coarser and map to the 252 convention; faster cadences
-scale linearly up to the cap. This keeps sub-hourly curves from producing
-absurd sqrt multipliers while still annualizing intraday curves proportionally.
+`_infer_portfolio_periods_per_year` infers the annualization period count
+from the median equity-point spacing: equity points spaced more than ~8.7
+hours apart are treated as daily-or-coarser and map to the 252 convention;
+faster cadences scale linearly (4-hourly points → ≈2192, hourly → ≈8766).
+There is no artificial ceiling: clamping an intraday curve's period count
+(the earlier `252 × 4` ≈ 1008 cap) would understate the annualization
+relative to the daily-resampled convention stats.py reports — a 4-hourly
+curve annualized with sqrt(1008) ≈ sqrt(6) too small. Sub-hourly curves
+still need enough bars for the per-observation mean/std to be meaningful,
+which is a sample-size question the cadence cap never addressed.
 
 ## D11 appendix — vectorbt bar-count reload
 

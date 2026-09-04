@@ -173,13 +173,13 @@ class TestAnnualizationCadenceCalibration:
         finally:
             portfolio_optimizer._LAST_PORTFOLIO_TIMESTAMPS.clear()
 
-    def test_intraday_cadence_scales_but_is_capped(self):
-        """Hourly cadence scales periods-per-year but hits the 252*4 ceiling.
+    def test_intraday_cadence_scales_uncapped(self):
+        """Hourly cadence scales periods-per-year with no artificial ceiling.
 
-        The ceiling (1008) binds for hourly curves — that IS the documented
-        cap's purpose. Kills the ceiling mutant (40 instead of 252*4) and
-        pins that the cap, not the calendar count (~8766) or the default
-        (252), is returned.
+        Kills the ceiling mutant (min(ppy, 252*4) instead of ppy): an hourly
+        curve must annualize with the true calendar count (~8766), not a
+        clamped 1008 — the cap understated intraday Sharpe by
+        sqrt(8766/1008) ≈ 2.9x relative to the daily-resampled convention.
         """
         times = list(range(1_700_000_000, 1_700_000_000 + 300 * 3600, 3600))
         equity = np.array([100_000.0 * (1 + 0.0005 * math.sin(i)) for i in range(300)])
@@ -191,12 +191,10 @@ class TestAnnualizationCadenceCalibration:
             periods = portfolio_optimizer._infer_portfolio_periods_per_year(
                 equity_matrix
             )
-            assert periods == pytest.approx(
-                portfolio_optimizer.PORTFOLIO_PERIODS_PER_YEAR_DEFAULT * 4
-            ), (
-                "hourly curves must hit the 252*4 ceiling — a lower value means "
-                "the cap constant was shrunk, a calendar-scale value means the "
-                "cap was dropped"
+            assert periods == pytest.approx(365.25 * 24), (
+                "hourly curves must annualize with the true hourly period "
+                "count (~8766) — a 1008-ish value means the 252*4 ceiling "
+                "was reintroduced, 252 means the sub-daily scaling was dropped"
             )
         finally:
             portfolio_optimizer._LAST_PORTFOLIO_TIMESTAMPS.clear()
