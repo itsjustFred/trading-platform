@@ -990,7 +990,11 @@ class TestStatsKeysContract:
             stats_csv.write_text(self.PYNE_STATS_CSV)
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
-        with patch("runner.engines.pynecore_adapter.subprocess.run", side_effect=fake_run):
+        with patch(
+            "runner.engines.pynecore_adapter.shutil.which", return_value="/usr/bin/pyne"
+        ), patch(
+            "runner.engines.pynecore_adapter.subprocess.run", side_effect=fake_run
+        ):
             result = PyneCoreAdapter().run(cfg, STRATEGY_PATH)
 
         assert len(result.trades) > 0, "the stubbed CLI output must yield trades"
@@ -1025,6 +1029,8 @@ class TestStatsKeysContract:
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
         with patch(
+            "runner.engines.pynecore_adapter.shutil.which", return_value="/usr/bin/pyne"
+        ), patch(
             "runner.engines.pynecore_adapter.subprocess.run", side_effect=fake_run
         ), patch(
             "runner.engines.pynecore_adapter._parse_stats_csv",
