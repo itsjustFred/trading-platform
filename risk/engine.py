@@ -240,6 +240,12 @@ class RiskEngine:
         if position_size * signal.entry_price > max_notional:
             position_size = max_notional / signal.entry_price
             capped_by_notional = True
+        # risk_amount/risk_percent stay the policy figures sizing was asked for
+        # (they anchor the validation-reference parity contract); the realized
+        # stop-loss amount of a notional-capped position is reported here.
+        realized_risk_amount = (
+            position_size * risk_distance * pip if capped_by_notional else None
+        )
         risk_reward_ratio = self._risk_reward_ratio(signal, stop_loss)
 
         return self._sized_order(
@@ -263,6 +269,11 @@ class RiskEngine:
                     "stop_source": stop_source,
                     "max_notional_per_trade": self.config.max_notional_per_trade,
                     "capped_by_notional": capped_by_notional,
+                    **(
+                        {"realized_risk_amount": realized_risk_amount}
+                        if realized_risk_amount is not None
+                        else {}
+                    ),
                 },
             ),
         )
