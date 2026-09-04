@@ -195,11 +195,17 @@ def test_dedupe_reports_without_confirm_too() -> None:
 
 def test_signal_bot_registry_mapping_is_complete_and_loadable() -> None:
     """Every registered bot must have a mapped config that yields a non-empty mapping."""
-    from signal_bots.registry import BOT_CONFIG_PATHS, SIGNAL_PROCESSORS
-
-    assert set(SIGNAL_PROCESSORS) == set(BOT_CONFIG_PATHS), (
-        "SIGNAL_PROCESSORS and BOT_CONFIG_PATHS must not drift apart"
+    from signal_bots.registry import (
+        SIGNAL_PROCESSORS,
+        SIGNAL_PROCESSOR_OPTIONS,
+        get_signal_processor_config_path,
     )
-    for name, path in BOT_CONFIG_PATHS.items():
+
+    listed = {option["id"] for option in SIGNAL_PROCESSOR_OPTIONS}
+    assert listed <= set(SIGNAL_PROCESSORS), (
+        "every registry option must have a factory"
+    )
+    for name in SIGNAL_PROCESSORS:
+        path = get_signal_processor_config_path(name)
         assert path.exists(), f"{name}: mapped config missing: {path}"
         assert path.read_text(encoding="utf-8").strip(), f"{name}: mapped config is empty: {path}"

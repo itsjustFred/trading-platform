@@ -32,7 +32,7 @@ def _load_yaml(path: Path) -> dict[str, Any]:
         # per-call config override still get the override, never a partial file.
         raise FileNotFoundError(
             f"Signal processor config file not found: {path} "
-            f"(mapped via BOT_CONFIG_PATHS — update signal_bots/registry.py if it moved)"
+            f"(mapped via _BOT_DIRS — update signal_bots/registry.py if it moved)"
         )
     payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     if not isinstance(payload, dict):
@@ -176,17 +176,6 @@ SIGNAL_PROCESSORS: dict[str, SignalProcessorFactory] = {
     "rocketfuel_longsonly": _build_rocketfuel_longsonly,
     "rocketfuel_longandshort": _build_rocketfuel_longandshort,
     "nitro": _build_nitro,
-}
-
-# Explicit bot -> config file mapping. The health check validates these paths;
-# no bot name may be mapped to a config by string convention.
-BOT_CONFIG_PATHS: dict[str, Path] = {
-    "stockkit": _ROOT / "ramjet" / "config.yaml",
-    "ramjet": _ROOT / "ramjet" / "config.yaml",
-    "nitro": _ROOT / "ramjet" / "config.yaml",
-    "rocketfuel": _ROOT / "rocketfuel" / "config.yaml",
-    "rocketfuel_longsonly": _ROOT / "rocketfuel" / "config.yaml",
-    "rocketfuel_longandshort": _ROOT / "rocketfuel" / "config.yaml",
 }
 
 
