@@ -1415,13 +1415,6 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             return await self._recover_duplicate_signal_order_id(canonical_signal_id)
 
         symbol_id = await self._resolve_symbol_id(signal.symbol)
-        if symbol_id is None:
-            raise ValueError(
-                f"Unknown cTrader symbol: {signal.symbol!r}; refusing to "
-                "persist or submit the signal."
-            )
-        if signal.action not in {"buy", "sell"}:
-            raise ValueError(f"Unsupported signal action: {signal.action}")
 
         request = self._build_new_order_request(signal, symbol_id=symbol_id)
         response = await self._submit_new_order_request(request)
