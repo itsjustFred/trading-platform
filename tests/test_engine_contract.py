@@ -983,19 +983,10 @@ class TestStatsKeysContract:
         data_dir = tmp_contract_dir(contract_data_dir)
         cfg = _config(data_dir, parameters={})
 
-        def fake_run(cmd, **kwargs):
-            trade_csv = Path(cmd[cmd.index("--trade") + 1])
-            trade_csv.write_text(self.PYNE_TRADE_CSV)
-            stats_csv = Path(cmd[cmd.index("--strat") + 1])
-            stats_csv.write_text(self.PYNE_STATS_CSV)
-            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-
-        with patch(
-            "runner.engines.pynecore_adapter.shutil.which", return_value="/usr/bin/pyne"
-        ), patch(
-            "runner.engines.pynecore_adapter.subprocess.run", side_effect=fake_run
-        ):
-            result = PyneCoreAdapter().run(cfg, STRATEGY_PATH)
+        result = _run_pyne_with_stubbed_cli(
+            cfg, STRATEGY_PATH,
+            trade_csv_text=self.PYNE_TRADE_CSV, stats_csv_text=self.PYNE_STATS_CSV,
+        )
 
         assert len(result.trades) > 0, "the stubbed CLI output must yield trades"
         missing = EngineStatsKeys.missing_from(result.stats)
@@ -1021,22 +1012,14 @@ class TestStatsKeysContract:
         # "net_profit" is a pynecore strategy stat; pretend the parsed strategy
         # stats also carry a canonical key ("total_pnl") with a bogus value to
         # prove the merge keeps the canonical one underneath.
-        def fake_run(cmd, **kwargs):
-            trade_csv = Path(cmd[cmd.index("--trade") + 1])
-            trade_csv.write_text(self.PYNE_TRADE_CSV)
-            stats_csv = Path(cmd[cmd.index("--strat") + 1])
-            stats_csv.write_text(self.PYNE_STATS_CSV)
-            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-
         with patch(
-            "runner.engines.pynecore_adapter.shutil.which", return_value="/usr/bin/pyne"
-        ), patch(
-            "runner.engines.pynecore_adapter.subprocess.run", side_effect=fake_run
-        ), patch(
             "runner.engines.pynecore_adapter._parse_stats_csv",
             side_effect=lambda path: {**_real_parse_stats_csv(path), "total_pnl": 99.0},
         ):
-            result = PyneCoreAdapter().run(cfg, STRATEGY_PATH)
+            result = _run_pyne_with_stubbed_cli(
+                cfg, STRATEGY_PATH,
+                trade_csv_text=self.PYNE_TRADE_CSV, stats_csv_text=self.PYNE_STATS_CSV,
+            )
 
         assert result.stats.get("total_pnl") != 99.0, (
             "the engine-specific strategy stat must not shadow the canonical "
@@ -1106,6 +1089,29 @@ def _stub_pyne_cli(captured: dict[str, list[str]], *, trade_csv_text: str = "", 
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     return fake_run
+
+
+def _run_pyne_with_stubbed_cli(cfg, strategy_path, *, trade_csv_text, stats_csv_text):
+    """Run PyneCoreAdapter.run() with the pyne CLI stubbed at the subprocess
+    boundary: `shutil.which` resolves a fake binary and `subprocess.run`
+    writes the given CSV artifacts and exits cleanly. Returns the result."""
+    from contextlib import ExitStack
+
+    def fake_run(cmd, **kwargs):
+        trade_csv = Path(cmd[cmd.index("--trade") + 1])
+        trade_csv.write_text(trade_csv_text)
+        stats_csv = Path(cmd[cmd.index("--strat") + 1])
+        stats_csv.write_text(stats_csv_text)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch("runner.engines.pynecore_adapter.shutil.which", return_value="/usr/bin/pyne")
+        )
+        stack.enter_context(
+            patch("runner.engines.pynecore_adapter.subprocess.run", side_effect=fake_run)
+        )
+        return PyneCoreAdapter().run(cfg, strategy_path)
 
 
 PYNE_EMPTY_TRADE_CSV = (
@@ -1202,6 +1208,29 @@ def main(
             }
         )
 
+    def _run_pyne_dispatch(self, tmp_path: Path):
+        """Write the parity fixture and dispatch it through the adapter with
+        the CLI stubbed; returns (strategy_path, captured-command dict)."""
+        data = self._pyne_fixture()
+        _write_ohlcv(tmp_path, "PARITY", "1h", data)
+        strategy_path = tmp_path / "contract_pyne_sma.py"
+        strategy_path.write_text(self.PYNE_FIXTURE_PY)
+
+        captured: dict[str, list[str]] = {}
+        cfg = _config(
+            tmp_path,
+            strategy_name="contract_pyne_sma",
+            start_date="2024-01-01",
+            end_date="2024-01-01",
+            parameters={},
+        )
+        with patch(
+            "runner.engines.pynecore_adapter.subprocess.run",
+            side_effect=_stub_pyne_cli(captured, stats_csv_text="Metric,All USD\n"),
+        ):
+            PyneCoreAdapter().run(cfg, str(strategy_path))
+        return strategy_path, captured
+
     @staticmethod
     def _run_pyne(
         tmp_path: Path, strategy_path: Path, csv_path: Path, end_bound: str, start_bound: str = "2024-01-01"
@@ -1274,24 +1303,7 @@ def main(
         CLI then cuts at midnight, the pyne backtest window is a strict subset
         of the native/vectorbt window for the same configuration.
         """
-        data = self._pyne_fixture()
-        _write_ohlcv(tmp_path, "PARITY", "1h", data)
-        strategy_path = tmp_path / "contract_pyne_sma.py"
-        strategy_path.write_text(self.PYNE_FIXTURE_PY)
-
-        captured: dict[str, list[str]] = {}
-        cfg = _config(
-            tmp_path,
-            strategy_name="contract_pyne_sma",
-            start_date="2024-01-01",
-            end_date="2024-01-01",
-            parameters={},
-        )
-        with patch(
-            "runner.engines.pynecore_adapter.subprocess.run",
-            side_effect=_stub_pyne_cli(captured, stats_csv_text="Metric,All USD\n"),
-        ):
-            PyneCoreAdapter().run(cfg, str(strategy_path))
+        strategy_path, captured = self._run_pyne_dispatch(tmp_path)
 
         cmd = captured["cmd"]
         end_bound = cmd[cmd.index("--to") + 1]
@@ -1312,24 +1324,7 @@ def main(
         must pass an aware UTC start-of-day instant (both bounds aware = host
         TZ irrelevant).
         """
-        data = self._pyne_fixture()
-        _write_ohlcv(tmp_path, "PARITY", "1h", data)
-        strategy_path = tmp_path / "contract_pyne_sma.py"
-        strategy_path.write_text(self.PYNE_FIXTURE_PY)
-
-        captured: dict[str, list[str]] = {}
-        cfg = _config(
-            tmp_path,
-            strategy_name="contract_pyne_sma",
-            start_date="2024-01-01",
-            end_date="2024-01-01",
-            parameters={},
-        )
-        with patch(
-            "runner.engines.pynecore_adapter.subprocess.run",
-            side_effect=_stub_pyne_cli(captured, stats_csv_text="Metric,All USD\n"),
-        ):
-            PyneCoreAdapter().run(cfg, str(strategy_path))
+        strategy_path, captured = self._run_pyne_dispatch(tmp_path)
 
         cmd = captured["cmd"]
         start_bound = cmd[cmd.index("--from") + 1]
