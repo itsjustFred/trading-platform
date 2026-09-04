@@ -957,6 +957,11 @@ def _trusted_author_ids_from_config(value: object) -> set[str]:
 
 
 def _deployment_trusted_author_ids(deployment: LiveDeploymentConfig) -> set[str]:
+    """Return this deployment's configured trusted-author allowlist (may be empty).
+
+    Only `trusted_author_ids` is documented (docs/signal_bots.md); the other
+    spellings are accepted for operator convenience but are not advertised.
+    """
     configured = deployment.signal_config or {}
     settings = deployment.settings or {}
     return _trusted_author_ids_from_config(
@@ -1585,16 +1590,15 @@ async def _reconnect_discord_bot_source(
     if source.is_connected or (running_task is not None and not running_task.done()):
         return
     if _is_discord_service_reconnect_blocked(service_id):
+        retry_not_before = _DISCORD_SERVICE_RECONNECT_RETRY_NOT_BEFORE.get(service_id)
         logger.debug(
             "Discord bot reconnect deferred; inside transient retry backoff",
             extra={
                 "data": {
                     "service_id": service_id,
                     "service_name": service.name,
-                    "retry_not_before": _DISCORD_SERVICE_RECONNECT_RETRY_NOT_BEFORE.get(
-                        service_id
-                    ).isoformat()
-                    if _DISCORD_SERVICE_RECONNECT_RETRY_NOT_BEFORE.get(service_id)
+                    "retry_not_before": retry_not_before.isoformat()
+                    if retry_not_before
                     else None,
                 }
             },
@@ -1675,7 +1679,9 @@ async def _ensure_discord_bot_source(
             )
         if not trusted_author_ids:
             # Fail closed: a bot service without an author allowlist must not
-            # ingest signals from unverified channel members.
+            # ingest signals from unverified channel members. The service is
+            # marked FAILED so the dashboard shows it as not ingesting instead
+            # of silently looking healthy (drops must be visible, not silent).
             logger.warning(
                 "Discord bot not started: no trusted_author_ids configured",
                 extra={
@@ -1684,6 +1690,11 @@ async def _ensure_discord_bot_source(
                         "service_name": service.name,
                     }
                 },
+            )
+            await asyncio.to_thread(
+                update_service_status,
+                service_id,
+                ServiceStatus.FAILED,
             )
             return
         source = DiscordSignalSource(

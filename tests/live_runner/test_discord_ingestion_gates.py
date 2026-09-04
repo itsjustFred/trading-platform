@@ -250,15 +250,15 @@ def test_burst_of_35_messages_all_reach_the_queue() -> None:
 def test_gap_detection_warns_with_channel_and_count(caplog) -> None:
     """The proposed surfacing contract: when the fetched page does not connect
     to the last seen message (a gap), log a warning naming the channel and the
-    estimated dropped count."""
+    boundary ids. Discord snowflake ids are not contiguous, so the log reports
+    the boundary rather than an invented message count."""
     import asyncio
 
     source = _source()
     source._last_seen_message_ids["channel-1"] = "100000000000000100"
 
     async def _fetch(_channel_id):
-        # Newest message jumps far beyond the last seen id: 99 messages missed.
-
+        # Newest message jumps far beyond the last seen id: history skipped.
         return [
             {
                 "id": "100000000000000200",
@@ -292,15 +292,16 @@ def test_gap_detection_warns_with_channel_and_count(caplog) -> None:
     assert gap_records, "a detected burst gap must be logged, not silent"
     data = getattr(gap_records[0], "data", {})
     assert data.get("channel_id") == "channel-1"
-    assert int(data.get("estimated_dropped", 0)) >= 1
+    assert data.get("last_seen_message_id") == "100000000000000100"
+    assert data.get("oldest_fetched_message_id") == "100000000000000200"
 
 
 def test_no_gap_warning_on_contiguous_page() -> None:
     import asyncio
 
-
     source = _source()
-    source._last_seen_message_ids["channel-1"] = "100000000000000099"
+    # The page reaches back to the last seen id: nothing was skipped.
+    source._last_seen_message_ids["channel-1"] = "100000000000000100"
 
     async def _fetch(_channel_id):
         return [

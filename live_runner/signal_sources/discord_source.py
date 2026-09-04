@@ -580,13 +580,8 @@ class DiscordSignalSource(BaseSignalSource):
         seen.intersection_update(
             message_id
             for message_id in seen
-            if _safe_message_id_int(message_id) is None
-            or _safe_message_id_int(message_id) > cursor
+            if (_safe_message_id_int(message_id) or cursor + 1) > cursor
         )
-
-    @staticmethod
-    def _safe_message_id_value(message_id: str) -> int | None:
-        return _safe_message_id_int(message_id)
 
     def _log_page_gap(
         self,
@@ -594,12 +589,14 @@ class DiscordSignalSource(BaseSignalSource):
         last_seen: str,
         messages: list[dict[str, Any]],
     ) -> None:
-        """Surface dropped messages instead of silently skipping them.
+        """Surface skipped history instead of silently skipping it.
 
         The REST poll fetches at most POLL_LIMIT messages per call. When the
-        page does not reach back to the last seen message, every message older
-        than the page boundary was outside the fetch window and is treated as
-        dropped; that count is logged so bursts are visible in ops.
+        page does not reach back to the last seen message, messages between
+        the page boundary and the cursor were never fetched. The snowflake id
+        distance is NOT a message count (ids are not contiguous), so the log
+        reports the boundary ids rather than an invented count; ops can query
+        Discord's audit log for the exact volume if needed.
         """
         if not last_seen:
             return
@@ -608,19 +605,16 @@ class DiscordSignalSource(BaseSignalSource):
             if int(oldest) <= int(last_seen):
                 # The page overlaps history we already tracked: nothing skipped.
                 return
-            estimated_dropped = int(oldest) - int(last_seen) - 1
         except ValueError:
             return
-        if estimated_dropped <= 0:
-            return
         logger.warning(
-            "Discord poll gap detected; older messages were dropped",
+            "Discord poll gap detected; messages between the last seen id and "
+            "the oldest fetched id were not polled",
             extra={
                 "data": {
                     "bot_name": self.bot_name,
                     "service_id": self.service_id,
                     "channel_id": channel_id,
-                    "estimated_dropped": estimated_dropped,
                     "last_seen_message_id": last_seen,
                     "oldest_fetched_message_id": oldest,
                     "poll_limit": POLL_LIMIT,
