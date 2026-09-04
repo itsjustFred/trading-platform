@@ -110,6 +110,13 @@ class RamJetSignalProcessor:
                             break
                 if st_dir_col in st.columns:
                     frame["supertrend"] = st[st_dir_col] == 1
+                    # Same warm-up contract as the fallback below: pandas_ta
+                    # emits a direction for every bar, including the early ones
+                    # whose ATR is still converging, and process_signal reads
+                    # supertrend_ready as ready when the column is missing —
+                    # so the marker must be set here too, or the warm-up bar
+                    # would be reported as a genuine direction.
+                    frame["supertrend_ready"] = np.arange(len(frame)) >= int(period)
                     st_dir_found = True
 
         if not st_dir_found:
@@ -223,13 +230,14 @@ class RamJetSignalProcessor:
         # False while the frame is shorter than the Supertrend warm-up: in that
         # regime supertrend=False means "unknown", not "bearish", so consumers
         # of supertrend_green_at_entry / the trailing flip workflow must not
-        # read a direction into it. The pandas_ta branch (when the library is
-        # available) computes a real direction and emits no marker, so its
-        # output counts as ready.
+        # read a direction into it. Both Supertrend paths above set the marker
+        # (the pandas_ta branch for the library's own warm-up, the fallback for
+        # the fail-closed zero seed), so a missing column is unexpected and
+        # stays fail-closed instead of silently reporting ready.
         supertrend_ready = (
             bool(frame["supertrend_ready"].iloc[-1])
             if "supertrend_ready" in frame.columns
-            else True
+            else False
         )
 
         timeframe = _resolve_timeframe(raw_signal.get("timeframe")) or self.default_timeframe
