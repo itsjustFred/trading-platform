@@ -415,8 +415,11 @@ def _load_strategy_helper_namespace(strategy_path: Path, source: str) -> dict[st
 # entry transitively widens what helper code can reach. The banned-call list
 # below is only a second fence, not a sandbox. Additions here need a
 # security-review and a test in tests/test_pynecore_helper_containment.py.
+# "__future__" is the compiler-flag pseudo-module (inert at runtime, no
+# attribute surface) so helper code may opt into postponed annotations.
 HELPER_ALLOWED_IMPORT_ROOTS = frozenset(
     {
+        "__future__",
         "pandas",
         "numpy",
         "math",
@@ -497,12 +500,18 @@ def _compile_helper_namespace(
     tree = ast.parse(source, filename=str(source_path))
     helper_nodes: list[ast.stmt] = []
     allowed_names = function_names or {"build_trade_context", "build_drawings"}
-    for node in tree.body:
+    for position, node in enumerate(tree.body):
         if isinstance(node, (ast.Import, ast.ImportFrom)):
             helper_nodes.append(node)
         elif isinstance(node, ast.FunctionDef) and node.name in allowed_names:
             helper_nodes.append(node)
-        elif strict_structure:
+        elif strict_structure and not (
+            position == 0
+            and isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Constant)
+        ):
+            # A leading string constant is the module docstring — inert, so it
+            # is dropped from the compiled module but does not fail the screen.
             raise RuntimeError(
                 f"Only imports and helper functions ({', '.join(sorted(allowed_names))}) "
                 f"are allowed in strategy helper code ({source_path.name}); found "
