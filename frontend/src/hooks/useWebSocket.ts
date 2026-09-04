@@ -72,6 +72,9 @@ export function useWebSocket<TMessage = unknown>(
   const socketRef = useRef<WebSocket | null>(null);
   const onMessageRef = useRef<typeof onMessage>(onMessage);
   const onOpenRef = useRef<typeof onOpen>(onOpen);
+  // Plain-text feeds cannot exchange JSON control frames; a non-positive
+  // interval therefore disables the heartbeat timer entirely.
+  const heartbeatEnabled = heartbeatIntervalMs > 0;
   const [status, setStatus] = useState<WebSocketStatus>("idle");
   const [isConnected, setIsConnected] = useState(false);
   const [lastMessage, setLastMessage] = useState<TMessage | null>(null);
@@ -168,6 +171,9 @@ export function useWebSocket<TMessage = unknown>(
 
     const startHeartbeat = () => {
       clearHeartbeatTimer();
+      if (!heartbeatEnabled) {
+        return;
+      }
       heartbeatTimer = window.setInterval(() => {
         if (disposed || socket == null || socket.readyState !== WebSocket.OPEN) {
           return;
@@ -268,6 +274,7 @@ export function useWebSocket<TMessage = unknown>(
     };
   }, [
     enabled,
+    heartbeatEnabled,
     heartbeatIntervalMs,
     heartbeatTimeoutMs,
     maxReconnectDelayMs,

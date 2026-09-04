@@ -65,6 +65,10 @@ export function LiveTerminal({
   const stream = useWebSocket<string>(wsUrl, {
     enabled: Boolean(wsUrl) && !taskFinished,
     messageFormat: "text",
+    // The task feed is plain text: the server never sends ping/pong frames and
+    // stays silent while a job is idle, so the JSON-feed heartbeat would tear
+    // the socket down and replay the log from position 0 on every reconnect.
+    heartbeatIntervalMs: 0,
     onOpen: () => {
       // Fresh connection: the server replays the log from position 0, so start
       // from a clean slate to avoid duplicated lines.
@@ -92,11 +96,12 @@ export function LiveTerminal({
     onStatusChangeRef.current?.(status);
   }, [status]);
 
+  // Runs on mount, when the job is cleared (null), and whenever the job id
+  // changes. A direct switch A→B must reset the terminal state: a stale
+  // terminal status from job A would keep the finished-gate closed and the
+  // feed for job B would never be opened.
   useEffect(() => {
-    if (jobId) {
-      return;
-    }
-    // Deferred: no active job means the feed must not retain previous output.
+    // Deferred: clearing during the same commit must not retain previous output.
     const task = window.setTimeout(() => {
       setLogs("");
       setTaskStatus(null);
