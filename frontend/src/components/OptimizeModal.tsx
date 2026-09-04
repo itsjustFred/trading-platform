@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Crosshair, SlidersHorizontal, Sparkles, Target } from "lucide-react";
 
 import { runOptimization } from "../api/client";
+import { parameterFieldId } from "../lib/liveChartTime";
 import type {
   OptimizationParameterRange,
   OptimizationRunRequest,
@@ -479,6 +480,7 @@ export function OptimizeModal({
             <div style={{ display: "grid", gap: "12px", maxHeight: "50vh", overflowY: "auto", paddingRight: "4px" }}>
               {parameterEntries.map(([name, draft]) => {
                 const isCategorical = draft.kind === "categorical";
+                const fieldId = parameterFieldId(name);
                 return (
                   <div
                     key={name}
@@ -547,9 +549,9 @@ export function OptimizeModal({
 
                       {isCategorical ? (
                         <div>
-                          <label htmlFor="optimize-categories" style={labelStyle}>Categories (comma-separated)</label>
+                          <label htmlFor={`${fieldId}-categories`} style={labelStyle}>Categories (comma-separated)</label>
                           <input
-                            id="optimize-categories"                            value={draft.choices}
+                            id={`${fieldId}-categories`}                            value={draft.choices}
                             onChange={(event) => updateDraft(name, { choices: event.target.value })}
                             placeholder={typeof draft.currentValue === "boolean" ? "true, false" : "sma, ema, wma"}
                             style={inputStyle}
@@ -561,9 +563,9 @@ export function OptimizeModal({
                       ) : (
                         <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: "12px" }}>
                           <div>
-                            <label htmlFor="optimize-min" style={labelStyle}>Min</label>
+                            <label htmlFor={`${fieldId}-min`} style={labelStyle}>Min</label>
                             <input
-                              id="optimize-min"                              type="number"
+                              id={`${fieldId}-min`}                              type="number"
                               value={draft.min}
                               onChange={(event) => updateDraft(name, { min: event.target.value })}
                               placeholder={typeof draft.currentValue === "number" ? String(draft.currentValue) : "0"}
@@ -572,9 +574,9 @@ export function OptimizeModal({
                             />
                           </div>
                           <div>
-                            <label htmlFor="optimize-max" style={labelStyle}>Max</label>
+                            <label htmlFor={`${fieldId}-max`} style={labelStyle}>Max</label>
                             <input
-                              id="optimize-max"                              type="number"
+                              id={`${fieldId}-max`}                              type="number"
                               value={draft.max}
                               onChange={(event) => updateDraft(name, { max: event.target.value })}
                               placeholder={typeof draft.currentValue === "number" ? String(draft.currentValue) : "0"}
@@ -583,9 +585,9 @@ export function OptimizeModal({
                             />
                           </div>
                           <div>
-                            <label htmlFor="optimize-step" style={labelStyle}>Step</label>
+                            <label htmlFor={`${fieldId}-step`} style={labelStyle}>Step</label>
                             <input
-                              id="optimize-step"                              type="number"
+                              id={`${fieldId}-step`}                              type="number"
                               value={draft.step}
                               onChange={(event) => updateDraft(name, { step: event.target.value })}
                               placeholder={draft.kind === "int" ? "1" : "optional"}

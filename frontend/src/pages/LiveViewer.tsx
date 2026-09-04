@@ -22,6 +22,7 @@ import type {
 
 import { getLiveAccounts, getLiveDeployments, getLiveTrades } from "../api/client";
 import { useLivePositions, useLiveQuotes, useLiveSignalLog } from "../api/queries";
+import { toChartTime as toChartTimeUnix } from "../lib/liveChartTime";
 import { stringifyUnknownValue } from "../lib/unknownValue";
 import {
   useLiveExecutionsStream,
@@ -56,7 +57,8 @@ type ViewerTrade = {
   pnl: number | null;
   exitReason: string;
   time: string;
-  signalTimeUnix: number;
+  /** Unix seconds of the exit fill; falls back to the signal time when no execution exists. */
+  exitTimeUnix: number;
 };
 
 type TradeMarker = {
@@ -98,7 +100,7 @@ function signalMarker(signal: LiveSignalLog): TradeMarker | null {
 /** Chart marker for one closed-trade exit. */
 function exitMarker(trade: ViewerTrade): TradeMarker | null {
   if (trade.exit === null) return null;
-  const t = toChartTime(trade.signalTimeUnix);
+  const t = toChartTime(trade.exitTimeUnix);
   if (t === null) return null;
   return {
     id: `exit-${trade.id}`,
@@ -1001,7 +1003,7 @@ function toTradeHistoryRows(rows: LiveTradeSlippage[]): ViewerTrade[] {
       pnl,
       exitReason: row.exit_reason || stringifyUnknownValue(row.signal_metadata?.exit_reason),
       time: row.execution_timestamp || row.signal_timestamp,
-      signalTimeUnix: asFinite(row.signal_time, 0),
+      exitTimeUnix: asFinite(row.execution_time, 0) || asFinite(row.signal_time, 0),
     };
   });
 }
@@ -1168,10 +1170,7 @@ function statusBadgeStyle(status: string): React.CSSProperties {
 }
 
 function toChartTime(value: number): UTCTimestamp | null {
-  if (!Number.isFinite(value) || value <= 0) {
-    return null;
-  }
-  return Math.trunc(value) as UTCTimestamp;
+  return toChartTimeUnix(value) as UTCTimestamp | null;
 }
 
 function asFinite(value: unknown, fallback: number): number {
