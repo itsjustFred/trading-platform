@@ -4765,3 +4765,69 @@ def test_logs_endpoint_sorts_space_separated_timestamps(viewer_client, tmp_path)
         '{"timestamp":"2026-03-08 10:01:00","level":"WARNING","message":"runner-warn"}',
         '{"timestamp":"2026-03-08 10:02:00","level":"ERROR","message":"viewer-fail"}',
     ]
+
+
+def test_download_and_verify_checks_normalized_timeframe(monkeypatch):
+    """Coverage verification must use the normalized timeframe, not the raw argument."""
+    import viewer.main as viewer_app_module
+
+    checked: list[str] = []
+
+    def _fake_verify(**kwargs):
+        checked.append(str(kwargs["timeframe"]))
+
+    monkeypatch.setattr(viewer_app_module, "_build_ohlcv_availability_index", lambda: {})
+    monkeypatch.setattr(
+        viewer_app_module,
+        "_data_check_result",
+        lambda **kwargs: {"available": True},
+    )
+    monkeypatch.setattr(
+        viewer_app_module, "_verify_missing_download_coverage", _fake_verify
+    )
+    monkeypatch.setattr(
+        viewer_app_module,
+        "_auto_download_source_plan",
+        lambda **kwargs: [],
+    )
+    monkeypatch.setattr(
+        viewer_app_module, "_download_missing_ohlcv_data", lambda **kwargs: None
+    )
+    monkeypatch.setattr(
+        viewer_app_module.cache_manager,
+        "invalidate_cache",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(viewer_app_module, "_invalidate_data_views_cache", lambda: None)
+    monkeypatch.setattr(viewer_app_module, "_refresh_catalog", lambda: None)
+
+    viewer_app_module._download_and_verify_missing_data(
+        [{"symbol": "SP500", "source": "dukascopy", "missing_range": None}],
+        normalized_timeframe="1m",
+        start="2024-01-01",
+        end="2024-01-02",
+    )
+
+    assert checked == ["1m"]
+
+
+def test_verify_missing_download_coverage_uses_given_timeframe(monkeypatch):
+    import viewer.main as viewer_app_module
+
+    checked: list[str] = []
+
+    def _fake_data_check(*, symbol, timeframe, start, end, availability_index):
+        checked.append(timeframe)
+        return {"available": True}
+
+    monkeypatch.setattr(viewer_app_module, "_build_ohlcv_availability_index", lambda: {})
+    monkeypatch.setattr(viewer_app_module, "_data_check_result", _fake_data_check)
+
+    viewer_app_module._verify_missing_download_coverage(
+        symbol="SP500",
+        timeframe="1m",
+        start="2024-01-01",
+        end="2024-01-02",
+    )
+
+    assert checked == ["1m"]

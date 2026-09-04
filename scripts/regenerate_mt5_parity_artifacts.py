@@ -63,9 +63,6 @@ COMPARISON_CASES: tuple[dict[str, Any], ...] = (
     },
 )
 
-MT5_SYMBOL_NAS100 = "USATECH.IDX"
-MT5_SYMBOL_SP500 = "USA500.IDX"
-
 MT5_CONTRACT_SIZES: dict[str, float] = {
     "EURUSD": 100_000.0,
     MT5_SYMBOL_NAS100: 1.0,

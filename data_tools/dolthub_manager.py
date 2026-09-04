@@ -198,6 +198,10 @@ def _export_stocks() -> None:
     logger.info(f"Found {len(symbols)} symbols to export.")
 
     for i, symbol in enumerate(symbols):
+        if not _SYMBOL_RE.match(symbol):
+            logger.warning("Skipping unexpected symbol value: %r", symbol)
+            continue
+
         out_parquet = _stock_export_path(target_dir, symbol)
         if out_parquet.exists():
             continue  # skip already exported

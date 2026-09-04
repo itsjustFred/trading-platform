@@ -6872,7 +6872,7 @@ def _download_and_verify_missing_data(
 
         _verify_missing_download_coverage(
             symbol=symbol,
-            timeframe=timeframe,
+            timeframe=normalized_timeframe,
             start=start,
             end=end,
             log_callback=log_callback,
