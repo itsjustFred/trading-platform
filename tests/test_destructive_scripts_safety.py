@@ -8,6 +8,7 @@ and swap the new state in atomically.
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -231,6 +232,83 @@ def test_existing_db_path_prefers_absolute_engine_url(monkeypatch, tmp_path):
 
     assert script._existing_db_path() == tmp_path / "engine.db"
     engine.dispose()
+
+
+def test_sqlite_backup_uses_online_backup_api(tmp_path, monkeypatch):
+    from scripts import regenerate_backtests as script
+
+    db_path = tmp_path / "backtests.db"
+    backup_dir = tmp_path / "backup"
+    backup_dir.mkdir()
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("CREATE TABLE backtests (id TEXT PRIMARY KEY)")
+        connection.execute("INSERT INTO backtests (id) VALUES ('bt-seed')")
+
+    backed_up_from: list[Path] = []
+    real_connect = sqlite3.connect
+
+    class _TrackingConnection:
+        """Wrap a real connection so ``backup`` calls can be observed."""
+
+        def __init__(self, path: Path):
+            self._connection = real_connect(path)
+
+        def backup(self, target, **kwargs):
+            backed_up_from.append(db_path)
+            return self._connection.backup(target, **kwargs)
+
+        def execute(self, *args, **kwargs):
+            return self._connection.execute(*args, **kwargs)
+
+        def commit(self):
+            return self._connection.commit()
+
+        def close(self):
+            return self._connection.close()
+
+    def tracking_connect(path, *args, **kwargs):
+        if Path(path) == db_path and not args and not kwargs:
+            return _TrackingConnection(Path(path))
+        return real_connect(path, *args, **kwargs)
+
+    monkeypatch.setattr(script.sqlite3, "connect", tracking_connect)
+
+    destination = script._dump_sqlite_backup(db_path, backup_dir)
+
+    assert destination == backup_dir / "backtests.db"
+    assert backed_up_from == [db_path], "snapshot must use the sqlite online backup API"
+    with sqlite3.connect(destination) as restored:
+        rows = restored.execute("SELECT id FROM backtests").fetchall()
+    assert rows == [("bt-seed",)]
+
+
+def test_sqlite_backup_survives_persisted_wal_content(tmp_path):
+    from scripts import regenerate_backtests as script
+
+    db_path = tmp_path / "backtests.db"
+    backup_dir = tmp_path / "backup"
+    backup_dir.mkdir()
+
+    connection = sqlite3.connect(db_path)
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("CREATE TABLE backtests (id TEXT PRIMARY KEY)")
+    connection.execute("INSERT INTO backtests (id) VALUES ('bt-seed')")
+    connection.commit()
+    # The commit above lives in <db>-wal until the last connection closes; a raw
+    # file copy taken while the writer is still open misses it.
+    assert (tmp_path / "backtests.db-wal").stat().st_size > 0
+    open_writer = sqlite3.connect(db_path)
+
+    try:
+        destination = script._dump_sqlite_backup(db_path, backup_dir)
+    finally:
+        open_writer.close()
+        connection.close()
+
+    with sqlite3.connect(destination) as restored:
+        rows = restored.execute("SELECT id FROM backtests").fetchall()
+    assert rows == [("bt-seed",)]
+    assert not (backup_dir / "backtests.db-wal").exists()
 
 
 def test_existing_db_path_falls_back_when_engine_url_is_not_absolute(monkeypatch):

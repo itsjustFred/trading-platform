@@ -292,7 +292,20 @@ def _dump_sqlite_backup(db_path: Path, backup_dir: Path) -> Path | None:
     if not db_path.exists():
         return None
     destination = backup_dir / db_path.name
-    shutil.copy2(db_path, destination)
+    # Snapshot the live database with SQLite's online backup API instead of
+    # copying the file: the engine runs in WAL mode, so a raw copy can miss
+    # commits that still live in ``<db>-wal`` and can tear mid-checkpoint.
+    source = sqlite3.connect(db_path)
+    target = sqlite3.connect(destination)
+    try:
+        source.backup(target)
+        # Leave the snapshot in rollback-journal mode so it is a single
+        # self-contained file (the backup inherits the live database's WAL mode).
+        target.execute("PRAGMA journal_mode=DELETE")
+        target.commit()
+    finally:
+        target.close()
+        source.close()
     return destination
 
 
