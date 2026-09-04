@@ -159,8 +159,8 @@ def test_parser_rejects_signal_with_thousands_corrupted_price() -> None:
     signal = _parse_trade_signal_from_message(
         message, default_timeframe="1h", trusted_author_ids={"bot-1"}
     )
-    if signal is not None:
-        assert signal.entry_price == 5934.0
+    assert signal is not None
+    assert signal.entry_price == 5934.0
 
 
 # ── C-3.3: fallback ticker extraction must go ─────────────────────────────────
@@ -211,19 +211,23 @@ def test_no_symbol_at_all_is_rejected() -> None:
 
 def test_burst_of_35_messages_all_reach_the_queue() -> None:
     """With POLL_LIMIT=20 a >20-message burst used to lose every message older
-    than the newest page (_seen_ids replaced per poll). The seen-set must be
-    cumulative so a burst is drained across polls without loss."""
+    than the newest page: the old code replaced _seen_ids per poll AND the
+    monotonic cursor filter dropped any fetched id at/below it — so the 15
+    oldest messages of a 35-message burst were silently dropped on the second
+    poll. Both must not happen: the seen-set is cumulative and only the
+    seen-set dedupes emits."""
     source = _source()
     ids = [str(100000000000000000 + index) for index in range(35)]
     newest_first = list(reversed(ids))
     pages: dict[str, int] = {"n": 0}
 
     async def _fetch(_channel_id):
-        # Discord returns newest-first, at most POLL_LIMIT per page.
+        # Discord returns newest-first, at most POLL_LIMIT per page: page 0 is
+        # the 20 newest messages, page 1 the next-older 15.
         page = pages["n"]
         pages["n"] += 1
-        start = max(0, len(ids) - 20 * (page + 1))
-        end = len(ids) - 20 * page
+        start = 20 * page
+        end = min(len(ids), 20 * (page + 1))
         return [
             {
                 "id": newest_first[index],
@@ -485,6 +489,120 @@ def test_dispatch_fans_out_to_every_matching_deployment() -> None:
         daemon.wait_for_candle_close = original
 
     assert len(submitted) == 2 and len(set(submitted)) == 2
+
+
+def test_dispatch_respects_each_deployments_own_allowlist() -> None:
+    """The listener's merged allowlist is a coarse ingestion filter; before an
+    order is submitted the signal must satisfy the target deployment's own
+    allowlist, so a deployment cannot trade on an author another deployment
+    trusted."""
+    import asyncio
+
+    import live_runner.daemon as daemon
+    from risk import TradeSignal
+
+    submitted: list[str] = []
+
+    class _Adapter:
+        async def submit_order(self, signal):
+            submitted.append(str(signal.deployment_id))
+            return "order-1"
+
+        async def get_balance(self):
+            return 100_000.0, 100_000.0
+
+        async def get_positions(self):
+            return []
+
+    trusted = _deployment_for_test("dep-1", symbols=["AAPL"], channel_id="channel-1")
+    trusted.signal_config["trusted_author_ids"] = ["bot-1"]
+    untrusting = _deployment_for_test("dep-2", symbols=["AAPL"], channel_id="channel-1")
+    untrusting.signal_config["trusted_author_ids"] = ["bot-9"]
+
+    signal = TradeSignal(
+        action="buy",
+        symbol="AAPL",
+        entry_price=200.0,
+        stop_loss=195.0,
+        take_profit=210.0,
+        timeframe="1h",
+        metadata={"discord_channel_id": "channel-1", "discord_author_id": "bot-1"},
+    )
+
+    async def _no_wait(_signal, _timeframe):
+        return None
+
+    original = daemon.wait_for_candle_close
+    daemon.wait_for_candle_close = _no_wait
+    try:
+        asyncio.run(
+            daemon._dispatch_discord_trade_signal(
+                "acc-1",
+                _Adapter(),
+                [trusted, untrusting],
+                signal,
+                accounts_env_values={},
+            )
+        )
+    finally:
+        daemon.wait_for_candle_close = original
+
+    assert len(submitted) == 1
+
+
+def test_dispatch_without_signal_author_metadata_still_dispatches() -> None:
+    """Signals without author metadata (e.g. internal replays) are not blocked
+    by the per-deployment gate: the ingestion gate is the author authority."""
+    import asyncio
+
+    import live_runner.daemon as daemon
+    from risk import TradeSignal
+
+    submitted: list[str] = []
+
+    class _Adapter:
+        async def submit_order(self, signal):
+            submitted.append(str(signal.deployment_id))
+            return "order-1"
+
+        async def get_balance(self):
+            return 100_000.0, 100_000.0
+
+        async def get_positions(self):
+            return []
+
+    deployment = _deployment_for_test("dep-1", symbols=["AAPL"], channel_id="channel-1")
+    deployment.signal_config["trusted_author_ids"] = ["bot-1"]
+
+    signal = TradeSignal(
+        action="buy",
+        symbol="AAPL",
+        entry_price=200.0,
+        stop_loss=195.0,
+        take_profit=210.0,
+        timeframe="1h",
+        metadata={"discord_channel_id": "channel-1"},
+    )
+
+    async def _no_wait(_signal, _timeframe):
+        return None
+
+    original = daemon.wait_for_candle_close
+    daemon.wait_for_candle_close = _no_wait
+    try:
+        asyncio.run(
+            daemon._dispatch_discord_trade_signal(
+                "acc-1",
+                _Adapter(),
+                [deployment],
+                signal,
+                accounts_env_values={},
+            )
+        )
+    finally:
+        daemon.wait_for_candle_close = original
+
+    assert len(submitted) == 1
 
 
 # ── B-4: token routing per deployment-group; auth blocks scoped per channel ───

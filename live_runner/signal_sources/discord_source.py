@@ -532,9 +532,12 @@ class DiscordSignalSource(BaseSignalSource):
             message_id = str(message.get("id"))
             if message_id in seen:
                 continue
-            if emit and last_seen and int(message_id) <= int(last_seen):
-                seen.add(message_id)
-                continue
+            # Dedupe is the cumulative seen-set's job alone. The monotonic
+            # cursor must NOT filter emits: after a burst larger than
+            # POLL_LIMIT the cursor sits above messages that were never
+            # fetched, and a cursor-based filter would drop them (the exact
+            # bug this class exists to prevent). The cursor only seeds `seen`
+            # at priming time.
             seen.add(message_id)
             if not emit:
                 continue

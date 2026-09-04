@@ -103,8 +103,9 @@ Ohne Allowlist startet der Listener nicht (fail-closed). Zusätzlich gilt:
   ohne strukturiertes Tickersymbol (`**$TICKER**`, `Ticker:`, `buy signal AAPL`,
   `$TICKER`, `TICKER $price`) wird verworfen.
 - Nachraten über `POLL_LIMIT` (20) hinaus werden nicht mehr still verworfen: der
-  Seen-Set ist kumulativ, Lücken werden als Warnung mit Kanal und geschätzter
-  Anzahl geloggt.
+  Seen-Set ist kumulativ, Lücken werden als Warnung mit Kanal und den Grenz-IDs
+  (`last_seen_message_id`, `oldest_fetched_message_id`) geloggt. Snowflake-IDs
+  sind nicht fortlaufend, daher wird keine Nachrichtenanzahl berechnet.
 - Ein Discord-Signal wird auf jedes passende Deployment verteilt (Fan-out), nicht
   nur auf das erste.
 - Transiente Reconnect-Fehler schreiben einen Bot-Service nicht dauerhaft auf
