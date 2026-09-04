@@ -245,6 +245,7 @@ def _monitor_backtest_process(
     *,
     timeout_seconds: float = BACKTEST_WATCHDOG_TIMEOUT_SECONDS,
     poll_interval: float = BACKTEST_WATCHDOG_POLL_SECONDS,
+    timed_out: threading.Event | None = None,
 ) -> bool:
     """Bound the whole child process lifetime.
 
@@ -252,6 +253,9 @@ def _monitor_backtest_process(
     EOF, this watchdog fires even when a hung child never closes its stdout.
     Kills the child's whole process group when the deadline expires. Returns
     True when the child exited inside the budget, False when it was killed.
+    When `timed_out` is given, it is set before the kill so the caller's
+    failure path can report the watchdog timeout instead of the kill's
+    negative exit code.
     """
     deadline = time.monotonic() + max(0.0, float(timeout_seconds))
     while True:
@@ -263,6 +267,8 @@ def _monitor_backtest_process(
                 proc.pid,
                 timeout_seconds,
             )
+            if timed_out is not None:
+                timed_out.set()
             _kill_process_group(proc)
             try:
                 proc.wait(timeout=30)
@@ -7727,8 +7733,8 @@ def _trade_context_payload(backtest_id: str, trade_nr: int) -> dict[str, Any]:
         drawings = _collect_viewer_drawings(result, symbol)
 
         if window.ohlcv and indicators:
-            time_start = ohlcv[0]["time"]
-            time_end = ohlcv[-1]["time"]
+            time_start = window.ohlcv[0]["time"]
+            time_end = window.ohlcv[-1]["time"]
             _slice_indicators_to_time_range(indicators, time_start=time_start, time_end=time_end)
 
         return {
@@ -8151,6 +8157,7 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
         output_path = ""
         backtest_id = ""
         stage_progress = 0.0
+        watchdog_timed_out = threading.Event()
 
         def report_stage(
             handle,
@@ -8237,6 +8244,7 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
                     args=(proc,),
                     kwargs={
                         "timeout_seconds": BACKTEST_WATCHDOG_TIMEOUT_SECONDS,
+                        "timed_out": watchdog_timed_out,
                     },
                     daemon=True,
                     name=f"backtest-watchdog-{task_id}",
@@ -8289,7 +8297,14 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
                     returncode = proc.wait(timeout=30)
                 except subprocess.TimeoutExpired:
                     if proc.poll() is None:
+                        watchdog_timed_out.set()
                         _kill_process_group(proc)
+                    raise subprocess.SubprocessError(
+                        f"Backtest timed out after {BACKTEST_WATCHDOG_TIMEOUT_SECONDS:.0f} seconds"
+                    )
+                if watchdog_timed_out.is_set():
+                    # The watchdog killed the child, so its returncode is the
+                    # signal that terminated it (-9), not a real exit status.
                     raise subprocess.SubprocessError(
                         f"Backtest timed out after {BACKTEST_WATCHDOG_TIMEOUT_SECONDS:.0f} seconds"
                     )

@@ -27,3 +27,18 @@ test("best/worst trade render N/A instead of page-scoped stand-ins", async () =>
   assert.match(source, /tradeStats\.bestTrade != null/);
   assert.match(source, /tradeStats\.worstTrade != null/);
 });
+
+test("PSR renders as a fraction per the backend contract", async () => {
+  const { metricScale } = await import("../src/api/metricScale.ts");
+  const { toPercentPoints } = await import("../src/api/metricScale.ts");
+  const source = await pageSource;
+
+  // The backend serves psr as a probability (0..1); the card must convert it,
+  // not render 0.95 as "0.95%".
+  assert.equal(metricScale("psr"), "fraction");
+  assert.equal(toPercentPoints(0.95, "fraction"), 95);
+  assert.match(
+    source,
+    /label="PSR \(higher = better\)"[\s\S]{0,200}percentScale="fraction"/,
+  );
+});

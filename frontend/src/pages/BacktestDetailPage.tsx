@@ -628,7 +628,7 @@ export function BacktestDetailPage() {
             label="PSR (higher = better)"
             value={stats.psr}
             format="percent"
-            percentScale="points"
+            percentScale="fraction"
             color={
               (stats.psr ?? 0) > 0.95
                 ? "#3fb950"
