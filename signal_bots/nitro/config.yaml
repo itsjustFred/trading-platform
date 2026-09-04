@@ -1,0 +1,42 @@
+nitro:
+  # Nitro shares RamJet's formulas (ATR + Supertrend, BUY-only intake) but is a
+  # separate bot: this file is its own config source, so tuning Nitro never
+  # touches RamJet and vice versa. Keep values in sync intentionally, not by
+  # aliasing the other bot's file.
+  #
+  # Risk Management
+  risk_per_trade_percent: 0.01
+  risk_mode: "PERCENT"
+  risk_per_trade_dollar: 1000
+  max_positions: 10
+
+  # ATR Settings
+  atr_period: 14
+
+  # Stop-Loss & Take-Profit (ATR multiples)
+  sl_multiplier: 2.0
+  tp1_multiplier: 3.0
+  tp1_exit_percent: 0.50
+
+  # Supertrend (trailing stop after TP1)
+  supertrend_period: 10
+  supertrend_multiplier: 3.0
+
+  # Timing
+  candle_timeframe: "5Min"
+  discord_poll_interval: 15
+  dashboard_refresh_interval: 1
+
+  # Operational
+  signal_max_age_seconds: 300
+  sl_price_buffer_pct: 0.002
+  order_fill_wait_seconds: 2
+
+  # Trade Filters
+  filters:
+    gap_down:
+      enabled: false
+    vix:
+      enabled: false
+      threshold: 1.5
+      sma_period: 20

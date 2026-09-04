@@ -15,16 +15,19 @@ process_signal(raw_signal: dict, market_data: pd.DataFrame) -> TradeSignal
 
 Zentrale Registry in `signal_bots/registry.py`:
 
-| ID | Klasse | Status |
-|----|--------|--------|
-| `stockkit` | RamJetSignalProcessor | ✅ Verfügbar |
-| `ramjet` | RamJetSignalProcessor | ✅ Verfügbar |
-| `rocketfuel_longsonly` | RocketFuelSignalProcessor | ✅ Verfügbar |
-| `rocketfuel_longandshort` | RocketFuelSignalProcessor | ✅ Verfügbar |
-| `nitro` | NitroSignalProcessor | ✅ Verfügbar (RamJet-Formeln, BUY-only) |
+| ID | Klasse | Config | Status |
+|----|--------|--------|--------|
+| `ramjet` | RamJetSignalProcessor | `signal_bots/ramjet/config.yaml` | ✅ Verfügbar |
+| `rocketfuel_longsonly` | RocketFuelSignalProcessor | `signal_bots/rocketfuel/config.yaml` | ✅ Verfügbar |
+| `rocketfuel_longandshort` | RocketFuelSignalProcessor | `signal_bots/rocketfuel/config.yaml` | ✅ Verfügbar |
+| `nitro` | NitroSignalProcessor | `signal_bots/nitro/config.yaml` | ✅ Verfügbar (RamJet-Formeln, BUY-only) |
 
-Zusätzlich gilt `stockkit` als RamJet-kompatibler Prozessor und wird über dieselbe
-RamJet-Konfiguration validiert.
+**Hinweis:** StockKit ist die Discord-Quelle/der Server, über den die Bots
+signale beziehen — kein Processor. Ein ehemaliger `stockkit`-Alias auf den
+RamJet-Processor wurde entfernt (Decision Record 2026-08-31): jeder Bot hat
+seine eigene Processor-Klasse und ihr eigenes Config-File; gemeinsame
+Low-Level-Helfer sind erlaubt, Processor-Semantik und Konfigurationen bleiben
+pro Bot.
 
 ## Bots im Detail
 
@@ -44,14 +47,14 @@ RamJet-Konfiguration validiert.
 - **Last-Run:** Über Health-Check-Job validierbar
 
 ### StockKit
-- **Status:** Aktiv, registriert als RamJet-kompatible Variante
-- **Features:** Nutzt RamJet-SL/TP- und Trailing-Metadaten-Verhalten
-- **Last-Run:** Über Health-Check-Job validierbar
+- **Status:** Kein Processor — Discord-Quelle/Server (siehe Registry-Hinweis)
+- **Routing:** `live_runner/stockkit_routing.py` mappt die Discord-Bots
+  (`nitro`, `ramjet`, `rocketfuel`) auf ihre Alpaca-Accounts
 
 ## Health-Check Status
 
-**Stand 2026-06-18:**
-- Alle 5 registrierten Prozessoren (`stockkit`, `ramjet`, `rocketfuel_longsonly`,
+**Stand 2026-08-31:**
+- Alle 4 registrierten Prozessoren (`ramjet`, `rocketfuel_longsonly`,
   `rocketfuel_longandshort`, `nitro`) sind importierbar und haben gültige
   Konfigurationsdateien.
 - Health-Check-CLI:

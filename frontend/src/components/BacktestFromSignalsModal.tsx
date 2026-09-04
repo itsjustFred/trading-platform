@@ -20,6 +20,10 @@ function defaultDateRange(): { start: string; end: string } {
   };
 }
 
+// Default signal processor for "backtest from signals". StockKit is the Discord
+// source, not a processor, so the fallback is RamJet.
+const DEFAULT_SIGNAL_PROCESSOR = "ramjet";
+
 const inputStyle: React.CSSProperties = {
   background: "var(--color-surface2)",
   border: "1px solid var(--color-border)",
@@ -50,7 +54,9 @@ export function BacktestFromSignalsModal({
   const [signalSource, setSignalSource] = useState<BacktestFromSignalsSource>("csv");
   const [filepath, setFilepath] = useState("");
   const [accountId, setAccountId] = useState("");
-  const [signalProcessor, setSignalProcessor] = useState("stockkit");
+  // Start empty (matches the placeholder option) and let the registry
+  // reconciliation below select the default or first advertised processor.
+  const [signalProcessor, setSignalProcessor] = useState("");
   const [timeframe, setTimeframe] = useState("");
   const [startDate, setStartDate] = useState(range.start);
   const [endDate, setEndDate] = useState(range.end);
@@ -68,13 +74,19 @@ export function BacktestFromSignalsModal({
       .then((options) => {
         const normalized = Array.isArray(options) ? options : [];
         setProcessors(normalized);
-        if (normalized.some((item) => item.id === "stockkit")) {
-          setSignalProcessor("stockkit");
-          return;
-        }
-        if (normalized.length > 0) {
-          setSignalProcessor(normalized[0].id);
-        }
+        // Reconcile the current selection against the registry. An id that is
+        // no longer advertised (e.g. a processor was removed) falls back to
+        // the documented default, then to the first advertised option — never
+        // silently to an unrelated entry's position in the list.
+        setSignalProcessor((current) => {
+          if (normalized.some((item) => item.id === current)) {
+            return current;
+          }
+          if (normalized.some((item) => item.id === DEFAULT_SIGNAL_PROCESSOR)) {
+            return DEFAULT_SIGNAL_PROCESSOR;
+          }
+          return normalized.length > 0 ? normalized[0].id : current;
+        });
       })
       .catch(() => {
         setProcessors([]);
