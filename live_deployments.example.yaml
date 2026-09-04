@@ -23,4 +23,8 @@ deployments:
     signal_source: discord
     signal_config:
       channel_id: "123456789012345678"
+      # Discord user/bot IDs allowed to originate signals for this deployment.
+      # Ingestion drops every message from any other author.
+      trusted_author_ids:
+        - "987654321098765432"
       wait_candle_close: true

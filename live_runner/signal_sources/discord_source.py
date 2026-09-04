@@ -42,9 +42,12 @@ class DiscordRateLimitError(RuntimeError):
 
 _RAMJET_OVERSOLD_RE = re.compile(r"is now oversold", re.IGNORECASE)
 _BUY_SIGNAL_RE = re.compile(r"buy signal", re.IGNORECASE)
-_PRICE_LABEL_RE = re.compile(r"Price:\s*\$\s*(\d+(?:[.,]\d+)?)", re.IGNORECASE)
-_DOLLAR_PRICE_RE = re.compile(r"\$\s*(\d+(?:[.,]\d+)?)")
-_AT_PRICE_RE = re.compile(r"@\s*(\d+(?:\.\d+)?)")
+_PRICE_LABEL_RE = re.compile(
+    r"Price:\s*\$\s*(?P<price>\d[\d,]*(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+_DOLLAR_PRICE_RE = re.compile(r"\$\s*(?P<price>\d[\d,]*(?:\.\d+)?)")
+_AT_PRICE_RE = re.compile(r"@\s*(?P<price>\d[\d,]*(?:\.\d+)?)")
 _ACTION_BUY_RE = re.compile(r"\bbuy\b|\blong\b", re.IGNORECASE)
 _ACTION_SELL_RE = re.compile(r"\bsell\b|\bshort\b|\bmomentum\s*reversal\b", re.IGNORECASE)
 _MOMENTUM_REVERSAL_RE = re.compile(r"momentum\s*reversal", re.IGNORECASE)
@@ -95,6 +98,13 @@ _SKIP_WORDS = {
     "EXIT",
     "ENTRY",
 }
+
+
+def _normalize_author_ids(author_ids: Iterable[str] | None) -> set[str] | None:
+    """Normalize a trusted-author allowlist; None means "no gate configured"."""
+    if author_ids is None:
+        return None
+    return {str(author_id).strip().lower() for author_id in author_ids if str(author_id).strip()}
 
 
 def _is_discord_auth_error(exc: BaseException | None) -> bool:
@@ -171,17 +181,6 @@ def _price_prefixed_symbol(content: str) -> str | None:
     return None
 
 
-def _fallback_uppercase_symbol(content: str) -> str | None:
-    for line in content.split("\n"):
-        line_stripped = line.strip()
-        if not line_stripped:
-            continue
-        symbol = _first_normalized_symbol(re.findall(r"\b([A-Z]{1,10})\b", line_stripped))
-        if symbol:
-            return symbol
-    return None
-
-
 def _extract_symbol(content: str) -> str | None:
     for extract_stage in (
         _extract_bold_symbol,
@@ -189,7 +188,6 @@ def _extract_symbol(content: str) -> str | None:
         _extract_action_symbol,
         _extract_dollar_symbol,
         _price_prefixed_symbol,
-        _fallback_uppercase_symbol,
     ):
         symbol = extract_stage(content)
         if symbol:
@@ -198,15 +196,41 @@ def _extract_symbol(content: str) -> str | None:
 
 
 def _extract_price(content: str) -> float | None:
+    """Extract the first plausible price from a Discord message.
+
+    Thousands separators are normalized to the decimal point they actually are
+    ("1,234.56" -> 1234.56); a comma that does not form a strict
+    thousands group (e.g. "$12,34") leaves the candidate malformed and is
+    rejected rather than reinterpreted as a decimal point, which used to turn
+    $1,234 into a 1000x-wrong entry price.
+    """
     for matcher in (_PRICE_LABEL_RE, _DOLLAR_PRICE_RE, _AT_PRICE_RE):
         matched = matcher.search(content)
         if matched is None:
             continue
+        raw_price = matched.group("price")
+        if not _is_well_formed_price_token(raw_price):
+            continue
         try:
-            return float(matched.group(1).replace(",", "."))
+            price = float(raw_price.replace(",", ""))
         except ValueError:
             continue
+        if price <= 0:
+            continue
+        return price
     return None
+
+
+def _is_well_formed_price_token(raw_price: str) -> bool:
+    """Reject tokens where a comma splits digits outside strict thousands groups
+    ("12,34"); accepting them as a smaller number corrupts sizing."""
+    if "," not in raw_price:
+        return True
+    whole = raw_price.split(".", 1)[0]
+    parts = whole.split(",")
+    if len(parts[0]) > 3 or not parts[0].isdigit():
+        return False
+    return all(len(part) == 3 and part.isdigit() for part in parts[1:])
 
 
 def _is_ramjet_signal(content: str) -> bool:
@@ -255,10 +279,35 @@ def _parse_trade_signal_from_message(
     message: Any,
     *,
     default_timeframe: str,
+    trusted_author_ids: Iterable[str] | None = None,
 ) -> TradeSignal | None:
+    """Parse a Discord message into a trade signal.
+
+    The author/bot-ID check is the source gate (campaign Decision Record):
+    when a trusted-author set is configured, only messages authored by one of
+    those IDs may become a signal. Every other author — including channel
+    members impersonating the signal bot — is dropped.
+    """
     content = str(getattr(message, "content", "") or "").strip()
     if not content:
         return None
+
+    trusted = _normalize_author_ids(trusted_author_ids)
+    if trusted is not None:
+        author_id = str(getattr(getattr(message, "author", None), "id", "") or "").strip().lower()
+        if not author_id or author_id not in trusted:
+            logger.warning(
+                "Discord message rejected: author is not a trusted signal source",
+                extra={
+                    "data": {
+                        "discord_author_id": author_id,
+                        "discord_channel_id": str(
+                            getattr(getattr(message, "channel", None), "id", "")
+                        ),
+                    }
+                },
+            )
+            return None
 
     signal_type = None
     if _is_ramjet_signal(content):
@@ -323,6 +372,7 @@ class DiscordSignalSource(BaseSignalSource):
         channel_ids: set[str] | None = None,
         timeframe: str = "1h",
         service_id: str | None = None,
+        trusted_author_ids: Iterable[str] | str | None = None,
     ) -> None:
         normalized_name = str(bot_name or "discord").strip()
         self.bot_name = normalized_name or "discord"
@@ -335,6 +385,21 @@ class DiscordSignalSource(BaseSignalSource):
             resolved_channel_ids.add(fallback_channel_id)
         self.channel_ids = {value for value in resolved_channel_ids if value}
         self.timeframe = normalize_timeframe(timeframe) or timeframe
+        # Decision Record: ingestion trusts one explicitly configured bot/author
+        # ID set; the author check is the source gate. No silent open gate.
+        if trusted_author_ids is None:
+            raise ValueError(
+                "DiscordSignalSource requires an explicit trusted_author_ids "
+                "allowlist; refusing to ingest signals from unverified authors"
+            )
+        if isinstance(trusted_author_ids, str):
+            trusted_author_ids = {trusted_author_ids}
+        self.trusted_author_ids = _normalize_author_ids(trusted_author_ids) or set()
+        if not self.trusted_author_ids:
+            raise ValueError(
+                "DiscordSignalSource requires a non-empty trusted_author_ids "
+                "allowlist; refusing to ingest signals from unverified authors"
+            )
         self._queue: asyncio.Queue[TradeSignal] = asyncio.Queue()
         self._ready = asyncio.Event()
         self._connected = False
@@ -453,9 +518,9 @@ class DiscordSignalSource(BaseSignalSource):
         if not messages:
             return
         seen = self._seen_ids.setdefault(channel_id, set())
+        last_seen = self._last_seen_message_ids.get(channel_id, "")
         # Messages arrive newest-first; iterate reversed so the queue receives
         # them in chronological (oldest -> newest) order.
-        last_seen = self._last_seen_message_ids.get(channel_id, "")
         for message in reversed(messages):
             message_id = str(message.get("id"))
             if message_id in seen:
@@ -470,6 +535,7 @@ class DiscordSignalSource(BaseSignalSource):
             parsed = _parse_trade_signal_from_message(
                 wrapped,
                 default_timeframe=self.timeframe,
+                trusted_author_ids=self.trusted_author_ids,
             )
             if parsed is None:
                 continue
@@ -483,9 +549,49 @@ class DiscordSignalSource(BaseSignalSource):
             )
             await self._queue.put(parsed)
         newest = str(messages[0].get("id"))
+        self._log_page_gap(channel_id, last_seen, messages)
         if not last_seen or int(newest) > int(last_seen):
             self._last_seen_message_ids[channel_id] = newest
-        self._seen_ids[channel_id] = {str(m.get("id")) for m in messages}
+
+    def _log_page_gap(
+        self,
+        channel_id: str,
+        last_seen: str,
+        messages: list[dict[str, Any]],
+    ) -> None:
+        """Surface dropped messages instead of silently skipping them.
+
+        The REST poll fetches at most POLL_LIMIT messages per call. When the
+        page does not reach back to the last seen message, every message older
+        than the page boundary was outside the fetch window and is treated as
+        dropped; that count is logged so bursts are visible in ops.
+        """
+        if not last_seen:
+            return
+        oldest = str(messages[-1].get("id"))
+        try:
+            if int(oldest) <= int(last_seen):
+                # The page overlaps history we already tracked: nothing skipped.
+                return
+            estimated_dropped = int(oldest) - int(last_seen) - 1
+        except ValueError:
+            return
+        if estimated_dropped <= 0:
+            return
+        logger.warning(
+            "Discord poll gap detected; older messages were dropped",
+            extra={
+                "data": {
+                    "bot_name": self.bot_name,
+                    "service_id": self.service_id,
+                    "channel_id": channel_id,
+                    "estimated_dropped": estimated_dropped,
+                    "last_seen_message_id": last_seen,
+                    "oldest_fetched_message_id": oldest,
+                    "poll_limit": POLL_LIMIT,
+                }
+            },
+        )
 
     async def _prime_cursors(self, channel_ids: Iterable[str]) -> None:
         for channel_id in channel_ids:
