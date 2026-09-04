@@ -243,6 +243,34 @@ def test_discover_configured_accounts_skips_block_with_invalid_bool(monkeypatch)
     assert [account.id for account in accounts if account.broker == "ctrader"] == ["47644617"]
 
 
+def test_iter_alpaca_credentials_safe_keeps_valid_sibling_blocks(monkeypatch):
+    """A typo'd ALPACA_PAPER_ACC{N} skips only that block: the other indexed
+    blocks must still be enumerated, not silently dropped together with it."""
+    env = {
+        "ALPACA_API_KEY_ACC1": "good-key",
+        "ALPACA_SECRET_KEY_ACC1": "good-secret",
+        "ALPACA_PAPER_ACC1": "false",
+        "ALPACA_API_KEY_ACC2": "bad-key",
+        "ALPACA_SECRET_KEY_ACC2": "bad-secret",
+        "ALPACA_PAPER_ACC2": "ture",
+        "ALPACA_API_KEY_ACC3": "also-good",
+        "ALPACA_SECRET_KEY_ACC3": "also-good-secret",
+        "ALPACA_ENDPOINT_ACC3": "https://paper-api.alpaca.markets/v2",
+    }
+
+    discovered = account_discovery._iter_alpaca_credentials_safe(env)
+
+    assert discovered == [
+        {"key": "ACC1", "api_key": "good-key", "secret_key": "good-secret", "paper": False},
+        {
+            "key": "ACC3",
+            "api_key": "also-good",
+            "secret_key": "also-good-secret",
+            "paper": True,
+        },
+    ]
+
+
 def test_discover_configured_accounts_uses_shared_ctrader_credentials(monkeypatch):
     monkeypatch.setenv("CTRADER_APP_ID", "app")
     monkeypatch.setenv("CTRADER_APP_SECRET", "secret")

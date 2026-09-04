@@ -32,6 +32,7 @@ from google.protobuf.json_format import MessageToDict
 
 from live_runner.alpaca_adapter import (
     _alpaca_acc_indexes,
+    _alpaca_credential_block,
     _alpaca_credential_blocks,
     _default_alpaca_credentials,
 )
@@ -142,20 +143,24 @@ def _iter_alpaca_credentials_safe(env: dict[str, str]) -> list[dict[str, Any]]:
     typo'd ALPACA_PAPER_ACC{N}) skips that block instead of aborting the whole
     discovery run, which would also drop accounts from the other broker."""
     blocks: list[dict[str, Any]] = []
-    try:
-        for block in _alpaca_credential_blocks(env, _alpaca_acc_indexes(env)):
-            blocks.append(
-                {
-                    "key": str(block.get("source_index", "")),
-                    "api_key": str(block["api_key"]),
-                    "secret_key": str(block["secret_key"]),
-                    "paper": bool(block["paper"]),
-                }
+    for idx in _alpaca_acc_indexes(env):
+        try:
+            block = _alpaca_credential_block(env, idx)
+        except ValueError as exc:
+            logger.warning(
+                "Skipping malformed Alpaca credential block during discovery",
+                extra={"data": {"block": f"ACC{idx}", "error": str(exc)}},
             )
-    except ValueError as exc:
-        logger.warning(
-            "Skipping malformed Alpaca credential blocks during discovery",
-            extra={"data": {"error": str(exc)}},
+            continue
+        if block is None:
+            continue
+        blocks.append(
+            {
+                "key": str(block.get("source_index", "")),
+                "api_key": str(block["api_key"]),
+                "secret_key": str(block["secret_key"]),
+                "paper": bool(block["paper"]),
+            }
         )
 
     if blocks:

@@ -107,40 +107,52 @@ def _alpaca_acc_indexes(values: Mapping[str, str]) -> list[int]:
     )
 
 
+def _alpaca_credential_block(
+    values: Mapping[str, str],
+    idx: int,
+) -> dict[str, str | bool] | None:
+    """Parse one ACC{idx} credential block.
+
+    Returns None when the block has no complete key/secret pair; raises
+    ValueError when its paper flag fails the strict parse.
+    """
+    api_key = str(values.get(f"ALPACA_API_KEY_ACC{idx}", "")).strip()
+    secret_key = str(values.get(f"ALPACA_SECRET_KEY_ACC{idx}", "")).strip()
+    if not api_key or not secret_key:
+        return None
+
+    endpoint = str(values.get(f"ALPACA_ENDPOINT_ACC{idx}", "")).strip().lower()
+    if endpoint:
+        paper = "paper" in endpoint
+    else:
+        raw_paper = values.get(f"ALPACA_PAPER_ACC{idx}")
+        paper = _parse_bool_env(
+            f"ALPACA_PAPER_ACC{idx}",
+            str(raw_paper).strip() if raw_paper is not None else None,
+            default=True,
+        )
+    return {
+        "source_index": f"ACC{idx}",
+        "api_key": api_key,
+        "secret_key": secret_key,
+        "paper": paper,
+        "account_id_hint": str(values.get(f"ALPACA_ACCOUNT_ID_ACC{idx}", "")).strip(),
+        "login_hint": (
+            str(values.get(f"ALPACA_BROKER_LOGIN_ACC{idx}", "")).strip()
+            or str(values.get(f"ALPACA_ACCOUNT_NUMBER_ACC{idx}", "")).strip()
+        ),
+    }
+
+
 def _alpaca_credential_blocks(
     values: Mapping[str, str],
     indexes: list[int],
 ) -> list[dict[str, str | bool]]:
     blocks: list[dict[str, str | bool]] = []
     for idx in indexes:
-        api_key = str(values.get(f"ALPACA_API_KEY_ACC{idx}", "")).strip()
-        secret_key = str(values.get(f"ALPACA_SECRET_KEY_ACC{idx}", "")).strip()
-        if not api_key or not secret_key:
-            continue
-
-        endpoint = str(values.get(f"ALPACA_ENDPOINT_ACC{idx}", "")).strip().lower()
-        if endpoint:
-            paper = "paper" in endpoint
-        else:
-            raw_paper = values.get(f"ALPACA_PAPER_ACC{idx}")
-            paper = _parse_bool_env(
-                f"ALPACA_PAPER_ACC{idx}",
-                str(raw_paper).strip() if raw_paper is not None else None,
-                default=True,
-            )
-        blocks.append(
-            {
-                "source_index": f"ACC{idx}",
-                "api_key": api_key,
-                "secret_key": secret_key,
-                "paper": paper,
-                "account_id_hint": str(values.get(f"ALPACA_ACCOUNT_ID_ACC{idx}", "")).strip(),
-                "login_hint": (
-                    str(values.get(f"ALPACA_BROKER_LOGIN_ACC{idx}", "")).strip()
-                    or str(values.get(f"ALPACA_ACCOUNT_NUMBER_ACC{idx}", "")).strip()
-                ),
-            }
-        )
+        block = _alpaca_credential_block(values, idx)
+        if block is not None:
+            blocks.append(block)
     return blocks
 
 
