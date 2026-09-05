@@ -6,7 +6,12 @@ import math
 
 from pydantic import BaseModel, ConfigDict
 
-from validation.risk.models import RiskSizingInput, RiskSizingResult, TradeRiskProfile
+from validation.risk.models import (
+    RiskSizingInput,
+    RiskSizingResult,
+    TradeRiskProfile,
+    enforce_minimum_position_size,
+)
 
 
 class FixedRiskConfig(BaseModel):
@@ -89,8 +94,7 @@ class FixedRiskModel:
                 math.floor(position_size / self.config.lot_size) * self.config.lot_size
             )
 
-        if position_size < self.config.min_position_size:
-            position_size = 0.0
+        enforce_minimum_position_size(position_size, self.config.min_position_size)
 
         max_size = self.config.max_position_size
         if max_size is not None and position_size > max_size:

@@ -6,6 +6,7 @@ an external reference backtest and the platform's own backtest engine.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -22,6 +23,8 @@ from validation.risk.adapter import RiskAdapter
 from validation.risk.fixed_risk import FixedRiskConfig
 from validation.risk.models import RiskSizingInput, SizingModel, TradeRiskProfile
 from validation.risk.percent_risk import PercentRiskConfig
+
+logger = logging.getLogger(__name__)
 
 
 def _pct_diff(a: float, b: float) -> float:
@@ -188,7 +191,15 @@ class RiskComparator:
                 config=self.config.model_config,
             )
             return result.profiles[0] if result.profiles else None
-        except Exception:
+        except Exception as exc:
+            # DV-B48: a sizing failure (e.g. a sub-minimum position size that
+            # now fails closed) must not vanish — a missing profile fails the
+            # comparison structurally, so record why it is missing.
+            logger.warning(
+                "Risk profile for trade %s could not be computed: %s",
+                trade.id,
+                exc,
+            )
             return None
 
     def _compare_pair(

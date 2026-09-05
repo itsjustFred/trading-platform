@@ -27,6 +27,35 @@ class RiskModelConfig(BaseModel):
     risk_percent: float | None = None
 
 
+def enforce_minimum_position_size(position_size: float, min_position_size: float) -> float:
+    """Validate a computed position size against the configured minimum (DV-B48).
+
+    A size of ``0.0`` is always rejected: it means the sizing produced no
+    position at all (typically lot rounding floored a sub-lot size), which
+    must surface as a failure instead of a trivially "matching" empty
+    profile.
+
+    Raises
+    ------
+    ValueError
+        When *position_size* is below *min_position_size* or zero.  Failing
+        closed replaces the previous silent flooring to 0, which produced a
+        zero-size profile that trivially "matched" in the risk comparison
+        instead of surfacing the undersized position.
+    """
+    if position_size <= 0.0:
+        raise ValueError(
+            f"computed position size {position_size} is not positive "
+            "(lot rounding must not silently produce an empty position)"
+        )
+    if position_size < min_position_size:
+        raise ValueError(
+            f"computed position size {position_size} is below the "
+            f"minimum position size {min_position_size}"
+        )
+    return position_size
+
+
 class RiskSizingInput(BaseModel):
     """Input parameters for a single position-sizing calculation."""
 

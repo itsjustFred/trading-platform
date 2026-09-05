@@ -14,16 +14,29 @@ Mathematical conventions (kept explicit so results are reproducible):
 * **Annualization:** ``sqrt(252)`` (daily-trade assumption).
 * **Drawdown:** absolute is in account currency; ``max_drawdown_pct`` is a
   fraction (0..1) of the running peak.
+* **PnL basis (DV-B46):** win/loss classification, ``net_profit``, Sharpe,
+  Sortino, drawdown, ``avg_trade`` and the largest winner/loser use the
+  *net* per-trade PnL (``net_pnl`` when set, else gross PnL minus ``fees``,
+  else the exit PnL sum).  ``gross_profit``/``gross_loss``/``avg_winner``/
+  ``avg_loser`` stay gross so they remain comparable with MT5's
+  Bruttogewinn/Bruttoverlust labels.
 """
 
 from __future__ import annotations
 
+import logging
 import math
 from typing import List
 
 from pydantic import BaseModel
 
 from shared.models import Trade, TradeExit
+
+logger = logging.getLogger(__name__)
+
+# Tolerance for the "net_pnl consistent with exit PnLs" invariant check: a
+# few float ulps of drift are fine, a systematic fee double count is not.
+_NET_PNL_EPSILON = 1e-6
 
 
 class TradeStatistics(BaseModel):
@@ -54,6 +67,38 @@ def _realized_pnl(trade: Trade) -> float:
     if not trade.exits:
         return 0.0
     return sum((exit_.pnl or 0.0) for exit_ in trade.exits)
+
+
+def _net_realized_pnl(trade: Trade) -> float:
+    """Net realized PnL for one trade after fees (DV-B46).
+
+    Preference order: explicit ``net_pnl`` (the trade already carries the
+    net figure), else gross PnL minus ``fees``, else the sum of exit PnLs
+    (fee-free trades and normalized inputs where fees are already deducted
+    from the exit PnLs).
+
+    ``net_pnl`` is only trusted when it is consistent with the exit PnLs:
+    importers must store exit PnLs *gross of fees* whenever ``fees`` is set,
+    so ``net_pnl == sum(exit PnLs) - fees``.  A trade that violates this
+    invariant (fee-inclusive exit PnLs *plus* a fees field) would double
+    count, so it falls back to the recomputed gross-minus-fees figure.
+    """
+    gross = _realized_pnl(trade)
+    recomputed = gross - float(trade.fees) if trade.fees is not None else gross
+    if trade.net_pnl is not None:
+        net = float(trade.net_pnl)
+        if trade.fees is None or abs(net - recomputed) <= _NET_PNL_EPSILON:
+            return net
+        logger.warning(
+            "Trade %s: net_pnl %s inconsistent with exit PnLs gross %s and "
+            "fees %s; using recomputed %s",
+            trade.id,
+            net,
+            gross,
+            trade.fees,
+            recomputed,
+        )
+    return recomputed
 
 
 def _compute_drawdowns(realized_pnls: List[float]) -> tuple[float, float]:
@@ -112,7 +157,10 @@ def compute_trade_statistics(trades: List[Trade]) -> TradeStatistics:
     if not trades:
         return TradeStatistics()
 
-    realized_pnls = [_realized_pnl(t) for t in trades]
+    realized_pnls = [_net_realized_pnl(t) for t in trades]
+    # Gross figures stay gross (fees excluded) so they remain comparable with
+    # MT5's Bruttogewinn/Bruttoverlust labels (DV-B46).
+    gross_pnls = [_realized_pnl(t) for t in trades]
 
     total_trades = len(trades)
     winning_trades = sum(1 for p in realized_pnls if p > 0)
@@ -120,8 +168,8 @@ def compute_trade_statistics(trades: List[Trade]) -> TradeStatistics:
     win_rate = winning_trades / total_trades if total_trades > 0 else 0.0
 
     net_profit = sum(realized_pnls)
-    gross_profit = sum(p for p in realized_pnls if p > 0)
-    gross_loss = sum(p for p in realized_pnls if p < 0)
+    gross_profit = sum(p for p in gross_pnls if p > 0)
+    gross_loss = sum(p for p in gross_pnls if p < 0)
 
     if gross_loss != 0.0:
         profit_factor = abs(gross_profit / gross_loss)

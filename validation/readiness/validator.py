@@ -465,11 +465,16 @@ class ReadinessValidator:
         ]
         position_size_issues: list[dict[str, Any]] = []
         stop_distance_issues: list[dict[str, Any]] = []
+        structural_failures = 0
 
         for result in failed_results:
             if result.expected_trade is None or result.actual_trade is None:
+                # Missing/extra side of a comparison: no field-level evidence
+                # exists, so it can only be counted structurally (DV-B37).
+                structural_failures += 1
                 continue
             fr = result.field_results
+            numeric_issue = False
             if "position_size" in fr and not fr["position_size"].passed:
                 expected = fr["position_size"].expected
                 actual = fr["position_size"].actual
@@ -480,6 +485,7 @@ class ReadinessValidator:
                             "diff_pct": _abs_pct_diff(float(expected), float(actual)),
                         }
                     )
+                    numeric_issue = True
             if "stop_distance" in fr and not fr["stop_distance"].passed:
                 expected = fr["stop_distance"].expected
                 actual = fr["stop_distance"].actual
@@ -490,12 +496,23 @@ class ReadinessValidator:
                             "diff_pct": _abs_pct_diff(float(expected), float(actual)),
                         }
                     )
+                    numeric_issue = True
+            if not numeric_issue:
+                # A failed result whose evidence is not numeric (or absent)
+                # would previously slip through both tolerance checks.
+                structural_failures += 1
 
         max_ps_diff = max((i["diff_pct"] for i in position_size_issues), default=0.0)
         max_sd_diff = max((i["diff_pct"] for i in stop_distance_issues), default=0.0)
 
         ps_passed = max_ps_diff <= cfg.max_position_size_diff_pct
         sd_passed = max_sd_diff <= cfg.max_stop_distance_diff_pct
+
+        # DV-B37: consult the report verdict and fail closed on structural
+        # failures that carry no numeric evidence.  An empty report counts as
+        # vacuously passing only when the producer marked it passed; both
+        # conditions surface as error-level checks below.
+        report_verdict_passed = bool(risk_report.passed)
 
         checks.append(
             ReadinessCheck(
@@ -541,6 +558,51 @@ class ReadinessValidator:
             recommendations.append(
                 f"Stop-distance mismatch exceeds threshold ({max_sd_diff:.4%} > "
                 f"{cfg.max_stop_distance_diff_pct:.4%})."
+            )
+
+        checks.append(
+            ReadinessCheck(
+                name="risk_failed_results",
+                description="No structurally failed risk comparisons without numeric evidence",
+                passed=structural_failures == 0,
+                severity="error" if structural_failures else "info",
+                message=(
+                    f"{structural_failures} failed risk result(s) without "
+                    "position-size/stop-distance evidence"
+                    if structural_failures
+                    else "All failed risk results carry numeric evidence"
+                ),
+                details={
+                    "structural_failure_count": structural_failures,
+                    "failed_result_count": len(failed_results),
+                },
+            )
+        )
+        if structural_failures:
+            recommendations.append(
+                f"Review {structural_failures} risk comparison(s) that failed "
+                "without comparable position-size or stop-distance values."
+            )
+
+        checks.append(
+            ReadinessCheck(
+                name="risk_report_verdict",
+                description="Risk comparison report verdict is passed",
+                passed=report_verdict_passed,
+                severity="error" if not report_verdict_passed else "info",
+                message=(
+                    "Risk comparison report passed"
+                    if report_verdict_passed
+                    else "Risk comparison report failed: "
+                    + str(risk_report.explanation or "no explanation")
+                ),
+                details={"report_passed": report_verdict_passed},
+            )
+        )
+        if not report_verdict_passed:
+            recommendations.append(
+                "Risk comparison report verdict is failed; resolve risk "
+                "deviations before paper trading."
             )
 
         return checks

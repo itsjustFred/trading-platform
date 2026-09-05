@@ -1,9 +1,7 @@
 import argparse
 import logging
 import os
-import shutil
 import subprocess
-import sys
 from pathlib import Path
 
 import pandas as pd
@@ -14,7 +12,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("dolthub_manager")
 
-from shared.constants import DATA_DIR, resolve_executable
+from shared.constants import DATA_DIR
+from shared.sql import quote_identifier, quote_literal
 
 DOLT_DIR = DATA_DIR / "dolthub"
 EXPORT_DIR = DATA_DIR / "ohlcv" / "dolthub"
@@ -26,10 +25,83 @@ REPOS = {
     "rates": "post-no-preference/rates",
 }
 
+# DV-B28: every dolt subprocess runs under a timeout.  Large `dolt clone`
+# and `dolt pull` operations override the timeout per call.
+DEFAULT_DOLT_TIMEOUT_SECONDS = 600.0
 
-def run_cmd(cmd, cwd=None):
+
+class DoltTimeoutError(RuntimeError):
+    """A dolt subprocess exceeded its allowed runtime."""
+
+
+def _dolt_timeout(override: float | None = None) -> float:
+    """Resolve the subprocess timeout: explicit arg > env > default."""
+    if override is not None:
+        return override
+    raw = os.environ.get("DOLT_TIMEOUT_SECONDS")
+    if raw:
+        try:
+            value = float(raw)
+            if value > 0:
+                return value
+        except ValueError:
+            pass
+    return DEFAULT_DOLT_TIMEOUT_SECONDS
+
+
+def run_dolt(
+    cmd: list[str],
+    cwd: str | Path | None = None,
+    *,
+    timeout: float | None = None,
+    capture: bool = False,
+    stdout=None,
+) -> subprocess.CompletedProcess:
+    """Run a dolt subprocess under a mandatory timeout (DV-B28).
+
+    Raises
+    ------
+    DoltTimeoutError
+        When the subprocess exceeds the timeout.
+    subprocess.CalledProcessError
+        When the subprocess exits non-zero.
+    """
     logger.info(f"Running: {' '.join(cmd)}")
-    subprocess.check_call(cmd, cwd=cwd)
+    try:
+        return subprocess.run(
+            cmd,
+            cwd=cwd,
+            check=True,
+            capture_output=capture,
+            text=capture,
+            stdout=stdout,
+            timeout=_dolt_timeout(timeout),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise DoltTimeoutError(
+            f"dolt command timed out after {_dolt_timeout(timeout)}s: {' '.join(cmd)}"
+        ) from exc
+
+
+def build_symbol_select(table_name: str, symbol: str) -> str:
+    """Build the distinct-symbol query without raw interpolation (DV-B27).
+
+    The symbol filter goes through :func:`shared.sql.quote_literal`, which
+    validates the symbol and raises ``ValueError`` on unsafe input.
+    """
+    return (
+        "SELECT DISTINCT act_symbol FROM "
+        f"{quote_identifier(table_name)} WHERE act_symbol = {quote_literal(symbol)}"
+    )
+
+
+def build_ohlcv_select(table_name: str, symbol: str) -> str:
+    """Build the per-symbol OHLCV query without raw interpolation (DV-B27)."""
+    return (
+        "SELECT date, open, high, low, close, volume FROM "
+        f"{quote_identifier(table_name)} WHERE act_symbol = {quote_literal(symbol)} "
+        "ORDER BY date"
+    )
 
 
 def update_repos():
@@ -42,29 +114,37 @@ def update_repos():
             # Check if it is a dolt repo
             if (repo_path / ".dolt").exists():
                 try:
-                    run_cmd(["dolt", "pull"], cwd=repo_path)
-                except subprocess.CalledProcessError:
-                    logger.error(f"Failed to pull {name}. Manual intervention required.")
+                    run_dolt(["dolt", "pull"], cwd=repo_path)
+                except (subprocess.CalledProcessError, DoltTimeoutError) as exc:
+                    # Per-repo update failures are logged and skipped so one
+                    # stuck repo does not block the others (DV-B28: the
+                    # timeout itself stays mandatory).
+                    logger.exception("Failed to pull %s: %s", name, exc)
             else:
                 logger.warning(f"{repo_path} exists but is not a dolt repo. Skipping.")
         else:
             logger.info(f"Cloning {remote} to {repo_path}...")
             try:
-                run_cmd(["dolt", "clone", remote, str(repo_path)])
-            except subprocess.CalledProcessError:
-                logger.error(f"Failed to clone {remote}.")
+                # Clones of large repos can legitimately take longer than the
+                # default; give them 3x before giving up.
+                run_dolt(
+                    ["dolt", "clone", remote, str(repo_path)],
+                    timeout=3 * DEFAULT_DOLT_TIMEOUT_SECONDS,
+                )
+            except (subprocess.CalledProcessError, DoltTimeoutError) as exc:
+                logger.exception("Failed to clone %s: %s", remote, exc)
 
 
 def _list_tables(repo_path: Path) -> list[str]:
     """List tables in a dolt repo using 'dolt sql -r csv'."""
-    result = subprocess.run(
-        ["dolt", "sql", "-q", "SHOW TABLES", "-r", "csv"],
-        cwd=repo_path,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        logger.error(f"Failed to list tables in {repo_path}: {result.stderr}")
+    try:
+        result = run_dolt(
+            ["dolt", "sql", "-q", "SHOW TABLES", "-r", "csv"],
+            cwd=repo_path,
+            capture=True,
+        )
+    except (subprocess.CalledProcessError, DoltTimeoutError) as exc:
+        logger.exception("Failed to list tables in %s: %s", repo_path, exc)
         return []
     lines = result.stdout.strip().split("\n")
     # First line is header (Tables_in_{dbname}), rest are table names
@@ -74,7 +154,7 @@ def _list_tables(repo_path: Path) -> list[str]:
 def _export_table_csv(repo_path: Path, table: str, output_csv: Path):
     """Export a dolt table to CSV using 'dolt table export'."""
     with open(output_csv, "w") as f:
-        subprocess.check_call(["dolt", "table", "export", "-f", table], cwd=repo_path, stdout=f)
+        run_dolt(["dolt", "table", "export", "-f", table], cwd=repo_path, stdout=f)
 
 
 def _stock_export_path(target_dir: Path, symbol: str) -> Path:
@@ -108,11 +188,10 @@ def export_data():
             logger.info(f"Using table: {table_name}")
 
             # Get symbols
-            result = subprocess.run(
-                ["dolt", "sql", "-q", f"SELECT DISTINCT act_symbol FROM {table_name}", "-r", "csv"],
+            result = run_dolt(
+                ["dolt", "sql", "-q", f"SELECT DISTINCT act_symbol FROM {quote_identifier(table_name)}", "-r", "csv"],
                 cwd=stocks_repo,
-                capture_output=True,
-                text=True,
+                capture=True,
             )
             lines = result.stdout.strip().split("\n")[1:]  # skip header
             symbols = [l.strip() for l in lines if l.strip()]
@@ -130,12 +209,12 @@ def export_data():
                     out_parquet.parent.mkdir(parents=True, exist_ok=True)
                     sym_csv = target_dir / f"{symbol}.csv"
                     with open(sym_csv, "w") as f:
-                        subprocess.check_call(
+                        run_dolt(
                             [
                                 "dolt",
                                 "sql",
                                 "-q",
-                                f"SELECT date, open, high, low, close, volume FROM {table_name} WHERE act_symbol='{symbol}' ORDER BY date",
+                                build_ohlcv_select(table_name, symbol),
                                 "-r",
                                 "csv",
                             ],

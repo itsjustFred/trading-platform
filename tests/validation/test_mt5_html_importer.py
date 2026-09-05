@@ -202,3 +202,78 @@ class TestHelpers:
     def test_infer_exit_reason_none(self):
         assert MT5HTMLImporter._infer_exit_reason("") is None
         assert MT5HTMLImporter._infer_exit_reason("some comment") is None
+
+
+class TestDirectionRequiresTypColumn:
+    """DV-B42: direction must never be inferred from a missing Typ column."""
+
+    def test_missing_typ_column_raises(self, tmp_path: Path):
+        report = Path("tests/fixtures/validation/mt5_html/missing_typ.html")
+        importer = MT5HTMLImporter()
+        with pytest.raises(ValueError) as excinfo:
+            importer.load(report)
+        assert "Typ" in str(excinfo.value)
+
+    def test_unsupported_entry_typ_raises(self):
+        report = Path("tests/fixtures/validation/mt5_html/bad_typ.html")
+        importer = MT5HTMLImporter()
+        with pytest.raises(ValueError) as excinfo:
+            importer.load(report)
+        assert "buy limit" in str(excinfo.value)
+
+
+class TestGermanNumberParsing:
+    """DV-B44: German-formatted SL/TP values must parse exactly."""
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("2.500", 2500.0),
+            ("1.234,56", 1234.56),
+            ("1.234.567,89", 1234567.89),
+            ("2.5", 2.5),
+            ("1,5", 1.5),
+            ("1234", 1234.0),
+            ("1 234,56", 1234.56),
+            ("-1.234,56", -1234.56),
+            ("1.23456", 1.23456),
+            # 5-digit fraction (MT5 price cell "1,08500") must stay a price,
+            # not be dropped as an unparseable grouping.
+            ("1,08500", 1.085),
+            ("-1,08500", -1.085),
+        ],
+    )
+    def test_parse_german_number(self, raw: str, expected: float):
+        from validation.importers._numbers import parse_german_number
+
+        value = parse_german_number(raw)
+        assert value == pytest.approx(expected)
+
+    @pytest.mark.parametrize("raw", ["", "n/a", "1.2.3", "abc"])
+    def test_parse_german_number_rejects_garbage(self, raw: str):
+        from validation.importers._numbers import parse_german_number
+
+        assert parse_german_number(raw) is None
+
+    def test_to_float_parses_german_locale_fallback(self):
+        """PnL/commission cells outside SL/TP also honour the German locale."""
+        from validation.importers.mt5_html import MT5HTMLImporter as I
+
+        assert I._to_float(["1.234,56"], 0) == pytest.approx(1234.56)
+        assert I._to_float(["1.08500"], 0) == pytest.approx(1.085)
+        assert I._to_float(["-499.60"], 0) == pytest.approx(-499.60)
+        assert I._to_float(["n/a"], 0) is None
+
+    def test_sltp_map_parses_german_formats(self):
+        ref = MT5HTMLImporter().load(
+            Path("tests/fixtures/validation/mt5_html/german_sltp.html")
+        )
+        sl_values = [t.meta.get("stop_loss") for t in ref.trades]
+        tp_values = [t.meta.get("take_profit") for t in ref.trades]
+        # "2.500" in the S/L column resolves to 2500 (German thousands),
+        # "1.234,56" to 1234.56, and the ASCII-looking "2.5" in the T/P
+        # column stays 2.5 under the detected German locale.
+        assert 2500.0 in sl_values
+        assert 1234.56 in sl_values
+        assert 2.5 in tp_values
+        assert 1.095 in tp_values

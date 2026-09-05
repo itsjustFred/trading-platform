@@ -277,9 +277,11 @@ class TradeComparator:
     ) -> FieldComparisonResult:
         diff_pct = _pct_diff(expected, actual)
         diff_abs = _abs_diff(expected, actual)
+        # Both bands must hold (DV-B35): a relative diff of 1.0 (one side
+        # exactly zero) is never rescued by the absolute band and vice versa.
         passed_pct = diff_pct <= tolerance_pct
         passed_abs = diff_abs <= tolerance_abs
-        passed = passed_pct or passed_abs
+        passed = passed_pct and passed_abs
         return FieldComparisonResult(
             field="pnl",
             expected=expected,

@@ -243,13 +243,13 @@ def test_lot_size_zero_disables_rounding() -> None:
 
 
 def test_min_position_size_clamping_zero() -> None:
+    """DV-B48: a size below min_position_size fails closed (raises)."""
     config = PercentRiskConfig(risk_percent=0.01, min_position_size=200.0)
     model = PercentRiskModel(config)
-    # distance = 10 -> size = 1, below min 200 -> clamped to 0
+    # distance = 10 -> size = 1, below min 200 -> raises instead of 0
     inp = _make_input(entry_price=100.0, stop_loss=90.0, account_balance=10_000.0)
-    result = model.size(inp)
-    assert result.profiles[0].position_size == 0.0
-    assert result.total_risk_amount == 0.0
+    with pytest.raises(ValueError, match="minimum position size"):
+        model.size(inp)
 
 
 def test_min_position_size_not_clamped_when_above() -> None:
@@ -459,3 +459,38 @@ def test_adapter_size_wrong_config_type_raises() -> None:
     config = FixedRiskConfig(risk_amount=100.0)
     with pytest.raises(TypeError, match="config must be PercentRiskConfig"):
         adapter.size(inp, model=SizingModel.PERCENT_RISK, config=config)
+
+
+# ─── Min-size fail-closed (DV-B48) ─────────────────────────────────────────
+
+
+def test_sub_minimum_size_raises_instead_of_silent_zero() -> None:
+    """DV-B48: a computed size below min_position_size must raise, not zero."""
+    config = PercentRiskConfig(risk_percent=0.01, min_position_size=200.0)
+    model = PercentRiskModel(config)
+    # distance = 10 -> raw size 1 < min 200
+    inp = _make_input(entry_price=100.0, stop_loss=90.0, account_balance=10_000.0)
+    with pytest.raises(ValueError, match="minimum position size"):
+        model.size(inp)
+
+
+def test_lot_rounded_to_zero_below_minimum_raises() -> None:
+    """A lot-floored zero size must fail closed (not positive)."""
+    config = PercentRiskConfig(
+        risk_percent=0.01, round_lots=True, lot_size=10_000.0, min_position_size=1.0
+    )
+    model = PercentRiskModel(config)
+    inp = _make_input(entry_price=100.0, stop_loss=97.0, account_balance=10_000.0)
+    with pytest.raises(ValueError, match="not positive"):
+        model.size(inp)
+
+
+def test_lot_floor_to_zero_raises_even_without_min_size() -> None:
+    """A lot-floored 0.0 size is an empty position, never a valid profile."""
+    config = PercentRiskConfig(
+        risk_percent=0.01, round_lots=True, lot_size=10_000.0
+    )
+    model = PercentRiskModel(config)
+    inp = _make_input(entry_price=100.0, stop_loss=97.0, account_balance=10_000.0)
+    with pytest.raises(ValueError, match="not positive"):
+        model.size(inp)

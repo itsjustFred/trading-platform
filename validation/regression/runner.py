@@ -37,6 +37,11 @@ def _is_numeric(v: Any) -> bool:
     return isinstance(v, (int, float)) and not isinstance(v, bool)
 
 
+def _infinite_like(v: Any) -> bool:
+    """True when *v* is a non-finite float (+inf, -inf or nan)."""
+    return isinstance(v, float) and not math.isfinite(v)
+
+
 def _build_stat_explanation(
     field: str,
     expected: float,
@@ -80,34 +85,41 @@ def _compare_stats(
     current: TradeStatistics,
     config: RegressionConfig,
 ) -> list[FieldDelta]:
-    """Compare two TradeStatistics objects field-by-field."""
+    """Compare two TradeStatistics objects field-by-field.
+
+    Gate semantics (DV-B35): a field passes only when every configured
+    tolerance holds (AND).  Infinite values (DV-B34) compare symmetrically:
+    identical infinities match, any other infinite combination fails.
+    """
     deltas: list[FieldDelta] = []
     for field in _STATS_FIELDS:
         expected = getattr(golden, field)
         actual = getattr(current, field)
 
-        # Handle infinities gracefully
-        if expected == float("inf") and actual == float("inf"):
-            deltas.append(
-                FieldDelta(
-                    field=field,
-                    expected=expected,
-                    actual=actual,
-                    passed=True,
-                    explanation=f"{field} matches (both infinite)",
+        # Handle infinities gracefully in either direction
+        exp_inf = _infinite_like(expected)
+        act_inf = _infinite_like(actual)
+        if exp_inf or act_inf:
+            if exp_inf and act_inf and expected == actual:
+                deltas.append(
+                    FieldDelta(
+                        field=field,
+                        expected=expected,
+                        actual=actual,
+                        passed=True,
+                        explanation=f"{field} matches (both infinite: {expected})",
+                    )
                 )
-            )
-            continue
-        if expected == float("inf") or actual == float("inf"):
-            deltas.append(
-                FieldDelta(
-                    field=field,
-                    expected=expected,
-                    actual=actual,
-                    passed=False,
-                    explanation=f"{field} differs (expected {expected}, actual {actual})",
+            else:
+                deltas.append(
+                    FieldDelta(
+                        field=field,
+                        expected=expected,
+                        actual=actual,
+                        passed=False,
+                        explanation=f"{field} differs (expected {expected}, actual {actual})",
+                    )
                 )
-            )
             continue
 
         abs_tol = config.stats_absolute_tolerance.get(
@@ -128,17 +140,19 @@ def _compare_stats(
             else:
                 rel_diff = abs(float(expected) - float(actual)) / denom
 
-        passed = False
+        # Tolerance bands: every *configured* band must hold (DV-B35 - AND,
+        # not OR).  A 0.0 band is therefore exact equality, not "disabled":
+        # only a band that is genuinely absent (None) is skipped.
+        passed = True
         checks = 0
         if abs_tol is not None and abs_diff is not None:
             checks += 1
-            passed = passed or (abs_diff <= abs_tol)
+            passed = abs_diff <= abs_tol
         if rel_tol is not None and rel_diff is not None:
             checks += 1
-            passed = passed or (rel_diff <= rel_tol)
+            passed = passed and (rel_diff <= rel_tol)
         if checks == 0:
             passed = expected == actual
-
         explanation = _build_stat_explanation(
             field, expected, actual, abs_tol, rel_tol, abs_diff, rel_diff, passed
         )
@@ -165,6 +179,9 @@ class RegressionConfig(BaseModel):
     trade_config: TradeComparisonConfig = Field(default_factory=TradeComparisonConfig)
     stats_absolute_tolerance: dict[str, float] = Field(default_factory=dict)
     stats_relative_tolerance: dict[str, float] = Field(default_factory=dict)
+    # Tolerance semantics (DV-B35): every *configured* band must hold (AND).
+    # A 0.0 band means exact equality, not "disabled"; a field with no band
+    # at all falls back to exact equality.
     default_stats_absolute_tolerance: float = 0.01
     default_stats_relative_tolerance: float = 0.001
     golden_base_path: str = ""

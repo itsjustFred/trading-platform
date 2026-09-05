@@ -11,6 +11,8 @@ from typing import Any
 from bs4 import BeautifulSoup
 
 from shared.models import Trade, TradeExit
+from validation.importers._numbers import detect_decimal_comma, parse_locale_number
+from validation.importers._pairing import closed_positions, group_position_fills
 from validation.importers.base import BaseImporter
 from validation.reference import ValidationReference
 
@@ -386,6 +388,16 @@ class MT5HTMLImporter(BaseImporter):
         if col_order_id is None:
             return mapping
 
+        # DV-B44: "2.500" alone is ambiguous (2.5 ASCII vs 2500 German), so
+        # the report locale is detected from grouped values across the whole
+        # table before parsing any single cell.  Only the SL/TP columns are
+        # parsed with this locale, but a grouped value anywhere in the table
+        # is evidence for it — the XLSX importer must stay in agreement here
+        # (DV-B43), so do not narrow the scan to the SL/TP columns only.
+        decimal_comma = detect_decimal_comma(
+            [row[col] for row in data_rows for col in range(len(row))]
+        )
+
         for row in data_rows:
             if col_order_id >= len(row):
                 continue
@@ -394,9 +406,18 @@ class MT5HTMLImporter(BaseImporter):
                 continue
             sl = row[col_sl] if (col_sl is not None and col_sl < len(row)) else ""
             tp = row[col_tp] if (col_tp is not None and col_tp < len(row)) else ""
+            # Unparseable values stay None instead of raising (aborting the
+            # whole import) or being silently corrupted.  A non-empty cell
+            # that yields None is logged so the skip stays observable.
+            parsed_sl = parse_locale_number(sl, decimal_comma)
+            parsed_tp = parse_locale_number(tp, decimal_comma)
+            if sl and parsed_sl is None:
+                logger.warning("Order %s: unparseable S/L value %r", oid, sl)
+            if tp and parsed_tp is None:
+                logger.warning("Order %s: unparseable T/P value %r", oid, tp)
             mapping[oid] = {
-                "sl": float(sl.replace(",", ".")) if sl else None,
-                "tp": float(tp.replace(",", ".")) if tp else None,
+                "sl": parsed_sl,
+                "tp": parsed_tp,
             }
         return mapping
 
@@ -428,57 +449,97 @@ class MT5HTMLImporter(BaseImporter):
         col_profit = MT5HTMLImporter._find_col_index(header, ["Gewinn"])
         col_comment = MT5HTMLImporter._find_col_index(header, ["Kommentar"])
 
-        if col_time is None or col_direction is None:
-            raise ValueError("Trades table is missing required columns (Zeit / Richtung).")
+        # DV-B42: direction is derived from the Typ column, so it must be
+        # present.  Without this check a missing or locale-variant Typ column
+        # silently relabels every trade as SHORT.
+        if col_time is None or col_direction is None or col_typ is None:
+            raise ValueError(
+                "Trades table is missing required columns (Zeit / Typ / Richtung)."
+            )
 
-        # Build mapping: trade_id -> {entry_row, exit_row}
-        # MT5 exports each trade as two rows: entry (in) and exit (out) with same Trade/Order ID
-        trade_rows: dict[str, dict[str, list[str]]] = {}
+        # DV-B43: group all fills per position id (the Trade column; Auftrag
+        # order ids differ per fill), then reconstruct one Trade per position
+        # with one TradeExit per out row.  The shared helper keeps the HTML
+        # and XLSX importers in agreement on the same report.
+        col_position_id = MT5HTMLImporter._find_col_index(header, ["Trade", "Auftrag"])
 
-        for row in data_rows:
-            typ = MT5HTMLImporter._get_str(row, col_typ, "").lower()
-            direction = MT5HTMLImporter._get_str(row, col_direction, "").lower()
+        def _row_direction(row: list[str]) -> str:
+            return MT5HTMLImporter._get_str(row, col_direction, "").lower()
 
-            if typ == "balance" or direction not in ("in", "out"):
-                continue
+        def _row_position_id(row: list[str]) -> str:
+            return MT5HTMLImporter._get_str(row, col_position_id, "") if col_position_id is not None else ""
 
-            tid = MT5HTMLImporter._get_str(row, col_trade_id, "") if col_trade_id is not None else ""
-            if not tid:
-                continue
-
-            if tid not in trade_rows:
-                trade_rows[tid] = {}
-            trade_rows[tid][direction] = row
+        position_fills = group_position_fills(
+            data_rows,
+            position_id_of=_row_position_id,
+            direction_of=_row_direction,
+            is_trade_row=lambda row: MT5HTMLImporter._get_str(row, col_typ, "").lower() != "balance",
+        )
 
         trades: list[Trade] = []
         trade_id_counter = 1
 
-        # Pair entry/exit by trade_id
-        for tid, pair in trade_rows.items():
-            entry_row = pair.get("in")
-            exit_row = pair.get("out")
-
-            if entry_row is None or exit_row is None:
-                continue  # Incomplete trade pair
+        for fills in closed_positions(position_fills):
+            entry_row = fills.entries[0]
+            exit_rows = fills.exits
 
             symbol = MT5HTMLImporter._get_str(entry_row, col_symbol, "")
             entry_time_raw = MT5HTMLImporter._get_str(entry_row, col_time, "")
-            exit_time_raw = MT5HTMLImporter._get_str(exit_row, col_time, "")
 
             entry_price = MT5HTMLImporter._to_float(entry_row, col_price)
-            exit_price = MT5HTMLImporter._to_float(exit_row, col_price)
-            volume = MT5HTMLImporter._to_float(entry_row, col_volume)
-            pnl = MT5HTMLImporter._to_float(exit_row, col_profit)
+            entry_volume = sum(
+                (MT5HTMLImporter._to_float(r, col_volume) or 0.0) for r in fills.entries
+            )
 
             typ_entry = MT5HTMLImporter._get_str(entry_row, col_typ, "").lower()
-            direction_str = "LONG" if typ_entry == "buy" else "SHORT"
+            # DV-B42: only plain buy/sell entries carry a derivable direction.
+            # Anything else (pending-order types, locale variants) must fail
+            # the import instead of silently becoming SHORT.
+            if typ_entry == "buy":
+                direction_str = "LONG"
+            elif typ_entry == "sell":
+                direction_str = "SHORT"
+            else:
+                raise ValueError(
+                    f"Unsupported entry Typ {typ_entry!r} for trade "
+                    f"{trade_id_counter} (expected 'buy' or 'sell'); cannot "
+                    "derive trade direction."
+                )
 
-            commission = MT5HTMLImporter._to_float(exit_row, col_commission, default=0.0)
-            swap = MT5HTMLImporter._to_float(exit_row, col_swap, default=0.0)
+            # DV-B43: commission/swap accumulate over every fill of the
+            # position (entry fills included), not just the last exit row.
+            commission = sum(
+                (MT5HTMLImporter._to_float(r, col_commission, default=0.0) or 0.0)
+                for r in fills.entries + exit_rows
+            )
+            swap = sum(
+                (MT5HTMLImporter._to_float(r, col_swap, default=0.0) or 0.0)
+                for r in fills.entries + exit_rows
+            )
             fees = commission + swap
 
-            exit_comment = MT5HTMLImporter._get_str(exit_row, col_comment, "")
-            exit_reason = MT5HTMLImporter._infer_exit_reason(exit_comment)
+            exits: list[TradeExit] = []
+            for exit_row in exit_rows:
+                exit_time_raw = MT5HTMLImporter._get_str(exit_row, col_time, "")
+                exit_price = MT5HTMLImporter._to_float(exit_row, col_price)
+                exit_volume = MT5HTMLImporter._to_float(exit_row, col_volume)
+                exit_pnl = MT5HTMLImporter._to_float(exit_row, col_profit)
+
+                exit_comment = MT5HTMLImporter._get_str(exit_row, col_comment, "")
+                exit_reason = MT5HTMLImporter._infer_exit_reason(exit_comment)
+                exits.append(
+                    TradeExit(
+                        time=MT5HTMLImporter._to_iso(exit_time_raw, source_timezone),
+                        price=exit_price if exit_price is not None else 0.0,
+                        quantity=exit_volume if exit_volume is not None else 0.0,
+                        pnl=exit_pnl,
+                        reason=exit_reason,
+                    )
+                )
+            last_exit_comment = MT5HTMLImporter._get_str(exit_rows[-1], col_comment, "")
+            exit_reason = MT5HTMLImporter._infer_exit_reason(last_exit_comment)
+
+            pnl = sum((e.pnl or 0.0) for e in exits)
 
             entry_comment = MT5HTMLImporter._get_str(entry_row, col_comment, "")
             tags = [entry_comment] if entry_comment else []
@@ -490,29 +551,21 @@ class MT5HTMLImporter(BaseImporter):
                 sl = mapped.get("sl")
                 tp = mapped.get("tp")
 
-            exit_obj = TradeExit(
-                time=MT5HTMLImporter._to_iso(exit_time_raw, source_timezone),
-                price=exit_price if exit_price is not None else 0.0,
-                quantity=volume if volume is not None else 0.0,
-                pnl=pnl,
-                fees=fees if fees != 0.0 else None,
-                reason=exit_reason,
-            )
-
             trade = Trade(
                 id=trade_id_counter,
                 symbol=symbol,
                 direction=direction_str,
                 entry_time=MT5HTMLImporter._to_iso(entry_time_raw, source_timezone),
                 entry_price=entry_price if entry_price is not None else 0.0,
-                quantity=volume if volume is not None else 0.0,
-                exits=[exit_obj],
-                pnl=pnl if pnl is not None else 0.0,
+                quantity=entry_volume,
+                exits=exits,
+                pnl=pnl,
                 fees=fees if fees != 0.0 else None,
-                net_pnl=(pnl - fees) if (pnl is not None and fees is not None) else None,
+                net_pnl=pnl - fees,
                 exit_reason=exit_reason,
                 tags=tags,
                 meta={
+                    "position_id": fills.position_id,
                     "order_id": order_id if order_id else None,
                     "stop_loss": sl,
                     "take_profit": tp,
@@ -547,10 +600,14 @@ class MT5HTMLImporter(BaseImporter):
         val = row[col]
         if not val:
             return default
-        try:
-            return float(val.replace(",", ".").replace(" ", ""))
-        except (ValueError, TypeError):
-            return default
+        # DV-B44: MT5 reports can be German-locale ("1.234,56", "2.500").
+        # The dot-decimal reading is tried first; when it is ambiguous or
+        # fails, the comma-decimal reading is used, so a PnL or commission
+        # of "1.234,56" is neither dropped nor corrupted.
+        parsed = parse_locale_number(val, decimal_comma=False)
+        if parsed is None:
+            parsed = parse_locale_number(val, decimal_comma=True)
+        return default if parsed is None else parsed
 
     @staticmethod
     def _to_iso(raw: str, source_tz: str | None = None) -> str:
@@ -580,3 +637,4 @@ class MT5HTMLImporter(BaseImporter):
         if comment.startswith("trailing "):
             return "trailing_stop"
         return None
+
