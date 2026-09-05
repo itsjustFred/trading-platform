@@ -692,8 +692,9 @@ def test_ctrader_volume_rejects_missing_and_below_minimum_qty():
             metadata=metadata,
         )
 
+    empty = _signal({})
     with pytest.raises(ValueError, match="no positive quantity"):
-        adapter._resolve_order_volume(_signal({}))
+        adapter._resolve_order_volume(empty)
     with pytest.raises(ValueError, match="below the broker minimum"):
         adapter._resolve_order_volume(_signal({"qty": 0.07}))
     assert adapter._resolve_order_volume(_signal({"qty": 5.0})) == 5000
@@ -887,14 +888,18 @@ def test_ctrader_volume_rejects_non_finite_qty():
             metadata={"qty": qty},
         )
 
+    bad_signal = _signal(float("nan"))
     with pytest.raises(ValueError, match="no positive quantity"):
-        adapter._resolve_order_volume(_signal(float("nan")))
+        adapter._resolve_order_volume(bad_signal)
+    bad_signal = _signal(float("inf"))
     with pytest.raises(ValueError, match="no positive quantity"):
-        adapter._resolve_order_volume(_signal(float("inf")))
+        adapter._resolve_order_volume(bad_signal)
+    bad_signal = _signal(-2.0)
     with pytest.raises(ValueError, match="no positive quantity"):
-        adapter._resolve_order_volume(_signal(-2.0))
+        adapter._resolve_order_volume(bad_signal)
+    bad_signal = _signal("not-a-number")
     with pytest.raises(ValueError, match="no positive quantity"):
-        adapter._resolve_order_volume(_signal("not-a-number"))
+        adapter._resolve_order_volume(bad_signal)
 
 
 def test_ctrader_fill_quantities_are_persisted_in_qty_units(monkeypatch):
@@ -1082,8 +1087,9 @@ def test_ctrader_invalid_action_never_persists_signal(monkeypatch):
     # broker request builder, so force an out-of-domain action through the model.
     object.__setattr__(signal, "action", "hold")
 
+    submission = adapter.submit_order(signal)
     with pytest.raises(ValueError, match=r"Unsupported (signal )?action"):
-        asyncio.run(adapter.submit_order(signal))
+        asyncio.run(submission)
 
 
 def test_alpaca_invalid_action_never_persists_signal(monkeypatch):
@@ -1110,8 +1116,9 @@ def test_alpaca_invalid_action_never_persists_signal(monkeypatch):
     )
     object.__setattr__(signal, "action", "hold")
 
+    submission = adapter.submit_order(signal)
     with pytest.raises(ValueError, match=r"Unsupported (signal )?action"):
-        asyncio.run(adapter.submit_order(signal))
+        asyncio.run(submission)
 
 
 def test_processor_market_data_refuses_synthetic_fabrication():
