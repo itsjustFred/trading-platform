@@ -476,6 +476,23 @@ def _deployment_for_test(
     )
 
 
+@pytest.fixture(autouse=True)
+def _assume_snapshot_deployments_currently_active(monkeypatch):
+    """The PR tests predate the #48 stale-snapshot DB recheck: the deployment
+    snapshots in these tests are not persisted, so `get_live_deployment` would
+    return None and every dispatch would be skipped. Default the recheck to
+    "the snapshot is still current"; tests that pin the recheck itself
+    override `daemon.get_live_deployment` explicitly."""
+    import live_runner.daemon as daemon_module
+
+    from types import SimpleNamespace as _NS
+
+    def _current(deployment_id: str):
+        return _NS(status="ACTIVE", id=deployment_id)
+
+    monkeypatch.setattr(daemon_module, "get_live_deployment", _current)
+
+
 def test_dispatch_fans_out_to_every_matching_deployment() -> None:
     """One Discord signal used to execute on at most one deployment (break after
     the first match). Every matching deployment must receive the signal."""

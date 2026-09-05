@@ -8,7 +8,7 @@ import os
 import re
 import uuid
 from collections.abc import Iterable, Mapping
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -66,6 +66,8 @@ _DISCORD_AUTH_BLOCKED_ACCOUNTS: set[str] = set()
 _DISCORD_AUTH_BLOCKED_REASONS: dict[str, str] = {}
 _DISCORD_SERVICE_AUTH_BLOCKED_IDS: set[str] = set()
 _DISCORD_SERVICE_AUTH_BLOCKED_REASONS: dict[str, str] = {}
+DISCORD_RECONNECT_RETRY_FLOOR_SECONDS = 30
+_DISCORD_SERVICE_RECONNECT_RETRY_NOT_BEFORE: dict[str, datetime] = {}
 _CTRADER_AUTH_BLOCKED_ACCOUNTS: set[str] = set()
 _CTRADER_AUTH_BLOCKED_REASONS: dict[str, str] = {}
 _CTRADER_ACCOUNT_CREDENTIAL_SIGNATURES: dict[str, str] = {}
@@ -936,6 +938,32 @@ def _deployment_covers_discord_symbol(
     return not deployment_symbols or symbol.upper() in deployment_symbols
 
 
+def _resolve_discord_service_trusted_author_ids(
+    service: Service,
+    *,
+    accounts_env_values: Mapping[str, str],
+) -> set[str]:
+    """Standalone Discord bot services configure their allowlist directly in
+    the service config; env vars may supply the same value."""
+    config = service.config if isinstance(service.config, dict) else {}
+    direct = _trusted_author_ids_from_config(
+        config.get("trusted_author_ids") or config.get("trusted_bot_ids")
+    )
+    if direct:
+        return direct
+    env_key = _service_config_string(config, "trusted_author_ids_env_key") or (
+        "DISCORD_TRUSTED_AUTHOR_IDS"
+    )
+    raw_env = str(
+        accounts_env_values.get(env_key) or os.environ.get(env_key, "")
+    ).strip()
+    if not raw_env:
+        return set()
+    return _trusted_author_ids_from_config(
+        item.strip() for item in raw_env.split(",") if item.strip()
+    )
+
+
 async def _submit_normalized_discord_signal(
     account_id: str,
     adapter: BaseLiveAdapter,
@@ -1200,6 +1228,28 @@ async def _run_discord_signal_listener_for_account(
 
     # Resolve a real account token (account/user tokens, not a generic bot token).
     primary_deployment = next(iter(active_discord_deployments))
+    # The trusted-author allowlist is the ingestion source gate (Decision
+    # Record): authors trusted by ANY deployment on the polled channels are
+    # merged into one allowlist. Without an explicit allowlist the listener
+    # refuses to start — an open gate must never trade.
+    merged_trusted_author_ids: set[str] = set()
+    for deployment in channel_to_deployments.values():
+        for channel_deployment in deployment:
+            merged_trusted_author_ids |= _deployment_trusted_author_ids(channel_deployment)
+    if not merged_trusted_author_ids:
+        logger.warning(
+            "Discord listener not started: no trusted_author_ids configured "
+            "for any active discord deployment",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "deployment_ids": sorted(
+                        str(deployment.id) for deployment in active_discord_deployments
+                    ),
+                }
+            },
+        )
+        return
     source = DiscordSignalSource(
         token=_resolve_account_discord_token(
             accounts_env_values,
@@ -1207,6 +1257,7 @@ async def _run_discord_signal_listener_for_account(
         ),
         channel_ids=set(channel_to_deployments.keys()),
         timeframe=_deployment_signal_timeframe(primary_deployment),
+        trusted_author_ids=merged_trusted_author_ids,
     )
     await source.connect()
     try:
@@ -1551,6 +1602,16 @@ async def _stop_inactive_discord_bots(
         )
 
 
+def _is_discord_service_reconnect_blocked(service_id: str) -> bool:
+    until = _DISCORD_SERVICE_RECONNECT_RETRY_NOT_BEFORE.get(service_id)
+    if until is None:
+        return False
+    if datetime.now(timezone.utc) >= until:
+        _DISCORD_SERVICE_RECONNECT_RETRY_NOT_BEFORE.pop(service_id, None)
+        return False
+    return True
+
+
 async def _reconnect_discord_bot_source(
     service: Service,
     source: DiscordSignalSource,
@@ -1560,6 +1621,21 @@ async def _reconnect_discord_bot_source(
 ) -> None:
     if source.is_connected or (running_task is not None and not running_task.done()):
         return
+    if _is_discord_service_reconnect_blocked(service_id):
+        retry_not_before = _DISCORD_SERVICE_RECONNECT_RETRY_NOT_BEFORE.get(service_id)
+        logger.debug(
+            "Discord bot reconnect deferred; inside transient retry backoff",
+            extra={
+                "data": {
+                    "service_id": service_id,
+                    "service_name": service.name,
+                    "retry_not_before": retry_not_before.isoformat()
+                    if retry_not_before
+                    else None,
+                }
+            },
+        )
+        return
     try:
         await source.reconnect()
         await asyncio.to_thread(
@@ -1568,6 +1644,7 @@ async def _reconnect_discord_bot_source(
             ServiceStatus.RUNNING,
             last_activity=datetime.now(timezone.utc),
         )
+        _DISCORD_SERVICE_RECONNECT_RETRY_NOT_BEFORE.pop(service_id, None)
         logger.info(
             "Reconnected Discord bot %s",
             service.name,
@@ -1587,17 +1664,23 @@ async def _reconnect_discord_bot_source(
             )
             await asyncio.to_thread(update_service_status, service_id, ServiceStatus.FAILED)
             return
+        # Transient failure: keep the service recoverable. The next sync tick
+        # retries after the backoff floor instead of the old behavior of
+        # writing FAILED once and never re-arming recovery (B-5).
+        _DISCORD_SERVICE_RECONNECT_RETRY_NOT_BEFORE[service_id] = datetime.now(
+            timezone.utc
+        ) + timedelta(seconds=DISCORD_RECONNECT_RETRY_FLOOR_SECONDS)
         logger.warning(
-            "Discord bot reconnect failed",
+            "Discord bot reconnect failed; will retry after backoff",
             extra={
                 "data": {
                     "service_id": service_id,
                     "service_name": service.name,
+                    "retry_in_seconds": DISCORD_RECONNECT_RETRY_FLOOR_SECONDS,
                     "error": str(exc),
                 }
             },
         )
-        await asyncio.to_thread(update_service_status, service_id, ServiceStatus.FAILED)
 
 
 async def _ensure_discord_bot_source(
