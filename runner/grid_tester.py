@@ -95,6 +95,10 @@ def _cell_from_stats(
         "total_trades": _total_trades_from(stats, has_trades, trade_count),
     }
     for source_key, canonical_key in _CANONICAL_STAT_KEYS:
+        # First valid match wins: a later alias row (e.g. legacy "sharpe") must
+        # not overwrite the canonical key already mapped from "sharpe_ratio".
+        if canonical_key in cell:
+            continue
         value = stats.get(source_key)
         if value is None:
             continue

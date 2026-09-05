@@ -100,6 +100,11 @@ def _detect_date_range(symbols: list[str], timeframe: str, data_dir: str = "") -
     normalized_timeframe = normalize_timeframe(timeframe)
     starts, ends = [], []
 
+    if not symbols:
+        raise ValueError(
+            "No symbols requested; refusing to fabricate a backtest date range"
+        )
+
     for symbol in symbols:
         matches = list(ohlcv_root.rglob(f"**/{symbol}/{normalized_timeframe}.parquet"))
         if not matches:
