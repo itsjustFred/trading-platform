@@ -179,7 +179,7 @@ def _allow_bar_coverage_preflight(monkeypatch) -> None:
     monkeypatch.setattr(optimizer_module, "has_ohlcv_bars_in_range", lambda **kwargs: True)
 
 
-def _write_risk_parity_base_backtest(backtests_dir: Path) -> None:
+def _write_risk_parity_base_backtest(backtests_dir: Path, *, data_dir: Path | None = None) -> None:
     trades: list[Trade] = []
     for index, symbol in enumerate(["SPY", "TLT", "GLD"], start=1):
         for day in range(1, 6):
@@ -212,7 +212,12 @@ def _write_risk_parity_base_backtest(backtests_dir: Path) -> None:
             backtest_start="2024-01-01",
             backtest_end="2024-01-10",
             initial_capital=100000.0,
-            data={"symbols": ["SPY", "TLT", "GLD"], "timeframes": ["1d"], "source": "test"},
+            data={
+                "symbols": ["SPY", "TLT", "GLD"],
+                "timeframes": ["1d"],
+                "source": "test",
+                **({"data_dir": str(data_dir)} if data_dir is not None else {}),
+            },
             parameters={"rebalance_period": 21},
         ),
         trades=trades,
@@ -487,8 +492,17 @@ def test_run_risk_parity_covariance_optimization_saves_weights(monkeypatch, tmp_
     backtests_dir = tmp_path / "backtests"
     optimizations_dir = tmp_path / "optimizations"
     backtests_dir.mkdir(parents=True, exist_ok=True)
-    _write_risk_parity_base_backtest(backtests_dir)
+    _write_risk_parity_base_backtest(backtests_dir, data_dir=backtests_dir)
 
+    # Cleanup 16-D1 (F30): covariance returns come from market data first.
+    # Seed tradable bars for the universe so the market-data path succeeds
+    # without network access.
+    for symbol in ("SPY", "TLT", "GLD"):
+        _write_ohlcv_bars(
+            backtests_dir,
+            symbol,
+            [f"2024-01-{day:02d}T00:00:00+00:00" for day in range(1, 11)],
+        )
     monkeypatch.setattr(optimizer_module, "BACKTESTS_DIR", backtests_dir)
     monkeypatch.setattr(optimizer_module, "OPTIMIZATIONS_DIR", optimizations_dir)
     monkeypatch.setattr(

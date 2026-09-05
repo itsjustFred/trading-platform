@@ -60,6 +60,60 @@ TARGET_METRIC_ALIASES = {
 
 ProgressCallback = Callable[[float, str], None]
 
+#: Marker value recorded on no-trade trials. Purely informational (the trial
+#: objective returns the dynamic penalty from :func:`_no_trade_penalty_value`);
+#: kept for the ``metric_value`` user attr so downstream consumers see an
+#: explicitly non-competitive value instead of a plausible-looking 0.0.
+_NO_TRADE_PENALTY = -1e9
+
+
+def _no_trade_penalty_value(completed_trading_values: list[float]) -> float:
+    """Return a no-trade trial value that can never win the study.
+
+    The penalty sits strictly below the worst value of the trading trials
+    completed so far (with a safety margin). For the very first trial there
+    is nothing to undercut yet, so a large finite negative constant is used —
+    it is still strictly below any plausible metric value (Sharpe, Sortino,
+    Calmar, profit factor and total return are all above −1e6 for real
+    backtests), so an honest trial can never lose against it.
+    """
+    if not completed_trading_values:
+        return _NO_TRADE_PENALTY
+    return min(float(value) for value in completed_trading_values) - 1.0
+
+
+def _best_trial_or_raise(study: optuna.Study) -> optuna.trial.FrozenTrial:
+    """Return the best completed TRADING trial, raising when none exist.
+
+    ``study.best_trial`` raises an opaque Optuna ValueError when every trial
+    failed (e.g. bad parameter ranges) — surfacing that as a plain message
+    keeps the failure distinguishable from "no valid parameter region".
+
+    No-trade (penalized) trials are excluded from selection (Cleanup 16-D1,
+    AC 2): a study whose completed trials are ALL no-trade trials must not
+    hand back a no-trade parameter set as "best".
+    """
+    completed = study.get_trials(
+        deepcopy=False, states=(optuna.trial.TrialState.COMPLETE,)
+    )
+    if not completed:
+        raise RuntimeError(
+            "Optimization produced no completed trials — every trial failed. "
+            "Check parameter_ranges/target_metric before retrying."
+        )
+    trading_trials = [
+        trial
+        for trial in completed
+        if not bool(trial.user_attrs.get("penalty_applied", False))
+    ]
+    if not trading_trials:
+        raise RuntimeError(
+            "Every completed optimization trial was a no-trade trial — no "
+            "parameter region produced trades. Widen parameter_ranges or "
+            "relax position-sizing constraints before retrying."
+        )
+    return max(trading_trials, key=lambda trial: float(trial.value or 0.0))
+
 
 class OptimizationConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -258,7 +312,14 @@ def run_optimization(
         trial.set_user_attr("failure_reason", f"{type(exc).__name__}: {exc}")
         raise exc
 
+    study = optuna.create_study(direction="maximize")
+
     def objective(trial: optuna.Trial) -> float:
+        completed_trading_values = [
+            float(t.value)
+            for t in study.get_trials(deepcopy=False, states=(optuna.trial.TrialState.COMPLETE,))
+            if t.value is not None and not bool(t.user_attrs.get("penalty_applied", False))
+        ]
         trial_symbols = _trial_symbols(trial, symbols, candidate_universes)
         trial_params = {
             param_name: _suggest_parameter(trial, param_name, spec)
@@ -289,10 +350,18 @@ def run_optimization(
         trial.set_user_attr("trade_count", len(train_result.trades))
 
         if not train_result.trades:
+            # No-trade trials (Cleanup 16-D1, AC 2): a trial that never trades
+            # must never win the study. Under direction="maximize" the previous
+            # penalty value 0.0 BEAT every honest trial with negative Sharpe,
+            # steering the search toward parameter regions that avoid trading.
+            # The explicit penalty is strictly below the value of the worst
+            # trading trial observed so far, and the marker stays on the trial
+            # for downstream validation.
             trial.set_user_attr("penalty_applied", True)
             trial.set_user_attr("metric_name", _metric_key(config.target_metric, train_stats))
-            trial.set_user_attr("metric_value", NO_TRADE_PENALTY)
-            return NO_TRADE_PENALTY
+            penalty = _no_trade_penalty_value(completed_trading_values)
+            trial.set_user_attr("metric_value", float(penalty))
+            return penalty
 
         metric_value = _metric_value(train_stats, config.target_metric)
         # The NO_TRADE_PENALTY floor only steers Optuna correctly while every
@@ -326,7 +395,6 @@ def run_optimization(
         )
         _emit_progress(progress_callback, percent, message)
 
-    study = optuna.create_study(direction="maximize")
     study.optimize(
         objective,
         n_trials=config.n_trials,
@@ -350,16 +418,17 @@ def run_optimization(
             f"parameter set from failed backtests. Last trials: {failure_summary}"
         ) from last_trial_exception
 
-    best_trial = study.best_trial
+    best_trial = _best_trial_or_raise(study)
     best_params = {
         key: value
-        for key, value in dict(study.best_params).items()
+        for key, value in dict(best_trial.params).items()
         if key != _INTERNAL_SYMBOL_UNIVERSE_PARAM
     }
     best_symbols = list(best_trial.user_attrs.get("symbols") or symbols)
     effective_best_params = dict(base_parameters)
     effective_best_params.update(best_params)
     best_train_stats = dict(best_trial.user_attrs.get("train_stats") or {})
+    best_value = best_trial.value
 
     test_result = _run_vectorbt_backtest(
         BacktestConfig(
@@ -401,7 +470,7 @@ def run_optimization(
         "base_parameters": _json_safe(base_parameters),
         "best_params": _json_safe(best_params),
         "effective_best_parameters": _json_safe(effective_best_params),
-        "best_value": _safe_float_or_none(study.best_value),
+        "best_value": _safe_float_or_none(best_value),
         "train_period": train_period,
         "test_period": test_period,
         "train_stats": _json_safe(best_train_stats),
@@ -593,15 +662,21 @@ def _run_risk_parity_covariance_optimization(
     progress_callback: ProgressCallback | None,
 ) -> dict[str, Any]:
     _emit_progress(progress_callback, 5.0, "Loading asset return history for risk parity.")
-    returns_frame = _asset_returns_frame_from_base_result(base_result)
+    # Covariance input precedence (Cleanup 16-D1, F30): risk-parity weights
+    # express ASSET co-movement, so the returns frame must come from market
+    # data (asset prices). The trade-PnL pseudo-equity frame measures
+    # strategy-trade overlap, not asset correlation, and is only a
+    # last-resort fallback — the previous order of preference let two
+    # traded symbols permanently block the market-data path.
+    returns_frame = _asset_returns_frame_from_market_data(
+        symbols=symbols,
+        timeframe=timeframe,
+        start=train_period["start"],
+        end=train_period["end"],
+        data_dir=str(base_result.meta.data.get("data_dir") or ""),
+    )
     if returns_frame.empty or len(returns_frame.columns) < 2:
-        returns_frame = _asset_returns_frame_from_market_data(
-            symbols=symbols,
-            timeframe=timeframe,
-            start=train_period["start"],
-            end=train_period["end"],
-            data_dir=str(base_result.meta.data.get("data_dir") or ""),
-        )
+        returns_frame = _asset_returns_frame_from_base_result(base_result)
     if returns_frame.empty or len(returns_frame.columns) < 2:
         raise ValueError(
             "Risk parity covariance optimization requires at least two asset return series"

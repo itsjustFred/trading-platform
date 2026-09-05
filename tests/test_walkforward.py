@@ -499,3 +499,34 @@ def test_walkforward_prefers_freshly_computed_stats(tmp_path):
     assert result["folds"][0]["is_stats"]["total_trades"] == 0
     assert result["folds"][0]["oos_stats"]["total_trades"] == 0
     assert "sharpe_ratio" in result["folds"][0]["is_stats"]
+class TestWindowBuilderGuards:
+    """Mutation hardening: fold-builder guards and canonical metric keys."""
+
+    def test_empty_window_set_raises(self):
+        """A range too short for a single fold must fail loudly.
+
+        Kills the mutant that removed the empty-windows guard: an empty fold
+        list would silently produce a payload with fold_count 0.
+        """
+        from runner.walkforward import _build_windows
+
+        with pytest.raises(ValueError, match="No walk-forward folds"):
+            _build_windows(
+                start="2024-01-01",
+                end="2024-02-01",
+                train_months=12,
+                test_months=3,
+                step_months=1,
+            )
+
+    def test_is_sharpe_reads_canonical_sharpe_ratio_key(self):
+        """Fold metrics must read the canonical sharpe_ratio first.
+
+        Kills the mutant that reads the non-canonical 'sharpe' alias first:
+        when a stats dict carries both, the canonical key must win (F15
+        merge-order semantics at the metric level).
+        """
+        from runner.walkforward import _metric
+
+        stats = {"sharpe_ratio": 1.5, "sharpe": 99.0}
+        assert _metric(stats, "sharpe_ratio", "sharpe") == 1.5

@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import contextlib
+import io
+
 import json
+import pytest
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -199,3 +203,41 @@ def test_detect_date_range_rejects_disjoint_symbol_ranges(tmp_path):
 
     with pytest.raises(ValueError, match="disjoint"):
         runner_cli._detect_date_range(["AAA", "BBB"], "1d", str(tmp_path))
+class TestMaxPositionPctHelpSemantics:
+    """Mutation hardening (F7/D12): the CLI help must pin the flag semantics."""
+
+    def test_help_documents_per_position_cap_not_leverage(self, capsys, monkeypatch):
+        """--max-position-pct help must say per-position and deny leverage.
+
+        Kills the mutant that rewrote the help into 'leverage may be applied'
+        — the whole F7 defusal rests on the documented semantics.
+        """
+        from runner.cli import main
+
+        monkeypatch.setattr("sys.argv", ["runner.cli", "run", "--help"])
+        with pytest.raises(SystemExit):
+            main()
+        text = " ".join(capsys.readouterr().out.split())
+        assert "Per-position notional cap" in text, (
+            "help must state the per-position notional-cap semantics"
+        )
+        assert "not a leverage grant" in text, (
+            "help must explicitly deny the leverage reading"
+        )
+
+
+def test_help_mentions_max_leverage_separately(capsys, monkeypatch):
+    """The help must point leverage at --max-leverage, not blur the two.
+
+    Kills the mutant that rewrote the leverage sentence into 'leverage may
+    be applied' — blurring the two knobs back into the F7 ambiguity.
+    """
+    from runner.cli import main
+
+    monkeypatch.setattr("sys.argv", ["runner.cli", "run", "--help"])
+    with pytest.raises(SystemExit):
+        main()
+    text = " ".join(capsys.readouterr().out.split())
+    assert "--max-leverage controls leverage separately" in text, (
+        "the help must route leverage semantics to --max-leverage"
+    )

@@ -206,12 +206,15 @@ def _process_symbol(
 
             if config.risk_per_trade_pct is not None and config.risk_per_trade_pct > 0:
                 sizing_mode = "risk_pct"
+                # Sizing semantics (Cleanup 16-D1, F7/F35): max_position_pct is
+                # the per-position notional cap (documented in the CLI). It is
+                # an INDEPENDENT cap, not an implicit leverage floor: the
+                # leverage limit is max_leverage alone, and a conservative
+                # max_leverage < max_position_pct is honored as configured.
                 max_position_pct = _resolve_max_position_pct(
                     config.max_position_pct, asset_class
                 )
                 max_leverage = _resolve_max_leverage(config.max_leverage)
-                if max_leverage < max_position_pct:
-                    max_leverage = max_position_pct
 
                 risk_target_usd = equity * config.risk_per_trade_pct
                 stop_distance = _resolve_stop_distance(
@@ -238,29 +241,32 @@ def _process_symbol(
                 capped_by_max_position = required_notional > cap_notional
                 capped_by_max_leverage = required_notional > leverage_notional_limit
 
-                if required_notional <= cap_notional:
+                # D10 (F35/F7): the binding notional is
+                # min(position cap, leverage limit); both are independent caps.
+                binding_notional = min(cap_notional, leverage_notional_limit)
+                if required_notional <= binding_notional:
                     final_notional = required_notional
-                elif required_notional <= leverage_notional_limit:
-                    final_notional = required_notional
-                    logger.info(
-                        "Leverage used for %s trade %s: required_notional=%.2f exceeds cap=%.2f (max_leverage=%.2fx)",
-                        symbol,
-                        trade_counter,
-                        required_notional,
-                        cap_notional,
-                        max_leverage,
-                    )
                 else:
-                    final_notional = leverage_notional_limit
+                    final_notional = binding_notional
                     achievable_risk = (final_notional / entry_price) * stop_distance
-                    _warn_once(
-                        (symbol, config.timeframe, "risk_underfilled"),
-                        "Risk target underfilled for %s/%s: cap=%.2f, max_leverage=%.2fx",
-                        symbol,
-                        config.timeframe,
-                        cap_notional,
-                        max_leverage,
-                    )
+                    if capped_by_max_leverage and not capped_by_max_position:
+                        logger.info(
+                            "Leverage bound notional for %s trade %s: required_notional=%.2f exceeds leverage limit=%.2f (max_leverage=%.2fx)",
+                            symbol,
+                            trade_counter,
+                            required_notional,
+                            leverage_notional_limit,
+                            max_leverage,
+                        )
+                    else:
+                        _warn_once(
+                            (symbol, config.timeframe, "risk_underfilled"),
+                            "Risk target underfilled for %s/%s: cap=%.2f, max_leverage=%.2fx",
+                            symbol,
+                            config.timeframe,
+                            cap_notional,
+                            max_leverage,
+                        )
 
                 qty = final_notional / entry_price
             else:
@@ -418,12 +424,27 @@ class VectorbtAdapter(EngineAdapter):
         for idx, trade in enumerate(all_trades, start=1):
             trade.id = idx
 
-        # Build equity curve from sorted trades
+        # Build equity curve from sorted trades (Cleanup 16-D1, F5).
+        # Semantics decision: the persisted curve is a REALIZED-PnL portfolio
+        # curve over EXIT time. Each symbol's own sizing compounds from the
+        # shared initial capital inside `_process_symbol`; summing those
+        # per-symbol paths into one "portfolio" equity would multiply capital
+        # by the symbol count, so the aggregate curve here intentionally
+        # replays only closed PnL, once per portfolio, credited at the trade's
+        # exit — and therefore replayed in EXIT order (native/pynecore do the
+        # same). Drawdown/Sharpe computed on this curve describe the realized
+        # portfolio, not an intraday mark-to-market path — the limitation is
+        # documented in the cross-engine contract.
         all_equity: list[EquityPoint] = []
         equity = config.initial_capital
-        for trade in all_trades:
+        for trade in sorted(all_trades, key=lambda item: item.last_exit_time):
             equity += trade.pnl
-            all_equity.append(EquityPoint(time=trade.entry_time, equity=round(equity, 2)))
+            all_equity.append(
+                EquityPoint(
+                    time=trade.last_exit_time or trade.entry_time,
+                    equity=round(equity, 2),
+                )
+            )
 
         now = datetime.now(timezone.utc)
         if hasattr(strategy_mod, "STRATEGY_META"):
