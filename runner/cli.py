@@ -27,7 +27,7 @@ from runner.backtest_grid import DEFAULT_OUTPUT_DIR, parse_csv_list, parse_param
 from runner.backtest_matrix import MATRIX_OUTPUT_DIR, run_backtest_matrix
 from runner.daily_equity import attach_daily_equity
 from runner.engines.base import BacktestConfig, EngineAdapter, resolve_strategy_parameters
-from runner.stats import compute_stats_for_result
+from runner.stats import merge_canonical_stats
 from runner.walkforward import run_walkforward
 from shared.constants import DATA_DIR, normalize_timeframe
 from shared.database import save_result_to_sqlite
@@ -89,6 +89,12 @@ def _detect_date_range(symbols: list[str], timeframe: str, data_dir: str = "") -
     """Auto-detect date range from available OHLCV data files.
 
     For multiple symbols, returns the intersection (common period).
+    Raises ValueError when no data is found or the symbols' covered periods
+    are disjoint — fabricated ranges must never flow into backtests.
+
+    Single-symbol callers with a plain ``data_dir`` may use the cheaper
+    per-symbol facet in ``runner.backtest_grid._detect_date_range``; both share
+    the same loud-failure contract (F19) over the same parquet layout.
     """
     ohlcv_root = Path(data_dir) / "ohlcv" if data_dir else DATA_DIR / "ohlcv"
     normalized_timeframe = normalize_timeframe(timeframe)
@@ -100,7 +106,10 @@ def _detect_date_range(symbols: list[str], timeframe: str, data_dir: str = "") -
             # Try without exact timeframe match — find any parquet for symbol
             matches = list(ohlcv_root.rglob(f"**/{symbol}/*.parquet"))
         if not matches:
-            continue
+            raise ValueError(
+                f"No OHLCV data found for {symbol}/{normalized_timeframe} under "
+                f"{ohlcv_root}; refusing to fabricate a backtest date range"
+            )
         try:
             import pandas as pd
 
@@ -110,13 +119,32 @@ def _detect_date_range(symbols: list[str], timeframe: str, data_dir: str = "") -
                 ts = pd.to_datetime(df["timestamp"])
                 starts.append(ts.min().strftime("%Y-%m-%d"))
                 ends.append(ts.max().strftime("%Y-%m-%d"))
+            else:
+                logger.warning(
+                    "No timestamp column in %s; symbol %s cannot contribute a date range",
+                    matches[0], symbol,
+                )
         except Exception as e:
             logger.warning("Could not read date range from %s: %s", matches[0], e)
 
-    if starts and ends:
-        # Intersection: latest start, earliest end
-        return max(starts), min(ends)
-    return "2023-01-01", "2025-12-31"  # fallback
+    # A symbol whose file could not be read must not silently shrink the
+    # intersection — every requested symbol has to contribute a range.
+    if len(starts) != len(symbols) or len(ends) != len(symbols):
+        raise ValueError(
+            f"OHLCV data for {symbols} under {ohlcv_root} has no readable "
+            "timestamps for every symbol; refusing to fabricate a backtest "
+            "date range"
+        )
+
+    # Intersection: latest start, earliest end
+    detected_start, detected_end = max(starts), min(ends)
+    if detected_start > detected_end:
+        raise ValueError(
+            f"Symbols {symbols} have disjoint data coverage "
+            f"({detected_start} > {detected_end}); refusing to backtest an "
+            "empty intersection"
+        )
+    return detected_start, detected_end
 
 
 def cmd_run(args):
@@ -216,7 +244,7 @@ def cmd_run(args):
     if engine.name != "native":
         _emit_progress(progress_callback, 90.0, "Calculating statistics...")
     attach_daily_equity(result, start=start, end=end)
-    result.stats = {**result.stats, **compute_stats_for_result(result)}
+    merge_canonical_stats(result)
 
     # Save result
     _emit_progress(progress_callback, 95.0, "Saving results...")
@@ -227,6 +255,11 @@ def cmd_run(args):
         ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         output_path = str(BACKTESTS_DIR / f"{config.strategy_name}_{ts}.trades.json")
 
+    if not getattr(args, "keep_indicators", False):
+        # Default is indicator-stripped output (F3): strip BEFORE saving so the
+        # serialized JSON omits indicators. The flag exists only on the
+        # grid/matrix commands, which opt in explicitly.
+        result.indicators = []
     result.save(output_path)
     if not getattr(args, "skip_sqlite", False):
         try:
@@ -384,6 +417,11 @@ def main():
     run_p.add_argument("--skip-sqlite", action="store_true", help="Do not persist this run to SQLite")
     run_p.add_argument("--params", help="Parameters JSON, e.g. '{\"fast\": 10, \"slow\": 30}'")
     run_p.add_argument("--data-dir", help="Override data directory")
+    run_p.add_argument(
+        "--keep-indicators",
+        action="store_true",
+        help="Keep indicator arrays in the output JSON (grids pass this when --keep-indicators is set)",
+    )
     run_p.add_argument(
         "--progress-stdout",
         action="store_true",

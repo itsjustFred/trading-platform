@@ -16,6 +16,7 @@ import subprocess
 import sys
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -26,7 +27,7 @@ from pydantic import ValidationError
 from data_tools.auto_download import ensure_backtest_data
 from runner.daily_equity import attach_daily_equity
 from runner.engines.base import BacktestConfig, resolve_strategy_parameters
-from runner.stats import compute_stats_for_result
+from runner.stats import merge_canonical_stats
 from shared.constants import DATA_DIR, normalize_timeframe
 from shared.database import save_result_to_sqlite
 from shared.logging import get_logger
@@ -100,6 +101,13 @@ def backtest_id_from_output_path(path: Path) -> str:
 
 
 def read_backtest_stats(path: Path) -> dict[str, Any]:
+    """Read the canonical stats from a persisted run JSON.
+
+    One canonical key per metric (F40). ``net_profit_pct`` is **derived** from
+    ``total_return`` explicitly — it is not a ``BacktestStats`` field and must
+    never be read from the stats dict, where an unrelated or missing value
+    would silently masquerade as the derived percentage.
+    """
     payload = json.loads(path.read_text(encoding="utf-8"))
     stats = payload.get("stats", {}) if isinstance(payload, dict) else {}
     trades = payload.get("trades", []) if isinstance(payload, dict) else []
@@ -110,13 +118,30 @@ def read_backtest_stats(path: Path) -> dict[str, Any]:
         "trade_data_available": isinstance(trades, list),
         "total_trades": len(trades) if isinstance(trades, list) else 0,
         "total_pnl": stats.get("total_pnl"),
-        "net_profit_pct": stats.get("net_profit_pct", stats.get("total_return")),
-        "sharpe": stats.get("sharpe", stats.get("sharpe_ratio")),
+        "total_return": stats.get("total_return"),
+        "net_profit_pct": _derive_net_profit_pct(stats.get("total_return")),
+        "sharpe_ratio": stats.get("sharpe_ratio"),
         "cagr": stats.get("cagr"),
         "max_drawdown_pct": stats.get("max_drawdown_pct"),
         "win_rate": stats.get("win_rate"),
         "daily_return_count": stats.get("daily_return_count", 0),
     }
+
+
+def _derive_net_profit_pct(total_return: Any) -> float | None:
+    """Derive net_profit_pct from the canonical total_return stat (F40).
+
+    ``net_profit_pct`` is not a ``BacktestStats`` field; it is always the
+    total-return value expressed as a percentage, or nothing when the run
+    never produced a total return.
+    """
+    if total_return is None:
+        return None
+    try:
+        derived = float(total_return) * 100.0
+    except (TypeError, ValueError):
+        return None
+    return derived
 
 
 def build_run_id(strategy: str, symbol: str, timeframe: str) -> str:
@@ -209,16 +234,37 @@ def get_engine(name: str):
 
 
 def _detect_date_range(symbol: str, timeframe: str, data_dir: str) -> tuple[str, str]:
+    """Detect one symbol's covered period, or raise instead of fabricating one.
+
+    Single-symbol facet of ``runner.cli._detect_date_range`` (which intersects
+    several symbols on top of the same parquet scan). Kept here so grid cells
+    resolve dates without importing runner.cli; both share the loud-failure
+    contract (F19): no fabricated range may ever flow into a backtest.
+    """
     root = Path(data_dir) / "ohlcv" if data_dir else DATA_DIR / "ohlcv"
     matches = list(root.rglob(f"**/{symbol}/{timeframe}.parquet"))
     if not matches:
         matches = list(root.rglob(f"**/{symbol}/*.parquet"))
     if not matches:
-        return "2023-01-01", "2025-12-31"
-    df = pd.read_parquet(matches[0], columns=["timestamp"])
+        raise ValueError(
+            f"No OHLCV data found for {symbol}/{timeframe} under {root}; "
+            "refusing to fabricate a backtest date range"
+        )
+    df = pd.read_parquet(matches[0])
+    df.columns = [str(c).lower() for c in df.columns]
+    if "timestamp" not in df.columns:
+        # Same contract as runner.cli._detect_date_range: a file without a
+        # readable timestamp column cannot contribute a date range.
+        raise ValueError(
+            f"OHLCV data for {symbol}/{timeframe} under {root} has no "
+            "timestamp column; refusing to fabricate a backtest date range"
+        )
     ts = pd.to_datetime(df["timestamp"], utc=True, errors="coerce").dropna()
     if ts.empty:
-        return "2023-01-01", "2025-12-31"
+        raise ValueError(
+            f"OHLCV data for {symbol}/{timeframe} under {root} has no valid "
+            "timestamps; refusing to fabricate a backtest date range"
+        )
     return ts.min().strftime("%Y-%m-%d"), ts.max().strftime("%Y-%m-%d")
 
 
@@ -240,49 +286,67 @@ def _resolve_dates_for_equity(
     return start_date, end_date
 
 
-def run_one_backtest_in_process(
+def _failed_cell(
+    request: CellRequest,
     *,
-    strategy: str,
-    symbol: str,
-    timeframe: str,
-    start: str,
-    end: str,
-    engine: str,
-    capital: float,
-    risk_pct: float | None,
-    max_position_pct: float | None,
-    max_leverage: float | None,
-    intrabar_resolution: str,
-    params: dict[str, Any] | None,
-    output_dir: Path,
-    data_dir: str,
-    skip_existing: bool,
-    save_sqlite: bool = True,
-    keep_indicators: bool = False,
+    error_class: str,
+    error: str,
 ) -> dict[str, Any]:
-    run_id = build_run_id(strategy, symbol, timeframe)
-    path = output_path_for(output_dir, run_id)
-    started_at = datetime.now(timezone.utc).isoformat()
+    """A minimal failed cell record for preambles that cannot complete.
+
+    ``start``/``end`` carry the *requested* window by construction: resolution
+    failed, so no resolved window exists to report (pre-mortem 16-B #9).
+    """
+    run_id = build_run_id(request.strategy, request.symbol, request.timeframe)
+    return {
+        "run_id": run_id,
+        "symbol": request.symbol,
+        "timeframe": request.timeframe,
+        "start": request.start,
+        "end": request.end,
+        "output": str(output_path_for(request.output_dir, run_id)),
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+        "status": "failed",
+        "error_class": error_class,
+        "error": error,
+    }
+
+
+def _init_cell_result(request: CellRequest) -> dict[str, Any]:
+    """Build the shared cell record and honor the skip-existing shortcut.
+
+    Returns the cell record; its ``status`` is ``pending`` unless the existing
+    output was reused (``skipped_existing``) or turned out to be unreadable
+    (``failed``). The resolved window is computed once here so the reported
+    cell window, the CLI command and ``attach_daily_equity`` all see the same
+    dates — callers must not re-resolve. Resolution errors fail only this cell
+    (like every other preamble error); they must not escape into the grid.
+    """
+    run_id = build_run_id(request.strategy, request.symbol, request.timeframe)
+    path = output_path_for(request.output_dir, run_id)
+    try:
+        resolved_start, resolved_end = _resolve_dates_for_equity(
+            request.symbol, request.timeframe, request.data_dir, request.start, request.end
+        )
+    except (OSError, ValueError) as exc:
+        return _failed_cell(request, error_class="no_data", error=str(exc))
     result: dict[str, Any] = {
         "run_id": run_id,
-        "symbol": symbol,
-        "timeframe": timeframe,
-        "start": start,
-        "end": end,
+        "symbol": request.symbol,
+        "timeframe": request.timeframe,
+        "start": resolved_start,
+        "end": resolved_end,
         "output": str(path),
-        "started_at": started_at,
+        "started_at": datetime.now(timezone.utc).isoformat(),
         "status": "pending",
     }
 
-    if skip_existing and path.exists():
+    if request.skip_existing and path.exists():
         try:
             backtest_result = BacktestResult.load(path)
-            # Resolve dates for equity attachment if not provided
-            resolved_start, resolved_end = _resolve_dates_for_equity(
-                symbol, timeframe, data_dir, start, end
-            )
             attach_daily_equity(backtest_result, start=resolved_start, end=resolved_end)
-            backtest_result.stats = {**backtest_result.stats, **compute_stats_for_result(backtest_result)}
+            merge_canonical_stats(backtest_result)
             backtest_result.save(path)
             result.update(read_backtest_stats(path))
             result.update({"status": "skipped_existing", "finished_at": datetime.now(timezone.utc).isoformat()})
@@ -291,70 +355,127 @@ def run_one_backtest_in_process(
             result.update({"status": "failed", "error": f"existing output is invalid: {exc}"})
             return result
 
+    return result
+
+
+@dataclass(frozen=True)
+class CellRequest:
+    """One grid cell's request: the knobs that always travel together between
+    the grid runner, the shared cell preamble and the engine call."""
+
+    strategy: str
+    symbol: str
+    timeframe: str
+    start: str
+    end: str
+    engine: str
+    capital: float
+    risk_pct: float | None
+    max_position_pct: float | None
+    max_leverage: float | None
+    intrabar_resolution: str
+    params: dict[str, Any] | None
+    output_dir: Path
+    data_dir: str
+    skip_existing: bool = False
+    save_sqlite: bool = True
+    keep_indicators: bool = False
+
+
+def _run_backtest_in_process_body(request: CellRequest) -> dict[str, Any]:
+    """Run the engine for one cell and persist the result.
+
+    Reads the cell knobs through ``request`` (single source of truth); only the
+    short-lived locals used several times in a row are unpacked. Returns the
+    extra cell fields (e.g. ``auto_downloaded_data``); raising propagates to
+    the caller's failure classification.
+    """
+    strategy = request.strategy
+    symbol = request.symbol
+    timeframe = request.timeframe
+    data_dir = request.data_dir
+    keep_indicators = request.keep_indicators
+    save_sqlite = request.save_sqlite
+    intrabar_resolution = request.intrabar_resolution
+    strategy_type = detect_strategy_type(Path(strategy).resolve())
+    if strategy_type == StrategyType.SIGNAL_PROCESSOR:
+        raise ValueError(
+            "Detected signal_processor strategy. runner.cli run currently supports market_data strategies only."
+        )
+
+    resolved_parameters = resolve_strategy_parameters(strategy, dict(request.params or {}))
+    normalized_timeframe = normalize_timeframe_value(timeframe)
+    start_date = request.start
+    end_date = request.end
+    if not start_date or not end_date:
+        detected_start, detected_end = _detect_date_range(symbol, normalized_timeframe, data_dir)
+        start_date = start_date or detected_start
+        end_date = end_date or detected_end
+
+    downloaded = ensure_backtest_data(
+        symbols=[symbol],
+        timeframe=normalized_timeframe,
+        start=start_date,
+        end=end_date,
+        data_dir=data_dir,
+        modeling_resolution=intrabar_resolution or "open_close",
+        log_callback=logger.info,
+    )
+
+    config = BacktestConfig(
+        strategy_name=Path(strategy).stem,
+        symbols=[symbol],
+        timeframe=normalized_timeframe,
+        start_date=start_date,
+        end_date=end_date,
+        initial_capital=request.capital,
+        risk_per_trade_pct=request.risk_pct,
+        max_position_pct=request.max_position_pct,
+        max_leverage=request.max_leverage,
+        modeling_resolution=intrabar_resolution or "open_close",
+        data_dir=data_dir,
+        parameters=resolved_parameters,
+    )
+    engine_adapter = get_engine(request.engine)
+    errors = engine_adapter.validate_config(config)
+    if errors:
+        raise ValueError("; ".join(errors))
+
+    logger.info("Running grid cell: engine=%s strategy=%s symbol=%s timeframe=%s", request.engine, strategy, symbol, timeframe)
+    backtest_result = engine_adapter.run(config, strategy)
+    backtest_result.meta.id = build_run_id(strategy, symbol, timeframe)
+    if not keep_indicators:
+        backtest_result.indicators = []
+    # Use the resolved dates for daily equity attachment
+    attach_daily_equity(backtest_result, start=start_date, end=end_date)
+    merge_canonical_stats(backtest_result)
+    # Save to the exact path the cell record reports (result["output"]), so the
+    # persisted artifact and the grid row can never diverge.
+    backtest_result.save(output_path_for(request.output_dir, backtest_result.meta.id))
+    if save_sqlite:
+        try:
+            save_result_to_sqlite(backtest_result)
+        except Exception as exc:
+            logger.warning("Could not persist grid cell to SQLite: %s", exc)
+
+    return {"auto_downloaded_data": downloaded} if downloaded else {}
+
+
+def run_one_backtest_in_process(request: CellRequest, cell: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Run one grid cell in-process; ``request`` carries the whole cell.
+
+    ``cell`` may carry a record already built by :func:`_init_cell_result`
+    (skip-existing already honored); when omitted, the preamble runs here.
+    """
+    if cell is None:
+        cell = _init_cell_result(request)
+    result = cell
+    if result["status"] != "pending":
+        return result
+
     try:
-        strategy_type = detect_strategy_type(Path(strategy).resolve())
-        if strategy_type == StrategyType.SIGNAL_PROCESSOR:
-            raise ValueError(
-                "Detected signal_processor strategy. runner.cli run currently supports market_data strategies only."
-            )
-
-        resolved_parameters = resolve_strategy_parameters(strategy, dict(params or {}))
-        normalized_timeframe = normalize_timeframe_value(timeframe)
-        start_date = start
-        end_date = end
-        if not start_date or not end_date:
-            detected_start, detected_end = _detect_date_range(symbol, normalized_timeframe, data_dir)
-            start_date = start_date or detected_start
-            end_date = end_date or detected_end
-
-        downloaded = ensure_backtest_data(
-            symbols=[symbol],
-            timeframe=normalized_timeframe,
-            start=start_date,
-            end=end_date,
-            data_dir=data_dir,
-            modeling_resolution=intrabar_resolution or "open_close",
-            log_callback=logger.info,
-        )
-        if downloaded:
-            result["auto_downloaded_data"] = downloaded
-
-        config = BacktestConfig(
-            strategy_name=Path(strategy).stem,
-            symbols=[symbol],
-            timeframe=normalized_timeframe,
-            start_date=start_date,
-            end_date=end_date,
-            initial_capital=capital,
-            risk_per_trade_pct=risk_pct,
-            max_position_pct=max_position_pct,
-            max_leverage=max_leverage,
-            modeling_resolution=intrabar_resolution or "open_close",
-            data_dir=data_dir,
-            parameters=resolved_parameters,
-        )
-        engine_adapter = get_engine(engine)
-        errors = engine_adapter.validate_config(config)
-        if errors:
-            raise ValueError("; ".join(errors))
-
-        logger.info("Running grid cell: engine=%s strategy=%s symbol=%s timeframe=%s", engine, strategy, symbol, timeframe)
-        backtest_result = engine_adapter.run(config, strategy)
-        backtest_result.meta.id = run_id
-        if not keep_indicators:
-            backtest_result.indicators = []
-        # Use resolved dates for daily equity attachment
-        attach_daily_equity(backtest_result, start=start_date, end=end_date)
-        backtest_result.stats = {**backtest_result.stats, **compute_stats_for_result(backtest_result)}
-        output_dir.mkdir(parents=True, exist_ok=True)
-        backtest_result.save(path)
-        if save_sqlite:
-            try:
-                save_result_to_sqlite(backtest_result)
-            except Exception as exc:
-                logger.warning("Could not persist grid cell to SQLite: %s", exc)
-
-        result.update(read_backtest_stats(path))
+        result.update(_run_backtest_in_process_body(request))
+        result.update(read_backtest_stats(Path(result["output"])))
         result.update({"status": "ok", "returncode": 0})
     except ValidationError as exc:
         result.update({"status": "failed", "returncode": 2, "error": str(exc)})
@@ -387,62 +508,40 @@ def run_one_backtest(
     save_sqlite: bool = True,
     keep_indicators: bool = False,
 ) -> dict[str, Any]:
-    if not use_subprocess:
-        return run_one_backtest_in_process(
-            strategy=strategy,
-            symbol=symbol,
-            timeframe=timeframe,
-            start=start,
-            end=end,
-            engine=engine,
-            capital=capital,
-            risk_pct=risk_pct,
-            max_position_pct=max_position_pct,
-            max_leverage=max_leverage,
-            intrabar_resolution=intrabar_resolution,
-            params=params,
-            output_dir=output_dir,
-            data_dir=data_dir,
-            skip_existing=skip_existing,
-            save_sqlite=save_sqlite,
-            keep_indicators=keep_indicators,
-        )
-
-    run_id = build_run_id(strategy, symbol, timeframe)
-    path = output_path_for(output_dir, run_id)
-    started_at = datetime.now(timezone.utc).isoformat()
-    result: dict[str, Any] = {
-        "run_id": run_id,
-        "symbol": symbol,
-        "timeframe": timeframe,
-        "start": start,
-        "end": end,
-        "output": str(path),
-        "started_at": started_at,
-        "status": "pending",
-    }
-
-    if skip_existing and path.exists():
-        try:
-            backtest_result = BacktestResult.load(path)
-            # Resolve dates for equity attachment if not provided
-            resolved_start, resolved_end = _resolve_dates_for_equity(
-                symbol, timeframe, data_dir, start, end
-            )
-            attach_daily_equity(backtest_result, start=resolved_start, end=resolved_end)
-            backtest_result.stats = {**backtest_result.stats, **compute_stats_for_result(backtest_result)}
-            backtest_result.save(path)
-            result.update(read_backtest_stats(path))
-            result.update({"status": "skipped_existing", "finished_at": datetime.now(timezone.utc).isoformat()})
-            return result
-        except (json.JSONDecodeError, ValidationError, OSError, ValueError) as exc:
-            result.update({"status": "failed", "error": f"existing output is invalid: {exc}"})
-            return result
-
-    # Resolve dates for CLI command and equity attachment
-    resolved_start, resolved_end = _resolve_dates_for_equity(
-        symbol, timeframe, data_dir, start, end
+    # start/end are resolve-or-detect as a pair: _resolve_dates_for_equity fills
+    # both-or-neither from the same detection, so the reported window and the
+    # engine window can never diverge. Don't fill only one of them at a call site.
+    request = CellRequest(
+        strategy=strategy,
+        symbol=symbol,
+        timeframe=timeframe,
+        start=start,
+        end=end,
+        engine=engine,
+        capital=capital,
+        risk_pct=risk_pct,
+        max_position_pct=max_position_pct,
+        max_leverage=max_leverage,
+        intrabar_resolution=intrabar_resolution,
+        params=params,
+        output_dir=output_dir,
+        data_dir=data_dir,
+        skip_existing=skip_existing,
+        save_sqlite=save_sqlite,
+        keep_indicators=keep_indicators,
     )
+    result = _init_cell_result(request)
+    if result["status"] != "pending":
+        return result
+
+    run_id = result["run_id"]
+    path = Path(result["output"])
+    resolved_start, resolved_end = result["start"], result["end"]
+
+    if not use_subprocess:
+        # The preamble already ran above; pass it through so dates and the
+        # skip-existing decision are resolved exactly once per cell.
+        return run_one_backtest_in_process(request, cell=result)
 
     cmd = build_cli_command(
         strategy=strategy,
@@ -488,8 +587,17 @@ def run_one_backtest(
     except subprocess.TimeoutExpired:
         result["status"] = "failed"
         result["returncode"] = -1
+        result["error_class"] = "timeout"
         result["finished_at"] = datetime.now(timezone.utc).isoformat()
-        result["error"] = f"timeout after {timeout_seconds}s"
+        result["error"] = f"subprocess cell timed out after {timeout_seconds}s"
+        return result
+    except OSError as exc:
+        result["status"] = "failed"
+        result["returncode"] = -1
+        result["error_class"] = "subprocess_error"
+        result["finished_at"] = datetime.now(timezone.utc).isoformat()
+        result["error"] = f"subprocess could not be launched: {exc}"
+        return result
     return result
 
 
@@ -503,8 +611,9 @@ def write_matrix_csv(output_dir: Path, rows: list[dict[str, Any]]) -> Path:
         "trade_data_available",
         "total_trades",
         "total_pnl",
+        "total_return",
         "net_profit_pct",
-        "sharpe",
+        "sharpe_ratio",
         "cagr",
         "max_drawdown_pct",
         "win_rate",
@@ -598,6 +707,7 @@ def run_backtest_grid(
             "skip_existing": skip_existing,
             "use_subprocess": use_subprocess,
             "save_sqlite": save_sqlite,
+            "keep_indicators": keep_indicators,
         }
         for symbol in normalized_symbols
         for timeframe in normalized_timeframes

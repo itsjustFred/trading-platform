@@ -14,7 +14,9 @@ import ast
 import json
 import os
 import re
+import selectors
 import subprocess
+import time
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -461,33 +463,42 @@ def _normalize_markdown_doc(markdown_doc: str, *, strategy_name: str | None) -> 
     return content
 
 
-def _extract_markdown_response(content: str) -> str:
-    for language in ("markdown", "md"):
-        match = re.search(
-            rf"```{language}\s*(.*?)```",
-            content,
-            flags=re.IGNORECASE | re.DOTALL,
-        )
+def _extract_fenced_block(content: str, languages: tuple[str, ...]) -> str | None:
+    """Return the body of the first fenced block for one of ``languages``.
+
+    No \s* between the fence and the lazy group: on input where the fence is
+    followed by a long run of whitespace and never closed, the greedy \s*
+    retries the whole lazy scan at every position (super-linear, Sonar S8786).
+    The lazy group swallows the leading whitespace and .strip() drops it.
+    """
+    for language in languages:
+        match = re.search(rf"```{language}(.*?)```", content, flags=re.IGNORECASE | re.DOTALL)
         if match:
             return match.group(1).strip()
-    return (content or "").strip()
+    return None
+
+
+def _extract_generic_fence(content: str) -> str | None:
+    """Return the body of the first fenced block with any language label."""
+    match = re.search(r"```(.*?)```", content, flags=re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    return None
+
+
+def _extract_markdown_response(content: str) -> str:
+    return _extract_fenced_block(content or "", ("markdown", "md")) or (content or "").strip()
 
 
 def _extract_python_response(content: str) -> str:
-    for language in ("python", "py"):
-        match = re.search(
-            rf"```{language}\s*(.*?)```",
-            content,
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-        if match:
-            return match.group(1).strip()
-
-    generic_match = re.search(r"```\s*(.*?)```", content, flags=re.DOTALL)
-    if generic_match:
-        return generic_match.group(1).strip()
-
-    return (content or "").strip()
+    content = content or ""
+    fenced = _extract_fenced_block(content, ("python", "py"))
+    if fenced is not None:
+        return fenced
+    generic = _extract_generic_fence(content)
+    if generic is not None:
+        return generic
+    return content.strip()
 
 
 def _extract_strategy_meta(
@@ -795,6 +806,19 @@ def _build_backtest_command(
     return cmd
 
 
+BACKTEST_TIMEOUT_SECONDS = 1800
+# Upper bound on how long the streaming loop waits inside one select() call.
+# Short enough that a deadline shrink mid-run (tests) is honored promptly.
+_DEADLINE_POLL_INTERVAL = 0.5
+# Output is read in bounded chunks after select() reports readiness.
+_READ_CHUNK = 65_536
+
+
+def _backtest_timeout() -> float:
+    """Module indirection so tests can shrink the deadline."""
+    return BACKTEST_TIMEOUT_SECONDS
+
+
 def _run_backtest(cmd: list[str], *, log: TaskLogger | None) -> tuple[int, str]:
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
@@ -811,15 +835,68 @@ def _run_backtest(cmd: list[str], *, log: TaskLogger | None) -> tuple[int, str]:
         bufsize=1,
     )
 
+    deadline = time.monotonic() + _backtest_timeout()
     try:
-        if proc.stdout is not None:
-            for line in proc.stdout:
-                output_lines.append(line)
-                _log(log, line.rstrip("\n"), stream="stdout")
+        # Read with a deadline: a child that streams forever (or hangs on a
+        # partial line) must not outlive BACKTEST_TIMEOUT_SECONDS any more than
+        # a child that sits silent — os.read() after select() never blocks
+        # longer than one deadline slice, unlike a blocking readline().
+        stdout_fd = proc.stdout.fileno() if proc.stdout is not None else None
+        selector = selectors.DefaultSelector()
+        if stdout_fd is not None:
+            selector.register(stdout_fd, selectors.EVENT_READ)
+        pending = ""
+        try:
+            while stdout_fd is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    _timeout(proc, cmd)
+                # select() wakes on output or after the slice, so a child that
+                # stays silent (or hangs mid-line) still comes back here to
+                # re-check the deadline.
+                if not selector.select(timeout=min(remaining, _DEADLINE_POLL_INTERVAL)):
+                    continue
+                chunk = os.read(stdout_fd, _READ_CHUNK)
+                if not chunk:
+                    break
+                pending += chunk.decode(errors="replace")
+                *complete, pending = pending.split("\n")
+                for line in complete:
+                    output_lines.append(line + "\n")
+                    _log(log, line, stream="stdout")
+            if pending:
+                output_lines.append(pending)
+                _log(log, pending, stream="stdout")
+        finally:
+            selector.close()
+        try:
+            returncode = proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            _timeout(proc, cmd)
     finally:
-        returncode = proc.wait()
+        # Belt-and-braces cleanup: every normal exit path leaves the child
+        # reaped, so this only fires if an exception interrupted the loop.
+        _kill(proc)
 
     return returncode, "".join(output_lines)
+
+
+def _kill(proc: subprocess.Popen) -> None:
+    """Kill and reap a child process; safe to call on an exited child."""
+    if proc.poll() is not None:
+        return
+    proc.kill()
+    proc.wait(timeout=30)
+
+
+def _timeout(proc: subprocess.Popen, cmd: list[str]) -> None:
+    """Kill a hung child and raise the timeout error for the caller."""
+    proc.kill()
+    proc.wait(timeout=30)
+    raise RuntimeError(
+        f"Generated-strategy backtest timed out after "
+        f"{_backtest_timeout()} seconds: {' '.join(cmd)}"
+    ) from None
 
 
 def _truncate(text: str, limit: int) -> str:

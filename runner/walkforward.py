@@ -16,7 +16,7 @@ import pandas as pd
 from runner.daily_equity import attach_daily_equity
 from runner.engines.base import BacktestConfig, EngineAdapter, resolve_strategy_parameters
 from runner.portfolio_optimizer import optimize_portfolio_allocation
-from runner.stats import compute_stats_for_result
+from runner.stats import merge_canonical_stats
 from shared.constants import DATA_DIR, normalize_timeframe
 
 
@@ -129,8 +129,9 @@ def _run_fold_backtest(
         raise ValueError("; ".join(errors))
     result = engine.run(config, strategy)
     if not result.equity_curve:
-        attach_daily_equity(result, start_date=start, end_date=end)
-    result.stats = {**compute_stats_for_result(result), **result.stats}
+        attach_daily_equity(result, start=start, end=end)
+    # Freshly computed canonical stats win over stale engine-provided stats.
+    merge_canonical_stats(result)
     return dict(result.stats)
 
 
@@ -182,7 +183,7 @@ def _run_portfolio_walkforward(
     )
     fold = {
         "fold": 1,
-        "is_sharpe": result.get("sharpe"),
+        "is_sharpe": _metric(result, "sharpe", "sharpe_ratio"),
         "oos_sharpe": result.get("oos_sharpe"),
         "oos_max_drawdown": result.get("oos_max_drawdown"),
     }

@@ -51,6 +51,7 @@ def test_run_strategy_grid_persists_to_sqlite(monkeypatch, tmp_path, isolated_db
     import runner.grid_tester as grid_tester_module
 
     class FakeResult:
+        trades = [object()] * 7
         stats = {
             "sharpe": 1.25,
             "cagr": 0.18,
@@ -61,7 +62,7 @@ def test_run_strategy_grid_persists_to_sqlite(monkeypatch, tmp_path, isolated_db
         }
 
     class FakeEngine:
-        def run(self, config):
+        def run(self, config, strategy_path, progress_callback=None):
             return FakeResult()
 
     class FixedDateTime:
@@ -69,7 +70,16 @@ def test_run_strategy_grid_persists_to_sqlite(monkeypatch, tmp_path, isolated_db
         def now(tz):
             return datetime(2026, 6, 17, 12, 0, tzinfo=tz)
 
-    monkeypatch.setattr(grid_tester_module, "find_strategy_entry", lambda slug: object())
+    from types import SimpleNamespace
+
+    strategy_file = tmp_path / "strategies" / "example_sma.py"
+    strategy_file.parent.mkdir(parents=True, exist_ok=True)
+    strategy_file.write_text("STRATEGY_META = {'name': 'example_sma'}\n", encoding="utf-8")
+    monkeypatch.setattr(
+        grid_tester_module,
+        "find_strategy_entry",
+        lambda slug: SimpleNamespace(slug=slug, file_path=strategy_file),
+    )
     monkeypatch.setattr(grid_tester_module, "get_engine", lambda engine_name: FakeEngine())
     monkeypatch.setattr(grid_tester_module, "GRID_RESULTS_DIR", tmp_path / "grid_results")
     monkeypatch.setattr(grid_tester_module, "datetime", FixedDateTime)
@@ -93,7 +103,11 @@ def test_run_strategy_grid_persists_to_sqlite(monkeypatch, tmp_path, isolated_db
     assert len(matching) == 1
     assert matching[0]["strategy"] == strategy_slug
     assert matching[0]["symbols"] == ["AAPL"]
-    assert matching[0]["results"]["AAPL"]["1h"]["sharpe"] == 1.25
+    first_cell = matching[0]["results"]["AAPL"]["1h"]
+    assert first_cell["status"] == "success"
+    assert first_cell["sharpe_ratio"] == 1.25
+    assert first_cell["total_trades"] == 7
+    assert "net_profit_pct" not in first_cell
 
 
 def test_save_grid_result_to_sqlite(isolated_db) -> None:
@@ -209,3 +223,198 @@ def test_grid_tester_loads_results_from_sqlite(monkeypatch) -> None:
     monkeypatch.setattr(grid_tester_module, "get_grid_results", lambda limit=100: expected[:limit])
 
     assert grid_tester_module.load_grid_results(limit=1) == expected
+
+
+def test_run_strategy_grid_passes_strategy_path_and_reports_errors(monkeypatch, tmp_path) -> None:
+    """Regression (F2/F40): engine gets strategy_path, canonical stats keys, error cells."""
+    import runner.grid_tester as grid_tester_module
+    from shared.models import BacktestMeta, BacktestResult
+
+    class CapturingEngine:
+        name = "fake"
+
+        def __init__(self):
+            self.calls = []
+
+        def run(self, config, strategy_path, progress_callback=None):
+            self.calls.append((config, strategy_path))
+            if config.timeframe == "1h":
+                return BacktestResult(
+                    meta=BacktestMeta(
+                        id="x",
+                        created_at="2026-06-17T12:00:00+00:00",
+                        engine="fake",
+                        strategies=["example_sma"],
+                        backtest_start=config.start_date,
+                        backtest_end=config.end_date,
+                        initial_capital=config.initial_capital,
+                        data={"symbols": config.symbols, "timeframes": [config.timeframe]},
+                        parameters={},
+                    ),
+                    trades=[],
+                    equity_curve=[],
+                    stats={},
+                )
+            raise RuntimeError("engine blew up")
+
+    engine = CapturingEngine()
+    strategy_path = tmp_path / "strategies" / "example_sma.py"
+    strategy_path.parent.mkdir(parents=True, exist_ok=True)
+    strategy_path.write_text("STRATEGY_META = {'name': 'example_sma'}\n", encoding="utf-8")
+
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        grid_tester_module,
+        "find_strategy_entry",
+        lambda slug: SimpleNamespace(slug=slug, file_path=strategy_path),
+    )
+    monkeypatch.setattr(grid_tester_module, "get_engine", lambda engine_name: engine)
+    monkeypatch.setattr(grid_tester_module, "GRID_RESULTS_DIR", tmp_path / "grid_results")
+
+    result = grid_tester_module.run_strategy_grid(
+        strategy_slug="example_sma",
+        symbols=["AAPL"],
+        timeframes=["1h", "4h"],
+        start="2024-01-01",
+        end="2024-01-31",
+        engine_name="fake_engine",
+    )
+
+    # The required strategy_path is forwarded to the engine (F2)
+    assert engine.calls[0][1] == str(strategy_path)
+
+    cells = result["results"]["AAPL"]
+    # Zero-trade run is distinguishable from success (no trades, no error);
+    # a no-trade run reports total_trades=0 — an explicit zero from observed
+    # trades, not a fabricated one for missing stats.
+    assert cells["1h"]["status"] == "no_trades"
+    assert cells["1h"]["total_trades"] == 0
+    # Failed cell is reported with the error, not persisted as success
+    assert cells["4h"]["status"] == "error"
+    assert "engine blew up" in cells["4h"]["error"]
+    # Canonical stats keys are used (F40): no fabricated zeros for missing metrics
+    assert "sharpe_ratio" not in cells["1h"]
+    assert "net_profit_pct" not in cells["1h"]
+
+
+def test_trading_run_without_trade_count_reports_presence_not_zero(monkeypatch, tmp_path) -> None:
+    """Pre-mortem 16-B #11, batch-review follow-up: total_trades precedence —
+    an explicit stats count wins; the observed-trades fallback surfaces the
+    REAL number of trades on the result, never a fabricated zero, minimum (1)
+    or loss of magnitude (a 50-trade cell must not persist as 1)."""
+    from shared.models import BacktestMeta, BacktestResult
+
+    import runner.grid_tester as grid_tester_module
+
+    class TradingEngineNoCount:
+        name = "fake"
+
+        def run(self, config, strategy_path, progress_callback=None):
+            return BacktestResult(
+                meta=BacktestMeta(
+                    id="x",
+                    created_at="2026-06-17T12:00:00+00:00",
+                    engine="fake",
+                    strategies=["example_sma"],
+                    backtest_start=config.start_date,
+                    backtest_end=config.end_date,
+                    initial_capital=config.initial_capital,
+                    data={"symbols": config.symbols, "timeframes": [config.timeframe]},
+                    parameters={},
+                ),
+                # 50 observed trades; stats deliberately lack total_trades.
+                trades=[object() for _ in range(50)],
+                equity_curve=[],
+                stats={"sharpe": 1.1},
+            )
+
+    strategy_file = tmp_path / "strategies" / "example_sma.py"
+    strategy_file.parent.mkdir(parents=True, exist_ok=True)
+    strategy_file.write_text("STRATEGY_META = {'name': 'example_sma'}\n", encoding="utf-8")
+
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        grid_tester_module,
+        "find_strategy_entry",
+        lambda slug: SimpleNamespace(slug=slug, file_path=strategy_file),
+    )
+    monkeypatch.setattr(grid_tester_module, "get_engine", lambda engine_name: TradingEngineNoCount())
+    monkeypatch.setattr(grid_tester_module, "GRID_RESULTS_DIR", tmp_path / "grid_results")
+
+    result = grid_tester_module.run_strategy_grid(
+        strategy_slug="example_sma",
+        symbols=["AAPL"],
+        timeframes=["1h"],
+        start="2024-01-01",
+        end="2024-01-31",
+        engine_name="fake_engine",
+    )
+
+    cell = result["results"]["AAPL"]["1h"]
+    assert cell["status"] == "success"
+    # The 50 observed trades, not a fabricated presence-marker of 1.
+    assert cell["total_trades"] == 50
+    assert cell["sharpe_ratio"] == 1.1
+
+
+def test_total_trades_fallback_sources() -> None:
+    """Unit-level precedence of _total_trades_from: stats count wins, observed
+    trades are the fallback, an explicit zero stays a zero, unknown is None."""
+    from runner.grid_tester import _total_trades_from
+
+    # Explicit stats count wins over the observed count.
+    assert _total_trades_from({"total_trades": 7}, True, trade_count=50) == 7
+    # No stats count: the real observed count, not a literal 1.
+    assert _total_trades_from({}, True, trade_count=50) == 50
+    assert _total_trades_from({"sharpe": 1.0}, True, trade_count=3) == 3
+    # Unparseable stats count falls through to the observed trades.
+    assert _total_trades_from({"total_trades": "many"}, True, trade_count=4) == 4
+    # An explicit zero in the stats is observed, not fabricated.
+    assert _total_trades_from({"total_trades": 0}, False, trade_count=0) == 0
+    # No-trade run with no stats at all: observed zero.
+    assert _total_trades_from({}, False, trade_count=0) == 0
+    # Neither source knows: None, never a fabricated number.
+    assert _total_trades_from({"sharpe": 1.0}, False, trade_count=0) is None
+
+
+def test_all_error_grid_is_not_persisted(monkeypatch, tmp_path) -> None:
+    """AC: never persist successful-looking artifacts for failed runs."""
+    import runner.grid_tester as grid_tester_module
+
+    class FailingEngine:
+        name = "fake"
+
+        def run(self, config, strategy_path, progress_callback=None):
+            raise RuntimeError("engine blew up")
+
+    strategy_file = tmp_path / "strategies" / "broken.py"
+    strategy_file.parent.mkdir(parents=True, exist_ok=True)
+    strategy_file.write_text("STRATEGY_META = {'name': 'broken'}\n", encoding="utf-8")
+
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        grid_tester_module,
+        "find_strategy_entry",
+        lambda slug: SimpleNamespace(slug=slug, file_path=strategy_file),
+    )
+    monkeypatch.setattr(grid_tester_module, "get_engine", lambda engine_name: FailingEngine())
+    monkeypatch.setattr(grid_tester_module, "GRID_RESULTS_DIR", tmp_path / "grid_results")
+    persisted: list[dict] = []
+    monkeypatch.setattr("shared.database.save_grid_result", lambda **kw: persisted.append(kw))
+
+    result = grid_tester_module.run_strategy_grid(
+        strategy_slug="broken",
+        symbols=["AAPL"],
+        timeframes=["1h"],
+        start="2024-01-01",
+        end="2024-01-31",
+        engine_name="fake_engine",
+    )
+
+    assert result["status"] == "error"
+    assert "All 1 grid cells failed" in result["message"]
+    assert persisted == []
+    assert not (tmp_path / "grid_results").exists()

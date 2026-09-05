@@ -122,8 +122,11 @@ def _process_symbol(
         data_root, symbol, config.timeframe, config.start_date, config.end_date
     )
     if df is None or df.empty:
-        logger.warning("No data for %s/%s, skipping", symbol, config.timeframe)
-        return [], [], [], [], 0
+        raise RuntimeError(
+            f"No OHLCV data for {symbol}/{config.timeframe} in "
+            f"{config.start_date}..{config.end_date} under {data_root}; "
+            "refusing to run a silent empty backtest"
+        )
 
     asset_class = _infer_asset_class_from_path(data_path)
     intrabar_df, intrabar_timeframe = _load_intrabar_ohlcv(

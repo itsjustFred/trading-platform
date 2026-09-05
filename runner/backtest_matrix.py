@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -87,7 +88,7 @@ def _load_daily_rows(path: Path, *, strategy: str, symbol: str, timeframe: str) 
                 "symbol": symbol,
                 "timeframe": timeframe,
                 "run_id": run_id,
-                "time": row.get("time", ""),
+                "time": row.get("date", row.get("time", "")),
                 "equity": row.get("equity", ""),
                 "daily_return": row.get("return", ""),
             }
@@ -186,8 +187,9 @@ def write_matrix_csv(output_dir: Path, rows: list[dict[str, Any]]) -> Path:
         "trade_data_available",
         "total_trades",
         "total_pnl",
+        "total_return",
         "net_profit_pct",
-        "sharpe",
+        "sharpe_ratio",
         "cagr",
         "max_drawdown_pct",
         "win_rate",
@@ -219,7 +221,8 @@ def _safe_float(value: Any) -> float | None:
         number = float(value)
     except (TypeError, ValueError):
         return None
-    return number if number == number else None
+    # float("nan") is the only float unequal to itself; read it as "no data".
+    return None if math.isnan(number) else number
 
 
 def build_strategy_overview(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -231,7 +234,7 @@ def build_strategy_overview(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     overview: list[dict[str, Any]] = []
     for strategy, strategy_rows in by_strategy.items():
         ok_rows = [row for row in strategy_rows if row.get("status") == "ok"]
-        sharpe_values = [_safe_float(row.get("sharpe")) for row in ok_rows]
+        sharpe_values = [_safe_float(row.get("sharpe_ratio")) for row in ok_rows]
         sharpe_values = [value for value in sharpe_values if value is not None]
         pnl_values = [_safe_float(row.get("total_pnl")) for row in ok_rows]
         pnl_values = [value for value in pnl_values if value is not None]
@@ -239,7 +242,7 @@ def build_strategy_overview(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         trade_values = [int(value) for value in trade_values if value is not None]
         return_values = [_safe_float(row.get("net_profit_pct")) for row in ok_rows]
         return_values = [value for value in return_values if value is not None]
-        best_row = max(ok_rows, key=lambda row: _safe_float(row.get("sharpe")) or float("-inf"), default=None)
+        best_row = max(ok_rows, key=lambda row: _safe_float(row.get("sharpe_ratio")) or float("-inf"), default=None)
         overview.append(
             {
                 "strategy": strategy,

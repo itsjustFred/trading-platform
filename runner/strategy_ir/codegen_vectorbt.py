@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from pprint import pformat
-from typing import Any
+from typing import Any, NoReturn
 
 from runner.strategy_ir.models import Condition, ExitSignal, IndicatorRef, StrategyIR
 
@@ -71,16 +71,27 @@ def _indicator_defaults(indicator: IndicatorRef) -> tuple[str, int]:
     return "window", 14
 
 
+def _untranslatable(text: str, *, source: str) -> NoReturn:
+    """F4: unmatched condition text must fail loudly, never fabricate rules."""
+    raise ValueError(
+        "Cannot deterministically translate condition text into vectorbt logic: "
+        f"{source}. Extend the StrategyIR with an explicit expression instead of "
+        "relying on keyword guessing."
+    )
+
+
 def _rule_from_text(
     text: str,
     *,
     primary_signal: str,
     secondary_signal: str,
-    default_rule: str,
+    source: str = "",
 ) -> str:
     normalized = (text or "").strip().lower()
+    # An empty condition is just as untranslatable as prose: falling back to a
+    # directional rule here would fabricate trading logic (same rule as F4).
     if not normalized:
-        return default_rule
+        _untranslatable(text, source=source or repr(text))
 
     if "crossunder" in normalized:
         return f"_cross_under({primary_signal}, {secondary_signal})"
@@ -92,17 +103,12 @@ def _rule_from_text(
     if "cross" in normalized and any(token in normalized for token in ("over", "above", "up")):
         return f"_cross_over({primary_signal}, {secondary_signal})"
 
-    if any(token in normalized for token in ("overbought", "take profit", "tp")):
-        return f"({primary_signal} > 70)"
-    if any(token in normalized for token in ("oversold", "stop", "risk-off")):
-        return f"({primary_signal} < 30)"
-
     if any(token in normalized for token in (">", "above", "over", "greater", "higher")):
         return f"({primary_signal} > {secondary_signal})"
     if any(token in normalized for token in ("<", "below", "under", "less", "lower")):
         return f"({primary_signal} < {secondary_signal})"
 
-    return default_rule
+    _untranslatable(text, source=source or text)
 
 
 def _entry_rule_expressions(
@@ -117,7 +123,7 @@ def _entry_rule_expressions(
             condition.expression,
             primary_signal=primary_signal,
             secondary_signal=secondary_signal,
-            default_rule=f"({primary_signal} > {secondary_signal})",
+            source=f"entry condition {condition.expression!r}",
         )
         expressions.append(expression)
     return expressions
@@ -135,7 +141,7 @@ def _exit_rule_expressions(
             signal.condition,
             primary_signal=primary_signal,
             secondary_signal=secondary_signal,
-            default_rule=f"({primary_signal} < {secondary_signal})",
+            source=f"exit signal {signal.condition!r}",
         )
         expressions.append(expression)
     return expressions

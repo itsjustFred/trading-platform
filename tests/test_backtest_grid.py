@@ -2,6 +2,8 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
+
 import runner.backtest_grid as bg
 from runner.backtest_grid import (
     build_cli_command,
@@ -61,7 +63,7 @@ def test_run_backtest_grid_runs_all_cells_with_same_risk(monkeypatch, tmp_path):
             "total_trades": 1,
             "total_pnl": 123.45,
             "net_profit_pct": 1.23,
-            "sharpe": 0.5,
+            "sharpe_ratio": 0.5,
             "cagr": 0.1,
             "max_drawdown_pct": -2.0,
             "win_rate": 1.0,
@@ -173,13 +175,13 @@ def test_in_process_uses_resolved_dates_for_daily_equity(monkeypatch, tmp_path):
     monkeypatch.setattr(bg, "resolve_strategy_parameters", lambda s, p: dict(p or {}))
     monkeypatch.setattr(bg, "_detect_date_range", lambda *a, **k: ("2024-01-01", "2024-02-01"))
     monkeypatch.setattr(bg, "ensure_backtest_data", lambda **k: [])
-    monkeypatch.setattr(bg, "compute_stats_for_result", lambda r: {})
+    monkeypatch.setattr(bg, "merge_canonical_stats", lambda r: None)
 
     captured: dict[str, str | None] = {}
 
-    def fake_attach(result, *, start_date=None, end_date=None):
-        captured["start_date"] = start_date
-        captured["end_date"] = end_date
+    def fake_attach(result, *, start=None, end=None):
+        captured["start_date"] = start
+        captured["end_date"] = end
         return result
 
     monkeypatch.setattr(bg, "attach_daily_equity", fake_attach)
@@ -207,12 +209,135 @@ def test_in_process_uses_resolved_dates_for_daily_equity(monkeypatch, tmp_path):
     monkeypatch.setattr(bg, "get_engine", lambda e: FakeEngine())
 
     result = bg.run_one_backtest_in_process(
-        strategy=str(strategy),
+        bg.CellRequest(
+            strategy=str(strategy),
+            symbol="SP500",
+            timeframe="1h",
+            start="",
+            end="",
+            engine="native",
+            capital=10000.0,
+            risk_pct=0.01,
+            max_position_pct=None,
+            max_leverage=None,
+            intrabar_resolution="open_close",
+            params=None,
+            output_dir=tmp_path / "out",
+            data_dir="/tmp/data",
+            skip_existing=False,
+            save_sqlite=False,
+        )
+    )
+
+    assert captured["start_date"] == "2024-01-01"
+    assert captured["end_date"] == "2024-02-01"
+    assert result["start"] == "2024-01-01"
+    assert result["end"] == "2024-02-01"
+
+
+def test_subprocess_command_does_not_pass_grid_only_flags(tmp_path):
+    """Regression (F3): runner.cli run has no --keep-indicators flag."""
+    cmd = build_cli_command(
+        strategy=str(tmp_path / "trend_following.py"),
         symbol="SP500",
+        timeframe="1h",
+        start="2025-01-01",
+        end="2025-12-31",
+        engine="vectorbt",
+        capital=10000.0,
+        risk_pct=0.01,
+        max_position_pct=None,
+        max_leverage=None,
+        intrabar_resolution="open_close",
+        params=None,
+        output_path=tmp_path / "out.trades.json",
+        data_dir="/tmp/data",
+        save_sqlite=False,
+    )
+
+    assert "--keep-indicators" not in cmd
+    assert "--skip-sqlite" in cmd
+
+
+def test_subprocess_command_forwards_keep_indicators(tmp_path):
+    """F3 residue: with keep_indicators=True the subprocess cell must pass the
+    flag explicitly (runner.cli run accepts it) instead of silently dropping
+    the knob in subprocess mode."""
+    cmd = build_cli_command(
+        strategy=str(tmp_path / "trend_following.py"),
+        symbol="SP500",
+        timeframe="1h",
+        start="2025-01-01",
+        end="2025-12-31",
+        engine="vectorbt",
+        capital=10000.0,
+        risk_pct=0.01,
+        max_position_pct=None,
+        max_leverage=None,
+        intrabar_resolution="open_close",
+        params=None,
+        output_path=tmp_path / "out.trades.json",
+        data_dir="/tmp/data",
+        save_sqlite=False,
+        keep_indicators=True,
+    )
+
+    assert "--keep-indicators" in cmd
+
+
+def test_no_date_range_is_fabricated_when_data_missing(tmp_path):
+    """Regression (F19): missing data must fail loudly, not invent 2023..2025."""
+    with pytest.raises(ValueError, match="No OHLCV data"):
+        bg._detect_date_range("NOSUCHSYMBOL", "1h", str(tmp_path / "data"))
+
+
+def test_read_backtest_stats_exposes_canonical_keys(tmp_path):
+    """Regression (F40): canonical keys only; net_profit_pct is derived from
+    total_return (never read from the stats dict) and the sharpe alias is gone."""
+    path = tmp_path / "run.trades.json"
+    path.write_text(
+        json.dumps(
+            {
+                "meta": {"id": "run-1"},
+                "trades": [{}],
+                "stats": {"total_return": 0.05, "sharpe_ratio": 1.5},
+            }
+        ),
+        encoding="utf-8",
+    )
+    stats = bg.read_backtest_stats(path)
+    assert stats["total_return"] == 0.05
+    assert stats["net_profit_pct"] == pytest.approx(5.0)
+    assert stats["sharpe_ratio"] == 1.5
+    # The non-canonical alias must not reappear in grid rows.
+    assert "sharpe" not in stats
+    # A stale/foreign net_profit_pct in the stats dict cannot leak through.
+    poisoned = tmp_path / "poisoned.trades.json"
+    poisoned.write_text(
+        json.dumps(
+            {
+                "meta": {"id": "run-2"},
+                "trades": [{}],
+                "stats": {"net_profit_pct": 999.0},
+            }
+        ),
+        encoding="utf-8",
+    )
+    poisoned_stats = bg.read_backtest_stats(poisoned)
+    assert poisoned_stats["net_profit_pct"] is None
+
+
+def test_missing_data_fails_only_that_cell(monkeypatch, tmp_path):
+    """CodeRabbit (cycle 2, critical): a cell whose data cannot be resolved must
+    produce a failed cell record — not raise out of run_one_backtest and abort
+    the whole grid run."""
+    result = run_one_backtest(
+        strategy=str(tmp_path / "trend_following.py"),
+        symbol="NOSUCHSYMBOL",
         timeframe="1h",
         start="",
         end="",
-        engine="native",
+        engine="vectorbt",
         capital=10000.0,
         risk_pct=0.01,
         max_position_pct=None,
@@ -220,12 +345,61 @@ def test_in_process_uses_resolved_dates_for_daily_equity(monkeypatch, tmp_path):
         intrabar_resolution="open_close",
         params=None,
         output_dir=tmp_path / "out",
-        data_dir="/tmp/data",
+        data_dir=str(tmp_path / "data"),
+        timeout_seconds=5,
         skip_existing=False,
-        save_sqlite=False,
+        use_subprocess=False,
     )
 
-    assert captured["start_date"] == "2024-01-01"
-    assert captured["end_date"] == "2024-02-01"
-    assert result["start"] == "2024-01-01"
-    assert result["end"] == "2024-02-01"
+    assert result["status"] == "failed"
+    assert result["error_class"] == "no_data"
+    assert "refusing to fabricate" in result["error"]
+    assert result["finished_at"]
+
+
+def test_detect_date_range_handles_case_insensitive_timestamp_column(tmp_path):
+    """CodeRabbit (cycle 2, minor): a parquet whose timestamp column is cased
+    differently must still contribute its range (same contract as
+    runner.cli._detect_date_range); a file without any timestamp column fails
+    loudly instead of being projected into a KeyError."""
+    import pandas as pd
+
+    data_dir = tmp_path / "data"
+    cased = data_dir / "ohlcv" / "test" / "AAA" / "1d.parquet"
+    cased.parent.mkdir(parents=True, exist_ok=True)
+    stamps = pd.date_range("2024-01-01", periods=5, freq="D", tz="UTC")
+    pd.DataFrame({"Timestamp": stamps, "close": [1.0] * 5}).to_parquet(cased, index=False)
+
+    start, end = bg._detect_date_range("AAA", "1d", str(data_dir))
+    assert (start, end) == ("2024-01-01", "2024-01-05")
+
+    nots = data_dir / "ohlcv" / "test" / "BBB" / "1d.parquet"
+    nots.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({"px": [1.0, 2.0]}).to_parquet(nots, index=False)
+
+    with pytest.raises(ValueError, match="timestamp column"):
+        bg._detect_date_range("BBB", "1d", str(data_dir))
+
+
+def test_grid_tasks_carry_keep_indicators(tmp_path, monkeypatch):
+    """CodeRabbit (cycle 2, major): run_backtest_grid must forward
+    keep_indicators into each cell request instead of silently dropping it."""
+    strategy = tmp_path / "trend_following.py"
+    strategy.write_text("STRATEGY_META = {'name': 'trend_following'}\n", encoding="utf-8")
+    captured: list[dict] = []
+
+    def fake_run_one(**kwargs):
+        captured.append(kwargs)
+        return {"symbol": kwargs["symbol"], "timeframe": kwargs["timeframe"], "status": "failed",
+                "finished_at": "2026-09-03T00:00:00+00:00"}
+
+    monkeypatch.setattr("runner.backtest_grid.run_one_backtest", fake_run_one)
+
+    run_backtest_grid(
+        strategy=str(strategy), symbols=["XAUUSD"], timeframes=["1h"],
+        start="2025-01-01", end="2025-01-31", output_dir=tmp_path / "out",
+        max_workers=1, keep_indicators=True,
+    )
+
+    assert captured
+    assert all(cell["keep_indicators"] is True for cell in captured)

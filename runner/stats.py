@@ -201,6 +201,18 @@ def compute_stats_for_result(
     )
 
 
+def merge_canonical_stats(result: BacktestResult, risk_free_rate: float = 0.04) -> None:
+    """Merge freshly computed canonical stats over engine-provided stats.
+
+    Engines may return arbitrary (stale or partially canonical) stats dicts;
+    for every key the canonical values computed here from the persisted
+    trades/equity curve **win**, engine-only keys are kept. Enforcing that
+    ordering in one named helper keeps call sites from re-introducing the
+    engine-wins merge by accident (pre-mortem 16-B #1).
+    """
+    result.stats = {**result.stats, **compute_stats_for_result(result, risk_free_rate)}
+
+
 # ─── QuantStats helpers ──────────────────────────────────────────────────────
 
 
@@ -241,7 +253,9 @@ def _daily_returns_series_from_equity_curve(equity_curve: list[EquityPoint]) -> 
 
     equities = [point.equity for point in equity_curve]
     try:
-        timestamps = pd.to_datetime([point.time for point in equity_curve], utc=True)
+        timestamps = pd.to_datetime(
+            [point.time for point in equity_curve], utc=True, format="ISO8601"
+        )
         series = pd.Series(equities, index=timestamps, dtype=float).sort_index()
         series = series.groupby(level=0).last()
         daily_equity = series.resample("D").last().ffill()

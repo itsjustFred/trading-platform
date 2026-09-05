@@ -38,7 +38,7 @@ def test_run_backtest_matrix_runs_selected_strategies_and_writes_outputs(monkeyp
                     "total_trades": 1,
                     "total_pnl": 12.5,
                     "net_profit_pct": 1.25,
-                    "sharpe": 0.5,
+                    "sharpe_ratio": 0.5,
                     "cagr": 0.1,
                     "max_drawdown_pct": -2.0,
                     "win_rate": 1.0,
@@ -157,3 +157,23 @@ def test_run_backtest_matrix_reports_strategy_failure(monkeypatch, tmp_path):
     assert summary["failed_cells"] == 1
     assert summary["runs"][0]["status"] == "failed"
     assert "boom" in summary["runs"][0]["error"]
+
+
+def test_load_daily_rows_reads_date_key_from_daily_equity(tmp_path):
+    """Regression (F18): daily_equity writes 'date', not 'time'."""
+    from runner.backtest_matrix import _load_daily_rows
+
+    output = tmp_path / "grid_demo_aapl_1h.trades.json"
+    output.write_text(
+        '{"stats": {"daily_returns": ['
+        '{"date": "2024-01-01", "equity": 100000.0, "return": 0.0},'
+        '{"date": "2024-01-02", "equity": 101000.0, "return": 0.01}'
+        ']}}',
+        encoding="utf-8",
+    )
+
+    rows = _load_daily_rows(output, strategy="demo", symbol="AAPL", timeframe="1h")
+
+    assert [row["time"] for row in rows] == ["2024-01-01", "2024-01-02"]
+    assert rows[0]["equity"] == 100000.0
+    assert rows[1]["daily_return"] == 0.01

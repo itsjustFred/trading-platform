@@ -250,6 +250,65 @@ class TestAttachDailyEquity:
         attach_daily_equity(result, start="2024-01-01", end="2024-02-01")
         assert result.meta.data["equity_frequency"] == "daily"
 
+    def test_window_scopes_preserved_engine_curve(self):
+        """Regression (pre-mortem 16-B #7): with start/end active, a preserved
+        engine-provided curve must be scoped to the same window as the daily
+        returns — otherwise the curve and stats describe different periods."""
+        result = make_result(
+            trades=[
+                make_trade(
+                    entry_time="2024-01-10T10:00:00Z",
+                    exit_time="2024-01-10T15:00:00Z",
+                    pnl=500.0,
+                ),
+                make_trade(
+                    entry_time="2024-02-10T10:00:00Z",
+                    exit_time="2024-02-10T15:00:00Z",
+                    pnl=700.0,
+                ),
+            ],
+            # Engine-provided per-bar curve spanning two months
+            equity_curve=[
+                EquityPoint(time=f"2024-01-{day:02d}T00:00:00+00:00", equity=100000.0 + day)
+                for day in range(1, 32)
+            ]
+            + [
+                EquityPoint(time=f"2024-02-{day:02d}T00:00:00+00:00", equity=101000.0 + day)
+                for day in range(1, 30)
+            ],
+        )
+        attach_daily_equity(result, start="2024-01-01", end="2024-01-31")
+
+        # The preserved curve covers January only — never February.
+        assert result.equity_curve
+        assert all(point.time < "2024-02-01" for point in result.equity_curve)
+        # And the daily returns describe the same window as the curve.
+        assert result.stats["daily_return_count"] == 1
+        assert result.meta.data["daily_return_count"] == 1
+
+    def test_window_excludes_out_of_window_trades_from_daily_returns(self):
+        """Trades outside the window must not feed the daily aggregation."""
+        result = make_result(
+            trades=[
+                make_trade(
+                    entry_time="2024-01-10T10:00:00Z",
+                    exit_time="2024-01-10T15:00:00Z",
+                    pnl=500.0,
+                ),
+                make_trade(
+                    entry_time="2024-02-10T10:00:00Z",
+                    exit_time="2024-02-10T15:00:00Z",
+                    pnl=700.0,
+                ),
+            ],
+        )
+        attach_daily_equity(result, start="2024-01-01", end="2024-01-31")
+
+        assert result.stats["daily_return_count"] == 1
+        (only_return,) = result.stats["daily_returns"]
+        assert only_return["date"] == "2024-01-10"
+        assert result.equity_curve[-1].equity == pytest.approx(100500.0)
+
     def test_empty_trades_with_existing_equity_curve(self):
         """Test with no trades but existing multi-point equity curve."""
         result = make_result(

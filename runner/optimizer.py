@@ -6,7 +6,7 @@ import math
 from datetime import datetime, timezone
 from itertools import combinations
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, NoReturn
 
 import optuna
 import pandas as pd
@@ -33,6 +33,12 @@ _INTERNAL_SYMBOL_UNIVERSE_PARAM = "__internal_symbol_universe"
 # cap the candidate set grows as 2**n and both memory and the Optuna categorical
 # search space explode for large symbol lists.
 MAX_CANDIDATE_SYMBOL_UNIVERSES = 256
+
+# No-trade trials must rank below every honest trial (including losing ones),
+# otherwise Optuna is steered toward parameter regions that avoid trading.
+# A finite, very negative floor keeps the study maximizable while making the
+# trial strictly worse than any real metric value.
+NO_TRADE_PENALTY = -1_000_000.0
 
 BACKTESTS_DIR = DATA_DIR / "backtests"
 TARGET_METRIC_ALIASES = {
@@ -244,6 +250,14 @@ def run_optimization(
 
     _emit_progress(progress_callback, 0.0, "Starting Optuna optimization.")
 
+    last_trial_exception: BaseException | None = None
+
+    def _record_failure(trial: optuna.Trial, exc: BaseException) -> NoReturn:
+        nonlocal last_trial_exception
+        last_trial_exception = exc
+        trial.set_user_attr("failure_reason", f"{type(exc).__name__}: {exc}")
+        raise exc
+
     def objective(trial: optuna.Trial) -> float:
         trial_symbols = _trial_symbols(trial, symbols, candidate_universes)
         trial_params = {
@@ -253,18 +267,21 @@ def run_optimization(
         combined_params = dict(base_parameters)
         combined_params.update(trial_params)
 
-        train_result = _run_vectorbt_backtest(
-            BacktestConfig(
-                strategy_name=strategy_slug,
-                symbols=trial_symbols,
-                timeframe=timeframe,
-                start_date=train_period["start"],
-                end_date=train_period["end"],
-                initial_capital=initial_capital,
-                parameters=combined_params,
-            ),
-            strategy_path,
-        )
+        try:
+            train_result = _run_vectorbt_backtest(
+                BacktestConfig(
+                    strategy_name=strategy_slug,
+                    symbols=trial_symbols,
+                    timeframe=timeframe,
+                    start_date=train_period["start"],
+                    end_date=train_period["end"],
+                    initial_capital=initial_capital,
+                    parameters=combined_params,
+                ),
+                strategy_path,
+            )
+        except (ValueError, RuntimeError, KeyError) as exc:
+            return _record_failure(trial, exc)
         train_stats = _canonical_stats(train_result)
         trial.set_user_attr("train_stats", _json_safe(train_stats))
         trial.set_user_attr("effective_parameters", _json_safe(combined_params))
@@ -274,10 +291,24 @@ def run_optimization(
         if not train_result.trades:
             trial.set_user_attr("penalty_applied", True)
             trial.set_user_attr("metric_name", _metric_key(config.target_metric, train_stats))
-            trial.set_user_attr("metric_value", 0.0)
-            return 0.0
+            trial.set_user_attr("metric_value", NO_TRADE_PENALTY)
+            return NO_TRADE_PENALTY
 
         metric_value = _metric_value(train_stats, config.target_metric)
+        # The NO_TRADE_PENALTY floor only steers Optuna correctly while every
+        # honest metric value ranks above it. A metric that reaches the floor
+        # (e.g. a raw-PnL target on a large account) would silently invert the
+        # no-trade steering, so record the failure loudly instead.
+        if metric_value <= NO_TRADE_PENALTY:
+            _record_failure(
+                trial,
+                ValueError(
+                    f"{config.target_metric}={metric_value} is at or below the "
+                    f"no-trade penalty floor ({NO_TRADE_PENALTY}); the floor only "
+                    "holds for metrics bounded above it. Choose a different "
+                    "target_metric or raise NO_TRADE_PENALTY's magnitude."
+                ),
+            )
         trial.set_user_attr("penalty_applied", False)
         trial.set_user_attr("metric_name", _metric_key(config.target_metric, train_stats))
         trial.set_user_attr("metric_value", metric_value)
@@ -296,7 +327,28 @@ def run_optimization(
         _emit_progress(progress_callback, percent, message)
 
     study = optuna.create_study(direction="maximize")
-    study.optimize(objective, n_trials=config.n_trials, callbacks=[on_trial_complete])
+    study.optimize(
+        objective,
+        n_trials=config.n_trials,
+        callbacks=[on_trial_complete],
+        catch=(ValueError, RuntimeError, KeyError),
+    )
+
+    completed_trials = study.get_trials(
+        deepcopy=False,
+        states=(optuna.trial.TrialState.COMPLETE,),
+    )
+    if not completed_trials:
+        failure_summary = "; ".join(
+            f"trial {trial.number}: {trial.state.name}"
+            + (f" ({trial.user_attrs.get('failure_reason')})" if trial.user_attrs.get("failure_reason") else "")
+            for trial in study.get_trials(deepcopy=False)[-5:]
+        )
+        raise RuntimeError(
+            f"No optimization trial completed successfully "
+            f"({config.n_trials} trials attempted); refusing to report a best "
+            f"parameter set from failed backtests. Last trials: {failure_summary}"
+        ) from last_trial_exception
 
     best_trial = study.best_trial
     best_params = {

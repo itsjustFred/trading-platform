@@ -340,6 +340,32 @@ class TestWalkforwardEdgeCases:
         assert parsed_dt.tzinfo is not None  # Should have timezone info
 
 
+def _fake_result(
+    config: BacktestConfig,
+    strategy_path: str,
+    call_index: int,
+    equity_curve: list[EquityPoint],
+    stats: dict,
+) -> BacktestResult:
+    """Shared BacktestResult factory for the fake walk-forward engines."""
+    return BacktestResult(
+        meta=BacktestMeta(
+            id=f"{Path(strategy_path).stem}-{call_index}",
+            created_at="2026-01-01T00:00:00+00:00",
+            engine="fake",
+            strategies=[Path(strategy_path).stem],
+            backtest_start=config.start_date,
+            backtest_end=config.end_date,
+            initial_capital=config.initial_capital,
+            data={"symbols": config.symbols, "timeframes": [config.timeframe], "source": "test"},
+            parameters=config.parameters,
+        ),
+        trades=[],
+        equity_curve=equity_curve,
+        stats=stats,
+    )
+
+
 class _FakeEngine:
     name = "fake"
 
@@ -368,21 +394,12 @@ class _FakeEngine:
             EquityPoint(time=timestamp.isoformat(), equity=equity)
             for timestamp, equity in zip(timestamps, equities, strict=True)
         ]
-        return BacktestResult(
-            meta=BacktestMeta(
-                id=f"{Path(strategy_path).stem}-{len(self.configs)}",
-                created_at="2026-01-01T00:00:00+00:00",
-                engine="fake",
-                strategies=[Path(strategy_path).stem],
-                backtest_start=config.start_date,
-                backtest_end=config.end_date,
-                initial_capital=config.initial_capital,
-                data={"symbols": config.symbols, "timeframes": [config.timeframe], "source": "test"},
-                parameters=config.parameters,
-            ),
-            trades=[],
-            equity_curve=equity_points,
-            stats={
+        return _fake_result(
+            config,
+            strategy_path,
+            len(self.configs),
+            equity_points,
+            {
                 "sharpe_ratio": sharpe,
                 "max_drawdown_pct": drawdown,
                 "total_trades": 2,
@@ -419,3 +436,66 @@ def test_strategy_walkforward_builds_rolling_folds_and_summary(tmp_path: Path) -
     assert result["folds"][0]["test_start"].startswith("2021-01-01")
     saved = json.loads(Path(result["output_path"]).read_text(encoding="utf-8"))
     assert saved == result
+
+
+class _FoldRecordingEngine(_FakeEngine):
+    """Like _FakeEngine but returns the caller's stats and no equity curve, so
+    the canonical-stats recomputation (F15) has a stale value to override."""
+
+    def __init__(self, *, stats: dict | None = None) -> None:
+        super().__init__()
+        self.stats = dict(stats or {})
+
+    def run(self, config: BacktestConfig, strategy_path: str, progress_callback=None) -> BacktestResult:
+        self.configs.append(config)
+        return _fake_result(config, strategy_path, len(self.configs), [], dict(self.stats))
+
+
+def test_walkforward_passes_correct_kwargs_to_attach_daily_equity(tmp_path, monkeypatch):
+    """Regression (F14): attach_daily_equity must be called with start=/end=."""
+    captured: dict = {}
+
+    def fake_attach(result, *, start=None, end=None):
+        captured["start"] = start
+        captured["end"] = end
+        return result
+
+    monkeypatch.setattr(wf_module, "attach_daily_equity", fake_attach)
+    engine = _FoldRecordingEngine(stats={"sharpe_ratio": 1.0})
+    wf_module.run_walkforward(
+        strategy="strategies/example.py",
+        engine=engine,
+        symbols=["SPY"],
+        timeframe="1d",
+        start="2020-01-01",
+        end="2021-01-31",
+        train_months=12,
+        test_months=1,
+        step_months=12,
+        output_dir=tmp_path / "wf_out",
+    )
+    assert len(engine.configs) == 2
+    assert captured["start"] == "2021-01-01T00:00:00+00:00"
+    assert captured["end"] == "2021-01-31T23:59:59.999999+00:00"
+
+
+def test_walkforward_prefers_freshly_computed_stats(tmp_path):
+    """Regression (F15): canonical stats must not be overridden by stale engine stats."""
+    engine = _FoldRecordingEngine(stats={"total_trades": 99})
+    result = wf_module.run_walkforward(
+        strategy="strategies/example.py",
+        engine=engine,
+        symbols=["SPY"],
+        timeframe="1d",
+        start="2020-01-01",
+        end="2021-01-31",
+        train_months=12,
+        test_months=1,
+        step_months=12,
+        output_dir=tmp_path / "wf_out",
+    )
+    # The engine fabricates total_trades=99 but returns no trades; the canonical
+    # computation must win over the stale engine-provided value.
+    assert result["folds"][0]["is_stats"]["total_trades"] == 0
+    assert result["folds"][0]["oos_stats"]["total_trades"] == 0
+    assert "sharpe_ratio" in result["folds"][0]["is_stats"]
