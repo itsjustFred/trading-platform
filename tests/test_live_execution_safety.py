@@ -96,8 +96,10 @@ def test_fallback_stop_is_below_entry_for_buys_and_above_for_sells():
         signal=sell, account_balance=10_000.0, pip_value=1.0, current_exposure=0.0
     )
 
-    assert buy.stop_loss is not None and buy.stop_loss < buy.entry_price
-    assert sell.stop_loss is not None and sell.stop_loss > sell.entry_price
+    assert buy.stop_loss is not None, "the long leg must carry a stop loss"
+    assert buy.stop_loss < buy.entry_price, "a long stop must sit below entry"
+    assert sell.stop_loss is not None, "the short leg must carry a stop loss"
+    assert sell.stop_loss > sell.entry_price, "a short stop must sit above entry"
 
 
 def test_fallback_stop_without_atr_is_percent_of_price():
@@ -693,7 +695,7 @@ def test_processor_market_data_refuses_synthetic_fabrication():
 # ── Persistence durability / idempotency / recovery reads ─────────────────────
 
 
-@pytest.fixture()
+@pytest.fixture
 def isolated_db(monkeypatch, tmp_path: Path):
     import shared.database as database
 
