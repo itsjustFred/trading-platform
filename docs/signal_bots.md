@@ -80,3 +80,33 @@ pro Bot.
 Der Health-Check-Job ist implementiert. Für Produktionsbetrieb sollte die
 Scheduler-Konfiguration den Job regelmäßig ausführen und bei `failed`-Status
 einen Alert auslösen.
+
+## Discord Ingestion Gate (live_runner)
+
+Discord-Signalquellen vertrauen ausschließlich einer explizit konfigurierten
+Autor-/Bot-ID-Allowlist (`trusted_author_ids`); der Autor-Check ist die
+Quell-Gate. Nachrichten jedes anderen Autors werden verworfen und geloggt.
+
+Konfiguration:
+
+- Deployment (`live_deployments.yaml` → `signal_config.trusted_author_ids`,
+  Liste oder einzelner String; mehrere Deployments auf einem Kanal werden
+  zusammengeführt).
+- Discord-Bot-Service (Service-Config `trusted_author_ids` oder Umgebungsvariable
+  `DISCORD_TRUSTED_AUTHOR_IDS`, kommagetrennt).
+
+Ohne Allowlist startet der Listener nicht (fail-closed). Zusätzlich gilt:
+
+- Preisparsing akzeptiert strenge Tausendergruppen (`$1,234.56` → 1234.56) und
+  verwirft mehrdeutige Tokens (`$12,34`) statt sie als Dezimalzahl zu interpretieren.
+- Fallback-Ticker-Extraktion (erstes GROSSBUCHSTABEN-Wort) ist entfernt; ein Signal
+  ohne strukturiertes Tickersymbol (`**$TICKER**`, `Ticker:`, `buy signal AAPL`,
+  `$TICKER`, `TICKER $price`) wird verworfen.
+- Nachraten über `POLL_LIMIT` (20) hinaus werden nicht mehr still verworfen: der
+  Seen-Set ist kumulativ, Lücken werden als Warnung mit Kanal und den Grenz-IDs
+  (`last_seen_message_id`, `oldest_fetched_message_id`) geloggt. Snowflake-IDs
+  sind nicht fortlaufend, daher wird keine Nachrichtenanzahl berechnet.
+- Ein Discord-Signal wird auf jedes passende Deployment verteilt (Fan-out), nicht
+  nur auf das erste.
+- Transiente Reconnect-Fehler schreiben einen Bot-Service nicht dauerhaft auf
+  `FAILED`; der Reconnect wird nach einem Backoff-Floor (30 s) erneut versucht.

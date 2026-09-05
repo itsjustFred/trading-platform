@@ -767,6 +767,7 @@ def test_discord_poll_does_not_claim_live_signal_before_deployment_routing(monke
         token="test-token",
         channel_ids={"channel-1"},
         timeframe="1h",
+        trusted_author_ids={"author-1"},
     )
     message = {
         "id": "discord-123",
