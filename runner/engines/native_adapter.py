@@ -8,6 +8,7 @@ from typing import Any
 import pandas as pd
 
 from runner.engine import TradeEngine
+from runner.engines import contract
 from runner.engines.base import (
     BacktestConfig,
     EngineAdapter,
@@ -17,7 +18,14 @@ from runner.engines.base import (
 from shared.constants import DATA_DIR
 from shared.models import BacktestMeta, BacktestResult, EquityPoint
 
-TIMEFRAME_ORDER = ["tick", "s1", "1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"]
+TIMEFRAME_ORDER = contract.TIMEFRAME_ORDER
+
+# Conformance (Cleanup 16-A, F8): the intrabar-resolution convention (spelling
+# table + base→intrabar mapping) lives in ONE place, contract.py, and both the
+# native and vectorbt loaders resolve through it — a private per-adapter copy
+# is how the "m1" alias ended up honored in one engine and dropped in the
+# other.
+ONE_LOWER_SPELLINGS = contract.ONE_LOWER_SPELLINGS
 
 
 def _load_strategy_module(path: str):
@@ -41,10 +49,9 @@ def _load_ohlcv(data_root: Path, symbol: str, timeframe: str, start: str, end: s
 
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
     df = df.dropna(subset=["timestamp"]).sort_values("timestamp")
-    if start:
-        df = df[df["timestamp"] >= pd.Timestamp(start, tz="UTC")]
-    if end:
-        df = df[df["timestamp"] <= pd.Timestamp(end, tz="UTC")]
+    # Conformance (Cleanup 16-A): shared date-filter convention (F9) — a
+    # date-only end boundary is inclusive of the full day.
+    df = contract.apply_date_filter(df, start=start, end=end)
     return df.reset_index(drop=True)
 
 
@@ -63,10 +70,12 @@ def _load_intrabar_data(
     start: str,
     end: str,
 ) -> pd.DataFrame | None:
-    selected = (modeling_resolution or "").strip().lower()
-    if selected in {"", "main", "main_timeframe", "open_close", base_timeframe.lower()}:
-        return None
-    if not _is_finer(selected, base_timeframe.lower()):
+    # Conformance (Cleanup 16-A, F8): resolve the spelling through the shared
+    # resolver so native and vectorbt always agree on which intrabar frame a
+    # configuration requests ("1-lower" → next-lower granularity, "m1" → "1m",
+    # unknown spellings → no intrabar walk).
+    selected = contract.resolve_intrabar_timeframe(base_timeframe, modeling_resolution)
+    if not selected:
         return None
     return _load_ohlcv(data_root, symbol, selected, start, end)
 

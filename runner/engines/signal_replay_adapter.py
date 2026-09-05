@@ -10,6 +10,8 @@ import pandas as pd
 from risk.config import RiskConfig
 from risk.engine import RiskEngine
 from risk.models import TradeSignal as RiskTradeSignal
+from runner.engines import contract
+from runner.engines.contract import resolve_same_bar_exit
 from runner.stats import compute_stats_for_result
 from shared.constants import DATA_DIR, normalize_timeframe
 from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, TradeExit
@@ -307,6 +309,53 @@ class SignalReplayAdapter:
             },
         )
 
+    def _check_protective_exit_bar(
+        self,
+        position: _OpenPosition,
+        bar: pd.Series,
+        index: int,
+    ) -> Trade | None:
+        """Process one bar of the protective-exit walk.
+
+        Conformance (Cleanup 16-A, F8): bars are walked chronologically and
+        classified through the shared same-bar policy; within a bar the
+        stop-first tie-break applies when both levels are hit.
+        """
+        self._update_excursions(position, bar)
+        event = resolve_same_bar_exit(
+            direction=position.direction,
+            high=float(bar["high"]),
+            low=float(bar["low"]),
+            stop_price=float(position.stop_loss) if position.stop_loss is not None else None,
+            take_profit_price=(
+                float(position.take_profit) if position.take_profit is not None else None
+            ),
+        )
+        if event is None:
+            self._apply_trailing_stop(position, bar)
+            return None
+        if event == "stop":
+            exit_price = (
+                float(position.stop_loss)
+                if position.stop_loss is not None
+                else float(bar["close"])
+            )
+            reason = "trailing_stop" if position.trailing_updates > 0 else "stop_loss"
+        else:
+            exit_price = (
+                float(position.take_profit)
+                if position.take_profit is not None
+                else float(bar["close"])
+            )
+            reason = "take_profit"
+        return self._close_position(
+            position,
+            exit_time=pd.Timestamp(bar["timestamp"]),
+            exit_price=exit_price,
+            exit_reason=reason,
+            exit_bar_index=int(index),
+        )
+
     def _process_protective_exits(
         self,
         *,
@@ -326,38 +375,9 @@ class SignalReplayAdapter:
             return None
 
         for index, bar in window.iterrows():
-            self._update_excursions(position, bar)
-            high = float(bar["high"])
-            low = float(bar["low"])
-            stop_hit = False
-            take_profit_hit = False
-
-            if position.direction == "LONG":
-                stop_hit = position.stop_loss is not None and low <= float(position.stop_loss)
-                take_profit_hit = (
-                    position.take_profit is not None and high >= float(position.take_profit)
-                )
-            else:
-                stop_hit = position.stop_loss is not None and high >= float(position.stop_loss)
-                take_profit_hit = (
-                    position.take_profit is not None and low <= float(position.take_profit)
-                )
-
-            if stop_hit or take_profit_hit:
-                if stop_hit:
-                    exit_price = float(position.stop_loss or float(bar["close"]))
-                    reason = "trailing_stop" if position.trailing_updates > 0 else "stop_loss"
-                else:
-                    exit_price = float(position.take_profit or float(bar["close"]))
-                    reason = "take_profit"
-                return self._close_position(
-                    position,
-                    exit_time=pd.Timestamp(bar["timestamp"]),
-                    exit_price=exit_price,
-                    exit_reason=reason,
-                    exit_bar_index=int(index),
-                )
-            self._apply_trailing_stop(position, bar)
+            trade = self._check_protective_exit_bar(position, bar, int(index))
+            if trade is not None:
+                return trade
             position.last_checked_at = pd.Timestamp(bar["timestamp"])
 
         position.last_checked_at = end_timestamp
@@ -702,12 +722,11 @@ class SignalReplayEngine:
         merged = pd.concat(frames, ignore_index=True, sort=False)
         merged = merged.drop_duplicates(subset=["timestamp"], keep="last").sort_values("timestamp")
         merged = merged.reset_index(drop=True)
-        if start:
-            start_ts = pd.Timestamp(pd.to_datetime(start, utc=True))
-            merged = merged[merged["timestamp"] >= start_ts]
-        if end:
-            end_ts = pd.Timestamp(pd.to_datetime(end, utc=True))
-            merged = merged[merged["timestamp"] <= end_ts]
+        # Conformance (Cleanup 16-A, F9): shared date-filter convention — a
+        # date-only end boundary is inclusive of the full day. This must be
+        # the ONLY date filter on the frame (a bare-date string comparison
+        # would truncate at midnight and drop the end day).
+        merged = contract.apply_date_filter(merged, start=start, end=end)
         if merged.empty:
             return None
         return merged

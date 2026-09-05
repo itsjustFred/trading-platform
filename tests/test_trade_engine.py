@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timezone
 from pathlib import Path
 
 import pyarrow.parquet as pq
@@ -10,41 +10,22 @@ import pytest
 
 from runner.engine import TradeEngine
 from runner.engines.base import BacktestConfig
+from runner.engines.contract import parse_date_bound
 from runner.engines.native_adapter import NativeAdapter
 from runner.engines.vectorbt_adapter import VectorbtAdapter
 from shared.constants import DATA_DIR
 
 
-def _parse_date_bound(value: str, *, is_end: bool) -> pd.Timestamp:
-    raw = str(value or "").strip()
-    normalized = raw.replace("Z", "+00:00")
-    try:
-        parsed = datetime.fromisoformat(normalized)
-    except ValueError as exc:
-        raise ValueError(f"Invalid date filter value: {value!r}") from exc
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    if is_end and "T" not in raw and ":" not in raw:
-        parsed = parsed + timedelta(days=1) - timedelta(microseconds=1)
-    return pd.Timestamp(parsed)
-
-
 def _to_utc_datetime(value: object) -> datetime | None:
+    """Coerce a parquet scalar into a tz-aware datetime (test-local, shared
+    by ``_time_bounds`` only; date-bound parsing itself goes through the
+    contract)."""
     if value is None:
         return None
     if isinstance(value, datetime):
         return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
     if isinstance(value, date):
         return datetime.combine(value, time.min, tzinfo=timezone.utc)
-    if isinstance(value, str):
-        normalized = value.strip().replace("Z", "+00:00")
-        if not normalized:
-            return None
-        try:
-            parsed = datetime.fromisoformat(normalized)
-        except ValueError:
-            return None
-        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
     return None
 
 
@@ -70,16 +51,12 @@ def _has_coverage(path: Path, *, start: str, end: str) -> bool:
     lower, upper = _time_bounds(path)
     if lower is None or upper is None:
         return False
-    return lower <= _parse_date_bound(start, is_end=False).to_pydatetime() and upper >= _parse_date_bound(
+    # Conformance (Cleanup 16-A, F9): the coverage check uses the SHARED
+    # contract parser instead of a private re-implementation, so the test's
+    # window arithmetic can never drift from the engines'.
+    return lower <= parse_date_bound(start, is_end=False).to_pydatetime() and upper >= parse_date_bound(
         end, is_end=True
     ).to_pydatetime()
-
-
-def _to_timestamp_utc(value: object) -> pd.Timestamp:
-    dt = _to_utc_datetime(value)
-    if dt is None:
-        raise ValueError(f"Invalid date filter value: {value!r}")
-    return pd.Timestamp(dt)
 
 
 def _synthetic_ohlcv(rows: int = 100) -> pd.DataFrame:
@@ -279,7 +256,14 @@ def test_trade_engine_can_anchor_market_stop_to_fill_price_with_stop_distance():
     assert trade.pnl == pytest.approx(-1000.0, abs=0.5)
 
 
-def test_trade_engine_can_configure_same_bar_take_profit_priority():
+def test_trade_engine_configured_same_bar_take_profit_priority_falls_back_to_stop_first():
+    """Cleanup 16-A Decision Record: the stop-first tie-break is contractual.
+
+    A configured ``same_bar_order = "take_profit_first"`` is no longer honored:
+    without intrabar data the stop wins the same-bar ambiguity, and the
+    configured-but-unsupported request stays visible in the audit metadata as
+    ``stop_first``.
+    """
     data = _synthetic_ohlcv(100)
     data.loc[12, "high"] = 113.0
     data.loc[12, "low"] = 109.0
@@ -315,10 +299,10 @@ def test_trade_engine_can_configure_same_bar_take_profit_priority():
 
     assert len(result.trades) == 1
     trade = result.trades[0]
-    assert trade.exits[-1].price == pytest.approx(112.0)
-    assert trade.exits[-1].reason == "tp"
-    assert trade.meta["execution_model"]["same_bar_order"] == "take_profit_first"
-    assert trade.pnl > 0
+    assert trade.exits[-1].price == pytest.approx(109.0)
+    assert trade.exits[-1].reason == "stop_loss"
+    assert trade.meta["execution_model"]["same_bar_order"] == "stop_first"
+    assert trade.pnl < 0
 
 
 def test_example_sma_native_vs_vectorbt_smoke_on_local_data():

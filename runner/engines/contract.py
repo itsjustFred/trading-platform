@@ -1,0 +1,346 @@
+"""Shared cross-engine backtest contract primitives.
+
+Documented contract: ``docs/cross-engine-backtest-contract.md``.
+
+This module holds the small, engine-neutral pieces of the cross-engine
+execution contract so that every adapter conforms by construction instead of
+re-implementing (and eventually diverging from) the same rules inline:
+
+- :func:`parse_date_bound` / :func:`apply_date_filter` — the date-filter
+  convention (F9). A date-only end bound is inclusive of the whole last day.
+- :func:`resolve_same_bar_exit` — the same-bar stop/take-profit priority (F8).
+  Stop-first whenever intrabar data cannot order the events, the chronological
+  intrabar event when it can.
+- :func:`flag_missing_intrabar` — the intrabar fallback flag required by the
+  Decision Record.
+- :class:`EngineStatsKeys` — the ``result.stats`` key set every engine must be
+  able to expose (F5: stats keys per engine).
+
+Scope note: this module implements the *facets* the engines already agree on
+and the Decision-Record facets that were previously implemented three times
+with different semantics. It does not unify the three execution-timing models
+(F10); those remain documented, per-engine, in the contract document.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+from typing import Any, Mapping
+
+import pandas as pd
+
+from shared.models import VALID_TIMEFRAMES
+
+__all__ = [
+    "apply_date_filter",
+    "flag_missing_intrabar",
+    "parse_date_bound",
+    "resolve_same_bar_exit",
+    "normalize_intrabar_resolution",
+    "resolve_intrabar_timeframe",
+    "EngineStatsKeys",
+    "TIMEFRAME_ORDER",
+    "ONE_LOWER_SPELLINGS",
+]
+
+
+# ─── Intrabar resolution convention (F8) ────────────────────────────────────
+
+# The engine-wide granularity order (coarse "tick" … fine "1w"). Derived from
+# the shared timeframe list so the two can never disagree.
+TIMEFRAME_ORDER: list[str] = list(VALID_TIMEFRAMES)
+
+# Spellings that request the intrabar frame ONE granularity below the main
+# timeframe. This table is the single source of truth: every engine adapter
+# must normalize spellings through :func:`normalize_intrabar_resolution`
+# instead of keeping a private copy (a private copy is how the "m1" alias
+# ended up honored in one engine and dropped in another).
+ONE_LOWER_SPELLINGS = frozenset({"1-lower", "1 timeframe lower", "one-lower"})
+
+# Spellings that request NO intrabar walk (open/close modeling on the main
+# timeframe).
+OPEN_CLOSE_SPELLINGS = frozenset(
+    {"", "open_close", "open-close", "open/close only", "open_close_only"}
+)
+
+
+def normalize_intrabar_resolution(value: str | None) -> str:
+    """Normalize a ``modeling_resolution``/intrabar spelling (F8 convention).
+
+    The single spelling table for every engine:
+
+    - ``""``/``open_close`` and its aliases → ``"open_close"`` (no intrabar
+      walk);
+    - ``"1-lower"`` and aliases → ``"1-lower"`` (one granularity below the
+      main timeframe);
+    - ``"m1"`` → ``"1m"`` (alias honored identically everywhere);
+    - a named main-timeframe granularity → itself (a request for that
+      intrabar resolution, not a silent downgrade);
+    - anything else → ``"open_close"`` (the conservative default; unknown
+      spellings never invent a window).
+    """
+    lowered = str(value or "open_close").strip().lower()
+    if lowered in OPEN_CLOSE_SPELLINGS:
+        return "open_close"
+    if lowered in ONE_LOWER_SPELLINGS:
+        return "1-lower"
+    if lowered == "m1":
+        return "1m"
+    if lowered in TIMEFRAME_ORDER:
+        return lowered
+    return "open_close"
+
+
+def resolve_intrabar_timeframe(base_timeframe: str, intrabar_resolution: str | None) -> str | None:
+    """Resolve an intrabar spelling against a main timeframe (F8 convention).
+
+    Returns the intrabar timeframe to load, or ``None`` when no intrabar frame
+    applies (open/close modeling, an unresolvable spelling, or a resolution
+    not strictly finer than the main timeframe). Every engine resolves its
+    ``modeling_resolution`` through this function so the same configuration
+    loads the same intrabar frame everywhere.
+    """
+    normalized = normalize_intrabar_resolution(intrabar_resolution)
+    if normalized == "open_close":
+        return None
+
+    try:
+        base_index = TIMEFRAME_ORDER.index(str(base_timeframe).lower())
+    except ValueError:
+        return None
+
+    if normalized == "1-lower":
+        if base_index <= 0:
+            return None
+        return TIMEFRAME_ORDER[base_index - 1]
+
+    try:
+        target_index = TIMEFRAME_ORDER.index(normalized)
+    except ValueError:
+        return None
+
+    if target_index >= base_index:
+        return None
+    return normalized
+
+
+# ─── Date filter convention (F9) ────────────────────────────────────────────
+
+
+def parse_date_bound(value: str, *, is_end: bool) -> pd.Timestamp:
+    """Parse a ``start_date``/``end_date`` value into an inclusive filter bound.
+
+    Decision Record (Cleanup 16-A, 2026-08-31): a date-only end boundary is
+    inclusive of the full day. Concretely:
+
+    - ``"2024-01-15"`` as a start bound → ``2024-01-15T00:00:00Z``;
+    - ``"2024-01-15"`` as an end bound → ``2024-01-15T23:59:59.999999Z``;
+    - a value carrying a time component (``"2024-01-15T14:30:00Z"``) is used
+      as-is; naive timestamps are interpreted as UTC.
+
+    Raises:
+        ValueError: If ``value`` is empty or not parseable as a timestamp.
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        raise ValueError("Date filter value cannot be empty")
+
+    normalized = raw.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise ValueError(f"Invalid date filter value: {value!r}") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    if is_end and "T" not in raw and ":" not in raw:
+        parsed = parsed + timedelta(days=1) - timedelta(microseconds=1)
+    return pd.Timestamp(parsed)
+
+
+def apply_date_filter(
+    frame: pd.DataFrame,
+    *,
+    start: str | None,
+    end: str | None,
+    timestamp_column: str = "timestamp",
+) -> pd.DataFrame:
+    """Filter ``frame`` to the inclusive [start, end] window (see F9 above).
+
+    Empty/None bounds are treated as unbounded on that side. The frame must
+    carry a UTC-convertible ``timestamp`` column.
+
+    This must be the ONLY date filter applied to the frame. A caller that
+    pre-filters with a bare-date string comparison (``df[df["timestamp"] <=
+    end_date]``) truncates at midnight and reintroduces the F9 end-day
+    truncation bug before this helper ever sees the data.
+    """
+    if start:
+        frame = frame[
+            frame[timestamp_column] >= parse_date_bound(start, is_end=False)
+        ]
+    if end:
+        frame = frame[
+            frame[timestamp_column] <= parse_date_bound(end, is_end=True)
+        ]
+    return frame
+
+
+# ─── Same-bar stop / take-profit priority (F8) ──────────────────────────────
+
+
+def resolve_same_bar_exit(
+    *,
+    direction: str,
+    high: float,
+    low: float,
+    stop_price: float | None,
+    take_profit_price: float | None,
+) -> str | None:
+    """Classify one bar (or one intrabar step) into ``stop``/``tp``/``None``.
+
+    Decision Record (Cleanup 16-A, 2026-08-31):
+
+    - Same-bar SL/TP priority is **stop-first everywhere when intrabar data is
+      unavailable**;
+    - with intrabar data enabled and available, the **actual chronological
+      event** wins;
+    - if intrabar data is missing, fall back to stop-first **and flag the
+      result** (see :func:`flag_missing_intrabar`).
+
+    This helper implements the classification for ONE bar/step. When both
+    levels are hit by the same bar it returns ``"stop"`` — the correct answer
+    whenever no finer-grained data can order the two events, and conservative
+    for sizing decisions. Callers that DO have intrabar data must walk it
+    chronologically and call this helper per intrabar step, so the first
+    chronological event wins rather than the stop-first tie-break.
+
+    ``direction`` must be exactly ``"LONG"`` or ``"SHORT"`` (the engine-wide
+    convention). Anything else raises ``ValueError``: an unknown direction
+    silently evaluated as SHORT would invert stop and TP logic and produce
+    plausible-looking, wrong exits.
+    """
+    if direction not in ("LONG", "SHORT"):
+        raise ValueError(f"direction must be 'LONG' or 'SHORT', got {direction!r}")
+    if direction == "LONG":
+        stop_hit = stop_price is not None and low <= stop_price
+        tp_hit = take_profit_price is not None and high >= take_profit_price
+    else:
+        stop_hit = stop_price is not None and high >= stop_price
+        tp_hit = take_profit_price is not None and low <= take_profit_price
+
+    if stop_hit:
+        return "stop"
+    if tp_hit:
+        return "tp"
+    return None
+
+
+def flag_missing_intrabar(
+    *,
+    intrabar_resolution: str | None,
+    intrabar_coverage: bool,
+    reason: str,
+) -> dict[str, Any] | None:
+    """Build the same-bar-ambiguity flag required by the Decision Record.
+
+    Returns ``None`` when no flag is needed — either no intrabar resolution was
+    requested (the stop-first fallback is the documented default, nothing to
+    disclose) or the walk actually resolved the chronology from sub-bars (the
+    caller then does not reach the fallback at all and must not call this
+    helper).
+
+    Returns a flag payload when an intrabar resolution WAS requested but the
+    walk could not resolve the chronology: the result then silently fell back
+    to the stop-first tie-break and that fact must be visible on the
+    trade/meta. ``reason`` is REQUIRED and distinguishes why the walk failed —
+    ``"intrabar_data_missing"`` (no sub-bars for the bar) vs.
+    ``"intrabar_unresolved"`` (sub-bars exist but neither level was touched).
+
+    The default-reason shortcut of the earlier revision was removed: a
+    defaulted ``reason`` made ``intrabar_coverage=True`` without an explicit
+    reason silently suppress the flag (``coverage=True`` + default reason read
+    as "resolved, nothing to disclose"), i.e. exactly the unflagged fallback
+    the Decision Record requires to be visible. Every caller must now state
+    which failure mode it hit.
+    """
+    if intrabar_resolution is None:
+        return None
+    if reason not in ("intrabar_data_missing", "intrabar_unresolved"):
+        raise ValueError(
+            f"reason must be 'intrabar_data_missing' or 'intrabar_unresolved', got {reason!r}"
+        )
+    return {
+        "same_bar_priority": "stop_first_fallback",
+        "intrabar_resolution": intrabar_resolution,
+        "intrabar_available": intrabar_coverage,
+        "reason": reason,
+    }
+
+
+# ─── Stats key set (F5) ─────────────────────────────────────────────────────
+
+
+class EngineStatsKeys:
+    """The ``result.stats`` key set every engine must be able to expose.
+
+    ``runner.stats.compute_stats`` derives these from ``trades`` plus the
+    ``equity_curve``, so any adapter that returns real trades and a real equity
+    curve can satisfy the full set by routing through that helper instead of
+    emitting a bespoke, shorter key set.
+    """
+
+    REQUIRED = frozenset(
+        {
+            "total_trades",
+            "winners",
+            "losers",
+            "win_rate",
+            "profit_factor",
+            "total_pnl",
+            "avg_winner",
+            "avg_loser",
+            "max_consecutive_wins",
+            "max_consecutive_losses",
+            "max_drawdown_pct",
+            "sharpe_ratio",
+            "sortino_ratio",
+            "calmar_ratio",
+            "total_return",
+            "p_value",
+        }
+    )
+
+    # Statistically meaningful extras ``runner.stats.compute_stats`` can emit
+    # on top of REQUIRED. They are pinned to ``BacktestStats``'s optional
+    # fields (shared/models.py: ``avg_holding_bars``, ``psr``,
+    # ``max_drawdown_duration``); both sets are asserted equal by
+    # ``test_optional_key_set_matches_backteststats_optional_fields`` so the
+    # two lists cannot silently drift apart. NOT an extension point: a new
+    # optional stat goes into ``BacktestStats`` (and hence here) explicitly.
+    OPTIONAL = frozenset({"avg_holding_bars", "psr", "max_drawdown_duration"})
+
+    @classmethod
+    def missing_from(cls, stats: Mapping[str, Any] | None) -> frozenset[str]:
+        """Return the required keys absent from ``stats`` (empty = conforms)."""
+        if not stats:
+            return cls.REQUIRED
+        return frozenset(cls.REQUIRED - set(stats.keys()))
+
+    @classmethod
+    def merge_over_canonical(
+        cls,
+        canonical: Mapping[str, Any] | None,
+        engine_specific: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Merge engine-specific stats ON TOP of the canonical ones (contract §6).
+
+        Engine-specific stats may ADD keys but must never REMOVE or overwrite a
+        canonical one: a same-named engine key would silently replace the
+        canonical value that every consumer (viewer, walk-forward, live
+        scoring) reads uniformly. Canonical keys therefore always win a
+        collision; the engine value under a canonical name is dropped.
+        """
+        merged: dict[str, Any] = dict(engine_specific or {})
+        for key, value in (canonical or {}).items():
+            merged[key] = value
+        return merged
