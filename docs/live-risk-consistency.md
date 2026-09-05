@@ -44,6 +44,29 @@ position_size = risk_amount / (risk_distance * pip_value)
 Dabei ist:
 - `risk_amount = balance * risk_percent`
 - `risk_percent = min(max_risk_per_trade, max_total_exposure - current_exposure)`
+- `position_size = min(position_size, max_notional_per_trade * balance / entry_price)`
+  (Notional-Obergrenze, `max_notional_per_trade` als Bruchteil des Balances, Default 0.20)
+
+## Einheiten-Contract (Cleanup 20-A)
+
+Alle Risk-Limits sind Bruchteile des Account-Balance (fraction of balance):
+
+| Größe | Einheit |
+|-------|---------|
+| `max_risk_per_trade` | Bruchteil des Balances (max. Verlust pro Trade) |
+| `max_total_exposure` / `current_exposure` | Bruchteil des Balances (aggregates Open-Risk) |
+| `max_notional_per_trade` | Bruchteil des Balances (Notional-Obergrenze pro Position) |
+| `SizedOrder.position_size` / `qty` | Account-Währungseinheiten des Symbols (Shares/Lots) |
+
+Vertrauensgrenze: Signal-Metadata ist **unvertrautes** Publisher-Payload. Sie darf
+nur Handels-Deskriptoren liefern (Entry-Price, Stop, Take-Profit, ATR, Timeframe,
+Pip-Value). Nie aus Metadata gelesen werden: `qty`/`explicit_qty` (Mengen-Override),
+`max_risk_per_trade`, `max_total_exposure`, `max_positions`, `current_positions`,
+`current_exposure`. Risk-Policy kommt ausschliesslich aus Deployment-/Runtime-Config
+(`RiskConfig`), State (`current_positions`, `current_exposure`) aus dem
+Portfolio-/Broker-Source-of-Truth. Der früher `qty`/`explicit_qty`-Bypass um die
+komplette Risk-Engine ist entfernt; `risk.live.size_live_signal` size't jeden
+Signal durch `RiskEngine`.
 
 ## Implizite Divergenz
 

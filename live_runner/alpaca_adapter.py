@@ -596,22 +596,31 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         if not persisted:
             raise RuntimeError("Failed to persist Alpaca broker order id.")
 
-    async def submit_order(self, signal: LiveSignal) -> str:
+    async def submit_order(self, signal: LiveSignal, *, qty: float | None = None) -> str:
         if not self._connected or self._trading_client is None:
             await self.connect()
         trading_client = self._trading_client
         if trading_client is None:
             raise RuntimeError("Alpaca trading client is unavailable after connect.")
 
-        # Use equity (not cash) for risk sizing so margin accounts with negative cash
-        # still pass sizing validation when total account value is positive.
-        _, equity = await self.get_balance()
-        sized_order = size_live_signal(signal, account_balance=equity)
-        qty = max(_to_float(signal.metadata.get("qty"), default=0.0), 0.0)
+        if qty is not None:
+            # Trusted channel: the caller has already run risk sizing.
+            risk_percent = float((signal.metadata or {}).get("risk_percent") or 0.0)
+        else:
+            # Legacy fallback (direct operator scripts): size with the shared
+            # default risk configuration. Signal metadata never supplies
+            # quantities or policy.
+            # Use equity (not cash) for risk sizing so margin accounts with negative cash
+            # still pass sizing validation when total account value is positive.
+            _, equity = await self.get_balance()
+            sized_order = size_live_signal(signal, account_balance=equity)
+            qty = float(sized_order.position_size)
+            risk_percent = float(sized_order.risk_percent)
+        qty = max(float(qty), 0.0)
         if qty <= 0:
             raise ValueError(
                 "Risk engine returned non-positive quantity; order blocked "
-                f"(risk_percent={sized_order.risk_percent:.4f})."
+                f"(risk_percent={risk_percent:.4f})."
             )
 
         order_side, time_in_force, market_request_cls = self._load_alpaca_order_types()

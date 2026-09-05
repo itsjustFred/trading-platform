@@ -75,7 +75,8 @@ def test_position_size_scales_inversely_with_pip_value():
         current_exposure=0.0,
     )
 
-    assert sized_pip_1.position_size == pytest.approx(50.0)
+    # Notional cap binds: 0.2 * 10k = 2000 / entry 100 = 20 shares.
+    assert sized_pip_1.position_size == pytest.approx(20.0)
     assert sized_pip_10.position_size == pytest.approx(5.0)
 
 
@@ -118,8 +119,10 @@ def test_fallback_stop_without_atr_is_percent_of_price():
 
     expected_distance = 100_000.0 * 0.02
     assert signal.stop_loss == pytest.approx(100_000.0 - expected_distance)
-    # risk_amount (1% of 10k) / distance (2000) = 0.05 units, not hundreds of BTC.
-    assert sized.position_size == pytest.approx(0.05)
+    # risk_amount (1% of 10k) = 100; the 20% notional cap (2000 / 100k entry)
+    # binds at 0.02 units — far below the uncapped 0.05, not hundreds of BTC.
+    assert sized.position_size == pytest.approx(0.02)
+    assert sized.decision.metadata["capped_by_notional"] is True
 
 
 def test_unknown_deployment_status_is_fail_closed():
@@ -230,6 +233,8 @@ def test_submit_order_with_risk_sizes_normally_when_flat():
 
     assert adapter.submitted_signal is not None
     assert adapter.submitted_signal.metadata["qty"] == pytest.approx(200.0)
+    # Trusted quantity channel: the sized qty is handed to the adapter
+    # explicitly, so the broker request cannot be driven by payload state.
 
 
 def test_submit_order_with_risk_fails_closed_without_resolved_stop(monkeypatch):
@@ -324,7 +329,9 @@ def test_submit_order_with_risk_resolves_stop_for_stopless_signals():
 
     assert adapter.submitted_signal is not None
     metadata = adapter.submitted_signal.metadata
-    assert metadata["qty"] == pytest.approx(500.0)  # 10 / (2 * 1) on 1% of 100k
+    # Sizing: risk budget 1000 (1% of 100k) / distance 2 = 500; the 20%
+    # notional cap (20000 / entry 100) binds and reduces the position to 200.
+    assert metadata["qty"] == pytest.approx(200.0)
     assert metadata["stop_loss"] == pytest.approx(98.0)
     assert metadata["take_profit"] == pytest.approx(102.0)
 
@@ -362,7 +369,8 @@ def test_alpaca_submit_order_blocks_non_positive_quantity(monkeypatch):
     )
     monkeypatch.setattr(module, "save_live_signal", lambda _signal: None)
 
-    # max positions reached -> risk engine returns qty 0 -> submit must refuse.
+    # A stop on the wrong side of entry makes the live sizing engine return
+    # qty 0 (bad_stop_direction) -> submit must refuse before the broker.
     signal = LiveSignal(
         deployment_id="dep-1",
         symbol="AAPL",
@@ -371,9 +379,7 @@ def test_alpaca_submit_order_blocks_non_positive_quantity(monkeypatch):
         timestamp=datetime.now(timezone.utc),
         metadata={
             "entry_price": 100.0,
-            "stop_loss": 98.0,
-            "max_positions": 1,
-            "current_positions": 1,
+            "stop_loss": 105.0,
         },
     )
 
@@ -479,7 +485,7 @@ def test_alpaca_discord_redelivery_submits_once_with_canonical_signal_id(monkeyp
     monkeypatch.setattr(
         module,
         "size_live_signal",
-        lambda _signal, *, account_balance: SimpleNamespace(risk_percent=0.01),
+        lambda _signal, *, account_balance: SimpleNamespace(position_size=1.0, risk_percent=0.01),
     )
     save_results = iter(
         [(canonical_signal_id, True), (canonical_signal_id, False)]
@@ -551,7 +557,7 @@ def test_alpaca_redelivery_recovers_accepted_order_without_resubmitting(monkeypa
     monkeypatch.setattr(
         module,
         "size_live_signal",
-        lambda _signal, *, account_balance: SimpleNamespace(risk_percent=0.01),
+        lambda _signal, *, account_balance: SimpleNamespace(position_size=1.0, risk_percent=0.01),
     )
     monkeypatch.setattr(
         module, "save_live_signal", lambda _signal: (canonical_signal_id, False)
@@ -597,7 +603,7 @@ def test_alpaca_redelivery_uses_persisted_order_id_without_broker_call(monkeypat
     monkeypatch.setattr(
         module,
         "size_live_signal",
-        lambda _signal, *, account_balance: SimpleNamespace(risk_percent=0.01),
+        lambda _signal, *, account_balance: SimpleNamespace(position_size=1.0, risk_percent=0.01),
     )
     monkeypatch.setattr(
         module, "save_live_signal", lambda _signal: (canonical_signal_id, False)
@@ -635,7 +641,7 @@ def test_alpaca_broker_order_id_persistence_failure_is_not_success(monkeypatch):
     monkeypatch.setattr(
         module,
         "size_live_signal",
-        lambda _signal, *, account_balance: SimpleNamespace(risk_percent=0.01),
+        lambda _signal, *, account_balance: SimpleNamespace(position_size=1.0, risk_percent=0.01),
     )
     monkeypatch.setattr(
         module, "save_live_signal", lambda _signal: (canonical_signal_id, True)
@@ -655,6 +661,10 @@ def test_alpaca_broker_order_id_persistence_failure_is_not_success(monkeypatch):
         asyncio.run(adapter.submit_order(signal))
 
     assert persistence_calls == [(canonical_signal_id, "alpaca-order-2")]
+
+
+
+
 
 
 def test_ctrader_volume_rejects_missing_and_below_minimum_qty():
@@ -1998,7 +2008,7 @@ def test_ctrader_discord_redelivery_uses_canonical_signal_without_resubmitting(m
     monkeypatch.setattr(
         module,
         "size_live_signal",
-        lambda _signal, *, account_balance: SimpleNamespace(risk_percent=0.01),
+        lambda _signal, *, account_balance: SimpleNamespace(position_size=1.0, risk_percent=0.01),
     )
     monkeypatch.setattr(
         module, "get_live_signal_broker_order_id",
@@ -2071,7 +2081,7 @@ def test_ctrader_redelivery_recovers_accepted_order_without_resubmitting(monkeyp
     monkeypatch.setattr(
         module,
         "size_live_signal",
-        lambda _signal, *, account_balance: SimpleNamespace(risk_percent=0.01),
+        lambda _signal, *, account_balance: SimpleNamespace(position_size=1.0, risk_percent=0.01),
     )
     monkeypatch.setattr(module, "save_live_signal", lambda _signal: None)
     monkeypatch.setattr(module, "get_live_signal_broker_order_id", lambda _sid: "")
@@ -2158,7 +2168,7 @@ def test_ctrader_accepted_order_fails_closed_when_local_id_persistence_fails(mon
     monkeypatch.setattr(
         module,
         "size_live_signal",
-        lambda _signal, *, account_balance: SimpleNamespace(risk_percent=0.01),
+        lambda _signal, *, account_balance: SimpleNamespace(position_size=1.0, risk_percent=0.01),
     )
     monkeypatch.setattr(module, "get_live_signal_broker_order_id", lambda _sid: "")
     monkeypatch.setattr(module, "get_live_signal_timestamp", lambda _sid: None)

@@ -117,6 +117,21 @@ class RiskEngine:
         pip_value: float,
         current_exposure: float,
     ) -> SizedOrder:
+        """Size one signal against the configured risk limits.
+
+        Unit contract (all limits are fractions of ``account_balance``):
+        - ``current_exposure``: aggregate open risk, fraction of balance.
+        - ``config.max_total_exposure``: aggregate open-risk ceiling, fraction.
+        - ``config.max_risk_per_trade``: maximum loss on this trade, fraction.
+        - ``config.max_notional_per_trade``: notional ceiling for the resulting
+          position, as a fraction of balance.
+
+        The returned ``SizedOrder.position_size`` is in account-currency units
+        of the traded symbol (shares/lots); it is the only quantity in that
+        unit domain. Caller-supplied state (``current_positions``,
+        ``current_exposure``) must come from the portfolio/broker source of
+        truth, never from untrusted signal payloads.
+        """
         balance = float(account_balance)
         if balance <= 0:
             raise ValueError("account_balance must be > 0")
@@ -216,6 +231,21 @@ class RiskEngine:
         risk_amount = balance * risk_percent
         raw_size = risk_amount / (risk_distance * pip)
         position_size = max(0.0, raw_size)
+        # Notional upper bound: cap the position's account-currency value at
+        # max_notional_per_trade * balance so a tiny stop distance, a broken
+        # pip_value or a misconfigured multiplier can never produce an
+        # unbounded position. Leverage beyond this fraction is never taken.
+        max_notional = balance * self.config.max_notional_per_trade
+        capped_by_notional = False
+        if position_size * signal.entry_price > max_notional:
+            position_size = max_notional / signal.entry_price
+            capped_by_notional = True
+        # risk_amount/risk_percent stay the policy figures sizing was asked for
+        # (they anchor the validation-reference parity contract); the realized
+        # stop-loss amount of a notional-capped position is reported here.
+        realized_risk_amount = (
+            position_size * risk_distance * pip if capped_by_notional else None
+        )
         risk_reward_ratio = self._risk_reward_ratio(signal, stop_loss)
 
         return self._sized_order(
@@ -237,6 +267,13 @@ class RiskEngine:
                     "current_exposure": exposure,
                     "pip_value": pip,
                     "stop_source": stop_source,
+                    "max_notional_per_trade": self.config.max_notional_per_trade,
+                    "capped_by_notional": capped_by_notional,
+                    **(
+                        {"realized_risk_amount": realized_risk_amount}
+                        if realized_risk_amount is not None
+                        else {}
+                    ),
                 },
             ),
         )

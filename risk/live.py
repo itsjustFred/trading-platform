@@ -1,3 +1,12 @@
+"""Live signal sizing bridge.
+
+Trust boundary: signal metadata is UNTRUSTED publisher payload. It may supply
+market descriptors of the trade itself (entry price, stop, take profit, ATR,
+timeframe, pip value) but never policy: risk limits, position counts, exposure
+state or a precomputed quantity all come from deployment/runtime configuration
+and the risk engine, never from the signal.
+"""
+
 from __future__ import annotations
 
 from typing import Any
@@ -39,87 +48,108 @@ def size_live_signal(
     signal: LiveSignal,
     *,
     account_balance: float,
+    config: RiskConfig | None = None,
+    current_positions: int = 0,
+    current_exposure: float = 0.0,
+    pip_value: float | None = None,
+    reduce_only: bool = False,
+    reduce_only_qty: float = 0.0,
 ) -> SizedOrder:
+    """Size a live signal through the shared RiskEngine.
+
+    Args:
+        signal: Incoming live signal. Only its trade-descriptor metadata is
+            read; policy (risk limits, quantities) never comes from metadata.
+        account_balance: Account equity used for fraction-of-balance sizing.
+        config: Trusted RiskConfig from deployment/runtime configuration.
+            Defaults to the shared ``RiskConfig()`` defaults.
+        current_positions: Open-position count from the portfolio/broker
+            source of truth.
+        current_exposure: Aggregate open risk as a fraction of balance, from
+            the portfolio/broker source of truth.
+        pip_value: Optional trusted per-symbol pip value; defaults to the
+            RiskEngine's unit contract (1.0 account-currency unit per pip).
+        reduce_only: Pass True only from trusted code (e.g. the daemon's
+            exit-only path) when the signal must flatten an existing position.
+            The quantity is then taken from ``reduce_only_qty`` — never from
+            signal metadata — and clamped to the engine's notional ceiling.
+
+    Returns:
+        The engine's ``SizedOrder``. ``signal.metadata`` is enriched with the
+        resolved quantity/risk figures (including a ``risk_rejected`` flag)
+        plus ``risk_config_source="deployment_runtime"``.
+    """
     metadata = dict(signal.metadata or {})
 
-    explicit_qty = _to_float(metadata.get("explicit_qty"), default=0.0)
-    if explicit_qty <= 0:
-        explicit_qty = _to_float(metadata.get("qty"), default=0.0)
-    if explicit_qty > 0:
-        risk_amount = _to_float(metadata.get("risk_amount"), default=0.0)
-        risk_percent = _to_float(metadata.get("risk_percent"), default=0.0)
-        risk_reward_ratio = _to_optional_float(metadata.get("risk_reward_ratio"))
-        trade_signal = TradeSignal(
-            action=str(signal.action),
-            symbol=str(signal.symbol),
-            entry_price=_to_float(
-                metadata.get("entry_price"),
-                default=float(signal.theoretical_price),
-            ),
-            stop_loss=_to_optional_float(metadata.get("stop_loss")),
-            take_profit=_to_optional_float(metadata.get("take_profit")),
-            timeframe=str(metadata.get("timeframe") or "1m"),
-            metadata={
-                "atr": metadata.get("atr"),
-                "current_positions": _to_int(metadata.get("current_positions"), default=0),
-                "pending_positions": _to_int(metadata.get("pending_positions"), default=0),
-                "enforce_stop_direction": True,
-            },
+    risk_config = config if config is not None else RiskConfig()
+    if reduce_only:
+        reduce_qty = max(0.0, float(reduce_only_qty))
+        # Trusted flatten: honor the caller's exact position size, but still
+        # apply the notional ceiling so even internal paths cannot overshoot.
+        max_notional = float(account_balance) * risk_config.max_notional_per_trade
+        entry = _to_float(
+            metadata.get("entry_price"), default=float(signal.theoretical_price)
         )
-        sized = SizedOrder(
-            signal=trade_signal,
-            position_size=float(explicit_qty),
-            risk_amount=risk_amount,
-            risk_percent=risk_percent,
-            risk_reward_ratio=risk_reward_ratio,
-        )
+        if entry > 0 and reduce_qty * entry > max_notional:
+            reduce_qty = max_notional / entry
+        for untrusted_key in ("explicit_qty", "risk_sizing_mode"):
+            metadata.pop(untrusted_key, None)
         signal.metadata = {
             **metadata,
-            "qty": float(explicit_qty),
-            "explicit_qty": float(explicit_qty),
-            "risk_amount": risk_amount,
-            "risk_percent": risk_percent,
-            "risk_reward_ratio": risk_reward_ratio,
-            "resolved_stop_loss": trade_signal.stop_loss,
+            "qty": float(reduce_qty),
+            "risk_amount": 0.0,
+            "risk_percent": 0.0,
+            "risk_reward_ratio": None,
+            "resolved_stop_loss": _to_optional_float(metadata.get("stop_loss")),
+            "risk_rejected": reduce_qty <= 0,
+            "risk_rejection_reason": None if reduce_qty > 0 else "reduce_only_zero_qty",
+            "risk_config_source": "deployment_runtime",
+            "risk_sizing_mode": "reduce_only" if reduce_qty > 0 else "reduce_only_blocked",
         }
-        return sized
-
-    config = RiskConfig(
-        max_risk_per_trade=_to_float(metadata.get("max_risk_per_trade"), default=0.01),
-        max_total_exposure=_to_float(metadata.get("max_total_exposure"), default=0.05),
-        max_positions=_to_int(metadata.get("max_positions"), default=5),
-        default_sl_atr_multiplier=_to_float(
-            metadata.get("default_sl_atr_multiplier"),
-            default=2.0,
-        ),
-    )
-    risk_engine = RiskEngine(config)
+        return SizedOrder(
+            signal=TradeSignal(
+                action=str(signal.action),
+                symbol=str(signal.symbol),
+                entry_price=entry if entry > 0 else float(signal.theoretical_price),
+                stop_loss=_to_optional_float(metadata.get("stop_loss")),
+                take_profit=_to_optional_float(metadata.get("take_profit")),
+                timeframe=str(metadata.get("timeframe") or "1m"),
+            ),
+            position_size=float(reduce_qty),
+            risk_amount=0.0,
+            risk_percent=0.0,
+            risk_reward_ratio=None,
+        )
 
     trade_signal = TradeSignal(
         action=str(signal.action),
         symbol=str(signal.symbol),
-        entry_price=_to_float(metadata.get("entry_price"), default=float(signal.theoretical_price)),
+        entry_price=_to_float(
+            metadata.get("entry_price"),
+            default=float(signal.theoretical_price),
+        ),
         stop_loss=_to_optional_float(metadata.get("stop_loss")),
         take_profit=_to_optional_float(metadata.get("take_profit")),
         timeframe=str(metadata.get("timeframe") or "1m"),
         metadata={
             "atr": metadata.get("atr"),
-            "current_positions": _to_int(metadata.get("current_positions"), default=0),
-            "pending_positions": _to_int(metadata.get("pending_positions"), default=0),
+            "current_positions": _to_int(current_positions, default=0),
             "enforce_stop_direction": True,
         },
     )
 
-    pip_value = _to_float(metadata.get("pip_value"), default=1.0)
-    current_exposure = _to_float(metadata.get("current_exposure"), default=0.0)
-
-    sized = risk_engine.calculate_position_size(
+    sized = RiskEngine(risk_config).calculate_position_size(
         signal=trade_signal,
         account_balance=float(account_balance),
-        pip_value=pip_value,
-        current_exposure=current_exposure,
+        pip_value=_to_float(pip_value, default=1.0),
+        current_exposure=max(0.0, float(current_exposure)),
     )
 
+    decision = sized.decision
+    # Strip untrusted quantity/policy keys so no downstream consumer can mistake
+    # payload-supplied values for engine truth.
+    for untrusted_key in ("explicit_qty", "risk_sizing_mode"):
+        metadata.pop(untrusted_key, None)
     signal.metadata = {
         **metadata,
         "qty": float(sized.position_size),
@@ -129,5 +159,8 @@ def size_live_signal(
             float(sized.risk_reward_ratio) if sized.risk_reward_ratio is not None else None
         ),
         "resolved_stop_loss": trade_signal.stop_loss,
+        "risk_rejected": not (decision is not None and decision.accepted),
+        "risk_rejection_reason": decision.rejection_reason if decision else None,
+        "risk_config_source": "deployment_runtime",
     }
     return sized

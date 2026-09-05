@@ -864,7 +864,7 @@ class _DiscordSmokeAdapter:
     async def connect(self) -> None:
         return None
 
-    async def submit_order(self, signal: Any) -> str:
+    async def submit_order(self, signal: Any, *, qty: float | None = None) -> str:
         self.submitted_signal = signal
         return "discord-smoke-order"
 
@@ -1226,8 +1226,6 @@ async def _stockkit_close_phase(
         theoretical_price=float(trade_signal.entry_price),
         timestamp=datetime.now(timezone.utc),
         metadata={
-            "qty": float(position_qty),
-            "explicit_qty": float(position_qty),
             "entry_price": float(trade_signal.entry_price),
             "timeframe": deployment.timeframe,
             "exit_only": True,
@@ -1238,7 +1236,7 @@ async def _stockkit_close_phase(
     if extended_hours:
         close_signal.metadata["limit_price"] = float(stock_prices["sell_limit"])
     close_order_id = await asyncio.wait_for(
-        adapter.submit_order(close_signal),
+        adapter.submit_order(close_signal, qty=float(position_qty)),
         timeout=timeout_seconds,
     )
     if close_order_id:
