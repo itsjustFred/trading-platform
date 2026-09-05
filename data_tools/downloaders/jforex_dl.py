@@ -201,13 +201,17 @@ def _java_exception_types() -> tuple[type[BaseException], ...]:
     ``except`` clause. Raising instead keeps the failure explicit.
     """
     if not JPYPE_AVAILABLE:
-        raise RuntimeError(
-            "JPype is required to catch JForex exceptions. Install with: pip install jpype1"
-        )
+        return ()
     java_exception = getattr(jpype, "JException", None)
     if isinstance(java_exception, type):
         return (java_exception,)
-    raise RuntimeError("JPype did not expose JException; cannot catch JForex exceptions")
+    # No JException exposed (e.g. mocked or very old JPype): an empty tuple
+    # keeps except-clause evaluation from raising *while raising* the real
+    # error — the surrounding `except Exception` branch handles this state.
+    logger.warning(
+        "JPype did not expose JException; JForex exception filtering is disabled"
+    )
+    return ()
 
 
 def _raise_jforex_runtime_error(context: str, exc: BaseException) -> None:
@@ -423,6 +427,16 @@ def _parse_jnlp_jar_urls(jnlp_url: str, *, _visited: set[str] | None = None) -> 
     return _dedupe_preserving_order(jar_urls)
 
 
+def _fetch_jar_file(jar_url: str, output_path: Path) -> None:
+    """Download a single JAR if it is not already cached (non-empty)."""
+    if not output_path.exists() or output_path.stat().st_size == 0:
+        try:
+            with urlopen(jar_url, timeout=30) as response:
+                output_path.write_bytes(response.read())
+        except URLError as exc:
+            raise RuntimeError(f"Failed to download JAR '{jar_url}': {exc}") from exc
+
+
 def _download_jforex_jars_from_jnlp(
     jnlp_url: str,
     target_dir: Path,
@@ -445,12 +459,7 @@ def _download_jforex_jars_from_jnlp(
         if not file_name.endswith(".jar"):
             continue
         output_path = target_dir / file_name
-        if not output_path.exists() or output_path.stat().st_size == 0:
-            try:
-                with urlopen(jar_url, timeout=30) as response:
-                    output_path.write_bytes(response.read())
-            except URLError as exc:
-                raise RuntimeError(f"Failed to download JAR '{jar_url}': {exc}") from exc
+        _fetch_jar_file(jar_url, output_path)
         # DV-B6b: the digest check runs on the artifact that actually ends up
         # on the classpath — also when the file was already cached on disk
         # from an earlier (possibly different or tampered) download.
