@@ -1,122 +1,53 @@
 # Backtest Grid Runner
 
-Run one strategy over a symbol/timeframe matrix with the same risk settings for every cell.
+## Überblick
 
-## Default universe
+Der Grid-Runner führt automatisierte Backtest-Matrizen für Strategien aus.
 
-```text
-Symbols:    XAUUSD, SP500, NAS100, EURUSD, USDJPY, OIL
-Timeframes: 1m, 5m, 15m, 1h, 4h, 1d
-Start:      2020-01-01
-```
+**Zwei Ebenen:**
 
-Aliases used for data downloads:
+- `runner/backtest_grid.py` — kanonische Grid-Execution-Engine: läuft eine Strategie über ein
+  Symbol × Timeframe-Grid. Jede Zelle läuft über denselben Validierungs-, Statistik-, Risk-Sizing-
+  und SQLite-Persistence-Pfad wie ein manueller Backtest.
+- `runner/backtest_matrix.py` — Multi-Strategy-Orchestrierung/Aggregation über `backtest_grid`
+  (alle Strategien, Matrix-CSVs, Daily-Equity-Export für Portfolio-Allocation).
+  Hostet zusätzlich das Legacy-Schnell-Grid `run_strategy_grid` (einzelne Strategie,
+  Ergebnis-Persistenz in SQLite via `GridRecord`).
 
-```text
-SP500  -> US500
-NAS100 -> USTEC
-OIL    -> USOIL
-```
-
-## Download data
-
-The downloader fetches one-minute Dukascopy data once per canonical symbol and resamples locally to the other grid timeframes.
+## CLI Usage
 
 ```bash
-python -m data_tools.download_grid_market_data \
-  --symbols XAUUSD,SP500,NAS100,EURUSD,USDJPY,OIL \
-  --timeframes 1m,5m,15m,1h,4h,1d \
-  --start 2020-01-01 \
-  --workers 6
+# Grid-Run für eine Strategie (kanonische Engine)
+python -m runner.backtest_grid --strategy strategies/example_sma.py --symbols EURUSD GBPUSD USDJPY --timeframes 1h 4h 1d --start 2023-01-01 --end 2024-12-31
+
+# Mit anderem Engine-Backend
+python -m runner.backtest_grid --strategy strategies/my_strategy.py --symbols BTCUSDT ETHUSDT --timeframes 1h 1d --start 2023-01-01 --end 2024-12-31 --engine vectorbt
+
+# Alle Strategien über das Grid (Matrix-Runner)
+python -m runner.backtest_matrix --symbols EURUSD GBPUSD --timeframes 1h 4h
 ```
 
-Useful options:
+## Output
 
-- `--end YYYY-MM-DD` to cap the download.
-- `--workers N` for parallel symbol downloads.
-- `--batch-size N` and `--pause-ms N` to tune Dukascopy batch behavior.
-- `--pipeline-batches N` to keep multiple Dukascopy batches in flight per
-  symbol before pausing; default is `2` for this bulk downloader.
-- `--oil-type UKOIL` if Brent is desired instead of WTI.
-- `--dry-run` to print the planned download plan without network calls.
+- **SQLite Storage:** Ergebnisse werden in `backtests.db` (Tabelle `grid_results`) gespeichert
+- **Heatmap-Daten:** Sharpe, CAGR, MaxDD, Win-Rate pro Kombination
+- **CSV:** `grid_matrix.csv` pro Grid-Run; `matrix_matrix.csv` / `matrix_daily_equity.csv` im Matrix-Runner
 
-## Run a grid backtest
+## GridRecord Model
 
-```bash
-python -m runner.cli grid \
-  --strategy strategies/trend_following/trend_following.py \
-  --symbols XAUUSD,SP500,NAS100,EURUSD,USDJPY,OIL \
-  --timeframes 1m,5m,15m,1h,4h,1d \
-  --start 2020-01-01 \
-  --capital 100000 \
-  --risk-pct 0.01 \
-  --max-workers 4
+```python
+class GridRecord(SQLModel, table=True):
+    id: str  # Unique grid run ID
+    strategy: str  # Strategy name
+    created_at: str  # ISO timestamp
+    symbols_json: list[str]  # Tested symbols
+    timeframes_json: list[str]  # Tested timeframes
+    results_json: dict[str, Any]  # {symbol: {timeframe: {metrics}}}
+    engine: str  # Backtest engine used
 ```
 
-Every cell uses the same engine/strategy/risk path as a normal `runner.cli run` call. The grid runner executes cells in-process by default for speed and keeps the normal JSON output format; use `--subprocess` if you need subprocess isolation. For large grids, `--skip-sqlite` is recommended to avoid SQLite write contention.
+## Tests
 
-Recommended fast verification run:
-
-```bash
-python -m runner.cli grid \
-  --strategy strategies/example_sma/example_sma.py \
-  --symbols XAUUSD,SP500,NAS100,EURUSD,USDJPY,OIL \
-  --timeframes 1m,5m,15m,1h,4h,1d \
-  --start 2020-01-01 \
-  --end 2020-12-31 \
-  --engine vectorbt \
-  --capital 100000 \
-  --risk-pct 0.01 \
-  --max-workers 6 \
-  --skip-sqlite
-```
-
-Outputs are written to `data/backtests/grid_runner/`:
-
-- `grid_summary.json` — full per-cell status, return codes, stats, and errors.
-- `grid_matrix.csv` — compact matrix for comparing assets/timeframes.
-- `grid_<strategy>_<symbol>_<timeframe>.trades.json` — one normal backtest output per cell.
-
-Each saved JSON now also contains daily `equity_curve` points and `stats.daily_returns`, so sparse trade-based equity curves are suitable for Sharpe/correlation/portfolio-allocation work.
-
-For a quick smoke test, limit the universe and period:
-
-```bash
-python -m runner.cli grid \
-  --strategy strategies/trend_following/trend_following.py \
-  --symbols XAUUSD,US500 \
-  --timeframes 1h,4h \
-  --start 2025-01-01 \
-  --end 2025-12-31 \
-  --risk-pct 0.01 \
-  --max-workers 2
-```
-
-## Run a strategy matrix across all strategies
-
-`runner.cli matrix` wraps the grid runner for every selected strategy and writes:
-
-```text
-matrix_summary.json      — all strategy/cell results and per-strategy grid summaries
-matrix_matrix.csv        — one row per strategy × symbol × timeframe cell
-matrix_daily_equity.csv  — daily equity/returns for downstream portfolio allocation
-<strategy_slug>/...      — per-strategy grid outputs from runner.cli grid
-```
-
-Example for a fast smoke run of the SMA strategy on one symbol/timeframe:
-
-```bash
-python -m runner.cli matrix \
-  --strategy example_sma \
-  --symbols XAUUSD \
-  --timeframes 1h \
-  --start 2025-01-01 \
-  --end 2025-12-31 \
-  --engine vectorbt \
-  --capital 100000 \
-  --risk-pct 0.01 \
-  --max-workers 1 \
-  --skip-sqlite
-```
-
-Omit `--strategy` to run all discovered market-data strategies. Repeating `--strategy` filters to multiple slugs/names/paths.
+- `tests/test_backtest_grid.py` - Grid-Execution-Engine (Zellen, CLI-Kommandos, Risk-Konsistenz)
+- `tests/test_backtest_matrix.py` - Matrix-Orchestrierung über mehrere Strategien
+- `tests/test_grid_tester_sqlite.py` - SQLite-Persistenz der Grid-Ergebnisse

@@ -19,11 +19,18 @@ import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 import pandas as pd
 
 from runner.engines import contract
+from runner.engines._drawings import DrawingList, _normalize_drawings
+from runner.engines._indicator_series import _build_indicator_series
+from runner.engines._shared import (
+    resolve_max_leverage as _resolve_max_leverage,
+    resolve_max_position_pct as _resolve_max_position_pct,
+    serialize_meta_value as _shared_serialize_meta_value,
+)
 from runner.engines.base import (
     BacktestConfig,
     EngineAdapter,
@@ -39,6 +46,30 @@ logger = logging.getLogger(__name__)
 _RISK_WARNING_KEYS: set[tuple[str, str, str]] = set()
 
 
+class _SizeRecord(TypedDict):
+    """Per-trade position-sizing record produced by ``_size_trade``.
+
+    These keys are re-serialized into ``trade.meta["risk_math"]`` (minus the
+    qty/bookkeeping fields) and are part of the viewer contract — see
+    ``frontend/src/api/types.ts`` (``TradeRiskMath``). Renaming or dropping a
+    key here without updating the ``risk_math`` assembly breaks the chart
+    silently; the key-set contract test guards this (pre-mortem PM-2).
+    """
+
+    sizing_mode: str
+    risk_target_usd: float | None
+    stop_distance: float | None
+    max_position_pct: float | None
+    max_leverage: float | None
+    required_notional: float | None
+    cap_notional: float | None
+    leverage_notional_limit: float | None
+    final_notional: float | None
+    capped_by_max_position: bool
+    capped_by_max_leverage: bool
+    qty: float
+
+
 def _warn_once(key: tuple[str, str, str], message: str, *args: Any) -> None:
     if key in _RISK_WARNING_KEYS:
         return
@@ -47,7 +78,6 @@ def _warn_once(key: tuple[str, str, str], message: str, *args: Any) -> None:
 
 
 IndicatorMap = dict[str, tuple[pd.Series, str]]
-DrawingList = list[dict[str, Any]]
 TIMEFRAME_ORDER = ["tick", "s1", "1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"]
 TIMEFRAME_TO_DURATION = {
     "s1": pd.Timedelta(seconds=1),
@@ -62,16 +92,6 @@ TIMEFRAME_TO_DURATION = {
 }
 
 MAX_PARALLEL_WORKERS = 4
-PANEL_INDICATOR_HINTS = ("rsi", "macd", "signal", "hist", "atr", "osc", "stoch", "cci", "adx")
-HIDDEN_DISPLAY_HINTS = (
-    "sl_price",
-    "stop_loss",
-    "tp_price",
-    "take_profit",
-    "exit_price",
-    "exit_reason",
-    "direction",
-)
 
 
 def _uses_kwargs_style(func) -> bool:
@@ -102,6 +122,115 @@ def _call_generate_signals(strategy_mod, df: pd.DataFrame, parameters: dict):
         filtered = {k: v for k, v in parameters.items() if k in accepted}
         return strategy_mod.generate_signals(df, **filtered)
     return strategy_mod.generate_signals(df, parameters)
+
+
+def _size_trade(
+    *,
+    config: BacktestConfig,
+    equity: float,
+    entry_price: float,
+    asset_class: str,
+    stop_loss_series: pd.Series | None,
+    atr_series: pd.Series | None,
+    entry_idx: int,
+    symbol: str,
+    trade_counter: int,
+) -> _SizeRecord:
+    """Size one trade and return the full risk-math record.
+
+    Mirrors the legacy in-loop sizing logic exactly: risk_pct sizing when
+    configured, otherwise full-equity sizing. Warnings are emitted once per
+    (symbol, timeframe, reason).
+    """
+    risk_target_usd: float | None = None
+    stop_distance: float | None = None
+    max_position_pct: float | None = None
+    max_leverage: float | None = None
+    required_notional: float | None = None
+    cap_notional: float | None = None
+    leverage_notional_limit: float | None = None
+    final_notional: float | None = None
+    capped_by_max_position = False
+    capped_by_max_leverage = False
+    sizing_mode = "full_equity"
+
+    if config.risk_per_trade_pct is not None and config.risk_per_trade_pct > 0:
+        sizing_mode = "risk_pct"
+        max_position_pct = _resolve_max_position_pct(config.max_position_pct, asset_class)
+        max_leverage = _resolve_max_leverage(config.max_leverage)
+        # D10 (F7/F35): max_position_pct is the per-position notional cap; it is
+        # an INDEPENDENT cap, not an implicit leverage floor — a conservative
+        # max_leverage < max_position_pct is honored as configured.
+
+        risk_target_usd = equity * config.risk_per_trade_pct
+        stop_distance = _resolve_stop_distance(
+            entry_idx,
+            entry_price,
+            stop_loss_series=stop_loss_series,
+            atr_series=atr_series,
+        )
+
+        if not stop_distance or stop_distance <= 0:
+            stop_distance = entry_price * 0.02
+            _warn_once(
+                (symbol, config.timeframe, "fallback_stop"),
+                "Risk sizing fallback for %s/%s: no stop_loss/ATR, using %.2f%% default stop",
+                symbol,
+                config.timeframe,
+                2.0,
+            )
+
+        base_qty = risk_target_usd / stop_distance
+        required_notional = base_qty * entry_price
+        cap_notional = equity * max_position_pct
+        leverage_notional_limit = equity * max_leverage
+        capped_by_max_position = required_notional > cap_notional
+        capped_by_max_leverage = required_notional > leverage_notional_limit
+
+        # D10: the binding notional is min(position cap, leverage limit).
+        binding_notional = min(cap_notional, leverage_notional_limit)
+        if required_notional <= binding_notional:
+            final_notional = required_notional
+        else:
+            final_notional = binding_notional
+            achievable_risk = (final_notional / entry_price) * stop_distance
+            if capped_by_max_leverage and not capped_by_max_position:
+                logger.info(
+                    "Leverage bound notional for %s trade %s: required_notional=%.2f exceeds leverage limit=%.2f (max_leverage=%.2fx)",
+                    symbol,
+                    trade_counter,
+                    required_notional,
+                    leverage_notional_limit,
+                    max_leverage,
+                )
+            _warn_once(
+                (symbol, config.timeframe, "risk_underfilled"),
+                "Risk target underfilled for %s/%s: cap=%.2f, max_leverage=%.2fx",
+                symbol,
+                config.timeframe,
+                cap_notional,
+                max_leverage,
+            )
+
+        qty = final_notional / entry_price
+    else:
+        qty = equity / entry_price
+        final_notional = qty * entry_price
+
+    return _SizeRecord(
+        sizing_mode=sizing_mode,
+        risk_target_usd=risk_target_usd,
+        stop_distance=stop_distance,
+        max_position_pct=max_position_pct,
+        max_leverage=max_leverage,
+        required_notional=required_notional,
+        cap_notional=cap_notional,
+        leverage_notional_limit=leverage_notional_limit,
+        final_notional=final_notional,
+        capped_by_max_position=capped_by_max_position,
+        capped_by_max_leverage=capped_by_max_leverage,
+        qty=qty,
+    )
 
 
 def _process_symbol(
@@ -186,7 +315,6 @@ def _process_symbol(
             final_notional: float | None = None
             capped_by_max_position = False
             capped_by_max_leverage = False
-            sizing_mode = "full_equity"
 
             intrabar_exit = _resolve_intrabar_exit(
                 intrabar_df=intrabar_df,
@@ -204,74 +332,29 @@ def _process_symbol(
                 exit_reason = intrabar_exit["reason"]
                 trade_meta["modeling_resolution"] = intrabar_exit["resolution"]
 
-            if config.risk_per_trade_pct is not None and config.risk_per_trade_pct > 0:
-                sizing_mode = "risk_pct"
-                # Sizing semantics (Cleanup 16-D1, F7/F35): max_position_pct is
-                # the per-position notional cap (documented in the CLI). It is
-                # an INDEPENDENT cap, not an implicit leverage floor: the
-                # leverage limit is max_leverage alone, and a conservative
-                # max_leverage < max_position_pct is honored as configured.
-                max_position_pct = _resolve_max_position_pct(
-                    config.max_position_pct, asset_class
-                )
-                max_leverage = _resolve_max_leverage(config.max_leverage)
-
-                risk_target_usd = equity * config.risk_per_trade_pct
-                stop_distance = _resolve_stop_distance(
-                    entry_idx,
-                    entry_price,
-                    stop_loss_series=stop_loss_series,
-                    atr_series=atr_series,
-                )
-
-                if not stop_distance or stop_distance <= 0:
-                    stop_distance = entry_price * 0.02
-                    _warn_once(
-                        (symbol, config.timeframe, "fallback_stop"),
-                        "Risk sizing fallback for %s/%s: no stop_loss/ATR, using %.2f%% default stop",
-                        symbol,
-                        config.timeframe,
-                        2.0,
-                    )
-
-                base_qty = risk_target_usd / stop_distance
-                required_notional = base_qty * entry_price
-                cap_notional = equity * max_position_pct
-                leverage_notional_limit = equity * max_leverage
-                capped_by_max_position = required_notional > cap_notional
-                capped_by_max_leverage = required_notional > leverage_notional_limit
-
-                # D10 (F35/F7): the binding notional is
-                # min(position cap, leverage limit); both are independent caps.
-                binding_notional = min(cap_notional, leverage_notional_limit)
-                if required_notional <= binding_notional:
-                    final_notional = required_notional
-                else:
-                    final_notional = binding_notional
-                    achievable_risk = (final_notional / entry_price) * stop_distance
-                    if capped_by_max_leverage and not capped_by_max_position:
-                        logger.info(
-                            "Leverage bound notional for %s trade %s: required_notional=%.2f exceeds leverage limit=%.2f (max_leverage=%.2fx)",
-                            symbol,
-                            trade_counter,
-                            required_notional,
-                            leverage_notional_limit,
-                            max_leverage,
-                        )
-                    else:
-                        _warn_once(
-                            (symbol, config.timeframe, "risk_underfilled"),
-                            "Risk target underfilled for %s/%s: cap=%.2f, max_leverage=%.2fx",
-                            symbol,
-                            config.timeframe,
-                            cap_notional,
-                            max_leverage,
-                        )
-
-                qty = final_notional / entry_price
-            else:
-                qty = equity / entry_price
-                final_notional = qty * entry_price
+            sizing = _size_trade(
+                config=config,
+                equity=equity,
+                entry_price=entry_price,
+                asset_class=asset_class,
+                stop_loss_series=stop_loss_series,
+                atr_series=atr_series,
+                entry_idx=entry_idx,
+                symbol=symbol,
+                trade_counter=trade_counter,
+            )
+            qty = sizing["qty"]
+            sizing_mode = sizing["sizing_mode"]
+            risk_target_usd = sizing["risk_target_usd"]
+            stop_distance = sizing["stop_distance"]
+            max_position_pct = sizing["max_position_pct"]
+            max_leverage = sizing["max_leverage"]
+            required_notional = sizing["required_notional"]
+            cap_notional = sizing["cap_notional"]
+            leverage_notional_limit = sizing["leverage_notional_limit"]
+            final_notional = sizing["final_notional"]
+            capped_by_max_position = sizing["capped_by_max_position"]
+            capped_by_max_leverage = sizing["capped_by_max_leverage"]
 
             if stop_price is None and stop_distance is not None and stop_distance > 0:
                 stop_price = (
@@ -625,261 +708,6 @@ def _normalize_indicator_map(indicators: Any, index: pd.Index) -> IndicatorMap:
 
         normalized[str(name)] = (_coerce_series(value, index), when)
     return normalized
-
-
-def _infer_indicator_display_type(name: str) -> str:
-    lowered = name.lower()
-    if any(hint in lowered for hint in PANEL_INDICATOR_HINTS):
-        return "panel"
-    return "overlay"
-
-
-def _infer_indicator_pane(name: str) -> str | None:
-    lowered = name.lower()
-    if "macd" in lowered or "signal" in lowered or "hist" in lowered:
-        return "macd"
-    if "rsi" in lowered:
-        return "rsi"
-    if "atr" in lowered:
-        return "atr"
-    return None
-
-
-def _is_hidden_indicator(name: str) -> bool:
-    lowered = name.lower()
-    return any(hint in lowered for hint in HIDDEN_DISPLAY_HINTS)
-
-
-def _series_points(
-    timestamps: pd.Series,
-    values: pd.Series,
-    *,
-    include_gaps: bool = False,
-) -> list[dict[str, Any]]:
-    points: list[dict[str, Any]] = []
-    for idx, raw_time in timestamps.items():
-        if idx not in values.index:
-            continue
-        value = values.loc[idx]
-        timestamp = pd.to_datetime(raw_time, utc=True, errors="coerce")
-        if pd.isna(timestamp):
-            continue
-
-        point: dict[str, Any] = {"time": pd.Timestamp(timestamp).isoformat()}
-        if pd.isna(value):
-            if include_gaps:
-                point["value"] = None
-                points.append(point)
-            continue
-
-        point["value"] = round(float(value), 6)
-        points.append(point)
-
-    return points
-
-
-def _supertrend_component(name: str) -> str | None:
-    lowered = name.lower()
-    if "supertrend" not in lowered:
-        return None
-
-    if any(token in lowered for token in ("_down", "down_", "upper", "bear")):
-        return "down"
-    if any(token in lowered for token in ("_up", "up_", "lower", "bull")):
-        return "up"
-    if "trend" in lowered:
-        return "trend"
-    return None
-
-
-def _build_supertrend_series(
-    timestamps: pd.Series,
-    indicators: IndicatorMap,
-) -> tuple[list[IndicatorSeries], set[str]]:
-    trend_series: pd.Series | None = None
-    up_series: pd.Series | None = None
-    down_series: pd.Series | None = None
-    consumed: set[str] = set()
-
-    for name, (series, _explicit_when) in indicators.items():
-        component = _supertrend_component(name)
-        if component is None:
-            continue
-        if component == "trend" and trend_series is None:
-            trend_series = pd.to_numeric(series, errors="coerce")
-            consumed.add(name)
-            continue
-        if component == "up" and up_series is None:
-            up_series = pd.to_numeric(series, errors="coerce")
-            consumed.add(name)
-            continue
-        if component == "down" and down_series is None:
-            down_series = pd.to_numeric(series, errors="coerce")
-            consumed.add(name)
-            continue
-
-    if up_series is None and down_series is None:
-        return [], set()
-
-    supertrend_indicators: list[IndicatorSeries] = []
-
-    if up_series is not None:
-        split_up = up_series.copy()
-        if trend_series is not None:
-            split_up = split_up.where(trend_series > 0)
-        points = _series_points(timestamps, split_up, include_gaps=True)
-        if points:
-            supertrend_indicators.append(
-                IndicatorSeries(
-                    name="supertrend_up",
-                    type="overlay",
-                    data=points,
-                    style={"color": "#22c55e", "pane": "price"},
-                )
-            )
-
-    if down_series is not None:
-        split_down = down_series.copy()
-        if trend_series is not None:
-            split_down = split_down.where(trend_series < 0)
-        points = _series_points(timestamps, split_down, include_gaps=True)
-        if points:
-            supertrend_indicators.append(
-                IndicatorSeries(
-                    name="supertrend_down",
-                    type="overlay",
-                    data=points,
-                    style={"color": "#ef4444", "pane": "price"},
-                )
-            )
-
-    return supertrend_indicators, consumed
-
-
-def _build_indicator_series(df: pd.DataFrame, indicators: IndicatorMap) -> list[IndicatorSeries]:
-    if not indicators or "timestamp" not in df.columns:
-        return []
-
-    timestamps = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
-    output: list[IndicatorSeries] = []
-    supertrend_series, consumed = _build_supertrend_series(timestamps, indicators)
-    output.extend(supertrend_series)
-
-    for name, (series, _explicit_when) in indicators.items():
-        if name in consumed or _is_hidden_indicator(name):
-            continue
-
-        numeric = pd.to_numeric(series, errors="coerce")
-        if numeric.isna().all():
-            continue
-
-        points = _series_points(timestamps, numeric)
-        if not points:
-            continue
-
-        display_type = _infer_indicator_display_type(name)
-        style: dict[str, Any] = {}
-        pane = _infer_indicator_pane(name)
-        if pane is not None:
-            style["pane"] = pane
-
-        output.append(
-            IndicatorSeries(
-                name=name,
-                type=display_type,
-                data=points,
-                style=style,
-            )
-        )
-
-    return output
-
-
-def _normalize_drawings(drawings: Any, *, symbol: str) -> DrawingList:
-    if drawings is None:
-        return []
-    if not isinstance(drawings, list):
-        raise TypeError("drawings must be a list of drawing dictionaries")
-
-    normalized: DrawingList = []
-    for idx, raw_drawing in enumerate(drawings, start=1):
-        if not isinstance(raw_drawing, dict):
-            raise TypeError(f"drawing #{idx} must be a dict")
-
-        drawing_type = str(raw_drawing.get("type", "")).strip()
-        if drawing_type not in {"marker", "line"}:
-            raise ValueError(
-                f"drawing #{idx} has unsupported type {drawing_type!r}; use 'marker' or 'line'"
-            )
-
-        normalized_drawing: dict[str, Any] = {}
-        for key, value in raw_drawing.items():
-            serialized = _serialize_meta_value(value)
-            if serialized is not None:
-                normalized_drawing[str(key)] = serialized
-
-        normalized_drawing["type"] = drawing_type
-        normalized_drawing.setdefault("symbol", symbol)
-
-        if drawing_type == "marker":
-            normalized_drawing["time"] = _normalize_drawing_time(
-                raw_drawing.get("time"), field_name="time", drawing_index=idx
-            )
-        else:
-            normalized_drawing["start_time"] = _normalize_drawing_time(
-                raw_drawing.get("start_time"), field_name="start_time", drawing_index=idx
-            )
-            normalized_drawing["end_time"] = _normalize_drawing_time(
-                raw_drawing.get("end_time"), field_name="end_time", drawing_index=idx
-            )
-            if "val1" not in raw_drawing or "val2" not in raw_drawing:
-                raise ValueError(f"drawing #{idx} line drawings require val1 and val2")
-            try:
-                normalized_drawing["val1"] = float(raw_drawing["val1"])
-                normalized_drawing["val2"] = float(raw_drawing["val2"])
-            except (TypeError, ValueError) as exc:
-                raise ValueError(
-                    f"drawing #{idx} line values must be numeric"
-                ) from exc
-
-        normalized.append(normalized_drawing)
-
-    return normalized
-
-
-def _normalize_drawing_time(value: Any, *, field_name: str, drawing_index: int) -> str:
-    if value is None:
-        raise ValueError(f"drawing #{drawing_index} missing required field {field_name!r}")
-
-    if hasattr(value, "item"):
-        try:
-            value = value.item()
-        except (TypeError, ValueError):
-            pass
-
-    if isinstance(value, pd.Timestamp):
-        timestamp = value.tz_localize("UTC") if value.tzinfo is None else value.tz_convert("UTC")
-        return timestamp.isoformat()
-
-    if isinstance(value, datetime):
-        timestamp = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
-        return timestamp.astimezone(timezone.utc).isoformat()
-
-    if isinstance(value, date):
-        return datetime(value.year, value.month, value.day, tzinfo=timezone.utc).isoformat()
-
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return datetime.fromtimestamp(float(value), tz=timezone.utc).isoformat()
-
-    if isinstance(value, str):
-        parsed = pd.to_datetime(value, utc=True, errors="coerce")
-        if pd.notna(parsed):
-            return pd.Timestamp(parsed).isoformat()
-        return value
-
-    raise TypeError(
-        f"drawing #{drawing_index} field {field_name!r} must be a timestamp-like value"
-    )
 
 
 def _infer_indicator_when(name: str, explicit_when: str) -> str:
@@ -1255,47 +1083,5 @@ def _extract_trade_meta(
 
 
 def _serialize_meta_value(value: Any) -> Any | None:
-    if value is None:
-        return None
-
-    if isinstance(value, dict):
-        return value
-    if isinstance(value, list):
-        return value
-    if isinstance(value, tuple):
-        return list(value)
-    if isinstance(value, pd.Timestamp):
-        return value.isoformat()
-
-    if hasattr(value, "item"):
-        try:
-            value = value.item()
-        except (TypeError, ValueError):
-            pass
-
-    if isinstance(value, float):
-        if pd.isna(value):
-            return None
-        return round(value, 6)
-
-    if isinstance(value, (int, str, bool)):
-        return value
-
-    if pd.isna(value):
-        return None
-
-    return str(value)
-
-
-def _resolve_max_position_pct(explicit: float | None, asset_class: str) -> float:
-    if explicit is not None and explicit > 0:
-        return float(explicit)
-    if asset_class in {"equity", "equities", "etf", "etfs", "stocks"}:
-        return 1.0
-    return 0.20
-
-
-def _resolve_max_leverage(explicit: float | None) -> float:
-    if explicit is not None and explicit > 0:
-        return float(explicit)
-    return 2.0
+    """Deprecated shim: use runner.engines._shared.serialize_meta_value."""
+    return _shared_serialize_meta_value(value)

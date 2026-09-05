@@ -64,12 +64,34 @@ Execution and conversion layer.
   - persists results to `$DATA_DIR/backtests` (JSON) and `$DATA_DIR/backtests.db` (SQLite)
 - `runner/stats.py`
   - computes Sharpe, Sortino, Calmar, drawdown, PSR, p-value, and related metrics
+- `runner/backtest_grid.py`
+  - canonical grid execution engine: one strategy over a symbol × timeframe grid;
+    every cell runs through the same validation/statistics/risk/SQLite path as a
+    manual backtest
+- `runner/backtest_matrix.py`
+  - multi-strategy orchestration/aggregation wrapper over `backtest_grid`
+    (matrix CSVs, daily-equity export) plus the legacy single-strategy quick grid
+    (`run_strategy_grid`)
 - `runner/auto_agent.py`
-  - NVIDIA NIM / Kimi-backed strategy conversion worker
+  - NVIDIA NIM / Kimi-backed strategy conversion worker (orchestration loop)
+  - companion modules: `runner/agent_prompts.py` (LLM prompts),
+    `runner/agent_response_parsing.py` (response extraction + STRATEGY_META
+    normalization), `runner/agent_backtest_target.py` (target resolution +
+    artifact paths), `runner/agent_process.py` (backtest subprocess control)
   - writes strategy assets into `strategies/<slug>/`
   - launches a validation backtest after generation
+- `runner/engine.py` + `runner/engine_pkg/`
+  - `runner/engine.py` is the public import shim (`TradeEngine`,
+    `ExecutionModelSettings`, `OrderType`, `Order`, `Position`); the
+    implementation lives in `runner/engine_pkg/`:
+    `trading_engine.py` (bar loop, order lifecycle, risk sizing),
+    `execution_model.py` (fill/trigger assumptions recorded per trade),
+    `orders.py` (Order/Position dataclasses), `result.py`
+    (indicator presentation + `BacktestResult` assembly)
 - `runner/engines/`
-  - `vectorbt_adapter.py`: fast vectorized backtests
+  - `vectorbt_adapter.py`: fast vectorized backtests (per-symbol processing in
+    `_process_symbol`, per-trade sizing in `_size_trade`; drawing and
+    indicator-series presentation shared via `_drawings.py`/`_indicator_series.py`)
   - `pynecore_adapter.py`: Pine-style strategies through PyneCore
   - `lean_adapter.py`: QuantConnect LEAN result ingestion / execution bridge
 

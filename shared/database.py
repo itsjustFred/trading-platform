@@ -3949,7 +3949,7 @@ def save_grid_result_to_sqlite(grid_result: dict[str, Any]) -> None:
     """Save grid strategy tester result to SQLite.
 
     Args:
-        grid_result: Grid result payload from grid_tester.run_strategy_grid()
+        grid_result: Grid result payload from backtest_matrix.run_strategy_grid()
     """
     init_db()
     with get_session() as session:
@@ -4039,3 +4039,8 @@ def list_grid_results() -> list[GridRecord]:
             select(GridRecord).order_by(GridRecord.created_at.desc())
         ).all()
     return [row for row in rows if isinstance(row, GridRecord)]
+
+
+def load_grid_results(limit: int = 100) -> list[dict[str, Any]]:
+    """Load persisted grid results from SQLite (newest first)."""
+    return get_grid_results(limit=limit)

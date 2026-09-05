@@ -30,10 +30,11 @@ from runner.engines.base import (
     ProgressCallback,
     resolve_strategy_parameters,
 )
-from runner.engines.vectorbt_adapter import (
-    _normalize_drawings,
-    _resolve_max_leverage,
-    _resolve_max_position_pct,
+from runner.engines._drawings import _normalize_drawings
+from runner.engines._shared import (
+    resolve_max_leverage as _resolve_max_leverage,
+    resolve_max_position_pct as _resolve_max_position_pct,
+    serialize_meta_value as _serialize_meta_value,
 )
 from runner.stats import compute_stats_for_result
 from shared.constants import DATA_DIR
@@ -586,35 +587,6 @@ def _locate_trade_bar(timestamp_series: pd.Series, raw_time: str) -> int | None:
     if diffs.loc[nearest_idx] <= pd.Timedelta(seconds=1):
         return int(nearest_idx)
     return None
-
-
-def _serialize_meta_value(value: Any) -> Any | None:
-    if value is None:
-        return None
-    if isinstance(value, dict):
-        return value
-    if isinstance(value, list):
-        return value
-    if isinstance(value, tuple):
-        return list(value)
-    if isinstance(value, pd.Timestamp):
-        return value.isoformat()
-
-    if hasattr(value, "item"):
-        try:
-            value = value.item()
-        except (TypeError, ValueError):
-            pass
-
-    if isinstance(value, float):
-        if pd.isna(value):
-            return None
-        return round(value, 6)
-    if isinstance(value, (int, str, bool)):
-        return value
-    if pd.isna(value):
-        return None
-    return str(value)
 
 
 def _promote_directional_price_meta(meta: dict[str, Any], direction: str, key_prefix: str) -> None:

@@ -8,7 +8,13 @@ This module wraps ``runner.backtest_grid.run_backtest_grid`` and produces:
 
 The daily equity file is intended for downstream portfolio allocation / BayesOpt:
 each row is a strategy cell at a calendar date with equity and pct return.
+
+It also hosts the legacy single-strategy quick grid (``run_strategy_grid``),
+which persists its matrix to SQLite for portfolio optimizer consumption.
+``runner/backtest_grid.py`` remains the canonical grid execution engine; this
+module is the multi-strategy orchestration/aggregation wrapper over it.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -19,27 +25,155 @@ import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
+from uuid import uuid4
 
 from runner.backtest_grid import (
-    DEFAULT_OUTPUT_DIR,
     GRID_SYMBOLS,
     GRID_TIMEFRAMES,
     build_run_id,
+    get_engine,
     normalize_symbol,
     normalize_timeframe_value,
-    output_path_for,
     parse_csv_list,
     parse_params,
     run_backtest_grid,
 )
 from shared.constants import DATA_DIR
+from shared.database import save_grid_result
 from shared.logging import get_logger
-from shared.strategy_registry import iter_strategy_files, load_strategy_meta, strategy_documentation_path, strategy_relative_file, strategy_slug_for_path, StrategyEntry
+from shared.strategy_registry import (
+    StrategyEntry,
+    find_strategy_entry,
+    iter_strategy_files,
+    load_strategy_meta,
+    strategy_documentation_path,
+    strategy_relative_file,
+    strategy_slug_for_path,
+)
 
 logger = get_logger("runner.matrix")
 
 MATRIX_OUTPUT_DIR = DATA_DIR / "backtests" / "matrix_runner"
+GRID_RESULTS_DIR = DATA_DIR / "grid_results"
+
+
+def load_grid_results(limit: int = 100) -> list[dict[str, Any]]:
+    """Load persisted grid results from SQLite (patch seam for tests)."""
+    from shared.database import get_grid_results
+
+    return get_grid_results(limit=limit)
+
+
+def run_strategy_grid(
+    strategy_slug: str,
+    symbols: list[str],
+    timeframes: list[str],
+    start: str,
+    end: str,
+    engine_name: str = "vectorbt",
+    capital: float = 100_000.0,
+    risk_per_trade_pct: float = 0.01,
+    progress_callback: Callable[[float, str], None] | None = None,
+) -> dict[str, Any]:
+    """Run a strategy across all symbol/timeframe combinations.
+
+    Returns a grid matrix showing which combinations work best.
+    """
+    entry = find_strategy_entry(strategy_slug)
+    if entry is None:
+        return {"status": "error", "message": f"Strategy {strategy_slug} not found"}
+
+    engine = get_engine(engine_name)
+    results_matrix: dict[str, dict[str, dict[str, Any]]] = {sym: {} for sym in symbols}
+
+    total_runs = len(symbols) * len(timeframes)
+    completed = 0
+
+    for symbol in symbols:
+        for timeframe in timeframes:
+            completed += 1
+            progress = completed / total_runs * 100
+            msg = f"{symbol}/{timeframe}"
+            if progress_callback:
+                progress_callback(progress, msg)
+
+            # Try to run backtest
+            try:
+                from runner.engines.base import BacktestConfig
+
+                config = BacktestConfig(
+                    strategy_name=strategy_slug,
+                    symbols=[symbol],
+                    timeframe=timeframe,
+                    start_date=start,
+                    end_date=end,
+                    initial_capital=capital,
+                    risk_per_trade_pct=risk_per_trade_pct,
+                )
+                result = engine.run(config, str(entry.file_path))
+
+                # Collect stats
+                stats = result.stats if result.stats else {}
+
+                # Explicit None metric values (engine produced no number) fall
+                # back to 0 instead of crashing float() and flipping a valid
+                # cell to "error" (CodeRabbit round on 16-D2). The sharpe key is
+                # read under both spellings ('sharpe' and the canonical
+                # 'sharpe_ratio' emitted by runner.stats.compute_stats_for_result)
+                # so a populated engine result is never reported as 0.
+                def _num(*keys: str, default: float = 0.0) -> float:
+                    for key in keys:
+                        value = stats.get(key)
+                        if value is not None:
+                            return float(value)
+                    return default
+
+                results_matrix[symbol][timeframe] = {
+                    "status": "success",
+                    "sharpe": _num("sharpe", "sharpe_ratio"),
+                    "cagr": _num("cagr"),
+                    "max_drawdown_pct": _num("max_drawdown_pct"),
+                    "win_rate": _num("win_rate"),
+                    "total_trades": int(_num("total_trades")),
+                    "net_profit_pct": _num("net_profit_pct"),
+                }
+            except Exception as e:
+                results_matrix[symbol][timeframe] = {
+                    "status": "error",
+                    "error": str(e),
+                }
+
+    # Save grid results
+    GRID_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(timezone.utc)
+    # Use microseconds + UUID to avoid collisions in parallel runs
+    grid_id = f"grid_{strategy_slug}_{now.strftime('%Y%m%d_%H%M%S_%f')}_{uuid4().hex[:8]}"
+    output_path = GRID_RESULTS_DIR / f"{grid_id}.json"
+
+    payload = {
+        "id": grid_id,
+        "strategy": strategy_slug,
+        "created_at": now.isoformat(),
+        "symbols": symbols,
+        "timeframes": timeframes,
+        "results": results_matrix,
+        "engine": engine_name,
+    }
+
+    output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    # Also save to SQLite
+    save_grid_result(
+        grid_id=grid_id,
+        strategy=strategy_slug,
+        symbols=symbols,
+        timeframes=timeframes,
+        results=results_matrix,
+        engine=engine_name,
+    )
+
+    return payload
 
 
 def _strategy_matches(entry, identifiers: Iterable[str] | None) -> bool:
@@ -70,7 +204,9 @@ def _field(value: Any) -> Any:
     return value
 
 
-def _load_daily_rows(path: Path, *, strategy: str, symbol: str, timeframe: str) -> list[dict[str, Any]]:
+def _load_daily_rows(
+    path: Path, *, strategy: str, symbol: str, timeframe: str
+) -> list[dict[str, Any]]:
     if not path.exists():
         return []
     payload = json.loads(path.read_text(encoding="utf-8"))
@@ -221,8 +357,7 @@ def _safe_float(value: Any) -> float | None:
         number = float(value)
     except (TypeError, ValueError):
         return None
-    # float("nan") is the only float unequal to itself; read it as "no data".
-    return None if math.isnan(number) else number
+    return number if math.isfinite(number) else None
 
 
 def build_strategy_overview(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -246,10 +381,14 @@ def build_strategy_overview(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         overview.append(
             {
                 "strategy": strategy,
-                "strategy_name": ok_rows[0].get("strategy_name") if ok_rows else strategy_rows[0].get("strategy_name"),
+                "strategy_name": ok_rows[0].get("strategy_name")
+                if ok_rows
+                else strategy_rows[0].get("strategy_name"),
                 "ok_cells": len(ok_rows),
                 "failed_cells": sum(1 for row in strategy_rows if row.get("status") == "failed"),
-                "skipped_existing_cells": sum(1 for row in strategy_rows if row.get("status") == "skipped_existing"),
+                "skipped_existing_cells": sum(
+                    1 for row in strategy_rows if row.get("status") == "skipped_existing"
+                ),
                 "total_trades": sum(trade_values),
                 "total_pnl": sum(pnl_values),
                 "avg_sharpe": sum(sharpe_values) / len(sharpe_values) if sharpe_values else None,
@@ -293,7 +432,9 @@ def run_backtest_matrix(
     output_dir = output_dir or MATRIX_OUTPUT_DIR
     output_dir.mkdir(parents=True, exist_ok=True)
     normalized_symbols = [normalize_symbol(symbol) for symbol in (symbols or GRID_SYMBOLS)]
-    normalized_timeframes = [normalize_timeframe_value(tf) for tf in (timeframes or GRID_TIMEFRAMES)]
+    normalized_timeframes = [
+        normalize_timeframe_value(tf) for tf in (timeframes or GRID_TIMEFRAMES)
+    ]
     params = dict(params or {})
 
     skipped_strategies: list[dict[str, Any]] = []
@@ -313,7 +454,9 @@ def run_backtest_matrix(
         try:
             meta = load_strategy_meta(path, strategies_dir)
         except Exception as exc:
-            skipped_strategies.append({"strategy": slug, "status": "skipped_unavailable", "error": str(exc)})
+            skipped_strategies.append(
+                {"strategy": slug, "status": "skipped_unavailable", "error": str(exc)}
+            )
             continue
         entries.append(
             StrategyEntry(
@@ -407,8 +550,17 @@ def run_backtest_matrix(
                     }
                 )
 
-    all_rows.sort(key=lambda row: (row.get("strategy", ""), row.get("symbol", ""), row.get("timeframe", "")))
-    all_daily_rows.sort(key=lambda row: (row.get("strategy", ""), row.get("symbol", ""), row.get("timeframe", ""), row.get("time", "")))
+    all_rows.sort(
+        key=lambda row: (row.get("strategy", ""), row.get("symbol", ""), row.get("timeframe", ""))
+    )
+    all_daily_rows.sort(
+        key=lambda row: (
+            row.get("strategy", ""),
+            row.get("symbol", ""),
+            row.get("timeframe", ""),
+            row.get("time", ""),
+        )
+    )
     matrix_csv = write_matrix_csv(output_dir, all_rows)
     daily_csv = write_daily_equity_csv(output_dir, all_daily_rows)
 
@@ -440,7 +592,9 @@ def run_backtest_matrix(
         "requested_cells": len(entries) * len(normalized_symbols) * len(normalized_timeframes),
         "ok_cells": sum(1 for row in all_rows if row.get("status") == "ok"),
         "failed_cells": sum(1 for row in all_rows if row.get("status") == "failed"),
-        "skipped_existing_cells": sum(1 for row in all_rows if row.get("status") == "skipped_existing"),
+        "skipped_existing_cells": sum(
+            1 for row in all_rows if row.get("status") == "skipped_existing"
+        ),
         "daily_equity_rows": len(all_daily_rows),
         "matrix_csv": str(matrix_csv),
         "daily_equity_csv": str(daily_csv),
@@ -455,13 +609,23 @@ def run_backtest_matrix(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run backtest grid matrix for all strategies")
-    parser.add_argument("--strategy", "-s", action="append", default=[], help="Strategy slug/name/path to include; repeatable. Default: all.")
+    parser.add_argument(
+        "--strategy",
+        "-s",
+        action="append",
+        default=[],
+        help="Strategy slug/name/path to include; repeatable. Default: all.",
+    )
     parser.add_argument("--strategies-dir", type=Path, default=Path("strategies"))
     parser.add_argument("--symbols", default=",".join(GRID_SYMBOLS), help="Comma-separated symbols")
-    parser.add_argument("--timeframes", default=",".join(GRID_TIMEFRAMES), help="Comma-separated timeframes")
+    parser.add_argument(
+        "--timeframes", default=",".join(GRID_TIMEFRAMES), help="Comma-separated timeframes"
+    )
     parser.add_argument("--start", default="2020-01-01", help="Start date")
     parser.add_argument("--end", default="", help="End date, empty lets runner.cli auto-detect")
-    parser.add_argument("--engine", default="", help="Override engine. Empty uses each strategy's detected engine.")
+    parser.add_argument(
+        "--engine", default="", help="Override engine. Empty uses each strategy's detected engine."
+    )
     parser.add_argument("--capital", type=float, default=100_000.0, help="Initial capital")
     parser.add_argument("--risk-pct", type=float, default=0.01, help="Risk per trade, e.g. 0.01")
     parser.add_argument("--max-position-pct", type=float, default=None)
@@ -470,12 +634,25 @@ def main() -> None:
     parser.add_argument("--params", default="", help="Strategy params JSON")
     parser.add_argument("--output-dir", type=Path, default=MATRIX_OUTPUT_DIR)
     parser.add_argument("--data-dir", default="", help="Override data directory")
-    parser.add_argument("--max-workers", type=int, default=1, help="Parallel backtest cells per strategy")
-    parser.add_argument("--strategy-workers", type=int, default=None, help="Parallel strategies in the matrix runner")
+    parser.add_argument(
+        "--max-workers", type=int, default=1, help="Parallel backtest cells per strategy"
+    )
+    parser.add_argument(
+        "--strategy-workers",
+        type=int,
+        default=None,
+        help="Parallel strategies in the matrix runner",
+    )
     parser.add_argument("--timeout-seconds", type=int, default=1800, help="Timeout per cell")
-    parser.add_argument("--resume", action="store_true", help="Skip/rehydrate cells with existing output JSON")
-    parser.add_argument("--subprocess", action="store_true", help="Run each grid cell via runner.cli subprocess")
-    parser.add_argument("--skip-sqlite", action="store_true", help="Do not persist grid cells to SQLite")
+    parser.add_argument(
+        "--resume", action="store_true", help="Skip/rehydrate cells with existing output JSON"
+    )
+    parser.add_argument(
+        "--subprocess", action="store_true", help="Run each grid cell via runner.cli subprocess"
+    )
+    parser.add_argument(
+        "--skip-sqlite", action="store_true", help="Do not persist grid cells to SQLite"
+    )
     args = parser.parse_args()
 
     summary = run_backtest_matrix(
