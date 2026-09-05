@@ -59,6 +59,14 @@ YF_INTERVAL_MAP: dict[str, str] = {
     "1w": "1wk",
 }
 
+# DV-B20: yfinance only ships 60m bars for the 4h output timeframe. Those are
+# resampled onto the proposed canonical bucket convention (parent record
+# leaves it open pending confirmation): a UTC-aligned hourly grid with a
+# 00:00 UTC origin (Dukascopy style). The raw provider bucket size is
+# retained in `source_bucket_timeframe` so cross-source comparisons know
+# what the numbers were built from.
+BUCKET_METADATA_COLUMN = "source_bucket_timeframe"
+
 
 def _normalize_supported_timeframe(value: str) -> str:
     normalized = str(value or "").strip().lower()
@@ -79,6 +87,57 @@ def _to_utc_timestamp(value: str | None) -> pd.Timestamp | None:
             return None
         return pd.Timestamp(ts[0])
     return pd.Timestamp(ts)
+
+
+def _resample_4h_utc_grid(
+    df: pd.DataFrame, source_bucket: str = "60m"
+) -> tuple[pd.DataFrame, str]:
+    """Resample intraday rows onto the canonical 4h/UTC-aligned grid.
+
+    The input must carry a UTC ``timestamp`` column. Buckets start at the
+    00:00 UTC origin (``origin="epoch"`` with a 4h offset is equivalent
+    because 4h divides the day), so labels are 00/04/08/12/16/20 UTC and
+    therefore comparable with session-aligned FX sources after their own
+    explicit resample. The provider's native bucket size is kept in
+    ``source_bucket_timeframe``.
+    """
+    if df.empty:
+        return df.copy(), source_bucket
+
+    # The resample silently produces a shifted or empty grid when the
+    # timestamp dtype drifts (naive timestamps change the origin, non-datetime
+    # columns break the bucketing), so fail loudly on the contract instead.
+    if not pd.api.types.is_datetime64_any_dtype(df["timestamp"]):
+        raise RuntimeError(
+            "4h resample requires a datetime64 'timestamp' column, got "
+            f"{df['timestamp'].dtype}"
+        )
+    if df["timestamp"].dt.tz is None:
+        raise RuntimeError("4h resample requires tz-aware (UTC) timestamps")
+
+    indexed = df.set_index("timestamp")
+    input_rows = len(indexed)
+    resampled = (
+        indexed.resample("4h", origin="start_day", label="left", closed="left")
+        .agg(
+            {
+                "open": "first",
+                "high": "max",
+                "low": "min",
+                "close": "last",
+                "volume": "sum",
+            }
+        )
+        .dropna(subset=["open", "high", "low", "close"])
+        .reset_index()
+    )
+    if resampled.empty:
+        raise RuntimeError(
+            f"4h resample produced no rows from {input_rows} input rows "
+            "(all-NaN buckets or misaligned timestamps)"
+        )
+    resampled[BUCKET_METADATA_COLUMN] = source_bucket
+    return resampled, "UTC"
 
 
 def _clip_intraday_window(
@@ -251,22 +310,14 @@ class YFinanceDownloader(Downloader):
             raise RuntimeError(f"yfinance returned only empty/NaN rows for {normalized_symbol} ({canonical_tf})")
 
         if canonical_tf == "4h":
-            resampled = (
-                df.set_index("timestamp")
-                .resample("4h")
-                .agg(
-                    {
-                        "open": "first",
-                        "high": "max",
-                        "low": "min",
-                        "close": "last",
-                        "volume": "sum",
-                    }
+            df, bucket_origin = _resample_4h_utc_grid(df, source_bucket=yf_interval)
+            warnings.append(
+                (
+                    f"Resampled yfinance {yf_interval} bars onto the UTC-aligned 4h grid "
+                    f"(origin={bucket_origin}); source bucket metadata kept in "
+                    f"'{BUCKET_METADATA_COLUMN}'."
                 )
-                .dropna(subset=["open", "high", "low", "close"])
-                .reset_index()
             )
-            df = resampled
 
         combined = self._merge_and_store_single_file(out_path, df)
         return DownloadResult(

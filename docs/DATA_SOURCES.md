@@ -188,20 +188,39 @@ python -m data_tools.downloaders.ctrader_dl \
 
 ## yfinance
 
-File: `data_tools/migrate_csv.py`
+Files: `data_tools/downloaders/yfinance_dl.py` (live downloader), `data_tools/migrate_csv.py` (legacy CSV import)
 
 ### Current truth
 
-There is **no dedicated live `yfinance_dl.py` module** in the repository at the
-moment. The `yfinance` source name still appears in data paths and in some UI
-labels because the platform already stores equity datasets under:
+The live downloader module is `data_tools/downloaders/yfinance_dl.py`
+(`YFinanceDownloader`). The `yfinance` source name also appears in data paths
+and in some UI labels because the platform stores equity datasets under:
 
 ```text
 $TRADING_DATA_DIR/ohlcv/yfinance/equity/US/{symbol}/{timeframe}.parquet
 ```
 
-Those files are currently populated by migrating existing CSV archives through
-`data_tools.migrate_csv.py`.
+Existing CSV archives are additionally populated through
+`data_tools/migrate_csv.py`.
+
+### 4h bucket convention (DV-B20)
+
+yfinance only provides 60m bars for the `4h` output timeframe. The downloader
+resamples those onto the canonical UTC-aligned 4h grid (00:00 UTC origin;
+labels 00/04/08/12/16/20 UTC) and keeps the provider's native bucket size in
+the `source_bucket_timeframe` column. Cross-source comparisons must resample
+all sources onto the same bucket convention first.
+
+### Offer-side semantics (Dukascopy tick)
+
+Hourly Dukascopy tick files (`.bi5`) carry **both** offer sides per record, so
+the native downloader fetches each file once and splits bid/ask afterwards.
+For `tick` timeframes the `offer_side`/`price_type` value is therefore
+**informational only**: it is validated (`bid`, `ask`, `both`) but does not
+change which files are downloaded or which columns the output contains. This
+differs from the JForex engine, which rejects `offer_side='both'` for tick
+outputs because it queries one side per request. Bar (`m1`+) downloads use the
+side to pick the per-side URL set, so there `price_type` is load-bearing.
 
 ### What gets migrated
 
@@ -222,8 +241,9 @@ The FastAPI viewer uses these source names in `/api/data/download`:
 - `dukascopy` -> `python -m data_tools.downloaders.jforex_dl` with automatic fallback to `data_tools.downloaders.dukascopy_native`
 - `jforex` -> `python -m data_tools.downloaders.jforex_dl` with automatic fallback to `data_tools.downloaders.dukascopy_native`
 - `dolthub` -> `python -m data_tools.dolthub_manager update`
-- `yfinance` -> legacy source label; current repo data is populated via
-  `data_tools.migrate_csv.py`, not a direct downloader module
+- `yfinance` -> `python -m data_tools.downloaders.yfinance_dl`
+  (`YFinanceDownloader`; CSV archives are additionally migrated via
+  `data_tools/migrate_csv.py`)
 
 The data pages and strategy/backtest runners ultimately consume normalized
 parquet files plus `catalog.json`, not the raw source-specific formats.

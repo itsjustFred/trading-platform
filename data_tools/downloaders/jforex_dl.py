@@ -25,6 +25,7 @@ import re
 import sys
 import time
 import xml.etree.ElementTree as ET
+import hashlib
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -56,6 +57,59 @@ DEFAULT_JNLP_URL = "https://platform.dukascopy.com/demo/jforex.jnlp"
 JAVA_LONG_MAX = (2**63) - 1
 JVM_START_LOCK = Lock()
 DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+# DV-B6a: the JForex/Dukascopy downloader only accepts remote JNLP/JAR
+# resources from Dukascopy hosts. This allowlist applies to the JForex
+# downloader only and does not restrict other data downloaders.
+DUKASCOPY_ALLOWED_HOST_SUFFIXES = (
+    ".dukascopy.com",
+    ".dukasconnect.com",
+    ".dukascopy.bank",
+)
+
+# DV-B6b: optional pinning of expected JAR digests.
+# Format: "<url>=<hex sha256>[,<url>=<hex sha256>...]"
+EXPECTED_JAR_DIGEST_ENV = "JFOREX_EXPECTED_JAR_SHA256"
+
+# Error fragments that mark the JForex SDK as unavailable so the viewer can
+# fall back to the native Dukascopy downloader instead of failing the task.
+# The bootstrap hard-raises on these (DV-B6/DV-B7), so the viewer's
+# `_jforex_fallback_reason` must keep matching them — extend this list when a
+# new bootstrap failure surface is added; do not swallow the errors inside the
+# downloader itself.
+UNAVAILABLE_ERROR_FRAGMENTS: tuple[str, ...] = (
+    "jpype is required",
+    "no module named 'jpype'",
+    "failed to import 'com.dukascopy'",
+    "classnotfoundexception",
+    "com.dukascopy",
+    "failed to start jvm",
+    "could not resolve jforex sdk classpath",
+    "jforex sdk classpath",
+    "jvm shared library",
+    "jvm dll not found",
+    "no jvm shared library file",
+    "nullpointerexception",
+    "jforex sdk request execution failed",
+    "jforex connection timed out",
+    "jforex data request timed out",
+    "jforex history query failed",
+    "interval from [",
+    "not valid for period",
+    "dukascopy credentials",
+    # Bootstrap surfaces (DV-B6/DV-B7):
+    "non-dukascopy host",
+    "integrity check failed",
+    "failed to fetch jnlp",
+    "invalid jnlp payload",
+    "no jar resources found in jnlp",
+    "failed to download jar",
+    "did not resolve any downloadable jar files",
+    "jvm candidates tried",
+    "failed to initialize jvm thread context class loader",
+    "jforex sdk import failed",
+    "jforex sdk prewarm failed",
+)
 
 TIMEFRAME_ALIASES: dict[str, str] = {
     "tick": "tick",
@@ -147,13 +201,17 @@ def _java_exception_types() -> tuple[type[BaseException], ...]:
     ``except`` clause. Raising instead keeps the failure explicit.
     """
     if not JPYPE_AVAILABLE:
-        raise RuntimeError(
-            "JPype is required to catch JForex exceptions. Install with: pip install jpype1"
-        )
+        return ()
     java_exception = getattr(jpype, "JException", None)
     if isinstance(java_exception, type):
         return (java_exception,)
-    raise RuntimeError("JPype did not expose JException; cannot catch JForex exceptions")
+    # No JException exposed (e.g. mocked or very old JPype): an empty tuple
+    # keeps except-clause evaluation from raising *while raising* the real
+    # error — the surrounding `except Exception` branch handles this state.
+    logger.warning(
+        "JPype did not expose JException; JForex exception filtering is disabled"
+    )
+    return ()
 
 
 def _raise_jforex_runtime_error(context: str, exc: BaseException) -> None:
@@ -210,6 +268,88 @@ def _resolve_jnlp_url() -> str:
     return jnlp_url
 
 
+def _is_allowed_dukascopy_url(url: str) -> bool:
+    """Return True only for Dukascopy-hosted remote resources (DV-B6a).
+
+    HTTPS only: an http:// Dukascopy URL would let an on-path attacker plant a
+    tampered JAR that no digest pin has been configured for, defeating the
+    integrity-check contract.
+    """
+    try:
+        parsed = urlparse(str(url or "").strip())
+    except ValueError:
+        return False
+    if parsed.scheme != "https":
+        return False
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return False
+    return any(
+        host == suffix.lstrip(".") or host.endswith(suffix)
+        for suffix in DUKASCOPY_ALLOWED_HOST_SUFFIXES
+    )
+
+
+def _require_allowed_dukascopy_url(url: str, context: str) -> None:
+    if not _is_allowed_dukascopy_url(url):
+        raise RuntimeError(
+            f"Refusing to fetch {context} from non-Dukascopy host: {url!r}. "
+            "The JForex downloader only accepts JNLP/JAR resources from "
+            "Dukascopy hosts."
+        )
+
+
+def _load_expected_jar_digests() -> dict[str, str]:
+    """Parse the optional JAR digest pin list from the environment."""
+    raw = (os.getenv(EXPECTED_JAR_DIGEST_ENV) or "").strip()
+    if not raw:
+        return {}
+    digests: dict[str, str] = {}
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry or "=" not in entry:
+            continue
+        url, _, digest = entry.partition("=")
+        url = url.strip()
+        digest = digest.strip().lower()
+        if url and digest:
+            digests[url] = digest
+    return digests
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _verify_jar_digest(path: Path, url: str, expected_digests: dict[str, str]) -> bool:
+    """Verify a downloaded JAR against a pinned digest (DV-B6b).
+
+    Returns True when there is nothing pinned for ``url`` (no expectation to
+    check) or when the digest matches. A mismatch is a hard failure: the
+    artifact is deleted and a RuntimeError raised so it can never reach the
+    JVM classpath.
+    """
+    expected = (expected_digests or {}).get(url)
+    if not expected:
+        return True
+    actual = _sha256_file(path)
+    if actual.lower() == expected.lower():
+        return True
+    try:
+        path.unlink()
+    except OSError:  # pragma: no cover - best-effort quarantine
+        pass
+    raise RuntimeError(
+        f"Integrity check failed for downloaded JAR '{url}': "
+        f"expected sha256 {expected}, got {actual}. The file was removed and "
+        "will not be added to the classpath."
+    )
+
+
 def _discover_jars(root: Path) -> list[Path]:
     if not root.exists():
         return []
@@ -224,13 +364,18 @@ def _discover_jars(root: Path) -> list[Path]:
     for search_root in search_roots:
         jars.extend(sorted(path for path in search_root.rglob("*.jar") if path.is_file()))
 
-    deduped: list[Path] = []
-    seen: set[Path] = set()
-    for jar in jars:
-        if jar in seen:
+    return [Path(entry) for entry in _dedupe_preserving_order(str(jar) for jar in jars)]
+
+
+def _dedupe_preserving_order(entries: list[str]) -> list[str]:
+    """First-occurrence dedupe used for JAR URL and JAR path collections."""
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for entry in entries:
+        if entry in seen:
             continue
-        deduped.append(jar)
-        seen.add(jar)
+        deduped.append(entry)
+        seen.add(entry)
     return deduped
 
 
@@ -249,6 +394,8 @@ def _parse_jnlp_jar_urls(jnlp_url: str, *, _visited: set[str] | None = None) -> 
     if jnlp_url in visited:
         return []
     visited.add(jnlp_url)
+
+    _require_allowed_dukascopy_url(jnlp_url, "JNLP descriptor")
 
     try:
         with urlopen(jnlp_url, timeout=20) as response:
@@ -274,37 +421,49 @@ def _parse_jnlp_jar_urls(jnlp_url: str, *, _visited: set[str] | None = None) -> 
             jar_urls.append(urljoin(base_url, href))
         elif tag == "extension":
             extension_url = urljoin(base_url, href)
+            _require_allowed_dukascopy_url(extension_url, "JNLP extension")
             jar_urls.extend(_parse_jnlp_jar_urls(extension_url, _visited=visited))
 
-    deduped: list[str] = []
-    seen: set[str] = set()
-    for entry in jar_urls:
-        if entry in seen:
-            continue
-        deduped.append(entry)
-        seen.add(entry)
-    return deduped
+    return _dedupe_preserving_order(jar_urls)
 
 
-def _download_jforex_jars_from_jnlp(jnlp_url: str, target_dir: Path) -> list[Path]:
-    jar_urls = _parse_jnlp_jar_urls(jnlp_url)
-    if not jar_urls:
+def _fetch_jar_file(jar_url: str, output_path: Path) -> None:
+    """Download a single JAR if it is not already cached (non-empty)."""
+    if not output_path.exists() or output_path.stat().st_size == 0:
+        try:
+            with urlopen(jar_url, timeout=30) as response:
+                output_path.write_bytes(response.read())
+        except URLError as exc:
+            raise RuntimeError(f"Failed to download JAR '{jar_url}': {exc}") from exc
+
+
+def _download_jforex_jars_from_jnlp(
+    jnlp_url: str,
+    target_dir: Path,
+    jar_urls: list[str] | None = None,
+) -> list[Path]:
+    _require_allowed_dukascopy_url(jnlp_url, "JNLP descriptor")
+
+    resolved_urls = _parse_jnlp_jar_urls(jnlp_url) if jar_urls is None else list(jar_urls)
+    for jar_url in resolved_urls:
+        _require_allowed_dukascopy_url(jar_url, "JAR resource")
+    if not resolved_urls:
         raise RuntimeError(f"No jar resources found in JNLP '{jnlp_url}'.")
 
+    expected_digests = _load_expected_jar_digests()
     target_dir.mkdir(parents=True, exist_ok=True)
     downloaded: list[Path] = []
 
-    for jar_url in jar_urls:
+    for jar_url in resolved_urls:
         file_name = Path(urlparse(jar_url).path).name
         if not file_name.endswith(".jar"):
             continue
         output_path = target_dir / file_name
-        if not output_path.exists() or output_path.stat().st_size == 0:
-            try:
-                with urlopen(jar_url, timeout=30) as response:
-                    output_path.write_bytes(response.read())
-            except URLError as exc:
-                raise RuntimeError(f"Failed to download JAR '{jar_url}': {exc}") from exc
+        _fetch_jar_file(jar_url, output_path)
+        # DV-B6b: the digest check runs on the artifact that actually ends up
+        # on the classpath — also when the file was already cached on disk
+        # from an earlier (possibly different or tampered) download.
+        _verify_jar_digest(output_path, jar_url, expected_digests)
         downloaded.append(output_path)
 
     if not downloaded:
@@ -352,14 +511,13 @@ def _resolve_jforex_classpath_details() -> tuple[list[str], str]:
         return classpath, "local discovery"
 
     bootstrap_dir = DATA_DIR / ".jforex-sdk"
-    try:
-        jnlp_url = _resolve_jnlp_url()
-        downloaded = _download_jforex_jars_from_jnlp(jnlp_url, bootstrap_dir)
-        logger.info("Bootstrapped %d JForex SDK jars from %s", len(downloaded), jnlp_url)
-        return [str(path.resolve(strict=True)) for path in downloaded], f"jnlp bootstrap: {jnlp_url}"
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Unable to bootstrap JForex SDK jars: %s", exc)
-        return [], f"unavailable: {exc}"
+    jnlp_url = _resolve_jnlp_url()
+    # DV-B7: bootstrap failures are surfaced, not swallowed into an empty
+    # classpath (which later degraded into an opaque "Could not resolve
+    # classpath" error far away from the root cause).
+    downloaded = _download_jforex_jars_from_jnlp(jnlp_url, bootstrap_dir)
+    logger.info("Bootstrapped %d JForex SDK jars from %s", len(downloaded), jnlp_url)
+    return [str(path.resolve(strict=True)) for path in downloaded], f"jnlp bootstrap: {jnlp_url}"
 
 
 def _trusted_java_home_roots() -> list[Path]:
@@ -557,9 +715,10 @@ def _ensure_jvm_started() -> None:
                 try:
                     jpype_mod.startJVM(jvm_path, classpath=classpath, convertStrings=False)
                     break
-                except _java_exception_types() as exc:
-                    _raise_jforex_runtime_error("Failed to start JVM for JForex SDK", exc)
                 except Exception as exc:  # noqa: BLE001
+                    # DV-B5: a failing candidate is recorded and the next one is
+                    # tried — including Java-originated exceptions, which
+                    # previously aborted the loop on the first candidate.
                     logger.debug("JVM candidate failed: %s", jvm_path, exc_info=True)
                     startup_errors.append((jvm_path, str(exc)))
 
