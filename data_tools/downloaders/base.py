@@ -19,6 +19,8 @@ from pathlib import Path
 import pandas as pd
 import pyarrow.parquet as pq
 
+from shared.atomic_io import atomic_replace
+
 logger = logging.getLogger(__name__)
 
 
@@ -128,7 +130,10 @@ class Downloader(ABC):
     def _make_output_path(
         self, output_dir: Path, asset_class: str, symbol: str, timeframe: str
     ) -> Path:
-        """Build standardised output path: {output_dir}/ohlcv/{source}/{asset_class}/{symbol}/{tf}.parquet"""
+        """Build the standardised output path.
+
+        Layout: {output_dir}/ohlcv/{source}/{asset_class}/{symbol}/{tf}.parquet
+        """
         path = (
             output_dir / "ohlcv" / self.source_name / asset_class / symbol / f"{timeframe}.parquet"
         )
@@ -148,12 +153,17 @@ class Downloader(ABC):
         logger.info("Smart resume enabled for %s from %s", output_path, resume_start)
         return resume_start
 
-    def _merge_and_store_single_file(self, output_path: Path, new_data: pd.DataFrame) -> pd.DataFrame:
+    def _merge_and_store_single_file(
+        self, output_path: Path, new_data: pd.DataFrame
+    ) -> pd.DataFrame:
         """Persist data in a single parquet file per symbol/timeframe.
 
         If the file exists, it is loaded and merged with incoming rows.
         Duplicate timestamps are removed (keeping newest row), data is sorted,
-        and the target parquet is overwritten.
+        and the target parquet is replaced atomically: the merged frame is
+        written to a temporary file in the same directory and moved into place
+        with :func:`os.replace`, so a crash mid-write can never truncate or
+        corrupt the previously stored canonical data.
         """
         normalized_new = self._normalize_timestamps(new_data)
 
@@ -161,9 +171,13 @@ class Downloader(ABC):
             try:
                 existing_data = pd.read_parquet(output_path)
             except (OSError, ValueError) as exc:
-                raise RuntimeError(f"Could not read existing parquet '{output_path}': {exc}") from exc
+                raise RuntimeError(
+                    f"Could not read existing parquet '{output_path}': {exc}"
+                ) from exc
             normalized_existing = self._normalize_timestamps(existing_data)
-            combined = pd.concat([normalized_existing, normalized_new], ignore_index=True, sort=False)
+            combined = pd.concat(
+                [normalized_existing, normalized_new], ignore_index=True, sort=False
+            )
         else:
             combined = normalized_new.copy()
 
@@ -176,15 +190,27 @@ class Downloader(ABC):
         else:
             combined = combined.drop_duplicates().reset_index(drop=True)
 
-        try:
-            combined.to_parquet(output_path, index=False)
-        except (OSError, ValueError) as exc:
-            raise RuntimeError(f"Could not write parquet '{output_path}': {exc}") from exc
+        def _write(target: Path) -> None:
+            try:
+                combined.to_parquet(target, index=False)
+            except (OSError, ValueError) as exc:
+                raise RuntimeError(f"Could not write parquet '{output_path}': {exc}") from exc
+
+        atomic_replace(output_path, _write)
 
         return combined
 
     def _read_latest_timestamp(self, output_path: Path) -> pd.Timestamp | None:
-        """Read max timestamp from an existing parquet without loading full OHLCV payload."""
+        """Read max timestamp from an existing parquet without loading full OHLCV payload.
+
+        Row-group max statistics are only a *lower bound* for the newest stored
+        timestamp: writers may disable statistics, drop them per row group, or
+        (for a file that was appended out of order) report a max below the
+        actual newest row. The statistics are therefore used as a fast path and
+        are always cross-checked against the last row of the final row group;
+        whichever value is newer wins, so resume can never rewind to a stale
+        point and re-download data that is already stored.
+        """
         if not output_path.exists():
             return None
 
@@ -204,23 +230,31 @@ class Downloader(ABC):
 
         column_index = columns.index(timestamp_column)
 
+        stats_latest: pd.Timestamp | None = None
         for row_group_index in range(metadata.num_row_groups - 1, -1, -1):
             stats = metadata.row_group(row_group_index).column(column_index).statistics
             if stats is None or not getattr(stats, "has_min_max", False):
                 continue
             latest = pd.to_datetime(stats.max, utc=True, errors="coerce")
             if not pd.isna(latest):
-                return pd.Timestamp(latest)
+                stats_latest = pd.Timestamp(latest)
+                break
 
-        row_group = parquet_file.read_row_group(metadata.num_row_groups - 1, columns=[timestamp_column])
+        row_group = parquet_file.read_row_group(
+            metadata.num_row_groups - 1, columns=[timestamp_column]
+        )
         if row_group.num_rows == 0:
-            return None
+            return stats_latest
 
         latest_value = row_group.column(0)[row_group.num_rows - 1].as_py()
-        latest = pd.to_datetime(latest_value, utc=True, errors="coerce")
-        if pd.isna(latest):
-            return None
-        return pd.Timestamp(latest)
+        row_latest = pd.to_datetime(latest_value, utc=True, errors="coerce")
+        if pd.isna(row_latest):
+            return stats_latest
+
+        row_latest = pd.Timestamp(row_latest)
+        if stats_latest is None or row_latest > stats_latest:
+            return row_latest
+        return stats_latest
 
     @staticmethod
     def _select_timestamp_column(columns: list[str]) -> str | None:
@@ -234,6 +268,8 @@ class Downloader(ABC):
     def _normalize_timestamps(df: pd.DataFrame) -> pd.DataFrame:
         normalized = df.copy()
         if "timestamp" in normalized.columns:
-            normalized["timestamp"] = pd.to_datetime(normalized["timestamp"], utc=True, errors="coerce")
+            normalized["timestamp"] = pd.to_datetime(
+                normalized["timestamp"], utc=True, errors="coerce"
+            )
             normalized = normalized.dropna(subset=["timestamp"])
         return normalized

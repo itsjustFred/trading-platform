@@ -20,8 +20,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import lzma
 import logging
+import lzma
 import struct
 import sys
 from dataclasses import dataclass
@@ -32,7 +32,8 @@ from typing import Any, Callable
 
 import pandas as pd
 
-from data_tools.downloaders.base import DownloadResult, Downloader, SourceMeta
+from data_tools.downloaders.base import Downloader, DownloadResult, SourceMeta
+from shared.atomic_io import write_text_atomically
 from shared.constants import DATA_DIR, resolve_genesis_path
 
 logger = logging.getLogger(__name__)
@@ -776,9 +777,10 @@ async def _download_and_assemble_merged_ticks(
     start_dt: datetime,
     end_dt: datetime,
     batch_size: int,
-    pipeline_batches: int,
-    pause_ms: int,
-    max_retries: int,
+    *,
+    pipeline_batches: int = 1,
+    pause_ms: int = 1000,
+    max_retries: int = 3,
     report_progress: Callable[[float, str], None] | None = None,
     stop_event: Event | None = None,
     pause_event: Event | None = None,
@@ -867,8 +869,13 @@ def _load_source_meta_index() -> dict:
 
 
 def _write_source_meta_index(index: dict) -> None:
+    """Persist the source-meta index atomically.
+
+    The catalog reads source_meta.json on every scan; writing it in place
+    means a crash mid-write truncates metadata for the whole catalog.
+    """
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    SOURCE_META_PATH.write_text(json.dumps(index, indent=2, sort_keys=True))
+    write_text_atomically(SOURCE_META_PATH, json.dumps(index, indent=2, sort_keys=True))
 
 
 def _resolve_requested_start(
@@ -1018,9 +1025,9 @@ class DukascopyNativeDownloader(Downloader):
                     start_dt,
                     end_dt,
                     batch_size,
-                    pause_ms,
-                    max_retries,
                     pipeline_batches=pipeline_batches,
+                    pause_ms=pause_ms,
+                    max_retries=max_retries,
                     report_progress=report_progress,
                     stop_event=stop_event,
                     pause_event=pause_event,

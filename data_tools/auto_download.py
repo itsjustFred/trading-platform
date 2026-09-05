@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import pandas as pd
+import pyarrow.parquet as pq
 
 from shared.constants import DATA_DIR, normalize_timeframe
 
@@ -22,6 +23,33 @@ US_INTRADAY_TIMEFRAMES = {"1m", "5m", "15m", "30m", "1h"}
 DEFAULT_HF_INTRADAY_COVERAGE_END = "2025-07-31"
 DEFAULT_ALPACA_INTRADAY_START = "2025-07-01"
 _US_STOCK_SYMBOL_PATTERN = re.compile(r"^[A-Z][A-Z.\-]{0,9}$")
+
+# Parent Decision Record (2026-08-31): coverage checks fail closed on
+# significant internal gaps. Small missing-bar windows may warn; larger gaps
+# fail. Defaults follow the thresholds proposed in the parent issue: an
+# internal hole longer than INTERNAL_GAP_FAIL_DAYS (3 calendar days) fails the
+# coverage check, a hole longer than INTERNAL_GAP_WARN_DAYS (1 calendar day)
+# warns, and anything shorter is tolerated (source downtime).
+#
+# Thresholds deliberately count calendar days, not business days (the parent
+# record states the fail threshold in calendar days): a regular FX weekend
+# (~2 days) therefore warns, and only holes beyond 3 calendar days fail.
+# Per-source overrides (crypto, holidays) are an explicit open item of the
+# parent issue and are intentionally not implemented here.
+INTERNAL_GAP_FAIL_DAYS = 3
+INTERNAL_GAP_WARN_DAYS = 1
+
+
+@dataclass
+class InternalGap:
+    """A hole between two consecutive bars inside the stored range."""
+
+    start: str
+    end: str
+    gap_days: float
+
+    def to_dict(self) -> dict[str, object]:
+        return {"start": self.start, "end": self.end, "gap_days": round(self.gap_days, 2)}
 
 
 def _coverage_window_from_env(env_value: str | None, default: str) -> str:
@@ -186,6 +214,204 @@ def _parquet_has_bar_in_range(path: Path, start_ts: pd.Timestamp, end_ts: pd.Tim
     return ((timestamps >= start_ts) & (timestamps <= end_ts)).any()
 
 
+def _timestamp_column_index(parquet_file: "pq.ParquetFile") -> int | None:
+    """Index of the (case-insensitive) ``timestamp`` column, or None if absent."""
+    columns = list(parquet_file.schema_arrow.names)
+    lowered = [column.lower() for column in columns]
+    if "timestamp" not in lowered:
+        return None
+    return lowered.index("timestamp")
+
+
+def _stat_boundary(
+    metadata: "pq.FileMetaData", column_index: int, row_group_index: int, boundary: str
+) -> pd.Timestamp | None:
+    """Min/max timestamp statistic of one row group, or None when unavailable."""
+    stats = metadata.row_group(row_group_index).column(column_index).statistics
+    if stats is None or not getattr(stats, "has_min_max", False):
+        return None
+    value = stats.min if boundary == "min" else stats.max
+    parsed = pd.to_datetime(value, utc=True, errors="coerce")
+    return None if pd.isna(parsed) else pd.Timestamp(parsed)
+
+
+def _row_group_edge_timestamp(
+    parquet_file: "pq.ParquetFile",
+    columns: list[str],
+    column_index: int,
+    row_group_index: int,
+    *,
+    last: bool,
+) -> pd.Timestamp | None:
+    """First (``last=False``) or last (``last=True``) timestamp of a row group."""
+    group = parquet_file.read_row_group(row_group_index, columns=[columns[column_index]])
+    if not group.num_rows:
+        return None
+    position = group.num_rows - 1 if last else 0
+    parsed = pd.to_datetime(group.column(0)[position].as_py(), utc=True, errors="coerce")
+    return None if pd.isna(parsed) else pd.Timestamp(parsed)
+
+
+def _parquet_timestamp_bounds(path: Path) -> tuple[pd.Timestamp, pd.Timestamp] | None:
+    """Read the min/max timestamp of a parquet without materializing the column.
+
+    Row-group min/max statistics are used when present; only the boundary row
+    groups are read as a fallback. This keeps repeated coverage checks cheap
+    instead of scanning the full timestamp column every time (DV-B17).
+
+    Statistics are only a *lower bound* for the true max: a writer that
+    appended rows out of order (or disabled statistics) reports a max below
+    the newest stored row. The last-group statistic is therefore
+    cross-checked against the actual last row of that group — the same rule
+    as :meth:`data_tools.downloaders.base.Downloader._read_latest_timestamp`.
+    """
+    try:
+        parquet_file = pq.ParquetFile(path)
+    except Exception as exc:
+        logger.warning("Could not inspect OHLCV timestamps for %s: %s", path, exc)
+        return None
+
+    column_index = _timestamp_column_index(parquet_file)
+    if column_index is None:
+        return None
+    columns = list(parquet_file.schema_arrow.names)
+    metadata = parquet_file.metadata
+    if metadata is None or metadata.num_rows == 0 or metadata.num_row_groups == 0:
+        return None
+
+    last_group = metadata.num_row_groups - 1
+    start = _stat_boundary(metadata, column_index, 0, "min")
+    end = _stat_boundary(metadata, column_index, last_group, "max")
+
+    # The last-group statistic understates the newest row for out-of-order
+    # appends, so it is cross-checked against the group's actual last row.
+    row_end = _row_group_edge_timestamp(
+        parquet_file, columns, column_index, last_group, last=True
+    )
+    if row_end is not None and (end is None or row_end > end):
+        end = row_end
+
+    if start is None:
+        start = _row_group_edge_timestamp(parquet_file, columns, column_index, 0, last=False)
+
+    if start is None or end is None:
+        return None
+    return start, end
+
+
+def _find_gaps_inside_file(
+    path: Path, *, threshold_days: float = INTERNAL_GAP_WARN_DAYS
+) -> list[InternalGap]:
+    """Find the largest bar-to-bar hole inside one parquet file.
+
+    Internal holes are not derivable from row-group min/max statistics, so
+    this reads the timestamp column of **every** row group. Cost is
+    O(file): fine for coverage checks at download time, not for hot paths.
+    """
+    try:
+        parquet_file = pq.ParquetFile(path)
+    except Exception as exc:
+        logger.warning("Could not inspect %s for internal gaps: %s", path, exc)
+        return []
+
+    metadata = parquet_file.metadata
+    columns = list(parquet_file.schema_arrow.names)
+    lowered = [column.lower() for column in columns]
+    if "timestamp" not in lowered or metadata is None or metadata.num_row_groups == 0:
+        return []
+    column_index = lowered.index("timestamp")
+    threshold = pd.Timedelta(days=threshold_days)
+
+    timestamps: list[pd.Timestamp] = []
+    for group_index in range(metadata.num_row_groups):
+        group = parquet_file.read_row_group(group_index, columns=[columns[column_index]])
+        parsed = pd.to_datetime(group.column(0).to_pandas(), utc=True, errors="coerce").dropna()
+        timestamps.extend(pd.Timestamp(value) for value in parsed)
+
+    if len(timestamps) < 2:
+        return []
+
+    series = pd.Series(pd.to_datetime(sorted(set(timestamps)), utc=True))
+    diffs = series.diff().dropna()
+    large = diffs[diffs > threshold]
+    gaps: list[InternalGap] = []
+    for index in large.index:
+        gaps.append(
+            InternalGap(
+                start=series[index - 1].date().isoformat(),
+                end=series[index].date().isoformat(),
+                gap_days=diffs[index].total_seconds() / 86_400,
+            )
+        )
+
+    # Report the largest hole per file so callers get a single actionable gap.
+    largest = max(gaps, key=lambda gap: gap.gap_days, default=None)
+    return [largest] if largest is not None else []
+
+
+def find_internal_gaps(
+    symbol_dir: Path,
+    timeframe: str | None = None,
+    *,
+    threshold_days: float = INTERNAL_GAP_WARN_DAYS,
+) -> list[dict[str, object]]:
+    """Detect holes *inside* the stored timestamp range of one symbol directory.
+
+    Coverage based on global min/max passes files that simply stop in the
+    middle (DV-B15). This compares the bar-to-bar boundaries of every parquet
+    that belongs to the symbol: adjacent files (segmented/monthly storage) and
+    the bars inside one file. The largest hole longer than ``threshold_days``
+    (default: 1 calendar day) is reported — gaps are measured in calendar
+    days, so a regular weekend (~2 days) is reported as a warning.
+    """
+    def _matches_timeframe(path: Path) -> bool:
+        if timeframe is None:
+            return True
+        stem = path.stem.lower()
+        normalized = timeframe.lower()
+        return (
+            stem == normalized
+            or stem.startswith(f"{normalized}_")
+            or stem.startswith(f"{normalized}-")
+        )
+
+    parquet_paths = sorted(
+        path for path in symbol_dir.rglob("*.parquet") if _matches_timeframe(path)
+    )
+    bounds: list[tuple[pd.Timestamp, pd.Timestamp, Path]] = []
+    for path in parquet_paths:
+        file_bounds = _parquet_timestamp_bounds(path)
+        if file_bounds is not None:
+            bounds.append((file_bounds[0], file_bounds[1], path))
+    if not bounds:
+        return []
+
+    gaps: list[InternalGap] = []
+
+    # Gap between the bars of adjacent files (e.g. monthly/segmented storage).
+    bounds.sort(key=lambda item: item[0])
+    for (_, previous_end, _), (next_start, _, _) in zip(bounds, bounds[1:]):
+        gap_days = (next_start - previous_end).total_seconds() / 86_400
+        if gap_days > threshold_days:
+            gaps.append(
+                InternalGap(
+                    start=previous_end.date().isoformat(),
+                    end=next_start.date().isoformat(),
+                    gap_days=gap_days,
+                )
+            )
+
+    # Largest hole inside each file; see _find_gaps_inside_file for the cost.
+    for _, _, path in bounds:
+        file_gaps = _find_gaps_inside_file(path, threshold_days=threshold_days)
+        gaps.extend(file_gaps)
+
+    largest = max(gaps, key=lambda gap: gap.gap_days, default=None)
+    if largest is not None:
+        return [largest.to_dict()]
+    return []
+
+
 def has_ohlcv_bars_in_range(
     *,
     symbol: str,
@@ -310,22 +536,74 @@ def _coverage_for(data_root: Path, symbol: str, timeframe: str) -> tuple[str, st
     starts: list[str] = []
     ends: list[str] = []
     for path in matches:
-        try:
-            df = pd.read_parquet(path, columns=["timestamp"])
-        except Exception as exc:
-            logger.warning("Could not inspect OHLCV coverage for %s: %s", path, exc)
+        bounds = _parquet_timestamp_bounds(path)
+        if bounds is None:
+            logger.warning("Could not inspect OHLCV coverage for %s", path)
             continue
-        if "timestamp" not in df.columns or df.empty:
-            continue
-        timestamps = pd.to_datetime(df["timestamp"], utc=True, errors="coerce").dropna()
-        if timestamps.empty:
-            continue
-        starts.append(pd.Timestamp(timestamps.min()).date().isoformat())
-        ends.append(pd.Timestamp(timestamps.max()).date().isoformat())
+        start, end = bounds
+        starts.append(start.date().isoformat())
+        ends.append(end.date().isoformat())
 
     if not starts or not ends:
         return None
     return min(starts), max(ends)
+
+
+def analyze_ohlcv_coverage(data_root: Path, requirement: DataRequirement) -> dict[str, Any]:
+    """Report coverage for one requirement, including internal holes.
+
+    Returns a dict with ``status`` ("ok", "warning" or "failed"), the global
+    ``start``/``end`` bounds, and any internal ``gaps``. Status is fail-closed:
+    missing data and significant internal holes both report "failed" (Decision
+    Record 2026-08-31), small holes warn.
+    """
+    symbol_dir_candidates = sorted((data_root / "ohlcv").rglob(f"**/{requirement.symbol}"))
+    timeframe = normalize_timeframe(str(requirement.timeframe or "").strip())
+    gaps: list[dict[str, object]] = []
+    bounds = _coverage_for(data_root, requirement.symbol, timeframe)
+
+    for candidate in symbol_dir_candidates:
+        gaps.extend(find_internal_gaps(candidate, timeframe))
+
+    error: str | None = None
+    if bounds is None:
+        error = (
+            f"No {requirement.symbol} {timeframe} parquet found under {data_root / 'ohlcv'}"
+        )
+    else:
+        required_start = _normalize_coverage_date(requirement.start)
+        required_end = _normalize_coverage_date(requirement.end)
+        if required_start is not None and required_start < bounds[0]:
+            error = (
+                f"Requested start {required_start} is before stored coverage start {bounds[0]}"
+            )
+        elif required_end is not None and required_end > bounds[1]:
+            error = f"Requested end {required_end} is after stored coverage end {bounds[1]}"
+
+    significant_gaps = [
+        gap for gap in gaps if float(gap.get("gap_days", 0)) > INTERNAL_GAP_FAIL_DAYS
+    ]
+
+    if error or significant_gaps:
+        status = "failed"
+    elif gaps:
+        status = "warning"
+    else:
+        status = "ok"
+
+    report: dict[str, Any] = {
+        "symbol": requirement.symbol,
+        "timeframe": timeframe,
+        "status": status,
+        "gaps": gaps,
+        "failed_downloads": list(significant_gaps),
+    }
+    if bounds is not None:
+        report["start"] = bounds[0]
+        report["end"] = bounds[1]
+    if error:
+        report["error"] = error
+    return report
 
 
 def _normalize_coverage_date(value: str | None) -> str | None:

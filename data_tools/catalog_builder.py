@@ -26,12 +26,27 @@ import pyarrow.parquet as pq
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 logger = logging.getLogger(__name__)
 
+from shared.atomic_io import write_text_atomically
 from shared.constants import DATA_DIR, normalize_timeframe
 
 CATALOG_FILE = "catalog.json"
 
 # Path to persisted source metadata (written by downloaders)
 SOURCE_META_FILE = "source_meta.json"
+
+
+def write_json_atomically(path: Path, payload: str) -> None:
+    """Write serialized JSON to ``path`` atomically.
+
+    Readers never observe a truncated catalog, and a crash mid-write leaves
+    the previous file intact.
+    """
+    write_text_atomically(Path(path), payload)
+
+
+def write_catalog_json(path: Path, catalog: dict) -> None:
+    """Serialize ``catalog`` and persist it atomically to ``path``."""
+    write_json_atomically(path, json.dumps(catalog, indent=2, default=str))
 _TIMEFRAME_REGEX = r"(?:tick|mn1|(?:\d+)?(?:s|sec|m|min|h|d|w|mo)|[smhdw]\d+)"
 TIMEFRAME_PATTERN = re.compile(rf"^{_TIMEFRAME_REGEX}$", re.IGNORECASE)
 _SEGMENT_CHARS_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -231,6 +246,23 @@ def _should_reuse_cached_summary(cached_entry: dict | None, file_mtime: float) -
         return False
 
 
+def _looks_like_bare_symbol(value: str) -> bool:
+    """Whether a filename stem is a plain instrument symbol (no timeframe info).
+
+    Used for flat export layouts where the stem is the only symbol hint. Stems
+    containing separators or timeframe-like spellings cannot be trusted as a
+    bare symbol and must not be catalogued as a "1d" dataset.
+    """
+    normalized = str(value or "").strip()
+    if not normalized or not re.fullmatch(r"[A-Za-z0-9]+", normalized):
+        return False
+    if not any(character.isalpha() for character in normalized):
+        return False
+    if _looks_like_timeframe(normalized):
+        return False
+    return True
+
+
 def parse_ohlcv_path(parquet_path: Path, ohlcv_root: Path) -> dict | None:
     """Parse an OHLCV parquet path into source/asset_class/symbol/timeframe fields."""
     rel = parquet_path.relative_to(ohlcv_root)
@@ -248,7 +280,7 @@ def parse_ohlcv_path(parquet_path: Path, ohlcv_root: Path) -> dict | None:
     if len(parts) >= 5:
         region = parts[-3]
         symbol = parts[-2]
-        timeframe_value = timeframe or "1d"
+        timeframe_value = timeframe
     elif len(parts) == 4:
         parent = parts[-2]
         if timeframe:
@@ -259,9 +291,13 @@ def parse_ohlcv_path(parquet_path: Path, ohlcv_root: Path) -> dict | None:
             else:
                 symbol = parent
         else:
+            # Flat layout {symbol}.parquet: the symbol directory is the region
+            # and the file stem is the symbol. The stem must look like a bare
+            # symbol (no timeframe-like or compound segments), otherwise the
+            # entry is rejected instead of silently catalogued as a "1d" dataset.
             region = parent
             symbol = stem
-            timeframe_value = "1d"
+            timeframe_value = "1d" if _looks_like_bare_symbol(stem) else None
     else:
         if timeframe and stem_symbol:
             symbol = stem_symbol
@@ -271,7 +307,13 @@ def parse_ohlcv_path(parquet_path: Path, ohlcv_root: Path) -> dict | None:
             return None
         else:
             symbol = stem
-            timeframe_value = "1d"
+            timeframe_value = "1d" if _looks_like_bare_symbol(stem) else None
+
+    if not timeframe_value:
+        logger.warning(
+            "Skipping parquet with unparseable timeframe (not defaulted to 1d): %s", rel
+        )
+        return None
 
     entry = {
         "source": source,
@@ -912,7 +954,7 @@ def main():
     out = json.dumps(catalog, indent=2, default=str)
 
     if args.output:
-        Path(args.output).write_text(out)
+        write_json_atomically(Path(args.output), out)
         logger.info("Catalog written to %s (%d datasets)", args.output, len(catalog["ohlcv"]))
     else:
         print(out)

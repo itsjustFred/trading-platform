@@ -13,11 +13,12 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 from pathlib import Path
 
 import pandas as pd
+
+from shared.atomic_io import write_parquet_atomically
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 logger = logging.getLogger(__name__)
@@ -75,6 +76,41 @@ def resample_ohlcv(df: pd.DataFrame, target_tf: str) -> pd.DataFrame:
     return resampled
 
 
+def merge_resampled_history(existing_path: Path, resampled: pd.DataFrame) -> pd.DataFrame:
+    """Merge freshly resampled bars with the stored higher-timeframe history.
+
+    Resampling only sees the rows of the source file it was given, so writing
+    the result directly over an existing {tf}.parquet would silently drop any
+    older history that is no longer present in the source. Merging keeps the
+    union of both, with the newer resampled values winning on duplicate
+    timestamps (DV-B23).
+    """
+    try:
+        existing = pd.read_parquet(existing_path)
+    except (OSError, ValueError) as exc:
+        logger.warning("Could not read existing resample target %s: %s", existing_path, exc)
+        return resampled
+
+    if existing.empty:
+        return resampled
+
+    existing = existing.copy()
+    existing.columns = [str(column).lower() for column in existing.columns]
+    if "timestamp" not in existing.columns:
+        return resampled
+
+    existing["timestamp"] = pd.to_datetime(existing["timestamp"], utc=True, errors="coerce")
+    existing = existing.dropna(subset=["timestamp"])
+
+    combined = (
+        pd.concat([existing, resampled], ignore_index=True, sort=False)
+        .sort_values("timestamp")
+        .drop_duplicates(subset=["timestamp"], keep="last")
+        .reset_index(drop=True)
+    )
+    return combined
+
+
 def resample_file(
     source_path: Path, timeframes: list[str], output_dir: Path | None = None
 ) -> list[Path]:
@@ -103,7 +139,9 @@ def resample_file(
     for tf in timeframes:
         out_path = out_dir / f"{tf}.parquet"
         resampled = resample_ohlcv(df, tf)
-        resampled.to_parquet(out_path, index=False)
+        if out_path.exists():
+            resampled = merge_resampled_history(out_path, resampled)
+        write_parquet_atomically(out_path, resampled)
         logger.info("  %s: %d → %d rows → %s", tf, len(df), len(resampled), out_path)
         results.append(out_path)
 
@@ -129,8 +167,8 @@ def resample_directory(source_dir: Path, from_tf: str, timeframes: list[str]) ->
         try:
             results = resample_file(src, timeframes)
             all_results.extend(results)
-        except Exception as e:
-            logger.error("  Failed: %s", e)
+        except Exception:
+            logger.exception("  Resampling %s failed", symbol)
 
     return all_results
 
@@ -143,8 +181,9 @@ def update_catalog(data_dir: Path | None = None):
 
         root = data_dir or _DEFAULT_DATA_DIR
         catalog = build_catalog(root)
-        catalog_path = root / "catalog.json"
-        catalog_path.write_text(json.dumps(catalog, indent=2, default=str))
+        from data_tools.catalog_builder import write_catalog_json
+
+        write_catalog_json(root / "catalog.json", catalog)
         logger.info("Catalog updated: %d datasets", catalog["summary"]["total_datasets"])
     except Exception as e:
         logger.warning("Could not update catalog: %s", e)

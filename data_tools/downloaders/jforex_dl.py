@@ -139,12 +139,21 @@ def _jpype_module() -> Any:
 
 
 def _java_exception_types() -> tuple[type[BaseException], ...]:
+    """Java exception types raised by JPype, for ``except`` clauses.
+
+    Without JPype (or before the JVM bridge exposes ``JException``) there is
+    nothing Java-specific to catch: the callers' ``except Exception`` branches
+    handle that state, so an empty tuple here would silently swallow the
+    ``except`` clause. Raising instead keeps the failure explicit.
+    """
     if not JPYPE_AVAILABLE:
-        return ()
+        raise RuntimeError(
+            "JPype is required to catch JForex exceptions. Install with: pip install jpype1"
+        )
     java_exception = getattr(jpype, "JException", None)
     if isinstance(java_exception, type):
         return (java_exception,)
-    return ()
+    raise RuntimeError("JPype did not expose JException; cannot catch JForex exceptions")
 
 
 def _raise_jforex_runtime_error(context: str, exc: BaseException) -> None:
@@ -1013,6 +1022,19 @@ def _build_offer_side_output_path(base_path: Path, target_tf: str, offer_side: s
     return base_path.with_name(f"{stem}{base_path.suffix}")
 
 
+def merged_result_path(bid_out_path: Path) -> Path:
+    """Result path for a merged bid/ask download.
+
+    ``DownloadResult.path`` must be a file, never a directory: every consumer
+    reads it as the stored parquet (DV-B9). The bid side is the canonical
+    stored file for merged downloads. Fails closed when the bid file is not
+    on disk, so a partial merge can never masquerade as a successful path.
+    """
+    if not bid_out_path.is_file():
+        raise RuntimeError(f"Merged JForex download did not store {bid_out_path}")
+    return bid_out_path
+
+
 def _query_bars_for_offer_side(
     *,
     java_instrument: Any,
@@ -1186,7 +1208,9 @@ class JForexDownloader(Downloader):
                 size_bytes += bid_out_path.stat().st_size
             if ask_out_path.exists():
                 size_bytes += ask_out_path.stat().st_size
-            output_path = out_path.parent
+            # DV-B9: the result must point at the stored bid parquet, never
+            # the symbol directory; fails closed when the file is missing.
+            output_path = merged_result_path(bid_out_path)
         else:
             combined = self._merge_and_store_single_file(out_path, result_df)
             size_bytes = out_path.stat().st_size

@@ -153,9 +153,26 @@ def symbol_asset_class(canonical_symbol: str) -> str:
 
 
 def ensure_alias_copy(canonical_path: Path, requested_symbol: str, asset_class: str, output_dir: Path) -> Path:
+    """Copy the canonical parquet under the requested symbol name.
+
+    Equal file size is not freshness: a re-download that merges or replaces rows
+    can produce a byte-identical size while the content changed (DV-B30). The
+    alias is refreshed whenever the canonical file is newer than the copy.
+
+    Assumes every writer under ``ohlcv/dukascopy/`` goes through this module:
+    external restores (rsync -a, tar, git checkout) can reorder mtimes without
+    changing content, which would make a stale alias look fresh.
+    """
     alias_path = output_dir / "ohlcv" / "dukascopy" / asset_class / requested_symbol / canonical_path.name
-    if alias_path.exists() and alias_path.stat().st_size == canonical_path.stat().st_size:
-        return alias_path
+    if alias_path.exists():
+        try:
+            canonical_is_newer = (
+                canonical_path.stat().st_mtime_ns > alias_path.stat().st_mtime_ns
+            )
+        except OSError:
+            canonical_is_newer = True
+        if not canonical_is_newer:
+            return alias_path
     alias_path.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(canonical_path, alias_path)
     return alias_path

@@ -106,3 +106,96 @@ class TestResampleFile:
             assert p.exists()
             df = pd.read_parquet(p)
             assert len(df) > 0
+
+
+class TestResampleMerge:
+    def test_resample_preserves_stored_history_not_present_in_source(self, tmp_path):
+        """Regression DV-B23: resampling must not drop older stored bars."""
+        source = tmp_path / "1m.parquet"
+        old_source = pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2020-01-01", periods=3, freq="h", tz="UTC"),
+                "open": [1.0, 2.0, 3.0],
+                "high": [1.1, 2.1, 3.1],
+                "low": [0.9, 1.9, 2.9],
+                "close": [1.05, 2.05, 3.05],
+                "volume": [10, 20, 30],
+            }
+        )
+        old_source.to_parquet(source, index=False)
+
+        outputs = resample_file(source, ["1h"])
+        stored = pd.read_parquet(outputs[0])
+        assert len(stored) == 3
+        assert str(stored["timestamp"].iloc[0])[:10] == "2020-01-01"
+
+        # The source file is later truncated to recent rows only (e.g. re-download).
+        new_source = old_source.iloc[[2]].copy()
+        new_source.to_parquet(source, index=False)
+
+        outputs = resample_file(source, ["1h"])
+        merged = pd.read_parquet(outputs[0])
+
+        assert len(merged) == 3, f"history regressed: {len(merged)} rows"
+        assert str(merged["timestamp"].iloc[0])[:10] == "2020-01-01"
+
+    def test_resample_newer_values_win_on_duplicate_timestamps(self, tmp_path):
+        source = tmp_path / "1m.parquet"
+        pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2020-01-01", periods=2, freq="h", tz="UTC"),
+                "open": [1.0, 2.0],
+                "high": [1.1, 2.1],
+                "low": [0.9, 1.9],
+                "close": [1.05, 2.05],
+                "volume": [10, 20],
+            }
+        ).to_parquet(source, index=False)
+        resample_file(source, ["1h"])
+
+        revised = pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2020-01-01", periods=1, freq="h", tz="UTC"),
+                "open": [9.0],
+                "high": [9.1],
+                "low": [8.9],
+                "close": [9.05],
+                "volume": [99],
+            }
+        )
+        revised.to_parquet(source, index=False)
+
+        outputs = resample_file(source, ["1h"])
+        merged = pd.read_parquet(outputs[0])
+
+        assert len(merged) == 2
+        assert float(merged.loc[merged["timestamp"].dt.date == pd.Timestamp("2020-01-01").date(), "close"].iloc[0]) == 9.05
+
+    def test_resample_write_is_atomic(self, tmp_path, monkeypatch):
+        source = tmp_path / "1m.parquet"
+        pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2020-01-01", periods=2, freq="h", tz="UTC"),
+                "open": [1.0, 2.0],
+                "high": [1.1, 2.1],
+                "low": [0.9, 1.9],
+                "close": [1.05, 2.05],
+                "volume": [10, 20],
+            }
+        ).to_parquet(source, index=False)
+
+        observed: dict[str, Path] = {}
+
+        real_to_parquet = pd.DataFrame.to_parquet
+
+        def spy(self, path, *args, **kwargs):
+            observed["path"] = Path(path)
+            return real_to_parquet(self, path, *args, **kwargs)
+
+        monkeypatch.setattr(pd.DataFrame, "to_parquet", spy)
+
+        outputs = resample_file(source, ["1h"])
+
+        assert observed["path"] != outputs[0], "resample target must be written via temp file"
+        assert len(pd.read_parquet(outputs[0])) == 2
+        assert not list(tmp_path.rglob("*.tmp-*")), "no temp files left behind"

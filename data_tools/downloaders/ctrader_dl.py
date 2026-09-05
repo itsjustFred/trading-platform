@@ -61,6 +61,24 @@ RESAMPLE_MAP = {
     "1d": "1D",
 }
 
+_INDEX_SYMBOLS = {"US500", "US100", "US30", "GER40", "UK100"}
+_METAL_SYMBOLS = {"XAUUSD", "XAGUSD", "XPTUSD", "XPDUSD"}
+
+
+def _asset_class_for(symbol: str) -> str:
+    """Map a cTrader symbol to its asset class.
+
+    Metals must not be catalogued under "forex" — the catalog and the runner
+    filter by asset class, so XAUUSD under forex silently hides it from every
+    metals view and universe (DV-B22).
+    """
+    normalized = str(symbol or "").strip().upper()
+    if normalized in _METAL_SYMBOLS:
+        return "metals"
+    if normalized in _INDEX_SYMBOLS:
+        return "index"
+    return "forex"
+
 
 class CTraderDownloader(Downloader):
     """Downloads data from cTrader Open API or CSV exports.
@@ -139,9 +157,7 @@ class CTraderDownloader(Downloader):
             raise RuntimeError(f"No data loaded for {symbol}")
 
         # Determine asset class
-        asset_class = "forex"
-        if symbol in ("US500", "US100", "US30", "GER40", "UK100"):
-            asset_class = "index"
+        asset_class = _asset_class_for(symbol)
         out_path = self._make_output_path(output_dir, asset_class, symbol, timeframe)
         effective_start = self._resolve_resume_start(out_path, start)
 
