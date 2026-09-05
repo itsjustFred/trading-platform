@@ -167,8 +167,20 @@ def generate_signals(df: pd.DataFrame, params: dict):
         if not can_trade:
             continue
 
-        enter_long = bool(adx.iloc[i] < 30.0) and bool(close.iloc[i] < breakout_long.iloc[i])
-        enter_short = bool(adx.iloc[i] > 30.0) and bool(close.iloc[i] < breakout_short.iloc[i])
+        # Breakout semantics (Cleanup #35): a long requires the close to break
+        # ABOVE the long breakout level, a short requires the close to break
+        # BELOW the short breakout level. The ADX regime gate directs the
+        # breakout side: trending market (ADX > threshold) takes longs,
+        # non-trending (ADX <= threshold) takes shorts — matching the original
+        # Pine stop-order logic where the level was entered in the breakout
+        # direction.
+        adx_breakout_threshold = 30.0
+        enter_long = bool(adx.iloc[i] > adx_breakout_threshold) and bool(
+            close.iloc[i] >= breakout_long.iloc[i]
+        )
+        enter_short = bool(adx.iloc[i] <= adx_breakout_threshold) and bool(
+            close.iloc[i] <= breakout_short.iloc[i]
+        )
 
         if enter_long:
             entries.iloc[i] = True

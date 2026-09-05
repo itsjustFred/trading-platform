@@ -17,8 +17,12 @@ Logic:
 
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+import logging
+
 import numpy as np
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 STRATEGY_META = {
     "name": "intraday_volatility_breakout",
@@ -329,6 +333,7 @@ def generate_signals(df: pd.DataFrame, params: dict):
     # with the shifted close.  When Use_Candle_Close is false the EA reacts to
     # the current market price (SYMBOL_LAST).  In a bar engine the best proxy
     # for intrabar touches is the high/low of the current bar.
+    signal_price_fallback_used = pd.Series(False, index=idx)
     if use_candle_close:
         conf_freq = _TF_FREQ_MAP.get(confirmation_timeframe, confirmation_timeframe)
         try:
@@ -354,10 +359,21 @@ def generate_signals(df: pd.DataFrame, params: dict):
                 signal_price_long = close.shift(1)
                 signal_price_short = signal_price_long
                 confirmation_eval_mask = pd.Series(True, index=idx)
-        except Exception:
+                signal_price_fallback_used = pd.Series(True, index=idx)
+        except Exception as exc:
+            # Cleanup #35: a genuine failure of the confirmation path must be
+            # visible, not silently traded. The fallback (previous bar close)
+            # is a DIFFERENT signal definition, so it is marked in the
+            # indicators AND logged instead of switching semantics invisibly.
+            logger.warning(
+                "intraday_volatility_breakout: confirmation resample failed "
+                f"({type(exc).__name__}: {exc}); falling back to close.shift(1) "
+                "signal prices (signal_price_fallback_used=True)"
+            )
             signal_price_long = close.shift(1)
             signal_price_short = signal_price_long
             confirmation_eval_mask = pd.Series(True, index=idx)
+            signal_price_fallback_used = pd.Series(True, index=idx)
     else:
         signal_price_long = df["high"]
         signal_price_short = df["low"]
@@ -490,6 +506,8 @@ def generate_signals(df: pd.DataFrame, params: dict):
         "order_timing": order_timing,
         "order_type": order_type,
         "exit_reason": exit_reason,
+        "signal_price": signal_price_long,
+        "signal_price_fallback_used": signal_price_fallback_used,
     }
 
     # --- Drawings ------------------------------------------------------------

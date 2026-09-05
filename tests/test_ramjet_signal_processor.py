@@ -89,3 +89,82 @@ def test_processor_loads_default_ramjet_config_file():
     assert processor.tp1_multiplier == pytest.approx(3.0)
     assert processor.tp1_exit_percent == pytest.approx(0.5)
     assert processor.default_timeframe == "5m"
+
+
+class _FakeSupertrendTA:
+    """Stands in for the ``pandas_ta`` accessor with a deterministic frame."""
+
+    def __init__(self, directions: list[int], period: int, multiplier: float):
+        self._directions = directions
+        self._period = period
+        self._multiplier = multiplier
+
+    def supertrend(self, length=None, multiplier=None, **_kwargs):
+        return pd.DataFrame(
+            {
+                f"SUPERTd_{self._period}_{float(self._multiplier)}": self._directions,
+            }
+        )
+
+
+def test_pandas_ta_supertrend_marks_warmup_not_ready(monkeypatch):
+    """The pandas_ta branch must carry the same warm-up marker as the fallback.
+
+    Old behaviour: the pandas_ta branch only set ``supertrend``, so
+    process_signal fell into its ``else True`` and reported the warm-up bar as
+    ready with whatever direction the library emitted for it — the marker was
+    the fallback's secret, not the contract's (CodeRabbit batch review).
+    """
+    period = 100
+    rows = 40
+    # The library reports green on every bar, but the frame is shorter than
+    # the requested warm-up — exactly the short live fetch the golden test
+    # pins for the fallback path.
+    directions = [1] * rows
+    # pandas_ta registers the ``ta`` accessor on import; it is absent when the
+    # library is not installed, hence raising=False.
+    monkeypatch.setattr(
+        pd.DataFrame,
+        "ta",
+        property(lambda self: _FakeSupertrendTA(directions, period, 3.0)),
+        raising=False,
+    )
+
+    processor = RamJetSignalProcessor(
+        {"ram_jet": {"supertrend_period": period, "candle_timeframe": "5Min"}}
+    )
+    signal = processor.process_signal({"symbol": "AAPL", "action": "BUY"}, _sample_market_data(rows))
+
+    assert signal.metadata["supertrend_ready"] is False
+    assert signal.metadata["supertrend_green_at_entry"] is True
+
+    # Once the warm-up is over the same library output counts as ready.
+    warmed_directions = [1] * rows
+    monkeypatch.setattr(
+        pd.DataFrame,
+        "ta",
+        property(lambda self: _FakeSupertrendTA(warmed_directions, 10, 3.0)),
+        raising=False,
+    )
+    warmed_processor = RamJetSignalProcessor(
+        {"ram_jet": {"supertrend_period": 10, "candle_timeframe": "5Min"}}
+    )
+    warmed = warmed_processor.process_signal({"symbol": "AAPL", "action": "BUY"}, _sample_market_data(rows))
+    assert warmed.metadata["supertrend_ready"] is True
+
+
+def test_process_signal_fails_closed_without_supertrend_ready_marker(monkeypatch):
+    """A Supertrend path that emits no ready marker must not read as ready.
+
+    Old behaviour: a missing ``supertrend_ready`` column defaulted to ``True``,
+    so a Supertrend variant that forgot the warm-up marker would silently
+    report a fabricated direction as ready (CodeRabbit batch review).
+    """
+
+    def _no_marker(df, period, multiplier):
+        return df.assign(supertrend=False)
+
+    monkeypatch.setattr(RamJetSignalProcessor, "_calculate_supertrend", staticmethod(_no_marker))
+    processor = RamJetSignalProcessor({"ram_jet": {"candle_timeframe": "5Min"}})
+    signal = processor.process_signal({"symbol": "AAPL", "action": "BUY"}, _sample_market_data())
+    assert signal.metadata["supertrend_ready"] is False

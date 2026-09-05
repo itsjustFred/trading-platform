@@ -1,20 +1,40 @@
 """
-Strategy: Risk Parity (Simplified)
+Strategy: Volatility-Regime Long (single instrument)
 
-Equal-risk allocation across multiple asset classes, rebalanced periodically.
-Uses inverse-volatility weighting as a simplified risk parity approach.
+Single-instrument long/flat strategy. Entry only in a calm volatility
+regime (annualized rolling vol below its own rolling median times a
+threshold) and above a long SMA trend filter; exits on ATR stop, regime
+break or trend break.
+
+Naming integrity (Cleanup #35 / Settlement S15): this file does NOT
+implement multi-asset risk parity — there is no weighting across
+instruments here. The real multi-asset risk-parity allocation lives in
+``scripts/run_risk_parity_backtest.py`` (+ ``runner/risk_parity_optimizer.py``).
+Meta/tags below describe the implemented single-instrument behavior.
 """
 
 STRATEGY_META = {
-    "name": "Risk Parity",
-    "version": "1.0.0",
+    "name": "Volatility-Regime Long (single instrument)",
+    "version": "1.1.0",
     "source_url": "https://github.com/desenyon/quantconnect-strategies/blob/main/risk_parity_strategy.py",
+    "notes": (
+        "- Implementiert NICHT die Multi-Asset-Risk-Parity-Allokation des "
+        "Originals; diese Strategie handelt ein einzelnes Instrument "
+        "long/flat mit Volatilitaets-Regime- und SMA-Trendfilter.\n"
+        "- Die echte Multi-Asset-Risk-Parity-Gewichtung liegt in "
+        "scripts/run_risk_parity_backtest.py (QuantConnect-Reimplementierung) "
+        "und runner/risk_parity_optimizer.py."
+    ),
     "tags": {
-        "type": ["risk-parity", "portfolio"],
+        "type": ["regime-filter", "trend-following", "single-instrument"],
         "source": "desenyon-github",
         "link": "https://github.com/desenyon/RiskParityAlpha",
-        "asset_class": ["multi-asset", "etf"],
-        "complexity": "complex",
+        "asset_class": ["equities", "etf"],
+        "complexity": "medium",
+        "naming_note": (
+            "slug retained as risk_parity for backtest-artifact compatibility; "
+            "implementation is single-instrument volatility-regime long"
+        ),
     },
 }
 

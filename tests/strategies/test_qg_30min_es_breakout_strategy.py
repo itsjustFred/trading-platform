@@ -19,7 +19,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from runner.engines.base import BacktestConfig
 from runner.engines.vectorbt_adapter import VectorbtAdapter
 
-
 STRATEGY_PATH = str(
     Path(__file__).parent.parent.parent
     / "strategies"
@@ -32,8 +31,12 @@ TEST_END = "2006-03-31"
 TEST_SYMBOL = "XAUUSD"
 TEST_TIMEFRAME = "1h"
 
-EXPECTED_TRADE_COUNT = 62
-EXPECTED_NET_PROFIT = 9408.30
+# Golden-master regenerated per Decision Record #17 (Cleanup #35): the entry
+# conditions were corrected from the inverted fade semantics (enter_long on
+# close < breakout_long with adx < 30) to breakout semantics (enter_long on
+# close >= breakout_long with adx > 30). Old values: 62 trades / +9408.30.
+EXPECTED_TRADE_COUNT = 42
+EXPECTED_NET_PROFIT = -3679.87
 
 
 @pytest.fixture(scope="module")

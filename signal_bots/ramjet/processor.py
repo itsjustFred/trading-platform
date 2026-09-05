@@ -110,6 +110,13 @@ class RamJetSignalProcessor:
                             break
                 if st_dir_col in st.columns:
                     frame["supertrend"] = st[st_dir_col] == 1
+                    # Same warm-up contract as the fallback below: pandas_ta
+                    # emits a direction for every bar, including the early ones
+                    # whose ATR is still converging, and process_signal reads
+                    # supertrend_ready as ready when the column is missing —
+                    # so the marker must be set here too, or the warm-up bar
+                    # would be reported as a genuine direction.
+                    frame["supertrend_ready"] = np.arange(len(frame)) >= int(period)
                     st_dir_found = True
 
         if not st_dir_found:
@@ -119,6 +126,9 @@ class RamJetSignalProcessor:
             frame["h_pc_st"] = (frame["high"] - frame["close"].shift(1)).abs()
             frame["l_pc_st"] = (frame["low"] - frame["close"].shift(1)).abs()
             frame["tr_st"] = frame[["h_l_st", "h_pc_st", "l_pc_st"]].max(axis=1)
+            # First bar has no previous close: seed its TR with high - low so
+            # the ATR recursion starts from a real range, not 0.
+            frame["tr_st"] = frame["tr_st"].fillna(frame["h_l_st"])
             frame["atr_st"] = frame["tr_st"].ewm(alpha=1 / period, adjust=False).mean()
 
             basic_upper = (hl2 + (multiplier * frame["atr_st"])).to_numpy()
@@ -128,7 +138,12 @@ class RamJetSignalProcessor:
             n_rows = len(frame)
             final_upper = np.full(n_rows, np.nan)
             final_lower = np.full(n_rows, np.nan)
-            supertrend = np.ones(n_rows, dtype=bool)
+            # Fail-closed seeding (Cleanup #35): before the ATR has enough
+            # data the Supertrend direction is unknown and is reported as
+            # bearish/False. The old code seeded an all-True array, so early
+            # bars compared close against uninitialized zero bands and
+            # reported a green Supertrend derived from nothing.
+            supertrend = np.zeros(n_rows, dtype=bool)
 
             first_valid_idx = 0
             for i in range(n_rows):
@@ -139,6 +154,9 @@ class RamJetSignalProcessor:
             if n_rows > first_valid_idx:
                 final_upper[first_valid_idx] = basic_upper[first_valid_idx]
                 final_lower[first_valid_idx] = basic_lower[first_valid_idx]
+                supertrend[first_valid_idx] = bool(
+                    close[first_valid_idx] >= final_lower[first_valid_idx]
+                )
 
             for i in range(first_valid_idx + 1, n_rows):
                 if basic_upper[i] < final_upper[i - 1] or close[i - 1] > final_upper[i - 1]:
@@ -158,6 +176,16 @@ class RamJetSignalProcessor:
                     supertrend[i] = close[i] >= final_upper[i]
 
             frame["supertrend"] = supertrend
+            # Warm-up marker (Pre-mortem strategies #3, PR #61): with the
+            # fail-closed zero seed, "not yet computable" and "bearish" are
+            # indistinguishable in the bool column. supertrend_ready is False
+            # until the recursion has period bars of history after the first
+            # computable bar; consumers (e.g. the trailing-stop flip workflow)
+            # must not treat pre-warmup values as a genuine direction.
+            warmup_bars = max(int(period), 1)
+            frame["supertrend_ready"] = (
+                np.arange(n_rows) >= first_valid_idx + warmup_bars
+            )
             frame = frame.drop(
                 columns=["h_l_st", "h_pc_st", "l_pc_st", "tr_st", "atr_st"],
                 errors="ignore",
@@ -199,6 +227,18 @@ class RamJetSignalProcessor:
         stop_loss = entry_price - (atr_value * self.sl_multiplier)
         take_profit = entry_price + (atr_value * self.tp1_multiplier)
         latest_supertrend_green = bool(frame["supertrend"].iloc[-1])
+        # False while the frame is shorter than the Supertrend warm-up: in that
+        # regime supertrend=False means "unknown", not "bearish", so consumers
+        # of supertrend_green_at_entry / the trailing flip workflow must not
+        # read a direction into it. Both Supertrend paths above set the marker
+        # (the pandas_ta branch for the library's own warm-up, the fallback for
+        # the fail-closed zero seed), so a missing column is unexpected and
+        # stays fail-closed instead of silently reporting ready.
+        supertrend_ready = (
+            bool(frame["supertrend_ready"].iloc[-1])
+            if "supertrend_ready" in frame.columns
+            else False
+        )
 
         timeframe = _resolve_timeframe(raw_signal.get("timeframe")) or self.default_timeframe
 
@@ -220,6 +260,7 @@ class RamJetSignalProcessor:
                 "tp1_price": take_profit,
                 "tp1_exit_percent": self.tp1_exit_percent,
                 "supertrend_green_at_entry": latest_supertrend_green,
+                "supertrend_ready": supertrend_ready,
                 "trailing_sl_config": {
                     "mode": "supertrend_flip",
                     "breakeven_after_tp1": True,
