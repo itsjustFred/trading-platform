@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import math
 import os
 import re
 from collections.abc import Mapping
@@ -9,6 +10,9 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 from uuid import UUID
+
+from alpaca.trading.enums import OrderClass
+from alpaca.trading.requests import StopLossRequest, TakeProfitRequest
 
 from live_runner.base_adapter import BaseLiveAdapter
 from risk.live import size_live_signal
@@ -29,6 +33,9 @@ logger = get_logger("live-runner")
 
 _ALPACA_ACC_RE = re.compile(r"^ALPACA_API_KEY_ACC(?P<index>\d+)$")
 
+_SL_METADATA_KEYS = ("stop_loss", "sl_price", "stop_price", "resolved_stop_loss")
+_TP_METADATA_KEYS = ("take_profit", "tp_price")
+
 
 def _parse_bool_env(value: str | None, default: bool = True) -> bool:
     if value is None:
@@ -45,6 +52,21 @@ def _to_float(value: Any, *, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _resolve_optional_float(metadata: Mapping[str, Any], keys: tuple[str, ...]) -> float | None:
+    """Return the first parseable positive-precision float from metadata keys."""
+    for key in keys:
+        if key not in metadata:
+            continue
+        value = metadata.get(key)
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
 
 
 def _to_datetime(value: Any) -> datetime:
@@ -364,15 +386,15 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
 
     def _load_alpaca_order_types(
         self,
-    ) -> tuple[Any, Any, Any, Any]:
+    ) -> tuple[Any, Any, Any]:
         try:
             from alpaca.trading.enums import OrderSide, TimeInForce
-            from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest
+            from alpaca.trading.requests import MarketOrderRequest
         except ModuleNotFoundError as exc:
             raise RuntimeError(
                 "alpaca-py is required for AlpacaLiveAdapter. Install package 'alpaca-py'."
             ) from exc
-        return OrderSide, TimeInForce, LimitOrderRequest, MarketOrderRequest
+        return OrderSide, TimeInForce, MarketOrderRequest
 
     async def _recover_existing_signal_order(
         self,
@@ -418,6 +440,40 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         )
         return recovered_order_id
 
+    def _resolve_broker_sl_tp(self, signal: LiveSignal) -> tuple[float, float]:
+        """Resolve absolute SL/TP prices from signal metadata.
+
+        Fail closed: sizing divided the risk budget by the stop distance, so an
+        order without SL/TP would open an unbounded position. Exit-only orders
+        (risk_sizing_mode == 'exit_only') close an existing position, reduce
+        exposure and legitimately carry no SL/TP — the guard applies to
+        opening orders only.
+        """
+        metadata = signal.metadata or {}
+        stop_loss = _resolve_optional_float(metadata, _SL_METADATA_KEYS)
+        take_profit = _resolve_optional_float(metadata, _TP_METADATA_KEYS)
+        exit_only = str(metadata.get("risk_sizing_mode") or "") == "exit_only"
+        missing = [
+            name
+            for name, value in (("stop_loss", stop_loss), ("take_profit", take_profit))
+            if value is None
+        ]
+        if missing and not exit_only:
+            raise ValueError(
+                "Refusing to submit Alpaca order without "
+                f"{' and '.join(missing)} (signal_id={signal.id}, "
+                f"symbol={signal.symbol}); opening an unbounded position is not allowed."
+            )
+        if missing:
+            return float("nan"), float("nan")
+        for name, value in (("stop_loss", stop_loss), ("take_profit", take_profit)):
+            if math.isnan(value) or math.isinf(value) or value <= 0:
+                raise ValueError(
+                    f"Invalid {name} price for {signal.symbol}: {value!r}; "
+                    "refusing to submit."
+                )
+        return float(stop_loss), float(take_profit)
+
     def _build_order_request(
         self,
         signal: LiveSignal,
@@ -425,33 +481,41 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         qty: float,
         order_side: Any,
         time_in_force: Any,
-        limit_request_cls: Any,
         market_request_cls: Any,
         client_order_id: str,
     ) -> Any:
+        if signal.action not in {"buy", "sell"}:
+            # Fail closed: an unmapped action must never fall through to SELL.
+            raise ValueError(f"Unsupported signal action: {signal.action}")
+        stop_loss_price, take_profit_price = self._resolve_broker_sl_tp(signal)
         extended_hours = bool((signal.metadata or {}).get("extended_hours"))
         limit_price = _to_float((signal.metadata or {}).get("limit_price"), default=0.0)
-        if extended_hours:
-            if limit_price <= 0:
-                raise ValueError(
-                    "Extended-hours orders require a positive 'limit_price' in "
-                    "signal metadata."
-                )
-            return limit_request_cls(
-                symbol=signal.symbol,
-                qty=qty,
-                side=order_side.BUY if signal.action == "buy" else order_side.SELL,
-                time_in_force=time_in_force.DAY,
-                extended_hours=True,
-                limit_price=limit_price,
-                client_order_id=client_order_id,
+        if signal.action == "buy":
+            side = order_side.BUY
+        else:
+            side = order_side.SELL
+        exit_only = str((signal.metadata or {}).get("risk_sizing_mode") or "") == "exit_only"
+        if extended_hours and not exit_only:
+            # The broker rejects bracket orders with extended_hours enabled
+            # ("bracket order has non-zero extended_hours value", HTTP 422), and
+            # OTO bracket legs cannot execute outside regular hours anyway.
+            # Fail closed rather than silently dropping the SL/TP the risk
+            # sizing assumed: the caller must choose bounded-hours bracket or
+            # naked extended-hours — and naked entries are not allowed.
+            raise ValueError(
+                "Extended-hours entry with mandatory SL/TP is not supported: "
+                "the broker rejects bracket orders with extended_hours enabled "
+                f"(signal_id={signal.id}, symbol={signal.symbol})."
             )
         return market_request_cls(
-            symbol=signal.symbol,
-            qty=qty,
-            side=order_side.BUY if signal.action == "buy" else order_side.SELL,
             time_in_force=time_in_force.DAY,
             extended_hours=False,
+            order_class=OrderClass.SIMPLE if exit_only else OrderClass.BRACKET,
+            take_profit=None if exit_only else TakeProfitRequest(limit_price=take_profit_price),
+            stop_loss=None if exit_only else StopLossRequest(stop_price=stop_loss_price),
+            symbol=signal.symbol,
+            qty=qty,
+            side=side,
             client_order_id=client_order_id,
         )
 
@@ -486,12 +550,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 f"(risk_percent={sized_order.risk_percent:.4f})."
             )
 
-        (
-            order_side,
-            time_in_force,
-            limit_request_cls,
-            market_request_cls,
-        ) = self._load_alpaca_order_types()
+        order_side, time_in_force, market_request_cls = self._load_alpaca_order_types()
 
         canonical_signal_id, created = await asyncio.to_thread(save_live_signal, signal)
         if not created:
@@ -504,7 +563,6 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             qty=qty,
             order_side=order_side,
             time_in_force=time_in_force,
-            limit_request_cls=limit_request_cls,
             market_request_cls=market_request_cls,
             client_order_id=canonical_signal_id,
         )

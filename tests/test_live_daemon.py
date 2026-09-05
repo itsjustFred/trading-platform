@@ -533,3 +533,246 @@ def test_stockkit_route_guard_rejects_mismatched_signal_metadata() -> None:
         deployment,
         {"discord_bot_name": "NITRO"},
     )
+
+
+# ── Cleanup 15-A: PAUSE must stop live trading from stale snapshots ───────────
+
+
+class _SignalSubmittingAdapter:
+    def __init__(self) -> None:
+        self.submitted: list[object] = []
+
+    async def connect(self) -> None:
+        return None
+
+    async def submit_order(self, signal) -> str:
+        self.submitted.append(signal)
+        return "order-1"
+
+    async def get_balance(self):
+        return 100_000.0, 100_000.0
+
+    async def get_positions(self):
+        return []
+
+
+def _discord_deployment(status: str = "ACTIVE") -> LiveDeploymentConfig:
+    return LiveDeploymentConfig(
+        id="11111111-1111-1111-1111-111111111111",
+        strategy_name="discord::ramjet",
+        account_id="acc-1",
+        symbols=["AAPL"],
+        timeframe="1h",
+        status=status,
+        signal_source="discord",
+        signal_source_type="discord",
+        signal_config={"channel_id": "channel-1"},
+    )
+
+
+def test_active_discord_deployments_exclude_paused_and_stopped() -> None:
+    deployments = [
+        _discord_deployment("ACTIVE"),
+        _discord_deployment("PAUSED"),
+        _discord_deployment("STOPPED"),
+    ]
+
+    active = daemon._active_discord_deployments_for_account("acc-1", deployments)
+
+    assert [deployment.status for deployment in active] == ["ACTIVE"]
+
+
+def _trade_signal() -> object:
+    from risk import TradeSignal
+
+    return TradeSignal(
+        action="buy",
+        symbol="AAPL",
+        entry_price=200.0,
+        stop_loss=195.0,
+        take_profit=210.0,
+        timeframe="1h",
+        metadata={"discord_channel_id": "channel-1"},
+    )
+
+
+def test_paused_deployment_snapshot_is_rejected_at_dispatch(monkeypatch) -> None:
+    """A stale snapshot must not trade: PAUSE is checked against the DB at dispatch."""
+    adapter = _SignalSubmittingAdapter()
+    stale = _discord_deployment("PAUSED")
+
+    def _forbid_refresh(_deployment_id: str):
+        pytest.fail("paused deployment must be rejected before any DB refresh")
+
+    monkeypatch.setattr(daemon, "get_live_deployment", _forbid_refresh)
+    consulted: list[str] = []
+    monkeypatch.setattr(
+        daemon,
+        "_deployment_is_currently_active",
+        lambda deployment: consulted.append(str(deployment.id)) or False,
+    )
+
+    async def _no_wait(_signal, _timeframe):
+        return None
+
+    monkeypatch.setattr(daemon, "wait_for_candle_close", _no_wait)
+
+    asyncio.run(
+        daemon._dispatch_discord_trade_signal(
+            "acc-1",
+            adapter,
+            [stale],
+            _trade_signal(),
+            accounts_env_values={},
+        )
+    )
+
+    assert adapter.submitted == []
+    assert consulted == [str(stale.id)]
+
+
+def test_active_deployment_trades_after_status_recheck(monkeypatch) -> None:
+    adapter = _SignalSubmittingAdapter()
+    deployment = _discord_deployment("ACTIVE")
+
+    monkeypatch.setattr(
+        daemon,
+        "get_live_deployment",
+        lambda deployment_id: _discord_deployment("ACTIVE"),
+    )
+
+    async def _no_wait(_signal, _timeframe):
+        return None
+
+    monkeypatch.setattr(daemon, "wait_for_candle_close", _no_wait)
+
+    asyncio.run(
+        daemon._dispatch_discord_trade_signal(
+            "acc-1",
+            adapter,
+            [deployment],
+            _trade_signal(),
+            accounts_env_values={},
+        )
+    )
+
+    assert len(adapter.submitted) == 1
+
+
+def test_deployment_paused_between_snapshot_and_dispatch_is_not_traded(
+    monkeypatch,
+) -> None:
+    """Snapshot says ACTIVE but the DB now says PAUSED: refuse to trade."""
+    adapter = _SignalSubmittingAdapter()
+    deployment = _discord_deployment("ACTIVE")
+
+    monkeypatch.setattr(
+        daemon,
+        "get_live_deployment",
+        lambda deployment_id: _discord_deployment("PAUSED"),
+    )
+
+    async def _no_wait(_signal, _timeframe):
+        return None
+
+    monkeypatch.setattr(daemon, "wait_for_candle_close", _no_wait)
+
+    asyncio.run(
+        daemon._dispatch_discord_trade_signal(
+            "acc-1",
+            adapter,
+            [deployment],
+            _trade_signal(),
+            accounts_env_values={},
+        )
+    )
+
+    assert adapter.submitted == []
+
+
+def test_stale_deployment_removed_from_db_is_not_traded(monkeypatch) -> None:
+    adapter = _SignalSubmittingAdapter()
+    deployment = _discord_deployment("ACTIVE")
+
+    monkeypatch.setattr(daemon, "get_live_deployment", lambda _deployment_id: None)
+
+    async def _no_wait(_signal, _timeframe):
+        return None
+
+    monkeypatch.setattr(daemon, "wait_for_candle_close", _no_wait)
+
+    asyncio.run(
+        daemon._dispatch_discord_trade_signal(
+            "acc-1",
+            adapter,
+            [deployment],
+            _trade_signal(),
+            accounts_env_values={},
+        )
+    )
+
+    assert adapter.submitted == []
+
+
+def test_deployment_with_unknown_status_is_not_traded(monkeypatch) -> None:
+    """Deny-by-default: a status outside ACTIVE/PAUSED/STOPPED must not trade.
+
+    Pins that _normalize_deployment_status's UNKNOWN fallback keeps
+    _deployment_is_currently_active fail-closed when a new status value
+    appears upstream before live_runner learns about it.
+    """
+    adapter = _SignalSubmittingAdapter()
+    deployment = _discord_deployment("ACTIVE")
+
+    monkeypatch.setattr(
+        daemon,
+        "get_live_deployment",
+        lambda deployment_id: _discord_deployment("MAINTENANCE"),
+    )
+
+    async def _no_wait(_signal, _timeframe):
+        return None
+
+    monkeypatch.setattr(daemon, "wait_for_candle_close", _no_wait)
+
+    asyncio.run(
+        daemon._dispatch_discord_trade_signal(
+            "acc-1",
+            adapter,
+            [deployment],
+            _trade_signal(),
+            accounts_env_values={},
+        )
+    )
+
+    assert adapter.submitted == []
+
+
+def test_deployment_paused_during_candle_close_wait_is_not_traded(monkeypatch) -> None:
+    """The pre-wait recheck passes, the deployment is paused during the
+    candle-close wait, and the post-wait recheck must refuse to trade."""
+    adapter = _SignalSubmittingAdapter()
+    deployment = _discord_deployment("ACTIVE")
+    statuses = iter(["ACTIVE", "PAUSED"])
+
+    def _status_after_each_recheck(_deployment_id):
+        return _discord_deployment(next(statuses))
+
+    monkeypatch.setattr(daemon, "get_live_deployment", _status_after_each_recheck)
+
+    async def _no_wait(_signal, _timeframe):
+        return None
+
+    monkeypatch.setattr(daemon, "wait_for_candle_close", _no_wait)
+
+    asyncio.run(
+        daemon._dispatch_discord_trade_signal(
+            "acc-1",
+            adapter,
+            [deployment],
+            _trade_signal(),
+            accounts_env_values={},
+        )
+    )
+
+    assert adapter.submitted == []

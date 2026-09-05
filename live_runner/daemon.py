@@ -32,6 +32,7 @@ from risk import RiskConfig, RiskEngine, TradeSignal
 from scheduler.scheduler import ServiceScheduler
 from shared.database import (
     create_service,
+    get_live_deployment,
     list_live_accounts,
     list_live_deployments,
     list_services,
@@ -514,7 +515,9 @@ def size_live_signal_for_submission(
     metadata: dict[str, object] = dict(signal.metadata or {})
     if current_positions is not None:
         metadata["current_positions"] = int(current_positions)
-    stop_loss = _first_metadata_float(metadata, ("stop_loss", "sl_price", "stop_price"))
+    stop_loss = _first_metadata_float(
+        metadata, ("stop_loss", "sl_price", "stop_price", "resolved_stop_loss")
+    )
     take_profit = _first_metadata_float(metadata, ("take_profit", "tp_price"))
     resolved_timeframe = (
         str(metadata.get("timeframe") or deployment.timeframe).strip() or deployment.timeframe
@@ -636,9 +639,13 @@ async def submit_order_with_risk(
 ) -> str:
     metadata = dict(signal.metadata or {})
     if signal.action == "sell" and bool(metadata.get("exit_only")):
+        # Exit-only orders close an existing position at the broker-observed
+        # quantity. They bypass risk sizing and the entry fail-closed SL/TP
+        # guard: they reduce exposure instead of opening a new position.
         metadata = await _metadata_for_exit_only_order(signal, adapter, metadata)
-        return await adapter.submit_order(signal.model_copy(update={"metadata": metadata}))
-
+        return await adapter.submit_order(
+            signal.model_copy(update={"metadata": metadata})
+        )
     # Feed broker truth into sizing so max_positions / max_total_exposure actually
     # bind. Without this, every signal is sized as if the account were flat.
     open_positions_count, broker_exposure = await _broker_exposure_estimate(
@@ -653,6 +660,62 @@ async def submit_order_with_risk(
         pip_value=pip_value,
         current_positions=open_positions_count,
     )
+    # Sizing may have resolved a fallback stop (ATR/percent). Persist that
+    # resolution so the broker order carries the stop sizing actually assumed,
+    # and derive the take profit from the same geometry (1:1 risk-reward) so a
+    # signal without an explicit TP still opens a bounded bracket at the broker.
+    sized_metadata = dict(sized_signal.metadata or {})
+    if "resolved_stop_loss" in sized_metadata:
+        metadata["stop_loss"] = float(sized_metadata["resolved_stop_loss"])
+    stop_loss = _first_metadata_float(
+        metadata, ("stop_loss", "sl_price", "stop_price", "resolved_stop_loss")
+    )
+    take_profit = _first_metadata_float(metadata, ("take_profit", "tp_price"))
+    if take_profit is None and stop_loss is not None:
+        risk_distance = abs(float(signal.theoretical_price) - float(stop_loss))
+        reward_distance = risk_distance * (
+            float(sized_metadata.get("risk_reward_ratio") or 1.0)
+        )
+        take_profit = (
+            float(signal.theoretical_price) + reward_distance
+            if signal.action == "buy"
+            else float(signal.theoretical_price) - reward_distance
+        )
+    # Fail closed: sizing divides the risk budget by the stop distance, so an
+    # order without SL/TP would be sized on an invented distance and open an
+    # unbounded position. Both broker adapters enforce the same guard.
+    missing: list[str] = []
+    if stop_loss is None:
+        missing.append("stop loss")
+    if take_profit is None:
+        missing.append("take profit")
+    if missing:
+        raise ValueError(
+            "Refusing to submit live order without "
+            f"{' and '.join(missing)} (deployment_id={deployment.id}, "
+            f"symbol={signal.symbol}); opening an unbounded position is "
+            "not allowed."
+        )
+    metadata["stop_loss"] = float(stop_loss)
+    metadata["take_profit"] = float(take_profit)
+    # Overlay the resolved SL/TP onto the SIZED metadata. The sized values for
+    # qty/explicit_qty/risk_* must win: letting incoming metadata re-override
+    # them would let a signal's self-declared qty bypass the risk sizing
+    # entirely. All other (non-sizing) incoming keys are preserved.
+    sizing_keys = frozenset({
+        "qty",
+        "explicit_qty",
+        "risk_amount",
+        "risk_percent",
+        "risk_reward_ratio",
+        "risk_timeframe",
+        "current_positions",
+    })
+    preserved_metadata = {
+        key: value for key, value in metadata.items() if key not in sizing_keys
+    }
+    final_metadata = {**sized_metadata, **preserved_metadata}
+    sized_signal = sized_signal.model_copy(update={"metadata": final_metadata})
     return await adapter.submit_order(sized_signal)
 
 
@@ -670,11 +733,25 @@ def _trade_signal_to_live_signal(
     if signal.action in {"sell", "short"} and not _deployment_allows_short(deployment):
         metadata["exit_only"] = True
         metadata["risk_sizing_mode"] = "exit_only"
+    # Whitelist at the conversion site itself (B-2): never default an unmapped
+    # action to SELL. The TradeSignal Literal gates construction today, but a
+    # future loosening (e.g. adding "close") must not silently become a live
+    # short — reject it here with a structured reason.
+    if signal.action in {"buy", "long"}:
+        live_action = "buy"
+    elif signal.action in {"sell", "short"}:
+        live_action = "sell"
+    else:
+        raise ValueError(
+            f"Unsupported signal action at conversion: {signal.action!r} "
+            f"(symbol={signal.symbol}); refusing to "
+            "default it to a live order side."
+        )
     return LiveSignal(
         id=uuid.uuid4(),
         deployment_id=str(deployment.id),
         symbol=signal.symbol,
-        action="buy" if signal.action in {"buy", "long"} else "sell",
+        action=live_action,
         theoretical_price=float(signal.entry_price),
         timestamp=datetime.now(timezone.utc),
         metadata=metadata,
@@ -692,6 +769,58 @@ def _active_discord_deployments_for_account(
         and _normalize_deployment_status(deployment.status) == "ACTIVE"
         and str(deployment.signal_source or "internal").lower() == "discord"
     ]
+
+
+def _deployment_is_currently_active(deployment: LiveDeploymentConfig) -> bool:
+    """Re-check deployment status against the DB right before submitting.
+
+    The listener holds a snapshot taken when the sync loop last ran. If an
+    operator pauses or stops one deployment on an account whose other Discord
+    deployments stay active, the stale snapshot would keep the paused
+    deployment trading until the next poll. The DB read here is the
+    authority at the moment an order is actually dispatched.
+    """
+    try:
+        current = get_live_deployment(str(deployment.id))
+    except Exception as exc:
+        logger.warning(
+            "Deployment status recheck failed; refusing to trade from stale snapshot",
+            extra={
+                "data": {
+                    "deployment_id": str(deployment.id),
+                    "account_id": deployment.account_id,
+                    "snapshot_status": deployment.status,
+                    "error": str(exc),
+                }
+            },
+        )
+        return False
+    if current is None:
+        logger.info(
+            "Deployment removed from DB; refusing to trade from stale snapshot",
+            extra={
+                "data": {
+                    "deployment_id": str(deployment.id),
+                    "account_id": deployment.account_id,
+                    "snapshot_status": deployment.status,
+                }
+            },
+        )
+        return False
+    if _normalize_deployment_status(current.status) != "ACTIVE":
+        logger.info(
+            "Deployment is not ACTIVE; refusing to trade from stale snapshot",
+            extra={
+                "data": {
+                    "deployment_id": str(deployment.id),
+                    "account_id": deployment.account_id,
+                    "snapshot_status": deployment.status,
+                    "current_status": current.status,
+                }
+            },
+        )
+        return False
+    return True
 
 
 def _group_discord_deployments_by_channel(
@@ -793,6 +922,23 @@ async def _submit_normalized_discord_signal(
             normalized_signal.timeframe or signal_timeframe,
         )
 
+    # Re-check after the candle-close wait: the wait can span minutes, and the
+    # pre-dispatch snapshot was taken before it. A deployment paused during the
+    # wait window must not trade at the candle-close price.
+    if not _deployment_is_currently_active(deployment):
+        logger.info(
+            "Skipping discord signal: deployment left ACTIVE during candle-close wait",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "deployment_id": str(deployment.id),
+                    "symbol": trade_signal.symbol,
+                    "snapshot_status": deployment.status,
+                }
+            },
+        )
+        return
+
     live_signal = _trade_signal_to_live_signal(normalized_signal, deployment)
     try:
         broker_order_id = await submit_order_with_risk(adapter, deployment, live_signal)
@@ -834,6 +980,8 @@ async def _dispatch_discord_trade_signal(
     accounts_env_values: Mapping[str, str],
 ) -> None:
     for deployment in deployments_for_channel:
+        if not _deployment_is_currently_active(deployment):
+            continue
         if not _deployment_matches_stockkit_route(deployment, trade_signal.metadata):
             continue
         if not _deployment_covers_discord_symbol(deployment, trade_signal.symbol):

@@ -14,6 +14,7 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from uuid import UUID, uuid4
@@ -95,10 +96,10 @@ def test_fallback_stop_is_below_entry_for_buys_and_above_for_sells():
         signal=sell, account_balance=10_000.0, pip_value=1.0, current_exposure=0.0
     )
 
-    assert buy.stop_loss is not None
-    assert buy.stop_loss < buy.entry_price
-    assert sell.stop_loss is not None
-    assert sell.stop_loss > sell.entry_price
+    assert buy.stop_loss is not None, "the long leg must carry a stop loss"
+    assert buy.stop_loss < buy.entry_price, "a long stop must sit below entry"
+    assert sell.stop_loss is not None, "the short leg must carry a stop loss"
+    assert sell.stop_loss > sell.entry_price, "a short stop must sit above entry"
 
 
 def test_fallback_stop_without_atr_is_percent_of_price():
@@ -178,7 +179,7 @@ def _live_signal(deployment: LiveDeploymentConfig) -> LiveSignal:
         action="buy",
         theoretical_price=100.0,
         timestamp=datetime.now(timezone.utc),
-        metadata={"stop_loss": 95.0},
+        metadata={"stop_loss": 95.0, "take_profit": 110.0},
     )
 
 
@@ -231,11 +232,122 @@ def test_submit_order_with_risk_sizes_normally_when_flat():
     assert adapter.submitted_signal.metadata["qty"] == pytest.approx(200.0)
 
 
-def _submit_signal(adapter, signal):
-    """Single possibly-throwing invocation for S5778-clean exception tests:
-    ``pytest.raises`` blocks below call this helper instead of nesting
-    ``asyncio.run`` inside argument construction."""
-    return asyncio.run(adapter.submit_order(signal))
+def test_submit_order_with_risk_fails_closed_without_resolved_stop(monkeypatch):
+    """A position sized against a computed stop must not open naked at the broker.
+
+    The risk engine resolves a fallback stop (ATR/percent) when the signal carries
+    none. The fail-closed guard fires when sizing produced no resolvable stop/TP —
+    simulated here by a sizing regression — so a future contract change cannot
+    silently reopen unbounded positions.
+    """
+    import live_runner.daemon as daemon_module
+
+    def _sizing_without_stop(signal, deployment, **_kwargs):
+        return signal.model_copy(
+            update={"metadata": {**signal.metadata, "qty": 1.0, "explicit_qty": 1.0}}
+        )
+
+    monkeypatch.setattr(
+        daemon_module, "size_live_signal_for_submission", _sizing_without_stop
+    )
+    from live_runner.daemon import submit_order_with_risk
+
+    deployment = _deployment()
+    adapter = _PositionsAdapter(positions=[])
+    sized_signal = LiveSignal(
+        deployment_id=str(deployment.id),
+        symbol="EURUSD",
+        action="buy",
+        theoretical_price=100.0,
+        timestamp=datetime.now(timezone.utc),
+        metadata={},
+    )
+
+    submit = submit_order_with_risk(adapter, deployment, sized_signal)
+    with pytest.raises(ValueError, match="stop loss"):
+        asyncio.run(submit)
+
+    assert adapter.submitted_signal is None
+
+
+def test_submit_order_with_risk_does_not_let_incoming_qty_override_sizing():
+    """A self-declared qty in the signal metadata must not bypass the risk
+    sizing: the sized qty/explicit_qty win, unrelated keys are preserved."""
+    from live_runner.daemon import submit_order_with_risk
+
+    deployment = _deployment()
+    adapter = _PositionsAdapter(positions=[])
+
+    asyncio.run(
+        submit_order_with_risk(
+            adapter,
+            deployment,
+            _live_signal(deployment).model_copy(
+                update={
+                    "metadata": {
+                        "qty": 999_999.0,
+                        "note": "hello",
+                        "stop_loss": 95.0,
+                        "take_profit": 110.0,
+                    }
+                }
+            ),
+        )
+    )
+
+    submitted = adapter.submitted_signal
+    assert submitted is not None
+    assert submitted.metadata["qty"] == pytest.approx(200.0)
+    assert submitted.metadata["explicit_qty"] == pytest.approx(200.0)
+    assert submitted.metadata["note"] == "hello"
+    assert submitted.metadata["stop_loss"] == pytest.approx(95.0)
+    assert submitted.metadata["take_profit"] == pytest.approx(110.0)
+
+
+def test_submit_order_with_risk_resolves_stop_for_stopless_signals():
+    """A stopless signal is sized on the engine's fallback stop and the broker
+    order carries that resolved stop plus a 1:1 take profit."""
+    from live_runner.daemon import submit_order_with_risk
+
+    deployment = _deployment()
+    adapter = _PositionsAdapter(positions=[])
+    signal = LiveSignal(
+        deployment_id=str(deployment.id),
+        symbol="EURUSD",
+        action="buy",
+        theoretical_price=100.0,
+        timestamp=datetime.now(timezone.utc),
+        metadata={},
+    )
+
+    asyncio.run(submit_order_with_risk(adapter, deployment, signal, pip_value=1.0))
+
+    assert adapter.submitted_signal is not None
+    metadata = adapter.submitted_signal.metadata
+    assert metadata["qty"] == pytest.approx(500.0)  # 10 / (2 * 1) on 1% of 100k
+    assert metadata["stop_loss"] == pytest.approx(98.0)
+    assert metadata["take_profit"] == pytest.approx(102.0)
+
+
+def test_submit_order_with_risk_forwards_sl_tp_to_broker_metadata():
+    """The broker adapter must receive the computed SL/TP, not just the risk stats."""
+    from live_runner.daemon import submit_order_with_risk
+
+    deployment = _deployment()
+    adapter = _PositionsAdapter(positions=[])
+
+    asyncio.run(
+        submit_order_with_risk(
+            adapter,
+            deployment,
+            _live_signal(deployment),
+            pip_value=1.0,
+        )
+    )
+
+    assert adapter.submitted_signal is not None
+    assert adapter.submitted_signal.metadata["stop_loss"] == pytest.approx(95.0)
+    assert adapter.submitted_signal.metadata["take_profit"] == pytest.approx(110.0)
 
 
 def test_alpaca_submit_order_blocks_non_positive_quantity(monkeypatch):
@@ -266,70 +378,50 @@ def test_alpaca_submit_order_blocks_non_positive_quantity(monkeypatch):
     )
 
     with pytest.raises(ValueError, match="non-positive quantity"):
-        _submit_signal(adapter, signal)
+        asyncio.run(adapter.submit_order(signal))
 
 
-def test_alpaca_extended_hours_without_positive_limit_price_raises(monkeypatch):
-    """Alpaca only accepts extended-hours sessions as LIMIT orders; a market
-    request flagged extended_hours=True is rejected by the broker and strands
-    the signal."""
+def test_alpaca_extended_hours_entries_fail_closed():
+    """The broker rejects bracket orders with extended_hours enabled ("bracket
+    order has non-zero extended_hours value", HTTP 422), and dropping the
+    SL/TP to work around it would open an unbounded position. Extended-hours
+    entries must therefore fail closed at the request builder."""
     from live_runner import alpaca_adapter as module
 
     adapter = module.AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True)
-    market_requests: list[Any] = []
 
-    def _market_request_cls(**kwargs):
-        market_requests.append(kwargs)
-        return SimpleNamespace(kind="market")
-
-    def _fail_limit_request_cls(**_kwargs):
-        pytest.fail("limit order must not be constructed without limit_price")
+    def _fail_request_cls(**_kwargs):
+        pytest.fail("no broker request may be constructed for extended-hours entries")
 
     base_kwargs = dict(
         qty=1.0,
         order_side=SimpleNamespace(BUY="buy", SELL="sell"),
         time_in_force=SimpleNamespace(DAY="day"),
-        limit_request_cls=_fail_limit_request_cls,
-        market_request_cls=_market_request_cls,
+        market_request_cls=_fail_request_cls,
         client_order_id="cid-eh",
     )
-    missing_limit = LiveSignal(
+    with_limit = LiveSignal(
         deployment_id="dep-1",
         symbol="AAPL",
         action="buy",
         theoretical_price=100.0,
         timestamp=datetime.now(timezone.utc),
-        metadata={"qty": 1.0, "extended_hours": True},
-    )
-    non_positive_limit = LiveSignal(
-        deployment_id="dep-1",
-        symbol="AAPL",
-        action="sell",
-        theoretical_price=100.0,
-        timestamp=datetime.now(timezone.utc),
-        metadata={"qty": 1.0, "extended_hours": True, "limit_price": -1.5},
+        metadata={"qty": 1.0, "extended_hours": True, "limit_price": 101.5, "stop_loss": 95.0, "take_profit": 110.0},
     )
 
-    with pytest.raises(ValueError, match="positive 'limit_price'"):
-        adapter._build_order_request(missing_limit, **base_kwargs)
-    with pytest.raises(ValueError, match="positive 'limit_price'"):
-        adapter._build_order_request(non_positive_limit, **base_kwargs)
-
-    # Nothing may reach the broker for the invalid signals.
-    assert market_requests == []
+    builder = adapter._build_order_request
+    with pytest.raises(ValueError, match="extended_hours"):
+        builder(with_limit, **base_kwargs)
 
 
-def test_alpaca_extended_hours_limit_and_regular_market_orders(monkeypatch):
-    """Valid extended-hours signals keep the LIMIT/DAY path; regular-session
-    signals always build market orders with extended_hours disabled."""
+def test_alpaca_regular_market_orders_carry_bracket_legs(monkeypatch):
+    """Regular-session signals always build market orders with extended_hours
+    disabled and the mandatory bracket legs attached."""
     from live_runner import alpaca_adapter as module
 
     adapter = module.AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True)
     order_side = SimpleNamespace(BUY="buy", SELL="sell")
     time_in_force = SimpleNamespace(DAY="day")
-
-    def _limit_request_cls(**kwargs):
-        return ("limit", kwargs)
 
     def _market_request_cls(**kwargs):
         return ("market", kwargs)
@@ -340,31 +432,9 @@ def test_alpaca_extended_hours_limit_and_regular_market_orders(monkeypatch):
             qty=2.0,
             order_side=order_side,
             time_in_force=time_in_force,
-            limit_request_cls=_limit_request_cls,
             market_request_cls=_market_request_cls,
             client_order_id=client_order_id,
         )
-
-    extended_hours = LiveSignal(
-        deployment_id="dep-1",
-        symbol="AAPL",
-        action="buy",
-        theoretical_price=100.0,
-        timestamp=datetime.now(timezone.utc),
-        metadata={"qty": 2.0, "extended_hours": True, "limit_price": 101.5},
-    )
-    assert _build(extended_hours, "cid-eh") == (
-        "limit",
-        {
-            "symbol": "AAPL",
-            "qty": 2.0,
-            "side": "buy",
-            "time_in_force": "day",
-            "extended_hours": True,
-            "limit_price": 101.5,
-            "client_order_id": "cid-eh",
-        },
-    )
 
     regular = LiveSignal(
         deployment_id="dep-1",
@@ -372,19 +442,17 @@ def test_alpaca_extended_hours_limit_and_regular_market_orders(monkeypatch):
         action="sell",
         theoretical_price=300.0,
         timestamp=datetime.now(timezone.utc),
-        metadata={"qty": 2.0},
+        metadata={"qty": 2.0, "stop_loss": 310.0, "take_profit": 280.0},
     )
-    assert _build(regular, "cid-regular") == (
-        "market",
-        {
-            "symbol": "MSFT",
-            "qty": 2.0,
-            "side": "sell",
-            "time_in_force": "day",
-            "extended_hours": False,
-            "client_order_id": "cid-regular",
-        },
-    )
+    market_kind, market_kwargs = _build(regular, "cid-regular")
+    assert market_kind == "market"
+    assert market_kwargs["symbol"] == "MSFT"
+    assert market_kwargs["qty"] == 2.0
+    assert market_kwargs["side"] == "sell"
+    assert market_kwargs["time_in_force"] == "day"
+    assert market_kwargs["extended_hours"] is False
+    assert market_kwargs["client_order_id"] == "cid-regular"
+    assert market_kwargs["order_class"] is module.OrderClass.BRACKET
 
 
 def test_alpaca_discord_redelivery_submits_once_with_canonical_signal_id(monkeypatch):
@@ -431,7 +499,7 @@ def test_alpaca_discord_redelivery_submits_once_with_canonical_signal_id(monkeyp
         action="buy",
         theoretical_price=100.0,
         timestamp=datetime(2026, 7, 15, 10, 0, tzinfo=timezone.utc),
-        metadata={"qty": 1.0, "discord_message_id": "discord-123"},
+        metadata={"qty": 1.0, "discord_message_id": "discord-123", "stop_loss": 95.0, "take_profit": 110.0},
     )
     redelivery = LiveSignal(
         id=uuid4(),
@@ -445,7 +513,7 @@ def test_alpaca_discord_redelivery_submits_once_with_canonical_signal_id(monkeyp
 
     assert asyncio.run(adapter.submit_order(first)) == "alpaca-order-1"
     with pytest.raises(RuntimeError, match="canonical signal already exists"):
-        _submit_signal(adapter, redelivery)
+        asyncio.run(adapter.submit_order(redelivery))
 
     assert len(submitted_requests) == 1
     assert submitted_requests[0].client_order_id == canonical_signal_id
@@ -558,7 +626,7 @@ def test_alpaca_broker_order_id_persistence_failure_is_not_success(monkeypatch):
         action="buy",
         theoretical_price=100.0,
         timestamp=datetime(2026, 7, 15, 10, 0, tzinfo=timezone.utc),
-        metadata={"qty": 1.0, "discord_message_id": "discord-456"},
+        metadata={"qty": 1.0, "discord_message_id": "discord-456", "stop_loss": 95.0, "take_profit": 110.0},
     )
     adapter._trading_client = SimpleNamespace(
         get_account=lambda: SimpleNamespace(cash="100000", equity="100000"),
@@ -584,7 +652,7 @@ def test_alpaca_broker_order_id_persistence_failure_is_not_success(monkeypatch):
     monkeypatch.setattr(module, "set_live_signal_broker_order_id", _fail_persistence)
 
     with pytest.raises(RuntimeError, match="Failed to persist Alpaca broker order id"):
-        _submit_signal(adapter, signal)
+        asyncio.run(adapter.submit_order(signal))
 
     assert persistence_calls == [(canonical_signal_id, "alpaca-order-2")]
 
@@ -603,12 +671,10 @@ def test_ctrader_volume_rejects_missing_and_below_minimum_qty():
             metadata=metadata,
         )
 
-    missing_qty = _signal({})
     with pytest.raises(ValueError, match="no positive quantity"):
-        adapter._resolve_order_volume(missing_qty)
-    below_minimum = _signal({"qty": 0.07})
+        adapter._resolve_order_volume(_signal({}))
     with pytest.raises(ValueError, match="below the broker minimum"):
-        adapter._resolve_order_volume(below_minimum)
+        adapter._resolve_order_volume(_signal({"qty": 0.07}))
     assert adapter._resolve_order_volume(_signal({"qty": 5.0})) == 5000
     assert adapter._resolve_order_volume(_signal({"ctrader_volume": 2000})) == 2000
     assert adapter._resolve_order_volume(_signal({"qty": 499.999, "ctrader_volume": 100000})) == 100000
@@ -630,12 +696,19 @@ def test_processor_market_data_refuses_synthetic_fabrication():
 
 
 @pytest.fixture
-def isolated_db(isolated_db_sandbox):
-    """Delegates to the shared sandbox fixture but yields the database module
-    directly, so these persistence tests keep their ``database = isolated_db``
-    style."""
-    database, _engine, _data_dir = isolated_db_sandbox
-    return database
+def isolated_db(monkeypatch, tmp_path: Path):
+    import shared.database as database
+
+    engine = database.create_engine(
+        f"sqlite:///{(tmp_path / 'test.db').as_posix()}",
+        connect_args={"check_same_thread": False},
+    )
+    database.event.listen(engine, "connect", database._configure_sqlite_connection)
+    monkeypatch.setattr(database, "ENGINE", engine)
+    monkeypatch.setattr(database, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(database, "_DB_INITIALIZED", False)
+    yield database
+    engine.dispose()
 
 
 def _persist_signal(database: Any) -> LiveSignal:
@@ -715,9 +788,6 @@ def test_save_live_signal_scopes_discord_claim_by_deployment(isolated_db):
 
 
 def _legacy_live_signal_table(database: Any, *, table_unique: bool = False) -> None:
-    """Drop any schema the sandbox pre-created, then lay down the legacy table
-    these migration tests start from."""
-    database.SQLModel.metadata.drop_all(database.ENGINE)
     unique_clause = ", UNIQUE(discord_message_id)" if table_unique else ""
     with database.ENGINE.begin() as connection:
         connection.execute(
@@ -1540,9 +1610,12 @@ def test_alpaca_reconcile_backfills_missing_fill(monkeypatch):
     assert saved[0][1] == 25.0
 
 
-def _paging_scenario(monkeypatch, module):
-    """Shared five-signal cursor-paging fixture for the two
-    ``reconcile_executions`` paging tests. Returns (signal_ids, cursors, queried)."""
+def test_alpaca_reconcile_pages_past_candidate_limit(monkeypatch):
+    from live_runner import alpaca_adapter as module
+
+    adapter = module.AlpacaLiveAdapter(
+        api_key="k", secret_key="s", paper=True, account_id="alpaca-acc-1"
+    )
     signal_ids = [str(uuid4()) for _ in range(5)]
     cursors = {
         signal_id: (datetime(2026, 7, 15, 10, minute, tzinfo=timezone.utc), signal_id)
@@ -1567,16 +1640,6 @@ def _paging_scenario(monkeypatch, module):
         lambda signal_id: cursors[signal_id],
         raising=False,
     )
-    return signal_ids, cursors, queried
-
-
-def test_alpaca_reconcile_pages_past_candidate_limit(monkeypatch):
-    from live_runner import alpaca_adapter as module
-
-    adapter = module.AlpacaLiveAdapter(
-        api_key="k", secret_key="s", paper=True, account_id="alpaca-acc-1"
-    )
-    signal_ids, cursors, queried = _paging_scenario(monkeypatch, module)
     monkeypatch.setattr(module, "get_live_signal_filled_qty", lambda _signal_id: 0.0)
     monkeypatch.setattr(
         module, "save_live_execution_up_to_cumulative", lambda execution, _cap: execution.filled_qty
@@ -1762,7 +1825,30 @@ def test_ctrader_reconcile_pages_past_candidate_limit(monkeypatch):
     module, adapter = _make_ctrader_adapter()
     adapter._client = object()
     adapter._authenticated = True
-    signal_ids, cursors, queried = _paging_scenario(monkeypatch, module)
+    signal_ids = [str(uuid4()) for _ in range(5)]
+    cursors = {
+        signal_id: (datetime(2026, 7, 15, 10, minute, tzinfo=timezone.utc), signal_id)
+        for minute, signal_id in enumerate(signal_ids)
+    }
+    queried: list[tuple[str, int, tuple[datetime, str] | None]] = []
+
+    def list_page(account_id, limit, *, before=None):
+        queried.append((account_id, limit, before))
+        if before is None:
+            return signal_ids[:2]
+        if before == cursors[signal_ids[1]]:
+            return signal_ids[2:4]
+        if before == cursors[signal_ids[3]]:
+            return signal_ids[4:]
+        return []
+
+    monkeypatch.setattr(module, "list_live_signal_ids_for_reconciliation", list_page)
+    monkeypatch.setattr(
+        module,
+        "get_live_signal_reconciliation_cursor",
+        lambda signal_id: cursors[signal_id],
+        raising=False,
+    )
     order_ids = {signal_id: str(45000 + index) for index, signal_id in enumerate(signal_ids)}
     monkeypatch.setattr(
         module, "get_live_signal_broker_order_id", lambda signal_id: order_ids[signal_id]
@@ -1961,10 +2047,8 @@ def test_ctrader_redelivery_with_persisted_order_id_needs_no_broker_connection(
     assert adapter._order_id_to_signal_id == {45678: str(signal.id)}
 
 
-def _make_ctrader_redelivery_adapter(monkeypatch, *, persist_result):
-    """Authenticated cTrader adapter with balance/sizing/persistence stubs —
-    shared by the two cTrader redelivery tests below. Yields (module, adapter,
-    signal) and lets the caller decide what ``save_live_signal`` returns."""
+def test_ctrader_redelivery_recovers_accepted_order_without_resubmitting(monkeypatch):
+    """A persisted signal with an accepted broker order must not submit twice."""
     module, adapter = _make_ctrader_adapter()
     adapter._client = object()
     adapter._connected = True
@@ -1989,15 +2073,7 @@ def _make_ctrader_redelivery_adapter(monkeypatch, *, persist_result):
         "size_live_signal",
         lambda _signal, *, account_balance: SimpleNamespace(risk_percent=0.01),
     )
-    monkeypatch.setattr(module, "save_live_signal", lambda _signal: persist_result)
-    return module, adapter, signal
-
-
-def test_ctrader_redelivery_recovers_accepted_order_without_resubmitting(monkeypatch):
-    """A persisted signal with an accepted broker order must not submit twice."""
-    module, adapter, signal = _make_ctrader_redelivery_adapter(
-        monkeypatch, persist_result=None
-    )
+    monkeypatch.setattr(module, "save_live_signal", lambda _signal: None)
     monkeypatch.setattr(module, "get_live_signal_broker_order_id", lambda _sid: "")
     monkeypatch.setattr(
         module,
@@ -2060,8 +2136,29 @@ def test_ctrader_redelivery_recovers_accepted_order_without_resubmitting(monkeyp
 
 def test_ctrader_accepted_order_fails_closed_when_local_id_persistence_fails(monkeypatch):
     """Broker acceptance must not be reported as durable when DB confirmation fails."""
-    module, adapter, signal = _make_ctrader_redelivery_adapter(
-        monkeypatch, persist_result=None
+    module, adapter = _make_ctrader_adapter()
+    adapter._client = object()
+    adapter._connected = True
+    adapter._authenticated = True
+    adapter._symbol_name_to_id = {"EURUSD": 1}
+    signal = LiveSignal(
+        id=uuid4(),
+        deployment_id="dep-1",
+        symbol="EURUSD",
+        action="buy",
+        theoretical_price=1.1,
+        timestamp=datetime(2026, 7, 15, 10, 0, tzinfo=timezone.utc),
+        metadata={"qty": 1.0, "stop_loss": 1.05, "take_profit": 1.2},
+    )
+
+    async def _balance() -> tuple[float, float]:
+        return 10_000.0, 10_000.0
+
+    adapter.get_balance = _balance
+    monkeypatch.setattr(
+        module,
+        "size_live_signal",
+        lambda _signal, *, account_balance: SimpleNamespace(risk_percent=0.01),
     )
     monkeypatch.setattr(module, "get_live_signal_broker_order_id", lambda _sid: "")
     monkeypatch.setattr(module, "get_live_signal_timestamp", lambda _sid: None)
@@ -2079,6 +2176,8 @@ def test_ctrader_accepted_order_fails_closed_when_local_id_persistence_fails(mon
             self.volume = 0
             self.timeInForce = 0
             self.clientOrderId = ""
+            self.stopLoss = 0
+            self.takeProfit = 0
 
     class _AcceptedOrderRes:
         orderId = 45678
@@ -2096,7 +2195,7 @@ def test_ctrader_accepted_order_fails_closed_when_local_id_persistence_fails(mon
     adapter._ProtoOATimeInForce = SimpleNamespace(IMMEDIATE_OR_CANCEL=1)
 
     with pytest.raises(RuntimeError, match="persist cTrader broker order id"):
-        _submit_signal(adapter, signal)
+        asyncio.run(adapter.submit_order(signal))
 
     assert adapter._order_id_to_signal_id == {}
 
@@ -2233,3 +2332,456 @@ def test_recover_failed_services_respects_paused_and_stopped(monkeypatch):
     assert len(updated) == 1
     assert updated[0][0] == str(services[2].id)
     assert updated[0][1] == ServiceStatus.RUNNING
+
+
+# ── Cleanup 15-A: unknown signal actions must never become SELL ────────────────
+
+
+def _live_signal_with_action(action: str) -> LiveSignal:
+    """Build a signal whose action bypasses the pydantic Literal gate.
+
+    The model already rejects unknown actions at construction time; the adapter
+    guard exists for defense in depth (e.g. signals loaded from persisted
+    metadata, future model changes, or in-memory copies with relaxed typing).
+    """
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="AAPL",
+        action="sell",
+        theoretical_price=100.0,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"qty": 1.0, "stop_loss": 95.0, "take_profit": 110.0},
+    )
+    object.__setattr__(signal, "__dict__", {**signal.__dict__, "action": action})
+    return signal
+
+
+def _make_ctrader_request_builder_adapter():
+    """Return (module, adapter) with cTrader proto stubs for _build_new_order_request."""
+    module, adapter = _make_ctrader_adapter()
+
+    class _NewOrderReq:
+        def __init__(self) -> None:
+            self.ctidTraderAccountId = 0
+            self.symbolId = 0
+            self.orderType = 0
+            self.tradeSide = 0
+            self.volume = 0
+            self.timeInForce = 0
+            self.clientOrderId = ""
+            self.stopLoss = 0
+            self.takeProfit = 0
+
+    adapter._ProtoOANewOrderReq = _NewOrderReq
+    adapter._ProtoOAOrderType = SimpleNamespace(MARKET=1)
+    adapter._ProtoOATradeSide = SimpleNamespace(BUY=1, SELL=2)
+    adapter._ProtoOATimeInForce = SimpleNamespace(IMMEDIATE_OR_CANCEL=1)
+    return module, adapter
+
+
+def test_alpaca_rejects_unknown_signal_action_instead_of_selling():
+    from live_runner import alpaca_adapter as module
+
+    adapter = module.AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True)
+    adapter._connected = True
+
+    def _forbidden(*_args, **_kwargs):
+        pytest.fail("unknown action must not reach the broker as a SELL order")
+
+    adapter.get_balance = lambda: asyncio.sleep(0, (100_000.0, 100_000.0))
+    adapter._trading_client = SimpleNamespace(
+        get_account=lambda: SimpleNamespace(cash="100000", equity="100000"),
+        submit_order=_forbidden,
+    )
+
+    bad_signal = _live_signal_with_action("close")
+    submission = adapter.submit_order(bad_signal)
+    with pytest.raises(ValueError, match=r"[Uu]nsupported .*action 'close'"):
+        asyncio.run(submission)
+
+
+def test_alpaca_build_order_request_rejects_unknown_signal_action():
+    """The request-builder guard must hold even when submit_order is bypassed."""
+    from live_runner import alpaca_adapter as module
+
+    adapter = module.AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True)
+    bad_signal = _live_signal_with_action("close")
+
+    builder = adapter._build_order_request
+    kwargs = dict(
+        qty=1.0,
+        order_side=SimpleNamespace(BUY="buy", SELL="sell"),
+        time_in_force=SimpleNamespace(DAY="day"),
+        market_request_cls=lambda **kw: ("market", kw),
+        client_order_id="cid-unknown-action",
+    )
+    with pytest.raises(ValueError, match=r"[Uu]nsupported .*action: close"):
+        builder(bad_signal, **kwargs)
+
+
+def test_ctrader_rejects_unknown_signal_action_instead_of_selling():
+    module, adapter = _make_ctrader_adapter()
+    adapter._client = object()
+    adapter._connected = True
+    adapter._authenticated = True
+    adapter._symbol_name_to_id = {"AAPL": 1}
+
+    class _NewOrderReq:
+        def __init__(self) -> None:
+            self.ctidTraderAccountId = 0
+            self.symbolId = 0
+            self.orderType = 0
+            self.tradeSide = 0
+            self.volume = 0
+            self.timeInForce = 0
+            self.clientOrderId = ""
+            self.stopLoss = 0
+            self.takeProfit = 0
+
+    async def _forbidden_send(request, *, timeout_seconds=20, _depth=0):
+        raise AssertionError(
+            f"unknown action submitted a broker order: {type(request).__name__}"
+        )
+
+    adapter._send_request_with_refresh_retry = _forbidden_send
+
+    async def _balance() -> tuple[float, float]:
+        return 10_000.0, 10_000.0
+
+    adapter.get_balance = _balance
+    adapter._ProtoOANewOrderReq = _NewOrderReq
+    adapter._ProtoOAOrderType = SimpleNamespace(MARKET=1)
+    adapter._ProtoOATradeSide = SimpleNamespace(BUY=1, SELL=2)
+    adapter._ProtoOATimeInForce = SimpleNamespace(IMMEDIATE_OR_CANCEL=1)
+
+    bad_signal = _live_signal_with_action("close")
+    submission = adapter.submit_order(bad_signal)
+    with pytest.raises(ValueError, match=r"[Uu]nsupported .*action 'close'"):
+        asyncio.run(submission)
+
+
+def test_ctrader_new_order_request_carries_sl_tp_prices():
+    """The computed SL/TP must land on the broker request, not just metadata."""
+    module, adapter = _make_ctrader_request_builder_adapter()
+
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="EURUSD",
+        action="buy",
+        theoretical_price=1.1,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"qty": 1.0, "stop_loss": 1.05, "take_profit": 1.2},
+    )
+
+    request = adapter._build_new_order_request(signal, symbol_id=7)
+
+    assert request.symbolId == 7
+    # MARKET orders ignore the absolute stopLoss/takeProfit fields; the
+    # distances must arrive via the relative int64 fields (1/100000 units):
+    # BUY stop = entry - relativeStopLoss, take = entry + relativeTakeProfit.
+    assert request.relativeStopLoss == int(round(abs(1.1 - 1.05) * 100_000))
+    assert request.relativeTakeProfit == int(round(abs(1.2 - 1.1) * 100_000))
+
+
+def test_ctrader_relative_sl_tp_direction_and_rejections():
+    """Relative distances are signed by trade side at the protocol level; the
+    sent magnitude must be the positive distance in 1/100000 price units, and
+    wrong-side/non-finite/zero-distance prices must fail closed."""
+    from live_runner import ctrader_adapter as module
+
+    module, adapter = _make_ctrader_request_builder_adapter()
+
+    def _signal(action, stop_loss, take_profit, theoretical_price=1.1):
+        return LiveSignal(
+            deployment_id="dep-1",
+            symbol="EURUSD",
+            action=action,
+            theoretical_price=theoretical_price,
+            timestamp=datetime.now(timezone.utc),
+            metadata={"qty": 1.0, "stop_loss": stop_loss, "take_profit": take_profit},
+        )
+
+    buy_request = adapter._build_new_order_request(_signal("buy", 1.05, 1.2), symbol_id=7)
+    assert buy_request.relativeStopLoss == int(round(0.05 * 100_000))
+    assert buy_request.relativeTakeProfit == int(round(0.1 * 100_000))
+
+    sell_request = adapter._build_new_order_request(_signal("sell", 1.2, 1.0), symbol_id=7)
+    assert sell_request.relativeStopLoss == int(round(0.1 * 100_000))
+    assert sell_request.relativeTakeProfit == int(round(0.1 * 100_000))
+
+    wrong_side = adapter._build_new_order_request
+    wrong_side_signal = _signal("buy", 1.2, 1.05)
+    with pytest.raises(ValueError, match="wrong side of the reference price"):
+        wrong_side(wrong_side_signal, symbol_id=7)
+    nan_signal = _signal("buy", float("nan"), 1.2)
+    with pytest.raises(ValueError, match="Invalid SL/TP price"):
+        wrong_side(nan_signal, symbol_id=7)
+    zero_distance_signal = _signal("buy", 1.1, 1.2)
+    with pytest.raises(ValueError, match="wrong side of the reference price"):
+        wrong_side(zero_distance_signal, symbol_id=7)
+    sub_unit_signal = _signal("buy", 1.099995, 1.2)
+    with pytest.raises(ValueError, match="below one 1/100000 price unit"):
+        wrong_side(sub_unit_signal, symbol_id=7)
+
+
+def test_ctrader_new_order_request_fails_closed_without_sl_tp():
+    module, adapter = _make_ctrader_request_builder_adapter()
+
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="EURUSD",
+        action="buy",
+        theoretical_price=1.1,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"qty": 1.0},
+    )
+
+    request = adapter._build_new_order_request
+    with pytest.raises(ValueError, match="without stop_loss"):
+        request(signal, symbol_id=7)
+
+
+def test_ctrader_build_new_order_request_rejects_unknown_signal_action():
+    """The request-builder guard must hold even when submit_order is bypassed."""
+    module, adapter = _make_ctrader_request_builder_adapter()
+    bad_signal = _live_signal_with_action("close")
+
+    with pytest.raises(ValueError, match=r"[Uu]nsupported .*action: close"):
+        adapter._build_new_order_request(bad_signal, symbol_id=7)
+
+
+def test_alpaca_rejects_non_finite_sl_tp_prices():
+    """NaN/inf prices must fail closed like missing ones — a NaN stop_price
+    reaches the broker as an unvalidatable order and blocks the position."""
+    from live_runner import alpaca_adapter as module
+
+    adapter = module.AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True)
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        signal = LiveSignal(
+            deployment_id="dep-1",
+            symbol="AAPL",
+            action="buy",
+            theoretical_price=100.0,
+            timestamp=datetime.now(timezone.utc),
+            metadata={"stop_loss": bad, "take_profit": 110.0},
+        )
+        with pytest.raises(ValueError, match="Invalid stop_loss price"):
+            adapter._resolve_broker_sl_tp(signal)
+
+
+def test_alpaca_build_order_request_carries_bracket_legs():
+    from live_runner import alpaca_adapter as module
+
+    adapter = module.AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True)
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="AAPL",
+        action="buy",
+        theoretical_price=100.0,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"qty": 2.0, "stop_loss": 95.0, "take_profit": 110.0},
+    )
+
+    request = adapter._build_order_request(
+        signal,
+        qty=2.0,
+        order_side=SimpleNamespace(BUY="buy", SELL="sell"),
+        time_in_force=SimpleNamespace(DAY="day"),
+        market_request_cls=lambda **kwargs: ("market", kwargs),
+        client_order_id="cid-bracket",
+    )
+
+    kind, kwargs = request
+    assert kind == "market"
+    assert kwargs["side"] == "buy"
+    assert kwargs["order_class"] is module.OrderClass.BRACKET
+    assert kwargs["take_profit"].limit_price == pytest.approx(110.0)
+    assert kwargs["stop_loss"].stop_price == pytest.approx(95.0)
+
+
+def test_alpaca_build_order_request_fails_closed_without_sl_tp():
+    from live_runner import alpaca_adapter as module
+
+    adapter = module.AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True)
+    naked_signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="AAPL",
+        action="buy",
+        theoretical_price=100.0,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"qty": 2.0},
+    )
+
+    resolve = adapter._resolve_broker_sl_tp
+    with pytest.raises(ValueError, match="without stop_loss"):
+        resolve(naked_signal)
+
+
+def test_exit_only_orders_still_bypass_sizing_but_close_exact_position():
+    """Exit-only must keep its exact-qty path (no risk sizing) and must not be
+    blocked by the entry SL/TP guard."""
+    from live_runner.daemon import submit_order_with_risk
+
+    deployment = _deployment()
+    adapter = _PositionsAdapter(
+        positions=[{"symbol": "EURUSD", "qty": 3.0}]
+    )
+    signal = LiveSignal(
+        deployment_id=str(deployment.id),
+        symbol="EURUSD",
+        action="sell",
+        theoretical_price=100.0,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"exit_only": True},
+    )
+
+    asyncio.run(submit_order_with_risk(adapter, deployment, signal))
+
+    assert adapter.submitted_signal is not None
+    assert adapter.submitted_signal.metadata["explicit_qty"] == pytest.approx(3.0)
+    assert adapter.submitted_signal.metadata["risk_sizing_mode"] == "exit_only"
+
+
+def test_trade_signal_conversion_rejects_unknown_action_instead_of_selling():
+    """The daemon-side conversion site must whitelist, not default: an action
+    outside {buy, long, sell, short} is rejected rather than mapped to SELL."""
+    from live_runner.daemon import _trade_signal_to_live_signal
+
+    deployment = _deployment()
+    base = TradeSignal(
+        action="sell", symbol="AAPL", entry_price=100.0, stop_loss=None,
+        take_profit=None, timeframe="1h", metadata={},
+    )
+    close = object.__new__(TradeSignal)
+    for field_name, value in (
+        ("action", "close"),
+        ("symbol", "AAPL"),
+        ("entry_price", 100.0),
+        ("stop_loss", None),
+        ("take_profit", None),
+        ("timeframe", "1h"),
+        ("metadata", {}),
+    ):
+        object.__setattr__(close, field_name, value)
+
+    with pytest.raises(ValueError, match="Unsupported signal action"):
+        _trade_signal_to_live_signal(close, deployment)
+
+    converted = _trade_signal_to_live_signal(base, deployment)
+    assert converted.action == "sell"
+
+
+def test_alpaca_exit_only_orders_bypass_entry_sl_tp_guard():
+    """Exit-only closes reduce exposure and carry no SL/TP; the adapter's
+    entry guard must not block them, and the order must go out as a plain
+    market order without bracket legs."""
+    from live_runner import alpaca_adapter as module
+
+    adapter = module.AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True)
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="AAPL",
+        action="sell",
+        theoretical_price=100.0,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"qty": 3.0, "risk_sizing_mode": "exit_only"},
+    )
+
+    request = adapter._build_order_request(
+        signal,
+        qty=3.0,
+        order_side=SimpleNamespace(BUY="buy", SELL="sell"),
+        time_in_force=SimpleNamespace(DAY="day"),
+        market_request_cls=lambda **kwargs: ("market", kwargs),
+        client_order_id="cid-exit",
+    )
+
+    kind, kwargs = request
+    assert kind == "market"
+    assert kwargs["qty"] == pytest.approx(3.0)
+    assert kwargs["order_class"] is module.OrderClass.SIMPLE
+    assert kwargs["take_profit"] is None
+    assert kwargs["stop_loss"] is None
+
+
+def test_alpaca_entry_guard_still_blocks_naked_non_exit_orders():
+    """The exit-only bypass must not open a hole: a plain entry without SL/TP
+    is still refused."""
+    from live_runner import alpaca_adapter as module
+
+    adapter = module.AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True)
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="AAPL",
+        action="buy",
+        theoretical_price=100.0,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"qty": 2.0},
+    )
+
+    resolve = adapter._resolve_broker_sl_tp
+    with pytest.raises(ValueError, match="without stop_loss"):
+        resolve(signal)
+
+
+def test_ctrader_exit_only_orders_bypass_entry_sl_tp_guard():
+    """Exit-only closes carry no SL/TP and must not set relative distances."""
+    module, adapter = _make_ctrader_request_builder_adapter()
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="AAPL",
+        action="sell",
+        theoretical_price=100.0,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"ctrader_volume": 3000, "risk_sizing_mode": "exit_only"},
+    )
+
+    request = adapter._build_new_order_request(signal, symbol_id=7)
+
+    assert not hasattr(request, "relativeStopLoss") or request.relativeStopLoss == 0
+    assert not hasattr(request, "relativeTakeProfit") or request.relativeTakeProfit == 0
+
+
+def test_ctrader_entry_guard_still_blocks_naked_non_exit_orders():
+    """The exit-only bypass must not open a hole on cTrader either."""
+    module, adapter = _make_ctrader_request_builder_adapter()
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="AAPL",
+        action="buy",
+        theoretical_price=100.0,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"qty": 2.0},
+    )
+
+    builder = adapter._build_new_order_request
+    with pytest.raises(ValueError, match="without stop_loss"):
+        builder(signal, symbol_id=7)
+
+
+def test_submit_order_with_risk_resolves_fallback_sl_tp_into_metadata():
+    """A signal without explicit SL/TP gets the risk engine's resolved stop and a
+    TP derived from the engine's risk-reward geometry, so the broker always
+    receives bounded prices."""
+    from live_runner.daemon import submit_order_with_risk
+
+    deployment = _deployment()
+    adapter = _PositionsAdapter(positions=[])
+    signal = LiveSignal(
+        deployment_id=str(deployment.id),
+        symbol="AAPL",
+        action="buy",
+        theoretical_price=100.0,
+        timestamp=datetime.now(timezone.utc),
+        metadata={},
+    )
+
+    asyncio.run(submit_order_with_risk(adapter, deployment, signal, pip_value=1.0))
+
+    assert adapter.submitted_signal is not None
+    metadata = adapter.submitted_signal.metadata
+    stop_loss = float(metadata["stop_loss"])
+    take_profit = float(metadata["take_profit"])
+    assert stop_loss == pytest.approx(98.0)  # fallback: entry * (1 - 0.02)
+    # risk_reward_ratio of the fallback geometry is 1.0 -> TP mirrors the stop distance
+    assert take_profit == pytest.approx(102.0)
