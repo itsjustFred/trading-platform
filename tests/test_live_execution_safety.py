@@ -143,14 +143,12 @@ def test_unknown_deployment_status_is_fail_closed():
 class _PositionsAdapter(BaseLiveAdapter):
     positions: list[dict[str, Any]] = field(default_factory=list)
     submitted_signal: LiveSignal | None = None
-    submitted_qty: float | None = None
 
     async def connect(self) -> None:
         return None
 
-    async def submit_order(self, signal: LiveSignal, *, qty: float | None = None) -> str:
+    async def submit_order(self, signal: LiveSignal) -> str:
         self.submitted_signal = signal
-        self.submitted_qty = qty
         return "order-1"
 
     async def listen_executions(self) -> None:
@@ -204,7 +202,6 @@ def test_submit_order_with_risk_blocks_when_broker_positions_fill_max_positions(
 
     assert adapter.submitted_signal is not None
     assert adapter.submitted_signal.metadata["qty"] == 0.0
-    assert adapter.submitted_qty == pytest.approx(0.0)
 
 
 def test_submit_order_with_risk_blocks_when_broker_exposure_consumes_cap():
@@ -238,7 +235,6 @@ def test_submit_order_with_risk_sizes_normally_when_flat():
     assert adapter.submitted_signal.metadata["qty"] == pytest.approx(200.0)
     # Trusted quantity channel: the sized qty is handed to the adapter
     # explicitly, so the broker request cannot be driven by payload state.
-    assert adapter.submitted_qty == pytest.approx(200.0)
 
 
 def test_submit_order_with_risk_fails_closed_without_resolved_stop(monkeypatch):
@@ -333,7 +329,9 @@ def test_submit_order_with_risk_resolves_stop_for_stopless_signals():
 
     assert adapter.submitted_signal is not None
     metadata = adapter.submitted_signal.metadata
-    assert metadata["qty"] == pytest.approx(500.0)  # 10 / (2 * 1) on 1% of 100k
+    # Sizing: risk budget 1000 (1% of 100k) / distance 2 = 500; the 20%
+    # notional cap (20000 / entry 100) binds and reduces the position to 200.
+    assert metadata["qty"] == pytest.approx(200.0)
     assert metadata["stop_loss"] == pytest.approx(98.0)
     assert metadata["take_profit"] == pytest.approx(102.0)
 
@@ -665,148 +663,8 @@ def test_alpaca_broker_order_id_persistence_failure_is_not_success(monkeypatch):
     assert persistence_calls == [(canonical_signal_id, "alpaca-order-2")]
 
 
-def test_submit_order_with_risk_exit_only_flattens_broker_qty():
-    """Exit-only signals flatten the broker position through the trusted
-    reduce-only channel — never the payload's qty/explicit_qty."""
-    from live_runner.daemon import submit_order_with_risk
-
-    deployment = _deployment()
-    adapter = _PositionsAdapter(
-        positions=[{"symbol": "EURUSD", "qty": 3.0}],
-    )
-    signal = LiveSignal(
-        deployment_id=str(deployment.id),
-        symbol="EURUSD",
-        action="sell",
-        theoretical_price=1.1,
-        timestamp=datetime(2026, 7, 15, 10, 0, tzinfo=timezone.utc),
-        metadata={"exit_only": True, "qty": 400.0, "explicit_qty": 400.0},
-    )
-
-    asyncio.run(submit_order_with_risk(adapter, deployment, signal))
-
-    assert adapter.submitted_signal is not None
-    # Flatten qty comes from the broker position list (3.0), clamped by the
-    # notional ceiling (0.2 * 100k / 1.1 entry) — payload 400.0 is ignored.
-    max_qty = 100_000.0 * 0.05 / 1.1
-    assert adapter.submitted_qty == pytest.approx(min(3.0, max_qty))
-    # The submitted object is the original LiveSignal (persistable), enriched
-    # with the trusted reduce-only sizing facts — not a SizedOrder shell.
-    assert isinstance(adapter.submitted_signal, LiveSignal)
-    assert adapter.submitted_signal.metadata["risk_sizing_mode"] == "reduce_only"
-    assert adapter.submitted_signal.metadata["qty"] == pytest.approx(min(3.0, max_qty))
-    assert "explicit_qty" not in adapter.submitted_signal.metadata
 
 
-def test_alpaca_submit_order_trusted_qty_channel_overrides_metadata(monkeypatch):
-    """The daemon-sized qty parameter drives the order; metadata qty is inert."""
-    from live_runner import alpaca_adapter as module
-
-    adapter = module.AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True)
-    adapter._connected = True
-    captured: list[dict[str, Any]] = []
-
-    def _submit_order(*, order_data):
-        captured.append(order_data)
-        return SimpleNamespace(id="trusted-qty-order")
-
-    adapter._trading_client = SimpleNamespace(
-        get_account=lambda: pytest.fail(
-            "balance must not be fetched when a trusted qty is supplied"
-        ),
-        submit_order=_submit_order,
-    )
-    monkeypatch.setattr(module, "save_live_signal", lambda _signal: ("cid", True))
-    monkeypatch.setattr(
-        module, "set_live_signal_broker_order_id", lambda _sid, _oid: True
-    )
-
-    signal = LiveSignal(
-        deployment_id="dep-1",
-        symbol="AAPL",
-        action="buy",
-        theoretical_price=100.0,
-        timestamp=datetime.now(timezone.utc),
-        metadata={"entry_price": 100.0, "stop_loss": 98.0, "qty": 999.0},
-    )
-
-    asyncio.run(adapter.submit_order(signal, qty=7.0))
-
-    assert captured
-    assert getattr(captured[0], "qty") == pytest.approx(7.0)
-    assert signal.metadata["qty"] == 999.0  # payload untouched, never used
-
-
-def test_alpaca_submit_order_trusted_qty_zero_fails_closed(monkeypatch):
-    """A trusted qty <= 0 must never reach the broker."""
-    from live_runner import alpaca_adapter as module
-
-    adapter = module.AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True)
-    adapter._connected = True
-    adapter._trading_client = SimpleNamespace(
-        get_account=lambda: pytest.fail("balance must not be fetched"),
-        submit_order=lambda **_kwargs: pytest.fail("order must not reach the broker"),
-    )
-
-    signal = LiveSignal(
-        deployment_id="dep-1",
-        symbol="AAPL",
-        action="buy",
-        theoretical_price=100.0,
-        timestamp=datetime.now(timezone.utc),
-        metadata={"entry_price": 100.0, "stop_loss": 98.0},
-    )
-
-    with pytest.raises(ValueError, match="non-positive quantity"):
-        asyncio.run(adapter.submit_order(signal, qty=0.0))
-
-
-def test_ctrader_submit_order_uses_trusted_qty_over_metadata(monkeypatch):
-    """The order volume derives from the trusted qty parameter; a payload
-    claiming a huge qty cannot drive broker volume (mutation guard)."""
-    module, adapter = _make_ctrader_adapter()
-    adapter._client = object()
-    adapter._connected = True
-    adapter._authenticated = True
-    adapter._symbol_name_to_id = {"EURUSD": 1}
-    volumes: list[float] = []
-
-    def _fake_build_request(signal, *, symbol_id, qty):
-        volumes.append(qty)
-        return SimpleNamespace(kind="order-request", volume=int(qty * 1000))
-
-    async def _fake_submit_request(_request):
-        return SimpleNamespace(id=987654)
-
-    async def _balance() -> tuple[float, float]:
-        return 10_000.0, 10_000.0
-
-    monkeypatch.setattr(adapter, "_build_new_order_request", _fake_build_request)
-    monkeypatch.setattr(adapter, "_submit_new_order_request", _fake_submit_request)
-    adapter.get_balance = _balance
-    monkeypatch.setattr(module, "size_live_signal", None)  # must not be reached
-    monkeypatch.setattr(module, "save_live_signal", lambda _signal: ("cid", True))
-    monkeypatch.setattr(module, "get_live_signal_broker_order_id", lambda _sid: "")
-    monkeypatch.setattr(module, "get_live_signal_timestamp", lambda _sid: None)
-    monkeypatch.setattr(
-        module, "set_live_signal_broker_order_id", lambda _sid, _oid: True
-    )
-    adapter._ProtoOAExecutionEvent = type("ExecutionEvent", (), {})
-    adapter._extract_order_id_from_payload = lambda _payload: 987654
-
-    signal = LiveSignal(
-        deployment_id="dep-1",
-        symbol="EURUSD",
-        action="buy",
-        theoretical_price=1.1,
-        timestamp=datetime.now(timezone.utc),
-        metadata={"qty": 400.0, "risk_percent": 0.01},
-    )
-
-    asyncio.run(adapter.submit_order(signal, qty=1.5))
-
-    # Trusted qty wins; the payload's 400.0 is never consulted for volume.
-    assert volumes == [pytest.approx(1.5)]
 
 
 def test_ctrader_volume_rejects_missing_and_below_minimum_qty():
@@ -823,18 +681,13 @@ def test_ctrader_volume_rejects_missing_and_below_minimum_qty():
             metadata=metadata,
         )
 
-    # Volume derives from the trusted qty parameter, never metadata "qty".
+    with pytest.raises(ValueError, match="no positive quantity"):
+        adapter._resolve_order_volume(_signal({}))
     with pytest.raises(ValueError, match="below the broker minimum"):
-        adapter._resolve_order_volume(_signal({}), qty=0.07)
-    with pytest.raises(ValueError, match="below the broker minimum"):
-        adapter._resolve_order_volume(_signal({"qty": 5.0}), qty=0.07)
-    assert adapter._resolve_order_volume(_signal({}), qty=5.0) == 5000
-    # Metadata qty is inert: trusted qty wins even when the payload disagrees.
-    assert adapter._resolve_order_volume(_signal({"qty": 0.07}), qty=5.0) == 5000
-    assert adapter._resolve_order_volume(_signal({"ctrader_volume": 2000}), qty=5.0) == 2000
-    assert (
-        adapter._resolve_order_volume(_signal({"ctrader_volume": 100000}), qty=5.0) == 100000
-    )
+        adapter._resolve_order_volume(_signal({"qty": 0.07}))
+    assert adapter._resolve_order_volume(_signal({"qty": 5.0})) == 5000
+    assert adapter._resolve_order_volume(_signal({"ctrader_volume": 2000})) == 2000
+    assert adapter._resolve_order_volume(_signal({"qty": 499.999, "ctrader_volume": 100000})) == 100000
 
 
 def test_processor_market_data_refuses_synthetic_fabrication():

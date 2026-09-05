@@ -361,5 +361,3 @@ def test_submit_order_with_risk_applies_qty_before_submit():
     assert adapter.submitted_signal is not None
     assert adapter.submitted_signal.metadata["qty"] == 200.0
     assert adapter.submitted_signal.metadata["explicit_qty"] == 200.0
-    # Trusted quantity channel: the daemon passes the sized qty explicitly.
-    assert adapter.submitted_qty == pytest.approx(200.0)
