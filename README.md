@@ -154,6 +154,10 @@ tests/               — Test suite
 | `SENTRY_ENABLE_LOGS` | `true` | Send SDK log records to Sentry |
 | `SENTRY_DEBUG` | `false` | Enable Sentry SDK debug logging |
 | `SENTRY_ATTACH_STACKTRACE` | `true` | Attach stacktraces to captured events |
+| `VITE_SENTRY_DSN` | — | Frontend Sentry DSN (same shared project as `SENTRY_DSN`). Empty disables Sentry in the frontend |
+| `VITE_SENTRY_ENVIRONMENT` | `local` | Frontend Sentry environment name |
+| `VITE_SENTRY_SAMPLE_RATE` | `1.0` | Frontend error event sample rate from `0.0` to `1.0` |
+| `VITE_SENTRY_TRACES_SAMPLE_RATE` | — | Optional frontend performance trace sample rate |
 | `UVICORN_HOST` | `0.0.0.0` | Recommended host for `python -m uvicorn viewer.main:app` |
 | `UVICORN_PORT` | `5556` | Recommended port for `python -m uvicorn viewer.main:app` |
 | `NVIDIA_API_KEY` | — | API key for the Strategy Lab auto-conversion agent via NVIDIA NIM |
@@ -165,6 +169,23 @@ tests/               — Test suite
   - `/api` → `http://localhost:5556`
   - `/ws` → `ws://localhost:5556`
 - Live terminal uses `GET /ws/tasks/{job_id}` WebSocket stream (tail-like task logs).
+
+## Sentry (Frontend)
+
+The frontend reports to the same shared Sentry project as the backend Python
+services (`shared/sentry.py`) and is identified by the `service: frontend` tag.
+Release naming mirrors the backend convention:
+`trading-platform-frontend@<version>+<git-sha>`, with `<version>` taken from
+`frontend/package.json` and `<git-sha>` resolved at build time in
+`frontend/vite.config.ts` (compile-time `__APP_VERSION__` / `__GIT_SHA__`
+globals).
+
+- Configure via `frontend/.env` (see `frontend/.env.example`): `VITE_SENTRY_DSN`
+  (blank disables Sentry locally), `VITE_SENTRY_ENVIRONMENT`,
+  `VITE_SENTRY_SAMPLE_RATE`, `VITE_SENTRY_TRACES_SAMPLE_RATE`.
+- Initialization lives in `frontend/src/lib/sentryConfig.ts` and is kicked off
+  from `frontend/src/main.tsx`. The SDK's default global-handlers integration
+  then reports uncaught errors and unhandled rejections automatically.
 
 ## Writing a Strategy (vectorbt)
 
