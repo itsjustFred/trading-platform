@@ -682,10 +682,9 @@ def _load_ohlcv(
 
     if "timestamp" in df.columns:
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-        if start_date:
-            df = df[df["timestamp"] >= start_date]
-        if end_date:
-            df = df[df["timestamp"] <= end_date]
+        # Conformance (Cleanup 16-A, F9): shared date-filter convention — a
+        # date-only end boundary is inclusive of the full day.
+        df = contract.apply_date_filter(df, start=start_date, end=end_date)
 
     return df.reset_index(drop=True)
 
