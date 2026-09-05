@@ -3170,7 +3170,8 @@ def test_backtest_run_signals_registers_task_manager_progress(viewer_client, mon
 def test_backtest_run_from_signals_csv_forwards_to_replay(viewer_client, monkeypatch, tmp_path):
     import viewer.main as viewer_app_module
 
-    csv_path = tmp_path / "signals.csv"
+    csv_path = tmp_path / "ohlcv" / "signals.csv"
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
     csv_path.write_text(
         "\n".join(
             [
@@ -3216,7 +3217,8 @@ def test_backtest_run_from_signals_csv_forwards_to_replay(viewer_client, monkeyp
 def test_backtest_run_from_signals_csv_date_only_end_is_inclusive(viewer_client, monkeypatch, tmp_path):
     import viewer.main as viewer_app_module
 
-    csv_path = tmp_path / "signals.csv"
+    csv_path = tmp_path / "ohlcv" / "signals.csv"
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
     csv_path.write_text(
         "\n".join(
             [

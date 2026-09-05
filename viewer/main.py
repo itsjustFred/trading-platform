@@ -163,6 +163,9 @@ initialize_sentry(
 logger = get_logger("viewer")
 AGENT_CONVERT_PROVIDER_NAMES: tuple[str, ...] = ("nim", "copilot_sdk")
 
+BACKTEST_TRADES_SUFFIX = ".trades.json"
+OHLCV_PARQUET_SUFFIX = ".parquet"
+
 BACKTESTS_DIR = DATA_DIR / "backtests"
 MATRIX_RESULTS_DIR = DATA_DIR / "backtests" / "matrix_runner"
 MATRIX_GRID_OVERVIEW_PATH = PROJECT_ROOT / "frontend" / "public" / "matrix-grid-overview.json"
@@ -629,10 +632,15 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="trading-platform viewer", lifespan=lifespan)
+# The viewer serves its own SPA from the same origin (and the Vite dev server
+# proxies /api), so no cross-origin browser access is needed. A wildcard
+# origin combined with allow_credentials=True would reflect any Origin header
+# and made every mutating endpoint drive-by reachable; credentials are now
+# explicitly disabled and no wildcard origin is advertised.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=[],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -906,6 +914,72 @@ class BacktestsBulkDeleteRequest(SQLModel):
 
 class PortfoliosBulkDeleteRequest(SQLModel):
     ids: list[str]
+
+
+_SAFE_ASSET_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _safe_asset_id(raw_id: object) -> str:
+    """Normalize a client-supplied asset id for file-backed operations.
+
+    Returns an empty string for ids that are blank or that could participate
+    in a path traversal (path separators, ``..`` segments). Ids are only ever
+    joined onto a fixed directory below, and the join is containment-checked
+    again by :func:`_contained_asset_path`.
+    """
+    normalized = str(raw_id or "").strip()
+    if not normalized:
+        return ""
+    if normalized in {".", ".."}:
+        return ""
+    if not _SAFE_ASSET_ID_RE.match(normalized):
+        return ""
+    return normalized
+
+
+def _contained_asset_path(base_dir: Path, asset_id: str, suffix: str) -> Path | None:
+    """Join ``asset_id`` onto ``base_dir`` if the result stays inside it.
+
+    The resolved candidate must be contained in the resolved base directory,
+    otherwise ``None`` is returned so the caller never builds an unlink path
+    from raw input. See :func:`_contained_client_data_file` for the
+    client-path variant of the same containment contract.
+    """
+    normalized = _safe_asset_id(asset_id)
+    if not normalized:
+        return None
+    base = base_dir.resolve()
+    candidate = (base / f"{normalized}{suffix}").resolve()
+    if candidate.parent != base:
+        return None
+    return candidate
+
+
+def _contained_client_data_file(
+    raw_path: str, *, allowed_suffix: str, base_dir: Path | None = None
+) -> Path | None:
+    """Validate a client-supplied data file path for reading or subprocess use.
+
+    The resolved path must stay inside the client data tree (``DATA_DIR`` by
+    default — signal CSVs live under ``DATA_DIR / "signals"`` and OHLCV
+    parquet under ``DATA_DIR / "ohlcv"``) and must carry the expected suffix,
+    so requests can neither read arbitrary files nor point a subprocess at
+    code outside the data directory. ``base_dir`` narrows the tree for
+    callers that manage a single subtree.
+    """
+    normalized = str(raw_path or "").strip()
+    if not normalized:
+        return None
+    base = (base_dir or DATA_DIR).resolve()
+    try:
+        candidate = Path(normalized).expanduser().resolve()
+    except (OSError, ValueError):
+        return None
+    if not candidate.is_relative_to(base):
+        return None
+    if candidate.suffix.lower() != allowed_suffix.lower():
+        return None
+    return candidate
 
 
 _QUIET_EXACT_PATHS = {
@@ -2017,7 +2091,7 @@ def _group_duplicate_portfolios() -> tuple[list[dict[str, Any]], int]:
 
 
 def _delete_portfolio_with_artifacts(portfolio_id: str) -> bool:
-    normalized_id = str(portfolio_id or "").strip()
+    normalized_id = _safe_asset_id(portfolio_id)
     if not normalized_id:
         return False
 
@@ -2027,9 +2101,9 @@ def _delete_portfolio_with_artifacts(portfolio_id: str) -> bool:
     except Exception as exc:
         logger.warning("Could not delete portfolio %s from DB: %s", normalized_id, exc)
 
-    path = PORTFOLIOS_DIR / f"{normalized_id}.json"
+    path = _contained_asset_path(PORTFOLIOS_DIR, normalized_id, ".json")
     deleted_file = False
-    if path.exists():
+    if path is not None and path.exists():
         try:
             path.unlink()
             deleted_file = True
@@ -2522,15 +2596,15 @@ def _group_duplicate_backtests() -> tuple[list[dict[str, Any]], int]:
 
 
 def _delete_backtest_with_artifacts(backtest_id: str) -> bool:
-    normalized_id = str(backtest_id or "").strip()
+    normalized_id = _safe_asset_id(backtest_id)
     if not normalized_id:
         return False
 
     deleted_in_db = delete_backtest(normalized_id)
     _remove_backtest_meta_cache(normalized_id)
-    json_path = BACKTESTS_DIR / f"{normalized_id}.trades.json"
+    json_path = _contained_asset_path(BACKTESTS_DIR, normalized_id, BACKTEST_TRADES_SUFFIX)
     deleted_json = False
-    if json_path.exists():
+    if json_path is not None and json_path.exists():
         try:
             json_path.unlink()
             deleted_json = True
@@ -5627,7 +5701,7 @@ def _cached_catalog_ohlcv_entries() -> list[dict[str, Any]]:
             return [
                 dict(entry)
                 for entry in legacy_entries
-                if isinstance(entry, dict) and str(entry.get("path", "")).endswith(".parquet")
+                if isinstance(entry, dict) and str(entry.get("path", "")).endswith(OHLCV_PARQUET_SUFFIX)
             ]
         return _scan_single_file_ohlcv_entries({})
 
@@ -5636,7 +5710,7 @@ def _cached_catalog_ohlcv_entries() -> list[dict[str, Any]]:
         normalized_entries = [
             entry
             for entry in entries
-            if isinstance(entry, dict) and str(entry.get("path", "")).endswith(".parquet")
+            if isinstance(entry, dict) and str(entry.get("path", "")).endswith(OHLCV_PARQUET_SUFFIX)
         ]
         if normalized_entries:
             return normalized_entries
@@ -5645,7 +5719,7 @@ def _cached_catalog_ohlcv_entries() -> list[dict[str, Any]]:
     for entry in entries:
         if not isinstance(entry, dict):
             continue
-        if not str(entry.get("path", "")).endswith(".parquet"):
+        if not str(entry.get("path", "")).endswith(OHLCV_PARQUET_SUFFIX):
             continue
         normalized = dict(entry)
         normalized.pop("last_updated", None)
@@ -8000,8 +8074,8 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
                             output_path = parsed_message[len("saved to:"):].strip()
                             if output_path:
                                 filename = Path(output_path).name
-                                if filename.endswith(".trades.json"):
-                                    filename_id = filename[: -len(".trades.json")]
+                                if filename.endswith(BACKTEST_TRADES_SUFFIX):
+                                    filename_id = filename[: -len(BACKTEST_TRADES_SUFFIX)]
                                     backtest_id = filename_id
                                     if filename_id:
                                         loaded_result = _load_result(filename_id)
@@ -8455,7 +8529,85 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
     return {"task_id": task_id, "job_id": task_id, "status": "queued"}
 
 
-@app.post("/api/backtests/run-from-signals", response_model=dict[str, Any], status_code=202)
+def _replay_signal_payload(
+    signal: dict[str, Any], signal_time: pd.Timestamp, source_label: str, file_path: str
+) -> dict[str, Any]:
+    """Normalise one raw CSV signal row into the replay payload shape."""
+    action = str(signal.get("action") or "").strip().lower()
+    entry_price = _safe_float(signal.get("entry_price"), 0.0)
+    metadata = dict(signal.get("metadata") or {})
+    metadata["signal_source_label"] = f"CSV: {Path(file_path).name}"
+    metadata["signal_filepath"] = str(Path(file_path).expanduser())
+    return {
+        "timestamp": pd.Timestamp(signal_time).isoformat(),
+        "symbol": str(signal.get("symbol") or "").strip().upper(),
+        "action": action,
+        "entry_price": entry_price,
+        "stop_loss": signal.get("stop_loss"),
+        "take_profit": signal.get("take_profit"),
+        "timeframe": normalize_timeframe(str(signal.get("timeframe") or "")) or "",
+        "source": source_label,
+        "metadata": metadata,
+    }
+
+
+async def _load_and_filter_csv_signals(
+    file_path: str, start_dt: datetime, end_dt: datetime
+) -> tuple[list[dict[str, Any]], list[SignalReplayInput]]:
+    """Load a contained signal CSV and keep only replayable rows in range."""
+    try:
+        loaded_signals = await asyncio.to_thread(load_signals_from_csv, file_path)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if not loaded_signals:
+        raise HTTPException(status_code=400, detail="CSV file contains no replayable signals")
+
+    source_label = f"csv:{Path(file_path).name}"
+    filtered_signals: list[dict[str, Any]] = []
+    signal_inputs: list[SignalReplayInput] = []
+    for signal in loaded_signals:
+        signal_time = pd.to_datetime(signal.get("timestamp"), utc=True, errors="coerce")
+        if pd.isna(signal_time):
+            continue
+        signal_dt = pd.Timestamp(signal_time).to_pydatetime()
+        if signal_dt < start_dt or signal_dt > end_dt:
+            continue
+
+        action = str(signal.get("action") or "").strip().lower()
+        if action not in {"buy", "sell", "long", "short"}:
+            continue
+        if _safe_float(signal.get("entry_price"), 0.0) <= 0:
+            continue
+
+        signal_payload = _replay_signal_payload(signal, signal_time, source_label, file_path)
+        filtered_signals.append(signal_payload)
+        signal_inputs.append(
+            SignalReplayInput(
+                timestamp=str(signal_payload["timestamp"]),
+                symbol=str(signal_payload["symbol"]),
+                action=str(signal_payload["action"]),
+                entry_price=float(signal_payload["entry_price"]),
+                stop_loss=signal_payload.get("stop_loss"),
+                take_profit=signal_payload.get("take_profit"),
+                timeframe=str(signal_payload["timeframe"] or ""),
+                source=str(signal_payload["source"]),
+                metadata=dict(signal_payload["metadata"]),
+            )
+        )
+    return filtered_signals, signal_inputs
+
+
+@app.post(
+    "/api/backtests/run-from-signals",
+    status_code=202,
+    responses={
+        400: {"description": "Invalid signal_source, filepath, date range or no replayable signals"},
+        403: {"description": "Signal CSV is outside the OHLCV data directory"},
+    },
+)
 async def run_backtest_from_signals(payload: BacktestRunFromSignalsRequest) -> dict[str, Any]:
     source = str(payload.signal_source or "csv").strip().lower()
     if source in {"discord-history", "discord"}:
@@ -8481,68 +8633,22 @@ async def run_backtest_from_signals(payload: BacktestRunFromSignalsRequest) -> d
     if not file_path:
         raise HTTPException(status_code=400, detail="filepath is required for csv signal_source")
 
-    try:
-        loaded_signals = await asyncio.to_thread(load_signals_from_csv, file_path)
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    if not loaded_signals:
-        raise HTTPException(status_code=400, detail="CSV file contains no replayable signals")
+    csv_path = _contained_client_data_file(file_path, allowed_suffix=".csv")
+    if csv_path is None:
+        raise HTTPException(
+            status_code=403,
+            detail="Signal CSV must be inside the OHLCV data directory",
+        )
+    file_path = str(csv_path)
 
     start_dt = _parse_request_date(payload.start_date, field_name="start_date")
     end_dt = _parse_request_date(payload.end_date, field_name="end_date", end_of_day=True)
     if start_dt > end_dt:
         raise HTTPException(status_code=400, detail="start_date must be <= end_date")
 
-    source_label = f"csv:{Path(file_path).name}"
-    filtered_signals: list[dict[str, Any]] = []
-    signal_inputs: list[SignalReplayInput] = []
-    for signal in loaded_signals:
-        signal_time = pd.to_datetime(signal.get("timestamp"), utc=True, errors="coerce")
-        if pd.isna(signal_time):
-            continue
-        signal_dt = pd.Timestamp(signal_time).to_pydatetime()
-        if signal_dt < start_dt or signal_dt > end_dt:
-            continue
-
-        action = str(signal.get("action") or "").strip().lower()
-        if action not in {"buy", "sell", "long", "short"}:
-            continue
-        entry_price = _safe_float(signal.get("entry_price"), 0.0)
-        if entry_price <= 0:
-            continue
-
-        metadata = dict(signal.get("metadata") or {})
-        metadata["signal_source_label"] = f"CSV: {Path(file_path).name}"
-        metadata["signal_filepath"] = str(Path(file_path).expanduser())
-        signal_payload = {
-            "timestamp": pd.Timestamp(signal_time).isoformat(),
-            "symbol": str(signal.get("symbol") or "").strip().upper(),
-            "action": action,
-            "entry_price": entry_price,
-            "stop_loss": signal.get("stop_loss"),
-            "take_profit": signal.get("take_profit"),
-            "timeframe": normalize_timeframe(str(signal.get("timeframe") or "")) or "",
-            "source": source_label,
-            "metadata": metadata,
-        }
-        filtered_signals.append(signal_payload)
-        signal_inputs.append(
-            SignalReplayInput(
-                timestamp=str(signal_payload["timestamp"]),
-                symbol=str(signal_payload["symbol"]),
-                action=str(signal_payload["action"]),
-                entry_price=float(signal_payload["entry_price"]),
-                stop_loss=signal_payload.get("stop_loss"),
-                take_profit=signal_payload.get("take_profit"),
-                timeframe=str(signal_payload["timeframe"] or ""),
-                source=str(signal_payload["source"]),
-                metadata=dict(metadata),
-            )
-        )
-
+    filtered_signals, signal_inputs = await _load_and_filter_csv_signals(
+        file_path, start_dt, end_dt
+    )
     if not signal_inputs:
         raise HTTPException(status_code=400, detail="No replayable CSV signals in selected date range")
 
@@ -10378,10 +10484,20 @@ async def data_check(
     }
 
 
-@app.post("/api/data/resample", response_model=dict[str, Any])
+@app.post(
+    "/api/data/resample",
+    responses={400: {"description": "source_path is not a parquet file in the data directory"}},
+)
 async def data_resample(payload: DataResampleRequest) -> dict[str, Any]:
-    source_path = payload.source_path
     target_timeframes = payload.target_timeframes
+    source_path = _contained_client_data_file(
+        payload.source_path, allowed_suffix=OHLCV_PARQUET_SUFFIX
+    )
+    if source_path is None:
+        raise HTTPException(
+            status_code=400,
+            detail="source_path must be a parquet file inside the OHLCV data directory",
+        )
     task_id = str(uuid.uuid4())
     cmd = [
         sys.executable,
@@ -10389,7 +10505,7 @@ async def data_resample(payload: DataResampleRequest) -> dict[str, Any]:
         "-m",
         "data_tools.resample",
         "--source",
-        source_path,
+        str(source_path),
         "--timeframes",
         target_timeframes,
     ]
@@ -10398,7 +10514,7 @@ async def data_resample(payload: DataResampleRequest) -> dict[str, Any]:
         cmd,
         total_items=1,
         name="Resample data",
-        description=f"Resample {Path(source_path).name or source_path} into {target_timeframes}.",
+        description=f"Resample {source_path.name or source_path} into {target_timeframes}.",
         source="resample",
     )
     _apply_recovery_data_metadata(
@@ -10658,21 +10774,23 @@ async def delete_data_task(task_id: str) -> dict[str, Any]:
     return {"task_id": task_id, "status": "deleted"}
 
 
-@app.delete("/api/data/symbol", response_model=dict[str, Any])
+@app.delete(
+    "/api/data/symbol",
+    responses={
+        400: {"description": "Path query parameter is missing"},
+        403: {"description": "Path is outside the OHLCV data directory or is not a parquet file"},
+    },
+)
 async def delete_symbol_data(path: str = Query(default="")) -> dict[str, Any]:
     if not path:
         raise HTTPException(status_code=400, detail="Path required")
 
-    file_path = Path(path)
-    try:
-        file_path = file_path.resolve()
-        data_root = DATA_DIR.resolve()
-        if not str(file_path).startswith(str(data_root)):
-            raise HTTPException(status_code=403, detail="Access denied")
-    except HTTPException:
-        raise
-    except (OSError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail="Invalid path") from exc
+    # Containment must be checked on resolved paths (prefix strings can be
+    # spoofed with ".." components) and deletion is restricted to the parquet
+    # files the catalog manages.
+    file_path = _contained_client_data_file(path, allowed_suffix=OHLCV_PARQUET_SUFFIX)
+    if file_path is None:
+        raise HTTPException(status_code=403, detail="Access denied")
 
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="File not found")
