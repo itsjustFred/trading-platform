@@ -99,6 +99,43 @@ def _first_metadata_float(
         except (TypeError, ValueError):
             continue
     return None
+# ── cTrader volume unit contract ───────────────────────────────────────────────
+#
+# ONE unit contract for every quantity in the cTrader path:
+#
+#   * Signal metadata 'qty' is in ACCOUNT-CURRENCY UNITS of the symbol, i.e.
+#     broker_volume / QTY_VOLUME_SCALE. The risk engine sizes in these units
+#     (position_size = risk_amount / (risk_distance * pip_value)); with the
+#     pip_value=1.0 quantity convention used by this daemon, one qty unit is
+#     one contract unit and cTrader counts 1000 of them per broker volume
+#     unit (FX: 1 lot == 100_000 == 100 volume units of 1_000).
+#   * Raw cTrader protocol fields (ProtoOANewOrderReq.volume,
+#     tradeData.volume, deal.filledVolume, order.executedVolume) are in
+#     BROKER VOLUME UNITS: broker_volume == qty * QTY_VOLUME_SCALE.
+#
+# Every crossing of that boundary goes through _qty_to_broker_volume /
+# _broker_volume_to_qty. Signal metadata 'ctrader_volume' / 'volume' are raw
+# broker units coming from the (untrusted) signal payload; per the parent
+# Decision Record they must not pick the traded size and are NOT read.
+
+
+QTY_VOLUME_SCALE = 1000.0
+
+
+def _qty_to_broker_volume(qty: float) -> int:
+    """Convert qty units (risk-engine units) into broker volume units."""
+    volume = int(round(float(qty) * QTY_VOLUME_SCALE))
+    if volume <= 0:
+        raise ValueError(
+            "Signal has no positive quantity ('qty'); "
+            "refusing to submit an order with a default size."
+        )
+    return volume
+
+
+def _broker_volume_to_qty(volume: float) -> float:
+    """Convert broker volume units into qty units (risk-engine units)."""
+    return _to_float(volume, default=0.0) / QTY_VOLUME_SCALE
 
 
 _NOT_AUTHORIZED_MARKER = "not authorized"
@@ -222,6 +259,7 @@ def _ensure_asyncio_twisted_reactor(loop: asyncio.AbstractEventLoop) -> None:
 
 
 def _explicit_metadata_volume(metadata: dict[str, Any]) -> int | None:
+    """Explicit broker-volume overrides from metadata ('ctrader_volume', 'volume')."""
     for key in ("ctrader_volume", "volume"):
         if key not in metadata:
             continue
@@ -775,6 +813,14 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         return None
 
     def _resolve_order_volume(self, signal: LiveSignal) -> int:
+        """Resolve the broker volume for an order from signal metadata 'qty'.
+
+        Unit contract: 'qty' is in risk-engine quantity units; broker volume is
+        qty * QTY_VOLUME_SCALE (see module docstring). The raw broker-unit keys
+        ('ctrader_volume', 'volume') are operator-supplied overrides from the
+        (untrusted) signal payload; per the Main contract they stay readable so
+        exit-only flatten payloads keep their explicit broker volume.
+        """
         metadata = signal.metadata or {}
         explicit = _explicit_metadata_volume(metadata)
         if explicit is not None:
@@ -782,8 +828,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
 
         if "qty" in metadata:
             qty = _to_float(metadata.get("qty"), default=0.0)
-            if qty > 0:
-                volume = int(qty * 1000)
+            if math.isfinite(qty) and qty > 0:
+                volume = _qty_to_broker_volume(qty)
                 if volume < 1000:
                     raise ValueError(
                         f"Risk-sized volume {volume} is below the broker minimum (1000); "
@@ -1243,6 +1289,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             filled_volume = _to_float(getattr(deal, "volume", 0))
         if filled_volume <= 0:
             return None
+        # Unit contract: persist filled_qty in qty units (broker volume / 1000),
+        # the same unit the risk engine sized and the viewer consumes.
+        filled_qty = _broker_volume_to_qty(filled_volume)
 
         timestamp_ms = 0
         if int(getattr(deal, "executionTimestamp", 0) or 0) > 0:
@@ -1253,7 +1302,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         return LiveExecution(
             signal_id=signal_uuid,
             actual_price=_to_float(getattr(deal, "executionPrice", 0)),
-            filled_qty=filled_volume,
+            filled_qty=filled_qty,
             commission=_to_float(getattr(deal, "commission", 0)),
             timestamp=_to_datetime_from_ms(timestamp_ms),
             broker_order_id=broker_order_id,
@@ -1322,6 +1371,21 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                     extra={"data": {"account_id": self.ctid_trader_account_id}},
                 )
 
+    def _validate_pre_persistence(self, signal: LiveSignal) -> None:
+        """B-8: validate symbol/action BEFORE the first persistence.
+
+        A signal persisted without a broker order wedges every redelivery on
+        the duplicate-persisted recovery path, so the cheap in-memory checks
+        run ahead of save_live_signal.
+        """
+        if signal.action not in {"buy", "sell"}:
+            raise ValueError(f"Unsupported action '{signal.action}'")
+        if self._symbol_name_to_id.get(signal.symbol.upper()) is None:
+            raise ValueError(
+                f"Unknown cTrader symbol: {signal.symbol!r}; refusing to "
+                "persist or submit the signal."
+            )
+
     async def submit_order(self, signal: LiveSignal) -> str:
         self._raise_if_terminal_auth_failed()
         signal_id = str(signal.id)
@@ -1337,6 +1401,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
 
         if not self._connected or not self._authenticated:
             await self.connect()
+
+        self._validate_pre_persistence(signal)
 
         balance, _ = await self.get_balance()
         sized_order = size_live_signal(signal, account_balance=balance)
@@ -1368,8 +1434,6 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             return await self._recover_duplicate_signal_order_id(canonical_signal_id)
 
         symbol_id = await self._resolve_symbol_id(signal.symbol)
-        if signal.action not in {"buy", "sell"}:
-            raise ValueError(f"Unsupported signal action: {signal.action}")
 
         request = self._build_new_order_request(signal, symbol_id=symbol_id)
         response = await self._submit_new_order_request(request)
@@ -1452,6 +1516,11 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         if symbol_id is None:
             await self._authenticate()
             symbol_id = self._symbol_name_to_id.get(symbol.upper())
+        if symbol_id is None:
+            raise ValueError(
+                f"Unknown cTrader symbol: {symbol!r}; refusing to "
+                "persist or submit the signal."
+            )
         return symbol_id
 
     def _build_new_order_request(self, signal: LiveSignal, *, symbol_id: int) -> Any:
@@ -1641,7 +1710,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             symbol_id = int(getattr(trade_data, "symbolId", 0) or 0)
             symbol = symbol_id_to_name.get(symbol_id, str(symbol_id))
             volume = _to_float(getattr(trade_data, "volume", 0))
-            qty = volume / 1000.0
+            qty = _broker_volume_to_qty(volume)
             if int(getattr(trade_data, "tradeSide", 0) or 0) == self._ProtoOATradeSide.SELL:
                 qty = -qty
             payload.append(
@@ -1685,10 +1754,12 @@ class CTraderLiveAdapter(BaseLiveAdapter):
 
         timestamp_ms = self._resolve_execution_timestamp_ms(order=order, deal=deal)
         filled_volume = self._resolve_filled_volume(order=order, deal=deal)
+        # Unit contract: persist filled_qty in qty units (broker volume / 1000).
+        filled_qty = _broker_volume_to_qty(filled_volume)
         execution = LiveExecution(
             signal_id=signal_id,
             actual_price=self._resolve_execution_price(order=order, deal=deal),
-            filled_qty=filled_volume,
+            filled_qty=filled_qty,
             commission=_to_float(deal.commission) if deal is not None else 0.0,
             timestamp=_to_datetime_from_ms(timestamp_ms),
             broker_order_id=str(order_id or ""),

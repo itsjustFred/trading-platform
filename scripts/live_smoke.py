@@ -428,7 +428,10 @@ async def _ctrader_order_worker(
         theoretical_price=1.0,
         timestamp=datetime.now(timezone.utc),
         metadata={
-            "ctrader_volume": volume,
+            # Unit contract: metadata 'qty' is in qty units (broker volume / 1000);
+            # raw broker-unit keys ('ctrader_volume') are no longer read by the
+            # adapter (Cleanup 15-D, B-7).
+            "qty": float(volume) / 1000.0,
             "entry_price": 1.0,
             "timeframe": "1m",
         },
@@ -521,7 +524,10 @@ async def _ctrader_strategy_e2e_worker(
         theoretical_price=1.0,
         timestamp=datetime.now(timezone.utc),
         metadata={
-            "ctrader_volume": 100000,
+            # Unit contract: qty is in qty units (broker volume / 1000), i.e.
+            # 100000 broker volume == 100.0 qty. The adapter no longer reads
+            # raw broker-unit metadata keys (Cleanup 15-D, B-7).
+            "qty": 100.0,
             "entry_price": 1.0,
             "stop_loss": 0.99,
             "timeframe": deployment.timeframe,

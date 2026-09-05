@@ -589,14 +589,25 @@ def _resolve_exit_only_target_qty(
     positions: Iterable[Mapping[str, object]],
     symbol: str,
 ) -> float:
+    """Return the total long quantity to flatten for ``symbol``.
+
+    Hedging accounts (cTrader default) can hold several lots of the same
+    symbol as separate positions; netting accounts fold them into one row.
+    Both shapes must flatten the whole long exposure, so matching quantities
+    are summed. Rows that cannot be parsed are skipped (fail-closed: the
+    close then covers less, and a residual row is still visible on the
+    broker), never crash the close.
+    """
     target_qty = 0.0
     for position in positions:
         position_symbol = str(position.get("symbol") or "").strip().upper()
         if position_symbol != symbol.upper():
             continue
-        resolved_qty = _coerce_live_float(position.get("qty"), field_name="qty")
-        target_qty = max(resolved_qty, 0.0)
-        break
+        try:
+            resolved_qty = _coerce_live_float(position.get("qty"), field_name="qty")
+        except ValueError:
+            continue
+        target_qty += max(resolved_qty, 0.0)
     return target_qty
 
 
@@ -635,6 +646,16 @@ async def _broker_exposure_estimate(
     adapter: BaseLiveAdapter,
     deployment: LiveDeploymentConfig,
 ) -> tuple[int | None, float]:
+    """Estimate the open risk already at stake on the broker.
+
+    Unit contract: the estimate is a fraction of account balance (risk-at-stake),
+    the same unit as ``RiskConfig.max_total_exposure`` — NOT a quantity or a
+    notional. Each open position was sized at most ``max_risk_per_trade`` of
+    balance (enforced by ``submit_order_with_risk`` -> risk engine), so the
+    worst-case open risk is ``count * max_risk_per_trade``. The estimate is
+    clamped to ``max_total_exposure``: position rows fetched between snapshots
+    must not fabricate budget overflow beyond the configured cap.
+    """
     open_positions_count: int | None = None
     broker_exposure = 0.0
     get_positions = getattr(adapter, "get_positions", None)
@@ -643,7 +664,10 @@ async def _broker_exposure_estimate(
         open_positions_count = _count_open_broker_positions(positions)
         # Conservative estimate: each open position was sized at max_risk_per_trade.
         risk_config = _risk_config_for_deployment(deployment)
-        broker_exposure = open_positions_count * risk_config.max_risk_per_trade
+        broker_exposure = min(
+            open_positions_count * risk_config.max_risk_per_trade,
+            risk_config.max_total_exposure,
+        )
     return open_positions_count, broker_exposure
 
 
