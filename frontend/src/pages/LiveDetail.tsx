@@ -75,6 +75,9 @@ export function LiveDetailPage() {
   const [isStartingReplay, setIsStartingReplay] = useState(false);
   const [signalProcessors, setSignalProcessors] = useState<SignalProcessorOption[]>([]);
   const [signalProcessorsLoading, setSignalProcessorsLoading] = useState(false);
+  // Tracks the last modal-open transition that already kicked off a fetch, so the
+  // modal fetches processors once per open instead of in an infinite loop.
+  const processorsFetchedForOpenRef = useRef(false);
   const [replayForm, setReplayForm] = useState<ReplayFormState>(() => {
     const today = new Date();
     const endDate = today.toISOString().slice(0, 10);
@@ -146,15 +149,21 @@ export function LiveDetailPage() {
   }, [accountId]);
 
   useEffect(() => {
-    if (!replayModalOpen || signalProcessorsLoading) {
+    if (!replayModalOpen) {
+      // Allow the next open transition to refetch (processors can appear meanwhile).
+      processorsFetchedForOpenRef.current = false;
       return;
     }
+    if (processorsFetchedForOpenRef.current) {
+      return;
+    }
+    processorsFetchedForOpenRef.current = true;
     setSignalProcessorsLoading(true);
     getSignalProcessors()
       .then((payload) => setSignalProcessors(payload))
       .catch(() => setSignalProcessors([]))
       .finally(() => setSignalProcessorsLoading(false));
-  }, [replayModalOpen, signalProcessorsLoading]);
+  }, [replayModalOpen]);
 
   const equitySeries = useMemo(
     () =>
