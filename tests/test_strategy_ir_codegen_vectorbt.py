@@ -385,12 +385,11 @@ def test_generated_code_metadata_round_trips_quotes_and_backslashes():
         # split keyword family
         ("Fast EMA cross below Slow EMA", "_cross_under("),
         ("Fast EMA cross above Slow EMA", "_cross_over("),
-        # overbought / take-profit family
-        ("RSI overbought", "(indicator_rsi_fast > 70)"),
-        ("RSI take profit", "(indicator_rsi_fast > 70)"),
-        # oversold / stop family
-        ("RSI oversold", "(indicator_rsi_fast < 30)"),
-        ("RSI risk-off", "(indicator_rsi_fast < 30)"),
+        # F4 (16-B): RSI-threshold keyword guessing is REMOVED — "overbought"/
+        # "take profit"/"oversold"/"risk-off" prose no longer fabricates
+        # (primary > 70) / (primary < 30) rules. Explicit expressions are the
+        # contract; see tests/test_codegen_loud_failures.py for the fail-loud
+        # pin of the removed keyword families.
     ],
 )
 def test_rule_keyword_families_are_pinned(expression: str, expected_fragment: str):
@@ -444,8 +443,12 @@ def test_comparison_families_are_pinned(expression: str, expected_fragment: str)
     )
 
 
-def test_unrecognized_expression_falls_back_and_is_detectable():
-    """An unknown wording must produce the documented fallback, not a crash."""
+def test_unrecognized_expression_fails_loudly():
+    """F4 (16-B): unknown wording must fail loudly, never fabricate a rule."""
+    import pytest as _pytest
+
+    from runner.strategy_ir.codegen_vectorbt import _untranslatable  # noqa: F401
+
     strategy_ir = _injection_ir(
         name="Fallback Demo",
         indicator_label="Fast EMA",
@@ -454,7 +457,5 @@ def test_unrecognized_expression_falls_back_and_is_detectable():
     )
     strategy_ir.exit_signals = []
 
-    code = generate_vectorbt_strategy_code(strategy_ir)
-
-    # Documented fallback: entry uses (primary > secondary).
-    assert "(indicator_fast_ema > close.shift(1))" in code
+    with _pytest.raises(ValueError, match="Cannot deterministically translate"):
+        generate_vectorbt_strategy_code(strategy_ir)

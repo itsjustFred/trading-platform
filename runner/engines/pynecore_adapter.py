@@ -23,6 +23,7 @@ from typing import Any
 
 import pandas as pd
 
+from runner.engines import contract
 from runner.engines.base import (
     BacktestConfig,
     EngineAdapter,
@@ -34,12 +35,69 @@ from runner.engines.vectorbt_adapter import (
     _resolve_max_leverage,
     _resolve_max_position_pct,
 )
+from runner.stats import compute_stats_for_result
 from shared.constants import DATA_DIR
 from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, TradeExit
 
 logger = logging.getLogger(__name__)
 
 IndicatorMap = dict[str, tuple[pd.Series, str]]
+
+
+def _pyne_cli_end_bound(end_date: str) -> str:
+    """Translate a config end date into the ``pyne`` CLI's ``--to`` bound.
+
+    Conformance (Cleanup 16-A, F9): a date-only end boundary is inclusive of
+    the whole end day. The adapter's own parquet loader enforces that via
+    :func:`contract.apply_date_filter`, but the external ``pyne`` CLI applies
+    its own window: a date-only ``--to`` value is parsed with
+    ``datetime.fromisoformat`` into a **midnight** bound (bars stamped
+    ``01:00``–``23:00`` of the end date are dropped from the replay). Passing
+    the raw ``end_date`` through therefore re-introduces the exact
+    midnight-truncation the F9 Decision Record removed everywhere else, and
+    pyne's replay window becomes a strict subset of native/vectorbt's for the
+    same configuration.
+
+    A date-only end date is translated to the inclusive end-of-day instant
+    (``"2024-01-01"`` → ``"2024-01-01T23:59:59.999999+00:00"``), which the CLI
+    parses and applies as-is; a value that already carries a time component
+    already states the intended bound and is passed through unchanged.
+
+    Timezone note: the translated instant carries an explicit ``+00:00``
+    offset, so the CLI's host-TZ handling (see
+    :func:`_pyne_cli_start_bound`) can never shift it.
+    """
+    raw = str(end_date or "").strip()
+    if not raw:
+        return raw
+    if "T" not in raw and ":" not in raw:
+        return contract.parse_date_bound(raw, is_end=True).isoformat()
+    return raw
+
+
+def _pyne_cli_start_bound(start_date: str) -> str:
+    """Translate a config start date into the ``pyne`` CLI's ``--from`` bound.
+
+    Conformance (Cleanup 16-A, F9): naive timestamps are interpreted as UTC.
+    The CLI, however, parses ``--from`` with ``datetime.fromisoformat`` and
+    resolves the resulting NAIVE datetime through ``timestamp()`` — i.e. in
+    the HOST timezone. A date-only ``--from 2024-01-01`` therefore lands at
+    ``2024-01-01T05:00Z`` on an ``America/New_York`` host and silently drops
+    the first five UTC bars of the day (verified against pynesys-pynecore
+    6.8.14): the replay window would depend on where the adapter runs, not on
+    the configuration.
+
+    Translating the date-only start to an AWARE UTC start-of-day instant
+    (``"2024-01-01"`` → ``"2024-01-01T00:00:00+00:00"``) makes the bound
+    host-TZ independent; a value that already carries a time component
+    already states the intended bound and is passed through unchanged.
+    """
+    raw = str(start_date or "").strip()
+    if not raw:
+        return raw
+    if "T" not in raw and ":" not in raw:
+        return contract.parse_date_bound(raw, is_end=False).isoformat()
+    return raw
 
 
 class PyneCoreAdapter(EngineAdapter):
@@ -101,13 +159,21 @@ class PyneCoreAdapter(EngineAdapter):
                 )
             )
 
-        return BacktestResult(
+        result = BacktestResult(
             meta=_pyne_meta(config, strategy_name, resolved_parameters, total_bars),
             trades=all_trades,
             equity_curve=_equity_curve_from_trades(config, all_trades),
             stats=all_stats,
             drawings=all_drawings,
         )
+        # Conformance (Cleanup 16-A): every engine exposes the canonical
+        # BacktestStats key set; the engine-specific strategy stats are merged
+        # on top of the derived ones. Contract §6: engine keys may add, never
+        # remove — canonical keys win a name collision.
+        result.stats = contract.EngineStatsKeys.merge_over_canonical(
+            compute_stats_for_result(result), result.stats
+        )
+        return result
 
     def _run_pyne_for_symbol(
         self,
@@ -189,9 +255,9 @@ class PyneCoreAdapter(EngineAdapter):
             str(stats_csv),
         ]
         if config.start_date:
-            cmd.extend(["--from", config.start_date])
+            cmd.extend(["--from", _pyne_cli_start_bound(config.start_date)])
         if config.end_date:
-            cmd.extend(["--to", config.end_date])
+            cmd.extend(["--to", _pyne_cli_end_bound(config.end_date)])
 
         logger.info(
             "Running PyneCore: %s on %s (%d bars)", config.strategy_name, symbol, bar_count

@@ -88,7 +88,7 @@ class _FailingSymbolProcessor:
     def __call__(self, symbol, config, strategy_path, resolved_parameters, data_root):
         if symbol == "QQQ":
             raise RuntimeError("No OHLCV data for QQQ/1d")
-        return [], [], [], []
+        return [], [], [], [], 0
 
 
 def test_vectorbt_parallel_branch_preserves_loud_failure(monkeypatch):

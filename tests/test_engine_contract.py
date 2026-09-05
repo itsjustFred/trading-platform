@@ -1060,10 +1060,15 @@ class TestTotalBarsContract:
         """Conformance: pynecore sums ``len(df)`` over the loaded symbols."""
         data_dir = tmp_contract_dir(contract_data_dir)
         frame = _read_parquet(data_dir, "PARITY", "1h")
-        result = PyneCoreAdapter().run(_config(data_dir), STRATEGY_PATH)
-        # pyne CLI is not installed in this environment; the adapter logs and
-        # skips symbol processing, but total_bars must still reflect the bars
-        # it loaded (not trades, not zero).
+        # The pyne CLI is stubbed at the subprocess boundary (as in the other
+        # pyne tests): F11 makes a genuinely missing binary a loud failure, so
+        # the bar-count contract must be observable with the CLI dispatch
+        # stubbed — total_bars reflects the bars loaded (not trades, not zero).
+        result = _run_pyne_with_stubbed_cli(
+            _config(data_dir), STRATEGY_PATH,
+            trade_csv_text=TestStatsKeysContract.PYNE_TRADE_CSV,
+            stats_csv_text=TestStatsKeysContract.PYNE_STATS_CSV,
+        )
         assert result.meta.total_bars == len(frame)
 
     def test_total_bars_is_not_the_trade_count(self, contract_data_dir: Path):
