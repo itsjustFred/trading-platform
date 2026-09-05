@@ -79,7 +79,10 @@ def _resolve_strategy_type(strategy_path: str) -> StrategyType:
     resolved = Path(strategy_path).resolve()
     if not resolved.exists():
         return StrategyType.MARKET_DATA
-    return detect_strategy_type(resolved)
+    # The run already trusts this explicit path (cmd_run would import it via
+    # load_strategy_module); contain the metadata read to the file's own
+    # directory so user-selected paths outside the strategy tree still work.
+    return detect_strategy_type(resolved, resolved.parent)
 
 
 def _detect_date_range(symbols: list[str], timeframe: str, data_dir: str = "") -> tuple[str, str]:

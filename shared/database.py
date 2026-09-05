@@ -6,13 +6,13 @@ import os
 import re
 import subprocess
 import threading
+import contextlib
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 from uuid import uuid4
 
-from dotenv import load_dotenv
 from sqlalchemy import (
     JSON,
     Column,
@@ -57,27 +57,123 @@ from shared.models import (
 
 logger = get_logger("database")
 
+# shared.constants loads .env exactly once (see its module docstring); importing
+# DATA_DIR from it here makes that ordering dependency explicit instead of
+# relying on callers importing shared.constants first.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-load_dotenv(PROJECT_ROOT / ".env")
+# .env is loaded exactly once, in shared.constants, before any module reads
+# os.environ for configuration. Do not add load_dotenv() here: it would freeze
+# configuration at a different point in the import order and could disagree
+# with the DATA_DIR this module already resolved.
 DATA_DIR = RESOLVED_DATA_DIR
 DB_PATH = DATA_DIR / "backtests.db"
+# Optional engine override. New code should call get_engine(); importing
+# ENGINE no longer forces engine creation at import time. Tests that need a
+# bespoke engine set this attribute directly (it is part of the module
+# contract, so monkeypatching it does not materialize hidden state).
+ENGINE: Any = None
 
 
 def _sqlite_url(path: Path) -> str:
     return f"sqlite:///{path.as_posix()}"
 
 
-ENGINE = create_engine(
-    _sqlite_url(DB_PATH),
-    echo=False,
-    connect_args={
-        "check_same_thread": False,
-        "timeout": 30.0,
-    },
-)
+def _default_database_url() -> str:
+    return _sqlite_url(DATA_DIR / "backtests.db")
 
 
-@event.listens_for(ENGINE, "connect")
+def _is_sqlite_url(url: str) -> bool:
+    return url.strip().lower().startswith("sqlite")
+
+
+def _create_database_engine() -> Any:
+    url = os.environ.get("DATABASE_URL") or _default_database_url()
+    # SQLite-specific connect args (and the WAL pragma listener) are only
+    # meaningful for SQLite: passing check_same_thread/timeout to another
+    # dialect is an error.
+    connect_args = (
+        {"check_same_thread": False, "timeout": 30.0} if _is_sqlite_url(url) else {}
+    )
+    engine = create_engine(url, echo=False, connect_args=connect_args)
+    if _is_sqlite_url(url):
+        event.listen(engine, "connect", _configure_sqlite_connection)
+    return engine
+
+
+_ENGINE: Any = None
+_ENGINE_LOCK = threading.Lock()
+_WARNED_DRIFT = False
+
+
+def _warn_if_data_dir_drifted() -> None:
+    """Warn when this module's DATA_DIR diverged from shared.constants'.
+
+    ``shared.constants.set_data_dir()`` is the only supported way to move the
+    data directory: it re-binds ``database.DATA_DIR``/``DB_PATH`` and resets the
+    engine. A direct ``constants.DATA_DIR = ...`` assignment (or any future
+    second writer) leaves this module's by-value copy behind — every engine and
+    session then silently keeps reading/writing the OLD directory. The check is
+    warn-once and never raises: production behaviour must not depend on it, but
+    the drift must be visible in the logs.
+    """
+    global _WARNED_DRIFT
+    if _WARNED_DRIFT:
+        return
+    try:
+        from shared import constants as _constants
+    except Exception:  # pragma: no cover - constants is always importable here
+        return
+    if DATA_DIR != _constants.DATA_DIR:
+        _WARNED_DRIFT = True
+        logger.warning(
+            "DATA_DIR drift detected: shared.database is using %s while "
+            "shared.constants uses %s. Rebind via shared.constants.set_data_dir() "
+            "only — direct assignment does not update the database paths.",
+            DATA_DIR,
+            _constants.DATA_DIR,
+        )
+
+
+def get_engine() -> Any:
+    """Return the process-wide SQLAlchemy engine, creating it on first use.
+
+    Lazy creation keeps imports side-effect free (no engine bound to a
+    possibly stale DATA_DIR) while guaranteeing a single engine per process.
+    An explicit ``ENGINE`` override (set by tests or embedders via
+    ``shared.database.ENGINE = engine``) always wins — it is used as handed
+    over, so the override owns its own pragmas (the test fixtures register
+    ``_configure_sqlite_connection`` themselves).
+    """
+    global _ENGINE
+    if ENGINE is not None:
+        return ENGINE
+    _warn_if_data_dir_drifted()
+    if _ENGINE is None:
+        with _ENGINE_LOCK:
+            if _ENGINE is None:
+                # _create_database_engine registers the SQLite pragma listener
+                # itself; no second listener here (it would fire twice).
+                _ENGINE = _create_database_engine()
+    return _ENGINE
+
+
+def reset_engine() -> None:
+    """Dispose and forget the lazily created engine (test isolation helper)."""
+    global _ENGINE
+    with _ENGINE_LOCK:
+        if _ENGINE is not None:
+            with contextlib.suppress(Exception):
+                _ENGINE.dispose()
+        _ENGINE = None
+
+
+def reset_initialized() -> None:
+    """Forget that the schema was initialized (test isolation helper)."""
+    global _DB_INITIALIZED
+    with _DB_INIT_LOCK:
+        _DB_INITIALIZED = False
+
+
 def _configure_sqlite_connection(dbapi_connection: Any, _connection_record: Any) -> None:
     cursor = dbapi_connection.cursor()
     try:
@@ -100,6 +196,16 @@ _FINAL_TASK_STATUSES = {
     "partial",
     "skipped",
 }
+
+
+def is_final_task_status(status: object) -> bool:
+    """True when ``status`` is a final background-task status.
+
+    Public predicate so callers (e.g. the scheduler consuming a job handler's
+    reported outcome) do not have to import the private ``_FINAL_TASK_STATUSES``
+    set.
+    """
+    return isinstance(status, str) and status in _FINAL_TASK_STATUSES
 _TASK_STATUS_TO_EVIDENCE_STATUS = {
     "completed": VerificationEvidenceStatus.SUCCESS.value,
     "failed": VerificationEvidenceStatus.FAILED.value,
@@ -819,20 +925,24 @@ def _normalize_task_record(row: Any) -> BackgroundTaskRecord | None:
 
 @contextmanager
 def get_session() -> Iterator[Session]:
-    with Session(ENGINE) as session:
+    with Session(get_engine()) as session:
         yield session
 
 
 def init_db() -> None:
     global _DB_INITIALIZED
+    _warn_if_data_dir_drifted()
     if _DB_INITIALIZED:
+        # The data directory may have moved (set_data_dir) since the last
+        # initialization; make sure it exists before any session touches it.
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
         return
 
     with _DB_INIT_LOCK:
         if _DB_INITIALIZED:
             return
         DATA_DIR.mkdir(parents=True, exist_ok=True)
-        SQLModel.metadata.create_all(ENGINE)
+        SQLModel.metadata.create_all(get_engine())
         _migrate_schema()
         _DB_INITIALIZED = True
 
@@ -1030,7 +1140,7 @@ def _migrate_live_signal_discord_identity(connection: Connection) -> None:
 @contextmanager
 def _schema_migration_connection() -> Iterator[Connection]:
     """Run SQLite schema changes with FK DDL disabled, then validate before commit."""
-    with ENGINE.connect() as connection:
+    with get_engine().connect() as connection:
         foreign_keys_enabled = int(
             connection.execute(text("PRAGMA foreign_keys")).scalar_one()
         )

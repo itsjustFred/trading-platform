@@ -578,7 +578,7 @@ def test_dedupe_executions_keeps_oldest_row(isolated_db):
 
     from scripts.dedupe_executions import dedupe_executions
 
-    deleted = dedupe_executions()
+    deleted = dedupe_executions(confirm=True)
 
     assert deleted == 1
     with database.get_session() as session:

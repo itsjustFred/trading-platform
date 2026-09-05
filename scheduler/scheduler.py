@@ -3,21 +3,32 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from datetime import datetime, timezone
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
+from scheduler.jobs.signal_bot_health_check import run as run_signal_bot_health_check
 from scheduler.jobs.weekly_data_refresh import run as run_weekly_data_refresh
-from shared.database import list_services, update_service_status, upsert_background_task_record
+from shared.database import (
+    is_final_task_status,
+    list_services,
+    update_service_status,
+    upsert_background_task_record,
+)
 from shared.logging import get_logger
 from shared.models import Service, ServiceStatus, ServiceType
 from shared.sentry import capture_exception
 
 logger = get_logger("scheduler")
 
-_SCHEDULED_JOB_HANDLERS: dict[str, Callable[..., Awaitable[None]]] = {
+# Handlers must either write their own final task record or raise — the wrapper's
+# completed-write below is a fallback, not the truth. A handler may also return a
+# mapping with a final "status" key (e.g. "partial"/"skipped"); that status is
+# recorded verbatim instead of an unconditional "completed".
+_SCHEDULED_JOB_HANDLERS: dict[str, Callable[..., Awaitable[Any]]] = {
     "weekly_data_refresh": run_weekly_data_refresh,
+    "signal_bot_health_check": run_signal_bot_health_check,
 }
 
 
@@ -193,30 +204,59 @@ class ServiceScheduler:
 
         try:
             handler = _SCHEDULED_JOB_HANDLERS[job_type]
-            await handler(task_id=task_id, service_id=service_id, service_name=service_name)
+            result = await handler(
+                task_id=task_id, service_id=service_id, service_name=service_name
+            )
             finished = datetime.now(timezone.utc)
+            # A handler may report a truthful non-success outcome (e.g.
+            # "partial"/"skipped"/"failed" plus a result payload) by returning a
+            # mapping with a "status" key. Only accept statuses that are final
+            # task statuses; anything else (or a None return) is a plain
+            # completion. The handler may also have written its own final record
+            # (this write then just supersedes it with the same status).
+            handler_status: object | None = None
+            handler_result: dict[str, Any] | None = None
+            if isinstance(result, dict):
+                candidate = result.get("status")
+                if is_final_task_status(candidate):
+                    handler_status = candidate
+                    handler_result = result
             complete_config = dict(base_config)
+            final_status = str(handler_status or "completed")
+            succeeded = final_status == "completed"
+            if handler_result is not None:
+                complete_config["result"] = dict(handler_result)
+                detail = handler_result.get("errors") or []
+                current = (
+                    f"{final_status}: {detail[0]}"
+                    if detail
+                    else f"Completed ({final_status})"
+                )
+            else:
+                current = "Completed" if succeeded else final_status
             complete_config.update(
                 {
                     "finished_at": finished.isoformat(),
                     "progress_percent": 100.0,
                     "progress_detail": {
-                        "completed": 1,
-                        "failed": 0,
+                        "completed": 1 if succeeded else 0,
+                        "failed": 1 if final_status == "failed" else 0,
                         "total": 1,
                         "percent": 100.0,
-                        "current": "Completed",
+                        "current": current,
                     },
-                    "result": {"status": "completed"},
+                    "result": complete_config.get("result") or {"status": final_status},
                 }
             )
+            if not succeeded:
+                complete_config["error"] = current
             await asyncio.to_thread(
                 upsert_background_task_record,
                 task_id=task_id,
                 task_type="service",
-                status="completed",
+                status=final_status,
                 config_json=complete_config,
-                progress_message="Completed",
+                progress_message=current,
                 name=f"{service_name} · {job_type}",
                 description=f"Scheduled service job '{job_type}'",
                 source="scheduler",

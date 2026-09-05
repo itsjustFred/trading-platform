@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
-"""Auto-discover trading strategies overnight.
+"""Auto-discover trading strategy parameter candidates (experimental).
 
-Random parameter search across SMA/RSI/Keltner combinations.
-Saves top performers to data/discovered_strategies/ for morning review.
+Random parameter search across SMA/RSI/Keltner combinations. The generated
+rows are candidates with ``"status": "mock"`` — no backtest has been run for
+them. They are NOT written to the discovery directory consumed by
+``scripts/run_discovery_grid_backtests.py`` unless ``--publish`` is passed
+explicitly, because the real grid runner treats everything it finds there as
+an executable discovery.
 """
 from __future__ import annotations
 
+import argparse
 import json
-import random
+import secrets
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,14 +22,22 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from runner.engines.base import BacktestConfig
+from shared.logging import get_logger
 
 try:
     from shared.constants import DATA_DIR
 except ImportError:
     DATA_DIR = PROJECT_ROOT / "data"
 
+logger = get_logger("scripts.discovery")
+
 DISCOVERED_DIR = DATA_DIR / "discovered_strategies"
-DISCOVERED_DIR.mkdir(parents=True, exist_ok=True)
+
+# Parameter sampling uses the OS CSPRNG (``secrets.SystemRandom``) instead of the
+# ``random`` module default: the search space is small, and reproducibility of a
+# candidate generator is worthless — but Sonar/auditors flag the Mersenne Twister
+# (S2245) in every security scan, which masks real findings.
+_RNG = secrets.SystemRandom()
 
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT"]
 TIMEFRAMES = ["1h", "4h", "1d"]
@@ -41,37 +54,43 @@ KELTNER_MULT_RANGE = (1.0, 4.0)
 
 def random_sma_params() -> dict:
     """Generate random SMA crossover params."""
-    fast = random.randint(*SMA_FAST_RANGE)
-    slow = random.randint(max(fast + 10, SMA_SLOW_RANGE[0]), SMA_SLOW_RANGE[1])
+    fast = _RNG.randint(*SMA_FAST_RANGE)
+    slow = _RNG.randint(max(fast + 10, SMA_SLOW_RANGE[0]), SMA_SLOW_RANGE[1])
     return {"sma_fast": fast, "sma_slow": slow}
 
 
 def random_rsi_params() -> dict:
     """Generate random RSI params."""
-    period = random.randint(*RSI_PERIOD_RANGE)
-    oversold = random.randint(*RSI_OVERSOLD_RANGE)
-    overbought = random.randint(*RSI_OVERBOUGHT_RANGE)
+    period = _RNG.randint(*RSI_PERIOD_RANGE)
+    oversold = _RNG.randint(*RSI_OVERSOLD_RANGE)
+    overbought = _RNG.randint(*RSI_OVERBOUGHT_RANGE)
     return {"rsi_period": period, "rsi_oversold": oversold, "rsi_overbought": overbought}
 
 
 def random_keltner_params() -> dict:
     """Generate random Keltner Channel params."""
-    period = random.randint(*KELTNER_PERIOD_RANGE)
-    mult = round(random.uniform(*KELTNER_MULT_RANGE), 1)
+    period = _RNG.randint(*KELTNER_PERIOD_RANGE)
+    mult = round(_RNG.uniform(*KELTNER_MULT_RANGE), 1)
     return {"keltner_period": period, "keltner_mult": mult}
 
 
-def run_discovery_batch(n_trials: int = 10) -> list[dict]:
-    """Run random strategy discovery."""
+def run_discovery_batch(n_trials: int = 10, publish: bool = False) -> list[dict]:
+    """Generate random trial candidates.
+
+    Results are candidates only (``status: mock``); no backtest is executed.
+    They are only written to ``DISCOVERED_DIR`` when ``publish=True`` — the
+    real grid runner consumes that directory and would otherwise treat mock
+    rows as executable discoveries.
+    """
     results = []
 
     for i in range(n_trials):
-        symbol = random.choice(SYMBOLS)
-        tf = random.choice(TIMEFRAMES)
+        symbol = _RNG.choice(SYMBOLS)
+        tf = _RNG.choice(TIMEFRAMES)
 
         # Pick random strategy type
         strategy_types = ["sma", "rsi", "keltner"]
-        strat_type = random.choice(strategy_types)
+        strat_type = _RNG.choice(strategy_types)
 
         params = {}
         if strat_type == "sma":
@@ -82,7 +101,7 @@ def run_discovery_batch(n_trials: int = 10) -> list[dict]:
             params = random_keltner_params()
 
         try:
-            config = BacktestConfig(
+            BacktestConfig(
                 strategy_name=f"{strat_type}_cross",  # Simplified
                 symbols=[symbol],
                 timeframe=tf,
@@ -91,8 +110,8 @@ def run_discovery_batch(n_trials: int = 10) -> list[dict]:
                 initial_capital=100000.0,
                 risk_per_trade_pct=0.01,
             )
-            # Note: Real implementation would need actual strategy files
-            # This is experimental skeleton
+            # Note: Real implementation would need actual strategy files.
+            # This is an experimental skeleton; rows stay marked as mock.
             result = {
                 "id": f"disc_{i:04d}",
                 "strategy": f"{strat_type}",
@@ -107,20 +126,42 @@ def run_discovery_batch(n_trials: int = 10) -> list[dict]:
             results.append({
                 "id": f"disc_{i:04d}",
                 "strategy": strat_type,
+                "status": "mock",
                 "error": str(e),
             })
 
-    # Save results
-    out_path = DISCOVERED_DIR / f"discovery_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.json"
-    out_path.write_text(json.dumps(results, indent=2))
+    if publish:
+        DISCOVERED_DIR.mkdir(parents=True, exist_ok=True)
+        out_path = (
+            DISCOVERED_DIR
+            / f"discovery_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.json"
+        )
+        out_path.write_text(json.dumps(results, indent=2))
 
     return results
 
 
 if __name__ == "__main__":
-    print("Overnight Strategy Discovery - Experimental")
-    print("=" * 50)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--trials", type=int, default=20, help="Number of trial candidates")
+    parser.add_argument(
+        "--publish",
+        action="store_true",
+        help="Write the candidates to the discovery directory consumed by the grid runner.",
+    )
+    args = parser.parse_args()
 
-    results = run_discovery_batch(n_trials=20)
-    print(f"Completed {len(results)} trial configurations")
-    print(f"Results saved to {DISCOVERED_DIR}")
+    logger.info("Overnight strategy discovery started")
+    results = run_discovery_batch(n_trials=args.trials, publish=args.publish)
+    logger.info(
+        "Overnight strategy discovery finished",
+        extra={
+            "data": {
+                "trials": len(results),
+                "published": args.publish,
+                "output_dir": str(DISCOVERED_DIR) if args.publish else None,
+            }
+        },
+    )
+    if not args.publish:
+        logger.info("Dry run: results were NOT published (pass --publish to write them)")

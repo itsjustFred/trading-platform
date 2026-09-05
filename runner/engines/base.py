@@ -77,8 +77,12 @@ def resolve_strategy_parameters(
     overrides: dict[str, Any] | None,
 ) -> dict[str, Any]:
     """Merge STRATEGY_META.parameters defaults with explicit overrides."""
+    resolved = Path(strategy_path).resolve()
     try:
-        meta = load_strategy_meta(Path(strategy_path).resolve())
+        # The run already trusts this explicit path (it is about to be imported
+        # by load_strategy_module); allow metadata reads outside the default
+        # strategy tree by containing to the file's own directory.
+        meta = load_strategy_meta(resolved, resolved.parent)
     except Exception:
         meta = {}
 

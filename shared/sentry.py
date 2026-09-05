@@ -11,11 +11,13 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import sentry_sdk
-from dotenv import load_dotenv
 from sentry_sdk.integrations.logging import LoggingIntegration
 
+# shared.constants loads .env exactly once (see its module docstring); importing it
+# here makes that ordering dependency explicit instead of relying on import order.
+import shared.constants  # noqa: F401
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-load_dotenv(PROJECT_ROOT / ".env")
 
 _INITIALIZED = False
 _INITIALIZED_SERVICE: str | None = None

@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """Run the backtest matrix strategy queue conservatively.
 
-Two cron sessions can call this script. A lock file guarantees that only one
-session runs at a time, so if one session dies/crashes the other session wakes
-the queue again on the next tick.
+Two cron sessions can call this script. A flock-held lock file guarantees that
+only one session runs at a time: acquisition is race-free (the kernel arbitrates
+the lock), and a lock belonging to a live process is never removed. If a session
+dies, the OS releases its flock and the next cron tick retakes the lock.
 """
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
 import subprocess
 import sys
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -23,9 +25,18 @@ LOCK_PATH = MATRIX_DIR / "queue.lock"
 MAX_WORKERS = os.environ.get("MATRIX_MAX_WORKERS", "2")
 TIMEOUT_SECONDS = os.environ.get("MATRIX_TIMEOUT_SECONDS", "3600")
 ENGINE = os.environ.get("MATRIX_ENGINE", "vectorbt")
-LOCK_TTL_SECONDS = int(os.environ.get("MATRIX_LOCK_TTL_SECONDS", "7200"))
+
+# Handle for the flock currently held by this process (None when unlocked).
+_LOCK_HANDLE = None
 
 sys.path.insert(0, str(REPO))
+# Ensure this script's own checkout wins over the hardcoded REPO default when the
+# script is executed from a different worktree (tests import it via importlib).
+_HERE = str(Path(__file__).resolve().parent.parent)
+if _HERE != str(REPO) and _HERE in sys.path:
+    sys.path.remove(_HERE)
+    sys.path.insert(0, _HERE)
+    sys.path.insert(1, str(REPO))
 
 from shared.strategy_registry import iter_strategy_files, strategy_slug_for_path  # noqa: E402
 
@@ -64,6 +75,7 @@ def save_state(state: dict) -> None:
 
 
 def any_matrix_process_running() -> bool:
+    """Liveness probe (diagnostics only — never used for lock decisions)."""
     try:
         proc = subprocess.run(
             ["pgrep", "-f", r"python.*runner\.cli matrix"],
@@ -78,29 +90,58 @@ def any_matrix_process_running() -> bool:
 
 
 def acquire_lock() -> bool:
+    """Take the queue lock for this process.
+
+    The lock is an exclusive ``flock`` on ``queue.lock``: the kernel arbitrates
+    acquisition, so there is no check-then-create race and no mtime/TTL
+    heuristic. A lock held by a live process is never deleted; a file left
+    behind by a crashed writer is simply re-locked (its owner died, so the OS
+    released the flock) and its timestamp refreshed.
+    """
     MATRIX_DIR.mkdir(parents=True, exist_ok=True)
-    if LOCK_PATH.exists():
-        try:
-            age = time.time() - LOCK_PATH.stat().st_mtime
-            if age < LOCK_TTL_SECONDS:
-                return False
-            if any_matrix_process_running():
-                return False
-            LOCK_PATH.unlink()
-        except Exception:
-            return False
     try:
-        LOCK_PATH.write_text(now_iso(), encoding="utf-8")
+        lock_handle = LOCK_PATH.open("a+", encoding="utf-8")
+    except OSError:
+        return False
+
+    try:
+        try:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            lock_handle.close()
+            return False
+
+        lock_handle.seek(0)
+        lock_handle.truncate()
+        lock_handle.write(now_iso() + "\n")
+        lock_handle.flush()
+        # Keep the handle open for the lifetime of the lock: closing it would
+        # release the flock.
+        global _LOCK_HANDLE
+        _LOCK_HANDLE = lock_handle
         return True
     except Exception:
+        with contextlib.suppress(Exception):
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        with contextlib.suppress(Exception):
+            lock_handle.close()
         return False
 
 
 def release_lock() -> None:
+    """Release the queue lock held by this process, if any."""
+    global _LOCK_HANDLE
+    handle = _LOCK_HANDLE
+    if handle is None:
+        return
     try:
-        LOCK_PATH.unlink(missing_ok=True)
-    except Exception:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except OSError:
         pass
+    finally:
+        with contextlib.suppress(Exception):
+            handle.close()
+        _LOCK_HANDLE = None
 
 
 def grid_summary(strategy: str) -> dict | None:

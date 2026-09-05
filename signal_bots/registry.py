@@ -26,7 +26,14 @@ CONFIG_FILENAME = "config.yaml"
 
 def _load_yaml(path: Path) -> dict[str, Any]:
     if not path.exists():
-        return {}
+        # A missing mapped config must be loud: an empty dict here would make
+        # every bot built from it silently fall back to class defaults while the
+        # health check keeps validating the (missing) path. Callers that pass a
+        # per-call config override still get the override, never a partial file.
+        raise FileNotFoundError(
+            f"Signal processor config file not found: {path} "
+            f"(mapped via _BOT_DIRS — update signal_bots/registry.py if it moved)"
+        )
     payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     if not isinstance(payload, dict):
         raise ValueError(f"Signal processor config must decode to mapping: {path}")

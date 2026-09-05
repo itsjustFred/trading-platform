@@ -1,4 +1,9 @@
-"""Helpers for discovering and editing strategy assets."""
+"""Helpers for discovering and editing strategy assets.
+
+Listing/looking up strategies never executes strategy files: metadata is
+derived by parsing the module AST. Importing a strategy is reserved for the
+explicit :func:`load_strategy_module` entry point used by real backtest runs.
+"""
 
 from __future__ import annotations
 
@@ -98,6 +103,11 @@ def strategy_documentation_path(
 
 
 def load_strategy_module(path: Path, strategies_dir: Path = DEFAULT_STRATEGIES_DIR):
+    """Explicitly import a strategy module (executes the file).
+
+    Only real backtest/engine runs should call this: listing or looking up
+    strategies uses :func:`load_strategy_meta`, which parses instead.
+    """
     module_name = f"strategy_{strategy_slug_for_path(path, strategies_dir).replace('-', '_')}"
     spec = importlib.util.spec_from_file_location(module_name, str(path))
     if spec is None or spec.loader is None:
@@ -107,12 +117,75 @@ def load_strategy_module(path: Path, strategies_dir: Path = DEFAULT_STRATEGIES_D
     return module
 
 
-def load_strategy_meta(path: Path, strategies_dir: Path = DEFAULT_STRATEGIES_DIR) -> dict[str, Any]:
-    module = load_strategy_module(path, strategies_dir)
-    meta = getattr(module, "STRATEGY_META", None)
-    if isinstance(meta, dict):
-        return dict(meta)
-    return {}
+def _strategy_meta_literal(source: str) -> dict[str, Any] | None:
+    """Return the STRATEGY_META literal parsed from source, or None.
+
+    Never executes the file: the assignment is located in the module AST and
+    decoded with ``ast.literal_eval``. Dynamic (non-literal) metadata returns
+    None so callers can skip the strategy instead of importing it.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    for node in tree.body:
+        targets: list[ast.expr] = []
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+        if not any(
+            isinstance(target, ast.Name) and target.id == "STRATEGY_META" for target in targets
+        ):
+            continue
+        try:
+            value = ast.literal_eval(node.value)
+        except (ValueError, TypeError):
+            return None
+        return dict(value) if isinstance(value, dict) else None
+    return None
+
+
+def _read_source(path: Path) -> str | None:
+    """Return the file's source, or None if unreadable."""
+    try:
+        return path.resolve().read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def _contained_strategy_source(path: Path, strategies_dir: Path) -> str | None:
+    """Return the file's source, or None if unreadable or outside strategies_dir.
+
+    Validates the constructed path before touching the file system (S8707):
+    a ``path`` argument that escapes ``strategies_dir`` — e.g. via ``..`` or a
+    symlink pointing elsewhere — is rejected instead of read. Listing/lookup
+    only ever inspects the strategy tree, never arbitrary files.
+    """
+    try:
+        root = strategies_dir.resolve()
+        resolved = path.resolve()
+        resolved.relative_to(root)
+    except (OSError, ValueError):
+        return None
+    return _read_source(resolved)
+
+
+def load_strategy_meta(
+    path: Path, strategies_dir: Path | None = None
+) -> dict[str, Any]:
+    """Read a strategy's STRATEGY_META without executing the strategy file.
+
+    Reading is contained to ``strategies_dir`` (default: the repository's
+    strategy tree). Engine runs that need metadata for a user-selected path
+    outside the tree pass the file's own directory — the run already trusts
+    that path explicitly (see :func:`resolve_strategy_parameters`).
+    """
+    source = _contained_strategy_source(path, strategies_dir or DEFAULT_STRATEGIES_DIR)
+    if source is None:
+        return {}
+    meta = _strategy_meta_literal(source)
+    return dict(meta) if isinstance(meta, dict) else {}
 
 
 def _strategy_type_from_meta(meta: dict[str, Any]) -> StrategyType | None:
@@ -144,32 +217,52 @@ def _strategy_type_from_meta(meta: dict[str, Any]) -> StrategyType | None:
     return None
 
 
-def _module_has_signal_processor_class(module: Any) -> bool:
-    for value in vars(module).values():
-        if not isinstance(value, type):
+def _source_declares_signal_processor(source: str) -> bool:
+    """Return whether the source statically defines a signal-processor class.
+
+    Pure AST check (never executes the file): a class whose name ends with
+    ``SignalProcessor`` and that defines a ``process_signal`` method. Preserves
+    detection for strategies whose STRATEGY_META lacks a literal
+    ``strategy_type`` without reintroducing module execution.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return False
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef):
             continue
-        if value.__name__.lower().endswith("signalprocessor") and callable(
-            getattr(value, "process_signal", None)
-        ):
-            return True
+        if not node.name.lower().endswith("signalprocessor"):
+            continue
+        for item in node.body:
+            if (
+                isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and item.name == "process_signal"
+            ):
+                return True
     return False
 
 
 def detect_strategy_type(
     path: Path,
-    strategies_dir: Path = DEFAULT_STRATEGIES_DIR,
+    strategies_dir: Path | None = None,
 ) -> StrategyType:
-    module = load_strategy_module(path, strategies_dir)
+    """Detect the strategy type from parsed metadata, without executing the file.
 
-    meta = getattr(module, "STRATEGY_META", None)
-    if isinstance(meta, dict):
-        detected = _strategy_type_from_meta(meta)
-        if detected is not None:
-            return detected
-
-    if _module_has_signal_processor_class(module):
+    Resolution order: literal ``STRATEGY_META`` (``strategy_type``/``type``,
+    optionally under ``tags``), then a statically detected signal-processor
+    class shape (``*SignalProcessor`` with a ``process_signal`` method).
+    Executing the strategy file is intentionally never done here.
+    """
+    source = _contained_strategy_source(path, strategies_dir or DEFAULT_STRATEGIES_DIR)
+    if source is None:
+        return StrategyType.MARKET_DATA
+    meta = _strategy_meta_literal(source)
+    detected = _strategy_type_from_meta(dict(meta)) if isinstance(meta, dict) else None
+    if detected is not None:
+        return detected
+    if _source_declares_signal_processor(source):
         return StrategyType.SIGNAL_PROCESSOR
-
     return StrategyType.MARKET_DATA
 
 

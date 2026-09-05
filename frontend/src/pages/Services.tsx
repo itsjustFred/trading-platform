@@ -128,6 +128,7 @@ export function ServicesPage() {
               style={fieldInputStyle}
             >
               <option value="weekly_data_refresh">Weekly Data Refresh</option>
+              <option value="signal_bot_health_check">Signal Bot Health Check</option>
             </select>
           </label>
           <label style={fieldLabelStyle}>

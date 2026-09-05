@@ -21,11 +21,33 @@ def test_detect_strategy_type_from_meta_field(tmp_path: Path):
     assert detected == StrategyType.SIGNAL_PROCESSOR
 
 
-def test_detect_strategy_type_from_class_pattern(tmp_path: Path):
+def test_detect_strategy_type_detects_signal_processor_class_statically(tmp_path: Path):
+    """A *SignalProcessor class with process_signal is detected from the AST —
+    the file is never executed, so dynamic/dangerous module code stays inert."""
     strategy_path = tmp_path / "class_signal_processor.py"
     strategy_path.write_text(
         "\n".join(
             [
+                "class ExampleSignalProcessor:",
+                "    def process_signal(self, raw_signal, market_data):",
+                "        return raw_signal",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    detected = detect_strategy_type(strategy_path, tmp_path)
+    assert detected == StrategyType.SIGNAL_PROCESSOR
+
+
+def test_detect_strategy_type_static_detection_never_executes(tmp_path: Path):
+    """Detection must not execute the strategy file (no import side effects)."""
+    strategy_path = tmp_path / "side_effect_signal_processor.py"
+    strategy_path.write_text(
+        "\n".join(
+            [
+                "raise RuntimeError('strategy file must never be executed on lookup')",
                 "class ExampleSignalProcessor:",
                 "    def process_signal(self, raw_signal, market_data):",
                 "        return raw_signal",

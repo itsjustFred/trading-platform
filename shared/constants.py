@@ -1,7 +1,14 @@
-"""Shared constants for the trading platform."""
+"""Shared constants for the trading platform.
 
+Environment (.env) loading happens exactly once here, before any module reads
+``os.environ`` for configuration, so every entry point resolves the same
+configuration regardless of import order.
+"""
+
+import contextlib
 import os
 import shutil
+import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -40,102 +47,66 @@ _data_dir_env = os.environ.get("DATA_DIR") or os.environ.get("TRADING_DATA_DIR")
 _log_dir_env = os.environ.get("LOG_DIR")
 
 
-def _safe_path_exists(path: Path) -> bool:
-    try:
-        return path.exists()
-    except OSError:
-        return False
-
-
-def _home_candidates() -> list[Path]:
-    candidates: list[Path] = []
-    seen: set[str] = set()
-
-    def _add(path: Path | None) -> None:
-        if path is None:
-            return
-        normalized = str(path)
-        if not normalized or normalized in seen:
-            return
-        seen.add(normalized)
-        candidates.append(path)
-
-    home_env = os.environ.get("HOME")
-    if home_env:
-        _add(Path(home_env).expanduser())
-
-    if pwd is not None:
-        try:
-            _add(Path(pwd.getpwuid(os.getuid()).pw_dir))
-        except (KeyError, OSError):
-            pass
-
-        try:
-            project_owner_home = Path(pwd.getpwuid(PROJECT_ROOT.stat().st_uid).pw_dir)
-            _add(project_owner_home)
-        except (KeyError, OSError):
-            pass
-
-        for env_key in ("SUDO_USER", "USER"):
-            username = str(os.environ.get(env_key) or "").strip()
-            if not username:
-                continue
-            try:
-                _add(Path(pwd.getpwnam(username).pw_dir))
-            except (KeyError, OSError):
-                continue
-
-    return candidates
-
-
-def _data_dir_score(path: Path) -> int:
-    score = 0
-    if _safe_path_exists(path):
-        score += 1
-    if _safe_path_exists(path / "ohlcv"):
-        score += 100
-    if _safe_path_exists(path / "backtests.db"):
-        score += 30
-    if _safe_path_exists(path / "backtests"):
-        score += 20
-    if _safe_path_exists(path / "catalog.json"):
-        score += 10
-    return score
-
-
 def _resolve_data_dir(raw_value: str | None) -> Path:
+    """Resolve DATA_DIR deterministically.
+
+    The configured value is authoritative: it is used verbatim (after
+    ``~`` expansion) without filesystem-based candidate scoring, so two
+    processes given the same configuration always agree on DATA_DIR. An
+    unset configuration falls back to ``<repo>/data``.
+    """
     default_path = (PROJECT_ROOT / "data").resolve()
     if not raw_value:
         return default_path
 
-    candidates: list[Path] = []
-    seen: set[str] = set()
-
-    def _add(path: Path) -> None:
-        key = str(path)
-        if key in seen:
-            return
-        seen.add(key)
-        candidates.append(path)
-
     configured = Path(raw_value).expanduser()
-    _add(configured)
+    if not configured.is_absolute():
+        configured = (PROJECT_ROOT / configured).resolve()
+    return configured.resolve()
 
-    # If config uses "~", prefer the candidate that actually contains runtime data.
-    if raw_value == "~" or raw_value.startswith("~/"):
-        suffix = raw_value[2:] if raw_value.startswith("~/") else ""
-        for home in _home_candidates():
-            _add(home / suffix if suffix else home)
 
-    best = candidates[0]
-    best_score = _data_dir_score(best)
-    for candidate in candidates[1:]:
-        score = _data_dir_score(candidate)
-        if score > best_score:
-            best = candidate
-            best_score = score
+def set_data_dir(path: str | Path) -> None:
+    """Override DATA_DIR for the current process (test isolation hook).
 
-    return best.resolve()
+    Keeps the derived module-level constants (DATA_DIR, OPTIMIZATIONS_DIR)
+    and the already-imported ``shared.database`` bindings in sync.
+    """
+    global DATA_DIR, OPTIMIZATIONS_DIR
+    resolved = Path(path).expanduser().resolve()
+    DATA_DIR = resolved
+    OPTIMIZATIONS_DIR = DATA_DIR / "optimizations"
+    _sync_database_paths()
+
+
+def reset_data_dir() -> None:
+    """Restore the process-wide DATA_DIR resolved from the environment."""
+    global DATA_DIR, OPTIMIZATIONS_DIR
+    DATA_DIR = _resolve_data_dir(os.environ.get("DATA_DIR") or os.environ.get("TRADING_DATA_DIR"))
+    OPTIMIZATIONS_DIR = DATA_DIR / "optimizations"
+    _sync_database_paths()
+
+
+def _sync_database_paths() -> None:
+    """Mirror DATA_DIR/DB_PATH into an already-imported shared.database.
+
+    Only synchronizes when ``shared.database`` is already in ``sys.modules``
+    (importing it here would be a second, circular initialization path). The
+    lazily created engine is disposed and reset so the next ``get_engine()``
+    binds to the new DB_PATH — a cached engine must never keep pointing at the
+    previous data directory while ``database.DB_PATH`` already claims the new
+    one. The schema-initialization flag is reset too, so the tables are
+    (re-)created in the new location on the next ``init_db()``. An explicit
+    ``database.ENGINE`` override is left untouched.
+    """
+    database = sys.modules.get("shared.database")
+    if database is None:
+        return
+    database.DATA_DIR = DATA_DIR
+    database.DB_PATH = DATA_DIR / "backtests.db"
+    with contextlib.suppress(Exception):
+        database.reset_engine()
+    with contextlib.suppress(Exception):
+        database.reset_initialized()
 
 
 DATA_DIR = _resolve_data_dir(_data_dir_env)
