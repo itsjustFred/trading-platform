@@ -869,8 +869,9 @@ def test_ctrader_volume_contract_uses_qty_units_only():
     # Operator overrides pass through in raw broker units (Main contract).
     assert adapter._resolve_order_volume(_signal({"ctrader_volume": 100000})) == 100000
     assert adapter._resolve_order_volume(_signal({"volume": 100000})) == 100000
+    empty = _signal({})
     with pytest.raises(ValueError, match="no positive quantity"):
-        adapter._resolve_order_volume(_signal({}))
+        adapter._resolve_order_volume(empty)
 
 
 def test_ctrader_volume_rejects_non_finite_qty():
@@ -1054,8 +1055,9 @@ def test_ctrader_invalid_symbol_never_persists_signal(monkeypatch):
         metadata={"qty": 5.0},
     )
 
+    submission = adapter.submit_order(signal)
     with pytest.raises(ValueError, match="Unknown cTrader symbol"):
-        asyncio.run(adapter.submit_order(signal))
+        asyncio.run(submission)
 
 
 def test_ctrader_invalid_action_never_persists_signal(monkeypatch):
