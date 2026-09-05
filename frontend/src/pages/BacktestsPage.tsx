@@ -1,4 +1,5 @@
 import { memo, useCallback, useEffect, useMemo, useState } from "react";
+import { normalizeWinRate } from "../api/metricScale";
 import { Link, useNavigate } from "react-router-dom";
 import { ArrowUpDown, Plus, Scale, Trash2 } from "lucide-react";
 
@@ -118,14 +119,6 @@ function toErrorMessage(error: unknown, fallback: string): string {
   if (error instanceof Error && error.message.trim()) return error.message;
   if (typeof error === "string" && error.trim()) return error;
   return fallback;
-}
-
-function normalizeWinRate(value: number | null | undefined): number | null {
-  if (value == null || !Number.isFinite(value)) return null;
-  if (value > 1 && value <= 100) return value / 100;
-  if (value < 0) return 0;
-  if (value > 1) return 1;
-  return value;
 }
 
 function metricValue(value: number | null | undefined, fallback = 0): number {

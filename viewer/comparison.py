@@ -36,10 +36,17 @@ def compute_drawdown_pct(values: list[float]) -> list[float]:
 
 
 def pearson_correlation(x: list[float], y: list[float]) -> float:
-    """Pearson correlation coefficient."""
-    n = len(x)
-    if n < 2:
+    """Pearson correlation coefficient.
+
+    Guards against mismatched lengths, non-finite values, zero variance and
+    empty inputs — all of which would otherwise produce a silently wrong or
+    crashing coefficient.
+    """
+    if len(x) != len(y) or len(x) < 2:
         return 0.0
+    if not all(math.isfinite(v) for v in x) or not all(math.isfinite(v) for v in y):
+        return 0.0
+    n = len(x)
     mean_x = sum(x) / n
     mean_y = sum(y) / n
     cov = sum((x[i] - mean_x) * (y[i] - mean_y) for i in range(n))
@@ -138,7 +145,7 @@ def compute_combined_stats(
 
 def compare_backtests(strategies: list[dict[str, Any]]) -> dict[str, Any]:
     """
-    Compare multiple backtest results.
+    Compare exactly two backtest results.
 
     Parameters
     ----------
@@ -151,13 +158,35 @@ def compare_backtests(strategies: list[dict[str, Any]]) -> dict[str, Any]:
 
     Returns
     -------
-    Structured comparison result with combined view.
+    Structured comparison result with combined view. The combined 50/50 view
+    is defined for exactly two strategies; any other count is reported as an
+    explicit error instead of silently blending the first two.
     """
     combined_view: dict[str, Any] = {
         "combined_equity_curve": [],
         "combined_stats": {},
         "errors": [],
     }
+
+    if len(strategies) != 2:
+        combined_view["errors"].append(
+            f"compare_backtests requires exactly 2 strategies, got {len(strategies)}"
+        )
+        # No combined 50/50 blend when the arity is wrong: silently blending
+        # the first two is exactly the behavior this guard replaces.
+        return {
+            "strategies": [
+                {
+                    "name": s.get("name", "Unknown"),
+                    "equity_curve": s.get("equity_curve", []),
+                    "drawdown_curve": s.get("drawdown_curve", []),
+                    "stats": s.get("stats", {}),
+                    "trades": s.get("trades", {}),
+                }
+                for s in strategies
+            ],
+            "combined_view": combined_view,
+        }
 
     if len(strategies) >= 2:
         eq_a = strategies[0].get("equity_curve", [])

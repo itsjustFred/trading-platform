@@ -437,7 +437,12 @@ export function PortfolioDetailPage() {
           gap: "12px",
         }}
       >
-        <StatCard label="Total Return" value={((stats.total_return || 0) * 100).toFixed(2)} format="percent" />
+        <StatCard
+          label="Total Return"
+          value={stats.total_return ?? 0}
+          format="percent"
+          percentScale="fraction"
+        />
         <StatCard label="Net Profit" value={stats.net_profit || 0} format="currency" />
         <StatCard
           label="Sharpe (higher = better)"
@@ -445,23 +450,36 @@ export function PortfolioDetailPage() {
           color={stats.sharpe > 1 ? "#3fb950" : "#d29922"}
         />
         <StatCard label="Sortino" value={(stats.sortino || 0).toFixed(3)} color="#58a6ff" />
-        <StatCard label="CAGR (higher = better)" value={((stats.cagr || 0) * 100).toFixed(2)} format="percent" />
+        <StatCard
+          label="CAGR (higher = better)"
+          value={stats.cagr ?? 0}
+          format="percent"
+          percentScale="fraction"
+        />
         <StatCard
           label="PSR (higher = better)"
-          value={stats.psr != null ? `${(Number(stats.psr) * 100).toFixed(1)}%` : "N/A"}
+          value={stats.psr}
+          format="percent"
+          percentScale="fraction"
           color={Number(stats.psr) > 0.95 ? "#3fb950" : Number(stats.psr) > 0.5 ? "#d29922" : "#f85149"}
         />
-        <StatCard label="p-Value (lower = better)" value={formatPValue(stats.p_value)} color={pValueColor(stats.p_value)} />
+        <StatCard
+          label="p-Value (lower = better)"
+          value={formatPValue(stats.p_value)}
+          color={pValueColor(stats.p_value)}
+        />
         <StatCard
           label="Max DD (lower = better)"
-          value={((stats.max_drawdown || 0) * 100).toFixed(2)}
+          value={stats.max_drawdown ?? 0}
           format="percent"
+          percentScale="fraction"
           color="#f85149"
         />
         <StatCard
           label="Win Rate (higher = better)"
-          value={(stats.win_rate || 0) * 100}
+          value={stats.win_rate}
           format="percent"
+          percentScale="fraction"
           color={(stats.win_rate || 0) >= 0.5 ? "#3fb950" : "#f85149"}
         />
       </div>

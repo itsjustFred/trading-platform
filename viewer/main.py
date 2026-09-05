@@ -44,6 +44,8 @@ from starlette.middleware.gzip import GZipMiddleware
 
 from data_tools.catalog_builder import merge_ohlcv_entries
 from data_tools import cache_manager
+from data_tools import auto_download as _auto_download_config
+from data_tools.auto_download import reload_coverage_windows
 from data_tools.signal_import import load_signals_from_csv
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -89,6 +91,7 @@ from shared.database import (
     get_live_account,
     get_service,
     get_latest_live_balance,
+    get_latest_live_balances,
     init_db,
     list_backtest_ids,
     list_backtest_fingerprint_rows,
@@ -204,12 +207,108 @@ REPLAY_MAX_BARS_WITHOUT_TRADES = 15_000
 REPLAY_TARGET_BARS = 50_000
 REPLAY_MIN_BARS_PER_EVENT = 4
 REPLAY_MAX_BARS_PER_EVENT = (BARS_BEFORE * 2) + (BARS_AFTER * 3)
+BACKTEST_WATCHDOG_TIMEOUT_SECONDS = float(os.environ.get("BACKTEST_TIMEOUT_SECONDS", "300"))
+BACKTEST_WATCHDOG_POLL_SECONDS = 2.0
+
+
+def _kill_process_group(proc: subprocess.Popen) -> None:
+    """Kill the child and everything it spawned.
+
+    The runner is started with `start_new_session=True`, so it leads its own
+    process group. A bare `proc.kill()` (SIGKILL to the direct child only)
+    leaves grandchildren alive holding the inherited stdout pipe, which would
+    keep the pump loop hanging and strand the task anyway.
+    """
+    try:
+        pgid = os.getpgid(proc.pid)
+    except OSError:
+        # ProcessLookupError (child gone) and PermissionError both derive
+        # from OSError, which covers every killpg precondition failure.
+        pgid = None
+    if pgid is not None and pgid == proc.pid:
+        # Only signal the group when the child actually leads it (it was
+        # started with start_new_session=True). Otherwise the pgid is OUR
+        # group and killpg would kill this process and its siblings.
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+            return
+        except OSError:
+            pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
+def _monitor_backtest_process(
+    proc: subprocess.Popen,
+    *,
+    timeout_seconds: float = BACKTEST_WATCHDOG_TIMEOUT_SECONDS,
+    poll_interval: float = BACKTEST_WATCHDOG_POLL_SECONDS,
+    timed_out: threading.Event | None = None,
+) -> bool:
+    """Bound the whole child process lifetime.
+
+    Runs alongside the stdout pump; unlike a `proc.wait(timeout=...)` after
+    EOF, this watchdog fires even when a hung child never closes its stdout.
+    Kills the child's whole process group when the deadline expires. Returns
+    True when the child exited inside the budget, False when it was killed.
+    When `timed_out` is given, it is set before the kill so the caller's
+    failure path can report the watchdog timeout instead of the kill's
+    negative exit code.
+    """
+    deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+    while True:
+        if proc.poll() is not None:
+            return True
+        if time.monotonic() >= deadline:
+            logger.warning(
+                "Backtest watchdog: child pid %s exceeded %.0fs; terminating",
+                proc.pid,
+                timeout_seconds,
+            )
+            if timed_out is not None:
+                timed_out.set()
+            _kill_process_group(proc)
+            try:
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                pass
+            return False
+        time.sleep(max(0.01, float(poll_interval)))
+
 
 DATA_TASKS = legacy_viewer.DATA_TASKS
 DATA_TASKS_LOCK = legacy_viewer.DATA_TASKS_LOCK
 ACTIVE_TASK_STATUSES = legacy_viewer.ACTIVE_TASK_STATUSES
 FINAL_TASK_STATUSES = legacy_viewer.FINAL_TASK_STATUSES
 _running_jobs = legacy_viewer._running_jobs
+_JOBS_LOCK = legacy_viewer._JOBS_LOCK
+_JOBS_TIMESTAMP = legacy_viewer._JOBS_TIMESTAMP
+
+
+def _set_job_status(job_id: str, status: str) -> None:
+    """Single lock-guarded status write (no-op for an unregistered job)."""
+    legacy_viewer.set_job_status(job_id, status)
+
+
+def _finish_job(
+    job_id: str,
+    *,
+    status: str,
+    result: Any | None,
+    error: str | None,
+) -> None:
+    """Finalize status/result/error in one lock-guarded write on core's helper."""
+    legacy_viewer.finish_job(job_id, status=status, result=result, error=error)
+
+
+def _register_job(job_id: str, job: dict[str, Any]) -> None:
+    """Register a job payload under the shared lock."""
+    with _JOBS_LOCK:
+        _running_jobs[job_id] = job
+        _JOBS_TIMESTAMP[job_id] = time.monotonic()
+
 
 _refresh_catalog = legacy_viewer._refresh_catalog
 _LEGACY_START_DATA_TASK = legacy_viewer._start_data_task
@@ -357,7 +456,49 @@ async def _prewarm_jforex_jvm_background() -> None:
         logger.warning("JForex JVM prewarm failed: %s", exc)
 
 
+def _run_coroutine_sync(coroutine_factory: Callable[[], Any]) -> Any:
+    """Drive an async helper from sync code without `asyncio.run()`.
+
+    The coroutine runs on its own worker thread with a private loop, so this
+    stays safe whether the caller is a worker thread or the event loop itself
+    (`asyncio.run()` would raise `RuntimeError` in the latter case and each
+    call would otherwise spin a throwaway loop).
+    """
+    result: dict[str, Any] = {}
+    done = threading.Event()
+
+    def _runner() -> None:
+        try:
+            result["payload"] = asyncio.run(coroutine_factory())
+        except BaseException as exc:  # noqa: BLE001 - re-raised verbatim on the joining thread
+            result["error"] = exc
+            raise
+        finally:
+            done.set()
+
+    thread = threading.Thread(target=_runner, daemon=True, name="coro-sync-dispatch")
+    thread.start()
+    done.wait()
+    if "error" in result:
+        raise result["error"]
+    return result.get("payload")
+
+
+def _run_backtest_sync(runner: Callable[[Any], Any], payload: Any) -> Any:
+    """Invoke the async `run_backtest` route logic from sync helpers."""
+    async def _invoke() -> Any:
+        return await runner(payload)
+
+    return _run_coroutine_sync(lambda: _invoke())
+
+
 def _resume_interrupted_tasks() -> None:
+    if not _LEGACY_HOOKS_INSTALLED:
+        raise RuntimeError(
+            "install_legacy_task_hooks() must run before _resume_interrupted_tasks: "
+            "the resume path writes task records through the persistence-aware "
+            "implementations, which only exist once the hooks are installed."
+        )
     records = list_background_task_records(statuses=["interrupted", "queued"])
     for record in records:
         try:
@@ -410,7 +551,7 @@ def _resume_interrupted_tasks() -> None:
                     ),
                     parameters=dict(backtest_config.get("parameters") or {}),
                 )
-                restarted = asyncio.run(run_backtest(request_payload))
+                restarted = _run_backtest_sync(run_backtest, request_payload)
                 restarted_task_id = restarted.get("task_id") if isinstance(restarted, dict) else None
                 upsert_background_task_record(
                     task_id=task_id,
@@ -595,7 +736,13 @@ async def lifespan(app: FastAPI):
     app.state.jforex_jvm_prewarm_task = jforex_jvm_prewarm_task
     app.state.live_market_data_sync_task = live_market_data_sync_task
     await asyncio.to_thread(mark_background_tasks_interrupted, from_statuses=["queued", "running"])
+    # The hooks swap the persistence-aware task implementations onto the legacy
+    # module; they MUST be installed before any helper that creates or updates
+    # task records (resume below), or those writes land on the in-memory
+    # originals and never persist.
+    install_legacy_task_hooks()
     await asyncio.to_thread(_resume_interrupted_tasks)
+    await asyncio.to_thread(legacy_viewer.evict_jobs)
     try:
         yield
     finally:
@@ -1219,7 +1366,7 @@ def _restart_interrupted_task(task_id: str) -> dict[str, Any]:
             ),
             parameters=dict(config_payload.get("parameters") or {}),
         )
-        restarted = asyncio.run(run_backtest(request_payload))
+        restarted = _run_backtest_sync(run_backtest, request_payload)
         _update_task_fields(
             task_id,
             status="completed",
@@ -1326,10 +1473,12 @@ _STRATEGIES_CACHE: dict[str, Any] = {"expires_at": 0.0, "payload": []}
 _STRATEGIES_CACHE_TTL_SECONDS = 60.0
 _LIVE_WS_QUEUE_MAX_SIZE = 64
 _LIVE_WS_HEARTBEAT_SECONDS = 15.0
-_LIVE_WS_ACCOUNTS_POLL_SECONDS = 1.0
-_LIVE_WS_SIGNALS_POLL_SECONDS = 1.0
-_LIVE_WS_EXECUTIONS_POLL_SECONDS = 1.0
-_LIVE_WS_POSITIONS_POLL_SECONDS = 1.0
+# Live streams refresh every few seconds (not 1 Hz): each poll fans out DB
+# and broker requests, and the previous 1 Hz default rate-limited brokers.
+_LIVE_WS_ACCOUNTS_POLL_SECONDS = 5.0
+_LIVE_WS_SIGNALS_POLL_SECONDS = 3.0
+_LIVE_WS_EXECUTIONS_POLL_SECONDS = 3.0
+_LIVE_WS_POSITIONS_POLL_SECONDS = 3.0
 _BACKTEST_META_CACHE_LOCK = threading.RLock()
 _BACKTEST_META_CACHE: dict[str, dict[str, Any]] = {}
 _BACKTEST_META_CACHE_SOURCE_MTIME_NS = 0
@@ -3265,15 +3414,28 @@ def _serialize_task(
     return payload
 
 
-# Route legacy core task lifecycle through persistence-aware wrappers.
-legacy_viewer._create_task_record = _create_task_record
-legacy_viewer._get_task = _get_task
-legacy_viewer._snapshot_task = _snapshot_task
-legacy_viewer._update_task_fields = _update_task_fields
-legacy_viewer._set_task_status = _set_task_status
-legacy_viewer._update_task_progress = _update_task_progress
-legacy_viewer._mark_task_finished = _mark_task_finished
-legacy_viewer._serialize_task = _serialize_task
+_LEGACY_HOOKS_INSTALLED = False
+
+
+def install_legacy_task_hooks() -> None:
+    """Wire the persistence-aware task wrappers into the legacy core module.
+
+    Explicit injection (called from lifespan startup) instead of import-time
+    attribute reassignment: behavior no longer depends on which module was
+    imported first and the wrapper chain is visible to static analysis.
+    """
+    global _LEGACY_HOOKS_INSTALLED
+    if _LEGACY_HOOKS_INSTALLED:
+        return
+    legacy_viewer._create_task_record = _create_task_record
+    legacy_viewer._get_task = _get_task
+    legacy_viewer._snapshot_task = _snapshot_task
+    legacy_viewer._update_task_fields = _update_task_fields
+    legacy_viewer._set_task_status = _set_task_status
+    legacy_viewer._update_task_progress = _update_task_progress
+    legacy_viewer._mark_task_finished = _mark_task_finished
+    legacy_viewer._serialize_task = _serialize_task
+    _LEGACY_HOOKS_INSTALLED = True
 
 
 def _serialize_live_timestamp(value: datetime | str | None) -> tuple[str, float]:
@@ -3452,7 +3614,7 @@ def _serialize_service_payload(service: Service) -> dict[str, Any]:
 
 
 def _discover_live_accounts_payload() -> list[dict[str, Any]]:
-    discovered = asyncio.run(discover_configured_accounts())
+    discovered = _run_coroutine_sync(discover_configured_accounts)
     payload: list[dict[str, Any]] = []
     for account in discovered:
         if isinstance(account, dict):
@@ -3523,10 +3685,15 @@ def _cached_live_accounts_payload(*, force_refresh: bool = False) -> list[dict[s
 def _live_accounts_stream_payload() -> dict[str, Any]:
     accounts = _cached_live_accounts_payload(force_refresh=True)
     enriched_accounts: list[dict[str, Any]] = []
+    # One batched query for all accounts instead of get_latest_live_balance
+    # per account (N+1) on every stream tick.
+    balances_by_account = get_latest_live_balances(
+        [str(item.get("id") or "").strip() for item in accounts]
+    )
     for account in accounts:
         item = dict(account)
         account_id = str(item.get("id") or "").strip()
-        latest_balance = get_latest_live_balance(account_id) if account_id else None
+        latest_balance = balances_by_account.get(account_id) if account_id else None
         if latest_balance is not None:
             timestamp_iso, timestamp_unix = _serialize_live_timestamp(latest_balance.timestamp)
             item["balance"] = float(latest_balance.balance)
@@ -3813,7 +3980,9 @@ def _live_account_stats_payload(account_id: str) -> dict[str, Any]:
     balances, execution_rows = load_live_account_stats_inputs(account_id)
 
     total_pnl_realized, wins, losses = _calculate_realized_live_pnl(execution_rows)
-    total_trades = len(execution_rows)
+    # Win rate denominators are closed round trips (a win or a loss), never raw
+    # execution rows: partial fills would otherwise deflate the ratio.
+    total_trades = wins + losses
     win_rate = (wins / total_trades * 100.0) if total_trades else 0.0
 
     max_drawdown = 0.0
@@ -6003,8 +6172,9 @@ def _data_check_result(
 
 
 US_INTRADAY_TIMEFRAMES = {"1m", "5m", "15m", "30m", "1h"}
-HF_INTRADAY_COVERAGE_END = "2025-07-31"
-ALPACA_INTRADAY_START = "2025-07-01"
+# Vendor intraday coverage windows live in data_tools.auto_download and are
+# configurable via HF_INTRADAY_COVERAGE_END / ALPACA_INTRADAY_START env vars;
+# _auto_download_source_plan re-reads them, so no module-level mirror here.
 _US_STOCK_SYMBOL_PATTERN = re.compile(r"^[A-Z][A-Z.\-]{0,9}$")
 
 
@@ -6070,62 +6240,14 @@ def _auto_download_source_plan(
     start: str | None,
     end: str | None,
 ) -> list[dict[str, str | None]]:
-    normalized_symbol = str(symbol or "").strip().upper()
-    normalized_timeframe = normalize_timeframe(str(timeframe or "").strip())
-    default_source = _auto_download_source(normalized_symbol, normalized_timeframe)
-    if default_source != "huggingface":
-        return [{"source": default_source, "start": start or None, "end": end or None}]
-
-    normalized_start = _normalize_coverage_date(start)
-    normalized_end = _normalize_coverage_date(end)
-    if normalized_start and normalized_end and normalized_start > normalized_end:
-        normalized_start, normalized_end = normalized_end, normalized_start
-
-    if normalized_start is None and normalized_end is None:
-        return [{"source": "alpaca", "start": None, "end": None}]
-
-    plan: list[dict[str, str | None]] = []
-
-    hf_start = normalized_start or normalized_end
-    hf_end = normalized_end
-    if hf_start is not None and hf_start > HF_INTRADAY_COVERAGE_END:
-        hf_start = None
-        hf_end = None
-    elif hf_end is None or hf_end > HF_INTRADAY_COVERAGE_END:
-        hf_end = HF_INTRADAY_COVERAGE_END
-    if hf_start and hf_end and hf_start > hf_end:
-        hf_start = None
-        hf_end = None
-    if hf_end is not None:
-        plan.append(
-            {
-                "source": "huggingface",
-                "start": hf_start,
-                "end": hf_end,
-            }
-        )
-
-    alpaca_start = normalized_start or normalized_end
-    alpaca_end = normalized_end
-    if alpaca_end is not None and alpaca_end < ALPACA_INTRADAY_START:
-        alpaca_start = None
-    else:
-        if alpaca_start is None or alpaca_start < ALPACA_INTRADAY_START:
-            alpaca_start = ALPACA_INTRADAY_START
-        if alpaca_end is not None and alpaca_start > alpaca_end:
-            alpaca_start = None
-    if alpaca_start is not None:
-        plan.append(
-            {
-                "source": "alpaca",
-                "start": alpaca_start,
-                "end": alpaca_end or end or None,
-            }
-        )
-
-    if not plan:
-        return [{"source": "alpaca", "start": start or None, "end": end or None}]
-    return plan
+    """Shared vendor plan from data_tools.auto_download (env-configurable)."""
+    reload_coverage_windows()
+    return _auto_download_config._auto_download_source_plan(
+        symbol=symbol,
+        timeframe=timeframe,
+        start=start or None,
+        end=end or None,
+    )
 
 
 def _download_missing_ohlcv_data(
@@ -6301,10 +6423,15 @@ def _ensure_backtest_data_availability(
                     if len(source_plan) > 1
                     else ""
                 )
+                coverage_note = (
+                    " [coverage unknown: no configured vendor window covers this range]"
+                    if str(step.get("coverage") or "") == "unknown"
+                    else ""
+                )
                 log_callback(
                     (
                         f"Auto-download{suffix}: {symbol} {normalized_timeframe} via {step_source} "
-                        f"({step_start or 'auto'} → {step_end or 'latest'})"
+                        f"({step_start or 'auto'} → {step_end or 'latest'}){coverage_note}"
                     )
                 )
             _download_missing_ohlcv_data(
@@ -7032,40 +7159,7 @@ async def get_backtest_stats(backtest_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=f"Backtest '{backtest_id}' not found")
 
     try:
-        raw = legacy_viewer._canonical_stats_from_result(result)
-        stats = {
-            "net_profit": raw.get("total_pnl", 0),
-            "net_profit_pct": round(
-                raw.get("total_pnl", 0) / (result.meta.initial_capital or 100000) * 100,
-                2,
-            ),
-            "sharpe": raw.get("sharpe_ratio", 0),
-            "sortino": raw.get("sortino_ratio", 0),
-            "calmar": raw.get("calmar_ratio", 0),
-            "max_drawdown_pct": round(raw.get("max_drawdown_pct", 0) * 100, 2),
-            "win_rate": round(raw.get("win_rate", 0) * 100, 1),
-            "profit_factor": raw.get("profit_factor", 0),
-            "total_trades": raw.get("total_trades", 0),
-            "winners": raw.get("winners", 0),
-            "losers": raw.get("losers", 0),
-            "avg_winner": raw.get("avg_winner", 0),
-            "avg_loser": raw.get("avg_loser", 0),
-            "avg_trade_pnl": round(raw.get("total_pnl", 0) / max(raw.get("total_trades", 1), 1), 2),
-            "avg_bars_held": raw.get("avg_holding_bars", 0),
-            "max_consecutive_losses": raw.get("max_consecutive_losses", 0),
-            "best_trade": raw.get("avg_winner", 0),
-            "worst_trade": raw.get("avg_loser", 0),
-            "cagr": round(_safe_float(raw.get("cagr")) * 100, 2),
-            "expectancy": 0,
-        }
-        win_rate = raw.get("win_rate", 0)
-        stats["expectancy"] = round(
-            win_rate * raw.get("avg_winner", 0) + (1 - win_rate) * raw.get("avg_loser", 0),
-            2,
-        )
-        stats["psr"] = raw.get("psr")
-        stats["p_value"] = raw.get("p_value", 1.0)
-        return stats
+        return await asyncio.to_thread(legacy_viewer._stats_payload_from_result, result)
     except Exception as exc:
         logger.exception("Failed to compute stats for '%s': %s", backtest_id, exc)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -7490,13 +7584,43 @@ def _replay_keep_mask_from_trades(df: pd.DataFrame, trade_payloads: list[dict[st
     return keep
 
 
+def _replay_timeframe(result: BacktestResult) -> str:
+    """First configured timeframe for a result, normalized (default "1h")."""
+    configured = result.meta.data.get("timeframes")
+    raw = configured[0] if configured else "1h"
+    return normalize_timeframe(str(raw or "1h"))
+
+
+def _load_symbol_ohlcv_with_details(
+    symbol: str, timeframe: str, result: BacktestResult
+) -> tuple[pd.DataFrame | None, dict[str, Any] | None]:
+    """Load a symbol frame, or the user-facing missing-data details for it."""
+    df = legacy_viewer._load_ohlcv_df(symbol, timeframe)
+    if df is None or len(df) == 0:
+        return None, legacy_viewer._missing_ohlcv_details(
+            symbol,
+            timeframe,
+            backtest_start=str(result.meta.backtest_start or ""),
+            backtest_end=str(result.meta.backtest_end or ""),
+        )
+    return df, None
+
+
+def _detect_indicators_for_result(result: BacktestResult) -> dict[str, Any]:
+    """Indicator specs detected from the result's first strategy, if any."""
+    strategy_identifier = result.meta.strategies[0] if result.meta.strategies else ""
+    return legacy_viewer._detect_indicators(strategy_identifier)
+
+
 def _slice_replay_ohlcv(df: pd.DataFrame, trade_payloads: list[dict[str, Any]]) -> pd.DataFrame:
     if df is None or len(df) == 0:
         return df
     keep_mask = _replay_keep_mask_from_trades(df, trade_payloads)
     if keep_mask.size != len(df) or np.all(keep_mask):
         return df
-    return df.iloc[np.flatnonzero(keep_mask)]
+    # reset_index so downstream consumers (indicator computation) never
+    # confuse the preserved original labels with positional row indexes.
+    return df.iloc[np.flatnonzero(keep_mask)].reset_index(drop=True)
 
 
 def _slice_indicators_to_timestamps(indicators: list[dict[str, Any]], *, ohlcv_times: list[float]) -> None:
@@ -7536,64 +7660,88 @@ def _collect_viewer_drawings(result: BacktestResult, symbol: str | None = None) 
 
 @app.get("/api/backtest/{backtest_id}/trade/{trade_nr}", response_model=dict[str, Any])
 async def get_trade_with_context(backtest_id: str, trade_nr: int) -> dict[str, Any]:
+    return await asyncio.to_thread(_trade_context_payload, backtest_id, trade_nr)
+
+
+def _resolve_trade(result: BacktestResult, trade_nr: int) -> tuple[Any, dict[str, Any]]:
+    """Locate a trade on the result and build its viewer payload."""
+    trade = next((item for item in result.trades if item.id == trade_nr), None)
+    if trade is None:
+        raise HTTPException(status_code=404, detail=f"Trade #{trade_nr} not found")
+    return trade, legacy_viewer._trade_to_viewer(trade)
+
+
+@dataclass(frozen=True)
+class _TradeWindow:
+    """OHLCV window around a trade's entry bar plus its source-frame bounds."""
+
+    ohlcv: list[dict[str, Any]]
+    df: pd.DataFrame
+    start_idx: int
+    end_idx: int
+
+
+def _trade_window_ohlcv(result: BacktestResult, trade: Any) -> _TradeWindow:
+    """OHLCV window around a trade's entry bar, plus the source frame and bounds."""
+    timeframe = _replay_timeframe(result)
+    symbol = str(trade.symbol or "").strip() or "SPY"
+    df, details = _load_symbol_ohlcv_with_details(symbol, timeframe, result)
+    if df is None:
+        raise HTTPException(status_code=404, detail=details)
+
+    ohlcv_start_idx = 0
+    ohlcv_end_idx = 0
+    entry_ts_raw = pd.to_datetime(trade.entry_time, utc=True, errors="coerce")
+    entry_ts = pd.Timestamp(entry_ts_raw) if not pd.isna(entry_ts_raw) else None
+    if entry_ts is not None:
+        idx = df["timestamp"].searchsorted(entry_ts)
+        ohlcv_start_idx = max(0, idx - legacy_viewer.BARS_BEFORE)
+        ohlcv_end_idx = min(len(df), idx + legacy_viewer.BARS_AFTER)
+        ohlcv = legacy_viewer._df_to_ohlcv_records(df.iloc[ohlcv_start_idx:ohlcv_end_idx])
+    else:
+        ohlcv = []
+    return _TradeWindow(ohlcv=ohlcv, df=df, start_idx=ohlcv_start_idx, end_idx=ohlcv_end_idx)
+
+
+def _trade_context_indicators(
+    result: BacktestResult, window: _TradeWindow
+) -> list[dict[str, Any]]:
+    """Indicators for the trade window: payload ones, else auto-detected ones."""
+    indicators = _normalize_indicator_payloads(list(result.indicators))
+    if indicators or not window.ohlcv:
+        return indicators
+
+    detected = _detect_indicators_for_result(result)
+    if not detected:
+        return indicators
+
+    ohlcv_times = [row["time"] for row in window.ohlcv]
+    warmup_start = max(0, window.start_idx - 50)
+    df_slice = window.df.iloc[warmup_start:window.end_idx].reset_index(drop=True)
+    return legacy_viewer._compute_indicators(df_slice, detected, ohlcv_times)
+
+
+def _trade_context_payload(backtest_id: str, trade_nr: int) -> dict[str, Any]:
     result = _load_result(backtest_id)
     if result is None:
         raise HTTPException(status_code=404, detail="Not found")
     try:
-        trade = next((item for item in result.trades if item.id == trade_nr), None)
-        if trade is None:
-            raise HTTPException(status_code=404, detail=f"Trade #{trade_nr} not found")
-
-        trade_payload = legacy_viewer._trade_to_viewer(trade)
-        timeframe = (
-            result.meta.data.get("timeframes", ["1h"])[0] if result.meta.data.get("timeframes") else "1h"
-        )
-        timeframe = normalize_timeframe(timeframe)
+        trade, trade_payload = _resolve_trade(result, trade_nr)
         symbol = str(trade.symbol or "").strip() or "SPY"
-
-        ohlcv: list[dict[str, Any]] = []
-        df = legacy_viewer._load_ohlcv_df(symbol, timeframe)
-        if df is None or len(df) == 0:
-            details = legacy_viewer._missing_ohlcv_details(
-                symbol,
-                timeframe,
-                backtest_start=str(result.meta.backtest_start or ""),
-                backtest_end=str(result.meta.backtest_end or ""),
-            )
-            raise HTTPException(status_code=404, detail=details)
-
-        ohlcv_start_idx = 0
-        ohlcv_end_idx = 0
-        entry_ts_raw = pd.to_datetime(trade.entry_time, utc=True, errors="coerce")
-        entry_ts = pd.Timestamp(entry_ts_raw) if not pd.isna(entry_ts_raw) else None
-        if entry_ts is not None:
-            idx = df["timestamp"].searchsorted(entry_ts)
-            ohlcv_start_idx = max(0, idx - legacy_viewer.BARS_BEFORE)
-            ohlcv_end_idx = min(len(df), idx + legacy_viewer.BARS_AFTER)
-            ohlcv = legacy_viewer._df_to_ohlcv_records(df.iloc[ohlcv_start_idx:ohlcv_end_idx])
-
-        indicators = _normalize_indicator_payloads(list(result.indicators))
+        window = _trade_window_ohlcv(result, trade)
+        indicators = _trade_context_indicators(result, window)
         drawings = _collect_viewer_drawings(result, symbol)
 
-        if not indicators and ohlcv and df is not None:
-            strategy_identifier = result.meta.strategies[0] if result.meta.strategies else ""
-            detected = legacy_viewer._detect_indicators(strategy_identifier)
-            if detected:
-                ohlcv_times = [row["time"] for row in ohlcv]
-                warmup_start = max(0, ohlcv_start_idx - 50)
-                df_slice = df.iloc[warmup_start:ohlcv_end_idx].reset_index(drop=True)
-                indicators = legacy_viewer._compute_indicators(df_slice, detected, ohlcv_times)
-
-        if ohlcv and indicators:
-            time_start = ohlcv[0]["time"]
-            time_end = ohlcv[-1]["time"]
+        if window.ohlcv and indicators:
+            time_start = window.ohlcv[0]["time"]
+            time_end = window.ohlcv[-1]["time"]
             _slice_indicators_to_time_range(indicators, time_start=time_start, time_end=time_end)
 
         return {
             "trade": trade_payload,
-            "ohlcv": ohlcv,
+            "ohlcv": window.ohlcv,
             "symbol": symbol,
-            "timeframe": timeframe,
+            "timeframe": _replay_timeframe(result),
             "indicators": indicators,
             "drawings": drawings,
             "total_trades": len(result.trades),
@@ -7612,55 +7760,81 @@ async def get_trade_with_context(backtest_id: str, trade_nr: int) -> dict[str, A
 
 @app.get("/api/backtest/{backtest_id}/replay", response_model=dict[str, Any])
 async def get_backtest_replay(backtest_id: str) -> dict[str, Any]:
+    return await asyncio.to_thread(_replay_payload, backtest_id)
+
+
+def _replay_symbols(result: BacktestResult) -> list[str]:
+    """Symbols to load for a replay: from trades, else the configured ones."""
+    from_trades = sorted({trade.symbol for trade in result.trades if trade.symbol})
+    return from_trades or list(result.meta.data.get("symbols", []))
+
+
+def _replay_ohlcv_by_symbol(
+    result: BacktestResult, timeframe: str, trades: list[dict[str, Any]], symbols: list[str]
+) -> tuple[dict[str, list[dict[str, Any]]], dict[str, dict[str, Any]]]:
+    """Per-symbol replay OHLCV; symbols without data are reported separately."""
+    ohlcv_by_symbol: dict[str, list[dict[str, Any]]] = {}
+    missing_ohlcv: dict[str, dict[str, Any]] = {}
+
+    for symbol in symbols:
+        df, details = _load_symbol_ohlcv_with_details(symbol, timeframe, result)
+        if df is None:
+            missing_ohlcv[symbol] = details
+            continue
+        symbol_trades = [
+            trade for trade in trades if str(trade.get("symbol") or "").upper() == symbol.upper()
+        ]
+        replay_df = _slice_replay_ohlcv(df, symbol_trades)
+        ohlcv_by_symbol[symbol] = legacy_viewer._df_to_ohlcv_records(replay_df)
+    return ohlcv_by_symbol, missing_ohlcv
+
+
+def _replay_indicators(
+    result: BacktestResult,
+    timeframe: str,
+    trades: list[dict[str, Any]],
+    ohlcv_by_symbol: dict[str, list[dict[str, Any]]],
+    primary_symbol: str,
+) -> list[dict[str, Any]]:
+    """Indicators for the replay: payload ones, else auto-detected on the primary symbol."""
+    indicators = _normalize_indicator_payloads(list(result.indicators))
+    if indicators:
+        return indicators
+
+    detected = _detect_indicators_for_result(result)
+    if not detected:
+        return indicators
+
+    df = legacy_viewer._load_ohlcv_df(primary_symbol, timeframe)
+    if df is None or len(df) == 0:
+        return indicators
+
+    primary_trades = [
+        trade for trade in trades if str(trade.get("symbol") or "").upper() == primary_symbol.upper()
+    ]
+    replay_df = _slice_replay_ohlcv(df, primary_trades)
+    ohlcv_times = [row["time"] for row in ohlcv_by_symbol[primary_symbol]]
+    return legacy_viewer._compute_indicators(replay_df, detected, ohlcv_times)
+
+
+def _replay_payload(backtest_id: str) -> dict[str, Any]:
     result = _load_result(backtest_id)
     if result is None:
         raise HTTPException(status_code=404, detail="Not found")
     try:
         trades = [legacy_viewer._trade_to_viewer(trade) for trade in result.trades]
-        timeframe = (
-            result.meta.data.get("timeframes", ["1h"])[0] if result.meta.data.get("timeframes") else "1h"
+        timeframe = _replay_timeframe(result)
+        symbols = _replay_symbols(result)
+
+        ohlcv_by_symbol, missing_ohlcv = _replay_ohlcv_by_symbol(
+            result, timeframe, trades, symbols
         )
-        timeframe = normalize_timeframe(timeframe)
-        symbols = sorted({trade.symbol for trade in result.trades if trade.symbol}) or list(
-            result.meta.data.get("symbols", [])
-        )
-
-        ohlcv_by_symbol: dict[str, list[dict[str, Any]]] = {}
-        missing_ohlcv: dict[str, dict[str, Any]] = {}
-
-        for symbol in symbols:
-            df = legacy_viewer._load_ohlcv_df(symbol, timeframe)
-            if df is None or len(df) == 0:
-                missing_ohlcv[symbol] = legacy_viewer._missing_ohlcv_details(
-                    symbol,
-                    timeframe,
-                    backtest_start=str(result.meta.backtest_start or ""),
-                    backtest_end=str(result.meta.backtest_end or ""),
-                )
-                continue
-            symbol_trades = [trade for trade in trades if str(trade.get("symbol") or "").upper() == symbol.upper()]
-            replay_df = _slice_replay_ohlcv(df, symbol_trades)
-            ohlcv_by_symbol[symbol] = legacy_viewer._df_to_ohlcv_records(replay_df)
-
         if not ohlcv_by_symbol:
             detail = next(iter(missing_ohlcv.values()), {"message": "No OHLCV data available"})
             raise HTTPException(status_code=404, detail=detail)
 
         primary_symbol = next(iter(ohlcv_by_symbol))
-        indicators = _normalize_indicator_payloads(list(result.indicators))
-
-        if not indicators:
-            df = legacy_viewer._load_ohlcv_df(primary_symbol, timeframe)
-            if df is not None and len(df) > 0:
-                strategy_identifier = result.meta.strategies[0] if result.meta.strategies else ""
-                detected = legacy_viewer._detect_indicators(strategy_identifier)
-                if detected:
-                    primary_trades = [
-                        trade for trade in trades if str(trade.get("symbol") or "").upper() == primary_symbol.upper()
-                    ]
-                    replay_df = _slice_replay_ohlcv(df, primary_trades)
-                    ohlcv_times = [row["time"] for row in ohlcv_by_symbol[primary_symbol]]
-                    indicators = legacy_viewer._compute_indicators(replay_df, detected, ohlcv_times)
+        indicators = _replay_indicators(result, timeframe, trades, ohlcv_by_symbol, primary_symbol)
 
         if indicators and ohlcv_by_symbol.get(primary_symbol):
             symbol_ohlcv = ohlcv_by_symbol[primary_symbol]
@@ -7691,6 +7865,10 @@ async def get_backtest_replay(backtest_id: str) -> dict[str, Any]:
 
 @app.get("/api/backtest/{backtest_id}/ohlcv", response_model=dict[str, Any])
 async def get_backtest_ohlcv(backtest_id: str) -> dict[str, Any]:
+    return await asyncio.to_thread(_backtest_ohlcv_payload, backtest_id)
+
+
+def _backtest_ohlcv_payload(backtest_id: str) -> dict[str, Any]:
     result = _load_result(backtest_id)
     if result is None:
         raise HTTPException(status_code=404, detail="Not found")
@@ -7711,6 +7889,10 @@ async def get_backtest_ohlcv(backtest_id: str) -> dict[str, Any]:
 
 @app.get("/api/compare", response_model=dict[str, Any])
 async def compare_backtests_endpoint(ids: str = Query(default="")) -> dict[str, Any]:
+    return await asyncio.to_thread(_compare_backtests_payload, ids)
+
+
+def _compare_backtests_payload(ids: str) -> dict[str, Any]:
     if not ids:
         raise HTTPException(status_code=400, detail="Provide ?ids=id1,id2,id3")
 
@@ -7861,13 +8043,16 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
         DATA_TASKS[task_id] = record
     _set_task_status(task_id, "queued")
 
-    _running_jobs[task_id] = {
-        "status": "queued",
-        "result": None,
-        "error": None,
-        "task_id": task_id,
-        "job_id": task_id,
-    }
+    _register_job(
+        task_id,
+        {
+            "status": "queued",
+            "result": None,
+            "error": None,
+            "task_id": task_id,
+            "job_id": task_id,
+        },
+    )
     _update_task_fields(
         task_id,
         restart_config={
@@ -7972,6 +8157,7 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
         output_path = ""
         backtest_id = ""
         stage_progress = 0.0
+        watchdog_timed_out = threading.Event()
 
         def report_stage(
             handle,
@@ -8006,7 +8192,7 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
         with log_file.open("a", encoding="utf-8", buffering=1) as handle:
             try:
                 _set_task_status(task_id, "running")
-                _running_jobs[task_id]["status"] = "running"
+                _set_job_status(task_id, "running")
                 report_stage(handle, percent=10.0, message="Loading market data...")
 
                 missing_downloads = _ensure_backtest_data_availability(
@@ -8046,8 +8232,24 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
                     env=env,
                     text=True,
                     bufsize=1,
+                    start_new_session=True,
                 )
                 _update_task_fields(task_id, pid=proc.pid, process=proc)
+
+                # Watchdog bounds the whole child lifetime: it fires even if
+                # a hung child never closes stdout (a post-EOF proc.wait()
+                # timeout would never cover that case).
+                watchdog = threading.Thread(
+                    target=_monitor_backtest_process,
+                    args=(proc,),
+                    kwargs={
+                        "timeout_seconds": BACKTEST_WATCHDOG_TIMEOUT_SECONDS,
+                        "timed_out": watchdog_timed_out,
+                    },
+                    daemon=True,
+                    name=f"backtest-watchdog-{task_id}",
+                )
+                watchdog.start()
 
                 if proc.stdout is not None:
                     for raw_line in proc.stdout:
@@ -8089,12 +8291,23 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
                                     backtest_id=backtest_id or None,
                                 )
 
+                # The watchdog owns the child-lifetime deadline; this wait only
+                # collects the exit status after EOF (or after the kill).
                 try:
-                    returncode = proc.wait(timeout=300)
+                    returncode = proc.wait(timeout=30)
                 except subprocess.TimeoutExpired:
                     if proc.poll() is None:
-                        proc.kill()
-                    raise subprocess.SubprocessError("Backtest timed out after 300 seconds")
+                        watchdog_timed_out.set()
+                        _kill_process_group(proc)
+                    raise subprocess.SubprocessError(
+                        f"Backtest timed out after {BACKTEST_WATCHDOG_TIMEOUT_SECONDS:.0f} seconds"
+                    )
+                if watchdog_timed_out.is_set():
+                    # The watchdog killed the child, so its returncode is the
+                    # signal that terminated it (-9), not a real exit status.
+                    raise subprocess.SubprocessError(
+                        f"Backtest timed out after {BACKTEST_WATCHDOG_TIMEOUT_SECONDS:.0f} seconds"
+                    )
                 if returncode == 0:
                     report_stage(handle, percent=96.0, message="Saving results...")
                     result_payload = {
@@ -8130,9 +8343,7 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
                         ingest_task_progress=False,
                     )
                     _mark_task_finished(task_id, status="completed", returncode=0)
-                    _running_jobs[task_id]["status"] = "completed"
-                    _running_jobs[task_id]["result"] = compact_result
-                    _running_jobs[task_id]["error"] = None
+                    _finish_job(task_id, status="completed", result=compact_result, error=None)
                 else:
                     error_text = latest_message or f"Backtest command exited with code {returncode}"
                     _write_task_log_line(
@@ -8150,10 +8361,8 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
                         returncode=returncode,
                         error=error_text,
                     )
-                    _running_jobs[task_id]["status"] = "failed"
-                    _running_jobs[task_id]["result"] = None
-                    _running_jobs[task_id]["error"] = error_text
-            except (subprocess.SubprocessError, OSError, RuntimeError, ValueError) as exc:
+                    _finish_job(task_id, status="failed", result=None, error=error_text)
+            except Exception as exc:
                 _write_task_log_line(
                     handle,
                     task_id,
@@ -8165,9 +8374,7 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
                 )
                 _write_task_traceback(handle, task_id, traceback.format_exc(), source="backtest")
                 _mark_task_finished(task_id, status="failed", returncode=1, error=str(exc))
-                _running_jobs[task_id]["status"] = "failed"
-                _running_jobs[task_id]["result"] = None
-                _running_jobs[task_id]["error"] = str(exc)
+                _finish_job(task_id, status="failed", result=None, error=str(exc))
             finally:
                 _update_task_fields(task_id, process=None)
 
@@ -8346,13 +8553,16 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
             "signal_count": len(normalized_signals),
         },
     )
-    _running_jobs[task_id] = {
-        "status": "queued",
-        "result": None,
-        "error": None,
-        "task_id": task_id,
-        "job_id": task_id,
-    }
+    _register_job(
+        task_id,
+        {
+            "status": "queued",
+            "result": None,
+            "error": None,
+            "task_id": task_id,
+            "job_id": task_id,
+        },
+    )
 
     def _run_signal_replay() -> None:
         stage_progress = 0.0
@@ -8387,7 +8597,7 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
         with log_file.open("a", encoding="utf-8", buffering=1) as handle:
             try:
                 _set_task_status(task_id, "running")
-                _running_jobs[task_id]["status"] = "running"
+                _set_job_status(task_id, "running")
                 report_stage(handle, percent=10.0, message="Preparing signal replay...")
 
                 if bool(payload.auto_download):
@@ -8504,10 +8714,8 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
                     message=f"Completed - {len(result.trades)} trades found",
                 )
                 _mark_task_finished(task_id, status="completed", returncode=0)
-                _running_jobs[task_id]["status"] = "completed"
-                _running_jobs[task_id]["result"] = compact_result
-                _running_jobs[task_id]["error"] = None
-            except (RuntimeError, ValueError, OSError) as exc:
+                _finish_job(task_id, status="completed", result=compact_result, error=None)
+            except Exception as exc:
                 _write_task_log_line(
                     handle,
                     task_id,
@@ -8519,9 +8727,7 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
                 )
                 _write_task_traceback(handle, task_id, traceback.format_exc(), source="backtest")
                 _mark_task_finished(task_id, status="failed", returncode=1, error=str(exc))
-                _running_jobs[task_id]["status"] = "failed"
-                _running_jobs[task_id]["result"] = None
-                _running_jobs[task_id]["error"] = str(exc)
+                _finish_job(task_id, status="failed", result=None, error=str(exc))
 
     thread = threading.Thread(target=_run_signal_replay, daemon=True)
     _update_task_fields(task_id, thread=thread)
@@ -8689,10 +8895,11 @@ async def get_backtest_run_status(job_id: str) -> dict[str, Any]:
             "progress": progress,
         }
 
-    job = _running_jobs.get(job_id)
+    legacy_viewer.evict_jobs()
+    job = legacy_viewer.get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
-    return dict(job)
+    return job
 
 
 @app.post("/api/optimizations/run", response_model=dict[str, Any], status_code=202)
@@ -9697,8 +9904,19 @@ async def get_live_dashboard() -> dict[str, Any]:
         deployment for deployment in deployments if str(deployment.status).upper() == "ACTIVE"
     ]
 
-    for account in accounts:
-        stats = await asyncio.to_thread(_live_account_stats_payload, account.id)
+    # Fetch stats and trades for all accounts concurrently instead of
+    # serially awaiting a full stats+trades scan per account.
+    stats_list = await asyncio.gather(
+        *(
+            asyncio.to_thread(_live_account_stats_payload, account.id)
+            for account in accounts
+        )
+    )
+    trades_payloads = await asyncio.gather(
+        *(_live_trades_payload(account.id) for account in accounts)
+    )
+
+    for account, stats, trades_payload in zip(accounts, stats_list, trades_payloads):
         equity = _safe_float(stats.get("current_equity"), 0.0) or 0.0
         total_equity += equity
         account_payloads.append(
@@ -9710,7 +9928,6 @@ async def get_live_dashboard() -> dict[str, Any]:
                 "total_pnl": stats.get("total_pnl", 0.0),
             }
         )
-        trades_payload = await _live_trades_payload(account.id)
         recent_fills.extend(trades_payload.get("trades", [])[:10])
 
     for deployment in active_deployments:
@@ -10056,8 +10273,7 @@ async def get_live_positions(account_id: str) -> dict[str, Any]:
     return await _live_positions_payload(account_id)
 
 
-@app.get("/api/data/overview", response_model=dict[str, Any])
-async def data_overview() -> dict[str, Any]:
+def _data_overview_payload() -> dict[str, Any]:
     data_views = _get_data_views()
     result = [dict(item) for item in data_views.get("overview_categories", [])]
 
@@ -10079,8 +10295,12 @@ async def data_overview() -> dict[str, Any]:
     return {"categories": sorted(result, key=lambda item: str(item.get("name") or ""))}
 
 
-@app.get("/api/data/category/{category_name}", response_model=dict[str, Any])
-async def data_category_details(category_name: str) -> dict[str, Any]:
+@app.get("/api/data/overview")
+async def data_overview() -> dict[str, Any]:
+    return await asyncio.to_thread(_data_overview_payload)
+
+
+def _data_category_payload(category_name: str) -> dict[str, Any]:
     target = category_name.lower()
     if target == "dolthub repos":
         repos = []
@@ -10121,6 +10341,11 @@ async def data_category_details(category_name: str) -> dict[str, Any]:
             key=lambda item: (item.get("symbol") or "", item.get("timeframe") or ""),
         )
     }
+
+
+@app.get("/api/data/category/{category_name}")
+async def data_category_details(category_name: str) -> dict[str, Any]:
+    return await asyncio.to_thread(_data_category_payload, category_name)
 
 
 @app.post("/api/data/cache/invalidate", response_model=dict[str, Any])
@@ -10882,64 +11107,71 @@ async def get_log(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+def _symbols_payload() -> dict[str, Any]:
+    return _get_data_views().get("symbols_payload", {"symbols": [], "categories": {}})
+
+
 @app.get("/api/symbols", response_model=SymbolsResponse)
 async def list_symbols() -> SymbolsResponse:
-    payload = _get_data_views().get("symbols_payload", {"symbols": [], "categories": {}})
+    payload = await asyncio.to_thread(_symbols_payload)
     return SymbolsResponse(
         symbols=list(payload.get("symbols", [])),
         categories=dict(payload.get("categories", {})),
     )
 
 
-@app.get("/api/benchmark/{symbol}", response_model=BenchmarkResponse)
-async def get_benchmark(
-    symbol: str,
-    start: str = Query(default=""),
-    end: str = Query(default=""),
-    timeframe: str = Query(default="1d"),
-) -> BenchmarkResponse:
-    timeframe = normalize_timeframe(timeframe)
+_BENCHMARK_AGG = {
+    "open": "first",
+    "high": "max",
+    "low": "min",
+    "close": "last",
+    "volume": "sum",
+}
+
+
+def _resample_to_daily(df: pd.DataFrame) -> pd.DataFrame:
+    """Resample an intraday frame to daily bars keyed by a `timestamp` column."""
+    daily = (
+        df.set_index("timestamp")
+        .resample("1D")
+        .agg(_BENCHMARK_AGG)
+        .dropna()
+        .reset_index()
+    )
+    return daily.rename(columns={"index": "timestamp"})
+
+
+def _load_benchmark_daily_df(symbol: str, timeframe: str) -> tuple[pd.DataFrame | None, str]:
+    """Frame for a benchmark request; intraday sources are resampled to 1d."""
     df = legacy_viewer._load_ohlcv_df(symbol, timeframe)
-    if df is None and timeframe == "1d":
-        for fallback_tf in ["4h", "1h", "15m"]:
-            df = legacy_viewer._load_ohlcv_df(symbol, fallback_tf)
-            if df is None:
-                continue
+    if df is not None:
+        return df, timeframe
 
-            if "timestamp" in df.columns:
-                df = df.set_index("timestamp")
-            df = (
-                df.resample("1D")
-                .agg(
-                    {
-                        "open": "first",
-                        "high": "max",
-                        "low": "min",
-                        "close": "last",
-                        "volume": "sum",
-                    }
-                )
-                .dropna()
-                .reset_index()
-            )
-            df.rename(columns={"index": "timestamp"} if "index" in df.columns else {}, inplace=True)
-            if "timestamp" not in df.columns and df.index.name == "timestamp":
-                df = df.reset_index()
-            timeframe = "1d"
-            logger.info("Benchmark %s: using %s resampled to 1d", symbol, fallback_tf)
-            break
+    if timeframe != "1d":
+        return None, timeframe
 
-    if df is None:
-        raise HTTPException(status_code=404, detail=f"No data for {symbol}/{timeframe}")
+    for fallback_tf in ["4h", "1h", "15m"]:
+        intraday = legacy_viewer._load_ohlcv_df(symbol, fallback_tf)
+        if intraday is None:
+            continue
+        logger.info("Benchmark %s: using %s resampled to 1d", symbol, fallback_tf)
+        return _resample_to_daily(intraday), "1d"
+    return None, timeframe
 
+
+def _filter_benchmark_df(
+    df: pd.DataFrame, start: str, end: str
+) -> pd.DataFrame:
+    """Restrict a benchmark frame to the requested window."""
     if start and "timestamp" in df.columns:
         df = df[df["timestamp"] >= start]
     if end and "timestamp" in df.columns:
         df = df[df["timestamp"] <= end]
-    if df.empty:
-        raise HTTPException(status_code=404, detail="No data in range")
+    return df
 
-    initial = 100000.0
+
+def _benchmark_equity_points(df: pd.DataFrame, initial: float = 100000.0) -> list[BenchmarkPoint]:
+    """Buy-and-hold equity curve over the frame's closes."""
     first_close = float(df.iloc[0]["close"])
     shares = initial / first_close
 
@@ -10948,8 +11180,37 @@ async def get_benchmark(
         ts = row["timestamp"]
         unix_ts = ts.timestamp() if hasattr(ts, "timestamp") else pd.Timestamp(ts).timestamp()
         equity.append(BenchmarkPoint(time=float(unix_ts), equity=round(float(row["close"]) * shares, 2)))
+    return equity
 
-    return BenchmarkResponse(symbol=symbol, timeframe=timeframe, equity=equity)
+
+def _benchmark_payload(
+    symbol: str,
+    start: str,
+    end: str,
+    timeframe: str,
+) -> BenchmarkResponse:
+    timeframe = normalize_timeframe(timeframe)
+    df, timeframe = _load_benchmark_daily_df(symbol, timeframe)
+    if df is None:
+        raise HTTPException(status_code=404, detail=f"No data for {symbol}/{timeframe}")
+
+    df = _filter_benchmark_df(df, start, end)
+    if df.empty:
+        raise HTTPException(status_code=404, detail="No data in range")
+
+    return BenchmarkResponse(
+        symbol=symbol, timeframe=timeframe, equity=_benchmark_equity_points(df)
+    )
+
+
+@app.get("/api/benchmark/{symbol}")
+async def get_benchmark(
+    symbol: str,
+    start: str = Query(default=""),
+    end: str = Query(default=""),
+    timeframe: str = Query(default="1d"),
+) -> BenchmarkResponse:
+    return await asyncio.to_thread(_benchmark_payload, symbol, start, end, timeframe)
 
 
 @app.websocket("/ws/live/accounts")

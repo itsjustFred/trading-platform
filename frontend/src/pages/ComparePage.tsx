@@ -26,6 +26,9 @@ type MetricConfig = {
   format: "number" | "percent" | "currency" | "integer";
 };
 
+// The /api/backtests/compare payload serves every percent-like metric here in
+// percent points (see _backtest_compare_payload in viewer/main.py), so no
+// per-metric scale is needed on this page.
 const METRICS: MetricConfig[] = [
   { key: "total_return", label: "Total Return", better: "higher", format: "percent" },
   { key: "net_profit", label: "Net Profit", better: "higher", format: "currency" },

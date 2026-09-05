@@ -16,6 +16,7 @@ import re
 import shutil
 import subprocess
 import threading
+import time
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
@@ -60,6 +61,88 @@ LOGS_DIR = LOG_DIR
 TASK_LOGS_DIR = LOGS_DIR / "tasks"
 ALL_LOGS_NAME = "ALL_LOGS"
 _running_jobs: dict[str, dict] = {}  # job_id -> {status, result, error}
+_JOBS_LOCK = threading.RLock()
+_JOBS_TIMESTAMP: dict[str, float] = {}  # job_id -> last lifecycle transition (monotonic)
+_JOBS_TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
+
+
+def register_job(job_id: str) -> dict:
+    """Register a job as `running` and stamp its lifecycle timestamp."""
+    job = {"status": "running", "result": None, "error": None}
+    with _JOBS_LOCK:
+        _running_jobs[job_id] = job
+        _JOBS_TIMESTAMP[job_id] = time.monotonic()
+    return dict(job)
+
+
+def set_job_status(job_id: str, status: str) -> dict | None:
+    """Transition a job to `status` atomically (single lock-guarded write)."""
+    with _JOBS_LOCK:
+        job = _running_jobs.get(job_id)
+        if job is None:
+            return None
+        job["status"] = str(status)
+        _JOBS_TIMESTAMP[job_id] = time.monotonic()
+        return dict(job)
+
+
+def finish_job(
+    job_id: str,
+    *,
+    status: str,
+    result: Any | None = None,
+    error: str | None = None,
+) -> dict | None:
+    """Finalize a job with result/error in one lock-guarded write."""
+    with _JOBS_LOCK:
+        job = _running_jobs.get(job_id)
+        if job is None:
+            return None
+        job["status"] = str(status)
+        job["result"] = result
+        job["error"] = error
+        _JOBS_TIMESTAMP[job_id] = time.monotonic()
+        return dict(job)
+
+
+def get_job(job_id: str) -> dict | None:
+    with _JOBS_LOCK:
+        job = _running_jobs.get(job_id)
+        return dict(job) if job is not None else None
+
+
+def evict_jobs(*, max_age_seconds: float = 3600.0) -> int:
+    """Drop terminal jobs whose final transition is older than the grace period.
+
+    Returns the number of evicted records. Non-terminal jobs are never evicted.
+    Invariant: `_running_jobs` and `_JOBS_TIMESTAMP` share exactly the same key
+    set; every writer must touch both under `_JOBS_LOCK`. The divergence guard
+    below turns a forgotten timestamp write into a loud warning instead of a
+    silently wrong eviction age.
+    """
+    now = time.monotonic()
+    with _JOBS_LOCK:
+        orphan_ids = _JOBS_TIMESTAMP.keys() - _running_jobs.keys()
+        if orphan_ids:  # pragma: no cover - a writer bypassed the helpers
+            for job_id in orphan_ids:
+                _JOBS_TIMESTAMP.pop(job_id, None)
+            logger.warning(
+                "Job registry: dropped %d orphan timestamp(s) with no job record; "
+                "a writer is mutating _running_jobs/_JOBS_TIMESTAMP outside the "
+                "register/finish/evict helpers",
+                len(orphan_ids),
+            )
+        stale_ids = [
+            job_id
+            for job_id, job in _running_jobs.items()
+            if str(job.get("status") or "").lower() in _JOBS_TERMINAL_STATUSES
+            and now - _JOBS_TIMESTAMP.get(job_id, now) >= max_age_seconds
+        ]
+        for job_id in stale_ids:
+            _running_jobs.pop(job_id, None)
+            _JOBS_TIMESTAMP.pop(job_id, None)
+        return len(stale_ids)
+
 
 BARS_BEFORE = 60
 BARS_AFTER = 25
@@ -982,6 +1065,58 @@ def _downsample_numeric_minmax(values: list[float], *, limit: int) -> list[float
     return sampled
 
 
+def _stats_payload_from_result(result: BacktestResult) -> dict:
+    """Normalize field names for the frontend stats contract.
+
+    `best_trade`/`worst_trade` are exact per-trade extremes computed from the
+    closed trades; `avg_winner`/`avg_loser` stay available under their own
+    names. Win/loss counts are whole-backtest values from the canonical stats.
+    """
+    raw = _canonical_stats_from_result(result)
+
+    pnls = [
+        _safe_float(trade.pnl, 0.0)
+        for trade in (result.trades or [])
+        if _safe_float(trade.pnl, 0.0) != 0.0
+    ]
+    best_trade = max(pnls) if pnls else 0
+    worst_trade = min(pnls) if pnls else 0
+
+    stats = {
+        "net_profit": raw.get("total_pnl", 0),
+        "net_profit_pct": round(
+            raw.get("total_pnl", 0) / (result.meta.initial_capital or 100000) * 100, 2
+        ),
+        "sharpe": raw.get("sharpe_ratio", 0),
+        "sortino": raw.get("sortino_ratio", 0),
+        "calmar": raw.get("calmar_ratio", 0),
+        "max_drawdown_pct": round(raw.get("max_drawdown_pct", 0) * 100, 2),
+        "win_rate": round(raw.get("win_rate", 0) * 100, 1),
+        "profit_factor": raw.get("profit_factor", 0),
+        "total_trades": raw.get("total_trades", 0),
+        "winners": raw.get("winners", 0),
+        "losers": raw.get("losers", 0),
+        "avg_winner": raw.get("avg_winner", 0),
+        "avg_loser": raw.get("avg_loser", 0),
+        "avg_trade_pnl": round(raw.get("total_pnl", 0) / max(raw.get("total_trades", 1), 1), 2),
+        "avg_bars_held": raw.get("avg_holding_bars", 0),
+        "max_consecutive_losses": raw.get("max_consecutive_losses", 0),
+        "best_trade": best_trade,
+        "worst_trade": worst_trade,
+        "cagr": round(_safe_float(raw.get("cagr")) * 100, 2),
+        "expectancy": 0,  # computed below
+    }
+    # Expectancy
+    wr = raw.get("win_rate", 0)
+    stats["expectancy"] = round(
+        wr * raw.get("avg_winner", 0) + (1 - wr) * raw.get("avg_loser", 0), 2
+    )
+    # PSR / p-value
+    stats["psr"] = raw.get("psr")
+    stats["p_value"] = raw.get("p_value", 1.0)
+    return stats
+
+
 def _detect_indicators(strategy_file: str) -> list[dict]:
     """Detect indicators used by a strategy from source code with basic parameter extraction."""
     path = _strategy_path(strategy_file)
@@ -1179,14 +1314,23 @@ def _compute_indicators(
 
 
 def _indicator_to_points(df: pd.DataFrame, series: pd.Series, time_set: set[float]) -> list[dict]:
-    """Convert a pandas Series to time/value points filtered to the OHLCV window."""
+    """Convert a pandas Series to time/value points filtered to the OHLCV window.
+
+    The series may carry non-contiguous labels (e.g. a row slice that keeps its
+    original index), so values are paired with timestamps positionally: iterate
+    the series values in order and index the frame positions with `.iloc`,
+    never treating a label as a position.
+    """
     points = []
-    for i, val in series.items():
-        if pd.notna(val) and i < len(df):
-            ts = df.iloc[i]["timestamp"]
-            unix_ts = ts.timestamp() if hasattr(ts, "timestamp") else pd.Timestamp(ts).timestamp()
-            if unix_ts in time_set:
-                points.append({"time": unix_ts, "value": round(float(val), 6)})
+    values = series.reset_index(drop=True)
+    for i in range(len(values)):
+        val = values.iloc[i]
+        if i >= len(df) or not pd.notna(val):
+            continue
+        ts = df.iloc[i]["timestamp"]
+        unix_ts = ts.timestamp() if hasattr(ts, "timestamp") else pd.Timestamp(ts).timestamp()
+        if unix_ts in time_set:
+            points.append({"time": unix_ts, "value": round(float(val), 6)})
     return points
 
 
@@ -2853,7 +2997,21 @@ def _launch_agent_task(task_id: str, payload: dict) -> None:
     def run_agent() -> None:
         started_at = datetime.now(timezone.utc)
         with log_file.open("a", encoding="utf-8", buffering=1) as handle:
+            # Thread-bound log capture: route root-logger records from this
+            # thread into the task log instead of swapping the process-global
+            # sys.stdout/sys.stderr (which would swallow concurrent request
+            # logging from other threads into this task's file).
+            log_handler = _ThreadBoundTaskLogHandler(
+                task_id=task_id,
+                handle=handle,
+                source="agent-task",
+            )
+            root_logger = logging.getLogger()
+            root_logger.addHandler(log_handler)
             try:
+                # `finally` below guarantees removal: a BaseException escaping
+                # the handler body must not leave this task's handler attached
+                # to the process-wide root logger.
                 _write_task_log_line(
                     handle,
                     task_id,
@@ -2877,20 +3035,19 @@ def _launch_agent_task(task_id: str, payload: dict) -> None:
                         source="agent-task",
                     )
 
-                with redirect_stdout(handle), redirect_stderr(handle):
-                    result = run_auto_agent(
-                        payload["code"],
-                        strategy_name=payload.get("strategy_name"),
-                        requested_engine=payload.get("engine"),
-                        provider=provider,
-                        model=model,
-                        symbols=payload.get("symbols"),
-                        timeframe=payload.get("timeframe"),
-                        start=payload.get("start"),
-                        end=payload.get("end"),
-                        capital=_safe_float(payload.get("capital"), 100000.0),
-                        log=task_log,
-                    )
+                result = run_auto_agent(
+                    payload["code"],
+                    strategy_name=payload.get("strategy_name"),
+                    requested_engine=payload.get("engine"),
+                    provider=provider,
+                    model=model,
+                    symbols=payload.get("symbols"),
+                    timeframe=payload.get("timeframe"),
+                    start=payload.get("start"),
+                    end=payload.get("end"),
+                    capital=_safe_float(payload.get("capital"), 100000.0),
+                    log=task_log,
+                )
                 duration_seconds = max(0.0, (datetime.now(timezone.utc) - started_at).total_seconds())
                 _update_task_fields(
                     task_id,
@@ -2931,6 +3088,8 @@ def _launch_agent_task(task_id: str, payload: dict) -> None:
                     exc,
                     extra={"data": {"task_id": task_id, "stream": "task", "source": "agent-task"}},
                 )
+            finally:
+                root_logger.removeHandler(log_handler)
 
     thread = threading.Thread(target=run_agent, daemon=True, name=f"agent-convert-{task_id[:8]}")
     _update_task_fields(task_id, thread=thread)

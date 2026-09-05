@@ -197,7 +197,8 @@ def test_live_endpoints_return_expected_payloads(monkeypatch):
     assert stats_resp.status_code == 200
     stats_payload = stats_resp.json()
     assert stats_payload["account_id"] == account_id
-    assert stats_payload["total_trades"] == 1
+    # The single buy execution never closes a round trip, so no trade counts.
+    assert stats_payload["total_trades"] == 0
     assert stats_payload["winning_trades"] == 0
     assert stats_payload["losing_trades"] == 0
     assert stats_payload["win_rate"] == 0.0
@@ -794,10 +795,12 @@ def test_live_stats_endpoint_uses_realized_pnl_and_balance_drawdown(monkeypatch)
     assert response.status_code == 200
     payload = response.json()
     assert payload["account_id"] == account_id
-    assert payload["total_trades"] == 5
+    # Two closed round trips (one win, one loss); the trailing open buy does
+    # not count, and win rate is 1/2 closed trades, not 1/5 executions.
+    assert payload["total_trades"] == 2
     assert payload["winning_trades"] == 1
     assert payload["losing_trades"] == 1
-    assert payload["win_rate"] == 20.0
+    assert payload["win_rate"] == 50.0
     assert payload["total_pnl"] == 0.0
     assert payload["current_balance"] == 950.0
     assert payload["current_equity"] == 960.0
