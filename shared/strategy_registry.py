@@ -146,11 +146,43 @@ def _strategy_meta_literal(source: str) -> dict[str, Any] | None:
     return None
 
 
-def load_strategy_meta(path: Path, strategies_dir: Path = DEFAULT_STRATEGIES_DIR) -> dict[str, Any]:
-    """Read a strategy's STRATEGY_META without executing the strategy file."""
+def _read_source(path: Path) -> str | None:
+    """Return the file's source, or None if unreadable."""
     try:
-        source = path.read_text(encoding="utf-8")
+        return path.resolve().read_text(encoding="utf-8")
     except OSError:
+        return None
+
+
+def _contained_strategy_source(path: Path, strategies_dir: Path) -> str | None:
+    """Return the file's source, or None if unreadable or outside strategies_dir.
+
+    Validates the constructed path before touching the file system (S8707):
+    a ``path`` argument that escapes ``strategies_dir`` — e.g. via ``..`` or a
+    symlink pointing elsewhere — is rejected instead of read. Listing/lookup
+    only ever inspects the strategy tree, never arbitrary files.
+    """
+    try:
+        root = strategies_dir.resolve()
+        resolved = path.resolve()
+        resolved.relative_to(root)
+    except (OSError, ValueError):
+        return None
+    return _read_source(resolved)
+
+
+def load_strategy_meta(
+    path: Path, strategies_dir: Path | None = None
+) -> dict[str, Any]:
+    """Read a strategy's STRATEGY_META without executing the strategy file.
+
+    Reading is contained to ``strategies_dir`` (default: the repository's
+    strategy tree). Engine runs that need metadata for a user-selected path
+    outside the tree pass the file's own directory — the run already trusts
+    that path explicitly (see :func:`resolve_strategy_parameters`).
+    """
+    source = _contained_strategy_source(path, strategies_dir or DEFAULT_STRATEGIES_DIR)
+    if source is None:
         return {}
     meta = _strategy_meta_literal(source)
     return dict(meta) if isinstance(meta, dict) else {}
@@ -213,7 +245,7 @@ def _source_declares_signal_processor(source: str) -> bool:
 
 def detect_strategy_type(
     path: Path,
-    strategies_dir: Path = DEFAULT_STRATEGIES_DIR,
+    strategies_dir: Path | None = None,
 ) -> StrategyType:
     """Detect the strategy type from parsed metadata, without executing the file.
 
@@ -222,9 +254,8 @@ def detect_strategy_type(
     class shape (``*SignalProcessor`` with a ``process_signal`` method).
     Executing the strategy file is intentionally never done here.
     """
-    try:
-        source = path.read_text(encoding="utf-8")
-    except OSError:
+    source = _contained_strategy_source(path, strategies_dir or DEFAULT_STRATEGIES_DIR)
+    if source is None:
         return StrategyType.MARKET_DATA
     meta = _strategy_meta_literal(source)
     detected = _strategy_type_from_meta(dict(meta)) if isinstance(meta, dict) else None

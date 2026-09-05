@@ -146,6 +146,45 @@ def test_detect_strategy_type_is_static(tmp_path: Path) -> None:
     )
 
 
+def test_strategy_reads_are_contained_to_strategies_dir(tmp_path: Path) -> None:
+    """Path traversal / outside files are never read by listing-time lookups (S8707)."""
+    from shared.strategy_registry import detect_strategy_type, load_strategy_meta
+    from shared.models import StrategyType
+
+    strategy_dir = tmp_path / "strategies"
+    strategy_dir.mkdir()
+    (strategy_dir / "contained.py").write_text(
+        "STRATEGY_META = {'name': 'Contained', 'strategy_type': 'signal_processor'}\n",
+        encoding="utf-8",
+    )
+
+    # A file outside strategies_dir is not read, even when pointed at directly.
+    outside = tmp_path / "outside.py"
+    outside.write_text(
+        "STRATEGY_META = {'name': 'Outside', 'strategy_type': 'signal_processor'}\n",
+        encoding="utf-8",
+    )
+    assert load_strategy_meta(outside, strategy_dir) == {}
+    assert detect_strategy_type(outside, strategy_dir) == StrategyType.MARKET_DATA
+
+    # A traversal path that resolves outside is rejected as well.
+    traversal = strategy_dir / ".." / "outside.py"
+    assert load_strategy_meta(traversal, strategy_dir) == {}
+    assert detect_strategy_type(traversal, strategy_dir) == StrategyType.MARKET_DATA
+
+    # A symlink escaping the tree is rejected; a contained symlink is followed.
+    escaping_link = strategy_dir / "escape.py"
+    escaping_link.symlink_to(outside)
+    assert load_strategy_meta(escaping_link, strategy_dir) == {}
+
+    linked_name = strategy_dir / "linked.py"
+    linked_name.symlink_to(strategy_dir / "contained.py")
+    assert load_strategy_meta(linked_name, strategy_dir) == {
+        "name": "Contained",
+        "strategy_type": "signal_processor",
+    }
+
+
 def test_iter_strategy_entries_skips_dynamic_meta(tmp_path: Path) -> None:
     """Strategies with non-literal STRATEGY_META are skipped, not imported."""
     from shared.strategy_registry import iter_strategy_entries
