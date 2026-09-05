@@ -15,6 +15,7 @@ from alpaca.trading.enums import OrderClass
 from alpaca.trading.requests import StopLossRequest, TakeProfitRequest
 
 from live_runner.base_adapter import BaseLiveAdapter
+from live_runner.credential_env import parse_bool_env
 from risk.live import size_live_signal
 from shared.database import (
     get_live_signal_broker_order_id,
@@ -37,10 +38,12 @@ _SL_METADATA_KEYS = ("stop_loss", "sl_price", "stop_price", "resolved_stop_loss"
 _TP_METADATA_KEYS = ("take_profit", "tp_price")
 
 
-def _parse_bool_env(value: str | None, default: bool = True) -> bool:
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
+def _parse_bool_env(name: str, value: str | None, *, default: bool = True) -> bool:
+    """Strict boolean parsing shared with live_runner.credential_env.
+
+    A typo'd value raises instead of silently selecting live/paper mode.
+    """
+    return parse_bool_env(name, value, default=default)
 
 
 def _to_float(value: Any, *, default: float = 0.0) -> float:
@@ -84,7 +87,12 @@ def _default_alpaca_credentials(values: Mapping[str, str]) -> tuple[str, str, bo
     api_key = str(values.get("ALPACA_API_KEY", "")).strip()
     secret_key = str(values.get("ALPACA_SECRET_KEY", "")).strip()
     if api_key and secret_key:
-        paper = _parse_bool_env(str(values.get("ALPACA_PAPER", "")).strip(), default=True)
+        raw_paper = values.get("ALPACA_PAPER")
+        paper = _parse_bool_env(
+            "ALPACA_PAPER",
+            str(raw_paper).strip() if raw_paper is not None else None,
+            default=True,
+        )
         return api_key, secret_key, paper
     return None
 
@@ -99,34 +107,52 @@ def _alpaca_acc_indexes(values: Mapping[str, str]) -> list[int]:
     )
 
 
+def _alpaca_credential_block(
+    values: Mapping[str, str],
+    idx: int,
+) -> dict[str, str | bool] | None:
+    """Parse one ACC{idx} credential block.
+
+    Returns None when the block has no complete key/secret pair; raises
+    ValueError when its paper flag fails the strict parse.
+    """
+    api_key = str(values.get(f"ALPACA_API_KEY_ACC{idx}", "")).strip()
+    secret_key = str(values.get(f"ALPACA_SECRET_KEY_ACC{idx}", "")).strip()
+    if not api_key or not secret_key:
+        return None
+
+    endpoint = str(values.get(f"ALPACA_ENDPOINT_ACC{idx}", "")).strip().lower()
+    if endpoint:
+        paper = "paper" in endpoint
+    else:
+        raw_paper = values.get(f"ALPACA_PAPER_ACC{idx}")
+        paper = _parse_bool_env(
+            f"ALPACA_PAPER_ACC{idx}",
+            str(raw_paper).strip() if raw_paper is not None else None,
+            default=True,
+        )
+    return {
+        "source_index": f"ACC{idx}",
+        "api_key": api_key,
+        "secret_key": secret_key,
+        "paper": paper,
+        "account_id_hint": str(values.get(f"ALPACA_ACCOUNT_ID_ACC{idx}", "")).strip(),
+        "login_hint": (
+            str(values.get(f"ALPACA_BROKER_LOGIN_ACC{idx}", "")).strip()
+            or str(values.get(f"ALPACA_ACCOUNT_NUMBER_ACC{idx}", "")).strip()
+        ),
+    }
+
+
 def _alpaca_credential_blocks(
     values: Mapping[str, str],
     indexes: list[int],
 ) -> list[dict[str, str | bool]]:
     blocks: list[dict[str, str | bool]] = []
     for idx in indexes:
-        api_key = str(values.get(f"ALPACA_API_KEY_ACC{idx}", "")).strip()
-        secret_key = str(values.get(f"ALPACA_SECRET_KEY_ACC{idx}", "")).strip()
-        if not api_key or not secret_key:
-            continue
-
-        endpoint = str(values.get(f"ALPACA_ENDPOINT_ACC{idx}", "")).strip().lower()
-        paper = "paper" in endpoint if endpoint else _parse_bool_env(
-            str(values.get(f"ALPACA_PAPER_ACC{idx}", "")).strip(),
-            default=True,
-        )
-        blocks.append(
-            {
-                "api_key": api_key,
-                "secret_key": secret_key,
-                "paper": paper,
-                "account_id_hint": str(values.get(f"ALPACA_ACCOUNT_ID_ACC{idx}", "")).strip(),
-                "login_hint": (
-                    str(values.get(f"ALPACA_BROKER_LOGIN_ACC{idx}", "")).strip()
-                    or str(values.get(f"ALPACA_ACCOUNT_NUMBER_ACC{idx}", "")).strip()
-                ),
-            }
-        )
+        block = _alpaca_credential_block(values, idx)
+        if block is not None:
+            blocks.append(block)
     return blocks
 
 
@@ -194,14 +220,44 @@ def resolve_alpaca_credentials(
             )
             return None
 
-    # Default pair applies only when no hints were given (or no ACC{N} blocks
-    # exist), otherwise every account would silently resolve to it.
+    # Default pair applies only when the mapping is still unique: the legacy
+    # single-account setup (no ACC{N} blocks, or exactly one block that the
+    # account did not identify itself against). With two or more credential
+    # blocks there is no unique mapping, so an unmatched account must never
+    # silently route through another account's keys.
+    if len(blocks) > 1:
+        logger.warning(
+            "No unique Alpaca credential block mapping; refusing ambiguous fallback",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "broker_login": broker_login,
+                    "candidate_blocks": len(blocks),
+                    "hints_present": _alpaca_blocks_have_hints(blocks),
+                }
+            },
+        )
+        return None
+
     default_credentials = _default_alpaca_credentials(values)
     if default_credentials is not None:
         return default_credentials
 
     if not blocks:
         return None
+    # Single remaining block with an unidentified account: the legacy
+    # single-account setup. Keep it working, but make it visible — this is
+    # the one path where an account can trade through keys it did not map to.
+    logger.warning(
+        "Unidentified account using the only configured Alpaca credential block",
+        extra={
+            "data": {
+                "account_id": account_id,
+                "broker_login": broker_login,
+                "block_source_index": str(blocks[0].get("source_index", "")),
+            }
+        },
+    )
     return _alpaca_block_credentials(blocks[0])
 
 
@@ -218,8 +274,16 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
     ):
         self.api_key = api_key or os.environ.get("ALPACA_API_KEY", "")
         self.secret_key = secret_key or os.environ.get("ALPACA_SECRET_KEY", "")
+        # Legacy fallback: with file-first precedence (credential_env) the
+        # caller is expected to pass resolved keys; the os.environ fallback
+        # only covers scripts constructed before that resolution existed.
+        if not api_key or not secret_key:
+            logger.warning(
+                "Alpaca adapter falling back to process-env credentials",
+                extra={"data": {"account_id": account_id}},
+            )
         self.paper = (
-            _parse_bool_env(os.environ.get("ALPACA_PAPER"), default=True)
+            _parse_bool_env("ALPACA_PAPER", os.environ.get("ALPACA_PAPER"), default=True)
             if paper is None
             else paper
         )

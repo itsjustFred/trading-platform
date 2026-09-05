@@ -501,8 +501,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
 
             self.access_token = access_token
             self.refresh_token = refresh_token
-            os.environ["CTRADER_ACCESS_TOKEN"] = access_token
-            os.environ["CTRADER_REFRESH_TOKEN"] = refresh_token
+            # The accounts file is the source of truth (file-first precedence):
+            # refreshed tokens are persisted above and must NOT be mirrored into
+            # os.environ, where a stale copy would shadow the fresh file value
+            # for any component resolving credentials through the file.
             self._terminal_auth_failure_reason = ""
             self._terminal_auth_failure_code = ""
             logger.info(

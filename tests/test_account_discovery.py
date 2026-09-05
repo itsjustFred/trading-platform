@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import os
+from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 import live_runner.account_discovery as account_discovery
+from live_runner.alpaca_adapter import _alpaca_acc_indexes, _alpaca_credential_blocks
 from shared.models import LiveAccount
 
 
@@ -118,6 +123,153 @@ def test_is_ctrader_account_not_authorized_error_detects_phrase():
 def test_is_ctrader_account_not_authorized_error_ignores_other_errors():
     error_text = "RuntimeError('TIMEOUT: endpoint unavailable')"
     assert not account_discovery._is_ctrader_account_not_authorized_error(error_text)
+
+
+def test_iter_alpaca_credentials_share_adapter_block_semantics():
+    """B-12: discovery and the runtime adapter must agree on how a credential
+    block is parsed, so discovered is_demo matches the paper flag the adapter
+    is actually constructed with.
+
+    Per block: ALPACA_ENDPOINT_ACC{N} containing 'paper' wins, then
+    ALPACA_PAPER_ACC{N}, then default True (the adapter's paper default).
+    """
+    env = {
+        "ALPACA_API_KEY_ACC1": "k1",
+        "ALPACA_SECRET_KEY_ACC1": "s1",
+        "ALPACA_PAPER_ACC1": "false",
+        "ALPACA_API_KEY_ACC2": "k2",
+        "ALPACA_SECRET_KEY_ACC2": "s2",
+        "ALPACA_ENDPOINT_ACC2": "https://paper-api.alpaca.markets/v2",
+        "ALPACA_API_KEY_ACC3": "k3",
+        "ALPACA_SECRET_KEY_ACC3": "s3",
+    }
+
+    discovered = account_discovery._iter_alpaca_credentials(env)
+    indexes = _alpaca_acc_indexes(env)
+    blocks = _alpaca_credential_blocks(env, indexes)
+
+    by_key = {block["key"]: block for block in discovered}
+    by_adapter_key = {f"ACC{index}": block for index, block in zip(indexes, blocks)}
+
+    assert by_key["ACC1"]["paper"] is False
+    assert by_adapter_key["ACC1"]["paper"] is False
+    assert by_key["ACC2"]["paper"] is True
+    assert by_adapter_key["ACC2"]["paper"] is True
+    # Unset paper flag: both default to paper.
+    assert by_key["ACC3"]["paper"] is True
+    assert by_adapter_key["ACC3"]["paper"] is True
+    for block in discovered:
+        adapter_block = by_adapter_key[block["key"]]
+        assert block["api_key"] == adapter_block["api_key"]
+        assert block["secret_key"] == adapter_block["secret_key"]
+        assert block["paper"] == adapter_block["paper"]
+
+    # Typo'd paper flag: both must refuse, not silently pick live.
+    typo_env = {
+        "ALPACA_API_KEY_ACC4": "k4",
+        "ALPACA_SECRET_KEY_ACC4": "s4",
+        "ALPACA_PAPER_ACC4": "tru",
+    }
+    acc_indexes = _alpaca_acc_indexes(typo_env)
+    with pytest.raises(ValueError, match="ALPACA_PAPER_ACC4"):
+        _alpaca_credential_blocks(typo_env, acc_indexes)
+    # Discovery delegates to the adapter parser (asserted above on the valid
+    # blocks), so refusing here follows from the same strict parse.
+
+    for block in discovered:
+        adapter_block = by_adapter_key[block["key"]]
+        assert block["api_key"] == adapter_block["api_key"]
+        assert block["secret_key"] == adapter_block["secret_key"]
+        assert block["paper"] == adapter_block["paper"]
+
+
+def test_iter_alpaca_credentials_default_block_falls_back_to_adapter_default_pair():
+    """With no ACC{N} blocks, discovery falls back to the default pair with the
+    same default-paper semantics the adapter uses."""
+    discovered = account_discovery._iter_alpaca_credentials(
+        {"ALPACA_API_KEY": "k", "ALPACA_SECRET_KEY": "s"}
+    )
+
+    assert discovered == [
+        {"key": "DEFAULT", "api_key": "k", "secret_key": "s", "paper": True}
+    ]
+
+    with pytest.raises(ValueError, match="ALPACA_PAPER"):
+        account_discovery._iter_alpaca_credentials(
+            {"ALPACA_API_KEY": "k", "ALPACA_SECRET_KEY": "s", "ALPACA_PAPER": "wahr"}
+        )
+
+
+def _tmp_accounts_env(content: str) -> Path:
+    import tempfile
+
+    fd, path = tempfile.mkstemp(suffix=".env")
+    with os.fdopen(fd, "w") as handle:
+        handle.write(content)
+    return Path(path)
+
+
+def test_discover_configured_accounts_skips_block_with_invalid_bool(monkeypatch):
+    """A typo'd ALPACA_PAPER_ACC{N} must skip that block with a warning, not
+    abort the whole discovery run (which would also drop cTrader accounts)."""
+    monkeypatch.setenv("CTRADER_APP_ID", "app")
+    monkeypatch.setenv("CTRADER_APP_SECRET", "secret")
+    monkeypatch.setenv("CTRADER_ACCESS_TOKEN", "token")
+    env_path = _tmp_accounts_env(
+        "ALPACA_API_KEY_ACC1=good-key\n"
+        "ALPACA_SECRET_KEY_ACC1=good-secret\n"
+        "ALPACA_PAPER_ACC1=false\n"
+        "ALPACA_API_KEY_ACC2=bad-key\n"
+        "ALPACA_SECRET_KEY_ACC2=bad-secret\n"
+        "ALPACA_PAPER_ACC2=ture\n"
+    )
+
+    async def _discover(app_id, app_secret, access_token):
+        return [
+            LiveAccount(
+                id="47644617",
+                name="cTrader Demo",
+                broker="ctrader",
+                is_demo=True,
+                ctid="47644617",
+            )
+        ]
+
+    monkeypatch.setattr(account_discovery, "discover_ctrader_accounts", _discover)
+
+    accounts = asyncio.run(account_discovery.discover_configured_accounts(accounts_env=env_path))
+
+    # The cTrader account survives; the typo'd block is skipped with a warning
+    # instead of aborting the whole discovery run.
+    assert [account.id for account in accounts if account.broker == "ctrader"] == ["47644617"]
+
+
+def test_iter_alpaca_credentials_safe_keeps_valid_sibling_blocks(monkeypatch):
+    """A typo'd ALPACA_PAPER_ACC{N} skips only that block: the other indexed
+    blocks must still be enumerated, not silently dropped together with it."""
+    env = {
+        "ALPACA_API_KEY_ACC1": "good-key",
+        "ALPACA_SECRET_KEY_ACC1": "good-secret",
+        "ALPACA_PAPER_ACC1": "false",
+        "ALPACA_API_KEY_ACC2": "bad-key",
+        "ALPACA_SECRET_KEY_ACC2": "bad-secret",
+        "ALPACA_PAPER_ACC2": "ture",
+        "ALPACA_API_KEY_ACC3": "also-good",
+        "ALPACA_SECRET_KEY_ACC3": "also-good-secret",
+        "ALPACA_ENDPOINT_ACC3": "https://paper-api.alpaca.markets/v2",
+    }
+
+    discovered = account_discovery._iter_alpaca_credentials_safe(env)
+
+    assert discovered == [
+        {"key": "ACC1", "api_key": "good-key", "secret_key": "good-secret", "paper": False},
+        {
+            "key": "ACC3",
+            "api_key": "also-good",
+            "secret_key": "also-good-secret",
+            "paper": True,
+        },
+    ]
 
 
 def test_discover_configured_accounts_uses_shared_ctrader_credentials(monkeypatch):

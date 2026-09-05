@@ -12,7 +12,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
-from dotenv import dotenv_values
 
 from live_runner.account_routing import (
     ctrader_account_identifier,
@@ -20,6 +19,7 @@ from live_runner.account_routing import (
 )
 from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credentials
 from live_runner.base_adapter import BaseLiveAdapter
+from live_runner.credential_env import accounts_env_mtime, load_accounts_env_values
 from live_runner.ctrader_adapter import CTraderAuthTerminalError, CTraderLiveAdapter
 from live_runner.service_discovery import discover_discord_bots_from_env
 from live_runner.signal_sources import DiscordSignalSource, wait_for_candle_close
@@ -159,20 +159,24 @@ def _parse_strict_bool_env(name: str, value: str | None, *, default: bool = True
     )
 
 
+def _raw_bool_text(value: object) -> str | None:
+    """Normalize a config value to text for boolean parsing.
+
+    None means "not configured" so the caller's default applies; an empty
+    string is deliberately NOT collapsed to None — a typo'd/blank value must
+    surface as a strict-parse error instead of silently enabling the default.
+    """
+    if value is None:
+        return None
+    return str(value)
+
+
 def _load_accounts_env_values(accounts_env: Path) -> dict[str, str]:
-    loaded = dotenv_values(accounts_env)
-    result: dict[str, str] = {}
-    for key, value in loaded.items():
-        if key and isinstance(value, str):
-            result[key] = value.strip()
-    return result
+    return load_accounts_env_values(accounts_env)
 
 
 def _accounts_env_mtime(accounts_env: Path) -> int | None:
-    try:
-        return accounts_env.stat().st_mtime_ns
-    except OSError:
-        return None
+    return accounts_env_mtime(accounts_env)
 
 
 def _discover_and_register_discord_services(*, log_summary: bool = True) -> list[Service]:
@@ -262,6 +266,21 @@ def _ctrader_credentials_signature(env_values: Mapping[str, str]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _ctrader_credentials_signature_safe(env_values: Mapping[str, str]) -> str:
+    """Credential signature that survives a strict-parse config error.
+
+    A typo'd boolean in `.accounts.env` must not abort the deployment sync
+    iteration for every account (the loop's only handler is the generic
+    `except Exception`). A stable error signature instead blocks rotation —
+    the account is skipped when its adapter is (re)created, which surfaces
+    the invalid value through the per-account error log.
+    """
+    try:
+        return _ctrader_credentials_signature(env_values)
+    except ValueError:
+        return "invalid-credentials"
+
+
 def _refresh_ctrader_blocked_state_for_accounts(
     accounts: list[LiveAccountConfig],
     env_values: Mapping[str, str],
@@ -271,7 +290,7 @@ def _refresh_ctrader_blocked_state_for_accounts(
         if account.broker != "ctrader":
             continue
         account_id = account.id
-        signature = _ctrader_credentials_signature(env_values)
+        signature = _ctrader_credentials_signature_safe(env_values)
         previous = _CTRADER_ACCOUNT_CREDENTIAL_SIGNATURES.get(account_id)
         _CTRADER_ACCOUNT_CREDENTIAL_SIGNATURES[account_id] = signature
         if previous is None or previous == signature:
@@ -375,7 +394,7 @@ def _deployment_allows_short(deployment: LiveDeploymentConfig) -> bool:
     settings = deployment.settings or {}
     configured = deployment.signal_config or {}
     value = configured.get("allow_short", settings.get("allow_short", False))
-    return _parse_bool_env(str(value), default=False)
+    return _parse_strict_bool_env("allow_short", _raw_bool_text(value), default=False)
 
 
 def _deployment_wait_for_candle_close(
@@ -383,10 +402,20 @@ def _deployment_wait_for_candle_close(
 ) -> bool:
     configured = deployment.signal_config or {}
     if "wait_candle_close" in configured:
-        return _parse_bool_env(str(configured.get("wait_candle_close")), default=False)
+        return _parse_strict_bool_env(
+            "wait_candle_close", _raw_bool_text(configured.get("wait_candle_close")), default=False
+        )
     if "wait_for_candle_close" in configured:
-        return _parse_bool_env(str(configured.get("wait_for_candle_close")), default=False)
-    return _parse_bool_env(env_values.get("DISCORD_WAIT_FOR_CANDLE_CLOSE"), default=True)
+        return _parse_strict_bool_env(
+            "wait_for_candle_close",
+            _raw_bool_text(configured.get("wait_for_candle_close")),
+            default=False,
+        )
+    return _parse_strict_bool_env(
+        "DISCORD_WAIT_FOR_CANDLE_CLOSE",
+        env_values.get("DISCORD_WAIT_FOR_CANDLE_CLOSE"),
+        default=True,
+    )
 
 
 def _deployment_signal_timeframe(deployment: LiveDeploymentConfig) -> str:
@@ -939,7 +968,22 @@ async def _submit_normalized_discord_signal(
         )
         return
 
-    live_signal = _trade_signal_to_live_signal(normalized_signal, deployment)
+    try:
+        live_signal = _trade_signal_to_live_signal(normalized_signal, deployment)
+    except ValueError:
+        # Strict-boolean config errors (e.g. typo'd allow_short) must skip this
+        # deployment without dropping the listener loop or sibling deployments.
+        logger.exception(
+            "Invalid deployment boolean config; skipping deployment",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "deployment_id": str(deployment.id),
+                    "symbol": trade_signal.symbol,
+                }
+            },
+        )
+        return
     try:
         broker_order_id = await submit_order_with_risk(adapter, deployment, live_signal)
     except Exception as exc:
@@ -987,13 +1031,30 @@ async def _dispatch_discord_trade_signal(
         if not _deployment_covers_discord_symbol(deployment, trade_signal.symbol):
             continue
 
+        try:
+            wait_enabled = _deployment_wait_for_candle_close(deployment, accounts_env_values)
+        except ValueError:
+            # A typo'd boolean must skip the deployment, not kill the listener
+            # loop or other deployments on the same account. It also must not
+            # default into immediate market orders.
+            logger.exception(
+                "Invalid deployment boolean config; skipping deployment",
+                extra={
+                    "data": {
+                        "account_id": account_id,
+                        "strategy_name": deployment.strategy_name,
+                    }
+                },
+            )
+            return
+
         await _submit_normalized_discord_signal(
             account_id,
             adapter,
             deployment,
             trade_signal,
             signal_timeframe=_deployment_signal_timeframe(deployment),
-            wait_enabled=_deployment_wait_for_candle_close(deployment, accounts_env_values),
+            wait_enabled=wait_enabled,
         )
         break
     else:
@@ -1960,11 +2021,21 @@ async def _ensure_adapter_for_active_account(
                 extra={"data": {"account_id": account_id}},
             )
             return
-        adapter = _create_adapter_for_account(
-            account,
-            accounts_env_values=accounts_env_values,
-            accounts_env_path=accounts_env_path,
-        )
+        try:
+            adapter = _create_adapter_for_account(
+                account,
+                accounts_env_values=accounts_env_values,
+                accounts_env_path=accounts_env_path,
+            )
+        except ValueError as exc:
+            # Strict-boolean config errors (e.g. a typo'd ALPACA_PAPER_ACC{N})
+            # must skip this account, not propagate through asyncio.gather and
+            # abort the whole deployment sync iteration every cycle.
+            logger.exception(
+                "Invalid credential config; skipping account",
+                extra={"data": {"account_id": account_id, "error": str(exc)}},
+            )
+            return
         if adapter is None:
             return
         active_adapters[account_id] = adapter
