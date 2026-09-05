@@ -212,16 +212,12 @@ class TestMaxPositionPctHelpSemantics:
         Kills the mutant that rewrote the help into 'leverage may be applied'
         — the whole F7 defusal rests on the documented semantics.
         """
-        import io
-        from contextlib import redirect_stdout
-
         from runner.cli import main
 
         monkeypatch.setattr("sys.argv", ["runner.cli", "run", "--help"])
         with pytest.raises(SystemExit):
-            with redirect_stdout(io.StringIO()) as out:
-                main()
-        text = " ".join(out.getvalue().split())
+            main()
+        text = " ".join(capsys.readouterr().out.split())
         assert "Per-position notional cap" in text, (
             "help must state the per-position notional-cap semantics"
         )
@@ -236,16 +232,12 @@ def test_help_mentions_max_leverage_separately(capsys, monkeypatch):
     Kills the mutant that rewrote the leverage sentence into 'leverage may
     be applied' — blurring the two knobs back into the F7 ambiguity.
     """
-    import io
-    from contextlib import redirect_stdout
-
     from runner.cli import main
 
     monkeypatch.setattr("sys.argv", ["runner.cli", "run", "--help"])
     with pytest.raises(SystemExit):
-        with redirect_stdout(io.StringIO()) as out:
-            main()
-    text = " ".join(out.getvalue().split())
+        main()
+    text = " ".join(capsys.readouterr().out.split())
     assert "--max-leverage controls leverage separately" in text, (
         "the help must route leverage semantics to --max-leverage"
     )

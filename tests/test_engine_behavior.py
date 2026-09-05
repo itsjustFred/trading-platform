@@ -65,7 +65,7 @@ def _linear_frame(n: int = 5, start: float = 100.0) -> pd.DataFrame:
 class TestSignalMergeElementWise:
     """Signal rows must overlay the OHLCV row by label, not stack vertically."""
 
-    def test_signal_named_close_does_not_shadow_ohlcv_close(self):
+    def test_signal_named_close_does_not_shadow_ohlcv_close(self, monkeypatch):
         """An indicator called 'close' must not corrupt the fill-price lookup.
 
         With a vertical concat the merged row carries 'close' twice and the
@@ -88,11 +88,10 @@ class TestSignalMergeElementWise:
             "entry fill must use the next bar's OHLCV open, not the indicator"
         )
 
-    def test_merged_row_length_matches_ohlcv_row(self):
+    def test_merged_row_length_matches_ohlcv_row(self, monkeypatch):
         """The merge must never widen the row (vertical concat artifact)."""
         frame = _linear_frame()
         captured: dict[str, pd.Series] = {}
-
         original_extract = TradeEngine._extract_levels
 
         def spy(self, row: pd.Series):
@@ -106,12 +105,9 @@ class TestSignalMergeElementWise:
              "low": pd.Series([2.0] * len(df), index=df.index)},
         )
 
-        TradeEngine._extract_levels = spy  # type: ignore[method-assign]
-        try:
-            engine = TradeEngine(_config(Path("/tmp")), symbol="PROBE")
-            engine.run(frame, strategy)
-        finally:
-            TradeEngine._extract_levels = original_extract  # type: ignore[method-assign]
+        monkeypatch.setattr(TradeEngine, "_extract_levels", spy)
+        engine = TradeEngine(_config(Path("/tmp")), symbol="PROBE")
+        engine.run(frame, strategy)
 
         row = captured["row"]
         ohlcv_labels = [str(label) for label in frame.iloc[0].index if label != "timestamp"]
@@ -396,7 +392,7 @@ class TestReportingEquityCurve:
 class TestSignalMergeOhlcvAuthority:
     """CodeRabbit round: OHLCV values are authoritative over signal values."""
 
-    def test_signal_value_never_overwrites_non_na_ohlcv_value(self):
+    def test_signal_value_never_overwrites_non_na_ohlcv_value(self, monkeypatch):
         """A signal column matching an OHLCV label must not change its value.
 
         combine_first takes the left (OHLCV) value whenever it is non-NaN, so
@@ -413,18 +409,15 @@ class TestSignalMergeOhlcvAuthority:
         )
 
         captured: dict[str, pd.Series] = {}
-        original = TradeEngine._extract_levels
+        original_extract = TradeEngine._extract_levels
 
         def spy(self, row):
             captured["row"] = row
-            return original(self, row)
+            return original_extract(self, row)
 
-        TradeEngine._extract_levels = spy  # type: ignore[method-assign]
-        try:
-            engine = TradeEngine(_config(Path("/tmp")), symbol="PROBE")
-            engine.run(frame, strategy)
-        finally:
-            TradeEngine._extract_levels = original  # type: ignore[method-assign]
+        monkeypatch.setattr(TradeEngine, "_extract_levels", spy)
+        engine = TradeEngine(_config(Path("/tmp")), symbol="PROBE")
+        engine.run(frame, strategy)
 
         row = captured["row"]
         assert row["close"] == pytest.approx(frame.iloc[0]["close"]), (

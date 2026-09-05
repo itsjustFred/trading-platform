@@ -54,7 +54,7 @@ def _config(tmp_path: Path, **overrides: Any) -> BacktestConfig:
     return BacktestConfig(**payload)
 
 
-@pytest.fixture()
+@pytest.fixture
 def sizing_env(tmp_path: Path):
     strategy_dir = tmp_path / "strategies"
     strategy_dir.mkdir()
@@ -131,7 +131,8 @@ class TestPortfolioEquityCurveSemantics:
         tmp_path, strategy_path = sizing_env
         config = _config(tmp_path)
         result = VectorbtAdapter().run(config, str(strategy_path))
-        assert result.trades and result.equity_curve
+        assert result.trades, "the fixture must produce trades"
+        assert result.equity_curve, "the fixture must produce an equity curve"
 
         equity_by_time = {point.time: point.equity for point in result.equity_curve}
         initial = config.initial_capital

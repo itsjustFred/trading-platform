@@ -28,7 +28,7 @@ def _frame(*, periods: int = 300) -> pd.DataFrame:
     return deterministic_ohlcv_frame(periods=periods)
 
 
-@pytest.fixture()
+@pytest.fixture
 def curve_env(tmp_path: Path):
     strategy_dir = tmp_path / "strategies"
     strategy_dir.mkdir()
@@ -55,7 +55,8 @@ class TestNativeCurveSemantics:
     def test_curve_credits_full_pnl_in_exit_order(self, curve_env):
         config, strategy_path = curve_env
         result = NativeAdapter().run(config, str(strategy_path))
-        assert result.trades and result.equity_curve
+        assert result.trades, "the fixture must produce trades"
+        assert result.equity_curve, "the fixture must produce an equity curve"
 
         # Full PnL credited exactly once per trade: the last curve point is
         # capital plus the realized PnL of every trade.
