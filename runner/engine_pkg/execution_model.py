@@ -45,13 +45,11 @@ class ExecutionModelSettings:
             and modeling_resolution not in {"main_timeframe", "open_close", config.timeframe}
             else None
         )
-        same_bar_order = str(params.get("same_bar_order") or "stop_first").strip().lower()
-        if same_bar_order in {"tp_first", "take_profit_first"}:
-            same_bar_order = "take_profit_first"
-        elif same_bar_order in {"stop", "stop_loss_first"}:
-            same_bar_order = "stop_first"
-        if same_bar_order not in {"stop_first", "take_profit_first"}:
-            raise ValueError("same_bar_order must be 'stop_first' or 'take_profit_first'")
+        # Conformance (Cleanup 16-A): same-bar priority is a shared contract
+        # resolved by intrabar chronology or the stop-first fallback — a
+        # configured tp-first order is no longer honored by the native engine
+        # (it stays visible in the audit metadata as ``stop_first``).
+        same_bar_order = "stop_first"
 
         return cls(
             market_order_timing=str(params.get("market_order_timing") or "next_bar_open"),

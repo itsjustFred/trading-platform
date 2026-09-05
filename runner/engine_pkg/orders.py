@@ -47,3 +47,4 @@ class Position:
     exits: list[TradeExit] = field(default_factory=list)
     mae: float = 0.0
     mfe: float = 0.0
+    meta: dict[str, Any] = field(default_factory=dict)

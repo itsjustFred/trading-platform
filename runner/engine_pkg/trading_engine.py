@@ -28,6 +28,7 @@ from runner.engine_pkg.execution_model import ExecutionModelSettings
 from runner.engine_pkg.orders import Order, OrderType, Position
 from runner.engine_pkg.result import build_indicator_series, build_result
 from runner.engines.base import BacktestConfig
+from runner.engines.contract import flag_missing_intrabar, resolve_same_bar_exit
 from shared.models import BacktestResult, EquityPoint, IndicatorSeries, Trade, TradeExit
 
 #: Engine-level concurrent-position policy for the native engine
@@ -373,7 +374,31 @@ class TradeEngine:
                         if order.direction == "LONG"
                         else float(fill_price) + distance
                     )
+                if (
+                    order.order_type in {OrderType.LIMIT, OrderType.STOP, OrderType.STOP_LIMIT}
+                ):
+                    # LIMIT/STOP/STOP_LIMIT orders fill at their trigger price,
+                    # so they are re-sized from that trigger price instead of
+                    # keeping the creation-price estimate (the creation-price
+                    # sizing on the signal bar is only the pending-order
+                    # estimate; market orders fill at the next bar's open and
+                    # are re-sized there).
+                    order.quantity = self._calculate_position_size(
+                        entry_price=float(fill_price),
+                        stop_loss_price=order.stop_loss,
+                        direction=order.direction,
+                        take_profit_price=(
+                            float(order.take_profit_levels[0]["price"])
+                            if order.take_profit_levels
+                            else None
+                        ),
+                    )
+                    if order.quantity <= 0:
+                        continue
                 if order.order_type == OrderType.MARKET and order.stop_loss is not None:
+                    # MARKET: no stop → no risk-based re-size; the creation
+                    # estimate (signal-bar close) is the documented fallback
+                    # for stopless market entries.
                     take_profit = (
                         float(order.take_profit_levels[0]["price"])
                         if order.take_profit_levels
@@ -470,6 +495,7 @@ class TradeEngine:
                     "timestamp": position.entry_time,
                     "price": position.entry_price,
                 },
+                **dict(getattr(position, "meta", {}) or {}),
             },
             tags=["native"],
         )
@@ -496,6 +522,30 @@ class TradeEngine:
                 next_positions.append(position)
 
         self.positions = next_positions
+
+    def _flag_same_bar_fallback(self, position: Position, bar_time: pd.Timestamp, next_time: pd.Timestamp | None) -> None:
+        """Record the stop-first fallback flag on the position's future trade.
+
+        Decision Record (Cleanup 16-A): when intrabar data was requested but
+        could not order the two same-bar events, the stop-first tie-break is
+        used and the result must be flagged. The flag lands in
+        ``trade.meta["same_bar_priority"]`` via ``_finalize_position``; when
+        the intrabar walk DID resolve the chronology the chronological event
+        already won and no flag is recorded.
+
+        The caller only reaches this method when the intrabar walk produced no
+        ordered event, so a fallback ALWAYS applies here; the reason records
+        whether sub-bars existed at all.
+        """
+        window = self._intrabar_window(bar_time, next_time)
+        has_sub_bars = window is not None and not window.empty
+        flag = flag_missing_intrabar(
+            intrabar_resolution=self._execution_model.intrabar_resolution,
+            intrabar_coverage=has_sub_bars,
+            reason="intrabar_data_missing" if not has_sub_bars else "intrabar_unresolved",
+        )
+        if flag is not None:
+            position.meta["same_bar_priority"] = flag
 
     def _intrabar_window(
         self, bar_time: pd.Timestamp, next_time: pd.Timestamp | None
@@ -527,23 +577,19 @@ class TradeEngine:
             sub_high = float(row["high"])
             sub_low = float(row["low"])
 
-            stop_hit = False
-            tp_hit = False
-            if position.direction == "LONG":
-                stop_hit = stop_price is not None and sub_low <= stop_price
-                tp_hit = tp_price is not None and sub_high >= tp_price
-            else:
-                stop_hit = stop_price is not None and sub_high >= stop_price
-                tp_hit = tp_price is not None and sub_low <= tp_price
-
-            if stop_hit and tp_hit:
-                return (
-                    "tp" if self._execution_model.same_bar_order == "take_profit_first" else "stop"
-                )
-            if stop_hit:
-                return "stop"
-            if tp_hit:
-                return "tp"
+            # Conformance (Cleanup 16-A, F8): with intrabar data available the
+            # actual chronological event wins — the shared helper classifies
+            # each intrabar step in time order, so the first event seen is the
+            # first event that happened, not the stop-first tie-break.
+            event = resolve_same_bar_exit(
+                direction=position.direction,
+                high=sub_high,
+                low=sub_low,
+                stop_price=stop_price,
+                take_profit_price=tp_price,
+            )
+            if event is not None:
+                return event
 
         return None
 
@@ -587,11 +633,12 @@ class TradeEngine:
                         next_time,
                     )
                 if first_event is None:
-                    first_event = (
-                        "tp"
-                        if self._execution_model.same_bar_order == "take_profit_first"
-                        else "stop"
-                    )
+                    # Conformance (Cleanup 16-A, F8): intrabar data was
+                    # requested but could not order the two events — fall
+                    # back to the stop-first tie-break and flag the trade so
+                    # the ambiguity is visible downstream.
+                    first_event = "stop"
+                    self._flag_same_bar_fallback(position, bar_time, next_time)
             elif stop_hit:
                 first_event = "stop"
             elif tp_hit:
@@ -763,7 +810,13 @@ class TradeEngine:
             signal_row = (
                 self._signals_frame.iloc[i] if self._signals_frame is not None else pd.Series()
             )
-            merged_row = pd.concat([row, signal_row])
+            # F20: overlay the signal values onto the OHLCV row ELEMENT-WISE
+            # (aligned by label). The previous ``pd.concat([row, signal_row])``
+            # stacked the two Series vertically, producing a row of length
+            # len(row) + len(signal_row) with duplicated labels — OHLCV lookups
+            # became ambiguous and colliding signal names ("close", "high", …)
+            # silently corrupted or crashed entry extraction.
+            merged_row = row.combine_first(signal_row)
 
             self._check_stops(row, i, next_time)
             self._fill_pending_orders(row, i)
