@@ -170,8 +170,9 @@ def test_iter_alpaca_credentials_share_adapter_block_semantics():
         "ALPACA_SECRET_KEY_ACC4": "s4",
         "ALPACA_PAPER_ACC4": "tru",
     }
+    acc_indexes = _alpaca_acc_indexes(typo_env)
     with pytest.raises(ValueError, match="ALPACA_PAPER_ACC4"):
-        _alpaca_credential_blocks(typo_env, _alpaca_acc_indexes(typo_env))
+        _alpaca_credential_blocks(typo_env, acc_indexes)
     # Discovery delegates to the adapter parser (asserted above on the valid
     # blocks), so refusing here follows from the same strict parse.
 

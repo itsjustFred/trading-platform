@@ -292,5 +292,6 @@ def test_alpaca_credential_blocks_strict_parse_preserves_sibling_blocks() -> Non
     ]
 
     complete_env = dict(env, ALPACA_API_KEY_ACC4="k4", ALPACA_SECRET_KEY_ACC4="s4")
+    acc_indexes = _alpaca_acc_indexes(complete_env)
     with pytest.raises(ValueError, match="ALPACA_PAPER_ACC4"):
-        _alpaca_credential_blocks(complete_env, _alpaca_acc_indexes(complete_env))
+        _alpaca_credential_blocks(complete_env, acc_indexes)

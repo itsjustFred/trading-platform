@@ -2031,7 +2031,7 @@ async def _ensure_adapter_for_active_account(
             # Strict-boolean config errors (e.g. a typo'd ALPACA_PAPER_ACC{N})
             # must skip this account, not propagate through asyncio.gather and
             # abort the whole deployment sync iteration every cycle.
-            logger.error(
+            logger.exception(
                 "Invalid credential config; skipping account",
                 extra={"data": {"account_id": account_id, "error": str(exc)}},
             )
