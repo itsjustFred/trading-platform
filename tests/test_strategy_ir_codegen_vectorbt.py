@@ -445,10 +445,6 @@ def test_comparison_families_are_pinned(expression: str, expected_fragment: str)
 
 def test_unrecognized_expression_fails_loudly():
     """F4 (16-B): unknown wording must fail loudly, never fabricate a rule."""
-    import pytest as _pytest
-
-    from runner.strategy_ir.codegen_vectorbt import _untranslatable  # noqa: F401
-
     strategy_ir = _injection_ir(
         name="Fallback Demo",
         indicator_label="Fast EMA",
@@ -457,5 +453,5 @@ def test_unrecognized_expression_fails_loudly():
     )
     strategy_ir.exit_signals = []
 
-    with _pytest.raises(ValueError, match="Cannot deterministically translate"):
+    with pytest.raises(ValueError, match="Cannot deterministically translate"):
         generate_vectorbt_strategy_code(strategy_ir)
