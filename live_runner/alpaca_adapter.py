@@ -607,7 +607,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         # A signal row persisted without a broker order wedges every redelivery
         # on the duplicate-persisted recovery path.
         if signal.action not in {"buy", "sell"}:
-            raise ValueError(f"Unsupported signal action: {signal.action}")
+            raise ValueError(f"Unsupported action '{signal.action}'")
 
         if qty is not None:
             # Trusted channel: the caller has already run risk sizing.

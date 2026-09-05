@@ -850,8 +850,8 @@ def test_submit_order_with_risk_zeroes_size_when_budget_exhausted_by_positions()
 def test_ctrader_volume_contract_uses_qty_units_only():
     """The one contract: signal metadata 'qty' is in broker volume / 1000
     (account-currency lots for FX). 'ctrader_volume' and 'volume' are raw
-    broker units and must never be read from signal metadata — an untrusted
-    payload must not pick its own size."""
+    broker-unit operator overrides — they stay readable (Main contract) but
+    map 1:1 to broker volume, never through the qty scale."""
     _module, adapter = _make_ctrader_adapter()
 
     def _signal(metadata: dict[str, Any]) -> LiveSignal:
@@ -865,10 +865,9 @@ def test_ctrader_volume_contract_uses_qty_units_only():
         )
 
     assert adapter._resolve_order_volume(_signal({"qty": 5.0})) == 5000
-    with pytest.raises(ValueError, match="no positive quantity"):
-        adapter._resolve_order_volume(_signal({"ctrader_volume": 100000}))
-    with pytest.raises(ValueError, match="no positive quantity"):
-        adapter._resolve_order_volume(_signal({"volume": 100000}))
+    # Operator overrides pass through in raw broker units (Main contract).
+    assert adapter._resolve_order_volume(_signal({"ctrader_volume": 100000})) == 100000
+    assert adapter._resolve_order_volume(_signal({"volume": 100000})) == 100000
     with pytest.raises(ValueError, match="no positive quantity"):
         adapter._resolve_order_volume(_signal({}))
 
@@ -1083,7 +1082,7 @@ def test_ctrader_invalid_action_never_persists_signal(monkeypatch):
     # broker request builder, so force an out-of-domain action through the model.
     object.__setattr__(signal, "action", "hold")
 
-    with pytest.raises(ValueError, match="Unsupported signal action"):
+    with pytest.raises(ValueError, match=r"Unsupported (signal )?action"):
         asyncio.run(adapter.submit_order(signal))
 
 
@@ -1111,7 +1110,7 @@ def test_alpaca_invalid_action_never_persists_signal(monkeypatch):
     )
     object.__setattr__(signal, "action", "hold")
 
-    with pytest.raises(ValueError, match="Unsupported signal action"):
+    with pytest.raises(ValueError, match=r"Unsupported (signal )?action"):
         asyncio.run(adapter.submit_order(signal))
 
 
@@ -3100,7 +3099,7 @@ def test_trade_signal_conversion_rejects_unknown_action_instead_of_selling():
     ):
         object.__setattr__(close, field_name, value)
 
-    with pytest.raises(ValueError, match="Unsupported signal action"):
+    with pytest.raises(ValueError, match=r"Unsupported (signal )?action"):
         _trade_signal_to_live_signal(close, deployment)
 
     converted = _trade_signal_to_live_signal(base, deployment)

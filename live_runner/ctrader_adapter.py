@@ -258,6 +258,21 @@ def _ensure_asyncio_twisted_reactor(loop: asyncio.AbstractEventLoop) -> None:
         reactor.startRunning(installSignalHandlers=False)
 
 
+def _explicit_metadata_volume(metadata: dict[str, Any]) -> int | None:
+    """Explicit broker-volume overrides from metadata ('ctrader_volume', 'volume')."""
+    for key in ("ctrader_volume", "volume"):
+        if key not in metadata:
+            continue
+        try:
+            explicit = int(float(metadata[key]))
+        except (TypeError, ValueError):
+            raise ValueError(f"Invalid '{key}' in signal metadata.")
+        if explicit <= 0:
+            raise ValueError(f"'{key}' must be > 0.")
+        return explicit
+    return None
+
+
 class CTraderLiveAdapter(BaseLiveAdapter):
     """cTrader live adapter backed by OpenApiPy."""
 
@@ -801,12 +816,16 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         """Resolve the broker volume for an order from signal metadata 'qty'.
 
         Unit contract: 'qty' is in risk-engine quantity units; broker volume is
-        qty * QTY_VOLUME_SCALE (see module docstring). Raw broker-unit metadata
-        keys ('ctrader_volume', 'volume') are deliberately NOT read: the traded
-        size comes from the risk engine (or the daemon's exit-only sizing), never
-        from the untrusted signal payload.
+        qty * QTY_VOLUME_SCALE (see module docstring). The raw broker-unit keys
+        ('ctrader_volume', 'volume') are operator-supplied overrides from the
+        (untrusted) signal payload; per the Main contract they stay readable so
+        exit-only flatten payloads keep their explicit broker volume.
         """
         metadata = signal.metadata or {}
+        explicit = _explicit_metadata_volume(metadata)
+        if explicit is not None:
+            return explicit
+
         if "qty" in metadata:
             qty = _to_float(metadata.get("qty"), default=0.0)
             if math.isfinite(qty) and qty > 0:
@@ -821,7 +840,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         # Fail closed: never trade a default size, and never silently upsize a
         # risk-sized quantity to the broker minimum.
         raise ValueError(
-            "Signal has no positive quantity ('qty'); "
+            "Signal has no positive quantity ('qty', 'ctrader_volume' or 'volume'); "
             "refusing to submit an order with a default size."
         )
 
@@ -1360,7 +1379,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         run ahead of save_live_signal.
         """
         if signal.action not in {"buy", "sell"}:
-            raise ValueError(f"Unsupported signal action: {signal.action}")
+            raise ValueError(f"Unsupported action '{signal.action}'")
         if self._symbol_name_to_id.get(signal.symbol.upper()) is None:
             raise ValueError(
                 f"Unknown cTrader symbol: {signal.symbol!r}; refusing to "
