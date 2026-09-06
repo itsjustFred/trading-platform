@@ -1,18 +1,12 @@
 import { memo, useEffect, useMemo, useState } from "react";
 import type { CSSProperties } from "react";
-import {
-  ArrowRight,
-  CheckCircle2,
-  Download,
-  Loader2,
-  RotateCcw,
-  XCircle,
-} from "lucide-react";
+import { ArrowRight, Download, Loader2, RotateCcw } from "lucide-react";
 
 import { downloadData, getDukascopyGenesis } from "../api/client";
 import type { DukascopyGenesisResponse } from "../api/types";
 import { LiveTerminal } from "./LiveTerminal";
 import { Modal } from "./Modal";
+import { renderTaskStatusIcon } from "./ResampleModal";
 import { useToast } from "./ToastProvider";
 import { useDebouncedValue } from "../hooks/useDebouncedValue";
 
@@ -143,6 +137,614 @@ interface DownloadModalProps {
   defaultTimeframes?: string[];
 }
 
+interface DownloadFormSnapshot {
+  source: string;
+  symbols: string;
+  selectedTimeframes: string[];
+  startDate: string;
+  batchSize: number;
+  pauseMs: number;
+  isDukascopy: boolean;
+  isDukascopyOrJForex: boolean;
+  dukascopyMinStart: string;
+}
+
+/** Returns the first validation error of the download form, or null when the form is valid. */
+function validateDownloadForm(form: DownloadFormSnapshot): string | null {
+  if (!form.symbols.trim() && form.source !== "dolthub") {
+    return "Please enter at least one symbol or instrument.";
+  }
+  if (form.selectedTimeframes.length === 0 && form.source !== "dolthub") {
+    return "Select at least one timeframe.";
+  }
+  if (
+    form.isDukascopy &&
+    form.dukascopyMinStart &&
+    form.startDate &&
+    form.startDate < form.dukascopyMinStart
+  ) {
+    return `Explicit start date must be on or after ${form.dukascopyMinStart} for all selected instruments and timeframes with Dukascopy coverage.`;
+  }
+  if (
+    form.isDukascopy &&
+    (!Number.isFinite(form.batchSize) || form.batchSize < 1)
+  ) {
+    return "Batch Size must be at least 1.";
+  }
+  if (
+    form.isDukascopy &&
+    (!Number.isFinite(form.pauseMs) || form.pauseMs < 0)
+  ) {
+    return "Pause between batches must be 0 ms or greater.";
+  }
+  return null;
+}
+
+/** Offer side / price type selector values. */
+type DownloadPriceTypeValue = "bid" | "ask" | "both";
+
+interface DownloadSourceFieldsProps {
+  source: string;
+  symbols: string;
+  onSourceChange: (value: string) => void;
+  onSymbolsChange: (value: string) => void;
+  inputStyle: CSSProperties;
+  isDukascopy: boolean;
+  symbolsPlaceholder: string;
+}
+
+function DownloadSourceFields({
+  source,
+  symbols,
+  onSourceChange,
+  onSymbolsChange,
+  inputStyle,
+  isDukascopy,
+  symbolsPlaceholder,
+}: Readonly<DownloadSourceFieldsProps>) {
+  return (
+    <div
+      style={{
+        display: "grid",
+        gridTemplateColumns: "1.1fr 1fr",
+        gap: "14px",
+      }}
+    >
+      <div style={{ display: "grid", gap: "8px" }}>
+        <label htmlFor="download-source" style={fieldLabelStyle}>
+          Source
+        </label>
+        <select
+          id="download-source"
+          value={source}
+          onChange={(e) => onSourceChange(e.target.value)}
+          style={inputStyle}
+        >
+          <option value="dukascopy">Dukascopy</option>
+          <option value="jforex">JForex</option>
+          <option value="yfinance">Yahoo Finance</option>
+          <option value="huggingface">HuggingFace (OHLCV-1m)</option>
+          <option value="alpaca">Alpaca</option>
+          <option value="dolthub">Dolthub (Update All)</option>
+        </select>
+      </div>
+      <div style={{ display: "grid", gap: "8px" }}>
+        <label htmlFor="download-symbols" style={fieldLabelStyle}>
+          {isDukascopy ? "Instrument set" : "Symbols"}
+        </label>
+        <input
+          id="download-symbols"
+          value={symbols}
+          onChange={(e) => onSymbolsChange(e.target.value)}
+          list={isDukascopy ? "dukascopy-instruments" : undefined}
+          placeholder={symbolsPlaceholder}
+          style={inputStyle}
+          disabled={source === "dolthub"}
+        />
+        {isDukascopy && (
+          <datalist id="dukascopy-instruments">
+            {DUKASCOPY_INSTRUMENTS.map((inst) => (
+              <option key={inst} value={inst} />
+            ))}
+          </datalist>
+        )}
+      </div>
+    </div>
+  );
+}
+
+interface DownloadDateFieldsProps {
+  startDate: string;
+  endDate: string;
+  minStart: string | undefined;
+  onStartDateChange: (value: string) => void;
+  onEndDateChange: (value: string) => void;
+  inputStyle: CSSProperties;
+}
+
+function DownloadDateFields({
+  startDate,
+  endDate,
+  minStart,
+  onStartDateChange,
+  onEndDateChange,
+  inputStyle,
+}: Readonly<DownloadDateFieldsProps>) {
+  return (
+    <div
+      style={{
+        display: "grid",
+        gridTemplateColumns: "1fr 1fr",
+        gap: "14px",
+      }}
+    >
+      <div style={{ display: "grid", gap: "8px" }}>
+        <label htmlFor="download-start-date" style={fieldLabelStyle}>
+          Start date
+        </label>
+        <input
+          id="download-start-date"
+          type="date"
+          value={startDate}
+          min={minStart}
+          onChange={(e) => onStartDateChange(e.target.value)}
+          style={inputStyle}
+        />
+      </div>
+      <div style={{ display: "grid", gap: "8px" }}>
+        <label htmlFor="download-end-date" style={fieldLabelStyle}>
+          End date
+        </label>
+        <input
+          id="download-end-date"
+          type="date"
+          value={endDate}
+          onChange={(e) => onEndDateChange(e.target.value)}
+          style={inputStyle}
+        />
+      </div>
+    </div>
+  );
+}
+
+interface DownloadAdvancedSettingsProps {
+  show: boolean;
+  onToggle: () => void;
+  batchSize: number;
+  pauseMs: number;
+  onBatchSizeChange: (value: number) => void;
+  onPauseMsChange: (value: number) => void;
+  inputStyle: CSSProperties;
+}
+
+function DownloadAdvancedSettings({
+  show,
+  onToggle,
+  batchSize,
+  pauseMs,
+  onBatchSizeChange,
+  onPauseMsChange,
+  inputStyle,
+}: Readonly<DownloadAdvancedSettingsProps>) {
+  return (
+    <div
+      style={{
+        display: "grid",
+        gap: "12px",
+        padding: "14px",
+        borderRadius: "16px",
+        border: "1px solid rgba(148, 163, 184, 0.16)",
+        background: "rgba(15, 23, 42, 0.56)",
+      }}
+    >
+      <button
+        type="button"
+        onClick={onToggle}
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          gap: "12px",
+          border: "none",
+          background: "transparent",
+          color: "var(--color-text)",
+          padding: 0,
+          cursor: "pointer",
+          textAlign: "left",
+        }}
+      >
+        <div>
+          <div style={fieldLabelStyle}>Advanced settings</div>
+          <div
+            style={{
+              marginTop: "4px",
+              fontSize: "0.84rem",
+              color: "var(--color-text-muted)",
+            }}
+          >
+            Control Dukascopy batch concurrency and pacing.
+          </div>
+        </div>
+        <div
+          style={{
+            fontSize: "0.82rem",
+            color: "#7dd3fc",
+            fontWeight: 700,
+          }}
+        >
+          {show ? "Hide" : "Show"}
+        </div>
+      </button>
+
+      {show && (
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "1fr 1fr",
+            gap: "14px",
+          }}
+        >
+          <div style={{ display: "grid", gap: "8px" }}>
+            <label htmlFor="download-batch-size" style={fieldLabelStyle}>
+              Batch Size
+            </label>
+            <input
+              id="download-batch-size"
+              type="number"
+              min={1}
+              value={batchSize}
+              onChange={(event) =>
+                onBatchSizeChange(
+                  Number.isFinite(event.target.valueAsNumber)
+                    ? Math.max(1, Math.floor(event.target.valueAsNumber))
+                    : 1,
+                )
+              }
+              style={inputStyle}
+            />
+            <div
+              style={{
+                fontSize: "0.76rem",
+                color: "var(--color-text-muted)",
+              }}
+            >
+              Maximum URLs fetched in one batch.
+            </div>
+          </div>
+
+          <div style={{ display: "grid", gap: "8px" }}>
+            <label htmlFor="download-pause-ms" style={fieldLabelStyle}>
+              Pause between batches (ms)
+            </label>
+            <input
+              id="download-pause-ms"
+              type="number"
+              min={0}
+              step={100}
+              value={pauseMs}
+              onChange={(event) =>
+                onPauseMsChange(
+                  Number.isFinite(event.target.valueAsNumber)
+                    ? Math.max(0, Math.floor(event.target.valueAsNumber))
+                    : 0,
+                )
+              }
+              style={inputStyle}
+            />
+            <div
+              style={{
+                fontSize: "0.76rem",
+                color: "var(--color-text-muted)",
+              }}
+            >
+              Applied after every batch; the downloader doubles it automatically
+              when rate-limit signals appear.
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+interface DownloadPriceTypeProps {
+  priceType: DownloadPriceTypeValue;
+  onPriceTypeChange: (value: DownloadPriceTypeValue) => void;
+  mergeTick: boolean;
+  mergeS1: boolean;
+  hasTickSelected: boolean;
+  hasS1Selected: boolean;
+  onMergeTickChange: (checked: boolean) => void;
+  onMergeS1Change: (checked: boolean) => void;
+}
+
+function DownloadPriceType({
+  priceType,
+  onPriceTypeChange,
+  mergeTick,
+  mergeS1,
+  hasTickSelected,
+  hasS1Selected,
+  onMergeTickChange,
+  onMergeS1Change,
+}: Readonly<DownloadPriceTypeProps>) {
+  return (
+    <div style={{ display: "grid", gap: "8px" }}>
+      <span id="download-price-type" style={fieldLabelStyle}>
+        Price type
+      </span>
+      <fieldset
+        aria-labelledby="download-price-type"
+        style={{
+          display: "flex",
+          gap: "10px",
+          flexWrap: "wrap",
+          border: "none",
+          margin: 0,
+          padding: 0,
+        }}
+      >
+        {(["bid", "ask", "both"] as const).map((option) => {
+          const active = priceType === option;
+          return (
+            <button
+              key={option}
+              type="button"
+              onClick={() => onPriceTypeChange(option)}
+              style={{
+                ...tfButtonStyle(active),
+                padding: "9px 14px",
+                textTransform: "uppercase",
+              }}
+            >
+              {option}
+            </button>
+          );
+        })}
+      </fieldset>
+      <div
+        style={{
+          display: "grid",
+          gap: "10px",
+          marginTop: "2px",
+        }}
+      >
+        <MergeOptionCard
+          checked={mergeTick}
+          disabled={!hasTickSelected}
+          label="Merge Bid & Ask for Tick data"
+          hint={
+            hasTickSelected
+              ? "When active, tick downloads ignore Price Type and store bid + ask together."
+              : "Select the tick timeframe to enable merged tick downloads."
+          }
+          onChange={onMergeTickChange}
+        />
+        <MergeOptionCard
+          checked={mergeS1}
+          disabled={!hasS1Selected}
+          label="Merge Bid & Ask for 1-Second (s1) data"
+          hint={
+            hasS1Selected
+              ? "When active, s1 downloads ignore Price Type and store bid + ask together."
+              : "Select the s1 timeframe to enable merged 1-second downloads."
+          }
+          onChange={onMergeS1Change}
+        />
+      </div>
+    </div>
+  );
+}
+
+function tfButtonStyle(active: boolean): CSSProperties {
+  return {
+    border: `1px solid ${active ? "rgba(96, 165, 250, 0.5)" : "rgba(148, 163, 184, 0.18)"}`,
+    background: active
+      ? "linear-gradient(135deg, rgba(59, 130, 246, 0.22), rgba(14, 165, 233, 0.08))"
+      : "rgba(15, 23, 42, 0.56)",
+    color: active ? "#dbeafe" : "var(--color-text-muted)",
+    borderRadius: "999px",
+    padding: "6px 11px",
+    fontSize: "0.74rem",
+    cursor: "pointer",
+    fontWeight: 700,
+    letterSpacing: "0.04em",
+  };
+}
+
+interface DukascopyCoveragePanelProps {
+  coverageRows: DukascopyTimeframeCoverageRow[];
+  coverageBySymbol: Record<
+    string,
+    Record<string, { available?: boolean; start?: string | null }>
+  >;
+  symbols: string[];
+  minStart: string;
+  loaded: boolean;
+  error: string;
+}
+
+const coverageBadgeStyle = (available: boolean): CSSProperties => ({
+  display: "inline-flex",
+  alignItems: "center",
+  gap: "6px",
+  padding: "6px 10px",
+  borderRadius: "999px",
+  border: `1px solid ${
+    available ? "rgba(34, 197, 94, 0.28)" : "rgba(148, 163, 184, 0.18)"
+  }`,
+  background: available ? "rgba(34, 197, 94, 0.12)" : "rgba(15, 23, 42, 0.72)",
+  color: available ? "#bbf7d0" : "var(--color-text-muted)",
+  fontSize: "0.74rem",
+  fontWeight: 700,
+  whiteSpace: "nowrap",
+});
+
+function DukascopyCoveragePanel({
+  coverageRows,
+  coverageBySymbol,
+  symbols,
+  minStart,
+  loaded,
+  error,
+}: Readonly<DukascopyCoveragePanelProps>) {
+  if (!loaded) {
+    return (
+      <div
+        style={{
+          display: "inline-flex",
+          alignItems: "center",
+          gap: "8px",
+          fontSize: "0.82rem",
+          color: "var(--color-text-muted)",
+        }}
+      >
+        <Loader2 size={14} className="animate-spin" />
+        Loading timeframe coverage…
+      </div>
+    );
+  }
+  if (error) {
+    return <div style={{ fontSize: "0.82rem", color: "#fca5a5" }}>{error}</div>;
+  }
+  if (coverageRows.length === 0) {
+    return (
+      <div
+        style={{
+          fontSize: "0.8rem",
+          color: "var(--color-text-muted)",
+        }}
+      >
+        Enter one or more instruments and select at least one timeframe to
+        inspect coverage.
+      </div>
+    );
+  }
+  return (
+    <>
+      <div style={{ display: "grid", gap: "10px" }}>
+        {coverageRows.map((row) => (
+          <div
+            key={row.timeframe}
+            style={{
+              padding: "12px",
+              borderRadius: "14px",
+              border: "1px solid rgba(148, 163, 184, 0.12)",
+              background: "rgba(2, 6, 23, 0.32)",
+              display: "grid",
+              gap: "10px",
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                gap: "10px",
+                alignItems: "center",
+                flexWrap: "wrap",
+              }}
+            >
+              <div
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: "8px",
+                  fontWeight: 800,
+                  color: "#e2e8f0",
+                }}
+              >
+                <span
+                  style={{
+                    ...coverageBadgeStyle(row.available),
+                    textTransform: "uppercase",
+                    letterSpacing: "0.08em",
+                  }}
+                >
+                  {formatCoverageTimeframe(row.timeframe)}
+                </span>
+                <span style={{ fontSize: "0.8rem" }}>
+                  {row.availableCount}/{row.symbolCount} available
+                </span>
+              </div>
+              <div
+                style={{
+                  fontSize: "0.78rem",
+                  color: "var(--color-text-muted)",
+                }}
+              >
+                {row.start ? `Available since ${row.start}` : "Not found"}
+              </div>
+            </div>
+
+            <div
+              style={{
+                display: "flex",
+                flexWrap: "wrap",
+                gap: "8px",
+              }}
+            >
+              {symbols.map((symbol) => {
+                const coverage = coverageBySymbol[symbol]?.[row.timeframe];
+                const available = Boolean(
+                  coverage?.available && coverage?.start,
+                );
+                return (
+                  <span
+                    key={`${symbol}-${row.timeframe}`}
+                    style={coverageBadgeStyle(available)}
+                  >
+                    {symbol} · {available ? coverage?.start : "Not found"}
+                  </span>
+                );
+              })}
+            </div>
+
+            {!row.available && row.missingSymbols.length > 0 && (
+              <div
+                style={{
+                  fontSize: "0.74rem",
+                  color: "var(--color-text-muted)",
+                }}
+                title={row.missingSymbols.join(", ")}
+              >
+                Missing: {formatMissingSymbols(row.missingSymbols)}
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+      {minStart ? (
+        <div
+          style={{
+            fontSize: "0.78rem",
+            color: "#bfdbfe",
+          }}
+        >
+          Explicit Start Date must be on or after <strong>{minStart}</strong>{" "}
+          for selected timeframe entries with known Dukascopy coverage.
+        </div>
+      ) : (
+        <div
+          style={{
+            fontSize: "0.78rem",
+            color: "var(--color-text-muted)",
+          }}
+        >
+          No known Dukascopy start dates for the selected instrument/timeframe
+          scope.
+        </div>
+      )}
+    </>
+  );
+}
+
+const fieldLabelStyle: CSSProperties = {
+  fontSize: "0.76rem",
+  letterSpacing: "0.08em",
+  textTransform: "uppercase",
+  color: "var(--color-text-muted)",
+};
+
 export function DownloadModal({
   open,
   onClose,
@@ -151,7 +753,7 @@ export function DownloadModal({
   defaultSource = "dukascopy",
   defaultSymbols = "",
   defaultTimeframes = ["d1"],
-}: DownloadModalProps) {
+}: Readonly<DownloadModalProps>) {
   const { showToast } = useToast();
   const normalizedDefaultTimeframes = useMemo(
     () =>
@@ -167,7 +769,7 @@ export function DownloadModal({
   );
   const [startDate, setStartDate] = useState("");
   const [endDate, setEndDate] = useState("");
-  const [priceType, setPriceType] = useState<"bid" | "ask" | "both">("bid");
+  const [priceType, setPriceType] = useState<DownloadPriceTypeValue>("bid");
   const [mergeTick, setMergeTick] = useState(false);
   const [mergeS1, setMergeS1] = useState(false);
   const [showAdvancedSettings, setShowAdvancedSettings] = useState(false);
@@ -185,6 +787,12 @@ export function DownloadModal({
   const isDukascopy = source === "dukascopy";
   const isJForex = source === "jforex";
   const isDukascopyOrJForex = isDukascopy || isJForex;
+  const symbolsPlaceholder =
+    source === "dolthub"
+      ? "No symbol required"
+      : isDukascopy
+        ? "EURUSD, XAUUSD, US500"
+        : "AAPL, MSFT";
   const isStreaming = jobId !== null;
   const defaultTimeframesKey = normalizedDefaultTimeframes.join("|");
   const parsedSymbols = useMemo(
@@ -235,57 +843,55 @@ export function DownloadModal({
     if (knownDates.length === 0) {
       return "";
     }
-    return knownDates.reduce((latest, current) =>
-      current > latest ? current : latest,
+    return knownDates.reduce(
+      (latest, current) => (current > latest ? current : latest),
+      knownDates[0],
     );
   }, [dukascopyCoverage, parsedSymbols, requestedTimeframes]);
 
-  const dukascopyTimeframeCoverage = useMemo<DukascopyTimeframeCoverageRow[]>(
-    () => {
-      if (
-        !isDukascopy ||
-        parsedSymbols.length === 0 ||
-        requestedTimeframes.length === 0
-      ) {
-        return [];
-      }
+  const dukascopyTimeframeCoverage = useMemo<
+    DukascopyTimeframeCoverageRow[]
+  >(() => {
+    if (
+      !isDukascopy ||
+      parsedSymbols.length === 0 ||
+      requestedTimeframes.length === 0
+    ) {
+      return [];
+    }
 
-      return requestedTimeframes.map((timeframe) => {
-        const entries = parsedSymbols.map((symbol) => {
-          const coverage = dukascopyCoverage[symbol]?.[timeframe];
-          return {
-            symbol,
-            available: Boolean(coverage?.available && coverage?.start),
-            start: coverage?.start ?? null,
-          };
-        });
-
-        const availableEntries = entries.filter((item) => item.available);
-        const starts = availableEntries
-          .map((item) => item.start)
-          .filter((value): value is string => Boolean(value));
-        const latestStart =
-          starts.length > 0
-            ? starts.reduce((latest, current) =>
-                current > latest ? current : latest,
-              )
-            : null;
-
+    return requestedTimeframes.map((timeframe) => {
+      const entries = parsedSymbols.map((symbol) => {
+        const coverage = dukascopyCoverage[symbol]?.[timeframe];
         return {
-          timeframe,
-          available:
-            entries.length > 0 && availableEntries.length === entries.length,
-          availableCount: availableEntries.length,
-          symbolCount: entries.length,
-          start: latestStart,
-          missingSymbols: entries
-            .filter((item) => !item.available)
-            .map((item) => item.symbol),
+          symbol,
+          available: Boolean(coverage?.available && coverage?.start),
+          start: coverage?.start ?? null,
         };
       });
-    },
-    [dukascopyCoverage, isDukascopy, parsedSymbols, requestedTimeframes],
-  );
+
+      const availableEntries = entries.filter((item) => item.available);
+      const starts = availableEntries
+        .map((item) => item.start)
+        .filter((value): value is string => Boolean(value));
+      const latestStart =
+        starts.length > 0
+          ? [...starts].sort((a, b) => a.localeCompare(b)).at(-1) ?? null
+          : null;
+
+      return {
+        timeframe,
+        available:
+          entries.length > 0 && availableEntries.length === entries.length,
+        availableCount: availableEntries.length,
+        symbolCount: entries.length,
+        start: latestStart,
+        missingSymbols: entries
+          .filter((item) => !item.available)
+          .map((item) => item.symbol),
+      };
+    });
+  }, [dukascopyCoverage, isDukascopy, parsedSymbols, requestedTimeframes]);
 
   useEffect(() => {
     if (!open) {
@@ -380,38 +986,6 @@ export function DownloadModal({
     width: "100%",
   };
 
-  const tfBtn = (active: boolean): CSSProperties => ({
-    border: `1px solid ${active ? "rgba(96, 165, 250, 0.5)" : "rgba(148, 163, 184, 0.18)"}`,
-    background: active
-      ? "linear-gradient(135deg, rgba(59, 130, 246, 0.22), rgba(14, 165, 233, 0.08))"
-      : "rgba(15, 23, 42, 0.56)",
-    color: active ? "#dbeafe" : "var(--color-text-muted)",
-    borderRadius: "999px",
-    padding: "6px 11px",
-    fontSize: "0.74rem",
-    cursor: "pointer",
-    fontWeight: 700,
-    letterSpacing: "0.04em",
-  });
-
-  const coverageBadgeStyle = (available: boolean): CSSProperties => ({
-    display: "inline-flex",
-    alignItems: "center",
-    gap: "6px",
-    padding: "6px 10px",
-    borderRadius: "999px",
-    border: `1px solid ${
-      available ? "rgba(34, 197, 94, 0.28)" : "rgba(148, 163, 184, 0.18)"
-    }`,
-    background: available
-      ? "rgba(34, 197, 94, 0.12)"
-      : "rgba(15, 23, 42, 0.72)",
-    color: available ? "#bbf7d0" : "var(--color-text-muted)",
-    fontSize: "0.74rem",
-    fontWeight: 700,
-    whiteSpace: "nowrap",
-  });
-
   const toggleTimeframe = (tf: string) => {
     setSelectedTimeframes((prev) =>
       prev.includes(tf) ? prev.filter((x) => x !== tf) : [...prev, tf],
@@ -430,36 +1004,19 @@ export function DownloadModal({
 
   const handleSubmit = async () => {
     setError("");
-
-    if (!symbols.trim() && source !== "dolthub") {
-      setError("Please enter at least one symbol or instrument.");
-      return;
-    }
-
-    if (selectedTimeframes.length === 0 && source !== "dolthub") {
-      setError("Select at least one timeframe.");
-      return;
-    }
-
-    if (
-      isDukascopy &&
-      dukascopyMinStart &&
-      startDate &&
-      startDate < dukascopyMinStart
-    ) {
-      setError(
-        `Explicit start date must be on or after ${dukascopyMinStart} for all selected instruments and timeframes with Dukascopy coverage.`,
-      );
-      return;
-    }
-
-    if (isDukascopy && (!Number.isFinite(batchSize) || batchSize < 1)) {
-      setError("Batch Size must be at least 1.");
-      return;
-    }
-
-    if (isDukascopy && (!Number.isFinite(pauseMs) || pauseMs < 0)) {
-      setError("Pause between batches must be 0 ms or greater.");
+    const validationError = validateDownloadForm({
+      source,
+      symbols,
+      selectedTimeframes,
+      startDate,
+      batchSize,
+      pauseMs,
+      isDukascopy,
+      isDukascopyOrJForex,
+      dukascopyMinStart,
+    });
+    if (validationError) {
+      setError(validationError);
       return;
     }
 
@@ -486,18 +1043,15 @@ export function DownloadModal({
       );
       onClose();
     } catch (err: unknown) {
-      setError(err instanceof Error && err.message ? err.message : "Failed to start download.");
+      setError(
+        err instanceof Error && err.message
+          ? err.message
+          : "Failed to start download.",
+      );
     }
   };
 
-  const statusIcon =
-    jobStatus === "completed" ? (
-      <CheckCircle2 size={18} color="#86efac" />
-    ) : jobStatus === "failed" ? (
-      <XCircle size={18} color="#fda4af" />
-    ) : (
-      <Loader2 size={18} className="animate-spin" color="#67e8f9" />
-    );
+  const statusIcon = renderTaskStatusIcon(jobStatus);
 
   return (
     <Modal
@@ -556,76 +1110,21 @@ export function DownloadModal({
                 </div>
               </div>
 
-              <div
-                style={{
-                  display: "grid",
-                  gridTemplateColumns: "1.1fr 1fr",
-                  gap: "14px",
-                }}
-              >
-                <div style={{ display: "grid", gap: "8px" }}>
-                  <label
-                    style={{
-                      fontSize: "0.76rem",
-                      letterSpacing: "0.08em",
-                      textTransform: "uppercase",
-                      color: "var(--color-text-muted)",
-                    }}
-                  >
-                    Source
-                  </label>
-                  <select
-                    value={source}
-                    onChange={(e) => setSource(e.target.value)}
-                    style={inputStyle}
-                  >
-                    <option value="dukascopy">Dukascopy</option>
-                    <option value="jforex">JForex</option>
-                    <option value="yfinance">Yahoo Finance</option>
-                    <option value="huggingface">HuggingFace (OHLCV-1m)</option>
-                    <option value="alpaca">Alpaca</option>
-                    <option value="dolthub">Dolthub (Update All)</option>
-                  </select>
-                </div>
-                <div style={{ display: "grid", gap: "8px" }}>
-                  <label
-                    style={{
-                      fontSize: "0.76rem",
-                      letterSpacing: "0.08em",
-                      textTransform: "uppercase",
-                      color: "var(--color-text-muted)",
-                    }}
-                  >
-                    {isDukascopy ? "Instrument set" : "Symbols"}
-                  </label>
-                  <input
-                    value={symbols}
-                    onChange={(e) => setSymbols(e.target.value)}
-                    list={isDukascopy ? "dukascopy-instruments" : undefined}
-                    placeholder={
-                      source === "dolthub"
-                        ? "No symbol required"
-                        : isDukascopy
-                          ? "EURUSD, XAUUSD, US500"
-                          : "AAPL, MSFT"
-                    }
-                    style={inputStyle}
-                    disabled={source === "dolthub"}
-                  />
-                  {isDukascopy && (
-                    <datalist id="dukascopy-instruments">
-                      {DUKASCOPY_INSTRUMENTS.map((inst) => (
-                        <option key={inst} value={inst} />
-                      ))}
-                    </datalist>
-                  )}
-                </div>
-              </div>
+              <DownloadSourceFields
+                source={source}
+                symbols={symbols}
+                onSourceChange={setSource}
+                onSymbolsChange={setSymbols}
+                inputStyle={inputStyle}
+                isDukascopy={isDukascopy}
+                symbolsPlaceholder={symbolsPlaceholder}
+              />
 
               {source !== "dolthub" && (
                 <>
                   <div style={{ display: "grid", gap: "8px" }}>
-                    <label
+                    <span
+                      id="download-timeframes"
                       style={{
                         fontSize: "0.76rem",
                         letterSpacing: "0.08em",
@@ -634,285 +1133,70 @@ export function DownloadModal({
                       }}
                     >
                       Timeframes
-                    </label>
-                    <div
-                      style={{ display: "flex", flexWrap: "wrap", gap: "8px" }}
+                    </span>
+                    <fieldset
+                      aria-labelledby="download-timeframes"
+                      style={{
+                        display: "flex",
+                        flexWrap: "wrap",
+                        gap: "8px",
+                        border: "none",
+                        margin: 0,
+                        padding: 0,
+                      }}
                     >
                       {TIMEFRAME_OPTIONS.map((tf) => (
                         <button
                           key={tf}
                           type="button"
                           onClick={() => toggleTimeframe(tf)}
-                          style={tfBtn(selectedTimeframes.includes(tf))}
+                          style={tfButtonStyle(selectedTimeframes.includes(tf))}
                         >
                           {tf}
                         </button>
                       ))}
-                    </div>
+                    </fieldset>
                   </div>
 
                   {isDukascopyOrJForex && (
-                    <div style={{ display: "grid", gap: "8px" }}>
-                      <label
-                        style={{
-                          fontSize: "0.76rem",
-                          letterSpacing: "0.08em",
-                          textTransform: "uppercase",
-                          color: "var(--color-text-muted)",
-                        }}
-                      >
-                        Price type
-                      </label>
-                      <div
-                        style={{
-                          display: "flex",
-                          gap: "10px",
-                          flexWrap: "wrap",
-                        }}
-                      >
-                        {(["bid", "ask", "both"] as const).map((option) => {
-                          const active = priceType === option;
-                          return (
-                            <button
-                              key={option}
-                              type="button"
-                              onClick={() => setPriceType(option)}
-                              style={{
-                                ...tfBtn(active),
-                                padding: "9px 14px",
-                                textTransform: "uppercase",
-                              }}
-                            >
-                              {option}
-                            </button>
-                          );
-                        })}
-                      </div>
-                      <div
-                        style={{
-                          display: "grid",
-                          gap: "10px",
-                          marginTop: "2px",
-                        }}
-                      >
-                        <MergeOptionCard
-                          checked={mergeTick}
-                          disabled={!hasTickSelected}
-                          label="Merge Bid & Ask for Tick data"
-                          hint={
-                            hasTickSelected
-                              ? "When active, tick downloads ignore Price Type and store bid + ask together."
-                              : "Select the tick timeframe to enable merged tick downloads."
-                          }
-                          onChange={setMergeTick}
-                        />
-                        <MergeOptionCard
-                          checked={mergeS1}
-                          disabled={!hasS1Selected}
-                          label="Merge Bid & Ask for 1-Second (s1) data"
-                          hint={
-                            hasS1Selected
-                              ? "When active, s1 downloads ignore Price Type and store bid + ask together."
-                              : "Select the s1 timeframe to enable merged 1-second downloads."
-                          }
-                          onChange={setMergeS1}
-                        />
-                      </div>
-                    </div>
+                    <DownloadPriceType
+                      priceType={priceType}
+                      onPriceTypeChange={setPriceType}
+                      mergeTick={mergeTick}
+                      mergeS1={mergeS1}
+                      hasTickSelected={hasTickSelected}
+                      hasS1Selected={hasS1Selected}
+                      onMergeTickChange={setMergeTick}
+                      onMergeS1Change={setMergeS1}
+                    />
                   )}
 
                   {isDukascopy && (
-                    <div
-                      style={{
-                        display: "grid",
-                        gap: "12px",
-                        padding: "14px",
-                        borderRadius: "16px",
-                        border: "1px solid rgba(148, 163, 184, 0.16)",
-                        background: "rgba(15, 23, 42, 0.56)",
-                      }}
-                    >
-                      <button
-                        type="button"
-                        onClick={() =>
-                          setShowAdvancedSettings((current) => !current)
-                        }
-                        style={{
-                          display: "flex",
-                          justifyContent: "space-between",
-                          alignItems: "center",
-                          gap: "12px",
-                          border: "none",
-                          background: "transparent",
-                          color: "var(--color-text)",
-                          padding: 0,
-                          cursor: "pointer",
-                          textAlign: "left",
-                        }}
-                      >
-                        <div>
-                          <div
-                            style={{
-                              fontSize: "0.76rem",
-                              letterSpacing: "0.08em",
-                              textTransform: "uppercase",
-                              color: "var(--color-text-muted)",
-                            }}
-                          >
-                            Advanced settings
-                          </div>
-                          <div
-                            style={{
-                              marginTop: "4px",
-                              fontSize: "0.84rem",
-                              color: "var(--color-text-muted)",
-                            }}
-                          >
-                            Control Dukascopy batch concurrency and pacing.
-                          </div>
-                        </div>
-                        <div
-                          style={{
-                            fontSize: "0.82rem",
-                            color: "#7dd3fc",
-                            fontWeight: 700,
-                          }}
-                        >
-                          {showAdvancedSettings ? "Hide" : "Show"}
-                        </div>
-                      </button>
-
-                      {showAdvancedSettings && (
-                        <div
-                          style={{
-                            display: "grid",
-                            gridTemplateColumns: "1fr 1fr",
-                            gap: "14px",
-                          }}
-                        >
-                          <div style={{ display: "grid", gap: "8px" }}>
-                            <label
-                              style={{
-                                fontSize: "0.76rem",
-                                letterSpacing: "0.08em",
-                                textTransform: "uppercase",
-                                color: "var(--color-text-muted)",
-                              }}
-                            >
-                              Batch Size
-                            </label>
-                            <input
-                              type="number"
-                              min={1}
-                              value={batchSize}
-                              onChange={(event) =>
-                                setBatchSize(
-                                  Number.isFinite(event.target.valueAsNumber)
-                                    ? Math.max(1, Math.floor(event.target.valueAsNumber))
-                                    : 1,
-                                )
-                              }
-                              style={inputStyle}
-                            />
-                            <div
-                              style={{
-                                fontSize: "0.76rem",
-                                color: "var(--color-text-muted)",
-                              }}
-                            >
-                              Maximum URLs fetched in one batch.
-                            </div>
-                          </div>
-
-                          <div style={{ display: "grid", gap: "8px" }}>
-                            <label
-                              style={{
-                                fontSize: "0.76rem",
-                                letterSpacing: "0.08em",
-                                textTransform: "uppercase",
-                                color: "var(--color-text-muted)",
-                              }}
-                            >
-                              Pause between batches (ms)
-                            </label>
-                            <input
-                              type="number"
-                              min={0}
-                              step={100}
-                              value={pauseMs}
-                              onChange={(event) =>
-                                setPauseMs(
-                                  Number.isFinite(event.target.valueAsNumber)
-                                    ? Math.max(0, Math.floor(event.target.valueAsNumber))
-                                    : 0,
-                                )
-                              }
-                              style={inputStyle}
-                            />
-                            <div
-                              style={{
-                                fontSize: "0.76rem",
-                                color: "var(--color-text-muted)",
-                              }}
-                            >
-                              Applied after every batch; the downloader doubles
-                              it automatically when rate-limit signals appear.
-                            </div>
-                          </div>
-                        </div>
-                      )}
-                    </div>
+                    <DownloadAdvancedSettings
+                      show={showAdvancedSettings}
+                      onToggle={() =>
+                        setShowAdvancedSettings((current) => !current)
+                      }
+                      batchSize={batchSize}
+                      pauseMs={pauseMs}
+                      onBatchSizeChange={setBatchSize}
+                      onPauseMsChange={setPauseMs}
+                      inputStyle={inputStyle}
+                    />
                   )}
 
-                  <div
-                    style={{
-                      display: "grid",
-                      gridTemplateColumns: "1fr 1fr",
-                      gap: "14px",
-                    }}
-                  >
-                    <div style={{ display: "grid", gap: "8px" }}>
-                      <label
-                        style={{
-                          fontSize: "0.76rem",
-                          letterSpacing: "0.08em",
-                          textTransform: "uppercase",
-                          color: "var(--color-text-muted)",
-                        }}
-                      >
-                        Start date
-                      </label>
-                      <input
-                        type="date"
-                        value={startDate}
-                        min={
-                          isDukascopy && dukascopyMinStart
-                            ? dukascopyMinStart
-                            : undefined
-                        }
-                        onChange={(e) => setStartDate(e.target.value)}
-                        style={inputStyle}
-                      />
-                    </div>
-                    <div style={{ display: "grid", gap: "8px" }}>
-                      <label
-                        style={{
-                          fontSize: "0.76rem",
-                          letterSpacing: "0.08em",
-                          textTransform: "uppercase",
-                          color: "var(--color-text-muted)",
-                        }}
-                      >
-                        End date
-                      </label>
-                      <input
-                        type="date"
-                        value={endDate}
-                        onChange={(e) => setEndDate(e.target.value)}
-                        style={inputStyle}
-                      />
-                    </div>
-                  </div>
+                  <DownloadDateFields
+                    startDate={startDate}
+                    endDate={endDate}
+                    minStart={
+                      isDukascopy && dukascopyMinStart
+                        ? dukascopyMinStart
+                        : undefined
+                    }
+                    onStartDateChange={setStartDate}
+                    onEndDateChange={setEndDate}
+                    inputStyle={inputStyle}
+                  />
                 </>
               )}
             </div>
@@ -930,163 +1214,17 @@ export function DownloadModal({
                     border: "1px solid rgba(148, 163, 184, 0.16)",
                   }}
                 >
-                  <div
-                    style={{
-                      fontSize: "0.76rem",
-                      letterSpacing: "0.08em",
-                      textTransform: "uppercase",
-                      color: "var(--color-text-muted)",
-                    }}
-                  >
+                  <div style={fieldLabelStyle}>
                     Dukascopy coverage by timeframe
                   </div>
-                  {!dukascopyCoverageLoaded ? (
-                    <div
-                      style={{
-                        display: "inline-flex",
-                        alignItems: "center",
-                        gap: "8px",
-                        fontSize: "0.82rem",
-                        color: "var(--color-text-muted)",
-                      }}
-                    >
-                      <Loader2 size={14} className="animate-spin" />
-                      Loading timeframe coverage…
-                    </div>
-                  ) : dukascopyCoverageError ? (
-                    <div style={{ fontSize: "0.82rem", color: "#fca5a5" }}>
-                      {dukascopyCoverageError}
-                    </div>
-                  ) : dukascopyTimeframeCoverage.length === 0 ? (
-                    <div
-                      style={{
-                        fontSize: "0.8rem",
-                        color: "var(--color-text-muted)",
-                      }}
-                    >
-                      Enter one or more instruments and select at least one
-                      timeframe to inspect coverage.
-                    </div>
-                  ) : (
-                    <div style={{ display: "grid", gap: "10px" }}>
-                      {dukascopyTimeframeCoverage.map((row) => (
-                        <div
-                          key={row.timeframe}
-                          style={{
-                            padding: "12px",
-                            borderRadius: "14px",
-                            border: "1px solid rgba(148, 163, 184, 0.12)",
-                            background: "rgba(2, 6, 23, 0.32)",
-                            display: "grid",
-                            gap: "10px",
-                          }}
-                        >
-                          <div
-                            style={{
-                              display: "flex",
-                              justifyContent: "space-between",
-                              gap: "10px",
-                              alignItems: "center",
-                              flexWrap: "wrap",
-                            }}
-                          >
-                            <div
-                              style={{
-                                display: "inline-flex",
-                                alignItems: "center",
-                                gap: "8px",
-                                fontWeight: 800,
-                                color: "#e2e8f0",
-                              }}
-                            >
-                              <span
-                                style={{
-                                  ...coverageBadgeStyle(row.available),
-                                  textTransform: "uppercase",
-                                  letterSpacing: "0.08em",
-                                }}
-                              >
-                                {formatCoverageTimeframe(row.timeframe)}
-                              </span>
-                              <span style={{ fontSize: "0.8rem" }}>
-                                {row.availableCount}/{row.symbolCount} available
-                              </span>
-                            </div>
-                            <div
-                              style={{
-                                fontSize: "0.78rem",
-                                color: "var(--color-text-muted)",
-                              }}
-                            >
-                              {row.start
-                                ? `Available since ${row.start}`
-                                : "Not found"}
-                            </div>
-                          </div>
-
-                          <div
-                            style={{
-                              display: "flex",
-                              flexWrap: "wrap",
-                              gap: "8px",
-                            }}
-                          >
-                            {parsedSymbols.map((symbol) => {
-                              const coverage = dukascopyCoverage[symbol]?.[
-                                row.timeframe
-                              ];
-                              const available = Boolean(
-                                coverage?.available && coverage?.start,
-                              );
-                              return (
-                                <span
-                                  key={`${symbol}-${row.timeframe}`}
-                                  style={coverageBadgeStyle(available)}
-                                >
-                                  {symbol} ·{" "}
-                                  {available ? coverage?.start : "Not found"}
-                                </span>
-                              );
-                            })}
-                          </div>
-
-                          {!row.available && row.missingSymbols.length > 0 && (
-                            <div
-                              style={{
-                                fontSize: "0.74rem",
-                                color: "var(--color-text-muted)",
-                              }}
-                              title={row.missingSymbols.join(", ")}
-                            >
-                              Missing: {formatMissingSymbols(row.missingSymbols)}
-                            </div>
-                          )}
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                  {dukascopyMinStart ? (
-                    <div
-                      style={{
-                        fontSize: "0.78rem",
-                        color: "#bfdbfe",
-                      }}
-                    >
-                      Explicit Start Date must be on or after{" "}
-                      <strong>{dukascopyMinStart}</strong> for selected
-                      timeframe entries with known Dukascopy coverage.
-                    </div>
-                  ) : (
-                    <div
-                      style={{
-                        fontSize: "0.78rem",
-                        color: "var(--color-text-muted)",
-                      }}
-                    >
-                      No known Dukascopy start dates for the selected
-                      instrument/timeframe scope.
-                    </div>
-                  )}
+                  <DukascopyCoveragePanel
+                    coverageRows={dukascopyTimeframeCoverage}
+                    coverageBySymbol={dukascopyCoverage}
+                    symbols={parsedSymbols}
+                    minStart={dukascopyMinStart}
+                    loaded={dukascopyCoverageLoaded}
+                    error={dukascopyCoverageError}
+                  />
                 </div>
               )}
             {isDukascopy && !startDate && (
@@ -1295,13 +1433,17 @@ const MergeOptionCard = memo(function MergeOptionCard({
     >
       <input
         type="checkbox"
+        aria-label={label}
         checked={checked}
         disabled={disabled}
         onChange={(event) => onChange(event.target.checked)}
         style={{ marginTop: "2px" }}
       />
       <div style={{ display: "grid", gap: "4px" }}>
-        <div style={{ fontWeight: 700, color: "var(--color-text)" }}>
+        <div
+          style={{ fontWeight: 700, color: "var(--color-text)" }}
+          aria-hidden
+        >
           {label}
         </div>
         <div

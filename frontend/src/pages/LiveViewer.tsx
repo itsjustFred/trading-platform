@@ -22,6 +22,8 @@ import type {
 
 import { getLiveAccounts, getLiveDeployments, getLiveTrades } from "../api/client";
 import { useLivePositions, useLiveQuotes, useLiveSignalLog } from "../api/queries";
+import { toChartTime as toChartTimeUnix } from "../lib/liveChartTime";
+import { stringifyUnknownValue } from "../lib/unknownValue";
 import {
   useLiveExecutionsStream,
   useLivePositionsStream,
@@ -55,7 +57,8 @@ type ViewerTrade = {
   pnl: number | null;
   exitReason: string;
   time: string;
-  signalTimeUnix: number;
+  /** Unix seconds of the exit fill; falls back to the signal time when no execution exists. */
+  exitTimeUnix: number;
 };
 
 type TradeMarker = {
@@ -74,6 +77,56 @@ function resolveChartLocale(): string {
   if (typeof navigator === "undefined") return "en-US";
   const language = String(navigator.language || "").trim();
   return language && language !== "undefined" ? language : "en-US";
+}
+
+/** Chart marker for one live signal arrow. */
+function signalMarker(signal: LiveSignalLog): TradeMarker | null {
+  const t = toChartTime(signal.signal_time);
+  if (t === null) return null;
+  const side =
+    String(signal.action || "").toLowerCase() === "sell" ? "SELL" : "BUY";
+  const qty = Number(signal.signal_metadata?.qty ?? signal.filled_qty ?? 0);
+  const price = signal.theoretical_price;
+  return {
+    id: `signal-${signal.signal_id}`,
+    time: t,
+    position: side === "BUY" ? "belowBar" : "aboveBar",
+    color: side === "BUY" ? "#22c55e" : "#f87171",
+    shape: side === "BUY" ? "arrowUp" : "arrowDown",
+    text: `${side} ${Number.isFinite(qty) ? qty.toFixed(2) : "0.00"} @ ${formatPrice(price)}`,
+  };
+}
+
+/** Chart marker for one closed-trade exit. */
+function exitMarker(trade: ViewerTrade): TradeMarker | null {
+  if (trade.exit === null) return null;
+  const t = toChartTime(trade.exitTimeUnix);
+  if (t === null) return null;
+  return {
+    id: `exit-${trade.id}`,
+    time: t,
+    position: trade.side === "BUY" ? "aboveBar" : "belowBar",
+    color: "#eab308",
+    shape: trade.side === "BUY" ? "arrowDown" : "arrowUp",
+    text: `EXIT ${trade.size.toFixed(2)} @ ${formatPrice(trade.exit)} · ${trade.exitReason}`,
+  };
+}
+
+/** Sorted chart markers for signals and closed trades. */
+function buildTradeMarkers(
+  signals: LiveSignalLog[],
+  trades: ViewerTrade[],
+): TradeMarker[] {
+  const out: TradeMarker[] = [];
+  for (const signal of signals) {
+    const marker = signalMarker(signal);
+    if (marker) out.push(marker);
+  }
+  for (const trade of trades) {
+    const marker = exitMarker(trade);
+    if (marker) out.push(marker);
+  }
+  return out.sort((left, right) => Number(left.time) - Number(right.time));
 }
 
 export function LiveViewerPage() {
@@ -123,10 +176,10 @@ export function LiveViewerPage() {
           return symbols[0] ?? "";
         });
         setHeaderError("");
-      } catch (issue: unknown) {
+      } catch (error_: unknown) {
         if (ignore) return;
         const message =
-          issue instanceof Error ? issue.message : "Failed to load live viewer context";
+          error_ instanceof Error ? error_.message : "Failed to load live viewer context";
         setHeaderError(message);
       } finally {
         if (!ignore) {
@@ -450,15 +503,16 @@ export function LiveViewerPage() {
             signals={selectedSignals}
             trades={selectedTrades}
           />
-          {quoteError ? (
+          {quoteError && (
             <div style={{ marginTop: "8px", color: "#fca5a5", fontSize: "0.76rem" }}>
               {(quoteError as Error).message || "No live quote bars available"}
             </div>
-          ) : quoteFetching ? (
+          )}
+          {!quoteError && quoteFetching && (
             <div style={{ marginTop: "8px", color: "var(--color-text-muted)", fontSize: "0.76rem" }}>
               Refreshing chart...
             </div>
-          ) : null}
+          )}
         </div>
 
         <div
@@ -563,12 +617,12 @@ function LiveCandlestickChart({
   bars,
   signals,
   trades,
-}: {
+}: Readonly<{
   symbol: string;
   bars: LiveQuoteBar[];
   signals: LiveSignalLog[];
   trades: ViewerTrade[];
-}) {
+}>) {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const candleSeriesRef = useRef<ISeriesApi<"Candlestick", Time> | null>(null);
@@ -600,38 +654,10 @@ function LiveCandlestickChart({
     [bars],
   );
 
-  const markers = useMemo<TradeMarker[]>(() => {
-    const out: TradeMarker[] = [];
-    for (const signal of signals) {
-      const t = toChartTime(signal.signal_time);
-      if (t === null) continue;
-      const side = String(signal.action || "").toLowerCase() === "sell" ? "SELL" : "BUY";
-      const qty = Number(signal.signal_metadata?.qty ?? signal.filled_qty ?? 0);
-      const price = signal.theoretical_price;
-      out.push({
-        id: `signal-${signal.signal_id}`,
-        time: t,
-        position: side === "BUY" ? "belowBar" : "aboveBar",
-        color: side === "BUY" ? "#22c55e" : "#f87171",
-        shape: side === "BUY" ? "arrowUp" : "arrowDown",
-        text: `${side} ${Number.isFinite(qty) ? qty.toFixed(2) : "0.00"} @ ${formatPrice(price)}`,
-      });
-    }
-    for (const trade of trades) {
-      if (trade.exit === null) continue;
-      const t = toChartTime(trade.signalTimeUnix);
-      if (t === null) continue;
-      out.push({
-        id: `exit-${trade.id}`,
-        time: t,
-        position: trade.side === "BUY" ? "aboveBar" : "belowBar",
-        color: "#eab308",
-        shape: trade.side === "BUY" ? "arrowDown" : "arrowUp",
-        text: `EXIT ${trade.size.toFixed(2)} @ ${formatPrice(trade.exit)} · ${trade.exitReason}`,
-      });
-    }
-    return out.sort((left, right) => Number(left.time) - Number(right.time));
-  }, [signals, trades]);
+  const markers = useMemo<TradeMarker[]>(
+    () => buildTradeMarkers(signals, trades),
+    [signals, trades],
+  );
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -812,7 +838,22 @@ function LiveCandlestickChart({
   );
 }
 
-function SignalLogTable({ signals, loading }: { signals: LiveSignalLog[]; loading: boolean }) {
+/** Shared tone color for viewer status chips. */
+function viewerToneColor(tone: "neutral" | "positive" | "negative" | undefined): string {
+  if (tone === "positive") {
+    return "#86efac";
+  }
+  if (tone === "negative") {
+    return "#fecaca";
+  }
+  return "#dbeafe";
+}
+
+/** Renders an unknown metadata cell without `[object Object]`. */
+function SignalLogTable({
+  signals,
+  loading,
+}: Readonly<{ signals: LiveSignalLog[]; loading: boolean }>) {
   return (
     <div style={{ maxHeight: "350px", overflowY: "auto", border: "1px solid var(--color-border)", borderRadius: "10px" }}>
       <table style={tableStyle}>
@@ -843,7 +884,9 @@ function SignalLogTable({ signals, loading }: { signals: LiveSignalLog[]; loadin
               </td>
               <td style={tdStyleMessage}>
                 {signal.raw_message ||
-                  String(signal.signal_metadata?.discord_content || signal.signal_metadata?.source || "—")}
+                  stringifyUnknownValue(
+                    signal.signal_metadata?.discord_content ?? signal.signal_metadata?.source,
+                  ) || "—"}
               </td>
             </tr>
           ))}
@@ -869,7 +912,7 @@ const HeaderStatCard = memo(function HeaderStatCard({
   subtitle?: string;
   tone?: "neutral" | "positive" | "negative";
 }) {
-  const toneColor = tone === "positive" ? "#86efac" : tone === "negative" ? "#fecaca" : "#dbeafe";
+  const toneColor = viewerToneColor(tone);
   return (
     <div
       style={{
@@ -911,7 +954,7 @@ const MiniMetric = memo(function MiniMetric({
       <span
         style={{
           fontSize: "0.82rem",
-          color: tone === "positive" ? "#86efac" : tone === "negative" ? "#fecaca" : "#dbeafe",
+          color: viewerToneColor(tone),
           fontWeight: 600,
         }}
       >
@@ -948,10 +991,8 @@ function toTradeHistoryRows(rows: LiveTradeSlippage[]): ViewerTrade[] {
     const entry = asFinite(row.theoretical_price, 0);
     const exit = Number.isFinite(row.actual_price) ? asFinite(row.actual_price, 0) : null;
     const side = String(row.action || "").toLowerCase() === "sell" ? "SELL" : "BUY";
-    const pnl =
-      exit == null
-        ? null
-        : (exit - entry) * asFinite(row.filled_qty, 0) * (side === "BUY" ? 1 : -1);
+    const sideFactor = side === "BUY" ? 1 : -1;
+    const pnl = exit == null ? null : (exit - entry) * asFinite(row.filled_qty, 0) * sideFactor;
     return {
       id: `${row.execution_id || row.signal_id}`,
       symbol: row.symbol,
@@ -960,9 +1001,9 @@ function toTradeHistoryRows(rows: LiveTradeSlippage[]): ViewerTrade[] {
       entry,
       exit,
       pnl,
-      exitReason: row.exit_reason || String(row.signal_metadata?.exit_reason || ""),
+      exitReason: row.exit_reason || stringifyUnknownValue(row.signal_metadata?.exit_reason),
       time: row.execution_timestamp || row.signal_timestamp,
-      signalTimeUnix: asFinite(row.signal_time, 0),
+      exitTimeUnix: asFinite(row.execution_time, 0) || asFinite(row.signal_time, 0),
     };
   });
 }
@@ -988,7 +1029,7 @@ function uniqueSymbols(
   for (const signal of signals) {
     if (signal.symbol.trim()) values.add(signal.symbol.trim().toUpperCase());
   }
-  return [...values].sort();
+  return [...values].sort((a, b) => a.localeCompare(b));
 }
 
 function positionCardStyle(position: LivePosition, selectedSymbol: string): React.CSSProperties {
@@ -1129,10 +1170,7 @@ function statusBadgeStyle(status: string): React.CSSProperties {
 }
 
 function toChartTime(value: number): UTCTimestamp | null {
-  if (!Number.isFinite(value) || value <= 0) {
-    return null;
-  }
-  return Math.trunc(value) as UTCTimestamp;
+  return toChartTimeUnix(value) as UTCTimestamp | null;
 }
 
 function asFinite(value: unknown, fallback: number): number {

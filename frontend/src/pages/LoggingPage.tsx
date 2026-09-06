@@ -14,8 +14,26 @@ const DEFAULT_LEVELS: Record<string, boolean> = {
   INFO: true,
   DEBUG: false,
 };
-const POLLING_PATHS = ["/api/tasks", "/api/data/tasks", "/api/live/accounts", "/api/live/deployments"];
-const POLLING_PREFIXES = ["/api/tasks/", "/api/data/tasks/", "/api/live/balances/", "/api/live/stats/", "/api/live/trades/"];
+const POLLING_PATHS = new Set([
+  "/api/tasks",
+  "/api/data/tasks",
+  "/api/live/accounts",
+  "/api/live/deployments",
+]);
+const POLLING_PREFIXES = [
+  "/api/tasks/",
+  "/api/data/tasks/",
+  "/api/live/balances/",
+  "/api/live/stats/",
+  "/api/live/trades/",
+];
+const CANONICAL_TIMESTAMP_RE =
+  /^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2})(\.\d+)?( [Zz]|[+-]\d{2}:\d{2})?$/;
+const TIMESTAMP_RE = /(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})/;
+const LOG_LEVEL_RE = /\b(ERROR|WARNING|WARN|INFO|DEBUG)\b/i;
+const MODULE_FUNC_RE = /\b([A-Za-z_][\w.-]*)\.([A-Za-z_][\w<>-]*)\b/;
+const TRACEBACK_FILE_RE = /File "(.*)\/(\w+)\.py", line \d+, in ([\w<>-]+)/;
+const UVICORN_PREFIX_RE = /^\s*(INFO|ERROR|WARNING|DEBUG)\s*:\s*/i;
 const LOG_FETCH_LIMIT = 5000;
 const LOG_REFRESH_MS = 5000;
 // Keeps keystrokes in the search box from refetching LOG_FETCH_LIMIT lines each time.
@@ -61,21 +79,30 @@ function levelColor(level: Level): string {
 }
 
 function parseTimestamp(input: unknown): { short: string; long: string } {
-  const raw = String(input ?? "").trim();
+  const raw = stringifyUnknownValue(input).trim();
   if (!raw) {
     return { short: "--:--:--", long: "Unknown timestamp" };
   }
-  const canonicalMatch = raw.match(
-    /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})(\.\d+)?(?:\s*(Z|[+-]\d{2}:?\d{2}))?$/,
-  );
+  // Normalise common ISO variants so the canonical pattern stays simple:
+  // "T" separator -> space, compact "+HHMM" zone -> "+HH:MM", bare
+  // UTC suffix (Z/z) -> " Z" so the canonical pattern keeps matching.
+  const normalized = raw
+    .replace("T", " ")
+    .replace(/([+-]\d{2})(\d{2})$/, "$1:$2")
+    .replace(/ ?[Zz]$/, " Z");
+  const canonicalMatch = CANONICAL_TIMESTAMP_RE.exec(normalized);
   if (canonicalMatch) {
     const datePart = canonicalMatch[1];
     const timePart = canonicalMatch[2];
     const millis = canonicalMatch[3] ?? "";
     const zone = canonicalMatch[4] ?? "";
+    let long = `${datePart} ${timePart}${millis}`;
+    if (zone) {
+      long = `${long} ${zone}`;
+    }
     return {
       short: timePart,
-      long: `${datePart} ${timePart}${millis}${zone ? ` ${zone}` : ""}`.trim(),
+      long: long.trim(),
     };
   }
 
@@ -105,24 +132,23 @@ function tryParseJson(line: string): Record<string, unknown> | null {
 }
 
 function parsePlainLine(line: string): ParsedLogLine {
-  const timestampMatch = line.match(/(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})/);
-  const levelMatch = line.match(/\b(ERROR|WARNING|WARN|INFO|DEBUG)\b/i);
-  const moduleFuncMatch = line.match(
-    /\b([A-Za-z_][A-Za-z0-9_.-]*)\.([A-Za-z_][A-Za-z0-9_<>-]*)\b/,
-  );
-  const tracebackMatch = line.match(
-    /File "[^"]*\/([A-Za-z_][A-Za-z0-9_]*)\.py", line \d+, in ([A-Za-z_][A-Za-z0-9_<>-]*)/,
-  );
-  const uvicornPrefixMatch = line.match(/^\s*(INFO|ERROR|WARNING|DEBUG)\s*:\s*(.*)$/i);
+  const timestampMatch = TIMESTAMP_RE.exec(line);
+  const levelMatch = LOG_LEVEL_RE.exec(line);
+  const moduleFuncMatch = MODULE_FUNC_RE.exec(line);
+  const tracebackMatch = TRACEBACK_FILE_RE.exec(line);
+  const uvicornPrefixMatch = UVICORN_PREFIX_RE.exec(line);
   const level = normalizeLevel(levelMatch?.[1] ?? line);
   const timestamp = parseTimestamp(timestampMatch?.[1] ?? "");
   const moduleName = (
-    tracebackMatch?.[1] ||
+    tracebackMatch?.[2] ||
     moduleFuncMatch?.[1] ||
     (uvicornPrefixMatch ? "uvicorn" : "app")
   ).trim();
-  const funcName = (tracebackMatch?.[2] || moduleFuncMatch?.[2] || "—").trim();
-  const message = (uvicornPrefixMatch?.[2] || line).trim() || line;
+  const funcName = (tracebackMatch?.[3] || moduleFuncMatch?.[2] || "—").trim();
+  const uvicornPrefixLength = uvicornPrefixMatch?.[0].length ?? 0;
+  const message =
+    (uvicornPrefixLength > 0 ? line.slice(uvicornPrefixLength) : line).trim() ||
+    line;
   return {
     raw: line,
     timestampShort: timestamp.short,
@@ -143,11 +169,14 @@ function parseLogLine(line: string): ParsedLogLine {
   }
 
   const ts = parseTimestamp(json.timestamp);
-  const level = normalizeLevel(String(json.level ?? ""));
-  const moduleName = String(json.module ?? "app") || "app";
-  const func = String(json.function ?? json.func ?? "—") || "—";
-  const message = String(json.message ?? line);
-  const data = typeof json.data === "object" && json.data !== null ? (json.data as Record<string, unknown>) : null;
+  const level = normalizeLevel(stringifyUnknownValue(json.level));
+  const moduleName = stringifyUnknownValue(json.module) || "app";
+  const func = stringifyUnknownValue(json.function ?? json.func) || "—";
+  const message = stringifyUnknownValue(json.message ?? line);
+  const data =
+    typeof json.data === "object" && json.data !== null
+      ? (json.data as Record<string, unknown>)
+      : null;
 
   return {
     raw: line,
@@ -166,7 +195,7 @@ function isPollingLog(entry: ParsedLogLine): boolean {
   const plainMessage = entry.message || "";
   if (
     plainMessage.includes("GET /api/data/tasks") ||
-    plainMessage.includes("\"GET /api/data/tasks")
+    plainMessage.includes('"GET /api/data/tasks')
   ) {
     return true;
   }
@@ -177,7 +206,7 @@ function isPollingLog(entry: ParsedLogLine): boolean {
   const path = String(maybePath || "").split("?", 1)[0];
   if (!path) return false;
   if (path.includes("/api/data/tasks")) return true;
-  if (POLLING_PATHS.includes(path)) return true;
+  if (POLLING_PATHS.has(path)) return true;
   return POLLING_PREFIXES.some((prefix) => path.startsWith(prefix));
 }
 
@@ -189,7 +218,8 @@ export function LoggingPage() {
   const [search, setSearch] = useState("");
   const debouncedSearch = useDebouncedValue(search, LOG_SEARCH_DEBOUNCE_MS);
   const [selectedModules, setSelectedModules] = useState<string[]>([]);
-  const [selectedLevels, setSelectedLevels] = useState<Record<string, boolean>>(DEFAULT_LEVELS);
+  const [selectedLevels, setSelectedLevels] =
+    useState<Record<string, boolean>>(DEFAULT_LEVELS);
   const [hidePolling, setHidePolling] = useState(true);
   const [autoScroll, setAutoScroll] = useState(true);
   const [expandedRows, setExpandedRows] = useState<Set<string>>(new Set());
@@ -201,13 +231,19 @@ export function LoggingPage() {
     getLogs()
       .then((files) => {
         const names = files.map((entry) => entry.name);
-        const ordered = [ALL_LOGS, ...names.filter((name) => name !== ALL_LOGS)];
+        const ordered = [
+          ALL_LOGS,
+          ...names.filter((name) => name !== ALL_LOGS),
+        ];
         setLogFiles([...new Set(ordered)]);
       })
       .catch(() => {
         setLogFiles([ALL_LOGS]);
         setSelectedFile(ALL_LOGS);
-        showToast("Failed to list log files. Showing aggregate stream only.", "error");
+        showToast(
+          "Failed to list log files. Showing aggregate stream only.",
+          "error",
+        );
         setHasLoadedOnce(true);
       });
   }, [showToast]);
@@ -270,9 +306,9 @@ export function LoggingPage() {
   }, [lines]);
 
   const moduleOptions = useMemo(() => {
-    return [...new Set(parsedEntries.map((entry) => entry.module).filter(Boolean))].sort((a, b) =>
-      a.localeCompare(b),
-    );
+    return [
+      ...new Set(parsedEntries.map((entry) => entry.module).filter(Boolean)),
+    ].sort((a, b) => a.localeCompare(b));
   }, [parsedEntries]);
 
   const selectedModulesEffective = useMemo(() => {
@@ -285,7 +321,10 @@ export function LoggingPage() {
     return parsedEntries.filter((entry) => {
       if (!selectedLevels[entry.level]) return false;
 
-      if (selectedModulesEffective.length > 0 && !selectedModulesEffective.includes(entry.module)) {
+      if (
+        selectedModulesEffective.length > 0 &&
+        !selectedModulesEffective.includes(entry.module)
+      ) {
         return false;
       }
 
@@ -294,12 +333,19 @@ export function LoggingPage() {
       }
 
       if (!query) return true;
-      const serialized = `${entry.timestampLong} ${entry.level} ${entry.module} ${entry.func} ${entry.message} ${
-        entry.data ? JSON.stringify(entry.data) : ""
-      }`.toLowerCase();
+      const serialized =
+        `${entry.timestampLong} ${entry.level} ${entry.module} ${entry.func} ${entry.message} ${
+          entry.data ? JSON.stringify(entry.data) : ""
+        }`.toLowerCase();
       return serialized.includes(query);
     });
-  }, [hidePolling, parsedEntries, search, selectedLevels, selectedModulesEffective]);
+  }, [
+    hidePolling,
+    parsedEntries,
+    search,
+    selectedLevels,
+    selectedModulesEffective,
+  ]);
 
   const entriesWithIds = useMemo(
     () =>
@@ -337,7 +383,8 @@ export function LoggingPage() {
   const rowVirtualizer = useVirtualizer({
     count: virtualRows.length,
     getScrollElement: () => tableContainerRef.current,
-    estimateSize: (index) => (virtualRows[index]?.rowType === "detail" ? 190 : 42),
+    estimateSize: (index) =>
+      virtualRows[index]?.rowType === "detail" ? 190 : 42,
     measureElement: (element) => element?.getBoundingClientRect().height ?? 0,
     overscan: 15,
   });
@@ -379,12 +426,17 @@ export function LoggingPage() {
     });
   };
 
-  const levelLabel = selectedLevelList.length === LEVEL_OPTIONS.length ? "All levels" : selectedLevelList.join(", ");
+  const levelLabel =
+    selectedLevelList.length === LEVEL_OPTIONS.length
+      ? "All levels"
+      : selectedLevelList.join(", ");
 
   return (
     <div style={{ padding: "22px", background: "#131722", minHeight: "100%" }}>
       <div style={{ marginBottom: "14px" }}>
-        <h1 style={{ fontSize: "1.36rem", fontWeight: 700 }}>Logging Terminal</h1>
+        <h1 style={{ fontSize: "1.36rem", fontWeight: 700 }}>
+          Logging Terminal
+        </h1>
         <p style={{ color: "var(--color-text-muted)", fontSize: "0.78rem" }}>
           Structured logs with module, level and polling-noise filters.
         </p>
@@ -401,10 +453,20 @@ export function LoggingPage() {
           marginBottom: "12px",
         }}
       >
-        <div style={{ display: "flex", gap: "10px", flexWrap: "wrap", alignItems: "center" }}>
+        <div
+          style={{
+            display: "flex",
+            gap: "10px",
+            flexWrap: "wrap",
+            alignItems: "center",
+          }}
+        >
           <MultiSelectDropdown
             label="Module"
-            options={moduleOptions.map((module) => ({ label: module, value: module }))}
+            options={moduleOptions.map((module) => ({
+              label: module,
+              value: module,
+            }))}
             selected={selectedModules}
             onChange={setSelectedModules}
             searchable
@@ -449,15 +511,28 @@ export function LoggingPage() {
             }}
           />
 
-          <ToggleButton active={hidePolling} onClick={() => setHidePolling((current) => !current)}>
+          <ToggleButton
+            active={hidePolling}
+            onClick={() => setHidePolling((current) => !current)}
+          >
             Hide API Polling
           </ToggleButton>
-          <ToggleButton active={autoScroll} onClick={() => setAutoScroll((current) => !current)}>
+          <ToggleButton
+            active={autoScroll}
+            onClick={() => setAutoScroll((current) => !current)}
+          >
             Auto-Scroll
           </ToggleButton>
         </div>
 
-        <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", alignItems: "center" }}>
+        <div
+          style={{
+            display: "flex",
+            gap: "8px",
+            flexWrap: "wrap",
+            alignItems: "center",
+          }}
+        >
           {LEVEL_OPTIONS.map((level) => (
             <button
               key={level}
@@ -468,8 +543,12 @@ export function LoggingPage() {
                 border: selectedLevels[level]
                   ? `1px solid ${levelColor(level)}`
                   : "1px solid rgba(148, 163, 184, 0.24)",
-                background: selectedLevels[level] ? `${levelColor(level)}22` : "rgba(17, 24, 39, 0.9)",
-                color: selectedLevels[level] ? levelColor(level) : "var(--color-text-muted)",
+                background: selectedLevels[level]
+                  ? `${levelColor(level)}22`
+                  : "rgba(17, 24, 39, 0.9)",
+                color: selectedLevels[level]
+                  ? levelColor(level)
+                  : "var(--color-text-muted)",
                 padding: "6px 10px",
                 fontSize: "0.72rem",
                 fontWeight: 700,
@@ -481,16 +560,35 @@ export function LoggingPage() {
             </button>
           ))}
 
-          <span style={{ color: "var(--color-text-muted)", fontSize: "0.72rem", marginInlineStart: "8px" }}>
+          <span
+            style={{
+              color: "var(--color-text-muted)",
+              fontSize: "0.72rem",
+              marginInlineStart: "8px",
+            }}
+          >
             {levelLabel}
           </span>
         </div>
 
-        <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", color: "var(--color-text-muted)", fontSize: "0.72rem" }}>
+        <div
+          style={{
+            display: "flex",
+            gap: "8px",
+            flexWrap: "wrap",
+            color: "var(--color-text-muted)",
+            fontSize: "0.72rem",
+          }}
+        >
           <span>
-            Modules: {selectedModulesEffective.length > 0 ? selectedModulesEffective.join(", ") : "All"}
+            Modules:{" "}
+            {selectedModulesEffective.length > 0
+              ? selectedModulesEffective.join(", ")
+              : "All"}
           </span>
-          {loadError ? <span style={{ color: "#f87171" }}>• {loadError}</span> : null}
+          {loadError ? (
+            <span style={{ color: "#f87171" }}>• {loadError}</span>
+          ) : null}
         </div>
       </section>
 
@@ -507,7 +605,8 @@ export function LoggingPage() {
           style={{
             maxHeight: "calc(100vh - 280px)",
             overflow: "auto",
-            fontFamily: '"SFMono-Regular", "Cascadia Code", "Roboto Mono", ui-monospace, monospace',
+            fontFamily:
+              '"SFMono-Regular", "Cascadia Code", "Roboto Mono", ui-monospace, monospace',
           }}
         >
           <div style={{ minWidth: "1080px" }}>
@@ -522,24 +621,26 @@ export function LoggingPage() {
                 borderBottom: "1px solid rgba(148, 163, 184, 0.28)",
               }}
             >
-              {["Timestamp", "Level", "Module", "Function", "Message"].map((heading) => (
-                <div
-                  key={heading}
-                  style={{
-                    color: "var(--color-text-muted)",
-                    textTransform: "uppercase",
-                    letterSpacing: "0.04em",
-                    fontSize: "0.71rem",
-                    fontWeight: 700,
-                    textAlign: "left",
-                    padding: "10px 10px",
-                  }}
-                >
-                  {heading}
-                </div>
-              ))}
+              {["Timestamp", "Level", "Module", "Function", "Message"].map(
+                (heading) => (
+                  <div
+                    key={heading}
+                    style={{
+                      color: "var(--color-text-muted)",
+                      textTransform: "uppercase",
+                      letterSpacing: "0.04em",
+                      fontSize: "0.71rem",
+                      fontWeight: 700,
+                      textAlign: "left",
+                      padding: "10px 10px",
+                    }}
+                  >
+                    {heading}
+                  </div>
+                ),
+              )}
             </div>
-            {loading ? (
+            {loading && (
               <div
                 style={{
                   padding: "28px 10px",
@@ -550,7 +651,8 @@ export function LoggingPage() {
               >
                 Loading logs...
               </div>
-            ) : filteredEntries.length === 0 ? (
+            )}
+            {!loading && filteredEntries.length === 0 && (
               <div
                 style={{
                   padding: "28px 10px",
@@ -561,7 +663,8 @@ export function LoggingPage() {
               >
                 No matching log entries.
               </div>
-            ) : (
+            )}
+            {!loading && filteredEntries.length > 0 && (
               <div
                 style={{
                   height: `${rowVirtualizer.getTotalSize()}px`,
@@ -600,11 +703,15 @@ export function LoggingPage() {
                           }}
                         >
                           <div>
-                            <span style={{ color: "var(--color-text-muted)" }}>Timestamp:</span>{" "}
+                            <span style={{ color: "var(--color-text-muted)" }}>
+                              Timestamp:
+                            </span>{" "}
                             {row.entry.timestampLong}
                           </div>
                           <div>
-                            <span style={{ color: "var(--color-text-muted)" }}>Format:</span>{" "}
+                            <span style={{ color: "var(--color-text-muted)" }}>
+                              Format:
+                            </span>{" "}
                             {row.entry.isJson ? "JSON" : "Plain text"}
                           </div>
                           <pre
@@ -632,7 +739,15 @@ export function LoggingPage() {
                       key={row.key}
                       data-index={virtualItem.index}
                       ref={rowVirtualizer.measureElement}
+                      role="button"
+                      tabIndex={0}
                       onClick={() => toggleExpanded(row.entry, row.index)}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter" || event.key === " ") {
+                          event.preventDefault();
+                          toggleExpanded(row.entry, row.index);
+                        }
+                      }}
                       style={{
                         position: "absolute",
                         top: 0,
@@ -645,7 +760,8 @@ export function LoggingPage() {
                         borderBottom: "1px solid rgba(148, 163, 184, 0.14)",
                       }}
                       onMouseEnter={(event) => {
-                        event.currentTarget.style.background = "rgba(88, 166, 255, 0.07)";
+                        event.currentTarget.style.background =
+                          "rgba(88, 166, 255, 0.07)";
                       }}
                       onMouseLeave={(event) => {
                         event.currentTarget.style.background = "transparent";
@@ -701,7 +817,13 @@ export function LoggingPage() {
                           wordBreak: "break-word",
                         }}
                       >
-                        <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                        <div
+                          style={{
+                            display: "flex",
+                            alignItems: "center",
+                            gap: "6px",
+                          }}
+                        >
                           <span>{row.entry.message}</span>
                           {row.entry.data ? (
                             expanded ? (
@@ -728,18 +850,20 @@ function ToggleButton({
   active,
   onClick,
   children,
-}: {
+}: Readonly<{
   active: boolean;
   onClick: () => void;
   children: ReactNode;
-}) {
+}>) {
   return (
     <button
       type="button"
       onClick={onClick}
       style={{
         borderRadius: "999px",
-        border: active ? "1px solid rgba(96, 165, 250, 0.45)" : "1px solid rgba(148, 163, 184, 0.24)",
+        border: active
+          ? "1px solid rgba(96, 165, 250, 0.45)"
+          : "1px solid rgba(148, 163, 184, 0.24)",
         background: active ? "rgba(37, 99, 235, 0.2)" : "rgba(17, 24, 39, 0.9)",
         color: active ? "#bfdbfe" : "var(--color-text-muted)",
         fontSize: "0.72rem",

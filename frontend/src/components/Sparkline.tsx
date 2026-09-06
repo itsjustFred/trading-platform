@@ -1,5 +1,10 @@
 import { memo, useMemo, useState } from "react";
 
+function formatSignedPercent(value: number): string {
+  const sign = value >= 0 ? "+" : "";
+  return `${sign}${value.toFixed(2)}%`;
+}
+
 /**
  * Sparkline — tiny SVG equity curve for card previews.
  * Green if last > first (profitable), red otherwise.
@@ -12,7 +17,7 @@ export const Sparkline = memo(function Sparkline({
   interactive = false,
   startDate,
   endDate,
-}: {
+}: Readonly<{
   data: number[];
   width?: number;
   height?: number;
@@ -20,9 +25,12 @@ export const Sparkline = memo(function Sparkline({
   interactive?: boolean;
   startDate?: string;
   endDate?: string;
-}) {
+}>): React.ReactElement | null {
   const normalized = useMemo(
-    () => (Array.isArray(data) ? data.filter((value) => Number.isFinite(value)).map((value) => Number(value)) : []),
+    () =>
+      Array.isArray(data)
+        ? data.filter((value) => Number.isFinite(value)).map(Number)
+        : [],
     [data],
   );
   const [hoverIndex, setHoverIndex] = useState<number | null>(null);
@@ -32,10 +40,9 @@ export const Sparkline = memo(function Sparkline({
   const min = Math.min(...normalized);
   const max = Math.max(...normalized);
   const range = max - min || 1;
+  const lastValue = normalized.at(-1) ?? normalized[0];
   const profitable =
-    trend != null
-      ? trend === "up"
-      : normalized[normalized.length - 1] >= normalized[0];
+    trend != null ? trend === "up" : lastValue >= normalized[0];
   const color = profitable ? "#3fb950" : "#f85149";
 
   const padding = 6;
@@ -61,30 +68,41 @@ export const Sparkline = memo(function Sparkline({
     });
   }, [normalized]);
 
-  const hoverIdx = hoverIndex == null ? null : Math.max(0, Math.min(normalized.length - 1, hoverIndex));
-  const hoverX = hoverIdx == null ? 0 : (hoverIdx / (normalized.length - 1)) * width;
+  const hoverIdx =
+    hoverIndex == null
+      ? null
+      : Math.max(0, Math.min(normalized.length - 1, hoverIndex));
+  const hoverX =
+    hoverIdx == null ? 0 : (hoverIdx / (normalized.length - 1)) * width;
   const hoverY =
     hoverIdx == null
       ? 0
       : height -
         padding -
-        ((normalized[hoverIdx] - min) / range) * Math.max(1, height - padding * 2);
+        ((normalized[hoverIdx] - min) / range) *
+          Math.max(1, height - padding * 2);
   const hoverValue = hoverIdx == null ? null : normalized[hoverIdx];
   const hoverDrawdown = hoverIdx == null ? null : drawdowns[hoverIdx];
   const baseValue = normalized[0];
   const hoverReturnPct =
-    hoverValue == null || !Number.isFinite(baseValue) || Math.abs(baseValue) < 1e-12
+    hoverValue == null ||
+    !Number.isFinite(baseValue) ||
+    Math.abs(baseValue) < 1e-12
       ? null
       : ((hoverValue - baseValue) / baseValue) * 100;
   const parsedStart = Date.parse(startDate || "");
   const parsedEnd = Date.parse(endDate || "");
-  const hasDateRange = Number.isFinite(parsedStart) && Number.isFinite(parsedEnd) && parsedEnd >= parsedStart;
-  const hoverDate =
-    hoverIdx == null
-      ? ""
-      : hasDateRange
-        ? new Date(parsedStart + ((parsedEnd - parsedStart) * hoverIdx) / (normalized.length - 1)).toLocaleDateString("de-DE")
-        : "";
+  const hasDateRange =
+    Number.isFinite(parsedStart) &&
+    Number.isFinite(parsedEnd) &&
+    parsedEnd >= parsedStart;
+  let hoverDate = "";
+  if (hoverIdx != null && hasDateRange) {
+    hoverDate = new Date(
+      parsedStart +
+        ((parsedEnd - parsedStart) * hoverIdx) / (normalized.length - 1),
+    ).toLocaleDateString("de-DE");
+  }
   const hoverPointLabel = hoverIdx == null ? "" : `Punkt ${hoverIdx + 1}`;
 
   return (
@@ -97,7 +115,10 @@ export const Sparkline = memo(function Sparkline({
           interactive
             ? (event) => {
                 const rect = event.currentTarget.getBoundingClientRect();
-                const relativeX = Math.max(0, Math.min(rect.width, event.clientX - rect.left));
+                const relativeX = Math.max(
+                  0,
+                  Math.min(rect.width, event.clientX - rect.left),
+                );
                 const ratio = rect.width > 0 ? relativeX / rect.width : 0;
                 setHoverIndex(Math.round(ratio * (normalized.length - 1)));
               }
@@ -108,8 +129,16 @@ export const Sparkline = memo(function Sparkline({
         <line
           x1={0}
           x2={width}
-          y1={height - padding - ((normalized[0] - min) / range) * Math.max(1, height - padding * 2)}
-          y2={height - padding - ((normalized[0] - min) / range) * Math.max(1, height - padding * 2)}
+          y1={
+            height -
+            padding -
+            ((normalized[0] - min) / range) * Math.max(1, height - padding * 2)
+          }
+          y2={
+            height -
+            padding -
+            ((normalized[0] - min) / range) * Math.max(1, height - padding * 2)
+          }
           stroke="rgba(255,255,255,0.10)"
           strokeWidth="1"
         />
@@ -133,7 +162,14 @@ export const Sparkline = memo(function Sparkline({
               strokeWidth="1"
               strokeDasharray="2 2"
             />
-            <circle cx={hoverX} cy={hoverY} r={2.5} fill={color} stroke="rgba(15,23,42,0.85)" strokeWidth="1" />
+            <circle
+              cx={hoverX}
+              cy={hoverY}
+              r={2.5}
+              fill={color}
+              stroke="rgba(15,23,42,0.85)"
+              strokeWidth="1"
+            />
           </>
         ) : null}
       </svg>
@@ -156,7 +192,9 @@ export const Sparkline = memo(function Sparkline({
           <div>{hoverDate || hoverPointLabel}</div>
           <div>
             {hoverValue.toLocaleString("en-US", { maximumFractionDigits: 0 })}
-            {hoverReturnPct != null ? ` · ${hoverReturnPct >= 0 ? "+" : ""}${hoverReturnPct.toFixed(2)}%` : ""}
+            {hoverReturnPct != null
+              ? ` · ${formatSignedPercent(hoverReturnPct)}`
+              : ""}
             {hoverDrawdown != null ? ` · DD ${hoverDrawdown.toFixed(2)}%` : ""}
           </div>
         </div>

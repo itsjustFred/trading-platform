@@ -39,6 +39,42 @@ const PROVIDER_OPTIONS: Array<{ label: string; value: AgentProviderId }> = [
   { label: "GitHub Copilot SDK", value: "copilot_sdk" },
 ];
 
+
+/** Picks the effective model for the selected conversion provider. */
+function resolveAgentModel(
+  provider: AgentProviderId,
+  model: string,
+  customModel: string,
+): string | undefined {
+  if (provider === "nim") {
+    return model;
+  }
+  return customModel.trim() ? customModel.trim() : undefined;
+}
+
+/** Renders the agent-run status line without nested template literals. */
+function agentRunStatusLine(
+  jobId: string | null,
+  providerLabel: string,
+  activeModel: string | null,
+): string {
+  if (!jobId) {
+    return "Start a run to stream conversion and backtest logs.";
+  }
+  const modelSuffix = activeModel ? ` · ${activeModel}` : "";
+  return `Live task ${jobId} · ${providerLabel}${modelSuffix}`;
+}
+
+/** Renders the parenthesized model suffix for the copy block. */
+function agentModelSuffix(
+  provider: AgentProviderId,
+  model: string,
+  customModel: string,
+): string {
+  const name = provider === "nim" ? model : customModel.trim();
+  return name ? ` (${name})` : "";
+}
+
 export function StrategyLabPage() {
   const [strategyName, setStrategyName] = useState("Aurora Cross");
   const [rawCode, setRawCode] = useState(sampleCode);
@@ -70,12 +106,7 @@ export function StrategyLabPage() {
       setError("");
       setJobId(null);
       setJobStatus("starting");
-      const selectedModel =
-        provider === "nim"
-          ? model
-          : customModel.trim()
-            ? customModel.trim()
-            : undefined;
+      const selectedModel = resolveAgentModel(provider, model, customModel);
       const response = await startAgentConvert({
         code: rawCode,
         strategy_name: strategyName.trim() || undefined,
@@ -235,9 +266,7 @@ export function StrategyLabPage() {
                 </div>
               </div>
               <div style={{ color: "rgba(226, 232, 240, 0.72)", fontSize: "0.82rem" }}>
-                {jobId
-                  ? `Live task ${jobId} · ${activeProvider || provider}${activeModel ? ` · ${activeModel}` : ""}`
-                  : "Start a run to stream conversion and backtest logs."}
+                {agentRunStatusLine(jobId, activeProvider || provider, activeModel)}
               </div>
             </div>
           </div>
@@ -481,9 +510,10 @@ export function StrategyLabPage() {
                   The agent writes a Python strategy file, emits Markdown documentation, and
                   backtests the output in the background after the analysis, meta, and code
                   generation steps complete using provider {provider}
-                  {provider === "nim" ? ` (${model})` : customModel.trim() ? ` (${customModel.trim()})` : ""}.
+                  {agentModelSuffix(provider, model, customModel)}.
                 </div>
               <button
+                type="button"
                 onClick={handleSubmit}
                 disabled={isSubmitting}
                 style={{

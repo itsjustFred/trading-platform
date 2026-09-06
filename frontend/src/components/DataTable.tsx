@@ -21,7 +21,7 @@ export function DataTable<T extends Record<string, any>>({
   data,
   onRowClick,
   maxHeight = "600px",
-}: DataTableProps<T>) {
+}: Readonly<DataTableProps<T>>) {
   const [sortKey, setSortKey] = useState<string | null>(null);
   const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
 
@@ -38,6 +38,16 @@ export function DataTable<T extends Record<string, any>>({
       return sortDir === "asc" ? cmp : -cmp;
     });
   }, [data, sortKey, sortDir]);
+
+  const rowKey = (row: T, index: number): string => {
+    for (const col of columns) {
+      const value = row[col.key];
+      if (typeof value === "string" || typeof value === "number") {
+        return String(value);
+      }
+    }
+    return `row-${index}`;
+  };
 
   const handleSort = (key: string) => {
     if (sortKey === key) setSortDir((d) => (d === "asc" ? "desc" : "asc"));
@@ -96,7 +106,7 @@ export function DataTable<T extends Record<string, any>>({
         <tbody>
           {sorted.map((row, i) => (
             <tr
-              key={i}
+              key={rowKey(row, i)}
               onClick={() => onRowClick?.(row)}
               style={{ cursor: onRowClick ? "pointer" : "default" }}
               onMouseEnter={(e) =>

@@ -25,7 +25,7 @@ export function SymbolInput({
   onChange,
   placeholder,
   style,
-}: SymbolInputProps) {
+}: Readonly<SymbolInputProps>) {
   const [categories, setCategories] = useState<Record<string, string[]>>({});
   const [query, setQuery] = useState("");
   const [showDropdown, setShowDropdown] = useState(false);
@@ -65,7 +65,7 @@ export function SymbolInput({
   const handleChange = (text: string) => {
     onChange(text);
     const parts = text.split(",").map((s) => s.trim());
-    const current = parts[parts.length - 1] || "";
+    const current = parts.at(-1) || "";
     setQuery(current);
     setShowDropdown(true);
 
@@ -151,12 +151,18 @@ export function SymbolInput({
                 key={cat}
                 style={{ borderBottom: "1px solid var(--color-border)" }}
               >
-                <div
+                <button
+                  type="button"
                   onClick={(e) => toggleCategory(cat, e)}
                   style={{
+                    width: "100%",
+                    textAlign: "left",
                     padding: "8px 10px",
                     cursor: "pointer",
                     background: "var(--color-surface2)",
+                    border: "none",
+                    color: "inherit",
+                    font: "inherit",
                     display: "flex",
                     alignItems: "center",
                     gap: "8px",
@@ -183,17 +189,23 @@ export function SymbolInput({
                   >
                     {syms.length}
                   </span>
-                </div>
+                </button>
                 {expandedCats[cat] && (
                   <div style={{ padding: "4px 0" }}>
                     {syms.slice(0, 100).map((sym) => (
-                      <div
+                      <button
                         key={sym}
+                        type="button"
                         onClick={() => selectSymbol(sym)}
                         style={{
+                          display: "block",
+                          width: "100%",
+                          textAlign: "left",
                           padding: "6px 28px",
                           cursor: "pointer",
                           fontSize: "0.85rem",
+                          border: "none",
+                          background: "transparent",
                           color: "var(--color-text)",
                         }}
                         onMouseEnter={(e) =>
@@ -205,7 +217,7 @@ export function SymbolInput({
                         }
                       >
                         {sym}
-                      </div>
+                      </button>
                     ))}
                     {syms.length > 100 && (
                       <div

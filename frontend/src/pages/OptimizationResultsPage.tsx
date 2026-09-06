@@ -6,6 +6,7 @@ import { getBacktestInfo, getOptimization } from "../api/client";
 import { DataTable } from "../components/DataTable";
 import type { BacktestInfo, OptimizationDetail } from "../api/types";
 import { classifyOptimizationOosEvidence } from "../lib/optimizationEvidence";
+import { stringifyUnknownValue } from "../lib/unknownValue";
 
 const COMPARISON_ROWS = [
   { key: "sharpe_ratio", label: "Sharpe" },
@@ -17,7 +18,11 @@ const COMPARISON_ROWS = [
   { key: "total_trades", label: "Trades" },
 ];
 
-function formatComparisonValue(key: string, value: number | string | boolean | null | undefined) {
+/** Renders an unknown parameter cell without falling back to `[object Object]`. */
+function formatComparisonValue(
+  key: string,
+  value: number | string | boolean | null | undefined,
+) {
   if (value == null) {
     return "—";
   }
@@ -42,13 +47,17 @@ function formatMode(value: string | null | undefined) {
 }
 
 function formatSymbols(symbols: string[] | null | undefined) {
-  const cleaned = (symbols || []).map((symbol) => String(symbol || "").trim()).filter(Boolean);
+  const cleaned = (symbols || [])
+    .map((symbol) => String(symbol || "").trim())
+    .filter(Boolean);
   return cleaned.length ? cleaned.join(", ") : "—";
 }
 
 export function OptimizationResultsPage() {
   const { id } = useParams<{ id: string }>();
-  const [optimization, setOptimization] = useState<OptimizationDetail | null>(null);
+  const [optimization, setOptimization] = useState<OptimizationDetail | null>(
+    null,
+  );
   const [backtestInfo, setBacktestInfo] = useState<BacktestInfo | null>(null);
   const [loadedId, setLoadedId] = useState<string | null>(null);
   const [error, setError] = useState("");
@@ -73,14 +82,22 @@ export function OptimizationResultsPage() {
         }
       })
       .catch((caughtError) => {
-        setError(caughtError instanceof Error ? caughtError.message : "Could not load optimization.");
+        setError(
+          caughtError instanceof Error
+            ? caughtError.message
+            : "Could not load optimization.",
+        );
         setLoadedId(id);
       });
   }, [id]);
 
   const topTrialColumns = useMemo(() => {
     const parameterKeys = Array.from(
-      new Set(optimization?.top_trials.flatMap((trial) => Object.keys(trial.params || {})) || []),
+      new Set(
+        optimization?.top_trials.flatMap((trial) =>
+          Object.keys(trial.params || {}),
+        ) || [],
+      ),
     );
 
     return [
@@ -94,22 +111,33 @@ export function OptimizationResultsPage() {
         key: "metric_value",
         label: "Metric",
         render: (row: Record<string, unknown>) => {
-          const value = typeof row.metric_value === "number" ? row.metric_value.toFixed(4) : "—";
-          return <span style={{ color: "#7dd3fc", fontWeight: 700 }}>{value}</span>;
+          const value =
+            typeof row.metric_value === "number"
+              ? row.metric_value.toFixed(4)
+              : "—";
+          return (
+            <span style={{ color: "#7dd3fc", fontWeight: 700 }}>{value}</span>
+          );
         },
       },
       {
         key: "symbols",
         label: "Symbols",
         render: (row: Record<string, unknown>) => {
-          const symbols = Array.isArray(row.symbols) ? row.symbols.map(String) : [];
-          return <span style={{ whiteSpace: "normal" }}>{formatSymbols(symbols)}</span>;
+          const symbols = Array.isArray(row.symbols)
+            ? row.symbols.map(String)
+            : [];
+          return (
+            <span style={{ whiteSpace: "normal" }}>
+              {formatSymbols(symbols)}
+            </span>
+          );
         },
       },
       ...parameterKeys.map((key) => ({
         key,
         label: key,
-        render: (row: Record<string, unknown>) => String(row[key] ?? "—"),
+        render: (row: Record<string, unknown>) => stringifyUnknownValue(row[key], "—"),
       })),
       {
         key: "trade_count",
@@ -131,7 +159,11 @@ export function OptimizationResultsPage() {
   );
 
   if (loading) {
-    return <div style={{ padding: "24px", color: "var(--color-text-muted)" }}>Loading optimization...</div>;
+    return (
+      <div style={{ padding: "24px", color: "var(--color-text-muted)" }}>
+        Loading optimization...
+      </div>
+    );
   }
 
   if (error || !optimization) {
@@ -171,7 +203,14 @@ export function OptimizationResultsPage() {
           }}
         />
         <div style={{ position: "relative", display: "grid", gap: "18px" }}>
-          <div style={{ display: "flex", justifyContent: "space-between", gap: "16px", flexWrap: "wrap" }}>
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              gap: "16px",
+              flexWrap: "wrap",
+            }}
+          >
             <div style={{ display: "grid", gap: "10px" }}>
               <Link
                 to="/optimizations"
@@ -211,16 +250,33 @@ export function OptimizationResultsPage() {
                 style={{
                   fontSize: "2rem",
                   lineHeight: 1,
-                  fontFamily: '"Iowan Old Style", "Palatino Linotype", Georgia, serif',
+                  fontFamily:
+                    '"Iowan Old Style", "Palatino Linotype", Georgia, serif',
                 }}
               >
-                {backtestInfo?.title || backtestInfo?.strategy_display_name || optimization.base_backtest_id}
+                {backtestInfo?.title ||
+                  backtestInfo?.strategy_display_name ||
+                  optimization.base_backtest_id}
               </h1>
-              <div style={{ color: "var(--color-text-muted)", lineHeight: 1.6 }}>
-                {optimization.n_trials} trials • {formatSymbols(optimization.best_symbols || optimization.symbols)} • {optimization.timeframe} • created {new Date(optimization.created_at).toLocaleString("en-US")}
+              <div
+                style={{ color: "var(--color-text-muted)", lineHeight: 1.6 }}
+              >
+                {optimization.n_trials} trials •{" "}
+                {formatSymbols(
+                  optimization.best_symbols || optimization.symbols,
+                )}{" "}
+                • {optimization.timeframe} • created{" "}
+                {new Date(optimization.created_at).toLocaleString("en-US")}
               </div>
             </div>
-            <div style={{ display: "flex", gap: "10px", flexWrap: "wrap", alignItems: "flex-start" }}>
+            <div
+              style={{
+                display: "flex",
+                gap: "10px",
+                flexWrap: "wrap",
+                alignItems: "flex-start",
+              }}
+            >
               <Link
                 to={`/backtests/${optimization.base_backtest_id}`}
                 style={{
@@ -242,12 +298,37 @@ export function OptimizationResultsPage() {
             </div>
           </div>
 
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: "12px" }}>
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))",
+              gap: "12px",
+            }}
+          >
             {[
-              { label: "In-sample selected score", value: formatComparisonValue(optimization.target_metric, optimization.best_value), tone: "#7dd3fc" },
-              { label: "Mode", value: formatMode(optimization.optimization_mode), tone: "#c4b5fd" },
-              { label: "Train split", value: `${Math.round(optimization.train_split_pct * 100)}%`, tone: "#fbbf24" },
-              { label: "OOS window", value: `${optimization.test_period.start.slice(0, 10)} → ${optimization.test_period.end.slice(0, 10)}`, tone: "#86efac" },
+              {
+                label: "In-sample selected score",
+                value: formatComparisonValue(
+                  optimization.target_metric,
+                  optimization.best_value,
+                ),
+                tone: "#7dd3fc",
+              },
+              {
+                label: "Mode",
+                value: formatMode(optimization.optimization_mode),
+                tone: "#c4b5fd",
+              },
+              {
+                label: "Train split",
+                value: `${Math.round(optimization.train_split_pct * 100)}%`,
+                tone: "#fbbf24",
+              },
+              {
+                label: "OOS window",
+                value: `${optimization.test_period.start.slice(0, 10)} → ${optimization.test_period.end.slice(0, 10)}`,
+                tone: "#86efac",
+              },
             ].map((item) => (
               <div
                 key={item.label}
@@ -258,10 +339,24 @@ export function OptimizationResultsPage() {
                   padding: "14px 16px",
                 }}
               >
-                <div style={{ fontSize: "0.72rem", textTransform: "uppercase", letterSpacing: "0.12em", color: "var(--color-text-muted)" }}>
+                <div
+                  style={{
+                    fontSize: "0.72rem",
+                    textTransform: "uppercase",
+                    letterSpacing: "0.12em",
+                    color: "var(--color-text-muted)",
+                  }}
+                >
                   {item.label}
                 </div>
-                <div style={{ marginTop: "8px", fontSize: "1.15rem", fontWeight: 700, color: item.tone }}>
+                <div
+                  style={{
+                    marginTop: "8px",
+                    fontSize: "1.15rem",
+                    fontWeight: 700,
+                    color: item.tone,
+                  }}
+                >
                   {item.value}
                 </div>
               </div>
@@ -279,7 +374,15 @@ export function OptimizationResultsPage() {
           padding: "16px 18px",
         }}
       >
-        <div style={{ color: oosEvidence.tone, fontSize: "0.76rem", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.12em" }}>
+        <div
+          style={{
+            color: oosEvidence.tone,
+            fontSize: "0.76rem",
+            fontWeight: 700,
+            textTransform: "uppercase",
+            letterSpacing: "0.12em",
+          }}
+        >
           {oosEvidence.label}
         </div>
         <div style={{ marginTop: "7px", color: "#e2e8f0", lineHeight: 1.55 }}>
@@ -291,14 +394,31 @@ export function OptimizationResultsPage() {
         style={{
           borderRadius: "22px",
           border: "1px solid rgba(148, 163, 184, 0.16)",
-          background: "linear-gradient(180deg, rgba(15, 23, 42, 0.96), rgba(2, 6, 23, 0.94))",
+          background:
+            "linear-gradient(180deg, rgba(15, 23, 42, 0.96), rgba(2, 6, 23, 0.94))",
           padding: "18px",
         }}
       >
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))", gap: "14px" }}>
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))",
+            gap: "14px",
+          }}
+        >
           {[
-            { label: "Base symbols", value: formatSymbols(optimization.symbols), tone: "#93c5fd" },
-            { label: "Best symbols", value: formatSymbols(optimization.best_symbols || optimization.symbols), tone: "#86efac" },
+            {
+              label: "Base symbols",
+              value: formatSymbols(optimization.symbols),
+              tone: "#93c5fd",
+            },
+            {
+              label: "Best symbols",
+              value: formatSymbols(
+                optimization.best_symbols || optimization.symbols,
+              ),
+              tone: "#86efac",
+            },
             {
               label: "Candidate universes",
               value: `${optimization.symbol_universes?.length || 0}`,
@@ -315,34 +435,57 @@ export function OptimizationResultsPage() {
                 minWidth: 0,
               }}
             >
-              <div style={{ fontSize: "0.72rem", textTransform: "uppercase", letterSpacing: "0.12em", color: item.tone }}>
+              <div
+                style={{
+                  fontSize: "0.72rem",
+                  textTransform: "uppercase",
+                  letterSpacing: "0.12em",
+                  color: item.tone,
+                }}
+              >
                 {item.label}
               </div>
-              <div style={{ marginTop: "8px", color: "#e2e8f0", lineHeight: 1.5, wordBreak: "break-word" }}>
+              <div
+                style={{
+                  marginTop: "8px",
+                  color: "#e2e8f0",
+                  lineHeight: 1.5,
+                  wordBreak: "break-word",
+                }}
+              >
                 {item.value}
               </div>
             </div>
           ))}
         </div>
         {(optimization.symbol_universes?.length || 0) > 0 ? (
-          <div style={{ marginTop: "14px", display: "flex", flexWrap: "wrap", gap: "8px" }}>
-            {(optimization.symbol_universes || []).slice(0, 12).map((universe, index) => (
-              <span
-                key={`${index}-${universe.join("-")}`}
-                style={{
-                  display: "inline-flex",
-                  alignItems: "center",
-                  padding: "8px 10px",
-                  borderRadius: "999px",
-                  border: "1px solid rgba(148, 163, 184, 0.14)",
-                  background: "rgba(148, 163, 184, 0.1)",
-                  color: "#cbd5e1",
-                  fontSize: "0.78rem",
-                }}
-              >
-                {formatSymbols(universe)}
-              </span>
-            ))}
+          <div
+            style={{
+              marginTop: "14px",
+              display: "flex",
+              flexWrap: "wrap",
+              gap: "8px",
+            }}
+          >
+            {(optimization.symbol_universes || [])
+              .slice(0, 12)
+              .map((universe, index) => (
+                <span
+                  key={`${index}-${universe.join("-")}`}
+                  style={{
+                    display: "inline-flex",
+                    alignItems: "center",
+                    padding: "8px 10px",
+                    borderRadius: "999px",
+                    border: "1px solid rgba(148, 163, 184, 0.14)",
+                    background: "rgba(148, 163, 184, 0.1)",
+                    color: "#cbd5e1",
+                    fontSize: "0.78rem",
+                  }}
+                >
+                  {formatSymbols(universe)}
+                </span>
+              ))}
           </div>
         ) : null}
       </section>
@@ -351,43 +494,73 @@ export function OptimizationResultsPage() {
         style={{
           borderRadius: "22px",
           border: "1px solid rgba(148, 163, 184, 0.16)",
-          background: "linear-gradient(180deg, rgba(15, 23, 42, 0.96), rgba(2, 6, 23, 0.94))",
+          background:
+            "linear-gradient(180deg, rgba(15, 23, 42, 0.96), rgba(2, 6, 23, 0.94))",
           padding: "18px",
         }}
       >
-        <div style={{ display: "flex", justifyContent: "space-between", gap: "12px", alignItems: "center", marginBottom: "14px", flexWrap: "wrap" }}>
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            gap: "12px",
+            alignItems: "center",
+            marginBottom: "14px",
+            flexWrap: "wrap",
+          }}
+        >
           <div>
-            <div style={{ fontSize: "0.72rem", textTransform: "uppercase", letterSpacing: "0.14em", color: "#93c5fd" }}>
+            <div
+              style={{
+                fontSize: "0.72rem",
+                textTransform: "uppercase",
+                letterSpacing: "0.14em",
+                color: "#93c5fd",
+              }}
+            >
               In-sample selection
             </div>
-            <div style={{ marginTop: "4px", fontSize: "1.02rem", fontWeight: 700 }}>
+            <div
+              style={{ marginTop: "4px", fontSize: "1.02rem", fontWeight: 700 }}
+            >
               In-sample selected parameters
             </div>
           </div>
-          <div style={{ display: "inline-flex", alignItems: "center", gap: "8px", color: "#f8fafc" }}>
+          <div
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: "8px",
+              color: "#f8fafc",
+            }}
+          >
             <Gauge size={16} />
-            {Object.keys(optimization.best_params || {}).length} optimized inputs
+            {Object.keys(optimization.best_params || {}).length} optimized
+            inputs
           </div>
         </div>
         <div style={{ display: "flex", flexWrap: "wrap", gap: "10px" }}>
-          {Object.entries(optimization.best_params || {}).map(([key, value]) => (
-            <div
-              key={key}
-              style={{
-                display: "inline-flex",
-                alignItems: "center",
-                gap: "8px",
-                borderRadius: "999px",
-                padding: "10px 14px",
-                border: "1px solid rgba(251, 191, 36, 0.16)",
-                background: "rgba(251, 191, 36, 0.08)",
-                fontFamily: '"SFMono-Regular", "Cascadia Code", ui-monospace, monospace',
-              }}
-            >
-              <span style={{ color: "#fbbf24" }}>{key}</span>
-              <span>{String(value)}</span>
-            </div>
-          ))}
+          {Object.entries(optimization.best_params || {}).map(
+            ([key, value]) => (
+              <div
+                key={key}
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: "8px",
+                  borderRadius: "999px",
+                  padding: "10px 14px",
+                  border: "1px solid rgba(251, 191, 36, 0.16)",
+                  background: "rgba(251, 191, 36, 0.08)",
+                  fontFamily:
+                    '"SFMono-Regular", "Cascadia Code", ui-monospace, monospace',
+                }}
+              >
+                <span style={{ color: "#fbbf24" }}>{key}</span>
+                <span>{String(value)}</span>
+              </div>
+            ),
+          )}
         </div>
       </section>
 
@@ -399,21 +572,32 @@ export function OptimizationResultsPage() {
         }}
       >
         {[
-          { title: "In-Sample", tone: "#7dd3fc", stats: optimization.train_stats },
-          { title: "Out-of-Sample", tone: "#86efac", stats: optimization.test_stats },
+          {
+            title: "In-Sample",
+            tone: "#7dd3fc",
+            stats: optimization.train_stats,
+          },
+          {
+            title: "Out-of-Sample",
+            tone: "#86efac",
+            stats: optimization.test_stats,
+          },
         ].map((panel) => (
           <div
             key={panel.title}
             style={{
               borderRadius: "22px",
               border: "1px solid rgba(148, 163, 184, 0.16)",
-              background: "linear-gradient(180deg, rgba(15, 23, 42, 0.96), rgba(2, 6, 23, 0.94))",
+              background:
+                "linear-gradient(180deg, rgba(15, 23, 42, 0.96), rgba(2, 6, 23, 0.94))",
               padding: "18px",
             }}
           >
             <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
               <Layers3 size={16} color={panel.tone} />
-              <div style={{ fontSize: "1rem", fontWeight: 700 }}>{panel.title}</div>
+              <div style={{ fontSize: "1rem", fontWeight: 700 }}>
+                {panel.title}
+              </div>
             </div>
             <div style={{ marginTop: "14px", display: "grid", gap: "10px" }}>
               {COMPARISON_ROWS.map((row) => (
@@ -430,7 +614,9 @@ export function OptimizationResultsPage() {
                     padding: "12px 14px",
                   }}
                 >
-                  <span style={{ color: "var(--color-text-muted)" }}>{row.label}</span>
+                  <span style={{ color: "var(--color-text-muted)" }}>
+                    {row.label}
+                  </span>
                   <span style={{ fontWeight: 700, color: panel.tone }}>
                     {formatComparisonValue(row.key, panel.stats?.[row.key])}
                   </span>
@@ -445,24 +631,49 @@ export function OptimizationResultsPage() {
         style={{
           borderRadius: "22px",
           border: "1px solid rgba(148, 163, 184, 0.16)",
-          background: "linear-gradient(180deg, rgba(15, 23, 42, 0.96), rgba(2, 6, 23, 0.94))",
+          background:
+            "linear-gradient(180deg, rgba(15, 23, 42, 0.96), rgba(2, 6, 23, 0.94))",
           padding: "18px",
         }}
       >
-        <div style={{ display: "flex", justifyContent: "space-between", gap: "12px", alignItems: "center", marginBottom: "16px", flexWrap: "wrap" }}>
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            gap: "12px",
+            alignItems: "center",
+            marginBottom: "16px",
+            flexWrap: "wrap",
+          }}
+        >
           <div>
-            <div style={{ fontSize: "0.72rem", textTransform: "uppercase", letterSpacing: "0.14em", color: "#93c5fd" }}>
+            <div
+              style={{
+                fontSize: "0.72rem",
+                textTransform: "uppercase",
+                letterSpacing: "0.14em",
+                color: "#93c5fd",
+              }}
+            >
               Ranked leaderboard
             </div>
-            <div style={{ marginTop: "4px", fontSize: "1.02rem", fontWeight: 700 }}>
+            <div
+              style={{ marginTop: "4px", fontSize: "1.02rem", fontWeight: 700 }}
+            >
               Top 10 trials
             </div>
           </div>
-          <div style={{ color: "var(--color-text-muted)", fontSize: "0.82rem" }}>
+          <div
+            style={{ color: "var(--color-text-muted)", fontSize: "0.82rem" }}
+          >
             Click column headers to sort.
           </div>
         </div>
-        <DataTable columns={topTrialColumns} data={topTrialRows} maxHeight="460px" />
+        <DataTable
+          columns={topTrialColumns}
+          data={topTrialRows}
+          maxHeight="460px"
+        />
       </section>
     </div>
   );

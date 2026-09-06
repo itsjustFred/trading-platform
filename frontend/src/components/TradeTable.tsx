@@ -120,7 +120,11 @@ const pnlCellStyle = (value: unknown) => {
   };
 };
 
-export function TradeTable({ trades, onTradeClick, showSignalColumns = false }: TradeTableProps) {
+export function TradeTable({
+  trades,
+  onTradeClick,
+  showSignalColumns = false,
+}: Readonly<TradeTableProps>) {
   const columnDefs = useMemo<ColDef<TradeTableRow>[]>(
     () => {
       const signalColumns: ColDef<TradeTableRow>[] = showSignalColumns

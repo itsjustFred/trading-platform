@@ -27,6 +27,8 @@ import type {
 import { TradeTable, type TradeTableRow } from "../components/TradeTable";
 import { Modal } from "../components/Modal";
 import { useToast } from "../components/ToastProvider";
+import { stringifyUnknownValue } from "../lib/unknownValue";
+import { formatSignedUsd } from "../lib/statFormat";
 
 const LIVE_DETAIL_POLL_MS = 30000;
 const DEFAULT_REPLAY_TIMEFRAME = "1h";
@@ -125,10 +127,10 @@ export function LiveDetailPage() {
         }
 
         setError("");
-      } catch (issue: unknown) {
+      } catch (error_: unknown) {
         if (ignore) return;
         const message =
-          issue instanceof Error ? issue.message : "Failed to load live account details";
+          error_ instanceof Error ? error_.message : "Failed to load live account details";
         setError(message);
       } finally {
         if (!ignore) {
@@ -179,16 +181,16 @@ export function LiveDetailPage() {
 
   const tradeRows = trades.map<TradeTableRow>((row, index) => {
     const metadata = row.signal_metadata as Record<string, unknown>;
-    const metadataPnl = Number(metadata?.pnl ?? NaN);
-    const metadataPnlPct = Number(metadata?.pnl_pct ?? NaN);
+    const metadataPnl = Number(metadata?.pnl ?? Number.NaN);
+    const metadataPnlPct = Number(metadata?.pnl_pct ?? Number.NaN);
     const direction = String(row.action || "").toUpperCase();
     const directionFactor = direction === "SELL" ? -1 : 1;
     const slippagePnl = -asFiniteNumber(row.slippage, 0) * asFiniteNumber(row.filled_qty, 0) * directionFactor;
     const resolvedPnl = Number.isFinite(metadataPnl) ? metadataPnl : slippagePnl;
 
-    const durationFromMeta = String(
-      metadata?.duration ?? metadata?.holding_time ?? metadata?.bars_held ?? "",
-    ).trim();
+    const durationFromMeta = stringifyUnknownMetadata(
+      metadata?.duration ?? metadata?.holding_time ?? metadata?.bars_held,
+    );
 
     return {
       id: row.execution_id || row.signal_id || `${row.symbol}-${row.execution_time}-${index}`,
@@ -202,12 +204,12 @@ export function LiveDetailPage() {
       pnlPct: Number.isFinite(metadataPnlPct) ? metadataPnlPct : null,
       exitReason:
         row.exit_reason ||
-        String(metadata?.exit_reason ?? metadata?.reason ?? "").trim(),
+        stringifyUnknownMetadata(metadata?.exit_reason ?? metadata?.reason),
       duration: durationFromMeta || null,
     };
   });
 
-  const handleStartReplay = async (event: React.FormEvent<HTMLFormElement>) => {
+  const handleStartReplay = async (event: React.SubmitEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (!accountId) {
       showToast("Missing account id for replay.", "warning");
@@ -232,8 +234,8 @@ export function LiveDetailPage() {
       setReplayModalOpen(false);
       showToast(`Signal replay started (task ${taskId}).`, "success");
       navigate("/backtests");
-    } catch (issue: unknown) {
-      const message = issue instanceof Error ? issue.message : "Failed to start signal replay";
+    } catch (error_: unknown) {
+      const message = error_ instanceof Error ? error_.message : "Failed to start signal replay";
       showToast(message, "error");
     } finally {
       setIsStartingReplay(false);
@@ -266,7 +268,7 @@ export function LiveDetailPage() {
       >
         <form onSubmit={handleStartReplay} style={{ display: "grid", gap: "12px" }}>
           <label style={fieldLabelStyle}>
-            Start Date
+            Start Date{" "}
             <input
               type="date"
               value={replayForm.start_date}
@@ -278,7 +280,7 @@ export function LiveDetailPage() {
             />
           </label>
           <label style={fieldLabelStyle}>
-            End Date
+            End Date{" "}
             <input
               type="date"
               value={replayForm.end_date}
@@ -290,7 +292,7 @@ export function LiveDetailPage() {
             />
           </label>
           <label style={fieldLabelStyle}>
-            Signal Processor (optional)
+            Signal Processor (optional){" "}
             <select
               value={replayForm.signal_processor}
               onChange={(event) =>
@@ -309,7 +311,7 @@ export function LiveDetailPage() {
             </select>
           </label>
           <label style={fieldLabelStyle}>
-            Replay Timeframe
+            Replay Timeframe{" "}
             <select
               value={replayForm.timeframe}
               onChange={(event) =>
@@ -324,8 +326,15 @@ export function LiveDetailPage() {
               ))}
             </select>
           </label>
-          <label style={{ ...fieldLabelStyle, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-            Auto-download missing OHLCV
+          <label
+            style={{
+              ...fieldLabelStyle,
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+            }}
+          >
+            Auto-download missing OHLCV{" "}
             <input
               type="checkbox"
               checked={replayForm.auto_download}
@@ -381,6 +390,7 @@ export function LiveDetailPage() {
                 <ArrowLeft size={16} />
               </Link>
               <button
+                type="button"
                 onClick={() => setReplayModalOpen(true)}
                 style={{
                   border: "1px solid rgba(168, 85, 247, 0.45)",
@@ -563,7 +573,7 @@ function LiveEquityChart({
     chartRef.current = chart;
 
     const start = equitySeries[0].value;
-    const end = equitySeries[equitySeries.length - 1].value;
+    const end = equitySeries.at(-1)?.value ?? start;
     const profit = end >= start;
     const lineColor = profit ? "#22c55e" : "#f87171";
 
@@ -720,11 +730,11 @@ function buildFallbackStats(
   const winRate = totalTrades > 0 ? (realized.winningTrades / totalTrades) * 100 : 0;
   const currentBalance =
     balances.length > 0
-      ? asFiniteNumber(balances[balances.length - 1].balance, 0)
+      ? asFiniteNumber(balances.at(-1)?.balance, 0)
       : 0;
   const currentEquity =
     balances.length > 0
-      ? asFiniteNumber(balances[balances.length - 1].equity, 0)
+      ? asFiniteNumber(balances.at(-1)?.equity, 0)
       : 0;
   return {
     totalTrades,
@@ -738,20 +748,80 @@ function buildFallbackStats(
   };
 }
 
-function calculateRealizedTradeStats(trades: LiveTradeSlippage[]): {
+interface PositionState {
+  qty: number;
+  avg: number;
+}
+
+interface RealizedStats {
   totalPnl: number;
   winningTrades: number;
   losingTrades: number;
-} {
-  const positions = new Map<string, { qty: number; avg: number }>();
-  let totalPnl = 0;
-  let winningTrades = 0;
-  let losingTrades = 0;
+}
+
+/** Folds a fill into an existing position, returning realized PnL from any closed part. */
+export function applyFillToPosition(
+  positions: Map<string, PositionState>,
+  symbol: string,
+  delta: number,
+  price: number,
+): RealizedStats {
+  const stats: RealizedStats = { totalPnl: 0, winningTrades: 0, losingTrades: 0 };
+  const current = positions.get(symbol) ?? { qty: 0, avg: 0 };
+  const currentQty = current.qty;
+  const currentAvg = current.avg;
+
+  if (currentQty === 0) {
+    positions.set(symbol, { qty: delta, avg: price });
+    return stats;
+  }
+
+  if (currentQty * delta > 0) {
+    const combinedQty = Math.abs(currentQty) + Math.abs(delta);
+    const nextAvg =
+      combinedQty > 0
+        ? ((Math.abs(currentQty) * currentAvg) + (Math.abs(delta) * price)) / combinedQty
+        : price;
+    positions.set(symbol, { qty: currentQty + delta, avg: nextAvg });
+    return stats;
+  }
+
+  const closedQty = Math.min(Math.abs(currentQty), Math.abs(delta));
+  if (closedQty > 0) {
+    const sideSign = currentQty > 0 ? 1 : -1;
+    const realizedPnl = (price - currentAvg) * closedQty * sideSign;
+    stats.totalPnl += realizedPnl;
+    if (realizedPnl > 0) {
+      stats.winningTrades += 1;
+    } else if (realizedPnl < 0) {
+      stats.losingTrades += 1;
+    }
+  }
+
+  const newQty = currentQty + delta;
+  if (newQty === 0) {
+    positions.set(symbol, { qty: 0, avg: 0 });
+  } else if (currentQty * newQty > 0) {
+    positions.set(symbol, { qty: newQty, avg: currentAvg });
+  } else {
+    positions.set(symbol, { qty: newQty, avg: price });
+  }
+  return stats;
+}
+
+function calculateRealizedTradeStats(trades: LiveTradeSlippage[]): RealizedStats {
+  const positions = new Map<string, PositionState>();
+  const stats: RealizedStats = { totalPnl: 0, winningTrades: 0, losingTrades: 0 };
 
   const orderedTrades = [...trades].sort((a, b) => a.execution_time - b.execution_time);
   for (const trade of orderedTrades) {
     const action = String(trade.action || "").toLowerCase();
-    const direction = action === "buy" ? 1 : action === "sell" ? -1 : 0;
+    let direction = 0;
+    if (action === "buy") {
+      direction = 1;
+    } else if (action === "sell") {
+      direction = -1;
+    }
     if (direction === 0) {
       continue;
     }
@@ -763,49 +833,13 @@ function calculateRealizedTradeStats(trades: LiveTradeSlippage[]): {
     }
 
     const symbol = String(trade.symbol || "UNKNOWN").toUpperCase();
-    const delta = quantity * direction;
-    const current = positions.get(symbol) ?? { qty: 0, avg: 0 };
-    const currentQty = current.qty;
-    const currentAvg = current.avg;
-
-    if (currentQty === 0) {
-      positions.set(symbol, { qty: delta, avg: price });
-      continue;
-    }
-
-    if (currentQty * delta > 0) {
-      const combinedQty = Math.abs(currentQty) + Math.abs(delta);
-      const nextAvg =
-        combinedQty > 0
-          ? ((Math.abs(currentQty) * currentAvg) + (Math.abs(delta) * price)) / combinedQty
-          : price;
-      positions.set(symbol, { qty: currentQty + delta, avg: nextAvg });
-      continue;
-    }
-
-    const closedQty = Math.min(Math.abs(currentQty), Math.abs(delta));
-    if (closedQty > 0) {
-      const sideSign = currentQty > 0 ? 1 : -1;
-      const realizedPnl = (price - currentAvg) * closedQty * sideSign;
-      totalPnl += realizedPnl;
-      if (realizedPnl > 0) {
-        winningTrades += 1;
-      } else if (realizedPnl < 0) {
-        losingTrades += 1;
-      }
-    }
-
-    const newQty = currentQty + delta;
-    if (newQty === 0) {
-      positions.set(symbol, { qty: 0, avg: 0 });
-    } else if (currentQty * newQty > 0) {
-      positions.set(symbol, { qty: newQty, avg: currentAvg });
-    } else {
-      positions.set(symbol, { qty: newQty, avg: price });
-    }
+    const fillStats = applyFillToPosition(positions, symbol, quantity * direction, price);
+    stats.totalPnl += fillStats.totalPnl;
+    stats.winningTrades += fillStats.winningTrades;
+    stats.losingTrades += fillStats.losingTrades;
   }
 
-  return { totalPnl, winningTrades, losingTrades };
+  return stats;
 }
 
 function maxDrawdownFromBalances(balances: LiveBalanceRecord[]): number {
@@ -861,12 +895,8 @@ function formatUsd(value: number): string {
   })}`;
 }
 
-function formatSignedUsd(value: number): string {
-  const sign = value > 0 ? "+" : value < 0 ? "-" : "";
-  return `${sign}$${Math.abs(value).toLocaleString("en-US", {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  })}`;
+function stringifyUnknownMetadata(value: unknown): string {
+  return stringifyUnknownValue(value).trim();
 }
 
 function formatPercent(value: number): string {

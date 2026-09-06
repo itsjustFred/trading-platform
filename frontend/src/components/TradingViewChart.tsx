@@ -149,11 +149,21 @@ function formatLotSize(value: number | null | undefined): string {
 }
 
 function normalizeExitReason(reason: unknown): string {
-  const value = String(reason || "").trim().toLowerCase();
+  let raw = JSON.stringify(reason);
+  if (typeof reason === "string") {
+    raw = reason;
+  } else if (reason == null) {
+    raw = "";
+  }
+  const value = raw.trim().toLowerCase();
   if (!value) {
     return "Signal";
   }
-  if (value === "tp" || value.includes("take_profit") || value.includes("take profit")) {
+  if (
+    value === "tp" ||
+    value.includes("take_profit") ||
+    value.includes("take profit")
+  ) {
     return "TP";
   }
   if (value.includes("trailing")) {
@@ -175,7 +185,10 @@ function formatMarkerTime(time: unknown): string {
   if (normalized === null) {
     return "—";
   }
-  return new Date(normalized * 1000).toISOString().slice(0, 16).replace("T", " ");
+  return new Date(normalized * 1000)
+    .toISOString()
+    .slice(0, 16)
+    .replace("T", " ");
 }
 
 function resolveChartLocale(): string {
@@ -223,7 +236,7 @@ export function TradingViewChart({
   showToolbar = true,
   isFullscreen = false,
   onToggleFullscreen,
-}: TradingViewChartProps) {
+}: Readonly<TradingViewChartProps>) {
   const wrapperRef = useRef<HTMLDivElement>(null);
   const chartContainerRef = useRef<HTMLDivElement>(null);
   const tooltipRef = useRef<HTMLDivElement>(null);
@@ -231,7 +244,9 @@ export function TradingViewChart({
   const chartRef = useRef<IChartApi | null>(null);
   const candleSeriesRef = useRef<ISeriesApi<"Candlestick", Time> | null>(null);
   const volumeSeriesRef = useRef<ISeriesApi<"Histogram", Time> | null>(null);
-  const markersPrimitiveRef = useRef<ISeriesMarkersPluginApi<Time> | null>(null);
+  const markersPrimitiveRef = useRef<ISeriesMarkersPluginApi<Time> | null>(
+    null,
+  );
   const indicatorSeriesRefs = useRef<ISeriesApi<"Line", Time>[]>([]);
   const separateIndicatorSeriesRefs = useRef<ISeriesApi<"Line", Time>[]>([]);
   const entryPriceLineRef = useRef<IPriceLine | null>(null);
@@ -266,10 +281,15 @@ export function TradingViewChart({
         close,
       });
     });
-    return Array.from(byTime.values()).sort((left, right) => Number(left.time) - Number(right.time));
+    return Array.from(byTime.values()).sort(
+      (left, right) => Number(left.time) - Number(right.time),
+    );
   }, [ohlcData]);
 
-  const candleTimes = useMemo(() => normalizedCandles.map((bar) => Number(bar.time)), [normalizedCandles]);
+  const candleTimes = useMemo(
+    () => normalizedCandles.map((bar) => Number(bar.time)),
+    [normalizedCandles],
+  );
   const candleTimeSet = useMemo(() => new Set(candleTimes), [candleTimes]);
 
   const normalizedVolume = useMemo<HistogramData<Time>[]>(() => {
@@ -290,18 +310,27 @@ export function TradingViewChart({
         color: bar.color,
       });
     });
-    return Array.from(byTime.values()).sort((left, right) => Number(left.time) - Number(right.time));
+    return Array.from(byTime.values()).sort(
+      (left, right) => Number(left.time) - Number(right.time),
+    );
   }, [volumeData, candleTimeSet]);
 
   const preparedIndicators = useMemo<PreparedIndicator[]>(() => {
     return indicators
       .map((indicator) => {
         const panelLabel = String(indicator.panel || "main").toLowerCase();
-        const panel: "main" | "separate" = panelLabel === "main" ? "main" : "separate";
-        const pointsByTime = new Map<number, LineData<Time> | WhitespaceData<Time>>();
+        const panel: "main" | "separate" =
+          panelLabel === "main" ? "main" : "separate";
+        const pointsByTime = new Map<
+          number,
+          LineData<Time> | WhitespaceData<Time>
+        >();
         indicator.data.forEach((point) => {
           const time = normalizeUnixTime(point.time);
-          if (time === null || (candleTimeSet.size > 0 && !candleTimeSet.has(time))) {
+          if (
+            time === null ||
+            (candleTimeSet.size > 0 && !candleTimeSet.has(time))
+          ) {
             return;
           }
           if (point.value === null || point.value === undefined) {
@@ -455,14 +484,26 @@ export function TradingViewChart({
         return;
       }
       const hoveredId =
-        typeof param.hoveredObjectId === "string" ? param.hoveredObjectId : null;
-      if (!hoveredId || !markerDetailsRef.current.has(hoveredId) || !param.point) {
+        typeof param.hoveredObjectId === "string"
+          ? param.hoveredObjectId
+          : null;
+      if (
+        !hoveredId ||
+        !markerDetailsRef.current.has(hoveredId) ||
+        !param.point
+      ) {
         tooltip.style.opacity = "0";
         return;
       }
       tooltip.textContent = markerDetailsRef.current.get(hoveredId) || "";
-      const left = Math.min(Math.max(param.point.x + 14, 8), Math.max(8, wrapper.clientWidth - 250));
-      const top = Math.min(Math.max(param.point.y + 14, 8), Math.max(8, wrapper.clientHeight - 90));
+      const left = Math.min(
+        Math.max(param.point.x + 14, 8),
+        Math.max(8, wrapper.clientWidth - 250),
+      );
+      const top = Math.min(
+        Math.max(param.point.y + 14, 8),
+        Math.max(8, wrapper.clientHeight - 90),
+      );
       tooltip.style.left = `${left}px`;
       tooltip.style.top = `${top}px`;
       tooltip.style.opacity = "1";
@@ -514,7 +555,9 @@ export function TradingViewChart({
     volumeSeries.setData(normalizedVolume);
 
     indicatorSeriesRefs.current.forEach((series) => chart.removeSeries(series));
-    separateIndicatorSeriesRefs.current.forEach((series) => chart.removeSeries(series));
+    separateIndicatorSeriesRefs.current.forEach((series) =>
+      chart.removeSeries(series),
+    );
     indicatorSeriesRefs.current = [];
     separateIndicatorSeriesRefs.current = [];
 
@@ -547,7 +590,13 @@ export function TradingViewChart({
     }
 
     applyRangePreset(rangePreset);
-  }, [normalizedCandles, normalizedVolume, preparedIndicators, rangePreset, applyRangePreset]);
+  }, [
+    normalizedCandles,
+    normalizedVolume,
+    preparedIndicators,
+    rangePreset,
+    applyRangePreset,
+  ]);
 
   useEffect(() => {
     const candleSeries = candleSeriesRef.current;
@@ -588,12 +637,16 @@ export function TradingViewChart({
         );
       }
 
-      const exits =
-        trade.exits && trade.exits.length
-          ? trade.exits
-          : trade.exit_time !== undefined && trade.exit_price !== undefined
-            ? [{ time: trade.exit_time, price: trade.exit_price, pnl: trade.pnl }]
-            : [];
+      let exits = trade.exits ?? [];
+      if (
+        exits.length === 0 &&
+        trade.exit_time !== undefined &&
+        trade.exit_price !== undefined
+      ) {
+        exits = [
+          { time: trade.exit_time, price: trade.exit_price, pnl: trade.pnl },
+        ];
+      }
 
       exits.forEach((exit, exitIndex) => {
         const exitTime = toChartTime(exit.time);
@@ -604,7 +657,9 @@ export function TradingViewChart({
         const pnlValue = exit.pnl ?? trade.pnl ?? 0;
         const exitColor = "#f85149";
         const exitId = `exit-${tradeKey}-${exitIndex}`;
-        const reasonLabel = normalizeExitReason(exit.reason ?? trade.exit_reason);
+        const reasonLabel = normalizeExitReason(
+          exit.reason ?? trade.exit_reason,
+        );
         markers.push({
           id: exitId,
           time: exitTime,
@@ -648,7 +703,7 @@ export function TradingViewChart({
         axisLabelVisible: true,
         title: "Entry",
       });
-      const fallbackExit = activeTrade.exits?.[activeTrade.exits.length - 1];
+      const fallbackExit = activeTrade.exits?.at(-1);
       const exitPrice = fallbackExit?.price ?? activeTrade.exit_price;
       if (exitPrice !== undefined && Number.isFinite(exitPrice)) {
         exitPriceLineRef.current = candleSeries.createPriceLine({
@@ -665,7 +720,12 @@ export function TradingViewChart({
 
   useEffect(() => {
     const chart = chartRef.current;
-    if (!chart || focusTradeTime === null || focusTradeTime === undefined || !candleTimes.length) {
+    if (
+      !chart ||
+      focusTradeTime === null ||
+      focusTradeTime === undefined ||
+      !candleTimes.length
+    ) {
       return;
     }
     const focusTime = normalizeUnixTime(focusTradeTime);
@@ -696,7 +756,14 @@ export function TradingViewChart({
             marginBottom: "8px",
           }}
         >
-          <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "6px",
+              flexWrap: "wrap",
+            }}
+          >
             {[
               { label: "50 bars", value: "50" as const },
               { label: "150 bars", value: "150" as const },
@@ -705,12 +772,18 @@ export function TradingViewChart({
             ].map((preset) => (
               <button
                 key={preset.value}
+                type="button"
                 onClick={() => handleRangeSelect(preset.value)}
                 style={{
                   border: `1px solid ${rangePreset === preset.value ? "rgba(88,166,255,0.45)" : "var(--color-border)"}`,
                   background:
-                    rangePreset === preset.value ? "rgba(88,166,255,0.15)" : "var(--color-surface2)",
-                  color: rangePreset === preset.value ? "#79c0ff" : "var(--color-text-muted)",
+                    rangePreset === preset.value
+                      ? "rgba(88,166,255,0.15)"
+                      : "var(--color-surface2)",
+                  color:
+                    rangePreset === preset.value
+                      ? "#79c0ff"
+                      : "var(--color-text-muted)",
                   borderRadius: "8px",
                   padding: "6px 10px",
                   fontSize: "0.74rem",
@@ -723,8 +796,16 @@ export function TradingViewChart({
             ))}
           </div>
 
-          <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "6px",
+              flexWrap: "wrap",
+            }}
+          >
             <button
+              type="button"
               onClick={handleScreenshot}
               style={{
                 border: "1px solid var(--color-border)",
@@ -741,6 +822,7 @@ export function TradingViewChart({
             </button>
             {onToggleFullscreen ? (
               <button
+                type="button"
                 onClick={onToggleFullscreen}
                 style={{
                   border: "1px solid var(--color-border)",

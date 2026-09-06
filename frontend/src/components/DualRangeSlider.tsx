@@ -43,7 +43,7 @@ export function DualRangeSlider({
   step,
   label,
   formatValue = defaultFormatter,
-}: DualRangeSliderProps) {
+}: Readonly<DualRangeSliderProps>) {
   const normalizedMin = Number.isFinite(min) ? min : 0;
   const normalizedMax = Number.isFinite(max) ? max : 1;
   const resolvedStep = normalizeStep(step, normalizedMin, normalizedMax);

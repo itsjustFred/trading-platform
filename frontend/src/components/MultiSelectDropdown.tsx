@@ -26,7 +26,7 @@ export function MultiSelectDropdown({
   searchable = false,
   searchPlaceholder = "Filter options...",
   buttonWidth = "220px",
-}: MultiSelectDropdownProps) {
+}: Readonly<MultiSelectDropdownProps>) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const wrapperRef = useRef<HTMLDivElement>(null);
@@ -74,6 +74,11 @@ export function MultiSelectDropdown({
     return preview.join(", ");
   }, [normalizedOptions, selectedSet]);
 
+  const buttonLabel =
+    selected.length === 0 ? label : `${label} (${selected.length})`;
+  const buttonSuffix =
+    selected.length > 0 && selectedPreview ? ` • ${selectedPreview}` : "";
+
   const toggleOption = (value: string) => {
     const next = new Set(selected);
     if (next.has(value)) {
@@ -85,7 +90,10 @@ export function MultiSelectDropdown({
   };
 
   return (
-    <div ref={wrapperRef} style={{ position: "relative", minWidth: buttonWidth }}>
+    <div
+      ref={wrapperRef}
+      style={{ position: "relative", minWidth: buttonWidth }}
+    >
       <button
         type="button"
         onClick={() => setOpen((current) => !current)}
@@ -113,9 +121,8 @@ export function MultiSelectDropdown({
             whiteSpace: "nowrap",
           }}
         >
-          {selected.length === 0
-            ? label
-            : `${label} (${selected.length})${selectedPreview ? ` • ${selectedPreview}` : ""}`}
+          {buttonLabel}
+          {buttonSuffix}
         </span>
         <ChevronDown size={14} />
       </button>
@@ -145,7 +152,9 @@ export function MultiSelectDropdown({
               borderBottom: "1px solid rgba(142, 155, 187, 0.2)",
             }}
           >
-            <span style={{ fontSize: "0.74rem", color: "var(--color-text-muted)" }}>
+            <span
+              style={{ fontSize: "0.74rem", color: "var(--color-text-muted)" }}
+            >
               {selected.length} selected
             </span>
             {selected.length > 0 ? (
@@ -226,7 +235,9 @@ export function MultiSelectDropdown({
                     style={{
                       width: "100%",
                       border: "none",
-                      background: active ? "rgba(88, 166, 255, 0.14)" : "transparent",
+                      background: active
+                        ? "rgba(88, 166, 255, 0.14)"
+                        : "transparent",
                       color: active ? "#dbe7ff" : "var(--color-text)",
                       display: "flex",
                       alignItems: "center",

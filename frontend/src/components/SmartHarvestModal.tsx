@@ -1,17 +1,11 @@
 import { useEffect, useState } from "react";
 import type { CSSProperties } from "react";
-import {
-  ArrowRight,
-  CheckCircle2,
-  Loader2,
-  RotateCcw,
-  Sparkles,
-  XCircle,
-} from "lucide-react";
+import { ArrowRight, RotateCcw, Sparkles } from "lucide-react";
 
 import { harvestData } from "../api/client";
 import { LiveTerminal } from "./LiveTerminal";
 import { Modal } from "./Modal";
+import { renderTaskStatusIcon } from "./ResampleModal";
 
 interface SmartHarvestModalProps {
   open: boolean;
@@ -33,7 +27,7 @@ export function SmartHarvestModal({
   defaultSymbol = "",
   defaultAssetClass = "",
   defaultStartDate = "",
-}: SmartHarvestModalProps) {
+}: Readonly<SmartHarvestModalProps>) {
   const [source, setSource] = useState(defaultSource || "dukascopy");
   const [symbol, setSymbol] = useState(defaultSymbol);
   const [assetClass, setAssetClass] = useState(defaultAssetClass);
@@ -108,14 +102,7 @@ export function SmartHarvestModal({
     }
   };
 
-  const statusIcon =
-    jobStatus === "completed" ? (
-      <CheckCircle2 size={18} color="#86efac" />
-    ) : jobStatus === "failed" ? (
-      <XCircle size={18} color="#fda4af" />
-    ) : (
-      <Loader2 size={18} className="animate-spin" color="#67e8f9" />
-    );
+  const statusIcon = renderTaskStatusIcon(jobStatus);
 
   return (
     <Modal
@@ -164,9 +151,16 @@ export function SmartHarvestModal({
                 <Sparkles size={20} color="#7dd3fc" />
               </div>
 
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "12px" }}>
+              <div
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "1fr 1fr",
+                  gap: "12px",
+                }}
+              >
                 <div style={{ display: "grid", gap: "8px" }}>
                   <label
+                    htmlFor="smart-harvest-source"
                     style={{
                       fontSize: "0.76rem",
                       letterSpacing: "0.08em",
@@ -177,6 +171,7 @@ export function SmartHarvestModal({
                     Source
                   </label>
                   <select
+                    id="smart-harvest-source"
                     value={source}
                     onChange={(event) => setSource(event.target.value)}
                     style={inputStyle}
@@ -187,6 +182,7 @@ export function SmartHarvestModal({
 
                 <div style={{ display: "grid", gap: "8px" }}>
                   <label
+                    htmlFor="smart-harvest-symbol"
                     style={{
                       fontSize: "0.76rem",
                       letterSpacing: "0.08em",
@@ -197,17 +193,27 @@ export function SmartHarvestModal({
                     Symbol
                   </label>
                   <input
+                    id="smart-harvest-symbol"
                     value={symbol}
-                    onChange={(event) => setSymbol(event.target.value.toUpperCase())}
+                    onChange={(event) =>
+                      setSymbol(event.target.value.toUpperCase())
+                    }
                     placeholder="XAUUSD"
                     style={inputStyle}
                   />
                 </div>
               </div>
 
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "12px" }}>
+              <div
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "1fr 1fr",
+                  gap: "12px",
+                }}
+              >
                 <div style={{ display: "grid", gap: "8px" }}>
                   <label
+                    htmlFor="smart-harvest-asset-class"
                     style={{
                       fontSize: "0.76rem",
                       letterSpacing: "0.08em",
@@ -218,8 +224,11 @@ export function SmartHarvestModal({
                     Asset Class
                   </label>
                   <input
+                    id="smart-harvest-asset-class"
                     value={assetClass}
-                    onChange={(event) => setAssetClass(event.target.value.toLowerCase())}
+                    onChange={(event) =>
+                      setAssetClass(event.target.value.toLowerCase())
+                    }
                     placeholder="metals / forex / indices ..."
                     style={inputStyle}
                   />
@@ -227,6 +236,7 @@ export function SmartHarvestModal({
 
                 <div style={{ display: "grid", gap: "8px" }}>
                   <label
+                    htmlFor="smart-harvest-start-date"
                     style={{
                       fontSize: "0.76rem",
                       letterSpacing: "0.08em",
@@ -237,6 +247,7 @@ export function SmartHarvestModal({
                     Start Date (optional)
                   </label>
                   <input
+                    id="smart-harvest-start-date"
                     type="date"
                     value={startDate}
                     onChange={(event) => setStartDate(event.target.value)}
@@ -246,7 +257,11 @@ export function SmartHarvestModal({
               </div>
             </div>
 
-            {error && <div style={{ color: "#fca5a5", fontSize: "0.82rem" }}>{error}</div>}
+            {error && (
+              <div style={{ color: "#fca5a5", fontSize: "0.82rem" }}>
+                {error}
+              </div>
+            )}
 
             <div
               style={{
@@ -256,8 +271,11 @@ export function SmartHarvestModal({
                 gap: "12px",
               }}
             >
-              <div style={{ fontSize: "0.8rem", color: "var(--color-text-muted)" }}>
-                Streams PID tuner logs live (batch size, delay, throughput, penalties).
+              <div
+                style={{ fontSize: "0.8rem", color: "var(--color-text-muted)" }}
+              >
+                Streams PID tuner logs live (batch size, delay, throughput,
+                penalties).
               </div>
               <div style={{ display: "flex", gap: "10px" }}>
                 <button
@@ -305,7 +323,9 @@ export function SmartHarvestModal({
                 gap: "12px",
               }}
             >
-              <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+              <div
+                style={{ display: "flex", alignItems: "center", gap: "10px" }}
+              >
                 {statusIcon}
                 <div>
                   <div
@@ -344,8 +364,11 @@ export function SmartHarvestModal({
                 gap: "12px",
               }}
             >
-              <div style={{ fontSize: "0.8rem", color: "var(--color-text-muted)" }}>
-                Keep this modal open to watch tuning cycles and final persistence status.
+              <div
+                style={{ fontSize: "0.8rem", color: "var(--color-text-muted)" }}
+              >
+                Keep this modal open to watch tuning cycles and final
+                persistence status.
               </div>
               <div style={{ display: "flex", gap: "10px" }}>
                 {(jobStatus === "completed" || jobStatus === "failed") && (

@@ -140,6 +140,7 @@ export function OptimizationsPage() {
           </div>
           <div style={{ minWidth: "240px", width: "min(100%, 320px)" }}>
             <label
+              htmlFor="optimizations-status-filter"
               style={{
                 display: "block",
                 marginBottom: "8px",
@@ -152,6 +153,7 @@ export function OptimizationsPage() {
               Search runs
             </label>
             <input
+              id="optimizations-status-filter"
               value={search}
               onChange={(event) => setSearch(event.target.value)}
               placeholder="base backtest, metric, parameter..."
@@ -169,11 +171,13 @@ export function OptimizationsPage() {
         </div>
       </section>
 
-      {loading ? (
+      {loading && (
         <div style={{ color: "var(--color-text-muted)", padding: "16px 4px" }}>Loading optimizations...</div>
-      ) : error ? (
+      )}
+      {!loading && error && (
         <div style={{ color: "#fecdd3", padding: "16px 4px" }}>Error: {error}</div>
-      ) : filtered.length === 0 ? (
+      )}
+      {!loading && !error && filtered.length === 0 && (
         <div
           style={{
             borderRadius: "22px",
@@ -186,7 +190,8 @@ export function OptimizationsPage() {
         >
           No optimization results found yet.
         </div>
-      ) : (
+      )}
+      {!loading && !error && filtered.length > 0 && (
         <div
           style={{
             display: "grid",

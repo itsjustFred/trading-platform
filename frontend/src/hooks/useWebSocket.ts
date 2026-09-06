@@ -117,8 +117,8 @@ export function useWebSocket<TMessage = unknown>(
         return;
       }
       if (
-        currentSocket.readyState === WebSocket.OPEN
-        || currentSocket.readyState === WebSocket.CONNECTING
+        currentSocket.readyState === WebSocket.OPEN ||
+        currentSocket.readyState === WebSocket.CONNECTING
       ) {
         currentSocket.close();
       }
@@ -151,14 +151,23 @@ export function useWebSocket<TMessage = unknown>(
       rawMessage: unknown,
       activeSocket: WebSocket,
     ): boolean => {
-      if (!rawMessage || typeof rawMessage !== "object" || !("type" in rawMessage)) {
+      if (
+        !rawMessage ||
+        typeof rawMessage !== "object" ||
+        !("type" in rawMessage)
+      ) {
         return false;
       }
-      const msgType = String((rawMessage as { type?: unknown }).type || "").toLowerCase();
+      const rawType = (rawMessage as { type?: unknown }).type;
+      const msgType = (
+        typeof rawType === "string" ? rawType : ""
+      ).toLowerCase();
       if (msgType === "ping") {
         lastActivityAt = Date.now();
         if (activeSocket.readyState === WebSocket.OPEN) {
-          activeSocket.send(JSON.stringify({ type: "pong", ts: Date.now() / 1000 }));
+          activeSocket.send(
+            JSON.stringify({ type: "pong", ts: Date.now() / 1000 }),
+          );
         }
         return true;
       }
@@ -175,14 +184,21 @@ export function useWebSocket<TMessage = unknown>(
         return;
       }
       heartbeatTimer = window.setInterval(() => {
-        if (disposed || socket == null || socket.readyState !== WebSocket.OPEN) {
+        // Ownership guard: this timer must only touch the socket this effect
+        // instance opened, never one from a later mount that reused the ref.
+        const current = socket;
+        if (
+          disposed ||
+          current?.readyState !== WebSocket.OPEN ||
+          socketRef.current !== current
+        ) {
           return;
         }
         if (Date.now() - lastActivityAt > heartbeatTimeoutMs) {
-          socket.close(4000, "heartbeat-timeout");
+          current.close(4000, "heartbeat-timeout");
           return;
         }
-        socket.send(JSON.stringify({ type: "ping", ts: Date.now() / 1000 }));
+        current.send(JSON.stringify({ type: "ping", ts: Date.now() / 1000 }));
       }, heartbeatIntervalMs);
     };
 
@@ -285,7 +301,7 @@ export function useWebSocket<TMessage = unknown>(
 
   const sendJson = useCallback((payload: unknown): boolean => {
     const socket = socketRef.current;
-    if (socket == null || socket.readyState !== WebSocket.OPEN) {
+    if (socket?.readyState !== WebSocket.OPEN) {
       return false;
     }
     socket.send(JSON.stringify(payload));

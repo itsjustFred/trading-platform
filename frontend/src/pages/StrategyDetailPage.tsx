@@ -4,7 +4,160 @@ import ReactMarkdown from "react-markdown";
 import { ArrowLeft, PencilLine, Plus, ScrollText } from "lucide-react";
 import { getStrategyDetail, renameStrategy } from "../api/client";
 import { CreateBacktestModal } from "../components/CreateBacktestModal";
+import { psrTone } from "../lib/statFormat";
 import { RenameModal } from "../components/RenameModal";
+
+interface MarkdownCodeProps {
+  inline?: boolean;
+  children?: React.ReactNode;
+}
+
+/** Shared react-markdown `code` renderer used by the notes/markdown panels. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function markdownCodeRenderer({ inline, children, ...props }: MarkdownCodeProps & Record<string, any>) {
+  return inline ? (
+    <code
+      style={{
+        background: "rgba(88,166,255,0.1)",
+        color: "#79c0ff",
+        borderRadius: "6px",
+        padding: "2px 6px",
+        fontSize: "0.8rem",
+      }}
+      {...props}
+    >
+      {children}
+    </code>
+  ) : (
+    <code
+      style={{
+        display: "block",
+        background: "#0d1117",
+        border: "1px solid var(--color-border)",
+        borderRadius: "10px",
+        padding: "12px",
+        overflowX: "auto",
+        color: "#c9d1d9",
+        fontSize: "0.82rem",
+      }}
+      {...props}
+    >
+      {children}
+    </code>
+  );
+}
+
+const compactMarkdownComponents = {
+  p: (props: React.ComponentProps<"p">) => (
+    <p
+      style={{
+        margin: "0 0 10px",
+        color: "var(--color-text-muted)",
+        lineHeight: 1.65,
+      }}
+      {...props}
+    />
+  ),
+  ul: (props: React.ComponentProps<"ul">) => (
+    <ul style={{ margin: "0 0 10px", paddingLeft: "18px" }} {...props} />
+  ),
+  li: (props: React.ComponentProps<"li">) => (
+    <li
+      style={{
+        color: "var(--color-text-muted)",
+        marginBottom: "4px",
+      }}
+      {...props}
+    />
+  ),
+  a: (props: React.ComponentProps<"a">) => (
+    <a target="_blank" rel="noreferrer" style={{ color: "#58a6ff" }} {...props} />
+  ),
+  code: markdownCodeRenderer,
+};
+
+const richMarkdownComponents = {
+  h1: (props: React.ComponentProps<"h1">) => (
+    <h2
+      style={{
+        fontSize: "1.35rem",
+        margin: "0 0 14px",
+        letterSpacing: "-0.02em",
+      }}
+      {...props}
+    />
+  ),
+  h2: (props: React.ComponentProps<"h2">) => (
+    <h3
+      style={{
+        fontSize: "1.05rem",
+        margin: "24px 0 10px",
+        color: "#c9d1d9",
+      }}
+      {...props}
+    />
+  ),
+  h3: (props: React.ComponentProps<"h3">) => (
+    <h4
+      style={{
+        fontSize: "0.92rem",
+        margin: "18px 0 8px",
+        color: "#c9d1d9",
+      }}
+      {...props}
+    />
+  ),
+  p: (props: React.ComponentProps<"p">) => (
+    <p
+      style={{
+        color: "var(--color-text-muted)",
+        lineHeight: 1.75,
+        margin: "0 0 14px",
+      }}
+      {...props}
+    />
+  ),
+  ul: (props: React.ComponentProps<"ul">) => (
+    <ul style={{ margin: "0 0 14px", paddingLeft: "18px" }} {...props} />
+  ),
+  ol: (props: React.ComponentProps<"ol">) => (
+    <ol style={{ margin: "0 0 14px", paddingLeft: "18px" }} {...props} />
+  ),
+  li: (props: React.ComponentProps<"li">) => (
+    <li
+      style={{
+        color: "var(--color-text-muted)",
+        lineHeight: 1.7,
+        marginBottom: "6px",
+      }}
+      {...props}
+    />
+  ),
+  a: (props: React.ComponentProps<"a">) => (
+    <a
+      target="_blank"
+      rel="noreferrer"
+      style={{ color: "#58a6ff" }}
+      {...props}
+    />
+  ),
+  code: markdownCodeRenderer,
+  pre: (props: React.ComponentProps<"pre">) => (
+    <pre style={{ margin: "0 0 14px", whiteSpace: "pre-wrap" }} {...props} />
+  ),
+  blockquote: (props: React.ComponentProps<"blockquote">) => (
+    <blockquote
+      style={{
+        margin: "0 0 14px",
+        padding: "12px 16px",
+        borderLeft: "3px solid #58a6ff",
+        background: "rgba(88,166,255,0.06)",
+        color: "#c9d1d9",
+      }}
+      {...props}
+    />
+  ),
+};
 
 export function StrategyDetailPage() {
   const { name } = useParams<{ name: string }>();
@@ -116,6 +269,7 @@ export function StrategyDetailPage() {
             }}
           >
             <button
+              type="button"
               onClick={() => navigate(-1)}
               style={{
                 background: "none",
@@ -260,6 +414,7 @@ export function StrategyDetailPage() {
           </div>
 
           <button
+            type="button"
             onClick={() => setShowCreateModal(true)}
             style={{
               display: "inline-flex",
@@ -337,66 +492,7 @@ export function StrategyDetailPage() {
             >
               Strategy Notes
             </div>
-            <ReactMarkdown
-              components={{
-                p: ({ ...props }) => (
-                  <p
-                    style={{
-                      margin: "0 0 10px",
-                      color: "var(--color-text-muted)",
-                      lineHeight: 1.65,
-                    }}
-                    {...props}
-                  />
-                ),
-                ul: ({ ...props }) => (
-                  <ul style={{ margin: "0 0 10px", paddingLeft: "18px" }} {...props} />
-                ),
-                li: ({ ...props }) => (
-                  <li
-                    style={{
-                      color: "var(--color-text-muted)",
-                      marginBottom: "4px",
-                    }}
-                    {...props}
-                  />
-                ),
-                a: ({ ...props }) => (
-                  <a target="_blank" rel="noreferrer" style={{ color: "#58a6ff" }} {...props} />
-                ),
-                code: ({ inline, children, ...props }: any) =>
-                  inline ? (
-                    <code
-                      style={{
-                        background: "rgba(88,166,255,0.1)",
-                        color: "#79c0ff",
-                        borderRadius: "6px",
-                        padding: "2px 6px",
-                        fontSize: "0.8rem",
-                      }}
-                      {...props}
-                    >
-                      {children}
-                    </code>
-                  ) : (
-                    <code
-                      style={{
-                        display: "block",
-                        background: "#0d1117",
-                        border: "1px solid var(--color-border)",
-                        borderRadius: "10px",
-                        padding: "12px",
-                        overflowX: "auto",
-                        color: "#c9d1d9",
-                        fontSize: "0.82rem",
-                      }}
-                      {...props}
-                    >
-                      {children}
-                    </code>
-                  ),
-              }}
-            >
+            <ReactMarkdown components={compactMarkdownComponents}>
               {renderedNotes}
             </ReactMarkdown>
           </div>
@@ -438,120 +534,7 @@ export function StrategyDetailPage() {
               border: "1px solid rgba(255,255,255,0.03)",
             }}
           >
-            <ReactMarkdown
-              components={{
-                h1: ({ ...props }) => (
-                  <h2
-                    style={{
-                      fontSize: "1.35rem",
-                      margin: "0 0 14px",
-                      letterSpacing: "-0.02em",
-                    }}
-                    {...props}
-                  />
-                ),
-                h2: ({ ...props }) => (
-                  <h3
-                    style={{
-                      fontSize: "1.05rem",
-                      margin: "24px 0 10px",
-                      color: "#c9d1d9",
-                    }}
-                    {...props}
-                  />
-                ),
-                h3: ({ ...props }) => (
-                  <h4
-                    style={{
-                      fontSize: "0.92rem",
-                      margin: "18px 0 8px",
-                      color: "#c9d1d9",
-                    }}
-                    {...props}
-                  />
-                ),
-                p: ({ ...props }) => (
-                  <p
-                    style={{
-                      color: "var(--color-text-muted)",
-                      lineHeight: 1.75,
-                      margin: "0 0 14px",
-                    }}
-                    {...props}
-                  />
-                ),
-                ul: ({ ...props }) => (
-                  <ul style={{ margin: "0 0 14px", paddingLeft: "18px" }} {...props} />
-                ),
-                ol: ({ ...props }) => (
-                  <ol style={{ margin: "0 0 14px", paddingLeft: "18px" }} {...props} />
-                ),
-                li: ({ ...props }) => (
-                  <li
-                    style={{
-                      color: "var(--color-text-muted)",
-                      lineHeight: 1.7,
-                      marginBottom: "6px",
-                    }}
-                    {...props}
-                  />
-                ),
-                a: ({ ...props }) => (
-                  <a
-                    target="_blank"
-                    rel="noreferrer"
-                    style={{ color: "#58a6ff" }}
-                    {...props}
-                  />
-                ),
-                code: ({ inline, children, ...props }: any) =>
-                  inline ? (
-                    <code
-                      style={{
-                        background: "rgba(88,166,255,0.1)",
-                        color: "#79c0ff",
-                        borderRadius: "6px",
-                        padding: "2px 6px",
-                        fontSize: "0.8rem",
-                      }}
-                      {...props}
-                    >
-                      {children}
-                    </code>
-                  ) : (
-                    <code
-                      style={{
-                        display: "block",
-                        background: "#0d1117",
-                        border: "1px solid var(--color-border)",
-                        borderRadius: "10px",
-                        padding: "14px",
-                        overflowX: "auto",
-                        color: "#c9d1d9",
-                        fontSize: "0.82rem",
-                      }}
-                      {...props}
-                    >
-                      {children}
-                    </code>
-                  ),
-                pre: ({ ...props }) => (
-                  <pre style={{ margin: "0 0 14px", whiteSpace: "pre-wrap" }} {...props} />
-                ),
-                blockquote: ({ ...props }) => (
-                  <blockquote
-                    style={{
-                      margin: "0 0 14px",
-                      padding: "12px 16px",
-                      borderLeft: "3px solid #58a6ff",
-                      background: "rgba(88,166,255,0.06)",
-                      color: "#c9d1d9",
-                    }}
-                    {...props}
-                  />
-                ),
-              }}
-            >
+            <ReactMarkdown components={richMarkdownComponents}>
               {renderedMarkdown}
             </ReactMarkdown>
           </div>
@@ -661,12 +644,7 @@ export function StrategyDetailPage() {
                         padding: "3px 8px",
                         fontSize: "0.7rem",
                         fontFamily: '"SFMono-Regular", "Cascadia Code", ui-monospace, monospace',
-                        color:
-                          Number(backtest.psr) >= 0.95
-                            ? "#3fb950"
-                            : Number(backtest.psr) >= 0.5
-                              ? "#d29922"
-                              : "#f85149",
+                        color: psrTone(Number(backtest.psr)),
                       }}
                     >
                       PSR {(Number(backtest.psr) * 100).toFixed(0)}%

@@ -43,10 +43,32 @@ function formatTradeMetaValue(value: unknown): string {
   if (Array.isArray(value)) {
     return value.map(formatTradeMetaValue).join(", ");
   }
-  if (typeof value === "object") {
-    return JSON.stringify(value);
+  if (typeof value === "string") {
+    return value;
   }
-  return String(value);
+  if (value == null || typeof value === "number") {
+    return String(value);
+  }
+  return JSON.stringify(value);
+}
+
+/** Renders "P&L $x (y%)" without nested template literals. */
+/** Sign/label-aware color for the trade summary rows. */
+function summaryRowColor(label: string, trade: Trade): string {
+  if (label === "Direction") {
+    return trade.direction === "LONG" ? "#3fb950" : "#f85149";
+  }
+  if (label === "P&L") {
+    return trade.pnl >= 0 ? "#3fb950" : "#f85149";
+  }
+  return "var(--color-text)";
+}
+
+function formatTradePnlSummary(trade: Trade): string {
+  const amount =
+    trade.pnl?.toLocaleString("en-US", { maximumFractionDigits: 2 }) ?? "—";
+  const percent = trade.pnl_pct != null ? `${trade.pnl_pct.toFixed(2)}%` : "—";
+  return `$${amount} (${percent})`;
 }
 
 function toFiniteNumber(value: unknown): number | null {
@@ -94,7 +116,9 @@ function buildRiskMathNarrative(riskMath: TradeRiskMath): string {
     parts.push(`Target Risk: ${formatUsd(targetRisk)}`);
   }
   if (size !== null) {
-    parts.push(`Size: ${size.toLocaleString("en-US", { maximumFractionDigits: 4 })} units`);
+    parts.push(
+      `Size: ${size.toLocaleString("en-US", { maximumFractionDigits: 4 })} units`,
+    );
   }
   if (entry !== null && stop !== null) {
     parts.push(`Entry/SL: ${formatPrice(entry)} → ${formatPrice(stop)}`);
@@ -154,7 +178,9 @@ function sanitizeOHLCVBars(bars: OHLCVBar[]): OHLCVBar[] {
       volume: Number.isFinite(volume) ? volume : 0,
     });
   });
-  return Array.from(barsByTime.values()).sort((left, right) => left.time - right.time);
+  return Array.from(barsByTime.values()).sort(
+    (left, right) => left.time - right.time,
+  );
 }
 
 function sanitizeIndicatorPoints(
@@ -180,7 +206,9 @@ function sanitizeIndicatorPoints(
     }
     pointsByTime.set(time, { time, value });
   });
-  return Array.from(pointsByTime.values()).sort((left, right) => left.time - right.time);
+  return Array.from(pointsByTime.values()).sort(
+    (left, right) => left.time - right.time,
+  );
 }
 
 function isMissingOHLCVDetail(value: unknown): value is MissingOHLCVDetail {
@@ -228,6 +256,149 @@ function indicatorIsPanel(indicator: IndicatorSeriesView): boolean {
   );
 }
 
+interface MissingOhlcvPanelProps {
+  missing: BacktestReplayResponse["missing_ohlcv"][string];
+  downloadStatus: string;
+  downloadTaskId: string | null;
+  downloadError: string;
+  onDownload: () => void;
+  onReload: () => void;
+}
+
+function MissingOhlcvPanel({
+  missing,
+  downloadStatus,
+  downloadTaskId,
+  downloadError,
+  onDownload,
+  onReload,
+}: Readonly<MissingOhlcvPanelProps>) {
+  const alternatives = missing.alternative_sources?.length
+    ? ` (alternatives: ${missing.alternative_sources.join(", ")})`
+    : "";
+  return (
+    <div
+      data-testid="missing-ohlcv"
+      style={{
+        minHeight: "460px",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: "24px",
+      }}
+    >
+      <div
+        style={{
+          width: "min(700px, 100%)",
+          border: "1px solid var(--color-border)",
+          borderRadius: "10px",
+          background: "var(--color-surface2)",
+          padding: "20px",
+        }}
+      >
+        <div style={{ fontSize: "1rem", fontWeight: 700, marginBottom: "8px" }}>
+          Missing OHLCV data for {missing.symbol} {missing.timeframe}
+        </div>
+        <div style={{ color: "var(--color-text-muted)", fontSize: "0.9rem" }}>
+          Source suggestion: <strong>{missing.suggested_source}</strong>
+          {alternatives}
+        </div>
+
+        <div
+          style={{
+            display: "flex",
+            gap: "10px",
+            marginTop: "16px",
+            flexWrap: "wrap",
+          }}
+        >
+          <button
+            type="button"
+            data-testid="missing-data-download-btn"
+            onClick={onDownload}
+            disabled={
+              downloadStatus === "starting" || downloadStatus === "running"
+            }
+            style={{
+              border: "1px solid #3fb950",
+              borderRadius: "8px",
+              background: "rgba(63, 185, 80, 0.12)",
+              color: "#3fb950",
+              padding: "8px 12px",
+              cursor: "pointer",
+              fontWeight: 600,
+            }}
+          >
+            {sourceButtonLabel(missing.suggested_source)}
+          </button>
+
+          <button
+            type="button"
+            onClick={onReload}
+            data-testid="missing-data-reload-btn"
+            style={{
+              border: "1px solid var(--color-border)",
+              borderRadius: "8px",
+              background: "var(--color-surface)",
+              color: "var(--color-text)",
+              padding: "8px 12px",
+              cursor: "pointer",
+            }}
+          >
+            Reload replay
+          </button>
+        </div>
+
+        <div
+          style={{
+            marginTop: "12px",
+            fontSize: "0.82rem",
+            color: "var(--color-text-muted)",
+          }}
+        >
+          {downloadTaskId
+            ? `Download task ${downloadTaskId} status: ${downloadStatus}`
+            : "No automatic download is started. Use the button above to trigger a download."}
+        </div>
+        {downloadError ? (
+          <div
+            style={{ marginTop: "8px", color: "#f85149", fontSize: "0.82rem" }}
+          >
+            {downloadError}
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+/** Result of resolving a requested trade number against loaded trades. */
+type ResolvedTradeNr = { nr: number; changed: boolean };
+
+/** Clamp a requested trade number to one that exists in the replay payload. */
+function resolveRequestedTradeNr(
+  trades: Trade[],
+  requestedNr: number | undefined,
+  fallback: number,
+): ResolvedTradeNr {
+  const requested = Number.isFinite(requestedNr)
+    ? Number(requestedNr)
+    : fallback;
+  const tradeNumbers = trades.map((trade) => trade.nr);
+  const resolvedNr = tradeNumbers.includes(requested)
+    ? requested
+    : (tradeNumbers[0] ?? 1);
+  return { nr: resolvedNr, changed: resolvedNr !== requested };
+}
+
+/** Error text for a failed replay load, with the missing-OHLCV detail. */
+function describeReplayLoadError(err: unknown): string {
+  if (err instanceof ApiError && isMissingOHLCVDetail(err.detail)) {
+    return err.detail.message;
+  }
+  return err instanceof Error ? err.message : "Could not load replay data";
+}
+
 export function TradeChartPage() {
   const { id, nr } = useParams<{ id: string; nr: string }>();
   const navigate = useNavigate();
@@ -235,7 +406,7 @@ export function TradeChartPage() {
   const [info, setInfo] = useState<BacktestInfo | null>(null);
   const [replay, setReplay] = useState<BacktestReplayResponse | null>(null);
   const [trades, setTrades] = useState<Trade[]>([]);
-  const [currentNr, setCurrentNr] = useState(parseInt(nr || "1", 10));
+  const [currentNr, setCurrentNr] = useState(Number.parseInt(nr || "1", 10));
   const [isLoading, setIsLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
   const [isPlaying, setIsPlaying] = useState(false);
@@ -262,15 +433,13 @@ export function TradeChartPage() {
         setReplay(replayPayload);
         setTrades(replayPayload.trades || []);
         setInfo(infoPayload);
-
-        const requested = Number.isFinite(requestedNr)
-          ? Number(requestedNr)
-          : currentNrRef.current;
-        const tradeNumbers = (replayPayload.trades || []).map((trade) => trade.nr);
-        const fallbackNr = tradeNumbers[0] ?? 1;
-        const resolvedNr = tradeNumbers.includes(requested) ? requested : fallbackNr;
+        const { nr: resolvedNr } = resolveRequestedTradeNr(
+          replayPayload.trades || [],
+          requestedNr,
+          currentNrRef.current,
+        );
         setCurrentNr(resolvedNr);
-        if (resolvedNr !== requested) {
+        if (resolvedNr !== requestedNr) {
           window.history.replaceState(
             window.history.state,
             "",
@@ -278,11 +447,7 @@ export function TradeChartPage() {
           );
         }
       } catch (err: unknown) {
-        if (err instanceof ApiError && isMissingOHLCVDetail(err.detail)) {
-          setLoadError(err.detail.message);
-        } else {
-          setLoadError(err instanceof Error ? err.message : "Could not load replay data");
-        }
+        setLoadError(describeReplayLoadError(err));
         setReplay(null);
         setTrades([]);
       } finally {
@@ -293,13 +458,13 @@ export function TradeChartPage() {
   );
 
   useEffect(() => {
-    const parsed = parseInt(nr || "1", 10);
+    const parsed = Number.parseInt(nr || "1", 10);
     shouldAutoFocusTradeRef.current = true;
     loadReplay(Number.isNaN(parsed) ? undefined : parsed);
   }, [id, nr, loadReplay]);
 
   useEffect(() => {
-    const parsed = parseInt(nr || "1", 10);
+    const parsed = Number.parseInt(nr || "1", 10);
     if (!Number.isNaN(parsed)) {
       if (parsed !== currentNrRef.current) {
         shouldAutoFocusTradeRef.current = true;
@@ -317,7 +482,8 @@ export function TradeChartPage() {
       setIsFullscreen(document.fullscreenElement === viewportRef.current);
     };
     document.addEventListener("fullscreenchange", onFullscreenChange);
-    return () => document.removeEventListener("fullscreenchange", onFullscreenChange);
+    return () =>
+      document.removeEventListener("fullscreenchange", onFullscreenChange);
   }, []);
 
   const tradeNumbers = useMemo(
@@ -342,7 +508,10 @@ export function TradeChartPage() {
     [replay, currentSymbol],
   );
 
-  const symbolOHLCV = useMemo(() => sanitizeOHLCVBars(rawSymbolOHLCV), [rawSymbolOHLCV]);
+  const symbolOHLCV = useMemo(
+    () => sanitizeOHLCVBars(rawSymbolOHLCV),
+    [rawSymbolOHLCV],
+  );
   const symbolTimeSet = useMemo(
     () => new Set(symbolOHLCV.map((bar) => bar.time)),
     [symbolOHLCV],
@@ -367,7 +536,10 @@ export function TradeChartPage() {
     () =>
       sanitizedIndicators.map((indicator) => ({
         name: indicator.name,
-        data: indicator.data.map((point) => ({ time: point.time, value: point.value })),
+        data: indicator.data.map((point) => ({
+          time: point.time,
+          value: point.value,
+        })),
         color: indicator.style?.color || indicator.color,
         panel: indicatorIsPanel(indicator) ? "separate" : "main",
       })),
@@ -384,7 +556,10 @@ export function TradeChartPage() {
       symbolOHLCV.map((bar) => ({
         time: bar.time,
         value: bar.volume || 0,
-        color: bar.close >= bar.open ? "rgba(63,185,80,0.22)" : "rgba(248,81,73,0.22)",
+        color:
+          bar.close >= bar.open
+            ? "rgba(63,185,80,0.22)"
+            : "rgba(248,81,73,0.22)",
       })),
     [symbolOHLCV],
   );
@@ -581,7 +756,9 @@ export function TradeChartPage() {
         .catch((err: unknown) => {
           setDownloadStatus("failed");
           setDownloadError(
-            err instanceof Error ? err.message : "Could not read download task status",
+            err instanceof Error
+              ? err.message
+              : "Could not read download task status",
           );
         });
     }, 1500);
@@ -601,7 +778,8 @@ export function TradeChartPage() {
       return;
     }
     const request = missingData.download_request;
-    const source = request?.source || missingData.suggested_source || "dukascopy";
+    const source =
+      request?.source || missingData.suggested_source || "dukascopy";
     const symbols = request?.symbols || missingData.symbol;
     const timeframes = request?.timeframes || missingData.timeframe;
     const start = request?.start || info?.timeframe?.start || "";
@@ -621,9 +799,55 @@ export function TradeChartPage() {
       setDownloadStatus(started.status || "running");
     } catch (err) {
       setDownloadStatus("failed");
-      setDownloadError(err instanceof Error ? err.message : "Could not start download");
+      setDownloadError(
+        err instanceof Error ? err.message : "Could not start download",
+      );
     }
   };
+
+  let chartBody: React.ReactElement;
+  if (symbolOHLCV.length > 0) {
+    chartBody = (
+      <TradingViewChart
+        ohlcData={symbolOHLCV}
+        volumeData={chartVolumeData}
+        trades={chartTrades}
+        indicators={chartIndicators}
+        height={chartHeight}
+        dataTestId="trade-chart-canvas"
+        activeTradeId={currentTrade?.nr ?? null}
+        focusTradeTime={chartFocusTime}
+        showToolbar
+        isFullscreen={isFullscreen}
+        onToggleFullscreen={toggleFullscreen}
+      />
+    );
+  } else if (missingData) {
+    chartBody = (
+      <MissingOhlcvPanel
+        missing={missingData}
+        downloadStatus={downloadStatus}
+        downloadTaskId={downloadTaskId}
+        downloadError={downloadError}
+        onDownload={triggerMissingDataDownload}
+        onReload={() => loadReplay(currentNrRef.current)}
+      />
+    );
+  } else {
+    chartBody = (
+      <div
+        style={{
+          minHeight: "460px",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          color: "var(--color-text-muted)",
+        }}
+      >
+        No OHLCV data available for this symbol
+      </div>
+    );
+  }
 
   if (isLoading) {
     return (
@@ -666,6 +890,7 @@ export function TradeChartPage() {
         }}
       >
         <button
+          type="button"
           onClick={() => navigate(`/backtests/${id}`)}
           style={{
             display: "inline-flex",
@@ -683,11 +908,12 @@ export function TradeChartPage() {
         </button>
 
         <div style={{ fontSize: "0.82rem", color: "var(--color-text-muted)" }}>
-          Trade {currentNr} / {tradeNumbers.length} • {currentSymbol || "—"} • {" "}
+          Trade {currentNr} / {tradeNumbers.length} • {currentSymbol || "—"} •{" "}
           {replay?.timeframe || "—"}
         </div>
 
         <button
+          type="button"
           onClick={toggleFullscreen}
           style={{
             display: "inline-flex",
@@ -740,7 +966,7 @@ export function TradeChartPage() {
                 },
                 {
                   label: "P&L",
-                  value: `$${currentTrade.pnl?.toLocaleString("en-US", { maximumFractionDigits: 2 })} (${currentTrade.pnl_pct != null ? `${currentTrade.pnl_pct.toFixed(2)}%` : "—"})`,
+                  value: formatTradePnlSummary(currentTrade),
                 },
               ].map((row) => (
                 <div
@@ -766,16 +992,7 @@ export function TradeChartPage() {
                   <div
                     style={{
                       fontWeight: 700,
-                      color:
-                        row.label === "Direction"
-                          ? currentTrade.direction === "LONG"
-                            ? "#3fb950"
-                            : "#f85149"
-                          : row.label === "P&L"
-                            ? currentTrade.pnl >= 0
-                              ? "#3fb950"
-                              : "#f85149"
-                            : "var(--color-text)",
+                      color: summaryRowColor(row.label, currentTrade),
                     }}
                   >
                     {row.value}
@@ -832,11 +1049,23 @@ export function TradeChartPage() {
                     Risk Math
                   </div>
                   {riskMathNarrative ? (
-                    <div style={{ fontSize: "0.82rem", fontWeight: 600, marginBottom: "8px" }}>
+                    <div
+                      style={{
+                        fontSize: "0.82rem",
+                        fontWeight: 600,
+                        marginBottom: "8px",
+                      }}
+                    >
                       {riskMathNarrative}
                     </div>
                   ) : null}
-                  <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+                  <div
+                    style={{
+                      display: "flex",
+                      flexDirection: "column",
+                      gap: "6px",
+                    }}
+                  >
                     {riskMathEntries.map(([key, value]) => (
                       <div
                         key={key}
@@ -874,7 +1103,13 @@ export function TradeChartPage() {
               ) : null}
 
               {tradeContextEntries.length > 0 ? (
-                <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+                <div
+                  style={{
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: "8px",
+                  }}
+                >
                   {tradeContextEntries.map(([key, value]) => (
                     <div
                       key={key}
@@ -923,109 +1158,8 @@ export function TradeChartPage() {
           overflow: "hidden",
         }}
       >
-        {symbolOHLCV.length ? (
-          <TradingViewChart
-            ohlcData={symbolOHLCV}
-            volumeData={chartVolumeData}
-            trades={chartTrades}
-            indicators={chartIndicators}
-            height={chartHeight}
-            dataTestId="trade-chart-canvas"
-            activeTradeId={currentTrade?.nr ?? null}
-            focusTradeTime={chartFocusTime}
-            showToolbar
-            isFullscreen={isFullscreen}
-            onToggleFullscreen={toggleFullscreen}
-          />
-        ) : missingData ? (
-          <div
-            data-testid="missing-ohlcv"
-            style={{
-              minHeight: "460px",
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              padding: "24px",
-            }}
-          >
-            <div
-              style={{
-                width: "min(700px, 100%)",
-                border: "1px solid var(--color-border)",
-                borderRadius: "10px",
-                background: "var(--color-surface2)",
-                padding: "20px",
-              }}
-            >
-              <div style={{ fontSize: "1rem", fontWeight: 700, marginBottom: "8px" }}>
-                Missing OHLCV data for {missingData.symbol} {missingData.timeframe}
-              </div>
-              <div style={{ color: "var(--color-text-muted)", fontSize: "0.9rem" }}>
-                Source suggestion: <strong>{missingData.suggested_source}</strong>
-                {missingData.alternative_sources?.length
-                  ? ` (alternatives: ${missingData.alternative_sources.join(", ")})`
-                  : ""}
-              </div>
+        {chartBody}
 
-              <div style={{ display: "flex", gap: "10px", marginTop: "16px", flexWrap: "wrap" }}>
-                <button
-                  data-testid="missing-data-download-btn"
-                  onClick={triggerMissingDataDownload}
-                  disabled={downloadStatus === "starting" || downloadStatus === "running"}
-                  style={{
-                    border: "1px solid #3fb950",
-                    borderRadius: "8px",
-                    background: "rgba(63, 185, 80, 0.12)",
-                    color: "#3fb950",
-                    padding: "8px 12px",
-                    cursor: "pointer",
-                    fontWeight: 600,
-                  }}
-                >
-                  {sourceButtonLabel(missingData.suggested_source)}
-                </button>
-
-                <button
-                  onClick={() => loadReplay(currentNrRef.current)}
-                  data-testid="missing-data-reload-btn"
-                  style={{
-                    border: "1px solid var(--color-border)",
-                    borderRadius: "8px",
-                    background: "var(--color-surface)",
-                    color: "var(--color-text)",
-                    padding: "8px 12px",
-                    cursor: "pointer",
-                  }}
-                >
-                  Reload replay
-                </button>
-              </div>
-
-              <div style={{ marginTop: "12px", fontSize: "0.82rem", color: "var(--color-text-muted)" }}>
-                {downloadTaskId
-                  ? `Download task ${downloadTaskId} status: ${downloadStatus}`
-                  : "No automatic download is started. Use the button above to trigger a download."}
-              </div>
-              {downloadError ? (
-                <div style={{ marginTop: "8px", color: "#f85149", fontSize: "0.82rem" }}>
-                  {downloadError}
-                </div>
-              ) : null}
-            </div>
-          </div>
-        ) : (
-          <div
-            style={{
-              minHeight: "460px",
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              color: "var(--color-text-muted)",
-            }}
-          >
-            No OHLCV data available for this symbol
-          </div>
-        )}
       </div>
 
       {tradeNumbers.length ? (
@@ -1046,6 +1180,7 @@ export function TradeChartPage() {
           }}
         >
           <button
+            type="button"
             onClick={goToPreviousTrade}
             disabled={tradeNumbers.indexOf(currentNr) <= 0}
             style={{
@@ -1066,6 +1201,7 @@ export function TradeChartPage() {
           </button>
 
           <button
+            type="button"
             onClick={() => setIsPlaying((value) => !value)}
             style={{
               display: "inline-flex",
@@ -1081,13 +1217,16 @@ export function TradeChartPage() {
               fontWeight: 700,
             }}
           >
-            {isPlaying ? <Pause size={14} /> : <Play size={14} />}
-            [{isPlaying ? "Pause" : "Play"}]
+            {isPlaying ? <Pause size={14} /> : <Play size={14} />}[
+            {isPlaying ? "Pause" : "Play"}]
           </button>
 
           <button
+            type="button"
             onClick={goToNextTrade}
-            disabled={tradeNumbers.indexOf(currentNr) >= tradeNumbers.length - 1}
+            disabled={
+              tradeNumbers.indexOf(currentNr) >= tradeNumbers.length - 1
+            }
             style={{
               display: "inline-flex",
               alignItems: "center",

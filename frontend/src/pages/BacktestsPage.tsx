@@ -14,7 +14,12 @@ import {
   getBacktestsAll,
   removeEmptyBacktests,
 } from "../api/client";
-import type { BacktestMatrixSummary, BacktestMetadataItem, BacktestsDuplicatesResponse } from "../api/types";
+import type {
+  BacktestMatrixStrategyOverview,
+  BacktestMatrixSummary,
+  BacktestMetadataItem,
+  BacktestsDuplicatesResponse,
+} from "../api/types";
 import { BacktestFromSignalsModal } from "../components/BacktestFromSignalsModal";
 import { CreateBacktestModal } from "../components/CreateBacktestModal";
 import { DualRangeSlider } from "../components/DualRangeSlider";
@@ -63,7 +68,8 @@ interface BacktestCardModel extends BacktestMetadataItem {
 }
 
 const DEFAULT_PER_PAGE = 24;
-const NUMERIC_FONT = '"SFMono-Regular", "Cascadia Code", "Roboto Mono", ui-monospace, monospace';
+const NUMERIC_FONT =
+  '"SFMono-Regular", "Cascadia Code", "Roboto Mono", ui-monospace, monospace';
 
 const BACKTEST_SORT_OPTIONS: Array<{ value: SortField; label: string }> = [
   { value: "created_at", label: "Created Date" },
@@ -142,26 +148,30 @@ function formatPValue(value: number | null | undefined): string {
 }
 
 function statColorPositive(value: number | null | undefined): string {
-  if (value == null || !Number.isFinite(value)) return "var(--color-text-muted)";
+  if (value == null || !Number.isFinite(value))
+    return "var(--color-text-muted)";
   return value >= 0 ? "#3fb950" : "#f87171";
 }
 
 function sharpeColor(value: number | null | undefined): string {
-  if (value == null || !Number.isFinite(value)) return "var(--color-text-muted)";
+  if (value == null || !Number.isFinite(value))
+    return "var(--color-text-muted)";
   if (value >= 1) return "#3fb950";
   if (value >= 0) return "#fbbf24";
   return "#f87171";
 }
 
 function psrColor(value: number | null | undefined): string {
-  if (value == null || !Number.isFinite(value)) return "var(--color-text-muted)";
+  if (value == null || !Number.isFinite(value))
+    return "var(--color-text-muted)";
   if (value >= 0.95) return "#3fb950";
   if (value >= 0.5) return "#fbbf24";
   return "#f87171";
 }
 
 function pValueColor(value: number | null | undefined): string {
-  if (value == null || !Number.isFinite(value)) return "var(--color-text-muted)";
+  if (value == null || !Number.isFinite(value))
+    return "var(--color-text-muted)";
   return value <= 0.05 ? "#3fb950" : "#f87171";
 }
 
@@ -175,10 +185,22 @@ function formatPeriodDate(value: string | null | undefined): string {
   return parsed.toLocaleDateString("de-DE");
 }
 
-function buildPageNumbers(currentPage: number, totalPages: number): Array<number | "..."> {
-  if (totalPages <= 7) return Array.from({ length: totalPages }, (_, index) => index + 1);
-  const values = new Set<number>([1, totalPages, currentPage - 1, currentPage, currentPage + 1]);
-  const pages = [...values].filter((entry) => entry >= 1 && entry <= totalPages).sort((a, b) => a - b);
+function buildPageNumbers(
+  currentPage: number,
+  totalPages: number,
+): Array<number | "..."> {
+  if (totalPages <= 7)
+    return Array.from({ length: totalPages }, (_, index) => index + 1);
+  const values = new Set<number>([
+    1,
+    totalPages,
+    currentPage - 1,
+    currentPage,
+    currentPage + 1,
+  ]);
+  const pages = [...values]
+    .filter((entry) => entry >= 1 && entry <= totalPages)
+    .sort((a, b) => a - b);
   const output: Array<number | "..."> = [];
   pages.forEach((value, index) => {
     const previous = pages[index - 1];
@@ -195,17 +217,21 @@ function cloneRows(rows: BacktestCardModel[]): BacktestCardModel[] {
     ...row,
     symbols: Array.isArray(row.symbols) ? [...row.symbols] : [],
     tags: Array.isArray(row.tags) ? [...row.tags] : [],
-    equity_preview: Array.isArray(row.equity_preview) ? [...row.equity_preview] : [],
+    equity_preview: Array.isArray(row.equity_preview)
+      ? [...row.equity_preview]
+      : [],
   }));
 }
 
-function normalizeBacktestRow(row: BacktestMetadataItem & { equity_preview?: number[] }): BacktestCardModel {
+function normalizeBacktestRow(
+  row: BacktestMetadataItem & { equity_preview?: number[] },
+): BacktestCardModel {
   return {
     ...row,
     symbols: Array.isArray(row.symbols) ? row.symbols : [],
     tags: Array.isArray(row.tags) ? row.tags : [],
     equity_preview: Array.isArray(row.equity_preview)
-      ? row.equity_preview.filter((value) => Number.isFinite(value)).map((value) => Number(value))
+      ? row.equity_preview.filter((value) => Number.isFinite(value)).map(Number)
       : [],
   };
 }
@@ -221,15 +247,33 @@ function toBounds(values: number[], fallback: NumericRange): NumericRange {
 
 function buildNumericBounds(items: BacktestCardModel[]): NumericBoundsState {
   return {
-    totalReturn: toBounds(items.map((item) => metricValue(item.total_return) * 100), { min: -50, max: 50 }),
-    sharpe: toBounds(items.map((item) => metricValue(item.sharpe_ratio)), { min: -2, max: 3 }),
-    psr: toBounds(items.map((item) => metricValue(item.psr)), { min: 0, max: 1 }),
-    pValue: toBounds(items.map((item) => metricValue(item.p_value, 1)), { min: 0, max: 1 }),
-    cagr: toBounds(items.map((item) => metricValue(item.cagr) * 100), { min: -20, max: 40 }),
-    maxDrawdown: toBounds(items.map((item) => Math.abs(metricValue(item.max_drawdown)) * 100), {
-      min: 0,
-      max: 60,
-    }),
+    totalReturn: toBounds(
+      items.map((item) => metricValue(item.total_return) * 100),
+      { min: -50, max: 50 },
+    ),
+    sharpe: toBounds(
+      items.map((item) => metricValue(item.sharpe_ratio)),
+      { min: -2, max: 3 },
+    ),
+    psr: toBounds(
+      items.map((item) => metricValue(item.psr)),
+      { min: 0, max: 1 },
+    ),
+    pValue: toBounds(
+      items.map((item) => metricValue(item.p_value, 1)),
+      { min: 0, max: 1 },
+    ),
+    cagr: toBounds(
+      items.map((item) => metricValue(item.cagr) * 100),
+      { min: -20, max: 40 },
+    ),
+    maxDrawdown: toBounds(
+      items.map((item) => Math.abs(metricValue(item.max_drawdown)) * 100),
+      {
+        min: 0,
+        max: 60,
+      },
+    ),
     winRate: toBounds(
       items.map((item) => {
         const normalized = normalizeWinRate(item.win_rate);
@@ -264,29 +308,39 @@ function boundsToFilters(bounds: NumericBoundsState): NumericFiltersState {
   });
 }
 
-async function loadBacktestsAllCached(name = "", force = false): Promise<BacktestCardModel[]> {
+async function loadBacktestsAllCached(
+  name = "",
+  force = false,
+): Promise<BacktestCardModel[]> {
   const normalizedName = name.trim();
   if (normalizedName) {
     const rows = await getBacktestsAll(normalizedName);
-    return (rows ?? []).map((row) => normalizeBacktestRow(row as BacktestMetadataItem & { equity_preview?: number[] }));
+    return (rows ?? []).map((row) =>
+      normalizeBacktestRow(
+        row as BacktestMetadataItem & { equity_preview?: number[] },
+      ),
+    );
   }
   if (force) {
     backtestsAllCache = null;
-    backtestsAllPromise = null;
   }
+  // Ordering matters: this warm-cache check must stay ABOVE the
+  // `backtestsAllPromise ??=` below, or a force refresh would start a fetch
+  // and immediately return the stale cached rows instead of them.
   if (backtestsAllCache) return cloneRows(backtestsAllCache);
-
-  if (!backtestsAllPromise) {
-    backtestsAllPromise = getBacktestsAll()
-      .then((rows) => {
-        const normalized = (rows ?? []).map((row) => normalizeBacktestRow(row as BacktestMetadataItem & { equity_preview?: number[] }));
-        backtestsAllCache = cloneRows(normalized);
-        return cloneRows(backtestsAllCache);
-      })
-      .finally(() => {
-        backtestsAllPromise = null;
-      });
-  }
+  backtestsAllPromise ??= getBacktestsAll()
+    .then((rows) => {
+      const normalized = (rows ?? []).map((row) =>
+        normalizeBacktestRow(
+          row as BacktestMetadataItem & { equity_preview?: number[] },
+        ),
+      );
+      backtestsAllCache = cloneRows(normalized);
+      return cloneRows(backtestsAllCache);
+    })
+    .finally(() => {
+      backtestsAllPromise = null;
+    });
   return backtestsAllPromise;
 }
 
@@ -344,10 +398,15 @@ function BacktestMatrixPanel() {
           <div>
             <h2 style={MATRIX_TITLE_STYLE}>Backtest Matrix</h2>
             <p style={MATRIX_SUBTITLE_STYLE}>
-              Run <code>python -m runner.cli matrix</code> to generate strategy × symbol × timeframe results.
+              Run <code>python -m runner.cli matrix</code> to generate strategy
+              × symbol × timeframe results.
             </p>
           </div>
-          <button style={MATRIX_BUTTON_STYLE} onClick={() => void loadMatrix()}>
+          <button
+            type="button"
+            style={MATRIX_BUTTON_STYLE}
+            onClick={() => void loadMatrix()}
+          >
             Refresh
           </button>
         </div>
@@ -366,29 +425,40 @@ function BacktestMatrixPanel() {
         <div>
           <h2 style={MATRIX_TITLE_STYLE}>Backtest Matrix</h2>
           <p style={MATRIX_SUBTITLE_STYLE}>
-            Latest run: {summary.completed_at ? new Date(summary.completed_at).toLocaleString("de-DE") : "n/a"} ·{" "}
-            {summary.symbols.length} symbols × {summary.timeframes.length} timeframes × {summary.strategies.length} strategies
+            Latest run:{" "}
+            {summary.completed_at
+              ? new Date(summary.completed_at).toLocaleString("de-DE")
+              : "n/a"}{" "}
+            · {summary.symbols.length} symbols × {summary.timeframes.length}{" "}
+            timeframes × {summary.strategies.length} strategies
           </p>
         </div>
         <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
-          <a style={MATRIX_BUTTON_STYLE} href={getBacktestMatrixMatrixCsvUrl()} download>
+          <a
+            style={MATRIX_BUTTON_STYLE}
+            href={getBacktestMatrixMatrixCsvUrl()}
+            download
+          >
             matrix CSV
           </a>
-          <a style={MATRIX_BUTTON_STYLE} href={getBacktestMatrixDailyEquityCsvUrl()} download>
+          <a
+            style={MATRIX_BUTTON_STYLE}
+            href={getBacktestMatrixDailyEquityCsvUrl()}
+            download
+          >
             daily equity CSV
           </a>
-          <button style={MATRIX_BUTTON_STYLE} onClick={() => void loadMatrix()}>
+          <button
+            type="button"
+            style={MATRIX_BUTTON_STYLE}
+            onClick={() => void loadMatrix()}
+          >
             Refresh
           </button>
         </div>
       </div>
 
-      <div style={MATRIX_METRIC_GRID_STYLE}>
-        <MatrixMetric label="Cells OK" value={`${summary.ok_cells}/${totalCells}`} tone="positive" />
-        <MatrixMetric label="OK Rate" value={okRate ? `${okRate.toFixed(1)}%` : "0%"} tone={okRate >= 80 ? "positive" : "warning"} />
-        <MatrixMetric label="Failed" value={String(summary.failed_cells)} tone={summary.failed_cells ? "danger" : "positive"} />
-        <MatrixMetric label="Daily equity rows" value={summary.daily_equity_rows.toLocaleString("de-DE")} tone="neutral" />
-      </div>
+      <MatrixMetricGrid summary={summary} totalCells={totalCells} okRate={okRate} />
 
       <div style={{ overflowX: "auto", marginTop: "16px" }}>
         <table style={MATRIX_TABLE_STYLE}>
@@ -407,32 +477,89 @@ function BacktestMatrixPanel() {
           </thead>
           <tbody>
             {overview.map((row) => (
-              <tr key={row.strategy}>
-                <Td>{row.strategy_name || row.strategy}</Td>
-                <Td align="right">{row.ok_cells}</Td>
-                <Td align="right" tone={row.failed_cells ? "danger" : "neutral"}>{row.failed_cells}</Td>
-                <Td align="right">{row.total_trades.toLocaleString("de-DE")}</Td>
-                <Td align="right" tone={metricValue(row.total_pnl) >= 0 ? "positive" : "danger"}>
-                  ${metricValue(row.total_pnl).toLocaleString("de-DE", { maximumFractionDigits: 0 })}
-                </Td>
-                <Td align="right" tone={metricValue(row.avg_sharpe) >= 0 ? "positive" : "danger"}>
-                  {formatNumber(row.avg_sharpe)}
-                </Td>
-                <Td align="right" tone={metricValue(row.best_sharpe) >= 0 ? "positive" : "danger"}>
-                  {formatNumber(row.best_sharpe)}
-                </Td>
-                <Td align="right" tone={metricValue(row.best_net_profit_pct) >= 0 ? "positive" : "danger"}>
-                  {percentage(row.best_net_profit_pct)}
-                </Td>
-                <Td>
-                  {row.best_symbol || row.best_timeframe ? `${row.best_symbol || ""} ${row.best_timeframe || ""}`.trim() : "—"}
-                </Td>
-              </tr>
+              <MatrixOverviewRow key={row.strategy} row={row} />
             ))}
           </tbody>
         </table>
       </div>
     </div>
+  );
+}
+
+/** Four headline metric cards for the matrix summary. */
+function MatrixMetricGrid({
+  summary,
+  totalCells,
+  okRate,
+}: Readonly<{
+  summary: BacktestMatrixSummary;
+  totalCells: number;
+  okRate: number;
+}>) {
+  return (
+    <div style={MATRIX_METRIC_GRID_STYLE}>
+      <MatrixMetric
+        label="Cells OK"
+        value={`${summary.ok_cells}/${totalCells}`}
+        tone="positive"
+      />
+      <MatrixMetric
+        label="OK Rate"
+        value={okRate ? `${okRate.toFixed(1)}%` : "0%"}
+        tone={okRate >= 80 ? "positive" : "warning"}
+      />
+      <MatrixMetric
+        label="Failed"
+        value={String(summary.failed_cells)}
+        tone={summary.failed_cells ? "danger" : "positive"}
+      />
+      <MatrixMetric
+        label="Daily equity rows"
+        value={summary.daily_equity_rows.toLocaleString("de-DE")}
+        tone="neutral"
+      />
+    </div>
+  );
+}
+
+/** Sign-aware tone for a numeric matrix metric. */
+function signTone(value: number): MatrixTone {
+  return value >= 0 ? "positive" : "danger";
+}
+
+/** One strategy summary row of the matrix table. */
+function MatrixOverviewRow({
+  row,
+}: Readonly<{ row: BacktestMatrixStrategyOverview }>) {
+  const bestCell =
+    row.best_symbol || row.best_timeframe
+      ? `${row.best_symbol || ""} ${row.best_timeframe || ""}`.trim()
+      : "—";
+  return (
+    <tr>
+      <Td>{row.strategy_name || row.strategy}</Td>
+      <Td align="right">{row.ok_cells}</Td>
+      <Td align="right" tone={row.failed_cells ? "danger" : "neutral"}>
+        {row.failed_cells}
+      </Td>
+      <Td align="right">{row.total_trades.toLocaleString("de-DE")}</Td>
+      <Td align="right" tone={signTone(metricValue(row.total_pnl))}>
+        $
+        {metricValue(row.total_pnl).toLocaleString("de-DE", {
+          maximumFractionDigits: 0,
+        })}
+      </Td>
+      <Td align="right" tone={signTone(metricValue(row.avg_sharpe))}>
+        {formatNumber(row.avg_sharpe)}
+      </Td>
+      <Td align="right" tone={signTone(metricValue(row.best_sharpe))}>
+        {formatNumber(row.best_sharpe)}
+      </Td>
+      <Td align="right" tone={signTone(metricValue(row.best_net_profit_pct))}>
+        {percentage(row.best_net_profit_pct)}
+      </Td>
+      <Td>{bestCell}</Td>
+    </tr>
   );
 }
 
@@ -486,23 +613,51 @@ const MATRIX_TABLE_STYLE: React.CSSProperties = {
   borderCollapse: "collapse",
   fontSize: "0.78rem",
 };
-function MatrixMetric(props: { label: string; value: string; tone?: "positive" | "warning" | "danger" | "neutral" }) {
-  const color =
-    props.tone === "positive"
-      ? "#3fb950"
-      : props.tone === "danger"
-        ? "#f85149"
-        : props.tone === "warning"
-          ? "#fbbf24"
-          : "var(--color-text)";
+type MatrixTone = string | undefined;
+
+/** Shared sign/tone color for matrix metric cells. */
+function toneColor(tone: MatrixTone): string {
+  if (tone === "positive") {
+    return "#3fb950";
+  }
+  if (tone === "danger") {
+    return "#f85149";
+  }
+  if (tone === "warning") {
+    return "#fbbf24";
+  }
+  return "var(--color-text)";
+}
+
+function MatrixMetric(
+  props: Readonly<{
+    label: string;
+    value: string;
+    tone?: "positive" | "warning" | "danger" | "neutral";
+  }>,
+) {
+  const color = toneColor(props.tone);
   return (
-    <div style={{ background: "var(--color-surface2)", border: "1px solid var(--color-border)", borderRadius: "10px", padding: "10px" }}>
-      <div style={{ color: "var(--color-text-muted)", fontSize: "0.72rem" }}>{props.label}</div>
-      <div style={{ color, fontWeight: 700, marginTop: "4px" }}>{props.value}</div>
+    <div
+      style={{
+        background: "var(--color-surface2)",
+        border: "1px solid var(--color-border)",
+        borderRadius: "10px",
+        padding: "10px",
+      }}
+    >
+      <div style={{ color: "var(--color-text-muted)", fontSize: "0.72rem" }}>
+        {props.label}
+      </div>
+      <div style={{ color, fontWeight: 700, marginTop: "4px" }}>
+        {props.value}
+      </div>
     </div>
   );
 }
-function Th(props: { children: React.ReactNode; align?: "left" | "right" }) {
+function Th(
+  props: Readonly<{ children: React.ReactNode; align?: "left" | "right" }>,
+) {
   return (
     <th
       style={{
@@ -516,8 +671,14 @@ function Th(props: { children: React.ReactNode; align?: "left" | "right" }) {
     </th>
   );
 }
-function Td(props: { children: React.ReactNode; align?: "left" | "right"; tone?: string }) {
-  const color = props.tone === "positive" ? "#3fb950" : props.tone === "danger" ? "#f85149" : "var(--color-text)";
+function Td(
+  props: Readonly<{
+    children: React.ReactNode;
+    align?: "left" | "right";
+    tone?: string;
+  }>,
+) {
+  const color = toneColor(props.tone);
   return (
     <td
       style={{
@@ -558,10 +719,11 @@ export function BacktestsPage() {
   const [numericBounds, setNumericBounds] = useState<NumericBoundsState>(() =>
     buildNumericBounds([]),
   );
-  const [numericFilters, setNumericFilters] = useState<NumericFiltersState>(() =>
-    boundsToFilters(buildNumericBounds([])),
+  const [numericFilters, setNumericFilters] = useState<NumericFiltersState>(
+    () => boundsToFilters(buildNumericBounds([])),
   );
-  const [duplicatesInfo, setDuplicatesInfo] = useState<BacktestsDuplicatesResponse | null>(null);
+  const [duplicatesInfo, setDuplicatesInfo] =
+    useState<BacktestsDuplicatesResponse | null>(null);
   const [showDuplicatesModal, setShowDuplicatesModal] = useState(false);
   const [loadingDuplicates, setLoadingDuplicates] = useState(false);
   const [runningDeduplicate, setRunningDeduplicate] = useState(false);
@@ -578,7 +740,10 @@ export function BacktestsPage() {
         setNumericFilters(boundsToFilters(bounds));
         setSelectedIds(new Set());
       } catch (error: unknown) {
-        showToast(toErrorMessage(error, "Failed to load backtests metadata."), "error");
+        showToast(
+          toErrorMessage(error, "Failed to load backtests metadata."),
+          "error",
+        );
       } finally {
         setLoading(false);
       }
@@ -599,39 +764,49 @@ export function BacktestsPage() {
 
   const allStrategies = useMemo(
     () =>
-      [...new Set(items.map((item) => item.strategy_name).filter(Boolean))].sort((a, b) =>
-        a.localeCompare(b),
-      ),
+      [
+        ...new Set(items.map((item) => item.strategy_name).filter(Boolean)),
+      ].sort((a, b) => a.localeCompare(b)),
     [items],
   );
 
   const allSymbols = useMemo(
     () =>
-      [...new Set(items.flatMap((item) => item.symbols ?? []).filter(Boolean))].sort((a, b) =>
-        a.localeCompare(b),
-      ),
+      [
+        ...new Set(items.flatMap((item) => item.symbols ?? []).filter(Boolean)),
+      ].sort((a, b) => a.localeCompare(b)),
     [items],
   );
 
   const allTimeframes = useMemo(
     () =>
-      [...new Set(items.map((item) => item.timeframe).filter(Boolean))].sort((a, b) =>
-        a.localeCompare(b),
+      [...new Set(items.map((item) => item.timeframe).filter(Boolean))].sort(
+        (a, b) => a.localeCompare(b),
       ),
     [items],
   );
 
   const filteredSorted = useMemo(() => {
     const result = items.filter((item) => {
-      if (selectedStrategies.length > 0 && !selectedStrategies.includes(item.strategy_name)) {
+      if (
+        selectedStrategies.length > 0 &&
+        !selectedStrategies.includes(item.strategy_name)
+      ) {
         return false;
       }
-      if (selectedTimeframes.length > 0 && !selectedTimeframes.includes(item.timeframe)) {
+      if (
+        selectedTimeframes.length > 0 &&
+        !selectedTimeframes.includes(item.timeframe)
+      ) {
         return false;
       }
       if (selectedSymbols.length > 0) {
-        const symbolSet = new Set((item.symbols ?? []).map((entry) => entry.toUpperCase()));
-        if (!selectedSymbols.every((entry) => symbolSet.has(entry.toUpperCase()))) {
+        const symbolSet = new Set(
+          (item.symbols ?? []).map((entry) => entry.toUpperCase()),
+        );
+        if (
+          !selectedSymbols.every((entry) => symbolSet.has(entry.toUpperCase()))
+        ) {
           return false;
         }
       }
@@ -667,18 +842,21 @@ export function BacktestsPage() {
       if (sortField === "created_at") {
         const leftTime = Date.parse(left.created_at || "") || 0;
         const rightTime = Date.parse(right.created_at || "") || 0;
-        if (leftTime === rightTime) return left.id.localeCompare(right.id) * direction;
+        if (leftTime === rightTime)
+          return left.id.localeCompare(right.id) * direction;
         return (leftTime - rightTime) * direction;
       }
       if (sortField === "win_rate") {
         const leftWin = normalizeWinRate(left.win_rate) ?? -1;
         const rightWin = normalizeWinRate(right.win_rate) ?? -1;
-        if (leftWin === rightWin) return left.id.localeCompare(right.id) * direction;
+        if (leftWin === rightWin)
+          return left.id.localeCompare(right.id) * direction;
         return (leftWin - rightWin) * direction;
       }
       const leftValue = Number(left[sortField] ?? 0);
       const rightValue = Number(right[sortField] ?? 0);
-      if (leftValue === rightValue) return left.id.localeCompare(right.id) * direction;
+      if (leftValue === rightValue)
+        return left.id.localeCompare(right.id) * direction;
       return (leftValue - rightValue) * direction;
     });
     return result;
@@ -736,7 +914,8 @@ export function BacktestsPage() {
 
   const selectedCount = selectedIds.size;
   const allVisibleSelected =
-    currentPageItems.length > 0 && currentPageItems.every((item) => selectedIds.has(item.id));
+    currentPageItems.length > 0 &&
+    currentPageItems.every((item) => selectedIds.has(item.id));
 
   const toggleSelected = (id: string) => {
     setSelectedIds((current) => {
@@ -763,13 +942,17 @@ export function BacktestsPage() {
     const normalized = symbolDraft.trim().toUpperCase();
     if (!normalized) return;
     if (!allSymbols.some((entry) => entry.toUpperCase() === normalized)) return;
-    setSelectedSymbols((current) => (current.includes(normalized) ? current : [...current, normalized]));
+    setSelectedSymbols((current) =>
+      current.includes(normalized) ? current : [...current, normalized],
+    );
     setSymbolDraft("");
     setPage(1);
   }, [allSymbols, symbolDraft]);
 
   const removeSelectedSymbol = useCallback((symbol: string) => {
-    setSelectedSymbols((current) => current.filter((entry) => entry !== symbol));
+    setSelectedSymbols((current) =>
+      current.filter((entry) => entry !== symbol),
+    );
     setPage(1);
   }, []);
 
@@ -787,7 +970,9 @@ export function BacktestsPage() {
   const handleBulkDelete = async () => {
     if (selectedCount === 0) return;
     const ids = [...selectedIds];
-    const confirmed = window.confirm(`Delete ${ids.length} selected backtests?`);
+    const confirmed = window.confirm(
+      `Delete ${ids.length} selected backtests?`,
+    );
     if (!confirmed) return;
 
     try {
@@ -825,7 +1010,10 @@ export function BacktestsPage() {
     setRunningDeduplicate(true);
     try {
       const payload = await deduplicateBacktests();
-      showToast(`Removed ${payload.deleted_ids.length} duplicate backtest(s).`, "success");
+      showToast(
+        `Removed ${payload.deleted_ids.length} duplicate backtest(s).`,
+        "success",
+      );
       setShowDuplicatesModal(false);
       await loadAllMetadata(true);
     } catch (error: unknown) {
@@ -846,7 +1034,9 @@ export function BacktestsPage() {
       showToast("No empty backtests found.", "info");
       return;
     }
-    const confirmed = window.confirm(`Remove ${emptyBacktestsCount} backtests with 0 trades?`);
+    const confirmed = window.confirm(
+      `Remove ${emptyBacktestsCount} backtests with 0 trades?`,
+    );
     if (!confirmed) return;
 
     setRunningRemoveEmpty(true);
@@ -855,78 +1045,37 @@ export function BacktestsPage() {
       showToast(`Removed ${payload.removed} empty backtest(s).`, "success");
       await loadAllMetadata(true);
     } catch (error: unknown) {
-      showToast(toErrorMessage(error, "Could not remove empty backtests."), "error");
+      showToast(
+        toErrorMessage(error, "Could not remove empty backtests."),
+        "error",
+      );
     } finally {
       setRunningRemoveEmpty(false);
     }
   };
 
-  const filterPanelContent = useMemo(() => (
-    <div style={FILTER_PANEL_GRID_STYLE}>
-      <div style={FILTER_PANEL_CONTROLS_STYLE}>
-        <div style={{ minWidth: "220px" }}>
-          <label style={{ display: "grid", gap: "6px", fontSize: "0.72rem", color: "var(--color-text-muted)" }}>
-            Name
-            <input
-              value={nameFilter}
-              onChange={(event) => {
-                setNameFilter(event.target.value);
-                setPage(1);
-              }}
-              placeholder="Partial name..."
+  const filterPanelContent = useMemo(
+    () => (
+      <div style={FILTER_PANEL_GRID_STYLE}>
+        <div style={FILTER_PANEL_CONTROLS_STYLE}>
+          <div style={{ minWidth: "220px" }}>
+            <label
               style={{
-                borderRadius: "10px",
-                border: "1px solid rgba(143, 154, 184, 0.28)",
-                background: "rgba(13, 19, 32, 0.95)",
-                color: "var(--color-text)",
-                padding: "9px 10px",
-                fontSize: "0.76rem",
+                display: "grid",
+                gap: "6px",
+                fontSize: "0.72rem",
+                color: "var(--color-text-muted)",
               }}
-            />
-          </label>
-        </div>
-
-        <MultiSelectDropdown
-          label="Strategy"
-          options={allStrategies.map((value) => ({ label: value, value }))}
-          selected={selectedStrategies}
-          onChange={(next) => {
-            setSelectedStrategies(next);
-            setPage(1);
-          }}
-          searchable
-          searchPlaceholder="Search strategy..."
-          buttonWidth="100%"
-        />
-
-        <MultiSelectDropdown
-          label="Timeframe"
-          options={allTimeframes.map((value) => ({ label: value, value }))}
-          selected={selectedTimeframes}
-          onChange={(next) => {
-            setSelectedTimeframes(next);
-            setPage(1);
-          }}
-          buttonWidth="100%"
-        />
-
-        <div style={{ minWidth: "220px" }}>
-          <label style={{ display: "grid", gap: "6px", fontSize: "0.72rem", color: "var(--color-text-muted)" }}>
-            Symbol (autocomplete)
-            <div style={{ display: "flex", gap: "6px" }}>
+            >
+              Name{" "}
               <input
-                list="backtests-symbols"
-                value={symbolDraft}
-                onChange={(event) => setSymbolDraft(event.target.value)}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter") {
-                    event.preventDefault();
-                    addSymbolDraft();
-                  }
+                value={nameFilter}
+                onChange={(event) => {
+                  setNameFilter(event.target.value);
+                  setPage(1);
                 }}
-                placeholder="Type symbol..."
+                placeholder="Partial name..."
                 style={{
-                  flex: 1,
                   borderRadius: "10px",
                   border: "1px solid rgba(143, 154, 184, 0.28)",
                   background: "rgba(13, 19, 32, 0.95)",
@@ -935,209 +1084,291 @@ export function BacktestsPage() {
                   fontSize: "0.76rem",
                 }}
               />
-              <button
-                type="button"
-                onClick={addSymbolDraft}
-                style={{
-                  borderRadius: "10px",
-                  border: "1px solid rgba(143, 154, 184, 0.34)",
-                  background: "rgba(17, 24, 39, 0.95)",
-                  color: "var(--color-text)",
-                  padding: "8px 10px",
-                  fontSize: "0.73rem",
-                  cursor: "pointer",
-                }}
-              >
-                Add
-              </button>
-            </div>
-          </label>
-          <datalist id="backtests-symbols">
-            {allSymbols.map((value) => (
-              <option key={value} value={value} />
-            ))}
-          </datalist>
-          {selectedSymbols.length > 0 ? (
-            <div style={{ display: "flex", gap: "6px", marginTop: "7px", flexWrap: "wrap" }}>
-              {selectedSymbols.map((symbol) => (
-                <button
-                  key={symbol}
-                  type="button"
-                  onClick={() => removeSelectedSymbol(symbol)}
+            </label>
+          </div>
+
+          <MultiSelectDropdown
+            label="Strategy"
+            options={allStrategies.map((value) => ({ label: value, value }))}
+            selected={selectedStrategies}
+            onChange={(next) => {
+              setSelectedStrategies(next);
+              setPage(1);
+            }}
+            searchable
+            searchPlaceholder="Search strategy..."
+            buttonWidth="100%"
+          />
+
+          <MultiSelectDropdown
+            label="Timeframe"
+            options={allTimeframes.map((value) => ({ label: value, value }))}
+            selected={selectedTimeframes}
+            onChange={(next) => {
+              setSelectedTimeframes(next);
+              setPage(1);
+            }}
+            buttonWidth="100%"
+          />
+
+          <div style={{ minWidth: "220px" }}>
+            <label
+              style={{
+                display: "grid",
+                gap: "6px",
+                fontSize: "0.72rem",
+                color: "var(--color-text-muted)",
+              }}
+            >
+              Symbol (autocomplete)
+              <div style={{ display: "flex", gap: "6px" }}>
+                <input
+                  list="backtests-symbols"
+                  value={symbolDraft}
+                  onChange={(event) => setSymbolDraft(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      addSymbolDraft();
+                    }
+                  }}
+                  placeholder="Type symbol..."
                   style={{
-                    borderRadius: "999px",
-                    border: "1px solid rgba(88,166,255,0.42)",
-                    background: "rgba(88,166,255,0.14)",
-                    color: "#dbeafe",
-                    padding: "3px 8px",
-                    fontSize: "0.68rem",
+                    flex: 1,
+                    borderRadius: "10px",
+                    border: "1px solid rgba(143, 154, 184, 0.28)",
+                    background: "rgba(13, 19, 32, 0.95)",
+                    color: "var(--color-text)",
+                    padding: "9px 10px",
+                    fontSize: "0.76rem",
+                  }}
+                />
+                <button
+                  type="button"
+                  onClick={addSymbolDraft}
+                  style={{
+                    borderRadius: "10px",
+                    border: "1px solid rgba(143, 154, 184, 0.34)",
+                    background: "rgba(17, 24, 39, 0.95)",
+                    color: "var(--color-text)",
+                    padding: "8px 10px",
+                    fontSize: "0.73rem",
                     cursor: "pointer",
                   }}
                 >
-                  {symbol}
+                  Add
                 </button>
+              </div>
+            </label>
+            <datalist id="backtests-symbols">
+              {allSymbols.map((value) => (
+                <option key={value} value={value} />
               ))}
-            </div>
-          ) : null}
+            </datalist>
+            {selectedSymbols.length > 0 ? (
+              <div
+                style={{
+                  display: "flex",
+                  gap: "6px",
+                  marginTop: "7px",
+                  flexWrap: "wrap",
+                }}
+              >
+                {selectedSymbols.map((symbol) => (
+                  <button
+                    key={symbol}
+                    type="button"
+                    onClick={() => removeSelectedSymbol(symbol)}
+                    style={{
+                      borderRadius: "999px",
+                      border: "1px solid rgba(88,166,255,0.42)",
+                      background: "rgba(88,166,255,0.14)",
+                      color: "#dbeafe",
+                      padding: "3px 8px",
+                      fontSize: "0.68rem",
+                      cursor: "pointer",
+                    }}
+                  >
+                    {symbol}
+                  </button>
+                ))}
+              </div>
+            ) : null}
+          </div>
         </div>
-      </div>
 
-      <div
-        style={{
-          display: "grid",
-          gap: "8px",
-          gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))",
-        }}
-      >
-        <DualRangeSlider
-          label="Sharpe (higher = better)"
-          min={numericBounds.sharpe.min}
-          max={numericBounds.sharpe.max}
-          valueMin={numericFilters.sharpe.min}
-          valueMax={numericFilters.sharpe.max}
-          onChange={(min, max) => {
-            setNumericFilters((current) => updateFilter(current, "sharpe", min, max));
-            setPage(1);
-          }}
-          step={0.01}
-        />
-        <DualRangeSlider
-          label="PSR (higher = better)"
-          min={numericBounds.psr.min}
-          max={numericBounds.psr.max}
-          valueMin={numericFilters.psr.min}
-          valueMax={numericFilters.psr.max}
-          onChange={(min, max) => {
-            setNumericFilters((current) => updateFilter(current, "psr", min, max));
-            setPage(1);
-          }}
-          step={0.001}
-        />
-        <DualRangeSlider
-          label="p-Value (lower = better)"
-          min={numericBounds.pValue.min}
-          max={numericBounds.pValue.max}
-          valueMin={numericFilters.pValue.min}
-          valueMax={numericFilters.pValue.max}
-          onChange={(min, max) => {
-            setNumericFilters((current) => updateFilter(current, "pValue", min, max));
-            setPage(1);
-          }}
-          step={0.001}
-        />
-        <DualRangeSlider
-          label="CAGR (higher = better)"
-          min={numericBounds.cagr.min}
-          max={numericBounds.cagr.max}
-          valueMin={numericFilters.cagr.min}
-          valueMax={numericFilters.cagr.max}
-          onChange={(min, max) => {
-            setNumericFilters((current) => updateFilter(current, "cagr", min, max));
-            setPage(1);
-          }}
-          step={0.1}
-          formatValue={(value) => `${value.toFixed(2)}%`}
-        />
-        <DualRangeSlider
-          label="Max DD (lower = better)"
-          min={numericBounds.maxDrawdown.min}
-          max={numericBounds.maxDrawdown.max}
-          valueMin={numericFilters.maxDrawdown.min}
-          valueMax={numericFilters.maxDrawdown.max}
-          onChange={(min, max) => {
-            setNumericFilters((current) => updateFilter(current, "maxDrawdown", min, max));
-            setPage(1);
-          }}
-          step={0.1}
-          formatValue={(value) => `${value.toFixed(2)}%`}
-        />
-        <DualRangeSlider
-          label="Total Return %"
-          min={numericBounds.totalReturn.min}
-          max={numericBounds.totalReturn.max}
-          valueMin={numericFilters.totalReturn.min}
-          valueMax={numericFilters.totalReturn.max}
-          onChange={(min, max) => {
-            setNumericFilters((current) => updateFilter(current, "totalReturn", min, max));
-            setPage(1);
-          }}
-          step={0.1}
-          formatValue={(value) => `${value.toFixed(2)}%`}
-        />
-        <DualRangeSlider
-          label="Win Rate (higher = better)"
-          min={numericBounds.winRate.min}
-          max={numericBounds.winRate.max}
-          valueMin={numericFilters.winRate.min}
-          valueMax={numericFilters.winRate.max}
-          onChange={(min, max) => {
-            setNumericFilters((current) => updateFilter(current, "winRate", min, max));
-            setPage(1);
-          }}
-          step={0.1}
-          formatValue={(value) => `${value.toFixed(1)}%`}
-        />
-      </div>
-
-      <div style={{ display: "flex", justifyContent: "flex-end" }}>
-        <button
-          type="button"
-          onClick={resetAllFilters}
+        <div
           style={{
-            borderRadius: "10px",
-            border: "1px solid rgba(143, 154, 184, 0.3)",
-            background: "rgba(13, 19, 32, 0.92)",
-            color: "var(--color-text-muted)",
-            padding: "8px 12px",
-            fontSize: "0.74rem",
-            cursor: "pointer",
+            display: "grid",
+            gap: "8px",
+            gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))",
           }}
         >
-          Reset All
-        </button>
+          <DualRangeSlider
+            label="Sharpe (higher = better)"
+            min={numericBounds.sharpe.min}
+            max={numericBounds.sharpe.max}
+            valueMin={numericFilters.sharpe.min}
+            valueMax={numericFilters.sharpe.max}
+            onChange={(min, max) => {
+              setNumericFilters((current) =>
+                updateFilter(current, "sharpe", min, max),
+              );
+              setPage(1);
+            }}
+            step={0.01}
+          />
+          <DualRangeSlider
+            label="PSR (higher = better)"
+            min={numericBounds.psr.min}
+            max={numericBounds.psr.max}
+            valueMin={numericFilters.psr.min}
+            valueMax={numericFilters.psr.max}
+            onChange={(min, max) => {
+              setNumericFilters((current) =>
+                updateFilter(current, "psr", min, max),
+              );
+              setPage(1);
+            }}
+            step={0.001}
+          />
+          <DualRangeSlider
+            label="p-Value (lower = better)"
+            min={numericBounds.pValue.min}
+            max={numericBounds.pValue.max}
+            valueMin={numericFilters.pValue.min}
+            valueMax={numericFilters.pValue.max}
+            onChange={(min, max) => {
+              setNumericFilters((current) =>
+                updateFilter(current, "pValue", min, max),
+              );
+              setPage(1);
+            }}
+            step={0.001}
+          />
+          <DualRangeSlider
+            label="CAGR (higher = better)"
+            min={numericBounds.cagr.min}
+            max={numericBounds.cagr.max}
+            valueMin={numericFilters.cagr.min}
+            valueMax={numericFilters.cagr.max}
+            onChange={(min, max) => {
+              setNumericFilters((current) =>
+                updateFilter(current, "cagr", min, max),
+              );
+              setPage(1);
+            }}
+            step={0.1}
+            formatValue={(value) => `${value.toFixed(2)}%`}
+          />
+          <DualRangeSlider
+            label="Max DD (lower = better)"
+            min={numericBounds.maxDrawdown.min}
+            max={numericBounds.maxDrawdown.max}
+            valueMin={numericFilters.maxDrawdown.min}
+            valueMax={numericFilters.maxDrawdown.max}
+            onChange={(min, max) => {
+              setNumericFilters((current) =>
+                updateFilter(current, "maxDrawdown", min, max),
+              );
+              setPage(1);
+            }}
+            step={0.1}
+            formatValue={(value) => `${value.toFixed(2)}%`}
+          />
+          <DualRangeSlider
+            label="Total Return %"
+            min={numericBounds.totalReturn.min}
+            max={numericBounds.totalReturn.max}
+            valueMin={numericFilters.totalReturn.min}
+            valueMax={numericFilters.totalReturn.max}
+            onChange={(min, max) => {
+              setNumericFilters((current) =>
+                updateFilter(current, "totalReturn", min, max),
+              );
+              setPage(1);
+            }}
+            step={0.1}
+            formatValue={(value) => `${value.toFixed(2)}%`}
+          />
+          <DualRangeSlider
+            label="Win Rate (higher = better)"
+            min={numericBounds.winRate.min}
+            max={numericBounds.winRate.max}
+            valueMin={numericFilters.winRate.min}
+            valueMax={numericFilters.winRate.max}
+            onChange={(min, max) => {
+              setNumericFilters((current) =>
+                updateFilter(current, "winRate", min, max),
+              );
+              setPage(1);
+            }}
+            step={0.1}
+            formatValue={(value) => `${value.toFixed(1)}%`}
+          />
+        </div>
+
+        <div style={{ display: "flex", justifyContent: "flex-end" }}>
+          <button
+            type="button"
+            onClick={resetAllFilters}
+            style={{
+              borderRadius: "10px",
+              border: "1px solid rgba(143, 154, 184, 0.3)",
+              background: "rgba(13, 19, 32, 0.92)",
+              color: "var(--color-text-muted)",
+              padding: "8px 12px",
+              fontSize: "0.74rem",
+              cursor: "pointer",
+            }}
+          >
+            Reset All
+          </button>
+        </div>
       </div>
-    </div>
-  ), [
-    addSymbolDraft,
-    allStrategies,
-    allSymbols,
-    allTimeframes,
-    numericBounds.cagr.max,
-    numericBounds.cagr.min,
-    numericBounds.maxDrawdown.max,
-    numericBounds.maxDrawdown.min,
-    numericBounds.pValue.max,
-    numericBounds.pValue.min,
-    numericBounds.psr.max,
-    numericBounds.psr.min,
-    numericBounds.sharpe.max,
-    numericBounds.sharpe.min,
-    numericBounds.totalReturn.max,
-    numericBounds.totalReturn.min,
-    numericBounds.winRate.max,
-    numericBounds.winRate.min,
-    numericFilters.cagr.max,
-    numericFilters.cagr.min,
-    numericFilters.maxDrawdown.max,
-    numericFilters.maxDrawdown.min,
-    numericFilters.pValue.max,
-    numericFilters.pValue.min,
-    numericFilters.psr.max,
-    numericFilters.psr.min,
-    numericFilters.sharpe.max,
-    numericFilters.sharpe.min,
-    numericFilters.totalReturn.max,
-    numericFilters.totalReturn.min,
-    numericFilters.winRate.max,
-    numericFilters.winRate.min,
-    nameFilter,
-    removeSelectedSymbol,
-    resetAllFilters,
-    selectedStrategies,
-    selectedSymbols,
-    selectedTimeframes,
-    symbolDraft,
-  ]);
+    ),
+    [
+      addSymbolDraft,
+      allStrategies,
+      allSymbols,
+      allTimeframes,
+      numericBounds.cagr.max,
+      numericBounds.cagr.min,
+      numericBounds.maxDrawdown.max,
+      numericBounds.maxDrawdown.min,
+      numericBounds.pValue.max,
+      numericBounds.pValue.min,
+      numericBounds.psr.max,
+      numericBounds.psr.min,
+      numericBounds.sharpe.max,
+      numericBounds.sharpe.min,
+      numericBounds.totalReturn.max,
+      numericBounds.totalReturn.min,
+      numericBounds.winRate.max,
+      numericBounds.winRate.min,
+      numericFilters.cagr.max,
+      numericFilters.cagr.min,
+      numericFilters.maxDrawdown.max,
+      numericFilters.maxDrawdown.min,
+      numericFilters.pValue.max,
+      numericFilters.pValue.min,
+      numericFilters.psr.max,
+      numericFilters.psr.min,
+      numericFilters.sharpe.max,
+      numericFilters.sharpe.min,
+      numericFilters.totalReturn.max,
+      numericFilters.totalReturn.min,
+      numericFilters.winRate.max,
+      numericFilters.winRate.min,
+      nameFilter,
+      removeSelectedSymbol,
+      resetAllFilters,
+      selectedStrategies,
+      selectedSymbols,
+      selectedTimeframes,
+      symbolDraft,
+    ],
+  );
 
   const resultSummaryLabel = useMemo(
     () => `${filteredSorted.length} results · ${items.length} total backtests`,
@@ -1145,7 +1376,13 @@ export function BacktestsPage() {
   );
 
   return (
-    <div style={{ padding: "20px 22px 120px", minHeight: "100%", background: "#0d1322" }}>
+    <div
+      style={{
+        padding: "20px 22px 120px",
+        minHeight: "100%",
+        background: "#0d1322",
+      }}
+    >
       <div
         style={{
           borderRadius: "18px",
@@ -1167,13 +1404,29 @@ export function BacktestsPage() {
           }}
         >
           <div>
-            <h1 style={{ margin: 0, fontSize: "1.35rem", fontWeight: 700 }}>Backtests</h1>
-            <div style={{ marginTop: "4px", color: "var(--color-text-muted)", fontSize: "0.78rem" }}>
-              Card layout with equity previews · server-side name filter · client-side metric filters
+            <h1 style={{ margin: 0, fontSize: "1.35rem", fontWeight: 700 }}>
+              Backtests
+            </h1>
+            <div
+              style={{
+                marginTop: "4px",
+                color: "var(--color-text-muted)",
+                fontSize: "0.78rem",
+              }}
+            >
+              Card layout with equity previews · server-side name filter ·
+              client-side metric filters
             </div>
           </div>
 
-          <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "8px",
+              flexWrap: "wrap",
+            }}
+          >
             <button
               type="button"
               onClick={() => void handleShowDuplicates()}
@@ -1206,7 +1459,8 @@ export function BacktestsPage() {
                   runningRemoveEmpty || emptyBacktestsCount <= 0
                     ? "not-allowed"
                     : "pointer",
-                opacity: runningRemoveEmpty || emptyBacktestsCount <= 0 ? 0.6 : 1,
+                opacity:
+                  runningRemoveEmpty || emptyBacktestsCount <= 0 ? 0.6 : 1,
               }}
             >
               {runningRemoveEmpty ? "Removing..." : "Remove Empty"}
@@ -1270,15 +1524,34 @@ export function BacktestsPage() {
 
         <BacktestMatrixPanel />
 
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
-          <div style={{ color: "var(--color-text-muted)", fontSize: "0.78rem" }}>
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            gap: "8px",
+            flexWrap: "wrap",
+          }}
+        >
+          <div
+            style={{ color: "var(--color-text-muted)", fontSize: "0.78rem" }}
+          >
             {resultSummaryLabel}
           </div>
-          <div style={{ display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" }}>
+          <div
+            style={{
+              display: "flex",
+              gap: "8px",
+              alignItems: "center",
+              flexWrap: "wrap",
+            }}
+          >
             <button
               type="button"
               onClick={() => {
-                setSortOrder((current) => (current === "desc" ? "asc" : "desc"));
+                setSortOrder((current) =>
+                  current === "desc" ? "asc" : "desc",
+                );
                 setPage(1);
               }}
               style={{
@@ -1303,14 +1576,14 @@ export function BacktestsPage() {
                 checked={allVisibleSelected}
                 onChange={toggleSelectedVisible}
                 style={{ cursor: "pointer", accentColor: "#58a6ff" }}
-              />
+              />{" "}
               Select All (visible)
             </label>
           </div>
         </div>
       </div>
 
-      {loading ? (
+      {loading && (
         <div
           style={{
             borderRadius: "14px",
@@ -1323,7 +1596,8 @@ export function BacktestsPage() {
         >
           Loading backtests...
         </div>
-      ) : currentPageItems.length === 0 ? (
+      )}
+      {!loading && currentPageItems.length === 0 && (
         <div
           style={{
             borderRadius: "14px",
@@ -1336,7 +1610,8 @@ export function BacktestsPage() {
         >
           No backtests for the current filter selection.
         </div>
-      ) : (
+      )}
+      {!loading && currentPageItems.length > 0 && (
         <div
           style={{
             display: "grid",
@@ -1348,7 +1623,8 @@ export function BacktestsPage() {
             const selected = selectedIds.has(item.id);
             const totalReturnPct = metricValue(item.total_return) * 100;
             const cagrPct = metricValue(item.cagr) * 100;
-            const maxDrawdownPct = Math.abs(metricValue(item.max_drawdown)) * 100;
+            const maxDrawdownPct =
+              Math.abs(metricValue(item.max_drawdown)) * 100;
             const winRatePct = (normalizeWinRate(item.win_rate) ?? 0) * 100;
             const sparkline = previewById[item.id] ?? item.equity_preview ?? [];
 
@@ -1367,20 +1643,25 @@ export function BacktestsPage() {
                     : "0 12px 28px rgba(0, 0, 0, 0.34)",
                   padding: "16px",
                   cursor: "pointer",
-                  transition: "transform 140ms ease, border-color 140ms ease, box-shadow 160ms ease",
+                  transition:
+                    "transform 140ms ease, border-color 140ms ease, box-shadow 160ms ease",
                 }}
                 onMouseEnter={(event) => {
                   event.currentTarget.style.transform = "translateY(-2px)";
                   if (!selected) {
-                    event.currentTarget.style.borderColor = "rgba(88, 166, 255, 0.46)";
-                    event.currentTarget.style.boxShadow = "0 16px 34px rgba(0, 0, 0, 0.42)";
+                    event.currentTarget.style.borderColor =
+                      "rgba(88, 166, 255, 0.46)";
+                    event.currentTarget.style.boxShadow =
+                      "0 16px 34px rgba(0, 0, 0, 0.42)";
                   }
                 }}
                 onMouseLeave={(event) => {
                   event.currentTarget.style.transform = "translateY(0px)";
                   if (!selected) {
-                    event.currentTarget.style.borderColor = "rgba(148, 163, 184, 0.26)";
-                    event.currentTarget.style.boxShadow = "0 12px 28px rgba(0, 0, 0, 0.34)";
+                    event.currentTarget.style.borderColor =
+                      "rgba(148, 163, 184, 0.26)";
+                    event.currentTarget.style.boxShadow =
+                      "0 12px 28px rgba(0, 0, 0, 0.34)";
                   }
                 }}
               >
@@ -1414,7 +1695,8 @@ export function BacktestsPage() {
                     height: "112px",
                     borderRadius: "10px",
                     border: "1px solid rgba(90, 105, 138, 0.2)",
-                    background: "linear-gradient(180deg, rgba(18, 27, 44, 0.92), rgba(11, 17, 30, 0.92))",
+                    background:
+                      "linear-gradient(180deg, rgba(18, 27, 44, 0.92), rgba(11, 17, 30, 0.92))",
                     padding: "10px 10px 2px",
                     display: "flex",
                     alignItems: "center",
@@ -1433,14 +1715,25 @@ export function BacktestsPage() {
                       endDate={item.end_date}
                     />
                   ) : (
-                    <span style={{ color: "var(--color-text-muted)", fontSize: "0.72rem" }}>
+                    <span
+                      style={{
+                        color: "var(--color-text-muted)",
+                        fontSize: "0.72rem",
+                      }}
+                    >
                       No equity preview
                     </span>
                   )}
                 </div>
 
                 <div style={{ marginBottom: "12px" }}>
-                  <div style={{ fontWeight: 800, fontSize: "1.02rem", marginBottom: "5px" }}>
+                  <div
+                    style={{
+                      fontWeight: 800,
+                      fontSize: "1.02rem",
+                      marginBottom: "5px",
+                    }}
+                  >
                     {item.strategy_name}
                   </div>
                   <div
@@ -1466,7 +1759,8 @@ export function BacktestsPage() {
                       fontWeight: 600,
                     }}
                   >
-                    Period: {formatPeriodDate(item.start_date)} → {formatPeriodDate(item.end_date)}
+                    Period: {formatPeriodDate(item.start_date)} →{" "}
+                    {formatPeriodDate(item.end_date)}
                   </div>
                   <div
                     style={{
@@ -1507,8 +1801,18 @@ export function BacktestsPage() {
                   ) : null}
                 </div>
 
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: "8px" }}>
-                  <StatBadge label="Return" value={percentage(totalReturnPct)} color={statColorPositive(totalReturnPct)} />
+                <div
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
+                    gap: "8px",
+                  }}
+                >
+                  <StatBadge
+                    label="Return"
+                    value={percentage(totalReturnPct)}
+                    color={statColorPositive(totalReturnPct)}
+                  />
                   <StatBadge
                     label="Sharpe (higher = better)"
                     value={formatNumber(item.sharpe_ratio)}
@@ -1516,11 +1820,23 @@ export function BacktestsPage() {
                   />
                   <StatBadge
                     label="PSR (higher = better)"
-                    value={item.psr == null ? "N/A" : `${(item.psr * 100).toFixed(1)}%`}
+                    value={
+                      item.psr == null
+                        ? "N/A"
+                        : `${(item.psr * 100).toFixed(1)}%`
+                    }
                     color={psrColor(item.psr)}
                   />
-                  <StatBadge label="CAGR (higher = better)" value={percentage(cagrPct)} color={statColorPositive(cagrPct)} />
-                  <StatBadge label="Max DD (lower = better)" value={percentage(-maxDrawdownPct)} color="#f87171" />
+                  <StatBadge
+                    label="CAGR (higher = better)"
+                    value={percentage(cagrPct)}
+                    color={statColorPositive(cagrPct)}
+                  />
+                  <StatBadge
+                    label="Max DD (lower = better)"
+                    value={percentage(-maxDrawdownPct)}
+                    color="#f87171"
+                  />
                   <StatBadge
                     label="Win Rate (higher = better)"
                     value={`${winRatePct.toFixed(1)}%`}
@@ -1589,8 +1905,17 @@ export function BacktestsPage() {
           Page {page} of {totalPages}
         </span>
 
-        <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
-          <label style={{ fontSize: "0.74rem", color: "var(--color-text-muted)" }}>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "8px",
+            flexWrap: "wrap",
+          }}
+        >
+          <label
+            style={{ fontSize: "0.74rem", color: "var(--color-text-muted)" }}
+          >
             Per Page{" "}
             <select
               value={perPage}
@@ -1614,31 +1939,46 @@ export function BacktestsPage() {
             </select>
           </label>
 
-          <PagerButton onClick={() => setPage((current) => Math.max(1, current - 1))} disabled={page <= 1}>
+          <PagerButton
+            onClick={() => setPage((current) => Math.max(1, current - 1))}
+            disabled={page <= 1}
+          >
             {"<"}
           </PagerButton>
           {buildPageNumbers(page, totalPages).map((entry, index) =>
             typeof entry === "number" ? (
-              <PagerButton key={`page-${entry}`} onClick={() => setPage(entry)} active={entry === page}>
+              <PagerButton
+                key={`page-${entry}`}
+                onClick={() => setPage(entry)}
+                active={entry === page}
+              >
                 {entry}
               </PagerButton>
             ) : (
-              <span key={`ellipsis-${index}`} style={{ color: "var(--color-text-muted)" }}>
+              <span
+                key={`ellipsis-${index === 0 ? "lead" : "tail"}`}
+                style={{ color: "var(--color-text-muted)" }}
+              >
                 ...
               </span>
             ),
           )}
-          <PagerButton onClick={() => setPage((current) => Math.min(totalPages, current + 1))} disabled={page >= totalPages}>
+          <PagerButton
+            onClick={() =>
+              setPage((current) => Math.min(totalPages, current + 1))
+            }
+            disabled={page >= totalPages}
+          >
             {">"}
           </PagerButton>
         </div>
       </div>
 
       {selectedCount > 0 ? (
-        <div
-          style={BULK_BAR_STYLE}
-        >
-          <span style={{ fontSize: "0.76rem", color: "var(--color-text-muted)" }}>
+        <div style={BULK_BAR_STYLE}>
+          <span
+            style={{ fontSize: "0.76rem", color: "var(--color-text-muted)" }}
+          >
             {selectedCount} selected
           </span>
           <button
@@ -1694,9 +2034,15 @@ export function BacktestsPage() {
         width="520px"
       >
         <div style={{ display: "grid", gap: "14px" }}>
-          <div style={{ color: "var(--color-text-muted)", fontSize: "0.84rem", lineHeight: 1.45 }}>
-            Found <b>{duplicatesInfo?.total_groups ?? 0}</b> duplicate group(s) across{" "}
-            <b>{duplicatesInfo?.total_backtests ?? 0}</b> backtests.
+          <div
+            style={{
+              color: "var(--color-text-muted)",
+              fontSize: "0.84rem",
+              lineHeight: 1.45,
+            }}
+          >
+            Found <b>{duplicatesInfo?.total_groups ?? 0}</b> duplicate group(s)
+            across <b>{duplicatesInfo?.total_backtests ?? 0}</b> backtests.
           </div>
           {duplicatesInfo && duplicatesInfo.total_groups > 0 ? (
             <div
@@ -1711,14 +2057,23 @@ export function BacktestsPage() {
               }}
             >
               {duplicatesInfo.groups.slice(0, 6).map((group) => (
-                <div key={group.fingerprint} style={{ padding: "5px 0", borderBottom: "1px solid rgba(255,255,255,0.06)" }}>
-                  {group.strategy_name || "Unknown"} · {(group.symbols || []).join(", ") || "N/A"} · {group.timeframe || "N/A"} ·{" "}
-                  {group.backtests.length} entries
+                <div
+                  key={group.fingerprint}
+                  style={{
+                    padding: "5px 0",
+                    borderBottom: "1px solid rgba(255,255,255,0.06)",
+                  }}
+                >
+                  {group.strategy_name || "Unknown"} ·{" "}
+                  {(group.symbols || []).join(", ") || "N/A"} ·{" "}
+                  {group.timeframe || "N/A"} · {group.backtests.length} entries
                 </div>
               ))}
             </div>
           ) : null}
-          <div style={{ display: "flex", justifyContent: "flex-end", gap: "8px" }}>
+          <div
+            style={{ display: "flex", justifyContent: "flex-end", gap: "8px" }}
+          >
             <button
               type="button"
               onClick={() => setShowDuplicatesModal(false)}
@@ -1737,7 +2092,9 @@ export function BacktestsPage() {
             <button
               type="button"
               onClick={() => void handleDeduplicate()}
-              disabled={runningDeduplicate || (duplicatesInfo?.total_groups ?? 0) === 0}
+              disabled={
+                runningDeduplicate || (duplicatesInfo?.total_groups ?? 0) === 0
+              }
               style={{
                 borderRadius: "8px",
                 border: "1px solid rgba(248,113,113,0.4)",
@@ -1745,7 +2102,11 @@ export function BacktestsPage() {
                 color: "#fecaca",
                 padding: "8px 12px",
                 cursor: runningDeduplicate ? "not-allowed" : "pointer",
-                opacity: runningDeduplicate || (duplicatesInfo?.total_groups ?? 0) === 0 ? 0.6 : 1,
+                opacity:
+                  runningDeduplicate ||
+                  (duplicatesInfo?.total_groups ?? 0) === 0
+                    ? 0.6
+                    : 1,
               }}
             >
               {runningDeduplicate ? "Removing..." : "Confirm Remove Duplicates"}
@@ -1787,7 +2148,15 @@ const StatBadge = memo(function StatBadge({
         fontSize: "0.72rem",
       }}
     >
-      <div style={{ color: "var(--color-text-muted)", marginBottom: "3px", fontSize: "0.67rem" }}>{label}</div>
+      <div
+        style={{
+          color: "var(--color-text-muted)",
+          marginBottom: "3px",
+          fontSize: "0.67rem",
+        }}
+      >
+        {label}
+      </div>
       <div style={{ color, fontWeight: 700 }}>{value}</div>
     </div>
   );
@@ -1798,12 +2167,12 @@ function PagerButton({
   onClick,
   disabled = false,
   active = false,
-}: {
+}: Readonly<{
   children: string | number;
   onClick: () => void;
   disabled?: boolean;
   active?: boolean;
-}) {
+}>) {
   return (
     <button
       type="button"
@@ -1811,8 +2180,12 @@ function PagerButton({
       disabled={disabled}
       style={{
         borderRadius: "8px",
-        border: active ? "1px solid rgba(88, 166, 255, 0.66)" : "1px solid rgba(148, 163, 184, 0.24)",
-        background: active ? "rgba(88, 166, 255, 0.2)" : "rgba(15, 23, 42, 0.96)",
+        border: active
+          ? "1px solid rgba(88, 166, 255, 0.66)"
+          : "1px solid rgba(148, 163, 184, 0.24)",
+        background: active
+          ? "rgba(88, 166, 255, 0.2)"
+          : "rgba(15, 23, 42, 0.96)",
         color: active ? "#dbeafe" : "var(--color-text)",
         minWidth: "30px",
         height: "30px",

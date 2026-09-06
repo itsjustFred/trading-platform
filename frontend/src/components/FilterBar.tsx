@@ -38,7 +38,7 @@ export function FilterBar({
   onSortChange,
   filterPanelContent,
   filterButtonLabel = "Filter",
-}: FilterBarProps) {
+}: Readonly<FilterBarProps>) {
   const [showFilters, setShowFilters] = useState(false);
   const hasFilterPanel = filters.length > 0 || filterPanelContent != null;
 
@@ -94,6 +94,7 @@ export function FilterBar({
         {/* Filter toggle */}
         {hasFilterPanel && (
           <button
+            type="button"
             onClick={() => setShowFilters((s) => !s)}
             style={{
               ...btnStyle,
