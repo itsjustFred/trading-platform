@@ -175,6 +175,8 @@ def build_cli_command(
         max_position_pct,
         caller="build_cli_command",
     )
+    if folded_max_position_exposure_pct is not None:
+        max_position_exposure_pct = folded_max_position_exposure_pct
     cmd = [
         sys.executable,
         "-m",
