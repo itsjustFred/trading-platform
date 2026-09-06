@@ -12,7 +12,7 @@ import {
 } from "../api/client";
 import { StatCard } from "../components/StatCard";
 import { TradeTable, type TradeTableRow } from "../components/TradeTable";
-import { psrTone, sharpeTone } from "../lib/statFormat";
+import { sharpeTone } from "../lib/statFormat";
 import { RenameModal } from "../components/RenameModal";
 import { OptimizeModal } from "../components/OptimizeModal";
 import { ArrowLeft, ArrowUpRight, PencilLine, Target } from "lucide-react";

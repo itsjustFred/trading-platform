@@ -37,7 +37,6 @@ import { StatCard } from "../components/StatCard";
 import { TradeTable, type TradeTableRow } from "../components/TradeTable";
 import { useToast } from "../components/ToastProvider";
 import { formatPValue, pValueColor } from "../utils/stats";
-import { psrTone } from "../lib/statFormat";
 
 type GroupBy = "component" | "strategy" | "symbol" | "timeframe";
 
