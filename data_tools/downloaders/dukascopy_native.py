@@ -165,6 +165,57 @@ TIMEFRAME_MAP: dict[str, str] = {
     "mn1": "mn1",
 }
 
+# Map normalized timeframes to on-disk storage timeframe labels
+STORAGE_TF_MAP: dict[str, str] = {
+    "tick": "tick",
+    "s1": "s1",
+    "m1": "1m",
+    "m5": "5m",
+    "m15": "15m",
+    "m30": "30m",
+    "h1": "1h",
+    "h4": "4h",
+    "d1": "1d",
+    "mn1": "mn1",
+}
+
+
+def _end_of_day_inclusive(end_dt: datetime) -> datetime:
+    """Expand a midnight end date to 23:59:59 so the last day is included."""
+    if end_dt.hour == 0 and end_dt.minute == 0:
+        return end_dt.replace(hour=23, minute=59, second=59)
+    return end_dt
+
+
+@dataclass
+class _TickDownloadOptions:
+    """Shared download-loop options for the Dukascopy strategy helpers."""
+
+    batch_size: int
+    pipeline_batches: int
+    pause_ms: int
+    max_retries: int
+    stop_event: Any
+    pause_event: Any
+    report_progress: Any
+    log_callback: Any
+
+
+@dataclass
+class _TickRequest:
+    """Per-request parameters for the Dukascopy strategy helpers."""
+
+    instrument: str
+    sym: str
+    normalized_tf: str
+    price_type: str
+    offer_side: str
+    decimal_factor: Any
+    start_dt: datetime
+    end_dt: datetime
+    requested_start: str
+    requested_end: str
+
 # Map normalized timeframes to pandas resample rules
 TF_RESAMPLE_RULE: dict[str, str] = {
     "s1": "1s",
@@ -216,7 +267,7 @@ def _guess_asset_class(instrument_key: str, normalized_symbol: str) -> str:
         return "indices"
     if "cmd" in inst or sym in {"UKOIL", "USOIL"}:
         return "energy"
-    if sym.startswith("XAU") or sym.startswith("XAG"):
+    if sym.startswith(("XAU", "XAG")):
         return "metals"
     return "forex"
 
@@ -462,95 +513,92 @@ async def download_bi5_files(
     connector = aiohttp.TCPConnector(limit=window_size, force_close=False)
     timeout = aiohttp.ClientTimeout(total=60, connect=15)
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-        try:
-            for batch_index, offset in enumerate(range(0, total, window_size), start=1):
-                await _wait_for_control(pause_event, stop_event)
-                batch_started_at_cap = current_pause_ms >= MAX_BATCH_PAUSE_MS
-                batch = urls[offset : offset + window_size]
-                tasks = [
-                    asyncio.create_task(
-                        _fetch_one(
-                            session,
-                            dt,
-                            url,
-                            semaphore,
-                            max_retries,
-                            pause_event=pause_event,
-                            stop_event=stop_event,
-                        )
+        for batch_index, offset in enumerate(range(0, total, window_size), start=1):
+            await _wait_for_control(pause_event, stop_event)
+            batch_started_at_cap = current_pause_ms >= MAX_BATCH_PAUSE_MS
+            batch = urls[offset : offset + window_size]
+            tasks = [
+                asyncio.create_task(
+                    _fetch_one(
+                        session,
+                        dt,
+                        url,
+                        semaphore,
+                        max_retries,
+                        pause_event=pause_event,
+                        stop_event=stop_event,
                     )
-                    for dt, url in batch
-                ]
-                try:
-                    batch_results = await asyncio.gather(*tasks)
-                except DownloadCancelled:
-                    for task in tasks:
-                        if not task.done():
-                            task.cancel()
-                    await asyncio.gather(*tasks, return_exceptions=True)
-                    raise
-                finally:
-                    for task in tasks:
-                        if not task.done():
-                            task.cancel()
+                )
+                for dt, url in batch
+            ]
+            try:
+                batch_results = await asyncio.gather(*tasks)
+            except DownloadCancelled:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
 
-                batch_throttled = False
-                cooldown_required = False
-                for result in batch_results:
-                    results.append((result.dt, result.data))
-                    batch_throttled = batch_throttled or result.throttle_signal
-                    cooldown_required = cooldown_required or result.cooldown_required
-                    completed += 1
-                    _report_progress(
-                        report_progress,
-                        (completed / total) * 100.0,
-                        f"Downloaded {completed}/{total} {unit}",
-                    )
+            batch_throttled = False
+            cooldown_required = False
+            for result in batch_results:
+                results.append((result.dt, result.data))
+                batch_throttled = batch_throttled or result.throttle_signal
+                cooldown_required = cooldown_required or result.cooldown_required
+                completed += 1
+                _report_progress(
+                    report_progress,
+                    (completed / total) * 100.0,
+                    f"Downloaded {completed}/{total} {unit}",
+                )
 
-                if batch_throttled:
-                    next_pause_ms = min(
-                        current_pause_ms * 2 if current_pause_ms > 0 else 1000,
-                        MAX_BATCH_PAUSE_MS,
-                    )
-                    if next_pause_ms == MAX_BATCH_PAUSE_MS and current_pause_ms != MAX_BATCH_PAUSE_MS:
-                        _emit_log_message(
-                            (
-                                "Potential Dukascopy rate-limit detected in batch "
-                                f"{batch_index}; backoff cap reached at {MAX_BATCH_PAUSE_MS} ms."
-                            ),
-                            level="warning",
-                            log_callback=log_callback,
-                        )
-                    current_pause_ms = next_pause_ms
+            if batch_throttled:
+                next_pause_ms = min(
+                    current_pause_ms * 2 if current_pause_ms > 0 else 1000,
+                    MAX_BATCH_PAUSE_MS,
+                )
+                if next_pause_ms == MAX_BATCH_PAUSE_MS and current_pause_ms != MAX_BATCH_PAUSE_MS:
                     _emit_log_message(
                         (
                             "Potential Dukascopy rate-limit detected in batch "
-                            f"{batch_index}; increasing pause to {current_pause_ms} ms."
+                            f"{batch_index}; backoff cap reached at {MAX_BATCH_PAUSE_MS} ms."
                         ),
                         level="warning",
                         log_callback=log_callback,
                     )
+                current_pause_ms = next_pause_ms
+                _emit_log_message(
+                    (
+                        "Potential Dukascopy rate-limit detected in batch "
+                        f"{batch_index}; increasing pause to {current_pause_ms} ms."
+                    ),
+                    level="warning",
+                    log_callback=log_callback,
+                )
 
-                if batch_started_at_cap and cooldown_required:
-                    _emit_log_message(
-                        (
-                            "Dukascopy still throttled requests after the 10000 ms backoff cap; "
-                            f"starting {int(HARD_COOLDOWN_SECONDS)}s cooldown and resetting pause."
-                        ),
-                        level="warning",
-                        log_callback=log_callback,
-                    )
-                    await _sleep_with_control(HARD_COOLDOWN_SECONDS, pause_event, stop_event)
-                    current_pause_ms = base_pause_ms
-                    continue
+            if batch_started_at_cap and cooldown_required:
+                _emit_log_message(
+                    (
+                        "Dukascopy still throttled requests after the 10000 ms backoff cap; "
+                        f"starting {int(HARD_COOLDOWN_SECONDS)}s cooldown and resetting pause."
+                    ),
+                    level="warning",
+                    log_callback=log_callback,
+                )
+                await _sleep_with_control(HARD_COOLDOWN_SECONDS, pause_event, stop_event)
+                current_pause_ms = base_pause_ms
+                continue
 
-                has_more_batches = completed < total
-                if not has_more_batches:
-                    continue
+            has_more_batches = completed < total
+            if not has_more_batches:
+                continue
 
-                await _sleep_with_control(current_pause_ms / 1000.0, pause_event, stop_event)
-        except DownloadCancelled:
-            raise
+            await _sleep_with_control(current_pause_ms / 1000.0, pause_event, stop_event)
 
     return results
 
@@ -1026,19 +1074,7 @@ class DukascopyNativeDownloader(Downloader):
             raise ValueError(
                 f"Unsupported timeframe: {timeframe}. Use one of: {list(TIMEFRAME_MAP)}"
             )
-        storage_tf_map = {
-            "tick": "tick",
-            "s1": "s1",
-            "m1": "1m",
-            "m5": "5m",
-            "m15": "15m",
-            "m30": "30m",
-            "h1": "1h",
-            "h4": "4h",
-            "d1": "1d",
-            "mn1": "mn1",
-        }
-        out_tf = storage_tf_map.get(normalized_tf, normalized_tf)
+        out_tf = STORAGE_TF_MAP.get(normalized_tf, normalized_tf)
 
         sym, instrument, asset_class = _resolve_symbol_and_instrument(symbol)
         out_path = self._make_output_path(output_dir, asset_class, sym, out_tf)
@@ -1072,9 +1108,7 @@ class DukascopyNativeDownloader(Downloader):
         requested_end = end or datetime.now(timezone.utc).date().isoformat()
 
         start_dt = datetime.fromisoformat(requested_start).replace(tzinfo=timezone.utc)
-        end_dt = datetime.fromisoformat(requested_end).replace(tzinfo=timezone.utc)
-        if end_dt.hour == 0 and end_dt.minute == 0:
-            end_dt = end_dt.replace(hour=23, minute=59, second=59)
+        end_dt = _end_of_day_inclusive(datetime.fromisoformat(requested_end).replace(tzinfo=timezone.utc))
 
         decimal_factor = _get_decimal_factor(instrument)
         strategy = DOWNLOAD_STRATEGY[normalized_tf]
@@ -1100,6 +1134,29 @@ class DukascopyNativeDownloader(Downloader):
             log_callback=log_callback,
         )
         _report_progress(report_progress, 0.0, "Preparing download")
+
+        request = _TickRequest(
+            instrument=instrument,
+            sym=sym,
+            normalized_tf=normalized_tf,
+            price_type=price_type,
+            offer_side=offer_side,
+            decimal_factor=decimal_factor,
+            start_dt=start_dt,
+            end_dt=end_dt,
+            requested_start=requested_start,
+            requested_end=requested_end,
+        )
+        options = _TickDownloadOptions(
+            batch_size=batch_size,
+            pipeline_batches=pipeline_batches,
+            pause_ms=pause_ms,
+            max_retries=max_retries,
+            stop_event=stop_event,
+            pause_event=pause_event,
+            report_progress=report_progress,
+            log_callback=log_callback,
+        )
 
         if strategy == "tick":
             if merge_bid_ask:
@@ -1298,6 +1355,191 @@ class DukascopyNativeDownloader(Downloader):
             license="free",
             update_frequency="manual",
             downloaded_at=datetime.now(timezone.utc).isoformat(),
+        )
+
+    async def _download_tick_strategy(
+        self,
+        *,
+        request: _TickRequest,
+        options: _TickDownloadOptions,
+        merge_bid_ask: bool,
+    ) -> tuple[pd.DataFrame, list[str]]:
+        if merge_bid_ask:
+            _emit_log_message("Downloading merged hourly tick files...", log_callback=options.log_callback)
+            df = await _download_and_assemble_merged_ticks(
+                request.instrument,
+                request.start_dt,
+                request.end_dt,
+                options.batch_size,
+                options.pipeline_batches,
+                options.pause_ms,
+                options.max_retries,
+                stop_event=options.stop_event,
+                pause_event=options.pause_event,
+                log_callback=options.log_callback,
+            )
+            warnings = ["offer_side:both", "price_type:bid+ask"]
+        else:
+            df, warnings = await self._download_single_side_ticks(
+                request=request, options=options
+            )
+
+        if df.empty:
+            raise RuntimeError(
+                f"No tick data for {request.sym} in range "
+                f"{request.requested_start} → {request.requested_end}"
+            )
+
+        if request.normalized_tf not in ("tick", "s1"):
+            df = _ticks_to_ohlcv(df, request.normalized_tf, request.price_type)
+        elif request.normalized_tf == "s1":
+            df = _ticks_to_ohlcv(df, "s1", request.price_type)
+        return df, warnings
+
+    @staticmethod
+    async def _download_single_side_ticks(
+        *,
+        request: _TickRequest,
+        options: _TickDownloadOptions,
+    ) -> tuple[pd.DataFrame, list[str]]:
+        urls = generate_tick_urls(request.instrument, request.start_dt, request.end_dt)
+        _emit_log_message(
+            f"Downloading {len(urls)} hourly tick files...",
+            log_callback=options.log_callback,
+        )
+        bi5_results = await download_bi5_files(
+            urls,
+            options.batch_size,
+            options.max_retries,
+            batch_size=options.batch_size,
+            pipeline_batches=options.pipeline_batches,
+            pause_ms=options.pause_ms,
+            report_progress=(
+                (lambda pct, msg: _report_progress(options.report_progress, pct * 0.9, msg))
+                if options.report_progress
+                else None
+            ),
+            progress_unit="files",
+            stop_event=options.stop_event,
+            pause_event=options.pause_event,
+            log_callback=options.log_callback,
+        )
+        non_empty = sum(1 for _, d in bi5_results if d)
+        _emit_log_message(
+            f"Received {non_empty}/{len(urls)} non-empty files",
+            log_callback=options.log_callback,
+        )
+        _report_progress(options.report_progress, 95.0, "Assembling tick data")
+        df = _assemble_tick_dataframe(bi5_results, request.decimal_factor)
+        return df, [f"offer_side:{request.offer_side}", f"price_type:{request.price_type}"]
+
+    async def _download_minute_strategy(
+        self,
+        *,
+        request: _TickRequest,
+        options: _TickDownloadOptions,
+    ) -> tuple[pd.DataFrame, list[str]]:
+        if request.offer_side == "both":
+            df = await self._download_both_minute_sides(request=request, options=options)
+            warnings = ["offer_side:both", "price_type:bid+ask"]
+            return df, warnings
+
+        df = await _download_minute_side_dataframe(
+            request.instrument,
+            request.start_dt,
+            request.end_dt,
+            side=request.price_type,
+            decimal_factor=request.decimal_factor,
+            batch_size=options.batch_size,
+            pipeline_batches=options.pipeline_batches,
+            pause_ms=options.pause_ms,
+            max_retries=options.max_retries,
+            report_progress=(
+                (lambda pct, msg: _report_progress(options.report_progress, pct * 0.9, msg))
+                if options.report_progress
+                else None
+            ),
+            stop_event=options.stop_event,
+            pause_event=options.pause_event,
+            log_callback=options.log_callback,
+        )
+        _report_progress(options.report_progress, 95.0, "Assembling candle data")
+        warnings = [f"offer_side:{request.offer_side}", f"price_type:{request.price_type}"]
+
+        if df.empty:
+            raise RuntimeError(
+                f"No candle data for {request.sym} in range "
+                f"{request.requested_start} → {request.requested_end}"
+            )
+
+        if request.normalized_tf != "m1":
+            df = _resample_candles(df, request.normalized_tf)
+        return df, warnings
+
+    @staticmethod
+    async def _download_both_minute_sides(
+        *,
+        request: _TickRequest,
+        options: _TickDownloadOptions,
+    ) -> pd.DataFrame:
+        bid_df = await _download_minute_side_dataframe(
+            request.instrument,
+            request.start_dt,
+            request.end_dt,
+            side="bid",
+            decimal_factor=request.decimal_factor,
+            batch_size=options.batch_size,
+            pipeline_batches=options.pipeline_batches,
+            pause_ms=options.pause_ms,
+            max_retries=options.max_retries,
+            report_progress=(
+                (lambda pct, msg: _report_progress(options.report_progress, pct * 0.45, f"Bid {msg}"))
+                if options.report_progress
+                else None
+            ),
+            stop_event=options.stop_event,
+            pause_event=options.pause_event,
+            log_callback=options.log_callback,
+        )
+        ask_df = await _download_minute_side_dataframe(
+            request.instrument,
+            request.start_dt,
+            request.end_dt,
+            side="ask",
+            decimal_factor=request.decimal_factor,
+            batch_size=options.batch_size,
+            pipeline_batches=options.pipeline_batches,
+            pause_ms=options.pause_ms,
+            max_retries=options.max_retries,
+            report_progress=(
+                (
+                    lambda pct, msg: _report_progress(
+                        options.report_progress, 45.0 + (pct * 0.45), f"Ask {msg}"
+                    )
+                )
+                if options.report_progress
+                else None
+            ),
+            stop_event=options.stop_event,
+            pause_event=options.pause_event,
+            log_callback=options.log_callback,
+        )
+        _report_progress(options.report_progress, 95.0, "Merging bid/ask candle data")
+        if bid_df.empty or ask_df.empty:
+            raise RuntimeError(
+                f"No bid/ask candle data for {request.sym} in range "
+                f"{request.requested_start} → {request.requested_end}"
+            )
+        bid_prefixed = _prefix_ohlcv_columns(bid_df, "bid")
+        ask_prefixed = _prefix_ohlcv_columns(ask_df, "ask")
+        if request.normalized_tf != "m1":
+            bid_prefixed = _resample_side_prefixed_ohlcv(bid_prefixed, request.normalized_tf, "bid")
+            ask_prefixed = _resample_side_prefixed_ohlcv(ask_prefixed, request.normalized_tf, "ask")
+        return (
+            bid_prefixed.merge(ask_prefixed, on="timestamp", how="inner")
+            .sort_values("timestamp")
+            .drop_duplicates(subset=["timestamp"])
+            .reset_index(drop=True)
         )
 
 

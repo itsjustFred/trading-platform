@@ -147,3 +147,15 @@ def resolve_executable(name: str) -> str:
             if path:
                 return path
     raise FileNotFoundError(f"Executable '{name}' not found in PATH")
+
+
+def ensure_path_within_workspace(path: Path) -> Path:
+    """Resolve ``path`` and reject anything outside the project workspace.
+
+    Guards operator-facing CLI tools against LLM-supplied arguments that
+    escape the repository (python:S8707).
+    """
+    resolved = path.expanduser().resolve()
+    if not resolved.is_relative_to(PROJECT_ROOT):
+        raise ValueError(f"Path escapes the project workspace: {resolved}")
+    return resolved

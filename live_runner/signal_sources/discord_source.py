@@ -699,10 +699,7 @@ class DiscordSignalSource(BaseSignalSource):
                             }
                         },
                     )
-            try:
-                await asyncio.sleep(max(rate_limit_retry_after, POLL_INTERVAL))
-            except asyncio.CancelledError:
-                raise
+            await asyncio.sleep(max(rate_limit_retry_after, POLL_INTERVAL))
 
     async def connect(self) -> None:
         if self._connected:

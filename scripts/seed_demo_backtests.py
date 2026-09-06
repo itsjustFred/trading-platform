@@ -7,6 +7,13 @@ from shared.database import init_db, save_result_to_sqlite
 from shared.models import BacktestMeta, BacktestResult, EquityPoint, IndicatorSeries, Trade, TradeExit
 
 
+# Demo timestamps inside the generated OHLCV window.
+_TS_10 = "2024-01-03T10:00:00+00:00"
+_TS_18 = "2024-01-03T18:00:00+00:00"
+_TS_09 = "2024-01-03T09:00:00+00:00"
+_TS_11 = "2024-01-03T11:00:00+00:00"
+
+
 def mk_ohlcv(symbol: str, base: float, source: str, asset_class: str, timeframe: str = "1h") -> None:
     ts = pd.date_range("2024-01-01T00:00:00Z", periods=220, freq="h", tz="UTC")
     rows = []
@@ -33,12 +40,12 @@ def main() -> None:
         id=1,
         symbol="AAPL",
         direction="LONG",
-        entry_time="2024-01-03T10:00:00+00:00",
+        entry_time=_TS_10,
         entry_price=160.0,
         quantity=10,
         exits=[
             TradeExit(time="2024-01-03T14:00:00+00:00", price=162.0, quantity=5, pnl=10.0, reason="tp1"),
-            TradeExit(time="2024-01-03T18:00:00+00:00", price=164.5, quantity=5, pnl=22.5, reason="tp2"),
+            TradeExit(time=_TS_18, price=164.5, quantity=5, pnl=22.5, reason="tp2"),
         ],
         pnl=32.5,
         pnl_pct=2.03,
@@ -69,9 +76,9 @@ def main() -> None:
             name="SMA 20",
             type="overlay",
             data=[
-                {"time": "2024-01-03T09:00:00+00:00", "value": 159.0},
-                {"time": "2024-01-03T10:00:00+00:00", "value": 159.2},
-                {"time": "2024-01-03T11:00:00+00:00", "value": 159.5},
+                {"time": _TS_09, "value": 159.0},
+                {"time": _TS_10, "value": 159.2},
+                {"time": _TS_11, "value": 159.5},
             ],
             style={"color": "#60a5fa"},
         ),
@@ -79,9 +86,9 @@ def main() -> None:
             name="RSI 14",
             type="panel",
             data=[
-                {"time": "2024-01-03T09:00:00+00:00", "value": 55.0},
-                {"time": "2024-01-03T10:00:00+00:00", "value": 62.1},
-                {"time": "2024-01-03T11:00:00+00:00", "value": 58.4},
+                {"time": _TS_09, "value": 55.0},
+                {"time": _TS_10, "value": 62.1},
+                {"time": _TS_11, "value": 58.4},
             ],
             style={"color": "#a78bfa"},
         ),
@@ -91,7 +98,7 @@ def main() -> None:
         {
             "type": "marker",
             "symbol": "AAPL",
-            "time": "2024-01-03T10:00:00+00:00",
+            "time": _TS_10,
             "position": "belowBar",
             "shape": "arrowUp",
             "color": "#22c55e",
@@ -100,8 +107,8 @@ def main() -> None:
         {
             "type": "line",
             "symbol": "AAPL",
-            "start_time": "2024-01-03T10:00:00+00:00",
-            "end_time": "2024-01-03T18:00:00+00:00",
+            "start_time": _TS_10,
+            "end_time": _TS_18,
             "start_value": 160.0,
             "end_value": 164.5,
             "color": "#f59e0b",
@@ -110,8 +117,8 @@ def main() -> None:
             "type": "line_with_breaks",
             "symbol": "AAPL",
             "data": [
-                {"time": "2024-01-03T10:00:00+00:00", "value": 159.8},
-                {"time": "2024-01-03T11:00:00+00:00", "value": 160.4},
+                {"time": _TS_10, "value": 159.8},
+                {"time": _TS_11, "value": 160.4},
                 {"time": "2024-01-03T12:00:00+00:00", "value": None},
                 {"time": "2024-01-03T13:00:00+00:00", "value": 161.3},
             ],
@@ -120,7 +127,7 @@ def main() -> None:
         {
             "type": "box",
             "symbol": "AAPL",
-            "start_time": "2024-01-03T09:00:00+00:00",
+            "start_time": _TS_09,
             "end_time": "2024-01-03T13:00:00+00:00",
             "low": 158.8,
             "high": 161.1,
@@ -142,8 +149,8 @@ def main() -> None:
         ),
         trades=[trade1, trade1b],
         equity_curve=[
-            EquityPoint(time="2024-01-03T10:00:00+00:00", equity=100000.0),
-            EquityPoint(time="2024-01-03T18:00:00+00:00", equity=100032.5),
+            EquityPoint(time=_TS_10, equity=100000.0),
+            EquityPoint(time=_TS_18, equity=100032.5),
         ],
         indicators=indicators1,
         drawings=drawings1,

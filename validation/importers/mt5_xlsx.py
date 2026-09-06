@@ -209,52 +209,64 @@ class MT5XLSXImporter(BaseImporter):
                 in_settings = False
                 continue
 
-            # Meta fields
-            if label_str == "Expertenprogramm:":
-                val = row[3] if len(row) > 3 and pd.notna(row[3]) else None
-                meta["strategy_name"] = str(val) if val is not None else "unknown"
-                continue
-            if label_str == "Symbol:":
-                val = row[3] if len(row) > 3 and pd.notna(row[3]) else None
-                meta["symbol"] = str(val) if val is not None else ""
-                continue
-            if label_str == "Periode:":
-                val = row[3] if len(row) > 3 and pd.notna(row[3]) else None
-                if val is not None:
-                    tf_match = re.search(r"^(\w+)\s*\(", str(val))
-                    meta["timeframe"] = tf_match.group(1).lower() if tf_match else str(val)
-                continue
-            if label_str == "Ersteinlage:":
-                val = row[3] if len(row) > 3 and pd.notna(row[3]) else None
-                meta["initial_capital"] = float(val) if val is not None else None
-                continue
-            if label_str == "Hebel:":
-                val = row[3] if len(row) > 3 and pd.notna(row[3]) else None
-                meta["leverage"] = str(val) if val is not None else None
+            if MT5XLSXImporter._apply_meta_row(row, label_str, meta):
                 continue
 
-            # Settings / parameters (look in first 8 columns for key=value patterns)
             if in_settings:
-                for cell in row[:12]:
-                    if cell is None or (isinstance(cell, float) and pd.isna(cell)):
-                        continue
-                    val_str = str(cell).strip()
-                    if "=" in val_str:
-                        key, _, v = val_str.partition("=")
-                        key = key.strip()
-                        v = v.strip()
-                        if not key:
-                            continue
-                        if not v:
-                            # Section header like "Breakout Parameters="
-                            current_section = key
-                        else:
-                            meta["settings"][key] = MT5XLSXImporter._coerce_setting(v)
-                    elif val_str and current_section and val_str not in meta["settings"]:
-                        # Stand-alone setting name
-                        meta["settings"][val_str] = True
+                current_section = MT5XLSXImporter._parse_settings_row(
+                    row, current_section, meta["settings"]
+                )
 
         return meta
+
+    @staticmethod
+    def _meta_val(row: list[Any]) -> Any:
+        return row[3] if len(row) > 3 and pd.notna(row[3]) else None
+
+    @staticmethod
+    def _apply_meta_row(row: list[Any], label_str: str, meta: dict[str, Any]) -> bool:
+        """Apply one meta row (label in column 0); True when the row was a meta label."""
+        val = MT5XLSXImporter._meta_val(row)
+        if label_str == "Expertenprogramm:":
+            meta["strategy_name"] = str(val) if val is not None else "unknown"
+        elif label_str == "Symbol:":
+            meta["symbol"] = str(val) if val is not None else ""
+        elif label_str == "Periode:":
+            if val is not None:
+                tf_match = re.search(r"^(\w+)\s*\(", str(val))
+                meta["timeframe"] = tf_match.group(1).lower() if tf_match else str(val)
+        elif label_str == "Ersteinlage:":
+            meta["initial_capital"] = float(val) if val is not None else None
+        elif label_str == "Hebel:":
+            meta["leverage"] = str(val) if val is not None else None
+        else:
+            return False
+        return True
+
+    @staticmethod
+    def _parse_settings_row(
+        row: list[Any], current_section: str | None, settings: dict[str, Any]
+    ) -> str | None:
+        """Parse one settings row; returns the (possibly new) current section."""
+        for cell in row[:12]:
+            if cell is None or (isinstance(cell, float) and pd.isna(cell)):
+                continue
+            val_str = str(cell).strip()
+            if "=" in val_str:
+                key, _, v = val_str.partition("=")
+                key = key.strip()
+                v = v.strip()
+                if not key:
+                    continue
+                if not v:
+                    # Section header like "Breakout Parameters="
+                    current_section = key
+                else:
+                    settings[key] = MT5XLSXImporter._coerce_setting(v)
+            elif val_str and current_section and val_str not in settings:
+                # Stand-alone setting name
+                settings[val_str] = True
+        return current_section
 
     @staticmethod
     def _coerce_setting(value: str) -> Any:
@@ -280,55 +292,14 @@ class MT5XLSXImporter(BaseImporter):
     def _parse_stats(rows: list[list[Any]], orders_header_idx: int) -> dict[str, Any]:
         stats: dict[str, Any] = {}
         for row in rows[:orders_header_idx]:
-            # Stats can be in columns 0-3, 4-7 or 8-11
-            label_value_groups = []
-            for col_offset in (0, 4, 8):
-                if len(row) <= col_offset:
-                    continue
-                label = row[col_offset]
-                if label is None or (isinstance(label, float) and pd.isna(label)):
-                    continue
-                label_str = str(label).strip()
-                val_col = col_offset + 3
-                val = row[val_col] if len(row) > val_col and pd.notna(row[val_col]) else None
-                label_value_groups.append((label_str, val))
-
-            for label_str, val in label_value_groups:
+            for label_str, val in MT5XLSXImporter._stat_label_value_groups(row):
                 key = _STAT_LABEL_MAP.get(label_str.rstrip(":"))
                 if key is None:
                     key = _STAT_LABEL_MAP.get(label_str.rstrip(" :"))
                 if key is None:
                     continue
 
-                if key == "winners_with_pct":
-                    w, pct = MT5XLSXImporter._parse_count_pct(val)
-                    if w is not None:
-                        stats["winners"] = w
-                    if pct is not None:
-                        stats["win_rate"] = pct
-                    continue
-                if key == "losers_with_pct":
-                    l, pct = MT5XLSXImporter._parse_count_pct(val)
-                    if l is not None:
-                        stats["losers"] = l
-                    continue
-                if key == "max_drawdown_pct":
-                    pct = MT5XLSXImporter._extract_first_percent(val)
-                    if pct is not None:
-                        stats["max_drawdown_pct"] = pct
-                    continue
-                if key == "max_drawdown_max":
-                    pct = MT5XLSXImporter._extract_first_percent(val)
-                    if pct is not None:
-                        stats["max_drawdown_max_pct"] = pct
-                    abs_val = MT5XLSXImporter._extract_parenthesized_number(val)
-                    if abs_val is not None:
-                        stats["max_drawdown_abs"] = abs_val
-                    continue
-
-                parsed = MT5XLSXImporter._coerce_stat(val)
-                if parsed is not None:
-                    stats[key] = parsed
+                MT5XLSXImporter._apply_stat_key(key, val, stats)
 
         # Derive total_return if possible
         if "total_pnl" in stats and "initial_capital" in stats:
@@ -337,6 +308,59 @@ class MT5XLSXImporter(BaseImporter):
                 stats["total_return"] = (stats["total_pnl"] / ic) * 100.0
 
         return stats
+
+    @staticmethod
+    def _stat_label_value_groups(row: list[Any]) -> list[tuple[str, Any]]:
+        """Extract (label, value) pairs; stats can be in columns 0-3, 4-7 or 8-11."""
+        label_value_groups: list[tuple[str, Any]] = []
+        for col_offset in (0, 4, 8):
+            if len(row) <= col_offset:
+                continue
+            label = row[col_offset]
+            if label is None or (isinstance(label, float) and pd.isna(label)):
+                continue
+            label_str = str(label).strip()
+            val_col = col_offset + 3
+            val = row[val_col] if len(row) > val_col and pd.notna(row[val_col]) else None
+            label_value_groups.append((label_str, val))
+        return label_value_groups
+
+    @staticmethod
+    def _apply_stat_key(key: str, val: Any, stats: dict[str, Any]) -> None:
+        """Apply one mapped stat key/value to the stats dict."""
+        if key == "winners_with_pct":
+            w, pct = MT5XLSXImporter._parse_count_pct(val)
+            if w is not None:
+                stats["winners"] = w
+            if pct is not None:
+                stats["win_rate"] = pct
+            return
+        if key == "losers_with_pct":
+            l, _pct = MT5XLSXImporter._parse_count_pct(val)
+            if l is not None:
+                stats["losers"] = l
+            return
+        if key == "max_drawdown_pct":
+            pct = MT5XLSXImporter._extract_first_percent(val)
+            if pct is not None:
+                stats["max_drawdown_pct"] = pct
+            return
+        if key == "max_drawdown_max":
+            MT5XLSXImporter._apply_max_drawdown_max(val, stats)
+            return
+
+        parsed = MT5XLSXImporter._coerce_stat(val)
+        if parsed is not None:
+            stats[key] = parsed
+
+    @staticmethod
+    def _apply_max_drawdown_max(val: Any, stats: dict[str, Any]) -> None:
+        pct = MT5XLSXImporter._extract_first_percent(val)
+        if pct is not None:
+            stats["max_drawdown_max_pct"] = pct
+        abs_val = MT5XLSXImporter._extract_parenthesized_number(val)
+        if abs_val is not None:
+            stats["max_drawdown_abs"] = abs_val
 
     @staticmethod
     def _parse_count_pct(val: Any) -> tuple[int | None, float | None]:
@@ -468,7 +492,6 @@ class MT5XLSXImporter(BaseImporter):
             return []
 
         col_time = MT5XLSXImporter._find_col(trades_df, ["Zeit"])
-        col_trade_id = MT5XLSXImporter._find_col(trades_df, ["Trade"])
         col_symbol = MT5XLSXImporter._find_col(trades_df, ["Symbol"])
         col_typ = MT5XLSXImporter._find_col(trades_df, ["Typ"])
         col_direction = MT5XLSXImporter._find_col(trades_df, ["Richtung"])
@@ -687,6 +710,35 @@ class MT5XLSXImporter(BaseImporter):
             trade_id_counter += 1
 
         return trades
+
+    @staticmethod
+    def _find_exit_row(
+        rows_list: list[dict[str, Any]],
+        start: int,
+        col_typ: str | None,
+        col_direction: str | None,
+    ) -> tuple[dict[str, Any] | None, int]:
+        """Find the exit row matching the entry at ``start - 1``.
+
+        Returns ``(exit_row, next_index)`` where ``next_index`` is the index the
+        caller should continue scanning from when no exit row was found.
+        """
+        j = start
+        n = len(rows_list)
+        while j < n:
+            nxt = rows_list[j]
+            nxt_typ = MT5XLSXImporter._get_str(nxt, col_typ, "").lower()
+            nxt_dir = MT5XLSXImporter._get_str(nxt, col_direction, "").lower()
+            if nxt_typ == "balance":
+                j += 1
+                continue
+            if nxt_dir == "out":
+                return nxt, j
+            if nxt_dir == "in":
+                # Unexpected next entry without exit — skip current entry
+                return None, j
+            j += 1
+        return None, j
 
     @staticmethod
     def _get_str(row: dict[str, Any], col: str | None, default: str) -> str:

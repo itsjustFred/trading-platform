@@ -55,9 +55,9 @@ def generate_signals(df: pd.DataFrame, params: dict):
     atr = tr.rolling(atr_period).mean()
 
     if "timestamp" in df.columns:
-        ts = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
-        day = ts.dt.date
-        minute_of_day = ts.dt.hour * 60 + ts.dt.minute
+        timestamp_series = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+        day = timestamp_series.dt.date
+        minute_of_day = timestamp_series.dt.hour * 60 + timestamp_series.dt.minute
     else:
         ts = pd.Series(pd.NaT, index=df.index)
         day = pd.Series(range(len(df)), index=df.index) // 7

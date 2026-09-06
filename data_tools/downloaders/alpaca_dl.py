@@ -37,6 +37,7 @@ TIMEFRAME_MAP: dict[str, str] = {
 }
 
 ALPACA_MAX_LIMIT = 10_000
+ALPACA_PY_REQUIRED_MESSAGE = "alpaca-py is required. Install dependency 'alpaca-py'."
 
 
 def _normalize_supported_timeframe(value: str) -> str:
@@ -97,14 +98,14 @@ class AlpacaDownloader(Downloader):
         try:
             from alpaca.data.historical import StockHistoricalDataClient
         except ImportError as exc:
-            raise RuntimeError("alpaca-py is required. Install dependency 'alpaca-py'.") from exc
+            raise RuntimeError(ALPACA_PY_REQUIRED_MESSAGE) from exc
         return StockHistoricalDataClient(api_key=self.api_key, secret_key=self.secret_key)
 
     def _to_alpaca_timeframe(self, timeframe: str):
         try:
             from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
         except ImportError as exc:
-            raise RuntimeError("alpaca-py is required. Install dependency 'alpaca-py'.") from exc
+            raise RuntimeError(ALPACA_PY_REQUIRED_MESSAGE) from exc
 
         if timeframe == "1m":
             return TimeFrame.Minute
@@ -223,7 +224,7 @@ class AlpacaDownloader(Downloader):
         try:
             from alpaca.data.requests import StockBarsRequest
         except ImportError as exc:
-            raise RuntimeError("alpaca-py is required. Install dependency 'alpaca-py'.") from exc
+            raise RuntimeError(ALPACA_PY_REQUIRED_MESSAGE) from exc
 
         client = self._build_client()
         alpaca_tf = self._to_alpaca_timeframe(canonical_tf)

@@ -153,7 +153,6 @@ def resample_directory(source_dir: Path, from_tf: str, timeframes: list[str]) ->
 
     Finds all {from_tf}.parquet files under source_dir and resamples each.
     """
-    pattern = f"**/{from_tf}.parquet"
     source_files = sorted(source_dir.rglob(f"{from_tf}.parquet"))
 
     if not source_files:

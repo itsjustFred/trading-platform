@@ -171,7 +171,15 @@ OHLCV_PARQUET_SUFFIX = ".parquet"
 
 BACKTESTS_DIR = DATA_DIR / "backtests"
 MATRIX_RESULTS_DIR = DATA_DIR / "backtests" / "matrix_runner"
-MATRIX_GRID_OVERVIEW_PATH = PROJECT_ROOT / "frontend" / "public" / "matrix-grid-overview.json"
+MATRIX_GRID_OVERVIEW_FILE = "matrix-grid-overview.json"
+MATRIX_GRID_OVERVIEW_PATH = PROJECT_ROOT / "frontend" / "public" / MATRIX_GRID_OVERVIEW_FILE
+LIVE_DEPLOYMENTS_PATH = "/api/live/deployments"
+TASK_NOT_FOUND_DETAIL = "Task not found"
+PARQUET_SUFFIX = ".parquet"
+NOT_FOUND_DETAIL = "Not found"
+SAVED_TO_PREFIX = "saved to:"
+SAVING_RESULTS_MESSAGE = "Saving results..."
+SERVICE_NOT_FOUND_DETAIL = "Service not found"
 PORTFOLIOS_DIR = DATA_DIR / "portfolios"
 STRATEGIES_DIR = DEFAULT_STRATEGIES_DIR
 REACT_DIST = PROJECT_ROOT / "frontend" / "dist"
@@ -508,8 +516,6 @@ def _resume_interrupted_tasks() -> None:
 
             task_type = str(record.get("type") or "")
             raw_config = dict(record.get("config_json") or {})
-            restart_config = raw_config.get("restart_config")
-            backtest_config = dict(restart_config) if isinstance(restart_config, dict) else dict(raw_config)
 
             if task_type == "backtest":
                 strategy = str(backtest_config.get("strategy") or "").strip()
@@ -572,146 +578,247 @@ def _resume_interrupted_tasks() -> None:
                 continue
 
             if task_type == "data":
-                source = str(record.get("source") or raw_config.get("source") or "").strip().lower()
-                downloader = str(raw_config.get("downloader") or source or "").strip().lower()
-                symbols = [str(item).strip().upper() for item in raw_config.get("symbols", []) if str(item).strip()]
-                timeframes = [
-                    str(item).strip().lower()
-                    for item in raw_config.get("timeframes", [])
-                    if str(item).strip()
-                ]
-                total_items = max(int(raw_config.get("total_items", 0) or 0), 0)
-                name = str(record.get("name") or "Recovered data task")
-                description = str(record.get("description") or "")
-                start = str(raw_config.get("start") or "").strip() or None
-                end = str(raw_config.get("end") or "").strip() or None
-
-                if downloader in {"dukascopy", "jforex"} and symbols and timeframes:
-                    downloader = "dukascopy" if downloader == "dukascopy" else "jforex"
-                    cmd = raw_config.get("command")
-                    if not isinstance(cmd, list) or not cmd:
-                        logger.warning(
-                            "Skipping auto-recovery for data task %s: missing command for %s",
-                            task_id,
-                            downloader,
-                        )
-                        upsert_background_task_record(
-                            task_id=task_id,
-                            task_type=task_type,
-                            status="queued",
-                            config_json=raw_config,
-                            progress_message="Recovery pending manual restart; missing restart command",
-                            name=str(record.get("name") or ""),
-                            description=str(record.get("description") or ""),
-                            source=str(record.get("source") or ""),
-                            created_at=str(record.get("created_at") or ""),
-                            updated_at=_now_iso(),
-                        )
-                        continue
-
-                    logger.info("Auto-restarting %s data task %s", downloader, task_id)
-                    cmd_list = [str(part) for part in cmd]
-                    _start_jforex_task(
-                        task_id,
-                        cmd_list,
-                        source_label=downloader,
-                        allow_native_fallback=(downloader == "dukascopy"),
-                        symbols=symbols,
-                        timeframes=timeframes,
-                        start=start,
-                        end=end,
-                        offer_side=str(raw_config.get("offer_side") or raw_config.get("price_type") or "bid"),
-                        merge_tick=bool(raw_config.get("merge_tick", False)),
-                        merge_s1=bool(raw_config.get("merge_s1", False)),
-                        batch_size=_safe_int(raw_config.get("batch_size"), 10),
-                        pause_ms=_safe_int(raw_config.get("pause_ms"), 1000),
-                        query_timeout_seconds=_safe_int(raw_config.get("query_timeout_seconds"), 900),
-                        total_items=total_items or max(len(symbols) * len(timeframes), 1),
-                        name=name,
-                        description=description,
-                    )
-                    _apply_recovery_data_metadata(
-                        task_id,
-                        command=cmd_list,
-                        downloader=downloader,
-                        symbols=symbols,
-                        timeframes=timeframes,
-                        start=start,
-                        end=end,
-                        offer_side=str(raw_config.get("offer_side") or "bid"),
-                        price_type=str(raw_config.get("price_type") or "bid"),
-                        merge_tick=bool(raw_config.get("merge_tick", False)),
-                        merge_s1=bool(raw_config.get("merge_s1", False)),
-                        batch_size=_safe_int(raw_config.get("batch_size"), 10),
-                        pause_ms=_safe_int(raw_config.get("pause_ms"), 1000),
-                        query_timeout_seconds=_safe_int(raw_config.get("query_timeout_seconds"), 900),
-                    )
-                    continue
-
-                command = raw_config.get("command")
-                if isinstance(command, list) and command:
-                    logger.info("Auto-restarting data task %s via persisted command", task_id)
-                    _start_data_task(
-                        task_id,
-                        [str(part) for part in command],
-                        total_items=total_items,
-                        name=name,
-                        description=description,
-                        kind="data",
-                        source=source or downloader or "data",
-                    )
-                    _apply_recovery_data_metadata(
-                        task_id,
-                        command=[str(part) for part in command],
-                        downloader=downloader or None,
-                        symbols=symbols or None,
-                        timeframes=timeframes or None,
-                        start=start,
-                        end=end,
-                        offer_side=str(raw_config.get("offer_side") or "") or None,
-                        price_type=str(raw_config.get("price_type") or "") or None,
-                        merge_tick=(
-                            bool(raw_config.get("merge_tick"))
-                            if raw_config.get("merge_tick") is not None
-                            else None
-                        ),
-                        merge_s1=(
-                            bool(raw_config.get("merge_s1"))
-                            if raw_config.get("merge_s1") is not None
-                            else None
-                        ),
-                        batch_size=(
-                            _safe_int(raw_config.get("batch_size"))
-                            if raw_config.get("batch_size") is not None
-                            else None
-                        ),
-                        pause_ms=(
-                            _safe_int(raw_config.get("pause_ms"))
-                            if raw_config.get("pause_ms") is not None
-                            else None
-                        ),
-                        query_timeout_seconds=(
-                            _safe_int(raw_config.get("query_timeout_seconds"))
-                            if raw_config.get("query_timeout_seconds") is not None
-                            else None
-                        ),
-                    )
-                    continue
-
-                upsert_background_task_record(
-                    task_id=task_id,
-                    task_type=task_type,
-                    status="queued",
-                    config_json=raw_config,
-                    progress_message="Recovery pending manual restart; missing restart metadata",
-                    name=str(record.get("name") or ""),
-                    description=str(record.get("description") or ""),
-                    source=str(record.get("source") or ""),
-                    created_at=str(record.get("created_at") or ""),
-                    updated_at=_now_iso(),
-                )
+                _resume_interrupted_data_task(record, task_id, raw_config)
         except Exception as exc:
             logger.warning("Failed to recover interrupted task %s: %s", record.get("id"), exc)
+
+
+def _resume_interrupted_backtest_task(
+    record: dict[str, Any], task_id: str, raw_config: dict[str, Any]
+) -> None:
+    restart_config = raw_config.get("restart_config")
+    backtest_config = dict(restart_config) if isinstance(restart_config, dict) else dict(raw_config)
+    strategy = str(backtest_config.get("strategy") or "").strip()
+    symbols = backtest_config.get("symbols")
+    if not strategy or not isinstance(symbols, list) or not symbols:
+        logger.warning(
+            "Skipping auto-recovery for task %s: incomplete backtest restart config",
+            task_id,
+        )
+        return
+
+    logger.info(
+        "Auto-restarting backtest task %s (%s %s %s)",
+        task_id,
+        strategy,
+        ",".join(str(symbol) for symbol in symbols),
+        str(backtest_config.get("timeframe") or "1d"),
+    )
+    request_payload = BacktestRunRequest(
+        strategy=strategy,
+        engine=str(backtest_config.get("engine") or "native"),
+        symbols=[str(symbol) for symbol in symbols if str(symbol).strip()],
+        timeframe=str(backtest_config.get("timeframe") or "1d"),
+        start=str(backtest_config.get("start") or ""),
+        end=str(backtest_config.get("end") or ""),
+        capital=float(backtest_config.get("capital") or 100000.0),
+        risk_per_trade_pct=backtest_config.get("risk_per_trade_pct"),
+        max_position_pct=backtest_config.get("max_position_pct"),
+        max_leverage=backtest_config.get("max_leverage"),
+        modeling_resolution=(
+            str(backtest_config.get("modeling_resolution"))
+            if backtest_config.get("modeling_resolution") is not None
+            else None
+        ),
+        intrabar_resolution=(
+            str(backtest_config.get("intrabar_resolution"))
+            if backtest_config.get("intrabar_resolution") is not None
+            else None
+        ),
+        parameters=dict(backtest_config.get("parameters") or {}),
+    )
+    restarted = asyncio.run(run_backtest(request_payload))
+    restarted_task_id = restarted.get("task_id") if isinstance(restarted, dict) else None
+    upsert_background_task_record(
+        task_id=task_id,
+        task_type=str(record.get("type") or ""),
+        status="completed",
+        config_json=raw_config,
+        progress_message=(
+            f"Auto-restarted as task {restarted_task_id}"
+            if restarted_task_id
+            else "Auto-restarted as new task"
+        ),
+        name=str(record.get("name") or ""),
+        description=str(record.get("description") or ""),
+        source=str(record.get("source") or ""),
+        created_at=str(record.get("created_at") or ""),
+        updated_at=_now_iso(),
+    )
+
+
+def _resume_interrupted_data_task(
+    record: dict[str, Any], task_id: str, raw_config: dict[str, Any]
+) -> None:
+    task_type = str(record.get("type") or "")
+    source = str(record.get("source") or raw_config.get("source") or "").strip().lower()
+    downloader = str(raw_config.get("downloader") or source or "").strip().lower()
+    symbols = [str(item).strip().upper() for item in raw_config.get("symbols", []) if str(item).strip()]
+    timeframes = [
+        str(item).strip().lower()
+        for item in raw_config.get("timeframes", [])
+        if str(item).strip()
+    ]
+    total_items = max(int(raw_config.get("total_items", 0) or 0), 0)
+    name = str(record.get("name") or "Recovered data task")
+    description = str(record.get("description") or "")
+    start = str(raw_config.get("start") or "").strip() or None
+    end = str(raw_config.get("end") or "").strip() or None
+
+    if downloader in {"dukascopy", "jforex"} and symbols and timeframes:
+        _resume_interrupted_downloader_task(
+            record=record,
+            task_id=task_id,
+            raw_config=raw_config,
+            downloader=downloader,
+            symbols=symbols,
+            timeframes=timeframes,
+            total_items=total_items,
+            name=name,
+            description=description,
+            start=start,
+            end=end,
+        )
+        return
+
+    command = raw_config.get("command")
+    if isinstance(command, list) and command:
+        logger.info("Auto-restarting data task %s via persisted command", task_id)
+        _start_data_task(
+            task_id,
+            [str(part) for part in command],
+            total_items=total_items,
+            name=name,
+            description=description,
+            kind="data",
+            source=source or downloader or "data",
+        )
+        _apply_recovery_data_metadata(
+            task_id,
+            command=[str(part) for part in command],
+            downloader=downloader or None,
+            symbols=symbols or None,
+            timeframes=timeframes or None,
+            start=start,
+            end=end,
+            offer_side=str(raw_config.get("offer_side") or "") or None,
+            price_type=str(raw_config.get("price_type") or "") or None,
+            merge_tick=(
+                bool(raw_config.get("merge_tick"))
+                if raw_config.get("merge_tick") is not None
+                else None
+            ),
+            merge_s1=(
+                bool(raw_config.get("merge_s1"))
+                if raw_config.get("merge_s1") is not None
+                else None
+            ),
+            batch_size=(
+                _safe_int(raw_config.get("batch_size"))
+                if raw_config.get("batch_size") is not None
+                else None
+            ),
+            pause_ms=(
+                _safe_int(raw_config.get("pause_ms"))
+                if raw_config.get("pause_ms") is not None
+                else None
+            ),
+            query_timeout_seconds=(
+                _safe_int(raw_config.get("query_timeout_seconds"))
+                if raw_config.get("query_timeout_seconds") is not None
+                else None
+            ),
+        )
+        return
+
+    upsert_background_task_record(
+        task_id=task_id,
+        task_type=task_type,
+        status="queued",
+        config_json=raw_config,
+        progress_message="Recovery pending manual restart; missing restart metadata",
+        name=str(record.get("name") or ""),
+        description=str(record.get("description") or ""),
+        source=str(record.get("source") or ""),
+        created_at=str(record.get("created_at") or ""),
+        updated_at=_now_iso(),
+    )
+
+
+def _resume_interrupted_downloader_task(
+    *,
+    record: dict[str, Any],
+    task_id: str,
+    raw_config: dict[str, Any],
+    downloader: str,
+    symbols: list[str],
+    timeframes: list[str],
+    total_items: int,
+    name: str,
+    description: str,
+    start: str | None,
+    end: str | None,
+) -> None:
+    task_type = str(record.get("type") or "")
+    downloader = "dukascopy" if downloader == "dukascopy" else "jforex"
+    cmd = raw_config.get("command")
+    if not isinstance(cmd, list) or not cmd:
+        logger.warning(
+            "Skipping auto-recovery for data task %s: missing command for %s",
+            task_id,
+            downloader,
+        )
+        upsert_background_task_record(
+            task_id=task_id,
+            task_type=task_type,
+            status="queued",
+            config_json=raw_config,
+            progress_message="Recovery pending manual restart; missing restart command",
+            name=str(record.get("name") or ""),
+            description=str(record.get("description") or ""),
+            source=str(record.get("source") or ""),
+            created_at=str(record.get("created_at") or ""),
+            updated_at=_now_iso(),
+        )
+        return
+
+    logger.info("Auto-restarting %s data task %s", downloader, task_id)
+    cmd_list = [str(part) for part in cmd]
+    _start_jforex_task(
+        task_id,
+        cmd_list,
+        source_label=downloader,
+        allow_native_fallback=(downloader == "dukascopy"),
+        symbols=symbols,
+        timeframes=timeframes,
+        start=start,
+        end=end,
+        offer_side=str(raw_config.get("offer_side") or raw_config.get("price_type") or "bid"),
+        merge_tick=bool(raw_config.get("merge_tick", False)),
+        merge_s1=bool(raw_config.get("merge_s1", False)),
+        batch_size=_safe_int(raw_config.get("batch_size"), 10),
+        pause_ms=_safe_int(raw_config.get("pause_ms"), 1000),
+        query_timeout_seconds=_safe_int(raw_config.get("query_timeout_seconds"), 900),
+        total_items=total_items or max(len(symbols) * len(timeframes), 1),
+        name=name,
+        description=description,
+    )
+    _apply_recovery_data_metadata(
+        task_id,
+        command=cmd_list,
+        downloader=downloader,
+        symbols=symbols,
+        timeframes=timeframes,
+        start=start,
+        end=end,
+        offer_side=str(raw_config.get("offer_side") or "bid"),
+        price_type=str(raw_config.get("price_type") or "bid"),
+        merge_tick=bool(raw_config.get("merge_tick", False)),
+        merge_s1=bool(raw_config.get("merge_s1", False)),
+        batch_size=_safe_int(raw_config.get("batch_size"), 10),
+        pause_ms=_safe_int(raw_config.get("pause_ms"), 1000),
+        query_timeout_seconds=_safe_int(raw_config.get("query_timeout_seconds"), 900),
+    )
 
 
 @asynccontextmanager
@@ -1133,7 +1240,7 @@ _QUIET_EXACT_PATHS = {
     "/api/tasks",
     "/api/data/tasks",
     "/api/live/accounts",
-    "/api/live/deployments",
+    LIVE_DEPLOYMENTS_PATH,
 }
 _QUIET_PREFIX_PATHS = (
     "/api/tasks/",
@@ -1317,14 +1424,14 @@ def _task_status(task_id: str) -> str | None:
 def _task_action_payload(task_id: str) -> dict[str, Any]:
     task = _snapshot_task(task_id)
     if task is None:
-        raise HTTPException(status_code=404, detail="Task not found")
+        raise HTTPException(status_code=404, detail=TASK_NOT_FOUND_DETAIL)
     return _serialize_task(task_id, task, include_log=True)
 
 
 def _restart_interrupted_task(task_id: str) -> dict[str, Any]:
     task = _get_task(task_id)
     if task is None:
-        raise HTTPException(status_code=404, detail="Task not found")
+        raise HTTPException(status_code=404, detail=TASK_NOT_FOUND_DETAIL)
     current_status = str(task.get("status") or "").lower()
     if current_status not in {"interrupted", "failed"}:
         raise HTTPException(status_code=409, detail="Only interrupted or failed tasks can be restarted")
@@ -1577,42 +1684,39 @@ class _LiveStreamBroker:
             await _queue_live_ws_message(queue, payload)
 
     async def _run_topic(self, state: _LiveStreamTopicState) -> None:
-        try:
-            while True:
-                await asyncio.sleep(max(0.1, state.poll_seconds))
-                try:
-                    payload = await state.fetch_payload()
-                except Exception as exc:
-                    await self._broadcast(
-                        state,
-                        {
-                            "type": "error",
-                            "topic": state.topic,
-                            "error": _live_ws_error_detail(exc),
-                            "ts": time.time(),
-                        },
-                    )
-                    continue
-
-                signature = _stable_payload_signature(payload)
-                is_initial = state.last_signature is None
-                if signature == state.last_signature:
-                    continue
-                state.last_signature = signature
-                state.last_payload = payload
-                if is_initial:
-                    continue
+        while True:
+            await asyncio.sleep(max(0.1, state.poll_seconds))
+            try:
+                payload = await state.fetch_payload()
+            except Exception as exc:
                 await self._broadcast(
                     state,
                     {
-                        "type": "update",
+                        "type": "error",
                         "topic": state.topic,
-                        "data": payload,
+                        "error": _live_ws_error_detail(exc),
                         "ts": time.time(),
                     },
                 )
-        except asyncio.CancelledError:
-            raise
+                continue
+
+            signature = _stable_payload_signature(payload)
+            is_initial = state.last_signature is None
+            if signature == state.last_signature:
+                continue
+            state.last_signature = signature
+            state.last_payload = payload
+            if is_initial:
+                continue
+            await self._broadcast(
+                state,
+                {
+                    "type": "update",
+                    "topic": state.topic,
+                    "data": payload,
+                    "ts": time.time(),
+                },
+            )
 
     async def shutdown(self) -> None:
         states: list[_LiveStreamTopicState]
@@ -1663,6 +1767,13 @@ _DATA_SEGMENT_METADATA_KEYS = {
     "validation",
     "error",
 }
+
+
+# Residual position size below this threshold is treated as flat. Broker
+# fills and aggregated quantities are floats; exact-zero equality (S1244)
+# leaves dust positions open and pollutes the average price of the next fill.
+# 1e-6 also absorbs the float error of closing fills that overshoot by dust.
+LIVE_POSITION_FLAT_THRESHOLD = 1e-6
 
 
 def _safe_float(value: object, default: float = 0.0) -> float:
@@ -2115,7 +2226,7 @@ def _snapshot_portfolio_payloads() -> list[dict[str, Any]]:
     for file_path in sorted(PORTFOLIOS_DIR.glob("*.json")):
         try:
             data = _normalize_portfolio_payload(json.loads(file_path.read_text(encoding="utf-8")))
-        except (json.JSONDecodeError, OSError, TypeError, ValueError) as exc:
+        except (OSError, TypeError, ValueError) as exc:
             logger.warning("Could not read portfolio %s: %s", file_path.name, exc)
             continue
         portfolio_id = str(data.get("id") or file_path.stem).strip()
@@ -2248,7 +2359,7 @@ def _delete_portfolio_with_artifacts(portfolio_id: str) -> bool:
     try:
         deleted_db = delete_portfolio_record(normalized_id)
     except Exception as exc:
-        logger.warning("Could not delete portfolio %s from DB: %s", normalized_id, exc)
+        logger.warning("Could not delete portfolio %s from DB: %s", _log_safe(normalized_id), exc)
 
     path = _contained_asset_path(PORTFOLIOS_DIR, normalized_id, ".json")
     deleted_file = False
@@ -2307,6 +2418,48 @@ def _ensure_backtest_meta_cache() -> None:
         ):
             return
     _refresh_backtest_meta_cache()
+
+
+def _resolve_backtest_output_id(output_path: str) -> tuple[str, str]:
+    """Map a 'saved to' path to (output_path, backtest_id) for a trades result file."""
+    if not output_path:
+        return "", ""
+    filename = Path(output_path).name
+    if not filename.endswith(".trades.json"):
+        return output_path, ""
+    backtest_id = filename[: -len(".trades.json")]
+    if backtest_id:
+        loaded_result = _load_result(backtest_id)
+        if loaded_result is not None:
+            meta_id = str(getattr(loaded_result.meta, "id", "") or "").strip()
+            if meta_id:
+                backtest_id = meta_id
+    return output_path, backtest_id
+
+
+def _update_saved_backtest(
+    output_path: str, prev_output_path: str, prev_backtest_id: str
+) -> tuple[str, str]:
+    """Merge a new 'saved to' path into the tracked output path / backtest id."""
+    new_path, new_id = _resolve_backtest_output_id(output_path)
+    return new_path or prev_output_path, new_id or prev_backtest_id
+
+
+def _count_backtest_trades(backtest_id: str, latest_message: str) -> int:
+    """Count trades of the finished backtest, falling back to the runner log line."""
+    final_trade_count = 0
+    if backtest_id:
+        loaded_result = _load_result(backtest_id)
+        if loaded_result is not None:
+            final_trade_count = len(loaded_result.trades)
+    if final_trade_count == 0 and isinstance(latest_message, str):
+        match = re.search(r"result:\s*(\d+)\s+trades", latest_message.lower())
+        if match:
+            try:
+                final_trade_count = int(match.group(1))
+            except ValueError:
+                final_trade_count = 0
+    return final_trade_count
 
 
 def _upsert_backtest_meta_cache(backtest_id: str) -> None:
@@ -2758,7 +2911,7 @@ def _delete_backtest_with_artifacts(backtest_id: str) -> bool:
             json_path.unlink()
             deleted_json = True
         except OSError as exc:
-            logger.warning("Could not delete JSON backtest %s: %s", normalized_id, exc)
+            logger.warning("Could not delete JSON backtest %s: %s", _log_safe(normalized_id), exc)
     return deleted_in_db or deleted_json
 
 
@@ -3927,8 +4080,11 @@ def _calculate_realized_live_pnl(
     for row in ordered_rows:
         symbol = str(row.get("symbol") or "UNKNOWN").upper()
         action = str(row.get("action") or "").strip().lower()
-        direction = 1.0 if action == "buy" else -1.0 if action == "sell" else 0.0
-        if direction == 0.0:
+        if action == "buy":
+            direction = 1.0
+        elif action == "sell":
+            direction = -1.0
+        else:
             continue
 
         quantity = abs(_safe_float(row.get("filled_qty"), 0.0))
@@ -3941,7 +4097,7 @@ def _calculate_realized_live_pnl(
         current_qty = state["qty"]
         current_avg = state["avg"]
 
-        if current_qty == 0.0:
+        if abs(current_qty) < LIVE_POSITION_FLAT_THRESHOLD:
             state["qty"] = delta
             state["avg"] = price
             continue
@@ -3964,7 +4120,7 @@ def _calculate_realized_live_pnl(
                 losses += 1
 
         new_qty = current_qty + delta
-        if new_qty == 0.0:
+        if abs(new_qty) < LIVE_POSITION_FLAT_THRESHOLD:
             state["qty"] = 0.0
             state["avg"] = 0.0
         elif current_qty * new_qty > 0:
@@ -4158,7 +4314,7 @@ def _benchmark_daily_returns(symbol: str, *, start: str = "", end: str = "") -> 
             intraday_close = _close_series_from_df(fallback_df, symbol=symbol)
             series = intraday_close.resample("1D").last().dropna()
             if not series.empty:
-                logger.info("CAPM benchmark %s: using %s resampled to 1d", symbol, fallback_timeframe)
+                logger.info("CAPM benchmark: using %s resampled to 1d", _log_safe(fallback_timeframe))
                 break
 
     if series.empty:
@@ -4179,7 +4335,7 @@ def _benchmark_daily_returns(symbol: str, *, start: str = "", end: str = "") -> 
 
 def _default_benchmark_symbol(result: BacktestResult) -> str:
     data = result.meta.data if isinstance(result.meta.data, dict) else {}
-    symbols = data.get("symbols") if isinstance(data, dict) else None
+    symbols = data.get("symbols") or []
     if isinstance(symbols, list) and symbols:
         return str(symbols[0]).strip().upper()
     return ""
@@ -4236,34 +4392,38 @@ def _normalize_timeframe_key(value: Any) -> str:
     return normalize_timeframe(str(value or "").strip() or "1h")
 
 
-def _resolve_component_backtest_id(
+def _cached_backtest_strategy_matches(
+    item: dict[str, Any],
     *,
-    strategy_name: str,
-    symbol: str,
-    timeframe: str,
-    explicit_backtest_id: str = "",
-) -> str:
-    explicit_id = str(explicit_backtest_id or "").strip()
-    if explicit_id:
-        return explicit_id
+    strategy_entry: Any,
+    normalized_strategy: str,
+) -> bool:
+    item_strategy = _normalize_strategy_key(item.get("strategy_name"))
+    if strategy_entry is not None and matches_strategy_identifier(
+        strategy_entry, str(item.get("strategy_name") or "")
+    ):
+        return True
+    return item_strategy == normalized_strategy
 
-    strategy_entry = _safe_strategy_entry(strategy_name)
-    normalized_strategy = _normalize_strategy_key(strategy_name)
-    normalized_symbol = _normalize_symbol_key(symbol)
-    normalized_timeframe = _normalize_timeframe_key(timeframe)
 
+def _latest_matching_cached_backtest(
+    *,
+    strategy_entry: Any,
+    normalized_strategy: str,
+    normalized_symbol: str,
+    normalized_timeframe: str,
+) -> tuple[str, str] | None:
+    """Newest backtest from the meta cache matching strategy/symbol/timeframe."""
     best_candidate: tuple[str, str] | None = None
     for item in _snapshot_backtest_meta_cache():
         backtest_id = str(item.get("id") or "").strip()
         if not backtest_id:
             continue
-        item_strategy = _normalize_strategy_key(item.get("strategy_name"))
-        strategy_matches = False
-        if strategy_entry is not None:
-            strategy_matches = matches_strategy_identifier(strategy_entry, str(item.get("strategy_name") or ""))
-        if not strategy_matches:
-            strategy_matches = item_strategy == normalized_strategy
-        if not strategy_matches:
+        if not _cached_backtest_strategy_matches(
+            item,
+            strategy_entry=strategy_entry,
+            normalized_strategy=normalized_strategy,
+        ):
             continue
 
         item_symbols = [str(raw).strip().upper() for raw in (item.get("symbols") or []) if str(raw).strip()]
@@ -4276,10 +4436,35 @@ def _resolve_component_backtest_id(
         created_at = str(item.get("created_at") or "")
         if best_candidate is None or created_at > best_candidate[0]:
             best_candidate = (created_at, backtest_id)
+    return best_candidate
 
-    if best_candidate is not None:
-        return best_candidate[1]
 
+def _file_backtest_strategy_matches(
+    raw_strategies: list[Any],
+    *,
+    strategy_entry: Any,
+    normalized_strategy: str,
+) -> bool:
+    if strategy_entry is not None and any(
+        matches_strategy_identifier(strategy_entry, strategy_value)
+        for strategy_value in raw_strategies
+    ):
+        return True
+    return any(
+        _normalize_strategy_key(strategy_value) == normalized_strategy
+        for strategy_value in raw_strategies
+    )
+
+
+def _latest_matching_file_backtest(
+    *,
+    strategy_name: str,
+    strategy_entry: Any,
+    normalized_strategy: str,
+    normalized_symbol: str,
+    normalized_timeframe: str,
+) -> str:
+    """Newest trade file on disk matching strategy/symbol/timeframe (meta cache miss)."""
     if not BACKTESTS_DIR.exists():
         raise HTTPException(
             status_code=404,
@@ -4299,18 +4484,11 @@ def _resolve_component_backtest_id(
         if not isinstance(raw_strategies, list) or not raw_strategies:
             continue
 
-        strategy_matches = False
-        if strategy_entry is not None:
-            strategy_matches = any(
-                matches_strategy_identifier(strategy_entry, strategy_value)
-                for strategy_value in raw_strategies
-            )
-        if not strategy_matches:
-            strategy_matches = any(
-                _normalize_strategy_key(strategy_value) == normalized_strategy
-                for strategy_value in raw_strategies
-            )
-        if not strategy_matches:
+        if not _file_backtest_strategy_matches(
+            raw_strategies,
+            strategy_entry=strategy_entry,
+            normalized_strategy=normalized_strategy,
+        ):
             continue
 
         data_payload = meta.get("data", {}) if isinstance(meta.get("data"), dict) else {}
@@ -4323,15 +4501,60 @@ def _resolve_component_backtest_id(
             continue
 
         timeframes_payload = data_payload.get("timeframes") or []
-        timeframe_match = True
-        if isinstance(timeframes_payload, list) and timeframes_payload:
-            timeframe_match = normalized_timeframe in {
-                _normalize_timeframe_key(raw_timeframe) for raw_timeframe in timeframes_payload
-            }
-        if not timeframe_match:
+        if (
+            isinstance(timeframes_payload, list)
+            and timeframes_payload
+            and normalized_timeframe
+            not in {_normalize_timeframe_key(raw) for raw in timeframes_payload}
+        ):
             continue
 
         return file_path.stem.replace(".trades", "")
+
+    raise HTTPException(
+        status_code=404,
+        detail=(
+            f"No backtest found for component '{strategy_name}' "
+            f"({normalized_symbol or 'N/A'} {normalized_timeframe})"
+        ),
+    )
+
+
+def _resolve_component_backtest_id(
+    *,
+    strategy_name: str,
+    symbol: str,
+    timeframe: str,
+    explicit_backtest_id: str = "",
+) -> str:
+    explicit_id = str(explicit_backtest_id or "").strip()
+    if explicit_id:
+        return explicit_id
+
+    strategy_entry = _safe_strategy_entry(strategy_name)
+    normalized_strategy = _normalize_strategy_key(strategy_name)
+    normalized_symbol = _normalize_symbol_key(symbol)
+    normalized_timeframe = _normalize_timeframe_key(timeframe)
+
+    best_candidate = _latest_matching_cached_backtest(
+        strategy_entry=strategy_entry,
+        normalized_strategy=normalized_strategy,
+        normalized_symbol=normalized_symbol,
+        normalized_timeframe=normalized_timeframe,
+    )
+
+    if best_candidate is not None:
+        return best_candidate[1]
+
+    file_candidate = _latest_matching_file_backtest(
+        strategy_name=strategy_name,
+        strategy_entry=strategy_entry,
+        normalized_strategy=normalized_strategy,
+        normalized_symbol=normalized_symbol,
+        normalized_timeframe=normalized_timeframe,
+    )
+    if file_candidate:
+        return file_candidate
 
     raise HTTPException(
         status_code=404,
@@ -4798,21 +5021,64 @@ def _compute_portfolio_contributions(
     total_return = _safe_float((portfolio.get("combined_stats") or {}).get("total_return"), 0.0)
     total_drawdown = abs(_safe_float((portfolio.get("combined_stats") or {}).get("max_drawdown"), 0.0))
 
+    component_metrics = _collect_component_contribution_metrics(components)
+
+    grouped = _accumulate_portfolio_buckets(
+        components=components,
+        component_metrics=component_metrics,
+        grouped=grouped,
+        normalized_group=normalized_group,
+    )
+
+    component_ids_by_group = {
+        key: {str(component_id) for component_id in value.get("component_ids", [])}
+        for key, value in grouped.items()
+    }
+
+    _accumulate_trade_pnls(
+        trades=trades,
+        component_ids_by_group=component_ids_by_group,
+        grouped=grouped,
+    )
+
+    total_pnl = _safe_float((portfolio.get("combined_stats") or {}).get("net_profit"), 0.0)
+    contributions = [
+        _portfolio_contribution_payload(
+            grouped[key],
+            group=normalized_group,
+            total_return=total_return,
+            total_drawdown=total_drawdown,
+            total_pnl=total_pnl,
+        )
+        for key in sorted(grouped.keys())
+    ]
+    return contributions
+
+
+def _empty_contribution_metrics() -> dict[str, float]:
+    return {
+        "sharpe_ratio": 0.0,
+        "psr": 0.0,
+        "p_value": 1.0,
+        "max_drawdown": 0.0,
+        "win_rate": 0.0,
+        "cagr": 0.0,
+        "total_return": 0.0,
+    }
+
+
+def _collect_component_contribution_metrics(
+    components: list[dict[str, Any]],
+) -> dict[str, dict[str, float]]:
+    """Load per-component stats from the linked backtest results."""
     component_metrics: dict[str, dict[str, float]] = {}
     for component in components:
         component_id = str(component.get("component_id") or "").strip()
         if not component_id:
             continue
         raw_win_rate = _normalize_win_rate(component.get("win_rate"))
-        metrics = {
-            "sharpe_ratio": 0.0,
-            "psr": 0.0,
-            "p_value": 1.0,
-            "max_drawdown": 0.0,
-            "win_rate": raw_win_rate if raw_win_rate is not None else 0.0,
-            "cagr": 0.0,
-            "total_return": 0.0,
-        }
+        metrics = _empty_contribution_metrics()
+        metrics["win_rate"] = raw_win_rate if raw_win_rate is not None else 0.0
         backtest_id = str(component.get("backtest_id") or "").strip()
         if backtest_id:
             result = _load_result(backtest_id)
@@ -4839,7 +5105,56 @@ def _compute_portfolio_contributions(
                         exc,
                     )
         component_metrics[component_id] = metrics
+    return component_metrics
 
+
+def _new_contribution_bucket(
+    *,
+    normalized_group: str,
+    key: str,
+    component_id: str,
+    strategy_name: str,
+    symbol: str,
+    timeframe: str,
+) -> dict[str, Any]:
+    return {
+        "group": normalized_group,
+        "group_value": key,
+        "component_id": component_id,
+        "component_ids": [],
+        "strategy_name": strategy_name,
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "weight": 0.0,
+        "return_contribution": 0.0,
+        "return_contribution_pct": 0.0,
+        "drawdown_contribution": 0.0,
+        "drawdown_contribution_pct": 0.0,
+        "trade_count": 0,
+        "win_rate": 0.0,
+        "wins": 0,
+        "pnl_total": 0.0,
+        "pnl_contribution": 0.0,
+        "pnl_contribution_pct": 0.0,
+        "metric_weight": 0.0,
+        "sharpe_sum": 0.0,
+        "psr_sum": 0.0,
+        "p_value_sum": 0.0,
+        "max_drawdown_sum": 0.0,
+        "win_rate_sum": 0.0,
+        "cagr_sum": 0.0,
+        "total_return_sum": 0.0,
+    }
+
+
+def _accumulate_portfolio_buckets(
+    *,
+    components: list[dict[str, Any]],
+    component_metrics: dict[str, dict[str, float]],
+    grouped: dict[str, dict[str, Any]],
+    normalized_group: str,
+) -> dict[str, dict[str, Any]]:
+    """Fold every component's weight/contributions/metrics into its group bucket."""
     for component in components:
         component_id = str(component.get("component_id") or "").strip()
         if not component_id:
@@ -4850,34 +5165,14 @@ def _compute_portfolio_contributions(
         key = _component_group_key(component, normalized_group)
         bucket = grouped.setdefault(
             key,
-            {
-                "group": normalized_group,
-                "group_value": key,
-                "component_id": component_id,
-                "component_ids": [],
-                "strategy_name": strategy_name,
-                "symbol": symbol,
-                "timeframe": timeframe,
-                "weight": 0.0,
-                "return_contribution": 0.0,
-                "return_contribution_pct": 0.0,
-                "drawdown_contribution": 0.0,
-                "drawdown_contribution_pct": 0.0,
-                "trade_count": 0,
-                "win_rate": 0.0,
-                "wins": 0,
-                "pnl_total": 0.0,
-                "pnl_contribution": 0.0,
-                "pnl_contribution_pct": 0.0,
-                "metric_weight": 0.0,
-                "sharpe_sum": 0.0,
-                "psr_sum": 0.0,
-                "p_value_sum": 0.0,
-                "max_drawdown_sum": 0.0,
-                "win_rate_sum": 0.0,
-                "cagr_sum": 0.0,
-                "total_return_sum": 0.0,
-            },
+            _new_contribution_bucket(
+                normalized_group=normalized_group,
+                key=key,
+                component_id=component_id,
+                strategy_name=strategy_name,
+                symbol=symbol,
+                timeframe=timeframe,
+            ),
         )
         if not bucket.get("strategy_name"):
             bucket["strategy_name"] = strategy_name
@@ -4889,63 +5184,77 @@ def _compute_portfolio_contributions(
         weight = _safe_float(component.get("weight"), 0.0)
         bucket["weight"] = _safe_float(bucket.get("weight"), 0.0) + weight
 
-        metrics = component_metrics.get(component_id) or {
-            "sharpe_ratio": 0.0,
-            "psr": 0.0,
-            "p_value": 1.0,
-            "max_drawdown": 0.0,
-            "win_rate": 0.0,
-            "cagr": 0.0,
-            "total_return": 0.0,
-        }
-        return_contribution = _safe_float(component.get("return_contribution"), float("nan"))
-        derived_return_contribution = _safe_float(metrics.get("total_return"), 0.0) * weight
-        if (
-            not math.isfinite(return_contribution)
-            or (abs(return_contribution) <= 1e-12 and abs(derived_return_contribution) > 1e-12)
-        ):
-            return_contribution = derived_return_contribution
+        metrics = component_metrics.get(component_id) or _empty_contribution_metrics()
+        _fold_contribution_values(bucket, component, metrics, weight)
+        _fold_metric_sums(bucket, metrics, weight)
+    return grouped
 
-        drawdown_contribution = _safe_float(component.get("drawdown_contribution"), float("nan"))
-        derived_drawdown_contribution = abs(_safe_float(metrics.get("max_drawdown"), 0.0)) * max(weight, 0.0)
-        if (
-            not math.isfinite(drawdown_contribution)
-            or (abs(drawdown_contribution) <= 1e-12 and derived_drawdown_contribution > 1e-12)
-        ):
-            drawdown_contribution = derived_drawdown_contribution
 
-        bucket["return_contribution"] = _safe_float(bucket.get("return_contribution"), 0.0) + return_contribution
-        bucket["drawdown_contribution"] = _safe_float(bucket.get("drawdown_contribution"), 0.0) + abs(
-            drawdown_contribution
-        )
+def _derived_contribution(
+    reported: Any, derived: float
+) -> float:
+    """Use the derived value when the reported one is missing or dust."""
+    value = _safe_float(reported, float("nan"))
+    if (
+        not math.isfinite(value)
+        or (abs(value) <= 1e-12 and abs(derived) > 1e-12)
+    ):
+        return derived
+    return value
 
-        metric_weight = max(weight, 0.000001)
-        bucket["metric_weight"] = _safe_float(bucket.get("metric_weight"), 0.0) + metric_weight
-        bucket["sharpe_sum"] = _safe_float(bucket.get("sharpe_sum"), 0.0) + _safe_float(
-            metrics.get("sharpe_ratio"), 0.0
-        ) * metric_weight
-        bucket["psr_sum"] = _safe_float(bucket.get("psr_sum"), 0.0) + _safe_float(
-            metrics.get("psr"), 0.0
-        ) * metric_weight
-        bucket["p_value_sum"] = _safe_float(bucket.get("p_value_sum"), 0.0) + _safe_float(
-            metrics.get("p_value"), 1.0
-        ) * metric_weight
-        bucket["max_drawdown_sum"] = _safe_float(bucket.get("max_drawdown_sum"), 0.0) + abs(
-            _safe_float(metrics.get("max_drawdown"), 0.0)
-        ) * metric_weight
-        bucket["win_rate_sum"] = _safe_float(bucket.get("win_rate_sum"), 0.0) + (
-            _normalize_win_rate(metrics.get("win_rate")) or 0.0
-        ) * metric_weight
-        bucket["cagr_sum"] = _safe_float(bucket.get("cagr_sum"), 0.0) + _safe_float(metrics.get("cagr"), 0.0) * metric_weight
-        bucket["total_return_sum"] = _safe_float(bucket.get("total_return_sum"), 0.0) + _safe_float(
-            metrics.get("total_return"), 0.0
-        ) * metric_weight
 
-    component_ids_by_group = {
-        key: {str(component_id) for component_id in value.get("component_ids", [])}
-        for key, value in grouped.items()
-    }
+def _fold_contribution_values(
+    bucket: dict[str, Any], component: dict[str, Any], metrics: dict[str, float], weight: float
+) -> None:
+    return_contribution = _derived_contribution(
+        component.get("return_contribution"),
+        _safe_float(metrics.get("total_return"), 0.0) * weight,
+    )
+    drawdown_contribution = _derived_contribution(
+        component.get("drawdown_contribution"),
+        abs(_safe_float(metrics.get("max_drawdown"), 0.0)) * max(weight, 0.0),
+    )
 
+    bucket["return_contribution"] = _safe_float(bucket.get("return_contribution"), 0.0) + return_contribution
+    bucket["drawdown_contribution"] = _safe_float(bucket.get("drawdown_contribution"), 0.0) + abs(
+        drawdown_contribution
+    )
+
+
+def _fold_metric_sums(
+    bucket: dict[str, Any], metrics: dict[str, float], weight: float
+) -> None:
+    """Accumulate weighted metric sums into the group bucket."""
+    metric_weight = max(weight, 0.000001)
+    bucket["metric_weight"] = _safe_float(bucket.get("metric_weight"), 0.0) + metric_weight
+    bucket["sharpe_sum"] = _safe_float(bucket.get("sharpe_sum"), 0.0) + _safe_float(
+        metrics.get("sharpe_ratio"), 0.0
+    ) * metric_weight
+    bucket["psr_sum"] = _safe_float(bucket.get("psr_sum"), 0.0) + _safe_float(
+        metrics.get("psr"), 0.0
+    ) * metric_weight
+    bucket["p_value_sum"] = _safe_float(bucket.get("p_value_sum"), 0.0) + _safe_float(
+        metrics.get("p_value"), 1.0
+    ) * metric_weight
+    bucket["max_drawdown_sum"] = _safe_float(bucket.get("max_drawdown_sum"), 0.0) + abs(
+        _safe_float(metrics.get("max_drawdown"), 0.0)
+    ) * metric_weight
+    bucket["win_rate_sum"] = _safe_float(bucket.get("win_rate_sum"), 0.0) + (
+        _normalize_win_rate(metrics.get("win_rate")) or 0.0
+    ) * metric_weight
+    bucket["cagr_sum"] = _safe_float(bucket.get("cagr_sum"), 0.0) + _safe_float(metrics.get("cagr"), 0.0) * metric_weight
+    bucket["total_return_sum"] = _safe_float(bucket.get("total_return_sum"), 0.0) + _safe_float(
+        metrics.get("total_return"), 0.0
+    ) * metric_weight
+
+
+def _accumulate_trade_pnls(
+    *,
+    trades: list[dict[str, Any]],
+    component_ids_by_group: dict[str, set[str]],
+    grouped: dict[str, dict[str, Any]],
+) -> None:
+    """Add per-trade counts and PnL to the groups owning their component."""
     for trade in trades:
         component_id = str(trade.get("component_id") or "").strip()
         if not component_id:
@@ -4960,63 +5269,74 @@ def _compute_portfolio_contributions(
                 bucket["wins"] = int(bucket.get("wins") or 0) + 1
             bucket["pnl_total"] = _safe_float(bucket.get("pnl_total"), 0.0) + pnl_value
 
-    total_pnl = _safe_float((portfolio.get("combined_stats") or {}).get("net_profit"), 0.0)
-    contributions: list[dict[str, Any]] = []
-    for key in sorted(grouped.keys()):
-        bucket = grouped[key]
-        trade_count = int(bucket.get("trade_count") or 0)
-        wins = int(bucket.get("wins") or 0)
-        return_value = _safe_float(bucket.get("return_contribution"), 0.0)
-        drawdown_value = abs(_safe_float(bucket.get("drawdown_contribution"), 0.0))
-        return_pct = 0.0 if total_return == 0 else (return_value / total_return) * 100.0
-        drawdown_pct = 0.0 if total_drawdown == 0 else (drawdown_value / total_drawdown) * 100.0
-        pnl_value = _safe_float(bucket.get("pnl_total"), 0.0)
-        pnl_pct = 0.0 if total_pnl == 0 else (pnl_value / total_pnl) * 100.0
-        metric_weight = _safe_float(bucket.get("metric_weight"), 0.0) or 1.0
-        sharpe_ratio = _safe_float(bucket.get("sharpe_sum"), 0.0) / metric_weight
-        psr = _safe_float(bucket.get("psr_sum"), 0.0) / metric_weight
-        p_value = _safe_float(bucket.get("p_value_sum"), 1.0) / metric_weight
-        max_drawdown = _safe_float(bucket.get("max_drawdown_sum"), 0.0) / metric_weight
-        metric_win_rate = _safe_float(bucket.get("win_rate_sum"), 0.0) / metric_weight
-        cagr = _safe_float(bucket.get("cagr_sum"), 0.0) / metric_weight
-        display_value = bucket.get("group_value", key)
-        if normalized_group == "component":
-            strategy_name = str(bucket.get("strategy_name") or display_value or "").strip()
-            symbol = _normalize_symbol_key(bucket.get("symbol"))
-            timeframe = _normalize_timeframe_key(bucket.get("timeframe"))
-            suffix_values = [value for value in [symbol, timeframe] if value]
-            if strategy_name and suffix_values:
-                display_value = f"{strategy_name} ({', '.join(suffix_values)})"
-            elif strategy_name:
-                display_value = strategy_name
-        contributions.append(
-            {
-                "group": normalized_group,
-                "group_value": display_value,
-                "component_id": str(bucket.get("component_id") or ""),
-                "component_ids": bucket.get("component_ids", []),
-                "strategy_name": bucket.get("strategy_name", ""),
-                "symbol": bucket.get("symbol", ""),
-                "timeframe": bucket.get("timeframe", ""),
-                "weight": round(_safe_float(bucket.get("weight"), 0.0), 6),
-                "return_contribution": round(return_value, 8),
-                "return_contribution_pct": round(return_pct, 3),
-                "drawdown_contribution": round(drawdown_value, 8),
-                "drawdown_contribution_pct": round(drawdown_pct, 3),
-                "trade_count": trade_count,
-                "win_rate": round(metric_win_rate * 100.0, 2),
-                "wins": wins,
-                "sharpe_ratio": round(sharpe_ratio, 6),
-                "psr": round(psr, 6),
-                "p_value": round(p_value, 6),
-                "max_drawdown": round(max_drawdown, 6),
-                "cagr": round(cagr, 6),
-                "pnl_total": round(pnl_value, 6),
-                "pnl_contribution": round(pnl_value, 6),
-                "pnl_contribution_pct": round(pnl_pct, 3),
-            }
-        )
-    return contributions
+
+def _portfolio_contribution_display_value(
+    bucket: dict[str, Any], group: str, default_value: str
+) -> str:
+    if group != "component":
+        return default_value
+    strategy_name = str(bucket.get("strategy_name") or default_value or "").strip()
+    symbol = _normalize_symbol_key(bucket.get("symbol"))
+    timeframe = _normalize_timeframe_key(bucket.get("timeframe"))
+    suffix_values = [value for value in [symbol, timeframe] if value]
+    if strategy_name and suffix_values:
+        return f"{strategy_name} ({', '.join(suffix_values)})"
+    if strategy_name:
+        return strategy_name
+    return default_value
+
+
+def _portfolio_contribution_payload(
+    bucket: dict[str, Any],
+    *,
+    group: str,
+    total_return: float,
+    total_drawdown: float,
+    total_pnl: float,
+) -> dict[str, Any]:
+    trade_count = int(bucket.get("trade_count") or 0)
+    wins = int(bucket.get("wins") or 0)
+    return_value = _safe_float(bucket.get("return_contribution"), 0.0)
+    drawdown_value = abs(_safe_float(bucket.get("drawdown_contribution"), 0.0))
+    return_pct = 0.0 if total_return == 0 else (return_value / total_return) * 100.0
+    drawdown_pct = 0.0 if total_drawdown == 0 else (drawdown_value / total_drawdown) * 100.0
+    pnl_value = _safe_float(bucket.get("pnl_total"), 0.0)
+    pnl_pct = 0.0 if total_pnl == 0 else (pnl_value / total_pnl) * 100.0
+    metric_weight = _safe_float(bucket.get("metric_weight"), 0.0) or 1.0
+    sharpe_ratio = _safe_float(bucket.get("sharpe_sum"), 0.0) / metric_weight
+    psr = _safe_float(bucket.get("psr_sum"), 0.0) / metric_weight
+    p_value = _safe_float(bucket.get("p_value_sum"), 1.0) / metric_weight
+    max_drawdown = _safe_float(bucket.get("max_drawdown_sum"), 0.0) / metric_weight
+    metric_win_rate = _safe_float(bucket.get("win_rate_sum"), 0.0) / metric_weight
+    cagr = _safe_float(bucket.get("cagr_sum"), 0.0) / metric_weight
+    display_value = _portfolio_contribution_display_value(
+        bucket, group, str(bucket.get("group_value") or "")
+    )
+    return {
+        "group": group,
+        "group_value": display_value,
+        "component_id": str(bucket.get("component_id") or ""),
+        "component_ids": bucket.get("component_ids", []),
+        "strategy_name": bucket.get("strategy_name", ""),
+        "symbol": bucket.get("symbol", ""),
+        "timeframe": bucket.get("timeframe", ""),
+        "weight": round(_safe_float(bucket.get("weight"), 0.0), 6),
+        "return_contribution": round(return_value, 8),
+        "return_contribution_pct": round(return_pct, 3),
+        "drawdown_contribution": round(drawdown_value, 8),
+        "drawdown_contribution_pct": round(drawdown_pct, 3),
+        "trade_count": trade_count,
+        "win_rate": round(metric_win_rate * 100.0, 2),
+        "wins": wins,
+        "sharpe_ratio": round(sharpe_ratio, 6),
+        "psr": round(psr, 6),
+        "p_value": round(p_value, 6),
+        "max_drawdown": round(max_drawdown, 6),
+        "cagr": round(cagr, 6),
+        "pnl_total": round(pnl_value, 6),
+        "pnl_contribution": round(pnl_value, 6),
+        "pnl_contribution_pct": round(pnl_pct, 3),
+    }
 
 
 def _portfolio_trades_filtered(
@@ -5091,30 +5411,29 @@ def _portfolio_trades_filtered(
     return filtered
 
 
-def _normalize_portfolio_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    normalized = dict(payload)
+def _source_components_from_strategies(strategies: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Map legacy 'strategies' rows into component-shaped dicts."""
+    source_components: list[dict[str, Any]] = []
+    for strategy_row in strategies:
+        if not isinstance(strategy_row, dict):
+            continue
+        source_components.append(
+            {
+                "strategy_name": strategy_row.get("strategy_name") or strategy_row.get("name") or "",
+                "symbol": strategy_row.get("symbol") or "",
+                "timeframe": strategy_row.get("timeframe") or "1h",
+                "weight": strategy_row.get("risk_per_trade_pct", 1.0),
+                "risk_config": {"max_positions": strategy_row.get("max_positions", 99)},
+                "settings": {},
+                "backtest_id": strategy_row.get("backtest_id", ""),
+            }
+        )
+    return source_components
 
-    raw_components = normalized.get("components")
+
+def _build_portfolio_components(source_components: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Normalize every raw component dict into a portfolio component payload."""
     components: list[dict[str, Any]] = []
-    if isinstance(raw_components, list) and raw_components:
-        source_components = [item for item in raw_components if isinstance(item, dict)]
-    else:
-        source_components = []
-        for strategy_row in normalized.get("strategies", []):
-            if not isinstance(strategy_row, dict):
-                continue
-            source_components.append(
-                {
-                    "strategy_name": strategy_row.get("strategy_name") or strategy_row.get("name") or "",
-                    "symbol": strategy_row.get("symbol") or "",
-                    "timeframe": strategy_row.get("timeframe") or "1h",
-                    "weight": strategy_row.get("risk_per_trade_pct", 1.0),
-                    "risk_config": {"max_positions": strategy_row.get("max_positions", 99)},
-                    "settings": {},
-                    "backtest_id": strategy_row.get("backtest_id", ""),
-                }
-            )
-
     for index, raw_component in enumerate(source_components, start=1):
         strategy_name = str(raw_component.get("strategy_name") or raw_component.get("name") or "").strip()
         symbol = _normalize_symbol_key(raw_component.get("symbol"))
@@ -5210,9 +5529,37 @@ def _normalize_portfolio_payload(payload: dict[str, Any]) -> dict[str, Any]:
             }
         )
         components.append(component_payload)
+    return components
 
-    normalized["components"] = components
-    normalized["strategies"] = [
+
+def _match_component_for_trade(
+    trade: dict[str, Any],
+    components: list[dict[str, Any]],
+    *,
+    strategy_name: str,
+    symbol: str,
+    timeframe: str,
+) -> dict[str, Any] | None:
+    """Find a component matching a trade by strategy/symbol/timeframe."""
+    if not strategy_name:
+        return None
+    normalized_strategy = _normalize_strategy_key(strategy_name)
+    for candidate in components:
+        if _normalize_strategy_key(candidate.get("strategy_name")) != normalized_strategy:
+            continue
+        candidate_symbol = _normalize_symbol_key(candidate.get("symbol"))
+        candidate_timeframe = _normalize_timeframe_key(candidate.get("timeframe"))
+        if symbol and candidate_symbol and symbol != candidate_symbol:
+            continue
+        if timeframe and candidate_timeframe and timeframe != candidate_timeframe:
+            continue
+        return candidate
+    return None
+
+
+def _portfolio_legacy_strategy_rows(components: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Map components back into the legacy 'strategies' row shape."""
+    return [
         {
             "backtest_id": str(component.get("backtest_id") or ""),
             "strategy_name": str(component.get("strategy_name") or ""),
@@ -5222,6 +5569,11 @@ def _normalize_portfolio_payload(payload: dict[str, Any]) -> dict[str, Any]:
         for component in components
     ]
 
+
+def _normalize_portfolio_trades(
+    raw_trades: list[Any], *, components: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Normalize portfolio trades and enrich them from their source backtests."""
     component_by_id = {
         str(component.get("component_id") or ""): component
         for component in components
@@ -5229,7 +5581,7 @@ def _normalize_portfolio_payload(payload: dict[str, Any]) -> dict[str, Any]:
     }
     backtest_trade_lookup_cache: dict[str, dict[tuple[str, str, str], list[dict[str, Any]]]] = {}
     normalized_trades: list[dict[str, Any]] = []
-    for raw_trade in normalized.get("trades", []):
+    for raw_trade in raw_trades:
         if not isinstance(raw_trade, dict):
             continue
         trade = dict(raw_trade)
@@ -5241,20 +5593,16 @@ def _normalize_portfolio_payload(payload: dict[str, Any]) -> dict[str, Any]:
         timeframe_text = str(trade.get("timeframe") or "").strip()
         timeframe = _normalize_timeframe_key(timeframe_text) if timeframe_text else ""
 
-        if component is None and strategy_name:
-            normalized_strategy = _normalize_strategy_key(strategy_name)
-            for candidate in components:
-                if _normalize_strategy_key(candidate.get("strategy_name")) != normalized_strategy:
-                    continue
-                candidate_symbol = _normalize_symbol_key(candidate.get("symbol"))
-                candidate_timeframe = _normalize_timeframe_key(candidate.get("timeframe"))
-                if symbol and candidate_symbol and symbol != candidate_symbol:
-                    continue
-                if timeframe and candidate_timeframe and timeframe != candidate_timeframe:
-                    continue
-                component = candidate
-                component_id = str(candidate.get("component_id") or "")
-                break
+        if component is None:
+            component = _match_component_for_trade(
+                trade,
+                components,
+                strategy_name=strategy_name,
+                symbol=symbol,
+                timeframe=timeframe,
+            )
+            if component is not None:
+                component_id = str(component.get("component_id") or "")
 
         if component is not None:
             if not strategy_name:
@@ -5286,6 +5634,45 @@ def _normalize_portfolio_payload(payload: dict[str, Any]) -> dict[str, Any]:
             else:
                 trade["id"] = uuid.uuid4().hex[:10]
         normalized_trades.append(trade)
+    return normalized_trades
+
+
+def _compute_strategy_contributions(
+    grouped: list[dict[str, Any]], *, combined_stats: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Derive per-strategy PnL contribution percentages from grouped stats."""
+    total_pnl = _safe_float(combined_stats.get("net_profit"), 0.0)
+    strategy_contributions: list[dict[str, Any]] = []
+    for item in grouped:
+        contribution_pnl = _safe_float(item.get("pnl_total"), 0.0)
+        pct = 0.0 if total_pnl == 0 else (contribution_pnl / total_pnl) * 100.0
+        strategy_contributions.append(
+            {
+                "strategy_name": item.get("group_value", ""),
+                "pnl_contribution": round(contribution_pnl, 2),
+                "pnl_contribution_pct": round(pct, 3),
+            }
+        )
+    return strategy_contributions
+
+
+def _normalize_portfolio_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(payload)
+
+    raw_components = normalized.get("components")
+    if isinstance(raw_components, list) and raw_components:
+        source_components = [item for item in raw_components if isinstance(item, dict)]
+    else:
+        source_components = _source_components_from_strategies(normalized.get("strategies", []))
+
+    components = _build_portfolio_components(source_components)
+    normalized["components"] = components
+    normalized["strategies"] = _portfolio_legacy_strategy_rows(components)
+
+    normalized_trades = _normalize_portfolio_trades(
+        normalized.get("trades", []),
+        components=components,
+    )
 
     normalized_trades.sort(key=_component_trade_time)
     normalized["trades"] = normalized_trades
@@ -5298,21 +5685,12 @@ def _normalize_portfolio_payload(payload: dict[str, Any]) -> dict[str, Any]:
         )
 
     if not isinstance(normalized.get("strategy_contributions"), list):
-        grouped = _compute_portfolio_contributions(portfolio=normalized, group_by="strategy")
-        stats = normalized.get("combined_stats") if isinstance(normalized.get("combined_stats"), dict) else {}
-        total_pnl = _safe_float(stats.get("net_profit"), 0.0)
-        strategy_contributions: list[dict[str, Any]] = []
-        for item in grouped:
-            contribution_pnl = _safe_float(item.get("pnl_total"), 0.0)
-            pct = 0.0 if total_pnl == 0 else (contribution_pnl / total_pnl) * 100.0
-            strategy_contributions.append(
-                {
-                    "strategy_name": item.get("group_value", ""),
-                    "pnl_contribution": round(contribution_pnl, 2),
-                    "pnl_contribution_pct": round(pct, 3),
-                }
-            )
-        normalized["strategy_contributions"] = strategy_contributions
+        normalized["strategy_contributions"] = _compute_strategy_contributions(
+            _compute_portfolio_contributions(portfolio=normalized, group_by="strategy"),
+            combined_stats=normalized.get("combined_stats")
+            if isinstance(normalized.get("combined_stats"), dict)
+            else {},
+        )
 
     combined_stats = normalized.get("combined_stats") if isinstance(normalized.get("combined_stats"), dict) else {}
     if normalized_trades and not _portfolio_stats_have_values(combined_stats):
@@ -6357,26 +6735,20 @@ def _download_missing_ohlcv_data(
     raise ValueError(f"Unsupported auto-download source '{selected_source}' for {normalized_symbol}")
 
 
-def _ensure_backtest_data_availability(
+def _collect_missing_backtest_data(
     *,
-    symbols: list[str],
+    symbol_list: list[str],
     timeframe: str,
-    start: str = "",
-    end: str = "",
-    progress_callback: Callable[[float, str], None] | None = None,
-    log_callback: Callable[[str], None] | None = None,
+    start: str,
+    end: str,
 ) -> list[dict[str, Any]]:
-    normalized_timeframe = normalize_timeframe(timeframe)
-    symbol_list = [str(symbol or "").strip().upper() for symbol in symbols if str(symbol or "").strip()]
-    if not symbol_list or not normalized_timeframe:
-        return []
-
+    """Return the per-symbol missing-range entries for the requested data."""
     availability_index = _build_ohlcv_availability_index()
     missing_items: list[dict[str, Any]] = []
     for symbol in symbol_list:
         availability = _data_check_result(
             symbol=symbol,
-            timeframe=normalized_timeframe,
+            timeframe=timeframe,
             start=start,
             end=end,
             availability_index=availability_index,
@@ -6386,15 +6758,68 @@ def _ensure_backtest_data_availability(
         missing_items.append(
             {
                 "symbol": symbol,
-                "timeframe": normalized_timeframe,
+                "timeframe": timeframe,
                 "missing_range": availability.get("missing_range"),
-                "source": _auto_download_source(symbol, normalized_timeframe),
+                "source": _auto_download_source(symbol, timeframe),
             }
         )
+    return missing_items
 
-    if not missing_items:
-        return []
 
+def _verify_missing_download_coverage(
+    *,
+    symbol: str,
+    timeframe: str,
+    start: str,
+    end: str,
+    log_callback: Callable[[str], None] | None = None,
+) -> None:
+    """Re-check coverage after an auto-download; tolerate only small boundary gaps."""
+    availability_index = _build_ohlcv_availability_index()
+    verification = _data_check_result(
+        symbol=symbol,
+        timeframe=timeframe,
+        start=start,
+        end=end,
+        availability_index=availability_index,
+    )
+    if verification.get("available"):
+        return
+    coverage_entry = availability_index.get((symbol, timeframe))
+    tolerated_gap = False
+    tolerated_reason: str | None = None
+    if isinstance(coverage_entry, dict):
+        tolerated_gap, tolerated_reason = _allow_small_backtest_boundary_gap(
+            requested_start=start,
+            requested_end=end,
+            available_start=str(coverage_entry.get("start") or ""),
+            available_end=str(coverage_entry.get("end") or ""),
+        )
+    if tolerated_gap:
+        if log_callback is not None:
+            available_start = str((coverage_entry or {}).get("start") or "unknown")
+            available_end = str((coverage_entry or {}).get("end") or "unknown")
+            log_callback(
+                (
+                    f"Auto-download coverage tolerance for {symbol} {timeframe}: "
+                    f"{tolerated_reason}; available range {available_start} → {available_end}."
+                )
+            )
+    else:
+        raise RuntimeError(
+            f"Auto-download did not provide required data range for {symbol} {timeframe}"
+        )
+
+
+def _download_and_verify_missing_data(
+    missing_items: list[dict[str, Any]],
+    *,
+    normalized_timeframe: str,
+    start: str,
+    end: str,
+    progress_callback: Callable[[float, str], None] | None = None,
+    log_callback: Callable[[str], None] | None = None,
+) -> None:
     total_missing = len(missing_items)
     for index, missing in enumerate(missing_items, start=1):
         progress_before = 10.0 + ((index - 1) / total_missing) * 35.0
@@ -6445,43 +6870,51 @@ def _ensure_backtest_data_availability(
         _invalidate_data_views_cache()
         _refresh_catalog()
 
-        availability_index = _build_ohlcv_availability_index()
-        verification = _data_check_result(
+        _verify_missing_download_coverage(
             symbol=symbol,
             timeframe=normalized_timeframe,
             start=start,
             end=end,
-            availability_index=availability_index,
+            log_callback=log_callback,
         )
-        if not verification.get("available"):
-            coverage_entry = availability_index.get((symbol, normalized_timeframe))
-            tolerated_gap = False
-            tolerated_reason: str | None = None
-            if isinstance(coverage_entry, dict):
-                tolerated_gap, tolerated_reason = _allow_small_backtest_boundary_gap(
-                    requested_start=start,
-                    requested_end=end,
-                    available_start=str(coverage_entry.get("start") or ""),
-                    available_end=str(coverage_entry.get("end") or ""),
-                )
-            if tolerated_gap:
-                if log_callback is not None:
-                    available_start = str((coverage_entry or {}).get("start") or "unknown")
-                    available_end = str((coverage_entry or {}).get("end") or "unknown")
-                    log_callback(
-                        (
-                            f"Auto-download coverage tolerance for {symbol} {normalized_timeframe}: "
-                            f"{tolerated_reason}; available range {available_start} → {available_end}."
-                        )
-                    )
-            else:
-                raise RuntimeError(
-                    f"Auto-download did not provide required data range for {symbol} {normalized_timeframe}"
-                )
 
         progress_after = 10.0 + (index / total_missing) * 35.0
         if progress_callback is not None:
             progress_callback(progress_after, f"Downloading data... {int(round(progress_after))}%")
+
+
+def _ensure_backtest_data_availability(
+    *,
+    symbols: list[str],
+    timeframe: str,
+    start: str = "",
+    end: str = "",
+    progress_callback: Callable[[float, str], None] | None = None,
+    log_callback: Callable[[str], None] | None = None,
+) -> list[dict[str, Any]]:
+    normalized_timeframe = normalize_timeframe(timeframe)
+    symbol_list = [str(symbol or "").strip().upper() for symbol in symbols if str(symbol or "").strip()]
+    if not symbol_list or not normalized_timeframe:
+        return []
+
+    missing_items = _collect_missing_backtest_data(
+        symbol_list=symbol_list,
+        timeframe=normalized_timeframe,
+        start=start,
+        end=end,
+    )
+
+    if not missing_items:
+        return []
+
+    _download_and_verify_missing_data(
+        missing_items,
+        normalized_timeframe=normalized_timeframe,
+        start=start,
+        end=end,
+        progress_callback=progress_callback,
+        log_callback=log_callback,
+    )
 
     return missing_items
 
@@ -6563,6 +6996,117 @@ def _canonical_timeframe_path(paths: set[str], timeframe: str) -> str:
     return sorted_paths[0]
 
 
+def _normalize_ohlcv_validation(
+    validation_payload: dict[str, Any],
+    warning_message: str | None,
+    error_message: str | None,
+) -> dict[str, Any]:
+    """Normalize a catalog validation payload; an empty dict means 'omit'."""
+    if not validation_payload and not warning_message and not error_message:
+        return {}
+    normalized_validation = dict(validation_payload)
+    status = str(normalized_validation.get("status") or "").strip().lower()
+    if status not in {"ok", "warning", "error"}:
+        status = "ok"
+    if status == "ok" and (warning_message or error_message):
+        status = "warning"
+    normalized_validation["status"] = status
+    return normalized_validation
+
+
+def _aggregate_ohlcv_entry_payload(
+    entry: dict[str, Any],
+    *,
+    include_category: bool = False,
+    include_size_bytes: bool = False,
+) -> dict[str, Any]:
+    path_value = str(entry.get("path") or "")
+    category = _categorize_path(path_value) if include_category else ""
+    start_value = entry.get("start") or entry.get("start_date")
+    end_value = entry.get("end") or entry.get("end_date")
+    size_bytes = _entry_size_bytes(entry)
+    warning_message = _warning_message_from_entry(entry)
+    error_message = str(entry.get("error") or "").strip() or None
+
+    row_count_raw = entry.get("row_count", entry.get("rows"))
+    try:
+        row_count = int(row_count_raw) if row_count_raw is not None else None
+    except (TypeError, ValueError):
+        row_count = None
+
+    files = [
+        str(file_path).strip()
+        for file_path in (entry.get("files") if isinstance(entry.get("files"), list) else [])
+        if str(file_path).strip()
+    ]
+    if not files and path_value:
+        files = [path_value]
+
+    source_values = [
+        str(item).strip()
+        for item in (entry.get("sources") if isinstance(entry.get("sources"), list) else [])
+        if str(item).strip()
+    ]
+
+    output_entry: dict[str, Any] = {
+        "symbol": str(entry.get("symbol") or "Unknown"),
+        "timeframe": normalize_timeframe(str(entry.get("timeframe") or "unknown")),
+        "path": path_value,
+        "size_mb": round(size_bytes / (1024 * 1024), 2),
+        "start": start_value,
+        "end": end_value,
+        "start_date": start_value,
+        "end_date": end_value,
+        "source": str(entry.get("source") or ""),
+        "files": files,
+        "file_count": len(files),
+    }
+    if row_count is not None:
+        output_entry["row_count"] = row_count
+    if source_values:
+        output_entry["sources"] = sorted(set(source_values))
+    if include_size_bytes:
+        output_entry["size_bytes"] = size_bytes
+
+    if include_category:
+        output_entry["category"] = category
+
+    validation_payload = entry.get("validation")
+    normalized_validation = _normalize_ohlcv_validation(
+        validation_payload if isinstance(validation_payload, dict) else {},
+        warning_message,
+        error_message,
+    )
+    if normalized_validation:
+        output_entry["validation"] = normalized_validation
+    if warning_message:
+        output_entry["warning_message"] = warning_message
+        output_entry["validation_message"] = warning_message
+    if error_message:
+        output_entry["error"] = error_message
+    if entry.get("repo"):
+        output_entry["repo"] = True
+    if entry.get("last_updated") is not None:
+        output_entry["last_updated"] = entry.get("last_updated")
+
+    segment_entries = sorted(
+        [
+            segment
+            for segment in (entry.get("segments") if isinstance(entry.get("segments"), list) else [])
+            if isinstance(segment, dict)
+        ],
+        key=lambda segment: str(segment.get("path") or ""),
+    )
+    include_segments = len(segment_entries) > 1 or any(
+        str(segment.get("segment") or "").strip() for segment in segment_entries
+    )
+    if include_segments:
+        output_entry["segments"] = segment_entries
+        output_entry["segment_count"] = len(segment_entries)
+
+    return output_entry
+
+
 def _aggregate_symbol_timeframe_entries(
     entries: list[dict[str, Any]],
     *,
@@ -6572,93 +7116,13 @@ def _aggregate_symbol_timeframe_entries(
     logical_entries: list[dict[str, Any]] = []
     merged_entries = merge_ohlcv_entries([entry for entry in entries if isinstance(entry, dict)])
     for entry in merged_entries:
-        path_value = str(entry.get("path") or "")
-        category = _categorize_path(path_value) if include_category else ""
-        start_value = entry.get("start") or entry.get("start_date")
-        end_value = entry.get("end") or entry.get("end_date")
-        size_bytes = _entry_size_bytes(entry)
-        warning_message = _warning_message_from_entry(entry)
-        error_message = str(entry.get("error") or "").strip() or None
-
-        row_count_raw = entry.get("row_count", entry.get("rows"))
-        try:
-            row_count = int(row_count_raw) if row_count_raw is not None else None
-        except (TypeError, ValueError):
-            row_count = None
-
-        files = [
-            str(file_path).strip()
-            for file_path in (entry.get("files") if isinstance(entry.get("files"), list) else [])
-            if str(file_path).strip()
-        ]
-        if not files and path_value:
-            files = [path_value]
-
-        source_values = [
-            str(item).strip()
-            for item in (entry.get("sources") if isinstance(entry.get("sources"), list) else [])
-            if str(item).strip()
-        ]
-
-        output_entry: dict[str, Any] = {
-            "symbol": str(entry.get("symbol") or "Unknown"),
-            "timeframe": normalize_timeframe(str(entry.get("timeframe") or "unknown")),
-            "path": path_value,
-            "size_mb": round(size_bytes / (1024 * 1024), 2),
-            "start": start_value,
-            "end": end_value,
-            "start_date": start_value,
-            "end_date": end_value,
-            "source": str(entry.get("source") or ""),
-            "files": files,
-            "file_count": len(files),
-        }
-        if row_count is not None:
-            output_entry["row_count"] = row_count
-        if source_values:
-            output_entry["sources"] = sorted(set(source_values))
-        if include_size_bytes:
-            output_entry["size_bytes"] = size_bytes
-
-        if include_category:
-            output_entry["category"] = category
-
-        validation_payload = entry.get("validation")
-        if isinstance(validation_payload, dict) or warning_message or error_message:
-            normalized_validation = dict(validation_payload) if isinstance(validation_payload, dict) else {}
-            status = str(normalized_validation.get("status") or "").strip().lower()
-            if status not in {"ok", "warning", "error"}:
-                status = "ok"
-            if status == "ok" and (warning_message or error_message):
-                status = "warning"
-            normalized_validation["status"] = status
-            output_entry["validation"] = normalized_validation
-        if warning_message:
-            output_entry["warning_message"] = warning_message
-            output_entry["validation_message"] = warning_message
-        if error_message:
-            output_entry["error"] = error_message
-        if entry.get("repo"):
-            output_entry["repo"] = True
-        if entry.get("last_updated") is not None:
-            output_entry["last_updated"] = entry.get("last_updated")
-
-        segment_entries = sorted(
-            [
-                segment
-                for segment in (entry.get("segments") if isinstance(entry.get("segments"), list) else [])
-                if isinstance(segment, dict)
-            ],
-            key=lambda segment: str(segment.get("path") or ""),
+        logical_entries.append(
+            _aggregate_ohlcv_entry_payload(
+                entry,
+                include_category=include_category,
+                include_size_bytes=include_size_bytes,
+            )
         )
-        include_segments = len(segment_entries) > 1 or any(
-            str(segment.get("segment") or "").strip() for segment in segment_entries
-        )
-        if include_segments:
-            output_entry["segments"] = segment_entries
-            output_entry["segment_count"] = len(segment_entries)
-
-        logical_entries.append(output_entry)
 
     logical_entries.sort(
         key=lambda item: (
@@ -6672,12 +7136,12 @@ def _aggregate_symbol_timeframe_entries(
     return logical_entries
 
 
-@app.get("/api/strategies", response_model=list[dict[str, Any]])
+@app.get("/api/strategies")
 async def list_strategies() -> list[dict[str, Any]]:
     return await asyncio.to_thread(_cached_strategies_payload)
 
 
-@app.get("/api/signal-processors", response_model=list[dict[str, str]])
+@app.get("/api/signal-processors")
 async def list_signal_processors() -> list[dict[str, str]]:
     return await asyncio.to_thread(list_signal_processor_options)
 
@@ -6770,7 +7234,7 @@ async def get_strategy(name: str) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@app.patch("/api/strategies/{name:path}", response_model=dict[str, Any])
+@app.patch("/api/strategies/{name:path}")
 async def rename_strategy(name: str, payload: NameUpdateRequest) -> dict[str, Any]:
     entry = _safe_strategy_entry(name)
     if entry is None:
@@ -6791,7 +7255,7 @@ async def rename_strategy(name: str, payload: NameUpdateRequest) -> dict[str, An
     except HTTPException:
         raise
     except Exception as exc:
-        logger.exception("Failed to rename strategy %s: %s", name, exc)
+        logger.exception("Failed to rename strategy %s: %s", _log_safe(name), exc)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
@@ -6818,8 +7282,8 @@ def _matrix_summary_payload() -> dict[str, Any]:
 def _matrix_grid_overview_path() -> Path:
     candidates = [
         MATRIX_GRID_OVERVIEW_PATH,
-        STATIC_DIR / "matrix-grid-overview.json",
-        PROJECT_ROOT / "frontend" / "public" / "matrix-grid-overview.json",
+        STATIC_DIR / MATRIX_GRID_OVERVIEW_FILE,
+        PROJECT_ROOT / "frontend" / "public" / MATRIX_GRID_OVERVIEW_FILE,
     ]
     for path in candidates:
         if path.exists():
@@ -6880,7 +7344,7 @@ def _matrix_grid_row_with_trades(row: dict[str, Any], *, trades_limit: int) -> d
     return enriched
 
 
-@app.get("/api/backtests/matrix/summary", response_model=dict[str, Any])
+@app.get("/api/backtests/matrix/summary")
 async def get_backtest_matrix_summary() -> dict[str, Any]:
     return _matrix_summary_payload()
 
@@ -6901,7 +7365,7 @@ async def get_backtest_matrix_daily_equity_csv() -> FileResponse:
     return FileResponse(path, media_type="text/csv", filename=path.name)
 
 
-@app.get("/api/grid/{strategy_id:path}", response_model=dict[str, Any])
+@app.get("/api/grid/{strategy_id:path}")
 async def get_grid_strategy_detail(
     strategy_id: str,
     trades_limit: int = Query(default=3, ge=0, le=20),
@@ -6945,7 +7409,7 @@ async def get_grid_strategy_detail(
     return payload
 
 
-@app.get("/api/backtests", response_model=BacktestsListResponse)
+@app.get("/api/backtests")
 async def list_backtests(
     page: int = Query(default=1, ge=1),
     per_page: int = Query(default=50, ge=1, le=50),
@@ -7012,7 +7476,7 @@ async def list_backtests(
     )
 
 
-@app.get("/api/backtests/all", response_model=list[dict[str, Any]])
+@app.get("/api/backtests/all")
 async def list_backtests_all(
     include_equity_preview: bool = Query(default=False),
     preview_limit: int = Query(default=50, ge=1, le=100),
@@ -7034,7 +7498,7 @@ async def list_backtests_all(
     return [_backtest_all_item_from_meta(item) for item in items]
 
 
-@app.get("/api/backtests/duplicates", response_model=BacktestsDuplicatesResponse)
+@app.get("/api/backtests/duplicates")
 async def list_backtest_duplicates() -> BacktestsDuplicatesResponse:
     groups, total_backtests = _group_duplicate_backtests()
     return BacktestsDuplicatesResponse(
@@ -7044,7 +7508,7 @@ async def list_backtest_duplicates() -> BacktestsDuplicatesResponse:
     )
 
 
-@app.post("/api/backtests/deduplicate", response_model=BacktestsDeduplicateResponse)
+@app.post("/api/backtests/deduplicate")
 async def deduplicate_backtests() -> BacktestsDeduplicateResponse:
     groups, _ = _group_duplicate_backtests()
     deleted_ids: list[str] = []
@@ -7077,7 +7541,7 @@ async def deduplicate_backtests() -> BacktestsDeduplicateResponse:
     )
 
 
-@app.post("/api/backtests/remove-empty", response_model=dict[str, int])
+@app.post("/api/backtests/remove-empty")
 async def remove_empty_backtests() -> dict[str, int]:
     removed = 0
     for item in _snapshot_backtest_meta_cache():
@@ -7092,7 +7556,7 @@ async def remove_empty_backtests() -> dict[str, int]:
     return {"removed": removed}
 
 
-@app.post("/api/backtests/delete-bulk", response_model=dict[str, int])
+@app.post("/api/backtests/delete-bulk")
 async def delete_backtests_bulk(payload: BacktestsBulkDeleteRequest) -> dict[str, int]:
     deleted = 0
     seen: set[str] = set()
@@ -7106,7 +7570,7 @@ async def delete_backtests_bulk(payload: BacktestsBulkDeleteRequest) -> dict[str
     return {"deleted": deleted}
 
 
-@app.get("/api/backtests/compare", response_model=dict[str, Any])
+@app.get("/api/backtests/compare")
 async def compare_two_backtests(ids: str = Query(default="")) -> dict[str, Any]:
     if not ids:
         raise HTTPException(status_code=400, detail="Provide ?ids=id1,id2")
@@ -7149,8 +7613,8 @@ async def compare_two_backtests(ids: str = Query(default="")) -> dict[str, Any]:
     }
 
 
-@app.get("/api/backtest/{backtest_id}", response_model=dict[str, Any])
-@app.get("/api/backtests/{backtest_id}", response_model=dict[str, Any])
+@app.get("/api/backtest/{backtest_id}")
+@app.get("/api/backtests/{backtest_id}")
 async def get_backtest(
     backtest_id: str,
     include_trades: bool = Query(default=True),
@@ -7178,14 +7642,14 @@ async def get_backtest(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@app.delete("/api/backtests/{backtest_id}", response_model=dict[str, Any])
+@app.delete("/api/backtests/{backtest_id}")
 async def delete_single_backtest(backtest_id: str) -> dict[str, Any]:
     if not _delete_backtest_with_artifacts(backtest_id):
         raise HTTPException(status_code=404, detail=f"Backtest '{backtest_id}' not found")
     return {"id": backtest_id, "status": "deleted"}
 
 
-@app.patch("/api/backtests/{backtest_id}", response_model=dict[str, Any])
+@app.patch("/api/backtests/{backtest_id}")
 async def rename_backtest(backtest_id: str, payload: NameUpdateRequest) -> dict[str, Any]:
     result = _load_result(backtest_id)
     if result is None:
@@ -7213,22 +7677,22 @@ async def rename_backtest(backtest_id: str, payload: NameUpdateRequest) -> dict[
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@app.put("/api/backtests/{backtest_id}/name", response_model=dict[str, Any])
+@app.put("/api/backtests/{backtest_id}/name")
 async def rename_backtest_name(backtest_id: str, payload: NameUpdateRequest) -> dict[str, Any]:
     return await rename_backtest(backtest_id, payload)
 
 
-@app.get("/api/backtest/{backtest_id}/info", response_model=dict[str, Any])
-@app.get("/api/backtests/{backtest_id}/info", response_model=dict[str, Any])
+@app.get("/api/backtest/{backtest_id}/info")
+@app.get("/api/backtests/{backtest_id}/info")
 async def get_backtest_info(backtest_id: str) -> dict[str, Any]:
     result = _load_result(backtest_id)
     if result is None:
-        raise HTTPException(status_code=404, detail="Not found")
+        raise HTTPException(status_code=404, detail=NOT_FOUND_DETAIL)
     return legacy_viewer._backtest_info_payload(result)
 
 
-@app.get("/api/backtest/{backtest_id}/stats", response_model=dict[str, Any])
-@app.get("/api/backtests/{backtest_id}/stats", response_model=dict[str, Any])
+@app.get("/api/backtest/{backtest_id}/stats")
+@app.get("/api/backtests/{backtest_id}/stats")
 async def get_backtest_stats(backtest_id: str) -> dict[str, Any]:
     result = _load_result(backtest_id)
     if result is None:
@@ -7241,8 +7705,8 @@ async def get_backtest_stats(backtest_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@app.get("/api/backtest/{backtest_id}/equity", response_model=list[dict[str, float]])
-@app.get("/api/backtests/{backtest_id}/equity", response_model=list[dict[str, float]])
+@app.get("/api/backtest/{backtest_id}/equity")
+@app.get("/api/backtests/{backtest_id}/equity")
 async def get_equity_curve(
     backtest_id: str,
     max_points: int = Query(default=0, ge=0, le=20000),
@@ -7250,7 +7714,7 @@ async def get_equity_curve(
 ) -> list[dict[str, float]]:
     result = _load_result(backtest_id)
     if result is None:
-        raise HTTPException(status_code=404, detail="Not found")
+        raise HTTPException(status_code=404, detail=NOT_FOUND_DETAIL)
     equity_curve = legacy_viewer._equity_to_viewer(result)
     equity_curve.sort(key=lambda point: _safe_float(point.get("time"), 0.0))
     if max_points and max_points > 0 and str(sampling or "").strip().lower() in {"minmax", "min_max"}:
@@ -7355,7 +7819,7 @@ def _downsample_equity_curve_minmax(
     return deduped
 
 
-@app.get("/api/backtests/{backtest_id}/equity-preview", response_model=list[float])
+@app.get("/api/backtests/{backtest_id}/equity-preview")
 async def get_backtest_equity_preview(
     backtest_id: str,
     limit: int = Query(default=50, ge=1, le=100),
@@ -7372,7 +7836,7 @@ async def get_backtest_equity_preview(
     return _cached_backtest_equity_preview(normalized_id, limit=limit)
 
 
-@app.get("/api/backtests/equity-preview/batch", response_model=dict[str, list[float]])
+@app.get("/api/backtests/equity-preview/batch")
 async def get_backtest_equity_preview_batch(
     ids: str = Query(default=""),
     limit: int = Query(default=48, ge=1, le=100),
@@ -7404,7 +7868,7 @@ async def get_backtest_equity_preview_batch(
     }
 
 
-@app.get("/api/backtest/{backtest_id}/capm", response_model=CapmResponse)
+@app.get("/api/backtest/{backtest_id}/capm")
 async def get_backtest_capm(
     backtest_id: str,
     benchmark: str = Query(default=""),
@@ -7463,8 +7927,8 @@ async def get_backtest_capm(
     )
 
 
-@app.get("/api/backtest/{backtest_id}/trades", response_model=list[dict[str, Any]])
-@app.get("/api/backtests/{backtest_id}/trades", response_model=list[dict[str, Any]])
+@app.get("/api/backtest/{backtest_id}/trades")
+@app.get("/api/backtests/{backtest_id}/trades")
 async def get_backtest_trades(
     backtest_id: str,
     offset: int = Query(default=0, ge=0),
@@ -7472,7 +7936,7 @@ async def get_backtest_trades(
 ) -> list[dict[str, Any]]:
     result = _load_result(backtest_id)
     if result is None:
-        raise HTTPException(status_code=404, detail="Not found")
+        raise HTTPException(status_code=404, detail=NOT_FOUND_DETAIL)
     paged_trades = result.trades[offset : offset + limit]
     return [legacy_viewer._trade_to_viewer(trade) for trade in paged_trades]
 
@@ -7480,11 +7944,12 @@ async def get_backtest_trades(
 def _normalize_indicator_payloads(indicators: list[Any]) -> list[dict[str, Any]]:
     normalized: list[dict[str, Any]] = []
     for raw_indicator in indicators:
-        indicator = (
-            raw_indicator.to_dict()
-            if hasattr(raw_indicator, "to_dict")
-            else dict(raw_indicator) if isinstance(raw_indicator, dict) else None
-        )
+        if hasattr(raw_indicator, "to_dict"):
+            indicator = raw_indicator.to_dict()
+        elif isinstance(raw_indicator, dict):
+            indicator = dict(raw_indicator)
+        else:
+            indicator = None
         if not isinstance(indicator, dict):
             continue
 
@@ -7734,7 +8199,7 @@ def _collect_viewer_drawings(result: BacktestResult, symbol: str | None = None) 
     return drawings
 
 
-@app.get("/api/backtest/{backtest_id}/trade/{trade_nr}", response_model=dict[str, Any])
+@app.get("/api/backtest/{backtest_id}/trade/{trade_nr}")
 async def get_trade_with_context(backtest_id: str, trade_nr: int) -> dict[str, Any]:
     return await asyncio.to_thread(_trade_context_payload, backtest_id, trade_nr)
 
@@ -7800,7 +8265,7 @@ def _trade_context_indicators(
 def _trade_context_payload(backtest_id: str, trade_nr: int) -> dict[str, Any]:
     result = _load_result(backtest_id)
     if result is None:
-        raise HTTPException(status_code=404, detail="Not found")
+        raise HTTPException(status_code=404, detail=NOT_FOUND_DETAIL)
     try:
         trade, trade_payload = _resolve_trade(result, trade_nr)
         symbol = str(trade.symbol or "").strip() or "SPY"
@@ -7834,7 +8299,7 @@ def _trade_context_payload(backtest_id: str, trade_nr: int) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail="Failed to load trade context") from exc
 
 
-@app.get("/api/backtest/{backtest_id}/replay", response_model=dict[str, Any])
+@app.get("/api/backtest/{backtest_id}/replay")
 async def get_backtest_replay(backtest_id: str) -> dict[str, Any]:
     return await asyncio.to_thread(_replay_payload, backtest_id)
 
@@ -7896,7 +8361,7 @@ def _replay_indicators(
 def _replay_payload(backtest_id: str) -> dict[str, Any]:
     result = _load_result(backtest_id)
     if result is None:
-        raise HTTPException(status_code=404, detail="Not found")
+        raise HTTPException(status_code=404, detail=NOT_FOUND_DETAIL)
     try:
         trades = [legacy_viewer._trade_to_viewer(trade) for trade in result.trades]
         timeframe = _replay_timeframe(result)
@@ -7935,11 +8400,11 @@ def _replay_payload(backtest_id: str) -> dict[str, Any]:
     except HTTPException:
         raise
     except Exception as exc:
-        logger.exception("Trade replay payload failed for backtest '%s': %s", backtest_id, exc)
+        logger.exception("Trade replay payload failed for backtest '%s': %s", _log_safe(backtest_id), exc)
         raise HTTPException(status_code=500, detail="Failed to load trade replay") from exc
 
 
-@app.get("/api/backtest/{backtest_id}/ohlcv", response_model=dict[str, Any])
+@app.get("/api/backtest/{backtest_id}/ohlcv")
 async def get_backtest_ohlcv(backtest_id: str) -> dict[str, Any]:
     return await asyncio.to_thread(_backtest_ohlcv_payload, backtest_id)
 
@@ -7947,7 +8412,7 @@ async def get_backtest_ohlcv(backtest_id: str) -> dict[str, Any]:
 def _backtest_ohlcv_payload(backtest_id: str) -> dict[str, Any]:
     result = _load_result(backtest_id)
     if result is None:
-        raise HTTPException(status_code=404, detail="Not found")
+        raise HTTPException(status_code=404, detail=NOT_FOUND_DETAIL)
 
     symbols = result.meta.data.get("symbols", [])
     timeframe = (
@@ -7963,7 +8428,7 @@ def _backtest_ohlcv_payload(backtest_id: str) -> dict[str, Any]:
     return ohlcv_data
 
 
-@app.get("/api/compare", response_model=dict[str, Any])
+@app.get("/api/compare")
 async def compare_backtests_endpoint(ids: str = Query(default="")) -> dict[str, Any]:
     return await asyncio.to_thread(_compare_backtests_payload, ids)
 
@@ -8065,7 +8530,243 @@ def _backtest_compare_payload(backtest_id: str) -> dict[str, Any]:
     }
 
 
-@app.post("/api/backtests/run", response_model=dict[str, Any], status_code=202)
+def _run_backtest_process(
+    *,
+    task_id: str,
+    handle: Any,
+    cmd: list[str],
+    env: dict[str, str],
+    output_path: str,
+    backtest_id: str,
+    report_stage: Callable[..., None],
+) -> tuple[Any, str, str, str]:
+    """Launch the runner process and drain its stdout.
+
+    Returns ``(proc, latest_message, output_path, backtest_id)``.
+    """
+    command_display = " ".join(str(part) for part in cmd)
+    _write_task_log_line(
+        handle,
+        task_id,
+        f"[{_task_timestamp()}] Starting command: {command_display}",
+        stream="task",
+        source="backtest",
+        ingest_task_progress=False,
+    )
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        cwd=str(PROJECT_ROOT),
+        env=env,
+        text=True,
+        bufsize=1,
+    )
+    _update_task_fields(task_id, pid=proc.pid, process=proc)
+
+    latest_message = ""
+    if proc.stdout is not None:
+        for raw_line in proc.stdout:
+            line = raw_line.rstrip("\n")
+            if line:
+                _write_task_log_line(
+                    handle,
+                    task_id,
+                    line,
+                    stream="stdout",
+                    source="backtest",
+                    ingest_task_progress=False,
+                )
+            outcome = _consume_backtest_line(
+                line,
+                output_path=output_path,
+                backtest_id=backtest_id,
+            )
+            if outcome is None:
+                continue
+            parsed_message, stage, output_path, backtest_id = outcome
+            latest_message = parsed_message
+            if stage is not None:
+                percent, message = stage
+                report_stage(handle, percent=percent, message=message)
+            if output_path or backtest_id:
+                _update_task_fields(
+                    task_id,
+                    output_path=output_path or None,
+                    backtest_id=backtest_id or None,
+                )
+    return proc, latest_message, output_path, backtest_id
+
+
+def _prepare_backtest_runner_data(
+    *,
+    task_id: str,
+    handle: Any,
+    symbols: list[str],
+    timeframe: str,
+    start: str,
+    end: str,
+    report_stage: Callable[..., None],
+    report_download_phase: Callable[[float, str], None],
+) -> None:
+    """Ensure OHLCV availability, then report the running-backtest stage."""
+    _set_task_status(task_id, "running")
+    _running_jobs[task_id]["status"] = "running"
+    report_stage(handle, percent=10.0, message="Loading market data...")
+
+    missing_downloads = _ensure_backtest_data_availability(
+        symbols=symbols,
+        timeframe=timeframe,
+        start=start,
+        end=end,
+        progress_callback=report_download_phase,
+        log_callback=lambda message: _write_task_log_line(
+            handle,
+            task_id,
+            f"[{_task_timestamp()}] {message}",
+            stream="task",
+            source="backtest",
+            ingest_task_progress=False,
+        ),
+    )
+    if missing_downloads:
+        report_stage(handle, percent=45.0, message="Downloading data... 45%")
+    report_stage(handle, percent=45.0, message="Running backtest... 45%")
+
+
+def _finalize_backtest_run(
+    *,
+    task_id: str,
+    handle: Any,
+    returncode: int,
+    output_path: str,
+    backtest_id: str,
+    latest_message: str,
+    report_stage: Callable[..., None],
+) -> None:
+    """Record completion or failure of a backtest runner process."""
+    if returncode != 0:
+        error_text = latest_message or f"Backtest command exited with code {returncode}"
+        _write_task_log_line(
+            handle,
+            task_id,
+            f"[{_task_timestamp()}] Backtest failed: {error_text}",
+            stream="stderr",
+            log_level="error",
+            source="backtest",
+            ingest_task_progress=False,
+        )
+        _mark_task_finished(
+            task_id,
+            status="failed",
+            returncode=returncode,
+            error=error_text,
+        )
+        _running_jobs[task_id]["status"] = "failed"
+        _running_jobs[task_id]["result"] = None
+        _running_jobs[task_id]["error"] = error_text
+        return
+
+    report_stage(handle, percent=96.0, message=SAVING_RESULTS_MESSAGE)
+    result_payload = {
+        "output_path": output_path or None,
+        "backtest_id": backtest_id or None,
+    }
+    compact_result = {key: value for key, value in result_payload.items() if value}
+    final_trade_count = _count_backtest_trades(backtest_id, latest_message)
+    _upsert_backtest_meta_cache(backtest_id or "")
+    _update_task_fields(task_id, result=compact_result)
+    report_stage(
+        handle,
+        percent=100.0,
+        message=f"Completed - {final_trade_count} trades found",
+    )
+    _write_task_log_line(
+        handle,
+        task_id,
+        f"[{_task_timestamp()}] Backtest completed successfully.",
+        stream="task",
+        source="backtest",
+        ingest_task_progress=False,
+    )
+    _mark_task_finished(task_id, status="completed", returncode=0)
+    _running_jobs[task_id]["status"] = "completed"
+    _running_jobs[task_id]["result"] = compact_result
+    _running_jobs[task_id]["error"] = None
+
+
+def _consume_backtest_line(
+    line: str,
+    *,
+    output_path: str,
+    backtest_id: str,
+) -> tuple[str, tuple[float, str] | None, str, str] | None:
+    """Parse one runner stdout line.
+
+    Returns ``(message, stage, output_path, backtest_id)`` or ``None`` when the
+    line carries no usable message.
+    """
+    parsed_message = _backtest_runner_log_message(line)
+    if not parsed_message:
+        return None
+    stage = _backtest_runner_stage(parsed_message)
+    if parsed_message.lower().startswith("saved to:"):
+        output_path, backtest_id = _update_saved_backtest(
+            parsed_message[len(SAVED_TO_PREFIX):].strip(),
+            output_path,
+            backtest_id,
+        )
+    return parsed_message, stage, output_path, backtest_id
+
+
+def _backtest_runner_log_message(raw_line: str) -> str:
+    text = str(raw_line or "").strip()
+    if not text:
+        return ""
+    try:
+        payload_json = json.loads(text)
+    except json.JSONDecodeError:
+        return text
+
+    if isinstance(payload_json, dict):
+        message = payload_json.get("message")
+        if isinstance(message, str) and message.strip():
+            return message.strip()
+    return text
+
+
+def _backtest_runner_stage(message: str) -> tuple[float, str] | None:
+    normalized = message.lower()
+    if normalized.startswith("progress:"):
+        payload = message.split(":", 2)
+        if len(payload) == 3:
+            try:
+                percent = float(payload[1])
+            except ValueError:
+                return None
+            progress_message = payload[2].strip() or "Running backtest..."
+            scaled = 45.0 + (max(0.0, min(percent, 100.0)) * 0.55)
+            if progress_message:
+                return (scaled, f"Running backtest... {int(round(scaled))}%")
+            return (scaled, "Running backtest...")
+        return None
+    if "auto-detected date range" in normalized:
+        return (50.0, "Running backtest... 50%")
+    if "starting command:" in normalized:
+        return (52.0, "Running backtest... 52%")
+    if "running backtest:" in normalized:
+        return (58.0, "Running backtest... 58%")
+    if "result:" in normalized and "trades" in normalized:
+        return (82.0, "Processing trades...")
+    if normalized.startswith("result:"):
+        return (90.0, "Calculating statistics...")
+    if normalized.startswith(SAVED_TO_PREFIX):
+        return (96.0, SAVING_RESULTS_MESSAGE)
+    return None
+
+
+@app.post("/api/backtests/run", status_code=202)
 async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
     try:
         threading.Thread(target=_dolthub_pull, daemon=True).start()
@@ -8148,52 +8849,9 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
         },
     )
 
-    def _runner_log_message(raw_line: str) -> str:
-        text = str(raw_line or "").strip()
-        if not text:
-            return ""
-        try:
-            payload_json = json.loads(text)
-        except json.JSONDecodeError:
-            return text
 
-        if isinstance(payload_json, dict):
-            message = payload_json.get("message")
-            if isinstance(message, str) and message.strip():
-                return message.strip()
-        return text
 
-    def _runner_stage(message: str) -> tuple[float, str] | None:
-        normalized = message.lower()
-        if normalized.startswith("progress:"):
-            payload = message.split(":", 2)
-            if len(payload) == 3:
-                try:
-                    percent = float(payload[1])
-                except ValueError:
-                    return None
-                progress_message = payload[2].strip() or "Running backtest..."
-                scaled = 45.0 + (max(0.0, min(percent, 100.0)) * 0.55)
-                if progress_message:
-                    return (scaled, f"Running backtest... {int(round(scaled))}%")
-                return (scaled, "Running backtest...")
-            return None
-        if "auto-detected date range" in normalized:
-            return (50.0, "Running backtest... 50%")
-        if "starting command:" in normalized:
-            return (52.0, "Running backtest... 52%")
-        if "running backtest:" in normalized:
-            return (58.0, "Running backtest... 58%")
-        if "result:" in normalized and "trades" in normalized:
-            return (82.0, "Processing trades...")
-        if normalized.startswith("result:"):
-            return (90.0, "Calculating statistics...")
-        if normalized.startswith("saved to:"):
-            return (96.0, "Saving results...")
-        return None
-
-    def _run() -> None:
-        env = os.environ.copy()
+    def _build_command(env: dict[str, str]) -> list[str]:
         env["PYTHONUNBUFFERED"] = "1"
         cmd = [
             sys.executable,
@@ -8228,6 +8886,11 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
         if modeling_resolution:
             cmd.extend(["--intrabar-resolution", modeling_resolution])
         _update_task_fields(task_id, command=list(cmd))
+        return cmd
+
+    def _run() -> None:
+        env = os.environ.copy()
+        cmd = _build_command(env)
 
         latest_message = ""
         output_path = ""
@@ -8276,35 +8939,14 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
                     timeframe=timeframe,
                     start=start,
                     end=end,
-                    progress_callback=report_download_phase,
-                    log_callback=lambda message: _write_task_log_line(
-                        handle,
-                        task_id,
-                        f"[{_task_timestamp()}] {message}",
-                        stream="task",
-                        source="backtest",
-                        ingest_task_progress=False,
-                    ),
-                )
-                if missing_downloads:
-                    report_stage(handle, percent=45.0, message="Downloading data... 45%")
-                report_stage(handle, percent=45.0, message="Running backtest... 45%")
-
-                command_display = " ".join(str(part) for part in cmd)
-                _write_task_log_line(
-                    handle,
-                    task_id,
-                    f"[{_task_timestamp()}] Starting command: {command_display}",
-                    stream="task",
-                    source="backtest",
-                    ingest_task_progress=False,
+                    report_stage=report_stage,
+                    report_download_phase=report_download_phase,
                 )
 
-                proc = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    cwd=str(PROJECT_ROOT),
+                proc, latest_message, output_path, backtest_id = _run_backtest_process(
+                    task_id=task_id,
+                    handle=handle,
+                    cmd=cmd,
                     env=env,
                     text=True,
                     bufsize=1,
@@ -8339,17 +8981,21 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
                                 source="backtest",
                                 ingest_task_progress=False,
                             )
-                        parsed_message = _runner_log_message(line)
-                        if not parsed_message:
+                        outcome = _consume_backtest_line(
+                            line,
+                            output_path=output_path,
+                            backtest_id=backtest_id,
+                        )
+                        if outcome is None:
                             continue
+                        parsed_message, stage, output_path, backtest_id = outcome
                         latest_message = parsed_message
-                        stage = _runner_stage(parsed_message)
                         if stage is not None:
                             percent, message = stage
                             report_stage(handle, percent=percent, message=message)
 
                         if parsed_message.lower().startswith("saved to:"):
-                            output_path = parsed_message[len("saved to:"):].strip()
+                            output_path = parsed_message[len(SAVED_TO_PREFIX):].strip()
                             if output_path:
                                 filename = Path(output_path).name
                                 if filename.endswith(BACKTEST_TRADES_SUFFIX):
@@ -8385,24 +9031,13 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
                         f"Backtest timed out after {BACKTEST_WATCHDOG_TIMEOUT_SECONDS:.0f} seconds"
                     )
                 if returncode == 0:
-                    report_stage(handle, percent=96.0, message="Saving results...")
+                    report_stage(handle, percent=96.0, message=SAVING_RESULTS_MESSAGE)
                     result_payload = {
                         "output_path": output_path or None,
                         "backtest_id": backtest_id or None,
                     }
                     compact_result = {key: value for key, value in result_payload.items() if value}
-                    final_trade_count = 0
-                    if backtest_id:
-                        loaded_result = _load_result(backtest_id)
-                        if loaded_result is not None:
-                            final_trade_count = len(loaded_result.trades)
-                    if final_trade_count == 0 and isinstance(latest_message, str):
-                        match = re.search(r"result:\s*(\d+)\s+trades", latest_message.lower())
-                        if match:
-                            try:
-                                final_trade_count = int(match.group(1))
-                            except ValueError:
-                                final_trade_count = 0
+                    final_trade_count = _count_backtest_trades(backtest_id, latest_message)
                     _upsert_backtest_meta_cache(backtest_id or "")
                     _update_task_fields(task_id, result=compact_result)
                     report_stage(
@@ -8460,14 +9095,97 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
     return {"task_id": task_id, "job_id": task_id, "status": "queued"}
 
 
-@app.post("/api/backtests/run-signals", response_model=dict[str, Any], status_code=202)
-async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, Any]:
-    requested_timeframe = normalize_timeframe(str(payload.timeframe or "").strip()) or ""
-    start_dt = _parse_request_date(payload.start_date, field_name="start_date")
-    end_dt = _parse_request_date(payload.end_date, field_name="end_date", end_of_day=True)
-    if start_dt > end_dt:
-        raise HTTPException(status_code=400, detail="start_date must be <= end_date")
+def _validate_signal_processor_name(signal_processor: Any) -> str:
+    """Normalize the requested signal processor; raises 400 when unknown."""
+    signal_processor_name = str(signal_processor or "").strip().lower()
+    if signal_processor_name:
+        try:
+            get_signal_processor(signal_processor_name, {})
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return signal_processor_name
 
+
+def _validate_positive_payload_float(value: Any, *, default: float, field: str) -> float:
+    """Normalize an optional positive float payload field; raises 400 when invalid."""
+    normalized = float(value) if value is not None else default
+    if normalized <= 0:
+        raise HTTPException(status_code=400, detail=f"{field} must be > 0")
+    return normalized
+
+
+async def _collect_source_signals(
+    *,
+    normalized_source: str,
+    account_id: str,
+    start_dt: datetime,
+    end_dt: datetime,
+    default_timeframe: str,
+) -> tuple[list[dict[str, Any]], str]:
+    """Load replay signals from a live signal source (discord/internal)."""
+    if normalized_source not in {"discord", "internal"}:
+        raise HTTPException(
+            status_code=400,
+            detail="signal_source must be 'discord' or 'internal' when signals are omitted",
+        )
+    deployments = await asyncio.to_thread(list_live_deployments)
+    candidate_deployment_ids = [
+        str(deployment.id)
+        for deployment in deployments
+        if str(deployment.signal_source or "internal").lower() == normalized_source
+        and (not account_id or str(deployment.account_id) == account_id)
+    ]
+    if not candidate_deployment_ids:
+        raise HTTPException(
+            status_code=404,
+            detail="No deployments found for requested signal_source/account_id",
+        )
+    db_signals = await asyncio.to_thread(
+        list_live_signals_for_replay,
+        deployment_ids=candidate_deployment_ids,
+        source=normalized_source,
+        start=start_dt,
+        end=end_dt,
+        limit=20000,
+    )
+    normalized_signals = []
+    for row in db_signals:
+        signal_time = row.get("timestamp")
+        if not isinstance(signal_time, datetime):
+            continue
+        if signal_time < start_dt or signal_time > end_dt:
+            continue
+        normalized_signals.append(
+            {
+                "timestamp": signal_time,
+                "symbol": str(row.get("symbol") or "").strip().upper(),
+                "action": str(row.get("action") or "").strip().lower(),
+                "entry_price": _safe_float(row.get("entry_price"), 0.0),
+                "stop_loss": row.get("stop_loss"),
+                "take_profit": row.get("take_profit"),
+                "timeframe": normalize_timeframe(str(row.get("timeframe") or default_timeframe))
+                or default_timeframe,
+                "source": str(row.get("source") or normalized_source or "internal").lower(),
+                "metadata": (
+                    dict(row.get("metadata")) if isinstance(row.get("metadata"), dict) else {}
+                ),
+            }
+        )
+    return normalized_signals, normalized_source
+
+
+def _log_safe(value: object) -> str:
+    """Sanitize user-controlled values before writing them to logs (S5145)."""
+    text = str(value)
+    return "".join(ch if ch.isprintable() else "?" for ch in text)
+
+
+def _validated_signal_replay_request(
+    payload: BacktestRunSignalsRequest,
+) -> tuple[
+    list[dict[str, Any]], str, str, str, str, float, float, int
+]:
+    """Validate a run-signals request; returns the normalized request fields."""
     direct_signals_payload = list(payload.signals or [])
     source_name = str(payload.signal_source or "").strip().lower()
     valid_sources = {"discord", "internal", "csv", "discord-history", "manual"}
@@ -8478,120 +9196,50 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
         )
     normalized_source = source_name if source_name in {"discord", "internal"} else ""
     account_id = str(payload.account_id or "").strip()
-    signal_processor_name = str(payload.signal_processor or "").strip().lower()
-    if signal_processor_name:
-        try:
-            get_signal_processor(signal_processor_name, {})
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    signal_processor_name = _validate_signal_processor_name(payload.signal_processor)
     if not direct_signals_payload and not normalized_source:
         raise HTTPException(
             status_code=400,
             detail="Provide either 'signals' or 'signal_source'",
         )
 
-    risk_per_trade_pct = (
-        float(payload.risk_per_trade_pct)
-        if payload.risk_per_trade_pct is not None
-        else 0.01
+    risk_per_trade_pct = _validate_positive_payload_float(
+        payload.risk_per_trade_pct, default=0.01, field="risk_per_trade_pct"
     )
-    if risk_per_trade_pct <= 0:
-        raise HTTPException(status_code=400, detail="risk_per_trade_pct must be > 0")
-
-    max_position_pct = (
-        float(payload.max_position_pct)
-        if payload.max_position_pct is not None
-        else 0.05
+    max_position_pct = _validate_positive_payload_float(
+        payload.max_position_pct, default=0.05, field="max_position_pct"
     )
-    if max_position_pct <= 0:
-        raise HTTPException(status_code=400, detail="max_position_pct must be > 0")
-
     max_positions = int(payload.max_positions or 5)
     if max_positions <= 0:
         raise HTTPException(status_code=400, detail="max_positions must be > 0")
-
-    default_timeframe = requested_timeframe or "1h"
-    if direct_signals_payload:
-        normalized_signals: list[dict[str, Any]] = [
-            _normalize_replay_signal_payload(item, default_timeframe=default_timeframe)
-            for item in direct_signals_payload
-        ]
-        replay_source_label = source_name or str(
-            normalized_signals[0].get("source") if normalized_signals else "manual"
-        )
-        replay_source_label = replay_source_label.strip().lower() or "manual"
-    else:
-        if normalized_source not in {"discord", "internal"}:
-            raise HTTPException(
-                status_code=400,
-                detail="signal_source must be 'discord' or 'internal' when signals are omitted",
-            )
-        deployments = await asyncio.to_thread(list_live_deployments)
-        candidate_deployment_ids = [
-            str(deployment.id)
-            for deployment in deployments
-            if str(deployment.signal_source or "internal").lower() == normalized_source
-            and (not account_id or str(deployment.account_id) == account_id)
-        ]
-        if not candidate_deployment_ids:
-            raise HTTPException(
-                status_code=404,
-                detail="No deployments found for requested signal_source/account_id",
-            )
-        db_signals = await asyncio.to_thread(
-            list_live_signals_for_replay,
-            deployment_ids=candidate_deployment_ids,
-            source=normalized_source,
-            start=start_dt,
-            end=end_dt,
-            limit=20000,
-        )
-        normalized_signals = []
-        for row in db_signals:
-            signal_time = row.get("timestamp")
-            if not isinstance(signal_time, datetime):
-                continue
-            if signal_time < start_dt or signal_time > end_dt:
-                continue
-            normalized_signals.append(
-                {
-                    "timestamp": signal_time,
-                    "symbol": str(row.get("symbol") or "").strip().upper(),
-                    "action": str(row.get("action") or "").strip().lower(),
-                    "entry_price": _safe_float(row.get("entry_price"), 0.0),
-                    "stop_loss": row.get("stop_loss"),
-                    "take_profit": row.get("take_profit"),
-                    "timeframe": normalize_timeframe(str(row.get("timeframe") or default_timeframe))
-                    or default_timeframe,
-                    "source": str(row.get("source") or normalized_source or "internal").lower(),
-                    "metadata": (
-                        dict(row.get("metadata"))
-                        if isinstance(row.get("metadata"), dict)
-                        else {}
-                    ),
-                }
-            )
-        replay_source_label = normalized_source
-
-    normalized_signals = [
-        item
-        for item in normalized_signals
-        if str(item.get("symbol") or "").strip()
-        and str(item.get("action") or "") in {"buy", "sell"}
-        and _safe_float(item.get("entry_price"), 0.0) > 0
-    ]
-    if not normalized_signals:
-        raise HTTPException(status_code=400, detail="No valid signals to replay")
-
-    timeframe = _resolve_signal_replay_timeframe(
-        requested_timeframe=requested_timeframe,
-        normalized_signals=normalized_signals,
-        fallback=default_timeframe,
+    return (
+        direct_signals_payload,
+        source_name,
+        normalized_source,
+        account_id,
+        signal_processor_name,
+        risk_per_trade_pct,
+        max_position_pct,
+        max_positions,
     )
 
-    symbols = sorted({str(item["symbol"]).strip().upper() for item in normalized_signals})
-    start_str = start_dt.date().isoformat()
-    end_str = end_dt.date().isoformat()
+
+def _register_signal_replay_task(
+    *,
+    payload: BacktestRunSignalsRequest,
+    symbols: list[str],
+    normalized_signals: list[dict[str, Any]],
+    replay_source_label: str,
+    account_id: str,
+    signal_processor_name: str,
+    risk_per_trade_pct: float,
+    max_position_pct: float,
+    max_positions: int,
+    timeframe: str,
+    start_dt: datetime,
+    end_dt: datetime,
+) -> tuple[str, Any, int]:
+    """Create the replay task record, restart config and job placeholder."""
     task_id = str(uuid.uuid4())[:8]
     TASK_LOGS_DIR.mkdir(parents=True, exist_ok=True)
     log_file = _task_log_path(task_id)
@@ -8609,6 +9257,130 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
         log_file=log_file,
         control_mode="thread",
         supports_control=False,
+    )
+    with DATA_TASKS_LOCK:
+        DATA_TASKS[task_id] = record
+    _set_task_status(task_id, "queued")
+    _update_task_fields(
+        task_id,
+        restart_config={
+            "signal_source": replay_source_label,
+            "account_id": account_id,
+            "start_date": start_dt.date().isoformat(),
+            "end_date": end_dt.date().isoformat(),
+            "timeframe": timeframe,
+            "capital": float(payload.capital or 100000.0),
+            "risk_per_trade_pct": risk_per_trade_pct,
+            "max_position_pct": max_position_pct,
+            "max_positions": max_positions,
+            "signal_processor": signal_processor_name or None,
+            "signal_count": len(normalized_signals),
+        },
+    )
+    _running_jobs[task_id] = {
+        "status": "queued",
+        "result": None,
+        "error": None,
+        "task_id": task_id,
+        "job_id": task_id,
+    }
+    return task_id, log_file, stage_total
+
+
+async def _gather_replay_signals(
+    *,
+    payload_signals: list[dict[str, Any]],
+    source_name: str,
+    normalized_source: str,
+    account_id: str,
+    start_dt: datetime,
+    end_dt: datetime,
+    default_timeframe: str,
+) -> tuple[list[dict[str, Any]], str]:
+    """Collect, normalize and validate the signals to replay; returns (signals, source)."""
+    if payload_signals:
+        normalized_signals: list[dict[str, Any]] = [
+            _normalize_replay_signal_payload(item, default_timeframe=default_timeframe)
+            for item in payload_signals
+        ]
+        replay_source_label = source_name or str(
+            normalized_signals[0].get("source") if normalized_signals else "manual"
+        )
+        replay_source_label = replay_source_label.strip().lower() or "manual"
+    else:
+        normalized_signals, replay_source_label = await _collect_source_signals(
+            normalized_source=normalized_source,
+            account_id=account_id,
+            start_dt=start_dt,
+            end_dt=end_dt,
+            default_timeframe=default_timeframe,
+        )
+        replay_source_label = replay_source_label or normalized_source
+
+    normalized_signals = [
+        item
+        for item in normalized_signals
+        if str(item.get("symbol") or "").strip()
+        and str(item.get("action") or "") in {"buy", "sell"}
+        and _safe_float(item.get("entry_price"), 0.0) > 0
+    ]
+    if not normalized_signals:
+        raise HTTPException(status_code=400, detail="No valid signals to replay")
+    return normalized_signals, replay_source_label
+
+
+@app.post("/api/backtests/run-signals", status_code=202)
+async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, Any]:
+    requested_timeframe = normalize_timeframe(str(payload.timeframe or "").strip()) or ""
+    start_dt = _parse_request_date(payload.start_date, field_name="start_date")
+    end_dt = _parse_request_date(payload.end_date, field_name="end_date", end_of_day=True)
+    if start_dt > end_dt:
+        raise HTTPException(status_code=400, detail="start_date must be <= end_date")
+
+    (
+        direct_signals_payload,
+        source_name,
+        normalized_source,
+        account_id,
+        signal_processor_name,
+        risk_per_trade_pct,
+        max_position_pct,
+        max_positions,
+    ) = _validated_signal_replay_request(payload)
+
+    default_timeframe = requested_timeframe or "1h"
+    normalized_signals, replay_source_label = await _gather_replay_signals(
+        payload_signals=direct_signals_payload,
+        source_name=source_name,
+        normalized_source=normalized_source,
+        account_id=account_id,
+        start_dt=start_dt,
+        end_dt=end_dt,
+        default_timeframe=default_timeframe,
+    )
+    timeframe = _resolve_signal_replay_timeframe(
+        requested_timeframe=requested_timeframe,
+        normalized_signals=normalized_signals,
+        fallback=default_timeframe,
+    )
+
+    symbols = sorted({str(item["symbol"]).strip().upper() for item in normalized_signals})
+    start_str = start_dt.date().isoformat()
+    end_str = end_dt.date().isoformat()
+    symbols = sorted({str(item["symbol"]).strip().upper() for item in normalized_signals})
+    task_id, log_file, stage_total = _register_signal_replay_task(
+        payload=payload,
+        symbols=symbols,
+        normalized_signals=normalized_signals,
+        replay_source_label=replay_source_label,
+        account_id=account_id,
+        signal_processor_name=signal_processor_name,
+        risk_per_trade_pct=risk_per_trade_pct,
+        max_position_pct=max_position_pct,
+        max_positions=max_positions,
+        timeframe=timeframe,
+        start_dt=start_dt,
+        end_dt=end_dt,
     )
     with DATA_TASKS_LOCK:
         DATA_TASKS[task_id] = record
@@ -8772,7 +9544,7 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
                     result.meta.tags.append(f"account:{account_id}")
                 result.meta.tags = sorted({str(tag).strip() for tag in result.meta.tags if str(tag).strip()})
 
-                report_stage(handle, percent=96.0, message="Saving results...")
+                report_stage(handle, percent=96.0, message=SAVING_RESULTS_MESSAGE)
                 BACKTESTS_DIR.mkdir(parents=True, exist_ok=True)
                 output_path = BACKTESTS_DIR / f"{result.meta.id}.trades.json"
                 result.save(output_path)
@@ -8956,7 +9728,7 @@ async def run_backtest_from_signals(payload: BacktestRunFromSignalsRequest) -> d
     return await run_backtest_signals(replay_payload)
 
 
-@app.get("/api/backtests/run/{job_id}/status", response_model=dict[str, Any])
+@app.get("/api/backtests/run/{job_id}/status")
 async def get_backtest_run_status(job_id: str) -> dict[str, Any]:
     task = _snapshot_task(job_id)
     if task is not None and task.get("kind") == "backtest":
@@ -8978,7 +9750,7 @@ async def get_backtest_run_status(job_id: str) -> dict[str, Any]:
     return job
 
 
-@app.post("/api/optimizations/run", response_model=dict[str, Any], status_code=202)
+@app.post("/api/optimizations/run", status_code=202)
 async def run_optimization_job(payload: dict[str, Any]) -> dict[str, Any]:
     try:
         config = OptimizationConfig.model_validate(payload)
@@ -9084,7 +9856,7 @@ async def run_optimization_job(payload: dict[str, Any]) -> dict[str, Any]:
     return {"task_id": task_id, "job_id": task_id, "status": "queued"}
 
 
-@app.get("/api/optimizations", response_model=list[dict[str, Any]])
+@app.get("/api/optimizations")
 async def list_optimizations() -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     if not OPTIMIZATIONS_DIR.exists():
@@ -9094,7 +9866,7 @@ async def list_optimizations() -> list[dict[str, Any]]:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
             results.append(_optimization_summary_payload(payload, path))
-        except (json.JSONDecodeError, OSError, TypeError, ValueError) as exc:
+        except (OSError, TypeError, ValueError) as exc:
             logger.warning("Could not read optimization %s: %s", path, exc)
 
     results.sort(
@@ -9107,12 +9879,12 @@ async def list_optimizations() -> list[dict[str, Any]]:
     return results
 
 
-@app.get("/api/optimizations/{optimization_id}", response_model=dict[str, Any])
+@app.get("/api/optimizations/{optimization_id}")
 async def get_optimization(optimization_id: str) -> dict[str, Any]:
     try:
         payload = _load_optimization_payload(optimization_id)
-    except (json.JSONDecodeError, OSError, TypeError, ValueError) as exc:
-        logger.exception("Failed to load optimization '%s': %s", optimization_id, exc)
+    except (OSError, TypeError, ValueError) as exc:
+        logger.exception("Failed to load optimization '%s': %s", _log_safe(optimization_id), exc)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     if payload is None:
@@ -9120,7 +9892,7 @@ async def get_optimization(optimization_id: str) -> dict[str, Any]:
     return payload
 
 
-@app.get("/api/portfolios/compare", response_model=dict[str, Any])
+@app.get("/api/portfolios/compare")
 async def compare_portfolios(ids: str = Query(default="")) -> dict[str, Any]:
     if not ids:
         raise HTTPException(status_code=400, detail="Provide ?ids=id1,id2")
@@ -9138,7 +9910,7 @@ async def compare_portfolios(ids: str = Query(default="")) -> dict[str, Any]:
     return {"portfolios": portfolios}
 
 
-@app.get("/api/portfolios", response_model=list[dict[str, Any]])
+@app.get("/api/portfolios")
 async def list_portfolios(
     name: str = Query(default=""),
     sort: str = Query(default="created_at"),
@@ -9155,7 +9927,7 @@ async def list_portfolios(
     return summaries
 
 
-@app.get("/api/portfolios/duplicates", response_model=PortfoliosDuplicatesResponse)
+@app.get("/api/portfolios/duplicates")
 async def list_portfolio_duplicates() -> PortfoliosDuplicatesResponse:
     groups, total_portfolios = _group_duplicate_portfolios()
     return PortfoliosDuplicatesResponse(
@@ -9165,7 +9937,7 @@ async def list_portfolio_duplicates() -> PortfoliosDuplicatesResponse:
     )
 
 
-@app.post("/api/portfolios/deduplicate", response_model=PortfoliosDeduplicateResponse)
+@app.post("/api/portfolios/deduplicate")
 async def deduplicate_portfolios() -> PortfoliosDeduplicateResponse:
     groups, _ = _group_duplicate_portfolios()
     deleted_ids: list[str] = []
@@ -9198,7 +9970,7 @@ async def deduplicate_portfolios() -> PortfoliosDeduplicateResponse:
     )
 
 
-@app.post("/api/portfolios/remove-empty", response_model=dict[str, Any])
+@app.post("/api/portfolios/remove-empty")
 async def remove_empty_portfolios() -> dict[str, Any]:
     portfolios = _snapshot_portfolio_payloads()
     removed_ids: list[str] = []
@@ -9219,16 +9991,12 @@ async def remove_empty_portfolios() -> dict[str, Any]:
     }
 
 
-@app.post("/api/portfolios", response_model=dict[str, Any], status_code=201)
-async def create_portfolio(payload: CreatePortfolioRequest) -> dict[str, Any]:
-    name = str(payload.name or "Untitled").strip() or "Untitled"
-    account_capital = float(payload.account_capital or 100000.0)
-    if not math.isfinite(account_capital) or account_capital <= 0:
-        raise HTTPException(status_code=400, detail="account_capital must be positive")
-
-    component_payloads = _resolve_component_payloads(payload)
-    allows_empty_portfolio = len(component_payloads) == 0
-
+def _build_portfolio_components_from_backtests(
+    component_payloads: list[dict[str, Any]],
+    *,
+    account_capital: float,
+) -> tuple[list[dict[str, Any]], list[pd.Series], list[dict[str, Any]]]:
+    """Load each component backtest and derive its returns, trades and stats."""
     component_returns: list[pd.Series] = []
     components: list[dict[str, Any]] = []
     all_trades_timed: list[dict[str, Any]] = []
@@ -9332,11 +10100,16 @@ async def create_portfolio(payload: CreatePortfolioRequest) -> dict[str, Any]:
                 ),
             }
         )
+    return components, component_returns, all_trades_timed
 
-    if not component_returns and not allows_empty_portfolio:
-        raise HTTPException(status_code=400, detail="No valid components found")
 
-    now = datetime.now(timezone.utc)
+def _portfolio_combined_metrics(
+    component_returns: list[pd.Series],
+    *,
+    account_capital: float,
+    now: datetime,
+) -> tuple[dict[str, Any], list[legacy_viewer.EquityPoint], dict[str, Any]]:
+    """Combine component return streams into portfolio metrics and equity curve."""
     if component_returns:
         combined_df = pd.concat(component_returns, axis=1).fillna(0.0)
         portfolio_daily_returns = combined_df.sum(axis=1)
@@ -9378,6 +10151,38 @@ async def create_portfolio(payload: CreatePortfolioRequest) -> dict[str, Any]:
             "psr": 0.0,
             "p_value": 1.0,
         }
+
+    return correlation_matrix, combined_equity_points, stats_result
+
+
+@app.post("/api/portfolios", status_code=201)
+async def create_portfolio(payload: CreatePortfolioRequest) -> dict[str, Any]:
+    name = str(payload.name or "Untitled").strip() or "Untitled"
+    account_capital = float(payload.account_capital or 100000.0)
+    if not math.isfinite(account_capital) or account_capital <= 0:
+        raise HTTPException(status_code=400, detail="account_capital must be positive")
+
+    component_payloads = _resolve_component_payloads(payload)
+    allows_empty_portfolio = len(component_payloads) == 0
+
+    component_returns: list[pd.Series] = []
+    components: list[dict[str, Any]] = []
+    all_trades_timed: list[dict[str, Any]] = []
+
+    components, component_returns, all_trades_timed = _build_portfolio_components_from_backtests(
+        component_payloads,
+        account_capital=account_capital,
+    )
+
+    if not component_returns and not allows_empty_portfolio:
+        raise HTTPException(status_code=400, detail="No valid components found")
+
+    now = datetime.now(timezone.utc)
+    correlation_matrix, combined_equity_points, stats_result = _portfolio_combined_metrics(
+        component_returns,
+        account_capital=account_capital,
+        now=now,
+    )
 
     portfolio_id = _portfolio_identifier(name, now=now)
     all_trades_timed.sort(key=_component_trade_time)
@@ -9468,7 +10273,7 @@ def _load_portfolio_payload(portfolio_id: str) -> dict[str, Any]:
     return _portfolio_record_to_payload(record)
 
 
-@app.post("/api/portfolios/delete-bulk", response_model=dict[str, int])
+@app.post("/api/portfolios/delete-bulk")
 async def delete_portfolios_bulk(payload: PortfoliosBulkDeleteRequest) -> dict[str, int]:
     deleted = 0
     seen: set[str] = set()
@@ -9482,7 +10287,7 @@ async def delete_portfolios_bulk(payload: PortfoliosBulkDeleteRequest) -> dict[s
     return {"deleted": deleted}
 
 
-@app.get("/api/portfolios/{portfolio_id}", response_model=dict[str, Any])
+@app.get("/api/portfolios/{portfolio_id}")
 async def get_portfolio(portfolio_id: str) -> dict[str, Any]:
     payload = _load_portfolio_payload(portfolio_id)
     payload["combined_stats"] = legacy_viewer.PortfolioStats.from_dict(
@@ -9491,7 +10296,7 @@ async def get_portfolio(portfolio_id: str) -> dict[str, Any]:
     return payload
 
 
-@app.patch("/api/portfolios/{portfolio_id}", response_model=dict[str, Any])
+@app.patch("/api/portfolios/{portfolio_id}")
 async def rename_portfolio(portfolio_id: str, payload: NameUpdateRequest) -> dict[str, Any]:
     updated_name = str(payload.name or "").strip()
     if not updated_name:
@@ -9508,19 +10313,19 @@ async def rename_portfolio(portfolio_id: str, payload: NameUpdateRequest) -> dic
         output_path = PORTFOLIOS_DIR / f"{portfolio_id}.json"
         output_path.write_text(json.dumps(normalized_portfolio, indent=2), encoding="utf-8")
     except Exception as exc:
-        logger.exception("Failed to rename portfolio '%s': %s", portfolio_id, exc)
+        logger.exception("Failed to rename portfolio '%s': %s", _log_safe(portfolio_id), exc)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     _upsert_portfolio_meta_cache_from_payload(normalized_portfolio)
     return {"id": portfolio_id, "name": updated_name, "status": "updated"}
 
 
-@app.put("/api/portfolios/{portfolio_id}/name", response_model=dict[str, Any])
+@app.put("/api/portfolios/{portfolio_id}/name")
 async def rename_portfolio_name(portfolio_id: str, payload: NameUpdateRequest) -> dict[str, Any]:
     return await rename_portfolio(portfolio_id, payload)
 
 
-@app.get("/api/portfolios/{portfolio_id}/contributions", response_model=list[dict[str, Any]])
+@app.get("/api/portfolios/{portfolio_id}/contributions")
 async def get_portfolio_contributions(
     portfolio_id: str,
     group_by: str = Query(default="component"),
@@ -9529,7 +10334,7 @@ async def get_portfolio_contributions(
     return _compute_portfolio_contributions(portfolio=portfolio, group_by=group_by)
 
 
-@app.get("/api/portfolios/{portfolio_id}/trades", response_model=list[dict[str, Any]])
+@app.get("/api/portfolios/{portfolio_id}/trades")
 async def get_portfolio_trades(
     portfolio_id: str,
     strategy: str = Query(default=""),
@@ -9545,11 +10350,24 @@ async def get_portfolio_trades(
     )
 
 
-@app.delete("/api/portfolios/{portfolio_id}", response_model=dict[str, Any])
+@app.delete("/api/portfolios/{portfolio_id}")
 async def delete_portfolio(portfolio_id: str) -> dict[str, Any]:
     if not _delete_portfolio_with_artifacts(portfolio_id):
         raise HTTPException(status_code=404, detail="Portfolio not found")
     return {"status": "deleted", "id": portfolio_id}
+
+
+def _execution_risk_value(
+    row: dict[str, Any], metadata: dict[str, Any], field: str
+) -> float | None:
+    """Prefer the execution row's risk value; fall back to signal metadata."""
+    row_value = row.get(field)
+    if row_value is not None:
+        return _safe_float(row_value)
+    metadata_value = metadata.get(field)
+    if metadata_value is not None:
+        return _safe_float(metadata_value)
+    return None
 
 
 async def _live_trades_payload(account_id: str) -> dict[str, Any]:
@@ -9576,33 +10394,9 @@ async def _live_trades_payload(account_id: str) -> dict[str, Any]:
                 "slippage": float(row.get("slippage", 0.0)),
                 "slippage_bps": float(row.get("slippage_bps", 0.0)),
                 "filled_qty": float(row.get("filled_qty", 0.0)),
-                "position_size": (
-                    _safe_float(row.get("position_size"))
-                    if row.get("position_size") is not None
-                    else (
-                        _safe_float(metadata.get("position_size"))
-                        if metadata.get("position_size") is not None
-                        else None
-                    )
-                ),
-                "risk_amount": (
-                    _safe_float(row.get("risk_amount"))
-                    if row.get("risk_amount") is not None
-                    else (
-                        _safe_float(metadata.get("risk_amount"))
-                        if metadata.get("risk_amount") is not None
-                        else None
-                    )
-                ),
-                "risk_percent": (
-                    _safe_float(row.get("risk_percent"))
-                    if row.get("risk_percent") is not None
-                    else (
-                        _safe_float(metadata.get("risk_percent"))
-                        if metadata.get("risk_percent") is not None
-                        else None
-                    )
-                ),
+                "position_size": _execution_risk_value(row, metadata, "position_size"),
+                "risk_amount": _execution_risk_value(row, metadata, "risk_amount"),
+                "risk_percent": _execution_risk_value(row, metadata, "risk_percent"),
                 "exit_reason": (
                     str(row.get("exit_reason")).strip()
                     if row.get("exit_reason") not in (None, "")
@@ -9739,13 +10533,13 @@ async def _live_positions_payload(account_id: str) -> dict[str, Any]:
     return {"account_id": account_id, "positions": positions}
 
 
-@app.get("/api/live/accounts", response_model=list[dict[str, Any]])
+@app.get("/api/live/accounts")
 async def get_live_accounts() -> list[dict[str, Any]]:
     _log_live_endpoint_request("/api/live/accounts")
     return await asyncio.to_thread(_cached_live_accounts_payload)
 
 
-@app.get("/api/services", response_model=list[dict[str, Any]])
+@app.get("/api/services")
 async def get_services_endpoint(
     type: str | None = Query(default=None),  # noqa: A002 - follows API contract
 ) -> list[dict[str, Any]]:
@@ -9759,7 +10553,7 @@ async def get_services_endpoint(
     return [_serialize_service_payload(service) for service in services]
 
 
-@app.post("/api/services", response_model=dict[str, Any], status_code=201)
+@app.post("/api/services", status_code=201)
 async def create_service_endpoint(payload: ServiceCreateRequest) -> dict[str, Any]:
     try:
         service = Service(
@@ -9775,15 +10569,15 @@ async def create_service_endpoint(payload: ServiceCreateRequest) -> dict[str, An
     return _serialize_service_payload(created)
 
 
-@app.get("/api/services/{service_id}", response_model=dict[str, Any])
+@app.get("/api/services/{service_id}")
 async def get_service_endpoint(service_id: str) -> dict[str, Any]:
     service = await asyncio.to_thread(get_service, service_id)
     if service is None:
-        raise HTTPException(status_code=404, detail="Service not found")
+        raise HTTPException(status_code=404, detail=SERVICE_NOT_FOUND_DETAIL)
     return _serialize_service_payload(service)
 
 
-@app.put("/api/services/{service_id}/status", response_model=dict[str, Any])
+@app.put("/api/services/{service_id}/status")
 async def update_service_status_endpoint(
     service_id: str,
     payload: ServiceStatusUpdateRequest,
@@ -9793,15 +10587,15 @@ async def update_service_status_endpoint(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if updated is None:
-        raise HTTPException(status_code=404, detail="Service not found")
+        raise HTTPException(status_code=404, detail=SERVICE_NOT_FOUND_DETAIL)
     return _serialize_service_payload(updated)
 
 
-@app.delete("/api/services/{service_id}", response_model=dict[str, Any])
+@app.delete("/api/services/{service_id}")
 async def delete_service_endpoint(service_id: str) -> dict[str, Any]:
     deleted = await asyncio.to_thread(delete_service, service_id)
     if not deleted:
-        raise HTTPException(status_code=404, detail="Service not found")
+        raise HTTPException(status_code=404, detail=SERVICE_NOT_FOUND_DETAIL)
     return {"status": "deleted", "id": service_id}
 
 
@@ -9854,7 +10648,7 @@ def _entry_matches_service_log(entry: dict[str, Any], *, service: Service, token
     return False
 
 
-@app.get("/api/services/{service_id}/logs", response_model=LogContentModel)
+@app.get("/api/services/{service_id}/logs")
 async def get_service_logs_endpoint(
     service_id: str,
     lines: int = Query(default=200, ge=1, le=100000),
@@ -9863,7 +10657,7 @@ async def get_service_logs_endpoint(
 ) -> LogContentModel:
     service = await asyncio.to_thread(get_service, service_id)
     if service is None:
-        raise HTTPException(status_code=404, detail="Service not found")
+        raise HTTPException(status_code=404, detail=SERVICE_NOT_FOUND_DETAIL)
     try:
         entries = legacy_viewer._collect_log_entries(legacy_viewer._available_log_files())
         level_filter = legacy_viewer._normalize_log_levels(level)
@@ -9890,7 +10684,7 @@ async def get_service_logs_endpoint(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@app.get("/api/verification/evidence", response_model=list[VerificationEvidenceRecord])
+@app.get("/api/verification/evidence")
 async def get_verification_evidence(
     component: str = Query(default=""),
     category: str = Query(default=""),
@@ -9909,7 +10703,7 @@ async def get_verification_evidence(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.get("/api/verification/evidence/summary", response_model=list[VerificationEvidenceSummary])
+@app.get("/api/verification/evidence/summary")
 async def get_verification_evidence_summary(
     component: str = Query(default=""),
     category: str = Query(default=""),
@@ -9928,7 +10722,7 @@ async def get_verification_evidence_summary(
 
 @app.post(
     "/api/verification/evidence",
-    response_model=VerificationEvidenceRecord,
+
     status_code=201,
 )
 async def create_verification_evidence(
@@ -9958,14 +10752,72 @@ async def create_verification_evidence(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.get("/api/live/deployments", response_model=list[dict[str, Any]])
+async def _resolve_live_deployment_signal_source(
+    *,
+    signal_source_type: str,
+    strategy_name: str,
+    symbols: list[str],
+    symbol_filter: list[str],
+    signal_source_id: str,
+    signal_config_payload: dict[str, Any],
+) -> tuple[str, list[str], str, list[str], dict[str, Any]]:
+    """Validate/normalize the signal-source inputs for a live deployment."""
+    if signal_source_type == "internal":
+        if not strategy_name:
+            raise HTTPException(status_code=400, detail="strategy_name is required for internal signal source")
+        if not symbols:
+            raise HTTPException(status_code=400, detail="At least one symbol is required")
+        return "", [], strategy_name, symbols, signal_config_payload
+
+    matched_service: Service | None = None
+    if signal_source_id:
+        discord_services = await asyncio.to_thread(
+            list_services,
+            service_type=ServiceType.DISCORD_BOT,
+        )
+        matched_service = next(
+            (
+                service
+                for service in discord_services
+                if str(service.name or "").strip().lower() == signal_source_id.lower()
+            ),
+            None,
+        )
+        if matched_service is None:
+            raise HTTPException(status_code=404, detail="Discord signal source service not found")
+        signal_source_id = matched_service.name
+    elif not str(signal_config_payload.get("channel_id") or "").strip():
+        raise HTTPException(
+            status_code=400,
+            detail="signal_source_id is required for discord signal source",
+        )
+    if not strategy_name:
+        strategy_name = (
+            f"discord::{signal_source_id.lower()}"
+            if signal_source_id
+            else "discord::legacy"
+        )
+    if not symbols and symbol_filter:
+        symbols = list(symbol_filter)
+    if not symbols:
+        symbols = ["*"]
+    if signal_source_id:
+        signal_config_payload.setdefault("service_name", signal_source_id)
+    if matched_service and isinstance(matched_service.config, dict):
+        channel_id = str(matched_service.config.get("channel_id") or "").strip()
+        if channel_id and not str(signal_config_payload.get("channel_id") or "").strip():
+            signal_config_payload["channel_id"] = channel_id
+    return signal_source_id, symbol_filter, strategy_name, symbols, signal_config_payload
+
+
+@app.get(LIVE_DEPLOYMENTS_PATH)
 async def get_live_deployments() -> list[dict[str, Any]]:
-    _log_live_endpoint_request("/api/live/deployments")
+    _log_live_endpoint_request(LIVE_DEPLOYMENTS_PATH)
     deployments = await asyncio.to_thread(list_live_deployments)
     return [_serialize_live_deployment_payload(deployment) for deployment in deployments]
 
 
-@app.get("/api/live/dashboard", response_model=dict[str, Any])
+@app.get("/api/live/dashboard")
 async def get_live_dashboard() -> dict[str, Any]:
     _log_live_endpoint_request("/api/live/dashboard")
     accounts, deployments = await asyncio.gather(
@@ -10042,7 +10894,7 @@ async def get_live_dashboard() -> dict[str, Any]:
     }
 
 
-@app.post("/api/live/deployments/ctrader/top5", response_model=dict[str, Any])
+@app.post("/api/live/deployments/ctrader/top5")
 async def deploy_top_ctrader_strategies(payload: CTraderTopDeployRequest) -> dict[str, Any]:
     limit = max(1, min(int(payload.limit or 5), 20))
     status = "ACTIVE" if payload.activate else "PAUSED"
@@ -10089,7 +10941,7 @@ async def deploy_top_ctrader_strategies(payload: CTraderTopDeployRequest) -> dic
     }
 
 
-@app.post("/api/live/deployments", response_model=dict[str, Any], status_code=201)
+@app.post(LIVE_DEPLOYMENTS_PATH, status_code=201)
 async def create_live_deployment_endpoint(
     payload: LiveDeploymentCreateRequest,
 ) -> dict[str, Any]:
@@ -10097,7 +10949,7 @@ async def create_live_deployment_endpoint(
         payload.signal_source_type or payload.signal_source or "internal"
     ).strip().lower()
     _log_live_endpoint_request(
-        "/api/live/deployments",
+        LIVE_DEPLOYMENTS_PATH,
         strategy_name=payload.strategy_name,
         account_id=payload.account_id,
         symbols=payload.symbols,
@@ -10135,52 +10987,20 @@ async def create_live_deployment_endpoint(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         signal_config_payload["signal_processor"] = signal_processor_name
 
-    if signal_source_type == "internal":
-        if not strategy_name:
-            raise HTTPException(status_code=400, detail="strategy_name is required for internal signal source")
-        if not symbols:
-            raise HTTPException(status_code=400, detail="At least one symbol is required")
-        signal_source_id = ""
-        symbol_filter = []
-    else:
-        matched_service: Service | None = None
-        if signal_source_id:
-            discord_services = await asyncio.to_thread(
-                list_services,
-                service_type=ServiceType.DISCORD_BOT,
-            )
-            matched_service = next(
-                (
-                    service
-                    for service in discord_services
-                    if str(service.name or "").strip().lower() == signal_source_id.lower()
-                ),
-                None,
-            )
-            if matched_service is None:
-                raise HTTPException(status_code=404, detail="Discord signal source service not found")
-            signal_source_id = matched_service.name
-        elif not str(signal_config_payload.get("channel_id") or "").strip():
-            raise HTTPException(
-                status_code=400,
-                detail="signal_source_id is required for discord signal source",
-            )
-        if not strategy_name:
-            strategy_name = (
-                f"discord::{signal_source_id.lower()}"
-                if signal_source_id
-                else "discord::legacy"
-            )
-        if not symbols and symbol_filter:
-            symbols = list(symbol_filter)
-        if not symbols:
-            symbols = ["*"]
-        if signal_source_id:
-            signal_config_payload.setdefault("service_name", signal_source_id)
-        if matched_service and isinstance(matched_service.config, dict):
-            channel_id = str(matched_service.config.get("channel_id") or "").strip()
-            if channel_id and not str(signal_config_payload.get("channel_id") or "").strip():
-                signal_config_payload["channel_id"] = channel_id
+    (
+        signal_source_id,
+        symbol_filter,
+        strategy_name,
+        symbols,
+        signal_config_payload,
+    ) = await _resolve_live_deployment_signal_source(
+        signal_source_type=signal_source_type,
+        strategy_name=strategy_name,
+        symbols=symbols,
+        symbol_filter=symbol_filter,
+        signal_source_id=signal_source_id,
+        signal_config_payload=signal_config_payload,
+    )
 
     deployment = LiveDeploymentConfig(
         strategy_name=strategy_name,
@@ -10206,7 +11026,7 @@ async def create_live_deployment_endpoint(
     return _serialize_live_deployment_payload(created)
 
 
-@app.put("/api/live/deployments/{deployment_id}/status", response_model=dict[str, Any])
+@app.put("/api/live/deployments/{deployment_id}/status")
 async def update_live_deployment_status_endpoint(
     deployment_id: str, payload: LiveDeploymentStatusUpdateRequest
 ) -> dict[str, Any]:
@@ -10226,7 +11046,7 @@ async def update_live_deployment_status_endpoint(
     return _serialize_live_deployment_payload(updated)
 
 
-@app.delete("/api/live/deployments/{deployment_id}", response_model=dict[str, Any])
+@app.delete("/api/live/deployments/{deployment_id}")
 async def delete_live_deployment_endpoint(deployment_id: str) -> dict[str, Any]:
     _log_live_endpoint_request(
         "/api/live/deployments/{deployment_id}",
@@ -10238,7 +11058,7 @@ async def delete_live_deployment_endpoint(deployment_id: str) -> dict[str, Any]:
     return {"status": "deleted", "id": deployment_id}
 
 
-@app.get("/api/live/balances/{account_id}", response_model=dict[str, Any])
+@app.get("/api/live/balances/{account_id}")
 async def get_live_balances(account_id: str) -> dict[str, Any]:
     _log_live_endpoint_request(
         "/api/live/balances/{account_id}",
@@ -10261,7 +11081,7 @@ async def get_live_balances(account_id: str) -> dict[str, Any]:
     return {"account_id": account_id, "series": series}
 
 
-@app.get("/api/live/trades/{account_id}", response_model=dict[str, Any])
+@app.get("/api/live/trades/{account_id}")
 async def get_live_trades(account_id: str) -> dict[str, Any]:
     _log_live_endpoint_request(
         "/api/live/trades/{account_id}",
@@ -10270,7 +11090,7 @@ async def get_live_trades(account_id: str) -> dict[str, Any]:
     return await _live_trades_payload(account_id)
 
 
-@app.get("/api/live/signals/{account_id}", response_model=dict[str, Any])
+@app.get("/api/live/signals/{account_id}")
 async def get_live_signals(account_id: str, limit: int = Query(default=200, ge=1, le=1000)) -> dict[str, Any]:
     _log_live_endpoint_request(
         "/api/live/signals/{account_id}",
@@ -10280,7 +11100,7 @@ async def get_live_signals(account_id: str, limit: int = Query(default=200, ge=1
     return await _live_signals_payload(account_id, limit=limit)
 
 
-@app.get("/api/live/stats/{account_id}", response_model=dict[str, Any])
+@app.get("/api/live/stats/{account_id}")
 async def get_live_stats(account_id: str) -> dict[str, Any]:
     _log_live_endpoint_request(
         "/api/live/stats/{account_id}",
@@ -10325,7 +11145,7 @@ def _fallback_live_quote_payload(symbol: str, *, limit: int = 500) -> dict[str, 
     return None
 
 
-@app.get("/api/live/quotes/{symbol}", response_model=dict[str, Any])
+@app.get("/api/live/quotes/{symbol}")
 async def get_live_quotes(symbol: str) -> dict[str, Any]:
     _log_live_endpoint_request(
         "/api/live/quotes/{symbol}",
@@ -10340,7 +11160,7 @@ async def get_live_quotes(symbol: str) -> dict[str, Any]:
     return payload
 
 
-@app.get("/api/live/positions/{account_id}", response_model=dict[str, Any])
+@app.get("/api/live/positions/{account_id}")
 async def get_live_positions(account_id: str) -> dict[str, Any]:
     _log_live_endpoint_request(
         "/api/live/positions/{account_id}",
@@ -10692,7 +11512,7 @@ def _manual_cache_invalidation_payload(
     }
 
 
-@app.post("/api/agent/convert", response_model=dict[str, Any], status_code=202)
+@app.post("/api/agent/convert", status_code=202)
 async def agent_convert(payload: AgentConvertRequest, background_tasks: BackgroundTasks) -> dict[str, Any]:
     code = str(payload.code or "")
     if not code.strip():
@@ -10740,7 +11560,7 @@ async def agent_convert(payload: AgentConvertRequest, background_tasks: Backgrou
     return queued
 
 
-@app.get("/api/data/dukascopy/genesis", response_model=dict[str, Any])
+@app.get("/api/data/dukascopy/genesis")
 async def get_dukascopy_genesis(
     symbols: str = Query(default=""),
     timeframes: str = Query(default=""),
@@ -10759,7 +11579,7 @@ async def get_dukascopy_genesis(
     }
 
 
-@app.get("/api/data/check", response_model=dict[str, Any])
+@app.get("/api/data/check")
 async def data_check(
     symbol: str = Query(default=""),
     timeframe: str = Query(default="1d"),
@@ -10826,7 +11646,7 @@ async def data_resample(payload: DataResampleRequest) -> dict[str, Any]:
     return result
 
 
-@app.post("/api/data/harvest", response_model=dict[str, Any])
+@app.post("/api/data/harvest")
 async def data_harvest(payload: DataHarvestRequest) -> dict[str, Any]:
     source = str(payload.source or "dukascopy").strip().lower()
     if source != "dukascopy":
@@ -10871,7 +11691,7 @@ async def data_harvest(payload: DataHarvestRequest) -> dict[str, Any]:
     return result
 
 
-@app.post("/api/data/validate", response_model=dict[str, Any])
+@app.post("/api/data/validate")
 async def data_validate(payload: DataValidateRequest) -> dict[str, Any]:
     task_id = str(uuid.uuid4())
     cmd = [sys.executable, "-u", "-m", "data_tools.validate", "--data-dir", str(DATA_DIR)]
@@ -10896,7 +11716,7 @@ async def data_validate(payload: DataValidateRequest) -> dict[str, Any]:
     return result
 
 
-@app.post("/api/data/calibrate", response_model=dict[str, Any])
+@app.post("/api/data/calibrate")
 async def data_calibrate(payload: DataCalibrateRequest) -> dict[str, Any]:
     symbols = str(payload.symbols or "").strip()
     if not symbols:
@@ -10946,7 +11766,7 @@ async def data_calibrate(payload: DataCalibrateRequest) -> dict[str, Any]:
     return result
 
 
-@app.get("/api/data/tasks", response_model=dict[str, Any])
+@app.get("/api/data/tasks")
 async def list_data_tasks() -> dict[str, Any]:
     await asyncio.to_thread(_hydrate_task_cache_once)
 
@@ -10968,29 +11788,29 @@ async def list_data_tasks() -> dict[str, Any]:
     return {"tasks": payload}
 
 
-@app.get("/api/tasks", response_model=dict[str, Any])
+@app.get("/api/tasks")
 async def list_tasks() -> dict[str, Any]:
     return await list_data_tasks()
 
 
-@app.get("/api/data/tasks/{task_id}", response_model=dict[str, Any])
+@app.get("/api/data/tasks/{task_id}")
 async def get_data_task(task_id: str) -> dict[str, Any]:
     task = _snapshot_task(task_id)
     if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
+        raise HTTPException(status_code=404, detail=TASK_NOT_FOUND_DETAIL)
     return _serialize_task(task_id, task, include_log=True)
 
 
-@app.post("/api/data/tasks/{task_id}/restart", response_model=dict[str, Any])
+@app.post("/api/data/tasks/{task_id}/restart")
 async def restart_data_task(task_id: str) -> dict[str, Any]:
     return await asyncio.to_thread(_restart_interrupted_task, task_id)
 
 
-@app.post("/api/data/tasks/{task_id}/pause", response_model=dict[str, Any])
+@app.post("/api/data/tasks/{task_id}/pause")
 async def pause_data_task(task_id: str) -> dict[str, Any]:
     task = _get_task(task_id)
     if task is None:
-        raise HTTPException(status_code=404, detail="Task not found")
+        raise HTTPException(status_code=404, detail=TASK_NOT_FOUND_DETAIL)
     if not task.get("supports_control", False):
         raise HTTPException(status_code=409, detail="Task cannot be paused")
     if task.get("status") in FINAL_TASK_STATUSES:
@@ -11006,11 +11826,11 @@ async def pause_data_task(task_id: str) -> dict[str, Any]:
     return _task_action_payload(task_id)
 
 
-@app.post("/api/data/tasks/{task_id}/resume", response_model=dict[str, Any])
+@app.post("/api/data/tasks/{task_id}/resume")
 async def resume_data_task(task_id: str) -> dict[str, Any]:
     task = _get_task(task_id)
     if task is None:
-        raise HTTPException(status_code=404, detail="Task not found")
+        raise HTTPException(status_code=404, detail=TASK_NOT_FOUND_DETAIL)
     if not task.get("supports_control", False):
         raise HTTPException(status_code=409, detail="Task cannot be resumed")
     if task.get("status") in FINAL_TASK_STATUSES:
@@ -11026,11 +11846,11 @@ async def resume_data_task(task_id: str) -> dict[str, Any]:
     return _task_action_payload(task_id)
 
 
-@app.post("/api/data/tasks/{task_id}/cancel", response_model=dict[str, Any])
+@app.post("/api/data/tasks/{task_id}/cancel")
 async def cancel_data_task(task_id: str) -> dict[str, Any]:
     task = _get_task(task_id)
     if task is None:
-        raise HTTPException(status_code=404, detail="Task not found")
+        raise HTTPException(status_code=404, detail=TASK_NOT_FOUND_DETAIL)
     if not task.get("supports_control", False):
         raise HTTPException(status_code=409, detail="Task cannot be cancelled")
     if task.get("status") in FINAL_TASK_STATUSES:
@@ -11047,24 +11867,24 @@ async def cancel_data_task(task_id: str) -> dict[str, Any]:
     return _task_action_payload(task_id)
 
 
-@app.get("/api/data/tasks/{task_id}/logs", response_model=dict[str, Any])
+@app.get("/api/data/tasks/{task_id}/logs")
 async def get_data_task_logs(task_id: str) -> dict[str, Any]:
     task = _snapshot_task(task_id)
     log_file = _task_log_path(task_id)
     if task is None and not log_file.exists():
-        raise HTTPException(status_code=404, detail="Task not found")
+        raise HTTPException(status_code=404, detail=TASK_NOT_FOUND_DETAIL)
     return {
         "logs": _read_task_log(task.get("log_file", log_file) if task else log_file),
         "status": task.get("status", "unknown") if task else "unknown",
     }
 
 
-@app.delete("/api/data/tasks/{task_id}", response_model=dict[str, Any])
+@app.delete("/api/data/tasks/{task_id}")
 async def delete_data_task(task_id: str) -> dict[str, Any]:
     with DATA_TASKS_LOCK:
         task = DATA_TASKS.get(task_id)
         if task is None:
-            raise HTTPException(status_code=404, detail="Task not found")
+            raise HTTPException(status_code=404, detail=TASK_NOT_FOUND_DETAIL)
         if task.get("status") not in FINAL_TASK_STATUSES:
             raise HTTPException(
                 status_code=409,
@@ -11102,11 +11922,11 @@ async def delete_symbol_data(path: str = Query(default="")) -> dict[str, Any]:
         _invalidate_data_views_cache()
         _refresh_catalog()
         return {"status": "deleted"}
-    except (FileNotFoundError, OSError) as exc:
+    except OSError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@app.get("/api/logs", response_model=list[LogFileModel])
+@app.get("/api/logs")
 async def list_logs() -> list[LogFileModel]:
     log_files = legacy_viewer._available_log_files()
     total_size = sum(path.stat().st_size for path in log_files) if log_files else 0
@@ -11130,7 +11950,7 @@ async def list_logs() -> list[LogFileModel]:
     return logs
 
 
-@app.get("/api/logs/{log_name}", response_model=LogContentModel)
+@app.get("/api/logs/{log_name}")
 async def get_log(
     log_name: str,
     lines: int = Query(default=200, ge=1, le=100000),

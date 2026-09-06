@@ -52,7 +52,6 @@ def generate_signals(df: pd.DataFrame, params: dict):
     atr = tr.rolling(atr_period).mean()
 
     entry_cond = (composite > 0) & (vol_adj_mom > 0)
-    exit_cond = (composite < -0.01) | (drawdown < dd_exit)
 
     entries = pd.Series(False, index=df.index)
     exits = pd.Series(False, index=df.index)

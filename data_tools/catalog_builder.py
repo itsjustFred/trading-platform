@@ -19,6 +19,7 @@ import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 import pyarrow.parquet as pq
@@ -30,6 +31,7 @@ from shared.atomic_io import write_text_atomically
 from shared.constants import DATA_DIR, normalize_timeframe
 
 CATALOG_FILE = "catalog.json"
+_COULD_NOT_READ_MESSAGE = "Could not read %s: %s"
 
 # Path to persisted source metadata (written by downloaders)
 SOURCE_META_FILE = "source_meta.json"
@@ -71,7 +73,7 @@ def _load_source_meta(data_dir: Path) -> dict[str, dict]:
         try:
             return json.loads(meta_path.read_text())
         except (json.JSONDecodeError, OSError) as exc:
-            logger.warning("Could not read %s: %s", meta_path, exc)
+            logger.warning(_COULD_NOT_READ_MESSAGE, meta_path, exc)
     return {}
 
 
@@ -84,7 +86,7 @@ def _load_catalog_cache(data_dir: Path) -> dict[str, dict]:
     try:
         payload = json.loads(cache_path.read_text())
     except (json.JSONDecodeError, OSError) as exc:
-        logger.warning("Could not read %s: %s", cache_path, exc)
+        logger.warning(_COULD_NOT_READ_MESSAGE, cache_path, exc)
         return {}
 
     cached_entries = payload.get("ohlcv", []) if isinstance(payload, dict) else []
@@ -478,6 +480,213 @@ def _canonical_group_path(paths: set[str], timeframe: str) -> str:
     return sorted_paths[0]
 
 
+def _new_group_aggregate(symbol: str, timeframe: str) -> dict:
+    return {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "sources": set(),
+        "asset_classes": set(),
+        "regions": set(),
+        "paths": set(),
+        "rows_total": 0,
+        "rows_unknown": False,
+        "size_bytes": 0,
+        "mtime_ns": None,
+        "last_updated": None,
+        "start": None,
+        "end": None,
+        "columns": set(),
+        "formats": set(),
+        "storages": set(),
+        "source_meta": None,
+        "validation_seen": False,
+        "validation_status": "ok",
+        "validation_warnings": set(),
+        "validation_gaps": 0,
+        "validation_duplicates": 0,
+        "validation_last_checked": None,
+        "errors": set(),
+        "segments": [],
+        "segment_paths": set(),
+    }
+
+
+def _entry_segment_candidates(entry: dict) -> list[dict]:
+    raw_segments = entry.get("segments")
+    if not isinstance(raw_segments, list):
+        return []
+    return [segment for segment in raw_segments if isinstance(segment, dict)]
+
+
+def _collect_entry_paths(aggregate: dict, entry: dict) -> None:
+    path_value = str(entry.get("path") or "")
+    if path_value:
+        aggregate["paths"].add(path_value)
+
+    file_paths = entry.get("files")
+    if isinstance(file_paths, list):
+        for file_path in file_paths:
+            normalized_path = str(file_path or "").strip()
+            if normalized_path:
+                aggregate["paths"].add(normalized_path)
+
+
+def _accumulate_stats(aggregate: dict, candidate: dict) -> None:
+    rows_value = candidate.get("row_count", candidate.get("rows"))
+    if rows_value is None:
+        aggregate["rows_unknown"] = True
+    else:
+        try:
+            aggregate["rows_total"] += max(int(rows_value), 0)
+        except (TypeError, ValueError):
+            aggregate["rows_unknown"] = True
+
+    aggregate["size_bytes"] += _coerce_nonnegative_int(candidate.get("size_bytes"))
+    aggregate["start"] = _merge_catalog_dates(
+        aggregate["start"],
+        candidate.get("start", candidate.get("start_date")),
+        latest=False,
+    )
+    aggregate["end"] = _merge_catalog_dates(
+        aggregate["end"],
+        candidate.get("end", candidate.get("end_date")),
+        latest=True,
+    )
+
+
+def _latest_scalar(aggregate: dict, key: str, value: Any, *, numeric: bool) -> None:
+    """Keep the largest (numeric or string) value seen for a scalar aggregate key."""
+    current = aggregate[key]
+    if numeric:
+        if value is not None and (current is None or value > current):
+            aggregate[key] = value
+        return
+    if value and (current is None or value > current):
+        aggregate[key] = value
+
+
+def _accumulate_metadata(aggregate: dict, candidate: dict) -> None:
+    mtime_ns = candidate.get("mtime_ns")
+    if mtime_ns is not None:
+        try:
+            numeric_mtime = int(mtime_ns)
+        except (TypeError, ValueError):
+            numeric_mtime = None
+        if numeric_mtime is not None:
+            _latest_scalar(aggregate, "mtime_ns", numeric_mtime, numeric=True)
+
+    last_updated = str(candidate.get("last_updated") or "").strip()
+    _latest_scalar(aggregate, "last_updated", last_updated, numeric=False)
+
+    columns = candidate.get("columns")
+    if isinstance(columns, list):
+        aggregate["columns"].update(str(column) for column in columns if str(column))
+
+    format_value = str(candidate.get("format") or "").strip()
+    if format_value:
+        aggregate["formats"].add(format_value)
+
+    storage_value = str(candidate.get("storage") or "").strip()
+    if storage_value:
+        aggregate["storages"].add(storage_value)
+
+    source_meta = candidate.get("source_meta")
+    if isinstance(source_meta, dict) and aggregate["source_meta"] is None:
+        aggregate["source_meta"] = dict(source_meta)
+
+    validation = candidate.get("validation")
+    if isinstance(validation, dict):
+        _accumulate_validation(aggregate, validation)
+
+    error_value = str(candidate.get("error") or "").strip()
+    if error_value:
+        aggregate["errors"].add(error_value)
+
+
+def _accumulate_validation(aggregate: dict, validation: dict) -> None:
+    aggregate["validation_seen"] = True
+    validation_status = str(validation.get("status") or "").strip().lower()
+    if validation_status == "error":
+        aggregate["validation_status"] = "error"
+    elif (
+        validation_status
+        and validation_status != "ok"
+        and aggregate["validation_status"] == "ok"
+    ):
+        aggregate["validation_status"] = validation_status
+
+    warnings = validation.get("warnings")
+    if isinstance(warnings, list):
+        aggregate["validation_warnings"].update(
+            str(item).strip() for item in warnings if str(item).strip()
+        )
+
+    gaps = validation.get("gaps")
+    if isinstance(gaps, int):
+        aggregate["validation_gaps"] += max(gaps, 0)
+    elif isinstance(gaps, list):
+        aggregate["validation_gaps"] += len(gaps)
+
+    duplicates = validation.get("duplicates")
+    if isinstance(duplicates, int):
+        aggregate["validation_duplicates"] += max(duplicates, 0)
+
+    checked_at = str(validation.get("last_checked") or "").strip()
+    if checked_at and (
+        aggregate["validation_last_checked"] is None
+        or checked_at > aggregate["validation_last_checked"]
+    ):
+        aggregate["validation_last_checked"] = checked_at
+
+
+def _append_segment_entries(aggregate: dict, segment_candidates: list[dict]) -> None:
+    for segment in segment_candidates:
+        segment_path = str(segment.get("path") or "").strip()
+        if not segment_path:
+            continue
+        aggregate["paths"].add(segment_path)
+        if segment_path in aggregate["segment_paths"]:
+            continue
+
+        segment_entry = {
+            "path": segment_path,
+            "start": segment.get("start", segment.get("start_date")),
+            "end": segment.get("end", segment.get("end_date")),
+            "rows": segment.get("rows"),
+            "size_bytes": _coerce_nonnegative_int(segment.get("size_bytes")),
+        }
+        if segment.get("segment"):
+            segment_entry["segment"] = segment.get("segment")
+        for key_name in (
+            "mtime_ns",
+            "last_updated",
+            "columns",
+            "format",
+            "storage",
+            "validation",
+            "error",
+            "source_meta",
+        ):
+            if segment.get(key_name) is not None:
+                segment_entry[key_name] = segment.get(key_name)
+        aggregate["segments"].append(segment_entry)
+        aggregate["segment_paths"].add(segment_path)
+
+
+def _accumulate_entry(aggregate: dict, entry: dict) -> None:
+    segment_candidates = _entry_segment_candidates(entry)
+    stat_candidates = segment_candidates if segment_candidates else [entry]
+
+    for candidate in stat_candidates:
+        _accumulate_stats(aggregate, candidate)
+
+    metadata_candidates = [entry, *segment_candidates] if segment_candidates else [entry]
+    for candidate in metadata_candidates:
+        _accumulate_metadata(aggregate, candidate)
+
+    _append_segment_entries(aggregate, segment_candidates if segment_candidates else [entry])
+
+
 def _group_ohlcv_entries(entries: list[dict]) -> list[dict]:
     grouped: dict[tuple[str, str], dict] = {}
 
@@ -488,37 +697,7 @@ def _group_ohlcv_entries(entries: list[dict]) -> list[dict]:
         timeframe = str(entry.get("timeframe") or "")
         key = (symbol, timeframe)
 
-        aggregate = grouped.setdefault(
-            key,
-            {
-                "symbol": symbol,
-                "timeframe": timeframe,
-                "sources": set(),
-                "asset_classes": set(),
-                "regions": set(),
-                "paths": set(),
-                "rows_total": 0,
-                "rows_unknown": False,
-                "size_bytes": 0,
-                "mtime_ns": None,
-                "last_updated": None,
-                "start": None,
-                "end": None,
-                "columns": set(),
-                "formats": set(),
-                "storages": set(),
-                "source_meta": None,
-                "validation_seen": False,
-                "validation_status": "ok",
-                "validation_warnings": set(),
-                "validation_gaps": 0,
-                "validation_duplicates": 0,
-                "validation_last_checked": None,
-                "errors": set(),
-                "segments": [],
-                "segment_paths": set(),
-            },
-        )
+        aggregate = grouped.setdefault(key, _new_group_aggregate(symbol, timeframe))
 
         _collect_text_values(aggregate["sources"], entry.get("source"))
         _collect_text_values(aggregate["sources"], entry.get("sources"))
@@ -527,154 +706,8 @@ def _group_ohlcv_entries(entries: list[dict]) -> list[dict]:
         _collect_text_values(aggregate["regions"], entry.get("region"))
         _collect_text_values(aggregate["regions"], entry.get("regions"))
 
-        path_value = str(entry.get("path") or "")
-        if path_value:
-            aggregate["paths"].add(path_value)
-
-        file_paths = entry.get("files")
-        if isinstance(file_paths, list):
-            for file_path in file_paths:
-                normalized_path = str(file_path or "").strip()
-                if normalized_path:
-                    aggregate["paths"].add(normalized_path)
-
-        raw_segments = entry.get("segments")
-        segment_candidates = (
-            [segment for segment in raw_segments if isinstance(segment, dict)]
-            if isinstance(raw_segments, list)
-            else []
-        )
-        stat_candidates = segment_candidates if segment_candidates else [entry]
-
-        for candidate in stat_candidates:
-            rows_value = candidate.get("row_count", candidate.get("rows"))
-            if rows_value is None:
-                aggregate["rows_unknown"] = True
-            else:
-                try:
-                    aggregate["rows_total"] += max(int(rows_value), 0)
-                except (TypeError, ValueError):
-                    aggregate["rows_unknown"] = True
-
-            aggregate["size_bytes"] += _coerce_nonnegative_int(candidate.get("size_bytes"))
-            aggregate["start"] = _merge_catalog_dates(
-                aggregate["start"],
-                candidate.get("start", candidate.get("start_date")),
-                latest=False,
-            )
-            aggregate["end"] = _merge_catalog_dates(
-                aggregate["end"],
-                candidate.get("end", candidate.get("end_date")),
-                latest=True,
-            )
-
-        metadata_candidates = [entry, *segment_candidates] if segment_candidates else [entry]
-        for candidate in metadata_candidates:
-            mtime_ns = candidate.get("mtime_ns")
-            if mtime_ns is not None:
-                try:
-                    numeric_mtime = int(mtime_ns)
-                except (TypeError, ValueError):
-                    numeric_mtime = None
-                if numeric_mtime is not None and (
-                    aggregate["mtime_ns"] is None or numeric_mtime > aggregate["mtime_ns"]
-                ):
-                    aggregate["mtime_ns"] = numeric_mtime
-
-            last_updated = str(candidate.get("last_updated") or "").strip()
-            if last_updated and (
-                aggregate["last_updated"] is None or last_updated > aggregate["last_updated"]
-            ):
-                aggregate["last_updated"] = last_updated
-
-            columns = candidate.get("columns")
-            if isinstance(columns, list):
-                aggregate["columns"].update(str(column) for column in columns if str(column))
-
-            format_value = str(candidate.get("format") or "").strip()
-            if format_value:
-                aggregate["formats"].add(format_value)
-
-            storage_value = str(candidate.get("storage") or "").strip()
-            if storage_value:
-                aggregate["storages"].add(storage_value)
-
-            source_meta = candidate.get("source_meta")
-            if isinstance(source_meta, dict) and aggregate["source_meta"] is None:
-                aggregate["source_meta"] = dict(source_meta)
-
-            validation = candidate.get("validation")
-            if isinstance(validation, dict):
-                aggregate["validation_seen"] = True
-                validation_status = str(validation.get("status") or "").strip().lower()
-                if validation_status == "error":
-                    aggregate["validation_status"] = "error"
-                elif (
-                    validation_status
-                    and validation_status != "ok"
-                    and aggregate["validation_status"] == "ok"
-                ):
-                    aggregate["validation_status"] = validation_status
-
-                warnings = validation.get("warnings")
-                if isinstance(warnings, list):
-                    aggregate["validation_warnings"].update(
-                        str(item).strip() for item in warnings if str(item).strip()
-                    )
-
-                gaps = validation.get("gaps")
-                if isinstance(gaps, int):
-                    aggregate["validation_gaps"] += max(gaps, 0)
-                elif isinstance(gaps, list):
-                    aggregate["validation_gaps"] += len(gaps)
-
-                duplicates = validation.get("duplicates")
-                if isinstance(duplicates, int):
-                    aggregate["validation_duplicates"] += max(duplicates, 0)
-
-                checked_at = str(validation.get("last_checked") or "").strip()
-                if checked_at and (
-                    aggregate["validation_last_checked"] is None
-                    or checked_at > aggregate["validation_last_checked"]
-                ):
-                    aggregate["validation_last_checked"] = checked_at
-
-            error_value = str(candidate.get("error") or "").strip()
-            if error_value:
-                aggregate["errors"].add(error_value)
-
-        segment_entries_source = segment_candidates if segment_candidates else [entry]
-        for segment in segment_entries_source:
-            segment_path = str(segment.get("path") or "").strip()
-            if not segment_path:
-                continue
-            aggregate["paths"].add(segment_path)
-            if segment_path in aggregate["segment_paths"]:
-                continue
-
-            segment_entry = {
-                "path": segment_path,
-                "start": segment.get("start", segment.get("start_date")),
-                "end": segment.get("end", segment.get("end_date")),
-                "rows": segment.get("rows"),
-                "size_bytes": _coerce_nonnegative_int(segment.get("size_bytes")),
-            }
-            if segment.get("segment"):
-                segment_entry["segment"] = segment.get("segment")
-            for key_name in (
-                "mtime_ns",
-                "last_updated",
-                "columns",
-                "format",
-                "storage",
-                "validation",
-                "error",
-                "source_meta",
-            ):
-                if segment.get(key_name) is not None:
-                    segment_entry[key_name] = segment.get(key_name)
-            aggregate["segments"].append(segment_entry)
-            aggregate["segment_paths"].add(segment_path)
+        _collect_entry_paths(aggregate, entry)
+        _accumulate_entry(aggregate, entry)
 
     grouped_entries: list[dict] = []
     for aggregate in sorted(
@@ -685,83 +718,92 @@ def _group_ohlcv_entries(entries: list[dict]) -> list[dict]:
             min(item["sources"]) if item["sources"] else "",
         ),
     ):
-        rows = None if aggregate["rows_unknown"] else aggregate["rows_total"]
-        source_values = sorted(aggregate["sources"])
-        asset_class_values = sorted(aggregate["asset_classes"])
-        region_values = sorted(aggregate["regions"])
-        format_values = sorted(aggregate["formats"])
-        storage_values = sorted(aggregate["storages"])
-        files = sorted(aggregate["paths"])
-        segment_entries = sorted(
-            aggregate["segments"], key=lambda segment: str(segment.get("path") or "")
-        )
-
-        grouped_entry = {
-            "source": source_values[0] if len(source_values) == 1 else (
-                "mixed" if source_values else ""
-            ),
-            "asset_class": asset_class_values[0] if len(asset_class_values) == 1 else (
-                "mixed" if asset_class_values else ""
-            ),
-            "symbol": aggregate["symbol"],
-            "timeframe": aggregate["timeframe"],
-            "path": _canonical_group_path(aggregate["paths"], aggregate["timeframe"]),
-            "format": format_values[0] if len(format_values) == 1 else "parquet",
-            "storage": storage_values[0] if len(storage_values) == 1 else (
-                "mixed" if storage_values else "local"
-            ),
-            "rows": rows,
-            "row_count": aggregate["rows_total"],
-            "size_bytes": aggregate["size_bytes"],
-            "start": aggregate["start"],
-            "end": aggregate["end"],
-            "start_date": aggregate["start"],
-            "end_date": aggregate["end"],
-            "files": files,
-            "file_count": len(files),
-        }
-        if source_values:
-            grouped_entry["sources"] = source_values
-        if asset_class_values:
-            grouped_entry["asset_classes"] = asset_class_values
-        if region_values:
-            grouped_entry["regions"] = region_values
-            if len(region_values) == 1:
-                grouped_entry["region"] = region_values[0]
-        if aggregate["mtime_ns"] is not None:
-            grouped_entry["mtime_ns"] = aggregate["mtime_ns"]
-        if aggregate["last_updated"] is not None:
-            grouped_entry["last_updated"] = aggregate["last_updated"]
-        if aggregate["columns"]:
-            grouped_entry["columns"] = sorted(aggregate["columns"])
-        if aggregate["source_meta"] is not None:
-            grouped_entry["source_meta"] = aggregate["source_meta"]
-
-        if aggregate["validation_seen"]:
-            validation_payload: dict[str, object] = {"status": aggregate["validation_status"]}
-            if aggregate["validation_warnings"]:
-                validation_payload["warnings"] = sorted(aggregate["validation_warnings"])
-            if aggregate["validation_gaps"] > 0:
-                validation_payload["gaps"] = aggregate["validation_gaps"]
-            if aggregate["validation_duplicates"] > 0:
-                validation_payload["duplicates"] = aggregate["validation_duplicates"]
-            if aggregate["validation_last_checked"] is not None:
-                validation_payload["last_checked"] = aggregate["validation_last_checked"]
-            grouped_entry["validation"] = validation_payload
-
-        if aggregate["errors"]:
-            grouped_entry["error"] = " | ".join(sorted(aggregate["errors"]))
-
-        include_segments = len(segment_entries) > 1 or any(
-            segment.get("segment") for segment in segment_entries
-        )
-        if include_segments:
-            grouped_entry["segments"] = segment_entries
-            grouped_entry["segment_count"] = len(segment_entries)
-
+        grouped_entry = _build_grouped_entry(aggregate)
         grouped_entries.append(grouped_entry)
 
     return grouped_entries
+
+
+def _single_or_label(values: list[str], default: str) -> str:
+    if len(values) == 1:
+        return values[0]
+    return "mixed" if values else default
+
+
+def _build_grouped_entry(aggregate: dict) -> dict:
+    rows = None if aggregate["rows_unknown"] else aggregate["rows_total"]
+    source_values = sorted(aggregate["sources"])
+    asset_class_values = sorted(aggregate["asset_classes"])
+    region_values = sorted(aggregate["regions"])
+    format_values = sorted(aggregate["formats"])
+    storage_values = sorted(aggregate["storages"])
+    files = sorted(aggregate["paths"])
+    segment_entries = sorted(
+        aggregate["segments"], key=lambda segment: str(segment.get("path") or "")
+    )
+
+    grouped_entry: dict[str, Any] = {
+        "source": _single_or_label(source_values, ""),
+        "asset_class": _single_or_label(asset_class_values, ""),
+        "symbol": aggregate["symbol"],
+        "timeframe": aggregate["timeframe"],
+        "path": _canonical_group_path(aggregate["paths"], aggregate["timeframe"]),
+        "format": format_values[0] if len(format_values) == 1 else "parquet",
+        "storage": _single_or_label(storage_values, "local"),
+        "rows": rows,
+        "row_count": aggregate["rows_total"],
+        "size_bytes": aggregate["size_bytes"],
+        "start": aggregate["start"],
+        "end": aggregate["end"],
+        "start_date": aggregate["start"],
+        "end_date": aggregate["end"],
+        "files": files,
+        "file_count": len(files),
+    }
+    if source_values:
+        grouped_entry["sources"] = source_values
+    if asset_class_values:
+        grouped_entry["asset_classes"] = asset_class_values
+    if region_values:
+        grouped_entry["regions"] = region_values
+        if len(region_values) == 1:
+            grouped_entry["region"] = region_values[0]
+    if aggregate["mtime_ns"] is not None:
+        grouped_entry["mtime_ns"] = aggregate["mtime_ns"]
+    if aggregate["last_updated"] is not None:
+        grouped_entry["last_updated"] = aggregate["last_updated"]
+    if aggregate["columns"]:
+        grouped_entry["columns"] = sorted(aggregate["columns"])
+    if aggregate["source_meta"] is not None:
+        grouped_entry["source_meta"] = aggregate["source_meta"]
+
+    if aggregate["validation_seen"]:
+        grouped_entry["validation"] = _build_validation_payload(aggregate)
+
+    if aggregate["errors"]:
+        grouped_entry["error"] = " | ".join(sorted(aggregate["errors"]))
+
+    include_segments = len(segment_entries) > 1 or any(
+        segment.get("segment") for segment in segment_entries
+    )
+    if include_segments:
+        grouped_entry["segments"] = segment_entries
+        grouped_entry["segment_count"] = len(segment_entries)
+
+    return grouped_entry
+
+
+def _build_validation_payload(aggregate: dict) -> dict[str, Any]:
+    validation_payload: dict[str, Any] = {"status": aggregate["validation_status"]}
+    if aggregate["validation_warnings"]:
+        validation_payload["warnings"] = sorted(aggregate["validation_warnings"])
+    if aggregate["validation_gaps"] > 0:
+        validation_payload["gaps"] = aggregate["validation_gaps"]
+    if aggregate["validation_duplicates"] > 0:
+        validation_payload["duplicates"] = aggregate["validation_duplicates"]
+    if aggregate["validation_last_checked"] is not None:
+        validation_payload["last_checked"] = aggregate["validation_last_checked"]
+    return validation_payload
 
 
 def merge_ohlcv_entries(entries: list[dict]) -> list[dict]:
@@ -812,8 +854,8 @@ def scan_ohlcv(data_dir: Path, include_validation: bool = False) -> list[dict]:
                     entry["last_updated"] = _mtime_to_iso(file_mtime)
             else:
                 entry.update(read_parquet_summary(parquet_file))
-        except (OSError, pd.errors.EmptyDataError, ValueError) as e:
-            logger.warning("Could not read %s: %s", parquet_file, e)
+        except (OSError, ValueError) as e:
+            logger.warning(_COULD_NOT_READ_MESSAGE, parquet_file, e)
             try:
                 file_mtime = os.path.getmtime(parquet_file)
                 entry["size_bytes"] = os.path.getsize(parquet_file)
@@ -886,7 +928,7 @@ def scan_fundamentals(data_dir: Path) -> list[dict]:
             df = pd.read_parquet(parquet_file)
             entry["rows"] = len(df)
             entry["columns"] = list(df.columns)
-        except (OSError, pd.errors.EmptyDataError, ValueError) as e:
+        except (OSError, ValueError) as e:
             entry["rows"] = None
             entry["error"] = str(e)
 

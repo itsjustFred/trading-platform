@@ -59,7 +59,7 @@ def cmd_convert(args):
 
     # Update meta with symbols from trades
     if result.trades and not result.meta.data.get("symbols"):
-        result.meta.data["symbols"] = sorted(set(t.symbol for t in result.trades))
+        result.meta.data["symbols"] = sorted({t.symbol for t in result.trades})
 
     output = args.output or str(input_path.with_suffix(".trades.json"))
     result.save(output)

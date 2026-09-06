@@ -26,6 +26,9 @@ from strategies.intraday_volatility_breakout.intraday_volatility_breakout import
 
 STRATEGY_PATH = Path("strategies/intraday_volatility_breakout/intraday_volatility_breakout.py")
 
+MT5_SYMBOL_NAS100 = "USATECH.IDX"
+MT5_SYMBOL_SP500 = "USA500.IDX"
+
 COMPARISON_CASES: tuple[dict[str, Any], ...] = (
     {
         "label": "EURUSD_H1",
@@ -40,7 +43,7 @@ COMPARISON_CASES: tuple[dict[str, Any], ...] = (
     },
     {
         "label": "NAS100_M15",
-        "symbol": "USATECH.IDX",
+        "symbol": MT5_SYMBOL_NAS100,
         "execution_symbol": "USTEC",
         "report_timeframe": "15m",
         "execution_timeframe": "1m",
@@ -50,7 +53,7 @@ COMPARISON_CASES: tuple[dict[str, Any], ...] = (
     },
     {
         "label": "SP500_M1",
-        "symbol": "USA500.IDX",
+        "symbol": MT5_SYMBOL_SP500,
         "execution_symbol": "US500",
         "report_timeframe": "1m",
         "execution_timeframe": "1m",
@@ -62,14 +65,14 @@ COMPARISON_CASES: tuple[dict[str, Any], ...] = (
 
 MT5_CONTRACT_SIZES: dict[str, float] = {
     "EURUSD": 100_000.0,
-    "USATECH.IDX": 1.0,
-    "USA500.IDX": 1.0,
+    MT5_SYMBOL_NAS100: 1.0,
+    MT5_SYMBOL_SP500: 1.0,
 }
 
 MT5_LOT_STEPS: dict[str, float] = {
     "EURUSD": 0.01,
-    "USATECH.IDX": 1.0,
-    "USA500.IDX": 1.0,
+    MT5_SYMBOL_NAS100: 1.0,
+    MT5_SYMBOL_SP500: 1.0,
 }
 
 

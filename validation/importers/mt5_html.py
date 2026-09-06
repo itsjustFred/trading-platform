@@ -86,9 +86,11 @@ class MT5HTMLImporter(BaseImporter):
             **kwargs:
                 Forwarded to ``BeautifulSoup`` parser selection.
             """
-            path = Path(source)
+            path = Path(source).resolve()
             if not path.exists():
                 raise FileNotFoundError(f"MT5 HTML report not found: {path}")
+            if not path.is_file():
+                raise ValueError(f"MT5 HTML report is not a file: {path}")
 
             html_text = path.read_text(encoding="utf-8", errors="replace")
             soup = BeautifulSoup(html_text, kwargs.pop("features", "lxml"))
@@ -198,39 +200,48 @@ class MT5HTMLImporter(BaseImporter):
         for table in soup.find_all("table"):
             for tr in table.find_all("tr"):
                 cells = tr.find_all(("td", "th"))
-                if len(cells) < 2:
-                    continue
-                label = cells[0].get_text(strip=True)
-                val = cells[1].get_text(strip=True) if len(cells) > 1 else ""
-
-                if label == "Expertenprogramm:":
-                    meta["strategy_name"] = val if val else "unknown"
-                elif label == "Symbol:":
-                    meta["symbol"] = val
-                elif label == "Periode:":
-                    tf_match = re.search(r"^(\w+)\s*\(", val)
-                    meta["timeframe"] = tf_match.group(1).lower() if tf_match else val.lower()
-                elif label == "Ersteinlage:":
-                    try:
-                        meta["initial_capital"] = float(val.replace(" ", "").replace(",", "."))
-                    except (ValueError, TypeError):
-                        meta["initial_capital"] = None
-                elif label == "Hebel:":
-                    meta["leverage"] = val
+                if len(cells) >= 2:
+                    label = cells[0].get_text(strip=True)
+                    val = cells[1].get_text(strip=True) if len(cells) > 1 else ""
+                    MT5HTMLImporter._apply_meta_label(label, val, meta)
 
         # Scan for settings sections (key=value patterns in any table cell)
         for table in soup.find_all("table"):
             for tr in table.find_all("tr"):
                 for cell in tr.find_all(("td", "th")):
-                    text = cell.get_text(strip=True)
-                    if "=" in text and not text.startswith("http"):
-                        key, _, v = text.partition("=")
-                        key = key.strip()
-                        v = v.strip()
-                        if key and v:
-                            meta["settings"][key] = MT5HTMLImporter._coerce_setting(v)
+                    MT5HTMLImporter._apply_setting_cell(cell, meta)
 
         return meta
+
+    @staticmethod
+    def _apply_meta_label(label: str, val: str, meta: dict[str, Any]) -> None:
+        """Apply one 'label: value' meta row to the meta dict."""
+        if label == "Expertenprogramm:":
+            meta["strategy_name"] = val if val else "unknown"
+        elif label == "Symbol:":
+            meta["symbol"] = val
+        elif label == "Periode:":
+            tf_match = re.search(r"^(\w+)\s*\(", val)
+            meta["timeframe"] = tf_match.group(1).lower() if tf_match else val.lower()
+        elif label == "Ersteinlage:":
+            try:
+                meta["initial_capital"] = float(val.replace(" ", "").replace(",", "."))
+            except (ValueError, TypeError):
+                meta["initial_capital"] = None
+        elif label == "Hebel:":
+            meta["leverage"] = val
+
+    @staticmethod
+    def _apply_setting_cell(cell: Any, meta: dict[str, Any]) -> None:
+        """Add a 'key=value' settings cell to the meta settings, if applicable."""
+        text = cell.get_text(strip=True)
+        if "=" not in text or text.startswith("http"):
+            return
+        key, _, v = text.partition("=")
+        key = key.strip()
+        v = v.strip()
+        if key and v:
+            meta["settings"][key] = MT5HTMLImporter._coerce_setting(v)
 
     @staticmethod
     def _coerce_setting(value: str) -> Any:
@@ -545,11 +556,7 @@ class MT5HTMLImporter(BaseImporter):
             tags = [entry_comment] if entry_comment else []
 
             order_id = MT5HTMLImporter._get_str(entry_row, col_order_id, "")
-            sl = tp = None
-            if order_id:
-                mapped = sltp_map.get(order_id, {})
-                sl = mapped.get("sl")
-                tp = mapped.get("tp")
+            sl, tp = MT5HTMLImporter._lookup_sltp(sltp_map, order_id)
 
             trade = Trade(
                 id=trade_id_counter,
@@ -577,6 +584,45 @@ class MT5HTMLImporter(BaseImporter):
             trade_id_counter += 1
 
         return trades
+
+    @staticmethod
+    def _group_trade_rows(
+        data_rows: list[list[str]],
+        col_typ: int | None,
+        col_direction: int | None,
+        col_trade_id: int | None,
+    ) -> dict[str, dict[str, list[str]]]:
+        """Build mapping: trade_id -> {entry_row, exit_row}.
+
+        MT5 exports each trade as two rows: entry (in) and exit (out) with the
+        same Trade/Order ID.
+        """
+        trade_rows: dict[str, dict[str, list[str]]] = {}
+
+        for row in data_rows:
+            typ = MT5HTMLImporter._get_str(row, col_typ, "").lower()
+            direction = MT5HTMLImporter._get_str(row, col_direction, "").lower()
+
+            if typ == "balance" or direction not in ("in", "out"):
+                continue
+
+            tid = MT5HTMLImporter._get_str(row, col_trade_id, "") if col_trade_id is not None else ""
+            if not tid:
+                continue
+
+            trade_rows.setdefault(tid, {})[direction] = row
+
+        return trade_rows
+
+    @staticmethod
+    def _lookup_sltp(
+        sltp_map: dict[str, dict[str, float | None]], order_id: str
+    ) -> tuple[float | None, float | None]:
+        """Resolve stop-loss/take-profit for an order id."""
+        if not order_id:
+            return None, None
+        mapped = sltp_map.get(order_id, {})
+        return mapped.get("sl"), mapped.get("tp")
 
     @staticmethod
     def _find_col_index(header: list[str], candidates: list[str]) -> int | None:

@@ -7,6 +7,7 @@ from pathlib import Path
 from statistics import mean, pstdev
 
 BASE = Path('/mnt/block-volume-data/backtests/matrix_runner_v2')
+_TRADES_SUFFIX = '.trades.json'
 REPORT_PATH = BASE / 'matrix_run_report.json'
 OUT_PATH = Path('/home/ubuntu/Desktop/trading-platform/frontend/public/matrix-grid-overview.json')
 
@@ -90,15 +91,15 @@ def load_backtest_id(output_path: str, fallback: str | None = None) -> str:
         with path.open('r', encoding='utf-8') as fh:
             payload = json.load(fh)
     except (OSError, json.JSONDecodeError):
-        return fallback or path.name.removesuffix('.trades.json')
+        return fallback or path.name.removesuffix(_TRADES_SUFFIX)
     if not isinstance(payload, dict):
-        return fallback or path.name.removesuffix('.trades.json')
+        return fallback or path.name.removesuffix(_TRADES_SUFFIX)
     meta = payload.get('meta')
     if isinstance(meta, dict):
         backtest_id = str(meta.get('id') or '').strip()
         if backtest_id:
             return backtest_id
-    return fallback or path.name.removesuffix('.trades.json')
+    return fallback or path.name.removesuffix(_TRADES_SUFFIX)
 
 
 def safe_round(value, digits=4):

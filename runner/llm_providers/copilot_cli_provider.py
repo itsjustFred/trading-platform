@@ -51,6 +51,9 @@ def _extract_content(payload: Any) -> str:
     return ""
 
 
+_COPILOT_CLI_EMPTY_RESPONSE_MESSAGE = "copilot_cli provider returned an empty response."
+
+
 class CopilotCLIProvider:
     def __init__(
         self,

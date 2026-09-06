@@ -48,7 +48,7 @@ def _parse_mapping_string(value: str) -> Any | None:
             parsed = parser(text)
             if isinstance(parsed, (dict, list, tuple)):
                 return parsed
-        except (ValueError, SyntaxError, TypeError, json.JSONDecodeError):
+        except (ValueError, SyntaxError, TypeError):
             pass
 
     parts = [part.strip() for part in text.split(",") if part.strip()]
@@ -66,18 +66,23 @@ def _parse_mapping_string(value: str) -> Any | None:
     return None
 
 
+def _coerce_str_dict(value: dict) -> dict[str, Any]:
+    """Return a dict with non-empty string keys, skipping blank keys."""
+    coerced: dict[str, Any] = {}
+    for key, item_value in value.items():
+        name = str(key).strip()
+        if not name:
+            continue
+        coerced[name] = item_value
+    return coerced
+
+
 def _coerce_parameters(value: Any) -> dict[str, Any]:
     if value is None:
         return {}
 
     if isinstance(value, dict):
-        coerced: dict[str, Any] = {}
-        for key, param_value in value.items():
-            name = str(key).strip()
-            if not name:
-                continue
-            coerced[name] = param_value
-        return coerced
+        return _coerce_str_dict(value)
 
     if isinstance(value, str):
         parsed = _parse_mapping_string(value)
@@ -88,42 +93,9 @@ def _coerce_parameters(value: Any) -> dict[str, Any]:
         )
 
     if isinstance(value, (list, tuple)):
-        coerced = {}
+        coerced: dict[str, Any] = {}
         for item in value:
-            if not isinstance(item, dict):
-                raise TypeError(
-                    "STRATEGY_META['parameters'] list entries must be dict values."
-                )
-
-            if "name" in item:
-                name = str(item.get("name", "")).strip()
-                if not name:
-                    raise TypeError(
-                        "STRATEGY_META['parameters'] list entries with 'name' must provide a non-empty value."
-                    )
-                parameter_value = item.get("default")
-                if "default" not in item:
-                    for fallback_key in ("value", "initial", "start"):
-                        if fallback_key in item:
-                            parameter_value = item[fallback_key]
-                            break
-                coerced[name] = parameter_value
-                continue
-
-            if len(item) == 1:
-                key, parameter_value = next(iter(item.items()))
-                name = str(key).strip()
-                if not name:
-                    raise TypeError(
-                        "STRATEGY_META['parameters'] single-entry dict keys must be non-empty."
-                    )
-                coerced[name] = parameter_value
-                continue
-
-            raise TypeError(
-                "STRATEGY_META['parameters'] list entries must contain 'name' or a single key-value pair."
-            )
-
+            coerced.update(_coerce_parameter_entry(item))
         return coerced
 
     raise TypeError(
@@ -131,18 +103,50 @@ def _coerce_parameters(value: Any) -> dict[str, Any]:
     )
 
 
+def _coerce_parameter_entry(item: Any) -> dict[str, Any]:
+    """Coerce a single list entry of ``parameters`` into one named parameter."""
+    if not isinstance(item, dict):
+        raise TypeError("STRATEGY_META['parameters'] list entries must be dict values.")
+
+    if "name" in item:
+        name = str(item.get("name", "")).strip()
+        if not name:
+            raise TypeError(
+                "STRATEGY_META['parameters'] list entries with 'name' must provide a non-empty value."
+            )
+        return {name: _parameter_default(item)}
+
+    if len(item) == 1:
+        key, parameter_value = next(iter(item.items()))
+        name = str(key).strip()
+        if not name:
+            raise TypeError(
+                "STRATEGY_META['parameters'] single-entry dict keys must be non-empty."
+            )
+        return {name: parameter_value}
+
+    raise TypeError(
+        "STRATEGY_META['parameters'] list entries must contain 'name' or a single key-value pair."
+    )
+
+
+def _parameter_default(item: dict) -> Any:
+    """Resolve the parameter default, falling back to value/initial/start keys."""
+    parameter_value = item.get("default")
+    if "default" not in item:
+        for fallback_key in ("value", "initial", "start"):
+            if fallback_key in item:
+                parameter_value = item[fallback_key]
+                break
+    return parameter_value
+
+
 def _coerce_tags(value: Any) -> dict[str, Any]:
     if value is None:
         return {}
 
     if isinstance(value, dict):
-        coerced: dict[str, Any] = {}
-        for key, tag_value in value.items():
-            name = str(key).strip()
-            if not name:
-                continue
-            coerced[name] = tag_value
-        return coerced
+        return _coerce_str_dict(value)
 
     if isinstance(value, str):
         parsed = _parse_mapping_string(value)
@@ -155,40 +159,44 @@ def _coerce_tags(value: Any) -> dict[str, Any]:
         return {"labels": [label]}
 
     if isinstance(value, (list, tuple)):
-        labels: list[str] = []
-        merged: dict[str, Any] = {}
-
-        for item in value:
-            if isinstance(item, str):
-                label = item.strip()
-                if label:
-                    labels.append(label)
-                continue
-            if isinstance(item, dict):
-                for key, tag_value in item.items():
-                    name = str(key).strip()
-                    if not name:
-                        continue
-                    merged[name] = tag_value
-                continue
-            raise TypeError(
-                "STRATEGY_META['tags'] list entries must be strings or dict values."
-            )
-
-        if labels:
-            existing = merged.get("labels")
-            if isinstance(existing, list):
-                merged["labels"] = [*existing, *labels]
-            elif existing is None:
-                merged["labels"] = labels
-            else:
-                merged["labels"] = [existing, *labels]
-
-        return merged
+        return _coerce_tag_list(value)
 
     raise TypeError(
         "STRATEGY_META['tags'] must be a dict, a supported list, or a mapping string."
     )
+
+
+def _coerce_tag_list(value: Any) -> dict[str, Any]:
+    """Coerce a list/tuple of tag entries into a merged tag mapping."""
+    labels: list[str] = []
+    merged: dict[str, Any] = {}
+
+    for item in value:
+        if isinstance(item, str):
+            label = item.strip()
+            if label:
+                labels.append(label)
+            continue
+        if isinstance(item, dict):
+            merged.update(_coerce_str_dict(item))
+            continue
+        raise TypeError(
+            "STRATEGY_META['tags'] list entries must be strings or dict values."
+        )
+
+    if labels:
+        merged["labels"] = _merge_labels(merged.get("labels"), labels)
+
+    return merged
+
+
+def _merge_labels(existing: Any, labels: list[str]) -> list[Any]:
+    """Append collected labels to any pre-existing 'labels' tag value."""
+    if isinstance(existing, list):
+        return [*existing, *labels]
+    if existing is None:
+        return labels
+    return [existing, *labels]
 
 
 def normalize_strategy_meta_payload(

@@ -1388,8 +1388,6 @@ def _migrate_backtests_equity_curve(connection: Connection) -> None:
 def _migrate_live_executions_dedupe_key(connection: Connection) -> None:
     """Add the dedupe_key column and its unique index to live_executions."""
     execution_column_names = _table_column_names(connection, "live_executions")
-
-    execution_column_names = _table_column_names(connection, "live_executions")
     if execution_column_names and "dedupe_key" not in execution_column_names:
         connection.execute(text("ALTER TABLE live_executions ADD COLUMN dedupe_key TEXT"))
     if _table_column_names(connection, "live_executions"):
@@ -2632,9 +2630,8 @@ def _coerce_backtest_row_id(row: Any) -> str | None:
         mapping = getattr(row, "_mapping")
         value = mapping.get("id")
         return str(value) if value else None
-    if isinstance(row, (tuple, list)) and row:
-        if row[0]:
-            return str(row[0])
+    if isinstance(row, (tuple, list)) and row and row[0]:
+        return str(row[0])
     return None
 
 
@@ -2974,11 +2971,11 @@ def list_verification_evidence_records(
 
     normalized_component = str(component or "").strip()
     normalized_category = str(category or "").strip().lower()
-    normalized_status = (
-        _normalize_evidence_status(status.value if isinstance(status, VerificationEvidenceStatus) else str(status))
-        if status is not None and str(status).strip()
-        else ""
-    )
+    if status is not None and str(status).strip():
+        raw_status = status.value if isinstance(status, VerificationEvidenceStatus) else str(status)
+        normalized_status = _normalize_evidence_status(raw_status)
+    else:
+        normalized_status = ""
 
     with get_session() as session:
         statement = select(VerificationEvidenceModel)
@@ -3170,9 +3167,7 @@ def _update_background_task_record(
     record.name = str(name or "")
     record.description = str(description or "")
     record.source = str(source or "")
-    if created_at:
-        record.created_at = created_value
-    elif not str(record.created_at or "").strip():
+    if created_at or not str(record.created_at or "").strip():
         record.created_at = created_value
     record.updated_at = updated_value
 

@@ -566,7 +566,7 @@ def _request_ctrader_account_detail(ctx: _CtraderAccountContext, account_id: int
             account_detail_res, _PROTO_OA_CTID_TRADER_ACCOUNT_RES
         ):
             _apply_ctrader_account_detail(ctx, account_id, account_detail_res)
-    except (TimeoutError, ConnectionError, OSError) as exc:
+    except OSError as exc:
         logger.warning(
             "cTrader account detail request desynchronized the socket",
             extra={

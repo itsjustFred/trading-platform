@@ -23,6 +23,10 @@ def _normalize_timestamp(ts: str) -> datetime:
     return dt.astimezone(timezone.utc)
 
 
+_MATCH_SUFFIX = " (match)"
+_MISMATCH_SUFFIX = " (mismatch)"
+
+
 def _pct_diff(a: float, b: float) -> float:
     """Return the relative difference, using max(|a|, |b|) as denominator."""
     denom = max(abs(a), abs(b))
@@ -126,7 +130,7 @@ class TradeComparator:
 
         exit_price_ref = ref.exits[-1].price if ref.exits else None
         exit_price_act = act.exits[-1].price if act.exits else None
-        field_results["exit_price"] = self._compare_optional_price(
+        field_results["exit_price"] = self._compare_optional_pct(
             exit_price_ref, exit_price_act, self.config.exit_price_pct, "exit_price"
         )
 
@@ -151,14 +155,14 @@ class TradeComparator:
         # stop_loss
         sl_ref = ref.meta.get("stop_loss") if ref.meta else None
         sl_act = act.meta.get("stop_loss") if act.meta else None
-        field_results["stop_loss"] = self._compare_optional_price(
+        field_results["stop_loss"] = self._compare_optional_pct(
             sl_ref, sl_act, self.config.sl_price_pct, "stop_loss"
         )
 
         # take_profit
         tp_ref = ref.meta.get("take_profit") if ref.meta else None
         tp_act = act.meta.get("take_profit") if act.meta else None
-        field_results["take_profit"] = self._compare_optional_price(
+        field_results["take_profit"] = self._compare_optional_pct(
             tp_ref, tp_act, self.config.tp_price_pct, "take_profit"
         )
 
@@ -181,7 +185,7 @@ class TradeComparator:
             tolerance=None,
             passed=passed,
             message=f"Direction: expected {expected!r}, got {actual!r}"
-            + (" (match)" if passed else " (mismatch)"),
+            + (_MATCH_SUFFIX if passed else _MISMATCH_SUFFIX),
         )
 
     def _compare_time(
@@ -196,7 +200,7 @@ class TradeComparator:
             tolerance=tolerance,
             passed=passed,
             message=f"{field_name} difference is {diff:.3f}s (tolerance {tolerance}s)"
-            + (" (match)" if passed else " (mismatch)"),
+            + (_MATCH_SUFFIX if passed else _MISMATCH_SUFFIX),
         )
 
     def _compare_pct(
@@ -211,37 +215,10 @@ class TradeComparator:
             tolerance=tolerance,
             passed=passed,
             message=f"{field_name} relative difference is {diff:.6f} (tolerance {tolerance:.6f})"
-            + (" (match)" if passed else " (mismatch)"),
+            + (_MATCH_SUFFIX if passed else _MISMATCH_SUFFIX),
         )
 
     def _compare_optional_pct(
-        self,
-        expected: float | None,
-        actual: float | None,
-        tolerance: float,
-        field_name: str,
-    ) -> FieldComparisonResult:
-        if expected is None and actual is None:
-            return FieldComparisonResult(
-                field=field_name,
-                expected=expected,
-                actual=actual,
-                tolerance=tolerance,
-                passed=True,
-                message=f"{field_name}: both None (match)",
-            )
-        if expected is None or actual is None:
-            return FieldComparisonResult(
-                field=field_name,
-                expected=expected,
-                actual=actual,
-                tolerance=tolerance,
-                passed=False,
-                message=f"{field_name}: expected {expected!r}, got {actual!r} (mismatch)",
-            )
-        return self._compare_pct(expected, actual, tolerance, field_name)
-
-    def _compare_optional_price(
         self,
         expected: float | None,
         actual: float | None,
@@ -290,5 +267,5 @@ class TradeComparator:
             passed=passed,
             message=f"PnL relative diff {diff_pct:.6f} (tol {tolerance_pct:.6f}), "
             f"absolute diff {diff_abs:.6f} (tol {tolerance_abs:.6f})"
-            + (" (match)" if passed else " (mismatch)"),
+            + (_MATCH_SUFFIX if passed else _MISMATCH_SUFFIX),
         )

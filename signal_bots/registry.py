@@ -14,6 +14,8 @@ from typing import Any, Callable
 
 import yaml
 
+_BOT_CONFIG_FILE = "config.yaml"
+
 from signal_bots.nitro import NitroSignalProcessor
 from signal_bots.ramjet import RamJetSignalProcessor
 from signal_bots.rocketfuel import RocketFuelSignalProcessor

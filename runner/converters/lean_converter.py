@@ -23,6 +23,10 @@ from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, Trad
 logger = logging.getLogger(__name__)
 
 
+_UTC_SUFFIX_Z = "Z"
+_UTC_SUFFIX_OFFSET = "+00:00"
+
+
 def convert_lean_result(
     lean_json_path: str | Path,
     strategy_name: str | None = None,
@@ -69,12 +73,12 @@ def _build_trades(data: dict) -> list[Trade]:
     for o in all_orders:
         by_ticker[o["ticker"]].append(o)
 
-    # P&L lookup (handle both Z and +00:00 suffixes)
+    # P&L lookup (handle both UTC suffix variants)
     pl_lookup: dict[str, float] = {}
     for ts, pnl in profit_loss.items():
         pl_lookup[ts] = float(pnl)
-        pl_lookup[ts.replace("Z", "+00:00")] = float(pnl)
-        pl_lookup[ts.replace("+00:00", "Z")] = float(pnl)
+        pl_lookup[ts.replace(_UTC_SUFFIX_Z, _UTC_SUFFIX_OFFSET)] = float(pnl)
+        pl_lookup[ts.replace(_UTC_SUFFIX_OFFSET, _UTC_SUFFIX_Z)] = float(pnl)
 
     trades: list[Trade] = []
 
@@ -200,7 +204,7 @@ def _extract_ticker(sym_value: str) -> str:
 def _parse_iso(ts: str) -> str:
     """Normalize ISO timestamp to consistent format."""
     try:
-        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(ts.replace(_UTC_SUFFIX_Z, _UTC_SUFFIX_OFFSET))
         return dt.isoformat()
     except (ValueError, AttributeError):
         return ts

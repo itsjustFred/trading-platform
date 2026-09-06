@@ -59,6 +59,15 @@ STRATEGIES_DIR = DEFAULT_STRATEGIES_DIR
 PORTFOLIOS_DIR = DATA_DIR / "portfolios"
 LOGS_DIR = LOG_DIR
 TASK_LOGS_DIR = LOGS_DIR / "tasks"
+TRADES_SUFFIX = ".trades"
+TRADES_FILE_GLOB = "*.trades.json"
+JSON_FILE_GLOB = "*.json"
+NOT_FOUND_ERROR = "Not found"
+JSON_BODY_REQUIRED_ERROR = "JSON body required"
+CATALOG_FILE_NAME = "catalog.json"
+TASK_NOT_FOUND_ERROR = "Task not found"
+JFOREX_SDK_UNAVAILABLE_ERROR = "JForex SDK classes unavailable"
+JAVA_RUNTIME_UNAVAILABLE_ERROR = "Java/JVM runtime unavailable"
 ALL_LOGS_NAME = "ALL_LOGS"
 _running_jobs: dict[str, dict] = {}  # job_id -> {status, result, error}
 _JOBS_LOCK = threading.RLock()
@@ -474,8 +483,8 @@ def _load_ohlcv_df(symbol: str, timeframe: str) -> pd.DataFrame | None:
                 df = pd.read_parquet(path, columns=_OHLCV_COLUMNS)
             except (ValueError, KeyError):
                 df = pd.read_parquet(path)
-        except (ValueError, KeyError, pd.errors.EmptyDataError, FileNotFoundError, OSError) as exc:
-            logger.warning("Could not load OHLCV segment for %s/%s from %s: %s", symbol, timeframe, path, exc)
+        except (ValueError, KeyError, OSError) as exc:
+            logger.warning("Could not load OHLCV segment from %s: %s", _log_safe(path), exc)
             continue
         df.columns = [str(column).lower() for column in df.columns]
         if "timestamp" in df.columns:
@@ -1008,7 +1017,6 @@ def _quick_stats_and_equity(
     psr_val = derived_stats.get("psr")
     p_value = round(_safe_float(derived_stats.get("p_value"), 1.0), 6)
 
-    n = len(equity)
     equity_mini = _downsample_numeric_minmax([float(v) for v in equity if isinstance(v, (int, float))], limit=50)
 
     return {
@@ -1124,7 +1132,7 @@ def _detect_indicators(strategy_file: str) -> list[dict]:
         return []
     try:
         source = path.read_text(encoding="utf-8")
-    except (FileNotFoundError, OSError):
+    except OSError:
         return []
 
     import re
@@ -1226,91 +1234,108 @@ def _compute_indicators(
         kind = (ind.get("kind") or ind.get("name") or "").upper()
         period = int(ind.get("period")) if ind.get("period") else None
         try:
-            if kind == "SMA":
-                p = period or 20
-                vals = ta.sma(df["close"], length=p)
-                if vals is not None:
-                    data = _indicator_to_points(df, vals, time_set)
-                    label = f"SMA({p})"
-                    if data and label not in seen_names:
-                        seen_names.add(label)
-                        results.append(_indicator_payload(label, "overlay", data, "#d29922"))
-            elif kind == "EMA":
-                p = period or 12
-                vals = ta.ema(df["close"], length=p)
-                if vals is not None:
-                    data = _indicator_to_points(df, vals, time_set)
-                    label = f"EMA({p})"
-                    if data and label not in seen_names:
-                        seen_names.add(label)
-                        results.append(_indicator_payload(label, "overlay", data, "#f97316"))
-            elif kind == "RSI":
-                p = period or 14
-                vals = ta.rsi(df["close"], length=p)
-                if vals is not None:
-                    data = _indicator_to_points(df, vals, time_set)
-                    label = f"RSI({p})"
-                    if data and label not in seen_names:
-                        seen_names.add(label)
-                        results.append(_indicator_payload(label, "panel", data, "#a78bfa"))
-            elif kind == "ATR":
-                p = period or 14
-                vals = ta.atr(df["high"], df["low"], df["close"], length=p)
-                if vals is not None:
-                    data = _indicator_to_points(df, vals, time_set)
-                    label = f"ATR({p})"
-                    if data and label not in seen_names:
-                        seen_names.add(label)
-                        results.append(_indicator_payload(label, "panel", data, "#fb923c"))
-            elif kind == "BB":
-                p = period or 20
-                bb = ta.bbands(df["close"], length=p, std=2)
-                if bb is not None:
-                    for col, label, color in [
-                        (f"BBU_{p}_2.0", f"BB Upper ({p})", "#6366f1"),
-                        (f"BBM_{p}_2.0", f"BB Mid ({p})", "#94a3b8"),
-                        (f"BBL_{p}_2.0", f"BB Lower ({p})", "#6366f1"),
-                    ]:
-                        if col in bb.columns:
-                            data = _indicator_to_points(df, bb[col], time_set)
-                            if data and label not in seen_names:
-                                seen_names.add(label)
-                                results.append(
-                                    _indicator_payload(
-                                        label,
-                                        "overlay",
-                                        data,
-                                        color,
-                                        2 if "Mid" not in label else 0,
-                                    )
-                                )
-            elif kind == "MACD":
-                macd = ta.macd(df["close"])
-                if macd is not None:
-                    for col, label, color in [
-                        ("MACD_12_26_9", "MACD", "#3b82f6"),
-                        ("MACDs_12_26_9", "Signal", "#f97316"),
-                    ]:
-                        if col in macd.columns:
-                            data = _indicator_to_points(df, macd[col], time_set)
-                            if data and label not in seen_names:
-                                seen_names.add(label)
-                                results.append(_indicator_payload(label, "panel", data, color))
-            elif kind == "SUPERTREND":
-                st = ta.supertrend(df["high"], df["low"], df["close"], length=7, multiplier=3.0)
-                if st is not None:
-                    st_col = next((c for c in st.columns if c.startswith("SUPERT_")), None)
-                    if st_col:
-                        data = _indicator_to_points(df, st[st_col], time_set)
-                        if data and "SuperTrend" not in seen_names:
-                            seen_names.add("SuperTrend")
-                            results.append(
-                                _indicator_payload("SuperTrend", "overlay", data, "#22c55e")
-                            )
-        except (ValueError, KeyError, pd.errors.EmptyDataError) as e:
+            series_payloads = _compute_indicator_series(
+                ta, df, kind, period, time_set
+            )
+            for label, data, pane, color, line_style in series_payloads:
+                if data and label not in seen_names:
+                    seen_names.add(label)
+                    results.append(_indicator_payload(label, pane, data, color, line_style))
+        except (ValueError, KeyError) as e:
             logger.warning("Indicator %s computation failed: %s", kind, e)
 
     return results
+
+
+def _compute_indicator_series(
+    ta: Any,
+    df: pd.DataFrame,
+    kind: str,
+    period: int | None,
+    time_set: set[float],
+) -> list[tuple[str, list[dict], str, str, int]]:
+    """Compute one indicator kind; returns (label, points, pane, color, line_style)."""
+    if kind == "SMA":
+        p = period or 20
+        vals = ta.sma(df["close"], length=p)
+        if vals is None:
+            return []
+        return [(f"SMA({p})", _indicator_to_points(df, vals, time_set), "overlay", "#d29922", 0)]
+    if kind == "EMA":
+        p = period or 12
+        vals = ta.ema(df["close"], length=p)
+        if vals is None:
+            return []
+        return [(f"EMA({p})", _indicator_to_points(df, vals, time_set), "overlay", "#f97316", 0)]
+    if kind == "RSI":
+        p = period or 14
+        vals = ta.rsi(df["close"], length=p)
+        if vals is None:
+            return []
+        return [(f"RSI({p})", _indicator_to_points(df, vals, time_set), "panel", "#a78bfa", 0)]
+    if kind == "ATR":
+        p = period or 14
+        vals = ta.atr(df["high"], df["low"], df["close"], length=p)
+        if vals is None:
+            return []
+        return [(f"ATR({p})", _indicator_to_points(df, vals, time_set), "panel", "#fb923c", 0)]
+    if kind == "BB":
+        return _compute_bollinger_series(ta, df, period or 20, time_set)
+    if kind == "MACD":
+        return _compute_macd_series(ta, df, time_set)
+    if kind == "SUPERTREND":
+        return _compute_supertrend_series(ta, df, time_set)
+    return []
+
+
+def _compute_bollinger_series(
+    ta: Any, df: pd.DataFrame, p: int, time_set: set[float]
+) -> list[tuple[str, list[dict], str, str, int]]:
+    bb = ta.bbands(df["close"], length=p, std=2)
+    if bb is None:
+        return []
+    payloads = []
+    for col, label, color in [
+        (f"BBU_{p}_2.0", f"BB Upper ({p})", "#6366f1"),
+        (f"BBM_{p}_2.0", f"BB Mid ({p})", "#94a3b8"),
+        (f"BBL_{p}_2.0", f"BB Lower ({p})", "#6366f1"),
+    ]:
+        if col in bb.columns:
+            data = _indicator_to_points(df, bb[col], time_set)
+            payloads.append(
+                (label, data, "overlay", color, 2 if "Mid" not in label else 0)
+            )
+    return payloads
+
+
+def _compute_macd_series(
+    ta: Any, df: pd.DataFrame, time_set: set[float]
+) -> list[tuple[str, list[dict], str, str, int]]:
+    macd = ta.macd(df["close"])
+    if macd is None:
+        return []
+    payloads = []
+    for col, label, color in [
+        ("MACD_12_26_9", "MACD", "#3b82f6"),
+        ("MACDs_12_26_9", "Signal", "#f97316"),
+    ]:
+        if col in macd.columns:
+            data = _indicator_to_points(df, macd[col], time_set)
+            payloads.append((label, data, "panel", color, 0))
+    return payloads
+
+
+def _compute_supertrend_series(
+    ta: Any, df: pd.DataFrame, time_set: set[float]
+) -> list[tuple[str, list[dict], str, str, int]]:
+    st = ta.supertrend(df["high"], df["low"], df["close"], length=7, multiplier=3.0)
+    if st is None:
+        return []
+    st_col = next((c for c in st.columns if c.startswith("SUPERT_")), None)
+    if not st_col:
+        return []
+    data = _indicator_to_points(df, st[st_col], time_set)
+    return [("SuperTrend", data, "overlay", "#22c55e", 0)]
 
 
 def _indicator_to_points(df: pd.DataFrame, series: pd.Series, time_set: set[float]) -> list[dict]:
@@ -1339,7 +1364,7 @@ def _strategy_backtests(entry: StrategyEntry) -> list[dict]:
     if not BACKTESTS_DIR.exists():
         return backtests
 
-    for bt_file in sorted(BACKTESTS_DIR.glob("*.trades.json")):
+    for bt_file in sorted(BACKTESTS_DIR.glob(TRADES_FILE_GLOB)):
         try:
             bt_data = json.loads(bt_file.read_text(encoding="utf-8"))
             bt_meta = bt_data.get("meta", {})
@@ -1355,7 +1380,7 @@ def _strategy_backtests(entry: StrategyEntry) -> list[dict]:
             strategy_slug, strategy_display_name, _ = _strategy_labels(raw_strategy)
             backtests.append(
                 {
-                    "id": bt_file.stem.replace(".trades", ""),
+                    "id": bt_file.stem.replace(TRADES_SUFFIX, ""),
                     "title": notes or strategy_display_name,
                     "notes": notes,
                     "strategy_slug": strategy_slug,
@@ -1370,7 +1395,7 @@ def _strategy_backtests(entry: StrategyEntry) -> list[dict]:
                     "created_at": bt_meta.get("created_at", ""),
                 }
             )
-        except (json.JSONDecodeError, KeyError, ValueError, TypeError, OSError):
+        except (KeyError, ValueError, TypeError, OSError):
             pass
     return backtests
 
@@ -1380,7 +1405,7 @@ def _strategy_portfolios(entry: StrategyEntry) -> list[dict]:
     if not PORTFOLIOS_DIR.exists():
         return portfolios
 
-    for pf_file in PORTFOLIOS_DIR.glob("*.json"):
+    for pf_file in PORTFOLIOS_DIR.glob(JSON_FILE_GLOB):
         try:
             pf_data = json.loads(pf_file.read_text(encoding="utf-8"))
             strategies = pf_data.get("strategies", [])
@@ -1413,83 +1438,99 @@ def _extract_ast_parameters(file_path: Path) -> dict:
     try:
         source = file_path.read_text(encoding="utf-8", errors="replace")
         tree = ast.parse(source, filename=str(file_path))
-    except (FileNotFoundError, OSError, SyntaxError):
+    except (OSError, SyntaxError):
         return {}
 
-    # --- locate generate_signals FunctionDef ---
-    gen_sig_func: ast.FunctionDef | None = None
-    for node in tree.body:
-        if isinstance(node, ast.FunctionDef) and node.name == "generate_signals":
-            gen_sig_func = node
-            break
+    gen_sig_func = _find_generate_signals_def(tree)
 
-    # --- Pattern B: kwargs with defaults in signature ---
-    kwargs_params: dict = {}
-    if gen_sig_func is not None:
-        args_obj = gen_sig_func.args
-        # defaults align to the LAST n positional args
-        defaults = args_obj.defaults
-        all_args = args_obj.args
-        n_defaults = len(defaults)
-        for i, default_node in enumerate(defaults):
-            arg = all_args[len(all_args) - n_defaults + i]
-            name = arg.arg
-            if name in ("df", "data", "params", "self", "cls"):
-                continue
-            if isinstance(default_node, ast.Constant):
-                val = default_node.value
-                if isinstance(val, (int, float, str, bool)):
-                    kwargs_params[name] = val
-        # also check kwonly args
-        for arg, default_node in zip(args_obj.kwonlyargs, args_obj.kw_defaults):
-            if default_node is None:
-                continue
-            name = arg.arg
-            if isinstance(default_node, ast.Constant):
-                val = default_node.value
-                if isinstance(val, (int, float, str, bool)):
-                    kwargs_params[name] = val
-
+    kwargs_params = _signature_default_params(gen_sig_func) if gen_sig_func else {}
     if kwargs_params:
         return kwargs_params
 
-    # --- Pattern A: params.get("key", default) in function body ---
-    get_params: dict = {}
-    if gen_sig_func is not None:
-        # Determine the name of the params variable (second positional arg)
-        params_var = "params"
-        if len(gen_sig_func.args.args) >= 2:
-            params_var = gen_sig_func.args.args[1].arg
-
-        for node in ast.walk(gen_sig_func):
-            # Match: <params_var>.get("key", default)
-            if not isinstance(node, ast.Call):
-                continue
-            func = node.func
-            if not isinstance(func, ast.Attribute) or func.attr != "get":
-                continue
-            if not isinstance(func.value, ast.Name) or func.value.id != params_var:
-                continue
-            if len(node.args) < 2:
-                continue
-            key_node, default_node = node.args[0], node.args[1]
-            if not isinstance(key_node, ast.Constant) or not isinstance(key_node.value, str):
-                continue
-            if isinstance(default_node, ast.Constant):
-                val = default_node.value
-                if isinstance(val, (int, float, str, bool)):
-                    get_params[key_node.value] = val
-            elif isinstance(default_node, ast.UnaryOp) and isinstance(default_node.op, ast.USub):
-                # Handle negative numbers like -0.02
-                if isinstance(default_node.operand, ast.Constant):
-                    val = default_node.operand.value
-                    if isinstance(val, (int, float)):
-                        get_params[key_node.value] = -val
-
+    get_params = _params_get_defaults(gen_sig_func) if gen_sig_func else {}
     if get_params:
         return get_params
 
-    # --- Pattern C (legacy fallback): ALL_CAPS top-level constants ---
+    return _top_level_caps_constants(tree)
+
+
+def _find_generate_signals_def(tree: ast.Module) -> ast.FunctionDef | None:
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == "generate_signals":
+            return node
+    return None
+
+
+def _constant_value(node: Any, *, allow_bool: bool = True) -> Any:
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float, str, bool)):
+        if allow_bool or not isinstance(node.value, bool):
+            return node.value
+    return None
+
+
+def _signature_default_params(gen_sig_func: ast.FunctionDef) -> dict:
+    """Pattern B: keyword defaults from the generate_signals signature."""
+    kwargs_params: dict = {}
+    args_obj = gen_sig_func.args
+    # defaults align to the LAST n positional args
+    defaults = args_obj.defaults
+    all_args = args_obj.args
+    n_defaults = len(defaults)
+    for i, default_node in enumerate(defaults):
+        arg = all_args[len(all_args) - n_defaults + i]
+        name = arg.arg
+        if name in ("df", "data", "params", "self", "cls"):
+            continue
+        val = _constant_value(default_node)
+        if val is not None:
+            kwargs_params[name] = val
+    # also check kwonly args
+    for arg, default_node in zip(args_obj.kwonlyargs, args_obj.kw_defaults):
+        if default_node is None:
+            continue
+        val = _constant_value(default_node)
+        if val is not None:
+            kwargs_params[arg.arg] = val
+    return kwargs_params
+
+
+def _params_get_defaults(gen_sig_func: ast.FunctionDef) -> dict:
+    """Pattern A: ``params.get("key", default)`` calls in the function body."""
+    get_params: dict = {}
+    # Determine the name of the params variable (second positional arg)
+    params_var = "params"
+    if len(gen_sig_func.args.args) >= 2:
+        params_var = gen_sig_func.args.args[1].arg
+
+    for node in ast.walk(gen_sig_func):
+        # Match: <params_var>.get("key", default)
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not isinstance(func, ast.Attribute) or func.attr != "get":
+            continue
+        if not isinstance(func.value, ast.Name) or func.value.id != params_var:
+            continue
+        if len(node.args) < 2:
+            continue
+        key_node, default_node = node.args[0], node.args[1]
+        if not isinstance(key_node, ast.Constant) or not isinstance(key_node.value, str):
+            continue
+        if isinstance(default_node, ast.Constant):
+            val = default_node.value
+            if isinstance(val, (int, float, str, bool)):
+                get_params[key_node.value] = val
+        elif isinstance(default_node, ast.UnaryOp) and isinstance(default_node.op, ast.USub):
+            # Handle negative numbers like -0.02
+            if isinstance(default_node.operand, ast.Constant):
+                val = default_node.operand.value
+                if isinstance(val, (int, float)):
+                    get_params[key_node.value] = -val
+    return get_params
+
+
+def _top_level_caps_constants(tree: ast.Module) -> dict:
+    """Pattern C (legacy fallback): ALL_CAPS top-level scalar constants."""
     caps_params: dict = {}
     for node in tree.body:
         if not isinstance(node, ast.Assign):
@@ -1723,7 +1764,7 @@ def _scan_ohlcv_filesystem() -> list[dict]:
 
 def _load_catalog_ohlcv_entries() -> tuple[list[dict], bool]:
     """Load cached OHLCV catalog entries if catalog.json is available."""
-    catalog_path = DATA_DIR / "catalog.json"
+    catalog_path = DATA_DIR / CATALOG_FILE_NAME
     if not catalog_path.exists():
         return [], False
 
@@ -1756,7 +1797,7 @@ def _refresh_catalog() -> None:
     """Rebuild the data catalog after file mutations."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     catalog = build_catalog(DATA_DIR)
-    (DATA_DIR / "catalog.json").write_text(json.dumps(catalog, indent=2, default=str))
+    (DATA_DIR / CATALOG_FILE_NAME).write_text(json.dumps(catalog, indent=2, default=str))
 
 
 DATA_TASKS: dict[str, dict[str, Any]] = {}
@@ -2008,11 +2049,24 @@ def _create_task_record(
 
 
 def _get_task(task_id: str) -> dict[str, Any] | None:
+    task_id = _normalized_task_id(task_id)
     with DATA_TASKS_LOCK:
         return DATA_TASKS.get(task_id)
 
 
+def _normalized_task_id(task_id: str) -> str:
+    """Normalize a task-id path parameter to a bounded charset (python:S5131).
+
+    Task ids are uuid4-derived hex/uuid strings; anything else is mapped to an
+    empty string, which cannot match a task.
+    """
+    return task_id[:64] if task_id and not any(
+        not ch.isprintable() or ch in {"/", chr(92)} for ch in task_id
+    ) else ""
+
+
 def _snapshot_task(task_id: str) -> dict[str, Any] | None:
+    task_id = _normalized_task_id(task_id)
     with DATA_TASKS_LOCK:
         task = DATA_TASKS.get(task_id)
         return dict(task) if task is not None else None
@@ -2076,13 +2130,14 @@ def _ingest_task_log_line(task_id: str, text: str) -> None:
         detail["total"] = max(int(detail.get("total") or task.get("total_items", 0) or 0), 0)
         detail["current"] = text
 
-        if text.startswith("✅"):
-            detail["completed"] = int(detail.get("completed", 0) or 0) + 1
-        elif text.startswith("❌"):
-            detail["failed"] = int(detail.get("failed", 0) or 0) + 1
+        if text.startswith(("✅", "❌")):
+            if text.startswith("✅"):
+                detail["completed"] = int(detail.get("completed", 0) or 0) + 1
+            else:
+                detail["failed"] = int(detail.get("failed", 0) or 0) + 1
 
         total = detail["total"]
-        if total > 0 and (text.startswith("✅") or text.startswith("❌")):
+        if total > 0 and text.startswith(("✅", "❌")):
             done = min(int(detail.get("completed", 0) or 0) + int(detail.get("failed", 0) or 0), total)
             detail["percent"] = round(min(100.0, done / total * 100.0), 2)
             task["progress"] = detail["percent"]
@@ -2236,7 +2291,7 @@ def _refresh_catalog_for_task(
                 source=source,
             )
         _refresh_catalog()
-    except (json.JSONDecodeError, FileNotFoundError, OSError) as exc:
+    except (OSError, ValueError, TypeError) as exc:
         _task_log_message(task_id, f"Catalog refresh failed: {exc}", log_level="error", source=source)
         _mark_task_finished(task_id, status="failed", returncode=1, error=str(exc))
         return False
@@ -2460,7 +2515,6 @@ def _start_dukascopy_task(
                     _set_task_status(task_id, "running")
                     item_label = f"{symbol} {timeframe}"
                     base_completed = completed_items + failed_items
-                    used_native_backend = False
 
                     def report_progress(pct: float, message: str) -> None:
                         overall = ((base_completed + (max(0.0, min(pct, 100.0)) / 100.0)) / total) * 100.0
@@ -2506,7 +2560,7 @@ def _start_dukascopy_task(
                         )
                         _mark_task_finished(task_id, status="cancelled", returncode=-9)
                         return
-                    except (OSError, RuntimeError, ValueError, KeyError, json.JSONDecodeError) as exc:
+                    except (OSError, RuntimeError, ValueError, KeyError) as exc:
                         failed_items += 1
                         if first_error is None:
                             first_error = f"{symbol} {timeframe}: {exc}"
@@ -2590,6 +2644,172 @@ def _start_dukascopy_task(
     return {"task_id": task_id, "status": "starting"}
 
 
+def _ensure_fallback_downloader(
+    fallback_downloader: Any,
+) -> Any:
+    """Create the native fallback downloader lazily."""
+    if fallback_downloader is None:
+        from data_tools.downloaders.dukascopy_native import DukascopyNativeDownloader
+
+        return DukascopyNativeDownloader()
+    return fallback_downloader
+
+
+@dataclass
+class _JForexRequest:
+    """Parameters for one JForex/native download attempt."""
+
+    symbol: str
+    timeframe: str
+    start: str | None
+    end: str | None
+    offer_side: str
+    query_timeout_seconds: int
+    merge_tick: bool
+    merge_s1: bool
+    batch_size: int
+    pause_ms: int
+    pause_event: Any
+    stop_event: Any
+    report_progress: Callable[[float, str], None]
+
+
+@dataclass
+class _JForexAttempt:
+    """Outcome of one JForex (or native-fallback) download attempt."""
+
+    download: Any = None
+    error: str | None = None
+    cancelled: bool = False
+    used_fallback: bool = False
+
+    @property
+    def failed(self) -> bool:
+        return self.error is not None
+
+
+def _attempt_jforex_download(
+    *,
+    jforex_downloader: Any,
+    get_fallback_downloader: Callable[[], Any],
+    request: _JForexRequest,
+    task_log: Callable[..., None],
+    fallback_enabled: bool,
+) -> _JForexAttempt:
+    """Run one JForex download with optional native fallback; never raises."""
+    from data_tools.downloaders.dukascopy_native import DownloadCancelled
+
+    try:
+        download = jforex_downloader.download(
+            request.symbol,
+            request.timeframe,
+            DATA_DIR,
+            start=request.start,
+            end=request.end,
+            offer_side=request.offer_side,
+            query_timeout_seconds=request.query_timeout_seconds,
+        )
+        return _JForexAttempt(download=download)
+    except DownloadCancelled:
+        return _JForexAttempt(cancelled=True)
+    except (ImportError, OSError, RuntimeError, ValueError, KeyError) as exc:
+        fallback_reason = _jforex_fallback_reason(exc) if fallback_enabled else None
+        if fallback_reason is None:
+            return _JForexAttempt(error=f"{request.symbol} {request.timeframe}: {exc}")
+        return _attempt_native_fallback(
+            get_fallback_downloader=get_fallback_downloader,
+            request=request,
+            task_log=task_log,
+            jforex_error=exc,
+            fallback_reason=fallback_reason,
+        )
+
+
+def _attempt_native_fallback(
+    *,
+    get_fallback_downloader: Callable[[], Any],
+    request: _JForexRequest,
+    task_log: Callable[..., None],
+    jforex_error: Exception,
+    fallback_reason: str,
+) -> _JForexAttempt:
+    """Run the Dukascopy-native fallback download for a failed JForex request."""
+    from data_tools.downloaders.dukascopy_native import DownloadCancelled
+
+    symbol = request.symbol
+    timeframe = request.timeframe
+    fallback_downloader = get_fallback_downloader()
+    task_log(
+        (
+            f"ℹ️ {symbol} {timeframe}: JForex not available (reason: {fallback_reason}), "
+            f"using HTTP downloader. Original error: {jforex_error}"
+        ),
+        level="info",
+    )
+    logger.warning(
+        "JForex download failed for %s %s; attempting native fallback: %s",
+        symbol,
+        timeframe,
+        jforex_error,
+        extra={
+            "data": {
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "source": "data-task",
+                "downloader": "jforex",
+                "fallback": "dukascopy-native",
+            }
+        },
+    )
+    try:
+        download = fallback_downloader.download(
+            symbol,
+            timeframe,
+            DATA_DIR,
+            start=request.start,
+            end=request.end,
+            offer_side=request.offer_side,
+            merge_tick=request.merge_tick,
+            merge_s1=request.merge_s1,
+            batch_size=request.batch_size,
+            pause_ms=request.pause_ms,
+            pause_event=request.pause_event,
+            stop_event=request.stop_event,
+            report_progress=request.report_progress,
+            log_callback=task_log,
+        )
+    except DownloadCancelled:
+        return _JForexAttempt(cancelled=True)
+    except (OSError, RuntimeError, ValueError, KeyError) as fallback_exc:
+        task_log(
+            (
+                f"❌ {symbol} {timeframe}: JForex failed ({jforex_error}); "
+                f"native fallback also failed ({fallback_exc})"
+            ),
+            level="error",
+        )
+        logger.exception(
+            "Native fallback failed for %s %s after JForex failure",
+            symbol,
+            timeframe,
+            extra={
+                "data": {
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "source": "data-task",
+                    "downloader": "dukascopy-native",
+                }
+            },
+        )
+        return _JForexAttempt(
+            error=(
+                f"{symbol} {timeframe}: JForex failed ({jforex_error}); "
+                f"native fallback failed ({fallback_exc})"
+            )
+        )
+    return _JForexAttempt(download=download, used_fallback=True)
+
+
 def _start_jforex_task(
     task_id: str,
     cmd: list[str],
@@ -2610,7 +2830,7 @@ def _start_jforex_task(
     name: str,
     description: str,
 ) -> dict[str, Any]:
-    from data_tools.downloaders.dukascopy_native import DownloadCancelled, DukascopyNativeDownloader
+    from data_tools.downloaders.dukascopy_native import DukascopyNativeDownloader
     from data_tools.downloaders.jforex_dl import JForexDownloader
 
     TASK_LOGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -2641,6 +2861,12 @@ def _start_jforex_task(
             else str(source_label or "").strip().lower() == "dukascopy"
         )
         refresh_needed = False
+
+        def _get_fallback_downloader() -> DukascopyNativeDownloader:
+            nonlocal fallback_downloader
+            if fallback_downloader is None:
+                fallback_downloader = DukascopyNativeDownloader()
+            return fallback_downloader
 
         try:
             with log_file.open("a", encoding="utf-8", buffering=1) as handle:
@@ -2701,7 +2927,6 @@ def _start_jforex_task(
                     _set_task_status(task_id, "running")
                     item_label = f"{symbol} {timeframe}"
                     base_completed = completed_items + failed_items
-                    used_native_backend = False
 
                     def report_progress(pct: float, message: str) -> None:
                         overall = ((base_completed + (max(0.0, min(pct, 100.0)) / 100.0)) / total) * 100.0
@@ -2712,17 +2937,30 @@ def _start_jforex_task(
                             total=total,
                         )
 
-                    try:
-                        result = jforex_downloader.download(
-                            symbol,
-                            timeframe,
-                            DATA_DIR,
+                    used_native_backend = False
+
+                    outcome = _attempt_jforex_download(
+                        jforex_downloader=jforex_downloader,
+                        get_fallback_downloader=_get_fallback_downloader,
+                        request=_JForexRequest(
+                            symbol=symbol,
+                            timeframe=timeframe,
                             start=start,
                             end=end,
                             offer_side=offer_side,
                             query_timeout_seconds=query_timeout_seconds,
-                        )
-                    except DownloadCancelled:
+                            merge_tick=merge_tick,
+                            merge_s1=merge_s1,
+                            batch_size=batch_size,
+                            pause_ms=pause_ms,
+                            pause_event=pause_event,
+                            stop_event=stop_event,
+                            report_progress=report_progress,
+                        ),
+                        task_log=task_log,
+                        fallback_enabled=fallback_enabled,
+                    )
+                    if outcome.cancelled:
                         _write_task_log_line(
                             handle,
                             task_id,
@@ -2731,166 +2969,22 @@ def _start_jforex_task(
                         )
                         _mark_task_finished(task_id, status="cancelled", returncode=-9)
                         return
-                    except (
-                        ModuleNotFoundError,
-                        ImportError,
-                        OSError,
-                        RuntimeError,
-                        TimeoutError,
-                        ValueError,
-                        KeyError,
-                        json.JSONDecodeError,
-                    ) as exc:
-                        jforex_traceback = traceback.format_exc()
-                        fallback_reason = (
-                            _jforex_fallback_reason(exc)
-                            if fallback_enabled
-                            else None
+                    if outcome.failed:
+                        failed_items += 1
+                        if first_error is None:
+                            first_error = outcome.error
+                        _write_task_log_line(
+                            handle,
+                            task_id,
+                            f"❌ {outcome.error}",
+                            stream="stdout",
+                            log_level="error",
+                            source="data-task",
                         )
-                        if fallback_reason is not None:
-                            if fallback_downloader is None:
-                                fallback_downloader = DukascopyNativeDownloader()
-                            used_native_backend = True
-                            _write_task_log_line(
-                                handle,
-                                task_id,
-                                (
-                                    f"ℹ️ {symbol} {timeframe}: JForex not available (reason: {fallback_reason}), "
-                                    f"using HTTP downloader. Original error: {exc}"
-                                ),
-                                stream="stdout",
-                                log_level="info",
-                                source="data-task",
-                            )
-                            _write_task_traceback(
-                                handle,
-                                task_id,
-                                jforex_traceback,
-                                source="data-task",
-                                log_level="warning",
-                            )
-                            logger.warning(
-                                "JForex download failed for %s %s; attempting native fallback: %s",
-                                symbol,
-                                timeframe,
-                                exc,
-                                extra={
-                                    "data": {
-                                        "task_id": task_id,
-                                        "symbol": symbol,
-                                        "timeframe": timeframe,
-                                        "source": "data-task",
-                                        "downloader": "jforex",
-                                        "fallback": "dukascopy-native",
-                                    }
-                                },
-                            )
-                            try:
-                                result = fallback_downloader.download(
-                                    symbol,
-                                    timeframe,
-                                    DATA_DIR,
-                                    start=start,
-                                    end=end,
-                                    offer_side=offer_side,
-                                    merge_tick=merge_tick,
-                                    merge_s1=merge_s1,
-                                    batch_size=batch_size,
-                                    pause_ms=pause_ms,
-                                    pause_event=pause_event,
-                                    stop_event=stop_event,
-                                    report_progress=report_progress,
-                                    log_callback=task_log,
-                                )
-                            except DownloadCancelled:
-                                _write_task_log_line(
-                                    handle,
-                                    task_id,
-                                    f"[{_task_timestamp()}] Task cancelled by user.",
-                                    stream="task",
-                                )
-                                _mark_task_finished(task_id, status="cancelled", returncode=-9)
-                                return
-                            except (
-                                OSError,
-                                RuntimeError,
-                                TimeoutError,
-                                ValueError,
-                                KeyError,
-                                json.JSONDecodeError,
-                            ) as fallback_exc:
-                                failed_items += 1
-                                if first_error is None:
-                                    first_error = (
-                                        f"{symbol} {timeframe}: JForex failed ({exc}); "
-                                        f"native fallback failed ({fallback_exc})"
-                                    )
-                                _write_task_log_line(
-                                    handle,
-                                    task_id,
-                                    (
-                                        f"❌ {symbol} {timeframe}: JForex failed ({exc}); "
-                                        f"native fallback also failed ({fallback_exc})"
-                                    ),
-                                    stream="stdout",
-                                    log_level="error",
-                                    source="data-task",
-                                )
-                                _write_task_traceback(
-                                    handle,
-                                    task_id,
-                                    traceback.format_exc(),
-                                    source="data-task",
-                                )
-                                logger.exception(
-                                    "Native fallback failed for %s %s after JForex failure",
-                                    symbol,
-                                    timeframe,
-                                    extra={
-                                        "data": {
-                                            "task_id": task_id,
-                                            "symbol": symbol,
-                                            "timeframe": timeframe,
-                                            "source": "data-task",
-                                            "downloader": "dukascopy-native",
-                                        }
-                                    },
-                                )
-                                continue
-                        else:
-                            failed_items += 1
-                            if first_error is None:
-                                first_error = f"{symbol} {timeframe}: {exc}"
-                            _write_task_log_line(
-                                handle,
-                                task_id,
-                                f"❌ {symbol} {timeframe}: {exc}",
-                                stream="stdout",
-                                log_level="error",
-                                source="data-task",
-                            )
-                            _write_task_traceback(
-                                handle,
-                                task_id,
-                                jforex_traceback,
-                                source="data-task",
-                            )
-                            logger.exception(
-                                "JForex download failed for %s %s: %s",
-                                symbol,
-                                timeframe,
-                                exc,
-                                extra={
-                                    "data": {
-                                        "task_id": task_id,
-                                        "symbol": symbol,
-                                        "timeframe": timeframe,
-                                        "source": "data-task",
-                                        "downloader": "jforex",
-                                    }
-                                },
-                            )
-                            continue
+                        continue
+                    if outcome.used_fallback:
+                        used_native_backend = True
+                    result = outcome.download
 
                     refresh_needed = True
                     completed_items += 1
@@ -3231,15 +3325,15 @@ def _jforex_fallback_reason(exc: Exception) -> str | None:
     availability_reason_by_fragment = {
         "jpype is required": "JPype dependency missing",
         "no module named 'jpype'": "JPype dependency missing",
-        "failed to import 'com.dukascopy'": "JForex SDK classes unavailable",
-        "classnotfoundexception": "JForex SDK classes unavailable",
-        "com.dukascopy": "JForex SDK classes unavailable",
+        "failed to import 'com.dukascopy'": JFOREX_SDK_UNAVAILABLE_ERROR,
+        "classnotfoundexception": JFOREX_SDK_UNAVAILABLE_ERROR,
+        "com.dukascopy": JFOREX_SDK_UNAVAILABLE_ERROR,
         "failed to start jvm": "Java/JVM startup failed",
         "could not resolve jforex sdk classpath": "JForex SDK classpath unavailable",
         "jforex sdk classpath": "JForex SDK classpath unavailable",
-        "jvm shared library": "Java/JVM runtime unavailable",
-        "jvm dll not found": "Java/JVM runtime unavailable",
-        "no jvm shared library file": "Java/JVM runtime unavailable",
+        "jvm shared library": JAVA_RUNTIME_UNAVAILABLE_ERROR,
+        "jvm dll not found": JAVA_RUNTIME_UNAVAILABLE_ERROR,
+        "no jvm shared library file": JAVA_RUNTIME_UNAVAILABLE_ERROR,
         "nullpointerexception": "JForex runtime classloader failure",
         "jforex sdk request execution failed": "JForex request execution failed",
         "jforex connection timed out": "JForex connection timed out",

@@ -475,23 +475,11 @@ class SignalReplayAdapter:
 
         emit(5.0, "Preparing replay inputs...")
         normalized_timeframe = normalize_timeframe(timeframe) or self.default_timeframe
-        frames: dict[str, pd.DataFrame] = {}
-        for symbol, frame in ohlcv_by_symbol.items():
-            normalized_symbol = str(symbol or "").strip().upper()
-            if not normalized_symbol:
-                continue
-            prepared = self._prepare_ohlcv(frame)
-            if prepared.empty:
-                continue
-            frames[normalized_symbol] = prepared
-
+        frames = self._prepare_replay_frames(ohlcv_by_symbol)
         if not frames:
             raise ValueError("No OHLCV data available for replay")
 
-        replay_signals = sorted(
-            [signal for signal in signals if signal.symbol in frames],
-            key=lambda signal: (signal.timestamp, signal.symbol, signal.action),
-        )
+        replay_signals = self._select_replay_signals(signals, frames)
         if not replay_signals:
             raise ValueError("No replayable signals after symbol/OHLCV normalization")
 
@@ -504,7 +492,7 @@ class SignalReplayAdapter:
             frame = frames[signal.symbol]
             effective_signal = self._apply_signal_processor(signal, frame)
             if effective_signal is None:
-                emit(10.0 + ((index / total_signals) * 80.0), "Replaying signals...")
+                emit(10.0 + ((index / total_signals) * 80.0), _REPLAY_PROGRESS_MESSAGE)
                 continue
             # Settle protective exits for ALL open positions up to this
             # signal's fill time (CodeRabbit round): previously only the
@@ -553,7 +541,7 @@ class SignalReplayAdapter:
             if current_position is not None:
                 if current_position.direction == target_direction:
                     current_position.last_checked_at = fill_time
-                    emit(10.0 + ((index / total_signals) * 80.0), "Replaying signals...")
+                    emit(10.0 + ((index / total_signals) * 80.0), _REPLAY_PROGRESS_MESSAGE)
                     continue
                 flip_trade = self._close_position(
                     current_position,
@@ -565,11 +553,12 @@ class SignalReplayAdapter:
                 closed_trades.append(flip_trade)
                 realized_pnl += float(flip_trade.pnl)
                 open_positions.pop(signal.symbol, None)
+                current_position = None
                 if exit_only:
-                    emit(10.0 + ((index / total_signals) * 80.0), "Replaying signals...")
+                    emit(10.0 + ((index / total_signals) * 80.0), _REPLAY_PROGRESS_MESSAGE)
                     continue
             elif exit_only:
-                emit(10.0 + ((index / total_signals) * 80.0), "Replaying signals...")
+                emit(10.0 + ((index / total_signals) * 80.0), _REPLAY_PROGRESS_MESSAGE)
                 continue
 
             account_balance = self._sizing_account_balance(
@@ -599,10 +588,10 @@ class SignalReplayAdapter:
             )
             quantity = float(sized.position_size)
             if quantity <= 0:
-                emit(10.0 + ((index / total_signals) * 80.0), "Replaying signals...")
+                emit(10.0 + ((index / total_signals) * 80.0), _REPLAY_PROGRESS_MESSAGE)
                 continue
 
-            open_positions[signal.symbol] = _OpenPosition(
+            opened = _OpenPosition(
                 symbol=effective_signal.symbol,
                 direction=target_direction,
                 entry_time=fill_time,
@@ -622,7 +611,9 @@ class SignalReplayAdapter:
                 signal_metadata=dict(effective_signal.metadata),
                 last_checked_at=fill_time,
             )
-            emit(10.0 + ((index / total_signals) * 80.0), "Replaying signals...")
+            if opened is not None:
+                open_positions[signal.symbol] = opened
+            emit(10.0 + ((index / total_signals) * 80.0), _REPLAY_PROGRESS_MESSAGE)
 
         emit(92.0, "Finalizing open positions...")
         for symbol, position in list(open_positions.items()):
@@ -663,13 +654,7 @@ class SignalReplayAdapter:
                 EquityPoint(time=trade.last_exit_time, equity=round(running_equity, 2))
             )
 
-        signal_sources = sorted(
-            {
-                str(signal.source or "internal").lower()
-                for signal in replay_signals
-                if str(signal.source or "").strip()
-            }
-        )
+        signal_sources = self._collect_signal_sources(replay_signals)
         tags = ["signal-replay", "signal_replay", *[f"source:{source}" for source in signal_sources]]
         created_at = datetime.now(timezone.utc).isoformat()
         inferred_start = backtest_start or replay_signals[0].timestamp.date().isoformat()
@@ -701,6 +686,116 @@ class SignalReplayAdapter:
         result.stats = compute_stats_for_result(result)
         emit(100.0, f"Completed - {len(closed_trades)} trades found")
         return result
+
+    def _prepare_replay_frames(
+        self, ohlcv_by_symbol: dict[str, pd.DataFrame]
+    ) -> dict[str, pd.DataFrame]:
+        frames: dict[str, pd.DataFrame] = {}
+        for symbol, frame in ohlcv_by_symbol.items():
+            normalized_symbol = str(symbol or "").strip().upper()
+            if not normalized_symbol:
+                continue
+            prepared = self._prepare_ohlcv(frame)
+            if prepared.empty:
+                continue
+            frames[normalized_symbol] = prepared
+        return frames
+
+    @staticmethod
+    def _select_replay_signals(
+        signals: list[ReplaySignal], frames: dict[str, pd.DataFrame]
+    ) -> list[ReplaySignal]:
+        return sorted(
+            [signal for signal in signals if signal.symbol in frames],
+            key=lambda signal: (signal.timestamp, signal.symbol, signal.action),
+        )
+
+    def _build_risk_signal(
+        self,
+        *,
+        effective_signal: ReplaySignal,
+        target_direction: str,
+        fill_price: float,
+        normalized_timeframe: str,
+        open_positions: dict[str, _OpenPosition],
+    ) -> RiskTradeSignal:
+        return RiskTradeSignal(
+            action="buy" if target_direction == "LONG" else "sell",
+            symbol=effective_signal.symbol,
+            entry_price=fill_price,
+            stop_loss=effective_signal.stop_loss,
+            take_profit=effective_signal.take_profit,
+            timeframe=effective_signal.timeframe or normalized_timeframe,
+            metadata={
+                **dict(effective_signal.metadata or {}),
+                "current_positions": len(open_positions),
+            },
+        )
+
+    def _size_and_open_position(
+        self,
+        *,
+        effective_signal: ReplaySignal,
+        target_direction: str,
+        fill_index: int,
+        fill_price: float,
+        fill_time: pd.Timestamp,
+        normalized_timeframe: str,
+        realized_pnl: float,
+        open_positions: dict[str, _OpenPosition],
+    ) -> _OpenPosition | None:
+        """Size the trade against the current balance; None when the size is rejected."""
+        account_balance = max(self.initial_capital + realized_pnl, 1.0)
+        risk_signal = self._build_risk_signal(
+            effective_signal=effective_signal,
+            target_direction=target_direction,
+            fill_price=fill_price,
+            normalized_timeframe=normalized_timeframe,
+            open_positions=open_positions,
+        )
+        sized = self.risk_engine.calculate_position_size(
+            signal=risk_signal,
+            account_balance=account_balance,
+            pip_value=1.0,
+            current_exposure=self._current_exposure(open_positions, account_balance),
+        )
+        quantity = float(sized.position_size)
+        if quantity <= 0:
+            return None
+
+        return _OpenPosition(
+            symbol=effective_signal.symbol,
+            direction=target_direction,
+            entry_time=fill_time,
+            entry_bar_index=fill_index,
+            entry_price=fill_price,
+            signal_entry_price=float(effective_signal.entry_price),
+            quantity=quantity,
+            stop_loss=risk_signal.stop_loss,
+            take_profit=risk_signal.take_profit,
+            initial_stop_loss=risk_signal.stop_loss,
+            initial_take_profit=risk_signal.take_profit,
+            risk_amount=float(sized.risk_amount),
+            risk_percent=float(sized.risk_percent),
+            timeframe=risk_signal.timeframe,
+            source=effective_signal.source,
+            signal_time=effective_signal.timestamp,
+            signal_metadata=dict(effective_signal.metadata),
+            last_checked_at=fill_time,
+        )
+
+    @staticmethod
+    def _collect_signal_sources(replay_signals: list[ReplaySignal]) -> list[str]:
+        return sorted(
+            {
+                str(signal.source or "internal").lower()
+                for signal in replay_signals
+                if str(signal.source or "").strip()
+            }
+        )
+
+
+_REPLAY_PROGRESS_MESSAGE = "Replaying signals..."
 
 
 class SignalReplayEngine:
@@ -765,7 +860,7 @@ class SignalReplayEngine:
         for path in matches:
             try:
                 frame = pd.read_parquet(path)
-            except (ValueError, FileNotFoundError, OSError):
+            except (ValueError, OSError):
                 continue
             frame.columns = [str(column).lower() for column in frame.columns]
             if "timestamp" not in frame.columns:

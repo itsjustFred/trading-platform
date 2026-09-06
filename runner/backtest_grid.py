@@ -359,7 +359,7 @@ def _init_cell_result(request: CellRequest) -> dict[str, Any]:
             result.update(read_backtest_stats(path))
             result.update({"status": "skipped_existing", "finished_at": datetime.now(timezone.utc).isoformat()})
             return result
-        except (json.JSONDecodeError, ValidationError, OSError, ValueError) as exc:
+        except (ValidationError, OSError, ValueError) as exc:
             result.update({"status": "failed", "error": f"existing output is invalid: {exc}"})
             return result
 
