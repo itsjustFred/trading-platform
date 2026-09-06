@@ -93,6 +93,33 @@ def test_copilot_cli_provider_empty_output(monkeypatch):
         provider.generate(prompt="hello")
 
 
+def test_copilot_cli_provider_output_failure_records_error_metadata(monkeypatch):
+    """An output-extraction failure must land in the metadata, not stay "running".
+
+    _extract_output runs inside the generate() try block, so its
+    CliInvocationError goes through the same translation path as _run_cli
+    failures: status "error" plus the error message on the metadata dict.
+    """
+    provider = CopilotCLIProvider(executable="copilot", timeout_seconds=5)
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args=["copilot"],
+            returncode=0,
+            stdout="",
+            stderr="",
+        ),
+    )
+    metadata: dict[str, object] = {}
+
+    with pytest.raises(RuntimeError, match="empty response"):
+        provider.generate(prompt="hello", metadata=metadata)
+
+    assert metadata["status"] == "error"
+    assert "empty response" in str(metadata["error"])
+    assert isinstance(metadata["duration_seconds"], float)
+
+
 def test_copilot_sdk_provider_missing_sdk(monkeypatch):
     provider = CopilotSDKProvider(timeout_seconds=5)
 

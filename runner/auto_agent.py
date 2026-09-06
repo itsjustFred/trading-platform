@@ -16,6 +16,10 @@ Companion modules:
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import os
+import shutil
+import subprocess
+from pathlib import Path
 from typing import Any
 
 from runner.agent_backtest_target import (
@@ -51,6 +55,8 @@ from runner.agent_response_parsing import (
     slugify as _slugify,
 )
 from runner.agent_response_parsing import normalize_strategy_meta as _normalize_strategy_meta
+from runner.approval_gate import StrategyNotApprovedError, approval_path_for, require_approval
+from runner.codegen_safety import screen_strategy_source
 from runner.llm_providers import (
     DEFAULT_LLM_PROVIDER_NAME,
     SUPPORTED_LLM_PROVIDER_NAMES,
@@ -92,6 +98,27 @@ def _step_two_developer_prompt() -> str:
 def _step_three_developer_prompt(*, system_prompt: str, engine: str) -> str:
     return _step_three_developer_prompt_impl(system_prompt=system_prompt, engine=engine)
 
+
+
+BACKTEST_ENV_ALLOWLIST = (
+    "PATH",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "TZ",
+    "PYTHONUNBUFFERED",
+    "PYTHONPATH",
+    "PYTHONHASHSEED",
+    "VIRTUAL_ENV",
+    "TMPDIR",
+    "DATA_DIR",
+    "LOG_DIR",
+)
+BACKTEST_ENV_ALWAYS_SET = {"PYTHONUNBUFFERED": "1"}
+
+# Wall-clock bound for the generated-strategy backtest child. Generated code is
+# untrusted: without a timeout a hanging strategy wedges the worker thread.
+BACKTEST_TIMEOUT_SECONDS = 1800
 
 
 def run_auto_agent(
@@ -170,6 +197,13 @@ def run_auto_agent(
     markdown_doc = _normalize_markdown_doc(markdown_response, strategy_name=strategy_name)
     resolved_name = _resolve_strategy_name(markdown_doc, requested_name=strategy_name)
     engine = _extract_engine(markdown_doc, requested_engine=requested_engine)
+    strategy_dir_check = STRATEGIES_DIR / resolved_name
+    if strategy_dir_check.exists():
+        raise ValueError(
+            f"Strategy slug '{resolved_name}' already exists under {STRATEGIES_DIR}. "
+            "Auto-agent conversion refuses to overwrite an existing strategy; "
+            "choose another name."
+        )
     artifacts = build_strategy_artifacts(
         resolved_name=resolved_name,
         engine=engine,
@@ -231,6 +265,27 @@ def run_auto_agent(
         )
         python_body = _extract_python_response(python_response)
         python_code = _assemble_strategy_module(meta_source, python_body)
+
+        screening = screen_strategy_source(python_code)
+        if not screening.allowed:
+            for finding in screening.findings:
+                _log(
+                    log,
+                    f"Screening finding (line {finding.line}): {finding.message}",
+                    level="error",
+                )
+            last_error = (
+                "Generated code failed safety screening before execution: "
+                + "; ".join(screening.messages)
+            )
+            _log(log, f"Iteration {attempt} failed: {last_error}", level="error")
+            if attempt >= max_iterations:
+                import shutil as _shutil
+                _shutil.rmtree(artifacts.strategy_dir, ignore_errors=True)
+                _log(log, f"Removed failed generated strategy artifacts: {artifacts.strategy_path}")
+            continue
+
+        artifacts.strategy_path.parent.mkdir(parents=True, exist_ok=True)
         artifacts.strategy_path.write_text(python_code.rstrip() + "\n", encoding="utf-8")
         _log(log, f"Wrote strategy file: {artifacts.strategy_path}")
         if attempt == 1:
@@ -264,8 +319,51 @@ def run_auto_agent(
 
         last_error = combined_output or "Backtest failed without output."
         _log(log, f"Iteration {attempt} failed: {last_error}", level="error")
+        _discard_failed_attempt(
+            attempt=attempt,
+            max_attempts=max_iterations,
+            last_error=last_error,
+            artifacts=artifacts,
+            log=log,
+        )
 
     raise RuntimeError(f"Auto-agent failed after {max_iterations} iterations: {last_error}")
+
+
+def _discard_failed_attempt(
+    *,
+    attempt: int,
+    max_attempts: int,
+    last_error: str,
+    artifacts: StrategyArtifacts,
+    log: TaskLogger | None = None,
+) -> None:
+    """Log one failed generation attempt and remove its strategy artifacts.
+
+    Intermediate attempts keep the slug directory and its README: the next
+    attempt reuses ``artifacts.documentation_path`` for its documentation and
+    writes its strategy file back into the same directory. Only after the last
+    attempt has failed is the whole slug directory removed — no broken file
+    stays registry-runnable and no leftover blocks a later retry of the slug.
+    """
+    _log(log, f"Iteration {attempt} failed: {last_error}", level="error")
+    strategy_path = artifacts.strategy_path
+    try:
+        strategy_path.unlink(missing_ok=True)
+        approval_path_for(strategy_path).unlink(missing_ok=True)
+        if attempt >= max_attempts:
+            # The generated strategy no longer exists, so the slug directory
+            # (README included) goes too — otherwise the leftovers would both
+            # surface a non-runnable strategy and block a later retry.
+            shutil.rmtree(artifacts.strategy_dir, ignore_errors=True)
+        _log(log, f"Removed failed generated strategy artifacts: {strategy_path}")
+    except OSError as exc:
+        _log(
+            log,
+            f"Could not remove failed generated strategy artifacts {strategy_path}: {exc}",
+            level="error",
+        )
+
 
 
 def _load_system_prompt() -> str:
@@ -326,13 +424,98 @@ def _resolve_strategy_name(markdown_doc: str, *, requested_name: str | None) -> 
     return _slugify(f"auto_strategy_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}")
 
 
-def _run_backtest(cmd: list[str], *, log: TaskLogger | None) -> tuple[int, str]:
-    """Indirection kept so tests (and callers) can stub backtest execution.
+def run_validated_backtest(
+    strategy_path: Path | str,
+    *,
+    engine: str,
+    target: BacktestTarget,
+    output_path: Path,
+    capital: float = DEFAULT_CAPITAL,
+    log: TaskLogger | None = None,
+) -> tuple[int, str]:
+    """Run the backtest for an already-generated strategy behind the review gate.
 
-    Runs in ``PROJECT_ROOT`` (this module's global — the single patch seam);
-    see pre-mortem PM-1 for why the root must not be re-derived elsewhere.
+    LLM-generated strategy code requires a human review gate before the first
+    run (Decision Record 2026-08-31). The approval is bound to the file's
+    SHA256 hash; if the file changed after approval, the gate refuses to run.
     """
-    return _run_backtest_impl(cmd, log=log, project_root=PROJECT_ROOT)
+    path = Path(strategy_path)
+    try:
+        require_approval(path, strategies_root=STRATEGIES_DIR)
+    except StrategyNotApprovedError as exc:
+        # Only add the how-to-approve action; the gate's own message already
+        # carries the why (SHA256-bound approval missing/voided).
+        raise StrategyNotApprovedError(
+            f"{exc} Approve '{path}' via runner.approval_gate.approve_strategy()."
+        ) from exc
+
+    cmd = build_backtest_command(
+        strategy_path=path,
+        engine=engine,
+        target=target,
+        output_path=output_path,
+        capital=capital,
+        default_risk_pct=DEFAULT_RISK_PCT,
+        project_root=PROJECT_ROOT,
+    )
+    return _run_backtest(cmd, log=log)
+
+
+def build_backtest_child_env() -> dict[str, str]:
+    """Build the child environment for generated-strategy backtests.
+
+    The full parent environment is never forwarded: it routinely contains API
+    keys and tokens (NIM_API_KEY, GITHUB_TOKEN, ...). Only allowlisted,
+    non-secret variables plus the values in ``BACKTEST_ENV_ALWAYS_SET`` are
+    inherited.
+    """
+    env = {key: value for key, value in os.environ.items() if key in set(BACKTEST_ENV_ALLOWLIST)}
+    env.update(BACKTEST_ENV_ALWAYS_SET)
+    return env
+
+
+def _kill_process(proc: subprocess.Popen, *, timeout: int = 30) -> None:
+    """Kill a child process and reap it, tolerating a stubborn exit."""
+    proc.kill()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:  # pragma: no cover - defensive
+        pass
+
+
+def _run_backtest(cmd: list[str], *, log: TaskLogger | None) -> tuple[int, str]:
+    env = build_backtest_child_env()
+    _log(log, "Launching backtest command: " + " ".join(cmd))
+
+    # The wall-clock bound must cover the whole child lifetime, including the
+    # output streaming: a generated strategy that hangs while holding the pipe
+    # open would otherwise block the read loop forever and wedge the worker
+    # thread. communicate() enforces the timeout across streaming and reaping.
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        cwd=str(PROJECT_ROOT),
+        env=env,
+        text=True,
+        bufsize=1,
+    )
+    try:
+        proc_output, _ = proc.communicate(timeout=BACKTEST_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        _kill_process(proc)
+        raise RuntimeError(
+            f"Generated-strategy backtest timed out after "
+            f"{BACKTEST_TIMEOUT_SECONDS} seconds: {' '.join(cmd)}"
+        ) from None
+    finally:
+        if proc.poll() is None:
+            _kill_process(proc)
+
+    output_lines = proc_output.splitlines(keepends=True) if proc_output else []
+    for line in output_lines:
+        _log(log, line.rstrip("\n"), stream="stdout")
+    return proc.returncode, "".join(output_lines)
 
 
 def _kill(proc: subprocess.Popen) -> None:

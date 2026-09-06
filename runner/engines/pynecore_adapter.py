@@ -23,6 +23,7 @@ from typing import Any
 
 import pandas as pd
 
+from runner.codegen_safety import BANNED_CALL_NAMES, import_root
 from runner.engines import contract
 from runner.engines.base import (
     BacktestConfig,
@@ -393,7 +394,13 @@ def _load_strategy_helper_namespace(strategy_path: Path, source: str) -> dict[st
 
     helper_path = strategy_path.with_name(f"{strategy_path.stem}_context.py")
     if helper_path.exists():
-        namespace.update(_compile_helper_namespace(helper_path, helper_path.read_text()))
+        namespace.update(
+            _compile_helper_namespace(
+                helper_path,
+                helper_path.read_text(),
+                strict_structure=True,
+            )
+        )
 
     source_namespace = _compile_helper_namespace(
         strategy_path,
@@ -404,23 +411,118 @@ def _load_strategy_helper_namespace(strategy_path: Path, source: str) -> dict[st
     return namespace
 
 
+# Trust boundary for helper code executed in-process by the runner (see
+# _compile_helper_namespace): this import whitelist is the real gate — every
+# entry transitively widens what helper code can reach. The banned-call list
+# below is only a second fence, not a sandbox. Additions here need a
+# security-review and a test in tests/test_pynecore_helper_containment.py.
+# "__future__" is the compiler-flag pseudo-module (inert at runtime, no
+# attribute surface) so helper code may opt into postponed annotations.
+HELPER_ALLOWED_IMPORT_ROOTS = frozenset(
+    {
+        "__future__",
+        "pandas",
+        "numpy",
+        "math",
+        "statistics",
+        "decimal",
+        "datetime",
+        "typing",
+        "collections",
+        "itertools",
+        "functools",
+        "dataclasses",
+    }
+)
+
+HELPER_ALLOWED_FUNCTION_NAMES = frozenset({"build_trade_context", "build_drawings"})
+
+# Shared with runner.codegen_safety (single source of truth, pinned by test).
+HELPER_BANNED_CALL_NAMES = BANNED_CALL_NAMES
+
+
+def _reject_helper_import(node: ast.Import | ast.ImportFrom, source_path: Path) -> None:
+    # Check EVERY alias: `import numpy, os` must not slip through on numpy's
+    # root alone (import_root only returns the first alias for ast.Import).
+    if isinstance(node, ast.Import):
+        roots = [alias.name.split(".")[0] for alias in node.names]
+    else:
+        roots = [import_root(node)]
+    for root in roots:
+        if root not in HELPER_ALLOWED_IMPORT_ROOTS:
+            raise RuntimeError(
+                f"Import '{root}' is not allowed in strategy helper code "
+                f"({source_path.name}). Allowed: "
+                + ", ".join(sorted(HELPER_ALLOWED_IMPORT_ROOTS))
+            )
+
+
+def _reject_helper_call(node: ast.Call, source_path: Path) -> None:
+    func = node.func
+    if not isinstance(func, ast.Name) or func.id not in HELPER_BANNED_CALL_NAMES:
+        return
+    raise RuntimeError(
+        f"Call to '{func.id}()' is not allowed in strategy helper code ({source_path.name})."
+    )
+
+
+def _reject_dunder_attribute(node: ast.Attribute, source_path: Path) -> None:
+    if node.attr.startswith("__") and node.attr.endswith("__"):
+        raise RuntimeError(
+            f"Dunder attribute access '{node.attr}' is not allowed in "
+            f"strategy helper code ({source_path.name})."
+        )
+
+
+def _screen_helper_node(node: ast.AST, source_path: Path) -> None:
+    """Apply every helper screening rule to one AST node."""
+    if isinstance(node, (ast.Import, ast.ImportFrom)):
+        _reject_helper_import(node, source_path)
+    elif isinstance(node, ast.Call):
+        _reject_helper_call(node, source_path)
+    elif isinstance(node, ast.Attribute):
+        _reject_dunder_attribute(node, source_path)
+
+
+def _helper_screen_nodes(nodes: list[ast.stmt], source_path: Path) -> None:
+    """Reject helper constructs the runner process must not execute."""
+    for node in nodes:
+        for inner in ast.walk(node):
+            _screen_helper_node(inner, source_path)
+
+
 def _compile_helper_namespace(
     source_path: Path,
     source: str,
     *,
     function_names: set[str] | None = None,
+    strict_structure: bool = False,
 ) -> dict[str, Any]:
     tree = ast.parse(source, filename=str(source_path))
     helper_nodes: list[ast.stmt] = []
     allowed_names = function_names or {"build_trade_context", "build_drawings"}
-    for node in tree.body:
+    for position, node in enumerate(tree.body):
         if isinstance(node, (ast.Import, ast.ImportFrom)):
             helper_nodes.append(node)
         elif isinstance(node, ast.FunctionDef) and node.name in allowed_names:
             helper_nodes.append(node)
+        elif strict_structure and not (
+            position == 0
+            and isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Constant)
+        ):
+            # A leading string constant is the module docstring — inert, so it
+            # is dropped from the compiled module but does not fail the screen.
+            raise RuntimeError(
+                f"Only imports and helper functions ({', '.join(sorted(allowed_names))}) "
+                f"are allowed in strategy helper code ({source_path.name}); found "
+                f"{type(node).__name__} at line {getattr(node, 'lineno', 0)}."
+            )
 
     if not helper_nodes:
         return {}
+
+    _helper_screen_nodes(helper_nodes, source_path)
 
     helper_module = ast.Module(body=helper_nodes, type_ignores=[])
     ast.fix_missing_locations(helper_module)

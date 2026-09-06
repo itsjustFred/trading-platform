@@ -1,16 +1,33 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import time
 from importlib import import_module
 from threading import Event, Thread
 from typing import Any
 
+logger = logging.getLogger(__name__)
+
 AUTH_SESSION_ERROR = (
     "copilot_sdk provider is configured but no valid Copilot SDK auth/session is available"
 )
 DEFAULT_COPILOT_SDK_MODEL = "gpt-5-mini"
+
+# Deliberate trust posture (F27, Decision Record 2026-08-31): the Copilot SDK
+# session installs PermissionHandler.approve_all, which grants every requested
+# tool permission without prompting. This provider only asks the model for
+# *generated strategy code* — no repository writes, no shell access — and the
+# returned text is screened (runner.codegen_safety) and gated behind a
+# SHA256-bound human review (runner.approval_gate) before it can ever run. If
+# this provider is ever reused for agentic coding tasks, approve_all must be
+# replaced with a real permission handler.
+PERMISSION_POSTURE_NOTE = (
+    "PermissionHandler.approve_all is deliberate: this provider only solicits "
+    "generated strategy code (never executed unscreened), so every tool "
+    "permission is auto-approved for the duration of the session."
+)
 MODEL_ALIASES: dict[str, str] = {
     "gpt-5": "gpt-5.2",
     "gpt-5.3-codex": "gpt-5-codex",
@@ -301,6 +318,8 @@ class CopilotSDKProvider:
             permission_handler = getattr(PermissionHandler, "approve_all", None)
             if permission_handler is None:
                 raise RuntimeError("Copilot SDK PermissionHandler.approve_all is not available.")
+            # Documented trust posture — see PERMISSION_POSTURE_NOTE (F27).
+            logger.debug("copilot_sdk permission posture: %s", PERMISSION_POSTURE_NOTE)
 
             session = await client.create_session(
                 on_permission_request=permission_handler,

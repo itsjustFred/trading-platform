@@ -68,6 +68,7 @@ class TradeEngine:
         configured_risk_pct = float(self.config.risk_per_trade_pct or 0.0)
         self._risk_enabled = configured_risk_pct > 0
         max_total_exposure = float(self.config.max_position_pct or 0.05)
+        max_leverage = float(self.config.max_leverage or 1.0)
         # Risk-policy provenance (Cleanup 16-D1, F22): the engine-level risk
         # policy is engine configuration only. It is intentionally NOT read
         # from ``config.parameters`` — strategy parameters must not silently
