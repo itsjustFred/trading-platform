@@ -46,5 +46,5 @@ export function resolveExitChartTime(
  */
 export function parameterFieldId(name: string): string {
   const slug = name.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-");
-  return `optimize-param-${slug.replace(/^-+|-+$/g, "") || "unnamed"}`;
+  return `optimize-param-${slug.replace(/^-+/, "").replace(/-+$/, "") || "unnamed"}`;
 }
