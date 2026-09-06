@@ -321,7 +321,8 @@ def run_auto_agent(
         _log(log, f"Iteration {attempt} failed: {last_error}", level="error")
         _discard_failed_attempt(
             attempt=attempt,
-            max_iterations=max_iterations,
+            max_attempts=max_iterations,
+            last_error=last_error,
             artifacts=artifacts,
             log=log,
         )
@@ -332,31 +333,37 @@ def run_auto_agent(
 def _discard_failed_attempt(
     *,
     attempt: int,
-    max_iterations: int,
-    artifacts: "StrategyArtifacts",
-    log: "TaskLogger | None" = None,
+    max_attempts: int,
+    last_error: str,
+    artifacts: StrategyArtifacts,
+    log: TaskLogger | None = None,
 ) -> None:
-    """Remove one failed generation attempt's artifacts.
+    """Log one failed generation attempt and remove its strategy artifacts.
 
     Intermediate attempts keep the slug directory and its README: the next
-    attempt reuses them. Only after the last attempt has failed is the whole
-    slug directory removed — no broken file stays registry-runnable and no
-    leftover blocks a later retry of the slug. The SHA256-bound approval (if
-    any) is removed together with the file so a stale approval can never
-    cover new code.
+    attempt reuses ``artifacts.documentation_path`` for its documentation and
+    writes its strategy file back into the same directory. Only after the last
+    attempt has failed is the whole slug directory removed — no broken file
+    stays registry-runnable and no leftover blocks a later retry of the slug.
     """
+    _log(log, f"Iteration {attempt} failed: {last_error}", level="error")
     strategy_path = artifacts.strategy_path
     try:
         strategy_path.unlink(missing_ok=True)
         approval_path_for(strategy_path).unlink(missing_ok=True)
-        # Main contract: the slug directory (README included) stays — only the
-        # unreviewed file (and its stale approval) is removed, so the failed
-        # attempt remains visible for debugging and cannot silently block a
-        # later retry of the same slug.
-
+        if attempt >= max_attempts:
+            # The generated strategy no longer exists, so the slug directory
+            # (README included) goes too — otherwise the leftovers would both
+            # surface a non-runnable strategy and block a later retry.
+            shutil.rmtree(artifacts.strategy_dir, ignore_errors=True)
         _log(log, f"Removed failed generated strategy artifacts: {strategy_path}")
     except OSError as exc:
-        _log(log, f"Could not remove failed strategy artifacts {strategy_path}: {exc}")
+        _log(
+            log,
+            f"Could not remove failed generated strategy artifacts {strategy_path}: {exc}",
+            level="error",
+        )
+
 
 
 def _load_system_prompt() -> str:

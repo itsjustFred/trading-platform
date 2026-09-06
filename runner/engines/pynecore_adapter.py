@@ -23,6 +23,7 @@ from typing import Any
 
 import pandas as pd
 
+from runner.codegen_safety import BANNED_CALL_NAMES, import_root
 from runner.engines import contract
 from runner.engines.base import (
     BacktestConfig,
