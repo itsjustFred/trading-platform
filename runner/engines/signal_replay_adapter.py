@@ -591,7 +591,7 @@ class SignalReplayAdapter:
                 emit(10.0 + ((index / total_signals) * 80.0), _REPLAY_PROGRESS_MESSAGE)
                 continue
 
-            open_positions[signal.symbol] = _OpenPosition(
+            opened = _OpenPosition(
                 symbol=effective_signal.symbol,
                 direction=target_direction,
                 entry_time=fill_time,

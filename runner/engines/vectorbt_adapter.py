@@ -18,6 +18,7 @@ import logging
 import os
 import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, TypedDict
