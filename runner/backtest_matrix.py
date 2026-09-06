@@ -39,6 +39,7 @@ from runner.backtest_grid import (
     parse_params,
     run_backtest_grid,
 )
+from runner.engines.base import resolve_legacy_max_position_kwarg
 from shared.constants import DATA_DIR
 from shared.database import save_grid_result
 from shared.logging import get_logger
@@ -242,7 +243,7 @@ def _run_strategy_matrix_cell(
     engine: str,
     capital: float,
     risk_pct: float | None,
-    max_position_pct: float | None,
+    max_position_exposure_pct: float | None,
     max_leverage: float | None,
     intrabar_resolution: str,
     params: dict[str, Any],
@@ -268,7 +269,7 @@ def _run_strategy_matrix_cell(
         engine=strategy_engine,
         capital=capital,
         risk_pct=risk_pct,
-        max_position_pct=max_position_pct,
+        max_position_exposure_pct=max_position_exposure_pct,
         max_leverage=max_leverage,
         intrabar_resolution=intrabar_resolution,
         params=params,
@@ -413,7 +414,7 @@ def run_backtest_matrix(
     engine: str = "",
     capital: float = 100_000.0,
     risk_pct: float | None = 0.01,
-    max_position_pct: float | None = None,
+    max_position_exposure_pct: float | None = None,
     max_leverage: float | None = None,
     intrabar_resolution: str = "open_close",
     params: dict[str, Any] | None = None,
@@ -427,8 +428,21 @@ def run_backtest_matrix(
     save_sqlite: bool = True,
     keep_indicators: bool = False,
     strategies_dir: Path = Path("strategies"),
+    max_position_pct: float | None = None,
 ) -> dict[str, Any]:
-    """Run every selected strategy over the symbol/timeframe grid."""
+    """Run every selected strategy over the symbol/timeframe grid.
+
+    Sizing semantics (Cleanup 16-E): ``risk_pct`` is the maximum loss per
+    trade; ``max_position_exposure_pct`` caps the notional of ONE position as
+    a fraction of equity. ``max_position_pct`` is a deprecated alias of
+    ``max_position_exposure_pct``.
+    """
+    max_position_exposure_pct = resolve_legacy_max_position_kwarg(
+        max_position_exposure_pct,
+        max_position_pct,
+        caller="run_backtest_matrix",
+    )
+
     output_dir = output_dir or MATRIX_OUTPUT_DIR
     output_dir.mkdir(parents=True, exist_ok=True)
     normalized_symbols = [normalize_symbol(symbol) for symbol in (symbols or GRID_SYMBOLS)]
@@ -488,7 +502,7 @@ def run_backtest_matrix(
             "engine": engine,
             "capital": capital,
             "risk_pct": risk_pct,
-            "max_position_pct": max_position_pct,
+            "max_position_exposure_pct": max_position_exposure_pct,
             "max_leverage": max_leverage,
             "intrabar_resolution": intrabar_resolution,
             "params": params,
@@ -577,7 +591,7 @@ def run_backtest_matrix(
         "engine": engine or "auto",
         "capital": capital,
         "risk_pct": risk_pct,
-        "max_position_pct": max_position_pct,
+        "max_position_exposure_pct": max_position_exposure_pct,
         "max_leverage": max_leverage,
         "intrabar_resolution": intrabar_resolution,
         "params": params,
@@ -628,7 +642,26 @@ def main() -> None:
     )
     parser.add_argument("--capital", type=float, default=100_000.0, help="Initial capital")
     parser.add_argument("--risk-pct", type=float, default=0.01, help="Risk per trade, e.g. 0.01")
-    parser.add_argument("--max-position-pct", type=float, default=None)
+    # Sizing flags (Cleanup 16-E semantics): the canonical
+    # --max-position-exposure-pct plus its deprecated alias
+    # --max-position-pct. Both spellings map onto the canonical
+    # max_position_exposure_pct keyword inside run_backtest_matrix(); the
+    # alias emits a DeprecationWarning there, and passing both spellings is
+    # rejected.
+    parser.add_argument(
+        "--max-position-exposure-pct",
+        dest="max_position_exposure_pct",
+        type=float,
+        default=None,
+        help="Max notional of ONE position / equity (e.g. 1.0 = 100%%)",
+    )
+    parser.add_argument(
+        "--max-position-pct",
+        dest="legacy_max_position_pct",
+        type=float,
+        default=None,
+        help="Deprecated alias of --max-position-exposure-pct",
+    )
     parser.add_argument("--max-leverage", type=float, default=None)
     parser.add_argument("--intrabar-resolution", default="open_close")
     parser.add_argument("--params", default="", help="Strategy params JSON")
@@ -664,7 +697,11 @@ def main() -> None:
         engine=args.engine,
         capital=args.capital,
         risk_pct=args.risk_pct,
-        max_position_pct=args.max_position_pct,
+        # The alias flag stores under legacy_max_position_pct and is folded
+        # onto the canonical keyword by run_backtest_matrix()'s shared
+        # resolver (DeprecationWarning + rejection of a double spelling).
+        max_position_exposure_pct=args.max_position_exposure_pct,
+        max_position_pct=getattr(args, "legacy_max_position_pct", None),
         max_leverage=args.max_leverage,
         intrabar_resolution=args.intrabar_resolution,
         params=parse_params(args.params),

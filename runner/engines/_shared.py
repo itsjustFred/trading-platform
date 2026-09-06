@@ -46,7 +46,7 @@ def serialize_meta_value(value: Any) -> Any | None:
     return str(value)
 
 
-def resolve_max_position_pct(explicit: float | None, asset_class: str) -> float:
+def resolve_max_position_exposure_pct(explicit: float | None, asset_class: str) -> float:
     """Cap on notional as a fraction of equity; asset-class default 20% (100% equities)."""
     if explicit is not None and explicit > 0:
         return float(explicit)

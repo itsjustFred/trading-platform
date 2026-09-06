@@ -14,7 +14,12 @@ from typing import Any
 import pandas as pd
 
 from runner.daily_equity import attach_daily_equity
-from runner.engines.base import BacktestConfig, EngineAdapter, resolve_strategy_parameters
+from runner.engines.base import (
+    BacktestConfig,
+    EngineAdapter,
+    resolve_legacy_max_position_kwarg,
+    resolve_strategy_parameters,
+)
 from runner.portfolio_optimizer import optimize_portfolio_allocation
 from runner.stats import merge_canonical_stats
 from shared.constants import DATA_DIR, normalize_timeframe
@@ -104,7 +109,7 @@ def _run_fold_backtest(
     end: str,
     capital: float,
     risk_pct: float | None,
-    max_position_pct: float | None,
+    max_position_exposure_pct: float | None,
     max_leverage: float | None,
     modeling_resolution: str,
     data_dir: str,
@@ -118,7 +123,7 @@ def _run_fold_backtest(
         end_date=end,
         initial_capital=capital,
         risk_per_trade_pct=risk_pct,
-        max_position_pct=max_position_pct,
+        max_position_exposure_pct=max_position_exposure_pct,
         max_leverage=max_leverage,
         modeling_resolution=modeling_resolution,
         data_dir=data_dir,
@@ -218,7 +223,7 @@ def run_walkforward(
     test_months: int = 3,
     step_months: int = 1,
     risk_pct: float | None = None,
-    max_position_pct: float | None = None,
+    max_position_exposure_pct: float | None = None,
     max_leverage: float | None = None,
     modeling_resolution: str = "open_close",
     params: dict[str, Any] | None = None,
@@ -226,11 +231,17 @@ def run_walkforward(
     output_dir: str | Path | None = None,
     backtest_ids: list[str] | None = None,
     n_trials: int = 100,
+    max_position_pct: float | None = None,
 ) -> dict[str, Any]:
     """Run generic strategy walk-forward validation.
 
     ``backtest_ids`` keeps backward compatibility for portfolio-allocation walk-forward
     checks. New callers should pass ``strategy``, ``engine`` and market data settings.
+
+    Sizing semantics (Cleanup 16-E): ``risk_pct`` is the maximum loss per trade;
+    ``max_position_exposure_pct`` caps the notional of ONE position as a fraction
+    of equity. ``max_position_pct`` is a deprecated alias of
+    ``max_position_exposure_pct``.
     """
     if backtest_ids and not strategy:
         return _run_portfolio_walkforward(
@@ -253,6 +264,11 @@ def run_walkforward(
         from runner.cli import get_engine
 
         engine = get_engine(engine_name)
+    max_position_exposure_pct = resolve_legacy_max_position_kwarg(
+        max_position_exposure_pct,
+        max_position_pct,
+        caller="run_walkforward",
+    )
     normalized_timeframe = normalize_timeframe(timeframe)
     strategy_name = Path(strategy).stem
     parameters = resolve_strategy_parameters(strategy, params or {})
@@ -266,37 +282,29 @@ def run_walkforward(
 
     folds: list[dict[str, Any]] = []
     for index, window in enumerate(windows, start=1):
+        # One shared kwargs block for both folds of a window: train and test
+        # folds must always receive IDENTICAL sizing/context parameters — a
+        # parameter added here must not silently reach only one of the two
+        # calls (otherwise OOS folds run with different sizing than IS).
+        fold_kwargs = {
+            "engine": engine,
+            "strategy": strategy,
+            "strategy_name": strategy_name,
+            "symbols": symbols,
+            "timeframe": normalized_timeframe,
+            "capital": capital,
+            "risk_pct": risk_pct,
+            "max_position_exposure_pct": max_position_exposure_pct,
+            "max_leverage": max_leverage,
+            "modeling_resolution": modeling_resolution,
+            "data_dir": data_dir,
+            "parameters": parameters,
+        }
         train_stats = _run_fold_backtest(
-            engine=engine,
-            strategy=strategy,
-            strategy_name=strategy_name,
-            symbols=symbols,
-            timeframe=normalized_timeframe,
-            start=window["train_start"],
-            end=window["train_end"],
-            capital=capital,
-            risk_pct=risk_pct,
-            max_position_pct=max_position_pct,
-            max_leverage=max_leverage,
-            modeling_resolution=modeling_resolution,
-            data_dir=data_dir,
-            parameters=parameters,
+            start=window["train_start"], end=window["train_end"], **fold_kwargs
         )
         test_stats = _run_fold_backtest(
-            engine=engine,
-            strategy=strategy,
-            strategy_name=strategy_name,
-            symbols=symbols,
-            timeframe=normalized_timeframe,
-            start=window["test_start"],
-            end=window["test_end"],
-            capital=capital,
-            risk_pct=risk_pct,
-            max_position_pct=max_position_pct,
-            max_leverage=max_leverage,
-            modeling_resolution=modeling_resolution,
-            data_dir=data_dir,
-            parameters=parameters,
+            start=window["test_start"], end=window["test_end"], **fold_kwargs
         )
         folds.append(
             {
@@ -324,7 +332,7 @@ def run_walkforward(
             "test_months": test_months,
             "step_months": step_months,
             "risk_pct": risk_pct,
-            "max_position_pct": max_position_pct,
+            "max_position_exposure_pct": max_position_exposure_pct,
             "max_leverage": max_leverage,
             "modeling_resolution": modeling_resolution,
             "parameters": parameters,

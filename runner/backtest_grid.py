@@ -26,7 +26,7 @@ from pydantic import ValidationError
 
 from data_tools.auto_download import ensure_backtest_data
 from runner.daily_equity import attach_daily_equity
-from runner.engines.base import BacktestConfig, resolve_strategy_parameters
+from runner.engines.base import BacktestConfig, resolve_legacy_max_position_kwarg, resolve_strategy_parameters
 from runner.stats import merge_canonical_stats
 from shared.constants import DATA_DIR, normalize_timeframe
 from shared.database import save_result_to_sqlite
@@ -159,16 +159,24 @@ def build_cli_command(
     engine: str,
     capital: float,
     risk_pct: float | None,
-    max_position_pct: float | None,
-    max_leverage: float | None,
-    intrabar_resolution: str,
-    params: dict[str, Any] | None,
-    output_path: Path,
-    data_dir: str,
+    max_position_exposure_pct: float | None = None,
+    max_position_pct: float | None = None,
+    max_leverage: float | None = None,
+    intrabar_resolution: str = "open_close",
+    params: dict[str, Any] | None = None,
+    output_path: Path | None = None,
+    data_dir: str = "",
     save_sqlite: bool = True,
     keep_indicators: bool = False,
     result_id: str = "",
 ) -> list[str]:
+    folded_max_position_exposure_pct = resolve_legacy_max_position_kwarg(
+        max_position_exposure_pct,
+        max_position_pct,
+        caller="build_cli_command",
+    )
+    if folded_max_position_exposure_pct is not None:
+        max_position_exposure_pct = folded_max_position_exposure_pct
     cmd = [
         sys.executable,
         "-m",
@@ -195,8 +203,8 @@ def build_cli_command(
         cmd.extend(["--end", end])
     if risk_pct is not None:
         cmd.extend(["--risk-pct", str(risk_pct)])
-    if max_position_pct is not None:
-        cmd.extend(["--max-position-pct", str(max_position_pct)])
+    if max_position_exposure_pct is not None:
+        cmd.extend(["--max-position-exposure-pct", str(max_position_exposure_pct)])
     if max_leverage is not None:
         cmd.extend(["--max-leverage", str(max_leverage)])
     if params:
@@ -371,15 +379,16 @@ class CellRequest:
     engine: str
     capital: float
     risk_pct: float | None
-    max_position_pct: float | None
-    max_leverage: float | None
-    intrabar_resolution: str
-    params: dict[str, Any] | None
-    output_dir: Path
-    data_dir: str
+    max_position_exposure_pct: float | None = None
+    max_leverage: float | None = None
+    intrabar_resolution: str = "open_close"
+    params: dict[str, Any] | None = None
+    output_dir: Path | None = None
+    data_dir: str = ""
     skip_existing: bool = False
     save_sqlite: bool = True
     keep_indicators: bool = False
+    max_position_pct: float | None = None
 
 
 def _run_backtest_in_process_body(request: CellRequest) -> dict[str, Any]:
@@ -430,7 +439,7 @@ def _run_backtest_in_process_body(request: CellRequest) -> dict[str, Any]:
         end_date=end_date,
         initial_capital=request.capital,
         risk_per_trade_pct=request.risk_pct,
-        max_position_pct=request.max_position_pct,
+        max_position_exposure_pct=request.max_position_exposure_pct,
         max_leverage=request.max_leverage,
         modeling_resolution=intrabar_resolution or "open_close",
         data_dir=data_dir,
@@ -496,7 +505,7 @@ def run_one_backtest(
     engine: str,
     capital: float,
     risk_pct: float | None,
-    max_position_pct: float | None,
+    max_position_exposure_pct: float | None,
     max_leverage: float | None,
     intrabar_resolution: str,
     params: dict[str, Any] | None,
@@ -520,7 +529,7 @@ def run_one_backtest(
         engine=engine,
         capital=capital,
         risk_pct=risk_pct,
-        max_position_pct=max_position_pct,
+        max_position_exposure_pct=max_position_exposure_pct,
         max_leverage=max_leverage,
         intrabar_resolution=intrabar_resolution,
         params=params,
@@ -552,7 +561,7 @@ def run_one_backtest(
         engine=engine,
         capital=capital,
         risk_pct=risk_pct,
-        max_position_pct=max_position_pct,
+        max_position_exposure_pct=max_position_exposure_pct,
         max_leverage=max_leverage,
         intrabar_resolution=intrabar_resolution,
         params=params,
@@ -639,7 +648,7 @@ def run_backtest_grid(
     engine: str = "vectorbt",
     capital: float = 100_000.0,
     risk_pct: float | None = 0.01,
-    max_position_pct: float | None = None,
+    max_position_exposure_pct: float | None = None,
     max_leverage: float | None = None,
     intrabar_resolution: str = "open_close",
     params: dict[str, Any] | None = None,
@@ -651,8 +660,21 @@ def run_backtest_grid(
     use_subprocess: bool = False,
     save_sqlite: bool = True,
     keep_indicators: bool = False,
+    max_position_pct: float | None = None,
 ) -> dict[str, Any]:
-    """Run one strategy across every symbol/timeframe combination."""
+    """Run one strategy across every symbol/timeframe combination.
+
+    Sizing semantics (Cleanup 16-E): ``risk_pct`` is the maximum loss per
+    trade; ``max_position_exposure_pct`` caps the notional of ONE position as
+    a fraction of equity. ``max_position_pct`` is a deprecated alias of
+    ``max_position_exposure_pct``.
+    """
+    max_position_exposure_pct = resolve_legacy_max_position_kwarg(
+        max_position_exposure_pct,
+        max_position_pct,
+        caller="run_backtest_grid",
+    )
+
     normalized_symbols = [normalize_symbol(symbol) for symbol in (symbols or GRID_SYMBOLS)]
     normalized_timeframes = [normalize_timeframe_value(tf) for tf in (timeframes or GRID_TIMEFRAMES)]
     if not normalized_symbols:
@@ -674,7 +696,7 @@ def run_backtest_grid(
         "engine": engine,
         "capital": capital,
         "risk_pct": risk_pct,
-        "max_position_pct": max_position_pct,
+        "max_position_exposure_pct": max_position_exposure_pct,
         "max_leverage": max_leverage,
         "intrabar_resolution": intrabar_resolution,
         "params": params,
@@ -697,7 +719,7 @@ def run_backtest_grid(
             "engine": engine,
             "capital": capital,
             "risk_pct": risk_pct,
-            "max_position_pct": max_position_pct,
+            "max_position_exposure_pct": max_position_exposure_pct,
             "max_leverage": max_leverage,
             "intrabar_resolution": intrabar_resolution,
             "params": params,
@@ -746,7 +768,25 @@ def main() -> None:
     parser.add_argument("--engine", default="vectorbt", help="Backtest engine")
     parser.add_argument("--capital", type=float, default=100_000.0, help="Initial capital")
     parser.add_argument("--risk-pct", type=float, default=0.01, help="Risk per trade, e.g. 0.01")
-    parser.add_argument("--max-position-pct", type=float, default=None)
+    # Sizing flags (Cleanup 16-E semantics): the canonical
+    # --max-position-exposure-pct plus its deprecated alias
+    # --max-position-pct. Both spellings map onto the canonical
+    # max_position_exposure_pct keyword inside run_backtest_grid(); the alias
+    # emits a DeprecationWarning there, and passing both spellings is rejected.
+    parser.add_argument(
+        "--max-position-exposure-pct",
+        dest="max_position_exposure_pct",
+        type=float,
+        default=None,
+        help="Max notional of ONE position / equity (e.g. 1.0 = 100%%)",
+    )
+    parser.add_argument(
+        "--max-position-pct",
+        dest="legacy_max_position_pct",
+        type=float,
+        default=None,
+        help="Deprecated alias of --max-position-exposure-pct",
+    )
     parser.add_argument("--max-leverage", type=float, default=None)
     parser.add_argument("--intrabar-resolution", default="open_close")
     parser.add_argument("--params", default="", help='Strategy params JSON, e.g. \'{"fast": 10}\'')
@@ -768,7 +808,11 @@ def main() -> None:
         engine=args.engine,
         capital=args.capital,
         risk_pct=args.risk_pct,
-        max_position_pct=args.max_position_pct,
+        # The alias flag stores under legacy_max_position_pct and is folded
+        # onto the canonical keyword by run_backtest_grid()'s shared resolver
+        # (DeprecationWarning + rejection of a double spelling).
+        max_position_exposure_pct=args.max_position_exposure_pct,
+        max_position_pct=getattr(args, "legacy_max_position_pct", None),
         max_leverage=args.max_leverage,
         intrabar_resolution=args.intrabar_resolution,
         params=parse_params(args.params),

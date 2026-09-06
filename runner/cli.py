@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
@@ -212,7 +213,7 @@ def cmd_run(args):
             end_date=end,
             initial_capital=args.capital,
             risk_per_trade_pct=getattr(args, "risk_pct", None),
-            max_position_pct=getattr(args, "max_position_pct", None),
+            max_position_exposure_pct=getattr(args, "max_position_exposure_pct", None),
             max_leverage=getattr(args, "max_leverage", None),
             modeling_resolution=getattr(args, "intrabar_resolution", "open_close") or "open_close",
             data_dir=args.data_dir or "",
@@ -309,7 +310,7 @@ def cmd_walkforward(args):
         test_months=args.test_months,
         step_months=args.step_months,
         risk_pct=args.risk_pct,
-        max_position_pct=args.max_position_pct,
+        max_position_exposure_pct=args.max_position_exposure_pct,
         max_leverage=args.max_leverage,
         modeling_resolution=args.intrabar_resolution,
         params=params,
@@ -330,7 +331,7 @@ def cmd_grid(args):
         engine=args.engine,
         capital=args.capital,
         risk_pct=args.risk_pct,
-        max_position_pct=args.max_position_pct,
+        max_position_exposure_pct=args.max_position_exposure_pct,
         max_leverage=args.max_leverage,
         intrabar_resolution=args.intrabar_resolution,
         params=parse_params(args.params),
@@ -359,7 +360,7 @@ def cmd_matrix(args):
         engine=args.engine or "",
         capital=args.capital,
         risk_pct=args.risk_pct,
-        max_position_pct=args.max_position_pct,
+        max_position_exposure_pct=args.max_position_exposure_pct,
         max_leverage=args.max_leverage,
         intrabar_resolution=args.intrabar_resolution,
         params=parse_params(args.params),
@@ -378,7 +379,87 @@ def cmd_matrix(args):
         raise SystemExit(1)
 
 
+def _add_sizing_flags(parser: argparse.ArgumentParser, *, risk_default: float | None) -> None:
+    """Add the sizing flags shared by all subcommands (Cleanup 16-E semantics).
+
+    - ``--risk-pct`` is the maximum loss per trade (fraction of equity).
+    - ``--max-position-exposure-pct`` caps the notional of ONE position as a
+      fraction of equity (position-size semantics). On the native engine this
+      value is applied as the risk engine's aggregate
+      ``RiskConfig.max_total_exposure`` (documented divergence — F7, see
+      ``docs/sizing-semantics.md``).
+    ``--max-position-pct`` is a deprecated alias of
+    ``--max-position-exposure-pct`` kept so old invocations keep working.
+    """
+    parser.add_argument(
+        "--risk-pct",
+        type=float,
+        default=risk_default,
+        help="Max loss per trade as a fraction of equity (decimal, e.g. 0.01 for 1%%)",
+    )
+    parser.add_argument(
+        "--max-position-exposure-pct",
+        action=_SizingAliasAction,
+        dest="max_position_exposure_pct",
+        type=float,
+        default=None,
+        help=(
+            "Per-position notional cap as a fraction of equity (e.g. 1.0 = 100%%). "
+            "Caps ONE position's exposure — not a leverage grant; "
+            "--max-leverage controls leverage separately."
+        ),
+    )
+    parser.add_argument(
+        "--max-position-pct",
+        action=_SizingAliasAction,
+        dest="max_position_exposure_pct",
+        type=float,
+        default=None,
+        help="Deprecated alias of --max-position-exposure-pct",
+    )
+    parser.add_argument(
+        "--max-leverage",
+        type=float,
+        default=None,
+        help="Max notional / equity allowed with leverage",
+    )
+
+
+class _SizingAliasAction(argparse.Action):
+    """Store the sizing value; warn when the deprecated spelling was used.
+
+    Both ``--max-position-exposure-pct`` and its deprecated alias
+    ``--max-position-pct`` store the same destination, so a conflict between
+    the two spellings is rejected outright.
+    """
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        previous = getattr(namespace, self.dest, None)
+        if previous is not None and values is not None and previous != values:
+            parser.error(
+                f"{option_string} conflicts with an already-provided sizing flag"
+            )
+        if option_string == "--max-position-pct":
+            warnings.warn(
+                "--max-position-pct is deprecated; use --max-position-exposure-pct "
+                "(same per-position notional/equity semantics). The alias will be "
+                "removed in a future release.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        setattr(namespace, self.dest, values)
+
+
 def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
+    args.func(args)
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Backtest Runner")
     subparsers = parser.add_subparsers(dest="command")
 
@@ -396,26 +477,7 @@ def main():
     run_p.add_argument("--start", default="", help="Start date (empty = auto from data)")
     run_p.add_argument("--end", default="", help="End date (empty = auto from data)")
     run_p.add_argument("--capital", type=float, default=100000, help="Initial capital")
-    run_p.add_argument(
-        "--risk-pct", type=float, default=None, help="Risk per trade (decimal, e.g. 0.01 for 1%%)"
-    )
-    run_p.add_argument(
-        "--max-position-pct",
-        type=float,
-        default=None,
-        help=(
-            "Per-position notional cap as a fraction of equity (e.g. 1.0 = 100%%). "
-            "Caps ONE position's exposure — not a leverage grant; "
-            "--max-leverage controls leverage separately. See "
-            "docs/cleanup-16d1-money-path-semantics.md (D10/D12)."
-        ),
-    )
-    run_p.add_argument(
-        "--max-leverage",
-        type=float,
-        default=None,
-        help="Max notional / equity allowed with leverage",
-    )
+    _add_sizing_flags(run_p, risk_default=None)
     run_p.add_argument(
         "--intrabar-resolution",
         default="open_close",
@@ -456,9 +518,7 @@ def main():
     wf_p.add_argument("--test-months", type=int, default=3, help="Out-of-sample test window in months")
     wf_p.add_argument("--step-months", type=int, default=1, help="Rolling step in months")
     wf_p.add_argument("--output-dir", default="", help="Override output directory")
-    wf_p.add_argument("--risk-pct", type=float, default=None, help="Risk per trade")
-    wf_p.add_argument("--max-position-pct", type=float, default=None)
-    wf_p.add_argument("--max-leverage", type=float, default=None)
+    _add_sizing_flags(wf_p, risk_default=None)
     wf_p.add_argument("--intrabar-resolution", default="open_close")
     wf_p.add_argument("--params", default="", help="Strategy params JSON")
     wf_p.add_argument("--data-dir", default="", help="Override data directory")
@@ -473,9 +533,7 @@ def main():
     grid_p.add_argument("--end", default="", help="End date, empty = auto-detect")
     grid_p.add_argument("--engine", default="vectorbt", help="Backtest engine")
     grid_p.add_argument("--capital", type=float, default=100000, help="Initial capital")
-    grid_p.add_argument("--risk-pct", type=float, default=0.01, help="Risk per trade")
-    grid_p.add_argument("--max-position-pct", type=float, default=None)
-    grid_p.add_argument("--max-leverage", type=float, default=None)
+    _add_sizing_flags(grid_p, risk_default=0.01)
     grid_p.add_argument("--intrabar-resolution", default="open_close")
     grid_p.add_argument("--params", default="", help='Strategy params JSON')
     grid_p.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
@@ -498,9 +556,7 @@ def main():
     matrix_p.add_argument("--end", default="", help="End date, empty = auto-detect")
     matrix_p.add_argument("--engine", default="", help="Override engine. Empty uses each strategy's detected engine.")
     matrix_p.add_argument("--capital", type=float, default=100000, help="Initial capital")
-    matrix_p.add_argument("--risk-pct", type=float, default=0.01, help="Risk per trade")
-    matrix_p.add_argument("--max-position-pct", type=float, default=None)
-    matrix_p.add_argument("--max-leverage", type=float, default=None)
+    _add_sizing_flags(matrix_p, risk_default=0.01)
     matrix_p.add_argument("--intrabar-resolution", default="open_close")
     matrix_p.add_argument("--params", default="", help='Strategy params JSON')
     matrix_p.add_argument("--output-dir", type=Path, default=MATRIX_OUTPUT_DIR)
@@ -513,12 +569,7 @@ def main():
     matrix_p.add_argument("--keep-indicators", action="store_true", help="Keep indicator arrays in grid output JSONs")
     matrix_p.set_defaults(func=cmd_matrix)
 
-    args = parser.parse_args()
-    if not args.command:
-        parser.print_help()
-        sys.exit(1)
-
-    args.func(args)
+    return parser
 
 
 if __name__ == "__main__":
