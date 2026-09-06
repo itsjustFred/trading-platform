@@ -26,7 +26,7 @@ from pydantic import ValidationError
 
 from data_tools.auto_download import ensure_backtest_data
 from runner.daily_equity import attach_daily_equity
-from runner.engines.base import BacktestConfig, resolve_strategy_parameters
+from runner.engines.base import BacktestConfig, resolve_legacy_max_position_kwarg, resolve_strategy_parameters
 from runner.stats import merge_canonical_stats
 from shared.constants import DATA_DIR, normalize_timeframe
 from shared.database import save_result_to_sqlite
@@ -159,16 +159,22 @@ def build_cli_command(
     engine: str,
     capital: float,
     risk_pct: float | None,
-    max_position_exposure_pct: float | None,
-    max_leverage: float | None,
-    intrabar_resolution: str,
-    params: dict[str, Any] | None,
-    output_path: Path,
-    data_dir: str,
+    max_position_exposure_pct: float | None = None,
+    max_position_pct: float | None = None,
+    max_leverage: float | None = None,
+    intrabar_resolution: str = "open_close",
+    params: dict[str, Any] | None = None,
+    output_path: Path | None = None,
+    data_dir: str = "",
     save_sqlite: bool = True,
     keep_indicators: bool = False,
     result_id: str = "",
 ) -> list[str]:
+    folded_max_position_exposure_pct = resolve_legacy_max_position_kwarg(
+        max_position_exposure_pct,
+        max_position_pct,
+        caller="build_cli_command",
+    )
     cmd = [
         sys.executable,
         "-m",
@@ -371,15 +377,16 @@ class CellRequest:
     engine: str
     capital: float
     risk_pct: float | None
-    max_position_pct: float | None
-    max_leverage: float | None
-    intrabar_resolution: str
-    params: dict[str, Any] | None
-    output_dir: Path
-    data_dir: str
+    max_position_exposure_pct: float | None = None
+    max_leverage: float | None = None
+    intrabar_resolution: str = "open_close"
+    params: dict[str, Any] | None = None
+    output_dir: Path | None = None
+    data_dir: str = ""
     skip_existing: bool = False
     save_sqlite: bool = True
     keep_indicators: bool = False
+    max_position_pct: float | None = None
 
 
 def _run_backtest_in_process_body(request: CellRequest) -> dict[str, Any]:
@@ -430,7 +437,7 @@ def _run_backtest_in_process_body(request: CellRequest) -> dict[str, Any]:
         end_date=end_date,
         initial_capital=request.capital,
         risk_per_trade_pct=request.risk_pct,
-        max_position_pct=request.max_position_pct,
+        max_position_exposure_pct=request.max_position_exposure_pct,
         max_leverage=request.max_leverage,
         modeling_resolution=intrabar_resolution or "open_close",
         data_dir=data_dir,
@@ -520,7 +527,7 @@ def run_one_backtest(
         engine=engine,
         capital=capital,
         risk_pct=risk_pct,
-        max_position_pct=max_position_pct,
+        max_position_exposure_pct=max_position_exposure_pct,
         max_leverage=max_leverage,
         intrabar_resolution=intrabar_resolution,
         params=params,
@@ -665,7 +672,6 @@ def run_backtest_grid(
         max_position_pct,
         caller="run_backtest_grid",
     )
-    max_position_pct = None  # folded; guard the rest of this entry point
 
     normalized_symbols = [normalize_symbol(symbol) for symbol in (symbols or GRID_SYMBOLS)]
     normalized_timeframes = [normalize_timeframe_value(tf) for tf in (timeframes or GRID_TIMEFRAMES)]

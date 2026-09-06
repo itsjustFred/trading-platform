@@ -1093,6 +1093,18 @@ def _extract_trade_meta(
     return trade_meta
 
 
+def _resolve_max_position_pct(explicit: float | None, asset_class: str) -> float:
+    """Deprecated alias of :func:`_resolve_max_position_exposure_pct` (16-E rename)."""
+    import warnings
+
+    warnings.warn(
+        "_resolve_max_position_pct is deprecated; use _resolve_max_position_exposure_pct",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return _resolve_max_position_exposure_pct(explicit, asset_class)
+
+
 def _serialize_meta_value(value: Any) -> Any | None:
     """Deprecated shim: use runner.engines._shared.serialize_meta_value."""
     return _shared_serialize_meta_value(value)

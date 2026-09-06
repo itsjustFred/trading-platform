@@ -403,7 +403,11 @@ def _add_sizing_flags(parser: argparse.ArgumentParser, *, risk_default: float | 
         dest="max_position_exposure_pct",
         type=float,
         default=None,
-        help="Max notional of ONE position / equity (e.g. 1.0 = 100%%)",
+        help=(
+            "Per-position notional cap as a fraction of equity (e.g. 1.0 = 100%%). "
+            "Caps ONE position's exposure — not a leverage grant; "
+            "--max-leverage controls leverage separately."
+        ),
     )
     parser.add_argument(
         "--max-position-pct",
@@ -473,26 +477,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--start", default="", help="Start date (empty = auto from data)")
     run_p.add_argument("--end", default="", help="End date (empty = auto from data)")
     run_p.add_argument("--capital", type=float, default=100000, help="Initial capital")
-    run_p.add_argument(
-        "--risk-pct", type=float, default=None, help="Risk per trade (decimal, e.g. 0.01 for 1%%)"
-    )
-    run_p.add_argument(
-        "--max-position-pct",
-        type=float,
-        default=None,
-        help=(
-            "Per-position notional cap as a fraction of equity (e.g. 1.0 = 100%%). "
-            "Caps ONE position's exposure — not a leverage grant; "
-            "--max-leverage controls leverage separately. See "
-            "docs/cleanup-16d1-money-path-semantics.md (D10/D12)."
-        ),
-    )
-    run_p.add_argument(
-        "--max-leverage",
-        type=float,
-        default=None,
-        help="Max notional / equity allowed with leverage",
-    )
+    _add_sizing_flags(run_p, risk_default=None)
     run_p.add_argument(
         "--intrabar-resolution",
         default="open_close",
