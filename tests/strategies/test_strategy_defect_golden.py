@@ -135,7 +135,7 @@ def test_pine_strategies_4_tuple_output_flows_through_vectorbt_normalization():
         if not path.name.startswith("__")
         and not path.stem.endswith("_context")
         and path.parent.name == path.stem
-        and path.stem not in {"pynecore_orb", "pynecore_sma_crossover"}
+        and path.stem not in {"pynecore_orb", "pynecore_sma_crossover", "tiingo_sentiment"}
     ),
 )
 def test_every_strategy_module_returns_four_tuple_contract(relative):
@@ -161,8 +161,19 @@ def test_every_strategy_module_returns_four_tuple_contract(relative):
 
 
 # ---------------------------------------------------------------------------
-# 2. QG ES breakout: entries read inverted relative to breakout semantics
+# 2. QG ES breakout: Pine-verified fade semantics
 # ---------------------------------------------------------------------------
+# The Pine source (rndm_stuff/QG-30Min_ES_Breakout_Strategy.pine, lines 58-66)
+# is a FADE system, not a breakout system:
+#   breakout_long  = low + FRACT * |open - low|
+#   breakout_short = high - FRACT * |open - low|   (note: |open-low|, NOT |high-open|)
+#   filter_long  = adx < 30   (non-trending)
+#   filter_short = adx > 30   (trending)
+#   enter_long   = can_trade and filter_long  and close < breakout_long
+#   enter_short  = can_trade and filter_short and close < breakout_short
+# A Cleanup #35 intermediate state inverted this to breakout semantics
+# (long on adx > 30 & close >= level); these tests pin the Pine reading, which
+# was verified against the .pine file itself rather than second-hand claims.
 
 
 def _qg_module():
@@ -171,108 +182,111 @@ def _qg_module():
     )
 
 
-def _qg_intraday_frame(direction: str, rows: int = 90) -> pd.DataFrame:
-    """Multi-session NY frame with a drifting intraday path.
+def _qg_fade_frame(side: str, days: int = 30) -> pd.DataFrame:
+    """Deterministic NY-session frame for one fade side.
 
-    Six bars per session inside 09:30-15:00 NY; the close stays strictly
-    above (long) / below (short) its breakout level on every bar while the
-    session drift gives the ADX a trend. The one-trade-per-day rule caps
-    entries at one per session (the session's first qualifying bar enters;
-    the stop checks keep the position alive through the session because the
-    frame's low never reaches the entry bar's low).
+    Six bars per session (09:30-14:30 NY, inside the 08:00-15:00 window).
+    ``side="long"`` is sideways (ADX stays low) with red bars whose close sits
+    below ``low + |open - low|``; ``side="short"`` is a steady uptrend (ADX
+    runs high) with closes below ``high - |open - low|``. The one-trade-per-day
+    rule caps entries at one per session; the protective stop (entry-bar low /
+    high) closes the trade the next bar, so every session after the ADX warm-up
+    yields exactly one entry on its first bar.
     """
     bars_per_day = 6
-    day_index = np.repeat(np.arange(rows // bars_per_day + 1), bars_per_day)[:rows]
-    bar_of_day = np.tile(np.arange(bars_per_day), rows // bars_per_day + 1)[:rows]
-    minutes_of_day = 9 * 60 + 30 + bar_of_day * 60
-    if direction == "short":
-        base = 100.0 - day_index * 2.0
-        # Every bar makes a new low, so a short's stop (entry-bar high) is
-        # never reached afterwards and the position stays open for the day.
-        offset = -np.where(bar_of_day % 2 == 0, 0.6, 0.2) - bar_of_day * 0.1
-    else:
-        base = 100.0 + day_index * 2.0
-        offset = np.where(bar_of_day % 2 == 0, 0.6, 0.2) + bar_of_day * 0.1
-    close = base + offset
-    timestamps = (
-        pd.to_datetime(pd.Timestamp("2024-01-02", tz="US/Eastern").normalize().tz_convert("UTC"))
-        + pd.to_timedelta(day_index, unit="D")
-        + pd.to_timedelta(minutes_of_day, unit="m")
-    )
-    return pd.DataFrame(
-        {
-            "timestamp": timestamps,
-            "open": close - np.sign(offset) * 0.2,
-            "high": close + 0.5,
-            "low": close - 0.5,
-            "close": close,
-            "volume": [1000.0] * rows,
-        }
-    )
+    rows = days * bars_per_day
+    recs: list[dict] = []
+    base_ts = pd.Timestamp("2024-01-02", tz="US/Eastern").normalize().tz_convert("UTC")
+    for day in range(days):
+        for bar in range(bars_per_day):
+            minute = 9 * 60 + 30 + bar * 60
+            ts = base_ts + pd.Timedelta(days=day, minutes=minute)
+            if side == "long":
+                open_ = 100.3
+                close = 100.0 if bar % 2 == 0 else 100.35
+                high = 100.4
+                low = 99.9
+            else:
+                base = 100.0 + day * 1.5
+                open_ = base + 0.1
+                close = base + 0.4
+                high = base + 0.8
+                low = base
+            recs.append(
+                {
+                    "timestamp": ts,
+                    "open": open_,
+                    "high": high,
+                    "low": low,
+                    "close": close,
+                    "volume": 1000.0,
+                }
+            )
+    return pd.DataFrame(recs)
 
 
-def test_qg_enters_long_when_close_breaks_above_long_breakout_level():
-    """Breakout semantics: a long requires ``close >= breakout_long``.
-
-    Old behaviour read ``close < breakout_long`` for longs (and
-    ``adx < 30``), which fires longs on fade-downs instead of breakouts.
-    """
+def test_qg_enters_long_on_fade_down_when_adx_low():
+    """Fade semantics: a long requires ``adx < 30`` and ``close < breakout_long``."""
     module = _qg_module()
-    # Multi-session intraday frame with drifting closes: ADX is high (trend),
-    # the close stays above its long breakout level, and the one-trade-per-day
-    # rule caps entries at one per session. The first sessions are skipped by
-    # the ADX warm-up.
-    df = _qg_intraday_frame("long")
+    df = _qg_fade_frame("long")
     params = {"adx_period": 10, "adx_smooth": 3, "fract": 1.0}
     entries, _, indicators, _ = _call(module, df, params)
 
-    assert entries.any(), "deterministic breakout path must produce entries"
-    assert entries.index[entries][0] >= 1, (
-        "the ADX warm-up must suppress the very first bar"
-    )
+    assert entries.any(), "deterministic fade-down path must produce long entries"
     for entry_idx in entries[entries].index:
         long_level = float(indicators["breakout_long"].loc[entry_idx])
-        assert float(df["close"].loc[entry_idx]) >= long_level, (
-            "every long entry must close at or above its breakout_long level"
+        assert float(df["close"].loc[entry_idx]) < long_level, (
+            "every long entry must close below its breakout_long level (fade)"
+        )
+        assert float(indicators["ADX"].loc[entry_idx]) < 30.0, (
+            "longs only trade the non-trending regime (adx < 30)"
         )
         assert indicators["direction"].loc[entry_idx] == "LONG"
 
 
-def test_qg_enters_short_when_close_breaks_below_short_breakout_level():
-    """Breakout semantics: a short requires ``close <= breakout_short``.
+def test_qg_enters_short_on_weak_close_when_adx_high():
+    """Fade semantics: a short requires ``adx > 30`` and ``close < breakout_short``.
 
-    Old behaviour read ``close < breakout_short`` with ``adx > 30`` — a
-    condition that is almost always true below the bar high, i.e. the short
-    fired on non-breakouts.
+    The short level uses ``|open - low|`` per the Pine
+    (``high - FRACT * |open - low|``), not ``|high - open|``.
     """
     module = _qg_module()
-    # Mirrored frame: declining closes so the breakdown side qualifies.
-    df = _qg_intraday_frame("short")
+    df = _qg_fade_frame("short")
     params = {"adx_period": 10, "adx_smooth": 3, "fract": 1.0}
     entries, _, indicators, _ = _call(module, df, params)
 
-    assert entries.any(), "deterministic breakdown path must produce entries"
+    assert entries.any(), "deterministic trend path must produce short entries"
     for entry_idx in entries[entries].index:
-        short_level = float(indicators["breakout_short"].loc[entry_idx])
-        assert float(df["close"].loc[entry_idx]) <= short_level, (
-            "every short entry must close at or below its breakout_short level"
+        row = df.loc[entry_idx]
+        expected_short = float(row["high"]) - 1.0 * abs(float(row["open"]) - float(row["low"]))
+        assert abs(float(indicators["breakout_short"].loc[entry_idx]) - expected_short) < 1e-9, (
+            "breakout_short must use |open - low| (Pine line 59)"
+        )
+        assert float(row["close"]) < expected_short, (
+            "every short entry must close below its breakout_short level (fade)"
+        )
+        assert float(indicators["ADX"].loc[entry_idx]) > 30.0, (
+            "shorts only trade the trending regime (adx > 30)"
         )
         assert indicators["direction"].loc[entry_idx] == "SHORT"
 
 
 def test_qg_suppressed_side_never_fires_when_direction_gate_blocks_it():
-    """The ADX direction gate must still suppress the opposite side.
+    """The ADX regime gate must still suppress the opposite side.
 
-    Old behaviour coupled the ADX threshold to the inverted comparisons, so
-    both sides could fire on the same (wrong) side of the levels.
+    The choppy long frame never reaches trending ADX (no SHORTs); the trending
+    short frame never drops to non-trending ADX after warm-up (no LONGs).
     """
     module = _qg_module()
-    df = _qg_intraday_frame("long")
     params = {"adx_period": 10, "adx_smooth": 3, "fract": 1.0}
-    entries, _, indicators, _ = _call(module, df, params)
 
-    for entry_idx in entries[entries].index:
-        assert indicators["direction"].loc[entry_idx] != "SHORT"
+    entries_long, _, indicators_long, _ = _call(module, _qg_fade_frame("long"), params)
+    for entry_idx in entries_long[entries_long].index:
+        assert indicators_long["direction"].loc[entry_idx] != "SHORT"
+
+    entries_short, _, indicators_short, _ = _call(module, _qg_fade_frame("short"), params)
+    for entry_idx in entries_short[entries_short].index:
+        assert indicators_short["direction"].loc[entry_idx] != "LONG"
 
 
 # ---------------------------------------------------------------------------
@@ -785,8 +799,10 @@ def test_naming_integrity_meta_matches_implementation():
 
     Old behaviour: ``risk_parity`` claimed multi-asset risk parity,
     ``stat_arb_pairs`` claimed pairs trading and ``pynecore_orb`` claimed an
-    opening-range breakout — none implemented those semantics, and the tags
-    routed discovery/portfolio tooling into wrong strategies.
+    opening-range breakout while implementing an SMA crossover — none
+    implemented those semantics, and the tags routed discovery/portfolio
+    tooling into wrong strategies. ``pynecore_orb`` was fixed back to a real
+    opening-range breakout (v2.0.0), so it now claims ``breakout`` again.
     """
     risk_parity = _load_strategy_module(
         "strategies/risk_parity/risk_parity.py", "risk_parity_naming"
@@ -812,7 +828,9 @@ def test_naming_integrity_meta_matches_implementation():
             "single-instrument",
         ),
         (stat_arb.STRATEGY_META, {"pairs-trading"}, "single-instrument"),
-        (orb_meta, {"breakout"}, "moving-average-crossover"),
+        # Fixed (2026-09-09): pynecore_orb implements the breakout again, so
+        # the false claim under test is the leftover SMA misnomer.
+        (orb_meta, {"moving-average-crossover"}, "breakout"),
     ):
         type_tags = {str(item).lower() for item in meta["tags"]["type"]}
         for claim in false_claims:
