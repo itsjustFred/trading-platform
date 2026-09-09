@@ -1,30 +1,92 @@
+"""Reference-logic test for the source-faithful Volatility Breakout port.
+
+Source: optimized_version_vola_breackout nt8.txt — daily ATR(5, previous bar),
+levels rthOpen +/- 0.3*ATR, stop at session open, session 8:30-15:00 NY with
+force-close 60 min before session end, no ATR-regime filter.
+
+The previous version of this test encoded the invented MT5-style behavior
+(16:30/18:05 entry clock, ATR-regime gate); it was rewritten with the
+source-faithful fix.
+"""
+
 import pandas as pd
 
 from strategies.volatility_breakout.volatility_breakout import generate_signals
 
 
 def _bars() -> pd.DataFrame:
-    timestamps = pd.date_range("2024-01-02 16:00", periods=12, freq="15min", tz="UTC")
-    return pd.DataFrame(
-        {
-            "timestamp": timestamps,
-            "open": [100.0, 100.0, 100.0, 100.0, 100.0, 101.8, 101.9, 100.7, 98.0, 97.8, 97.6, 100.0],
-            "high": [100.2, 100.3, 100.4, 100.2, 100.4, 102.2, 102.0, 101.0, 98.2, 98.0, 97.8, 100.2],
-            "low": [99.8, 99.7, 99.6, 99.8, 99.6, 101.4, 101.2, 100.3, 97.5, 97.2, 97.0, 99.8],
-            "close": [100.0, 100.0, 100.0, 100.0, 100.0, 101.8, 101.6, 100.6, 98.0, 97.6, 97.4, 100.0],
-            "volume": [1000] * 12,
-        }
-    )
+    # 8 NY days of 30m bars across the full UTC day (covers 8:30-15:00 NY).
+    days = pd.date_range("2024-01-08", periods=8, freq="D", tz="UTC")
+    rows = []
+    for di, d in enumerate(days):
+        idx = pd.date_range(d, periods=48, freq="30min", tz="UTC")
+        base = 100.0 + di * 0.5
+        px = pd.Series(base, index=range(48), dtype=float)
+        rows.append(
+            pd.DataFrame(
+                {
+                    "timestamp": idx,
+                    "open": px.values,
+                    "high": px.values + 1.0,
+                    "low": px.values - 1.0,
+                    "close": px.values,
+                    "volume": 100,
+                }
+            )
+        )
+    df = pd.concat(rows, ignore_index=True)
+    ts = pd.to_datetime(df["timestamp"], utc=True)
+    ny = ts.dt.tz_convert("America/New_York")
+    minutes = ny.dt.hour * 60 + ny.dt.minute
+    in_session = (minutes >= 8 * 60 + 30) & (minutes < 15 * 60)
+    day7 = ny.dt.date == ny.iloc[6 * 48].date()
+    day8 = ny.dt.date == ny.iloc[7 * 48].date()
+    # Day 7: close above the long level through the session -> LONGs.
+    df.loc[day7 & in_session, "close"] = 105.0
+    df.loc[day7 & in_session, "high"] = 105.5
+    df.loc[day7 & in_session, "low"] = 104.6
+    # Day 8: close below the short level through the session -> SHORTs.
+    df.loc[day8 & in_session, "close"] = 102.0
+    df.loc[day8 & in_session, "high"] = 102.4
+    df.loc[day8 & in_session, "low"] = 101.5
+    return df
 
 
-def test_reference_defaults_enter_only_during_window_and_emit_direction_and_stop():
+def test_source_session_entries_direction_and_session_open_stop():
     entries, exits, indicators, _ = generate_signals(_bars(), {})
 
-    entry_indices = entries[entries].index.tolist()
+    entry_idx = entries[entries].index.tolist()
+    assert len(entry_idx) > 0
+    ts = pd.to_datetime(_bars()["timestamp"], utc=True)
+    ny = ts.dt.tz_convert("America/New_York")
+    minutes = ny.dt.hour * 60 + ny.dt.minute
+    # Entries only inside 8:30-15:00 NY.
+    assert all(8 * 60 + 30 <= minutes.iloc[i] < 15 * 60 for i in entry_idx)
 
-    assert entry_indices == [5, 8]
-    assert indicators["direction"].iloc[5] == "LONG"
-    assert indicators["direction"].iloc[8] == "SHORT"
-    assert pd.notna(indicators["sl_price"].iloc[5])
-    assert pd.notna(indicators["stop_loss"].iloc[8])
-    assert exits.any()
+    dirs = set(indicators["direction"].iloc[entry_idx].tolist())
+    assert dirs == {"LONG", "SHORT"}
+
+    # Stop AT SESSION OPEN on every entry.
+    for i in entry_idx:
+        assert indicators["sl_price"].iloc[i] == indicators["Session_Open"].iloc[i]
+        assert indicators["stop_loss"].iloc[i] == indicators["Session_Open"].iloc[i]
+
+    # Bands are symmetric around the session open with the 0.3 offset.
+    width = (indicators["Upper_Band"] - indicators["Lower_Band"]).dropna()
+    expect = (2 * 0.3 * indicators["ATR"]).dropna()
+    pd.testing.assert_series_equal(
+        width.loc[expect.index], expect, check_names=False, atol=1e-9
+    )
+
+    # No invented regime filter anymore.
+    assert "ATR_Regime_OK" not in indicators
+    assert "ATR_Short" not in indicators
+    assert "ATR_Long" not in indicators
+
+    # Every exit carries price + reason (NaN-PnL cascade guard).
+    exit_idx = exits[exits].index.tolist()
+    assert len(exit_idx) > 0
+    assert int(indicators["exit_price"].iloc[exit_idx].isna().sum()) == 0
+    assert int(pd.Series(indicators["exit_reason"].iloc[exit_idx]).isna().sum()) == 0
+    reasons = set(pd.Series(indicators["exit_reason"].iloc[exit_idx]).tolist())
+    assert reasons <= {"stop_loss", "force_close", "session_exit"}

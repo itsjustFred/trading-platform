@@ -21,12 +21,19 @@ from runner.engines.vectorbt_adapter import VectorbtAdapter
 
 
 STRATEGY_PATH = str(Path(__file__).parent.parent.parent / "strategies" / "volatility_breakout" / "volatility_breakout.py")
-TEST_START = "2025-01-01"
-TEST_END = "2025-03-31"
+# Window retargeted: the old window (2025-01-01..2025-03-31) predates the local
+# US500/1h dataset (starts 2025-04-01) and is uncovered everywhere locally.
+# Start 2025-04-02 avoids the data-gate 4h edge on 04-01 (dataset starts 04:00).
+TEST_START = "2025-04-02"
+TEST_END = "2025-06-30"
 TEST_SYMBOL = "US500"
 TEST_TIMEFRAME = "1h"
-EXPECTED_TRADE_COUNT = 9
-EXPECTED_NET_PROFIT = -6122.70
+# Re-baselined 2026-09-09 for the source-faithful rewrite (daily ATR(5)[1],
+# 0.3 offset, stop at session open, 8:30-15:00 NY + 60-min force-close, no
+# regime filter). Old values (9 / -6122.70) encoded the invented
+# ATR-regime filter and MT5-style 16:30/18:05/22:55 clock.
+EXPECTED_TRADE_COUNT = 46
+EXPECTED_NET_PROFIT = 38.85
 
 
 @pytest.fixture(scope="module")

@@ -21,12 +21,18 @@ from runner.engines.vectorbt_adapter import VectorbtAdapter
 
 
 STRATEGY_PATH = str(Path(__file__).parent.parent.parent / "strategies" / "channel_breakout" / "channel_breakout.py")
-TEST_START = "2025-04-01"
+# Window start moved 2025-04-01 -> 2025-04-02: the local US500/1h dataset starts
+# 2025-04-01 04:00 UTC, so the data gate rejects a 00:00 start bound.
+TEST_START = "2025-04-02"
 TEST_END = "2025-06-30"
 TEST_SYMBOL = "US500"
 TEST_TIMEFRAME = "1h"
-EXPECTED_TRADE_COUNT = 8
-EXPECTED_NET_PROFIT = 2886.67
+# Re-baselined 2026-09-09 for the source-faithful fix (shorts restored, gap
+# filter incl. gap==0 block, opposite-side channel exit, session-close exit,
+# EMA/fixed-stop opt-ins). Old values (8 trades / +2886.67) encoded the buggy
+# long-only port without gap/channel/session exits.
+EXPECTED_TRADE_COUNT = 33
+EXPECTED_NET_PROFIT = -417.31
 
 
 @pytest.fixture(scope="module")

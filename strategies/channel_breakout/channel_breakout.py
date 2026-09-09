@@ -1,8 +1,34 @@
 """
 Intraday Channel Breakout Strategy
 
-N-Bar High/Low channel breakout with 200 EMA trend filter,
-gap filter, and ATR trailing stop.
+Source-faithful port of "Intraday Channel Breakout nt8.txt"
+(NQ 5 min US Equities RTH, Discord ID 1388096847498707044).
+
+Source semantics (NT8, Calculate.OnBarClose):
+- Channel Length=5 (MAX(high,5)/MIN(low,5)), EMA(200) trend filter (default ON),
+  ATR(14) x 2.0 trailing stop (default).
+- Bi-directional: EnableLong/EnableShort default True. Entries are STOP orders
+  at the channel (long: upBound+TickSize, short: downBound-TickSize),
+  approximated here as close-breakout vs PRIOR bar channel
+  (close > upper[-1] / close < lower[-1]) with next-open execution in vectorbt.
+- Gap filter (default ON, MinGap 0.5 pts): positive gap -> longs only,
+  negative gap -> shorts only, gap < MinGap (incl. gap==0) -> NO trades.
+- Channel exit (default ON): opposite-side stop (long exits at
+  downBound-TickSize, short at upBound+TickSize).
+- Session-close exit (IsExitOnSessionCloseStrategy, 30s): flatten at the last
+  bar of each NY session day (no overnight holds).
+- EMA exit (default OFF) + fixed-$ stop (default OFF, $100) are opt-in params
+  defaulting to source defaults.
+
+vectorbt notes:
+- Engine supports SHORTS via the `direction` indicator (LONG/SHORT); PnL is
+  mirrored in the adapter. Shorts are therefore restored (not long-only).
+- Next-open execution: signals fire on bar close, fills on next open.
+- Fixed-$ stop: NT8 Currency-mode needs account/contract value unavailable in
+  generate_signals; approximated as price distance = stop_loss_amount
+  (documented; for NQ $100 ~ 5 pts at $20/pt).
+- Trailing-stop trigger is close-based per source (Close <= trail); channel /
+  fixed stops are stop orders, checked against low/high.
 """
 
 import numpy as np
@@ -11,31 +37,70 @@ import pandas as pd
 
 STRATEGY_META = {
     "name": "Intraday Channel Breakout",
-    "version": "1.0.0",
-    "source_url": "https://discord.com/channels/zenomtrader",
+    "version": "1.1.0",
+    "source_url": "https://discord.com/channels/1230977283888648315/1383712509831155782/1388096847498707044",
+    "notes": (
+        "- Source: Intraday Channel Breakout nt8.txt (Length=5, EMA200 filter ON, "
+        "ATR14x2.0 trailing, gap filter ON MinGap 0.5, channel exit ON, EMA exit OFF, "
+        "fixed-$ stop OFF $100, session-close exit ON, longs+shorts ON).\n"
+        "- vectorbt_adapter supports SHORT entries via the `direction` indicator "
+        "(LONG/SHORT with mirrored PnL); shorts restored, not long-only.\n"
+        "- Stop-entry orders approximated as close vs prior-bar channel with "
+        "next-open execution; no intrabar stop fills.\n"
+        "- Fixed-$ (Currency-mode) stop approximated as price distance "
+        "stop_loss_amount (true $ stop needs contract point value).\n"
+        "- Gap/session-close use NY calendar dates (US Equities RTH); without a "
+        "`timestamp` column the gap filter is bypassed (documented)."
+    ),
     "tags": {
         "type": ["breakout"],
         "source": "zenomtrader-discord",
-        "link": "https://discord.com/channels/zenomtrader",
+        "link": "https://discord.com/channels/1230977283888648315/1383712509831155782/1388096847498707044",
         "asset_class": ["equities", "futures"],
         "complexity": "medium",
     },
 }
 
 
+def _ny_dates(df: pd.DataFrame):
+    """Return NY dates array or None when no timestamp column."""
+    if "timestamp" not in df.columns:
+        return None, None
+    ts_utc = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+    try:
+        ts_ny = ts_utc.dt.tz_convert("America/New_York")
+    except Exception:
+        return None, None
+    return ts_ny.dt.date.to_numpy(), ts_ny
+
+
 def generate_signals(df: pd.DataFrame, params: dict = None):
     params = params or {}
-    channel_length = int(params.get("channel_length", 5))
-    ema_period = int(params.get("ema_period", 200))
-    use_ema_filter = params.get("use_ema_filter", True)
-    atr_period = int(params.get("atr_period", 14))
-    atr_multiplier = float(params.get("atr_multiplier", 2.0))
+    channel_length = int(params.get("channel_length", params.get("Length", 5)))
+    ema_period = int(params.get("ema_period", params.get("EmaPeriod", 200)))
+    use_ema_filter = params.get("use_ema_filter", params.get("UseEmaFilter", True))
+    enable_long = params.get("enable_long", params.get("EnableLongTrades", True))
+    enable_short = params.get("enable_short", params.get("EnableShortTrades", True))
+    atr_period = int(params.get("atr_period", params.get("AtrPeriod", 14)))
+    atr_multiplier = float(params.get("atr_multiplier", params.get("AtrMultiplier", 2.0)))
+    use_fixed_stop = params.get(
+        "use_fixed_stop_loss", params.get("UseFixedStopLoss", False)
+    )
+    stop_loss_amount = float(params.get("stop_loss_amount", params.get("StopLossAmount", 100.0)))
+    use_channel_exit = params.get("use_channel_exit", params.get("UseChannelExit", True))
+    use_ema_exit = params.get("use_ema_exit", params.get("UseEmaExit", False))
+    use_gap_filter = params.get("use_gap_filter", params.get("UseGapFilter", True))
+    min_gap_size = float(params.get("min_gap_size", params.get("MinimumGapSize", 0.5)))
+    exit_on_session_close = params.get(
+        "exit_on_session_close", params.get("ExitOnSessionClose", True)
+    )
 
-    close = df["close"]
-    high = df["high"]
-    low = df["low"]
+    close = df["close"].astype(float)
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    open_ = df["open"].astype(float) if "open" in df.columns else close
 
-    ema200 = close.ewm(span=ema_period, adjust=False).mean()
+    ema = close.ewm(span=ema_period, adjust=False).mean()
     upper_channel = high.rolling(channel_length).max()
     lower_channel = low.rolling(channel_length).min()
 
@@ -50,59 +115,254 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
     tr.iloc[0] = high.iloc[0] - low.iloc[0]
     atr = tr.rolling(atr_period).mean()
 
+    n = len(df)
+    # Gap direction per bar: 1 = long only, -1 = short only, 0 = no trades.
+    gap_direction = pd.Series(np.zeros(n, dtype=int), index=df.index)
+    ny_dates, _ = _ny_dates(df)
+    gap_filter_active = bool(use_gap_filter) and (ny_dates is not None)
+    if gap_filter_active:
+        dates = np.array(ny_dates)
+        # first open / last close per date in encountered order
+        order: list = []
+        first_open: dict = {}
+        last_close: dict = {}
+        for i in range(n):
+            d = dates[i]
+            if d not in first_open:
+                first_open[d] = float(open_.iloc[i])
+                order.append(d)
+            last_close[d] = float(close.iloc[i])
+        prev_close = None
+        gap_by_date: dict = {}
+        for d in order:
+            if prev_close is None:
+                gap_by_date[d] = 0
+            else:
+                gap = first_open[d] - prev_close
+                if abs(gap) >= min_gap_size and gap != 0:
+                    gap_by_date[d] = 1 if gap > 0 else -1
+                else:
+                    gap_by_date[d] = 0
+            prev_close = last_close[d]
+        for i in range(n):
+            gap_direction.iloc[i] = gap_by_date[dates[i]]
+        is_last_of_day = pd.Series(False, index=df.index)
+        for i in range(n):
+            if i == n - 1 or dates[i] != dates[i + 1]:
+                is_last_of_day.iloc[i] = True
+    else:
+        is_last_of_day = pd.Series(False, index=df.index)
+        if "timestamp" in df.columns and bool(use_gap_filter):
+            # Timestamp present but NY conversion failed -> fall back to UTC dates
+            # for session-close only; gap stays bypassed (documented).
+            try:
+                ts_utc = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+                utc_dates = ts_utc.dt.date.to_numpy()
+                for i in range(n):
+                    if i == n - 1 or utc_dates[i] != utc_dates[i + 1]:
+                        is_last_of_day.iloc[i] = True
+            except Exception:
+                pass
+
     entries = pd.Series(False, index=df.index)
     exits = pd.Series(False, index=df.index)
+    direction = pd.Series(index=df.index, dtype="object")
     sl_price = pd.Series(np.nan, index=df.index)
     trailing_stop_at_exit = pd.Series(np.nan, index=df.index)
     exit_price = pd.Series(np.nan, index=df.index)
     exit_reason = pd.Series(index=df.index, dtype="object")
 
     in_trade = False
+    active_direction: str | None = None
     trailing_stop_value = 0.0
-    warmup = max(channel_length, ema_period, atr_period)
+    entry_price = np.nan
+    active_sl = np.nan
+    warmup = max(channel_length, ema_period, atr_period, 20)
 
-    for i in range(warmup, len(df)):
+    for i in range(warmup, n):
+        up_prev = upper_channel.iloc[i - 1]
+        dn_prev = lower_channel.iloc[i - 1]
+        ema_v = ema.iloc[i]
+        atr_v = atr.iloc[i]
+        c = float(close.iloc[i])
+        lo = float(low.iloc[i])
+        hi = float(high.iloc[i])
+        if pd.isna(up_prev) or pd.isna(dn_prev) or pd.isna(ema_v):
+            continue
+
         if in_trade:
-            atr_value = atr.iloc[i]
-            if pd.notna(atr_value):
-                new_stop = float(close.iloc[i]) - float(atr_value) * atr_multiplier
-                trailing_stop_value = max(trailing_stop_value, new_stop)
-                trailing_stop_at_exit.iloc[i] = trailing_stop_value
-            if float(close.iloc[i]) <= trailing_stop_value:
-                exits.iloc[i] = True
-                exit_price.iloc[i] = trailing_stop_value
-                exit_reason.iloc[i] = "trailing_stop"
-                in_trade = False
-                trailing_stop_value = 0.0
+            if active_direction == "LONG":
+                # ATR trailing / fixed stop bookkeeping (source: trailing is
+                # close-based; fixed SetStopLoss is a stop order -> low/high).
+                if not use_fixed_stop and pd.notna(atr_v):
+                    new_stop = c - float(atr_v) * atr_multiplier
+                    if trailing_stop_value == 0.0 or new_stop > trailing_stop_value:
+                        trailing_stop_value = new_stop
+                    trailing_stop_at_exit.iloc[i] = trailing_stop_value
+                # 1) stop hit (stop-first priority)
+                if use_fixed_stop:
+                    if lo <= active_sl:
+                        exits.iloc[i] = True
+                        exit_price.iloc[i] = float(active_sl)
+                        exit_reason.iloc[i] = "fixed_stop"
+                        in_trade = False
+                        active_direction = None
+                        trailing_stop_value = 0.0
+                        continue
+                else:
+                    if c <= trailing_stop_value:
+                        exits.iloc[i] = True
+                        exit_price.iloc[i] = float(trailing_stop_value)
+                        exit_reason.iloc[i] = "trailing_stop"
+                        in_trade = False
+                        active_direction = None
+                        trailing_stop_value = 0.0
+                        continue
+                # 2) channel exit: opposite-side stop (stop order -> low check)
+                if use_channel_exit and lo <= float(dn_prev):
+                    exits.iloc[i] = True
+                    exit_price.iloc[i] = float(dn_prev)
+                    exit_reason.iloc[i] = "channel_exit"
+                    in_trade = False
+                    active_direction = None
+                    trailing_stop_value = 0.0
+                    continue
+                # 3) EMA exit (close-based per source)
+                if use_ema_exit and c < float(ema_v):
+                    exits.iloc[i] = True
+                    exit_price.iloc[i] = c
+                    exit_reason.iloc[i] = "ema_exit"
+                    in_trade = False
+                    active_direction = None
+                    trailing_stop_value = 0.0
+                    continue
+                # 4) session-close flatten
+                if bool(exit_on_session_close) and bool(is_last_of_day.iloc[i]):
+                    exits.iloc[i] = True
+                    exit_price.iloc[i] = c
+                    exit_reason.iloc[i] = "session_close"
+                    in_trade = False
+                    active_direction = None
+                    trailing_stop_value = 0.0
+                    continue
+            else:  # SHORT
+                if not use_fixed_stop and pd.notna(atr_v):
+                    new_stop = c + float(atr_v) * atr_multiplier
+                    if trailing_stop_value == 0.0 or new_stop < trailing_stop_value:
+                        trailing_stop_value = new_stop
+                    trailing_stop_at_exit.iloc[i] = trailing_stop_value
+                if use_fixed_stop:
+                    if hi >= active_sl:
+                        exits.iloc[i] = True
+                        exit_price.iloc[i] = float(active_sl)
+                        exit_reason.iloc[i] = "fixed_stop"
+                        in_trade = False
+                        active_direction = None
+                        trailing_stop_value = 0.0
+                        continue
+                else:
+                    if c >= trailing_stop_value:
+                        exits.iloc[i] = True
+                        exit_price.iloc[i] = float(trailing_stop_value)
+                        exit_reason.iloc[i] = "trailing_stop"
+                        in_trade = False
+                        active_direction = None
+                        trailing_stop_value = 0.0
+                        continue
+                if use_channel_exit and hi >= float(up_prev):
+                    exits.iloc[i] = True
+                    exit_price.iloc[i] = float(up_prev)
+                    exit_reason.iloc[i] = "channel_exit"
+                    in_trade = False
+                    active_direction = None
+                    trailing_stop_value = 0.0
+                    continue
+                if use_ema_exit and c > float(ema_v):
+                    exits.iloc[i] = True
+                    exit_price.iloc[i] = c
+                    exit_reason.iloc[i] = "ema_exit"
+                    in_trade = False
+                    active_direction = None
+                    trailing_stop_value = 0.0
+                    continue
+                if bool(exit_on_session_close) and bool(is_last_of_day.iloc[i]):
+                    exits.iloc[i] = True
+                    exit_price.iloc[i] = c
+                    exit_reason.iloc[i] = "session_close"
+                    in_trade = False
+                    active_direction = None
+                    trailing_stop_value = 0.0
+                    continue
         else:
-            ema_long_ok = (not use_ema_filter) or (float(close.iloc[i]) > float(ema200.iloc[i]))
-            if ema_long_ok and float(close.iloc[i]) > float(upper_channel.iloc[i - 1]):
+            # Gap gate: 1 -> longs only, -1 -> shorts only, 0 -> no trades.
+            if gap_filter_active:
+                g = int(gap_direction.iloc[i])
+                long_allowed = bool(enable_long) and g == 1
+                short_allowed = bool(enable_short) and g == -1
+            else:
+                long_allowed = bool(enable_long)
+                short_allowed = bool(enable_short)
+
+            long_breakout = c > float(up_prev)
+            short_breakout = c < float(dn_prev)
+            long_ema_ok = (not use_ema_filter) or (c > float(ema_v))
+            short_ema_ok = (not use_ema_filter) or (c < float(ema_v))
+
+            if long_allowed and long_ema_ok and long_breakout:
                 entries.iloc[i] = True
+                direction.iloc[i] = "LONG"
                 in_trade = True
-                atr_value = atr.iloc[i]
-                if pd.notna(atr_value):
-                    trailing_stop_value = float(close.iloc[i]) - float(atr_value) * atr_multiplier
-                    sl_price.iloc[i] = trailing_stop_value
+                active_direction = "LONG"
+                entry_price = c
+                if use_fixed_stop:
+                    active_sl = c - float(stop_loss_amount)
+                    sl_price.iloc[i] = float(active_sl)
+                    trailing_stop_value = 0.0
+                else:
+                    if pd.notna(atr_v):
+                        trailing_stop_value = c - float(atr_v) * atr_multiplier
+                        sl_price.iloc[i] = float(trailing_stop_value)
+                        active_sl = float(trailing_stop_value)
+                    else:
+                        trailing_stop_value = 0.0
+                        active_sl = np.nan
+            elif short_allowed and short_ema_ok and short_breakout:
+                entries.iloc[i] = True
+                direction.iloc[i] = "SHORT"
+                in_trade = True
+                active_direction = "SHORT"
+                entry_price = c
+                if use_fixed_stop:
+                    active_sl = c + float(stop_loss_amount)
+                    sl_price.iloc[i] = float(active_sl)
+                    trailing_stop_value = 0.0
+                else:
+                    if pd.notna(atr_v):
+                        trailing_stop_value = c + float(atr_v) * atr_multiplier
+                        sl_price.iloc[i] = float(trailing_stop_value)
+                        active_sl = float(trailing_stop_value)
+                    else:
+                        trailing_stop_value = 0.0
+                        active_sl = np.nan
 
     indicators_dict = {
-        "EMA_200": ema200,
+        "EMA_200": ema,
         "Upper_Channel": upper_channel,
         "Lower_Channel": lower_channel,
         "ATR": atr,
         "sl_price": sl_price,
         "trailing_stop_at_exit": trailing_stop_at_exit,
+        "direction": direction,
+        "gap_direction": gap_direction.astype(float),
         "exit_price": exit_price,
         "exit_reason": exit_reason,
     }
     drawings: list[dict] = []
     if "timestamp" in df.columns:
-        entry_times = pd.to_datetime(
-            df.loc[entries[entries].index, "timestamp"], utc=True, errors="coerce"
-        ).dropna()
-        exit_times = pd.to_datetime(
-            df.loc[exits[exits].index, "timestamp"], utc=True, errors="coerce"
-        ).dropna()
-        for ts in entry_times.iloc[:30]:
+        ts_all = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+        long_mask = entries & (direction == "LONG")
+        short_mask = entries & (direction == "SHORT")
+        for ts in ts_all.loc[long_mask].dropna().iloc[:30]:
             drawings.append(
                 {
                     "type": "marker",
@@ -110,10 +370,21 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
                     "position": "belowBar",
                     "shape": "arrowUp",
                     "color": "#22c55e",
-                    "text": "Entry",
+                    "text": "Long",
                 }
             )
-        for ts in exit_times.iloc[:30]:
+        for ts in ts_all.loc[short_mask].dropna().iloc[:30]:
+            drawings.append(
+                {
+                    "type": "marker",
+                    "time": ts.isoformat(),
+                    "position": "aboveBar",
+                    "shape": "arrowDown",
+                    "color": "#f97316",
+                    "text": "Short",
+                }
+            )
+        for ts in ts_all.loc[exits].dropna().iloc[:30]:
             drawings.append(
                 {
                     "type": "marker",

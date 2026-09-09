@@ -25,8 +25,15 @@ TEST_START = "2025-01-01"
 TEST_END = "2025-03-31"
 TEST_SYMBOL = "SPY"
 TEST_TIMEFRAME = "1d"
-EXPECTED_TRADE_COUNT = 3
-EXPECTED_NET_PROFIT = -1160.43
+# Re-baselined 2026-09-09 for the source-faithful rewrite (VIX>=19 & chg%>=10 &
+# SPX chg%<=-1% panic gate, 1-5 day window, SMA200 bull filter, dip 9:30-10:59
+# close<VWAP RSI14<40 Wilder near-prior-low, ORB 9:30-10:00/10:00-14:00,
+# TP+2%/SL-0.3%, scale>=14:00, EOD>=15:50). Old values (3 / -1160.43) encoded
+# the invented RSI35/SMA20 logic. Without a local VIX/1d.parquet the regime
+# gate is FAIL-CLOSED (0 trades); daily bars additionally cannot trigger the
+# intraday dip/ORB legs.
+EXPECTED_TRADE_COUNT = 0
+EXPECTED_NET_PROFIT = 0.00
 
 
 @pytest.fixture(scope="module")
