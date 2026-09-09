@@ -1,122 +1,125 @@
 """
-Strategy: Mean Reversion (RSI + Bollinger Bands)
+Overnight Gap Mean Reversion (daily-expressible proxy).
 
-Mean reversion strategy using RSI oversold/overbought conditions confirmed
-by Bollinger Band extremes.
+Faithful daily port of the QuantConnect strategy
+``overnight_gap_mean_reverse`` (alexisbouley2/quantconnect):
+
+- Entry on the overnight gap: ``gap = open[t] - close[t-1]`` filtered by a
+  sigma gate against the rolling 60-close standard deviation
+  (``abs(gap) >= sigma * std(close[-60:])``), fading the gap
+  (gap up -> SHORT, gap down -> LONG).
+- Exit at the next open (one-bar hold).
+
+DAILY-PROXY LIMITATION (intraday logic not expressible on 1d bars):
+the source enters at 09:31 ET and liquidates at 09:45 ET on MINUTE bars.
+On daily bars the entry signal fires on the gap day and the exit signal on
+the next day; the platform's next-open execution convention additionally
+shifts fills by one bar. P&L therefore corresponds to a 1-day-delayed fade,
+not to the 14-minute 09:31 -> 09:45 window. See README and STRATEGY_META
+notes. There is no stop-loss in the source; the emitted ``sl_price``
+(entry-bar low for LONG / high for SHORT) is a structural protective level
+used ONLY for runner risk sizing, not a source rule.
 """
-
-STRATEGY_META = {
-    "name": "Mean Reversion RSI+BB",
-    "version": "1.0.0",
-    "source_url": "https://github.com/alexisbouley2/quantconnect/tree/main/strategies/overnight_gap_mean_reverse",
-    "tags": {
-        "type": ["mean-reversion"],
-        "source": "alexisbouley2-github",
-        "link": "https://github.com/alexisbouley2/spy_mean_reversion_strategy",
-        "asset_class": ["equities"],
-        "complexity": "medium",
-    },
-}
 
 import numpy as np
 import pandas as pd
 
 
+STRATEGY_META = {
+    "name": "Overnight Gap Mean Reversion (Daily Proxy)",
+    "version": "2.0.0",
+    "source_url": "https://github.com/alexisbouley2/quantconnect/tree/main/strategies/overnight_gap_mean_reverse",
+    "notes": (
+        "Daily-expressible proxy of overnight_gap_mean_reverse "
+        "(algorithm.py: sigma=10.0, volatility_window=60, entry 09:31 ET, "
+        "liquidate 09:45 ET; variants/variant_1.py: same gap/std filter with "
+        "sigma default 3.0). Entry fades the overnight gap "
+        "(open vs previous close) when abs(gap) >= sigma * 60-close std; "
+        "exit is the next open (one-bar hold). LIMITATION: the 09:31->09:45 "
+        "intraday window cannot be expressed on 1d bars, and next-open "
+        "execution shifts fills by one bar, so backtest P&L is a 1-day-delayed "
+        "fade proxy. sl_price (entry-bar low/high) is a sizing-only "
+        "protective level, not a source rule. Replaces the previous generic "
+        "BB/RSI implementation that was mapped to this source by mistake."
+    ),
+    "parameters": {
+        "sigma": 10.0,
+        "volatility_window": 60,
+    },
+    "tags": {
+        "type": ["mean-reversion"],
+        "source": "alexisbouley2-github",
+        "link": "https://github.com/alexisbouley2/quantconnect/tree/main/strategies/overnight_gap_mean_reverse",
+        "asset_class": ["equities"],
+        "complexity": "medium",
+    },
+}
+
+
 def generate_signals(df: pd.DataFrame, params: dict):
-    bb_period = params.get("bb_period", 20)
-    bb_std = params.get("bb_std", 2.0)
-    rsi_period = params.get("rsi_period", 14)
-    rsi_entry = params.get("rsi_entry", 30)
-    rsi_exit = params.get("rsi_exit", 70)
-    max_hold = params.get("max_hold", 15)
-    atr_period = params.get("atr_period", 14)
-    atr_stop_mult = params.get("atr_stop_mult", 2.0)
+    sigma = float(params.get("sigma", 10.0))
+    volatility_window = int(params.get("volatility_window", 60))
 
-    close = df["close"]
-    high = df["high"]
-    low = df["low"]
-    sma = close.rolling(bb_period).mean()
-    std = close.rolling(bb_period).std()
-    upper_bb = sma + bb_std * std
-    lower_bb = sma - bb_std * std
-    tr = pd.concat(
-        [
-            high - low,
-            (high - close.shift(1)).abs(),
-            (low - close.shift(1)).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-    atr = tr.rolling(atr_period).mean()
+    open_ = df["open"].astype(float)
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    close = df["close"].astype(float)
 
-    delta = close.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.rolling(rsi_period).mean()
-    avg_loss = loss.rolling(rsi_period).mean()
-    rs = avg_gain / avg_loss.replace(0, 1e-10)
-    rsi = 100 - (100 / (1 + rs))
+    # Overnight gap per source: today's open minus yesterday's close.
+    prev_close = close.shift(1)
+    gap = open_ - prev_close
+    # Volatility per source: rolling std of closes over the window, read off
+    # the history available BEFORE the gap day (shifted by one bar so the
+    # gap day itself cannot leak into its own gate).
+    volatility = close.shift(1).rolling(volatility_window).std()
+    with np.errstate(divide="ignore", invalid="ignore"):
+        deviations = gap / volatility
 
-    raw_entries = (close < lower_bb) & (rsi < rsi_entry)
+    valid = volatility.notna() & (volatility > 0) & gap.notna()
+    raw_signal = valid & (deviations.abs() >= sigma)
 
-    in_trade = False
-    bars_held = 0
     entries = pd.Series(False, index=df.index)
     exits = pd.Series(False, index=df.index)
+    direction = pd.Series(index=df.index, dtype="object")
     sl_price = pd.Series(np.nan, index=df.index)
-    bars_held_at_exit = pd.Series(np.nan, index=df.index)
-    exit_price = pd.Series(np.nan, index=df.index)
+    gap_at_entry = pd.Series(np.nan, index=df.index)
+    volatility_at_entry = pd.Series(np.nan, index=df.index)
+    deviations_at_entry = pd.Series(np.nan, index=df.index)
     exit_reason = pd.Series(index=df.index, dtype="object")
-    active_stop = np.nan
 
+    in_trade = False
     for i in range(len(df)):
-        if not in_trade and bool(raw_entries.iloc[i]):
+        if in_trade:
+            # Daily proxy for the 09:45 liquidate: flat after one bar.
+            exits.iloc[i] = True
+            exit_reason.iloc[i] = "time_exit_next_open"
+            in_trade = False
+            continue
+        if bool(raw_signal.iloc[i]):
             in_trade = True
-            bars_held = 0
             entries.iloc[i] = True
-            atr_value = atr.iloc[i]
-            if pd.notna(atr_value):
-                active_stop = float(close.iloc[i]) - float(atr_value) * atr_stop_mult
-                sl_price.iloc[i] = active_stop
-        elif in_trade:
-            bars_held += 1
-            stop_hit = pd.notna(active_stop) and float(low.iloc[i]) <= float(active_stop)
-            rsi_exit_hit = bool(rsi.iloc[i] > rsi_exit) if pd.notna(rsi.iloc[i]) else False
-            mean_reversion_hit = (
-                bool(close.iloc[i] > sma.iloc[i]) if pd.notna(sma.iloc[i]) else False
-            )
-            time_exit_hit = bars_held >= max_hold
-            if stop_hit or rsi_exit_hit or mean_reversion_hit or time_exit_hit:
-                in_trade = False
-                exits.iloc[i] = True
-                bars_held_at_exit.iloc[i] = bars_held
-                if stop_hit:
-                    exit_price.iloc[i] = active_stop
-                    exit_reason.iloc[i] = "stop_loss"
-                elif rsi_exit_hit:
-                    exit_price.iloc[i] = float(close.iloc[i])
-                    exit_reason.iloc[i] = "rsi_exit"
-                elif mean_reversion_hit:
-                    exit_price.iloc[i] = float(close.iloc[i])
-                    exit_reason.iloc[i] = "mean_reversion_to_mid"
-                else:
-                    exit_price.iloc[i] = float(close.iloc[i])
-                    exit_reason.iloc[i] = "time_exit"
-                active_stop = np.nan
+            is_gap_up = bool(gap.iloc[i] > 0)
+            # Fade the gap: gap up -> SHORT, gap down -> LONG.
+            direction.iloc[i] = "SHORT" if is_gap_up else "LONG"
+            # Sizing-only structural stop (NOT a source rule): the entry bar's
+            # extreme against the fade direction.
+            sl_price.iloc[i] = float(high.iloc[i]) if is_gap_up else float(low.iloc[i])
+            gap_at_entry.iloc[i] = float(gap.iloc[i])
+            volatility_at_entry.iloc[i] = float(volatility.iloc[i])
+            deviations_at_entry.iloc[i] = float(deviations.iloc[i])
 
     indicators_dict = {
-        "RSI": rsi,
-        "RSI_at_exit": rsi,
-        "BB_Mid": sma,
-        "BB_Mid_at_exit": sma,
-        "BB_Upper": upper_bb,
-        "BB_Lower": lower_bb,
-        "ATR": atr,
+        "gap": gap,
+        "gap_volatility": volatility,
+        "gap_deviations": deviations,
+        "direction": direction,
         "sl_price": sl_price,
-        "bars_held_at_exit": bars_held_at_exit,
-        "exit_price": exit_price,
+        "gap_at_entry": gap_at_entry,
+        "volatility_at_entry": volatility_at_entry,
+        "deviations_at_entry": deviations_at_entry,
         "exit_reason": exit_reason,
     }
+
     drawings: list[dict] = []
     if "timestamp" in df.columns:
         entry_times = pd.to_datetime(
@@ -125,7 +128,7 @@ def generate_signals(df: pd.DataFrame, params: dict):
         exit_times = pd.to_datetime(
             df.loc[exits[exits].index, "timestamp"], utc=True, errors="coerce"
         ).dropna()
-        for ts in entry_times.iloc[:30]:
+        for ts in entry_times.iloc[:200]:
             drawings.append(
                 {
                     "type": "marker",
@@ -133,10 +136,10 @@ def generate_signals(df: pd.DataFrame, params: dict):
                     "position": "belowBar",
                     "shape": "arrowUp",
                     "color": "#22c55e",
-                    "text": "Entry",
+                    "text": "Gap fade",
                 }
             )
-        for ts in exit_times.iloc[:30]:
+        for ts in exit_times.iloc[:200]:
             drawings.append(
                 {
                     "type": "marker",

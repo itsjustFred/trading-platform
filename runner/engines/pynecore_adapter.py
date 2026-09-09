@@ -406,6 +406,13 @@ def _load_strategy_helper_namespace(strategy_path: Path, source: str) -> dict[st
         strategy_path,
         source,
         function_names={"build_trade_context", "build_drawings"},
+        # The main strategy file is a PyneCore script executed out-of-process
+        # by the ``pyne`` CLI; its ``pynecore`` imports are the engine contract
+        # and are never needed by the in-process helper namespace, so they are
+        # dropped here instead of failing the screen. Every other import is
+        # still screened against the whitelist (a helper that really needs
+        # ``pynecore`` fails loudly with NameError at call time).
+        ignored_roots=frozenset({"pynecore"}),
     )
     namespace.update({key: value for key, value in source_namespace.items() if value is not None})
     return namespace
@@ -474,6 +481,30 @@ def _reject_dunder_attribute(node: ast.Attribute, source_path: Path) -> None:
         )
 
 
+def _strip_ignored_import(
+    node: ast.Import | ast.ImportFrom,
+    ignored_roots: frozenset[str] | None,
+) -> ast.Import | ast.ImportFrom | None:
+    """Drop engine-contract imports that the helper namespace never needs.
+
+    Only whole roots listed in ``ignored_roots`` are removed; any other alias
+    on the same statement is kept and still screened. ``import pynecore, os``
+    therefore still fails on ``os`` instead of slipping through.
+    """
+    if not ignored_roots:
+        return node
+    if isinstance(node, ast.ImportFrom):
+        if import_root(node) in ignored_roots:
+            return None
+        return node
+    kept = [alias for alias in node.names if alias.name.split(".")[0] not in ignored_roots]
+    if not kept:
+        return None
+    if len(kept) == len(node.names):
+        return node
+    return ast.Import(names=kept)
+
+
 def _screen_helper_node(node: ast.AST, source_path: Path) -> None:
     """Apply every helper screening rule to one AST node."""
     if isinstance(node, (ast.Import, ast.ImportFrom)):
@@ -497,13 +528,16 @@ def _compile_helper_namespace(
     *,
     function_names: set[str] | None = None,
     strict_structure: bool = False,
+    ignored_roots: frozenset[str] | None = None,
 ) -> dict[str, Any]:
     tree = ast.parse(source, filename=str(source_path))
     helper_nodes: list[ast.stmt] = []
     allowed_names = function_names or {"build_trade_context", "build_drawings"}
     for position, node in enumerate(tree.body):
         if isinstance(node, (ast.Import, ast.ImportFrom)):
-            helper_nodes.append(node)
+            stripped = _strip_ignored_import(node, ignored_roots)
+            if stripped is not None:
+                helper_nodes.append(stripped)
         elif isinstance(node, ast.FunctionDef) and node.name in allowed_names:
             helper_nodes.append(node)
         elif strict_structure and not (
@@ -753,6 +787,7 @@ def _load_ohlcv(
 
     df = pd.read_parquet(matches[0])
     df.columns = [c.lower() for c in df.columns]
+    df = contract.normalize_ohlcv_columns(df)
 
     if "timestamp" in df.columns:
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
@@ -901,6 +936,22 @@ def _infer_exit_reason_from_meta(exit_price: float, meta: dict[str, Any]) -> str
     return None
 
 
+def _initial_exit_reason(raw_signal: str) -> str | None:
+    """Seed an exit reason from the broker ledger's Signal column.
+
+    ``strategy.close(..., comment="...")`` / ``strategy.exit`` comments surface
+    here verbatim (e.g. ``time_exit``, ``trailing_stop``), as do emulator
+    events (``Margin call``). The generic ``Close entry(s) order ...`` text
+    carries no strategy intent and stays None so context/meta inference can
+    still classify the exit. Normalised to snake_case to match the
+    vectorbt/native reason vocabulary.
+    """
+    signal = (raw_signal or "").strip()
+    if not signal or signal.lower().startswith("close entry(s) order"):
+        return None
+    return "_".join(signal.lower().split())
+
+
 def _parse_trade_csv(csv_path: Path, symbol: str, id_offset: int) -> list[Trade]:
     trades: list[Trade] = []
     entries: dict[int, dict[str, Any]] = {}
@@ -938,6 +989,7 @@ def _parse_trade_csv(csv_path: Path, symbol: str, id_offset: int) -> list[Trade]
                             price=round(exit_price, 6),
                             quantity=round(qty, 4),
                             pnl=round(profit, 2),
+                            reason=_initial_exit_reason(row.get("Signal", "")),
                         )
                     ],
                     pnl=round(profit, 2),

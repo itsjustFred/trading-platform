@@ -183,6 +183,10 @@ def test_all_vectorbt_strategies_return_entries_exits_and_indicators_dict():
     for strategy_path in iter_strategy_files(STRATEGIES_DIR):
         if strategy_path.name.startswith("pynecore_"):
             continue
+        if strategy_path.name == "tiingo_sentiment.py":
+            # Blocked skeleton: generate_signals raises NotImplementedError by
+            # design (no news feed); covered by its own blocked-behavior test.
+            continue
 
         module = _load_module(strategy_path)
         output = module.generate_signals(df.copy(), {})

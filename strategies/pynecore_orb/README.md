@@ -1,35 +1,42 @@
-# SMA Crossover ATR Bracket — slug `pynecore_orb`
-
-> **Naming-Integrity (Cleanup #35 / Settlement S15):** Diese Strategie
-> berechnet KEINE Opening Range. Implementiert ist ein SMA-Crossover
-> (schnelle SMA gegen 4x langsame SMA) mit EMA(200)-Trendfilter und
-> ATR-TP/SL-Bracket. Der Verzeichnis-/Slug-Name `pynecore_orb` bleibt aus
-> Kompatibilitaetsgruenden mit bestehenden Backtest-Artefakten erhalten.
+# Opening Range Breakout (PyneCore) — slug `pynecore_orb`
 
 ## Quelle
-- Original: PyneCore/Pine-Style Python-Strategie im Repository, manuelle Konvertierung aus NinjaTrader 8 (C#)
-- Konvertiert: 2026-03-08
-- Umbenannt/umetikettiert: 2026-09-02 (Cleanup #35)
+- Original: `opening_range_breakout` (`algorithm.py`, Variante 2 mit Preis-Prozent-Trailing-Stop)
+  aus `alexisbouley2/quantconnect`
+  (`https://github.com/alexisbouley2/quantconnect/tree/main/strategies/opening_range_breakout`)
+- Konvertiert: 2026-09-09 (Rewrite als echte Opening-Range-Breakout-Strategie, v2.0.0;
+  die v1.x-Implementierung war ein SMA-Crossover mit ATR-Bracket, das unter diesem
+  Slug versehentlich weitergefuehrt wurde)
 
 ## Kernlogik
 
 ### Entry
-Long-Entry, wenn die schnelle SMA die langsame SMA von unten nach oben kreuzt und der Preis oberhalb der EMA liegt.
-Short-Entry, wenn die schnelle SMA die langsame SMA von oben nach unten kreuzt und der Preis unterhalb der EMA liegt.
-Standardparameter: `fast_length=5`, `slow_sma = sma(fast_length * 4)`, `EMA(200)` als Trendfilter.
+Single-Symbol Intraday-Breakout der ersten 30 Minuten (09:30-10:00 ET):
+- `or_range = or_high - or_low`
+- Long, wenn `close > or_high + or_range * breakout_buffer` (Default `0.2` aus `variant_2.py`)
+- Short, wenn `close < or_low - or_range * breakout_buffer`
+- Nur nach Abschluss der Opening Range, nur ein Trade pro ET-Tag.
+
+Die Session-Zeiten (09:30 ET Open, 15:45 ET Zwangs-Exit) werden aus den
+Bar-Timestamps in `America/New_York` abgeleitet. Bars vor 09:30 ET
+(z. B. Overnight-CFD-Bars) fliessen nicht in die Range ein.
 
 ### Exit
-Vollausstieg ausschliesslich ueber ATR-basiertes Take-Profit oder Stop-Loss.
-- Long: `limit = entry_price + ATR(14) * 2.0`, `stop = entry_price - ATR(14) * 1.0`
-- Short: `limit = entry_price - ATR(14) * 2.0`, `stop = entry_price + ATR(14) * 1.0`
+- Trailing Stop (Variante 2): Reversion um 1 % des Water Marks
+  - Long: Exit wenn `close < HWM - HWM * 0.01`
+  - Short: Exit wenn `close > LWM + LWM * 0.01`
+- Time-Exit: Zwangsglattstellung ab 15:45 ET (`time_exit`).
+- Hinweis: Auf 24h-CFD-Feeds (z. B. US500 mit Handelspause 16:00-18:00 ET) kann
+  der Fill des 15:45-Exits auf der naechsten verfuegbaren Bar liegen.
 
 ### Stop-Loss
-ATR-basierter Initial-Stop auf Basis des Fill-Preises.
-Long: `sl_price = entry_price - ATR(14) * 1.0`
-Short: `sl_price = entry_price + ATR(14) * 1.0`
+Der initiale Schutzabstand entspricht dem Trailing-Start (1 % vom Entry, da
+`HWM/LWM = Entry` bei Eroeffnung). Fuer das Runner Risk-Sizing emittiert der
+Context-Helper `sl_price` (Long: `close * 0.99`, Short: `close * 1.01`).
 
 ### Trailing Stop (falls vorhanden)
-Kein klassischer Trailing Stop. Der Adapter speichert fuer die Validierung die am Exit-Bar materialisierte Stop-Loss-Ebene.
+Siehe Exit: 1 % Reversion ab HWM/LWM, manuell nachgefuehrt ( Faithful zum
+`high_water_mark`/`low_water_mark` der Quelle).
 
 ### Partial Exits (falls vorhanden)
 Keine Partial Exits implementiert.
@@ -37,18 +44,23 @@ Keine Partial Exits implementiert.
 ## Indikator-Einstellungen
 | Indikator | Parameter | Wert |
 |-----------|-----------|------|
-| SMA Fast | Length | 5 |
-| SMA Slow | Length | 20 |
-| EMA Trend Filter | Length | 200 |
-| ATR | Period | 14 |
-| Take Profit | ATR Multiplier | 2.0 |
-| Stop Loss | ATR Multiplier | 1.0 |
-| EMA Filter | Enabled | true |
+| Opening Range | Minuten ab 09:30 ET | 30 |
+| Breakout Buffer | Vielfaches der OR-Range | 0.2 |
+| Trailing Reversion | Anteil vom Water Mark | 0.01 (1 %) |
+| Zwangs-Exit | Zeit (ET) | 15:45 |
+| Trades | Limit | 1 pro ET-Tag |
 
 ## Risk-Management
-- Stop-Distanz: ATR-basiert
+- Stop-Distanz: 1 % vom Entry-Preis (Trailing-Start)
 - Position Sizing: PyneCore-Adapter skaliert die finalen Trades auf `--risk-pct` und `sl_price`
 - Empfohlenes `--risk-pct`: 0.01 (1 % pro Trade)
+- Hinweis: Bei 100-%-Equity-Sizing koennen Short-Positionen bei adversen Ticks
+  vom Broker-Emulator per Margin-Call teilglattgestellt werden (1-Kontrakt-Stubs
+  im Ledger, Exit-Reason `margin_call`); mit `--risk-pct`-Sizing tritt das nicht auf.
 
 ## Framework-Empfehlung
-pynecore — die Strategie nutzt Pine-/PyneCore-typische `strategy.entry()` / `strategy.exit()`-Orderlogik und ist bereits als PyneCore-Skript umgesetzt.
+pynecore — die Strategie nutzt Pine-/PyneCore-typische `strategy.entry()` /
+`strategy.close()`-Orderlogik mit Session-Zeiten und wird als PyneCore-Skript
+ausgefuehrt. Der Context-Helper (`pynecore_orb_context.py`) bleibt bewusst
+reines pandas/numpy (kein `pynecore`-Import): Er laeuft im Runner-Prozess,
+das Skript selbst nur in der `pyne`-CLI.
