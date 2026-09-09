@@ -89,6 +89,18 @@ class BacktestConfig(BaseModel):
     max_position_exposure_pct: float | None = Field(None, gt=0.0)
     max_leverage: float | None = Field(None, gt=0.0)
     modeling_resolution: str = "main_timeframe"
+    # Fill convention for signal-driven
+    # exits in bar engines. "close" (default, unchanged legacy behavior) fills
+    # at the signal bar's close; "open" fills at its open — closer to MT5,
+    # which exits at the first tick inside the exit minute (~bar open).
+    # Stop-loss fills are unaffected (always the stop price).
+    signal_exit_fill: str = "close"
+    # Indicator warmup. When set (date
+    # string), market data is loaded from this earlier date so indicators
+    # needing history (e.g. daily ATR) are already warmed up at start_date.
+    # No orders are created and no signal exits fire before start_date; the
+    # equity curve starts at start_date. Empty (default) = legacy behavior.
+    warmup_start: str = ""
     data_dir: str = ""
     parameters: dict[str, Any] = Field(default_factory=dict)
 

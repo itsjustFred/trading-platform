@@ -218,6 +218,7 @@ class TradeEngine:
         stop_loss_price: float | None,
         direction: str,
         take_profit_price: float | None = None,
+        stop_distance: float | None = None,
     ) -> float:
         max_leverage = float(self.config.max_leverage or 1.0)
         fixed_risk_amount = self.config.parameters.get("fixed_risk_amount")
@@ -226,7 +227,16 @@ class TradeEngine:
 
         if fixed_risk_amount is not None and stop_loss_price is not None:
             risk_amount = float(fixed_risk_amount)
-            risk_distance = abs(float(entry_price) - float(stop_loss_price))
+            # MT5 parity: when the strategy provides an explicit stop distance
+            # (e.g. ATR-based, as the MT5 EA computes lots from the ATR
+            # distance at order time), size from it directly instead of
+            # deriving it from |entry - stop|. The derived form inherits
+            # fill-price noise (bid/ask, next-open gaps) that MT5 lots never
+            # see. Falls back to the derived form when no distance is given.
+            if stop_distance is not None and stop_distance > 0:
+                risk_distance = float(stop_distance)
+            else:
+                risk_distance = abs(float(entry_price) - float(stop_loss_price))
             if risk_amount > 0 and risk_distance > 0:
                 tick_value = float(self.config.parameters.get("tick_value", 1.0) or 1.0)
                 tick_size = float(self.config.parameters.get("tick_size", 1.0) or 1.0)
@@ -276,6 +286,31 @@ class TradeEngine:
     def _to_iso(value: Any) -> str:
         return to_iso_utc(value)
 
+    def _bar_spread(self, row: pd.Series) -> float:
+        """Per-bar spread surcharge in price units (ask = open + spread).
+
+        Opt-in via the ``spread_price_col`` strategy parameter naming a data
+        column with the spread in PRICE units (e.g. converted from MT5
+        spread points at ingest). Default off (0.0): all existing behavior
+        is unchanged. Only LONG market fills pay the spread (buys lift the
+        ask); SHORT fills and stop fills stay on the bid-side data, matching
+        MT5 order semantics tick-for-tick (verified: platform long entries
+        equaled MT5 entries exactly after adding open-side spread).
+        """
+        col = self.config.parameters.get("spread_price_col")
+        if not col:
+            return 0.0
+        try:
+            raw = row.get(col)
+        except (AttributeError, KeyError):
+            return 0.0
+        if raw is None or pd.isna(raw):
+            return 0.0
+        try:
+            return max(0.0, float(raw))
+        except (TypeError, ValueError):
+            return 0.0
+
     def _create_order(self, row: pd.Series, i: int, direction: str) -> None:
         entry_price = float(row["close"])
         stop_loss, tp_levels = self._extract_levels(row)
@@ -287,6 +322,7 @@ class TradeEngine:
             stop_loss_price=stop_loss,
             direction=direction,
             take_profit_price=take_profit,
+            stop_distance=stop_distance,
         )
         if qty <= 0:
             return
@@ -337,7 +373,13 @@ class TradeEngine:
 
             if order.order_type == OrderType.MARKET:
                 filled = i > order.created_index
-                fill_price = bar_open
+                # Spread-aware market fill: LONGs lift the ask (open + spread),
+                # SHORTs hit the bid (open). Matches MT5 fills tick-for-tick
+                # when the spread column carries per-bar ask-bid in price units.
+                if order.direction == "LONG":
+                    fill_price = bar_open + self._bar_spread(row)
+                else:
+                    fill_price = bar_open
             elif order.order_type == OrderType.LIMIT:
                 if order.direction == "LONG" and order.limit_price is not None:
                     filled = bar_low <= order.limit_price
@@ -387,6 +429,10 @@ class TradeEngine:
                     # sizing on the signal bar is only the pending-order
                     # estimate; market orders fill at the next bar's open and
                     # are re-sized there).
+                    # NOTE: unlike the MARKET path below, no explicit
+                    # stop_distance is forwarded here — trigger fills keep
+                    # sizing from |fill - stop|. Only MARKET orders carry
+                    # the MT5-parity distance sizing (intraday_volatility_breakout audit).
                     order.quantity = self._calculate_position_size(
                         entry_price=float(fill_price),
                         stop_loss_price=order.stop_loss,
@@ -413,6 +459,7 @@ class TradeEngine:
                         stop_loss_price=order.stop_loss,
                         direction=order.direction,
                         take_profit_price=take_profit,
+                        stop_distance=order.stop_distance,
                     )
                     if order.quantity <= 0:
                         continue
@@ -509,14 +556,26 @@ class TradeEngine:
         if not self.positions:
             return
 
-        close_price = float(row["close"])
+        # MT5 parity (strategy-test-audit): signal exits fill at the bar open
+        # when configured — MT5 exits at the first tick inside the exit
+        # minute, i.e. at the bar open, not the close. Closing a SHORT buys
+        # the ask (open + spread); closing a LONG sells the bid (open).
+        # Verified tick-for-tick: MT5 long time-exits == 22:55 bar open,
+        # short time-exits == 22:55 bar open + spread.
+        fill_at_open = (
+            str(getattr(self.config, "signal_exit_fill", "close")).lower()
+            == "open"
+        )
+        spread = self._bar_spread(row) if fill_at_open else 0.0
+        base_exit = float(row["open"]) if fill_at_open else float(row["close"])
         time_iso = self._to_iso(row["timestamp"])
         next_positions: list[Position] = []
 
         for position in self.positions:
+            exit_price = base_exit + (spread if position.direction == "SHORT" else 0.0)
             self._close_partial(
                 position,
-                price=close_price,
+                price=exit_price,
                 qty=position.remaining_qty,
                 time_iso=time_iso,
                 reason=reason,
@@ -580,6 +639,12 @@ class TradeEngine:
         for _, row in window.iterrows():
             sub_high = float(row["high"])
             sub_low = float(row["low"])
+            if position.direction == "SHORT":
+                sub_ask_high, sub_ask_low = self._ask_bar(row)
+                if sub_ask_high is not None:
+                    sub_high = sub_ask_high
+                if sub_ask_low is not None:
+                    sub_low = sub_ask_low
 
             # Conformance (Cleanup 16-A, F8): with intrabar data available the
             # actual chronological event wins — the shared helper classifies
@@ -597,6 +662,48 @@ class TradeEngine:
 
         return None
 
+    def _ask_bar(self, row: pd.Series) -> tuple[float | None, float | None]:
+        """Per-bar ask-side high/low in price units (opt-in).
+
+        MT5 triggers SHORT stops/TPs on the ASK, not the bid: a short stop
+        fills when ask-high >= stop. Enable via the ``ask_ohlc`` strategy
+        parameter (default False — legacy bid-only behavior unchanged).
+        Reads explicit ``ask_high``/``ask_low`` data columns when present
+        (exact, e.g. Dukascopy bid/ask M1); otherwise falls back to
+        bid high/low + ``spread_price_col`` spread when configured.
+        Returns (None, None) when neither is available.
+        """
+        if not bool(self.config.parameters.get("ask_ohlc", False)):
+            return None, None
+        spread = self._bar_spread(row)
+        ask_high = ask_low = None
+        try:
+            raw_high = row.get("ask_high")
+            raw_low = row.get("ask_low")
+        except (AttributeError, KeyError):
+            raw_high = raw_low = None
+        if raw_high is not None and pd.notna(raw_high):
+            try:
+                ask_high = float(raw_high)
+            except (TypeError, ValueError):
+                ask_high = None
+        if raw_low is not None and pd.notna(raw_low):
+            try:
+                ask_low = float(raw_low)
+            except (TypeError, ValueError):
+                ask_low = None
+        if ask_high is None or ask_low is None:
+            try:
+                base_high = float(row["high"])
+                base_low = float(row["low"])
+            except (KeyError, TypeError, ValueError):
+                return None, None
+            if ask_high is None:
+                ask_high = base_high + spread
+            if ask_low is None:
+                ask_low = base_low + spread
+        return ask_high, ask_low
+
     def _check_stops(self, row: pd.Series, i: int, next_time: pd.Timestamp | None) -> None:
         if not self.positions:
             return
@@ -611,11 +718,13 @@ class TradeEngine:
         time_iso = self._to_iso(row["timestamp"])
 
         remaining_positions: list[Position] = []
+        ask_high, ask_low = self._ask_bar(row)
         for position in self.positions:
             if position.direction == "LONG":
                 stop_hit = position.stop_loss is not None and bar_low <= float(position.stop_loss)
             else:
-                stop_hit = position.stop_loss is not None and bar_high >= float(position.stop_loss)
+                short_high = ask_high if ask_high is not None else bar_high
+                stop_hit = position.stop_loss is not None and short_high >= float(position.stop_loss)
 
             pending_tp = [
                 level for level in position.take_profit_levels if not bool(level.get("filled"))
@@ -623,7 +732,8 @@ class TradeEngine:
             if position.direction == "LONG":
                 tp_hit = any(bar_high >= float(level["price"]) for level in pending_tp)
             else:
-                tp_hit = any(bar_low <= float(level["price"]) for level in pending_tp)
+                short_low = ask_low if ask_low is not None else bar_low
+                tp_hit = any(short_low <= float(level["price"]) for level in pending_tp)
 
             first_tp_price = float(pending_tp[0]["price"]) if pending_tp else None
             first_event = None
@@ -801,6 +911,18 @@ class TradeEngine:
         self._indicator_series = self._build_indicator_series(indicators, frame)
         self.drawings = drawings
 
+        # Indicator warmup gate. When
+        # config.warmup_start is set, bars before start_date feed the
+        # indicators only — no orders, no exits, no equity points.
+        trade_from = None
+        if str(getattr(self.config, "warmup_start", "") or "").strip():
+            try:
+                trade_from = pd.to_datetime(
+                    getattr(self.config, "start_date", ""), utc=True
+                )
+            except (ValueError, TypeError):
+                trade_from = None
+
         total_bars = len(frame)
         progress_span = max(0.0, self._progress_end - self._progress_start)
         # Avoid noisy per-bar callbacks: at most once per 2% and at least every 1000 bars.
@@ -810,6 +932,10 @@ class TradeEngine:
 
         for i in range(total_bars):
             row = frame.iloc[i]
+            if trade_from is not None and pd.to_datetime(
+                row["timestamp"], utc=True
+            ) < trade_from:
+                continue  # warmup bar: indicators only, no trading
             next_time = frame.iloc[i + 1]["timestamp"] if i + 1 < total_bars else None
             signal_row = (
                 self._signals_frame.iloc[i] if self._signals_frame is not None else pd.Series()

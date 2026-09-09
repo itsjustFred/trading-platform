@@ -112,7 +112,12 @@ class NativeAdapter(EngineAdapter):
         total_loaded_bars = 0
 
         for symbol_index, symbol in enumerate(config.symbols):
-            data = _load_ohlcv(data_root, symbol, config.timeframe, config.start_date, config.end_date)
+            # warmup_start extends the
+            # loaded window backwards for indicator warmup; the engine gates
+            # trading to start_date..end_date.
+            warmup_raw = str(getattr(config, "warmup_start", "") or "").strip()
+            load_start = warmup_raw or config.start_date
+            data = _load_ohlcv(data_root, symbol, config.timeframe, load_start, config.end_date)
             if data is None or data.empty:
                 raise RuntimeError(
                     f"No OHLCV data for {symbol}/{config.timeframe} in "
@@ -135,7 +140,7 @@ class NativeAdapter(EngineAdapter):
                 symbol,
                 config.timeframe,
                 config.modeling_resolution,
-                config.start_date,
+                load_start,
                 config.end_date,
             )
             if intrabar is not None and not intrabar.empty and config.modeling_resolution not in used_timeframes:
