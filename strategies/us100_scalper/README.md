@@ -27,6 +27,15 @@ Session-Zeiten werden aus den Bar-Timestamps in `America/New_York` abgeleitet.
 - Stop-Loss-Exit am SL-Preis, sobald das Bar-Low den Stop beruehrt.
 - Time-Exit (EOD-Flatten) an der ersten Bar ab 16:00 ET zum Close.
 
+### Engine + Daten
+- Buy-Stop-Fills brauchen den `entry_stop`-Pfad des vectorbt-Adapters
+  (Fill am Stop bei Touch, sonst Open-Fallback); ein invertierter Stop
+  (SL auf der falschen Seite des Fills) wird lautstark uebersprungen.
+- Feed-Anforderung: konsistenter Single-Feed mit Stundenbalken
+  (`dukascopy/indices/USTEC/1h.parquet` ist defekt — interleavte Plain-
+  und Bid-Serien mit ~2000 Punkten Offset — und darf nicht verwendet
+  werden; validiert auf US500/1h bid-only).
+
 ### Parameter-Konflikt (infos.txt vs Code)
 `infos.txt` nennt Entry 0.5 / SL 0.1 / Buffer 0.12, der `.txt`-CODE nutzt
 `EntryOffsetPercent = 0.12` / `StopLossPercent = 0.10` /

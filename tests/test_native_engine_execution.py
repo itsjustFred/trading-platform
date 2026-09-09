@@ -229,7 +229,8 @@ def test_signal_exit_fill_open_short_pays_spread():
     assert trade.exits[0].price == 102.0 + 0.2
 
 
-def test_warmup_bars_feed_indicators_but_create_no_trades():    # Warmup (strategy-test-audit): bars before start_date warm indicators;
+def test_warmup_bars_feed_indicators_but_create_no_trades():
+    # Warmup (strategy-test-audit): bars before start_date warm indicators;
     # entries AND exits on them are ignored, the equity curve starts at start.
     frame = pd.DataFrame(
         {

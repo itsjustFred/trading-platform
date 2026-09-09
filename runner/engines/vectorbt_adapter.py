@@ -281,6 +281,7 @@ def _process_symbol(
     exits = execution_signals["exits"]
     stop_loss_series = _find_stop_loss_series(execution_signals, execution_indicators)
     take_profit_series = _find_take_profit_series(execution_signals, execution_indicators)
+    entry_stop_series = _find_entry_stop_series(execution_signals, execution_indicators)
     atr_series = _find_atr_series(execution_signals, execution_indicators)
     direction_series = _find_direction_series(execution_signals, execution_indicators)
     exit_price_series = _find_exit_price_series(execution_signals, execution_indicators)
@@ -303,7 +304,7 @@ def _process_symbol(
             entry_row = df.iloc[entry_idx]
             exit_row = df.iloc[i]
             direction = _resolve_direction(execution_signals, direction_series, entry_idx)
-            entry_price = _resolve_entry_price(entry_row)
+            entry_price = _resolve_entry_price(entry_row, direction, entry_stop_series, entry_idx)
             exit_price = _resolve_exit_price(exit_row, i, exit_price_series)
             exit_reason = _resolve_exit_reason(i, exit_reason_series)
             entry_ts = str(entry_row.get("timestamp", entry_row.name))
@@ -372,6 +373,30 @@ def _process_symbol(
                 sl_from_meta = trade_meta.get("sl_price")
                 if isinstance(sl_from_meta, (int, float)):
                     stop_price = float(sl_from_meta)
+
+            # Inverted-stop guard: a stop on the wrong side of the entry
+            # (LONG stop >= entry, SHORT stop <= entry) would produce an
+            # instantly-triggered, sign-flipped fantasy exit. This happens
+            # when a stop-order strategy's level is resolved against a
+            # market fill instead of its stop fill. Skip the trade loudly
+            # instead of compounding garbage into equity.
+            if stop_price is not None:
+                inverted = (
+                    direction == "LONG" and stop_price >= entry_price
+                ) or (direction != "LONG" and stop_price <= entry_price)
+                if inverted:
+                    _warn_once(
+                        (symbol, config.timeframe, "inverted_stop"),
+                        "Skipping %s/%s trade at %s: %s stop %.6f is on the "
+                        "wrong side of entry %.6f",
+                        symbol,
+                        config.timeframe,
+                        entry_ts,
+                        direction,
+                        stop_price,
+                        entry_price,
+                    )
+                    continue
 
             if stop_distance is None and stop_price is not None:
                 stop_distance = abs(entry_price - stop_price)
@@ -476,7 +501,12 @@ def _build_vectorbt_trade(
     entry_row = df.iloc[entry_idx]
     exit_row = df.iloc[i]
     direction = _resolve_direction(execution_signals, ctx.direction_series, entry_idx)
-    entry_price = _resolve_entry_price(entry_row)
+    entry_price = _resolve_entry_price(
+        entry_row,
+        direction,
+        _find_entry_stop_series(execution_signals, execution_indicators),
+        entry_idx,
+    )
     exit_price = _resolve_exit_price(exit_row, i, ctx.exit_price_series)
     exit_reason = _resolve_exit_reason(i, ctx.exit_reason_series)
     entry_ts = str(entry_row.get("timestamp", entry_row.name))
@@ -987,6 +1017,8 @@ def _find_indicator_series(
             return series
         if kind == "exit_reason" and lowered == "exit_reason":
             return series
+        if kind == "entry_stop" and lowered == "entry_stop":
+            return series
         if kind == "atr" and lowered.startswith("atr"):
             return series
     return None
@@ -1014,6 +1046,10 @@ def _find_exit_price_series(signals: pd.DataFrame, indicators: IndicatorMap) -> 
 
 def _find_exit_reason_series(signals: pd.DataFrame, indicators: IndicatorMap) -> pd.Series | None:
     return _find_indicator_series(signals, indicators, kind="exit_reason")
+
+
+def _find_entry_stop_series(signals: pd.DataFrame, indicators: IndicatorMap) -> pd.Series | None:
+    return _find_indicator_series(signals, indicators, kind="entry_stop")
 
 
 def _normalize_direction_value(value: Any) -> str:
@@ -1045,7 +1081,33 @@ def _resolve_exit_price(
     return float(exit_row["close"])
 
 
-def _resolve_entry_price(entry_row: pd.Series) -> float:
+def _resolve_entry_price(
+    entry_row: pd.Series,
+    direction: str,
+    entry_stop_series: pd.Series | None,
+    entry_idx: int,
+) -> float:
+    """Resolve the fill price for an entry bar.
+
+    Strategies expressing stop orders (e.g. buy-stop scalpers) publish an
+    ``entry_stop`` level: a LONG fills at the stop when the bar traded
+    through it (``high >= stop``), a SHORT when ``low <= stop`` -- matching
+    stop-market semantics instead of the default next-open market fill.
+    Without a usable stop level the legacy open/close fallback applies, so
+    strategies without ``entry_stop`` behave exactly as before.
+    """
+    if entry_stop_series is not None:
+        stop = entry_stop_series.iloc[entry_idx]
+        if pd.notna(stop) and float(stop) > 0:
+            stop = float(stop)
+            high = entry_row.get("high")
+            low = entry_row.get("low")
+            if direction == "LONG":
+                if high is not None and pd.notna(high) and float(high) >= stop:
+                    return stop
+            else:
+                if low is not None and pd.notna(low) and float(low) <= stop:
+                    return stop
     open_value = entry_row.get("open")
     if open_value is not None and pd.notna(open_value):
         return float(open_value)
