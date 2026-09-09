@@ -17,13 +17,22 @@ import pandas as pd
 
 STRATEGY_META = {
     "name": "Single-Leg Z-Score Mean Reversion",
-    "version": "1.1.0",
+    "version": "1.2.0",
     "source_url": "https://github.com/desenyon/quantconnect-strategies/blob/main/statistical_arbitrage_pairs.py",
     "notes": (
         "- KEIN Pairs-Trading: der Z-Score wird auf den kumulierten Log-"
         "Returns des EINZELNEN Instruments berechnet (Single-Leg Mean "
         "Reversion), nicht auf einem Spread zwischen zwei Instrumenten.\n"
-        "- Long-only; keine Market-Neutral-Absicherung."
+        "- Long-only; keine Market-Neutral-Absicherung.\n"
+        "- Quellen-Schwellen exakt: Lookback 60, Entry |z| >= 2.0, "
+        "Mean-Reversion-Exit bei z >= -0.5, statistischer Fail-Stop bei "
+        "z <= -4.0 (stop_zscore der Quelle).\n"
+        "- KEIN ATR-Stop im Standard (Erfingung des Ports, entfernt "
+        "2026-09-09); Opt-in via use_atr_stop=true. Die Quelle kennt "
+        "kein ATR. Sizing ohne Stop faellt auf Engine-Fallbacks zurueck.\n"
+        "- Dropped (nicht single-symbol-exprimierbar): zweites Bein, "
+        "Kalman-Hedge-Ratio, Korrelations-/Half-Life-Validierung, "
+        "Short-Spread-Seite."
     ),
     "tags": {
         "type": ["mean-reversion", "single-instrument", "z-score"],
@@ -45,6 +54,9 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
     entry_zscore = float(params.get("entry_zscore", 2.0))
     exit_zscore = float(params.get("exit_zscore", 0.5))
     stop_zscore = float(params.get("stop_zscore", 4.0))
+    # Opt-in extra (default OFF - not source behavior; the source knows
+    # no ATR at all).
+    use_atr_stop = bool(params.get("use_atr_stop", False))
     atr_period = int(params.get("atr_period", 14))
     atr_stop_mult = float(params.get("atr_stop_mult", 2.0))
 
@@ -56,15 +68,18 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
     rolling_mean = cum_ret.rolling(lookback).mean()
     rolling_std = cum_ret.rolling(lookback).std().replace(0, np.nan)
     zscore = (cum_ret - rolling_mean) / rolling_std
-    tr = pd.concat(
-        [
-            high - low,
-            (high - close.shift(1)).abs(),
-            (low - close.shift(1)).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-    atr = tr.rolling(atr_period).mean()
+    atr = None
+    if use_atr_stop:
+        prev_close = close.shift(1)
+        tr = pd.concat(
+            [
+                high - low,
+                (high - prev_close).abs(),
+                (low - prev_close).abs(),
+            ],
+            axis=1,
+        ).max(axis=1)
+        atr = tr.ewm(alpha=1.0 / atr_period, min_periods=atr_period, adjust=False).mean()
 
     entries = pd.Series(False, index=df.index)
     exits = pd.Series(False, index=df.index)
@@ -79,7 +94,11 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
         if pd.isna(z_value):
             continue
         if in_long:
-            stop_hit = pd.notna(active_stop) and float(low.iloc[i]) <= float(active_stop)
+            stop_hit = (
+                use_atr_stop
+                and pd.notna(active_stop)
+                and float(low.iloc[i]) <= float(active_stop)
+            )
             mean_reversion_hit = z_value >= -exit_zscore
             zscore_stop_hit = z_value <= -stop_zscore
             if stop_hit or mean_reversion_hit or zscore_stop_hit:
@@ -98,21 +117,23 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
         elif z_value <= -entry_zscore:
             entries.iloc[i] = True
             in_long = True
-            atr_value = atr.iloc[i]
-            if pd.notna(atr_value):
-                active_stop = float(close.iloc[i]) - float(atr_value) * atr_stop_mult
-                sl_price.iloc[i] = active_stop
+            if use_atr_stop and atr is not None:
+                atr_value = atr.iloc[i]
+                if pd.notna(atr_value):
+                    active_stop = float(close.iloc[i]) - float(atr_value) * atr_stop_mult
+                    sl_price.iloc[i] = active_stop
 
     indicators_dict = {
         "ZScore": zscore,
         "ZScore_at_exit": zscore,
         "Rolling_Mean": rolling_mean,
         "Rolling_Std": rolling_std,
-        "ATR": atr,
         "sl_price": sl_price,
         "exit_price": exit_price,
         "exit_reason": exit_reason,
     }
+    if atr is not None:
+        indicators_dict["ATR"] = atr
     drawings: list[dict] = []
     if "timestamp" in df.columns:
         entry_times = pd.to_datetime(

@@ -4,8 +4,13 @@ Regression-Test fuer Strategie: Sector Rotation
 Smoke-Test: stellt sicher, dass zukuenftige Core-Updates die Strategie-Logik
 nicht unbemerkt brechen. Getestet auf einem festen Zeitraum mit genuegend Warmup.
 
-Validiert am: 2026-03-08
+Validiert am: 2026-09-09
 Symbol/Timeframe: AAPL / 1d
+
+Historie: Erwartungen am 2026-09-09 neu kalibriert (17 Trades / -1576.84
+waren mit erfundenem ATR-Stop, Mom63<0-Exit und 10d-Schwaeche-Exit
+erzeugt; Standard ist jetzt nur der Trendbruch-Exit, die drei erfundenen
+Exits sind Opt-in default-OFF).
 """
 
 import math
@@ -25,8 +30,8 @@ TEST_START = "2023-01-01"
 TEST_END = "2024-12-31"
 TEST_SYMBOL = "AAPL"
 TEST_TIMEFRAME = "1d"
-EXPECTED_TRADE_COUNT = 17
-EXPECTED_NET_PROFIT = -1576.84
+EXPECTED_TRADE_COUNT = 1
+EXPECTED_NET_PROFIT = -11.84
 
 
 @pytest.fixture(scope="module")
@@ -59,17 +64,80 @@ class TestStrategyRegression:
     def test_trade_meta_contains_core_indicator(self, backtest_result):
         for trade in backtest_result.trades:
             assert "Momentum_63" in trade.meta, f"Trade {trade.id}: 'Momentum_63' fehlt in trade.meta"
-            assert "sl_price" in trade.meta, f"Trade {trade.id}: 'sl_price' fehlt in trade.meta"
+            # sl_price gibt es im Standard NICHT mehr (erfundener ATR-Stop
+            # entfernt; nur mit use_atr_stop=true vorhanden).
 
     def test_no_trade_exceeds_risk_limit(self, backtest_result):
         equity = 100_000.0
         for trade in backtest_result.trades:
-            sl = trade.meta.get("sl_price")
-            assert sl is not None, f"Trade {trade.id}: 'sl_price' fehlt in trade.meta"
-            stop_dist = abs(trade.entry_price - sl)
-            risk_usd = stop_dist * trade.quantity
-            risk_pct = risk_usd / equity
+            risk_math = trade.meta.get("risk_math", {})
+            stop_distance = risk_math.get("stop_distance")
+            assert stop_distance is not None and stop_distance > 0, (
+                f"Trade {trade.id}: keine Stop-Distanz in risk_math"
+            )
+            risk_pct = (stop_distance * trade.quantity) / risk_math.get(
+                "equity_at_entry", equity
+            )
             assert risk_pct <= 0.015, (
                 f"Trade {trade.id}: Risk {risk_pct*100:.2f}% ueberschreitet Limit von 1.5%"
             )
             equity += trade.pnl
+
+
+def _load_strategy():
+    import importlib.util
+    from pathlib import Path
+
+    spec = importlib.util.spec_from_file_location(
+        "sector", str(Path(STRATEGY_PATH))
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _synthetic_df(n=400, start=100.0, drift=0.002):
+    import numpy as np
+    import pandas as pd
+
+    rng = np.random.default_rng(11)
+    rets = drift + rng.normal(0, 0.01, n)
+    close = pd.Series(start * np.exp(np.cumsum(rets)))
+    return pd.DataFrame(
+        {
+            "close": close,
+            "high": close * 1.005,
+            "low": close * 0.995,
+            "open": close.shift(1).fillna(start),
+            "volume": 1_000_000.0,
+        }
+    )
+
+
+class TestSourceFidelity:
+    def test_invented_exits_absent_by_default(self):
+        mod = _load_strategy()
+        _, _, ind, _ = mod.generate_signals(_synthetic_df(), {})
+        reasons = set(ind["exit_reason"].dropna().unique())
+        assert reasons <= {"trend_break"}, reasons
+        assert ind["sl_price"].dropna().empty
+
+    def test_opt_in_exits_trigger(self):
+        mod = _load_strategy()
+        df = _synthetic_df()
+        _, _, ind, _ = mod.generate_signals(
+            df,
+            {
+                "use_atr_stop": True,
+                "use_momentum_exit": True,
+                "use_weakness_exit": True,
+            },
+        )
+        assert not ind["sl_price"].dropna().empty
+        reasons = set(ind["exit_reason"].dropna().unique())
+        assert reasons <= {
+            "stop_loss",
+            "trend_break",
+            "momentum_break",
+            "short_weakness",
+        }, reasons

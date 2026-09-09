@@ -4,8 +4,13 @@ Regression-Test fuer Strategie: Statistical Arbitrage Pairs
 Smoke-Test: stellt sicher, dass zukuenftige Core-Updates die Strategie-Logik
 nicht unbemerkt brechen. Getestet auf einem festen Zeitraum mit genuegend Warmup.
 
-Validiert am: 2026-03-08
+Validiert am: 2026-09-09
 Symbol/Timeframe: AAPL / 1d
+
+Historie: Erwartungen am 2026-09-09 neu kalibriert (11 Trades / 4006.10
+mit erfundenem ATR-Stop erzeugt, der 4 Trades frueh stoppte; Quelle:
+nur z-Score-Exits, kein ATR-Stop — jetzt 7 Trades, alle
+mean_reversion).
 """
 
 import math
@@ -25,8 +30,8 @@ TEST_START = "2021-01-01"
 TEST_END = "2024-12-31"
 TEST_SYMBOL = "AAPL"
 TEST_TIMEFRAME = "1d"
-EXPECTED_TRADE_COUNT = 11
-EXPECTED_NET_PROFIT = 4006.10
+EXPECTED_TRADE_COUNT = 7
+EXPECTED_NET_PROFIT = 12224.60
 
 
 @pytest.fixture(scope="module")
@@ -59,17 +64,68 @@ class TestStrategyRegression:
     def test_trade_meta_contains_core_indicator(self, backtest_result):
         for trade in backtest_result.trades:
             assert "ZScore" in trade.meta, f"Trade {trade.id}: 'ZScore' fehlt in trade.meta"
-            assert "sl_price" in trade.meta, f"Trade {trade.id}: 'sl_price' fehlt in trade.meta"
+            # sl_price gibt es im Standard NICHT mehr (erfundener ATR-Stop
+            # entfernt; nur mit use_atr_stop=true vorhanden).
 
     def test_no_trade_exceeds_risk_limit(self, backtest_result):
         equity = 100_000.0
         for trade in backtest_result.trades:
-            sl = trade.meta.get("sl_price")
-            assert sl is not None, f"Trade {trade.id}: 'sl_price' fehlt in trade.meta"
-            stop_dist = abs(trade.entry_price - sl)
-            risk_usd = stop_dist * trade.quantity
-            risk_pct = risk_usd / equity
+            risk_math = trade.meta.get("risk_math", {})
+            stop_distance = risk_math.get("stop_distance")
+            assert stop_distance is not None and stop_distance > 0, (
+                f"Trade {trade.id}: keine Stop-Distanz in risk_math"
+            )
+            risk_pct = (stop_distance * trade.quantity) / risk_math.get(
+                "equity_at_entry", equity
+            )
             assert risk_pct <= 0.015, (
                 f"Trade {trade.id}: Risk {risk_pct*100:.2f}% ueberschreitet Limit von 1.5%"
             )
             equity += trade.pnl
+
+
+def _load_strategy():
+    import importlib.util
+    from pathlib import Path
+
+    spec = importlib.util.spec_from_file_location(
+        "statarb", str(Path(STRATEGY_PATH))
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class TestSourceFidelity:
+    def test_no_atr_stop_by_default_opt_in_emits_stop(self):
+        import numpy as np
+        import pandas as pd
+
+        mod = _load_strategy()
+        rng = np.random.default_rng(5)
+        close = pd.Series(100 * np.exp(np.cumsum(rng.normal(0, 0.02, 500))))
+        df = pd.DataFrame(
+            {
+                "close": close,
+                "high": close * 1.005,
+                "low": close * 0.995,
+                "open": close.shift(1).fillna(close.iloc[0]),
+                "volume": 1_000_000.0,
+            }
+        )
+        _, _, ind_default, _ = mod.generate_signals(df, {})
+        assert "ATR" not in ind_default
+        assert ind_default["sl_price"].dropna().empty
+        _, _, ind_stop, _ = mod.generate_signals(df, {"use_atr_stop": True})
+        assert "ATR" in ind_stop
+        assert not ind_stop["sl_price"].dropna().empty
+
+    def test_threshold_defaults_match_source(self):
+        import inspect
+
+        mod = _load_strategy()
+        src = inspect.getsource(mod.generate_signals)
+        assert 'params.get("lookback", 60)' in src
+        assert 'params.get("entry_zscore", 2.0)' in src
+        assert 'params.get("exit_zscore", 0.5)' in src
+        assert 'params.get("stop_zscore", 4.0)' in src
