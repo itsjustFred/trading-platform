@@ -39,6 +39,7 @@ from runner.engines.contract import (
     EngineStatsKeys,
     apply_date_filter,
     flag_missing_intrabar,
+    normalize_ohlcv_frame,
     parse_date_bound,
     resolve_intrabar_timeframe,
     resolve_same_bar_exit,
@@ -1611,3 +1612,22 @@ class TestPynecoreRestatementContainment:
                 _normalize_trade_exits(trades)
                 assert trades[0].exits[-1].price == pytest.approx(sl)
                 assert trades[0].exits[-1].reason == "stop_loss"
+
+
+def test_normalize_ohlcv_frame_fills_missing_and_all_nan_from_bid():
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=4, freq="h", tz="UTC"),
+            "high": [np.nan] * 4,  # all-NaN canonical (index feeds)
+            "low": [1.0, 1.1, 1.2, 1.3],  # healthy canonical wins
+            "bid_high": [2.0, 2.1, 2.2, 2.3],
+            "bid_low": [9.0, 9.1, 9.2, 9.3],
+            "bid_close": [3.0, np.nan, 3.2, 3.3],  # partial NaN stays NaN (no close col)
+            "ask_high": [2.5, 2.6, 2.7, 2.8],  # ask_* must survive
+        }
+    )
+    out = normalize_ohlcv_frame(frame)
+    assert out["high"].tolist() == [2.0, 2.1, 2.2, 2.3]
+    assert out["low"].tolist() == [1.0, 1.1, 1.2, 1.3]
+    assert "open" not in out.columns  # no bid_open -> not fabricated
+    assert out["ask_high"].tolist() == [2.5, 2.6, 2.7, 2.8]

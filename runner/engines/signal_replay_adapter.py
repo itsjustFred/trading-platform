@@ -863,7 +863,7 @@ class SignalReplayEngine:
             except (ValueError, OSError):
                 continue
             frame.columns = [str(column).lower() for column in frame.columns]
-            frame = contract.normalize_ohlcv_columns(frame)
+            frame = contract.normalize_ohlcv_frame(frame)
             if "timestamp" not in frame.columns:
                 continue
             frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")

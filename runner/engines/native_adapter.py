@@ -44,7 +44,7 @@ def _load_ohlcv(data_root: Path, symbol: str, timeframe: str, start: str, end: s
 
     df = pd.read_parquet(matches[0])
     df.columns = [str(col).lower() for col in df.columns]
-    df = contract.normalize_ohlcv_columns(df)
+    df = contract.normalize_ohlcv_frame(df)
     if "timestamp" not in df.columns:
         return None
 

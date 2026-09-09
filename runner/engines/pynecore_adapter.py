@@ -787,7 +787,7 @@ def _load_ohlcv(
 
     df = pd.read_parquet(matches[0])
     df.columns = [c.lower() for c in df.columns]
-    df = contract.normalize_ohlcv_columns(df)
+    df = contract.normalize_ohlcv_frame(df)
 
     if "timestamp" in df.columns:
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
