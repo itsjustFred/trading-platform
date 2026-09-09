@@ -1112,6 +1112,7 @@ def _load_ohlcv(
     selected_path = matches[0]
     df = pd.read_parquet(selected_path)
     df.columns = [c.lower() for c in df.columns]
+    df = contract.normalize_ohlcv_columns(df)
 
     if "timestamp" in df.columns:
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)

@@ -185,6 +185,25 @@ def apply_date_filter(
     return frame
 
 
+# ─── OHLCV column normalization (bid_/ask_-prefixed feeds) ─────────────────
+
+
+def normalize_ohlcv_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    """Map vendor-prefixed OHLCV columns to canonical ``open/high/low/close``.
+
+    Dukascopy index/energy feeds store ``bid_open/bid_high/...`` (plus
+    ``ask_*``) instead of plain OHLC. Strategies and adapters expect the
+    canonical names, so when a canonical column is missing it is filled from
+    its ``bid_`` counterpart (the bid side is the conservative, MT5-chart
+    equivalent series). Existing canonical columns always win; ``ask_*``
+    columns are preserved untouched (e.g. for ask-side stop monitoring).
+    """
+    for canonical in ("open", "high", "low", "close", "volume"):
+        if canonical not in frame.columns and f"bid_{canonical}" in frame.columns:
+            frame[canonical] = frame[f"bid_{canonical}"]
+    return frame
+
+
 # ─── Same-bar stop / take-profit priority (F8) ──────────────────────────────
 
 
