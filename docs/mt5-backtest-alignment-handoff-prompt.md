@@ -13,7 +13,7 @@ Recent commits already did the first round of comparison work:
 
 Read these first:
 
-- `reports/strategy-comparison-platform-check-2026-06-23.md`
+- `reports/strategy-comparison-platform-check-2026-06-23.md` (historisch, mit `reports/`-Ordner entfernt; Vergleichsbasis heute: `strategy-comparisons/`)
 - `strategy-comparisons/intraday_volatility_breakout/EURUSD_H1.html`
 - `strategy-comparisons/intraday_volatility_breakout/SP500_M1.html`
 - `strategy-comparisons/intraday_volatility_breakout/US100_M15.html`
@@ -22,7 +22,7 @@ Read these first:
 - `runner/engines/native_adapter.py`
 - `runner/engines/vectorbt_adapter.py`
 - `data_tools/downloaders/dukascopy_native.py`
-- `todo/codex-todo.md`
+- `todo/codex-todo.md` (historisch, alte Todo-Lage; aktuelle Stand: `docs/todo/todo.md`)
 
 Important correction: Dukascopy does have intraday US index CFDs. Do not reintroduce old notes that say otherwise. `SP500`/`US500` and `US100`/`NAS100`/`USTEC` should use Dukascopy, not yfinance proxies.
 
@@ -34,17 +34,17 @@ Baseline platform runs before strategy alignment:
 
 | Reference | Platform artifact | Trades | PnL | Profit Factor | Sharpe |
 |---|---:|---:|---:|---:|---:|
-| EURUSD H1 | `reports/strategy_comparison_backtest_EURUSD_H1_20260623.trades.json` | 217 | -267.96 | 0.7806 | -1.2609 |
-| SP500 M1 | `reports/strategy_comparison_backtest_SP500_M1_20260623.trades.json` | 79 | 6825.47 | 17.5496 | 0.2410 |
-| US100 M15 | `reports/strategy_comparison_backtest_US100_M15_20260623.trades.json` | 34 | 10655.24 | 11.5610 | 0.2924 |
+| EURUSD H1 | `[entfernt] reports/strategy_comparison_backtest_EURUSD_H1_20260623.trades.json` | 217 | -267.96 | 0.7806 | -1.2609 |
+| SP500 M1 | `[entfernt] reports/strategy_comparison_backtest_SP500_M1_20260623.trades.json` | 79 | 6825.47 | 17.5496 | 0.2410 |
+| US100 M15 | `[entfernt] reports/strategy_comparison_backtest_US100_M15_20260623.trades.json` | 34 | 10655.24 | 11.5610 | 0.2924 |
 
 After first strategy alignment:
 
 | Reference | Platform artifact | Trades | PnL | Profit Factor | Sharpe |
 |---|---:|---:|---:|---:|---:|
-| EURUSD H1 | `reports/strategy_comparison_backtest_EURUSD_H1_after_align_20260623.trades.json` | 71 | 11310.19 | 1.7590 | 0.3453 |
-| SP500 M1 | `reports/strategy_comparison_backtest_SP500_M1_after_align_20260623.trades.json` | 239 | -4800.04 | 0.7227 | -0.2174 |
-| US100 M15 | `reports/strategy_comparison_backtest_US100_M15_after_align_20260623.trades.json` | 319 | -5598.22 | 0.8072 | -0.4270 |
+| EURUSD H1 | `[entfernt] reports/strategy_comparison_backtest_EURUSD_H1_after_align_20260623.trades.json` | 71 | 11310.19 | 1.7590 | 0.3453 |
+| SP500 M1 | `[entfernt] reports/strategy_comparison_backtest_SP500_M1_after_align_20260623.trades.json` | 239 | -4800.04 | 0.7227 | -0.2174 |
+| US100 M15 | `[entfernt] reports/strategy_comparison_backtest_US100_M15_after_align_20260623.trades.json` | 319 | -5598.22 | 0.8072 | -0.4270 |
 
 MT5 references still differ materially, especially for SP500 and US100.
 
@@ -152,8 +152,8 @@ Plan a tool, for example:
 ```bash
 python -m scripts.compare_mt5_report \
   --mt5 strategy-comparisons/intraday_volatility_breakout/SP500_M1.html \
-  --platform reports/strategy_comparison_backtest_SP500_M1_after_align_20260623.trades.json \
-  --output reports/mt5_alignment_SP500_M1_YYYYMMDD.md
+  --platform [entfernt] reports/strategy_comparison_backtest_SP500_M1_after_align_20260623.trades.json \
+  --output docs/reports/mt5_alignment_SP500_M1_YYYYMMDD.md
 ```
 
 It should compare:

@@ -260,7 +260,7 @@ Kommentar      str
 
 ## Mapping zu `ValidationReference`
 
-> `ValidationReference` ist das zentrale Domänenmodell des Strategy Validation Frameworks (vgl. `todo/kimchi-todo.md`). Es aggregiert normalisierte Backtest-Daten unabhängig vom externen Framework.
+> `ValidationReference` ist das zentrale Domänenmodell des Strategy Validation Frameworks. Es aggregiert normalisierte Backtest-Daten unabhängig vom externen Framework.
 
 ### Pflichtfelder (Top-Level)
 

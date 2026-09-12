@@ -157,7 +157,7 @@ Berücksichtige dabei:
 - Gib bei jedem Daten-Download den Befehl, die erwartete Dauer und das Zielverzeichnis an.
 
 **WICHTIG — Setup-Dokumentation:**
-- Recherchiere in den vorhandenen Docs (`docs/`, `README.md`, `reports/`), was jeweils zum Setup/Skalieren/Deployment benötigt wird.
+- Recherchiere in den vorhandenen Docs (`docs/`, `README.md`, `docs/reports/` — früher `reports/`, im Repo-Cleanup entfernt), was jeweils zum Setup/Skalieren/Deployment benötigt wird.
 - Gib konkrete Prompts/Checklisten, die Fred oder ein Agent direkt ausführen kann.
 
 **WICHTIG — Branching:**

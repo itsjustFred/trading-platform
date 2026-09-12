@@ -320,7 +320,7 @@ Golden tests should assert event-level facts, not only final summary metrics:
 2. Preserve existing artifact behavior until a branch explicitly changes a
    documented execution model.
 3. Keep branch ownership disjoint as listed in
-   `reports/architecture-orchestration-plan-20260713.md`.
+   `reports/architecture-orchestration-plan-20260713.md` (historisch, mit `reports/`-Ordner entfernt).
 4. Rebase dependent branches after contract changes merge.
 5. Do not tune MT5/QC parity numbers without stronger reference evidence.
 6. Every branch must document changed contracts, focused tests, and remaining
