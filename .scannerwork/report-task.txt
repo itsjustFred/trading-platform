@@ -1,6 +1,0 @@
-projectKey=trading-platform-local
-serverUrl=http://localhost:9000
-serverVersion=26.8.0.126808
-dashboardUrl=http://localhost:9000/dashboard?id=trading-platform-local
-ceTaskId=257d3859-e8bd-4681-b6e1-b08b5c359106
-ceTaskUrl=http://localhost:9000/api/ce/task?id=257d3859-e8bd-4681-b6e1-b08b5c359106

@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<title>Cleanup-Kampagne — Abschluss-Report (2026-09-04)</title>
+<style>
+  :root {
+    --green: #1a7f37; --green-bg: #dafbe1;
+    --red: #cf222e; --red-bg: #ffebe9;
+    --yellow: #9a6700; --yellow-bg: #fff8c5;
+    --blue: #0969da; --blue-bg: #ddf4ff;
+    --gray: #57606a; --gray-bg: #f6f8fa;
+    --border: #d0d7de;
+  }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; margin: 0; padding: 24px; background: #fff; color: #1f2328; line-height: 1.45; }
+  h1 { font-size: 26px; border-bottom: 2px solid var(--border); padding-bottom: 12px; }
+  h2 { font-size: 20px; margin-top: 32px; border-bottom: 1px solid var(--border); padding-bottom: 8px; }
+  h3 { font-size: 16px; margin-top: 20px; }
+  .summary { display: flex; gap: 16px; flex-wrap: wrap; margin: 20px 0; }
+  .stat { border: 1px solid var(--border); border-radius: 8px; padding: 14px 20px; min-width: 150px; }
+  .stat .num { font-size: 30px; font-weight: 700; }
+  .stat .lbl { font-size: 13px; color: var(--gray); }
+  .ok .num { color: var(--green); }
+  table { border-collapse: collapse; width: 100%; margin: 16px 0; font-size: 13.5px; }
+  th, td { border: 1px solid var(--border); padding: 6px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--gray-bg); position: sticky; top: 0; }
+  tr:nth-child(even) { background: #fafbfc; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 11.5px; font-weight: 600; white-space: nowrap; }
+  .b-ready { background: var(--green-bg); color: var(--green); }
+  .b-partial { background: var(--yellow-bg); color: var(--yellow); }
+  .b-artifact { background: var(--blue-bg); color: var(--blue); }
+  .b-blocked { background: var(--red-bg); color: var(--red); }
+  a { color: var(--blue); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code { background: var(--gray-bg); padding: 1px 5px; border-radius: 4px; font-size: 12.5px; }
+  .merge-order { counter-reset: mo; }
+  .merge-order li { margin: 8px 0; }
+  .merge-order li::marker { font-weight: 700; color: var(--blue); }
+  .risk { color: var(--gray); font-size: 12.5px; }
+  .warn { border-left: 4px solid var(--yellow); background: var(--yellow-bg); padding: 10px 14px; margin: 12px 0; }
+  .note { border-left: 4px solid var(--blue); background: var(--blue-bg); padding: 10px 14px; margin: 12px 0; }
+  .critical { border-left: 4px solid var(--red); background: var(--red-bg); padding: 10px 14px; margin: 12px 0; }
+  .footer { margin-top: 40px; padding-top: 16px; border-top: 1px solid var(--border); color: var(--gray); font-size: 12.5px; }
+  .epic-head td { background: #eef1f4; font-weight: 700; }
+</style>
+</head>
+<body>
+
+<h1>Cleanup-Kampagne — Abschluss-Report</h1>
+<p><strong>Repo:</strong> itsjustFred/trading-platform · <strong>Baseline:</strong> <code>6caf461</code> (origin/main) · <strong>Erzeugt:</strong> 2026-09-04 · <strong>Modus:</strong> Orchestrierte Multi-Agent-Kampagne (Claude Code Workflows + Serial-Agents), alle 26 Sub-Issues der Epics #14–#20 implementiert, reviewt und <code>ready-for-human</code> gelabelt. <strong>Nichts gemergt</strong> — Merge-Entscheidungen beim Human. <strong>Stand 2026-09-04 abends:</strong> alle Merge-Blocker abgearbeitet — Gruppe-C-Sign-offs 10/10 gepostet, #61 human-freigegeben, #62 gefixt+Pipeline re-run, Money-Path-Rehearsal 334/334 grün (Abschnitt 3.2d).</p>
+
+<div class="summary">
+  <div class="stat ok"><div class="num">26/26</div><div class="lbl">PRs ready-for-human</div></div>
+  <div class="stat ok"><div class="num">26</div><div class="lbl">Sub-Issues (#21–#46) implementiert</div></div>
+  <div class="stat"><div class="num">~410</div><div class="lbl">Review-Findings behoben (geschätzt, Summe aller Stufen)</div></div>
+  <div class="stat"><div class="num">7</div><div class="lbl">Mutation-Testing-PRs (gemäß Vorgabe)</div></div>
+  <div class="stat"><div class="num">3</div><div class="lbl">Gate-Artefakt-PRs (siehe Offene Punkte)</div></div>
+</div>
+
+<h2>1. Übersicht aller 26 PRs</h2>
+<p>Status-Badges: <span class="badge b-ready">ready</span> = Pipeline komplett grün + Label gesetzt · <span class="badge b-artifact">Gate-Artefakt</span> = Sonar-QG rot wegen stale-main-Perioden-Artefakt, 0 Issues auf geänderten Zeilen (im PR-Body dokumentiert) · <span class="badge b-partial">Teil-AC</span> = AC-Anteil bewusst als Follow-up dokumentiert.</p>
+
+<table>
+<thead><tr><th>Sub-Issue</th><th>PR</th><th>Titel</th><th>Zyklen</th><th>Status</th><th>Highlight / Auffälligkeit</th></tr></thead>
+<tbody>
+<tr class="epic-head"><td colspan="6">Epic #14 — Sonar-Batches (Lückenfüller zwischen Review-Wellen)</td></tr>
+<tr><td>#45 14-A</td><td><a href="https://github.com/itsjustFred/trading-platform/pull/63">PR #63</a></td><td>TypeScript mechanics batch</td><td>5</td><td><span class="badge b-ready">ready</span></td><td>Alle 32 Scope-Regeln → 0; Batch-Gate 46 Files ≤ 150; S3776-Extraktionen (LiveHub/TradeChartPage/BacktestsPage/Services)</td></tr>
+<tr><td>#46 14-B</td><td><a href="https://github.com/itsjustFred/trading-platform/pull/67">PR #67</a></td><td>Python mechanics batch + S3776 + S1244</td><td>5</td><td><span class="badge b-ready">ready</span> <span class="badge b-artifact">Gate-Artefakt</span></td><td>Batch-Gate PASS (55 Files); S3776 28/42 first-pass; S1244-Threshold 1e-6 + 6 Tests; CodeRabbit fand 2 echte Self-Refactor-Bugs (critical Param-Mismatch, _log_safe-Shadowing); Security-Taint-Findings = eigener Backlog-Pass (nicht im Scope)</td></tr>
+<tr class="epic-head"><td colspan="6">Epic #15 — live_runner</td></tr>
+<tr><td>#21 15-A</td><td><a href="https://github.com/itsjustFred/trading-platform/pull/48">PR #48</a></td><td>honor PAUSE, SL/TP fail-closed, reject unknown actions</td><td>5</td><td><span class="badge b-ready">ready</span></td><td>30 Mutationen/4 Survivors→Tests; CodeRabbit-Fund: cTrader absolute SL/TP auf MARKET nicht supported → relative 1/100000 units; Alpaca bracket+extended_hours → 422 fail-closed; Exit-only-Bypass; NaN-Bypass (math.isnan/isinf); Dup 7.7→0%</td></tr>
+<tr><td>#22 15-B</td><td><a href="https://github.com/itsjustFred/trading-platform/pull/70">PR #70</a></td><td>credential mapping, precedence, typed config</td><td>1</td><td><span class="badge b-ready">ready</span> <span class="badge b-partial">Teil-AC</span></td><td>credential_env-Resolver (file-first); 2 latente Bugs gefixt (unset ALPACA_PAPER bedeutete still <em>live</em>; Typos→False koerziert); Single-Block-Fallback bleibt Legacy+Warning (Spec-Spannung, Follow-up im Body)</td></tr>
+<tr><td>#23 15-C</td><td><a href="https://github.com/itsjustFred/trading-platform/pull/71">PR #71</a></td><td>Discord ingestion gates and routing</td><td>1</td><td><span class="badge b-ready">ready</span> <span class="badge b-partial">Teil-AC</span></td><td>Trusted-Author-Gate fail-closed; strenge Tausendergruppierung; kumulativer Seen-Set (CodeRabbit fand echten latenten Live-Bug: Burst-Drop unter echter Pagination); B-11 Fan-out statt break; B-5 Backoff-Floor; B-4 „auth-blocks per channel" als Schema-Change-Follow-up</td></tr>
+<tr><td>#24 15-D</td><td><a href="https://github.com/itsjustFred/trading-platform/pull/72">PR #72</a></td><td>broker adapter — volume units, persistence, exposure</td><td>2</td><td><span class="badge b-ready">ready</span> <span class="badge b-partial">Teil-AC</span></td><td>Unit contract QTY_VOLUME_SCALE=1000 als einzige Boundary; never-persists-Tests; exposure/exit-only auf Fixtures; Per-Symbol-Lot-Size-Validierung bewusst nicht implementiert (Proto-Limitierung, dokumentiert); Merge-Abhängigkeit zu #48 (SL/TP-Guard-Reihenfolge) im Body</td></tr>
+<tr class="epic-head"><td colspan="6">Epic #16 — runner</td></tr>
+<tr><td>#36 16-A</td><td><a href="https://github.com/itsjustFred/trading-platform/pull/62">PR #62</a></td><td>cross-engine contract core + conformance tests</td><td>5</td><td><span class="badge b-ready">ready</span> <span class="badge b-artifact">Gate-Artefakt</span></td><td>Conformance-Suite (fills, end-date, same-bar priority, sizing, stats keys, total_bars); collect_ignore-Regression selbst gefunden+behoben (99 Tests stumm); Deep-Review-Findings → Abschnitt 3</td></tr>
+<tr><td>#37 16-B</td><td><a href="https://github.com/itsjustFred/trading-platform/pull/56">PR #56</a></td><td>critical engine/grid fixes + silent-failure elimination</td><td>5</td><td><span class="badge b-ready">ready</span></td><td>CodeRabbit-kritisch empirisch verifiziert (Preamble-Regression brach Grid-Läufe bei fehlenden Daten); F40 end-to-end; F3-Restproblem (--keep-indicators); PM-7 echter vorbestehender Bug; 40 Commits</td></tr>
+<tr><td>#38 16-C</td><td><a href="https://github.com/itsjustFred/trading-platform/pull/57">PR #57</a></td><td>trust boundary and codegen gate</td><td>3</td><td><span class="badge b-ready">ready</span> <span class="badge b-artifact">Gate-Artefakt</span></td><td>SHA256-Approval-Gate für LLM-generierten Code; AST-Screening statt exec; Registry-Matcher-Normalisierung '../demo.py'→'demo.py' abgedeckt</td></tr>
+<tr><td>#39 16-D1</td><td><a href="https://github.com/itsjustFred/trading-platform/pull/65">PR #65</a></td><td>money-path behavior fixes</td><td>3</td><td><span class="badge b-ready">ready</span></td><td>31 Mutationen/13 Survivors→19 Tests + 2 latente Bugs (asi8-Annualisierung, QS-Sharpe-Fallback); F20 war härter als gemeldet (TypeError-Crash); Golden-Master A/B: Trade-Counts/PnL identisch</td></tr>
+<tr><td>#40 16-D2</td><td><a href="https://github.com/itsjustFred/trading-platform/pull/66">PR #66</a></td><td>structural debt — engine/adapter/grid consolidation</td><td>3</td><td><span class="badge b-ready">ready</span></td><td>engine.py 903→27-Zeilen-Shim + engine_pkg; auto_agent 843→334; vectorbt 1296→1065; grid_tester entfernt (Open-Proposal umgesetzt); Pre-Mortem fand Live-Bug PM-1 (geleakte Test-Strategien ins echte strategies/); Merge-Rehearsal mit #65 erfolgreich</td></tr>
+<tr><td>#41 16-E</td><td><a href="https://github.com/itsjustFred/trading-platform/pull/64">PR #64</a></td><td>rename sizing semantics to max_position_exposure_pct</td><td>1</td><td><span class="badge b-ready">ready</span></td><td>docs/sizing-semantics.md pinnt die 3 Bedeutungen verbatim; Deprecated-Alias an 4 Layern mit 32 Golden-Master-Tests; F7 als dokumentierte Divergenz (→ 16-D1)</td></tr>
+<tr class="epic-head"><td colspan="6">Epic #17 — tests</td></tr>
+<tr><td>#33 17-A</td><td><a href="https://github.com/itsjustFred/trading-platform/pull/53">PR #53</a></td><td>test isolation and global-state hygiene</td><td>1</td><td><span class="badge b-ready">ready</span></td><td>isolated_db-Fixture, MagicMock-Leak, DATA_DIR-Patches entfernt; 694 Tests in Diff-Files grün</td></tr>
+<tr><td>#34 17-B</td><td><a href="https://github.com/itsjustFred/trading-platform/pull/55">PR #55</a></td><td>eliminate vacuous passes, strict mode, parity fixture</td><td>3</td><td><span class="badge b-ready">ready</span></td><td>CRITICAL Self-Review-Fund: code_validator führte untrusted Code via exec_module aus (experimentell bestätigt: shutil.rmtree lief!) → Validator jetzt statisch; Parity-Fixture exakt; FAIL_ON_MISSING_DATA=1</td></tr>
+<tr class="epic-head"><td colspan="6">Epic #18 — frontend+viewer</td></tr>
+<tr><td>#29 18-A</td><td><a href="https://github.com/itsjustFred/trading-platform/pull/50">PR #50</a></td><td>CORS fix, path containment, Flask-compat removal</td><td>3</td><td><span class="badge b-ready">ready</span> <span class="badge b-artifact">Gate-Artefakt</span></td><td>Flask-Layer 4888→3101 Zeilen gelöscht; 18/18 Containment-Tests; Registry-Normalisierung '../demo.py' abgedeckt; Präzedenz für Gate-Artefakt-Doku</td></tr>
+<tr><td>#30 18-B</td><td><a href="https://github.com/itsjustFred/trading-platform/pull/69">PR #69</a></td><td>live controls, error boundary, stream hygiene</td><td>1</td><td><span class="badge b-ready">ready</span></td><td>PAUSE/STOP/DELETE klickbar + Resume-Pfad; Error-Boundary; 3N+3-Refresh-Fan-out behoben; Request-Storms dedupliziert</td></tr>
+<tr><td>#31 18-C</td><td><a href="https://github.com/itsjustFred/trading-platform/pull/54">PR #54</a></td><td>metric contracts, stats correctness, backend reliability</td><td>2</td><td><span class="badge b-ready">ready</span></td><td>Typed metric contract; page-scoped Stats gelabelt; Job-Lifecycle-Fixes</td></tr>
+<tr><td>#32 18-D</td><td><a href="https://github.com/itsjustFred/trading-platform/pull/52">PR #52</a></td><td>wire Sentry for frontend (mini-PR)</td><td>2</td><td><span class="badge b-ready">ready</span></td><td>Sentry.init mit service tag frontend; Re-Verifikation 0 Findings; 18 Node-Tests</td></tr>
+<tr class="epic-head"><td colspan="6">Epic #19 — data_tools/validation</td></tr>
+<tr><td>#42 19-A</td><td><a href="https://github.com/itsjustFred/trading-platform/pull/58">PR #58</a></td><td>atomic writes, resume, fail-closed coverage</td><td>2</td><td><span class="badge b-ready">ready</span></td><td>Atomare Parquet-Writes; Resume nicht mehr blind auf row-group maxima</td></tr>
+<tr><td>#43 19-B</td><td><a href="https://github.com/itsjustFred/trading-platform/pull/60">PR #60</a></td><td>downloader correctness — bid/ask, JForex allowlist, 4h</td><td>3</td><td><span class="badge b-ready">ready</span></td><td>Spec-Review zwang HTTPS-only Allowlist (MITM-Lücke) + Digest-Richtung fail-closed; tick side-split; yfinance 4h auf UTC-Grid</td></tr>
+<tr><td>#44 19-C</td><td><a href="https://github.com/itsjustFred/trading-platform/pull/59">PR #59</a></td><td>importer/gate correctness + subprocess/SQL hardening</td><td>4</td><td><span class="badge b-ready">ready</span> <span class="badge b-artifact">Gate-Artefakt</span></td><td>2 echte Spec-Bugs: DV-B35-AND-Gate behandelte 0.0-Bande als disabled; XLSX-Pairing droppte ersten Entry-Fill; Dup-QG 4.9→1.2%; Validation 598 passed</td></tr>
+<tr class="epic-head"><td colspan="6">Epic #20 — misc-backend</td></tr>
+<tr><td>#25 20-A</td><td><a href="https://github.com/itsjustFred/trading-platform/pull/68">PR #68</a></td><td>risk sizing contract — units, caps, no bypass</td><td>1+1</td><td><span class="badge b-ready">ready</span></td><td>23 Mutationen alle killed; trusted qty-channel submit_order(signal,*,qty); notional cap; Metadata-Bypass entfernt; Nachtrag: fehlende realized_risk_amount-Engine-Implementierung nachgereicht (<code>21a0496</code>, Test war am Branch-Head rot — Abschnitt 3.2d)</td></tr>
+<tr><td>#26 20-B</td><td><a href="https://github.com/itsjustFred/trading-platform/pull/47">PR #47</a></td><td>per-bot signal processors, remove StockKit alias</td><td>5</td><td><span class="badge b-ready">ready</span></td><td>_BOT_DIRS Registry-of-Record; Config-Shape-Guard; Dup 6.3→0%</td></tr>
+<tr><td>#27 20-C</td><td><a href="https://github.com/itsjustFred/trading-platform/pull/49">PR #49</a></td><td>destructive scripts — dry-run, confirmation, atomicity</td><td>5</td><td><span class="badge b-ready">ready</span></td><td>dry-run Default, [y/N]-Confirmation, Snapshots, temp+os.replace</td></tr>
+<tr><td>#28 20-D</td><td><a href="https://github.com/itsjustFred/trading-platform/pull/51">PR #51</a></td><td>scheduler/jobs truthfulness + init hygiene</td><td>5</td><td><span class="badge b-ready">ready</span></td><td>9× S2245 Mersenne-Twister → secrets.SystemRandom; weekly refresh ehrlich (skipped/partial/completed); AST-Signal-Processor-Detection; 1270 passed</td></tr>
+<tr><td>#35 strategies</td><td><a href="https://github.com/itsjustFred/trading-platform/pull/61">PR #61</a></td><td>strategy correctness defects, parity-gated</td><td>4</td><td><span class="badge b-ready">ready</span> <span class="badge b-partial">Teil-AC</span></td><td>17 Golden-Tests (alle fangen Alt-Verhalten); QG-Golden-Master 62→42 Trades (Human-Review!); custom_swings_supertrend bewusst ausgeklammert (Dataset fehlt); Naming-Integrity</td></tr>
+</tbody>
+</table>
+
+<h2>2. Merge-Order-Empfehlung</h2>
+<p>Begründung je Position: Blocker-Kette zuerst (jede spätere Welle rebased auf frühere), dann Risiko (Security/money-path vor Refactor vor Mechanics). Sonar-Gate-Artefakte blockieren die Merge-Order nicht (siehe Abschnitt 3.1 — Empfehlung: vor dem ersten Merge <code>main</code> neu analysieren lassen, dann fallen die meisten Gates auf grün).</p>
+
+<ol class="merge-order">
+  <li><strong>PR #55 (17-B)</strong> — Deterministische Parity-Fixture + statischer Validator. <span class="risk">Risiko: niedrig (nur tests/). Grund: Basis für #61/#65-Verifikation; CRITICAL-Fix (exec_module) earliest.</span></li>
+  <li><strong>PR #53 (17-A)</strong> — Test-Isolation. <span class="risk">Risiko: niedrig (tests/). Grund: isolierte DB-Fixtures vor allen runner-Änderungen.</span></li>
+  <li><strong>PR #47 (20-B)</strong> — Per-bot processors. <span class="risk">Risiko: niedrig. Grund: kleine, gut getestete Registry-Änderung; kein Blocker für andere.</span></li>
+  <li><strong>PR #49 (20-C)</strong> — Destructive scripts. <span class="risk">Risiko: niedrig (scripts/). Grund: keine Cross-Dependencies.</span></li>
+  <li><strong>PR #51 (20-D)</strong> — Scheduler truthfulness. <span class="risk">Risiko: mittel (scheduler+shared init). Grund: DATA_DIR-Resolver-Änderung — nach 17-A, vor live_runner.</span></li>
+  <li><strong>PR #52 (18-D)</strong> — Sentry mini-PR. <span class="risk">Risiko: niedrig. Grund: isoliert.</span></li>
+  <li><strong>PR #54 (18-C)</strong> — Metric contracts. <span class="risk">Risiko: mittel (viewer API + Frontend). Grund: vor 18-B (nutzt stabilisierte viewer-API).</span></li>
+  <li><strong>PR #50 (18-A)</strong> — CORS/Containment/Flask-Entfernung. <span class="risk">Risiko: mittel-hoch (viewer/main.py −1787 Zeilen). Grund: große Entfernung früh, damit Folge-PRs saubere Basis haben.</span></li>
+  <li><strong>PR #69 (18-B)</strong> — Live controls + error boundary. <span class="risk">Risiko: mittel (Frontend). Grund: baut auf 18-C/18-A-Frontend-Fixes.</span></li>
+  <li><strong>PR #58 (19-A)</strong> — Atomic writes. <span class="risk">Risiko: mittel (downloader base). Grund: vor 19-B (nutzt atomare Writes).</span></li>
+  <li><strong>PR #60 (19-B)</strong> — Bid/ask + JForex allowlist. <span class="risk">Risiko: mittel. Grund: DV-C1/C2-Datenkorrektur vor 19-C-Importer-Fixes.</span></li>
+  <li><strong>PR #59 (19-C)</strong> — Importer/gate correctness. <span class="risk">Risiko: mittel. Grund: XLSX/HTML-Pairing-Fixes auf 19-B-Datenbasis.</span></li>
+  <li><strong>PR #48 (15-A)</strong> — live_runner PAUSE/SL/TP fail-closed. <span class="risk">Risiko: hoch (live money path!). Grund: MUST-HAVE zuerst in 15er-Kette; cTrader relative-SL/TP + Alpaca-Bracket-Verhalten ändern Live-Order-Semantik.</span></li>
+  <li><strong>PR #70 (15-B)</strong> — Credential mapping. <span class="risk">Risiko: hoch (Deployment-Config-Verhalten: Refusals statt Fallback). Grund: direkt nach 15-A; Agent-Doku: 15-A-SL/TP-Guard braucht gleiche Persistenz-Reihenfolge bei Merge.</span></li>
+  <li><strong>PR #68 (20-A)</strong> — Risk sizing contract. <span class="risk">Risiko: hoch (trusted qty-channel ändert Adapter-Interface). Grund: vor 15-D (nutzt trusted-channel-Muster) und nach 15-A (Daemon-Integration).</span></li>
+  <li><strong>PR #72 (15-D)</strong> — Broker adapter volume/persistence/exposure. <span class="risk">Risiko: hoch (live order units). Grund: baut auf 20-A trusted channel + 15-A Adapter-Verträge; Body flaggt Merge-Abhängigkeit zu #48 (SL/TP-Persistenz-Reihenfolge).</span></li>
+  <li><strong>PR #71 (15-C)</strong> — Discord ingestion gates. <span class="risk">Risiko: mittel-hoch (Signal-Pfad). Grund: Trusted-Author-Gate ändert, welche Signale ankommen — nach 15-A/15-B (daemon-Pfade stabil).</span></li>
+  <li><strong>PR #62 (16-A)</strong> — Cross-engine conformance core. <span class="risk">Risiko: mittel (neue tests/ + contract-Doku). Grund: Test-Backbone für 16-D1/D2.</span></li>
+  <li><strong>PR #56 (16-B)</strong> — Engine/Grid-Fixes. <span class="risk">Risiko: mittel (40 Commits, Engine/Grid — Inhalt vollständig reviewed, CodeRabbit completed auf HEAD). Grund: gehört in die 16er-Kette — nach 16-A (Test-Backbone), vor 16-D1 (dessen Money-Path-Fixes auf denselben Engine-/Grid-Code treffen; Deep-Review-Findings an #62 und Grid-Follow-ups aus #56 sind dokumentiert). [Nachtrag 2026-09-04: fehlte in der ursprünglichen Order.]</span></li>
+  <li><strong>PR #65 (16-D1)</strong> — Money-path behavior fixes. <span class="risk">Risiko: hoch (Backtest-Ergebnisse ändern sich dokumentiert — QG-Golden-Master 62→42 Trades bei #61, vectorbt total_bars 4→600 bei #65). Grund: nach 16-A-Harness; vor 16-D2 (dessen Refactor darauf rebased).</span></li>
+  <li><strong>PR #66 (16-D2)</strong> — Structural consolidation. <span class="risk">Risiko: hoch (große Datei-Splits: engine_pkg, auto_agent, vectorbt). Grund: NACH 16-D1 (Merge-Rehearsal erfolgreich); Behavior-pinning durch 16-D1-Tests.</span></li>
+  <li><strong>PR #61 (strategies)</strong> — Strategy correctness, parity-gated. <span class="risk">Risiko: hoch (QG-Golden-Master 62→42 Trades — getestete Strategien ändern Handelsergebnisse!). Grund: spät, weil strategie-Verhalten Human-Review der Golden-Master-Diffs braucht; PR-Body listet den Diff.</span></li>
+  <li><strong>PR #57 (16-C)</strong> — Trust boundary/codegen gate. <span class="risk">Risiko: mittel. Grund: LLM-Gate unabhängig von Runner-Reihenfolge; SHA256-Approval-Flow vor aktivem Auto-Agent-Betrieb.</span></li>
+  <li><strong>PR #64 (16-E)</strong> — Rename sizing semantics. <span class="risk">Risiko: niedrig-mittel (Rename + Alias). Grund: nach 16-D1 (F7-Divergenz dort dokumentiert); Alias hält alte Invocations.</span></li>
+  <li><strong>PR #63 (14-A)</strong> — TypeScript batch. <span class="risk">Risiko: niedrig (mechanisch). Grund: nach Frontend-Feature-PRs (18-B/18-C), damit keine Konflikte.</span></li>
+  <li><strong>PR #67 (14-B)</strong> — Python batch. <span class="risk">Risiko: niedrig (mechanisch, aber 57 Files). Grund: ganz spät — größter Diff, mechanisch; nach allen inhaltlichen PRs um Konflikte zu vermeiden. Merge-Note: #72 flaggt SL/TP-Persistenz-Reihenfolge-Abhängigkeit zu #48.</span></li>
+</ol>
+<p class="risk"><strong>Parallelisierungshinweis:</strong> #63/#67 (mechanisch) können als letzte unabhängig voneinander gemergt werden. Die 15er/16er-Ketten (#48→#70→#68→#72→#71) sollten in dieser Reihenfolge bleiben — dort sind echte Interface- und Verhaltens-Abhängigkeiten dokumentiert.</p>
+
+<h2>3. Offene Punkte &amp; Diskrepanzen</h2>
+
+<h3>3.1 Sonar-Perioden-Artefakt (betrifft ~8 PRs)</h3>
+<div class="warn"><strong>Symptom:</strong> Der „SonarCloud Code Analysis"-Check bleibt bei mehreren PRs rot (Reliability/Security-Rating, Duplizierung), obwohl <strong>0 Issues auf geänderten Zeilen</strong> liegen — verifiziert per Diff-Zeilenabgleich gegen <code>reports/sonar-review-full-2408.json</code>. <strong>Ursache:</strong> main wurde seit 2026-05-04 (rev <code>a9060aa7</code>) nicht mehr analysiert; die New-Code-Definition „previous_version" zählt daher den gesamten Post-May-Code (222+ Commits) als „new". <strong>Betroffen (rot trotz sauber):</strong> #50, #57, #59, #61, #62, #63 (teilweise), #64, #67. <strong>Grün:</strong> #49, #55, #56, #63, #65, #66, #68, #70–#72. <strong>Empfehlung:</strong> Vor dem ersten Merge eine frische main-Analyse anstoßen — danach sollten die meisten Gates auf grün fallen. Jeder betroffene PR-Body dokumentiert die Analyse nach dem Präzedenzfall PR #50.</div>
+
+<h3>3.2 Human-Review-Pflichtpunkte</h3>
+<div class="critical"><strong>Golden-Master-Diff in PR #61 (strategies):</strong> <code>qg_30min_es_breakout</code> XAUUSD/1h: <strong>62 Trades / +9408.30 → 42 Trades / −3679.87</strong> (35 SHORT / 7 LONG). Erwartete Richtung (alter One-Sided-Fade weg), aber: Handelsergebnisse ändern sich — vor Merge die Diff-Tabelle im PR-Body reviewen.</div>
+<div class="note"><strong>Deep-Review-Findings an PR #62 (16-A, bereits ready):</strong> Ein späterer Inline-/code-review-Lauf am Branch-Head fand 10 Findings, die NICHT mehr in den PR geflossen sind (der Agent hatte die Pipeline bereits abgeschlossen). Die 2 substanziellsten: (a) native engine kann <code>modeling_resolution="1-lower"</code> nicht auflösen → widerspricht dem F8-Parity-Contract für denselben Input; (b) pynecore übergibt date-only <code>--to</code> an die CLI — derselbe Input, der den (bereits gefixten) midnight-truncation-Bug im Adapter verursachte; ferner: der PyneCore-Stats-Conformance-Test übt keinen PyneCore-Code aus (Blind Spot, der einen Dead-Code-Bug hatte durchrutschen lassen), Merge-Order verletzt Contract §6 (engine-stats shadow canonical), <code>DateFilterConvention</code>-Phantom-Referenz in der Contract-Doku. <strong>Empfehlung:</strong> Diese als Follow-up-Tickets aufnehmen oder vor Merge von #62 fixen.</div>
+<div class="note"><strong>Bewusste Teil-ACs (dokumentiert, nicht still ausgelassen):</strong> 15-B Single-Block-Fallback (Legacy+Warning, Spec-Spannung zum Decision Record); 15-C „auth-blocks per channel" (braucht Config-Schema-Change); 15-D Per-Symbol-Lot-Size-Validierung (Proto-OA liefert keine lotSize — bräuchte ProtoOASymbolByIdReq-Roundtrip); #35 custom_swings_supertrend + pine tr[0]=0 (Datasets fehlen lokal, Golden-Regeneration nötig); F31 Walk-Forward-Expectation-Gap als Docs-Flag statt Implementierung.</div>
+
+
+<h3>3.2b CodeRabbit-Batch-Review-Nachbereitung (2026-09-04)</h3>
+<div class="note"><strong>Nachträge aus dem externen Review umgesetzt:</strong> Die 21 PRs ohne CodeRabbit-HEAD-Review wurden über 6 konsolidierte Batch-Branches (Greedy-Gruppierung, 0 File-Overlap, alle ≤145 Files) nachreviewt — 48 Findings gesamt. <strong>Alle 4 Criticals und 10 der 11 Majors wurden in 12 Fix-Agents behoben und gepusht</strong> (jeweils verifiziert + Regressionstests, PR-Bodies aktualisiert). False Positives: 1 (daemon.py:901 early-return = dokumentierte Fail-closed-Semantik); 1 Finding außerhalb des PR-Diffs korrekt delegiert (#59 → #46-Scope). 1 Major verblieb als dokumentiertes Follow-up (#46 Security-Taint-Backlog-Referenz). Minor/Info-Findings: als Backlog im <code>cr-findings-todo.md</code> (Fix-Status dort abgehakt). Workflow-Endstand: 12/12 Agent-Results ok/committed/pushed, gegen Branch-Commits verifiziert.</div>
+<div class="warn"><strong>Zuordnungskorrektur (Fix-Runde):</strong> Das Finding <code>pynecore_adapter.py:263+350</code> (__future__-Import + Docstring in <code>strict_structure</code>) war dem falschen PR zugeordnet — der Code liegt ausschlie&szlig;lich auf <strong>PR #57 (cleanup/16c)</strong>, nicht #68 (20-A ber&uuml;hrt pynecore_adapter.py nicht). Fix-Commit <code>0d9d12a</code> liegt korrekt auf cleanup/16c; PR #57-Body um Batch-Fix-Abschnitt erg&auml;nzt, PR #68 mit Querverweis-Kommentar versehen. Kein offener Fix-Restposten.</div>
+
+<h3>3.2c Sonar-Verifikation #68/#69/#71/#67 + LoC-Limit-Entscheidung (2026-09-04, nachmittags)</h3>
+<div class="note"><strong>LoC-Limit-Entscheidung (externes Review &uuml;bernommen):</strong> Das Repo ist privat mit ~128k LoC &mdash; die 50k-Free-Cap ist auch mit Exclusions (Tests/Scripts/Strategies &rarr; ~85k) strukturell nicht erreichbar. <strong>Kein Gr&uuml;n-Erzwingen, keine Main-Reanalyse</strong>: Gruppe C wird per Hand-Sign-off freigegeben (&bdquo;Gate rot wegen X, changed lines clean&ldquo;); Sonar-Zukunft (bezahlen / public / manuelles Gating) als Folgeticket nach den Merges.</div>
+<div class="note"><strong>Changed-Lines-Abgleich mit SonarCloud-API verifiziert</strong> (QG <code>pullRequest=&lt;nr&gt;</code> + Issues-API): <strong>#68</strong> &mdash; 747 Issues im New-Code-Fenster, <strong>0</strong> auf den 17 ge&auml;nderten Files; 72 BUGs = 47&times; S1244 (Float-Vergleiche, Baseline-Thema) + S2259/S1082. <strong>#71</strong> &mdash; <strong>0</strong> Issues auf den 7 ge&auml;nderten Files; reines Grenz-Rot (Duplizierung 3,1&nbsp;% vs 3,0&nbsp;%-Threshold). <strong>#69</strong> &mdash; 1&times; MAJOR S6959 (reduce ohne Initialwert) auf ge&auml;ndertem File, aber die Meldung sitzt versetzt auf unver&auml;nderten Zeilen (Zeile 184 ist keine reduce-Zeile; die Hunks liegen bei 14/28/203/315/325/347) &rarr; Baseline-Debt. <strong>#67</strong> &mdash; QG security=E (BLOCKER S2083 <code>pynecore_adapter.py:78</code>) + 10&times; S1244 <code>test_viewer_features.py</code>: s&auml;mtliche Issues haben creationDate 2026-03/05 (vor der Kampagne), existieren identisch auf der main-Analyse, und die #67-Hunks in diesen Files (nur @@-258 bzw. EOF-Append) ber&uuml;hren die Zeilen nicht. <strong>Auch das Security-Rating-E ist Backdating-Artefakt</strong> durch die neuen Taint-Regeln (S5131/S5145/S6549) &mdash; kein neues PR-Finding. Hinweis: der Sonar-Check von #67 zeigt CANCELLED (&bdquo;last analysis has failed&ldquo;) &mdash; fehlgeschlagener Analyse-Run, nicht Findings.</div>
+<h3>3.2d Abschlussrunde: Sign-offs, Money-Path-Rehearsal, #61/#62 (2026-09-04, abends)</h3>
+<div class="note"><strong>Gruppe-C-Sign-offs: 10/10 gepostet</strong> (PRs 50, 54, 57, 59, 61, 64, 67, 68, 69, 71) — je ein Kommentar &bdquo;Gate rot wegen X, changed lines clean&ldquo; mit Issues&cap;Added-Lines-Verifikation gegen die SonarCloud-API; #67 mit CANCELLED-Hinweis, #61 mit Vorbehalt (erledigt, s.&nbsp;u.).</div>
+<div class="note"><strong>#61 Human-Freigabe:</strong> Golden-Master-Diff (62&rarr;42 Trades, +9408&rarr;&minus;3679, Fade&rarr;Breakout) vom Repo-Owner gesichtet &mdash; &bdquo;kann erstmal so gemerged werden&ldquo;; als PR-Kommentar dokumentiert.</div>
+<div class="note"><strong>#62 statt Follow-up-Tickets: Fixes direkt im PR (User-Entscheidung, sauberer als Backlog):</strong> <code>ready-for-human</code> entfernt, 9 von 10 Deep-Review-Findings per Subagent gefixt (<code>5b04e79</code>: native modeling_resolution-Resolve, pynecore date-only <code>--to</code> inkl. empirischer pynecore-6.8.14-CLI-Verifikation, echter PyneCore-Stats-Conformance-Run statt Blind-Spot, &sect;6-Merge-Helper, flag_missing_intrabar-Reason-Pflicht, Test-Dedupes, OPTIONAL-Pin; Finding&nbsp;#10 existierte nur als Z&auml;hlung). Dann Review-Pipeline komplett neu:
+<ul>
+<li>Two-Axis-Review (kein Critical) &rarr; Nacharbeit <code>554faa7</code>: <strong>MAJOR behoben</strong> &mdash; pyne <code>--from</code> war Host-TZ-abh&auml;ngig (TZ=America/New_York: 0 Trades statt 2, empirisch); beide Bounds jetzt UTC-aware + Pin-Test; <code>m1</code>-Spelling-Parit&auml;t &uuml;ber geteilte Tabelle in contract.py.</li>
+<li>CodeRabbit-MAJOR <code>0847fe4</code>: Stats-Tests stubbten shutil.which nicht (auf Hosts ohne pyne-CLI w&auml;ren die Parsing-Pfade ungedeckt geblieben).</li>
+<li>Sonar-Duplizierung 3,1&nbsp;% &gt; 3&nbsp;% <code>0a70d40</code>: Test-Setups konsolidiert &rarr; 0,0&nbsp;%.</li>
+<li>CodeRabbit-MINOR <code>f1c5ba8</code>: Docstring EMA&rarr;SMA.</li>
+</ul>
+<strong>Endstatus: Sonar QG 5/5 gr&uuml;n, CodeRabbit 0 Criticals/Majors, 1288 passed / 0 failed, mergeable, ready-for-human wieder gesetzt.</strong></div>
+<div class="warn"><strong>Money-Path-Rehearsal (Kette #48&rarr;#70&rarr;#68&rarr;#72&rarr;#71 kombiniert, 334/334 Tests gr&uuml;n) &mdash; zwei wesentliche Funde:</strong>
+<ul>
+<li><strong>Fehlende Engine-Implementierung in PR #68:</strong> Fix-Commit <code>ab4b3c6</code> pinnte <code>realized_risk_amount</code> per Test, committete aber nie die Engine-&Auml;nderung &mdash; der Test war auf dem Branch-Head rot. Implementierung nachgeholt (<code>21a0496</code> auf cleanup/20a gepusht, PR-Body erg&auml;nzt).</li>
+<li><strong>#48/#68-Vertragskonflikt:</strong> Beide PRs definieren Exit-only unterschiedlich (#48: explicit_qty/exit_only-Metadaten ohne Trusted-Channel; #68: reduce_only-Sizing &uuml;ber Broker-Qty). Reconciled auf den sp&auml;teren #68-Vertrag (reduce_only-Facts + Broker-Qty via Trusted Channel; exit_only-Marker bleibt als Adapter-SL/TP-Bypass-Schl&uuml;ssel); 3 veraltete #48-Tests angepasst (Rehearsal-Commit <code>507f89e</code>, dokumentiert).</li>
+</ul>
+Rehearsal-Konflikte best&auml;tigen die Merge-Order: Die Kette muss strikt sequenziell gemergt werden.</div>
+<h3>3.3 Infrastruktur-Erkenntnisse (für künftige Runs)</h3>
+<div class="note">
+<ul>
+<li><strong>e2e-Event-Loop-Leak (Root Cause der „73 Failures"-Baseline):</strong> <code>tests/e2e/lab/test_conversion.py</code> hinterlässt über pytest-playwrights session-scoped sync dispatcher eine laufende Event-Loop — alle nachfolgenden <code>asyncio.run()</code>-Tests crashen. Ohne e2e/integration: nur 4 pre-existing Failures (1264 passed). Mehrere PRs dokumentieren das; eigener Cleanup-Kandidat.</li>
+<li><strong>SonarCloud-Community-Edition kann keine Branches:</strong> PR-#70-Review nutzte deshalb einen Klon als eigenes Projekt; PR-Scans laufen über die SonarCloud-App-Integration.</li>
+<li><strong>CodeRabbit Free Tier:</strong> 3 Reviews/h — mehrfach rate-limited; Agents warteten die gemeldeten Restzeiten ab. „Review rate limited" auf Checks heißt nur „kein weiterer Run", nicht „Findings offen".</li>
+<li><strong>Gateway-Instabilität:</strong> 4 Ausfall-Wellen (503 activity-cost-limit, 503 auth_unavailable, 429 cool-down, 502) — Recovery via Serial-Agents (Stall-Detection-umgehende Resume-Anweisungen) statt Workflow-Retry-Sturm. inkrementelle Commits pro TDD-Slice als Cutoff-Versicherung.</li>
+<li><strong>Kapazitäts-Limit:</strong> 4 CPUs + CodeRabbit 3/h + SonarCloud-Queue begrenzten den Parallelismus auf ~11 Agent-Instanzen; mehr Parallelität hätte die Stall-Detection (180 s) getriggert.</li>
+</ul>
+</div>
+
+<h3>3.4 Dokumentierte Follow-ups (aus PR-Bodies, nicht Teil des Backlogs)</h3>
+<table>
+<thead><tr><th>Quelle</th><th>Follow-up</th></tr></thead>
+<tbody>
+<tr><td>#50/#57</td><td>legacy_viewer-Split (79 private Zugriffe), Rename des Mysterious-Name-Alias</td></tr>
+<tr><td>#62</td><td>Deep-Review-Findings (Abschnitt 3.2), pynecore-CLI date-only <code>--to</code>, PyneCore-Conformance-Test-Blind Spot</td></tr>
+<tr><td>#65</td><td>live sizing audit, scaling audit, Consumer-Timestamp-Mismatch-Audit</td></tr>
+<tr><td>#66</td><td>Viewer <code>/api/grid-results</code> auf SQLite umstellen, <code>run_strategy_grid</code>-Folding, Rebase nach #65-Merge</td></tr>
+<tr><td>#70</td><td>Parser-Konsolidierung (4 Kopien), Single-Block-Fallback-Entscheidung</td></tr>
+<tr><td>#71</td><td>B-4: Token-/Block-Scoping per Channel (Config-Schema-Change)</td></tr>
+<tr><td>#72</td><td>Per-Symbol-Lot-Size-Validierung (ProtoOASymbolByIdReq), historische raw-unit fill-rows (Deploy-Note)</td></tr>
+<tr><td>#35/#61</td><td>custom_swings_supertrend zero-seed + pine tr[0]=0 (Golden-Regeneration mit Datasets)</td></tr>
+<tr><td>#46/#67</td><td>Security-Taint-Backlog (S5131/S5145/S6549/S2583 — 29 Findings auf unverändertem Code, eigener Härtungs-Pass)</td></tr>
+</tbody>
+</table>
+
+<h2>4. Kampagnen-Statistik</h2>
+<table>
+<thead><tr><th>Metrik</th><th>Wert</th></tr></thead>
+<tbody>
+<tr><td>Sub-Issues implementiert</td><td>26/26 (0 blocked)</td></tr>
+<tr><td>PRs eröffnet &amp; ready-for-human</td><td>26/26</td></tr>
+<tr><td>Review-Zyklen (Min/Ø/Max)</td><td>1 / ~2,9 / 5</td></tr>
+<tr><td>Mutation-Testing-PRs</td><td>7 (#21, #22*, #24*, #25, #39, #46*, #45*) — * = laut Vorgabe übersprungen bzw. Batch</td></tr>
+<tr><td>Größte Einzel-PRs</td><td>#67 (+4022/−2804, 57 Files), #50 (+666/−1823), #56 (40 Commits), #48 (19 Commits)</td></tr>
+<tr><td>Runtime</td><td>~4 Tage (2026-08-31 → 2026-09-04), inkl. 4 Gateway-Ausfall-Wellen</td></tr>
+<tr><td>Substanzgewichtige Review-Funde (Auswahl)</td><td>exec_module-Code-Execution (CRITICAL, experimentell bestätigt), cTrader absolute-SL/TP auf MARKET, unset ALPACA_PAPER=live, Registry-Normalisierung '../demo.py', Mersenne-Twister→CSPRNG (9× S2245), geleakte Test-Strategien ins echte strategies/, transplantierter F2-Defekt, DV-B35 0.0-Bande, XLSX-Pairing-Drop, JAR-Digest-Bypass→HTTPS-only, 2 latente Money-Path-Bugs via Mutation</td></tr>
+</tbody>
+</table>
+
+<div class="footer">Erzeugt vom Orchestrator (Claude Code, Multi-Agent-Kampagne). Checkpoint-Historie: <code>~/tmp/cleanup-run-state.md</code> · PR-Liste: <code>~/tmp/cleanup-final-prs.tsv</code> · Alle 26 PRs tragen <code>ready-for-human</code> und warten auf Human-Review. Nichts wurde gemergt.</div>
+
+</body>
+</html>
