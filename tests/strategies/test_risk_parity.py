@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from scripts.run_risk_parity_backtest import (
     ASSETS,
     TICKERS,
+    _simulate_portfolio_value,
     adjust_for_regime,
     apply_tail_risk_hedge,
     apply_volatility_scaling,
@@ -328,3 +329,27 @@ def test_lean_statistics_use_calendar_days_and_compounded_mean():
     # endpoints (return/drawdown/trades) are sampling-invariant
     for key in ("total_return", "cagr", "max_drawdown", "total_trades"):
         assert lean["stats"][key] == plain["stats"][key]
+
+
+def test_rebalance_weights_effective_next_day():
+    """A-H3: Market-On-Close fills earn from the NEXT trading day.
+
+    New weights set on the rebalance date must not capture the rebalance
+    day's own return — the fill happens AT the close.
+    """
+    dates = pd.date_range("2024-01-01", periods=4, freq="D", tz="UTC")
+    returns = pd.DataFrame(0.0, index=dates, columns=TICKERS)
+    returns["SPY"] = [0.0, 0.10, 0.0, 0.0]  # +10% on the rebalance day
+    schedule = {dates[1]: {t: (1.0 if t == "SPY" else 0.0) for t in TICKERS}}
+    portfolio_value = _simulate_portfolio_value(returns, 100_000.0, schedule)
+    assert float(portfolio_value.iloc[-1]) == pytest.approx(100_000.0)
+
+
+def test_held_weights_earn_next_day_return():
+    """A-H3 complement: weights set on day T earn day T+1's return."""
+    dates = pd.date_range("2024-01-01", periods=4, freq="D", tz="UTC")
+    returns = pd.DataFrame(0.0, index=dates, columns=TICKERS)
+    returns["SPY"] = [0.0, 0.0, 0.10, 0.0]  # +10% the day after rebalance
+    schedule = {dates[1]: {t: (1.0 if t == "SPY" else 0.0) for t in TICKERS}}
+    portfolio_value = _simulate_portfolio_value(returns, 100_000.0, schedule)
+    assert float(portfolio_value.iloc[-1]) == pytest.approx(110_000.0)

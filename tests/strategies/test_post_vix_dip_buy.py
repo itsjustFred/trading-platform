@@ -12,6 +12,7 @@ import math
 import sys
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -81,3 +82,39 @@ class TestStrategyRegression:
                 f"Trade {trade.id}: Risk {risk_pct*100:.2f}% ueberschreitet Limit von 1.5%"
             )
             equity += trade.pnl
+
+
+class TestBullFilterNoLookahead:
+    """A-C1: the SMA200 bull filter uses the PRIOR day's close/SMA200.
+
+    daily_close holds each date's FINAL close (last intraday close wins);
+    gating an intraday bar on the same date's close/SMA200 is lookahead.
+    """
+
+    def test_sma200_indicator_excludes_current_day_close(self):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "post_vix_dip_buy_under_test", STRATEGY_PATH
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        stamps = pd.date_range("2024-01-01", periods=205, freq="D", tz="UTC")
+        rows = []
+        for day in stamps:
+            for ts in pd.date_range(day, periods=8, freq="h", tz="UTC"):
+                rows.append((ts, 100.0))
+        # Spike only the final bar: the day's FINAL close jumps to 200.
+        rows[-1] = (rows[-1][0], 200.0)
+        frame = pd.DataFrame(rows, columns=["timestamp", "close"])
+        frame["open"] = 100.0
+        frame["high"] = frame["close"].clip(lower=100.0) + 0.1
+        frame["low"] = 99.9
+        frame["volume"] = 1000.0
+
+        _, _, indicators, _ = module.generate_signals(frame, {})
+        sma_last = float(indicators["SMA200"].iloc[-1])
+        # Prior-day SMA200 over all-100 closes; with lookahead it would be
+        # (199*100+200)/200 = 100.5.
+        assert sma_last == pytest.approx(100.0)

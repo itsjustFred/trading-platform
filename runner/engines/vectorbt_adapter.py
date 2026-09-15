@@ -252,8 +252,13 @@ def _process_symbol(
     parallelized.
     """
     strategy_mod = _load_strategy_module(strategy_path)
+    # A-H4 (D3): warmup_start extends the loaded window backwards for
+    # indicator warmup, mirroring the native adapter — bars before
+    # start_date feed the strategy's indicators but create no trades.
+    warmup_raw = str(getattr(config, "warmup_start", "") or "").strip()
+    load_start = warmup_raw or config.start_date
     df, data_path = _load_ohlcv(
-        data_root, symbol, config.timeframe, config.start_date, config.end_date
+        data_root, symbol, config.timeframe, load_start, config.end_date
     )
     if df is None or df.empty:
         raise RuntimeError(
@@ -261,6 +266,12 @@ def _process_symbol(
             f"{config.start_date}..{config.end_date} under {data_root}; "
             "refusing to run a silent empty backtest"
         )
+    trade_from = None
+    if warmup_raw:
+        try:
+            trade_from = pd.to_datetime(config.start_date, utc=True)
+        except (ValueError, TypeError):
+            trade_from = None
 
     asset_class = _infer_asset_class_from_path(data_path)
     intrabar_df, intrabar_timeframe = _load_intrabar_ohlcv(
@@ -268,7 +279,7 @@ def _process_symbol(
         symbol,
         config.timeframe,
         config.modeling_resolution,
-        config.start_date,
+        load_start,
         config.end_date,
     )
     extra_timeframes = [intrabar_timeframe] if intrabar_timeframe else []
@@ -294,6 +305,17 @@ def _process_symbol(
     trade_counter = 0
 
     for i in range(len(df)):
+        if trade_from is not None:
+            # A-H4 (D3): warmup gate mirroring native TradeEngine.run — bars
+            # before start_date feed indicators only (signals were already
+            # generated on the extended frame above); no entries, no exits.
+            bar_ts = pd.to_datetime(
+                df["timestamp"].iloc[i] if "timestamp" in df.columns else None,
+                utc=True,
+                errors="coerce",
+            )
+            if pd.notna(bar_ts) and bar_ts < trade_from:
+                continue
         if not in_trade and bool(entries.iloc[i]):
             in_trade = True
             entry_idx = i
@@ -303,14 +325,27 @@ def _process_symbol(
             entry_row = df.iloc[entry_idx]
             exit_row = df.iloc[i]
             direction = _resolve_direction(execution_signals, direction_series, entry_idx)
-            entry_price = _resolve_entry_price(entry_row, direction, entry_stop_series, entry_idx)
+            entry_price = _resolve_entry_price(
+                entry_row,
+                direction,
+                entry_stop_series,
+                entry_idx,
+                parameters=resolved_parameters,
+            )
             if entry_price is None:
                 # D2 strict (A-H2): entry_stop present but never touched --
                 # no fill, no phantom trade. State is already flat
                 # (in_trade=False above); skip before sizing/equity.
                 continue
             trade_counter += 1
-            exit_price = _resolve_exit_price(exit_row, i, exit_price_series)
+            exit_price = _resolve_exit_price(
+                exit_row,
+                i,
+                exit_price_series,
+                signal_exit_fill=getattr(config, "signal_exit_fill", "close"),
+                parameters=resolved_parameters,
+                direction=direction,
+            )
             exit_reason = _resolve_exit_reason(i, exit_reason_series)
             entry_ts = str(entry_row.get("timestamp", entry_row.name))
             exit_ts = str(exit_row.get("timestamp", exit_row.name))
@@ -336,6 +371,7 @@ def _process_symbol(
                 scheduled_exit_time=exit_ts,
                 stop_price=_resolve_level_value(stop_loss_series, entry_idx),
                 take_profit_price=_resolve_level_value(take_profit_series, entry_idx),
+                parameters=resolved_parameters,
             )
             if intrabar_exit is not None:
                 exit_price = intrabar_exit["price"]
@@ -1079,20 +1115,107 @@ def _resolve_direction(
     return "LONG"
 
 
+def _vbt_bar_spread(row: pd.Series, parameters: dict[str, Any] | None) -> float:
+    """Per-bar spread surcharge in price units (ask = open + spread).
+
+    A-H4 (D3): mirrors native ``TradeEngine._bar_spread`` exactly — opt-in
+    via the ``spread_price_col`` strategy parameter naming a data column
+    with the spread in PRICE units. Default off (0.0): all existing
+    behavior is unchanged.
+    """
+    col = (parameters or {}).get("spread_price_col")
+    if not col:
+        return 0.0
+    try:
+        raw = row.get(col)
+    except (AttributeError, KeyError):
+        return 0.0
+    if raw is None or pd.isna(raw):
+        return 0.0
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _vbt_ask_bar(
+    row: pd.Series, parameters: dict[str, Any] | None
+) -> tuple[float | None, float | None]:
+    """Per-bar ask-side high/low in price units (opt-in).
+
+    A-H4 (D3): mirrors native ``TradeEngine._ask_bar`` exactly. MT5
+    triggers SHORT stops/TPs on the ASK, not the bid. Enable via the
+    ``ask_ohlc`` strategy parameter (default False — legacy bid-only
+    behavior unchanged). Reads explicit ``ask_high``/``ask_low`` data
+    columns when present; otherwise falls back to bid high/low plus the
+    ``spread_price_col`` spread. Returns (None, None) when unavailable.
+    """
+    if not bool((parameters or {}).get("ask_ohlc", False)):
+        return None, None
+    spread = _vbt_bar_spread(row, parameters)
+    ask_high = ask_low = None
+    try:
+        raw_high = row.get("ask_high")
+        raw_low = row.get("ask_low")
+    except (AttributeError, KeyError):
+        raw_high = raw_low = None
+    if raw_high is not None and pd.notna(raw_high):
+        try:
+            ask_high = float(raw_high)
+        except (TypeError, ValueError):
+            ask_high = None
+    if raw_low is not None and pd.notna(raw_low):
+        try:
+            ask_low = float(raw_low)
+        except (TypeError, ValueError):
+            ask_low = None
+    if ask_high is None or ask_low is None:
+        try:
+            base_high = float(row["high"])
+            base_low = float(row["low"])
+        except (KeyError, TypeError, ValueError):
+            return None, None
+        if ask_high is None:
+            ask_high = base_high + spread
+        if ask_low is None:
+            ask_low = base_low + spread
+    return ask_high, ask_low
+
+
 def _resolve_exit_price(
-    exit_row: pd.Series, exit_idx: int, exit_price_series: pd.Series | None
+    exit_row: pd.Series,
+    exit_idx: int,
+    exit_price_series: pd.Series | None,
+    *,
+    signal_exit_fill: str = "close",
+    parameters: dict[str, Any] | None = None,
+    direction: str | None = None,
 ) -> float:
     # D4 dock (Phase 3, A-M1): the unified Fill-zum-Trigger-Close convention
     # re-prices THIS signal-exit leg; stop/TP legs resolve via the intrabar
     # walk. Kept separate so D4 lands without reverting A-H2.
+    # A-H4 (D3): honor signal_exit_fill like native _close_position —
+    # "close" (default) fills at the signal bar's close, "open" at its open
+    # (closer to MT5). An explicit strategy exit_price level always wins.
+    # Spread mirrors native: only open-fills carry it, and only SHORT exits
+    # pay it (closing a SHORT buys the ask); LONG exits sell the bid.
     if exit_price_series is not None:
         exit_price = exit_price_series.iloc[exit_idx]
         if pd.notna(exit_price) and float(exit_price) > 0:
             return float(exit_price)
+    fill_at_open = str(signal_exit_fill or "close").lower() == "open"
     open_value = exit_row.get("open")
-    if open_value is not None and pd.notna(open_value):
-        return float(open_value)
-    return float(exit_row["close"])
+    close_value = exit_row.get("close")
+    open_ok = open_value is not None and pd.notna(open_value)
+    close_ok = close_value is not None and pd.notna(close_value)
+    if fill_at_open:
+        base = float(open_value) if open_ok else float(close_value)
+    else:
+        base = float(close_value) if close_ok else float(open_value)
+    spread = _vbt_bar_spread(exit_row, parameters) if fill_at_open else 0.0
+    if direction == "SHORT":
+        base += spread
+    return base
 
 
 def _resolve_entry_price(
@@ -1100,6 +1223,8 @@ def _resolve_entry_price(
     direction: str,
     entry_stop_series: pd.Series | None,
     entry_idx: int,
+    *,
+    parameters: dict[str, Any] | None = None,
 ) -> float | None:
     """Resolve the fill price for an entry bar.
 
@@ -1113,6 +1238,9 @@ def _resolve_entry_price(
     book phantom fills for orders the market never triggered.
     Without a usable stop level the legacy open/close fallback applies, so
     strategies without ``entry_stop`` behave exactly as before.
+    A-H4 (D3): spread-aware market fill mirroring native
+    ``_fill_pending_orders`` — LONGs lift the ask (open + spread), SHORTs
+    hit the bid (open). Stop-order fills trade at the stop level itself.
     D4 dock (Phase 3, A-M1): the exit convention does not touch entry
     resolution; a later Fill-zum-Trigger-Close change only re-prices exits.
     """
@@ -1131,8 +1259,12 @@ def _resolve_entry_price(
             return None
     open_value = entry_row.get("open")
     if open_value is not None and pd.notna(open_value):
-        return float(open_value)
-    return float(entry_row["close"])
+        base = float(open_value)
+    else:
+        base = float(entry_row["close"])
+    if direction == "LONG":
+        base += _vbt_bar_spread(entry_row, parameters)
+    return base
 
 
 def _resolve_exit_reason(exit_idx: int, exit_reason_series: pd.Series | None) -> str | None:
@@ -1254,6 +1386,7 @@ def _resolve_intrabar_exit(
     scheduled_exit_time: str,
     stop_price: float | None,
     take_profit_price: float | None,
+    parameters: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     if intrabar_df is None or intrabar_df.empty or intrabar_timeframe is None:
         return None
@@ -1281,12 +1414,20 @@ def _resolve_intrabar_exit(
     if window.empty:
         return None
 
-    for row in window.itertuples(index=False):
-        timestamp = pd.to_datetime(getattr(row, "timestamp"), utc=True, errors="coerce")
+    for _, row in window.iterrows():
+        timestamp = pd.to_datetime(row.get("timestamp"), utc=True, errors="coerce")
         if pd.isna(timestamp):
             continue
-        high = float(getattr(row, "high"))
-        low = float(getattr(row, "low"))
+        high = float(row["high"])
+        low = float(row["low"])
+        if direction == "SHORT":
+            # A-H4 (D3): SHORT stops/TPs trigger on the ASK when ask_ohlc is
+            # enabled, mirroring native _check_stops/_ask_bar.
+            ask_high, ask_low = _vbt_ask_bar(row, parameters)
+            if ask_high is not None:
+                high = ask_high
+            if ask_low is not None:
+                low = ask_low
         event = _match_intrabar_exit_event(
             direction=direction,
             high=high,

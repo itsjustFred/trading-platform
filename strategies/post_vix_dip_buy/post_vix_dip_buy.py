@@ -181,6 +181,13 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
     )
     daily_prev_s = daily_close_s.shift(1)
     daily_sma200_s = daily_close_s.rolling(200, min_periods=200).mean()
+    # A-C1: the bull filter must not see the day it trades on. daily_close_s
+    # holds each date's FINAL close (last intraday close wins), so comparing
+    # an intraday bar against the same date's close/SMA200 gates on
+    # information that only exists at the closing auction (lookahead). Pine
+    # evaluates the regime on the PRIOR daily bar ([1] offsets) — use
+    # shift(1) for both the close and the SMA200.
+    daily_sma200_prev_s = daily_sma200_s.shift(1)
     daily_low_prev_s = pd.Series(
         [daily_low_by_date[d] for d in date_order], index=pd.Index(date_order)
     ).shift(1)
@@ -249,8 +256,9 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
             in_regime.iloc[i] = True
             days_since_bar.iloc[i] = float(ds)
         if use_htf_filter:
-            sma = daily_sma200_s.get(d, np.nan)
-            dc = daily_close_by_date.get(d, np.nan)
+            # A-C1: prior-day close vs prior-day SMA200 (no same-day lookahead).
+            sma = daily_sma200_prev_s.get(d, np.nan)
+            dc = daily_prev_s.get(d, np.nan)
             sma200_bar.iloc[i] = float(sma) if pd.notna(sma) else np.nan
             bull_market.iloc[i] = bool(
                 pd.notna(sma) and pd.notna(dc) and dc > sma

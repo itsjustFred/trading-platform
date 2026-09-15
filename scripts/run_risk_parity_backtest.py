@@ -242,14 +242,21 @@ def _simulate_portfolio_value(
     initial_cash: float,
     rebalance_schedule: dict[pd.Timestamp, dict[str, float]],
 ) -> pd.Series:
-    """Walk the returns with rebalanced weights to build the portfolio value."""
+    """Walk the returns with rebalanced weights to build the portfolio value.
+
+    A-H3: rebalance orders are Market-On-Close — the fill happens AT the
+    rebalance-day close, so the new weights earn from the NEXT trading day.
+    The schedule update therefore applies AFTER the day's return is booked
+    with the previously active weights (same-day application would credit
+    the new portfolio with a return it was never exposed to).
+    """
     portfolio_value = pd.Series(index=returns.index, dtype=float)
     portfolio_value.iloc[0] = initial_cash
     active_weights = {t: 0.0 for t in TICKERS}
     for date in returns.index:
+        daily_ret = sum(active_weights[t] * returns[t].loc[date] for t in TICKERS)
         if date in rebalance_schedule:
             active_weights = rebalance_schedule[date]
-        daily_ret = sum(active_weights[t] * returns[t].loc[date] for t in TICKERS)
         prev_idx = returns.index.get_loc(date) - 1
         if prev_idx >= 0:
             portfolio_value.loc[date] = portfolio_value.iloc[prev_idx] * (1 + daily_ret)
