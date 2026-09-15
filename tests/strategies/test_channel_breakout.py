@@ -12,6 +12,7 @@ import math
 import sys
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -83,3 +84,94 @@ class TestStrategyRegression:
                 f"Trade {trade.id}: Risk {risk_pct*100:.2f}% ueberschreitet Limit von 1.5%"
             )
             equity += trade.pnl
+
+
+def _load_module():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "channel_breakout_unit", STRATEGY_PATH
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _two_day_frame() -> pd.DataFrame:
+    """Zwei NY-Tage 30m-Bars; Tag 2 mit Breakout + steady Rise (kein Trail-Exit)."""
+    rows = []
+    for day in ("2024-01-02", "2024-01-03"):
+        base = pd.Timestamp(day + " 09:30", tz="America/New_York")
+        for k in range(14):
+            rows.append((base + pd.Timedelta(minutes=30 * k)).tz_convert("UTC"))
+    stamps = pd.DatetimeIndex(rows)
+    n = len(stamps)
+    close = [100.0] * n
+    close[15] = 102.0
+    for k in range(16, n):
+        close[k] = 102.0 + 0.1 * (k - 15)
+    close_s = pd.Series(close)
+    return pd.DataFrame(
+        {
+            "timestamp": stamps,
+            "open": close_s,
+            "high": close_s + 0.05,
+            "low": close_s - 0.05,
+            "close": close_s,
+            "volume": 1.0,
+        }
+    )
+
+
+_SMALL = dict(
+    channel_length=3,
+    ema_period=5,
+    atr_period=5,
+    use_ema_filter=False,
+    use_channel_exit=False,
+    use_ema_exit=False,
+)
+
+
+def test_fixed_stop_is_dollar_risk_via_point_value():
+    """B-H2/D6: stop_loss_amount ist $-Risiko, Distanz = amount/point_value.
+
+    Default $100 bei $20/Punkt (NQ) -> 5 Punkte, nicht 100 Punkte
+    (~$2000/Kontrakt, ~20x mis-sized).
+    """
+    module = _load_module()
+    df = _two_day_frame()
+    params = dict(
+        _SMALL, use_fixed_stop_loss=True, stop_loss_amount=100.0, use_gap_filter=False
+    )
+    entries, _, indicators, _ = module.generate_signals(df, params)
+    assert int(entries.sum()) >= 1
+    entry_idx = entries[entries].index.tolist()
+    for i in entry_idx:
+        dist = abs(float(df.loc[i, "close"]) - float(indicators["sl_price"].loc[i]))
+        assert dist == pytest.approx(5.0), (
+            f"$100/$20pt muss 5 Punkte Distanz geben, gefunden {dist}"
+        )
+    # Custom point value skaliert die Distanz.
+    params_ep = dict(params, point_value=10.0)
+    _, _, indicators_ep, _ = module.generate_signals(df, params_ep)
+    for i in entry_idx:
+        dist = abs(float(df.loc[i, "close"]) - float(indicators_ep["sl_price"].loc[i]))
+        assert dist == pytest.approx(10.0)
+
+
+def test_session_close_exit_fires_without_gap_filter():
+    """B-M2: exit_on_session_close gilt auch bei use_gap_filter=False."""
+    module = _load_module()
+    df = _two_day_frame()
+    params = dict(
+        _SMALL, use_gap_filter=False, exit_on_session_close=True
+    )
+    entries, exits, indicators, _ = module.generate_signals(df, params)
+    assert int(entries.sum()) >= 1
+    exit_idx = exits[exits].index.tolist()
+    assert len(exit_idx) >= 1, "Session-Close muss flatten"
+    last = exit_idx[-1]
+    assert indicators["exit_reason"].loc[last] == "session_close"
+    assert df.loc[last, "timestamp"] == df["timestamp"].iloc[-1]

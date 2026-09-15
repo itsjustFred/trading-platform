@@ -152,10 +152,15 @@ def build_trade_context(df: pd.DataFrame, params: dict | None = None) -> dict[st
     # The broker fills entries/exits on the bar AFTER the signal bar, so the
     # adapter samples markers at signal+1. Carry each marker one bar forward
     # (harmless for non-trade bars, which are never sampled).
-    direction = direction.combine_first(direction.shift(1))
-    exit_reason = exit_reason.combine_first(exit_reason.shift(1))
+    # B-M5: the carry must not leak across the session boundary — a marker on
+    # the last bar of day N would otherwise be sampled as a signal on the
+    # first bar of day N+1 (different OR range, different session state).
+    day_key_s = pd.Series(list(day_key), index=df.index)
+    same_day = day_key_s.eq(day_key_s.shift(1))
+    direction = direction.combine_first(direction.shift(1).where(same_day))
+    exit_reason = exit_reason.combine_first(exit_reason.shift(1).where(same_day))
     trailing_stop_at_exit = trailing_stop_at_exit.combine_first(
-        trailing_stop_at_exit.shift(1)
+        trailing_stop_at_exit.shift(1).where(same_day)
     )
 
     return {

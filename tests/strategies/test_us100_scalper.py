@@ -115,6 +115,31 @@ def test_stop_loss_exit():
     assert indicators["exit_price"].loc[exit_idx[0]] == pytest.approx(19975.0)
 
 
+def test_day_reset_flattens_without_eod_bar():
+    """B-H1: offene Position wird am Day-Reset geflattet (kein Phantom-Trade).
+
+    Fehlt jede Post-16:00-ET-Bar des Entry-Tages (Session-Data-Gap), feuert
+    der time_exit_eod nie. Der Day-Rollover muss den Exit auf der letzten
+    Bar des Vortages zum Close buchen statt die Position still zu droppen.
+    """
+    module = _load_module()
+    df = _frame()
+    ny = df["timestamp"].dt.tz_convert("America/New_York")
+    et_day = ny.dt.date.astype(str)
+    mins = ny.dt.hour * 60 + ny.dt.minute
+    df_gap = df[~((et_day == "2024-01-02") & (mins >= 16 * 60))].reset_index(drop=True)
+    entries, exits, indicators, _ = module.generate_signals(df_gap, {})
+    assert entries.sum() == 1
+    exit_idx = exits[exits].index.tolist()
+    assert len(exit_idx) == 1, "Day-Reset muss genau einen Exit buchen"
+    assert indicators["exit_reason"].loc[exit_idx[0]] == "day_reset_flatten"
+    # Letzte Bar des ET-Tages 2024-01-02 = 20:00 UTC (15:00 ET), Close 20035.
+    assert df_gap.loc[exit_idx[0], "timestamp"] == pd.Timestamp(
+        "2024-01-02 20:00", tz="UTC"
+    )
+    assert indicators["exit_price"].loc[exit_idx[0]] == pytest.approx(20035.0)
+
+
 def test_code_values_win_over_infos_txt():
     module = _load_module()
     params = module.STRATEGY_META["parameters"]

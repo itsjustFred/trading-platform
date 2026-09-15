@@ -200,7 +200,12 @@ def normalize_ohlcv_frame(frame: pd.DataFrame) -> pd.DataFrame:
     values are filled per-value from the ``bid_`` counterpart (the bid side
     is the conservative, MT5-chart equivalent series); existing non-null
     canonical values always win. All other columns pass through untouched.
+
+    C-1: this helper is NON-MUTATING — it works on a copy and returns it.
+    Callers must use the return value; the input frame is never modified
+    in place.
     """
+    frame = frame.copy()
     for canonical in ("open", "high", "low", "close", "volume"):
         bid_col = f"bid_{canonical}"
         if bid_col not in frame.columns:

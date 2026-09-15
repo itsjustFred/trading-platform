@@ -149,6 +149,24 @@ class TestOrbContextMirror:
         assert ctx["exit_reason"].iloc[4] == "trailing_stop"
         assert ctx["trailing_stop_at_exit"].iloc[4] == pytest.approx(103.0 * 0.99)
 
+    def test_signal_plus_one_carry_stops_at_session_boundary(self):
+        # B-M5: ein Signal auf der LETZTEN Bar von Tag 1 darf nicht auf die
+        # erste Bar von Tag 2 uebertragen werden (andere OR-Range/Session).
+        rows = [
+            ("2024-01-02 14:30:00+00:00", 100, 100.0, 98.0, 99.0),  # OR Tag 1
+            ("2024-01-02 15:00:00+00:00", 99, 101.0, 99.0, 101.0),  # LONG-Signal
+            ("2024-01-03 14:30:00+00:00", 100, 100.1, 99.9, 100.0),  # Tag 2
+            ("2024-01-03 15:00:00+00:00", 100, 100.1, 99.9, 100.0),
+        ]
+        df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close"])
+        df["volume"] = 1.0
+        ctx = _load_context_module().build_trade_context(df, {})
+        assert ctx["direction"].iloc[1] == "LONG"
+        assert pd.isna(ctx["direction"].iloc[2]), (
+            "Signal-Carry darf die Session-Boundary nicht ueberschreiten"
+        )
+        assert pd.isna(ctx["exit_reason"].iloc[2])
+
     def test_overnight_bars_do_not_pollute_range(self):
         df = self._frame().copy()
         df.loc[0, "high"] = 150.0  # 09:00-ET-Bar ausserhalb der OR

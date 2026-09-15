@@ -84,6 +84,111 @@ class TestStrategyRegression:
             equity += trade.pnl
 
 
+class TestPanicFixtureProducesTrades:
+    """B-L1: der Golden-Test darf nicht vakant sein.
+
+    Der Engine-Golden oben erwartet 0 Trades / 0.00 (VIX-Dataset fehlt
+    lokal -> FAIL-CLOSED) und passt damit zu jeder nicht-crashenden
+    Implementierung. Diese Klasse baut ein synthetisches Panik-Fenster
+    (VIX-Spike + SPX-Drop + Intraday-ORB) und verlangt echte Signale —
+    mit kaputter Panik-/Dip-/ORB-Logik faellt sie rot aus.
+    """
+
+    N_DAYS = 205
+    START = "2023-12-25"  # Montag: Panik-Tag 200 = Fr 2024-07-12
+    PANIC_IDX = 200
+    INTRADAY_IDX = 203  # Mo 2024-07-15, days_since_panic = 3
+
+    @staticmethod
+    def _frame() -> pd.DataFrame:
+        n = TestPanicFixtureProducesTrades.N_DAYS
+        start = pd.Timestamp(TestPanicFixtureProducesTrades.START, tz="UTC")
+        dates = [(start + pd.Timedelta(days=i)).date() for i in range(n)]
+        trend = [100.0 + 0.05 * i for i in range(n)]
+        # Panik-Freitag: SPX-Tages-Close -2 % (Gate: <= -1 %).
+        trend[TestPanicFixtureProducesTrades.PANIC_IDX] = (
+            trend[TestPanicFixtureProducesTrades.PANIC_IDX - 1] * 0.98
+        )
+        rows = []
+        for i in range(n):
+            if i == TestPanicFixtureProducesTrades.INTRADAY_IDX:
+                continue  # Intraday-Bars statt Tages-Bar
+            ts = pd.Timestamp(dates[i]) + pd.Timedelta(hours=21)
+            rows.append(
+                (ts.tz_localize("UTC"), trend[i], trend[i] + 0.5,
+                 trend[i] - 0.5, trend[i], 1_000_000.0)
+            )
+        # Intraday 30m: OR 9:30 (High 110.2), Cross drueber 10:30 -> ORB-Long,
+        # danach moderater Drift (kein TP/SL), Exit via Power-Hour-Scale.
+        ny = pd.date_range(
+            pd.Timestamp("2024-07-15 09:30", tz="America/New_York"),
+            periods=13,
+            freq="30min",
+        )
+        closes = [110.0, 110.1, 110.5, 110.6, 110.7, 110.8, 110.9,
+                  111.0, 111.1, 111.2, 111.3, 111.4, 111.5]
+        for ts, c in zip(ny, closes):
+            if ts.hour == 9:
+                o, h, low = 110.0, 110.2, 109.8
+            else:
+                o, h, low = c - 0.05, c + 0.1, c - 0.1
+            rows.append((ts.tz_convert("UTC"), o, h, low, c, 1000.0))
+        df = pd.DataFrame(
+            rows, columns=["timestamp", "open", "high", "low", "close", "volume"]
+        )
+        return df.sort_values("timestamp").reset_index(drop=True)
+
+    @staticmethod
+    def _vix() -> pd.Series:
+        n = TestPanicFixtureProducesTrades.N_DAYS
+        start = pd.Timestamp(TestPanicFixtureProducesTrades.START, tz="UTC")
+        dates = [(start + pd.Timedelta(days=i)).date() for i in range(n)]
+        idx = pd.DatetimeIndex([pd.Timestamp(d, tz="UTC") for d in dates])
+        vix = pd.Series(15.0, index=idx)
+        # Panik-Freitag: +66 % auf 25 (Gate: chg% >= 10 & close >= 19).
+        vix.iloc[TestPanicFixtureProducesTrades.PANIC_IDX] = 25.0
+        vix.iloc[TestPanicFixtureProducesTrades.PANIC_IDX + 1:] = 20.0
+        return vix
+
+    @staticmethod
+    def _module():
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "post_vix_dip_buy_fixture", STRATEGY_PATH
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_panic_window_produces_entry_and_exit(self, monkeypatch):
+        module = self._module()
+        monkeypatch.setattr(
+            module, "_load_vix_data", lambda start=None, end=None: self._vix()
+        )
+        df = self._frame()
+        entries, exits, indicators, _ = module.generate_signals(df, {})
+        assert int(entries.sum()) >= 1, "Panik-Fixture muss Entries liefern"
+        assert int(exits.sum()) >= 1, "Entry muss einen Exit (Scale/EOD) haben"
+        entry_idx = entries[entries].index.tolist()
+        assert indicators["sl_price"].loc[entry_idx].notna().all()
+        reasons = set(indicators["exit_reason"][exits].dropna().tolist())
+        assert reasons <= {
+            "stop_loss",
+            "take_profit",
+            "scale_50pct_power_hour",
+            "eod_flatten",
+        }, f"unerwartete Exit-Reasons: {reasons}"
+
+    def test_fail_closed_without_vix(self, monkeypatch):
+        module = self._module()
+        monkeypatch.setattr(
+            module, "_load_vix_data", lambda start=None, end=None: None
+        )
+        entries, _, _, _ = module.generate_signals(self._frame(), {})
+        assert int(entries.sum()) == 0, "ohne VIX-Daten keine Entries"
+
+
 class TestBullFilterNoLookahead:
     """A-C1: the SMA200 bull filter uses the PRIOR day's close/SMA200.
 

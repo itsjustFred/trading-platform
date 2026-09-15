@@ -12,6 +12,8 @@ import math
 import sys
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -81,3 +83,43 @@ class TestStrategyRegression:
                 f"Trade {trade.id}: Risk {risk_pct*100:.2f}% ueberschreitet Limit von 1.5%"
             )
             equity += trade.pnl
+
+
+def test_warmup_is_day_based_not_bar_counted():
+    """B-M4: kein zusaetzliches i<20-Bar-Gate auf Intraday-Daten.
+
+    10 Tages-Bars (15:00 UTC = 10:00 ET, in Session): der Entry auf
+    Bar 8 (Tages-Index 8 >= 5, aber Bar-Index 8 < 20) muss feuern —
+    das alte Doppel-Gate hat ihn geschluckt.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "volatility_breakout_unit", STRATEGY_PATH
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    stamps = pd.date_range("2024-01-08", periods=10, freq="D", tz="UTC") + pd.Timedelta(
+        hours=15
+    )
+    base = 100.0 + np.arange(10) * 0.3
+    close = base.copy()
+    close[-2] = base[-2] + 3.0
+    close[-1] = base[-1] + 3.5
+    df = pd.DataFrame(
+        {
+            "timestamp": stamps,
+            "open": base,
+            "high": np.maximum(base, close) + 0.5,
+            "low": np.minimum(base, close) - 0.5,
+            "close": close,
+            "volume": 100.0,
+        }
+    )
+    entries, _, indicators, _ = module.generate_signals(df, {})
+    entry_idx = entries[entries].index.tolist()
+    assert len(entry_idx) >= 1, "Day-Warmup (5 Tage) reicht, kein Bar-Count-Gate"
+    assert all(i < 20 for i in entry_idx)
+    assert set(indicators["direction"].loc[entry_idx]) <= {"LONG", "SHORT"}

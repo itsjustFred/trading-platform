@@ -36,9 +36,14 @@ STRATEGY_META = {
         "(entry 30pt / SL 25pt / buffer 30pt). MQL5 server hours map to ET: "
         "07:00 ref -> NY midnight, 07-15h detect -> 00:00-08:00 ET, 15-23h "
         "buy-stops -> 08:00-16:00 ET, 23:00 flatten -> 16:00 ET. "
-        "Approximations: buy-stop fills via bar-high touch (fill at next open "
-        "per platform convention, not at the stop price); SL exits at bar "
-        "low touch; one fill per ET day."
+        "Approximations: buy-stop fills via bar-high touch; SL exits at bar "
+        "low touch; one fill per ET day. Fill pricing is engine-specific: "
+        "the native engine fills the touched buy-stop at the next open, "
+        "while the vectorbt engine (D2 strict) fills at the stop level "
+        "itself — gap-through fills at the stop, and no touch means no "
+        "fill (never a next-open fallback). EOD flatten books the bar "
+        "close; a missing post-16:00-ET bar books 'day_reset_flatten' on "
+        "the last bar of the ET day instead of dropping the position."
     ),
     "parameters": {
         "reference_price": 25000.0,
@@ -121,6 +126,15 @@ def generate_signals(df: pd.DataFrame, params: dict):
 
     for i in range(len(df)):
         if et_day[i] != cur_day:
+            if in_trade:
+                # B-H1: day-reset flatten. The 16:00-ET exit never fired
+                # (no post-16:00 bar in the frame, e.g. a session-data gap).
+                # Book the exit on the last bar of the prior ET day at its
+                # close instead of silently dropping the open position
+                # (phantom trade: entry without exit).
+                exits.iloc[i - 1] = True
+                exit_price.iloc[i - 1] = float(close.iloc[i - 1])
+                exit_reason.iloc[i - 1] = "day_reset_flatten"
             cur_day = et_day[i]
             # H1 close into NY midnight: previous bar's close at the first bar
             # of the ET day (exactly iClose(H1,1) at 07:00 server on H1 data).

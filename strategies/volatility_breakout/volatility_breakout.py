@@ -253,10 +253,13 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
             continue
 
         # Flat: entries only inside the session with warmed-up daily ATR
-        # (source: 6 daily bars + BarsRequiredToTrade 20).
+        # (source: 6 daily bars + BarsRequiredToTrade 20). B-M4: the warmup
+        # is day-based (5 prior daily bars for ATR(5)[1]) — a bar-count gate
+        # (i < 20) would additionally eat 20 session bars on intraday data,
+        # double-gating the same warmup.
         if not clock_ok or not (start_min <= m < end_min):
             continue
-        if i < 20 or day_index_by_date.get(d, 0) < 5:
+        if day_index_by_date.get(d, 0) < 5:
             continue
         if pd.isna(ro) or pd.isna(atr_v):
             continue

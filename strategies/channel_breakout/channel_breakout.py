@@ -25,8 +25,9 @@ vectorbt notes:
   mirrored in the adapter. Shorts are therefore restored (not long-only).
 - Next-open execution: signals fire on bar close, fills on next open.
 - Fixed-$ stop: NT8 Currency-mode needs account/contract value unavailable in
-  generate_signals; approximated as price distance = stop_loss_amount
-  (documented; for NQ $100 ~ 5 pts at $20/pt).
+  generate_signals; stop_loss_amount is a DOLLAR risk amount (D6) converted
+  to a price distance via point_value ($/point, default 20.0 = NQ: $100
+  risk ~= 5 pts). Pass the instrument's point value for other symbols.
 - Trailing-stop trigger is close-based per source (Close <= trail); channel /
   fixed stops are stop orders, checked against low/high.
 """
@@ -47,8 +48,10 @@ STRATEGY_META = {
         "(LONG/SHORT with mirrored PnL); shorts restored, not long-only.\n"
         "- Stop-entry orders approximated as close vs prior-bar channel with "
         "next-open execution; no intrabar stop fills.\n"
-        "- Fixed-$ (Currency-mode) stop approximated as price distance "
-        "stop_loss_amount (true $ stop needs contract point value).\n"
+        "- Fixed-$ stop is a DOLLAR risk amount (D6): price distance = "
+        "stop_loss_amount / point_value (default point_value 20.0 = NQ, "
+        "so $100 ~= 5 pts). Set point_value to the traded instrument's "
+        "$/point.\n"
         "- Gap/session-close use NY calendar dates (US Equities RTH); without a "
         "`timestamp` column the gap filter is bypassed (documented)."
     ),
@@ -87,6 +90,13 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
         "use_fixed_stop_loss", params.get("UseFixedStopLoss", False)
     )
     stop_loss_amount = float(params.get("stop_loss_amount", params.get("StopLossAmount", 100.0)))
+    # D6 (B-H2): stop_loss_amount is a DOLLAR risk amount, not a price
+    # distance. 100 POINTS ~= $2000/contract at $20/pt instead of $100 risk
+    # (~20x mis-sized). Convert via the instrument point value ($/point).
+    point_value = float(params.get("point_value", params.get("PointValue", 20.0)))
+    if point_value <= 0:
+        raise ValueError(f"point_value must be positive ($/point), got {point_value!r}")
+    fixed_stop_distance = stop_loss_amount / point_value
     use_channel_exit = params.get("use_channel_exit", params.get("UseChannelExit", True))
     use_ema_exit = params.get("use_ema_exit", params.get("UseEmaExit", False))
     use_gap_filter = params.get("use_gap_filter", params.get("UseGapFilter", True))
@@ -146,23 +156,27 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
             prev_close = last_close[d]
         for i in range(n):
             gap_direction.iloc[i] = gap_by_date[dates[i]]
-        is_last_of_day = pd.Series(False, index=df.index)
+
+    # B-M2: last-bar-of-day markers are derived whenever a session calendar
+    # is available — INDEPENDENT of the gap filter. Previously
+    # is_last_of_day stayed all-False with use_gap_filter=False, so
+    # exit_on_session_close=True silently held positions overnight.
+    is_last_of_day = pd.Series(False, index=df.index)
+    session_dates = np.array(ny_dates) if ny_dates is not None else None
+    if session_dates is None and "timestamp" in df.columns and (
+        bool(use_gap_filter) or bool(exit_on_session_close)
+    ):
+        # NY conversion failed -> fall back to UTC dates for session-close
+        # only; gap stays bypassed (documented).
+        try:
+            ts_utc = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+            session_dates = ts_utc.dt.date.to_numpy()
+        except Exception:
+            session_dates = None
+    if session_dates is not None:
         for i in range(n):
-            if i == n - 1 or dates[i] != dates[i + 1]:
+            if i == n - 1 or session_dates[i] != session_dates[i + 1]:
                 is_last_of_day.iloc[i] = True
-    else:
-        is_last_of_day = pd.Series(False, index=df.index)
-        if "timestamp" in df.columns and bool(use_gap_filter):
-            # Timestamp present but NY conversion failed -> fall back to UTC dates
-            # for session-close only; gap stays bypassed (documented).
-            try:
-                ts_utc = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
-                utc_dates = ts_utc.dt.date.to_numpy()
-                for i in range(n):
-                    if i == n - 1 or utc_dates[i] != utc_dates[i + 1]:
-                        is_last_of_day.iloc[i] = True
-            except Exception:
-                pass
 
     entries = pd.Series(False, index=df.index)
     exits = pd.Series(False, index=df.index)
@@ -322,7 +336,7 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
                 active_direction = "LONG"
                 entry_price = c
                 if use_fixed_stop:
-                    active_sl = c - float(stop_loss_amount)
+                    active_sl = c - fixed_stop_distance
                     sl_price.iloc[i] = float(active_sl)
                     trailing_stop_value = 0.0
                 else:
@@ -340,7 +354,7 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
                 active_direction = "SHORT"
                 entry_price = c
                 if use_fixed_stop:
-                    active_sl = c + float(stop_loss_amount)
+                    active_sl = c + fixed_stop_distance
                     sl_price.iloc[i] = float(active_sl)
                     trailing_stop_value = 0.0
                 else:
@@ -358,6 +372,9 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
         "Lower_Channel": lower_channel,
         "ATR": atr,
         "sl_price": sl_price,
+        "fixed_stop_distance_pts": pd.Series(
+            fixed_stop_distance, index=df.index, dtype=float
+        ),
         "trailing_stop_at_exit": trailing_stop_at_exit,
         "direction": direction,
         "gap_direction": gap_direction.astype(float),

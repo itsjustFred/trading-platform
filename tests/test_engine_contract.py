@@ -1634,3 +1634,18 @@ def test_normalize_ohlcv_frame_fills_missing_and_all_nan_from_bid():
     assert out["low"].tolist() == [1.0, 1.1, 1.2, 1.3]
     assert "open" not in out.columns  # no bid_open -> not fabricated
     assert out["ask_high"].tolist() == [2.5, 2.6, 2.7, 2.8]
+
+
+def test_normalize_ohlcv_frame_does_not_mutate_input():
+    # C-1: the helper works on a copy; callers must use the return value.
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=2, freq="h", tz="UTC"),
+            "high": [np.nan, np.nan],
+            "bid_high": [2.0, 2.1],
+        }
+    )
+    snapshot = frame.copy(deep=True)
+    out = normalize_ohlcv_frame(frame)
+    pd.testing.assert_frame_equal(frame, snapshot)
+    assert out["high"].tolist() == [2.0, 2.1]
