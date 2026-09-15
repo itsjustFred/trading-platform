@@ -58,9 +58,19 @@ TICKERS = list(ASSETS.keys())
 QC_DATA_START = pd.Timestamp("2015-08-04")
 
 
-def download_prices(start: str, end: str) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Download adjusted daily close and open prices from yfinance."""
-    data = yf.download(TICKERS, start=start, end=end, auto_adjust=True, progress=False)
+def download_prices(
+    start: str, end: str, history_start: str = "2015-08-04"
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Download adjusted daily close and open prices from yfinance.
+
+    A-M6: history is loaded from ``history_start`` (default: the QC data
+    start 2015-08-04) instead of the backtest ``start``, so the SMA(200)
+    ready-gate counts its 200 bars from the same origin LEAN does. Without
+    this the gate goes ready ~100 trading days late on histories that start
+    at the backtest start (the Brexit window is affected).
+    """
+    effective_start = min(pd.Timestamp(start), pd.Timestamp(history_start)).strftime("%Y-%m-%d")
+    data = yf.download(TICKERS, start=effective_start, end=end, auto_adjust=True, progress=False)
     # yfinance returns a MultiIndex when multiple tickers
     closes = data["Close"].copy() if "Close" in data.columns else data.copy()
     opens = data["Open"].copy() if "Open" in data.columns else closes.copy()
@@ -299,8 +309,24 @@ def _portfolio_performance_stats(
     # Sharpe/Sortino one-for-one (audit calibration: ~0.025 for 2016-2024).
     excess_ann = ann_perf - risk_free_rate
     sharpe = float(excess_ann / (port_returns.std() * np.sqrt(252))) if vol_ann else 0.0
-    downside = port_returns[port_returns < 0]
-    sortino = float(excess_ann / (downside.std() * np.sqrt(252))) if len(downside) and downside.std() > 0 else 0.0
+    if lean_statistics:
+        # LEAN-faithful downside deviation (verified 0.3901 vs QC 0.39 at
+        # rf~=0.025): sample std of the negative returns only. Kept
+        # byte-identical — do not "fix" toward the textbook definition here,
+        # it would diverge from LEAN.
+        downside = port_returns[port_returns < 0]
+        sortino = float(excess_ann / (downside.std() * np.sqrt(252))) if len(downside) and downside.std() > 0 else 0.0
+    else:
+        # A-L3: textbook downside deviation for the non-lean path — mean of
+        # squared downside vs the daily risk-free target over ALL
+        # observations (not std over negatives only), so the metric no
+        # longer depends on the negative-count convention.
+        daily_rf = risk_free_rate / 252.0
+        downside_sq_mean = float(
+            np.mean([min(0.0, float(r) - daily_rf) ** 2 for r in port_returns])
+        ) if len(port_returns) else 0.0
+        downside_dev = float(np.sqrt(downside_sq_mean * 252.0)) if downside_sq_mean > 0 else 0.0
+        sortino = float(excess_ann / downside_dev) if downside_dev > 0 else 0.0
 
     rolling_max = portfolio_value.cummax()
     drawdown = (portfolio_value - rolling_max) / rolling_max
@@ -354,12 +380,28 @@ def run_backtest(
     rebalance_threshold: float = 0.02,
     risk_free_rate: float = 0.0,
     lean_statistics: bool = False,
+    history_start: str = "2015-08-04",
 ) -> dict[str, Any]:
     """Run the risk parity backtest and return result dict."""
     if prices is None:
-        prices, open_prices = download_prices(start_date, end_date)
+        # A-M6: download from history_start (default QC data start) so the
+        # SMA(200) IsReady gate counts from the LEAN origin.
+        prices, open_prices = download_prices(start_date, end_date, history_start=history_start)
     elif open_prices is None:
         open_prices = prices
+    if prices.index[0] > QC_DATA_START:
+        # Explicit-price path without QC history: the SMA(200) ready-gate
+        # counts local bars only and goes ready late vs LEAN (documented
+        # limitation — pass history from 2015-08-04 or leave prices=None to
+        # download it).
+        import logging as _logging
+
+        _logging.getLogger(__name__).warning(
+            "Price history starts %s, after QC data start %s: the SMA(200) "
+            "hedge gate counts local bars only and fires late vs LEAN",
+            prices.index[0].date(),
+            QC_DATA_START.date(),
+        )
     if not 0 <= warm_up_days < len(prices):
         raise ValueError("warm_up_days must be non-negative and less than the number of price rows")
     returns = prices.pct_change().dropna()

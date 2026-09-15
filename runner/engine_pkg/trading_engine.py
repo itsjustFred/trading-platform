@@ -303,6 +303,13 @@ class TradeEngine:
         col = self.config.parameters.get("spread_price_col")
         if not col:
             return 0.0
+        # A-L6: frame/intrabar columns are lowercased on load while the
+        # configured name keeps its original case — an uppercase config
+        # ("Spread_Price") silently missed and priced 0.0 spread. Normalize
+        # the lookup key the same way.
+        col = str(col).strip().lower()
+        if not col:
+            return 0.0
         try:
             raw = row.get(col)
         except (AttributeError, KeyError):
@@ -317,12 +324,28 @@ class TradeEngine:
     def _create_order(self, row: pd.Series, i: int, direction: str) -> None:
         entry_price = float(row["close"])
         stop_loss, tp_levels = self._extract_levels(row)
+        # A-M3: sizing-only protective levels (e.g. mean_reversion_rsi_bb
+        # ``sizing_sl_price``) size the position but must NEVER become a live
+        # intrabar stop — exit detection only honors real stop_loss/sl_price.
+        sizing_only_stop: float | None = None
+        for sizing_key in ("sizing_sl_price", "sizing_stop", "sizing_sl"):
+            try:
+                raw_sizing = row.get(sizing_key)
+            except (AttributeError, KeyError):
+                raw_sizing = None
+            if raw_sizing is not None and pd.notna(raw_sizing):
+                try:
+                    sizing_only_stop = float(raw_sizing)
+                except (TypeError, ValueError):
+                    sizing_only_stop = None
+                break
         stop_distance_raw = row.get("stop_distance")
         stop_distance = float(stop_distance_raw) if pd.notna(stop_distance_raw) else None
         take_profit = float(tp_levels[0]["price"]) if tp_levels else None
+        size_from_stop = stop_loss if stop_loss is not None else sizing_only_stop
         qty = self._calculate_position_size(
             entry_price=entry_price,
-            stop_loss_price=stop_loss,
+            stop_loss_price=size_from_stop,
             direction=direction,
             take_profit_price=take_profit,
             stop_distance=stop_distance,
@@ -342,9 +365,30 @@ class TradeEngine:
             stop_distance=stop_distance,
             take_profit_levels=tp_levels,
         )
+        # A-M4 (D5): fixed-amount sizing is absolute-$ (not equity
+        # proportional), so the shared-equity replay must not re-scale this
+        # order's quantity — it still tracks exposure and credits PnL.
+        fixed_cfg = self.config.parameters.get("fixed_risk_amount")
+        if fixed_cfg is None:
+            fixed_cfg = self.config.parameters.get("Fixed_Risk_Amount")
+        order_equity_proportional = not (
+            fixed_cfg is not None and size_from_stop is not None
+        )
+        order._equity_proportional = order_equity_proportional  # transient, not a dataclass field
         self.pending_orders.append(order)
 
     def _open_position(self, order: Order, fill_price: float, fill_time: str, i: int) -> None:
+        # A-M4 (D5): record the equity basis at fill time so the adapter-level
+        # shared-equity replay can rescale multi-symbol trades onto one
+        # running portfolio equity (position size is linear in equity, so the
+        # per-unit coefficient quantity/equity_at_entry replays exactly).
+        position_meta = dict(getattr(order, "meta", None) or {})
+        position_meta["equity_at_entry"] = round(float(self.equity), 2)
+        # A-M4 (D5): transient proportionality flag from _create_order
+        # (fixed-amount sizing must not be re-scaled by the shared replay).
+        position_meta["equity_proportional_sizing"] = bool(
+            getattr(order, "_equity_proportional", True)
+        )
         self.positions.append(
             Position(
                 symbol=order.symbol,
@@ -357,6 +401,7 @@ class TradeEngine:
                 remaining_qty=float(order.quantity),
                 stop_loss=order.stop_loss,
                 take_profit_levels=[dict(level) for level in order.take_profit_levels],
+                meta=position_meta,
             )
         )
 
@@ -535,7 +580,20 @@ class TradeEngine:
 
         self._trade_counter += 1
         pnl = sum(float(item.pnl or 0.0) for item in position.exits)
-        fees = 0.0
+        # A-L1: fees are an explicit engine cost model instead of hardcoded
+        # 0.0. ``fee_rate`` is a fraction of notional charged per side
+        # (entry + each exit leg), ``fee_flat_per_trade`` a flat per-trade
+        # surcharge. Both default to 0.0 (legacy behavior unchanged).
+        fee_rate = max(0.0, float(self.config.parameters.get("fee_rate", 0.0) or 0.0))
+        fee_flat = max(
+            0.0, float(self.config.parameters.get("fee_flat_per_trade", 0.0) or 0.0)
+        )
+        entry_notional = float(position.entry_price) * float(position.quantity)
+        exit_notional = sum(
+            float(item.price or 0.0) * float(item.quantity or 0.0)
+            for item in position.exits
+        )
+        fees = (entry_notional + exit_notional) * fee_rate + fee_flat
         net_pnl = pnl - fees
         risk_per_share = abs(
             position.entry_price - (position.stop_loss or position.entry_price * 0.98)
@@ -585,16 +643,14 @@ class TradeEngine:
         if not self.positions:
             return
 
-        # MT5 parity (strategy-test-audit): signal exits fill at the bar open
-        # when configured — MT5 exits at the first tick inside the exit
-        # minute, i.e. at the bar open, not the close. Closing a SHORT buys
-        # the ask (open + spread); closing a LONG sells the bid (open).
-        # Verified tick-for-tick: MT5 long time-exits == 22:55 bar open,
-        # short time-exits == 22:55 bar open + spread.
-        # D4 dock (Phase 3, A-M1): the unified Fill-zum-Trigger-Close
-        # convention re-prices THIS signal-exit leg (base_exit selection);
-        # stop/TP legs dock in _check_stops. Kept separate so D4 lands
-        # without reverting A-H1/A-H5.
+        # D4 (Phase 3, A-M1 — implemented): unified Fill-zum-Trigger-Close
+        # for signal exits — the exit fills at the trigger bar's close by
+        # default, exactly like the vectorbt adapter (which keeps its exit
+        # leg unshifted). signal_exit_fill="open" stays as an MT5-parity
+        # opt-in (first tick inside the exit minute ~= bar open).
+        # Closing a SHORT buys the ask (open + spread); closing a LONG
+        # sells the bid. Verified tick-for-tick: MT5 long time-exits ==
+        # 22:55 bar open, short time-exits == 22:55 bar open + spread.
         fill_at_open = (
             str(getattr(self.config, "signal_exit_fill", "close")).lower()
             == "open"
@@ -802,24 +858,34 @@ class TradeEngine:
                 first_event = "tp"
 
             if first_event == "stop" and position.stop_loss is not None:
-                # D4 dock (Phase 3, A-M1 exit convention): the unified
-                # Fill-zum-Trigger-Close convention lands here — stop exits
-                # currently fill at the stop level; D4 re-prices this leg to
-                # the trigger bar's close without touching the detection above.
+                # D4 (Phase 3, A-M1 exit convention): the unified convention
+                # is Fill-zum-Trigger-Close for SIGNAL exits; stop/TP legs
+                # keep LEVEL fills (the stop distance is the sizing risk
+                # unit — re-pricing stops to the close would silently void
+                # the risk model). A-H7: SHORT stop fills buy the ask, so
+                # they carry the spread like entries and signal exits do;
+                # LONG stops sell the bid (level as-is).
+                stop_fill = float(position.stop_loss)
+                if position.direction != "LONG":
+                    stop_fill += self._bar_spread(row)
                 self._close_partial(
                     position,
-                    price=float(position.stop_loss),
+                    price=stop_fill,
                     qty=position.remaining_qty,
                     time_iso=time_iso,
                     reason="stop_loss",
                 )
             elif first_event == "tp":
+                # A-H7: SHORT TP fills buy the ask (level + spread), LONG TP
+                # fills sell the bid (level as-is) — same side convention as
+                # stop fills, entries and signal exits.
+                tp_spread = self._bar_spread(row) if position.direction != "LONG" else 0.0
                 for level in pending_tp:
-                    level_price = float(level["price"])
+                    trigger_price = float(level["price"])
                     if position.direction == "LONG":
-                        reached = bar_high >= level_price
+                        reached = bar_high >= trigger_price
                     else:
-                        reached = bar_low <= level_price
+                        reached = bar_low <= trigger_price
                     if not reached:
                         continue
 
@@ -830,7 +896,7 @@ class TradeEngine:
 
                     self._close_partial(
                         position,
-                        price=level_price,
+                        price=trigger_price + tp_spread,
                         qty=qty,
                         time_iso=time_iso,
                         reason=str(level.get("name") or "take_profit"),
@@ -841,9 +907,12 @@ class TradeEngine:
                         break
 
                 if position.remaining_qty > 1e-9 and stop_hit and position.stop_loss is not None:
+                    trailing_fill = float(position.stop_loss)
+                    if position.direction != "LONG":
+                        trailing_fill += self._bar_spread(row)
                     self._close_partial(
                         position,
-                        price=float(position.stop_loss),
+                        price=trailing_fill,
                         qty=position.remaining_qty,
                         time_iso=time_iso,
                         reason="stop_loss",
@@ -865,9 +934,15 @@ class TradeEngine:
                 high_pnl = (float(row["high"]) - position.entry_price) * position.remaining_qty
                 low_pnl = (float(row["low"]) - position.entry_price) * position.remaining_qty
             else:
+                # A-L5: SHORT exits trigger on the ASK when ask_ohlc is
+                # enabled — MAE/MFE must be measured on the same side the
+                # position would actually trade, not on bid high/low.
+                ask_high, ask_low = self._ask_bar(row)
+                ref_high = ask_high if ask_high is not None else float(row["high"])
+                ref_low = ask_low if ask_low is not None else float(row["low"])
                 unrealized += (position.entry_price - close_price) * position.remaining_qty
-                high_pnl = (position.entry_price - float(row["low"])) * position.remaining_qty
-                low_pnl = (position.entry_price - float(row["high"])) * position.remaining_qty
+                high_pnl = (position.entry_price - ref_low) * position.remaining_qty
+                low_pnl = (position.entry_price - ref_high) * position.remaining_qty
 
             position.mfe = max(position.mfe, high_pnl)
             position.mae = min(position.mae, low_pnl)
@@ -961,14 +1036,20 @@ class TradeEngine:
         # Indicator warmup gate. When
         # config.warmup_start is set, bars before start_date feed the
         # indicators only — no orders, no exits, no equity points.
+        # A-M11: a warmup window without a parseable start_date must fail
+        # loudly — silently trading the warmup bars (trade_from=None) is
+        # worse than refusing the run.
         trade_from = None
         if str(getattr(self.config, "warmup_start", "") or "").strip():
-            try:
-                trade_from = pd.to_datetime(
-                    getattr(self.config, "start_date", ""), utc=True
+            trade_from = pd.to_datetime(
+                getattr(self.config, "start_date", ""), utc=True, errors="coerce"
+            )
+            if trade_from is None or pd.isna(trade_from):
+                raise ValueError(
+                    "warmup_start is set but start_date "
+                    f"({getattr(self.config, 'start_date', '')!r}) is empty or "
+                    "unparseable — the warmup gate cannot derive trade_from"
                 )
-            except (ValueError, TypeError):
-                trade_from = None
 
         total_bars = len(frame)
         progress_span = max(0.0, self._progress_end - self._progress_start)
@@ -1003,9 +1084,9 @@ class TradeEngine:
             # positions). Re-run the check scoped to just-opened positions so
             # fill-bar breakouts exit on the fill bar instead of leaking a
             # full extra bar of phantom exposure.
-            # D4 dock (Phase 3, A-M1): this scoped re-check reuses _check_stops
-            # detection + pricing, so a later Fill-zum-Trigger-Close change
-            # applies to fill-bar exits automatically with no revert here.
+            # D4 (A-M1): this scoped re-check reuses _check_stops detection
+            # + pricing, so fill-bar exits follow the same convention with no
+            # special case here.
             self._check_stops(row, i, next_time, only_entry_index=i)
 
             if bool(entries.iloc[i]):

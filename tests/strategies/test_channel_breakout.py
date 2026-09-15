@@ -32,7 +32,10 @@ TEST_TIMEFRAME = "1h"
 # EMA/fixed-stop opt-ins). Old values (8 trades / +2886.67) encoded the buggy
 # long-only port without gap/channel/session exits.
 EXPECTED_TRADE_COUNT = 33
-EXPECTED_NET_PROFIT = -417.31
+# Re-baselined 2026-09-15 for P3a A-M2 (close-triggered trailing exits fill
+# at the close, not at the stop level) + D4 (signal exits at trigger close):
+# same 33 triggers, fills move from -417.31 to -688.18.
+EXPECTED_NET_PROFIT = -688.18
 
 
 @pytest.fixture(scope="module")

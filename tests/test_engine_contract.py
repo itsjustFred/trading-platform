@@ -835,7 +835,10 @@ class TestSizingContract:
         _write_ohlcv(tmp_path, "PARITY", "1h", data)
 
         strategy = tmp_path / "sl_tp_strategy.py"
-        _sl_tp_strategy(strategy, stop=103.9, take_profit=200.0)
+        # P3a: stop must sit on the valid side of the ~102.0 entry — a
+        # wrong-side stop (e.g. the previous 103.9) is correctly dropped by
+        # the inverted-stop guard, which would void this leverage-cap test.
+        _sl_tp_strategy(strategy, stop=100.0, take_profit=200.0)
 
         cfg = _config(
             tmp_path,

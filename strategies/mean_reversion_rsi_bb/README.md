@@ -32,8 +32,8 @@ nicht dem 09:31->09:45-Fenster.
 Die Quelle definiert keinen Stop-Loss (reiner Time-Exit).
 Fuer das Runner Risk-Sizing (`--risk-pct`) emittiert die Konvertierung einen
 strukturellen Schutz-Level pro Entry-Bar (Plattform-Ergaenzung, keine Source-Regel):
-- SHORT (Gap up): `sl_price = high` der Entry-Bar
-- LONG (Gap down): `sl_price = low` der Entry-Bar
+- SHORT (Gap up): `sizing_sl_price = high` der Entry-Bar
+- LONG (Gap down): `sizing_sl_price = low` der Entry-Bar
 
 ### Trailing Stop (falls vorhanden)
 Kein Trailing Stop implementiert (Quelle hat keinen).
@@ -51,7 +51,7 @@ Keine Partial Exits implementiert.
 
 ## Risk-Management
 - Stop-Distanz: strukturell pro Entry-Bar (`high` bei SHORT, `low` bei LONG), nur fuer Sizing
-- Position Sizing: Runner berechnet die Positionsgroesse ueber `--risk-pct` und `sl_price`
+- Position Sizing: Runner berechnet die Positionsgroesse ueber `--risk-pct` und `sizing_sl_price` (A-M3: Sizing-Level, kein Live-Stop)
 - Empfohlenes `--risk-pct`: 0.01 (1 % pro Trade)
 
 ## Framework-Empfehlung

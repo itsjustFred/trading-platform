@@ -210,9 +210,14 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
                         trailing_stop_value = 0.0
                         continue
                 else:
+                    # A-M2: close-triggered trailing exit fills at the CLOSE,
+                    # not at the stop level (filling LONGs at the level above
+                    # the close systematically sells too high). Stop-order
+                    # legs (fixed stop on low/high, channel exit on low/high)
+                    # keep level fills — only close-triggered legs move.
                     if c <= trailing_stop_value:
                         exits.iloc[i] = True
-                        exit_price.iloc[i] = float(trailing_stop_value)
+                        exit_price.iloc[i] = c
                         exit_reason.iloc[i] = "trailing_stop"
                         in_trade = False
                         active_direction = None
@@ -261,9 +266,11 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
                         trailing_stop_value = 0.0
                         continue
                 else:
+                    # A-M2: close-triggered trailing exit fills at the CLOSE
+                    # (mirror of the LONG leg) — never at the stop level.
                     if c >= trailing_stop_value:
                         exits.iloc[i] = True
-                        exit_price.iloc[i] = float(trailing_stop_value)
+                        exit_price.iloc[i] = c
                         exit_reason.iloc[i] = "trailing_stop"
                         in_trade = False
                         active_direction = None

@@ -27,7 +27,15 @@
       "Trades per Day": 0.4,
       "Turnover": "1%"
     },
-    "source": "strategy-comparisons/risk_parity/risk_parity_report_quantconnect.pdf"
+    "source": "strategy-comparisons/risk_parity/risk_parity_report_quantconnect.pdf",
+    "pdf_gate": {
+      "comment": "D7: the PDF summary is the parity gate (the top-level stats mirror the reimplementation and can never fail on their own). Wide tolerance: the PDF has no trade list and LEAN differs in methodology/fees/timing.",
+      "source": "strategy-comparisons/risk_parity/risk_parity_report_quantconnect.pdf",
+      "cagr": 0.076,
+      "sharpe_ratio": 0.4,
+      "max_drawdown": 0.177,
+      "tolerance_rel": 0.5
+    }
   },
   "settings": {
     "lean_statistics": true,

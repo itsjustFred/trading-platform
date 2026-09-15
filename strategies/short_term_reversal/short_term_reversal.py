@@ -101,14 +101,16 @@ def generate_signals(df: pd.DataFrame, params: dict):
                 in_trade = False
                 exits.iloc[i] = True
                 bars_held_at_exit.iloc[i] = bars_held
+                # A-M2: all triggers are close-based (pnl_pct derives from the
+                # close), so every leg fills at the CLOSE — filling the stop
+                # leg at entry*(1-stop_pct) above the close systematically
+                # sells LONGs too high.
+                exit_price.iloc[i] = float(close.iloc[i])
                 if stop_hit:
-                    exit_price.iloc[i] = entry_price * (1 - stop_pct)
                     exit_reason.iloc[i] = "stop_loss"
                 elif profit_hit:
-                    exit_price.iloc[i] = float(close.iloc[i])
                     exit_reason.iloc[i] = "profit_target"
                 else:
-                    exit_price.iloc[i] = float(close.iloc[i])
                     exit_reason.iloc[i] = "time_exit"
                 entry_price = np.nan
 

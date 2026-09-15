@@ -30,7 +30,10 @@ TEST_END = "2025-09-30"
 TEST_SYMBOL = "US500"
 TEST_TIMEFRAME = "1h"
 EXPECTED_TRADE_COUNT = 4
-EXPECTED_NET_PROFIT = 256.87
+# Re-baselined 2026-09-15 for P3a A-M2 (close-triggered trailing exits fill
+# at the close, not at the stop level) + D4 (signal exits at trigger close):
+# same 4 triggers, fills move from 256.87 to 143.81.
+EXPECTED_NET_PROFIT = 143.81
 
 
 @pytest.fixture(scope="module")

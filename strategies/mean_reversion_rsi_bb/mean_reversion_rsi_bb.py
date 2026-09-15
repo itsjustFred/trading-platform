@@ -16,9 +16,10 @@ On daily bars the entry signal fires on the gap day and the exit signal on
 the next day; the platform's next-open execution convention additionally
 shifts fills by one bar. P&L therefore corresponds to a 1-day-delayed fade,
 not to the 14-minute 09:31 -> 09:45 window. See README and STRATEGY_META
-notes. There is no stop-loss in the source; the emitted ``sl_price``
-(entry-bar low for LONG / high for SHORT) is a structural protective level
-used ONLY for runner risk sizing, not a source rule.
+notes. There is no stop-loss in the source; the emitted
+``sizing_sl_price`` (entry-bar low for LONG / high for SHORT) is a
+sizing-only structural protective level used ONLY for runner risk sizing —
+never armed as a live exit (A-M3).
 """
 
 import numpy as np
@@ -38,8 +39,8 @@ STRATEGY_META = {
         "exit is the next open (one-bar hold). LIMITATION: the 09:31->09:45 "
         "intraday window cannot be expressed on 1d bars, and next-open "
         "execution shifts fills by one bar, so backtest P&L is a 1-day-delayed "
-        "fade proxy. sl_price (entry-bar low/high) is a sizing-only "
-        "protective level, not a source rule. Replaces the previous generic "
+        "fade proxy. sizing_sl_price (entry-bar low/high) is a sizing-only "
+        "protective level, never a live exit (A-M3). Replaces the previous generic "
         "BB/RSI implementation that was mapped to this source by mistake."
     ),
     "parameters": {
@@ -81,7 +82,7 @@ def generate_signals(df: pd.DataFrame, params: dict):
     entries = pd.Series(False, index=df.index)
     exits = pd.Series(False, index=df.index)
     direction = pd.Series(index=df.index, dtype="object")
-    sl_price = pd.Series(np.nan, index=df.index)
+    sizing_sl_price = pd.Series(np.nan, index=df.index)
     gap_at_entry = pd.Series(np.nan, index=df.index)
     volatility_at_entry = pd.Series(np.nan, index=df.index)
     deviations_at_entry = pd.Series(np.nan, index=df.index)
@@ -101,9 +102,13 @@ def generate_signals(df: pd.DataFrame, params: dict):
             is_gap_up = bool(gap.iloc[i] > 0)
             # Fade the gap: gap up -> SHORT, gap down -> LONG.
             direction.iloc[i] = "SHORT" if is_gap_up else "LONG"
-            # Sizing-only structural stop (NOT a source rule): the entry bar's
-            # extreme against the fade direction.
-            sl_price.iloc[i] = float(high.iloc[i]) if is_gap_up else float(low.iloc[i])
+            # A-M3: sizing-only structural stop (NOT a source rule and NOT a
+            # live exit level): the entry bar's extreme against the fade
+            # direction. Published as ``sizing_sl_price`` so engines size
+            # from it without arming a live intrabar stop (a ``sl_price``
+            # key would be picked up by exit detection whenever
+            # modeling_resolution enables the intrabar walk).
+            sizing_sl_price.iloc[i] = float(high.iloc[i]) if is_gap_up else float(low.iloc[i])
             gap_at_entry.iloc[i] = float(gap.iloc[i])
             volatility_at_entry.iloc[i] = float(volatility.iloc[i])
             deviations_at_entry.iloc[i] = float(deviations.iloc[i])
@@ -113,7 +118,7 @@ def generate_signals(df: pd.DataFrame, params: dict):
         "gap_volatility": volatility,
         "gap_deviations": deviations,
         "direction": direction,
-        "sl_price": sl_price,
+        "sizing_sl_price": sizing_sl_price,
         "gap_at_entry": gap_at_entry,
         "volatility_at_entry": volatility_at_entry,
         "deviations_at_entry": deviations_at_entry,

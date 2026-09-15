@@ -6,12 +6,18 @@ framework (the parallel ``validation/statistics/`` module was removed).
 Mathematical conventions (kept explicit so results are reproducible):
 
 * **Standard deviation:** *population* std (divide by ``n``), risk-free rate 0.
-* **Sharpe:** ``mean(returns) / population_std(returns) * sqrt(252)`` where the
-  "returns" series is the per-trade realized PnL sequence.
-* **Sortino:** ``mean(returns) / downside_deviation * sqrt(252)`` where the
+* **Sharpe:** ``mean(returns) / population_std(returns) * sqrt(P)`` where the
+  "returns" series is the per-trade realized PnL sequence and ``P`` is the
+  number of trades per year derived from the trade timestamps
+  (``n_trades / span_years``) — compatible with ``runner/stats.py``, which
+  annualizes daily equity returns with 252 periods. When the timestamps
+  cannot support a trade-frequency annualization (fewer than 2 dated
+  trades, zero span, or more than one trade per day on average — e.g.
+  intraday or synthetic fixtures), it falls back to ``sqrt(252)``.
+* **Sortino:** ``mean(returns) / downside_deviation * sqrt(P)`` where the
   downside deviation divides the sum of squared *negative* returns by the count
-  of *negative* returns only.
-* **Annualization:** ``sqrt(252)`` (daily-trade assumption).
+  of *negative* returns only (same negatives-only convention as
+  ``runner/stats.py`` ``_sortino_manual``).
 * **Drawdown:** absolute is in account currency; ``max_drawdown_pct`` is a
   fraction (0..1) of the running peak.
 * **PnL basis (DV-B46):** win/loss classification, ``net_profit``, Sharpe,
@@ -123,7 +129,48 @@ def _compute_drawdowns(realized_pnls: List[float]) -> tuple[float, float]:
     return max_dd, max_dd_pct
 
 
-def _sharpe(returns: List[float], annualize_factor: float = math.sqrt(252)) -> float:
+def _trade_span_years(trades: List[Trade]) -> float | None:
+    """Calendar span covered by the trades, in years (None when undatable)."""
+    stamps: list[pd.Timestamp] = []
+    try:
+        import pandas as pd
+    except ImportError:  # pragma: no cover
+        return None
+    for trade in trades:
+        for raw in (trade.entry_time, trade.last_exit_time):
+            if raw is None:
+                continue
+            ts = pd.to_datetime(str(raw), utc=True, errors="coerce")
+            if ts is not None and not pd.isna(ts):
+                stamps.append(ts)
+    if len(stamps) < 2:
+        return None
+    span_days = (max(stamps) - min(stamps)).total_seconds() / 86400.0
+    if span_days <= 0:
+        return None
+    return span_days / 365.25
+
+
+def _annualize_factor(trades: List[Trade]) -> float:
+    """Trades-per-year annualization factor (A-L4).
+
+    ``sqrt(n_trades / span_years)`` — the trade-based analogue of the
+    ``sqrt(252)`` daily annualization in ``runner/stats.py``. Falls back to
+    ``sqrt(252)`` when the timestamps cannot support it (undatable, zero
+    span, or denser than one trade per day — the per-trade Sharpe has no
+    defined annualization there, so the legacy daily-trade assumption
+    applies).
+    """
+    span_years = _trade_span_years(trades)
+    if span_years is None or span_years <= 0:
+        return math.sqrt(252)
+    periods_per_year = len(trades) / span_years
+    if not 1.0 <= periods_per_year <= 252.0:
+        return math.sqrt(252)
+    return math.sqrt(periods_per_year)
+
+
+def _sharpe(returns: List[float], annualize_factor: float | None = None) -> float:
     """Annualized Sharpe ratio (population std, risk-free rate = 0)."""
     n = len(returns)
     if n < 2:
@@ -133,10 +180,11 @@ def _sharpe(returns: List[float], annualize_factor: float = math.sqrt(252)) -> f
     std = math.sqrt(variance) if variance > 0 else 0.0
     if std == 0.0:
         return 0.0
-    return (mean_return / std) * annualize_factor
+    factor = annualize_factor if annualize_factor is not None else math.sqrt(252)
+    return (mean_return / std) * factor
 
 
-def _sortino(returns: List[float], annualize_factor: float = math.sqrt(252)) -> float:
+def _sortino(returns: List[float], annualize_factor: float | None = None) -> float:
     """Annualized Sortino ratio (downside deviation, risk-free rate = 0)."""
     n = len(returns)
     if n < 2:
@@ -149,7 +197,8 @@ def _sortino(returns: List[float], annualize_factor: float = math.sqrt(252)) -> 
     downside_std = math.sqrt(downside_var) if downside_var > 0 else 0.0
     if downside_std == 0.0:
         return 0.0
-    return (mean_return / downside_std) * annualize_factor
+    factor = annualize_factor if annualize_factor is not None else math.sqrt(252)
+    return (mean_return / downside_std) * factor
 
 
 def compute_trade_statistics(trades: List[Trade]) -> TradeStatistics:
@@ -178,8 +227,9 @@ def compute_trade_statistics(trades: List[Trade]) -> TradeStatistics:
 
     max_drawdown, max_drawdown_pct = _compute_drawdowns(realized_pnls)
 
-    sharpe_ratio = _sharpe(realized_pnls)
-    sortino_ratio = _sortino(realized_pnls)
+    annualize = _annualize_factor(trades)
+    sharpe_ratio = _sharpe(realized_pnls, annualize)
+    sortino_ratio = _sortino(realized_pnls, annualize)
 
     if max_drawdown != 0.0:
         recovery_factor = net_profit / max_drawdown

@@ -5,7 +5,8 @@ Deterministische Synthetic-Frame-Tests (keine Marktdaten noetig):
 - Fade-Richtung (Gap down -> LONG, Gap up -> SHORT)
 - Sigma-Filter (hohes Sigma -> keine Entries)
 - Exit am naechsten Bar (1-Bar-Hold als Tages-Proxy der 09:45-Liquidation)
-- sl_price pro Entry vorhanden (Sizing-Level, keine Source-Regel)
+- sizing_sl_price pro Entry vorhanden (Sizing-Level, keine Source-Regel,
+  kein Live-Exit — A-M3)
 - Provenance: STRATEGY_META zeigt auf overnight_gap_mean_reverse,
   keine BB/RSI/ATR-Relikte.
 """
@@ -81,13 +82,16 @@ def test_sigma_filter_blocks_small_gaps():
     assert not entries.any(), "sigma=100 must block 5-point gaps on ~0.17 volatility"
 
 
-def test_sl_price_present_at_entries():
+def test_sizing_sl_price_present_at_entries_and_not_a_live_stop():
     module = _load_module()
     df = _gap_frame()
     entries, _, indicators, _ = module.generate_signals(df, {"sigma": 1.0})
-    sl = indicators["sl_price"]
+    # A-M3: sizing-only key — "sl_price" must NOT be published (engines
+    # would arm it as a live intrabar stop under modeling_resolution).
+    assert "sl_price" not in indicators
+    sl = indicators["sizing_sl_price"]
     for idx in entries[entries].index:
-        assert pd.notna(sl.loc[idx]), f"missing sl_price at entry {idx}"
+        assert pd.notna(sl.loc[idx]), f"missing sizing_sl_price at entry {idx}"
     # Structural sizing level: LONG stop at entry-bar low, SHORT at entry-bar high.
     assert sl.loc[65] == pytest.approx(df["low"].loc[65])
     assert sl.loc[70] == pytest.approx(df["high"].loc[70])

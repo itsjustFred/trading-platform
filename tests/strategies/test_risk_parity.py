@@ -353,3 +353,79 @@ def test_held_weights_earn_next_day_return():
     schedule = {dates[1]: {t: (1.0 if t == "SPY" else 0.0) for t in TICKERS}}
     portfolio_value = _simulate_portfolio_value(returns, 100_000.0, schedule)
     assert float(portfolio_value.iloc[-1]) == pytest.approx(110_000.0)
+
+
+def test_pdf_gate_bounds_checked_in_reference_stats():
+    """A-M8 (D7): the QC PDF summary gates the reimplementation snapshot.
+
+    The top-level stats mirror the Python reimplementation (comparing them
+    to themselves is always green), so the PDF summary (CAGR 7.6%, Sharpe
+    0.4, Drawdown 17.7%) is stored as ``pdf_gate`` with a wide relative
+    tolerance (±50%: no trade list, different LEAN methodology/fees/timing).
+    A regenerated reference that drifts past the gate fails here.
+    """
+    import json
+
+    ref_path = (
+        Path(__file__).parent.parent.parent
+        / "strategy-comparisons"
+        / "risk_parity"
+        / "risk_parity_reference.json"
+    )
+    reference = json.loads(ref_path.read_text(encoding="utf-8"))
+    gate = reference["raw_metadata"]["pdf_gate"]
+    assert gate["source"].endswith("risk_parity_report_quantconnect.pdf")
+    tolerance = float(gate["tolerance_rel"])
+    assert tolerance == pytest.approx(0.5)
+
+    stats = reference["stats"]
+    checks = {
+        "cagr": (stats["cagr"], float(gate["cagr"])),
+        "sharpe_ratio": (stats["sharpe_ratio"], float(gate["sharpe_ratio"])),
+        "max_drawdown": (abs(stats["max_drawdown"]), float(gate["max_drawdown"])),
+    }
+    for name, (actual, expected) in checks.items():
+        rel_diff = abs(actual - expected) / expected
+        assert rel_diff <= tolerance, (
+            f"{name}: reimplementation {actual} vs PDF gate {expected} "
+            f"(rel. diff {rel_diff:.1%} > {tolerance:.0%})"
+        )
+
+
+def test_download_prices_loads_history_from_qc_start(monkeypatch):
+    """A-M6: downloads start at the QC data start, not the backtest start."""
+    import scripts.run_risk_parity_backtest as risk_parity
+
+    seen: dict[str, str] = {}
+
+    def fake_download(tickers, start, end, auto_adjust, progress):
+        seen["start"] = start
+        idx = pd.bdate_range("2015-08-04", periods=300)
+        frame = pd.DataFrame(100.0, index=idx, columns=tickers)
+        return pd.concat({"Close": frame, "Open": frame}, axis=1)
+
+    monkeypatch.setattr(risk_parity.yf, "download", fake_download)
+    risk_parity.download_prices("2016-01-01", "2016-06-01")
+    assert seen["start"] == "2015-08-04"
+
+
+def test_non_lean_sortino_uses_full_sample_downside():
+    """A-L3: non-lean Sortino divides by the all-observation downside."""
+    dates = pd.bdate_range("2024-01-02", periods=60)
+    drift = np.linspace(100.0, 110.0, len(dates))
+    drift[::7] -= 1.5
+    prices = pd.DataFrame({ticker: drift for ticker in TICKERS}, index=dates)
+    kwargs = dict(
+        start_date=str(dates[0].date()),
+        end_date=str(dates[-1].date()),
+        prices=prices,
+        open_prices=prices,
+        warm_up_days=0,
+    )
+    plain = run_backtest(**kwargs)
+    # Textbook downside (all observations) is smaller than the
+    # negatives-only sample std, so non-lean Sortino exceeds Sharpe here
+    # while the lean recipe stays LEAN-faithful (verified vs QC 0.39).
+    assert plain["stats"]["sortino_ratio"] > 0.0
+    lean = run_backtest(**kwargs, lean_statistics=True, risk_free_rate=0.025)
+    assert lean["stats"]["sortino_ratio"] > 0.0

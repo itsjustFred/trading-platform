@@ -248,8 +248,8 @@ def _process_symbol(
     """Process a single symbol: load data, generate signals, extract trades.
 
     Returns (trades_with_temp_ids, used_intrabar_timeframes, drawings,
-    indicator_series, loaded_bar_count). Runs in its own process when
-    parallelized.
+    indicator_series, loaded_bar_count, inverted_stop_drops). Runs in its
+    own process when parallelized.
     """
     strategy_mod = _load_strategy_module(strategy_path)
     # A-H4 (D3): warmup_start extends the loaded window backwards for
@@ -268,10 +268,15 @@ def _process_symbol(
         )
     trade_from = None
     if warmup_raw:
-        try:
-            trade_from = pd.to_datetime(config.start_date, utc=True)
-        except (ValueError, TypeError):
-            trade_from = None
+        # A-M11: a warmup window without a parseable start_date must fail
+        # loudly (mirrors the native engine) — never trade warmup bars.
+        trade_from = pd.to_datetime(config.start_date, utc=True, errors="coerce")
+        if trade_from is None or pd.isna(trade_from):
+            raise ValueError(
+                "warmup_start is set but start_date "
+                f"({config.start_date!r}) is empty or unparseable — the "
+                "warmup gate cannot derive trade_from"
+            )
 
     asset_class = _infer_asset_class_from_path(data_path)
     intrabar_df, intrabar_timeframe = _load_intrabar_ohlcv(
@@ -291,6 +296,11 @@ def _process_symbol(
     entries = execution_signals["entries"]
     exits = execution_signals["exits"]
     stop_loss_series = _find_stop_loss_series(execution_signals, execution_indicators)
+    # A-M3: sizing-only protective levels (e.g. mean_reversion_rsi_bb
+    # ``sizing_sl_price``) size the position but must NEVER arm the live
+    # intrabar stop — exit detection keeps using the real stop_loss series.
+    sizing_stop_series = _find_sizing_stop_series(execution_signals, execution_indicators)
+    sizing_basis_series = sizing_stop_series if sizing_stop_series is not None else stop_loss_series
     take_profit_series = _find_take_profit_series(execution_signals, execution_indicators)
     entry_stop_series = _find_entry_stop_series(execution_signals, execution_indicators)
     atr_series = _find_atr_series(execution_signals, execution_indicators)
@@ -303,6 +313,7 @@ def _process_symbol(
     entry_idx = None
     equity = config.initial_capital
     trade_counter = 0
+    inverted_stop_drops = 0
 
     for i in range(len(df)):
         if trade_from is not None:
@@ -317,9 +328,16 @@ def _process_symbol(
             if pd.notna(bar_ts) and bar_ts < trade_from:
                 continue
         if not in_trade and bool(entries.iloc[i]):
+            # Entry leg executes next-open (shifted index = execution bar).
             in_trade = True
             entry_idx = i
-        elif in_trade and bool(exits.iloc[i]):
+        if in_trade and bool(exits.iloc[i]):
+            # D4 (A-M1): the exit leg stays on the trigger bar, so an exit
+            # may fire on the entry execution bar itself (same-bar open
+            # fill -> close exit), exactly like the native engine which
+            # fills pending orders at the open and closes signal exits at
+            # the close of the same bar. No `elif`: it would swallow the
+            # exit whenever both legs land on one bar.
             in_trade = False
 
             entry_row = df.iloc[entry_idx]
@@ -384,7 +402,7 @@ def _process_symbol(
                 equity=equity,
                 entry_price=entry_price,
                 asset_class=asset_class,
-                stop_loss_series=stop_loss_series,
+                stop_loss_series=sizing_basis_series,
                 atr_series=atr_series,
                 entry_idx=entry_idx,
                 symbol=symbol,
@@ -426,6 +444,10 @@ def _process_symbol(
                     direction == "LONG" and stop_price >= entry_price
                 ) or (direction != "LONG" and stop_price <= entry_price)
                 if inverted:
+                    # A-M7: count every drop (the warn-once log only shows
+                    # the first) — the per-run total is reported in
+                    # meta.data["inverted_stop_drops"] by VectorbtAdapter.run.
+                    inverted_stop_drops += 1
                     _warn_once(
                         (symbol, config.timeframe, "inverted_stop"),
                         "Skipping %s/%s trade at %s: %s stop %.6f is on the "
@@ -480,6 +502,18 @@ def _process_symbol(
             else:
                 pnl = (entry_price - exit_price) * qty
 
+            # A-L1 (mirror of native _finalize_position): explicit fee model
+            # instead of implicit 0.0. fee_rate = fraction of notional per
+            # side, fee_flat_per_trade = flat surcharge; default 0.0 legacy.
+            fee_rate = max(0.0, float((resolved_parameters or {}).get("fee_rate", 0.0) or 0.0))
+            fee_flat = max(
+                0.0,
+                float((resolved_parameters or {}).get("fee_flat_per_trade", 0.0) or 0.0),
+            )
+            fees = (
+                (entry_price * qty + exit_price * qty) * fee_rate + fee_flat
+            )
+
             trade = Trade(
                 id=trade_counter,  # temporary; renumbered after merge
                 symbol=symbol,
@@ -497,6 +531,8 @@ def _process_symbol(
                     )
                 ],
                 pnl=round(pnl, 2),
+                fees=round(fees, 2),
+                net_pnl=round(pnl - fees, 2),
                 holding_bars=i - entry_idx,
                 tags=["vectorbt"],
                 meta=trade_meta,
@@ -504,7 +540,7 @@ def _process_symbol(
             trades.append(trade)
             equity += pnl
 
-    return trades, extra_timeframes, drawings, indicator_series, len(df)
+    return trades, extra_timeframes, drawings, indicator_series, len(df), inverted_stop_drops
 
 
 @dataclass
@@ -744,6 +780,7 @@ class VectorbtAdapter(EngineAdapter):
         all_indicators: list[IndicatorSeries] = []
         used_timeframes = [config.timeframe]
         total_loaded_bars = 0
+        total_inverted_drops = 0
 
         num_symbols = len(config.symbols)
         use_parallel = num_symbols > 1
@@ -764,8 +801,9 @@ class VectorbtAdapter(EngineAdapter):
                 for future in as_completed(futures):
                     sym = futures[future]
                     try:
-                        trades, extra_tfs, drawings, indicator_series, loaded_bars = future.result()
+                        trades, extra_tfs, drawings, indicator_series, loaded_bars, inverted_drops = future.result()
                         total_loaded_bars += loaded_bars
+                        total_inverted_drops += inverted_drops
                         all_trades.extend(trades)
                         all_drawings.extend(drawings)
                         all_indicators.extend(indicator_series)
@@ -782,10 +820,11 @@ class VectorbtAdapter(EngineAdapter):
                 ) from symbol_errors[0][1]
         else:
             for symbol in config.symbols:
-                trades, extra_tfs, drawings, indicator_series, loaded_bars = _process_symbol(
+                trades, extra_tfs, drawings, indicator_series, loaded_bars, inverted_drops = _process_symbol(
                     symbol, config, strategy_path, resolved_parameters, data_root
                 )
                 total_loaded_bars += loaded_bars
+                total_inverted_drops += inverted_drops
                 all_trades.extend(trades)
                 all_drawings.extend(drawings)
                 all_indicators.extend(indicator_series)
@@ -798,27 +837,56 @@ class VectorbtAdapter(EngineAdapter):
         for idx, trade in enumerate(all_trades, start=1):
             trade.id = idx
 
-        # Build equity curve from sorted trades (Cleanup 16-D1, F5).
-        # Semantics decision: the persisted curve is a REALIZED-PnL portfolio
-        # curve over EXIT time. Each symbol's own sizing compounds from the
-        # shared initial capital inside `_process_symbol`; summing those
-        # per-symbol paths into one "portfolio" equity would multiply capital
-        # by the symbol count, so the aggregate curve here intentionally
-        # replays only closed PnL, once per portfolio, credited at the trade's
-        # exit — and therefore replayed in EXIT order (native/pynecore do the
-        # same). Drawdown/Sharpe computed on this curve describe the realized
-        # portfolio, not an intraday mark-to-market path — the limitation is
-        # documented in the cross-engine contract.
-        all_equity: list[EquityPoint] = []
-        equity = config.initial_capital
-        for trade in sorted(all_trades, key=lambda item: item.last_exit_time):
-            equity += trade.pnl
-            all_equity.append(
-                EquityPoint(
-                    time=trade.last_exit_time or trade.entry_time,
-                    equity=round(equity, 2),
-                )
+        # A-M7: report every inverted-stop drop (the per-trade log is
+        # warn-once by design) — the total lands in meta.data below.
+        if total_inverted_drops:
+            logger.warning(
+                "Inverted-stop guard dropped %d trade(s) in this backtest "
+                "(stops on the wrong side of entry); see meta.data "
+                "inverted_stop_drops",
+                total_inverted_drops,
             )
+
+        # A-M4 (D5): multi-symbol runs replay all trades onto ONE running
+        # portfolio equity (shared sizing basis, summed exposure). Each
+        # symbol still generates its signals independently, but quantities
+        # re-scale chronologically from shared equity instead of compounding
+        # N symbols x full capital. Single-symbol runs keep the legacy path
+        # bit-identical (no replay).
+        shared_summary: dict[str, Any] = {}
+        if num_symbols > 1 and all_trades:
+            from runner.engines._shared import replay_shared_equity
+
+            all_trades, shared_equity_curve, shared_summary = replay_shared_equity(
+                all_trades, config.initial_capital
+            )
+            # Renumber again: the replay re-sorts chronologically by entry.
+            all_trades.sort(key=lambda t: t.entry_time)
+            for idx, trade in enumerate(all_trades, start=1):
+                trade.id = idx
+            all_equity = shared_equity_curve
+        else:
+            # Build equity curve from sorted trades (Cleanup 16-D1, F5).
+            # Semantics decision: the persisted curve is a REALIZED-PnL portfolio
+            # curve over EXIT time. Each symbol's own sizing compounds from the
+            # shared initial capital inside `_process_symbol`; summing those
+            # per-symbol paths into one "portfolio" equity would multiply capital
+            # by the symbol count, so the aggregate curve here intentionally
+            # replays only closed PnL, once per portfolio, credited at the trade's
+            # exit — and therefore replayed in EXIT order (native/pynecore do the
+            # same). Drawdown/Sharpe computed on this curve describe the realized
+            # portfolio, not an intraday mark-to-market path — the limitation is
+            # documented in the cross-engine contract.
+            all_equity: list[EquityPoint] = []
+            equity = config.initial_capital
+            for trade in sorted(all_trades, key=lambda item: item.last_exit_time):
+                equity += trade.pnl
+                all_equity.append(
+                    EquityPoint(
+                        time=trade.last_exit_time or trade.entry_time,
+                        equity=round(equity, 2),
+                    )
+                )
 
         now = datetime.now(timezone.utc)
         if hasattr(strategy_mod, "STRATEGY_META"):
@@ -855,6 +923,13 @@ class VectorbtAdapter(EngineAdapter):
                 "symbols": config.symbols,
                 "universe": "",
                 "source": "yfinance",
+                # A-M7: every inverted-stop drop is counted (warn-once log
+                # only shows the first) — a non-zero count here means the
+                # run silently skipped mispriced trades.
+                "inverted_stop_drops": total_inverted_drops,
+                # A-M4 (D5): shared-equity replay summary for multi-symbol
+                # runs (empty for single-symbol legacy path).
+                "shared_equity": shared_summary,
             },
             initial_capital=config.initial_capital,
             parameters=resolved_parameters,
@@ -949,23 +1024,50 @@ def _coerce_boolean_series(value: Any, index: pd.Index) -> pd.Series:
     return _coerce_series(value, index).fillna(False).astype(bool)
 
 
+def _is_exit_column(name: str) -> bool:
+    """True for signal/exit-leg columns that live on the trigger bar (D4)."""
+    lowered = str(name).lower()
+    return (
+        lowered in {"exits", "exit_price", "exit_reason"}
+        or lowered.startswith("exit_")
+    )
+
+
 def _prepare_next_open_execution_data(
     signals: pd.DataFrame,
     indicators: IndicatorMap,
 ) -> tuple[pd.DataFrame, IndicatorMap]:
-    """Shift strategy output by one bar so signal bars execute on the next bar open."""
-    execution_signals = signals.shift(1)
-    execution_signals.index = signals.index
-    execution_signals["entries"] = _coerce_boolean_series(execution_signals["entries"], signals.index)
-    shifted_exits = _coerce_boolean_series(execution_signals["exits"], signals.index)
-    original_exits = _coerce_boolean_series(signals["exits"], signals.index)
-    if len(shifted_exits) > 0 and bool(original_exits.iloc[-1]):
-        shifted_exits.iloc[-1] = True
-    execution_signals["exits"] = shifted_exits
+    """Split strategy output into execution timing (D4, A-M1).
+
+    Unified Fill-zum-Trigger-Close convention:
+    - ENTRIES execute on the next bar open → entry leg (entries + entry-when
+      series: direction, stop_loss, take_profit, atr, entry_stop, meta_*)
+      shifts by one bar.
+    - SIGNAL EXITS fill at the trigger bar's close → exit leg (exits +
+      exit-when series: exit_price, exit_reason, exit_*, exit_meta_*) stays
+      UNSHIFTED, so both engines price the same bar's close.
+    """
+    execution_signals = pd.DataFrame(index=signals.index)
+    for column in signals.columns:
+        raw = signals[column]
+        if _is_exit_column(column):
+            aligned = raw.copy()
+            aligned.index = signals.index
+        else:
+            aligned = raw.shift(1)
+            aligned.index = signals.index
+        if str(column).lower() in {"entries", "exits"}:
+            execution_signals[column] = _coerce_boolean_series(aligned, signals.index)
+        else:
+            execution_signals[column] = aligned
 
     execution_indicators: IndicatorMap = {}
     for name, (series, explicit_when) in indicators.items():
-        shifted_series = series.shift(1)
+        when = _infer_indicator_when(name, explicit_when)
+        if when == "exit":
+            shifted_series = series.copy()
+        else:
+            shifted_series = series.shift(1)
         shifted_series.index = signals.index
         execution_indicators[name] = (shifted_series, explicit_when)
 
@@ -1054,6 +1156,8 @@ def _find_indicator_series(
             continue
 
         lowered = name.lower()
+        if kind == "sizing_stop" and lowered in {"sizing_stop", "sizing_sl_price", "sizing_sl"}:
+            return series
         if kind == "direction" and lowered == "direction":
             return series
         if kind == "stop_loss" and lowered in {"stop_loss", "sl_price"}:
@@ -1073,6 +1177,11 @@ def _find_indicator_series(
 
 def _find_stop_loss_series(signals: pd.DataFrame, indicators: IndicatorMap) -> pd.Series | None:
     return _find_indicator_series(signals, indicators, kind="stop_loss")
+
+
+def _find_sizing_stop_series(signals: pd.DataFrame, indicators: IndicatorMap) -> pd.Series | None:
+    """Sizing-only protective level (A-M3): never arms exit detection."""
+    return _find_indicator_series(signals, indicators, kind="sizing_stop")
 
 
 def _find_take_profit_series(signals: pd.DataFrame, indicators: IndicatorMap) -> pd.Series | None:
@@ -1124,6 +1233,11 @@ def _vbt_bar_spread(row: pd.Series, parameters: dict[str, Any] | None) -> float:
     behavior is unchanged.
     """
     col = (parameters or {}).get("spread_price_col")
+    if not col:
+        return 0.0
+    # A-L6: data columns are lowercased on load — normalize the configured
+    # name the same way so an uppercase config cannot silently price 0.0.
+    col = str(col).strip().lower()
     if not col:
         return 0.0
     try:
@@ -1191,12 +1305,12 @@ def _resolve_exit_price(
     parameters: dict[str, Any] | None = None,
     direction: str | None = None,
 ) -> float:
-    # D4 dock (Phase 3, A-M1): the unified Fill-zum-Trigger-Close convention
-    # re-prices THIS signal-exit leg; stop/TP legs resolve via the intrabar
-    # walk. Kept separate so D4 lands without reverting A-H2.
-    # A-H4 (D3): honor signal_exit_fill like native _close_position —
-    # "close" (default) fills at the signal bar's close, "open" at its open
-    # (closer to MT5). An explicit strategy exit_price level always wins.
+    # D4 (Phase 3, A-M1 — implemented): unified Fill-zum-Trigger-Close.
+    # Signal exits stay on the trigger bar (see
+    # _prepare_next_open_execution_data) and fill at its close (or open with
+    # signal_exit_fill="open", mirroring native _close_position); stop/TP
+    # legs resolve via the intrabar walk at their levels. An explicit
+    # strategy exit_price level always wins.
     # Spread mirrors native: only open-fills carry it, and only SHORT exits
     # pay it (closing a SHORT buys the ask); LONG exits sell the bid.
     if exit_price_series is not None:
@@ -1241,8 +1355,8 @@ def _resolve_entry_price(
     A-H4 (D3): spread-aware market fill mirroring native
     ``_fill_pending_orders`` — LONGs lift the ask (open + spread), SHORTs
     hit the bid (open). Stop-order fills trade at the stop level itself.
-    D4 dock (Phase 3, A-M1): the exit convention does not touch entry
-    resolution; a later Fill-zum-Trigger-Close change only re-prices exits.
+    D4 (A-M1): entries still execute next-open; only signal exits moved to
+    trigger-close, so entry resolution is untouched by the convention.
     """
     if entry_stop_series is not None:
         stop = entry_stop_series.iloc[entry_idx]

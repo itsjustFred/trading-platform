@@ -132,11 +132,13 @@ def generate_signals(df: pd.DataFrame, params: dict):
                 in_trade = False
                 exits.iloc[i] = True
                 trailing_stop_at_exit.iloc[i] = trailing_stop_value
+                # A-M2: the trigger is close-based, so the fill is the CLOSE
+                # (filling at the stop level above the close systematically
+                # sells LONGs too high) — same price for both legs.
+                exit_price.iloc[i] = float(close.iloc[i])
                 if trailing_stop_hit:
-                    exit_price.iloc[i] = trailing_stop_value
                     exit_reason.iloc[i] = "trailing_stop"
                 else:
-                    exit_price.iloc[i] = float(close.iloc[i])
                     exit_reason.iloc[i] = "ema_cross_down"
                 trailing_stop_value = 0.0
                 entry_price = 0.0
