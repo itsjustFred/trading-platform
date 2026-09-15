@@ -299,12 +299,17 @@ def _process_symbol(
             entry_idx = i
         elif in_trade and bool(exits.iloc[i]):
             in_trade = False
-            trade_counter += 1
 
             entry_row = df.iloc[entry_idx]
             exit_row = df.iloc[i]
             direction = _resolve_direction(execution_signals, direction_series, entry_idx)
             entry_price = _resolve_entry_price(entry_row, direction, entry_stop_series, entry_idx)
+            if entry_price is None:
+                # D2 strict (A-H2): entry_stop present but never touched --
+                # no fill, no phantom trade. State is already flat
+                # (in_trade=False above); skip before sizing/equity.
+                continue
+            trade_counter += 1
             exit_price = _resolve_exit_price(exit_row, i, exit_price_series)
             exit_reason = _resolve_exit_reason(i, exit_reason_series)
             entry_ts = str(entry_row.get("timestamp", entry_row.name))
@@ -493,8 +498,12 @@ def _build_vectorbt_trade(
     equity: float,
     trade_counter: int,
     asset_class: str,
-) -> tuple[Trade, float]:
-    """Build one closed vectorbt trade and its realized PnL."""
+) -> tuple[Trade | None, float]:
+    """Build one closed vectorbt trade and its realized PnL.
+
+    Returns (None, 0.0) when D2 strict no-touch applies (entry_stop present
+    but never touched) -- the caller skips the trade.
+    """
     df = ctx.df
     execution_signals = ctx.execution_signals
     execution_indicators = ctx.execution_indicators
@@ -507,6 +516,8 @@ def _build_vectorbt_trade(
         _find_entry_stop_series(execution_signals, execution_indicators),
         entry_idx,
     )
+    if entry_price is None:
+        return None, 0.0
     exit_price = _resolve_exit_price(exit_row, i, ctx.exit_price_series)
     exit_reason = _resolve_exit_reason(i, ctx.exit_reason_series)
     entry_ts = str(entry_row.get("timestamp", entry_row.name))
@@ -1071,6 +1082,9 @@ def _resolve_direction(
 def _resolve_exit_price(
     exit_row: pd.Series, exit_idx: int, exit_price_series: pd.Series | None
 ) -> float:
+    # D4 dock (Phase 3, A-M1): the unified Fill-zum-Trigger-Close convention
+    # re-prices THIS signal-exit leg; stop/TP legs resolve via the intrabar
+    # walk. Kept separate so D4 lands without reverting A-H2.
     if exit_price_series is not None:
         exit_price = exit_price_series.iloc[exit_idx]
         if pd.notna(exit_price) and float(exit_price) > 0:
@@ -1086,15 +1100,21 @@ def _resolve_entry_price(
     direction: str,
     entry_stop_series: pd.Series | None,
     entry_idx: int,
-) -> float:
+) -> float | None:
     """Resolve the fill price for an entry bar.
 
     Strategies expressing stop orders (e.g. buy-stop scalpers) publish an
     ``entry_stop`` level: a LONG fills at the stop when the bar traded
     through it (``high >= stop``), a SHORT when ``low <= stop`` -- matching
     stop-market semantics instead of the default next-open market fill.
+    Gaps through the stop fill at the stop (stop-market semantics).
+    D2 (strict, A-H2): with a usable stop level and NO touch there is NO
+    fill -- the caller skips the trade. Falling back to open/close would
+    book phantom fills for orders the market never triggered.
     Without a usable stop level the legacy open/close fallback applies, so
     strategies without ``entry_stop`` behave exactly as before.
+    D4 dock (Phase 3, A-M1): the exit convention does not touch entry
+    resolution; a later Fill-zum-Trigger-Close change only re-prices exits.
     """
     if entry_stop_series is not None:
         stop = entry_stop_series.iloc[entry_idx]
@@ -1108,6 +1128,7 @@ def _resolve_entry_price(
             else:
                 if low is not None and pd.notna(low) and float(low) <= stop:
                     return stop
+            return None
     open_value = entry_row.get("open")
     if open_value is not None and pd.notna(open_value):
         return float(open_value)

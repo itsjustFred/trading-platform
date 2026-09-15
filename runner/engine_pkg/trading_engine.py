@@ -15,6 +15,7 @@ Presentation (indicator series, result payload assembly) lives in
 
 from __future__ import annotations
 
+import logging
 import math
 from typing import Any, Callable
 
@@ -30,6 +31,8 @@ from runner.engine_pkg.result import build_indicator_series, build_result
 from runner.engines.base import BacktestConfig
 from runner.engines.contract import flag_missing_intrabar, resolve_same_bar_exit
 from shared.models import BacktestResult, EquityPoint, IndicatorSeries, Trade, TradeExit
+
+logger = logging.getLogger(__name__)
 
 #: Engine-level concurrent-position policy for the native engine
 #: (Cleanup 16-D1, F22). Deliberately a module constant, not a strategy
@@ -429,10 +432,9 @@ class TradeEngine:
                     # sizing on the signal bar is only the pending-order
                     # estimate; market orders fill at the next bar's open and
                     # are re-sized there).
-                    # NOTE: unlike the MARKET path below, no explicit
-                    # stop_distance is forwarded here — trigger fills keep
-                    # sizing from |fill - stop|. Only MARKET orders carry
-                    # the MT5-parity distance sizing (intraday_volatility_breakout audit).
+                    # A-H5 parity: forward the strategy's explicit stop_distance
+                    # (e.g. ATR-based) so trigger fills size from the same
+                    # distance as MARKET fills instead of |fill - stop|.
                     order.quantity = self._calculate_position_size(
                         entry_price=float(fill_price),
                         stop_loss_price=order.stop_loss,
@@ -442,6 +444,7 @@ class TradeEngine:
                             if order.take_profit_levels
                             else None
                         ),
+                        stop_distance=order.stop_distance,
                     )
                     if order.quantity <= 0:
                         continue
@@ -462,6 +465,32 @@ class TradeEngine:
                         stop_distance=order.stop_distance,
                     )
                     if order.quantity <= 0:
+                        continue
+                # A-C2 inverted-stop guard (mirrors vectorbt_adapter): a stop
+                # on the wrong side of the entry (LONG stop >= entry, SHORT
+                # stop <= entry) would produce an instantly-triggered,
+                # sign-flipped fantasy exit. Skip the trade loudly instead of
+                # compounding garbage into equity. Checked against the final
+                # fill price, like vectorbt checks against its final entry.
+                if order.stop_loss is not None:
+                    inverted = (
+                        order.direction == "LONG"
+                        and float(order.stop_loss) >= float(fill_price)
+                    ) or (
+                        order.direction != "LONG"
+                        and float(order.stop_loss) <= float(fill_price)
+                    )
+                    if inverted:
+                        logger.warning(
+                            "Skipping %s %s order created at %s: %s stop %.6f is on "
+                            "the wrong side of fill %.6f",
+                            order.symbol,
+                            order.order_type.value,
+                            order.created_time,
+                            order.direction,
+                            float(order.stop_loss),
+                            float(fill_price),
+                        )
                         continue
                 self._open_position(order, float(fill_price), fill_time, i)
             else:
@@ -562,6 +591,10 @@ class TradeEngine:
         # the ask (open + spread); closing a LONG sells the bid (open).
         # Verified tick-for-tick: MT5 long time-exits == 22:55 bar open,
         # short time-exits == 22:55 bar open + spread.
+        # D4 dock (Phase 3, A-M1): the unified Fill-zum-Trigger-Close
+        # convention re-prices THIS signal-exit leg (base_exit selection);
+        # stop/TP legs dock in _check_stops. Kept separate so D4 lands
+        # without reverting A-H1/A-H5.
         fill_at_open = (
             str(getattr(self.config, "signal_exit_fill", "close")).lower()
             == "open"
@@ -704,7 +737,14 @@ class TradeEngine:
                 ask_low = base_low + spread
         return ask_high, ask_low
 
-    def _check_stops(self, row: pd.Series, i: int, next_time: pd.Timestamp | None) -> None:
+    def _check_stops(
+        self,
+        row: pd.Series,
+        i: int,
+        next_time: pd.Timestamp | None,
+        *,
+        only_entry_index: int | None = None,
+    ) -> None:
         if not self.positions:
             return
 
@@ -720,6 +760,9 @@ class TradeEngine:
         remaining_positions: list[Position] = []
         ask_high, ask_low = self._ask_bar(row)
         for position in self.positions:
+            if only_entry_index is not None and position.entry_index != only_entry_index:
+                remaining_positions.append(position)
+                continue
             if position.direction == "LONG":
                 stop_hit = position.stop_loss is not None and bar_low <= float(position.stop_loss)
             else:
@@ -759,6 +802,10 @@ class TradeEngine:
                 first_event = "tp"
 
             if first_event == "stop" and position.stop_loss is not None:
+                # D4 dock (Phase 3, A-M1 exit convention): the unified
+                # Fill-zum-Trigger-Close convention lands here — stop exits
+                # currently fill at the stop level; D4 re-prices this leg to
+                # the trigger bar's close without touching the detection above.
                 self._close_partial(
                     position,
                     price=float(position.stop_loss),
@@ -950,6 +997,16 @@ class TradeEngine:
 
             self._check_stops(row, i, next_time)
             self._fill_pending_orders(row, i)
+            # A-H1: the fill bar itself can trade through the fresh stop/TP.
+            # Positions opened above fill at this bar's open and were never
+            # stop-checked on it (the pre-fill _check_stops only saw older
+            # positions). Re-run the check scoped to just-opened positions so
+            # fill-bar breakouts exit on the fill bar instead of leaking a
+            # full extra bar of phantom exposure.
+            # D4 dock (Phase 3, A-M1): this scoped re-check reuses _check_stops
+            # detection + pricing, so a later Fill-zum-Trigger-Close change
+            # applies to fill-bar exits automatically with no revert here.
+            self._check_stops(row, i, next_time, only_entry_index=i)
 
             if bool(entries.iloc[i]):
                 direction = self._resolve_direction(merged_row)
