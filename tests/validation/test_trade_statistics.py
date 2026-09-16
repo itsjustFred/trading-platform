@@ -484,3 +484,57 @@ def test_break_even_counted_in_denominator() -> None:
     stats = compute_trade_statistics(trades)
     assert stats.total_trades == 3
     assert stats.win_rate == pytest.approx(1 / 3)
+
+
+# ── Mutation hardening (cycle 1: A-L4 annualization + Sharpe guards) ───────
+
+
+def _make_dated_trade(trade_id: int, entry: str, exit_: str, pnl: float) -> Trade:
+    return Trade(
+        id=trade_id,
+        symbol="TEST",
+        direction="LONG",
+        entry_time=entry,
+        entry_price=100.0,
+        quantity=1.0,
+        exits=[TradeExit(time=exit_, price=100.0, quantity=1.0, pnl=pnl)],
+        pnl=pnl,
+    )
+
+
+def test_sharpe_two_trades_is_nonzero() -> None:
+    """The n<2 Sharpe guard must not swallow a 2-trade series."""
+    trades = [_make_trade(1, [100.0]), _make_trade(2, [-50.0])]
+    stats = compute_trade_statistics(trades)
+    # mean=25, population std=75, undatable span -> sqrt(252) fallback.
+    expected = (25.0 / 75.0) * math.sqrt(252.0)
+    assert stats.sharpe_ratio == pytest.approx(expected, rel=1e-4)
+
+
+def test_sharpe_uses_trade_frequency_annualization() -> None:
+    """A-L4: dated trades spanning ~1y annualize with sqrt(n/span_years)."""
+    pnls = [100.0, -50.0] * 6  # mean=25, population std=75
+    trades = [
+        _make_dated_trade(
+            i + 1, f"2024-{i + 1:02d}-01T00:00:00Z", f"2024-{i + 1:02d}-02T00:00:00Z", p
+        )
+        for i, p in enumerate(pnls)
+    ]
+    stats = compute_trade_statistics(trades)
+    # Span Jan-01 -> Dec-02 = 336d; ppy = 12 / (336/365.25) is in [1, 252].
+    expected = (25.0 / 75.0) * math.sqrt(12.0 * 365.25 / 336.0)
+    assert stats.sharpe_ratio == pytest.approx(expected, rel=1e-4)
+
+
+def test_sharpe_falls_back_for_denser_than_daily_trades() -> None:
+    """A-L4: >1 trade/day has no defined per-trade annualization -> sqrt(252)."""
+    pnls = [10.0, -9.0] * 150  # mean=0.5, population std=9.5
+    trades = [
+        _make_dated_trade(
+            i + 1, "2024-01-01T00:00:00Z", "2024-01-02T00:00:00Z", p
+        )
+        for i, p in enumerate(pnls)
+    ]
+    stats = compute_trade_statistics(trades)
+    expected = (0.5 / 9.5) * math.sqrt(252.0)
+    assert stats.sharpe_ratio == pytest.approx(expected, rel=1e-4)

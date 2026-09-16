@@ -223,3 +223,66 @@ class TestBullFilterNoLookahead:
         # Prior-day SMA200 over all-100 closes; with lookahead it would be
         # (199*100+200)/200 = 100.5.
         assert sma_last == pytest.approx(100.0)
+
+    def test_bull_filter_uses_prior_day_close(self, monkeypatch):
+        """A-C1 (close leg): prior-day close <= SMA200-prev blocks entries
+        even when the traded day's FINAL close rallies above it."""
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "post_vix_dip_buy_close_leg", STRATEGY_PATH
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        days = pd.date_range("2023-12-08", "2024-07-15", freq="D", tz="UTC")
+        closes = {d.date(): 100.0 for d in days}
+        panic_day = pd.Timestamp("2024-07-12", tz="UTC").date()
+        # Panic Friday -2 %, weekend stays weak: prior-day close (Sun)
+        # is below SMA200-prev -> bear market, no entries allowed.
+        closes[panic_day] = 98.0
+        closes[pd.Timestamp("2024-07-13", tz="UTC").date()] = 98.0
+        closes[pd.Timestamp("2024-07-14", tz="UTC").date()] = 98.0
+        rows = []
+        for d in days:
+            if d.date() == pd.Timestamp("2024-07-15", tz="UTC").date():
+                continue  # intraday bars instead of the daily bar
+            ts = pd.Timestamp(d.date()) + pd.Timedelta(hours=21)
+            c = closes[d.date()]
+            rows.append(
+                (ts.tz_localize("UTC"), c, c + 0.5, c - 0.5, c, 1_000_000.0)
+            )
+        # Mon 2024-07-15 intraday (EDT=UTC-4): OR 100.4/100.2, cross
+        # above at 10:30 NY -> ORB trigger; FINAL close 101.4 rallies
+        # above SMA200-prev (~99.97), so a same-day-close mutant passes
+        # the bull filter while the prior-day close (98.0) must block it.
+        ny = pd.date_range(
+            pd.Timestamp("2024-07-15 09:30", tz="America/New_York"),
+            periods=5,
+            freq="30min",
+        )
+        bars = [
+            (100.4, 100.6, 100.2, 100.5),
+            (100.5, 100.7, 100.3, 100.5),
+            (100.6, 101.5, 100.6, 101.4),
+            (101.4, 101.6, 101.2, 101.4),
+            (101.4, 101.6, 101.2, 101.4),
+        ]
+        for ts, (o, h, low, c) in zip(ny, bars):
+            rows.append((ts.tz_convert("UTC"), o, h, low, c, 1000.0))
+        df = pd.DataFrame(
+            rows, columns=["timestamp", "open", "high", "low", "close", "volume"]
+        ).sort_values("timestamp").reset_index(drop=True)
+
+        idx = days
+        vix = pd.Series(15.0, index=idx)
+        vix.loc[pd.Timestamp("2024-07-12", tz="UTC")] = 25.0
+        vix.iloc[idx.get_loc(pd.Timestamp("2024-07-12", tz="UTC")) + 1:] = 20.0
+        monkeypatch.setattr(
+            module, "_load_vix_data", lambda start=None, end=None: vix
+        )
+        entries, _, _, _ = module.generate_signals(df, {})
+        assert int(entries.sum()) == 0, (
+            "prior-day close below SMA200-prev must block entries despite "
+            "the same-day rally"
+        )
