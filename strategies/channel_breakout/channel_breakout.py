@@ -189,7 +189,6 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
     in_trade = False
     active_direction: str | None = None
     trailing_stop_value = 0.0
-    entry_price = np.nan
     active_sl = np.nan
     warmup = max(channel_length, ema_period, atr_period, 20)
 
@@ -263,7 +262,6 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
                     in_trade = False
                     active_direction = None
                     trailing_stop_value = 0.0
-                    continue
             else:  # SHORT
                 if not use_fixed_stop and pd.notna(atr_v):
                     new_stop = c + float(atr_v) * atr_multiplier
@@ -313,7 +311,6 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
                     in_trade = False
                     active_direction = None
                     trailing_stop_value = 0.0
-                    continue
         else:
             # Gap gate: 1 -> longs only, -1 -> shorts only, 0 -> no trades.
             if gap_filter_active:
@@ -334,7 +331,6 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
                 direction.iloc[i] = "LONG"
                 in_trade = True
                 active_direction = "LONG"
-                entry_price = c
                 if use_fixed_stop:
                     active_sl = c - fixed_stop_distance
                     sl_price.iloc[i] = float(active_sl)
@@ -352,7 +348,6 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
                 direction.iloc[i] = "SHORT"
                 in_trade = True
                 active_direction = "SHORT"
-                entry_price = c
                 if use_fixed_stop:
                     active_sl = c + fixed_stop_distance
                     sl_price.iloc[i] = float(active_sl)

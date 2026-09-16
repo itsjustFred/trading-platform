@@ -147,7 +147,7 @@ def generate_signals(df: pd.DataFrame, params: dict):
         midnight_close.iloc[i] = ref
         mins = int(minutes_now[i])
 
-        if _BREAKOUT_START <= mins < _BREAKOUT_END and ref == ref:
+        if _BREAKOUT_START <= mins < _BREAKOUT_END and pd.notna(ref):
             if float(high.iloc[i]) > ref + buffer_points:
                 cond = True
         armed.iloc[i] = cond

@@ -1044,7 +1044,7 @@ class TradeEngine:
             trade_from = pd.to_datetime(
                 getattr(self.config, "start_date", ""), utc=True, errors="coerce"
             )
-            if trade_from is None or pd.isna(trade_from):
+            if pd.isna(trade_from):
                 raise ValueError(
                     "warmup_start is set but start_date "
                     f"({getattr(self.config, 'start_date', '')!r}) is empty or "

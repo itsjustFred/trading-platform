@@ -141,7 +141,7 @@ def _trade_span_years(trades: List[Trade]) -> float | None:
             if raw is None:
                 continue
             ts = pd.to_datetime(str(raw), utc=True, errors="coerce")
-            if ts is not None and not pd.isna(ts):
+            if not pd.isna(ts):
                 stamps.append(ts)
     if len(stamps) < 2:
         return None

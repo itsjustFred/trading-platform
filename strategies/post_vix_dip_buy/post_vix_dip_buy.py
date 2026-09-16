@@ -275,7 +275,7 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
     if volume is not None:
         vol = volume.fillna(0.0)
         for d in date_order:
-            idx = np.where(utc_arr == d)[0]
+            idx = np.nonzero(utc_arr == d)[0]
             if len(idx) == 0:
                 continue
             pv = (hlc3.iloc[idx].to_numpy() * vol.iloc[idx].to_numpy()).cumsum()
@@ -289,7 +289,7 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
             vwap.iloc[idx] = v
     else:
         for d in date_order:
-            idx = np.where(utc_arr == d)[0]
+            idx = np.nonzero(utc_arr == d)[0]
             if len(idx) == 0:
                 continue
             vwap.iloc[idx] = hlc3.iloc[idx].expanding().mean().to_numpy()
@@ -305,7 +305,7 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
     # OR range per UTC date from 9:30-9:59 NY bars.
     or_high_by_date: dict = {}
     for d in date_order:
-        idx = np.where((utc_arr == d) & orb_form_mask)[0]
+        idx = np.nonzero((utc_arr == d) & orb_form_mask)[0]
         if len(idx):
             or_high_by_date[d] = float(high.iloc[idx].max())
     or_high_bar = pd.Series(np.nan, index=df.index, dtype=float)

@@ -271,7 +271,7 @@ def _process_symbol(
         # A-M11: a warmup window without a parseable start_date must fail
         # loudly (mirrors the native engine) — never trade warmup bars.
         trade_from = pd.to_datetime(config.start_date, utc=True, errors="coerce")
-        if trade_from is None or pd.isna(trade_from):
+        if pd.isna(trade_from):
             raise ValueError(
                 "warmup_start is set but start_date "
                 f"({config.start_date!r}) is empty or unparseable — the "
