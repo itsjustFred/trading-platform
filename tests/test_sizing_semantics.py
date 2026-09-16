@@ -72,6 +72,14 @@ class TestBacktestConfigField:
         with pytest.raises(ValueError, match="not both"):
             self._config(max_position_exposure_pct=0.4, max_position_pct=0.5)
 
+    def test_invalid_timeframe_is_rejected(self):
+        with pytest.raises(ValidationError):
+            self._config(timeframe="7y")
+
+    def test_invalid_modeling_resolution_is_rejected(self):
+        with pytest.raises(ValidationError):
+            self._config(modeling_resolution="tick-per-second")
+
     def test_alias_is_a_documented_readonly_property(self):
         assert isinstance(getattr(BacktestConfig, "max_position_pct"), property)
         assert "max_position_exposure_pct" in BacktestConfig.model_fields

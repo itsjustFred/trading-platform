@@ -1649,3 +1649,13 @@ def test_normalize_ohlcv_frame_does_not_mutate_input():
     out = normalize_ohlcv_frame(frame)
     pd.testing.assert_frame_equal(frame, snapshot)
     assert out["high"].tolist() == [2.0, 2.1]
+
+
+def test_intrabar_resolution_equal_to_base_resolves_to_none():
+    """F8 boundary: an intrabar frame must be strictly FINER than the main
+    timeframe — requesting the same granularity ("1h" intrabar on "1h"
+    data) resolves to no intrabar walk, never to a self-referential window."""
+    assert resolve_intrabar_timeframe("1h", "1h") is None
+    assert resolve_intrabar_timeframe("1d", "1d") is None
+    assert resolve_intrabar_timeframe("1h", "1m") == "1m"
+    assert resolve_intrabar_timeframe("1h", "4h") is None

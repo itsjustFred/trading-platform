@@ -192,6 +192,28 @@ def generate_signals(df, params):
             )
 
 
+class TestNativeWarmupLoad:
+    """A-H4: NativeAdapter loads from warmup_start so indicators are warm."""
+
+    def test_warmup_start_extends_loaded_window(self, tmp_path: Path):
+        _write_ohlcv(tmp_path, "CEC", _frame())
+        strategy_path = _write_strategy(tmp_path, "contract_warmup_load", _strategy_text())
+        config = BacktestConfig(
+            strategy_name="contract",
+            symbols=["CEC"],
+            timeframe="1h",
+            start_date="2024-01-01 05:00",
+            end_date="2024-01-02",
+            initial_capital=100_000.0,
+            modeling_resolution="main_timeframe",
+            warmup_start="2024-01-01 00:00",
+            data_dir=str(tmp_path),
+        )
+        result = NativeAdapter().run(config, strategy_path)
+        # 12 bars loaded (00:00..11:00), not just the 7 since start_date.
+        assert result.meta.total_bars == 12
+
+
 _INVERTED_TEXT = """
 import pandas as pd
 
@@ -343,3 +365,55 @@ class TestSharedEquityReplayMath:
         by_id = {t.id: t for t in replayed}
         assert by_id[2].meta["portfolio"]["open_positions"] == 1
         assert summary["peak_open_notional_usd"] == pytest.approx(20_000.0)
+
+    def test_replay_scales_fees_with_quantity(self):
+        from shared.models import Trade, TradeExit
+
+        from runner.engines._shared import replay_shared_equity
+
+        def _fee_trade(trade_id, symbol, entry, exit, qty, fees):
+            pnl = (110.0 - 100.0) * qty
+            return Trade(
+                id=trade_id,
+                symbol=symbol,
+                direction="LONG",
+                entry_time=entry,
+                entry_price=100.0,
+                quantity=qty,
+                exits=[TradeExit(time=exit, price=110.0, quantity=qty, pnl=pnl)],
+                pnl=pnl,
+                fees=fees,
+                net_pnl=pnl - fees,
+                meta={"risk_math": {"equity_at_entry": 100_000.0}},
+            )
+
+        # Sequential: t2 resizes by 101/100 on shared equity — fees are
+        # per-share costs and must scale with the quantity.
+        t1 = _fee_trade(1, "A", "2024-01-01T00:00:00Z", "2024-01-02T00:00:00Z",
+                        100.0, 50.0)
+        t2 = _fee_trade(2, "B", "2024-01-03T00:00:00Z", "2024-01-04T00:00:00Z",
+                        100.0, 50.0)
+        replayed, _, _ = replay_shared_equity([t1, t2], 100_000.0)
+        by_id = {t.id: t for t in replayed}
+        assert by_id[1].fees == pytest.approx(50.0)
+        # t1 nets +950, so t2 rescales by 100950/100000 — fees scale with it.
+        assert by_id[2].quantity == pytest.approx(100.0 * 1.0095)
+        assert by_id[2].fees == pytest.approx(50.0 * 1.0095, abs=0.01)
+        assert by_id[2].net_pnl == pytest.approx(by_id[2].pnl - by_id[2].fees)
+
+    def test_replay_processes_entries_in_entry_order(self):
+        from runner.engines._shared import replay_shared_equity
+
+        # D exits (t1.5, +1000) before B enters (t2) but AFTER A enters
+        # (t1): entry-order replay sizes A from the still-unreleased shared
+        # equity. Exit-order processing would release D's profit first and
+        # over-size A.
+        d = _replay_trade(3, "D", "2024-01-01T00:30:00Z", "2024-01-01T01:30:00Z",
+                          100.0, 101.0, 1000.0, 100_000.0)
+        a = _replay_trade(1, "A", "2024-01-01T01:00:00Z", "2024-01-05T00:00:00Z",
+                          100.0, 100.0, 100.0, 100_000.0)
+        b = _replay_trade(2, "B", "2024-01-01T02:00:00Z", "2024-01-03T00:00:00Z",
+                          100.0, 100.0, 100.0, 100_000.0)
+        replayed, _, _ = replay_shared_equity([a, b, d], 100_000.0)
+        by_id = {t.id: t for t in replayed}
+        assert by_id[1].quantity == pytest.approx(100.0)

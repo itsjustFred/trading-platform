@@ -25,6 +25,8 @@ from runner.engines.pynecore_adapter import (
     _apply_fill_parity,
     _apply_risk_sizing,
     _gate_warmup_trades,
+    _pyne_cli_end_bound,
+    _pyne_cli_start_bound,
 )
 from runner.engines._shared import resolve_max_leverage as _resolve_max_leverage
 from shared.models import Trade, TradeExit
@@ -253,3 +255,22 @@ class TestFillParity:
         # entry without spread stays.
         assert trades[0].entry_price == pytest.approx(before[0])
         assert trades[0].exits[-1].price == pytest.approx(101.2)
+
+
+class TestPyneCliDateBounds:
+    def test_date_only_end_bound_includes_full_end_day(self):
+        # F9: a date-only --to is midnight-exclusive in the pyne CLI, so the
+        # adapter must translate it to the inclusive end-of-day instant —
+        # otherwise the replay window silently drops the end date's bars.
+        assert _pyne_cli_end_bound("2024-01-31") == "2024-01-31T23:59:59.999999+00:00"
+
+    def test_end_bound_with_time_passes_through(self):
+        assert _pyne_cli_end_bound("2024-01-31T14:30:00Z") == "2024-01-31T14:30:00Z"
+
+    def test_date_only_start_bound_is_host_tz_independent(self):
+        # F9: a naive date-only --from resolves in the HOST timezone inside
+        # the CLI — the adapter must pass an aware UTC start-of-day instant.
+        assert _pyne_cli_start_bound("2024-01-01") == "2024-01-01T00:00:00+00:00"
+
+    def test_start_bound_with_time_passes_through(self):
+        assert _pyne_cli_start_bound("2024-01-01T09:00:00+00:00") == "2024-01-01T09:00:00+00:00"

@@ -337,3 +337,120 @@ def test_short_stop_stays_bid_based_by_default():
     # until end_of_data.
     assert len(result.trades) == 1
     assert result.trades[0].exits[0].reason == "end_of_data"
+
+
+def _fill_bar_stop_frame():
+    # LONG stop 95: bar 1 (the fill bar) already trades through it.
+    return pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(
+                [
+                    "2024-01-01 00:00",
+                    "2024-01-01 00:01",
+                    "2024-01-01 00:02",
+                    "2024-01-01 00:03",
+                ],
+                utc=True,
+            ),
+            "open": [100.0, 100.0, 100.0, 100.0],
+            "high": [101.0, 101.0, 101.0, 101.0],
+            "low": [99.0, 90.0, 99.0, 99.0],
+            "close": [100.0, 100.0, 100.0, 100.0],
+            "volume": [1000.0, 1000.0, 1000.0, 1000.0],
+        }
+    )
+
+
+def _fill_bar_stop_strategy(df, params):
+    entries = pd.Series([True, False, False, False], index=df.index)
+    exits = pd.Series([False, False, False, False], index=df.index)
+    direction = pd.Series(["LONG", None, None, None], index=df.index, dtype=object)
+    stop = pd.Series([95.0, float("nan"), float("nan"), float("nan")], index=df.index)
+    return entries, exits, {"direction": direction, "stop_loss": stop}, []
+
+
+def test_fill_bar_stop_exits_on_fill_bar():
+    # A-H1: the market order fills at bar 1 open and bar 1 already trades
+    # through the fresh stop — the scoped fill-bar recheck must exit on bar
+    # 1 itself instead of leaking a full extra bar of phantom exposure.
+    engine = _engine()
+    result = engine.run(_fill_bar_stop_frame(), _fill_bar_stop_strategy)
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    assert trade.holding_bars == 0
+    assert trade.exits[0].reason == "stop_loss"
+    assert trade.exits[0].price == 95.0
+    assert trade.exits[0].time.startswith("2024-01-01T00:01")
+
+
+def _short_spread_stop_frame():
+    # SHORT filled at bar 1 open (100); bar 1 high touches stop 105.
+    return pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(
+                ["2024-01-01 00:00", "2024-01-01 00:01", "2024-01-01 00:02"], utc=True
+            ),
+            "open": [100.0, 100.0, 100.0],
+            "high": [100.5, 106.0, 100.5],
+            "low": [99.5, 99.5, 99.5],
+            "close": [100.0, 100.0, 100.0],
+            "volume": [1000.0, 1000.0, 1000.0],
+            "spread_price": [0.5, 0.5, 0.5],
+        }
+    )
+
+
+def _short_spread_stop_strategy(df, params):
+    entries = pd.Series([True, False, False], index=df.index)
+    exits = pd.Series([False, False, False], index=df.index)
+    direction = pd.Series(["SHORT", None, None], index=df.index, dtype=object)
+    stop = pd.Series([105.0, float("nan"), float("nan")], index=df.index)
+    return entries, exits, {"direction": direction, "stop_loss": stop}, []
+
+
+def test_short_stop_fill_adds_spread():
+    # A-H7: SHORT stop fills buy the ask (stop level + spread), LONG stops
+    # sell the bid (level as-is).
+    engine = TradeEngine(
+        BacktestConfig(
+            strategy_name="test",
+            symbols=["T"],
+            timeframe="1m",
+            start_date="2024-01-01",
+            end_date="2024-01-02",
+            initial_capital=100_000.0,
+            parameters={"spread_price_col": "spread_price"},
+        ),
+        symbol="T",
+    )
+    result = engine.run(_short_spread_stop_frame(), _short_spread_stop_strategy)
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    assert trade.entry_price == 100.0
+    assert trade.exits[0].reason == "stop_loss"
+    assert trade.exits[0].price == 105.0 + 0.5
+
+
+def test_explicit_fees_reduce_net_pnl():
+    # A-L1: fee_rate (fraction of notional per side) + fee_flat_per_trade
+    # must come out of net_pnl instead of silently staying 0.0.
+    engine = TradeEngine(
+        BacktestConfig(
+            strategy_name="test",
+            symbols=["T"],
+            timeframe="1m",
+            start_date="2024-01-01",
+            end_date="2024-01-02",
+            initial_capital=100_000.0,
+            parameters={"fee_rate": 0.01, "fee_flat_per_trade": 3.0},
+        ),
+        symbol="T",
+    )
+    result = engine.run(_spread_frame(), _spread_strategy)
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    qty = trade.quantity
+    expected_fees = (trade.entry_price * qty + trade.exits[0].price * qty) * 0.01 + 3.0
+    assert trade.fees > 0
+    assert trade.fees == expected_fees
+    assert trade.net_pnl == trade.pnl - trade.fees

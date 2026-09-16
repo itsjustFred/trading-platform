@@ -507,3 +507,35 @@ class TestEntryStopFills:
         with caplog.at_level("WARNING"):
             result = VectorbtAdapter().run(config, str(strategy_path))
         assert result.trades == []
+
+    def test_entry_stop_no_touch_produces_no_trade(self, tmp_path: Path):
+        """D2 strict (A-H2): entry_stop present but never touched — no fill,
+        no phantom trade at the open. Falling back to open/close would book
+        fills for orders the market never triggered."""
+        text = _stop_order_strategy_text().replace(
+            'indicators["entry_stop"].iloc[5] = 105.0',
+            'indicators["entry_stop"].iloc[5] = 200.0',
+        )
+        strategy_dir = tmp_path / "strategies"
+        strategy_dir.mkdir(exist_ok=True)
+        strategy_path = strategy_dir / "vbt_stop_order_untouched.py"
+        strategy_path.write_text(text)
+        frame = pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2024-01-01", periods=24, freq="h", tz="UTC"),
+                "open": [100.0] * 24,
+                "high": [106.0 if i in (5, 6) else 101.0 for i in range(24)],
+                "low": [99.0] * 24,
+                "close": [100.0 + i * 0.1 for i in range(24)],
+                "volume": [1000.0] * 24,
+            }
+        )
+        _write_ohlcv(tmp_path, "VSO", frame)
+        config = _config(
+            tmp_path,
+            strategy_name="vbt_stop_order_untouched",
+            symbols=["VSO"],
+            risk_per_trade_pct=0.01,
+        )
+        result = VectorbtAdapter().run(config, str(strategy_path))
+        assert result.trades == []

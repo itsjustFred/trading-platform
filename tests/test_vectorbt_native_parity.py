@@ -18,6 +18,7 @@ import pandas as pd
 import pytest
 
 from runner.engines.base import BacktestConfig
+from runner.engines.native_adapter import NativeAdapter
 from runner.engines.vectorbt_adapter import (
     VectorbtAdapter,
     _match_intrabar_exit_event,
@@ -249,3 +250,27 @@ class TestAskSideStops:
         )
         assert event is not None
         assert event["reason"] == "stop_loss"
+
+
+class TestFeeModelParity:
+    def test_explicit_fees_reduce_net_pnl_on_both_engines(self, parity_env):
+        # A-L1: fee_rate (fraction of notional per side) + fee_flat_per_trade
+        # must come out of net_pnl in BOTH engines, not stay implicit 0.0.
+        fee_params = {
+            "spread_price_col": "spread_price",
+            "fee_rate": 0.01,
+            "fee_flat_per_trade": 3.0,
+        }
+        path = _write_strategy(parity_env, "s_fee", _strategy_text("LONG"))
+        config = _config(parity_env, path, parameters=fee_params)
+        for adapter in (VectorbtAdapter(), NativeAdapter()):
+            result = adapter.run(config, path)
+            assert len(result.trades) == 1
+            trade = result.trades[0]
+            qty = trade.quantity
+            expected = (
+                trade.entry_price * qty + trade.exits[0].price * qty
+            ) * 0.01 + 3.0
+            assert trade.fees > 0
+            assert trade.fees == pytest.approx(expected, abs=0.02)
+            assert trade.net_pnl == pytest.approx(trade.pnl - trade.fees, abs=0.02)

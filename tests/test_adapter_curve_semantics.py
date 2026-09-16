@@ -97,3 +97,70 @@ class TestNativeCurveSemantics:
         assert ids == list(range(1, len(result.trades) + 1))
         entries = [trade.entry_time for trade in result.trades]
         assert entries == sorted(entries)
+
+
+def _overlap_frame() -> pd.DataFrame:
+    # Rising series. Entries on bars 0+1 fill bars 1+2; A carries a far TP
+    # (110, never hit), B a near TP (103, hit on bar 3). A exits on the bar
+    # 5 signal. Entry order is A,B but exit order is B,A.
+    return pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=6, freq="h", tz="UTC"),
+            "open": [100.0, 101.0, 102.0, 103.0, 104.0, 105.0],
+            "high": [100.5, 101.5, 102.5, 103.5, 104.5, 105.5],
+            "low": [99.5, 100.5, 101.5, 102.5, 103.5, 104.5],
+            "close": [100.2, 101.2, 102.2, 103.2, 104.2, 105.2],
+            "volume": [1000.0] * 6,
+        }
+    )
+
+
+_OVERLAP_STRATEGY = """
+import pandas as pd
+
+STRATEGY_META = {"name": "overlap_curve", "version": "1.0"}
+
+def generate_signals(df, params):
+    n = len(df)
+    entries = pd.Series([True, True, False, False, False, False], index=df.index)
+    exits = pd.Series([False, False, False, False, False, True], index=df.index)
+    indicators = {
+        "direction": pd.Series("LONG", index=df.index),
+        "take_profit": pd.Series([110.0, 103.0, float("nan"), float("nan"),
+                                  float("nan"), float("nan")], index=df.index),
+    }
+    return entries, exits, indicators, []
+"""
+
+
+class TestNativeCurveExitOrder:
+    def test_overlapping_trades_replay_in_exit_order(self, tmp_path: Path):
+        # F5: the single-symbol curve credits closed PnL at EXIT time, so
+        # with overlapping trades (entry order A,B vs exit order B,A) the
+        # curve must be stamped B-exit then A-exit — entry order with exit
+        # stamps would run backwards in time.
+        (tmp_path / "strategies").mkdir()
+        strategy_path = tmp_path / "strategies" / "overlap_curve.py"
+        strategy_path.write_text(_OVERLAP_STRATEGY)
+        symbol_dir = tmp_path / "ohlcv" / "test_source" / "equities" / "OVL"
+        symbol_dir.mkdir(parents=True)
+        _overlap_frame().to_parquet(symbol_dir / "1h.parquet", index=False)
+        config = BacktestConfig(
+            strategy_name="overlap_curve",
+            symbols=["OVL"],
+            timeframe="1h",
+            start_date="2024-01-01",
+            end_date="2024-01-02",
+            initial_capital=100_000,
+            modeling_resolution="main_timeframe",
+            data_dir=str(tmp_path),
+        )
+        result = NativeAdapter().run(config, str(strategy_path))
+        assert len(result.trades) == 2
+        assert len(result.equity_curve) == 2
+        first_exit = min(pd.Timestamp(t.last_exit_time) for t in result.trades)
+        assert pd.Timestamp(result.equity_curve[0].time) == first_exit
+        stamps = [pd.Timestamp(p.time) for p in result.equity_curve]
+        assert stamps == sorted(stamps)
+        expected = config.initial_capital + sum(t.pnl for t in result.trades)
+        assert result.equity_curve[-1].equity == pytest.approx(round(expected, 2))
