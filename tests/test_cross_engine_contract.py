@@ -191,6 +191,32 @@ def generate_signals(df, params):
                 frame, strategy_fn, warmup_start="2024-01-01 00:00", start_date=""
             )
 
+    def test_signal_exit_fill_rejects_unknown_values(self, tmp_path: Path):
+        """D4: the fill-convention switch is load-bearing — a typo must fail
+        loudly instead of silently falling through to close-fill."""
+        with pytest.raises(ValueError, match="signal_exit_fill"):
+            BacktestConfig(
+                strategy_name="contract",
+                symbols=["CEC"],
+                timeframe="1h",
+                start_date="2024-01-01",
+                end_date="2024-01-02",
+                initial_capital=100_000.0,
+                signal_exit_fill="clos",
+            )
+
+    def test_signal_exit_fill_normalizes_case(self, tmp_path: Path):
+        config = BacktestConfig(
+            strategy_name="contract",
+            symbols=["CEC"],
+            timeframe="1h",
+            start_date="2024-01-01",
+            end_date="2024-01-02",
+            initial_capital=100_000.0,
+            signal_exit_fill="Close",
+        )
+        assert config.signal_exit_fill == "close"
+
 
 class TestNativeWarmupLoad:
     """A-H4: NativeAdapter loads from warmup_start so indicators are warm."""

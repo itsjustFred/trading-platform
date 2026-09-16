@@ -63,6 +63,12 @@ def _pyne_bar_spread(row: pd.Series, parameters: dict[str, Any] | None) -> float
     col = (parameters or {}).get("spread_price_col")
     if not col:
         return 0.0
+    # A-L6 parity with native _bar_spread / _vbt_bar_spread: data columns
+    # are lowercased on load, so normalize the configured name the same way
+    # — an uppercase config ("Spread_Price") must not silently price 0.0.
+    col = str(col).strip().lower()
+    if not col:
+        return 0.0
     try:
         raw = row.get(col)
     except (AttributeError, KeyError):
@@ -82,10 +88,17 @@ def _gate_warmup_trades(trades: list[Trade], config: BacktestConfig) -> list[Tra
     warmup_raw = str(getattr(config, "warmup_start", "") or "").strip()
     if not warmup_raw:
         return trades
-    try:
-        trade_from = pd.to_datetime(config.start_date, utc=True)
-    except (ValueError, TypeError):
-        return trades
+    # A-M11 parity with native TradeEngine.run and the vectorbt gate: a
+    # warmup window without a parseable start_date must fail loudly — the
+    # previous passthrough silently traded the warmup bars here while the
+    # other engines refused the run.
+    trade_from = pd.to_datetime(config.start_date, utc=True, errors="coerce")
+    if pd.isna(trade_from):
+        raise ValueError(
+            "warmup_start is set but start_date "
+            f"({config.start_date!r}) is empty or unparseable — the "
+            "warmup gate cannot derive trade_from"
+        )
     kept: list[Trade] = []
     for trade in trades:
         entry_ts = _normalize_trade_timestamp(trade.entry_time)

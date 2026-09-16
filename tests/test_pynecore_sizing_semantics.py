@@ -196,6 +196,14 @@ class TestWarmupGate:
         trades = [_trade(entry_time="2024-01-02T00:00:00+00:00")]
         assert _gate_warmup_trades(trades, config) == trades
 
+    def test_warmup_without_start_date_fails_loudly(self, tmp_path):
+        """A-M11 parity with native/vectorbt: warmup without a parseable
+        start_date must raise — never silently trade the warmup bars."""
+        config = _config(tmp_path, warmup_start="2024-01-01", start_date="")
+        trades = [_trade(entry_time="2024-01-02T00:00:00+00:00")]
+        with pytest.raises(ValueError, match="warmup_start"):
+            _gate_warmup_trades(trades, config)
+
 
 class TestFillParity:
     def test_long_entry_lifts_ask(self, tmp_path):
@@ -255,6 +263,16 @@ class TestFillParity:
         # entry without spread stays.
         assert trades[0].entry_price == pytest.approx(before[0])
         assert trades[0].exits[-1].price == pytest.approx(101.2)
+
+    def test_uppercase_spread_column_still_prices_spread(self, tmp_path):
+        """A-L6 parity with native/_vbt: frame columns load lowercased, so an
+        uppercase configured name must not silently price 0.0 spread."""
+        config = _config(tmp_path)
+        trades = [_trade(exit_reason="signal")]
+        _apply_fill_parity(
+            trades, _frame(), config, {"spread_price_col": "Spread_Price"}
+        )
+        assert trades[0].entry_price == pytest.approx(100.2)
 
 
 class TestPyneCliDateBounds:

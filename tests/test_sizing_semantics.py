@@ -103,17 +103,19 @@ class TestResolveHelperRename:
         assert resolved == 0.3
 
     def test_persisted_risk_math_key_stays_max_position_pct(self):
-        """Artifact-key stability: the emitted key in
+        """Artifact-key stability: the emitted keys in
         ``trade.meta["risk_math"]`` must keep the historical spelling
         (frontend ``TradeRiskMath`` + SQLite fallback read it), even though the
-        config field was renamed in 16-E."""
+        config field was renamed in 16-E. The canonical
+        ``max_position_exposure_pct`` spelling is emitted ALONGSIDE (PM-2
+        sizing-record viewer contract) — never instead of — the legacy key."""
         import inspect
 
         from runner.engines import vectorbt_adapter
 
         source = inspect.getsource(vectorbt_adapter._process_symbol)
         assert '"max_position_pct":' in source
-        assert '"max_position_exposure_pct":' not in source
+        assert '"max_position_exposure_pct":' in source
 
 
 # ─── CLI flag alias ─────────────────────────────────────────────────────────

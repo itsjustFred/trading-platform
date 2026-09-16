@@ -484,10 +484,17 @@ def _process_symbol(
                     if leverage_notional_limit is not None
                     else None
                 ),
-                # Persisted key stays "max_position_pct" for artifact
-                # compatibility (frontend TradeRiskMath + SQLite fallback);
-                # its meaning is documented as max_position_exposure_pct.
+                # "max_position_pct" stays for artifact compatibility
+                # (frontend TradeRiskMath + SQLite fallback in
+                # shared/database.py); "max_position_exposure_pct" carries
+                # the same value under the canonical _SizeRecord name so the
+                # sizing-record viewer contract holds for both spellings.
                 "max_position_pct": (
+                    round(max_position_exposure_pct, 6)
+                    if max_position_exposure_pct is not None
+                    else None
+                ),
+                "max_position_exposure_pct": (
                     round(max_position_exposure_pct, 6)
                     if max_position_exposure_pct is not None
                     else None

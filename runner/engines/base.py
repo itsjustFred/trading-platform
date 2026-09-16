@@ -131,6 +131,20 @@ class BacktestConfig(BaseModel):
         )
         return self.max_position_exposure_pct
 
+    @field_validator("signal_exit_fill")
+    @classmethod
+    def _validate_signal_exit_fill(cls, v: str) -> str:
+        # D4: the fill convention switch is load-bearing across all three
+        # bar engines — a typo ("clos", "OPEN ") silently fell through to
+        # close-fill everywhere (every reader tests `== "open"`). Normalize
+        # case/whitespace so "Close"/"OPEN" keep working, reject the rest.
+        normalized = str(v or "").strip().lower()
+        if normalized not in {"close", "open"}:
+            raise ValueError(
+                f"Invalid signal_exit_fill {v!r}, must be 'close' or 'open'"
+            )
+        return normalized
+
     @field_validator("timeframe")
     @classmethod
     def _validate_timeframe(cls, v: str) -> str:
