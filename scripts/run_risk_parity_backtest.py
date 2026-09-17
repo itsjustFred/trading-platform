@@ -265,7 +265,7 @@ def _simulate_portfolio_value(
     """
     portfolio_value = pd.Series(index=returns.index, dtype=float)
     portfolio_value.iloc[0] = initial_cash
-    active_weights = {t: 0.0 for t in TICKERS}
+    active_weights = dict.fromkeys(TICKERS, 0.0)
     for date in returns.index:
         daily_ret = sum(active_weights[t] * returns[t].loc[date] for t in TICKERS)
         if date in rebalance_schedule:
@@ -420,9 +420,9 @@ def run_backtest(
     rebalance_dates = first_available_trading_dates(prices.index, rebalance_dates)
     regime_schedule = weekly_correlation_regimes(returns)
 
-    current_weights: dict[str, float] = {t: 0.0 for t in TICKERS}
-    position_entry_prices: dict[str, float | None] = {t: None for t in TICKERS}
-    position_entry_times: dict[str, pd.Timestamp | None] = {t: None for t in TICKERS}
+    current_weights: dict[str, float] = dict.fromkeys(TICKERS, 0.0)
+    position_entry_prices: dict[str, float | None] = dict.fromkeys(TICKERS)
+    position_entry_times: dict[str, pd.Timestamp | None] = dict.fromkeys(TICKERS)
     rebalance_schedule: dict[pd.Timestamp, dict[str, float]] = {}
     portfolio_target_signals: list[dict[str, Any]] = []
     trades: list[dict[str, Any]] = []

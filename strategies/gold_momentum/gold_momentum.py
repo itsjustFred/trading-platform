@@ -142,9 +142,6 @@ def generate_signals(df: pd.DataFrame, params: dict):
     )
     score = score.clip(-1, 1)
 
-    macd_cross_up = (macd_line > signal_line) & (macd_line.shift(1) <= signal_line.shift(1))
-    macd_cross_down = (macd_line < signal_line) & (macd_line.shift(1) >= signal_line.shift(1))
-
     raw_entries = score > score_entry
     raw_exits = score <= score_exit
 

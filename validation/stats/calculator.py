@@ -44,6 +44,12 @@ logger = logging.getLogger(__name__)
 # few float ulps of drift are fine, a systematic fee double count is not.
 _NET_PNL_EPSILON = 1e-6
 
+# Absolute tolerance for "is this float effectively zero" guards (S1244):
+# exact ``== 0.0`` on floats is fragile (accumulated rounding can leave a
+# 1e-16 residue), while a 1e-12 band is far below any economically meaningful
+# PnL/std magnitude in this module, so pinned test expectations are unchanged.
+_ZERO_TOL = 1e-12
+
 
 class TradeStatistics(BaseModel):
     """Canonical trade-based performance statistics."""
@@ -178,7 +184,7 @@ def _sharpe(returns: List[float], annualize_factor: float | None = None) -> floa
     mean_return = sum(returns) / n
     variance = sum((r - mean_return) ** 2 for r in returns) / n
     std = math.sqrt(variance) if variance > 0 else 0.0
-    if std == 0.0:
+    if math.isclose(std, 0.0, abs_tol=_ZERO_TOL):
         return 0.0
     factor = annualize_factor if annualize_factor is not None else math.sqrt(252)
     return (mean_return / std) * factor
@@ -195,7 +201,7 @@ def _sortino(returns: List[float], annualize_factor: float | None = None) -> flo
         return 0.0
     downside_var = sum(r**2 for r in downside) / len(downside)
     downside_std = math.sqrt(downside_var) if downside_var > 0 else 0.0
-    if downside_std == 0.0:
+    if math.isclose(downside_std, 0.0, abs_tol=_ZERO_TOL):
         return 0.0
     factor = annualize_factor if annualize_factor is not None else math.sqrt(252)
     return (mean_return / downside_std) * factor
@@ -220,7 +226,7 @@ def compute_trade_statistics(trades: List[Trade]) -> TradeStatistics:
     gross_profit = sum(p for p in gross_pnls if p > 0)
     gross_loss = sum(p for p in gross_pnls if p < 0)
 
-    if gross_loss != 0.0:
+    if not math.isclose(gross_loss, 0.0, abs_tol=_ZERO_TOL):
         profit_factor = abs(gross_profit / gross_loss)
     else:
         profit_factor = float("inf")
@@ -231,7 +237,7 @@ def compute_trade_statistics(trades: List[Trade]) -> TradeStatistics:
     sharpe_ratio = _sharpe(realized_pnls, annualize)
     sortino_ratio = _sortino(realized_pnls, annualize)
 
-    if max_drawdown != 0.0:
+    if not math.isclose(max_drawdown, 0.0, abs_tol=_ZERO_TOL):
         recovery_factor = net_profit / max_drawdown
     else:
         recovery_factor = float("inf")

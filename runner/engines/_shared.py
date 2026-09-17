@@ -64,6 +64,73 @@ def resolve_max_leverage(explicit: float | None) -> float:
     return 2.0
 
 
+def resolve_bar_spread(row: pd.Series, raw_col: Any) -> float:
+    """Per-bar spread surcharge in price units (shared D3 helper).
+
+    Byte-identical consolidation of ``TradeEngine._bar_spread``,
+    ``_vbt_bar_spread`` and ``_pyne_bar_spread``: opt-in via a strategy
+    parameter naming a data column with the spread in PRICE units. Default
+    off (0.0). The configured name is normalized (strip + lowercase) the
+    same way data columns are lowercased on load, so an uppercase config
+    cannot silently price 0.0 (A-L6).
+    """
+    if not raw_col:
+        return 0.0
+    col = str(raw_col).strip().lower()
+    if not col:
+        return 0.0
+    try:
+        raw = row.get(col)
+    except (AttributeError, KeyError):
+        return 0.0
+    if raw is None or pd.isna(raw):
+        return 0.0
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def resolve_ask_high_low(row: pd.Series, spread: float) -> tuple[float | None, float | None]:
+    """Per-bar ask-side high/low in price units (shared D3 helper).
+
+    Byte-identical consolidation of ``TradeEngine._ask_bar`` and
+    ``_vbt_ask_bar``: reads explicit ``ask_high``/``ask_low`` data columns
+    when present, otherwise falls back to bid high/low plus ``spread``.
+    Returns (None, None) when unavailable. Callers gate on the ``ask_ohlc``
+    strategy parameter and supply the spread themselves (native
+    ``_bar_spread`` / ``_vbt_bar_spread``), so this helper stays free of
+    engine-specific config plumbing.
+    """
+    ask_high = ask_low = None
+    try:
+        raw_high = row.get("ask_high")
+        raw_low = row.get("ask_low")
+    except (AttributeError, KeyError):
+        raw_high = raw_low = None
+    if raw_high is not None and pd.notna(raw_high):
+        try:
+            ask_high = float(raw_high)
+        except (TypeError, ValueError):
+            ask_high = None
+    if raw_low is not None and pd.notna(raw_low):
+        try:
+            ask_low = float(raw_low)
+        except (TypeError, ValueError):
+            ask_low = None
+    if ask_high is None or ask_low is None:
+        try:
+            base_high = float(row["high"])
+            base_low = float(row["low"])
+        except (KeyError, TypeError, ValueError):
+            return None, None
+        if ask_high is None:
+            ask_high = base_high + spread
+        if ask_low is None:
+            ask_low = base_low + spread
+    return ask_high, ask_low
+
+
 def _trade_equity_basis(trade: Trade, initial_capital: float) -> float:
     """Equity the trade was sized from (per-unit coefficient denominator)."""
     meta = trade.meta or {}

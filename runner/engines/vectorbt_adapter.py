@@ -29,6 +29,8 @@ from runner.engines import contract
 from runner.engines._drawings import DrawingList, _normalize_drawings
 from runner.engines._indicator_series import _build_indicator_series
 from runner.engines._shared import (
+    resolve_ask_high_low,
+    resolve_bar_spread,
     resolve_max_leverage as _resolve_max_leverage,
     resolve_max_position_exposure_pct as _resolve_max_position_exposure_pct,
     serialize_meta_value as _shared_serialize_meta_value,
@@ -198,7 +200,6 @@ def _size_trade(
             final_notional = required_notional
         else:
             final_notional = binding_notional
-            achievable_risk = (final_notional / entry_price) * stop_distance
             if capped_by_max_leverage and not capped_by_max_position:
                 logger.info(
                     "Leverage bound notional for %s trade %s: required_notional=%.2f exceeds leverage limit=%.2f (max_leverage=%.2fx)",
@@ -1253,24 +1254,7 @@ def _vbt_bar_spread(row: pd.Series, parameters: dict[str, Any] | None) -> float:
     with the spread in PRICE units. Default off (0.0): all existing
     behavior is unchanged.
     """
-    col = (parameters or {}).get("spread_price_col")
-    if not col:
-        return 0.0
-    # A-L6: data columns are lowercased on load — normalize the configured
-    # name the same way so an uppercase config cannot silently price 0.0.
-    col = str(col).strip().lower()
-    if not col:
-        return 0.0
-    try:
-        raw = row.get(col)
-    except (AttributeError, KeyError):
-        return 0.0
-    if raw is None or pd.isna(raw):
-        return 0.0
-    try:
-        return max(0.0, float(raw))
-    except (TypeError, ValueError):
-        return 0.0
+    return resolve_bar_spread(row, (parameters or {}).get("spread_price_col"))
 
 
 def _vbt_ask_bar(
@@ -1287,34 +1271,7 @@ def _vbt_ask_bar(
     """
     if not bool((parameters or {}).get("ask_ohlc", False)):
         return None, None
-    spread = _vbt_bar_spread(row, parameters)
-    ask_high = ask_low = None
-    try:
-        raw_high = row.get("ask_high")
-        raw_low = row.get("ask_low")
-    except (AttributeError, KeyError):
-        raw_high = raw_low = None
-    if raw_high is not None and pd.notna(raw_high):
-        try:
-            ask_high = float(raw_high)
-        except (TypeError, ValueError):
-            ask_high = None
-    if raw_low is not None and pd.notna(raw_low):
-        try:
-            ask_low = float(raw_low)
-        except (TypeError, ValueError):
-            ask_low = None
-    if ask_high is None or ask_low is None:
-        try:
-            base_high = float(row["high"])
-            base_low = float(row["low"])
-        except (KeyError, TypeError, ValueError):
-            return None, None
-        if ask_high is None:
-            ask_high = base_high + spread
-        if ask_low is None:
-            ask_low = base_low + spread
-    return ask_high, ask_low
+    return resolve_ask_high_low(row, _vbt_bar_spread(row, parameters))
 
 
 def _resolve_exit_price(

@@ -33,6 +33,7 @@ from runner.engines.base import (
 )
 from runner.engines._drawings import _normalize_drawings
 from runner.engines._shared import (
+    resolve_bar_spread,
     resolve_max_leverage as _resolve_max_leverage,
     resolve_max_position_exposure_pct as _resolve_max_position_exposure_pct,
     serialize_meta_value as _serialize_meta_value,
@@ -60,25 +61,7 @@ def _effective_load_start(config: BacktestConfig) -> str:
 
 def _pyne_bar_spread(row: pd.Series, parameters: dict[str, Any] | None) -> float:
     """A-H4 (D3): per-bar spread surcharge mirroring native _bar_spread."""
-    col = (parameters or {}).get("spread_price_col")
-    if not col:
-        return 0.0
-    # A-L6 parity with native _bar_spread / _vbt_bar_spread: data columns
-    # are lowercased on load, so normalize the configured name the same way
-    # — an uppercase config ("Spread_Price") must not silently price 0.0.
-    col = str(col).strip().lower()
-    if not col:
-        return 0.0
-    try:
-        raw = row.get(col)
-    except (AttributeError, KeyError):
-        return 0.0
-    if raw is None or pd.isna(raw):
-        return 0.0
-    try:
-        return max(0.0, float(raw))
-    except (TypeError, ValueError):
-        return 0.0
+    return resolve_bar_spread(row, (parameters or {}).get("spread_price_col"))
 
 
 def _gate_warmup_trades(trades: list[Trade], config: BacktestConfig) -> list[Trade]:

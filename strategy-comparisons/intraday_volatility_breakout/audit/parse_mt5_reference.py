@@ -48,6 +48,34 @@ def _read_log(path: pathlib.Path) -> list[str]:
     return path.read_bytes().decode("utf-16", errors="replace").splitlines()
 
 
+def _resolve_output_dir(raw: str) -> pathlib.Path:
+    """Resolve the ``--out`` CLI argument and confine it (S8707).
+
+    The argument must resolve inside the current working directory or the
+    audit directory next to this script; anything else raises ``ValueError``
+    instead of letting a crafted ``--out`` (``..``, absolute path,
+    symlink escape) redirect output writes elsewhere.
+    """
+    candidate = pathlib.Path(raw).expanduser().resolve()
+    allowed = (pathlib.Path.cwd().resolve(), CMP.resolve())
+    if not any(candidate == base or base in candidate.parents for base in allowed):
+        raise ValueError(f"--out {raw!r} escapes the allowed output bases")
+    return candidate
+
+
+def _output_csv_path(out_dir: pathlib.Path, filename: str) -> pathlib.Path:
+    """Join a constant output filename onto a validated output dir (S8707).
+
+    Re-checks containment of the final path so every file sink carries its
+    own guard even if ``out_dir`` was built elsewhere.
+    """
+    base = out_dir.resolve()
+    candidate = (base / filename).resolve()
+    if candidate.parent != base:
+        raise ValueError(f"refusing to write outside {base}: {filename!r}")
+    return candidate
+
+
 def parse_log_trades(log_path: pathlib.Path, contract: float) -> list[dict]:
     lines = _read_log(log_path)
     deals, opens = [], {}
@@ -166,7 +194,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default=str(CMP / "audit"))
     args = ap.parse_args()
-    out = pathlib.Path(args.out)
+    out = _resolve_output_dir(args.out)
     out.mkdir(parents=True, exist_ok=True)
 
     ok = True
@@ -176,11 +204,11 @@ def main() -> int:
 
         import csv as _csv
 
-        with open(out / f"mt5_trades_{name}.csv", "w", newline="") as f:
+        with open(_output_csv_path(out, f"mt5_trades_{name}.csv"), "w", newline="") as f:
             w = _csv.DictWriter(f, fieldnames=list(log_trades[0].keys()), lineterminator="\n")
             w.writeheader()
             w.writerows(log_trades)
-        with open(out / f"xlsx_trades_{name}.csv", "w", newline="") as f:
+        with open(_output_csv_path(out, f"xlsx_trades_{name}.csv"), "w", newline="") as f:
             w = _csv.DictWriter(f, fieldnames=list(xlsx_trades[0].keys()), lineterminator="\n")
             w.writeheader()
             w.writerows(xlsx_trades)

@@ -29,6 +29,7 @@ from runner.engine_pkg.execution_model import ExecutionModelSettings
 from runner.engine_pkg.orders import Order, OrderType, Position
 from runner.engine_pkg.result import build_indicator_series, build_result
 from runner.engines.base import BacktestConfig
+from runner.engines._shared import resolve_ask_high_low, resolve_bar_spread
 from runner.engines.contract import flag_missing_intrabar, resolve_same_bar_exit
 from shared.models import BacktestResult, EquityPoint, IndicatorSeries, Trade, TradeExit
 
@@ -300,26 +301,7 @@ class TradeEngine:
         MT5 order semantics tick-for-tick (verified: platform long entries
         equaled MT5 entries exactly after adding open-side spread).
         """
-        col = self.config.parameters.get("spread_price_col")
-        if not col:
-            return 0.0
-        # A-L6: frame/intrabar columns are lowercased on load while the
-        # configured name keeps its original case — an uppercase config
-        # ("Spread_Price") silently missed and priced 0.0 spread. Normalize
-        # the lookup key the same way.
-        col = str(col).strip().lower()
-        if not col:
-            return 0.0
-        try:
-            raw = row.get(col)
-        except (AttributeError, KeyError):
-            return 0.0
-        if raw is None or pd.isna(raw):
-            return 0.0
-        try:
-            return max(0.0, float(raw))
-        except (TypeError, ValueError):
-            return 0.0
+        return resolve_bar_spread(row, self.config.parameters.get("spread_price_col"))
 
     def _create_order(self, row: pd.Series, i: int, direction: str) -> None:
         entry_price = float(row["close"])
@@ -764,34 +746,7 @@ class TradeEngine:
         """
         if not bool(self.config.parameters.get("ask_ohlc", False)):
             return None, None
-        spread = self._bar_spread(row)
-        ask_high = ask_low = None
-        try:
-            raw_high = row.get("ask_high")
-            raw_low = row.get("ask_low")
-        except (AttributeError, KeyError):
-            raw_high = raw_low = None
-        if raw_high is not None and pd.notna(raw_high):
-            try:
-                ask_high = float(raw_high)
-            except (TypeError, ValueError):
-                ask_high = None
-        if raw_low is not None and pd.notna(raw_low):
-            try:
-                ask_low = float(raw_low)
-            except (TypeError, ValueError):
-                ask_low = None
-        if ask_high is None or ask_low is None:
-            try:
-                base_high = float(row["high"])
-                base_low = float(row["low"])
-            except (KeyError, TypeError, ValueError):
-                return None, None
-            if ask_high is None:
-                ask_high = base_high + spread
-            if ask_low is None:
-                ask_low = base_low + spread
-        return ask_high, ask_low
+        return resolve_ask_high_low(row, self._bar_spread(row))
 
     def _check_stops(
         self,
