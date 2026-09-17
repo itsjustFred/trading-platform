@@ -1,6 +1,7 @@
 from runner.engine import TradeEngine
 from runner.engines.base import BacktestConfig
 import pandas as pd
+import pytest
 
 
 def _engine(params=None):
@@ -452,5 +453,5 @@ def test_explicit_fees_reduce_net_pnl():
     qty = trade.quantity
     expected_fees = (trade.entry_price * qty + trade.exits[0].price * qty) * 0.01 + 3.0
     assert trade.fees > 0
-    assert trade.fees == expected_fees
+    assert trade.fees == pytest.approx(expected_fees)
     assert trade.net_pnl == trade.pnl - trade.fees

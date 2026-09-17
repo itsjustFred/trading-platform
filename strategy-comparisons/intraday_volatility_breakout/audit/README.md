@@ -50,7 +50,7 @@ SL-Exits centgenau, Lots exakt, Time-Exits = 22:55-Open (+Spread bei SHORT).
    (nur direction≠both + Reverse) → Filter nach Mapping + Tests.
 4. **Engine hatte kein Spread-Modell**: LONG-Entries um vollen Spread daneben →
    `spread_price_col` (LONG ask/SHORT bid, opt-in) + Tests.
-5. **Lots aus |Fill−SL`** statt MT5-ATR-Distanz → `stop_distance`-Sizing + Tests.
+5. **Lots aus |Fill−SL** statt MT5-ATR-Distanz → `stop_distance`-Sizing + Tests.
 6. **Time-Exits füllten per Bar-Close** statt First-Tick (Bar-Open) →
    `signal_exit_fill=open` (opt-in, SHORT-Close +Spread) + Tests.
 7. **03-20-Ersttag-Trades fehlen** (je ~+$861): Regime braucht Vortag, CSV beginnt

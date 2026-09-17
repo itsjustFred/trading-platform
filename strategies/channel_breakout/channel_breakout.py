@@ -194,7 +194,7 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
 
     in_trade = False
     active_direction: str | None = None
-    trailing_stop_value = 0.0
+    trailing_stop_value: float | None = None
     active_sl = np.nan
     warmup = max(channel_length, ema_period, atr_period, 20)
 
@@ -215,7 +215,7 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
                 # close-based; fixed SetStopLoss is a stop order -> low/high).
                 if not use_fixed_stop and pd.notna(atr_v):
                     new_stop = c - float(atr_v) * atr_multiplier
-                    if trailing_stop_value == 0.0 or new_stop > trailing_stop_value:
+                    if trailing_stop_value is None or new_stop > trailing_stop_value:
                         trailing_stop_value = new_stop
                     trailing_stop_at_exit.iloc[i] = trailing_stop_value
                 # 1) stop hit (stop-first priority)
@@ -226,7 +226,7 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
                         exit_reason.iloc[i] = "fixed_stop"
                         in_trade = False
                         active_direction = None
-                        trailing_stop_value = 0.0
+                        trailing_stop_value = None
                         continue
                 else:
                     # A-M2: close-triggered trailing exit fills at the CLOSE,
@@ -234,13 +234,13 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
                     # the close systematically sells too high). Stop-order
                     # legs (fixed stop on low/high, channel exit on low/high)
                     # keep level fills — only close-triggered legs move.
-                    if c <= trailing_stop_value:
+                    if trailing_stop_value is not None and c <= trailing_stop_value:
                         exits.iloc[i] = True
                         exit_price.iloc[i] = c
                         exit_reason.iloc[i] = "trailing_stop"
                         in_trade = False
                         active_direction = None
-                        trailing_stop_value = 0.0
+                        trailing_stop_value = None
                         continue
                 # 2) channel exit: opposite-side stop (stop order -> low check)
                 if use_channel_exit and lo <= float(dn_prev):
@@ -249,7 +249,7 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
                     exit_reason.iloc[i] = "channel_exit"
                     in_trade = False
                     active_direction = None
-                    trailing_stop_value = 0.0
+                    trailing_stop_value = None
                     continue
                 # 3) EMA exit (close-based per source)
                 if use_ema_exit and c < float(ema_v):
@@ -258,7 +258,7 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
                     exit_reason.iloc[i] = "ema_exit"
                     in_trade = False
                     active_direction = None
-                    trailing_stop_value = 0.0
+                    trailing_stop_value = None
                     continue
                 # 4) session-close flatten
                 if bool(exit_on_session_close) and bool(is_last_of_day.iloc[i]):
@@ -267,11 +267,11 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
                     exit_reason.iloc[i] = "session_close"
                     in_trade = False
                     active_direction = None
-                    trailing_stop_value = 0.0
+                    trailing_stop_value = None
             else:  # SHORT
                 if not use_fixed_stop and pd.notna(atr_v):
                     new_stop = c + float(atr_v) * atr_multiplier
-                    if trailing_stop_value == 0.0 or new_stop < trailing_stop_value:
+                    if trailing_stop_value is None or new_stop < trailing_stop_value:
                         trailing_stop_value = new_stop
                     trailing_stop_at_exit.iloc[i] = trailing_stop_value
                 if use_fixed_stop:
@@ -281,18 +281,18 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
                         exit_reason.iloc[i] = "fixed_stop"
                         in_trade = False
                         active_direction = None
-                        trailing_stop_value = 0.0
+                        trailing_stop_value = None
                         continue
                 else:
                     # A-M2: close-triggered trailing exit fills at the CLOSE
                     # (mirror of the LONG leg) — never at the stop level.
-                    if c >= trailing_stop_value:
+                    if trailing_stop_value is not None and c >= trailing_stop_value:
                         exits.iloc[i] = True
                         exit_price.iloc[i] = c
                         exit_reason.iloc[i] = "trailing_stop"
                         in_trade = False
                         active_direction = None
-                        trailing_stop_value = 0.0
+                        trailing_stop_value = None
                         continue
                 if use_channel_exit and hi >= float(up_prev):
                     exits.iloc[i] = True
@@ -300,7 +300,7 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
                     exit_reason.iloc[i] = "channel_exit"
                     in_trade = False
                     active_direction = None
-                    trailing_stop_value = 0.0
+                    trailing_stop_value = None
                     continue
                 if use_ema_exit and c > float(ema_v):
                     exits.iloc[i] = True
@@ -308,7 +308,7 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
                     exit_reason.iloc[i] = "ema_exit"
                     in_trade = False
                     active_direction = None
-                    trailing_stop_value = 0.0
+                    trailing_stop_value = None
                     continue
                 if bool(exit_on_session_close) and bool(is_last_of_day.iloc[i]):
                     exits.iloc[i] = True
@@ -316,7 +316,7 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
                     exit_reason.iloc[i] = "session_close"
                     in_trade = False
                     active_direction = None
-                    trailing_stop_value = 0.0
+                    trailing_stop_value = None
         else:
             # Gap gate: 1 -> longs only, -1 -> shorts only, 0 -> no trades.
             if gap_filter_active:
@@ -340,14 +340,14 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
                 if use_fixed_stop:
                     active_sl = c - fixed_stop_distance
                     sl_price.iloc[i] = float(active_sl)
-                    trailing_stop_value = 0.0
+                    trailing_stop_value = None
                 else:
                     if pd.notna(atr_v):
                         trailing_stop_value = c - float(atr_v) * atr_multiplier
                         sl_price.iloc[i] = float(trailing_stop_value)
                         active_sl = float(trailing_stop_value)
                     else:
-                        trailing_stop_value = 0.0
+                        trailing_stop_value = None
                         active_sl = np.nan
             elif short_allowed and short_ema_ok and short_breakout:
                 entries.iloc[i] = True
@@ -357,14 +357,14 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
                 if use_fixed_stop:
                     active_sl = c + fixed_stop_distance
                     sl_price.iloc[i] = float(active_sl)
-                    trailing_stop_value = 0.0
+                    trailing_stop_value = None
                 else:
                     if pd.notna(atr_v):
                         trailing_stop_value = c + float(atr_v) * atr_multiplier
                         sl_price.iloc[i] = float(trailing_stop_value)
                         active_sl = float(trailing_stop_value)
                     else:
-                        trailing_stop_value = 0.0
+                        trailing_stop_value = None
                         active_sl = np.nan
 
     indicators_dict = {

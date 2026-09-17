@@ -29,7 +29,8 @@ Session-Zeiten werden aus den Bar-Timestamps in `America/New_York` abgeleitet.
 
 ### Engine + Daten
 - Buy-Stop-Fills brauchen den `entry_stop`-Pfad des vectorbt-Adapters
-  (Fill am Stop bei Touch, sonst Open-Fallback); ein invertierter Stop
+  (Fill am Stop bei Touch, kein Fill ohne Touch — D2 strict; nur ohne
+  nutzbares `entry_stop`-Level greift der Open-Fallback); ein invertierter Stop
   (SL auf der falschen Seite des Fills) wird lautstark uebersprungen.
 - Feed-Anforderung: konsistenter Single-Feed mit Stundenbalken
   (`dukascopy/indices/USTEC/1h.parquet` ist defekt — interleavte Plain-
