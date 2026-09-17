@@ -23,11 +23,14 @@ import numpy as np
 import pandas as pd
 
 from shared.constants import ensure_path_within_workspace
+from shared.logging import get_logger
 import yfinance as yf
 from scipy.optimize import minimize
 
 # Ensure project root is importable when called directly
 import sys
+
+logger = get_logger("scripts.run-risk-parity-backtest")
 
 _ISO_UTC_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
@@ -394,9 +397,7 @@ def run_backtest(
         # counts local bars only and goes ready late vs LEAN (documented
         # limitation — pass history from 2015-08-04 or leave prices=None to
         # download it).
-        import logging as _logging
-
-        _logging.getLogger(__name__).warning(
+        logger.warning(
             "Price history starts %s, after QC data start %s: the SMA(200) "
             "hedge gate counts local bars only and fires late vs LEAN",
             prices.index[0].date(),

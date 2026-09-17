@@ -32,8 +32,12 @@ vectorbt notes:
   fixed stops are stop orders, checked against low/high.
 """
 
+import logging
+
 import numpy as np
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 
 STRATEGY_META = {
@@ -73,6 +77,7 @@ def _ny_dates(df: pd.DataFrame):
     try:
         ts_ny = ts_utc.dt.tz_convert("America/New_York")
     except Exception:
+        logger.warning("NY timezone conversion failed; gap filter bypassed")
         return None, None
     return ts_ny.dt.date.to_numpy(), ts_ny
 
@@ -172,6 +177,7 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
             ts_utc = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
             session_dates = ts_utc.dt.date.to_numpy()
         except Exception:
+            logger.warning("Session-date fallback failed; session-close exit disabled")
             session_dates = None
     if session_dates is not None:
         for i in range(n):

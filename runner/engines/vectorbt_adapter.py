@@ -808,7 +808,14 @@ class VectorbtAdapter(EngineAdapter):
                 for future in as_completed(futures):
                     sym = futures[future]
                     try:
-                        trades, extra_tfs, drawings, indicator_series, loaded_bars, inverted_drops = future.result()
+                        (
+                            trades,
+                            extra_tfs,
+                            drawings,
+                            indicator_series,
+                            loaded_bars,
+                            inverted_drops,
+                        ) = future.result()
                         total_loaded_bars += loaded_bars
                         total_inverted_drops += inverted_drops
                         all_trades.extend(trades)
@@ -827,7 +834,14 @@ class VectorbtAdapter(EngineAdapter):
                 ) from symbol_errors[0][1]
         else:
             for symbol in config.symbols:
-                trades, extra_tfs, drawings, indicator_series, loaded_bars, inverted_drops = _process_symbol(
+                (
+                    trades,
+                    extra_tfs,
+                    drawings,
+                    indicator_series,
+                    loaded_bars,
+                    inverted_drops,
+                ) = _process_symbol(
                     symbol, config, strategy_path, resolved_parameters, data_root
                 )
                 total_loaded_bars += loaded_bars

@@ -823,7 +823,9 @@ class TradeEngine:
                 stop_hit = position.stop_loss is not None and bar_low <= float(position.stop_loss)
             else:
                 short_high = ask_high if ask_high is not None else bar_high
-                stop_hit = position.stop_loss is not None and short_high >= float(position.stop_loss)
+                stop_hit = position.stop_loss is not None and short_high >= float(
+                    position.stop_loss
+                )
 
             pending_tp = [
                 level for level in position.take_profit_levels if not bool(level.get("filled"))
