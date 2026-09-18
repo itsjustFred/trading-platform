@@ -20,7 +20,7 @@ When creating an issue, give the appropriate labels. If things are unclear, give
 Before creating a PR, make sure to have a complete, review-ready change. This includes running all relevant tests making sure none fails. If a required check cannot run, report the limitation and do not claim the change is ready.
 Include test coverage for the change.
 Treat the project CI as a confirmation of the locally validated change, do not rely on an open PR as the primary development loop.
-After you're done with the work and have added it to the PR, run the `verify-pr` skill found in `.agents/skills/` in this repo as a verification pipeline.
+After you're done with the work and have added it to the PR, run the `platform-pr-verify` skill found in `.agents/skills/` in this repo as a verification pipeline.
 When referencing an issue, include it in the PR description, but not in the title.
 Before starting work, check open PRs for an existing PR on this issue, and do not submit a competing one unless explicitly told by the user, instead add useful context or an alternative approach.
 Give the `ready-for-human` tag only if the implementation is done. If further work is required after human review, remove the tag while working and re-add when done.

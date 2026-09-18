@@ -1,5 +1,5 @@
 ---
-name: verify-pr
+name: platform-pr-verify
 description: Mandatory verification pipeline for a pull request. Runs SonarQube comment check, mutation testing, pre-mortem, code review and CodeRabbit in sequence until all pass without findings.
 ---
 
