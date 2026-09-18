@@ -8,6 +8,7 @@ import pytest
 
 from shared.models import Trade, TradeExit
 from validation.stats import TradeStatistics, compute_trade_statistics
+from validation.stats.calculator import _annualize_factor, _trade_span_years
 
 
 def _make_trade(trade_id: int, pnls: list[float]) -> Trade:
@@ -538,3 +539,30 @@ def test_sharpe_falls_back_for_denser_than_daily_trades() -> None:
     stats = compute_trade_statistics(trades)
     expected = (0.5 / 9.5) * math.sqrt(252.0)
     assert stats.sharpe_ratio == pytest.approx(expected, rel=1e-4)
+
+
+# ── 18. Trade-span counts distinct dated trades (coderabbit cycle 2) ─────────
+
+
+def test_span_needs_two_dated_trades_not_two_timestamps() -> None:
+    """One trade with entry+exit dated is a SINGLE dated trade -> span None.
+
+    Regression: ``_trade_span_years`` counted timestamps, so a lone trade
+    contributing both ``entry_time`` and ``last_exit_time`` produced a span
+    (its own holding time) and ``_annualize_factor`` annualized 1 trade over
+    it instead of falling back to sqrt(252).
+    """
+    trade = _make_dated_trade(1, "2024-01-01T00:00:00Z", "2024-07-01T00:00:00Z", 100.0)
+    assert _trade_span_years([trade]) is None
+    assert _annualize_factor([trade]) == pytest.approx(math.sqrt(252.0))
+
+
+def test_span_two_dated_trades_still_spans() -> None:
+    """Two dated trades keep the trade-frequency annualization (A-L4)."""
+    trades = [
+        _make_dated_trade(1, "2024-01-01T00:00:00Z", "2024-01-02T00:00:00Z", 10.0),
+        _make_dated_trade(2, "2024-07-01T00:00:00Z", "2024-07-02T00:00:00Z", -5.0),
+    ]
+    span = _trade_span_years(trades)
+    assert span is not None and span > 0
+    assert _annualize_factor(trades) == pytest.approx(math.sqrt(2.0 / span))

@@ -23,6 +23,7 @@ Checks performed (fail loudly on mismatch):
 from __future__ import annotations
 
 import argparse
+import math
 import pathlib
 import re
 import sys
@@ -116,9 +117,29 @@ def parse_log_trades(log_path: pathlib.Path, contract: float) -> list[dict]:
         sign = 1 if direction == "LONG" else -1
         pnl = sign * (d_out["price"] - d_in["price"]) * d_in["vol"] * contract
         metric = opens.get(d_in["time"], (None, None, None, None))
-        side, _, lots, sl = metric[0], metric[1], metric[2], metric[3]
+        side, open_price, lots, sl = metric[0], metric[1], metric[2], metric[3]
         if side is None or lots is None:
             raise ValueError(f"{log_path}: open line missing for {d_in['time']}")
+        expected_side = "Long" if d_in["side"] == "buy" else "Short"
+        if side != expected_side:
+            raise ValueError(
+                f"{log_path}: open side mismatch at {d_in['time']}: "
+                f"{side!r} vs {expected_side!r}"
+            )
+        if open_price is None or not math.isclose(
+            open_price, d_in["price"], rel_tol=1e-9, abs_tol=1e-9
+        ):
+            raise ValueError(
+                f"{log_path}: open price mismatch at {d_in['time']}: "
+                f"{open_price!r} vs {d_in['price']!r}"
+            )
+        # Tolerance (not ==): the EA logs Lots with a JS-float repr
+        # (e.g. 1.6600000000000001) while deals log 1.66.
+        if not math.isclose(lots, d_in["vol"], rel_tol=1e-9, abs_tol=1e-9):
+            raise ValueError(
+                f"{log_path}: open lots mismatch at {d_in['time']}: "
+                f"{lots!r} vs {d_in['vol']!r}"
+            )
         tol = abs(d_in["price"]) * 1e-5 + 1e-9
         reason = "sl" if abs(d_out["price"] - sl) <= tol else "time"
         trades.append(

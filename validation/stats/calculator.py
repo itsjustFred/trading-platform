@@ -138,18 +138,26 @@ def _compute_drawdowns(realized_pnls: List[float]) -> tuple[float, float]:
 def _trade_span_years(trades: List[Trade]) -> float | None:
     """Calendar span covered by the trades, in years (None when undatable)."""
     stamps: list[pd.Timestamp] = []
+    dated_trades = 0
     try:
         import pandas as pd
     except ImportError:  # pragma: no cover
         return None
     for trade in trades:
+        trade_dated = False
         for raw in (trade.entry_time, trade.last_exit_time):
             if raw is None:
                 continue
             ts = pd.to_datetime(str(raw), utc=True, errors="coerce")
             if not pd.isna(ts):
                 stamps.append(ts)
-    if len(stamps) < 2:
+                # One trade = one dated trade even when it contributes
+                # both an entry and an exit timestamp (A-L4 annualizes
+                # per TRADE, n_trades / span_years).
+                trade_dated = True
+        if trade_dated:
+            dated_trades += 1
+    if dated_trades < 2:
         return None
     span_days = (max(stamps) - min(stamps)).total_seconds() / 86400.0
     if span_days <= 0:
