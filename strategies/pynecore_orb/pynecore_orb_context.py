@@ -41,9 +41,19 @@ def build_trade_context(df: pd.DataFrame, params: dict | None = None) -> dict[st
         ts_ny = pd.to_datetime(df["timestamp"], utc=True, errors="coerce").dt.tz_convert(_TZ)
         minutes_now = (ts_ny.dt.hour * 60 + ts_ny.dt.minute).to_numpy()
         day_key = ts_ny.dt.date.to_numpy()
+    elif isinstance(df.index, pd.DatetimeIndex):
+        # Mirror us100_scalper: derive ET sessions from the tz-aware index
+        # instead of degrading into a constant noon/zero-day fallback that
+        # silently produces no trades.
+        ts_ny = pd.to_datetime(df.index, utc=True, errors="coerce").tz_convert(_TZ)
+        minutes_now = (ts_ny.hour * 60 + ts_ny.minute).to_numpy()
+        day_key = ts_ny.date
     else:
-        minutes_now = pd.Series(12 * 60, index=df.index).to_numpy()
-        day_key = pd.Series(0, index=df.index).to_numpy()
+        raise ValueError(
+            "pynecore_orb context needs a 'timestamp' column or a "
+            "DatetimeIndex to derive ET sessions (constant fallback would "
+            "silently disable the opening-range logic)"
+        )
 
     or_end = _OR_START_MINUTES + opening_range_minutes
     exit_minutes = exit_hour * 60 + exit_minute
