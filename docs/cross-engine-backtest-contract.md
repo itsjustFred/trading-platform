@@ -65,6 +65,20 @@ consumed by the adapters (native, pynecore, vectorbt and signal-replay all
 filter through the shared helper). A date-only end bound must never drop the
 bars of the end date itself.
 
+**Warmup gate (A-M11, A-H4/D3).** `warmup_start` (default `""`) names a
+period whose bars feed indicator warm-up but must produce NO trades. All
+adapters gate trades before the warm-up boundary; an explicit `start_date`
+inside the warm-up span is a hard error (`ValueError`), never a silent
+no-gate. Engines agree on the boundary semantics (pinned by cross-engine
+conformance tests).
+
+**Signal exit fill convention (A-M1/D4).** A signal exit (not a protective
+level exit) fills at the **trigger bar's close** in every engine; the
+convention is one place — `_prepare_next_open_execution_data` keeps the exit
+leg unshifted in vectorbt, and `BacktestConfig.signal_exit_fill` (validated
+to `close`/`open`) selects `open` for MT5-parity runs. Stop/TP exits fill at
+the level in every engine (§1).
+
 **Pynecore CLI bounds.** Pynecore additionally hands each symbol's frame to
 the external `pyne` CLI (`--from`/`--to`). The CLI parses those values with
 `datetime.fromisoformat` and resolves a NAIVE result through `timestamp()` —
@@ -119,9 +133,12 @@ Implementation:
   might interpret differently). The same configuration therefore yields the
   same intrabar frame — and the same exits — on every engine (pinned by
   `test_native_and_vectorbt_resolve_the_same_intrabar_spellings` and
-  `test_spellings_pinned_against_one_shared_table`). vectorbt schedules
-  exits at the next bar's open (F10), so it never faces the same-bar
-  ambiguity on its main frame and therefore needs no fallback flag.
+  `test_spellings_pinned_against_one_shared_table`). Since D4 (A-M1) the
+  vectorbt signal exit fires on the trigger bar itself, so vectorbt faces
+  the same-bar ambiguity on its main frame exactly like native; its
+  intrabar walk covers the trigger bar's own sub-bars (window through the
+  trigger bar's close) and a trigger-bar stop/TP therefore fills at the
+  level in both engines.
 - Signal replay: `_process_protective_exits` walks bars chronologically and
   classifies each through the shared helper.
 - Configuring `same_bar_order = "take_profit_first"` is **not** part of the
@@ -150,6 +167,18 @@ Implementation:
 - Without an explicit stop, engines fall back to a documented default stop
   distance (native/risk engine: `fallback_stop_pct = 2%`; vectorbt: 2% of
   entry) — the fallback must be visible in the trade meta, not silent.
+- **Multi-symbol shared equity (D5, A-M4):** per-symbol engines size each
+  trade from the full starting capital; on multi-symbol runs the adapters
+  replay all trades onto ONE running portfolio equity
+  (`runner.engines._shared.replay_shared_equity`, wired in the native and
+  vectorbt adapters): quantities are re-scaled onto the shared equity,
+  PnL/fees re-priced from the scaled quantities, and open exposure is summed
+  across symbols into `trade.meta["portfolio"]`. Trades flagged
+  `equity_proportional_sizing=False` (native fixed-amount sizing is
+  absolute-$) keep their quantity; exposure is still summed. Single-symbol
+  runs skip the replay (identity). The PyneCore adapter does NOT replay
+  shared equity yet — a multi-symbol PyneCore run still risks
+  N × risk_pct (known limitation).
 
 ## 5. Execution-timing models (documented divergence)
 
@@ -162,8 +191,8 @@ behavior**, not a bug to be fixed by silently changing one engine:
 | signal-replay | same-bar-close | External signal payloads fill at the signal bar's close; slippage/delay recorded in `trade.meta`. |
 | pynecore | post-hoc restatement | Pine execution produces exit prices that are then *recontained* to the recorded protective levels. |
 
-**Pynecore restatement containment.** `_normalize_trade_exits` may only
-*tighten* an exit leg to the recorded protective level:
+**Pynecore restatement containment.** `_normalize_trade_exits` tightens a
+level-violating exit leg to the recorded protective level:
 
 - a LONG exit below `sl_price` is restated to `sl_price` with reason
   `stop_loss` (mirrored for SHORT);
@@ -171,10 +200,19 @@ behavior**, not a bug to be fixed by silently changing one engine:
   `take_profit` (mirrored for SHORT);
 - an exit inside the levels is left untouched.
 
+Since A-H4 (D3) the adapter additionally runs `_apply_fill_parity` before
+sizing: non-level exit legs (signal/time exits) are re-priced to the fill
+convention the other engines use — the configured `signal_exit_fill`
+(default `close`: the trigger bar's close; `open`: the next bar's open) —
+when the recorded Pine price disagrees with that convention. Level exits
+(`stop_loss`/`take_profit`) keep their recorded level. This re-pricing is a
+documented divergence from the raw Pine ledger, applied so cross-engine
+comparisons measure strategy edge instead of engine artifacts.
+
 The restatement never invents prices beyond the recorded levels and never
-rewrites entry legs. Conformance tests pin this as a property: for any exit
-price, the restated price is either the original price or exactly the violated
-level.
+rewrites entry legs. Conformance tests pin the containment as a property:
+for any exit price, the restated price is either the original price or
+exactly the violated level.
 
 ## 6. Stats keys
 
