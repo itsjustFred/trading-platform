@@ -194,3 +194,21 @@ def test_frame_end_flattens_open_position():
     assert indicators["exit_price"].iloc[-1] == pytest.approx(
         float(df_cut["close"].iloc[-1])
     )
+
+
+def test_frame_end_flatten_skips_same_bar_entry():
+    """PM11: Entry auf der letzten Bar bekommt keinen Flatten-Exit auf derselben Bar.
+
+    Der Frame endet exakt auf der Touch-Bar des Buy-Stops. Ein day_reset_flatten
+    auf derselben Bar wuerde einen Phantom-Roundtrip buchen (Entry zum Stop-Level,
+    Exit zum Close), obwohl die Position nie bestand. Ohne Flatten-Exit faengt
+    der naechste Frame (Day-Reset oder EOD) die Position ab.
+    """
+    module = _load_module()
+    df = _frame()
+    last = df.index[df["timestamp"] == pd.Timestamp("2024-01-02 13:00", tz="UTC")][0]
+    df_cut = df.iloc[: last + 1].reset_index(drop=True)
+    entries, exits, indicators, _ = module.generate_signals(df_cut, {})
+    assert entries.sum() == 1, "Entry-Touch auf der letzten Bar muss als Entry erkannt sein"
+    assert not exits.any(), "Kein Exit auf derselben Bar wie der Entry"
+    assert indicators["exit_reason"].isna().all()

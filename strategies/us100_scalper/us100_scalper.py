@@ -190,9 +190,14 @@ def generate_signals(df: pd.DataFrame, params: dict):
         # exit on the last bar at its close instead of dropping the position
         # (phantom trade: entry without exit).
         last = len(df) - 1
-        exits.iloc[last] = True
-        exit_price.iloc[last] = float(close.iloc[last])
-        exit_reason.iloc[last] = "day_reset_flatten"
+        # PM11: skip when the entry fired on this very bar — a same-bar flatten
+        # would book a phantom round trip (entry at the stop level, exit at the
+        # close) for a position that never held. The next frame's day-reset or
+        # EOD exit picks it up instead.
+        if not entries.iloc[last]:
+            exits.iloc[last] = True
+            exit_price.iloc[last] = float(close.iloc[last])
+            exit_reason.iloc[last] = "day_reset_flatten"
 
     _ = open_  # retained for OHLCV-shape parity; logic keys off high/low/close
     indicators_dict = {
