@@ -1493,16 +1493,21 @@ def _resolve_intrabar_exit(
 
     effective_start = entry_ts
     effective_end = exit_ts
-    if effective_end <= effective_start:
+    if effective_end < effective_start:
         return None
 
     timestamps = pd.to_datetime(intrabar_df["timestamp"], utc=True, errors="coerce")
-    # The upper bound is EXCLUSIVE because vectorbt schedules exits at the
-    # next bar's open (F10 execution-timing models, contract doc §3) — the
-    # exit bar's own sub-bars are outside the resolution window. If exits are
-    # ever moved onto the signal bar, this slice must become inclusive or the
-    # intrabar resolution silently degrades to main-frame fills.
-    window = intrabar_df.loc[(timestamps >= effective_start) & (timestamps < effective_end)]
+    # The upper bound extends through the trigger bar (D4, A-M1): the exit
+    # leg fires on the trigger bar itself, so the trigger bar's own sub-bars
+    # sit inside the resolution window — a stop/TP touched intrabar on the
+    # trigger bar must fill at the level, exactly like native `_check_stops`
+    # which runs on the trigger bar before the signal close. An upper bound
+    # at the trigger bar's open silently degraded those fills to
+    # trigger-close (engine divergence). Sub-bars of the NEXT bar and beyond
+    # stay excluded: the window ends at the trigger bar's close.
+    base_duration = TIMEFRAME_TO_DURATION.get(str(base_timeframe).lower())
+    window_end = effective_end + base_duration if base_duration else effective_end
+    window = intrabar_df.loc[(timestamps >= effective_start) & (timestamps < window_end)]
     if window.empty:
         return None
 

@@ -251,6 +251,79 @@ class TestAskSideStops:
         assert event is not None
         assert event["reason"] == "stop_loss"
 
+    def test_trigger_bar_intrabar_stop_is_inside_window(self):
+        """D4 (A-M1): the exit leg fires on the trigger bar, so its own
+        sub-bars sit inside the intrabar window — a stop touched intrabar on
+        the trigger bar fills at the level (native parity), not at the
+        trigger close."""
+        # Hourly frame: entry bar 08:00, trigger bar 09:00. The stop is hit
+        # ONLY inside the trigger bar's 09:15 sub-bar.
+        sub = pd.date_range("2024-01-01 08:00", periods=8, freq="15min", tz="UTC")
+        intrabar = pd.DataFrame(
+            {
+                "timestamp": sub,
+                "open": [100.0] * 8,
+                "high": [100.5] * 8,
+                "low": [100.0, 100.0, 100.0, 100.0, 100.0, 98.8, 100.0, 100.0],
+                "close": [100.0] * 8,
+            }
+        )
+        hit = _resolve_intrabar_exit(
+            intrabar_df=intrabar,
+            intrabar_timeframe="15min",
+            base_timeframe="1h",
+            direction="LONG",
+            entry_time="2024-01-01T08:00:00+00:00",
+            scheduled_exit_time="2024-01-01T09:00:00+00:00",
+            stop_price=99.0,
+            take_profit_price=None,
+        )
+        assert hit is not None, (
+            "Trigger-bar intrabar stop must fill at the level (native parity)"
+        )
+        assert hit["reason"] == "stop_loss"
+        assert hit["price"] == pytest.approx(99.0)
+        assert hit["time"] == "2024-01-01T09:15:00+00:00"
+
+    def test_next_bar_intrabar_stop_stays_outside_window(self):
+        """The window ends at the trigger bar's close: a stop touched only in
+        the NEXT bar's sub-bars must NOT fire (the scheduled exit already
+        ended at the trigger bar)."""
+        sub = pd.date_range("2024-01-01 08:00", periods=8, freq="15min", tz="UTC")
+        intrabar = pd.DataFrame(
+            {
+                "timestamp": sub,
+                "open": [100.0] * 8,
+                "high": [100.5] * 8,
+                "low": [100.0] * 7 + [98.8],  # only the 10:45 sub-bar? no: 8 bars end 09:45
+                "close": [100.0] * 8,
+            }
+        )
+        # 8 x 15min from 08:00 ends at 09:45 — inside the trigger bar. For a
+        # next-bar-only hit, extend past the trigger bar's close (10:00+).
+        sub2 = pd.date_range("2024-01-01 08:00", periods=12, freq="15min", tz="UTC")
+        intrabar2 = pd.DataFrame(
+            {
+                "timestamp": sub2,
+                "open": [100.0] * 12,
+                "high": [100.5] * 12,
+                "low": [100.0] * 11 + [98.8],  # only 10:45 sub-bar (next bar)
+                "close": [100.0] * 12,
+            }
+        )
+        hit = _resolve_intrabar_exit(
+            intrabar_df=intrabar2,
+            intrabar_timeframe="15min",
+            base_timeframe="1h",
+            direction="LONG",
+            entry_time="2024-01-01T08:00:00+00:00",
+            scheduled_exit_time="2024-01-01T09:00:00+00:00",
+            stop_price=99.0,
+            take_profit_price=None,
+        )
+        assert hit is None, "Next-bar intrabar touch must stay outside the window"
+        assert intrabar["low"].min() < 99.0  # sanity: the fixture does contain a touch
+
 
 class TestFeeModelParity:
     def test_explicit_fees_reduce_net_pnl_on_both_engines(self, parity_env):
