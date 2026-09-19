@@ -40,6 +40,8 @@ COMPARISON_CASES: tuple[dict[str, Any], ...] = (
         "end": "2026-06-23",
         "output": Path("data/backtests/intraday_volatility_breakout_eurusd_h1.json"),
         "use_native_daily_ohlcv": True,
+        # Account-Währung aus Tester-Setfile Currency=... (EURUSD_H1_setfile.ini: USD).
+        "account_currency": "USD",
     },
     {
         "label": "NAS100_M15",
@@ -50,6 +52,8 @@ COMPARISON_CASES: tuple[dict[str, Any], ...] = (
         "start": "2018-01-01",
         "end": "2026-06-23",
         "output": Path("data/backtests/intraday_volatility_breakout_nas100_m15.json"),
+        # Account-Währung aus Tester-Setfile Currency=... (NAS100_M15_setfile.ini: EUR).
+        "account_currency": "EUR",
     },
     {
         "label": "SP500_M1",
@@ -60,6 +64,8 @@ COMPARISON_CASES: tuple[dict[str, Any], ...] = (
         "start": "2018-01-01",
         "end": "2026-06-23",
         "output": Path("data/backtests/intraday_volatility_breakout_sp500_m1.json"),
+        # Account-Währung aus Tester-Setfile Currency=... (SP500_M1_setfile.ini: USD).
+        "account_currency": "USD",
     },
 )
 
@@ -73,6 +79,38 @@ MT5_LOT_STEPS: dict[str, float] = {
     "EURUSD": 0.01,
     MT5_SYMBOL_NAS100: 1.0,
     MT5_SYMBOL_SP500: 1.0,
+}
+
+# MT5 Tick-Specs für CalculateLotSize (Herkunft: .mq5 Z.381-396 Formel
+# lots=(Risk/dist)*(tick_size/tick_val), Werte reverse-engineered aus
+# MT5-Tester-Logs: EURUSD 2.75/2.12/1.66 bei dist 0.00181/0.00235/0.00300
+# -> tick 1e-5/1.0; USATECH 31/29/40 und USA500 123/88 bei lots=500/dist
+# -> tick 1.0/1.0; Dukascopy-demo, nur Ratio tick_size/tick_value lot-relevant).
+MT5_TICK_SIZES: dict[str, float] = {
+    "EURUSD": 0.00001,
+    MT5_SYMBOL_NAS100: 1.0,
+    MT5_SYMBOL_SP500: 1.0,
+}
+
+MT5_TICK_VALUES: dict[str, float] = {
+    "EURUSD": 1.0,
+    MT5_SYMBOL_NAS100: 1.0,
+    MT5_SYMBOL_SP500: 1.0,
+}
+
+# Broker-Lot-Limits für MathMax(min)/MathMin(max)-Clamp (.mq5 Z.391-393,
+# Werte: Dukascopy-demo-Defaults min=step; max großzügig über beobachteten
+# Maxima EURUSD 6.04 / USATECH 42 / USA500 145 aus den MT5-Logs).
+MT5_MIN_LOTS: dict[str, float] = {
+    "EURUSD": 0.01,
+    MT5_SYMBOL_NAS100: 1.0,
+    MT5_SYMBOL_SP500: 1.0,
+}
+
+MT5_MAX_LOTS: dict[str, float] = {
+    "EURUSD": 1000.0,
+    MT5_SYMBOL_NAS100: 1000.0,
+    MT5_SYMBOL_SP500: 1000.0,
 }
 
 
@@ -200,8 +238,17 @@ def _conversion_series(data_dir: Path, start: str, end: str) -> pd.Series:
     return series[~series.index.duplicated(keep="first")]
 
 
-def _price_unit_value(symbol: str, timestamp: Any, conversion: pd.Series | None) -> float:
+def _price_unit_value(
+    symbol: str, timestamp: Any, conversion: pd.Series | None, account_currency: str = "USD"
+) -> float:
+    """PnL-Unit-Value in Account-Währung (Bug-1-Fix: nur EUR-Cases konvertieren).
+
+    USD-Accounts brauchen keine EURUSD-Konvertierung (contract pur);
+    EUR-Accounts (NAS100) konvertieren USD-Ergebnis via last-known EURUSD-Rate.
+    """
     contract_size = MT5_CONTRACT_SIZES.get(symbol, 1.0)
+    if str(account_currency).upper() != "EUR":
+        return contract_size
     if conversion is None or conversion.empty:
         return contract_size
     ts = pd.Timestamp(timestamp)
@@ -209,7 +256,11 @@ def _price_unit_value(symbol: str, timestamp: Any, conversion: pd.Series | None)
         ts = ts.tz_localize("UTC")
     else:
         ts = ts.tz_convert("UTC")
-    pos = conversion.index.searchsorted(ts)
+    # Bug-4-Fix: last-known Rate (side='right'-1) statt nächster Rate —
+    # bei Lücken (00:00/00:05, Anfrage 00:02) gilt 1.10, nicht 1.20.
+    pos = conversion.index.searchsorted(ts, side="right") - 1
+    if pos < 0:
+        pos = 0
     if pos >= len(conversion):
         pos = len(conversion) - 1
     rate = float(conversion.iloc[pos])
@@ -243,10 +294,31 @@ def _opposite_side_series(frame: pd.DataFrame, side: str, field: str) -> pd.Seri
 
 
 def _round_mt5_lots(symbol: str, lots: float) -> float:
+    """MT5-Lot-Rundung + Broker-Clamp (.mq5 Z.391-393: floor, max(min), min(max))."""
     step = MT5_LOT_STEPS.get(symbol, 0.0)
     if step <= 0:
-        return max(lots, 0.0)
-    return max(math.floor((lots / step) + 1e-12) * step, 0.0)
+        floored = max(lots, 0.0)
+    else:
+        floored = max(math.floor((lots / step) + 1e-12) * step, 0.0)
+    min_lot = MT5_MIN_LOTS.get(symbol)
+    max_lot = MT5_MAX_LOTS.get(symbol)
+    if min_lot is not None and floored > 0:
+        floored = max(floored, min_lot)
+    elif min_lot is not None and floored <= 0 and lots > 0:
+        # MT5 MathMax(min): auch sub-minimale positive Roh-Lots werden auf min angehoben.
+        floored = min_lot
+    if max_lot is not None:
+        floored = min(floored, max_lot)
+    return floored
+
+
+def _mt5_raw_lots(symbol: str, fixed_risk_amount: float, stop_distance: float) -> float:
+    """MT5-Roh-Lots (.mq5 Z.389: (Risk/dist)*(tick_size/tick_val))."""
+    tick_size = MT5_TICK_SIZES.get(symbol, 1.0)
+    tick_value = MT5_TICK_VALUES.get(symbol, 1.0)
+    if stop_distance <= 0 or tick_value <= 0:
+        return 0.0
+    return (float(fixed_risk_amount) / float(stop_distance)) * (float(tick_size) / float(tick_value))
 
 
 def _build_trades(
@@ -288,7 +360,11 @@ def _build_trades(
         side = str(direction.iloc[int(entry_index)] if int(entry_index) < len(direction) else "LONG").upper()
         if side != "SHORT":
             side = "LONG"
-        entry_price = _side_price(entry_row, side, "close")
+        # Bug-3a-Fix (MT5-First-Tick-Näherung, Audit-belegt): Market-Fills zum
+        # Bar-Open der Fill-/Exit-Bar (First Tick ≈ Open). LONG-Entry=Ask-Open
+        # (Bid+Spread), SHORT-Entry=Bid-Open; Time-Exit LONG=Bid-Open,
+        # SHORT=Ask-Open (=Bid+Spread). _side/_opposite_side wählen ask/bid.
+        entry_price = _side_price(entry_row, side, "open")
         stop_loss = signal_stop_loss
         signal_stop_distance = (
             stop_distance_series.iloc[int(entry_index)]
@@ -309,28 +385,39 @@ def _build_trades(
 
         exit_index = int(exit_indices[exit_cursor])
         exit_reason = "signal"
-        exit_price = _opposite_side_price(df.iloc[exit_index], side, "close")
+        exit_price = _opposite_side_price(df.iloc[exit_index], side, "open")
 
         if pd.notna(stop_loss):
             stop = float(stop_loss)
+            # Bug-2-Fix: Suche ab fill_index (Broker-Stop ist ab Fill aktiv).
+            # Fill-Bar-Annahme: Close-seitige Ausführungsordnung (Signal-Close
+            # -> Fill-Next-Bar), daher Stop-Prüfung inkl. Fill-Bar (MT5-Parity).
             if side == "LONG":
-                lows = _opposite_side_series(df, side, "low").iloc[fill_index + 1 : exit_index + 1]
+                lows = _opposite_side_series(df, side, "low").iloc[fill_index : exit_index + 1]
                 hit = lows[lows <= stop]
             else:
-                highs = _opposite_side_series(df, side, "high").iloc[fill_index + 1 : exit_index + 1]
+                highs = _opposite_side_series(df, side, "high").iloc[fill_index : exit_index + 1]
                 hit = highs[highs >= stop]
             if not hit.empty:
                 exit_index = int(hit.index[0])
                 exit_price = stop
                 exit_reason = "stop_loss"
 
+        account_currency = str(case.get("account_currency", "USD"))
+        symbol = str(case["symbol"])
         risk_stop_distance = abs(entry_price - float(stop_loss)) if pd.notna(stop_loss) else entry_price * 0.02
-        risk_unit_value = _price_unit_value(str(case["symbol"]), entry_row["timestamp"], conversion)
-        qty = fixed_risk_amount / (risk_stop_distance * risk_unit_value) if risk_stop_distance > 0 else equity / entry_price
-        qty = _round_mt5_lots(str(case["symbol"]), qty)
+        # Bug-1-Fix: Konvertierung nur für EUR-Accounts (USD: contract pur).
+        risk_unit_value = _price_unit_value(symbol, entry_row["timestamp"], conversion, account_currency)
+        # Bug-3b-Fix: MT5-Tick-Sizing (.mq5 Z.389) + Broker-Clamp, statt
+        # contract/rate-Näherung (für USD identisch, für NAS100/EUR belegt:
+        # Tick-statisch 31 Lots wie XLSX statt 37 via contract/rate).
+        if risk_stop_distance > 0:
+            qty = _round_mt5_lots(symbol, _mt5_raw_lots(symbol, fixed_risk_amount, risk_stop_distance))
+        else:
+            qty = _round_mt5_lots(symbol, equity / entry_price if entry_price > 0 else 0.0)
         if qty <= 0:
             continue
-        pnl_unit_value = _price_unit_value(str(case["symbol"]), df.iloc[exit_index]["timestamp"], conversion)
+        pnl_unit_value = _price_unit_value(symbol, df.iloc[exit_index]["timestamp"], conversion, account_currency)
         pnl = (exit_price - entry_price) * qty * pnl_unit_value if side == "LONG" else (entry_price - exit_price) * qty * pnl_unit_value
         exit_time = _to_iso(df.iloc[exit_index]["timestamp"])
         trade = Trade(
@@ -361,6 +448,9 @@ def _build_trades(
                 "contract_size": MT5_CONTRACT_SIZES.get(str(case["symbol"]), 1.0),
                 "risk_unit_value": round(risk_unit_value, 6),
                 "pnl_unit_value": round(pnl_unit_value, 6),
+                "tick_size": MT5_TICK_SIZES.get(symbol, 1.0),
+                "tick_value": MT5_TICK_VALUES.get(symbol, 1.0),
+                "account_currency": account_currency,
             },
         )
         trades.append(trade)

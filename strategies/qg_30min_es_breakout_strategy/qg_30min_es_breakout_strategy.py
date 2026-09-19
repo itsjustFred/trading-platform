@@ -16,9 +16,14 @@ STRATEGY_META = {
         "- Original nutzt Stop-Orders (`strategy.entry(..., stop=...)`).\n"
         "- Der vectorbt-Adapter arbeitet signalbasiert mit Next-Open-Ausfuehrung; "
         "die Konvertierung bildet daher die Signal-Logik nach, aber keine intrabar Stop-Order-Fills.\n"
+        "- Fade-Semantik direkt aus dem Pine verifiziert: Long bei ADX < 30 und "
+        "close < breakout_long, Short bei ADX > 30 und close < breakout_short; "
+        "beide Level nutzen |open - low| "
+        "(breakout_short = high - FRACT * |open - low|).\n"
+        "- Time-Exit 14:55 NY wie im Pine.\n"
         "- Original hat keinen expliziten Stop-Loss. Fuer robustes Risk-Sizing und begrenzte Tail-Risiken "
         "nutzt die Konvertierung einen technischen Schutz-Stop aus dem Entry-Bar "
-        "(Long=low, Short=high) und schliesst bei Stop-Hit."
+        "(Long=low, Short=high) und schliesst bei Stop-Hit (dokumentierte Plattform-Erweiterung)."
     ),
     "parameters": {
         "fract": 3.3,
@@ -29,7 +34,7 @@ STRATEGY_META = {
         "market_close_hour_ny": 15,
         "market_close_minute_ny": 0,
         "forced_exit_hour_ny": 14,
-        "forced_exit_minute_ny": 30,
+        "forced_exit_minute_ny": 55,
     },
     "tags": {
         "type": ["breakout", "intraday"],
@@ -96,7 +101,7 @@ def generate_signals(df: pd.DataFrame, params: dict):
     market_close_hour = int(params.get("market_close_hour_ny", 15))
     market_close_minute = int(params.get("market_close_minute_ny", 0))
     forced_exit_hour = int(params.get("forced_exit_hour_ny", 14))
-    forced_exit_minute = int(params.get("forced_exit_minute_ny", 30))
+    forced_exit_minute = int(params.get("forced_exit_minute_ny", 55))
 
     close = df["close"].astype(float)
     high = df["high"].astype(float)
@@ -112,7 +117,7 @@ def generate_signals(df: pd.DataFrame, params: dict):
     adx, plus_di, minus_di = _calc_adx(high, low, close, adx_period, adx_smooth)
 
     breakout_long = low + fract * (open_ - low).abs()
-    breakout_short = high - fract * (high - open_).abs()
+    breakout_short = high - fract * (open_ - low).abs()
 
     ny_minutes = timestamps_ny.dt.hour * 60 + timestamps_ny.dt.minute
     open_minutes = market_open_hour * 60 + market_open_minute
@@ -167,19 +172,24 @@ def generate_signals(df: pd.DataFrame, params: dict):
         if not can_trade:
             continue
 
-        # Breakout semantics (Cleanup #35): a long requires the close to break
-        # ABOVE the long breakout level, a short requires the close to break
-        # BELOW the short breakout level. The ADX regime gate directs the
-        # breakout side: trending market (ADX > threshold) takes longs,
-        # non-trending (ADX <= threshold) takes shorts — matching the original
-        # Pine stop-order logic where the level was entered in the breakout
-        # direction.
+        # Fade-Semantik aus dem Pine (Zeilen 62-66): Long-Seite handelt die
+        # nicht-trendige Phase (ADX < 30), Short-Seite die trendige (ADX > 30);
+        # BEIDE Seiten triggern auf close UNTER dem jeweiligen Level
+        # (kein Breakout nach oben). ADX == 30 exakt handelt keine Seite.
+        # Warmup: Pine-ADX ist auf den ersten Bars na (kein Trade); die
+        # RMA-Naeherung mit fillna(0) wuerde sonst frueh feuern.
         adx_breakout_threshold = 30.0
-        enter_long = bool(adx.iloc[i] > adx_breakout_threshold) and bool(
-            close.iloc[i] >= breakout_long.iloc[i]
+        adx_v = adx.iloc[i]
+        warmed_up = i >= adx_period + adx_smooth and pd.notna(adx_v)
+        enter_long = (
+            warmed_up
+            and bool(adx_v < adx_breakout_threshold)
+            and bool(close.iloc[i] < breakout_long.iloc[i])
         )
-        enter_short = bool(adx.iloc[i] <= adx_breakout_threshold) and bool(
-            close.iloc[i] <= breakout_short.iloc[i]
+        enter_short = (
+            warmed_up
+            and bool(adx_v > adx_breakout_threshold)
+            and bool(close.iloc[i] < breakout_short.iloc[i])
         )
 
         if enter_long:

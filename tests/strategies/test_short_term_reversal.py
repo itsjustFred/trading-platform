@@ -4,8 +4,12 @@ Regression-Test fuer Strategie: Short Term Reversal
 Smoke-Test: stellt sicher, dass zukuenftige Core-Updates die Strategie-Logik
 nicht unbemerkt brechen. Getestet auf einem festen, kurzen Zeitraum.
 
-Validiert am: 2026-03-08
+Validiert am: 2026-09-09
 Symbol/Timeframe: AAPL / 1d
+
+Historie: Erwartungen am 2026-09-09 neu kalibriert (alter Profit 2441.70
+mit erfundenem RSI14<35-Filter, ATR-Stop und 10-Bar-Hold; Quelle: kein
+RSI, fixer 8-%-Stop, 5-Bar-Hold, +5-%-Target).
 """
 
 import math
@@ -26,7 +30,7 @@ TEST_END = "2025-09-30"
 TEST_SYMBOL = "AAPL"
 TEST_TIMEFRAME = "1d"
 EXPECTED_TRADE_COUNT = 1
-EXPECTED_NET_PROFIT = 2441.70
+EXPECTED_NET_PROFIT = 477.06
 
 
 @pytest.fixture(scope="module")
@@ -74,3 +78,52 @@ class TestStrategyRegression:
                 f"Trade {trade.id}: Risk {risk_pct*100:.2f}% ueberschreitet Limit von 1.5%"
             )
             equity += trade.pnl
+
+
+def _load_strategy():
+    import importlib.util
+    from pathlib import Path
+
+    spec = importlib.util.spec_from_file_location(
+        "str", str(Path(STRATEGY_PATH))
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class TestSourceFidelity:
+    def test_no_rsi_no_atr_fixed_stop_and_hold_5(self):
+        import numpy as np
+        import pandas as pd
+
+        mod = _load_strategy()
+        # Konstruierte Bahn: Crash an Tag 50 (-6 %), dann Seitwaertsdrift.
+        n = 120
+        close = pd.Series(np.linspace(100, 101, n))
+        close.iloc[50] = 94.0
+        df = pd.DataFrame(
+            {
+                "close": close,
+                "high": close * 1.002,
+                "low": close * 0.998,
+                "open": close.shift(1).fillna(close.iloc[0]),
+                "volume": 1_000_000.0,
+            }
+        )
+        entries, exits, ind, _ = mod.generate_signals(df, {})
+        assert "RSI" not in ind, "Quelle hat keinen RSI"
+        assert "ATR" not in ind, "Quelle hat keinen ATR"
+        entry_idx = entries[entries].index
+        assert len(entry_idx) >= 1
+        first = entry_idx[0]
+        # Fixer 8-%-Stop ab Entry-Close.
+        assert ind["sl_price"].iloc[first] == (
+            __import__("pytest").approx(close.iloc[first] * 0.92)
+        )
+        # Time-Exit spaetestens 5 Bars nach Entry (kein Profit/Stop davor:
+        # Bahn driftet nur +~0.01/Bar).
+        exit_idx = exits[exits].index
+        assert len(exit_idx) >= 1
+        assert exit_idx[0] - first <= 5
+        assert ind["bars_held_at_exit"].iloc[exit_idx[0]] <= 5

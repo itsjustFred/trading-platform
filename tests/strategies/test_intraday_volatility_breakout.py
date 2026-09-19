@@ -322,8 +322,81 @@ def test_session_timezone_uses_dst_aware_server_day():
     _, _, indicators, _ = mod.generate_signals(df, params)
 
     entry_open = indicators["entry_open"]
-    assert pd.isna(entry_open.iloc[0])
+    # MT5 parity (iBarShift with exact=false): the entry open is the NEAREST
+    # bar to 16:30 server time per day, not the first bar at/after it. Each
+    # synthetic day holds a single bar, which is trivially its own nearest
+    # bar — even the 15:30 (pre-entry) bar resolves to its own open.
+    assert entry_open.iloc[0] == 1.0
     assert entry_open.iloc[1] == 1.0
+
+
+def test_entry_open_uses_nearest_bar_on_gaps():
+    mod = _load_module()
+    idx = pd.to_datetime(
+        [
+            "2024-01-02T16:28:00Z",
+            "2024-01-02T16:29:00Z",
+            # 16:30 and 16:31 bars missing (data gap, cf. 2026-04-28 USATECH)
+            "2024-01-02T16:32:00Z",
+            "2024-01-02T16:33:00Z",
+        ],
+        utc=True,
+    )
+    df = pd.DataFrame(
+        {
+            "timestamp": idx,
+            "open": [1.0, 2.0, 3.0, 4.0],
+            "high": [1.0, 2.0, 3.0, 4.0],
+            "low": [1.0, 2.0, 3.0, 4.0],
+            "close": [1.0, 2.0, 3.0, 4.0],
+        }
+    )
+    params = mod.STRATEGY_META["parameters"].copy()
+    params.update(
+        {
+            "entry_time": "16:30",
+            "max_entry_time": "18:05",
+            "exit_time": "22:55",
+        }
+    )
+
+    _, _, indicators, _ = mod.generate_signals(df, params)
+
+    # Nearest to 16:30 is 16:29 (1 min away beats 16:32 at 2 min) — matches
+    # MT5 iBarShift, which picked the 16:29 open on 2026-04-28 USATECH.
+    assert (indicators["entry_open"] == 2.0).all()
+
+
+def test_entry_open_tie_prefers_earlier_bar():
+    mod = _load_module()
+    idx = pd.to_datetime(
+        [
+            "2024-01-02T16:29:00Z",
+            "2024-01-02T16:31:00Z",
+        ],
+        utc=True,
+    )
+    df = pd.DataFrame(
+        {
+            "timestamp": idx,
+            "open": [1.0, 3.0],
+            "high": [1.0, 3.0],
+            "low": [1.0, 3.0],
+            "close": [1.0, 3.0],
+        }
+    )
+    params = mod.STRATEGY_META["parameters"].copy()
+    params.update(
+        {
+            "entry_time": "16:30",
+            "max_entry_time": "18:05",
+            "exit_time": "22:55",
+        }
+    )
+
+    _, _, indicators, _ = mod.generate_signals(df, params)
+
+    assert (indicators["entry_open"] == 1.0).all()
 
 
 # ---------------------------------------------------------------------------
@@ -344,6 +417,50 @@ def test_short_only_blocks_long_breakouts():
     active_dirs = indicators["direction"].dropna()
     assert not entries.any()
     assert active_dirs.empty
+
+
+def test_reverse_long_only_fades_lower_breakout():
+    # MT5 parity: EvaluateReverseSignals checks the direction permission
+    # against the side actually traded — long_only + reverse may only take
+    # the fade LONG on lower-level touches, never a SHORT on upper touches.
+    mod = _load_module()
+    df = _two_day_breakout_df(direction="up")
+    params = mod.STRATEGY_META["parameters"].copy()
+    params["trade_direction"] = "long_only"
+    params["reverse_mode"] = True
+    params["use_candle_close"] = False
+    params["entry_time"] = "16:30"
+    params["max_entry_time"] = "18:00"
+    params["exit_time"] = "20:00"
+    params["atr_regime_factor"] = 2.0
+    params["atr_period"] = 1
+    params["atr_long_period"] = 1
+
+    entries, _, indicators, _ = mod.generate_signals(df, params)
+    active_dirs = indicators["direction"].dropna()
+    assert not entries.any()
+    assert active_dirs.empty
+
+
+def test_reverse_short_only_fades_upper_breakout():
+    # Mirror: short_only + reverse fades the upper breakout into a SHORT.
+    mod = _load_module()
+    df = _two_day_breakout_df(direction="up")
+    params = mod.STRATEGY_META["parameters"].copy()
+    params["trade_direction"] = "short_only"
+    params["reverse_mode"] = True
+    params["use_candle_close"] = False
+    params["entry_time"] = "16:30"
+    params["max_entry_time"] = "18:00"
+    params["exit_time"] = "20:00"
+    params["atr_regime_factor"] = 2.0
+    params["atr_period"] = 1
+    params["atr_long_period"] = 1
+
+    entries, _, indicators, _ = mod.generate_signals(df, params)
+    active_dirs = indicators["direction"].dropna()
+    assert entries.any()
+    assert (active_dirs == "SHORT").all()
 
 
 # ---------------------------------------------------------------------------

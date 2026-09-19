@@ -1,27 +1,29 @@
 # QG-30Min ES Breakout Strategy
 
 ## Quelle
-- Original: Pine Script v6 (`rndm_stuff/QG-30Min_ES_Breakout_Strategy.md`), Kommentar-Link: `https://discord.com/channels/1230977283888648315/1387506825603059762/1387506825603059762`
-- Konvertiert: 2026-05-04
+- Original: Pine Script v6 (`rndm_stuff/QG-30Min_ES_Breakout_Strategy.pine`), Kommentar-Link: `https://discord.com/channels/1230977283888648315/1387506825603059762/1387506825603059762`
+- Konvertiert: 2026-05-04, source-faithful Fix: 2026-09-09 (Fade-Semantik, Short-Level, Exit-Zeit direkt am Pine verifiziert)
 
 ## Kernlogik
 
 ### Entry
 - Trading-Fenster (New York): nur zwischen 08:00 und 15:00.
 - Maximal ein Trade pro NY-Tag (`trade_count == 0`).
-- Long-Filter: `ADX(45, smooth=5) > 30`.
-- Short-Filter: `ADX(45, smooth=5) > 30`.
-- Breakout-Levels:
+- ADX(45, smooth=5, Wilder-RMA) als Regime-Filter — Fade-Semantik wie im Pine:
+  - Long-Filter: `ADX < 30` (nicht-trendig).
+  - Short-Filter: `ADX > 30` (trendig).
+  - `ADX == 30` exakt handelt keine Seite.
+- Breakout-Levels (beide mit `|open - low|`):
   - `breakout_long = low + FRACT * abs(open - low)` mit `FRACT = 3.3`
-  - `breakout_short = high - FRACT * abs(high - open)` mit `FRACT = 3.3`
-- Entry-Bedingungen (wie im Original):
-  - Long: `can_trade and (adx > 30) and (close > breakout_long)`
+  - `breakout_short = high - FRACT * abs(open - low)` mit `FRACT = 3.3`
+- Entry-Bedingungen (wie im Original — BEIDE Seiten unter dem Level):
+  - Long: `can_trade and (adx < 30) and (close < breakout_long)`
   - Short: `can_trade and (adx > 30) and (close < breakout_short)`
+- Warmup: Entries erst nach `adx_period + adx_smooth` Bars (Pine-ADX ist auf den ersten Bars `na` und handelt dort nicht).
 
 ### Exit
-- Stop-Loss-Exit (Plattform-Erweiterung): Exit bei Stop-Hit.
-- Time-Exit: Offene Position wird zum Session-Ende geschlossen.
-  Wegen Next-Open-Ausführung im vectorbt-Adapter wird das Exit-Signal auf 14:30 NY gesetzt, damit der Fill auf der 15:00-NY-Bar liegt (nahe am Pine-Ziel 14:55).
+- Stop-Loss-Exit (Plattform-Erweiterung, dokumentiert): Exit bei Stop-Hit (`stop_loss`).
+- Time-Exit: Offene Position wird per Signal um 14:55 NY geschlossen (`time_exit_1455_ny`, wie `exit_time` im Pine). Wegen Next-Open-Ausführung im vectorbt-Adapter liegt der Fill auf der Folge-Bar.
 
 ### Stop-Loss
 - Originalstrategie definiert keinen expliziten Stop-Loss.
@@ -43,7 +45,7 @@ Nicht vorhanden.
 | ADX (Wilder) | Smooth (RMA auf DX) | 5 |
 | Breakout | Fractal Factor (`FRACT`) | 3.3 |
 | Session-Filter | Marktfenster (NY) | 08:00-15:00 |
-| Session-Exit-Signal | Time Exit Trigger (NY) | 14:30 (Fill auf 15:00-Bar) |
+| Session-Exit | Time Exit Trigger (NY) | 14:55 |
 
 ## Risk-Management
 - Stop-Distanz: statisch pro Entry-Bar (`low` bei Long, `high` bei Short)

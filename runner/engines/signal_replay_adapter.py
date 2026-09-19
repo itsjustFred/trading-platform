@@ -611,12 +611,11 @@ class SignalReplayAdapter:
                 signal_metadata=dict(effective_signal.metadata),
                 last_checked_at=fill_time,
             )
-            if opened is not None:
-                open_positions[signal.symbol] = opened
+            open_positions[signal.symbol] = opened
             emit(10.0 + ((index / total_signals) * 80.0), _REPLAY_PROGRESS_MESSAGE)
 
         emit(92.0, "Finalizing open positions...")
-        for symbol, position in list(open_positions.items()):
+        for symbol, position in open_positions.items():
             frame = frames[symbol]
             protected_exit = self._process_protective_exits(
                 position=position,
@@ -863,6 +862,7 @@ class SignalReplayEngine:
             except (ValueError, OSError):
                 continue
             frame.columns = [str(column).lower() for column in frame.columns]
+            frame = contract.normalize_ohlcv_frame(frame)
             if "timestamp" not in frame.columns:
                 continue
             frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")

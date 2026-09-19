@@ -113,13 +113,14 @@ Hinweis: Die EA-Logik berechnet ATR und Regime-Filter immer auf `PERIOD_D1`, una
 | MQL5-Konstrukt | Python-Äquivalent | Hinweis |
 |----------------|-------------------|---------|
 | `iATR(_Symbol, PERIOD_D1, period)` | `pandas_ta.atr(df["high"], df["low"], df["close"], length=period)` auf Daily-Resampling, dann auf Haupt-Timeframe forward-fillen. | ATR vom Vortages-Bar (Shift=1) verwenden. |
-| `iOpen(_Symbol, PERIOD_M1, shift)` | `df.loc[entry_time, "open"]` | Innerhalb des Backtests: `entry_time` ist der Timestamp zu `Entry_Time`. |
+| `iOpen(_Symbol, PERIOD_M1, shift)` | Nächste M1-Bar zur `Entry_Time` pro Tag (Ties → frühere Bar) | MT5-`iBarShift(..., exact=false)`-Parität: fehlt die Entry-Bar (Datenlücke), wird die zeitlich nächste Bar genommen — verifiziert am 2026-04-28 USATECH (16:30/16:31 fehlten, MT5 nutzte 16:29). |
 | `iClose(_Symbol, Confirmation_Timeframe, 1)` | `df["close"].shift(1)` auf dem Resampled Confirmation-DataFrame; oder direkt `df["close"]` wenn Haupt-TF = Confirmation-TF. | In vektorbasiertem Backtest: Signal triggert am Close der vorherigen Bar. |
 | `Use_Candle_Close` | Bestätigungs-Logik als separate boolesche Serie: `signal_price = confirmation_df["close"].shift(1)` | Nur ein Signal pro neuer Confirmation-Bar erlauben. |
 | `IsInEntryWindow()` | `(df.index.hour * 60 + df.index.minute >= entry_mins) & (df.index.hour * 60 + df.index.minute < max_entry_mins)` | Tägliche Maske. |
 | `ShouldClosePosition()` / `Exit_Time` | `(df.index.hour * 60 + df.index.minute >= exit_mins)` als Exit-Signal. | Verwende `pd.Series(False, index=df.index)` als Basis-Exit und setze Exit-Bar auf True. |
 | `PositionSelect(_Symbol)` | In vectorbt: Engine verwaltet Position; in `generate_signals` nur Entry/Exit-Booleans liefern. Maximal ein Trade pro Tag via `~entries.cumsum().groupby(df.index.date).diff().gt(0)` oder ähnlich sicherstellen. | `g_trade_taken`-Flag mappen auf „nur erster Entry-Signal pro Tag". |
 | `Reverse_Mode` | Vertausche Long/Short-Bedingungen: `entries_long = lower_hit, entries_short = upper_hit` statt umgekehrt. | Einfache boolean-Flip. |
+| `Trade_Direction` + `Reverse_Mode` | Richtungsfilter wird auf die finale Seite nach dem Reverse-Mapping angewandt (MT5 prüft `Trade_Direction` gegen die tatsächlich gehandelte Seite). | Vor dem Fix wurde vor dem Swap gefiltert — bei `long_only`+Reverse entstanden fälschlich SHORTs statt Fade-LONGs. |
 | `Fixed_Risk_Amount` / `CalculateLotSize` | Im Adapter via `sl_stop` / `size`-Parameter oder manuell: `size = Fixed_Risk_Amount / (sl_distance * (tick_value / tick_size))` | In `vectorbt` wird Sizing oft über `size` und `sl_stop` gesteuert. |
 | `Magic_Number` | Strategie-Name in `STRATEGY_META["name"]"` | Dient nur zur Zuordnung/Filterung. |
 | `ParseTime("HH:MM")` | Python `datetime.strptime` oder direkt als `params["entry_hour"], params["entry_min"]` | Parameter als ints übergeben. |

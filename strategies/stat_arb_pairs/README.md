@@ -21,14 +21,15 @@ Signal: `ZScore <= -2.0`.
 Der Z-Score wird auf kumulierten Log-Returns ueber ein `lookback` von 60 Bars berechnet.
 
 ### Exit
-Vollausstieg bei einem von drei Events:
-1. Stop-Loss-Hit auf dem ATR-Schutzstop.
-2. Mean-Reversion-Ziel: `ZScore >= -0.5`.
-3. Statistischer Fail-Stop: `ZScore <= -4.0`.
+Vollausstieg bei einem von zwei quellenbasierten Events:
+1. Mean-Reversion-Ziel: `ZScore >= -0.5` (Quelle: `exit_zscore`).
+2. Statistischer Fail-Stop: `ZScore <= -4.0` (Quelle: `stop_zscore`).
+Opt-in (default OFF, keine Quelllogik): `use_atr_stop=true` fuer zusaetzlichen Stop-Loss-Hit auf dem ATR-Schutzstop.
 
 ### Stop-Loss
-Retrofit fuer den Agent-Standard: ATR-basierter Schutzstop beim Entry.
-Formel: `sl_price = entry_close - ATR(14) * 2.0`.
+Kein Stop-Loss im Standard (die Quelle nutzt einen z-Score-Fail-Stop, keinen ATR-Stop).
+Opt-in via `use_atr_stop=true`: `sl_price = entry_close - ATR_Wilder(14) * 2.0`.
+Position Sizing ohne Stop faellt auf die Engine-Fallbacks zurueck (2-%-Default).
 
 ### Trailing Stop (falls vorhanden)
 Kein Trailing Stop implementiert.
@@ -43,12 +44,11 @@ Keine Partial Exits implementiert.
 | Entry Z-Score | Threshold | -2.0 |
 | Exit Z-Score | Threshold | -0.5 |
 | Stop Z-Score | Threshold | -4.0 |
-| ATR Stop | Period | 14 |
-| ATR Stop | Multiplier | 2.0 |
+| ATR Stop (Opt-in) | Wilder Period / Multiplier | 14 / 2.0 |
 
 ## Risk-Management
-- Stop-Distanz: ATR-basiert
-- Position Sizing: Runner berechnet die Positionsgroesse ueber `--risk-pct` und `sl_price`
+- Stop-Distanz: keine im Standard (Opt-in ATR)
+- Position Sizing: Runner berechnet die Positionsgroesse ueber `--risk-pct` (Faellt ohne `sl_price`/ATR auf den 2-%-Default zurueck)
 - Empfohlenes `--risk-pct`: 0.01 (1 % pro Trade)
 
 ## Hinweis zur Vereinfachung

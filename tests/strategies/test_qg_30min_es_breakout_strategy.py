@@ -26,17 +26,22 @@ STRATEGY_PATH = str(
     / "qg_30min_es_breakout_strategy.py"
 )
 
-TEST_START = "2006-01-02"
-TEST_END = "2006-03-31"
+# Window retargeted: the old window (2006-01-02..2006-03-31) has no local
+# coverage (XAUUSD/1h starts 2025-06-01) and is unrunnable.
+TEST_START = "2025-06-02"
+TEST_END = "2025-09-30"
 TEST_SYMBOL = "XAUUSD"
 TEST_TIMEFRAME = "1h"
 
-# Golden-master regenerated per Decision Record #17 (Cleanup #35): the entry
-# conditions were corrected from the inverted fade semantics (enter_long on
-# close < breakout_long with adx < 30) to breakout semantics (enter_long on
-# close >= breakout_long with adx > 30). Old values: 62 trades / +9408.30.
-EXPECTED_TRADE_COUNT = 42
-EXPECTED_NET_PROFIT = -3679.87
+# Golden-master re-baselined 2026-09-09 for the Pine-verified fade semantics
+# (long: adx < 30 & close < breakout_long; short: adx > 30 & close <
+# breakout_short with breakout_short = high - FRACT*|open-low|; exit 14:55 NY).
+# The 42-trade/-3679.87 golden encoded the inverted breakout semantics from
+# Cleanup #35 (long adx > 30 & close >= level), which contradicted the Pine.
+# Older values before that: 62 trades / +9408.30 (fade era, different
+# stop/exit handling).
+EXPECTED_TRADE_COUNT = 72
+EXPECTED_NET_PROFIT = 369.39
 
 
 @pytest.fixture(scope="module")

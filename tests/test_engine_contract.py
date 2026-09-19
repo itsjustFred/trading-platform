@@ -39,6 +39,7 @@ from runner.engines.contract import (
     EngineStatsKeys,
     apply_date_filter,
     flag_missing_intrabar,
+    normalize_ohlcv_frame,
     parse_date_bound,
     resolve_intrabar_timeframe,
     resolve_same_bar_exit,
@@ -834,7 +835,10 @@ class TestSizingContract:
         _write_ohlcv(tmp_path, "PARITY", "1h", data)
 
         strategy = tmp_path / "sl_tp_strategy.py"
-        _sl_tp_strategy(strategy, stop=103.9, take_profit=200.0)
+        # P3a: stop must sit on the valid side of the ~102.0 entry — a
+        # wrong-side stop (e.g. the previous 103.9) is correctly dropped by
+        # the inverted-stop guard, which would void this leverage-cap test.
+        _sl_tp_strategy(strategy, stop=100.0, take_profit=200.0)
 
         cfg = _config(
             tmp_path,
@@ -1611,3 +1615,47 @@ class TestPynecoreRestatementContainment:
                 _normalize_trade_exits(trades)
                 assert trades[0].exits[-1].price == pytest.approx(sl)
                 assert trades[0].exits[-1].reason == "stop_loss"
+
+
+def test_normalize_ohlcv_frame_fills_missing_and_all_nan_from_bid():
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=4, freq="h", tz="UTC"),
+            "high": [np.nan] * 4,  # all-NaN canonical (index feeds)
+            "low": [1.0, 1.1, 1.2, 1.3],  # healthy canonical wins
+            "bid_high": [2.0, 2.1, 2.2, 2.3],
+            "bid_low": [9.0, 9.1, 9.2, 9.3],
+            "bid_close": [3.0, np.nan, 3.2, 3.3],  # partial NaN stays NaN (no close col)
+            "ask_high": [2.5, 2.6, 2.7, 2.8],  # ask_* must survive
+        }
+    )
+    out = normalize_ohlcv_frame(frame)
+    assert out["high"].tolist() == [2.0, 2.1, 2.2, 2.3]
+    assert out["low"].tolist() == [1.0, 1.1, 1.2, 1.3]
+    assert "open" not in out.columns  # no bid_open -> not fabricated
+    assert out["ask_high"].tolist() == [2.5, 2.6, 2.7, 2.8]
+
+
+def test_normalize_ohlcv_frame_does_not_mutate_input():
+    # C-1: the helper works on a copy; callers must use the return value.
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=2, freq="h", tz="UTC"),
+            "high": [np.nan, np.nan],
+            "bid_high": [2.0, 2.1],
+        }
+    )
+    snapshot = frame.copy(deep=True)
+    out = normalize_ohlcv_frame(frame)
+    pd.testing.assert_frame_equal(frame, snapshot)
+    assert out["high"].tolist() == [2.0, 2.1]
+
+
+def test_intrabar_resolution_equal_to_base_resolves_to_none():
+    """F8 boundary: an intrabar frame must be strictly FINER than the main
+    timeframe — requesting the same granularity ("1h" intrabar on "1h"
+    data) resolves to no intrabar walk, never to a self-referential window."""
+    assert resolve_intrabar_timeframe("1h", "1h") is None
+    assert resolve_intrabar_timeframe("1d", "1d") is None
+    assert resolve_intrabar_timeframe("1h", "1m") == "1m"
+    assert resolve_intrabar_timeframe("1h", "4h") is None

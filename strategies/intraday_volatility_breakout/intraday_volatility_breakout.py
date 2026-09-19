@@ -315,12 +315,20 @@ def generate_signals(df: pd.DataFrame, params: dict):
     else:
         regime_ok = daily_atr_short_ffill > threshold
 
-    # --- Entry open price (first bar >= entry_time per day) -----------------
-    past_entry = minute_of_day >= entry_minute
-    entry_open_eligible = open_.where(past_entry)
-    # Fix the entry open to the first eligible bar of the day so breakout levels
-    # do not drift with subsequent bars.
-    entry_open = entry_open_eligible.groupby(day.values).transform("first")
+    # --- Entry open price (nearest bar to entry_time per day) ---------------
+    # MT5 parity: iBarShift(_Symbol, PERIOD_M1, entry_time) with exact=false
+    # returns the NEAREST bar when the entry-time bar is missing (data gap),
+    # not the first bar at/after entry_time. Verified against MT5 logs
+    # (2026-04-28 USATECH: 16:30/16:31 bars missing -> MT5 used the 16:29
+    # open while first->= would use 16:32). Ties resolve to the earlier bar.
+    # When the 16:30 bar exists this is identical to first->=.
+    abs_delta = (minute_of_day - entry_minute).abs()
+    is_after = (minute_of_day > entry_minute).astype(int)
+    rank_key = abs_delta * 2 + is_after
+    best_rank = rank_key.groupby(day.values).transform("min")
+    entry_open = (
+        open_.where(rank_key == best_rank).groupby(day.values).transform("first")
+    )
 
     # --- Breakout levels & stop distance -------------------------------------
     upper_level = entry_open + daily_atr_ffill * atr_multiplier
@@ -396,15 +404,23 @@ def generate_signals(df: pd.DataFrame, params: dict):
         & (signal_price_short <= lower_level)
     )
 
-    # Trade direction
+    # Trade direction filter.
+    #
+    # MT5 parity: EvaluateBreakoutSignals / EvaluateReverseSignals check the
+    # direction permission against the side ACTUALLY traded, so the filter
+    # must apply after the reverse-mode mapping. (Filtering before the swap
+    # permits e.g. long_only+reverse to SHORT on upper hits, while MT5 only
+    # allows the fade LONG on lower hits.) With trade_direction="both" the
+    # order is irrelevant.
+    if reverse_mode:
+        long_candidates, short_candidates = (
+            short_candidates.copy(),
+            long_candidates.copy(),
+        )
     if trade_direction == "long_only":
         short_candidates = pd.Series(False, index=idx)
     elif trade_direction == "short_only":
         long_candidates = pd.Series(False, index=idx)
-
-    # Reverse mode (flip long / short)
-    if reverse_mode:
-        long_candidates, short_candidates = short_candidates.copy(), long_candidates.copy()
 
     # --- One trade per day ---------------------------------------------------
     any_candidate = long_candidates | short_candidates

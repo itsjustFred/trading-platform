@@ -89,6 +89,22 @@ class BacktestConfig(BaseModel):
     max_position_exposure_pct: float | None = Field(None, gt=0.0)
     max_leverage: float | None = Field(None, gt=0.0)
     modeling_resolution: str = "main_timeframe"
+    # Fill convention for signal-driven
+    # exits in bar engines. D4 (A-M1): the unified convention is
+    # Fill-zum-Trigger-Close — "close" (default) fills at the signal bar's
+    # close in every engine (native _close_position and vectorbt
+    # _resolve_exit_price with an unshifted exit leg). "open" fills at the
+    # signal bar's open — closer to MT5, which exits at the first tick
+    # inside the exit minute (~bar open) — and stays available as an
+    # explicitly configured opt-in. Stop-loss fills are unaffected (always
+    # the stop level, SHORT legs on the ask when spread/ask_ohlc applies).
+    signal_exit_fill: str = "close"
+    # Indicator warmup. When set (date
+    # string), market data is loaded from this earlier date so indicators
+    # needing history (e.g. daily ATR) are already warmed up at start_date.
+    # No orders are created and no signal exits fire before start_date; the
+    # equity curve starts at start_date. Empty (default) = legacy behavior.
+    warmup_start: str = ""
     data_dir: str = ""
     parameters: dict[str, Any] = Field(default_factory=dict)
 
@@ -114,6 +130,20 @@ class BacktestConfig(BaseModel):
             stacklevel=2,
         )
         return self.max_position_exposure_pct
+
+    @field_validator("signal_exit_fill")
+    @classmethod
+    def _validate_signal_exit_fill(cls, v: str) -> str:
+        # D4: the fill convention switch is load-bearing across all three
+        # bar engines — a typo ("clos", "OPEN ") silently fell through to
+        # close-fill everywhere (every reader tests `== "open"`). Normalize
+        # case/whitespace so "Close"/"OPEN" keep working, reject the rest.
+        normalized = str(v or "").strip().lower()
+        if normalized not in {"close", "open"}:
+            raise ValueError(
+                f"Invalid signal_exit_fill {v!r}, must be 'close' or 'open'"
+            )
+        return normalized
 
     @field_validator("timeframe")
     @classmethod

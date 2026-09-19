@@ -33,6 +33,7 @@ from runner.engines.base import (
 )
 from runner.engines._drawings import _normalize_drawings
 from runner.engines._shared import (
+    resolve_bar_spread,
     resolve_max_leverage as _resolve_max_leverage,
     resolve_max_position_exposure_pct as _resolve_max_position_exposure_pct,
     serialize_meta_value as _serialize_meta_value,
@@ -44,6 +45,135 @@ from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, Trad
 logger = logging.getLogger(__name__)
 
 IndicatorMap = dict[str, tuple[pd.Series, str]]
+
+#: Exit reasons that represent level fills (stop/TP). Their prices are the
+#: strategy's levels — not re-priced by the signal-exit convention, mirroring
+#: native _close_position (stop fills) and vectorbt (intrabar stop/TP legs).
+_LEVEL_EXIT_REASONS = frozenset({"stop_loss", "take_profit", "trailing_stop"})
+
+
+def _effective_load_start(config: BacktestConfig) -> str:
+    """A-H4 (D3): warmup_start extends the loaded window backwards for
+    indicator warmup, mirroring the native adapter."""
+    warmup_raw = str(getattr(config, "warmup_start", "") or "").strip()
+    return warmup_raw or config.start_date
+
+
+def _pyne_bar_spread(row: pd.Series, parameters: dict[str, Any] | None) -> float:
+    """A-H4 (D3): per-bar spread surcharge mirroring native _bar_spread."""
+    return resolve_bar_spread(row, (parameters or {}).get("spread_price_col"))
+
+
+def _gate_warmup_trades(trades: list[Trade], config: BacktestConfig) -> list[Trade]:
+    """A-H4 (D3): drop trades entered before start_date when warmup_start is
+    set — warmup bars feed indicators only, mirroring native TradeEngine.run
+    and the vectorbt warmup gate. No warmup configured: passthrough."""
+    warmup_raw = str(getattr(config, "warmup_start", "") or "").strip()
+    if not warmup_raw:
+        return trades
+    # A-M11 parity with native TradeEngine.run and the vectorbt gate: a
+    # warmup window without a parseable start_date must fail loudly — the
+    # previous passthrough silently traded the warmup bars here while the
+    # other engines refused the run.
+    trade_from = pd.to_datetime(config.start_date, utc=True, errors="coerce")
+    if pd.isna(trade_from):
+        raise ValueError(
+            "warmup_start is set but start_date "
+            f"({config.start_date!r}) is empty or unparseable — the "
+            "warmup gate cannot derive trade_from"
+        )
+    kept: list[Trade] = []
+    for trade in trades:
+        entry_ts = _normalize_trade_timestamp(trade.entry_time)
+        if entry_ts is not None and entry_ts < trade_from:
+            continue
+        kept.append(trade)
+    return kept
+
+
+def _apply_fill_parity(
+    trades: list[Trade], df: pd.DataFrame, config: BacktestConfig, parameters: dict[str, Any]
+) -> None:
+    """A-H4 (D3): post-hoc fill parity with the native/vectorbt convention.
+
+    The PyneCore engine reports fills without spread/ask awareness and
+    without a signal-exit-fill convention. This re-prices deterministically
+    from the loaded OHLCV frame, mirroring native semantics exactly:
+
+    - LONG entries lift the ask (bar open + ``spread_price_col`` spread);
+      SHORT entries hit the bid (unchanged). Only applied when the spread
+      column is configured AND the entry bar is locatable — otherwise the
+      engine price stands (default off = unchanged behavior).
+    - Non-level exits (anything but stop_loss/take_profit/trailing_stop)
+      follow ``signal_exit_fill``: "close" (default) fills at the exit bar's
+      close, "open" at its open; SHORT open-exits pay the spread (ask).
+      Level exits keep the engine price (stop-market fills at the level).
+    - Touched legs get their pnl recomputed from the new prices so
+      trade.pnl stays consistent ahead of risk sizing.
+
+    Known limitation (documented, not silent): stop/TP TRIGGER TIMING stays
+    engine-internal — PyneCore detects triggers on its own feed without an
+    ask-side distinction, so ask_ohlc cannot move a stop earlier post-hoc.
+    Price parity holds (stops fill at the level in every engine); only the
+    ask-side early-trigger edge is native/vectorbt-only.
+    """
+    if not trades or df is None or df.empty or "timestamp" not in df.columns:
+        return
+    fill_at_open = str(getattr(config, "signal_exit_fill", "close") or "close").lower() == "open"
+    timestamp_series = df["timestamp"]
+    for trade in trades:
+        entry_idx = _locate_trade_bar(timestamp_series, trade.entry_time)
+        if entry_idx is not None and trade.direction == "LONG":
+            spread = _pyne_bar_spread(df.iloc[entry_idx], parameters)
+            if spread > 0:
+                try:
+                    base_open = float(df.iloc[entry_idx]["open"])
+                except (KeyError, TypeError, ValueError):
+                    base_open = None
+                if base_open is not None:
+                    trade.entry_price = round(base_open + spread, 6)
+        if not trade.exits:
+            continue
+        for leg in trade.exits:
+            reason = str(getattr(leg, "reason", "") or "")
+            if reason in _LEVEL_EXIT_REASONS:
+                continue
+            exit_idx = _locate_trade_bar(timestamp_series, leg.time)
+            if exit_idx is None:
+                continue
+            row = df.iloc[exit_idx]
+            try:
+                if fill_at_open:
+                    base = float(row["open"])
+                else:
+                    base = float(row["close"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if fill_at_open and trade.direction == "SHORT":
+                base += _pyne_bar_spread(row, parameters)
+            leg.price = round(base, 6)
+        try:
+            total = 0.0
+            for leg in trade.exits:
+                qty = float(getattr(leg, "quantity", 0.0) or 0.0)
+                if trade.direction == "LONG":
+                    total += (float(leg.price) - float(trade.entry_price)) * qty
+                else:
+                    total += (float(trade.entry_price) - float(leg.price)) * qty
+            trade.pnl = round(total, 2)
+            if trade.exits:
+                last = trade.exits[-1]
+                last.pnl = round(
+                    (
+                        (float(last.price) - float(trade.entry_price))
+                        if trade.direction == "LONG"
+                        else (float(trade.entry_price) - float(last.price))
+                    )
+                    * float(getattr(last, "quantity", 0.0) or 0.0),
+                    2,
+                )
+        except (TypeError, ValueError):
+            continue
 
 
 def _pyne_cli_end_bound(end_date: str) -> str:
@@ -129,8 +259,12 @@ class PyneCoreAdapter(EngineAdapter):
         )
 
         for symbol in config.symbols:
+            # A-H4 (D3): load from warmup_start when set (indicator warmup,
+            # mirroring the native adapter); trades are gated to start_date
+            # after parsing.
+            load_start = _effective_load_start(config)
             df = _load_ohlcv(
-                data_root, symbol, config.timeframe, config.start_date, config.end_date
+                data_root, symbol, config.timeframe, load_start, config.end_date
             )
             if df is None or df.empty:
                 # Same rule as the native/vectorbt adapters (F24): a symbol with
@@ -222,6 +356,10 @@ class PyneCoreAdapter(EngineAdapter):
                 if trade_context:
                     _enrich_trades_with_context(trades, trade_context, df)
                 _normalize_trade_exits(trades)
+                # A-H4 (D3): warmup gate + fill parity before sizing so the
+                # resized quantities/pnl build on parity prices.
+                trades = _gate_warmup_trades(trades, config)
+                _apply_fill_parity(trades, df, config, resolved_parameters)
                 _apply_risk_sizing(trades, config, asset_class)
 
             if stats_csv.exists():
@@ -257,7 +395,10 @@ class PyneCoreAdapter(EngineAdapter):
             str(stats_csv),
         ]
         if config.start_date:
-            cmd.extend(["--from", _pyne_cli_start_bound(config.start_date)])
+            # A-H4 (D3): the CLI window starts at the warmup date when set
+            # (the CSV already carries the extended frame); strategy-time
+            # gating to start_date happens in _gate_warmup_trades.
+            cmd.extend(["--from", _pyne_cli_start_bound(_effective_load_start(config))])
         if config.end_date:
             cmd.extend(["--to", _pyne_cli_end_bound(config.end_date)])
 
@@ -406,6 +547,13 @@ def _load_strategy_helper_namespace(strategy_path: Path, source: str) -> dict[st
         strategy_path,
         source,
         function_names={"build_trade_context", "build_drawings"},
+        # The main strategy file is a PyneCore script executed out-of-process
+        # by the ``pyne`` CLI; its ``pynecore`` imports are the engine contract
+        # and are never needed by the in-process helper namespace, so they are
+        # dropped here instead of failing the screen. Every other import is
+        # still screened against the whitelist (a helper that really needs
+        # ``pynecore`` fails loudly with NameError at call time).
+        ignored_roots=frozenset({"pynecore"}),
     )
     namespace.update({key: value for key, value in source_namespace.items() if value is not None})
     return namespace
@@ -474,6 +622,30 @@ def _reject_dunder_attribute(node: ast.Attribute, source_path: Path) -> None:
         )
 
 
+def _strip_ignored_import(
+    node: ast.Import | ast.ImportFrom,
+    ignored_roots: frozenset[str] | None,
+) -> ast.Import | ast.ImportFrom | None:
+    """Drop engine-contract imports that the helper namespace never needs.
+
+    Only whole roots listed in ``ignored_roots`` are removed; any other alias
+    on the same statement is kept and still screened. ``import pynecore, os``
+    therefore still fails on ``os`` instead of slipping through.
+    """
+    if not ignored_roots:
+        return node
+    if isinstance(node, ast.ImportFrom):
+        if import_root(node) in ignored_roots:
+            return None
+        return node
+    kept = [alias for alias in node.names if alias.name.split(".")[0] not in ignored_roots]
+    if not kept:
+        return None
+    if len(kept) == len(node.names):
+        return node
+    return ast.Import(names=kept)
+
+
 def _screen_helper_node(node: ast.AST, source_path: Path) -> None:
     """Apply every helper screening rule to one AST node."""
     if isinstance(node, (ast.Import, ast.ImportFrom)):
@@ -497,13 +669,16 @@ def _compile_helper_namespace(
     *,
     function_names: set[str] | None = None,
     strict_structure: bool = False,
+    ignored_roots: frozenset[str] | None = None,
 ) -> dict[str, Any]:
     tree = ast.parse(source, filename=str(source_path))
     helper_nodes: list[ast.stmt] = []
     allowed_names = function_names or {"build_trade_context", "build_drawings"}
     for position, node in enumerate(tree.body):
         if isinstance(node, (ast.Import, ast.ImportFrom)):
-            helper_nodes.append(node)
+            stripped = _strip_ignored_import(node, ignored_roots)
+            if stripped is not None:
+                helper_nodes.append(stripped)
         elif isinstance(node, ast.FunctionDef) and node.name in allowed_names:
             helper_nodes.append(node)
         elif strict_structure and not (
@@ -753,6 +928,7 @@ def _load_ohlcv(
 
     df = pd.read_parquet(matches[0])
     df.columns = [c.lower() for c in df.columns]
+    df = contract.normalize_ohlcv_frame(df)
 
     if "timestamp" in df.columns:
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
@@ -837,7 +1013,10 @@ def _apply_risk_sizing(trades: list[Trade], config: BacktestConfig, asset_class:
     max_position_exposure_pct = _resolve_max_position_exposure_pct(
         config.max_position_exposure_pct, asset_class
     )
-    max_leverage = max(_resolve_max_leverage(config.max_leverage), max_position_exposure_pct)
+    # A-C3: mirror vectorbt _size_trade min() semantics. max_leverage is an
+    # INDEPENDENT cap, not a floor above the position cap — max() here
+    # silently disabled the position cap whenever leverage allowed more.
+    max_leverage = _resolve_max_leverage(config.max_leverage)
 
     for trade in sorted(trades, key=lambda item: item.entry_time):
         meta = trade.meta or {}
@@ -857,12 +1036,14 @@ def _apply_risk_sizing(trades: list[Trade], config: BacktestConfig, asset_class:
         cap_notional = equity * max_position_exposure_pct
         leverage_notional_limit = equity * max_leverage
 
-        if required_notional <= cap_notional:
-            final_notional = required_notional
-        elif required_notional <= leverage_notional_limit:
+        # A-C3: the binding notional is min(position cap, leverage limit),
+        # mirroring vectorbt _size_trade — a conservative position cap binds
+        # even when leverage would allow more (no over-cap fill).
+        binding_notional = min(cap_notional, leverage_notional_limit)
+        if required_notional <= binding_notional:
             final_notional = required_notional
         else:
-            final_notional = leverage_notional_limit
+            final_notional = binding_notional
 
         qty = round(final_notional / trade.entry_price, 4)
         exit_price = trade.exits[-1].price
@@ -899,6 +1080,22 @@ def _infer_exit_reason_from_meta(exit_price: float, meta: dict[str, Any]) -> str
         if abs(exit_price - target) / abs(target) <= 0.001:
             return reason
     return None
+
+
+def _initial_exit_reason(raw_signal: str) -> str | None:
+    """Seed an exit reason from the broker ledger's Signal column.
+
+    ``strategy.close(..., comment="...")`` / ``strategy.exit`` comments surface
+    here verbatim (e.g. ``time_exit``, ``trailing_stop``), as do emulator
+    events (``Margin call``). The generic ``Close entry(s) order ...`` text
+    carries no strategy intent and stays None so context/meta inference can
+    still classify the exit. Normalised to snake_case to match the
+    vectorbt/native reason vocabulary.
+    """
+    signal = (raw_signal or "").strip()
+    if not signal or signal.lower().startswith("close entry(s) order"):
+        return None
+    return "_".join(signal.lower().split())
 
 
 def _parse_trade_csv(csv_path: Path, symbol: str, id_offset: int) -> list[Trade]:
@@ -938,6 +1135,7 @@ def _parse_trade_csv(csv_path: Path, symbol: str, id_offset: int) -> list[Trade]
                             price=round(exit_price, 6),
                             quantity=round(qty, 4),
                             pnl=round(profit, 2),
+                            reason=_initial_exit_reason(row.get("Signal", "")),
                         )
                     ],
                     pnl=round(profit, 2),

@@ -29,6 +29,8 @@ from runner.engines import contract
 from runner.engines._drawings import DrawingList, _normalize_drawings
 from runner.engines._indicator_series import _build_indicator_series
 from runner.engines._shared import (
+    resolve_ask_high_low,
+    resolve_bar_spread,
     resolve_max_leverage as _resolve_max_leverage,
     resolve_max_position_exposure_pct as _resolve_max_position_exposure_pct,
     serialize_meta_value as _shared_serialize_meta_value,
@@ -198,7 +200,6 @@ def _size_trade(
             final_notional = required_notional
         else:
             final_notional = binding_notional
-            achievable_risk = (final_notional / entry_price) * stop_distance
             if capped_by_max_leverage and not capped_by_max_position:
                 logger.info(
                     "Leverage bound notional for %s trade %s: required_notional=%.2f exceeds leverage limit=%.2f (max_leverage=%.2fx)",
@@ -248,12 +249,17 @@ def _process_symbol(
     """Process a single symbol: load data, generate signals, extract trades.
 
     Returns (trades_with_temp_ids, used_intrabar_timeframes, drawings,
-    indicator_series, loaded_bar_count). Runs in its own process when
-    parallelized.
+    indicator_series, loaded_bar_count, inverted_stop_drops). Runs in its
+    own process when parallelized.
     """
     strategy_mod = _load_strategy_module(strategy_path)
+    # A-H4 (D3): warmup_start extends the loaded window backwards for
+    # indicator warmup, mirroring the native adapter — bars before
+    # start_date feed the strategy's indicators but create no trades.
+    warmup_raw = str(getattr(config, "warmup_start", "") or "").strip()
+    load_start = warmup_raw or config.start_date
     df, data_path = _load_ohlcv(
-        data_root, symbol, config.timeframe, config.start_date, config.end_date
+        data_root, symbol, config.timeframe, load_start, config.end_date
     )
     if df is None or df.empty:
         raise RuntimeError(
@@ -261,6 +267,17 @@ def _process_symbol(
             f"{config.start_date}..{config.end_date} under {data_root}; "
             "refusing to run a silent empty backtest"
         )
+    trade_from = None
+    if warmup_raw:
+        # A-M11: a warmup window without a parseable start_date must fail
+        # loudly (mirrors the native engine) — never trade warmup bars.
+        trade_from = pd.to_datetime(config.start_date, utc=True, errors="coerce")
+        if pd.isna(trade_from):
+            raise ValueError(
+                "warmup_start is set but start_date "
+                f"({config.start_date!r}) is empty or unparseable — the "
+                "warmup gate cannot derive trade_from"
+            )
 
     asset_class = _infer_asset_class_from_path(data_path)
     intrabar_df, intrabar_timeframe = _load_intrabar_ohlcv(
@@ -268,7 +285,7 @@ def _process_symbol(
         symbol,
         config.timeframe,
         config.modeling_resolution,
-        config.start_date,
+        load_start,
         config.end_date,
     )
     extra_timeframes = [intrabar_timeframe] if intrabar_timeframe else []
@@ -280,7 +297,13 @@ def _process_symbol(
     entries = execution_signals["entries"]
     exits = execution_signals["exits"]
     stop_loss_series = _find_stop_loss_series(execution_signals, execution_indicators)
+    # A-M3: sizing-only protective levels (e.g. mean_reversion_rsi_bb
+    # ``sizing_sl_price``) size the position but must NEVER arm the live
+    # intrabar stop — exit detection keeps using the real stop_loss series.
+    sizing_stop_series = _find_sizing_stop_series(execution_signals, execution_indicators)
+    sizing_basis_series = sizing_stop_series if sizing_stop_series is not None else stop_loss_series
     take_profit_series = _find_take_profit_series(execution_signals, execution_indicators)
+    entry_stop_series = _find_entry_stop_series(execution_signals, execution_indicators)
     atr_series = _find_atr_series(execution_signals, execution_indicators)
     direction_series = _find_direction_series(execution_signals, execution_indicators)
     exit_price_series = _find_exit_price_series(execution_signals, execution_indicators)
@@ -291,20 +314,57 @@ def _process_symbol(
     entry_idx = None
     equity = config.initial_capital
     trade_counter = 0
+    inverted_stop_drops = 0
 
     for i in range(len(df)):
+        if trade_from is not None:
+            # A-H4 (D3): warmup gate mirroring native TradeEngine.run — bars
+            # before start_date feed indicators only (signals were already
+            # generated on the extended frame above); no entries, no exits.
+            bar_ts = pd.to_datetime(
+                df["timestamp"].iloc[i] if "timestamp" in df.columns else None,
+                utc=True,
+                errors="coerce",
+            )
+            if pd.notna(bar_ts) and bar_ts < trade_from:
+                continue
         if not in_trade and bool(entries.iloc[i]):
+            # Entry leg executes next-open (shifted index = execution bar).
             in_trade = True
             entry_idx = i
-        elif in_trade and bool(exits.iloc[i]):
+        if in_trade and bool(exits.iloc[i]):
+            # D4 (A-M1): the exit leg stays on the trigger bar, so an exit
+            # may fire on the entry execution bar itself (same-bar open
+            # fill -> close exit), exactly like the native engine which
+            # fills pending orders at the open and closes signal exits at
+            # the close of the same bar. No `elif`: it would swallow the
+            # exit whenever both legs land on one bar.
             in_trade = False
-            trade_counter += 1
 
             entry_row = df.iloc[entry_idx]
             exit_row = df.iloc[i]
             direction = _resolve_direction(execution_signals, direction_series, entry_idx)
-            entry_price = _resolve_entry_price(entry_row)
-            exit_price = _resolve_exit_price(exit_row, i, exit_price_series)
+            entry_price = _resolve_entry_price(
+                entry_row,
+                direction,
+                entry_stop_series,
+                entry_idx,
+                parameters=resolved_parameters,
+            )
+            if entry_price is None:
+                # D2 strict (A-H2): entry_stop present but never touched --
+                # no fill, no phantom trade. State is already flat
+                # (in_trade=False above); skip before sizing/equity.
+                continue
+            trade_counter += 1
+            exit_price = _resolve_exit_price(
+                exit_row,
+                i,
+                exit_price_series,
+                signal_exit_fill=getattr(config, "signal_exit_fill", "close"),
+                parameters=resolved_parameters,
+                direction=direction,
+            )
             exit_reason = _resolve_exit_reason(i, exit_reason_series)
             entry_ts = str(entry_row.get("timestamp", entry_row.name))
             exit_ts = str(exit_row.get("timestamp", exit_row.name))
@@ -330,6 +390,7 @@ def _process_symbol(
                 scheduled_exit_time=exit_ts,
                 stop_price=_resolve_level_value(stop_loss_series, entry_idx),
                 take_profit_price=_resolve_level_value(take_profit_series, entry_idx),
+                parameters=resolved_parameters,
             )
             if intrabar_exit is not None:
                 exit_price = intrabar_exit["price"]
@@ -342,7 +403,7 @@ def _process_symbol(
                 equity=equity,
                 entry_price=entry_price,
                 asset_class=asset_class,
-                stop_loss_series=stop_loss_series,
+                stop_loss_series=sizing_basis_series,
                 atr_series=atr_series,
                 entry_idx=entry_idx,
                 symbol=symbol,
@@ -373,6 +434,34 @@ def _process_symbol(
                 if isinstance(sl_from_meta, (int, float)):
                     stop_price = float(sl_from_meta)
 
+            # Inverted-stop guard: a stop on the wrong side of the entry
+            # (LONG stop >= entry, SHORT stop <= entry) would produce an
+            # instantly-triggered, sign-flipped fantasy exit. This happens
+            # when a stop-order strategy's level is resolved against a
+            # market fill instead of its stop fill. Skip the trade loudly
+            # instead of compounding garbage into equity.
+            if stop_price is not None:
+                inverted = (
+                    direction == "LONG" and stop_price >= entry_price
+                ) or (direction != "LONG" and stop_price <= entry_price)
+                if inverted:
+                    # A-M7: count every drop (the warn-once log only shows
+                    # the first) — the per-run total is reported in
+                    # meta.data["inverted_stop_drops"] by VectorbtAdapter.run.
+                    inverted_stop_drops += 1
+                    _warn_once(
+                        (symbol, config.timeframe, "inverted_stop"),
+                        "Skipping %s/%s trade at %s: %s stop %.6f is on the "
+                        "wrong side of entry %.6f",
+                        symbol,
+                        config.timeframe,
+                        entry_ts,
+                        direction,
+                        stop_price,
+                        entry_price,
+                    )
+                    continue
+
             if stop_distance is None and stop_price is not None:
                 stop_distance = abs(entry_price - stop_price)
 
@@ -396,10 +485,17 @@ def _process_symbol(
                     if leverage_notional_limit is not None
                     else None
                 ),
-                # Persisted key stays "max_position_pct" for artifact
-                # compatibility (frontend TradeRiskMath + SQLite fallback);
-                # its meaning is documented as max_position_exposure_pct.
+                # "max_position_pct" stays for artifact compatibility
+                # (frontend TradeRiskMath + SQLite fallback in
+                # shared/database.py); "max_position_exposure_pct" carries
+                # the same value under the canonical _SizeRecord name so the
+                # sizing-record viewer contract holds for both spellings.
                 "max_position_pct": (
+                    round(max_position_exposure_pct, 6)
+                    if max_position_exposure_pct is not None
+                    else None
+                ),
+                "max_position_exposure_pct": (
                     round(max_position_exposure_pct, 6)
                     if max_position_exposure_pct is not None
                     else None
@@ -413,6 +509,18 @@ def _process_symbol(
                 pnl = (exit_price - entry_price) * qty
             else:
                 pnl = (entry_price - exit_price) * qty
+
+            # A-L1 (mirror of native _finalize_position): explicit fee model
+            # instead of implicit 0.0. fee_rate = fraction of notional per
+            # side, fee_flat_per_trade = flat surcharge; default 0.0 legacy.
+            fee_rate = max(0.0, float((resolved_parameters or {}).get("fee_rate", 0.0) or 0.0))
+            fee_flat = max(
+                0.0,
+                float((resolved_parameters or {}).get("fee_flat_per_trade", 0.0) or 0.0),
+            )
+            fees = (
+                (entry_price * qty + exit_price * qty) * fee_rate + fee_flat
+            )
 
             trade = Trade(
                 id=trade_counter,  # temporary; renumbered after merge
@@ -431,6 +539,8 @@ def _process_symbol(
                     )
                 ],
                 pnl=round(pnl, 2),
+                fees=round(fees, 2),
+                net_pnl=round(pnl - fees, 2),
                 holding_bars=i - entry_idx,
                 tags=["vectorbt"],
                 meta=trade_meta,
@@ -438,7 +548,7 @@ def _process_symbol(
             trades.append(trade)
             equity += pnl
 
-    return trades, extra_timeframes, drawings, indicator_series, len(df)
+    return trades, extra_timeframes, drawings, indicator_series, len(df), inverted_stop_drops
 
 
 @dataclass
@@ -468,15 +578,26 @@ def _build_vectorbt_trade(
     equity: float,
     trade_counter: int,
     asset_class: str,
-) -> tuple[Trade, float]:
-    """Build one closed vectorbt trade and its realized PnL."""
+) -> tuple[Trade | None, float]:
+    """Build one closed vectorbt trade and its realized PnL.
+
+    Returns (None, 0.0) when D2 strict no-touch applies (entry_stop present
+    but never touched) -- the caller skips the trade.
+    """
     df = ctx.df
     execution_signals = ctx.execution_signals
     execution_indicators = ctx.execution_indicators
     entry_row = df.iloc[entry_idx]
     exit_row = df.iloc[i]
     direction = _resolve_direction(execution_signals, ctx.direction_series, entry_idx)
-    entry_price = _resolve_entry_price(entry_row)
+    entry_price = _resolve_entry_price(
+        entry_row,
+        direction,
+        _find_entry_stop_series(execution_signals, execution_indicators),
+        entry_idx,
+    )
+    if entry_price is None:
+        return None, 0.0
     exit_price = _resolve_exit_price(exit_row, i, ctx.exit_price_series)
     exit_reason = _resolve_exit_reason(i, ctx.exit_reason_series)
     entry_ts = str(entry_row.get("timestamp", entry_row.name))
@@ -667,6 +788,7 @@ class VectorbtAdapter(EngineAdapter):
         all_indicators: list[IndicatorSeries] = []
         used_timeframes = [config.timeframe]
         total_loaded_bars = 0
+        total_inverted_drops = 0
 
         num_symbols = len(config.symbols)
         use_parallel = num_symbols > 1
@@ -687,8 +809,16 @@ class VectorbtAdapter(EngineAdapter):
                 for future in as_completed(futures):
                     sym = futures[future]
                     try:
-                        trades, extra_tfs, drawings, indicator_series, loaded_bars = future.result()
+                        (
+                            trades,
+                            extra_tfs,
+                            drawings,
+                            indicator_series,
+                            loaded_bars,
+                            inverted_drops,
+                        ) = future.result()
                         total_loaded_bars += loaded_bars
+                        total_inverted_drops += inverted_drops
                         all_trades.extend(trades)
                         all_drawings.extend(drawings)
                         all_indicators.extend(indicator_series)
@@ -705,10 +835,18 @@ class VectorbtAdapter(EngineAdapter):
                 ) from symbol_errors[0][1]
         else:
             for symbol in config.symbols:
-                trades, extra_tfs, drawings, indicator_series, loaded_bars = _process_symbol(
+                (
+                    trades,
+                    extra_tfs,
+                    drawings,
+                    indicator_series,
+                    loaded_bars,
+                    inverted_drops,
+                ) = _process_symbol(
                     symbol, config, strategy_path, resolved_parameters, data_root
                 )
                 total_loaded_bars += loaded_bars
+                total_inverted_drops += inverted_drops
                 all_trades.extend(trades)
                 all_drawings.extend(drawings)
                 all_indicators.extend(indicator_series)
@@ -721,27 +859,56 @@ class VectorbtAdapter(EngineAdapter):
         for idx, trade in enumerate(all_trades, start=1):
             trade.id = idx
 
-        # Build equity curve from sorted trades (Cleanup 16-D1, F5).
-        # Semantics decision: the persisted curve is a REALIZED-PnL portfolio
-        # curve over EXIT time. Each symbol's own sizing compounds from the
-        # shared initial capital inside `_process_symbol`; summing those
-        # per-symbol paths into one "portfolio" equity would multiply capital
-        # by the symbol count, so the aggregate curve here intentionally
-        # replays only closed PnL, once per portfolio, credited at the trade's
-        # exit — and therefore replayed in EXIT order (native/pynecore do the
-        # same). Drawdown/Sharpe computed on this curve describe the realized
-        # portfolio, not an intraday mark-to-market path — the limitation is
-        # documented in the cross-engine contract.
-        all_equity: list[EquityPoint] = []
-        equity = config.initial_capital
-        for trade in sorted(all_trades, key=lambda item: item.last_exit_time):
-            equity += trade.pnl
-            all_equity.append(
-                EquityPoint(
-                    time=trade.last_exit_time or trade.entry_time,
-                    equity=round(equity, 2),
-                )
+        # A-M7: report every inverted-stop drop (the per-trade log is
+        # warn-once by design) — the total lands in meta.data below.
+        if total_inverted_drops:
+            logger.warning(
+                "Inverted-stop guard dropped %d trade(s) in this backtest "
+                "(stops on the wrong side of entry); see meta.data "
+                "inverted_stop_drops",
+                total_inverted_drops,
             )
+
+        # A-M4 (D5): multi-symbol runs replay all trades onto ONE running
+        # portfolio equity (shared sizing basis, summed exposure). Each
+        # symbol still generates its signals independently, but quantities
+        # re-scale chronologically from shared equity instead of compounding
+        # N symbols x full capital. Single-symbol runs keep the legacy path
+        # bit-identical (no replay).
+        shared_summary: dict[str, Any] = {}
+        if num_symbols > 1 and all_trades:
+            from runner.engines._shared import replay_shared_equity
+
+            all_trades, shared_equity_curve, shared_summary = replay_shared_equity(
+                all_trades, config.initial_capital
+            )
+            # Renumber again: the replay re-sorts chronologically by entry.
+            all_trades.sort(key=lambda t: t.entry_time)
+            for idx, trade in enumerate(all_trades, start=1):
+                trade.id = idx
+            all_equity = shared_equity_curve
+        else:
+            # Build equity curve from sorted trades (Cleanup 16-D1, F5).
+            # Semantics decision: the persisted curve is a REALIZED-PnL portfolio
+            # curve over EXIT time. Each symbol's own sizing compounds from the
+            # shared initial capital inside `_process_symbol`; summing those
+            # per-symbol paths into one "portfolio" equity would multiply capital
+            # by the symbol count, so the aggregate curve here intentionally
+            # replays only closed PnL, once per portfolio, credited at the trade's
+            # exit — and therefore replayed in EXIT order (native/pynecore do the
+            # same). Drawdown/Sharpe computed on this curve describe the realized
+            # portfolio, not an intraday mark-to-market path — the limitation is
+            # documented in the cross-engine contract.
+            all_equity: list[EquityPoint] = []
+            equity = config.initial_capital
+            for trade in sorted(all_trades, key=lambda item: item.last_exit_time):
+                equity += trade.pnl
+                all_equity.append(
+                    EquityPoint(
+                        time=trade.last_exit_time or trade.entry_time,
+                        equity=round(equity, 2),
+                    )
+                )
 
         now = datetime.now(timezone.utc)
         if hasattr(strategy_mod, "STRATEGY_META"):
@@ -778,6 +945,13 @@ class VectorbtAdapter(EngineAdapter):
                 "symbols": config.symbols,
                 "universe": "",
                 "source": "yfinance",
+                # A-M7: every inverted-stop drop is counted (warn-once log
+                # only shows the first) — a non-zero count here means the
+                # run silently skipped mispriced trades.
+                "inverted_stop_drops": total_inverted_drops,
+                # A-M4 (D5): shared-equity replay summary for multi-symbol
+                # runs (empty for single-symbol legacy path).
+                "shared_equity": shared_summary,
             },
             initial_capital=config.initial_capital,
             parameters=resolved_parameters,
@@ -872,23 +1046,50 @@ def _coerce_boolean_series(value: Any, index: pd.Index) -> pd.Series:
     return _coerce_series(value, index).fillna(False).astype(bool)
 
 
+def _is_exit_column(name: str) -> bool:
+    """True for signal/exit-leg columns that live on the trigger bar (D4)."""
+    lowered = str(name).lower()
+    return (
+        lowered in {"exits", "exit_price", "exit_reason"}
+        or lowered.startswith("exit_")
+    )
+
+
 def _prepare_next_open_execution_data(
     signals: pd.DataFrame,
     indicators: IndicatorMap,
 ) -> tuple[pd.DataFrame, IndicatorMap]:
-    """Shift strategy output by one bar so signal bars execute on the next bar open."""
-    execution_signals = signals.shift(1)
-    execution_signals.index = signals.index
-    execution_signals["entries"] = _coerce_boolean_series(execution_signals["entries"], signals.index)
-    shifted_exits = _coerce_boolean_series(execution_signals["exits"], signals.index)
-    original_exits = _coerce_boolean_series(signals["exits"], signals.index)
-    if len(shifted_exits) > 0 and bool(original_exits.iloc[-1]):
-        shifted_exits.iloc[-1] = True
-    execution_signals["exits"] = shifted_exits
+    """Split strategy output into execution timing (D4, A-M1).
+
+    Unified Fill-zum-Trigger-Close convention:
+    - ENTRIES execute on the next bar open → entry leg (entries + entry-when
+      series: direction, stop_loss, take_profit, atr, entry_stop, meta_*)
+      shifts by one bar.
+    - SIGNAL EXITS fill at the trigger bar's close → exit leg (exits +
+      exit-when series: exit_price, exit_reason, exit_*, exit_meta_*) stays
+      UNSHIFTED, so both engines price the same bar's close.
+    """
+    execution_signals = pd.DataFrame(index=signals.index)
+    for column in signals.columns:
+        raw = signals[column]
+        if _is_exit_column(column):
+            aligned = raw.copy()
+            aligned.index = signals.index
+        else:
+            aligned = raw.shift(1)
+            aligned.index = signals.index
+        if str(column).lower() in {"entries", "exits"}:
+            execution_signals[column] = _coerce_boolean_series(aligned, signals.index)
+        else:
+            execution_signals[column] = aligned
 
     execution_indicators: IndicatorMap = {}
     for name, (series, explicit_when) in indicators.items():
-        shifted_series = series.shift(1)
+        when = _infer_indicator_when(name, explicit_when)
+        if when == "exit":
+            shifted_series = series.copy()
+        else:
+            shifted_series = series.shift(1)
         shifted_series.index = signals.index
         execution_indicators[name] = (shifted_series, explicit_when)
 
@@ -977,6 +1178,8 @@ def _find_indicator_series(
             continue
 
         lowered = name.lower()
+        if kind == "sizing_stop" and lowered in {"sizing_stop", "sizing_sl_price", "sizing_sl"}:
+            return series
         if kind == "direction" and lowered == "direction":
             return series
         if kind == "stop_loss" and lowered in {"stop_loss", "sl_price"}:
@@ -987,6 +1190,8 @@ def _find_indicator_series(
             return series
         if kind == "exit_reason" and lowered == "exit_reason":
             return series
+        if kind == "entry_stop" and lowered == "entry_stop":
+            return series
         if kind == "atr" and lowered.startswith("atr"):
             return series
     return None
@@ -994,6 +1199,11 @@ def _find_indicator_series(
 
 def _find_stop_loss_series(signals: pd.DataFrame, indicators: IndicatorMap) -> pd.Series | None:
     return _find_indicator_series(signals, indicators, kind="stop_loss")
+
+
+def _find_sizing_stop_series(signals: pd.DataFrame, indicators: IndicatorMap) -> pd.Series | None:
+    """Sizing-only protective level (A-M3): never arms exit detection."""
+    return _find_indicator_series(signals, indicators, kind="sizing_stop")
 
 
 def _find_take_profit_series(signals: pd.DataFrame, indicators: IndicatorMap) -> pd.Series | None:
@@ -1016,6 +1226,10 @@ def _find_exit_reason_series(signals: pd.DataFrame, indicators: IndicatorMap) ->
     return _find_indicator_series(signals, indicators, kind="exit_reason")
 
 
+def _find_entry_stop_series(signals: pd.DataFrame, indicators: IndicatorMap) -> pd.Series | None:
+    return _find_indicator_series(signals, indicators, kind="entry_stop")
+
+
 def _normalize_direction_value(value: Any) -> str:
     if value in ("SHORT", "short", -1):
         return "SHORT"
@@ -1032,24 +1246,117 @@ def _resolve_direction(
     return "LONG"
 
 
+def _vbt_bar_spread(row: pd.Series, parameters: dict[str, Any] | None) -> float:
+    """Per-bar spread surcharge in price units (ask = open + spread).
+
+    A-H4 (D3): mirrors native ``TradeEngine._bar_spread`` exactly — opt-in
+    via the ``spread_price_col`` strategy parameter naming a data column
+    with the spread in PRICE units. Default off (0.0): all existing
+    behavior is unchanged.
+    """
+    return resolve_bar_spread(row, (parameters or {}).get("spread_price_col"))
+
+
+def _vbt_ask_bar(
+    row: pd.Series, parameters: dict[str, Any] | None
+) -> tuple[float | None, float | None]:
+    """Per-bar ask-side high/low in price units (opt-in).
+
+    A-H4 (D3): mirrors native ``TradeEngine._ask_bar`` exactly. MT5
+    triggers SHORT stops/TPs on the ASK, not the bid. Enable via the
+    ``ask_ohlc`` strategy parameter (default False — legacy bid-only
+    behavior unchanged). Reads explicit ``ask_high``/``ask_low`` data
+    columns when present; otherwise falls back to bid high/low plus the
+    ``spread_price_col`` spread. Returns (None, None) when unavailable.
+    """
+    if not bool((parameters or {}).get("ask_ohlc", False)):
+        return None, None
+    return resolve_ask_high_low(row, _vbt_bar_spread(row, parameters))
+
+
 def _resolve_exit_price(
-    exit_row: pd.Series, exit_idx: int, exit_price_series: pd.Series | None
+    exit_row: pd.Series,
+    exit_idx: int,
+    exit_price_series: pd.Series | None,
+    *,
+    signal_exit_fill: str = "close",
+    parameters: dict[str, Any] | None = None,
+    direction: str | None = None,
 ) -> float:
+    # D4 (Phase 3, A-M1 — implemented): unified Fill-zum-Trigger-Close.
+    # Signal exits stay on the trigger bar (see
+    # _prepare_next_open_execution_data) and fill at its close (or open with
+    # signal_exit_fill="open", mirroring native _close_position); stop/TP
+    # legs resolve via the intrabar walk at their levels. An explicit
+    # strategy exit_price level always wins.
+    # Spread mirrors native: only open-fills carry it, and only SHORT exits
+    # pay it (closing a SHORT buys the ask); LONG exits sell the bid.
     if exit_price_series is not None:
         exit_price = exit_price_series.iloc[exit_idx]
         if pd.notna(exit_price) and float(exit_price) > 0:
             return float(exit_price)
+    fill_at_open = str(signal_exit_fill or "close").lower() == "open"
     open_value = exit_row.get("open")
-    if open_value is not None and pd.notna(open_value):
-        return float(open_value)
-    return float(exit_row["close"])
+    close_value = exit_row.get("close")
+    open_ok = open_value is not None and pd.notna(open_value)
+    close_ok = close_value is not None and pd.notna(close_value)
+    if fill_at_open:
+        base = float(open_value) if open_ok else float(close_value)
+    else:
+        base = float(close_value) if close_ok else float(open_value)
+    spread = _vbt_bar_spread(exit_row, parameters) if fill_at_open else 0.0
+    if direction == "SHORT":
+        base += spread
+    return base
 
 
-def _resolve_entry_price(entry_row: pd.Series) -> float:
+def _resolve_entry_price(
+    entry_row: pd.Series,
+    direction: str,
+    entry_stop_series: pd.Series | None,
+    entry_idx: int,
+    *,
+    parameters: dict[str, Any] | None = None,
+) -> float | None:
+    """Resolve the fill price for an entry bar.
+
+    Strategies expressing stop orders (e.g. buy-stop scalpers) publish an
+    ``entry_stop`` level: a LONG fills at the stop when the bar traded
+    through it (``high >= stop``), a SHORT when ``low <= stop`` -- matching
+    stop-market semantics instead of the default next-open market fill.
+    Gaps through the stop fill at the stop (stop-market semantics).
+    D2 (strict, A-H2): with a usable stop level and NO touch there is NO
+    fill -- the caller skips the trade. Falling back to open/close would
+    book phantom fills for orders the market never triggered.
+    Without a usable stop level the legacy open/close fallback applies, so
+    strategies without ``entry_stop`` behave exactly as before.
+    A-H4 (D3): spread-aware market fill mirroring native
+    ``_fill_pending_orders`` — LONGs lift the ask (open + spread), SHORTs
+    hit the bid (open). Stop-order fills trade at the stop level itself.
+    D4 (A-M1): entries still execute next-open; only signal exits moved to
+    trigger-close, so entry resolution is untouched by the convention.
+    """
+    if entry_stop_series is not None:
+        stop = entry_stop_series.iloc[entry_idx]
+        if pd.notna(stop) and float(stop) > 0:
+            stop = float(stop)
+            high = entry_row.get("high")
+            low = entry_row.get("low")
+            if direction == "LONG":
+                if high is not None and pd.notna(high) and float(high) >= stop:
+                    return stop
+            else:
+                if low is not None and pd.notna(low) and float(low) <= stop:
+                    return stop
+            return None
     open_value = entry_row.get("open")
     if open_value is not None and pd.notna(open_value):
-        return float(open_value)
-    return float(entry_row["close"])
+        base = float(open_value)
+    else:
+        base = float(entry_row["close"])
+    if direction == "LONG":
+        base += _vbt_bar_spread(entry_row, parameters)
+    return base
 
 
 def _resolve_exit_reason(exit_idx: int, exit_reason_series: pd.Series | None) -> str | None:
@@ -1112,6 +1419,7 @@ def _load_ohlcv(
     selected_path = matches[0]
     df = pd.read_parquet(selected_path)
     df.columns = [c.lower() for c in df.columns]
+    df = contract.normalize_ohlcv_frame(df)
 
     if "timestamp" in df.columns:
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
@@ -1170,6 +1478,7 @@ def _resolve_intrabar_exit(
     scheduled_exit_time: str,
     stop_price: float | None,
     take_profit_price: float | None,
+    parameters: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     if intrabar_df is None or intrabar_df.empty or intrabar_timeframe is None:
         return None
@@ -1184,25 +1493,38 @@ def _resolve_intrabar_exit(
 
     effective_start = entry_ts
     effective_end = exit_ts
-    if effective_end <= effective_start:
+    if effective_end < effective_start:
         return None
 
     timestamps = pd.to_datetime(intrabar_df["timestamp"], utc=True, errors="coerce")
-    # The upper bound is EXCLUSIVE because vectorbt schedules exits at the
-    # next bar's open (F10 execution-timing models, contract doc §3) — the
-    # exit bar's own sub-bars are outside the resolution window. If exits are
-    # ever moved onto the signal bar, this slice must become inclusive or the
-    # intrabar resolution silently degrades to main-frame fills.
-    window = intrabar_df.loc[(timestamps >= effective_start) & (timestamps < effective_end)]
+    # The upper bound extends through the trigger bar (D4, A-M1): the exit
+    # leg fires on the trigger bar itself, so the trigger bar's own sub-bars
+    # sit inside the resolution window — a stop/TP touched intrabar on the
+    # trigger bar must fill at the level, exactly like native `_check_stops`
+    # which runs on the trigger bar before the signal close. An upper bound
+    # at the trigger bar's open silently degraded those fills to
+    # trigger-close (engine divergence). Sub-bars of the NEXT bar and beyond
+    # stay excluded: the window ends at the trigger bar's close.
+    base_duration = TIMEFRAME_TO_DURATION.get(str(base_timeframe).lower())
+    window_end = effective_end + base_duration if base_duration else effective_end
+    window = intrabar_df.loc[(timestamps >= effective_start) & (timestamps < window_end)]
     if window.empty:
         return None
 
-    for row in window.itertuples(index=False):
-        timestamp = pd.to_datetime(getattr(row, "timestamp"), utc=True, errors="coerce")
+    for _, row in window.iterrows():
+        timestamp = pd.to_datetime(row.get("timestamp"), utc=True, errors="coerce")
         if pd.isna(timestamp):
             continue
-        high = float(getattr(row, "high"))
-        low = float(getattr(row, "low"))
+        high = float(row["high"])
+        low = float(row["low"])
+        if direction == "SHORT":
+            # A-H4 (D3): SHORT stops/TPs trigger on the ASK when ask_ohlc is
+            # enabled, mirroring native _check_stops/_ask_bar.
+            ask_high, ask_low = _vbt_ask_bar(row, parameters)
+            if ask_high is not None:
+                high = ask_high
+            if ask_low is not None:
+                low = ask_low
         event = _match_intrabar_exit_event(
             direction=direction,
             high=high,

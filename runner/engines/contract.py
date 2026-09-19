@@ -185,6 +185,38 @@ def apply_date_filter(
     return frame
 
 
+# ─── OHLCV column normalization (bid_/ask_-prefixed feeds) ─────────────────
+
+
+def normalize_ohlcv_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    """Fill canonical ``open/high/low/close/volume`` from ``bid_*`` columns.
+
+    In-memory counterpart of
+    ``data_tools.download_grid_market_data.normalize_ohlcv_columns``
+    (which rewrites parquet files and drops non-OHLCV columns -- unsuitable
+    here because ``ask_*``/spread columns must survive for ask-side stop
+    monitoring). Dukascopy index/energy feeds store ``bid_open/bid_high/...``
+    (plus ``ask_*``) instead of, or alongside all-NaN, plain OHLC. Missing
+    values are filled per-value from the ``bid_`` counterpart (the bid side
+    is the conservative, MT5-chart equivalent series); existing non-null
+    canonical values always win. All other columns pass through untouched.
+
+    C-1: this helper is NON-MUTATING — it works on a copy and returns it.
+    Callers must use the return value; the input frame is never modified
+    in place.
+    """
+    frame = frame.copy()
+    for canonical in ("open", "high", "low", "close", "volume"):
+        bid_col = f"bid_{canonical}"
+        if bid_col not in frame.columns:
+            continue
+        if canonical not in frame.columns:
+            frame[canonical] = frame[bid_col].to_numpy()
+        else:
+            frame[canonical] = frame[canonical].fillna(frame[bid_col])
+    return frame
+
+
 # ─── Same-bar stop / take-profit priority (F8) ──────────────────────────────
 
 

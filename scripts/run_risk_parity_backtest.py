@@ -23,11 +23,14 @@ import numpy as np
 import pandas as pd
 
 from shared.constants import ensure_path_within_workspace
+from shared.logging import get_logger
 import yfinance as yf
 from scipy.optimize import minimize
 
 # Ensure project root is importable when called directly
 import sys
+
+logger = get_logger("scripts.run-risk-parity-backtest")
 
 _ISO_UTC_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
@@ -52,10 +55,25 @@ ASSETS: dict[str, dict[str, str]] = {
 
 TICKERS = list(ASSETS.keys())
 
+# First trading session of the QuantConnect data history (log line 1:
+# "Algorithm starting warm up..." 2015-08-04). The LEAN SMA(200) hedge
+# indicator counts its 200 ready-bars from here.
+QC_DATA_START = pd.Timestamp("2015-08-04")
 
-def download_prices(start: str, end: str) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Download adjusted daily close and open prices from yfinance."""
-    data = yf.download(TICKERS, start=start, end=end, auto_adjust=True, progress=False)
+
+def download_prices(
+    start: str, end: str, history_start: str = "2015-08-04"
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Download adjusted daily close and open prices from yfinance.
+
+    A-M6: history is loaded from ``history_start`` (default: the QC data
+    start 2015-08-04) instead of the backtest ``start``, so the SMA(200)
+    ready-gate counts its 200 bars from the same origin LEAN does. Without
+    this the gate goes ready ~100 trading days late on histories that start
+    at the backtest start (the Brexit window is affected).
+    """
+    effective_start = min(pd.Timestamp(start), pd.Timestamp(history_start)).strftime("%Y-%m-%d")
+    data = yf.download(TICKERS, start=effective_start, end=end, auto_adjust=True, progress=False)
     # yfinance returns a MultiIndex when multiple tickers
     closes = data["Close"].copy() if "Close" in data.columns else data.copy()
     opens = data["Open"].copy() if "Open" in data.columns else closes.copy()
@@ -237,14 +255,21 @@ def _simulate_portfolio_value(
     initial_cash: float,
     rebalance_schedule: dict[pd.Timestamp, dict[str, float]],
 ) -> pd.Series:
-    """Walk the returns with rebalanced weights to build the portfolio value."""
+    """Walk the returns with rebalanced weights to build the portfolio value.
+
+    A-H3: rebalance orders are Market-On-Close — the fill happens AT the
+    rebalance-day close, so the new weights earn from the NEXT trading day.
+    The schedule update therefore applies AFTER the day's return is booked
+    with the previously active weights (same-day application would credit
+    the new portfolio with a return it was never exposed to).
+    """
     portfolio_value = pd.Series(index=returns.index, dtype=float)
     portfolio_value.iloc[0] = initial_cash
-    active_weights = {t: 0.0 for t in TICKERS}
+    active_weights = dict.fromkeys(TICKERS, 0.0)
     for date in returns.index:
+        daily_ret = sum(active_weights[t] * returns[t].loc[date] for t in TICKERS)
         if date in rebalance_schedule:
             active_weights = rebalance_schedule[date]
-        daily_ret = sum(active_weights[t] * returns[t].loc[date] for t in TICKERS)
         prev_idx = returns.index.get_loc(date) - 1
         if prev_idx >= 0:
             portfolio_value.loc[date] = portfolio_value.iloc[prev_idx] * (1 + daily_ret)
@@ -256,6 +281,8 @@ def _portfolio_performance_stats(
     portfolio_value: pd.Series,
     trades: list[dict[str, Any]],
     attribution_pnls: list[float],
+    risk_free_rate: float = 0.0,
+    lean_statistics: bool = False,
 ) -> dict[str, float]:
     """Derive the raw return/risk/trade statistics from the simulated value."""
     total_return = float(portfolio_value.iloc[-1] / portfolio_value.iloc[0] - 1)
@@ -263,11 +290,46 @@ def _portfolio_performance_stats(
     years = (portfolio_value.index[-1] - portfolio_value.index[0]).days / 365.25
     cagr = float((portfolio_value.iloc[-1] / portfolio_value.iloc[0]) ** (1 / years) - 1)
 
-    port_returns = portfolio_value.pct_change().dropna()
+    if lean_statistics:
+        # LEAN-exact recipe (Common/Statistics/Statistics.cs + PortfolioStatistics.cs):
+        # performance = day-over-day equity returns on CALENDAR days (weekends
+        # flat at 0), annual return = (1+daily_mean)^252-1, sample variance
+        # (ddof=1). Verified against the QC order-ledger curve: vol matches
+        # LEAN 0.0872 to 4 decimals; Sharpe/Sortino match with the average
+        # risk-free rate (GetAverageRiskFreeRate ~2.5%/yr for 2016-2024).
+        curve = portfolio_value.asfreq("D", method="ffill")
+    else:
+        curve = portfolio_value
+    port_returns = curve.pct_change().dropna()
+    if lean_statistics:
+        ann_perf = float((1 + port_returns.mean()) ** 252 - 1)
+    else:
+        ann_perf = float(port_returns.mean() * 252)
     vol_ann = float(port_returns.std() * np.sqrt(252))
-    sharpe = float((port_returns.mean() * 252) / (port_returns.std() * np.sqrt(252))) if vol_ann else 0.0
-    downside = port_returns[port_returns < 0]
-    sortino = float((port_returns.mean() * 252) / (downside.std() * np.sqrt(252))) if len(downside) and downside.std() > 0 else 0.0
+    # LEAN subtracts the average risk-free rate (US Treasury curve via the
+    # risk-free interest rate model); the reimplementation defaults to 0.0
+    # (pure excess over cash). Pass risk_free_rate to reproduce LEAN
+    # Sharpe/Sortino one-for-one (audit calibration: ~0.025 for 2016-2024).
+    excess_ann = ann_perf - risk_free_rate
+    sharpe = float(excess_ann / (port_returns.std() * np.sqrt(252))) if vol_ann else 0.0
+    if lean_statistics:
+        # LEAN-faithful downside deviation (verified 0.3901 vs QC 0.39 at
+        # rf~=0.025): sample std of the negative returns only. Kept
+        # byte-identical — do not "fix" toward the textbook definition here,
+        # it would diverge from LEAN.
+        downside = port_returns[port_returns < 0]
+        sortino = float(excess_ann / (downside.std() * np.sqrt(252))) if len(downside) and downside.std() > 0 else 0.0
+    else:
+        # A-L3: textbook downside deviation for the non-lean path — mean of
+        # squared downside vs the daily risk-free target over ALL
+        # observations (not std over negatives only), so the metric no
+        # longer depends on the negative-count convention.
+        daily_rf = risk_free_rate / 252.0
+        downside_sq_mean = float(
+            np.mean([min(0.0, float(r) - daily_rf) ** 2 for r in port_returns])
+        ) if len(port_returns) else 0.0
+        downside_dev = float(np.sqrt(downside_sq_mean * 252.0)) if downside_sq_mean > 0 else 0.0
+        sortino = float(excess_ann / downside_dev) if downside_dev > 0 else 0.0
 
     rolling_max = portfolio_value.cummax()
     drawdown = (portfolio_value - rolling_max) / rolling_max
@@ -319,12 +381,28 @@ def run_backtest(
     open_prices: pd.DataFrame | None = None,
     warm_up_days: int = 150,
     rebalance_threshold: float = 0.02,
+    risk_free_rate: float = 0.0,
+    lean_statistics: bool = False,
+    history_start: str = "2015-08-04",
 ) -> dict[str, Any]:
     """Run the risk parity backtest and return result dict."""
     if prices is None:
-        prices, open_prices = download_prices(start_date, end_date)
+        # A-M6: download from history_start (default QC data start) so the
+        # SMA(200) IsReady gate counts from the LEAN origin.
+        prices, open_prices = download_prices(start_date, end_date, history_start=history_start)
     elif open_prices is None:
         open_prices = prices
+    if prices.index[0] > QC_DATA_START:
+        # Explicit-price path without QC history: the SMA(200) ready-gate
+        # counts local bars only and goes ready late vs LEAN (documented
+        # limitation — pass history from 2015-08-04 or leave prices=None to
+        # download it).
+        logger.warning(
+            "Price history starts %s, after QC data start %s: the SMA(200) "
+            "hedge gate counts local bars only and fires late vs LEAN",
+            prices.index[0].date(),
+            QC_DATA_START.date(),
+        )
     if not 0 <= warm_up_days < len(prices):
         raise ValueError("warm_up_days must be non-negative and less than the number of price rows")
     returns = prices.pct_change().dropna()
@@ -342,9 +420,9 @@ def run_backtest(
     rebalance_dates = first_available_trading_dates(prices.index, rebalance_dates)
     regime_schedule = weekly_correlation_regimes(returns)
 
-    current_weights: dict[str, float] = {t: 0.0 for t in TICKERS}
-    position_entry_prices: dict[str, float | None] = {t: None for t in TICKERS}
-    position_entry_times: dict[str, pd.Timestamp | None] = {t: None for t in TICKERS}
+    current_weights: dict[str, float] = dict.fromkeys(TICKERS, 0.0)
+    position_entry_prices: dict[str, float | None] = dict.fromkeys(TICKERS)
+    position_entry_times: dict[str, pd.Timestamp | None] = dict.fromkeys(TICKERS)
     rebalance_schedule: dict[pd.Timestamp, dict[str, float]] = {}
     portfolio_target_signals: list[dict[str, Any]] = []
     trades: list[dict[str, Any]] = []
@@ -364,11 +442,13 @@ def run_backtest(
         return portfolio_value_at_rebalance
 
     def execution_price(ticker: str, date: pd.Timestamp) -> float:
-        """Prefer the rebalance-day open when it is available locally."""
-        if open_prices is not None and ticker in open_prices.columns and date in open_prices.index:
-            price = open_prices.at[date, ticker]
-            if pd.notna(price):
-                return float(price)
+        """Fill at the rebalance-day close (QuantConnect MarketOnClose).
+
+        LEAN converts intraday market orders on daily resolution into
+        MarketOnClose orders (see QC log 2016-01-04 warning); orders.csv
+        confirms Type='Market On Close' with close prices (median 0.002%
+        vs adjusted close). Never use the open.
+        """
         return float(prices.at[date, ticker])
 
     for i, reb_date in enumerate(rebalance_dates):
@@ -387,12 +467,26 @@ def run_backtest(
             weights, cov, target_vol, max_leverage, max_weight, TICKERS
         )
 
-        # Tail risk hedge: SPY below 200-day SMA * 0.98
+        # Tail risk hedge: SPY below 200-day SMA * 0.98.
+        # LEAN gate: the SMA(200) indicator is only IsReady after 200
+        # bars. With SetWarmUp(150 days) the indicator cannot fire before
+        # ~2016-03 even if the price condition holds (audit: QC did NOT
+        # hedge 2016-02-01 although SPY < SMA200*0.98 on raw history).
+        # bars_since_data_start counts trading bars since the QC data
+        # start (2015-08-04); local histories starting earlier must still
+        # count from that date to reproduce IsReady faithfully.
         spy_idx = prices.index.get_loc(reb_date)
+        bars_since_data_start = (
+            int((prices.index >= QC_DATA_START).sum())
+            - int((prices.index > reb_date).sum())
+        )
+        spy_sma_ready = bars_since_data_start >= 200
         spy_window = prices["SPY"].iloc[max(0, spy_idx - 199) : spy_idx + 1]
         spy_sma = spy_window.mean()
         spy_price = prices["SPY"].iloc[spy_idx]
-        hedge_active = bool(spy_price < spy_sma * 0.98)
+        hedge_active = bool(
+            spy_sma_ready and len(spy_window) >= 200 and spy_price < spy_sma * 0.98
+        )
         if hedge_active:
             weights = apply_tail_risk_hedge(weights)
 
@@ -491,6 +585,8 @@ def run_backtest(
         portfolio_value=portfolio_value,
         trades=trades,
         attribution_pnls=rebalance_attribution_pnls,
+        risk_free_rate=risk_free_rate,
+        lean_statistics=lean_statistics,
     )
 
     stats = {

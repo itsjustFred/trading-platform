@@ -44,6 +44,7 @@ def _load_ohlcv(data_root: Path, symbol: str, timeframe: str, start: str, end: s
 
     df = pd.read_parquet(matches[0])
     df.columns = [str(col).lower() for col in df.columns]
+    df = contract.normalize_ohlcv_frame(df)
     if "timestamp" not in df.columns:
         return None
 
@@ -112,7 +113,12 @@ class NativeAdapter(EngineAdapter):
         total_loaded_bars = 0
 
         for symbol_index, symbol in enumerate(config.symbols):
-            data = _load_ohlcv(data_root, symbol, config.timeframe, config.start_date, config.end_date)
+            # warmup_start extends the
+            # loaded window backwards for indicator warmup; the engine gates
+            # trading to start_date..end_date.
+            warmup_raw = str(getattr(config, "warmup_start", "") or "").strip()
+            load_start = warmup_raw or config.start_date
+            data = _load_ohlcv(data_root, symbol, config.timeframe, load_start, config.end_date)
             if data is None or data.empty:
                 raise RuntimeError(
                     f"No OHLCV data for {symbol}/{config.timeframe} in "
@@ -135,7 +141,7 @@ class NativeAdapter(EngineAdapter):
                 symbol,
                 config.timeframe,
                 config.modeling_resolution,
-                config.start_date,
+                load_start,
                 config.end_date,
             )
             if intrabar is not None and not intrabar.empty and config.modeling_resolution not in used_timeframes:
@@ -162,6 +168,13 @@ class NativeAdapter(EngineAdapter):
         for index, trade in enumerate(all_trades, start=1):
             trade.id = index
 
+        # A-M4 (D5): multi-symbol runs replay all trades onto ONE running
+        # portfolio equity (shared sizing basis, summed exposure) via the
+        # same helper the vectorbt adapter uses. Per-symbol engines still
+        # generate signals independently and size from full capital in pass
+        # 1; the replay re-scales quantities chronologically from shared
+        # equity (position size is linear in equity). Single-symbol runs keep
+        # the legacy path bit-identical (no replay).
         # Realized-PnL portfolio curve over EXIT time (Cleanup 16-D1, F5):
         # per-symbol engines each compound sizing from full capital; a
         # portfolio curve must not sum those per-symbol equities (it would
@@ -169,10 +182,22 @@ class NativeAdapter(EngineAdapter):
         # closed PnL once per portfolio, credited at exit — documented in the
         # cross-engine contract.
         equity_curve: list[EquityPoint] = []
-        running = config.initial_capital
-        for trade in sorted(all_trades, key=lambda item: item.last_exit_time):
-            running += trade.pnl
-            equity_curve.append(EquityPoint(time=trade.last_exit_time, equity=round(running, 2)))
+        shared_summary: dict[str, Any] = {}
+        if len(config.symbols) > 1 and all_trades:
+            from runner.engines._shared import replay_shared_equity
+
+            all_trades, replayed_curve, shared_summary = replay_shared_equity(
+                all_trades, config.initial_capital
+            )
+            all_trades.sort(key=lambda trade: (trade.entry_time, trade.id))
+            for index, trade in enumerate(all_trades, start=1):
+                trade.id = index
+            equity_curve = replayed_curve
+        else:
+            running = config.initial_capital
+            for trade in sorted(all_trades, key=lambda item: item.last_exit_time):
+                running += trade.pnl
+                equity_curve.append(EquityPoint(time=trade.last_exit_time, equity=round(running, 2)))
         emit_progress(90.0, "Calculating statistics...")
 
         now = datetime.now(timezone.utc)
@@ -200,6 +225,9 @@ class NativeAdapter(EngineAdapter):
                 "symbols": config.symbols,
                 "universe": "",
                 "source": "ohlcv",
+                # A-M4 (D5): shared-equity replay summary for multi-symbol
+                # runs (empty for single-symbol legacy path).
+                "shared_equity": shared_summary,
             },
             initial_capital=config.initial_capital,
             parameters=resolved_parameters,
