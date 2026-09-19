@@ -77,6 +77,10 @@ def test_source_session_entries_direction_and_session_open_stop():
     pd.testing.assert_series_equal(
         width.loc[expect.index], expect, check_names=False, atol=1e-9
     )
+    # Bands are centred on the session open (midpoint complements width).
+    mid = ((indicators["Upper_Band"] + indicators["Lower_Band"]) / 2).dropna()
+    centre = indicators["Session_Open"].loc[mid.index]
+    pd.testing.assert_series_equal(mid, centre, check_names=False, atol=1e-9)
 
     # No invented regime filter anymore.
     assert "ATR_Regime_OK" not in indicators
