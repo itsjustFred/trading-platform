@@ -68,6 +68,13 @@ def build_trade_context(df: pd.DataFrame, params: dict | None = None) -> dict[st
 
     for i in range(n):
         if day_key[i] != cur_day:
+            if position != 0:
+                # B-H1 mirror: the prior session had no forced-exit bar (data
+                # gap), so the script's day-reset flatten fires. Book the exit
+                # on the last bar of the prior session instead of silently
+                # dropping the open position. (The signal+1 carry below never
+                # leaks across the session boundary, so this marker stays put.)
+                exit_reason.iloc[i - 1] = "day_reset_flatten"
             cur_day = day_key[i]
             cur_or_high = None
             cur_or_low = None

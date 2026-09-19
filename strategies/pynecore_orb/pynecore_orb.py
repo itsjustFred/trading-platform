@@ -90,6 +90,11 @@ def main(
     day_key = (year(bar_time, _TZ), month(bar_time, _TZ), dayofmonth(bar_time, _TZ))
 
     if _STATE["day"] != day_key:
+        if strategy.position_size != 0:
+            # B-H1: day-reset flatten. No forced-exit bar fired in the prior
+            # session (data gap) — never carry an intraday position overnight.
+            strategy.close("Long", comment="day_reset_flatten")
+            strategy.close("Short", comment="day_reset_flatten")
         _STATE["day"] = day_key
         _STATE["or_high"] = None
         _STATE["or_low"] = None

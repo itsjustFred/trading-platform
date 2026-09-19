@@ -174,3 +174,21 @@ class TestOrbContextMirror:
         ctx = _load_context_module().build_trade_context(df, {})
         assert ctx["OR_High"].iloc[2] == pytest.approx(100.0)
         assert ctx["OR_Low"].iloc[2] == pytest.approx(98.0)
+
+    def test_day_change_flattens_open_position_without_forced_exit_bar(self):
+        # B-H1-Mirror: Position ist zum Session-Ende noch offen (keine
+        # 15:45-ET-Bar in Tag 1 -> kein time_exit), Tag 2 beginnt. Der Helper
+        # muss den Exit auf der letzten Bar von Tag 1 als day_reset_flatten
+        # buchen statt die Position still zu droppen (Skript-Seite: Close).
+        rows = [
+            ("2024-01-02 14:30:00+00:00", 100, 100.0, 98.0, 99.0),  # OR Tag 1
+            ("2024-01-02 15:00:00+00:00", 99, 101.0, 99.0, 101.0),  # LONG-Signal
+            ("2024-01-02 15:30:00+00:00", 101, 103.0, 100.5, 103.0),  # offen, HWM
+            ("2024-01-03 14:30:00+00:00", 100, 100.1, 99.9, 100.0),  # Tag 2
+            ("2024-01-03 15:00:00+00:00", 100, 100.1, 99.9, 100.0),
+        ]
+        df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close"])
+        df["volume"] = 1.0
+        ctx = _load_context_module().build_trade_context(df, {})
+        assert ctx["direction"].iloc[1] == "LONG"
+        assert ctx["exit_reason"].iloc[2] == "day_reset_flatten"
