@@ -149,10 +149,11 @@ def _build_result(result: dict[str, Any], prices: pd.DataFrame, *, start: str, e
     )
 
 
-def regenerate(*, data_dir: Path, source: Path, output: Path, start: str, end: str) -> BacktestResult:
-    prices, open_prices = _load_local_prices(data_dir, source, start, end)
+def regenerate(*, data_dir: Path, source: Path, output: Path, start: str, end: str,
+               history_start: str = "2015-08-04") -> BacktestResult:
+    prices, open_prices = _load_local_prices(data_dir, source, history_start, end)
 
-    def local_prices(_: str, __: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    def local_prices(_: str, __: str, history_start: str | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
         return prices.copy(), open_prices.copy()
 
     original = risk_parity.download_prices
@@ -174,6 +175,8 @@ def main() -> int:
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--start", default="2016-01-01")
     parser.add_argument("--end", default="2024-12-31")
+    parser.add_argument("--history-start", default="2015-08-04",
+                        help="Local price history start (QC data start; A-M6 SMA200 gate origin)")
     args = parser.parse_args()
 
     result = regenerate(
@@ -182,6 +185,7 @@ def main() -> int:
         output=args.output,
         start=args.start,
         end=args.end,
+        history_start=args.history_start,
     )
     print(
         json.dumps(
