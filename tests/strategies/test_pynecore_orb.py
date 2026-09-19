@@ -104,11 +104,22 @@ class TestStrategyRegression:
             if count > 1:
                 # Broker-Emulator-Margin-Splits (100-%-Sizing + 100-%-Margin)
                 # teilen einen Entry in 1-Kontrakt-Stub + Rest; kein zweiter Trade.
-                reasons = [
-                    t.exits[-1].reason
+                # Ein Split-Tag muss genau EINE logische Entry-Identitaet haben
+                # (gleicher Entry-Timestamp + Richtung) und deren Legs muessen
+                # den margin_call tragen — sonst waere es ein echter zweiter Trade.
+                day_trades = [
+                    t
                     for t in backtest_result.trades
                     if pd.Timestamp(t.entry_time).tz_convert("America/New_York").date().isoformat() == day
                 ]
+                identities = {
+                    (t.entry_time, t.direction) for t in day_trades
+                }
+                assert len(identities) == 1, (
+                    f"Tag {day}: {count} Trades ueber {len(identities)} "
+                    f"Entry-Identitaeten ohne Margin-Split ({identities})"
+                )
+                reasons = [t.exits[-1].reason for t in day_trades]
                 assert "margin_call" in reasons, (
                     f"Tag {day}: {count} Trades ohne Margin-Split ({reasons})"
                 )

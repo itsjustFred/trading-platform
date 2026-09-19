@@ -73,11 +73,11 @@ no-gate. Engines agree on the boundary semantics (pinned by cross-engine
 conformance tests).
 
 **Signal exit fill convention (A-M1/D4).** A signal exit (not a protective
-level exit) fills at the **trigger bar's close** in every engine; the
-convention is one place — `_prepare_next_open_execution_data` keeps the exit
-leg unshifted in vectorbt, and `BacktestConfig.signal_exit_fill` (validated
-to `close`/`open`) selects `open` for MT5-parity runs. Stop/TP exits fill at
-the level in every engine (§1).
+level exit) fills at the **trigger bar's close** by default; the convention
+is one place — `_prepare_next_open_execution_data` keeps the exit leg
+unshifted in vectorbt, and `BacktestConfig.signal_exit_fill` (validated to
+`close`/`open`) selects `open` to fill at the exit bar's open instead for
+MT5-parity runs. Stop/TP exits fill at the level in every engine (§1).
 
 **Pynecore CLI bounds.** Pynecore additionally hands each symbol's frame to
 the external `pyne` CLI (`--from`/`--to`). The CLI parses those values with

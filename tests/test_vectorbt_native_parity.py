@@ -322,7 +322,7 @@ class TestAskSideStops:
             take_profit_price=None,
         )
         assert hit is None, "Next-bar intrabar touch must stay outside the window"
-        assert intrabar["low"].min() < 99.0  # sanity: the fixture does contain a touch
+        assert intrabar2["low"].min() < 99.0  # sanity: the fixture does contain a touch
 
 
 class TestFeeModelParity:

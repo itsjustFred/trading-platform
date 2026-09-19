@@ -168,6 +168,57 @@ def parse_log_trades(log_path: pathlib.Path, contract: float) -> list[dict]:
     return trades
 
 
+def parse_xlsx_summary(df) -> dict:
+    """Extract the official MT5 report summary block (label -> raw value).
+
+    Labels sit in one cell, the value in the next non-empty cell of the same
+    row (the MT5 report is a two-column label/value grid laid out across the
+    sheet). Missing labels raise — an unexpected report layout must not
+    silently skip the financial cross-check.
+    """
+    pd = __import__("pandas")
+    labels = {
+        "net": "Nettogewinn gesamt:",
+        "gross_profit": "Bruttogewinn:",
+        "gross_loss": "Bruttoverlust:",
+        "profit_factor": "Profitfaktor:",
+        "trade_count": "Gesamtanzahl Trades:",
+        "won": "Gewonnene Trades",
+    }
+    summary: dict = {}
+    for key, label in labels.items():
+        found = None
+        for i in range(len(df)):
+            for j in range(df.shape[1]):
+                cell = df.iat[i, j]
+                if isinstance(cell, str) and cell.strip().startswith(label):
+                    for k in range(j + 1, df.shape[1]):
+                        v = df.iat[i, k]
+                        if pd.notna(v):
+                            found = v
+                            break
+                    break
+            if found is not None:
+                break
+        if found is None:
+            raise ValueError(f"summary label not found: {label!r}")
+        summary[key] = found
+    return summary
+
+
+def _summary_number(raw) -> float:
+    return float(str(raw).replace("\xa0", "").replace(" ", "").replace("%", ""))
+
+
+def _summary_won_fraction(raw) -> float:
+    """``"222 (45.12%)"`` (won count with percent share) -> 0.4512."""
+    text = str(raw).replace("\xa0", "").replace(" ", "")
+    match = re.search(r"\(([\d.,]+)%\)", text)
+    if not match:
+        raise ValueError(f"cannot parse won-percentage from {raw!r}")
+    return float(match.group(1).replace(",", ".")) / 100.0
+
+
 def parse_xlsx_trades(xlsx_path: pathlib.Path) -> list[dict]:
     pd = __import__("pandas")
     df = pd.read_excel(xlsx_path, sheet_name="Sheet1", header=None)
@@ -234,9 +285,19 @@ def main() -> int:
             w.writeheader()
             w.writerows(xlsx_trades)
 
-        # cross-check: same trade keys and prices
-        log_keys = [(t["entry_time"], t["dir"], t["entry"], t["exit"]) for t in log_trades]
-        xlsx_keys = [(t["entry_time"], t["dir"], t["entry"], t["exit"]) for t in xlsx_trades]
+        # cross-check: same trade keys and prices (entry AND exit times,
+        # direction, prices). Volume is deliberately NOT compared: the log
+        # trades come from the USD runs and the XLSX trades from the EUR
+        # runs (separate backtests with independent sizing), so volumes
+        # legitimately differ between the two sources.
+        log_keys = [
+            (t["entry_time"], t["exit_time"], t["dir"], t["entry"], t["exit"])
+            for t in log_trades
+        ]
+        xlsx_keys = [
+            (t["entry_time"], t["exit_time"], t["dir"], t["entry"], t["exit"])
+            for t in xlsx_trades
+        ]
         match = log_keys == xlsx_keys
         log_total = sum(t["pnl"] for t in log_trades)
         xlsx_net = sum(t["net"] for t in xlsx_trades)
@@ -244,9 +305,47 @@ def main() -> int:
         status = "OK" if match else "MISMATCH"
         if not match:
             ok = False
+
+        # XLSX financial data vs the report's own official summary block:
+        # every computed aggregate must reproduce the printed stats to the
+        # cent (net, gross profit/loss, PF, trade count, win rate).
+        # MT5 computes the summary on the NET per-trade result (Gewinn +
+        # Kommission + Swap), so the gross classification uses `net`, not
+        # the raw `Gewinn` column.
+        pd = __import__("pandas")
+        xlsx_df = pd.read_excel(CMP / xlsx_name, sheet_name="Sheet1", header=None)
+        summary = parse_xlsx_summary(xlsx_df)
+        gross_profit = sum(t["net"] for t in xlsx_trades if t["net"] > 0)
+        gross_loss = sum(t["net"] for t in xlsx_trades if t["net"] < 0)
+        xlsx_wins = sum(1 for t in xlsx_trades if t["net"] > 0)
+        pf = abs(gross_profit / gross_loss) if gross_loss else float("inf")
+        wr = xlsx_wins / len(xlsx_trades) if xlsx_trades else 0.0
+        summary_checks = {
+            "net": (xlsx_net, _summary_number(summary["net"]), 0.01),
+            "gross_profit": (gross_profit, _summary_number(summary["gross_profit"]), 0.01),
+            "gross_loss": (gross_loss, _summary_number(summary["gross_loss"]), 0.01),
+            "profit_factor": (pf, _summary_number(summary["profit_factor"]), 1e-4),
+            "trade_count": (
+                float(len(xlsx_trades)),
+                _summary_number(summary["trade_count"]),
+                0.0,
+            ),
+            "win_rate": (wr, _summary_won_fraction(summary["won"]), 1e-4),
+        }
+        summary_ok = True
+        for check_name, (computed, reported, tol) in summary_checks.items():
+            if abs(computed - reported) > tol:
+                summary_ok = False
+                ok = False
+                print(
+                    f"  {name} SUMMARY MISMATCH {check_name}: "
+                    f"computed={computed:.6f} reported={reported:.6f}",
+                    flush=True,
+                )
         print(
             f"{name}: n={len(log_trades)} log_total={log_total:,.2f} "
-            f"xlsx_net={xlsx_net:,.2f} wins={wins} xlsx==log: {status}",
+            f"xlsx_net={xlsx_net:,.2f} wins={wins} xlsx==log: {status} "
+            f"summary: {'OK' if summary_ok else 'MISMATCH'}",
             flush=True,
         )
     return 0 if ok else 1
