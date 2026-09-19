@@ -113,6 +113,12 @@ def parse_log_trades(log_path: pathlib.Path, contract: float) -> list[dict]:
         d_in, d_out = deals[i], deals[i + 1]
         if d_in["vol"] != d_out["vol"]:
             raise ValueError(f"{log_path}: volume mismatch at deal {d_in['deal']}")
+        if d_out["side"] == d_in["side"]:
+            raise ValueError(
+                f"{log_path}: same-side deal pair at {d_in['time']}: "
+                f"deals {d_in['deal']}/{d_out['deal']} are both "
+                f"{d_in['side']!r} (entry/exit must be opposite sides)"
+            )
         direction = "LONG" if d_in["side"] == "buy" else "SHORT"
         sign = 1 if direction == "LONG" else -1
         pnl = sign * (d_out["price"] - d_in["price"]) * d_in["vol"] * contract
