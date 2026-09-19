@@ -99,7 +99,9 @@ def generate_signals(df: pd.DataFrame, params: dict):
         ts_ny = pd.to_datetime(df["timestamp"], utc=True, errors="coerce").dt.tz_convert(_TZ)
     else:
         ts_ny = pd.to_datetime(df.index, utc=True, errors="coerce").tz_convert(_TZ)
-        ts_ny = pd.Series(ts_ny.values, index=df.index)
+        # Keep the tz-aware series (no .values round-trip: that strips the
+        # timezone and silently shifts session windows to UTC).
+        ts_ny = pd.Series(ts_ny, index=df.index)
     minutes_now = (ts_ny.dt.hour * 60 + ts_ny.dt.minute).to_numpy()
     et_day = ts_ny.dt.date.to_numpy()
 
@@ -181,6 +183,16 @@ def generate_signals(df: pd.DataFrame, params: dict):
                 sl_price.iloc[i] = active_sl
                 traded = True
                 in_trade = True
+
+    if in_trade and len(df) > 0:
+        # B-H1 edge: the frame ends mid-day with an open position (no further
+        # bar to trigger the 16:00 EOD exit or a day-change flatten). Book the
+        # exit on the last bar at its close instead of dropping the position
+        # (phantom trade: entry without exit).
+        last = len(df) - 1
+        exits.iloc[last] = True
+        exit_price.iloc[last] = float(close.iloc[last])
+        exit_reason.iloc[last] = "day_reset_flatten"
 
     _ = open_  # retained for OHLCV-shape parity; logic keys off high/low/close
     indicators_dict = {

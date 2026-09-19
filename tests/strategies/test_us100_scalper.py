@@ -151,3 +151,46 @@ def test_code_values_win_over_infos_txt():
     assert "entry 0.5" in module.STRATEGY_META["notes"]
     # ... aber implementiert sind die CODE-Werte.
     assert "code values are implemented" in module.STRATEGY_META["notes"]
+
+
+def test_index_only_frame_matches_timestamp_column():
+    """Index-Pfad muss NY-Zeit behalten (kein .values-TZ-Strip → UTC-Shift).
+
+    Ohne timestamp-Spalte leitet die Strategie ET-Sessions aus dem
+    tz-aware UTC-DatetimeIndex ab; Ergebnis muss identisch zum
+    timestamp-Spalten-Pfad sein (sonst +5h-Fenster-Shift im Winter).
+    """
+    module = _load_module()
+    df = _frame()
+    df_idx = df.drop(columns=["timestamp"]).copy()
+    df_idx.index = pd.DatetimeIndex(df["timestamp"])
+    entries_a, exits_a, ind_a, _ = module.generate_signals(df, {})
+    entries_b, exits_b, ind_b, _ = module.generate_signals(df_idx, {})
+    assert entries_a.to_numpy().tolist() == entries_b.to_numpy().tolist()
+    assert exits_a.to_numpy().tolist() == exits_b.to_numpy().tolist()
+    assert (
+        ind_a["exit_reason"].fillna("").tolist()
+        == ind_b["exit_reason"].fillna("").tolist()
+    )
+    assert entries_b.sum() == 1, "Index-Pfad muss denselben Fill finden"
+
+
+def test_frame_end_flattens_open_position():
+    """B-H1-Edge: Frame endet mid-day mit offener Position (kein EOD/Day-Reset).
+
+    Entry 13:00 UTC, Frame endet 15:00 UTC (vor 16:00-ET-EOD, kein Tag 2):
+    Exit muss auf der letzten Bar zum Close als day_reset_flatten gebucht
+    werden statt die Position still zu droppen.
+    """
+    module = _load_module()
+    df = _frame()
+    end = df.index[df["timestamp"] == pd.Timestamp("2024-01-02 15:00", tz="UTC")][0]
+    df_cut = df.iloc[: end + 1].reset_index(drop=True)
+    entries, exits, indicators, _ = module.generate_signals(df_cut, {})
+    assert entries.sum() == 1
+    exit_idx = exits[exits].index.tolist()
+    assert exit_idx == [df_cut.index[-1]], "Exit muss auf der letzten Bar liegen"
+    assert indicators["exit_reason"].iloc[-1] == "day_reset_flatten"
+    assert indicators["exit_price"].iloc[-1] == pytest.approx(
+        float(df_cut["close"].iloc[-1])
+    )
