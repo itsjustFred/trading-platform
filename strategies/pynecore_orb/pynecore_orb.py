@@ -52,11 +52,15 @@ from pynecore import Series
 from pynecore.lib import script, input, strategy
 from pynecore.lib import high, low
 from pynecore.lib import time, hour, minute, dayofmonth, month, year
+from pynecore.lib import timeframe
 
 
 _TZ = "America/New_York"
 _OR_START_MINUTES = 9 * 60 + 30  # 09:30 ET
 
+# Session state. Module-level by design: the adapter runs one pyne CLI
+# subprocess per symbol, so this is process-isolated (the pyne equivalent
+# of Pine `var`); pynecore.lib offers no Persistent-fields API.
 _STATE = {
     "day": None,
     "or_high": None,
@@ -84,6 +88,15 @@ def main(
     exit_hour_ny: int = input.int(15, title="Forced Exit Hour (ET)"),
     exit_minute_ny: int = input.int(45, title="Forced Exit Minute"),
 ):
+    # Coarse bars cannot express the 30-minute opening range (a 1h bar spans
+    # past the window end; daily bars have no session clock). Fail loudly
+    # instead of backtesting silently wrong sessions. 30m is the coarsest
+    # supported interval — one bar covers the window exactly.
+    if not timeframe.isintraday() or timeframe.in_seconds() > 30 * 60:
+        raise ValueError(
+            "pynecore_orb requires 30m-or-finer intraday bars "
+            f"(chart timeframe {timeframe.period!r})."
+        )
     bar_time = time()
     bar_hour = hour(bar_time, _TZ)
     bar_minute = minute(bar_time, _TZ)
@@ -133,6 +146,8 @@ def main(
         return
 
     if position > 0:
+        # HWM/LWM track close by design: QC Variant 2 watermarks
+        # current_price = bar close (algorithm.py), not high/low.
         price = float(src)
         if _STATE["hwm"] is None or price > _STATE["hwm"]:
             _STATE["hwm"] = price
