@@ -52,4 +52,4 @@
 - `docs/validation_architecture.md` dokumentiert Architektur und Reuse-vs-Neu-Entscheidung.
 - `docs/validation_inventory.md` listet bestehende relevante Module auf.
 - `docs/mt5_xlsx_schema.md` beschreibt das XLSX-Spaltenschema.
-- `todo/kimchi-todo.md` enthält pro Phase verifizierbare Tasks.
+- `docs/todo/todo.md` listet die bei der Verifikation offen gebliebenen Punkte.

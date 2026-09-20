@@ -12,69 +12,77 @@ venv/
 dist/
 build/
 
-# IDE
-.idea/
-.vscode/*
-!.vscode/mcp.json
-.obsidian/
-.pi/tau-instances/
-~/.pi/tau-instances/
-*.swp
-*.swo
-
-# Environment (.env.example allowed)
-.env
-*.env
-.env.*
-!*.env.example
-
 # OS
 .DS_Store
 Thumbs.db
 
-# User data (lives in $TRADING_DATA_DIR, not in repo)
+# IDE / Editor
+.idea/
+.vscode/*
+!.vscode/mcp.json
+.obsidian/
+*.swp
+*.swo
+
+# Coding-agent local state (nie committen; Doku dazu liegt in docs/)
+.commandcode/
+.claude/worktrees/
+.claude/settings.json
+.claude/settings.local.json
+.codex/
+.hermes/
+.opencode/
+.cursor/
+.aider*
+.qodo/
+.pi/tau-instances/
+~/.pi/tau-instances/
+.playwright-mcp
+
+# Secrets / Environment (.env.example erlaubt)
+.env
+*.env
+.env.*
+!*.env.example
+.accounts.env
+live_integration_report.json
+live_smoke_*.json
+docs/reports/live_daemon_*.log
+docs/reports/live_smoke_*.json
+
+# User data (lebt in $TRADING_DATA_DIR, nicht im Repo)
 data/
 logs/
-
-# Node
-node_modules/
-
-# Frontend build output (must be built locally)
-frontend/dist/
-
-# Data files (managed separately in $TRADING_DATA_DIR)
 *.parquet
 *.csv
 !tests/fixtures/*.csv
 !tests/fixtures/validation/quantconnect-reference/*.csv
 !tests/fixtures/*.json
 
-# Cache/temp
+# Node
+node_modules/
+
+# Frontend build output (wird lokal gebaut)
+frontend/dist/
+frontend/public/matrix-grid-overview.json
+
+# Cache / temp
 .pytest_cache/
 .ruff_cache/
-.playwright-mcp
 temp/
 tmp/
 
 # uv
-.accounts.env
+.uv/
 
-# Kimchi runtime data (generated locally, large)
+# Kimchi runtime data (generiert, gross)
 .kimchi/
 
-# Graphify output (generated locally, not versioned)
+# Graphify output (generiert, nicht versioniert)
 graphify-out/
 
-# Generated backtest/grid artifacts (regenerate locally; curated fixtures live
-# under tests/fixtures/)
+# Generierte Backtest-/Grid-Artefakte (lokal regenerieren; kuratierte
+# Fixtures liegen unter tests/fixtures/)
 *.trades.json
-reports/*.csv
-reports/*.trades.json
-frontend/public/matrix-grid-overview.json
 
-# Live smoke integration report (generated at repo root, contains account
-# ids/balances - never commit)
-live_integration_report.json
-
-# Command Code local state
-.commandcode/
+# Docs werden IMMER committet — keine docs/-Ignore-Regel hier einbauen.

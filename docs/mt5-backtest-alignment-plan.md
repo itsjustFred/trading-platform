@@ -22,7 +22,7 @@ Dukascopy index-CFD aliases.
 ## Current Baseline
 
 The first strategy-alignment pass is documented in
-`reports/strategy-comparison-platform-check-2026-06-23.md`.
+`reports/strategy-comparison-platform-check-2026-06-23.md` (historisch, mit `reports/`-Ordner entfernt; Vergleichsbasis heute: `strategy-comparisons/`).
 
 Main remaining gaps:
 
@@ -409,15 +409,15 @@ Likely files:
 
 - Add `scripts/compare_mt5_report.py`
 - Add `tests/test_compare_mt5_report.py`
-- Add generated markdown reports under `reports/`
+- Add generated markdown reports under `docs/reports/` (früher `reports/`, Ordner im Repo-Cleanup entfernt)
 
 Proposed command:
 
 ```bash
 python -m scripts.compare_mt5_report \
   --mt5 strategy-comparisons/intraday_volatility_breakout/SP500_M1.html \
-  --platform reports/strategy_comparison_backtest_SP500_M1_after_align_20260623.trades.json \
-  --output reports/mt5_alignment_SP500_M1_YYYYMMDD.md
+  --platform [entfernt] reports/strategy_comparison_backtest_SP500_M1_after_align_20260623.trades.json \
+  --output docs/reports/mt5_alignment_SP500_M1_YYYYMMDD.md
 ```
 
 Implementation tasks:
@@ -484,8 +484,8 @@ Suggested commit:
 Likely files:
 
 - `tests/fixtures/mt5_reports/`
-- `reports/mt5_alignment_*.md`
-- `reports/strategy_comparison_backtest_*_mt5_align_*.trades.json`
+- `docs/reports/mt5_alignment_*.md` (früher `reports/`)
+- `docs/reports/strategy_comparison_backtest_*_mt5_align_*.trades.json` (früher `reports/`)
 - `tests/test_auto_download.py`
 - `tests/test_dukascopy_downloader.py`
 
@@ -498,7 +498,7 @@ Implementation tasks:
 - Create an integration validation script or documented command sequence:
   - run native platform backtest for each reference with MT5 alignment params
   - run comparison CLI
-  - save markdown reports under `reports/`
+  - save markdown reports under `docs/reports/` (früher `reports/`)
 - Add non-regression coverage for data routing:
   - AAPL intraday routes to existing equity path, HuggingFace/Alpaca/yfinance as
     configured today.
