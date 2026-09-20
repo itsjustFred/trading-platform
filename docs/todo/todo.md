@@ -1,6 +1,6 @@
 # TODO — Trading-Platform (Repo-Cleanup-Nachlese)
 
-Stand: 2026-09-12 · Branch: `repo-cleanup` · Worktree: `/home/ubuntu/worktrees/repo-cleanup`
+Stand: 2026-09-12 · Branch: `repo-cleanup`
 Quelle: Verifikation der Alt-Todos (`todo/todo.md`, `todo/kimchi-todo.md`, `overnight_report.md`,
 `reports/`, `server_planning/`) gegen den Code + Sichtung von Home-Quellen
 (`~/tmp/`, `~/codex-goals/`, Home-Root-`*.md`, `.claude/.codex/.commandcode/.hermes/.opencode`).
@@ -52,25 +52,25 @@ Legende: `[ ]` offen · `[x]` erledigt (nur mit Code-Beleg abhaken) · Quelle in
   `docs/planning-prompt-for-external-model.md`, `docs/signal-risk-execution-contract.md`
   als historisch (`reports/` entfernt) markiert.
 
-## 2. Security / Money-Path (aus `muse-findings/`, Stand main@`6caf461` — gegen aktuellen Code re-validieren!)
+## 2. Security / Money-Path (aus `muse-findings/`, Stand main@`6caf461` — Triage-Stand: Issue #90, 2026-09-20; Fundorte vor Fix am Code verifizieren!)
 
-- [ ] WS-Log Path-Traversal + Full-File-Read (`viewer/main.py:10881`) — kritisch
-- [ ] Live-Execution Check-then-Insert → Doppel-Fill (`shared/database.py`) — kritisch
-- [ ] cTrader `submit_order` → `""` als Erfolg; `daemon.py:566` Exit-only schließt Shorts nie — kritisch
-- [ ] Alpaca-Stream-Leak (Handler-Akkumulation, Executor-Blockade) — kritisch
-- [ ] Startup-RCE via DB-Recovery (`viewer/main.py:469`) — kritisch
-- [ ] Default All-in `risk_per_trade=None → 100%` — kritisch
-- [ ] Discord `int()`-Crash + 20er-Fenster-Dup-Orders; `connect() → RUNNING` ohne Netz
-- [ ] Fees/Slippage ≠ 0, CAGR/Sortino/Optimizer-Penalty korrekt rechnen
-- [ ] `trading_engine.py:70` deprecated `max_position_pct`-Fallback entfernen (vgl. `cleanup-kampagne/cleanup-kampagne-reste-2026-09-06.md`)
-- [ ] `viewer/main.py` `response_model`-Dups + 14× S3776 ≥ 40 aufräumen
-- [ ] 5 Fails `test_auto_agent_backtest_timeout.py` (Namespace-Drift PR #66 → `agent_process.py`)
+- [ ] WS-Log Path-Traversal + Full-File-Read (`viewer/main.py:10881`) — kritisch → #91 (B1)
+- [ ] Live-Execution Check-then-Insert → Doppel-Fill (`shared/database.py`) — kritisch → #95 (Dedup-Gaps)
+- [ ] cTrader `submit_order` → `""` als Erfolg; `daemon.py:566` Exit-only schließt Shorts nie — kritisch → #77 + #76
+- [ ] Alpaca-Stream-Leak (Handler-Akkumulation, Executor-Blockade) — kritisch → #78
+- [ ] Startup-RCE via DB-Recovery (`viewer/main.py:469`) — kritisch → #91 (B1)
+- [ ] Default All-in `risk_per_trade=None → 100%` — kritisch → #95 (Full-Equity-Default)
+- [ ] Discord `int()`-Crash + 20er-Fenster-Dup-Orders; `connect() → RUNNING` ohne Netz → #92 (B2)
+- [ ] Fees/Slippage ≠ 0, CAGR/Sortino/Optimizer-Penalty korrekt rechnen → #84, #82, #83, #87
+- [ ] `trading_engine.py:70` deprecated `max_position_pct`-Fallback entfernen (vgl. `cleanup-kampagne/cleanup-kampagne-reste-2026-09-06.md`) → #94 (16-E-Rest)
+- [ ] `viewer/main.py` `response_model`-Dups + 14× S3776 ≥ 40 aufräumen → #94
+- [ ] 5 Fails `test_auto_agent_backtest_timeout.py` (Namespace-Drift PR #66 → `agent_process.py`) → #94
 
 ## 3. Cleanup-Kampagne fertig fahren (aus `cleanup-kampagne/`)
 
-- [ ] Baseline-Tag `cleanup-baseline` + `reports/baseline-cleanup.md` (Basis-Metriken) anlegen
+- [ ] Baseline-Tag `cleanup-baseline` + `docs/reports/baseline-cleanup.md` (Basis-Metriken) anlegen
 - [ ] Regel-Tabelle fix/suppress/won't-fix aus Sonar-Export ableiten (1190 Issues, S3776×225, S8415/09×254)
-- [ ] Tracking-Ticket #68 Metadata-Bypass + Sonar-Gate `cancelled` klären
+- [ ] Metadata-Bypass-Verifikation per #94 (Rest-Item; #68 ist der gemergte PR „Cleanup 20-A", kein Tracking-Ticket) + Sonar-Gate `cancelled` klären
 - [x] Merge-Sequenz der 26 PRs laut `merge-auftrag-26-prs.md` abarbeiten (erledigt – alle 26 PRs gemergt, Stand 5184b46; historisch)
 - [ ] Money-Path im Zweifel won't-fix (live_runner/risk/engines nur mit Tests anfassen)
 
@@ -100,10 +100,10 @@ Legende: `[ ]` offen · `[x]` erledigt (nur mit Code-Beleg abhaken) · Quelle in
 
 ## 7. Repo-Hygiene (Rest aus Cleanup-Verifikation)
 
-- [x] `100`, `.scannerwork/`, `rndm_stuff/`, `PR_REVIEW_SUMMARY.md`, artifacts-Videos, `overnight_report.md`, `todo/`, `reports/`, `server_planning/` entfernt (Commit `468f03a`)
+- [x] `100`, `.scannerwork/`, `rndm_stuff/`, `PR_REVIEW_SUMMARY.md`, artifacts-Videos, `overnight_report.md`, `todo/`, `reports/`, `server_planning/` entfernt (Commit `ccde4e7`)
 - [ ] **ENTSCHEIDUNG OFFEN**: `docs/codex-rewrite-notes.md`, `docs/planning-prompt-for-external-model.md`, `docs/hermes-sessions/` löschen? (abgeschlossene Sessions, keine externen Refs per Grep)
 - [ ] **ENTSCHEIDUNG OFFEN**: `.graphifyignore` (ungenutzt) + `.gitattributes` (schützt nur QC-CSV-Fixtures) behalten?
-- [ ] **ENTSCHEIDUNG OFFEN**: `sonar-project.properties` (enthält `reports/**`, `rndm_stuff/**`, `100` in exclusions — jetzt tote Pfade) bereinigen?
-- [ ] `.gitignore` neu sortieren (Coding-Agent-Block, `docs/` immer committet) — siehe Commit-Historie
+- [x] `sonar-project.properties`-Exclusions bereinigt (`reports/**`, `rndm_stuff/**`, `100` raus, `reports/` → `docs/reports/`; Commit `7eca1b6`)
+- [x] `.gitignore` neu sortiert (Coding-Agent-Block, `docs/` immer committet; Commit `7eca1b6`)
 - [ ] `data/` (nur 4 JSON, `.gitignore`-Regel `data/` greift nicht für Getracktes) — ent-tracken oder bewusst behalten?
 - [ ] `~/tmp/review.md` ist Fremdthema (Bewerbungen) — NICHT ins Repo
