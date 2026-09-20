@@ -26,7 +26,9 @@ Thumbs.db
 
 # Coding-agent local state (nie committen; Doku dazu liegt in docs/)
 .commandcode/
-.claude/
+.claude/worktrees/
+.claude/settings.json
+.claude/settings.local.json
 .codex/
 .hermes/
 .opencode/
