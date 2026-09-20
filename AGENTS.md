@@ -24,3 +24,4 @@ After you're done with the work and have added it to the PR, run the `platform-p
 When referencing an issue, include it in the PR description, but not in the title.
 Before starting work, check open PRs for an existing PR on this issue, and do not submit a competing one unless explicitly told by the user, instead add useful context or an alternative approach.
 Give the `ready-for-human` tag only if the implementation is done. If further work is required after human review, remove the tag while working and re-add when done.
+After merging a PR that fully solves an issue, close the issue unless told otherwise. If it only partly solves it, leave it open and comment remaining scope with PR link.
