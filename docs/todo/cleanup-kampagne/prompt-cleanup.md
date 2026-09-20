@@ -1,7 +1,7 @@
 Bitte helfe mir beim Cleanup der Codebase.
 
 Ich habe eine code-review per KI gemacht, gespeichert unter reports/code-review-full-ox-alpha-2026-08-24.md sowie eine Analyse mit SonarQube, gespeichert unter reports/sonar-review-full-2408.json
-Wenn du weitere Infos über einzelne Sonar-Findings benötigst, kannst du diese mit ```curl -s -u "squ_8db202512e3d520c3bdf2c46ad0c4904bfc002ae:" "http://localhost:9000/api/issues/search?componentKeys=trading-platform-local&resolved=false&ps=500" | python3 -m json.tool``` abrufen, wenn du weitere Infos zu Filtern, bspw. nach Severity brauchst, schaue mit ```ctx7``` cli nach docs zu sonarqube (token nie in commits/issues kopieren)
+Wenn du weitere Infos über einzelne Sonar-Findings benötigst, kannst du diese mit ```curl -s -u "${SONAR_TOKEN}:" "http://localhost:9000/api/issues/search?componentKeys=trading-platform-local&resolved=false&ps=500" | python3 -m json.tool``` abrufen (Token aus Umgebungsvariable, nie in commits/issues kopieren), wenn du weitere Infos zu Filtern, bspw. nach Severity brauchst, schaue mit ```ctx7``` cli nach docs zu sonarqube (token nie in commits/issues kopieren)
 Allein von SonarQube gibt es schon 1190 Issues insgesamt, viele davon doppeln sich aber (es gibt bspw. 225x Regel S3776 und 254x S8415/S8409)
 
 Bitte gehe wie folgt vor:

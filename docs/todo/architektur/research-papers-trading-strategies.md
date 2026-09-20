@@ -161,7 +161,7 @@
 | **FinRobot** | laufend | Sehr hoch — AI Agent Platform für Financial Analysis. Multi-Agent-Workflows | [GitHub](https://github.com/AI4Finance-Foundation/FinRobot) |
 | **Gym Trading Environment** | laufend | Hoch — Einfache, schnelle Trading-Gym für RL-Agenten. Short/Margin, Multi-Exchange, High-Performance-Rendering | [GitHub](https://github.com/ClementPerroud/Gym-Trading-Env) |
 | **JaxMARL-HFT** | 2025 | Sehr hoch — GPU-accelerated Multi-Agent RL für HFT. JAX-basiert, LOBSTER-Daten, Market Making, Execution, Directional Trading | [GitHub](https://github.com/vmohl/JaxMARL-HFT) |
-| **TradeMaster** | 2025 | Hoch — RL-empowered Plattform für Quantitative Trading. Strategy Research & Simulation | [GitHub](https://github.com/)(siehe Grokipedia) |
+| **TradeMaster** | 2025 | Hoch — RL-empowered Plattform für Quantitative Trading. Strategy Research & Simulation | (kein direkter Repo-Link verifiziert, siehe Grokipedia) |
 | **Deep RL for Automated Stock Trading: Ensemble Strategy** | 2025 | Sehr hoch — Ensemble PPO, A2C, DDPG. 30 Dow Jones-Aktien. Sharpe verbessert. Open-Source FinRL | [arXiv:2511.12120](https://arxiv.org/abs/2511.12120) |
 | **Deep RL for Trading** (Oxford) | 2019 | Sehr hoch — DQN/DRL auf 50 Futures (2011–2019). Übertrifft Time-Series-Momentum. Volatility Scaling integriert | [arXiv:1911.10107](https://arxiv.org/abs/1911.10107) |
 

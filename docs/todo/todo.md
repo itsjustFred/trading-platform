@@ -71,7 +71,7 @@ Legende: `[ ]` offen · `[x]` erledigt (nur mit Code-Beleg abhaken) · Quelle in
 - [ ] Baseline-Tag `cleanup-baseline` + `reports/baseline-cleanup.md` (Basis-Metriken) anlegen
 - [ ] Regel-Tabelle fix/suppress/won't-fix aus Sonar-Export ableiten (1190 Issues, S3776×225, S8415/09×254)
 - [ ] Tracking-Ticket #68 Metadata-Bypass + Sonar-Gate `cancelled` klären
-- [ ] Merge-Sequenz der 26 PRs laut `merge-auftrag-26-prs.md` abarbeiten (strikt sequenziell, STOPP bei live/risk/engine-Konflikten)
+- [x] Merge-Sequenz der 26 PRs laut `merge-auftrag-26-prs.md` abarbeiten (erledigt – alle 26 PRs gemergt, Stand 5184b46; historisch)
 - [ ] Money-Path im Zweifel won't-fix (live_runner/risk/engines nur mit Tests anfassen)
 
 ## 4. Live-Integration / Deploy (aus `pr-vorbereitung/`, Home-Root-Goals, Codex-Goals)

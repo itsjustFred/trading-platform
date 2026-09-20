@@ -5,10 +5,7 @@ Status: credential-gated as of 2026-07-13.
 ## Preconditions
 
 - `.accounts.env` exists and remains gitignored.
-- Alpaca account blocks `ACC1..3` contain paper endpoints only:
-  - Nitro: `PA3E767TJ91D`
-  - RamJet: `PA3T0MQAGQ51`
-  - RocketFuel: `PA3EFBL4P7BU`
+- Alpaca account blocks `ACC1..3` (Nitro, RamJet, RocketFuel) contain paper endpoints only; IDs werden aus `.accounts.env` aufgeloest, nicht hier dokumentiert.
 - Discord bot tokens and channel IDs are set for Nitro, RamJet, and RocketFuel.
 - cTrader credentials are demo credentials if the cTrader smoke is run.
 
