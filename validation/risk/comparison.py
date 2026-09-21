@@ -54,6 +54,10 @@ class RiskComparisonConfig:
     account_balance: float = 100_000.0
     sizing_model: SizingModel = SizingModel.FIXED_RISK
     model_config: FixedRiskConfig | PercentRiskConfig | None = None
+    #: Phantom (actual-without-expected) trades fail the comparison by
+    #: default (#85). A strict count threshold is explicit opt-in only —
+    #: mirrors ``ReadinessConfig.max_extra_trades`` (default 0).
+    max_extra_trades: int = 0
 
 
 @dataclass
@@ -144,7 +148,12 @@ class RiskComparator:
                 )
             )
 
-        for act_trade in match_result.extra:
+        # Phantom trades (#85): an actual trade with no expected counterpart
+        # used to pass as `info` — certifying agreement that was never
+        # checked. Fail by default; a strict threshold is explicit opt-in.
+        extra_trades = list(match_result.extra)
+        extra_passed = len(extra_trades) <= max(0, int(self.config.max_extra_trades))
+        for act_trade in extra_trades:
             profile = self._compute_profile(act_trade)
             results.append(
                 RiskComparisonResult(
@@ -153,10 +162,16 @@ class RiskComparator:
                     expected_risk_profile=None,
                     actual_risk_profile=profile,
                     field_results={},
-                    passed=True,
-                    severity="info",
+                    passed=extra_passed,
+                    severity="info" if extra_passed else "error",
                     explanation=(
                         f"Actual trade {act_trade.id} has no matching expected trade"
+                        + (
+                            ""
+                            if extra_passed
+                            else " (phantom trade: exceeds max_extra_trades="
+                            f"{self.config.max_extra_trades})"
+                        )
                     ),
                 )
             )
@@ -167,11 +182,17 @@ class RiskComparator:
         """Build a risk profile for *trade* using the configured adapter."""
         stop_loss = getattr(trade, "stop_loss", None)
         if stop_loss is None and trade.meta:
-            stop_loss = trade.meta.get("stop_loss")
+            for _key in ("stop_loss", "sl_price", "stop_price"):
+                stop_loss = trade.meta.get(_key)
+                if stop_loss is not None:
+                    break
 
         take_profit = getattr(trade, "take_profit", None)
         if take_profit is None and trade.meta:
-            take_profit = trade.meta.get("take_profit")
+            for _key in ("take_profit", "tp_price"):
+                take_profit = trade.meta.get(_key)
+                if take_profit is not None:
+                    break
 
         if stop_loss is None:
             return None

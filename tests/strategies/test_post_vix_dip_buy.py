@@ -40,7 +40,7 @@ EXPECTED_NET_PROFIT = 0.00
 @pytest.fixture(scope="module")
 def backtest_result():
     engine = VectorbtAdapter()
-    config = BacktestConfig(
+    config = BacktestConfig(parameters={"fees": "zero"}, 
         strategy_name="post_vix_dip_buy",
         symbols=[TEST_SYMBOL],
         timeframe=TEST_TIMEFRAME,

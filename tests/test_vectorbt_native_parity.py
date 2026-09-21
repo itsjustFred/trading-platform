@@ -29,6 +29,15 @@ from runner.engines.vectorbt_adapter import (
 from tests.helpers import write_ohlcv as _write_shared_ohlcv
 
 
+
+def _with_zero_fees(payload: dict) -> dict:
+    """#84: explicit no-cost declaration for engine fixtures."""
+    merged = dict(payload)
+    params = dict(merged.get("parameters") or {})
+    params.setdefault("fees", "zero")
+    merged["parameters"] = params
+    return merged
+
 def _frame() -> pd.DataFrame:
     return pd.DataFrame(
         {
@@ -92,7 +101,7 @@ def _config(tmp_path: Path, strategy_file: str, **overrides: Any) -> BacktestCon
         "parameters": {"spread_price_col": "spread_price"},
     }
     payload.update(overrides)
-    return BacktestConfig(**payload)
+    return BacktestConfig(**_with_zero_fees(payload))
 
 
 def _write_strategy(tmp_path: Path, name: str, text: str) -> str:
@@ -169,7 +178,7 @@ class TestWarmupGate:
         )
         path = parity_env / "warmup_strat.py"
         path.write_text(text)
-        config = BacktestConfig(
+        config = BacktestConfig(parameters={"fees": "zero"}, 
             strategy_name="vbt_warmup",
             symbols=["VBW"],
             timeframe="1h",

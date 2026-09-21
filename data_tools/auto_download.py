@@ -39,6 +39,25 @@ _US_STOCK_SYMBOL_PATTERN = re.compile(r"^[A-Z][A-Z.\-]{0,9}$")
 INTERNAL_GAP_FAIL_DAYS = 3
 INTERNAL_GAP_WARN_DAYS = 1
 
+# #86: segment-coverage rule replacing the 1-bar check. Expected bars are
+# derived from timeframe x segment length; >=95% of expected bars must be
+# present and no single bar-to-bar gap may exceed 3x the timeframe,
+# regardless of density. Exchange/forex calendars are an explicit open item
+# (weekends/holidays are not skipped here — the gate is intentionally
+# strict and fails closed on gappy months).
+TIMEFRAME_MINUTES: dict[str, float] = {
+    "1m": 1.0,
+    "5m": 5.0,
+    "15m": 15.0,
+    "30m": 30.0,
+    "1h": 60.0,
+    "4h": 240.0,
+    "1d": 1440.0,
+    "1w": 10080.0,
+}
+SEGMENT_MIN_DENSITY = 0.95
+SEGMENT_MAX_GAP_MULTIPLIER = 3.0
+
 
 @dataclass
 class InternalGap:
@@ -420,7 +439,13 @@ def has_ohlcv_bars_in_range(
     end: str,
     data_dir: str | Path = "",
 ) -> bool:
-    """Return whether canonical OHLCV data contains a valid bar in ``[start, end]``."""
+    """Return whether canonical OHLCV data contains a valid bar in ``[start, end]``.
+
+    NOTE (#86): presence-only — a single bar in a month-long segment still
+    returns True. Backtest/optimizer segment gates must use
+    :func:`has_sufficient_segment_coverage` instead; this helper stays for
+    freshness checks (e.g. weekly refresh) where presence is the question.
+    """
     normalized_symbol = str(symbol or "").strip().upper()
     normalized_timeframe = normalize_timeframe(str(timeframe or "").strip())
     if not normalized_symbol or not normalized_timeframe:
@@ -438,6 +463,81 @@ def has_ohlcv_bars_in_range(
         if path.parent.name.upper() == normalized_symbol
     )
     return any(_parquet_has_bar_in_range(path, start_ts, end_ts) for path in matches)
+
+
+def _segment_timestamps_in_range(
+    symbol: str,
+    timeframe: str,
+    start_ts: pd.Timestamp,
+    end_ts: pd.Timestamp,
+    data_dir: str | Path = "",
+) -> list[pd.Timestamp]:
+    """Collect sorted unique bar timestamps in ``[start_ts, end_ts]``."""
+    normalized_symbol = str(symbol or "").strip().upper()
+    normalized_timeframe = normalize_timeframe(str(timeframe or "").strip())
+    ohlcv_root = _resolve_data_root(data_dir) / "ohlcv"
+    matches = sorted(
+        path
+        for path in ohlcv_root.rglob(f"**/{normalized_timeframe}.parquet")
+        if path.parent.name.upper() == normalized_symbol
+    )
+    stamps: set[pd.Timestamp] = set()
+    for path in matches:
+        try:
+            frame = pd.read_parquet(path, columns=["timestamp"])
+        except Exception:
+            continue
+        if "timestamp" not in frame.columns or frame.empty:
+            continue
+        parsed = pd.to_datetime(
+            frame["timestamp"], utc=True, errors="coerce", format="mixed"
+        ).dropna()
+        for value in parsed:
+            ts = pd.Timestamp(value)
+            if start_ts <= ts <= end_ts:
+                stamps.add(ts)
+    return sorted(stamps)
+
+
+def has_sufficient_segment_coverage(
+    *,
+    symbol: str,
+    timeframe: str,
+    start: str,
+    end: str,
+    data_dir: str | Path = "",
+    min_density: float = SEGMENT_MIN_DENSITY,
+    max_gap_multiplier: float = SEGMENT_MAX_GAP_MULTIPLIER,
+) -> bool:
+    """Return whether ``[start, end]`` has dense, gap-free coverage (#86).
+
+    Expected bars = segment length / timeframe step; at least ``min_density``
+    (default 95%) must be present, and no single bar-to-bar gap may exceed
+    ``max_gap_multiplier`` x the timeframe step (default 3x), regardless of
+    density. A month-long segment with a single bar is rejected. Unknown
+    timeframes fail closed.
+    """
+    normalized_timeframe = normalize_timeframe(str(timeframe or "").strip())
+    step_minutes = TIMEFRAME_MINUTES.get(normalized_timeframe)
+    if step_minutes is None:
+        return False
+    start_ts = pd.to_datetime(str(start or ""), utc=True, errors="coerce")
+    end_ts = pd.to_datetime(str(end or ""), utc=True, errors="coerce")
+    if pd.isna(start_ts) or pd.isna(end_ts) or start_ts > end_ts:
+        return False
+    span_minutes = max((end_ts - start_ts).total_seconds() / 60.0, 0.0)
+    expected = max(int(span_minutes // step_minutes) + 1, 1)
+    stamps = _segment_timestamps_in_range(symbol, normalized_timeframe, start_ts, end_ts, data_dir)
+    if not stamps:
+        return False
+    if len(stamps) / expected < min_density:
+        return False
+    step = pd.Timedelta(minutes=step_minutes)
+    limit = step * max_gap_multiplier
+    for prev, cur in zip(stamps, stamps[1:]):
+        if cur - prev > limit:
+            return False
+    return True
 
 
 def _build_requirements(

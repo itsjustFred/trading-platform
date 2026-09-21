@@ -25,6 +25,15 @@ from runner.engines.native_adapter import NativeAdapter
 from tests.helpers import write_ohlcv as _write_ohlcv
 
 
+
+def _with_zero_fees(payload: dict) -> dict:
+    """#84: explicit no-cost declaration for engine fixtures."""
+    merged = dict(payload)
+    params = dict(merged.get("parameters") or {})
+    params.setdefault("fees", "zero")
+    merged["parameters"] = params
+    return merged
+
 def _frame(*, spread: float = 0.0) -> pd.DataFrame:
     closes = [100.0 + i * 1.0 for i in range(12)]
     data: dict[str, list] = {
@@ -76,7 +85,7 @@ def _native_result(frame: pd.DataFrame, strategy_fn, **config_kwargs):
         "initial_capital": 100_000.0,
     }
     payload.update(config_kwargs)
-    config = BacktestConfig(**payload)
+    config = BacktestConfig(**_with_zero_fees(payload))
     engine = TradeEngine(config, symbol="CEC")
     return engine.run(frame, strategy_fn)
 
@@ -96,7 +105,7 @@ def _vectorbt_result(tmp_path: Path, frame: pd.DataFrame, strategy_text: str, **
         "parameters": {},
     }
     payload.update(config_kwargs)
-    return VectorbtAdapter().run(BacktestConfig(**payload), strategy_path)
+    return VectorbtAdapter().run(BacktestConfig(**_with_zero_fees(payload)), strategy_path)
 
 
 def _load_strategy_fn(strategy_text: str, tmp_path: Path, name: str):
@@ -195,7 +204,7 @@ def generate_signals(df, params):
         """D4: the fill-convention switch is load-bearing — a typo must fail
         loudly instead of silently falling through to close-fill."""
         with pytest.raises(ValueError, match="signal_exit_fill"):
-            BacktestConfig(
+            BacktestConfig(parameters={"fees": "zero"}, 
                 strategy_name="contract",
                 symbols=["CEC"],
                 timeframe="1h",
@@ -206,7 +215,7 @@ def generate_signals(df, params):
             )
 
     def test_signal_exit_fill_normalizes_case(self, tmp_path: Path):
-        config = BacktestConfig(
+        config = BacktestConfig(parameters={"fees": "zero"}, 
             strategy_name="contract",
             symbols=["CEC"],
             timeframe="1h",
@@ -224,7 +233,7 @@ class TestNativeWarmupLoad:
     def test_warmup_start_extends_loaded_window(self, tmp_path: Path):
         _write_ohlcv(tmp_path, "CEC", _frame())
         strategy_path = _write_strategy(tmp_path, "contract_warmup_load", _strategy_text())
-        config = BacktestConfig(
+        config = BacktestConfig(parameters={"fees": "zero"}, 
             strategy_name="contract",
             symbols=["CEC"],
             timeframe="1h",
@@ -292,7 +301,7 @@ class TestSharedEquity:
             initial_capital=100_000.0,
             modeling_resolution="main_timeframe",
             data_dir=str(tmp_path),
-            parameters={},
+            parameters={"fees": "zero"},
         )
         result = VectorbtAdapter().run(config, strategy_path)
         assert len(result.trades) == 2
@@ -325,7 +334,7 @@ class TestSharedEquity:
             initial_capital=100_000.0,
             modeling_resolution="main_timeframe",
             data_dir=str(tmp_path),
-            parameters={},
+            parameters={"fees": "zero"},
         )
         result = NativeAdapter().run(config, strategy_path)
         assert len(result.trades) == 2

@@ -494,6 +494,9 @@ def _run_strategy(
     strategy_name = entry["strategy"]
     engine = get_engine(engine_name)
     parameters = resolve_strategy_parameters(strategy_path, {})
+    # #84: explicit no-cost declaration — regeneration preserves the
+    # canonical gross-parity artifacts until a realistic fee model lands.
+    parameters = {**parameters, "fees": "zero"}
 
     try:
         config = BacktestConfig(

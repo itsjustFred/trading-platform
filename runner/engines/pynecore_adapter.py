@@ -38,6 +38,7 @@ from runner.engines._shared import (
     resolve_max_position_exposure_pct as _resolve_max_position_exposure_pct,
     serialize_meta_value as _serialize_meta_value,
 )
+from runner.fees import resolve_fee_model
 from runner.stats import compute_stats_for_result
 from shared.constants import DATA_DIR
 from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, TradeExit
@@ -247,6 +248,8 @@ class PyneCoreAdapter(EngineAdapter):
     ) -> BacktestResult:
         data_root = Path(config.data_dir) if config.data_dir else DATA_DIR
         resolved_parameters = resolve_strategy_parameters(strategy_path, config.parameters)
+        # #84: missing fee/slippage config is a hard error, never silent gross.
+        fee_model = resolve_fee_model(resolved_parameters)
         # Fail before any per-symbol work when the CLI is absent.
         _resolve_pyne_bin()
         all_trades: list[Trade] = []
@@ -295,6 +298,7 @@ class PyneCoreAdapter(EngineAdapter):
                 )
             )
 
+        _apply_fee_model(all_trades, fee_model)
         result = BacktestResult(
             meta=_pyne_meta(config, strategy_name, resolved_parameters, total_bars),
             trades=all_trades,
@@ -463,12 +467,32 @@ def _resolve_pyne_bin() -> str:
     return pyne_bin
 
 
+def _apply_fee_model(all_trades: list[Trade], fee_model) -> None:
+    """Price pyne-binary fills through the explicit fee model (#84).
+
+    The external binary reports gross fills; fees/net are attached here so
+    stats and equity never see silent gross.
+    """
+    for trade in all_trades:
+        exit_price = trade.exits[-1].price if trade.exits else trade.entry_price
+        fees = round(
+            float(fee_model.fee_for_trade(trade.entry_price, exit_price, trade.quantity)),
+            2,
+        )
+        trade.fees = fees
+        trade.net_pnl = round(float(trade.pnl) - fees, 2)
+
+
 def _equity_curve_from_trades(config: BacktestConfig, all_trades: list[Trade]) -> list[EquityPoint]:
-    """Build the equity curve from the merged, time-ordered trades."""
+    """Build the equity curve from the merged, time-ordered trades (#84: net)."""
     equity = config.initial_capital
     curve: list[EquityPoint] = []
     for trade in sorted(all_trades, key=lambda item: item.entry_time):
-        equity += trade.pnl
+        equity += (
+            float(trade.net_pnl)
+            if trade.net_pnl is not None
+            else float(trade.pnl) - float(trade.fees or 0.0)
+        )
         curve.append(EquityPoint(time=trade.entry_time, equity=round(equity, 2)))
     return curve
 

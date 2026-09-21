@@ -301,11 +301,13 @@ class MT5XLSXImporter(BaseImporter):
 
                 MT5XLSXImporter._apply_stat_key(key, val, stats)
 
-        # Derive total_return if possible
+        # Derive total_return as a FRACTION (#84: the runner reports
+        # total_return as equity_end/equity_start - 1, e.g. 0.21 — the old
+        # *100.0 percent diverged by a factor of 100 in comparisons).
         if "total_pnl" in stats and "initial_capital" in stats:
             ic = stats.get("initial_capital")
             if isinstance(ic, (int, float)) and ic != 0:
-                stats["total_return"] = (stats["total_pnl"] / ic) * 100.0
+                stats["total_return"] = stats["total_pnl"] / ic
 
         return stats
 

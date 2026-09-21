@@ -66,6 +66,15 @@ from shared.models import VALID_TIMEFRAMES, Trade, TradeExit
 STRATEGY_PATH = str(Path(__file__).resolve().parent / "strategies" / "contract_sma.py")
 
 
+
+def _with_zero_fees(payload: dict) -> dict:
+    """#84: explicit no-cost declaration for engine fixtures."""
+    merged = dict(payload)
+    params = dict(merged.get("parameters") or {})
+    params.setdefault("fees", "zero")
+    merged["parameters"] = params
+    return merged
+
 def _deterministic_ohlcv(
     *,
     periods: int = 260,
@@ -129,7 +138,7 @@ def _config(data_dir: Path, **overrides) -> BacktestConfig:
         "parameters": {"fast_length": 5, "slow_length": 20},
     }
     payload.update(overrides)
-    return BacktestConfig(**payload)
+    return BacktestConfig(**_with_zero_fees(payload))
 
 
 @pytest.fixture(scope="module")
@@ -715,7 +724,7 @@ def test_native_and_vectorbt_resolve_the_same_intrabar_spellings(tmp_path: Path)
     ]
     for resolution in resolutions:
         for base in ("1h", "1d"):
-            cfg = BacktestConfig(
+            cfg = BacktestConfig(parameters={"fees": "zero"}, 
                 strategy_name="parity",
                 symbols=["X"],
                 timeframe=base,
@@ -763,7 +772,7 @@ def test_spellings_pinned_against_one_shared_table():
     assert native_module.TIMEFRAME_ORDER is contract.TIMEFRAME_ORDER
     # The config validator canonicalizes alias spellings before any adapter
     # sees them, so per-adapter divergence is structurally impossible.
-    cfg = BacktestConfig(
+    cfg = BacktestConfig(parameters={"fees": "zero"}, 
         strategy_name="pin",
         symbols=["X"],
         timeframe="1h",
@@ -794,7 +803,7 @@ class TestSizingContract:
             end_date="2024-01-02",
             initial_capital=100_000.0,
             risk_per_trade_pct=0.01,
-            parameters={},
+            parameters={"fees": "zero"},
         )
         from runner.engine import TradeEngine
 
@@ -935,7 +944,7 @@ class TestStatsKeysContract:
                 "entry_price": 108.0,
             },
         ]
-        result = SignalReplayAdapter().run(
+        result = SignalReplayAdapter(fee_params={"fees": "zero"}, ).run(
             signals=[ReplaySignal.from_payload(signal) for signal in signals],
             ohlcv_by_symbol={"PARITY": frame},
             timeframe="1h",
@@ -1457,7 +1466,7 @@ class TestFillContract:
             end_date="2024-01-02",
             initial_capital=100_000,
             modeling_resolution="main_timeframe",
-            parameters={},
+            parameters={"fees": "zero"},
         )
         result = TradeEngine(cfg, symbol="PARITY").run(data, strategy_fn)
 
@@ -1506,7 +1515,7 @@ class TestFillContract:
                 "entry_price": float(frame.iloc[5]["close"]),
             }
         )
-        result = SignalReplayAdapter().run(
+        result = SignalReplayAdapter(fee_params={"fees": "zero"}, ).run(
             signals=[signal],
             ohlcv_by_symbol={"PARITY": frame},
             timeframe="1h",

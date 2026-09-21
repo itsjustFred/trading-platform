@@ -30,6 +30,15 @@ from tests.helpers import deterministic_ohlcv_frame, write_ohlcv as _write_share
 STRATEGY = sma_crossover_strategy_text("vbt_sizing_sma", with_stop_loss=True)
 
 
+
+def _with_zero_fees(payload: dict) -> dict:
+    """#84: explicit no-cost declaration for engine fixtures."""
+    merged = dict(payload)
+    params = dict(merged.get("parameters") or {})
+    params.setdefault("fees", "zero")
+    merged["parameters"] = params
+    return merged
+
 def _deterministic_frame(*, periods: int = 300, start: float = 100.0) -> pd.DataFrame:
     return deterministic_ohlcv_frame(periods=periods, start=start)
 
@@ -51,7 +60,7 @@ def _config(tmp_path: Path, **overrides: Any) -> BacktestConfig:
         "parameters": {"fast_length": 3, "slow_length": 10},
     }
     payload.update(overrides)
-    return BacktestConfig(**payload)
+    return BacktestConfig(**_with_zero_fees(payload))
 
 
 @pytest.fixture

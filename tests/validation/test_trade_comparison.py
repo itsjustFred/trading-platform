@@ -353,6 +353,43 @@ class TestTakeProfit:
         assert not result.is_match
 
 
+class TestStopLevelResolution:
+    """#85: SL/TP must be resolved from Position-level fields with meta as
+    fallback — a meta-only read saw None on BOTH sides for native trades and
+    certified "both None (match)" without ever comparing a stop."""
+
+    def test_sl_resolved_from_meta_sl_price_fallback(self):
+        """A trade carrying its stop under the engine's ``sl_price`` meta key
+        must be compared, not skipped as both-None."""
+        ref = _make_trade(stop_loss=None)
+        act = _make_trade(stop_loss=None)
+        object.__setattr__(act, "meta", {"sl_price": 1.0900})
+        result = TradeComparator().compare(_make_matched(ref, act))
+        _assert_field_failed(result, "stop_loss")
+        assert not result.is_match
+
+    def test_sl_position_attribute_wins_over_meta(self):
+        """A Position-level stop_loss attribute takes precedence over meta."""
+        ref = _make_trade(stop_loss=1.0900, take_profit=1.1100)
+        act = _make_trade(stop_loss=None, take_profit=1.1100)
+        object.__setattr__(act, "stop_loss", 1.0900)
+        # NOTE: preserve take_profit in meta — overwriting meta without it
+        # would create an unrelated TP mismatch and mask the SL assertion.
+        object.__setattr__(act, "meta", {"stop_loss": 1.9999, "take_profit": 1.1100})
+        result = TradeComparator().compare(_make_matched(ref, act))
+        _assert_field_passed(result, "stop_loss")
+        assert result.is_match
+
+    def test_tp_meta_none_vs_real_value_is_mismatch(self):
+        """None vs a real stop is a mismatch, never 'both None (match)'."""
+        ref = _make_trade(take_profit=None)
+        act = _make_trade(take_profit=None)
+        object.__setattr__(act, "meta", {"tp_price": 1.1100})
+        result = TradeComparator().compare(_make_matched(ref, act))
+        _assert_field_failed(result, "take_profit")
+        assert not result.is_match
+
+
 class TestCombinedMismatches:
     def test_multiple_mismatches_reported(self):
         ref = _make_trade(

@@ -45,7 +45,7 @@ def _load_context_module():
 @pytest.fixture(scope="module")
 def backtest_result():
     engine = PyneCoreAdapter()
-    config = BacktestConfig(
+    config = BacktestConfig(parameters={"fees": "zero"}, 
         strategy_name="pynecore_orb",
         symbols=[TEST_SYMBOL],
         timeframe=TEST_TIMEFRAME,

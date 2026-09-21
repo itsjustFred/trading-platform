@@ -290,6 +290,10 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         self.account_id = account_id
         self._trading_client: Any | None = None
         self._trading_stream: Any | None = None
+        # #78: subscribe exactly once per stream instance. Re-subscribing
+        # the same (or a reconnected) stream duplicates callbacks, so
+        # _subscribed_streams tracks stream identities already subscribed.
+        self._subscribed_streams: set[int] = set()
         self._connected = False
 
         if not self.api_key or not self.secret_key:
@@ -844,7 +848,18 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                     self._trading_stream = TradingStream(
                         self.api_key, self.secret_key, paper=self.paper
                     )
-                self._trading_stream.subscribe_trade_updates(self._on_trade_update)
+                # #78: subscribe exactly once per stream instance —
+                # re-subscribing on every reconnect fires duplicate fill
+                # callbacks (double-counted PnL/exposure).
+                stream_id = id(self._trading_stream)
+                if stream_id not in self._subscribed_streams:
+                    self._trading_stream.subscribe_trade_updates(self._on_trade_update)
+                    self._subscribed_streams.add(stream_id)
+                # NOTE: TradingStream.run is blocking sync; it occupies one
+                # executor thread for the stream lifetime (no asyncio-native
+                # alternative in alpaca-py). The thread is released when run
+                # returns/raises; on error the stream is stopped below before
+                # discard so a healthy stream never leaks a thread per retry.
                 await asyncio.to_thread(self._trading_stream.run)
             except asyncio.CancelledError:
                 raise
@@ -859,8 +874,27 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                         }
                     },
                 )
+                stream = self._trading_stream
                 self._trading_stream = None
+                if stream is not None:
+                    self._subscribed_streams.discard(id(stream))
+                    stop_ws = getattr(stream, "stop_ws", None)
+                    stop = getattr(stream, "stop", None)
+                    try:
+                        if callable(stop_ws):
+                            result = stop_ws()
+                            if inspect.isawaitable(result):
+                                await result
+                        elif callable(stop):
+                            result = stop()
+                            if inspect.isawaitable(result):
+                                await result
+                    except Exception:
+                        pass
                 await asyncio.sleep(backoff_seconds)
                 backoff_seconds = min(backoff_seconds * 2, 30)
             else:
+                # #78: a clean run() return must not spin — back off before
+                # re-subscribing (reconnect storm) and reset the backoff.
+                await asyncio.sleep(backoff_seconds)
                 backoff_seconds = 2

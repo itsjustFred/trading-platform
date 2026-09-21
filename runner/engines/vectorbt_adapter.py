@@ -42,6 +42,7 @@ from runner.engines.base import (
     resolve_strategy_parameters,
 )
 from runner.engines.contract import resolve_same_bar_exit
+from runner.fees import resolve_fee_model
 from shared.constants import DATA_DIR
 from shared.models import BacktestMeta, BacktestResult, EquityPoint, IndicatorSeries, Trade, TradeExit
 
@@ -510,17 +511,10 @@ def _process_symbol(
             else:
                 pnl = (entry_price - exit_price) * qty
 
-            # A-L1 (mirror of native _finalize_position): explicit fee model
-            # instead of implicit 0.0. fee_rate = fraction of notional per
-            # side, fee_flat_per_trade = flat surcharge; default 0.0 legacy.
-            fee_rate = max(0.0, float((resolved_parameters or {}).get("fee_rate", 0.0) or 0.0))
-            fee_flat = max(
-                0.0,
-                float((resolved_parameters or {}).get("fee_flat_per_trade", 0.0) or 0.0),
-            )
-            fees = (
-                (entry_price * qty + exit_price * qty) * fee_rate + fee_flat
-            )
+            # #84: explicit pluggable fee model — missing fee config is a
+            # hard error, never silent gross.
+            fee_model = resolve_fee_model(resolved_parameters)
+            fees = fee_model.fee_for_trade(entry_price, exit_price, qty)
 
             trade = Trade(
                 id=trade_counter,  # temporary; renumbered after merge
@@ -546,7 +540,8 @@ def _process_symbol(
                 meta=trade_meta,
             )
             trades.append(trade)
-            equity += pnl
+            # #84: the equity path accumulates NET pnl (fees are real costs).
+            equity += pnl - fees
 
     return trades, extra_timeframes, drawings, indicator_series, len(df), inverted_stop_drops
 
@@ -902,7 +897,12 @@ class VectorbtAdapter(EngineAdapter):
             all_equity: list[EquityPoint] = []
             equity = config.initial_capital
             for trade in sorted(all_trades, key=lambda item: item.last_exit_time):
-                equity += trade.pnl
+                # #84: portfolio replay accumulates NET pnl.
+                equity += (
+                    float(trade.net_pnl)
+                    if trade.net_pnl is not None
+                    else float(trade.pnl) - float(trade.fees or 0.0)
+                )
                 all_equity.append(
                     EquityPoint(
                         time=trade.last_exit_time or trade.entry_time,

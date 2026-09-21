@@ -437,3 +437,16 @@ class TestOrphanOutDeal:
         assert len(ref.trades) == 2
         assert [t.pnl for t in ref.trades] == [pytest.approx(500.0), pytest.approx(500.0)]
         assert [t.meta["position_id"] for t in ref.trades] == ["position-1", "position-2"]
+
+
+class TestTotalReturnFraction:
+    """#84: total_return is a fraction (parity with runner stats)."""
+
+    def test_total_return_is_fraction_not_percent(self, importer: MT5XLSXImporter):
+        ref = importer.load(_eurusd_path())
+        total_return = ref.stats.get("total_return")
+        if total_return is None:
+            pytest.skip("fixture report carries no total_return")
+        # A percent-scale value (>= 1.0 for any double-digit return) would
+        # diverge by factor 100 against the runner's fraction.
+        assert abs(float(total_return)) < 10.0

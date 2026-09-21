@@ -37,7 +37,7 @@ EXPECTED_NET_PROFIT = -11.84
 @pytest.fixture(scope="module")
 def backtest_result():
     engine = VectorbtAdapter()
-    config = BacktestConfig(
+    config = BacktestConfig(parameters={"fees": "zero"}, 
         strategy_name="sector_rotation",
         symbols=[TEST_SYMBOL],
         timeframe=TEST_TIMEFRAME,

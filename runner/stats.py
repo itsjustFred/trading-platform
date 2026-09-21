@@ -56,7 +56,9 @@ def compute_stats(
         return _empty_stats()
 
     if trades:
-        pnls = [t.pnl for t in trades]
+        # #84: net-based stats — gross t.pnl ignores fees and flatters every
+        # selection metric. Prefer stored net_pnl, else subtract stored fees.
+        pnls = [_net_trade_pnl(t) for t in trades]
         winners = [p for p in pnls if p > 0]
         losers = [p for p in pnls if p < 0]
 
@@ -301,6 +303,14 @@ def _attach_inferred_freq(returns: pd.Series) -> pd.Series:
         return returns
 
 
+def _net_trade_pnl(trade: Trade) -> float:
+    """Net realized PnL for one trade (#84: never silently gross)."""
+    if trade.net_pnl is not None:
+        return float(trade.net_pnl)
+    fees = float(trade.fees or 0.0)
+    return float(trade.pnl) - fees
+
+
 def _cagr_from_backtest_period(*, equity_curve: list[EquityPoint], trades: list[Trade]) -> float:
     if len(equity_curve) < 2:
         return 0.0
@@ -320,6 +330,25 @@ def _cagr_from_backtest_period(*, equity_curve: list[EquityPoint], trades: list[
 def _resolve_backtest_period_bounds(
     *, equity_curve: list[EquityPoint], trades: list[Trade]
 ) -> tuple[pd.Timestamp, pd.Timestamp]:
+    """Calendar-window bounds for CAGR annualization (#84).
+
+    The old trade-span window (first entry -> last exit) exploded CAGR/Calmar
+    for clustered trades. Annualize over the calendar backtest window, i.e.
+    the equity-curve endpoints; trades are only a fallback when the curve
+    carries no usable timestamps.
+    """
+    try:
+        equity_times = [
+            pd.Timestamp(ts)
+            for ts in pd.to_datetime([point.time for point in equity_curve], utc=True, errors="coerce")
+            if not pd.isna(ts)
+        ]
+    except Exception:
+        equity_times = []
+
+    if len(equity_times) >= 2:
+        return min(equity_times), max(equity_times)
+
     trade_start_times: list[pd.Timestamp] = []
     trade_end_times: list[pd.Timestamp] = []
 
@@ -334,18 +363,6 @@ def _resolve_backtest_period_bounds(
 
     if trade_start_times and trade_end_times:
         return min(trade_start_times), max(trade_end_times)
-
-    try:
-        equity_times = [
-            pd.Timestamp(ts)
-            for ts in pd.to_datetime([point.time for point in equity_curve], utc=True, errors="coerce")
-            if not pd.isna(ts)
-        ]
-    except Exception:
-        equity_times = []
-
-    if len(equity_times) >= 2:
-        return min(equity_times), max(equity_times)
 
     fallback_start = pd.Timestamp.now(tz="UTC")
     return fallback_start, fallback_start

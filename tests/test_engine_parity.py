@@ -82,7 +82,7 @@ def _parity_config(data_dir: Path) -> BacktestConfig:
         initial_capital=100_000,
         modeling_resolution="main_timeframe",
         data_dir=str(data_dir),
-        parameters={"fast_length": 5, "slow_length": 20},
+        parameters={"fees": "zero", "fast_length": 5, "slow_length": 20},
     )
 
 

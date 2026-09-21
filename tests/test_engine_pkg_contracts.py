@@ -97,7 +97,7 @@ def test_size_trade_returns_typed_record():
     """_size_trade must keep returning the typed record (not a loose dict)."""
     from runner.engines.base import BacktestConfig
 
-    config = BacktestConfig(
+    config = BacktestConfig(parameters={"fees": "zero"}, 
         strategy_name="t",
         symbols=["X"],
         timeframe="1h",

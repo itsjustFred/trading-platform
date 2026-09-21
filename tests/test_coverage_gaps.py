@@ -18,6 +18,7 @@ from data_tools.auto_download import (
     analyze_ohlcv_coverage,
     find_internal_gaps,
     has_ohlcv_bars_in_range,
+    has_sufficient_segment_coverage,
 )
 
 
@@ -150,6 +151,83 @@ class TestFailedDownloadVisibility:
         assert not has_ohlcv_bars_in_range(
             symbol="EURUSD", timeframe="1h", start="2024-01-01", end="2024-01-02", data_dir=tmp_path
         )
+
+
+class TestSegmentCoverageGate:
+    """#86: a 1-bar month must be rejected; dense segments pass."""
+
+    def test_single_bar_in_month_is_rejected(self, tmp_path):
+        _write_bars(
+            tmp_path / "ohlcv" / "dukascopy" / "forex" / "EURUSD" / "1h.parquet",
+            ["2024-01-15T00:00:00Z"],
+        )
+        # Presence-only helper still sees the bar (freshness semantics).
+        assert has_ohlcv_bars_in_range(
+            symbol="EURUSD", timeframe="1h",
+            start="2024-01-01", end="2024-01-31", data_dir=tmp_path,
+        )
+        # Strict gate rejects it: 1/721 bars, huge max gap.
+        assert not has_sufficient_segment_coverage(
+            symbol="EURUSD", timeframe="1h",
+            start="2024-01-01", end="2024-01-31", data_dir=tmp_path,
+        )
+
+    def test_dense_segment_passes(self, tmp_path):
+        stamps = pd.date_range("2024-01-01", "2024-01-02", freq="1h", tz="UTC")
+        _write_bars(
+            tmp_path / "ohlcv" / "dukascopy" / "forex" / "EURUSD" / "1h.parquet",
+            [ts.isoformat() for ts in stamps],
+        )
+        assert has_sufficient_segment_coverage(
+            symbol="EURUSD", timeframe="1h",
+            start="2024-01-01", end="2024-01-02", data_dir=tmp_path,
+        )
+
+    def test_single_large_gap_fails_despite_density(self, tmp_path):
+        # Two dense halves with a 12h hole (>3x 1h) in the middle.
+        first = pd.date_range("2024-01-01", "2024-01-01T11:00", freq="1h", tz="UTC")
+        second = pd.date_range("2024-01-01T23:00", "2024-01-02T10:00", freq="1h", tz="UTC")
+        stamps = list(first) + list(second)
+        _write_bars(
+            tmp_path / "ohlcv" / "dukascopy" / "forex" / "EURUSD" / "1h.parquet",
+            [ts.isoformat() for ts in stamps],
+        )
+        assert not has_sufficient_segment_coverage(
+            symbol="EURUSD", timeframe="1h",
+            start="2024-01-01", end="2024-01-02", data_dir=tmp_path,
+        )
+
+
+class TestValidateGapBounds:
+    """#86: validate_parquet must report exact gap boundaries."""
+
+    def test_gap_bounds_are_exact_after_dropna(self, tmp_path):
+        from data_tools.validate import validate_parquet
+
+        # Non-default index + a NaT row: label index != positional index,
+        # which the old iloc[label] code mis-reported.
+        frame = pd.DataFrame(
+            {
+                "timestamp": [
+                    "2024-01-01T00:00:00Z",
+                    "not-a-timestamp",
+                    "2024-01-01T01:00:00Z",
+                    "2024-01-05T00:00:00Z",
+                ],
+                "open": [1.0] * 4,
+                "high": [1.1] * 4,
+                "low": [0.9] * 4,
+                "close": [1.0] * 4,
+                "volume": [10] * 4,
+            }
+        )
+        target = tmp_path / "ohlcv" / "dukascopy" / "forex" / "EURUSD" / "1h.parquet"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        frame.to_parquet(target, index=False)
+        result = validate_parquet(target)
+        assert result.gaps, "the 4-day hole must be reported"
+        assert "2024-01-01" in result.gaps[0]["start"] and "01:00" in result.gaps[0]["start"]
+        assert "2024-01-05" in result.gaps[0]["end"] and "00:00" in result.gaps[0]["end"]
 
 
 class TestGapDetectionSingleFile:

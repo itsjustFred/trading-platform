@@ -28,6 +28,15 @@ from runner.engines.base import BacktestConfig
 # ─── Fixtures ────────────────────────────────────────────────────────────────
 
 
+
+def _with_zero_fees(payload: dict) -> dict:
+    """#84: explicit no-cost declaration for engine fixtures."""
+    merged = dict(payload)
+    params = dict(merged.get("parameters") or {})
+    params.setdefault("fees", "zero")
+    merged["parameters"] = params
+    return merged
+
 def _config(tmp_path: Path, **overrides) -> BacktestConfig:
     payload = {
         "strategy_name": "probe",
@@ -41,7 +50,7 @@ def _config(tmp_path: Path, **overrides) -> BacktestConfig:
         "parameters": {},
     }
     payload.update(overrides)
-    return BacktestConfig(**payload)
+    return BacktestConfig(**_with_zero_fees(payload))
 
 
 def _linear_frame(n: int = 5, start: float = 100.0) -> pd.DataFrame:

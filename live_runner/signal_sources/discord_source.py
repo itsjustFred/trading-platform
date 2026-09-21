@@ -386,12 +386,23 @@ class DiscordSignalSource(BaseSignalSource):
         timeframe: str = "1h",
         service_id: str | None = None,
         trusted_author_ids: Iterable[str] | str | None = None,
+        auth_scheme: str | None = None,
     ) -> None:
         normalized_name = str(bot_name or "discord").strip()
         self.bot_name = normalized_name or "discord"
         self.service_id = str(service_id or "").strip() or None
         self.source_name = f"discord_{self.bot_name.lower()}"
         self.token = (token or os.environ.get("DISCORD_BOT_TOKEN", "")).strip()
+        # #81: operator tokens are account/user tokens copied from Discord
+        # devtools — sent RAW (no "Bot " prefix) like the Stockkit reference
+        # (headers = {"authorization": token}, api v9). Real bot tokens stay
+        # possible via auth_scheme="bot". Default "raw" (owner decision).
+        scheme = str(auth_scheme or os.environ.get("DISCORD_AUTH_SCHEME", "raw")).strip().lower()
+        if scheme not in ("raw", "bot"):
+            raise ValueError(
+                f"Unknown discord_auth_scheme {auth_scheme!r}; expected 'raw' or 'bot'."
+            )
+        self.auth_scheme = scheme
         resolved_channel_ids: set[str] = set(channel_ids or set())
         fallback_channel_id = str(channel_id or os.environ.get("DISCORD_CHANNEL_ID", "")).strip()
         if fallback_channel_id:
@@ -456,9 +467,16 @@ class DiscordSignalSource(BaseSignalSource):
                 },
             )
 
+    def _auth_header(self) -> str:
+        """Build the Authorization header per configured scheme (#81)."""
+        if self.auth_scheme == "bot":
+            if self.token.lower().startswith("bot "):
+                return self.token
+            return f"Bot {self.token}"
+        return self.token
+
     async def _fetch_messages(self, channel_id: str) -> list[dict[str, Any]]:
-        token = self.token if self.token.lower().startswith("bot ") else f"Bot {self.token}"
-        headers = {"Authorization": token}
+        headers = {"Authorization": self._auth_header()}
         url = f"https://discord.com/api/v10/channels/{channel_id}/messages?limit={POLL_LIMIT}"
 
         def _do_request() -> requests.Response:

@@ -27,7 +27,7 @@ def _write_ohlcv(tmp_path: Path, symbol: str) -> None:
 
 
 def _config(tmp_path: Path, symbols: list[str]) -> BacktestConfig:
-    return BacktestConfig(
+    return BacktestConfig(parameters={"fees": "zero"}, 
         strategy_name="pyne_demo",
         symbols=symbols,
         timeframe="1d",

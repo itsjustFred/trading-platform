@@ -508,8 +508,8 @@ class TestReportMeta:
         assert ready_result.level == PaperReadinessLevel.READY
 
     def test_empty_inputs(self) -> None:
-        """All optional inputs omitted → NOT_READY because required artifacts missing."""
-        # Empty inputs with default config (require all artifacts) should be NOT_READY
+        """#83: missing artifacts fail closed regardless of caller flags —
+        no inputs must never read as READY, even with require_*=False."""
         config = ReadinessConfig(
             require_trade_report=False,
             require_regression=False,
@@ -518,11 +518,12 @@ class TestReportMeta:
         )
         result = ReadinessValidator.validate(config=config)
 
-        assert result.level == PaperReadinessLevel.READY
-        assert result.passed is True
-        assert result.errors == 0
-        assert result.warnings == 0
-        assert all(c.severity == "info" for c in result.checks)
+        assert result.level == PaperReadinessLevel.NOT_READY
+        assert result.passed is False
+        assert result.errors > 0
+        assert all(
+            c.severity == "error" for c in result.checks if not c.passed
+        )
 
 
 class TestRiskGateStructuralFailures:
@@ -606,3 +607,72 @@ class TestRiskGateStructuralFailures:
         )
 
         assert result.level == PaperReadinessLevel.READY
+
+
+class TestIssue83Gates:
+    """#83: denominator on |expected|, Sharpe + max-drawdown gates."""
+
+    def test_halved_denominator_fixed(self) -> None:
+        """100 -> 200 must read as 100% drift, not 50%."""
+        from validation.readiness.validator import _abs_pct_diff
+
+        assert _abs_pct_diff(100.0, 200.0) == 1.0
+
+    def test_sharpe_gate_trips_on_decay(self) -> None:
+        expected = _make_stats()
+        object.__setattr__(expected, "sharpe_ratio", 2.0)
+        actual = _make_stats()
+        object.__setattr__(actual, "sharpe_ratio", 0.01)
+        result = ReadinessValidator.validate(
+            report=_make_delta_report(),
+            regression=_make_regression_result(passed=True),
+            risk_report=_make_risk_report(),
+            stats=(expected, actual),
+        )
+        sharpe = next(c for c in result.checks if c.name == "stats_sharpe")
+        assert sharpe.passed is False
+        assert sharpe.severity == "error"
+        assert result.level == PaperReadinessLevel.NOT_READY
+
+    def test_sharpe_gate_passes_within_absolute_band(self) -> None:
+        expected = _make_stats()
+        object.__setattr__(expected, "sharpe_ratio", 1.5)
+        actual = _make_stats()
+        object.__setattr__(actual, "sharpe_ratio", 1.55)
+        result = ReadinessValidator.validate(
+            report=_make_delta_report(),
+            regression=_make_regression_result(passed=True),
+            risk_report=_make_risk_report(),
+            stats=(expected, actual),
+        )
+        sharpe = next(c for c in result.checks if c.name == "stats_sharpe")
+        assert sharpe.passed is True
+
+    def test_max_drawdown_gate_trips_beyond_2pp(self) -> None:
+        expected = _make_stats()
+        object.__setattr__(expected, "max_drawdown_pct", 0.05)
+        actual = _make_stats()
+        object.__setattr__(actual, "max_drawdown_pct", 0.10)
+        result = ReadinessValidator.validate(
+            report=_make_delta_report(),
+            regression=_make_regression_result(passed=True),
+            risk_report=_make_risk_report(),
+            stats=(expected, actual),
+        )
+        dd = next(c for c in result.checks if c.name == "stats_max_drawdown")
+        assert dd.passed is False
+        assert dd.severity == "error"
+        assert result.level == PaperReadinessLevel.NOT_READY
+
+    def test_missing_stats_fails_closed(self) -> None:
+        result = ReadinessValidator.validate(
+            report=_make_delta_report(),
+            regression=_make_regression_result(passed=True),
+            risk_report=_make_risk_report(),
+            stats=None,
+            config=ReadinessConfig(require_stats=False),
+        )
+        assert result.level == PaperReadinessLevel.NOT_READY
+        assert any(
+            c.name == "stats_sharpe" and not c.passed for c in result.checks
+        )

@@ -453,6 +453,8 @@ def test_get_positions_maps_symbol_ids_to_names(tmp_path: Path):
 
 
 def test_get_positions_falls_back_to_raw_id_for_unknown_symbol(tmp_path: Path):
+    """#80: an unmapped symbol id fails closed — guessing FX would misstate
+    XAU/index exposure by 10-1000x."""
     from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
         ProtoOAPositionStatus,
         ProtoOATradeSide,
@@ -473,10 +475,8 @@ def test_get_positions_falls_back_to_raw_id_for_unknown_symbol(tmp_path: Path):
     )
     adapter._symbol_name_to_id = {}
 
-    positions = _run_get_positions(adapter)
-
-    assert positions[0]["symbol"] == "42"
-    assert positions[0]["qty"] == 1.0
+    with pytest.raises(ValueError, match="not in the symbols cache"):
+        _run_get_positions(adapter)
 
 
 # ─── Broker order ID roundtrip ────────────────────────────────────────────────

@@ -113,3 +113,27 @@ class SizedOrder:
         self.risk_reward_ratio = (
             float(self.risk_reward_ratio) if self.risk_reward_ratio is not None else None
         )
+
+
+def realized_risk_amount(order: SizedOrder) -> float:
+    """Realized stop-loss amount for a sized order (#84).
+
+    ``risk_amount``/``risk_percent`` intentionally keep the policy values
+    (validation-reference parity contract); on notional-cap the position is
+    smaller than the policy asked for, and the truth lives in the decision
+    metadata as ``realized_risk_amount``. Consumers (stats, reports,
+    validation parity, live metadata) must read this, never the policy
+    figure, or they overstate risk on every capped fill.
+    """
+    decision = getattr(order, "decision", None)
+    metadata = getattr(decision, "metadata", None) or {}
+    realized = metadata.get("realized_risk_amount")
+    if realized is not None:
+        try:
+            value = float(realized)
+        except (TypeError, ValueError):
+            pass
+        else:
+            if math.isfinite(value) and value >= 0:
+                return value
+    return float(order.risk_amount)

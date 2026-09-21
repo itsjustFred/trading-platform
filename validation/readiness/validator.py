@@ -21,9 +21,15 @@ from validation.stats.calculator import TradeStatistics
 
 
 def _abs_pct_diff(expected: float, actual: float) -> float:
-    denom = max(abs(expected), abs(actual))
+    """Relative difference against the EXPECTED base (#83).
+
+    The old ``max(|expected|, |actual|)`` denominator halved real drift
+    (100 -> 200 read as 50%, not 100%). Zero expected fails closed unless
+    actual is also zero.
+    """
+    denom = abs(expected)
     if denom == 0.0:
-        return 0.0 if expected == actual else 1.0
+        return 0.0 if actual == 0.0 else 1.0
     return abs(expected - actual) / denom
 
 
@@ -213,6 +219,8 @@ class ReadinessValidator:
         checks: list[ReadinessCheck] = []
 
         if report is None:
+            # #83: missing artifacts fail closed regardless of caller flags —
+            # a absent delta report must never read as four info passes.
             skipped_names = (
                 ("trade_errors", "No error-level deviations in matched trades"),
                 ("missing_trades", "Number of missing trades within threshold"),
@@ -224,11 +232,15 @@ class ReadinessValidator:
                     ReadinessCheck(
                         name=name,
                         description=description,
-                        passed=True,
-                        severity="info",
+                        passed=False,
+                        severity="error",
                         message=_NO_TRADE_DELTA_REPORT_MESSAGE,
                     )
                 )
+            recommendations.append(
+                "Provide the trade delta report (readiness cannot be certified "
+                "on missing trade comparison)."
+            )
             return checks
 
         all_deltas = report.matched_trades + report.missing_trades + report.extra_trades
@@ -375,14 +387,19 @@ class ReadinessValidator:
         checks: list[ReadinessCheck] = []
 
         if regression is None:
+            # #83: fail closed — a missing regression result is not a pass.
             checks.append(
                 ReadinessCheck(
                     name="regression_status",
                     description="Regression result passes when required",
-                    passed=True,
-                    severity="info",
-                    message="No regression result provided; skipping.",
+                    passed=False,
+                    severity="error",
+                    message="No regression result provided; cannot certify readiness.",
                 )
+            )
+            recommendations.append(
+                "Provide the regression result (readiness cannot be certified "
+                "on missing regression)."
             )
             return checks
 
@@ -423,14 +440,19 @@ class ReadinessValidator:
         checks: list[ReadinessCheck] = []
 
         if risk_report is None:
+            # #83: fail closed — a missing risk report is not a pass.
             checks.append(
                 ReadinessCheck(
                     name="risk_consistency",
                     description="Risk profiles are consistent between reference and platform",
-                    passed=True,
-                    severity="info",
-                    message="No risk comparison report provided; skipping.",
+                    passed=False,
+                    severity="error",
+                    message="No risk comparison report provided; cannot certify readiness.",
                 )
+            )
+            recommendations.append(
+                "Provide the risk comparison report (readiness cannot be "
+                "certified on missing risk comparison)."
             )
             return checks
 
@@ -592,23 +614,25 @@ class ReadinessValidator:
         checks: list[ReadinessCheck] = []
 
         if stats is None:
-            checks.append(
-                ReadinessCheck(
-                    name="stats_win_rate",
-                    description="Win rate is within tolerance between reference and platform",
-                    passed=True,
-                    severity="info",
-                    message="No statistics pair provided; skipping.",
+            # #83: fail closed — missing statistics are not two info passes.
+            for name, description in (
+                ("stats_win_rate", "Win rate within tolerance (reference vs platform)"),
+                ("stats_net_profit", "Net profit within tolerance (reference vs platform)"),
+                ("stats_sharpe", "Sharpe ratio within tolerance (reference vs platform)"),
+                ("stats_max_drawdown", "Max drawdown within tolerance (reference vs platform)"),
+            ):
+                checks.append(
+                    ReadinessCheck(
+                        name=name,
+                        description=description,
+                        passed=False,
+                        severity="error",
+                        message="No statistics pair provided; cannot certify readiness.",
+                    )
                 )
-            )
-            checks.append(
-                ReadinessCheck(
-                    name="stats_net_profit",
-                    description="Net profit is within tolerance between reference and platform",
-                    passed=True,
-                    severity="info",
-                    message="No statistics pair provided; skipping.",
-                )
+            recommendations.append(
+                "Provide the statistics pair (readiness cannot be certified "
+                "on missing statistics)."
             )
             return checks
 
@@ -662,6 +686,69 @@ class ReadinessValidator:
             recommendations.append(
                 f"Net-profit deviation exceeds threshold ({net_profit_diff:.4%} > "
                 f"{cfg.stats_net_profit_tolerance_pct:.4%})."
+            )
+
+        # #83: Sharpe gate (canonical rf=0 on both sides). Pass when the
+        # absolute drift fits max(10% relative, 0.1 absolute).
+        expected_sharpe = float(expected_stats.sharpe_ratio)
+        actual_sharpe = float(actual_stats.sharpe_ratio)
+        sharpe_abs_diff = abs(expected_sharpe - actual_sharpe)
+        sharpe_threshold = max(
+            cfg.stats_sharpe_tolerance_pct * abs(expected_sharpe),
+            cfg.stats_sharpe_tolerance_abs,
+        )
+        sharpe_passed = sharpe_abs_diff <= sharpe_threshold
+        checks.append(
+            ReadinessCheck(
+                name="stats_sharpe",
+                description="Sharpe ratio is within tolerance between reference and platform",
+                passed=sharpe_passed,
+                severity="error" if not sharpe_passed else "info",
+                message=(
+                    f"Sharpe abs diff {sharpe_abs_diff:.4f} "
+                    f"(threshold {sharpe_threshold:.4f})"
+                ),
+                details={
+                    "expected": expected_sharpe,
+                    "actual": actual_sharpe,
+                    "abs_diff": sharpe_abs_diff,
+                    "threshold": sharpe_threshold,
+                },
+            )
+        )
+        if not sharpe_passed:
+            recommendations.append(
+                f"Sharpe deviation exceeds threshold ({sharpe_abs_diff:.4f} > "
+                f"{sharpe_threshold:.4f})."
+            )
+
+        # #83: max-drawdown gate — 2pp absolute on max_drawdown_pct.
+        expected_dd = float(expected_stats.max_drawdown_pct)
+        actual_dd = float(actual_stats.max_drawdown_pct)
+        dd_abs_diff = abs(expected_dd - actual_dd)
+        dd_passed = dd_abs_diff <= cfg.stats_max_drawdown_tolerance_pp
+        checks.append(
+            ReadinessCheck(
+                name="stats_max_drawdown",
+                description="Max drawdown is within tolerance between reference and platform",
+                passed=dd_passed,
+                severity="error" if not dd_passed else "info",
+                message=(
+                    f"Max-drawdown abs diff {dd_abs_diff:.4%} "
+                    f"(threshold {cfg.stats_max_drawdown_tolerance_pp:.4%})"
+                ),
+                details={
+                    "expected": expected_dd,
+                    "actual": actual_dd,
+                    "abs_diff": dd_abs_diff,
+                    "threshold": cfg.stats_max_drawdown_tolerance_pp,
+                },
+            )
+        )
+        if not dd_passed:
+            recommendations.append(
+                f"Max-drawdown deviation exceeds threshold ({dd_abs_diff:.4%} > "
+                f"{cfg.stats_max_drawdown_tolerance_pp:.4%})."
             )
 
         return checks
