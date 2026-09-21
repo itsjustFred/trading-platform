@@ -2935,7 +2935,9 @@ def test_backtest_run_registers_task_manager_progress(viewer_client, monkeypatch
             return 0
 
         def poll(self):
-            return None
+            # The fake child "exits" immediately so the fill-bar watchdog
+            # thread terminates instead of blocking pytest shutdown.
+            return 0
 
         def kill(self):
             self._killed = True

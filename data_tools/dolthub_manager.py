@@ -1,6 +1,7 @@
 import argparse
 import logging
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -214,7 +215,7 @@ def _export_stocks() -> None:
 
 def _list_symbols(stocks_repo: Path, table_name: str) -> list[str]:
     result = subprocess.run(
-        ["dolt", "sql", "-q", f"SELECT DISTINCT act_symbol FROM {table_name}", "-r", "csv"],
+        ["dolt", "sql", "-q", build_symbol_select(table_name, "%"), "-r", "csv"],
         cwd=stocks_repo,
         capture_output=True,
         text=True,
@@ -241,7 +242,7 @@ def _export_symbol_csv(
                     "dolt",
                     "sql",
                     "-q",
-                    f"SELECT date, open, high, low, close, volume FROM {table_name} WHERE act_symbol='{symbol}' ORDER BY date",
+                    build_ohlcv_select(table_name, symbol),
                     "-r",
                     "csv",
                 ],

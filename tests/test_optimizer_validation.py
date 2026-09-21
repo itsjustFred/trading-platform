@@ -15,6 +15,7 @@ from __future__ import annotations
 import math
 from pathlib import Path
 
+import optuna
 import pandas as pd
 import pytest
 
@@ -150,8 +151,16 @@ class TestNoTradeTrialsCannotWin:
             def get_trials(self, deepcopy: bool = True, states=None):
                 return list(self.trials)
 
-            def optimize(self, objective, n_trials, callbacks=None):
+            def optimize(self, objective, n_trials, callbacks=None, catch=None):
                 class _Trial:
+                    number = 0
+                    state = optuna.trial.TrialState.COMPLETE
+                    params = {"fast_length": 2}
+                    value = None
+
+                    def __init__(self):
+                        self.user_attrs: dict = {}
+
                     def suggest_int(self, name, low, high, step=1):
                         return low
 
@@ -162,10 +171,15 @@ class TestNoTradeTrialsCannotWin:
                         return choices[0]
 
                     def set_user_attr(self, key, value):
-                        setattr(self, key, value)
+                        self.user_attrs[key] = value
 
                 trial = _Trial()
                 captured["no_trade_value"] = float(objective(trial))
+                trial.value = captured["no_trade_value"]
+                # Record the trial as COMPLETE (the real study would) so the
+                # post-optimize completed-trials gate passes and the
+                # no-trade exclusion in _best_trial_or_raise is what fires.
+                self.trials.append(trial)
 
             @property
             def best_trial(self):

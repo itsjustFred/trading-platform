@@ -627,7 +627,7 @@ def _resume_interrupted_backtest_task(
         ),
         parameters=dict(backtest_config.get("parameters") or {}),
     )
-    restarted = asyncio.run(run_backtest(request_payload))
+    restarted = _run_backtest_sync(run_backtest, request_payload)
     restarted_task_id = restarted.get("task_id") if isinstance(restarted, dict) else None
     upsert_background_task_record(
         task_id=task_id,
@@ -8539,6 +8539,7 @@ def _run_backtest_process(
     output_path: str,
     backtest_id: str,
     report_stage: Callable[..., None],
+    watchdog_timed_out: threading.Event,
 ) -> tuple[Any, str, str, str]:
     """Launch the runner process and drain its stdout.
 
@@ -8562,8 +8563,27 @@ def _run_backtest_process(
         env=env,
         text=True,
         bufsize=1,
+        # Leads its own process group so _kill_process_group can signal the
+        # whole tree without touching this process (see its docstring).
+        start_new_session=True,
     )
     _update_task_fields(task_id, pid=proc.pid, process=proc)
+
+    # Watchdog bounds the whole child lifetime: it fires even if a hung child
+    # never closes stdout (a post-EOF proc.wait() timeout would never cover
+    # that case). It must start BEFORE the stdout pump below — the pump only
+    # returns at EOF, so starting it after would never watch a hung child.
+    watchdog = threading.Thread(
+        target=_monitor_backtest_process,
+        args=(proc,),
+        kwargs={
+            "timeout_seconds": BACKTEST_WATCHDOG_TIMEOUT_SECONDS,
+            "timed_out": watchdog_timed_out,
+        },
+        daemon=True,
+        name=f"backtest-watchdog-{task_id}",
+    )
+    watchdog.start()
 
     latest_message = ""
     if proc.stdout is not None:
@@ -8934,7 +8954,9 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
                 _set_job_status(task_id, "running")
                 report_stage(handle, percent=10.0, message="Loading market data...")
 
-                missing_downloads = _ensure_backtest_data_availability(
+                _prepare_backtest_runner_data(
+                    task_id=task_id,
+                    handle=handle,
                     symbols=symbols,
                     timeframe=timeframe,
                     start=start,
@@ -8948,26 +8970,12 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
                     handle=handle,
                     cmd=cmd,
                     env=env,
-                    text=True,
-                    bufsize=1,
-                    start_new_session=True,
+                    output_path=output_path,
+                    backtest_id=backtest_id,
+                    report_stage=report_stage,
+                    watchdog_timed_out=watchdog_timed_out,
                 )
                 _update_task_fields(task_id, pid=proc.pid, process=proc)
-
-                # Watchdog bounds the whole child lifetime: it fires even if
-                # a hung child never closes stdout (a post-EOF proc.wait()
-                # timeout would never cover that case).
-                watchdog = threading.Thread(
-                    target=_monitor_backtest_process,
-                    args=(proc,),
-                    kwargs={
-                        "timeout_seconds": BACKTEST_WATCHDOG_TIMEOUT_SECONDS,
-                        "timed_out": watchdog_timed_out,
-                    },
-                    daemon=True,
-                    name=f"backtest-watchdog-{task_id}",
-                )
-                watchdog.start()
 
                 if proc.stdout is not None:
                     for raw_line in proc.stdout:
@@ -9382,8 +9390,6 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
         start_dt=start_dt,
         end_dt=end_dt,
     )
-    with DATA_TASKS_LOCK:
-        DATA_TASKS[task_id] = record
     _set_task_status(task_id, "queued")
     _update_task_fields(
         task_id,

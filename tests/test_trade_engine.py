@@ -263,9 +263,17 @@ def test_trade_engine_configured_same_bar_take_profit_priority_falls_back_to_sto
     without intrabar data the stop wins the same-bar ambiguity, and the
     configured-but-unsupported request stays visible in the audit metadata as
     ``stop_first``.
+
+    The ambiguity bar must NOT be the fill bar, and neither level may sit
+    inside the fill bar's default range: since A-H1 the scoped fill-bar
+    recheck exits a just-opened position on the fill bar itself (bar 11
+    here has high 112), which would preempt the same-bar ambiguity this
+    test pins. TP is 113 so the fill bar cannot trigger it; the ambiguity
+    bar (12, high 114 / low 109) then hits both levels and F8 stop-first
+    decides.
     """
     data = _synthetic_ohlcv(100)
-    data.loc[12, "high"] = 113.0
+    data.loc[12, "high"] = 114.0
     data.loc[12, "low"] = 109.0
 
     def strategy_fn(df: pd.DataFrame, params: dict):
@@ -278,7 +286,7 @@ def test_trade_engine_configured_same_bar_take_profit_priority_falls_back_to_sto
             "take_profit": pd.Series(pd.NA, index=df.index),
         }
         indicators["stop_loss"].iloc[10] = 109.0
-        indicators["take_profit"].iloc[10] = 112.0
+        indicators["take_profit"].iloc[10] = 113.0
         return entries, exits, indicators, []
 
     cfg = BacktestConfig(
