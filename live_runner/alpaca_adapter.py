@@ -14,7 +14,7 @@ from uuid import UUID
 from alpaca.trading.enums import OrderClass
 from alpaca.trading.requests import StopLossRequest, TakeProfitRequest
 
-from live_runner.base_adapter import BaseLiveAdapter
+from live_runner.base_adapter import EXIT_ONLY_RISK_SIZING_MODE, BaseLiveAdapter
 from live_runner.credential_env import parse_bool_env
 from risk.live import size_live_signal
 from shared.database import (
@@ -520,7 +520,9 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         metadata = signal.metadata or {}
         stop_loss = _resolve_optional_float(metadata, _SL_METADATA_KEYS)
         take_profit = _resolve_optional_float(metadata, _TP_METADATA_KEYS)
-        exit_only = str(metadata.get("risk_sizing_mode") or "") == "exit_only"
+        exit_only = (
+            str(metadata.get("risk_sizing_mode") or "") == EXIT_ONLY_RISK_SIZING_MODE
+        )
         missing = [
             name
             for name, value in (("stop_loss", stop_loss), ("take_profit", take_profit))
@@ -562,7 +564,10 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             side = order_side.BUY
         else:
             side = order_side.SELL
-        exit_only = str((signal.metadata or {}).get("risk_sizing_mode") or "") == "exit_only"
+        exit_only = (
+            str((signal.metadata or {}).get("risk_sizing_mode") or "")
+            == EXIT_ONLY_RISK_SIZING_MODE
+        )
         if extended_hours and not exit_only:
             # The broker rejects bracket orders with extended_hours enabled
             # ("bracket order has non-zero extended_hours value", HTTP 422), and

@@ -4,6 +4,11 @@ from abc import ABC, abstractmethod
 
 from shared.models import LiveSignal
 
+#: Marker in signal metadata (`risk_sizing_mode`) for exit-only flatten
+#: orders. Shared constant (pre-mortem PM1): producer (daemon) and consumers
+#: (adapters) must never compare divergent spellings again.
+EXIT_ONLY_RISK_SIZING_MODE = "exit_only"
+
 
 class BaseLiveAdapter(ABC):
     """Abstract broker adapter for live order routing and fill streaming."""

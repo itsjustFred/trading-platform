@@ -18,7 +18,7 @@ from live_runner.account_routing import (
     validate_live_account_routes,
 )
 from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credentials
-from live_runner.base_adapter import BaseLiveAdapter
+from live_runner.base_adapter import EXIT_ONLY_RISK_SIZING_MODE, BaseLiveAdapter
 from live_runner.credential_env import accounts_env_mtime, load_accounts_env_values
 from live_runner.ctrader_adapter import CTraderAuthTerminalError, CTraderLiveAdapter
 from live_runner.service_discovery import discover_discord_bots_from_env
@@ -654,7 +654,7 @@ async def _metadata_for_exit_only_order(
             f"Exit-only signal received for {signal.symbol} but no position is open"
         )
     metadata["explicit_qty"] = float(target_qty)
-    metadata["risk_sizing_mode"] = "exit_only"
+    metadata["risk_sizing_mode"] = EXIT_ONLY_RISK_SIZING_MODE
     # A short position must be closed with a BUY; keep the close side derived
     # from the broker book instead of trusting the signal's action. The
     # adapters read signal.action (not metadata), so the signal itself is
@@ -828,7 +828,7 @@ def _trade_signal_to_live_signal(
     metadata["source"] = str(metadata.get("source") or "discord")
     if signal.action in {"sell", "short"} and not _deployment_allows_short(deployment):
         metadata["exit_only"] = True
-        metadata["risk_sizing_mode"] = "exit_only"
+        metadata["risk_sizing_mode"] = EXIT_ONLY_RISK_SIZING_MODE
     # Whitelist at the conversion site itself (B-2): never default an unmapped
     # action to SELL. The TradeSignal Literal gates construction today, but a
     # future loosening (e.g. adding "close") must not silently become a live
@@ -1942,12 +1942,29 @@ async def _sync_discord_bot_services(
             continue
         if str(service.id) in _DISCORD_SERVICE_AUTH_BLOCKED_IDS:
             continue
-        await _sync_running_discord_bot(
-            service,
-            active_discord_bots=active_discord_bots,
-            active_discord_bot_tasks=active_discord_bot_tasks,
-            accounts_env_values=accounts_env_values,
-        )
+        try:
+            await _sync_running_discord_bot(
+                service,
+                active_discord_bots=active_discord_bots,
+                active_discord_bot_tasks=active_discord_bot_tasks,
+                accounts_env_values=accounts_env_values,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # One misconfigured service (e.g. missing allowlist) must not
+            # starve its siblings for the rest of the tick.
+            logger.warning(
+                "Discord service sync failed; continuing with siblings",
+                extra={
+                    "data": {
+                        "service_id": str(service.id),
+                        "service_name": service.name,
+                        "error": str(exc),
+                    }
+                },
+            )
+            continue
 
 
 async def sync_services_loop(

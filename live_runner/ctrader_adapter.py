@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-from live_runner.base_adapter import BaseLiveAdapter
+from live_runner.base_adapter import EXIT_ONLY_RISK_SIZING_MODE, BaseLiveAdapter
 from risk.live import size_live_signal
 from shared.database import (
     find_live_signal_id_by_broker_order_id,
@@ -181,6 +181,21 @@ _INDEX_SYMBOLS = frozenset(
     }
 )
 
+#: Crypto bases that form 6-letter pairs (BTCUSD, ETHUSD, ...). Their lotSize
+#: varies per coin and broker (BTC 1, altcoins differ), so no static fallback
+#: is safe — they are UNKNOWN by design (broker props or no trade). Without
+#: this guard they would fall into the 6-alpha FX branch at up to 100000x the
+#: intended size.
+_CRYPTO_BASES = frozenset(
+    {
+        "BTC", "ETH", "XRP", "LTC", "BCH", "DOT", "LINK", "XLM", "ADA",
+        "DOGE", "SOL", "AVAX", "MATIC", "TRX", "ETC", "FIL", "ATOM",
+        "NEAR", "ARB", "OP", "INJ", "SUI", "UNI", "APT", "HBAR", "VET",
+        "ALGO", "SAND", "MANA", "XTZ", "EOS", "AAVE", "SNX", "ZEC",
+        "DASH", "XMR", "BNB",
+    }
+)
+
 
 def _fallback_scale_class(symbol: str) -> str | None:
     """Classify *symbol* into a fallback scale class, or None when unknown."""
@@ -191,9 +206,12 @@ def _fallback_scale_class(symbol: str) -> str | None:
         return "xau"
     if upper.startswith("XAG"):
         return "xag"
-    if len(upper) == 6 and upper.endswith("JPY") and upper.isalpha():
-        return "jpy"
     if len(upper) == 6 and upper.isalpha():
+        if upper.endswith("JPY"):
+            return "jpy"
+        if upper[:3] in _CRYPTO_BASES:
+            # Crypto lotSizes are per-coin: fail closed, never FX.
+            return None
         return "fx"
     if upper in _INDEX_SYMBOLS:
         return "index"
@@ -1045,7 +1063,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         metadata = signal.metadata or {}
         explicit = _explicit_metadata_volume(metadata)
         if explicit is not None:
-            if str(metadata.get("risk_sizing_mode") or "") != "exit_only":
+            if str(metadata.get("risk_sizing_mode") or "") != EXIT_ONLY_RISK_SIZING_MODE:
                 raise ValueError(
                     "Explicit metadata volume ('ctrader_volume'/'volume') is only "
                     "allowed for exit-only flatten orders; entries must use the "
@@ -1588,6 +1606,11 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._already_logged_in_notified = False
         self._symbol_name_to_id.clear()
         self._order_id_to_signal_id.clear()
+        # #80: props and order-symbol mappings are session state — a
+        # reconnect must re-fetch broker props, never trade on stale scales,
+        # and the order map must not grow unboundedly across sessions.
+        self._symbol_props.clear()
+        self._order_id_to_symbol.clear()
         self._execution_queue = asyncio.Queue(maxsize=5000)
         self._terminal_auth_failure_reason = ""
         self._terminal_auth_failure_code = ""
@@ -1789,7 +1812,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             metadata, ("stop_loss", "sl_price", "stop_price", "resolved_stop_loss")
         )
         take_profit = _first_metadata_float(metadata, ("take_profit", "tp_price"))
-        exit_only = str(metadata.get("risk_sizing_mode") or "") == "exit_only"
+        exit_only = (
+            str(metadata.get("risk_sizing_mode") or "") == EXIT_ONLY_RISK_SIZING_MODE
+        )
         if stop_loss is None or take_profit is None:
             if exit_only:
                 # Exit-only orders close an existing position; they reduce

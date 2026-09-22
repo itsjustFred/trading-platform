@@ -3661,3 +3661,58 @@ def test_ctrader_xau_order_volume_uses_ounce_scale() -> None:
     """XAU qty 5.0 (0.05 lots = 5 oz) resolves to volume 5, not 5000."""
     _module, adapter = _make_ctrader_adapter()
     assert adapter._resolve_order_volume(_ctrader_signal("XAUUSD", {"qty": 5.0})) == 5
+
+
+def test_ctrader_crypto_symbols_fail_closed_not_fx() -> None:
+    """6-letter crypto pairs (BTCUSD) must not fall into the FX branch —
+    their lotSizes are per-coin and an FX scale would oversize ~100000x."""
+    from live_runner import ctrader_adapter as module
+
+    assert module._fallback_scale_class("BTCUSD") is None
+    assert module._fallback_scale_class("ETHUSD") is None
+    with pytest.raises(ValueError, match="[Uu]nknown cTrader symbol"):
+        module._fallback_symbol_scale("BTCUSD")
+
+
+def test_ctrader_disconnect_clears_symbol_session_state() -> None:
+    """Reconnects re-fetch broker props; order-symbol map stays bounded."""
+    _module, adapter = _make_ctrader_adapter()
+    adapter._symbol_props["EURUSD"] = adapter._scale_for("EURUSD")
+    adapter._order_id_to_symbol[123] = "EURUSD"
+    asyncio.run(adapter.disconnect())
+    assert adapter._symbol_props == {}
+    assert adapter._order_id_to_symbol == {}
+
+
+def test_exit_only_metadata_flows_through_adapter_volume_gate() -> None:
+    """Pre-mortem PM1: daemon exit-only metadata must satisfy the adapter's
+    volume gate — producer and consumer share one constant, not two
+    spellings."""
+    import asyncio
+
+    from live_runner.base_adapter import EXIT_ONLY_RISK_SIZING_MODE
+    from live_runner.daemon import _metadata_for_exit_only_order
+
+    assert EXIT_ONLY_RISK_SIZING_MODE == "exit_only"
+
+    class _Adapter:
+        async def get_positions(self):
+            return [{"symbol": "EURUSD", "qty": 2.0}]
+
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="EURUSD",
+        action="sell",
+        theoretical_price=1.1,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"exit_only": True},
+    )
+    metadata = asyncio.run(_metadata_for_exit_only_order(signal, _Adapter(), {}))
+    assert metadata["risk_sizing_mode"] == EXIT_ONLY_RISK_SIZING_MODE
+
+    _module, adapter = _make_ctrader_adapter()
+    explicit_volume = int(2.0 * 1000)
+    gated = signal.model_copy(
+        update={"metadata": {**metadata, "ctrader_volume": explicit_volume}}
+    )
+    assert adapter._resolve_order_volume(gated) == explicit_volume
