@@ -76,6 +76,7 @@ def _config(tmp_path: Path, **overrides: Any) -> BacktestConfig:
         "start_date": "2024-01-01",
         "end_date": "2024-02-01",
         "initial_capital": 100_000,
+        "risk_per_trade_pct": 0.01,
         "modeling_resolution": "main_timeframe",
         "data_dir": str(tmp_path),
     }

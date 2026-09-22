@@ -183,21 +183,33 @@ class _StreamWorker:
 
 
 class LiveMarketDataStreamService:
-    def __init__(self, *, max_bars_per_symbol: int = 500) -> None:
+    def __init__(
+        self,
+        *,
+        max_bars_per_symbol: int = 500,
+        env_values: dict[str, str] | None = None,
+    ) -> None:
         self._max_bars_per_symbol = max(10, int(max_bars_per_symbol))
         self._bars: dict[str, deque[dict[str, Any]]] = defaultdict(
             lambda: deque(maxlen=self._max_bars_per_symbol)
         )
         self._workers: dict[tuple[_CredentialKey, str], _StreamWorker] = {}
         self._lock = threading.Lock()
+        # C1: file-first credential source so quotes resolve the same
+        # credentials as execution (never process-env while trading on file).
+        self._env_values = env_values
 
     async def refresh_from_deployments(
         self,
         deployments: list[LiveDeploymentConfig],
         account_lookup: dict[str, LiveAccountConfig],
+        *,
+        env_values: dict[str, str] | None = None,
     ) -> None:
         try:
-            await asyncio.to_thread(self._refresh_sync, deployments, account_lookup)
+            await asyncio.to_thread(
+                self._refresh_sync, deployments, account_lookup, env_values
+            )
         except ModuleNotFoundError:
             logger.info("alpaca-py market data stream unavailable; install alpaca-py to enable live quotes")
 
@@ -205,6 +217,7 @@ class LiveMarketDataStreamService:
         self,
         deployments: list[LiveDeploymentConfig],
         account_lookup: dict[str, LiveAccountConfig],
+        env_values: dict[str, str] | None = None,
     ) -> None:
         target_symbols: dict[tuple[_CredentialKey, str], set[str]] = defaultdict(set)
         for deployment in deployments:
@@ -216,6 +229,7 @@ class LiveMarketDataStreamService:
             credentials = resolve_alpaca_credentials(
                 account_id=account.id,
                 broker_login=account.broker_login,
+                env=env_values if env_values is not None else self._env_values,
             )
             if credentials is None:
                 continue

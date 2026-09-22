@@ -84,6 +84,25 @@ def load_accounts_env_values(
     return values
 
 
+def resolve_env_value(
+    accounts_env_values: Mapping[str, str] | None,
+    key: str,
+    default: str = "",
+) -> str:
+    """Resolve one key file-first (C1: credential-precedence source of truth).
+
+    A key DEFINED in `.accounts.env` wins even when its value is empty
+    (present-but-empty stays empty); `os.environ` only fills keys ABSENT
+    from the file. This closes the `values.get(k) or os.environ.get(k)`
+    hole where a stale process-env value shadowed a fresh (possibly
+    intentionally blanked) file value.
+    """
+    if accounts_env_values is not None and key in accounts_env_values:
+        value = accounts_env_values[key]
+        return value.strip() if isinstance(value, str) else default
+    return str(os.environ.get(key, default)).strip()
+
+
 def accounts_env_mtime(accounts_env: Path | str) -> int | None:
     try:
         return Path(accounts_env).stat().st_mtime_ns

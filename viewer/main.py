@@ -1305,7 +1305,17 @@ async def _sync_live_market_data_stream_background() -> None:
             deployments = await asyncio.to_thread(list_live_deployments)
             accounts = await asyncio.to_thread(list_live_accounts)
             account_lookup = {account.id: account for account in accounts}
-            await _live_market_data_service.refresh_from_deployments(deployments, account_lookup)
+            # C1: quotes resolve credentials from the same file-first source
+            # as execution, never bare process env.
+            from live_runner.credential_env import load_accounts_env_values
+            from live_runner.service_discovery import DEFAULT_ACCOUNTS_ENV
+
+            env_values = await asyncio.to_thread(
+                load_accounts_env_values, DEFAULT_ACCOUNTS_ENV
+            )
+            await _live_market_data_service.refresh_from_deployments(
+                deployments, account_lookup, env_values=env_values
+            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:

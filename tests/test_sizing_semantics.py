@@ -294,6 +294,7 @@ class TestNativeEngineExposureWiring:
             "start_date": "2024-01-01",
             "end_date": "2024-01-31",
             "initial_capital": 100_000.0,
+        "risk_per_trade_pct": 0.01,
             "parameters": {},
         }
         payload.update(overrides)

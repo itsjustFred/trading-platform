@@ -37,6 +37,7 @@ def _config(tmp_path: Path, **overrides) -> BacktestConfig:
         "start_date": "2024-01-01",
         "end_date": "2024-12-31",
         "initial_capital": 100_000,
+        "risk_per_trade_pct": 0.01,
         "modeling_resolution": "main_timeframe",
         "data_dir": str(tmp_path),
         "parameters": {},
@@ -156,23 +157,25 @@ class TestSizingEquityExcludesUnrealizedPnl:
         (unrealized +30/qty). A second entry on bar 3 sizes from the same
         capital base as the first — the paper profit is not spendable.
         """
-        # Sizing capital is realized cash (100k, unchanged — no trade closed),
-        # so the second entry (fill 130) must size 100000/130 ≈ 769.23.
-        # Mark-to-market sizing would use equity 100k + 30*1000 = 160k → 1230.77.
+        # C1: explicit risk sizing (1%, 2% fallback stop). Sizing capital is
+        # realized cash (100k, unchanged — no trade closed), so the second
+        # entry (fill 130, stop distance 2.6) sizes 1000/2.6 ≈ 384.62.
+        # Mark-to-market sizing would use equity 100k + 30*500 = 115k → 442.31.
         assert self._run_two_entry_scenario(130.0) == pytest.approx(
-            100_000.0 / 130.0, rel=1e-9
+            1000.0 / 2.6, rel=1e-9
         ), (
             "the second entry must size from realized cash (100k), not from "
-            "mark-to-market equity (160k would be MTM)"
+            "mark-to-market equity (115k would be MTM)"
         )
 
     def test_unrealized_loss_does_not_shrink_sizing(self):
         """The mirror case: open losses must not shrink new position sizes."""
-        # Sizing capital is realized cash (100k), so the second entry (fill 70)
-        # sizes 100000/70 ≈ 1428.57. Mark-to-market sizing would use equity
-        # 100k − 30*1000 = 40k → 571.43 (paper losses shrinking new sizes).
+        # C1: explicit risk sizing. Sizing capital is realized cash (100k),
+        # so the second entry (fill 70, stop distance 1.4) sizes 1000/1.4.
+        # Mark-to-market sizing would use equity 100k − 30*500 = 85k → 607.14
+        # (paper losses shrinking new sizes).
         assert self._run_two_entry_scenario(70.0) == pytest.approx(
-            100_000.0 / 70.0, rel=1e-9
+            1000.0 / 1.4, rel=1e-9
         ), (
             "an unrealized drawdown must not reduce the cash available for sizing"
         )
@@ -261,7 +264,9 @@ class TestOrderTypeSizingSemantics:
         engine, frame = self._limit_order_engine(limit_price=100.5)
         assert engine.closed_trades, "limit order must fill"
         trade = engine.closed_trades[0]
-        expected_qty = 100_000.0 / 100.5
+        # C1: explicit risk sizing (1% of 100k = 1000 risk, 2% fallback stop
+        # on the 100.5 trigger → distance 2.01).
+        expected_qty = 1000.0 / 2.01
         assert trade.quantity == pytest.approx(expected_qty, rel=1e-6), (
             "LIMIT orders must be sized at fill from the trigger price, "
             "not keep the creation-price estimate"
@@ -316,7 +321,9 @@ class TestOrderTypeSizingSemantics:
 
         assert engine.closed_trades, "stop order must fill"
         trade = engine.closed_trades[0]
-        assert trade.quantity == pytest.approx(100_000.0 / stop_price, rel=1e-6), (
+        # C1: explicit risk sizing (1000 risk, 2% fallback stop on the
+        # 101.5 trigger → distance 2.03).
+        assert trade.quantity == pytest.approx(1000.0 / 2.03, rel=1e-6), (
             "STOP orders must be sized at fill from the trigger price"
         )
 
@@ -339,8 +346,8 @@ class TestOrderTypeSizingSemantics:
         assert engine.closed_trades
         trade = engine.closed_trades[0]
         # Fill happens on bar 1 (open 101); stopless sizing was computed on
-        # bar 0 close (100) → 100000/100 = 1000 shares.
-        assert trade.quantity == pytest.approx(100_000.0 / 100.0, rel=1e-6)
+        # bar 0 close (100) → C1 risk sizing: 1000 risk / 2.0 distance = 500.
+        assert trade.quantity == pytest.approx(1000.0 / 2.0, rel=1e-6)
 
 
 # ─── Mutation hardening: reporting equity curve ─────────────────────────────

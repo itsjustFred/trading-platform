@@ -14,7 +14,7 @@ from typing import Any
 from uuid import UUID
 
 from live_runner.base_adapter import EXIT_ONLY_RISK_SIZING_MODE, BaseLiveAdapter
-from risk.live import size_live_signal
+from live_runner.credential_env import resolve_env_value
 from shared.database import (
     find_live_signal_id_by_broker_order_id,
     get_live_signal_broker_order_id,
@@ -435,16 +435,20 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         accounts_env_path: Path | str | None = None,
         connect_max_attempts: int | None = None,
         connect_timeout_seconds: float | None = None,
+        env_values: Mapping[str, str] | None = None,
     ):
-        self.app_id = app_id or os.environ.get("CTRADER_APP_ID", "")
-        self.app_secret = app_secret or os.environ.get("CTRADER_APP_SECRET", "")
-        self.access_token = access_token or os.environ.get("CTRADER_ACCESS_TOKEN", "")
-        self.refresh_token = refresh_token or os.environ.get("CTRADER_REFRESH_TOKEN", "")
+        # C1: file-first credential precedence (see credential_env).
+        self.app_id = app_id or resolve_env_value(env_values, "CTRADER_APP_ID")
+        self.app_secret = app_secret or resolve_env_value(env_values, "CTRADER_APP_SECRET")
+        self.access_token = access_token or resolve_env_value(env_values, "CTRADER_ACCESS_TOKEN")
+        self.refresh_token = refresh_token or resolve_env_value(env_values, "CTRADER_REFRESH_TOKEN")
         self.accounts_env_path = Path(accounts_env_path) if accounts_env_path else DEFAULT_ACCOUNTS_ENV
         raw_account_id = str(account_id or account_config_id).strip()
         self.ctid_trader_account_id = int(raw_account_id) if raw_account_id else 0
         self.demo = (
-            _parse_bool_env("CTRADER_DEMO", os.environ.get("CTRADER_DEMO"), default=True)
+            _parse_bool_env(
+                "CTRADER_DEMO", resolve_env_value(env_values, "CTRADER_DEMO") or None, default=True
+            )
             if demo is None
             else demo
         )
@@ -1647,7 +1651,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 "persist or submit the signal."
             )
 
-    async def submit_order(self, signal: LiveSignal) -> str:
+    async def submit_order(self, signal: LiveSignal, *, qty: float | None = None) -> str:
         self._raise_if_terminal_auth_failed()
         signal_id = str(signal.id)
         existing_order_id = await asyncio.to_thread(
@@ -1665,14 +1669,35 @@ class CTraderLiveAdapter(BaseLiveAdapter):
 
         self._validate_pre_persistence(signal)
 
-        balance, _ = await self.get_balance()
-        sized_order = size_live_signal(signal, account_balance=balance)
-        sized_qty = _to_float((signal.metadata or {}).get("qty"), default=0.0)
-        if sized_qty <= 0:
+        # C1/B2: size exactly once upstream (deployment RiskConfig); the
+        # incoming qty is binding. No default-config sizing here.
+        if qty is None:
             raise ValueError(
-                "Risk engine returned non-positive quantity; order blocked "
-                f"(risk_percent={sized_order.risk_percent:.4f})."
+                "cTrader submit_order requires an explicit risk-sized qty; "
+                "size exactly once upstream and pass it as binding "
+                f"(signal_id={signal.id}, symbol={signal.symbol})."
             )
+        try:
+            qty_value = float(qty)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"cTrader order qty is not a number: {qty!r} "
+                f"(signal_id={signal.id}, symbol={signal.symbol})."
+            )
+        if not math.isfinite(qty_value) or qty_value <= 0:
+            raise ValueError(
+                "cTrader order qty must be finite and positive, "
+                f"got {qty!r} (signal_id={signal.id}, symbol={signal.symbol})."
+            )
+        signal = signal.model_copy(
+            update={
+                "metadata": {
+                    **(signal.metadata or {}),
+                    "qty": qty_value,
+                    "explicit_qty": qty_value,
+                }
+            }
+        )
 
         persisted_timestamp = await asyncio.to_thread(
             get_live_signal_timestamp, signal_id
@@ -1815,7 +1840,16 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         exit_only = (
             str(metadata.get("risk_sizing_mode") or "") == EXIT_ONLY_RISK_SIZING_MODE
         )
-        if stop_loss is None or take_profit is None:
+        # C1: explicit unbounded-take-profit policy (processor-declared, e.g.
+        # RocketFuel exits on the opposite signal) — stop-only order, never
+        # an invented bracket.
+        unbounded_tp = (
+            not exit_only
+            and take_profit is None
+            and str(metadata.get("take_profit_policy") or "")
+            == "unbounded_exit_on_opposite_signal"
+        )
+        if stop_loss is None or (take_profit is None and not unbounded_tp):
             if exit_only:
                 # Exit-only orders close an existing position; they reduce
                 # exposure and carry no entry SL/TP. Only OPENING orders are
@@ -1845,7 +1879,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         return request
 
     def _resolve_relative_sl_tp(
-        self, signal: LiveSignal, stop_loss: float, take_profit: float
+        self, signal: LiveSignal, stop_loss: float, take_profit: float | None
     ) -> tuple[int, int]:
         """Convert absolute SL/TP prices into cTrader relative units.
 
@@ -1892,13 +1926,22 @@ class CTraderLiveAdapter(BaseLiveAdapter):
 
         buy = signal.action == "buy"
         stop_outward = reference_price - stop_loss if buy else stop_loss - reference_price
-        take_outward = take_profit - reference_price if buy else reference_price - take_profit
-        if stop_outward <= 0 or take_outward <= 0:
+        if stop_outward <= 0:
             raise ValueError(
-                f"SL/TP prices are on the wrong side of the reference price for "
+                f"SL price is on the wrong side of the reference price for "
                 f"{signal.symbol} ({signal.action}): stop_loss={stop_loss!r}, "
-                f"take_profit={take_profit!r}, reference={reference_price!r}; "
-                "refusing to submit."
+                f"reference={reference_price!r}; refusing to submit."
+            )
+        if take_profit is None:
+            # C1: explicit unbounded policy — stop-only order. cTrader treats
+            # a zero relativeTakeProfit as "no take profit".
+            return (_distance(stop_loss), 0)
+        take_outward = take_profit - reference_price if buy else reference_price - take_profit
+        if take_outward <= 0:
+            raise ValueError(
+                f"TP price is on the wrong side of the reference price for "
+                f"{signal.symbol} ({signal.action}): take_profit={take_profit!r}, "
+                f"reference={reference_price!r}; refusing to submit."
             )
         return (_distance(stop_loss), _distance(take_profit))
 

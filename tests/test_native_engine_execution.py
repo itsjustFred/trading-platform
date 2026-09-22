@@ -143,7 +143,7 @@ def _spread_strategy(df, params):
 
 def test_market_long_pays_spread_short_hits_bid():
     engine = TradeEngine(
-        BacktestConfig(
+        BacktestConfig(risk_per_trade_pct=0.01, 
             strategy_name="test",
             symbols=["T"],
             timeframe="1m",
@@ -165,7 +165,7 @@ def test_signal_exit_fill_open_uses_bar_open():
     from runner.engine import TradeEngine as _TE
 
     engine = _TE(
-        BacktestConfig(
+        BacktestConfig(risk_per_trade_pct=0.01, 
             strategy_name="test",
             symbols=["T"],
             timeframe="1m",
@@ -187,7 +187,7 @@ def test_signal_exit_fill_close_is_default():
     from runner.engine import TradeEngine as _TE
 
     engine = _TE(
-        BacktestConfig(
+        BacktestConfig(risk_per_trade_pct=0.01, 
             strategy_name="test",
             symbols=["T"],
             timeframe="1m",
@@ -213,7 +213,7 @@ def _short_spread_strategy(df, params):
 def test_signal_exit_fill_open_short_pays_spread():
     # MT5 parity: closing a SHORT buys the ask (open + spread).
     engine = TradeEngine(
-        BacktestConfig(
+        BacktestConfig(risk_per_trade_pct=0.01, 
             strategy_name="test",
             symbols=["T"],
             timeframe="1m",
@@ -260,7 +260,7 @@ def test_warmup_bars_feed_indicators_but_create_no_trades():
         return entries, exits, {}, []
 
     engine = TradeEngine(
-        BacktestConfig(
+        BacktestConfig(risk_per_trade_pct=0.01, 
             strategy_name="test",
             symbols=["T"],
             timeframe="1m",
@@ -306,7 +306,7 @@ def _ask_stop_strategy(df, params):
 
 def test_short_stop_uses_ask_high_when_enabled():
     engine = TradeEngine(
-        BacktestConfig(
+        BacktestConfig(risk_per_trade_pct=0.01, 
             strategy_name="test",
             symbols=["T"],
             timeframe="1m",
@@ -325,7 +325,7 @@ def test_short_stop_uses_ask_high_when_enabled():
 
 def test_short_stop_stays_bid_based_by_default():
     engine = TradeEngine(
-        BacktestConfig(
+        BacktestConfig(risk_per_trade_pct=0.01, 
             strategy_name="test",
             symbols=["T"],
             timeframe="1m",
@@ -416,7 +416,7 @@ def test_short_stop_fill_adds_spread():
     # A-H7: SHORT stop fills buy the ask (stop level + spread), LONG stops
     # sell the bid (level as-is).
     engine = TradeEngine(
-        BacktestConfig(
+        BacktestConfig(risk_per_trade_pct=0.01, 
             strategy_name="test",
             symbols=["T"],
             timeframe="1m",
@@ -439,7 +439,7 @@ def test_explicit_fees_reduce_net_pnl():
     # A-L1: fee_rate (fraction of notional per side) + fee_flat_per_trade
     # must come out of net_pnl instead of silently staying 0.0.
     engine = TradeEngine(
-        BacktestConfig(
+        BacktestConfig(risk_per_trade_pct=0.01, 
             strategy_name="test",
             symbols=["T"],
             timeframe="1m",

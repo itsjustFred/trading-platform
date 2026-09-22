@@ -10,7 +10,7 @@ from runner.engines.lean_adapter import LeanAdapter
 
 
 def _config(tmp_path: Path) -> BacktestConfig:
-    return BacktestConfig(parameters={"fees": "zero"}, 
+    return BacktestConfig(risk_per_trade_pct=0.01, parameters={"fees": "zero"}, 
         strategy_name="lean_demo",
         symbols=["SPY"],
         timeframe="1d",

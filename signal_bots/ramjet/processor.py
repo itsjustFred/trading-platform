@@ -274,8 +274,16 @@ class RamJetSignalProcessor:
 
         if "timestamp" in raw_signal and raw_signal.get("timestamp") is not None:
             metadata["signal_timestamp"] = str(raw_signal.get("timestamp"))
-        if "signal_price" in raw_signal and raw_signal.get("signal_price") is not None:
-            metadata["signal_price"] = float(raw_signal.get("signal_price"))
+        # C1: signal-vs-fill attribution is never dropped and slippage is
+        # visible. The fill (latest close) overwrites the entry by design;
+        # signal_price falls back to the fill itself (slippage 0, explicit).
+        incoming_price = raw_signal.get("signal_price")
+        try:
+            signal_price = float(incoming_price) if incoming_price is not None else entry_price
+        except (TypeError, ValueError):
+            signal_price = entry_price
+        metadata["signal_price"] = signal_price
+        metadata["slippage_vs_signal"] = entry_price - signal_price
 
         return TradeSignal(
             action=action,

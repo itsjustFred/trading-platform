@@ -221,9 +221,13 @@ def _size_trade(
 
         qty = final_notional / entry_price
     else:
-        qty = equity / entry_price
-        final_notional = qty * entry_price
-
+        # C1 (owner decision): HARD ERROR without explicit sizing —
+        # no silent full-equity default. Without config there is no trade.
+        raise ValueError(
+            "Risk sizing is not configured (risk_per_trade_pct unset); "
+            "refusing the full-equity default. Set risk_per_trade_pct "
+            "explicitly (uncapped branches get the same caps as risk sizing)."
+        )
     return _SizeRecord(
         sizing_mode=sizing_mode,
         risk_target_usd=risk_target_usd,

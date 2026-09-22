@@ -460,6 +460,14 @@ class LiveSignalModel(SQLModel, table=True):
         default=None,
         sa_column=Column("discord_message_id", String, nullable=True, index=True),
     )
+    # C1: idempotency key for non-Discord signals (internal/replay). Discord
+    # redeliveries dedup on (deployment_id, discord_message_id); everything
+    # else carries a producer-stable key here so a redelivery returns the
+    # canonical row instead of opening a second broker order.
+    idempotency_key: str | None = Field(
+        default=None,
+        sa_column=Column("idempotency_key", String, nullable=True, index=True),
+    )
     metadata_json: dict[str, Any] = Field(
         default_factory=dict, sa_column=Column("metadata", JSON, nullable=False)
     )
@@ -468,6 +476,7 @@ class LiveSignalModel(SQLModel, table=True):
     def from_live_signal(cls, signal: LiveSignal) -> "LiveSignalModel":
         discord_msg_id = _normalize_optional_id(signal.metadata.get("discord_message_id"))
         broker_order_id = _normalize_optional_id(signal.metadata.get("broker_order_id")) or ""
+        idempotency_key = _normalize_optional_id(signal.metadata.get("idempotency_key"))
 
         return cls(
             id=str(signal.id),
@@ -483,6 +492,7 @@ class LiveSignalModel(SQLModel, table=True):
             source=str(signal.metadata.get("source", "internal")),
             broker_order_id=broker_order_id or "",
             discord_message_id=discord_msg_id,
+            idempotency_key=idempotency_key,
             metadata_json=signal.metadata,
         )
 
@@ -1124,6 +1134,33 @@ def _create_live_signal_discord_indexes(connection: Connection) -> None:
     )
 
 
+def _migrate_live_signal_idempotency_key(connection: Connection) -> None:
+    """Add the idempotency_key column + deployment-scoped unique index (C1).
+
+    Non-Discord signals dedup on (deployment_id, idempotency_key) exactly
+    like Discord signals dedup on (deployment_id, discord_message_id).
+    """
+    column_names = _table_column_names(connection, "live_signals")
+    if not column_names:
+        return
+    if "idempotency_key" not in column_names:
+        connection.execute(text("ALTER TABLE live_signals ADD COLUMN idempotency_key TEXT"))
+    connection.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_live_signals_idempotency_key "
+            "ON live_signals(idempotency_key)"
+        )
+    )
+    connection.execute(
+        text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS "
+            "uq_live_signals_deployment_idempotency_key "
+            "ON live_signals(deployment_id, idempotency_key) "
+            "WHERE idempotency_key IS NOT NULL"
+        )
+    )
+
+
 def _migrate_live_signal_discord_identity(connection: Connection) -> None:
     """Migrate Discord execution identity from global to deployment scope."""
     column_names = _table_column_names(connection, "live_signals")
@@ -1410,6 +1447,7 @@ def _migrate_schema() -> None:
         _add_trade_columns(connection)
 
         _migrate_live_signal_discord_identity(connection)
+        _migrate_live_signal_idempotency_key(connection)
 
         _migrate_backtests_equity_curve(connection)
         _migrate_live_executions_dedupe_key(connection)
@@ -1423,6 +1461,18 @@ def _find_existing_live_signal(
         select(LiveSignalModel)
         .where(LiveSignalModel.deployment_id == deployment_id)
         .where(LiveSignalModel.discord_message_id == discord_msg_id)
+        .limit(1)
+    ).first()
+
+
+def _find_existing_live_signal_by_idempotency_key(
+    session: Session, deployment_id: str, idempotency_key: str
+) -> LiveSignalModel | None:
+    """Find a persisted signal for one (deployment, idempotency_key) pair."""
+    return session.exec(
+        select(LiveSignalModel)
+        .where(LiveSignalModel.deployment_id == deployment_id)
+        .where(LiveSignalModel.idempotency_key == idempotency_key)
         .limit(1)
     ).first()
 
@@ -1470,15 +1520,31 @@ def save_live_signal(signal: LiveSignal) -> tuple[str, bool]:
             if existing is not None:
                 _reconcile_existing_live_signal(session, existing, record)
                 return str(existing.id), False
+        # C1: non-Discord signals (internal/replay) dedup on the producer-
+        # stable idempotency key instead of minting a second broker order.
+        if record.idempotency_key:
+            existing = _find_existing_live_signal_by_idempotency_key(
+                session, deployment_id, record.idempotency_key
+            )
+            if existing is not None:
+                _reconcile_existing_live_signal(session, existing, record)
+                return str(existing.id), False
         record_id = str(record.id)
         session.add(record)
         try:
             session.commit()
         except IntegrityError:
             session.rollback()
-            if not discord_msg_id:
-                raise
-            existing = _find_existing_live_signal(session, deployment_id, discord_msg_id)
+            # Concurrent duplicate: re-query by whichever identity lost the
+            # race (discord id or idempotency key) instead of surfacing the
+            # constraint as a second broker order.
+            existing = None
+            if discord_msg_id:
+                existing = _find_existing_live_signal(session, deployment_id, discord_msg_id)
+            if existing is None and record.idempotency_key:
+                existing = _find_existing_live_signal_by_idempotency_key(
+                    session, deployment_id, record.idempotency_key
+                )
             if existing is None:
                 raise
             logger.info(
@@ -1489,33 +1555,70 @@ def save_live_signal(signal: LiveSignal) -> tuple[str, bool]:
     return record_id, True
 
 
+def _auto_execution_dedupe_key(execution: LiveExecution) -> str:
+    """Deterministic dedupe key from fill content (C1).
+
+    A redelivered fill carries identical content, so the key is stable
+    across redeliveries (unlike a random UUID, which would never dedupe).
+    """
+    timestamp = execution.timestamp
+    if isinstance(timestamp, datetime):
+        if timestamp.tzinfo:
+            stamp = timestamp.astimezone(timezone.utc).isoformat()
+        else:
+            stamp = timestamp.replace(tzinfo=timezone.utc).isoformat()
+    else:
+        stamp = str(timestamp)
+    return (
+        f"auto:{execution.signal_id}:{float(execution.actual_price or 0.0):.8f}:"
+        f"{float(execution.filled_qty or 0.0):.8f}:{stamp}:{execution.broker_order_id}"
+    )
+
+
+def _insert_live_execution_locked(session: Session, record: LiveExecutionModel) -> bool:
+    """Insert-or-skip one execution under a write lock (C1: single path).
+
+    Both plain and cumulative callers funnel through here so the
+    select-check-insert sequence cannot interleave.
+    """
+    existing = session.exec(
+        select(LiveExecutionModel)
+        .where(LiveExecutionModel.dedupe_key == record.dedupe_key)
+        .limit(1)
+    ).first()
+    if existing is not None:
+        logger.info(
+            "Skipping duplicate live execution (dedupe_key=%s)", record.dedupe_key
+        )
+        return False
+    session.add(record)
+    try:
+        session.commit()
+    except IntegrityError:
+        session.rollback()
+        logger.info(
+            "Skipping duplicate live execution on unique constraint (dedupe_key=%s)",
+            record.dedupe_key,
+        )
+        return False
+    return True
+
+
 def save_live_execution(execution: LiveExecution) -> bool:
     """Persist a fill. Returns False when a duplicate (same dedupe_key) was skipped."""
     init_db()
     with get_session() as session:
-        record = LiveExecutionModel.from_live_execution(execution)
-        if record.dedupe_key:
-            existing = session.exec(
-                select(LiveExecutionModel)
-                .where(LiveExecutionModel.dedupe_key == record.dedupe_key)
-                .limit(1)
-            ).first()
-            if existing is not None:
-                logger.info(
-                    "Skipping duplicate live execution (dedupe_key=%s)", record.dedupe_key
-                )
-                return False
-        session.add(record)
+        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
         try:
-            session.commit()
-        except IntegrityError:
+            record = LiveExecutionModel.from_live_execution(execution)
+            if not record.dedupe_key:
+                # C1: a missing key must not bypass the partial unique index
+                # via NULL — derive it deterministically from the fill.
+                record.dedupe_key = _auto_execution_dedupe_key(execution)
+            return _insert_live_execution_locked(session, record)
+        except Exception:
             session.rollback()
-            logger.info(
-                "Skipping duplicate live execution on unique constraint (dedupe_key=%s)",
-                record.dedupe_key,
-            )
-            return False
-    return True
+            raise
 
 
 def save_live_execution_up_to_cumulative(
@@ -1533,15 +1636,16 @@ def save_live_execution_up_to_cumulative(
         session.connection().exec_driver_sql("BEGIN IMMEDIATE")
         try:
             record = LiveExecutionModel.from_live_execution(execution)
-            if record.dedupe_key:
-                existing = session.exec(
-                    select(LiveExecutionModel)
-                    .where(LiveExecutionModel.dedupe_key == record.dedupe_key)
-                    .limit(1)
-                ).first()
-                if existing is not None:
-                    session.rollback()
-                    return 0.0
+            if not record.dedupe_key:
+                record.dedupe_key = _auto_execution_dedupe_key(execution)
+            existing = session.exec(
+                select(LiveExecutionModel)
+                .where(LiveExecutionModel.dedupe_key == record.dedupe_key)
+                .limit(1)
+            ).first()
+            if existing is not None:
+                session.rollback()
+                return 0.0
 
             local_filled_qty = float(
                 session.exec(
@@ -1559,8 +1663,9 @@ def save_live_execution_up_to_cumulative(
             record.filled_qty = persisted_qty
             if requested_qty != persisted_qty and record.commission:
                 record.commission *= persisted_qty / requested_qty
-            session.add(record)
-            session.commit()
+            if not _insert_live_execution_locked(session, record):
+                session.rollback()
+                return 0.0
             return persisted_qty
         except IntegrityError:
             session.rollback()

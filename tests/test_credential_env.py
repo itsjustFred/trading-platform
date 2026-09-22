@@ -242,3 +242,56 @@ def asyncio_run(coro):
     import asyncio
 
     return asyncio.run(coro)
+
+
+class TestResolveEnvValue:
+    """C1: file-first precedence with absent-vs-empty distinction."""
+
+    def test_file_value_wins_over_process_env(self, monkeypatch) -> None:
+        from live_runner.credential_env import resolve_env_value
+
+        monkeypatch.setenv("C1_TEST_KEY", "stale-env")
+        assert resolve_env_value({"C1_TEST_KEY": "fresh-file"}, "C1_TEST_KEY") == "fresh-file"
+
+    def test_present_but_empty_stays_empty(self, monkeypatch) -> None:
+        """The `or`-fallback hole: '' must not fall through to os.environ."""
+        from live_runner.credential_env import resolve_env_value
+
+        monkeypatch.setenv("C1_TEST_KEY", "stale-env")
+        assert resolve_env_value({"C1_TEST_KEY": ""}, "C1_TEST_KEY") == ""
+
+    def test_absent_key_falls_back_to_process_env(self, monkeypatch) -> None:
+        from live_runner.credential_env import resolve_env_value
+
+        monkeypatch.setenv("C1_TEST_KEY", "env-only")
+        assert resolve_env_value({}, "C1_TEST_KEY") == "env-only"
+
+    def test_missing_everywhere_returns_default(self, monkeypatch) -> None:
+        from live_runner.credential_env import resolve_env_value
+
+        monkeypatch.delenv("C1_TEST_KEY", raising=False)
+        assert resolve_env_value({}, "C1_TEST_KEY") == ""
+        assert resolve_env_value(None, "C1_TEST_KEY", default="d") == "d"
+
+
+class TestAdapterEnvValues:
+    def test_alpaca_adapter_prefers_env_values_map(self, monkeypatch) -> None:
+        from live_runner import alpaca_adapter as module
+
+        monkeypatch.setenv("ALPACA_API_KEY", "stale-env-key")
+        adapter = module.AlpacaLiveAdapter(
+            account_id="test",
+            env_values={"ALPACA_API_KEY": "file-key", "ALPACA_SECRET_KEY": "file-secret"},
+        )
+        assert adapter.api_key == "file-key"
+        assert adapter.secret_key == "file-secret"
+
+    def test_alpaca_adapter_empty_file_value_not_shadowed(self, monkeypatch) -> None:
+        from live_runner import alpaca_adapter as module
+
+        monkeypatch.setenv("ALPACA_API_KEY", "stale-env-key")
+        with pytest.raises(ValueError, match="Missing Alpaca credentials"):
+            module.AlpacaLiveAdapter(
+                account_id="test",
+                env_values={"ALPACA_API_KEY": "", "ALPACA_SECRET_KEY": "s"},
+            )

@@ -90,7 +90,7 @@ def test_trade_engine_market_entry_and_signal_exit_price_model():
         exits.iloc[20] = True
         return entries, exits, {}, []
 
-    cfg = BacktestConfig(
+    cfg = BacktestConfig(risk_per_trade_pct=0.01, 
         strategy_name="unit-test",
         symbols=["TEST"],
         timeframe="1h",
@@ -347,7 +347,7 @@ def test_example_sma_native_vs_vectorbt_smoke_on_local_data():
         pytest.skip("No local 1h OHLCV parquet data covering 2024-01-01..2025-12-31")
 
     symbol = selected.parent.name
-    cfg = BacktestConfig(
+    cfg = BacktestConfig(risk_per_trade_pct=0.01, 
         strategy_name="example_sma",
         symbols=[symbol],
         timeframe="1h",

@@ -15,8 +15,7 @@ from alpaca.trading.enums import OrderClass
 from alpaca.trading.requests import StopLossRequest, TakeProfitRequest
 
 from live_runner.base_adapter import EXIT_ONLY_RISK_SIZING_MODE, BaseLiveAdapter
-from live_runner.credential_env import parse_bool_env
-from risk.live import size_live_signal
+from live_runner.credential_env import parse_bool_env, resolve_env_value
 from shared.database import (
     get_live_signal_broker_order_id,
     get_live_signal_filled_qty,
@@ -271,19 +270,24 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         secret_key: str | None = None,
         paper: bool | None = None,
         account_id: str = "",
+        env_values: Mapping[str, str] | None = None,
     ):
-        self.api_key = api_key or os.environ.get("ALPACA_API_KEY", "")
-        self.secret_key = secret_key or os.environ.get("ALPACA_SECRET_KEY", "")
-        # Legacy fallback: with file-first precedence (credential_env) the
-        # caller is expected to pass resolved keys; the os.environ fallback
-        # only covers scripts constructed before that resolution existed.
+        # C1: file-first credential precedence — explicit args win, then
+        # .accounts.env via credential_env, then os.environ for ABSENT keys.
+        # A present-but-empty file value stays empty (never shadowed).
+        self.api_key = api_key or resolve_env_value(env_values, "ALPACA_API_KEY")
+        self.secret_key = secret_key or resolve_env_value(env_values, "ALPACA_SECRET_KEY")
         if not api_key or not secret_key:
             logger.warning(
-                "Alpaca adapter falling back to process-env credentials",
+                "Alpaca adapter falling back to resolved-env credentials",
                 extra={"data": {"account_id": account_id}},
             )
         self.paper = (
-            _parse_bool_env("ALPACA_PAPER", os.environ.get("ALPACA_PAPER"), default=True)
+            _parse_bool_env(
+                "ALPACA_PAPER",
+                resolve_env_value(env_values, "ALPACA_PAPER") or None,
+                default=True,
+            )
             if paper is None
             else paper
         )
@@ -526,18 +530,28 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         exit_only = (
             str(metadata.get("risk_sizing_mode") or "") == EXIT_ONLY_RISK_SIZING_MODE
         )
+        # C1: explicit unbounded-take-profit policy (processor-declared) —
+        # stop-only order, never an invented bracket.
+        unbounded_tp = (
+            not exit_only
+            and take_profit is None
+            and str(metadata.get("take_profit_policy") or "")
+            == "unbounded_exit_on_opposite_signal"
+        )
         missing = [
             name
             for name, value in (("stop_loss", stop_loss), ("take_profit", take_profit))
             if value is None
         ]
-        if missing and not exit_only:
+        if missing and not exit_only and not (unbounded_tp and missing == ["take_profit"]):
             raise ValueError(
                 "Refusing to submit Alpaca order without "
                 f"{' and '.join(missing)} (signal_id={signal.id}, "
                 f"symbol={signal.symbol}); opening an unbounded position is not allowed."
             )
         if missing:
+            if unbounded_tp and stop_loss is not None:
+                return float(stop_loss), float("nan")
             return float("nan"), float("nan")
         for name, value in (("stop_loss", stop_loss), ("take_profit", take_profit)):
             if math.isnan(value) or math.isinf(value) or value <= 0:
@@ -583,11 +597,28 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 "the broker rejects bracket orders with extended_hours enabled "
                 f"(signal_id={signal.id}, symbol={signal.symbol})."
             )
+        # C1: explicit unbounded policy rides as OTO (entry + stop leg,
+        # no take-profit leg) instead of an invented bracket.
+        unbounded_tp = (
+            not exit_only
+            and isinstance(take_profit_price, float)
+            and math.isnan(take_profit_price)
+            and str((signal.metadata or {}).get("take_profit_policy") or "")
+            == "unbounded_exit_on_opposite_signal"
+        )
+        if unbounded_tp:
+            order_class = OrderClass.OTO
+            take_profit_leg = None
+        else:
+            order_class = OrderClass.SIMPLE if exit_only else OrderClass.BRACKET
+            take_profit_leg = (
+                None if exit_only else TakeProfitRequest(limit_price=take_profit_price)
+            )
         return market_request_cls(
             time_in_force=time_in_force.DAY,
             extended_hours=False,
-            order_class=OrderClass.SIMPLE if exit_only else OrderClass.BRACKET,
-            take_profit=None if exit_only else TakeProfitRequest(limit_price=take_profit_price),
+            order_class=order_class,
+            take_profit=take_profit_leg,
             stop_loss=None if exit_only else StopLossRequest(stop_price=stop_loss_price),
             symbol=signal.symbol,
             qty=qty,
@@ -621,25 +652,29 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         if signal.action not in {"buy", "sell"}:
             raise ValueError(f"Unsupported action '{signal.action}'")
 
-        if qty is not None:
-            # Trusted channel: the caller has already run risk sizing.
-            risk_percent = float((signal.metadata or {}).get("risk_percent") or 0.0)
-        else:
-            # Legacy fallback (direct operator scripts): size with the shared
-            # default risk configuration. Signal metadata never supplies
-            # quantities or policy.
-            # Use equity (not cash) for risk sizing so margin accounts with negative cash
-            # still pass sizing validation when total account value is positive.
-            _, equity = await self.get_balance()
-            sized_order = size_live_signal(signal, account_balance=equity)
-            qty = float(sized_order.position_size)
-            risk_percent = float(sized_order.risk_percent)
-        qty = max(float(qty), 0.0)
-        if qty <= 0:
+        # C1/B2: size exactly once upstream (deployment RiskConfig); the
+        # incoming qty is binding. No default-config sizing here — sizing
+        # with defaults silently diverged from the deployment policy, and
+        # max(float(qty), 0.0) let NaN through to MarketOrderRequest.
+        if qty is None:
             raise ValueError(
-                "Risk engine returned non-positive quantity; order blocked "
-                f"(risk_percent={risk_percent:.4f})."
+                "Alpaca submit_order requires an explicit risk-sized qty; "
+                "size exactly once upstream and pass it as binding "
+                f"(signal_id={signal.id}, symbol={signal.symbol})."
             )
+        try:
+            qty_value = float(qty)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"Alpaca order qty is not a number: {qty!r} "
+                f"(signal_id={signal.id}, symbol={signal.symbol})."
+            )
+        if not math.isfinite(qty_value) or qty_value <= 0:
+            raise ValueError(
+                "Alpaca order qty must be finite and positive, "
+                f"got {qty!r} (signal_id={signal.id}, symbol={signal.symbol})."
+            )
+        qty = qty_value
 
         order_side, time_in_force, market_request_cls = self._load_alpaca_order_types()
 

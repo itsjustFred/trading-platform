@@ -72,7 +72,17 @@ class TradeEngine:
         self._progress_end = float(progress_end)
         configured_risk_pct = float(self.config.risk_per_trade_pct or 0.0)
         self._risk_enabled = configured_risk_pct > 0
-        max_total_exposure = float(self.config.max_position_pct or 0.05)
+        # B4 (16-E remainder): BacktestConfig folds the deprecated alias
+        # into max_position_exposure_pct at construction (with warning), so
+        # only the canonical field is read here. The silent `or 0.05`
+        # fallback is gone — unset means the RiskConfig default, named
+        # explicitly.
+        _position_cap = self.config.max_position_exposure_pct
+        max_total_exposure = (
+            float(_position_cap)
+            if _position_cap is not None
+            else RiskConfig().max_total_exposure
+        )
         max_leverage = float(self.config.max_leverage or 1.0)
         # Risk-policy provenance (Cleanup 16-D1, F22): the engine-level risk
         # policy is engine configuration only. It is intentionally NOT read
@@ -281,7 +291,13 @@ class TradeEngine:
             )
             shares = float(sized_order.position_size)
         else:
-            shares = self.equity / entry_price
+            # C1 (owner decision): HARD ERROR without explicit sizing —
+            # no silent full-equity default. Without config there is no trade.
+            raise ValueError(
+                "Risk sizing is not configured (risk_per_trade_pct unset and "
+                "no fixed_risk_amount); refusing the full-equity default. "
+                "Set risk_per_trade_pct or fixed_risk_amount explicitly."
+            )
 
         max_value = self.equity * max_leverage
         shares = min(shares, max_value / entry_price)

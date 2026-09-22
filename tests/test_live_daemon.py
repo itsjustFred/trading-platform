@@ -832,7 +832,7 @@ class _SignalSubmittingAdapter:
     async def connect(self) -> None:
         return None
 
-    async def submit_order(self, signal) -> str:
+    async def submit_order(self, signal, *, qty: float | None = None) -> str:
         self.submitted.append(signal)
         return "order-1"
 

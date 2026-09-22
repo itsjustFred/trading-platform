@@ -436,7 +436,10 @@ async def _ctrader_order_worker(
             "timeframe": "1m",
         },
     )
-    broker_order_id = await asyncio.wait_for(adapter.submit_order(signal), timeout=timeout_seconds)
+    # C1/B2: adapters size zero times — the smoke qty is explicit intent.
+    broker_order_id = await asyncio.wait_for(
+        adapter.submit_order(signal, qty=float(volume) / 1000.0), timeout=timeout_seconds
+    )
 
     opened_position = await _wait_for_ctrader_position(
         adapter,
@@ -922,6 +925,17 @@ async def _discord_replay_smoke() -> list[SmokeCheck]:
             raise RuntimeError("Parsed signal did not match deployment symbols.")
 
         live_signal = _trade_signal_to_live_signal(trade_signal, deployment)
+        # C1: the routing smoke carries an explicit bounded bracket (the
+        # parser emits price-only signals; unbounded ones are refused).
+        live_signal = live_signal.model_copy(
+            update={
+                "metadata": {
+                    **(live_signal.metadata or {}),
+                    "stop_loss": 190.50 * 0.98,
+                    "take_profit": 190.50 * 1.04,
+                }
+            }
+        )
         broker_order_id = await submit_order_with_risk(
             adapter,
             deployment,

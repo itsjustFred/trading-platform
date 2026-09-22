@@ -87,6 +87,8 @@ def _config(tmp_path: Path, strategy_file: str, **overrides: Any) -> BacktestCon
         "start_date": "2024-01-01",
         "end_date": "2024-01-02",
         "initial_capital": 100_000,
+        # C1: engines size zero times without explicit sizing.
+        "risk_per_trade_pct": 0.01,
         "modeling_resolution": "main_timeframe",
         "data_dir": str(tmp_path),
         "parameters": {"spread_price_col": "spread_price"},
@@ -169,7 +171,7 @@ class TestWarmupGate:
         )
         path = parity_env / "warmup_strat.py"
         path.write_text(text)
-        config = BacktestConfig(parameters={"fees": "zero"}, 
+        config = BacktestConfig(risk_per_trade_pct=0.01, parameters={"fees": "zero"}, 
             strategy_name="vbt_warmup",
             symbols=["VBW"],
             timeframe="1h",
