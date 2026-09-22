@@ -136,7 +136,7 @@ class TestNoTradeTrialsCannotWin:
                 {"start": "2024-06-01T00:00:00+00:00", "end": "2024-12-31T00:00:00+00:00"},
             ),
         )
-        monkeypatch.setattr(optimizer_module, "_resolve_strategy_reference", lambda r: ("s", Path("/tmp/s.py"), "s"))
+        monkeypatch.setattr(optimizer_module, "_resolve_strategy_reference", lambda r: ("s", Path("mock_strategy.py"), "s"))
         monkeypatch.setattr(optimizer_module, "ensure_backtest_data", lambda **kwargs: None)
         monkeypatch.setattr(
             optimizer_module,
@@ -385,7 +385,7 @@ class TestMetricDirection:
             ),
         )
         monkeypatch.setattr(
-            optimizer_module, "_resolve_strategy_reference", lambda r: ("s", Path("/tmp/s.py"), "s")
+            optimizer_module, "_resolve_strategy_reference", lambda r: ("s", Path("mock_strategy.py"), "s")
         )
         monkeypatch.setattr(optimizer_module, "ensure_backtest_data", lambda **kwargs: None)
         monkeypatch.setattr(optimizer_module, "has_sufficient_segment_coverage", lambda **kwargs: True)

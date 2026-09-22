@@ -10,7 +10,7 @@ import pandas as pd
 from risk.config import RiskConfig
 from risk.engine import RiskEngine
 from risk.models import TradeSignal as RiskTradeSignal
-from risk.models import realized_risk_amount
+from risk.models import realized_risk_amount, realized_risk_percent
 from runner.engines import contract
 from runner.engines.contract import resolve_same_bar_exit
 from runner.fees import resolve_fee_model
@@ -644,7 +644,7 @@ class SignalReplayAdapter:
                 # #84: store the realized stop-loss amount, not the policy
                 # figure (they differ on notional-cap).
                 risk_amount=float(realized_risk_amount(sized)),
-                risk_percent=float(sized.risk_percent),
+                risk_percent=float(realized_risk_percent(sized, account_balance)),
                 timeframe=risk_signal.timeframe,
                 source=effective_signal.source,
                 signal_time=effective_signal.timestamp,
@@ -817,7 +817,7 @@ class SignalReplayAdapter:
             initial_take_profit=risk_signal.take_profit,
             # #84: store the realized stop-loss amount, not the policy figure.
             risk_amount=float(realized_risk_amount(sized)),
-            risk_percent=float(sized.risk_percent),
+            risk_percent=float(realized_risk_percent(sized, account_balance)),
             timeframe=risk_signal.timeframe,
             source=effective_signal.source,
             signal_time=effective_signal.timestamp,

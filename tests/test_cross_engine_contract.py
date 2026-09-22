@@ -22,17 +22,8 @@ from runner.engine import TradeEngine
 from runner.engines.base import BacktestConfig
 from runner.engines.vectorbt_adapter import VectorbtAdapter
 from runner.engines.native_adapter import NativeAdapter
-from tests.helpers import write_ohlcv as _write_ohlcv
+from tests.helpers import write_ohlcv as _write_ohlcv, with_zero_fees
 
-
-
-def _with_zero_fees(payload: dict) -> dict:
-    """#84: explicit no-cost declaration for engine fixtures."""
-    merged = dict(payload)
-    params = dict(merged.get("parameters") or {})
-    params.setdefault("fees", "zero")
-    merged["parameters"] = params
-    return merged
 
 def _frame(*, spread: float = 0.0) -> pd.DataFrame:
     closes = [100.0 + i * 1.0 for i in range(12)]
@@ -85,7 +76,7 @@ def _native_result(frame: pd.DataFrame, strategy_fn, **config_kwargs):
         "initial_capital": 100_000.0,
     }
     payload.update(config_kwargs)
-    config = BacktestConfig(**_with_zero_fees(payload))
+    config = BacktestConfig(**with_zero_fees(payload))
     engine = TradeEngine(config, symbol="CEC")
     return engine.run(frame, strategy_fn)
 
@@ -105,7 +96,7 @@ def _vectorbt_result(tmp_path: Path, frame: pd.DataFrame, strategy_text: str, **
         "parameters": {},
     }
     payload.update(config_kwargs)
-    return VectorbtAdapter().run(BacktestConfig(**_with_zero_fees(payload)), strategy_path)
+    return VectorbtAdapter().run(BacktestConfig(**with_zero_fees(payload)), strategy_path)
 
 
 def _load_strategy_fn(strategy_text: str, tmp_path: Path, name: str):

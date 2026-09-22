@@ -29,7 +29,7 @@ from live_runner.stockkit_routing import (
     validate_stockkit_deployment_route,
 )
 from risk import RiskConfig, RiskEngine, TradeSignal
-from risk.models import realized_risk_amount
+from risk.models import realized_risk_amount, realized_risk_percent
 from scheduler.scheduler import ServiceScheduler
 from shared.database import (
     create_service,
@@ -578,7 +578,7 @@ def size_live_signal_for_submission(
     # #84: live metadata carries the realized stop-loss amount (differs from
     # the policy figure on notional-cap).
     metadata["risk_amount"] = float(realized_risk_amount(sized_order))
-    metadata["risk_percent"] = float(sized_order.risk_percent)
+    metadata["risk_percent"] = float(realized_risk_percent(sized_order, account_balance))
     metadata["risk_reward_ratio"] = (
         float(sized_order.risk_reward_ratio)
         if sized_order.risk_reward_ratio is not None

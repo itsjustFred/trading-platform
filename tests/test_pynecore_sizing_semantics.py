@@ -13,6 +13,7 @@ PyneCore branch was test-blind) plus the P2 fixes:
 """
 
 from __future__ import annotations
+from tests.helpers import with_zero_fees
 
 from pathlib import Path
 from typing import Any
@@ -31,15 +32,6 @@ from runner.engines.pynecore_adapter import (
 from runner.engines._shared import resolve_max_leverage as _resolve_max_leverage
 from shared.models import Trade, TradeExit
 
-
-
-def _with_zero_fees(payload: dict) -> dict:
-    """#84: explicit no-cost declaration for engine fixtures."""
-    merged = dict(payload)
-    params = dict(merged.get("parameters") or {})
-    params.setdefault("fees", "zero")
-    merged["parameters"] = params
-    return merged
 
 def _trade(
     *,
@@ -88,7 +80,7 @@ def _config(tmp_path: Path, **overrides: Any) -> BacktestConfig:
         "data_dir": str(tmp_path),
     }
     payload.update(overrides)
-    return BacktestConfig(**_with_zero_fees(payload))
+    return BacktestConfig(**with_zero_fees(payload))
 
 
 def _frame() -> pd.DataFrame:

@@ -137,3 +137,19 @@ def realized_risk_amount(order: SizedOrder) -> float:
             if math.isfinite(value) and value >= 0:
                 return value
     return float(order.risk_amount)
+
+
+def realized_risk_percent(order: SizedOrder, account_balance: float) -> float:
+    """Realized risk as a fraction of equity (#84).
+
+    The engine reports no realized percent (only the policy figure plus the
+    realized amount), so it is derived here: realized amount over the sizing
+    balance. Falls back to the policy percent on zero/unknown balance.
+    """
+    try:
+        balance = float(account_balance)
+    except (TypeError, ValueError):
+        balance = 0.0
+    if balance > 0:
+        return float(realized_risk_amount(order)) / balance
+    return float(order.risk_percent)

@@ -23,6 +23,7 @@ Decision Records (Cleanup 16-A, 2026-08-31):
 """
 
 from __future__ import annotations
+from tests.helpers import with_zero_fees
 
 import shutil
 import subprocess
@@ -65,15 +66,6 @@ from shared.models import VALID_TIMEFRAMES, Trade, TradeExit
 
 STRATEGY_PATH = str(Path(__file__).resolve().parent / "strategies" / "contract_sma.py")
 
-
-
-def _with_zero_fees(payload: dict) -> dict:
-    """#84: explicit no-cost declaration for engine fixtures."""
-    merged = dict(payload)
-    params = dict(merged.get("parameters") or {})
-    params.setdefault("fees", "zero")
-    merged["parameters"] = params
-    return merged
 
 def _deterministic_ohlcv(
     *,
@@ -138,7 +130,7 @@ def _config(data_dir: Path, **overrides) -> BacktestConfig:
         "parameters": {"fast_length": 5, "slow_length": 20},
     }
     payload.update(overrides)
-    return BacktestConfig(**_with_zero_fees(payload))
+    return BacktestConfig(**with_zero_fees(payload))
 
 
 @pytest.fixture(scope="module")

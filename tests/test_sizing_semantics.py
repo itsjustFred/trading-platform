@@ -13,6 +13,7 @@ name) keep old invocations working during migration and emit a
 """
 
 from __future__ import annotations
+from tests.helpers import with_zero_fees
 
 import argparse
 import contextlib
@@ -29,15 +30,6 @@ from runner.engines.vectorbt_adapter import _resolve_max_position_exposure_pct
 # ─── BacktestConfig field semantics ─────────────────────────────────────────
 
 
-
-def _with_zero_fees(payload: dict) -> dict:
-    """#84: explicit no-cost declaration for engine fixtures."""
-    merged = dict(payload)
-    params = dict(merged.get("parameters") or {})
-    params.setdefault("fees", "zero")
-    merged["parameters"] = params
-    return merged
-
 class TestBacktestConfigField:
     @staticmethod
     def _config(**overrides) -> BacktestConfig:
@@ -49,7 +41,7 @@ class TestBacktestConfigField:
             "end_date": "2024-01-31",
         }
         payload.update(overrides)
-        return BacktestConfig(**_with_zero_fees(payload))
+        return BacktestConfig(**with_zero_fees(payload))
 
     def test_new_field_is_the_canonical_name(self):
         config = self._config(max_position_exposure_pct=0.75)
@@ -305,7 +297,7 @@ class TestNativeEngineExposureWiring:
             "parameters": {},
         }
         payload.update(overrides)
-        return TradeEngine(BacktestConfig(**_with_zero_fees(payload)), symbol="X")
+        return TradeEngine(BacktestConfig(**with_zero_fees(payload)), symbol="X")
 
     def test_exposure_flag_feeds_max_total_exposure(self):
         engine = self._engine(max_position_exposure_pct=0.4)

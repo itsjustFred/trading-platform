@@ -26,17 +26,8 @@ from runner.engines.vectorbt_adapter import (
     _vbt_ask_bar,
     _vbt_bar_spread,
 )
-from tests.helpers import write_ohlcv as _write_shared_ohlcv
+from tests.helpers import write_ohlcv as _write_shared_ohlcv, with_zero_fees
 
-
-
-def _with_zero_fees(payload: dict) -> dict:
-    """#84: explicit no-cost declaration for engine fixtures."""
-    merged = dict(payload)
-    params = dict(merged.get("parameters") or {})
-    params.setdefault("fees", "zero")
-    merged["parameters"] = params
-    return merged
 
 def _frame() -> pd.DataFrame:
     return pd.DataFrame(
@@ -101,7 +92,7 @@ def _config(tmp_path: Path, strategy_file: str, **overrides: Any) -> BacktestCon
         "parameters": {"spread_price_col": "spread_price"},
     }
     payload.update(overrides)
-    return BacktestConfig(**_with_zero_fees(payload))
+    return BacktestConfig(**with_zero_fees(payload))
 
 
 def _write_strategy(tmp_path: Path, name: str, text: str) -> str:

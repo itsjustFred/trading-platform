@@ -15,6 +15,7 @@ Covers Cleanup 16-D1 findings on ``runner/engine.py``:
 """
 
 from __future__ import annotations
+from tests.helpers import with_zero_fees
 
 from pathlib import Path
 
@@ -27,15 +28,6 @@ from runner.engines.base import BacktestConfig
 
 # ─── Fixtures ────────────────────────────────────────────────────────────────
 
-
-
-def _with_zero_fees(payload: dict) -> dict:
-    """#84: explicit no-cost declaration for engine fixtures."""
-    merged = dict(payload)
-    params = dict(merged.get("parameters") or {})
-    params.setdefault("fees", "zero")
-    merged["parameters"] = params
-    return merged
 
 def _config(tmp_path: Path, **overrides) -> BacktestConfig:
     payload = {
@@ -50,7 +42,7 @@ def _config(tmp_path: Path, **overrides) -> BacktestConfig:
         "parameters": {},
     }
     payload.update(overrides)
-    return BacktestConfig(**_with_zero_fees(payload))
+    return BacktestConfig(**with_zero_fees(payload))
 
 
 def _linear_frame(n: int = 5, start: float = 100.0) -> pd.DataFrame:
