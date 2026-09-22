@@ -40,11 +40,12 @@ INTERNAL_GAP_FAIL_DAYS = 3
 INTERNAL_GAP_WARN_DAYS = 1
 
 # #86: segment-coverage rule replacing the 1-bar check. Expected bars are
-# derived from timeframe x segment length; >=95% of expected bars must be
-# present and no single bar-to-bar gap may exceed 3x the timeframe,
-# regardless of density. Exchange/forex calendars are an explicit open item
-# (weekends/holidays are not skipped here — the gate is intentionally
-# strict and fails closed on gappy months).
+# derived from timeframe x TRADING minutes in the segment (Saturdays and
+# Sundays excluded — no venue in this repo prints Sat bars, so wall-clock
+# counting would reject every multi-week segment); >=95% of expected bars
+# must be present and no single bar-to-bar gap may exceed 3x the timeframe
+# in trading minutes, regardless of density. Exchange holidays are NOT
+# skipped (no calendar wired) — the gate stays fail-closed there by design.
 TIMEFRAME_MINUTES: dict[str, float] = {
     "1m": 1.0,
     "5m": 5.0,
@@ -57,6 +58,28 @@ TIMEFRAME_MINUTES: dict[str, float] = {
 }
 SEGMENT_MIN_DENSITY = 0.95
 SEGMENT_MAX_GAP_MULTIPLIER = 3.0
+
+
+def _weekend_overlap_minutes(start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> float:
+    """Minutes of ``[start_ts, end_ts]`` falling on Saturday/Sunday (UTC)."""
+    if end_ts <= start_ts:
+        return 0.0
+    total = 0.0
+    cursor = start_ts.normalize()
+    while cursor <= end_ts:
+        if cursor.weekday() >= 5:
+            day_start = max(start_ts, cursor)
+            day_end = min(end_ts, cursor + pd.Timedelta(days=1))
+            if day_end > day_start:
+                total += (day_end - day_start).total_seconds() / 60.0
+        cursor += pd.Timedelta(days=1)
+    return total
+
+
+def _trading_minutes_between(start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> float:
+    """Wall-clock minutes minus full-weekend overlap (CodeRabbit round)."""
+    total = max((end_ts - start_ts).total_seconds() / 60.0, 0.0)
+    return max(total - _weekend_overlap_minutes(start_ts, end_ts), 0.0)
 
 
 @dataclass
@@ -511,11 +534,11 @@ def has_sufficient_segment_coverage(
 ) -> bool:
     """Return whether ``[start, end]`` has dense, gap-free coverage (#86).
 
-    Expected bars = segment length / timeframe step; at least ``min_density``
-    (default 95%) must be present, and no single bar-to-bar gap may exceed
-    ``max_gap_multiplier`` x the timeframe step (default 3x), regardless of
-    density. A month-long segment with a single bar is rejected. Unknown
-    timeframes fail closed.
+    Expected bars = TRADING minutes / timeframe step (weekends excluded);
+    at least ``min_density`` (default 95%) must be present, and no single
+    bar-to-bar gap may exceed ``max_gap_multiplier`` x the step in trading
+    minutes (default 3x), regardless of density. A month-long segment with
+    a single bar is rejected. Unknown timeframes fail closed.
     """
     normalized_timeframe = normalize_timeframe(str(timeframe or "").strip())
     step_minutes = TIMEFRAME_MINUTES.get(normalized_timeframe)
@@ -525,17 +548,19 @@ def has_sufficient_segment_coverage(
     end_ts = pd.to_datetime(str(end or ""), utc=True, errors="coerce")
     if pd.isna(start_ts) or pd.isna(end_ts) or start_ts > end_ts:
         return False
-    span_minutes = max((end_ts - start_ts).total_seconds() / 60.0, 0.0)
+    span_minutes = _trading_minutes_between(start_ts, end_ts)
     expected = max(int(span_minutes // step_minutes) + 1, 1)
     stamps = _segment_timestamps_in_range(symbol, normalized_timeframe, start_ts, end_ts, data_dir)
     if not stamps:
         return False
     if len(stamps) / expected < min_density:
         return False
-    step = pd.Timedelta(minutes=step_minutes)
-    limit = step * max_gap_multiplier
+    limit_minutes = step_minutes * max_gap_multiplier
     for prev, cur in zip(stamps, stamps[1:]):
-        if cur - prev > limit:
+        gap_trading_minutes = (cur - prev).total_seconds() / 60.0 - _weekend_overlap_minutes(
+            prev, cur
+        )
+        if gap_trading_minutes > limit_minutes:
             return False
     return True
 

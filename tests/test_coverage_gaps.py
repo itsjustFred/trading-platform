@@ -263,3 +263,45 @@ class TestGapDetectionSingleFile:
         gaps = find_internal_gaps(target.parent, "1h")
         assert gaps, "hole inside one file must be detected"
         assert gaps[0]["gap_days"] > 1000
+
+
+class TestSegmentCoverageWeekends:
+    """Weekends are non-trading: no false rejects, real holes still fail."""
+
+    def test_daily_equity_segment_over_weekend_passes(self, tmp_path):
+        # Mon 2024-01-01 .. Fri 2024-01-12, weekdays only (real equity feed).
+        stamps = pd.date_range("2024-01-01", "2024-01-12", freq="B", tz="UTC")
+        _write_bars(
+            tmp_path / "ohlcv" / "test" / "AAPL" / "1d.parquet",
+            [ts.isoformat() for ts in stamps],
+        )
+        assert has_sufficient_segment_coverage(
+            symbol="AAPL", timeframe="1d",
+            start="2024-01-01", end="2024-01-12", data_dir=tmp_path,
+        )
+
+    def test_hourly_segment_with_weekend_gap_passes(self, tmp_path):
+        # Fri 22:00 -> Mon 00:00 UTC gap is weekend, not missing data.
+        stamps = list(pd.date_range("2024-01-05T00:00", "2024-01-05T22:00", freq="1h", tz="UTC"))
+        stamps += list(pd.date_range("2024-01-08T00:00", "2024-01-08T10:00", freq="1h", tz="UTC"))
+        _write_bars(
+            tmp_path / "ohlcv" / "dukascopy" / "forex" / "EURUSD" / "1h.parquet",
+            [ts.isoformat() for ts in stamps],
+        )
+        assert has_sufficient_segment_coverage(
+            symbol="EURUSD", timeframe="1h",
+            start="2024-01-05", end="2024-01-08T10:00", data_dir=tmp_path,
+        )
+
+    def test_midweek_hole_still_fails(self, tmp_path):
+        # 12h hole Tue->Wed (no weekend involved) exceeds 3x 1h.
+        stamps = list(pd.date_range("2024-01-09T00:00", "2024-01-09T05:00", freq="1h", tz="UTC"))
+        stamps += list(pd.date_range("2024-01-09T17:00", "2024-01-09T23:00", freq="1h", tz="UTC"))
+        _write_bars(
+            tmp_path / "ohlcv" / "dukascopy" / "forex" / "EURUSD" / "1h.parquet",
+            [ts.isoformat() for ts in stamps],
+        )
+        assert not has_sufficient_segment_coverage(
+            symbol="EURUSD", timeframe="1h",
+            start="2024-01-09", end="2024-01-09T23:00", data_dir=tmp_path,
+        )

@@ -291,9 +291,11 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         self._trading_client: Any | None = None
         self._trading_stream: Any | None = None
         # #78: subscribe exactly once per stream instance. Re-subscribing
-        # the same (or a reconnected) stream duplicates callbacks, so
-        # _subscribed_streams tracks stream identities already subscribed.
-        self._subscribed_streams: set[int] = set()
+        # the same (or a reconnected) stream duplicates callbacks. The
+        # subscribed stream object itself is tracked (not its id(): CPython
+        # reuses addresses after GC, so a stale id could skip subscribing a
+        # NEW stream — a silent mute after disconnect/reconnect).
+        self._subscribed_stream: Any | None = None
         self._connected = False
 
         if not self.api_key or not self.secret_key:
@@ -430,6 +432,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
     async def disconnect(self) -> None:
         stream = self._trading_stream
         self._trading_stream = None
+        self._subscribed_stream = None
         self._trading_client = None
         self._connected = False
         if stream is None:
@@ -856,10 +859,9 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 # #78: subscribe exactly once per stream instance —
                 # re-subscribing on every reconnect fires duplicate fill
                 # callbacks (double-counted PnL/exposure).
-                stream_id = id(self._trading_stream)
-                if stream_id not in self._subscribed_streams:
+                if self._subscribed_stream is not self._trading_stream:
                     self._trading_stream.subscribe_trade_updates(self._on_trade_update)
-                    self._subscribed_streams.add(stream_id)
+                    self._subscribed_stream = self._trading_stream
                 # NOTE: TradingStream.run is blocking sync; it occupies one
                 # executor thread for the stream lifetime (no asyncio-native
                 # alternative in alpaca-py). The thread is released when run
@@ -881,8 +883,9 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 )
                 stream = self._trading_stream
                 self._trading_stream = None
+                if self._subscribed_stream is stream:
+                    self._subscribed_stream = None
                 if stream is not None:
-                    self._subscribed_streams.discard(id(stream))
                     stop_ws = getattr(stream, "stop_ws", None)
                     stop = getattr(stream, "stop", None)
                     try:
