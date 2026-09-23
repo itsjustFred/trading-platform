@@ -289,3 +289,14 @@ def test_scheduler_wrapper_defaults_to_completed_when_handler_returns_none() -> 
 
     assert records, "wrapper must write a final task record"
     assert records[-1]["status"] == "completed"
+
+
+def test_scheduler_task_ids_are_unique_within_a_second() -> None:
+    """B2: microsecond suffix — same-second runs must not share a task id."""
+    import re
+
+    import scheduler.scheduler as scheduler_module
+    import inspect
+
+    source = inspect.getsource(scheduler_module.ServiceScheduler._run_service_job)
+    assert "%Y%m%d%H%M%S%f" in source

@@ -32,7 +32,24 @@ SEEN_ID_RETENTION = POLL_LIMIT * 10
 
 
 class DiscordAuthenticationError(RuntimeError):
-    """Raised when Discord returns a terminal authentication error (401/403)."""
+    """Raised when Discord returns a terminal authentication error (401)."""
+
+
+class DiscordChannelForbiddenError(RuntimeError):
+    """Raised when Discord returns 403 for one channel (B2).
+
+    Missing channel access, not a dead token: the channel is skipped while
+    the source keeps polling the rest.
+    """
+
+    def __init__(self, channel_id: str, message: str = "") -> None:
+        super().__init__(message or f"Discord channel forbidden (403): {channel_id}")
+        self.channel_id = channel_id
+
+
+#: Maximum backfill pages per poll when a gap is detected (B2: bursts beyond
+#: POLL_LIMIT and 429-windows must not lose signals incl. exits).
+MAX_BACKFILL_PAGES = 5
 
 
 class DiscordRateLimitError(RuntimeError):
@@ -475,9 +492,20 @@ class DiscordSignalSource(BaseSignalSource):
             return f"Bot {self.token}"
         return self.token
 
-    async def _fetch_messages(self, channel_id: str) -> list[dict[str, Any]]:
+    async def _fetch_messages(
+        self,
+        channel_id: str,
+        *,
+        before: str | None = None,
+        after: str | None = None,
+        limit: int = POLL_LIMIT,
+    ) -> list[dict[str, Any]]:
         headers = {"Authorization": self._auth_header()}
-        url = f"https://discord.com/api/v10/channels/{channel_id}/messages?limit={POLL_LIMIT}"
+        url = f"https://discord.com/api/v10/channels/{channel_id}/messages?limit={limit}"
+        if before:
+            url += f"&before={before}"
+        if after:
+            url += f"&after={after}"
 
         def _do_request() -> requests.Response:
             return requests.get(url, headers=headers, timeout=10)
@@ -498,9 +526,15 @@ class DiscordSignalSource(BaseSignalSource):
             )
             return []
 
-        if response.status_code in (401, 403):
+        if response.status_code == 401:
             raise DiscordAuthenticationError(
-                f"Discord auth failed ({response.status_code}) for {channel_id}"
+                f"Discord auth failed (401) for {channel_id}"
+            )
+        if response.status_code == 403:
+            # B2: 403 is per-channel (missing access), not a dead token —
+            # skip the channel, never kill the whole source.
+            raise DiscordChannelForbiddenError(
+                f"Discord channel forbidden (403) for {channel_id}"
             )
         if response.status_code == 429:
             try:
@@ -544,49 +578,100 @@ class DiscordSignalSource(BaseSignalSource):
 
         return body if isinstance(body, list) else []
 
+    def _page_reaches_cursor(
+        self, messages: list[dict[str, Any]], last_seen: str
+    ) -> bool:
+        """Whether a newest-first page reaches back to the tracked cursor."""
+        if not last_seen:
+            return True
+        last_int = _safe_message_id_int(last_seen)
+        if last_int is None:
+            return True
+        for message in messages:
+            oldest_int = _safe_message_id_int(str(message.get("id")))
+            if oldest_int is not None and oldest_int <= last_int:
+                return True
+        return False
+
     async def _poll_once(self, channel_id: str, *, emit: bool = True) -> None:
-        messages = await self._fetch_messages(channel_id)
-        if not messages:
+        first_page = await self._fetch_messages(channel_id)
+        if not first_page:
             return
         seen = self._seen_ids.setdefault(channel_id, set())
         last_seen = self._last_seen_message_ids.get(channel_id, "")
-        # Messages arrive newest-first; iterate reversed so the queue receives
-        # them in chronological (oldest -> newest) order.
-        for message in reversed(messages):
-            message_id = str(message.get("id"))
-            if message_id in seen:
-                continue
-            # Dedupe is the cumulative seen-set's job alone. The monotonic
-            # cursor must NOT filter emits: after a burst larger than
-            # POLL_LIMIT the cursor sits above messages that were never
-            # fetched, and a cursor-based filter would drop them (the exact
-            # bug this class exists to prevent). The cursor only seeds `seen`
-            # at priming time.
-            seen.add(message_id)
-            if not emit:
-                continue
-            wrapped = _DiscordMessageAdapter(message)
-            parsed = _parse_trade_signal_from_message(
-                wrapped,
-                default_timeframe=self.timeframe,
-                trusted_author_ids=self.trusted_author_ids,
-            )
-            if parsed is None:
-                continue
-            parsed.metadata["source"] = self.source_name
-            parsed.metadata["discord_bot_name"] = self.bot_name
-            if self.service_id:
-                parsed.metadata["service_id"] = self.service_id
-            await self._set_service_status(
-                ServiceStatus.RUNNING,
-                last_activity=datetime.now(timezone.utc),
-            )
-            await self._queue.put(parsed)
-        newest = str(messages[0].get("id"))
-        self._log_page_gap(channel_id, last_seen, messages)
-        if not last_seen or int(newest) > int(last_seen):
+        # B2: bursts beyond POLL_LIMIT (and 429-windows) must not lose
+        # signals incl. exits — paginate backwards with `before` until a
+        # page overlaps the tracked cursor (bounded by MAX_BACKFILL_PAGES).
+        # A short page proves Discord returned everything (no gap), so only
+        # full pages trigger another fetch — otherwise REST traffic doubles
+        # on every quiet poll straight into the next 429.
+        pages = [first_page]
+        while (
+            len(pages[-1]) >= POLL_LIMIT
+            and not self._page_reaches_cursor(pages[-1], last_seen)
+            and len(pages) <= MAX_BACKFILL_PAGES
+        ):
+            oldest = str(pages[-1][-1].get("id"))
+            if _safe_message_id_int(oldest) is None:
+                break
+            older = await self._fetch_messages(channel_id, before=oldest)
+            if not older:
+                break
+            pages.append(older)
+        # Messages arrive newest-first; iterate oldest page first, reversed,
+        # so the queue receives them in chronological (oldest -> newest) order.
+        for page in reversed(pages):
+            for message in reversed(page):
+                await self._emit_polled_message(channel_id, message, seen, emit=emit)
+        newest = str(first_page[0].get("id"))
+        self._log_page_gap(channel_id, last_seen, first_page)
+        # B2: poison-message guard — a non-numeric id must never crash the
+        # cursor update into a tight crash loop (seen-set dedupes anyway).
+        newest_int = _safe_message_id_int(newest)
+        last_int = _safe_message_id_int(last_seen)
+        if not last_seen or (
+            newest_int is not None and (last_int is None or newest_int > last_int)
+        ):
             self._last_seen_message_ids[channel_id] = newest
         self._prune_seen_ids(channel_id, seen)
+
+    async def _emit_polled_message(
+        self,
+        channel_id: str,
+        message: dict[str, Any],
+        seen: set[str],
+        *,
+        emit: bool,
+    ) -> None:
+        message_id = str(message.get("id"))
+        if message_id in seen:
+            return
+        # Dedupe is the cumulative seen-set's job alone. The monotonic
+        # cursor must NOT filter emits: after a burst larger than
+        # POLL_LIMIT the cursor sits above messages that were never
+        # fetched, and a cursor-based filter would drop them (the exact
+        # bug this class exists to prevent). The cursor only seeds `seen`
+        # at priming time.
+        seen.add(message_id)
+        if not emit:
+            return
+        wrapped = _DiscordMessageAdapter(message)
+        parsed = _parse_trade_signal_from_message(
+            wrapped,
+            default_timeframe=self.timeframe,
+            trusted_author_ids=self.trusted_author_ids,
+        )
+        if parsed is None:
+            return
+        parsed.metadata["source"] = self.source_name
+        parsed.metadata["discord_bot_name"] = self.bot_name
+        if self.service_id:
+            parsed.metadata["service_id"] = self.service_id
+        await self._set_service_status(
+            ServiceStatus.RUNNING,
+            last_activity=datetime.now(timezone.utc),
+        )
+        await self._queue.put(parsed)
 
     def _prune_seen_ids(self, channel_id: str, seen: set[str]) -> None:
         """Bound the cumulative seen-set (pre-mortem mitigation).
@@ -663,6 +748,19 @@ class DiscordSignalSource(BaseSignalSource):
                 messages = await self._fetch_messages(channel_id)
             except DiscordAuthenticationError:
                 raise
+            except DiscordChannelForbiddenError as exc:
+                logger.warning(
+                    "Discord channel skipped at priming (forbidden)",
+                    extra={
+                        "data": {
+                            "bot_name": self.bot_name,
+                            "service_id": self.service_id,
+                            "channel_id": channel_id,
+                            "error": str(exc),
+                        }
+                    },
+                )
+                continue
             except Exception as exc:
                 logger.warning(
                     "Discord cursor priming failed",
@@ -692,6 +790,21 @@ class DiscordSignalSource(BaseSignalSource):
                     await self._poll_once(channel_id)
                 except DiscordAuthenticationError:
                     raise
+                except DiscordChannelForbiddenError as exc:
+                    # B2: one forbidden channel skips itself; the source
+                    # keeps polling the rest.
+                    logger.warning(
+                        "Discord channel skipped (forbidden)",
+                        extra={
+                            "data": {
+                                "bot_name": self.bot_name,
+                                "service_id": self.service_id,
+                                "channel_id": channel_id,
+                                "error": str(exc),
+                            }
+                        },
+                    )
+                    continue
                 except DiscordRateLimitError as exc:
                     rate_limit_retry_after = max(rate_limit_retry_after, exc.retry_after)
                     logger.warning(
@@ -732,9 +845,19 @@ class DiscordSignalSource(BaseSignalSource):
             self._seen_ids.setdefault(channel_id, set())
 
         # Verify auth with an initial poll before starting the background loop.
+        # B2: poll EVERY channel up front (a single-channel prime swallowed
+        # the other channels' signals). The service reports RUNNING only when
+        # the initial poll actually succeeded — a failed start reports FAILED
+        # with backoff instead of a healthy-looking RUNNING.
+        initial_ok = False
         try:
             await self._prime_cursors(self.channel_ids)
-            await self._poll_once(next(iter(self.channel_ids)))
+            for channel_id in sorted(self.channel_ids):
+                try:
+                    await self._poll_once(channel_id)
+                except DiscordChannelForbiddenError:
+                    continue
+            initial_ok = True
         except DiscordAuthenticationError as exc:
             await self.disconnect(failed=True)
             message = f"Discord bot {self.bot_name} auth failed: Invalid token"
@@ -764,7 +887,7 @@ class DiscordSignalSource(BaseSignalSource):
         self._connected = True
         self._ready.set()
         await self._set_service_status(
-            ServiceStatus.RUNNING,
+            ServiceStatus.RUNNING if initial_ok else ServiceStatus.FAILED,
             last_activity=datetime.now(timezone.utc),
         )
         self._run_task = asyncio.create_task(

@@ -26,7 +26,11 @@ from live_runner.credential_env import (
 )
 from live_runner.ctrader_adapter import CTraderAuthTerminalError, CTraderLiveAdapter
 from live_runner.service_discovery import discover_discord_bots_from_env
-from live_runner.signal_sources import DiscordSignalSource, wait_for_candle_close
+from live_runner.signal_sources import (
+    DiscordSignalSource,
+    signal_is_fresh,
+    wait_for_candle_close,
+)
 from live_runner.signal_sources.discord_source import DiscordAuthenticationError
 from live_runner.stockkit_routing import (
     infer_stockkit_route,
@@ -230,13 +234,20 @@ def _recover_failed_services() -> list[Service]:
     """Retry FAILED services on startup; never resurrect PAUSED/STOPPED ones.
 
     PAUSED/STOPPED encode operator intent and must survive a daemon restart.
-    FAILED is system state (e.g. transient auth/network) and is safe to retry.
+    FAILED is system state (e.g. transient auth/network) and is safe to retry —
+    but bounded (B2): each resuscitated service starts with its reconnect
+    floor armed, so a still-broken credential backs off instead of hot-looping
+    from the first tick. Terminal auth failures re-block immediately.
     """
     services = list_services()
     for service in services:
         if service.status != ServiceStatus.FAILED:
             continue
         update_service_status(str(service.id), ServiceStatus.RUNNING)
+        _DISCORD_SERVICE_RECONNECT_RETRY_NOT_BEFORE[str(service.id)] = (
+            datetime.now(timezone.utc)
+            + timedelta(seconds=DISCORD_RECONNECT_RETRY_FLOOR_SECONDS)
+        )
     return list_services()
 
 
@@ -1070,6 +1081,22 @@ async def _submit_normalized_discord_signal(
     signal_timeframe: str,
     wait_enabled: bool,
 ) -> None:
+    # B2 (owner decision): stale signals trade immediately on outdated
+    # information — discard anything older than one deployment-timeframe
+    # candle instead.
+    if not signal_is_fresh(trade_signal, signal_timeframe):
+        logger.info(
+            "Skipping stale discord signal: older than one timeframe candle",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "deployment_id": str(deployment.id),
+                    "symbol": trade_signal.symbol,
+                    "signal_timeframe": signal_timeframe,
+                }
+            },
+        )
+        return
     normalized_signal = TradeSignal(
         action=trade_signal.action,
         symbol=trade_signal.symbol,
@@ -1102,7 +1129,8 @@ async def _submit_normalized_discord_signal(
 
     # Re-check after the candle-close wait: the wait can span minutes, and the
     # pre-dispatch snapshot was taken before it. A deployment paused during the
-    # wait window must not trade at the candle-close price.
+    # wait window must not trade at the candle-close price — and neither must
+    # a signal that AGED OUT during the wait (B2 price/age revalidation).
     if not _deployment_is_currently_active(deployment):
         logger.info(
             "Skipping discord signal: deployment left ACTIVE during candle-close wait",
@@ -1112,6 +1140,18 @@ async def _submit_normalized_discord_signal(
                     "deployment_id": str(deployment.id),
                     "symbol": trade_signal.symbol,
                     "snapshot_status": deployment.status,
+                }
+            },
+        )
+        return
+    if not signal_is_fresh(normalized_signal, signal_timeframe):
+        logger.info(
+            "Skipping discord signal: aged out during candle-close wait",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "deployment_id": str(deployment.id),
+                    "symbol": trade_signal.symbol,
                 }
             },
         )
@@ -2148,6 +2188,10 @@ async def _poll_adapter_balance(
         )
 
 
+#: Per-account balance timeout (B2): one hung broker must not stall the tick.
+BALANCE_POLL_TIMEOUT_SECONDS = 30.0
+
+
 async def _poll_balances(
     adapters: dict[str, BaseLiveAdapter], *, interval_seconds: int = BALANCE_POLL_INTERVAL_SECONDS
 ) -> None:
@@ -2157,10 +2201,37 @@ async def _poll_balances(
             "Polling balances for adapters",
             extra={"data": {"adapter_count": len(adapters)}},
         )
-        for account_id, adapter in list(adapters.items()):
-            if not _adapter_is_ready(adapter):
-                continue
-            await _poll_adapter_balance(adapters, account_id, adapter, snapshot_time)
+        # B2: fan out with gather (per-account timestamp preserved) instead
+        # of sequential awaits — one slow broker no longer blocks all
+        # accounts. return_exceptions keeps one failure from killing the tick.
+        ready = [
+            (account_id, adapter)
+            for account_id, adapter in list(adapters.items())
+            if _adapter_is_ready(adapter)
+        ]
+
+        async def _poll_one(account_id: str, adapter: BaseLiveAdapter) -> None:
+            try:
+                await asyncio.wait_for(
+                    _poll_adapter_balance(adapters, account_id, adapter, snapshot_time),
+                    timeout=BALANCE_POLL_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Live balance polling timed out",
+                    extra={
+                        "data": {
+                            "account_id": account_id,
+                            "adapter": type(adapter).__name__,
+                            "timeout_seconds": BALANCE_POLL_TIMEOUT_SECONDS,
+                        }
+                    },
+                )
+
+        await asyncio.gather(
+            *(_poll_one(account_id, adapter) for account_id, adapter in ready),
+            return_exceptions=True,
+        )
         await asyncio.sleep(interval_seconds)
 
 
@@ -2481,7 +2552,9 @@ async def _connect_active_accounts(
     accounts_env_values: Mapping[str, str],
     accounts_env_path: Path | str | None = None,
 ) -> None:
-    await asyncio.gather(
+    # B2: per-account isolation — one failing connect must not fail the
+    # whole tick (bare gather propagated the first exception).
+    results = await asyncio.gather(
         *(
             _ensure_adapter_for_active_account(
                 account_id,
@@ -2491,8 +2564,19 @@ async def _connect_active_accounts(
                 accounts_env_path=accounts_env_path,
             )
             for account_id in sorted(account_ids)
-        )
+        ),
+        return_exceptions=True,
     )
+    for account_id, result in zip(sorted(account_ids), results):
+        if isinstance(result, asyncio.CancelledError):
+            raise result
+        if isinstance(result, BaseException):
+            logger.warning(
+                "Adapter connect failed; will retry",
+                extra={
+                    "data": {"account_id": account_id, "error": str(result)}
+                },
+            )
 
 
 async def _rotate_changed_ctrader_adapters(
@@ -2635,7 +2719,10 @@ async def sync_deployments_loop(
             )
             runnable_account_ids = set(active_account_ids) - _CTRADER_AUTH_BLOCKED_ACCOUNTS
 
-            await _disconnect_inactive_adapters(active_adapters, active_account_ids)
+            # B2: disconnect against runnable (blocked-excluded) ids — a
+            # blocked account must never keep a live adapter via the
+            # active-id set.
+            await _disconnect_inactive_adapters(active_adapters, runnable_account_ids)
 
             active_discord_account_ids = _discord_active_account_ids(deployments)
 
@@ -2720,16 +2807,32 @@ async def run_daemon(
             )
         raise
     finally:
-        if not service_sync_task.done():
-            service_sync_task.cancel()
+        # B2: cancel EVERYTHING (sync + balance loops leaked before) and
+        # await the cancels — fire-and-forget cancel() leaves pending tasks
+        # and "Task was destroyed" warnings behind.
+        for task in (sync_task, service_sync_task, balance_task):
+            if not task.done():
+                task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
-            await service_sync_task
+            await asyncio.gather(
+                sync_task, service_sync_task, balance_task, return_exceptions=True
+            )
+        for task in list(active_listener_tasks.values()):
+            if not task.done():
+                task.cancel()
         for task in list(active_discord_tasks.values()):
             if not task.done():
                 task.cancel()
         for task in list(active_discord_bot_tasks.values()):
             if not task.done():
                 task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.gather(
+                *list(active_listener_tasks.values()),
+                *list(active_discord_tasks.values()),
+                *list(active_discord_bot_tasks.values()),
+                return_exceptions=True,
+            )
         for source in list(active_discord_bots.values()):
             with contextlib.suppress(Exception):
                 await source.disconnect(failed=False)

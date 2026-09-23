@@ -3875,3 +3875,70 @@ def test_save_live_execution_derives_stable_key_without_dedupe_key(isolated_db):
     )
     assert database.save_live_execution(execution) is True
     assert database.save_live_execution(execution) is False
+
+
+def test_ctrader_adapter_treats_incoming_qty_as_binding(monkeypatch) -> None:
+    """B2/C1: size exactly once upstream — submit trades the passed qty,
+    never a metadata self-declaration."""
+    module, adapter = _make_ctrader_adapter()
+    adapter._connected = True
+    adapter._authenticated = True
+    adapter._symbol_name_to_id = {"EURUSD": 1}
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="EURUSD",
+        action="buy",
+        theoretical_price=1.1,
+        timestamp=datetime.now(timezone.utc),
+        metadata={
+            "qty": 999_999.0,
+            "stop_loss": 1.05,
+            "take_profit": 1.2,
+        },
+    )
+    monkeypatch.setattr(module, "save_live_signal", lambda _signal: (str(signal.id), True))
+    monkeypatch.setattr(module, "get_live_signal_broker_order_id", lambda _sid: "")
+    monkeypatch.setattr(module, "get_live_signal_timestamp", lambda _sid: None)
+    monkeypatch.setattr(
+        module, "set_live_signal_broker_order_id", lambda _sid, _oid: True
+    )
+    volumes: list[int] = []
+
+    class _Req:
+        def __init__(self) -> None:
+            self.volume = 0
+
+    adapter._ProtoOANewOrderReq = _Req
+    adapter._ProtoOAOrderType = SimpleNamespace(MARKET=1)
+    adapter._ProtoOATradeSide = SimpleNamespace(BUY=1, SELL=2)
+    adapter._ProtoOATimeInForce = SimpleNamespace(IMMEDIATE_OR_CANCEL=1)
+
+    async def _send(request, **_kwargs):
+        volumes.append(request.volume)
+        return SimpleNamespace(orderId=777)
+
+    adapter._submit_new_order_request = _send
+    adapter._extract_order_id_from_payload = lambda _payload: 777
+
+    assert asyncio.run(adapter.submit_order(signal, qty=2.0)) == "777"
+    assert volumes == [2000]
+
+
+def test_recover_failed_services_arms_reconnect_floor(monkeypatch) -> None:
+    """B2: resuscitation is bounded — a flipped service backs off first."""
+    from live_runner import daemon as module
+    from shared.models import Service, ServiceStatus, ServiceType
+
+    service = Service(
+        name="failed-bot",
+        type=ServiceType.DISCORD_BOT,
+        status=ServiceStatus.FAILED,
+        config={},
+        created_at=datetime.now(timezone.utc),
+    )
+    monkeypatch.setattr(module, "list_services", lambda: [service])
+    monkeypatch.setattr(module, "update_service_status", lambda *_args: None)
+
+    module._recover_failed_services()
+
+    assert str(service.id) in module._DISCORD_SERVICE_RECONNECT_RETRY_NOT_BEFORE
