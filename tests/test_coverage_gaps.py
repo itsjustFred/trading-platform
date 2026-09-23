@@ -305,3 +305,61 @@ class TestSegmentCoverageWeekends:
             symbol="EURUSD", timeframe="1h",
             start="2024-01-09", end="2024-01-09T23:00", data_dir=tmp_path,
         )
+
+
+class TestValidateHolidayCalendar:
+    """B3: NYSE holidays are not data holes (equity-like paths only)."""
+
+    def _write_equity_bars(self, root: Path, timestamps: list[str]) -> Path:
+        import pandas as pd
+
+        target = root / "ohlcv" / "test" / "equity" / "AAPL" / "1d.parquet"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        frame = pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(timestamps, utc=True),
+                "open": [100.0] * len(timestamps),
+                "high": [101.0] * len(timestamps),
+                "low": [99.0] * len(timestamps),
+                "close": [100.5] * len(timestamps),
+                "volume": [1000.0] * len(timestamps),
+            }
+        )
+        frame.to_parquet(target, index=False)
+        return target
+
+    def test_july4_gap_skipped_for_equity(self, tmp_path, monkeypatch) -> None:
+        import data_tools.validate as validate_module
+
+        monkeypatch.setattr(validate_module, "DATA_DIR", tmp_path)
+        # Wed 2024-07-03 -> Fri 2024-07-05: Thursday July 4th (holiday).
+        target = self._write_equity_bars(
+            tmp_path, ["2024-07-03T00:00:00Z", "2024-07-05T00:00:00Z"]
+        )
+        result = validate_module.validate_parquet(target)
+        assert result.gaps == []
+
+    def test_same_gap_flagged_for_forex(self, tmp_path, monkeypatch) -> None:
+        import pandas as pd
+
+        import data_tools.validate as validate_module
+
+        monkeypatch.setattr(validate_module, "DATA_DIR", tmp_path)
+        # 1h bars: the 2-day span exceeds the 180-minute threshold even
+        # though Thursday is a holiday (FX prints through it).
+        target = tmp_path / "ohlcv" / "test" / "forex" / "EURUSD" / "1h.parquet"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(
+                    ["2024-07-03T00:00:00Z", "2024-07-05T00:00:00Z"], utc=True
+                ),
+                "open": [1.0, 1.0],
+                "high": [1.1, 1.1],
+                "low": [0.9, 0.9],
+                "close": [1.0, 1.0],
+                "volume": [10, 10],
+            }
+        ).to_parquet(target, index=False)
+        result = validate_module.validate_parquet(target)
+        assert len(result.gaps) == 1

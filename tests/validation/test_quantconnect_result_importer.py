@@ -189,7 +189,7 @@ def test_reference_dir_defaults_to_repo_fixture(
 
 def test_closed_trade_net_pnl_subtracts_fees(tmp_path: Path):
     reference = QuantConnectResultImporter().load(
-        _write_result(tmp_path, _valid_result())
+        _write_result(tmp_path, _valid_result()), timeframe="1d"
     )
     trade = reference.trades[0]
 
@@ -209,7 +209,7 @@ def test_non_finite_closed_trade_profit_loss_fails_closed(tmp_path: Path):
         ValueError,
         match=r"^closedTrade\.profitLoss must be finite$",
     ):
-        importer.load(source)
+        importer.load(source, timeframe="1d")
 
 
 def test_fractional_numeric_order_id_fails_closed(tmp_path: Path):
@@ -219,7 +219,7 @@ def test_fractional_numeric_order_id_fails_closed(tmp_path: Path):
     importer = QuantConnectResultImporter()
 
     with pytest.raises(ValueError, match=r"^order\.id must be an integer$"):
-        importer.load(source)
+        importer.load(source, timeframe="1d")
 
 
 def test_order_numeric_value_with_trailing_text_fails_closed(tmp_path: Path):
@@ -229,7 +229,7 @@ def test_order_numeric_value_with_trailing_text_fails_closed(tmp_path: Path):
     importer = QuantConnectResultImporter()
 
     with pytest.raises(ValueError, match=r"^order\.price must be numeric$"):
-        importer.load(source)
+        importer.load(source, timeframe="1d")
 
 
 def test_closed_trade_without_symbol_fails_closed(tmp_path: Path):
@@ -239,7 +239,7 @@ def test_closed_trade_without_symbol_fails_closed(tmp_path: Path):
     importer = QuantConnectResultImporter()
 
     with pytest.raises(ValueError, match=r"^closedTrade\.symbols must not be empty$"):
-        importer.load(source)
+        importer.load(source, timeframe="1d")
 
 
 def test_empty_closed_trade_id_fails_closed(tmp_path: Path):
@@ -249,7 +249,7 @@ def test_empty_closed_trade_id_fails_closed(tmp_path: Path):
     importer = QuantConnectResultImporter()
 
     with pytest.raises(ValueError, match=r"^closedTrade\.id must not be empty$"):
-        importer.load(source)
+        importer.load(source, timeframe="1d")
 
 
 def test_empty_closed_trade_order_ids_fails_closed(tmp_path: Path):
@@ -263,7 +263,7 @@ def test_empty_closed_trade_order_ids_fails_closed(tmp_path: Path):
         ValueError,
         match=r"^closedTrade\.orderIds must not be empty$",
     ):
-        importer.load(source)
+        importer.load(source, timeframe="1d")
 
 
 def test_duplicate_closed_trade_order_ids_fail_closed(tmp_path: Path):
@@ -276,7 +276,7 @@ def test_duplicate_closed_trade_order_ids_fail_closed(tmp_path: Path):
         ValueError,
         match=r"^closedTrade\.orderIds must not contain duplicates$",
     ):
-        importer.load(source)
+        importer.load(source, timeframe="1d")
 
 
 def test_duplicate_closed_trade_id_fails_closed(tmp_path: Path):
@@ -296,7 +296,7 @@ def test_duplicate_closed_trade_id_fails_closed(tmp_path: Path):
     importer = QuantConnectResultImporter()
 
     with pytest.raises(ValueError, match=r"^duplicate closedTrade\.id: closed-1$"):
-        importer.load(source)
+        importer.load(source, timeframe="1d")
 
 
 @pytest.fixture(scope="module")
@@ -308,6 +308,8 @@ def golden_reference():
         RESULT_JSON,
         orders_csv=ORDERS_CSV,
         trades_csv=TRADES_CSV,
+        # The export carries no resolution; 1d pins the test contract.
+        timeframe="1d",
     )
 
 
@@ -465,7 +467,9 @@ def test_default_fee_reconciliation_leaves_unreferenced_fees_unresolved(
     payload["statistics"]["Total Orders"] = "2"
     payload["statistics"]["Total Fees"] = "$9.50"
 
-    reference = QuantConnectResultImporter().load(_write_result(tmp_path, payload))
+    reference = QuantConnectResultImporter().load(
+        _write_result(tmp_path, payload), timeframe="1d"
+    )
     fees = reference.raw_metadata["fee_reconciliation"]
     derivation = fees["unreferenced_order_fee_derivation"]
 
@@ -504,7 +508,7 @@ def test_explicit_fee_model_mismatch_fails_closed(tmp_path: Path):
             r"remainder=7\.00$"
         ),
     ):
-        importer.load(source)
+        importer.load(source, timeframe="1d")
 
 
 def test_negative_fee_remainder_fails_closed_without_model(tmp_path: Path):
@@ -523,7 +527,7 @@ def test_negative_fee_remainder_fails_closed_without_model(tmp_path: Path):
             r"remainder=-0\.50$"
         ),
     ):
-        importer.load(source)
+        importer.load(source, timeframe="1d")
 
 
 @pytest.mark.parametrize(
@@ -573,7 +577,7 @@ def test_fee_derivation_preserves_source_decimal_quantity(tmp_path: Path):
 
     reference = QuantConnectResultImporter(
         fee_model=QuantConnectFeeModel.interactive_brokers_us_equities()
-    ).load(source)
+    ).load(source, timeframe="1d")
     derivation = reference.raw_metadata["fee_reconciliation"][
         "unreferenced_order_fee_derivation"
     ]
@@ -649,7 +653,7 @@ def test_malformed_json_fails_closed(tmp_path: Path):
     importer = QuantConnectResultImporter()
 
     with pytest.raises(ValueError, match="Invalid QuantConnect result JSON"):
-        importer.load(source)
+        importer.load(source, timeframe="1d")
 
 
 @pytest.mark.parametrize(
@@ -671,7 +675,7 @@ def test_unsuccessful_result_fails_closed(
     importer = QuantConnectResultImporter()
 
     with pytest.raises(ValueError, match=message):
-        importer.load(source)
+        importer.load(source, timeframe="1d")
 
 
 def test_missing_orders_fail_closed(tmp_path: Path):
@@ -681,7 +685,7 @@ def test_missing_orders_fail_closed(tmp_path: Path):
     importer = QuantConnectResultImporter()
 
     with pytest.raises(ValueError, match="orders must not be empty"):
-        importer.load(source)
+        importer.load(source, timeframe="1d")
 
 
 def test_duplicate_order_id_fails_closed(tmp_path: Path):
@@ -691,7 +695,7 @@ def test_duplicate_order_id_fails_closed(tmp_path: Path):
     importer = QuantConnectResultImporter()
 
     with pytest.raises(ValueError, match="duplicate order id: 1"):
-        importer.load(source)
+        importer.load(source, timeframe="1d")
 
 
 def test_unknown_closed_trade_order_id_fails_closed(tmp_path: Path):
@@ -706,7 +710,7 @@ def test_unknown_closed_trade_order_id_fails_closed(tmp_path: Path):
         ValueError,
         match=r"^closedTrades reference unknown order IDs: \[999\]$",
     ):
-        importer.load(source)
+        importer.load(source, timeframe="1d")
 
 
 def test_empty_closed_trades_fail_closed(tmp_path: Path):
@@ -716,7 +720,7 @@ def test_empty_closed_trades_fail_closed(tmp_path: Path):
     importer = QuantConnectResultImporter()
 
     with pytest.raises(ValueError, match="closedTrades must not be empty"):
-        importer.load(source)
+        importer.load(source, timeframe="1d")
 
 
 @pytest.mark.parametrize("csv_kind", ["orders", "trades"])
@@ -774,7 +778,7 @@ def test_csv_mismatch_fails_closed(tmp_path: Path, csv_kind: str):
         writer.writeheader()
         writer.writerow(row)
 
-    kwargs = {f"{csv_kind}_csv": csv_path}
+    kwargs = {f"{csv_kind}_csv": csv_path, "timeframe": "1d"}
     importer = QuantConnectResultImporter()
     with pytest.raises(ValueError, match=f"{csv_kind} CSV does not match result JSON"):
         importer.load(source, **kwargs)
@@ -823,7 +827,7 @@ def test_trades_csv_missing_fees_fails_closed(tmp_path: Path):
         ValueError,
         match="trades CSV missing required columns: fees",
     ):
-        importer.load(source, trades_csv=csv_path)
+        importer.load(source, trades_csv=csv_path, timeframe="1d")
 
 
 def test_trades_csv_rejects_escaped_tab_order_ids(tmp_path: Path):
@@ -868,7 +872,7 @@ def test_trades_csv_rejects_escaped_tab_order_ids(tmp_path: Path):
 
     importer = QuantConnectResultImporter()
     with pytest.raises(ValueError, match="trades CSV does not match result JSON"):
-        importer.load(source, trades_csv=csv_path)
+        importer.load(source, trades_csv=csv_path, timeframe="1d")
 
 
 def test_orders_csv_accepts_qc_decimal_truncation_but_rejects_material_change(
@@ -894,7 +898,9 @@ def test_orders_csv_accepts_qc_decimal_truncation_but_rejects_material_change(
         writer.writeheader()
         writer.writerow(row)
 
-    reference = QuantConnectResultImporter().load(source, orders_csv=csv_path)
+    reference = QuantConnectResultImporter().load(
+        source, orders_csv=csv_path, timeframe="1d"
+    )
 
     assert reference.raw_metadata["orders"][0]["value"] == pytest.approx(
         103828.272132545
@@ -909,4 +915,48 @@ def test_orders_csv_accepts_qc_decimal_truncation_but_rejects_material_change(
 
     importer = QuantConnectResultImporter()
     with pytest.raises(ValueError, match="orders CSV does not match result JSON"):
-        importer.load(source, orders_csv=csv_path)
+        importer.load(source, orders_csv=csv_path, timeframe="1d")
+
+
+class TestTimeframeInference:
+    """B3: timeframe is inferred or fail-closed — never silent "unknown"."""
+
+    def test_explicit_timeframe_wins(self, tmp_path: Path) -> None:
+        reference = QuantConnectResultImporter().load(
+            _write_result(tmp_path, _valid_result()), timeframe="4h"
+        )
+        assert reference.timeframe == "4h"
+
+    def test_uninferable_trades_fail_closed(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="cannot infer reference timeframe"):
+            QuantConnectResultImporter().load(_write_result(tmp_path, _valid_result()))
+
+
+class TestCanonicalTimeStrict:
+    """B3: unparsable timestamps fail closed instead of passing raw text."""
+
+    def test_garbage_time_fails_closed(self, tmp_path: Path) -> None:
+        payload = _valid_result()
+        payload["orders"]["1"]["time"] = "not-a-time"
+        with pytest.raises(ValueError, match="unparsable timestamp"):
+            QuantConnectResultImporter().load(
+                _write_result(tmp_path, payload), timeframe="1d"
+            )
+
+
+class TestCentTolerance:
+    """B3: exact-equality fee reconciliation becomes a cent band."""
+
+    def test_sub_cent_remainder_reconciles(self, tmp_path: Path) -> None:
+        from decimal import Decimal
+
+        from validation.importers import quantconnect_result as qc_module
+
+        assert (
+            qc_module._decimal_export_matches(Decimal("100.0055"), Decimal("100.005"))
+            is True  # half-quantum truncation: indistinguishable from rounding
+        )
+        assert (
+            qc_module._decimal_export_matches(Decimal("100.0065"), Decimal("100.005"))
+            is False  # beyond half a quantum: material, not rounding
+        )
