@@ -110,7 +110,7 @@ def test_build_trades_prefers_shifted_stop_distance_for_fill_anchoring():
         "stop_distance": pd.Series([2.0, np.nan, np.nan, np.nan], index=frame.index),
     }
 
-    trades = _build_trades(
+    trades, _open_positions = _build_trades(
         case={"symbol": "USA500.IDX", "execution_symbol": "US500", "execution_timeframe": "1m"},
         df=frame,
         entries=entries,
@@ -145,7 +145,7 @@ def test_build_trades_ignores_non_positive_stop_distance():
         "stop_distance": pd.Series([0.0, np.nan, np.nan, np.nan], index=frame.index),
     }
 
-    trades = _build_trades(
+    trades, _open_positions = _build_trades(
         case={"symbol": "USA500.IDX", "execution_symbol": "US500", "execution_timeframe": "1m"},
         df=frame,
         entries=entries,
@@ -214,7 +214,7 @@ def test_bug1_build_trades_risk_unit_value_respects_account_currency():
         "sl_price": pd.Series([99.0, np.nan, np.nan, np.nan], index=frame.index),
         "stop_distance": pd.Series([1.0, np.nan, np.nan, np.nan], index=frame.index),
     }
-    usd_trades = _build_trades(
+    usd_trades, _open_positions = _build_trades(
         case={"symbol": "USA500.IDX", "execution_symbol": "US500", "execution_timeframe": "1m", "account_currency": "USD"},
         df=frame,
         entries=entries,
@@ -248,7 +248,7 @@ def test_bug2_stop_search_includes_fill_bar():
         "sl_price": pd.Series([np.nan, np.nan, np.nan, np.nan], index=frame.index),
         "stop_distance": pd.Series([1.0, np.nan, np.nan, np.nan], index=frame.index),
     }
-    trades = _build_trades(
+    trades, _open_positions = _build_trades(
         case={"symbol": "USA500.IDX", "execution_symbol": "US500", "execution_timeframe": "1m", "account_currency": "USD"},
         df=frame,
         entries=entries,
@@ -288,7 +288,7 @@ def test_bug3a_entry_and_time_exit_use_bar_open():
         "sl_price": pd.Series([50.0, np.nan, np.nan, np.nan], index=frame.index),
         "stop_distance": pd.Series([5.0, np.nan, np.nan, np.nan], index=frame.index),
     }
-    trades = _build_trades(
+    trades, _open_positions = _build_trades(
         case={"symbol": "EURUSD", "execution_symbol": "EURUSD", "execution_timeframe": "1m", "account_currency": "USD"},
         df=frame,
         entries=entries,
@@ -330,7 +330,7 @@ def test_bug3b_tick_sizing_matches_mt5_and_clamps():
         "sl_price": pd.Series([np.nan, np.nan, np.nan, np.nan], index=frame.index),
         "stop_distance": pd.Series([0.002, np.nan, np.nan, np.nan], index=frame.index),
     }
-    trades = _build_trades(
+    trades, _open_positions = _build_trades(
         case={"symbol": "EURUSD", "execution_symbol": "EURUSD", "execution_timeframe": "1m", "account_currency": "USD"},
         df=frame,
         entries=entries,

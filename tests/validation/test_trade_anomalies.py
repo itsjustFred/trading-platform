@@ -63,12 +63,13 @@ class TestDetectMissing:
         assert len(anomalies) == 2
         assert {a.expected_trade.id for a in anomalies} == {1, 3}
 
-    def test_missing_severity_is_warning(self):
+    def test_missing_severity_is_error(self):
+        # C4: missing flips the readiness gate — error, not warning.
         ref = [_make_trade(trade_id=1)]
         act = []
         anomalies = AnomalyDetector.detect_missing(ref, act)
         assert len(anomalies) == 1
-        assert anomalies[0].severity == "warning"
+        assert anomalies[0].severity == "error"
 
     def test_missing_message_contains_details(self):
         ref = [_make_trade(trade_id=1, symbol="GBPUSD", direction="SHORT")]
@@ -109,12 +110,13 @@ class TestDetectExtra:
         assert len(anomalies) == 2
         assert {a.actual_trade.id for a in anomalies} == {20, 30}
 
-    def test_extra_severity_is_info(self):
+    def test_extra_severity_is_error(self):
+        # C4: phantom trades flip the readiness gate — error, not info.
         ref = []
         act = [_make_trade(trade_id=10)]
         anomalies = AnomalyDetector.detect_extra(ref, act)
         assert len(anomalies) == 1
-        assert anomalies[0].severity == "info"
+        assert anomalies[0].severity == "error"
 
     def test_extra_message_contains_details(self):
         ref = []

@@ -277,3 +277,29 @@ class TestMatchResultStructure:
         result = TradeMatcher.match(ref, act)
         _, _, key = result.matched[0]
         assert key.entry_time == "2024-01-01T10:00:00Z"
+
+
+class TestCostBasedTieBreak:
+    """C4: minimum cost wins ties — array order no longer decides."""
+
+    def test_closer_price_wins_over_earlier_index(self) -> None:
+        from validation.comparison.matcher import TradeMatcher
+
+        ref = [_make_trade(trade_id=1, entry_price=1.1000)]
+        # First actual is eligible but far in price; second is close.
+        act = [
+            _make_trade(trade_id=2, entry_price=1.1500),
+            _make_trade(trade_id=3, entry_price=1.1001),
+        ]
+        result = TradeMatcher.match(ref, act, time_tolerance_seconds=60)
+        assert len(result.matched) == 1
+        assert result.matched[0][1].id == 3
+
+    def test_exact_tie_keeps_lowest_index(self) -> None:
+        from validation.comparison.matcher import TradeMatcher
+
+        ref = [_make_trade(trade_id=1)]
+        act = [_make_trade(trade_id=2), _make_trade(trade_id=3)]
+        result = TradeMatcher.match(ref, act, time_tolerance_seconds=60)
+        assert len(result.matched) == 1
+        assert result.matched[0][1].id == 2

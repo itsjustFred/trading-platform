@@ -66,13 +66,45 @@ class MatchResult(BaseModel):
     extra: list[Trade] = Field(default_factory=list)
 
 
+def _match_cost(
+    ref: dict[str, Any],
+    act: dict[str, Any],
+    tolerance_seconds: int,
+    *,
+    time_weight: float = 1.0,
+    price_weight: float = 1.0,
+    quantity_weight: float = 1.0,
+) -> float:
+    """Cost of pairing two eligible trades (C4: lower wins ties deterministically).
+
+    Time cost normalizes the entry+exit drift by the tolerance window;
+    price/quantity costs are relative differences. All terms are unitless
+    so time, price and quantity trade off against each other instead of
+    array order deciding ties.
+    """
+    time_cost = (
+        _time_diff_seconds(ref["entry"], act["entry"])
+        + _time_diff_seconds(ref["exit"], act["exit"])
+    ) / (2.0 * max(tolerance_seconds, 1))
+    ref_price = abs(float(ref["trade"].entry_price or 0.0))
+    act_price = abs(float(act["trade"].entry_price or 0.0))
+    price_base = max(ref_price, act_price, 1e-12)
+    price_cost = abs(ref_price - act_price) / price_base
+    ref_qty = abs(float(ref["trade"].quantity or 0.0))
+    act_qty = abs(float(act["trade"].quantity or 0.0))
+    qty_base = max(ref_qty, act_qty, 1e-12)
+    qty_cost = abs(ref_qty - act_qty) / qty_base
+    return time_weight * time_cost + price_weight * price_cost + quantity_weight * qty_cost
+
+
 class TradeMatcher:
     """Pair reference trades with actual trades.
 
-    The matcher works greedily: it walks the ``reference_trades`` list in
-    order and picks the *first* still-unmatched ``actual_trade`` that
-    satisfies all criteria.  This means that when several trades share the
-    same timestamps the pairing follows the original array order.
+    The matcher walks the ``reference_trades`` list in order and picks the
+    minimum-cost still-unmatched ``actual_trade`` satisfying all criteria
+    (direction, symbol, time tolerance). Cost blends time drift with entry-
+    price and quantity differences, so ties no longer fall to array order.
+    Exact ties keep the lowest actual index (deterministic).
     """
 
     @classmethod
@@ -95,6 +127,8 @@ class TradeMatcher:
                 Maximum allowed difference for *both* entry and exit time.
             ``match_symbol`` (bool, default True):
                 Whether the symbol field must match exactly.
+            ``time_weight``/``price_weight``/``quantity_weight`` (float):
+                Cost-term weights for tie-breaking (default 1.0 each).
 
         Returns
         -------
@@ -103,6 +137,9 @@ class TradeMatcher:
         """
         tolerance_seconds: int = int(options.get("time_tolerance_seconds", 0))
         match_symbol: bool = bool(options.get("match_symbol", True))
+        time_weight = float(options.get("time_weight", 1.0))
+        price_weight = float(options.get("price_weight", 1.0))
+        quantity_weight = float(options.get("quantity_weight", 1.0))
 
         # Pre-compute normalized timestamps so that we do not re-parse inside
         # the inner loop.
@@ -129,7 +166,8 @@ class TradeMatcher:
         extra: list[Trade] = []
 
         for ref in ref_data:
-            found_idx: int | None = None
+            best_idx: int | None = None
+            best_cost = float("inf")
             for idx, act in enumerate(act_data):
                 if act["matched"]:
                     continue
@@ -146,9 +184,21 @@ class TradeMatcher:
                 if _time_diff_seconds(ref["exit"], act["exit"]) > tolerance_seconds:
                     continue
 
-                found_idx = idx
-                break
+                # C4: minimum cost wins; strict < keeps the lowest index on
+                # exact ties (deterministic, preserves old order behavior).
+                cost = _match_cost(
+                    ref,
+                    act,
+                    tolerance_seconds,
+                    time_weight=time_weight,
+                    price_weight=price_weight,
+                    quantity_weight=quantity_weight,
+                )
+                if cost < best_cost:
+                    best_cost = cost
+                    best_idx = idx
 
+            found_idx = best_idx
             if found_idx is not None:
                 act_data[found_idx]["matched"] = True
                 act_trade = act_data[found_idx]["trade"]

@@ -7,7 +7,7 @@ BacktestResult objects.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
@@ -48,7 +48,11 @@ class ValidationReference(BaseModel):
     # ── Optional fields ──────────────────────────────────────────────────
     source_path: str | None = None
     source_hash: str | None = None
-    imported_at: datetime = Field(default_factory=datetime.utcnow)
+    # C4: timezone-aware import stamp (naive utcnow mixed with aware
+    # timestamps downstream).
+    imported_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
     validation_status: str = Field(default="pending")
     allow_empty: bool = False
 
@@ -82,7 +86,11 @@ class ValidationReference(BaseModel):
         """Convert this ValidationReference into a platform-native BacktestResult.
 
         Fields that are not available on the external import are populated
-        with sensible defaults or ``None``.
+        with sensible defaults or ``None``. The equity curve is always empty
+        here by design — no importer ships curves, they are rebuilt
+        downstream from trades (compute_stats_for_result / daily equity).
+        Callers needing a curve must build it explicitly instead of
+        assuming this one is populated.
         """
         meta = BacktestMeta(
             id=f"{self.strategy_name}_{self.source_framework}_{self.imported_at.strftime('%Y%m%d-%H%M%S')}",

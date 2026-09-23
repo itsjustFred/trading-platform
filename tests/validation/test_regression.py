@@ -498,3 +498,29 @@ class TestCompareStatsHelper:
         deltas = _compare_stats(s1, s2, cfg)
         pf = next(d for d in deltas if d.field == "profit_factor")
         assert pf.passed is False
+
+
+class TestMatchTolerancePlumbing:
+    """C4: the regression match tolerance reaches the matcher."""
+
+    def test_time_tolerance_forwards_to_matcher(self, tmp_path: Path) -> None:
+        ref_trades = [_make_trade(entry_time="2024-01-01T10:00:00Z")]
+        act_trades = [_make_trade(entry_time="2024-01-01T10:00:30Z")]
+        golden = _make_reference(ref_trades)
+        golden_path = tmp_path / "golden.json"
+        _write_golden(golden, golden_path)
+        current = _make_reference(act_trades)
+
+        strict = run_regression(
+            golden_path,
+            current_data=current,
+            config=RegressionConfig(match_time_tolerance_seconds=0),
+        )
+        assert len(strict.trade_delta_report.matched_trades) == 0
+
+        lenient = run_regression(
+            golden_path,
+            current_data=current,
+            config=RegressionConfig(match_time_tolerance_seconds=60),
+        )
+        assert len(lenient.trade_delta_report.matched_trades) == 1

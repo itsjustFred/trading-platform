@@ -113,7 +113,9 @@ class AnomalyDetector:
                 TradeAnomaly(
                     anomaly_type=AnomalyType.MISSING_TRADE,
                     expected_trade=trade,
-                    severity="warning",
+                    # C4: a missing trade flips the readiness
+                    # missing-trades gate — error, not warning.
+                    severity="error",
                     message=msg,
                 )
             )
@@ -143,7 +145,9 @@ class AnomalyDetector:
                 TradeAnomaly(
                     anomaly_type=AnomalyType.EXTRA_TRADE,
                     actual_trade=trade,
-                    severity="info",
+                    # C4: a phantom trade flips the readiness extra-trades
+                    # gate — error, not info.
+                    severity="error",
                     message=msg,
                 )
             )

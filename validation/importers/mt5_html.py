@@ -12,7 +12,11 @@ from bs4 import BeautifulSoup
 
 from shared.models import Trade, TradeExit
 from validation.importers._numbers import detect_decimal_comma, parse_locale_number
-from validation.importers._pairing import closed_positions, group_position_fills
+from validation.importers._pairing import (
+    closed_positions,
+    group_position_fills,
+    open_position_summary,
+)
 from validation.importers.base import BaseImporter
 from validation.reference import ValidationReference
 
@@ -110,7 +114,15 @@ class MT5HTMLImporter(BaseImporter):
                 raise ValueError("Could not locate 'Trades' table in the HTML report.")
 
             sltp_map = self._build_sltp_map(orders_table)
-            trades = self._build_trades(trades_table, sltp_map, source_timezone)
+            trades, open_summary = self._build_trades(trades_table, sltp_map, source_timezone)
+            # C4: open positions are accounted explicitly (counts + ids).
+            raw_metadata["open_positions"] = open_summary
+            if open_summary.get("open_position_count"):
+                logger.warning(
+                    "MT5 HTML report ends with %d open position(s): %s",
+                    open_summary["open_position_count"],
+                    open_summary["open_position_ids"],
+                )
 
             return ValidationReference(
                 strategy_name=meta.get("strategy_name", "unknown"),
@@ -439,7 +451,7 @@ class MT5HTMLImporter(BaseImporter):
         trades_table: BeautifulSoup,
         sltp_map: dict[str, dict[str, float | None]],
         source_timezone: str | None = None,
-    ) -> list[Trade]:
+    ) -> tuple[list[Trade], dict[str, Any]]:
         rows = MT5HTMLImporter._table_to_rows(trades_table)
         if not rows:
             return []
@@ -583,7 +595,7 @@ class MT5HTMLImporter(BaseImporter):
             trades.append(trade)
             trade_id_counter += 1
 
-        return trades
+        return trades, open_position_summary(position_fills)
 
     @staticmethod
     def _group_trade_rows(
