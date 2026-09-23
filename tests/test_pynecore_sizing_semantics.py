@@ -294,3 +294,78 @@ class TestPyneCliDateBounds:
 
     def test_start_bound_with_time_passes_through(self):
         assert _pyne_cli_start_bound("2024-01-01T09:00:00+00:00") == "2024-01-01T09:00:00+00:00"
+
+
+def test_pyne_cli_receives_full_day_bounds_for_date_only_config(monkeypatch, tmp_path):
+    """C2: bound contract — date-only bounds reach the CLI as full-day
+    instants, so pyne replays the same window as native/vectorbt. Anything
+    narrower fails loudly (midnight truncation) instead of silently."""
+    import subprocess
+
+    from runner.engines.pynecore_adapter import PyneCoreAdapter
+
+    seen: dict[str, str] = {}
+
+    def _fake_which(_name):
+        return "/usr/bin/pyne"
+
+    def _fake_run(cmd, **kwargs):
+        args = list(cmd)
+        seen["from"] = args[args.index("--from") + 1]
+        seen["to"] = args[args.index("--to") + 1]
+        trade_csv = Path(args[args.index("--trade") + 1])
+        trade_csv.write_text(
+            "Trade #,Bar Index,Type,Signal,Date/Time,Price USD,Contracts,"
+            "Profit USD,Profit %,Cumulative profit USD,Cumulative profit %,"
+            "Run-up USD,Run-up %,Drawdown USD,Drawdown %\n"
+        )
+        stats_csv = Path(args[args.index("--strat") + 1])
+        stats_csv.write_text("stat,value\n")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("shutil.which", _fake_which)
+    import runner.engines.pynecore_adapter as pyne_module
+
+    monkeypatch.setattr(pyne_module.shutil, "which", _fake_which)
+    monkeypatch.setattr(pyne_module.subprocess, "run", _fake_run)
+
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=48, freq="h", tz="UTC"),
+            "open": [100.0] * 48,
+            "high": [101.0] * 48,
+            "low": [99.0] * 48,
+            "close": [100.5] * 48,
+            "volume": [1000.0] * 48,
+        }
+    )
+    ohlcv_dir = tmp_path / "ohlcv" / "test" / "PYNE" / "1h.parquet"
+    ohlcv_dir.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_parquet(ohlcv_dir, index=False)
+    strategy = tmp_path / "pyne_bound.py"
+    strategy.write_text(
+        "STRATEGY_META = {'name': 'pyne_bound'}\n"
+        "def generate_signals(df, params):\n"
+        "    import pandas as pd\n"
+        "    n = len(df)\n"
+        "    return (pd.Series([False] * n, index=df.index),\n"
+        "            pd.Series([False] * n, index=df.index), {})\n",
+        encoding="utf-8",
+    )
+    from runner.engines.base import BacktestConfig
+
+    config = BacktestConfig(
+        strategy_name="pyne_bound",
+        symbols=["PYNE"],
+        timeframe="1h",
+        start_date="2024-01-01",
+        end_date="2024-01-02",
+        initial_capital=100_000.0,
+        risk_per_trade_pct=0.01,
+        data_dir=str(tmp_path),
+        parameters={"fees": "zero"},
+    )
+    PyneCoreAdapter().run(config, str(strategy))
+
+    assert seen["from"] == "2024-01-01T00:00:00+00:00"
+    assert seen["to"] == "2024-01-02T23:59:59.999999+00:00"

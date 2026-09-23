@@ -201,27 +201,28 @@ class TradeEngine:
         return "SHORT" if direction == "SHORT" else "LONG"
 
     def _current_risk_exposure(self, reference_price: float) -> float:
+        # C2: no invented stops. Only stop-protected legs contribute their
+        # stop distance — a leg WITHOUT a stop contributes nothing here
+        # instead of entry*0.98 fantasy math. (Sizing still bounds every
+        # leg through the fallback-stop path with a warning; exposure
+        # intentionally measures stop-defined risk only. Stopless legs are
+        # therefore invisible to the exposure cap by design, not by
+        # accident — see max_positions, which counts every leg.)
         if self.equity <= 0:
             return 0.0
 
         risk_exposure = 0.0
 
         for position in self.positions:
-            stop_price = (
-                float(position.stop_loss)
-                if position.stop_loss is not None
-                else float(position.entry_price) * 0.98
-            )
-            risk_distance = abs(float(position.entry_price) - stop_price)
+            if position.stop_loss is None:
+                continue
+            risk_distance = abs(float(position.entry_price) - float(position.stop_loss))
             risk_exposure += (risk_distance * float(position.remaining_qty)) / float(self.equity)
 
         for order in self.pending_orders:
-            stop_price = (
-                float(order.stop_loss)
-                if order.stop_loss is not None
-                else float(reference_price) * 0.98
-            )
-            risk_distance = abs(float(reference_price) - stop_price)
+            if order.stop_loss is None:
+                continue
+            risk_distance = abs(float(reference_price) - float(order.stop_loss))
             risk_exposure += (risk_distance * float(order.quantity)) / float(self.equity)
 
         return max(0.0, risk_exposure)
@@ -279,7 +280,9 @@ class TradeEngine:
                 take_profit=take_profit_price,
                 timeframe=self.config.timeframe,
                 metadata={
-                    "current_positions": len(self.positions),
+                    # C2: pending orders count toward max_positions — a
+                    # pending order is committed intent, not free capacity.
+                    "current_positions": len(self.positions) + len(self.pending_orders),
                     "pending_positions": len(self.pending_orders),
                 },
             )

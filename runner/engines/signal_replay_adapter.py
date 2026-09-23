@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,6 +19,8 @@ from runner.stats import compute_stats_for_result
 from shared.constants import DATA_DIR, normalize_timeframe
 from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, TradeExit
 from signal_bots.registry import get_signal_processor
+
+logger = logging.getLogger(__name__)
 
 ProgressCallback = Callable[[float, str], None]
 
@@ -141,6 +144,16 @@ def _net_pnl_of(trade: Trade) -> float:
 
 
 class SignalReplayAdapter:
+    """Replay external signals through OHLCV bars (C2 fill-policy delta).
+
+    Documented differences vs the bar engines (native/vectorbt), by design:
+    fills happen at the fill bar's CLOSE located via ``searchsorted(left)``
+    (no next-open/spread model, no ``signal_exit_fill``/``spread_price_col``
+    handling); bars with NaN OHLC are dropped loudly (count-logged, never
+    silently skipped); protective exits settle across ALL open positions per
+    signal, not just the signaled symbol.
+    """
+
     def __init__(
         self,
         *,
@@ -179,7 +192,15 @@ class SignalReplayAdapter:
         frame["high"] = pd.to_numeric(frame.get("high"), errors="coerce")
         frame["low"] = pd.to_numeric(frame.get("low"), errors="coerce")
         frame["close"] = pd.to_numeric(frame.get("close"), errors="coerce")
+        before = len(frame)
         frame = frame.dropna(subset=["timestamp", "open", "high", "low", "close"])
+        dropped = before - len(frame)
+        if dropped:
+            # C2: NaN-OHLC drops are count-logged, never silent.
+            logger.warning(
+                "Dropped %d bars with non-numeric OHLC during replay prep",
+                dropped,
+            )
         frame = frame.sort_values("timestamp").reset_index(drop=True)
         return frame
 
@@ -194,12 +215,12 @@ class SignalReplayAdapter:
 
     @staticmethod
     def _position_risk_amount(position: _OpenPosition) -> float:
+        # C2: no invented stops (same rule as the native engine's exposure
+        # math) — a stopless position contributes nothing here instead of a
+        # 2% fantasy distance.
         stop_loss = position.stop_loss
         if stop_loss is None:
-            if position.direction == "LONG":
-                stop_loss = position.entry_price * 0.98
-            else:
-                stop_loss = position.entry_price * 1.02
+            return 0.0
         return abs(position.entry_price - stop_loss) * position.quantity
 
     def _current_exposure(self, open_positions: dict[str, _OpenPosition], equity: float) -> float:
@@ -770,59 +791,6 @@ class SignalReplayAdapter:
                 **dict(effective_signal.metadata or {}),
                 "current_positions": len(open_positions),
             },
-        )
-
-    def _size_and_open_position(
-        self,
-        *,
-        effective_signal: ReplaySignal,
-        target_direction: str,
-        fill_index: int,
-        fill_price: float,
-        fill_time: pd.Timestamp,
-        normalized_timeframe: str,
-        realized_pnl: float,
-        open_positions: dict[str, _OpenPosition],
-    ) -> _OpenPosition | None:
-        """Size the trade against the current balance; None when the size is rejected."""
-        account_balance = max(self.initial_capital + realized_pnl, 1.0)
-        risk_signal = self._build_risk_signal(
-            effective_signal=effective_signal,
-            target_direction=target_direction,
-            fill_price=fill_price,
-            normalized_timeframe=normalized_timeframe,
-            open_positions=open_positions,
-        )
-        sized = self.risk_engine.calculate_position_size(
-            signal=risk_signal,
-            account_balance=account_balance,
-            pip_value=1.0,
-            current_exposure=self._current_exposure(open_positions, account_balance),
-        )
-        quantity = float(sized.position_size)
-        if quantity <= 0:
-            return None
-
-        return _OpenPosition(
-            symbol=effective_signal.symbol,
-            direction=target_direction,
-            entry_time=fill_time,
-            entry_bar_index=fill_index,
-            entry_price=fill_price,
-            signal_entry_price=float(effective_signal.entry_price),
-            quantity=quantity,
-            stop_loss=risk_signal.stop_loss,
-            take_profit=risk_signal.take_profit,
-            initial_stop_loss=risk_signal.stop_loss,
-            initial_take_profit=risk_signal.take_profit,
-            # #84: store the realized stop-loss amount, not the policy figure.
-            risk_amount=float(realized_risk_amount(sized)),
-            risk_percent=float(realized_risk_percent(sized, account_balance)),
-            timeframe=risk_signal.timeframe,
-            source=effective_signal.source,
-            signal_time=effective_signal.timestamp,
-            signal_metadata=dict(effective_signal.metadata),
-            last_checked_at=fill_time,
         )
 
     @staticmethod

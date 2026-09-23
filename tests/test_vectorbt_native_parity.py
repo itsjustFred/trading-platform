@@ -349,3 +349,32 @@ class TestFeeModelParity:
             assert trade.fees > 0
             assert trade.fees == pytest.approx(expected, abs=0.02)
             assert trade.net_pnl == pytest.approx(trade.pnl - trade.fees, abs=0.02)
+
+
+class TestExplicitColumnRoles:
+    """C2: strategy-declared column roles beat exit_* name guessing."""
+
+    def test_exit_named_entry_column_shifts_when_declared(self) -> None:
+        import pandas as pd
+
+        from runner.engines.vectorbt_adapter import _prepare_next_open_execution_data
+
+        index = pd.RangeIndex(4)
+        signals = pd.DataFrame({"entries": [True, False, False, False], "exit_signal": [10.0, 11.0, 12.0, 13.0]}, index=index)
+        exec_default, _ = _prepare_next_open_execution_data(signals, {})
+        # Legacy guess: exit_* stays unshifted.
+        assert exec_default["exit_signal"].tolist()[1:2] == [11.0]
+        exec_declared, _ = _prepare_next_open_execution_data(
+            signals, {}, {"exit_signal": "entry"}
+        )
+        # Declared entry: shifted like the entry leg.
+        assert pd.isna(exec_declared["exit_signal"].iloc[0])
+        assert exec_declared["exit_signal"].tolist()[1:2] == [10.0]
+
+    def test_explicit_indicator_when_wins_over_name(self) -> None:
+        from runner.engines.vectorbt_adapter import _infer_indicator_when
+
+        assert _infer_indicator_when("exit_trigger", "entry") == "entry"
+        assert _infer_indicator_when("plain", "exit") == "exit"
+        assert _infer_indicator_when("exit_trigger", "") == "exit"
+        assert _infer_indicator_when("plain", "") == "entry"
