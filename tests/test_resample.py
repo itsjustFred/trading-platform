@@ -199,3 +199,41 @@ class TestResampleMerge:
         assert observed["path"] != outputs[0], "resample target must be written via temp file"
         assert len(pd.read_parquet(outputs[0])) == 2
         assert not list(tmp_path.rglob("*.tmp-*")), "no temp files left behind"
+
+
+class TestResampleWithOrigin:
+    """C5: explicit UTC buckets, extra-column retention, loud gap drops."""
+
+    def test_buckets_align_to_utc_day(self, sample_1m_df):
+        from data_tools.resample import resample_with_origin
+
+        out = resample_with_origin(sample_1m_df, "1h")
+        # 09:00 and 10:00 UTC boundaries, not pandas-default alignment drift.
+        assert out["timestamp"].dt.minute.eq(0).all()
+
+    def test_extra_columns_retained(self, sample_1m_df):
+        from data_tools.resample import resample_with_origin
+
+        frame = sample_1m_df.copy()
+        frame["spread"] = 0.5
+        out = resample_with_origin(frame, "5min")
+        assert "spread" in out.columns
+        assert (out["spread"] == 0.5).all()
+
+    def test_empty_buckets_warn_loudly(self, sample_1m_df, caplog):
+        import logging
+
+        import pandas as pd
+
+        from data_tools.resample import resample_with_origin
+
+        # Bars on both sides of a fully missing 10:00 hour: the empty
+        # bucket materializes (and warns) instead of vanishing silently.
+        morning = sample_1m_df.iloc[:60].copy()
+        late = sample_1m_df.iloc[:60].copy()
+        late["timestamp"] = pd.date_range("2024-01-02 11:00", periods=60, freq="min")
+        gapped = pd.concat([morning, late], ignore_index=True)
+        with caplog.at_level(logging.WARNING, logger="data_tools.resample"):
+            out = resample_with_origin(gapped, "1h")
+        assert any("empty bucket" in record.message for record in caplog.records)
+        assert len(out) == 2

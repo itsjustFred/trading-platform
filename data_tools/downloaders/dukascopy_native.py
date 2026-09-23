@@ -699,7 +699,10 @@ def _assemble_candle_dataframe(
 
     df = pd.DataFrame(all_candles, columns=["timestamp", "open", "high", "low", "close", "volume"])
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-    df = df[df["volume"] > 0]  # filter flat/zero-volume candles
+    # C5: zero-volume bars are illiquid-but-present time — flag them instead
+    # of deleting them. Deletion made holidays and illiquid sessions
+    # indistinguishable from missing data (invisible gaps).
+    df["zero_volume_bar"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0) <= 0.0
     return df.sort_values("timestamp").drop_duplicates("timestamp").reset_index(drop=True)
 
 
@@ -893,7 +896,11 @@ def _ticks_to_ohlcv(
     resampled.columns = ["open", "high", "low", "close"]
     resampled["volume"] = indexed[vol_col].resample(rule).sum()
     resampled = resampled.dropna(subset=["open"])
-    resampled = resampled[resampled["volume"] > 0]
+    # C5: keep zero-volume buckets flagged (see above) — never filter them
+    # into invisible gaps.
+    resampled["zero_volume_bar"] = (
+        pd.to_numeric(resampled["volume"], errors="coerce").fillna(0.0) <= 0.0
+    )
 
     result = resampled.reset_index()
     result.rename(columns={"index": "timestamp"}, inplace=True)

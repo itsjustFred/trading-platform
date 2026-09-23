@@ -550,3 +550,26 @@ def test_jforex_daily_window_equals_one_day():
     import data_tools.downloaders.jforex_dl as jforex
 
     assert jforex.WINDOW_DAYS_BY_BASE_TF["1d"] == 1
+
+
+def test_zero_volume_buckets_kept_and_flagged() -> None:
+    """C5: illiquid time stays visible (flagged), never filtered invisible."""
+    import pandas as pd
+
+    from data_tools.downloaders.dukascopy_native import _ticks_to_ohlcv
+
+    ticks = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(
+                ["2024-01-01T00:00:30Z", "2024-01-01T00:01:30Z"], utc=True
+            ),
+            "bid": [1.0, 1.0],
+            "ask": [1.1, 1.1],
+            "bid_vol": [0.0, 5.0],
+            "ask_vol": [0.0, 5.0],
+        }
+    )
+    out = _ticks_to_ohlcv(ticks, "m1", price_type="bid")
+    assert len(out) == 2
+    assert "zero_volume_bar" in out.columns
+    assert out["zero_volume_bar"].tolist() == [True, False]

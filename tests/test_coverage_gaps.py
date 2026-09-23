@@ -363,3 +363,31 @@ class TestValidateHolidayCalendar:
         ).to_parquet(target, index=False)
         result = validate_module.validate_parquet(target)
         assert len(result.gaps) == 1
+
+
+class TestEnsureBacktestDataGapGate:
+    """C5: ensure_backtest_data fails on internal gaps, not just bounds."""
+
+    def test_internal_gap_fails_coverage(self, tmp_path, monkeypatch):
+        from data_tools import auto_download
+
+        # Two dense clusters with a 10-day hole inside the required window.
+        early = pd.date_range("2024-01-01", "2024-01-05", freq="1h", tz="UTC")
+        late = pd.date_range("2024-01-15", "2024-01-20", freq="1h", tz="UTC")
+        _write_bars(
+            tmp_path / "ohlcv" / "dukascopy" / "forex" / "EURUSD" / "1h.parquet",
+            [ts.isoformat() for ts in list(early) + list(late)],
+        )
+        monkeypatch.setattr(
+            auto_download,
+            "_download_missing_ohlcv_data",
+            lambda **kwargs: None,
+        )
+        with pytest.raises(RuntimeError, match="internal gaps"):
+            auto_download.ensure_backtest_data(
+                symbols=["EURUSD"],
+                timeframe="1h",
+                start="2024-01-01",
+                end="2024-01-20",
+                data_dir=tmp_path,
+            )

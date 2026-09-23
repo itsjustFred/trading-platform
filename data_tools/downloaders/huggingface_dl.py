@@ -193,23 +193,9 @@ class HuggingFaceDownloader(Downloader):
             return frame
         if timeframe == "1m":
             return frame
-        rule = RESAMPLE_RULES[timeframe]
-        resampled = (
-            frame.set_index("timestamp")
-            .resample(rule)
-            .agg(
-                {
-                    "open": "first",
-                    "high": "max",
-                    "low": "min",
-                    "close": "last",
-                    "volume": "sum",
-                }
-            )
-            .dropna(subset=["open", "high", "low", "close"])
-            .reset_index()
-        )
-        return resampled
+        from data_tools.resample import resample_with_origin
+
+        return resample_with_origin(frame, RESAMPLE_RULES[timeframe])
 
     def download(
         self,

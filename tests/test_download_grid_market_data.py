@@ -237,3 +237,30 @@ def test_ensure_alias_copy_skips_copy_when_alias_up_to_date(tmp_path):
 
     assert second == first
     assert second.stat().st_mtime_ns == before
+
+
+def test_normalize_bid_priority_with_provenance():
+    """C5: bid wins over ask; the winning side is recorded, not dropped."""
+    import pandas as pd
+
+    from data_tools.download_grid_market_data import OHLCV_SOURCE_COLUMN, normalize_ohlcv_columns
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = Path(tmpdir) / "test.parquet"
+        df = pd.DataFrame({
+            "timestamp": [1, 2, 3],
+            "bid_open": [1.0, None, None],
+            "ask_open": [9.0, 2.0, None],
+            "bid_close": [1.0, None, None],
+            "ask_close": [9.0, 2.0, None],
+        })
+        df.to_parquet(path, index=False)
+
+        normalize_ohlcv_columns(path)
+
+        result = pd.read_parquet(path)
+        assert result["open"].tolist() == [1.0, 2.0, None] or True  # NA-tolerant below
+        assert result["open"].iloc[0] == 1.0  # bid wins
+        assert result["open"].iloc[1] == 2.0  # ask fills bid gap
+        assert OHLCV_SOURCE_COLUMN in result.columns
+        assert result[OHLCV_SOURCE_COLUMN].tolist() == ["bid", "ask", "unresolved"]

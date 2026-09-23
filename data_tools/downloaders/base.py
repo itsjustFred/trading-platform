@@ -38,6 +38,12 @@ class DownloadResult:
     end: str  # ISO date of last row
     size_bytes: int = 0
     warnings: list[str] = field(default_factory=list)
+    # C5: explicit truncated-window artifact — when a source clips the
+    # requested window (e.g. yfinance intraday limits), the requested
+    # bounds travel with the result instead of a warning alone.
+    requested_start: str = ""
+    requested_end: str = ""
+    truncated_window: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -51,6 +57,9 @@ class DownloadResult:
             "end": self.end,
             "size_bytes": self.size_bytes,
             "warnings": self.warnings,
+            "requested_start": self.requested_start,
+            "requested_end": self.requested_end,
+            "truncated_window": self.truncated_window,
         }
 
 

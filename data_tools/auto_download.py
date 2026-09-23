@@ -167,6 +167,7 @@ def ensure_backtest_data(
         if not _has_required_coverage(data_root, requirement)
     ]
     if not missing:
+        _fail_on_internal_gaps(data_root, requirements)
         return []
 
     downloaded: list[dict[str, Any]] = []
@@ -215,7 +216,6 @@ def ensure_backtest_data(
                 f"{requirement.symbol} {requirement.timeframe} "
                 f"({requirement.start or 'auto'} -> {requirement.end or 'latest'})"
             )
-
         payload = {
             "symbol": requirement.symbol,
             "timeframe": requirement.timeframe,
@@ -231,8 +231,25 @@ def ensure_backtest_data(
                 f"Downloaded data for {requirement.symbol} {requirement.timeframe}",
             )
 
+    # C5: global min/max bounds are not coverage — fail on internal gaps
+    # the bounds check cannot see (DV-B15). Verified for every requirement,
+    # not just freshly downloaded ones.
+    _fail_on_internal_gaps(data_root, requirements)
+
     _invalidate_catalog_cache(data_root)
     return downloaded
+
+
+def _fail_on_internal_gaps(data_root: Path, requirements: list[DataRequirement]) -> None:
+    """Raise when any requirement's stored range hides an internal hole."""
+    for requirement in requirements:
+        coverage_report = analyze_ohlcv_coverage(data_root, requirement)
+        if coverage_report.get("status") == "failed":
+            raise RuntimeError(
+                "OHLCV coverage has internal gaps for "
+                f"{requirement.symbol} {requirement.timeframe}: "
+                f"{coverage_report.get('gaps') or coverage_report.get('error')}"
+            )
 
 
 def _resolve_data_root(data_dir: str | Path) -> Path:
