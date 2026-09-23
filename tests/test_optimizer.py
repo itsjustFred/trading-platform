@@ -701,3 +701,177 @@ def test_all_trials_failing_raises_informative_error(monkeypatch, tmp_path: Path
     )
     with pytest.raises(RuntimeError, match="No optimization trial completed successfully"):
         optimizer_module.run_optimization(config)
+
+
+class TestRiskAdjustedObjective:
+    """C3: raw targets carry mandatory trade-count/drawdown haircuts."""
+
+    def test_lucky_sparse_run_loses_to_robust_run(self) -> None:
+        from runner.optimizer import _risk_adjusted_metric_value
+
+        lucky, _ = _risk_adjusted_metric_value(
+            5000.0,
+            {"total_trades": 3, "max_drawdown_pct": -0.40},
+            metric_key="total_pnl",
+            direction="maximize",
+        )
+        robust, _ = _risk_adjusted_metric_value(
+            3000.0,
+            {"total_trades": 120, "max_drawdown_pct": -0.05},
+            metric_key="total_pnl",
+            direction="maximize",
+        )
+        assert robust > lucky
+
+    def test_full_credit_leaves_value_untouched(self) -> None:
+        from runner.optimizer import _risk_adjusted_metric_value
+
+        value, terms = _risk_adjusted_metric_value(
+            100.0,
+            {"total_trades": 30, "max_drawdown_pct": 0.0},
+            metric_key="win_rate",
+            direction="maximize",
+        )
+        assert value == 100.0
+        assert terms == {"sparsity_factor": 1.0, "drawdown_factor": 1.0}
+
+    def test_losing_value_passes_through_raw(self) -> None:
+        from runner.optimizer import _risk_adjusted_metric_value
+
+        # A multiplicative haircut would compress losers toward zero and let
+        # them outrank small winners — losers keep their raw value.
+        value, _ = _risk_adjusted_metric_value(
+            -50.0,
+            {"total_trades": 5, "max_drawdown_pct": -0.5},
+            metric_key="total_pnl",
+            direction="maximize",
+        )
+        assert value == -50.0
+
+    def test_risk_adjusted_metrics_pass_through(self) -> None:
+        from runner.optimizer import _risk_adjusted_metric_value
+
+        for key in ("sharpe_ratio", "sortino_ratio", "calmar_ratio", "cagr"):
+            value, _ = _risk_adjusted_metric_value(
+                1.5,
+                {"total_trades": 2, "max_drawdown_pct": -0.9},
+                metric_key=key,
+                direction="maximize",
+            )
+            assert value == 1.5
+
+    def test_embargo_separates_train_and_test(self) -> None:
+        from datetime import datetime
+
+        train, test = optimizer_module._split_backtest_period(
+            "2024-01-01", "2024-01-10", 0.7, embargo_days=1
+        )
+        test_start = datetime.fromisoformat(test["start"])
+        train_end = datetime.fromisoformat(train["end"])
+        assert (test_start - train_end).days >= 1
+
+    def test_zero_embargo_keeps_adjacent_segments(self) -> None:
+        train, test = optimizer_module._split_backtest_period(
+            "2024-01-01", "2024-01-10", 0.7, embargo_days=0
+        )
+        assert train["end"] < test["start"]
+
+
+class TestGridHardening:
+    """C3: validated fan-out width + stale-cell invalidation helpers."""
+
+    def test_max_workers_validation(self) -> None:
+        from runner.backtest_grid import _validate_max_workers
+
+        assert _validate_max_workers(4) == 4
+        assert _validate_max_workers(None) == 1
+        with pytest.raises(ValueError, match=">= 1"):
+            _validate_max_workers(0)
+        with pytest.raises(ValueError, match="integer"):
+            _validate_max_workers("many")
+        assert _validate_max_workers(1000) == 64
+
+    def test_stale_cell_mismatch_recomputes(self, tmp_path: Path) -> None:
+        from runner.backtest_grid import (
+            CellRequest,
+            _existing_cell_matches_request,
+        )
+        from shared.models import BacktestMeta, BacktestResult
+
+        meta = BacktestMeta(
+            id="cell-1",
+            created_at="2026-01-01T00:00:00+00:00",
+            engine="vectorbt",
+            strategies=["sma"],
+            backtest_start="2024-01-01",
+            backtest_end="2024-01-10",
+            initial_capital=100000.0,
+            data={"symbols": ["AAPL"], "timeframes": ["1d"]},
+            parameters={"fast": 2},
+        )
+        result = BacktestResult(meta=meta, trades=[], equity_curve=[])
+        request = CellRequest(
+            strategy="sma",
+            symbol="AAPL",
+            timeframe="1d",
+            start="2024-01-01",
+            end="2024-01-10",
+            engine="vectorbt",
+            capital=100000.0,
+            risk_pct=0.01,
+            params={"fast": 2},
+            output_dir=tmp_path,
+        )
+        assert _existing_cell_matches_request(result, request, "2024-01-01", "2024-01-10") is True
+        stale = CellRequest(
+            strategy="sma",
+            symbol="AAPL",
+            timeframe="1d",
+            start="2024-01-01",
+            end="2024-01-10",
+            engine="vectorbt",
+            capital=100000.0,
+            risk_pct=0.01,
+            params={"fast": 3},
+            output_dir=tmp_path,
+        )
+        assert _existing_cell_matches_request(result, stale, "2024-01-01", "2024-01-10") is False
+
+
+class TestMatrixOverviewContracts:
+    """C3: no cross-capital aggregation in the strategy overview."""
+
+    def test_overview_has_no_sums_or_means(self) -> None:
+        from runner.backtest_matrix import build_strategy_overview
+
+        rows = [
+            {
+                "strategy": "s",
+                "strategy_name": "s",
+                "status": "ok",
+                "symbol": "A",
+                "timeframe": "1d",
+                "run_id": "r1",
+                "sharpe_ratio": 1.0,
+                "net_profit_pct": 5.0,
+                "total_trades": 10,
+                "total_pnl": 100.0,
+            },
+            {
+                "strategy": "s",
+                "strategy_name": "s",
+                "status": "ok",
+                "symbol": "B",
+                "timeframe": "1d",
+                "run_id": "r2",
+                "sharpe_ratio": 2.0,
+                "net_profit_pct": 7.0,
+                "total_trades": 20,
+                "total_pnl": 200.0,
+            },
+        ]
+        (entry,) = build_strategy_overview(rows)
+        assert "total_pnl" not in entry
+        assert "avg_sharpe" not in entry
+        assert entry["best_sharpe"] == 2.0
+        assert entry["total_trades"] == 30

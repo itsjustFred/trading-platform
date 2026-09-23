@@ -131,7 +131,7 @@ class TestNoTradeTrialsCannotWin:
         )
         monkeypatch.setattr(
             optimizer_module, "_split_backtest_period",
-            lambda s, e, pct: (
+            lambda s, e, pct, **kwargs: (
                 {"start": "2024-01-01T00:00:00+00:00", "end": "2024-06-01T00:00:00+00:00"},
                 {"start": "2024-06-01T00:00:00+00:00", "end": "2024-12-31T00:00:00+00:00"},
             ),
@@ -379,7 +379,7 @@ class TestMetricDirection:
         monkeypatch.setattr(
             optimizer_module,
             "_split_backtest_period",
-            lambda s, e, pct: (
+            lambda s, e, pct, **kwargs: (
                 {"start": "2024-01-01T00:00:00+00:00", "end": "2024-06-01T00:00:00+00:00"},
                 {"start": "2024-06-01T00:00:00+00:00", "end": "2024-12-31T00:00:00+00:00"},
             ),

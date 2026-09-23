@@ -353,17 +353,90 @@ def _init_cell_result(request: CellRequest) -> dict[str, Any]:
     if request.skip_existing and path.exists():
         try:
             backtest_result = BacktestResult.load(path)
-            attach_daily_equity(backtest_result, start=resolved_start, end=resolved_end)
-            merge_canonical_stats(backtest_result)
-            backtest_result.save(path)
-            result.update(read_backtest_stats(path))
-            result.update({"status": "skipped_existing", "finished_at": datetime.now(timezone.utc).isoformat()})
-            return result
+            if not _existing_cell_matches_request(
+                backtest_result, request, resolved_start, resolved_end
+            ):
+                logger.info(
+                    "Existing cell output is stale (engine/params/window/capital "
+                    "mismatch); recomputing instead of selling it as fresh.",
+                    extra={"data": {"run_id": run_id}},
+                )
+            else:
+                attach_daily_equity(backtest_result, start=resolved_start, end=resolved_end)
+                merge_canonical_stats(backtest_result)
+                backtest_result.save(path)
+                result.update(read_backtest_stats(path))
+                result.update({"status": "skipped_existing", "finished_at": datetime.now(timezone.utc).isoformat()})
+                return result
         except (ValidationError, OSError, ValueError) as exc:
             result.update({"status": "failed", "error": f"existing output is invalid: {exc}"})
             return result
 
     return result
+
+
+def _validate_max_workers(max_workers: Any) -> int:
+    """Validate the grid fan-out width (C3)."""
+    try:
+        workers = int(1 if max_workers is None else max_workers)
+    except (TypeError, ValueError):
+        raise ValueError(f"max_workers must be an integer, got {max_workers!r}.")
+    if workers < 1:
+        raise ValueError(f"max_workers must be >= 1, got {workers}.")
+    if workers > 64:
+        logger.warning(
+            "Clamping max_workers %d to 64 (unbounded threads + pandas frames).",
+            workers,
+        )
+        workers = 64
+    return workers
+
+
+def _existing_cell_matches_request(
+    backtest_result: BacktestResult,
+    request: CellRequest,
+    resolved_start: str,
+    resolved_end: str,
+) -> bool:
+    """Whether a persisted cell artifact matches the current request (C3).
+
+    `skip_existing` must not sell stale cells as fresh: engine, strategy,
+    symbol, timeframe, resolved window, capital and strategy parameters must
+    all agree, otherwise the cell recomputes. (Risk sizing knobs live outside
+    the artifact schema and are NOT covered — residual gap, documented.)
+    """
+    meta = backtest_result.meta
+    try:
+        if str(meta.engine or "").strip().lower() != str(request.engine or "").strip().lower():
+            return False
+        strategies = [str(name) for name in (meta.strategies or [])]
+        if request.strategy not in strategies and Path(request.strategy).stem not in strategies:
+            return False
+        data = meta.data if isinstance(meta.data, dict) else {}
+        symbols = [str(symbol).upper() for symbol in (data.get("symbols") or [])]
+        if symbols and request.symbol.upper() not in symbols:
+            return False
+        timeframes = [str(timeframe) for timeframe in (data.get("timeframes") or [])]
+        if timeframes and request.timeframe not in timeframes:
+            return False
+        if str(meta.backtest_start or "") != str(resolved_start or ""):
+            return False
+        if str(meta.backtest_end or "") != str(resolved_end or ""):
+            return False
+        if float(meta.initial_capital or 0.0) != float(request.capital or 0.0):
+            return False
+        stored_params = meta.parameters if isinstance(meta.parameters, dict) else {}
+        wanted_params = request.params or {}
+        for key, value in wanted_params.items():
+            if key not in stored_params:
+                return False
+            if json.dumps(stored_params[key], sort_keys=True, default=str) != json.dumps(
+                value, sort_keys=True, default=str
+            ):
+                return False
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
 @dataclass(frozen=True)
@@ -736,11 +809,24 @@ def run_backtest_grid(
     ]
 
     rows: list[dict[str, Any]] = []
-    if max_workers and max_workers > 1:
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+    # C3: validated fan-out — unvalidated max_workers (0/negative/huge)
+    # either silently serialized or exploded thread counts; one escaping
+    # cell exception no longer aborts the whole grid.
+    workers = _validate_max_workers(max_workers)
+    if workers > 1:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = [executor.submit(run_one_backtest, **task) for task in tasks]
             for future in as_completed(futures):
-                rows.append(future.result())
+                try:
+                    rows.append(future.result())
+                except Exception as exc:
+                    rows.append(
+                        {
+                            "status": "failed",
+                            "error": f"grid cell raised outside isolation: {exc}",
+                            "error_class": "fanout",
+                        }
+                    )
     else:
         rows = [run_one_backtest(**task) for task in tasks]
 
