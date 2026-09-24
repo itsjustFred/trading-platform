@@ -642,6 +642,35 @@ def test_alpaca_redelivery_uses_persisted_order_id_without_broker_call(monkeypat
     assert asyncio.run(adapter.submit_order(signal, qty=1.0)) == "alpaca-already-persisted"
 
 
+def test_alpaca_rejects_invalid_persisted_order_id_on_redelivery(monkeypatch):
+    from live_runner import alpaca_adapter as module
+
+    adapter = module.AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True)
+    adapter._connected = True
+    adapter._trading_client = SimpleNamespace(
+        get_account=lambda: SimpleNamespace(cash="100000", equity="100000"),
+        get_order_by_client_id=lambda _cid: pytest.fail("invalid persisted id must stop recovery"),
+        submit_order=lambda **_kwargs: pytest.fail("duplicate order must not be submitted"),
+    )
+    monkeypatch.setattr(module, "save_live_signal", lambda _signal: (str(uuid4()), False))
+    monkeypatch.setattr(module, "get_live_signal_broker_order_id", lambda _sid: "0")
+
+    with pytest.raises(RuntimeError, match="persisted broker order id is invalid"):
+        asyncio.run(
+            adapter.submit_order(
+                LiveSignal(
+                    deployment_id="dep-1",
+                    symbol="AAPL",
+                    action="buy",
+                    theoretical_price=100.0,
+                    timestamp=datetime.now(timezone.utc),
+                    metadata={"stop_loss": 95.0, "take_profit": 110.0},
+                ),
+                qty=1.0,
+            )
+        )
+
+
 def test_alpaca_broker_order_id_persistence_failure_is_not_success(monkeypatch):
     from live_runner import alpaca_adapter as module
 

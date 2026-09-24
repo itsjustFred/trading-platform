@@ -503,11 +503,17 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         trading_client: Any,
         canonical_signal_id: str,
     ) -> str:
-        existing_order_id = await asyncio.to_thread(
+        raw_existing_order_id = await asyncio.to_thread(
             get_live_signal_broker_order_id, canonical_signal_id
         )
-        if existing_order_id:
+        if raw_existing_order_id:
+            existing_order_id = _normalize_broker_order_id(raw_existing_order_id)
+            if existing_order_id is None:
+                raise RuntimeError(
+                    "Alpaca persisted broker order id is invalid; refusing duplicate submission."
+                )
             return existing_order_id
+
         try:
             recovered_order = await asyncio.to_thread(
                 trading_client.get_order_by_client_id,
