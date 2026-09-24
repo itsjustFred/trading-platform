@@ -1,25 +1,32 @@
-# Mutation testing report — PR #103 (mega-batch, stacked on #102)
+# Mutation testing report — PR #103 verify cycle (2026-09-24)
 
-Scope: sampled high-risk new logic (first cycle). Each mutant applied, tested
-on a targeted subset, reverted (`git checkout -- <file>`, verified clean).
+Scope: newest production code in the mega-batch (review-hardening additions).
+Working tree was clean; full suite green before starting (2261 + 105 passed).
+Each mutant applied singly via Edit, tested on a relevant subset, reverted via
+`git checkout -- <file>` immediately after.
 
-| # | File | Mutation | Result | Diagnostic | Catching test(s) |
-|---|------|----------|--------|------------|------------------|
-| M1 | `live_runner/credential_env.py` | `resolve_env_value` falls back on empty (the `or` hole) | Killed (2 tests) | Clear | `test_alpaca_adapter_empty_file_value_not_shadowed` + file-wins test |
-| M2 | `live_runner/daemon.py` | Synthetic TP reintroduced (`* 1.01`) | Killed | Clear | `test_submit_order_with_risk_fails_closed_without_take_profit` |
-| M4 | `validation/comparison/matcher.py` | Min-cost → first-fit | Killed (10, cascading) | Clear (dedicated) | `test_closer_price_wins_over_earlier_index` |
-| M5 | `runner/optimizer.py` | Haircut call-site disabled (`if False`) | SURVIVED → test added, then killed | — | NEW `test_sparse_trial_returns_adjusted_value` (end-to-end wiring) |
-| M8 | `runner/converters/lean_converter.py` | Everything scales in, nothing closes | Killed (2) | Clear | partial-fill + fee tests |
-| M9 | `runner/strategy_ir/routing.py` | Unknown mode falls back to default | Killed | Clear | `test_unknown_rollout_mode_fails_closed` |
+| # | File | Mutation | Result | Diagnostic | Notes |
+|---|------|----------|--------|------------|-------|
+| 1 | `live_runner/base_adapter.py` | `==` → `!=` in `is_unbounded_tp` | Killed | Clear | 3 failures, all named `unbounded_tp_policy` |
+| 2 | `data_tools/downloaders/histdata_dl.py` | drop `.csv` suffix check | Survived → test added → Killed | Clear | new `test_non_csv_entry_rejected` kills it |
+| 3 | `data_tools/downloaders/huggingface_dl.py` | invert host allowlist (`not in` → `in`) | Killed | Clear | `test_unknown_host_rejected` |
+| 4a | `runner/optimizer.py` | drop drawdown factor | Survived (equivalent) | — | fixture has zero drawdown → behaviorally identical; not a gap |
+| 4b | `runner/optimizer.py` | drop sparsity factor | Killed | Clear | `test_sparse_trial_returns_adjusted_value` |
+| 5 | `live_runner/base_adapter.py` | delete `isinstance` guard | Survived → test added → Killed | Clear | new `test_is_unbounded_tp_rejects_non_dict_metadata` kills it |
 
 ## Mutation score
 
-6/6 sampled mutants killed after closing the M5 gap (5/6 on first pass).
+4/6 killed on first pass; both survivors got focused regression tests and
+re-verified as killed. Effective: 6/6 (4a is a behaviorally equivalent mutant,
+documented, not a coverage gap).
 
-## Gaps found and closed
+## Recommended tests (implemented)
 
-- M5: unit tests covered `_risk_adjusted_metric_value` but nothing covered
-  the objective wiring (return value + `penalty_terms` attrs). Added
-  `TestRiskAdjustedObjectiveWiring::test_sparse_trial_returns_adjusted_value`
-  (mocked 3-trade backtest through a real 1-trial study) and re-verified the
-  kill by construction (mutant returns 300, test expects 30).
+- `tests/test_remote_integrity.py::TestHistdataZipBounds::test_non_csv_entry_rejected`
+- `tests/test_live_execution_safety.py::test_is_unbounded_tp_rejects_non_dict_metadata`
+
+Both pass on clean code and fail with the corresponding mutant applied.
+Committed as `test: kill survived mutants — non-csv zip entry, non-dict tp metadata`.
+
+---
+Model: Muse Spark, Harness: OpenCode (CLI agent session, 2026-09-24)
