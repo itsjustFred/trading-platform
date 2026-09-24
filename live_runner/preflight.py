@@ -342,7 +342,22 @@ def run_live_preflight(
 ) -> LivePreflightResult:
     config = Path(config_path)
     accounts_env = Path(accounts_env_path)
-    accounts, deployments = parse_live_deployments_config(config)
+    try:
+        accounts, deployments = parse_live_deployments_config(config)
+    except ValueError as exc:
+        # B3: invalid account definitions (e.g. non-routable ctrader ids)
+        # report as a failed preflight, never as an unhandled crash.
+        logger.warning(
+            "Live deployment config invalid",
+            extra={"data": {"config_path": str(config), "error": str(exc)}},
+        )
+        return LivePreflightResult(
+            ok=False,
+            config_path=str(config),
+            accounts_env_path=str(accounts_env),
+            accounts=[],
+            deployment_errors=[str(exc)],
+        )
     logger.info(
         "Running live preflight",
         extra={

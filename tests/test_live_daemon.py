@@ -1068,7 +1068,6 @@ def test_deployment_paused_during_candle_close_wait_is_not_traded(monkeypatch) -
 def test_balance_polling_fans_out_across_accounts(monkeypatch) -> None:
     """B2: one slow broker must not serialize all balance snapshots."""
     import contextlib
-    import time
 
     import live_runner.daemon as daemon_module
 

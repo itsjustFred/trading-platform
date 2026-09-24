@@ -313,9 +313,9 @@ def test_signal_replay_accepts_csv_inside_data_dir(
     csv_path = tmp_path / "signals" / "signals_demo.csv"
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     csv_path.write_text(
-        "Symbol;Signal Price;Datum;Zeit (NY);Signal Type\n"
-        "AAPL;173,79;2026-02-23;09:32;BUY\n"
-        "AAPL;175,10;2026-02-23;10:07;SELL\n",
+        "Symbol;Signal Price;Datum;Zeit;Signal Type\n"
+        "AAPL;173,79;2026-02-23;09:32:00-05:00;BUY\n"
+        "AAPL;175,10;2026-02-23;10:07:00-05:00;SELL\n",
         encoding="utf-8",
     )
 

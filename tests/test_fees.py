@@ -93,7 +93,7 @@ class TestEngineHardError:
             exits.iloc[20] = True
             return entries, exits, {}, []
 
-        cfg = BacktestConfig(risk_per_trade_pct=0.01, 
+        cfg = BacktestConfig(risk_per_trade_pct=0.01,
             strategy_name="unit-test",
             symbols=["TEST"],
             timeframe="1h",

@@ -89,7 +89,7 @@ def generate_signals(df: pd.DataFrame, params: dict):
 
     adapter = VectorbtAdapter()
     result = adapter.run(
-        BacktestConfig(parameters={"fees": "zero"}, 
+        BacktestConfig(parameters={"fees": "zero"},
             strategy_name="tuple_strategy",
             symbols=["AAPL"],
             timeframe="1d",
@@ -155,7 +155,7 @@ def generate_signals(df: pd.DataFrame, params: dict):
     ).to_parquet(parquet_dir / "1d.parquet", index=False)
 
     result = VectorbtAdapter().run(
-        BacktestConfig(risk_per_trade_pct=0.01, parameters={"fees": "zero"}, 
+        BacktestConfig(risk_per_trade_pct=0.01, parameters={"fees": "zero"},
             strategy_name="supertrend_strategy",
             symbols=["AAPL"],
             timeframe="1d",
@@ -241,7 +241,7 @@ def generate_signals(df: pd.DataFrame, params: dict):
     ).to_parquet(parquet_dir / "1d.parquet", index=False)
 
     result = VectorbtAdapter().run(
-        BacktestConfig(risk_per_trade_pct=0.01, 
+        BacktestConfig(risk_per_trade_pct=0.01,
             strategy_name="meta_params_strategy",
             symbols=["AAPL"],
             timeframe="1d",
@@ -313,7 +313,7 @@ def generate_signals(df: pd.DataFrame, params: dict):
     ).to_parquet(symbol_dir / "1m.parquet", index=False)
 
     result = VectorbtAdapter().run(
-        BacktestConfig(risk_per_trade_pct=0.01, parameters={"fees": "zero"}, 
+        BacktestConfig(risk_per_trade_pct=0.01, parameters={"fees": "zero"},
             strategy_name="intrabar_strategy",
             symbols=["AAPL"],
             timeframe="1h",
@@ -387,7 +387,7 @@ def generate_signals(df: pd.DataFrame, params: dict):
     ).to_parquet(parquet_dir / "1d.parquet", index=False)
 
     result = VectorbtAdapter().run(
-        BacktestConfig(risk_per_trade_pct=0.01, parameters={"fees": "zero"}, 
+        BacktestConfig(risk_per_trade_pct=0.01, parameters={"fees": "zero"},
             strategy_name="drawing_strategy",
             symbols=["AAPL"],
             timeframe="1d",

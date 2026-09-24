@@ -719,7 +719,7 @@ def test_native_and_vectorbt_resolve_the_same_intrabar_spellings(tmp_path: Path)
     ]
     for resolution in resolutions:
         for base in ("1h", "1d"):
-            cfg = BacktestConfig(risk_per_trade_pct=0.01, parameters={"fees": "zero"}, 
+            cfg = BacktestConfig(risk_per_trade_pct=0.01, parameters={"fees": "zero"},
                 strategy_name="parity",
                 symbols=["X"],
                 timeframe=base,
@@ -767,7 +767,7 @@ def test_spellings_pinned_against_one_shared_table():
     assert native_module.TIMEFRAME_ORDER is contract.TIMEFRAME_ORDER
     # The config validator canonicalizes alias spellings before any adapter
     # sees them, so per-adapter divergence is structurally impossible.
-    cfg = BacktestConfig(risk_per_trade_pct=0.01, parameters={"fees": "zero"}, 
+    cfg = BacktestConfig(risk_per_trade_pct=0.01, parameters={"fees": "zero"},
         strategy_name="pin",
         symbols=["X"],
         timeframe="1h",
@@ -1453,7 +1453,7 @@ class TestFillContract:
             exits.iloc[10] = True
             return entries, exits, {}, []
 
-        cfg = BacktestConfig(risk_per_trade_pct=0.01, 
+        cfg = BacktestConfig(risk_per_trade_pct=0.01,
             strategy_name="unit-test",
             symbols=["PARITY"],
             timeframe="1h",

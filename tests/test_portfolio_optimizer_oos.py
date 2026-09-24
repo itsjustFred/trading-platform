@@ -617,9 +617,8 @@ class TestIssue87Guards:
 
 def test_load_strategy_equity_surfaces_load_errors(monkeypatch) -> None:
     """C3: load errors surface with the id instead of decaying to []."""
-    import shared.database as database_module
-
     import runner.portfolio_optimizer as po_module
+    import shared.database as database_module
 
     def _boom(_backtest_id: str):
         raise RuntimeError("db gone")

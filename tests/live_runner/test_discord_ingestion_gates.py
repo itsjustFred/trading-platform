@@ -1115,8 +1115,6 @@ class TestIssueB2Backfill:
         """Bursts > POLL_LIMIT paginate backwards instead of losing exits."""
         import asyncio
 
-        from live_runner.signal_sources import discord_source as ds_module
-
         source = _source(trusted_author_ids={"bot-1"})
         newest = [_burst_message(i) for i in range(20, 0, -1)]  # ids 1020..1001
         older = [_burst_message(i) for i in range(0, -5, -1)]  # ids 1000..996

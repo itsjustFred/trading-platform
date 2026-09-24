@@ -295,8 +295,6 @@ def test_build_catalog_recomputes_on_content_change_same_second(
     sample_data_dir, monkeypatch
 ) -> None:
     """B3: same-mtime rewrite with different bytes must not reuse the cache."""
-    import time
-
     first_catalog = build_catalog(sample_data_dir)
     (sample_data_dir / "catalog.json").write_text(json.dumps(first_catalog))
 

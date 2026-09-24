@@ -360,7 +360,13 @@ class TestExplicitColumnRoles:
         from runner.engines.vectorbt_adapter import _prepare_next_open_execution_data
 
         index = pd.RangeIndex(4)
-        signals = pd.DataFrame({"entries": [True, False, False, False], "exit_signal": [10.0, 11.0, 12.0, 13.0]}, index=index)
+        signals = pd.DataFrame(
+            {
+                "entries": [True, False, False, False],
+                "exit_signal": [10.0, 11.0, 12.0, 13.0],
+            },
+            index=index,
+        )
         exec_default, _ = _prepare_next_open_execution_data(signals, {})
         # Legacy guess: exit_* stays unshifted.
         assert exec_default["exit_signal"].tolist()[1:2] == [11.0]

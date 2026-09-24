@@ -3514,8 +3514,8 @@ def _patch_alpaca_listen_env(monkeypatch, module):
 
 def test_alpaca_listen_subscribes_once_across_reconnects(monkeypatch):
     """#78: reconnect must not duplicate subscribe_trade_updates callbacks."""
-    import alpaca.trading.stream as alpaca_stream_module
     from live_runner import alpaca_adapter as module
+    import alpaca.trading.stream as alpaca_stream_module
 
     _FakeAlpacaStream.instances.clear()
     first = _FakeAlpacaStream([RuntimeError("boom")])
@@ -3598,8 +3598,6 @@ def test_ctrader_index_fallback_class() -> None:
 
 def test_ctrader_unknown_symbol_fails_closed() -> None:
     """No broker props + no fallback class = no trade, never a guessed size."""
-    from live_runner import ctrader_adapter as module
-
     _module, adapter = _make_ctrader_adapter()
     with pytest.raises(ValueError, match="[Uu]nknown cTrader symbol"):
         adapter._resolve_order_volume(_ctrader_signal("NOTASYMBOLXYZ", {"qty": 5.0}))

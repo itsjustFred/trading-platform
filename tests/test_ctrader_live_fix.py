@@ -237,7 +237,10 @@ def test_env_key_persistence_serializes_concurrent_writers(tmp_path: Path) -> No
 
         fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
 
-    writer.wait(timeout=2)
+    # Generous budget: the child pays a full cold import (sqlmodel chain,
+    # several seconds on loaded boxes); the lock semantics above — blocked
+    # while held, correct content after — are what this test verifies.
+    writer.wait(timeout=30)
     assert writer.returncode == 0
     assert _read_env_pair(accounts_env) == {
         "EXISTING": "1",
