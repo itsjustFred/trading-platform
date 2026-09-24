@@ -15,17 +15,16 @@ from __future__ import annotations
 import importlib.util
 import inspect
 import logging
-import os
-import warnings
 from collections.abc import Mapping
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TypedDict
 
 import pandas as pd
 
+from runner.approval_gate import require_generated_strategy_approval
 from runner.engines import contract
 from runner.engines._drawings import DrawingList, _normalize_drawings
 from runner.engines._indicator_series import _build_indicator_series
@@ -572,6 +571,7 @@ class VectorbtAdapter(EngineAdapter):
         strategy_path: str,
         progress_callback: ProgressCallback | None = None,
     ) -> BacktestResult:
+        require_generated_strategy_approval(strategy_path)
         strategy_mod = _load_strategy_module(strategy_path)
         if not hasattr(strategy_mod, "generate_signals"):
             raise ValueError(f"Strategy {strategy_path} must define generate_signals(df, params)")
@@ -767,6 +767,7 @@ class VectorbtAdapter(EngineAdapter):
 
 
 def _load_strategy_module(path: str):
+    require_generated_strategy_approval(path)
     p = Path(path).resolve()
     spec = importlib.util.spec_from_file_location("strategy", str(p))
     mod = importlib.util.module_from_spec(spec)

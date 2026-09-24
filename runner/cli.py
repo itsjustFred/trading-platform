@@ -24,6 +24,7 @@ from typing import Callable
 from pydantic import ValidationError
 
 from data_tools.auto_download import ensure_backtest_data
+from runner.approval_gate import require_generated_strategy_approval
 from runner.backtest_grid import DEFAULT_OUTPUT_DIR, parse_csv_list, parse_params, run_backtest_grid
 from runner.backtest_matrix import MATRIX_OUTPUT_DIR, run_backtest_matrix
 from runner.daily_equity import attach_daily_equity
@@ -167,6 +168,7 @@ def cmd_run(args):
             "runner.cli run currently supports market_data strategies only."
         )
 
+    require_generated_strategy_approval(args.strategy)
     engine = get_engine(args.engine)
     logger.info("Detected strategy type: %s", strategy_type.value)
     progress_callback: Callable[[float, str], None] | None = None

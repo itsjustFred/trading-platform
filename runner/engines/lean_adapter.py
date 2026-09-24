@@ -17,10 +17,11 @@ import logging
 import os
 import shutil
 import subprocess
-import tempfile
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
+from runner.agent_process import build_backtest_child_env
+from runner.approval_gate import require_generated_strategy_approval
 from runner.converters.lean_converter import convert_lean_result
 from runner.engines.base import BacktestConfig, EngineAdapter, ProgressCallback
 from shared.models import BacktestResult
@@ -57,6 +58,7 @@ class LeanAdapter(EngineAdapter):
         strategy_path should point to a LEAN algorithm file or a config JSON
         in the custom_lean_integration project.
         """
+        require_generated_strategy_approval(strategy_path)
         # For Phase 1: if strategy_path points to an existing LEAN result JSON,
         # just convert it (no actual LEAN execution yet)
         sp = Path(strategy_path)
@@ -117,6 +119,7 @@ class LeanAdapter(EngineAdapter):
                 text=True,
                 timeout=600,
                 cwd=str(self.project_dir),
+                env=build_backtest_child_env(),
             )
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError(

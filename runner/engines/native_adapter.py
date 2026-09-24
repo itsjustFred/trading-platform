@@ -7,6 +7,7 @@ from typing import Any
 
 import pandas as pd
 
+from runner.approval_gate import require_generated_strategy_approval
 from runner.engine import TradeEngine
 from runner.engines import contract
 from runner.engines.base import (
@@ -29,6 +30,7 @@ ONE_LOWER_SPELLINGS = contract.ONE_LOWER_SPELLINGS
 
 
 def _load_strategy_module(path: str):
+    require_generated_strategy_approval(path)
     resolved = Path(path).resolve()
     spec = importlib.util.spec_from_file_location("strategy", str(resolved))
     module = importlib.util.module_from_spec(spec)
@@ -92,6 +94,8 @@ class NativeAdapter(EngineAdapter):
         strategy_path: str,
         progress_callback: ProgressCallback | None = None,
     ) -> BacktestResult:
+        require_generated_strategy_approval(strategy_path)
+
         def emit_progress(percent: float, message: str) -> None:
             if progress_callback is None:
                 return

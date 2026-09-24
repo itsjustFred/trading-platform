@@ -108,6 +108,9 @@ def load_strategy_module(path: Path, strategies_dir: Path = DEFAULT_STRATEGIES_D
     Only real backtest/engine runs should call this: listing or looking up
     strategies uses :func:`load_strategy_meta`, which parses instead.
     """
+    from runner.approval_gate import require_generated_strategy_approval
+
+    require_generated_strategy_approval(path, strategies_root=strategies_dir)
     module_name = f"strategy_{strategy_slug_for_path(path, strategies_dir).replace('-', '_')}"
     spec = importlib.util.spec_from_file_location(module_name, str(path))
     if spec is None or spec.loader is None:

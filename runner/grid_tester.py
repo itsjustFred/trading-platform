@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Callable
 from uuid import uuid4
 
+from runner.approval_gate import require_generated_strategy_approval
 from runner.cli import get_engine
 from runner.engines.base import BacktestConfig
 from shared.constants import DATA_DIR
@@ -51,6 +52,7 @@ def _run_grid_cell(
 ) -> dict[str, Any]:
     """Run a single grid cell and classify it as success / no_trades / error."""
     try:
+        require_generated_strategy_approval(strategy_path)
         config = BacktestConfig(
             strategy_name=strategy_slug,
             symbols=[symbol],

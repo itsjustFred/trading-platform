@@ -78,8 +78,8 @@ Execution and conversion layer.
     `runner/agent_response_parsing.py` (response extraction + STRATEGY_META
     normalization), `runner/agent_backtest_target.py` (target resolution +
     artifact paths), `runner/agent_process.py` (backtest subprocess control)
-  - writes strategy assets into `strategies/<slug>/`
-  - launches a validation backtest after generation
+  - writes screened draft assets into `strategies/<slug>/` and returns an awaiting-approval result
+  - leaves execution to `runner.auto_agent.run_validated_backtest` after human approval
 - `runner/engine.py` + `runner/engine_pkg/`
   - `runner/engine.py` is the public import shim (`TradeEngine`,
     `ExecutionModelSettings`, `OrderType`, `Order`, `Position`); the
@@ -89,8 +89,8 @@ Execution and conversion layer.
     `orders.py` (Order/Position dataclasses), `result.py`
     (indicator presentation + `BacktestResult` assembly)
   - refuses to overwrite an existing strategy slug
-  - removes the generated module when validation fails, so no broken file stays registry-runnable
-  - validation runs with an allowlisted child environment (no API keys) and a wall-clock timeout
+  - generated drafts carry a provenance marker and are not executable until approved
+  - approved execution runs with an allowlisted child environment (no API keys) and a wall-clock timeout
 - `runner/codegen_safety.py`
   - static screening of LLM-generated strategy code before it is written or executed
   - denies process spawning, dynamic execution, network egress, untrusted deserialization, and reflection escape hatches
@@ -213,20 +213,19 @@ has reviewed it:
 
 1. the generated module is statically screened (`runner/codegen_safety.py`);
    unscreenable or banned code never reaches disk,
-2. the module is written without an approval file, so it is never runnable
-   through the normal backtest path,
+2. the module is written as a draft with a generated-strategy marker and no
+   approval file, so it is never runnable through an execution route,
 3. `POST /api/strategies/{file}/approve` records a SHA256-bound approval after
    human review, and
 4. only then can the strategy run; if the file changes afterwards, the
    approval is void and the gate refuses execution.
 
-The gate lives in `runner.auto_agent.run_validated_backtest`, which is the only
-supported way to execute a generated strategy. Engine adapters
-(`runner/engines/*`) intentionally do not check approvals — they cannot tell a
-generated file from a hand-written one. Any new execution route for strategy
-files MUST go through `run_validated_backtest` (or call
-`runner.approval_gate.require_approval` itself); calling
-`EngineAdapter.run(...)` directly bypasses the human review gate.
+The approved execution route is `runner.auto_agent.run_validated_backtest`.
+Engine and grid execution boundaries also reject marked drafts that lack a
+valid approval, and re-apply static screening as defense in depth. Any new
+execution route for generated strategy files MUST call
+`runner.approval_gate.require_generated_strategy_approval` (or
+`run_validated_backtest`) before importing or executing the module.
 
 ## Metrics and chart semantics
 

@@ -16,7 +16,33 @@ from typing import Any, Callable
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
+BACKTEST_ENV_ALLOWLIST = (
+    "PATH",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "TZ",
+    "PYTHONUNBUFFERED",
+    "PYTHONPATH",
+    "PYTHONHASHSEED",
+    "VIRTUAL_ENV",
+    "TMPDIR",
+    "DATA_DIR",
+    "LOG_DIR",
+)
+BACKTEST_ENV_ALWAYS_SET = {"PYTHONUNBUFFERED": "1"}
+
 TaskLogger = Callable[..., None]
+
+
+def build_backtest_child_env() -> dict[str, str]:
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key in set(BACKTEST_ENV_ALLOWLIST)
+    }
+    env.update(BACKTEST_ENV_ALWAYS_SET)
+    return env
 
 
 def build_backtest_command(
@@ -77,8 +103,7 @@ def run_backtest(
     of hanging forever on a wedged LLM-generated strategy (CodeRabbit round
     on 16-D2).
     """
-    env = os.environ.copy()
-    env["PYTHONUNBUFFERED"] = "1"
+    env = build_backtest_child_env()
     log_message(log, "Launching backtest command: " + " ".join(cmd))
 
     output_lines: list[str] = []
@@ -129,7 +154,8 @@ def run_backtest(
                     log_message(log, line, stream="stdout")
             # Child still alive: keep polling until stdout EOF or deadline.
 
-        returncode = proc.wait(timeout=0)
+        remaining = _remaining()
+        returncode = proc.wait() if remaining is None else proc.wait(timeout=remaining)
     except subprocess.TimeoutExpired:
         timed_out = True
         proc.kill()

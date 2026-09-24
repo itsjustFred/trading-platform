@@ -38,6 +38,7 @@ if _HERE != str(REPO) and _HERE in sys.path:
     sys.path.insert(0, _HERE)
     sys.path.insert(1, str(REPO))
 
+from runner.agent_process import build_backtest_child_env
 from shared.strategy_registry import iter_strategy_files, strategy_slug_for_path  # noqa: E402
 
 
@@ -236,6 +237,7 @@ def run_strategy(slug: str) -> dict:
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
+            env=build_backtest_child_env(),
             timeout=int(TIMEOUT_SECONDS) + 120,
         )
         output_tail = proc.stdout[-8000:] if proc.stdout else ""

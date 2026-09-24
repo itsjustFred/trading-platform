@@ -12,7 +12,6 @@ import ast
 import csv
 import inspect
 import logging
-import os
 import shutil
 import subprocess
 import sys
@@ -23,20 +22,22 @@ from typing import Any
 
 import pandas as pd
 
+from runner.agent_process import build_backtest_child_env
+from runner.approval_gate import require_generated_strategy_approval
 from runner.codegen_safety import BANNED_CALL_NAMES, import_root
 from runner.engines import contract
-from runner.engines.base import (
-    BacktestConfig,
-    EngineAdapter,
-    ProgressCallback,
-    resolve_strategy_parameters,
-)
 from runner.engines._drawings import _normalize_drawings
 from runner.engines._shared import (
     resolve_bar_spread,
     resolve_max_leverage as _resolve_max_leverage,
     resolve_max_position_exposure_pct as _resolve_max_position_exposure_pct,
     serialize_meta_value as _serialize_meta_value,
+)
+from runner.engines.base import (
+    BacktestConfig,
+    EngineAdapter,
+    ProgressCallback,
+    resolve_strategy_parameters,
 )
 from runner.fees import resolve_fee_model
 from runner.stats import compute_stats_for_result
@@ -246,6 +247,7 @@ class PyneCoreAdapter(EngineAdapter):
         strategy_path: str,
         progress_callback: ProgressCallback | None = None,
     ) -> BacktestResult:
+        require_generated_strategy_approval(strategy_path)
         data_root = Path(config.data_dir) if config.data_dir else DATA_DIR
         resolved_parameters = resolve_strategy_parameters(strategy_path, config.parameters)
         # #84: missing fee/slippage config is a hard error, never silent gross.
@@ -415,6 +417,7 @@ class PyneCoreAdapter(EngineAdapter):
                 capture_output=True,
                 text=True,
                 cwd=str(tmpdir_path),
+                env=build_backtest_child_env(),
                 timeout=300,
             )
         except subprocess.TimeoutExpired as exc:
@@ -555,6 +558,7 @@ def _load_strategy_artifacts(path: str, fallback_name: str) -> tuple[str, Any, A
 
 
 def _load_strategy_helper_namespace(strategy_path: Path, source: str) -> dict[str, Any]:
+    require_generated_strategy_approval(strategy_path)
     namespace: dict[str, Any] = {}
 
     helper_path = strategy_path.with_name(f"{strategy_path.stem}_context.py")
@@ -695,6 +699,7 @@ def _compile_helper_namespace(
     strict_structure: bool = False,
     ignored_roots: frozenset[str] | None = None,
 ) -> dict[str, Any]:
+    require_generated_strategy_approval(source_path)
     tree = ast.parse(source, filename=str(source_path))
     helper_nodes: list[ast.stmt] = []
     allowed_names = function_names or {"build_trade_context", "build_drawings"}

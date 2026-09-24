@@ -6,7 +6,6 @@ from pathlib import Path
 
 import runner.auto_agent as auto_agent
 
-
 STEP_ONE_MARKDOWN = """# Demo Agent
 
 ## Quelle
@@ -121,20 +120,18 @@ def _install_fake_provider(monkeypatch, responses, captured_kwargs=None, capture
     return recorded_calls
 
 
-def test_run_auto_agent_writes_strategy_docs_and_backtest_output(tmp_path, monkeypatch):
+def test_run_auto_agent_writes_screened_draft_without_execution(tmp_path, monkeypatch):
     _setup_agent(monkeypatch, tmp_path)
     llm_calls = _install_fake_provider(
         monkeypatch,
         [STEP_ONE_MARKDOWN, STEP_TWO_META, STEP_THREE_CODE],
     )
-
-    def fake_run_backtest(cmd: list[str], *, log=None):
-        output_path = Path(cmd[cmd.index("--output") + 1])
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text('{"status":"ok"}')
-        return 0, "ok"
-
-    monkeypatch.setattr(auto_agent, "_run_backtest", fake_run_backtest)
+    backtest_calls: list[list[str]] = []
+    monkeypatch.setattr(
+        auto_agent,
+        "_run_backtest",
+        lambda cmd, *, log=None: backtest_calls.append(cmd) or (0, "ok"),
+    )
 
     result = auto_agent.run_auto_agent(
         "strategy.entry('Long', strategy.long)",
@@ -143,10 +140,15 @@ def test_run_auto_agent_writes_strategy_docs_and_backtest_output(tmp_path, monke
     )
 
     assert len(llm_calls) == 3
+    assert result["status"] == "awaiting_approval"
+    assert result["approval_required"] is True
+    assert result["validation"] == "not_run"
+    assert result["backtest_output"] == ""
     assert result["engine"] == "vectorbt"
     assert result["symbols"] == ["AAPL"]
     assert result["timeframe"] == "1h"
     assert result["attempts"] == 1
+    assert backtest_calls == []
 
     strategy_file = Path(result["strategy_file"])
     documentation_file = Path(result["documentation_file"])
@@ -154,13 +156,13 @@ def test_run_auto_agent_writes_strategy_docs_and_backtest_output(tmp_path, monke
     assert documentation_file.exists()
     assert strategy_file.parent.name == strategy_file.stem
     assert documentation_file.name == "README.md"
-    assert Path(result["backtest_output"]).exists()
 
     strategy_text = strategy_file.read_text()
     assert 'STRATEGY_META = {' in strategy_text
     assert '"""Generated strategy."""' in strategy_text
     assert "def generate_signals" in strategy_text
     assert documentation_file.read_text().startswith("# Demo Agent")
+
 
 
 
@@ -200,28 +202,25 @@ def test_run_auto_agent_sets_timeout_and_logs_for_long_code(tmp_path, monkeypatc
 
 
 
-def test_run_auto_agent_retries_only_step_three_on_validation_failure(tmp_path, monkeypatch):
+def test_run_auto_agent_retries_only_step_three_after_screening_failure(tmp_path, monkeypatch):
     _setup_agent(monkeypatch, tmp_path)
     llm_calls: list[dict[str, object]] = []
     _install_fake_provider(
         monkeypatch,
-        [STEP_ONE_MARKDOWN, STEP_TWO_META, STEP_THREE_CODE, FIXED_STEP_THREE_CODE],
+        [
+            STEP_ONE_MARKDOWN,
+            STEP_TWO_META,
+            "import subprocess\nsubprocess.run(['ls'])\n",
+            FIXED_STEP_THREE_CODE,
+        ],
         captured_calls=llm_calls,
     )
-
-    backtest_calls = 0
-
-    def fake_run_backtest(cmd: list[str], *, log=None):
-        nonlocal backtest_calls
-        backtest_calls += 1
-        output_path = Path(cmd[cmd.index("--output") + 1])
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        if backtest_calls == 1:
-            return 1, "Traceback: boom"
-        output_path.write_text('{"status":"ok"}')
-        return 0, "ok"
-
-    monkeypatch.setattr(auto_agent, "_run_backtest", fake_run_backtest)
+    backtest_calls: list[list[str]] = []
+    monkeypatch.setattr(
+        auto_agent,
+        "_run_backtest",
+        lambda cmd, *, log=None: backtest_calls.append(cmd) or (0, "ok"),
+    )
 
     result = auto_agent.run_auto_agent(
         "strategy.entry('Long', strategy.long)",
@@ -230,13 +229,14 @@ def test_run_auto_agent_retries_only_step_three_on_validation_failure(tmp_path, 
     )
 
     assert result["attempts"] == 2
-    assert backtest_calls == 2
+    assert result["status"] == "awaiting_approval"
+    assert backtest_calls == []
     assert len(llm_calls) == 4
     assert "The Analyst" in str(llm_calls[0]["system_prompt"])
     assert "The Architect" in str(llm_calls[1]["system_prompt"])
     assert "The Coder" in str(llm_calls[2]["system_prompt"])
     assert "The Coder" in str(llm_calls[3]["system_prompt"])
-    assert "Traceback: boom" in str(llm_calls[3]["prompt"])
+    assert "screening" in str(llm_calls[3]["prompt"])
 
 
 def test_normalize_strategy_meta_accepts_list_tags():
@@ -300,11 +300,9 @@ def test_run_auto_agent_writes_artifacts_inside_patched_dirs(tmp_path, monkeypat
 
     strategy_file = Path(result["strategy_file"])
     documentation_file = Path(result["documentation_file"])
-    backtest_output = Path(result["backtest_output"])
-
+    assert result["backtest_output"] == ""
     assert strategy_file.is_relative_to(tmp_path), f"strategy leaked: {strategy_file}"
     assert documentation_file.is_relative_to(tmp_path), f"docs leaked: {documentation_file}"
-    assert backtest_output.is_relative_to(tmp_path), f"output leaked: {backtest_output}"
 
     # The CLI command must be launched with the strategy path relative to the
     # SAME root the subprocess runs in (pre-mortem PM-1 masking defect).

@@ -101,7 +101,7 @@ def step_three_user_prompt(
     repair_section = ""
     if attempt_error:
         repair_section = (
-            "\n\nDer vorherige Backtest-/Validierungsversuch ist mit folgendem Fehler fehlgeschlagen. "
+            "\n\nDer vorherige Screening-Versuch ist mit folgendem Fehler fehlgeschlagen. "
             "Korrigiere NUR den Python-Code. Markdown und STRATEGY_META bleiben unveraendert.\n"
             "```text\n"
             f"{attempt_error[-ERROR_CONTEXT_LIMIT:]}\n"

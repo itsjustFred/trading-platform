@@ -1,10 +1,10 @@
 """Autonomous strategy-conversion agent (orchestration).
 
-Converts raw strategy code into a runnable repository strategy using three
-smaller LLM stages (analyst, architect, coder), writes the generated Python +
-Markdown artifacts into per-strategy folders, and validates the result by
-launching a backtest through runner.cli. If validation fails, only the coder
-stage is retried with the latest error context.
+Converts raw strategy code into a screened draft strategy using three smaller
+LLM stages (analyst, architect, coder), writes the generated Python + Markdown
+artifacts into per-strategy folders, and leaves execution to the approved
+backtest route. If screening fails, only the coder stage is retried with the
+latest error context.
 
 Companion modules:
 - runner/agent_prompts.py          — the per-stage LLM prompts
@@ -15,10 +15,10 @@ Companion modules:
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-import os
 import shutil
 import subprocess
+from collections.abc import Callable
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -32,10 +32,12 @@ from runner.agent_backtest_target import (
     resolve_backtest_target,
 )
 from runner.agent_process import (
+    BACKTEST_ENV_ALLOWLIST as _BACKTEST_ENV_ALLOWLIST,
+    BACKTEST_ENV_ALWAYS_SET as _BACKTEST_ENV_ALWAYS_SET,
     TaskLogger,
+    build_backtest_child_env,
     build_backtest_command,
     log_message as _log,
-    run_backtest as _run_backtest_impl,
 )
 from runner.agent_prompts import (
     step_one_developer_prompt as _step_one_developer_prompt_impl,
@@ -52,10 +54,16 @@ from runner.agent_response_parsing import (
     extract_python_response as _extract_python_response,
     extract_strategy_meta as _extract_strategy_meta,
     normalize_markdown_doc as _normalize_markdown_doc,
+    normalize_strategy_meta as _normalize_strategy_meta_impl,
     slugify as _slugify,
 )
-from runner.agent_response_parsing import normalize_strategy_meta as _normalize_strategy_meta
-from runner.approval_gate import StrategyNotApprovedError, approval_path_for, require_approval
+from runner.approval_gate import (
+    StrategyNotApprovedError,
+    approval_path_for,
+    generated_marker_path_for,
+    mark_generated_strategy,
+    require_generated_strategy_approval,
+)
 from runner.codegen_safety import screen_strategy_source
 from runner.llm_providers import (
     DEFAULT_LLM_PROVIDER_NAME,
@@ -64,6 +72,10 @@ from runner.llm_providers import (
 )
 from runner.llm_providers.base import LLMProvider
 from shared.logging import get_logger
+
+_normalize_strategy_meta = _normalize_strategy_meta_impl
+BACKTEST_ENV_ALLOWLIST = _BACKTEST_ENV_ALLOWLIST
+BACKTEST_ENV_ALWAYS_SET = _BACKTEST_ENV_ALWAYS_SET
 
 PROMPT_PATH = PROJECT_ROOT / ".github" / "agents" / "strategy-conversion.md"
 
@@ -100,22 +112,6 @@ def _step_three_developer_prompt(*, system_prompt: str, engine: str) -> str:
 
 
 
-BACKTEST_ENV_ALLOWLIST = (
-    "PATH",
-    "HOME",
-    "LANG",
-    "LC_ALL",
-    "TZ",
-    "PYTHONUNBUFFERED",
-    "PYTHONPATH",
-    "PYTHONHASHSEED",
-    "VIRTUAL_ENV",
-    "TMPDIR",
-    "DATA_DIR",
-    "LOG_DIR",
-)
-BACKTEST_ENV_ALWAYS_SET = {"PYTHONUNBUFFERED": "1"}
-
 # Wall-clock bound for the generated-strategy backtest child. Generated code is
 # untrusted: without a timeout a hanging strategy wedges the worker thread.
 BACKTEST_TIMEOUT_SECONDS = 1800
@@ -136,8 +132,8 @@ def run_auto_agent(
     max_iterations: int = MAX_ITERATIONS,
     timeout_seconds: float = OPENAI_TIMEOUT_SECONDS,
     log: TaskLogger | None = None,
-) -> dict[str, str | int | list[str]]:
-    """Convert raw strategy code into a runnable strategy and validate it via backtest."""
+) -> dict[str, str | int | list[str] | bool]:
+    """Generate a screened draft and leave execution behind the approval gate."""
     source_code = (code or "").strip()
     if not source_code:
         raise ValueError("Strategy source code is required.")
@@ -245,7 +241,7 @@ def run_auto_agent(
         else:
             _log(
                 log,
-                f"Step 3/3: Retry {attempt}/{max_iterations} with validation feedback using "
+                f"Step 3/3: Retry {attempt}/{max_iterations} with screening feedback using "
                 f"{_provider_step_target(selected_provider, selected_model)}.",
             )
 
@@ -275,57 +271,46 @@ def run_auto_agent(
                     level="error",
                 )
             last_error = (
-                "Generated code failed safety screening before execution: "
+                "Generated code failed safety screening before approval: "
                 + "; ".join(screening.messages)
             )
-            _log(log, f"Iteration {attempt} failed: {last_error}", level="error")
-            if attempt >= max_iterations:
-                import shutil as _shutil
-                _shutil.rmtree(artifacts.strategy_dir, ignore_errors=True)
-                _log(log, f"Removed failed generated strategy artifacts: {artifacts.strategy_path}")
+            _discard_failed_attempt(
+                attempt=attempt,
+                max_attempts=max_iterations,
+                last_error=last_error,
+                artifacts=artifacts,
+                log=log,
+            )
             continue
 
-        artifacts.strategy_path.parent.mkdir(parents=True, exist_ok=True)
-        artifacts.strategy_path.write_text(python_code.rstrip() + "\n", encoding="utf-8")
+        try:
+            approval_path_for(artifacts.strategy_path).unlink(missing_ok=True)
+            mark_generated_strategy(artifacts.strategy_path, strategies_root=STRATEGIES_DIR)
+            artifacts.strategy_path.parent.mkdir(parents=True, exist_ok=True)
+            artifacts.strategy_path.write_text(python_code.rstrip() + "\n", encoding="utf-8")
+        except OSError:
+            generated_marker_path_for(artifacts.strategy_path).unlink(missing_ok=True)
+            raise
         _log(log, f"Wrote strategy file: {artifacts.strategy_path}")
         if attempt == 1:
             _log(log, "✅ Step 3/3: Python Code generated.")
         else:
             _log(log, f"✅ Step 3/3: Python Code regenerated (attempt {attempt}/{max_iterations}).")
-
-        cmd = build_backtest_command(
-            strategy_path=artifacts.strategy_path,
-            engine=engine,
-            target=target,
-            output_path=artifacts.output_path,
-            capital=capital,
-            default_risk_pct=DEFAULT_RISK_PCT,
-            project_root=PROJECT_ROOT,
-        )
-        returncode, combined_output = _run_backtest(cmd, log=log)
-        if returncode == 0 and artifacts.output_path.exists():
-            _log(log, f"✅ Validation loop: Backtest succeeded. Output saved to {artifacts.output_path}")
-            return {
-                "strategy_file": str(artifacts.strategy_path),
-                "documentation_file": str(artifacts.documentation_path),
-                "backtest_output": str(artifacts.output_path),
-                "engine": engine,
-                "symbols": target.symbols,
-                "timeframe": target.timeframe,
-                "attempts": attempt,
-                "provider": selected_provider,
-                "model": selected_model or "",
-            }
-
-        last_error = combined_output or "Backtest failed without output."
-        _log(log, f"Iteration {attempt} failed: {last_error}", level="error")
-        _discard_failed_attempt(
-            attempt=attempt,
-            max_attempts=max_iterations,
-            last_error=last_error,
-            artifacts=artifacts,
-            log=log,
-        )
+        _log(log, "Generated strategy is awaiting human approval; no backtest was launched.")
+        return {
+            "strategy_file": str(artifacts.strategy_path),
+            "documentation_file": str(artifacts.documentation_path),
+            "backtest_output": "",
+            "engine": engine,
+            "symbols": target.symbols,
+            "timeframe": target.timeframe,
+            "attempts": attempt,
+            "provider": selected_provider,
+            "model": selected_model or "",
+            "status": "awaiting_approval",
+            "approval_required": True,
+            "validation": "not_run",
+        }
 
     raise RuntimeError(f"Auto-agent failed after {max_iterations} iterations: {last_error}")
 
@@ -351,6 +336,7 @@ def _discard_failed_attempt(
     try:
         strategy_path.unlink(missing_ok=True)
         approval_path_for(strategy_path).unlink(missing_ok=True)
+        generated_marker_path_for(strategy_path).unlink(missing_ok=True)
         if attempt >= max_attempts:
             # The generated strategy no longer exists, so the slug directory
             # (README included) goes too — otherwise the leftovers would both
@@ -432,46 +418,48 @@ def run_validated_backtest(
     output_path: Path,
     capital: float = DEFAULT_CAPITAL,
     log: TaskLogger | None = None,
+    max_attempts: int = 1,
+    retry: Callable[[str], None] | None = None,
 ) -> tuple[int, str]:
-    """Run the backtest for an already-generated strategy behind the review gate.
+    """Run an approved backtest, optionally retrying through a repair callback.
 
     LLM-generated strategy code requires a human review gate before the first
     run (Decision Record 2026-08-31). The approval is bound to the file's
     SHA256 hash; if the file changed after approval, the gate refuses to run.
     """
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be >= 1")
     path = Path(strategy_path)
-    try:
-        require_approval(path, strategies_root=STRATEGIES_DIR)
-    except StrategyNotApprovedError as exc:
-        # Only add the how-to-approve action; the gate's own message already
-        # carries the why (SHA256-bound approval missing/voided).
-        raise StrategyNotApprovedError(
-            f"{exc} Approve '{path}' via runner.approval_gate.approve_strategy()."
-        ) from exc
+    last_result = (1, "Approved validation did not run.")
+    for attempt in range(1, max_attempts + 1):
+        try:
+            require_generated_strategy_approval(
+                path,
+                strategies_root=STRATEGIES_DIR,
+                force=True,
+            )
+        except StrategyNotApprovedError as exc:
+            raise StrategyNotApprovedError(
+                f"{exc} Approve '{path}' via runner.approval_gate.approve_strategy()."
+            ) from exc
 
-    cmd = build_backtest_command(
-        strategy_path=path,
-        engine=engine,
-        target=target,
-        output_path=output_path,
-        capital=capital,
-        default_risk_pct=DEFAULT_RISK_PCT,
-        project_root=PROJECT_ROOT,
-    )
-    return _run_backtest(cmd, log=log)
-
-
-def build_backtest_child_env() -> dict[str, str]:
-    """Build the child environment for generated-strategy backtests.
-
-    The full parent environment is never forwarded: it routinely contains API
-    keys and tokens (NIM_API_KEY, GITHUB_TOKEN, ...). Only allowlisted,
-    non-secret variables plus the values in ``BACKTEST_ENV_ALWAYS_SET`` are
-    inherited.
-    """
-    env = {key: value for key, value in os.environ.items() if key in set(BACKTEST_ENV_ALLOWLIST)}
-    env.update(BACKTEST_ENV_ALWAYS_SET)
-    return env
+        cmd = build_backtest_command(
+            strategy_path=path,
+            engine=engine,
+            target=target,
+            output_path=output_path,
+            capital=capital,
+            default_risk_pct=DEFAULT_RISK_PCT,
+            project_root=PROJECT_ROOT,
+        )
+        last_result = _run_backtest(cmd, log=log)
+        if last_result[0] == 0 and output_path.exists():
+            return last_result
+        if attempt >= max_attempts or retry is None:
+            return last_result
+        _log(log, f"Approved validation attempt {attempt} failed; retrying.")
+        retry(last_result[1])
+    return last_result
 
 
 def _kill_process(proc: subprocess.Popen, *, timeout: int = 30) -> None:
@@ -518,8 +506,11 @@ def _run_backtest(cmd: list[str], *, log: TaskLogger | None) -> tuple[int, str]:
     return proc.returncode, "".join(output_lines)
 
 
+def _backtest_timeout() -> float:
+    return BACKTEST_TIMEOUT_SECONDS
+
+
 def _kill(proc: subprocess.Popen) -> None:
-    """Kill and reap a child process; safe to call on an exited child."""
     if proc.poll() is not None:
         return
     proc.kill()
@@ -527,7 +518,6 @@ def _kill(proc: subprocess.Popen) -> None:
 
 
 def _timeout(proc: subprocess.Popen, cmd: list[str]) -> None:
-    """Kill a hung child and raise the timeout error for the caller."""
     proc.kill()
     proc.wait(timeout=30)
     raise RuntimeError(
