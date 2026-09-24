@@ -15,7 +15,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -232,20 +231,33 @@ def _mtime_to_iso(value: float) -> str:
     return datetime.fromtimestamp(value, tz=timezone.utc).isoformat()
 
 
-def _should_reuse_cached_summary(cached_entry: dict | None, file_mtime: float) -> bool:
-    if not isinstance(cached_entry, dict):
-        return False
-
-    cached_last_updated = _catalog_timestamp_to_epoch(cached_entry.get("last_updated"))
-    if cached_last_updated is not None:
-        return file_mtime <= (cached_last_updated + 1e-6)
-
-    # Backward-compatible fallback for older cache payloads without last_updated.
-    cached_mtime_ns = cached_entry.get("mtime_ns")
+def _file_fingerprint(path: Path) -> tuple[int, int] | None:
+    """Exact (mtime_ns, size_bytes) fingerprint, or None when unreadable."""
     try:
-        return float(file_mtime) <= float(cached_mtime_ns) / 1_000_000_000
-    except (TypeError, ValueError):
+        stat = path.stat()
+    except OSError:
+        return None
+    return (int(stat.st_mtime_ns), int(stat.st_size))
+
+
+def _should_reuse_cached_summary(
+    cached_entry: dict[str, Any] | None, fingerprint: tuple[int, int] | None
+) -> bool:
+    """Reuse a cached summary only on exact fingerprint match (B3).
+
+    The old float-mtime/ISO comparison (±1µs epsilon) called a rewritten
+    file fresh when only its content changed within the window. Size is
+    part of the fingerprint so same-second rewrites with different bytes
+    cannot masquerade as fresh. Legacy entries without the pair never match.
+    """
+    if not isinstance(cached_entry, dict) or fingerprint is None:
         return False
+    try:
+        cached_ns = int(cached_entry["mtime_ns"])
+        cached_size = int(cached_entry["size_bytes"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    return (cached_ns, cached_size) == fingerprint
 
 
 def _looks_like_bare_symbol(value: str) -> bool:
@@ -836,9 +848,9 @@ def scan_ohlcv(data_dir: Path, include_validation: bool = False) -> list[dict]:
         entry["storage"] = _detect_storage(parquet_file, data_dir)
 
         try:
-            file_mtime = os.path.getmtime(parquet_file)
+            fingerprint = _file_fingerprint(parquet_file)
             cached_entry = catalog_cache.get(str(parquet_file))
-            if _should_reuse_cached_summary(cached_entry, file_mtime):
+            if _should_reuse_cached_summary(cached_entry, fingerprint):
                 for key in (
                     "rows",
                     "size_bytes",
@@ -850,17 +862,17 @@ def scan_ohlcv(data_dir: Path, include_validation: bool = False) -> list[dict]:
                 ):
                     if key in cached_entry:
                         entry[key] = cached_entry[key]
-                if entry.get("last_updated") is None:
-                    entry["last_updated"] = _mtime_to_iso(file_mtime)
+                if entry.get("last_updated") is None and fingerprint is not None:
+                    entry["last_updated"] = _mtime_to_iso(fingerprint[0] / 1_000_000_000)
             else:
                 entry.update(read_parquet_summary(parquet_file))
         except (OSError, ValueError) as e:
             logger.warning(_COULD_NOT_READ_MESSAGE, parquet_file, e)
             try:
-                file_mtime = os.path.getmtime(parquet_file)
-                entry["size_bytes"] = os.path.getsize(parquet_file)
-                entry["mtime_ns"] = int(file_mtime * 1_000_000_000)
-                entry["last_updated"] = _mtime_to_iso(file_mtime)
+                stat = parquet_file.stat()
+                entry["size_bytes"] = int(stat.st_size)
+                entry["mtime_ns"] = int(stat.st_mtime_ns)
+                entry["last_updated"] = _mtime_to_iso(stat.st_mtime)
             except OSError:
                 entry["size_bytes"] = 0
             entry["rows"] = None

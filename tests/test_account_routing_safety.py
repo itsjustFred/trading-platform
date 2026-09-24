@@ -148,3 +148,21 @@ def test_daemon_fails_closed_before_adapter_creation_for_duplicate_ctrader_targe
         )
 
     assert adapter_creations == []
+
+
+def test_live_config_rejects_non_numeric_ctrader_identifier(tmp_path: Path) -> None:
+    """B3: a ctrader account without numeric cTID fails at validation."""
+    config_path = _write_config(
+        tmp_path / "live_deployments.yaml",
+        """
+accounts:
+  - id: bad-ctrader
+    broker: ctrader
+    broker_login: "not-a-number"
+
+deployments: []
+        """,
+    )
+
+    with pytest.raises(ValueError, match="no numeric broker identifier"):
+        parse_live_deployments_config(config_path)

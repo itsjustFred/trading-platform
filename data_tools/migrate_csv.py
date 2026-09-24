@@ -18,6 +18,7 @@ import logging
 import os
 import re
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -32,7 +33,7 @@ STOCKKIT_DATA = Path.home() / "Desktop" / "stockkit_ai_bot" / "data"
 LEAN_UNIVERSE = Path.home() / "Desktop" / "custom_lean_integration" / "universe_sp500.txt"
 
 
-def migrate_dukascopy_xauusd(dry_run: bool) -> int:
+def migrate_dukascopy_xauusd(dry_run: bool, force: bool = False) -> int:
     """Migrate XAUUSD H1 and M15 CSVs from lean integration."""
     count = 0
     patterns = {
@@ -42,21 +43,21 @@ def migrate_dukascopy_xauusd(dry_run: bool) -> int:
     for pattern, tf in patterns.items():
         for csv_path in LEAN_DATA.glob(pattern):
             dest = DATA_DIR / "ohlcv" / "dukascopy" / "forex" / "XAUUSD" / f"{tf}.parquet"
-            count += _convert_ohlcv(csv_path, dest, dry_run, timestamp_col="timestamp")
+            count += _convert_ohlcv(csv_path, dest, dry_run, force=force, timestamp_col="timestamp")
     return count
 
 
-def migrate_lean_equities_h1(dry_run: bool) -> int:
+def migrate_lean_equities_h1(dry_run: bool, force: bool = False) -> int:
     """Migrate US equity H1 CSVs (730d files)."""
     count = 0
     for csv_path in LEAN_DATA.glob("*_H1_730d.csv"):
         symbol = csv_path.name.split("_")[0]
         dest = DATA_DIR / "ohlcv" / "yfinance" / "equity" / "US" / symbol / "1h.parquet"
-        count += _convert_ohlcv(csv_path, dest, dry_run, timestamp_col="timestamp")
+        count += _convert_ohlcv(csv_path, dest, dry_run, force=force, timestamp_col="timestamp")
     return count
 
 
-def migrate_lean_equities_m15(dry_run: bool) -> int:
+def migrate_lean_equities_m15(dry_run: bool, force: bool = False) -> int:
     """Migrate US equity M15 CSVs."""
     count = 0
     for csv_path in LEAN_DATA.glob("*_M15_*.csv"):
@@ -65,11 +66,11 @@ def migrate_lean_equities_m15(dry_run: bool) -> int:
             continue  # handled by dukascopy migration
         symbol = name.split("_")[0]
         dest = DATA_DIR / "ohlcv" / "yfinance" / "equity" / "US" / symbol / "15m.parquet"
-        count += _convert_ohlcv(csv_path, dest, dry_run, timestamp_col="timestamp")
+        count += _convert_ohlcv(csv_path, dest, dry_run, force=force, timestamp_col="timestamp")
     return count
 
 
-def migrate_lean_equities_daily(dry_run: bool) -> int:
+def migrate_lean_equities_daily(dry_run: bool, force: bool = False) -> int:
     """Migrate daily equity CSVs from lean integration/data/equity/."""
     count = 0
     equity_dir = LEAN_DATA / "equity"
@@ -78,11 +79,11 @@ def migrate_lean_equities_daily(dry_run: bool) -> int:
     for csv_path in equity_dir.glob("*_daily.csv"):
         symbol = csv_path.name.replace("_daily.csv", "")
         dest = DATA_DIR / "ohlcv" / "yfinance" / "equity" / "US" / symbol / "1d.parquet"
-        count += _convert_ohlcv(csv_path, dest, dry_run)
+        count += _convert_ohlcv(csv_path, dest, dry_run, force=force)
     return count
 
 
-def migrate_stockkit_5m(dry_run: bool) -> int:
+def migrate_stockkit_5m(dry_run: bool, force: bool = False) -> int:
     """Migrate stockkit 5-min equity CSVs."""
     count = 0
     for csv_path in STOCKKIT_DATA.glob("*.csv"):
@@ -93,21 +94,30 @@ def migrate_stockkit_5m(dry_run: bool) -> int:
         if not re.match(r"^[A-Z]{1,5}$", symbol):
             continue
         dest = DATA_DIR / "ohlcv" / "yfinance" / "equity" / "US" / symbol / "5m.parquet"
-        count += _convert_ohlcv(csv_path, dest, dry_run, datetime_col="Datetime")
+        count += _convert_ohlcv(csv_path, dest, dry_run, force=force, datetime_col="Datetime")
     return count
 
 
-def migrate_universe(dry_run: bool) -> int:
+def migrate_universe(dry_run: bool, force: bool = False) -> int:
     """Copy SP500 universe file."""
     if not LEAN_UNIVERSE.exists():
         return 0
     dest = DATA_DIR / "universes" / "sp500_changes.txt"
+    if dest.exists() and not force:
+        logger.info("[SKIP] %s (already exists)", dest)
+        return 0
     if dry_run:
         logger.info("[DRY] %s → %s", LEAN_UNIVERSE, dest)
         return 1
     dest.parent.mkdir(parents=True, exist_ok=True)
     import shutil
 
+    if dest.exists() and force:
+        backup = dest.with_name(
+            f"{dest.stem}.bak.{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}{dest.suffix}"
+        )
+        shutil.copy2(dest, backup)
+        logger.info("Backed up %s → %s", dest, backup)
     shutil.copy2(LEAN_UNIVERSE, dest)
     logger.info("Copied %s → %s", LEAN_UNIVERSE, dest)
     return 1
@@ -118,15 +128,33 @@ def _looks_like_timestamp(val: str) -> bool:
     return len(val) > 8 and val[0].isdigit() and "-" in val
 
 
+def _source_fingerprint(csv_path: Path) -> str:
+    """Short SHA256 + row estimate identifying the migration source (B3)."""
+    import hashlib
+
+    digest = hashlib.sha256()
+    rows = 0
+    try:
+        with csv_path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(chunk)
+        with csv_path.open("r", encoding="utf-8", errors="replace") as handle:
+            rows = sum(1 for _ in handle) - 1
+    except OSError:
+        return "unreadable"
+    return f"sha256:{digest.hexdigest()[:16]} rows~{max(rows, 0)}"
+
+
 def _convert_ohlcv(
     csv_path: Path,
     dest: Path,
     dry_run: bool,
     timestamp_col: str | None = None,
     datetime_col: str | None = None,
+    force: bool = False,
 ) -> int:
     """Convert a single OHLCV CSV to Parquet."""
-    if dest.exists():
+    if dest.exists() and not force:
         logger.info("[SKIP] %s (already exists)", dest)
         return 0
 
@@ -193,8 +221,24 @@ def _convert_ohlcv(
         df = df[keep]
 
         dest.parent.mkdir(parents=True, exist_ok=True)
+        if dest.exists() and force:
+            # B3: --force overwrites back up the previous artifact with a
+            # timestamped backup instead of destroying it.
+            backup = dest.with_name(
+                f"{dest.stem}.bak.{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}{dest.suffix}"
+            )
+            import shutil
+
+            shutil.copy2(dest, backup)
+            logger.info("Backed up %s → %s", dest, backup)
         df.to_parquet(dest, index=False, engine="pyarrow")
-        logger.info("Converted %s → %s (%d rows)", csv_path.name, dest, len(df))
+        logger.info(
+            "Converted %s → %s (%d rows, source %s)",
+            csv_path.name,
+            dest,
+            len(df),
+            _source_fingerprint(csv_path),
+        )
         return 1
 
     except Exception as e:
@@ -207,6 +251,11 @@ def main():
     parser.add_argument(
         "--execute", action="store_true", help="Actually perform the migration (default: dry-run)"
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-migrate existing destinations (backs the previous artifact up as *.bak.<ts>)",
+    )
     args = parser.parse_args()
 
     dry_run = not args.execute
@@ -214,12 +263,12 @@ def main():
         logger.info("=== DRY RUN (use --execute to actually migrate) ===\n")
 
     total = 0
-    total += migrate_dukascopy_xauusd(dry_run)
-    total += migrate_lean_equities_h1(dry_run)
-    total += migrate_lean_equities_m15(dry_run)
-    total += migrate_lean_equities_daily(dry_run)
-    total += migrate_stockkit_5m(dry_run)
-    total += migrate_universe(dry_run)
+    total += migrate_dukascopy_xauusd(dry_run, force=args.force)
+    total += migrate_lean_equities_h1(dry_run, force=args.force)
+    total += migrate_lean_equities_m15(dry_run, force=args.force)
+    total += migrate_lean_equities_daily(dry_run, force=args.force)
+    total += migrate_stockkit_5m(dry_run, force=args.force)
+    total += migrate_universe(dry_run, force=args.force)
 
     action = "Would migrate" if dry_run else "Migrated"
     logger.info("\n%s %d files total.", action, total)
