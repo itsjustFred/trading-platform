@@ -27,6 +27,62 @@ import pandas as pd
 import requests
 
 from data_tools.downloaders.base import Downloader, DownloadResult, SourceMeta
+
+#: Remote-artifact bounds (B3): a year of M1 rarely exceeds tens of MB —
+#: anything larger (or exploding past the de-compression cap) is hostile.
+HISTDATA_MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
+HISTDATA_MAX_CSV_BYTES = 2 * 1024 * 1024 * 1024
+
+
+def _read_histdata_zip(content: bytes, *, symbol: str, year: int) -> pd.DataFrame:
+    """Parse a histdata ZIP payload with integrity bounds (B3).
+
+    Rejects oversize archives, non-CSV/multi-entry payloads, path
+    traversals (zip slip) and decompression bombs. Logs the SHA256 so the
+    artifact is attributable.
+    """
+    import hashlib
+
+    if len(content) > HISTDATA_MAX_ARCHIVE_BYTES:
+        raise ValueError(
+            f"histdata archive for {symbol}/{year} is {len(content)} bytes "
+            f"(cap {HISTDATA_MAX_ARCHIVE_BYTES}); refusing."
+        )
+    logger.info(
+        "histdata archive sha256=%s (%d bytes) for %s/%d",
+        hashlib.sha256(content).hexdigest()[:16],
+        len(content),
+        symbol,
+        year,
+    )
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(content))
+    except zipfile.BadZipFile as exc:
+        raise ValueError(f"histdata archive for {symbol}/{year} is not a zip: {exc}") from exc
+    names = archive.namelist()
+    if len(names) != 1:
+        raise ValueError(
+            f"histdata archive for {symbol}/{year} holds {len(names)} entries "
+            f"(expected exactly one CSV): {names[:5]}"
+        )
+    csv_name = names[0]
+    if not csv_name.lower().endswith(".csv") or "/" in csv_name or "\\" in csv_name or ".." in csv_name:
+        raise ValueError(
+            f"histdata archive entry {csv_name!r} is not a plain CSV filename; refusing."
+        )
+    with archive.open(csv_name) as handle:
+        raw = handle.read(HISTDATA_MAX_CSV_BYTES + 1)
+    if len(raw) > HISTDATA_MAX_CSV_BYTES:
+        raise ValueError(
+            f"histdata CSV for {symbol}/{year} exceeds the decompression cap; refusing."
+        )
+    # histdata M1 format: YYYYMMDD HHMMSS;OPEN;HIGH;LOW;CLOSE;VOLUME
+    return pd.read_csv(
+        io.BytesIO(raw),
+        sep=";",
+        header=None,
+        names=["datetime", "open", "high", "low", "close", "volume"],
+    )
 from shared.constants import DATA_DIR
 
 logger = logging.getLogger(__name__)
@@ -214,17 +270,9 @@ class HistdataDownloader(Downloader):
                 logger.warning("Download failed for %s/%d", symbol, year)
                 return None
 
-            # Step 3: Unzip and parse CSV
-            with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
-                csv_name = zf.namelist()[0]
-                with zf.open(csv_name) as f:
-                    # histdata M1 format: YYYYMMDD HHMMSS;OPEN;HIGH;LOW;CLOSE;VOLUME
-                    df = pd.read_csv(
-                        f,
-                        sep=";",
-                        header=None,
-                        names=["datetime", "open", "high", "low", "close", "volume"],
-                    )
+            # Step 3: Unzip and parse CSV (B3: bounded remote artifact —
+            # content cap, entry allowlist incl. zip-slip guard, SHA256 log).
+            df = _read_histdata_zip(resp.content, symbol=symbol, year=year)
 
             df["timestamp"] = pd.to_datetime(
                 df["datetime"].str.strip(), format="%Y%m%d %H%M%S", utc=True

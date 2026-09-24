@@ -82,6 +82,40 @@ def _trading_minutes_between(start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> fl
     return max(total - _weekend_overlap_minutes(start_ts, end_ts), 0.0)
 
 
+def _is_trading_instant(ts: pd.Timestamp, step_minutes: float) -> bool:
+    """Whether a bar grid instant falls in trading time (pre-mortem R1).
+
+    Weekends print no bars on any venue in this repo; weekly+ grids are
+    sparse by nature and count every grid point.
+    """
+    if step_minutes >= 10080.0:
+        return True
+    return ts.weekday() < 5
+
+
+def _expected_trading_bars(
+    start_ts: pd.Timestamp, end_ts: pd.Timestamp, step_minutes: float
+) -> int:
+    """Count step-grid points in [start, end] that fall in trading time.
+
+    The old `span // step + 1` overcounted whenever the span end landed on
+    excluded time (e.g. a Mon–Sat daily segment expected 6 bars for 5
+    perfect weekday bars and failed a healthy feed).
+    """
+    if step_minutes <= 0:
+        return 0
+    span_minutes = (end_ts - start_ts).total_seconds() / 60.0
+    steps = int(span_minutes // step_minutes)
+    count = 0
+    for k in range(steps + 1):
+        instant = start_ts + pd.Timedelta(minutes=k * step_minutes)
+        if instant > end_ts:
+            break
+        if _is_trading_instant(instant, step_minutes):
+            count += 1
+    return count
+
+
 @dataclass
 class InternalGap:
     """A hole between two consecutive bars inside the stored range."""
@@ -565,8 +599,10 @@ def has_sufficient_segment_coverage(
     end_ts = pd.to_datetime(str(end or ""), utc=True, errors="coerce")
     if pd.isna(start_ts) or pd.isna(end_ts) or start_ts > end_ts:
         return False
-    span_minutes = _trading_minutes_between(start_ts, end_ts)
-    expected = max(int(span_minutes // step_minutes) + 1, 1)
+    expected = max(
+        _expected_trading_bars(start_ts, end_ts, step_minutes),
+        1,
+    )
     stamps = _segment_timestamps_in_range(symbol, normalized_timeframe, start_ts, end_ts, data_dir)
     if not stamps:
         return False

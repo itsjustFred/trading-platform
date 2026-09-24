@@ -18,7 +18,11 @@ from live_runner.account_routing import (
     validate_live_account_routes,
 )
 from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credentials
-from live_runner.base_adapter import EXIT_ONLY_RISK_SIZING_MODE, BaseLiveAdapter
+from live_runner.base_adapter import (
+    EXIT_ONLY_RISK_SIZING_MODE,
+    BaseLiveAdapter,
+    is_unbounded_tp,
+)
 from live_runner.credential_env import (
     accounts_env_mtime,
     load_accounts_env_values,
@@ -789,10 +793,7 @@ async def submit_order_with_risk(
     # ONLY exception is an explicit unbounded-take-profit policy flag set by
     # the originating processor (C1 owner decision: bounded TP or explicit
     # unbounded flag — RocketFuel exits on the opposite signal).
-    unbounded_tp = (
-        str(metadata.get("take_profit_policy") or "")
-        == "unbounded_exit_on_opposite_signal"
-    )
+    unbounded_tp = is_unbounded_tp(metadata)
     missing: list[str] = []
     if stop_loss is None:
         missing.append("stop loss")

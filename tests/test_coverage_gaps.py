@@ -391,3 +391,16 @@ class TestEnsureBacktestDataGapGate:
                 end="2024-01-20",
                 data_dir=tmp_path,
             )
+
+
+def test_segment_ending_on_weekend_counts_trading_bars_only(tmp_path):
+    """Pre-mortem R1: a Mon-Sat segment with perfect weekday data passes."""
+    stamps = pd.date_range("2024-01-01", "2024-01-05", freq="B", tz="UTC")
+    _write_bars(
+        tmp_path / "ohlcv" / "dukascopy" / "forex" / "EURUSD" / "1d.parquet",
+        [ts.isoformat() for ts in stamps],
+    )
+    assert has_sufficient_segment_coverage(
+        symbol="EURUSD", timeframe="1d",
+        start="2024-01-01", end="2024-01-06", data_dir=tmp_path,
+    )

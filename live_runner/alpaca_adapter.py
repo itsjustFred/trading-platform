@@ -14,7 +14,11 @@ from uuid import UUID
 from alpaca.trading.enums import OrderClass
 from alpaca.trading.requests import StopLossRequest, TakeProfitRequest
 
-from live_runner.base_adapter import EXIT_ONLY_RISK_SIZING_MODE, BaseLiveAdapter
+from live_runner.base_adapter import (
+    EXIT_ONLY_RISK_SIZING_MODE,
+    BaseLiveAdapter,
+    is_unbounded_tp,
+)
 from live_runner.credential_env import parse_bool_env, resolve_env_value
 from shared.database import (
     get_live_signal_broker_order_id,
@@ -532,12 +536,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         )
         # C1: explicit unbounded-take-profit policy (processor-declared) —
         # stop-only order, never an invented bracket.
-        unbounded_tp = (
-            not exit_only
-            and take_profit is None
-            and str(metadata.get("take_profit_policy") or "")
-            == "unbounded_exit_on_opposite_signal"
-        )
+        unbounded_tp = not exit_only and take_profit is None and is_unbounded_tp(metadata)
         missing = [
             name
             for name, value in (("stop_loss", stop_loss), ("take_profit", take_profit))
@@ -603,8 +602,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             not exit_only
             and isinstance(take_profit_price, float)
             and math.isnan(take_profit_price)
-            and str((signal.metadata or {}).get("take_profit_policy") or "")
-            == "unbounded_exit_on_opposite_signal"
+            and is_unbounded_tp(signal.metadata)
         )
         if unbounded_tp:
             order_class = OrderClass.OTO

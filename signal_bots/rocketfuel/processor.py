@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 import yaml
 
+from live_runner.base_adapter import UNBOUNDED_TP_POLICY
 from risk.models import TradeSignal
 from shared.constants import normalize_timeframe
 
@@ -157,7 +158,7 @@ class RocketFuelSignalProcessor:
         # C1 (owner decision): RocketFuel exits on the opposite signal, so it
         # carries no bounded take profit. That is an EXPLICIT unbounded flag,
         # never a silent None the daemon would invent a bracket for.
-        metadata["take_profit_policy"] = "unbounded_exit_on_opposite_signal"
+        metadata["take_profit_policy"] = UNBOUNDED_TP_POLICY
 
         return TradeSignal(
             action=action,

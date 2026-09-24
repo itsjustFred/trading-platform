@@ -13,7 +13,11 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-from live_runner.base_adapter import EXIT_ONLY_RISK_SIZING_MODE, BaseLiveAdapter
+from live_runner.base_adapter import (
+    EXIT_ONLY_RISK_SIZING_MODE,
+    BaseLiveAdapter,
+    is_unbounded_tp,
+)
 from live_runner.credential_env import resolve_env_value
 from shared.database import (
     find_live_signal_id_by_broker_order_id,
@@ -1843,12 +1847,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         # C1: explicit unbounded-take-profit policy (processor-declared, e.g.
         # RocketFuel exits on the opposite signal) — stop-only order, never
         # an invented bracket.
-        unbounded_tp = (
-            not exit_only
-            and take_profit is None
-            and str(metadata.get("take_profit_policy") or "")
-            == "unbounded_exit_on_opposite_signal"
-        )
+        unbounded_tp = not exit_only and take_profit is None and is_unbounded_tp(metadata)
         if stop_loss is None or (take_profit is None and not unbounded_tp):
             if exit_only:
                 # Exit-only orders close an existing position; they reduce
