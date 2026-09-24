@@ -3775,6 +3775,16 @@ def test_unbounded_tp_policy_builds_stop_only_requests() -> None:
     assert request.relativeTakeProfit == 0
 
 
+def test_is_unbounded_tp_rejects_non_dict_metadata() -> None:
+    """C1: the unbounded-TP guard never blows up on malformed metadata."""
+    from live_runner.base_adapter import UNBOUNDED_TP_POLICY, is_unbounded_tp
+
+    assert is_unbounded_tp(None) is False
+    assert is_unbounded_tp("unbounded_exit_on_opposite_signal") is False
+    assert is_unbounded_tp({"take_profit_policy": UNBOUNDED_TP_POLICY}) is True
+    assert is_unbounded_tp({"take_profit_policy": "bounded"}) is False
+
+
 def test_processor_signal_price_attribution_is_explicit() -> None:
     """C1: processors always stamp signal_price + visible slippage."""
     import pandas as pd

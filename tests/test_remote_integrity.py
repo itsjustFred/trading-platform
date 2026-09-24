@@ -41,6 +41,15 @@ class TestHistdataZipBounds:
         with pytest.raises(ValueError, match="not a plain CSV filename"):
             _read_histdata_zip(payload, symbol="EURUSD", year=2024)
 
+    def test_non_csv_entry_rejected(self) -> None:
+        import pytest
+
+        from data_tools.downloaders.histdata_dl import _read_histdata_zip
+
+        payload = _zip_bytes({"payload.exe": b"MZ" + b"\x00" * 64})
+        with pytest.raises(ValueError, match="not a plain CSV filename"):
+            _read_histdata_zip(payload, symbol="EURUSD", year=2024)
+
     def test_oversize_archive_rejected(self, monkeypatch) -> None:
         import pytest
 
