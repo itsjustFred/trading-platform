@@ -4,11 +4,12 @@ import asyncio
 import contextlib
 import hashlib
 import inspect
+import math
 import os
 import re
 import uuid
 from collections.abc import Iterable, Mapping
-from datetime import datetime, timedelta, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -620,9 +621,8 @@ def _resolve_exit_only_target_qty(
     Both shapes must flatten the whole exposure, so the magnitudes of all
     matching rows are summed — shorts count too (a negative qty is an open
     short that an exit-only close must buy back, not a residual to ignore).
-    Rows that cannot be parsed are skipped (fail-closed: the close then
-    covers less, and a residual row is still visible on the broker), never
-    crash the close.
+    The live submission path validates every matching broker row before
+    calling this helper.
     """
     target_qty = 0.0
     for position in positions:
@@ -666,18 +666,66 @@ async def _metadata_for_exit_only_order(
     get_positions = getattr(adapter, "get_positions", None)
     if not callable(get_positions):
         raise ValueError("Exit-only signal requires broker adapter with get_positions support")
-    positions = await get_positions()
-    target_qty = _resolve_exit_only_target_qty(positions, signal.symbol)
-    if target_qty <= 0:
+    positions = list(await get_positions())
+    matching_positions = [
+        position
+        for position in positions
+        if str(position.get("symbol") or "").strip().upper() == signal.symbol.upper()
+    ]
+    quantities: list[float] = []
+    for position in matching_positions:
+        try:
+            quantity = _coerce_live_float(position.get("qty"), field_name="broker position qty")
+        except ValueError as exc:
+            raise ValueError(
+                f"Exit-only signal for {signal.symbol} received an invalid "
+                "broker position quantity."
+            ) from exc
+        if not math.isfinite(quantity) or quantity == 0:
+            raise ValueError(
+                f"Exit-only signal for {signal.symbol} received a non-positive broker position."
+            )
+        quantities.append(quantity)
+    if not quantities:
         raise ValueError(
             f"Exit-only signal received for {signal.symbol} but no position is open"
         )
+    if any(quantity < 0 for quantity in quantities) and any(
+        quantity > 0 for quantity in quantities
+    ):
+        raise ValueError(
+            f"Exit-only signal for {signal.symbol} has mixed long and short broker positions; "
+            "refusing an ambiguous close."
+        )
+    target_qty = sum(abs(quantity) for quantity in quantities)
+    for key in (
+        "qty",
+        "explicit_qty",
+        "ctrader_volume",
+        "volume",
+        "position_id",
+        "position_ids",
+        "position_count",
+    ):
+        metadata.pop(key, None)
     metadata["explicit_qty"] = float(target_qty)
     metadata["risk_sizing_mode"] = EXIT_ONLY_RISK_SIZING_MODE
-    # A short position must be closed with a BUY; keep the close side derived
-    # from the broker book instead of trusting the signal's action. The
-    # adapters read signal.action (not metadata), so the signal itself is
-    # re-stamped below by the caller's model_copy.
+    metadata["position_count"] = len(matching_positions)
+    position_ids: list[int] = []
+    for position in matching_positions:
+        raw_position_id = position.get("position_id", position.get("positionId"))
+        if raw_position_id is None:
+            continue
+        try:
+            position_id = int(raw_position_id)
+        except (TypeError, ValueError):
+            continue
+        if position_id > 0:
+            position_ids.append(position_id)
+    if len(matching_positions) == 1 and len(position_ids) == 1:
+        metadata["position_id"] = position_ids[0]
+    elif position_ids:
+        metadata["position_ids"] = position_ids
     close_action = _exit_only_close_action(positions, signal.symbol)
     metadata["action"] = close_action
     metadata["signal_action"] = signal.action

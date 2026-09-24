@@ -161,6 +161,74 @@ def test_execution_queue_overflow_requests_broker_reconciliation() -> None:
     assert adapter._reconciliation_required is True
 
 
+def test_failed_execution_event_is_requeued_and_reconciled() -> None:
+    from live_runner import ctrader_adapter as module
+
+    adapter = module.CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="1"
+    )
+    event = object()
+
+    assert adapter._requeue_execution_event(event) is True
+    assert adapter._execution_queue.get_nowait() is event
+    assert adapter._reconciliation_required is True
+    assert adapter._execution_retry_counts[id(event)] == 1
+
+
+def test_listener_requeues_a_failed_execution_before_retry(monkeypatch) -> None:
+    from live_runner import ctrader_adapter as module
+
+    adapter = module.CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="1"
+    )
+    adapter._connected = True
+    adapter._authenticated = True
+    event = object()
+    attempts = 0
+
+    async def _persist(received):
+        nonlocal attempts
+        assert received is event
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("temporary mapping failure")
+        raise asyncio.CancelledError
+
+    async def _reconcile(*, max_signals: int = 200) -> int:
+        return 0
+
+    async def _sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(adapter, "_persist_execution_event", _persist)
+    monkeypatch.setattr(adapter, "reconcile_executions", _reconcile)
+    monkeypatch.setattr(module.asyncio, "sleep", _sleep)
+    adapter._execution_queue.put_nowait(event)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(adapter.listen_executions())
+
+    assert attempts == 2
+    assert adapter._execution_retry_counts[id(event)] == 1
+
+
+def test_execution_event_requeue_is_bounded_and_defers_to_reconciliation() -> None:
+    from live_runner import ctrader_adapter as module
+
+    adapter = module.CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="1"
+    )
+    event = object()
+    for _ in range(module.EXECUTION_RETRY_LIMIT + 1):
+        adapter._requeue_execution_event(event)
+        while not adapter._execution_queue.empty():
+            adapter._execution_queue.get_nowait()
+
+    assert len(adapter._unresolved_execution_events) == 1
+    assert adapter._unresolved_execution_events[0] is event
+    assert adapter._reconciliation_required is True
+
+
 def test_stale_execution_callback_cannot_request_reconciliation() -> None:
     adapter = CTraderLiveAdapter(
         app_id="app", app_secret="secret", access_token="token", account_id="1"
@@ -176,6 +244,25 @@ def test_stale_execution_callback_cannot_request_reconciliation() -> None:
     adapter._on_message(object(), SimpleNamespace(payloadType=200))
 
     assert adapter._reconciliation_required is False
+
+
+def test_unmapped_execution_fill_is_not_acknowledged_as_persisted(monkeypatch) -> None:
+    from live_runner import ctrader_adapter as module
+
+    adapter = module.CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="1"
+    )
+    adapter._ProtoOAExecutionType = SimpleNamespace(ORDER_FILLED=1, ORDER_PARTIAL_FILL=2)
+    event = SimpleNamespace(
+        executionType=1,
+        order=SimpleNamespace(orderId=45678, clientOrderId=""),
+        deal=None,
+        HasField=lambda field: field == "order",
+    )
+    monkeypatch.setattr(module, "find_live_signal_id_by_broker_order_id", lambda *_args: None)
+
+    with pytest.raises(ValueError, match="could not be mapped"):
+        asyncio.run(adapter._persist_execution_event(event))
 
 
 def test_listener_keeps_processing_queue_when_reconciliation_fails(monkeypatch) -> None:

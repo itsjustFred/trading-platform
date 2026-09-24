@@ -37,8 +37,7 @@ class BaseLiveAdapter(ABC):
         ``qty`` is the trusted quantity channel: callers that have already run
         risk sizing (the daemon's ``submit_order_with_risk``) pass the sized
         quantity explicitly so adapters never have to trust signal metadata.
-        When ``qty`` is None (direct operator scripts), the adapter falls back
-        to sizing the signal with the shared default risk configuration.
+        Live submissions must provide a finite, positive quantity.
         """
 
     @abstractmethod

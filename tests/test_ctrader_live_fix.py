@@ -308,7 +308,9 @@ def _reconcile_response(positions: list) -> Any:
     return response
 
 
-def _reconcile_position(*, status: int, trade_side: int, symbol_id: int, volume: int):
+def _reconcile_position(
+    *, status: int, trade_side: int, symbol_id: int, volume: int, position_id: int = 0
+):
     """Build a real ProtoOAPosition payload for the reconcile response."""
     from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAPosition, ProtoOATradeData
 
@@ -317,6 +319,7 @@ def _reconcile_position(*, status: int, trade_side: int, symbol_id: int, volume:
     trade_data.volume = volume
     trade_data.tradeSide = trade_side
     position = ProtoOAPosition()
+    position.positionId = position_id
     position.positionStatus = status
     position.tradeData.CopyFrom(trade_data)
     position.price = 0.0
@@ -453,6 +456,34 @@ def test_get_positions_maps_symbol_ids_to_names(tmp_path: Path):
     assert len(positions) == 1
     assert positions[0]["symbol"] == "USDJPY"
     assert positions[0]["qty"] == 4.0
+
+
+def test_get_positions_preserves_broker_position_id(tmp_path: Path):
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAPositionStatus,
+        ProtoOATradeSide,
+    )
+
+    adapter = _make_reconcile_adapter(
+        tmp_path,
+        _reconcile_response(
+            [
+                _reconcile_position(
+                    status=ProtoOAPositionStatus.POSITION_STATUS_OPEN,
+                    trade_side=ProtoOATradeSide.BUY,
+                    symbol_id=1,
+                    volume=5000,
+                    position_id=77,
+                )
+            ]
+        ),
+    )
+    adapter._symbol_name_to_id = {"EURUSD": 1}
+
+    positions = _run_get_positions(adapter)
+
+    assert positions[0]["position_id"] == 77
+    assert adapter._position_ids_by_symbol["EURUSD"] == (77,)
 
 
 def test_get_positions_falls_back_to_raw_id_for_unknown_symbol(tmp_path: Path):
