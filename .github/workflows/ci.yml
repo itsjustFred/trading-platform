@@ -18,7 +18,7 @@ jobs:
       - name: Install uv
         run: pip install uv
       - name: Sync dependencies
-        run: uv sync --frozen
+        run: uv sync --frozen --extra dev
       # Advisory until the legacy debt is cleared (1144 pre-existing
       # findings on main): new code is held to ruff-parity with main in
       # review instead of a repo-wide gate that can never pass.
