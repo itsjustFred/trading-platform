@@ -114,6 +114,13 @@ def _risk_adjusted_metric_value(
         max_dd = 0.0
     if not math.isfinite(max_dd):
         max_dd = 0.0
+    # Pre-mortem T3: stats publish drawdown as a FRACTION (e.g. 0.05, not
+    # 5.0). Percent-scale input would silently zero every trial via the
+    # min(max_dd, 1.0) clamp — fail loud instead.
+    if max_dd > 1.0:
+        raise ValueError(
+            f"max_drawdown_pct {max_dd} looks percent-scaled; expected a fraction <= 1.0."
+        )
     sparsity = min(1.0, trade_count / max(int(min_trades_for_full_credit), 1))
     drawdown_factor = max(0.0, 1.0 - min(max_dd, 1.0) * max(drawdown_penalty_weight, 0.0))
     terms = {"sparsity_factor": sparsity, "drawdown_factor": drawdown_factor}

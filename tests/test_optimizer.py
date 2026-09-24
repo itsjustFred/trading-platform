@@ -760,6 +760,21 @@ class TestRiskAdjustedObjective:
             )
             assert value == 1.5
 
+    def test_percent_scaled_drawdown_fails_loud(self) -> None:
+        import pytest
+
+        from runner.optimizer import _risk_adjusted_metric_value
+
+        # Pre-mortem T3: percent-scale drawdown must raise, not silently
+        # zero the trial via the fraction clamp.
+        with pytest.raises(ValueError, match="percent-scaled"):
+            _risk_adjusted_metric_value(
+                100.0,
+                {"total_trades": 30, "max_drawdown_pct": -40.0},
+                metric_key="total_pnl",
+                direction="maximize",
+            )
+
     def test_embargo_separates_train_and_test(self) -> None:
         from datetime import datetime
 
