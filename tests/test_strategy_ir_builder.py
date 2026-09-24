@@ -77,3 +77,13 @@ def test_build_strategy_ir_marks_unknown_engine_hint():
     )
 
     assert strategy_ir.engine_hint == EngineHint.UNKNOWN
+
+
+def test_exit_kind_ignores_substring_matches() -> None:
+    """C6: "laptop" is not a take-profit; word boundaries decide."""
+    from runner.strategy_ir.builder import _infer_exit_kind
+    from runner.strategy_ir.models import ExitSignalKind
+
+    assert _infer_exit_kind("close the laptop lid") == ExitSignalKind.CLOSE
+    assert _infer_exit_kind("take profit at 110") == ExitSignalKind.TAKE_PROFIT
+    assert _infer_exit_kind("exit on tps cascade") == ExitSignalKind.CLOSE

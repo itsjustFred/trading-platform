@@ -55,10 +55,11 @@ def _strategy_meta_from_ir(strategy_ir: StrategyIR) -> dict[str, Any]:
 
 
 def _indicator_defaults(indicator: IndicatorRef) -> tuple[str, int]:
-    # Heuristic: the FIRST positive numeric param (alphabetically by key) is
-    # taken as the indicator's window. This assumes each IR indicator carries
-    # at most one positive numeric param; adding a second one (e.g. "smooth")
-    # silently changes which value is used as the window.
+    # C6: explicit window mapping with loud failure. A single positive
+    # numeric param is unambiguous; MULTIPLE candidates (e.g. "window" plus
+    # "smooth") raise instead of silently picking the alphabetical first.
+    # No numeric params fall back to the documented default window=14.
+    candidates: list[tuple[str, int]] = []
     for key in sorted(indicator.params):
         value = indicator.params[key]
         if isinstance(value, bool):
@@ -66,9 +67,52 @@ def _indicator_defaults(indicator: IndicatorRef) -> tuple[str, int]:
         if isinstance(value, (int, float)):
             window = int(value)
             if window > 0:
-                return str(key), window
-
+                candidates.append((str(key), window))
+    if len(candidates) > 1:
+        raise ValueError(
+            f"Ambiguous window for indicator {indicator.name!r}: "
+            f"{[key for key, _ in candidates]} all look like windows. "
+            "Declare the window explicitly instead of relying on guessing."
+        )
+    if candidates:
+        return candidates[0]
     return "window", 14
+
+
+def _select_signal_roles(
+    indicators: list[IndicatorRef],
+) -> tuple[IndicatorRef | None, IndicatorRef | None]:
+    """Resolve primary/secondary signal roles (C6).
+
+    Explicit `role == "primary"/"secondary"` declarations win; contradictory
+    declarations (two primaries, or one indicator as both) fail loudly.
+    With no declarations at all, the legacy alphabetical fallback applies
+    (documented, not silent — callers see the emitted slugs).
+    """
+    by_role: dict[str, list[IndicatorRef]] = {}
+    for indicator in indicators:
+        role = str(indicator.role or "").strip().lower()
+        if role in {"primary", "secondary"}:
+            by_role.setdefault(role, []).append(indicator)
+    primaries = by_role.get("primary", [])
+    secondaries = by_role.get("secondary", [])
+    if len(primaries) > 1:
+        raise ValueError(
+            "Multiple indicators declare role 'primary': "
+            f"{[item.name for item in primaries]}"
+        )
+    if len(secondaries) > 1:
+        raise ValueError(
+            "Multiple indicators declare role 'secondary': "
+            f"{[item.name for item in secondaries]}"
+        )
+    primary = primaries[0] if primaries else None
+    secondary = secondaries[0] if secondaries else None
+    if primary is not None and secondary is not None and primary is secondary:
+        raise ValueError(
+            f"Indicator {primary.name!r} declares both primary and secondary roles"
+        )
+    return primary, secondary
 
 
 def _untranslatable(text: str, *, source: str) -> NoReturn:
@@ -168,15 +212,20 @@ def generate_vectorbt_strategy_code(strategy_ir: StrategyIR) -> str:
             }
         )
 
+    declared_primary, declared_secondary = _select_signal_roles(
+        [indicator for indicator in indicators]
+    )
+    by_name = {spec["label"]: spec for spec in indicator_specs}
     primary_signal = "close"
     secondary_signal = "close.shift(1)"
-    if indicator_specs:
+    if declared_primary is not None:
+        primary_signal = f"indicator_{by_name[declared_primary.name]['slug']}"
+    elif indicator_specs:
         primary_signal = f"indicator_{indicator_specs[0]['slug']}"
-        secondary_signal = (
-            f"indicator_{indicator_specs[1]['slug']}"
-            if len(indicator_specs) > 1
-            else "close.shift(1)"
-        )
+    if declared_secondary is not None:
+        secondary_signal = f"indicator_{by_name[declared_secondary.name]['slug']}"
+    elif len(indicator_specs) > 1 and declared_primary is None:
+        secondary_signal = f"indicator_{indicator_specs[1]['slug']}"
 
     entry_expressions = _entry_rule_expressions(
         strategy_ir.entry_conditions,

@@ -80,3 +80,25 @@ def test_resolve_codegen_route_disables_legacy_fallback_in_ir_only_mode():
     assert route.generator is _demo_generator
     assert route.rollout_mode == "ir-only"
     assert route.allow_legacy_fallback is False
+
+
+def test_unknown_rollout_mode_fails_closed() -> None:
+    """C6: unknown modes never silently fall back to ir-first."""
+    import pytest
+
+    from runner.strategy_ir.routing import _normalize_rollout_mode
+
+    with pytest.raises(ValueError, match="Unknown rollout mode"):
+        _normalize_rollout_mode("turbo")
+
+
+def test_ir_only_without_ir_or_generator_raises() -> None:
+    """C6: ir-only degrades loudly instead of sliding into legacy."""
+    import pytest
+
+    from runner.strategy_ir.routing import resolve_codegen_route
+
+    with pytest.raises(ValueError, match="requires a StrategyIR"):
+        resolve_codegen_route(
+            engine="vectorbt", strategy_ir=None, generators={}, rollout_mode="ir-only"
+        )

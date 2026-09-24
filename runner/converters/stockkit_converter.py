@@ -107,9 +107,13 @@ def _build_trades(rows: list[dict], strategy_name: str) -> list[Trade]:
             exit_time_str = row["Exit Time"].strip()
             entry_price = float(row["Entry Price"])
             exit_price = float(row["Exit Price"])
-            qty_total = int(row["Qty Total"])
-            qty_tp1 = int(row["Qty TP1"])
-            qty_runner = int(row["Qty Runner"])
+            # C6: fractional quantities — int() truncation silently shrank
+            # partial fills.
+            qty_total = float(row["Qty Total"])
+            qty_tp1 = float(row["Qty TP1"])
+            qty_runner = float(row["Qty Runner"])
+            if qty_total <= 0:
+                raise ValueError(f"non-positive Qty Total: {row['Qty Total']!r}")
             tp1_reached = row["TP1 Reached"].strip().lower() == "yes"
             tp1_price = float(row[TP1_PRICE_COLUMN]) if row[TP1_PRICE_COLUMN].strip() else None
             exit_reason = row["Exit Reason"].strip()
@@ -133,9 +137,12 @@ def _build_trades(rows: list[dict], strategy_name: str) -> list[Trade]:
 
                 exits.append(
                     TradeExit(
-                        time="",  # exact TP1 time unknown
+                        # C6: the exact TP1 time is unknown, but an empty
+                        # timestamp breaks downstream sort/match worse — use
+                        # the exit time as the documented estimate.
+                        time=exit_dt,
                         price=round(tp1_price, 6),
-                        quantity=qty_tp1,
+                        quantity=round(qty_tp1, 4),
                         pnl=round(tp1_pnl, 2),
                         reason="TP1",
                     )
@@ -144,7 +151,7 @@ def _build_trades(rows: list[dict], strategy_name: str) -> list[Trade]:
                     TradeExit(
                         time=exit_dt,
                         price=round(exit_price, 6),
-                        quantity=qty_runner,
+                        quantity=round(qty_runner, 4),
                         pnl=round(runner_pnl, 2),
                         reason=exit_reason,
                     )
@@ -155,7 +162,7 @@ def _build_trades(rows: list[dict], strategy_name: str) -> list[Trade]:
                     TradeExit(
                         time=exit_dt,
                         price=round(exit_price, 6),
-                        quantity=qty_total,
+                        quantity=round(qty_total, 4),
                         pnl=round(total_pnl, 2),
                         reason=exit_reason,
                     )
@@ -167,11 +174,15 @@ def _build_trades(rows: list[dict], strategy_name: str) -> list[Trade]:
                 direction=direction,
                 entry_time=entry_dt,
                 entry_price=round(entry_price, 6),
-                quantity=qty_total,
+                quantity=round(qty_total, 4),
                 exits=exits,
                 pnl=round(total_pnl, 2),
-                fees=round(slippage, 4),
+                # C6: slippage is a separate cost leg, not a fee — fees
+                # stay 0.0 and slippage rides in meta (as-reported PnL basis
+                # preserved verbatim).
+                fees=0.0,
                 tags=["stockkit", strategy_name],
+                meta={"slippage": round(slippage, 4)},
             )
             trades.append(trade)
 
@@ -183,9 +194,18 @@ def _build_trades(rows: list[dict], strategy_name: str) -> list[Trade]:
 
 
 def _parse_datetime(date_str: str, time_str: str) -> str:
-    """Parse stockkit date/time to ISO format."""
+    """Parse stockkit date/time to ISO format (C6).
+
+    Naive values are stamped UTC (the CSV carries no zone); unparseable
+    values RAISE so the caller skips the row loudly instead of smuggling a
+    raw f-string downstream into sort/match.
+    """
     try:
         dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M:%S")
-        return dt.replace(tzinfo=timezone.utc).isoformat()
     except ValueError:
-        return f"{date_str}T{time_str}"
+        # One retry for date-only values (midnight UTC, documented).
+        try:
+            dt = datetime.strptime(date_str.strip(), "%Y-%m-%d")
+        except ValueError:
+            raise ValueError(f"unparsable stockkit datetime: {date_str!r} {time_str!r}")
+    return dt.replace(tzinfo=timezone.utc).isoformat()

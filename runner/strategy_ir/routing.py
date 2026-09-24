@@ -13,6 +13,8 @@ IR_ROLLOUT_MODES = frozenset({"legacy", "ir-first", "ir-only"})
 
 
 def _normalize_rollout_mode(rollout_mode: str | None) -> str:
+    # C6: unknown modes fail closed — silently falling back to ir-first
+    # sent unconfigured traffic down an unreviewed path.
     normalized = (rollout_mode or "").strip().lower()
     if normalized in {"", "default"}:
         return IR_ROLLOUT_DEFAULT
@@ -24,7 +26,10 @@ def _normalize_rollout_mode(rollout_mode: str | None) -> str:
         return "ir-only"
     if normalized in IR_ROLLOUT_MODES:
         return normalized
-    return IR_ROLLOUT_DEFAULT
+    raise ValueError(
+        f"Unknown rollout mode {rollout_mode!r}; expected one of "
+        f"{sorted(IR_ROLLOUT_MODES)} (or a documented alias)."
+    )
 
 
 @dataclass(frozen=True)
@@ -63,6 +68,12 @@ def resolve_codegen_route(
     allow_legacy_fallback = normalized_rollout_mode != "ir-only"
 
     if strategy_ir is None:
+        if not allow_legacy_fallback:
+            # C6: ir-only without an IR is a hard error, not a quiet slide
+            # into legacy codegen.
+            raise ValueError(
+                "Rollout mode 'ir-only' requires a StrategyIR, got None."
+            )
         return CodegenRoute(
             use_ir_generator=False,
             first_llm_attempt=1,
@@ -73,6 +84,11 @@ def resolve_codegen_route(
 
     generator = generators.get(normalized_engine)
     if generator is None:
+        if not allow_legacy_fallback:
+            raise ValueError(
+                f"Rollout mode 'ir-only' has no registered IR generator for "
+                f"engine '{normalized_engine}'."
+            )
         return CodegenRoute(
             use_ir_generator=False,
             first_llm_attempt=1,

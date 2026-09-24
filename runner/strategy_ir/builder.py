@@ -180,17 +180,22 @@ def _entry_conditions_from_markdown(markdown_doc: str) -> list[Condition]:
     ]
 
 
+def _has_word(text: str, *words: str) -> bool:
+    """Whole-word match (C6) — substring matching mistook "laptop" for a TP."""
+    return any(re.search(rf"\b{re.escape(word)}\b", text) for word in words)
+
+
 def _infer_exit_kind(description: str) -> ExitSignalKind:
     lowered = description.lower()
-    if "stop" in lowered and "trail" in lowered:
+    if _has_word(lowered, "stop") and _has_word(lowered, "trail", "trailing"):
         return ExitSignalKind.TRAILING_STOP
-    if "stop" in lowered:
+    if _has_word(lowered, "stop", "stop-loss", "stoploss"):
         return ExitSignalKind.STOP_LOSS
-    if "take profit" in lowered or "tp" in lowered:
+    if _has_word(lowered, "take profit", "take-profit", "takeprofit", "tp"):
         return ExitSignalKind.TAKE_PROFIT
-    if "time" in lowered:
+    if _has_word(lowered, "time", "timeout", "expiry", "expire"):
         return ExitSignalKind.TIME_EXIT
-    if "close" in lowered or "exit" in lowered:
+    if _has_word(lowered, "close", "exit", "flat", "flatten"):
         return ExitSignalKind.CLOSE
     return ExitSignalKind.CUSTOM
 

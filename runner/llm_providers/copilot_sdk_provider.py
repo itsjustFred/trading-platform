@@ -220,10 +220,20 @@ class CopilotSDKProvider:
         model: str | None = None,
         temperature: float | None = None,
         metadata: dict[str, Any] | None = None,
+        purpose: str = "codegen",
     ) -> str:
         user_prompt = str(prompt or "").strip()
         if not user_prompt:
             raise ValueError("copilot_sdk provider requires a non-empty prompt.")
+        # C6: approve_all is only valid for codegen (F27 trust posture).
+        # Any agentic reuse must replace the permission handler first —
+        # track it here instead of ignoring it.
+        if str(purpose or "").strip().lower() != "codegen":
+            raise ValueError(
+                "copilot_sdk provider refuses non-codegen purpose "
+                f"{purpose!r}: PermissionHandler.approve_all must be replaced "
+                "with a real permission handler before agentic reuse."
+            )
 
         requested_model = str(model or "").strip()
         selected_model = requested_model or self._default_model
