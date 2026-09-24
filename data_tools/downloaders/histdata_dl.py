@@ -27,6 +27,7 @@ import pandas as pd
 import requests
 
 from data_tools.downloaders.base import Downloader, DownloadResult, SourceMeta
+from shared.constants import DATA_DIR
 
 #: Remote-artifact bounds (B3): a year of M1 rarely exceeds tens of MB —
 #: anything larger (or exploding past the de-compression cap) is hostile.
@@ -66,7 +67,13 @@ def _read_histdata_zip(content: bytes, *, symbol: str, year: int) -> pd.DataFram
             f"(expected exactly one CSV): {names[:5]}"
         )
     csv_name = names[0]
-    if not csv_name.lower().endswith(".csv") or "/" in csv_name or "\\" in csv_name or ".." in csv_name:
+    bad_name = (
+        not csv_name.lower().endswith(".csv")
+        or "/" in csv_name
+        or "\\" in csv_name
+        or ".." in csv_name
+    )
+    if bad_name:
         raise ValueError(
             f"histdata archive entry {csv_name!r} is not a plain CSV filename; refusing."
         )
@@ -83,9 +90,10 @@ def _read_histdata_zip(content: bytes, *, symbol: str, year: int) -> pd.DataFram
         header=None,
         names=["datetime", "open", "high", "low", "close", "volume"],
     )
-from shared.constants import DATA_DIR
+
 
 logger = logging.getLogger(__name__)
+
 
 # histdata.com serves M1 ASCII data for these pairs (free tier)
 AVAILABLE_PAIRS = [

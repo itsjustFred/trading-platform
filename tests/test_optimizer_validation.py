@@ -495,12 +495,18 @@ class TestRiskAdjustedObjectiveWiring:
 
         monkeypatch.setattr(optimizer_module.optuna, "create_study", spy_create_study)
         monkeypatch.setattr(optimizer_module, "_run_vectorbt_backtest", fake_run_vectorbt)
-        monkeypatch.setattr(optimizer_module, "_load_base_backtest", lambda _id: _base_result(tmp_path))
         monkeypatch.setattr(
-            optimizer_module, "_resolve_strategy_reference", lambda r: ("s", Path("mock_strategy.py"), "s")
+            optimizer_module, "_load_base_backtest", lambda _id: _base_result(tmp_path)
+        )
+        monkeypatch.setattr(
+            optimizer_module,
+            "_resolve_strategy_reference",
+            lambda r: ("s", Path("mock_strategy.py"), "s"),
         )
         monkeypatch.setattr(optimizer_module, "ensure_backtest_data", lambda **kwargs: None)
-        monkeypatch.setattr(optimizer_module, "has_sufficient_segment_coverage", lambda **kwargs: True)
+        monkeypatch.setattr(
+            optimizer_module, "has_sufficient_segment_coverage", lambda **kwargs: True
+        )
 
         config = OptimizationConfig(
             base_backtest_id="bt_x",
