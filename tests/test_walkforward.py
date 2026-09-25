@@ -452,6 +452,70 @@ class _FakeEngine:
         )
 
 
+def test_walkforward_anchors_embargo_to_unpurged_training_end() -> None:
+    windows = wf_module._build_windows(
+        start="2024-01-01",
+        end="2024-06-30",
+        train_months=2,
+        test_months=1,
+        step_months=1,
+        purge_days=2,
+        embargo_days=3,
+    )
+    unpurged_end = pd.Timestamp("2024-02-29T23:59:59.999999+00:00")
+    first = windows[0]
+    assert pd.Timestamp(first["train_end"]) == unpurged_end - pd.Timedelta(days=2)
+    assert pd.Timestamp(first["test_start"]) == (
+        unpurged_end + pd.Timedelta(days=3) + pd.Timedelta(microseconds=1)
+    )
+
+
+def test_daily_close_series_drops_days_without_observations() -> None:
+    series = wf_module._daily_close_series(
+        [
+            {"time": "2024-01-01T23:00:00+00:00", "equity": 100.0},
+            {"time": "2024-01-03T23:00:00+00:00", "equity": 110.0},
+        ]
+    )
+
+    assert series.index.tolist() == [
+        pd.Timestamp("2024-01-01T00:00:00+00:00"),
+        pd.Timestamp("2024-01-03T00:00:00+00:00"),
+    ]
+    assert series.tolist() == [100.0, 110.0]
+
+
+def test_aggregate_oos_metrics_skips_returns_across_missing_days() -> None:
+    curve = [
+        {"time": "2024-01-01T23:00:00+00:00", "equity": 100.0},
+        {"time": "2024-01-02T23:00:00+00:00", "equity": 110.0},
+        {"time": "2024-01-04T23:00:00+00:00", "equity": 120.0},
+        {"time": "2024-01-05T23:00:00+00:00", "equity": 132.0},
+    ]
+
+    sharpe, drawdown = wf_module._aggregate_oos_metrics(
+        [{"oos_equity_curve": curve}]
+    )
+
+    assert sharpe == pytest.approx(0.0)
+    assert drawdown == pytest.approx(0.0)
+
+
+def test_aggregate_oos_metrics_keeps_returns_across_weekends() -> None:
+    curve = [
+        {"time": "2024-01-05T23:00:00+00:00", "equity": 100.0},
+        {"time": "2024-01-08T23:00:00+00:00", "equity": 110.0},
+        {"time": "2024-01-09T23:00:00+00:00", "equity": 121.0},
+    ]
+
+    sharpe, drawdown = wf_module._aggregate_oos_metrics(
+        [{"oos_equity_curve": curve}]
+    )
+
+    assert sharpe == pytest.approx(0.0)
+    assert drawdown == pytest.approx(0.0)
+
+
 def test_aggregate_oos_metrics_uses_daily_closes_and_epoch_seconds() -> None:
     curve = [
         {"time": 1_703_980_800, "equity": 100.0},

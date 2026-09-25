@@ -340,6 +340,14 @@ class TestSegmentCoverageWeekends:
 class TestValidateHolidayCalendar:
     """B3: NYSE holidays are not data holes (equity-like paths only)."""
 
+    def test_weekend_boundary_rejects_more_than_three_calendar_days(self) -> None:
+        from data_tools.validate import _weekend_boundary
+
+        assert not _weekend_boundary(
+            pd.Timestamp("2024-01-05T20:00:00Z"),
+            pd.Timestamp("2024-01-09T02:00:00Z"),
+        )
+
     def _write_equity_bars(self, root: Path, timestamps: list[str]) -> Path:
         import pandas as pd
 

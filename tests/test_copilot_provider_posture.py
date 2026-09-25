@@ -113,11 +113,10 @@ def test_cli_provider_reads_the_assistant_message_event_from_jsonl(monkeypatch):
     [
         "raw generated response",
         '{"content":"generated"}',
-        '{"type":"unknown.event","data":{"content":"generated"}}',
         '["generated"]',
     ],
 )
-def test_cli_provider_rejects_raw_or_unknown_json_envelopes(monkeypatch, stdout):
+def test_cli_provider_rejects_raw_or_malformed_json_envelopes(monkeypatch, stdout):
     provider = CopilotCLIProvider(executable="copilot", timeout_seconds=5)
     monkeypatch.setattr(
         "subprocess.run",
@@ -125,6 +124,36 @@ def test_cli_provider_rejects_raw_or_unknown_json_envelopes(monkeypatch, stdout)
     )
 
     with pytest.raises(RuntimeError, match="JSON event envelope"):
+        provider.generate(prompt="hello")
+
+
+def test_cli_provider_skips_unknown_json_event_types(monkeypatch):
+    provider = CopilotCLIProvider(executable="copilot", timeout_seconds=5)
+    stdout = "\n".join(
+        [
+            json.dumps({"type": "future.event", "data": {"content": "ignored"}}),
+            _assistant_event("generated"),
+            json.dumps({"type": "result", "exitCode": 0}),
+        ]
+    )
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda *args, **kwargs: _completed(stdout=stdout),
+    )
+
+    assert provider.generate(prompt="hello") == "generated"
+
+
+@pytest.mark.parametrize("exit_code", [1, "0"])
+def test_cli_provider_rejects_failed_result_events(monkeypatch, exit_code):
+    provider = CopilotCLIProvider(executable="copilot", timeout_seconds=5)
+    stdout = json.dumps({"type": "result", "exitCode": exit_code})
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda *args, **kwargs: _completed(stdout=stdout),
+    )
+
+    with pytest.raises(RuntimeError, match="failed result event"):
         provider.generate(prompt="hello")
 
 
