@@ -220,6 +220,16 @@ REPLAY_MAX_BARS_PER_EVENT = (BARS_BEFORE * 2) + (BARS_AFTER * 3)
 BACKTEST_WATCHDOG_TIMEOUT_SECONDS = float(os.environ.get("BACKTEST_TIMEOUT_SECONDS", "300"))
 BACKTEST_WATCHDOG_POLL_SECONDS = 2.0
 _TASK_ID_RE = re.compile(r"^[A-Za-z0-9-]{8,64}$")
+_SINGLEFLIGHT_PERSISTED_KEYS = (
+    "download_request_key",
+    "owner_pid",
+    "owner_thread_id",
+    "owner_token",
+    "singleflight_owner_boot_id",
+    "singleflight_heartbeat_at",
+    "singleflight_lease_until",
+    "singleflight_lease_expires_at",
+)
 _TASK_LOG_WS_CHUNK_BYTES = 64 * 1024
 _TASK_LOG_WS_MAX_BYTES = 2 * 1024 * 1024
 _TASK_LOG_RESPONSE_MAX_LINES = 2000
@@ -1055,7 +1065,10 @@ async def lifespan(app: FastAPI):
     app.state.task_cache_prewarm_task = task_cache_prewarm_task
     app.state.jforex_jvm_prewarm_task = jforex_jvm_prewarm_task
     app.state.live_market_data_sync_task = live_market_data_sync_task
-    await asyncio.to_thread(mark_background_tasks_interrupted, from_statuses=["queued", "running"])
+    await asyncio.to_thread(
+        mark_background_tasks_interrupted,
+        from_statuses=["queued", "starting", "running", "paused"],
+    )
     # The hooks swap the persistence-aware task implementations onto the legacy
     # module; they MUST be installed before any helper that creates or updates
     # task records (resume below), or those writes land on the in-memory
@@ -3522,6 +3535,9 @@ def _task_config_payload(task: dict[str, Any]) -> dict[str, Any]:
     ):
         if key in task and task.get(key) is not None:
             payload[key] = _json_safe(task.get(key))
+    for key in _SINGLEFLIGHT_PERSISTED_KEYS:
+        if key in task and task.get(key) is not None:
+            payload[key] = _json_safe(task.get(key))
     return _strip_executable_command_fields(payload)
 
 
@@ -3616,10 +3632,29 @@ def _decorate_task_from_record(task_id: str, task: dict[str, Any]) -> None:
     for key in ("recovery_rejected", "recovery_mode"):
         if config_payload.get(key) is not None:
             task[key] = config_payload[key]
+    for key in _SINGLEFLIGHT_PERSISTED_KEYS:
+        if key in config_payload and key not in task:
+            task[key] = config_payload[key]
     record_history = _sanitize_progress_history(config_payload.get("progress_history"))
     if record_history:
         task["progress_history"] = record_history
     _ensure_task_runtime_metadata(task)
+
+
+def _singleflight_reservation_is_stale(
+    record: dict[str, Any], config_payload: dict[str, Any]
+) -> bool:
+    status = _task_status_or_manual(record.get("status"))
+    if status not in ACTIVE_TASK_STATUSES or not config_payload.get("download_request_key"):
+        return False
+    if str(config_payload.get("singleflight_owner_boot_id") or "") != str(
+        getattr(legacy_viewer, "SINGLEFLIGHT_BOOT_ID", "")
+    ):
+        return True
+    try:
+        return int(config_payload.get("owner_pid")) != os.getpid()
+    except (TypeError, ValueError):
+        return True
 
 
 def _build_task_from_record(record: dict[str, Any]) -> dict[str, Any]:
@@ -3627,10 +3662,20 @@ def _build_task_from_record(record: dict[str, Any]) -> dict[str, Any]:
     config_payload = dict(record.get("config_json") or {})
     total_items = int(config_payload.get("total_items", 0) or 0)
     raw_status = str(record.get("status") or "").strip().lower()
+    stale_singleflight = _singleflight_reservation_is_stale(record, config_payload)
+    if stale_singleflight:
+        raw_status = "interrupted"
     status = _task_status_or_manual(raw_status)
     status_error = None
-    if status == "manual_required" and raw_status != "manual_required":
+    if stale_singleflight:
+        status_error = "Singleflight reservation invalidated by server restart"
+        for key in _SINGLEFLIGHT_PERSISTED_KEYS:
+            config_payload.pop(key, None)
+    elif status == "manual_required" and raw_status != "manual_required":
         status_error = "Unknown persisted task status; manual review required"
+    if status not in ACTIVE_TASK_STATUSES and config_payload.get("download_request_key"):
+        for key in _SINGLEFLIGHT_PERSISTED_KEYS:
+            config_payload.pop(key, None)
     progress_detail = dict(config_payload.get("progress_detail") or {})
     progress_detail.setdefault("completed", 0)
     progress_detail.setdefault("failed", 0)
@@ -3678,6 +3723,9 @@ def _build_task_from_record(record: dict[str, Any]) -> dict[str, Any]:
         task["pid"] = config_payload.get("pid")
     if config_payload.get("downloader") is not None:
         task["downloader"] = config_payload.get("downloader")
+    for key in _SINGLEFLIGHT_PERSISTED_KEYS:
+        if key in config_payload and key not in task:
+            task[key] = config_payload[key]
     if config_payload.get("task_spec") is not None:
         task["task_spec"] = config_payload["task_spec"]
     for key in ("recovery_rejected", "recovery_mode"):
@@ -3774,61 +3822,65 @@ def _coalesced_cleanup_state_path() -> Path:
 
 
 def _load_coalesced_cleanup_state() -> dict[str, dict[str, Any]]:
-    try:
-        payload = json.loads(_coalesced_cleanup_state_path().read_text(encoding="utf-8"))
-    except (OSError, TypeError, ValueError):
-        return {}
-    if not isinstance(payload, dict):
-        return {}
-    state: dict[str, dict[str, Any]] = {}
-    for task_id, entry in payload.items():
-        normalized = str(task_id or "").strip()
-        if _TASK_ID_RE.fullmatch(normalized) is None or not isinstance(entry, dict):
-            continue
+    with _COALESCED_CLEANUP_STATE_LOCK:
         try:
-            attempts = max(0, int(entry.get("attempts", 0)))
-        except (TypeError, ValueError):
-            attempts = 0
-        state[normalized] = {
-            "attempts": attempts,
-            "exhausted": bool(entry.get("exhausted")),
-        }
-        if len(state) >= _COALESCED_CLEANUP_MAX_ENTRIES:
-            break
-    return state
+            payload = json.loads(_coalesced_cleanup_state_path().read_text(encoding="utf-8"))
+        except (OSError, TypeError, ValueError):
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+        state: dict[str, dict[str, Any]] = {}
+        for task_id, entry in payload.items():
+            normalized = str(task_id or "").strip()
+            if _TASK_ID_RE.fullmatch(normalized) is None or not isinstance(entry, dict):
+                continue
+            try:
+                attempts = max(0, int(entry.get("attempts", 0)))
+            except (TypeError, ValueError):
+                attempts = 0
+            state[normalized] = {
+                "attempts": attempts,
+                "exhausted": bool(entry.get("exhausted")),
+            }
+            if len(state) >= _COALESCED_CLEANUP_MAX_ENTRIES:
+                break
+        return state
 
 
 def _write_coalesced_cleanup_state(state: dict[str, dict[str, Any]]) -> None:
-    path = _coalesced_cleanup_state_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    write_text_atomically(path, json.dumps(state, sort_keys=True))
+    with _COALESCED_CLEANUP_STATE_LOCK:
+        path = _coalesced_cleanup_state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_text_atomically(path, json.dumps(state, sort_keys=True))
 
 
 def _update_coalesced_cleanup_state(
     task_id: str, *, attempts: int, exhausted: bool
 ) -> None:
-    state = _load_coalesced_cleanup_state()
-    state[task_id] = {
-        "attempts": max(0, int(attempts)),
-        "exhausted": bool(exhausted),
-    }
-    while len(state) > _COALESCED_CLEANUP_MAX_ENTRIES:
-        state.pop(next(iter(state)))
-    _write_coalesced_cleanup_state(state)
+    with _COALESCED_CLEANUP_STATE_LOCK:
+        state = _load_coalesced_cleanup_state()
+        state[task_id] = {
+            "attempts": max(0, int(attempts)),
+            "exhausted": bool(exhausted),
+        }
+        while len(state) > _COALESCED_CLEANUP_MAX_ENTRIES:
+            state.pop(next(iter(state)))
+        _write_coalesced_cleanup_state(state)
 
 
 def _clear_coalesced_cleanup_state(task_id: str) -> None:
-    state = _load_coalesced_cleanup_state()
-    if task_id not in state:
-        return
-    state.pop(task_id, None)
-    if state:
-        _write_coalesced_cleanup_state(state)
-        return
-    try:
-        _coalesced_cleanup_state_path().unlink(missing_ok=True)
-    except OSError:
-        pass
+    with _COALESCED_CLEANUP_STATE_LOCK:
+        state = _load_coalesced_cleanup_state()
+        if task_id not in state:
+            return
+        state.pop(task_id, None)
+        if state:
+            _write_coalesced_cleanup_state(state)
+            return
+        try:
+            _coalesced_cleanup_state_path().unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _is_coalesced_cleanup_marker(record: dict[str, Any]) -> bool:
@@ -4626,7 +4678,7 @@ def _serialize_live_account_payload(account: Any) -> dict[str, Any]:
 
 
 def _serialize_live_deployment_payload(deployment: LiveDeploymentConfig) -> dict[str, Any]:
-    return {
+    payload = {
         "id": str(deployment.id),
         "strategy_name": deployment.strategy_name,
         "account_id": deployment.account_id,
@@ -4640,10 +4692,12 @@ def _serialize_live_deployment_payload(deployment: LiveDeploymentConfig) -> dict
         "signal_config": deployment.signal_config,
         "settings": deployment.settings,
     }
+    safe_payload = redact_value(payload)
+    return safe_payload if isinstance(safe_payload, dict) else {}
 
 
 def _serialize_service_payload(service: Service) -> dict[str, Any]:
-    return {
+    payload = {
         "id": str(service.id),
         "name": service.name,
         "type": service.type.value,
@@ -4652,6 +4706,8 @@ def _serialize_service_payload(service: Service) -> dict[str, Any]:
         "last_activity": service.last_activity.isoformat() if service.last_activity else None,
         "created_at": service.created_at.isoformat(),
     }
+    safe_payload = redact_value(payload)
+    return safe_payload if isinstance(safe_payload, dict) else {}
 
 
 def _discover_live_accounts_payload() -> list[dict[str, Any]]:

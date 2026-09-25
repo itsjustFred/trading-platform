@@ -10,6 +10,7 @@ import {
 } from "lucide-react";
 
 import { resampleData } from "../api/client";
+import { isTerminalTaskStatus } from "../lib/taskStatus";
 import { LiveTerminal } from "./LiveTerminal";
 import { Modal } from "./Modal";
 
@@ -27,7 +28,7 @@ export function renderTaskStatusIcon(
   if (status === "completed") {
     return <CheckCircle2 size={size} color={STATUS_ICON_COLORS.ok} />;
   }
-  if (status === "failed") {
+  if (isTerminalTaskStatus(status)) {
     return <XCircle size={size} color={STATUS_ICON_COLORS.failed} />;
   }
   return (
@@ -81,8 +82,10 @@ export function ResampleModal({
     if (!jobId || completionNotified) {
       return;
     }
-    if (jobStatus === "completed" || jobStatus === "failed") {
-      onTaskFinished?.(jobStatus, jobId);
+    if (isTerminalTaskStatus(jobStatus)) {
+      if (jobStatus === "completed" || jobStatus === "failed") {
+        onTaskFinished?.(jobStatus, jobId);
+      }
       setCompletionNotified(true);
     }
   }, [completionNotified, jobId, jobStatus, onTaskFinished]);
@@ -347,7 +350,7 @@ export function ResampleModal({
                 Keep this open if you want to tail the job output to completion.
               </div>
               <div style={{ display: "flex", gap: "10px" }}>
-                {(jobStatus === "completed" || jobStatus === "failed") && (
+                {isTerminalTaskStatus(jobStatus) && (
                   <button
                     type="button"
                     onClick={resetStream}
@@ -383,7 +386,7 @@ export function ResampleModal({
                     fontWeight: 700,
                   }}
                 >
-                  {jobStatus === "completed" || jobStatus === "failed"
+                  {isTerminalTaskStatus(jobStatus)
                     ? "Close terminal"
                     : "Hide terminal"}
                   <ArrowRight size={15} />

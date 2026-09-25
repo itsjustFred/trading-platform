@@ -73,26 +73,28 @@ _SENSITIVE_VALUE_RE = re.compile(
     r"github[_-]?token|password|passwd|private[_-]?key|refresh[_-]?token|"
     r"secret|session[_-]?id|webhook|(?:^|[^a-z])token(?:[^a-z]|$))"
 )
+_SENSITIVE_KEY_PATTERN = (
+    r"(?:access[_-]?token|api[_-]?key|apikey|app[_-]?secret|broker[_-]?login|"
+    r"cookie|credential|dsn|github[_-]?token|password|passwd|private[_-]?key|"
+    r"refresh[_-]?token|secret(?:[_-]?key)?|session(?:[_-]?id)?|token|webhook|"
+    r"client[_-]?secret)"
+)
 _SENSITIVE_QUERY_RE = re.compile(
-    r"(?i)([?&](?:access_token|accessToken|api_key|apiKey|apikey|broker_login|"
-    r"brokerLogin|credential|dsn|key|password|refresh_token|refreshToken|secret|"
-    r"session|sessionId|token)=)([^&#\s]+)"
+    r"(?i)([?&](?:access_token|accessToken|api_key|apiKey|apikey|app_secret|"
+    r"appSecret|broker_login|brokerLogin|credential|dsn|key|password|refresh_token|"
+    r"refreshToken|secret|secret_key|secretKey|session|sessionId|token)=)([^&#\s]+)"
 )
 _SENSITIVE_ASSIGNMENT_RE = re.compile(
-    r"(?i)([\"']?(?:access_token|accessToken|api_key|apiKey|apikey|app_secret|"
-    r"appSecret|broker_login|brokerLogin|cookie|credential|dsn|github_token|"
-    r"githubToken|password|private_key|privateKey|refresh_token|refreshToken|secret|"
-    r"session|sessionId|token|webhook)[\"']?\s*[:=]\s*[\"']?)([^\"',;&\s}]+)"
+    rf"(?i)([\"']?(?:{_SENSITIVE_KEY_PATTERN})[\"']?\s*[:=]\s*[\"']?)"
+    rf"([^\"',;&\s}}]+)"
 )
 _SENSITIVE_QUOTED_ASSIGNMENT_RE = re.compile(
-    r"(?i)(?P<prefix>[\"']?(?:access_token|accessToken|api_key|apiKey|apikey|"
-    r"app_secret|appSecret|broker_login|brokerLogin|cookie|credential|dsn|"
-    r"github_token|githubToken|password|private_key|privateKey|refresh_token|"
-    r"refreshToken|secret|session|sessionId|token|webhook)[\"']?\s*[:=]\s*)"
-    r"(?P<quote>[\"'])(?P<value>.*?)(?P=quote)"
+    rf"(?i)(?P<prefix>[\"']?(?:{_SENSITIVE_KEY_PATTERN}|authorization)[\"']?\s*[:=]\s*)"
+    rf"(?P<quote>[\"'])(?P<value>.*?)(?P=quote)"
 )
 _AUTHORIZATION_RE = re.compile(
-    r"(?i)(authorization\s*[:=]\s*)(bearer|basic)\s+[^\s,;]+"
+    r"(?i)(\bauthorization\s*[:=]\s*)(?![\"'])"
+    r"(?:(?P<scheme>[A-Za-z][A-Za-z0-9_-]*)\s+)?(?P<value>[^\r\n]*)"
 )
 _BEARER_TOKEN_RE = re.compile(r"(?i)\bbearer\s+[a-z0-9._~+/=-]+")
 _PRIVATE_KEY_RE = re.compile(r"(?is)-----BEGIN [^-]+-----.*?-----END [^-]+-----")
@@ -109,21 +111,33 @@ def _is_sensitive_key(key: object) -> bool:
     return any(marker in normalized for marker in _SENSITIVE_KEY_PARTS)
 
 
+def _redact_authorization(match: re.Match[str]) -> str:
+    prefix = match.group(1)
+    scheme = match.group("scheme")
+    value = match.group("value")
+    if scheme and scheme.lower() == "bearer":
+        parts = value.split(maxsplit=1)
+        token = parts[0] if parts else ""
+        suffix = value[len(token) :]
+        return f"{prefix}{scheme} {_REDACTED}{suffix}"
+    return f"{prefix}{scheme + ' ' if scheme else ''}{_REDACTED}"
+
+
 def redact_text(value: object) -> str:
     try:
         raw = str(value)
     except Exception:
         return "[Unserializable]"
-    redacted = _AUTHORIZATION_RE.sub(r"\1\2 [Filtered]", raw)
-    redacted = _BEARER_TOKEN_RE.sub("Bearer [Filtered]", redacted)
-    redacted = _SENSITIVE_QUERY_RE.sub(r"\1[Filtered]", redacted)
     redacted = _SENSITIVE_QUOTED_ASSIGNMENT_RE.sub(
         lambda match: (
             f"{match.group('prefix')}{match.group('quote')}"
             f"{_REDACTED}{match.group('quote')}"
         ),
-        redacted,
+        raw,
     )
+    redacted = _AUTHORIZATION_RE.sub(_redact_authorization, redacted)
+    redacted = _BEARER_TOKEN_RE.sub("Bearer [Filtered]", redacted)
+    redacted = _SENSITIVE_QUERY_RE.sub(r"\1[Filtered]", redacted)
     redacted = _SENSITIVE_ASSIGNMENT_RE.sub(r"\1[Filtered]", redacted)
     redacted = _PRIVATE_KEY_RE.sub("[Filtered private key]", redacted)
     for pattern in _TOKEN_VALUE_RES:

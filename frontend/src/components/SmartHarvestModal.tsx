@@ -3,6 +3,7 @@ import type { CSSProperties } from "react";
 import { ArrowRight, RotateCcw, Sparkles } from "lucide-react";
 
 import { harvestData } from "../api/client";
+import { isTerminalTaskStatus } from "../lib/taskStatus";
 import { LiveTerminal } from "./LiveTerminal";
 import { Modal } from "./Modal";
 import { renderTaskStatusIcon } from "./ResampleModal";
@@ -55,8 +56,10 @@ export function SmartHarvestModal({
     if (!jobId || completionNotified) {
       return;
     }
-    if (jobStatus === "completed" || jobStatus === "failed") {
-      onTaskFinished?.(jobStatus, jobId);
+    if (isTerminalTaskStatus(jobStatus)) {
+      if (jobStatus === "completed" || jobStatus === "failed") {
+        onTaskFinished?.(jobStatus, jobId);
+      }
       setCompletionNotified(true);
     }
   }, [completionNotified, jobId, jobStatus, onTaskFinished]);
@@ -371,7 +374,7 @@ export function SmartHarvestModal({
                 persistence status.
               </div>
               <div style={{ display: "flex", gap: "10px" }}>
-                {(jobStatus === "completed" || jobStatus === "failed") && (
+                {isTerminalTaskStatus(jobStatus) && (
                   <button
                     type="button"
                     onClick={resetStream}
@@ -407,7 +410,7 @@ export function SmartHarvestModal({
                     fontWeight: 700,
                   }}
                 >
-                  {jobStatus === "completed" || jobStatus === "failed"
+                  {isTerminalTaskStatus(jobStatus)
                     ? "Close terminal"
                     : "Hide terminal"}
                   <ArrowRight size={15} />

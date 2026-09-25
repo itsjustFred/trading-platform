@@ -4,7 +4,10 @@ import { ArrowUpRight, Target, Telescope } from "lucide-react";
 
 import { getOptimizations } from "../api/client";
 import type { OptimizationSummary } from "../api/types";
-import { classifyOptimizationOosEvidence } from "../lib/optimizationEvidence";
+import {
+  classifyOptimizationOosEvidence,
+  resolveCompatibleInSampleValue,
+} from "../lib/optimizationEvidence";
 
 function formatMetricValue(metric: string, value: number | string | boolean | null | undefined) {
   if (typeof value !== "number") {
@@ -204,9 +207,20 @@ export function OptimizationsPage() {
               optimization.target_metric === "net_profit" ? "total_pnl" : optimization.target_metric,
               optimization.best_value,
             );
+            const compatibleMetric = optimization.oos_comparison ?? {
+              metric_key: optimization.best_metric_key,
+              in_sample_value: optimization.best_raw_value,
+              compatible:
+                optimization.best_metric_key != null &&
+                optimization.best_raw_value != null,
+            };
+            const compatibleInSampleValue = resolveCompatibleInSampleValue(
+              optimization.target_metric,
+              compatibleMetric,
+            );
             const oosEvidence = classifyOptimizationOosEvidence(
               optimization.target_metric,
-              optimization.best_value,
+              compatibleInSampleValue,
               optimization.test_stats,
               optimization.oos_status ?? "unavailable",
             );

@@ -99,3 +99,27 @@ def test_redact_value_handles_camel_case_sensitive_keys():
     redacted = redact_value({"apiKey": "key-secret", "refreshToken": "token-secret"})
 
     assert redacted == {"apiKey": "[Filtered]", "refreshToken": "[Filtered]"}
+
+
+def test_redact_text_handles_secret_key_and_authorization_values():
+    from shared.logging import redact_text
+
+    cases = {
+        "secret_key=secret-key-value": "secret-key-value",
+        "app_secret: app-secret-value": "app-secret-value",
+        "secretKey=secret-camel-value": "secret-camel-value",
+        "Authorization: Basic basic-auth-value": "basic-auth-value",
+        "Authorization: Token token-auth-value": "token-auth-value",
+        "Authorization: Digest username=digest-user, response=digest-response": "digest-user",
+    }
+
+    for raw, secret in cases.items():
+        redacted = redact_text(raw)
+        assert secret not in redacted
+    assert "Basic [Filtered]" in redact_text("Authorization: Basic basic-auth-value")
+    assert "Token [Filtered]" in redact_text("Authorization: Token token-auth-value")
+    digest_redacted = redact_text(
+        "Authorization: Digest username=digest-user, response=digest-response"
+    )
+    assert "digest-user" not in digest_redacted
+    assert "digest-response" not in digest_redacted

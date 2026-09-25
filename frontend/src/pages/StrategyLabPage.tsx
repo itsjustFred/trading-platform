@@ -4,6 +4,7 @@ import { Bot, Sparkles, Wand2 } from "lucide-react";
 import { startAgentConvert } from "../api/client";
 import type { AgentModelId, AgentProviderId } from "../api/types";
 import { LiveTerminal } from "../components/LiveTerminal";
+import { isTerminalTaskStatus } from "../lib/taskStatus";
 
 const sampleCode = `//@version=5
 strategy("Impulse Cross", overlay=true)
@@ -91,6 +92,7 @@ export function StrategyLabPage() {
   const statusTone = useMemo(() => {
     if (jobStatus === "completed") return "#86efac";
     if (jobStatus === "failed" || jobStatus === "disconnected") return "#fca5a5";
+    if (isTerminalTaskStatus(jobStatus)) return "#fbbf24";
     if (jobStatus === "running" || jobStatus === "starting") return "#67e8f9";
     return "rgba(196, 181, 253, 0.9)";
   }, [jobStatus]);

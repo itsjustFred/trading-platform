@@ -93,13 +93,20 @@ def any_matrix_process_running() -> bool:
         return False
 
 
+def _lock_metadata_path() -> Path:
+    return LOCK_PATH.with_name(f"{LOCK_PATH.name}.metadata")
+
+
 def acquire_lock() -> bool:
     """Take the queue lock for this process."""
     MATRIX_DIR.mkdir(parents=True, exist_ok=True)
     lock = FileLock(str(LOCK_PATH))
     try:
         lock.acquire(timeout=0)
-        LOCK_PATH.write_text(now_iso() + "\n", encoding="utf-8")
+        _lock_metadata_path().write_text(
+            json.dumps({"pid": os.getpid(), "acquired_at": now_iso()}) + "\n",
+            encoding="utf-8",
+        )
     except Timeout:
         return False
     except OSError:

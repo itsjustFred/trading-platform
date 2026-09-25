@@ -95,8 +95,19 @@ test("batch maintenance pages use item-aware result notices", async () => {
   }
 });
 
-test("manual-required and cleanup statuses are terminal, not active", () => {
+test("portfolio remove-empty requires confirmation before calling the API", async () => {
+  const source = await read("../src/pages/PortfoliosPage.tsx");
+  const start = source.indexOf("const handleRemoveEmpty");
+  const end = source.indexOf("const inputStyle", start);
+  assert.ok(start >= 0 && end > start);
+  assert.match(source.slice(start, end), /window\.confirm\(/);
+  assert.match(source.slice(start, end), /if \(!confirmed\) return;/);
+});
+
+test("manual-required, partial, skipped, and cleanup statuses are terminal, not active", () => {
   for (const status of [
+    "partial",
+    "skipped",
     "manual_required",
     "cleanup_pending",
     "cleanup_exhausted",
@@ -124,4 +135,19 @@ test("task hub and live terminal use the shared terminal classification", async 
   assert.match(taskHub, /isFailedTaskStatus\(status\)/);
   assert.match(liveTerminal, /!taskFinished/);
   assert.match(liveTerminal, /isTerminalTaskStatus\(taskStatus\)/);
+});
+
+test("data management polling and terminal labels use shared classification", async () => {
+  const [dataManagement, resample, download, harvest] = await Promise.all([
+    read("../src/pages/DataManagementPage.tsx"),
+    read("../src/components/ResampleModal.tsx"),
+    read("../src/components/DownloadModal.tsx"),
+    read("../src/components/SmartHarvestModal.tsx"),
+  ]);
+
+  assert.match(dataManagement, /isTerminalTaskStatus\(nextStatus\)/);
+  assert.doesNotMatch(dataManagement, /FINAL_DATA_TASK_STATUSES/);
+  for (const source of [resample, download, harvest]) {
+    assert.match(source, /isTerminalTaskStatus\(jobStatus\)/);
+  }
 });

@@ -540,6 +540,8 @@ export function PortfoliosPage() {
   };
 
   const handleRemoveEmpty = async () => {
+    const confirmed = window.confirm("Remove all portfolios with no components?");
+    if (!confirmed) return;
     try {
       const payload = await removeEmptyPortfolios();
       const notice = formatMaintenanceDeletionResult(

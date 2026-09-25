@@ -36,7 +36,13 @@ from runner.llm_providers import DEFAULT_LLM_PROVIDER_NAME, SUPPORTED_LLM_PROVID
 from runner.optimizer import OptimizationConfig
 from runner.optimizer import run_optimization as execute_optimization
 from runner.stats import compute_stats, compute_stats_for_result
-from shared.constants import DATA_DIR, LOG_DIR, OPTIMIZATIONS_DIR, normalize_timeframe
+from shared.constants import (
+    DATA_DIR,
+    LOG_DIR,
+    OHLCV_COLUMNS,
+    OPTIMIZATIONS_DIR,
+    normalize_timeframe,
+)
 from shared.logging import get_logger, redact_text, redact_value
 from shared.models import BacktestResult, EquityPoint, PortfolioStats, Trade
 from shared.strategy_registry import (
@@ -96,6 +102,7 @@ SINGLEFLIGHT_LEASE_SECONDS = _environment_float(
 SINGLEFLIGHT_HEARTBEAT_SECONDS = _environment_float(
     "VIEWER_SINGLEFLIGHT_HEARTBEAT_SECONDS", 30.0, 0.1
 )
+SINGLEFLIGHT_BOOT_ID = secrets.token_urlsafe(16)
 TASK_LOG_MAX_BYTES = 64 * 1024
 GENERAL_LOG_MAX_BYTES = 2 * 1024 * 1024
 GENERAL_LOG_MAX_LINES = 2000
@@ -186,7 +193,7 @@ def evict_jobs(*, max_age_seconds: float = 3600.0) -> int:
 
 BARS_BEFORE = 60
 BARS_AFTER = 25
-_OHLCV_COLUMNS = ["timestamp", "open", "high", "low", "close", "volume"]
+_OHLCV_COLUMNS = list(OHLCV_COLUMNS)
 _OHLCV_SYMBOL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/+:-]{0,63}$")
 _OHLCV_TIMEFRAME_RE = re.compile(r"^[A-Za-z0-9]{1,16}$")
 _OHLCV_MAX_MATCHES = 32
@@ -251,6 +258,14 @@ def _optimization_summary_payload(payload: dict[str, Any], path: Path) -> dict[s
         "train_stats": payload.get("train_stats", {}),
         "test_stats": payload.get("test_stats", {}),
     }
+    for key in (
+        "best_metric_key",
+        "best_raw_value",
+        "best_value_is_risk_adjusted",
+        "oos_comparison",
+    ):
+        if key in payload:
+            summary[key] = payload.get(key)
     if "oos_status" in payload:
         summary["oos_status"] = payload.get("oos_status")
     return summary
@@ -575,9 +590,12 @@ def _read_parquet_frame_bounded(path: Path, max_rows: int) -> pd.DataFrame | Non
     row_limit = max(0, int(max_rows))
     parquet_file = pq.ParquetFile(path)
     try:
-        columns = None
-        if set(_OHLCV_COLUMNS).issubset(set(parquet_file.schema.names)):
-            columns = list(_OHLCV_COLUMNS)
+        schema_names = [str(name).lower() for name in parquet_file.schema.names]
+        canonical_names = {name: name for name in schema_names}
+        missing = [column for column in _OHLCV_COLUMNS if column not in canonical_names]
+        if missing:
+            raise ValueError(f"OHLCV parquet is missing canonical columns: {missing}")
+        columns = [canonical_names[column] for column in _OHLCV_COLUMNS]
         batches = iter(
             parquet_file.iter_batches(
                 columns=columns,
@@ -1909,39 +1927,74 @@ def _collect_log_entries(
     max_bytes: int = GENERAL_LOG_MAX_BYTES,
     max_lines: int = GENERAL_LOG_MAX_LINES,
 ) -> list[dict]:
-    entries: list[dict] = []
-    remaining = max(0, int(max_bytes))
     line_limit = max(0, int(max_lines))
+    byte_limit = max(0, int(max_bytes))
+    if line_limit <= 0 or byte_limit <= 0:
+        return []
+
+    unique_paths: list[Path] = []
+    seen_paths: set[str] = set()
     for path in paths:
-        if remaining <= 0 or len(entries) >= line_limit:
-            break
-        per_file_limit = min(256 * 1024, remaining)
-        text = _read_log_tail(path, per_file_limit)
-        if not text:
+        key = str(path)
+        if key in seen_paths:
             continue
-        remaining -= len(text.encode("utf-8", errors="ignore"))
-        for line_number, line in enumerate(text.splitlines()):
-            if len(entries) >= line_limit:
+        seen_paths.add(key)
+        unique_paths.append(path)
+    if not unique_paths:
+        return []
+
+    base_byte_limit, byte_remainder = divmod(byte_limit, len(unique_paths))
+    file_lines: list[list[tuple[int, str]]] = []
+    for index, path in enumerate(unique_paths):
+        per_file_limit = min(
+            256 * 1024,
+            base_byte_limit + (1 if index < byte_remainder else 0),
+        )
+        if per_file_limit <= 0:
+            file_lines.append([])
+            continue
+        text = _read_log_tail(path, per_file_limit)
+        file_lines.append(list(enumerate(text.splitlines())) if text else [])
+
+    offsets = [len(lines) - 1 for lines in file_lines]
+    selected: list[tuple[int, int, str, Path]] = []
+    while len(selected) < line_limit:
+        added = False
+        for file_index, lines in enumerate(file_lines):
+            line_index = offsets[file_index]
+            if line_index < 0:
+                continue
+            line_number, line = lines[line_index]
+            selected.append((file_index, line_number, line, unique_paths[file_index]))
+            offsets[file_index] -= 1
+            added = True
+            if len(selected) >= line_limit:
                 break
-            safe_line = redact_text(line)
-            payload: dict | None = None
-            timestamp: datetime | None = None
-            try:
-                parsed = json.loads(line)
-                if isinstance(parsed, dict):
-                    payload = redact_value(parsed)
-                    timestamp = _parse_log_timestamp(parsed.get("timestamp"))
-            except json.JSONDecodeError:
-                payload = None
-            entries.append(
-                {
-                    "line": safe_line,
-                    "timestamp": timestamp,
-                    "level": _extract_log_level(safe_line, payload),
-                    "path": path.name,
-                    "line_number": line_number,
-                }
-            )
+        if not added:
+            break
+
+    selected.sort(key=lambda item: (item[0], item[1]))
+    entries: list[dict] = []
+    for _, line_number, line, path in selected:
+        safe_line = redact_text(line)
+        payload: dict | None = None
+        timestamp: datetime | None = None
+        try:
+            parsed = json.loads(line)
+            if isinstance(parsed, dict):
+                payload = redact_value(parsed)
+                timestamp = _parse_log_timestamp(parsed.get("timestamp"))
+        except json.JSONDecodeError:
+            payload = None
+        entries.append(
+            {
+                "line": safe_line,
+                "timestamp": timestamp,
+                "level": _extract_log_level(safe_line, payload),
+                "path": path.name,
+                "line_number": line_number,
+            }
+        )
     return entries
 
 
@@ -2146,6 +2199,21 @@ def _download_request_key(identity: dict[str, Any]) -> str:
 
 
 _SINGLEFLIGHT_OWNER_CONTEXT = threading.local()
+_SINGLEFLIGHT_RUNTIME_KEYS = (
+    "download_request_key",
+    "owner_pid",
+    "owner_thread_id",
+    "owner_token",
+    "singleflight_owner_boot_id",
+    "singleflight_heartbeat_at",
+    "singleflight_lease_until",
+    "singleflight_lease_expires_at",
+)
+
+
+def _clear_singleflight_reservation(task: dict[str, Any]) -> None:
+    for key in _SINGLEFLIGHT_RUNTIME_KEYS:
+        task.pop(key, None)
 
 
 def _new_singleflight_owner_token() -> str:
@@ -2180,13 +2248,22 @@ def _singleflight_lease_expired(task: dict[str, Any], now: float) -> bool:
     if _normalized_task_status(task.get("status")) not in ACTIVE_TASK_STATUSES:
         return False
     lease_until = task.get("singleflight_lease_until")
+    uses_wall_clock = lease_until is None
+    lease_clock = time.time if uses_wall_clock else time.monotonic
+    if uses_wall_clock:
+        lease_until = task.get("singleflight_lease_expires_at")
     if lease_until is None:
         return True
     try:
         lease_until_value = float(lease_until)
-        if not math.isfinite(lease_until_value) or not math.isfinite(float(now)):
+        current_value = float(lease_clock())
+        if not math.isfinite(lease_until_value) or not math.isfinite(current_value):
             return True
-        return now >= lease_until_value
+        if not uses_wall_clock:
+            if not math.isfinite(float(now)):
+                return True
+            current_value = float(now)
+        return current_value >= lease_until_value
     except (TypeError, ValueError):
         return True
 
@@ -2196,7 +2273,8 @@ def _touch_singleflight_lease(
     now: float | None = None,
     owner_token: str | None = None,
 ) -> bool:
-    if task.get("download_request_key") and not _singleflight_owner_matches(task, owner_token):
+    has_reservation = bool(task.get("download_request_key") or task.get("owner_token"))
+    if has_reservation and not _singleflight_owner_matches(task, owner_token):
         return False
     current = time.monotonic() if now is None else now
     last_heartbeat = task.get("singleflight_heartbeat_at")
@@ -2209,8 +2287,10 @@ def _touch_singleflight_lease(
                 return False
         except (TypeError, ValueError):
             pass
+    task["singleflight_owner_boot_id"] = SINGLEFLIGHT_BOOT_ID
     task["singleflight_heartbeat_at"] = current
     task["singleflight_lease_until"] = current + SINGLEFLIGHT_LEASE_SECONDS
+    task["singleflight_lease_expires_at"] = time.time() + SINGLEFLIGHT_LEASE_SECONDS
     return True
 
 
@@ -2232,18 +2312,18 @@ def _register_download_task(
                     continue
                 if _normalized_task_status(task.get("status")) in ACTIVE_TASK_STATUSES:
                     if not _singleflight_lease_expired(task, now):
-                        _touch_singleflight_lease(task, now, owner_token=reservation_token)
                         return dict(task)
                     task["status"] = "failed"
                     task["error"] = "singleflight reservation lease expired"
                     task["finished_at"] = _task_now_iso()
-                    task.pop("download_request_key", None)
+                    _clear_singleflight_reservation(task)
                 else:
-                    task.pop("download_request_key", None)
+                    _clear_singleflight_reservation(task)
             record["download_request_key"] = request_key
         record["owner_pid"] = os.getpid()
         record["owner_thread_id"] = threading.get_ident()
         record["owner_token"] = str(reservation_token)
+        record["singleflight_owner_boot_id"] = SINGLEFLIGHT_BOOT_ID
         _touch_singleflight_lease(record, now, owner_token=reservation_token)
         DATA_TASKS[record["id"]] = record
         _prune_terminal_tasks_locked()
@@ -2269,6 +2349,7 @@ def _start_singleflight_download(
         "owner_pid": os.getpid(),
         "owner_thread_id": threading.get_ident(),
         "owner_token": owner_token,
+        "singleflight_owner_boot_id": SINGLEFLIGHT_BOOT_ID,
     }
     existing = _register_download_task(
         reservation,
@@ -2331,7 +2412,7 @@ def _read_task_log(log_file: str | Path, *, max_bytes: int | None = None) -> str
 
 def _append_task_log(log_file: Path, message: str) -> None:
     with log_file.open("a", encoding="utf-8") as handle:
-        handle.write(message)
+        handle.write(redact_text(message))
 
 
 class _ThreadBoundTaskLogHandler(logging.Handler):
@@ -2371,6 +2452,7 @@ def _write_task_log_line(
     source: str = "data-task",
     ingest_task_progress: bool = True,
 ) -> None:
+    message = redact_text(message)
     if not message.endswith("\n"):
         message = f"{message}\n"
     handle.write(message)
@@ -2465,14 +2547,7 @@ def _create_task_record(
         _prune_terminal_tasks_locked()
         reservation = DATA_TASKS.get(task_id)
         if reservation is not None and reservation.get("download_request_key"):
-            for key in (
-                "download_request_key",
-                "owner_pid",
-                "owner_thread_id",
-                "owner_token",
-                "singleflight_heartbeat_at",
-                "singleflight_lease_until",
-            ):
+            for key in _SINGLEFLIGHT_RUNTIME_KEYS:
                 if key in reservation:
                     record[key] = reservation[key]
     return record
@@ -2511,7 +2586,7 @@ def _update_task_fields(task_id: str, **updates: Any) -> dict[str, Any] | None:
         status = _task_status_or_manual(task.get("status"))
         task["status"] = status
         if status in FINAL_TASK_STATUSES:
-            task.pop("download_request_key", None)
+            _clear_singleflight_reservation(task)
         elif task.get("download_request_key"):
             _touch_singleflight_lease(task)
         task["updated_at"] = _task_now_iso()

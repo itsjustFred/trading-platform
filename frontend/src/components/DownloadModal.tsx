@@ -4,6 +4,7 @@ import { ArrowRight, Download, Loader2, RotateCcw } from "lucide-react";
 
 import { downloadData, getDukascopyGenesis } from "../api/client";
 import type { DukascopyGenesisResponse } from "../api/types";
+import { isTerminalTaskStatus } from "../lib/taskStatus";
 import { LiveTerminal } from "./LiveTerminal";
 import { Modal } from "./Modal";
 import { renderTaskStatusIcon } from "./ResampleModal";
@@ -971,8 +972,10 @@ export function DownloadModal({
     if (!jobId || completionNotified) {
       return;
     }
-    if (jobStatus === "completed" || jobStatus === "failed") {
-      onTaskFinished?.(jobStatus, jobId);
+    if (isTerminalTaskStatus(jobStatus)) {
+      if (jobStatus === "completed" || jobStatus === "failed") {
+        onTaskFinished?.(jobStatus, jobId);
+      }
       setCompletionNotified(true);
     }
   }, [completionNotified, jobId, jobStatus, onTaskFinished]);
@@ -1352,7 +1355,7 @@ export function DownloadModal({
                 continue elsewhere.
               </div>
               <div style={{ display: "flex", gap: "10px" }}>
-                {(jobStatus === "completed" || jobStatus === "failed") && (
+                {isTerminalTaskStatus(jobStatus) && (
                   <button
                     type="button"
                     onClick={resetStream}
@@ -1388,7 +1391,7 @@ export function DownloadModal({
                     fontWeight: 700,
                   }}
                 >
-                  {jobStatus === "completed" || jobStatus === "failed"
+                  {isTerminalTaskStatus(jobStatus)
                     ? "Close terminal"
                     : "Hide terminal"}
                   <ArrowRight size={15} />

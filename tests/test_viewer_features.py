@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import sys
+from io import StringIO
 import threading
 import time
 import traceback
@@ -1807,6 +1808,46 @@ def test_data_download_discards_persisted_record_for_coalesced_request(
     assert deleted.isdisjoint(persisted)
 
 
+def test_coalesced_cleanup_state_updates_are_serialized(tmp_path, monkeypatch):
+    import viewer.main as viewer_app_module
+
+    monkeypatch.setattr(viewer_app_module, "DATA_DIR", tmp_path)
+    first_write_started = threading.Event()
+    release_first_write = threading.Event()
+    write_calls: list[dict] = []
+    real_write = viewer_app_module._write_coalesced_cleanup_state
+
+    def blocking_write(state):
+        write_calls.append(dict(state))
+        if len(write_calls) == 1:
+            first_write_started.set()
+            assert release_first_write.wait(timeout=2)
+        real_write(state)
+
+    monkeypatch.setattr(viewer_app_module, "_write_coalesced_cleanup_state", blocking_write)
+    first = threading.Thread(
+        target=viewer_app_module._update_coalesced_cleanup_state,
+        args=("cleanup-0001",),
+        kwargs={"attempts": 1, "exhausted": False},
+    )
+    second = threading.Thread(
+        target=viewer_app_module._update_coalesced_cleanup_state,
+        args=("cleanup-0002",),
+        kwargs={"attempts": 1, "exhausted": False},
+    )
+    first.start()
+    assert first_write_started.wait(timeout=2)
+    second.start()
+    time.sleep(0.05)
+    assert len(write_calls) == 1
+    release_first_write.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    state = viewer_app_module._load_coalesced_cleanup_state()
+    assert set(state) == {"cleanup-0001", "cleanup-0002"}
+
+
 def test_coalesced_cleanup_failure_persists_retryable_marker(
     viewer_client, monkeypatch
 ):
@@ -2875,6 +2916,47 @@ def test_data_task_logs_endpoint_bounds_and_redacts_output(
     assert len(logs.encode("utf-8")) <= 64 * 1024
     assert "endpoint-secret" not in logs
     assert "Bearer [Filtered]" in logs
+
+
+def test_task_log_writer_redacts_before_persisting():
+    from viewer import core
+
+    handle = StringIO()
+    core._write_task_log_line(
+        handle,
+        "task-redact",
+        "secret_key=task-secret Authorization: Basic task-auth-secret",
+        stream="stdout",
+    )
+
+    persisted = handle.getvalue()
+    assert "task-secret" not in persisted
+    assert "task-auth-secret" not in persisted
+    assert "Basic [Filtered]" in persisted
+
+
+def test_service_payload_redacts_structured_secrets():
+    import viewer.main as viewer_app_module
+
+    service = SimpleNamespace(
+        id="service-redact",
+        name="Service",
+        type=SimpleNamespace(value="scheduled_job"),
+        status=SimpleNamespace(value="running"),
+        config={
+            "secret_key": "service-secret",
+            "app_secret": "service-app-secret",
+            "safe": "visible",
+        },
+        last_activity=None,
+        created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+
+    payload = viewer_app_module._serialize_service_payload(service)
+
+    assert payload["config"]["secret_key"] == "[Filtered]"
+    assert payload["config"]["app_secret"] == "[Filtered]"
+    assert payload["config"]["safe"] == "visible"
 
 
 def test_data_task_logs_rejects_syntactically_valid_unknown_task(viewer_client, tmp_path):
@@ -5459,6 +5541,22 @@ def test_general_log_collection_caps_lines_and_redacts_json(tmp_path):
     assert all("secret" not in entry["line"] for entry in entries)
 
 
+def test_general_log_collection_spreads_line_budget_across_files(tmp_path):
+    from viewer import core
+
+    paths = []
+    for name in ("viewer.log", "runner.log"):
+        path = tmp_path / name
+        path.write_text("\n".join(f"{name}:{index}" for index in range(8)), encoding="utf-8")
+        paths.append(path)
+
+    entries = core._collect_log_entries(paths, max_bytes=1024 * 1024, max_lines=4)
+
+    assert len(entries) == 4
+    assert {entry["path"] for entry in entries} == {"viewer.log", "runner.log"}
+    assert all(sum(entry["path"] == path.name for entry in entries) == 2 for path in paths)
+
+
 def test_ctrader_report_is_atomic_and_private(tmp_path, monkeypatch):
     import importlib.util
 
@@ -5521,6 +5619,100 @@ def test_singleflight_lease_boundary_and_owner_authorization(monkeypatch):
     task["owner_pid"] = core.os.getpid()
     assert core._touch_singleflight_lease(task, 110.0, owner_token=owner_token) is True
     assert task["singleflight_lease_until"] == 210.0
+
+
+def test_singleflight_requester_cannot_renew_existing_owner_lease(monkeypatch):
+    from viewer import core
+
+    core.DATA_TASKS.clear()
+    monkeypatch.setattr(core, "SINGLEFLIGHT_LEASE_SECONDS", 100.0)
+    monkeypatch.setattr(core, "SINGLEFLIGHT_HEARTBEAT_SECONDS", 10.0)
+    now = time.monotonic()
+    existing = {
+        "id": "task-owned-reservation",
+        "status": "running",
+        "download_request_key": "same-request",
+        "owner_pid": core.os.getpid(),
+        "owner_token": "owner-token",
+        "singleflight_owner_boot_id": core.SINGLEFLIGHT_BOOT_ID,
+        "singleflight_heartbeat_at": now - 20,
+        "singleflight_lease_until": now + 100,
+    }
+    core.DATA_TASKS[existing["id"]] = existing
+
+    result = core._register_download_task(
+        {"id": "task-new-owner", "status": "starting"},
+        "same-request",
+        owner_token="new-owner",
+    )
+
+    assert result is not None
+    assert result["id"] == existing["id"]
+    assert existing["singleflight_lease_until"] == now + 100
+    core.DATA_TASKS.clear()
+
+
+def test_singleflight_reservation_is_invalidated_after_restart():
+    import viewer.main as viewer_app_module
+
+    task = viewer_app_module._build_task_from_record(
+        {
+            "id": "task-stale-reservation",
+            "type": "data",
+            "status": "starting",
+            "config_json": {
+                "download_request_key": "same-request",
+                "owner_pid": viewer_app_module.os.getpid(),
+                "owner_token": "old-owner",
+                "singleflight_owner_boot_id": "old-boot",
+            },
+        }
+    )
+
+    assert task["status"] == "interrupted"
+    assert "download_request_key" not in task
+    assert "owner_token" not in task
+    assert "invalidated by server restart" in task["error"]
+
+    terminal = viewer_app_module._build_task_from_record(
+        {
+            "id": "task-terminal-reservation",
+            "type": "data",
+            "status": "completed",
+            "config_json": {
+                "download_request_key": "old-request",
+                "owner_token": "old-owner",
+            },
+        }
+    )
+
+    assert terminal["status"] == "completed"
+    assert "download_request_key" not in terminal
+    assert "owner_token" not in terminal
+
+
+def test_singleflight_runtime_state_is_in_persisted_task_config():
+    import viewer.main as viewer_app_module
+
+    config = viewer_app_module._task_config_payload(
+        {
+            "id": "task-persisted-reservation",
+            "kind": "data",
+            "status": "starting",
+            "download_request_key": "same-request",
+            "owner_pid": 123,
+            "owner_thread_id": 456,
+            "owner_token": "owner-token",
+            "singleflight_owner_boot_id": "boot-id",
+            "singleflight_lease_expires_at": 789.5,
+        }
+    )
+
+    assert config["download_request_key"] == "same-request"
+    assert config["owner_pid"] == 123
+    assert config["owner_token"] == "owner-token"
+    assert config["singleflight_owner_boot_id"] == "boot-id"
+    assert config["singleflight_lease_expires_at"] == 789.5
 
 
 def test_task_status_evidence_mapping_is_exhaustive_and_fail_closed():
@@ -5727,6 +5919,8 @@ def test_live_websocket_payload_redacts_nested_secrets_and_unknown_objects():
             "type": "snapshot",
             "data": {
                 "apiKey": "key-secret",
+                "secret_key": "nested-secret-key",
+                "headers": {"Authorization": "Digest digest-secret"},
                 "opaque": "opaque-secret",
                 "unknown": _Unknown(),
                 "safe": "visible",
@@ -5735,6 +5929,8 @@ def test_live_websocket_payload_redacts_nested_secrets_and_unknown_objects():
     )
 
     assert safe["data"]["apiKey"] == "[Filtered]"
+    assert safe["data"]["secret_key"] == "[Filtered]"
+    assert safe["data"]["headers"]["Authorization"] == "[Filtered]"
     assert safe["data"]["opaque"] == "[Filtered]"
     assert safe["data"]["unknown"] == "[Unserializable]"
     assert safe["data"]["safe"] == "visible"

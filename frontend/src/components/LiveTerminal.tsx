@@ -16,6 +16,8 @@ const TERMINAL_STATUS_TONES: Record<string, string> = {
   completed: "#86efac",
   failed: "#f87171",
   interrupted: "#f87171",
+  partial: "#fbbf24",
+  skipped: "#fbbf24",
   cancelled: "#fbbf24",
   manual_required: "#f87171",
   cleanup_pending: "#fbbf24",

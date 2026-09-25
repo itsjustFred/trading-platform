@@ -334,7 +334,6 @@ def test_signal_replay_accepts_csv_inside_data_dir(
                 BacktestMeta,
                 BacktestResult,
                 EquityPoint,
-                Trade,
             )
 
             meta = BacktestMeta(
@@ -636,6 +635,68 @@ def test_viewer_ohlcv_loader_enforces_byte_budget(monkeypatch, tmp_path):
     _make_parquet(tmp_path / "ohlcv" / "dukascopy" / "forex" / "EURUSD" / "1h.parquet")
 
     assert core._load_ohlcv_df("EURUSD", "1h") is None
+    core._OHLCV_DF_CACHE.clear()
+
+
+def test_viewer_ohlcv_loader_reads_only_canonical_columns(monkeypatch, tmp_path):
+    from viewer import core
+
+    monkeypatch.setattr(core, "DATA_DIR", tmp_path)
+    core._OHLCV_DF_CACHE.clear()
+    path = tmp_path / "ohlcv" / "dukascopy" / "forex" / "EURUSD" / "1h.parquet"
+    path.parent.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=2, freq="h", tz="UTC"),
+            "open": [1.0, 1.1],
+            "high": [1.2, 1.3],
+            "low": [0.9, 1.0],
+            "close": [1.1, 1.2],
+            "volume": [2, 3],
+            "untrusted_extra": ["x" * 1000, "y" * 1000],
+        }
+    ).to_parquet(path, index=False)
+    observed: dict[str, object] = {}
+    original = core.pq.ParquetFile.iter_batches
+
+    def tracked_iter_batches(self, *args, **kwargs):
+        observed["columns"] = kwargs.get("columns")
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(core.pq.ParquetFile, "iter_batches", tracked_iter_batches)
+
+    loaded = core._load_ohlcv_df("EURUSD", "1h")
+
+    assert loaded is not None
+    assert observed["columns"] == core._OHLCV_COLUMNS
+    assert "untrusted_extra" not in loaded.columns
+    core._OHLCV_DF_CACHE.clear()
+
+
+def test_viewer_ohlcv_loader_rejects_noncanonical_schema_before_read(monkeypatch, tmp_path):
+    from viewer import core
+
+    monkeypatch.setattr(core, "DATA_DIR", tmp_path)
+    core._OHLCV_DF_CACHE.clear()
+    path = tmp_path / "ohlcv" / "dukascopy" / "forex" / "BAD" / "1h.parquet"
+    path.parent.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=2, freq="h", tz="UTC"),
+            "open": [1.0, 1.1],
+            "high": [1.2, 1.3],
+            "low": [0.9, 1.0],
+            "close": [1.1, 1.2],
+            "untrusted_extra": ["x" * 1000, "y" * 1000],
+        }
+    ).to_parquet(path, index=False)
+
+    def fail_iter_batches(*_args, **_kwargs):
+        raise AssertionError("noncanonical parquet must be rejected before batching")
+
+    monkeypatch.setattr(core.pq.ParquetFile, "iter_batches", fail_iter_batches)
+
+    assert core._load_ohlcv_df("BAD", "1h") is None
     core._OHLCV_DF_CACHE.clear()
 
 

@@ -12,6 +12,12 @@ export interface OptimizationOosEvidence {
   border: string;
 }
 
+export interface CompatibleOptimizationMetric {
+  metric_key?: unknown;
+  in_sample_value?: unknown;
+  compatible?: unknown;
+}
+
 const TARGET_METRIC_ALIASES: Record<string, string> = {
   sharpe: "sharpe_ratio",
   sharpe_ratio: "sharpe_ratio",
@@ -64,6 +70,19 @@ export function resolveOptimizationMetricKey(targetMetric: string): string {
     : normalized;
 }
 
+export function resolveCompatibleInSampleValue(
+  targetMetric: string,
+  comparison: CompatibleOptimizationMetric | null | undefined,
+): number | null {
+  if (!comparison || comparison.compatible !== true) return null;
+  const expectedMetric = resolveOptimizationMetricKey(targetMetric);
+  if (String(comparison.metric_key || "") !== expectedMetric) return null;
+  return typeof comparison.in_sample_value === "number" &&
+    Number.isFinite(comparison.in_sample_value)
+    ? comparison.in_sample_value
+    : null;
+}
+
 export function classifyOptimizationOosEvidence(
   targetMetric: string,
   inSampleValue: unknown,
@@ -108,14 +127,19 @@ export function classifyOptimizationOosEvidence(
     );
   }
 
-  const finiteInSampleValue =
-    typeof inSampleValue === "number" && Number.isFinite(inSampleValue) ? inSampleValue : null;
-  if (finiteInSampleValue === null) {
+  if (inSampleValue === null || inSampleValue === undefined) {
+    return unavailableEvidence(
+      metricKey,
+      `No compatible in-sample ${metricKey} value was provided, so the raw OOS value cannot be compared.`,
+    );
+  }
+  if (typeof inSampleValue !== "number" || !Number.isFinite(inSampleValue)) {
     return unavailableEvidence(
       metricKey,
       `The in-sample selected score for ${metricKey} is not finite, so OOS evidence cannot be validated.`,
     );
   }
+  const finiteInSampleValue = inSampleValue;
   if (
     metricValueOutsideRange(metricKey, finiteInSampleValue) ||
     metricValueOutsideRange(metricKey, oosValue)

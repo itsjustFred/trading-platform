@@ -307,6 +307,7 @@ export interface OptimizationTrial {
   symbols?: string[];
   trade_count: number;
   penalty_applied: boolean;
+  raw_metric_value?: number | null;
   train_stats: OptimizationStatMap;
 }
 
@@ -318,6 +319,12 @@ export type OptimizationOosStatus =
   | "no_oos_requested"
   | "unavailable";
 
+export interface OptimizationOosComparison {
+  metric_key: string;
+  in_sample_value: number | null;
+  compatible: boolean;
+}
+
 export interface OptimizationSummary {
   id: string;
   filename: string;
@@ -327,6 +334,10 @@ export interface OptimizationSummary {
   n_trials: number;
   train_split_pct: number;
   best_value: number | null;
+  best_metric_key?: string | null;
+  best_raw_value?: number | null;
+  best_value_is_risk_adjusted?: boolean;
+  oos_comparison?: OptimizationOosComparison | null;
   best_params: Record<string, StrategyParameterValue>;
   effective_best_parameters: Record<string, StrategyParameterValue>;
   symbols?: string[];
@@ -364,6 +375,10 @@ export interface OptimizationDetail {
   best_params: Record<string, StrategyParameterValue>;
   effective_best_parameters: Record<string, StrategyParameterValue>;
   best_value: number | null;
+  best_metric_key?: string | null;
+  best_raw_value?: number | null;
+  best_value_is_risk_adjusted?: boolean;
+  oos_comparison?: OptimizationOosComparison | null;
   train_period: OptimizationPeriod;
   test_period: OptimizationPeriod;
   train_stats: OptimizationStatMap;

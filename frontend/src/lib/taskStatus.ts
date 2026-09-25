@@ -4,6 +4,8 @@ const TERMINAL_STATUSES = new Set([
   "failed",
   "cancelled",
   "interrupted",
+  "partial",
+  "skipped",
   "manual_required",
   "cleanup_pending",
   "cleanup_exhausted",

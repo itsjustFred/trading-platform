@@ -4,6 +4,7 @@ import test from "node:test";
 
 import {
   classifyOptimizationOosEvidence,
+  resolveCompatibleInSampleValue,
   resolveOptimizationMetricKey,
 } from "../src/lib/optimizationEvidence.ts";
 
@@ -43,6 +44,33 @@ test("target metric aliases resolve to the stats keys persisted by the optimizer
   assert.equal(resolveOptimizationMetricKey("calmar"), "calmar_ratio");
   assert.equal(resolveOptimizationMetricKey("cagr"), "cagr");
   assert.equal(resolveOptimizationMetricKey("win_rate"), "win_rate");
+});
+
+test("risk-adjusted objective values require an explicit compatible metric", () => {
+  assert.equal(
+    resolveCompatibleInSampleValue("net_profit", {
+      metric_key: "total_pnl",
+      in_sample_value: 500,
+      compatible: false,
+    }),
+    null,
+  );
+  assert.equal(
+    resolveCompatibleInSampleValue("net_profit", {
+      metric_key: "sharpe_ratio",
+      in_sample_value: 2,
+      compatible: true,
+    }),
+    null,
+  );
+  assert.equal(
+    resolveCompatibleInSampleValue("net_profit", {
+      metric_key: "total_pnl",
+      in_sample_value: 500,
+      compatible: true,
+    }),
+    500,
+  );
 });
 
 test("inherited alias names fall back to normalized string metric keys", async () => {
