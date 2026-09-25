@@ -1,8 +1,9 @@
-import { memo, useCallback, useEffect, useState } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { ArrowUpDown, Plus, Trash2, X } from "lucide-react";
 
 import type {
+  MaintenanceDeleteItem,
   PortfolioSummary,
   PortfoliosDuplicatesResponse,
   PortfoliosSortField,
@@ -24,7 +25,10 @@ import { FilterBar } from "../components/FilterBar";
 import { Modal } from "../components/Modal";
 import { Sparkline } from "../components/Sparkline";
 import { useToast } from "../components/ToastProvider";
-import { formatMaintenanceDeletionResult } from "../lib/maintenanceDeletion";
+import {
+  formatMaintenanceDeletionResult,
+  reconcileMaintenanceSelection,
+} from "../lib/maintenanceDeletion";
 import { formatPValue, pValueColor } from "../utils/stats";
 
 let componentIdCounter = 0;
@@ -305,6 +309,7 @@ export function PortfoliosPage() {
   const [loading, setLoading] = useState(true);
   const [showCreate, setShowCreate] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const retrySelectionIds = useRef<Set<string>>(new Set());
   const [duplicatesInfo, setDuplicatesInfo] =
     useState<PortfoliosDuplicatesResponse | null>(null);
   const [showDuplicatesModal, setShowDuplicatesModal] = useState(false);
@@ -329,7 +334,7 @@ export function PortfoliosPage() {
           );
           const next = new Set<string>();
           current.forEach((id) => {
-            if (valid.has(id)) next.add(id);
+            if (valid.has(id) || retrySelectionIds.current.has(id)) next.add(id);
           });
           return next;
         });
@@ -363,6 +368,12 @@ export function PortfoliosPage() {
   }, [showToast]);
 
   const selectedCount = selectedIds.size;
+
+  const applyMaintenanceResult = (items: readonly MaintenanceDeleteItem[]) => {
+    const update = reconcileMaintenanceSelection(selectedIds, items);
+    retrySelectionIds.current = update.retryIds;
+    setSelectedIds(update.selectedIds);
+  };
 
   const setComponentField = useCallback(
     (id: string, field: keyof ComponentDraft, value: string) => {
@@ -462,6 +473,7 @@ export function PortfoliosPage() {
       setSelectedIds((current) => {
         const next = new Set(current);
         next.delete(id);
+        retrySelectionIds.current.delete(id);
         return next;
       });
       showToast("Portfolio deleted.", "success");
@@ -478,6 +490,7 @@ export function PortfoliosPage() {
       const next = new Set(current);
       if (next.has(id)) next.delete(id);
       else next.add(id);
+      if (!next.has(id)) retrySelectionIds.current.delete(id);
       return next;
     });
   };
@@ -494,7 +507,7 @@ export function PortfoliosPage() {
         result.items,
       );
       showToast(notice.message, notice.tone);
-      setSelectedIds(new Set());
+      applyMaintenanceResult(result.items);
       loadPortfolios();
     } catch (error: unknown) {
       const message =
@@ -528,6 +541,7 @@ export function PortfoliosPage() {
         payload.items,
       );
       showToast(notice.message, notice.tone);
+      applyMaintenanceResult(payload.items);
       setShowDuplicatesModal(false);
       loadPortfolios();
     } catch (error: unknown) {
@@ -550,7 +564,7 @@ export function PortfoliosPage() {
         payload.items,
       );
       showToast(notice.message, notice.tone);
-      setSelectedIds(new Set());
+      applyMaintenanceResult(payload.items);
       loadPortfolios();
     } catch (error: unknown) {
       const message =

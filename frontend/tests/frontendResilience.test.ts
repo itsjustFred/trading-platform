@@ -2,7 +2,10 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
-import { formatMaintenanceDeletionResult } from "../src/lib/maintenanceDeletion.ts";
+import {
+  formatMaintenanceDeletionResult,
+  reconcileMaintenanceSelection,
+} from "../src/lib/maintenanceDeletion.ts";
 import {
   isActiveTaskStatus,
   isFailedTaskStatus,
@@ -62,6 +65,32 @@ test("maintenance cleanup pending is never reported as success", () => {
   assert.match(journalPending.message, /1 pending cleanup/);
 });
 
+test("maintenance selection only clears resolved items", () => {
+  const update = reconcileMaintenanceSelection(
+    new Set(["deleted", "missing", "failed", "pending", "journal", "unreported"]),
+    [
+      deletionItem("deleted", "deleted"),
+      deletionItem("missing", "not_found"),
+      deletionItem("failed", "failed"),
+      deletionItem("pending", "cleanup_pending"),
+      { ...deletionItem("journal", "deleted"), journal_pending: true },
+    ],
+  );
+
+  assert.deepEqual([...update.selectedIds].sort(), [
+    "failed",
+    "journal",
+    "pending",
+    "unreported",
+  ]);
+  assert.deepEqual([...update.retryIds].sort(), [
+    "failed",
+    "journal",
+    "pending",
+    "unreported",
+  ]);
+});
+
 test("batch maintenance pages use item-aware result notices", async () => {
   const [backtestsPage, portfoliosPage] = await Promise.all([
     read("../src/pages/BacktestsPage.tsx"),
@@ -93,6 +122,9 @@ test("batch maintenance pages use item-aware result notices", async () => {
       );
     }
   }
+  assert.doesNotMatch(portfoliosPage, /setSelectedIds\(new Set\(\)\)/);
+  assert.match(portfoliosPage, /applyMaintenanceResult\(result\.items\)/);
+  assert.match(portfoliosPage, /applyMaintenanceResult\(payload\.items\)/);
 });
 
 test("portfolio remove-empty requires confirmation before calling the API", async () => {

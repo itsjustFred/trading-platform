@@ -802,7 +802,13 @@ def _download_request_from_recovery_spec(
         merge_s1=_recovery_bool(spec, "merge_s1"),
         batch_size=_recovery_int(spec, "batch_size", 10, 1, 50),
         pause_ms=_recovery_int(spec, "pause_ms", 1000, 0, 60000),
-        query_timeout_seconds=_recovery_int(spec, "query_timeout_seconds", 900, 30, 7200),
+        query_timeout_seconds=_recovery_int(
+            spec,
+            "query_timeout_seconds",
+            900,
+            30,
+            int(legacy_viewer.MAX_DATA_QUERY_TIMEOUT_SECONDS),
+        ),
         symbol_list=symbols,
         timeframe_list=timeframes,
     )
@@ -12330,10 +12336,15 @@ def _validate_download_limits(request: _PreparedDownloadRequest) -> None:
     if request.pause_ms < 0 or request.pause_ms > 60000:
         raise HTTPException(status_code=400, detail="pause_ms must be between 0 and 60000")
     if request.source in {"dukascopy", "jforex"} and (
-        request.query_timeout_seconds < 30 or request.query_timeout_seconds > 7200
+        request.query_timeout_seconds < 30
+        or request.query_timeout_seconds > legacy_viewer.MAX_DATA_QUERY_TIMEOUT_SECONDS
     ):
         raise HTTPException(
-            status_code=400, detail="query_timeout_seconds must be between 30 and 7200"
+            status_code=400,
+            detail=(
+                "query_timeout_seconds must be between 30 and "
+                f"{int(legacy_viewer.MAX_DATA_QUERY_TIMEOUT_SECONDS)}"
+            ),
         )
 
 

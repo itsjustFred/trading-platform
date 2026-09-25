@@ -96,8 +96,14 @@ def _environment_float(name: str, default: float, minimum: float) -> float:
     return max(value, minimum)
 
 
-SINGLEFLIGHT_LEASE_SECONDS = _environment_float(
-    "VIEWER_SINGLEFLIGHT_LEASE_SECONDS", 900.0, 1.0
+MAX_DATA_QUERY_TIMEOUT_SECONDS = 7200.0
+SINGLEFLIGHT_LEASE_SECONDS = max(
+    _environment_float(
+        "VIEWER_SINGLEFLIGHT_LEASE_SECONDS",
+        MAX_DATA_QUERY_TIMEOUT_SECONDS + 60.0,
+        1.0,
+    ),
+    MAX_DATA_QUERY_TIMEOUT_SECONDS + 60.0,
 )
 SINGLEFLIGHT_HEARTBEAT_SECONDS = _environment_float(
     "VIEWER_SINGLEFLIGHT_HEARTBEAT_SECONDS", 30.0, 0.1

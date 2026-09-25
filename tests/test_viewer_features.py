@@ -2224,7 +2224,17 @@ def test_data_download_rejects_invalid_query_timeout_for_jforex(viewer_client):
             "query_timeout_seconds": 10,
         },
     )
+    too_long = viewer_client.post(
+        "/api/data/download",
+        json={
+            "source": "jforex",
+            "symbols": "EURUSD",
+            "timeframes": "h1",
+            "query_timeout_seconds": 7201,
+        },
+    )
     assert response.status_code == 400
+    assert too_long.status_code == 400
     message = response.json().get("detail", "")
     assert "query_timeout_seconds" in message
 
@@ -5509,6 +5519,26 @@ def test_singleflight_expired_reservation_does_not_block_new_work(monkeypatch):
     assert stale["status"] == "failed"
     assert core.DATA_TASKS["task-new"]["download_request_key"] == "same-request"
     core.DATA_TASKS.clear()
+
+
+def test_singleflight_lease_covers_max_admitted_query_timeout():
+    from viewer import core
+
+    now = 100.0
+    task = {
+        "status": "running",
+        "download_request_key": "same-request",
+        "singleflight_lease_until": now + core.SINGLEFLIGHT_LEASE_SECONDS,
+    }
+
+    assert core.SINGLEFLIGHT_LEASE_SECONDS > core.MAX_DATA_QUERY_TIMEOUT_SECONDS
+    assert (
+        core._singleflight_lease_expired(
+            task,
+            now + core.MAX_DATA_QUERY_TIMEOUT_SECONDS,
+        )
+        is False
+    )
 
 
 def test_task_log_read_is_bounded_and_redacted(tmp_path):

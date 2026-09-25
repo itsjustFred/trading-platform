@@ -169,13 +169,21 @@ test("#87: p_value losing significance is degraded, doubling is decayed", async 
   );
 });
 
-test("negative baseline worsening is direction-aware decay", async () => {
+test("negative baselines compare decay in the favorable direction", () => {
   assert.equal(
-    classifyAvailable("sharpe", -2, { sharpe_ratio: -3 }).state,
+    classifyAvailable("sharpe", -0.2, { sharpe_ratio: -0.1 }).state,
+    "available",
+  );
+  assert.equal(
+    classifyAvailable("sharpe", -0.2, { sharpe_ratio: -0.3 }).state,
+    "available",
+  );
+  assert.equal(
+    classifyAvailable("sharpe", -0.2, { sharpe_ratio: -0.5 }).state,
     "decayed",
   );
   assert.equal(
-    classifyAvailable("sharpe", -2, { sharpe_ratio: 0 }).state,
+    classifyAvailable("sharpe", -0.2, { sharpe_ratio: 0 }).state,
     "degraded",
   );
 });
@@ -241,9 +249,12 @@ test("out-of-domain selected and OOS metric values are unavailable", async () =>
   }
 });
 
-test("p_value at the significance boundary cannot lose significance silently", async () => {
-  const evidence = classifyAvailable("p_value", 0.05, { p_value: 0.06 });
+test("p_value significance boundaries count as lost significance", () => {
+  const inSampleBoundary = classifyAvailable("p_value", 0.05, { p_value: 0.06 });
+  const oosBoundary = classifyAvailable("p_value", 0.01, { p_value: 0.05 });
 
-  assert.equal(evidence.state, "degraded");
-  assert.match(evidence.message, /becomes insignificant OOS/i);
+  assert.equal(inSampleBoundary.state, "degraded");
+  assert.match(inSampleBoundary.message, /becomes insignificant OOS/i);
+  assert.equal(oosBoundary.state, "degraded");
+  assert.match(oosBoundary.message, /becomes insignificant OOS/i);
 });

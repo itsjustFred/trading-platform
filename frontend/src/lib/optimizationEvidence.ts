@@ -158,7 +158,7 @@ export function classifyOptimizationOosEvidence(
 
   const lowerIsFavorable = metricKey === "p_value";
   if (lowerIsFavorable) {
-    if (finiteInSampleValue <= 0.05 && oosValue > 0.05) {
+    if (finiteInSampleValue <= 0.05 && oosValue >= 0.05) {
       return {
         state: "degraded",
         metricKey,
@@ -198,13 +198,19 @@ export function classifyOptimizationOosEvidence(
         border: "rgba(251, 113, 133, 0.3)",
       };
     }
-    if (oosValue < 0.5 * finiteInSampleValue) {
+    const decayThreshold = finiteInSampleValue > 0
+      ? 0.5 * finiteInSampleValue
+      : 2 * finiteInSampleValue;
+    if (oosValue < decayThreshold) {
+      const decayMessage = finiteInSampleValue > 0
+        ? `The out-of-sample value (${oosValue}) is less than 50% of the in-sample selected score (${finiteInSampleValue}) for ${metricKey}. Treat this candidate as decayed, not OOS validated.`
+        : `The out-of-sample value (${oosValue}) is more than twice as negative as the in-sample selected score (${finiteInSampleValue}) for ${metricKey}. Treat this candidate as decayed, not OOS validated.`;
       return {
         state: "decayed",
         metricKey,
         oosValue,
         label: "OOS decay",
-        message: `The out-of-sample value (${oosValue}) is less than 50% of the in-sample selected score (${finiteInSampleValue}) for ${metricKey}. Treat this candidate as decayed, not OOS validated.`,
+        message: decayMessage,
         tone: "#fcd34d",
         background: "rgba(120, 53, 15, 0.2)",
         border: "rgba(251, 191, 36, 0.3)",

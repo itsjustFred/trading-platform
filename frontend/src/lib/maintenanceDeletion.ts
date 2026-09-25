@@ -9,6 +9,37 @@ function normalizedCount(value: number): number {
   return Number.isFinite(value) ? Math.max(0, Math.trunc(value)) : 0;
 }
 
+export interface MaintenanceSelectionUpdate {
+  selectedIds: Set<string>;
+  retryIds: Set<string>;
+}
+
+export function reconcileMaintenanceSelection(
+  current: ReadonlySet<string>,
+  items: readonly MaintenanceDeleteItem[],
+): MaintenanceSelectionUpdate {
+  const selectedIds = new Set(current);
+  const retryIds = new Set<string>();
+  const seen = new Set<string>();
+
+  for (const item of items) {
+    const id = String(item.id || "");
+    if (!id || !current.has(id)) continue;
+    seen.add(id);
+    if (item.status === "not_found" || (item.status === "deleted" && item.journal_pending !== true)) {
+      selectedIds.delete(id);
+    } else {
+      retryIds.add(id);
+    }
+  }
+
+  for (const id of current) {
+    if (!seen.has(id)) retryIds.add(id);
+  }
+
+  return { selectedIds, retryIds };
+}
+
 export function formatMaintenanceDeletionResult(
   entity: string,
   reportedSuccessful: number,
